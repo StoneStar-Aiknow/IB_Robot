@@ -7,7 +7,9 @@
 # registry identity: it inherits the exact snapshot of the enclosing planned
 # TaskCommand.dispatch_binding. timeout_sec <= 0 uses the entry default;
 # positive values are still bounded by the Skill cap and shared TaskBudget.
-# schema_version is 1 in v1.
+# schema_version 1 preserves the original manipulation fields. Navigation
+# steps use schema_version 2 and the fields below; has_x/has_y/has_yaw
+# distinguish omitted coordinates from explicit zero values.
 
 uint32 schema_version
 string skill_name
@@ -17,3 +19,12 @@ string place_name
 string motion_direction
 float32 motion_distance
 float32 timeout_sec
+string direction
+float64 distance
+float64 degree
+bool has_x
+float64 x
+bool has_y
+float64 y
+bool has_yaw
+float64 yaw

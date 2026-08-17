@@ -5,12 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import struct
 import uuid
 from typing import Any
 
 # ROS 2 Humble float32 setters reject values beyond the IEEE-754 single-precision maximum,
 # so motion_distance and timeout_sec must stay within float32 range to match ROS action fields.
 _FLOAT32_MAX = 3.402823466e38
+_SUPPORTED_REQUEST_SCHEMA_VERSIONS = frozenset({1, 2})
+_SCHEMA_VERSION_ERROR = "SKILL_SCHEMA_INVALID: schema_version must be 1 or 2"
+
+
+def validate_request_schema_version(value: Any) -> int:
+    """Return a supported public request schema version or fail closed."""
+    if isinstance(value, bool) or not isinstance(value, int) or value not in _SUPPORTED_REQUEST_SCHEMA_VERSIONS:
+        raise ValueError(_SCHEMA_VERSION_ERROR)
+    return value
 
 
 def _normalized_string(value: Any, field_name: str, *, required: bool = False, lowercase: bool = False) -> str:
@@ -41,9 +51,40 @@ def _finite_float(value: Any, field_name: str, *, positive: bool, float32: bool 
         )
     if float32 and number > _FLOAT32_MAX:
         raise ValueError(f"{field_name} must not exceed float32 maximum")
+    if float32:
+        number = struct.unpack("!f", struct.pack("!f", number))[0]
     if number == 0.0:
         return 0.0
     return number
+
+
+def _optional_coordinate(value: Any, provided: Any, field_name: str) -> tuple[bool, float]:
+    if provided is None:
+        is_provided = value is not None
+    elif isinstance(provided, bool):
+        is_provided = provided
+    else:
+        raise ValueError(f"has_{field_name} must be a boolean")
+
+    if not is_provided:
+        if value is not None and _signed_finite_float(value, field_name) != 0.0:
+            raise ValueError(f"{field_name} must be zero when has_{field_name} is false")
+        return False, 0.0
+    if value is None:
+        raise ValueError(f"{field_name} must be provided when has_{field_name} is true")
+    return True, _signed_finite_float(value, field_name)
+
+
+def _signed_finite_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be a finite number")
+    return 0.0 if number == 0.0 else number
 
 
 def canonical_skill_payload(
@@ -55,27 +96,65 @@ def canonical_skill_payload(
     motion_distance: Any = None,
     timeout_sec: Any = None,
     *,
+    schema_version: Any,
+    direction: Any = None,
+    distance: Any = None,
+    degree: Any = None,
+    x: Any = None,
+    y: Any = None,
+    yaw: Any = None,
+    has_x: Any = None,
+    has_y: Any = None,
+    has_yaw: Any = None,
     default_timeout_sec: Any,
-) -> dict[str, str | float | None]:
+) -> dict[str, str | float | bool | int | None]:
     """Normalize a skill request into the exact payload hashed by the Gateway."""
     effective_timeout = default_timeout_sec if timeout_sec is None else timeout_sec
     normalized_distance = None
     if motion_distance is not None:
         normalized_distance = _finite_float(motion_distance, "motion_distance", positive=False, float32=True)
+    coordinate_x = _optional_coordinate(x, has_x, "x")
+    coordinate_y = _optional_coordinate(y, has_y, "y")
+    coordinate_yaw = _optional_coordinate(yaw, has_yaw, "yaw")
+    normalized_direction = _normalized_string(direction, "direction", lowercase=True)
+    normalized_nav_distance = _finite_float(0.0 if distance is None else distance, "distance", positive=False)
+    normalized_degree = _finite_float(0.0 if degree is None else degree, "degree", positive=False)
 
-    return {
+    payload: dict[str, str | float | bool | int | None] = {
+        "schema_version": validate_request_schema_version(schema_version),
         "skill_name": _normalized_string(skill_name, "skill_name", required=True),
         "target_name": _normalized_string(target_name, "target_name"),
         "container_name": _normalized_string(container_name, "container_name"),
         "place_name": _normalized_string(place_name, "place_name"),
         "motion_direction": _normalized_string(motion_direction, "motion_direction", lowercase=True),
         "motion_distance": normalized_distance,
-        "timeout_sec": _finite_float(effective_timeout, "timeout_sec", positive=True, float32=True),
     }
+    if (
+        normalized_direction
+        or normalized_nav_distance
+        or normalized_degree
+        or any(coordinate[0] for coordinate in (coordinate_x, coordinate_y, coordinate_yaw))
+    ):
+        payload.update(
+            {
+                "direction": normalized_direction,
+                "distance": normalized_nav_distance,
+                "degree": normalized_degree,
+                "has_x": coordinate_x[0],
+                "x": coordinate_x[1],
+                "has_y": coordinate_y[0],
+                "y": coordinate_y[1],
+                "has_yaw": coordinate_yaw[0],
+                "yaw": coordinate_yaw[1],
+            }
+        )
+    payload["timeout_sec"] = _finite_float(effective_timeout, "timeout_sec", positive=True, float32=True)
+    return payload
 
 
 def skill_payload_hash(payload: dict[str, Any]) -> str:
     """Return the SHA256 digest of canonical JSON payload bytes."""
+    validate_request_schema_version(payload.get("schema_version"))
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode(
         "utf-8"
     )

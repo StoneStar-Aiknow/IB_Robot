@@ -83,3 +83,31 @@ def test_checker_requires_plan_cancel_and_routing(valid_skill):
 
     assert "missing Agent plan cancel command" in errors
     assert "missing natural-language single-Skill/Workflow routing rule" in errors
+
+
+def test_checker_requires_typed_workflow_step_schema_version_contract(valid_skill):
+    checker = _load_checker()
+    content = valid_skill.read_text(encoding="utf-8")
+    content = content.replace(
+        "`workflow-json` is an array of flat `WorkflowStep` objects.",
+        "`workflow-json` is an array of flat objects.",
+    )
+    valid_skill.write_text(content, encoding="utf-8")
+
+    errors = checker.validate_skill(valid_skill)
+
+    assert "missing typed WorkflowStep schema_version requirement" in errors
+
+
+def test_checker_requires_no_domain_based_workflow_step_rewrite(valid_skill):
+    checker = _load_checker()
+    content = valid_skill.read_text(encoding="utf-8")
+    content = content.replace(
+        "Never infer or rewrite `WorkflowStep.schema_version` from the skill domain.",
+        "Infer `WorkflowStep.schema_version` from the skill domain.",
+    )
+    valid_skill.write_text(content, encoding="utf-8")
+
+    errors = checker.validate_skill(valid_skill)
+
+    assert "missing prohibition on domain-based WorkflowStep schema rewrites" in errors

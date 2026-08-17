@@ -9,10 +9,10 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from embodied_common.primitive_contracts import SUPPORTED_PRIMITIVES
 from skill_catalog.models import (
     DELEGATED_ENDPOINT_KINDS,
-    EXECUTION_ENDPOINT_ROLES,
+    DISPATCH_KIND_CAPABILITY_BY_CONTEXT_VERSION,
+    EXECUTION_ENDPOINT_ROLES_BY_CONTEXT_VERSION,
     DelegatedExecutorDescriptor,
     SkillDiagnostic,
     SkillRobotContext,
@@ -23,13 +23,39 @@ SEMVER_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 SEMANTIC_LEVELS = frozenset({"atomic_operator", "skill"})
-CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning"})
+CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning", "base_navigation"})
+CONTROL_MODES_BY_SCHEMA_VERSION = {
+    1: frozenset({"teleop", "model_inference", "moveit_planning"}),
+    2: CONTROL_MODES,
+}
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
-CAPABILITY_PARAMETER_NAMES = frozenset(
-    {"target_name", "container_name", "place_name", "motion_direction", "motion_distance"}
+CAPABILITY_PARAMETER_NAMES_V1 = frozenset(
+    {
+        "target_name",
+        "container_name",
+        "place_name",
+        "motion_direction",
+        "motion_distance",
+    }
 )
+CAPABILITY_PARAMETER_NAMES = frozenset(
+    {
+        "direction",
+        "distance",
+        "degree",
+        "x",
+        "y",
+        "yaw",
+    }
+    | CAPABILITY_PARAMETER_NAMES_V1
+)
+CAPABILITY_PARAMETER_NAMES_BY_SCHEMA_VERSION = {
+    1: CAPABILITY_PARAMETER_NAMES_V1,
+    2: CAPABILITY_PARAMETER_NAMES,
+}
+SOURCE_SCHEMA_VERSIONS = frozenset({1, 2})
 
 MANIFEST_FIELDS = frozenset(
     {
@@ -163,11 +189,16 @@ def validate_manifest(
 ) -> list[SkillDiagnostic]:
     diagnostics: list[SkillDiagnostic] = []
     _exact_fields(manifest, MANIFEST_FIELDS, diagnostics, source_relative_path=source_relative_path)
-    if manifest.get("schema_version") != 1:
+    manifest_version = manifest.get("schema_version")
+    if (
+        not isinstance(manifest_version, int)
+        or isinstance(manifest_version, bool)
+        or manifest_version not in SOURCE_SCHEMA_VERSIONS
+    ):
         _error(
             diagnostics,
             "SKILL_SCHEMA_INVALID",
-            "schema_version must be 1",
+            "schema_version must be 1 or 2",
             source_relative_path=source_relative_path,
             field_path="schema_version",
         )
@@ -250,7 +281,7 @@ def validate_manifest(
             field_path="capability",
         )
     else:
-        _validate_capability(capability, diagnostics, source_relative_path)
+        _validate_capability(capability, diagnostics, source_relative_path, schema_version=manifest_version)
     implementations = manifest.get("implementations")
     if not isinstance(implementations, Mapping) or not implementations:
         _error(
@@ -286,15 +317,16 @@ def validate_implementation(
 ) -> tuple[list[SkillDiagnostic], dict[str, Any], frozenset[str]]:
     diagnostics: list[SkillDiagnostic] = []
     normalized = dict(implementation)
+    source_version = manifest.get("schema_version")
     kind = implementation.get("kind")
     if kind == "primitive_sequence":
         allowed = {"schema_version", "kind", "robot", "initial_gripper_state", "timeout_sec", "primitive_sequence"}
         _exact_fields(implementation, allowed, diagnostics, source_relative_path=source_relative_path)
-        if implementation.get("schema_version") != 1:
+        if implementation.get("schema_version") != source_version:
             _error(
                 diagnostics,
                 "SKILL_SCHEMA_INVALID",
-                "schema_version must be 1",
+                "implementation schema_version must match manifest schema_version",
                 source_relative_path=source_relative_path,
                 field_path="schema_version",
             )
@@ -348,7 +380,7 @@ def validate_implementation(
                 continue
             primitive_name = step.get("primitive_name")
             descriptor = primitive_contracts.get(primitive_name) if isinstance(primitive_name, str) else None
-            if descriptor is None or primitive_name not in SUPPORTED_PRIMITIVES:
+            if descriptor is None:
                 _error(
                     diagnostics,
                     "SKILL_REFERENCE_MISSING",
@@ -357,6 +389,33 @@ def validate_implementation(
                     field_path=f"{step_path}.primitive_name",
                 )
                 continue
+            if descriptor.schema_version != source_version:
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    "primitive descriptor schema_version must match source schema_version",
+                    source_relative_path=source_relative_path,
+                    field_path=f"{step_path}.primitive_name",
+                )
+            endpoint_role = descriptor.dispatch_kind
+            if endpoint_role not in context.execution_endpoints:
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    f"primitive dispatch requires execution endpoint role '{endpoint_role}'",
+                    source_relative_path=source_relative_path,
+                    field_path=f"{step_path}.primitive_name",
+                )
+            dispatch_capabilities = DISPATCH_KIND_CAPABILITY_BY_CONTEXT_VERSION.get(context.context_schema_version, {})
+            implied_capability = dispatch_capabilities.get(endpoint_role)
+            if implied_capability is None or implied_capability not in descriptor.required_runtime_capabilities:
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    "primitive dispatch capability contract is invalid",
+                    source_relative_path=source_relative_path,
+                    field_path=f"{step_path}.primitive_name",
+                )
             if primitive_name == "move_to_pose":
                 _error(
                     diagnostics,
@@ -403,11 +462,11 @@ def validate_implementation(
     if kind == "delegated_executor":
         allowed = {"schema_version", "kind", "robot", "executor", "required_args", "timeout_sec"}
         _exact_fields(implementation, allowed, diagnostics, source_relative_path=source_relative_path)
-        if implementation.get("schema_version") != 1:
+        if implementation.get("schema_version") != source_version:
             _error(
                 diagnostics,
                 "SKILL_SCHEMA_INVALID",
-                "schema_version must be 1",
+                "implementation schema_version must match manifest schema_version",
                 source_relative_path=source_relative_path,
                 field_path="schema_version",
             )
@@ -583,13 +642,19 @@ def _validate_description(
                 )
 
 
-def _validate_capability(capability: Mapping[str, Any], diagnostics: list[SkillDiagnostic], path: str) -> None:
+def _validate_capability(
+    capability: Mapping[str, Any],
+    diagnostics: list[SkillDiagnostic],
+    path: str,
+    *,
+    schema_version: int | None,
+) -> None:
     _exact_fields(capability, CAPABILITY_FIELDS, diagnostics, source_relative_path=path, field_path="capability")
-    if capability.get("schema_version") != 1:
+    if capability.get("schema_version") != schema_version:
         _error(
             diagnostics,
             "SKILL_SCHEMA_INVALID",
-            "schema_version must be 1",
+            "capability schema_version must match manifest schema_version",
             source_relative_path=path,
             field_path="capability.schema_version",
         )
@@ -610,7 +675,8 @@ def _validate_capability(capability: Mapping[str, Any], diagnostics: list[SkillD
             source_relative_path=path,
             field_path="capability.moves_robot",
         )
-    if capability.get("required_control_mode") not in CONTROL_MODES:
+    allowed_control_modes = CONTROL_MODES_BY_SCHEMA_VERSION.get(schema_version, frozenset())
+    if capability.get("required_control_mode") not in allowed_control_modes:
         _error(
             diagnostics,
             "SKILL_SCHEMA_INVALID",
@@ -618,7 +684,14 @@ def _validate_capability(capability: Mapping[str, Any], diagnostics: list[SkillD
             source_relative_path=path,
             field_path="capability.required_control_mode",
         )
-    _validate_parameter_schema(capability.get("parameters"), diagnostics, path, "capability.parameters")
+    allowed_parameter_names = CAPABILITY_PARAMETER_NAMES_BY_SCHEMA_VERSION.get(schema_version, frozenset())
+    _validate_parameter_schema(
+        capability.get("parameters"),
+        diagnostics,
+        path,
+        "capability.parameters",
+        allowed_parameter_names=allowed_parameter_names,
+    )
     if capability.get("recovery_policy") not in RECOVERY_POLICIES:
         _error(
             diagnostics,
@@ -629,7 +702,14 @@ def _validate_capability(capability: Mapping[str, Any], diagnostics: list[SkillD
         )
 
 
-def _validate_parameter_schema(schema: Any, diagnostics: list[SkillDiagnostic], path: str, field_path: str) -> None:
+def _validate_parameter_schema(
+    schema: Any,
+    diagnostics: list[SkillDiagnostic],
+    path: str,
+    field_path: str,
+    *,
+    allowed_parameter_names: frozenset[str],
+) -> None:
     if not isinstance(schema, Mapping):
         _error(
             diagnostics,
@@ -656,7 +736,7 @@ def _validate_parameter_schema(schema: Any, diagnostics: list[SkillDiagnostic], 
         or not isinstance(required, list)
         or len(set(required)) != len(required)
         or any(name not in properties for name in required)
-        or set(properties) - CAPABILITY_PARAMETER_NAMES
+        or set(properties) - allowed_parameter_names
     ):
         _error(
             diagnostics,
@@ -676,17 +756,36 @@ def _validate_parameter_schema(schema: Any, diagnostics: list[SkillDiagnostic], 
                 field_path=f"{field_path}.properties.{name}",
             )
             continue
-        if name == "motion_distance":
+        positive_numeric_units = {
+            "motion_distance": {"meters", "degrees"},
+            "distance": {"meters"},
+            "degree": {"degrees"},
+        }
+        signed_numeric_units = {"x": "meters", "y": "meters", "yaw": "degrees"}
+        if name in positive_numeric_units:
             if (
                 set(property_schema) != {"type", "exclusiveMinimum", "unit"}
                 or property_schema.get("type") != "number"
                 or property_schema.get("exclusiveMinimum") != 0
-                or property_schema.get("unit") not in {"meters", "degrees"}
+                or property_schema.get("unit") not in positive_numeric_units[name]
             ):
                 _error(
                     diagnostics,
                     "SKILL_SCHEMA_INVALID",
-                    "motion_distance schema is invalid",
+                    f"{name} schema is invalid",
+                    source_relative_path=path,
+                    field_path=f"{field_path}.properties.{name}",
+                )
+        elif name in signed_numeric_units:
+            if (
+                set(property_schema) != {"type", "unit"}
+                or property_schema.get("type") != "number"
+                or property_schema.get("unit") != signed_numeric_units[name]
+            ):
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    f"{name} schema is invalid",
                     source_relative_path=path,
                     field_path=f"{field_path}.properties.{name}",
                 )
@@ -726,6 +825,16 @@ def _validate_parameter_schema(schema: Any, diagnostics: list[SkillDiagnostic], 
                     diagnostics,
                     "SKILL_SCHEMA_INVALID",
                     "motion_direction enum is invalid",
+                    source_relative_path=path,
+                    field_path=f"{field_path}.properties.{name}",
+                )
+            if name == "direction" and any(
+                item not in {"forward", "backward", "left", "right"} for item in property_schema.get("enum", [])
+            ):
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    "direction enum is invalid",
                     source_relative_path=path,
                     field_path=f"{field_path}.properties.{name}",
                 )
@@ -871,17 +980,19 @@ def _validate_executor(
 
 def validate_robot_context(context: SkillRobotContext) -> list[SkillDiagnostic]:
     diagnostics: list[SkillDiagnostic] = []
-    if context.context_schema_version != 1:
+    endpoint_roles = EXECUTION_ENDPOINT_ROLES_BY_CONTEXT_VERSION.get(context.context_schema_version)
+    if endpoint_roles is None:
         _error(
             diagnostics, "SKILL_SCHEMA_INVALID", "unsupported robot context schema", field_path="context_schema_version"
         )
-    if context.required_control_mode not in CONTROL_MODES:
+    allowed_control_modes = CONTROL_MODES_BY_SCHEMA_VERSION.get(context.context_schema_version, frozenset())
+    if context.required_control_mode not in allowed_control_modes:
         _error(diagnostics, "SKILL_SCHEMA_INVALID", "invalid required control mode", field_path="required_control_mode")
-    if set(context.execution_endpoints) != EXECUTION_ENDPOINT_ROLES:
+    if endpoint_roles is not None and set(context.execution_endpoints) != endpoint_roles:
         _error(
             diagnostics,
             "SKILL_SCHEMA_INVALID",
-            "execution endpoint roles must match the v1 closed set",
+            f"execution endpoint roles must match the v{context.context_schema_version} closed set",
             field_path="execution_endpoints",
         )
     return diagnostics

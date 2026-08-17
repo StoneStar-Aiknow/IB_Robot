@@ -28,6 +28,7 @@ from embodied_common.dispatch_binding import (
     delegated_executor_identity_matches,
     fill_delegated_executor_identity,
 )
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from ibrobot_msgs.action import PlaceObject, PrimitiveCommand
 from ibrobot_msgs.msg import DetectionArray
 from ibrobot_msgs.srv import GroundingDetect, SegmentDetections
@@ -320,6 +321,7 @@ class PlacementExecutorNode(Node):
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("placement_executor_node", parameter_overrides=parameter_overrides)
+        validate_public_request_wire_contracts()
         self.declare_parameter("action_name", "/manipulation/execute_place")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("placement_execution_json", "{}")
@@ -850,6 +852,7 @@ class PlacementExecutorNode(Node):
     ) -> None:
         """Move the configured joints through the guarded primitive."""
         goal = PrimitiveCommand.Goal()
+        goal.schema_version = 1
         if self._dispatch_binding is not None:
             goal.dispatch_binding = copy_binding(self._dispatch_binding)
         if goal.dispatch_binding.task_id != task_id:
@@ -895,6 +898,7 @@ class PlacementExecutorNode(Node):
 
     def _open_gripper(self, goal_handle, deadline: float, task_id: str) -> float:
         goal = PrimitiveCommand.Goal()
+        goal.schema_version = 1
         if self._dispatch_binding is not None:
             goal.dispatch_binding = copy_binding(self._dispatch_binding)
         if goal.dispatch_binding.task_id != task_id:

@@ -505,7 +505,7 @@ SO-101 真机从启动、控制器检查、Hermes 自然语言计划展示并立
 # Hermes 通过 robot-skill 提交 Agent 计划
 robot-skill --config-name so101_single_arm plan-workflow \
   --request-id plan-request-001 --text "打开夹爪" \
-  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
+  --workflow-json '[{"schema_version":1,"skill_name":"open_gripper_skill"}]'
 ```
 
 更多配置说明见：

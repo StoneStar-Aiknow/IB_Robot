@@ -47,6 +47,13 @@ REQUIRED_RULES = {
     "on any nonzero exit, report the exact cli error and stop": "missing truthful nonzero-exit reporting rule",
     "call `plan-workflow` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
     "do not retry alternate phrasings": "missing prohibition: alternate workflow paraphrase retries",
+    "`workflow-json` is an array of flat `workflowstep` objects": (
+        "missing typed WorkflowStep schema_version requirement"
+    ),
+    "every object must include an explicit `schema_version`": ("missing typed WorkflowStep schema_version requirement"),
+    "never infer or rewrite `workflowstep.schema_version` from the skill domain": (
+        "missing prohibition on domain-based WorkflowStep schema rewrites"
+    ),
 }
 
 

@@ -7,7 +7,12 @@ from typing import Any
 from launch_ros.actions import Node
 
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
-from robot_config.loader import robot_config_digest
+from robot_config.loader import (
+    navigation_endpoint_projection,
+    robot_config_digest,
+    robot_context_schema_version,
+    validate_navigation_endpoint_contract,
+)
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
@@ -71,10 +76,22 @@ def generate_embodied_nodes(
         logger.info("Embodied minimal closure disabled, skipping")
         return []
 
+    required_control_mode = str(robot_config.get("skill_required_control_mode", "moveit_planning")).strip()
+    moveit_compatible = "moveit" in required_control_mode.lower() and "moveit" in active_control_mode.lower()
+    motion_mode_compatible = active_control_mode == required_control_mode or moveit_compatible
+    required_mode_error = (
+        "embodied minimal closure requires a MoveIt-compatible control mode"
+        if "moveit" in required_control_mode.lower()
+        else f"embodied minimal closure requires control_mode:={required_control_mode}"
+    )
+
     execution = embodied_config.get("execution", {})
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
     if entry_mode != "hermes":
         raise ValueError("embodied.entry_mode must be hermes")
+    endpoint_errors = validate_navigation_endpoint_contract(robot_config)
+    if endpoint_errors:
+        raise ValueError("; ".join(endpoint_errors))
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
     safety = embodied_config.get("safety", {})
@@ -149,6 +166,7 @@ def generate_embodied_nodes(
             "finalize_workflow_service", "/embodied/finalize_workflow_execution"
         ),
         "robot_name": robot_config.get("name", "unknown"),
+        "context_schema_version": robot_context_schema_version(robot_config),
         "config_digest": robot_config_digest(robot_config),
         "default_skill_timeout_sec": timeout_policy["default_skill_timeout_sec"],
         "task_budget_sec": timeout_policy["task_budget_sec"],
@@ -171,6 +189,9 @@ def generate_embodied_nodes(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
     }
+    navigation_action_name = navigation_endpoint_projection(robot_config)
+    if navigation_action_name is not None:
+        common_params["navigation_action_name"] = navigation_action_name
     perception_node = None
     if perception.get("enabled", False):
         perception_node = Node(
@@ -269,23 +290,18 @@ def generate_embodied_nodes(
         if perception_node is not None and include_perception:
             visual_nodes.append(perception_node)
 
-    non_moveit = "moveit" not in active_control_mode.lower()
     has_visual_closure = visual_game_gateway_node is not None
 
     if not include_motion:
-        if non_moveit and not has_visual_closure:
-            raise ValueError(
-                "embodied minimal closure requires a MoveIt-compatible control mode when no visual game is enabled"
-            )
+        if not motion_mode_compatible and not has_visual_closure:
+            raise ValueError(required_mode_error)
         return visual_nodes
 
-    if non_moveit:
+    if not motion_mode_compatible:
         if not include_visual_games:
             return []
         if not has_visual_closure:
-            raise ValueError(
-                "embodied minimal closure requires a MoveIt-compatible control mode when no visual game is enabled"
-            )
+            raise ValueError(required_mode_error)
         logger.info("Embodied visual-game closure enabled without motion nodes")
         return visual_nodes
 

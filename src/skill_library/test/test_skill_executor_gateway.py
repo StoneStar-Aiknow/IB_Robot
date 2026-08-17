@@ -16,9 +16,10 @@ from rclpy.parameter import Parameter
 from unique_identifier_msgs.msg import UUID
 
 from embodied_common.dispatch_binding import copy_binding, new_binding, workflow_step
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, PRIMITIVE_CONTRACT_V2
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
-from ibrobot_msgs.action import ExecuteTaskPlan, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.action import ExecuteNavigation, ExecuteTaskPlan, PrimitiveCommand, SkillCommand
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
     FinalizeWorkflowExecution,
@@ -89,9 +90,19 @@ def _write_yaml(path, data) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=True), encoding="utf-8")
 
 
-def _skill_manifest(name, summary, *, parameters, recovery_policy, anchor_pose, profile_name, intensity="moderate"):
+def _skill_manifest(
+    name,
+    summary,
+    *,
+    parameters,
+    recovery_policy,
+    anchor_pose,
+    profile_name,
+    intensity="moderate",
+    schema_version=1,
+):
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "name": name,
         "version": "1.0.0",
         "semantic_level": "atomic_operator",
@@ -104,7 +115,7 @@ def _skill_manifest(name, summary, *, parameters, recovery_policy, anchor_pose, 
             "anchor_pose": anchor_pose,
         },
         "capability": {
-            "schema_version": 1,
+            "schema_version": schema_version,
             "summary": summary,
             "domain": "manipulation",
             "moves_robot": True,
@@ -116,9 +127,9 @@ def _skill_manifest(name, summary, *, parameters, recovery_policy, anchor_pose, 
     }
 
 
-def _skill_implementation(profile_name, primitive_sequence):
+def _skill_implementation(profile_name, primitive_sequence, *, schema_version=1):
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "kind": "primitive_sequence",
         "robot": profile_name,
         "initial_gripper_state": "none",
@@ -127,17 +138,23 @@ def _skill_implementation(profile_name, primitive_sequence):
     }
 
 
-def _write_test_catalog(root, profile_name, *, include_relative=True, bad_primitive=False) -> None:
+def _write_test_catalog(
+    root, profile_name, *, include_relative=True, include_navigation=False, bad_primitive=False
+) -> None:
     """Stage a minimal DevelopmentStagingSkillSource catalog (move [+ relative] [+ bad])."""
     skills_dir = root / "config" / "skills"
     profiles_dir = root / "config" / "profiles"
     profiles_dir.mkdir(parents=True, exist_ok=True)
 
-    enabled_skills = [{"name": "move", "implementation": profile_name, "planner_visible": True}]
-    if include_relative:
+    enabled_skills = (
+        [] if include_navigation else [{"name": "move", "implementation": profile_name, "planner_visible": True}]
+    )
+    if include_relative and not include_navigation:
         enabled_skills.append({"name": "relative", "implementation": profile_name, "planner_visible": True})
     if bad_primitive:
         enabled_skills.append({"name": "bad", "implementation": profile_name, "planner_visible": True})
+    if include_navigation:
+        enabled_skills.append({"name": "nav_straight", "implementation": profile_name, "planner_visible": True})
 
     _write_yaml(
         profiles_dir / f"{profile_name}.yaml",
@@ -217,6 +234,38 @@ def _write_test_catalog(root, profile_name, *, include_relative=True, bad_primit
             _skill_implementation(profile_name, [{"primitive_name": "definitely_not_a_real_primitive"}]),
         )
 
+    if include_navigation:
+        manifest = _skill_manifest(
+            "nav_straight",
+            "Translate the mobile base by a requested distance.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                    "distance": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+                },
+                "required": ["direction", "distance"],
+                "additionalProperties": False,
+            },
+            recovery_policy="ask_user",
+            anchor_pose="none",
+            profile_name=profile_name,
+            schema_version=2,
+        )
+        manifest["description"]["category"] = "navigation"
+        manifest["description"]["motion_scope"] = ["base"]
+        manifest["capability"]["domain"] = "navigation"
+        manifest["capability"]["required_control_mode"] = "base_navigation"
+        _write_yaml(skills_dir / "nav_straight" / "manifest.yaml", manifest)
+        _write_yaml(
+            skills_dir / "nav_straight" / "implementations" / f"{profile_name}.yaml",
+            _skill_implementation(
+                profile_name,
+                [{"primitive_name": "nav_straight", "direction_from_request": True, "distance_from_request": True}],
+                schema_version=2,
+            ),
+        )
+
 
 def _assert_test_ros_environment() -> None:
     expected_domain = os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID")
@@ -264,6 +313,7 @@ def gateway_rig(request, tmp_path):
         "ee_pose": f"/{suffix}/ee_pose",
         "finalize_workflow": f"/{suffix}/finalize_workflow",
         "joint_state": f"/{suffix}/joint_state",
+        "navigation": f"/{suffix}/navigation",
         "primitive": f"/{suffix}/primitive",
         "reload": f"/{suffix}/reload",
         "skill": f"/{suffix}/skill",
@@ -277,6 +327,7 @@ def gateway_rig(request, tmp_path):
     hold_task_executor = test_config.pop("_hold_task_executor", False)
     hold_validate_primitive = test_config.pop("_hold_validate_primitive", False)
     serve_task_executor = hold_task_executor or test_config.pop("_task_executor", False)
+    serve_navigation = test_config.pop("_navigation", False)
     mock_node = rclpy.create_node(f"mock_{suffix}")
     client_node = rclpy.create_node(f"client_{suffix}")
 
@@ -306,12 +357,18 @@ def gateway_rig(request, tmp_path):
 
     mock_node.create_service(ValidateSkill, names["validate_skill"], validate_skill)
     mock_node.create_service(ValidatePrimitive, names["validate_primitive"], validate_primitive)
-    _write_test_catalog(tmp_path, profile_name)
+    _write_test_catalog(
+        tmp_path,
+        profile_name,
+        include_relative=not serve_navigation,
+        include_navigation=serve_navigation,
+    )
     overrides = {
         "active_control_mode": _TEST_CONTROL_MODE,
         "arm_trajectory_action_name": names["arm"],
         "begin_workflow_service": names["begin_workflow"],
         "cmd_pose_topic": names["cmd_pose"],
+        "context_schema_version": 2 if serve_navigation else 1,
         "default_skill_timeout_sec": 2.5,
         "ee_pose_topic": names["ee_pose"],
         "finalize_workflow_service": names["finalize_workflow"],
@@ -320,6 +377,7 @@ def gateway_rig(request, tmp_path):
         "gripper_settle_sec": 0.4,
         "model_idle_timeout_sec": 8.0,
         "motion_authorized": True,
+        "navigation_action_name": names["navigation"],
         "named_poses_json": json.dumps({"home": {}}),
         "primitive_action_name": names["primitive"],
         "robot_name": profile_name,
@@ -370,6 +428,21 @@ def gateway_rig(request, tmp_path):
     downstream_goals = []
     task_ids = []
     task_server = None
+    navigation_goals = []
+    navigation_server = None
+    if serve_navigation:
+
+        def execute_navigation(goal_handle):
+            navigation_goals.append(goal_handle.request)
+            result = ExecuteNavigation.Result()
+            result.success = True
+            result.error_code = ExecuteNavigation.Result.NONE
+            goal_handle.succeed()
+            return result
+
+        navigation_server = ActionServer(mock_node, ExecuteNavigation, names["navigation"], execute_navigation)
+        _wait_for(executor_node._navigation_client.server_is_ready)
+
     if serve_task_executor:
         task_calls = []
 
@@ -398,6 +471,8 @@ def gateway_rig(request, tmp_path):
         executor_node=executor_node,
         finalize_workflow_client=finalize_workflow_client,
         names=names,
+        navigation_goals=navigation_goals,
+        navigation_server=navigation_server,
         overrides=overrides,
         primitive_client=primitive_client,
         reload_client=reload_client,
@@ -421,8 +496,9 @@ def gateway_rig(request, tmp_path):
             node.destroy_node()
 
 
-def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move"):
+def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move", schema_version: int | None = None):
     goal = SkillCommand.Goal()
+    goal.schema_version = schema_version if schema_version is not None else (2 if skill_name.startswith("nav_") else 1)
     goal.dispatch_binding = new_binding(task_id=task_id)
     status = _get_status(rig)
     goal.dispatch_binding.expected_registry_epoch = status.registry_epoch
@@ -433,6 +509,9 @@ def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move"):
     goal.place_name = ""
     goal.motion_direction = ""
     goal.motion_distance = 0.0
+    if skill_name == "nav_straight":
+        goal.direction = "forward"
+        goal.distance = 1.0
     goal.timeout_sec = 0.0
     goal_handle = _future_result(rig.skill_client.send_goal_async(goal))
     assert goal_handle.accepted
@@ -451,6 +530,12 @@ def _set_root_identity(rig, binding) -> None:
     binding.expected_registry_epoch = status.registry_epoch
     binding.expected_registry_generation = status.registry_generation
     binding.expected_registry_digest = status.registry_digest
+
+
+def test_v1_executor_does_not_create_navigation_action_client(gateway_rig):
+    assert gateway_rig.executor_node._context_schema_version == 1
+    assert not hasattr(gateway_rig.executor_node, "_navigation_client")
+    assert gateway_rig.executor_node._runtime_snapshot().navigation_ready is False
 
 
 def test_snapshot_service_response_matches_generated_contract(gateway_rig):
@@ -572,6 +657,7 @@ def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gatew
 
     def send_child(index: int):
         goal = SkillCommand.Goal()
+        goal.schema_version = 1
         goal.dispatch_binding = copy_binding(root_binding)
         goal.dispatch_binding.task_id = derive_skill_task_id(root_task_id, index)
         goal.dispatch_binding.workflow_step_index = index
@@ -585,6 +671,8 @@ def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gatew
     out_of_order = send_child(1)
     assert out_of_order.success is False
     assert out_of_order.error_code == "SKILL_WORKFLOW_STEP_MISMATCH"
+    first_result = send_child(0)
+    assert first_result.success is True
     assert send_child(0).success is True
     assert send_child(1).success is True
 
@@ -600,6 +688,97 @@ def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gatew
     assert finalized.actual_completed_step_count == 2
     assert repeated_finalize.success is True
     assert _get_status(gateway_rig, task_id=root_task_id).request_state == "terminal"
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [{"_navigation": True, "active_control_mode": "base_navigation", "skill_required_control_mode": "base_navigation"}],
+    indirect=True,
+)
+def test_typed_workflow_executes_schema_v2_navigation_child(gateway_rig):
+    status = _get_status(gateway_rig)
+    root_task_id = "workflow-navigation"
+    root_binding = new_binding(task_id=root_task_id)
+    root_binding.expected_registry_epoch = status.registry_epoch
+    root_binding.expected_registry_generation = status.registry_generation
+    root_binding.expected_registry_digest = status.registry_digest
+    started = time.time()
+    deadline = started + 8.0
+    root_binding.task_budget.schema_version = 1
+    root_binding.task_budget.started_at.sec = int(started)
+    root_binding.task_budget.started_at.nanosec = int((started - int(started)) * 1_000_000_000)
+    root_binding.task_budget.deadline.sec = int(deadline)
+    root_binding.task_budget.deadline.nanosec = int((deadline - int(deadline)) * 1_000_000_000)
+    steps = [
+        workflow_step(
+            schema_version=2,
+            skill_name="nav_straight",
+            direction="forward",
+            distance=1.25,
+            timeout_sec=2.5,
+        )
+    ]
+    root_binding.workflow_digest = compute_workflow_digest(
+        root_task_id=root_task_id,
+        task_budget=root_binding.task_budget,
+        expected_registry_epoch=status.registry_epoch,
+        expected_registry_generation=status.registry_generation,
+        expected_registry_digest=status.registry_digest,
+        workflow_steps=steps,
+    )
+    begin_request = BeginWorkflowExecution.Request()
+    begin_request.dispatch_binding = root_binding
+    begin_request.workflow_steps = steps
+    began = _future_result(gateway_rig.begin_workflow_client.call_async(begin_request))
+    assert began.success is True
+
+    goal = SkillCommand.Goal()
+    goal.schema_version = 2
+    goal.dispatch_binding = copy_binding(root_binding)
+    goal.dispatch_binding.task_id = derive_skill_task_id(root_task_id, 0)
+    goal.dispatch_binding.workflow_step_index = 0
+    goal.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+    goal.skill_name = "nav_straight"
+    goal.direction = "forward"
+    goal.distance = 1.25
+    goal.timeout_sec = 2.5
+    goal_handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
+    result = _future_result(goal_handle.get_result_async()).result
+
+    assert result.success is True
+    assert result.error_code == ""
+    assert len(gateway_rig.navigation_goals) == 1
+    assert gateway_rig.navigation_goals[0].command_type == ExecuteNavigation.Goal.FORWARD
+    assert gateway_rig.navigation_goals[0].value == pytest.approx(1.25)
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [{"_navigation": True, "active_control_mode": "base_navigation", "skill_required_control_mode": "base_navigation"}],
+    indirect=True,
+)
+def test_direct_navigation_rejects_hidden_coordinate_value(gateway_rig):
+    status = _get_status(gateway_rig)
+    goal = SkillCommand.Goal()
+    goal.schema_version = 2
+    goal.dispatch_binding = new_binding(task_id="hidden-coordinate")
+    goal.dispatch_binding.expected_registry_epoch = status.registry_epoch
+    goal.dispatch_binding.expected_registry_generation = status.registry_generation
+    goal.dispatch_binding.expected_registry_digest = status.registry_digest
+    goal.skill_name = "nav_straight"
+    goal.direction = "forward"
+    goal.distance = 1.0
+    goal.has_x = False
+    goal.x = 5.0
+    goal.timeout_sec = 2.5
+
+    goal_handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
+    result = _future_result(goal_handle.get_result_async()).result
+
+    assert result.success is False
+    assert result.error_code == "SKILL_REJECTED"
+    assert "has_x is false" in result.message
+    assert gateway_rig.navigation_goals == []
 
 
 def _begin_single_step_workflow(rig, root_task_id: str):
@@ -634,6 +813,7 @@ def _begin_single_step_workflow(rig, root_task_id: str):
 
 def _send_workflow_child(rig, binding, root_lease_nonce: str):
     goal = SkillCommand.Goal()
+    goal.schema_version = 1
     goal.dispatch_binding = copy_binding(binding)
     goal.dispatch_binding.task_id = derive_skill_task_id(binding.root_task_id, 0)
     goal.dispatch_binding.workflow_step_index = 0
@@ -775,11 +955,22 @@ def _status_snapshot(**overrides) -> RuntimeSnapshot:
 
 def _primitive_goal(task_id: str, rig=None) -> PrimitiveCommand.Goal:
     goal = PrimitiveCommand.Goal()
+    goal.schema_version = 1
     goal.dispatch_binding = new_binding(task_id=task_id)
     if rig is not None:
         _set_root_identity(rig, goal.dispatch_binding)
     goal.primitive_name = "move_to_named_pose"
     goal.pose_name = "home"
+    return goal
+
+
+def _navigation_primitive_goal(task_id: str, rig=None, *, schema_version: int = 2) -> PrimitiveCommand.Goal:
+    goal = _primitive_goal(task_id, rig)
+    goal.schema_version = schema_version
+    goal.primitive_name = "nav_straight"
+    goal.pose_name = ""
+    goal.navigation_command_type = ExecuteNavigation.Goal.FORWARD
+    goal.navigation_value = 1.0
     return goal
 
 
@@ -821,6 +1012,7 @@ def test_unauthorized_skill_does_not_dispatch_primitive(gateway_rig, monkeypatch
 
 def test_direct_skill_rejects_incomplete_registry_binding(gateway_rig):
     goal = SkillCommand.Goal()
+    goal.schema_version = 1
     goal.dispatch_binding = new_binding(task_id="missing-identity")
     goal.skill_name = "move"
 
@@ -833,6 +1025,7 @@ def test_direct_skill_rejects_incomplete_registry_binding(gateway_rig):
 
 def test_zero_budget_root_rejects_timeout_over_catalog_entry_cap(gateway_rig):
     goal = SkillCommand.Goal()
+    goal.schema_version = 1
     goal.dispatch_binding = new_binding(task_id="full-root-budget")
     _set_root_identity(gateway_rig, goal.dispatch_binding)
     goal.skill_name = "move"
@@ -898,6 +1091,117 @@ def test_gateway_config_digest_equals_capability_digest(gateway_rig):
     assert status.config_digest
     assert gateway_rig.executor_node._gateway_timeout_policy == _expected_timeout_policy(gateway_rig.overrides)
     assert not gateway_rig.executor_node.has_parameter("skill_templates_json")
+
+
+def test_v1_gateway_status_uses_v1_primitive_contract_digest(gateway_rig):
+    status = _get_status(gateway_rig)
+
+    assert status.primitive_contract_digest == PRIMITIVE_CONTRACT_V1.digest
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [{"_navigation": True, "active_control_mode": "base_navigation", "skill_required_control_mode": "base_navigation"}],
+    indirect=True,
+)
+def test_v2_gateway_status_uses_v2_primitive_contract_digest(gateway_rig):
+    status = _get_status(gateway_rig)
+
+    assert status.primitive_contract_digest == PRIMITIVE_CONTRACT_V2.digest
+
+
+@pytest.mark.parametrize(
+    ("gateway_rig", "skill_name", "submitted_version", "capability_version", "task_id"),
+    [
+        (
+            {
+                "_navigation": True,
+                "active_control_mode": "base_navigation",
+                "skill_required_control_mode": "base_navigation",
+            },
+            "nav_straight",
+            1,
+            2,
+            "skill-v1-to-capability-v2",
+        ),
+        ({"_task_executor": True}, "move", 2, 1, "skill-v2-to-capability-v1"),
+    ],
+    indirect=["gateway_rig"],
+)
+def test_skill_version_mismatch_fails_before_gateway_side_effects(
+    gateway_rig, monkeypatch, skill_name, submitted_version, capability_version, task_id
+):
+    before = _get_status(gateway_rig)
+    capability = gateway_rig.executor_node._runtime_coordinator.current.snapshot.capability_view[skill_name]
+    assert capability.get("schema_version", 1) == capability_version
+    validation_calls = []
+    monkeypatch.setattr(
+        gateway_rig.executor_node,
+        "_validate_skill",
+        lambda *_args, **_kwargs: validation_calls.append(True) or (True, ""),
+    )
+
+    result = _send_skill(
+        gateway_rig,
+        task_id=task_id,
+        skill_name=skill_name,
+        schema_version=submitted_version,
+    )
+    after = _get_status(gateway_rig, task_id=task_id)
+
+    assert result.success is False
+    assert result.error_code == "SKILL_SCHEMA_INVALID"
+    assert gateway_rig.executor_node._gateway_lease.owner is None
+    assert gateway_rig.executor_node._gateway_ledger.get(task_id) is None
+    assert validation_calls == []
+    assert gateway_rig.downstream_goals == []
+    assert gateway_rig.navigation_goals == []
+    assert after.request_state == ""
+    assert after.active_task_id == ""
+    assert after.motion_authorized == before.motion_authorized
+
+
+@pytest.mark.parametrize(
+    ("gateway_rig", "submitted_version", "primitive_name", "task_id"),
+    [
+        (
+            {
+                "_navigation": True,
+                "active_control_mode": "base_navigation",
+                "skill_required_control_mode": "base_navigation",
+            },
+            1,
+            "nav_straight",
+            "primitive-v1-to-descriptor-v2",
+        ),
+        ({"_task_executor": True}, 2, "move_to_named_pose", "primitive-v2-to-descriptor-v1"),
+    ],
+    indirect=["gateway_rig"],
+)
+def test_primitive_version_mismatch_fails_before_gateway_side_effects(
+    gateway_rig, submitted_version, primitive_name, task_id
+):
+    before = _get_status(gateway_rig)
+    if primitive_name == "nav_straight":
+        goal = _navigation_primitive_goal(task_id, gateway_rig, schema_version=submitted_version)
+    else:
+        goal = _primitive_goal(task_id, gateway_rig)
+        goal.schema_version = submitted_version
+
+    goal_handle = _future_result(gateway_rig.primitive_client.send_goal_async(goal))
+    result = _future_result(goal_handle.get_result_async()).result
+    after = _get_status(gateway_rig, task_id=task_id)
+
+    assert result.success is False
+    assert result.error_code == "SKILL_SCHEMA_INVALID"
+    assert gateway_rig.executor_node._gateway_lease.owner is None
+    assert gateway_rig.executor_node._gateway_ledger.get(task_id) is None
+    assert gateway_rig.validate_primitive_calls == []
+    assert gateway_rig.downstream_goals == []
+    assert gateway_rig.navigation_goals == []
+    assert after.request_state == ""
+    assert after.active_task_id == ""
+    assert after.motion_authorized == before.motion_authorized
 
 
 def test_constructor_declares_catalog_parameters_and_drops_legacy_template_parameter(tmp_path):
@@ -968,6 +1272,7 @@ def test_internal_relative_primitive_rejects_pose_stale_after_root_admission(gat
 
     monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", validate_skill)
     goal = SkillCommand.Goal()
+    goal.schema_version = 1
     goal.dispatch_binding = new_binding(task_id="stale-internal")
     _set_root_identity(gateway_rig, goal.dispatch_binding)
     goal.skill_name = "relative"
@@ -1012,7 +1317,14 @@ def test_external_relative_primitive_rejects_stale_pose_before_validation_or_dis
 
 @pytest.mark.parametrize(
     "gateway_rig",
-    [{"_hold_validate_primitive": True, "_task_executor": True, "rpc_timeout_sec": 1.0}],
+    [
+        {
+            "_hold_validate_primitive": True,
+            "_task_executor": True,
+            "robot_state_freshness_sec": 0.5,
+            "rpc_timeout_sec": 1.0,
+        }
+    ],
     indirect=True,
 )
 def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_validation(gateway_rig):
@@ -1078,6 +1390,7 @@ def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_s
 @pytest.mark.parametrize("gateway_rig", [{"_hold_task_executor": True}], indirect=True)
 def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_rig):
     root_goal = SkillCommand.Goal()
+    root_goal.schema_version = 1
     root_goal.dispatch_binding = new_binding(task_id="active-task")
     _set_root_identity(gateway_rig, root_goal.dispatch_binding)
     root_goal.skill_name = "move"
@@ -1109,6 +1422,7 @@ def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_
 @pytest.mark.parametrize("gateway_rig", [{"_hold_task_executor": True}], indirect=True)
 def test_root_skill_busy_rejection_preserves_admission_reason(gateway_rig, monkeypatch):
     root_goal = SkillCommand.Goal()
+    root_goal.schema_version = 1
     root_goal.dispatch_binding = new_binding(task_id="active-task")
     _set_root_identity(gateway_rig, root_goal.dispatch_binding)
     root_goal.skill_name = "move"

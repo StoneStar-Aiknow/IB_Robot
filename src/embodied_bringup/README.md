@@ -67,11 +67,12 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | --- | --- | --- |
 | `robot_config` | `so101_single_arm` | robot_config 中的机器人配置名 |
 | `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
-| `control_mode` | `moveit_planning` | 具身闭环当前要求 MoveIt 兼容控制模式 |
+| `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
+| `nav_stage` | 空 | 可选导航阶段；`navigation` 启用导航闭环，`mapping` 默认不启动具身运行时 |
 | `use_sim` | `false` | 是否启动仿真路径 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |
-| `with_embodied` | `true` | 是否启动具身运行时节点 |
+| `with_embodied` | 空 | 默认启动具身运行时；`nav_stage=mapping` 时默认关闭，可显式覆盖 |
 | `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
 | `authorize_motion` | `false` | 操作员运动授权；唯一运行时授权来源 |
 
@@ -79,6 +80,7 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 
 - 运动技能闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。仅启用视觉游戏时
   可在其他控制模式启动 Gateway + perception，不启动 safety/skill/planner/executor 等运动节点。
+- 机械臂 profile 要求 MoveIt 兼容控制模式；`lekiwi_lidar` 导航 profile 精确要求 `base_navigation`。
 - 自然语言规则入口只支持观察、回位、夹爪开合、相对移动和夹爪旋转等最小闭环动作。
 - 抓取、放置、目标物操作当前不由规则入口直接生成；应通过后续 VLM/显式技能链路完善。
 - 视觉趣味游戏（分院帽等）的能力开关来自 `embodied.visual_games`；camera/VLM 由

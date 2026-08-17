@@ -1,11 +1,11 @@
 from pathlib import Path
 
 import pytest
+
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.models import SkillCompileContext, SkillCompileError, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
-
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 
 
 def _context() -> SkillCompileContext:
@@ -111,6 +111,7 @@ def test_compiler_builds_immutable_snapshot(tmp_path):
     assert snapshot.enabled_skill_names == ("open_gripper_skill",)
     assert snapshot.planner_visible_skill_names == ("open_gripper_skill",)
     assert snapshot.capability_view["open_gripper_skill"]["semantic_level"] == "atomic_operator"
+    assert "schema_version" not in snapshot.capability_view["open_gripper_skill"]
     with pytest.raises(TypeError):
         snapshot.templates["new"] = {}
 

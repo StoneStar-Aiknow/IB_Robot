@@ -25,7 +25,7 @@ def test_navigation_command_api_and_cli_are_installed():
     assert "nav_cmd = robot_navigation.nav_cmd:main" in setup_content
     assert "nav_request =" not in setup_content
     cli_content = cli.read_text(encoding="utf-8")
-    assert "/navigation/execute" in cli_content
+    assert "/navigation/execute" not in cli_content
     assert "/navigation/cancel_current" in cli_content
     assert '"leftward": ExecuteNavigation.Goal.STRAFE_LEFT' in cli_content
     assert '"rightward": ExecuteNavigation.Goal.STRAFE_RIGHT' in cli_content

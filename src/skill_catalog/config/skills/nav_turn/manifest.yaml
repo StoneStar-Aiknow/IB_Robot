@@ -1,0 +1,44 @@
+schema_version: 2
+name: nav_turn
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Rotate the mobile base in a requested direction by a requested angle.
+  category: navigation
+  when_to_use:
+  - turn the robot left by a known angle
+  - turn the robot right by a known angle
+  aliases_en:
+  - rotate the base
+  - turn in place
+  motion_scope:
+  - base
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: true
+capability:
+  schema_version: 2
+  summary: Rotate the mobile base left or right.
+  domain: navigation
+  moves_robot: true
+  required_control_mode: base_navigation
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      direction:
+        type: string
+        enum:
+        - left
+        - right
+      degree:
+        type: number
+        exclusiveMinimum: 0
+        unit: degrees
+    required:
+    - direction
+    - degree
+  recovery_policy: ask_user
+implementations:
+  lekiwi_navigation_v2: implementations/lekiwi_navigation_v2.yaml

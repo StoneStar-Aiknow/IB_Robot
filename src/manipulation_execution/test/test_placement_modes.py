@@ -380,12 +380,34 @@ def test_joint_target_dispatches_guarded_primitive_fields_in_configured_order():
 
     assert len(sent_goals) == 1
     goal = sent_goals[0]
+    assert goal.schema_version == 1
     assert goal.dispatch_binding.task_id == "place-test"
     assert goal.dispatch_binding.dispatch_nonce == "delegated-nonce"
     assert goal.primitive_name == "move_to_joint_positions"
     assert list(goal.joint_names) == ["1", "2", "3", "4", "5"]
     assert list(goal.joint_positions) == pytest.approx([-0.047553, -0.073631, -0.840621, 1.497165, -1.570790])
     assert goal.primitive_duration_sec == pytest.approx(10.0)
+
+
+def test_open_gripper_dispatches_versioned_primitive_goal():
+    node = PlacementExecutorNode.__new__(PlacementExecutorNode)
+    node._dispatch_binding = _binding("place-test")
+    node._gripper_open = 1.0
+    sent_goals = []
+    node._primitive_client = type(
+        "PrimitiveClient",
+        (),
+        {"send_goal_async": lambda _self, goal: sent_goals.append(goal) or object()},
+    )()
+    handle = type("Handle", (), {"accepted": True, "get_result_async": lambda _self: object()})()
+    wrapped = type("Wrapped", (), {"result": type("Result", (), {"success": True})()})()
+    responses = iter([handle, wrapped])
+    node._wait_future = lambda *_args, **_kwargs: next(responses)
+
+    node._open_gripper(SimpleNamespace(goal_id=None), time.monotonic() + 60.0, "place-test")
+
+    assert sent_goals[0].schema_version == 1
+    assert sent_goals[0].primitive_name == "open_gripper"
 
 
 def test_execute_place_moves_joint_3_to_verify_then_returns_to_release_pose():

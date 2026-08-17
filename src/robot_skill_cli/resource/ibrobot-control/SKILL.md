@@ -39,9 +39,12 @@ By default, omit `--timeout-sec` from both commands so both use the current Gate
 budget from `default_skill_timeout_sec`. Only when the user explicitly requests a smaller budget, append the same
 `--timeout-sec SEC` value to both commands. Never change the budget after confirmation.
 
-`workflow-json` is an array of flat `WorkflowStep` objects. Skill arguments are top-level fields, for example
-`[{"skill_name":"pick_object","target_name":"marker"}]`. Never use `skill`, a nested `parameters` object, or a bare
-object. Invoke `plan-workflow` once with all three required options; do not probe it with an incomplete command.
+`workflow-json` is an array of flat `WorkflowStep` objects. Every object must include an explicit `schema_version`.
+Use `schema_version: 1` for legacy non-navigation contracts and `schema_version: 2` for navigation contracts. Skill
+arguments are top-level fields, for example
+`[{"schema_version":1,"skill_name":"pick_object","target_name":"marker"}]`. Never use `skill`, a nested
+`parameters` object, or a bare object. Never infer or rewrite `WorkflowStep.schema_version` from the skill domain. Invoke
+`plan-workflow` once with all three required options; do not probe it with an incomplete command.
 
 Construct request IDs and task IDs directly in the conversation and `robot-skill` arguments. Do not call Python,
 `uuidgen`, `date`, a shell, or any other helper tool to generate them. A command approval, including session-wide

@@ -11,11 +11,15 @@
 # schema_version on DispatchBinding is 1 in v1.
 
 # --- Goal ---
+uint32 schema_version
 DispatchBinding dispatch_binding
 # Correlation token derived from the parent PickObject goal UUID. Authorization
 # is always decided from dispatch_binding; callers must not use this as a lease.
 string execution_token
 string primitive_name
+uint8 navigation_command_type
+geometry_msgs/PoseStamped navigation_target_pose
+float64 navigation_value
 string pose_name
 geometry_msgs/Pose target_pose
 float32 relative_dx

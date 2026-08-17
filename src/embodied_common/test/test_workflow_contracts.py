@@ -68,6 +68,7 @@ def test_workflow_step_normalization_is_typed():
     )
     assert steps[0].to_dict()["skill_name"] == "move_relative_ee"
     assert steps[0].to_dict()["motion_direction"] == "left"
+    assert steps[0] == CanonicalWorkflowStep(1, "move_relative_ee", motion_direction="left", motion_distance=0.05)
 
 
 @pytest.mark.parametrize("distance", [float("nan"), float("inf"), -0.1])
@@ -79,3 +80,41 @@ def test_workflow_step_rejects_invalid_distance(distance):
 def test_workflow_rejects_more_than_sixteen_steps():
     with pytest.raises(ValueError, match="maximum of 16"):
         normalize_workflow_steps([CanonicalWorkflowStep(1, f"skill-{index}") for index in range(17)])
+
+
+def test_workflow_v2_preserves_navigation_parameters_and_explicit_zero():
+    step = CanonicalWorkflowStep(
+        2,
+        "nav_abs_coordinate",
+        direction=" LEFT ",
+        distance=1.25,
+        degree=90.0,
+        x=0.0,
+        y=-2.5,
+        yaw=-180.0,
+    ).to_dict()
+
+    assert step["schema_version"] == 2
+    assert step["direction"] == "left"
+    assert step["distance"] == 1.25
+    assert step["degree"] == 90.0
+    assert (step["has_x"], step["x"]) == (True, 0.0)
+    assert (step["has_y"], step["y"]) == (True, -2.5)
+    assert (step["has_yaw"], step["yaw"]) == (True, -180.0)
+
+
+def test_workflow_v2_distinguishes_absent_coordinate_from_explicit_zero():
+    absent, explicit_zero = normalize_workflow_steps(
+        [
+            {"schema_version": 2, "skill_name": "nav_abs_coordinate"},
+            {"schema_version": 2, "skill_name": "nav_abs_coordinate", "x": 0.0},
+        ]
+    )
+
+    assert (absent.to_dict()["has_x"], absent.to_dict()["x"]) == (False, 0.0)
+    assert (explicit_zero.to_dict()["has_x"], explicit_zero.to_dict()["x"]) == (True, 0.0)
+
+
+def test_workflow_v1_rejects_navigation_parameters():
+    with pytest.raises(ValueError, match="schema_version 2"):
+        CanonicalWorkflowStep(1, "nav_straight", direction="forward", distance=1.0)

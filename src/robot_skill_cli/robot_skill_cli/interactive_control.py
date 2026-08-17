@@ -306,7 +306,7 @@ class InteractiveController:
     def _workflow_steps_match(requested: list[dict[str, Any]], planned: list[dict[str, Any]]) -> bool:
         if len(requested) != len(planned):
             return False
-        text_fields = ("skill_name", "target_name", "place_name", "motion_direction")
+        text_fields = ("skill_name", "target_name", "container_name", "place_name", "motion_direction", "direction")
         for expected, actual in zip(requested, planned, strict=True):
             if int(actual.get("schema_version", 0)) != int(expected.get("schema_version", 0)):
                 return False
@@ -314,6 +314,17 @@ class InteractiveController:
                 return False
             for field in ("motion_distance", "timeout_sec"):
                 if _float32(actual.get(field, 0.0)) != _float32(expected.get(field, 0.0)):
+                    return False
+            for field in ("distance", "degree"):
+                if float(actual.get(field, 0.0)) != float(expected.get(field, 0.0)):
+                    return False
+            for field in ("x", "y", "yaw"):
+                has_field = f"has_{field}"
+                if bool(actual.get(has_field, False)) != bool(expected.get(has_field, False)):
+                    return False
+                if bool(expected.get(has_field, False)) and float(actual.get(field, 0.0)) != float(
+                    expected.get(field, 0.0)
+                ):
                     return False
         return True
 

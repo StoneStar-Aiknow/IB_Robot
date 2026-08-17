@@ -24,6 +24,7 @@ from embodied_common.dispatch_binding import (
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
 from ibrobot_msgs.srv import MoveToConfiguration, PlanGrasp, VerifyGrasp
 from manipulation_execution.phases.execution import ExecutionPhase
@@ -86,6 +87,7 @@ class PickExecutorNode(
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("pick_executor_node", parameter_overrides=parameter_overrides)
+        validate_public_request_wire_contracts()
         self.declare_parameter("action_name", "/manipulation/execute_pick")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("grasp_execution_json", "{}")

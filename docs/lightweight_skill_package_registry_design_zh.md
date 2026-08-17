@@ -159,10 +159,28 @@ mode、lease 和 safety 校验；`planner_visible` 只决定是否可以进入�
 Primitive 的 canonical descriptor registry 由 `embodied_common` 单独拥有；Stage 1 将当前
 `skill_templates.py` 中的 `SUPPORTED_PRIMITIVES` 移到专用 `primitive_contracts.py`，其余包只能导入
 它。该 registry 是随软件构建发布的静态、只读数据模块，不是第二个 ROS registry，不提供 reload service。
-Descriptor schema v1 的字段精确为 `schema_version`、canonical `name`、`parameter_contract`、
-`required_runtime_capabilities` 和 `dispatch_kind`；callable、进程地址和运行时状态不得进入 descriptor 或
-digest。`required_runtime_capabilities` 去重后按字典序排序，descriptor 按 name 排序，并使用以下精确 preimage
-计算 `primitive_contract_digest`：
+Descriptor schema v1 的字段精确为 `schema_version`、canonical `name`、`parameter_contract`、`required_runtime_capabilities` 和 `dispatch_kind`；callable、进程地址和运行时状态不得进入 descriptor 或
+digest。`required_runtime_capabilities` 去重后按字典序排序，descriptor 按 name 排序。
+
+registry 不再暴露单一全局 digest，而是以 **`PrimitiveContractSet`** 为单位组织版本化契约。一个
+`PrimitiveContractSet` 由三元组 `(schema_version, descriptors, digest)` 组成：`schema_version` 标识
+该契约集合的版本（`1` 或 `2`），`descriptors` 是该版本下的全部 canonical `PrimitiveDescriptor` 有序集合，
+`digest` 是对该集合 canonical preimage 计算的 SHA-256。`embodied_common.primitive_contracts` 提供
+`primitive_contract_for_version(version: int) -> PrimitiveContractSet` 选择器，按 `schema_version` 返回
+对应契约集合；未知版本返回 `SKILL_SCHEMA_INVALID`。
+
+- v1 契约集合的 `digest` 固定为 `537210f8...`（完整 SHA-256 见 golden vector），覆盖 10 个 manipulation
+  primitive。
+- v2 契约集合拥有**独立** `digest`（与 v1 不同），覆盖 13 个 primitive（v1 ∪
+  `nav_straight` / `nav_turn` / `nav_abs_coordinate`）。v1 与 v2 digest 不混用，也不可互相回退。
+
+registry preimage 写入的 `primitive_contract_digest` 由 `robot_context.context_schema_version` 选择：
+compiler 调用 `primitive_contract_for_version(robot_context.context_schema_version)` 取对应
+`PrimitiveContractSet`，将其 `digest` 写入 `registry_preimage.primitive_contract_digest`，并用其
+`descriptors` 校验 implementation 的 primitive 白名单。compiler 不接受调用方临时覆盖或 merge
+两个版本的 descriptor。
+
+使用以下精确 preimage 计算 `PrimitiveContractSet.digest`：
 
 ```json
 {
@@ -216,8 +234,10 @@ contract digest 并增加 golden vector；新增 schema keyword、capability 或
 descriptor schema 和 endpoint role 契约，不能由 consumer 私自扩展。
 
 `skill_catalog`、`skill_library` 和 `safety_guard` 必须读取同一 canonical registry，不得复制名称列表、参数表或
-默认值。Compiler 将 `primitive_contract_digest` 写入 registry preimage；executor 和 safety 在接受快照前重算
-本地 digest，不匹配时 fail closed，从而拒绝混跑不同 Primitive contract 的二进制。Primitive action 只接受
+默认值。Compiler 调用 `primitive_contract_for_version(robot_context.context_schema_version)` 选择对应
+`PrimitiveContractSet`，将其 `digest` 写入 registry preimage 的 `primitive_contract_digest`；executor 和
+safety 在接受快照前按同一 `context_schema_version` 重算本地 digest，不匹配时 fail closed，从而拒绝混跑
+不同 schema 版本或不同 Primitive contract 的二进制。Primitive action 只接受
 active `ExecutionCoordinator` 签发的内部 dispatch binding；外部能力入口只能使用 `SkillCommand`。
 
 #### 当前配置的迁移分类
@@ -251,6 +271,50 @@ Workflow 首版不进入 `skill_catalog`，表示 catalog 不持久化可复用 
 schema、无版本或散落在 planner 私有 JSON 中。Planned Workflow 必须是绑定 exact snapshot 的 typed
 `WorkflowStep[]`。未来如果需要持久化、共享或版本化 Workflow template，应由 `embodied_agent` 增加独立
 `WorkflowDefinition` schema 和 owner，不得把它伪装成 catalog entry 或 implementation。
+
+### 5.3 Schema 版本演进（v1 / v2）
+
+本节冻结 primitive contract 与公开请求类型的 schema 版本分离。schema_version 是契约层级的强类型
+门禁，不是运行时可协商字段；新增版本必须升级 preimage、digest、IDL 和 golden vector，并在同一次
+原子部署中切换全部 producer/consumer。
+
+**v1（原始 manipulation 契约）**
+
+- 公开请求类型（`SkillCommand.Goal`、`PrimitiveCommand.Goal`、`ValidateSkill.Request`、
+  `ValidatePrimitive.Request`）和 `WorkflowStep` 都以 `uint32 schema_version` 为首字段，v1 取值为 `1`。
+- 字段集合仅包含 manipulation 字段：`motion_direction`、`motion_distance`，以及 Primitive 联合字段
+  （`pose_name`、`target_pose`、`relative_dx/dy/dz`、`joint_*` 等）。
+- 控制模式封闭集合为 3 种（`teleop` / `model_inference` / `moveit_planning`）。
+- Primitive 白名单为 10 个：`move_to_named_pose`、`move_to_pose`、`move_to_configuration`、
+  `move_relative_ee`、`move_to_joint_positions`、`move_through_joint_positions`、`open_gripper`、
+  `close_gripper`、`rotate_gripper_cw`、`rotate_gripper_ccw`。
+- v1 请求**拒绝**任何导航字段（`direction` / `distance` / `degree` / `x` / `y` / `yaw`）：携带导航字段
+  的 v1 请求返回 `SKILL_SCHEMA_INVALID`。
+- v1 primitive contract digest 固定为 `537210f8...`（完整 SHA-256 见 `embodied_common.primitive_contracts`
+  的 golden vector）。
+
+**v2（v1 ∪ 导航扩展）**
+
+- v2 在 v1 字段集合之上**并集**新增导航字段：`direction`、`distance`、`degree`、`has_x`、`x`、`has_y`、
+  `y`、`has_yaw`、`yaw`。`has_*` 三个 bool 用于区分“字段缺失”与“显式零值”，避免把未设置静默当作
+  “移动到 (0, 0, 0)”的导航目标。
+- 控制模式封闭集合新增 `base_navigation`，共 4 种。
+- Primitive 白名单新增 3 个导航 primitive：`nav_straight`、`nav_turn`、`nav_abs_coordinate`，共 13 个。
+- v2 请求**必须**显式设置 `schema_version=2`，不得依赖默认零值；`schema_version=0` 或未知值返回
+  `SKILL_SCHEMA_INVALID`。
+- v2 拥有**独立**的 `primitive_contract_digest`（与 v1 不同），由 v2 descriptor 集合的 canonical preimage
+  重新计算；v1 与 v2 digest 不混用。
+- registry preimage 写入的 `primitive_contract_digest` 由 `robot_context.context_schema_version` 选择
+  （`context_schema_version=1` 选 v1 digest，`=2` 选 v2 digest），compiler 不接受调用方临时覆盖。
+
+**Breaking IDL change 与原子重建**
+
+新增 / 重命名 schema 字段、primitive 或 dispatch kind 会改变 ROS type hash，不提供旧二进制 wire
+compatibility。v1 → v2 升级是一次 **breaking IDL change**，必须**原子重建并部署**全部 workspace
+producer / consumer（`skill_library`、`safety_guard`、`embodied_agent`、`robot_skill_cli`、
+`ibrobot_msgs` 等），不得混跑 v1 与 v2 二进制。`embodied_common.wire_contracts.validate_public_request_wire_contracts()`
+在节点启动时执行 preflight：四个公开请求类型必须以 `schema_version` 为首字段，且取值属于 `{1, 2}`；
+不匹配时节点不进入 ready。该 preflight 与运行期 `primitive_contract_digest` 校验共同构成二重门禁。
 
 ## 6. 版本模型
 
@@ -837,15 +901,39 @@ class SkillCompileContext:
 ```
 
 `SkillRobotContext` 必须包含 primitive expansion 和 execution 会读取的全部 robot_config 值，而不只是名称。
-字段新增必须升级 `context_schema_version`。活动 goal 的 primitive dispatch、cancel 和 finalize 禁止回读节点的
+字段新增必须升级 `context_schema_version`。`context_schema_version` 取值集合为 `{1, 2}`：v1 对应仅 manipulation
+的 10-role `execution_endpoints` 与 v1 primitive contract；v2 对应新增 `navigation_action` role 的 11-role
+mapping 与 v2 primitive contract。该版本由 `robot_config.loader` 的
+`navigation_endpoint_projection()` 决定：当且仅当 `robot_config` 配置了 `navigation.command_server.action_name`
+时，projection 输出 `context_schema_version=2` 并把该 action 名写入 `execution_endpoints.navigation_action`；
+否则输出 `context_schema_version=1` 且不写入 `navigation_action` role。projection 是确定 context schema 版本
+的**唯一**入口，caller 不得自行声明版本。
+
+`context_schema_version` 同时决定下游 `WorkflowStep.schema_version`：planner 生成的 step schema_version
+必须与所属 capability 的 schema 版本一致（v1 capability 产生 `schema_version=1` step，v2 capability 产生
+`schema_version=2` step），**不再固定为 `1`**。`registry_preimage.primitive_contract_digest` 也由
+`context_schema_version` 通过 `primitive_contract_for_version()` 选择对应 `PrimitiveContractSet`。
+
+活动 goal 的 primitive dispatch、cancel 和 finalize 禁止回读节点的
 current robot parameters，必须只使用其捕获 bundle 中冻结的 context。
 
-`execution_endpoints` 是 role 到完全展开 ROS 名称的 canonical mapping，v1 key 精确为 `skill_action`、
-`primitive_action`、`validate_skill_service`、`validate_primitive_service`、`gateway_status_service`、
-`begin_workflow_service`、`finalize_workflow_service`、`task_executor_action`、`arm_trajectory_action`、
-`move_configuration_service`，未知 key 拒绝。Delegated endpoint 只存在于其 descriptor，不能在这里重复。
+`execution_endpoints` 是 role 到完全展开 ROS 名称的 canonical mapping。v1 key 精确为 10 个 role：
+`skill_action`、`primitive_action`、`validate_skill_service`、`validate_primitive_service`、
+`gateway_status_service`、`begin_workflow_service`、`finalize_workflow_service`、
+`task_executor_action`、`arm_trajectory_action`、`move_configuration_service`，未知 key 拒绝。v2 在 v1 的
+10 个 role 之上**新增** `navigation_action` role，共 11 个；v1 context 不得携带 `navigation_action`，
+v2 context 必须携带。Delegated endpoint 只存在于其 descriptor，不能在这里重复。
+
+`navigation_action` role 的**唯一权威**（sole owner）是 `robot_config` 中的
+`navigation.command_server.action_name`；该 ROS action 名由 navigation command server 所有，compiler
+从 `robot_config.navigation.command_server.action_name` 读取并写入 `execution_endpoints.navigation_action`。
+legacy 参数 `embodied.execution.navigation_action_name` **已退役**（retired）：runtime 不再从该参数读取
+endpoint，operator 必须改用 `robot_config.navigation.command_server.action_name` 配置；保留旧参数的部署
+必须迁移，不得作为 fallback 静默继续使用。
+
 Runtime dispatch 必须使用 captured mapping；新增或重命名 role 必须升级 context schema，并改变
-`robot_config_digest` 和 registry digest。
+`robot_config_digest` 和 registry digest。v1 → v2 新增 `navigation_action` role 属于 context schema
+升级：`context_schema_version` 从 `1` 升级为 `2`，`robot_config_digest` 和 `registry_digest` 随之改变。
 
 Delegated executor descriptor 的所有字符串字段都必须存在；不适用模型部署的 executor 将三个 model 字段
 规范化为空字符串。Descriptor registry 由 runtime owner 根据实际启动的 executor、endpoint 和 deployment

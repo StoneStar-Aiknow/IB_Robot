@@ -195,6 +195,7 @@ def test_safety_guard_asynchronously_switches_and_retains_verified_snapshots():
         assert safety._snapshot_cache.current_identity.generation == 2
 
         request = ValidateSkill.Request()
+        request.schema_version = 1
         request.dispatch_binding.schema_version = 1
         request.dispatch_binding.expected_registry_epoch = "epoch-1"
         request.dispatch_binding.expected_registry_generation = 1
@@ -217,6 +218,7 @@ def test_safety_guard_asynchronously_switches_and_retains_verified_snapshots():
         assert missing_identity.error_code == "SKILL_SCHEMA_INVALID"
 
         primitive_request.dispatch_binding.schema_version = 1
+        primitive_request.schema_version = 1
         primitive_request.dispatch_binding.task_id = "task-1"
         primitive_request.dispatch_binding.root_task_id = "task-1"
         primitive_request.dispatch_binding.dispatch_nonce = "nonce-1"

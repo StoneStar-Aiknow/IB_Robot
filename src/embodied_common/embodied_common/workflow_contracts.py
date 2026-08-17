@@ -20,25 +20,51 @@ class CanonicalWorkflowStep:
     motion_direction: str = ""
     motion_distance: float = 0.0
     timeout_sec: float = 0.0
+    direction: str = ""
+    distance: float = 0.0
+    degree: float = 0.0
+    x: float | None = None
+    y: float | None = None
+    yaw: float | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("WorkflowStep.schema_version must be 1")
+        if self.schema_version not in {1, 2}:
+            raise ValueError("WorkflowStep.schema_version must be 1 or 2")
+        if not isinstance(self.skill_name, str):
+            raise TypeError("WorkflowStep.skill_name must be a string")
         if not self.skill_name.strip():
             raise ValueError("WorkflowStep.skill_name must be non-empty")
-        for field_name in ("target_name", "container_name", "place_name", "motion_direction"):
+        for field_name in ("target_name", "container_name", "place_name", "motion_direction", "direction"):
             if not isinstance(getattr(self, field_name), str):
                 raise TypeError(f"WorkflowStep.{field_name} must be a string")
-        for field_name in ("motion_distance", "timeout_sec"):
+        object.__setattr__(self, "skill_name", self.skill_name.strip())
+        for field_name in ("target_name", "container_name", "place_name"):
+            object.__setattr__(self, field_name, getattr(self, field_name).strip())
+        for field_name in ("motion_direction", "direction"):
+            object.__setattr__(self, field_name, getattr(self, field_name).strip().lower())
+        for field_name in ("motion_distance", "timeout_sec", "distance", "degree"):
             value = getattr(self, field_name)
             if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
                 raise ValueError(f"WorkflowStep.{field_name} must be finite")
             if float(value) < 0.0:
                 raise ValueError(f"WorkflowStep.{field_name} must be non-negative")
+        for field_name in ("x", "y", "yaw"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _finite_float(value)
+        if self.schema_version == 1 and (
+            self.direction.strip()
+            or float(self.distance) != 0.0
+            or float(self.degree) != 0.0
+            or self.x is not None
+            or self.y is not None
+            or self.yaw is not None
+        ):
+            raise ValueError("navigation parameters require WorkflowStep schema_version 2")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
+        result = {
+            "schema_version": self.schema_version,
             "skill_name": self.skill_name.strip(),
             "target_name": self.target_name.strip(),
             "container_name": self.container_name.strip(),
@@ -47,6 +73,21 @@ class CanonicalWorkflowStep:
             "motion_distance": _finite_float(self.motion_distance),
             "timeout_sec": _finite_float(self.timeout_sec),
         }
+        if self.schema_version == 2:
+            result.update(
+                {
+                    "direction": self.direction.strip().lower(),
+                    "distance": _finite_float(self.distance),
+                    "degree": _finite_float(self.degree),
+                    "has_x": self.x is not None,
+                    "x": 0.0 if self.x is None else _finite_float(self.x),
+                    "has_y": self.y is not None,
+                    "y": 0.0 if self.y is None else _finite_float(self.y),
+                    "has_yaw": self.yaw is not None,
+                    "yaw": 0.0 if self.yaw is None else _finite_float(self.yaw),
+                }
+            )
+        return result
 
 
 def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
@@ -56,16 +97,25 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         values = step
     else:
         values = {
-            field: getattr(step, field)
-            for field in (
-                "schema_version",
-                "skill_name",
-                "target_name",
-                "container_name",
-                "place_name",
-                "motion_direction",
-                "motion_distance",
-                "timeout_sec",
+            field: getattr(step, field, default)
+            for field, default in (
+                ("schema_version", 0),
+                ("skill_name", ""),
+                ("target_name", ""),
+                ("container_name", ""),
+                ("place_name", ""),
+                ("motion_direction", ""),
+                ("motion_distance", 0.0),
+                ("timeout_sec", 0.0),
+                ("direction", ""),
+                ("distance", 0.0),
+                ("degree", 0.0),
+                ("has_x", None),
+                ("x", None),
+                ("has_y", None),
+                ("y", None),
+                ("has_yaw", None),
+                ("yaw", None),
             )
         }
     return CanonicalWorkflowStep(
@@ -77,6 +127,12 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         motion_direction=str(values.get("motion_direction", "")),
         motion_distance=_finite_float(values.get("motion_distance", 0.0)),
         timeout_sec=_finite_float(values.get("timeout_sec", 0.0)),
+        direction=str(values.get("direction", "")),
+        distance=_finite_float(values.get("distance", 0.0)),
+        degree=_finite_float(values.get("degree", 0.0)),
+        x=_optional_workflow_coordinate(values, "x"),
+        y=_optional_workflow_coordinate(values, "y"),
+        yaw=_optional_workflow_coordinate(values, "yaw"),
     )
 
 
@@ -155,3 +211,19 @@ def _finite_float(value: Any) -> float:
     if not math.isfinite(result):
         raise ValueError("number must be finite")
     return 0.0 if result == 0.0 else result
+
+
+def _optional_workflow_coordinate(values: Mapping[str, Any], field_name: str) -> float | None:
+    presence_name = f"has_{field_name}"
+    presence = values.get(presence_name)
+    if presence is None:
+        return _finite_float(values[field_name]) if field_name in values and values[field_name] is not None else None
+    if not isinstance(presence, bool):
+        raise ValueError(f"WorkflowStep.{presence_name} must be a boolean")
+    value = values.get(field_name, 0.0)
+    normalized = _finite_float(value)
+    if not presence:
+        if normalized != 0.0:
+            raise ValueError(f"WorkflowStep.{field_name} must be zero when {presence_name} is false")
+        return None
+    return normalized

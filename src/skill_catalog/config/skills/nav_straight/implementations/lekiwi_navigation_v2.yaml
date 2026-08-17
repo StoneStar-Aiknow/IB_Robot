@@ -1,0 +1,9 @@
+schema_version: 2
+kind: primitive_sequence
+robot: lekiwi_navigation_v2
+initial_gripper_state: none
+timeout_sec: 300.0
+primitive_sequence:
+- primitive_name: nav_straight
+  direction_from_request: true
+  distance_from_request: true

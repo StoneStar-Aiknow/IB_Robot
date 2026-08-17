@@ -1,4 +1,5 @@
 import math
+import re
 import threading
 import time
 from enum import Enum
@@ -7,6 +8,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -24,6 +26,17 @@ from robot_navigation.navigation_command_core import (
     resolve_navigation_target,
 )
 
+_ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _validate_action_name(action_name) -> None:
+    if not isinstance(action_name, str) or not action_name.strip():
+        raise ValueError("action_name must be a non-empty string")
+    if not action_name.startswith("/"):
+        raise ValueError("action_name must be an absolute ROS name")
+    if not _ROS_ABSOLUTE_NAME_PATTERN.fullmatch(action_name):
+        raise ValueError("action_name must be a valid ROS name")
+
 
 class NavigationState(str, Enum):
     IDLE = "idle"
@@ -39,7 +52,7 @@ class NavigationCommandServer(Node):
     def __init__(self) -> None:
         super().__init__("navigation_command_server")
         defaults = {
-            "action_name": "/navigation/execute",
+            "action_name": "",
             "cancel_service_name": "/navigation/cancel_current",
             "nav2_action_name": "/navigate_to_pose",
             "stop_velocity_topic": "/cmd_vel_safe",
@@ -54,16 +67,20 @@ class NavigationCommandServer(Node):
             "angular_stop_threshold": 0.05,
             "stop_stable_duration": 0.5,
             "stop_confirmation_timeout": 3.0,
+            "costmap_readiness_timeout": 60.0,
+            "costmap_topic": "/global_costmap/costmap",
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
             setattr(self, name, self.get_parameter(name).value)
+        _validate_action_name(self.action_name)
 
         self._callback_group = ReentrantCallbackGroup()
         self._lock = threading.Lock()
         self.state = NavigationState.IDLE
         self._generation = 0
         self._nav_goal_handle = None
+        self._active_execute_goal_handle = None
         self._cancel_sent = False
         self._cancel_failed = False
         self._timeout_cancel_requested = False
@@ -103,6 +120,15 @@ class NavigationCommandServer(Node):
             10,
             callback_group=self._callback_group,
         )
+        self._costmap_ready = threading.Event()
+        self._costmap_data_size = 0
+        self._costmap_sub = self.create_subscription(
+            OccupancyGrid,
+            self.costmap_topic,
+            self._costmap_callback,
+            1,
+            callback_group=self._callback_group,
+        )
 
     def destroy_node(self):
         self._action_server.destroy()
@@ -111,7 +137,10 @@ class NavigationCommandServer(Node):
     def _goal_callback(self, _goal_request) -> GoalResponse:
         return GoalResponse.ACCEPT
 
-    def _cancel_callback(self, _goal_handle) -> CancelResponse:
+    def _cancel_callback(self, goal_handle) -> CancelResponse:
+        with self._lock:
+            if goal_handle is not self._active_execute_goal_handle:
+                return CancelResponse.REJECT
         return CancelResponse.ACCEPT if self._request_cancel() else CancelResponse.REJECT
 
     def _handle_cancel_current(self, _request, response):
@@ -176,21 +205,45 @@ class NavigationCommandServer(Node):
         ):
             self._stop_confirmed.set()
 
-    def _start_goal(self) -> int | None:
+    def _costmap_callback(self, msg: OccupancyGrid) -> None:
+        size = len(msg.data)
+        with self._lock:
+            self._costmap_data_size = size
+        if size > 0:
+            self._costmap_ready.set()
+
+    def _wait_for_costmap_ready(self) -> bool:
+        with self._lock:
+            if self._costmap_data_size > 0:
+                return True
+        deadline = time.monotonic() + float(self.costmap_readiness_timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._costmap_ready.wait(timeout=min(remaining, 0.5)):
+                return True
+            if self._cancel_requested.is_set():
+                return False
+
+    def _start_goal(self, goal_handle) -> int | None:
         with self._lock:
             if self.state != NavigationState.IDLE:
                 return None
+            self._cancel_requested.clear()
+            self._cancel_complete.clear()
+            self._stop_confirmed.clear()
+            self._stop_gate.reset()
+            self._costmap_ready.clear()
+            self._costmap_data_size = 0
             self._generation += 1
             generation = self._generation
+            self._active_execute_goal_handle = goal_handle
             self.state = NavigationState.RESOLVING
             self._nav_goal_handle = None
             self._cancel_sent = False
             self._cancel_failed = False
             self._timeout_cancel_requested = False
-        self._cancel_requested.clear()
-        self._cancel_complete.clear()
-        self._stop_confirmed.clear()
-        self._stop_gate.reset()
         return generation
 
     def _finish(self, generation: int, state: NavigationState = NavigationState.IDLE) -> None:
@@ -198,8 +251,9 @@ class NavigationCommandServer(Node):
             if generation != self._generation:
                 return
             self._nav_goal_handle = None
+            self._active_execute_goal_handle = None
+            self._cancel_requested.clear()
             self.state = state
-        self._cancel_requested.clear()
 
     def _resolve_target(self, request) -> PoseStamped:
         command_type = int(request.command_type)
@@ -246,7 +300,7 @@ class NavigationCommandServer(Node):
 
     def _execute_callback(self, goal_handle):
         result = ExecuteNavigation.Result()
-        generation = self._start_goal()
+        generation = self._start_goal(goal_handle)
         if generation is None:
             result.error_code = ExecuteNavigation.Result.BUSY
             result.message = "Another navigation command is active"
@@ -277,6 +331,19 @@ class NavigationCommandServer(Node):
             goal_handle.abort()
             self._finish(generation)
             return result
+        if self._cancel_requested.is_set() or goal_handle.is_cancel_requested:
+            return self._complete_without_nav_goal(goal_handle, result, generation)
+
+        if not self._wait_for_costmap_ready():
+            if self._cancel_requested.is_set() or goal_handle.is_cancel_requested:
+                return self._complete_without_nav_goal(goal_handle, result, generation)
+            result.error_code = ExecuteNavigation.Result.NAV2_UNAVAILABLE
+            result.message = "Global costmap is empty or not received within readiness timeout"
+            goal_handle.abort()
+            self._finish(generation)
+            return result
+        if self._cancel_requested.is_set() or goal_handle.is_cancel_requested:
+            return self._complete_without_nav_goal(goal_handle, result, generation)
 
         nav_goal = NavigateToPose.Goal()
         nav_goal.pose = target
@@ -286,7 +353,20 @@ class NavigationCommandServer(Node):
             feedback_callback=lambda feedback: self._forward_feedback(goal_handle, feedback, generation),
         )
         nav_goal_handle = self._wait_future(send_future, float(self.nav2_server_timeout))
-        if nav_goal_handle is None or not nav_goal_handle.accepted:
+        if nav_goal_handle is None:
+            self._track_late_nav_goal(send_future, generation)
+            self._cancel_complete.wait()
+            with self._lock:
+                cleanup_failed = self._cancel_failed or self.state != NavigationState.IDLE
+            if cleanup_failed:
+                result.error_code = ExecuteNavigation.Result.STOP_TIMEOUT
+                result.message = "Nav2 goal acceptance timed out and safe cleanup was not confirmed"
+            else:
+                result.error_code = ExecuteNavigation.Result.NAVIGATION_CANCELED
+                result.message = "Nav2 goal acceptance timed out; late goal was canceled and stopped safely"
+            goal_handle.abort()
+            return result
+        if not nav_goal_handle.accepted:
             result.error_code = ExecuteNavigation.Result.GOAL_REJECTED
             result.message = "Nav2 rejected the navigation goal"
             goal_handle.abort()
@@ -423,6 +503,81 @@ class NavigationCommandServer(Node):
         feedback.estimated_time_remaining = nav_feedback.estimated_time_remaining
         feedback.number_of_recoveries = nav_feedback.number_of_recoveries
         goal_handle.publish_feedback(feedback)
+
+    def _track_late_nav_goal(self, send_future, generation: int) -> None:
+        self._cancel_requested.set()
+        with self._lock:
+            if generation != self._generation:
+                return
+            self.state = NavigationState.FAULT
+
+        send_future.add_done_callback(lambda completed: self._cleanup_late_nav_goal(completed, generation))
+
+    def _cleanup_late_nav_goal(self, send_future, generation: int) -> None:
+        try:
+            nav_goal_handle = send_future.result()
+        except Exception:
+            with self._lock:
+                if generation == self._generation:
+                    self._cancel_failed = True
+                    self.state = NavigationState.FAULT
+            self._cancel_complete.set()
+            return
+        if nav_goal_handle is None:
+            with self._lock:
+                if generation == self._generation:
+                    self._cancel_failed = True
+                    self.state = NavigationState.FAULT
+            self._cancel_complete.set()
+            return
+        if not nav_goal_handle.accepted:
+            self._finish(generation)
+            self._cancel_complete.set()
+            return
+
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._nav_goal_handle = nav_goal_handle
+            self.state = NavigationState.CANCELING
+        try:
+            result_future = nav_goal_handle.get_result_async()
+        except Exception:
+            with self._lock:
+                if generation == self._generation:
+                    self._cancel_failed = True
+                    self.state = NavigationState.FAULT
+            self._cancel_complete.set()
+            return
+        if not self._request_cancel():
+            return
+        wrapped_result, _ = self._wait_result_future(
+            result_future,
+            result_timeout=float(self.cancel_timeout),
+            cancel_timeout=float(self.cancel_timeout),
+            cancel_requested=self._cancel_requested,
+        )
+        if wrapped_result is None or wrapped_result.status != GoalStatus.STATUS_CANCELED:
+            with self._lock:
+                if generation == self._generation:
+                    self.state = NavigationState.FAULT
+                    self._cancel_failed = True
+            self._cancel_complete.set()
+            return
+
+        with self._lock:
+            if generation != self._generation:
+                return
+            self.state = NavigationState.STOPPING
+        self._stop_gate.reset()
+        self._stop_confirmed.clear()
+        if self._stop_confirmed.wait(timeout=float(self.stop_confirmation_timeout)):
+            self._finish(generation)
+        else:
+            self._finish(generation, NavigationState.FAULT)
+            with self._lock:
+                self._cancel_failed = True
+        self._cancel_complete.set()
 
     @staticmethod
     def _wait_future(future, timeout: float | None):

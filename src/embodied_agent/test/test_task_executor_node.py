@@ -150,6 +150,7 @@ def test_execute_task_dispatches_distinct_child_ids_and_parent_statuses():
         "parent/skill/0001",
         "parent/skill/0002",
     ]
+    assert [goal.schema_version for goal in node._skill_client.goals] == [1, 1]  # noqa: SLF001
     assert {goal.dispatch_binding.root_lease_nonce for goal in node._skill_client.goals} == {"root-nonce"}
     assert len({goal.dispatch_binding.workflow_digest for goal in node._skill_client.goals}) == 1
     assert len(node._finalize_workflow_client.requests) == 1  # noqa: SLF001
@@ -169,6 +170,45 @@ def test_execute_task_derives_first_child_id_for_single_skill():
 
     assert [goal.dispatch_binding.task_id for goal in node._skill_client.goals] == ["parent/skill/0001"]  # noqa: SLF001
     assert {status["task_id"] for status in statuses} == {"parent"}
+
+
+def test_execute_task_preserves_navigation_step_fields():
+    node, _statuses = _make_executor()
+    message = _make_message("parent", ["nav_abs_coordinate"])
+    message.workflow_steps = [
+        workflow_step(
+            schema_version=2,
+            skill_name="nav_abs_coordinate",
+            x=0.0,
+            y=-3.0,
+            yaw=0.0,
+            timeout_sec=30.0,
+        )
+    ]
+
+    try:
+        node._execute_task(message)  # noqa: SLF001
+    finally:
+        assert not node._active_task_lock.locked()  # noqa: SLF001
+
+    goal = node._skill_client.goals[0]  # noqa: SLF001
+    assert goal.schema_version == 2
+    assert goal.has_x is True and goal.x == pytest.approx(0.0)
+    assert goal.has_y is True and goal.y == pytest.approx(-3.0)
+    assert goal.has_yaw is True and goal.yaw == pytest.approx(0.0)
+
+
+def test_execute_task_preserves_zero_step_timeout_for_gateway_identity():
+    node, _statuses = _make_executor()
+    message = _make_message("parent", ["only_skill"])
+    message.workflow_steps = [workflow_step(skill_name="only_skill", timeout_sec=0.0)]
+
+    try:
+        node._execute_task(message)  # noqa: SLF001
+    finally:
+        assert not node._active_task_lock.locked()  # noqa: SLF001
+
+    assert node._skill_client.goals[0].timeout_sec == pytest.approx(0.0)  # noqa: SLF001
 
 
 def test_execute_task_rejects_invalid_parent_without_dispatch():

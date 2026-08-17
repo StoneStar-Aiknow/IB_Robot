@@ -1,5 +1,9 @@
+uint32 schema_version
 DispatchBinding dispatch_binding
 string primitive_name
+uint8 navigation_command_type
+geometry_msgs/PoseStamped navigation_target_pose
+float64 navigation_value
 string pose_name
 float32 relative_dx
 float32 relative_dy

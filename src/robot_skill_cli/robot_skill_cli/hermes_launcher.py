@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import get_effective_visual_game_policies, load_robot_config_dict
 from robot_skill_cli.catalog import load_runtime_context, load_visual_game_runtime_context
@@ -266,6 +267,12 @@ def _check_robot_runtime(config_name: str | None, config_path: str | None, mode:
         if not bridge.start():
             raise LauncherError("ROS_UNAVAILABLE", "failed to initialize the robot Gateway bridge")
         try:
+            public_interfaces = getattr(bridge, "wait_for_public_request_interfaces", None)
+            if public_interfaces is not None and not public_interfaces(timeout_sec=timeout_sec):
+                raise LauncherError(
+                    "PUBLIC_REQUEST_INTERFACES_UNAVAILABLE",
+                    "versioned Skill and Primitive public interfaces are not discoverable",
+                )
             if preflight_mode in {"visual-games", "both"} and not bridge.wait_for_visual_game_interfaces(
                 timeout_sec=timeout_sec
             ):
@@ -298,6 +305,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         hermes_path = _require_binary("hermes")
         robot_skill_path = _require_binary("robot-skill")
         _check_hermes_version(hermes_path)
+        try:
+            validate_public_request_wire_contracts()
+        except LauncherError:
+            raise
+        except Exception as exc:
+            raise LauncherError("WIRE_CONTRACT_INVALID", str(exc)) from exc
         if args.mode == "auto":
             config_path = _check_robot_runtime(args.config_name, args.config_path)
         else:

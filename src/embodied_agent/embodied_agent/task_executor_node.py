@@ -12,6 +12,7 @@ from embodied_agent.base_node import BaseTaskNode
 from embodied_agent.task_context import TIMEOUT_CONTEXT_KEY, load_task_context, remaining_task_budget_sec
 from embodied_common.dispatch_binding import binding_task_id, copy_binding
 from embodied_common.skill_request import derive_skill_task_id
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from embodied_common.workflow_contracts import compute_workflow_digest
 from embodied_common.workflow_lifecycle import WorkflowLifecycleClient, WorkflowLifecycleError
 from ibrobot_msgs.action import SkillCommand
@@ -55,6 +56,7 @@ class TaskExecutorNode(BaseTaskNode):
         self._active_task_lock = threading.Lock()
         self._active_task_id = ""
 
+        validate_public_request_wire_contracts()
         self._status_publisher = self.create_publisher(TaskStatus, self._status_topic, 10)
         self._skill_client = ActionClient(self, SkillCommand, self._skill_action_name)
         self._gateway_status_client = self.create_client(GetSkillGatewayStatus, self._gateway_status_service)
@@ -367,6 +369,7 @@ class TaskExecutorNode(BaseTaskNode):
                     )
 
                 goal = SkillCommand.Goal()
+                goal.schema_version = step.schema_version
                 goal.dispatch_binding = copy_binding(workflow_binding)
                 goal.dispatch_binding.task_id = child_task_id
                 goal.dispatch_binding.root_task_id = binding_task_id(msg)
@@ -377,10 +380,20 @@ class TaskExecutorNode(BaseTaskNode):
                 goal.place_name = step.place_name
                 goal.motion_direction = step.motion_direction
                 goal.motion_distance = step.motion_distance
-                goal.timeout_sec = float(step.timeout_sec or msg.timeout_sec or self._default_timeout)
+                goal.direction = step.direction
+                goal.distance = step.distance
+                goal.degree = step.degree
+                goal.has_x = step.has_x
+                goal.x = step.x
+                goal.has_y = step.has_y
+                goal.y = step.y
+                goal.has_yaw = step.has_yaw
+                goal.yaw = step.yaw
+                effective_child_timeout = float(step.timeout_sec or msg.timeout_sec or self._default_timeout)
+                goal.timeout_sec = float(step.timeout_sec)
 
                 send_goal_future = self._skill_client.send_goal_async(goal)
-                send_timeout = min(self._rpc_timeout, goal.timeout_sec)
+                send_timeout = min(self._rpc_timeout, effective_child_timeout)
                 if not self._wait_for_future(send_goal_future, timeout_sec=max(0.1, send_timeout)):
                     child_state_unknown = True
                     self._publish_status(
@@ -424,7 +437,7 @@ class TaskExecutorNode(BaseTaskNode):
                 result_future = goal_handle.get_result_async()
                 result_timeout = self._remaining_budget_sec(plan_context)
                 if result_timeout is None:
-                    result_timeout = goal.timeout_sec
+                    result_timeout = effective_child_timeout
                 if not self._wait_for_future(result_future, timeout_sec=max(0.1, result_timeout)):
                     if not self._cancel_goal(goal_handle, result_future):
                         child_state_unknown = True

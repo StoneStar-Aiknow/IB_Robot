@@ -72,6 +72,12 @@ ibrobot_msgs / rclpy
 - `embodied_common.vlm_api_client.VLMAPIClient.analyze`（原有底层接口，返回 `(str, dict)`，向后兼容）
 - `embodied_common.vlm_api_client.VLMAPIClient.complete`（底层扩展接口，返回结构化 dict）
 - `embodied_common.vlm_api_client.VLMClient`（高层客户端，一行式多模型调用，自动路由 / 建图 / 上下文）
+- `embodied_common.wire_contracts.validate_public_request_wire_contracts`（公开请求 wire contract 校验入口，按 schema version 分流 V1/V2 字段集）
+- `embodied_common.wire_contracts.validate_request_schema_version`（仅接受 `{1, 2}`，与请求体顶层 `schema_version` 和 `dispatch_binding.schema_version` 一致性校验）
+- `embodied_common.wire_contracts.PRIMITIVE_CONTRACT_V1`（V1 primitive contract digest 常量）
+- `embodied_common.wire_contracts.PRIMITIVE_CONTRACT_V2`（V2 primitive contract digest 常量，含 nav_* primitive）
+- `embodied_common.wire_contracts.primitive_contract_for_version(version)`（按 context_schema_version 选择 V1/V2 digest）
+- `embodied_common.wire_contracts.PrimitiveContractSet`（同时持有 V1/V2 digest 与对应 primitive 名称集合，供工具与跨版本比对使用）
 
 视觉游戏 JSON loader 供 `embodied_agent.visual_game_gateway_node` 解析 ROS 参数；
 `get_default_visual_game_handler` 供
@@ -109,6 +115,30 @@ float32 字段对齐）。`canonical_skill_payload()` 在未给出 timeout 时�
 `uuid.NAMESPACE_URL` 下的 `ibrobot:{task_id}`。`derive_skill_task_id(parent_task_id, skill_index)`
 派生 `<parent>/skill/<1-based index>` 形式的 child task ID，供 task_executor 与未来消费者共用。
 这些 helper 不包含 primitive 或 ROS transport 数据。
+
+V2 schema 之上的 navigation 字段集在 `skill_request` 中也保持同一套规范化规则：
+
+- `navigation_direction` 转为小写并去首尾空白，必须命中允许枚举集合
+  （`forward` / `backward` / `leftward` / `rightward` / `turn-left` / `turn-right`）。
+- `navigation_distance`（给出时）必须为有限、正且不超过 float32 最大值；零或负数返回
+  `SKILL_LIMIT_VIOLATION`。
+- `navigation_degree` 必须为有限数，绝对值不超过 float32 最大值；允许负值表示反方向旋转的语义。
+- `navigation_x` / `navigation_y` / `navigation_yaw` 与三个 presence flag
+  `navigation_has_x` / `navigation_has_y` / `navigation_has_yaw` 配对使用：
+  - 每个 `navigation_*` 数值字段都通过 `_optional_coordinate` helper 解析。调用方提供
+    `has_*` 为 `True` 时，对应数值字段必须为有限数；提供 `False` 时，对应数值字段被忽略并归一化
+    为缺省值（`0.0`），同时从 canonical payload 中剔除，避免 0.0 被误读为“显式 0 坐标”。
+  - `has_x` / `has_y` 至少有一个为 `True`，否则视为空目标；`has_yaw` 可以单独为 `False`，
+    表示不指定 yaw。
+- 所有 V2 navigation 数值字段在下发到 ROS action 前都用 `struct.pack('<f', value)` /
+  `struct.unpack('<f', ...)` 做 IEEE-754 binary32 归一化：先把 Python float 截断为 float32 表示，
+  再用 `unpack` 恢复为 float。该步骤与 ROS msg 的 `float32` 字段对齐，确保
+  `canonical_skill_payload()` 计算的 SHA-256 与下游节点接收到的 float32 字节级一致；
+  未做归一化的 NaN / Inf / -0.0 / 双精度扩展位都会被 `validate_public_request_wire_contracts`
+  以 `SKILL_SCHEMA_INVALID` 拒绝。
+- `schema_version` 必须落在 `validate_request_schema_version` 接受集合 `{1, 2}` 内，且与
+  `dispatch_binding.schema_version` 一致；V1 请求携带任何 navigation_* 字段返回
+  `SKILL_SCHEMA_INVALID`，V2 请求缺失必填 navigation_* 字段（按对应 primitive 而定）同样拒绝。
 
 视觉游戏 handler definition 同样保持 ROS 无关。部署策略只包含 `enabled`、`announce`、`handler`
 与公开 `summary`；共享 registry 是 required inputs、结果 schema 和运行时 prompt 的唯一声明源。

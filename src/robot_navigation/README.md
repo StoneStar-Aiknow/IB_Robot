@@ -784,22 +784,59 @@ LiDAR navigation 阶段提供独立于上层任务框架的单线执行接口：
 
 #### CLI 用法
 
-CLI 的平移参数单位为米，转向参数单位为度：
+CLI 的平移参数单位为米，转向参数单位为度。`--action-name` 现在是必填参数，默认值为
+`/navigation/execute`，必须与 `robot_config.navigation.command_server.action_name` 保持一致：
 
 ```bash
-ros2 run robot_navigation nav_cmd status
-ros2 run robot_navigation nav_cmd forward 0.10
-ros2 run robot_navigation nav_cmd backward 0.10
-ros2 run robot_navigation nav_cmd leftward 0.10
-ros2 run robot_navigation nav_cmd rightward 0.10
-ros2 run robot_navigation nav_cmd turn-left 10
-ros2 run robot_navigation nav_cmd turn-right 10
-ros2 run robot_navigation nav_cmd absolute 1.0 0.5 90
-ros2 run robot_navigation nav_cmd cancel
+ros2 run robot_navigation nav_cmd status --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd forward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd backward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd leftward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd rightward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd turn-left 10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd turn-right 10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd absolute 1.0 0.5 90 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd cancel --action-name /navigation/execute
 ```
 
 `status` 同时检查 `/navigation/execute` 和 Nav2 `/navigate_to_pose` 是否可用；`cancel` 会等待
 当前导航任务结束并确认安全速度输出归零。
+
+##### Action name SSOT
+
+`/navigation/execute` 的 action name 来自 `robot_config.navigation.command_server.action_name`
+配置（SSOT）。`robot_config.loader` 会在加载阶段校验该字段，并将其作为
+`robot_execution_endpoints` 的 `navigation_action_name` 投影进 canonical execution-context
+digest。下游节点（`navigation_command_server`、`nav_cmd`、`skill_library` 的
+`ExecuteNavigation` dispatch）必须从该 SSOT 读取，不允许在节点参数或代码中重新声明该 action name。
+旧字段 `embodied.execution.navigation_action_name` 已退役，loader 检测到该键时直接报错。
+
+##### Costmap readiness 检查
+
+`navigation_command_server` 在向 Nav2 发送 `NavigateToPose` goal 前，会先检查
+`/global_costmap/costmap` 数据是否非空（避免在空 costmap 上规划）。检查以
+`costmap_readiness_timeout` 参数控制，默认 `60.0` 秒：
+
+- 在该超时窗口内一直探测 `/global_costmap/costmap`，直到拿到非空 occupancy grid 才向 Nav2
+  发送 goal；
+- 超时仍未拿到非空 costmap 时，`ExecuteNavigation` 直接以 `NAV2_UNAVAILABLE` 终态返回，
+  不会向 Nav2 发送 goal，也不会取得 root lease；
+- 该检查只覆盖 costmap 数据可用性，不保证定位收敛或 planner/controller 已就绪，调用方仍需
+  自行确认 `map -> base_link` 稳定与 Nav2 lifecycle active。
+
+##### Cancel / cleanup 语义
+
+`/navigation/cancel_current` 与 `ExecuteNavigation` goal 取消遵循同一清理路径：
+cancel 请求会等待 Nav2 取消当前 goal、并等待底盘速度指令稳定到零。若速度未能在
+`cancel_cleanup_timeout_sec` 内收敛到零（典型原因：Collision Monitor 仍在发布非零速度、
+底盘 bridge 仍在执行残余指令、或下游 controller 拒绝取消），action 进入
+`STOP_TIMEOUT` 终态：
+
+- `STOP_TIMEOUT` 是 fail-closed 终态：`ExecuteNavigation.Result.success=false`、
+  `error_code=STOP_TIMEOUT`，调用方**不得**释放 root lease，必须显式 finalization 才能恢复；
+- `INTERNAL_ERROR` 终态同样不释放 root lease，由 coordinator ledger terminal record
+  保留 lease 直到操作员介入或后续 `FinalizeWorkflowExecution` 以匹配终态幂等收敛；
+- 正常 `SUCCEEDED`/`CANCELLED` 终态才会释放 root lease 与 runtime bundle retention。
 
 #### ROS 2 Action API
 

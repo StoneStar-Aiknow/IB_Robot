@@ -422,6 +422,89 @@ motion_mode:
 软排序本身只改变执行顺序。启用 `fixed_finger_robust_gap` 时，独立硬门禁使用下降后的低位实测残差，
 不直接使用准备阶段的预测余量。
 
+## 导航端点 SSOT
+
+`robot.navigation.command_server.action_name` 是 `ExecuteNavigation` action 名的**唯一**配置来源
+（默认 `/navigation/execute`）。`robot_config.loader` 在加载阶段把它投影到
+`robot_execution_endpoints.navigation_action_name`，并参与 canonical execution-context digest。
+
+旧字段 `embodied.execution.navigation_action_name` 已退役。`load_robot_config_dict()` 检测到该键时直接
+报错，要求改用 `robot.navigation.command_server.action_name`。`skill_library` 的 nav_* primitive
+dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` CLI 都从该 SSOT 读取，
+不允许在节点参数或代码里重新声明该 action name。
+
+### 公开 API
+
+`robot_config.loader` 暴露以下与导航端点相关的公开 API：
+
+- `navigation_endpoint_projection(robot_config_dict)`：从完整 robot YAML 解析出导航端点身份
+  （`action_name`、`costmap_readiness_timeout`、`cancel_cleanup_timeout_sec`、`active` 布尔）。
+  只在 `robot.navigation.command_server` 存在且 `action_name` 非空时返回非空 projection。
+- `robot_context_schema_version(robot_config_dict)`：根据 endpoint projection 决定
+  `context_schema_version`。profile 选 `base_navigation` 控制模式且 `action_name` 非空时返回 `2`，
+  否则返回 `1`。返回值写入 `SkillRobotContext.context_schema_version`，并进入
+  canonical execution-context digest preimage；切换版本会强制新 registry generation。
+- `robot_execution_endpoints(robot_config_dict)`：返回 V1 10-role endpoint map，加上 V2 时的
+  `navigation_action_name`。V1 profile 上 `navigation_action_name` 必须为空，V2 profile 上必须非空。
+- `validate_navigation_endpoint_contract(robot_config_dict)`：在 loader 阶段校验导航端点契约的
+  一致性。拒绝下列情况：V1 profile 上声明非空 `navigation.command_server.action_name`、
+  V2 profile 上 `action_name` 为空、`action_name` 与 `embodied.execution.navigation_action_name`
+  同时存在但取值不一致、或 `costmap_readiness_timeout` 非正。任一不满足时 `load_robot_config_dict()`
+  在返回配置前直接报错。
+
+### `nav_stage` 参数与 stage 解析
+
+`nav_stage` 是 `robot.launch.py` 的 launch argument，取值为 `mapping` / `navigation`
+（缺省时由 profile 内 `navigation.default_stage` 决定）。stage 解析发生在 launch builder 层，
+不进入 canonical execution-context digest：
+
+- `mapping`：启动 SLAM Toolbox（LiDAR）或 RTAB-Map mapping（RealSense），不启动 Nav2 / AMCL /
+  Collision Monitor。`/cmd_vel` 直接由 `cmd_vel_bridge` 消费。
+- `navigation`：启动 AMCL（LiDAR）或 RTAB-Map localization（RealSense）、Nav2 完整栈、Collision
+  Monitor（仅 LiDAR）与 `navigation_command_server`。`/cmd_vel` 经 Collision Monitor 收口为
+  `/cmd_vel_safe` 再交由 bridge 消费。
+
+stage 不影响 `context_schema_version` —— 只要 profile 选择 `base_navigation` 控制模式且
+`action_name` 非空，就投影为 V2，无论 stage 是 mapping 还是 navigation。但 V2 profile 实际运行
+mapping stage 时不会启动 `navigation_command_server`，因此 nav_* primitive 在 mapping stage 下
+没有可用的 dispatch 端点，调用方应在 navigation stage 才发起 nav_* primitive。
+
+### `base_navigation` 控制模式
+
+`base_navigation` 是 V2 schema 唯一授权导航 primitive 的控制模式。它在 `control_modes` 中声明
+底盘速度控制器集合（典型为 `joint_state_broadcaster` + `base_velocity_controller`），并要求
+`active_control_mode == 'base_navigation'` 才允许 `skill_library` dispatch nav_* primitive。
+
+```yaml
+robot:
+  default_control_mode: "base_navigation"
+
+  control_modes:
+    base_navigation:
+      description: "底盘导航控制模式（V2 schema 独占）"
+      controllers:
+        - joint_state_broadcaster
+        - base_velocity_controller
+      inference:
+        enabled: false
+```
+
+`base_navigation` 与 `moveit_planning`、`teleop`、`model_inference` 互斥（同一时刻只能激活一种
+控制模式）。需要从机械臂操作切到导航时，调用方通过 `motion_mode` 服务切换 `navigation_enabled`
+授权，再通过 `controller_manager` 的 `switch_controller` 切到 `base_navigation` 控制器集合；
+反向切换同样要求先停止当前导航目标。`base_navigation` 不启用任何推理 pipeline；如果机器人
+同时需要导航与机械臂推理，应使用单独的 profile，而不是在 `base_navigation` 下混入 `inference`。
+
+### context_schema_version 与 digest preimage
+
+`context_schema_version` 由 `navigation_endpoint_projection` 决定，并写入
+`SkillRobotContext.context_schema_version`。`robot_config.loader.robot_config_digest` 把
+`context_schema_version`、`execution_endpoints`（含 `navigation_action_name`）、命名位姿/目标、
+关节限位、工作空间、控制模式、timeout policy 与相对运动语义一起纳入 digest preimage。
+切换 `context_schema_version`（例如从 V1 profile 切到 V2 profile）会改变 digest，强制
+`skill_catalog` 重新编译并生成新 registry generation。V1 与 V2 snapshot 在 registry 层
+永远不可互换校验。
+
 ## 控制模式配置
 
 robot_config 包支持双控制模式，以满足不同 AI 模型的需求：

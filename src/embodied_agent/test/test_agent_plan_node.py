@@ -50,6 +50,117 @@ def _workflow_request(request, *skill_names: str) -> None:
         request.workflow_steps.append(step)
 
 
+def test_navigation_steps_normalize_to_v2_and_validate_with_presence():
+    node = object.__new__(AgentPlanNode)
+    source = WorkflowStep()
+    source.schema_version = 2
+    source.skill_name = "nav_abs_coordinate"
+    source.has_x = True
+    source.x = 0.0
+    source.has_y = True
+    source.y = -2.0
+    source.has_yaw = True
+    source.yaw = 0.0
+    catalog = SimpleNamespace(
+        planner_visible_names={"nav_abs_coordinate"},
+        capability_view={
+            "nav_abs_coordinate": {
+                "semantic_level": "atomic_operator",
+                "domain": "navigation",
+                "schema_version": 2,
+            }
+        },
+    )
+
+    steps = node._normalize_steps([source], SimpleNamespace(), catalog)
+    step = steps[0]
+
+    assert step.schema_version == 2
+    assert step.x == pytest.approx(0.0)
+    assert step.y == pytest.approx(-2.0)
+    assert step.yaw == pytest.approx(0.0)
+    message = node._to_workflow_step_message(step)
+    assert message.schema_version == 2
+    assert message.has_x is True and message.x == pytest.approx(0.0)
+
+    captured = {}
+    node._validate_skill_client = object()
+    node._validate_skill_service = "/validate"
+    node._call_service = lambda _client, request, _service: captured.setdefault("request", request)
+    plan = SimpleNamespace(
+        plan_id="plan-1",
+        registry_epoch="epoch",
+        registry_generation=1,
+        registry_digest="digest",
+    )
+    node._validate_step(plan, step)
+    validation = captured["request"]
+    assert validation.schema_version == 2
+    assert validation.has_x is True and validation.x == pytest.approx(0.0)
+    assert validation.has_y is True and validation.y == pytest.approx(-2.0)
+    assert validation.has_yaw is True and validation.yaw == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("submitted_version", "capability_version", "skill_name", "domain"),
+    [
+        (1, 2, "nav_abs_coordinate", "navigation"),
+        (2, 1, "open_gripper_skill", "manipulation"),
+    ],
+)
+def test_plan_rejects_step_capability_version_mismatch_without_validation_or_goal_side_effects(
+    plan_rig, monkeypatch, submitted_version, capability_version, skill_name, domain
+):
+    monkeypatch.setattr(
+        plan_rig.plan_node,
+        "_catalog_view",
+        lambda _status: SimpleNamespace(
+            planner_visible_names={skill_name},
+            capability_view={
+                skill_name: {
+                    "semantic_level": "skill",
+                    "domain": domain,
+                    "schema_version": capability_version,
+                }
+            },
+        ),
+    )
+    request = PlanAgentCommand.Request()
+    request.schema_version = 1
+    request.request_id = f"version-mismatch-{submitted_version}-{capability_version}"
+    request.raw_command = "submit a versioned workflow"
+    step = WorkflowStep()
+    step.schema_version = submitted_version
+    step.skill_name = skill_name
+    request.workflow_steps = [step]
+
+    planned = _future_result(plan_rig.plan_client.call_async(request))
+
+    assert planned.success is False
+    assert planned.error_code == "SKILL_SCHEMA_INVALID"
+    assert planned.plan.plan_token == ""
+    assert plan_rig.validation_requests == []
+    assert plan_rig.executed_goals == []
+
+
+def test_validate_step_propagates_v1_schema_version():
+    captured = {}
+    node = object.__new__(AgentPlanNode)
+    node._validate_skill_client = object()
+    node._validate_skill_service = "/validate"
+    node._call_service = lambda _client, request, _service: captured.setdefault("request", request)
+    plan = SimpleNamespace(
+        plan_id="plan-1",
+        registry_epoch="epoch",
+        registry_generation=1,
+        registry_digest="digest",
+    )
+
+    node._validate_step(plan, CanonicalWorkflowStep(1, "open_gripper_skill"))
+
+    assert captured["request"].schema_version == 1
+
+
 @pytest.fixture
 def plan_rig(request):
     if rclpy.ok():
@@ -97,8 +208,10 @@ def plan_rig(request):
         return response
 
     validation_control = {"registry": registry, "allowed": True}
+    validation_requests = []
 
-    def validate_callback(_request, response):
+    def validate_callback(request, response):
+        validation_requests.append(request)
         response.allowed = validation_control["allowed"]
         response.actual_registry_epoch, response.actual_registry_generation, response.actual_registry_digest = (
             validation_control["registry"]
@@ -175,6 +288,7 @@ def plan_rig(request):
             registry=registry,
             validate_client=validate_client,
             validation_control=validation_control,
+            validation_requests=validation_requests,
             executed_goals=executed_goals,
         )
     finally:
@@ -805,6 +919,48 @@ def test_send_skill_rejects_success_payload_from_aborted_action():
         )
 
     assert raised.value.code == "CAPABILITY_NOT_READY"
+
+
+def test_send_skill_preserves_navigation_goal_presence():
+    captured = {}
+
+    def send_goal(goal):
+        captured["goal"] = goal
+        result = SimpleNamespace(
+            success=True,
+            actual_registry_epoch="epoch",
+            actual_registry_generation=1,
+            actual_registry_digest="digest",
+        )
+        return _DoneFuture(
+            SimpleNamespace(
+                accepted=True,
+                get_result_async=lambda: _DoneFuture(SimpleNamespace(status=4, result=result)),
+            )
+        )
+
+    node = _send_skill_node(SimpleNamespace(wait_for_server=lambda **_: True, send_goal_async=send_goal))
+    step = CanonicalWorkflowStep(
+        schema_version=2,
+        skill_name="nav_abs_coordinate",
+        x=0.0,
+        y=-2.0,
+        yaw=0.0,
+        timeout_sec=1.0,
+    )
+
+    node._send_skill(
+        SimpleNamespace(is_cancel_requested=False),
+        new_binding(task_id="task-1"),
+        step,
+        time.monotonic() + 1.0,
+        ("epoch", 1, "digest"),
+    )
+
+    goal = captured["goal"]
+    assert goal.has_x is True and goal.x == pytest.approx(0.0)
+    assert goal.has_y is True and goal.y == pytest.approx(-2.0)
+    assert goal.has_yaw is True and goal.yaw == pytest.approx(0.0)
 
 
 def test_send_skill_reports_unknown_when_goal_acceptance_times_out():

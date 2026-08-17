@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V2
 from skill_library import gateway_policy
 from skill_library.gateway_policy import (
     BoundedRequestLedger,
@@ -62,13 +63,38 @@ EXPANDED_SKILL_TEMPLATES = {
             {"primitive_name": "move_through_joint_positions"},
         ],
     },
+    "navigation": {
+        "capability": {
+            "parameters": _parameters(
+                {
+                    "direction": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                    "distance": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+                },
+                ["direction", "distance"],
+            )
+        },
+        "primitive_sequence": [{"primitive_name": "nav_straight"}],
+    },
+    "absolute_navigation": {
+        "capability": {
+            "parameters": _parameters(
+                {
+                    "x": {"type": "number", "unit": "meters"},
+                    "y": {"type": "number", "unit": "meters"},
+                    "yaw": {"type": "number", "unit": "degrees"},
+                },
+                ["x", "y", "yaw"],
+            )
+        },
+        "primitive_sequence": [{"primitive_name": "nav_abs_coordinate"}],
+    },
 }
 
 
 def _policy() -> GatewayPolicy:
     return GatewayPolicy(
         TIMEOUT_POLICY,
-        build_skill_requirements(EXPANDED_SKILL_TEMPLATES),
+        build_skill_requirements(EXPANDED_SKILL_TEMPLATES, PRIMITIVE_CONTRACT_V2.descriptors),
         parameter_schemas=build_skill_parameter_schemas(EXPANDED_SKILL_TEMPLATES),
     )
 
@@ -79,7 +105,7 @@ def _atomic_policy() -> tuple[GatewayPolicy, BoundedRequestLedger, RootExecution
     return (
         GatewayPolicy(
             TIMEOUT_POLICY,
-            build_skill_requirements(EXPANDED_SKILL_TEMPLATES),
+            build_skill_requirements(EXPANDED_SKILL_TEMPLATES, PRIMITIVE_CONTRACT_V2.descriptors),
             parameter_schemas=build_skill_parameter_schemas(EXPANDED_SKILL_TEMPLATES),
             ledger=ledger,
             lease=lease,
@@ -147,12 +173,14 @@ def test_policy_keeps_invalid_request_timeout_as_local_value_error(timeout_sec):
         _policy().prepare(_request(timeout_sec=timeout_sec))
 
 
-def test_policy_rejects_timeout_over_budget_without_truncating_effective_timeout():
+def test_policy_rejects_timeout_over_budget_using_wire_effective_timeout():
     decision = _policy().evaluate(_request(timeout_sec=10.1), _snapshot())
 
     assert not decision.admitted
     assert decision.error_code == "TIMEOUT_EXCEEDS_POLICY"
-    assert decision.effective_timeout_sec == 10.1
+    assert decision.prepared_request is not None
+    assert decision.effective_timeout_sec == decision.prepared_request.payload["timeout_sec"]
+    assert decision.effective_timeout_sec == pytest.approx(10.1)
 
 
 def test_workflow_root_lease_issues_only_internal_child_borrows() -> None:
@@ -279,7 +307,7 @@ def test_policy_reports_first_unavailable_required_capability(skill_name, snapsh
 
 
 def test_build_skill_requirements_maps_primitives_and_initial_gripper_state():
-    requirements = build_skill_requirements(EXPANDED_SKILL_TEMPLATES)
+    requirements = build_skill_requirements(EXPANDED_SKILL_TEMPLATES, PRIMITIVE_CONTRACT_V2.descriptors)
 
     assert requirements["named"] == SkillRequirements(validate_skill=True, task_executor=True)
     assert requirements["relative"] == SkillRequirements(
@@ -288,9 +316,41 @@ def test_build_skill_requirements_maps_primitives_and_initial_gripper_state():
         fresh_ee_pose=True,
     )
     assert requirements["joint"] == SkillRequirements(validate_skill=True, arm_trajectory=True)
+    assert requirements["navigation"] == SkillRequirements(validate_skill=True, navigation=True)
 
     with pytest.raises(ValueError, match="unknown primitive"):
         build_skill_requirements({"unknown": {"primitive_sequence": [{"primitive_name": "not_real"}]}})
+
+
+def test_navigation_readiness_uses_navigation_action_state():
+    decision = _policy().evaluate(
+        GatewayRequest(
+            task_id="nav-1",
+            skill_name="navigation",
+            direction="left",
+            distance=1.0,
+        ),
+        _snapshot(navigation_ready=False),
+    )
+
+    assert not decision.admitted
+    assert decision.error_code == "CAPABILITY_NOT_READY"
+    assert decision.message == "navigation action unavailable"
+
+
+def test_absolute_navigation_accepts_explicit_zero_and_signed_coordinates():
+    decision = _policy().evaluate(
+        GatewayRequest(
+            task_id="nav-absolute-1",
+            skill_name="absolute_navigation",
+            x=0.0,
+            y=-2.5,
+            yaw=-180.0,
+        ),
+        _snapshot(navigation_ready=True),
+    )
+
+    assert decision.admitted
 
 
 def test_root_execution_lease_uses_opaque_token_for_reuse_and_release():

@@ -1,5 +1,8 @@
+import math
+
 import pytest
 
+from ibrobot_msgs.action import ExecuteNavigation
 from skill_library.resolver import direction_to_delta, resolve_skill_primitives
 
 SKILL_TEMPLATES = {
@@ -31,6 +34,34 @@ SKILL_TEMPLATES = {
                 "primitive_name": "move_relative_ee",
                 "motion_direction_from_request": True,
                 "motion_distance_from_request": True,
+            }
+        ]
+    },
+    "nav_straight": {
+        "primitive_sequence": [
+            {
+                "primitive_name": "nav_straight",
+                "direction_from_request": True,
+                "distance_from_request": True,
+            }
+        ]
+    },
+    "nav_turn": {
+        "primitive_sequence": [
+            {
+                "primitive_name": "nav_turn",
+                "direction_from_request": True,
+                "degree_from_request": True,
+            }
+        ]
+    },
+    "nav_abs_coordinate": {
+        "primitive_sequence": [
+            {
+                "primitive_name": "nav_abs_coordinate",
+                "x_from_request": True,
+                "y_from_request": True,
+                "yaw_from_request": True,
             }
         ]
     },
@@ -186,3 +217,102 @@ def test_default_templates_resolve_gripper_rotation_skill():
     )
     assert [primitive.primitive_name for primitive in primitives] == ["rotate_gripper_cw"]
     assert primitives[0].relative_dz == 30.0
+
+
+def _resolve_navigation(skill_name, **navigation_parameters):
+    goal = resolve_skill_primitives(
+        skill_name,
+        "",
+        "",
+        "",
+        0.0,
+        {},
+        1.0,
+        0.15,
+        SKILL_TEMPLATES,
+        None,
+        **navigation_parameters,
+    )[0].navigation_goal
+    assert goal is not None
+    return goal
+
+
+@pytest.mark.parametrize(
+    ("direction", "command_type"),
+    [
+        ("forward", ExecuteNavigation.Goal.FORWARD),
+        ("backward", ExecuteNavigation.Goal.BACKWARD),
+        ("left", ExecuteNavigation.Goal.STRAFE_LEFT),
+        ("right", ExecuteNavigation.Goal.STRAFE_RIGHT),
+    ],
+)
+def test_resolve_navigation_straight_maps_four_directions(direction, command_type):
+    goal = _resolve_navigation("nav_straight", direction=direction, distance=1.25)
+
+    assert goal.command_type == command_type
+    assert goal.value == 1.25
+
+
+@pytest.mark.parametrize(
+    ("direction", "command_type"),
+    [("left", ExecuteNavigation.Goal.TURN_LEFT), ("right", ExecuteNavigation.Goal.TURN_RIGHT)],
+)
+def test_resolve_navigation_turn_converts_degrees_to_radians(direction, command_type):
+    goal = _resolve_navigation("nav_turn", direction=direction, degree=90.0)
+
+    assert goal.command_type == command_type
+    assert goal.value == pytest.approx(math.pi / 2.0)
+
+
+def test_resolve_navigation_turn_preserves_large_requested_angle():
+    goal = _resolve_navigation("nav_turn", direction="left", degree=450.0)
+
+    assert goal.value == pytest.approx(5.0 * math.pi / 2.0)
+
+
+def test_resolve_absolute_coordinate_preserves_zero_negative_values_and_map_frame():
+    goal = _resolve_navigation("nav_abs_coordinate", x=0.0, y=-2.5, yaw=-180.0)
+
+    assert goal.command_type == ExecuteNavigation.Goal.ABSOLUTE_POSE
+    assert goal.value == 0.0
+    assert goal.target_pose.header.frame_id == "map"
+    assert goal.target_pose.pose.position.x == 0.0
+    assert goal.target_pose.pose.position.y == -2.5
+    assert goal.target_pose.pose.orientation.z == pytest.approx(-1.0)
+    assert goal.target_pose.pose.orientation.w == pytest.approx(0.0, abs=1e-15)
+
+
+@pytest.mark.parametrize("missing_field", ["x", "y", "yaw"])
+def test_resolve_absolute_coordinate_requires_all_values(missing_field):
+    values: dict[str, float | None] = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+    values[missing_field] = None
+
+    with pytest.raises(ValueError, match=missing_field):
+        _resolve_navigation("nav_abs_coordinate", **values)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    ("skill_name", "parameters", "field_name"),
+    [
+        ("nav_straight", {"direction": "forward", "distance": None}, "distance"),
+        ("nav_turn", {"direction": "left", "degree": None}, "degree"),
+        ("nav_abs_coordinate", {"x": None, "y": 0.0, "yaw": 0.0}, "x"),
+        ("nav_abs_coordinate", {"x": 0.0, "y": None, "yaw": 0.0}, "y"),
+        ("nav_abs_coordinate", {"x": 0.0, "y": 0.0, "yaw": None}, "yaw"),
+    ],
+)
+def test_resolve_navigation_rejects_non_finite_values(skill_name, parameters, field_name, value):
+    parameters[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
+        _resolve_navigation(skill_name, **parameters)
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "parameters"),
+    [("nav_straight", {"direction": "forward", "distance": 0.0}), ("nav_turn", {"direction": "left", "degree": -1.0})],
+)
+def test_resolve_relative_navigation_requires_positive_magnitude(skill_name, parameters):
+    with pytest.raises(ValueError, match="positive"):
+        _resolve_navigation(skill_name, **parameters)

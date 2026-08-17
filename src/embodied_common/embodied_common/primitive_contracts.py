@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
@@ -17,6 +17,18 @@ class PrimitiveDescriptor:
     parameter_contract: MappingProxyType
     required_runtime_capabilities: tuple[str, ...]
     dispatch_kind: str
+
+
+@dataclass(frozen=True)
+class PrimitiveContractSet:
+    schema_version: int
+    descriptors: MappingProxyType
+    digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        descriptors = MappingProxyType(dict(self.descriptors))
+        object.__setattr__(self, "descriptors", descriptors)
+        object.__setattr__(self, "digest", sha256_text(canonical_json(_primitive_contract_preimage(self))))
 
 
 def _property(type_name: str, **constraints: Any) -> dict[str, Any]:
@@ -67,6 +79,7 @@ def _object(
 def _descriptor(
     name: str,
     *,
+    schema_version: int = 1,
     dispatch_kind: str,
     capabilities: tuple[str, ...],
     properties: dict[str, dict[str, Any]] | None = None,
@@ -75,7 +88,7 @@ def _descriptor(
     all_of: tuple[dict[str, Any], ...] = (),
 ) -> PrimitiveDescriptor:
     return PrimitiveDescriptor(
-        schema_version=1,
+        schema_version=schema_version,
         name=name,
         parameter_contract=_object(name, properties, required, one_of=one_of, all_of=all_of),
         required_runtime_capabilities=tuple(sorted(set(capabilities))),
@@ -85,6 +98,7 @@ def _descriptor(
 
 _TASK_EXECUTOR_CAPABILITIES = ("task_executor", "validate_skill")
 _ARM_TRAJECTORY_CAPABILITIES = ("arm_trajectory", "validate_skill")
+_NAVIGATION_CAPABILITIES = ("navigation", "validate_skill")
 
 _JOINT_MAPPING = {"type": "object", "additionalProperties": {"type": "number"}}
 _POSITIVE_DURATION = _property("number", exclusiveMinimum=0.0)
@@ -97,6 +111,24 @@ def _closed_branch(properties: dict[str, Any], required: tuple[str, ...]) -> dic
         "required": ["primitive_name", *required],
         "additionalProperties": False,
     }
+
+
+def _request_bound_choices(properties: dict[str, dict[str, Any]], parameter_names: tuple[str, ...]) -> tuple[dict, ...]:
+    choices = []
+    for parameter_name in parameter_names:
+        request_field = f"{parameter_name}_from_request"
+        literal_properties = {name: schema for name, schema in properties.items() if name != request_field}
+        request_properties = {name: schema for name, schema in properties.items() if name != parameter_name}
+        request_properties[request_field] = {"type": "boolean", "const": True}
+        choices.append(
+            {
+                "oneOf": (
+                    _closed_branch(literal_properties, (parameter_name,)),
+                    _closed_branch(request_properties, (request_field,)),
+                )
+            }
+        )
+    return tuple(choices)
 
 
 _JOINT_SELECTION = (
@@ -188,173 +220,218 @@ _WAYPOINT = {
     "additionalProperties": False,
 }
 
-PRIMITIVE_DESCRIPTORS = MappingProxyType(
-    {
-        descriptor.name: descriptor
-        for descriptor in (
-            _descriptor(
-                "move_to_named_pose",
-                dispatch_kind="task_executor_action",
-                capabilities=_TASK_EXECUTOR_CAPABILITIES,
-                properties={
-                    "pose_name": _property("string"),
-                    "target_pose_key": _property("string"),
-                    "place_name_from_request": _property("boolean"),
-                },
-                one_of=(
-                    _closed_branch({"pose_name": _property("string")}, ("pose_name",)),
-                    _closed_branch({"target_pose_key": _property("string")}, ("target_pose_key",)),
+_NAV_STRAIGHT_PROPERTIES = {
+    "direction": _property("string", enum=("forward", "backward", "left", "right")),
+    "direction_from_request": _property("boolean"),
+    "distance": _property("number", exclusiveMinimum=0.0),
+    "distance_from_request": _property("boolean"),
+}
+_NAV_TURN_PROPERTIES = {
+    "direction": _property("string", enum=("left", "right")),
+    "direction_from_request": _property("boolean"),
+    "degree": _property("number", exclusiveMinimum=0.0),
+    "degree_from_request": _property("boolean"),
+}
+_NAV_ABS_COORDINATE_PROPERTIES = {
+    "x": _property("number"),
+    "x_from_request": _property("boolean"),
+    "y": _property("number"),
+    "y_from_request": _property("boolean"),
+    "yaw": _property("number"),
+    "yaw_from_request": _property("boolean"),
+}
+
+_V1_DESCRIPTOR_LIST = (
+    _descriptor(
+        "move_to_named_pose",
+        dispatch_kind="task_executor_action",
+        capabilities=_TASK_EXECUTOR_CAPABILITIES,
+        properties={
+            "pose_name": _property("string"),
+            "target_pose_key": _property("string"),
+            "place_name_from_request": _property("boolean"),
+        },
+        one_of=(
+            _closed_branch({"pose_name": _property("string")}, ("pose_name",)),
+            _closed_branch({"target_pose_key": _property("string")}, ("target_pose_key",)),
+            _closed_branch(
+                {"place_name_from_request": {"type": "boolean", "const": True}},
+                ("place_name_from_request",),
+            ),
+        ),
+    ),
+    _descriptor(
+        "move_to_pose",
+        dispatch_kind="task_executor_action",
+        capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
+    ),
+    _descriptor(
+        "move_to_configuration",
+        dispatch_kind="move_configuration_service",
+        capabilities=("move_configuration", "validate_skill"),
+        properties={
+            "joint_positions": _JOINT_MAPPING,
+            "joint_position_offsets": _JOINT_MAPPING,
+            "duration_sec": _POSITIVE_DURATION,
+        },
+        one_of=_JOINT_SELECTION,
+    ),
+    _descriptor(
+        "move_relative_ee",
+        dispatch_kind="task_executor_action",
+        capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
+        properties={
+            "motion_direction": _property("string"),
+            "motion_direction_from_request": _property("boolean"),
+            "motion_distance": _property("number", exclusiveMinimum=0.0),
+            "motion_distance_from_request": _property("boolean"),
+        },
+        all_of=(
+            {
+                "oneOf": (
                     _closed_branch(
-                        {"place_name_from_request": {"type": "boolean", "const": True}},
-                        ("place_name_from_request",),
-                    ),
-                ),
-            ),
-            _descriptor(
-                "move_to_pose",
-                dispatch_kind="task_executor_action",
-                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
-            ),
-            _descriptor(
-                "move_to_configuration",
-                dispatch_kind="move_configuration_service",
-                capabilities=("move_configuration", "validate_skill"),
-                properties={
-                    "joint_positions": _JOINT_MAPPING,
-                    "joint_position_offsets": _JOINT_MAPPING,
-                    "duration_sec": _POSITIVE_DURATION,
-                },
-                one_of=_JOINT_SELECTION,
-            ),
-            _descriptor(
-                "move_relative_ee",
-                dispatch_kind="task_executor_action",
-                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
-                properties={
-                    "motion_direction": _property("string"),
-                    "motion_direction_from_request": _property("boolean"),
-                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                    "motion_distance_from_request": _property("boolean"),
-                },
-                all_of=(
-                    {
-                        "oneOf": (
-                            _closed_branch(
-                                {
-                                    "motion_direction": {
-                                        "type": "string",
-                                        "enum": ("forward", "backward", "left", "right", "up", "down"),
-                                    },
-                                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                                    "motion_distance_from_request": _property("boolean"),
-                                },
-                                ("motion_direction",),
-                            ),
-                            _closed_branch(
-                                {
-                                    "motion_direction_from_request": {"type": "boolean", "const": True},
-                                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                                    "motion_distance_from_request": _property("boolean"),
-                                },
-                                ("motion_direction_from_request",),
-                            ),
-                        )
-                    },
-                    {
-                        "oneOf": (
-                            _closed_branch(
-                                {
-                                    "motion_direction": _property("string"),
-                                    "motion_direction_from_request": _property("boolean"),
-                                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                                },
-                                ("motion_distance",),
-                            ),
-                            _closed_branch(
-                                {
-                                    "motion_direction": _property("string"),
-                                    "motion_direction_from_request": _property("boolean"),
-                                    "motion_distance_from_request": {"type": "boolean", "const": True},
-                                },
-                                ("motion_distance_from_request",),
-                            ),
-                        )
-                    },
-                ),
-            ),
-            _descriptor(
-                "move_to_joint_positions",
-                dispatch_kind="arm_trajectory_action",
-                capabilities=_ARM_TRAJECTORY_CAPABILITIES,
-                properties={
-                    "joint_positions": _JOINT_MAPPING,
-                    "joint_position_offsets": _JOINT_MAPPING,
-                    "duration_sec": _POSITIVE_DURATION,
-                },
-                one_of=_JOINT_SELECTION,
-            ),
-            _descriptor(
-                "move_through_joint_positions",
-                dispatch_kind="arm_trajectory_action",
-                capabilities=_ARM_TRAJECTORY_CAPABILITIES,
-                properties={
-                    "trajectory_template": _TRAJECTORY_TEMPLATE,
-                    "joint_waypoints": {"type": "array", "minItems": 1, "items": _WAYPOINT},
-                    "waypoint_duration_sec": _property("number", exclusiveMinimum=0.0),
-                },
-                one_of=(
-                    _closed_branch(
-                        {"trajectory_template": _TRAJECTORY_TEMPLATE},
-                        ("trajectory_template",),
+                        {
+                            "motion_direction": {
+                                "type": "string",
+                                "enum": ("forward", "backward", "left", "right", "up", "down"),
+                            },
+                            "motion_distance": _property("number", exclusiveMinimum=0.0),
+                            "motion_distance_from_request": _property("boolean"),
+                        },
+                        ("motion_direction",),
                     ),
                     _closed_branch(
                         {
-                            "joint_waypoints": {"type": "array", "minItems": 1, "items": _WAYPOINT},
-                            "waypoint_duration_sec": _POSITIVE_DURATION,
+                            "motion_direction_from_request": {"type": "boolean", "const": True},
+                            "motion_distance": _property("number", exclusiveMinimum=0.0),
+                            "motion_distance_from_request": _property("boolean"),
                         },
-                        ("joint_waypoints", "waypoint_duration_sec"),
+                        ("motion_direction_from_request",),
                     ),
-                ),
+                )
+            },
+            {
+                "oneOf": (
+                    _closed_branch(
+                        {
+                            "motion_direction": _property("string"),
+                            "motion_direction_from_request": _property("boolean"),
+                            "motion_distance": _property("number", exclusiveMinimum=0.0),
+                        },
+                        ("motion_distance",),
+                    ),
+                    _closed_branch(
+                        {
+                            "motion_direction": _property("string"),
+                            "motion_direction_from_request": _property("boolean"),
+                            "motion_distance_from_request": {"type": "boolean", "const": True},
+                        },
+                        ("motion_distance_from_request",),
+                    ),
+                )
+            },
+        ),
+    ),
+    _descriptor(
+        "move_to_joint_positions",
+        dispatch_kind="arm_trajectory_action",
+        capabilities=_ARM_TRAJECTORY_CAPABILITIES,
+        properties={
+            "joint_positions": _JOINT_MAPPING,
+            "joint_position_offsets": _JOINT_MAPPING,
+            "duration_sec": _POSITIVE_DURATION,
+        },
+        one_of=_JOINT_SELECTION,
+    ),
+    _descriptor(
+        "move_through_joint_positions",
+        dispatch_kind="arm_trajectory_action",
+        capabilities=_ARM_TRAJECTORY_CAPABILITIES,
+        properties={
+            "trajectory_template": _TRAJECTORY_TEMPLATE,
+            "joint_waypoints": {"type": "array", "minItems": 1, "items": _WAYPOINT},
+            "waypoint_duration_sec": _property("number", exclusiveMinimum=0.0),
+        },
+        one_of=(
+            _closed_branch(
+                {"trajectory_template": _TRAJECTORY_TEMPLATE},
+                ("trajectory_template",),
             ),
-            _descriptor(
-                "open_gripper",
-                dispatch_kind="task_executor_action",
-                capabilities=_TASK_EXECUTOR_CAPABILITIES,
-            ),
-            _descriptor(
-                "close_gripper",
-                dispatch_kind="task_executor_action",
-                capabilities=_TASK_EXECUTOR_CAPABILITIES,
-            ),
-            _descriptor(
-                "rotate_gripper_cw",
-                dispatch_kind="task_executor_action",
-                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
-                properties={
-                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                    "motion_distance_from_request": _property("boolean"),
+            _closed_branch(
+                {
+                    "joint_waypoints": {"type": "array", "minItems": 1, "items": _WAYPOINT},
+                    "waypoint_duration_sec": _POSITIVE_DURATION,
                 },
+                ("joint_waypoints", "waypoint_duration_sec"),
             ),
-            _descriptor(
-                "rotate_gripper_ccw",
-                dispatch_kind="task_executor_action",
-                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
-                properties={
-                    "motion_distance": _property("number", exclusiveMinimum=0.0),
-                    "motion_distance_from_request": _property("boolean"),
-                },
-            ),
-        )
-    }
+        ),
+    ),
+    _descriptor(
+        "open_gripper",
+        dispatch_kind="task_executor_action",
+        capabilities=_TASK_EXECUTOR_CAPABILITIES,
+    ),
+    _descriptor(
+        "close_gripper",
+        dispatch_kind="task_executor_action",
+        capabilities=_TASK_EXECUTOR_CAPABILITIES,
+    ),
+    _descriptor(
+        "rotate_gripper_cw",
+        dispatch_kind="task_executor_action",
+        capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
+        properties={
+            "motion_distance": _property("number", exclusiveMinimum=0.0),
+            "motion_distance_from_request": _property("boolean"),
+        },
+    ),
+    _descriptor(
+        "rotate_gripper_ccw",
+        dispatch_kind="task_executor_action",
+        capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
+        properties={
+            "motion_distance": _property("number", exclusiveMinimum=0.0),
+            "motion_distance_from_request": _property("boolean"),
+        },
+    ),
 )
 
-SUPPORTED_PRIMITIVES = frozenset(PRIMITIVE_DESCRIPTORS)
+_V2_NAVIGATION_DESCRIPTOR_LIST = (
+    _descriptor(
+        "nav_straight",
+        schema_version=2,
+        dispatch_kind="navigation_action",
+        capabilities=_NAVIGATION_CAPABILITIES,
+        properties=_NAV_STRAIGHT_PROPERTIES,
+        all_of=_request_bound_choices(_NAV_STRAIGHT_PROPERTIES, ("direction", "distance")),
+    ),
+    _descriptor(
+        "nav_turn",
+        schema_version=2,
+        dispatch_kind="navigation_action",
+        capabilities=_NAVIGATION_CAPABILITIES,
+        properties=_NAV_TURN_PROPERTIES,
+        all_of=_request_bound_choices(_NAV_TURN_PROPERTIES, ("direction", "degree")),
+    ),
+    _descriptor(
+        "nav_abs_coordinate",
+        schema_version=2,
+        dispatch_kind="navigation_action",
+        capabilities=_NAVIGATION_CAPABILITIES,
+        properties=_NAV_ABS_COORDINATE_PROPERTIES,
+        all_of=_request_bound_choices(_NAV_ABS_COORDINATE_PROPERTIES, ("x", "y", "yaw")),
+    ),
+)
 
 
-def primitive_contract_preimage() -> dict[str, Any]:
+def _descriptor_mapping(descriptors: tuple[PrimitiveDescriptor, ...]) -> MappingProxyType:
+    return MappingProxyType({descriptor.name: descriptor for descriptor in descriptors})
+
+
+def _primitive_contract_preimage(contract: PrimitiveContractSet) -> dict[str, Any]:
     primitives = []
-    for name in sorted(PRIMITIVE_DESCRIPTORS):
-        descriptor = PRIMITIVE_DESCRIPTORS[name]
+    for name in sorted(contract.descriptors):
+        descriptor = contract.descriptors[name]
         primitives.append(
             {
                 "schema_version": descriptor.schema_version,
@@ -364,14 +441,38 @@ def primitive_contract_preimage() -> dict[str, Any]:
                 "dispatch_kind": descriptor.dispatch_kind,
             }
         )
-    return {"schema_version": 1, "primitives": primitives}
+    return {"schema_version": contract.schema_version, "primitives": primitives}
+
+
+def primitive_contract_preimage(contract: PrimitiveContractSet | None = None) -> dict[str, Any]:
+    return _primitive_contract_preimage(contract or PRIMITIVE_CONTRACT_V1)
 
 
 def canonical_json(value: Any) -> str:
     return to_canonical_json(value)
 
 
-PRIMITIVE_CONTRACT_DIGEST = sha256_text(canonical_json(primitive_contract_preimage()))
+PRIMITIVE_CONTRACT_V1 = PrimitiveContractSet(1, _descriptor_mapping(_V1_DESCRIPTOR_LIST))
+PRIMITIVE_CONTRACT_V2 = PrimitiveContractSet(
+    2,
+    _descriptor_mapping(_V1_DESCRIPTOR_LIST + _V2_NAVIGATION_DESCRIPTOR_LIST),
+)
+
+PRIMITIVE_DESCRIPTORS = PRIMITIVE_CONTRACT_V1.descriptors
+SUPPORTED_PRIMITIVES = frozenset(PRIMITIVE_CONTRACT_V1.descriptors)
+
+
+PRIMITIVE_CONTRACT_DIGEST = PRIMITIVE_CONTRACT_V1.digest
+
+
+def primitive_contract_for_version(version: int) -> PrimitiveContractSet:
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract version: {version}")
+    if version == 1:
+        return PRIMITIVE_CONTRACT_V1
+    if version == 2:
+        return PRIMITIVE_CONTRACT_V2
+    raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract version: {version}")
 
 
 def get_primitive_descriptor(name: str) -> PrimitiveDescriptor:

@@ -51,6 +51,10 @@ PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 Agent 必须通过 `robot-skill plan-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
 `raw_command` 只作为审计文本和幂等请求摘要的一部分。
 
+每个 `WorkflowStep` 必须显式携带 `schema_version`。非导航旧合同使用 v1，导航 typed step 使用 v2；CLI 拒绝缺少
+版本的导航步骤，不会从 `domain` 推导或重写版本。IDL/生成接口、wire preflight、执行器、CLI 和 Agent skill 文档
+按同一版本原子部署，避免新旧 public request wire 混装。
+
 ## 边界
 
 - 本包不得调用 primitive、MoveIt 或 controller。

@@ -37,6 +37,44 @@ def _enabled_game_view() -> dict:
     )
 
 
+def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
+    from robot_config import loader
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    root = Path(__file__).resolve().parents[3]
+    config_path = root / "src/robot_config/config/robots/lekiwi_lidar.yaml"
+    mount_path = root / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+    original_resolver = loader.resolve_ros_path
+
+    def resolve_path(value):
+        if value == "$(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml":
+            return str(mount_path)
+        return original_resolver(value)
+
+    monkeypatch.setattr(loader, "resolve_ros_path", resolve_path)
+    navigation = loader.load_robot_config_dict(config_path, nav_stage="navigation")
+
+    snapshot = compile_local_snapshot(navigation, config_path)
+
+    assert snapshot.robot_context.context_schema_version == 2
+    assert snapshot.robot_context.execution_endpoints["navigation_action"] == "/navigation/execute"
+    assert set(snapshot.enabled_skill_names) == {
+        "nav_abs_coordinate",
+        "nav_straight",
+        "nav_turn",
+    }
+
+
+def test_non_navigation_profile_keeps_v1_robot_context():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    config = load_robot_config_dict(CONFIG_PATH)
+    snapshot = compile_local_snapshot(config, CONFIG_PATH)
+
+    assert snapshot.robot_context.context_schema_version == 1
+    assert "navigation_action" not in snapshot.robot_context.execution_endpoints
+
+
 def test_catalog_import_does_not_load_rclpy(monkeypatch):
     original_import = builtins.__import__
 
@@ -63,6 +101,72 @@ def test_agent_control_timeout_preserves_larger_configured_value():
 
     context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 40.0}}})()
     assert _plan_rpc_timeout(context) == 40.0
+
+
+@pytest.mark.parametrize(
+    "workflow_step",
+    [
+        {
+            "schema_version": 1,
+            "skill_name": "nav_abs_coordinate",
+            "has_x": False,
+            "x": 0.0,
+        },
+        {
+            "schema_version": 2,
+            "skill_name": "open_gripper_skill",
+        },
+    ],
+)
+def test_plan_workflow_forwards_explicit_step_version_without_domain_inference(workflow_step):
+    from robot_skill_cli.cli import _run_plan_workflow
+
+    context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 2.0}})
+    bridge = Mock()
+    bridge.plan_agent_command.return_value = {"success": True}
+    args = SimpleNamespace(
+        request_id="versioned-workflow",
+        raw_command="submit an explicit workflow",
+        workflow_json=json.dumps([workflow_step]),
+    )
+
+    result = _run_plan_workflow(args, context, bridge)
+
+    assert result == {"success": True}
+    bridge.plan_agent_command.assert_called_once_with(
+        request_id="versioned-workflow",
+        raw_command="submit an explicit workflow",
+        workflow_steps=[workflow_step],
+        timeout_sec=30.0,
+    )
+
+
+def test_plan_workflow_rejects_unversioned_typed_step_instead_of_domain_rewriting():
+    from robot_skill_cli.cli import _CliArgumentError, _run_plan_workflow
+
+    context = SimpleNamespace(
+        view={
+            "timeout_policy": {"rpc_timeout_sec": 2.0},
+            "skills": [
+                {
+                    "name": "nav_abs_coordinate",
+                    "schema_version": 2,
+                    "domain": "navigation",
+                }
+            ],
+        }
+    )
+    bridge = Mock()
+    args = SimpleNamespace(
+        request_id="unversioned-workflow",
+        raw_command="submit an unversioned workflow",
+        workflow_json=json.dumps([{"skill_name": "nav_abs_coordinate", "x": 0.0}]),
+    )
+
+    with pytest.raises(_CliArgumentError, match="schema_version"):
+        _run_plan_workflow(args, context, bridge)
+
+    bridge.plan_agent_command.assert_not_called()
 
 
 def test_load_catalog_uses_exported_config_resolver(monkeypatch):
@@ -107,6 +211,7 @@ def test_list_skills_uses_every_profile_enabled_entry_and_only_public_fields():
         set(skill)
         == {
             "name",
+            "contract_schema_version",
             "summary",
             "domain",
             "moves_robot",
@@ -400,6 +505,7 @@ def test_catalog_list_and_describe_project_explicit_capability_fields():
 
     assert set(listed["skills"][0]) == {
         "name",
+        "contract_schema_version",
         "summary",
         "domain",
         "moves_robot",
@@ -481,6 +587,7 @@ def test_catalog_uses_capability_metadata_without_legacy_descriptions():
 
     assert listed == {
         "name": "fallback",
+        "contract_schema_version": 1,
         "summary": "Open the fallback gripper.",
         "domain": "manipulation",
         "moves_robot": True,
@@ -560,6 +667,56 @@ def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
 
 
 @pytest.mark.parametrize(
+    ("skill_name", "arguments", "properties", "expected"),
+    [
+        (
+            "nav_straight",
+            ["--direction", "left", "--distance", "1.25"],
+            {
+                "direction": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                "distance": {"type": "number", "exclusiveMinimum": 0},
+            },
+            {"direction": "left", "distance": 1.25},
+        ),
+        (
+            "nav_turn",
+            ["--direction", "right", "--degree", "450"],
+            {
+                "direction": {"type": "string", "enum": ["left", "right"]},
+                "degree": {"type": "number", "exclusiveMinimum": 0},
+            },
+            {"direction": "right", "degree": 450.0},
+        ),
+        (
+            "nav_abs_coordinate",
+            ["--x", "0", "--y", "-2.5", "--yaw", "0"],
+            {"x": {"type": "number"}, "y": {"type": "number"}, "yaw": {"type": "number"}},
+            {"x": 0.0, "y": -2.5, "yaw": 0.0},
+        ),
+    ],
+)
+def test_navigation_cli_parser_validates_all_public_parameters(skill_name, arguments, properties, expected):
+    from robot_skill_cli.cli import _build_parser, _validate_schema
+
+    args = _build_parser().parse_args(["validate", skill_name, *arguments])
+    skill = {
+        "name": skill_name,
+        "parameters": {
+            "properties": properties,
+            "required": list(properties),
+        },
+    }
+
+    _validate_schema(skill, args)
+
+    for field_name, value in expected.items():
+        actual = getattr(args, field_name)
+        assert actual == pytest.approx(value) if isinstance(value, float) else actual == value
+    assert args.motion_direction is None
+    assert args.motion_distance is None
+
+
+@pytest.mark.parametrize(
     ("error_code", "exit_code"),
     [
         ("SKILL_PACKAGE_NOT_FOUND", 10),
@@ -591,12 +748,14 @@ def test_runtime_capability_view_rejects_tampered_snapshot() -> None:
 def test_skill_payload_normalization_and_default_timeout_identity():
     omitted = canonical_skill_payload(
         " move_relative_ee ",
+        schema_version=1,
         motion_direction=" FoRwArD ",
         motion_distance=-0.0,
         default_timeout_sec=30.0,
     )
     explicit = canonical_skill_payload(
         "move_relative_ee",
+        schema_version=1,
         motion_direction="forward",
         motion_distance=0.0,
         timeout_sec=30,
@@ -619,7 +778,7 @@ def test_skill_payload_normalization_and_default_timeout_identity():
 )
 def test_skill_payload_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):
-        canonical_skill_payload(default_timeout_sec=30.0, **kwargs)
+        canonical_skill_payload(schema_version=1, default_timeout_sec=30.0, **kwargs)
 
 
 def test_schema_allows_omitted_optional_declared_parameter():

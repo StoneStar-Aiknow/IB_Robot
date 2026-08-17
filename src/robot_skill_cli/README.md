@@ -47,7 +47,9 @@ source install/local_setup.sh
 | `game-result --request-id ID` | 是 | 查询视觉游戏的 pending/terminal 结果 |
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
-`ValidateSkill`、`SkillCommand`、Agent plan services/actions 和标准 `CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。
+`ValidateSkill`、`SkillCommand`、`ValidatePrimitive`、`PrimitiveCommand`、Agent plan services/actions 和标准
+`CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。Hermes 启动前会先验证四个版本化
+Skill/Primitive 公共接口，再检查 Gateway/Agent 接口。
 
 ```bash
 robot-skill --config-name so101_single_arm list-skills
@@ -69,7 +71,7 @@ robot-skill --config-name so101_single_arm cancel \
 
 robot-skill --config-name so101_single_arm plan-workflow \
   --request-id plan-request-001 --text "打开夹爪" \
-  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
+  --workflow-json '[{"schema_version":1,"skill_name":"open_gripper_skill"}]'
 robot-skill --config-name so101_single_arm validate-plan \
   --plan-token PLAN_TOKEN
 robot-skill --config-name so101_single_arm confirm-plan \
@@ -91,6 +93,16 @@ robot-skill --config-name so101_single_arm describe-game sorting_hat
 robot-skill --config-name so101_single_arm start-game sorting_hat --request-id game-20260803-001
 robot-skill --config-name so101_single_arm game-result --request-id game-20260803-001
 ```
+
+### Wire schema 与原子部署
+
+`SkillCommand.Goal`、`PrimitiveCommand.Goal`、`ValidateSkill.Request` 和 `ValidatePrimitive.Request` 的首字段都是
+`uint32 schema_version`，当前 v1 公共 wire 合同必须显式发送 `1`。`WorkflowStep` 也必须携带显式版本：旧的非导航
+步骤使用 v1，导航步骤使用 v2；CLI 会拒绝缺少版本的导航 typed step，并且不会根据 `domain` 推导或改写版本。
+
+IDL、生成的 ROS 接口、`embodied_common` wire preflight、执行器、CLI 和 Agent skill 文档必须作为一个版本化发布单元
+原子部署。启动时发现生成接口不是同一版本会在创建 ROS client、subscription、action 或 readiness 之前失败；不要把
+旧生成接口与新节点或新 CLI 混装。
 
 可用 typed flags 为 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance` 和
 `--timeout-sec`。CLI 根据当前技能显式 `capability.parameters` schema 拒绝缺失参数和不属于该技能的参数。

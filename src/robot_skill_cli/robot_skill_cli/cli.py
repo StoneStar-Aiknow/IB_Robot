@@ -51,6 +51,9 @@ _AGENT_TIMEOUT_CODES = {
     "SKILL_TASK_DEADLINE_EXPIRED",
     "SKILL_CANCEL_TIMEOUT",
 }
+_NAVIGATION_WORKFLOW_FIELDS = frozenset(
+    {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
+)
 
 
 def _agent_error_exit_code(error_code: str) -> int:
@@ -147,6 +150,12 @@ def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--place-name")
     parser.add_argument("--motion-direction")
     parser.add_argument("--motion-distance", type=float)
+    parser.add_argument("--direction")
+    parser.add_argument("--distance", type=float)
+    parser.add_argument("--degree", type=float)
+    parser.add_argument("--x", type=float)
+    parser.add_argument("--y", type=float)
+    parser.add_argument("--yaw", type=float)
     parser.add_argument("--timeout-sec", type=float)
 
 
@@ -188,6 +197,8 @@ def _create_bridge(transport):
         reload_service=transport.reload_service,
         validate_skill_service=transport.validate_skill_service,
         skill_action=transport.skill_action_name,
+        primitive_action=transport.primitive_action_name,
+        validate_primitive_service=transport.validate_primitive_service,
         plan_service=transport.plan_service,
         validate_plan_service=transport.validate_plan_service,
         confirm_plan_service=transport.confirm_plan_service,
@@ -202,11 +213,17 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
     properties = parameters["properties"]
     required = set(parameters["required"])
     values = {
-        "target_name": args.target_name,
+        "target_name": getattr(args, "target_name", None),
         "container_name": getattr(args, "container_name", None),
-        "place_name": args.place_name,
-        "motion_direction": args.motion_direction,
-        "motion_distance": args.motion_distance,
+        "place_name": getattr(args, "place_name", None),
+        "motion_direction": getattr(args, "motion_direction", None),
+        "motion_distance": getattr(args, "motion_distance", None),
+        "direction": getattr(args, "direction", None),
+        "distance": getattr(args, "distance", None),
+        "degree": getattr(args, "degree", None),
+        "x": getattr(args, "x", None),
+        "y": getattr(args, "y", None),
+        "yaw": getattr(args, "yaw", None),
     }
     for name, value in values.items():
         if name not in properties:
@@ -225,6 +242,29 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
             isinstance(value, bool) or not math.isfinite(value) or value <= schema.get("exclusiveMinimum", -math.inf)
         ):
             raise _CliArgumentError(f"{name} must be a finite number greater than zero")
+
+
+def _contract_schema_version(skill: dict[str, Any]) -> int:
+    version = skill.get("schema_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
+        raise _CliArgumentError("skill contract schema_version must be 1 or 2")
+    return version
+
+
+def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], context) -> list[dict[str, Any]]:
+    normalized = []
+    for step in workflow_steps:
+        if not isinstance(step, dict):
+            raise _CliArgumentError("each workflow step must be an object")
+        if "schema_version" in step:
+            # The Agent plan boundary compares explicit versions against its
+            # snapshot. Do not rewrite a submitted mismatch at the CLI edge.
+            normalized.append(step)
+            continue
+        if _NAVIGATION_WORKFLOW_FIELDS.intersection(step):
+            raise _CliArgumentError("navigation typed workflow steps require explicit schema_version")
+        normalized.append({**step, "schema_version": 1})
+    return normalized
 
 
 def _validate_timeout(status: dict[str, Any], timeout_sec: float | None) -> float:
@@ -278,11 +318,18 @@ def _prepare_request(
         raise _CommandError(error_code, reason, exit_code=EXIT_GATEWAY_REJECTED)
     payload = canonical_skill_payload(
         skill["name"],
+        schema_version=_contract_schema_version(skill),
         target_name=args.target_name,
         container_name=args.container_name,
         place_name=args.place_name,
         motion_direction=args.motion_direction,
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,
+        direction=args.direction,
+        distance=0.0 if args.distance is None else args.distance,
+        degree=0.0 if args.degree is None else args.degree,
+        x=args.x,
+        y=args.y,
+        yaw=args.yaw,
         timeout_sec=effective_timeout,
         default_timeout_sec=status["default_skill_timeout_sec"],
     )
@@ -384,6 +431,7 @@ def _run_plan_workflow(args: argparse.Namespace, context, bridge) -> dict[str, A
         raise _CliArgumentError("workflow_json must be valid JSON") from exc
     if not isinstance(workflow_steps, list) or not 1 <= len(workflow_steps) <= 16:
         raise _CliArgumentError("workflow_json must contain between 1 and 16 steps")
+    workflow_steps = _workflow_steps_with_schema_versions(workflow_steps, context)
     result = bridge.plan_agent_command(
         request_id=request_id,
         raw_command=raw_command,

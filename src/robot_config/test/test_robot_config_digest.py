@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from robot_config.loader import robot_config_digest
+from robot_config.loader import robot_config_digest, robot_context_schema_version
 
 
 def _config():
@@ -55,6 +55,25 @@ def test_robot_config_digest_covers_execution_semantics_and_defaults():
     changed["embodied"]["execution"]["relative_motion_step_m"] = 0.04
 
     assert robot_config_digest(original) == robot_config_digest(explicit_defaults)
+    assert robot_config_digest(original) != robot_config_digest(changed)
+
+
+def test_robot_context_schema_version_requires_explicit_navigation_endpoint():
+    original = _config()
+    explicit_default = copy.deepcopy(original)
+    explicit_default["navigation"] = {
+        "enabled": True,
+        "command_server": {"enabled": True, "action_name": "/navigation/execute"},
+    }
+    changed = copy.deepcopy(original)
+    changed["navigation"] = {
+        "enabled": True,
+        "command_server": {"enabled": True, "action_name": "/robot/navigation/execute"},
+    }
+
+    assert robot_context_schema_version(original) == 1
+    assert robot_context_schema_version(explicit_default) == 2
+    assert robot_config_digest(original) != robot_config_digest(explicit_default)
     assert robot_config_digest(original) != robot_config_digest(changed)
 
 

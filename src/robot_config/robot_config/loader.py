@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -58,6 +59,7 @@ _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
 _NAV_STAGES = frozenset({"mapping", "navigation"})
+_ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
 
 
 def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -95,6 +97,78 @@ def _resolve_nav_stage(robot_config: dict[str, Any], nav_stage: str) -> dict[str
     return resolved
 
 
+def navigation_endpoint_projection(robot_config: dict[str, Any]) -> str | None:
+    """Project the resolved navigation command endpoint into the runtime context."""
+    navigation = robot_config.get("navigation", {})
+    if not isinstance(navigation, dict):
+        return None
+    if navigation.get("enabled") is not True:
+        return None
+    command_server = navigation.get("command_server")
+    if not isinstance(command_server, dict) or command_server.get("enabled") is not True:
+        return None
+    action_name = command_server.get("action_name")
+    return action_name if isinstance(action_name, str) and action_name.strip() else None
+
+
+def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the stage-resolved navigation endpoint ownership contract."""
+    errors: list[str] = []
+    embodied = robot_config.get("embodied", {})
+    execution = embodied.get("execution", {}) if isinstance(embodied, dict) else {}
+    if isinstance(execution, dict) and "navigation_action_name" in execution:
+        errors.append(
+            "embodied.execution.navigation_action_name is retired; configure navigation.command_server.action_name"
+        )
+
+    navigation = robot_config.get("navigation", {})
+    if not isinstance(navigation, dict):
+        return errors
+    command_server_marker = object()
+    command_server = navigation.get("command_server", command_server_marker)
+    nav_stage = robot_config.get("nav_stage")
+    navigation_enabled = navigation.get("enabled", False)
+
+    if command_server is command_server_marker:
+        if nav_stage == "navigation" and navigation_enabled is True:
+            errors.append("navigation.command_server is required when nav_stage is navigation")
+        return errors
+    if not isinstance(command_server, dict):
+        errors.append("navigation.command_server must be a mapping")
+        return errors
+
+    enabled = command_server.get("enabled")
+    if not isinstance(enabled, bool):
+        errors.append("navigation.command_server.enabled must be a boolean")
+        enabled = False
+
+    action_name_present = "action_name" in command_server
+    action_name = command_server.get("action_name")
+    if enabled:
+        if not action_name_present:
+            errors.append("navigation.command_server.action_name is required when command_server is enabled")
+        elif not isinstance(action_name, str) or not action_name.strip():
+            errors.append("navigation.command_server.action_name must be a non-empty string")
+        elif not action_name.startswith("/"):
+            errors.append("navigation.command_server.action_name must be an absolute ROS name")
+        elif not _ROS_ABSOLUTE_NAME_PATTERN.fullmatch(action_name):
+            errors.append("navigation.command_server.action_name must be a valid ROS name")
+    elif action_name_present:
+        errors.append("navigation.command_server.action_name must be omitted when command_server is disabled")
+
+    if nav_stage == "mapping":
+        errors.append("navigation.command_server is not allowed in nav_stage mapping")
+    elif nav_stage == "navigation":
+        if navigation_enabled is not True:
+            errors.append("navigation.enabled must be true when nav_stage is navigation")
+        if not enabled:
+            errors.append("navigation.command_server.enabled must be true when nav_stage is navigation")
+    elif enabled and navigation_enabled is not True:
+        errors.append("navigation.command_server.enabled requires navigation.enabled=true")
+
+    return errors
+
+
 def _normalize_digest_value(value: Any) -> Any:
     if isinstance(value, dict):
         if any(not isinstance(key, str) for key in value):
@@ -121,6 +195,41 @@ def _canonical_digest_json(value: Any) -> str:
     )
 
 
+def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
+    """Select the context schema from the resolved navigation endpoint projection."""
+    return 2 if navigation_endpoint_projection(robot_config) is not None else 1
+
+
+def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the closed endpoint set for the selected robot context schema."""
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        embodied = {}
+    execution = embodied.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
+    endpoints = {
+        "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
+        "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
+        "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
+        "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
+        "gateway_status_service": embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+        "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
+        "finalize_workflow_service": embodied.get("finalize_workflow_service", "/embodied/finalize_workflow_execution"),
+        "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
+        "arm_trajectory_action": execution.get(
+            "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
+        ),
+        "move_configuration_service": execution.get(
+            "move_configuration_service", "/moveit_gateway/move_to_configuration"
+        ),
+    }
+    navigation_action = navigation_endpoint_projection(robot_config)
+    if navigation_action is not None:
+        endpoints["navigation_action"] = navigation_action
+    return endpoints
+
+
 def robot_config_digest(robot_config: dict[str, Any]) -> str:
     """Return the digest of the closed skill execution context preimage.
 
@@ -145,7 +254,7 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
     if not isinstance(teleop_safety, dict):
         teleop_safety = {}
     preimage = {
-        "context_schema_version": 1,
+        "context_schema_version": robot_context_schema_version(robot_config),
         "robot_name": robot_config.get("name"),
         "named_poses": embodied.get("named_poses", {}) if isinstance(embodied, dict) else {},
         "named_targets": embodied.get("named_targets", {}) if isinstance(embodied, dict) else {},
@@ -159,26 +268,7 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
         "relative_motion_direction_mapping": execution.get("relative_motion_direction_mapping", {}),
         "gripper_open_position": execution.get("gripper_open_position", 1.0),
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
-        "execution_endpoints": {
-            "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
-            "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
-            "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
-            "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
-            "gateway_status_service": embodied.get(
-                "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
-            ),
-            "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
-            "finalize_workflow_service": embodied.get(
-                "finalize_workflow_service", "/embodied/finalize_workflow_execution"
-            ),
-            "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
-            "arm_trajectory_action": execution.get(
-                "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
-            ),
-            "move_configuration_service": execution.get(
-                "move_configuration_service", "/moveit_gateway/move_to_configuration"
-            ),
-        },
+        "execution_endpoints": robot_execution_endpoints(robot_config),
     }
     return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
@@ -1213,7 +1303,8 @@ def load_robot_config_dict(
         with mount_path.open("r", encoding="utf-8") as stream:
             robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
     _apply_approved_camera_calibration(robot_config)
-    validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors = validate_navigation_endpoint_contract(robot_config)
+    validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))

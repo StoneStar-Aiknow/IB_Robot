@@ -25,7 +25,7 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
     skill_path = tmp_path / "installed" / "SKILL.md"
     skill_path.parent.mkdir()
     skill_path.write_text("---\nname: ibrobot-control\n---\n", encoding="utf-8")
-    calls = {"binaries": [], "exec": None, "chdir": None}
+    calls = {"binaries": [], "events": [], "exec": None, "chdir": None}
 
     def require_binary(name):
         calls["binaries"].append(name)
@@ -38,7 +38,17 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "0")
     monkeypatch.setattr(hermes_launcher, "_require_binary", require_binary)
     monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
-    monkeypatch.setattr(hermes_launcher, "_check_robot_runtime", lambda _name, _path: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "validate_public_request_wire_contracts",
+        lambda: calls["events"].append("wire"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_launcher,
+        "_check_robot_runtime",
+        lambda _name, _path: calls["events"].append("runtime") or config_path,
+    )
     monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: skill_path)
     monkeypatch.setattr(hermes_launcher, "_hermes_skills_directory", lambda _path: tmp_path / "hermes-skills")
     monkeypatch.setattr(hermes_launcher, "_check_hermes_skill_discovery", lambda _path: None)
@@ -51,6 +61,7 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
 
     assert hermes_launcher.main(["--config-name", "test"]) == 0
 
+    assert calls["events"][:2] == ["wire", "runtime"]
     executable, arguments, environment = calls["exec"]
     assert calls["binaries"] == ["hermes", "robot-skill"]
     assert executable == "/bin/hermes"
@@ -67,6 +78,40 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
     assert "authorize_motion" not in environment
     registered_skill = tmp_path / "hermes-skills" / "ibrobot-control" / "SKILL.md"
     assert registered_skill.read_bytes() == skill_path.read_bytes()
+    assert (registered_skill.parent / ".ibrobot-managed").read_text(encoding="utf-8") == (
+        "robot_skill_cli:ibrobot-control\n"
+    )
+
+
+def test_launcher_wire_preflight_failure_blocks_gateway_agent_and_hermes(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    events = []
+
+    monkeypatch.setattr(hermes_launcher, "_require_binary", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "validate_public_request_wire_contracts",
+        lambda: (_ for _ in ()).throw(
+            hermes_launcher.LauncherError("WIRE_CONTRACT_INVALID", "stale generated public request interface")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_launcher,
+        "_check_robot_runtime",
+        lambda *_args, **_kwargs: events.append("runtime") or config_path,
+    )
+    monkeypatch.setattr(hermes_launcher, "_prepare_hermes_workspace", lambda: tmp_path / "workspace")
+    monkeypatch.setattr(hermes_launcher, "_hermes_skills_directory", lambda _path: tmp_path / "skills")
+    monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: events.append("skill") or config_path)
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_skill_discovery", lambda _path: events.append("discovery"))
+    monkeypatch.setattr(os, "chdir", lambda _path: events.append("chdir"))
+    monkeypatch.setattr(os, "execvpe", lambda *_args: events.append("exec"))
+
+    assert hermes_launcher.main(["--config-name", "test"]) == 4
+    assert events == []
 
 
 def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(tmp_path, monkeypatch) -> None:

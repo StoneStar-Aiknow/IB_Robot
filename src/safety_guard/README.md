@@ -47,9 +47,14 @@ Task / Skill request
    `generation>0` 必须精确匹配，不静默升级到更新版本；已被回收返回 `SKILL_SNAPSHOT_NOT_RETAINED`。
 
 拉取到的 `snapshot_json` 进入 `SafetySnapshotCache` 前必须通过完整校验：必须是 canonical JSON、
-`schema_version=1`、字段集严格等于 `snapshot_payload_v1`；本地重算 `registry_digest`、`capability_digest`、
-`provenance_digest` 必须与响应一致；`primitive_contract_digest` 必须等于本地 SSOT
-`PRIMITIVE_CONTRACT_DIGEST`；skill 名称必须唯一非空。任一校验失败以 `SKILL_SNAPSHOT_DIGEST_MISMATCH`
+`schema_version` 取值由 `SkillRobotContext.context_schema_version` 选择，仅接受 `{1, 2}`
+（V1 字段集严格等于 `snapshot_payload_v1`，V2 在 V1 之上追加 navigation 字段集）；本地重算
+`registry_digest`、`capability_digest`、`provenance_digest` 必须与响应一致；
+`primitive_contract_digest` 不再是单一全局常量，而是按 context version 选择
+（V1 使用 `PRIMITIVE_CONTRACT_V1`，V2 使用 `PRIMITIVE_CONTRACT_V2`，由
+`primitive_contract_for_version(context_schema_version)` 在
+`embodied_common` 中导出），snapshot 内的 `primitive_contract_digest` 必须等于本地对应版本的
+digest；skill 名称必须唯一非空。任一校验失败以 `SKILL_SNAPSHOT_DIGEST_MISMATCH`
 或 `SKILL_SCHEMA_INVALID` 拒绝并丢弃，不更新 current 指针。
 
 校验时 robot context（`named_poses`、`named_targets`、`workspace_limits`、`arm_joint_names`、`joint_limits`）
@@ -97,11 +102,21 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 | 字段 | 说明 |
 | --- | --- |
 | `dispatch_binding` | `DispatchBinding`，必须携带完整期望 registry identity；`root_lease_nonce` 仅用于关联，不视为授权；`dispatch_nonce` 必须为空 |
+| `schema_version` | 请求 wire contract 的 schema version，仅接受 `{1, 2}`；V1 不得携带 navigation 字段，V2 必须按下方 navigation_* 字段集下发；与 `dispatch_binding.schema_version` 必须一致，否则 `SKILL_SCHEMA_INVALID` |
 | `skill_name` | 待执行技能名 |
 | `target_name` | 命名目标 |
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向 |
 | `motion_distance` | 相对运动距离 |
+| `direction` | V2 导航方向枚举（`forward` / `backward` / `leftward` / `rightward` / `turn-left` / `turn-right`），仅 V2 schema 由导航技能下发 |
+| `distance` | V2 直行距离 (m)，仅 `nav_straight` 必填，必须为有限正数 |
+| `degree` | V2 转向角度 (deg)，仅 `nav_turn` 必填，必须为有限数 |
+| `x` | V2 绝对坐标 X (m)，仅 `nav_abs_coordinate` 使用，与 `has_x` 配对 |
+| `y` | V2 绝对坐标 Y (m)，仅 `nav_abs_coordinate` 使用，与 `has_y` 配对 |
+| `yaw` | V2 绝对坐标 yaw (rad)，仅 `nav_abs_coordinate` 使用，与 `has_yaw` 配对 |
+| `has_x` | V2 presence flag，标识 `x` 是否由调用方显式提供 |
+| `has_y` | V2 presence flag，标识 `y` 是否由调用方显式提供 |
+| `has_yaw` | V2 presence flag，标识 `yaw` 是否由调用方显式提供 |
 
 **响应字段**
 
@@ -124,6 +139,7 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 | 字段 | 说明 |
 | --- | --- |
 | `dispatch_binding` | `DispatchBinding`，必须携带完整期望 registry identity 和非空 `dispatch_nonce` |
+| `schema_version` | 请求 wire contract 的 schema version，仅接受 `{1, 2}`；V1 不得携带 navigation 字段，V2 由导航 primitive 下发；与 `dispatch_binding.schema_version` 必须一致，否则 `SKILL_SCHEMA_INVALID` |
 | `primitive_name` | 原子动作名 |
 | `pose_name` | 命名位姿名 |
 | `relative_dx/dy/dz` | 相对位移增量 |
@@ -137,6 +153,9 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 | `joint_waypoints` | 扁平化关节路点序列 |
 | `joint_waypoint_count` | 关节路点数量 |
 | `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
+| `navigation_command_type` | uint8，V2 导航子类型枚举，仅 `nav_straight` / `nav_turn` / `nav_abs_coordinate` 携带 |
+| `navigation_target_pose` | geometry_msgs/PoseStamped，V2 导航目标位姿，`header.frame_id` 必须为 `map` |
+| `navigation_value` | float64，V2 导航参数（直行距离 (m) 或转向角度 (deg)），必须为有限数 |
 
 **响应字段**
 
@@ -154,9 +173,11 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 
 两个 validate 服务均 fail closed：
 
-- `dispatch_binding.schema_version != 1` 或期望 identity 不完整（epoch 空、generation<=0、digest 空）：
+- `dispatch_binding.schema_version` 不在 `validate_request_schema_version` 接受集合 `{1, 2}`
+  内，或与请求体顶层 `schema_version` 不一致，或期望 identity 不完整（epoch 空、generation<=0、digest 空）：
   `allowed=false`、`error_code=SKILL_SCHEMA_INVALID`，`actual_*` 取当前缓存 identity（可能为空）。
-  `ValidatePrimitive` 还要求 `dispatch_nonce` 非空。
+  `ValidatePrimitive` 还要求 `dispatch_nonce` 非空。V1 请求携带任何 navigation_* 字段、或 V2 请求缺失
+  必填 navigation_* 字段同样以 `SKILL_SCHEMA_INVALID` 拒绝。
 - exact snapshot 未缓存（已被回收）：`error_code=SKILL_SNAPSHOT_NOT_RETAINED`。
 - 缓存的 snapshot digest 与请求期望不一致：`error_code=SKILL_REGISTRY_VERSION_MISMATCH`。
 - snapshot payload 校验失败：`error_code=SKILL_SCHEMA_INVALID` 或 `SKILL_SNAPSHOT_DIGEST_MISMATCH`。
@@ -196,6 +217,9 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 - `close_gripper`
 - `rotate_gripper_cw`
 - `rotate_gripper_ccw`
+- `nav_straight`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
+- `nav_turn`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
+- `nav_abs_coordinate`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
 
 ### 原子动作边界检查
 
@@ -241,6 +265,42 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 3. `joint_waypoints` 长度必须等于 `len(joint_names) * joint_waypoint_count`
 4. `waypoint_duration_sec` 必须大于 0
 5. 每个路点都必须符合手臂关节顺序和关节限位
+
+#### `nav_straight`
+
+会检查（仅 V2 schema 触发；V1 请求携带该 primitive 名直接 `SKILL_SCHEMA_INVALID`）：
+
+1. `direction` 必须命中允许枚举集合（`forward` / `backward` / `leftward` / `rightward`），
+   非枚举值返回 `SKILL_LIMIT_VIOLATION`
+2. `distance` 必须为有限正数（`> 0`），且不超过 `float32` 最大值；零、负数或 NaN/Inf
+   返回 `SKILL_LIMIT_VIOLATION`
+3. `degree`、`x/y/yaw` 与 `has_x/y/yaw` 必须全部为缺省/零值，
+   防止不同 nav_* primitive 的字段混用
+4. snapshot `robot_context.workspace_limits`（若声明）必须覆盖目标位移后的 base 位姿；
+   当前最小实现只做静态白名单与字段类型校验，不预测 Nav2 规划结果
+
+#### `nav_turn`
+
+会检查（仅 V2 schema 触发）：
+
+1. `direction` 必须命中 `turn-left` 或 `turn-right`，其他值返回 `SKILL_LIMIT_VIOLATION`
+2. `degree` 必须为有限数（允许负值表示反方向旋转的语义），但绝对值不得超过
+   `float32` 最大值；NaN/Inf 返回 `SKILL_LIMIT_VIOLATION`
+3. `distance`、`x/y/yaw` 与 `has_x/y/yaw` 必须全部为缺省/零值
+
+#### `nav_abs_coordinate`
+
+会检查（仅 V2 schema 触发）：
+
+1. `direction` 与 `distance`、`degree` 必须全部为缺省/零值，
+   防止与 `nav_straight` / `nav_turn` 字段混用
+2. `has_x` / `has_y` 至少有一个为 `true`；至少一个坐标分量必须由调用方显式
+   提供，否则视为空目标，返回 `SKILL_LIMIT_VIOLATION`
+3. `x` / `y`（在 `has_*` 为 `true` 时）必须为有限数，
+   且必须落在 `workspace_limits` 的 x/y 范围内
+4. 目标 pose 的 `header.frame_id` 必须为 `map`；非 `map` frame 返回 `SKILL_LIMIT_VIOLATION`
+5. 若调用方提供四元数姿态（`target_qx/qy/qz/qw`），必须是有效单位四元数
+   （`qx²+qy²+qz²+qw²` 与 1.0 的差必须在容差内）；非单位四元数返回 `SKILL_LIMIT_VIOLATION`
 
 ## 6. 工作空间定义
 

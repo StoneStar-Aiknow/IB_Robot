@@ -211,6 +211,7 @@ class PickFlowPhase:
         duration_sec: float = 0.0,
     ) -> None:
         primitive_goal = PrimitiveCommand.Goal()
+        primitive_goal.schema_version = 1
         primitive_goal.dispatch_binding = copy_binding(self._dispatch_binding)
         if getattr(self, "_supervised_direct", False):
             self._direct_primitive_index = int(getattr(self, "_direct_primitive_index", 0)) + 1

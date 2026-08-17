@@ -1,0 +1,10 @@
+schema_version: 2
+kind: primitive_sequence
+robot: lekiwi_navigation_v2
+initial_gripper_state: none
+timeout_sec: 300.0
+primitive_sequence:
+- primitive_name: nav_abs_coordinate
+  x_from_request: true
+  y_from_request: true
+  yaw_from_request: true

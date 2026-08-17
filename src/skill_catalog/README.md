@@ -13,12 +13,15 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
 The current source-workspace profiles are `so101_single_arm`,
-`lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`, and `so101_rtp_distributed`. The shared stable
+`lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
+`so101_rtp_distributed`, and `lekiwi_lidar`. The shared stable
 implementation `so101_arm_v1` is selected by every enabled entry in both
 `so101_single_arm` and `so101_rtp_distributed`; the two profiles compile the
 same execution body, so their implementation content cannot drift through
 duplicated files. Registry/capability identity can still differ through the
-canonical robot execution context.
+canonical robot execution context. `lekiwi_lidar` is the navigation-only
+profile that selects the V2 schema contract (see [Schema v2](#schema-v2)
+below); it does not enable any manipulation primitive.
 
 Both hand-eye profiles expose `pick_object` and `place_in_container` through
 the Gateway. 310P binds grasping to the `ascend_310p` manifest deployment;
@@ -75,3 +78,92 @@ consumer's exact identity becomes unavailable until the new snapshot has been
 fetched and verified. Callers that cannot tolerate that gap must retain the
 previous generation through the registry's retain/release API instead of
 relying on the synchronizer's `current` view.
+
+## Schema v2
+
+`SkillRobotContext.context_schema_version` selects the wire contract used by
+every consumer of the compiled snapshot. Two values are accepted:
+
+- `1` (V1): the original manipulation-only contract. Skill and primitive
+  requests must not carry navigation fields.
+- `2` (V2): superset of V1 that adds the navigation field set
+  (`direction` / `distance` / `degree` / `x` / `y` / `yaw`) plus
+  `has_x` / `has_y` / `has_yaw` presence flags, and exposes three navigation
+  primitives: `nav_straight`, `nav_turn`, `nav_abs_coordinate`.
+
+The active `context_schema_version` is derived from `robot_config`'s
+`navigation_endpoint_projection` (a profile that selects
+`base_navigation` control mode and a non-empty
+`navigation.command_server.action_name` resolves to V2; otherwise V1). The
+resolved version enters the canonical execution-context digest preimage, so
+flipping it forces a new registry generation — V1 and V2 snapshots are never
+interchangeably validated.
+
+`base_navigation` is the V2 control mode that authorizes the chassis velocity
+controllers and grants `/cmd_vel` ownership to the navigation stack. It is the
+only control mode under which `nav_*` primitives may be dispatched; profiles
+that select V1 do not declare it and `skill_library` rejects navigation
+primitives with `CONTROL_MODE_MISMATCH`.
+
+## Primitive contract versioning
+
+`embodied_common` exposes `primitive_contract_for_version(version)` and the
+two digest constants `PRIMITIVE_CONTRACT_V1` / `PRIMITIVE_CONTRACT_V2`.
+`skill_catalog` resolves the matching digest per snapshot using the snapshot's
+`context_schema_version`, and writes the result into the immutable
+`primitive_contract_digest` field. The contract is therefore
+**per-context-version**, not a single global constant: a V1 snapshot is
+validated against `PRIMITIVE_CONTRACT_V1` and a V2 snapshot against
+`PRIMITIVE_CONTRACT_V2`. Downstream consumers (`safety_guard`,
+`skill_library`) must call `primitive_contract_for_version()` with the
+snapshot's context version when re-computing the digest locally — comparing
+a V2 snapshot against a V1 digest returns `SKILL_SNAPSHOT_DIGEST_MISMATCH`
+and discards the snapshot.
+
+A `PrimitiveContractSet` is also exported for callers that need both
+digests in one structure (e.g. tooling that displays both versions side by
+side). Production code paths must select exactly one version per snapshot;
+they must not mix V1 and V2 digests within a single validation request.
+
+## Execution endpoint roles
+
+The canonical execution context exposes a fixed set of execution endpoint
+roles. V1 declares 10 roles: `arm_trajectory_action_name`,
+`task_executor_action_name`, `pick_action_name`, `move_configuration_service`,
+`ee_pose_topic`, `joint_state_topic`, `validate_skill_service`,
+`validate_primitive_service`, `skill_gateway_status_service`, and
+`skill_catalog_reload_service`. `skill_catalog_snapshot_service` and
+`skill_registry_event_topic` are runtime plumbing and not part of the
+execution-context digest.
+
+V2 adds `navigation_action_name` as an 11th role. The value is the sole
+projection of `robot_config.navigation.command_server.action_name` (default
+`/navigation/execute`); no other field may override it. Profiles that resolve
+to V1 leave `navigation_action_name` empty, and the loader rejects any V1
+request that declares a non-empty navigation action name. V2 profiles with
+an empty `navigation_action_name` fail compilation with
+`SKILL_SCHEMA_INVALID`.
+
+## SkillRobotContext.context_schema_version
+
+`SkillRobotContext` is the canonical robot execution context structure
+passed to `SkillCatalogCompiler`. It carries:
+
+- `robot_config_digest`: the canonical execution-context digest from
+  `robot_config.loader`, excluding catalog source selection fields.
+- `context_schema_version`: `1` or `2`, resolved from
+  `navigation_endpoint_projection`. Determines which
+  `primitive_contract_digest` is selected and which wire fields are
+  permitted on requests.
+- `named_poses` / `named_targets` / `workspace_limits` /
+  `arm_joint_names` / `joint_limits` / `timeout_policy`: the V1 manipulation
+  context.
+- `execution_endpoints`: the V1 10-role endpoint map, plus
+  `navigation_action_name` when `context_schema_version == 2`.
+- `control_mode`: the active control mode. For V2 snapshots this must be
+  `base_navigation` (or another mode explicitly authorized for navigation
+  primitives); otherwise navigation primitives are rejected at admission
+  time.
+
+Changing any of the above (other than catalog source selection) produces a
+different `robot_config_digest` and forces a new registry generation.

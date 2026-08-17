@@ -14,10 +14,16 @@ from embodied_common.dispatch_binding import (
     delegated_executor_identity,
     load_delegated_model_identity,
 )
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
+from embodied_common.primitive_contracts import primitive_contract_for_version
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
 from robot_config.config_path import resolve_robot_config_path
-from robot_config.loader import get_effective_visual_game_policies, load_robot_config_dict, robot_config_digest
+from robot_config.loader import (
+    get_effective_visual_game_policies,
+    load_robot_config_dict,
+    robot_config_digest,
+    robot_context_schema_version,
+    robot_execution_endpoints,
+)
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.digest import (
@@ -68,6 +74,8 @@ class GatewayTransport:
     status_service: str
     validate_skill_service: str
     skill_action_name: str
+    primitive_action_name: str = "/embodied/execute_primitive"
+    validate_primitive_service: str = "/embodied/validate_primitive"
     snapshot_service: str = "/embodied/get_skill_snapshot"
     reload_service: str = "/embodied/reload_skill_catalog"
     plan_service: str = "/embodied/plan_agent_command"
@@ -167,6 +175,8 @@ def _gateway_transport(embodied: dict[str, Any]) -> GatewayTransport:
         reload_service=embodied.get("skill_catalog_reload_service", "/embodied/reload_skill_catalog"),
         validate_skill_service=embodied.get("validate_skill_service", "/embodied/validate_skill"),
         skill_action_name=embodied.get("skill_action_name", "/embodied/execute_skill"),
+        primitive_action_name=embodied.get("primitive_action_name", "/embodied/execute_primitive"),
+        validate_primitive_service=embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
         plan_service=embodied.get("plan_service", "/embodied/plan_agent_command"),
         validate_plan_service=embodied.get("validate_plan_service", "/embodied/validate_agent_plan"),
         confirm_plan_service=embodied.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
@@ -228,7 +238,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         delegated[descriptor.name] = descriptor
     robot_context = SkillRobotContext(
         robot_name=robot_config["name"],
-        context_schema_version=1,
+        context_schema_version=robot_context_schema_version(robot_config),
         robot_config_digest=robot_config_digest(robot_config),
         named_poses=embodied.get("named_poses", {}),
         named_targets=embodied.get("named_targets", {}),
@@ -242,34 +252,16 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         relative_motion_direction_mapping=execution.get("relative_motion_direction_mapping", {}),
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
-        execution_endpoints={
-            "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
-            "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
-            "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
-            "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
-            "gateway_status_service": embodied.get(
-                "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
-            ),
-            "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
-            "finalize_workflow_service": embodied.get(
-                "finalize_workflow_service", "/embodied/finalize_workflow_execution"
-            ),
-            "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
-            "arm_trajectory_action": execution.get(
-                "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
-            ),
-            "move_configuration_service": execution.get(
-                "move_configuration_service", "/moveit_gateway/move_to_configuration"
-            ),
-        },
+        execution_endpoints=robot_execution_endpoints(robot_config),
     )
+    primitive_contract = primitive_contract_for_version(robot_context.context_schema_version)
     return compile_skill_catalog(
         source,
         profile_name=embodied["skill_catalog_profile"],
         context=SkillCompileContext(
             robot=robot_context,
-            primitive_contracts=PRIMITIVE_DESCRIPTORS,
-            primitive_contract_digest=PRIMITIVE_CONTRACT_DIGEST,
+            primitive_contracts=primitive_contract.descriptors,
+            primitive_contract_digest=primitive_contract.digest,
             delegated_executors=delegated,
         ),
     )
@@ -361,6 +353,7 @@ def list_skills(view: dict[str, Any]) -> dict[str, Any]:
     for skill in view["skills"]:
         entry = {
             "name": skill["name"],
+            "contract_schema_version": int(skill.get("schema_version", 1)),
             **{field: copy.deepcopy(skill[field]) for field in _LIST_CAPABILITY_FIELDS},
         }
         skills.append(entry)
@@ -376,6 +369,7 @@ def describe_skill(view: dict[str, Any], skill_name: str) -> dict[str, Any]:
     result = {
         "robot_name": view["robot_name"],
         "name": skill["name"],
+        "schema_version": int(skill.get("schema_version", 1)),
         **{field: copy.deepcopy(skill[field]) for field in _LIST_CAPABILITY_FIELDS},
         "parameters": copy.deepcopy(skill["parameters"]),
         "recovery_policy": copy.deepcopy(skill["recovery_policy"]),

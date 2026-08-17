@@ -171,10 +171,10 @@ def sort_diagnostics(diagnostics: list[SkillDiagnostic]) -> list[SkillDiagnostic
 # Compiler inputs (section 9.1)                                               #
 # --------------------------------------------------------------------------- #
 
-CONTEXT_SCHEMA_VERSION = 1
+CONTEXT_SCHEMA_VERSION = 2
 
-# Closed set of execution endpoint roles (section 9.1).
-EXECUTION_ENDPOINT_ROLES: frozenset[str] = frozenset(
+# Closed execution endpoint role sets by context schema version (section 9.1).
+EXECUTION_ENDPOINT_ROLES_V1: frozenset[str] = frozenset(
     {
         "skill_action",
         "primitive_action",
@@ -188,17 +188,35 @@ EXECUTION_ENDPOINT_ROLES: frozenset[str] = frozenset(
         "move_configuration_service",
     }
 )
+EXECUTION_ENDPOINT_ROLES: frozenset[str] = EXECUTION_ENDPOINT_ROLES_V1 | {"navigation_action"}
+EXECUTION_ENDPOINT_ROLES_BY_CONTEXT_VERSION: Mapping[int, frozenset[str]] = {
+    1: EXECUTION_ENDPOINT_ROLES_V1,
+    2: EXECUTION_ENDPOINT_ROLES,
+}
 
 # Closed set of dispatch kinds and the readiness capability they imply (5.1).
-DISPATCH_KIND_CAPABILITY: Mapping[str, str] = {
+DISPATCH_KIND_CAPABILITY_V1: Mapping[str, str] = {
     "task_executor_action": "task_executor",
     "arm_trajectory_action": "arm_trajectory",
     "move_configuration_service": "move_configuration",
 }
+DISPATCH_KIND_CAPABILITY: Mapping[str, str] = {
+    **DISPATCH_KIND_CAPABILITY_V1,
+    "navigation_action": "navigation",
+}
+DISPATCH_KIND_CAPABILITY_BY_CONTEXT_VERSION: Mapping[int, Mapping[str, str]] = {
+    1: DISPATCH_KIND_CAPABILITY_V1,
+    2: DISPATCH_KIND_CAPABILITY,
+}
 
-REQUIRED_RUNTIME_CAPABILITIES: frozenset[str] = frozenset(
+REQUIRED_RUNTIME_CAPABILITIES_V1: frozenset[str] = frozenset(
     {"validate_skill", "task_executor", "arm_trajectory", "fresh_ee_pose", "move_configuration"}
 )
+REQUIRED_RUNTIME_CAPABILITIES: frozenset[str] = REQUIRED_RUNTIME_CAPABILITIES_V1 | {"navigation"}
+REQUIRED_RUNTIME_CAPABILITIES_BY_CONTEXT_VERSION: Mapping[int, frozenset[str]] = {
+    1: REQUIRED_RUNTIME_CAPABILITIES_V1,
+    2: REQUIRED_RUNTIME_CAPABILITIES,
+}
 
 DELEGATED_ENDPOINT_KINDS: frozenset[str] = frozenset({"ros_action", "ros_service"})
 

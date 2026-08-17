@@ -23,6 +23,7 @@ COMMAND_TYPES = {
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Send a single navigation command for manual testing.")
+    parser.add_argument("--action-name", required=True, help="Absolute ExecuteNavigation action name.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status")
     subparsers.add_parser("cancel")
@@ -49,10 +50,10 @@ def _pose(x: float, y: float, yaw_deg: float) -> PoseStamped:
     return pose
 
 
-def _send(node: Node, goal: ExecuteNavigation.Goal) -> int:
-    client = ActionClient(node, ExecuteNavigation, "/navigation/execute")
+def _send(node: Node, goal: ExecuteNavigation.Goal, action_name: str) -> int:
+    client = ActionClient(node, ExecuteNavigation, action_name)
     if not client.wait_for_server(timeout_sec=5.0):
-        node.get_logger().error("/navigation/execute is unavailable")
+        node.get_logger().error(f"{action_name} is unavailable")
         return 1
     future = client.send_goal_async(goal, feedback_callback=lambda message: print(message.feedback.state))
     rclpy.spin_until_future_complete(node, future)
@@ -73,10 +74,10 @@ def main(args=None):
     node = Node("nav_cmd")
     try:
         if parsed.command == "status":
-            action_client = ActionClient(node, ExecuteNavigation, "/navigation/execute")
+            action_client = ActionClient(node, ExecuteNavigation, parsed.action_name)
             nav2_client = ActionClient(node, NavigateToPose, "/navigate_to_pose")
             print(
-                f"/navigation/execute: {'ready' if action_client.wait_for_server(timeout_sec=2.0) else 'unavailable'}"
+                f"{parsed.action_name}: {'ready' if action_client.wait_for_server(timeout_sec=2.0) else 'unavailable'}"
             )
             print(f"/navigate_to_pose: {'ready' if nav2_client.wait_for_server(timeout_sec=2.0) else 'unavailable'}")
             return 0
@@ -100,7 +101,7 @@ def main(args=None):
                 raise ValueError("relative command value must be positive and finite")
             goal.command_type = COMMAND_TYPES[parsed.command]
             goal.value = parsed.value if not parsed.command.startswith("turn-") else math.radians(parsed.value)
-        return _send(node, goal)
+        return _send(node, goal, parsed.action_name)
     except ValueError as exc:
         print(f"nav_cmd: {exc}", file=sys.stderr)
         return 2

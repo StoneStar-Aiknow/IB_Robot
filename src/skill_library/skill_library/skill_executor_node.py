@@ -35,10 +35,18 @@ from embodied_common.dispatch_binding import (
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
-from embodied_common.skill_request import derive_skill_task_id
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
+from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from embodied_common.workflow_contracts import CanonicalWorkflowStep, compute_workflow_digest, normalize_workflow_steps
-from ibrobot_msgs.action import ExecuteTaskPlan, PickObject, PlaceObject, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.action import (
+    ExecuteNavigation,
+    ExecuteTaskPlan,
+    PickObject,
+    PlaceObject,
+    PrimitiveCommand,
+    SkillCommand,
+)
 from ibrobot_msgs.msg import SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
@@ -77,6 +85,18 @@ WORKFLOW_STEP_ACTIVE = "active"
 WORKFLOW_STEP_SUCCEEDED = "succeeded"
 WORKFLOW_STEP_FAILED = "failed"
 WORKFLOW_STEP_CANCELED = "canceled"
+
+_NAVIGATION_ERROR_CODES = {
+    ExecuteNavigation.Result.INVALID_GOAL: "NAVIGATION_INVALID_GOAL",
+    ExecuteNavigation.Result.BUSY: "NAVIGATION_BUSY",
+    ExecuteNavigation.Result.TF_UNAVAILABLE: "NAVIGATION_TF_UNAVAILABLE",
+    ExecuteNavigation.Result.NAV2_UNAVAILABLE: "NAVIGATION_NAV2_UNAVAILABLE",
+    ExecuteNavigation.Result.GOAL_REJECTED: "NAVIGATION_GOAL_REJECTED",
+    ExecuteNavigation.Result.NAVIGATION_ABORTED: "NAVIGATION_ABORTED",
+    ExecuteNavigation.Result.NAVIGATION_CANCELED: "NAVIGATION_CANCELED",
+    ExecuteNavigation.Result.STOP_TIMEOUT: "NAVIGATION_STOP_TIMEOUT",
+    ExecuteNavigation.Result.INTERNAL_ERROR: "NAVIGATION_INTERNAL_ERROR",
+}
 
 
 def _binding_task_id(value) -> str:
@@ -328,6 +348,7 @@ class SkillExecutorNode(Node):
 
     def __init__(self, parameter_overrides=None, node_name: str | None = None) -> None:
         super().__init__(node_name or "skill_executor_node", parameter_overrides=parameter_overrides)
+        validate_public_request_wire_contracts()
         startup_descriptor = ParameterDescriptor(read_only=True)
         self.declare_parameter("skill_action_name", "/embodied/execute_skill")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
@@ -373,6 +394,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("skill_catalog_source_root", "")
         self.declare_parameter("skill_catalog_profile", "")
         self.declare_parameter("robot_name", "unknown", descriptor=startup_descriptor)
+        self.declare_parameter("context_schema_version", 1, descriptor=startup_descriptor)
         self.declare_parameter("default_skill_timeout_sec", 120.0, descriptor=startup_descriptor)
         self.declare_parameter("task_budget_sec", 180.0, descriptor=startup_descriptor)
         self.declare_parameter("robot_state_freshness_sec", 0.5, descriptor=startup_descriptor)
@@ -460,6 +482,19 @@ class SkillExecutorNode(Node):
         if self._skill_catalog_source_mode in {"development", "production"} and not self._skill_catalog_source_root:
             raise ValueError("skill_catalog_source_root is required in development and production modes")
         self._robot_name = self.get_parameter("robot_name").get_parameter_value().string_value
+        self._context_schema_version = self.get_parameter("context_schema_version").get_parameter_value().integer_value
+        if self._context_schema_version not in {1, 2}:
+            raise ValueError("context_schema_version must be 1 or 2")
+        self._primitive_contract = primitive_contract_for_version(self._context_schema_version)
+        self._primitive_descriptors = self._primitive_contract.descriptors
+        self._primitive_contract_digest = self._primitive_contract.digest
+        if self._context_schema_version >= 2:
+            self.declare_parameter("navigation_action_name", "")
+            self._navigation_action_name = (
+                self.get_parameter("navigation_action_name").get_parameter_value().string_value
+            )
+            if not self._navigation_action_name.strip():
+                raise ValueError("navigation_action_name must be a non-empty projected endpoint")
         if not self._skill_catalog_profile:
             self._skill_catalog_profile = self._robot_name
         self._default_skill_timeout_sec = (
@@ -540,6 +575,7 @@ class SkillExecutorNode(Node):
             startup_requirements,
             parameter_schemas=startup_parameter_schemas,
             skill_timeout_caps=startup_timeout_caps,
+            skill_schema_versions=self._snapshot_skill_schema_versions(startup_bundle.snapshot),
         )
         self._skill_requirements = startup_requirements
         self._skill_parameter_schemas = startup_parameter_schemas
@@ -562,6 +598,13 @@ class SkillExecutorNode(Node):
             self._arm_trajectory_action_name,
             callback_group=callback_group,
         )
+        if self._context_schema_version >= 2:
+            self._navigation_client = ActionClient(
+                self,
+                ExecuteNavigation,
+                self._navigation_action_name,
+                callback_group=callback_group,
+            )
         self.create_subscription(
             PoseStamped,
             self._ee_pose_topic,
@@ -669,9 +712,23 @@ class SkillExecutorNode(Node):
             for name, values in self._relative_motion_direction_mapping.items()
             if isinstance(values, list | tuple) and len(values) == 3
         }
+        execution_endpoints = {
+            "skill_action": self._skill_action_name,
+            "primitive_action": self._primitive_action_name,
+            "validate_skill_service": self._validate_skill_service,
+            "validate_primitive_service": self._validate_primitive_service,
+            "gateway_status_service": self._skill_gateway_status_service,
+            "begin_workflow_service": self._begin_workflow_service,
+            "finalize_workflow_service": self._finalize_workflow_service,
+            "task_executor_action": self._task_executor_action_name,
+            "arm_trajectory_action": self._arm_trajectory_action_name,
+            "move_configuration_service": self._move_configuration_service,
+        }
+        if self._context_schema_version >= 2:
+            execution_endpoints["navigation_action"] = self._navigation_action_name
         robot_context = SkillRobotContext(
             robot_name=self._robot_name,
-            context_schema_version=1,
+            context_schema_version=self._context_schema_version,
             robot_config_digest=self._robot_config_digest,
             named_poses=self._named_poses,
             named_targets=self._named_targets,
@@ -685,18 +742,7 @@ class SkillExecutorNode(Node):
             relative_motion_direction_mapping=direction_mapping,
             gripper_open_position=self._gripper_open,
             gripper_closed_position=self._gripper_closed,
-            execution_endpoints={
-                "skill_action": self._skill_action_name,
-                "primitive_action": self._primitive_action_name,
-                "validate_skill_service": self._validate_skill_service,
-                "validate_primitive_service": self._validate_primitive_service,
-                "gateway_status_service": self._skill_gateway_status_service,
-                "begin_workflow_service": self._begin_workflow_service,
-                "finalize_workflow_service": self._finalize_workflow_service,
-                "task_executor_action": self._task_executor_action_name,
-                "arm_trajectory_action": self._arm_trajectory_action_name,
-                "move_configuration_service": self._move_configuration_service,
-            },
+            execution_endpoints=execution_endpoints,
         )
         source_root = Path(self._skill_catalog_source_root)
         if self._skill_catalog_source_mode == "installed":
@@ -707,8 +753,8 @@ class SkillExecutorNode(Node):
             source = DirectoryReleaseSkillSource(source_root)
         context = SkillCompileContext(
             robot=robot_context,
-            primitive_contracts=PRIMITIVE_DESCRIPTORS,
-            primitive_contract_digest=PRIMITIVE_CONTRACT_DIGEST,
+            primitive_contracts=getattr(self, "_primitive_descriptors", PRIMITIVE_CONTRACT_V1.descriptors),
+            primitive_contract_digest=getattr(self, "_primitive_contract_digest", PRIMITIVE_CONTRACT_V1.digest),
             delegated_executors=self._delegated_executor_descriptors(),
         )
         return SkillCatalogCompiler().compile(
@@ -759,6 +805,7 @@ class SkillExecutorNode(Node):
                 task_executor="task_executor" in values,
                 arm_trajectory="arm_trajectory" in values,
                 fresh_ee_pose="fresh_ee_pose" in values,
+                navigation="navigation" in values,
             )
             for name, values in snapshot.requirements.items()
         }
@@ -767,6 +814,47 @@ class SkillExecutorNode(Node):
         }
         timeout_caps = {str(name): float(template["timeout_sec"]) for name, template in snapshot.templates.items()}
         return requirements, parameter_schemas, timeout_caps
+
+    @staticmethod
+    def _snapshot_skill_schema_versions(snapshot) -> dict[str, int]:
+        return {
+            str(name): int(capability.get("schema_version", 1)) for name, capability in snapshot.capability_view.items()
+        }
+
+    def _primitive_descriptor(self, primitive_name: str):
+        descriptors = getattr(self, "_primitive_descriptors", None)
+        if descriptors is None:
+            context_version = getattr(self, "_context_schema_version", None)
+            if context_version not in {1, 2}:
+                context_version = 2 if primitive_name in {"nav_straight", "nav_turn", "nav_abs_coordinate"} else 1
+            descriptors = primitive_contract_for_version(context_version).descriptors
+        return descriptors.get(str(primitive_name))
+
+    @staticmethod
+    def _skill_schema_version(bundle, skill_name: str) -> int:
+        if bundle is None:
+            return 1
+        capability = bundle.snapshot.capability_view.get(skill_name, {})
+        return int(capability.get("schema_version", 1))
+
+    def _validate_skill_goal_schema(self, goal, bundle) -> str:
+        try:
+            submitted_version = validate_request_schema_version(getattr(goal, "schema_version", 1))
+        except ValueError:
+            return "SKILL_SCHEMA_INVALID"
+        if bundle is not None and submitted_version != self._skill_schema_version(bundle, str(goal.skill_name)):
+            return "SKILL_SCHEMA_INVALID"
+        return ""
+
+    def _validate_primitive_goal_schema(self, goal) -> str:
+        try:
+            submitted_version = validate_request_schema_version(getattr(goal, "schema_version", 1))
+        except ValueError:
+            return "SKILL_SCHEMA_INVALID"
+        descriptor = self._primitive_descriptor(goal.primitive_name)
+        if descriptor is None or descriptor.schema_version != submitted_version:
+            return "SKILL_SCHEMA_INVALID"
+        return ""
 
     @staticmethod
     def _fill_catalog_diagnostics(response, diagnostics) -> None:
@@ -822,6 +910,7 @@ class SkillExecutorNode(Node):
                     requirements,
                     parameter_schemas=parameter_schemas,
                     skill_timeout_caps=timeout_caps,
+                    skill_schema_versions=self._snapshot_skill_schema_versions(bundle.snapshot),
                 )
                 self._skill_requirements = requirements
                 self._skill_parameter_schemas = parameter_schemas
@@ -913,6 +1002,9 @@ class SkillExecutorNode(Node):
             task_executor_ready=self._task_executor_client.server_is_ready(),
             arm_trajectory_ready=self._arm_trajectory_client.server_is_ready(),
             ee_pose_fresh=self._ee_pose_is_fresh(),
+            navigation_ready=(
+                self._navigation_client.server_is_ready() if self._context_schema_version >= 2 else False
+            ),
         )
 
     def _ee_pose_is_fresh(self) -> bool:
@@ -1062,8 +1154,9 @@ class SkillExecutorNode(Node):
     @staticmethod
     def _primitive_payload_digest(goal) -> str:
         """Digest the complete canonical external primitive payload before admission mutation."""
+        is_navigation = str(goal.primitive_name) in {"nav_straight", "nav_turn", "nav_abs_coordinate"}
         payload = {
-            "schema_version": 1,
+            "schema_version": validate_request_schema_version(getattr(goal, "schema_version", None)),
             "binding": _binding_key(goal.dispatch_binding),
             "primitive_name": str(goal.primitive_name),
             "pose_name": str(goal.pose_name),
@@ -1087,6 +1180,27 @@ class SkillExecutorNode(Node):
             "waypoint_duration_sec": float(goal.waypoint_duration_sec),
             "timeout_sec": float(goal.timeout_sec),
         }
+        if is_navigation:
+            target = goal.navigation_target_pose
+            payload["navigation"] = {
+                "command_type": int(goal.navigation_command_type),
+                "target_pose": {
+                    "frame_id": str(target.header.frame_id),
+                    "stamp": [int(target.header.stamp.sec), int(target.header.stamp.nanosec)],
+                    "position": [
+                        float(target.pose.position.x),
+                        float(target.pose.position.y),
+                        float(target.pose.position.z),
+                    ],
+                    "orientation": [
+                        float(target.pose.orientation.x),
+                        float(target.pose.orientation.y),
+                        float(target.pose.orientation.z),
+                        float(target.pose.orientation.w),
+                    ],
+                },
+                "value": float(goal.navigation_value),
+            }
         return sha256_text(to_canonical_json(payload))
 
     @staticmethod
@@ -1174,6 +1288,7 @@ class SkillExecutorNode(Node):
                 requirements,
                 parameter_schemas=parameter_schemas,
                 skill_timeout_caps=timeout_caps,
+                skill_schema_versions=self._snapshot_skill_schema_versions(bundle.snapshot),
                 ledger=self._gateway_ledger,
                 lease=self._gateway_lease,
             )
@@ -1188,11 +1303,18 @@ class SkillExecutorNode(Node):
                     GatewayRequest(
                         task_id=derive_skill_task_id(root_task_id, index),
                         skill_name=step.skill_name,
+                        schema_version=step.schema_version,
                         target_name=step.target_name,
                         container_name=step.container_name,
                         place_name=step.place_name,
                         motion_direction=step.motion_direction,
                         motion_distance=step.motion_distance,
+                        direction=step.direction,
+                        distance=step.distance,
+                        degree=step.degree,
+                        x=step.x,
+                        y=step.y,
+                        yaw=step.yaw,
                         timeout_sec=step.timeout_sec or None,
                     ),
                     snapshot,
@@ -1495,7 +1617,7 @@ class SkillExecutorNode(Node):
         response.registry_epoch = bundle.registry_epoch if bundle else ""
         response.registry_generation = bundle.generation if bundle else 0
         response.registry_digest = catalog_snapshot.registry_digest if catalog_snapshot else ""
-        response.primitive_contract_digest = PRIMITIVE_CONTRACT_DIGEST
+        response.primitive_contract_digest = self._primitive_contract_digest
         response.source_release_digest = (
             str(catalog_snapshot.provenance.get("source_release_digest", "")) if catalog_snapshot else ""
         )
@@ -1516,16 +1638,20 @@ class SkillExecutorNode(Node):
         return response
 
     def _capability_status(self, skill_name: str, snapshot: RuntimeSnapshot) -> SkillCapabilityStatus:
+        coordinator = getattr(self, "_runtime_coordinator", None)
+        bundle = coordinator.current if coordinator is not None else None
         decision = self._gateway_policy.evaluate(
-            GatewayRequest(task_id=f"status-{skill_name}", skill_name=skill_name),
+            GatewayRequest(
+                task_id=f"status-{skill_name}",
+                skill_name=skill_name,
+                schema_version=self._skill_schema_version(bundle, skill_name),
+            ),
             snapshot,
             validate_parameters=False,
         )
         capability = SkillCapabilityStatus()
         capability.schema_version = 1
         capability.name = skill_name
-        coordinator = getattr(self, "_runtime_coordinator", None)
-        bundle = coordinator.current if coordinator is not None else None
         catalog_snapshot = bundle.snapshot if bundle else None
         capability.semantic_level = (
             catalog_snapshot.semantic_levels.get(skill_name, "skill") if catalog_snapshot else "skill"
@@ -1770,12 +1896,20 @@ class SkillExecutorNode(Node):
         container_name: str = "",
         motion_direction: str = "",
         motion_distance: float = 0.0,
+        direction: str = "",
+        distance: float = 0.0,
+        degree: float = 0.0,
+        x: float | None = None,
+        y: float | None = None,
+        yaw: float | None = None,
+        schema_version: int | None = None,
         dispatch_binding=None,
     ) -> tuple[bool, str]:
         if not self._validate_skill_client.wait_for_service(timeout_sec=self._rpc_timeout):
             return False, "validate_skill service unavailable"
 
         request = ValidateSkill.Request()
+        request.schema_version = validate_request_schema_version(schema_version if schema_version is not None else 1)
         if dispatch_binding is not None:
             request.dispatch_binding = copy_binding(dispatch_binding)
         request.skill_name = skill_name
@@ -1784,6 +1918,15 @@ class SkillExecutorNode(Node):
         request.place_name = place_name
         request.motion_direction = motion_direction
         request.motion_distance = float(motion_distance)
+        request.direction = direction
+        request.distance = float(distance)
+        request.degree = float(degree)
+        request.has_x = x is not None
+        request.has_y = y is not None
+        request.has_yaw = yaw is not None
+        request.x = float(x) if x is not None else 0.0
+        request.y = float(y) if y is not None else 0.0
+        request.yaw = float(yaw) if yaw is not None else 0.0
         future = self._validate_skill_client.call_async(request)
         if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
             return False, "validate_skill timeout"
@@ -1820,6 +1963,9 @@ class SkillExecutorNode(Node):
         joint_waypoint_count: int = 0,
         primitive_duration_sec: float = 0.0,
         waypoint_duration_sec: float = 0.0,
+        navigation_command_type: int = 0,
+        navigation_target_pose: PoseStamped | None = None,
+        navigation_value: float = 0.0,
         dispatch_binding=None,
     ) -> tuple[bool, str]:
         if not self._validate_primitive_client.wait_for_service(timeout_sec=self._rpc_timeout):
@@ -1828,6 +1974,10 @@ class SkillExecutorNode(Node):
         request = ValidatePrimitive.Request()
         if dispatch_binding is not None:
             request.dispatch_binding = copy_binding(dispatch_binding)
+        descriptor = self._primitive_descriptor(primitive_name)
+        if descriptor is None:
+            return False, f"unsupported primitive: {primitive_name}"
+        request.schema_version = descriptor.schema_version
         request.primitive_name = primitive_name
         request.pose_name = pose_name
         request.relative_dx = float(relative_dx)
@@ -1857,6 +2007,10 @@ class SkillExecutorNode(Node):
         request.joint_waypoint_count = int(joint_waypoint_count)
         request.primitive_duration_sec = float(primitive_duration_sec)
         request.waypoint_duration_sec = float(waypoint_duration_sec)
+        request.navigation_command_type = int(navigation_command_type)
+        if navigation_target_pose is not None:
+            request.navigation_target_pose = copy.deepcopy(navigation_target_pose)
+        request.navigation_value = float(navigation_value)
         future = self._validate_primitive_client.call_async(request)
         if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
             return False, "validate_primitive timeout"
@@ -2117,6 +2271,9 @@ class SkillExecutorNode(Node):
         confirmation.watch_goal_future(goal_future, self._best_effort_cancel_goal)
 
     def _admit_primitive(self, goal, internal_admission) -> tuple[str, object | None, object | None, bool]:
+        schema_error = self._validate_primitive_goal_schema(goal)
+        if schema_error:
+            return schema_error, None, None, False
         snapshot = self._runtime_snapshot()
         delegated_primitive = False
         if internal_admission is None and goal.dispatch_binding.dispatch_nonce:
@@ -2211,6 +2368,17 @@ class SkillExecutorNode(Node):
         # See _execute_skill for the rationale of this test-fixture fallback.
         if not hasattr(self, "_gateway_policy"):
             return self._execute_primitive_unchecked(goal_handle)
+
+        schema_error = self._validate_primitive_goal_schema(goal_handle.request)
+        if schema_error:
+            result = PrimitiveCommand.Result()
+            result.success = False
+            result.error_code = schema_error
+            result.message = "primitive schema_version does not match its selected descriptor"
+            result.pose_name = goal_handle.request.pose_name
+            self._set_primitive_replay_identity(result, _binding_task_id(goal_handle.request))
+            goal_handle.abort()
+            return result
 
         goal_key, internal_admission = self._activate_internal_primitive_goal(goal_handle)
         error_code, token, internal_admission, delegated_primitive = self._admit_primitive(
@@ -2314,6 +2482,14 @@ class SkillExecutorNode(Node):
         goal = goal_handle.request
         result = PrimitiveCommand.Result()
 
+        schema_error = self._validate_primitive_goal_schema(goal)
+        if schema_error:
+            result.error_code = schema_error
+            result.message = "primitive schema_version does not match its selected descriptor"
+            result.pose_name = goal.pose_name
+            goal_handle.abort()
+            return result
+
         target_pose = None
         ee_pose_snapshot = None
         if goal.primitive_name in {"move_relative_ee", "rotate_gripper_cw", "rotate_gripper_ccw"}:
@@ -2357,6 +2533,9 @@ class SkillExecutorNode(Node):
             joint_waypoint_count=goal.joint_waypoint_count,
             primitive_duration_sec=goal.primitive_duration_sec,
             waypoint_duration_sec=goal.waypoint_duration_sec,
+            navigation_command_type=goal.navigation_command_type,
+            navigation_target_pose=goal.navigation_target_pose,
+            navigation_value=goal.navigation_value,
             dispatch_binding=goal.dispatch_binding,
         )
         if not allowed:
@@ -2489,6 +2668,19 @@ class SkillExecutorNode(Node):
                 )
             if not ok:
                 return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
+        elif goal.primitive_name in {"nav_straight", "nav_turn", "nav_abs_coordinate"}:
+            navigation_goal = ExecuteNavigation.Goal()
+            navigation_goal.command_type = int(goal.navigation_command_type)
+            navigation_goal.target_pose = copy.deepcopy(goal.navigation_target_pose)
+            navigation_goal.value = float(goal.navigation_value)
+            navigation_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 120.0)
+            ok, error_code, err_msg = self._exec_navigation(
+                goal_handle,
+                navigation_goal,
+                navigation_timeout,
+            )
+            if not ok:
+                return self._finish_primitive_failure(result, goal_handle, error_code, err_msg, "")
         else:
             # Delegate gripper control to task_dispatch via ExecuteTaskPlan action
             ok, err_msg = self._exec_gripper_via_task_dispatch(
@@ -2505,6 +2697,162 @@ class SkillExecutorNode(Node):
         self._set_primitive_result_catalog_identity(result)
         goal_handle.succeed()
         return result
+
+    def _exec_navigation(
+        self,
+        goal_handle,
+        navigation_goal: ExecuteNavigation.Goal,
+        timeout_sec: float,
+    ) -> tuple[bool, str, str]:
+        if self._context_schema_version < 2 or not hasattr(self, "_navigation_client"):
+            return (
+                False,
+                "NAVIGATION_SERVER_UNAVAILABLE",
+                "navigation action endpoint is unavailable in context schema v1",
+            )
+        late_cleanup_confirmation = self._late_cleanup_confirmation(goal_handle)
+        execution_deadline = time.monotonic() + timeout_sec
+        server_wait_timeout = min(self._rpc_timeout, max(0.0, execution_deadline - time.monotonic()))
+        if not self._navigation_client.wait_for_server(timeout_sec=server_wait_timeout):
+            if time.monotonic() >= execution_deadline:
+                return False, "NAVIGATION_TIMEOUT", "timeout waiting for navigation action server"
+            message = f"navigation action server not available: {self._navigation_action_name}"
+            self.get_logger().warning(f"[embodied-debug] {message}")
+            return False, "NAVIGATION_SERVER_UNAVAILABLE", message
+        if time.monotonic() >= execution_deadline:
+            return False, "NAVIGATION_TIMEOUT", "timeout waiting for navigation action server"
+        if goal_handle.is_cancel_requested:
+            return False, "NAVIGATION_CANCELED", "navigation canceled before goal dispatch"
+
+        def feedback_callback(feedback_message) -> None:
+            navigation_feedback = getattr(feedback_message, "feedback", feedback_message)
+            estimated = navigation_feedback.estimated_time_remaining
+            estimated_sec = float(estimated.sec) + float(estimated.nanosec) / 1_000_000_000.0
+            feedback = PrimitiveCommand.Feedback()
+            feedback.state = str(navigation_feedback.state)
+            feedback.detail = (
+                f"distance_remaining={float(navigation_feedback.distance_remaining):.3f} "
+                f"estimated_time_remaining_sec={estimated_sec:.3f} "
+                f"number_of_recoveries={int(navigation_feedback.number_of_recoveries)}"
+            )
+            goal_handle.publish_feedback(feedback)
+
+        try:
+            send_future = self._navigation_client.send_goal_async(
+                navigation_goal,
+                feedback_callback=feedback_callback,
+            )
+        except Exception:
+            return False, "NAVIGATION_INTERNAL_ERROR", "navigation goal send state is unknown"
+
+        if goal_handle.is_cancel_requested:
+            cleaned = self._cancel_goal_future(send_future, late_cleanup_confirmation)
+            return (
+                (False, "NAVIGATION_CANCELED", "navigation canceled")
+                if cleaned
+                else (False, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "cancel cleanup timed out while sending navigation goal")
+            )
+        acceptance_deadline = min(execution_deadline, time.monotonic() + self._rpc_timeout)
+        while rclpy.ok() and not send_future.done():
+            if goal_handle.is_cancel_requested:
+                cleaned = self._cancel_goal_future(send_future, late_cleanup_confirmation)
+                return (
+                    (False, "NAVIGATION_CANCELED", "navigation canceled")
+                    if cleaned
+                    else (
+                        False,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "cancel cleanup timed out while sending navigation goal",
+                    )
+                )
+            if time.monotonic() >= acceptance_deadline:
+                cleaned = self._cancel_goal_future(send_future, late_cleanup_confirmation)
+                return (
+                    (False, "NAVIGATION_GOAL_TIMEOUT", "timeout waiting for navigation goal acceptance")
+                    if cleaned
+                    else (
+                        False,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "cancel cleanup timed out while sending navigation goal",
+                    )
+                )
+            time.sleep(0.05)
+        if not send_future.done():
+            self._cancel_goal_future(send_future, late_cleanup_confirmation)
+            return False, "NAVIGATION_INTERNAL_ERROR", "navigation goal send interrupted"
+
+        try:
+            navigation_handle = send_future.result()
+        except Exception:
+            return False, "NAVIGATION_INTERNAL_ERROR", "navigation goal send state is unknown"
+        if navigation_handle is None or not navigation_handle.accepted:
+            return False, "NAVIGATION_GOAL_REJECTED", "navigation goal rejected"
+
+        try:
+            result_future = navigation_handle.get_result_async()
+        except Exception:
+            self._best_effort_cancel_goal(navigation_handle)
+            return (
+                False,
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                "cancel cleanup timed out during navigation execution",
+            )
+
+        if goal_handle.is_cancel_requested:
+            cleaned = self._cancel_goal(navigation_handle, result_future, late_cleanup_confirmation)
+            return (
+                (False, "NAVIGATION_CANCELED", "navigation canceled")
+                if cleaned
+                else (False, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "cancel cleanup timed out during navigation execution")
+            )
+
+        while rclpy.ok() and not result_future.done():
+            if goal_handle.is_cancel_requested:
+                cleaned = self._cancel_goal(navigation_handle, result_future, late_cleanup_confirmation)
+                return (
+                    (False, "NAVIGATION_CANCELED", "navigation canceled")
+                    if cleaned
+                    else (
+                        False,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "cancel cleanup timed out during navigation execution",
+                    )
+                )
+            if time.monotonic() >= execution_deadline:
+                cleaned = self._cancel_goal(navigation_handle, result_future, late_cleanup_confirmation)
+                return (
+                    (False, "NAVIGATION_TIMEOUT", "timeout waiting for navigation result")
+                    if cleaned
+                    else (
+                        False,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "cancel cleanup timed out during navigation execution",
+                    )
+                )
+            time.sleep(0.05)
+        if not result_future.done():
+            cleaned = self._cancel_goal(navigation_handle, result_future, late_cleanup_confirmation)
+            return (
+                (False, "NAVIGATION_INTERNAL_ERROR", "navigation result wait interrupted")
+                if cleaned
+                else (False, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "cancel cleanup timed out during navigation execution")
+            )
+
+        try:
+            wrapped_result = result_future.result()
+        except Exception:
+            self._best_effort_cancel_goal(navigation_handle)
+            return False, "NAVIGATION_INTERNAL_ERROR", "navigation result state is unknown"
+        navigation_result = getattr(wrapped_result, "result", None)
+        if navigation_result is None:
+            return False, "NAVIGATION_INTERNAL_ERROR", "navigation action returned no result"
+        if navigation_result.success:
+            return True, "", ""
+        if int(navigation_result.error_code) == ExecuteNavigation.Result.STOP_TIMEOUT:
+            return False, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, f"cancel cleanup timed out: {navigation_result.message}"
+        error_code = _NAVIGATION_ERROR_CODES.get(int(navigation_result.error_code), "NAVIGATION_FAILED")
+        message = str(navigation_result.message) or error_code
+        return False, error_code, message
 
     def _exec_rotate_gripper_via_task_dispatch(
         self,
@@ -3374,11 +3722,21 @@ class SkillExecutorNode(Node):
         request = GatewayRequest(
             task_id=_binding_task_id(goal),
             skill_name=goal.skill_name,
+            schema_version=goal.schema_version,
             target_name=goal.target_name,
             container_name=goal.container_name,
             place_name=goal.place_name,
             motion_direction=goal.motion_direction,
             motion_distance=goal.motion_distance,
+            direction=goal.direction,
+            distance=goal.distance,
+            degree=goal.degree,
+            x=goal.x,
+            y=goal.y,
+            yaw=goal.yaw,
+            has_x=goal.has_x,
+            has_y=goal.has_y,
+            has_yaw=goal.has_yaw,
             timeout_sec=None if goal.timeout_sec == 0.0 else goal.timeout_sec,
         )
         owner = ExecutionOwner.skill_command(_binding_task_id(goal))
@@ -3394,6 +3752,16 @@ class SkillExecutorNode(Node):
                     "skill catalog reload is in progress",
                 )
             bundle = coordinator.current if coordinator is not None else None
+            schema_error = self._validate_skill_goal_schema(goal, bundle)
+            if schema_error:
+                result = SkillCommand.Result()
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    schema_error,
+                    "skill schema_version does not match the selected capability",
+                )
             binding_error = (
                 self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
                 if coordinator is not None
@@ -3483,6 +3851,13 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                direction=goal.direction,
+                distance=goal.distance,
+                degree=goal.degree,
+                x=goal.x if goal.has_x else None,
+                y=goal.y if goal.has_y else None,
+                yaw=goal.yaw if goal.has_yaw else None,
+                schema_version=goal.schema_version,
                 dispatch_binding=goal.dispatch_binding,
             )
             self._audit(
@@ -3583,25 +3958,21 @@ class SkillExecutorNode(Node):
         goal = goal_handle.request
         binding = goal.dispatch_binding
         result = SkillCommand.Result()
-        try:
-            requested_step = CanonicalWorkflowStep(
-                schema_version=1,
-                skill_name=goal.skill_name,
-                target_name=goal.target_name,
-                container_name=goal.container_name,
-                place_name=goal.place_name,
-                motion_direction=goal.motion_direction,
-                motion_distance=goal.motion_distance,
-                timeout_sec=goal.timeout_sec,
-            )
-        except (TypeError, ValueError) as exc:
-            return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", str(exc))
 
         with self._state_guard():
             workflow = self._active_workflow
             if workflow is None:
                 return self._abort_skill(
                     result, goal_handle, [], "SKILL_WORKFLOW_LEASE_MISMATCH", "workflow is not active"
+                )
+            schema_error = self._validate_skill_goal_schema(goal, workflow.bundle)
+            if schema_error:
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    schema_error,
+                    "skill schema_version does not match the selected capability",
                 )
             index = int(binding.workflow_step_index)
             if binding.schema_version != 1:
@@ -3624,6 +3995,26 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(
                     result, goal_handle, [], "SKILL_WORKFLOW_STEP_MISMATCH", "workflow step index is out of range"
                 )
+            expected_step = workflow.workflow_steps[index]
+            try:
+                requested_step = CanonicalWorkflowStep(
+                    schema_version=expected_step.schema_version,
+                    skill_name=goal.skill_name,
+                    target_name=goal.target_name,
+                    container_name=goal.container_name,
+                    place_name=goal.place_name,
+                    motion_direction=goal.motion_direction,
+                    motion_distance=goal.motion_distance,
+                    timeout_sec=goal.timeout_sec,
+                    direction=goal.direction,
+                    distance=goal.distance,
+                    degree=goal.degree,
+                    x=goal.x if goal.has_x else None,
+                    y=goal.y if goal.has_y else None,
+                    yaw=goal.yaw if goal.has_yaw else None,
+                )
+            except (TypeError, ValueError) as exc:
+                return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", str(exc))
             expected_task_id = derive_skill_task_id(workflow.root_task_id, index)
             if binding.task_id != expected_task_id or binding.root_lease_nonce != workflow.root_lease_nonce:
                 return self._abort_skill(
@@ -3652,7 +4043,7 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(
                     result, goal_handle, [], "SKILL_WORKFLOW_DIGEST_MISMATCH", "workflow digest does not match"
                 )
-            if index != workflow.completed_step_count or requested_step != workflow.workflow_steps[index]:
+            if requested_step != expected_step:
                 return self._abort_skill(
                     result, goal_handle, [], "SKILL_WORKFLOW_STEP_MISMATCH", "workflow step does not match"
                 )
@@ -3667,16 +4058,27 @@ class SkillExecutorNode(Node):
                     "SKILL_REQUEST_ID_CONFLICT",
                     "workflow child result is no longer available for replay",
                 )
+            if index != workflow.completed_step_count:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_STEP_MISMATCH", "workflow step is out of order"
+                )
             child_owner = ExecutionOwner.internal_child(workflow.owner, goal.skill_name)
             decision = workflow.policy.evaluate(
                 GatewayRequest(
                     task_id=binding.task_id,
                     skill_name=goal.skill_name,
+                    schema_version=goal.schema_version,
                     target_name=goal.target_name,
                     container_name=goal.container_name,
                     place_name=goal.place_name,
                     motion_direction=goal.motion_direction,
                     motion_distance=goal.motion_distance,
+                    direction=goal.direction,
+                    distance=goal.distance,
+                    degree=goal.degree,
+                    x=goal.x if goal.has_x else None,
+                    y=goal.y if goal.has_y else None,
+                    yaw=goal.yaw if goal.has_yaw else None,
                     timeout_sec=goal.timeout_sec or None,
                 ),
                 self._runtime_snapshot(),
@@ -3722,6 +4124,13 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                direction=goal.direction,
+                distance=goal.distance,
+                degree=goal.degree,
+                x=goal.x if goal.has_x else None,
+                y=goal.y if goal.has_y else None,
+                yaw=goal.yaw if goal.has_yaw else None,
+                schema_version=goal.schema_version,
                 dispatch_binding=goal.dispatch_binding,
             )
             if not allowed:
@@ -3821,6 +4230,13 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                direction=goal.direction,
+                distance=goal.distance,
+                degree=goal.degree,
+                x=goal.x if goal.has_x else None,
+                y=goal.y if goal.has_y else None,
+                yaw=goal.yaw if goal.has_yaw else None,
+                schema_version=goal.schema_version,
                 dispatch_binding=goal.dispatch_binding,
             )
             if not allowed:
@@ -3860,6 +4276,12 @@ class SkillExecutorNode(Node):
                 self._relative_motion_direction_mapping,
                 current_joint_positions=self._current_joint_positions(),
                 arm_joint_names=self._arm_joint_names,
+                direction=goal.direction,
+                distance=goal.distance,
+                degree=goal.degree,
+                x=goal.x if goal.has_x else None,
+                y=goal.y if goal.has_y else None,
+                yaw=goal.yaw if goal.has_yaw else None,
             )
         except Exception as exc:
             return self._abort_skill(result, goal_handle, [], "SKILL_RESOLUTION_FAILED", str(exc))
@@ -3921,6 +4343,16 @@ class SkillExecutorNode(Node):
             primitive_goal.dispatch_binding.task_id = canonical_task_id or _binding_task_id(goal)
             primitive_goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
             primitive_goal.primitive_name = primitive_name
+            descriptor = self._primitive_descriptor(primitive_name)
+            if descriptor is None:
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed_primitives,
+                    "SKILL_SCHEMA_INVALID",
+                    f"unknown primitive descriptor: {primitive_name}",
+                )
+            primitive_goal.schema_version = descriptor.schema_version
             primitive_goal.pose_name = pose_name
             primitive_goal.velocity_scaling = 0.0
             primitive_goal.relative_dx = float(primitive.relative_dx)
@@ -3936,12 +4368,26 @@ class SkillExecutorNode(Node):
             primitive_goal.primitive_duration_sec = float(primitive.duration_sec)
             primitive_goal.waypoint_duration_sec = float(primitive.waypoint_duration_sec)
             primitive_goal.timeout_sec = remaining_timeout if remaining_timeout is not None else 0.0
+            if primitive.navigation_goal is not None:
+                primitive_goal.navigation_command_type = int(primitive.navigation_goal.command_type)
+                primitive_goal.navigation_target_pose = copy.deepcopy(primitive.navigation_goal.target_pose)
+                primitive_goal.navigation_value = float(primitive.navigation_goal.value)
 
             if audit_context is not None:
                 self._audit("primitive_started", step_count=step_count, **audit_context)
 
             internal_goal_key = None
             internal_late_cleanup_confirmation = None
+
+            def primitive_feedback_callback(feedback_message, active_primitive_name=primitive_name) -> None:
+                if active_primitive_name not in {"nav_straight", "nav_turn", "nav_abs_coordinate"}:
+                    return
+                primitive_feedback = getattr(feedback_message, "feedback", feedback_message)
+                skill_feedback = SkillCommand.Feedback()
+                skill_feedback.state = str(primitive_feedback.state)
+                skill_feedback.detail = str(primitive_feedback.detail)
+                goal_handle.publish_feedback(skill_feedback)
+
             with self._state_guard():
                 admission = getattr(self, "_active_skill_admission", None)
             if admission is not None:
@@ -3959,7 +4405,9 @@ class SkillExecutorNode(Node):
                 )
                 try:
                     send_goal_future = self._primitive_client.send_goal_async(
-                        primitive_goal, goal_uuid=internal_goal_id
+                        primitive_goal,
+                        feedback_callback=primitive_feedback_callback,
+                        goal_uuid=internal_goal_id,
                     )
                 except Exception:
                     self._forget_internal_primitive_goal(internal_goal_key)
@@ -3972,7 +4420,10 @@ class SkillExecutorNode(Node):
                     )
             else:
                 try:
-                    send_goal_future = self._primitive_client.send_goal_async(primitive_goal)
+                    send_goal_future = self._primitive_client.send_goal_async(
+                        primitive_goal,
+                        feedback_callback=primitive_feedback_callback,
+                    )
                 except Exception:
                     return self._abort_skill(
                         result,
