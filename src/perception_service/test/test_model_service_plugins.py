@@ -482,11 +482,11 @@ def test_unfinished_compiled_family_fails_before_session_creation_without_fallba
     )
     with pytest.raises(RuntimeError, match="ABI is not finalized"):
         context = SimpleNamespace(
-            model=SimpleNamespace(family="sam2"),
+            model=SimpleNamespace(family="grounding_dino"),
             deployment=deployment,
             runtime_options={},
         )
-        build_perception_session(context, adapter=SAM2Adapter())
+        build_perception_session(context, adapter=GroundingDINOAdapter())
 
 
 def test_only_conformant_adapters_promote_compiled_abi() -> None:
@@ -494,6 +494,7 @@ def test_only_conformant_adapters_promote_compiled_abi() -> None:
 
     assert {adapter.identity.family for adapter in adapters if adapter.compiled_abi_finalized} == {
         "ram_plus",
+        "sam2",
         "siglip2",
     }
 

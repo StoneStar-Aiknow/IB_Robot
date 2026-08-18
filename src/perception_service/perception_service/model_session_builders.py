@@ -15,6 +15,7 @@ from inference_service.model_sessions import (
 )
 
 from .graspgen_session import GraspGenAscendSession
+from .sam2_automatic_ascend_session import SAM2AutomaticAscendSession
 from .siglip2_ascend_session import SigLIP2AscendSession
 
 
@@ -51,6 +52,8 @@ def build_perception_session(context: RuntimeContext, *, adapter) -> ModelSessio
         device_id = _ascend_device_id(family, adapter, deployment, options, {"acl_config_path", "device_id"})
         if family == "siglip2":
             return SigLIP2AscendSession(device_id=device_id)
+        if family == "sam2" and adapter.identity.operation == "automatic":
+            return SAM2AutomaticAscendSession(device_id=device_id)
         return AscendOmModelSession(device_id=device_id)
     if isinstance(deployment, TorchDeployment):
         if options:
