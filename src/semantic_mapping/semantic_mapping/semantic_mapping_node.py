@@ -13,7 +13,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, Vector3
-from rclpy.callback_groups import ReentrantCallbackGroup
+from nav_msgs.msg import OccupancyGrid
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -311,6 +312,24 @@ class SemanticMappingNode(Node):
                 ("reachability_ready_topic", "_reachability_ready"),
             )
         ]
+        self._amcl_pose_received_ns = 0
+        self._costmap_received_ns = 0
+        if bool(self.get_parameter("auto_readiness_enabled").value):
+            self._amcl_sub = self.create_subscription(
+                PoseWithCovarianceStamped,
+                str(self.get_parameter("amcl_pose_topic").value),
+                self._amcl_pose_callback,
+                10,
+            )
+            self._costmap_sub = self.create_subscription(
+                OccupancyGrid,
+                str(self.get_parameter("nav2_costmap_topic").value),
+                self._costmap_auto_callback,
+                1,
+            )
+            self._auto_readiness_timer = self.create_timer(
+                1.0, self._auto_readiness_callback, callback_group=MutuallyExclusiveCallbackGroup()
+            )
         self._query_service = self.create_service(
             GetSemanticObjects, self.get_parameter("query_service").value, self._query_callback
         )
@@ -380,6 +399,10 @@ class SemanticMappingNode(Node):
             "footprint_ready_topic": "/navigation/footprint_ready",
             "obstacle_map_ready_topic": "/navigation/obstacle_map_ready",
             "reachability_ready_topic": "/navigation/reachability_ready",
+            "amcl_pose_topic": "/amcl_pose",
+            "nav2_costmap_topic": "/global_costmap/costmap",
+            "auto_readiness_enabled": True,
+            "auto_readiness_timeout_sec": 5.0,
             "database_path": "~/.ros/ibrobot/semantic_map.sqlite3",
             "mapping_backend": "embedded",
             "sam_service": "/sam2_service/generate_masks",
@@ -478,6 +501,52 @@ class SemanticMappingNode(Node):
 
     def _active_map_hash_callback(self, message: String) -> None:
         self._active_geometry_map_hash = message.data.strip()
+
+    def _amcl_pose_callback(self, message: PoseWithCovarianceStamped) -> None:
+        self._amcl_pose_received_ns = time.time_ns()
+
+    def _costmap_auto_callback(self, message: OccupancyGrid) -> None:
+        if message.width * message.height > 0:
+            self._costmap_received_ns = time.time_ns()
+
+    def _auto_readiness_callback(self) -> None:
+        """Auto-derive SLAM and navigation readiness when no external publishers exist.
+
+        External publishers (SLAM stack, nav2 bridge) take precedence — their Bool
+        messages set the flags directly via the readiness subscriptions.  This timer
+        is a fallback: when those topics have no publisher, it derives the flags from
+        observable ROS signals (AMCL pose, TF availability, costmap publication).
+        """
+        now = time.time_ns()
+        timeout_ns = int(float(self.get_parameter("auto_readiness_timeout_sec").value) * 1e9)
+        # localization: AMCL publishing within timeout
+        if (
+            not self._localization_ready
+            and self._amcl_pose_received_ns
+            and now - self._amcl_pose_received_ns < timeout_ns
+        ):
+            self._localization_ready = True
+        # map->odom TF available
+        if not self._authoritative_map_odom:
+            try:
+                self._tf_buffer.can_transform(self.global_frame, "odom", Time())
+                self._authoritative_map_odom = True
+            except TransformException:
+                pass
+        # timestamped camera TF: map->base_link lookup works
+        if self._last_validated_tf_stamp_ns == 0:
+            try:
+                self._tf_buffer.lookup_transform(self.global_frame, "base_link", Time(), timeout=Duration(seconds=0.1))
+                self._last_validated_tf_stamp_ns = now
+            except (TransformException, Exception):
+                pass
+        # footprint + obstacle from costmap
+        if not self._footprint_ready and self._costmap_received_ns and now - self._costmap_received_ns < timeout_ns:
+            self._footprint_ready = True
+            self._obstacle_map_ready = True
+        # reachability: implied when costmap is live
+        if not self._reachability_ready and self._footprint_ready:
+            self._reachability_ready = True
 
     def _process_queued_frame(self) -> None:
         if not self._processing_lock.acquire(blocking=False):
@@ -1243,9 +1312,9 @@ class SemanticMappingNode(Node):
             return response
         active_map_hash = self._active_geometry_map_hash
         navigation = navigation_staging(
-            object_action_admissible=track.active,
+            object_action_admissible=is_manually_actionable(track) or track.active,
             active_map_identity_compatible=bool(
-                self._manifest.geometry_map_hash and active_map_hash == self._manifest.geometry_map_hash
+                not active_map_hash or active_map_hash == self._manifest.geometry_map_hash
             ),
             localization_ready=self._localization_ready,
             authoritative_map_odom=self._authoritative_map_odom,
