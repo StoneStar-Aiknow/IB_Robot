@@ -468,6 +468,71 @@ def test_ascend_session_executes_linked_roles_individually(tmp_path) -> None:
     session.close()
 
 
+def test_ascend_diagnostic_capture_reads_linked_outputs_without_returning_them(tmp_path) -> None:
+    _FakeAclModel.instances = []
+    _FakeAclModel.fail_role = None
+    bundle_files = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, bundle_files)
+    (tmp_path / "artifacts/consumer.om").write_bytes(b"consumer")
+    manifest["model"] = {
+        "kind": "generic",
+        "family": "linked",
+        "inputs": [
+            {"semantic": "features", "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "bias", "dtype": "float32", "shape": [1, 2]},
+        ],
+        "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
+    }
+    deployment = manifest["deployments"]["ascend"]
+    deployment["artifacts"] = {
+        "producer": {"path": "artifacts/ram_plus.om", "format": "om"},
+        "consumer": {"path": "artifacts/consumer.om", "format": "om"},
+    }
+    deployment["execution"] = ["producer", "consumer"]
+    deployment["bindings"] = {
+        "producer": {
+            "inputs": [{"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+            "outputs": [{"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+        "consumer": {
+            "inputs": [
+                {"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]},
+                {"semantic": "bias", "index": 1, "dtype": "float32", "shape": [1, 2]},
+            ],
+            "outputs": [{"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+    }
+    deployment["device_links"] = [
+        {
+            "semantic": "internal.hidden",
+            "producer": "producer",
+            "consumer": "consumer",
+            "transport": "device_pointer",
+            "owner": "producer",
+        }
+    ]
+    write_manifest(tmp_path, manifest)
+    captured = []
+    session = AscendOmModelSession(
+        runtime_manager=_FakeRuntimeManager(),
+        model_factory=_FakeAclModel,
+        diagnostic_capture=lambda name, value: captured.append((name, value)),
+    )
+    session.load(RuntimeContext(load_inference_manifest(tmp_path, "ascend")))
+    request = NamedTensorRequest(
+        "linked-diagnostics",
+        {"features": np.zeros((1, 2), dtype=np.float32), "bias": np.ones((1, 2), dtype=np.float32)},
+    )
+
+    with session.execution(request) as execution:
+        assert execution.invoke("producer", {"features": request.inputs["features"]}) == {}
+
+    producer = _FakeAclModel.instances[0]
+    assert producer.read_outputs == {0}
+    assert [name for name, _value in captured] == ["producer_in_features", "producer_out_internal.hidden"]
+    session.close()
+
+
 def test_stateful_ascend_session_accepts_raw_acl_and_manages_device_state_banks(tmp_path) -> None:
     class StatefulModel(_FakeAclModel):
         def __init__(self, *args, **kwargs) -> None:

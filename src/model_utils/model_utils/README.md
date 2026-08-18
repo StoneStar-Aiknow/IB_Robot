@@ -315,14 +315,32 @@ ros2 run model_utils pi05-export \
     --steps vlm_onnx,vlm_quant,vlm_quant_om
 ```
 
+`pi05-ae-attn-mlp-sq-v1` 固化经过 checkpoint 验证的 108 节点 Action Expert 策略：18 层
+q/k/v/o attention projection、fused GeGLU MLP projection 和 down projection，并携带 SmoothQuant
+`alpha=0.5`、`epsilon=1e-5`。它要求每个校准 episode 包含完整 10 步 AE 轨迹：
+
+```bash
+ros2 run model_utils pi05-export \
+    --policy-path /path/to/pi05_bundle \
+    --exp-dir /path/to/ae-sq-run \
+    --soc-version Ascend310P3 \
+    --device npu \
+    --donor-device cpu \
+    --calib-dir /path/to/ae_trajectory_calibration \
+    --quant-profile pi05-ae-attn-mlp-sq-v1 \
+    --steps ae_onnx,ae_quant,ae_quant_om
+```
+
 可用 `--list-quant-profiles` 查看随包 YAML 和配置文件中的策略。运行 profile 可保存
 `quant_profile: pi05-q40-v1` 引用；自定义策略放在同一 YAML 的 `quantization_profiles` 下，格式为
 `pi05-quant-profile-v1`，并为每组 selector 声明 regex 和预期匹配数量。显式执行 `vlm_quant` 会始终
 重新校准；只执行 `vlm_quant_om` 时，工具会检查相邻的 `.quant.json`，拒绝复用来自其他 profile
 或 policy bundle 的 W8A8 ONNX。
 
-量化 profile 只描述节点选择，不携带权重、scale 或 OM。将 q40 用于另一个 PI05 checkpoint 时仍需
-重新量化，并重新执行独立精度与性能验证；q40 YAML 不允许 `ae_quant`/`ae_quant_om`。
+量化 profile 描述节点选择和可复用的算法参数，不携带 checkpoint 相关权重、校准 scale、SmoothQuant
+plan 或 OM。将任一 profile 用于另一个 PI05 checkpoint 时仍需重新采集校准数据、重新量化，并执行
+独立精度与性能验证；q40 YAML 不允许 `ae_quant`/`ae_quant_om`，AE SmoothQuant YAML 不允许
+`vlm_quant`/`vlm_quant_om`。
 
 请求的步骤会先删除该步骤的旧输出，并在子工具返回后确认新输出确实存在，因此失败的导出或
 ATC 调用不会把 stale ONNX/OM/ABI 当作本次成功。只重跑 `vlm_om` 或 `ae_om` 时，另一角色

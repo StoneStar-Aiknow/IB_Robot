@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
@@ -37,6 +38,8 @@ class QuantizationRoleProfile:
     expected_npu_geglu_nodes: int | None = None
     expected_calibration_steps: int | None = None
     donor_dtype: str | None = None
+    smoothquant_alpha: float | None = None
+    smoothquant_epsilon: float | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,9 @@ def _role_as_dict(role: QuantizationRoleProfile) -> dict[str, Any]:
         data["expected_calibration_steps"] = role.expected_calibration_steps
     if role.donor_dtype is not None:
         data["donor_dtype"] = role.donor_dtype
+    if role.smoothquant_alpha is not None:
+        data["smoothquant_alpha"] = role.smoothquant_alpha
+        data["smoothquant_epsilon"] = role.smoothquant_epsilon
     return data
 
 
@@ -117,6 +123,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         "expected_npu_geglu_nodes",
         "expected_calibration_steps",
         "donor_dtype",
+        "smoothquant_alpha",
+        "smoothquant_epsilon",
     }
     unknown = sorted(set(data) - allowed)
     if unknown:
@@ -173,6 +181,25 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         raise ValueError(f"{where}.selectors must not be empty when the role is enabled")
     if enabled and (data.get("expected_selected_nodes") is None or data.get("expected_quantized_nodes") is None):
         raise ValueError(f"{where} must declare expected_selected_nodes and expected_quantized_nodes when enabled")
+    smoothquant_alpha = data.get("smoothquant_alpha")
+    smoothquant_epsilon = data.get("smoothquant_epsilon")
+    if (smoothquant_alpha is None) != (smoothquant_epsilon is None):
+        raise ValueError(f"{where} must declare smoothquant_alpha and smoothquant_epsilon together")
+    if smoothquant_alpha is not None:
+        if (
+            isinstance(smoothquant_alpha, bool)
+            or not isinstance(smoothquant_alpha, int | float)
+            or not math.isfinite(smoothquant_alpha)
+            or not 0.0 <= smoothquant_alpha <= 1.0
+        ):
+            raise ValueError(f"{where}.smoothquant_alpha must be finite and in [0, 1]")
+        if (
+            isinstance(smoothquant_epsilon, bool)
+            or not isinstance(smoothquant_epsilon, int | float)
+            or not math.isfinite(smoothquant_epsilon)
+            or smoothquant_epsilon <= 0.0
+        ):
+            raise ValueError(f"{where}.smoothquant_epsilon must be finite and positive")
 
     return QuantizationRoleProfile(
         enabled=enabled,
@@ -185,6 +212,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         expected_npu_geglu_nodes=expected_npu_geglu_nodes,
         expected_calibration_steps=expected_calibration_steps,
         donor_dtype=donor_dtype,
+        smoothquant_alpha=float(smoothquant_alpha) if smoothquant_alpha is not None else None,
+        smoothquant_epsilon=float(smoothquant_epsilon) if smoothquant_epsilon is not None else None,
     )
 
 
@@ -235,12 +264,11 @@ def parse_quantization_profile(name: str, value: Any) -> QuantizationProfile:
     )
     if npu_geglu is True and fast_gelu is True:
         raise ValueError(f"quantization profile {name!r} cannot enable both npu_geglu and fast_gelu")
-    if vlm.fused_geglu_donor is True and (npu_geglu is not True or fast_gelu is True):
+    role_profiles = (vlm, action_expert)
+    if any(role.fused_geglu_donor is True for role in role_profiles) and (npu_geglu is not True or fast_gelu is True):
         raise ValueError(f"quantization profile {name!r} fused_geglu_donor requires exact NPU GeGLU")
-    if vlm.expected_npu_geglu_nodes is not None and npu_geglu is not True:
+    if any(role.expected_npu_geglu_nodes is not None for role in role_profiles) and npu_geglu is not True:
         raise ValueError(f"quantization profile {name!r} expected_npu_geglu_nodes requires npu_geglu=true")
-    if action_expert.fused_geglu_donor is not None or action_expert.expected_npu_geglu_nodes is not None:
-        raise ValueError(f"quantization profile {name!r} GeGLU deployment fields apply only to vlm")
     if vlm.expected_calibration_steps is not None:
         raise ValueError(f"quantization profile {name!r} expected_calibration_steps applies only to action_expert")
     return QuantizationProfile(

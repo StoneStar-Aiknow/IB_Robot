@@ -29,6 +29,15 @@ def _q40_node_names() -> list[str]:
     return names
 
 
+def _ae108_node_names() -> list[str]:
+    names = []
+    for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        names.extend(f"/layers.{layer}/self_attn/{projection}/MatMul" for layer in range(18))
+    names.extend(f"/layers.{layer}/mlp/MatMul" for layer in range(18))
+    names.extend(f"/layers.{layer}/mlp/down_proj/MatMul" for layer in range(18))
+    return names
+
+
 def _write_policy(policy: Path, model: bytes = b"weights") -> None:
     policy.mkdir()
     (policy / "config.json").write_text('{"type":"pi05"}', encoding="utf-8")
@@ -61,6 +70,38 @@ def test_ae_attention_profile_requires_complete_trajectory():
     assert profile.action_expert.expected_quantized_nodes == 72
     assert profile.action_expert.expected_calibration_steps == 10
     assert profile.action_expert.donor_dtype == "fp32"
+
+
+def test_ae_attention_mlp_smoothquant_profile_has_exact_validated_scope():
+    profile = bundled_quantization_profiles()["pi05-ae-attn-mlp-sq-v1"]
+    role = profile.action_expert
+
+    assert profile.digest == "cfe53326b0bbf64ae0bf87f5ee829c8f6c1b9f984eb7435c40a593b28c390c3b"
+    assert profile.status == "checkpoint-validated"
+    assert profile.target_soc == "Ascend310P3"
+    assert profile.npu_geglu is True
+    assert profile.fast_gelu is False
+    assert not profile.vlm.enabled
+    assert role.enabled
+    assert role.donor_dtype == "fp16"
+    assert role.fused_geglu_donor is True
+    assert role.expected_npu_geglu_nodes == 18
+    assert role.expected_calibration_steps == 10
+    assert role.smoothquant_alpha == 0.5
+    assert role.smoothquant_epsilon == 1e-5
+    assert sum(selector.expected for selector in role.selectors) == 108
+    assert role.expected_selected_nodes == 108
+    assert role.expected_quantized_nodes == 108
+
+    names = _ae108_node_names()
+    selection = w8a8_common.select_quantizable_nodes(
+        [(name, "MatMul") for name in names],
+        list(role.disable_regex),
+        [selector.regex for selector in role.selectors],
+        expected_regex_matches=[selector.expected for selector in role.selectors],
+        expected_selected_nodes=108,
+    )
+    assert list(selection.selected_names) == names
 
 
 def test_q40_profile_selects_exact_nodes_and_rejects_graph_drift():
@@ -180,6 +221,65 @@ def test_custom_profile_rejects_contradictory_geglu_modes():
         )
 
 
+def test_custom_profile_requires_complete_smoothquant_parameters():
+    with pytest.raises(ValueError, match="declare smoothquant_alpha and smoothquant_epsilon together"):
+        parse_quantization_profile(
+            "invalid-smoothquant",
+            {
+                "format": "pi05-quant-profile-v1",
+                "vlm": {"enabled": False},
+                "action_expert": {
+                    "enabled": True,
+                    "selectors": [{"name": "one", "regex": "MatMul", "expected": 1}],
+                    "expected_selected_nodes": 1,
+                    "expected_quantized_nodes": 1,
+                    "smoothquant_alpha": 0.5,
+                },
+            },
+        )
+
+
+def test_custom_profile_allows_ae_exact_fused_geglu_donor():
+    profile = parse_quantization_profile(
+        "ae-fused",
+        {
+            "format": "pi05-quant-profile-v1",
+            "npu_geglu": True,
+            "fast_gelu": False,
+            "vlm": {"enabled": False},
+            "action_expert": {
+                "enabled": True,
+                "selectors": [{"name": "fused-mlp", "regex": r"/mlp/MatMul$", "expected": 18}],
+                "expected_selected_nodes": 18,
+                "expected_quantized_nodes": 18,
+                "fused_geglu_donor": True,
+                "expected_npu_geglu_nodes": 18,
+            },
+        },
+    )
+
+    assert profile.action_expert.fused_geglu_donor is True
+    assert profile.action_expert.expected_npu_geglu_nodes == 18
+
+
+def test_custom_ae_fused_geglu_donor_requires_exact_npu_geglu():
+    with pytest.raises(ValueError, match="requires exact NPU GeGLU"):
+        parse_quantization_profile(
+            "ae-fused",
+            {
+                "format": "pi05-quant-profile-v1",
+                "vlm": {"enabled": False},
+                "action_expert": {
+                    "enabled": True,
+                    "selectors": [{"name": "fused-mlp", "regex": r"/mlp/MatMul$", "expected": 18}],
+                    "expected_selected_nodes": 18,
+                    "expected_quantized_nodes": 18,
+                    "fused_geglu_donor": True,
+                },
+            },
+        )
+
+
 def test_effective_cli_rejects_fast_gelu_with_npu_geglu_profile(tmp_path):
     policy = tmp_path / "bundle"
     policy.mkdir()
@@ -250,6 +350,8 @@ def test_q40_profile_rejects_non_npu_export(tmp_path):
             [
                 "--policy-path",
                 str(policy),
+                "--device",
+                "cpu",
                 "--quant-profile",
                 "pi05-q40-v1",
                 "--batch-path",

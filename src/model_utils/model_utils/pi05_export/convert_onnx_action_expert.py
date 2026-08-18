@@ -241,6 +241,12 @@ def parse_args() -> argparse.Namespace:
         help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
         "This is faster but not numerically identical to PyTorch tanh GELU.",
     )
+    parser.add_argument(
+        "--fused-geglu-donor",
+        action="store_true",
+        help="Export an ORT-runnable quantization donor with one [up,gate] MatMul per Gemma MLP. "
+        "Internal Route-A option; incompatible with NPU export and --fast-gelu.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     parser.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return parser.parse_args()
@@ -357,6 +363,8 @@ def main() -> int:
     # NPU-affine fused ops (RoPE, etc.) are used automatically when exporting
     # on an NPU device; cpu/cuda exports keep the ORT-runnable fallbacks.
     use_npu_ops = str(device).startswith("npu")
+    if args.fused_geglu_donor and (use_npu_ops or args.fast_gelu):
+        raise ValueError("--fused-geglu-donor requires a non-NPU device and --no-fast-gelu")
 
     past_kv_path = Path(args.past_kv_path).expanduser()
     prefix_pad_masks_path = Path(args.prefix_pad_masks_path).expanduser()
@@ -479,6 +487,7 @@ def main() -> int:
         softmax_in_model_dtype=softmax_in_model_dtype,
         mqa_broadcast=True,
         fast_gelu=bool(args.fast_gelu),
+        fused_geglu_donor=bool(args.fused_geglu_donor),
     ):
         torch.onnx.export(
             onnx_wrapper,

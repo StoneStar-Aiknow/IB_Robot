@@ -131,6 +131,54 @@ def test_profiled_ae_quantization_removes_failed_output(tmp_path, monkeypatch):
     assert not metadata.exists()
 
 
+def test_ae_quantizer_validates_fused_geglu_donor_and_npu_graph(tmp_path, monkeypatch):
+    input_path = tmp_path / "ae-donor.onnx"
+    npu_path = tmp_path / "ae-npu.onnx"
+    output_path = tmp_path / "ae-w8a8.onnx"
+    _write_ae_model(input_path)
+    _write_ae_model(npu_path)
+    validated = []
+
+    monkeypatch.setattr(quantize_ae, "build_calib_data", lambda **_kwargs: [[np.ones((1, 2, 2), dtype=np.float16)]])
+    monkeypatch.setattr(
+        quantize_ae.common,
+        "validate_npu_geglu_deployment",
+        lambda _model, expected: validated.append(("npu", expected)),
+    )
+    monkeypatch.setattr(
+        quantize_ae.common,
+        "validate_fused_geglu_route",
+        lambda _donor, _npu: validated.append(("donor", None)),
+    )
+
+    def fake_quantize(**_kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+        return 2
+
+    monkeypatch.setattr(quantize_ae.common, "run_msmodelslim_w8a8", fake_quantize)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "quantize_ae",
+            "--onnx-path",
+            str(input_path),
+            "--npu-onnx-path",
+            str(npu_path),
+            "--output-path",
+            str(output_path),
+            "--calib-dir",
+            str(tmp_path),
+            "--fused-geglu-donor",
+            "--require-npu-geglu",
+            "--expected-npu-geglu-nodes",
+            "18",
+        ],
+    )
+
+    assert quantize_ae.main() == 0
+    assert validated == [("npu", 18), ("donor", None)]
+
+
 def test_build_calib_data_expands_each_episode_into_all_trajectory_steps(tmp_path):
     onnx_path = tmp_path / "ae-inputs.onnx"
     _write_ae_input_model(onnx_path)

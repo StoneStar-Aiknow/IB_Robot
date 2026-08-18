@@ -12,6 +12,7 @@ from inference_manifest import load_inference_manifest
 from inference_service.pi05_schedule import load_pi05_schedule
 from model_utils.pi05_export import _cli
 from model_utils.pi05_export.convert_om import (
+    _run_atc,
     build_arg_parser,
     convert_role,
     replace_pi05_ascend_schedule,
@@ -88,6 +89,31 @@ def test_convert_role_removes_stale_om_before_atc(tmp_path, monkeypatch):
         )
 
     assert not om_path.exists()
+
+
+def test_run_atc_resolves_external_data_from_onnx_directory(tmp_path, monkeypatch):
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    onnx_path = onnx_dir / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+    recorded = {}
+
+    def fake_run(command, *, check, cwd):
+        recorded.update(command=command, check=check, cwd=cwd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("model_utils.pi05_export.convert_om.subprocess.run", fake_run)
+
+    assert _run_atc(
+        onnx_path,
+        tmp_path / "model.om",
+        "Ascend310P3",
+        extra_args=[],
+        input_shape_mode="none",
+    )
+    assert recorded["check"] is False
+    assert recorded["cwd"] == onnx_dir
+    assert f"--model={onnx_path}" in recorded["command"]
 
 
 def test_write_pi05_ascend_deployment_uses_compiled_abis_and_strict_loader(tmp_path):

@@ -187,6 +187,69 @@ def select_quantizable_nodes(
     )
 
 
+def validate_fused_geglu_route(donor, npu):  # noqa: ANN001
+    """Require each NPU fused GeGLU MatMul to have an identical donor target."""
+    npu_producer = {output: node for node in npu.graph.node for output in node.output}
+    donor_names = [node.name for node in donor.graph.node if node.name]
+    if len(donor_names) != len(set(donor_names)):
+        raise RuntimeError("Fused GeGLU donor contains duplicate node names")
+    donor_by_name = {node.name: node for node in donor.graph.node}
+    donor_init = {initializer.name: initializer for initializer in donor.graph.initializer}
+    npu_init = {initializer.name: initializer for initializer in npu.graph.initializer}
+    fused_targets = []
+    for geglu in npu.graph.node:
+        if geglu.op_type != "NPUGeglu" or not geglu.input:
+            continue
+        producer = npu_producer.get(geglu.input[0])
+        if producer is None or producer.op_type not in {"MatMul", "Gemm"}:
+            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
+        donor_node = donor_by_name.get(producer.name)
+        if donor_node is None or donor_node.op_type != producer.op_type:
+            raise RuntimeError(f"Fused GeGLU donor is missing {producer.op_type} {producer.name!r}")
+        if len(donor_node.input) < 2 or len(producer.input) < 2:
+            raise RuntimeError(f"Fused GeGLU MatMul {producer.name!r} has no weight input")
+        donor_weight = donor_init.get(donor_node.input[1])
+        npu_weight = npu_init.get(producer.input[1])
+        if donor_weight is None or npu_weight is None or list(donor_weight.dims) != list(npu_weight.dims):
+            raise RuntimeError(f"Fused GeGLU weight shape mismatch for {producer.name!r}")
+        fused_targets.append(producer.name)
+    if not fused_targets:
+        raise RuntimeError("NPU graph has no NPUGeglu nodes to quantize")
+    LOGGER.info("Validated %d fused GeGLU MatMul donor target(s).", len(fused_targets))
+    return fused_targets
+
+
+def validate_npu_geglu_deployment(npu, expected: int | None = None):  # noqa: ANN001
+    """Require every NPUGeglu site in the deployment graph to consume a weight MatMul/Gemm."""
+    import re
+
+    producer = {output: node for node in npu.graph.node for output in node.output}
+    initializers = {initializer.name for initializer in npu.graph.initializer}
+    separate_projection = re.compile(r"/mlp/(?:gate_proj|up_proj)/MatMul$")
+    mixed = [node.name for node in npu.graph.node if separate_projection.search(node.name)]
+    if mixed:
+        raise RuntimeError(f"NPU deployment graph mixes NPUGeglu with separate gate/up projections: {mixed[:5]}")
+    targets = []
+    for geglu in npu.graph.node:
+        if geglu.op_type != "NPUGeglu":
+            continue
+        parent = producer.get(geglu.input[0]) if geglu.input else None
+        if (
+            parent is None
+            or parent.op_type not in {"MatMul", "Gemm"}
+            or len(parent.input) < 2
+            or parent.input[1] not in initializers
+        ):
+            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
+        targets.append(parent.name)
+    if not targets:
+        raise RuntimeError("NPU deployment graph has no NPUGeglu nodes")
+    if expected is not None and len(targets) != expected:
+        raise RuntimeError(f"NPU deployment graph has {len(targets)} NPUGeglu nodes, expected {expected}")
+    LOGGER.info("Validated %d NPU GeGLU deployment site(s).", len(targets))
+    return targets
+
+
 def ordered_input_names(onnx_path: Path) -> list[str]:
     """Graph input order (excluding initializers), read straight from the proto.
 
@@ -1689,6 +1752,36 @@ def add_common_quant_args(p: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="Disk-backed scratch directory for AMP model and activation staging (defaults to the output directory).",
+    )
+    p.add_argument(
+        "--smoothquant-alpha",
+        type=float,
+        default=None,
+        help="Prepare matched donor/NPU graphs with SmoothQuant before W8A8 PTQ (disabled when omitted).",
+    )
+    p.add_argument(
+        "--smoothquant-epsilon",
+        type=float,
+        default=1e-5,
+        help="Positive floor used while deriving SmoothQuant channel scales.",
+    )
+    p.add_argument(
+        "--smoothquant-output-dir",
+        type=Path,
+        default=None,
+        help="Directory for prepared SmoothQuant graph pairs and the scale plan sidecar.",
+    )
+    p.add_argument(
+        "--smoothquant-verify-rtol",
+        type=float,
+        default=2e-3,
+        help="Relative tolerance for original-vs-smoothed portable donor equivalence.",
+    )
+    p.add_argument(
+        "--smoothquant-verify-atol",
+        type=float,
+        default=2e-3,
+        help="Absolute tolerance for original-vs-smoothed portable donor equivalence.",
     )
     p.add_argument(
         "--list-nodes", action="store_true", help="Print the quantizable node inventory and exit (no quantization)."

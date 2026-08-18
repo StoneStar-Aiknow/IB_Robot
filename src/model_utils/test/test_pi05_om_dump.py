@@ -9,7 +9,7 @@ import torch
 
 import model_utils.pi05_om_dump as pi05_om_dump_module
 from model_utils.observation_batch import FieldSpec, save_observation_batch
-from model_utils.pi05_om_dump import dump_pi05_om, dump_pi05_om_batches
+from model_utils.pi05_om_dump import DiagnosticCapture, dump_pi05_om, dump_pi05_om_batches
 
 
 class _Engine:

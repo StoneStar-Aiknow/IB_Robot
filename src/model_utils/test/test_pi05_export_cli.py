@@ -4,7 +4,7 @@ from importlib import import_module
 from types import SimpleNamespace
 
 from model_utils.pi05_export import _cli
-from model_utils.pi05_export.quant.profiles import bundled_quantization_profiles
+from model_utils.pi05_export.quant.profiles import bundled_quantization_profiles, parse_quantization_profile
 
 pipeline = import_module("model_utils.pi05_export.__main__")
 
@@ -212,6 +212,74 @@ def test_ae_attention_profile_exports_fp32_calibration_donor(tmp_path, monkeypat
     module, argv = calls[0]
     assert module == "model_utils.pi05_export.convert_onnx_action_expert"
     assert argv[argv.index("--dtype") + 1] == "fp32"
+
+
+def test_ae_fused_geglu_profile_exports_matching_donor_and_validates_npu_graph(tmp_path, monkeypatch):
+    profile = parse_quantization_profile(
+        "ae-fused",
+        {
+            "format": "pi05-quant-profile-v1",
+            "npu_geglu": True,
+            "fast_gelu": False,
+            "vlm": {"enabled": False},
+            "action_expert": {
+                "enabled": True,
+                "selectors": [{"name": "fused-mlp", "regex": r"/mlp/MatMul$", "expected": 18}],
+                "expected_selected_nodes": 18,
+                "expected_quantized_nodes": 18,
+                "fused_geglu_donor": True,
+                "expected_npu_geglu_nodes": 18,
+            },
+        },
+    )
+    ctx = SimpleNamespace(
+        args=SimpleNamespace(
+            dtype="fp16",
+            donor_device="cpu",
+            num_calib=16,
+            amp_num=0,
+            amp_rank_samples=1,
+            amp_scratch_dir=None,
+            log_level="INFO",
+        ),
+        policy_path=tmp_path / "bundle",
+        output_dir=tmp_path / "onnx",
+        runtime_save_dir=tmp_path / "runtime",
+        calib_dir=tmp_path / "calib",
+        ae_w8a8=tmp_path / "ae-w8a8.onnx",
+        quantization_profile=profile,
+    )
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_quant_inputs",
+        lambda *_args, **_kwargs: (tmp_path / "donor.onnx", tmp_path / "npu.onnx"),
+    )
+    monkeypatch.setattr(pipeline, "_run_module", lambda module, argv: calls.append((module, argv)))
+
+    pipeline._run_ae_donor_onnx(ctx)
+    pipeline._run_ae_quant(ctx)
+
+    donor_args = calls[0][1]
+    quant_args = calls[1][1]
+    assert "--fused-geglu-donor" in donor_args
+    assert "pi05-action_expert_fused-geglu.onnx" in donor_args[donor_args.index("--output") + 1]
+    assert "--fused-geglu-donor" in quant_args
+    assert "--require-npu-geglu" in quant_args
+    assert quant_args[quant_args.index("--expected-npu-geglu-nodes") + 1] == "18"
+
+
+def test_ae_attention_mlp_profile_forwards_smoothquant_parameters(tmp_path):
+    profile = bundled_quantization_profiles()["pi05-ae-attn-mlp-sq-v1"]
+    ctx = SimpleNamespace(quantization_profile=profile)
+
+    argv = pipeline._quant_profile_args(ctx, role="ae", output_onnx=tmp_path / "ae-w8a8.onnx")
+
+    assert argv[argv.index("--smoothquant-alpha") + 1] == "0.5"
+    assert argv[argv.index("--smoothquant-epsilon") + 1] == "1e-05"
+    assert argv[argv.index("--expected-selected-nodes") + 1] == "108"
+    assert argv[argv.index("--expected-quantized-nodes") + 1] == "108"
+    assert argv[argv.index("--expected-calibration-steps") + 1] == "10"
 
 
 def test_quant_om_revalidates_profile_metadata_immediately_before_compile(monkeypatch):

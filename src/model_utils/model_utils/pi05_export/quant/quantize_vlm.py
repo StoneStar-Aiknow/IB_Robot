@@ -46,6 +46,7 @@ import numpy as np
 
 from model_utils.pi05_export.quant import w8a8_common as common
 from model_utils.pi05_export.quant.profiles import write_quantization_metadata
+from model_utils.pi05_export.quant.smoothquant import prepare_smoothquant_pair, verify_smoothquant_outputs
 
 LOGGER = logging.getLogger("quantize_vlm")
 
@@ -259,67 +260,6 @@ def _resolve_disable_regexes(disable_regexes: list[str] | None, *, unfused_geglu
     ]
 
 
-def validate_fused_geglu_route(donor, npu):  # noqa: ANN001
-    """Require each NPU fused GeGLU MatMul to have an identical donor target."""
-    npu_producer = {output: node for node in npu.graph.node for output in node.output}
-    donor_names = [node.name for node in donor.graph.node if node.name]
-    if len(donor_names) != len(set(donor_names)):
-        raise RuntimeError("Fused GeGLU donor contains duplicate node names")
-    donor_by_name = {node.name: node for node in donor.graph.node}
-    donor_init = {initializer.name: initializer for initializer in donor.graph.initializer}
-    npu_init = {initializer.name: initializer for initializer in npu.graph.initializer}
-    fused_targets = []
-    for geglu in npu.graph.node:
-        if geglu.op_type != "NPUGeglu" or not geglu.input:
-            continue
-        producer = npu_producer.get(geglu.input[0])
-        if producer is None or producer.op_type not in {"MatMul", "Gemm"}:
-            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
-        donor_node = donor_by_name.get(producer.name)
-        if donor_node is None or donor_node.op_type != producer.op_type:
-            raise RuntimeError(f"Fused GeGLU donor is missing {producer.op_type} {producer.name!r}")
-        if len(donor_node.input) < 2 or len(producer.input) < 2:
-            raise RuntimeError(f"Fused GeGLU MatMul {producer.name!r} has no weight input")
-        donor_weight = donor_init.get(donor_node.input[1])
-        npu_weight = npu_init.get(producer.input[1])
-        if donor_weight is None or npu_weight is None or list(donor_weight.dims) != list(npu_weight.dims):
-            raise RuntimeError(f"Fused GeGLU weight shape mismatch for {producer.name!r}")
-        fused_targets.append(producer.name)
-    if not fused_targets:
-        raise RuntimeError("NPU graph has no NPUGeglu nodes to quantize")
-    LOGGER.info("Validated %d fused GeGLU MatMul donor target(s).", len(fused_targets))
-    return fused_targets
-
-
-def validate_npu_geglu_deployment(npu, expected: int | None = None):  # noqa: ANN001
-    """Require every NPUGeglu site in the deployment graph to consume a weight MatMul/Gemm."""
-    producer = {output: node for node in npu.graph.node for output in node.output}
-    initializers = {initializer.name for initializer in npu.graph.initializer}
-    separate_projection = re.compile(r"/mlp/(?:gate_proj|up_proj)/MatMul$")
-    mixed = [node.name for node in npu.graph.node if separate_projection.search(node.name)]
-    if mixed:
-        raise RuntimeError(f"NPU deployment graph mixes NPUGeglu with separate gate/up projections: {mixed[:5]}")
-    targets = []
-    for geglu in npu.graph.node:
-        if geglu.op_type != "NPUGeglu":
-            continue
-        parent = producer.get(geglu.input[0]) if geglu.input else None
-        if (
-            parent is None
-            or parent.op_type not in {"MatMul", "Gemm"}
-            or len(parent.input) < 2
-            or parent.input[1] not in initializers
-        ):
-            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
-        targets.append(parent.name)
-    if not targets:
-        raise RuntimeError("NPU deployment graph has no NPUGeglu nodes")
-    if expected is not None and len(targets) != expected:
-        raise RuntimeError(f"NPU deployment graph has {len(targets)} NPUGeglu nodes, expected {expected}")
-    LOGGER.info("Validated %d NPU GeGLU deployment site(s).", len(targets))
-    return targets
-
-
 def validate_unfused_geglu_route(donor, npu):  # noqa: ANN001
     """Require separate gate/up MatMuls in both donor and NPU deployment graphs."""
     if any(node.op_type == "NPUGeglu" for node in npu.graph.node):
@@ -436,9 +376,9 @@ def main() -> int:
             return 1
         npu_model = common.load_onnx(npu_graph_path)
         if args.require_npu_geglu:
-            validate_npu_geglu_deployment(npu_model, args.expected_npu_geglu_nodes)
+            common.validate_npu_geglu_deployment(npu_model, args.expected_npu_geglu_nodes)
         if args.fused_geglu_donor:
-            validate_fused_geglu_route(model_proto, npu_model)
+            common.validate_fused_geglu_route(model_proto, npu_model)
         if args.unfused_geglu_deployment:
             validate_unfused_geglu_route(model_proto, npu_model)
 
@@ -452,18 +392,66 @@ def main() -> int:
         device_str=args.device,
     )
 
+    quant_donor_path = onnx_path
+    quant_npu_path = npu_graph_path
+    if args.smoothquant_alpha is not None:
+        if npu_graph_path is None:
+            raise ValueError("--smoothquant-alpha requires --npu-onnx-path")
+        quantizable_ops = dict(quantizable)
+        smoothquant_names = [name for name in selection.selected_names if quantizable_ops[name] in {"MatMul", "Gemm"}]
+        skipped_smoothquant_names = sorted(set(selection.selected_names) - set(smoothquant_names))
+        if skipped_smoothquant_names:
+            LOGGER.info(
+                "SmoothQuant skips %d unsupported selected node(s): %s",
+                len(skipped_smoothquant_names),
+                skipped_smoothquant_names,
+            )
+        smoothquant_dir = (
+            args.smoothquant_output_dir.expanduser().resolve()
+            if args.smoothquant_output_dir
+            else output_path.parent / f"{output_path.stem}.smoothquant"
+        )
+        smoothquant = prepare_smoothquant_pair(
+            onnx_path,
+            npu_graph_path,
+            smoothquant_dir,
+            calib_data,
+            smoothquant_names,
+            args.smoothquant_alpha,
+            args.smoothquant_epsilon,
+            output_prefix=output_path.stem,
+        )
+        verification = verify_smoothquant_outputs(
+            onnx_path,
+            smoothquant.donor_path,
+            calib_data,
+            rtol=args.smoothquant_verify_rtol,
+            atol=args.smoothquant_verify_atol,
+        )
+        LOGGER.info(
+            "SmoothQuant prepared %d node(s) in %d activation group(s), scale range=[%.6g, %.6g], plan=%s",
+            smoothquant.node_count,
+            smoothquant.group_count,
+            smoothquant.scale_min,
+            smoothquant.scale_max,
+            smoothquant.plan_digest,
+        )
+        LOGGER.info("SmoothQuant donor equivalence passed across %d calibration sample(s)", verification.sample_count)
+        quant_donor_path = smoothquant.donor_path
+        quant_npu_path = smoothquant.npu_path
+
     if args.quant_metadata_path:
         args.quant_metadata_path.unlink(missing_ok=True)
     try:
         actual_quantized_nodes = common.run_msmodelslim_w8a8(
-            input_onnx=onnx_path,
+            input_onnx=quant_donor_path,
             output_onnx=output_path,
             calib_data=calib_data,
             disable_names=disable_names,
             amp_num=args.amp_num,
             amp_rank_samples=args.amp_rank_samples,
             amp_scratch_dir=args.amp_scratch_dir,
-            npu_graph=npu_graph_path,
+            npu_graph=quant_npu_path,
         )
         if args.expected_quantized_nodes is not None and actual_quantized_nodes != args.expected_quantized_nodes:
             raise RuntimeError(

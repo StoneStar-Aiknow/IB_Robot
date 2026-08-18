@@ -499,7 +499,11 @@ def _validate_quantization_profile(
         actual = merged.get(setting)
         if required is not None and (not actual or actual.split(":", 1)[0] != required):
             problems.append(f"profile {profile.name!r} requires {setting}={required}")
-    if (profile.npu_geglu is True or profile.vlm.fused_geglu_donor is True) and merged.get("fast_gelu"):
+    if (
+        profile.npu_geglu is True
+        or profile.vlm.fused_geglu_donor is True
+        or profile.action_expert.fused_geglu_donor is True
+    ) and merged.get("fast_gelu"):
         problems.append(f"profile {profile.name!r} requires fast_gelu=False for NPU GeGLU")
     if profile.target_soc and merged.get("soc_version") and merged["soc_version"] != profile.target_soc:
         problems.append(f"profile {profile.name!r} requires soc_version={profile.target_soc}")

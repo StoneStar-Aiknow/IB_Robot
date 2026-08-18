@@ -26,8 +26,17 @@ class DiagnosticCapture:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.values: dict[str, dict[str, Any]] = {}
+        self._name_counts: dict[str, int] = {}
 
     def save(self, name: str, value: object) -> None:
+        count = self._name_counts.get(name, 0)
+        self._name_counts[name] = count + 1
+        if name == "action_expert_in_noise":
+            name = "ae_in_noise" if count == 0 else f"x_t_step{count - 1:02d}"
+        elif name == "action_expert_in_time":
+            name = f"ae_in_time_step{count:02d}"
+        elif name == "action_expert_out_action":
+            name = f"velocity_step{count:02d}"
         candidate = value
         detach = getattr(candidate, "detach", None)
         if callable(detach):
@@ -51,6 +60,7 @@ class DiagnosticCapture:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.values = {}
+        self._name_counts = {}
 
     def write_index(self, metadata: dict[str, Any]) -> None:
         document = {**metadata, "values": self.values}

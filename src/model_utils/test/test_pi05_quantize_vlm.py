@@ -17,8 +17,6 @@ from model_utils.pi05_export.quant.quantize_vlm import (
     _resize_calibration_images,
     _resolve_disable_regexes,
     build_arg_parser,
-    validate_fused_geglu_route,
-    validate_npu_geglu_deployment,
     validate_unfused_geglu_route,
 )
 from model_utils.pi05_export.verify_pi05_split_equivalence import load_real_batches_raw, preprocess_real_batches
@@ -430,6 +428,31 @@ def test_amp_rank_samples_cli_default_and_override():
     assert parser.parse_args(["--onnx-path", "model.onnx", "--amp-rank-samples", "8"]).amp_rank_samples == 8
 
 
+def test_smoothquant_cli_defaults_and_override(tmp_path):
+    parser = build_arg_parser()
+
+    defaults = parser.parse_args(["--onnx-path", "model.onnx"])
+    assert defaults.smoothquant_alpha is None
+    assert defaults.smoothquant_epsilon == 1e-5
+    assert defaults.smoothquant_output_dir is None
+
+    configured = parser.parse_args(
+        [
+            "--onnx-path",
+            "model.onnx",
+            "--smoothquant-alpha",
+            "0.3",
+            "--smoothquant-epsilon",
+            "1e-4",
+            "--smoothquant-output-dir",
+            str(tmp_path),
+        ]
+    )
+    assert configured.smoothquant_alpha == 0.3
+    assert configured.smoothquant_epsilon == 1e-4
+    assert configured.smoothquant_output_dir == tmp_path
+
+
 def test_quantize_regex_restricts_nodes_and_preserves_exclusions():
     quantizable = [
         ("/layers.0/mlp/MatMul", "MatMul"),
@@ -653,14 +676,14 @@ def test_fused_geglu_route_rejects_legacy_donor():
     )
 
     with pytest.raises(RuntimeError, match="missing MatMul"):
-        validate_fused_geglu_route(donor, npu)
+        w8a8_common.validate_fused_geglu_route(donor, npu)
 
 
 def test_npu_geglu_deployment_requires_fused_site():
     npu = helper.make_model(helper.make_graph([], "npu", [], []))
 
     with pytest.raises(RuntimeError, match="no NPUGeglu"):
-        validate_npu_geglu_deployment(npu)
+        w8a8_common.validate_npu_geglu_deployment(npu)
 
 
 def test_npu_geglu_deployment_enforces_expected_site_count():
@@ -678,9 +701,9 @@ def test_npu_geglu_deployment_enforces_expected_site_count():
         )
     )
 
-    assert validate_npu_geglu_deployment(npu, expected=1) == ["/layers.0/mlp/MatMul"]
+    assert w8a8_common.validate_npu_geglu_deployment(npu, expected=1) == ["/layers.0/mlp/MatMul"]
     with pytest.raises(RuntimeError, match="1 NPUGeglu nodes, expected 2"):
-        validate_npu_geglu_deployment(npu, expected=2)
+        w8a8_common.validate_npu_geglu_deployment(npu, expected=2)
 
 
 def test_unfused_geglu_route_matches_separate_projections():

@@ -56,6 +56,7 @@ import numpy as np
 
 from model_utils.pi05_export.quant import w8a8_common as common
 from model_utils.pi05_export.quant.profiles import write_quantization_metadata
+from model_utils.pi05_export.quant.smoothquant import prepare_smoothquant_pair, verify_smoothquant_outputs
 
 LOGGER = logging.getLogger("quantize_ae")
 
@@ -369,6 +370,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--noise-path", type=str, default=None, help="Optional fixed noise (.npy/.pth) for the single-sample path."
     )
+    p.add_argument(
+        "--fused-geglu-donor",
+        action="store_true",
+        help="Require a Route-A donor whose fused Gemma MLP MatMuls match every NPUGeglu producer.",
+    )
+    p.add_argument(
+        "--require-npu-geglu",
+        action="store_true",
+        help="Require the Route-A NPU deployment graph to contain valid NPUGeglu sites.",
+    )
+    p.add_argument("--expected-npu-geglu-nodes", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--expected-calibration-steps", type=int, default=None, help=argparse.SUPPRESS)
     return p
 
@@ -381,6 +393,12 @@ def main() -> int:
     )
     if args.expected_calibration_steps is not None and args.expected_calibration_steps <= 0:
         LOGGER.error("--expected-calibration-steps must be positive")
+        return 1
+    if args.expected_npu_geglu_nodes is not None and not args.require_npu_geglu:
+        LOGGER.error("--expected-npu-geglu-nodes requires --require-npu-geglu")
+        return 1
+    if (args.fused_geglu_donor or args.require_npu_geglu) and not args.npu_onnx_path:
+        LOGGER.error("GeGLU Route-A validation requires --npu-onnx-path")
         return 1
 
     onnx_path = Path(args.onnx_path).expanduser().resolve()
@@ -431,6 +449,11 @@ def main() -> int:
         if not npu_graph_path.is_file():
             LOGGER.error("--npu-onnx-path not found: %s", npu_graph_path)
             return 1
+        npu_model = common.load_onnx(npu_graph_path)
+        if args.require_npu_geglu:
+            common.validate_npu_geglu_deployment(npu_model, args.expected_npu_geglu_nodes)
+        if args.fused_geglu_donor:
+            common.validate_fused_geglu_route(model_proto, npu_model)
 
     calib_data = build_calib_data(
         onnx_path=onnx_path,
@@ -442,18 +465,66 @@ def main() -> int:
         expected_calibration_steps=args.expected_calibration_steps,
     )
 
+    quant_donor_path = onnx_path
+    quant_npu_path = npu_graph_path
+    if args.smoothquant_alpha is not None:
+        if npu_graph_path is None:
+            raise ValueError("--smoothquant-alpha requires --npu-onnx-path")
+        quantizable_ops = dict(quantizable)
+        smoothquant_names = [name for name in selection.selected_names if quantizable_ops[name] in {"MatMul", "Gemm"}]
+        skipped_smoothquant_names = sorted(set(selection.selected_names) - set(smoothquant_names))
+        if skipped_smoothquant_names:
+            LOGGER.info(
+                "SmoothQuant skips %d unsupported selected node(s): %s",
+                len(skipped_smoothquant_names),
+                skipped_smoothquant_names,
+            )
+        smoothquant_dir = (
+            args.smoothquant_output_dir.expanduser().resolve()
+            if args.smoothquant_output_dir
+            else output_path.parent / f"{output_path.stem}.smoothquant"
+        )
+        smoothquant = prepare_smoothquant_pair(
+            onnx_path,
+            npu_graph_path,
+            smoothquant_dir,
+            calib_data,
+            smoothquant_names,
+            args.smoothquant_alpha,
+            args.smoothquant_epsilon,
+            output_prefix=output_path.stem,
+        )
+        verification = verify_smoothquant_outputs(
+            onnx_path,
+            smoothquant.donor_path,
+            calib_data,
+            rtol=args.smoothquant_verify_rtol,
+            atol=args.smoothquant_verify_atol,
+        )
+        LOGGER.info(
+            "SmoothQuant prepared %d node(s) in %d activation group(s), scale range=[%.6g, %.6g], plan=%s",
+            smoothquant.node_count,
+            smoothquant.group_count,
+            smoothquant.scale_min,
+            smoothquant.scale_max,
+            smoothquant.plan_digest,
+        )
+        LOGGER.info("SmoothQuant donor equivalence passed across %d calibration sample(s)", verification.sample_count)
+        quant_donor_path = smoothquant.donor_path
+        quant_npu_path = smoothquant.npu_path
+
     if args.quant_metadata_path:
         args.quant_metadata_path.unlink(missing_ok=True)
     try:
         actual_quantized_nodes = common.run_msmodelslim_w8a8(
-            input_onnx=onnx_path,
+            input_onnx=quant_donor_path,
             output_onnx=output_path,
             calib_data=calib_data,
             disable_names=disable_names,
             amp_num=args.amp_num,
             amp_rank_samples=args.amp_rank_samples,
             amp_scratch_dir=args.amp_scratch_dir,
-            npu_graph=npu_graph_path,
+            npu_graph=quant_npu_path,
         )
         if args.expected_quantized_nodes is not None and actual_quantized_nodes != args.expected_quantized_nodes:
             raise RuntimeError(
