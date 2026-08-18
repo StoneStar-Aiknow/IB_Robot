@@ -1472,7 +1472,16 @@ def main(args=None):
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=1.0)
+            except (KeyboardInterrupt, TransformException):
+                raise
+            except Exception as exc:
+                # A vanished service client (e.g. ros2 service call timed out)
+                # raises RCLError when the response is sent; log and keep serving
+                # instead of letting one lost client kill the node.
+                node.get_logger().warn(f"executor recovered from callback error: {exc}")
     except (KeyboardInterrupt, TransformException):
         pass
     finally:
