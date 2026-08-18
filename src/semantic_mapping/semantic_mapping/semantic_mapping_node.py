@@ -506,7 +506,7 @@ class SemanticMappingNode(Node):
         self._amcl_pose_received_ns = time.time_ns()
 
     def _costmap_auto_callback(self, message: OccupancyGrid) -> None:
-        if message.width * message.height > 0:
+        if message.info.width * message.info.height > 0:
             self._costmap_received_ns = time.time_ns()
 
     def _auto_readiness_callback(self) -> None:
