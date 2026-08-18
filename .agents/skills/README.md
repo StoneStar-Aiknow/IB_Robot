@@ -22,8 +22,8 @@
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
 | [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
-| [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh。 |
-| [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。 |
+| [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。 |
+| [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。 |
 | [sync-github](./sync-github) | 工作流 | 将 IB_Robot 仓库的 origin 远端（个人 AtomGit fork）的 master 分支同步推送到 GitHub 远端。 |
 | [skill-creator](./skill-creator) | 工作流 | 新建/重构 Agent skill，按 agentskills.io 规范编写 SKILL.md，校验 frontmatter 与渐进式披露。 |
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
@@ -33,7 +33,7 @@
 | [deepwiki-translator](./deepwiki-translator) | 文档 | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档。 |
 | [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML 不再渲染 Mermaid 错误 SVG。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
-| [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、更新标题/描述、生成摘要。 |
+| [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、选择 WIP/正式检视阶段、更新标题/描述；工具版本由 coding agent 先行执行版本命令后传入。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
 | [atomgit-pr-review](./atomgit-pr-review) | AtomGit | 对 PR 进行代码质量审查、逻辑检查、发现潜在 Bug 并提交检视意见。 |
 | [atomgit-pr-architecture-review](./atomgit-pr-architecture-review) | AtomGit | 验证 PR 是否符合 SSOT、契约驱动设计等项目架构支柱。 |
@@ -65,8 +65,8 @@
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
 - **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。
 - **工程规范 ([ibrobot-git-flow](./ibrobot-git-flow))**: 自动化执行开源社区繁琐的提交规范校验。
-- **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh 的完整端到端验证，确保修改不会破坏首次安装体验。
-- **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器（qemu-user 模拟 chroot）中端到端验证 setup.sh + build.sh，以 root 用户模拟真实开发板操作环境。
+- **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh；作者侧门禁先询问 WIP/正式检视，`[WIP]` 暂缓验证。
+- **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。
 - **OH 交叉编译移植 ([oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg))**: 将第三方 ROS 2 包（如 usb_cam）通过 Docker 交叉编译工具链移植到 OpenHarmony 板，覆盖克隆、编译、部署、板端验证和 launch 集成全流程。
 - **OH 内核重编 ([oh-rebuild-kernel](./oh-rebuild-kernel))**: 重新编译并刷入 OpenHarmony 板的 Linux 内核 (boot_linux.img)，用于启用 USB ACM（SO-101 机械臂）、游戏手柄等内核驱动。
 
@@ -97,7 +97,7 @@
 > 
 > Token 配置存储在项目根目录的 `config.json` 中，通过环境变量 `$ATOMGIT_TOKEN` 引用。
 
-- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、读取管理上下文、更新描述等全生命周期动作；如果目标是通用 review，应改用 `atomgit-pr-review`。
+- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、WIP/正式检视阶段选择、读取管理上下文和更新描述；coding agent 先执行实际工具版本命令，再将结果传给 `--agent-tool`；如果目标是通用 review，应改用 `atomgit-pr-review`。
 - **Issue 工作流 ([atomgit-issue](./atomgit-issue))**: 面向 Issue 资源本身，覆盖创建、读取、更新与状态流转，支持 `--owner` / `--repo` / `--url` 进行跨仓库调用。
 - **通用评审 ([atomgit-pr-review](./atomgit-pr-review))**: 利用 LLM 充当第一道代码防线，默认提取变更、提交和已有评论，支持直接从 PR 链接解析目标仓库与编号。
 - **架构扫描 ([atomgit-pr-architecture-review](./atomgit-pr-architecture-review))**: 专门检查是否违背了 SSOT 等核心架构原则。

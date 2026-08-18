@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import sys
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from comment_formatter import CommentFormatter
 from llm_reviewer import LLMCodeReviewer
-from verification_gate import extract_verified_commit, file_triggers_dual_docker_gate
+from verification_gate import extract_verified_tree, file_triggers_dual_docker_gate, is_wip_title, resolve_pr_head_tree
+
+_AGENT_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._/@:+~\- ]*\s+v?\d+(?:\.\d+){1,5}(?:[-+][0-9A-Za-z.-]+)?$")
 
 
 class CodeReviewer:
@@ -89,7 +92,7 @@ class CodeReviewer:
                 if not line.strip().startswith("Co-Authored-By:"):
                     continue
                 value = line.partition(":")[2].strip()
-                if value and not ("<" in value and ">" in value):
+                if value and not re.search(r"<[^<>]+>\s*$", value):
                     commit_models.add(value)
 
         ai_declared = "[x] 是" in body.lower() or "[x] yes" in body.lower()
@@ -119,13 +122,30 @@ class CodeReviewer:
                 }
             )
 
+        tool_match = re.search(
+            r"(?:Agent平台信息\s*（?Tool）?|Agent\s*(?:platform|tool))\s*[:：]\s*([^\n]+)",
+            body,
+            re.IGNORECASE,
+        )
+        if tool_match and _AGENT_TOOL_RE.fullmatch(tool_match.group(1).strip()) is None:
+            checks.append(
+                {
+                    "id": "ai_tool_version_invalid",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": "Agent platform must contain the tool name and version reported by the coding agent.",
+                }
+            )
+
         model_match = re.search(
             r"(?:模型信息\s*(?:\(Model\))?|\bModel\b)\s*[:：]\s*([^\n]+)",
             body,
             re.IGNORECASE,
         )
-        pr_model = model_match.group(1).strip() if model_match else ""
-        if "/" in pr_model or any("/" in model for model in commit_models):
+        pr_model_text = model_match.group(1).strip() if model_match else ""
+        pr_models = {model.strip() for model in re.split(r"[,，]", pr_model_text) if model.strip()}
+        if any("/" in model for model in pr_models | commit_models):
             checks.append(
                 {
                     "id": "ai_model_provider_prefix",
@@ -148,7 +168,8 @@ class CodeReviewer:
                     ),
                 }
             )
-        elif not pr_model or commit_models != {pr_model}:
+        elif not pr_models or not commit_models.issubset(pr_models):
+            missing_models = commit_models - pr_models
             checks.append(
                 {
                     "id": "ai_model_metadata_mismatch",
@@ -156,16 +177,19 @@ class CodeReviewer:
                     "blocking_until_reviewed": True,
                     "file": "PR description and commit messages",
                     "message": (
-                        f"PR model disclosure ({pr_model or 'missing'}) must exactly match all Co-Authored-By values "
-                        f"({', '.join(sorted(commit_models))})."
+                        f"PR model disclosure ({pr_model_text or 'missing'}) must include every AI model used by "
+                        f"commits; missing: {', '.join(sorted(missing_models))}."
                     ),
                 }
             )
         return checks
 
     @staticmethod
-    def _build_verification_commit_checks(pr: dict, files: list[dict]) -> list[dict]:
-        """Bind required dual Docker verification evidence to the current PR head."""
+    def _build_verification_tree_checks(pr: dict, files: list[dict], head_tree: str | None) -> list[dict]:
+        """Bind required dual Docker verification evidence to the current PR tree."""
+        if is_wip_title(pr.get("title") or ""):
+            return []
+
         gate_triggered = False
         for file_info in files:
             filename = file_info.get("filename") or file_info.get("new_path") or ""
@@ -178,33 +202,33 @@ class CodeReviewer:
         if not gate_triggered:
             return []
 
-        verified_commit = extract_verified_commit(pr.get("body") or "")
-        head_sha = (pr.get("head", {}).get("sha") or "").lower()
-        if verified_commit is None:
+        verified_tree = extract_verified_tree(pr.get("body") or "")
+        if verified_tree is None or head_tree is None:
             return [
                 {
-                    "id": "docker_verification_commit_missing",
+                    "id": "docker_verification_tree_missing",
                     "severity": "error",
                     "blocking_until_reviewed": True,
                     "file": "PR description",
                     "message": (
                         "This PR requires dual Docker verification, but its description does not contain exactly one "
-                        "'**Verified commit:** `<40-character SHA>`' field. Record the commit tested by both platforms."
+                        "'**Verified tree:** `<40-character SHA>`' field, or the PR head tree is unavailable. "
+                        "Record the tree tested by both platforms."
                     ),
                 }
             ]
-        if verified_commit != head_sha:
+        if verified_tree != head_tree:
             return [
                 {
-                    "id": "docker_verification_commit_mismatch",
+                    "id": "docker_verification_tree_mismatch",
                     "severity": "error",
                     "blocking_until_reviewed": True,
                     "file": "PR description",
-                    "verified_commit": verified_commit,
-                    "head_sha": head_sha,
+                    "verified_tree": verified_tree,
+                    "head_tree": head_tree,
                     "message": (
-                        f"Docker verification covers {verified_commit}, but the latest PR commit is {head_sha}. "
-                        "Re-run both Docker verifications on the latest commit and update the PR description."
+                        f"Docker verification covers tree {verified_tree}, but the latest PR tree is {head_tree}. "
+                        "Re-run both Docker verifications on the latest source tree and update the PR description."
                     ),
                 }
             ]
@@ -220,7 +244,19 @@ class CodeReviewer:
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
         mandatory_review_checks = self._build_mandatory_review_checks(files)
-        mandatory_review_checks.extend(self._build_verification_commit_checks(pr, files))
+        head_tree = None
+        if not is_wip_title(pr.get("title") or ""):
+            for file_info in files:
+                filename = file_info.get("filename") or file_info.get("new_path") or ""
+                patch = file_info.get("patch") or ""
+                if isinstance(patch, dict):
+                    patch = patch.get("diff") or ""
+                if not file_triggers_dual_docker_gate(filename, patch):
+                    continue
+                with suppress(ValueError):
+                    head_tree = resolve_pr_head_tree(pr)
+                break
+        mandatory_review_checks.extend(self._build_verification_tree_checks(pr, files, head_tree))
         mandatory_review_checks.extend(self._build_ai_metadata_checks(pr, commits))
 
         changed_files = []
@@ -255,6 +291,8 @@ class CodeReviewer:
                 "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
+                "head_tree": head_tree,
+                "wip": is_wip_title(pr.get("title") or ""),
                 "mandatory_review_checks": mandatory_review_checks,
                 "stats": {
                     "files_changed": len(changed_files),

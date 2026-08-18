@@ -65,8 +65,9 @@ fi
 TOTAL_START=$(date +%s)
 ```
 
-The source mode is selected in Phase 3. Use the default local workspace copy
-unless the user explicitly asks for a clean remote branch or commit.
+The source mode is selected in Phase 3. Author-side PR verification must use an
+isolated committed snapshot. Use the current workspace copy only for local
+diagnosis of uncommitted changes.
 
 The CUDA toolkit is mounted read-only into the container at the same path
 (`/usr/local/cuda-<version>`) so `install_graspgen_pip.sh`'s
@@ -233,11 +234,62 @@ cache credentials through in detached mode.
 Choose exactly one source mode. Record the selected mode and source details in
 the verification result and in the PR description's Verification section.
 
-### Default: Copy the Current Host Workspace
+### PR Evidence: Copy an Isolated Committed Snapshot
 
-Use this mode unless the user explicitly requests a remote clone. It preserves
-committed, uncommitted, and untracked changes from the current IB-Robot
-workspace.
+Use this mode whenever the result will be placed in a PR description. It does
+not inspect or copy the user's working tree, so unrelated tracked or untracked
+changes do not block verification or leak into the evidence.
+
+Resolve `VERIFICATION_REF` to the exact commit intended for the PR. Create a
+standalone clone rather than a linked worktree: the standalone `.git` directory
+and initialized submodule remain usable after `docker cp`.
+
+```bash
+set -e
+command -v git-lfs >/dev/null
+
+VERIFICATION_REF="<pushed-branch-or-commit>"
+VERIFICATION_REPO="<pushed-repository-url>"
+VERIFIED_COMMIT=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFICATION_REF}^{commit}")
+VERIFIED_TREE=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFIED_COMMIT}^{tree}")
+SNAPSHOT_ROOT=""
+cleanup_snapshot() {
+  if [ -n "${SNAPSHOT_ROOT}" ] && [ -d "${SNAPSHOT_ROOT}" ]; then
+    rm -rf -- "${SNAPSHOT_ROOT}"
+  fi
+}
+trap cleanup_snapshot EXIT INT TERM
+SNAPSHOT_ROOT=$(mktemp -d "/tmp/ibrobot-verify-${VERIFIED_TREE:0:12}.XXXXXX")
+
+git clone --no-hardlinks --no-checkout "${PROJECT_ROOT}" "${SNAPSHOT_ROOT}"
+git -C "${SNAPSHOT_ROOT}" remote set-url origin "${VERIFICATION_REPO}"
+git -C "${SNAPSHOT_ROOT}" checkout --detach "${VERIFIED_COMMIT}"
+git -C "${SNAPSHOT_ROOT}" submodule update --init --recursive
+git -C "${SNAPSHOT_ROOT}" lfs pull origin
+git -C "${SNAPSHOT_ROOT}" lfs fsck
+test "$(git -C "${SNAPSHOT_ROOT}" rev-parse HEAD^{tree})" = "${VERIFIED_TREE}"
+test -z "$(git -C "${SNAPSHOT_ROOT}" status --porcelain --untracked-files=all)"
+
+SOURCE_MODE="isolated committed snapshot"
+SOURCE_DETAILS="commit ${VERIFIED_COMMIT}, tree ${VERIFIED_TREE}"
+
+docker cp "${SNAPSHOT_ROOT}" "${CONTAINER}":/home/testuser/IB_Robot
+docker exec "${CONTAINER}" \
+  chown -R "${HOST_UID}:${HOST_GID}" /home/testuser/IB_Robot
+docker exec "${CONTAINER}" bash -c '
+  rm -rf /home/testuser/IB_Robot/{venv,build,install,log}
+'
+```
+
+Keep `SNAPSHOT_ROOT` until both platforms have copied or independently
+materialized the same commit. Remove it during final cleanup. Report both
+`VERIFIED_COMMIT` for provenance and `VERIFIED_TREE` as the binding identity.
+
+### Local Diagnosis: Copy the Current Host Workspace
+
+Use this mode to test local, uncommitted work. It preserves committed,
+uncommitted, and untracked changes from the current IB-Robot workspace. The
+result is not valid PR evidence because it has no immutable tree identity.
 
 ```bash
 SOURCE_MODE="local workspace copy"
@@ -265,11 +317,11 @@ If the host workspace contains large unrelated untracked files, report that
 fact before copying. Do not silently switch to a remote clone because doing so
 would omit the uncommitted changes the user may intend to verify.
 
-### Optional: Clone a Clean Remote Branch
+### Explicit Request: Clone a Clean Remote Commit or Branch
 
 Use this mode only when the user explicitly asks to validate a pushed commit,
-fork branch, or clean upstream state. Replace the placeholders with the exact
-requested remote and branch; do not default them silently.
+fork branch, or clean upstream state. Resolve and report the exact commit and
+tree after cloning; branch names alone are not stable verification identities.
 
 ```bash
 SOURCE_MODE="remote clean clone"
@@ -359,13 +411,13 @@ Build complete. Source with: source install/setup.sh
 ## Phase 6 — Inspect, Report Timing, and Clean Up
 
 ```bash
-# Collect source, status, timing, commit, and all ERROR lines with context.
+# Collect source, status, timing, commit/tree provenance, and all ERROR lines with context.
 printf 'source_mode=%s\n' "${SOURCE_MODE}"
 printf 'source_details=%s\n' "${SOURCE_DETAILS}"
 docker exec "${CONTAINER}" bash -c '
   cat /tmp/setup.status /tmp/setup.time
   cat /tmp/build.status /tmp/build.time
-  git -C /home/testuser/IB_Robot rev-parse HEAD
+  git -C /home/testuser/IB_Robot rev-parse HEAD HEAD^{tree}
   grep -n -E "ERROR|Error|error" /tmp/setup.log || true
   grep -n -E "ERROR|Error|error|Failed|failed" /tmp/build.log || true
 '
@@ -378,6 +430,10 @@ printf 'total=%ss\n' "${TOTAL_SECONDS}"
 
 # Clean up
 docker stop "${CONTAINER}" && docker rm "${CONTAINER}"
+if [ "${SOURCE_MODE}" = "isolated committed snapshot" ]; then
+  rm -rf -- "${SNAPSHOT_ROOT}"
+  SNAPSHOT_ROOT=""
+fi
 ```
 
 > **错误报告要求**：必须逐条列出所有 ERROR 行，并按 Verification Discipline 中的分类标准标注 Fatal / Non-fatal。不能只给 ERROR 行数不给内容。
@@ -390,9 +446,13 @@ Report both totals when relevant:
 Also record the pip cache size before and after the run. A warm cache result
 must not be presented as a cold-cache baseline.
 
-The final report and any PR Verification section must explicitly state one of:
+The final report must explicitly state one source mode:
 
+- `Source: isolated committed snapshot`, with the exact commit and tree. This
+  is the normal PR-evidence mode; the PR's canonical identity is
+  `**Verified tree:** \`<tree SHA>\``.
 - `Source: local workspace copy`, with the host commit and whether the copied
-  workspace contained uncommitted or untracked changes.
+  workspace contained uncommitted or untracked changes. Mark it local-only and
+  do not put it in a PR as tree-bound evidence.
 - `Source: remote clean clone`, with the exact repository URL, branch, and
-  tested commit.
+  tested commit and tree.

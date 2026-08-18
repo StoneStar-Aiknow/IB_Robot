@@ -186,11 +186,53 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 
 ## Phase 4 — Prepare Workspace
 
-提供两种方式，根据场景选择：
+根据验证目的选择来源。PR 证据必须使用独立 commit 快照；当前工作区 copy 只用于本地调试。
 
-### 方式 A：从宿主机 docker cp（适合本地代码验证）
+### PR 证据：从独立 commit 快照 docker cp
 
-> 用于验证本地未提交的改动。`docker cp` 拷入当前项目目录，可直接验证修改效果。
+> 当前工作区无需 clean。先在宿主机 worktree 外创建 standalone clone，只检出目标 commit，
+> 初始化 submodule 并核对 tree SHA，再把快照复制进 rootfs。
+
+```bash
+set -e
+command -v git-lfs >/dev/null
+
+PROJECT_ROOT=<project_root>
+VERIFICATION_REF=<pushed-branch-or-commit>
+VERIFICATION_REPO=<pushed-repository-url>
+VERIFIED_COMMIT=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFICATION_REF}^{commit}")
+VERIFIED_TREE=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFIED_COMMIT}^{tree}")
+SNAPSHOT_ROOT=""
+cleanup_snapshot() {
+  if [ -n "${SNAPSHOT_ROOT}" ] && [ -d "${SNAPSHOT_ROOT}" ]; then
+    rm -rf -- "${SNAPSHOT_ROOT}"
+  fi
+}
+trap cleanup_snapshot EXIT INT TERM
+SNAPSHOT_ROOT=$(mktemp -d "/tmp/ibrobot-verify-${VERIFIED_TREE:0:12}.XXXXXX")
+SOURCE_MODE="isolated committed snapshot"
+
+git clone --no-hardlinks --no-checkout "${PROJECT_ROOT}" "${SNAPSHOT_ROOT}"
+git -C "${SNAPSHOT_ROOT}" remote set-url origin "${VERIFICATION_REPO}"
+git -C "${SNAPSHOT_ROOT}" checkout --detach "${VERIFIED_COMMIT}"
+git -C "${SNAPSHOT_ROOT}" submodule update --init --recursive
+git -C "${SNAPSHOT_ROOT}" lfs pull origin
+git -C "${SNAPSHOT_ROOT}" lfs fsck
+test "$(git -C "${SNAPSHOT_ROOT}" rev-parse HEAD^{tree})" = "${VERIFIED_TREE}"
+test -z "$(git -C "${SNAPSHOT_ROOT}" status --porcelain --untracked-files=all)"
+
+docker cp "${SNAPSHOT_ROOT}" verify-oee:/root/openeuler_rootfs/root/IB_Robot
+docker exec verify-oee bash -c \
+  'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
+```
+
+结果同时记录 provenance 用的 `VERIFIED_COMMIT` 和门禁使用的 `VERIFIED_TREE`。保留快照直到
+两个平台都已复制，或让两个平台分别按同一 commit 生成并核对相同 tree 的快照。
+
+### 本地调试：从当前宿主机工作区 docker cp
+
+> 用于验证本地未提交的改动。`docker cp` 拷入当前项目目录，可直接验证修改效果，但该结果
+> 不具备不可变 tree 身份，不能作为 PR Verification。
 
 ```bash
 # 4.1 Copy current workspace into rootfs
@@ -201,10 +243,10 @@ docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 ```
 
-### 方式 B：在容器内 git clone（适合验证远程分支）
+### 显式请求：在容器内 git clone 远程 commit 或 branch
 
-> 用于验证已推送到个人仓库分支的代码。注意 rootfs 中 `which` 不可靠，
-> git 命令请用绝对路径 `/usr/bin/git`。
+> 仅在用户明确指定远端来源时使用。clone 后必须记录实际 HEAD commit 及其 tree，不能只记录
+> 可移动的 branch 名。注意 rootfs 中 `which` 不可靠，git 命令请用绝对路径 `/usr/bin/git`。
 
 ```bash
 # 4.1 Clone the branch inside chroot
@@ -264,12 +306,22 @@ Build complete. Source with: source install/setup.sh
 ```bash
 # Collect all ERROR lines with context
 docker exec verify-oee bash -c \
+  'chroot /root/openeuler_rootfs /bin/bash -c "git -C /root/IB_Robot rev-parse HEAD HEAD^{tree}"'
+docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "grep ERROR /tmp/setup.log || echo \"(none)\""'
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "grep ERROR /tmp/build.log || echo \"(none)\""'
 
 # Clean up
 docker stop verify-oee && docker rm verify-oee
+if [ "${SOURCE_MODE:-}" = "isolated committed snapshot" ]; then
+  rm -rf -- "${SNAPSHOT_ROOT}"
+  SNAPSHOT_ROOT=""
+fi
 ```
 
 > **错误报告要求**：必须逐条列出所有 ERROR 行，并按 Verification Discipline 中的分类标准标注 Fatal / Non-fatal。不能只给 ERROR 行数不给内容。
+
+PR 证据的最终报告必须写出 `Source: isolated committed snapshot`、完整 commit 和完整 tree，
+并将 tree 写成唯一标准字段 `**Verified tree:** \`<40位 tree SHA>\``。当前工作区 copy 的结果必须
+标为 local-only，不得伪装成 tree-bound PR 证据。

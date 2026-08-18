@@ -13,9 +13,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from ai_compliance import add_ai_disclosure, validate_commit_ai_model
+from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
-from verification_gate import file_triggers_dual_docker_gate, validate_verified_commit
+from verification_gate import (
+    file_triggers_dual_docker_gate,
+    is_wip_title,
+    resolve_pr_head_tree,
+    resolve_pr_stage,
+    validate_verified_tree,
+)
 
 
 def load_config(config_path: str = "config.json") -> dict:
@@ -47,6 +53,20 @@ def mode_fetch_info(args, api: AtomGitClient):
         commits = api.get_pr_commits(args.pr)
         files = api.get_pr_files(args.pr)
         comments = [] if args.no_comments else api.get_all_pr_comments(args.pr)
+        head_tree = None
+        gate_required = False
+        for file_info in files:
+            patch = file_info.get("patch") or ""
+            if isinstance(patch, dict):
+                patch = patch.get("diff") or ""
+            if file_triggers_dual_docker_gate(
+                file_info.get("filename") or file_info.get("new_path") or "",
+                patch,
+            ):
+                gate_required = True
+                if not is_wip_title(pr.get("title") or ""):
+                    head_tree = resolve_pr_head_tree(pr)
+                break
 
         # 统计信息
         additions = sum(f.get("additions", 0) for f in files)
@@ -61,6 +81,9 @@ def mode_fetch_info(args, api: AtomGitClient):
                 "state": pr.get("state", ""),
                 "branch": f"{pr.get('head', {}).get('ref', '')} -> {pr.get('base', {}).get('ref', '')}",
                 "head_sha": pr.get("head", {}).get("sha", ""),
+                "head_tree": head_tree,
+                "wip": is_wip_title(pr.get("title") or ""),
+                "dual_docker_gate_required": gate_required,
                 "stats": {
                     "files_changed": len(files),
                     "additions": additions,
@@ -135,16 +158,18 @@ def mode_update_pr(args, api: AtomGitClient):
         commits = api.get_pr_commits(args.pr)
         pr = api.get_pull_request(args.pr)
         files = api.get_pr_files(args.pr)
+        title = title or pr.get("title") or ""
         validate_commit_ai_model(commits, args.ai_model)
+        agent_tool = validate_agent_tool(args.agent_tool)
         description = add_ai_disclosure(
             description,
-            agent_tool=args.agent_tool,
+            agent_tool=agent_tool,
             ai_model=args.ai_model,
             prompt_summary=args.prompt_summary,
             third_party_materials=args.third_party_materials,
         )
 
-        gate_triggered = False
+        gate_required = False
         for file_info in files:
             patch = file_info.get("patch") or ""
             if isinstance(patch, dict):
@@ -153,13 +178,13 @@ def mode_update_pr(args, api: AtomGitClient):
                 file_info.get("filename") or file_info.get("new_path") or "",
                 patch,
             ):
-                gate_triggered = True
+                gate_required = True
                 break
+        title, gate_triggered = resolve_pr_stage(title, args.pr_stage, gate_required)
+        if gate_required and not gate_triggered:
+            print("ℹ️  [WIP] PR 跳过双平台 Docker 验证；移除 [WIP] 转为正式检视时门禁会恢复。")
         if gate_triggered:
-            head_sha = pr.get("head", {}).get("sha") or ""
-            if len(head_sha) != 40:
-                raise ValueError("PR latest commit SHA is unavailable; refusing to update commit-bound verification")
-            validate_verified_commit(description, head_sha)
+            validate_verified_tree(description, resolve_pr_head_tree(pr))
 
         if not args.human_reviewed and not args.dry_run:
             raise ValueError("更新 PR 前必须由开发者人工审查，并显式传入 --human-reviewed")
@@ -174,7 +199,7 @@ def mode_update_pr(args, api: AtomGitClient):
         api.update_pull_request(args.pr, title=title, body=description)
         if gate_triggered:
             updated_pr = api.get_pull_request(args.pr)
-            validate_verified_commit(description, updated_pr.get("head", {}).get("sha", ""))
+            validate_verified_tree(description, resolve_pr_head_tree(updated_pr))
 
         print(f"\n✅ PR #{args.pr} 描述已更新")
         print(f"🔗 链接: {api.get_pr_url(args.pr)}")
@@ -219,13 +244,16 @@ def main():
         action="store_true",
         help="在 --fetch-info 模式下跳过抓取 PR 评论",
     )
-    parser.add_argument("--agent-tool", help="Agent 平台名称及版本（更新 PR 时必填）")
-    parser.add_argument(
-        "--ai-model", help="AI 模型名称及版本（不含 provider 前缀，更新 PR 时必填且必须与 commit 一致）"
-    )
+    parser.add_argument("--agent-tool", help="Coding agent 执行 <tool> --version 后传入实际工具名和版本")
+    parser.add_argument("--ai-model", help="PR 使用的 AI 模型名称及版本；多个模型用逗号分隔，不含 provider 前缀")
     parser.add_argument("--prompt-summary", help="核心提示词或核心意图摘要（更新 PR 时必填）")
     parser.add_argument("--third-party-materials", help="第三方材料、来源及许可证（更新 PR 时必填）")
     parser.add_argument("--human-reviewed", action="store_true", help="确认开发者已人工审查 AI 辅助内容")
+    parser.add_argument(
+        "--pr-stage",
+        choices=("wip", "review"),
+        help="PR 阶段；命中双 Docker 门禁时必须在询问用户后指定",
+    )
     parser.add_argument("--dry-run", action="store_true", help="预览但不提交")
 
     args = parser.parse_args()

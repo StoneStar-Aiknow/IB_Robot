@@ -5,7 +5,7 @@ AtomGit Pull Request Creation Tool
 自动创建 PR，从当前分支生成 PR 标题和描述
 
 用法：
-    python3 pr_creation.py --branch <branch> --fork-owner <owner> [--title "标题"] [--dry-run]
+    python3 pr_creation.py --branch <branch> --fork-owner <owner> --description-file <file> [--title "标题"] [--dry-run]
 """
 
 import argparse
@@ -14,9 +14,13 @@ import os
 import subprocess
 import sys
 
-from ai_compliance import add_ai_disclosure, validate_commit_ai_model
+from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
-from verification_gate import file_triggers_dual_docker_gate, validate_verified_commit
+from verification_gate import (
+    file_triggers_dual_docker_gate,
+    resolve_pr_stage,
+    validate_verified_tree,
+)
 
 
 def run_git(args: list[str], cwd: str = None) -> str:
@@ -94,7 +98,7 @@ def get_changed_files(branch: str, base_branch: str = "master") -> list[str]:
 
 
 def dual_docker_gate_triggered(branch: str, base_branch: str, files: list[str]) -> bool:
-    """Return whether the PR diff requires commit-bound dual Docker verification."""
+    """Return whether the PR diff requires tree-bound dual Docker verification."""
     base_ref = get_best_base_ref(base_branch)
     for filename in files:
         patch = ""
@@ -113,6 +117,10 @@ def get_remote_branch_head(branch: str) -> str:
     if not output:
         raise ValueError(f"origin/{branch} does not exist; push the verified commit before creating the PR")
     return output.split()[0].lower()
+
+
+def get_local_tree(ref: str) -> str:
+    return run_git(["rev-parse", f"{ref}^{{tree}}"])
 
 
 def get_diff_stats(branch: str, base_branch: str = "master") -> dict:
@@ -156,8 +164,7 @@ def main():
     parser.add_argument("--branch", type=str, help="源分支名")
     parser.add_argument("--base", type=str, default="master", help="目标分支名")
     parser.add_argument("--title", type=str, help="PR 标题")
-    parser.add_argument("--body", type=str, help="PR 描述文本")
-    parser.add_argument("--description-file", type=str, help="从文件读取 PR 描述 (Markdown 格式)")
+    parser.add_argument("--description-file", type=str, required=True, help="从文件读取 PR 描述 (Markdown 格式)")
     parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
     parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
     parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
@@ -173,10 +180,23 @@ def main():
         help="Fork 仓库的 owner（必需，通过 git remote -v 获取）",
     )
     parser.add_argument("--draft", action="store_true", help="创建为草稿 PR")
+    parser.add_argument(
+        "--pr-stage",
+        choices=("wip", "review"),
+        help="PR 阶段；命中双 Docker 门禁时必须在询问用户后指定",
+    )
     parser.add_argument("--dry-run", action="store_true", help="仅显示计划，不实际创建")
     parser.add_argument("-y", "--yes", action="store_true", help="自动确认创建 PR")
-    parser.add_argument("--agent-tool", required=True, help="Agent 平台名称及版本")
-    parser.add_argument("--ai-model", required=True, help="AI 模型名称及版本，不含 provider 前缀，必须与 commit 一致")
+    parser.add_argument(
+        "--agent-tool",
+        required=True,
+        help="Coding agent 执行 <tool> --version 后传入实际工具名和版本",
+    )
+    parser.add_argument(
+        "--ai-model",
+        required=True,
+        help="PR 使用的 AI 模型名称及版本；多个模型用逗号分隔，不含 provider 前缀",
+    )
     parser.add_argument("--prompt-summary", required=True, help="核心提示词或核心意图摘要")
     parser.add_argument("--third-party-materials", required=True, help="第三方材料、来源及许可证；没有时明确写无")
     parser.add_argument("--human-reviewed", action="store_true", help="确认开发者已人工审查 AI 辅助内容")
@@ -238,27 +258,19 @@ def main():
 
     print(">>> 生成 PR 描述...")
 
-    # 描述优先级: --description-file > --body
-    if args.description_file:
-        try:
-            with open(args.description_file, encoding="utf-8") as f:
-                description = f.read()
-            print(f"✓ 从文件读取描述: {args.description_file}")
-        except Exception as e:
-            print(f"❌ 读取描述文件失败: {e}")
-            sys.exit(1)
-    elif args.body:
-        description = args.body
-    else:
-        print("❌ 错误: 必须提供 PR 描述。")
-        print("   建议先让 AI 分析变更并生成专业描述文件，然后使用 --description-file 参数。")
-        print("   或者使用 --body 参数直接传入描述内容。")
+    try:
+        with open(args.description_file, encoding="utf-8") as f:
+            description = f.read()
+        print(f"✓ 从文件读取 Markdown 描述: {args.description_file}")
+    except Exception as e:
+        print(f"❌ 读取描述文件失败: {e}")
         sys.exit(1)
 
     try:
+        agent_tool = validate_agent_tool(args.agent_tool)
         description = add_ai_disclosure(
             description,
-            agent_tool=args.agent_tool,
+            agent_tool=agent_tool,
             ai_model=args.ai_model,
             prompt_summary=args.prompt_summary,
             third_party_materials=args.third_party_materials,
@@ -267,7 +279,18 @@ def main():
         print(f"❌ AI 披露信息无效: {e}")
         sys.exit(1)
 
-    if dual_docker_gate_triggered(branch, args.base, files):
+    title = args.title or commits[0]["subject"]
+    gate_required = dual_docker_gate_triggered(branch, args.base, files)
+    try:
+        title, gate_triggered = resolve_pr_stage(title, args.pr_stage, gate_required)
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    if gate_required and not gate_triggered:
+        print("ℹ️  [WIP] PR 跳过双平台 Docker 验证；移除 [WIP] 转为正式检视时门禁会恢复。")
+    remote_head = None
+    verified_tree = None
+    if gate_triggered:
         try:
             local_head = run_git(["rev-parse", branch]).lower()
             remote_head = get_remote_branch_head(branch)
@@ -275,12 +298,12 @@ def main():
                 raise ValueError(
                     f"local branch head {local_head} does not match origin/{branch} {remote_head}; push the latest commit first"
                 )
-            validate_verified_commit(description, remote_head)
+            verified_tree = get_local_tree(branch)
+            validate_verified_tree(description, verified_tree)
         except ValueError as e:
-            print(f"❌ 双 Docker 验证提交校验失败: {e}")
+            print(f"❌ 双 Docker 验证 tree 校验失败: {e}")
             sys.exit(1)
 
-    title = args.title or commits[0]["subject"]
     print(f"✓ 标题: {title}")
 
     print()
@@ -322,9 +345,12 @@ def main():
                 draft=args.draft,
             )
             pr_number = pr.get("number")
-            if dual_docker_gate_triggered(branch, args.base, files):
+            if gate_triggered:
                 created_pr = api.get_pull_request(pr_number)
-                validate_verified_commit(description, created_pr.get("head", {}).get("sha", ""))
+                created_head = (created_pr.get("head", {}).get("sha") or "").lower()
+                if created_head != remote_head:
+                    raise ValueError(f"PR head changed during creation: expected {remote_head}, got {created_head}")
+                validate_verified_tree(description, verified_tree)
             pr_url = api.get_pr_url(pr_number)
 
             print()

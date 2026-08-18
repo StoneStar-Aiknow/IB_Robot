@@ -20,7 +20,7 @@
 
 **当前实现的工作流**:
 
-1. 先确认 PR 的 Model 披露只含模型名称及版本、不含 provider 前缀，与本次 `--ai-model` 一致，并确认每个 `fixup_target` 已包含相同的 `Co-Authored-By`。若缺失，先使用 `ibrobot-git-flow` 规范化 commit message 和 PR 描述。
+1. 先确认 PR 的 Model 披露只含模型名称及版本、不含 provider 前缀，并包含本次 `--ai-model`。不同 `fixup_target` 可记录不同模型；若当前修复会折入尚未记录本模型的目标 commit，应补充该模型的 `Co-Authored-By` 并同步 PR 模型列表。
 2. 从 PR API 读取不可变 `base.sha`、开始处理时的 `head.sha`、source branch/repository；本地 `HEAD` 必须等于 `head.sha`，且 base 必须是 HEAD 的祖先。
 3. 任何本地改写前验证所有 `comment_id` 属于目标 PR，并拒绝 `base.sha..HEAD` 中的 merge commit。
 4. 按 fixes 中逐项 `fixup_target` 解析后的 SHA 分组；每组使用 `GIT_LITERAL_PATHSPECS=1 git add -- <paths>`、`git commit --fixup=<sha>`，不会把 pathspec magic 展开到其他路径。

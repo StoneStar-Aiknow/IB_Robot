@@ -78,7 +78,7 @@ python3 review_resolution.py --resume ./tmp/ib_robot_pr_123_review_resolution_<t
 
 **当前实现的元数据绑定工作流**:
 
-1. 在写文件前检查 PR 的 openEuler AI 披露和目标 commit：模型只记录名称及版本，不携带 provider 前缀；PR 模型必须与本次真实 `--ai-model` 一致，每个将接收 AI 修复的目标 commit 必须已有相同的 `Co-Authored-By` trailer。缺失时先调用 `ibrobot-git-flow` 规范化 commit message 和 PR 元数据；不得让 autosquash 把 AI 修改折入一个未披露 AI 参与的 commit。
+1. 在写文件前检查 PR 的 openEuler AI 披露和目标 commit：模型只记录名称及版本，不携带 provider 前缀；PR 模型列表必须包含本次真实 `--ai-model`。不同 commit 可以保留各自实际使用的模型；若当前 AI 修复将 autosquash 到尚未记录本模型的目标 commit，应在历史整理时为该 commit 补充本模型 trailer 并同步 PR 模型列表，而不是因原有模型不同而阻止处理。
 2. 在写文件前读取 PR `base.sha`、`head.sha`、`head.ref`、`head.repo`；要求本地 `HEAD == head.sha`，且 `base.sha` 是 HEAD 的祖先。
 3. 通过 SDK 的 PR 作用域全量评论接口验证每个 `comment_id` 确实属于目标 PR，并保留 `discussion_id` 等元数据；校验发生在任何本地历史重写前。
 4. 先校验全部 fixes；只有存在 code fix 时才要求 index 和 tracked worktree 均干净。纯 `reply_only` 批次不依赖本地 Git 状态。

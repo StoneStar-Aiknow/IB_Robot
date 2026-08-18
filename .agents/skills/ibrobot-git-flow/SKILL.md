@@ -50,7 +50,8 @@ Must strictly follow this structure with exactly one blank line between sections
   - `Signed-off-by` must be the last line.
   - Allowed tags: `Fixes`, `Closes`, `Co-developed-by`, `Co-Authored-By`, `Link`.
   - For AI-assisted contributions, add `Co-Authored-By: <AI model name and version>` immediately before
-    `Signed-off-by`. The model value must exactly match the PR's `模型信息 (Model)` disclosure.
+    `Signed-off-by`. The PR's `模型信息 (Model)` disclosure must include that model. Different commits in one PR
+    may record different models, and human co-authors use `Co-Authored-By: Name <email>`.
   - Record only the model name and version (for example, `gpt-5.6-sol`). Strip runtime provider prefixes such as
     `xunxing/`; provider routing is not contribution metadata.
   - Tags must start with capital letter, one space after colon.
@@ -65,8 +66,13 @@ Must strictly follow this structure with exactly one blank line between sections
   Co-Authored-By: <AI model name and version>
   Signed-off-by: Name <email>
   ```
-- **Keep PR metadata consistent**: Before push or PR creation, verify every AI-assisted commit's
-  `Co-Authored-By` value exactly matches the model disclosed in the PR. A mismatch is a blocking error.
+- **Keep PR metadata complete**: Before push or PR creation, collect the AI model from every AI-assisted commit and
+  ensure the PR disclosure lists the complete model set. Different commits may use different models; a model present
+  in a commit but absent from the PR disclosure is a blocking error. Purely human commits need no AI trailer.
+- **Verify Agent tool provenance**: Before invoking the PR workflow, the coding agent must run the actual tool's
+  `--version` (or equivalent) command and pass the observed tool name/version as `--agent-tool`. The repository
+  must not maintain an exhaustive tool allowlist or execute arbitrary unknown tools; the workflow only validates
+  that the supplied provenance is concrete, versioned, and safe to include in Markdown.
 - **Human responsibility and provenance**: Before submission, require the human contributor to confirm review of the
   AI-assisted changes and disclose third-party materials and licenses. Refuse unreviewed, unexplained, sensitive,
   confidential, or license-incompatible content. Follow the openEuler policy at
@@ -128,7 +134,7 @@ These add noise to git history, bloat the PR, and make the change set harder to 
 
 - If the staged changes modify a ROS package `package.xml` dependency declaration (`depend`, `exec_depend`, `build_depend`, `test_depend`, etc.), or global setup/build workflow files such as `scripts/setup.sh`, `scripts/build.sh`, `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`, `scripts/install_ros.sh`, top-level `CMakeLists.txt`, top-level `pyproject.toml`, or `requirements/*.txt` (pip dependency files that affect setup/install), the eventual PR description must include real Ubuntu 22.04 and openEuler Embedded Docker `setup.sh + build.sh` verification results.
 - ROS package-local `setup.py` changes do **not** by themselves trigger this dual-platform setup/build gate. Examples that do not trigger it alone: console entry points, Python package metadata, or Python-only `install_requires` edits.
-- When the gate is triggered during commit preparation, explicitly remind the user before committing/pushing that dual-platform verification is required for the PR. After the final commit is pushed, require a clean worktree, record the full `git rev-parse HEAD`, and make `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` test that same commit. The PR description must contain exactly one `**Verified commit:** \`<40-character SHA>\`` field. PR creation/update must compare it with the remote branch or PR `head.sha`; any later push invalidates both results. This is an author-side PR submission rule and does not apply to reviewer-side `atomgit-pr-review` flows.
+- When the gate is triggered, ask the user before Docker execution whether the PR is temporary WIP or ready for reviewer inspection. Pass the explicit answer as `--pr-stage wip|review` to the PR workflow. WIP normalizes the title to `[WIP] <title>` and defers both Docker runs; it does not waive DCO, AI disclosure, other tests, or CI. Review stage removes `[WIP]`, records `git rev-parse HEAD^{tree}`, and makes both Docker skills test an isolated snapshot. The PR description then contains exactly one `**Verified tree:** \`<40-character SHA>\`` field. A source-tree change invalidates both results, while metadata-only rewrites do not.
 
 ## Execution Steps
 
@@ -144,7 +150,7 @@ If user explicitly requests **local commit only** (e.g., "commit to local", "onl
 2. **Validate**: Check title length, format, blank lines, Chinese characters, DCO sign-off, and AI metadata when AI
    participated. Confirm the real model name and version; do not infer or abbreviate it.
 3. **Confirm staging scope**: Show the user which files will be committed, explicitly noting any excluded files (especially `libs/lerobot`).
-4. **Check verification gate**: Inspect the staged file list for ROS package `package.xml` dependency changes or global setup/build workflow changes. If triggered, remind the user that Ubuntu + openEuler dual-platform Docker verification will run before creating or updating the PR description.
+4. **Check verification gate**: Inspect the staged file list for ROS package `package.xml` dependency changes or global setup/build workflow changes. If triggered, ask whether this is a `[WIP]` PR or ready for reviewer inspection before invoking Docker.
 
 ### Phase 3: Execute Commit and Push
 
@@ -174,8 +180,8 @@ For root repository:
    - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
      1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
      2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
-      3. If the PR context triggers the verification gate, record the clean latest HEAD, run `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` against that same commit, then include the real results and canonical `Verified commit` field. Any new push requires both runs again.
-     4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json`.
+     3. If the PR context triggers the verification gate, ask for WIP/review stage. For WIP, keep `[WIP]` and skip Docker. For review, run both Docker skills against the latest remote head tree and include the canonical `Verified tree` field.
+     4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json --pr-stage <wip|review>`.
    - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
 
 For submodule `libs/lerobot` (only when user explicitly asks):
