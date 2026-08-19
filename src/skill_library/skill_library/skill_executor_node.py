@@ -3353,7 +3353,6 @@ class SkillExecutorNode(Node):
         pick_goal.mode = PickObject.Goal.MODE_EXECUTE
         pick_goal.supervised_direct = False
         pick_goal.release_after_success = False
-        pick_goal.release_drop_height_m = -1.0
         delegated_admission = self._active_skill_admission
         delegated_nonce = pick_goal.dispatch_binding.dispatch_nonce
         cleanup_key = self._register_delegated_dispatch(

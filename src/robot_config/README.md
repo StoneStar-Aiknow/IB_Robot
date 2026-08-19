@@ -308,7 +308,7 @@ pass = gap_deficit <= measurement_tolerance_m
 当前两个 SO101 RealSense 抓取 profile 都将该开关设为 `false`，因此下降后直接闭爪。
 
 `candidate_target_offset_base_m` 是候选目标在 `base_frame` 中的三轴平移补偿。它统一作用于 grasp、approach、
-lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
+grasp 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
 验证过的 `[0.0, 0.0, -0.008]`；该值属于机器人/手眼执行几何，因此由 robot YAML 管理，action 客户端不提供
 覆盖参数。
 
@@ -341,7 +341,7 @@ ik_orientation_guard:
 
 HOME joint5 由同一 robot YAML 的 `ros2_control.reset_positions["5"]` 提供。初始候选只检查
 `abs(candidate_joint5 - home_joint5) <= joint5_home_max_delta_rad + joint5_limit_epsilon_rad`，不把观察位
-joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、grasp 和 lift 才使用阶段连续性门阻止真正的
+joint5 当作抓取安全原点；候选选定以后，approach、pregrasp 和 grasp 才使用阶段连续性门阻止真正的
 半圈翻腕。Hermes 与监督式客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal。
 
 MoveIt LMA 仍使用 `position_only_ik: true`。当前 SO101 profile 不启用
@@ -961,7 +961,6 @@ robot:
         observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-        lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
 
 #### Capability Gateway 接线契约

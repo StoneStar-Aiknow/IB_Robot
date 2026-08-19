@@ -24,7 +24,6 @@ def _config():
         "source_contact_point": [0.0, 0.0, 0.195],
         "adapter": {"source_to_ee_rpy": [math.pi, 0.0, 0.0]},
         "approach_distance_m": 0.08,
-        "lift_distance_m": 0.165,
         "target_gripper": {
             "fixed_finger_contact_ee": [-0.014, 0.0, -0.080],
             "closing_axis_ee": [1.0, 0.0, 0.0],
@@ -82,7 +81,6 @@ def test_candidate_plan_preserves_contact_alignment():
     candidate[:3, 3] = [0.2, -0.1, 0.3]
     plan = build_candidate_plan(candidate.reshape(-1), np.eye(4), 0.035, 0.9, _config())
     assert np.allclose(plan.target_contact_base, (0.2, -0.1, 0.495), atol=1e-8)
-    assert math.isclose(plan.lift[2] - plan.grasp[2], 0.165)
     assert math.isclose(sum(value * value for value in plan.quaternion), 1.0, rel_tol=1e-8)
 
 

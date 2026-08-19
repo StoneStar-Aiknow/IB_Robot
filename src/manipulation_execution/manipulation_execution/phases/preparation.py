@@ -520,12 +520,9 @@ class PreparationPhase:
                     f"< min_contact_z {selection_min_contact_z:.4f}",
                     retryable=True,
                 )
-            correction_x = result.correction_x
-            correction_y = result.correction_y
             plan = replace(
                 plan,
                 grasp=result.command_xyz,
-                lift=(plan.lift[0] + correction_x, plan.lift[1] + correction_y, plan.lift[2]),
             )
             payload = result.prediction.payload
             contact_residual_xy = math.hypot(float(result.residual_x), float(result.residual_y))
@@ -581,7 +578,7 @@ class PreparationPhase:
 
         check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
         position_only_quaternion = (0.0, 0.0, 0.0, 1.0)
-        for label, xyz in (("approach", plan.approach), ("lift", plan.lift)):
+        for label, xyz in (("approach", plan.approach),):
             allowed, reason = xyz_within_workspace(xyz, self._workspace)
             if not allowed:
                 raise PickFlowError("WORKSPACE_REJECTED", f"candidate {ranked.index} {label}: {reason}", retryable=True)

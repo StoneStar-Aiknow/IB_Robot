@@ -775,6 +775,20 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     pick_executor_params = _normalize_launch_param_mapping(pick_executor._Node__parameters[0])
     home_joint_positions = _decode_launch_json_string(str(pick_executor_params["home_joint_positions_json"]))
     assert home_joint_positions["5"] == 0.0
+    grasp_execution_json = _decode_launch_json_string(str(pick_executor_params["grasp_execution_json"]))
+    assert grasp_execution_json["post_grasp_motion"] == {
+        "pose_name": "place_container",
+        "joint_names": ["1", "2", "3", "4", "5"],
+        "joint_positions": {
+            "1": -0.047553,
+            "2": -0.073631,
+            "3": -0.840621,
+            "4": 1.497165,
+            "5": -1.570790,
+        },
+        "duration_sec": 5.0,
+        "velocity_scaling": 0.08,
+    }
     place_executor = next(node for node in nodes if vars(node).get("_Node__node_name") == "placement_executor_node")
     place_params = _normalize_launch_param_mapping(place_executor._Node__parameters[0])
     placement_json = _decode_launch_json_string(str(place_params["placement_execution_json"]))

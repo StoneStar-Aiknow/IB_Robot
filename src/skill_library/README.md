@@ -127,7 +127,7 @@ SO101 当前配置示例：
 
 `pick_object` 不展开静态 `named_targets` 位姿，而是委托给
 `/manipulation/execute_pick`。GraspGen 在运行时生成动态 6-DOF 候选，执行器再通过安全 primitive
-完成 approach、补偿下降、夹爪闭合和 lift。
+完成 approach、补偿下降、夹爪闭合和到 place container 位姿的运输。
 
 `place_in_container` 同样只允许从 `/embodied/execute_skill` 进入。Gateway
 将完整 `DispatchBinding` 和 `placement_pipeline` identity 传给

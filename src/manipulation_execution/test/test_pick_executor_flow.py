@@ -14,6 +14,7 @@ from embodied_common.dispatch_binding import delegated_executor_identity, new_bi
 from ibrobot_msgs.action import PickObject
 from ibrobot_msgs.msg import GraspCandidate
 from manipulation_execution.grasp_geometry import CandidatePlan, FixedFingerEnvelope
+from manipulation_execution.phases.execution import ExecutionPhase
 from manipulation_execution.phases.flow import _is_execution_retryable
 from manipulation_execution.pick_executor_helpers import PickExecutorHelpers
 from manipulation_execution.pick_executor_models import FlowState, PreparedCandidate, RankedCandidate
@@ -35,7 +36,7 @@ class _Logger:
 
 
 class _GoalHandle:
-    def __init__(self, *, mode: int, release_after_success: bool = False, release_drop_height_m: float = -1.0):
+    def __init__(self, *, mode: int, release_after_success: bool = False):
         self.request = PickObject.Goal()
         self.request.dispatch_binding = new_binding(task_id="test-pick")
         self.request.dispatch_binding.task_budget.schema_version = 1
@@ -45,7 +46,6 @@ class _GoalHandle:
         self.request.timeout_sec = 5.0
         self.request.mode = mode
         self.request.release_after_success = release_after_success
-        self.request.release_drop_height_m = release_drop_height_m
         self.is_cancel_requested = False
         self.feedback: list[tuple[str, str]] = []
         self.terminal_state = ""
@@ -70,7 +70,6 @@ def _prepared_candidate(index: int = 7):
     plan = SimpleNamespace(
         approach=(0.1, -0.2, 0.12),
         grasp=(0.1, -0.2, 0.02),
-        lift=(0.1, -0.2, 0.10),
         quaternion=(0.0, 0.0, 0.0, 1.0),
     )
     return SimpleNamespace(
@@ -94,7 +93,6 @@ def _full_prepared_candidate(index: int = 7) -> PreparedCandidate:
     plan = CandidatePlan(
         approach=(0.10, -0.20, 0.12),
         grasp=(0.10, -0.20, 0.04),
-        lift=(0.10, -0.20, 0.10),
         quaternion=(0.0, 0.0, 0.0, 1.0),
         approach_axis=(0.0, 0.0, 1.0),
         target_contact_ee=(0.0, 0.0, 0.0),
@@ -396,7 +394,6 @@ def test_execute_mode_passes_release_goal_to_the_only_executor_path():
     goal_handle = _GoalHandle(
         mode=PickObject.Goal.MODE_EXECUTE,
         release_after_success=True,
-        release_drop_height_m=0.015,
     )
 
     result = PickExecutorNode._execute_pick(cast(Any, harness), goal_handle)
@@ -404,7 +401,6 @@ def test_execute_mode_passes_release_goal_to_the_only_executor_path():
     assert captured == {
         "selected": prepared,
         "release_after_success": True,
-        "release_drop_height_m": pytest.approx(0.015),
     }
     assert result.success is True
     assert result.attempts == 1
@@ -601,49 +597,84 @@ def test_missing_target_after_grasp_failure_stops_without_another_execution():
     assert goal_handle.terminal_state == "aborted"
 
 
-def test_post_success_release_descends_then_opens_gripper():
-    logger = _Logger()
-    calls: list[tuple] = []
+def test_post_grasp_motion_target_uses_configured_container_joints():
     harness = SimpleNamespace(
-        _config={"release_velocity_scaling": 0.04, "release_settle_sec": 0.2},
+        _arm_joint_names=["1", "2", "3", "4", "5"],
+        _config={
+            "post_grasp_motion": {
+                "pose_name": "place_container",
+                "joint_names": ["1", "2", "3", "4", "5"],
+                "joint_positions": {
+                    "1": -0.047553,
+                    "2": -0.073631,
+                    "3": -0.840621,
+                    "4": 1.497165,
+                    "5": -1.570790,
+                },
+                "duration_sec": 5.0,
+            }
+        },
+    )
+
+    config, target = ExecutionPhase._post_grasp_motion_target(cast(Any, harness))
+
+    assert config["pose_name"] == "place_container"
+    assert target.name == ["1", "2", "3", "4", "5"]
+    assert target.position == pytest.approx([-0.047553, -0.073631, -0.840621, 1.497165, -1.570790])
+
+
+def test_post_grasp_motion_target_rejects_incomplete_arm_target():
+    harness = SimpleNamespace(
+        _arm_joint_names=["1", "2", "3", "4", "5"],
+        _config={
+            "post_grasp_motion": {
+                "joint_names": ["1", "2"],
+                "joint_positions": {"1": 0.0, "2": 0.0},
+            }
+        },
+    )
+
+    with pytest.raises(PickFlowError, match="exactly the configured arm joints"):
+        ExecutionPhase._post_grasp_motion_target(cast(Any, harness))
+
+
+def test_release_at_transport_pose_opens_gripper_without_arm_motion():
+    calls: list[tuple[str, dict]] = []
+    harness = SimpleNamespace(
+        _config={"release_settle_sec": 0.2},
         _gripper_open=1.0,
-        get_logger=lambda: logger,
+        _publish_feedback=lambda *_args: None,
+        _run_primitive=lambda _goal, _deadline, _task_id, name, **kwargs: calls.append((name, kwargs)),
+        _sleep_with_cancel=lambda *_args: None,
     )
-    harness._publish_feedback = lambda _goal, _state, phase, detail: calls.append(("feedback", phase, detail))
-
-    def move(_goal, _deadline, task_id, xyz, quaternion, velocity, seed, **kwargs):
-        calls.append(("move", task_id, xyz, quaternion, velocity, seed, kwargs))
-        return SimpleNamespace(joint_state="release-seed")
-
-    harness._move_branch_locked_pose = move
-    harness._run_primitive = lambda _goal, _deadline, task_id, primitive, **kwargs: calls.append(
-        ("primitive", task_id, primitive, kwargs)
-    )
-    harness._sleep_with_cancel = lambda _goal, _deadline, duration: calls.append(("sleep", duration))
     state = FlowState(completed_phases=[])
-    prepared = _prepared_candidate(index=3)
 
-    PickExecutorNode._release_verified_pick(
-        cast(Any, harness),
-        None,
-        time.monotonic() + 5.0,
-        state,
-        "release-test",
-        prepared,
-        "lift-seed",
-        0.015,
+    ExecutionPhase._release_at_transport_pose(cast(Any, harness), None, time.monotonic() + 5.0, state, "task")
+
+    assert calls == [("open_gripper", {"gripper_position": 1.0})]
+    assert state.released_after_success is True
+
+
+def test_release_at_transport_pose_reports_explicit_failure():
+    harness = SimpleNamespace(
+        _config={},
+        _gripper_open=1.0,
+        _publish_feedback=lambda *_args: None,
+        _run_primitive=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PickFlowError("PRIMITIVE_FAILED", "open failed")
+        ),
     )
 
-    move_call = next(call for call in calls if call[0] == "move")
-    assert move_call[2] == pytest.approx((0.1, -0.2, 0.035))
-    assert move_call[4] == pytest.approx(0.04)
-    assert move_call[5] == "lift-seed"
-    assert move_call[6] == {"validate_orientation": False}
-    primitive_call = next(call for call in calls if call[0] == "primitive")
-    assert primitive_call[2] == "open_gripper"
-    assert primitive_call[3] == {"gripper_position": pytest.approx(1.0)}
-    assert calls[-1] == ("sleep", 0.2)
-    assert state.released_after_success is True
+    with pytest.raises(PickFlowError, match="open failed") as exc_info:
+        ExecutionPhase._release_at_transport_pose(
+            cast(Any, harness),
+            None,
+            time.monotonic() + 5.0,
+            FlowState(completed_phases=[]),
+            "task",
+        )
+
+    assert exc_info.value.code == "RELEASE_FAILED"
 
 
 def test_close_gripper_is_immediate_after_descent_before_diagnostics():

@@ -503,8 +503,7 @@ Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway �
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
 | `supervised_direct` | 仅人工真机测试 client 为 `true`；Hermes/catalog 固定为 `false` |
 | `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
-| `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
-| `release_drop_height_m` | 非负时先下降到指定高度再开爪；负值在最终 lift 位释放 |
+| `release_after_success` | 验证成功并运输到 place container 后是否开爪 |
 
 **Result 字段**
 

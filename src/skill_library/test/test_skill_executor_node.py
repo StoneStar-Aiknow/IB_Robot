@@ -412,7 +412,6 @@ def test_pick_skill_sets_internal_execute_policy(monkeypatch):
     assert sent_goals[0].mode == skill_executor_node.PickObject.Goal.MODE_EXECUTE
     assert sent_goals[0].supervised_direct is False
     assert sent_goals[0].release_after_success is False
-    assert sent_goals[0].release_drop_height_m == pytest.approx(-1.0)
 
 
 def test_fresh_ee_pose_snapshot_is_independent_and_rejects_stale_pose(monkeypatch):

@@ -100,6 +100,17 @@ def generate_embodied_nodes(
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
     placement_execution = robot_config.get("placement_execution", {})
+    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
+        motion = placement_execution.get("motion", {})
+        if isinstance(motion, dict):
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["post_grasp_motion"] = {
+                "pose_name": motion.get("place_pose", "place_container"),
+                "joint_names": motion.get("place_joint_names", []),
+                "joint_positions": motion.get("place_joint_positions", {}),
+                "duration_sec": motion.get("place_duration_sec", 5.0),
+                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
+            }
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})

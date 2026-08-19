@@ -584,7 +584,6 @@ class PickFlowPhase:
                         prepared,
                         scene_base,
                         release_after_success=bool(goal.release_after_success),
-                        release_drop_height_m=float(goal.release_drop_height_m),
                     )
                     self._publish_feedback(goal_handle, state, "completed", "object grasped and verified")
                     result = self._result_from_state(state)

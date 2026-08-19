@@ -26,7 +26,6 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["verification"] == "required"
     assert grasp_execution["max_execution_attempts"] == 3
     assert grasp_execution["recover_after_close_failure"] is True
-    assert grasp_execution["recover_after_retention_failure"] is True
     assert grasp_execution["approach_distance_m"] == 0.09
     assert grasp_execution["planner"] == {
         "confidence_threshold": 0.30,

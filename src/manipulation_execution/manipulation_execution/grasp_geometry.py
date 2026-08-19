@@ -17,7 +17,6 @@ Quaternion = tuple[float, float, float, float]
 class CandidatePlan:
     approach: Vector3
     grasp: Vector3
-    lift: Vector3
     quaternion: Quaternion
     approach_axis: Vector3
     target_contact_ee: Vector3
@@ -540,13 +539,11 @@ def build_candidate_plan(
         float(base_to_source[2, 2]),
     )
     approach_distance = float(grasp_execution.get("approach_distance_m", 0.08))
-    lift_distance = float(grasp_execution.get("lift_distance_m", 0.165))
     approach: Vector3 = (
         grasp[0] - approach_axis[0] * approach_distance,
         grasp[1] - approach_axis[1] * approach_distance,
         grasp[2] - approach_axis[2] * approach_distance,
     )
-    lift = (grasp[0], grasp[1], grasp[2] + lift_distance)
     quaternion = quaternion_from_matrix(base_to_ee)
     contact = base_to_ee @ np.array([*target_contact, 1.0], dtype=np.float64)
     target_width_min_base = None
@@ -568,7 +565,6 @@ def build_candidate_plan(
     return CandidatePlan(
         approach=approach,
         grasp=grasp,
-        lift=lift,
         quaternion=quaternion,
         approach_axis=approach_axis,
         target_contact_ee=(float(target_contact[0]), float(target_contact[1]), float(target_contact[2])),

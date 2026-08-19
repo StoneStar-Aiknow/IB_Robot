@@ -15,7 +15,7 @@
 - `grasp_verifier_node`：抓取后验证节点。订阅 `/joint_states`、
   `/so101_follower/joint_currents` 和腕部深度图，提供 `~/verify_grasp` 服务，
   融合夹爪残余开度、夹爪电流和腕部 RealSense 可见性判断抓取是否成功。腕部相机抓后可能因
-  夹爪/手腕自遮挡、目标离开视野、深度缺失、反光或 lift 后视角变化而不可靠；此时视觉结果
+  夹爪/手腕自遮挡、目标离开视野、深度缺失或反光而不可靠；此时视觉结果
   只作为诊断/弱证据，不会单独判失败。深度订阅回调只保留最新消息；全帧有效率、近距比例和
   中位深度在 `VerifyGrasp` 请求时计算，避免空闲期间持续扫描 30 Hz 深度图。
 - `test_graspgen.py`：离线 GraspGen 调试脚本。读取已有 RGB-D/mask fixture 目录，直接运行
@@ -269,8 +269,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `evidence`：稳定的 `key: value` 诊断行，包括夹爪开度、电流、腕部深度有效比例和遮挡状态。
 
 **触发方式与边界**：`verify_grasp` 是被动 ROS 2 服务，仍需调用方主动触发。
-`manipulation_execution/pick_executor_node` 会按 `robot.grasp_execution.verification` 策略在 close、低速
-probe lift 和最终 lift 后自动调用；监督式测试和 Hermes 通过同一个 `PickObject` action 进入该路径。
+`manipulation_execution/pick_executor_node` 会按 `robot.grasp_execution.verification` 策略在 close 后
+自动调用；监督式测试和 Hermes 通过同一个 `PickObject` action 进入该路径。
 每次调用独立采样当前传感器状态，不追踪抓取历史。
 
 当前版本只做后验状态融合，不做外部 RGBD 目标跟踪。返回 `UNCERTAIN` 时，required 策略会保守停止；

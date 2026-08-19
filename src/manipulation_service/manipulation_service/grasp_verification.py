@@ -21,7 +21,7 @@ class DepthVisibilityStats:
 
 @dataclass(frozen=True)
 class GraspVerificationInput:
-    """Evidence sampled after gripper close or after lift."""
+    """Evidence sampled after gripper close."""
 
     gripper_position: float | None
     gripper_closed_position: float

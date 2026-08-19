@@ -77,10 +77,7 @@ class PickExecutorNode(
         "descend": 0.60,
         "close": 0.68,
         "verify_close": 0.74,
-        "probe_lift": 0.80,
-        "verify_probe": 0.84,
-        "lift": 0.92,
-        "verify_lift": 0.97,
+        "transport": 0.98,
         "release": 0.99,
         "completed": 1.0,
     }
@@ -261,8 +258,6 @@ class PickExecutorNode(
             PickObject.Goal.MODE_PLAN_ONLY,
             PickObject.Goal.MODE_OBSERVE_ONLY,
         }:
-            return GoalResponse.REJECT
-        if not math.isfinite(float(goal_request.release_drop_height_m)):
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:

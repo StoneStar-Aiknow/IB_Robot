@@ -81,15 +81,15 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
 
 `PickObject.mode` 支持 `MODE_EXECUTE`、`MODE_PLAN_ONLY` 和 `MODE_OBSERVE_ONLY`。三个模式共享同一
 观测、规划和配置入口；plan-only 会完成正式候选筛选与 IK/FK 准备但不执行抓取。`release_after_success`
-和 `release_drop_height_m` 可让 executor 在验证成功后执行安全下降和开爪。这些字段属于内部 delegated
-契约；当前 v1 catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求自动释放。
+可让 executor 在验证成功并运输到 place container 后开爪。该字段属于内部 delegated 契约；当前 v1
+catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求自动释放。
 
 目标字段 `target_query` 是 Grounded-SAM2/GraspGen 的文本查询，例如 `banana`，不是
 `named_targets` 中的静态配置键。
 
 放置反馈阶段包括 `preflight`、`move_to_place`、`release`、`move_to_verify`、`verify_place` 和
 `return_to_place`；抓取反馈阶段包括 `preflight`、`observe`、`planning`、`selecting`、`approach`、`descend`、
-`close`、`verify_close`、`probe_lift`、`verify_probe`、`lift` 和 `verify_lift`。
+`close`、`verify_close`、`transport` 和 `release`。
 
 只有最终抓取验证成功时 action 才返回 `success=true`。动作执行完成但验证失败或不确定分别返回
 `GRASP_VERIFICATION_FAILED` 或 `GRASP_UNCERTAIN`。
@@ -102,7 +102,7 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
 - 相机 topic 和 base/EE frame。
 - source gripper 到目标夹爪的几何适配。
 - 基于检测目标体积质心的 contact-distance 排序，以及 confidence/top-down 权重。
-- approach、lift、速度、候选数量和物理执行重试次数；IK/FK 准备失败不消耗物理重试次数。
+- approach、速度、候选数量和物理执行重试次数；IK/FK 准备失败不消耗物理重试次数。
 - `ik.worker_count` 个隔离 MoveIt worker 从同一个动态队列准备候选；所有 worker 使用同一份
   `/joint_states` seed，空闲 worker 立即领取下一个候选，结果仍按原候选顺序合并，并在每次抓取前校验
   主 MoveIt 与全部 worker 的 IK 解一致。
@@ -110,7 +110,7 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
   `TARGET_NOT_VISIBLE`（目标未检测到、置信度不足或没有生成候选）和
   `TARGET_OUTSIDE_WORKSPACE`（目标可见但所有候选均超出工作范围）会立即报错，不继续规划；不可恢复的
   配置、安全门禁和 worker 一致性错误同样不会重试。
-- `max_execution_attempts` 控制完整物理抓取次数。close/probe/lift 验证失败后，执行器先按安全恢复路径
+- `max_execution_attempts` 控制完整物理抓取次数。close 验证失败后，执行器先按安全恢复路径
   回撤、开爪并返回 `observe_pose`，然后从新观测帧重新规划，不复用目标可能已移动后的旧候选。
   执行中若出现可恢复的 IK/FK、joint5 分支、接触补偿、工作空间、固定指最终检查、桌面碰撞、TF 或
   IK/FK RPC 错误（包括 `IK_ORIENTATION_REJECTED`），同样先返回 `observe_pose`、等待观测稳定，再重新规划并
@@ -136,8 +136,7 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
 - 抓后验证策略。
 - `PickObject.Result.pipeline_timings_json` 返回 `phase_preflight`、`phase_observe`、`phase_planning`、
   `phase_selecting`、`phase_open`、`phase_approach`、`phase_descend`、`phase_close`、
-  `phase_verify_close`、`phase_probe_lift`、`phase_verify_probe`、`phase_lift`、`phase_verify_lift` 和
-  `phase_release` 等正式反馈阶段墙钟；`subphase_contact_realign` 是包含在 approach 阶段内的
+  `phase_verify_close`、`phase_transport` 和 `phase_release` 等正式反馈阶段墙钟；`subphase_contact_realign` 是包含在 approach 阶段内的
   嵌套聚合耗时，`subphase_recovery` 是失败安全恢复的嵌套聚合耗时，二者不能与 phase 字段直接相加。
 
 `pick_object` skill 的 catalog manifest（`skill_catalog/config/skills/pick_object/`）负责把技能入口
@@ -169,7 +168,7 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
   `min(goal.timeout_sec, deadline - now)` 作为实际 deadline；若预算在执行前已过期，立即返回
   `TASK_TIMEOUT`（`shared task budget expired before pick execution`）并 abort，不进入任何抓取阶段。
   预算在执行中过期由各阶段 deadline 自然截断。
-- 候选选定后，approach、内部安全下降过渡点、最终下降、probe lift 和 final lift 都沿用同一 joint5
+- 候选选定后，approach、内部安全下降过渡点和最终下降都沿用同一 joint5
   分支，并通过 `move_to_configuration` primitive 执行精确 IK 解；安全层检查完整关节顺序和限位。
 - 抓取前检查所有必需服务，缺失时不产生运动。
 - 最终 IK 解的 FK 固定爪朝向复检失败时，不执行该候选的 approach/descend/close。
@@ -179,7 +178,7 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
   闭爪后的 TF/pose/robust-gap 检查同样是 best-effort，不能中断 commit-to-grasp。
 - position-only IK 的 joint5 超出执行门限时，将 seed 翻转 `±π` 以交换固定指/活动指所在侧；最终 FK 接近轴、
   180° 对称闭合轴直线或固定指内侧检查失败时拒绝该候选，不再把 joint5 强制归零或停在 `±2.0` 边界。
-- close 验证失败时闭爪撤回后再打开；probe/final lift 的 IK/FK、运动或 retention 验证失败时在当前位置
+- close 验证失败时闭爪撤回后再打开；抓取验证成功后直接移动到配置的 `place_container` 关节位置
   打开并返回观察位。验证失败且仍有物理尝试预算时，从该观测位重新检测和规划；如果新观测返回
   `TARGET_NOT_VISIBLE` 或 `TARGET_OUTSIDE_WORKSPACE`，立即终止而不再规划。监督式客户端通过同一个 action
   获得完全相同的恢复行为。
