@@ -1316,7 +1316,23 @@ class SemanticMappingNode(Node):
 
     def _target_callback(self, request, response):
         with self._state_lock:
-            track = self._tracker.tracks.get(request.object_id)
+            track = self._tracker.tracks.get(request.object_id) if request.object_id else None
+            if track is None and request.query_text:
+                query_label = request.query_text.strip().casefold()
+                matches = [
+                    t
+                    for t in self._tracker.tracks.values()
+                    if t.label.casefold() == query_label and has_manual_label(t)
+                ]
+                if len(matches) == 1:
+                    track = matches[0]
+                elif len(matches) > 1:
+                    response.message = (
+                        f"query_text '{request.query_text}' matched {len(matches)} manual tracks; "
+                        "provide object_id for a unique target"
+                    )
+                    response.metadata = self._metadata_message(False, response.message)
+                    return response
         if track is None:
             response.message = f"semantic object not found: {request.object_id}"
             response.metadata = self._metadata_message(False, response.message)

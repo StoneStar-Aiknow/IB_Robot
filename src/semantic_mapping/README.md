@@ -251,6 +251,29 @@ ros2 launch semantic_mapping semantic_mapping.launch.py \
   config_path:=/path/to/enabled-lekiwi-mapping.yaml
 ```
 
+`mode:=query_only` 只启动 `semantic_mapping_node`，不启动 SAM2/RAM++/SigLIP2 模型服务；
+用于在导航板上加载预建静态语义地图并提供 `get_objects` 和 `resolve_target` 查询：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+ros2 launch semantic_mapping semantic_mapping.launch.py \
+  mode:=query_only \
+  config_path:=/path/to/enabled-lekiwi-mapping.yaml \
+  database_path:=/data/semantic_map.sqlite3 \
+  artifact_output_dir:=/data/artifacts
+```
+
+`resolve_target` 支持 `query_text` 按人工标签查询（返回唯一匹配的停靠位）：
+
+```bash
+ros2 service call /semantic_mapping/resolve_target \
+  ibrobot_msgs/srv/ResolveSemanticTarget \
+  "{query_text: banana, stand_off_distance_m: 0.5, require_manipulation_ready: false}"
+```
+
+多个同名人工轨迹匹配时返回明确的歧义错误，要求提供 `object_id`。
+
 离线入口额外要求 rosbag 路径；它从同一配置读取 camera topics、map/model identities、filtering 和 services：
 
 ```bash
