@@ -99,8 +99,17 @@ from launch_ros.actions import Node
 from robot_config.inference_config import scheduler_enabled_from_raw_config
 
 # Import node generators from launch_builders modules
-from robot_config.launch_builders.control import generate_ros2_control_nodes
+from robot_config.launch_builders.control import (
+    generate_auxiliary_actuator_nodes,
+    generate_ros2_control_nodes,
+    validate_runtime_resources,
+)
 from robot_config.launch_builders.execution import generate_execution_nodes
+from robot_config.launch_builders.hand_sources import (
+    apply_hand_profile,
+    confirm_interactive_startup_p_pose,
+    generate_hand_source_nodes,
+)
 from robot_config.launch_builders.hardware_mock import (
     mock_mode_skips_subsystem,
     validate_mock_control_mode,
@@ -336,6 +345,7 @@ def launch_setup(context, *args, **kwargs):
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
     nav_stage = context.launch_configurations.get("nav_stage", "").strip()
+    hand_profile_override = context.launch_configurations.get("hand_profile", "").strip().lower()
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "")
     with_perception_str = context.launch_configurations.get("with_perception", "")
@@ -350,6 +360,7 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
     logger.info(f"nav_stage: {nav_stage if nav_stage else '(from config)'}")
+    logger.info(f"hand_profile: {hand_profile_override if hand_profile_override else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
     logger.info(f"with_embodied: {with_embodied_str if with_embodied_str else '(from config)'}")
     logger.info(f"with_perception: {with_perception_str if with_perception_str else '(from config)'}")
@@ -391,6 +402,10 @@ def launch_setup(context, *args, **kwargs):
     # ========== 3. Apply control mode override ==========
     if control_mode_override:
         robot_config["default_control_mode"] = control_mode_override
+
+    active_hand_profile = apply_hand_profile(robot_config, hand_profile_override)
+    if active_hand_profile is not None:
+        logger.info(f"Active hand profile: {active_hand_profile}")
 
     voice_asr_auto_start = parse_bool(voice_asr_auto_start_str, default=False)
     if voice_asr_auto_start:
@@ -446,6 +461,12 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
+    validate_runtime_resources(robot_config, use_sim=use_sim, control_mode=active_control_mode)
+    confirm_interactive_startup_p_pose(
+        robot_config,
+        use_sim=use_sim,
+        control_mode=active_control_mode,
+    )
     deferred_controller_spawners = []
     controller_names = []
     robot_description = {}
@@ -466,6 +487,24 @@ def launch_setup(context, *args, **kwargs):
         except Exception as e:
             logger.error(f"generating control nodes: {e}")
             raise
+
+    auxiliary_actuator_nodes = generate_auxiliary_actuator_nodes(
+        robot_config,
+        use_sim=use_sim,
+        control_mode=active_control_mode,
+    )
+    actions.extend(auxiliary_actuator_nodes)
+    if auxiliary_actuator_nodes:
+        logger.info(f"Added {len(auxiliary_actuator_nodes)} auxiliary actuator node(s)")
+
+    hand_source_nodes = generate_hand_source_nodes(
+        robot_config,
+        use_sim=use_sim,
+        control_mode=active_control_mode,
+    )
+    actions.extend(hand_source_nodes)
+    if hand_source_nodes:
+        logger.info(f"Added {len(hand_source_nodes)} shared hand source node(s)")
 
     controller_ready_waiter = None
     if parse_bool(auto_start_controllers, default=True) and controller_names:
@@ -942,6 +981,11 @@ def generate_launch_description():
                     "Navigation profiles use mapping/navigation; combined mobile-manipulator profiles may also "
                     "declare grasp/hybrid. Empty uses default_nav_stage."
                 ),
+            ),
+            DeclareLaunchArgument(
+                "hand_profile",
+                default_value="",
+                description="Select a hand profile declared by the robot YAML (for example right, left, or dual).",
             ),
             DeclareLaunchArgument(
                 "voice_asr_device_index",

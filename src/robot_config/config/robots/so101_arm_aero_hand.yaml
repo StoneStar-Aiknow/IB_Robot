@@ -1,0 +1,117 @@
+# SO-101 + Aero Hand integration profile.
+#
+# The arm, cameras, MoveIt, inference, embodied and safety defaults come from
+# so101_single_arm.yaml. This file owns only the hand-specific delta.
+
+robot:
+  name: so101_arm_aero_hand
+  base_config: so101_single_arm
+
+  joints:
+    hand:
+      - right_thumb_cmc_abd
+      - right_thumb_cmc_flex
+      - right_thumb_mcp_ip
+      - right_index
+      - right_middle
+      - right_ring
+      - right_pinky
+
+  # One vendor SDK worker owns acquisition and publishes target-independent
+  # HumanHandState. Retarget devices consume that topic below.
+  hand_sources:
+    mhandpro:
+      type: mhandpro
+      enabled: true
+      active_control_modes: [teleop]
+      mock: false
+      lib_path: "$(env MHANDPRO_SDK_LIB)"
+      sides: [right]
+      require_p_pose: true
+      calibration_service: /hand_sources/mhandpro/calibrate_p_pose
+      topic_prefix: /hand_sources/mhandpro
+      publish_frequency: 50.0
+      publish_raw_frame: false
+      stale_timeout: 0.2
+      startup_timeout: 30.0
+      calibration_timeout: 30.0
+      p_pose_quality_frames: 5
+      p_pose_max_openness: 0.7
+      failure_policy: require_all
+      auto_reconnect: true
+      reconnect_initial_delay: 1.0
+      reconnect_max_delay: 10.0
+      reconnect_max_attempts: 0
+      exclusive_resources: [mhandpro_sdk]
+      replay_rate_hz: 50.0
+      replay_segment_seconds: 0.7
+
+  auxiliary_actuators:
+    aero_hand_right:
+      type: aero_hand
+      enabled: true
+      active_control_modes: [teleop]
+      mock: false
+      port: "$(env AERO_HAND_RIGHT_PORT)"
+      baudrate: 921600
+      joint_names:
+        - right_thumb_cmc_abd
+        - right_thumb_cmc_flex
+        - right_thumb_mcp_ip
+        - right_index
+        - right_middle
+        - right_ring
+        - right_pinky
+      command_topic: /aero_hand_right/commands
+      joint_state_topic: /aero_hand_right/joint_states
+      command_frequency: 50.0
+      state_frequency: 20.0
+      command_timeout: 0.25
+      estop_topic: /emergency_stop
+      estop_behavior: hold
+
+  teleoperation:
+    # Keep the inherited arm device and append the hand retarget device.
+    active_device: null
+    active_devices: [so101_leader, aero_glove_right]
+    devices:
+      __append__:
+        - name: aero_glove_right
+          type: hand_retarget
+          source_name: mhandpro
+          side: right
+          source_topic: /hand_sources/mhandpro/right/state
+          stale_timeout: 0.2
+          calib_file: "$(env HOME)/.calibrate/aero_hand_right_calibrate.json"
+          retargeter:
+            type: aero_compact
+            aero_thumb_model:
+              mcp_ip_weights: [9.4372, 12.5]
+              root_neutral_trims: [0.0, 0.0]
+              root_output_scales: [0.95, 0.94]
+              root_deadband_rad: 0.017453292519943295
+              tendon_deadband_rad: 0.05235987755982989
+              tendon_output_scale: 0.60
+              max_thumb_step_rad: [0.04, 0.03, 0.04]
+            aero_finger_model:
+              pip_weight: 0.55
+              dip_weight: 0.45
+              open_threshold_rad: 0.2617993877991494
+              closed_threshold_rad: 0.8726646259971648
+              active_trim_fraction: 0.08
+          target:
+            actuator: aero_hand_right
+    safety:
+      joint_limits:
+        right_thumb_cmc_abd: {min: 0.0, max: 1.7453292519943295}
+        right_thumb_cmc_flex: {min: 0.0, max: 0.9599310885968813}
+        right_thumb_mcp_ip: {min: 0.0, max: 1.5707963267948966}
+        right_index: {min: 0.0, max: 1.5707963267948966}
+        right_middle: {min: 0.0, max: 1.5707963267948966}
+        right_ring: {min: 0.0, max: 1.5707963267948966}
+        right_pinky: {min: 0.0, max: 1.5707963267948966}
+
+  recording:
+    extra_topics:
+      - /aero_hand_right/commands
+      - /aero_hand_right/joint_states

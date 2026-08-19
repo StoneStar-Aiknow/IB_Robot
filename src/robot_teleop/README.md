@@ -344,6 +344,268 @@ Placo ArmReturnHome -> SSOT reset_positions -> 新鲜 JointState 稳定到位，
 会将该值传给手机使用的 Placo solver。旧 `phone_config.position_only` 暂时兼容，但启动时会
 提示迁移。
 
+### 4. mHandPro 手部数据源与可插拔机械手重定向
+
+生产链路按职责拆分：`mhandpro_source_node` 独占厂商 SDK，默认只发布目标无关的
+`HumanHandState`；显式设置 `publish_raw_frame: true` 时才额外发布完整 `MHandProFrame`。
+`HandRetargetDevice` 订阅统一人手状态，由 `aero_compact` 或 `synergy_matrix`
+插件转换为目标机械手的弧度关节；TeleopNode 只负责安全裁剪和命令组发布。旧的直接手套设备入口
+已移除，生产配置统一使用这条 source/retarget 链路。
+
+真实 SDK 在隔离的纯标准库 worker 进程中运行，避免闭源库与 ROS/SciPy 的动态库冲突；SDK
+崩溃不会带走 TeleopNode。厂商库把运行文件路径硬编码为可执行文件同目录，因此 worker 使用用户私有的
+`~/.cache/ibrobot/mhandpro/python3` 启动副本，使运行目录可写。实机验证表明 P-pose 的骨段偏置
+不能跨 SDK 进程复用，因此真实手套在同一个 worker 完成 P-pose 前保持输出锁定。
+worker 使用厂商 virtual callback，只更新带序号和 monotonic timestamp 的最新完整帧缓存：
+20 个骨骼节点、20 个 `wxyz` 四元数、5 个虚拟指尖和 20 个 sensor state。50 Hz TeleopNode
+通过 `HumanHandState` 读取几何特征；订阅边界直接校验 20 个 landmark、20 个 orientation、5 个
+virtual tip，以及等长且无重复的 feature name/value。随后执行插件标定归一化和
+`safety.joint_limits` 弧度映射。断连、错误侧别、
+过期帧、退化标定和非法数值都返回 `{}`，并限频记录警告。
+
+`sides: [right]`、`[left]` 和 `[left, right]` 分别选择右手、左手和共享 worker 的双手模式。
+生产默认 `failure_policy: require_all`：双手模式任一侧断连，两侧输出都立即失效。配置
+`allow_available` 时，worker 可由任一已连接侧启动，运行时缺失一侧也不会中断健康侧。worker 启动失败或
+所有必需侧断连时，source 节点保持服务在线并在线程中按有界指数退避重连，不阻塞 ROS timer；需要
+P-pose 的配置在重连后重新进入门禁。
+`/hand_sources/mhandpro/<side>/health` 固定发布 `waiting_p_pose`、`ready`、`stale`、`reconnecting`
+或 `disconnected`，无需从日志猜测状态。
+
+`synergy_matrix` 可直接用统一解剖特征声明任意输出维度，例如 Amazing Hand 三指；与
+`aero_compact` 一样，它要求每个输出通道都具备有限且递增的 `safety.joint_limits`。新增机械手只需
+执行器 driver、关节/话题契约和重定向配置。需要更复杂运动学时再注册新的 retargeter，mHandPro
+采集层不感知 Aero 的 7 维或 Amazing Hand 的 3 维结构。
+
+生产配置使用 `retarget_mode: aero_compact` 和完整 25 点数据。四指继续按 Aero tendon 系数
+聚合连续骨段。拇指在掌局部坐标中提取根部 yaw、root pitch、MCP 屈曲和虚拟指尖 IP 屈曲。
+根据真机轴向验证，mHandPro 的 root pitch 和 root yaw 分别映射到
+`right_thumb_cmc_abd` 和 `right_thumb_cmc_flex`，不引入跨关节经验耦合。MCP/IP 角度先按 Aero SDK 肌腱系数
+`9.4372 / 12.5` 投影为单一角度坐标，再归一化并驱动 `right_thumb_mcp_ip`。SDK 自身负责
+CMC 运动对机械腱行程的补偿。该路径不识别或特判命名手势。
+
+四指使用独立的 PIP/DIP 单腱收缩标定端点。标定只裁掉主动端 `8%`（原先误用的 `20%` 已移除），
+避免末端极限姿态占据过大无响应区；默认按 `0.55 / 0.45` 加权，`15°` 以下保持张开，中间使用
+smoothstep 连续映射。mHandPro 在当前骨架数据中几乎不变化的 MCP 角不参与四指输出。
+
+标定文件必须声明 `feature_schema: aero_compact_v3`，在 `thumb_endpoints` 保存拇指端点，并在
+`finger_endpoints` 保存四指单腱端点。MCP/IP 肌腱权重、output scale、deadband 和每周期最大步长属于
+Aero 机构模型。拇指 CMC 舒适区通过根部 `10%/90%` 分位数独立拟合，不与四指的 `8%` 主动端裁剪混用。
+旧的 `aero_compact_v1`、`aero_compact_v2`、`positions_v1` 和
+`sdk_virtual_tip_v1` 文件不会被生产模式静默复用。
+
+`retarget_mode: calibrated_channels` 保留为旧 20 点兼容路径；它不能可靠区分直拇指对掌和
+拇指自身卷曲。`retarget_mode: sdk_skeleton` 保留上一版虚拟指尖兼容路径；
+`retarget_mode: task_space` 仅保留为离线实验路径。节点四元数在真实 SDK 连续帧中不够稳定，
+不参与 `aero_compact` 的标定或运行时门禁。
+
+task-space 实验路径仍会在运行时前 25 帧建立自然张开中性旋转，
+open 噪声 98% 分位作为 deadband，自由 sweep 98% 分位作为量程。相对旋转会抵消整根拇指的
+CMC 共同运动，因此不需要对“对掌”等姿态分类。无四元数的 mock replay 才回退到位置链收缩。
+
+更新完整骨架端点时，CLI 会先在本次 SDK 进程中完成一次 P-pose：
+
+```bash
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB" --aero-compact-only \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+CLI 只需一次动作确认：连续自由 sweep 中会自动识别稳定、充分伸展的张开帧，不单独要求自然张开
+姿态。`--raw-output` 会原子保存每帧的 20 节点
+position、5 个虚拟指尖、20 个 sensor state、`wxyz` quaternion、SDK sequence、monotonic timestamp
+和采集阶段。离线分析会拟合 `aero_compact_v3` 拇指 directional endpoints 和四指端点；即使不可靠的 quaternion
+task-space 门禁失败，完整骨架结果仍可使用。后续调参无需重连
+手套或重复手势，可直接离线检查同一份录制：
+
+```bash
+ros2 run robot_teleop analyze_glove_capture \
+  --input ~/.calibrate/aero_hand_right_sdk_capture.json --side right \
+  --update-calibration ~/.calibrate/aero_hand_right_calibrate.json
+```
+
+当前验证的闭源 SDK 是 `VDMocapSDK_mHandPro 3.0.20`，只支持 x86_64。其技术身份、
+SHA-256 和授权状态记录在 `third_party/vendor/mhandpro/3.0.20/`；`.so` 不进入仓库或发布包，
+真机用户必须在仓库外取得合法副本。mock 模式使用
+仓库内固定标定和确定性 replay 骨架，包含 5 个虚拟指尖并经过完整的 25 点到 7 关节算法。
+
+生产配置使用 `lib_path: "$(env MHANDPRO_SDK_LIB)"`。一键脚本要求通过环境变量或 `--sdk`
+提供外部 3.0.20 制品并校验 SHA-256；launch 会解析并检查该文件。mHandPro 通常枚举为 `/dev/ttyUSB*`，但 SDK 自行发现设备，
+`lib_path` 不是串口路径。闭源库仅支持 x86_64，arm64/OpenHarmony 不支持真实手套。
+
+```bash
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB"
+```
+
+左右手可以在同一轮 sweep 中同时采集；SDK 只建立一个共享 worker，采集窗口和 P-pose 只执行一次，
+最后分别写入两份侧别标定。默认输出为 `~/.calibrate/aero_hand_left_calibrate.json` 和
+`~/.calibrate/aero_hand_right_calibrate.json`：
+
+```bash
+ros2 run robot_teleop calibrate_glove --side both \
+  --lib-path "$MHANDPRO_SDK_LIB"
+```
+
+双手模式下 `--output` 和 `--raw-output` 必须指定目录，程序会在目录下生成左右两份文件；单手模式的
+文件路径语义保持不变。
+
+CLI 在当前采集进程内完成 P-pose，然后只采默认 15 秒连续全范围 sweep，覆盖张手/握拳、逐指
+弯曲、拇指外展和对掌。算法用完整骨架的屈曲度与稳定拇指根部聚类自动识别张开帧。根部
+yaw/pitch 使用 10%/90% 舒适区间，避免偶发极限姿态拉宽 CMC 映射；MCP/IP 屈曲仍使用
+2%/98% 分位数，并选择距自动张开基准更远的端点。未出现清晰张开或覆盖跨度不足时拒绝写入。
+通过后原子写入 `~/.calibrate/aero_hand_right_calibrate.json`。该文件保存长期复用的映射范围，不保存
+SDK 进程内的姿态偏置。真实遥操节点启动后先保持 `{}` 输出，只需完成 P-pose 对齐；SDK 成功后
+还会检查多帧新鲜、完整且充分伸展的骨架，通过后才解锁：
+
+```bash
+ros2 run robot_teleop calibrate_glove --side right \
+  --runtime-service /hand_sources/mhandpro/calibrate_p_pose
+```
+
+可选 `--verify-p-pose-persistence` 仅用于诊断厂商状态是否跨进程保存；检查包含虚拟拇指尖，失败
+不会通过调小映射增益掩盖。
+
+#### 真机快速使用流程
+
+以下流程适用于 x86_64 主机上的独立 Aero Hand 遥操；完整 SO-101 + Aero Hand 的启动方式见本节后半部分。
+真实模式不会在 SDK、手套或串口缺失时静默降级为 mock。
+
+单手和双手共用 `aero_hand_teleop` 配置，通过 `hand_profile:=right|left|dual` 选择；默认是右手。
+其
+`hand_sources.mhandpro.startup_p_pose: interactive` 会让统一 launch 在启动硬件前提示 P-pose；按回车后，
+mHandPro source 在自己的 SDK 进程中完成校准和质量检查，成功后自动解锁，不需要第二个终端或服务命令：
+
+首次在工作区根目录创建本机配置；该文件已被 Git 忽略，不会把个人路径写进提交。真实手套
+必须填写外部 `MHANDPRO_SDK_LIB`：
+
+```bash
+cp .aero_hand_teleop.env.example .aero_hand_teleop.env
+# 编辑左右 Aero Hand 的 /dev/serial/by-id/... 路径
+```
+
+先识别 Aero Hand 的稳定设备路径。不要把 mHandPro 枚举出的 `/dev/ttyUSB*` 写成 Aero 端口；手套由
+厂商 SDK 自行发现：
+
+```bash
+ls -l /dev/serial/by-id/
+udevadm info --query=property --name=/dev/serial/by-id/CANDIDATE_DEVICE | grep -E 'ID_VENDOR|ID_MODEL|ID_SERIAL'
+```
+
+将确认后的 `/dev/serial/by-id/...` 路径写入 `.aero_hand_teleop.env`。USB 重新插拔后如果权限丢失，
+可临时授权当前用户；长期使用建议加入 `dialout` 组并重新登录：
+
+```bash
+AERO_PORT=/dev/serial/by-id/AERO_HAND_DEVICE_ID
+sudo setfacl -m "u:$USER:rw" "$(readlink -f "$AERO_PORT")"
+test -r "$AERO_PORT" && test -w "$AERO_PORT"
+
+# 持久权限，执行后需要退出并重新登录
+sudo usermod -aG dialout "$USER"
+```
+
+启动前用 `fuser` 确认解析后的串口没有被旧节点占用；无输出表示空闲：
+
+```bash
+fuser -v "$(readlink -f "$AERO_PORT")"
+```
+
+之后日常启动只需一条命令：
+
+```bash
+cd /path/to/IB_Robot
+scripts/launch_aero_hand_teleop.sh --profile right
+```
+
+左手设置 `AERO_HAND_LEFT_PORT` 后使用 `--profile left`；双手设置左右串口后使用 `--profile dual`。
+双手仍只创建一个共享 mHandPro SDK worker。脚本从 `.aero_hand_teleop.env`（或
+`AERO_HAND_TELEOP_CONFIG` 指定的文件）读取本机路径，CLI 参数优先；核心 profile/P-pose 生命周期
+仍属于标准 launch。
+P-pose 或 SDK 启动失败时整套 launch 会退出；保持好姿势后重跑同一条命令。
+配置可以合并，但操作者/佩戴相关标定不能合并：左右侧分别使用
+`~/.calibrate/aero_hand_left_calibrate.json` 和 `~/.calibrate/aero_hand_right_calibrate.json`；双手模式要求
+两份均存在。
+
+P-pose 成功后，可在相同 `ROS_DOMAIN_ID` 的另一个终端确认三个节点和 50 Hz 数据链路：
+
+```bash
+cd /path/to/IB_Robot
+source .shrc_local
+set -a
+source .aero_hand_teleop.env
+set +a
+
+ros2 node list | grep -E 'aero_hand|mhandpro|robot_teleop'
+ros2 topic echo /hand_sources/mhandpro/right/health --once
+timeout --signal=INT 3 ros2 topic hz /hand_sources/mhandpro/right/state
+timeout --signal=INT 3 ros2 topic hz /aero_hand_right/commands
+```
+
+结束遥操时在启动终端按 `Ctrl+C`，等待 Aero Hand、mHandPro 和 TeleopNode 都报告正常退出。不要把
+`kill -9` 作为常规停止方式；长时间停用或机械手持续受力时，应在确认姿态安全后按硬件要求断电。
+
+首次使用、更换操作者、明显改变手套佩戴位置，或映射效果持续漂移时，先生成长期映射标定：
+
+```bash
+source .shrc_local
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+source install/setup.zsh
+
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB" \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+完成 P-pose 后，连续活动所有手指覆盖完整范围，并在过程中多次完全张开。程序自动识别张开帧；
+无需单独保持或确认自然张开。成功后应存在
+`~/.calibrate/aero_hand_right_calibrate.json`。普通启动不重复这段自由 sweep。
+
+完整 SO-101 + Aero Hand 配置仍可按以下方式启动：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+export AERO_HAND_RIGHT_PORT=/dev/serial/by-id/<aero-hand-id>
+source install/setup.zsh
+
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_arm_aero_hand \
+  control_mode:=teleop \
+  use_sim:=false
+```
+
+在使用相同 `ROS_DOMAIN_ID` 的第二个终端完成当前 worker 的运行时对齐：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+source install/setup.zsh
+
+ros2 run robot_teleop calibrate_glove --side right \
+  --runtime-service /hand_sources/mhandpro/calibrate_p_pose
+```
+
+日常只提示 **P-pose**：手臂向前放平、手掌朝下、手腕和手指伸直，拇指与食指约呈 45 度。
+P-pose 及质量检查成功前，手套状态标记为无效，Aero Hand 命令保持锁定。长期映射标定通常只做
+一次；P-pose 需要在 mHandPro worker 每次重启或重连后执行一次。
+仅重启 Aero Hand 驱动、mHandPro worker 仍在运行时不需要重新对齐。
+
+操作注意事项：
+
+- 上电前确认机械手运动范围内没有人体、线缆和易损物，急停或断电手段应触手可及。
+- 先确认 Aero Hand 的串口与 YAML 一致。mHandPro 的 `/dev/ttyUSB*` 由厂商 SDK 自动发现；
+  `MHANDPRO_SDK_LIB` 是 `.so` 文件路径，不是串口路径。
+- follower、leader 和 Aero Hand 必须使用不同串口。建议给 Aero 使用 `/dev/serial/by-id/...`；launch
+  会在启动节点前拒绝重复的真实硬件资源。
+- P-pose 期间保持姿势稳定；失败时重新执行运行时命令，不要绕过输出门禁。
+- `HumanHandState` 消费端会校验 schema、source 和 side；配置或接线错误不会让左手数据驱动右手。
+- Aero 硬件节点再次执行 YAML 关节限位，并在急停时清空驱动队列，避免旧命令越过急停边界。
+- 如果张手不能回零、手指方向错误或动作突然跳变，立即停止运动并检查佩戴位置、标定文件和串口，
+  不要通过扩大限位掩盖问题。
+- 已验证 SDK 是 3.0.20 且仅支持 x86_64，必须通过外部 `MHANDPRO_SDK_LIB` 提供。arm64 和
+  OpenHarmony 只能使用 mock 数据源，不能接入真实 mHandPro。
+
 ---
 
 ## VR 遥操作 (VR Teleoperation)
@@ -705,7 +967,7 @@ Cartesian 输入；多个 leader 等关节输入设备不受此限制。
 - name: "xbox"
   type: "xbox_controller"
   default_mode: "joint"            # joint | cartesian
-  mapping_config: "xbox_mapping"   # 对应 robot_config/config/xbox_mapping.yaml
+  mapping_config: "xbox_mapping"   # 对应 robot_teleop/config/xbox_mapping.yaml
   control_params:
     deadzone: 0.1
     joint_velocity_gain: 1.5

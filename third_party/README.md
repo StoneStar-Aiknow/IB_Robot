@@ -2,7 +2,8 @@
 
 本目录用于存放 **IB_Robot 对上游第三方依赖的受控定制内容**。
 
-当前目录维护 LeRobot 补丁栈，以及由固定上游版本和补丁构建的第三方 wheel：
+当前目录维护 LeRobot 补丁栈、由固定上游版本和补丁构建的第三方 wheel，以及需要单独
+核对许可证和平台约束的厂商制品清单：
 
 ```text
 third_party/
@@ -27,13 +28,19 @@ third_party/
 │       ├── manifest.yaml
 │       ├── series.txt
 │       └── 0001-*.patch
-└── wheels/
+├── wheels/
     ├── recognize-anything/<commit>/
     │   ├── ibrobot_ram-*.whl
     │   └── SHA256SUMS
     └── groundingdino/<commit>/
         ├── ibrobot_groundingdino-*.whl
         └── SHA256SUMS
+└── vendor/
+    └── mhandpro/<version>/
+        ├── manifest.yaml
+        ├── README.md
+        ├── NOTICE
+        └── LICENSE_STATUS.md
 ```
 
 RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。GroundingDINO wheel 通过
@@ -42,6 +49,10 @@ RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上�
 CUDA 用户如需最优性能可单独构建 `_C` 扩展）。setup 使用 `--no-deps` 安装这些 wheel，Python runtime 依赖仍由
 `requirements/perception.txt` 统一解析，避免第三方元数据覆盖
 IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
+
+`vendor/` 中的 manifest 记录厂商制品的技术身份、授权状态和预期外部路径，不自动授予
+许可证。未获公开再分发授权的二进制不得进入提交或发布包；用户必须从合法来源取得外部
+副本。取得厂商书面再分发授权后，必须同时提交授权文本、NOTICE、制品哈希和适用平台说明。
 
 ## 设计目标
 

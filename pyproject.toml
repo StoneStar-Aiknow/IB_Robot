@@ -31,6 +31,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = [
+    "aero_hand_hardware",
     "robot_config",
     "embodied_agent",
     "embodied_common",

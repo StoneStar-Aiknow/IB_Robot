@@ -1,0 +1,57 @@
+{
+  "channel_order": [
+    "thumb_abd",
+    "thumb_opp",
+    "thumb_mcp",
+    "index",
+    "middle",
+    "ring",
+    "pinky"
+  ],
+  "feature_schema": "aero_compact_v2",
+  "feature_unit": "radians",
+  "high": [
+    0.9719070617688021,
+    0.6499999999999999,
+    1.5707963267948968,
+    0.9759942867586937,
+    0.9759942867586938,
+    0.9759942867586937,
+    0.9759942867586938
+  ],
+  "low": [
+    0.2719070617688025,
+    0.039999999999999994,
+    2.7755575615628914e-16,
+    1.498461800585797e-16,
+    6.243523403105014e-17,
+    1.908566101177361e-17,
+    1.3548398485537096e-16
+  ],
+  "schema_version": 1,
+  "sdk": {
+    "name": "mHandPro",
+    "p_pose_cross_process_persistence_verified": false,
+    "version": "replay-v1"
+  },
+  "side": "right",
+  "target_unit": "normalized_0_1",
+  "thumb_endpoints": {
+    "ip_flex_rad": {
+      "active": 1.5707963267948968,
+      "neutral": 2.7755575615628914e-16
+    },
+    "mcp_flex_rad": {
+      "active": 0.9400000000000001,
+      "neutral": 0.039999999999999994
+    },
+    "root_pitch_rad": {
+      "active": 0.6499999999999999,
+      "neutral": 0.039999999999999994
+    },
+    "root_yaw_rad": {
+      "active": 0.9719070617688021,
+      "neutral": 0.2719070617688025
+    }
+  }
+}

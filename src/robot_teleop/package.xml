@@ -29,7 +29,6 @@
   <depend>trajectory_msgs</depend>
   <depend>std_srvs</depend>
   <depend>diagnostic_msgs</depend>
-  <depend>robot_config</depend>
 
   <!-- Test dependencies -->
   <test_depend>python3-pytest</test_depend>

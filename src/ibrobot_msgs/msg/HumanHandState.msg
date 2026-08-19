@@ -1,0 +1,14 @@
+std_msgs/Header header
+string source
+string schema
+string side
+uint64 sequence
+bool valid
+string status
+string[] feature_names
+float64[] features
+float32[] confidence
+float64 openness_score
+geometry_msgs/Point[] landmarks
+geometry_msgs/Quaternion[] orientations
+geometry_msgs/Point[] virtual_tips

@@ -25,10 +25,14 @@ class _Logger:
 class _Device:
     def __init__(self):
         self.estop_calls = 0
+        self.estop_release_calls = 0
         self.is_connected = True
 
     def emergency_stop(self):
         self.estop_calls += 1
+
+    def emergency_stop_released(self):
+        self.estop_release_calls += 1
 
 
 def _estop_harness():
@@ -72,6 +76,7 @@ def test_bool_estop_latches_stops_once_and_releases_explicitly():
     TeleopNode.estop_callback(node, Bool(data=False))
 
     assert node.estop_active is False
+    assert node.device.estop_release_calls == 1
     assert any("released" in message for message in logger.warnings)
 
 
@@ -91,6 +96,7 @@ def test_estop_callback_does_not_block_when_control_loop_owns_device_lock():
 
     assert node._try_dispatch_estop() is True
     assert node.device.estop_calls == 1
+    assert node.device.estop_release_calls == 1
     assert node.estop_active is False
 
 

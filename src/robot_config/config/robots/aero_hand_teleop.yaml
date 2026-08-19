@@ -1,0 +1,193 @@
+# Standalone Aero Hand teleoperation with selectable right/left/dual profiles.
+#
+# The profile selection changes only the active mHandPro sides, Aero actuators,
+# and retarget devices. Shared SDK, timing, P-pose, safety, and retarget settings
+# remain in this single SSOT file.
+
+robot:
+  name: aero_hand_teleop
+  type: aero_hand
+
+  hand_profiles:
+    default_profile: right
+    profiles:
+      right:
+        sides: [right]
+        hand_source: mhandpro
+        active_actuators: [aero_hand_right]
+        active_devices: [aero_glove_right]
+      left:
+        sides: [left]
+        hand_source: mhandpro
+        active_actuators: [aero_hand_left]
+        active_devices: [aero_glove_left]
+      dual:
+        sides: [left, right]
+        hand_source: mhandpro
+        active_actuators: [aero_hand_left, aero_hand_right]
+        active_devices: [aero_glove_left, aero_glove_right]
+
+  joints:
+    arm: []
+    gripper: []
+    # Replaced at launch with the joints owned by the selected profile.
+    hand: []
+    all: []
+
+  default_control_mode: teleop
+  control_modes:
+    teleop:
+      description: "Standalone mHandPro to Aero Hand teleoperation"
+      controllers: []
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+  # Exactly one vendor SDK worker owns all selected sides, including dual mode.
+  hand_sources:
+    mhandpro:
+      type: mhandpro
+      enabled: true
+      active_control_modes: [teleop]
+      mock: false
+      lib_path: "$(env MHANDPRO_SDK_LIB)"
+      # Overridden by hand_profiles before nodes are generated.
+      sides: [right]
+      require_p_pose: true
+      startup_p_pose: interactive
+      calibration_service: /hand_sources/mhandpro/calibrate_p_pose
+      topic_prefix: /hand_sources/mhandpro
+      publish_frequency: 50.0
+      publish_raw_frame: false
+      stale_timeout: 0.2
+      startup_timeout: 30.0
+      calibration_timeout: 30.0
+      p_pose_quality_frames: 5
+      p_pose_max_openness: 0.7
+      # Dual mode is fail-closed: either side disconnecting locks both outputs.
+      failure_policy: require_all
+      auto_reconnect: true
+      reconnect_initial_delay: 1.0
+      reconnect_max_delay: 10.0
+      reconnect_max_attempts: 0
+      exclusive_resources: [mhandpro_sdk]
+
+  auxiliary_actuators:
+    aero_hand_left:
+      type: aero_hand
+      profile_managed: true
+      enabled: false
+      active_control_modes: [teleop]
+      mock: false
+      port: "$(env AERO_HAND_LEFT_PORT)"
+      baudrate: 921600
+      joint_names:
+        - left_thumb_cmc_abd
+        - left_thumb_cmc_flex
+        - left_thumb_mcp_ip
+        - left_index
+        - left_middle
+        - left_ring
+        - left_pinky
+      command_topic: /aero_hand_left/commands
+      joint_state_topic: /aero_hand_left/joint_states
+      command_frequency: 50.0
+      state_frequency: 20.0
+      command_timeout: 0.25
+      estop_topic: /emergency_stop
+      estop_behavior: hold
+
+    aero_hand_right:
+      type: aero_hand
+      profile_managed: true
+      enabled: false
+      active_control_modes: [teleop]
+      mock: false
+      port: "$(env AERO_HAND_RIGHT_PORT)"
+      baudrate: 921600
+      joint_names:
+        - right_thumb_cmc_abd
+        - right_thumb_cmc_flex
+        - right_thumb_mcp_ip
+        - right_index
+        - right_middle
+        - right_ring
+        - right_pinky
+      command_topic: /aero_hand_right/commands
+      joint_state_topic: /aero_hand_right/joint_states
+      command_frequency: 50.0
+      state_frequency: 20.0
+      command_timeout: 0.25
+      estop_topic: /emergency_stop
+      estop_behavior: hold
+
+  teleoperation:
+    enabled: true
+    # Replaced by hand_profiles before teleop validation and node generation.
+    active_devices: [aero_glove_right]
+    devices:
+      - name: aero_glove_left
+        type: hand_retarget
+        source_name: mhandpro
+        side: left
+        source_topic: /hand_sources/mhandpro/left/state
+        stale_timeout: 0.2
+        calib_file: "$(env HOME)/.calibrate/aero_hand_left_calibrate.json"
+        retargeter:
+          type: aero_compact
+          aero_thumb_model: &aero_thumb_model
+            # mHandPro root pitch/yaw map to Aero CMC abduction/flexion.
+            # MCP/IP contributes only to Aero's single coupled tendon axis.
+            mcp_ip_weights: [9.4372, 12.5]
+            root_output_scales: [0.95, 0.94]
+            root_deadband_rad: 0.017453292519943295
+            tendon_deadband_rad: 0.05235987755982989
+            tendon_output_scale: 0.60
+            max_thumb_step_rad: [0.04, 0.03, 0.04]
+          aero_finger_model: &aero_finger_model
+            pip_weight: 0.55
+            dip_weight: 0.45
+            open_threshold_rad: 0.2617993877991494
+            closed_threshold_rad: 0.8726646259971648
+            active_trim_fraction: 0.08
+        target:
+          actuator: aero_hand_left
+
+      - name: aero_glove_right
+        type: hand_retarget
+        source_name: mhandpro
+        side: right
+        source_topic: /hand_sources/mhandpro/right/state
+        stale_timeout: 0.2
+        calib_file: "$(env HOME)/.calibrate/aero_hand_right_calibrate.json"
+        retargeter:
+          type: aero_compact
+          aero_thumb_model:
+            <<: *aero_thumb_model
+            # Thumb CMC comfort is fitted independently from the four-finger active-end trim.
+            root_neutral_trims: [0.0, 0.0]
+          aero_finger_model: *aero_finger_model
+        target:
+          actuator: aero_hand_right
+
+    safety:
+      estop_topic: /emergency_stop
+      joint_limits:
+        left_thumb_cmc_abd: {min: 0.0, max: 1.7453292519943295}
+        left_thumb_cmc_flex: {min: 0.0, max: 0.9599310885968813}
+        left_thumb_mcp_ip: {min: 0.0, max: 1.5707963267948966}
+        left_index: {min: 0.0, max: 1.5707963267948966}
+        left_middle: {min: 0.0, max: 1.5707963267948966}
+        left_ring: {min: 0.0, max: 1.5707963267948966}
+        left_pinky: {min: 0.0, max: 1.5707963267948966}
+        right_thumb_cmc_abd: {min: 0.0, max: 1.7453292519943295}
+        right_thumb_cmc_flex: {min: 0.0, max: 0.9599310885968813}
+        right_thumb_mcp_ip: {min: 0.0, max: 1.5707963267948966}
+        right_index: {min: 0.0, max: 1.5707963267948966}
+        right_middle: {min: 0.0, max: 1.5707963267948966}
+        right_ring: {min: 0.0, max: 1.5707963267948966}
+        right_pinky: {min: 0.0, max: 1.5707963267948966}

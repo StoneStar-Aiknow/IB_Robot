@@ -81,6 +81,17 @@ SO101 defaults to `placo_servo`; MoveIt Servo remains available as a generic com
 
 Backend input contract: devices send linear commands in the base frame and angular commands in the tool frame. `placo_servo` and `moveit_servo` convert tool angular velocity to the base frame internally. Phone and Xbox both receive Cartesian speed knobs from the `robot_config` SSOT.
 
+### Publish Groups and Device Coexistence
+
+Joint devices return `{joint_name: radians}`. `TeleopNode` publishes configured
+`target.publish_groups` independently and emits a group only when every joint key is present.
+Legacy arm/gripper target fields are translated to equivalent groups; a device cannot mix the
+legacy and explicit forms.
+
+The launch builder validates command topic ownership across every active device, including the
+standalone VR node. Leader, phone, Xbox, and VR remain mutually exclusive on the SO-101 command
+topics. An mHandPro glove owns only the Aero Hand topic and can coexist with any one arm input.
+
 #### Class Inheritance Diagram
 
 ```mermaid
@@ -592,6 +603,296 @@ _last_commanded_positions = {}    # Command state (integrator)
 _current_gripper_pos = 0.0        # Gripper state
 ```
 
+#### 3. mHandPro acquisition and hand retargeting
+
+`mhandpro_source_node` runs the SDK in an isolated standard-library-only worker process, avoiding
+native-library conflicts with ROS/SciPy and preventing a vendor crash from taking down TeleopNode.
+Because the vendor library hard-codes calibration storage beside `/proc/self/exe`, the worker uses a
+private `~/.cache/ibrobot/mhandpro/python3` launcher copy so `CalibrationFiles/` is writable and shared
+across worker processes.
+The worker uses the vendor virtual callback and copies complete frames into a sequence-numbered,
+monotonic-timestamped cache: 20 skeleton nodes, 20 `wxyz` quaternions, five virtual fingertips, and
+20 sensor states. The
+HandRetargetDevice performs geometric retargeting and calibration, then maps
+normalized channels into radian `safety.joint_limits`. Disconnects, stale frames, side mismatch,
+degenerate geometry, and non-finite values return `{}` with rate-limited warnings.
+
+`sides: [right]`, `[left]`, and `[left, right]` select one right glove, one left glove, or both gloves
+in one shared worker. Production defaults to `failure_policy: require_all`: either disconnect invalidates
+both outputs in dual-hand mode. With `allow_available`, any connected side can start the worker and a
+missing peer does not interrupt the healthy side. If startup fails or all required sides disconnect, the
+source node stays alive and reconnects outside the ROS timer with bounded exponential backoff;
+configurations requiring P-pose return to that gate after reconnect. Per-side
+`/hand_sources/mhandpro/<side>/health` publishes `waiting_p_pose`, `ready`, `stale`, `reconnecting`, or
+`disconnected` without requiring log inspection.
+
+Production uses `retarget_mode: aero_compact` with the complete 25-point hierarchy. Finger segments
+remain aggregated with Aero tendon coefficients. Hardware axis validation maps mHandPro palm-local
+root pitch and root yaw to `right_thumb_cmc_abd` and `right_thumb_cmc_flex`, respectively, with no
+empirical cross-joint coupling. Human MCP
+and virtual-tip IP flexion are projected onto one angle coordinate using the Aero SDK tendon
+coefficients `9.4372 / 12.5`, then normalized to drive `right_thumb_mcp_ip`. The SDK itself compensates
+for CMC motion in the mechanical tendon actuation. Optional `root_neutral_trims` and
+`root_active_trims` trim uncomfortable human root-axis end ranges before normalization; they do not
+widen the Aero joint safety limits. No named gesture is classified.
+
+The four fingers use separately calibrated PIP/DIP tendon endpoints. Only the active end is trimmed by
+`8%` (the previous, incorrect `20%` trim is removed), preventing an excessive dead region at the human
+extreme. The model uses weights `0.55 / 0.45`, holds open below `15 deg`, and applies smoothstep.
+MCP angles do not drive these tendons.
+
+The calibration must declare `feature_schema: aero_compact_v3` and store neutral/active pairs for the
+four raw thumb features plus the `mcp_ip_flex_rad` projection in `thumb_endpoints`, and store four-finger
+PIP/DIP endpoints in `finger_endpoints`. MCP/IP tendon
+weights, output scales, deadbands, and per-cycle maximum steps describe the Aero mechanism and live in
+robot_config rather than user calibration. Thumb CMC comfort uses an independent 10th/90th-percentile fit
+and is not coupled to the four-finger 8% active-end trim. Production does not silently reuse `aero_compact_v1`,
+`aero_compact_v2`, `positions_v1`, or `sdk_virtual_tip_v1` files.
+
+Acquisition and retargeting are separate. `mhandpro_source_node` is the only owner of the
+vendor SDK and publishes target-independent `HumanHandState` messages by default. It publishes the
+full `MHandProFrame` only when `publish_raw_frame: true` is explicitly configured.
+`HandRetargetDevice` subscribes to that state and delegates to an `aero_compact`, `synergy_matrix`,
+or registered target plugin. The old direct glove-device entry point has been removed; production
+configurations must use `hand_retarget` with an mHandPro source topic.
+The subscription boundary requires 20 landmarks, 20 orientations, five virtual tips, and matching
+unique feature names/values. Every retarget plugin, including `synergy_matrix`, requires a finite,
+increasing safety joint range for every output channel. `synergy_matrix` supports arbitrary output
+dimensions, so a three-channel Amazing Hand needs a driver,
+an actuator command contract, and a retarget profile without changing mHandPro acquisition.
+
+`retarget_mode: calibrated_channels` remains as the legacy 20-point compatibility path and cannot
+reliably separate straight-thumb opposition from thumb curl. `sdk_skeleton` remains as the previous
+virtual-tip compatibility path, while `task_space` remains offline-only. Real SDK node quaternions
+were not stable enough across consecutive frames and are not a calibration or runtime gate for
+`aero_compact`.
+
+The task-space experiment still uses its first 25 runtime frames
+establish the natural-open relative rotation; the open 98th-percentile noise is the deadband and the
+free-sweep 98th percentile is the range. Relative rotation cancels common CMC motion, so no named
+opposition gesture is classified. Quaternion-free mock replay falls back to position-chain shortening.
+
+When updating complete-skeleton endpoints, the CLI first performs P-pose in the SDK process that
+captures the new ranges:
+
+```bash
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB" --aero-compact-only \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+The CLI needs one motion confirmation and records one continuous free sweep. It automatically detects
+stable open-hand frames from complete skeleton flexion and thumb-root clustering; no separate
+natural-open prompt is required.
+`--raw-output` atomically records each frame's 20-node positions, five virtual fingertips, 20 sensor
+states, `wxyz` quaternions, SDK sequence, monotonic timestamp, and capture phase. Offline analysis
+fits the `aero_compact_v3` directional thumb endpoints and finger endpoints; an unusable quaternion task-space
+range does not discard valid complete-skeleton results.
+Retarget changes can reuse the recording without
+reconnecting the glove or repeating gestures:
+
+```bash
+ros2 run robot_teleop analyze_glove_capture \
+  --input ~/.calibrate/aero_hand_right_sdk_capture.json --side right \
+  --update-calibration ~/.calibrate/aero_hand_right_calibrate.json
+```
+
+The validated closed SDK is `VDMocapSDK_mHandPro 3.0.20` and supports x86_64 only. Its identity,
+SHA-256, and authorization status are recorded under `third_party/vendor/mhandpro/3.0.20/`. The binary
+is not stored or packaged by this repository; real-glove users must obtain an authorized external copy.
+Mock mode uses deterministic geometric replay data and an installed fixture,
+including five virtual fingertips, so it exercises the complete 25-point to 7-joint mapping path.
+
+Production config uses `lib_path: "$(env MHANDPRO_SDK_LIB)"`. The one-command wrapper requires an
+external 3.0.20 artifact through the environment or `--sdk`, verifies its SHA-256, and fails fast when
+the file is missing. mHandPro normally enumerates as
+`/dev/ttyUSB*`, but the vendor SDK discovers it itself: `lib_path` is not a serial path. The closed
+library supports x86_64 only, so real glove mode is unsupported on arm64/OpenHarmony.
+
+```bash
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB"
+```
+
+Both gloves can be captured in one sweep. The CLI creates one shared SDK worker, performs P-pose once,
+collects both sides in the same time window, and writes separate side-specific mappings. By default it
+writes `~/.calibrate/aero_hand_left_calibrate.json` and
+`~/.calibrate/aero_hand_right_calibrate.json`:
+
+```bash
+ros2 run robot_teleop calibrate_glove --side both \
+  --lib-path "$MHANDPRO_SDK_LIB"
+```
+
+With `--side both`, `--output` and `--raw-output` must name a directory; the CLI creates one file per
+side there. Single-side path semantics are unchanged.
+
+The CLI performs P-pose calibration and then captures only one 15-second continuous full-range sweep
+covering open/close, individual finger flexion, thumb abduction, and thumb opposition. It selects the
+open reference automatically. Root yaw/pitch use the comfortable 10th/90th-percentile envelope so an
+occasional end-range pose cannot dilute CMC sensitivity; MCP/IP flexion keeps the 2nd/98th-percentile
+envelope. A missing clear opening or insufficient coverage prevents writing. The JSON stores reusable mapping ranges, not the vendor's
+process-local pose offsets. After startup, output remains locked until one command completes P-pose
+alignment and fresh complete-skeleton quality checks in the shared SDK worker:
+
+```bash
+ros2 run robot_teleop calibrate_glove --side right \
+  --runtime-service /hand_sources/mhandpro/calibrate_p_pose
+```
+
+`--verify-p-pose-persistence` is an optional vendor diagnostic and includes the virtual thumb tip.
+
+##### Real-Hardware Quick Start
+
+This procedure covers standalone Aero Hand teleoperation on an x86_64 host. The complete SO-101 plus
+Aero Hand launch is documented later in this section. Real mode never silently falls back to mock when
+the SDK, glove, or serial device is unavailable.
+
+Single- and dual-hand operation share the `aero_hand_teleop` config. Select
+`hand_profile:=right|left|dual`; the default is right. Its `hand_sources.mhandpro.startup_p_pose:
+interactive` setting makes the unified launch prompt
+before hardware starts. After Enter, the mHandPro source performs SDK calibration and quality checks in
+its own process, then unlocks output without a second terminal or service command:
+
+Create the machine-local config once from the workspace root. Git ignores the result so workstation
+paths do not enter commits. Real-glove mode requires an external `MHANDPRO_SDK_LIB` path:
+
+```bash
+cp .aero_hand_teleop.env.example .aero_hand_teleop.env
+# Edit the /dev/serial/by-id/... Aero Hand paths.
+```
+
+Identify the stable Aero Hand device path first. Do not configure the mHandPro `/dev/ttyUSB*` device as
+an Aero port; the vendor SDK discovers the glove itself:
+
+```bash
+ls -l /dev/serial/by-id/
+udevadm info --query=property --name=/dev/serial/by-id/CANDIDATE_DEVICE | grep -E 'ID_VENDOR|ID_MODEL|ID_SERIAL'
+```
+
+Put the confirmed `/dev/serial/by-id/...` path in `.aero_hand_teleop.env`. If USB reconnect removes the
+current access, grant a temporary ACL. For persistent access, join `dialout` and log in again:
+
+```bash
+AERO_PORT=/dev/serial/by-id/AERO_HAND_DEVICE_ID
+sudo setfacl -m "u:$USER:rw" "$(readlink -f "$AERO_PORT")"
+test -r "$AERO_PORT" && test -w "$AERO_PORT"
+
+# Persistent access; log out and back in after this command.
+sudo usermod -aG dialout "$USER"
+```
+
+Before launch, confirm that no stale process owns the resolved port. No `fuser` output means it is free:
+
+```bash
+fuser -v "$(readlink -f "$AERO_PORT")"
+```
+
+Daily startup is then one command:
+
+```bash
+cd /path/to/IB_Robot
+scripts/launch_aero_hand_teleop.sh --profile right
+```
+
+For left mode, set `AERO_HAND_LEFT_PORT` and pass `--profile left`; dual mode sets both ports and passes
+`--profile dual`. Dual mode still creates one shared mHandPro SDK worker. The wrapper reads machine
+paths from `.aero_hand_teleop.env` or the file named by `AERO_HAND_TELEOP_CONFIG`; CLI options take
+precedence. The standard launch owns the profile and P-pose lifecycle. If SDK startup or P-pose fails, the complete
+launch exits; hold the correct pose and rerun the same command.
+The robot config is shared, but operator/fit calibration is side-specific: left and right use
+`~/.calibrate/aero_hand_left_calibrate.json` and `~/.calibrate/aero_hand_right_calibrate.json` respectively;
+dual mode requires both files.
+
+After P-pose succeeds, use another terminal with the same `ROS_DOMAIN_ID` to verify the three nodes and
+the 50 Hz data path:
+
+```bash
+cd /path/to/IB_Robot
+source .shrc_local
+set -a
+source .aero_hand_teleop.env
+set +a
+
+ros2 node list | grep -E 'aero_hand|mhandpro|robot_teleop'
+ros2 topic echo /hand_sources/mhandpro/right/health --once
+timeout --signal=INT 3 ros2 topic hz /hand_sources/mhandpro/right/state
+timeout --signal=INT 3 ros2 topic hz /aero_hand_right/commands
+```
+
+Stop teleoperation with `Ctrl+C` in the launch terminal and wait for Aero Hand, mHandPro, and TeleopNode
+to exit cleanly. Do not use `kill -9` as the normal stop path. For extended idle periods or while the hand
+remains under load, disconnect hardware power according to the device procedure after confirming a safe pose.
+
+Before the first use, after changing operators or glove fit, or when mapping consistently drifts,
+create the reusable mapping calibration:
+
+```bash
+source .shrc_local
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+source install/setup.zsh
+
+ros2 run robot_teleop calibrate_glove --side right \
+  --lib-path "$MHANDPRO_SDK_LIB" \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+After P-pose, continuously move every finger through its full useful range and fully open the hand a
+few times. The program finds the open frames automatically. A successful run creates
+`~/.calibrate/aero_hand_right_calibrate.json`; normal startup does not repeat this free sweep.
+
+The complete SO-101 plus Aero Hand profile can still be launched as follows:
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+export AERO_HAND_RIGHT_PORT=/dev/serial/by-id/<aero-hand-id>
+source install/setup.zsh
+
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_arm_aero_hand \
+  control_mode:=teleop \
+  use_sim:=false
+```
+
+In a second terminal with the same `ROS_DOMAIN_ID`, align the active worker:
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+source install/setup.zsh
+
+ros2 run robot_teleop calibrate_glove --side right \
+  --runtime-service /hand_sources/mhandpro/calibrate_p_pose
+```
+
+Daily startup prompts only for **P-pose**: arms level and forward, palms down, wrists and fingers
+straight, with each thumb about 45 degrees from the index finger. Until P-pose and the automatic frame
+quality check succeed, the shared hand state is invalid and Aero Hand output remains locked. The reusable
+mapping is normally captured once; P-pose is required after each mHandPro worker restart or reconnect.
+Restarting only the Aero Hand driver does not require realignment while the glove worker remains alive.
+
+Safety and troubleshooting notes:
+
+- Before power-on, clear people, cables, and fragile objects from the hand workspace and keep an
+  emergency stop or power disconnect within reach.
+- Confirm that the Aero Hand serial port matches the YAML. The vendor SDK discovers the mHandPro
+  `/dev/ttyUSB*` device; `MHANDPRO_SDK_LIB` is the `.so` path, not a serial port.
+- The follower, leader, and Aero Hand must use distinct serial ports. Prefer a stable
+  `/dev/serial/by-id/...` path for Aero; launch rejects duplicate real-hardware resources before nodes start.
+- Keep P-pose stable. Retry the runtime command after a failure; do not bypass the
+  output gate.
+- `HumanHandState` consumers validate schema, source, and side so a wiring or
+  configuration error cannot cross-drive the opposite hand.
+- The Aero hardware node reapplies YAML joint limits and clears the driver queue
+  at E-stop so an old command cannot cross the stop boundary.
+- Stop motion immediately if open does not return to zero, a finger moves in the wrong direction, or
+  targets jump. Check glove fit, calibration files, and serial selection instead of widening limits.
+- The validated SDK is version 3.0.20 and supports x86_64 only. Supply it externally through
+  `MHANDPRO_SDK_LIB`; arm64 and OpenHarmony can use the mock source but cannot run a real mHandPro glove.
+
 **Reverse-Snap Algorithm**:
 ```python
 # Snap to actual position when direction reverses
@@ -791,7 +1092,7 @@ source install/setup.bash
 
 Launch via `robot_config` with teleoperation support:
 
-**Configuration** (in `src/robot_config/config/robots/so101_single_arm.yaml`):
+**Configuration** (in `src/robot_config/config/robots/so101_single_arm.yaml`; Xbox mapping is packaged by `robot_teleop`):
 
 ```yaml
 robot:
@@ -909,7 +1210,7 @@ devices:
   arm_joint_names: ["1","2","3","4","5"]
   gripper_joint_names: ["6"]
   joint_limits: {...}                # Joint limits
-  mapping_config: "xbox_mapping"     # Button mapping config file
+  mapping_config: "xbox_mapping"     # robot_teleop/config/xbox_mapping.yaml
   default_mode: "joint"              # Default mode (joint/cartesian)
 ```
 
@@ -973,6 +1274,8 @@ tunnels, guest Wi-Fi, or untrusted VPNs; restrict them to the robot control subn
      does not use this joint-target contract
    - Each joint limit needs `min` and `max` fields
    - `min` must be less than `max`
+   - Active devices must not own the same final command topic
+   - `hand_retarget` requires `source_topic` and `retargeter.type`; `aero_compact` also requires `calib_file`
 
 ## Topics
 

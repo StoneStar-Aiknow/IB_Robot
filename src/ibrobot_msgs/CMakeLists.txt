@@ -65,6 +65,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
   "msg/SpeechDirection.msg"
+  "msg/MHandProFrame.msg"
+  "msg/HumanHandState.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"

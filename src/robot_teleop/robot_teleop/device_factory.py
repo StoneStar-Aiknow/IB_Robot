@@ -5,15 +5,15 @@ Provides a factory pattern for creating teleoperation devices based on
 configuration, enabling easy extension without modifying core code.
 """
 
-from typing import Dict, Type
 from .base_teleop import BaseTeleopDevice
+from .devices.hand_retarget import HandRetargetDevice
 from .devices.leader_arm import LeaderArmDevice
-from .phone.phone_device import PhoneDevice
 from .devices.xbox_controller import XboxTeleopDevice
-
+from .phone.phone_device import PhoneDevice
 
 # Device registry - add new device types here
-DEVICE_MAP: Dict[str, Type[BaseTeleopDevice]] = {
+DEVICE_MAP: dict[str, type[BaseTeleopDevice]] = {
+    "hand_retarget": HandRetargetDevice,
     "leader_arm": LeaderArmDevice,  # SO-101 leader arm
     "phone": PhoneDevice,
     "xbox_controller": XboxTeleopDevice,
@@ -40,16 +40,13 @@ def device_factory(config: dict, node=None) -> BaseTeleopDevice:
 
     if dev_type not in DEVICE_MAP:
         available_types = ", ".join(DEVICE_MAP.keys())
-        raise ValueError(
-            f"Unknown teleop device type: '{dev_type}'. "
-            f"Available types: [{available_types}]"
-        )
+        raise ValueError(f"Unknown teleop device type: '{dev_type}'. Available types: [{available_types}]")
 
     device_class = DEVICE_MAP[dev_type]
     return device_class(config, node=node)
 
 
-def register_device(device_type: str, device_class: Type[BaseTeleopDevice]) -> None:
+def register_device(device_type: str, device_class: type[BaseTeleopDevice]) -> None:
     """
     Register a new device type in the global device map.
 
@@ -66,9 +63,7 @@ def register_device(device_type: str, device_class: Type[BaseTeleopDevice]) -> N
     """
     if device_type in DEVICE_MAP:
         import warnings
-        warnings.warn(
-            f"Overwriting existing device type: {device_type}",
-            UserWarning
-        )
+
+        warnings.warn(f"Overwriting existing device type: {device_type}", UserWarning, stacklevel=2)
 
     DEVICE_MAP[device_type] = device_class

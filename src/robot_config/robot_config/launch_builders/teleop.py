@@ -10,12 +10,21 @@ import os
 import re
 from pathlib import Path
 
+from launch.actions import EmitEvent
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import prepare_lerobot_env, resolve_ros_path
+from robot_teleop.teleop_groups import resolve_target_publish_groups
 
 logger = get_colored_logger("robot_config.teleop")
+
+
+def _shutdown_when_process_exits(node_name: str):
+    """Stop the complete launch when the teleoperation node exits."""
+    return EmitEvent(event=Shutdown(reason=f"required process {node_name!r} exited"))
+
 
 _PLACO_ENDPOINT_DEFAULTS = {
     "linear_cmd_topic": "/so101_placo_servo_node/linear_cmd_base",
@@ -84,7 +93,12 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         logger.info("Teleoperation not enabled, skipping")
         return nodes
 
-    validation_errors = validate_teleop_config(teleop_config)
+    validation_errors = validate_teleop_config(
+        teleop_config,
+        robot_config.get("auxiliary_actuators", {}),
+        robot_config.get("joints", {}),
+        robot_config.get("safety", {}),
+    )
     if validation_errors:
         raise ConfigError("Invalid teleoperation configuration: " + "; ".join(validation_errors))
 
@@ -121,6 +135,7 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
 def _generate_device_nodes(robot_config: dict, device_config: dict, robot_description_dict: dict = None) -> list[Node]:
     nodes = []
     teleop_config = robot_config.get("teleoperation", {})
+    device_type = device_config.get("type", "")
 
     # Get joint limits from safety config
     safety_config = teleop_config.get("safety", robot_config.get("safety", {}))
@@ -128,9 +143,15 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
 
     # Get joint names from robot config
     joints_config = robot_config.get("joints", {})
-    target_config = device_config.get("target", {})
-    arm_joint_names = target_config.get("arm_joint_names", joints_config.get("arm", []))
-    gripper_joint_names = target_config.get("gripper_joint_names", joints_config.get("gripper", []))
+    target_config = device_config.get("target", {}) or {}
+    publish_groups = resolve_target_publish_groups(
+        target_config,
+        joints_config,
+        robot_config.get("auxiliary_actuators", {}),
+    )
+    groups_by_name = {group.name: group for group in publish_groups}
+    arm_joint_names = list(groups_by_name["arm"].joint_names) if "arm" in groups_by_name else []
+    gripper_joint_names = list(groups_by_name["gripper"].joint_names) if "gripper" in groups_by_name else []
 
     # Build device config for node parameter
     device_param = {
@@ -150,24 +171,30 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         device_param["calib_file"] = calib_file_expanded
         if not Path(calib_file_expanded).exists():
             logger.error("=" * 60)
-            logger.error("Leader arm calibration file not found!")
+            logger.error(f"{device_type} calibration file not found!")
             logger.error(f"  Resolved path: {calib_file_expanded}")
             logger.error(f"  Raw path:      {calib_file_raw}")
             logger.error(f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}")
-            calib_port = device_config.get("port", "/dev/ttyACM0")
             logger.error("")
             logger.error("  Please run calibration first:")
-            logger.error("    ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port)
+            if device_type == "hand_retarget":
+                side = device_config.get("side", "right")
+                calibration_command = (
+                    f'ros2 run robot_teleop calibrate_glove --side {side} --lib-path "$MHANDPRO_SDK_LIB"'
+                )
+            else:
+                calib_port = device_config.get("port", "/dev/ttyACM0")
+                calibration_command = "ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
+            logger.error("    " + calibration_command)
             logger.error("=" * 60)
-            raise RuntimeError(
-                f"Calibration file not found: {calib_file_expanded}. "
-                f"Run: ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
-            )
+            raise RuntimeError(f"Calibration file not found: {calib_file_expanded}. Run: {calibration_command}")
     if "joint_mapping" in device_config:
         device_param["joint_mapping"] = device_config["joint_mapping"]
 
     device_param["arm_joint_names"] = arm_joint_names
     device_param["gripper_joint_names"] = gripper_joint_names
+    device_param["joint_names"] = [joint for group in publish_groups for joint in group.joint_names]
+    device_param["publish_groups"] = [group.to_dict() for group in publish_groups]
 
     # Add joint limits for proper scaling
     if joint_limits:
@@ -178,6 +205,7 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         "name",
         "type",
         "port",
+        "lib_path",
         "calib_file",
         "joint_mapping",
         "phone_config",
@@ -278,7 +306,7 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         resolved_placo_params = _resolve_so101_placo_servo_params(
             robot_config,
             arm_joint_names=arm_joint_names,
-            command_out_topic=target_config.get("arm_command_topic"),
+            command_out_topic=groups_by_name["arm"].topic if "arm" in groups_by_name else None,
             input_mode=phone_input_mode,
             position_only=position_only_override,
             require_complete_contract=True,
@@ -291,6 +319,7 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     # Convert dicts to JSON strings for ROS 2 parameter passing
     device_param_json = json.dumps(device_param)
     joint_limits_json = json.dumps(joint_limits)
+    publish_groups_json = json.dumps([group.to_dict() for group in publish_groups])
     logger.debug(f"device_param_json: {device_param_json}")
     logger.debug(f"device_param dict: {device_param}")
 
@@ -312,26 +341,34 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     if device_config.get("name"):
         node_name = f"robot_teleop_{re.sub(r'[^A-Za-z0-9_]+', '_', device_config['name']).strip('_')}"
 
+    teleop_parameters = {
+        "control_frequency": control_frequency,
+        "device_config": device_param_json,
+        "joint_limits": joint_limits_json,
+        "publish_groups": publish_groups_json,
+        "arm_command_topic": groups_by_name.get("arm").topic
+        if "arm" in groups_by_name
+        else "/arm_position_controller/commands",
+        "gripper_command_topic": (
+            groups_by_name["gripper"].topic if "gripper" in groups_by_name else "/gripper_position_controller/commands"
+        ),
+        "estop_topic": safety_config.get("estop_topic", "/emergency_stop"),
+    }
+    # Empty arrays are not valid untyped ROS 2 parameters. Hand retargeting
+    # uses explicit publish_groups, so omit unused legacy arrays.
+    if arm_joint_names:
+        teleop_parameters["arm_joint_names"] = arm_joint_names
+    if gripper_joint_names:
+        teleop_parameters["gripper_joint_names"] = gripper_joint_names
+
     teleop_node = Node(
         package="robot_teleop",
         executable="teleop_node",
         name=node_name,
         output="screen",
         env=env,
-        parameters=[
-            {
-                "control_frequency": control_frequency,
-                "device_config": device_param_json,
-                "joint_limits": joint_limits_json,
-                "arm_joint_names": arm_joint_names,
-                "gripper_joint_names": gripper_joint_names,
-                "arm_command_topic": target_config.get("arm_command_topic", "/arm_position_controller/commands"),
-                "gripper_command_topic": target_config.get(
-                    "gripper_command_topic", "/gripper_position_controller/commands"
-                ),
-                "estop_topic": safety_config.get("estop_topic", "/emergency_stop"),
-            }
-        ],
+        parameters=[teleop_parameters],
+        on_exit=_shutdown_when_process_exits(node_name),
     )
     nodes.append(teleop_node)
     logger.info(f"Generated teleop_node for device: {device_config.get('name', '')} (type: {device_type})")
@@ -809,7 +846,12 @@ def _create_so101_placo_servo_node(
     )
 
 
-def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
+def validate_teleop_config(
+    teleop_config: dict[str, object],
+    auxiliary_actuators: dict | None = None,
+    joints: dict | None = None,
+    root_safety: dict | None = None,
+) -> list[str]:
     """
     Validate teleoperation configuration.
 
@@ -855,7 +897,7 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
     if len(set(active_device_names)) != len(active_device_names):
         errors.append("active_devices must not contain duplicate device names")
     cartesian_devices = []
-    command_topic_owners: dict[str, dict[str, list[str]]] = {"arm": {}, "gripper": {}}
+    command_topic_owners: dict[str, list[tuple[str, str]]] = {}
     for name in active_device_names:
         device = devices_by_name.get(name) or {}
         device_type = device.get("type")
@@ -869,35 +911,51 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
             device_type == "vr_teleop"
             and (device.get("vr_config", {}) or {}).get("output_profile", "humanoid") == "so101"
         )
-        if commands_so101:
-            target = device.get("target", {}) or {}
-            if not isinstance(target, dict):
-                target = {}
-            if device_type == "vr_teleop":
+        target = device.get("target", {}) or {}
+        if not isinstance(target, dict):
+            target = {}
+        if device_type == "vr_teleop":
+            if target:
+                errors.append(f"Device '{name}': vr_teleop uses vr_config outputs and cannot define target")
+            if commands_so101:
                 vr_config = device.get("vr_config", {}) or {}
-                topics = {
-                    "arm": "/arm_position_controller/commands",
-                    "gripper": vr_config.get("so101_gripper_topic", "/gripper_position_controller/commands"),
-                }
+                command_groups = [
+                    ("arm", "/arm_position_controller/commands"),
+                    ("gripper", vr_config.get("so101_gripper_topic", "/gripper_position_controller/commands")),
+                ]
             else:
-                topics = {
-                    "arm": target.get("arm_command_topic", "/arm_position_controller/commands"),
-                    "gripper": target.get("gripper_command_topic", "/gripper_position_controller/commands"),
-                }
-            for controller, topic in topics.items():
-                if isinstance(topic, str) and topic.strip():
-                    command_topic_owners[controller].setdefault(topic, []).append(name)
+                command_groups = []
+        else:
+            try:
+                groups = resolve_target_publish_groups(
+                    target,
+                    joints or {"arm": ["1", "2", "3", "4", "5"], "gripper": ["6"]},
+                    auxiliary_actuators or {},
+                )
+            except ValueError as exc:
+                errors.append(f"Device '{name}': {exc}")
+                groups = []
+            command_groups = [(group.name, group.topic) for group in groups]
+            if device_type == "hand_retarget" and "publish_groups" not in target and "actuator" not in target:
+                errors.append(
+                    f"Device '{name}': hand retarget requires explicit target.publish_groups or target.actuator"
+                )
+        for group_name, topic in command_groups:
+            if not isinstance(topic, str) or not topic.strip():
+                errors.append(f"Device '{name}': command topics must be non-empty strings")
+                continue
+            command_topic_owners.setdefault(topic, []).append((name, group_name))
     if len(cartesian_devices) > 1:
         errors.append(
             f"only one active SO-101 Cartesian device is currently supported; selected: {', '.join(cartesian_devices)}"
         )
-    for controller, topic_owners in command_topic_owners.items():
-        for topic, owners in topic_owners.items():
-            if len(owners) > 1:
-                errors.append(
-                    f"active devices share {controller} command topic {topic!r}: {', '.join(owners)}; "
-                    f"only one controller may own a {controller} command topic"
-                )
+    for topic, ownership in command_topic_owners.items():
+        if len(ownership) > 1:
+            owners = [owner for owner, _group in ownership]
+            groups = {group for _owner, group in ownership}
+            role = next(iter(groups)) if len(groups) == 1 and groups <= {"arm", "gripper"} else ""
+            label = f"{role} command topic" if role else "command topic"
+            errors.append(f"active devices share {label} {topic!r}: {', '.join(owners)}")
 
     cartesian = teleop_config.get("cartesian", {}) or {}
     placo_config = cartesian.get("placo_servo", {}) or {}
@@ -914,12 +972,29 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
         device_type = device.get("type")
         if not device_type:
             errors.append(f"Device '{active_device_name}': missing 'type' field")
+        elif device_type == "mhandpro_glove":
+            errors.append(
+                f"Device '{active_device_name}': mhandpro_glove has been removed; "
+                "use hand_sources.mhandpro with a hand_retarget device"
+            )
         elif device_type not in ("joy_teleop", "vr_teleop"):
             requires_joint_limits = True
 
         # Type-specific validation
         if device_type == "leader_arm" and not device.get("port"):
             errors.append(f"Device '{active_device_name}': leader_arm requires 'port' field")
+
+        if device_type == "hand_retarget":
+            side = device.get("side", "right")
+            if side not in ("left", "right"):
+                errors.append(f"Device '{active_device_name}': hand_retarget side must be left or right")
+            if not device.get("source_topic"):
+                errors.append(f"Device '{active_device_name}': hand_retarget requires source_topic")
+            retargeter = device.get("retargeter", {}) or {}
+            if not isinstance(retargeter, dict) or not retargeter.get("type"):
+                errors.append(f"Device '{active_device_name}': hand_retarget requires retargeter.type")
+            elif retargeter.get("type") == "aero_compact" and not device.get("calib_file"):
+                errors.append(f"Device '{active_device_name}': aero_compact hand_retarget requires calib_file")
 
         if device_type == "phone":
             phone_config = device.get("phone_config", {})
@@ -1007,7 +1082,7 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
                     errors.append(f"Device '{active_device_name}': WebPhone TLS cert_file/key_file must be paired")
 
     # Validate safety config
-    safety = teleop_config.get("safety", {})
+    safety = teleop_config.get("safety", root_safety or {})
     joint_limits = safety.get("joint_limits", {})
     estop_topic = safety.get("estop_topic", "/emergency_stop")
     if not isinstance(estop_topic, str) or not estop_topic.strip():

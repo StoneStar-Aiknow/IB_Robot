@@ -1,0 +1,17 @@
+std_msgs/Header header
+string source
+string schema
+string side
+uint64 sequence
+int32 sdk_frame_index
+bool valid
+string status
+float32 device_power
+uint32 source_frequency_hz
+geometry_msgs/Point[] positions
+geometry_msgs/Quaternion[] orientations
+geometry_msgs/Point[] virtual_positions
+geometry_msgs/Vector3[] angular_velocity
+geometry_msgs/Vector3[] linear_acceleration
+geometry_msgs/Vector3[] linear_velocity
+int32[] sensor_states

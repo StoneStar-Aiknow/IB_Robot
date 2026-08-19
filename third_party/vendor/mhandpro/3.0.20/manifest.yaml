@@ -1,0 +1,41 @@
+schema_version: 1
+name: mhandpro-sdk
+product: VDMocapSDK_mHandPro
+vendor: Guangzhou Virtual Dynamics Network Technology Co., Ltd.
+vendor_name_zh: 广州虚拟动力网络科技有限公司
+version: "3.0.20"
+
+artifact:
+  path: linux-x86_64/libVDMocapSDK_mHandPro.so
+  present_in_repository: false
+  format: ELF 64-bit LSB shared object
+  os: linux
+  architecture: x86_64
+  size_bytes: 5801952
+  sha256: 1f25964d465be31bc74fc577874a99e5ec26cf1d77c5a86a081642d9c399a057
+  gnu_build_id: bfad72076cd7a8e67ff7a2ffd6a3a67702466a3d
+  compiler: GCC 11.4.0 on Ubuntu 22.04
+
+identity:
+  source: exported GetVersionInfo ABI
+  project_name: VDMocapSDK_mHandPro
+  reported_version: "3.0.20"
+
+runtime:
+  loader: ctypes.CDLL
+  required_for: real mHandPro glove input
+  not_required_for: mock mHandPro input
+  dependencies:
+    - libstdc++.so.6
+    - libm.so.6
+    - libmvec.so.1
+    - libgomp.so.1
+    - libgcc_s.so.1
+    - libc.so.6
+
+licensing:
+  status: pending_vendor_redistribution_permission
+  public_redistribution_authorized: false
+  license_file: null
+  distribution_mode: external_user_supplied
+  required_action: Obtain written vendor permission before adding the binary to this repository or a release.

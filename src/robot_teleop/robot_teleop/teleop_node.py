@@ -18,6 +18,7 @@ from std_msgs.msg import Bool, Float64MultiArray
 from .base_teleop import BaseTeleopDevice
 from .device_factory import device_factory
 from .safety_filter import SafetyFilter
+from .teleop_groups import resolve_node_publish_groups
 
 
 def connect_device_or_raise(device: BaseTeleopDevice) -> None:
@@ -61,6 +62,7 @@ class TeleopNode(Node):
         self.declare_parameter("control_frequency", 50.0)
         self.declare_parameter("device_config", "")
         self.declare_parameter("joint_limits", "")
+        self.declare_parameter("publish_groups", "")
         self.declare_parameter("arm_joint_names", ["1", "2", "3", "4", "5"])
         self.declare_parameter("gripper_joint_names", ["6"])
 
@@ -72,6 +74,7 @@ class TeleopNode(Node):
         self.control_frequency = self.get_parameter("control_frequency").value
         device_config_str = self.get_parameter("device_config").value
         joint_limits_str = self.get_parameter("joint_limits").value
+        publish_groups_value = self.get_parameter("publish_groups").value
         self.arm_joint_names = self.get_parameter("arm_joint_names").value
         self.gripper_joint_names = self.get_parameter("gripper_joint_names").value
         self.arm_command_topic = self.get_parameter("arm_command_topic").value
@@ -106,9 +109,16 @@ class TeleopNode(Node):
         self.safety_filter = SafetyFilter(joint_limits)
 
         # Publishers
-        self.arm_cmd_pub = self.create_publisher(Float64MultiArray, self.arm_command_topic, 10)
-
-        self.gripper_cmd_pub = self.create_publisher(Float64MultiArray, self.gripper_command_topic, 10)
+        self.publish_groups = resolve_node_publish_groups(
+            publish_groups_value,
+            arm_joint_names=self.arm_joint_names,
+            gripper_joint_names=self.gripper_joint_names,
+            arm_command_topic=self.arm_command_topic,
+            gripper_command_topic=self.gripper_command_topic,
+        )
+        self.command_publishers = {
+            group.name: self.create_publisher(Float64MultiArray, group.topic, 10) for group in self.publish_groups
+        }
 
         self.diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
@@ -183,21 +193,20 @@ class TeleopNode(Node):
         if not safe_targets:
             return
 
-        # Only publish arm commands when all arm keys are present (avoids sending
-        # zeros when PhoneDevice omits arm keys during Servo Cartesian control)
-        if all(name in safe_targets for name in self.arm_joint_names):
-            arm_msg = Float64MultiArray()
-            arm_msg.data = [safe_targets[name] for name in self.arm_joint_names]
-            self.arm_cmd_pub.publish(arm_msg)
-
-        if self.gripper_joint_names and all(name in safe_targets for name in self.gripper_joint_names):
-            gripper_msg = Float64MultiArray()
-            gripper_msg.data = [safe_targets[name] for name in self.gripper_joint_names]
-            self.gripper_cmd_pub.publish(gripper_msg)
+        self._publish_targets(safe_targets)
 
         # Update diagnostics
         loop_time = time.time() - loop_start
         self._update_diagnostics(loop_time)
+
+    def _publish_targets(self, safe_targets: dict[str, float]) -> None:
+        """Publish each complete command group in its configured joint order."""
+        for group in self.publish_groups:
+            if not all(name in safe_targets for name in group.joint_names):
+                continue
+            msg = Float64MultiArray()
+            msg.data = [safe_targets[name] for name in group.joint_names]
+            self.command_publishers[group.name].publish(msg)
 
     def estop_callback(self, msg):
         """Latch or explicitly release the emergency-stop gate."""
@@ -216,13 +225,8 @@ class TeleopNode(Node):
         with self._estop_state_lock:
             if not self.estop_active:
                 return
-            if self._estop_stop_pending:
-                self._estop_release_pending = True
-                released = False
-            else:
-                self.estop_active = False
-                self._estop_release_pending = False
-                released = True
+            self._estop_release_pending = True
+            released = False
 
         if not released:
             self._try_dispatch_estop()
@@ -239,25 +243,35 @@ class TeleopNode(Node):
     def _try_dispatch_estop(self) -> bool:
         """Dispatch a pending device stop without blocking on the control-loop lock."""
         with self._estop_state_lock:
-            if not self._estop_stop_pending:
+            if not self._estop_stop_pending and not self._estop_release_pending:
                 return True
 
         if not self._device_lock.acquire(blocking=False):
             return False
         try:
             with self._estop_state_lock:
-                if not self._estop_stop_pending:
-                    return True
-            try:
-                if self.device is not None:
-                    self.device.emergency_stop()
-            except Exception as exc:  # noqa: BLE001 - retry on the next control cycle
-                self.get_logger().error(f"Emergency stop dispatch failed: {exc}")
-                return False
+                stop_pending = self._estop_stop_pending
+                release_pending = self._estop_release_pending
+            if stop_pending:
+                try:
+                    if self.device is not None:
+                        self.device.emergency_stop()
+                except Exception as exc:  # noqa: BLE001 - retry on the next control cycle
+                    self.get_logger().error(f"Emergency stop dispatch failed: {exc}")
+                    return False
+                with self._estop_state_lock:
+                    self._estop_stop_pending = False
 
-            with self._estop_state_lock:
-                self._estop_stop_pending = False
-                if self._estop_release_pending:
+            if release_pending:
+                try:
+                    if self.device is not None:
+                        release = getattr(self.device, "emergency_stop_released", None)
+                        if callable(release):
+                            release()
+                except Exception as exc:  # noqa: BLE001 - retry on the next control cycle
+                    self.get_logger().error(f"Emergency stop release dispatch failed: {exc}")
+                    return False
+                with self._estop_state_lock:
                     self.estop_active = False
                     self._estop_release_pending = False
             return True

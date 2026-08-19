@@ -1,0 +1,11 @@
+mHandPro SDK / VDMocapSDK_mHandPro 3.0.20
+Copyright and ownership: Guangzhou Virtual Dynamics Network Technology Co., Ltd.
+
+Expected artifact:
+  linux-x86_64/libVDMocapSDK_mHandPro.so
+  SHA-256: 1f25964d465be31bc74fc577874a99e5ec26cf1d77c5a86a081642d9c399a057
+  GNU Build ID: bfad72076cd7a8e67ff7a2ffd6a3a67702466a3d
+
+The vendor binary is not covered by the Apache-2.0 license of IB-Robot. This NOTICE records technical
+provenance only and does not grant redistribution rights. The binary is not stored or packaged by this
+repository; users must supply an authorized external copy through MHANDPRO_SDK_LIB.

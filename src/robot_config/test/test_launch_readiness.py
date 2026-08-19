@@ -16,8 +16,10 @@ from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.inference_config import InferenceConfigError
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
+    generate_auxiliary_actuator_nodes,
     generate_controller_spawners,
     generate_ros2_control_nodes,
+    validate_runtime_resources,
 )
 from robot_config.launch_builders.execution import (
     _attention_viz_request,
@@ -25,10 +27,15 @@ from robot_config.launch_builders.execution import (
     generate_execution_nodes,
     generate_inference_node,
 )
+from robot_config.launch_builders.hand_sources import (
+    apply_hand_profile,
+    confirm_interactive_startup_p_pose,
+    generate_hand_source_nodes,
+)
 from robot_config.launch_builders.navigation import generate_navigation_nodes
 from robot_config.launch_builders.perception import generate_camera_nodes, generate_tf_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
-from robot_config.launch_builders.teleop import generate_teleop_nodes
+from robot_config.launch_builders.teleop import generate_teleop_nodes, validate_teleop_config
 from robot_config.loader import load_robot_config_dict
 from robot_config.wait_for_controllers import missing_inactive_controllers
 
@@ -38,6 +45,13 @@ assert _LAUNCH_SPEC is not None
 assert _LAUNCH_SPEC.loader is not None
 robot_launch = importlib.util.module_from_spec(_LAUNCH_SPEC)
 _LAUNCH_SPEC.loader.exec_module(robot_launch)
+
+_HAND_JOINTS = [f"hand_{index}" for index in range(7)]
+
+
+def _joint_limits(names):
+    return {name: {"min": -1.0, "max": 1.0} for name in names}
+
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -64,6 +78,8 @@ def _node_parameters(node):
             return value
         if all(isinstance(item, list) for item in value):
             return [decode_parameter(tuple(item)) for item in value]
+        if all(isinstance(item, bool | int | float) for item in value):
+            return list(value)
         text = _text(value)
         try:
             return yaml.safe_load(text)
@@ -495,6 +511,7 @@ def test_shared_loader_preserves_source_path_metadata():
 
     assert robot_config["name"] == "so101_single_arm"
     assert robot_config["_config_path"] == str(config_path.resolve())
+    assert robot_config["_config_sources"] == [str(config_path.resolve())]
 
 
 def test_launch_loader_uses_shared_dict_loader():
@@ -881,6 +898,904 @@ def test_generate_teleop_nodes_injects_target_joint_names_into_device_config():
 
     assert device_config["arm_joint_names"] == ["joint1_left", "joint2_left"]
     assert device_config["gripper_joint_names"] == ["joint6_left"]
+
+    publish_groups = json.loads(params["publish_groups"].strip("'"))
+    assert publish_groups == [
+        {
+            "name": "arm",
+            "joint_names": ["joint1_left", "joint2_left"],
+            "topic": "/arm_position_controller/commands",
+        },
+        {
+            "name": "gripper",
+            "joint_names": ["joint6_left"],
+            "topic": "/gripper_position_controller/commands",
+        },
+    ]
+
+
+def test_dual_arm_legacy_targets_keep_topics_and_joint_order(tmp_path):
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_dual_arm.yaml"
+    robot_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
+    calibration = tmp_path / "leader.json"
+    calibration.write_text("{}\n", encoding="utf-8")
+    for device in robot_config["teleoperation"]["devices"]:
+        device["calib_file"] = str(calibration)
+
+    nodes = generate_teleop_nodes(robot_config)
+
+    assert len(nodes) == 2
+    expected = [
+        (
+            ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left"],
+            ["joint6_left"],
+            "/arm_position_controller_left/commands",
+            "/gripper_position_controller_left/commands",
+        ),
+        (
+            ["joint1_right", "joint2_right", "joint3_right", "joint4_right", "joint5_right"],
+            ["joint6_right"],
+            "/arm_position_controller_right/commands",
+            "/gripper_position_controller_right/commands",
+        ),
+    ]
+    for node, (arm_joints, gripper_joints, arm_topic, gripper_topic) in zip(nodes, expected, strict=True):
+        params = _node_parameters(node)
+        assert params["arm_joint_names"] == arm_joints
+        assert params["gripper_joint_names"] == gripper_joints
+        assert params["arm_command_topic"] == arm_topic
+        assert params["gripper_command_topic"] == gripper_topic
+        assert json.loads(params["publish_groups"].strip("'")) == [
+            {"name": "arm", "joint_names": arm_joints, "topic": arm_topic},
+            {"name": "gripper", "joint_names": gripper_joints, "topic": gripper_topic},
+        ]
+
+
+def test_generate_auxiliary_aero_hand_node_uses_configured_topics_and_rates():
+    joint_names = [f"hand_{index}" for index in range(7)]
+    nodes = generate_auxiliary_actuator_nodes(
+        {
+            "teleoperation": {"safety": {"joint_limits": _joint_limits(joint_names)}},
+            "auxiliary_actuators": [
+                {
+                    "name": "aero_hand_right",
+                    "type": "aero_hand",
+                    "mock": True,
+                    "joint_names": joint_names,
+                    "command_topic": "/aero_hand_right/commands",
+                    "joint_state_topic": "/aero_hand_right/joint_states",
+                    "command_frequency": 50.0,
+                    "state_frequency": 20.0,
+                }
+            ],
+        }
+    )
+
+    assert len(nodes) == 1
+    params = _node_parameters(nodes[0])
+    assert params["mock"] is True
+    assert params["joint_names"] == joint_names
+    assert params["command_topic"] == "/aero_hand_right/commands"
+    assert params["joint_state_topic"] == "/aero_hand_right/joint_states"
+    assert params["command_frequency"] == 50.0
+    assert params["state_frequency"] == 20.0
+    assert params["command_lower_limits"] == [-1.0] * 7
+    assert params["command_upper_limits"] == [1.0] * 7
+    assert params["estop_topic"] == "/emergency_stop"
+    assert params["estop_behavior"] == "hold"
+    assert "safe_pose" not in params
+
+
+def test_generate_auxiliary_aero_hand_safe_pose_contract():
+    safe_pose = [0.1 * index for index in range(7)]
+    nodes = generate_auxiliary_actuator_nodes(
+        {
+            "auxiliary_actuators": {
+                "aero_hand_right": {
+                    "type": "aero_hand",
+                    "mock": True,
+                    "joint_names": [f"hand_{index}" for index in range(7)],
+                    "command_topic": "/aero_hand_right/commands",
+                    "joint_state_topic": "/aero_hand_right/joint_states",
+                    "estop_topic": "/safety/stop",
+                    "estop_behavior": "safe_pose",
+                    "safe_pose": safe_pose,
+                }
+            }
+        }
+    )
+
+    params = _node_parameters(nodes[0])
+    assert params["estop_topic"] == "/safety/stop"
+    assert params["estop_behavior"] == "safe_pose"
+    assert params["safe_pose"] == safe_pose
+
+
+def test_generate_auxiliary_actuator_resolves_port_environment(monkeypatch):
+    monkeypatch.setenv("AERO_HAND_RIGHT_PORT", "/dev/aero-right")
+    joint_names = [f"hand_{index}" for index in range(7)]
+    nodes = generate_auxiliary_actuator_nodes(
+        {
+            "teleoperation": {"safety": {"joint_limits": _joint_limits(joint_names)}},
+            "auxiliary_actuators": {
+                "aero_hand_right": {
+                    "type": "aero_hand",
+                    "mock": False,
+                    "port": "$(env AERO_HAND_RIGHT_PORT)",
+                    "joint_names": joint_names,
+                    "command_topic": "/hand/commands",
+                    "joint_state_topic": "/hand/joint_states",
+                }
+            },
+        }
+    )
+
+    assert _node_parameters(nodes[0])["port"] == "/dev/aero-right"
+
+
+def test_auxiliary_aero_hands_reject_duplicate_real_serial_ports():
+    joint_names = [f"hand_{index}" for index in range(7)]
+    config = {
+        "teleoperation": {
+            "safety": {
+                "joint_limits": _joint_limits(
+                    [f"{joint}_{side}" for side in ("left", "right") for joint in joint_names]
+                )
+            }
+        },
+        "auxiliary_actuators": [
+            {
+                "name": side,
+                "type": "aero_hand",
+                "mock": False,
+                "port": "/dev/aero",
+                "joint_names": [f"{joint}_{side}" for joint in joint_names],
+                "command_topic": f"/{side}/commands",
+                "joint_state_topic": f"/{side}/joint_states",
+            }
+            for side in ("left", "right")
+        ],
+    }
+
+    with pytest.raises(ValueError, match="serial port is used more than once"):
+        generate_auxiliary_actuator_nodes(config)
+
+
+def test_real_auxiliary_aero_hand_requires_hardware_boundary_limits():
+    with pytest.raises(ValueError, match="requires safety joint_limits"):
+        generate_auxiliary_actuator_nodes(
+            {
+                "auxiliary_actuators": {
+                    "aero_hand_right": {
+                        "type": "aero_hand",
+                        "mock": False,
+                        "port": "/dev/aero-right",
+                        "joint_names": [f"hand_{index}" for index in range(7)],
+                        "command_topic": "/hand/commands",
+                        "joint_state_topic": "/hand/joint_states",
+                    }
+                }
+            }
+        )
+
+
+def test_runtime_resources_reject_ros2_control_and_auxiliary_port_conflict():
+    config = {
+        "ros2_control": {"port": "/dev/robot"},
+        "auxiliary_actuators": {
+            "hand": {
+                "type": "aero_hand",
+                "mock": False,
+                "port": "/dev/robot",
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"/dev/robot: ros2_control, auxiliary_actuators.hand"):
+        validate_runtime_resources(config)
+
+
+def test_runtime_resources_reject_multiple_real_mhandpro_sdk_owners():
+    config = {
+        "hand_sources": {
+            "left": {"type": "mhandpro", "mock": False, "sides": ["left"]},
+            "right": {"type": "mhandpro", "mock": False, "sides": ["right"]},
+        }
+    }
+
+    with pytest.raises(ValueError, match=r"mhandpro_sdk: hand_sources.left, hand_sources.right"):
+        validate_runtime_resources(config)
+
+
+def test_runtime_resources_allow_one_shared_mhandpro_and_disjoint_serial_ports():
+    validate_runtime_resources(
+        {
+            "ros2_control": {"port": "/dev/follower"},
+            "teleoperation": {
+                "enabled": True,
+                "active_devices": ["leader", "glove"],
+                "devices": [
+                    {"name": "leader", "type": "leader_arm", "port": "/dev/leader"},
+                    {"name": "glove", "type": "hand_retarget"},
+                ],
+            },
+            "auxiliary_actuators": {"hand": {"type": "aero_hand", "mock": False, "port": "/dev/aero"}},
+            "hand_sources": {"mhandpro": {"type": "mhandpro", "mock": False, "sides": ["left", "right"]}},
+        }
+    )
+
+
+def test_simulation_skips_real_external_hand_components(monkeypatch):
+    monkeypatch.delenv("AERO_HAND_RIGHT_PORT", raising=False)
+    monkeypatch.delenv("MHANDPRO_SDK_LIB", raising=False)
+    config = {
+        "auxiliary_actuators": {
+            "hand": {
+                "type": "aero_hand",
+                "mock": False,
+                "port": "$(env AERO_HAND_RIGHT_PORT)",
+                "joint_names": _HAND_JOINTS,
+                "command_topic": "/hand/commands",
+                "joint_state_topic": "/hand/joint_states",
+            }
+        },
+        "hand_sources": {
+            "mhandpro": {
+                "type": "mhandpro",
+                "mock": False,
+                "lib_path": "$(env MHANDPRO_SDK_LIB)",
+            }
+        },
+    }
+
+    validate_runtime_resources(config, use_sim=True, control_mode="teleop")
+    assert generate_auxiliary_actuator_nodes(config, use_sim=True, control_mode="teleop") == []
+    assert generate_hand_source_nodes(config, use_sim=True, control_mode="teleop") == []
+
+
+def test_external_hand_components_respect_active_control_modes():
+    config = {
+        "auxiliary_actuators": {
+            "hand": {
+                "type": "aero_hand",
+                "mock": True,
+                "active_control_modes": ["teleop"],
+                "joint_names": _HAND_JOINTS,
+                "command_topic": "/hand/commands",
+                "joint_state_topic": "/hand/joint_states",
+            }
+        },
+        "hand_sources": {
+            "mhandpro": {
+                "type": "mhandpro",
+                "mock": True,
+                "active_control_modes": ["teleop"],
+            }
+        },
+    }
+
+    assert generate_auxiliary_actuator_nodes(config, control_mode="model_inference") == []
+    assert generate_hand_source_nodes(config, control_mode="model_inference") == []
+    assert len(generate_auxiliary_actuator_nodes(config, use_sim=True, control_mode="teleop")) == 1
+    assert len(generate_hand_source_nodes(config, use_sim=True, control_mode="teleop")) == 1
+
+
+def test_generate_generic_three_channel_auxiliary_actuator():
+    nodes = generate_auxiliary_actuator_nodes(
+        {
+            "auxiliary_actuators": {
+                "amazing_hand_right": {
+                    "type": "amazing_hand",
+                    "mock": True,
+                    "driver": {"package": "amazing_hand_hardware", "executable": "amazing_hand_node"},
+                    "joint_names": ["thumb", "index", "middle"],
+                    "command_topic": "/amazing_hand_right/commands",
+                    "joint_state_topic": "/amazing_hand_right/joint_states",
+                    "parameters": {"device_id": "right"},
+                }
+            }
+        }
+    )
+
+    assert len(nodes) == 1
+    assert nodes[0].node_package == "amazing_hand_hardware"
+    assert nodes[0].node_executable == "amazing_hand_node"
+    params = _node_parameters(nodes[0])
+    assert params["joint_names"] == ["thumb", "index", "middle"]
+    assert params["device_id"] == "right"
+
+
+def test_required_auxiliary_process_exits_shutdown_launch():
+    nodes = generate_auxiliary_actuator_nodes(
+        {
+            "auxiliary_actuators": {
+                "hand": {
+                    "type": "aero_hand",
+                    "mock": True,
+                    "driver": {"package": "aero_hand_hardware", "executable": "aero_hand_node"},
+                    "joint_names": _HAND_JOINTS,
+                    "command_topic": "/hand/commands",
+                    "joint_state_topic": "/hand/joint_states",
+                }
+            }
+        }
+    )
+
+    assert nodes[0]._ExecuteLocal__on_exit is not None
+
+
+def test_required_teleop_process_exits_shutdown_launch():
+    nodes = generate_teleop_nodes(
+        {
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "leader",
+                "devices": [
+                    {
+                        "name": "leader",
+                        "type": "leader_arm",
+                        "port": "/dev/leader",
+                        "target": {"arm_joint_names": ["1"], "gripper_joint_names": ["6"]},
+                    }
+                ],
+            },
+            "joints": {"arm": ["1"], "gripper": ["6"]},
+            "safety": {"joint_limits": _joint_limits(["1", "6"])},
+        },
+        {},
+    )
+
+    assert nodes[0]._ExecuteLocal__on_exit is not None
+
+
+def test_generate_mock_mhandpro_source_for_both_sides():
+    nodes = generate_hand_source_nodes(
+        {
+            "hand_sources": {
+                "mhandpro": {
+                    "type": "mhandpro",
+                    "mock": True,
+                    "sides": ["left", "right"],
+                    "topic_prefix": "/hands/mhandpro",
+                }
+            }
+        }
+    )
+
+    assert len(nodes) == 1
+    assert nodes[0].node_package == "robot_teleop"
+    assert nodes[0].node_executable == "mhandpro_source_node"
+    params = _node_parameters(nodes[0])
+    assert params["sides"] == ["left", "right"]
+    assert params["topic_prefix"] == "/hands/mhandpro"
+    assert params["mock"] is True
+    assert params["publish_raw_frame"] is False
+    assert params["calibrate_p_pose_on_startup"] is False
+    assert params["failure_policy"] == "require_all"
+    assert params["auto_reconnect"] is True
+    assert params["reconnect_initial_delay"] == 1.0
+    assert params["reconnect_max_delay"] == 10.0
+    assert params["reconnect_max_attempts"] == 0
+    assert nodes[0]._ExecuteLocal__on_exit is None
+
+
+def test_real_mhandpro_source_exits_shutdown_launch(tmp_path):
+    library = tmp_path / "libVDMocapSDK_mHandPro.so"
+    library.touch()
+    nodes = generate_hand_source_nodes(
+        {
+            "hand_sources": {
+                "mhandpro": {
+                    "type": "mhandpro",
+                    "mock": False,
+                    "lib_path": str(library),
+                }
+            }
+        }
+    )
+
+    assert nodes[0]._ExecuteLocal__on_exit is not None
+
+
+def test_mhandpro_raw_frame_publication_requires_explicit_opt_in():
+    nodes = generate_hand_source_nodes(
+        {
+            "hand_sources": {
+                "mhandpro": {
+                    "type": "mhandpro",
+                    "mock": True,
+                    "publish_raw_frame": True,
+                }
+            }
+        }
+    )
+
+    assert _node_parameters(nodes[0])["publish_raw_frame"] is True
+
+
+def test_interactive_startup_p_pose_prompts_and_enables_in_process_calibration(monkeypatch, tmp_path):
+    library = tmp_path / "libVDMocapSDK_mHandPro.so"
+    library.touch()
+    config = {
+        "hand_sources": {
+            "mhandpro": {
+                "type": "mhandpro",
+                "mock": False,
+                "lib_path": str(library),
+                "sides": ["right"],
+                "require_p_pose": True,
+                "startup_p_pose": "interactive",
+            }
+        }
+    }
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt))
+
+    confirm_interactive_startup_p_pose(config, use_sim=False, control_mode="teleop")
+    nodes = generate_hand_source_nodes(config, use_sim=False, control_mode="teleop")
+
+    assert len(prompts) == 1
+    assert "P-pose" in prompts[0]
+    assert _node_parameters(nodes[0])["calibrate_p_pose_on_startup"] is True
+
+
+def test_interactive_startup_p_pose_requires_foreground_terminal(monkeypatch, tmp_path):
+    library = tmp_path / "libVDMocapSDK_mHandPro.so"
+    library.touch()
+    config = {
+        "hand_sources": {
+            "mhandpro": {
+                "type": "mhandpro",
+                "mock": False,
+                "lib_path": str(library),
+                "startup_p_pose": "interactive",
+            }
+        }
+    }
+    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(EOFError))
+
+    with pytest.raises(RuntimeError, match="requires a terminal"):
+        confirm_interactive_startup_p_pose(config, use_sim=False, control_mode="teleop")
+
+
+def test_unknown_startup_p_pose_mode_is_rejected():
+    with pytest.raises(ValueError, match="startup_p_pose"):
+        generate_hand_source_nodes(
+            {
+                "hand_sources": {
+                    "mhandpro": {
+                        "type": "mhandpro",
+                        "mock": True,
+                        "startup_p_pose": "automatic",
+                    }
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "sides", "actuator_count", "device_count"),
+    [
+        ("right", ["right"], 1, 1),
+        ("left", ["left"], 1, 1),
+        ("dual", ["left", "right"], 2, 2),
+    ],
+)
+def test_hand_profile_selects_sides_actuators_and_devices(profile, sides, actuator_count, device_count):
+    config = {
+        "joints": {"hand": []},
+        "hand_profiles": {
+            "default_profile": "right",
+            "profiles": {
+                "right": {
+                    "sides": ["right"],
+                    "hand_source": "mhandpro",
+                    "active_actuators": ["aero_hand_right"],
+                    "active_devices": ["aero_glove_right"],
+                },
+                "left": {
+                    "sides": ["left"],
+                    "hand_source": "mhandpro",
+                    "active_actuators": ["aero_hand_left"],
+                    "active_devices": ["aero_glove_left"],
+                },
+                "dual": {
+                    "sides": ["left", "right"],
+                    "hand_source": "mhandpro",
+                    "active_actuators": ["aero_hand_left", "aero_hand_right"],
+                    "active_devices": ["aero_glove_left", "aero_glove_right"],
+                },
+            },
+        },
+        "hand_sources": {"mhandpro": {"type": "mhandpro", "mock": True}},
+        "auxiliary_actuators": {
+            "aero_hand_left": {
+                "profile_managed": True,
+                "enabled": False,
+                "joint_names": [f"left_{index}" for index in range(7)],
+            },
+            "aero_hand_right": {
+                "profile_managed": True,
+                "enabled": False,
+                "joint_names": [f"right_{index}" for index in range(7)],
+            },
+        },
+        "teleoperation": {
+            "devices": [{"name": "aero_glove_left"}, {"name": "aero_glove_right"}],
+        },
+    }
+
+    assert apply_hand_profile(config, profile) == profile
+    assert config["hand_sources"]["mhandpro"]["sides"] == sides
+    assert sum(item["enabled"] for item in config["auxiliary_actuators"].values()) == actuator_count
+    assert len(config["teleoperation"]["active_devices"]) == device_count
+    assert len(config["joints"]["hand"]) == actuator_count * 7
+
+
+def test_hand_profile_defaults_to_robot_yaml_selection():
+    config = {
+        "joints": {"hand": []},
+        "hand_profiles": {
+            "default_profile": "right",
+            "profiles": {
+                "right": {
+                    "sides": ["right"],
+                    "hand_source": "mhandpro",
+                    "active_actuators": ["aero_hand_right"],
+                    "active_devices": ["aero_glove_right"],
+                }
+            },
+        },
+        "hand_sources": {"mhandpro": {}},
+        "auxiliary_actuators": {
+            "aero_hand_right": {
+                "profile_managed": True,
+                "enabled": False,
+                "joint_names": [f"right_{index}" for index in range(7)],
+            }
+        },
+        "teleoperation": {"devices": [{"name": "aero_glove_right"}]},
+    }
+
+    assert apply_hand_profile(config) == "right"
+    assert config["teleoperation"]["active_devices"] == ["aero_glove_right"]
+
+
+def test_unknown_hand_profile_is_rejected():
+    config = {"hand_profiles": {"default_profile": "right", "profiles": {"right": {}}}}
+
+    with pytest.raises(ValueError, match="unknown hand_profile"):
+        apply_hand_profile(config, "triple")
+
+
+def test_mhandpro_source_rejects_unknown_dual_hand_failure_policy():
+    with pytest.raises(ValueError, match="failure_policy"):
+        generate_hand_source_nodes(
+            {
+                "hand_sources": {
+                    "mhandpro": {
+                        "type": "mhandpro",
+                        "mock": True,
+                        "sides": ["left", "right"],
+                        "failure_policy": "ignore_missing",
+                    }
+                }
+            }
+        )
+
+
+def test_real_mhandpro_source_resolves_external_library(tmp_path, monkeypatch):
+    library = tmp_path / "libVDMocapSDK_mHandPro.so"
+    library.touch()
+    monkeypatch.setenv("MHANDPRO_SDK_LIB", str(library))
+
+    nodes = generate_hand_source_nodes(
+        {
+            "hand_sources": {
+                "mhandpro": {
+                    "type": "mhandpro",
+                    "mock": False,
+                    "lib_path": "$(env MHANDPRO_SDK_LIB)",
+                }
+            }
+        }
+    )
+
+    assert _node_parameters(nodes[0])["lib_path"] == str(library)
+
+
+def test_real_mhandpro_source_requires_external_library_when_environment_is_unset(monkeypatch):
+    monkeypatch.delenv("MHANDPRO_SDK_LIB", raising=False)
+
+    with pytest.raises(RuntimeError, match="external vendor library"):
+        generate_hand_source_nodes(
+            {
+                "hand_sources": {
+                    "mhandpro": {
+                        "type": "mhandpro",
+                        "mock": False,
+                        "lib_path": "$(env MHANDPRO_SDK_LIB)",
+                    }
+                }
+            }
+        )
+
+
+def test_hand_retarget_resolves_output_contract_from_auxiliary_actuator():
+    joints = ["thumb", "index", "middle"]
+    nodes = generate_teleop_nodes(
+        {
+            "joints": {"arm": ["1"], "gripper": ["6"]},
+            "auxiliary_actuators": {
+                "amazing_hand_right": {
+                    "type": "amazing_hand",
+                    "mock": True,
+                    "driver": {"package": "amazing_hand_hardware", "executable": "amazing_hand_node"},
+                    "joint_names": joints,
+                    "command_topic": "/amazing_hand_right/commands",
+                    "joint_state_topic": "/amazing_hand_right/joint_states",
+                }
+            },
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "amazing_retarget",
+                "safety": {"joint_limits": _joint_limits(joints)},
+                "devices": [
+                    {
+                        "name": "amazing_retarget",
+                        "type": "hand_retarget",
+                        "side": "right",
+                        "source_topic": "/hand_sources/mhandpro/right/state",
+                        "retargeter": {
+                            "type": "synergy_matrix",
+                            "input_features": ["index_mcp_flex"],
+                            "matrix": [[1.0], [1.0], [1.0]],
+                        },
+                        "target": {"actuator": "amazing_hand_right"},
+                    }
+                ],
+            },
+        }
+    )
+
+    params = _node_parameters(nodes[0])
+    assert json.loads(params["publish_groups"].strip("'")) == [
+        {"name": "hand", "joint_names": joints, "topic": "/amazing_hand_right/commands"}
+    ]
+    device_config = json.loads(params["device_config"].strip("'"))
+    assert device_config["joint_names"] == joints
+
+
+def test_phone_placo_uses_explicit_arm_group_topic():
+    nodes = generate_teleop_nodes(
+        {
+            "joints": {"arm": ["1", "2"], "gripper": ["6"]},
+            "moveit": {
+                "base_link": "base",
+                "ee_link": "gripper",
+                "so101_placo_servo_config_path": "$(find robot_moveit)/config/so101_placo_servo.yaml",
+            },
+            "ros2_control": {"reset_positions": {"1": 0.0, "2": 0.0}},
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "phone",
+                "cartesian": {"solver": "placo_servo"},
+                "safety": {"joint_limits": _joint_limits(["1", "2", "6"])},
+                "devices": [
+                    {
+                        "name": "phone",
+                        "type": "phone",
+                        "phone_config": {
+                            "backend": "webphone",
+                            "end_effector_bounds": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5]},
+                        },
+                        "target": {
+                            "publish_groups": [
+                                {"name": "arm", "joint_names": ["1", "2"], "topic": "/custom/arm"},
+                                {"name": "gripper", "joint_names": ["6"], "topic": "/custom/gripper"},
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    teleop_params = _node_parameters(nodes[0])
+    device_config = json.loads(teleop_params["device_config"].strip("'"))
+    placo = device_config["cartesian_backend_config"]
+    assert placo["command_lease_topic"] == "/so101_placo_servo_node/command_lease"
+    placo_node = next(node for node in nodes if _text(node.node_executable) == "so101_placo_servo_node.py")
+    assert _node_parameters(placo_node)["command_out_topic"] == "/custom/arm"
+
+
+def test_synergy_hand_retarget_does_not_require_aero_calibration():
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_device": "amazing",
+            "safety": {"joint_limits": _joint_limits(["thumb", "index", "middle"])},
+            "devices": [
+                {
+                    "name": "amazing",
+                    "type": "hand_retarget",
+                    "side": "right",
+                    "source_topic": "/hands/right/state",
+                    "retargeter": {
+                        "type": "synergy_matrix",
+                        "input_features": ["index_mcp_flex"],
+                        "matrix": [[1.0], [1.0], [1.0]],
+                    },
+                    "target": {
+                        "publish_groups": [
+                            {
+                                "name": "hand",
+                                "joint_names": ["thumb", "index", "middle"],
+                                "topic": "/amazing/commands",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    )
+
+    assert errors == []
+
+
+def test_active_devices_allow_disjoint_arm_and_hand_topics():
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_devices": ["leader", "glove"],
+            "safety": {"joint_limits": _joint_limits(["1", *_HAND_JOINTS])},
+            "devices": [
+                {"name": "leader", "type": "leader_arm", "port": "/dev/leader"},
+                {
+                    "name": "glove",
+                    "type": "hand_retarget",
+                    "side": "right",
+                    "source_topic": "/hands/right/state",
+                    "retargeter": {
+                        "type": "synergy_matrix",
+                        "input_features": ["index_mcp_flex"],
+                        "matrix": [[1.0]] * 7,
+                    },
+                    "target": {
+                        "publish_groups": [
+                            {"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}
+                        ]
+                    },
+                },
+            ],
+        }
+    )
+
+    assert errors == []
+
+
+def test_vr_and_glove_allow_disjoint_command_topics():
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_devices": ["vr", "glove"],
+            "safety": {"joint_limits": _joint_limits(_HAND_JOINTS)},
+            "devices": [
+                {"name": "vr", "type": "vr_teleop", "vr_config": {"output_profile": "so101"}},
+                {
+                    "name": "glove",
+                    "type": "hand_retarget",
+                    "side": "right",
+                    "source_topic": "/hands/right/state",
+                    "retargeter": {
+                        "type": "synergy_matrix",
+                        "input_features": ["index_mcp_flex"],
+                        "matrix": [[1.0]] * 7,
+                    },
+                    "target": {
+                        "publish_groups": [
+                            {"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}
+                        ]
+                    },
+                },
+            ],
+        }
+    )
+
+    assert errors == []
+
+
+def test_two_gloves_reject_shared_aero_hand_topic():
+    devices = []
+    for name in ("first", "second"):
+        devices.append(
+            {
+                "name": name,
+                "type": "hand_retarget",
+                "side": "right",
+                "source_topic": f"/hands/{name}/state",
+                "retargeter": {
+                    "type": "synergy_matrix",
+                    "input_features": ["index_mcp_flex"],
+                    "matrix": [[1.0]] * 7,
+                },
+                "target": {
+                    "publish_groups": [{"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}]
+                },
+            }
+        )
+
+    errors = validate_teleop_config({"enabled": True, "active_devices": ["first", "second"], "devices": devices})
+
+    assert any("share command topic" in error for error in errors)
+
+
+def test_hand_retarget_requires_explicit_publish_group():
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_device": "glove",
+            "devices": [
+                {
+                    "name": "glove",
+                    "type": "hand_retarget",
+                    "side": "right",
+                    "source_topic": "/hands/right/state",
+                    "retargeter": {
+                        "type": "synergy_matrix",
+                        "input_features": ["index_mcp_flex"],
+                        "matrix": [[1.0]] * 7,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert any("requires explicit target.publish_groups" in error for error in errors)
+
+
+def test_vr_rejects_target_override_that_does_not_match_its_builder():
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_device": "vr",
+            "devices": [
+                {
+                    "name": "vr",
+                    "type": "vr_teleop",
+                    "vr_config": {"output_profile": "so101"},
+                    "target": {
+                        "publish_groups": [{"name": "other", "joint_names": ["1"], "topic": "/not_the_vr_output"}]
+                    },
+                }
+            ],
+        }
+    )
+
+    assert any("vr_teleop uses vr_config outputs" in error for error in errors)
+
+
+@pytest.mark.parametrize("second_type", ["leader_arm", "phone", "xbox_controller"])
+def test_active_arm_devices_reject_shared_command_topics(second_type):
+    second = {"name": "second", "type": second_type}
+    if second_type == "leader_arm":
+        second["port"] = "/dev/leader2"
+    if second_type == "phone":
+        second["phone_config"] = {"phone_os": "android"}
+
+    errors = validate_teleop_config(
+        {
+            "enabled": True,
+            "active_devices": ["leader", "second"],
+            "safety": {"joint_limits": _joint_limits(["1"])},
+            "devices": [
+                {"name": "leader", "type": "leader_arm", "port": "/dev/leader"},
+                second,
+            ],
+        }
+    )
+
+    assert any("share arm command topic" in error for error in errors)
 
 
 def test_generate_joy_teleop_nodes_for_mobile_base():

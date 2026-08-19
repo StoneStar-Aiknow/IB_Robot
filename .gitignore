@@ -38,3 +38,7 @@ docs/superpowers/
 
 # Runtime artifacts
 /outputs/
+
+# Machine-local real-hardware paths
+/.aero_hand_teleop.env
+third_party/vendor/**/*.so

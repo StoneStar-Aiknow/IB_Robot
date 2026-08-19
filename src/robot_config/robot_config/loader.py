@@ -72,12 +72,47 @@ _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES = {
 _SPEECH_DIRECTION_OVERRIDE_NAMES = {"input_source", "mount_yaw_deg", "wav_path", "wav_replay_rate"}
 
 
-def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Merge a mode overlay without sharing mutable values with the source YAML."""
+def _deep_merge_config(
+    base: dict[str, Any],
+    overlay: dict[str, Any],
+    *,
+    allow_list_append: bool = False,
+    strict_container_types: bool = False,
+    _path: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Merge an overlay without sharing mutable values with the source YAML.
+
+    Robot overlays may opt into explicit list append and strict container-type
+    checks. Other users retain the historical recursive merge behavior.
+    """
     result = copy.deepcopy(base)
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _deep_merge_config(result[key], value)
+        current_path = (*_path, str(key))
+        existing = result.get(key)
+        if allow_list_append and isinstance(value, dict) and "__append__" in value:
+            if set(value) != {"__append__"} or not isinstance(value["__append__"], list):
+                raise ValueError(f"overlay append for {key!r} must contain only a list-valued __append__ key")
+            if not isinstance(existing, list):
+                raise ValueError(f"overlay append for {key!r} requires a list in the base configuration")
+            result[key] = copy.deepcopy(existing) + copy.deepcopy(value["__append__"])
+            continue
+        if strict_container_types and key in result and value is not None:
+            existing_is_container = isinstance(existing, dict | list)
+            value_is_container = isinstance(value, dict | list)
+            if (existing_is_container or value_is_container) and type(existing) is not type(value):
+                path = ".".join(current_path)
+                raise ValueError(
+                    f"overlay type mismatch at {path}: cannot replace {type(existing).__name__} "
+                    f"with {type(value).__name__}"
+                )
+        if isinstance(value, dict) and isinstance(existing, dict):
+            result[key] = _deep_merge_config(
+                existing,
+                value,
+                allow_list_append=allow_list_append,
+                strict_container_types=strict_container_types,
+                _path=current_path,
+            )
         else:
             result[key] = copy.deepcopy(value)
     return result
@@ -1087,8 +1122,18 @@ def _validate_skill_capability(
         errors.append(f"{prefix}.recovery_policy must be one of {sorted(_VALID_RECOVERY_POLICIES)}")
 
 
-def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
-    """Load the raw ``robot`` section from a robot_config YAML file."""
+def _load_robot_section_with_sources(
+    config_path: str | Path,
+    *,
+    _include_stack: tuple[Path, ...] = (),
+) -> tuple[Path, dict[str, Any], tuple[Path, ...]]:
+    """Load a robot section and return its ordered configuration source chain.
+
+    A robot overlay is intentionally a normal YAML file with a small explicit
+    inheritance mechanism.  The resolved document remains a single mapping for
+    all existing validators and launch builders, while the source file no
+    longer needs to duplicate the complete SO-101 configuration.
+    """
     resolved_config_path = Path(config_path).expanduser().resolve()
 
     if not resolved_config_path.exists():
@@ -1107,10 +1152,47 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     if not isinstance(robot_data, dict):
         raise ValueError(f"Invalid robot config: 'robot' section must be a mapping in {resolved_config_path}")
 
+    base_ref = robot_data.pop("base_config", None)
+    if base_ref is not None:
+        if not isinstance(base_ref, str) or not base_ref.strip():
+            raise ValueError(f"Invalid robot config: base_config must be a non-empty string in {resolved_config_path}")
+        if resolved_config_path in _include_stack:
+            chain = " -> ".join(str(path) for path in (*_include_stack, resolved_config_path))
+            raise ValueError(f"Robot config base_config cycle detected: {chain}")
+        base_path = Path(base_ref).expanduser()
+        if not base_path.is_absolute():
+            base_path = resolved_config_path.parent / base_path
+        if base_path.suffix == "":
+            base_path = base_path.with_suffix(".yaml")
+        base_path = base_path.resolve()
+        if base_path.parent != resolved_config_path.parent:
+            raise ValueError(
+                f"Invalid robot config: base_config must reference a sibling robot YAML in {resolved_config_path}"
+            )
+        _, base_data, base_sources = _load_robot_section_with_sources(
+            base_path,
+            _include_stack=(*_include_stack, resolved_config_path),
+        )
+        robot_data = _deep_merge_config(
+            base_data,
+            robot_data,
+            allow_list_append=True,
+            strict_container_types=True,
+            _path=("robot",),
+        )
+    else:
+        base_sources = ()
+
     name = robot_data.get("name")
     if not name:
         raise ValueError(f"Invalid robot config: missing 'name' in {resolved_config_path}")
 
+    return resolved_config_path, robot_data, (*base_sources, resolved_config_path)
+
+
+def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
+    """Load the resolved robot section while preserving the historical helper contract."""
+    resolved_config_path, robot_data, _ = _load_robot_section_with_sources(config_path)
     return resolved_config_path, robot_data
 
 
@@ -1459,7 +1541,9 @@ def load_robot_config_dict(
     the full YAML schema under ``robot`` and annotates the resolved source path for
     downstream users that need provenance.
     """
-    resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
+    resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(
+        resolve_robot_config_path(config_path=config_path)
+    )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
     mount_file = robot_config.get("mid360_mount_file")
     if mount_file:
@@ -1493,6 +1577,7 @@ def load_robot_config_dict(
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
+    robot_config["_config_sources"] = [str(path) for path in config_sources]
     return robot_config
 
 
