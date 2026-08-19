@@ -15,9 +15,7 @@ from onnx import TensorProto, helper, numpy_helper
 from model_utils.pi05_export.quant import w8a8_common
 from model_utils.pi05_export.quant.quantize_vlm import (
     _resize_calibration_images,
-    _resolve_disable_regexes,
     build_arg_parser,
-    validate_unfused_geglu_route,
 )
 from model_utils.pi05_export.verify_pi05_split_equivalence import load_real_batches_raw, preprocess_real_batches
 
@@ -474,12 +472,9 @@ def test_quantize_regex_rejects_no_matches():
         w8a8_common.restrict_quantizable_nodes([("/layers.0/mlp/MatMul", "MatMul")], [], [r"/missing/"])
 
 
-def test_unfused_geglu_route_removes_only_builtin_projection_exclusion():
-    fallback = _resolve_disable_regexes(None, unfused_geglu=True)
-
-    assert not any("gate_proj" in pattern for pattern in fallback)
-    assert r"self_attn/MatMul(_\d+)?$" in fallback
-    assert _resolve_disable_regexes(["custom"], unfused_geglu=True) == ["custom"]
+def test_unfused_geglu_deployment_option_is_removed():
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--unfused-geglu-deployment"])
 
 
 def test_restore_opset_imports_preserves_custom_domains():
@@ -704,19 +699,3 @@ def test_npu_geglu_deployment_enforces_expected_site_count():
     assert w8a8_common.validate_npu_geglu_deployment(npu, expected=1) == ["/layers.0/mlp/MatMul"]
     with pytest.raises(RuntimeError, match="1 NPUGeglu nodes, expected 2"):
         w8a8_common.validate_npu_geglu_deployment(npu, expected=2)
-
-
-def test_unfused_geglu_route_matches_separate_projections():
-    gate_weight = numpy_helper.from_array(np.ones((2, 4), dtype=np.float16), name="gate_weight")
-    up_weight = numpy_helper.from_array(np.ones((2, 4), dtype=np.float16), name="up_weight")
-    nodes = [
-        helper.make_node("MatMul", ["x", gate_weight.name], ["gate"], name="/layers.0/mlp/gate_proj/MatMul"),
-        helper.make_node("MatMul", ["x", up_weight.name], ["up"], name="/layers.0/mlp/up_proj/MatMul"),
-    ]
-    donor = helper.make_model(helper.make_graph(nodes, "donor", [], [], [gate_weight, up_weight]))
-    npu = helper.make_model(helper.make_graph(nodes, "npu", [], [], [gate_weight, up_weight]))
-
-    assert validate_unfused_geglu_route(donor, npu) == [
-        "/layers.0/mlp/gate_proj/MatMul",
-        "/layers.0/mlp/up_proj/MatMul",
-    ]

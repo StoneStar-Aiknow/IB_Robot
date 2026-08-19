@@ -373,12 +373,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fused-geglu-donor",
         action="store_true",
-        help="Require a Route-A donor whose fused Gemma MLP MatMuls match every NPUGeglu producer.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--require-npu-geglu",
         action="store_true",
-        help="Require the Route-A NPU deployment graph to contain valid NPUGeglu sites.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--expected-npu-geglu-nodes", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--expected-calibration-steps", type=int, default=None, help=argparse.SUPPRESS)

@@ -503,9 +503,9 @@ Registry 还要求每个 family/backend 声明 `ConformanceEvidence`；仅列出
 camera-major prefix。该优化不改变外部 VLM ABI：runtime bindings、逐相机 observation semantic、
 raw image shape 和 ROS camera topic 契约保持不变。
 
-NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。只有显式导出参数
-`--fast-gelu` 才以近似 `NPUFastGelu` 覆盖该路径；它可能降低动作精度，必须针对既有 baseline
-验证。
+NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。显式参数
+`--fast-gelu-scope vision|vlm-text|ae|all` 可将近似 `NPUFastGelu` 限制到指定模型区域；旧参数
+`--fast-gelu` 等价于全局 `all`。近似路径可能降低动作精度，必须针对既有 baseline 验证。
 
 新 Action Expert OM 的 runtime output 名为 `velocity` 或 `v_t`，Manifest 仍将其映射为策略
 semantic `action`。Ascend backend 从选中 deployment 的 `denoising_schedule` artifact 读取严格

@@ -49,7 +49,9 @@ def _write_policy(policy: Path, model: bytes = b"weights") -> None:
 def test_q40_profile_has_exact_validated_scope():
     profile = bundled_quantization_profiles()["pi05-q40-v1"]
 
-    assert profile.digest == "8afca52b7fd7e5774f8049c81caa98bba9f6980af949f742c498797095daae36"
+    assert profile.digest == "774dbb7dc5750b0decc3becee337b16e365049d7c7bdd68123c1aa7b07c234ac"
+    assert profile.fast_gelu_scope == "none"
+    assert profile.export_dtype == "fp16"
     assert profile.vlm.enabled
     assert not profile.action_expert.enabled
     assert sum(selector.expected for selector in profile.vlm.selectors) == 136
@@ -62,6 +64,7 @@ def test_q40_profile_has_exact_validated_scope():
 def test_ae_attention_profile_requires_complete_trajectory():
     profile = bundled_quantization_profiles()["pi05-ae-attn-v1"]
 
+    assert profile.digest == "611bb55460e2a0cd291099a987ea7e68f74b53cc66cb6de87da8245a54816092"
     assert profile.status == "validated"
     assert not profile.vlm.enabled
     assert profile.action_expert.enabled
@@ -70,17 +73,21 @@ def test_ae_attention_profile_requires_complete_trajectory():
     assert profile.action_expert.expected_quantized_nodes == 72
     assert profile.action_expert.expected_calibration_steps == 10
     assert profile.action_expert.donor_dtype == "fp32"
+    assert profile.action_expert.fused_geglu_donor is False
+    assert profile.action_expert.expected_npu_geglu_nodes == 18
 
 
-def test_ae_attention_mlp_smoothquant_profile_has_exact_validated_scope():
-    profile = bundled_quantization_profiles()["pi05-ae-attn-mlp-sq-v1"]
+def test_vlm_text_ae_attention_mlp_smoothquant_profile_has_expected_scope():
+    profiles = bundled_quantization_profiles()
+    assert "pi05-ae-attn-mlp-sq-v1" not in profiles
+    profile = profiles["pi05-vlm-text-ae-attn-mlp-sq-v1"]
     role = profile.action_expert
 
-    assert profile.digest == "cfe53326b0bbf64ae0bf87f5ee829c8f6c1b9f984eb7435c40a593b28c390c3b"
-    assert profile.status == "checkpoint-validated"
+    assert profile.digest == "6f497b3706d25f533cad4710ebb89b91c74c549828bc69c31fca1284aa88fe1e"
+    assert profile.status == "experimental"
     assert profile.target_soc == "Ascend310P3"
-    assert profile.npu_geglu is True
-    assert profile.fast_gelu is False
+    assert profile.export_dtype == "fp16"
+    assert profile.fast_gelu_scope == "vlm-text"
     assert not profile.vlm.enabled
     assert role.enabled
     assert role.donor_dtype == "fp16"
@@ -150,7 +157,7 @@ def test_export_profile_can_save_quant_profile_reference(tmp_path):
             "--batch-path",
             str(tmp_path / "observations.safetensors"),
             "--steps",
-            "vlm_quant",
+            "vlm_onnx,vlm_quant",
             "--save-as",
             "q40-run",
         ]
@@ -198,7 +205,7 @@ quantization_profiles:
             "--batch-path",
             str(tmp_path / "observations.safetensors"),
             "--steps",
-            "vlm_quant",
+            "vlm_onnx,vlm_quant",
         ]
     )
 
@@ -207,8 +214,8 @@ quantization_profiles:
     assert resolved.quantization_profile.vlm.selectors[0].expected == 1
 
 
-def test_custom_profile_rejects_contradictory_geglu_modes():
-    with pytest.raises(ValueError, match="cannot enable both"):
+def test_custom_profile_rejects_removed_geglu_mode_fields():
+    with pytest.raises(ValueError, match="unknown fields"):
         parse_quantization_profile(
             "invalid",
             {
@@ -239,13 +246,12 @@ def test_custom_profile_requires_complete_smoothquant_parameters():
         )
 
 
-def test_custom_profile_allows_ae_exact_fused_geglu_donor():
+def test_custom_profile_allows_vlm_text_with_ae_exact_fused_geglu_donor():
     profile = parse_quantization_profile(
         "ae-fused",
         {
             "format": "pi05-quant-profile-v1",
-            "npu_geglu": True,
-            "fast_gelu": False,
+            "fast_gelu_scope": "vlm-text",
             "vlm": {"enabled": False},
             "action_expert": {
                 "enabled": True,
@@ -260,10 +266,11 @@ def test_custom_profile_allows_ae_exact_fused_geglu_donor():
 
     assert profile.action_expert.fused_geglu_donor is True
     assert profile.action_expert.expected_npu_geglu_nodes == 18
+    assert profile.fast_gelu_scope == "vlm-text"
 
 
 def test_custom_ae_fused_geglu_donor_requires_exact_npu_geglu():
-    with pytest.raises(ValueError, match="requires exact NPU GeGLU"):
+    with pytest.raises(ValueError, match="requires expected_npu_geglu_nodes"):
         parse_quantization_profile(
             "ae-fused",
             {
@@ -280,45 +287,66 @@ def test_custom_ae_fused_geglu_donor_requires_exact_npu_geglu():
         )
 
 
-def test_effective_cli_rejects_fast_gelu_with_npu_geglu_profile(tmp_path):
+def test_vlm_text_ae_profile_applies_scope_and_rejects_explicit_mismatch(tmp_path):
     policy = tmp_path / "bundle"
     policy.mkdir()
-    config_path = tmp_path / "pi05-export.yaml"
-    config_path.write_text(
-        """
-quantization_profiles:
-  npu-geglu-v1:
-    format: pi05-quant-profile-v1
-    npu_geglu: true
-    vlm:
-      enabled: true
-      selectors:
-        - name: one-layer
-          regex: '^/layers\\.0/self_attn/q_proj/MatMul$'
-          expected: 1
-      expected_selected_nodes: 1
-      expected_quantized_nodes: 1
-    action_expert:
-      enabled: false
-""".lstrip(),
-        encoding="utf-8",
-    )
+    base = [
+        "--config",
+        str(tmp_path / "missing.yaml"),
+        "--policy-path",
+        str(policy),
+        "--device",
+        "npu",
+        "--quant-profile",
+        "pi05-vlm-text-ae-attn-mlp-sq-v1",
+        "--steps",
+        "vlm_onnx",
+    ]
 
-    with pytest.raises(SystemExit, match="requires fast_gelu=False"):
-        _cli.resolve(
-            [
-                "--config",
-                str(config_path),
-                "--policy-path",
-                str(policy),
-                "--quant-profile",
-                "npu-geglu-v1",
-                "--fast-gelu",
-                "--batch-path",
-                str(tmp_path / "observations.safetensors"),
-                "--steps",
-                "vlm_quant",
-            ]
+    resolved = _cli.resolve(base)
+
+    assert resolved.args.fast_gelu_scope == "vlm-text"
+    assert resolved.sources["fast_gelu_scope"] == "quant-profile:pi05-vlm-text-ae-attn-mlp-sq-v1"
+
+    with pytest.raises(SystemExit, match="requires fast_gelu_scope=vlm-text"):
+        _cli.resolve([*base, "--fast-gelu-scope", "none"])
+
+
+@pytest.mark.parametrize("scope", ["ae", "all"])
+def test_custom_ae_w8a8_rejects_ae_fast_gelu(scope):
+    with pytest.raises(ValueError, match="cannot combine Action Expert W8A8"):
+        parse_quantization_profile(
+            "invalid-ae-scope",
+            {
+                "format": "pi05-quant-profile-v1",
+                "fast_gelu_scope": scope,
+                "vlm": {"enabled": False},
+                "action_expert": {
+                    "enabled": True,
+                    "selectors": [{"name": "one", "regex": "MatMul", "expected": 1}],
+                    "expected_selected_nodes": 1,
+                    "expected_quantized_nodes": 1,
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize("scope", ["vision", "vlm-text", "all"])
+def test_custom_vlm_w8a8_rejects_vlm_fast_gelu(scope):
+    with pytest.raises(ValueError, match="cannot combine VLM W8A8"):
+        parse_quantization_profile(
+            "invalid-vlm-scope",
+            {
+                "format": "pi05-quant-profile-v1",
+                "fast_gelu_scope": scope,
+                "vlm": {
+                    "enabled": True,
+                    "selectors": [{"name": "one", "regex": "MatMul", "expected": 1}],
+                    "expected_selected_nodes": 1,
+                    "expected_quantized_nodes": 1,
+                },
+                "action_expert": {"enabled": False},
+            },
         )
 
 
@@ -416,6 +444,43 @@ def test_quant_metadata_rejects_changed_policy(tmp_path):
             output_onnx=output,
         )
 
+
+def test_quant_metadata_accepts_reexported_identical_source_graph(tmp_path):
+    profile = bundled_quantization_profiles()["pi05-q40-v1"]
+    policy = tmp_path / "bundle"
+    _write_policy(policy)
+    donor = tmp_path / "donor.onnx"
+    npu = tmp_path / "npu.onnx"
+    output = tmp_path / "output.onnx"
+    donor.write_bytes(b"donor")
+    npu.write_bytes(b"npu")
+    output.write_bytes(b"quantized")
+    path = metadata_path(output)
+    write_quantization_metadata(
+        path=path,
+        profile_name=profile.name,
+        profile_hash=profile.digest,
+        role="vlm",
+        policy_path=policy,
+        donor_onnx=donor,
+        npu_onnx=npu,
+        output_onnx=output,
+        selected_nodes=_q40_node_names(),
+        actual_quantized_nodes=136,
+    )
+
+    donor.write_bytes(b"donor")
+    npu.write_bytes(b"npu")
+    validate_quantization_metadata(
+        path=path,
+        profile=profile,
+        role="vlm",
+        policy_path=policy,
+        donor_onnx=donor,
+        npu_onnx=npu,
+        output_onnx=output,
+    )
+
     write_quantization_metadata(
         path=path,
         profile_name=profile.name,
@@ -438,4 +503,23 @@ def test_quant_metadata_rejects_changed_policy(tmp_path):
             donor_onnx=donor,
             npu_onnx=npu,
             output_onnx=output,
+        )
+
+
+def test_smoothquant_verify_tolerances_require_smoothquant():
+    with pytest.raises(ValueError, match="require smoothquant_alpha"):
+        parse_quantization_profile(
+            "invalid-tolerance",
+            {
+                "format": "pi05-quant-profile-v1",
+                "vlm": {"enabled": False},
+                "action_expert": {
+                    "enabled": True,
+                    "selectors": [{"name": "one", "regex": "one", "expected": 1}],
+                    "expected_selected_nodes": 1,
+                    "expected_quantized_nodes": 1,
+                    "smoothquant_verify_rtol": 0.005,
+                    "smoothquant_verify_atol": 0.005,
+                },
+            },
         )

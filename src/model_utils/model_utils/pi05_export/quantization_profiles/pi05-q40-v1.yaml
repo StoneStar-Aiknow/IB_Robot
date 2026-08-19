@@ -3,9 +3,9 @@ format: pi05-quant-profile-v1
 status: checkpoint-validated
 target_soc: Ascend310P3
 export_device: npu
+export_dtype: fp16
 donor_device: cpu
-npu_geglu: true
-fast_gelu: false
+fast_gelu_scope: none
 
 vlm:
   enabled: true

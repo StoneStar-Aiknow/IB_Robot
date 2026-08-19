@@ -3,8 +3,9 @@ format: pi05-quant-profile-v1
 status: validated
 target_soc: Ascend310P3
 export_device: npu
+export_dtype: fp16
 donor_device: cpu
-fast_gelu: false
+fast_gelu_scope: none
 
 vlm:
   enabled: false
@@ -15,7 +16,9 @@ action_expert:
   expected_selected_nodes: 72
   expected_quantized_nodes: 72
   expected_calibration_steps: 10
+  expected_npu_geglu_nodes: 18
   quantize_convs: false
+  fused_geglu_donor: false
   disable_regex:
     - rotary_emb
     - 'self_attn/MatMul(_[0-9]+)?$'

@@ -23,14 +23,14 @@ two tools share one mental model:
   (auto-written after each run — replaces a separate "remember last args" cache).
 - **Merge precedence** (high -> low):
   ``CLI > --profile > defaults > _last (only when no --profile) > builtin``.
-- **Derived paths**: a single ``--exp-dir`` expands to ``onnx/`` (ONNX output),
-  ``runtime_save/`` (VLM->AE handoff tensors), and ``om/`` (compiled artifacts)
-  so the long paths collapse into one directory. ``inference_manifest.json`` is still
-  written next to the policy, and points to the compiled OM paths.
+- **Work path**: a single optional ``--work-dir`` contains ``onnx/`` (ONNX output),
+  ``runtime_save/`` (VLM->AE handoff tensors), ``om/`` (compiled artifacts), and
+  calibration outputs. The default follows the shared ``models/_work`` convention.
+  ``inference_manifest.json`` is still written next to the policy.
 - **Wizard**: on first use (no config / no _last) or ``--init`` it prompts each
   field with its meaning + example + default, then offers to save a profile.
 
-Explicit flags override values supplied by profiles or derived paths.
+Explicit flags override values supplied by profiles.
 """
 
 from __future__ import annotations
@@ -52,11 +52,6 @@ from model_utils.pi05_export.quant.profiles import (
 CONFIG_ENV = "PI05_EXPORT_CONFIG"
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/model_utils/pi05_export.yaml")
 
-# Derived sub-directories under --exp-dir.
-DERIVED_ONNX_DIR = "onnx"
-DERIVED_RUNTIME_DIR = "runtime_save"
-DERIVED_OM_DIR = "om"
-
 # Provenance labels (shown by print_effective so the user knows where each
 # value came from). Kept as constants because some control flow checks them.
 SRC_CLI = "cli"
@@ -65,7 +60,7 @@ SRC_DEFAULTS = "defaults"
 SRC_LAST = "last"
 SRC_BUILTIN = "builtin"
 SRC_WIZARD = "wizard"
-SRC_DERIVED = "derived(exp-dir)"
+SRC_QUANT_PROFILE = "quant-profile"
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +100,6 @@ STEPS: list[StepSpec] = [
         step_deps=("vlm_onnx",),
     ),
     StepSpec(
-        "ae_quant",
-        "Quantize the Action Expert ONNX to W8A8 (calib defaults to runtime_save)",
-        step_deps=("ae_onnx",),
-    ),
-    StepSpec(
         "vlm_om",
         "Compile the VLM FP16 ONNX to OM via ATC",
         param_deps=("soc_version",),
@@ -120,6 +110,12 @@ STEPS: list[StepSpec] = [
         "Compile the Action Expert FP16 ONNX to OM via ATC",
         param_deps=("soc_version",),
         step_deps=("ae_onnx",),
+    ),
+    StepSpec(
+        "ae_quant",
+        "Quantize the Action Expert ONNX to W8A8 with an automatically captured FP16 trajectory",
+        param_deps=("batch_path", "soc_version"),
+        step_deps=("vlm_onnx", "ae_onnx", "vlm_om", "ae_om"),
     ),
     StepSpec(
         "vlm_quant_om",
@@ -184,9 +180,9 @@ PARAMS: list[Param] = [
         required_for_run=True,
     ),
     Param(
-        dest="exp_dir",
-        cli="--exp-dir",
-        meaning="Experiment directory: auto-derives onnx/, runtime_save/, and om/ to avoid typing long paths",
+        dest="work_dir",
+        cli="--work-dir",
+        meaning="Intermediate root outside the bundle; default: models/_work/<bundle>/ascend/pi05",
     ),
     Param(
         dest="dtype",
@@ -211,15 +207,8 @@ PARAMS: list[Param] = [
     Param(
         dest="deployment",
         cli="--deployment",
-        meaning="Named FP ONNX/OM deployment written to inference_manifest.json",
+        meaning="Named deployment added to or updated in inference_manifest.json",
         default="ascend",
-        in_wizard=False,
-    ),
-    Param(
-        dest="quant_deployment",
-        cli="--quant-deployment",
-        meaning="Named W8A8 OM deployment written to inference_manifest.json",
-        default="ascend-w8a8",
         in_wizard=False,
     ),
     Param(
@@ -252,17 +241,16 @@ PARAMS: list[Param] = [
     Param(
         dest="fast_gelu",
         cli="--fast-gelu",
-        meaning="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export; faster but approximate",
+        meaning="Legacy alias for --fast-gelu-scope all; faster but approximate",
         default=False,
         bool_optional=True,
         in_wizard=False,
     ),
     Param(
-        dest="npu_geglu",
-        cli="--npu-geglu",
-        meaning="Fuse Gemma gate/up projections into NPUGeglu; disable for separate exact projections",
-        default=True,
-        bool_optional=True,
+        dest="fast_gelu_scope",
+        cli="--fast-gelu-scope",
+        meaning="Limit approximate Ascend NPUFastGelu to one PI05 model region; default: none",
+        choices=["none", "all", "vision", "vlm-text", "ae"],
         in_wizard=False,
     ),
     Param(
@@ -271,29 +259,6 @@ PARAMS: list[Param] = [
         meaning="Optional explicit override for the task stored in the observation batch",
         example='"pick up the cup"',
         default="",
-    ),
-    # The two paths below are normally derived from --exp-dir; kept as explicit
-    # overrides for non-standard layouts.
-    Param(
-        dest="output_dir",
-        cli="--output-dir",
-        meaning="Directory for the exported ONNX files (normally derived from --exp-dir)",
-        default="outputs/onnx",
-        in_wizard=False,
-    ),
-    Param(
-        dest="runtime_save_dir",
-        cli="--runtime-save-dir",
-        meaning="Directory for the VLM->AE handoff tensors (normally derived from --exp-dir)",
-        default="runtime_save",
-        in_wizard=False,
-    ),
-    Param(
-        dest="om_dir",
-        cli="--om-dir",
-        meaning="Directory for compiled OM artifacts (normally derived from --exp-dir)",
-        default="outputs/om",
-        in_wizard=False,
     ),
     Param(
         dest="log_level",
@@ -333,12 +298,6 @@ PARAMS: list[Param] = [
         meaning="Torch device used to auto-export ORT-runnable donor ONNX when quantizing an NPU ONNX",
         example="cpu",
         default="cpu",
-        in_wizard=False,
-    ),
-    Param(
-        dest="calib_dir",
-        cli="--calib-dir",
-        meaning="AE calibration sample dir (past_kv_tensor.* + prefix_pad_masks.*); defaults to --runtime-save-dir",
         in_wizard=False,
     ),
     Param(
@@ -474,6 +433,66 @@ def _validate_step_param_deps(chosen_steps: list[str], merged: dict[str, Any]) -
         )
 
 
+def _normalize_fast_gelu_scope(merged: dict[str, Any], sources: dict[str, str]) -> None:
+    """Resolve the legacy global flag and the scoped FastGELU option."""
+    legacy_value = merged.get("fast_gelu")
+    legacy_enabled = bool(legacy_value)
+    scope = merged.get("fast_gelu_scope")
+    if legacy_enabled and scope not in (None, "all"):
+        legacy_origin = sources.get("fast_gelu", SRC_BUILTIN)
+        scope_origin = sources.get("fast_gelu_scope", SRC_BUILTIN)
+        legacy_rank = _source_rank(legacy_origin)
+        scope_rank = _source_rank(scope_origin)
+        if scope_rank > legacy_rank or (scope_origin == legacy_origin == SRC_LAST):
+            merged["fast_gelu"] = False
+            sources["fast_gelu"] = scope_origin
+            legacy_enabled = False
+        elif legacy_rank > scope_rank:
+            scope = "all"
+            sources["fast_gelu_scope"] = legacy_origin
+        else:
+            raise SystemExit("--fast-gelu is an alias for --fast-gelu-scope all and cannot select another scope")
+    elif legacy_value is False and sources.get("fast_gelu") == SRC_CLI and scope not in (None, "none"):
+        if sources.get("fast_gelu_scope") == SRC_CLI:
+            raise SystemExit("--no-fast-gelu cannot be combined with a non-none --fast-gelu-scope")
+        scope = "none"
+        sources["fast_gelu_scope"] = SRC_CLI
+    if scope is None:
+        scope = "all" if legacy_enabled else "none"
+        sources["fast_gelu_scope"] = sources.get("fast_gelu", SRC_BUILTIN)
+    merged["fast_gelu_scope"] = scope
+
+
+def _source_rank(source: str) -> int:
+    if source in {SRC_CLI, SRC_WIZARD}:
+        return 5
+    if source.startswith(f"{SRC_PROFILE}:"):
+        return 4
+    if source == SRC_DEFAULTS:
+        return 3
+    if source == SRC_LAST:
+        return 2
+    return 1
+
+
+def _apply_quantization_profile_scope(
+    profile: QuantizationProfile,
+    merged: dict[str, Any],
+    sources: dict[str, str],
+) -> None:
+    """Use a profile scope unless this run explicitly selected another one."""
+    required = profile.fast_gelu_scope
+    if required is None or merged.get("fast_gelu_scope") == required:
+        return
+    origin = sources.get("fast_gelu_scope", SRC_BUILTIN)
+    if origin in {SRC_BUILTIN, SRC_LAST}:
+        merged["fast_gelu_scope"] = required
+        sources["fast_gelu_scope"] = f"{SRC_QUANT_PROFILE}:{profile.name}"
+        if required != "all":
+            merged["fast_gelu"] = False
+            sources["fast_gelu"] = f"{SRC_QUANT_PROFILE}:{profile.name}"
+
+
 def _validate_quantization_profile(
     profile: QuantizationProfile,
     chosen_steps: list[str],
@@ -485,30 +504,55 @@ def _validate_quantization_profile(
         "ae": {"ae_quant", "ae_quant_om"},
     }
     chosen = set(chosen_steps)
-    if not any(chosen & steps for steps in role_steps.values()):
-        return
     problems: list[str] = []
     for role, steps in role_steps.items():
         if chosen & steps and not profile.role(role).enabled:
             problems.append(f"profile {profile.name!r} disables {role} quantization")
-    for setting in ("npu_geglu", "fast_gelu"):
-        required = getattr(profile, setting)
-        if required is not None and merged.get(setting) != required:
-            problems.append(f"profile {profile.name!r} requires {setting}={required}")
-    for setting, required in (("device", profile.export_device), ("donor_device", profile.donor_device)):
+    for role in ("vlm", "ae"):
+        if f"{role}_om" in chosen and f"{role}_onnx" not in chosen:
+            problems.append(
+                f"profile {profile.name!r} requires {role}_onnx with {role}_om "
+                "to prevent stale FastGELU-scope artifacts"
+            )
+    if chosen & {"vlm_quant_om", "ae_quant_om"}:
+        publication_steps = {
+            "vlm_quant_om" if profile.vlm.enabled else "vlm_om",
+            "ae_quant_om" if profile.action_expert.enabled else "ae_om",
+        }
+        missing_steps = sorted((publication_steps | {"vlm_onnx", "ae_onnx"}) - chosen)
+        if missing_steps:
+            problems.append(
+                f"profile {profile.name!r} publication requires steps {','.join(missing_steps)} "
+                "to prevent stale or cross-profile artifact reuse"
+            )
+    if profile.fast_gelu_scope is not None and merged.get("fast_gelu_scope") != profile.fast_gelu_scope:
+        problems.append(f"profile {profile.name!r} requires fast_gelu_scope={profile.fast_gelu_scope}")
+    for setting, required in (
+        ("device", profile.export_device),
+        ("dtype", profile.export_dtype),
+        ("donor_device", profile.donor_device),
+    ):
         actual = merged.get(setting)
-        if required is not None and (not actual or actual.split(":", 1)[0] != required):
+        if required is not None and (not actual or str(actual).split(":", 1)[0] != required):
             problems.append(f"profile {profile.name!r} requires {setting}={required}")
-    if (
-        profile.npu_geglu is True
-        or profile.vlm.fused_geglu_donor is True
-        or profile.action_expert.fused_geglu_donor is True
-    ) and merged.get("fast_gelu"):
-        problems.append(f"profile {profile.name!r} requires fast_gelu=False for NPU GeGLU")
     if profile.target_soc and merged.get("soc_version") and merged["soc_version"] != profile.target_soc:
         problems.append(f"profile {profile.name!r} requires soc_version={profile.target_soc}")
     if problems:
         raise SystemExit("Quantization profile is incompatible with this run:\n  - " + "\n  - ".join(problems))
+
+
+def _validate_quantization_freshness(chosen_steps: list[str]) -> None:
+    chosen = set(chosen_steps)
+    problems: list[str] = []
+    if "vlm_quant" in chosen and "vlm_onnx" not in chosen:
+        problems.append("vlm_quant requires vlm_onnx in the same run")
+    if "ae_quant" in chosen:
+        required = {"vlm_onnx", "ae_onnx", "vlm_om", "ae_om"}
+        missing = sorted(required - chosen)
+        if missing:
+            problems.append(f"ae_quant automatic calibration requires steps {','.join(missing)} in the same run")
+    if problems:
+        raise SystemExit("Quantization requires fresh source artifacts:\n  - " + "\n  - ".join(problems))
 
 
 # ---------------------------------------------------------------------------
@@ -556,30 +600,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="List bundled and configured quantization profiles and exit",
     )
     return parser
-
-
-# ---------------------------------------------------------------------------
-# Derivation
-# ---------------------------------------------------------------------------
-def apply_exp_dir_derivation(values: dict[str, Any], sources: dict[str, str]) -> None:
-    """Fill output_dir / runtime_save_dir / om_dir from exp_dir unless explicitly provided.
-
-    These params carry builtin defaults, so "explicitly provided" means a
-    source stronger than builtin (CLI / profile / defaults / last). Derivation
-    therefore overrides only the builtin fallback, never a user-chosen value.
-    """
-    exp_dir = values.get("exp_dir")
-    if not exp_dir:
-        return
-    derivations = {
-        "output_dir": os.path.join(exp_dir, DERIVED_ONNX_DIR),
-        "runtime_save_dir": os.path.join(exp_dir, DERIVED_RUNTIME_DIR),
-        "om_dir": os.path.join(exp_dir, DERIVED_OM_DIR),
-    }
-    for dest, derived in derivations.items():
-        if values.get(dest) is None or sources.get(dest) == SRC_BUILTIN:
-            values[dest] = derived
-            sources[dest] = SRC_DERIVED
 
 
 # ---------------------------------------------------------------------------
@@ -725,19 +745,19 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
             merged[k] = v
             sources[k] = SRC_CLI
 
-    # Derive output_dir / runtime_save_dir from exp-dir (unless explicitly set).
-    apply_exp_dir_derivation(merged, sources)
+    _normalize_fast_gelu_scope(merged, sources)
 
     # Parse + normalize the requested pipeline steps (registry order).
     chosen_steps = parse_steps(merged.get("steps"))
     merged["steps"] = ",".join(chosen_steps)
-
     try:
         quantization_profile = resolve_quantization_profile(merged.get("quant_profile"), config)
     except ValueError as exc:
         raise SystemExit(f"Invalid --quant-profile: {exc}. Use --list-quant-profiles.") from exc
     if quantization_profile is not None:
+        _apply_quantization_profile_scope(quantization_profile, merged, sources)
         _validate_quantization_profile(quantization_profile, chosen_steps, merged)
+    _validate_quantization_freshness(chosen_steps)
 
     # Validate required-for-run params.
     missing = [p.cli for p in PARAMS if p.required_for_run and not merged.get(p.dest)]
@@ -782,21 +802,17 @@ def print_effective(resolved: ResolvedConfig) -> None:
     print("[pi05_export] effective params (source):")
     order = [
         "policy_path",
-        "exp_dir",
-        "output_dir",
-        "runtime_save_dir",
-        "om_dir",
+        "work_dir",
         "dtype",
         "device",
         "fast_gelu",
-        "npu_geglu",
+        "fast_gelu_scope",
         "soc_version",
         "schedule_file",
         "quant_profile",
         "steps",
         "batch_path",
         "donor_device",
-        "calib_dir",
         "num_calib",
         "amp_num",
         "amp_rank_samples",
@@ -809,8 +825,7 @@ def print_effective(resolved: ResolvedConfig) -> None:
         if val in (None, "", False):
             continue
         origin = src.get(dest, SRC_BUILTIN)
-        arrow = "  → " if origin.startswith("derived") else "  "
-        print(f"{arrow}{dest:18s}= {val}   ({origin})")
+        print(f"  {dest:18s}= {val}   ({origin})")
     print(f"  config: {resolved.config_path}")
     if resolved.quantization_profile is not None:
         profile = resolved.quantization_profile
@@ -828,18 +843,11 @@ _TRANSIENT_KEYS = {"steps"}
 def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
     """Prepare run params for writing into ``_last``/profiles.
 
-    Drops:
-    - derived ``output_dir`` / ``runtime_save_dir`` / ``om_dir`` when an ``exp_dir`` exists
-      (they are *computed*, so persisting them would make a later ``--exp-dir``
-      change silently ineffective);
-    - transient flow flags such as ``verify`` (remembering "I verified last
+    Drops transient flow flags such as ``verify`` (remembering "I verified last
       time" would wrongly re-trigger verification — and its --task requirement —
       on a later plain export run).
     """
     out = {k: v for k, v in run_params.items() if k not in _TRANSIENT_KEYS}
-    if out.get("exp_dir"):
-        for k in ("output_dir", "runtime_save_dir", "om_dir"):
-            out.pop(k, None)
     return out
 
 

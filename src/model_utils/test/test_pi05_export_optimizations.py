@@ -1,3 +1,4 @@
+import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import TypeVar
@@ -9,9 +10,12 @@ from model_utils.pi05_export.ascend_export_patches import (
     _build_patch_registry,
     _exact_fused_geglu,
     _fused_up_gate_weight,
+    _patch_gemma_fast_gelu_npu,
     _patch_gemma_geglu_donor,
     _patch_gemma_geglu_npu,
     _patch_pytorch_gelu_tanh_npu,
+    _patch_siglip_fast_gelu_npu,
+    ascend_onnx_export_patches,
 )
 
 
@@ -168,11 +172,57 @@ def test_gelu_patch_registry_precedence(use_npu_ops, fast_gelu, expected, unexpe
     assert unexpected not in patch_fns
 
 
-def test_gelu_patch_registry_can_disable_npu_geglu():
-    patch_fns = {patch_fn for _, patch_fn in _build_patch_registry(use_npu_ops=True, fast_gelu=False, npu_geglu=False)}
+@pytest.mark.parametrize(
+    ("scope", "expected", "unexpected"),
+    [
+        ("none", {_patch_gemma_geglu_npu}, {_patch_pytorch_gelu_tanh_npu, _patch_siglip_fast_gelu_npu}),
+        ("all", {_patch_pytorch_gelu_tanh_npu}, {_patch_gemma_geglu_npu, _patch_siglip_fast_gelu_npu}),
+        ("vision", {_patch_siglip_fast_gelu_npu, _patch_gemma_geglu_npu}, {_patch_pytorch_gelu_tanh_npu}),
+        ("gemma", {_patch_gemma_fast_gelu_npu}, {_patch_gemma_geglu_npu, _patch_siglip_fast_gelu_npu}),
+    ],
+)
+def test_scoped_gelu_patch_registry(scope, expected, unexpected):
+    patch_fns = {patch_fn for _, patch_fn in _build_patch_registry(use_npu_ops=True, fast_gelu_scope=scope)}
 
-    assert _patch_gemma_geglu_npu not in patch_fns
-    assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+    assert expected <= patch_fns
+    assert not (unexpected & patch_fns)
+
+
+def test_scoped_gelu_patches_only_target_requested_model_family(monkeypatch):
+    class SiglipMLP:
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class GemmaMLP:
+        def forward(self, hidden_states):
+            return hidden_states
+
+    modules = {
+        "transformers.models.siglip.modeling_siglip": SimpleNamespace(SiglipMLP=SiglipMLP),
+        "transformers.models.gemma.modeling_gemma": SimpleNamespace(GemmaMLP=GemmaMLP),
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+
+    def fake_import_module(name):
+        if name not in modules:
+            raise ImportError(name)
+        return modules[name]
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    original_siglip = SiglipMLP.forward
+    original_gemma = GemmaMLP.forward
+
+    vision_undo = _patch_siglip_fast_gelu_npu()
+    assert SiglipMLP.forward is not original_siglip
+    assert GemmaMLP.forward is original_gemma
+    for cls, attr, original in reversed(vision_undo):
+        setattr(cls, attr, original)
+
+    gemma_undo = _patch_gemma_fast_gelu_npu()
+    assert SiglipMLP.forward is original_siglip
+    assert GemmaMLP.forward is not original_gemma
+    for cls, attr, original in reversed(gemma_undo):
+        setattr(cls, attr, original)
 
 
 def test_gelu_patch_registry_has_no_npu_gelu_off_npu():
@@ -180,6 +230,8 @@ def test_gelu_patch_registry_has_no_npu_gelu_off_npu():
 
     assert _patch_gemma_geglu_npu not in patch_fns
     assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+    assert _patch_siglip_fast_gelu_npu not in patch_fns
+    assert _patch_gemma_fast_gelu_npu not in patch_fns
 
 
 def test_fused_geglu_donor_registry_is_ort_only():
@@ -188,6 +240,29 @@ def test_fused_geglu_donor_registry_is_ort_only():
     assert _patch_gemma_geglu_donor in patch_fns
     assert _patch_gemma_geglu_npu not in patch_fns
     assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+    assert _patch_siglip_fast_gelu_npu not in patch_fns
+    assert _patch_gemma_fast_gelu_npu not in patch_fns
+
+
+@pytest.mark.parametrize("scope", ["all", "vision", "gemma"])
+def test_fused_geglu_donor_rejects_fast_gelu_scope(scope):
+    with pytest.raises(ValueError, match="FastGELU disabled"):
+        _build_patch_registry(use_npu_ops=False, fast_gelu_scope=scope, fused_geglu_donor=True)
+
+
+def test_fused_geglu_donor_rejects_npu_export():
+    with pytest.raises(ValueError, match="non-NPU"):
+        _build_patch_registry(use_npu_ops=True, fused_geglu_donor=True)
+
+
+def test_required_npu_activation_patch_fails_closed(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
+
+    with (
+        pytest.raises(RuntimeError, match="required NPU activation patch"),
+        ascend_onnx_export_patches(use_npu_ops=True),
+    ):
+        pass
 
 
 def test_exact_fused_geglu_uses_up_then_gate_order():

@@ -15,7 +15,10 @@ def _work_layout(bundle_root: Path) -> tuple[Path, Path]:
 
     for models_root in bundle_root.parents:
         if models_root.name == "models":
-            return models_root / "_work", bundle_root.relative_to(models_root)
+            relative = bundle_root.relative_to(models_root)
+            if relative.parts[0] == "_work":
+                return bundle_root.parent / "_work", Path(bundle_root.name)
+            return models_root / "_work", relative
     return bundle_root.parent / "_work", Path(bundle_root.name)
 
 
@@ -32,9 +35,19 @@ def export_work_dir(bundle_root: str | Path, exporter: str, override: str | Path
     else:
         work_root, bundle_rel = _work_layout(root)
         work_dir = work_root / bundle_rel / exporter
-    work_dir = work_dir.resolve()
+    work_dir = resolve_outside_bundle_path(root, work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     return work_dir
+
+
+def resolve_outside_bundle_path(bundle_root: str | Path, path: str | Path) -> Path:
+    """Resolve an intermediate path and reject bundle-local destinations."""
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    resolved = Path(path).expanduser().resolve()
+    if resolved == root or resolved.is_relative_to(root):
+        raise ValueError(f"conversion intermediate path must be outside the policy bundle {root}: {resolved}")
+    return resolved
 
 
 def ensure_output_parent(path: str | Path) -> Path:

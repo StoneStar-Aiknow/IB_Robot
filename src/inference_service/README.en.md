@@ -425,9 +425,10 @@ The optimized PI0.5 VLM combines all camera images into one temporary vision bat
 camera-major prefix before the handoff. This optimization does not change the external VLM ABI: runtime bindings,
 per-camera observation semantics, raw image shapes, and ROS camera-topic contracts remain unchanged.
 
-NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP by default. Only the explicit
-`--fast-gelu` export option replaces it with approximate `NPUFastGelu`; this may reduce action accuracy and must be
-validated against an existing baseline.
+NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP by default. The explicit
+`--fast-gelu-scope vision|vlm-text|ae|all` option limits approximate `NPUFastGelu` to one model region; the legacy
+`--fast-gelu` option means global `all`. The approximate path may reduce action accuracy and must be validated
+against an existing baseline.
 
 A new Action Expert OM has a runtime output named `velocity` or `v_t`, while the Manifest still maps that tensor
 to the policy `action` semantic. The Ascend backend reads strictly decreasing timesteps from the selected

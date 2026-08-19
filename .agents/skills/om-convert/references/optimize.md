@@ -273,7 +273,7 @@ movement dominate after glue removal.
 Requirements:
 
 - representative real LeRobot dataset observations;
-- recorded calibration provenance;
+- for PI05 AE quantization, same-invocation trajectory capture from fresh FP16 VLM/AE artifacts;
 - no random calibration fallback;
 - start with selected linear layers;
 - exclude sensitive norm, attention BMM, final action head, and empirically sensitive layers by default;

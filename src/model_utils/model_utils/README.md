@@ -216,16 +216,17 @@ source .shrc_local
 
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/pi05_export_run \
+    --work-dir /path/to/pi05_export_run \
     --soc-version Ascend310P3 \
     --device cpu \
     --dtype fp16
 ```
 
 使用 NPU 导出时，Gemma text MLP 默认使用精度保持的 `NPUGeglu` 融合
-`gelu(gate_proj(x)) * up_proj(x)`。显式传入 `--fast-gelu` 会覆盖该默认路径，将 GELU 站点改为
-`NPUFastGelu`；它可能降低延迟，但属于近似计算，可能降低动作精度，必须使用既有 baseline
-验证。精度优先时省略该参数或使用 `--no-fast-gelu`。
+`gelu(gate_proj(x)) * up_proj(x)`。`--fast-gelu-scope` 可将近似 `NPUFastGelu` 限制到
+`vision`、`vlm-text`、`ae` 或显式选择 `all`；默认值为 `none`。旧参数 `--fast-gelu` 保持兼容，
+等价于 `--fast-gelu-scope all`。FastGELU 可能降低延迟，但会改变 GELU 数学，必须使用既有
+baseline 验证。精度优先时省略这些参数或使用 `--fast-gelu-scope none`。
 
 新导出的 Action Expert OM 在每个 timestep 输出 velocity，而不是已经积分的 action。Ascend
 backend 按 schedule 对相邻 timestep 执行 Euler integration：
@@ -241,7 +242,7 @@ exporter 根据 bundle `config.json` 的 `num_inference_steps` 生成 uniform sc
 ```bash
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/pi05_export_run \
+    --work-dir /path/to/pi05_export_run \
     --soc-version Ascend310P3 \
     --schedule-file /path/to/selected_schedule.json \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om
@@ -269,7 +270,9 @@ legacy deployment 继续使用旧的逐步 action-output 行为，不会被自�
 这里的 `--device` 仅是 Torch export/verification device。OM 完成后工具通过 ACL model
 descriptor 自动生成 `<model>.om.abi.json`（只有实际需要时才导入 `acl`），并在 policy bundle
 中更新默认名为 `ascend` 的 unified deployment，写入 VLM/Action Expert artifacts、bindings 和
-device-pointer links。可用 `--deployment` 和 `--quant-deployment` 修改 FP/W8A8 名称。ACL ABI
+device-pointer links。`--deployment` 统一指定本次写入的 deployment 名称：名称不存在时添加，
+已存在时保留 UUID 并更新 revision，内容不变时为 no-op。量化由 `--quant-profile` 和 steps 决定，
+没有单独的量化 deployment 命名参数；一次调用只发布一个 deployment。ACL ABI
 检查默认使用 device 0；可通过 `--abi-device-id` 和 `--acl-config-path` 覆盖。`--vlm-abi` /
 `--ae-abi` 仍可在直接调用 `convert_om` 时显式覆盖自动生成的 ABI。
 
@@ -279,24 +282,25 @@ device-pointer links。可用 `--deployment` 和 `--quant-deployment` 修改 FP/
 # 只导出 ONNX
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/run \
+    --work-dir /path/to/run \
     --steps vlm_onnx,ae_onnx
 
 # 导出、编译并验证
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/run \
+    --work-dir /path/to/run \
     --soc-version Ascend310P3 \
     --task "pick up the cup" \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify
 
-# W8A8 ONNX + OM；写入独立的 ascend-w8a8 deployment，不覆盖 FP deployment
+# W8A8 ONNX + OM；写入命名 deployment
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/run \
+    --work-dir /path/to/run \
     --soc-version Ascend310P3 \
+    --deployment ascend-w8a8 \
     --batch-path /path/to/calibration_batches.json \
-    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om
+    --steps vlm_onnx,ae_onnx,vlm_quant,vlm_om,ae_om,ae_quant,vlm_quant_om,ae_quant_om
 ```
 
 量化策略可以保存为版本化 `quantization_profiles`，顶层 CLI 只通过 `--quant-profile` 选择策略，
@@ -306,30 +310,49 @@ INT8 MatMul；它要求 NPU VLM export、CPU donor、精确 GeGLU，并明确保
 ```bash
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/q40-run \
+    --work-dir /path/to/q40-run \
     --soc-version Ascend310P3 \
     --device npu \
     --donor-device cpu \
     --batch-path /path/to/calibration_batches.json \
     --quant-profile pi05-q40-v1 \
-    --steps vlm_onnx,vlm_quant,vlm_quant_om
+    --steps vlm_onnx,ae_onnx,vlm_quant,ae_om,vlm_quant_om
 ```
 
-`pi05-ae-attn-mlp-sq-v1` 固化经过 checkpoint 验证的 108 节点 Action Expert 策略：18 层
-q/k/v/o attention projection、fused GeGLU MLP projection 和 down projection，并携带 SmoothQuant
-`alpha=0.5`、`epsilon=1e-5`。它要求每个校准 episode 包含完整 10 步 AE 轨迹：
+`pi05-vlm-text-ae-attn-mlp-sq-v1` 组合 FP16 VLM text FastGELU 与 108 节点 W8A8
+Action Expert：18 层 q/k/v/o attention projection、fused GeGLU MLP projection 和 down projection，
+并携带 SmoothQuant `alpha=0.5`、`epsilon=1e-5`。该组合尚待 checkpoint 实测，因此状态为
+`experimental`。选择 `ae_quant` 后，顶层 exporter 会用本轮 fresh FP16 VLM/AE OM 创建临时
+calibration deployment，按 `--batch-path`、`--num-calib`、task 和固定 seed 42 自动调用
+`pi05-om-dump`，在 `<work-dir>/calibration/ae` 生成完整 uniform-10 AE 轨迹；不再接受顶层
+`--calib-dir`，因此不会复用 exact-VLM calibration：
 
 ```bash
 ros2 run model_utils pi05-export \
     --policy-path /path/to/pi05_bundle \
-    --exp-dir /path/to/ae-sq-run \
+    --work-dir /path/to/ae-sq-run \
     --soc-version Ascend310P3 \
     --device npu \
     --donor-device cpu \
-    --calib-dir /path/to/ae_trajectory_calibration \
-    --quant-profile pi05-ae-attn-mlp-sq-v1 \
-    --steps ae_onnx,ae_quant,ae_quant_om
+    --batch-path /path/to/calibration_batches.safetensors \
+    --num-calib 20 \
+    --quant-profile pi05-vlm-text-ae-attn-mlp-sq-v1 \
+    --deployment ascend_310p3_vlm_text_ae108_sq \
+    --steps vlm_onnx,ae_onnx,vlm_om,ae_om,ae_quant,ae_quant_om
 ```
+
+不指定 `--work-dir` 时，顶层 exporter 默认使用
+`models/_work/<bundle>/ascend/pi05/`，并在其中固定创建 `onnx/`、`runtime_save/`、`om/` 和
+`calibration/`。顶层不再暴露 `--exp-dir`、`--output-dir`、`--runtime-save-dir` 或 `--om-dir`；
+需要调试非标准布局时直接调用对应底层 exporter。显式 `--work-dir` 和 `--amp-scratch-dir`
+在创建任何文件前都会解析真实路径，并拒绝 policy bundle 本身或其子目录（包括 symlink 绕入）。
+
+该 profile 自动采用 `fast_gelu_scope=vlm-text`；显式选择其他 scope 会在导出前报错。精确 NPU
+Gemma 路径始终使用 `NPUGeglu`，不再提供公开的 unfused fallback。量化 deployment 按角色选择
+artifact，因此上例会把 FP16 VLM OM 与 W8A8 Action Expert OM 写入同一个 deployment。由于当前
+manifest 不记录 quant profile identity，profiled deployment 的发布和更新必须同时列出两个角色的
+OM 步骤和 fresh ONNX export，避免从同名但不同 profile 的 deployment 或旧 FastGELU scope
+复用不兼容 artifact。为 AE calibration 构建的 FP16 AE OM 是工作产物，不会额外发布 FP deployment。
 
 可用 `--list-quant-profiles` 查看随包 YAML 和配置文件中的策略。运行 profile 可保存
 `quant_profile: pi05-q40-v1` 引用；自定义策略放在同一 YAML 的 `quantization_profiles` 下，格式为

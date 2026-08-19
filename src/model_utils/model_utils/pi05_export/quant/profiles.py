@@ -40,6 +40,8 @@ class QuantizationRoleProfile:
     donor_dtype: str | None = None
     smoothquant_alpha: float | None = None
     smoothquant_epsilon: float | None = None
+    smoothquant_verify_rtol: float | None = None
+    smoothquant_verify_atol: float | None = None
 
 
 @dataclass(frozen=True)
@@ -48,9 +50,9 @@ class QuantizationProfile:
     status: str
     target_soc: str | None
     export_device: str | None
+    export_dtype: str | None
     donor_device: str | None
-    npu_geglu: bool | None
-    fast_gelu: bool | None
+    fast_gelu_scope: str | None
     vlm: QuantizationRoleProfile
     action_expert: QuantizationRoleProfile
 
@@ -72,9 +74,9 @@ class QuantizationProfile:
             "status": self.status,
             "target_soc": self.target_soc,
             "export_device": self.export_device,
+            "export_dtype": self.export_dtype,
             "donor_device": self.donor_device,
-            "npu_geglu": self.npu_geglu,
-            "fast_gelu": self.fast_gelu,
+            "fast_gelu_scope": self.fast_gelu_scope,
             "vlm": _role_as_dict(self.vlm),
             "action_expert": _role_as_dict(self.action_expert),
         }
@@ -101,6 +103,9 @@ def _role_as_dict(role: QuantizationRoleProfile) -> dict[str, Any]:
     if role.smoothquant_alpha is not None:
         data["smoothquant_alpha"] = role.smoothquant_alpha
         data["smoothquant_epsilon"] = role.smoothquant_epsilon
+    if role.smoothquant_verify_rtol is not None:
+        data["smoothquant_verify_rtol"] = role.smoothquant_verify_rtol
+        data["smoothquant_verify_atol"] = role.smoothquant_verify_atol
     return data
 
 
@@ -125,6 +130,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         "donor_dtype",
         "smoothquant_alpha",
         "smoothquant_epsilon",
+        "smoothquant_verify_rtol",
+        "smoothquant_verify_atol",
     }
     unknown = sorted(set(data) - allowed)
     if unknown:
@@ -200,6 +207,20 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
             or smoothquant_epsilon <= 0.0
         ):
             raise ValueError(f"{where}.smoothquant_epsilon must be finite and positive")
+    smoothquant_verify_rtol = data.get("smoothquant_verify_rtol")
+    smoothquant_verify_atol = data.get("smoothquant_verify_atol")
+    if (smoothquant_verify_rtol is None) != (smoothquant_verify_atol is None):
+        raise ValueError(f"{where} must declare smoothquant_verify_rtol and smoothquant_verify_atol together")
+    if smoothquant_verify_rtol is not None and smoothquant_alpha is None:
+        raise ValueError(f"{where} SmoothQuant verification tolerances require smoothquant_alpha and epsilon")
+    for field, value in (
+        ("smoothquant_verify_rtol", smoothquant_verify_rtol),
+        ("smoothquant_verify_atol", smoothquant_verify_atol),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0.0
+        ):
+            raise ValueError(f"{where}.{field} must be finite and non-negative")
 
     return QuantizationRoleProfile(
         enabled=enabled,
@@ -214,6 +235,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         donor_dtype=donor_dtype,
         smoothquant_alpha=float(smoothquant_alpha) if smoothquant_alpha is not None else None,
         smoothquant_epsilon=float(smoothquant_epsilon) if smoothquant_epsilon is not None else None,
+        smoothquant_verify_rtol=float(smoothquant_verify_rtol) if smoothquant_verify_rtol is not None else None,
+        smoothquant_verify_atol=float(smoothquant_verify_atol) if smoothquant_verify_atol is not None else None,
     )
 
 
@@ -225,9 +248,9 @@ def parse_quantization_profile(name: str, value: Any) -> QuantizationProfile:
         "status",
         "target_soc",
         "export_device",
+        "export_dtype",
         "donor_device",
-        "npu_geglu",
-        "fast_gelu",
+        "fast_gelu_scope",
         "vlm",
         "action_expert",
     }
@@ -242,33 +265,42 @@ def parse_quantization_profile(name: str, value: Any) -> QuantizationProfile:
     status = data.get("status", "experimental")
     target_soc = data.get("target_soc")
     export_device = data.get("export_device")
+    export_dtype = data.get("export_dtype")
     donor_device = data.get("donor_device")
-    npu_geglu = data.get("npu_geglu")
-    fast_gelu = data.get("fast_gelu")
+    fast_gelu_scope = data.get("fast_gelu_scope")
     if not isinstance(status, str) or not status:
         raise ValueError(f"quantization profile {name!r}.status must be non-empty")
     for field, value in (
         ("target_soc", target_soc),
         ("export_device", export_device),
+        ("export_dtype", export_dtype),
         ("donor_device", donor_device),
     ):
         if value is not None and not isinstance(value, str):
             raise ValueError(f"quantization profile {name!r}.{field} must be a string or null")
-    for field, value in (("npu_geglu", npu_geglu), ("fast_gelu", fast_gelu)):
-        if value is not None and not isinstance(value, bool):
-            raise ValueError(f"quantization profile {name!r}.{field} must be boolean or null")
+    if export_dtype is not None and export_dtype not in {"fp16", "fp32", "auto"}:
+        raise ValueError(f"quantization profile {name!r}.export_dtype must be one of fp16, fp32, or auto")
+    if fast_gelu_scope is not None and fast_gelu_scope not in {"none", "all", "vision", "vlm-text", "ae"}:
+        raise ValueError(
+            f"quantization profile {name!r}.fast_gelu_scope must be one of none, all, vision, vlm-text, or ae"
+        )
     vlm = _parse_role(data.get("vlm", {"enabled": False}), f"quantization profile {name!r}.vlm")
     action_expert = _parse_role(
         data.get("action_expert", {"enabled": False}),
         f"quantization profile {name!r}.action_expert",
     )
-    if npu_geglu is True and fast_gelu is True:
-        raise ValueError(f"quantization profile {name!r} cannot enable both npu_geglu and fast_gelu")
-    role_profiles = (vlm, action_expert)
-    if any(role.fused_geglu_donor is True for role in role_profiles) and (npu_geglu is not True or fast_gelu is True):
-        raise ValueError(f"quantization profile {name!r} fused_geglu_donor requires exact NPU GeGLU")
-    if any(role.expected_npu_geglu_nodes is not None for role in role_profiles) and npu_geglu is not True:
-        raise ValueError(f"quantization profile {name!r} expected_npu_geglu_nodes requires npu_geglu=true")
+    if vlm.enabled and fast_gelu_scope in {"vision", "vlm-text", "all"}:
+        raise ValueError(f"quantization profile {name!r} cannot combine VLM W8A8 with scope {fast_gelu_scope!r}")
+    if action_expert.enabled and fast_gelu_scope in {"ae", "all"}:
+        raise ValueError(
+            f"quantization profile {name!r} cannot combine Action Expert W8A8 with scope {fast_gelu_scope!r}"
+        )
+    if vlm.fused_geglu_donor is True and vlm.expected_npu_geglu_nodes is None:
+        raise ValueError(f"quantization profile {name!r} VLM fused_geglu_donor requires expected_npu_geglu_nodes")
+    if action_expert.fused_geglu_donor is True and action_expert.expected_npu_geglu_nodes is None:
+        raise ValueError(
+            f"quantization profile {name!r} Action Expert fused_geglu_donor requires expected_npu_geglu_nodes"
+        )
     if vlm.expected_calibration_steps is not None:
         raise ValueError(f"quantization profile {name!r} expected_calibration_steps applies only to action_expert")
     return QuantizationProfile(
@@ -276,9 +308,9 @@ def parse_quantization_profile(name: str, value: Any) -> QuantizationProfile:
         status=status,
         target_soc=target_soc,
         export_device=export_device,
+        export_dtype=export_dtype,
         donor_device=donor_device,
-        npu_geglu=npu_geglu,
-        fast_gelu=fast_gelu,
+        fast_gelu_scope=fast_gelu_scope,
         vlm=vlm,
         action_expert=action_expert,
     )
@@ -339,11 +371,19 @@ def _stat_identity(path: Path) -> dict[str, Any]:
     return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def _content_identity(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path.resolve()), "size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
 def artifact_identity(path: Path) -> dict[str, Any]:
-    files = [_stat_identity(path)]
+    files = [_content_identity(path)]
     sidecar = path.with_name(path.name + ".data")
     if sidecar.is_file():
-        files.append(_stat_identity(sidecar))
+        files.append(_content_identity(sidecar))
     return {"files": files}
 
 

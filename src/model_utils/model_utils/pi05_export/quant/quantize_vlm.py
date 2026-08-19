@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 from pathlib import Path
 
 import numpy as np
@@ -83,7 +82,6 @@ def _resize_calibration_images(feed: dict[str, np.ndarray], onnx_path: Path) -> 
 
 # Regexes (case-insensitive, matched against ONNX node *name*) whose nodes are
 # kept in fp16 by default. Tune for your exported graph via --list-nodes first.
-_UNFUSED_GEGLU_DISABLE_REGEX = r"mlp/(gate_proj|up_proj)/MatMul"
 _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
     # SigLIP / vision tower — small FLOPs, wide dynamic range, feeds all tokens.
     r"vision",
@@ -100,7 +98,7 @@ _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
     # Legacy donors expose separate gate/up MatMuls while the NPU graph fuses
     # them. The Route-A fused donor instead exposes ``mlp/MatMul`` and therefore
     # does not match this safety exclusion; its fused MatMul can be quantized.
-    _UNFUSED_GEGLU_DISABLE_REGEX,
+    r"mlp/(gate_proj|up_proj)/MatMul",
 )
 
 
@@ -225,17 +223,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fused-geglu-donor",
         action="store_true",
-        help="Require a Route-A donor whose fused Gemma MLP MatMuls match every NPUGeglu producer.",
-    )
-    p.add_argument(
-        "--unfused-geglu-deployment",
-        action="store_true",
-        help="Require a Route-A NPU graph with separate gate_proj/up_proj MatMuls and no NPUGeglu.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--require-npu-geglu",
         action="store_true",
-        help="Require the Route-A NPU deployment graph to contain valid NPUGeglu sites.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--expected-npu-geglu-nodes", type=int, default=None, help=argparse.SUPPRESS)
     return p
@@ -251,56 +244,6 @@ def _parse_key_map(items: list[str] | None) -> dict[str, str]:
     return out
 
 
-def _resolve_disable_regexes(disable_regexes: list[str] | None, *, unfused_geglu: bool) -> list[str]:
-    """Drop the legacy gate/up exclusion only for the explicit fallback route."""
-    if disable_regexes is not None:
-        return disable_regexes
-    return [
-        pattern for pattern in _DEFAULT_DISABLE_REGEXES if not unfused_geglu or pattern != _UNFUSED_GEGLU_DISABLE_REGEX
-    ]
-
-
-def validate_unfused_geglu_route(donor, npu):  # noqa: ANN001
-    """Require separate gate/up MatMuls in both donor and NPU deployment graphs."""
-    if any(node.op_type == "NPUGeglu" for node in npu.graph.node):
-        raise RuntimeError("Unfused GeGLU deployment still contains NPUGeglu")
-    donor_names = [node.name for node in donor.graph.node if node.name]
-    npu_names = [node.name for node in npu.graph.node if node.name]
-    if len(donor_names) != len(set(donor_names)) or len(npu_names) != len(set(npu_names)):
-        raise RuntimeError("Unfused GeGLU route contains duplicate node names")
-    donor_by_name = {node.name: node for node in donor.graph.node}
-    donor_init = {initializer.name: initializer for initializer in donor.graph.initializer}
-    npu_init = {initializer.name: initializer for initializer in npu.graph.initializer}
-    target_pattern = re.compile(r"^(?P<scope>.+/mlp)/(?P<projection>gate_proj|up_proj)/MatMul$")
-    targets = []
-    projections_by_scope: dict[str, set[str]] = {}
-    for node in npu.graph.node:
-        match = target_pattern.search(node.name)
-        if node.op_type not in {"MatMul", "Gemm"} or match is None:
-            continue
-        targets.append(node.name)
-        projections_by_scope.setdefault(match.group("scope"), set()).add(match.group("projection"))
-    if not targets:
-        raise RuntimeError("Unfused GeGLU deployment has no separate gate_proj/up_proj MatMuls")
-    incomplete = [
-        scope for scope, projections in projections_by_scope.items() if projections != {"gate_proj", "up_proj"}
-    ]
-    if incomplete:
-        raise RuntimeError(f"Unfused GeGLU deployment has incomplete gate/up pairs: {incomplete[:5]}")
-    for npu_node in (node for node in npu.graph.node if node.name in targets):
-        donor_node = donor_by_name.get(npu_node.name)
-        if donor_node is None or donor_node.op_type != npu_node.op_type:
-            raise RuntimeError(f"Unfused GeGLU donor is missing {npu_node.op_type} {npu_node.name!r}")
-        if len(donor_node.input) < 2 or len(npu_node.input) < 2:
-            raise RuntimeError(f"Unfused GeGLU MatMul {npu_node.name!r} has no weight input")
-        donor_weight = donor_init.get(donor_node.input[1])
-        npu_weight = npu_init.get(npu_node.input[1])
-        if donor_weight is None or npu_weight is None or list(donor_weight.dims) != list(npu_weight.dims):
-            raise RuntimeError(f"Unfused GeGLU weight shape mismatch for {npu_node.name!r}")
-    LOGGER.info("Validated %d separate gate/up donor target(s).", len(targets))
-    return targets
-
-
 def main() -> int:
     args = build_arg_parser().parse_args()
     logging.basicConfig(
@@ -308,13 +251,10 @@ def main() -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    if args.unfused_geglu_deployment and (args.fused_geglu_donor or args.require_npu_geglu):
-        LOGGER.error("--unfused-geglu-deployment conflicts with fused/required NPU GeGLU")
-        return 1
     if args.expected_npu_geglu_nodes is not None and not args.require_npu_geglu:
         LOGGER.error("--expected-npu-geglu-nodes requires --require-npu-geglu")
         return 1
-    if (args.fused_geglu_donor or args.unfused_geglu_deployment or args.require_npu_geglu) and not args.npu_onnx_path:
+    if (args.fused_geglu_donor or args.require_npu_geglu) and not args.npu_onnx_path:
         LOGGER.error("GeGLU Route-A validation requires --npu-onnx-path")
         return 1
 
@@ -327,10 +267,7 @@ def main() -> int:
     quantizable = common.collect_quantizable_nodes(model_proto)
     LOGGER.info("Found %d quantizable node(s) (%s).", len(quantizable), "/".join(common._QUANTIZABLE_OPS))
 
-    disable_regexes = _resolve_disable_regexes(
-        args.disable_regex,
-        unfused_geglu=args.unfused_geglu_deployment,
-    )
+    disable_regexes = args.disable_regex if args.disable_regex is not None else list(_DEFAULT_DISABLE_REGEXES)
     disable_names = common.build_disable_names(
         quantizable,
         disable_regexes,
@@ -379,8 +316,6 @@ def main() -> int:
             common.validate_npu_geglu_deployment(npu_model, args.expected_npu_geglu_nodes)
         if args.fused_geglu_donor:
             common.validate_fused_geglu_route(model_proto, npu_model)
-        if args.unfused_geglu_deployment:
-            validate_unfused_geglu_route(model_proto, npu_model)
 
     calib_data = build_calib_data(
         onnx_path=onnx_path,
