@@ -243,6 +243,25 @@ def test_policy_uses_snapshot_active_mode_and_allows_active_owner_child():
     assert decision.error_code == ""
 
 
+def test_policy_defers_control_mode_match_to_hybrid_runtime_switcher():
+    snapshot = _snapshot(
+        active_control_mode="moveit_planning",
+        required_control_mode="moveit_planning",
+        control_mode_switching_enabled=True,
+        navigation_ready=True,
+    )
+
+    decision = _policy().evaluate(
+        _request(
+            skill_name="navigation", motion_direction=None, motion_distance=None, direction="forward", distance=1.0
+        ),
+        snapshot,
+    )
+
+    assert decision.admitted
+    assert decision.error_code == ""
+
+
 def test_policy_returns_stable_readiness_reason():
     decision = _policy().evaluate(
         _request(skill_name="relative"),

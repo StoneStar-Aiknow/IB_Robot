@@ -69,7 +69,7 @@ PROVENANCE_PREIMAGE_FIELDS = frozenset({"schema_version", "source_release_digest
 
 
 def _robot_context_to_preimage(robot_context: Any) -> dict[str, Any]:
-    return {
+    preimage = {
         "context_schema_version": _attr(robot_context, "context_schema_version"),
         "robot_config_digest": _attr(robot_context, "robot_config_digest"),
         "named_poses": _as_mapping(_attr(robot_context, "named_poses")),
@@ -86,6 +86,11 @@ def _robot_context_to_preimage(robot_context: Any) -> dict[str, Any]:
         "gripper_closed_position": _attr(robot_context, "gripper_closed_position"),
         "execution_endpoints": _as_mapping(_attr(robot_context, "execution_endpoints")),
     }
+    if preimage["context_schema_version"] >= 3:
+        preimage["supported_control_modes"] = list(
+            _as_tuple(_attr(robot_context, "supported_control_modes", default=()))
+        )
+    return preimage
 
 
 def _delegated_executor_to_preimage(executor: Any) -> dict[str, Any]:

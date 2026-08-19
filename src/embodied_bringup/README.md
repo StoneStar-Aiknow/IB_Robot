@@ -68,7 +68,7 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | `robot_config` | `so101_single_arm` | robot_config 中的机器人配置名 |
 | `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
 | `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
-| `nav_stage` | 空 | 可选导航阶段；`navigation` 启用导航闭环，`mapping` 默认不启动具身运行时 |
+| `nav_stage` | 空 | 配置声明的工作阶段；导航配置支持 `mapping`/`navigation`，移动抓取统一配置还支持 `grasp` |
 | `use_sim` | `false` | 是否启动仿真路径 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |

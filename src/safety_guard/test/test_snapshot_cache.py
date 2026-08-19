@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, PRIMITIVE_CONTRACT_V2
+from embodied_common.primitive_contracts import (
+    PRIMITIVE_CONTRACT_V1,
+    PRIMITIVE_CONTRACT_V2,
+    PRIMITIVE_CONTRACT_V3,
+)
 from ibrobot_msgs.srv import ValidateSkill
 from safety_guard.safety_guard_node import SafetyGuardNode
 from safety_guard.snapshot_cache import SafetySnapshotCache, SnapshotCacheError, SnapshotIdentity
@@ -22,7 +26,7 @@ def _snapshot(name: str = "open_gripper_skill", *, context_schema_version: int =
         "arm_trajectory_action": "/trajectory",
         "move_configuration_service": "/move",
     }
-    if context_schema_version == 2:
+    if context_schema_version >= 2:
         execution_endpoints["navigation_action"] = "/navigation"
     robot = SkillRobotContext(
         robot_name="test_robot",
@@ -41,6 +45,7 @@ def _snapshot(name: str = "open_gripper_skill", *, context_schema_version: int =
         gripper_open_position=1.0,
         gripper_closed_position=0.0,
         execution_endpoints=execution_endpoints,
+        supported_control_modes=("moveit_planning", "base_navigation") if context_schema_version == 3 else (),
     )
     template = {
         "capability": {
@@ -59,9 +64,11 @@ def _snapshot(name: str = "open_gripper_skill", *, context_schema_version: int =
     return SkillSnapshot(
         robot_name="test_robot",
         profile_name="test",
-        primitive_contract_digest=(
-            PRIMITIVE_CONTRACT_V2.digest if context_schema_version == 2 else PRIMITIVE_CONTRACT_V1.digest
-        ),
+        primitive_contract_digest={
+            1: PRIMITIVE_CONTRACT_V1.digest,
+            2: PRIMITIVE_CONTRACT_V2.digest,
+            3: PRIMITIVE_CONTRACT_V3.digest,
+        }[context_schema_version],
         robot_context=robot,
         delegated_executors={},
         templates={name: template},
@@ -108,6 +115,17 @@ def test_cache_accepts_v2_primitive_contract_digest_selected_by_context() -> Non
 
     assert cached.payload["registry_preimage"]["primitive_contract_digest"] == PRIMITIVE_CONTRACT_V2.digest
     assert cached.robot_context["context_schema_version"] == 2
+
+
+def test_cache_accepts_v3_hybrid_context_and_supported_control_modes() -> None:
+    cache = SafetySnapshotCache()
+    snapshot = _snapshot(context_schema_version=3)
+
+    cached = _activate(cache, snapshot)
+
+    assert cached.payload["registry_preimage"]["primitive_contract_digest"] == PRIMITIVE_CONTRACT_V3.digest
+    assert cached.robot_context["context_schema_version"] == 3
+    assert cached.robot_context["supported_control_modes"] == ("moveit_planning", "base_navigation")
 
 
 def test_cache_rejects_digest_and_canonical_payload_mismatches() -> None:

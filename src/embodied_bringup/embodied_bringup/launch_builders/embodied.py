@@ -11,6 +11,7 @@ from robot_config.loader import (
     navigation_endpoint_projection,
     robot_config_digest,
     robot_context_schema_version,
+    robot_supported_control_modes,
     validate_navigation_endpoint_contract,
 )
 from robot_config.logger_utils import get_colored_logger
@@ -77,8 +78,13 @@ def generate_embodied_nodes(
         return []
 
     required_control_mode = str(robot_config.get("skill_required_control_mode", "moveit_planning")).strip()
+    supported_control_modes = robot_supported_control_modes(robot_config)
     moveit_compatible = "moveit" in required_control_mode.lower() and "moveit" in active_control_mode.lower()
-    motion_mode_compatible = active_control_mode == required_control_mode or moveit_compatible
+    motion_mode_compatible = (
+        active_control_mode == required_control_mode
+        or moveit_compatible
+        or (active_control_mode in supported_control_modes and required_control_mode in supported_control_modes)
+    )
     required_mode_error = (
         "embodied minimal closure requires a MoveIt-compatible control mode"
         if "moveit" in required_control_mode.lower()
@@ -160,6 +166,12 @@ def generate_embodied_nodes(
         "motion_authorized": motion_authorized,
         "active_control_mode": active_control_mode,
         "skill_required_control_mode": robot_config.get("skill_required_control_mode", ""),
+        "supported_control_modes_json": json.dumps(list(supported_control_modes)),
+        "motion_mode_service": str(
+            robot_config.get("motion_mode", {}).get(
+                "set_navigation_enabled_service", "motion_mode/set_navigation_enabled"
+            )
+        ),
         "skill_gateway_status_service": embodied_config.get(
             "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
         ),

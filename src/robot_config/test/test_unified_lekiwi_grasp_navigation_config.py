@@ -1,0 +1,159 @@
+from pathlib import Path
+
+import yaml
+
+from robot_config.launch_builders.perception import generate_camera_nodes
+from robot_config.loader import load_robot_config_dict
+
+ROOT = Path(__file__).resolve().parents[3]
+CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_lidar.yaml"
+
+
+def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
+
+    assert config["joints"]["all"] == ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    assert config["ros2_control"]["controllers_config"].endswith("lekiwi_controllers.yaml")
+    assert "base_only" not in config["ros2_control"].get("xacro_mappings", {})
+    assert config["motion_mode"]["manipulation_controllers"] == [
+        "arm_trajectory_controller",
+        "gripper_trajectory_controller",
+    ]
+    assert config["motion_mode"]["navigation_controllers"] == ["base_velocity_controller"]
+
+    peripherals = {item["name"]: item for item in config["peripherals"]}
+    assert set(peripherals) == {"wrist", "front", "mid360"}
+    assert peripherals["wrist"]["transform"]["parent_frame"] == "gripper"
+    assert peripherals["wrist"]["serial_number"] == "349522071345"
+    assert peripherals["front"]["transform"]["parent_frame"] == "base_link"
+    assert peripherals["front"]["serial_number"] == "043322073551"
+    assert peripherals["front"]["driver_camera_name"] == "front"
+    assert peripherals["front"]["align_depth"] is True
+    assert peripherals["mid360"]["driver"] == "livox_mid360"
+    assert config["semantic_mapping"]["camera"] == {
+        "peripheral": "front",
+        "mounting": "fixed",
+        "parent_frame": "base_link",
+        "rgb_topic": "/camera/front/image_raw",
+        "depth_topic": "/camera/front/aligned_depth_to_color/image_raw",
+        "camera_info_topic": "/camera/front/camera_info",
+    }
+
+
+def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
+    hybrid = load_robot_config_dict(CONFIG_PATH)
+    grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
+    mapping = load_robot_config_dict(CONFIG_PATH, nav_stage="mapping")
+    navigation = load_robot_config_dict(CONFIG_PATH, nav_stage="navigation")
+
+    assert hybrid["nav_stage"] == "hybrid"
+    assert hybrid["default_control_mode"] == "moveit_planning"
+    assert hybrid["skill_required_control_mode"] == "moveit_planning"
+    assert hybrid["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_lidar"
+    assert hybrid["navigation"]["enabled"] is True
+    assert hybrid["navigation"]["command_server"]["enabled"] is True
+    assert hybrid["mid360_mount_file"].endswith("lekiwi_mid360_mount.yaml")
+    assert [item["name"] for item in hybrid["peripherals"]] == ["wrist", "front", "mid360"]
+    assert "peripheral_names" not in hybrid
+    assert set(hybrid["control_modes"]["moveit_planning"]["inactive_controllers"]) == {"base_velocity_controller"}
+    assert hybrid["motion_mode"]["manipulation_control_mode"] == "moveit_planning"
+    assert hybrid["motion_mode"]["navigation_control_mode"] == "base_navigation"
+
+    assert grasp["nav_stage"] == "grasp"
+    assert grasp["navigation"]["enabled"] is False
+    assert [item["name"] for item in grasp["peripherals"]] == ["wrist"]
+
+    assert mapping["nav_stage"] == "mapping"
+    assert mapping["default_control_mode"] == "base_navigation"
+    assert mapping["navigation"]["fast_lio"]["enabled"] is True
+    assert mapping["navigation"]["slam_toolbox"]["enabled"] is True
+    assert mapping["navigation"]["nav2_bringup"]["enabled"] is False
+    assert mapping["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel"
+    assert mapping["motion_mode"]["navigation_enabled_on_startup"] is True
+    assert mapping["embodied"]["skill_catalog_profile"] == ""
+    assert mapping["perception_services"]["services"] == []
+    assert mapping["grasp_execution"]["enabled"] is False
+    assert mapping["placement_execution"]["enabled"] is False
+    assert mapping["contract"]["observations"] == []
+    assert mapping["contract"]["actions"] == []
+    assert [item["name"] for item in mapping["peripherals"]] == ["front", "mid360"]
+    assert "peripheral_names" not in mapping
+    assert mapping["control_modes"]["base_navigation"]["controllers"] == [
+        "joint_state_broadcaster",
+        "base_velocity_controller",
+    ]
+
+    assert navigation["nav_stage"] == "navigation"
+    assert navigation["default_control_mode"] == "base_navigation"
+    assert navigation["skill_required_control_mode"] == "base_navigation"
+    assert navigation["embodied"]["skill_catalog_profile"] == ""
+    assert navigation["perception_services"]["services"] == []
+    assert navigation["grasp_execution"]["enabled"] is False
+    assert navigation["placement_execution"]["enabled"] is False
+    assert navigation["contract"]["observations"] == []
+    assert navigation["contract"]["actions"] == []
+    assert [item["name"] for item in navigation["peripherals"]] == ["front", "mid360"]
+    assert "peripheral_names" not in navigation
+    assert navigation["navigation"]["fast_lio"]["enabled"] is True
+    assert navigation["navigation"]["slam_toolbox"]["enabled"] is False
+    assert navigation["navigation"]["nav2_bringup"]["use_amcl"] is True
+    assert navigation["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
+    assert navigation["navigation"]["command_server"]["enabled"] is True
+    assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
+
+
+def test_unified_profile_launches_distinct_realsense_devices():
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
+
+    drivers = [
+        node
+        for node in generate_camera_nodes(config, use_sim=False)
+        if vars(node).get("_Node__package") == "realsense2_camera"
+    ]
+    assert {vars(node).get("_Node__node_name") for node in drivers} == {"wrist_camera", "front"}
+
+    def text_value(value):
+        if isinstance(value, tuple):
+            value = "".join(item.text if hasattr(item, "text") else str(item) for item in value)
+        return str(value).strip().strip("'\"")
+
+    params_by_name = {
+        vars(node).get("_Node__node_name"): {
+            text_value(key): text_value(value) for key, value in vars(node).get("_Node__parameters")[0].items()
+        }
+        for node in drivers
+    }
+    assert params_by_name["wrist_camera"]["serial_no"] == "349522071345"
+    assert params_by_name["front"]["serial_no"] == "043322073551"
+
+
+def test_unified_profile_applies_only_the_front_camera_artifact(monkeypatch, tmp_path):
+    artifact = tmp_path / ".ros/ibrobot/calib/current/base_to_front_camera.yaml"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "status": "approved",
+                "device": {"name": "front_camera", "serial": "043322073551"},
+                "transform": {
+                    "parent_frame": "base_link",
+                    "child_frame": "camera_front_optical_frame",
+                    "translation": [0.12, -0.03, 0.42],
+                    "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    hybrid = load_robot_config_dict(CONFIG_PATH)
+    front = next(item for item in hybrid["peripherals"] if item["name"] == "front")
+    wrist = next(item for item in hybrid["peripherals"] if item["name"] == "wrist")
+    assert [front["transform"][key] for key in ("x", "y", "z")] == [0.12, -0.03, 0.42]
+    assert wrist["transform"]["parent_frame"] == "gripper"
+
+    grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
+    assert [item["name"] for item in grasp["peripherals"]] == ["wrist"]

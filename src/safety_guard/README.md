@@ -47,11 +47,11 @@ Task / Skill request
    `generation>0` 必须精确匹配，不静默升级到更新版本；已被回收返回 `SKILL_SNAPSHOT_NOT_RETAINED`。
 
 拉取到的 `snapshot_json` 进入 `SafetySnapshotCache` 前必须通过完整校验：必须是 canonical JSON、
-`schema_version` 取值由 `SkillRobotContext.context_schema_version` 选择，仅接受 `{1, 2}`
-（V1 字段集严格等于 `snapshot_payload_v1`，V2 在 V1 之上追加 navigation 字段集）；本地重算
+context schema 接受 V1/V2/V3（V3 在 V1+V2 primitive 集合上增加 hybrid 控制模式字段）。公开 request
+wire 的 `schema_version` 仍仅接受 `{1, 2}`，由每个 capability 选择；本地重算
 `registry_digest`、`capability_digest`、`provenance_digest` 必须与响应一致；
 `primitive_contract_digest` 不再是单一全局常量，而是按 context version 选择
-（V1 使用 `PRIMITIVE_CONTRACT_V1`，V2 使用 `PRIMITIVE_CONTRACT_V2`，由
+（V1 使用 `PRIMITIVE_CONTRACT_V1`，V2 使用 `PRIMITIVE_CONTRACT_V2`，V3 使用 `PRIMITIVE_CONTRACT_V3`，由
 `primitive_contract_for_version(context_schema_version)` 在
 `embodied_common` 中导出），snapshot 内的 `primitive_contract_digest` 必须等于本地对应版本的
 digest；skill 名称必须唯一非空。任一校验失败以 `SKILL_SNAPSHOT_DIGEST_MISMATCH`
@@ -108,7 +108,7 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向 |
 | `motion_distance` | 相对运动距离 |
-| `direction` | V2 导航方向枚举（`forward` / `backward` / `leftward` / `rightward` / `turn-left` / `turn-right`），仅 V2 schema 由导航技能下发 |
+| `direction` | V2 request schema 导航方向枚举（`forward` / `backward` / `leftward` / `rightward` / `turn-left` / `turn-right`），V2/V3 context 由导航技能下发 |
 | `distance` | V2 直行距离 (m)，仅 `nav_straight` 必填，必须为有限正数 |
 | `degree` | V2 转向角度 (deg)，仅 `nav_turn` 必填，必须为有限数 |
 | `x` | V2 绝对坐标 X (m)，仅 `nav_abs_coordinate` 使用，与 `has_x` 配对 |
@@ -217,9 +217,9 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 - `close_gripper`
 - `rotate_gripper_cw`
 - `rotate_gripper_ccw`
-- `nav_straight`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
-- `nav_turn`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
-- `nav_abs_coordinate`（V2 schema 独占；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
+- `nav_straight`（V2 request schema；V2/V3 context 可用；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
+- `nav_turn`（V2 request schema；V2/V3 context 可用；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
+- `nav_abs_coordinate`（V2 request schema；V2/V3 context 可用；V1 请求携带该 primitive 名返回 `SKILL_SCHEMA_INVALID`）
 
 ### 原子动作边界检查
 
@@ -268,7 +268,7 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 
 #### `nav_straight`
 
-会检查（仅 V2 schema 触发；V1 请求携带该 primitive 名直接 `SKILL_SCHEMA_INVALID`）：
+会检查（V2 request schema，在 V2/V3 context 触发；V1 请求携带该 primitive 名直接 `SKILL_SCHEMA_INVALID`）：
 
 1. `direction` 必须命中允许枚举集合（`forward` / `backward` / `leftward` / `rightward`），
    非枚举值返回 `SKILL_LIMIT_VIOLATION`

@@ -207,6 +207,22 @@ def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
     assert all(vars(node).get("_Node__package") != "robot_moveit" for node in nodes)
 
 
+def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
+    config_path = (
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_lidar.yaml"
+    )
+    config = load_robot_config_dict(config_path)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+
+    assert params["context_schema_version"] == 3
+    assert _decode_launch_json_string(params["supported_control_modes_json"]) == [
+        "moveit_planning",
+        "base_navigation",
+    ]
+    assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
+
+
 def test_navigation_endpoint_missing_action_name_raises():
     import pytest
 

@@ -89,12 +89,12 @@ SO101 当前配置示例：
 | `close_gripper` | 闭合夹爪 |
 | `rotate_gripper_cw` | 绕当前末端局部 Z 轴顺时针旋转 |
 | `rotate_gripper_ccw` | 绕当前末端局部 Z 轴逆时针旋转 |
-| `nav_straight` | V2 schema 独占；按方向枚举直行/横移指定距离，委托 `ExecuteNavigation` action |
-| `nav_turn` | V2 schema 独占；按 `turn-left` / `turn-right` 方向旋转指定角度，委托 `ExecuteNavigation` action |
-| `nav_abs_coordinate` | V2 schema 独占；导航到 `map` frame 绝对坐标 (x, y, yaw)，委托 `ExecuteNavigation` action |
+| `nav_straight` | V2 request schema；V2/V3 context 可用；按方向枚举直行/横移指定距离，委托 `ExecuteNavigation` action |
+| `nav_turn` | V2 request schema；V2/V3 context 可用；按 `turn-left` / `turn-right` 方向旋转指定角度，委托 `ExecuteNavigation` action |
+| `nav_abs_coordinate` | V2 request schema；V2/V3 context 可用；导航到 `map` frame 绝对坐标 (x, y, yaw)，委托 `ExecuteNavigation` action |
 
 `nav_*` 三个 primitive 委托到 `/navigation/execute`（`ibrobot_msgs/action/ExecuteNavigation`）。
-它们只在 V2 schema 上下文中可用；V1 请求携带 `nav_*` primitive 名直接返回
+它们只在 V2/V3 context 中可用；V1 请求携带 `nav_*` primitive 名直接返回
 `SKILL_SCHEMA_INVALID`，不会进入 dispatch 阶段。详见
 [导航 action dispatch](#9-导航-action-dispatch)。
 
@@ -486,7 +486,8 @@ delegated nonce；只有人工 bring-up client 可使用 `supervised_direct=true
 
 ### 8.6 导航 action dispatch
 
-`nav_straight` / `nav_turn` / `nav_abs_coordinate` 三个 primitive（V2 schema 独占）的 dispatch 入口是
+`nav_straight` / `nav_turn` / `nav_abs_coordinate` 三个 primitive（V2 request schema，V2/V3 context
+可用）的 dispatch 入口是
 `/navigation/execute`（`ibrobot_msgs/action/ExecuteNavigation`）。该 action name 由
 `robot_config.navigation.command_server.action_name` SSOT 提供，经
 `robot_execution_endpoints.navigation_action_name` 投影到 `SkillRobotContext`，并随
@@ -497,9 +498,10 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 1. **wire contract 校验**：请求体 `schema_version` 与 `dispatch_binding.schema_version` 都必须等于 `2`，
    由 `validate_request_schema_version` 校验；任一为 `1` 而请求携带 navigation_* 字段，或
    `context_schema_version=1` 的 snapshot 上执行 nav_* primitive，返回 `SKILL_SCHEMA_INVALID`。
-2. **context version 选择**：snapshot 的 `context_schema_version` 必须为 `2`，否则即使 wire
+2. **context version 选择**：snapshot 的 `context_schema_version` 必须为 `2` 或 `3`，否则即使 wire
    `schema_version=2` 也以 `SKILL_SCHEMA_INVALID` 拒绝（防止 V1 snapshot 上通过 wire 字段绕过 contract）。
-3. **控制模式**：`active_control_mode` 必须等于 `base_navigation`；其他模式返回
+3. **控制模式**：V2 snapshot 要求 `active_control_mode == base_navigation`；V3 hybrid snapshot 在下发
+   前通过 `motion_mode/set_navigation_enabled` 切换到 `base_navigation`。切换失败返回
    `CONTROL_MODE_MISMATCH`，不发送 ExecuteNavigation goal。
 4. **navigation_ready**：Gateway 在 dispatch 前等待 `navigation_ready=true`，即
    `navigation_command_server` 已声明 Action 可发现且 `/global_costmap/costmap` 非空。该 readiness

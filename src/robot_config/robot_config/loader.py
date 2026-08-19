@@ -59,6 +59,8 @@ _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
 _NAV_STAGES = frozenset({"mapping", "navigation"})
+_EXTENDED_NAV_STAGES = frozenset({"grasp", "mapping", "navigation"})
+_HYBRID_NAV_STAGES = frozenset({"grasp", "mapping", "navigation", "hybrid"})
 _ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
 
 
@@ -80,19 +82,51 @@ def _resolve_nav_stage(robot_config: dict[str, Any], nav_stage: str) -> dict[str
         if nav_stage:
             raise ValueError("nav_stage is only supported by configs that declare nav_stages")
         return robot_config
-    if not isinstance(stage_configs, dict) or set(stage_configs) != _NAV_STAGES:
+    if not isinstance(stage_configs, dict):
         raise ValueError(f"nav_stages must contain exactly {sorted(_NAV_STAGES)}")
+    declared_stages = set(stage_configs)
+    if declared_stages == _NAV_STAGES:
+        supported_stages = _NAV_STAGES
+    elif declared_stages == _EXTENDED_NAV_STAGES:
+        supported_stages = _EXTENDED_NAV_STAGES
+    elif declared_stages == _HYBRID_NAV_STAGES:
+        supported_stages = _HYBRID_NAV_STAGES
+    else:
+        raise ValueError(
+            f"nav_stages must contain exactly {sorted(_NAV_STAGES)}, {sorted(_EXTENDED_NAV_STAGES)}, "
+            f"or {sorted(_HYBRID_NAV_STAGES)}"
+        )
     if any(not isinstance(config, dict) for config in stage_configs.values()):
         raise ValueError("each nav_stages entry must be a mapping")
 
     default_stage = robot_config.get("default_nav_stage", "navigation")
     resolved_stage = nav_stage or default_stage
-    if resolved_stage not in _NAV_STAGES:
-        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(_NAV_STAGES)}")
+    if resolved_stage not in supported_stages:
+        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(supported_stages)}")
 
     base = copy.deepcopy(robot_config)
     del base["nav_stages"]
     resolved = _deep_merge_config(base, stage_configs[resolved_stage])
+    peripheral_names = resolved.pop("peripheral_names", None)
+    if peripheral_names is not None:
+        if (
+            not isinstance(peripheral_names, list)
+            or not peripheral_names
+            or not all(isinstance(name, str) and name for name in peripheral_names)
+        ):
+            raise ValueError("peripheral_names must be a non-empty list of names")
+        configured_peripherals = resolved.get("peripherals", [])
+        if not isinstance(configured_peripherals, list):
+            raise ValueError("robot.peripherals must be a list when peripheral_names is used")
+        by_name = {
+            peripheral.get("name"): peripheral
+            for peripheral in configured_peripherals
+            if isinstance(peripheral, dict) and isinstance(peripheral.get("name"), str)
+        }
+        missing = [name for name in peripheral_names if name not in by_name]
+        if missing:
+            raise ValueError(f"peripheral_names references unknown peripheral(s): {missing}")
+        resolved["peripherals"] = [copy.deepcopy(by_name[name]) for name in peripheral_names]
     resolved["nav_stage"] = resolved_stage
     return resolved
 
@@ -130,8 +164,8 @@ def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[
     navigation_enabled = navigation.get("enabled", False)
 
     if command_server is command_server_marker:
-        if nav_stage == "navigation" and navigation_enabled is True:
-            errors.append("navigation.command_server is required when nav_stage is navigation")
+        if nav_stage in {"navigation", "hybrid"} and navigation_enabled is True:
+            errors.append(f"navigation.command_server is required when nav_stage is {nav_stage}")
         return errors
     if not isinstance(command_server, dict):
         errors.append("navigation.command_server must be a mapping")
@@ -158,11 +192,11 @@ def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[
 
     if nav_stage == "mapping":
         errors.append("navigation.command_server is not allowed in nav_stage mapping")
-    elif nav_stage == "navigation":
+    elif nav_stage in {"navigation", "hybrid"}:
         if navigation_enabled is not True:
-            errors.append("navigation.enabled must be true when nav_stage is navigation")
+            errors.append(f"navigation.enabled must be true when nav_stage is {nav_stage}")
         if not enabled:
-            errors.append("navigation.command_server.enabled must be true when nav_stage is navigation")
+            errors.append(f"navigation.command_server.enabled must be true when nav_stage is {nav_stage}")
     elif enabled and navigation_enabled is not True:
         errors.append("navigation.command_server.enabled requires navigation.enabled=true")
 
@@ -197,7 +231,23 @@ def _canonical_digest_json(value: Any) -> str:
 
 def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
     """Select the context schema from the resolved navigation endpoint projection."""
+    if robot_config.get("nav_stage") == "hybrid":
+        return 3
     return 2 if navigation_endpoint_projection(robot_config) is not None else 1
+
+
+def robot_supported_control_modes(robot_config: dict[str, Any]) -> tuple[str, ...]:
+    """Return control modes that a hybrid runtime may select per skill."""
+    if robot_context_schema_version(robot_config) != 3:
+        return ()
+    motion_mode = robot_config.get("motion_mode", {})
+    if not isinstance(motion_mode, dict):
+        return ()
+    modes = (
+        str(motion_mode.get("manipulation_control_mode", "moveit_planning")).strip(),
+        str(motion_mode.get("navigation_control_mode", "base_navigation")).strip(),
+    )
+    return tuple(dict.fromkeys(mode for mode in modes if mode))
 
 
 def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
@@ -253,8 +303,9 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
     teleop_safety = teleoperation.get("safety", {})
     if not isinstance(teleop_safety, dict):
         teleop_safety = {}
+    context_schema_version = robot_context_schema_version(robot_config)
     preimage = {
-        "context_schema_version": robot_context_schema_version(robot_config),
+        "context_schema_version": context_schema_version,
         "robot_name": robot_config.get("name"),
         "named_poses": embodied.get("named_poses", {}) if isinstance(embodied, dict) else {},
         "named_targets": embodied.get("named_targets", {}) if isinstance(embodied, dict) else {},
@@ -270,6 +321,8 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
         "execution_endpoints": robot_execution_endpoints(robot_config),
     }
+    if context_schema_version >= 3:
+        preimage["supported_control_modes"] = list(robot_supported_control_modes(robot_config))
     return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
@@ -354,6 +407,23 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
     overlap = set(controller_groups["manipulation_controllers"]) & set(controller_groups["navigation_controllers"])
     if overlap:
         errors.append("motion_mode controller groups must be disjoint: " + ", ".join(sorted(overlap)))
+
+    mode_names = {}
+    for key in ("manipulation_control_mode", "navigation_control_mode"):
+        value = config.get(key)
+        if value is None and robot_config.get("nav_stage") != "hybrid":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"motion_mode.{key} must be a non-empty control_modes member")
+            continue
+        mode_names[key] = value.strip()
+        control_modes = robot_config.get("control_modes", {})
+        if not isinstance(control_modes, dict) or value.strip() not in control_modes:
+            errors.append(f"motion_mode.{key} must be a control_modes member")
+    if len(set(mode_names.values())) != len(mode_names):
+        errors.append("motion_mode manipulation and navigation control modes must be distinct")
+    if robot_config.get("nav_stage") == "hybrid" and config.get("navigation_enabled_on_startup") is not False:
+        errors.append("hybrid motion_mode must start with navigation_enabled_on_startup=false")
 
     for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
         _positive_number(config, key, "motion_mode", errors)

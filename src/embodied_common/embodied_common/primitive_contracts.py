@@ -457,6 +457,12 @@ PRIMITIVE_CONTRACT_V2 = PrimitiveContractSet(
     2,
     _descriptor_mapping(_V1_DESCRIPTOR_LIST + _V2_NAVIGATION_DESCRIPTOR_LIST),
 )
+# Hybrid Hermes runtimes use the same primitive set as V2 but a distinct
+# context contract because control ownership changes between skills.
+PRIMITIVE_CONTRACT_V3 = PrimitiveContractSet(
+    3,
+    _descriptor_mapping(_V1_DESCRIPTOR_LIST + _V2_NAVIGATION_DESCRIPTOR_LIST),
+)
 
 PRIMITIVE_DESCRIPTORS = PRIMITIVE_CONTRACT_V1.descriptors
 SUPPORTED_PRIMITIVES = frozenset(PRIMITIVE_CONTRACT_V1.descriptors)
@@ -472,6 +478,8 @@ def primitive_contract_for_version(version: int) -> PrimitiveContractSet:
         return PRIMITIVE_CONTRACT_V1
     if version == 2:
         return PRIMITIVE_CONTRACT_V2
+    if version == 3:
+        return PRIMITIVE_CONTRACT_V3
     raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract version: {version}")
 
 

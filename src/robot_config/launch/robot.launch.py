@@ -68,7 +68,7 @@ Launch Arguments:
     sim_platform: Optional CLI override for robot YAML simulation.platform
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
-    nav_stage: Select a navigation workflow stage (mapping or navigation)
+    nav_stage: Select a workflow stage declared by the robot config
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
     inference_pipeline: Pipeline ID targeted by inference launch overrides
     inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
@@ -904,7 +904,9 @@ def generate_launch_description():
                 "nav_stage",
                 default_value="",
                 description=(
-                    "Select a navigation workflow stage: mapping or navigation. Empty uses default_nav_stage."
+                    "Select a workflow stage declared by the robot config. "
+                    "Navigation profiles use mapping/navigation; combined mobile-manipulator profiles may also "
+                    "declare grasp/hybrid. Empty uses default_nav_stage."
                 ),
             ),
             DeclareLaunchArgument(

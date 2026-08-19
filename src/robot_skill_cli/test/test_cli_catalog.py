@@ -65,6 +65,33 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
     }
 
 
+def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    root = Path(__file__).resolve().parents[3]
+    config_path = root / "src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_lidar.yaml"
+    config = load_robot_config_dict(config_path)
+
+    snapshot = compile_local_snapshot(config, config_path)
+
+    assert snapshot.robot_context.context_schema_version == 3
+    assert snapshot.robot_context.supported_control_modes == ("moveit_planning", "base_navigation")
+    control_modes = {
+        skill_name: snapshot.capability_view[skill_name]["required_control_mode"]
+        for skill_name in snapshot.enabled_skill_names
+    }
+    assert {name for name, mode in control_modes.items() if mode == "base_navigation"} == {
+        "nav_abs_coordinate",
+        "nav_straight",
+        "nav_turn",
+    }
+    assert {name for name, mode in control_modes.items() if mode == "moveit_planning"} >= {
+        "pick_object",
+        "place_in_container",
+        "open_gripper_skill",
+    }
+
+
 def test_non_navigation_profile_keeps_v1_robot_context():
     from robot_skill_cli.catalog import compile_local_snapshot
 

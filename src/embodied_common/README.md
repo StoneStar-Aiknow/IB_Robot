@@ -73,11 +73,11 @@ ibrobot_msgs / rclpy
 - `embodied_common.vlm_api_client.VLMAPIClient.complete`（底层扩展接口，返回结构化 dict）
 - `embodied_common.vlm_api_client.VLMClient`（高层客户端，一行式多模型调用，自动路由 / 建图 / 上下文）
 - `embodied_common.wire_contracts.validate_public_request_wire_contracts`（公开请求 wire contract 校验入口，按 schema version 分流 V1/V2 字段集）
-- `embodied_common.wire_contracts.validate_request_schema_version`（仅接受 `{1, 2}`，与请求体顶层 `schema_version` 和 `dispatch_binding.schema_version` 一致性校验）
+- `embodied_common.wire_contracts.validate_request_schema_version`（公开 request wire 仍仅接受 `{1, 2}`；V3 hybrid context 按技能分别使用 V1 或 V2，与请求体顶层 `schema_version` 和 `dispatch_binding.schema_version` 一致性校验）
 - `embodied_common.wire_contracts.PRIMITIVE_CONTRACT_V1`（V1 primitive contract digest 常量）
 - `embodied_common.wire_contracts.PRIMITIVE_CONTRACT_V2`（V2 primitive contract digest 常量，含 nav_* primitive）
-- `embodied_common.wire_contracts.primitive_contract_for_version(version)`（按 context_schema_version 选择 V1/V2 digest）
-- `embodied_common.wire_contracts.PrimitiveContractSet`（同时持有 V1/V2 digest 与对应 primitive 名称集合，供工具与跨版本比对使用）
+- `embodied_common.wire_contracts.primitive_contract_for_version(version)`（按 context_schema_version 选择 V1/V2/V3 digest）
+- `embodied_common.wire_contracts.PrimitiveContractSet`（持有 V1/V2/V3 digest 与对应 primitive 名称集合，供工具与跨版本比对使用）
 
 视觉游戏 JSON loader 供 `embodied_agent.visual_game_gateway_node` 解析 ROS 参数；
 `get_default_visual_game_handler` 供

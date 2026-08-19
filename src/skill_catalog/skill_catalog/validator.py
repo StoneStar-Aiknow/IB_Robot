@@ -27,6 +27,7 @@ CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning", "base
 CONTROL_MODES_BY_SCHEMA_VERSION = {
     1: frozenset({"teleop", "model_inference", "moveit_planning"}),
     2: CONTROL_MODES,
+    3: CONTROL_MODES,
 }
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
@@ -988,6 +989,37 @@ def validate_robot_context(context: SkillRobotContext) -> list[SkillDiagnostic]:
     allowed_control_modes = CONTROL_MODES_BY_SCHEMA_VERSION.get(context.context_schema_version, frozenset())
     if context.required_control_mode not in allowed_control_modes:
         _error(diagnostics, "SKILL_SCHEMA_INVALID", "invalid required control mode", field_path="required_control_mode")
+    supported_control_modes = tuple(getattr(context, "supported_control_modes", ()))
+    if context.context_schema_version < 3 and supported_control_modes:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "supported_control_modes requires robot context schema v3",
+            field_path="supported_control_modes",
+        )
+    if context.context_schema_version == 3 and len(set(supported_control_modes)) < 2:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "hybrid robot context requires at least two supported_control_modes",
+            field_path="supported_control_modes",
+        )
+    if supported_control_modes:
+        unsupported = sorted(set(supported_control_modes) - allowed_control_modes)
+        if unsupported:
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                f"unsupported control mode(s): {unsupported}",
+                field_path="supported_control_modes",
+            )
+        if context.required_control_mode not in supported_control_modes:
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                "required_control_mode must be one of supported_control_modes",
+                field_path="required_control_mode",
+            )
     if endpoint_roles is not None and set(context.execution_endpoints) != endpoint_roles:
         _error(
             diagnostics,

@@ -24,6 +24,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
+from std_srvs.srv import SetBool
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
@@ -380,6 +381,10 @@ class SkillExecutorNode(Node):
         self.declare_parameter("motion_authorized", False, descriptor=startup_descriptor)
         self.declare_parameter("active_control_mode", "", descriptor=startup_descriptor)
         self.declare_parameter("skill_required_control_mode", "", descriptor=startup_descriptor)
+        self.declare_parameter("supported_control_modes_json", "[]", descriptor=startup_descriptor)
+        self.declare_parameter(
+            "motion_mode_service", "/motion_mode/set_navigation_enabled", descriptor=startup_descriptor
+        )
         self.declare_parameter(
             "skill_gateway_status_service",
             "/embodied/get_skill_gateway_status",
@@ -454,6 +459,13 @@ class SkillExecutorNode(Node):
         self._skill_required_control_mode = (
             self.get_parameter("skill_required_control_mode").get_parameter_value().string_value
         )
+        self._supported_control_modes = tuple(
+            str(mode).strip()
+            for mode in json.loads(self.get_parameter("supported_control_modes_json").value)
+            if str(mode).strip()
+        )
+        self._motion_mode_service = self.get_parameter("motion_mode_service").value
+        self._motion_mode_switch_lock = RLock()
         self._skill_gateway_status_service = (
             self.get_parameter("skill_gateway_status_service").get_parameter_value().string_value
         )
@@ -483,8 +495,8 @@ class SkillExecutorNode(Node):
             raise ValueError("skill_catalog_source_root is required in development and production modes")
         self._robot_name = self.get_parameter("robot_name").get_parameter_value().string_value
         self._context_schema_version = self.get_parameter("context_schema_version").get_parameter_value().integer_value
-        if self._context_schema_version not in {1, 2}:
-            raise ValueError("context_schema_version must be 1 or 2")
+        if self._context_schema_version not in {1, 2, 3}:
+            raise ValueError("context_schema_version must be 1, 2, or 3")
         self._primitive_contract = primitive_contract_for_version(self._context_schema_version)
         self._primitive_descriptors = self._primitive_contract.descriptors
         self._primitive_contract_digest = self._primitive_contract.digest
@@ -567,8 +579,8 @@ class SkillExecutorNode(Node):
         if not startup_reload.success:
             raise ValueError(f"skill catalog startup failed: {startup_reload.error_code}: {startup_reload.message}")
         startup_bundle = self._runtime_coordinator.current
-        startup_requirements, startup_parameter_schemas, startup_timeout_caps = self._snapshot_policy_inputs(
-            startup_bundle.snapshot
+        startup_requirements, startup_parameter_schemas, startup_timeout_caps, startup_control_modes = (
+            self._snapshot_policy_inputs(startup_bundle.snapshot)
         )
         self._gateway_policy.replace_catalog(
             startup_bundle.snapshot.robot_context.timeout_policy,
@@ -576,9 +588,11 @@ class SkillExecutorNode(Node):
             parameter_schemas=startup_parameter_schemas,
             skill_timeout_caps=startup_timeout_caps,
             skill_schema_versions=self._snapshot_skill_schema_versions(startup_bundle.snapshot),
+            skill_control_modes=startup_control_modes,
         )
         self._skill_requirements = startup_requirements
         self._skill_parameter_schemas = startup_parameter_schemas
+        self._skill_control_modes = startup_control_modes
         self._skill_templates = self._mutable_templates(startup_bundle.snapshot.templates)
         self._active_runtime_bundle = None
         self._latest_ee_pose = None
@@ -628,6 +642,7 @@ class SkillExecutorNode(Node):
         self._primitive_client = ActionClient(
             self, PrimitiveCommand, self._primitive_action_name, callback_group=callback_group
         )
+        self._motion_mode_client = self.create_client(SetBool, self._motion_mode_service, callback_group=callback_group)
         self._pick_client = ActionClient(self, PickObject, self._pick_action_name, callback_group=callback_group)
         self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
         self._move_configuration_client = self.create_client(
@@ -743,6 +758,7 @@ class SkillExecutorNode(Node):
             gripper_open_position=self._gripper_open,
             gripper_closed_position=self._gripper_closed,
             execution_endpoints=execution_endpoints,
+            supported_control_modes=getattr(self, "_supported_control_modes", ()),
         )
         source_root = Path(self._skill_catalog_source_root)
         if self._skill_catalog_source_mode == "installed":
@@ -813,7 +829,11 @@ class SkillExecutorNode(Node):
             str(name): cls._mutable_template_value(schema) for name, schema in snapshot.parameter_schemas.items()
         }
         timeout_caps = {str(name): float(template["timeout_sec"]) for name, template in snapshot.templates.items()}
-        return requirements, parameter_schemas, timeout_caps
+        control_modes = {
+            str(name): str(capability.get("required_control_mode", ""))
+            for name, capability in snapshot.capability_view.items()
+        }
+        return requirements, parameter_schemas, timeout_caps, control_modes
 
     @staticmethod
     def _snapshot_skill_schema_versions(snapshot) -> dict[str, int]:
@@ -825,7 +845,7 @@ class SkillExecutorNode(Node):
         descriptors = getattr(self, "_primitive_descriptors", None)
         if descriptors is None:
             context_version = getattr(self, "_context_schema_version", None)
-            if context_version not in {1, 2}:
+            if context_version not in {1, 2, 3}:
                 context_version = 2 if primitive_name in {"nav_straight", "nav_turn", "nav_abs_coordinate"} else 1
             descriptors = primitive_contract_for_version(context_version).descriptors
         return descriptors.get(str(primitive_name))
@@ -898,7 +918,9 @@ class SkillExecutorNode(Node):
             force=bool(request.force),
         )
         if prepared is not None:
-            requirements, parameter_schemas, timeout_caps = self._snapshot_policy_inputs(prepared.snapshot)
+            requirements, parameter_schemas, timeout_caps, control_modes = self._snapshot_policy_inputs(
+                prepared.snapshot
+            )
             templates = self._mutable_templates(prepared.snapshot.templates)
         with self._state_guard():
             if prepared is not None:
@@ -911,9 +933,11 @@ class SkillExecutorNode(Node):
                     parameter_schemas=parameter_schemas,
                     skill_timeout_caps=timeout_caps,
                     skill_schema_versions=self._snapshot_skill_schema_versions(bundle.snapshot),
+                    skill_control_modes=control_modes,
                 )
                 self._skill_requirements = requirements
                 self._skill_parameter_schemas = parameter_schemas
+                self._skill_control_modes = control_modes
                 self._skill_templates = templates
                 self._publish_registry_event(result)
         assert result is not None
@@ -1004,6 +1028,11 @@ class SkillExecutorNode(Node):
             ee_pose_fresh=self._ee_pose_is_fresh(),
             navigation_ready=(
                 self._navigation_client.server_is_ready() if self._context_schema_version >= 2 else False
+            ),
+            control_mode_switching_enabled=(
+                self._context_schema_version >= 3
+                and bool(getattr(self, "_supported_control_modes", ()))
+                and bool(getattr(self, "_motion_mode_service", ""))
             ),
         )
 
@@ -1181,9 +1210,9 @@ class SkillExecutorNode(Node):
             "timeout_sec": float(goal.timeout_sec),
         }
         if is_navigation:
-            target = goal.navigation_target_pose
+            target = getattr(goal, "navigation_target_pose", PoseStamped())
             payload["navigation"] = {
-                "command_type": int(goal.navigation_command_type),
+                "command_type": int(getattr(goal, "navigation_command_type", 0)),
                 "target_pose": {
                     "frame_id": str(target.header.frame_id),
                     "stamp": [int(target.header.stamp.sec), int(target.header.stamp.nanosec)],
@@ -1199,7 +1228,7 @@ class SkillExecutorNode(Node):
                         float(target.pose.orientation.w),
                     ],
                 },
-                "value": float(goal.navigation_value),
+                "value": float(getattr(goal, "navigation_value", 0.0)),
             }
         return sha256_text(to_canonical_json(payload))
 
@@ -1282,13 +1311,14 @@ class SkillExecutorNode(Node):
 
             snapshot = self._runtime_snapshot()
             owner = ExecutionOwner.workflow(root_task_id)
-            requirements, parameter_schemas, timeout_caps = self._snapshot_policy_inputs(bundle.snapshot)
+            requirements, parameter_schemas, timeout_caps, control_modes = self._snapshot_policy_inputs(bundle.snapshot)
             workflow_policy = GatewayPolicy(
                 bundle.snapshot.robot_context.timeout_policy,
                 requirements,
                 parameter_schemas=parameter_schemas,
                 skill_timeout_caps=timeout_caps,
                 skill_schema_versions=self._snapshot_skill_schema_versions(bundle.snapshot),
+                skill_control_modes=control_modes,
                 ledger=self._gateway_ledger,
                 lease=self._gateway_lease,
             )
@@ -1661,7 +1691,9 @@ class SkillExecutorNode(Node):
         )
         capability.ready = decision.admitted
         capability.reason = f"{decision.error_code}: {decision.message}" if decision.error_code else ""
-        capability.required_control_mode = self._skill_required_control_mode
+        capability.required_control_mode = (
+            self._gateway_policy.required_control_mode(skill_name) or self._skill_required_control_mode
+        )
         return capability
 
     def _audit(
@@ -1734,6 +1766,89 @@ class SkillExecutorNode(Node):
                 return False
             time.sleep(0.05)
         return future.done()
+
+    def _required_control_mode_for_skill(self, skill_name: str) -> str:
+        """Read the immutable catalog capability selected for this execution."""
+        if skill_name.startswith("__primitive__:"):
+            return skill_name.partition(":")[2].strip()
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is not None:
+            capability = bundle.snapshot.capability_view.get(str(skill_name), {})
+            mode = str(capability.get("required_control_mode", "")).strip()
+            if mode:
+                return mode
+        return str(getattr(self, "_skill_control_modes", {}).get(str(skill_name), "")).strip()
+
+    def _ensure_skill_control_mode(self, skill_name: str, goal_handle) -> tuple[bool, str]:
+        """Switch arm/base ownership through the existing motion-mode service.
+
+        The switch is deliberately performed before any delegated executor or
+        primitive is dispatched.  A failed transition therefore fails closed.
+        """
+        # Keep object-level/unit-test fixtures that predate the motion-mode
+        # client on the legacy unchecked path.
+        if not hasattr(self, "_motion_mode_client") and not hasattr(self, "_supported_control_modes"):
+            return True, ""
+        required_mode = self._required_control_mode_for_skill(skill_name)
+        if not required_mode:
+            required_mode = str(getattr(self, "_skill_required_control_mode", "")).strip()
+        if not required_mode:
+            return False, "skill control mode is not declared"
+        active_mode = str(getattr(self, "_active_control_mode", "")).strip()
+        supported_modes = tuple(getattr(self, "_supported_control_modes", ()))
+        motion_mode_service = str(getattr(self, "_motion_mode_service", "")).strip()
+        # A production node always creates the client.  If a hybrid fixture
+        # supplies supported modes but omits the client, fail closed instead of
+        # dispatching under an unverified controller ownership state.
+        if not hasattr(self, "_motion_mode_client"):
+            if not supported_modes:
+                return True, ""
+            return False, "motion-mode client is unavailable"
+        switching_enabled = bool(supported_modes) and bool(motion_mode_service)
+        if not switching_enabled:
+            if active_mode == required_mode or ("moveit" in active_mode.lower() and "moveit" in required_mode.lower()):
+                return True, ""
+            return False, f"requires {required_mode}, active mode is {active_mode}"
+        if required_mode not in supported_modes:
+            return False, f"unsupported control mode: {required_mode}"
+        if active_mode == required_mode:
+            return True, ""
+        navigation_enabled = required_mode == "base_navigation"
+        if required_mode not in {"moveit_planning", "base_navigation"}:
+            return False, f"unsupported runtime control mode: {required_mode}"
+        with self._motion_mode_switch_lock:
+            if goal_handle.is_cancel_requested:
+                return False, "skill canceled before control-mode switch"
+            current_mode = str(getattr(self, "_active_control_mode", "")).strip()
+            if current_mode == required_mode:
+                return True, ""
+            if not self._motion_mode_client.wait_for_service(timeout_sec=self._rpc_timeout):
+                return False, f"motion-mode service unavailable: {motion_mode_service}"
+            request = SetBool.Request()
+            request.data = navigation_enabled
+            try:
+                future = self._motion_mode_client.call_async(request)
+            except Exception as exc:
+                return False, f"motion-mode switch failed: {exc}"
+            # From this point until a successful response, the hardware mode is
+            # intentionally treated as unknown so a later skill cannot skip a
+            # transition after a timed-out service call.
+            self._active_control_mode = ""
+            if not self._wait_for_future(
+                future,
+                timeout_sec=self._rpc_timeout,
+                cancel_requested=lambda: goal_handle.is_cancel_requested,
+            ):
+                return False, "motion-mode switch timed out"
+            try:
+                response = future.result()
+            except Exception as exc:
+                return False, f"motion-mode switch failed: {exc}"
+            if response is None or not bool(response.success):
+                message = str(getattr(response, "message", "")).strip()
+                return False, message or "motion-mode switch rejected"
+            self._active_control_mode = required_mode
+            return True, ""
 
     def _set_result_catalog_identity(self, result, bundle=None) -> None:
         if bundle is None:
@@ -1977,7 +2092,8 @@ class SkillExecutorNode(Node):
         descriptor = self._primitive_descriptor(primitive_name)
         if descriptor is None:
             return False, f"unsupported primitive: {primitive_name}"
-        request.schema_version = descriptor.schema_version
+        if hasattr(request, "schema_version"):
+            request.schema_version = descriptor.schema_version
         request.primitive_name = primitive_name
         request.pose_name = pose_name
         request.relative_dx = float(relative_dx)
@@ -2481,6 +2597,26 @@ class SkillExecutorNode(Node):
     def _execute_primitive_unchecked(self, goal_handle):
         goal = goal_handle.request
         result = PrimitiveCommand.Result()
+
+        primitive_mode = (
+            "base_navigation"
+            if goal.primitive_name
+            in {
+                "nav_straight",
+                "nav_turn",
+                "nav_abs_coordinate",
+            }
+            else "moveit_planning"
+        )
+        mode_ready, mode_reason = self._ensure_skill_control_mode(f"__primitive__:{primitive_mode}", goal_handle)
+        if not mode_ready:
+            return self._finish_primitive_failure(
+                result,
+                goal_handle,
+                "CONTROL_MODE_MISMATCH",
+                mode_reason,
+                goal.pose_name,
+            )
 
         schema_error = self._validate_primitive_goal_schema(goal)
         if schema_error:
@@ -4240,6 +4376,10 @@ class SkillExecutorNode(Node):
             )
             if not allowed:
                 return self._abort_skill(result, goal_handle, [], "SKILL_REJECTED", reason)
+
+        control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
+        if not control_mode_ready:
+            return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", control_mode_reason)
 
         active_bundle = getattr(self, "_active_runtime_bundle", None)
         active_templates = (

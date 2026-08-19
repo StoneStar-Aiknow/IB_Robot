@@ -23,6 +23,7 @@ from robot_config.loader import (
     robot_config_digest,
     robot_context_schema_version,
     robot_execution_endpoints,
+    robot_supported_control_modes,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
@@ -253,6 +254,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         execution_endpoints=robot_execution_endpoints(robot_config),
+        supported_control_modes=robot_supported_control_modes(robot_config),
     )
     primitive_contract = primitive_contract_for_version(robot_context.context_schema_version)
     return compile_skill_catalog(

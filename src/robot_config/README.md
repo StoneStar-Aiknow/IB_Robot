@@ -406,14 +406,19 @@ LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令�
 motion_mode:
   enabled: true
   navigation_enabled_on_startup: false
-  navigation_enabled_topic: /motion_mode/navigation_enabled
-  navigation_mode_ack_topic: /motion_mode/base_navigation_enabled
-  set_navigation_enabled_service: /motion_mode/set_navigation_enabled
+  navigation_enabled_topic: motion_mode/navigation_enabled
+  navigation_mode_ack_topic: motion_mode/base_navigation_enabled
+  set_navigation_enabled_service: motion_mode/set_navigation_enabled
+  manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+  navigation_controllers: [base_velocity_controller]
+  manipulation_control_mode: moveit_planning
+  navigation_control_mode: base_navigation
   transition_timeout_s: 2.0
 ```
 
-`moveit_planning` 同时启动机械臂轨迹、夹爪轨迹、底盘速度、全量关节状态和机械臂专用关节状态控制器。
-任务切换只调用上述服务改变新命令的授权，不停止控制器或重启硬件节点。
+默认抓取模式激活机械臂/夹爪控制器并把底盘控制器保持 inactive。任务切换只调用上述服务；
+MoveIt Gateway 按顺序停止当前运动域、切换 controller manager 中的 active/inactive 控制器集合，并等待
+底盘 bridge 的零速确认。硬件节点不重启，且 1～6 轴与 7～9 轴始终互斥。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -440,12 +445,12 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 - `navigation_endpoint_projection(robot_config_dict)`：从完整 robot YAML 解析出导航端点身份
   （`action_name`、`costmap_readiness_timeout`、`cancel_cleanup_timeout_sec`、`active` 布尔）。
   只在 `robot.navigation.command_server` 存在且 `action_name` 非空时返回非空 projection。
-- `robot_context_schema_version(robot_config_dict)`：根据 endpoint projection 决定
-  `context_schema_version`。profile 选 `base_navigation` 控制模式且 `action_name` 非空时返回 `2`，
-  否则返回 `1`。返回值写入 `SkillRobotContext.context_schema_version`，并进入
+- `robot_context_schema_version(robot_config_dict)`：根据解析后的 stage 与 endpoint projection 决定
+  `context_schema_version`。`hybrid` stage 返回 `3`，独立 navigation stage 返回 `2`，其他 stage 返回 `1`。
+  返回值写入 `SkillRobotContext.context_schema_version`，并进入
   canonical execution-context digest preimage；切换版本会强制新 registry generation。
-- `robot_execution_endpoints(robot_config_dict)`：返回 V1 10-role endpoint map，加上 V2 时的
-  `navigation_action_name`。V1 profile 上 `navigation_action_name` 必须为空，V2 profile 上必须非空。
+- `robot_execution_endpoints(robot_config_dict)`：返回 V1 10-role endpoint map，加上 V2/V3 时的
+  `navigation_action_name`。V1 profile 上 `navigation_action_name` 必须为空，V2/V3 profile 上必须非空。
 - `validate_navigation_endpoint_contract(robot_config_dict)`：在 loader 阶段校验导航端点契约的
   一致性。拒绝下列情况：V1 profile 上声明非空 `navigation.command_server.action_name`、
   V2 profile 上 `action_name` 为空、`action_name` 与 `embodied.execution.navigation_action_name`
@@ -454,26 +459,35 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 
 ### `nav_stage` 参数与 stage 解析
 
-`nav_stage` 是 `robot.launch.py` 的 launch argument，取值为 `mapping` / `navigation`
-（缺省时由 profile 内 `navigation.default_stage` 决定）。stage 解析发生在 launch builder 层，
-不进入 canonical execution-context digest：
+`nav_stage` 是 `robot.launch.py` 的 launch argument。标准导航配置声明 `mapping` / `navigation`；
+移动抓取与导航统一配置 `lekiwi_handeye_realsense_grasp_lidar` 还声明 `grasp` 和 `hybrid`。缺省时由
+`robot.default_nav_stage` 决定。stage 在 canonical loader 中解析，builder 和具身运行时只会看到
+解析后的单一配置：
 
+- `grasp`：兼容入口，仅选择腕部 RealSense 与 MoveIt 机械臂/夹爪控制器；
+  `base_velocity_controller` 保持 inactive，不启动 MID-360、FAST-LIO 或 Nav2。
 - `mapping`：启动 SLAM Toolbox（LiDAR）或 RTAB-Map mapping（RealSense），不启动 Nav2 / AMCL /
-  Collision Monitor。`/cmd_vel` 直接由 `cmd_vel_bridge` 消费。
-- `navigation`：启动 AMCL（LiDAR）或 RTAB-Map localization（RealSense）、Nav2 完整栈、Collision
-  Monitor（仅 LiDAR）与 `navigation_command_server`。`/cmd_vel` 经 Collision Monitor 收口为
-  `/cmd_vel_safe` 再交由 bridge 消费。
+  Collision Monitor。统一配置只选择 MID-360 与底盘控制器，并关闭抓取/放置运行时；`/cmd_vel`
+  直接由 `cmd_vel_bridge` 消费。
+- `navigation`：兼容入口，启动 AMCL、Nav2 完整栈与 `navigation_command_server`，但不启动 Hermes；
+  `/cmd_vel` 经 Collision Monitor 收口为 `/cmd_vel_safe` 再交由 bridge 消费。
+- `hybrid`：统一配置的默认入口，同时保留腕部 RealSense、MID-360、抓取/放置依赖、AMCL、Nav2、
+  `navigation_command_server` 和单一 Hermes runtime。统一 skill catalog 同时暴露操作与导航技能，
+  skill executor 在每个技能执行前通过 `motion_mode/set_navigation_enabled` 切换控制权。
 
-stage 不影响 `context_schema_version` —— 只要 profile 选择 `base_navigation` 控制模式且
-`action_name` 非空，就投影为 V2，无论 stage 是 mapping 还是 navigation。但 V2 profile 实际运行
-mapping stage 时不会启动 `navigation_command_server`，因此 nav_* primitive 在 mapping stage 下
-没有可用的 dispatch 端点，调用方应在 navigation stage 才发起 nav_* primitive。
+统一配置通过 active/inactive controller 集合与 `motion_mode` bridge gate 双重隔离 1～6 轴和 7～9 轴。
+`hybrid` 支持一次启动后交替执行抓取和导航，但不允许两类运动并发。
+
+`grasp` / `mapping` 使用 V1 context，独立 `navigation` 使用 V2 context，`hybrid` 使用 V3 context。
+V3 同时携带 V1 操作 primitive 与 V2 导航 primitive，并在 digest preimage 中加入
+`supported_control_modes`，防止与旧 snapshot 混用。
 
 ### `base_navigation` 控制模式
 
-`base_navigation` 是 V2 schema 唯一授权导航 primitive 的控制模式。它在 `control_modes` 中声明
-底盘速度控制器集合（典型为 `joint_state_broadcaster` + `base_velocity_controller`），并要求
-`active_control_mode == 'base_navigation'` 才允许 `skill_library` dispatch nav_* primitive。
+`base_navigation` 是 V2/V3 context 授权导航 primitive 的控制模式。它在 `control_modes` 中声明
+底盘速度控制器集合（典型为 `joint_state_broadcaster` + `base_velocity_controller`）。V2 runtime
+要求 `active_control_mode == 'base_navigation'`；V3 hybrid runtime 则在每个 nav_* 技能下发前通过
+`motion_mode` 切换到该模式。
 
 ```yaml
 robot:
@@ -481,7 +495,7 @@ robot:
 
   control_modes:
     base_navigation:
-      description: "底盘导航控制模式（V2 schema 独占）"
+      description: "底盘导航控制模式（V2/V3 context）"
       controllers:
         - joint_state_broadcaster
         - base_velocity_controller
@@ -490,19 +504,18 @@ robot:
 ```
 
 `base_navigation` 与 `moveit_planning`、`teleop`、`model_inference` 互斥（同一时刻只能激活一种
-控制模式）。需要从机械臂操作切到导航时，调用方通过 `motion_mode` 服务切换 `navigation_enabled`
-授权，再通过 `controller_manager` 的 `switch_controller` 切到 `base_navigation` 控制器集合；
-反向切换同样要求先停止当前导航目标。`base_navigation` 不启用任何推理 pipeline；如果机器人
-同时需要导航与机械臂推理，应使用单独的 profile，而不是在 `base_navigation` 下混入 `inference`。
+控制模式）。V1/V2 profile 仍要求启动模式与 profile 一致；V3 hybrid profile 允许 catalog 中的技能
+分别声明 `moveit_planning` 或 `base_navigation`，由 skill executor 在安全校验后、下发 primitive 或
+delegated executor 前调用 `motion_mode` 服务。切换失败时技能 fail closed，不下发运动。
 
 ### context_schema_version 与 digest preimage
 
-`context_schema_version` 由 `navigation_endpoint_projection` 决定，并写入
+`context_schema_version` 由解析后的 stage 与 `navigation_endpoint_projection` 决定，并写入
 `SkillRobotContext.context_schema_version`。`robot_config.loader.robot_config_digest` 把
 `context_schema_version`、`execution_endpoints`（含 `navigation_action_name`）、命名位姿/目标、
 关节限位、工作空间、控制模式、timeout policy 与相对运动语义一起纳入 digest preimage。
-切换 `context_schema_version`（例如从 V1 profile 切到 V2 profile）会改变 digest，强制
-`skill_catalog` 重新编译并生成新 registry generation。V1 与 V2 snapshot 在 registry 层
+V3 额外包含 `supported_control_modes`。切换 `context_schema_version` 会改变 digest，强制
+`skill_catalog` 重新编译并生成新 registry generation。V1、V2 与 V3 snapshot 在 registry 层
 永远不可互换校验。
 
 ## 控制模式配置

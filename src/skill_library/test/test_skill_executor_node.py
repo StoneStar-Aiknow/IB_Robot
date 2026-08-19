@@ -55,6 +55,22 @@ class _Future:
             callback(self)
 
 
+class _MotionModeClient:
+    def __init__(self, *, success: bool = True, message: str = "") -> None:
+        self.success = success
+        self.message = message
+        self.requests = []
+        self.wait_calls = 0
+
+    def wait_for_service(self, **_kwargs) -> bool:
+        self.wait_calls += 1
+        return True
+
+    def call_async(self, request):
+        self.requests.append(request)
+        return _Future(done=True, result=SimpleNamespace(success=self.success, message=self.message))
+
+
 class _ChildGoalHandle:
     accepted = True
 
@@ -297,6 +313,125 @@ def test_v1_runtime_snapshot_reports_navigation_not_ready_without_client():
 
     assert not hasattr(node, "_navigation_client")
     assert snapshot.navigation_ready is False
+
+
+@pytest.mark.parametrize(
+    ("context_schema_version", "supported_control_modes", "expected"),
+    [
+        (1, (), False),
+        (2, ("moveit_planning", "base_navigation"), False),
+        (3, (), False),
+        (3, ("moveit_planning", "base_navigation"), True),
+    ],
+)
+def test_runtime_snapshot_reports_control_mode_switching_only_for_hybrid_context(
+    context_schema_version, supported_control_modes, expected
+):
+    node = object.__new__(SkillExecutorNode)
+    node._context_schema_version = context_schema_version
+    node._supported_control_modes = supported_control_modes
+    node._motion_mode_service = "motion_mode/set_navigation_enabled"
+    node._gateway_lease = RootExecutionLease()
+    node._active_workflow = None
+    node._motion_authorized = True
+    node._active_control_mode = "moveit_planning"
+    node._skill_required_control_mode = "moveit_planning"
+    node._validate_skill_client = SimpleNamespace(service_is_ready=lambda: True)
+    node._task_executor_client = SimpleNamespace(server_is_ready=lambda: True)
+    node._arm_trajectory_client = SimpleNamespace(server_is_ready=lambda: True)
+    node._navigation_client = SimpleNamespace(server_is_ready=lambda: True)
+    node._ee_pose_is_fresh = lambda: True
+
+    assert node._runtime_snapshot().control_mode_switching_enabled is expected
+
+
+def _make_motion_mode_node(active_mode: str, required_mode: str, *, success: bool = True):
+    node = object.__new__(SkillExecutorNode)
+    node._active_control_mode = active_mode
+    node._supported_control_modes = ("moveit_planning", "base_navigation")
+    node._motion_mode_service = "motion_mode/set_navigation_enabled"
+    node._motion_mode_switch_lock = RLock()
+    node._rpc_timeout = 0.1
+    node._skill_control_modes = {"test_skill": required_mode}
+    node._motion_mode_client = _MotionModeClient(success=success, message="injected rejection")
+    return node
+
+
+def test_control_mode_switch_is_skipped_when_required_mode_is_already_active():
+    node = _make_motion_mode_node("moveit_planning", "moveit_planning")
+
+    ready, reason = node._ensure_skill_control_mode("test_skill", _NoCancelParentGoalHandle())
+
+    assert ready is True
+    assert reason == ""
+    assert node._motion_mode_client.wait_calls == 0
+    assert node._motion_mode_client.requests == []
+
+
+@pytest.mark.parametrize(
+    ("active_mode", "required_mode", "navigation_enabled"),
+    [
+        ("moveit_planning", "base_navigation", True),
+        ("base_navigation", "moveit_planning", False),
+    ],
+)
+def test_control_mode_switch_routes_skill_domain_through_motion_mode_service(
+    active_mode, required_mode, navigation_enabled
+):
+    node = _make_motion_mode_node(active_mode, required_mode)
+
+    ready, reason = node._ensure_skill_control_mode("test_skill", _NoCancelParentGoalHandle())
+
+    assert ready is True
+    assert reason == ""
+    assert node._active_control_mode == required_mode
+    assert node._motion_mode_client.wait_calls == 1
+    assert [request.data for request in node._motion_mode_client.requests] == [navigation_enabled]
+
+
+def test_rejected_control_mode_switch_fails_closed_with_unknown_active_mode():
+    node = _make_motion_mode_node("moveit_planning", "base_navigation", success=False)
+
+    ready, reason = node._ensure_skill_control_mode("test_skill", _NoCancelParentGoalHandle())
+
+    assert ready is False
+    assert reason == "injected rejection"
+    assert node._active_control_mode == ""
+    assert [request.data for request in node._motion_mode_client.requests] == [True]
+
+
+def test_hybrid_runtime_without_motion_mode_client_fails_closed():
+    node = object.__new__(SkillExecutorNode)
+    node._active_control_mode = "moveit_planning"
+    node._supported_control_modes = ("moveit_planning", "base_navigation")
+    node._motion_mode_service = "motion_mode/set_navigation_enabled"
+    node._skill_control_modes = {"test_skill": "base_navigation"}
+
+    ready, reason = node._ensure_skill_control_mode("test_skill", _NoCancelParentGoalHandle())
+
+    assert ready is False
+    assert reason == "motion-mode client is unavailable"
+
+
+def test_rejected_control_mode_switch_prevents_skill_primitive_dispatch():
+    primitive_dispatches = []
+    node = _make_skill_node(_Future(done=False))
+    node._primitive_client.send_goal_async = lambda *_args, **_kwargs: primitive_dispatches.append(True)
+    node._active_control_mode = "moveit_planning"
+    node._supported_control_modes = ("moveit_planning", "base_navigation")
+    node._motion_mode_service = "motion_mode/set_navigation_enabled"
+    node._motion_mode_switch_lock = RLock()
+    node._skill_control_modes = {"test_skill": "base_navigation"}
+    node._motion_mode_client = _MotionModeClient(success=False, message="base controller unavailable")
+    goal_handle = _NoCancelParentGoalHandle()
+
+    result = node._execute_skill(goal_handle)
+
+    assert result.success is False
+    assert result.error_code == "CONTROL_MODE_MISMATCH"
+    assert result.message == "base controller unavailable"
+    assert goal_handle.abort_count == 1
+    assert primitive_dispatches == []
 
 
 def test_wait_for_future_runs_cancel_callback_once(monkeypatch):

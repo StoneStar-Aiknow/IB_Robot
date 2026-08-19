@@ -230,11 +230,21 @@ class SkillCatalogCompiler:
 
             capability = manifest["capability"]
             description = selected_description
-            if capability["required_control_mode"] != context.robot.required_control_mode:
+            # A unified mobile-manipulator profile may expose skills from more
+            # than one mutually-exclusive motion domain.  The capability's
+            # required mode is selected at execution time; only validate that
+            # it is a mode supported by the robot context.
+            supported_control_modes = getattr(context.robot, "supported_control_modes", ())
+            mode_mismatch = (
+                capability["required_control_mode"] not in supported_control_modes
+                if supported_control_modes
+                else capability["required_control_mode"] != context.robot.required_control_mode
+            )
+            if mode_mismatch:
                 diagnostics.append(
                     SkillDiagnostic.error(
                         "SKILL_LIMIT_VIOLATION",
-                        "capability control mode does not match robot context",
+                        "capability control mode is not supported by robot context",
                         source_relative_path=manifest_relative_path,
                         field_path="capability.required_control_mode",
                     )

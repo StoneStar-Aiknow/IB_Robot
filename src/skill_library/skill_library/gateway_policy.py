@@ -122,6 +122,7 @@ class RuntimeSnapshot:
     arm_trajectory_ready: bool = False
     ee_pose_fresh: bool = False
     navigation_ready: bool = False
+    control_mode_switching_enabled: bool = False
 
     @property
     def is_busy(self) -> bool:
@@ -547,6 +548,7 @@ class GatewayPolicy:
         parameter_schemas: Mapping[str, Mapping[str, Any]],
         skill_timeout_caps: Mapping[str, float] | None = None,
         skill_schema_versions: Mapping[str, int] | None = None,
+        skill_control_modes: Mapping[str, str] | None = None,
         ledger: BoundedRequestLedger | None = None,
         lease: RootExecutionLease | None = None,
     ) -> None:
@@ -568,6 +570,7 @@ class GatewayPolicy:
         self._parameter_schemas = dict(parameter_schemas)
         self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
         self._skill_schema_versions = self._validate_schema_versions(skill_schema_versions or {})
+        self._skill_control_modes = {str(name): str(mode) for name, mode in (skill_control_modes or {}).items()}
         self._ledger = ledger
         self._lease = lease
         self._transition_lock = RLock()
@@ -587,6 +590,7 @@ class GatewayPolicy:
         parameter_schemas: Mapping[str, Mapping[str, Any]],
         skill_timeout_caps: Mapping[str, float] | None = None,
         skill_schema_versions: Mapping[str, int] | None = None,
+        skill_control_modes: Mapping[str, str] | None = None,
     ) -> None:
         """Replace immutable admission indexes for the next root request.
 
@@ -609,6 +613,7 @@ class GatewayPolicy:
             self._parameter_schemas = dict(parameter_schemas)
             self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
             self._skill_schema_versions = self._validate_schema_versions(skill_schema_versions or {})
+            self._skill_control_modes = {str(name): str(mode) for name, mode in (skill_control_modes or {}).items()}
 
     def _validate_timeout_caps(self, values: Mapping[str, float]) -> dict[str, float]:
         if not isinstance(values, Mapping):
@@ -673,7 +678,10 @@ class GatewayPolicy:
                 message="operator authorization is disabled",
                 **decision_args,
             )
-        if snapshot.active_control_mode != snapshot.required_control_mode:
+        if (
+            not snapshot.control_mode_switching_enabled
+            and snapshot.active_control_mode != snapshot.required_control_mode
+        ):
             return GatewayDecision(
                 admitted=False,
                 error_code=CONTROL_MODE_MISMATCH,
@@ -811,7 +819,10 @@ class GatewayPolicy:
         with self._transition_lock:
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
-            if snapshot.active_control_mode != snapshot.required_control_mode:
+            if (
+                not snapshot.control_mode_switching_enabled
+                and snapshot.active_control_mode != snapshot.required_control_mode
+            ):
                 return CONTROL_MODE_MISMATCH, None
             if lease.owner is not None:
                 return SKILL_BUSY, None
@@ -859,7 +870,10 @@ class GatewayPolicy:
                 return SKILL_REJECTED, None
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
-            if snapshot.active_control_mode != snapshot.required_control_mode:
+            if (
+                not snapshot.control_mode_switching_enabled
+                and snapshot.active_control_mode != snapshot.required_control_mode
+            ):
                 return CONTROL_MODE_MISMATCH, None
             if snapshot.is_busy and not _is_active_owner(owner, snapshot.active_task_id):
                 return SKILL_BUSY, None
@@ -904,6 +918,10 @@ class GatewayPolicy:
             return self._skill_requirements[skill_name]
         except KeyError as exc:
             raise ValueError(f"unknown skill '{skill_name}'") from exc
+
+    def required_control_mode(self, skill_name: str) -> str:
+        """Return the mode declared by the immutable catalog capability."""
+        return self._skill_control_modes.get(str(skill_name), "")
 
     def _validate_parameters(self, prepared: PreparedRequest) -> None:
         skill_name = str(prepared.payload["skill_name"])

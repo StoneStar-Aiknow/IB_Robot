@@ -8,6 +8,7 @@ from embodied_common.primitive_contracts import (
     PRIMITIVE_CONTRACT_DIGEST,
     PRIMITIVE_CONTRACT_V1,
     PRIMITIVE_CONTRACT_V2,
+    PRIMITIVE_CONTRACT_V3,
     PRIMITIVE_DESCRIPTORS,
     SUPPORTED_PRIMITIVES,
     canonical_json,
@@ -65,21 +66,24 @@ def test_v1_primitive_preimage_and_digest_are_the_exact_base_contract():
     assert PRIMITIVE_CONTRACT_V1.digest == V1_PRIMITIVE_DIGEST
 
 
-def test_primitive_contract_selector_returns_immutable_v1_and_v2_sets():
+def test_primitive_contract_selector_returns_immutable_versioned_sets():
     assert primitive_contract_for_version(1) is PRIMITIVE_CONTRACT_V1
     assert primitive_contract_for_version(2) is PRIMITIVE_CONTRACT_V2
+    assert primitive_contract_for_version(3) is PRIMITIVE_CONTRACT_V3
     assert tuple(sorted(PRIMITIVE_CONTRACT_V1.descriptors)) == V1_PRIMITIVE_NAMES
     assert tuple(sorted(set(PRIMITIVE_CONTRACT_V2.descriptors) - set(PRIMITIVE_CONTRACT_V1.descriptors))) == (
         V2_NAVIGATION_PRIMITIVE_NAMES
     )
+    assert tuple(PRIMITIVE_CONTRACT_V3.descriptors) == tuple(PRIMITIVE_CONTRACT_V2.descriptors)
     assert PRIMITIVE_CONTRACT_V2.digest != PRIMITIVE_CONTRACT_V1.digest
+    assert PRIMITIVE_CONTRACT_V3.digest not in {PRIMITIVE_CONTRACT_V1.digest, PRIMITIVE_CONTRACT_V2.digest}
 
-    for contract in (PRIMITIVE_CONTRACT_V1, PRIMITIVE_CONTRACT_V2):
+    for contract in (PRIMITIVE_CONTRACT_V1, PRIMITIVE_CONTRACT_V2, PRIMITIVE_CONTRACT_V3):
         with pytest.raises(TypeError):
             operator.setitem(contract.descriptors, "new", PRIMITIVE_CONTRACT_V1.descriptors["open_gripper"])
 
 
-@pytest.mark.parametrize("version", [0, -1, 3, 99])
+@pytest.mark.parametrize("version", [0, -1, 4, 99])
 def test_primitive_contract_selector_rejects_unknown_versions(version):
     with pytest.raises(ValueError, match="SKILL_SCHEMA_INVALID"):
         primitive_contract_for_version(version)

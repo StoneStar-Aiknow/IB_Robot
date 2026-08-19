@@ -149,7 +149,9 @@ def launch_setup(context, *_args, **_kwargs):
 
     embodied_config = config.setdefault("embodied", {})
     embodied_config["enabled"] = (
-        nav_stage != "mapping" if with_embodied_str == "" else parse_bool(with_embodied_str, default=True)
+        bool(embodied_config.get("enabled", False))
+        if with_embodied_str == ""
+        else parse_bool(with_embodied_str, default=True)
     )
     if entry_mode_override:
         embodied_config["entry_mode"] = entry_mode_override
