@@ -1,6 +1,6 @@
-# LeKiwi MID-360 mapping with synchronized D435i dataset recording.
+# LeKiwi MID-360 and D435i capture for offline semantic mapping.
 robot:
-  name: lekiwi_semantic_mapping
+  name: lekiwi_semantic_capture
   type: lekiwi
   robot_type: lekiwi
 

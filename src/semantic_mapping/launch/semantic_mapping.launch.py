@@ -13,7 +13,7 @@ from semantic_mapping.configuration import (
 
 def launch_setup(context, *_args, **_kwargs):
     config = load_semantic_mapping_robot_config(
-        context.launch_configurations.get("robot_config", "lekiwi_mapping"),
+        context.launch_configurations.get("robot_config", "lekiwi_realsense_mapping"),
         context.launch_configurations.get("config_path", ""),
     )
     return semantic_perception_nodes(config) + [
@@ -30,7 +30,7 @@ def launch_setup(context, *_args, **_kwargs):
 def generate_launch_description():
     return LaunchDescription(
         [
-            DeclareLaunchArgument("robot_config", default_value="lekiwi_mapping"),
+            DeclareLaunchArgument("robot_config", default_value="lekiwi_realsense_mapping"),
             DeclareLaunchArgument("config_path", default_value=""),
             OpaqueFunction(function=launch_setup),
         ]

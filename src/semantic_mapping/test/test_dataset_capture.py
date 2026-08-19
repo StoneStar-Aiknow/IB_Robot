@@ -318,7 +318,7 @@ def test_finalize_stops_recorder_saves_map_reindexes_then_generates_artifacts(tm
     pinned_mount.write_bytes(mount.read_bytes())
     state = {
         "session_id": "20260815_120000",
-        "profile": "lekiwi_semantic_mapping",
+        "profile": "lekiwi_semantic_capture",
         "session_root": str(session_root),
         "supervisor_pid": 4242,
         "status": "recording",

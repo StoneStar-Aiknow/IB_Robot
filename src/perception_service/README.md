@@ -452,7 +452,7 @@ PointNet++ 采样几何变更都会 bump 该版本号，避免旧图编出的 OM
 ### 10.4 SSOT 配置
 
 与其它五个感知服务一样，由 robot-config 的 `perception_services.services[]` 声明；
-`lekiwi_mapping.yaml` 里模板条目为 `id: semantic_graspgen_grasps`（默认 `enabled: false`）。
+`lekiwi_realsense_mapping.yaml` 里模板条目为 `id: semantic_graspgen_grasps`（默认 `enabled: false`）。
 启用时补齐 `bundle_path`、`deployment`（如 `ascend_310p`）、`adapter_class`、`service_type`、
 `endpoint`。GraspGen 不绑定到 `semantic_mapping.perception.semantic_roles` 的任何角色——
 抓取由 manipulation 侧直接调用 `GenerateGrasps`，不参与建图。

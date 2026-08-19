@@ -1,4 +1,4 @@
-"""Finalize a supervised RGB-D LiDAR mapping session into one compressed dataset archive."""
+"""Finalize a supervised RGB-D LiDAR capture session into one compressed dataset archive."""
 
 import argparse
 import gzip

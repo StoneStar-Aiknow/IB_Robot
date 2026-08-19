@@ -95,17 +95,17 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | 你要做什么 | 看哪一节 | 推荐命令入口 |
 |---|---|---|
 | 按现场顺序完成标定、采集、建图和导航 | [现场直接运行流程](#现场直接运行流程) | `robot_config/robot.launch.py` |
-| 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_mapping` / `robot_config:=lekiwi_navi` |
+| 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_realsense_mapping` / `robot_config:=lekiwi_realsense_navigation` |
 | 跑本包测试 | [测试验证](#测试验证) | `colcon test --packages-select robot_navigation` |
 | 验证完整 Gazebo/Nav2 仿真 | [测试验证](#测试验证) | `NAV_TEST_PROFILE=full colcon test --packages-select robot_config ...` |
-| 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
-| 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
-| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_lidar_mapping_rviz.launch.py` / `lekiwi_lidar_navigation_rviz.launch.py` |
+| 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping` |
+| 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop` |
+| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_realsense_*_rviz.launch.py` / `lekiwi_lidar_*_rviz.launch.py` |
 | 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
 `robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
 
-LeKiwi 导航的 body-frame 速度与加速度包络由 `lekiwi_navi.yaml` 的
+LeKiwi RealSense 导航的 body-frame 速度与加速度包络由 `lekiwi_realsense_navigation.yaml` 的
 `robot.navigation.motion_envelope` 唯一维护。`nav2_params.yaml` 中的 MPPI 和
 velocity smoother 参数是该包络的镜像，FAST-LIO、SLAM 与其他导航消费者不得
 另建权威值。静态测试会同时检查镜像漂移和整个速度盒的轮空间可行性。
@@ -136,8 +136,8 @@ source install/setup.sh
 
 | 模式 | 工作流 | 开发板 profile | PC 侧 RViz |
 |---|---|---|---|
-| RealSense | 建图 | `robot_config:=lekiwi_mapping` | `lekiwi_realsense_mapping_rviz.launch.py` |
-| RealSense | 导航 | `robot_config:=lekiwi_navi control_mode:=teleop` | `lekiwi_realsense_navigation_rviz.launch.py` |
+| RealSense | 建图 | `robot_config:=lekiwi_realsense_mapping` | `lekiwi_realsense_mapping_rviz.launch.py` |
+| RealSense | 导航 | `robot_config:=lekiwi_realsense_navigation control_mode:=teleop` | `lekiwi_realsense_navigation_rviz.launch.py` |
 | LiDAR | 建图 | `robot_config:=lekiwi_lidar nav_stage:=mapping` | `lekiwi_lidar_mapping_rviz.launch.py` |
 | LiDAR | 导航 | `robot_config:=lekiwi_lidar nav_stage:=navigation` | `lekiwi_lidar_navigation_rviz.launch.py` |
 
@@ -202,7 +202,7 @@ ros2 run robot_calibration calib_approve \
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-  robot_config:=lekiwi_semantic_mapping
+  robot_config:=lekiwi_semantic_capture
 ```
 
 开发板终端 B 移动底盘完成采集轨迹：
@@ -214,7 +214,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 PC 侧观察低带宽图像、点云和地图预览：
 
 ```bash
-ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+ros2 launch semantic_mapping lekiwi_semantic_capture_rviz.launch.py
 ```
 
 采集完成后，在开发板另一个终端执行保存：
@@ -232,7 +232,7 @@ ros2 run semantic_mapping save_semantic_map
 ```bash
 ros2 launch robot_config robot.launch.py \
   use_sim:=false \
-  robot_config:=lekiwi_mapping
+  robot_config:=lekiwi_realsense_mapping
 ```
 
 开发板终端 B 启动键盘遥控：
@@ -263,7 +263,7 @@ ros2 run robot_navigation save_rtabmap_map
 ```bash
 ros2 launch robot_config robot.launch.py \
   use_sim:=false \
-  robot_config:=lekiwi_navi \
+  robot_config:=lekiwi_realsense_navigation \
   control_mode:=teleop
 ```
 
@@ -391,12 +391,12 @@ LeKiwi 建图和导航支持两类运行方式：
 
 | 入口 YAML | 用途 | 启动命令 |
 |---|---|---|
-| `lekiwi_mapping.yaml` | base-only 建图：底盘 + RealSense + RTAB-Map mapping + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
-| `lekiwi_navi.yaml` | 完整导航：加载静态地图 + Nav2 + RTAB-Map localization + EKF + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
+| `lekiwi_realsense_mapping.yaml` | base-only 建图：底盘 + RealSense + RTAB-Map mapping + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping` |
+| `lekiwi_realsense_navigation.yaml` | 完整导航：加载静态地图 + Nav2 + RTAB-Map localization + EKF + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop` |
 
-建图和导航使用独立配置文件。`lekiwi_mapping` 只负责建图主链；`lekiwi_navi` 消费保存好的地图做定位与导航。
+RealSense 建图和导航使用独立配置文件。`lekiwi_realsense_mapping` 只负责建图主链；`lekiwi_realsense_navigation` 消费保存好的地图做定位与导航。
 
-`lekiwi_navi.yaml` 中导航相关配置形态如下：
+`lekiwi_realsense_navigation.yaml` 中导航相关配置形态如下：
 
 ```yaml
 navigation:
@@ -436,7 +436,7 @@ navigation:
     enabled: true
 ```
 
-MPPI 未通过完整门禁时，`lekiwi_navi.yaml` 保持选择
+MPPI 未通过完整门禁时，`lekiwi_realsense_navigation.yaml` 保持选择
 `$(find robot_navigation)/config/nav2_params_dwb.yaml`。验证 MPPI 候选时显式选择
 `nav2_params.yaml`，全部门禁通过后才可将它设为实机默认值。仿真对应
 `nav2_sim_params.yaml` 与 `nav2_sim_params_dwb.yaml`。切换前必须终止当前导航目标并
@@ -458,12 +458,12 @@ P95 严格低于 50 ms 时才返回成功。仅有 `/cmd_vel` 到达间隔不能
 
 ## 建图流程
 
-建图入口使用 `lekiwi_mapping.yaml`，链路包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。它不会自动启动键盘遥控，需要另一个终端发布 `/cmd_vel`。
+建图入口使用 `lekiwi_realsense_mapping.yaml`，链路包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。它不会自动启动键盘遥控，需要另一个终端发布 `/cmd_vel`。
 
 终端 A 启动建图主链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping
 ```
 
 终端 B 启动键盘遥控：
@@ -472,7 +472,7 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_map
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
 
-`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。常用键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止；`w/x/e/c/q/z` 是速度倍率调整键。
+`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_realsense_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。常用键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止；`w/x/e/c/q/z` 是速度倍率调整键。
 
 终端 C 保存地图：
 
@@ -494,14 +494,14 @@ ros2 run nav2_map_server map_saver_cli -t /rtabmap/map -f ~/.ros/ibrobot/maps/rt
 ~/.ros/ibrobot/maps/rtabmap.db       # RTAB-Map localization 复用
 ```
 
-后续导航默认从 `lekiwi_navi.yaml` 的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载地图。
+后续导航默认从 `lekiwi_realsense_navigation.yaml` 的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载地图。
 
 ## 导航流程
 
 启动导航主链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop
 ```
 
 RViz 启动后，使用 `2D Goal Pose` 或 `Nav2 Goal` 在地图上点击目标。Nav2 会规划全局路径并通过配置的速度链驱动底盘；
@@ -510,7 +510,7 @@ MID-360 navigation 使用 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bri
 如果需要导航评估模式并联动推理链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=navi
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=navi
 ```
 
 ## PC 端 RViz 观察
@@ -541,7 +541,7 @@ ros2 launch robot_navigation lekiwi_realsense_mapping_rviz.launch.py
 ros2 launch robot_navigation lekiwi_realsense_navigation_rviz.launch.py
 ```
 
-开发板上已经启动 `lekiwi_mapping` 或 `lekiwi_navi` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
+开发板上已经启动 `lekiwi_realsense_mapping` 或 `lekiwi_realsense_navigation` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
 
 PC 端同样需要先加载 ROS 和工作区环境，具体方式参考 IB Robot 仓主目录下的 README。如果 PC 本地也有同一份工作区，并希望使用工作区里的 launch/config，再 source 该 overlay。两端 `ROS_DOMAIN_ID` 必须一致，例如 `<your_id>`。
 
@@ -633,7 +633,7 @@ ros2 daemon start
 
 ```bash
 # Nav2 子系统入口：map_server + Nav2 navigation_launch.py
-# 通常由 robot_config 根据 lekiwi_navi.yaml 间接包含
+# 通常由 robot_config 根据 lekiwi_realsense_navigation.yaml 间接包含
 ros2 launch robot_navigation nav2_bringup.launch.py
 
 # 指定地图

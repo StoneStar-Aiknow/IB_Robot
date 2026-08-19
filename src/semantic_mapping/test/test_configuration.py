@@ -13,7 +13,7 @@ from semantic_mapping.configuration import (
     semantic_perception_nodes,
 )
 
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_mapping.yaml"
+CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
 
 
 def _write_enabled_config(tmp_path: Path) -> Path:

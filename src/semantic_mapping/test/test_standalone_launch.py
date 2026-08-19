@@ -9,7 +9,7 @@ import yaml
 from perception_bundle_fixture import configure_perception_bundles
 
 PACKAGE_ROOT = Path(__file__).parents[1]
-ROBOT_CONFIG = PACKAGE_ROOT.parent / "robot_config" / "config" / "robots" / "lekiwi_mapping.yaml"
+ROBOT_CONFIG = PACKAGE_ROOT.parent / "robot_config" / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
 
 
 @dataclass

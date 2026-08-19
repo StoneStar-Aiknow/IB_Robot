@@ -1,5 +1,5 @@
 robot:
-  name: lekiwi_mapping
+  name: lekiwi_realsense_mapping
   type: lekiwi
   robot_type: lekiwi
 

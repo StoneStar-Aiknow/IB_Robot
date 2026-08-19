@@ -11,7 +11,7 @@ from robot_navigation.cmd_vel_bridge_node import _body_to_wheel_radps
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PACKAGE_ROOT.parents[1]
 CONFIG_ROOT = PACKAGE_ROOT / "config"
-ROBOT_CONFIG = WORKSPACE_ROOT / "src" / "robot_config" / "config" / "robots" / "lekiwi_navi.yaml"
+ROBOT_CONFIG = WORKSPACE_ROOT / "src" / "robot_config" / "config" / "robots" / "lekiwi_realsense_navigation.yaml"
 
 MPPI_PROFILES = [CONFIG_ROOT / "nav2_params.yaml", CONFIG_ROOT / "nav2_sim_params.yaml"]
 DWB_PROFILES = [CONFIG_ROOT / "nav2_params_dwb.yaml", CONFIG_ROOT / "nav2_sim_params_dwb.yaml"]

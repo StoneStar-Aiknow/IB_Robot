@@ -108,9 +108,9 @@ ros2 run lekiwi_hardware scan_motors /dev/ttyUSB0
 
 ```bash
 # 推理
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=model_inference
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=model_inference
 # 遥操
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop
 ```
 
 也可通过 `ros2 control` 命令行单独加载控制器管理器（需配合 URDF 中的 ros2_control 配置）。

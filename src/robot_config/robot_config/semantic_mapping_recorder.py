@@ -1,4 +1,4 @@
-"""Supervise one rosbag2 process for an RGB-D LiDAR mapping session."""
+"""Supervise one rosbag2 process for an RGB-D LiDAR capture session."""
 
 import argparse
 import hashlib

@@ -1,12 +1,12 @@
 # LeKiwi Mobile Manipulator - Evaluation Configuration
-# Single Source of Truth for LeKiwi robot used in lekiwi_navi.
+# Single Source of Truth for LeKiwi RealSense navigation.
 #
-# This config enables lekiwi_navi to load robot configuration from YAML
+# This config enables RealSense navigation to load robot configuration from YAML
 # instead of hardcoding LeKiwiClientConfig(remote_ip=..., id=...).
 # Actions are dispatched via ROS topics to ros2_control controllers.
 
 robot:
-  name: lekiwi_navi
+  name: lekiwi_realsense_navigation
   type: lekiwi
   robot_type: lekiwi  # For LeRobot dataset metadata
 
@@ -75,8 +75,8 @@ robot:
         control_frequency: 30.0
 
     navi:
-      description: "Navigation evaluation mode (lekiwi_navi + ACT policy)"
-      description_cn: "导航评估模式（lekiwi_navi + ACT 策略）"
+      description: "Navigation evaluation mode (RealSense + ACT policy)"
+      description_cn: "导航评估模式（RealSense + ACT 策略）"
       controllers:
         - joint_state_broadcaster
         - arm_position_controller

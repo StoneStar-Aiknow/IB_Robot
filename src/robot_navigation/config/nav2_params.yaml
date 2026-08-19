@@ -112,7 +112,7 @@ controller_server:
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.05
       yaw_goal_tolerance: 0.1
-    # MPPI parameters. Motion bounds mirror lekiwi_navi.yaml motion_envelope.
+    # MPPI parameters. Motion bounds mirror the active LeKiwi profile motion envelope.
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
       motion_model: "Omni"

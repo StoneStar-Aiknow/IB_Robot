@@ -15,7 +15,7 @@ from robot_config.loader import (
     validate_semantic_mapping_config,
 )
 
-CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_mapping.yaml"
+CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
 FIXTURE_PATH = Path(__file__).parents[2] / "semantic_mapping" / "test" / "perception_bundle_fixture.py"
 FIXTURE_SPEC = importlib.util.spec_from_file_location("semantic_perception_bundle_fixture", FIXTURE_PATH)
 FIXTURE_MODULE = importlib.util.module_from_spec(FIXTURE_SPEC)

@@ -404,7 +404,7 @@ ros2 service call /action_dispatcher/reset std_srvs/srv/Empty "{}"
 
 ```bash
 # 启动系统（navigation_mode=true 时）
-ros2 launch robot_config robot.launch.py robot_config:=lekiwi_navi control_mode:=navi
+ros2 launch robot_config robot.launch.py robot_config:=lekiwi_realsense_navigation control_mode:=navi
 
 # Nav2 到达目的地后，开始执行
 ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger
