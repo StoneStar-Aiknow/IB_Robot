@@ -68,10 +68,12 @@ safe_kill_matching KILL "task_executor_node"
 safe_kill_matching KILL "perception_service_node"
 safe_kill_matching KILL "geometric_grasp_node"
 safe_kill_matching KILL "act_inference_node"
+safe_kill_matching KILL "cmd_vel_bridge_node"
 
 # IB-Robot grasp pipeline nodes (manipulation_execution / manipulation_service /
 # embodied_agent / inference_service / perception_service generic model services)
 safe_kill_matching KILL "pick_executor_node"
+safe_kill_matching KILL "place_executor_node"
 safe_kill_matching KILL "grasp_planner_node"
 safe_kill_matching KILL "grasp_verifier_node"
 safe_kill_matching KILL "task_planner_node"
