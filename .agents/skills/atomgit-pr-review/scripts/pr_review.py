@@ -22,7 +22,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from comment_formatter import CommentFormatter
 from llm_reviewer import LLMCodeReviewer
-from verification_gate import extract_verified_tree, file_triggers_dual_docker_gate, is_wip_title, resolve_pr_head_tree
+from verification_gate import (
+    VERIFICATION_MODE_REUSED,
+    compute_verification_inputs,
+    extract_verification_metadata,
+    is_wip_title,
+    resolve_pr_head_tree,
+    validate_verification_metadata,
+)
 
 _AGENT_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._/@:+~\- ]*\s+v?\d+(?:\.\d+){1,5}(?:[-+][0-9A-Za-z.-]+)?$")
 
@@ -186,50 +193,68 @@ class CodeReviewer:
 
     @staticmethod
     def _build_verification_tree_checks(pr: dict, files: list[dict], head_tree: str | None) -> list[dict]:
-        """Bind required dual Docker verification evidence to the current PR tree."""
+        """Validate Docker verification evidence against the current PR inputs and tree."""
         if is_wip_title(pr.get("title") or ""):
             return []
 
-        gate_triggered = False
-        for file_info in files:
-            filename = file_info.get("filename") or file_info.get("new_path") or ""
-            patch = file_info.get("patch") or ""
-            if isinstance(patch, dict):
-                patch = patch.get("diff") or ""
-            if file_triggers_dual_docker_gate(filename, patch):
-                gate_triggered = True
-                break
-        if not gate_triggered:
+        verification_inputs = compute_verification_inputs(files)
+        if verification_inputs is None:
             return []
 
-        verified_tree = extract_verified_tree(pr.get("body") or "")
-        if verified_tree is None or head_tree is None:
+        try:
+            metadata = extract_verification_metadata(pr.get("body") or "")
+        except ValueError:
+            metadata = None
+
+        if metadata is None:
             return [
                 {
-                    "id": "docker_verification_tree_missing",
+                    "id": "docker_verification_missing",
                     "severity": "error",
                     "blocking_until_reviewed": True,
                     "file": "PR description",
                     "message": (
-                        "This PR requires dual Docker verification, but its description does not contain exactly one "
-                        "'**Verified tree:** `<40-character SHA>`' field, or the PR head tree is unavailable. "
-                        "Record the tree tested by both platforms."
+                        "This PR requires dual Docker verification, but its description does not contain a valid "
+                        "'## Docker Verification' block with mode, Verified inputs, Tested source tree, and "
+                        "Docker environment fields. Record the evidence tested by both platforms."
                     ),
                 }
             ]
-        if verified_tree != head_tree:
+
+        is_reused = metadata.get("mode") == VERIFICATION_MODE_REUSED
+        if not is_reused and head_tree is None:
             return [
                 {
-                    "id": "docker_verification_tree_mismatch",
+                    "id": "docker_verification_missing",
                     "severity": "error",
                     "blocking_until_reviewed": True,
                     "file": "PR description",
-                    "verified_tree": verified_tree,
-                    "head_tree": head_tree,
-                    "message": (
-                        f"Docker verification covers tree {verified_tree}, but the latest PR tree is {head_tree}. "
-                        "Re-run both Docker verifications on the latest source tree and update the PR description."
-                    ),
+                    "message": "PR head tree is unavailable; cannot verify full Docker evidence.",
+                }
+            ]
+
+        try:
+            if is_reused:
+                validate_verification_metadata(
+                    pr.get("body") or "",
+                    verification_inputs,
+                    "",
+                    allow_reuse=True,
+                )
+            else:
+                validate_verification_metadata(
+                    pr.get("body") or "",
+                    verification_inputs,
+                    head_tree or "",
+                )
+        except ValueError as exc:
+            return [
+                {
+                    "id": "docker_verification_mismatch",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": str(exc),
                 }
             ]
         return []
@@ -244,18 +269,11 @@ class CodeReviewer:
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
         mandatory_review_checks = self._build_mandatory_review_checks(files)
+        verification_inputs = compute_verification_inputs(files)
         head_tree = None
-        if not is_wip_title(pr.get("title") or ""):
-            for file_info in files:
-                filename = file_info.get("filename") or file_info.get("new_path") or ""
-                patch = file_info.get("patch") or ""
-                if isinstance(patch, dict):
-                    patch = patch.get("diff") or ""
-                if not file_triggers_dual_docker_gate(filename, patch):
-                    continue
-                with suppress(ValueError):
-                    head_tree = resolve_pr_head_tree(pr)
-                break
+        if verification_inputs and not is_wip_title(pr.get("title") or ""):
+            with suppress(ValueError):
+                head_tree = resolve_pr_head_tree(pr)
         mandatory_review_checks.extend(self._build_verification_tree_checks(pr, files, head_tree))
         mandatory_review_checks.extend(self._build_ai_metadata_checks(pr, commits))
 

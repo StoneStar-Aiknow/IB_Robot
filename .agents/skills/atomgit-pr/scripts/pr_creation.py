@@ -17,9 +17,9 @@ import sys
 from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 from verification_gate import (
-    file_triggers_dual_docker_gate,
+    compute_verification_inputs,
     resolve_pr_stage,
-    validate_verified_tree,
+    validate_verification_metadata,
 )
 
 
@@ -97,19 +97,18 @@ def get_changed_files(branch: str, base_branch: str = "master") -> list[str]:
     return [f for f in output.split("\n") if f.strip()]
 
 
-def dual_docker_gate_triggered(branch: str, base_branch: str, files: list[str]) -> bool:
-    """Return whether the PR diff requires tree-bound dual Docker verification."""
+def get_changed_file_infos(branch: str, base_branch: str = "master") -> list[dict]:
+    """Return changed paths with zero-context patches for input fingerprinting."""
     base_ref = get_best_base_ref(base_branch)
+    files = get_changed_files(branch, base_branch)
+    infos = []
     for filename in files:
-        patch = ""
-        if filename.endswith("/package.xml"):
-            try:
-                patch = run_git(["diff", "--unified=0", f"{base_ref}...{branch}", "--", filename])
-            except Exception:
-                patch = run_git(["diff", "--unified=0", f"{base_branch}...{branch}", "--", filename])
-        if file_triggers_dual_docker_gate(filename, patch):
-            return True
-    return False
+        try:
+            patch = run_git(["diff", "--unified=0", f"{base_ref}...{branch}", "--", filename])
+        except Exception:
+            patch = run_git(["diff", "--unified=0", f"{base_branch}...{branch}", "--", filename])
+        infos.append({"filename": filename, "patch": patch})
+    return infos
 
 
 def get_remote_branch_head(branch: str) -> str:
@@ -280,7 +279,9 @@ def main():
         sys.exit(1)
 
     title = args.title or commits[0]["subject"]
-    gate_required = dual_docker_gate_triggered(branch, args.base, files)
+    file_infos = get_changed_file_infos(branch, args.base)
+    verification_inputs = compute_verification_inputs(file_infos)
+    gate_required = verification_inputs is not None
     try:
         title, gate_triggered = resolve_pr_stage(title, args.pr_stage, gate_required)
     except ValueError as e:
@@ -299,7 +300,7 @@ def main():
                     f"local branch head {local_head} does not match origin/{branch} {remote_head}; push the latest commit first"
                 )
             verified_tree = get_local_tree(branch)
-            validate_verified_tree(description, verified_tree)
+            validate_verification_metadata(description, verification_inputs, verified_tree)
         except ValueError as e:
             print(f"❌ 双 Docker 验证 tree 校验失败: {e}")
             sys.exit(1)
@@ -350,7 +351,7 @@ def main():
                 created_head = (created_pr.get("head", {}).get("sha") or "").lower()
                 if created_head != remote_head:
                     raise ValueError(f"PR head changed during creation: expected {remote_head}, got {created_head}")
-                validate_verified_tree(description, verified_tree)
+                validate_verification_metadata(description, verification_inputs, verified_tree)
             pr_url = api.get_pr_url(pr_number)
 
             print()

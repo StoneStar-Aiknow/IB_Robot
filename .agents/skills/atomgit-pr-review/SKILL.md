@@ -34,7 +34,7 @@ Do not expose these references as separate skills.
 
 1. **`libs/lerobot` gitlink 强制检查（阻塞性）**：每个 PR 都必须检查 `libs/lerobot` 是否发生 gitlink 指针变化；违规指针变更应提交 severity=error 的阻塞性 issue。
 2. **README / 文档联动检查**：根据变更是否影响用户可见的使用方式决定是否要求同步更新文档，不机械要求所有 PR 都改 README。
-3. **依赖 / setup / build 变更的 Verification 强制门禁**：标题以 `[WIP]` 开头时暂缓双平台 Docker 证据检查，表示 PR 尚未准备好正式检视。移除 `[WIP]` 后，相关 PR 必须提供双平台 Verification，且 `Verified tree` 必须匹配最新 head tree。review 默认只检查声明，不自动执行验证。
+3. **依赖 / setup / build 变更的 Verification 强制门禁**：标题以 `[WIP]` 开头时暂缓双平台 Docker 证据检查，表示 PR 尚未准备好正式检视。移除 `[WIP]` 后，相关 PR 必须提供双平台 Verification，且结构化 `## Docker Verification` 块中的 `Verified inputs` 必须匹配当前输入指纹。`full` 模式还要求 `Tested source tree` 匹配最新 head tree；`reused-environment` 模式允许复用旧 tree。review 默认只检查声明，不自动执行验证。
 4. **禁止本地重复执行 pre-commit 已覆盖的检查**：信任 pre-commit 已通过的 ruff/format；不要本地复跑 lint/build；静态阅读 diff 始终允许。
 5. **openEuler AI 元数据检查（阻塞性）**：AI 参与时检查 PR 的 Tool/Model/Prompt Summary、人工审查、第三方材料/许可证披露，以及 Agent 工具字段是否为具体名称和版本、PR 模型集合是否覆盖所有 commit 的 AI `Co-Authored-By`。不同 commit 可以使用不同模型；人类 `Name <email>` trailer 不参与模型比较。
 
@@ -64,7 +64,7 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 - 文件名格式：`./tmp/{repo}_pr_{number}_issues.json`（例如：`./tmp/ib_robot_pr_123_issues.json`）
 - 进行 IB_Robot PR review 时，必须先处理 `.pr.mandatory_review_checks`，重点检查
   `libs/lerobot` gitlink；此外还要检查 README / 文档是否应随变更同步，以及 PR 描述中的
-  非 WIP PR 的 Verification 是否覆盖双平台，以及 `Verified tree` 是否与最新 head tree 一致
+  非 WIP PR 的 Verification 是否覆盖双平台，以及结构化 `## Docker Verification` 块是否有效
 
 API 参数详情、issues.json 字段说明、大文件处理技巧和 config.json 配置见 `references/api-and-issues-format.md`。
 

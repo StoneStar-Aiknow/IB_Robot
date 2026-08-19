@@ -450,7 +450,7 @@ The final report must explicitly state one source mode:
 
 - `Source: isolated committed snapshot`, with the exact commit and tree. This
   is the normal PR-evidence mode; the PR's canonical identity is
-  `**Verified tree:** \`<tree SHA>\``.
+  `## Docker Verification` block (mode, Verified inputs, Tested source tree, Docker environment).
 - `Source: local workspace copy`, with the host commit and whether the copied
   workspace contained uncommitted or untracked changes. Mark it local-only and
   do not put it in a PR as tree-bound evidence.

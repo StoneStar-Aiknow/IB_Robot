@@ -37,8 +37,8 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
    `VERIFIED_TREE="$(git rev-parse "${VERIFIED_COMMIT}^{tree}")"`；用户当前 worktree 无需干净。
 2. 在用户 worktree 外生成目标 commit 的独立快照。openEuler 与 Ubuntu 必须验证 tree SHA
    均等于 `VERIFIED_TREE` 的快照，PR 证据模式不得直接复制 dirty 工作区。
-3. 本 skill 的结果中写入 `Verified tree: <full SHA>`；PR 工作流会将其写成标准字段
-   `**Verified tree:** \`<full SHA>\``。
+3. 本 skill 的结果中写入 `Verified tree: <full SHA>`；PR 工作流会将其组装成结构化
+   `## Docker Verification` 块。
 4. 创建或更新 PR 时将该字段与远端 head commit 的 tree 比对。只有 tree 改变才要求重跑；
    单纯修改 commit message、作者或 trailer 不会让结果失效。
 5. `docker cp` 当前 dirty 工作区仍可用于本地调试，但结果不得写成 PR 验证证据。

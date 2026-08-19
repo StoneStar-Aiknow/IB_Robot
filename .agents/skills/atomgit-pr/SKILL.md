@@ -71,7 +71,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         *   禁止把 `git diff`、`git status`、文件列表这类仅用于查看变更的命令当作 Verification。
         *   对纯文档、注释、gitignore、纯元数据等**不涉及运行时行为**的提交，可以省略 Verification，而不是生硬补一个无意义小节。
         *   如果正式检视 PR 修改了 ROS 包的 `package.xml` 依赖声明，或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/setup/python_venv.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml`、`requirements/*.txt` 等直接影响 pip/rosdep 依赖安装的文件），则 Verification **必须提供**，且必须包含双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。ROS 包内的 `setup.py` 普通改动不单独触发该门禁。
-         *   正式检视阶段触发上述门禁时，Agent 记录目标 commit 的完整 `git rev-parse HEAD^{tree}`，再调用两个 Docker skill 验证该 tree 的隔离快照。当前工作区无需 clean，但直接复制 dirty 工作区的结果只能用于本地调试，不能作为 PR 证据。Verification 必须且只能包含一个标准字段 `**Verified tree:** \`<40位 SHA>\``，并写入两平台真实结果。
+         *   正式检视阶段触发上述门禁时，Agent 记录目标 commit 的完整 `git rev-parse HEAD^{tree}`，再调用两个 Docker skill 验证该 tree 的隔离快照。当前工作区无需 clean，但直接复制 dirty 工作区的结果只能用于本地调试，不能作为 PR 证据。Verification 必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段，并写入两平台真实结果。
          *   创建或更新 PR 时，脚本会将该 tree SHA 与已推送分支或 AtomGit PR 最新 head commit 的 tree 比对。源码 tree 改变会阻止创建/更新并要求重跑；只修改 commit message、作者或 trailer 而 tree 不变时，已有结果仍然有效。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
          *   在真正启动双平台 Docker 前，Agent 必须询问用户当前 PR 是临时 WIP 还是准备交给 reviewer 正式检视。命中门禁时，`pr_creation.py` / `pr_management.py` 要求显式传入 `--pr-stage wip|review`：`wip` 会把标题规范化为 `[WIP] <title>` 并暂缓 Docker；`review` 会移除 `[WIP]` 并恢复 tree-bound 门禁。WIP 只豁免双平台 Docker 证据，不豁免 DCO、AI 披露、其他测试或 CI。
 4.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
@@ -86,7 +86,7 @@ git diff upstream/master..HEAD
 # 如果变更影响用户使用方式，要判断并同步 README / 使用文档。
 # 如果变更触发双平台门禁，先询问用户并选择 --pr-stage wip 或 review。
 # WIP 自动添加 [WIP] 前缀并跳过 Docker；review 才验证隔离 tree 快照并写入
-# **Verified tree:** `<40位 SHA>`。
+# **Verified tree:** `<40位 SHA>` → 现在改为结构化 `## Docker Verification` 块。
 # 创建/更新 PR 前先运行实际 Agent 工具的版本命令，例如 `opencode --version`，再把完整输出中的
 # 工具名和版本（如 `OpenCode 1.17.20`）传给 `--agent-tool`。
 
@@ -222,7 +222,7 @@ PR 描述通常应包含与本次提交最相关的内容，而不是固定模�
 - **验证结果（可选）**：仅在存在真实验证时写清场景、方法与结果
 
 对于纯文档、注释、`.gitignore`、说明文字等不涉及运行时行为的 PR，可以不写 Verification。
-但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程（含 `requirements/*.txt`），Agent 必须先询问 PR 阶段。`[WIP]` PR 可暂缓双平台 Docker；正式检视 PR 的 Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。正式检视前，Agent 必须记录目标 commit 的完整 tree SHA，让两个 Docker skill 验证该 tree 的隔离快照，并写入唯一标准字段 `**Verified tree:** \`<40位 SHA>\``。脚本将此字段与最新 head tree 强制比对；移除 `[WIP]` 时门禁立即恢复。
+但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程（含 `requirements/*.txt`），Agent 必须先询问 PR 阶段。`[WIP]` PR 可暂缓双平台 Docker；正式检视 PR 的 Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。正式检视前，Agent 必须记录目标 commit 的完整 tree SHA，让两个 Docker skill 验证该 tree 的隔离快照，并写入结构化 `## Docker Verification` 块（含 mode、Verified inputs、Tested source tree、Docker environment 四字段）。脚本校验该块的 inputs 指纹和 tested tree；移除 `[WIP]` 时门禁立即恢复。非门禁文件变化时可复用旧证据（`reused-environment` 模式）。
 
 ## 注意事项
 

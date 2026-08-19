@@ -323,5 +323,5 @@ fi
 > **错误报告要求**：必须逐条列出所有 ERROR 行，并按 Verification Discipline 中的分类标准标注 Fatal / Non-fatal。不能只给 ERROR 行数不给内容。
 
 PR 证据的最终报告必须写出 `Source: isolated committed snapshot`、完整 commit 和完整 tree，
-并将 tree 写成唯一标准字段 `**Verified tree:** \`<40位 tree SHA>\``。当前工作区 copy 的结果必须
+并将 tree SHA 交给 PR 工作流组装成结构化 `## Docker Verification` 块。当前工作区 copy 的结果必须
 标为 local-only，不得伪装成 tree-bound PR 证据。

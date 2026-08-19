@@ -8,14 +8,35 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 import verification_gate
 from verification_gate import (
-    extract_verified_tree,
+    compute_verification_inputs,
     file_triggers_dual_docker_gate,
+    format_verification_metadata,
     is_wip_title,
     normalize_pr_title,
+    prepare_update_verification,
     resolve_pr_head_tree,
     resolve_pr_stage,
-    validate_verified_tree,
+    upsert_verification_metadata,
+    validate_verification_metadata,
 )
+
+_ENV = "ubuntu:ros-humble-desktop-full-jammy|openeuler:ibrobot-dev-env|policy:1"
+
+
+def _gated_files():
+    return [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-old\n+new"}]
+
+
+def _inputs_sha():
+    return compute_verification_inputs(_gated_files())
+
+
+def _full_block(tree, inputs):
+    return format_verification_metadata("full", inputs, tree, _ENV)
+
+
+def _reused_block(old_tree, inputs):
+    return format_verification_metadata("reused-environment", inputs, old_tree, _ENV)
 
 
 def test_gate_detects_global_and_package_dependency_changes():
@@ -63,19 +84,108 @@ def test_gate_requires_explicit_stage_and_wip_only_defers_docker():
     assert review_gate
 
 
-def test_verified_tree_requires_one_full_matching_sha():
+def test_compute_verification_inputs_is_deterministic():
+    sha1 = compute_verification_inputs(_gated_files())
+    sha2 = compute_verification_inputs(_gated_files())
+    assert sha1 == sha2
+    assert len(sha1) == 40
+
+
+def test_compute_verification_inputs_changes_with_patch():
+    files_a = [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-old\n+new"}]
+    files_b = [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-old\n+other"}]
+    assert compute_verification_inputs(files_a) != compute_verification_inputs(files_b)
+
+
+def test_compute_verification_inputs_ignores_non_gated_files():
+    assert compute_verification_inputs([{"filename": "src/foo.py", "patch": "+x"}]) is None
+
+
+def test_full_verification_metadata_validates():
     tree = "a" * 40
-    body = f"## Verification\n\n**Verified tree:** `{tree}`"
+    inputs = _inputs_sha()
+    body = _full_block(tree, inputs)
+    metadata = validate_verification_metadata(body, inputs, tree)
+    assert metadata["mode"] == "full"
+    assert metadata["tested_tree"] == tree
 
-    assert extract_verified_tree(body) == tree
-    assert validate_verified_tree(body, tree.upper()) == tree
 
-    with pytest.raises(ValueError, match="exactly one"):
-        validate_verified_tree("**Verified tree:** `abc123`", tree)
-    with pytest.raises(ValueError, match="does not match"):
-        validate_verified_tree(f"**Verified tree:** `{'b' * 40}`", tree)
-    with pytest.raises(ValueError, match="exactly one"):
-        validate_verified_tree(f"**Verified tree:** `{tree}`\n**Verified tree:** `{tree}`", tree)
+def test_full_verification_rejects_mismatched_tree():
+    inputs = _inputs_sha()
+    body = _full_block("b" * 40, inputs)
+    with pytest.raises(ValueError, match="does not match current tree"):
+        validate_verification_metadata(body, inputs, "a" * 40)
+
+
+def test_reused_environment_validates_with_prior_evidence():
+    old_tree = "a" * 40
+    new_tree = "b" * 40
+    inputs = _inputs_sha()
+    body = _reused_block(old_tree, inputs)
+    metadata = validate_verification_metadata(body, inputs, new_tree, allow_reuse=True)
+    assert metadata["mode"] == "reused-environment"
+    assert metadata["tested_tree"] == old_tree
+
+
+def test_reused_environment_rejects_without_prior_evidence():
+    inputs = _inputs_sha()
+    body = _reused_block("a" * 40, inputs)
+    with pytest.raises(ValueError, match="only valid when prior evidence"):
+        validate_verification_metadata(body, inputs, "b" * 40)
+
+
+def test_prepare_update_carries_forward_reused_environment():
+    old_tree = "a" * 40
+    new_tree = "b" * 40
+    inputs = _inputs_sha()
+    previous = _reused_block(old_tree, inputs)
+    description = "## Changes\n\nFix a typo.\n"
+    updated, metadata = prepare_update_verification(description, previous, inputs, new_tree)
+    assert metadata["mode"] == "reused-environment"
+    assert metadata["tested_tree"] == old_tree
+    assert "reused-environment" in updated
+
+
+def test_prepare_update_requires_full_when_inputs_change():
+    old_tree = "a" * 40
+    new_tree = "b" * 40
+    inputs_old = _inputs_sha()
+    inputs_new = compute_verification_inputs(
+        [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-old\n+brand-new"}]
+    )
+    previous = _full_block(old_tree, inputs_old)
+    description = "## Changes\n\nNo Docker block yet.\n"
+    with pytest.raises(ValueError, match="full Docker verification is required"):
+        prepare_update_verification(description, previous, inputs_new, new_tree)
+
+
+def test_prepare_update_accepts_draft_reused_block():
+    old_tree = "a" * 40
+    new_tree = "b" * 40
+    inputs = _inputs_sha()
+    previous = _reused_block(old_tree, inputs)
+    draft = _reused_block(old_tree, inputs)
+    updated, metadata = prepare_update_verification(draft, previous, inputs, new_tree)
+    assert metadata["mode"] == "reused-environment"
+    assert metadata["tested_tree"] == old_tree
+
+
+def test_prepare_update_accepts_new_full_block():
+    tree = "a" * 40
+    inputs = _inputs_sha()
+    body = _full_block(tree, inputs)
+    previous = _full_block(tree, inputs)
+    updated, metadata = prepare_update_verification(body, previous, inputs, tree)
+    assert metadata["mode"] == "full"
+
+
+def test_upsert_replaces_legacy_verified_tree():
+    tree = "a" * 40
+    inputs = _inputs_sha()
+    legacy = f"## Verification\n\n**Verified tree:** `{tree}`\n"
+    updated = upsert_verification_metadata(legacy, "full", inputs, tree, _ENV)
+    assert "**Verified tree:**" not in updated
+    assert "**Verified inputs:**" in updated
 
 
 def test_resolve_pr_head_tree_fetches_source_branch(monkeypatch):

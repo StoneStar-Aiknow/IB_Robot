@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -5,12 +7,37 @@ import tempfile
 from urllib.parse import urlparse
 
 VERIFIED_TREE_LABEL = "Verified tree"
+VERIFICATION_MODE_LABEL = "Docker verification mode"
+VERIFIED_INPUTS_LABEL = "Verified inputs"
+TESTED_SOURCE_TREE_LABEL = "Tested source tree"
+VERIFICATION_ENVIRONMENT_LABEL = "Docker environment"
+VERIFICATION_MODE_FULL = "full"
+VERIFICATION_MODE_REUSED = "reused-environment"
+VERIFICATION_POLICY_VERSION = "1"
 WIP_PREFIX = "[WIP]"
 _VERIFIED_TREE_RE = re.compile(
     rf"\*\*{VERIFIED_TREE_LABEL}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
     re.IGNORECASE,
 )
 _WIP_PREFIX_RE = re.compile(r"^(?:\s*\[WIP\]\s*)+", re.IGNORECASE)
+_VERIFICATION_MODE_RE = re.compile(
+    rf"\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*\s*`?(full|reused-environment)`?",
+    re.IGNORECASE,
+)
+_VERIFICATION_SHA_FIELDS = {
+    VERIFIED_INPUTS_LABEL: re.compile(
+        rf"\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
+        re.IGNORECASE,
+    ),
+    TESTED_SOURCE_TREE_LABEL: re.compile(
+        rf"\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
+        re.IGNORECASE,
+    ),
+}
+_VERIFICATION_ENVIRONMENT_RE = re.compile(
+    rf"\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*\s*`([^`\n]+)`",
+    re.IGNORECASE,
+)
 _PACKAGE_DEPENDENCY_RE = re.compile(
     r"^[+-](?![+-])\s*</?(?:depend|build_depend|build_export_depend|buildtool_depend|buildtool_export_depend|exec_depend|test_depend|doc_depend|group_depend)\b",
     re.MULTILINE,
@@ -23,7 +50,10 @@ _GLOBAL_GATE_FILES = {
     "scripts/setup.sh",
     "scripts/setup/python_venv.sh",
     "scripts/setup/verify_env.sh",
+    "scripts/setup/lerobot_patches.sh",
+    ".gitmodules",
 }
+_LEROBOT_PATCH_PREFIX = "third_party/patches/lerobot/"
 
 
 def file_triggers_dual_docker_gate(filename: str, patch: str = "") -> bool:
@@ -33,10 +63,60 @@ def file_triggers_dual_docker_gate(filename: str, patch: str = "") -> bool:
         return True
     if filename.startswith("requirements/") and filename.endswith(".txt"):
         return True
-    if not filename.endswith("/package.xml"):
+    if filename == "libs/lerobot" or filename.startswith(_LEROBOT_PATCH_PREFIX):
+        return True
+    if filename != "package.xml" and not filename.endswith("/package.xml"):
         return False
     # Missing patches are treated as gated so API truncation cannot bypass the check.
     return not patch or bool(_PACKAGE_DEPENDENCY_RE.search(patch))
+
+
+def _normalise_patch(patch: str | dict | None) -> str:
+    if isinstance(patch, dict):
+        patch = patch.get("diff") or ""
+    return patch or ""
+
+
+def _changed_lines(patch: str) -> list[str]:
+    """Extract only +/- content lines, ignoring hunk headers and context."""
+    lines = []
+    for line in patch.splitlines():
+        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
+            continue
+        lines.append(line)
+    return lines
+
+
+def verification_input_record(filename: str, patch: str | dict | None = "") -> tuple[str, str] | None:
+    """Return the setup/ dependency input represented by one changed file."""
+    patch = _normalise_patch(patch)
+    if filename == "package.xml" or filename.endswith("/package.xml"):
+        if not patch:
+            return filename, "<patch-unavailable>"
+        dependency_lines = [line for line in _changed_lines(patch) if _PACKAGE_DEPENDENCY_RE.search(line)]
+        return (filename, "\n".join(sorted(dependency_lines))) if dependency_lines else None
+    if file_triggers_dual_docker_gate(filename, patch):
+        if not patch:
+            return filename, "<patch-unavailable>"
+        return filename, "\n".join(_changed_lines(patch))
+    return None
+
+
+def compute_verification_inputs(files: list[dict]) -> str | None:
+    records = []
+    for file_info in files:
+        filename = file_info.get("filename") or file_info.get("new_path") or ""
+        record = verification_input_record(filename, file_info.get("patch") or "")
+        if record is not None:
+            records.append(record)
+    if not records:
+        return None
+    payload = {
+        "policy": VERIFICATION_POLICY_VERSION,
+        "records": sorted(set(records)),
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
+    return hashlib.sha1(encoded).hexdigest()
 
 
 def is_wip_title(title: str) -> bool:
@@ -71,16 +151,192 @@ def extract_verified_tree(description: str) -> str | None:
     return matches[0]
 
 
-def validate_verified_tree(description: str, expected_tree: str) -> str:
-    verified_tree = extract_verified_tree(description)
-    if verified_tree is None:
+def extract_verification_metadata(description: str) -> dict | None:
+    mode_matches = _VERIFICATION_MODE_RE.findall(description or "")
+    input_matches = _VERIFICATION_SHA_FIELDS[VERIFIED_INPUTS_LABEL].findall(description or "")
+    tree_matches = _VERIFICATION_SHA_FIELDS[TESTED_SOURCE_TREE_LABEL].findall(description or "")
+    environment_matches = _VERIFICATION_ENVIRONMENT_RE.findall(description or "")
+    if not mode_matches and not input_matches and not tree_matches:
+        legacy_tree = extract_verified_tree(description)
+        return {"mode": "legacy", "tested_tree": legacy_tree} if legacy_tree else None
+    if len(mode_matches) != 1 or len(input_matches) != 1 or len(tree_matches) != 1 or len(environment_matches) != 1:
         raise ValueError(
-            f"dual Docker verification requires exactly one '**{VERIFIED_TREE_LABEL}:** `<40-character SHA>`' field"
+            "Docker verification metadata requires exactly one mode, one '**Verified inputs:**' field, "
+            "one '**Tested source tree:**' field, and one '**Docker environment:**' field"
         )
-    expected_tree = expected_tree.lower()
-    if verified_tree != expected_tree:
-        raise ValueError(f"Docker verification tree {verified_tree} does not match the latest PR tree {expected_tree}")
-    return verified_tree
+    return {
+        "mode": mode_matches[0].lower(),
+        "verified_inputs": input_matches[0].lower(),
+        "tested_tree": tree_matches[0].lower(),
+        "environment": environment_matches[0],
+    }
+
+
+def format_verification_metadata(
+    mode: str,
+    verified_inputs: str,
+    tested_tree: str,
+    environment: str,
+) -> str:
+    if mode not in {VERIFICATION_MODE_FULL, VERIFICATION_MODE_REUSED}:
+        raise ValueError(f"unsupported Docker verification mode: {mode}")
+    return (
+        "## Docker Verification\n\n"
+        f"**{VERIFICATION_MODE_LABEL}:** `{mode}`\n"
+        f"**{VERIFIED_INPUTS_LABEL}:** `{verified_inputs}`\n"
+        f"**{TESTED_SOURCE_TREE_LABEL}:** `{tested_tree}`\n"
+        f"**{VERIFICATION_ENVIRONMENT_LABEL}:** `{environment}`"
+    )
+
+
+def upsert_verification_metadata(
+    description: str,
+    mode: str,
+    verified_inputs: str,
+    tested_tree: str,
+    environment: str,
+) -> str:
+    line_patterns = [
+        rf"^\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^\*\*{re.escape(VERIFIED_TREE_LABEL)}:\*\*.*(?:\n|$)",
+    ]
+    cleaned = description
+    for pattern in line_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.MULTILINE)
+    return f"{cleaned.rstrip()}\n\n{format_verification_metadata(mode, verified_inputs, tested_tree, environment)}\n"
+
+
+def validate_verification_metadata(
+    description: str,
+    expected_inputs: str,
+    expected_tree: str,
+    *,
+    allow_reuse: bool = False,
+    expected_environment: str | None = None,
+) -> dict:
+    """Validate Docker verification metadata.
+
+    For reused-environment mode, prior-evidence existence is verified by the
+    author-side ``prepare_update_verification``; the reviewer only checks that
+    inputs fingerprint and environment match.
+    """
+    metadata = extract_verification_metadata(description)
+    if metadata is None:
+        raise ValueError("Docker verification metadata is missing")
+    if metadata["mode"] == "legacy":
+        if metadata.get("tested_tree", "").lower() != expected_tree.lower():
+            raise ValueError("legacy Docker verification only matches the current source tree")
+        raise ValueError("legacy Docker evidence must be migrated to full verification metadata")
+    if metadata["verified_inputs"] != expected_inputs.lower():
+        raise ValueError(
+            f"Docker verification inputs {metadata['verified_inputs']} do not match current inputs {expected_inputs}"
+        )
+    if not metadata.get("environment"):
+        raise ValueError("Docker verification environment is missing")
+    if expected_environment is not None and metadata.get("environment") != expected_environment:
+        raise ValueError(
+            f"Docker environment {metadata.get('environment')} does not match current environment {expected_environment}"
+        )
+    if metadata["mode"] == VERIFICATION_MODE_FULL:
+        if expected_tree and metadata["tested_tree"] != expected_tree.lower():
+            raise ValueError(
+                f"full Docker verification tested tree {metadata['tested_tree']} does not match current tree {expected_tree}"
+            )
+    elif metadata["mode"] == VERIFICATION_MODE_REUSED:
+        if not allow_reuse:
+            raise ValueError("reused-environment verification is only valid when prior evidence is available")
+    else:
+        raise ValueError(f"unsupported Docker verification mode: {metadata['mode']}")
+    return metadata
+
+
+def prepare_update_verification(
+    description: str,
+    previous_description: str,
+    expected_inputs: str,
+    current_tree: str,
+) -> tuple[str, dict]:
+    """Carry forward reusable evidence or require a fresh full verification.
+
+    The description supplied by the Agent is treated as a *draft*: when it lacks a
+    current Docker verification block but the previous PR description carries reusable
+    evidence with the same inputs, the workflow automatically inserts a
+    ``reused-environment`` block so reviewers see explicit provenance instead of a
+    silent gap. A new ``full`` block is only required when the inputs changed or no
+    reusable evidence exists.
+    """
+    current = extract_verification_metadata(description)
+    try:
+        previous = extract_verification_metadata(previous_description)
+    except ValueError:
+        previous = None
+
+    if current and current["mode"] == VERIFICATION_MODE_FULL:
+        if current.get("verified_inputs") != expected_inputs.lower():
+            raise ValueError("full Docker verification inputs do not match the current PR inputs")
+        if current.get("tested_tree") != current_tree.lower():
+            raise ValueError("full Docker verification tested tree does not match the current PR tree")
+        if not current.get("environment"):
+            raise ValueError("full Docker verification environment is missing")
+        validate_verification_metadata(description, expected_inputs, current_tree)
+        return upsert_verification_metadata(
+            description,
+            VERIFICATION_MODE_FULL,
+            expected_inputs,
+            current_tree,
+            current["environment"],
+        ), current
+
+    previous_reusable = bool(
+        previous
+        and previous.get("mode") in {VERIFICATION_MODE_FULL, VERIFICATION_MODE_REUSED}
+        and previous.get("verified_inputs") == expected_inputs.lower()
+        and previous.get("tested_tree")
+        and previous.get("environment")
+    )
+
+    if current and current["mode"] == VERIFICATION_MODE_REUSED:
+        if not previous_reusable:
+            raise ValueError("reused-environment verification requires previously recorded Docker evidence")
+        if current.get("tested_tree") != previous["tested_tree"]:
+            raise ValueError("reused-environment tested tree must match the previously verified tree")
+        if not current.get("environment"):
+            raise ValueError("reused-environment verification environment is missing")
+        validate_verification_metadata(
+            description,
+            expected_inputs,
+            current_tree,
+            allow_reuse=True,
+        )
+        return upsert_verification_metadata(
+            description,
+            VERIFICATION_MODE_REUSED,
+            expected_inputs,
+            current["tested_tree"],
+            current["environment"],
+        ), current
+
+    if previous_reusable:
+        mode = VERIFICATION_MODE_FULL if previous["tested_tree"] == current_tree else VERIFICATION_MODE_REUSED
+        tested_tree = current_tree if mode == VERIFICATION_MODE_FULL else previous["tested_tree"]
+        metadata = {
+            "mode": mode,
+            "verified_inputs": expected_inputs,
+            "tested_tree": tested_tree,
+            "environment": previous["environment"],
+        }
+        return upsert_verification_metadata(
+            description,
+            mode,
+            expected_inputs,
+            tested_tree,
+            previous["environment"],
+        ), metadata
+
+    raise ValueError("a full Docker verification is required; no reusable evidence matches the current inputs")
 
 
 def _run_git(args: list[str], cwd: str) -> str:

@@ -16,11 +16,13 @@ from pathlib import Path
 from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 from verification_gate import (
-    file_triggers_dual_docker_gate,
+    compute_verification_inputs,
+    extract_verification_metadata,
     is_wip_title,
+    prepare_update_verification,
     resolve_pr_head_tree,
     resolve_pr_stage,
-    validate_verified_tree,
+    validate_verification_metadata,
 )
 
 
@@ -53,20 +55,19 @@ def mode_fetch_info(args, api: AtomGitClient):
         commits = api.get_pr_commits(args.pr)
         files = api.get_pr_files(args.pr)
         comments = [] if args.no_comments else api.get_all_pr_comments(args.pr)
+        verification_inputs = compute_verification_inputs(files)
         head_tree = None
-        gate_required = False
-        for file_info in files:
-            patch = file_info.get("patch") or ""
-            if isinstance(patch, dict):
-                patch = patch.get("diff") or ""
-            if file_triggers_dual_docker_gate(
-                file_info.get("filename") or file_info.get("new_path") or "",
-                patch,
-            ):
-                gate_required = True
-                if not is_wip_title(pr.get("title") or ""):
+        verification_metadata = None
+        if verification_inputs and not is_wip_title(pr.get("title") or ""):
+            try:
+                verification_metadata = extract_verification_metadata(pr.get("body") or "")
+            except ValueError:
+                verification_metadata = None
+            if not verification_metadata or verification_metadata.get("mode") != "reused-environment":
+                try:
                     head_tree = resolve_pr_head_tree(pr)
-                break
+                except ValueError:
+                    head_tree = None
 
         # 统计信息
         additions = sum(f.get("additions", 0) for f in files)
@@ -83,7 +84,8 @@ def mode_fetch_info(args, api: AtomGitClient):
                 "head_sha": pr.get("head", {}).get("sha", ""),
                 "head_tree": head_tree,
                 "wip": is_wip_title(pr.get("title") or ""),
-                "dual_docker_gate_required": gate_required,
+                "verification_inputs": verification_inputs,
+                "verification": verification_metadata,
                 "stats": {
                     "files_changed": len(files),
                     "additions": additions,
@@ -169,22 +171,19 @@ def mode_update_pr(args, api: AtomGitClient):
             third_party_materials=args.third_party_materials,
         )
 
-        gate_required = False
-        for file_info in files:
-            patch = file_info.get("patch") or ""
-            if isinstance(patch, dict):
-                patch = patch.get("diff") or ""
-            if file_triggers_dual_docker_gate(
-                file_info.get("filename") or file_info.get("new_path") or "",
-                patch,
-            ):
-                gate_required = True
-                break
+        verification_inputs = compute_verification_inputs(files)
+        gate_required = verification_inputs is not None
         title, gate_triggered = resolve_pr_stage(title, args.pr_stage, gate_required)
         if gate_required and not gate_triggered:
             print("ℹ️  [WIP] PR 跳过双平台 Docker 验证；移除 [WIP] 转为正式检视时门禁会恢复。")
         if gate_triggered:
-            validate_verified_tree(description, resolve_pr_head_tree(pr))
+            current_tree = resolve_pr_head_tree(pr)
+            description, verification = prepare_update_verification(
+                description,
+                pr.get("body") or "",
+                verification_inputs,
+                current_tree,
+            )
 
         if not args.human_reviewed and not args.dry_run:
             raise ValueError("更新 PR 前必须由开发者人工审查，并显式传入 --human-reviewed")
@@ -199,7 +198,12 @@ def mode_update_pr(args, api: AtomGitClient):
         api.update_pull_request(args.pr, title=title, body=description)
         if gate_triggered:
             updated_pr = api.get_pull_request(args.pr)
-            validate_verified_tree(description, resolve_pr_head_tree(updated_pr))
+            validate_verification_metadata(
+                description,
+                verification_inputs,
+                resolve_pr_head_tree(updated_pr),
+                allow_reuse=True,
+            )
 
         print(f"\n✅ PR #{args.pr} 描述已更新")
         print(f"🔗 链接: {api.get_pr_url(args.pr)}")

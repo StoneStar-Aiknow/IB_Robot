@@ -52,7 +52,7 @@ must describe one exact committed tree:
 2. Materialize an isolated standalone snapshot of `VERIFIED_COMMIT`; Ubuntu and
    openEuler must both test snapshots whose tree equals `VERIFIED_TREE`.
 3. Include `Verified tree: <full SHA>` in this skill's result. The PR workflow
-   converts it to the canonical `**Verified tree:** \`<full SHA>\`` field.
+   assembles it into the structured `## Docker Verification` block.
 4. At PR creation/update, compare the field with the remote head commit's tree.
    Re-run only when that tree changes. Commit-message, author, or trailer-only
    rewrites retain the same tree and do not invalidate the result.

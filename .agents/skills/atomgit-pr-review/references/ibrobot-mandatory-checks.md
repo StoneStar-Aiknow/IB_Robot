@@ -71,10 +71,10 @@
 - 对此类 PR，review 过程中应检查 **PR 描述中的 Verification 是否由开发者提供**，且必须同时覆盖：
   - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
   - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
-- PR 描述必须且只能包含一个标准字段 `**Verified tree:** \`<40位 SHA>\``。该 SHA 表示上述两个平台实际验证的同一个 Git tree。
+- PR 描述必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段。
 - 必须将该字段与 PR 最新 head commit 的 tree SHA 比对。`pr_review.py` 会自动生成：
-  - `docker_verification_tree_missing`：字段缺失、不是完整 40 位 SHA、出现多个 SHA，或 API 未返回 head tree。
-  - `docker_verification_tree_mismatch`：验证 tree 与 PR 当前最新 head tree 不一致。
+  - `docker_verification_missing`：块缺失或字段不完整。
+  - `docker_verification_mismatch`：inputs 指纹不匹配当前输入，或 full 模式下 tested tree 不匹配当前 head tree。
 - 两种情况都是阻塞性问题。作者 push 后只有源码 tree 改变才要求重跑 Ubuntu 与 openEuler；只改 commit message、作者或 trailer 而 tree 不变时，已有验证仍有效。
 - **review 默认只检查 PR 描述中由开发者声明的验证结果，禁止自动执行双平台 Docker 验证。**
 - "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
