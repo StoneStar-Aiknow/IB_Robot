@@ -378,7 +378,7 @@ class SemanticMappingNode(Node):
             "text_prompt": "object",
             "semantic_map_topic": "/semantic_mapping/objects",
             "object_cloud_topic": "/semantic_mapping/object_cloud",
-            "cloud_map_topic": "/cloud_map",
+            "cloud_map_topic": "/cloud_registered_body",
             "active_map_hash_topic": "/slam/active_geometry_map_hash",
             "localization_ready_topic": "/slam/localization_ready",
             "authoritative_map_odom_topic": "/slam/authoritative_map_odom_ready",

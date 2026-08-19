@@ -158,7 +158,7 @@ robot:
       # Replace these identities with values exported by the active SLAM,
       # calibration, and robot-description deployments before enabling mapping.
       global_frame: map
-      cloud_map_topic: /cloud_map
+      cloud_map_topic: /cloud_registered_body
       active_map_hash_topic: /slam/active_geometry_map_hash
       localization_ready_topic: /slam/localization_ready
       authoritative_map_odom_topic: /slam/authoritative_map_odom_ready

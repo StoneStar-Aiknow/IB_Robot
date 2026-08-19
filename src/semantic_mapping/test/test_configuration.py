@@ -40,7 +40,7 @@ def test_online_parameters_are_derived_from_top_level_ssot(tmp_path: Path) -> No
 
     assert parameters["mapping_backend"] == "service"
     assert parameters["rgb_topic"] == "/camera/realsense/image_raw"
-    assert parameters["cloud_map_topic"] == "/cloud_map"
+    assert parameters["cloud_map_topic"] == "/cloud_registered_body"
     assert parameters["frame_queue_policy"] == "drop_oldest"
     assert parameters["max_masks_per_frame"] == 32
     assert parameters["max_masks_per_batch"] == 8
