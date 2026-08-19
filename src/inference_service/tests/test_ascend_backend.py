@@ -26,7 +26,7 @@ from inference_service.core.pure_inference_engine import PureInferenceEngine
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
 from inference_service.pi05_schedule import load_pi05_schedule
-from inference_service.pipeline import InferencePipeline, PipelineState
+from inference_service.pipeline import InferencePipeline, PipelineCanceledError, PipelineState
 from inference_service.pipeline import factory as pipeline_factory
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
@@ -1145,7 +1145,7 @@ def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scor
         schedule=schedule,
         runtime_options={"curvature_log_path": str(curvature_path)},
     )
-    velocities = iter((1.0, 2.0, 4.0))
+    velocities = iter((1.0, 2.0, 4.0, 1.0, 3.0, 6.0))
     acl = _pi05_acl(
         context,
         [],
@@ -1155,11 +1155,58 @@ def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scor
     pipeline.load()
 
     _pi05_infer(pipeline, "curvature", noise=np.zeros((1, 2, 8), dtype=np.float32))
+    _pi05_infer(pipeline, "curvature-repeat", noise=np.zeros((1, 2, 8), dtype=np.float32))
     pipeline.close()
 
-    record = json.loads(curvature_path.read_text(encoding="utf-8"))
-    assert record["schedule"] == schedule
-    np.testing.assert_allclose(record["curvature_scores"], [1.0, 1.0, 1.0], rtol=1e-5)
+    records = [json.loads(line) for line in curvature_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["schedule"] for record in records] == [schedule, schedule]
+    np.testing.assert_allclose(records[0]["curvature_scores"], [1.0, 1.0, 1.0], rtol=1e-5)
+    np.testing.assert_allclose(records[1]["curvature_scores"], [2.0, 1.0, 1.0], rtol=1e-5)
+
+
+def test_ascend_curvature_log_excludes_failed_request_trace_prefix(tmp_path):
+    schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "failure-recovery",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.75, 0.25, 0.0],
+    }
+    curvature_path = tmp_path / "diagnostics" / "curvature.jsonl"
+    context = _pi05_context(
+        tmp_path,
+        action_runtime_name="v_t",
+        schedule=schedule,
+        runtime_options={"curvature_log_path": str(curvature_path)},
+    )
+    velocities = iter((8.0, 1.0, 2.0, 4.0))
+    cancel_failed_request = True
+    pipeline = None
+
+    def action_callback(noise):
+        nonlocal cancel_failed_request
+        velocity = next(velocities)
+        if cancel_failed_request:
+            cancel_failed_request = False
+            assert pipeline is not None
+            pipeline.cancel("curvature-failed")
+        return np.full_like(noise, velocity)
+
+    acl = _pi05_acl(context, [], action_callback=action_callback)
+    pipeline = _pi05_pipeline(context, acl, pipeline_id="curvature-failure-recovery")
+    pipeline.load()
+
+    with pytest.raises(PipelineCanceledError, match="was canceled"):
+        _pi05_infer(pipeline, "curvature-failed", noise=np.zeros((1, 2, 8), dtype=np.float32))
+    assert curvature_path.read_text(encoding="utf-8") == ""
+
+    _pi05_infer(pipeline, "curvature-success", noise=np.zeros((1, 2, 8), dtype=np.float32))
+    pipeline.close()
+
+    records = [json.loads(line) for line in curvature_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["schedule"] == schedule
+    np.testing.assert_allclose(records[0]["curvature_scores"], [1.0, 1.0, 1.0], rtol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["curvature_log_path"])

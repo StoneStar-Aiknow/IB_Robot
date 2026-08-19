@@ -628,7 +628,9 @@ class InferencePipeline:
     def _write_curvature_log(self, handle: _PolicySessionHandle) -> None:
         if handle.curvature_log_path is None or not handle.velocity_trace:
             return
-        record: dict[str, object] = {"curvature_scores": _curvature_scores(handle.velocity_trace)}
+        velocities = tuple(handle.velocity_trace)
+        handle.velocity_trace.clear()
+        record: dict[str, object] = {"curvature_scores": _curvature_scores(velocities)}
         if handle.schedule is not None:
             record["schedule"] = handle.schedule.to_dict()
         path = Path(str(handle.curvature_log_path)).expanduser().resolve()
