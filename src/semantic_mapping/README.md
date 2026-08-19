@@ -131,6 +131,23 @@ coverage unavailable。
 
 数据库默认位于 `~/.ros/ibrobot/semantic_map.sqlite3`，不保存 SLAM 几何点云或 SLAM 状态。
 
+静态地图使用者可以通过 `semantic_map_standoff` 查询人工标注物品并输出紧凑的
+`[x, y, theta_degrees]` 停靠位。该工具只查询 `get_objects`，不依赖 TF 或 live
+readiness；默认以 map 原点作为接近参考点，也可以传入一个 map-frame 参考点：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=77
+ros2 run semantic_mapping semantic_map_standoff banana 0.2
+# [0.6536,-0.9555,-55.6]
+
+ros2 run semantic_mapping semantic_map_standoff banana 0.2 \
+  --reference-x 0.24 --reference-y 0.09
+```
+
+输出角度以度为单位，`0` 表示 map-frame 的 `x` 正轴，正方向为逆时针。
+查询失败时输出 `[]`。该工具只生成几何目标，不替代 Nav2 的可达性和安全门控。
+
 ## Configuration
 
 新流水线配置由 `robot_config` YAML 顶层的 `robot.semantic_mapping` 管理，不依赖 embodied minimal closure。

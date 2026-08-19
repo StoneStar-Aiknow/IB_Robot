@@ -31,6 +31,7 @@ setup(
             "semantic_map_migrate = semantic_mapping.migrate_database:main",
             "semantic_map_render_labels = semantic_mapping.final_label_visualization:main",
             "semantic_map_manual_labels = semantic_mapping.manual_labels:main",
+            "semantic_map_standoff = semantic_mapping.standoff_query:main",
             "save_semantic_map = semantic_mapping.dataset_capture:main",
         ],
     },
