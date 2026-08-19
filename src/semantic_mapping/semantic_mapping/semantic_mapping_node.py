@@ -393,6 +393,7 @@ class SemanticMappingNode(Node):
             "track_state_persist_interval_sec": 1.0,
             "encode_text_service": "/siglip2_service/encode_text",
             "gdino_confirmation_service": "",
+            "base_frame": "base_link",
             "robot_position_x": 0.0,
             "robot_position_y": 0.0,
             "robot_position_z": 0.0,
@@ -1303,6 +1304,16 @@ class SemanticMappingNode(Node):
             readiness_reason=reason,
         )
 
+    def _robot_position_from_tf(self) -> np.ndarray:
+        transform = self._tf_buffer.lookup_transform(
+            self.global_frame,
+            str(self.get_parameter("base_frame").value),
+            Time(),
+            timeout=self.tf_timeout,
+        )
+        translation = transform.transform.translation
+        return np.asarray([translation.x, translation.y, translation.z], dtype=np.float64)
+
     def _target_callback(self, request, response):
         with self._state_lock:
             track = self._tracker.tracks.get(request.object_id)
@@ -1343,14 +1354,12 @@ class SemanticMappingNode(Node):
         def checker(candidate):
             return True, ""
 
-        robot_position = np.asarray(
-            [
-                self.get_parameter("robot_position_x").value,
-                self.get_parameter("robot_position_y").value,
-                self.get_parameter("robot_position_z").value,
-            ],
-            dtype=np.float64,
-        )
+        try:
+            robot_position = self._robot_position_from_tf()
+        except TransformException as exc:
+            response.message = f"robot pose TF is unavailable: {exc}"
+            response.metadata = self._metadata_message(False, response.message)
+            return response
         resolution = resolve_target(
             track,
             robot_position,

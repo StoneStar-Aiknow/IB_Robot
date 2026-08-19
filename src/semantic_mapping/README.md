@@ -131,6 +131,10 @@ coverage unavailable。
 
 数据库默认位于 `~/.ros/ibrobot/semantic_map.sqlite3`，不保存 SLAM 几何点云或 SLAM 状态。
 
+`resolve_target` 使用 live TF `global_frame -> base_frame`（默认 `map -> base_link`）
+选择机器人当前所在一侧的停靠候选，并让最终 yaw 指向目标物体；TF 不可用时 fail closed，
+不会回退到 map 原点或静态机器人坐标参数。
+
 静态地图使用者可以通过 `semantic_map_standoff` 查询人工标注物品并输出紧凑的
 `[x, y, theta_degrees]` 停靠位。该工具只查询 `get_objects`，不依赖 TF 或 live
 readiness；默认以 map 原点作为接近参考点，也可以传入一个 map-frame 参考点：
