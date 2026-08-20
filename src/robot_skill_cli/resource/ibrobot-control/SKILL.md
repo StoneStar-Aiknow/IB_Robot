@@ -123,6 +123,56 @@ A reference implementation of this loop (catalog discovery, out-of-catalog rejec
 stop-to-definite-terminal, and fresh-state continuation) lives in
 `robot_skill_cli.interactive_control.InteractiveController` and is unit-tested without a ROS stack.
 
+## Perception Reads
+
+For requests that need a runtime perception value (e.g., "转向我" needs the
+user's azimuth), read it via the `ibrobot-perceive` wrapper **before** calling
+`plan-workflow`, then inject the returned literal into `workflow_json`.
+
+```
+ibrobot-perceive --topic /voice/speech_direction --field azimuth_rad
+```
+
+- `ibrobot-perceive` is the **only** allowed path to read ROS topics. Never call `ros2 topic echo`,
+  `ros2 topic list`, `ros2 param get`, or any other `ros2` subcommand directly — not even as a
+  suggestion, fallback, or "alternative" when `ibrobot-perceive` rejects a topic.
+- If `ibrobot-perceive` rejects a topic (e.g., `/joint_states`, `/cmd_vel`) because it is not in
+  the allowlist, report "该 topic 未授权读取" and stop. Do **not** suggest `ros2 topic echo` or
+  any other `ros2` command as a workaround; the rejection is a security boundary, not a missing
+  feature.
+- The wrapper's topic/field allowlist is hard-coded in source; you cannot widen it by editing config.
+- `ros2 topic echo --once` returns the *next* published message, a single point-in-time sample, not a
+  persistent snapshot. For volatile event topics such as `/voice/speech_direction` (published only on
+  voice activity) the value may be absent within the timeout or already stale when consumed.
+- The wrapper prints the value on stdout (e.g., `0.5236`) and errors on stderr. On any error,
+  timeout, or missing field, report "无法感知" to the user and stop; do not fabricate a value.
+- The returned literal becomes a frozen plan parameter. It may be stale by execution time
+  (open-loop, no correction); execution result is authoritative.
+
+Example flow for "转向我" (requires a robot with a mobile base, e.g. lekiwi):
+
+1. `ibrobot-perceive --topic /voice/speech_direction --field azimuth_rad` -> `0.5236`
+2. Convert azimuth_rad (radians, REP-103: 0=front, +π/2=left, -π/2=right) to
+   direction and degree: positive => left, negative => right;
+   degree = abs(azimuth_rad) * 180 / pi  (e.g. 0.5236 rad => 30.0 degrees).
+3. `robot-skill describe nav_turn` (confirm it takes `direction` and `degree`)
+4. `robot-skill plan-workflow --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
+5. validate-plan -> confirm-plan -> execute-plan as usual.
+
+Do **not** map "转向我" to `rotate_gripper_cw`/`rotate_gripper_ccw` — those
+rotate the wrist/gripper, not the robot base, and will not face the user.
+For a single-arm robot without a mobile base (e.g. so101), "转向我" is not
+available; report that the robot has no base rotation and ask the user for a
+different request.
+
+If the user says "left" or "right" with an explicit small nudge for the
+end-effector (not base rotation), use `move_relative_ee` with **both**
+`motion_direction` and `motion_distance` (the skill requires both):
+
+```
+[{"schema_version":1,"skill_name":"move_relative_ee","motion_direction":"left","motion_distance":0.05}]
+```
+
 ## Visual Games
 
 Visual games are non-motion capabilities with a separate asynchronous control surface:

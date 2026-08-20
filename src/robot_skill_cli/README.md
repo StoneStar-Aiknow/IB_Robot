@@ -45,6 +45,18 @@ source install/local_setup.sh
 | `robot-skill-closed-loop ...` | 是 | 展示 Workflow 后立即执行，并验证「别动」和安全 continuation 门禁 |
 | `start-game GAME --request-id ID` | 是 | 以调用方 ID 幂等发起视觉游戏 |
 | `game-result --request-id ID` | 是 | 查询视觉游戏的 pending/terminal 结果 |
+| `ibrobot-perceive --topic TOPIC --field FIELD` | 否 | 只读感知 topic 读取（硬编码 allowlist + audit log），LLM 唯一受信入口 |
+
+`ibrobot-perceive` 是独立的 console script，不经过 Gateway，也不初始化 `rclpy`。它通过硬编码
+topic/field allowlist 读取 `ros2 topic echo --once` 的 YAML 输出并打印请求字段的裸字面量值（供 LLM
+直接读取并注入 `workflow_json`），不遵循下文的 JSON envelope 输出契约；任何非 allowlist 的
+topic/field 都会被拒绝并写入 `/tmp/hermes-perceive.log`。当前 allowlist 仅含
+`/voice/speech_direction`（字段 `azimuth_rad`、`seq_id`），扩展必须修改源码，不接受 config.yaml 覆盖。
+
+`ros2 topic echo --once` 返回下一条已发布消息的单次点时值，不是持久快照。对
+`/voice/speech_direction` 这类事件型 topic，发布方不活跃时会在超时（5s）内取不到值；取到的值在
+消费时可能已经过期。该字面量在 `plan-workflow` 时冻结进 plan digest，后续按 frozen plan 语义审计；
+执行结果以真实运动为准，不自动重试或修正。
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
 `ValidateSkill`、`SkillCommand`、`ValidatePrimitive`、`PrimitiveCommand`、Agent plan services/actions 和标准
@@ -188,11 +200,14 @@ UUIDv5（`ibrobot:{task_id}`）。`cancel` 只对 ledger 中 `active` task 发�
 
 ## 输出契约
 
-除 `execute` 和 `execute-plan` 外，命令向 stdout 输出单行 JSON envelope：
+除 `execute`、`execute-plan` 和 `ibrobot-perceive` 外，命令向 stdout 输出单行 JSON envelope：
 
 ```json
 {"command":"status","data":{},"error":null,"ok":true,"schema_version":1}
 ```
+
+`ibrobot-perceive` 是有意例外：它直接打印请求字段的裸字面量值（如 `0.5236`）供 LLM 读取并
+注入 `workflow_json`，错误信息走 stderr；详见上文「命令」表格。
 
 `execute` 与 `execute-plan` 输出 JSONL：零到多条 `feedback`，最后恰好一条 `result`。每行都包含 `task_id` 和
 `payload_hash`；公开结果只提供 `executed_step_count`，不暴露 primitive、pose 或 joint 名称。
@@ -259,8 +274,16 @@ hermes-robot --config-name so101_single_arm --mode both
 抓取计划使用 `pick_object` 和必填的 `target_name`，Gateway 再将其委派给配置绑定的 `grasp_pipeline`。
 
 运动 catalog 的 `reload-catalog` 是显式、受控的运行时 snapshot 切换，不是自动监听文件。视觉游戏当前
-不支持热加载：YAML 配置变更需要重启 pipeline，Python handler 变更需要重新构建并重启；
+不支持热加载：YAML 配置变更需要重启 pipeline，Python handler 变更要重新构建并重启；
 `reload-catalog` 不会更新视觉游戏。
+
+## raw-ROS 拦截 hook
+
+`resource/hermes/hooks/ibrobot-block-raw-ros` 是 Hermes `pre_tool_call` hook，从 stdin 解析 tool
+payload 并用 `shlex` 分词，阻断任何裸 `ros2` 子命令和 `rclpy`/`roslaunch` 间接调用，强制 LLM 走
+`ibrobot-perceive`（感知读取）或 `robot-skill`（运动控制）。它是 defense-in-depth，权威边界仍是
+`authorize_motion` 和 Gateway plan validation。策略全文见
+[`resource/hermes/POLICY.md`](resource/hermes/POLICY.md)。
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

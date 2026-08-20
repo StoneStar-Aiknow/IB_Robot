@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Hermes pre_tool_call hook: block raw ros2/rclpy commands that bypass the
+ibrobot-perceive wrapper and the robot-skill CLI.
+
+Protocol:
+  stdin  = JSON with tool_name, tool_input.command, etc.
+  stdout = JSON {"action":"block","message":"..."} to block, or empty to allow.
+  exit code is NOT used for blocking; only stdout JSON matters.
+
+Security note: this hook parses the JSON payload and tokenizes the command
+field with shlex so that variable expansion, quoting, and indirect shell
+invocations are harder to smuggle through than a naive substring match.
+It is defense-in-depth, not a sandbox; the authoritative boundary remains
+the operator's authorize_motion gate and the Gateway plan validation.
+"""
+
+import json
+import shlex
+import sys
+
+_BLOCK_MESSAGE = (
+    "raw ros2 is forbidden by IB-Robot POLICY. Use ibrobot-perceive for perception reads or robot-skill for motion."
+)
+
+# Any token whose basename is "ros2" is a direct invocation; we block all
+# subcommands, not just a subset, because POLICY forbids any bare ros2 use.
+_ROS2_BINARY = "ros2"
+
+# Substrings that indicate an indirect ros2/rclpy invocation hidden inside a
+# shell wrapper or Python one-liner. Checked against the raw command string
+# after JSON extraction, covering the common bypass patterns.
+_INDIRECT_MARKERS = (
+    "ros2 ",
+    "ros2\t",
+    "rclpy",
+    "roslaunch",
+    "ros2 control",
+)
+
+
+def _extract_command(payload):
+    tool_input = payload.get("tool_input") or {}
+    return tool_input.get("command")
+
+
+def _tokenize(command):
+    if isinstance(command, list):
+        tokens = []
+        for part in command:
+            tokens.extend(shlex.split(str(part)))
+        return tokens
+    if isinstance(command, str):
+        try:
+            return shlex.split(command)
+        except ValueError:
+            return command.split()
+    return []
+
+
+def _has_direct_ros2(tokens):
+    return any(token.rsplit("/", 1)[-1] == _ROS2_BINARY for token in tokens)
+
+
+def _has_indirect_marker(command_str):
+    if not command_str:
+        return False
+    lowered = command_str.lower()
+    return any(marker in lowered for marker in _INDIRECT_MARKERS)
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    command = _extract_command(payload)
+    if command is None:
+        return
+
+    command_str = " ".join(str(p) for p in command) if isinstance(command, list) else str(command)
+    tokens = _tokenize(command)
+
+    if _has_direct_ros2(tokens) or _has_indirect_marker(command_str):
+        print(json.dumps({"action": "block", "message": _BLOCK_MESSAGE}))
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
