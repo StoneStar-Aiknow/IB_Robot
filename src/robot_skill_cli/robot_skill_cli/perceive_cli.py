@@ -7,6 +7,7 @@ YAML output. Direct ``ros2`` subcommands remain forbidden by POLICY.md.
 
 Allowlisted topics map to real publishers in the IB-Robot stack:
   /voice/speech_direction  — voice_asr_service SpeechDirection (azimuth_rad, seq_id)
+  /joint_states            — sensor_msgs JointState (position)
 
 Point-in-time read, not a persistent snapshot:
   The wrapper calls ``ros2 topic echo --once`` which returns the *next* message
@@ -31,6 +32,7 @@ from pathlib import Path
 import yaml
 
 PERCEPTION_ALLOWLIST: dict[str, set[str]] = {
+    "/joint_states": {"position"},
     "/voice/speech_direction": {"azimuth_rad", "seq_id"},
 }
 
@@ -56,7 +58,9 @@ def _log(topic: str, field: str, status: str) -> None:
 
 
 def _extract_field(stdout: str, field: str) -> object | None:
-    docs = list(yaml.safe_load_all(stdout))
+    marker = stdout.find("---\n")
+    payload = stdout[marker:] if marker >= 0 else stdout
+    docs = list(yaml.safe_load_all(payload))
     for doc in docs:
         if isinstance(doc, dict) and field in doc:
             return doc[field]

@@ -10,6 +10,9 @@
   可能已经过期。`ibrobot-perceive` 返回的字面量值可以作为 `workflow_json` 的参数注入；该值在
   `plan-workflow` 时冻结进 plan digest，后续 validate/confirm/execute 链路按 frozen plan 语义审计。
   感知数据可能过期，执行结果以真实运动为准，不自动重试或修正。
+- 用户询问当前电机或关节角度时，只能运行
+  `ibrobot-perceive --topic /joint_states --field position`。该接口返回原始弧度数组且不返回 `name` 字段，
+  不得编造关节名称、重排数值或把数组索引解释为具体关节。
 - 生成并验证冻结计划后，先展示并 flush exact ordered steps、参数、plan digest、registry identity 和 task ID，
   随后立即调用内部 `confirm-plan` 绑定 exact tuple 并执行；不得询问“确认执行吗”，不得等待用户再次回复。
 - `confirm-plan` 是 Gateway 技术绑定，不是用户确认门禁。物理运动仍只能由操作员启动 pipeline 时设置的

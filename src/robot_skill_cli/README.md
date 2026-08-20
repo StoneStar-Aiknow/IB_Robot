@@ -50,8 +50,9 @@ source install/local_setup.sh
 `ibrobot-perceive` 是独立的 console script，不经过 Gateway，也不初始化 `rclpy`。它通过硬编码
 topic/field allowlist 读取 `ros2 topic echo --once` 的 YAML 输出并打印请求字段的裸字面量值（供 LLM
 直接读取并注入 `workflow_json`），不遵循下文的 JSON envelope 输出契约；任何非 allowlist 的
-topic/field 都会被拒绝并写入 `/tmp/hermes-perceive.log`。当前 allowlist 仅含
-`/voice/speech_direction`（字段 `azimuth_rad`、`seq_id`），扩展必须修改源码，不接受 config.yaml 覆盖。
+topic/field 都会被拒绝并写入 `/tmp/hermes-perceive.log`。当前 allowlist 包含
+`/voice/speech_direction`（字段 `azimuth_rad`、`seq_id`）和 `/joint_states`（字段 `position`），扩展必须
+修改源码，不接受 config.yaml 覆盖。`/joint_states.position` 返回原始弧度数组，不包含关节名映射。
 
 `ros2 topic echo --once` 返回下一条已发布消息的单次点时值，不是持久快照。对
 `/voice/speech_direction` 这类事件型 topic，发布方不活跃时会在超时（5s）内取不到值；取到的值在

@@ -50,6 +50,18 @@ def test_successful_read_prints_literal(capsys, monkeypatch, tmp_path) -> None:
     assert "0.5236" in log
 
 
+def test_joint_positions_read_prints_raw_array(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(perceive_cli, "LOG_PATH", tmp_path / "perceive.log")
+    yaml_out = "---\nname: [shoulder_pan, shoulder_lift]\nposition: [0.12, -0.31]\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _ok_run(yaml_out))
+
+    code = perceive_cli.main(["--topic", "/joint_states", "--field", "position"])
+
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "[0.12, -0.31]"
+    assert "status=ok" in (tmp_path / "perceive.log").read_text(encoding="utf-8")
+
+
 def test_timeout_returns_error(capsys, monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(perceive_cli, "LOG_PATH", tmp_path / "perceive.log")
 
@@ -92,10 +104,22 @@ def test_missing_field_returns_error(capsys, monkeypatch, tmp_path) -> None:
 def test_allowlist_is_hardcoded_and_not_configurable() -> None:
     assert "/voice/speech_direction" in perceive_cli.PERCEPTION_ALLOWLIST
     assert perceive_cli.PERCEPTION_ALLOWLIST["/voice/speech_direction"] == {"azimuth_rad", "seq_id"}
+    assert perceive_cli.PERCEPTION_ALLOWLIST["/joint_states"] == {"position"}
     assert "/cmd_vel" not in perceive_cli.PERCEPTION_ALLOWLIST
-    assert "/joint_states" not in perceive_cli.PERCEPTION_ALLOWLIST
 
 
 def test_extract_field_handles_multiple_yaml_documents() -> None:
     stdout = "---\nseq_id: 1\n---\nazimuth_rad: 0.1\nseq_id: 2\n"
     assert perceive_cli._extract_field(stdout, "azimuth_rad") == 0.1
+
+
+def test_extract_field_ignores_fastdds_diagnostics_before_yaml() -> None:
+    stdout = (
+        "\x1b[31;1m[RTPS_TRANSPORT_SHM Error]\x1b[0m Failed init_port\n"
+        "A message was lost!!!\n"
+        "\ttotal count: 1---\n"
+        "name: ['1', '2']\n"
+        "position: [0.12, -0.31]\n"
+        "---\n"
+    )
+    assert perceive_cli._extract_field(stdout, "position") == [0.12, -0.31]
