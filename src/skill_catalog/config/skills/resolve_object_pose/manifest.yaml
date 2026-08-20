@@ -1,0 +1,46 @@
+schema_version: 2
+name: resolve_object_pose
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Query the semantic map for a named object and return its stand-off navigation target.
+  category: navigation
+  when_to_use:
+  - find where an object is and get a navigation stand-off pose
+  - get the docking position next to a known object
+  aliases_zh:
+  - 查物品位置
+  - 查停靠位
+  - 找物品
+  aliases_en:
+  - find object
+  - get object pose
+  - query stand-off
+  motion_scope:
+  - base
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 5.0
+  requires_motion_params: true
+capability:
+  schema_version: 2
+  summary: Query the semantic map and return a stand-off [x, y, yaw_degrees] target.
+  domain: navigation
+  moves_robot: false
+  required_control_mode: base_navigation
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      target_name:
+        type: string
+        freeform: true
+      stand_off_distance_m:
+        type: number
+        exclusiveMinimum: 0
+        unit: meters
+    required:
+    - target_name
+  recovery_policy: ask_user
+implementations:
+  lekiwi_navigation_v2: implementations/lekiwi_navigation_v2.yaml

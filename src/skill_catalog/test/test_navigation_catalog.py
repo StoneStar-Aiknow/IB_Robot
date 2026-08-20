@@ -5,12 +5,12 @@ import pytest
 
 from embodied_common.primitive_contracts import primitive_contract_for_version
 from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.models import SkillCompileContext, SkillCompileError, SkillRobotContext
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillCompileError, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
 from skill_catalog.validator import validate_manifest
 
 CATALOG_ROOT = Path(__file__).resolve().parents[1]
-NAVIGATION_SKILLS = ("nav_straight", "nav_turn", "nav_abs_coordinate")
+NAVIGATION_SKILLS = ("nav_straight", "nav_turn", "nav_abs_coordinate", "resolve_object_pose")
 
 
 def _parameter_schema(properties):
@@ -113,7 +113,18 @@ def _navigation_context() -> SkillCompileContext:
         robot=robot,
         primitive_contracts=primitive_contract.descriptors,
         primitive_contract_digest=primitive_contract.digest,
-        delegated_executors={},
+        delegated_executors={
+            "semantic_map_query": DelegatedExecutorDescriptor(
+                name="semantic_map_query",
+                contract_version="v1",
+                endpoint_kind="ros_action",
+                endpoint_name="/navigation/execute",
+                configuration_digest="a" * 64,
+                model_deployment_name="",
+                model_fingerprint="",
+                model_bundle_digest="",
+            ),
+        },
     )
 
 
@@ -130,13 +141,20 @@ def test_lekiwi_lidar_profile_compiles_three_atomic_navigation_skills():
     for skill_name in NAVIGATION_SKILLS:
         assert snapshot.semantic_levels[skill_name] == "atomic_operator"
         assert snapshot.capability_view[skill_name]["schema_version"] == 2
-        primitive_sequence = snapshot.templates[skill_name]["primitive_sequence"]
-        assert len(primitive_sequence) == 1
-        assert dict(primitive_sequence[0]) == {
-            "primitive_name": skill_name,
-            **{f"{parameter}_from_request": True for parameter in snapshot.parameter_schemas[skill_name]["required"]},
-        }
-        assert snapshot.requirements[skill_name] == frozenset({"navigation", "validate_skill"})
+        template = snapshot.templates[skill_name]
+        if skill_name == "resolve_object_pose":
+            assert template.get("executor") == "semantic_map_query"
+        else:
+            primitive_sequence = template["primitive_sequence"]
+            assert len(primitive_sequence) == 1
+            assert dict(primitive_sequence[0]) == {
+                "primitive_name": skill_name,
+                **{
+                    f"{parameter}_from_request": True
+                    for parameter in snapshot.parameter_schemas[skill_name]["required"]
+                },
+            }
+            assert snapshot.requirements[skill_name] == frozenset({"navigation", "validate_skill"})
 
 
 def test_navigation_compile_uses_context_selected_primitive_contract():

@@ -49,6 +49,7 @@ CAPABILITY_PARAMETER_NAMES = frozenset(
         "x",
         "y",
         "yaw",
+        "stand_off_distance_m",
     }
     | CAPABILITY_PARAMETER_NAMES_V1
 )
@@ -761,6 +762,7 @@ def _validate_parameter_schema(
             "motion_distance": {"meters", "degrees"},
             "distance": {"meters"},
             "degree": {"degrees"},
+            "stand_off_distance_m": {"meters"},
         }
         signed_numeric_units = {"x": "meters", "y": "meters", "yaw": "degrees"}
         if name in positive_numeric_units:

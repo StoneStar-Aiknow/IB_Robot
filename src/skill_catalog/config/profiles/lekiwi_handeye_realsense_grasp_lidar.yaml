@@ -2,6 +2,9 @@ schema_version: 1
 name: lekiwi_handeye_realsense_grasp_lidar
 robot_name: lekiwi_handeye_realsense_grasp_lidar
 enabled_skills:
+- name: resolve_object_pose
+  implementation: lekiwi_navigation_v2
+  planner_visible: true
 - name: close_gripper_skill
   implementation: lekiwi_handeye_realsense_grasp
   planner_visible: true
