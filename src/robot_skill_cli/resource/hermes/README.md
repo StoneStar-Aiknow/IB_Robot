@@ -49,6 +49,24 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
 `--soul-mode replace` 会先备份现有 `SOUL.md`，再安装仓库中的完整推荐版本。使用
 `--soul-mode merge` 会在现有文件中维护一个 `IBROBOT-MANAGED` 区块；`--soul-mode skip` 不修改 SOUL。
 
+## 同步产物
+
+同步在当前 Hermes profile 下生成以下受管文件（带 managed 标记，重跑同步即覆盖，不要手改）：
+
+- `skills/ibrobot-control/SKILL.md`：当前 `ibrobot-control` Agent Skill 副本。
+- `ibrobot/bin/robot-skill`：绑定 `ROBOT_CONFIG`、`ROS_DOMAIN_ID` 并 source workspace
+  `.shrc_local` 的 wrapper；进入 Hermes 会话后用它而非裸 `robot-skill`，且不得再传
+  `--config-name` / `--config-path`。
+- `ibrobot/ibrobot-env.sh`：写入 `terminal.shell_init_files` 的环境文件，并把
+  `auto_source_bashrc` 置 `false`，使受管环境优先于用户 bashrc；它同时把 `ibrobot/bin`
+  加入 `PATH`。排查「Hermes 不再 source 我的 bashrc」时先看此文件与该开关。
+- `hooks/ibrobot-speak`：`post_llm_call` speech hook wrapper，source `.shrc_local` 后
+  `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT。
+
+`--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
+`hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经
+`hermes hooks list` 确认未注册后跳过，不会阻断审批。
+
 ## 生效与验证
 
 本地 CLI：

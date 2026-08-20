@@ -299,17 +299,19 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
   写入 profile/SOUL.md，`skip` 不修改 SOUL；`replace` 会先备份。
 - 把 `ibrobot-control` Skill 幂等注册到 `profile/skills/`，仅替换带 `robot_skill_cli` 所有权标记
   的副本，遇到同名用户自管 skill 时以 `AGENT_SKILL_CONFLICT` 退出。
-- 生成两个 wrapper：`profile/ibrobot/bin/robot-skill`（绑定 `ROBOT_CONFIG` 并 source
-  `.shrc_local`）和 `profile/hooks/ibrobot-speak`，全部 source workspace `.shrc_local`
-  而非硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
+- 生成两个 wrapper 与一个环境文件：`profile/ibrobot/bin/robot-skill`（绑定 `ROBOT_CONFIG` 并 source
+  `.shrc_local`）、`profile/hooks/ibrobot-speak`（TTS hook）和 `profile/ibrobot/ibrobot-env.sh`
+  （写入 `terminal.shell_init_files` 并把 `auto_source_bashrc` 置 `false`，使 managed 环境优先于
+  用户 bashrc）。三者全部 source workspace `.shrc_local`，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
 - 安装 `post_llm_call` speech hook（`ibrobot-speak`），移除同路径旧 managed 副本；
   `--disable-speech` 仅移除 speech hook。
 - 移除已退役的 `ibrobot-robot-control` Plugin 副本（即时执行改由 `robot-skill` 的
   `confirm-plan` + `execute-plan` 承担），并清理 `external_dirs` 缓存目录下同名的 stale skill 副本。
   Plugin 目录只在带 `hermes-robot-configure` managed 标记时才会被 quarantine（重命名），
   不删除无标记或用户自管内容。
-- `--accept-hooks` 调用 `hermes hooks revoke` + `hermes --accept-hooks hooks doctor` 重新批准
-  hook；`--restart-gateway` 调用 `hermes gateway restart`。
+- `--accept-hooks` 先调用 `hermes hooks revoke` 清理旧 mtime（首次安装无既有审批时经
+  `hermes hooks list` 确认未注册则跳过该失败），再用 `hermes --accept-hooks hooks doctor`
+  重新批准 hook；`--restart-gateway` 调用 `hermes gateway restart`。
 
 `hermes-robot-speak` 是 `post_llm_call` hook 的 Python 入口（由 `ibrobot-speak` shell wrapper 调用），
 从 stdin 读取 Hermes hook payload，提取最终 assistant 回复，经 `sanitize_for_tts` 移除 ASCII

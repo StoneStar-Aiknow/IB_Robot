@@ -251,6 +251,67 @@ def test_approve_hooks_revokes_stale_mtime_before_auto_approval(tmp_path: Path, 
     assert calls[1][1]["HERMES_ACCEPT_HOOKS"] == "1"
 
 
+def test_approve_hooks_continues_when_hook_not_yet_registered(tmp_path: Path, monkeypatch) -> None:
+    """First install: revoke finds nothing to revoke, hook is unlisted, doctor still runs."""
+    hook_path = tmp_path / "hook"
+    run_calls: list[list[str]] = []
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs):
+        run_calls.append(list(arguments))
+        if arguments[1:] == ["hooks", "revoke", str(hook_path)]:
+            return SimpleNamespace(returncode=1, stderr="no such hook", stdout="")
+        if arguments[1:] == ["hooks", "list"]:
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(hermes_configure, "_run", fake_run)
+    monkeypatch.setattr(
+        hermes_configure.subprocess,
+        "run",
+        lambda arguments, **_kwargs: (
+            subprocess_calls.append(list(arguments)) or SimpleNamespace(returncode=0, stderr="", stdout="")
+        ),
+    )
+
+    hermes_configure._approve_hooks("/bin/hermes", hook_path)
+
+    assert run_calls[0][1:] == ["hooks", "revoke", str(hook_path)]
+    assert run_calls[1][1:] == ["hooks", "list"]
+    assert subprocess_calls[0][1:] == ["--accept-hooks", "hooks", "doctor"]
+
+
+def test_approve_hooks_raises_when_registered_hook_revoke_fails(tmp_path: Path, monkeypatch) -> None:
+    """Reupgrade: hook is registered but revoke fails -> raise before reaching doctor."""
+    hook_path = tmp_path / "hook"
+    run_calls: list[list[str]] = []
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs):
+        run_calls.append(list(arguments))
+        if arguments[1:] == ["hooks", "revoke", str(hook_path)]:
+            return SimpleNamespace(returncode=1, stderr="revoke denied", stdout="")
+        if arguments[1:] == ["hooks", "list"]:
+            return SimpleNamespace(returncode=0, stderr="", stdout=f"approved hooks:\n{hook_path}\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(hermes_configure, "_run", fake_run)
+    monkeypatch.setattr(
+        hermes_configure.subprocess,
+        "run",
+        lambda arguments, **_kwargs: (
+            subprocess_calls.append(list(arguments)) or SimpleNamespace(returncode=0, stderr="", stdout="")
+        ),
+    )
+
+    with pytest.raises(hermes_configure.ConfigureError, match="approval refresh failed"):
+        hermes_configure._approve_hooks("/bin/hermes", hook_path)
+
+    assert run_calls[0][1:] == ["hooks", "revoke", str(hook_path)]
+    assert run_calls[1][1:] == ["hooks", "list"]
+    assert subprocess_calls == [], "doctor must not run when revoke fails for a registered hook"
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [

@@ -404,9 +404,27 @@ def _approval_environment() -> dict[str, str]:
     return environment
 
 
+def _hook_registered(hermes: str, hook_path: Path) -> bool:
+    """Return True if Hermes currently tracks ``hook_path`` as an approved hook.
+
+    ``hermes hooks revoke`` is best-effort: on first install the hook was never
+    approved, so revoke has nothing to remove and may exit non-zero. Before
+    treating a revoke failure as fatal, confirm the hook is actually registered
+    via ``hermes hooks list``. When the listing itself fails, conservatively
+    return True so a real revoke failure is not silently swallowed. The match
+    is by the hook's absolute path; if Hermes lists hooks by name only the
+    check reports False and the subsequent ``hooks doctor`` remains the
+    authoritative approval gate.
+    """
+    listed = _run([hermes, "hooks", "list"])
+    if listed.returncode != 0:
+        return True
+    return str(hook_path) in (listed.stdout or "")
+
+
 def _approve_hooks(hermes: str, hook_path: Path) -> None:
     revoked = _run([hermes, "hooks", "revoke", str(hook_path)])
-    if revoked.returncode != 0:
+    if revoked.returncode != 0 and _hook_registered(hermes, hook_path):
         detail = (revoked.stderr or revoked.stdout).strip()
         raise ConfigureError(f"Hermes hook approval refresh failed: {detail}")
     result = subprocess.run(
