@@ -56,6 +56,14 @@ def test_has_indirect_marker_ros2_substring() -> None:
     assert hook._has_indirect_marker("bash -c 'ros2 topic pub ...'") is True
 
 
+def test_has_indirect_marker_ros2cli_module() -> None:
+    assert hook._has_indirect_marker("python3 -m ros2cli topic echo /joint_states") is True
+
+
+def test_has_indirect_marker_ros2cli_import() -> None:
+    assert hook._has_indirect_marker("python3 -c 'import ros2cli'") is True
+
+
 def test_has_indirect_marker_empty_or_clean() -> None:
     assert hook._has_indirect_marker("") is False
     assert hook._has_indirect_marker("ls -la") is False
@@ -118,6 +126,16 @@ def test_main_blocks_rclpy_import(capsys, monkeypatch) -> None:
     code, out = _run_main({"tool_input": {"command": "python3 -c 'import rclpy'"}}, capsys, monkeypatch)
     assert code == 0
     assert json.loads(out)["action"] == "block"
+
+
+def test_main_blocks_ros2cli_module_form(capsys, monkeypatch) -> None:
+    code, out = _run_main(
+        {"tool_input": {"command": "python3 -m ros2cli topic echo /joint_states"}}, capsys, monkeypatch
+    )
+    assert code == 0
+    parsed = json.loads(out)
+    assert parsed["action"] == "block"
+    assert "ibrobot-perceive" in parsed["message"]
 
 
 def test_main_blocks_command_list(capsys, monkeypatch) -> None:

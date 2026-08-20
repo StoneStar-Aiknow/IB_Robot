@@ -28,12 +28,15 @@ _ROS2_BINARY = "ros2"
 
 # Substrings that indicate an indirect ros2/rclpy invocation hidden inside a
 # shell wrapper or Python one-liner. Checked against the raw command string
-# after JSON extraction, covering the common bypass patterns.
+# after JSON extraction, covering the common bypass patterns. "ros2cli" closes
+# the ``python3 -m ros2cli`` module-form bypass, whose token lacks the trailing
+# space that "ros2 " requires.
 _INDIRECT_MARKERS = (
     "ros2 ",
     "ros2\t",
     "rclpy",
     "roslaunch",
+    "ros2cli",
     "ros2 control",
 )
 
