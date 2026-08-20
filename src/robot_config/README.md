@@ -862,6 +862,11 @@ TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加
 WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
 不是 `robot_config` 的隐式后端选择。
 
+`voice_tts` 同时维护三个语义不同的超时字段：`playback_timeout_sec` 是 `/voice_tts/play`
+同步播放超时；`synthesis_timeout_sec` 是 Hermes `post_llm_call` TTS hook 等待
+`/voice_tts/synthesize` 返回合成结果的超时（由 `hermes-robot-configure` 写入 wrapper 环境变量）；
+`tts_timeout_sec` 是 `embodied_agent` 视觉游戏播报节点的内部 RPC 超时。三者互不替代。
+
 ### 真机手眼配置
 
 SO101 抓取使用同级独立配置 `config/robots/lekiwi_handeye_realsense_grasp.yaml`。用户应直接在

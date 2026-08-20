@@ -568,12 +568,13 @@ def test_load_single_arm_config():
     assert config.voice_asr.device_name == ""
     assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
-    assert config.voice_tts.enabled is False
+    assert config.voice_tts.enabled is True
     assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
-    assert config.voice_tts.deployment == ""
+    assert config.voice_tts.deployment == "ubuntu_onnx"
     assert config.voice_tts.service_name == "/voice_tts/synthesize"
     assert config.voice_tts.playback_service_name == "/voice_tts/play"
     assert config.voice_tts.playback_timeout_sec == 300.0
+    assert config.voice_tts.synthesis_timeout_sec == 90.0
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
     assert config.skill_gateway.default_skill_timeout_sec == 120.0
