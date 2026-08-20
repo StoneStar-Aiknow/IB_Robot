@@ -254,6 +254,14 @@ def test_group_spawner_is_the_controller_readiness_barrier():
         robot_launch._controller_readiness_barrier([group_spawner, ExecuteProcess(cmd=["true"])], fallback_waiter)
 
 
+def test_controller_readiness_handler_is_registered_before_barrier_can_start():
+    source = _LAUNCH_PATH.read_text(encoding="utf-8")
+    block = source[source.index("if controller_dependent_actions:") : source.index("# ========== N. Tracing")]
+
+    assert "actions.insert(" in block
+    assert "target_action=controller_ready_barrier" in block
+
+
 def _relay_targets(nodes):
     """Collect (source_topic, target_topic) pairs from robot_config topic_relay nodes."""
     pairs = []

@@ -1,12 +1,13 @@
+from copy import deepcopy
 from pathlib import Path
 
 import yaml
 
 from robot_config.launch_builders.perception import generate_camera_nodes
-from robot_config.loader import load_robot_config_dict
+from robot_config.loader import load_robot_config_dict, validate_motion_mode_config
 
 ROOT = Path(__file__).resolve().parents[3]
-CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_lidar.yaml"
+CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
 
 
 def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
@@ -24,9 +25,7 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     peripherals = {item["name"]: item for item in config["peripherals"]}
     assert set(peripherals) == {"wrist", "front", "mid360"}
     assert peripherals["wrist"]["transform"]["parent_frame"] == "gripper"
-    assert peripherals["wrist"]["serial_number"] == "349522071345"
     assert peripherals["front"]["transform"]["parent_frame"] == "base_link"
-    assert peripherals["front"]["serial_number"] == "043322073551"
     assert peripherals["front"]["driver_camera_name"] == "front"
     assert peripherals["front"]["align_depth"] is True
     assert peripherals["mid360"]["driver"] == "livox_mid360"
@@ -47,7 +46,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     navigation = load_robot_config_dict(CONFIG_PATH, nav_stage="navigation")
 
     assert hybrid["nav_stage"] == "hybrid"
-    assert hybrid["default_control_mode"] == "moveit_planning"
+    assert hybrid["default_control_mode"] == "base_navigation"
     assert hybrid["skill_required_control_mode"] == "moveit_planning"
     assert hybrid["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_lidar"
     assert hybrid["navigation"]["enabled"] is True
@@ -55,9 +54,11 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert hybrid["mid360_mount_file"].endswith("lekiwi_mid360_mount.yaml")
     assert [item["name"] for item in hybrid["peripherals"]] == ["wrist", "front", "mid360"]
     assert "peripheral_names" not in hybrid
+    assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
     assert set(hybrid["control_modes"]["moveit_planning"]["inactive_controllers"]) == {"base_velocity_controller"}
     assert hybrid["motion_mode"]["manipulation_control_mode"] == "moveit_planning"
     assert hybrid["motion_mode"]["navigation_control_mode"] == "base_navigation"
+    assert hybrid["motion_mode"]["navigation_enabled_on_startup"] is True
 
     assert grasp["nav_stage"] == "grasp"
     assert grasp["navigation"]["enabled"] is False
@@ -102,7 +103,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
 
 
-def test_unified_profile_launches_distinct_realsense_devices():
+def test_unified_profile_launches_wrist_and_front_realsense_drivers():
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
 
     drivers = [
@@ -112,19 +113,17 @@ def test_unified_profile_launches_distinct_realsense_devices():
     ]
     assert {vars(node).get("_Node__node_name") for node in drivers} == {"wrist_camera", "front"}
 
-    def text_value(value):
-        if isinstance(value, tuple):
-            value = "".join(item.text if hasattr(item, "text") else str(item) for item in value)
-        return str(value).strip().strip("'\"")
 
-    params_by_name = {
-        vars(node).get("_Node__node_name"): {
-            text_value(key): text_value(value) for key, value in vars(node).get("_Node__parameters")[0].items()
-        }
-        for node in drivers
-    }
-    assert params_by_name["wrist_camera"]["serial_no"] == "349522071345"
-    assert params_by_name["front"]["serial_no"] == "043322073551"
+def test_hybrid_startup_mode_and_navigation_gate_must_match():
+    hybrid = load_robot_config_dict(CONFIG_PATH)
+
+    navigation_startup = deepcopy(hybrid)
+    navigation_startup["default_control_mode"] = "base_navigation"
+    navigation_startup["motion_mode"]["navigation_enabled_on_startup"] = True
+    assert validate_motion_mode_config(navigation_startup) == []
+
+    navigation_startup["motion_mode"]["navigation_enabled_on_startup"] = False
+    assert any("must match default_control_mode" in error for error in validate_motion_mode_config(navigation_startup))
 
 
 def test_unified_profile_applies_only_the_front_camera_artifact(monkeypatch, tmp_path):

@@ -400,3 +400,31 @@ collision_monitor:
       min_height: -0.20
       max_height: 1.60
       enabled: true
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: False
+    bond_timeout: 10.0
+    attempt_respawn_reconnection: true
+    bond_respawn_max_duration: 10.0
+
+lifecycle_manager_localization:
+  ros__parameters:
+    use_sim_time: False
+    bond_timeout: 10.0
+    attempt_respawn_reconnection: true
+    bond_respawn_max_duration: 10.0
+
+lifecycle_manager_amcl:
+  ros__parameters:
+    use_sim_time: False
+    bond_timeout: 10.0
+    attempt_respawn_reconnection: true
+    bond_respawn_max_duration: 10.0
+
+lifecycle_manager_collision_monitor:
+  ros__parameters:
+    use_sim_time: False
+    bond_timeout: 10.0
+    attempt_respawn_reconnection: true
+    bond_respawn_max_duration: 10.0

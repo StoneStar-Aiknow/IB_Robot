@@ -151,13 +151,13 @@ def generate_launch_description():
         condition=IfCondition(autostart),
         parameters=[
             {
-                "startup_delay_sec": 10.0,
+                "startup_delay_sec": 3.0,
                 "service_name": "/lifecycle_manager_navigation/manage_nodes",
                 "namespace": namespace,
-                "service_wait_timeout_sec": 2.0,
-                "request_timeout_sec": 30.0,
-                "retry_count": 3,
-                "retry_interval_sec": 1.0,
+                "service_wait_timeout_sec": 30.0,
+                "request_timeout_sec": 60.0,
+                "retry_count": 15,
+                "retry_interval_sec": 5.0,
             }
         ],
     )

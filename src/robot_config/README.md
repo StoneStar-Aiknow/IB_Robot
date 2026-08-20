@@ -460,7 +460,7 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 ### `nav_stage` 参数与 stage 解析
 
 `nav_stage` 是 `robot.launch.py` 的 launch argument。标准导航配置声明 `mapping` / `navigation`；
-移动抓取与导航统一配置 `lekiwi_handeye_realsense_grasp_lidar` 还声明 `grasp` 和 `hybrid`。缺省时由
+移动抓取与导航统一配置 `lekiwi_nav_grasp` 还声明 `grasp` 和 `hybrid`。缺省时由
 `robot.default_nav_stage` 决定。stage 在 canonical loader 中解析，builder 和具身运行时只会看到
 解析后的单一配置：
 

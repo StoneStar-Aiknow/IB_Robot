@@ -840,7 +840,8 @@ def launch_setup(context, *args, **kwargs):
                 f"Controller readiness barrier armed for "
                 f"{len(controller_dependent_actions)} control-dependent action(s)"
             )
-            actions.append(
+            actions.insert(
+                0,
                 RegisterEventHandler(
                     event_handler=OnProcessExit(
                         target_action=controller_ready_barrier,
@@ -850,7 +851,7 @@ def launch_setup(context, *args, **kwargs):
                             failure_reason="Controller readiness probe failed; aborting launch.",
                         ),
                     )
-                )
+                ),
             )
         else:
             actions.extend(controller_dependent_actions)

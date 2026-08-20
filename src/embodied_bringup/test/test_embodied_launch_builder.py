@@ -208,9 +208,7 @@ def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
 
 
 def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
-    config_path = (
-        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_lidar.yaml"
-    )
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)
 
     params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
@@ -557,6 +555,69 @@ def test_navigation_stage_launch_argument_is_declared_and_forwarded(monkeypatch,
     base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
     assert base_launch_arguments["nav_stage"] == "navigation"
     assert base_launch_arguments["control_mode"] == "base_navigation"
+
+
+def test_hybrid_navigation_entry_starts_moveit_for_complete_runtime(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args: {
+            "name": "lekiwi_handeye_realsense_grasp_lidar",
+            "nav_stage": "hybrid",
+            "default_control_mode": "base_navigation",
+            "skill_required_control_mode": "moveit_planning",
+            "control_modes": {"base_navigation": {"controllers": []}},
+            "navigation": {"enabled": True},
+            "grasp_execution": {"enabled": True},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        },
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_nav_grasp",
+                "with_embodied": "false",
+            }
+        )
+    )
+
+    base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert base_launch_arguments["with_moveit"] == "true"
+
+
+def test_hybrid_teleop_override_does_not_auto_start_moveit(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args: {
+            "name": "lekiwi_handeye_realsense_grasp_lidar",
+            "nav_stage": "hybrid",
+            "default_control_mode": "base_navigation",
+            "skill_required_control_mode": "moveit_planning",
+            "control_modes": {"teleop": {"controllers": []}},
+            "navigation": {"enabled": True},
+            "grasp_execution": {"enabled": True},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        },
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_nav_grasp",
+                "control_mode": "teleop",
+                "with_embodied": "false",
+            }
+        )
+    )
+
+    base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert base_launch_arguments["with_moveit"] == ""
 
 
 def test_mapping_stage_defaults_embodied_runtime_off(monkeypatch, tmp_path):
