@@ -130,32 +130,36 @@ user's azimuth), read it via the `ibrobot-perceive` wrapper **before** calling
 `plan-workflow`, then inject the returned literal into `workflow_json`.
 
 ```
-ibrobot-perceive --topic /voice/speech_direction --field azimuth_rad
-ibrobot-perceive --topic /joint_states --field position
+ibrobot-perceive --source voice_direction --field azimuth_rad
+ibrobot-perceive --source arm_joint_position --field position [--config-name NAME]
 ```
 
 - `ibrobot-perceive` is the **only** allowed path to read ROS topics. Never call `ros2 topic echo`,
   `ros2 topic list`, `ros2 param get`, or any other `ros2` subcommand directly — not even as a
-  suggestion, fallback, or "alternative" when `ibrobot-perceive` rejects a topic.
-- If `ibrobot-perceive` rejects a topic (e.g., `/cmd_vel`) because it is not in
-  the allowlist, report "该 topic 未授权读取" and stop. Do **not** suggest `ros2 topic echo` or
+  suggestion, fallback, or "alternative" when `ibrobot-perceive` rejects a source.
+- If `ibrobot-perceive` rejects a source (e.g., `cmd_vel`) because it is not in
+  the allowlist, report "该 source 未授权读取" and stop. Do **not** suggest `ros2 topic echo` or
   any other `ros2` command as a workaround; the rejection is a security boundary, not a missing
   feature.
-- The wrapper's topic/field allowlist is hard-coded in source; you cannot widen it by editing config.
+- The wrapper's source/field allowlist is hard-coded in source; you cannot widen it by editing config.
+  `--source` is a semantic alias, not a ROS topic name. The actual topic for config-backed sources
+  (`arm_joint_position`) is resolved from `robot_config.moveit.joint_state_topic` at runtime
+  (so101 -> `/joint_states`, lekiwi_handeye -> `/arm_joint_state_broadcaster/joint_states`); pass
+  `--config-name` to match the robot the pipeline is running.
 - `ros2 topic echo --once` returns the *next* published message, a single point-in-time sample, not a
-  persistent snapshot. For volatile event topics such as `/voice/speech_direction` (published only on
+  persistent snapshot. For volatile event sources such as `voice_direction` (published only on
   voice activity) the value may be absent within the timeout or already stale when consumed.
 - The wrapper prints the value on stdout (e.g., `0.5236`) and errors on stderr. On any error,
   timeout, or missing field, report "无法感知" to the user and stop; do not fabricate a value.
 - For requests asking for current motor or joint angles, run
-  `ibrobot-perceive --topic /joint_states --field position`. Return the raw position array in radians;
+  `ibrobot-perceive --source arm_joint_position --field position`. Return the raw position array in radians;
   do not invent joint names or reorder values because this minimal interface does not return the companion `name` field.
 - The returned literal becomes a frozen plan parameter. It may be stale by execution time
   (open-loop, no correction); execution result is authoritative.
 
 Example flow for "转向我" (requires a robot with a mobile base, e.g. lekiwi):
 
-1. `ibrobot-perceive --topic /voice/speech_direction --field azimuth_rad` -> `0.5236`
+1. `ibrobot-perceive --source voice_direction --field azimuth_rad` -> `0.5236`
 2. Convert azimuth_rad (radians, REP-103: 0=front, +π/2=left, -π/2=right) to
    direction and degree: positive => left, negative => right;
    degree = abs(azimuth_rad) * 180 / pi  (e.g. 0.5236 rad => 30.0 degrees).

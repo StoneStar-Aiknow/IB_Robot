@@ -13,7 +13,7 @@ Source allowlist (alias -> real ROS topic):
   depend on ``robot_config``. ``arm_joint_position`` resolves its topic from the
   same ``robot_config`` that MoveIt and the Capability Gateway consume, so multi-part
   robots publish the correct arm joint topic:
-    so101_single_arm            -> /joint_states (moveit default)
+    so101_single_arm            -> /joint_states (wrapper fallback)
     lekiwi_handeye_realsense_grasp -> /arm_joint_state_broadcaster/joint_states
   Topic resolution reuses ``robot_config.config_path.resolve_robot_config_path`` (the
   SSOT path resolver); no second path priority is maintained. The resolved topic is
