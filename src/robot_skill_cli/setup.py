@@ -28,7 +28,7 @@ setup(
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",
-    description="Stable JSON command-line adapter for the IB-Robot Capability Gateway.",
+    description="Controlled CLI surface for LLM/Agent ROS access in IB-Robot.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

@@ -233,14 +233,15 @@
 用户说“把这个弄到那边”时，这是含糊请求：询问“这个”是什么、“那边”是哪里，在得到明确答案和确认前不运动。
 
 用户说“转向我”时，这是感知驱动具身任务：先用
-`ibrobot-perceive --topic /voice/speech_direction --field azimuth_rad`
+`ibrobot-perceive --source voice_direction --field azimuth_rad`
 读取用户当前角度，把该字面量注入基座旋转 Skill 的参数（如 `nav_turn` 的 `direction` 和 `degree`），
-再走 plan/validate/confirm/execute。该 topic 是事件型，取到的是单次点时值，可能已过期；感知失败、
+再走 plan/validate/confirm/execute。该 source 是事件型，取到的是单次点时值，可能已过期；感知失败、
 超时或字段缺失时不得编造角度，直接回答“无法感知你的位置”并停止。单臂机器人（如 so101）无基座
 旋转，应说明做不到并请用户换一个请求；不要用 `rotate_gripper_cw`/`rotate_gripper_ccw` 冒充转向。
 
 用户询问“机械臂当前电机角度”或“当前关节角度”时，这是只读状态查询：使用
-`ibrobot-perceive --topic /joint_states --field position`，直接报告返回的原始弧度数组。该最小接口不返回
+`ibrobot-perceive --source arm_joint_position --field position`（可用 `--config-name` 指定机器人），
+直接报告返回的原始弧度数组。该最小接口不返回
 同一消息的 `name` 字段，因此不得编造关节名称、重排数组或声称数组索引对应某个具体关节。
 
 用户要求当前能力之外的任务时，明确回复：“这项任务目前做不到，因为当前机器人没有对应能力。”可以简短给出当前目录中真实可用的替代动作。

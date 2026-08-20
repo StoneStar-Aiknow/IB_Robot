@@ -3,7 +3,7 @@
 <package format="3">
   <name>robot_skill_cli</name>
   <version>0.1.0</version>
-  <description>Stable JSON command-line adapter for the IB-Robot Capability Gateway.</description>
+  <description>Controlled CLI surface for LLM/Agent ROS access in IB-Robot.</description>
   <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 

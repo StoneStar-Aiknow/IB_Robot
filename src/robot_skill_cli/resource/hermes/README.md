@@ -14,11 +14,17 @@ persona 见仓库 [`docs/hermes_soul/SOUL.md`](../../../docs/hermes_soul/SOUL.md
 
 ## `ibrobot-perceive`（感知读取唯一入口）
 
-`ibrobot-perceive` 是 `robot_skill_cli` 提供的独立 console script，不经过 Gateway。它通过
-硬编码 topic/field allowlist 读取 `ros2 topic echo --once` 的 YAML 输出并打印请求字段的裸字面量值，
-供 LLM 直接读取并注入 `workflow_json`。当前 allowlist 包含
-`/voice/speech_direction`（字段 `azimuth_rad`、`seq_id`）和 `/joint_states`（字段 `position`），扩展必须
-修改源码，不接受 config.yaml 覆盖。`/joint_states.position` 直接返回原始弧度数组，不提供关节名映射。
+`ibrobot-perceive` 是 `robot_skill_cli` 提供的独立 console script，不经过 Gateway。它以硬编码
+source/field allowlist 限制可读取的感知量，通过 `ros2 topic echo --once` 读取 YAML 输出并打印请求
+字段的裸字面量值，供 LLM 直接读取并注入 `workflow_json`。当前 allowlist 包含
+`voice_direction`（topic `/voice/speech_direction`，字段 `azimuth_rad`、`seq_id`）和
+`arm_joint_position`（字段 `position`），扩展必须修改源码，不接受 config.yaml 覆盖。
+
+`--source` 是语义别名而非 ROS topic 名：`voice_direction` 是 `voice_asr_service` 的固定契约，topic 写死
+不读 robot_config；`arm_joint_position` 的 topic 在运行时从 `robot_config` 的 `moveit.joint_state_topic`
+解析（so101 -> `/joint_states`，lekiwi_handeye -> `/arm_joint_state_broadcaster/joint_states`），复用
+`resolve_robot_config_path()`，不维护第二套路径优先级。安全边界是硬编码的 *field* 集合，不是 topic 名。
+`arm_joint_position.position` 直接返回原始弧度数组，不提供关节名映射。
 
 `ros2 topic echo --once` 返回的是下一条已发布消息的单次点时值，不是持久快照。对
 `/voice/speech_direction` 这类事件型 topic，发布方不活跃时会在超时内取不到值；取到的值在消费时

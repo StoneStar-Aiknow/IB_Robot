@@ -1,13 +1,21 @@
 # robot_skill_cli
 
-`robot_skill_cli` 提供稳定的 `robot-skill` 命令行接口，将 Agent 的运动技能请求限定在 ROS Capability
-Gateway 的公开边界内，并为非运动视觉游戏提供独立的异步 start/query 控制面。默认 Agent 控制链路为：
+`robot_skill_cli` 提供约束 LLM/Agent 对 ROS 访问面的命令行工具集，包含三条受控入口：
 
 ```text
-Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
+运动控制:   Hermes -> ibrobot-control Skill -> robot-skill            -> ROS Capability Gateway
+感知读取:   Hermes -> ibrobot-perceive (硬编码 allowlist)              -> ros2 topic echo --once
+裸 ROS 拦截: Hermes pre_tool_call -> ibrobot-block-raw-ros hook        -> block ros2/rclpy/roslaunch
 ```
 
-CLI 不直接调用 primitive、MoveIt、controller 或裸 ROS 运动接口，也不修改 Gateway 的授权和安全策略。
+- `robot-skill`：运动技能请求的唯一受控入口，限定在 Capability Gateway 公开边界内，不直接调用
+  primitive、MoveIt、controller 或裸 ROS 运动接口，也不修改 Gateway 的授权和安全策略。
+- `ibrobot-perceive`：只读感知读取的唯一受信入口，硬编码 source/field allowlist + 审计日志，
+  有界超时；不经 Gateway，不初始化 `rclpy`。
+- `ibrobot-block-raw-ros`：Hermes `pre_tool_call` 防御 hook，拦截裸 `ros2`/`rclpy`/`roslaunch`
+  调用，是 defense-in-depth，权威边界仍是 `authorize_motion` 与 Gateway plan validation。
+
+运动控制始终走 Gateway；感知读取走受控 allowlist；裸 `ros2` 调用被 hook 拦截。
 
 ## 环境与配置
 
@@ -45,14 +53,27 @@ source install/local_setup.sh
 | `robot-skill-closed-loop ...` | 是 | 展示 Workflow 后立即执行，并验证「别动」和安全 continuation 门禁 |
 | `start-game GAME --request-id ID` | 是 | 以调用方 ID 幂等发起视觉游戏 |
 | `game-result --request-id ID` | 是 | 查询视觉游戏的 pending/terminal 结果 |
-| `ibrobot-perceive --topic TOPIC --field FIELD` | 否 | 只读感知 topic 读取（硬编码 allowlist + audit log），LLM 唯一受信入口 |
+| `ibrobot-perceive --source SOURCE --field FIELD [--config-name NAME]` | 否 | 只读感知 source 读取（硬编码 allowlist + audit log），LLM 唯一受信入口 |
 
-`ibrobot-perceive` 是独立的 console script，不经过 Gateway，也不初始化 `rclpy`。它通过硬编码
-topic/field allowlist 读取 `ros2 topic echo --once` 的 YAML 输出并打印请求字段的裸字面量值（供 LLM
-直接读取并注入 `workflow_json`），不遵循下文的 JSON envelope 输出契约；任何非 allowlist 的
-topic/field 都会被拒绝并写入 `/tmp/hermes-perceive.log`。当前 allowlist 包含
-`/voice/speech_direction`（字段 `azimuth_rad`、`seq_id`）和 `/joint_states`（字段 `position`），扩展必须
-修改源码，不接受 config.yaml 覆盖。`/joint_states.position` 返回原始弧度数组，不包含关节名映射。
+`ibrobot-perceive` 是独立的 console script，不经过 Gateway，也不初始化 `rclpy`。它以硬编码
+source/field allowlist 限制可读取的感知量，通过 `ros2 topic echo --once` 读取 YAML 输出并打印请求
+字段的裸字面量值（供 LLM 直接读取并注入 `workflow_json`），不遵循下文的 JSON envelope 输出契约；
+任何非 allowlist 的 source/field 都会被拒绝并写入 `/tmp/hermes-perceive.log`。当前 allowlist 包含
+`voice_direction`（topic `/voice/speech_direction`，字段 `azimuth_rad`、`seq_id`）和
+`arm_joint_position`（字段 `position`），扩展必须修改源码，不接受 config.yaml 覆盖。
+
+`--source` 是语义别名，不是 ROS topic 名；config-backed source 的实际 topic 在运行时从 `robot_config`
+解析，复用 `resolve_robot_config_path()`，CLI 不维护第二套路径优先级：
+
+- `voice_direction`：`voice_asr_service` 固定契约，topic 写死为 `/voice/speech_direction`，不读 robot_config。
+- `arm_joint_position`：topic 取自 `robot_config` 的 `moveit.joint_state_topic`，缺失时回退 `/joint_states`。
+  so101_single_arm 解析为 `/joint_states`；lekiwi_handeye_realsense_grasp 解析为
+  `/arm_joint_state_broadcaster/joint_states`（手臂关节，不含底盘轮子）。`--config-name`/`--config-path`
+  语义与 `robot-skill` 一致且互斥；省略时按 `ROBOT_CONFIG`/`ROBOT_NAME`/默认 `so101_single_arm` 解析。
+  安全边界是硬编码的 *field* 集合，不是 topic 名——topic 名是机器人级配置，不是安全敏感面。
+
+`arm_joint_position.position` 返回原始弧度数组，不包含关节名映射，不得编造关节名称、重排数值或把
+数组索引解释为具体关节。
 
 `ros2 topic echo --once` 返回下一条已发布消息的单次点时值，不是持久快照。对
 `/voice/speech_direction` 这类事件型 topic，发布方不活跃时会在超时（5s）内取不到值；取到的值在
