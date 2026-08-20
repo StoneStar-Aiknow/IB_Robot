@@ -231,6 +231,30 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
     assert "120.0" in _text(deferred_spawners[0]._Node__arguments)
 
 
+def test_hybrid_real_hardware_spawner_keeps_arm_state_stream_active():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    robot_config = load_robot_config_dict(config_path)
+
+    _nodes, controller_names, deferred_spawners, _robot_description = generate_ros2_control_nodes(
+        robot_config,
+        use_sim=False,
+        auto_start_controllers="true",
+        controller_startup_timeout=120.0,
+    )
+
+    assert controller_names == [
+        "joint_state_broadcaster",
+        "arm_joint_state_broadcaster",
+        "base_velocity_controller",
+    ]
+    assert len(deferred_spawners) == 1
+    arguments = [_text(argument) for argument in deferred_spawners[0]._Node__arguments]
+    inactive_controllers = [
+        arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--inactive-controller"
+    ]
+    assert inactive_controllers == ["arm_trajectory_controller", "gripper_trajectory_controller"]
+
+
 def test_controller_startup_processes_are_serialized():
     processes = [ExecuteProcess(cmd=["true"]) for _ in range(4)]
 

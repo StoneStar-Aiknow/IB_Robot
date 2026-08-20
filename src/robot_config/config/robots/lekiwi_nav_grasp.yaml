@@ -644,6 +644,12 @@ robot:
       peripheral_names: [wrist, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
+      control_modes:
+        base_navigation:
+          controllers:
+            - joint_state_broadcaster
+            - arm_joint_state_broadcaster
+            - base_velocity_controller
       embodied:
         enabled: true
         skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar

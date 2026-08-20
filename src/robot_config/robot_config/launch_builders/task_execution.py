@@ -27,19 +27,34 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
     """
     is_sim = parse_bool(use_sim, default=False)
 
-    # Only launch for modes that use task-level execution
+    # Only launch for modes that use task-level execution.  A hybrid robot may
+    # start in navigation mode while keeping MoveIt online for an automatic
+    # transition to its configured manipulation mode.  In that case the task
+    # executor is still a required manipulation dependency and must be started
+    # before the first skill requests the transition.
     control_modes = robot_config.get("control_modes", {})
     mode_config = control_modes.get(control_mode, {})
+    motion_mode = robot_config.get("motion_mode", {})
+    manipulation_control_mode = ""
+    if isinstance(motion_mode, dict) and bool(motion_mode.get("enabled", False)):
+        manipulation_control_mode = str(motion_mode.get("manipulation_control_mode", "")).strip()
+    manipulation_mode_config = control_modes.get(manipulation_control_mode, {})
 
     # Task executor is relevant for moveit-based modes with task_dispatch enabled
     executor_config = mode_config.get("executor", {})
+    candidate_modes = [(control_mode, mode_config)]
+    if manipulation_control_mode and control_mode != manipulation_control_mode:
+        candidate_modes.append((manipulation_control_mode, manipulation_mode_config))
+        executor_config = manipulation_mode_config.get("executor", {})
 
-    # Auto-detect: launch task_executor when mode has moveit semantics
-    needs_task_executor = (
-        "moveit" in control_mode.lower()
-        or "visual_grasp" in control_mode.lower()
-        or "voxposer" in control_mode.lower()
-        or executor_config.get("task_dispatch", False)
+    # Auto-detect: launch task_executor when either the active mode or the
+    # configured manipulation mode has MoveIt/task-dispatch semantics.
+    needs_task_executor = any(
+        "moveit" in mode_name.lower()
+        or "visual_grasp" in mode_name.lower()
+        or "voxposer" in mode_name.lower()
+        or mode.get("executor", {}).get("task_dispatch", False)
+        for mode_name, mode in candidate_modes
     )
 
     if not needs_task_executor:

@@ -4,10 +4,30 @@ from pathlib import Path
 import yaml
 
 from robot_config.launch_builders.perception import generate_camera_nodes
+from robot_config.launch_builders.task_execution import generate_task_executor_node
 from robot_config.loader import load_robot_config_dict, validate_motion_mode_config
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
+
+
+def _launch_parameter_value(node, name: str):
+    for raw_key, raw_value in node._Node__parameters[0].items():
+        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
+        if key != name:
+            continue
+        if not isinstance(raw_value, tuple):
+            return raw_value
+        text = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
+        if text.endswith("\n..."):
+            text = text[:-4].rstrip()
+        if text in {"True", "False"}:
+            return text == "True"
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    raise KeyError(name)
 
 
 def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
@@ -55,6 +75,11 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert [item["name"] for item in hybrid["peripherals"]] == ["wrist", "front", "mid360"]
     assert "peripheral_names" not in hybrid
     assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
+    assert hybrid["control_modes"]["base_navigation"]["controllers"] == [
+        "joint_state_broadcaster",
+        "arm_joint_state_broadcaster",
+        "base_velocity_controller",
+    ]
     assert set(hybrid["control_modes"]["moveit_planning"]["inactive_controllers"]) == {"base_velocity_controller"}
     assert hybrid["motion_mode"]["manipulation_control_mode"] == "moveit_planning"
     assert hybrid["motion_mode"]["navigation_control_mode"] == "base_navigation"
@@ -101,6 +126,20 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
     assert navigation["navigation"]["command_server"]["enabled"] is True
     assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
+
+
+def test_hybrid_navigation_startup_keeps_manipulation_task_executor_online():
+    config = load_robot_config_dict(CONFIG_PATH)
+
+    node = generate_task_executor_node(config, "base_navigation")
+
+    assert node is not None
+    assert node.node_package == "task_dispatch"
+    assert node.node_executable == "task_executor_node"
+    assert _launch_parameter_value(node, "skip_redundant_gripper_open") is False
+    assert _launch_parameter_value(node, "gripper_open_position") == 1.0
+    assert _launch_parameter_value(node, "gripper_position_tolerance") == 0.05
+    assert _launch_parameter_value(node, "joint_state_max_age_s") == 0.25
 
 
 def test_unified_profile_launches_wrist_and_front_realsense_drivers():
