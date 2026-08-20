@@ -11,10 +11,17 @@ from robot_navigation.cmd_vel_bridge_node import _body_to_wheel_radps
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PACKAGE_ROOT.parents[1]
 CONFIG_ROOT = PACKAGE_ROOT / "config"
+NAV2_BRINGUP_LAUNCH = PACKAGE_ROOT / "launch" / "nav2_bringup.launch.py"
 ROBOT_CONFIG = WORKSPACE_ROOT / "src" / "robot_config" / "config" / "robots" / "lekiwi_realsense_navigation.yaml"
 
 MPPI_PROFILES = [CONFIG_ROOT / "nav2_params.yaml", CONFIG_ROOT / "nav2_sim_params.yaml"]
 DWB_PROFILES = [CONFIG_ROOT / "nav2_params_dwb.yaml", CONFIG_ROOT / "nav2_sim_params_dwb.yaml"]
+LIFECYCLE_MANAGERS = {
+    "lifecycle_manager_navigation",
+    "lifecycle_manager_localization",
+    "lifecycle_manager_amcl",
+    "lifecycle_manager_collision_monitor",
+}
 REQUIRED_CRITICS = {
     "ConstraintCritic",
     "CostCritic",
@@ -32,6 +39,29 @@ def _load(path):
 
 def _follow_path(profile):
     return profile["controller_server"]["ros__parameters"]["FollowPath"]
+
+
+@pytest.mark.parametrize("path", [CONFIG_ROOT / "nav2_params.yaml", CONFIG_ROOT / "nav2_params_dwb.yaml"])
+def test_hardware_lifecycle_managers_tolerate_310p_startup_load(path):
+    profile = _load(path)
+    for manager in LIFECYCLE_MANAGERS:
+        params = profile[manager]["ros__parameters"]
+        assert params["bond_timeout"] == 10.0
+        assert params["attempt_respawn_reconnection"] is True
+        assert params["bond_respawn_max_duration"] == 10.0
+
+
+def test_navigation_lifecycle_coordinator_retries_slow_310p_bringup():
+    launch_source = NAV2_BRINGUP_LAUNCH.read_text(encoding="utf-8")
+
+    for assignment in (
+        '"startup_delay_sec": 3.0',
+        '"service_wait_timeout_sec": 30.0',
+        '"request_timeout_sec": 60.0',
+        '"retry_count": 15',
+        '"retry_interval_sec": 5.0',
+    ):
+        assert assignment in launch_source
 
 
 def _envelope():

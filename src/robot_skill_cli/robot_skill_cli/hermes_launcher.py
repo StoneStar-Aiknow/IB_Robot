@@ -138,7 +138,7 @@ def _hermes_skills_directory(hermes_path: str) -> Path:
     return config_path.parent / "skills"
 
 
-def _register_hermes_skill(skill_path: Path, skills_directory: Path) -> Path:
+def register_hermes_skill(skill_path: Path, skills_directory: Path) -> Path:
     target_dir = skills_directory / _HERMES_SKILL_NAME
     target = target_dir / "SKILL.md"
     marker = target_dir / _MANAGED_SKILL_MARKER
@@ -317,7 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config_path = _check_robot_runtime(args.config_name, args.config_path, args.mode)
         workspace = _prepare_hermes_workspace()
         skills_directory = _hermes_skills_directory(hermes_path)
-        _register_hermes_skill(_installed_skill_path(), skills_directory)
+        register_hermes_skill(_installed_skill_path(), skills_directory)
         _check_hermes_skill_discovery(hermes_path)
         hermes_arguments = _build_hermes_arguments(hermes_path, args.hermes_args)
     except (FileNotFoundError, ValueError) as exc:

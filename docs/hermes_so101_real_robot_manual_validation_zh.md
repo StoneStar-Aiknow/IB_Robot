@@ -149,7 +149,40 @@ robot-skill --config-path "$ROBOT_CONFIG_PATH" describe recover_safe_pose
 
 任一命令非零退出或返回 not-ready/unauthorized 时停止，不要进入运动验证。
 
-## 6. 终端 3：启动 Hermes
+## 6. 同步 Hermes Profile 与飞书 Gateway
+
+每次更新 Hermes 集成资源、`ibrobot-control` Skill 或 TTS hook 后，先在工作区根目录执行：
+
+```bash
+export IBROBOT_WS=/mnt/data/lwh/IB_Robot_0803
+cd "$IBROBOT_WS"
+source .shrc_local
+source install/setup.bash
+export ROS_DOMAIN_ID=52
+
+hermes-robot-configure \
+  --config-path "$IBROBOT_WS/src/robot_config/config/robots/so101_single_arm.yaml" \
+  --soul-mode replace \
+  --accept-hooks \
+  --restart-gateway
+```
+
+该命令会安装当前 `ibrobot-control` Skill，绑定当前 workspace、`ROBOT_CONFIG` 和 ROS Domain，配置自动 TTS，
+并禁用旧的 `ibrobot-robot-control` Plugin。它不会启动机器人、开启运动授权或发送运动。
+
+同步后执行以下只读检查：
+
+```bash
+hermes gateway status
+hermes hooks list
+hermes hooks doctor
+```
+
+飞书 Gateway 重启后，在飞书发送 `/new` 创建新会话。先发送普通中文消息并现场确认扬声器播放最终回复；再发送
+“你会挥手吗”确认能力询问不会触发运动。任何 hook 未 allowlist、Gateway 未连接或 TTS 服务不可用时，停止真机
+验收并先修复运行环境。
+
+## 7. 终端 3：启动本地 Hermes CLI
 
 打开第三个终端：
 
@@ -170,7 +203,7 @@ control plane 和 Agent plan 接口。它不会启动机器人，也不会替操
 
 预检查失败时停止，并记录完整错误码和错误信息。
 
-## 7. 使用自然语言验证打开夹爪
+## 8. 使用自然语言验证打开夹爪
 
 进入 Hermes 后输入：
 
@@ -214,7 +247,19 @@ executed_step_count: 1
 
 同时现场确认夹爪实际打开。只看到 goal accepted、feedback 或进程退出都不能视为成功。
 
-## 8. 回到安全原位
+## 9. 飞书自然语言验收
+
+在飞书新会话中发送与第 8 节相同的“打开夹爪”请求。通过标准与本地 CLI 相同，且必须同时确认：
+
+- 冻结计划已在飞书中展示后立即执行，没有出现 `/robot-confirm` 或“确认执行吗”的等待；
+- 机器人仅通过 Capability Gateway 执行；
+- 最终自然语言回复已由本地扬声器播放；
+- `hermes hooks doctor` 对 `post_llm_call` hook 仍为健康状态。
+
+如计划错误，立即在飞书发送「别动」，并按第 12 节等待停止终态。飞书消息送达或取消请求被接受都不能单独证明
+物理机器人已停止。
+
+## 10. 回到安全原位
 
 完成动作验证后，不要直接关闭 ROS。继续在同一个 Hermes 会话中输入：
 
@@ -230,7 +275,7 @@ status -> list-skills -> plan-workflow -> describe -> validate-plan。
 计划不正确，立即输入「别动」。必须等待 terminal result 返回 `success: true`，并现场确认机械臂已经回到
 安全原位。
 
-## 9. 正常关闭与重启
+## 11. 正常关闭与重启
 
 仅在 `recover_safe_pose` 已返回成功并确认机器人处于安全原位后执行：
 
@@ -243,7 +288,7 @@ cd "$IBROBOT_WS"
 确认旧进程已经退出后，才能按照本文第 4 节重新启动。不要用直接 kill controller manager 的方式代替
 正常恢复和清理顺序。
 
-## 10. 失败、超时与取消处理
+## 12. 失败、超时与取消处理
 
 以下任一情况发生时，停止当前流程，不要自动重试，不要更换 task ID 后再次执行：
 
@@ -270,7 +315,7 @@ robot-skill --config-path "$ROBOT_CONFIG_PATH" cancel-plan \
 如果 Gateway 不可用，以至于无法按要求执行 `recover_safe_pose`，不要盲目重启服务。先恢复受控入口或由现场
 操作员完成安全处置，再决定是否清理和重启。
 
-## 11. 验收记录
+## 13. 验收记录
 
 一次完整通过的真机验证至少应记录：
 
@@ -282,6 +327,8 @@ robot-skill --config-path "$ROBOT_CONFIG_PATH" cancel-plan \
 - Gateway status 中的 registry epoch、generation 和 digest；
 - `open_gripper_skill` 的 plan digest、task ID 和 terminal result；
 - `recover_safe_pose` 的 plan digest、task ID 和 terminal result；
+- Hermes profile 同步命令、Gateway restart 结果和 hook doctor 输出；
+- 飞书新会话的展示后立即执行结果与本地扬声器播报结果；
 - 现场观察结果；
 - 最终执行 `cleanup_ros.sh` 的时间与结果。
 

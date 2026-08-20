@@ -142,14 +142,18 @@ robot:
     device_name: ""
     exit_on_init_failure: true
 
-  # Voice TTS is disabled until a validated ZipVoice bundle and named deployment are installed.
+  # Voice TTS is enabled with the validated ZipVoice bundle and the ubuntu_onnx deployment.
+  # exit_on_init_failure is false so a missing/unbuilt bundle degrades gracefully:
+  # the node stays alive, /voice_tts/synthesize stays registered, and requests return
+  # MODEL_NOT_READY instead of crashing the pipeline.
   voice_tts:
-    enabled: false
+    enabled: true
     bundle_path: "models/voice_tts/zipvoice"
-    deployment: ""
+    deployment: "ubuntu_onnx"
     service_name: /voice_tts/synthesize
     playback_service_name: /voice_tts/play
     playback_timeout_sec: 300.0
+    synthesis_timeout_sec: 90.0
     prompt_profile: default
     segment_max_chars: 200
     segment_pause_ms: 150
@@ -160,7 +164,7 @@ robot:
     max_response_audio_bytes: 67108864
     tts_timeout_sec: 15.0
     device_id: 0
-    exit_on_init_failure: true
+    exit_on_init_failure: false
 
   semantic_mapping:
     enabled: false

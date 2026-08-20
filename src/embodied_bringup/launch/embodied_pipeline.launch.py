@@ -171,6 +171,14 @@ def launch_setup(context, *_args, **_kwargs):
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     motion_authorized = parse_bool(authorize_motion_str, default=False)
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
+    requested_moveit = context.launch_configurations.get("with_moveit", "")
+    if (
+        requested_moveit == ""
+        and config.get("nav_stage") == "hybrid"
+        and active_control_mode == "base_navigation"
+        and "moveit" in str(config.get("skill_required_control_mode", "")).lower()
+    ):
+        requested_moveit = "true"
     base_launch_arguments = {
         "robot_config": robot_config_name,
         "config_path": config_path_override,
@@ -179,7 +187,7 @@ def launch_setup(context, *_args, **_kwargs):
         "auto_start_controllers": context.launch_configurations.get("auto_start_controllers", "true"),
         "control_mode": active_control_mode,
         "nav_stage": nav_stage,
-        "with_moveit": context.launch_configurations.get("with_moveit", ""),
+        "with_moveit": requested_moveit,
         "moveit_display": context.launch_configurations.get("moveit_display", "false"),
         "with_embodied": "false",
         "with_perception": "false",

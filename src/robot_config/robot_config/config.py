@@ -207,6 +207,7 @@ class VoiceTTSConfig:
     service_name: str = "/voice_tts/synthesize"
     playback_service_name: str = "/voice_tts/play"
     playback_timeout_sec: float = 300.0
+    synthesis_timeout_sec: float = 90.0
     prompt_profile: str = "default"
     segment_max_chars: int = 200
     segment_pause_ms: int = 150

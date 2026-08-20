@@ -23,8 +23,9 @@
 
 ```bash
 source .shrc_local
-source install/local_setup.sh
 ```
+
+`.shrc_local` 是 ROS+venv+install overlay 的 SSOT 入口（见 `AGENTS.md` 环境初始化章节），无需重复 `source install/setup.bash`。
 
 每个命令可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
 配置解析完全复用 `robot_config.resolve_robot_config_path()`，CLI 不维护第二套路径优先级：底层选择顺序是
@@ -306,6 +307,65 @@ payload 并用 `shlex` 分词，阻断任何裸 `ros2` 子命令和 `rclpy`/`ros
 `ibrobot-perceive`（感知读取）或 `robot-skill`（运动控制）。它是 defense-in-depth，权威边界仍是
 `authorize_motion` 和 Gateway plan validation。策略全文见
 [`resource/hermes/POLICY.md`](resource/hermes/POLICY.md)。
+
+## Hermes 集成同步
+
+`hermes-robot-configure` 是 IB-Robot Hermes 集成的幂等 profile 同步命令，把 Skill、SOUL 策略和
+speech hook 一次性写入当前 Hermes profile。它取代了手工维护的 `SOUL.md`、`POLICY.md`、
+`ibrobot-control` Plugin 和 TTS hook 副本，作为 `robot_skill_cli/resource/hermes/` 唯一发布源的
+落地入口。
+
+```bash
+hermes-robot-configure \
+  --config-name so101_single_arm \
+  --soul-mode replace \
+  --accept-hooks \
+  --restart-gateway
+```
+
+也可以使用安装到 `share/robot_skill_cli/hermes/sync_hermes.sh` 的 shell 入口（等价于
+`hermes-robot-configure`），适合源码场景或无 `install/setup.bash` 时使用：
+
+```bash
+bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
+  --config-name so101_single_arm --dry-run
+```
+
+同步会执行以下动作（`--dry-run` 仅预览不写文件）：
+
+- 调用 `resolve_robot_config_path()` / `load_robot_config()` 从 `robot_config` SSOT 读取
+  `voice_tts` 服务名、playback 服务名、synthesis 超时和 playback 超时；严禁硬编码 ROS 服务名。
+  其中 `synthesis_timeout_sec` 是 hook 等待 `/voice_tts/synthesize` 返回合成结果的超时，
+  `playback_timeout_sec` 是等待 `/voice_tts/play` 完成播放的超时；`tts_timeout_sec` 是
+  `embodied_agent` 视觉游戏播报节点的内部 RPC 超时，三者语义不同，互不替代。
+- 验证当前 `ROS_DOMAIN_ID`（0-232）和 workspace `.shrc_local`（ROS+venv+install overlay 的
+  SSOT 入口，见 `AGENTS.md`）。
+- 把 `resource/hermes/SOUL.md`（`--soul-mode replace`）或 `POLICY.md` 托管区块（`--soul-mode merge`）
+  写入 profile/SOUL.md，`skip` 不修改 SOUL；`replace` 会先备份。
+- 把 `ibrobot-control` Skill 幂等注册到 `profile/skills/`，仅替换带 `robot_skill_cli` 所有权标记
+  的副本，遇到同名用户自管 skill 时以 `AGENT_SKILL_CONFLICT` 退出。
+- 生成两个 wrapper 与一个环境文件：`profile/ibrobot/bin/robot-skill`（绑定 `ROBOT_CONFIG` 并 source
+  `.shrc_local`）、`profile/hooks/ibrobot-speak`（TTS hook）和 `profile/ibrobot/ibrobot-env.sh`
+  （写入 `terminal.shell_init_files` 并把 `auto_source_bashrc` 置 `false`，使 managed 环境优先于
+  用户 bashrc）。三者全部 source workspace `.shrc_local`，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
+- 安装 `post_llm_call` speech hook（`ibrobot-speak`），移除同路径旧 managed 副本；
+  `--disable-speech` 仅移除 speech hook。
+- 移除已退役的 `ibrobot-robot-control` Plugin 副本（即时执行改由 `robot-skill` 的
+  `confirm-plan` + `execute-plan` 承担），并清理 `external_dirs` 缓存目录下同名的 stale skill 副本。
+  Plugin 目录只在带 `hermes-robot-configure` managed 标记时才会被 quarantine（重命名），
+  不删除无标记或用户自管内容。
+- `--accept-hooks` 先调用 `hermes hooks revoke` 清理旧 mtime（首次安装无既有审批时经
+  `hermes hooks list` 确认未注册则跳过该失败），再用 `hermes --accept-hooks hooks doctor`
+  重新批准 hook；`--restart-gateway` 调用 `hermes gateway restart`。
+
+`hermes-robot-speak` 是 `post_llm_call` hook 的 Python 入口（由 `ibrobot-speak` shell wrapper 调用），
+从 stdin 读取 Hermes hook payload，提取最终 assistant 回复，经 `sanitize_for_tts` 移除 ASCII
+字母 run（ZipVoice 中文前端不发音英文），调用 `ibrobot_msgs.srv.SynthesizeSpeech` 合成 WAV
+并通过 `PlayAudioFile` 服务播放。TTS 是系统自动功能，不是机器人 Skill，不进入 `workflow_json`。
+诊断日志位于 `/tmp/hermes-speak.log`（受 `IBROBOT_HERMES_TTS_LOG` 覆盖）。
+
+详细同步步骤、前置条件和升级流程见
+[`resource/hermes/README.md`](resource/hermes/README.md)。
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

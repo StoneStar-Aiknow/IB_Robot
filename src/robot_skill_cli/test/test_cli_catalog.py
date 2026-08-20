@@ -69,7 +69,7 @@ def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
     from robot_skill_cli.catalog import compile_local_snapshot
 
     root = Path(__file__).resolve().parents[3]
-    config_path = root / "src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_lidar.yaml"
+    config_path = root / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)
 
     snapshot = compile_local_snapshot(config, config_path)

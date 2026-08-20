@@ -1,4 +1,4 @@
-## IB-Robot 控制与感知策略
+## IB-Robot 控制、感知与语音策略
 
 - 对真实机器人请求，必须使用 `ibrobot-control` Skill 和 Capability Gateway，不得调用裸 ROS 运动类接口
   （`ros2 topic pub`、`ros2 service call`、`ros2 action`、MoveIt、controller、primitive 或硬件接口）。
@@ -21,3 +21,5 @@
 - Gateway 不可用、未授权、计划校验失败、执行超时或状态未知时必须停止，不得自动重试或发起新运动。
 - 用户发送“别动”“停止”或“取消”时立即通过受控取消入口处理；取消请求不等于机器人已停止，必须等待
   stop-confirmed terminal result。
+- TTS 是系统自动功能，不是机器人 Skill。最终自然语言回复由 `post_llm_call` hook 合成并播放，不得在
+  workflow 中加入“播报”“语音”或“发声”步骤。

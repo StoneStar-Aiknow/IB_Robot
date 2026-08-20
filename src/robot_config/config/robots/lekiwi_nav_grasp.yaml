@@ -210,7 +210,7 @@ robot:
       rpc_timeout_sec: 3.0
       avoid_collisions: false
       check_orientation: false
-      worker_count: 4
+      worker_count: 1
       worker_namespace_prefix: /ik_worker
       auto_start_workers: true
     contact_compensation:
@@ -638,12 +638,12 @@ robot:
           publish_tf: false
           cmd_vel_topic: /cmd_vel_safe
     hybrid:
-      default_control_mode: moveit_planning
+      default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
       mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
       peripheral_names: [wrist, front, mid360]
       motion_mode:
-        navigation_enabled_on_startup: false
+        navigation_enabled_on_startup: true
       embodied:
         enabled: true
         skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
@@ -842,11 +842,9 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # librealsense serial for the 310P wrist D435i. Explicit binding avoids
-      # selecting another RealSense when multiple devices are connected.
-      # This is the librealsense serial reported by the currently installed
-      # D435i; it intentionally differs from the USB descriptor serial.
-      serial_number: "349522071345"
+      # Set the librealsense serial for the wrist camera when multiple
+      # RealSense devices are connected.
+      serial_number: ""
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
       initial_reset: false
@@ -887,9 +885,9 @@ robot:
       name: front
       driver: realsense
       driver_camera_name: front
-      # The second D435i attached to the 310P is the fixed base camera. Explicit
-      # binding prevents either RealSense process from claiming the other role.
-      serial_number: "043322073551"
+      # Set the librealsense serial for the fixed front camera when multiple
+      # RealSense devices are connected.
+      serial_number: ""
       width: 640
       height: 480
       fps: 30

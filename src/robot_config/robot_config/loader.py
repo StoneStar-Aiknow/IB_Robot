@@ -422,8 +422,12 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append(f"motion_mode.{key} must be a control_modes member")
     if len(set(mode_names.values())) != len(mode_names):
         errors.append("motion_mode manipulation and navigation control modes must be distinct")
-    if robot_config.get("nav_stage") == "hybrid" and config.get("navigation_enabled_on_startup") is not False:
-        errors.append("hybrid motion_mode must start with navigation_enabled_on_startup=false")
+    if robot_config.get("nav_stage") == "hybrid":
+        default_mode = str(robot_config.get("default_control_mode", "")).strip()
+        navigation_mode = mode_names.get("navigation_control_mode", "")
+        expected_navigation_enabled = default_mode == navigation_mode
+        if config.get("navigation_enabled_on_startup") is not expected_navigation_enabled:
+            errors.append("hybrid motion_mode.navigation_enabled_on_startup must match default_control_mode")
 
     for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
         _positive_number(config, key, "motion_mode", errors)
@@ -1571,6 +1575,7 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         service_name=data.get("service_name", defaults.service_name),
         playback_service_name=data.get("playback_service_name", defaults.playback_service_name),
         playback_timeout_sec=data.get("playback_timeout_sec", defaults.playback_timeout_sec),
+        synthesis_timeout_sec=data.get("synthesis_timeout_sec", defaults.synthesis_timeout_sec),
         prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
         segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
         segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
@@ -2014,6 +2019,8 @@ def validate_config(config: RobotConfig) -> list[str]:
             errors.append("voice_tts.playback_service_name must be an absolute ROS service name")
         if config.voice_tts.playback_timeout_sec <= 0:
             errors.append("voice_tts.playback_timeout_sec must be positive")
+        if config.voice_tts.synthesis_timeout_sec <= 0:
+            errors.append("voice_tts.synthesis_timeout_sec must be positive")
         if not config.voice_tts.prompt_profile:
             errors.append("voice_tts.prompt_profile must be non-empty")
         positive_limits = {

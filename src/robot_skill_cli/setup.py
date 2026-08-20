@@ -17,6 +17,8 @@ setup(
             [
                 "resource/hermes/README.md",
                 "resource/hermes/POLICY.md",
+                "resource/hermes/SOUL.md",
+                "resource/hermes/sync_hermes.sh",
             ],
         ),
         (
@@ -35,6 +37,8 @@ setup(
             "robot-skill = robot_skill_cli.cli:main",
             "robot-skill-closed-loop = robot_skill_cli.closed_loop_runner:main",
             "hermes-robot = robot_skill_cli.hermes_launcher:main",
+            "hermes-robot-configure = robot_skill_cli.hermes_configure:main",
+            "hermes-robot-speak = robot_skill_cli.hermes_tts_hook:main",
             "ibrobot-perceive = robot_skill_cli.perceive_cli:main",
         ]
     },

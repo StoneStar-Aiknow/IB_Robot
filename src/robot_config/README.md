@@ -460,7 +460,7 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 ### `nav_stage` 参数与 stage 解析
 
 `nav_stage` 是 `robot.launch.py` 的 launch argument。标准导航配置声明 `mapping` / `navigation`；
-移动抓取与导航统一配置 `lekiwi_handeye_realsense_grasp_lidar` 还声明 `grasp` 和 `hybrid`。缺省时由
+移动抓取与导航统一配置 `lekiwi_nav_grasp` 还声明 `grasp` 和 `hybrid`。缺省时由
 `robot.default_nav_stage` 决定。stage 在 canonical loader 中解析，builder 和具身运行时只会看到
 解析后的单一配置：
 
@@ -861,6 +861,11 @@ TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加
 当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
 WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
 不是 `robot_config` 的隐式后端选择。
+
+`voice_tts` 同时维护三个语义不同的超时字段：`playback_timeout_sec` 是 `/voice_tts/play`
+同步播放超时；`synthesis_timeout_sec` 是 Hermes `post_llm_call` TTS hook 等待
+`/voice_tts/synthesize` 返回合成结果的超时（由 `hermes-robot-configure` 写入 wrapper 环境变量）；
+`tts_timeout_sec` 是 `embodied_agent` 视觉游戏播报节点的内部 RPC 超时。三者互不替代。
 
 ### 真机手眼配置
 
