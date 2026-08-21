@@ -27,6 +27,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
+    SpeechDirectionConfig,
     VoiceASRConfig,
     VoiceTTSConfig,
 )
@@ -62,6 +63,13 @@ _NAV_STAGES = frozenset({"mapping", "navigation"})
 _EXTENDED_NAV_STAGES = frozenset({"grasp", "mapping", "navigation"})
 _HYBRID_NAV_STAGES = frozenset({"grasp", "mapping", "navigation", "hybrid"})
 _ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
+_SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES = {
+    "arecord_device",
+    "channel_indices",
+    "device_name_contains",
+    "sample_rate",
+}
+_SPEECH_DIRECTION_OVERRIDE_NAMES = {"input_source", "mount_yaw_deg", "wav_path", "wav_replay_rate"}
 
 
 def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -143,6 +151,82 @@ def navigation_endpoint_projection(robot_config: dict[str, Any]) -> str | None:
         return None
     action_name = command_server.get("action_name")
     return action_name if isinstance(action_name, str) and action_name.strip() else None
+
+
+def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the robot-owned speech-direction launch and microphone contract."""
+
+    errors: list[str] = []
+    config = robot_config.get("speech_direction", {})
+    if not isinstance(config, dict):
+        return ["speech_direction must be a mapping"]
+
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append("speech_direction.enabled must be a boolean")
+        return errors
+    if not enabled:
+        return errors
+
+    for name in ("profile", "microphone", "config_file", "profiles_file", "models_root"):
+        if not isinstance(config.get(name), str) or not config[name].strip():
+            errors.append(f"speech_direction.{name} must be a non-empty string when enabled")
+
+    parameters = config.get("parameters", {})
+    if not isinstance(parameters, dict):
+        errors.append("speech_direction.parameters must be a mapping")
+        parameters = {}
+    unexpected_overrides = set(parameters) - _SPEECH_DIRECTION_OVERRIDE_NAMES
+    if unexpected_overrides:
+        errors.append(f"speech_direction.parameters contains unsupported keys: {sorted(unexpected_overrides)}")
+
+    microphone_name = config.get("microphone")
+    peripherals = robot_config.get("peripherals", [])
+    if not isinstance(peripherals, list):
+        errors.append("robot.peripherals must be a list")
+        return errors
+    matches = [item for item in peripherals if isinstance(item, dict) and item.get("name") == microphone_name]
+    if len(matches) != 1:
+        errors.append(f"speech_direction.microphone must reference exactly one peripheral: {microphone_name!r}")
+        return errors
+
+    microphone = matches[0]
+    if microphone.get("type") != "microphone":
+        errors.append("speech_direction.microphone must reference a peripheral with type=microphone")
+    if not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip():
+        errors.append("speech direction microphone driver must be a non-empty string")
+    microphone_parameters = microphone.get("params", {})
+    if not isinstance(microphone_parameters, dict):
+        errors.append("speech direction microphone params must be a mapping")
+        return errors
+    missing = _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES - set(microphone_parameters)
+    if missing:
+        errors.append(f"speech direction microphone params is missing: {sorted(missing)}")
+        return errors
+
+    for name in ("device_name_contains", "arecord_device"):
+        value = microphone_parameters.get(name)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"speech direction microphone params.{name} must be a non-empty string")
+    sample_rate = microphone_parameters.get("sample_rate")
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+        errors.append("speech direction microphone params.sample_rate must be a positive integer")
+    channel_indices = microphone_parameters.get("channel_indices")
+    if (
+        not isinstance(channel_indices, list)
+        or len(channel_indices) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in channel_indices)
+        or len(set(channel_indices)) != len(channel_indices)
+    ):
+        errors.append("speech direction microphone params.channel_indices must contain 4 unique non-negative integers")
+
+    input_source = parameters.get("input_source", "device")
+    if input_source not in {"device", "wav"}:
+        errors.append("speech_direction.parameters.input_source must be device or wav")
+    mount_yaw_deg = parameters.get("mount_yaw_deg", 0.0)
+    if isinstance(mount_yaw_deg, bool) or not isinstance(mount_yaw_deg, int | float):
+        errors.append("speech_direction.parameters.mount_yaw_deg must be numeric")
+    return errors
 
 
 def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[str]:
@@ -1395,6 +1479,7 @@ def load_robot_config_dict(
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    validation_errors.extend(validate_speech_direction_config(robot_config))
     try:
         validation_errors.extend(validate_robot_config_observation_transports(robot_config))
     except (TypeError, ValueError) as exc:
@@ -1590,6 +1675,27 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
     )
 
 
+def load_speech_direction_config(data: dict[str, Any]) -> SpeechDirectionConfig:
+    """Load speech-direction launch settings without duplicating DSP defaults."""
+
+    defaults = SpeechDirectionConfig()
+    return SpeechDirectionConfig(
+        enabled=data.get("enabled", defaults.enabled),
+        profile=data.get("profile", defaults.profile),
+        microphone=data.get("microphone", defaults.microphone),
+        config_file=resolve_ros_path(data.get("config_file", defaults.config_file))
+        if data.get("config_file", defaults.config_file)
+        else "",
+        profiles_file=resolve_ros_path(data.get("profiles_file", defaults.profiles_file))
+        if data.get("profiles_file", defaults.profiles_file)
+        else "",
+        models_root=resolve_ros_path(data.get("models_root", defaults.models_root))
+        if data.get("models_root", defaults.models_root)
+        else "",
+        parameters=dict(data.get("parameters", defaults.parameters)),
+    )
+
+
 def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
     """Load the standalone semantic mapping section without flattening its contracts."""
     return SemanticMappingConfig(
@@ -1704,6 +1810,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    speech_direction = load_speech_direction_config(robot_data.get("speech_direction", {}))
     voice_tts = load_voice_tts_config(robot_data.get("voice_tts", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
     skill_gateway = SkillGatewayRuntimeConfig(
@@ -1728,6 +1835,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        speech_direction=speech_direction,
         voice_tts=voice_tts,
         embodied=embodied,
         skill_gateway=skill_gateway,
@@ -1887,6 +1995,31 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+    speech_direction = config.speech_direction
+    errors.extend(
+        validate_speech_direction_config(
+            {
+                "speech_direction": {
+                    "enabled": speech_direction.enabled,
+                    "profile": speech_direction.profile,
+                    "microphone": speech_direction.microphone,
+                    "config_file": speech_direction.config_file,
+                    "profiles_file": speech_direction.profiles_file,
+                    "models_root": speech_direction.models_root,
+                    "parameters": speech_direction.parameters,
+                },
+                "peripherals": [
+                    {
+                        "type": "camera" if isinstance(peripheral, CameraConfig) else peripheral.type,
+                        "name": peripheral.name,
+                        "driver": peripheral.driver,
+                        "params": peripheral.params if isinstance(peripheral, PeripheralConfig) else {},
+                    }
+                    for peripheral in config.peripherals
+                ],
+            }
+        )
+    )
     typed_embodied = {
         "visual_games": config.embodied.visual_games or {},
         "start_visual_game_service": config.embodied.start_visual_game_service,

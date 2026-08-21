@@ -1,6 +1,6 @@
 speech_direction_node:
   ros__parameters:
-    # 音频输入与麦克风设备参数仅归 voice_asr_service 所有。
+    # 以下值是独立启动时的默认值；由 robot_config 启动时，设备参数由机器人 SSOT 覆盖。
     device_name_contains: "ReSpeaker"
     # 310P 上已验证正常的 ALSA 直采设备；在线采集不再经过 PyAudio。
     arecord_device: "hw:0,0"

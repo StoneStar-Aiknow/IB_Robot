@@ -6,6 +6,7 @@
 # - follower joint calibration at ~/.calibrate/so101_follower_calibrate.json
 # - two D435i cameras connected to the 310P board: one rigidly mounted on the
 #   SO-101 gripper and one fixed to the LeKiwi base for semantic mapping
+# - a ReSpeaker microphone array connected to the 310P board for speech direction
 # - during grasp execution the base is held still; only arm + gripper move
 # - navigation owns only base joints 7/8/9; motion_mode enforces mutual exclusion
 #
@@ -535,7 +536,7 @@ robot:
       default_control_mode: moveit_planning
       skill_required_control_mode: moveit_planning
       mid360_mount_file: ""
-      peripheral_names: [wrist]
+      peripheral_names: [respeaker, wrist]
       # The fixed camera is not part of this compatibility stage, so its
       # calibration artifact must not be projected into the wrist-only config.
       sensor_calibration:
@@ -553,7 +554,7 @@ robot:
           enabled: false
     mapping:
       default_control_mode: base_navigation
-      peripheral_names: [front, mid360]
+      peripheral_names: [respeaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       perception_services:
@@ -589,7 +590,7 @@ robot:
     navigation:
       default_control_mode: base_navigation
       skill_required_control_mode: base_navigation
-      peripheral_names: [front, mid360]
+      peripheral_names: [respeaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       perception_services:
@@ -643,7 +644,7 @@ robot:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
       mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
-      peripheral_names: [wrist, front, mid360]
+      peripheral_names: [respeaker, wrist, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       control_modes:
@@ -759,6 +760,22 @@ robot:
     device_name: ""
     exit_on_init_failure: false
 
+  # Start the ReSpeaker direction-of-arrival pipeline with this robot. Common
+  # algorithm and microphone-array parameters remain owned by
+  # voice_asr_service/config/speech_direction.yaml.
+  speech_direction:
+    enabled: true
+    profile: ascend_310p
+    microphone: respeaker
+    config_file: "$(find voice_asr_service)/config/speech_direction.yaml"
+    profiles_file: "$(find voice_asr_service)/config/speech_direction_profiles.yaml"
+    models_root: "$(env WORKSPACE)/models"
+    # Runtime overrides are limited to deployment-level values; DSP and model
+    # parameters remain owned by voice_asr_service/config/*.yaml.
+    parameters:
+      input_source: device
+      mount_yaw_deg: 0.0
+
   embodied:
     enabled: false
     entry_mode: hermes
@@ -847,6 +864,15 @@ robot:
       - base_velocity_controller
 
   peripherals:
+    - type: microphone
+      name: respeaker
+      driver: alsa
+      params:
+        device_name_contains: "ReSpeaker"
+        arecord_device: "hw:0,0"
+        sample_rate: 16000
+        channel_indices: [1, 2, 3, 4]
+
     - type: camera
       name: wrist
       driver: realsense

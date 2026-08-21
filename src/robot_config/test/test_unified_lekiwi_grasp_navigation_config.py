@@ -43,7 +43,18 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     assert config["motion_mode"]["navigation_controllers"] == ["base_velocity_controller"]
 
     peripherals = {item["name"]: item for item in config["peripherals"]}
-    assert set(peripherals) == {"wrist", "front", "mid360"}
+    assert set(peripherals) == {"respeaker", "wrist", "front", "mid360"}
+    assert peripherals["respeaker"] == {
+        "type": "microphone",
+        "name": "respeaker",
+        "driver": "alsa",
+        "params": {
+            "device_name_contains": "ReSpeaker",
+            "arecord_device": "hw:0,0",
+            "sample_rate": 16000,
+            "channel_indices": [1, 2, 3, 4],
+        },
+    }
     assert peripherals["wrist"]["transform"]["parent_frame"] == "gripper"
     assert peripherals["front"]["transform"]["parent_frame"] == "base_link"
     assert peripherals["front"]["driver_camera_name"] == "front"
@@ -57,6 +68,9 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
         "depth_topic": "/camera/front/aligned_depth_to_color/image_raw",
         "camera_info_topic": "/camera/front/camera_info",
     }
+    assert config["speech_direction"]["enabled"] is True
+    assert config["speech_direction"]["profile"] == "ascend_310p"
+    assert config["speech_direction"]["microphone"] == "respeaker"
 
 
 def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
@@ -72,7 +86,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert hybrid["navigation"]["enabled"] is True
     assert hybrid["navigation"]["command_server"]["enabled"] is True
     assert hybrid["mid360_mount_file"].endswith("lekiwi_mid360_mount.yaml")
-    assert [item["name"] for item in hybrid["peripherals"]] == ["wrist", "front", "mid360"]
+    assert [item["name"] for item in hybrid["peripherals"]] == ["respeaker", "wrist", "front", "mid360"]
     assert "peripheral_names" not in hybrid
     assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
     assert hybrid["grasp_execution"]["ik"]["verification_position_tolerance_m"] == 0.001
@@ -89,7 +103,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
 
     assert grasp["nav_stage"] == "grasp"
     assert grasp["navigation"]["enabled"] is False
-    assert [item["name"] for item in grasp["peripherals"]] == ["wrist"]
+    assert [item["name"] for item in grasp["peripherals"]] == ["respeaker", "wrist"]
 
     assert mapping["nav_stage"] == "mapping"
     assert mapping["default_control_mode"] == "base_navigation"
@@ -104,7 +118,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert mapping["placement_execution"]["enabled"] is False
     assert mapping["contract"]["observations"] == []
     assert mapping["contract"]["actions"] == []
-    assert [item["name"] for item in mapping["peripherals"]] == ["front", "mid360"]
+    assert [item["name"] for item in mapping["peripherals"]] == ["respeaker", "front", "mid360"]
     assert "peripheral_names" not in mapping
     assert mapping["control_modes"]["base_navigation"]["controllers"] == [
         "joint_state_broadcaster",
@@ -120,7 +134,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["placement_execution"]["enabled"] is False
     assert navigation["contract"]["observations"] == []
     assert navigation["contract"]["actions"] == []
-    assert [item["name"] for item in navigation["peripherals"]] == ["front", "mid360"]
+    assert [item["name"] for item in navigation["peripherals"]] == ["respeaker", "front", "mid360"]
     assert "peripheral_names" not in navigation
     assert navigation["navigation"]["fast_lio"]["enabled"] is True
     assert navigation["navigation"]["slam_toolbox"]["enabled"] is False
@@ -196,4 +210,4 @@ def test_unified_profile_applies_only_the_front_camera_artifact(monkeypatch, tmp
     assert wrist["transform"]["parent_frame"] == "gripper"
 
     grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
-    assert [item["name"] for item in grasp["peripherals"]] == ["wrist"]
+    assert [item["name"] for item in grasp["peripherals"]] == ["respeaker", "wrist"]

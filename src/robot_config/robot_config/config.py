@@ -198,6 +198,19 @@ class VoiceASRConfig:
 
 
 @dataclass
+class SpeechDirectionConfig:
+    """Typed speech-direction configuration managed by robot_config."""
+
+    enabled: bool = False
+    profile: str = "ascend_310p"
+    microphone: str = ""
+    config_file: str = ""
+    profiles_file: str = ""
+    models_root: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class VoiceTTSConfig:
     """Typed Voice TTS service configuration managed by robot_config."""
 
@@ -257,6 +270,7 @@ class RobotConfig:
     peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
+    speech_direction: SpeechDirectionConfig = field(default_factory=SpeechDirectionConfig)
     voice_tts: VoiceTTSConfig = field(default_factory=VoiceTTSConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)

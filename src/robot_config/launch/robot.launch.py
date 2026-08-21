@@ -6,6 +6,7 @@ This launch file loads robot configuration from YAML and dynamically generates:
 - Camera drivers (usb_cam, realsense2_camera)
 - Static TF publishers for camera frames
 - Voice ASR node (optional, configured from robot.voice_asr)
+- Speech direction node (optional, configured from robot.speech_direction)
 - Voice TTS service (optional, configured from robot.voice_tts)
 - Inference service and action dispatcher (optional, auto-detected)
 - MoveIt motion planning (optional, auto-detected)
@@ -667,6 +668,22 @@ def launch_setup(context, *args, **kwargs):
     except Exception as e:
         logger.error(f"generating voice TTS nodes: {e}")
         raise
+
+    # ========== 9.5 Generate Speech Direction Node ==========
+    logger.info("========== Checking Speech Direction ==========")
+    if mock_mode_skips_subsystem(mock_backend_active, "speech_direction"):
+        logger.info("hardware_mock active: skipping speech direction node (out of mock scope)")
+    else:
+        try:
+            from robot_config.launch_builders.speech_direction import generate_speech_direction_actions
+
+            speech_direction_actions = generate_speech_direction_actions(robot_config)
+            actions.extend(speech_direction_actions)
+            if speech_direction_actions:
+                logger.info("Added speech direction launch")
+        except Exception as e:
+            logger.error(f"generating speech direction node: {e}")
+            raise
 
     # ========== 10. Generate Navigation Nodes ==========
     logger.info("========== Checking Navigation ==========")
