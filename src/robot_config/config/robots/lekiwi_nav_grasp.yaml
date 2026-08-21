@@ -1067,3 +1067,13 @@ robot:
     dataset_name: lekiwi_handeye_realsense_grasp_lidar
     default_task: "check eye-in-hand calibration preconditions"
     task_family: calibration
+
+  voice_tts:
+    enabled: true
+    bundle_path: "models/voice_tts/zipvoice"
+    deployment: "ascend_310p"
+    service_name: /voice_tts/synthesize
+    playback_service_name: /voice_tts/play
+    playback_timeout_sec: 300.0
+    prompt_profile: default
+    player: /usr/local/bin/tts-bt-play
