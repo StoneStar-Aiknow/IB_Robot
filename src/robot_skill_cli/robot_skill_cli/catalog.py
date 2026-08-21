@@ -378,6 +378,8 @@ def describe_skill(view: dict[str, Any], skill_name: str) -> dict[str, Any]:
         "timeout_policy": copy.deepcopy(view["timeout_policy"]),
         "config_digest": view["capability_digest"],
     }
+    if "timeout_sec" in skill:
+        result["timeout_sec"] = float(skill["timeout_sec"])
     return result
 
 

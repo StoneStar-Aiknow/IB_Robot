@@ -573,6 +573,7 @@ def test_describe_exposes_derived_schema_timeout_policy_and_digest():
     assert relative["timeout_policy"] == {
         name: value for name, value in resolved_timeouts.items() if not name.startswith("visual_game_")
     }
+    assert relative["timeout_sec"] == 120.0
     assert relative["config_digest"] == view["capability_digest"]
 
 
@@ -1252,6 +1253,17 @@ def test_validate_uses_status_default_timeout_and_shared_payload_hash(monkeypatc
     assert omitted["data"]["payload"] == explicit["data"]["payload"]
     assert omitted["data"]["payload_hash"] == explicit["data"]["payload_hash"]
     assert bridge.validate_payloads[0] == bridge.validate_payloads[1]
+
+
+def test_omitted_timeout_uses_skill_implementation_limit():
+    from robot_skill_cli.catalog import describe_skill, load_capability_catalog
+    from robot_skill_cli.cli import _validate_timeout
+
+    view = load_capability_catalog(config_path=CONFIG_PATH)
+    skill = describe_skill(view, "move_relative_ee")
+    status = {"default_skill_timeout_sec": 300.0, "task_budget_sec": 360.0}
+
+    assert _validate_timeout(status, None, skill_timeout_cap=skill["timeout_sec"]) == 120.0
 
 
 def test_validate_uses_action_wire_zero_for_omitted_motion_distance(monkeypatch, capsys):
