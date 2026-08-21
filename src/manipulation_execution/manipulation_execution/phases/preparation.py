@@ -35,7 +35,12 @@ from manipulation_execution.pick_executor_models import (
     PreparedCandidate,
     RankedCandidate,
 )
-from manipulation_execution.so101_geometry import axis_error_deg, gripper_mesh_min_z, tabletop_clearance
+from manipulation_execution.so101_geometry import (
+    axis_error_deg,
+    gripper_mesh_min_z,
+    quaternion_error_deg,
+    tabletop_clearance,
+)
 from manipulation_execution.so101_kinematics_guard import (
     apply_joint5_retry,
     canonicalize_joint5,
@@ -698,6 +703,41 @@ class PreparationPhase:
             predicted_robust_gap_headroom_m=predicted_robust_gap_headroom_m,
         )
 
+    def _ik_worker_verification_services(self) -> tuple[tuple[str, object], ...]:
+        return (
+            ("primary_ik", self._ik_client),
+            ("primary_fk", self._fk_client),
+            *((f"worker_{index}_ik", self._ik_worker_clients[index]) for index in range(len(self._ik_worker_clients))),
+            *((f"worker_{index}_fk", self._fk_worker_clients[index]) for index in range(len(self._fk_worker_clients))),
+        )
+
+    def _refresh_ik_worker_service_generation(self) -> tuple[tuple[bool, ...], int]:
+        services = PreparationPhase._ik_worker_verification_services(self)
+        readiness = []
+        for _name, client in services:
+            try:
+                readiness.append(bool(client.service_is_ready()))
+            except Exception:  # noqa: BLE001 - a destroyed ROS handle is not ready
+                readiness.append(False)
+        readiness_tuple = tuple(readiness)
+
+        changed = False
+        with self._ik_worker_verification_lock:
+            previous = self._ik_worker_service_state
+            generation = self._ik_worker_service_generation
+            if previous is not None and previous != readiness_tuple:
+                generation += 1
+                self._ik_worker_verification = None
+                changed = True
+            self._ik_worker_service_state = readiness_tuple
+            self._ik_worker_service_generation = generation
+        if changed:
+            self.get_logger().info(
+                f"IK worker service readiness changed: generation={generation} "
+                f"ready={sum(readiness_tuple)}/{len(readiness_tuple)} verification_cache_cleared=true"
+            )
+        return readiness_tuple, generation
+
     def _verify_ik_worker_pool(
         self,
         joint_seed: JointState,
@@ -706,7 +746,32 @@ class PreparationPhase:
     ) -> None:
         if not self._ik_worker_clients:
             return
-        check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
+
+        readiness, service_generation = PreparationPhase._refresh_ik_worker_service_generation(self)
+        if not all(readiness):
+            with self._ik_worker_verification_lock:
+                self._ik_worker_verification = None
+            services = PreparationPhase._ik_worker_verification_services(self)
+            unavailable = [name for (name, _client), ready in zip(services, readiness, strict=True) if not ready]
+            raise PickFlowError(
+                "IK_WORKER_UNAVAILABLE",
+                f"IK worker verification services unavailable: {', '.join(unavailable)}",
+                retryable=True,
+            )
+
+        ik_config = self._config.get("ik", {})
+        with self._ik_worker_verification_lock:
+            cached = self._ik_worker_verification
+        if cached == (readiness, service_generation):
+            self.get_logger().info(
+                f"IK worker verification passed: cached=true workers={len(self._ik_worker_clients)} "
+                "trigger=service_generation"
+            )
+            return
+
+        check_orientation = bool(ik_config.get("check_orientation", False))
+        position_tolerance = max(0.0, float(ik_config.get("verification_position_tolerance_m", 0.001)))
+        orientation_tolerance = max(0.0, float(ik_config.get("verification_orientation_tolerance_deg", 1.0)))
         pose = self._compute_fk(
             joint_seed,
             goal_handle,
@@ -718,35 +783,83 @@ class PreparationPhase:
             pose.orientation.y = 0.0
             pose.orientation.z = 0.0
             pose.orientation.w = 1.0
+        reference_xyz = (float(pose.position.x), float(pose.position.y), float(pose.position.z))
+        reference_quaternion = (
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        )
         primary = self._solve_ik(pose, goal_handle, deadline, joint_seed)
         primary_positions = dict(zip(primary.name, primary.position, strict=False))
-        max_delta = 0.0
+        solutions = [("primary", primary, self._fk_client)]
         for worker_index, worker_client in enumerate(self._ik_worker_clients):
-            worker = self._solve_ik(
-                pose,
-                goal_handle,
-                deadline,
-                joint_seed,
-                client=worker_client,
+            solutions.append(
+                (
+                    f"IK worker {worker_index}",
+                    self._solve_ik(pose, goal_handle, deadline, joint_seed, client=worker_client),
+                    self._fk_worker_clients[worker_index],
+                )
             )
-            worker_positions = dict(zip(worker.name, worker.position, strict=False))
-            common_names = sorted(primary_positions.keys() & worker_positions.keys())
-            if not common_names:
+
+        max_joint_delta = 0.0
+        max_position_error = 0.0
+        max_orientation_error = 0.0
+        for label, solution, fk_client in solutions:
+            solution_pose = self._compute_fk(solution, goal_handle, deadline, client=fk_client)
+            solution_xyz = (
+                float(solution_pose.position.x),
+                float(solution_pose.position.y),
+                float(solution_pose.position.z),
+            )
+            solution_quaternion = (
+                float(solution_pose.orientation.x),
+                float(solution_pose.orientation.y),
+                float(solution_pose.orientation.z),
+                float(solution_pose.orientation.w),
+            )
+            position_error = math.dist(reference_xyz, solution_xyz)
+            orientation_error = (
+                quaternion_error_deg(reference_quaternion, solution_quaternion) if check_orientation else 0.0
+            )
+            if position_error > position_tolerance or orientation_error > orientation_tolerance:
                 raise PickFlowError(
                     "IK_WORKER_MISMATCH",
-                    f"primary and IK worker {worker_index} returned no common joints",
+                    f"{label} FK does not reproduce the verification pose: "
+                    f"position_error={position_error:.6f}/{position_tolerance:.6f} m "
+                    f"orientation_error={orientation_error:.3f}/{orientation_tolerance:.3f} deg",
                 )
-            worker_delta = max(
-                abs(float(primary_positions[name]) - float(worker_positions[name])) for name in common_names
+            solution_positions = dict(zip(solution.name, solution.position, strict=False))
+            common_names = primary_positions.keys() & solution_positions.keys()
+            if common_names:
+                max_joint_delta = max(
+                    max_joint_delta,
+                    max(abs(float(primary_positions[name]) - float(solution_positions[name])) for name in common_names),
+                )
+            max_position_error = max(max_position_error, position_error)
+            max_orientation_error = max(max_orientation_error, orientation_error)
+
+        final_readiness, final_generation = PreparationPhase._refresh_ik_worker_service_generation(self)
+        if not all(final_readiness) or final_generation != service_generation:
+            raise PickFlowError(
+                "IK_WORKER_RESTARTED",
+                "IK worker service generation changed during pool verification",
+                retryable=True,
             )
-            if worker_delta > 1e-8:
+        with self._ik_worker_verification_lock:
+            if self._ik_worker_service_generation != service_generation:
                 raise PickFlowError(
-                    "IK_WORKER_MISMATCH",
-                    f"primary and IK worker {worker_index} differ by {worker_delta:.12f} rad",
+                    "IK_WORKER_RESTARTED",
+                    "IK worker service generation changed before verification cache commit",
+                    retryable=True,
                 )
-            max_delta = max(max_delta, worker_delta)
+            self._ik_worker_verification = (readiness, service_generation)
         self.get_logger().info(
-            f"IK worker verification passed: workers={self._ik_worker_count} max_joint_delta={max_delta:.12f}"
+            f"IK worker verification passed: cached=false workers={len(self._ik_worker_clients)} "
+            f"max_joint_delta={max_joint_delta:.12f} "
+            f"max_fk_position_error_m={max_position_error:.6f} "
+            f"max_fk_orientation_error_deg={max_orientation_error:.3f} "
+            "trigger=service_generation"
         )
 
     def _prepare_ranked_candidates(

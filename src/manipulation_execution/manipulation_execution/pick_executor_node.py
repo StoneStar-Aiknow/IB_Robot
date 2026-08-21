@@ -148,7 +148,10 @@ class PickExecutorNode(
         callback_group = ReentrantCallbackGroup()
         self._joint_state_lock = threading.Lock()
         self._latest_joint_state: JointState | None = None
-        self._ik_worker_verification: tuple[tuple[object, ...], float] | None = None
+        self._ik_worker_verification: tuple[tuple[bool, ...], int] | None = None
+        self._ik_worker_verification_lock = threading.Lock()
+        self._ik_worker_service_state: tuple[bool, ...] | None = None
+        self._ik_worker_service_generation = 0
         self._kinematics_health_lock = threading.Lock()
         self._kinematics_unhealthy_workers: set[int] = set()
         self.create_subscription(
@@ -187,6 +190,15 @@ class PickExecutorNode(
             )
             for index in range(self._ik_worker_count)
         ]
+        self._ik_worker_service_timer = (
+            self.create_timer(
+                0.1,
+                self._refresh_ik_worker_service_generation,
+                callback_group=callback_group,
+            )
+            if self._ik_worker_clients
+            else None
+        )
         self._primitive_client = ActionClient(
             self,
             PrimitiveCommand,

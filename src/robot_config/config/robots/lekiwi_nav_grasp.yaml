@@ -211,6 +211,8 @@ robot:
       avoid_collisions: false
       check_orientation: false
       worker_count: 1
+      verification_position_tolerance_m: 0.001
+      verification_orientation_tolerance_deg: 1.0
       worker_namespace_prefix: /ik_worker
       auto_start_workers: true
     contact_compensation:

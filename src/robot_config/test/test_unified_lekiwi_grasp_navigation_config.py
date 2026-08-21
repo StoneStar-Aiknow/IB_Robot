@@ -75,6 +75,8 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert [item["name"] for item in hybrid["peripherals"]] == ["wrist", "front", "mid360"]
     assert "peripheral_names" not in hybrid
     assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
+    assert hybrid["grasp_execution"]["ik"]["verification_position_tolerance_m"] == 0.001
+    assert hybrid["grasp_execution"]["ik"]["verification_orientation_tolerance_deg"] == 1.0
     assert hybrid["control_modes"]["base_navigation"]["controllers"] == [
         "joint_state_broadcaster",
         "arm_joint_state_broadcaster",

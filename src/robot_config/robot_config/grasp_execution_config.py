@@ -140,6 +140,8 @@ _SCHEMA: dict[str, Any] = {
         "worker_count": _integer(0, 8),
         "worker_namespace_prefix": _string(allow_empty=True),
         "auto_start_workers": _bool(),
+        "verification_position_tolerance_m": _NON_NEGATIVE,
+        "verification_orientation_tolerance_deg": _number(0.0, 180.0),
     },
     "contact_compensation": {
         "enabled": _bool(),
