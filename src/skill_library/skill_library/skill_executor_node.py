@@ -378,7 +378,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
-        self.declare_parameter("semantic_map_stand_off_distance_m", 0.8)
+        self.declare_parameter("semantic_map_stand_off_distance_m", 0.3)
         self.declare_parameter("move_configuration_service", "/moveit_gateway/move_to_configuration")
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")

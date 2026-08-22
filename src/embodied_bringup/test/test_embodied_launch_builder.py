@@ -220,7 +220,7 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     ]
     assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
     assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/resolve_target"
-    assert params["semantic_map_stand_off_distance_m"] == 0.8
+    assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
 def test_navigation_endpoint_missing_action_name_raises():

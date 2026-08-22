@@ -243,7 +243,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         interfaces = semantic_mapping.get("interfaces", {})
         target_service = interfaces.get("query_service", "/semantic_mapping/get_objects")
         target_watch = semantic_mapping.get("target_watch", {})
-        stand_off_distance_m = target_watch.get("stand_off_distance_m", 0.8)
+        stand_off_distance_m = target_watch.get("stand_off_distance_m", 0.3)
         if isinstance(target_service, str) and target_service.strip():
             configuration = {
                 "query_service": target_service,

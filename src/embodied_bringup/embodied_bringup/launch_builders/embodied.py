@@ -221,7 +221,7 @@ def generate_embodied_nodes(
             "query_service", "/semantic_mapping/get_objects"
         )
         common_params["semantic_map_stand_off_distance_m"] = float(
-            semantic_mapping.get("target_watch", {}).get("stand_off_distance_m", 0.8)
+            semantic_mapping.get("target_watch", {}).get("stand_off_distance_m", 0.3)
         )
     perception_node = None
     if perception.get("enabled", False):

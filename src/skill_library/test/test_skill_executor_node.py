@@ -307,7 +307,7 @@ def test_semantic_map_executor_descriptor_uses_service_identity():
     node._pick_action_name = "/manipulation/execute_pick"
     node._place_action_name = "/manipulation/execute_place"
     node._semantic_map_target_service = "/semantic_mapping/get_objects"
-    node._semantic_map_stand_off_distance_m = 0.8
+    node._semantic_map_stand_off_distance_m = 0.3
 
     descriptor = node._delegated_executor_descriptors()["semantic_map_query"]
     expected = delegated_executor_identity(
@@ -316,7 +316,7 @@ def test_semantic_map_executor_descriptor_uses_service_identity():
         endpoint_kind="ros_service",
         configuration={
             "query_service": "/semantic_mapping/get_objects",
-            "stand_off_distance_m": 0.8,
+            "stand_off_distance_m": 0.3,
         },
     )
 
@@ -331,7 +331,7 @@ def test_semantic_map_executor_is_registered_before_templates_are_loaded():
     node._pick_action_name = "/manipulation/execute_pick"
     node._place_action_name = "/manipulation/execute_place"
     node._semantic_map_target_service = "/semantic_mapping/resolve_target"
-    node._semantic_map_stand_off_distance_m = 0.8
+    node._semantic_map_stand_off_distance_m = 0.3
 
     assert "semantic_map_query" in node._delegated_executor_descriptors()
 
@@ -357,7 +357,7 @@ def test_semantic_map_query_calls_resolve_target_service_and_returns_pose_json()
     node = object.__new__(SkillExecutorNode)
     node._semantic_map_target_client = Client()
     node._semantic_map_target_service = "/semantic_mapping/get_objects"
-    node._semantic_map_stand_off_distance_m = 0.8
+    node._semantic_map_stand_off_distance_m = 0.3
     node._rpc_timeout = 0.1
     node._tf_buffer = SimpleNamespace(
         lookup_transform=lambda *_args, **_kwargs: SimpleNamespace(
@@ -379,7 +379,7 @@ def test_semantic_map_query_calls_resolve_target_service_and_returns_pose_json()
     result = node._execute_semantic_map_query(goal_handle)
 
     assert result.success is True
-    assert json.loads(result.message) == pytest.approx([0.5072186473, -0.2028874589, -21.8014094864])
+    assert json.loads(result.message) == pytest.approx([0.9714569927, -0.3885827971, -21.8014094864])
     assert len(requests) == 1
     assert requests[0].label == "banana"
     assert requests[0].include_inactive is True
@@ -405,7 +405,7 @@ def test_semantic_map_query_uses_request_standoff_distance():
     node = object.__new__(SkillExecutorNode)
     node._semantic_map_target_client = Client()
     node._semantic_map_target_service = "/semantic_mapping/get_objects"
-    node._semantic_map_stand_off_distance_m = 0.8
+    node._semantic_map_stand_off_distance_m = 0.3
     node._rpc_timeout = 0.1
     node._tf_buffer = SimpleNamespace(
         lookup_transform=lambda *_args, **_kwargs: SimpleNamespace(

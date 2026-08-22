@@ -246,7 +246,7 @@ robot:
     target_watch:
       max_attempts: 3
       scan_profile: fixed_d435_base_scan
-      stand_off_distance_m: 0.8
+      stand_off_distance_m: 0.3
       clearance_m: 0.2
       track_state_updates_enabled: true
       track_state_topic: /object_tracker/track_state
@@ -864,7 +864,7 @@ robot:
         enabled: false
         skill_catalog_profile: ""
         timeouts:
-          task_budget_sec: 360.0
+          task_budget_sec: 1200.0
           default_skill_timeout_sec: 300.0
           robot_state_freshness_sec: 0.5
           scene_freshness_sec: 0.5
@@ -919,7 +919,7 @@ robot:
         enabled: true
         skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
         timeouts:
-          task_budget_sec: 360.0
+          task_budget_sec: 1200.0
           default_skill_timeout_sec: 300.0
           robot_state_freshness_sec: 0.5
           scene_freshness_sec: 0.8
