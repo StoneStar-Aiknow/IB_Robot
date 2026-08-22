@@ -45,7 +45,7 @@ from .model_sessions import SpeechDirectionRoleRunner
 from .pipeline import DoaState, PipelineParams, SpeechDirectionPipeline, VadState
 from .pipeline_streaming import StreamingPipelineParams, StreamingSpeechDirectionPipeline
 from .runtime import SpeechDirectionRuntime
-from .speech_gate import SpeechGate
+from .speech_gate import SileroVadEngine, SpeechGate
 from .wav_input import WavInput
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,15 @@ def _require_string(values: Mapping[str, Any], name: str, *, allow_empty: bool =
 def _require_non_empty_string(values: Mapping[str, Any], name: str) -> str:
     """读取并校验必填字符串参数。"""
     return _require_string(values, name)
+
+
+def _build_acl_runtime_options(device_id: int, acl_config_path: str) -> dict[str, object]:
+    """Build Ascend runtime options while preserving the default ACL initialization contract."""
+    runtime_options: dict[str, object] = {"device_id": device_id}
+    normalized_path = acl_config_path.strip()
+    if normalized_path:
+        runtime_options["acl_config_path"] = normalized_path
+    return runtime_options
 
 
 def _convert_int(values: Mapping[str, Any], name: str) -> int:
@@ -419,7 +428,7 @@ class SpeechDirectionNode(Node):
             fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
             fullsubnet_context = RuntimeContext(
                 fullsubnet_manifest,
-                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+                _build_acl_runtime_options(cfg.fullnet.device_id, cfg.fullnet.acl_config_path),
             )
             fullsubnet_session = MODEL_SESSION_BUILDER_REGISTRY.create(fullsubnet_context)
             fullsubnet_session.load(fullsubnet_context)
@@ -452,7 +461,7 @@ class SpeechDirectionNode(Node):
             vad_manifest = load_inference_manifest(Path(cfg.fullnet.inference_bundle), "ascend_310p_silero")
             vad_context = RuntimeContext(
                 vad_manifest,
-                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+                _build_acl_runtime_options(cfg.fullnet.device_id, cfg.fullnet.acl_config_path),
             )
             vad_session = MODEL_SESSION_BUILDER_REGISTRY.create(vad_context)
             vad_session.load(vad_context)
@@ -460,13 +469,27 @@ class SpeechDirectionNode(Node):
             vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context)
 
         # 人声门控(复用 common/vad/silero)
+        # vad_runner(manifest 驱动)只做裸推理转发，不含 SileroVadEngine 的帧间 context 拼接
+        # (Silero 要求 [上一帧末尾64样本|本帧512样本] 组成 (1,576) 输入)；
+        # 用 SileroVadEngine(acl_runner=vad_runner) 包一层，复用其 context 拼接逻辑，
+        # 同时避免重复加载 OM。
+        silero_engine = (
+            SileroVadEngine(
+                model_path=cfg.vad.model_path,
+                sample_rate=cfg.vad.sample_rate,
+                backend=cfg.vad.backend,
+                acl_runner=vad_runner,
+            )
+            if vad_runner is not None
+            else None
+        )
         speech_gate = SpeechGate(
             model_path=cfg.vad.model_path,
             sample_rate=cfg.vad.sample_rate,
             vad_threshold=cfg.gray_region.vad_threshold,
             rms_threshold=cfg.gray_region.rms_threshold,
             backend=cfg.vad.backend,
-            silero_engine=vad_runner,
+            silero_engine=silero_engine,
         )
 
         # SRP-PHAT(阵列几何与声学参数从配置传入,配置驱动)
