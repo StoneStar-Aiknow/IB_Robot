@@ -14,17 +14,20 @@ from pathlib import Path
 from threading import RLock
 
 import rclpy
-from builtin_interfaces.msg import Duration
+from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_srvs.srv import SetBool
+from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
@@ -52,6 +55,7 @@ from ibrobot_msgs.msg import SkillCapabilityStatus, SkillDiagnostic, SkillRegist
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
     FinalizeWorkflowExecution,
+    GetSemanticObjects,
     GetSkillGatewayStatus,
     GetSkillSnapshot,
     MoveToConfiguration,
@@ -315,7 +319,7 @@ def _duration_from_seconds(seconds: float) -> Duration:
     if nanosec >= 1_000_000_000:
         sec += 1
         nanosec -= 1_000_000_000
-    return Duration(sec=sec, nanosec=nanosec)
+    return DurationMsg(sec=sec, nanosec=nanosec)
 
 
 def _build_joint_trajectory_goal(
@@ -373,6 +377,8 @@ class SkillExecutorNode(Node):
         self.declare_parameter("place_action_name", "/manipulation/execute_place")
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
+        self.declare_parameter("semantic_map_target_service", "")
+        self.declare_parameter("semantic_map_stand_off_distance_m", 0.8)
         self.declare_parameter("move_configuration_service", "/moveit_gateway/move_to_configuration")
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")
@@ -447,6 +453,8 @@ class SkillExecutorNode(Node):
         self._place_action_name = self.get_parameter("place_action_name").get_parameter_value().string_value
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
         self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
+        self._semantic_map_target_service = self.get_parameter("semantic_map_target_service").value
+        self._semantic_map_stand_off_distance_m = self.get_parameter("semantic_map_stand_off_distance_m").value
         self._move_configuration_service = (
             self.get_parameter("move_configuration_service").get_parameter_value().string_value
         )
@@ -602,6 +610,8 @@ class SkillExecutorNode(Node):
         self._skill_goal_active = False
 
         callback_group = ReentrantCallbackGroup()
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
         self._pose_publisher = self.create_publisher(Pose, self._cmd_pose_topic, 10)
         self._task_executor_client = ActionClient(
             self, ExecuteTaskPlan, self._task_executor_action_name, callback_group=callback_group
@@ -617,6 +627,12 @@ class SkillExecutorNode(Node):
                 self,
                 ExecuteNavigation,
                 self._navigation_action_name,
+                callback_group=callback_group,
+            )
+        if self._semantic_map_target_service:
+            self._semantic_map_target_client = self.create_client(
+                GetSemanticObjects,
+                self._semantic_map_target_service,
                 callback_group=callback_group,
             )
         self.create_subscription(
@@ -794,7 +810,29 @@ class SkillExecutorNode(Node):
             configured_executors.add("grasp_pipeline")
         if self._placement_execution.get("enabled", False):
             configured_executors.add("placement_pipeline")
+        # Startup compilation runs before skill templates are cached. The
+        # configured service is the SSOT signal that this executor is present.
+        if self._semantic_map_target_service:
+            configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == "semantic_map_query":
+                endpoint_name = self._semantic_map_target_service
+                if not endpoint_name:
+                    continue
+                configuration = {
+                    "query_service": endpoint_name,
+                    "stand_off_distance_m": float(self._semantic_map_stand_off_distance_m),
+                }
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_service",
+                        configuration=configuration,
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             endpoint_name, configuration = executor_configs.get(name, ("", {}))
             if not endpoint_name:
                 continue
@@ -812,6 +850,101 @@ class SkillExecutorNode(Node):
             )
             descriptors[descriptor.name] = descriptor
         return descriptors
+
+    def _execute_semantic_map_query(self, goal_handle, *, effective_timeout_sec: float | None = None):
+        result = SkillCommand.Result()
+        if not hasattr(self, "_semantic_map_target_client"):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_SERVICE_UNAVAILABLE",
+                "semantic map target service is not configured",
+            )
+        timeout_sec = float(effective_timeout_sec or goal_handle.request.timeout_sec or self._rpc_timeout)
+        if not self._semantic_map_target_client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_SERVICE_UNAVAILABLE",
+                f"semantic map target service unavailable: {self._semantic_map_target_service}",
+            )
+
+        request = GetSemanticObjects.Request()
+        request.label = goal_handle.request.target_name
+        request.include_inactive = True
+        request.max_age_sec = 0.0
+        request.max_results = 1
+        future = self._semantic_map_target_client.call_async(request)
+        if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], goal_handle.request.skill_name)
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_QUERY_TIMEOUT",
+                "semantic map target query timed out",
+            )
+        try:
+            response = future.result()
+        except Exception as exc:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_QUERY_FAILED",
+                f"semantic map target query failed: {exc}",
+            )
+        if response is None or not response.success or not response.semantic_map.objects:
+            message = str(getattr(response, "message", "")).strip()
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_QUERY_FAILED",
+                message or "semantic map target query failed",
+            )
+
+        object_pose = response.semantic_map.objects[0].pose.pose.pose.position
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                "map", "base_link", Time(), timeout=Duration(seconds=min(timeout_sec, self._rpc_timeout))
+            )
+        except TransformException as exc:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SEMANTIC_MAP_TF_UNAVAILABLE",
+                f"map to base_link transform is unavailable: {exc}",
+            )
+        robot_x = transform.transform.translation.x
+        robot_y = transform.transform.translation.y
+        dx = robot_x - object_pose.x
+        dy = robot_y - object_pose.y
+        distance = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / distance, dy / distance
+        stand_off_distance_m = (
+            float(goal_handle.request.distance)
+            if float(goal_handle.request.distance) > 0.0
+            else float(self._semantic_map_stand_off_distance_m)
+        )
+        goal_x = object_pose.x + ux * stand_off_distance_m
+        goal_y = object_pose.y + uy * stand_off_distance_m
+        yaw_degrees = math.degrees(math.atan2(object_pose.y - goal_y, object_pose.x - goal_x))
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        result.success = True
+        result.error_code = ""
+        result.message = json.dumps(
+            [float(goal_x), float(goal_y), yaw_degrees],
+            separators=(",", ":"),
+        )
+        result.executed_primitives = []
+        goal_handle.succeed()
+        return result
 
     @classmethod
     def _snapshot_policy_inputs(cls, snapshot):
@@ -4398,6 +4531,11 @@ class SkillExecutorNode(Node):
             return self._execute_place_skill(
                 goal_handle,
                 template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == "semantic_map_query":
+            return self._execute_semantic_map_query(
+                goal_handle,
                 effective_timeout_sec=effective_timeout_sec,
             )
 

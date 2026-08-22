@@ -122,6 +122,7 @@ class SemanticMappingNode(Node):
         self._label_aliases = parse_label_aliases(str(self.get_parameter("allowed_label_aliases_json").value))
         self.tf_timeout = Duration(seconds=float(self.get_parameter("tf_timeout_sec").value))
         self.mapping_backend = validate_mapping_backend(self.get_parameter("mapping_backend").value)
+        self._online_processing_enabled = bool(self.get_parameter("online_processing_enabled").value)
         self._last_validated_tf_stamp_ns = 0
         self._run_admission_open = True
 
@@ -191,7 +192,7 @@ class SemanticMappingNode(Node):
         self._siglip = None
         self._service_pipeline = None
         self._gdino_confirmation_client = None
-        if self.mapping_backend == "embedded":
+        if self.mapping_backend == "embedded" and self._online_processing_enabled:
             detector_backend = self.get_parameter("detector_backend").value
             self.get_logger().info(f"Loading Grounding DINO and SAM2 models with backend={detector_backend}")
             if detector_backend == "huggingface":
@@ -220,7 +221,7 @@ class SemanticMappingNode(Node):
                     self.get_parameter("siglip_model_path").value,
                     device=self.get_parameter("device").value,
                 )
-        else:
+        elif self._online_processing_enabled:
             service_group = ReentrantCallbackGroup()
             self._sam_client = self.create_client(
                 GenerateMasks, self.get_parameter("sam_service").value, callback_group=service_group
@@ -269,11 +270,15 @@ class SemanticMappingNode(Node):
         self._map_pub = self.create_publisher(
             SemanticObject3DArray, self.get_parameter("semantic_map_topic").value, state_qos
         )
-        self._track_state_sub = self.create_subscription(
-            TrackState,
-            self.get_parameter("track_state_topic").value,
-            self._track_state_callback,
-            10,
+        self._track_state_sub = (
+            self.create_subscription(
+                TrackState,
+                self.get_parameter("track_state_topic").value,
+                self._track_state_callback,
+                10,
+            )
+            if self._online_processing_enabled
+            else None
         )
         self._cloud_pub = self.create_publisher(
             PointCloud2, self.get_parameter("object_cloud_topic").value, qos_profile_sensor_data
@@ -285,36 +290,41 @@ class SemanticMappingNode(Node):
         self._footprint_ready = False
         self._obstacle_map_ready = False
         self._reachability_ready = False
-        self._cloud_map_sub = self.create_subscription(
-            PointCloud2,
-            self.get_parameter("cloud_map_topic").value,
-            self._cloud_map_callback,
-            qos_profile_sensor_data,
-        )
-        self._active_map_hash_sub = self.create_subscription(
-            String,
-            self.get_parameter("active_map_hash_topic").value,
-            self._active_map_hash_callback,
-            state_qos,
-        )
-        self._readiness_subscriptions = [
-            self.create_subscription(
-                Bool,
-                self.get_parameter(topic_parameter).value,
-                lambda message, attribute=attribute: setattr(self, attribute, bool(message.data)),
+        if self._online_processing_enabled:
+            self._cloud_map_sub = self.create_subscription(
+                PointCloud2,
+                self.get_parameter("cloud_map_topic").value,
+                self._cloud_map_callback,
+                qos_profile_sensor_data,
+            )
+            self._active_map_hash_sub = self.create_subscription(
+                String,
+                self.get_parameter("active_map_hash_topic").value,
+                self._active_map_hash_callback,
                 state_qos,
             )
-            for topic_parameter, attribute in (
-                ("localization_ready_topic", "_localization_ready"),
-                ("authoritative_map_odom_topic", "_authoritative_map_odom"),
-                ("footprint_ready_topic", "_footprint_ready"),
-                ("obstacle_map_ready_topic", "_obstacle_map_ready"),
-                ("reachability_ready_topic", "_reachability_ready"),
-            )
-        ]
+            self._readiness_subscriptions = [
+                self.create_subscription(
+                    Bool,
+                    self.get_parameter(topic_parameter).value,
+                    lambda message, attribute=attribute: setattr(self, attribute, bool(message.data)),
+                    state_qos,
+                )
+                for topic_parameter, attribute in (
+                    ("localization_ready_topic", "_localization_ready"),
+                    ("authoritative_map_odom_topic", "_authoritative_map_odom"),
+                    ("footprint_ready_topic", "_footprint_ready"),
+                    ("obstacle_map_ready_topic", "_obstacle_map_ready"),
+                    ("reachability_ready_topic", "_reachability_ready"),
+                )
+            ]
+        else:
+            self._cloud_map_sub = None
+            self._active_map_hash_sub = None
+            self._readiness_subscriptions = []
         self._amcl_pose_received_ns = 0
         self._costmap_received_ns = 0
-        if bool(self.get_parameter("auto_readiness_enabled").value):
+        if self._online_processing_enabled and bool(self.get_parameter("auto_readiness_enabled").value):
             self._amcl_sub = self.create_subscription(
                 PoseWithCovarianceStamped,
                 str(self.get_parameter("amcl_pose_topic").value),
@@ -338,36 +348,49 @@ class SemanticMappingNode(Node):
             self.get_parameter("target_service").value,
             self._target_callback,
         )
-        self._encode_text_client = self.create_client(
-            EncodeText,
-            self.get_parameter("encode_text_service").value,
-            callback_group=ReentrantCallbackGroup(),
+        self._encode_text_client = (
+            self.create_client(
+                EncodeText,
+                self.get_parameter("encode_text_service").value,
+                callback_group=ReentrantCallbackGroup(),
+            )
+            if self._online_processing_enabled
+            else None
         )
 
-        rgb_sub = message_filters.Subscriber(
-            self, Image, self.get_parameter("rgb_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, self.get_parameter("depth_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        info_sub = message_filters.Subscriber(
-            self, CameraInfo, self.get_parameter("camera_info_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub, info_sub],
-            queue_size=int(self.get_parameter("sync_queue_size").value),
-            slop=float(self.get_parameter("sync_slop_sec").value),
-        )
-        self._synchronizer.registerCallback(self._synchronized_callback)
-        self._frame_queue = BoundedFrameQueue(
-            capacity=int(self.get_parameter("frame_queue_capacity").value),
-            policy=self.get_parameter("frame_queue_policy").value,
-        )
-        self._queue_timer = self.create_timer(0.01, self._process_queued_frame)
-        self._stale_timer = self.create_timer(1.0, self._stale_callback)
+        if self._online_processing_enabled:
+            rgb_sub = message_filters.Subscriber(
+                self, Image, self.get_parameter("rgb_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            depth_sub = message_filters.Subscriber(
+                self, Image, self.get_parameter("depth_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            info_sub = message_filters.Subscriber(
+                self, CameraInfo, self.get_parameter("camera_info_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub, info_sub],
+                queue_size=int(self.get_parameter("sync_queue_size").value),
+                slop=float(self.get_parameter("sync_slop_sec").value),
+            )
+            self._synchronizer.registerCallback(self._synchronized_callback)
+            self._frame_queue = BoundedFrameQueue(
+                capacity=int(self.get_parameter("frame_queue_capacity").value),
+                policy=self.get_parameter("frame_queue_policy").value,
+            )
+            self._queue_timer = self.create_timer(0.01, self._process_queued_frame)
+        else:
+            self._synchronizer = None
+            self._frame_queue = None
+            self._queue_timer = None
+        self._stale_timer = self.create_timer(1.0, self._stale_callback) if self._online_processing_enabled else None
         self._publish_map()
-        self._start_label_refinement()
-        self.get_logger().info(f"Semantic mapping ready; database={database_path}, global_frame={self.global_frame}")
+        if self._online_processing_enabled:
+            self._start_label_refinement()
+        mode = "online" if self._online_processing_enabled else "query-only"
+        self.get_logger().info(
+            f"Semantic mapping ready ({mode}); database={database_path}, global_frame={self.global_frame}"
+        )
 
     def _declare_parameters(self) -> None:
         defaults = {
@@ -403,6 +426,7 @@ class SemanticMappingNode(Node):
             "amcl_pose_topic": "/amcl_pose",
             "nav2_costmap_topic": "/global_costmap/costmap",
             "auto_readiness_enabled": True,
+            "online_processing_enabled": True,
             "auto_readiness_timeout_sec": 5.0,
             "database_path": "~/.ros/ibrobot/semantic_map.sqlite3",
             "mapping_backend": "embedded",
@@ -1219,10 +1243,11 @@ class SemanticMappingNode(Node):
             return response
         query_embedding = None
         if request.query_text:
+            text_service_ready = self._encode_text_client is not None and self._encode_text_client.service_is_ready()
             readiness = text_query(
                 database_readable=True,
                 database_compatible=True,
-                siglip2_text_ready=self._encode_text_client.service_is_ready(),
+                siglip2_text_ready=text_service_ready,
                 embedding_space_compatible=True,
             )
             if not readiness.ready:

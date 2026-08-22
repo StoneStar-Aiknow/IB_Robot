@@ -940,7 +940,12 @@ class GatewayPolicy:
                 missing = not bool(prepared.payload.get(f"has_{field_name}", False))
             else:
                 missing = value is None or (isinstance(value, str) and not value)
-            definition = properties.get(field_name)
+            schema_field_name = (
+                "stand_off_distance_m"
+                if field_name == "distance" and "distance" not in properties and "stand_off_distance_m" in properties
+                else field_name
+            )
+            definition = properties.get(schema_field_name)
             if definition is None:
                 if missing or (field_name in {"motion_distance", "distance", "degree"} and value == 0.0):
                     continue
@@ -948,8 +953,8 @@ class GatewayPolicy:
             if not isinstance(definition, Mapping):
                 raise ValueError(f"invalid parameter schema for skill '{skill_name}'")
             if missing:
-                if field_name in required:
-                    raise ValueError(f"{field_name} is required for skill '{skill_name}'")
+                if schema_field_name in required:
+                    raise ValueError(f"{schema_field_name} is required for skill '{skill_name}'")
                 continue
             if definition.get("type") == "string":
                 if definition.get("freeform") is True:

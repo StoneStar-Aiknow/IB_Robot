@@ -81,10 +81,14 @@ robot:
 
   skill_required_control_mode: "moveit_planning"
   semantic_mapping:
-    enabled: false
-    # The mapping runtime is disabled by default in the grasp/navigation hybrid,
-    # but its camera contract is kept here so enabling it cannot fall back to
-    # the wrist camera by accident.
+    # Enabled by default: the default hybrid stage keeps online semantic
+    # mapping alive alongside grasp and navigation. The lean legacy stages
+    # (grasp/mapping/navigation) opt out explicitly below. The camera contract
+    # is declared here so enabling mapping cannot fall back to the wrist
+    # camera by accident.
+    enabled: true
+    # Keep the persisted map queryable while disabling online RGB-D updates.
+    query_only: false
     camera:
       peripheral: front
       mounting: fixed
@@ -92,6 +96,173 @@ robot:
       rgb_topic: /camera/front/image_raw
       depth_topic: /camera/front/aligned_depth_to_color/image_raw
       camera_info_topic: /camera/front/camera_info
+    slam:
+      # Identity of the reviewed lab-083830 semantic map deployed on LeKiwi.
+      # Runtime readiness still derives live flags from AMCL pose, map->odom
+      # TF, and the registered cloud when FAST-LIO publishes no identity topic.
+      global_frame: map
+      cloud_map_topic: /cloud_registered_body
+      active_map_hash_topic: /slam/active_geometry_map_hash
+      localization_ready_topic: /slam/localization_ready
+      authoritative_map_odom_topic: /slam/authoritative_map_odom_ready
+      geometry_map_id: fastlio-lekiwi-newbag
+      geometry_map_hash: newbag-offline-hash-001
+      localization_session_id: newbag-offline-session-001
+      calibration_id: newbag-offline-calib-001
+      urdf_hash: newbag-offline-urdf-001
+      coordinate_convention: ros-rep-103-map-enu
+      map_odom_authority: slam
+    perception:
+      mapping_backend: service
+      service_wait_sec: 1.0
+      semantic_roles:
+        sam2_masks: semantic_sam2_masks
+        ram_plus_tags: semantic_ram_plus_tags
+        siglip2_image: semantic_siglip2_image
+        siglip2_text: semantic_siglip2_text
+      allow_legacy_embedded: false
+    persistence:
+      database_path: ~/maps/lab-083830/semantic_map.sqlite3
+      artifact_output_dir: ~/.ros/ibrobot/semantic_artifacts
+    filtering:
+      depth_trunc_m: 4.0
+      min_points: 30
+      min_frame_valid_depth_ratio: 0.05
+      min_mask_pixels: 300
+      min_mask_area_ratio: 0.001
+      min_mask_valid_depth_ratio: 0.2
+      max_mask_overlap_ratio: 0.8
+      ground_filter_enabled: true
+      ground_reference_frame: base_link
+      ground_height_offset_m: 0.0
+      ground_max_bottom_clearance_m: 0.15
+      ground_max_object_height_m: 0.75
+      ground_max_footprint_m: 1.2
+      max_object_extent_m: 0.65
+      max_object_distance_m: 2.5
+    queue:
+      sync_queue_size: 10
+      sync_slop_sec: 0.06
+      tf_timeout_sec: 0.15
+      processing_interval_sec: 0.5
+      frame_capacity: 2
+      policy: drop_oldest
+      max_masks_per_frame: 32
+      max_masks_per_batch: 8
+    lifecycle:
+      association_distance_m: 0.45
+      association_max_size_ratio: 4.0
+      association_position_weight: 0.55
+      embedding_similarity_threshold: 0.72
+      label_switch_confidence_margin: 0.05
+      stale_after_sec: 10.0
+      move_stability_m: 0.1
+      move_confirmations: 2
+    labels:
+      min_confidence: 0.2
+      max_candidates_per_mask: 5
+      recurrence_count_ratio: 3.0
+      high_confidence_override_margin: 0.08
+      excluded_labels:
+        # Scene background, generic concepts, shapes, and action-like RAM++ noise.
+        - animal
+        - attach
+        - bite
+        - bomb
+        - briefcase
+        - building
+        - candle
+        - cloud
+        - cloudy
+        - cloth
+        - color
+        - container
+        - cube
+        - cylinder
+        - draw
+        - drive
+        - eagle
+        - face
+        - fighter jet
+        - fly
+        - floor
+        - food
+        - foot
+        - fruit
+        - gun
+        - hang
+        - hand
+        - hay
+        - hot
+        - image
+        - iceberg
+        - jet
+        - line
+        - liquid
+        - man
+        - missile
+        - move
+        - oval
+        - person
+        - photo
+        - polygon
+        - plastic
+        - plane
+        - pole
+        - rectangle
+        - reflection
+        - room
+        - shape
+        - sheet
+        - sign
+        - sky
+        - square
+        - stack
+        - stop sign
+        - stop light
+        - street sign
+        - tear
+        - tie
+        - toothpaste
+        - traffic light
+        - triangle
+        - unlabeled
+        - water
+        - wind
+    label_refinement:
+      enabled: false
+      model: gpt-5.6-sol
+      model_identity: xunxing/gpt-5.6-sol@az.gptplus5.com
+      prompt: >-
+        The left panel is the full indoor office/laboratory scene with the target highlighted in green and boxed in
+        red. The right panel is an enlarged masked crop of that target. Identify exactly one concrete, physically
+        manipulable item plausible in a robotics laboratory. Use the most specific common object noun supported by
+        the image. Prefer banana over food or fruit, trash can or bin over container or plastic, crumpled paper over
+        paper or cloth, and marker over cylinder. Never answer with a material, shape, color, visual attribute,
+        action, scene/background, or broad parent category. RAM++ candidates are weak hints and may all be wrong.
+      min_confidence: 0.8
+      trigger_below_confidence: 0.7
+      min_observations: 1
+    target_watch:
+      max_attempts: 3
+      scan_profile: fixed_d435_base_scan
+      stand_off_distance_m: 0.8
+      clearance_m: 0.2
+      track_state_updates_enabled: true
+      track_state_topic: /object_tracker/track_state
+      track_state_frame: odom
+      track_state_max_age_sec: 1.0
+      track_state_max_covariance_m2: 0.25
+      track_state_confirmation_gap_sec: 1.0
+      track_state_persist_interval_sec: 1.0
+      footprint_ready_topic: /navigation/footprint_ready
+      obstacle_map_ready_topic: /navigation/obstacle_map_ready
+      reachability_ready_topic: /navigation/reachability_ready
+    interfaces:
+      semantic_map_topic: /semantic_mapping/objects
+      object_cloud_topic: /semantic_mapping/object_cloud
+      query_service: /semantic_mapping/get_objects
+      target_service: /semantic_mapping/resolve_target
 
   perception_services:
     services:
@@ -115,6 +286,56 @@ robot:
         service_type: ibrobot_msgs/srv/SegmentDetections
         endpoint: /perception/grasp/segment_detections
         node_name: grasp_segment_detections
+        runtime_options:
+          device_id: 0
+      # Semantic-mapping model services for online mapping. They are enabled by
+      # default together with semantic_mapping above; the lean legacy stages
+      # opt out below. SAM2 here is the automatic mask generator and is
+      # intentionally a different bundle from the grasp prompt segmenter.
+      - id: semantic_sam2_masks
+        enabled: true
+        required: true
+        bundle_path: models/sam2.1_hiera_tiny
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SAM2GenerateMasksPlugin
+        service_type: ibrobot_msgs/srv/GenerateMasks
+        endpoint: /semantic_perception/semantic_sam2_masks
+        node_name: semantic_sam2_masks
+        runtime_options:
+          device_id: 0
+      - id: semantic_ram_plus_tags
+        enabled: true
+        required: true
+        bundle_path: models/ram_plus_swin_large_14m
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:RAMPlusRecognizeTagsPlugin
+        service_type: ibrobot_msgs/srv/RecognizeTags
+        endpoint: /semantic_perception/semantic_ram_plus_tags
+        node_name: semantic_ram_plus_tags
+        runtime_options:
+          device_id: 0
+      - id: semantic_siglip2_image
+        enabled: true
+        required: true
+        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SigLIP2EncodeEmbeddingsPlugin
+        service_type: ibrobot_msgs/srv/EncodeEmbeddings
+        endpoint: /semantic_perception/semantic_siglip2_image
+        node_name: semantic_siglip2_image
+        runtime_options:
+          device_id: 0
+      - id: semantic_siglip2_text
+        # Optional role: text encoding shares the SigLIP2 bundle with the
+        # image service and must stay non-required per the role policy.
+        enabled: true
+        required: false
+        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SigLIP2EncodeTextPlugin
+        service_type: ibrobot_msgs/srv/EncodeText
+        endpoint: /semantic_perception/semantic_siglip2_text
+        node_name: semantic_siglip2_text
         runtime_options:
           device_id: 0
 
@@ -542,6 +763,34 @@ robot:
       sensor_calibration:
         artifacts:
           base_to_front_camera: ""
+      # Wrist-only stage: the front camera is absent, so online semantic
+      # mapping must stay off and only the two grasp model services are kept.
+      semantic_mapping:
+        enabled: false
+      perception_services:
+        services:
+          - id: grasp_grounding
+            enabled: true
+            required: true
+            bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+            deployment: ascend_310p
+            adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+            service_type: ibrobot_msgs/srv/GroundingDetect
+            endpoint: /perception/grasp/grounding_detect
+            node_name: grasp_grounding_detect
+            runtime_options:
+              device_id: 0
+          - id: grasp_segmentation
+            enabled: true
+            required: true
+            bundle_path: models/sam2_hiera_tiny_ascend
+            deployment: ascend_310p
+            adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
+            service_type: ibrobot_msgs/srv/SegmentDetections
+            endpoint: /perception/grasp/segment_detections
+            node_name: grasp_segment_detections
+            runtime_options:
+              device_id: 0
       motion_mode:
         navigation_enabled_on_startup: false
         manipulation_control_mode: moveit_planning
@@ -557,6 +806,10 @@ robot:
       peripheral_names: [respeaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
+      # Legacy navigation-mapping stage stays lean: online semantic mapping and
+      # all model services are off; use the default hybrid stage for mapping.
+      semantic_mapping:
+        enabled: false
       perception_services:
         services: []
       grasp_execution:
@@ -593,6 +846,10 @@ robot:
       peripheral_names: [respeaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
+      # Legacy localization-navigation stage stays lean: online semantic
+      # mapping and all model services are off.
+      semantic_mapping:
+        enabled: false
       perception_services:
         services: []
       grasp_execution:
@@ -653,6 +910,11 @@ robot:
             - joint_state_broadcaster
             - arm_joint_state_broadcaster
             - base_velocity_controller
+      # Online semantic mapping and all six model services (two grasp, four
+      # semantic) are inherited from the top level. The default hybrid runtime
+      # is query-only until dynamic semantic mapping is explicitly re-enabled.
+      semantic_mapping:
+        query_only: true
       embodied:
         enabled: true
         skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar

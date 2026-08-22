@@ -1,33 +1,47 @@
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
 import yaml
 
 from robot_config.launch_builders.perception import generate_camera_nodes
-from robot_config.launch_builders.task_execution import generate_task_executor_node
+from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict, validate_motion_mode_config
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
 
 
-def _launch_parameter_value(node, name: str):
-    for raw_key, raw_value in node._Node__parameters[0].items():
-        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
-        if key != name:
-            continue
-        if not isinstance(raw_value, tuple):
-            return raw_value
-        text = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
-        if text.endswith("\n..."):
-            text = text[:-4].rstrip()
-        if text in {"True", "False"}:
-            return text == "True"
-        try:
-            return float(text)
-        except ValueError:
-            return text
-    raise KeyError(name)
+@pytest.fixture(autouse=True)
+def _front_camera_calibration(tmp_path, monkeypatch):
+    """Install an approved front-camera artifact into an isolated HOME.
+
+    The hybrid stage enables semantic mapping, which fails closed when the
+    front camera has no mounting transform. Real calibration values are
+    deployment-specific; the placeholder keeps the contract loadable while
+    ``test_unified_profile_applies_only_the_front_camera_artifact`` still
+    verifies the projection with its own explicit artifact.
+    """
+    artifact = tmp_path / ".ros/ibrobot/calib/current/base_to_front_camera.yaml"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "status": "approved",
+                "device": {"name": "front_camera", "serial": "043322073551"},
+                "transform": {
+                    "parent_frame": "base_link",
+                    "child_frame": "camera_front_optical_frame",
+                    "translation": [0.0, 0.0, 0.0],
+                    "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
@@ -144,18 +158,64 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
 
 
-def test_hybrid_navigation_startup_keeps_manipulation_task_executor_online():
-    config = load_robot_config_dict(CONFIG_PATH)
+def test_hybrid_keeps_static_semantic_query_and_disables_online_services():
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
+    assert raw["semantic_mapping"]["enabled"] is True
+    raw_services = {service["id"]: service for service in raw["perception_services"]["services"]}
+    assert all(
+        raw_services[service_id]["enabled"]
+        for service_id in (
+            "semantic_sam2_masks",
+            "semantic_ram_plus_tags",
+            "semantic_siglip2_image",
+            "semantic_siglip2_text",
+        )
+    )
+    assert raw["nav_stages"]["hybrid"]["semantic_mapping"]["query_only"] is True
 
-    node = generate_task_executor_node(config, "base_navigation")
+    hybrid = load_robot_config_dict(CONFIG_PATH)
 
-    assert node is not None
-    assert node.node_package == "task_dispatch"
-    assert node.node_executable == "task_executor_node"
-    assert _launch_parameter_value(node, "skip_redundant_gripper_open") is False
-    assert _launch_parameter_value(node, "gripper_open_position") == 1.0
-    assert _launch_parameter_value(node, "gripper_position_tolerance") == 0.05
-    assert _launch_parameter_value(node, "joint_state_max_age_s") == 0.25
+    assert hybrid["semantic_mapping"]["enabled"] is True
+    assert hybrid["semantic_mapping"]["query_only"] is True
+    slam = hybrid["semantic_mapping"]["slam"]
+    assert slam["global_frame"] == "map"
+    assert slam["cloud_map_topic"] == "/cloud_registered_body"
+    assert slam["geometry_map_id"] == "fastlio-lekiwi-newbag"
+    assert slam["geometry_map_hash"] == "newbag-offline-hash-001"
+    assert slam["localization_session_id"] == "newbag-offline-session-001"
+    assert slam["calibration_id"] == "newbag-offline-calib-001"
+    assert slam["urdf_hash"] == "newbag-offline-urdf-001"
+    assert hybrid["semantic_mapping"]["persistence"]["database_path"] == "~/maps/lab-083830/semantic_map.sqlite3"
+    roles = hybrid["semantic_mapping"]["perception"]["semantic_roles"]
+    assert roles == {
+        "sam2_masks": "semantic_sam2_masks",
+        "ram_plus_tags": "semantic_ram_plus_tags",
+        "siglip2_image": "semantic_siglip2_image",
+        "siglip2_text": "semantic_siglip2_text",
+    }
+    services = {service["id"]: service for service in hybrid["perception_services"]["services"]}
+    assert all(services[role]["enabled"] for role in roles.values())
+    assert services["semantic_sam2_masks"]["deployment"] == "ascend_310p"
+    assert services["semantic_sam2_masks"]["bundle_path"].endswith("sam2.1_hiera_tiny")
+    assert services["semantic_siglip2_text"]["required"] is False
+    # Endpoints stay disjoint from the grasp services in the same stage.
+    endpoints = [service["endpoint"] for service in services.values()]
+    assert len(endpoints) == len(set(endpoints))
+    assert {vars(node)["_Node__node_name"] for node in generate_perception_model_nodes(hybrid)} == {
+        "grasp_grounding_detect",
+        "grasp_segment_detections",
+    }
+
+
+def test_lean_stages_keep_semantic_mapping_disabled():
+    for stage in ("grasp", "mapping", "navigation"):
+        config = load_robot_config_dict(CONFIG_PATH, nav_stage=stage)
+        assert config["semantic_mapping"]["enabled"] is False, stage
+        enabled = [
+            service["id"] for service in config["perception_services"]["services"] if service.get("enabled", False)
+        ]
+        assert "semantic_sam2_masks" not in enabled, stage
+        assert "semantic_siglip2_image" not in enabled, stage
 
 
 def test_unified_profile_launches_wrist_and_front_realsense_drivers():
@@ -183,7 +243,7 @@ def test_hybrid_startup_mode_and_navigation_gate_must_match():
 
 def test_unified_profile_applies_only_the_front_camera_artifact(monkeypatch, tmp_path):
     artifact = tmp_path / ".ros/ibrobot/calib/current/base_to_front_camera.yaml"
-    artifact.parent.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text(
         yaml.safe_dump(
             {

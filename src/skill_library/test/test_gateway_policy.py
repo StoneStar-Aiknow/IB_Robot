@@ -88,6 +88,21 @@ EXPANDED_SKILL_TEMPLATES = {
         },
         "primitive_sequence": [{"primitive_name": "nav_abs_coordinate"}],
     },
+    "semantic_query": {
+        "capability": {
+            "parameters": _parameters(
+                {
+                    "target_name": {
+                        "type": "string",
+                        "enum": ["banana", "basket", "paper ball", "toy", "ballpoint pen", "grapes"],
+                    },
+                    "stand_off_distance_m": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+                },
+                ["target_name"],
+            )
+        },
+        "primitive_sequence": [],
+    },
 }
 
 
@@ -296,6 +311,35 @@ def test_policy_rejects_capability_parameter_contract_without_state_mutation(gat
     assert decision.error_code == gateway_policy.SKILL_REJECTED
     assert ledger.query(str(gateway_request.task_id)) == gateway_policy.LedgerQuery()
     assert lease.owner is None
+
+
+def test_policy_validates_standoff_schema_against_distance_wire_field():
+    request = _request(
+        skill_name="semantic_query",
+        target_name="banana",
+        motion_direction=None,
+        motion_distance=None,
+        distance=0.3,
+    )
+
+    prepared = _policy().prepare(request)
+
+    assert prepared.payload["distance"] == 0.3
+
+
+def test_policy_rejects_unknown_semantic_map_target():
+    request = _request(
+        skill_name="semantic_query",
+        target_name="billboard",
+        motion_direction=None,
+        motion_distance=None,
+    )
+
+    decision = _policy().evaluate(request, _snapshot())
+
+    assert decision.admitted is False
+    assert decision.error_code == gateway_policy.SKILL_REJECTED
+    assert decision.message == "target_name is invalid for skill 'semantic_query'"
 
 
 def test_policy_readiness_evaluation_skips_request_parameter_validation():

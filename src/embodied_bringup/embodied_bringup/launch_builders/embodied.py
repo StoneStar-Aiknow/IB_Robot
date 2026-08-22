@@ -106,6 +106,7 @@ def generate_embodied_nodes(
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
     placement_execution = robot_config.get("placement_execution", {})
+    semantic_mapping = robot_config.get("semantic_mapping", {})
     if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
         motion = placement_execution.get("motion", {})
         if isinstance(motion, dict):
@@ -215,6 +216,13 @@ def generate_embodied_nodes(
     navigation_action_name = navigation_endpoint_projection(robot_config)
     if navigation_action_name is not None:
         common_params["navigation_action_name"] = navigation_action_name
+    if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
+        common_params["semantic_map_target_service"] = semantic_mapping.get("interfaces", {}).get(
+            "query_service", "/semantic_mapping/get_objects"
+        )
+        common_params["semantic_map_stand_off_distance_m"] = float(
+            semantic_mapping.get("target_watch", {}).get("stand_off_distance_m", 0.8)
+        )
     perception_node = None
     if perception.get("enabled", False):
         perception_node = Node(

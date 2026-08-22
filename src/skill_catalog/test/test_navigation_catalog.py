@@ -116,9 +116,9 @@ def _navigation_context() -> SkillCompileContext:
         delegated_executors={
             "semantic_map_query": DelegatedExecutorDescriptor(
                 name="semantic_map_query",
-                contract_version="v1",
-                endpoint_kind="ros_action",
-                endpoint_name="/navigation/execute",
+                contract_version="1",
+                endpoint_kind="ros_service",
+                endpoint_name="/semantic_mapping/resolve_target",
                 configuration_digest="a" * 64,
                 model_deployment_name="",
                 model_fingerprint="",

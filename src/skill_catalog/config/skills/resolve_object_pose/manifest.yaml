@@ -1,6 +1,6 @@
 schema_version: 2
 name: resolve_object_pose
-version: 1.0.0
+version: 1.1.0
 semantic_level: atomic_operator
 description:
   summary: Query the semantic map for a named object and return its stand-off navigation target.
@@ -34,7 +34,13 @@ capability:
     properties:
       target_name:
         type: string
-        freeform: true
+        enum:
+        - banana
+        - basket
+        - paper ball
+        - toy
+        - ballpoint pen
+        - grapes
       stand_off_distance_m:
         type: number
         exclusiveMinimum: 0

@@ -610,6 +610,22 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating model service nodes: {e}")
         raise
 
+    # ========== 6.5 Semantic Mapping Node (online updates) ==========
+    try:
+        from robot_config.launch_builders.semantic_mapping import generate_semantic_mapping_nodes
+
+        semantic_mapping_nodes = generate_semantic_mapping_nodes(robot_config)
+        if semantic_mapping_nodes:
+            if controller_ready_barrier is not None:
+                controller_dependent_actions.extend(semantic_mapping_nodes)
+                logger.info("Deferring semantic mapping node until required controllers are active")
+            else:
+                actions.extend(semantic_mapping_nodes)
+            logger.info(f"Added {len(semantic_mapping_nodes)} semantic mapping node(s)")
+    except Exception as e:
+        logger.error(f"generating semantic mapping nodes: {e}")
+        raise
+
     # ========== 7. Generate Teleop Nodes (if in teleop mode) ==========
     logger.info("========== Checking Teleop Mode ==========")
     try:

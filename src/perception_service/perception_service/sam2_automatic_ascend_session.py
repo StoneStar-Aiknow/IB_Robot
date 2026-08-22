@@ -62,7 +62,7 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         self._points_per_side = int(adapter.get("points_per_side", _DEFAULT_POINTS_PER_SIDE))
         self._pred_iou_thresh = float(adapter.get("pred_iou_thresh", _DEFAULT_PRED_IOU_THRESH))
         self._stability_thresh = float(adapter.get("stability_score_thresh", _DEFAULT_STABILITY_THRESH))
-        self._decoder_batch = self._decoder_batch_size()
+        self._decoder_batch = self._decoder_batch_size(deployment)
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
         image_rgb = np.asarray(request.inputs["observation.image"], dtype=np.uint8)
@@ -222,8 +222,9 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
             "stability_scores": np.empty((0,), dtype=np.float32),
         }
 
-    def _decoder_batch_size(self) -> int:
-        binding = self._loaded_deployment().bindings["decoder"].inputs
+    @staticmethod
+    def _decoder_batch_size(deployment) -> int:
+        binding = deployment.bindings["decoder"].inputs
         point_coords = next((b for b in binding if b.semantic == "host.sam2.point_coords"), None)
         if point_coords is None or len(point_coords.shape) < 1 or point_coords.shape[0] < 1:
             raise BackendInferenceError(

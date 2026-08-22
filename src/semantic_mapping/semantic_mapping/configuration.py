@@ -42,6 +42,7 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
     target_watch = mapping["target_watch"]
     interfaces = mapping["interfaces"]
     roles = perception["semantic_roles"]
+    query_only = bool(mapping.get("query_only", False))
     mapping_backend = perception["mapping_backend"]
     runtime = parse_perception_runtime_config(config) if mapping_backend == "service" else None
     services = {} if runtime is None else {service.instance_id: service for service in runtime.enabled_services}
@@ -70,6 +71,7 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "coordinate_convention": slam["coordinate_convention"],
         "database_path": persistence["database_path"],
         "configuration_generation": generation,
+        "online_processing_enabled": not query_only,
         "sync_slop_sec": queue["sync_slop_sec"],
         "max_masks_per_frame": queue.get("max_masks_per_frame", 32),
         "max_masks_per_batch": queue["max_masks_per_batch"],
@@ -172,6 +174,8 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
 
 def semantic_perception_nodes(config: dict, *, offline: bool = False) -> list:
     """Build generic model hosts required by the selected semantic workflow."""
+    if config["semantic_mapping"].get("query_only", False):
+        return []
     perception = config["semantic_mapping"]["perception"]
     if perception["mapping_backend"] == "embedded":
         return []

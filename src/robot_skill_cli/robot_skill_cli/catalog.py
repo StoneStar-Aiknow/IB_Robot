@@ -237,6 +237,27 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
             )
         )
         delegated[descriptor.name] = descriptor
+
+    semantic_mapping = robot_config.get("semantic_mapping", {})
+    if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
+        interfaces = semantic_mapping.get("interfaces", {})
+        target_service = interfaces.get("query_service", "/semantic_mapping/get_objects")
+        target_watch = semantic_mapping.get("target_watch", {})
+        stand_off_distance_m = target_watch.get("stand_off_distance_m", 0.8)
+        if isinstance(target_service, str) and target_service.strip():
+            configuration = {
+                "query_service": target_service,
+                "stand_off_distance_m": float(stand_off_distance_m),
+            }
+            descriptor = DelegatedExecutorDescriptor(
+                **delegated_executor_identity(
+                    name="semantic_map_query",
+                    endpoint_name=target_service,
+                    endpoint_kind="ros_service",
+                    configuration=configuration,
+                )
+            )
+            delegated[descriptor.name] = descriptor
     robot_context = SkillRobotContext(
         robot_name=robot_config["name"],
         context_schema_version=robot_context_schema_version(robot_config),
@@ -277,9 +298,12 @@ def _snapshot_capability_view(snapshot):
             return [thaw(item) for item in value]
         return value
 
+    skills = [thaw(snapshot.capability_view[name]) for name in sorted(snapshot.capability_view)]
+    for skill in skills:
+        skill["timeout_sec"] = float(snapshot.templates[skill["name"]]["timeout_sec"])
     return {
         "robot_name": snapshot.robot_name,
-        "skills": [thaw(snapshot.capability_view[name]) for name in sorted(snapshot.capability_view)],
+        "skills": skills,
         "pose_names": sorted(snapshot.robot_context.named_poses),
         "timeout_policy": project_capability_timeout_policy(snapshot.robot_context.timeout_policy),
         "capability_digest": snapshot.capability_digest,
@@ -332,9 +356,18 @@ def capability_view_from_snapshot(snapshot: dict[str, Any], status: dict[str, An
     capability_mapping = capability_preimage.get("capability_view")
     if not isinstance(capability_mapping, dict):
         raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: capability view is invalid")
+    timeout_caps = {
+        str(entry["name"]): float(entry["template"]["timeout_sec"])
+        for entry in registry_preimage.get("skills", [])
+        if isinstance(entry, dict) and isinstance(entry.get("template"), dict) and "timeout_sec" in entry["template"]
+    }
+    skills = [copy.deepcopy(capability_mapping[name]) for name in sorted(capability_mapping)]
+    for skill in skills:
+        if skill["name"] in timeout_caps:
+            skill["timeout_sec"] = timeout_caps[skill["name"]]
     return {
         "robot_name": capability_preimage["robot_name"],
-        "skills": [copy.deepcopy(capability_mapping[name]) for name in sorted(capability_mapping)],
+        "skills": skills,
         "pose_names": list(capability_preimage["named_pose_names"]),
         "timeout_policy": project_capability_timeout_policy(capability_preimage["timeout_policy"]),
         "capability_digest": snapshot["capability_digest"],

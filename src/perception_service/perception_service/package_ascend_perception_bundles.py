@@ -59,6 +59,7 @@ class BundleSpec:
     assets: tuple[tuple[str, str], ...] = ()
     operation: str = ""
     embedding: EmbeddingMetadata | None = None
+    logical_model_revision: str = ""
 
 
 def _semantic(semantic: str, dtype: str, shape: tuple[int, ...], layout: str | None = None) -> SemanticTensor:
@@ -429,6 +430,7 @@ def _specs() -> dict[str, BundleSpec]:
                 image_preprocessing="masked-crop-gray127-resize384-bilinear-normalize0.5-v1",
                 text_preprocessing="photo-template-gemma-tokenizer-max64-v1",
             ),
+            logical_model_revision="google/siglip2-so400m-patch14-384@main",
             deployments=(
                 _siglip_deployment(
                     "ascend_310p",
@@ -586,7 +588,7 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
         inputs=spec.inputs,
         outputs=spec.outputs,
         semantic_identity=SemanticIdentity(
-            logical_model_revision=f"{spec.family}@v1",
+            logical_model_revision=spec.logical_model_revision or f"{spec.family}@v1",
             preprocessing_contract=spec.preprocessing,
             output_semantics=spec.postprocessing,
             embedding=spec.embedding,

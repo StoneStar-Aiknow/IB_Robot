@@ -88,6 +88,9 @@ def test_siglip2_ascend_bundle_declares_loadable_embedding_identity(tmp_path, mo
     )
 
     assert adapter.dimension == 1152
+    assert validated.manifest.model.semantic_identity.logical_model_revision == (
+        "google/siglip2-so400m-patch14-384@main"
+    )
     assert validated.deployment.bindings["vision"].inputs[0].runtime_name == "image"
     assert validated.deployment.bindings["text"].inputs[0].runtime_name == "input_ids"
     assert validated.deployment.bindings["vision"].outputs[0].runtime_name is None

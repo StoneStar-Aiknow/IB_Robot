@@ -146,6 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-name")
+    parser.add_argument("--stand-off-distance-m", dest="stand_off_distance_m", type=float)
     parser.add_argument("--container-name")
     parser.add_argument("--place-name")
     parser.add_argument("--motion-direction")
@@ -214,6 +215,7 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
     required = set(parameters["required"])
     values = {
         "target_name": getattr(args, "target_name", None),
+        "stand_off_distance_m": getattr(args, "stand_off_distance_m", None),
         "container_name": getattr(args, "container_name", None),
         "place_name": getattr(args, "place_name", None),
         "motion_direction": getattr(args, "motion_direction", None),
@@ -236,8 +238,11 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
                 raise _CliArgumentError(f"{name} is required for skill {skill['name']}")
             if value is None:
                 continue
-        if schema["type"] == "string" and "enum" in schema and value.strip().lower() not in schema["enum"]:
-            raise _CliArgumentError(f"{name} must be one of: {', '.join(schema['enum'])}")
+        if schema["type"] == "string" and "enum" in schema:
+            normalized_value = value.strip().lower()
+            if normalized_value not in schema["enum"]:
+                raise _CliArgumentError(f"{name} must be one of: {', '.join(schema['enum'])}")
+            setattr(args, name, normalized_value)
         if schema["type"] == "number" and (
             isinstance(value, bool) or not math.isfinite(value) or value <= schema.get("exclusiveMinimum", -math.inf)
         ):
@@ -267,12 +272,21 @@ def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], c
     return normalized
 
 
-def _validate_timeout(status: dict[str, Any], timeout_sec: float | None) -> float:
-    effective_timeout = status["default_skill_timeout_sec"] if timeout_sec is None else timeout_sec
+def _validate_timeout(
+    status: dict[str, Any], timeout_sec: float | None, *, skill_timeout_cap: float | None = None
+) -> float:
+    default_timeout = status["default_skill_timeout_sec"]
+    if skill_timeout_cap is not None:
+        if not math.isfinite(skill_timeout_cap) or skill_timeout_cap <= 0.0:
+            raise _CliArgumentError("skill timeout cap must be finite and positive")
+        default_timeout = min(default_timeout, skill_timeout_cap)
+    effective_timeout = default_timeout if timeout_sec is None else timeout_sec
     if not math.isfinite(effective_timeout) or effective_timeout <= 0.0:
         raise _CliArgumentError("timeout_sec must be a finite number greater than zero")
     if effective_timeout > status["task_budget_sec"]:
         raise _CliArgumentError("timeout_sec must not exceed the Gateway task budget")
+    if skill_timeout_cap is not None and effective_timeout > skill_timeout_cap:
+        raise _CliArgumentError("timeout_sec must not exceed the skill timeout cap")
     return effective_timeout
 
 
@@ -303,7 +317,12 @@ def _prepare_request(
         ) from exc
     skill = describe_skill(runtime_view, args.skill)
     _validate_schema(skill, args)
-    effective_timeout = _validate_timeout(status, args.timeout_sec)
+    skill_timeout_cap = skill.get("timeout_sec")
+    effective_timeout = _validate_timeout(
+        status,
+        args.timeout_sec,
+        skill_timeout_cap=float(skill_timeout_cap) if skill_timeout_cap is not None else None,
+    )
     capability = next((item for item in status["capabilities"] if item["name"] == skill["name"]), None)
     if capability is None or not capability["ready"]:
         reason = capability["reason"] if capability is not None and capability["reason"] else "CAPABILITY_NOT_READY"
@@ -325,7 +344,11 @@ def _prepare_request(
         motion_direction=args.motion_direction,
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,
         direction=args.direction,
-        distance=0.0 if args.distance is None else args.distance,
+        distance=(
+            float(getattr(args, "stand_off_distance_m", None))
+            if getattr(args, "stand_off_distance_m", None) is not None
+            else (0.0 if args.distance is None else args.distance)
+        ),
         degree=0.0 if args.degree is None else args.degree,
         x=args.x,
         y=args.y,

@@ -721,6 +721,15 @@ def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
             {"x": {"type": "number"}, "y": {"type": "number"}, "yaw": {"type": "number"}},
             {"x": 0.0, "y": -2.5, "yaw": 0.0},
         ),
+        (
+            "resolve_object_pose",
+            ["--target-name", "Paper Ball", "--stand-off-distance-m", "0.3"],
+            {
+                "target_name": {"type": "string", "enum": ["banana", "paper ball"]},
+                "stand_off_distance_m": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+            },
+            {"target_name": "paper ball", "stand_off_distance_m": 0.3},
+        ),
     ],
 )
 def test_navigation_cli_parser_validates_all_public_parameters(skill_name, arguments, properties, expected):

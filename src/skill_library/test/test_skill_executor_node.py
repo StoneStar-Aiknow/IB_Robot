@@ -1,3 +1,4 @@
+import json
 import threading
 from threading import RLock
 from types import SimpleNamespace
@@ -5,8 +6,10 @@ from types import SimpleNamespace
 import pytest
 import rclpy
 
-from embodied_common.dispatch_binding import copy_binding, new_binding
+from embodied_common.dispatch_binding import copy_binding, delegated_executor_identity, new_binding
 from ibrobot_msgs.action import ExecuteNavigation, PrimitiveCommand
+from ibrobot_msgs.msg import SemanticObject3D
+from ibrobot_msgs.srv import GetSemanticObjects
 from skill_library import skill_executor_node
 from skill_library.gateway_policy import (
     BoundedRequestLedger,
@@ -294,6 +297,136 @@ def test_runtime_snapshot_uses_configured_context_schema(monkeypatch, context_sc
     robot_context = captured["context"].robot
     assert robot_context.context_schema_version == context_schema_version
     assert ("navigation_action" in robot_context.execution_endpoints) is has_navigation
+
+
+def test_semantic_map_executor_descriptor_uses_service_identity():
+    node = object.__new__(SkillExecutorNode)
+    node._skill_templates = {"resolve_object_pose": {"executor": "semantic_map_query"}}
+    node._grasp_execution = {}
+    node._placement_execution = {}
+    node._pick_action_name = "/manipulation/execute_pick"
+    node._place_action_name = "/manipulation/execute_place"
+    node._semantic_map_target_service = "/semantic_mapping/get_objects"
+    node._semantic_map_stand_off_distance_m = 0.8
+
+    descriptor = node._delegated_executor_descriptors()["semantic_map_query"]
+    expected = delegated_executor_identity(
+        name="semantic_map_query",
+        endpoint_name="/semantic_mapping/get_objects",
+        endpoint_kind="ros_service",
+        configuration={
+            "query_service": "/semantic_mapping/get_objects",
+            "stand_off_distance_m": 0.8,
+        },
+    )
+
+    assert vars(descriptor) == expected
+
+
+def test_semantic_map_executor_is_registered_before_templates_are_loaded():
+    node = object.__new__(SkillExecutorNode)
+    node._skill_templates = {}
+    node._grasp_execution = {}
+    node._placement_execution = {}
+    node._pick_action_name = "/manipulation/execute_pick"
+    node._place_action_name = "/manipulation/execute_place"
+    node._semantic_map_target_service = "/semantic_mapping/resolve_target"
+    node._semantic_map_stand_off_distance_m = 0.8
+
+    assert "semantic_map_query" in node._delegated_executor_descriptors()
+
+
+def test_semantic_map_query_calls_resolve_target_service_and_returns_pose_json():
+    requests = []
+    response = GetSemanticObjects.Response()
+    response.success = True
+    response.semantic_map.objects = [SemanticObject3D()]
+    response.semantic_map.objects[0].pose.pose.pose.position.x = 1.25
+    response.semantic_map.objects[0].pose.pose.pose.position.y = -0.5
+
+    class Client:
+        @staticmethod
+        def wait_for_service(**_kwargs):
+            return True
+
+        @staticmethod
+        def call_async(request):
+            requests.append(request)
+            return _Future(done=True, result=response)
+
+    node = object.__new__(SkillExecutorNode)
+    node._semantic_map_target_client = Client()
+    node._semantic_map_target_service = "/semantic_mapping/get_objects"
+    node._semantic_map_stand_off_distance_m = 0.8
+    node._rpc_timeout = 0.1
+    node._tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args, **_kwargs: SimpleNamespace(
+            transform=SimpleNamespace(translation=SimpleNamespace(x=0.0, y=0.0))
+        )
+    )
+    node._set_result_catalog_identity = lambda result, bundle=None: None
+    goal_handle = SimpleNamespace(
+        request=SimpleNamespace(
+            skill_name="resolve_object_pose",
+            target_name="banana",
+            distance=0.0,
+            timeout_sec=5.0,
+        ),
+        is_cancel_requested=False,
+        succeed=lambda: None,
+    )
+
+    result = node._execute_semantic_map_query(goal_handle)
+
+    assert result.success is True
+    assert json.loads(result.message) == pytest.approx([0.5072186473, -0.2028874589, -21.8014094864])
+    assert len(requests) == 1
+    assert requests[0].label == "banana"
+    assert requests[0].include_inactive is True
+    assert requests[0].max_age_sec == 0.0
+
+
+def test_semantic_map_query_uses_request_standoff_distance():
+    response = GetSemanticObjects.Response()
+    response.success = True
+    response.semantic_map.objects = [SemanticObject3D()]
+    response.semantic_map.objects[0].pose.pose.pose.position.x = 1.25
+    response.semantic_map.objects[0].pose.pose.pose.position.y = -0.5
+
+    class Client:
+        @staticmethod
+        def wait_for_service(**_kwargs):
+            return True
+
+        @staticmethod
+        def call_async(_request):
+            return _Future(done=True, result=response)
+
+    node = object.__new__(SkillExecutorNode)
+    node._semantic_map_target_client = Client()
+    node._semantic_map_target_service = "/semantic_mapping/get_objects"
+    node._semantic_map_stand_off_distance_m = 0.8
+    node._rpc_timeout = 0.1
+    node._tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args, **_kwargs: SimpleNamespace(
+            transform=SimpleNamespace(translation=SimpleNamespace(x=0.0, y=0.0))
+        )
+    )
+    node._set_result_catalog_identity = lambda result, bundle=None: None
+    goal_handle = SimpleNamespace(
+        request=SimpleNamespace(
+            skill_name="resolve_object_pose",
+            target_name="banana",
+            distance=0.3,
+            timeout_sec=5.0,
+        ),
+        is_cancel_requested=False,
+        succeed=lambda: None,
+    )
+
+    result = node._execute_semantic_map_query(goal_handle)
+
+    assert json.loads(result.message) == pytest.approx([0.9714569927, -0.3885827971, -21.8014094864])
 
 
 def test_v1_runtime_snapshot_reports_navigation_not_ready_without_client():

@@ -425,9 +425,15 @@ def _required_string(section: dict[str, Any], key: str, path: str, errors: list[
 
 
 def _active_identity(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
-    _required_string(section, key, path, errors)
+    # An empty value is a valid deployment state: SLAM stacks without a map
+    # identity publisher keep the manifest identity as the local contract and
+    # let runtime readiness (evaluate_slam_readiness) derive flags from
+    # observable signals. Only template placeholders and non-strings fail.
     value = section.get(key)
-    if isinstance(value, str) and value.startswith("REPLACE_WITH_"):
+    if not isinstance(value, str):
+        errors.append(f"{path}.{key} must be a string")
+        return
+    if value.startswith("REPLACE_WITH_"):
         errors.append(f"{path}.{key} must be an active identity")
 
 

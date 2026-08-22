@@ -30,8 +30,17 @@ def test_manifest_has_query_only_contract():
     assert cap["domain"] == "navigation"
     assert cap["required_control_mode"] == "base_navigation"
     params = cap["parameters"]["properties"]
-    assert "target_name" in params
-    assert "stand_off_distance_m" in params
+    assert params["target_name"]["enum"] == [
+        "banana",
+        "basket",
+        "paper ball",
+        "toy",
+        "ballpoint pen",
+        "grapes",
+    ]
+    assert params["stand_off_distance_m"]["type"] == "number"
+    assert params["stand_off_distance_m"]["exclusiveMinimum"] == 0
+    assert params["stand_off_distance_m"]["unit"] == "meters"
     assert cap["parameters"]["required"] == ["target_name"]
 
 
