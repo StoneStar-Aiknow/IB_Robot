@@ -229,32 +229,72 @@ def hwc_uint8_to_nv12(
     normalized_range = color_range.lower()
     if normalized_range not in _BT709_COLOR_RANGES:
         raise ValueError(f"NV12 color_range must be one of {sorted(_BT709_COLOR_RANGES)}, got {color_range!r}")
-    rgb = decoded_frame_to_hwc_uint8(frame, encoding=encoding, output_encoding="rgb8")
-    height, width, _ = rgb.shape
+    source_encoding = str(encoding).lower()
+    source = np.asarray(frame)
+    direct_channels = source_encoding in {"rgb8", "bgr8"}
+    if direct_channels:
+        if source.dtype != np.uint8:
+            raise ValueError(f"color image dtype must be uint8, got {source.dtype}")
+        if source.ndim != 3 or source.shape[2] != 3:
+            raise ValueError(f"encoding '{source_encoding}' requires a HxWx3 frame, got shape {source.shape}")
+        height, width, _ = source.shape
+        if height <= 0 or width <= 0:
+            raise ValueError(f"image dimensions must be positive, got {height}x{width}")
+        rgb = None
+    else:
+        rgb = decoded_frame_to_hwc_uint8(frame, encoding=encoding, output_encoding="rgb8")
+        height, width, _ = rgb.shape
     if height % 2 or width % 2:
         raise ValueError(f"NV12 requires even dimensions, got {height}x{width}")
-    surface_stride = width if stride is None else int(stride)
+    if stride is None:
+        surface_stride = width
+    elif isinstance(stride, bool) or not isinstance(stride, Integral):
+        raise ValueError("NV12 stride must be a positive integer")
+    else:
+        surface_stride = int(stride)
     if surface_stride < width:
         raise ValueError(f"NV12 stride {surface_stride} is smaller than width {width}")
 
-    red = rgb[..., 0].astype(np.float32)
-    green = rgb[..., 1].astype(np.float32)
-    blue = rgb[..., 2].astype(np.float32)
-    if normalized_range == "limited":
-        y_plane = 16.0 + 0.182586 * red + 0.614231 * green + 0.062007 * blue
-        u_plane = 128.0 - 0.100644 * red - 0.338572 * green + 0.439216 * blue
-        v_plane = 128.0 + 0.439216 * red - 0.398942 * green - 0.040274 * blue
+    if direct_channels:
+        red = source[..., 0 if source_encoding == "rgb8" else 2].astype(np.int32)
+        green = source[..., 1].astype(np.int32)
+        blue = source[..., 2 if source_encoding == "rgb8" else 0].astype(np.int32)
     else:
-        y_plane = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-        u_plane = 128.0 - 0.114572 * red - 0.385428 * green + 0.5 * blue
-        v_plane = 128.0 + 0.5 * red - 0.454153 * green - 0.045847 * blue
+        assert rgb is not None
+        red = rgb[..., 0].astype(np.int32)
+        green = rgb[..., 1].astype(np.int32)
+        blue = rgb[..., 2].astype(np.int32)
 
-    u_subsampled = u_plane.reshape(height // 2, 2, width // 2, 2).mean(axis=(1, 3))
-    v_subsampled = v_plane.reshape(height // 2, 2, width // 2, 2).mean(axis=(1, 3))
+    # Keep the conversion integer-only on the hot RGB/BGR path.  The fixed
+    # point coefficients preserve the BT.709 equations while avoiding the
+    # float32 channel and subsampling temporaries on small ARM CPUs.
+    scale = 1_000_000
+    if normalized_range == "limited":
+        y_coefficients = (182586, 614231, 62007)
+        u_coefficients = (-100644, -338572, 439216)
+        v_coefficients = (439216, -398942, -40274)
+        y_offset = 16
+    else:
+        y_coefficients = (212600, 715200, 72200)
+        u_coefficients = (-114572, -385428, 500000)
+        v_coefficients = (500000, -454153, -45847)
+        y_offset = 0
+
+    y_numerator = y_coefficients[0] * red + y_coefficients[1] * green + y_coefficients[2] * blue
+    y_plane = np.clip((y_numerator + y_offset * scale + scale // 2) // scale, 0, 255).astype(np.uint8)
+    red_sum = red[0::2, 0::2] + red[0::2, 1::2] + red[1::2, 0::2] + red[1::2, 1::2]
+    green_sum = green[0::2, 0::2] + green[0::2, 1::2] + green[1::2, 0::2] + green[1::2, 1::2]
+    blue_sum = blue[0::2, 0::2] + blue[0::2, 1::2] + blue[1::2, 0::2] + blue[1::2, 1::2]
+    u_numerator = u_coefficients[0] * red_sum + u_coefficients[1] * green_sum + u_coefficients[2] * blue_sum
+    v_numerator = v_coefficients[0] * red_sum + v_coefficients[1] * green_sum + v_coefficients[2] * blue_sum
+    chroma_denominator = 4 * scale
+    chroma_offset = 128 * chroma_denominator + chroma_denominator // 2
+    u_subsampled = np.clip((u_numerator + chroma_offset) // chroma_denominator, 0, 255).astype(np.uint8)
+    v_subsampled = np.clip((v_numerator + chroma_offset) // chroma_denominator, 0, 255).astype(np.uint8)
     surface = np.zeros((height + height // 2, surface_stride), dtype=np.uint8)
-    surface[:height, :width] = _rounded_uint8(y_plane)
-    surface[height:, :width:2] = _rounded_uint8(u_subsampled)
-    surface[height:, 1:width:2] = _rounded_uint8(v_subsampled)
+    surface[:height, :width] = y_plane
+    surface[height:, :width:2] = u_subsampled
+    surface[height:, 1:width:2] = v_subsampled
     return surface
 
 

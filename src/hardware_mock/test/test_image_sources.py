@@ -9,6 +9,7 @@ from hardware_mock.image_sources import make_generator, resolve_spec
 def test_default_is_checkerboard():
     spec = resolve_spec("cam", 64, 48, overrides=None)
     assert spec.kind == "checkerboard"
+    assert spec.encoding == "bgr8"
     frame = make_generator(spec)()
     assert frame.shape == (48, 64, 3)
     assert frame.dtype == np.uint8
@@ -25,6 +26,19 @@ def test_solid_color_override():
     assert frame[0, 0, 2] == 0x10
 
 
+def test_solid_color_honors_rgb_encoding():
+    spec = resolve_spec(
+        "cam",
+        4,
+        4,
+        overrides={"cam": {"kind": "solid", "color": "#102030"}},
+        encoding="rgb8",
+    )
+    frame = make_generator(spec)()
+    assert spec.encoding == "rgb8"
+    assert tuple(frame[0, 0]) == (0x10, 0x20, 0x30)
+
+
 def test_gradient_shape():
     spec = resolve_spec("cam", 8, 4, overrides={"cam": {"kind": "gradient"}})
     frame = make_generator(spec)()
@@ -39,3 +53,8 @@ def test_invalid_kind_rejected():
 def test_invalid_color_rejected():
     with pytest.raises(ValueError):
         resolve_spec("cam", 8, 8, overrides={"cam": {"kind": "solid", "color": "not-a-color"}})
+
+
+def test_invalid_encoding_rejected():
+    with pytest.raises(ValueError, match="image encoding"):
+        resolve_spec("cam", 8, 8, overrides=None, encoding="rgba8")

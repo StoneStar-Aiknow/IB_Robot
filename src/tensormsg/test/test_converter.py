@@ -210,6 +210,7 @@ def test_nv12_limited_and_full_ranges_use_expected_black_white_levels():
     [
         (lambda: hwc_uint8_to_nv12(np.zeros((3, 4, 3), dtype=np.uint8)), "even dimensions"),
         (lambda: hwc_uint8_to_nv12(np.zeros((2, 4, 3), dtype=np.uint8), stride=3), "smaller than width"),
+        (lambda: hwc_uint8_to_nv12(np.zeros((2, 4, 3), dtype=np.uint8), stride=1.5), "positive integer"),
         (lambda: nv12_to_hwc_uint8(bytes(8), width=4, height=2), "expected at least"),
         (lambda: nv12_to_hwc_uint8(bytes(12), width=4, height=2, color_space="bt601"), "bt709"),
         (lambda: nv12_to_hwc_uint8(bytes(12), width=4, height=2, color_range="unknown"), "color_range"),
@@ -218,6 +219,33 @@ def test_nv12_limited_and_full_ranges_use_expected_black_white_levels():
 def test_nv12_conversion_rejects_invalid_surfaces(operation, match):
     with pytest.raises(ValueError, match=match):
         operation()
+
+
+def test_nv12_conversion_matches_float_reference_within_one_lsb():
+    rng = np.random.default_rng(123)
+    image = rng.integers(0, 256, size=(4, 6, 3), dtype=np.uint8)
+    for encoding in ("rgb8", "bgr8"):
+        for color_range in ("limited", "full"):
+            source = image if encoding == "rgb8" else image[..., ::-1]
+            red = source[..., 0].astype(np.float32)
+            green = source[..., 1].astype(np.float32)
+            blue = source[..., 2].astype(np.float32)
+            if color_range == "limited":
+                y_plane = 16.0 + 0.182586 * red + 0.614231 * green + 0.062007 * blue
+                u_plane = 128.0 - 0.100644 * red - 0.338572 * green + 0.439216 * blue
+                v_plane = 128.0 + 0.439216 * red - 0.398942 * green - 0.040274 * blue
+            else:
+                y_plane = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                u_plane = 128.0 - 0.114572 * red - 0.385428 * green + 0.5 * blue
+                v_plane = 128.0 + 0.5 * red - 0.454153 * green - 0.045847 * blue
+            u_subsampled = u_plane.reshape(2, 2, 3, 2).mean(axis=(1, 3))
+            v_subsampled = v_plane.reshape(2, 2, 3, 2).mean(axis=(1, 3))
+            reference = np.zeros((6, 6), dtype=np.uint8)
+            reference[:4] = np.clip(np.rint(y_plane), 0, 255).astype(np.uint8)
+            reference[4:, ::2] = np.clip(np.rint(u_subsampled), 0, 255).astype(np.uint8)
+            reference[4:, 1::2] = np.clip(np.rint(v_subsampled), 0, 255).astype(np.uint8)
+            actual = hwc_uint8_to_nv12(image, encoding=encoding, color_range=color_range)
+            assert np.max(np.abs(actual.astype(np.int16) - reference.astype(np.int16))) <= 1
 
 
 def test_nv12_decode_resize_and_canonical_dds_path_remain_consistent():

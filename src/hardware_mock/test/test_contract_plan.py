@@ -169,6 +169,31 @@ def test_image_source_override_applied():
     assert top.image.color_rgb == (255, 0, 0)
 
 
+def test_image_source_uses_contract_encoding():
+    robot = _base_robot()
+    robot["contract"]["observations"][0]["image"]["encoding"] = "rgb8"
+    plan = build_plan(robot)
+    top = next(o for o in plan.observations if o.topic == "/camera/top/image_raw")
+    assert top.image.encoding == "rgb8"
+
+
+def test_image_source_resolves_driver_pixel_format_to_rgb8():
+    robot = _base_robot()
+    robot["contract"]["observations"][0]["image"]["encoding"] = "mjpeg2rgb"
+    plan = build_plan(robot)
+    top = next(o for o in plan.observations if o.topic == "/camera/top/image_raw")
+    # usb_cam 0.8.1 publishes RGB8 for its mjpeg2rgb conversion; the mock must
+    # mirror the real driver instead of silently republishing as bgr8.
+    assert top.image.encoding == "rgb8"
+
+
+def test_image_source_rejects_unknown_encoding():
+    robot = _base_robot()
+    robot["contract"]["observations"][0]["image"]["encoding"] = "yuyv"
+    with pytest.raises(ValueError, match="unknown image encoding"):
+        build_plan(robot)
+
+
 def test_build_plan_accepts_joint_current():
     robot = _base_robot()
     robot["contract"]["observations"].append(

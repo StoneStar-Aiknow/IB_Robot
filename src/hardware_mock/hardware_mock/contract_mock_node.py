@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np  # noqa: F401  # cv_bridge runtime dependency
 import rclpy
 from cv_bridge import CvBridge
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -28,7 +30,6 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from ibrobot_msgs.msg import JointCurrent
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -41,6 +42,7 @@ from hardware_mock.contract_plan import (
 from hardware_mock.image_sources import make_generator
 from hardware_mock.joint_model import JointModel
 from hardware_mock.type_registry import resolve_msg_class
+from ibrobot_msgs.msg import JointCurrent
 
 
 def _qos_from_dict(d: dict) -> QoSProfile:
@@ -89,6 +91,10 @@ class ContractMockNode(Node):
         self._image_timers: list = []
         self._joint_state_timer = None
         self._action_subs: list = []
+        # Joint callbacks (timers + action subscribers) share one group so the
+        # unsynchronized JointModel stays serialized under the multi-threaded
+        # executor; image timers each get their own group instead.
+        self._joint_group = MutuallyExclusiveCallbackGroup()
 
         self._setup_publishers()
         self._setup_subscribers()
@@ -105,10 +111,15 @@ class ContractMockNode(Node):
             if obs.kind == "image":
                 gen = make_generator(obs.image)
                 self._image_publishers.append((obs, pub, gen))
+                # Per-camera callback group: a slow synthetic frame on one
+                # camera must not stall the other cameras' timers.  Under the
+                # single-threaded executor the top camera's 30 Hz timer could
+                # starve the wrist camera down to ~26 Hz on a loaded board.
                 self._image_timers.append(
                     self.create_timer(
                         period,
                         lambda o=obs, p=pub, g=gen: self._publish_image(o, p, g),
+                        callback_group=MutuallyExclusiveCallbackGroup(),
                     )
                 )
             elif obs.kind == "joint_state":
@@ -116,12 +127,16 @@ class ContractMockNode(Node):
                 # One shared timer per joint_state observation is fine: usually
                 # there is only one such topic in the contract.
                 self._joint_state_timer = self.create_timer(
-                    period, lambda o=obs, p=pub: self._publish_joint_state(o, p)
+                    period,
+                    lambda o=obs, p=pub: self._publish_joint_state(o, p),
+                    callback_group=self._joint_group,
                 )
             elif obs.kind == "joint_current":
                 self._joint_current_publishers.append((obs, pub))
                 self.create_timer(
-                    period, lambda o=obs, p=pub: self._publish_joint_current(o, p)
+                    period,
+                    lambda o=obs, p=pub: self._publish_joint_current(o, p),
+                    callback_group=self._joint_group,
                 )
 
     def _setup_subscribers(self) -> None:
@@ -133,6 +148,7 @@ class ContractMockNode(Node):
                 act.topic,
                 lambda msg, a=act: self._on_action(a, msg),
                 qos,
+                callback_group=self._joint_group,
             )
             self._action_subs.append(sub)
 
@@ -151,7 +167,8 @@ class ContractMockNode(Node):
 
     def _publish_image(self, obs: ObservationSpec, pub, gen) -> None:
         frame = gen()
-        msg: Image = self._bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+        assert obs.image is not None
+        msg: Image = self._bridge.cv2_to_imgmsg(frame, encoding=obs.image.encoding)
         stamp = self.get_clock().now().to_msg()
         msg.header.stamp = stamp
         msg.header.frame_id = obs.frame_id
@@ -200,8 +217,12 @@ class ContractMockNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = ContractMockNode()
+    # Multi-threaded so per-camera image timers in their own callback groups
+    # publish concurrently instead of competing for one dispatch loop.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

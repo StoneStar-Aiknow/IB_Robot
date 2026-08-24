@@ -18,6 +18,7 @@ from hardware_mock.type_registry import (
     ensure_publish_supported,
     ensure_subscribe_supported,
 )
+from robot_config.contract_utils import resolve_image_encoding
 
 # ----- runtime spec dataclasses ----------------------------------------------
 
@@ -186,7 +187,8 @@ def build_plan(robot: dict[str, Any]) -> MockPlan:
             if rate_hz <= 0:
                 raise ValueError(f"peripheral '{periph_name}' fps must be > 0")
             _validate_image_rate(key, rate_hz, align, skip_rate_check)
-            img_spec = resolve_spec(periph_name, width, height, image_overrides)
+            image_encoding = resolve_image_encoding(str((obs.get("image") or {}).get("encoding", "bgr8")))
+            img_spec = resolve_spec(periph_name, width, height, image_overrides, encoding=image_encoding)
             obs_specs.append(
                 ObservationSpec(
                     key=key,

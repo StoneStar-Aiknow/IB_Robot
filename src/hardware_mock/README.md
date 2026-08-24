@@ -121,6 +121,11 @@ hardware_mock:
       color: '#3399ff'             # solid 专用，#RRGGBB
 ```
 
+Image topics use the observation contract's `image.encoding` resolved through
+`robot_config.contract_utils.resolve_image_encoding`: `rgb8`/`bgr8` pass through,
+driver pixel formats map to what the real driver publishes (`mjpeg2rgb` → `rgb8`,
+matching usb_cam 0.8.1), and unknown encodings fail at launch with `ValueError`.
+
 ### 3.4 启动期硬校验规则
 
 `build_plan()` 会在启动时直接抛 `ValueError` 的几种情况：

@@ -24,6 +24,7 @@ class ImageSourceSpec:
     kind: str  # 'checkerboard' | 'solid' | 'gradient'
     tile: int = 40
     color_rgb: tuple = (128, 128, 128)
+    encoding: str = "bgr8"
 
 
 def _parse_hex_color(text: str) -> tuple:
@@ -45,6 +46,8 @@ def resolve_spec(
     width: int,
     height: int,
     overrides: dict[str, dict] | None,
+    *,
+    encoding: str = "bgr8",
 ) -> ImageSourceSpec:
     """Resolve final image-source spec from optional YAML overrides.
 
@@ -63,31 +66,43 @@ def resolve_spec(
     tile = int(cfg.get("tile", 40))
     if tile <= 0:
         raise ValueError(f"hardware_mock.image_sources.{camera_name}.tile must be > 0")
+    normalized_encoding = encoding.lower()
+    if normalized_encoding not in {"bgr8", "rgb8"}:
+        raise ValueError(f"hardware_mock image encoding must be 'bgr8' or 'rgb8', got {encoding!r}")
     color = _parse_hex_color(cfg["color"]) if "color" in cfg else (128, 128, 128)
-    return ImageSourceSpec(width=width, height=height, kind=kind, tile=tile, color_rgb=color)
+    return ImageSourceSpec(
+        width=width,
+        height=height,
+        encoding=normalized_encoding,
+        kind=kind,
+        tile=tile,
+        color_rgb=color,
+    )
 
 
 def make_generator(spec: ImageSourceSpec) -> ImageGenerator:
-    """Build a zero-arg generator returning an HxWx3 uint8 BGR frame.
+    """Build a zero-arg generator returning an HxWx3 uint8 color frame.
 
     The image is computed once and reused; mocking does not require novelty
     and avoids needless CPU at 30/60 Hz.
     """
     if spec.kind == "solid":
         frame = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
-        # cv_bridge expects bgr8 when we pass 'bgr8' encoding.
         r, g, b = spec.color_rgb
-        frame[..., 0] = b
+        first, third = (r, b) if spec.encoding == "rgb8" else (b, r)
+        frame[..., 0] = first
         frame[..., 1] = g
-        frame[..., 2] = r
+        frame[..., 2] = third
     elif spec.kind == "gradient":
         x = np.linspace(0, 255, spec.width, dtype=np.uint8)
         y = np.linspace(0, 255, spec.height, dtype=np.uint8)
         gx, gy = np.meshgrid(x, y)
         frame = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
-        frame[..., 0] = gx  # B
+        blue = gx
+        red = (gx // 2 + gy // 2).astype(np.uint8)
+        frame[..., 0] = red if spec.encoding == "rgb8" else blue
         frame[..., 1] = gy  # G
-        frame[..., 2] = (gx // 2 + gy // 2).astype(np.uint8)  # R
+        frame[..., 2] = blue if spec.encoding == "rgb8" else red
     else:  # checkerboard
         tile = spec.tile
         yy, xx = np.indices((spec.height, spec.width))
