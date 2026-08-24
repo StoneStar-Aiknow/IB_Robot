@@ -165,6 +165,42 @@ def test_receiver_validates_stream_identity_and_bounds_packet_queue():
     receiver.close()
 
 
+def test_sender_reset_suppresses_on_sent_of_retired_access_units():
+    """reset() drops queued access units and rotates the session epoch so an
+    access unit already dequeued by a send in flight cannot fire on_sent
+    afterwards: the late callback would re-populate bookkeeping that a
+    session rollover just cleared."""
+    callbacks: list[EncodedPacket] = []
+    datagram_sender = _MemoryDatagramSender([])
+    sender = H264RtpSender(
+        stream_id="top",
+        endpoint=_ENDPOINT,
+        ssrc=_SSRC,
+        queue_capacity=4,
+        datagram_sender=datagram_sender,
+        on_sent=callbacks.append,
+    )
+    sender.enqueue(_encoded(1, b"\x41first"))
+    sender.enqueue(_encoded(2, b"\x41second"))
+
+    epoch_before = sender._epoch
+    sender.reset()
+
+    # The rollover cleared the queue and advanced the epoch.
+    assert sender._epoch == epoch_before + 1
+    assert sender.status.metrics.queued_frames == 0
+
+    # Nothing is left to send, and no retired access unit fires on_sent.
+    assert not sender.send_pending()
+    assert callbacks == []
+
+    # A fresh access unit of the new session flows normally.
+    sender.enqueue(_encoded(3, b"\x41third"))
+    assert sender.send_pending()
+    assert [packet.rtp_timestamp for packet in callbacks] == [3]
+    sender.close()
+
+
 def test_software_rtp_interoperability_preserves_count_timestamps_and_quality():
     encoder = _encoder(gop_frames=2)
     datagram_sender = _MemoryDatagramSender([])

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -30,16 +32,42 @@ from inference_service.video_codec import (
     VideoFrame,
 )
 from inference_service.video_rtp import H264Depacketizer, RtpPacket
-from tensormsg.converter import hwc_uint8_to_nv12, nv12_to_hwc_uint8
+from tensormsg.converter import nv12_to_hwc_uint8
 
 _BACKEND = "ascend"
 _PRIVATE_FFMPEG_PATHS = (
+    "/usr/bin/ffmpeg-ascend",
+    "/usr/local/bin/ffmpeg-ascend",
+    "/usr/local/ffmpeg-ascend-611/bin/ffmpeg",
     "/home/HwHiAiUser/ffmpeg-ascend-cann83/install/bin/ffmpeg",
     "/usr/local/Ascend/ffmpeg/bin/ffmpeg",
     "/usr/local/Ascend/ascend-toolkit/latest/tools/ffmpeg/bin/ffmpeg",
     "/opt/ascend/ffmpeg/bin/ffmpeg",
 )
 _STDERR_TAIL_BYTES = 8192
+_ASCEND_WRAPPER_NAMES = {"ffmpeg-ascend"}
+# Binaries that live in an RPM-installed ffmpeg-ascend runtime tree. The RPM
+# wrapper and its payload binary belong to the same installation unit, so both
+# get the default environment isolation; a payload path probed as "available"
+# but launched unisolated hangs on the first frame on the real board.
+_RPM_ASCEND_RUNTIME_PATHS = {
+    Path("/usr/bin/ffmpeg-ascend"),
+    Path("/usr/local/bin/ffmpeg-ascend"),
+}
+_RPM_ASCEND_PAYLOAD_PATTERN = re.compile(r"^ffmpeg-ascend-[\d.]+/bin/ffmpeg$")
+# CANN installation-path variables that the RPM wrapper is known to leak into
+# the child environment. Device-visibility and selection policy variables
+# (ASCEND_RT_VISIBLE_DEVICES, ASCEND_DEVICE_ID, ...) are runtime resource
+# configuration, not installation paths, and must be preserved.
+_ASCEND_INSTALL_PATH_ENV = {
+    "ASCEND_TOOLKIT_HOME",
+    "ASCEND_HOME_PATH",
+    "ASCEND_AICPU_PATH",
+    "ASCEND_OPP_PATH",
+    "ASCEND_NNRT_HOME",
+    "ASCEND_NNAE_HOME",
+    "TOOLCHAIN_HOME",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,17 +101,47 @@ def resolve_ascend_ffmpeg(environ: Mapping[str, str] | None = None) -> str | Non
     return None
 
 
+def _is_rpm_ascend_runtime(ffmpeg_path: str | Path) -> bool:
+    """Whether *ffmpeg_path* belongs to an RPM-installed ffmpeg-ascend tree.
+
+    Covers the distro wrapper links and the versioned payload binaries they
+    wrap (``/usr/local/ffmpeg-ascend-611/bin/ffmpeg`` and friends). Only these
+    get the default environment isolation: a wrapper script re-derives its own
+    installation paths, and inherited CANN install-path variables from an
+    unrelated toolkit are known to break it.
+    """
+    path = Path(ffmpeg_path).expanduser()
+    if path in _RPM_ASCEND_RUNTIME_PATHS:
+        return True
+    try:
+        relative = path.resolve().relative_to(Path("/usr/local"))
+    except (ValueError, OSError):
+        return False
+    return _RPM_ASCEND_PAYLOAD_PATTERN.match(str(relative)) is not None
+
+
 def build_ascend_child_environment(
     ffmpeg_path: str,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build process-local library search paths without mutating this process."""
     child = dict(os.environ if environ is None else environ)
-    if child.get("IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV", "").strip() == "1":
-        for name in tuple(child):
-            if name.startswith("ASCEND_") or name == "TOOLCHAIN_HOME":
-                child.pop(name)
+    wrapper_path = Path(ffmpeg_path).expanduser()
+    is_standard_wrapper = wrapper_path.name in _ASCEND_WRAPPER_NAMES and wrapper_path.parent in {
+        Path("/usr/bin"),
+        Path("/usr/local/bin"),
+    }
+    # The wrapper and the payload binary it dispatches to belong to the same
+    # RPM installation, so both default to the isolated environment; probing
+    # the payload without isolation was shown to hang on the first frame.
+    is_rpm_runtime = is_standard_wrapper or _is_rpm_ascend_runtime(wrapper_path)
+    isolate = child.get("IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV", "").strip()
+    if isolate == "1" or (is_rpm_runtime and isolate != "0"):
+        for name in _ASCEND_INSTALL_PATH_ENV:
+            child.pop(name, None)
     configured_prefix = child.get("IBROBOT_ASCEND_FFMPEG_PREFIX", "").strip()
+    if is_standard_wrapper and not configured_prefix:
+        return child
     prefix = Path(configured_prefix).expanduser() if configured_prefix else Path(ffmpeg_path).resolve().parent.parent
     library_candidates = (
         prefix / "lib",
@@ -222,6 +280,63 @@ class _StderrTail:
             return
 
 
+class _StdinWriter:
+    """Persistent FFmpeg stdin writer enforcing per-write timeouts.
+
+    Spawning a fresh thread per frame (the previous design) cost ~60 thread
+    create/join cycles per second for dual 30fps streams and churned the GIL
+    on the 3-core edge board.  One daemon thread now serves writes strictly
+    in order; each :meth:`write` still blocks its caller until completion or
+    timeout, preserving the backpressure that bounds the caller's queue.
+    """
+
+    _STOP = object()
+    _TIMEOUT = object()
+
+    def __init__(self, stdin: Any, timeout_s: float) -> None:
+        self._stdin = stdin
+        self._timeout_s = timeout_s
+        self._requests: queue.Queue = queue.Queue()
+        self._results: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="ascend-ffmpeg-stdin", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            payload = self._requests.get()
+            if payload is self._STOP:
+                return
+            try:
+                written = self._stdin.write(payload)
+                if written is not None and written != len(payload):
+                    raise OSError(f"short FFmpeg stdin write: {written}/{len(payload)}")
+                flush = getattr(self._stdin, "flush", None)
+                if flush is not None:
+                    flush()
+                self._results.put(None)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                self._results.put(exc)
+                return
+
+    def write(self, payload: bytes) -> object:
+        """Block until *payload* is written; None, an exception, or _TIMEOUT."""
+        self._requests.put(payload)
+        try:
+            return self._results.get(timeout=self._timeout_s)
+        except queue.Empty:
+            return self._TIMEOUT
+
+    def stop(self, timeout_s: float) -> None:
+        # Closing stdin first unblocks a write stuck in the pipe so the join
+        # below can actually complete; posting _STOP alone never interrupts
+        # an in-flight write, which left the writer thread and the FFmpeg
+        # process alive after a timeout on the real board.
+        with suppress(OSError, ValueError, AttributeError):
+            self._stdin.close()
+        self._requests.put(self._STOP)
+        self._thread.join(max(0.0, timeout_s))
+
+
 class _FixedFrameReader:
     def __init__(self, pipe: Any, frame_bytes: int) -> None:
         self._pipe = pipe
@@ -308,6 +423,7 @@ class _AscendProcessCodec:
         self._environ = environ
         self._process: Any = None
         self._stderr: _StderrTail | None = None
+        self._stdin_writer: _StdinWriter | None = None
         self._state = CodecLifecycleState.CREATED
         self._metrics = CodecMetrics()
 
@@ -338,6 +454,8 @@ class _AscendProcessCodec:
             raise VideoCodecError("process_start_failed", "FFmpeg pipes were not created", backend=_BACKEND)
         self._process = process
         self._stderr = _StderrTail(process.stderr)
+        if stdin is subprocess.PIPE:
+            self._stdin_writer = _StdinWriter(process.stdin, self._io_timeout_s)
         self._state = CodecLifecycleState.RUNNING
         return process
 
@@ -345,26 +463,20 @@ class _AscendProcessCodec:
         self._require_running()
         if self._process.poll() is not None:
             self._fail("process_exited", "FFmpeg exited before accepting input")
-        failure: list[Exception] = []
-
-        def write() -> None:
-            try:
-                written = self._process.stdin.write(payload)
-                if written is not None and written != len(payload):
-                    raise OSError(f"short FFmpeg stdin write: {written}/{len(payload)}")
-                flush = getattr(self._process.stdin, "flush", None)
-                if flush is not None:
-                    flush()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                failure.append(exc)
-
-        writer = threading.Thread(target=write, name="ascend-ffmpeg-stdin", daemon=True)
-        writer.start()
-        writer.join(self._io_timeout_s)
-        if writer.is_alive():
+        writer = self._stdin_writer
+        if writer is None:
+            self._fail("process_exited", "FFmpeg stdin is not writable")
+        result = writer.write(payload)
+        if result is _StdinWriter._TIMEOUT:
+            # The write is stuck and the writer thread stays blocked in the
+            # pipe; close stdin now so the blocked write fails, the writer
+            # thread exits, and reset()/close() can reap the process instead
+            # of leaving both alive after the timeout.
+            with suppress(OSError, ValueError, AttributeError):
+                self._process.stdin.close()
             self._fail("process_write_timeout", "timed out writing to FFmpeg stdin")
-        if failure:
-            self._fail("process_write_failed", str(failure[0]), cause=failure[0])
+        if isinstance(result, BaseException):
+            self._fail("process_write_failed", str(result), cause=result)
 
     def _fail(self, code: str, message: str, *, recoverable: bool = True, cause: Exception | None = None) -> None:
         self._state = CodecLifecycleState.FAILED
@@ -395,6 +507,10 @@ class _AscendProcessCodec:
         if process is None:
             return
         deadline = time.monotonic() + timeout_s
+        if self._stdin_writer is not None:
+            # Stop the writer first so it does not race with stdin.close().
+            self._stdin_writer.stop(max(0.0, deadline - time.monotonic()))
+            self._stdin_writer = None
         with suppress(AttributeError, OSError, ValueError):
             process.stdin.close()
         try:
@@ -455,10 +571,13 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         self._channel_id = int(channel_id)
         self._io_timeout_s = float(io_timeout_s)
         self._drain_timeout_s = float(drain_timeout_s)
+        self._skip_next_drain_wait = False
         self._socket_factory = socket_factory
         self._socket: Any = None
         self._depacketizer = H264Depacketizer()
         self._timestamps: deque[int] = deque()
+        self._last_rtp_timestamp: int | None = None
+        self._lost_packets = 0
         self._start()
 
     def _start(self) -> None:
@@ -475,13 +594,20 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "nv12",
+            self._input_pixel_format,
             "-video_size",
             f"{self._width}x{self._height}",
             "-framerate",
             str(self._fps),
             "-i",
             "pipe:0",
+            # FFmpeg's NEON-optimized swscale converts rgb24/bgr24 to the
+            # limited-range BT.709 NV12 that h264_ascend requires. Doing the
+            # conversion here keeps the ~15-20ms/frame numpy cost out of the
+            # GIL-constrained Python process, which matters on the 3-core
+            # edge board.
+            "-vf",
+            "scale=out_color_matrix=bt709:out_range=tv,format=nv12",
             "-an",
             "-c:v",
             "h264_ascend",
@@ -508,10 +634,26 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         try:
             self._socket = udp_socket
             self._spawn(command, stdout=subprocess.DEVNULL)
+            self._grow_stdin_pipe_buffer()
         except Exception:
             udp_socket.close()
             self._socket = None
             raise
+
+    def _grow_stdin_pipe_buffer(self) -> None:
+        """Raise the FFmpeg stdin pipe buffer to several whole frames.
+
+        The default 64KB pipe holds only a fraction of one 640x480 rgb24
+        frame, so every write blocks until FFmpeg drains it and ties the
+        caller's cadence to the encoder's per-frame latency. A multi-frame
+        buffer lets writes complete immediately while FFmpeg consumes at
+        its own pace. Non-fatal when the kernel caps the request.
+        """
+        set_pipe_size = getattr(fcntl, "F_SETPIPE_SZ", None)
+        if set_pipe_size is None or self._process is None or self._process.stdin is None:
+            return
+        with suppress(OSError, ValueError):
+            fcntl.fcntl(self._process.stdin.fileno(), set_pipe_size, 4 * 1024 * 1024)
 
     def encode(self, frame: VideoFrame) -> list[EncodedPacket]:
         self._require_running()
@@ -525,12 +667,10 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         if array.shape != (self._height, self._width, 3) or array.dtype != np.uint8:
             raise VideoCodecError("invalid_frame", "expected a uint8 HWC color frame", backend=_BACKEND)
         try:
-            nv12 = hwc_uint8_to_nv12(
-                array,
-                encoding="rgb8" if self._input_pixel_format == "rgb24" else "bgr8",
-                color_range="limited",
-            )
-            self._write(nv12.tobytes())
+            # The raw rgb24/bgr24 frame goes straight to FFmpeg; its swscale
+            # filter graph performs the BT.709 limited-range NV12 conversion
+            # (see _start) off the Python GIL.
+            self._write(array.tobytes())
             self._timestamps.append(frame.capture_timestamp_ns)
             packets = self._drain_access_units(self._drain_timeout_s)
         except VideoCodecError:
@@ -550,38 +690,114 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
 
         The Ascend DVPP hardware encoder has an internal pipeline delay:
         output for frame N typically arrives only after frame N+1 has been
-        submitted.  This method uses a short non-blocking drain so that the
-        caller can continue feeding frames without deadlocking.  When no
-        output is ready (e.g. the very first frame), an empty list is
-        returned and the delayed output surfaces on the next call.
+        submitted. Wait up to *timeout_s* for the first complete access unit,
+        then collect only datagrams that are already queued. When no output is
+        ready (e.g. the very first frame), an empty list is returned and the
+        delayed output surfaces on the next call.
+
+        Waiting the full window on every fruitless call would cap the encode
+        cadence at 1/timeout_s (20fps for the default 50ms), below the 30fps
+        target on the CPU-starved edge board.  After one empty drain,
+        subsequent calls return immediately until output actually flows
+        again, mirroring the decoder's ``_skip_next_output_wait``.
         """
         packets: list[EncodedPacket] = []
-        deadline = time.monotonic() + timeout_s
+        wait_s = 0.0 if self._skip_next_drain_wait else timeout_s
+        self._skip_next_drain_wait = False
+        deadline = time.monotonic() + wait_s
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            self._socket.settimeout(remaining)
+            # Once one access unit arrived, or when no wait is allowed, only
+            # collect datagrams that are already queued.  A skipped wait still
+            # polls the socket buffer once so queued output is not starved.
+            self._socket.settimeout(0.0 if packets or remaining <= 0 else remaining)
             try:
                 datagram = self._socket.recvfrom(65535)[0]
-                access_unit, _lost = self._depacketizer.push(RtpPacket.from_bytes(datagram))
-            except TimeoutError:
+                access_unit, lost = self._depacketizer.push(RtpPacket.from_bytes(datagram))
+                self._lost_packets += lost
+            except (TimeoutError, BlockingIOError):
                 break
             except (OSError, ValueError) as exc:
                 self._fail("invalid_rtp", str(exc), cause=exc)
-            if access_unit is not None:
-                if not self._timestamps:
-                    self._fail("timestamp_underflow", "encoded output has no input timestamp")
-                capture_timestamp_ns = self._timestamps.popleft()
-                packets.append(
-                    EncodedPacket(
-                        access_unit.payload,
-                        access_unit.timestamp,
-                        capture_timestamp_ns,
-                        keyframe=access_unit.keyframe,
-                    )
+            if access_unit is None:
+                # A datagram gap damages an access unit that is then discarded
+                # by the depacketizer and never surfaces as output.  Its input
+                # timestamp is retired by _retire_lost_timestamps once the next
+                # surviving access unit reports the frame gap.
+                continue
+            if not self._timestamps:
+                self._fail("timestamp_underflow", "encoded output has no input timestamp")
+            if self._last_rtp_timestamp is None and self._lost_packets:
+                # Output was lost before the first surviving access unit, so
+                # the number of missing outputs is unknowable and pairing the
+                # FIFO against the encoded output cannot be proven.  Fail
+                # closed so the caller resets the encoder instead of pairing
+                # the second frame's payload with the first frame's timestamp.
+                self._fail(
+                    "timestamp_misaligned",
+                    "packet loss before the first encoded output broke the timestamp FIFO",
                 )
+            self._retire_lost_timestamps(access_unit.timestamp)
+            capture_timestamp_ns = self._timestamps.popleft()
+            packets.append(
+                EncodedPacket(
+                    access_unit.payload,
+                    access_unit.timestamp,
+                    capture_timestamp_ns,
+                    keyframe=access_unit.keyframe,
+                )
+            )
+        self._skip_next_drain_wait = not packets
         return packets
+
+    def _retire_lost_timestamps(self, rtp_timestamp: int) -> None:
+        """Drop input timestamps whose encoded output was lost to packet loss.
+
+        FFmpeg stamps output access units with frame-rate spaced RTP
+        timestamps, so the gap between consecutive surviving units tells how
+        many input frames went missing in between (a damaged access unit
+        produces no output at all).  Retiring those timestamps here keeps the
+        FIFO aligned with the encoded output instead of shifting every later
+        frame by one.
+
+        The delta is computed modulo 2**32: RTP timestamps wrap roughly every
+        13h15m at the 90kHz clock, and a plain subtraction at the wrap
+        boundary yields a huge negative number that never retires anything
+        and permanently misaligns the FIFO. Deltas at or above half the
+        module space indicate out-of-order or corrupt input and fail closed.
+        """
+        if self._last_rtp_timestamp is None:
+            self._last_rtp_timestamp = rtp_timestamp
+            return
+        delta = (rtp_timestamp - self._last_rtp_timestamp) & 0xFFFFFFFF
+        if delta >= 0x80000000:
+            self._fail(
+                "timestamp_misaligned",
+                f"encoded output RTP timestamp moved backwards ({delta:#x} delta)",
+            )
+        self._last_rtp_timestamp = rtp_timestamp
+        frame_gap = round(delta * self._fps / 90000)
+        for _ in range(max(0, frame_gap - 1)):
+            if self._timestamps:
+                self._timestamps.popleft()
+
+    def discard_pending_output(self) -> None:
+        """Drop access units still in flight through the DVPP pipeline.
+
+        The hardware encoder has a pipeline delay, so access units of the
+        retired session can surface as the first output after a session
+        rollover. Draining whatever is already queued and clearing the
+        timestamp FIFO re-pairs the next output with the next input without
+        respawning the FFmpeg process.
+        """
+        self._require_running()
+        with suppress(VideoCodecError, OSError, ValueError):
+            self._drain_access_units(0.0)
+        self._timestamps.clear()
+        self._last_rtp_timestamp = None
+        self._lost_packets = 0
+        self._skip_next_drain_wait = False
+        self._depacketizer.reset()
 
     def reset(self) -> None:
         self._require_not_closed()
@@ -591,6 +807,9 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         if self._socket is not None:
             self._socket.close()
         self._timestamps.clear()
+        self._last_rtp_timestamp = None
+        self._lost_packets = 0
+        self._skip_next_drain_wait = False
         self._depacketizer.reset()
         self._state = CodecLifecycleState.CREATED
         self._start()
@@ -636,6 +855,7 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
         self._channel_id = int(channel_id)
         self._io_timeout_s = float(io_timeout_s)
         self._output_wait_s = min(self._io_timeout_s, 0.5 / frame_rate_hz)
+        self._skip_next_output_wait = False
         self._socket_factory = socket_factory
         self._socket: Any = None
         self._output_pipe: _DatagramPipe | None = None
@@ -711,9 +931,18 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             assert self._reader is not None
             frames = self._reader.drain()
             if not frames:
-                first_frame = self._reader.get(self._output_wait_s)
+                # The DVPP decoder pipelines output, so most calls find nothing
+                # queued and the frame surfaces with a later access unit
+                # anyway.  Waiting the full window on every empty call only
+                # added latency, so after one fruitless wait subsequent calls
+                # return immediately until output actually flows again.
+                wait_s = 0.0 if self._skip_next_output_wait else self._output_wait_s
+                first_frame = self._reader.get(wait_s)
                 if first_frame is not None:
                     frames = [first_frame, *self._reader.drain()]
+                    self._skip_next_output_wait = False
+                else:
+                    self._skip_next_output_wait = True
         except VideoCodecError:
             raise
         except Exception as exc:
@@ -763,6 +992,7 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             self._socket = None
         self._input_endpoint = None
         self._frame_metadata.clear()
+        self._skip_next_output_wait = False
         self._state = CodecLifecycleState.CREATED
         self._start()
 
@@ -804,5 +1034,11 @@ def _validate_common(
         raise ValueError("Ascend H.264 supports limited color range only")
     if device_id < 0 or channel_id < 0:
         raise ValueError("device_id and channel_id cannot be negative")
+    # Ascend DVPP VENC channels are a per-device hardware resource with a
+    # 0..127 range (the encoder uses 1..N for dense allocation).  device_id 0
+    # is the only scope the manager currently passes; multi-device support
+    # would require a resource allocation contract, not a code change here.
+    if channel_id > 127:
+        raise ValueError(f"Ascend DVPP channel_id must be 0..127; got {channel_id}")
     if io_timeout_s <= 0:
         raise ValueError("io_timeout_s must be positive")
