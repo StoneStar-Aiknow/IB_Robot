@@ -1,0 +1,60 @@
+schema_version: 1
+
+baseline:
+  real:
+    profile: nav2_params_dwb.yaml
+    sha256: 3627e9f18b9a1ea6fbb3df8c25b86ed414374f2c44fc5dedef37815ac0fc5191
+  simulation:
+    profile: nav2_sim_params_dwb.yaml
+    sha256: c15682c21098a4ce27f55f82cbc9c91d2e7dc14bcd40502fde717ead6dbb312a
+
+execution:
+  repetitions: 5
+  initial_pose: {x: 0.0, y: 0.0, yaw: 0.0}
+  fixed_map: config/maps/nav_test_map.yaml
+  resource_profile: same-host-no-unrelated-workload
+  sustained_oscillation:
+    direction_changes: 6
+    window_seconds: 5.0
+
+scenarios:
+  - id: straight
+    goal: {x: 1.0, y: 0.0, yaw: 0.0}
+    obstacle_layout: clear
+  - id: lateral
+    goal: {x: 0.0, y: 0.75, yaw: 0.0}
+    obstacle_layout: clear
+  - id: reverse
+    goal: {x: -0.75, y: 0.0, yaw: 0.0}
+    obstacle_layout: clear
+  - id: rotate_translate
+    goal: {x: 0.75, y: 0.5, yaw: 1.5708}
+    obstacle_layout: clear
+  - id: narrow_clearance
+    goal: {x: 1.0, y: 0.0, yaw: 0.0}
+    obstacle_layout: narrow-corridor
+  - id: blocked
+    goal: {x: 1.0, y: 0.0, yaw: 0.0}
+    obstacle_layout: fully-blocked
+    expected_result: safe-failure
+  - id: stop_restart
+    goal: {x: 1.0, y: 0.5, yaw: 0.0}
+    obstacle_layout: clear
+    repetitions: 10
+
+metrics:
+  - goal_result
+  - duration_seconds
+  - minimum_clearance_meters
+  - collision_count
+  - sustained_oscillation_count
+  - command_limit_violation_count
+  - controller_computation_ms
+  - missed_cycle_warning_count
+
+promotion_gate:
+  success_rate_delta_min: 0.0
+  additional_collisions_max: 0
+  additional_sustained_oscillations_max: 0
+  command_limit_violations_max: 0
+  controller_computation_p95_ms_max_exclusive: 50.0

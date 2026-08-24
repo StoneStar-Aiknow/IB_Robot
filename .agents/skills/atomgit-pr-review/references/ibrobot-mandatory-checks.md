@@ -63,6 +63,7 @@
 
 - 如果 PR 修改了 ROS 包的 `package.xml` 依赖声明（尤其是新增/删除/调整 `exec_depend`、`build_depend`、`depend`、`test_depend` 等），或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml` 等），则 **PR 描述中的 Verification 不再是可选项，而是必填项**。
 - ROS 包内的 `setup.py` 普通改动（例如 console entry point、Python package metadata 或 Python-only `install_requires` 调整）不单独触发双平台 `setup.sh + build.sh` Verification 门禁；只有同一 PR 还修改了 `package.xml` 依赖声明或全局 setup/build 流程文件时才触发。
+- 如果标题以标准 `[WIP]` 前缀开头，表示作者仍在初步提交阶段，暂缓本节的双平台 Docker 证据检查。WIP 不豁免其他 review、DCO、AI 披露或 CI；标题移除 `[WIP]` 后，本节门禁立即恢复。
 - 该 Verification 必须体现**真实执行过的验证**，并明确写出：
   - **Scenario**：在哪类干净环境中验证
   - **Method**：如何执行 setup 和 build
@@ -70,28 +71,32 @@
 - 对此类 PR，review 过程中应检查 **PR 描述中的 Verification 是否由开发者提供**，且必须同时覆盖：
   - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
   - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
-- PR 描述必须且只能包含一个标准字段 `**Verified commit:** \`<40位 SHA>\``。该 SHA 表示上述两个平台实际验证的同一个 commit。
-- 必须将该字段与提取上下文中的 `.pr.head_sha` 比对。`pr_review.py` 会自动生成：
-  - `docker_verification_commit_missing`：字段缺失、不是完整 40 位 SHA，或出现多个不同 SHA。
-  - `docker_verification_commit_mismatch`：验证 SHA 与 PR 当前最新 commit 不一致。
-- 两种情况都是阻塞性问题。尤其是作者在验证后又 push 新 commit 时，不得接受旧结果；必须要求作者在最新 `head_sha` 上重跑 Ubuntu 与 openEuler，并同步 PR 描述。
+- PR 描述必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段。
+- 必须将该字段与 PR 最新 head commit 的 tree SHA 比对。`pr_review.py` 会自动生成：
+  - `docker_verification_missing`：块缺失或字段不完整。
+  - `docker_verification_mismatch`：inputs 指纹不匹配当前输入，或 full 模式下 tested tree 不匹配当前 head tree。
+- 两种情况都是阻塞性问题。作者 push 后只有源码 tree 改变才要求重跑 Ubuntu 与 openEuler；只改 commit message、作者或 trailer 而 tree 不变时，已有验证仍有效。
 - **review 默认只检查 PR 描述中由开发者声明的验证结果，禁止自动执行双平台 Docker 验证。**
 - "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
-- 如果 PR 描述缺少任一平台验证说明，只给出命令但没有结果，验证没有覆盖 setup/build 两个阶段，或验证 commit 与最新 `head_sha` 不一致，都应视为**阻塞性 review 问题**，要求开发者补充或重跑。
+- 如果 PR 描述缺少任一平台验证说明，只给出命令但没有结果，验证没有覆盖 setup/build 两个阶段，或验证 tree 与最新 head tree 不一致，都应视为**阻塞性 review 问题**，要求开发者补充或重跑。
 
 ## 4. openEuler AI 贡献元数据检查（阻塞性）
 
 - 当 PR 声明 AI 参与，或任一 commit 包含 `Co-Authored-By` 时，必须检查 PR 正文是否完整披露：
   Agent 平台及版本、模型名称及版本、Prompt 摘要、人工审查情况、第三方材料来源和许可证情况。
-- 每个 AI-assisted commit 必须包含 `Co-Authored-By: <AI 模型名称及版本>`，且所有值必须与 PR
-  的模型信息完全一致。缺失、占位值或不一致均为阻塞性问题。
+- 每个 AI-assisted commit 必须包含 `Co-Authored-By: <AI 模型名称及版本>`；不同 commit 可以使用不同模型，PR
+  的模型信息必须完整覆盖这些值。缺失、占位值或存在未披露模型均为阻塞性问题。人类共同作者使用
+  `Co-Authored-By: Name <email>`，不参与 AI 模型集合比较。
 - 模型元数据只记录模型名称及版本（如 `gpt-5.6-sol`），不得携带 `xunxing/` 等 provider 前缀。
+- Agent 平台字段必须包含 coding agent 实际版本命令确认的工具名和语义版本。仓库不维护工具白名单，
+  reviewer 也不应在本机重新执行作者的工具；只将 `latest`、`unknown`、缺少版本、手工拼接的危险字符或
+  无法解析的格式视为阻塞性元数据问题。
 - 检查贡献者是否声明已进行人工审查，并关注无法解释或维护的输出、许可证不兼容材料、商业秘密、
   个人信息、敏感数据、私有代码、内部文档和未公开漏洞信息。
 - 元数据完整不代表代码自动合规；仍需按风险检查正确性、安全性、许可证和必要 Verification。
 - 完整规则见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
 
-任一必填披露缺失，或 PR/commit 模型不一致时，应提交 `severity=error` 的阻塞性 review issue。
+任一必填披露缺失，或 commit 使用了 PR 未披露的模型时，应提交 `severity=error` 的阻塞性 review issue。
 
 ## 5. 禁止本地重复执行 pre-commit 已覆盖的检查
 

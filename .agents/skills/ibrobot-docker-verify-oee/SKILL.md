@@ -1,6 +1,6 @@
 ---
 name: ibrobot-docker-verify-oee
-description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setup.sh + build.sh。Use when the user explicitly asks for openEuler/OEE Docker verification, or when author-side PR creation/update workflows trigger the dependency/setup verification gate. Do not use automatically during PR review; review should check developer-provided Verification in the PR description."
+description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setup.sh + build.sh。Use when the user explicitly asks for openEuler/OEE Docker verification, or after an author-side PR gate asks WIP vs review and the user confirms review-ready. Skip author-side [WIP] PRs; do not run automatically during PR review."
 ---
 
 # IB-Robot openEuler Embedded Docker Verification Skill
@@ -17,9 +17,10 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 ## When to Use
 
 - 用户明确要求 "openEuler Docker 验证" / "oee container test" / "实际验证 openEuler setup/build"。
-- 作者侧创建/更新 PR 流程（`atomgit-pr` 或 `ibrobot-git-flow`）触发依赖/setup 验证门禁，需要真实结果写入 PR 描述。
+- 作者侧创建/更新 PR 流程触发依赖/setup 门禁，且用户确认 PR 已准备交给 reviewer 正式检视，需要真实结果写入描述。
 - 当前任务是验证本地对 `scripts/setup/platforms/openeuler-embedded-24.03.sh`、`scripts/setup.sh`、`scripts/setup/lerobot_patches.sh` 或 dnf/rosdep 相关逻辑的修改。
 - 不要仅因为 PR review 触发本 skill。
+- 作者侧门禁调用本 skill 前必须询问 WIP/正式检视阶段；`[WIP]` PR 暂缓两个 Docker skill，直到用户将其转为正式检视。用户单独明确要求实际 Docker 验证时仍正常执行。
 
 ## Review Boundary
 
@@ -28,22 +29,25 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 - review 默认只检查 PR 描述中开发者声明的 openEuler Embedded Verification。如果缺少或不完整，应作为阻塞性 review 问题要求开发者补充。
 - 只有当用户在当前请求中明确要求 agent 实际执行 openEuler / 双平台 Docker setup/build 验证时，才运行本 skill。
 
-## PR 验证的 Commit 绑定
+## PR 验证的 Tree 绑定
 
 作者侧 PR 门禁触发两个 Docker skill 时，两平台必须验证同一个已提交代码树：
 
-1. 启动第一个平台前要求 worktree 干净，并记录完整 40 位
-   `VERIFIED_COMMIT="$(git rev-parse HEAD)"`。
-2. openEuler 与 Ubuntu 都必须验证该 commit。使用 `docker cp` 时也必须先确认没有 tracked 或
-   untracked 源码改动，不能让容器内容超出该 commit。
-3. 本 skill 的结果中写入 `Verified commit: <full SHA>`；PR 工作流会将其写成标准字段
-   `**Verified commit:** \`<full SHA>\``。
-4. 完成后再次检查 `git rev-parse HEAD`。若已产生新 commit，则旧结果立即失效，必须对最新
-   commit 重跑两个平台，禁止复用旧 SHA 更新 PR 描述。
+1. 启动第一个平台前解析目标 commit，并记录完整 40 位
+   `VERIFIED_TREE="$(git rev-parse "${VERIFIED_COMMIT}^{tree}")"`；用户当前 worktree 无需干净。
+2. 在用户 worktree 外生成目标 commit 的独立快照。openEuler 与 Ubuntu 必须验证 tree SHA
+   均等于 `VERIFIED_TREE` 的快照，PR 证据模式不得直接复制 dirty 工作区。
+3. 本 skill 的结果中写入 `Verified tree: <full SHA>`；PR 工作流会将其组装成结构化
+   `## Docker Verification` 块。
+4. 创建或更新 PR 时将该字段与远端 head commit 的 tree 比对。只有 tree 改变才要求重跑；
+   单纯修改 commit message、作者或 trailer 不会让结果失效。
+5. `docker cp` 当前 dirty 工作区仍可用于本地调试，但结果不得写成 PR 验证证据。
 
 ## Prerequisites
 
 - 宿主机已安装 Docker CLI（检查 `command -v docker`）。
+- PR 证据快照要求宿主机安装 Git LFS；流程会执行 `git lfs pull` 和 `git lfs fsck`，避免相同
+  tree SHA 因 LFS smudge 状态不同而复制出不同字节内容。
 - 宿主机已安装 openEuler aarch64 验证所需的 `qemu-user-static`（只检查不自动安装；缺失时提醒用户 `sudo apt install -y qemu-user-static`）。
 - 当前用户有运行容器的权限。
 - **必须检查验证镜像**：本地不存在或创建超过 30 天则重新拉取 `swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:env`。
@@ -91,7 +95,41 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 
 - 禁止手动 `dnf install` / `pip install` / `sed` patch 脚本 / 手动配置 ROS 仓库。
 - 允许修复 chroot 基础设施（DNS、`/var/log`、`git safe.directory`）、通过环境变量传递镜像 URL。
+- 允许修复 `:env` 镜像自带的状态不一致基础包（RPM DB 与磁盘内容版本不符），
+  用 `dnf reinstall -y --nogpgcheck <pkg>` 把磁盘内容重新对齐到 RPM DB 已声明的状态。
+  这属于环境修复，不是"安装新软件"。详见 Base Image Integrity Pre-flight 与
+  [references/discipline.md](references/discipline.md)。
 - 完整的禁止/允许事项清单和论述见 [references/discipline.md](references/discipline.md)。
+
+## Base Image Integrity Pre-flight
+
+> **`:env` 镜像有时会自带状态不一致的基础包。**
+
+`swr.cn-north-4.myhuaweicloud.com/.../openeuler-ibrobot-dev:env` 是预装的
+openEuler Embedded rootfs。当镜像构建过程中基础包升级但 RPM DB 未同步刷新时，
+会出现"RPM 数据库记录版本 X，磁盘实际二进制 / soname 为版本 Y"的不一致状态。
+这种**原始镜像就已损坏**的状态会让 setup.sh 的 dnf 事务在尝试安装新子包（如
+`*-devel`）时失败：RPM 会按数据库记录创建指向"应当存在但磁盘上不存在"的 soname
+符号链接，导致后续编译 / 运行时找不到库。
+
+**典型示例（lz4）：**
+
+- RPM DB 标称：`lz4-1.9.4-2.oe2403`
+- 磁盘实际：`lz4 1.10.0`，`/usr/lib64/liblz4.so.1 -> liblz4.so.1.10.0`
+- `/usr/lib64/liblz4.so.1.9.4` 不存在，`/usr/lib64/liblz4.so` 不存在
+- `rpm -V lz4` 直接报告 `liblz4.so.1` 链接错误与 `liblz4.so.1.9.4` 缺失
+- setup.sh rosdep 解析 PCL/FLANN 依赖链时需安装 `flann-devel` → `lz4-devel`；
+  dnf 事务创建指向不存在的 `liblz4.so.1.9.4` 的 `/usr/lib64/liblz4.so`，导致
+  后续链接错误
+
+**处理策略：** 在 setup.sh 启动**之前**对已知易损坏包用 `rpm -V` 探测，
+若发现不一致就在 chroot 中用 `dnf reinstall -y --nogpgcheck <pkg> <pkg>-devel`
+重装。`reinstall` 不是"安装新软件"，而是把磁盘内容重新对齐到 RPM DB 已声明
+的状态——属于环境修复，不违反 Core Principle。完整流程见 Phase 3.5。
+
+**扩展规则：** lz4 是首个已知示例，不是封闭列表。当 setup.sh 因其他包出现
+"RPM DB 标称版本 vs 磁盘实际版本不一致"失败时，把该包加入 Phase 3.5 的
+易损坏包表，并追加对应的 `rpm -V` 检测与 `dnf reinstall` 修复步骤。
 
 ## Error Classification
 
@@ -117,6 +155,7 @@ corresponding phase section.
 | **1** | Ensure `:env` image is fresh (pull if >30 days old) | Image ready |
 | **2** | Start container, verify aarch64 emulation, fix chroot env (DNS, /var/log, git safe.directory) | Container ready |
 | **3** | Inspect chroot environment (git, python3, dnf, ROS 2) | Environment confirmed |
+| **3.5** | Verify & repair base image integrity (RPM DB vs on-disk binary mismatch) — see [Base Image Integrity Pre-flight](#base-image-integrity-pre-flight) | Base packages consistent |
 | **4** | Prepare workspace — **choose one mode** (docker cp or git clone) | `SOURCE_MODE` |
 | **5** | Run `setup.sh --yes --no-sudo`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
 | **6** | Run `build.sh`, capture log | `/tmp/build.log` |
@@ -124,8 +163,10 @@ corresponding phase section.
 
 ### Phase 4 Source Modes
 
-- **方式 A — docker cp（默认）**: 从宿主机拷入当前项目目录，适合验证本地未提交改动。
-- **方式 B — git clone**: 在容器内 clone 远程分支，适合验证已推送代码。注意 rootfs 中 `which` 不可靠，git 命令用绝对路径 `/usr/bin/git`。
+- **PR 证据 — 独立 commit 快照**：在当前 worktree 外生成目标 commit 的 standalone clone，
+  校验 tree 后 `docker cp`；作者侧 PR 门禁必须使用此模式。
+- **本地调试 — 当前工作区 copy**：可包含未提交改动，但不能作为 PR 证据。
+- **显式远端 clone**：仅在用户指定远端 commit/branch 时使用，并记录实际 commit 与 tree。
 
 ## Variants
 

@@ -26,7 +26,13 @@ def bridge_rig():
 
     from ibrobot_msgs.action import SkillCommand
     from ibrobot_msgs.msg import SkillCapabilityStatus
-    from ibrobot_msgs.srv import GetSkillGatewayStatus, ReloadSkillCatalog, ValidateSkill
+    from ibrobot_msgs.srv import (
+        GetSkillGatewayStatus,
+        GetVisualGameResult,
+        ReloadSkillCatalog,
+        StartVisualGame,
+        ValidateSkill,
+    )
 
     if not rclpy.ok():
         rclpy.init()
@@ -36,10 +42,12 @@ def bridge_rig():
         "reload": f"/{suffix}/reload_catalog",
         "validate": f"/{suffix}/validate_skill",
         "action": f"/{suffix}/execute_skill",
+        "start_game": f"/{suffix}/start_visual_game",
+        "game_result": f"/{suffix}/get_visual_game_result",
     }
     requests = []
     status_control = {"delay_sec": 0.0, "queries": {}}
-    action_control = {"reject": False, "goal_ids": [], "delay_sec": 0.0}
+    action_control = {"reject": False, "goal_ids": [], "goals": [], "delay_sec": 0.0}
     server_node = rclpy.create_node(f"robot_skill_cli_test_server_{suffix}")
 
     def get_status(request, response):
@@ -95,6 +103,30 @@ def bridge_rig():
     server_node.create_service(ReloadSkillCatalog, names["reload"], reload_catalog)
     server_node.create_service(ValidateSkill, names["validate"], validate_skill)
 
+    def start_game(request, response):
+        response.accepted = request.game_name == "sorting_hat" and request.expected_config_digest == "game-digest"
+        response.duplicate = False
+        response.request_id = request.request_id if response.accepted else ""
+        response.config_digest = "game-digest"
+        response.error_code = "" if response.accepted else "GAME_NOT_ENABLED"
+        response.message = "accepted" if response.accepted else "disabled"
+        return response
+
+    def get_game_result(request, response):
+        response.found = request.request_id == "game-test-1"
+        response.terminal = response.found
+        response.success = response.found
+        response.game_name = "sorting_hat" if response.found else ""
+        response.scene_summary = "赫奇帕奇" if response.found else ""
+        response.result_json = '{"scene_summary":"赫奇帕奇"}' if response.found else ""
+        response.config_digest = "game-digest"
+        response.error_code = "" if response.found else "GAME_REQUEST_NOT_FOUND"
+        response.message = "completed" if response.found else "missing"
+        return response
+
+    server_node.create_service(StartVisualGame, names["start_game"], start_game)
+    server_node.create_service(GetVisualGameResult, names["game_result"], get_game_result)
+
     def goal_callback(_goal_request):
         return GoalResponse.REJECT if action_control["reject"] else GoalResponse.ACCEPT
 
@@ -103,6 +135,7 @@ def bridge_rig():
 
     def execute_skill(goal_handle):
         action_control["goal_ids"].append(bytes(goal_handle.goal_id.uuid))
+        action_control["goals"].append(goal_handle.request)
         feedback = SkillCommand.Feedback()
         feedback.state = "executing"
         feedback.detail = "step 1 of 1"
@@ -141,6 +174,8 @@ def bridge_rig():
         reload_service=names["reload"],
         validate_skill_service=names["validate"],
         skill_action=names["action"],
+        start_visual_game_service=names["start_game"],
+        get_visual_game_result_service=names["game_result"],
     )
     assert bridge.start() is True
 
@@ -238,6 +273,134 @@ def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
     assert request.place_name == "home"
     assert request.motion_direction == "forward"
     assert request.motion_distance == pytest.approx(0.03)
+
+
+def test_visual_game_services_preserve_request_and_result_fields(bridge_rig):
+    bridge, _names, _requests, _status_control, _action_control = bridge_rig
+
+    started = bridge.start_visual_game(
+        "sorting_hat",
+        request_id="game-test-1",
+        expected_config_digest="game-digest",
+        timeout_sec=1.0,
+    )
+    result = bridge.get_visual_game_result(started["request_id"], timeout_sec=1.0)
+
+    assert started == {
+        "accepted": True,
+        "duplicate": False,
+        "request_id": "game-test-1",
+        "config_digest": "game-digest",
+        "error_code": "",
+        "message": "accepted",
+    }
+    assert result == {
+        "found": True,
+        "terminal": True,
+        "success": True,
+        "game_name": "sorting_hat",
+        "scene_summary": "赫奇帕奇",
+        "result_json": '{"scene_summary":"赫奇帕奇"}',
+        "config_digest": "game-digest",
+        "error_code": "",
+        "message": "completed",
+    }
+
+
+def test_validate_and_execute_preserve_navigation_fields(bridge_rig):
+    bridge, _names, requests, _status_control, action_control = bridge_rig
+    payload = {
+        "schema_version": 2,
+        "skill_name": "nav_abs_coordinate",
+        "target_name": "",
+        "container_name": "",
+        "place_name": "",
+        "motion_direction": "",
+        "motion_distance": 0.0,
+        "direction": "left",
+        "distance": 1.25,
+        "degree": 90.0,
+        "has_x": True,
+        "x": 0.0,
+        "has_y": True,
+        "y": -2.5,
+        "has_yaw": True,
+        "yaw": 0.0,
+        "timeout_sec": 12.0,
+    }
+
+    assert bridge.validate_skill(payload, timeout_sec=1.0)["allowed"] is True
+    send_future = bridge.send_skill_goal(payload, task_id="nav-task")
+    assert bridge.wait_future(send_future, timeout_sec=1.0) is True
+    result_future = send_future.result().get_result_async()
+    assert bridge.wait_future(result_future, timeout_sec=1.0) is True
+
+    validation = requests[-1]
+    goal = action_control["goals"][-1]
+    for message in (validation, goal):
+        assert message.direction == "left"
+        assert message.distance == pytest.approx(1.25)
+        assert message.degree == pytest.approx(90.0)
+        assert message.has_x is True
+        assert message.x == pytest.approx(0.0)
+        assert message.has_y is True
+        assert message.y == pytest.approx(-2.5)
+        assert message.has_yaw is True
+        assert message.yaw == pytest.approx(0.0)
+
+
+def test_navigation_workflow_step_round_trip_preserves_presence():
+    from ibrobot_msgs.msg import WorkflowStep
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._WorkflowStep = WorkflowStep
+    source = {
+        "schema_version": 2,
+        "skill_name": "nav_abs_coordinate",
+        "direction": "",
+        "distance": 0.0,
+        "degree": 0.0,
+        "x": 0.0,
+        "y": -1.0,
+        "yaw": 0.0,
+    }
+
+    message = bridge._workflow_step_message(source)
+    restored = bridge._workflow_step_dict(message)
+
+    assert restored["schema_version"] == 2
+    assert restored["skill_name"] == "nav_abs_coordinate"
+    assert restored["has_x"] is True and restored["x"] == pytest.approx(0.0)
+    assert restored["has_y"] is True and restored["y"] == pytest.approx(-1.0)
+    assert restored["has_yaw"] is True and restored["yaw"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {
+            "schema_version": 1,
+            "skill_name": "nav_abs_coordinate",
+            "has_x": False,
+            "x": 0.0,
+        },
+        {
+            "schema_version": 2,
+            "skill_name": "open_gripper_skill",
+        },
+    ],
+)
+def test_workflow_step_message_preserves_explicit_version_without_domain_inference(source):
+    from ibrobot_msgs.msg import WorkflowStep
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._WorkflowStep = WorkflowStep
+
+    message = bridge._workflow_step_message(source)
+
+    assert message.schema_version == source["schema_version"]
+    assert message.skill_name == source["skill_name"]
+    assert message.has_x is False
 
 
 def test_unavailable_service_maps_to_server_unavailable(bridge_rig):

@@ -219,7 +219,6 @@ class PickActionClient(Node):
         goal.supervised_direct = True
         goal.mode = PickObject.Goal.MODE_EXECUTE
         goal.release_after_success = bool(args.release_after_success)
-        goal.release_drop_height_m = float(args.release_drop_height_m)
         print(
             f"PICK_ACTION_SEND action={args.action_name} task_id={task_id} target={args.prompt!r} "
             f"timeout_s={timeout_sec:.1f} supervised_direct=true",
@@ -286,7 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ready-timeout-s", type=float, default=30.0)
     parser.add_argument("--goal-response-timeout-s", type=float, default=10.0)
     parser.add_argument("--release-after-success", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--release-drop-height-m", type=float, default=-1.0)
     return parser
 
 

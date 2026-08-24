@@ -15,13 +15,22 @@ LOST = "lost"
 ACTION_READY_STATES = {OBSERVED, MOVED}
 LIFECYCLE_STATES = {FROZEN, OBSERVED, STALE, MISSING, MOVED, LOST}
 _ALLOWED_TRANSITIONS = {
-    FROZEN: {OBSERVED},
+    FROZEN: {OBSERVED, MOVED},
     OBSERVED: {OBSERVED, MOVED, STALE, MISSING},
-    STALE: {OBSERVED, LOST},
-    MISSING: {MOVED, LOST},
-    MOVED: {OBSERVED},
-    LOST: {OBSERVED},
+    STALE: {OBSERVED, MOVED, LOST},
+    MISSING: {OBSERVED, MOVED, LOST},
+    MOVED: {MOVED, OBSERVED, STALE},
+    LOST: {OBSERVED, MOVED},
 }
+
+
+def has_manual_label(track: "SemanticTrack") -> bool:
+    return isinstance(track.attributes.get("manual_label"), dict)
+
+
+def is_manually_actionable(track: "SemanticTrack") -> bool:
+    manual = track.attributes.get("manual_label", {})
+    return isinstance(manual, dict) and bool(manual.get("actionable", False))
 
 
 @dataclass(frozen=True)
@@ -109,13 +118,25 @@ class SemanticTracker:
         position_weight: float = 0.55,
         max_size_ratio: float = 4.0,
         label_switch_confidence_margin: float = 0.05,
+        label_recurrence_count_ratio: float = 3.0,
+        label_high_confidence_override_margin: float = 0.08,
         stale_after_sec: float = 10.0,
+        manual_association_distance_m: float = 0.25,
+        manual_alias_limit: int = 24,
     ):
+        if manual_association_distance_m > association_distance_m:
+            raise ValueError("manual association distance must not exceed the general association distance")
+        if manual_alias_limit < 1:
+            raise ValueError("manual alias limit must be positive")
         self.association_distance_m = association_distance_m
         self.embedding_similarity_threshold = embedding_similarity_threshold
         self.position_weight = position_weight
         self.max_size_ratio = max_size_ratio
         self.label_switch_confidence_margin = label_switch_confidence_margin
+        self.label_recurrence_count_ratio = label_recurrence_count_ratio
+        self.label_high_confidence_override_margin = label_high_confidence_override_margin
+        self.manual_association_distance_m = manual_association_distance_m
+        self.manual_alias_limit = manual_alias_limit
         self.stale_after_ns = int(stale_after_sec * 1e9)
         self.tracks: dict[str, SemanticTrack] = {}
 
@@ -185,7 +206,19 @@ class SemanticTracker:
         match.attributes["label_score_evidence"] = label_score_evidence
         match.attributes["label_max_confidence"] = label_max_confidence
         match.attributes["label_candidate_evidence"] = candidate_evidence
-        if not isinstance(match.attributes.get("label_refinement"), dict):
+        manual_state = match.attributes.get("manual_label")
+        if isinstance(manual_state, dict):
+            aliases = [str(alias).casefold() for alias in manual_state.get("automatic_labels", ()) or ()]
+            legacy = str(manual_state.get("automatic_label", "")).casefold()
+            if legacy and legacy not in aliases:
+                aliases.insert(0, legacy)
+            novel = observation.label.casefold()
+            if novel and novel not in aliases and len(aliases) < self.manual_alias_limit:
+                # Confirmed binding to a human-labeled unique item teaches the
+                # recognizer a new alias, so later frames associate by label.
+                aliases.append(novel)
+            manual_state["automatic_labels"] = aliases
+        if not has_manual_label(match) and not isinstance(match.attributes.get("label_refinement"), dict):
             winner = max(
                 label_evidence,
                 key=lambda label: (
@@ -203,6 +236,25 @@ class SemanticTracker:
                 < float(label_max_confidence[current_label]) + self.label_switch_confidence_margin
             ):
                 winner = current_label
+            recurring_label = max(
+                label_evidence,
+                key=lambda label: (
+                    int(label_evidence[label]),
+                    float(label_score_evidence.get(label, 0.0)),
+                    float(label_max_confidence.get(label, 0.0)),
+                    label,
+                ),
+            )
+            recurring_count = int(label_evidence[recurring_label])
+            winner_count = int(label_evidence[winner])
+            if (
+                recurring_label != winner
+                and recurring_count >= 3
+                and recurring_count >= self.label_recurrence_count_ratio * winner_count
+                and float(label_max_confidence[winner])
+                < float(label_max_confidence[recurring_label]) + self.label_high_confidence_override_margin
+            ):
+                winner = recurring_label
             match.label = winner
             match.canonical_label = winner
             match.confidence = float(label_score_evidence[winner]) / int(label_evidence[winner])
@@ -263,7 +315,7 @@ class SemanticTracker:
         now_ns = time.time_ns() if now_ns is None else now_ns
         changed = False
         for track in self.tracks.values():
-            if track.state == OBSERVED and now_ns - track.last_seen_ns > self.stale_after_ns:
+            if track.state in {OBSERVED, MOVED} and now_ns - track.last_seen_ns > self.stale_after_ns:
                 self.transition(
                     track.object_id,
                     STALE,
@@ -304,8 +356,12 @@ class SemanticTracker:
         return self.transition(object_id, MISSING, evidence)
 
     def mark_moved(self, object_id: str, position: np.ndarray, evidence: LifecycleEvidence) -> SemanticTrack:
+        previous_state = self.tracks[object_id].state
+        previous_position = self.tracks[object_id].position.copy()
         track = self.transition(object_id, MOVED, evidence)
         track.position = np.asarray(position, dtype=np.float64)
+        if previous_state == MOVED and not np.allclose(previous_position, track.position):
+            track.object_version += 1
         return track
 
     def mark_lost(self, object_id: str, evidence: LifecycleEvidence) -> SemanticTrack:
@@ -321,8 +377,20 @@ class SemanticTracker:
             refinement = track.attributes.get("label_refinement", {})
             if isinstance(refinement, dict) and refinement.get("previous_label"):
                 association_labels.add(str(refinement["previous_label"]).casefold())
+            manual = track.attributes.get("manual_label", {})
+            if isinstance(manual, dict):
+                if manual.get("automatic_label"):
+                    association_labels.add(str(manual["automatic_label"]).casefold())
+                for alias in manual.get("automatic_labels", ()) or ():
+                    association_labels.add(str(alias).casefold())
             distance = float(np.linalg.norm(track.position - observation.position))
             if distance > self.association_distance_m:
+                continue
+            label_matched = observation.label.casefold() in association_labels
+            if has_manual_label(track) and not label_matched and distance > self.manual_association_distance_m:
+                # Unique-item protection: a manual track only accepts an
+                # unmatched-label observation when it is tightly co-located;
+                # farther candidates must wait for a matching label.
                 continue
             track_extent = float(np.linalg.norm(track.size))
             observation_extent = float(np.linalg.norm(observation.size))

@@ -82,6 +82,7 @@ def test_delegated_dispatch_nonce_is_forwarded_to_primitive() -> None:
     executor._run_primitive(object(), 1.0, "task", "move_to_named_pose")
 
     goal = executor._primitive_client.goals[0]
+    assert goal.schema_version == 1
     assert goal.dispatch_binding.dispatch_nonce == "delegated-nonce"
     assert goal.dispatch_binding.expected_registry_generation == 2
     assert goal.timeout_sec == 0.0

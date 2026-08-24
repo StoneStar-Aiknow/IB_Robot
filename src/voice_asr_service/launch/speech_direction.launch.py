@@ -92,6 +92,7 @@ def _load_speech_direction_parameters(
     *,
     profile: str = "ascend_310p",
     profiles_path: str | Path | None = None,
+    parameter_overrides: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """加载基础 YAML、应用平台小覆盖，并相对 models 根解析模型路径。"""
     config_file_path = Path(config_path)
@@ -111,6 +112,8 @@ def _load_speech_direction_parameters(
     params = dict(parameter_config)
     if profiles_path is not None:
         params.update(_load_profile_overrides(profiles_path, profile))
+    if parameter_overrides:
+        params.update(parameter_overrides)
     _validate_profile_combination(profile, params)
     for key in _MODEL_PATH_KEYS:
         value = params.get(key)
@@ -131,11 +134,39 @@ def _launch_setup(context):
     profile = LaunchConfiguration("profile").perform(context)
     profiles_path = LaunchConfiguration("profiles_file").perform(context)
     models_root = Path(LaunchConfiguration("models_root").perform(context)).expanduser()
+    channel_indices = LaunchConfiguration("microphone_channel_indices").perform(context).strip()
+    parameter_overrides: dict[str, object] = {}
+    for launch_name, parameter_name in (
+        ("microphone_device_name_contains", "device_name_contains"),
+        ("microphone_arecord_device", "arecord_device"),
+        ("microphone_sample_rate", "sample_rate"),
+    ):
+        value = LaunchConfiguration(launch_name).perform(context).strip()
+        if value:
+            parameter_overrides[parameter_name] = int(value) if parameter_name == "sample_rate" else value
+    if channel_indices:
+        parsed_channels = yaml.safe_load(channel_indices)
+        if not isinstance(parsed_channels, list):
+            raise ValueError("microphone_channel_indices must be a YAML list")
+        parameter_overrides["channel_indices"] = parsed_channels
+    for launch_name, parameter_name in (
+        ("speech_direction_input_source", "input_source"),
+        ("speech_direction_mount_yaw_deg", "mount_yaw_deg"),
+        ("speech_direction_wav_path", "wav_path"),
+        ("speech_direction_wav_replay_rate", "wav_replay_rate"),
+    ):
+        value = LaunchConfiguration(launch_name).perform(context).strip()
+        if value:
+            if parameter_name in {"mount_yaw_deg", "wav_replay_rate"}:
+                parameter_overrides[parameter_name] = float(value)
+            else:
+                parameter_overrides[parameter_name] = value
     params = _load_speech_direction_parameters(
         config_path,
         models_root,
         profile=profile,
         profiles_path=profiles_path,
+        parameter_overrides=parameter_overrides,
     )
     # 只有 raw ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
     environment = {}
@@ -187,6 +218,14 @@ def generate_launch_description():
                 default_value=str(_workspace_root() / "models"),
                 description="模型根目录；YAML 中相对模型路径以此为基准",
             ),
+            DeclareLaunchArgument("microphone_device_name_contains", default_value=""),
+            DeclareLaunchArgument("microphone_arecord_device", default_value=""),
+            DeclareLaunchArgument("microphone_sample_rate", default_value=""),
+            DeclareLaunchArgument("microphone_channel_indices", default_value=""),
+            DeclareLaunchArgument("speech_direction_input_source", default_value=""),
+            DeclareLaunchArgument("speech_direction_mount_yaw_deg", default_value=""),
+            DeclareLaunchArgument("speech_direction_wav_path", default_value=""),
+            DeclareLaunchArgument("speech_direction_wav_replay_rate", default_value=""),
             OpaqueFunction(function=_launch_setup),
         ]
     )

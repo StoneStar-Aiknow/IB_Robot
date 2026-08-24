@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
 )
+from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import (
     CameraConfig,
     ContractAction,
@@ -25,6 +27,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
+    SpeechDirectionConfig,
     VoiceASRConfig,
     VoiceTTSConfig,
 )
@@ -57,6 +60,16 @@ _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
 _NAV_STAGES = frozenset({"mapping", "navigation"})
+_EXTENDED_NAV_STAGES = frozenset({"grasp", "mapping", "navigation"})
+_HYBRID_NAV_STAGES = frozenset({"grasp", "mapping", "navigation", "hybrid"})
+_ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
+_SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES = {
+    "arecord_device",
+    "channel_indices",
+    "device_name_contains",
+    "sample_rate",
+}
+_SPEECH_DIRECTION_OVERRIDE_NAMES = {"input_source", "mount_yaw_deg", "wav_path", "wav_replay_rate"}
 
 
 def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -77,21 +90,201 @@ def _resolve_nav_stage(robot_config: dict[str, Any], nav_stage: str) -> dict[str
         if nav_stage:
             raise ValueError("nav_stage is only supported by configs that declare nav_stages")
         return robot_config
-    if not isinstance(stage_configs, dict) or set(stage_configs) != _NAV_STAGES:
+    if not isinstance(stage_configs, dict):
         raise ValueError(f"nav_stages must contain exactly {sorted(_NAV_STAGES)}")
+    declared_stages = set(stage_configs)
+    if declared_stages == _NAV_STAGES:
+        supported_stages = _NAV_STAGES
+    elif declared_stages == _EXTENDED_NAV_STAGES:
+        supported_stages = _EXTENDED_NAV_STAGES
+    elif declared_stages == _HYBRID_NAV_STAGES:
+        supported_stages = _HYBRID_NAV_STAGES
+    else:
+        raise ValueError(
+            f"nav_stages must contain exactly {sorted(_NAV_STAGES)}, {sorted(_EXTENDED_NAV_STAGES)}, "
+            f"or {sorted(_HYBRID_NAV_STAGES)}"
+        )
     if any(not isinstance(config, dict) for config in stage_configs.values()):
         raise ValueError("each nav_stages entry must be a mapping")
 
     default_stage = robot_config.get("default_nav_stage", "navigation")
     resolved_stage = nav_stage or default_stage
-    if resolved_stage not in _NAV_STAGES:
-        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(_NAV_STAGES)}")
+    if resolved_stage not in supported_stages:
+        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(supported_stages)}")
 
     base = copy.deepcopy(robot_config)
     del base["nav_stages"]
     resolved = _deep_merge_config(base, stage_configs[resolved_stage])
+    peripheral_names = resolved.pop("peripheral_names", None)
+    if peripheral_names is not None:
+        if (
+            not isinstance(peripheral_names, list)
+            or not peripheral_names
+            or not all(isinstance(name, str) and name for name in peripheral_names)
+        ):
+            raise ValueError("peripheral_names must be a non-empty list of names")
+        configured_peripherals = resolved.get("peripherals", [])
+        if not isinstance(configured_peripherals, list):
+            raise ValueError("robot.peripherals must be a list when peripheral_names is used")
+        by_name = {
+            peripheral.get("name"): peripheral
+            for peripheral in configured_peripherals
+            if isinstance(peripheral, dict) and isinstance(peripheral.get("name"), str)
+        }
+        missing = [name for name in peripheral_names if name not in by_name]
+        if missing:
+            raise ValueError(f"peripheral_names references unknown peripheral(s): {missing}")
+        resolved["peripherals"] = [copy.deepcopy(by_name[name]) for name in peripheral_names]
     resolved["nav_stage"] = resolved_stage
     return resolved
+
+
+def navigation_endpoint_projection(robot_config: dict[str, Any]) -> str | None:
+    """Project the resolved navigation command endpoint into the runtime context."""
+    navigation = robot_config.get("navigation", {})
+    if not isinstance(navigation, dict):
+        return None
+    if navigation.get("enabled") is not True:
+        return None
+    command_server = navigation.get("command_server")
+    if not isinstance(command_server, dict) or command_server.get("enabled") is not True:
+        return None
+    action_name = command_server.get("action_name")
+    return action_name if isinstance(action_name, str) and action_name.strip() else None
+
+
+def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the robot-owned speech-direction launch and microphone contract."""
+
+    errors: list[str] = []
+    config = robot_config.get("speech_direction", {})
+    if not isinstance(config, dict):
+        return ["speech_direction must be a mapping"]
+
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append("speech_direction.enabled must be a boolean")
+        return errors
+    if not enabled:
+        return errors
+
+    for name in ("profile", "microphone", "config_file", "profiles_file", "models_root"):
+        if not isinstance(config.get(name), str) or not config[name].strip():
+            errors.append(f"speech_direction.{name} must be a non-empty string when enabled")
+
+    parameters = config.get("parameters", {})
+    if not isinstance(parameters, dict):
+        errors.append("speech_direction.parameters must be a mapping")
+        parameters = {}
+    unexpected_overrides = set(parameters) - _SPEECH_DIRECTION_OVERRIDE_NAMES
+    if unexpected_overrides:
+        errors.append(f"speech_direction.parameters contains unsupported keys: {sorted(unexpected_overrides)}")
+
+    microphone_name = config.get("microphone")
+    peripherals = robot_config.get("peripherals", [])
+    if not isinstance(peripherals, list):
+        errors.append("robot.peripherals must be a list")
+        return errors
+    matches = [item for item in peripherals if isinstance(item, dict) and item.get("name") == microphone_name]
+    if len(matches) != 1:
+        errors.append(f"speech_direction.microphone must reference exactly one peripheral: {microphone_name!r}")
+        return errors
+
+    microphone = matches[0]
+    if microphone.get("type") != "microphone":
+        errors.append("speech_direction.microphone must reference a peripheral with type=microphone")
+    if not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip():
+        errors.append("speech direction microphone driver must be a non-empty string")
+    microphone_parameters = microphone.get("params", {})
+    if not isinstance(microphone_parameters, dict):
+        errors.append("speech direction microphone params must be a mapping")
+        return errors
+    missing = _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES - set(microphone_parameters)
+    if missing:
+        errors.append(f"speech direction microphone params is missing: {sorted(missing)}")
+        return errors
+
+    for name in ("device_name_contains", "arecord_device"):
+        value = microphone_parameters.get(name)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"speech direction microphone params.{name} must be a non-empty string")
+    sample_rate = microphone_parameters.get("sample_rate")
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+        errors.append("speech direction microphone params.sample_rate must be a positive integer")
+    channel_indices = microphone_parameters.get("channel_indices")
+    if (
+        not isinstance(channel_indices, list)
+        or len(channel_indices) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in channel_indices)
+        or len(set(channel_indices)) != len(channel_indices)
+    ):
+        errors.append("speech direction microphone params.channel_indices must contain 4 unique non-negative integers")
+
+    input_source = parameters.get("input_source", "device")
+    if input_source not in {"device", "wav"}:
+        errors.append("speech_direction.parameters.input_source must be device or wav")
+    mount_yaw_deg = parameters.get("mount_yaw_deg", 0.0)
+    if isinstance(mount_yaw_deg, bool) or not isinstance(mount_yaw_deg, int | float):
+        errors.append("speech_direction.parameters.mount_yaw_deg must be numeric")
+    return errors
+
+
+def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the stage-resolved navigation endpoint ownership contract."""
+    errors: list[str] = []
+    embodied = robot_config.get("embodied", {})
+    execution = embodied.get("execution", {}) if isinstance(embodied, dict) else {}
+    if isinstance(execution, dict) and "navigation_action_name" in execution:
+        errors.append(
+            "embodied.execution.navigation_action_name is retired; configure navigation.command_server.action_name"
+        )
+
+    navigation = robot_config.get("navigation", {})
+    if not isinstance(navigation, dict):
+        return errors
+    command_server_marker = object()
+    command_server = navigation.get("command_server", command_server_marker)
+    nav_stage = robot_config.get("nav_stage")
+    navigation_enabled = navigation.get("enabled", False)
+
+    if command_server is command_server_marker:
+        if nav_stage in {"navigation", "hybrid"} and navigation_enabled is True:
+            errors.append(f"navigation.command_server is required when nav_stage is {nav_stage}")
+        return errors
+    if not isinstance(command_server, dict):
+        errors.append("navigation.command_server must be a mapping")
+        return errors
+
+    enabled = command_server.get("enabled")
+    if not isinstance(enabled, bool):
+        errors.append("navigation.command_server.enabled must be a boolean")
+        enabled = False
+
+    action_name_present = "action_name" in command_server
+    action_name = command_server.get("action_name")
+    if enabled:
+        if not action_name_present:
+            errors.append("navigation.command_server.action_name is required when command_server is enabled")
+        elif not isinstance(action_name, str) or not action_name.strip():
+            errors.append("navigation.command_server.action_name must be a non-empty string")
+        elif not action_name.startswith("/"):
+            errors.append("navigation.command_server.action_name must be an absolute ROS name")
+        elif not _ROS_ABSOLUTE_NAME_PATTERN.fullmatch(action_name):
+            errors.append("navigation.command_server.action_name must be a valid ROS name")
+    elif action_name_present:
+        errors.append("navigation.command_server.action_name must be omitted when command_server is disabled")
+
+    if nav_stage == "mapping":
+        errors.append("navigation.command_server is not allowed in nav_stage mapping")
+    elif nav_stage in {"navigation", "hybrid"}:
+        if navigation_enabled is not True:
+            errors.append(f"navigation.enabled must be true when nav_stage is {nav_stage}")
+        if not enabled:
+            errors.append(f"navigation.command_server.enabled must be true when nav_stage is {nav_stage}")
+    elif enabled and navigation_enabled is not True:
+        errors.append("navigation.command_server.enabled requires navigation.enabled=true")
+
+    return errors
 
 
 def _normalize_digest_value(value: Any) -> Any:
@@ -120,6 +313,57 @@ def _canonical_digest_json(value: Any) -> str:
     )
 
 
+def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
+    """Select the context schema from the resolved navigation endpoint projection."""
+    if robot_config.get("nav_stage") == "hybrid":
+        return 3
+    return 2 if navigation_endpoint_projection(robot_config) is not None else 1
+
+
+def robot_supported_control_modes(robot_config: dict[str, Any]) -> tuple[str, ...]:
+    """Return control modes that a hybrid runtime may select per skill."""
+    if robot_context_schema_version(robot_config) != 3:
+        return ()
+    motion_mode = robot_config.get("motion_mode", {})
+    if not isinstance(motion_mode, dict):
+        return ()
+    modes = (
+        str(motion_mode.get("manipulation_control_mode", "moveit_planning")).strip(),
+        str(motion_mode.get("navigation_control_mode", "base_navigation")).strip(),
+    )
+    return tuple(dict.fromkeys(mode for mode in modes if mode))
+
+
+def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the closed endpoint set for the selected robot context schema."""
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        embodied = {}
+    execution = embodied.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
+    endpoints = {
+        "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
+        "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
+        "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
+        "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
+        "gateway_status_service": embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+        "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
+        "finalize_workflow_service": embodied.get("finalize_workflow_service", "/embodied/finalize_workflow_execution"),
+        "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
+        "arm_trajectory_action": execution.get(
+            "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
+        ),
+        "move_configuration_service": execution.get(
+            "move_configuration_service", "/moveit_gateway/move_to_configuration"
+        ),
+    }
+    navigation_action = navigation_endpoint_projection(robot_config)
+    if navigation_action is not None:
+        endpoints["navigation_action"] = navigation_action
+    return endpoints
+
+
 def robot_config_digest(robot_config: dict[str, Any]) -> str:
     """Return the digest of the closed skill execution context preimage.
 
@@ -143,8 +387,9 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
     teleop_safety = teleoperation.get("safety", {})
     if not isinstance(teleop_safety, dict):
         teleop_safety = {}
+    context_schema_version = robot_context_schema_version(robot_config)
     preimage = {
-        "context_schema_version": 1,
+        "context_schema_version": context_schema_version,
         "robot_name": robot_config.get("name"),
         "named_poses": embodied.get("named_poses", {}) if isinstance(embodied, dict) else {},
         "named_targets": embodied.get("named_targets", {}) if isinstance(embodied, dict) else {},
@@ -158,27 +403,10 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
         "relative_motion_direction_mapping": execution.get("relative_motion_direction_mapping", {}),
         "gripper_open_position": execution.get("gripper_open_position", 1.0),
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
-        "execution_endpoints": {
-            "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
-            "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
-            "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
-            "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
-            "gateway_status_service": embodied.get(
-                "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
-            ),
-            "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
-            "finalize_workflow_service": embodied.get(
-                "finalize_workflow_service", "/embodied/finalize_workflow_execution"
-            ),
-            "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
-            "arm_trajectory_action": execution.get(
-                "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
-            ),
-            "move_configuration_service": execution.get(
-                "move_configuration_service", "/moveit_gateway/move_to_configuration"
-            ),
-        },
+        "execution_endpoints": robot_execution_endpoints(robot_config),
     }
+    if context_schema_version >= 3:
+        preimage["supported_control_modes"] = list(robot_supported_control_modes(robot_config))
     return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
@@ -197,9 +425,15 @@ def _required_string(section: dict[str, Any], key: str, path: str, errors: list[
 
 
 def _active_identity(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
-    _required_string(section, key, path, errors)
+    # An empty value is a valid deployment state: SLAM stacks without a map
+    # identity publisher keep the manifest identity as the local contract and
+    # let runtime readiness (evaluate_slam_readiness) derive flags from
+    # observable signals. Only template placeholders and non-strings fail.
     value = section.get(key)
-    if isinstance(value, str) and value.startswith("REPLACE_WITH_"):
+    if not isinstance(value, str):
+        errors.append(f"{path}.{key} must be a string")
+        return
+    if value.startswith("REPLACE_WITH_"):
         errors.append(f"{path}.{key} must be an active identity")
 
 
@@ -263,6 +497,27 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
     overlap = set(controller_groups["manipulation_controllers"]) & set(controller_groups["navigation_controllers"])
     if overlap:
         errors.append("motion_mode controller groups must be disjoint: " + ", ".join(sorted(overlap)))
+
+    mode_names = {}
+    for key in ("manipulation_control_mode", "navigation_control_mode"):
+        value = config.get(key)
+        if value is None and robot_config.get("nav_stage") != "hybrid":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"motion_mode.{key} must be a non-empty control_modes member")
+            continue
+        mode_names[key] = value.strip()
+        control_modes = robot_config.get("control_modes", {})
+        if not isinstance(control_modes, dict) or value.strip() not in control_modes:
+            errors.append(f"motion_mode.{key} must be a control_modes member")
+    if len(set(mode_names.values())) != len(mode_names):
+        errors.append("motion_mode manipulation and navigation control modes must be distinct")
+    if robot_config.get("nav_stage") == "hybrid":
+        default_mode = str(robot_config.get("default_control_mode", "")).strip()
+        navigation_mode = mode_names.get("navigation_control_mode", "")
+        expected_navigation_enabled = default_mode == navigation_mode
+        if config.get("navigation_enabled_on_startup") is not expected_navigation_enabled:
+            errors.append("hybrid motion_mode.navigation_enabled_on_startup must match default_control_mode")
 
     for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
         _positive_number(config, key, "motion_mode", errors)
@@ -402,6 +657,7 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "ground_max_bottom_clearance_m",
         "ground_max_object_height_m",
         "ground_max_footprint_m",
+        "max_object_extent_m",
         "max_object_distance_m",
     ):
         if key in filtering:
@@ -436,6 +692,38 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     labels_path = "semantic_mapping.labels"
     _unit_interval(labels, "min_confidence", labels_path, errors)
     _positive_integer(labels, "max_candidates_per_mask", labels_path, errors)
+    if "recurrence_count_ratio" in labels:
+        _positive_number(labels, "recurrence_count_ratio", labels_path, errors)
+        recurrence_ratio = labels.get("recurrence_count_ratio")
+        if _is_finite_number(recurrence_ratio) and float(recurrence_ratio) < 1.0:
+            errors.append(f"{labels_path}.recurrence_count_ratio must be >= 1.0")
+    if "high_confidence_override_margin" in labels:
+        _unit_interval(labels, "high_confidence_override_margin", labels_path, errors)
+    allowed_labels = labels.get("allowed_labels", {})
+    if not isinstance(allowed_labels, dict) or any(
+        not isinstance(canonical, str)
+        or not canonical.strip()
+        or not isinstance(aliases, list)
+        or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+        for canonical, aliases in (allowed_labels.items() if isinstance(allowed_labels, dict) else ())
+    ):
+        errors.append(f"{labels_path}.allowed_labels must map non-empty canonical labels to string lists")
+        allowed_labels = {}
+    canonical_labels = {str(label).strip().casefold() for label in allowed_labels}
+    seen_aliases = {}
+    for canonical, aliases in allowed_labels.items():
+        for alias in [canonical, *aliases]:
+            normalized = alias.strip().casefold()
+            previous = seen_aliases.setdefault(normalized, canonical.strip().casefold())
+            if previous != canonical.strip().casefold():
+                errors.append(f"{labels_path}.allowed_labels alias {normalized!r} maps to multiple labels")
+    actionable_labels = labels.get("actionable_labels", [])
+    if not isinstance(actionable_labels, list) or any(
+        not isinstance(label, str) or not label.strip() for label in actionable_labels
+    ):
+        errors.append(f"{labels_path}.actionable_labels must be a list of non-empty strings")
+    elif not {label.strip().casefold() for label in actionable_labels} <= canonical_labels:
+        errors.append(f"{labels_path}.actionable_labels must reference canonical allowed_labels")
     excluded_labels = labels.get("excluded_labels")
     if not isinstance(excluded_labels, list) or any(
         not isinstance(label, str) or not label.strip() for label in excluded_labels
@@ -456,13 +744,24 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     target_watch = sections["target_watch"]
     target_watch_path = "semantic_mapping.target_watch"
     _positive_integer(target_watch, "max_attempts", target_watch_path, errors)
-    for key in ("stand_off_distance_m", "clearance_m"):
+    if not isinstance(target_watch.get("track_state_updates_enabled"), bool):
+        errors.append(f"{target_watch_path}.track_state_updates_enabled must be a boolean")
+    for key in (
+        "stand_off_distance_m",
+        "clearance_m",
+        "track_state_max_age_sec",
+        "track_state_max_covariance_m2",
+        "track_state_confirmation_gap_sec",
+        "track_state_persist_interval_sec",
+    ):
         _positive_number(target_watch, key, target_watch_path, errors)
     for key in (
         "scan_profile",
         "footprint_ready_topic",
         "obstacle_map_ready_topic",
         "reachability_ready_topic",
+        "track_state_topic",
+        "track_state_frame",
     ):
         _required_string(target_watch, key, target_watch_path, errors)
 
@@ -1036,11 +1335,46 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append("embodied.skill_catalog_source_root is required in development and production modes")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
+        errors.extend(_validate_visual_game_services(embodied))
         try:
             resolve_embodied_timeout_policy(embodied)
         except ValueError as exc:
             errors.append(str(exc))
     return errors
+
+
+def _validate_visual_game_services(embodied: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field_name in ("start_visual_game_service", "get_visual_game_result_service"):
+        service_name = embodied.get(field_name)
+        if service_name is not None and (not isinstance(service_name, str) or not service_name.strip()):
+            errors.append(f"embodied.{field_name} must be a non-empty string")
+    start_service = embodied.get("start_visual_game_service", "/embodied/start_visual_game")
+    result_service = embodied.get("get_visual_game_result_service", "/embodied/get_visual_game_result")
+    if start_service == result_service:
+        errors.append("embodied visual game start and result services must be different")
+    event_topic = embodied.get("visual_game_event_topic", "/embodied/visual_game_events")
+    if not isinstance(event_topic, str) or not event_topic.strip():
+        errors.append("embodied.visual_game_event_topic must be a non-empty string")
+    capacity = embodied.get("visual_game_result_capacity", 128)
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+        errors.append("embodied.visual_game_result_capacity must be a positive integer")
+    return errors
+
+
+def _validate_visual_game_policies(robot_config: dict[str, Any]) -> list[str]:
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        return []
+    entry = embodied.get("entry")
+    if entry is not None:
+        return ["embodied.entry is no longer supported; visual games are triggered through robot-skill"]
+    try:
+        games = embodied.get("visual_games", {})
+        normalize_visual_game_policies(games)
+    except ValueError as exc:
+        return [str(exc)]
+    return []
 
 
 def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
@@ -1133,16 +1467,25 @@ def load_robot_config_dict(
         with mount_path.open("r", encoding="utf-8") as stream:
             robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
     _apply_approved_camera_calibration(robot_config)
-    validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors = validate_navigation_endpoint_contract(robot_config)
+    validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
+    visual_game_policy_errors = _validate_visual_game_policies(robot_config)
+    validation_errors.extend(visual_game_policy_errors)
+    if not visual_game_policy_errors:
+        try:
+            get_effective_visual_game_policies(robot_config)
+        except ValueError as exc:
+            validation_errors.append(str(exc))
     try:
         parse_perception_runtime_config(robot_config)
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    validation_errors.extend(validate_speech_direction_config(robot_config))
     try:
         validation_errors.extend(validate_robot_config_observation_transports(robot_config))
     except (TypeError, ValueError) as exc:
@@ -1323,6 +1666,7 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         service_name=data.get("service_name", defaults.service_name),
         playback_service_name=data.get("playback_service_name", defaults.playback_service_name),
         playback_timeout_sec=data.get("playback_timeout_sec", defaults.playback_timeout_sec),
+        synthesis_timeout_sec=data.get("synthesis_timeout_sec", defaults.synthesis_timeout_sec),
         prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
         segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
         segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
@@ -1331,8 +1675,30 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         max_prompt_duration_sec=data.get("max_prompt_duration_sec", defaults.max_prompt_duration_sec),
         max_segments=data.get("max_segments", defaults.max_segments),
         max_response_audio_bytes=data.get("max_response_audio_bytes", defaults.max_response_audio_bytes),
+        tts_timeout_sec=data.get("tts_timeout_sec", defaults.tts_timeout_sec),
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+    )
+
+
+def load_speech_direction_config(data: dict[str, Any]) -> SpeechDirectionConfig:
+    """Load speech-direction launch settings without duplicating DSP defaults."""
+
+    defaults = SpeechDirectionConfig()
+    return SpeechDirectionConfig(
+        enabled=data.get("enabled", defaults.enabled),
+        profile=data.get("profile", defaults.profile),
+        microphone=data.get("microphone", defaults.microphone),
+        config_file=resolve_ros_path(data.get("config_file", defaults.config_file))
+        if data.get("config_file", defaults.config_file)
+        else "",
+        profiles_file=resolve_ros_path(data.get("profiles_file", defaults.profiles_file))
+        if data.get("profiles_file", defaults.profiles_file)
+        else "",
+        models_root=resolve_ros_path(data.get("models_root", defaults.models_root))
+        if data.get("models_root", defaults.models_root)
+        else "",
+        parameters=dict(data.get("parameters", defaults.parameters)),
     )
 
 
@@ -1360,7 +1726,6 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     safety = data.get("safety", {})
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
     perception = data.get("perception", {})
-    entry = data.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
 
     return EmbodiedConfig(
@@ -1378,6 +1743,10 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         skill_catalog_source_mode=data.get("skill_catalog_source_mode", "installed"),
         skill_catalog_source_root=data.get("skill_catalog_source_root", ""),
         skill_catalog_profile=data.get("skill_catalog_profile", ""),
+        start_visual_game_service=data.get("start_visual_game_service", "/embodied/start_visual_game"),
+        get_visual_game_result_service=data.get("get_visual_game_result_service", "/embodied/get_visual_game_result"),
+        visual_game_event_topic=data.get("visual_game_event_topic", "/embodied/visual_game_events"),
+        visual_game_result_capacity=data.get("visual_game_result_capacity", 128),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
         skill_timeout_sec=execution.get("skill_timeout_sec", 120.0),
@@ -1388,7 +1757,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
         relative_motion_direction_mapping=direction_mapping,
         perception=perception,
-        entry=entry,
+        visual_games=data.get("visual_games", {}),
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         skill_templates=data.get("skill_templates", {}),
@@ -1447,6 +1816,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    speech_direction = load_speech_direction_config(robot_data.get("speech_direction", {}))
     voice_tts = load_voice_tts_config(robot_data.get("voice_tts", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
     skill_gateway = SkillGatewayRuntimeConfig(
@@ -1471,6 +1841,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        speech_direction=speech_direction,
         voice_tts=voice_tts,
         embodied=embodied,
         skill_gateway=skill_gateway,
@@ -1548,38 +1919,50 @@ def _validate_vlm_runtime_config(
         errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
 
 
-def validate_visual_games_consistency(
-    entry: dict[str, Any],
-    perception: dict[str, Any],
-    *,
-    entry_mode: str = "hermes",
-) -> list[str]:
+def validate_visual_games_consistency(visual_games: dict[str, Any], perception: dict[str, Any]) -> list[str]:
     """Check the visual-games <-> perception enable consistency rule.
 
-    Any enabled ``embodied.entry.visual_games.<name>`` routes its trigger to
+    Any enabled ``embodied.visual_games.<name>`` routes its request to
     ``perception_service``; if perception is disabled the request lands on a
     topic nobody consumes. This is the single source of truth for that rule,
     shared by both the typed :func:`validate_config` and the raw-dict launch
     entry :func:`validate_embodied_launch_dict`.
     """
     errors: list[str] = []
-    games = entry.get("visual_games", {})
-    if isinstance(games, dict):
-        enabled_games = [
-            name for name, policy in games.items() if isinstance(policy, dict) and policy.get("enabled", False)
-        ]
-        if enabled_games and not perception.get("enabled", False):
-            errors.append(
-                "embodied.entry.visual_games requires "
-                "embodied.perception.enabled: true when any game is enabled "
-                f"({enabled_games})"
-            )
-        if enabled_games and entry_mode == "hermes":
-            errors.append(
-                "embodied.entry.visual_games requires a voice entry mode, which is not supported "
-                f"when any game is enabled ({enabled_games})"
-            )
+    try:
+        normalized_games = normalize_visual_game_policies(visual_games)
+    except ValueError as exc:
+        errors.append(str(exc))
+        return errors
+    enabled_games = [name for name, policy in normalized_games.items() if policy["enabled"]]
+    if enabled_games and not perception.get("enabled", False):
+        errors.append(
+            "embodied.visual_games requires "
+            "embodied.perception.enabled: true when any game is enabled "
+            f"({enabled_games})"
+        )
     return errors
+
+
+def get_effective_visual_game_policies(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Return visual-game policies available from the configured runtime.
+
+    Visual games are not runtime capabilities while the embodied stack is
+    disabled. When it is enabled, reject policies that require a disabled
+    perception path using the same consistency rule as typed and launch-time
+    validation.
+    """
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict) or not embodied.get("enabled", False):
+        return {}
+    visual_games = embodied.get("visual_games", {})
+    perception = embodied.get("perception", {})
+    if not isinstance(perception, dict):
+        perception = {}
+    errors = validate_visual_games_consistency(visual_games, perception)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return copy.deepcopy(visual_games)
 
 
 def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
@@ -1599,13 +1982,15 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
     embodied = config.get("embodied", {})
     if not isinstance(embodied, dict) or not embodied.get("enabled", False):
         return []
-    entry = embodied.get("entry", {}) or {}
     perception = embodied.get("perception", {}) or {}
-    entry_mode = str(embodied.get("entry_mode", "hermes")).lower()
-    errors = []
-    if entry_mode != "hermes":
-        errors.append("embodied.entry_mode must be hermes")
-    errors.extend(validate_visual_games_consistency(entry, perception, entry_mode=entry_mode))
+    errors = _validate_visual_game_policies({"embodied": embodied})
+    # Service/capacity fields are independent of game policies: validate them
+    # even when policies are invalid so launch-time overrides (e.g. colliding
+    # start/result service names) surface in the same pass instead of at runtime.
+    errors.extend(_validate_visual_game_services(embodied))
+    if errors:
+        return errors
+    errors = validate_visual_games_consistency(embodied.get("visual_games", {}), perception)
     return errors
 
 
@@ -1616,6 +2001,41 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+    speech_direction = config.speech_direction
+    errors.extend(
+        validate_speech_direction_config(
+            {
+                "speech_direction": {
+                    "enabled": speech_direction.enabled,
+                    "profile": speech_direction.profile,
+                    "microphone": speech_direction.microphone,
+                    "config_file": speech_direction.config_file,
+                    "profiles_file": speech_direction.profiles_file,
+                    "models_root": speech_direction.models_root,
+                    "parameters": speech_direction.parameters,
+                },
+                "peripherals": [
+                    {
+                        "type": "camera" if isinstance(peripheral, CameraConfig) else peripheral.type,
+                        "name": peripheral.name,
+                        "driver": peripheral.driver,
+                        "params": peripheral.params if isinstance(peripheral, PeripheralConfig) else {},
+                    }
+                    for peripheral in config.peripherals
+                ],
+            }
+        )
+    )
+    typed_embodied = {
+        "visual_games": config.embodied.visual_games or {},
+        "start_visual_game_service": config.embodied.start_visual_game_service,
+        "get_visual_game_result_service": config.embodied.get_visual_game_result_service,
+        "visual_game_event_topic": config.embodied.visual_game_event_topic,
+        "visual_game_result_capacity": config.embodied.visual_game_result_capacity,
+    }
+    visual_game_policy_errors = _validate_visual_game_policies({"embodied": typed_embodied})
+    errors.extend(visual_game_policy_errors)
+    errors.extend(_validate_visual_game_services(typed_embodied))
 
     errors.extend(validate_placement_execution_config(getattr(config, "placement_execution", None)))
 
@@ -1738,6 +2158,8 @@ def validate_config(config: RobotConfig) -> list[str]:
             errors.append("voice_tts.playback_service_name must be an absolute ROS service name")
         if config.voice_tts.playback_timeout_sec <= 0:
             errors.append("voice_tts.playback_timeout_sec must be positive")
+        if config.voice_tts.synthesis_timeout_sec <= 0:
+            errors.append("voice_tts.synthesis_timeout_sec must be positive")
         if not config.voice_tts.prompt_profile:
             errors.append("voice_tts.prompt_profile must be non-empty")
         positive_limits = {
@@ -1747,6 +2169,7 @@ def validate_config(config: RobotConfig) -> list[str]:
             "max_prompt_duration_sec": config.voice_tts.max_prompt_duration_sec,
             "max_segments": config.voice_tts.max_segments,
             "max_response_audio_bytes": config.voice_tts.max_response_audio_bytes,
+            "tts_timeout_sec": config.voice_tts.tts_timeout_sec,
         }
         for name, value in positive_limits.items():
             if value <= 0:
@@ -1859,7 +2282,13 @@ def validate_config(config: RobotConfig) -> list[str]:
                 "perception is enabled",
             )
 
-        errors.extend(validate_visual_games_consistency(config.embodied.entry or {}, perception))
+        if not visual_game_policy_errors:
+            errors.extend(
+                validate_visual_games_consistency(
+                    config.embodied.visual_games or {},
+                    perception,
+                )
+            )
 
         if float(timeout_policy.get("task_budget_sec", 0.0)) <= 0.0:
             errors.append("embodied.timeouts.task_budget_sec must be greater than zero")

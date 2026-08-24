@@ -116,13 +116,123 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 容器镜像应包含：git、python3、dnf、ROS 2 Humble、pip 下载缓存和两个 openEuler ROS repo 配置。
 setup.sh 仍须完整执行，以验证 ROS 检测、workspace venv 安装和项目依赖配置；无需手动干预。
 
+## Phase 3.5 — Verify & Repair Base Image Integrity
+
+> **必须执行。** `:env` 镜像有时会自带状态不一致的基础包：RPM 数据库记录
+> 版本 X，但磁盘上的实际二进制 / soname 是版本 Y。这种"原始镜像就已损坏"
+> 的状态会让 setup.sh 的 dnf 事务失败：当 setup.sh 安装新子包（如 `*-devel`）
+> 时，RPM 会按数据库记录创建指向"应当存在但磁盘上不存在"的 soname 符号链接，
+> 导致运行时找不到库。参见 SKILL.md 的 [Base Image Integrity Pre-flight](../SKILL.md#base-image-integrity-pre-flight)。
+
+**通用处理流程：**
+
+1. 在 chroot 中用 `rpm -V` 探测已知易损坏包的一致性
+2. 若 `rpm -V` 报告缺失或链接错误，对受影响包及 `-devel` 子包执行 `dnf reinstall -y --nogpgcheck`
+3. 重新 `rpm -V` 确认磁盘内容与数据库一致
+
+**已知易损坏包列表（按发现顺序追加，非封闭列表）：**
+
+| 包名 | 子包 | 发现镜像批次 | 现象 |
+|------|------|----------|------|
+| `lz4` | `lz4-devel` | `:env` 镜像（2026-07 前后） | RPM DB 标称 `lz4-1.9.4-2.oe2403`，磁盘实为 `lz4 1.10.0`；`/usr/lib64/liblz4.so.1 -> liblz4.so.1.10.0`；`liblz4.so.1.9.4` 与 `liblz4.so` 不存在；`rpm -V lz4` 报 `liblz4.so.1` 链接错误与 `liblz4.so.1.9.4` 缺失。setup.sh 安装 `flann-devel` → `lz4-devel` 时 dnf 创建指向不存在的 `liblz4.so.1.9.4` 的 `/usr/lib64/liblz4.so`，导致后续链接错误 |
+
+**步骤 1 — 探测已知易损坏包：**
+
+```bash
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  for pkg in lz4 lz4-devel; do
+    if rpm -q \"\$pkg\" >/dev/null 2>&1; then
+      echo \"=== \$pkg ===\"
+      rpm -V \"\$pkg\" || true
+    else
+      echo \"=== \$pkg (not installed) ===\"
+    fi
+  done
+"'
+```
+
+预期输出（损坏时）：包含 `missing /usr/lib64/liblz4.so.1.9.4` 和
+`..?......  /usr/lib64/liblz4.so.1` 之类的行。如果所有包都无输出，说明基础
+层一致，可跳过步骤 2 直接进入 Phase 4。
+
+**步骤 2 — 修复（按需执行，仅对 `rpm -V` 报错的包重装）：**
+
+```bash
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  dnf reinstall -y --nogpgcheck lz4 lz4-devel
+"'
+```
+
+> **为什么是 `reinstall` 而不是 `install` / `upgrade`：** 包已经在 RPM DB 中
+> 声明，问题是磁盘内容与数据库不一致。`reinstall` 强制重新解包 RPM，把磁盘
+> 内容对齐到数据库记录；`install` 看到包已声明会跳过，`upgrade` 会改写 RPM
+> DB 引入新的版本不一致风险。
+
+**步骤 3 — 重新验证一致性：**
+
+```bash
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  rpm -V lz4 lz4-devel && echo OK || echo STILL_BROKEN
+"'
+```
+
+输出 `OK` 才能继续。若仍 `STILL_BROKEN`，按 Fatal 错误上报：基础镜像损坏
+超出本 Phase 修复范围，需要重新拉取 `:env` 镜像（回到 Phase 1）或联系镜像
+维护者。
+
+**何时扩展：** 当 setup.sh 因其他包出现类似"RPM DB 标称版本 vs 磁盘实际版本
+不一致"失败时，把该包加入上表，并在步骤 1 的 `for pkg in ...` 列表与步骤 2
+的 `dnf reinstall` 命令中追加对应包名。lz4 是已知示例，不是封闭列表。
+
 ## Phase 4 — Prepare Workspace
 
-提供两种方式，根据场景选择：
+根据验证目的选择来源。PR 证据必须使用独立 commit 快照；当前工作区 copy 只用于本地调试。
 
-### 方式 A：从宿主机 docker cp（适合本地代码验证）
+### PR 证据：从独立 commit 快照 docker cp
 
-> 用于验证本地未提交的改动。`docker cp` 拷入当前项目目录，可直接验证修改效果。
+> 当前工作区无需 clean。先在宿主机 worktree 外创建 standalone clone，只检出目标 commit，
+> 初始化 submodule 并核对 tree SHA，再把快照复制进 rootfs。
+
+```bash
+set -e
+command -v git-lfs >/dev/null
+
+PROJECT_ROOT=<project_root>
+VERIFICATION_REF=<pushed-branch-or-commit>
+VERIFICATION_REPO=<pushed-repository-url>
+VERIFIED_COMMIT=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFICATION_REF}^{commit}")
+VERIFIED_TREE=$(git -C "${PROJECT_ROOT}" rev-parse "${VERIFIED_COMMIT}^{tree}")
+SNAPSHOT_ROOT=""
+cleanup_snapshot() {
+  if [ -n "${SNAPSHOT_ROOT}" ] && [ -d "${SNAPSHOT_ROOT}" ]; then
+    rm -rf -- "${SNAPSHOT_ROOT}"
+  fi
+}
+trap cleanup_snapshot EXIT INT TERM
+SNAPSHOT_ROOT=$(mktemp -d "/tmp/ibrobot-verify-${VERIFIED_TREE:0:12}.XXXXXX")
+SOURCE_MODE="isolated committed snapshot"
+
+git clone --no-hardlinks --no-checkout "${PROJECT_ROOT}" "${SNAPSHOT_ROOT}"
+git -C "${SNAPSHOT_ROOT}" remote set-url origin "${VERIFICATION_REPO}"
+git -C "${SNAPSHOT_ROOT}" checkout --detach "${VERIFIED_COMMIT}"
+git -C "${SNAPSHOT_ROOT}" submodule update --init --recursive
+git -C "${SNAPSHOT_ROOT}" lfs pull origin
+git -C "${SNAPSHOT_ROOT}" lfs fsck
+test "$(git -C "${SNAPSHOT_ROOT}" rev-parse HEAD^{tree})" = "${VERIFIED_TREE}"
+test -z "$(git -C "${SNAPSHOT_ROOT}" status --porcelain --untracked-files=all)"
+
+docker cp "${SNAPSHOT_ROOT}" verify-oee:/root/openeuler_rootfs/root/IB_Robot
+docker exec verify-oee bash -c \
+  'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
+```
+
+结果同时记录 provenance 用的 `VERIFIED_COMMIT` 和门禁使用的 `VERIFIED_TREE`。保留快照直到
+两个平台都已复制，或让两个平台分别按同一 commit 生成并核对相同 tree 的快照。
+
+### 本地调试：从当前宿主机工作区 docker cp
+
+> 用于验证本地未提交的改动。`docker cp` 拷入当前项目目录，可直接验证修改效果，但该结果
+> 不具备不可变 tree 身份，不能作为 PR Verification。
 
 ```bash
 # 4.1 Copy current workspace into rootfs
@@ -133,10 +243,10 @@ docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 ```
 
-### 方式 B：在容器内 git clone（适合验证远程分支）
+### 显式请求：在容器内 git clone 远程 commit 或 branch
 
-> 用于验证已推送到个人仓库分支的代码。注意 rootfs 中 `which` 不可靠，
-> git 命令请用绝对路径 `/usr/bin/git`。
+> 仅在用户明确指定远端来源时使用。clone 后必须记录实际 HEAD commit 及其 tree，不能只记录
+> 可移动的 branch 名。注意 rootfs 中 `which` 不可靠，git 命令请用绝对路径 `/usr/bin/git`。
 
 ```bash
 # 4.1 Clone the branch inside chroot
@@ -196,12 +306,22 @@ Build complete. Source with: source install/setup.sh
 ```bash
 # Collect all ERROR lines with context
 docker exec verify-oee bash -c \
+  'chroot /root/openeuler_rootfs /bin/bash -c "git -C /root/IB_Robot rev-parse HEAD HEAD^{tree}"'
+docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "grep ERROR /tmp/setup.log || echo \"(none)\""'
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "grep ERROR /tmp/build.log || echo \"(none)\""'
 
 # Clean up
 docker stop verify-oee && docker rm verify-oee
+if [ "${SOURCE_MODE:-}" = "isolated committed snapshot" ]; then
+  rm -rf -- "${SNAPSHOT_ROOT}"
+  SNAPSHOT_ROOT=""
+fi
 ```
 
 > **错误报告要求**：必须逐条列出所有 ERROR 行，并按 Verification Discipline 中的分类标准标注 Fatal / Non-fatal。不能只给 ERROR 行数不给内容。
+
+PR 证据的最终报告必须写出 `Source: isolated committed snapshot`、完整 commit 和完整 tree，
+并将 tree SHA 交给 PR 工作流组装成结构化 `## Docker Verification` 块。当前工作区 copy 的结果必须
+标为 local-only，不得伪装成 tree-bound PR 证据。

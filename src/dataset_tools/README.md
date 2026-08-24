@@ -203,6 +203,50 @@ ros2 run dataset_tools bag_to_lerobot \
 
 将 ROS 2 episodic dataset 根目录转换为 LeRobot v3 数据集格式。
 
+#### RTP 编码视频录制
+
+跨设备 RTP 模式不把 H.264 数据送入 DDS。cloud `recording_node` 在 RTP receiver
+完成 access unit 重组后、解码前直接录制：
+
+```text
+episode_000001/
+├── metadata.yaml
+├── *.mcap                              # DDS action/state
+├── observation.images.top.h264         # H.264 Annex-B
+└── observation.images.top.h264.json    # NDJSON sidecar
+```
+
+sidecar 每行是一个 JSON 对象，包含 `frame_index`、`capture_timestamp_ns`、
+`rtp_timestamp`、`keyframe`、`lost_packets`、`session_generation` 和 `dropped`。
+`dropped: "timestamp_unmapped"` 的条目只有 metadata，没有对应 `.h264` payload。
+转换器因此先过滤所有 `dropped != null` 条目，再将剩余条目按位置与解码帧配对；
+非 dropped 条目数与解码帧数不同会拒绝转换。
+
+RTP 视频仍要求同一 episode 中存在 DDS action/state rosbag。转换器自动检测
+`.h264` 文件，跳过 rosbag 中同 observation key 的图像 topic，并将两种来源按
+`capture_timestamp_ns`/ROS header stamp 对齐到统一 tick grid。输出 MP4 仍走标准
+LeRobot 重编码路径。
+
+启动 cloud 录制端：
+
+```bash
+ros2 launch inference_service cloud_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/unused/when/recording \
+    deployment:=unused \
+    recording:=true
+```
+
+edge 仍以 `record:=true record_mode:=episodic` 启动机器人，但 RTP 配置不会在 edge
+重复启动 `episode_recorder`；episode action server 由 cloud `recording_node` 提供。
+
+跨设备录制前必须使用 NTP/PTP 同步 edge 与 cloud 时钟，并让 action/state observation
+使用 `stamp_src: header`。转换日志中的 `source=Annex-B` 和
+`max_alignment_error=... ms` 可用于诊断：持续增大的误差通常表示时钟漂移；
+`timestamp_unmapped` 表示 RTP timestamp anchor 缺失或过期；配对数量不一致表示裸流
+或 sidecar 不完整。strict 模式会在录制阶段删除此类 episode，tolerant 模式则在
+`meta/info.json` 的 `integrity.frame_gaps` 中保留 episode、observation 和 frame 定位信息。
+
 **基本用法**：
 ```bash
 ros2 run dataset_tools bag_to_lerobot \

@@ -16,6 +16,12 @@ def generate_perception_model_nodes(
     require_semantic_identity: bool = False,
 ) -> list[Node]:
     runtime = parse_perception_runtime_config(robot_config)
+    mapping = robot_config.get("semantic_mapping", {})
+    excluded_ids = (
+        set(mapping.get("perception", {}).get("semantic_roles", {}).values())
+        if mapping.get("query_only", False)
+        else set()
+    )
     return [
         Node(
             package="inference_service",
@@ -38,7 +44,7 @@ def generate_perception_model_nodes(
             ],
         )
         for service in runtime.enabled_services
-        if instance_ids is None or service.instance_id in instance_ids
+        if service.instance_id not in excluded_ids and (instance_ids is None or service.instance_id in instance_ids)
     ]
 
 

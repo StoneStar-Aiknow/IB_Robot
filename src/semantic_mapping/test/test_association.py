@@ -95,6 +95,26 @@ def test_close_one_shot_confidence_does_not_replace_established_label():
     assert track.confidence == pytest.approx(0.891)
 
 
+def test_recurrent_label_corrects_an_early_high_confidence_outlier():
+    tracker = SemanticTracker(association_distance_m=0.5, embedding_similarity_threshold=0.7)
+    track = tracker.update(_observation([0.0, 0.0, 1.0], 1, [1.0, 0.0], label="paper", confidence=0.93))
+    for stamp in range(2, 6):
+        track = tracker.update(_observation([0.0, 0.0, 1.0], stamp, [1.0, 0.0], label="cardboard box", confidence=0.90))
+
+    assert track.label == "cardboard box"
+    assert track.confidence == pytest.approx(0.90)
+
+
+def test_large_confidence_advantage_survives_recurrent_noise():
+    tracker = SemanticTracker(association_distance_m=0.5, embedding_similarity_threshold=0.7)
+    track = tracker.update(_observation([0.0, 0.0, 1.0], 1, [1.0, 0.0], label="banana", confidence=0.996))
+    for stamp in range(2, 8):
+        track = tracker.update(_observation([0.0, 0.0, 1.0], stamp, [1.0, 0.0], label="straw", confidence=0.876))
+
+    assert track.label == "banana"
+    assert track.confidence == pytest.approx(0.996)
+
+
 def test_cloud_refinement_confidence_is_preserved_across_new_observations():
     tracker = SemanticTracker(association_distance_m=0.5, embedding_similarity_threshold=0.7)
     track = tracker.update(_observation([0.0, 0.0, 1.0], 1, [1.0, 0.0], label="food", confidence=0.6))
@@ -194,6 +214,36 @@ def test_track_becomes_inactive_after_stale_timeout():
     assert tracker.mark_stale(2_100_000_001)
     assert not track.active
     assert track.state == STALE
+
+
+def test_moved_track_becomes_stale_after_timeout():
+    tracker = SemanticTracker(stale_after_sec=1.0)
+    track = tracker.update(_observation([0.0, 0.0, 1.0], 1_000_000_000, [1.0, 0.0]))
+    tracker.mark_moved(
+        track.object_id,
+        np.asarray([1.0, 0.0, 1.0]),
+        LifecycleEvidence(identity_confirmed=True, geometry_confirmed=True),
+    )
+
+    assert tracker.mark_stale(2_100_000_001)
+    assert track.state == STALE
+    assert not track.active
+
+
+@pytest.mark.parametrize("initial_state", [FROZEN, LOST])
+def test_confirmed_movement_can_relocate_inactive_track(initial_state):
+    tracker = SemanticTracker()
+    track = tracker.update(_observation([0.0, 0.0, 1.0], 1, [1.0, 0.0]))
+    track.state = initial_state
+
+    tracker.mark_moved(
+        track.object_id,
+        np.asarray([1.0, 0.0, 1.0]),
+        LifecycleEvidence(identity_confirmed=True, geometry_confirmed=True),
+    )
+
+    assert track.state == MOVED
+    assert np.allclose(track.position, [1.0, 0.0, 1.0])
 
 
 def test_frozen_track_requires_identity_and_geometry_to_become_observed():

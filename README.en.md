@@ -600,7 +600,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 ```bash
 robot-skill --config-name so101_single_arm plan-workflow \
   --request-id plan-request-001 --text "打开夹爪" \
-  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
+  --workflow-json '[{"schema_version":1,"skill_name":"open_gripper_skill"}]'
 ```
 
 For further details, see:

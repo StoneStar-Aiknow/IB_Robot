@@ -27,7 +27,6 @@ def _plan() -> CandidatePlan:
     return CandidatePlan(
         approach=(0.194, 0.0, 0.1),
         grasp=(0.194, 0.0, 0.0),
-        lift=(0.194, 0.0, 0.1),
         quaternion=(0.0, 0.0, 0.0, 1.0),
         approach_axis=(0.0, 0.0, -1.0),
         target_contact_ee=(0.0, 0.0, 0.0),

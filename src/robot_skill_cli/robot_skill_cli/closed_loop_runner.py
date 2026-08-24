@@ -46,13 +46,25 @@ _EXIT_MOTION_UNKNOWN = 15
 
 
 def _workflow_step(args: argparse.Namespace, skill: str) -> dict[str, Any]:
+    navigation_requested = any(
+        getattr(args, field_name) is not None for field_name in ("direction", "distance", "degree", "x", "y", "yaw")
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2 if navigation_requested else 1,
         "skill_name": skill,
         "target_name": args.target_name or "",
         "place_name": args.place_name or "",
         "motion_direction": args.motion_direction or "",
         "motion_distance": args.motion_distance or 0.0,
+        "direction": args.direction or "",
+        "distance": args.distance or 0.0,
+        "degree": args.degree or 0.0,
+        "has_x": args.x is not None,
+        "x": args.x or 0.0,
+        "has_y": args.y is not None,
+        "y": args.y or 0.0,
+        "has_yaw": args.yaw is not None,
+        "yaw": args.yaw or 0.0,
         "timeout_sec": args.timeout_sec or 0.0,
     }
 
@@ -86,6 +98,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--place-name", default="")
     parser.add_argument("--motion-direction", default="")
     parser.add_argument("--motion-distance", type=float, default=0.0)
+    parser.add_argument("--direction")
+    parser.add_argument("--distance", type=float)
+    parser.add_argument("--degree", type=float)
+    parser.add_argument("--x", type=float)
+    parser.add_argument("--y", type=float)
+    parser.add_argument("--yaw", type=float)
     parser.add_argument("--timeout-sec", type=float, default=0.0)
     parser.add_argument(
         "--stop-after-sec",

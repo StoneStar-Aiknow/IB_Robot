@@ -20,6 +20,7 @@ mapping 由 cmd_vel bridge 发布 `odom -> base_link`。LiDAR profile 以 `lekiw
 
 - **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
+- **全向局部控制**: 提供 Nav2 MPPI `Omni` 候选 profile，实机门禁通过前默认保留 DWB
 - **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
 - **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 默认保存为 `rtabmap.yaml/rtabmap.pgm`
@@ -94,15 +95,20 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | 你要做什么 | 看哪一节 | 推荐命令入口 |
 |---|---|---|
 | 按现场顺序完成标定、采集、建图和导航 | [现场直接运行流程](#现场直接运行流程) | `robot_config/robot.launch.py` |
-| 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_mapping` / `robot_config:=lekiwi_navi` |
+| 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_realsense_mapping` / `robot_config:=lekiwi_realsense_navigation` |
 | 跑本包测试 | [测试验证](#测试验证) | `colcon test --packages-select robot_navigation` |
 | 验证完整 Gazebo/Nav2 仿真 | [测试验证](#测试验证) | `NAV_TEST_PROFILE=full colcon test --packages-select robot_config ...` |
-| 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
-| 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
-| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_lidar_mapping_rviz.launch.py` / `lekiwi_lidar_navigation_rviz.launch.py` |
+| 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping` |
+| 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop` |
+| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_realsense_*_rviz.launch.py` / `lekiwi_lidar_*_rviz.launch.py` |
 | 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
 `robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
+
+LeKiwi RealSense 导航的 body-frame 速度与加速度包络由 `lekiwi_realsense_navigation.yaml` 的
+`robot.navigation.motion_envelope` 唯一维护。`nav2_params.yaml` 中的 MPPI 和
+velocity smoother 参数是该包络的镜像，FAST-LIO、SLAM 与其他导航消费者不得
+另建权威值。静态测试会同时检查镜像漂移和整个速度盒的轮空间可行性。
 
 ## 现场直接运行流程
 
@@ -130,8 +136,8 @@ source install/setup.sh
 
 | 模式 | 工作流 | 开发板 profile | PC 侧 RViz |
 |---|---|---|---|
-| RealSense | 建图 | `robot_config:=lekiwi_mapping` | `lekiwi_realsense_mapping_rviz.launch.py` |
-| RealSense | 导航 | `robot_config:=lekiwi_navi control_mode:=teleop` | `lekiwi_realsense_navigation_rviz.launch.py` |
+| RealSense | 建图 | `robot_config:=lekiwi_realsense_mapping` | `lekiwi_realsense_mapping_rviz.launch.py` |
+| RealSense | 导航 | `robot_config:=lekiwi_realsense_navigation control_mode:=teleop` | `lekiwi_realsense_navigation_rviz.launch.py` |
 | LiDAR | 建图 | `robot_config:=lekiwi_lidar nav_stage:=mapping` | `lekiwi_lidar_mapping_rviz.launch.py` |
 | LiDAR | 导航 | `robot_config:=lekiwi_lidar nav_stage:=navigation` | `lekiwi_lidar_navigation_rviz.launch.py` |
 
@@ -196,7 +202,7 @@ ros2 run robot_calibration calib_approve \
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-  robot_config:=lekiwi_semantic_mapping
+  robot_config:=lekiwi_semantic_capture
 ```
 
 开发板终端 B 移动底盘完成采集轨迹：
@@ -208,7 +214,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 PC 侧观察低带宽图像、点云和地图预览：
 
 ```bash
-ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+ros2 launch semantic_mapping lekiwi_semantic_capture_rviz.launch.py
 ```
 
 采集完成后，在开发板另一个终端执行保存：
@@ -226,7 +232,7 @@ ros2 run semantic_mapping save_semantic_map
 ```bash
 ros2 launch robot_config robot.launch.py \
   use_sim:=false \
-  robot_config:=lekiwi_mapping
+  robot_config:=lekiwi_realsense_mapping
 ```
 
 开发板终端 B 启动键盘遥控：
@@ -257,7 +263,7 @@ ros2 run robot_navigation save_rtabmap_map
 ```bash
 ros2 launch robot_config robot.launch.py \
   use_sim:=false \
-  robot_config:=lekiwi_navi \
+  robot_config:=lekiwi_realsense_navigation \
   control_mode:=teleop
 ```
 
@@ -385,19 +391,30 @@ LeKiwi 建图和导航支持两类运行方式：
 
 | 入口 YAML | 用途 | 启动命令 |
 |---|---|---|
-| `lekiwi_mapping.yaml` | base-only 建图：底盘 + RealSense + RTAB-Map mapping + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
-| `lekiwi_navi.yaml` | 完整导航：加载静态地图 + Nav2 + RTAB-Map localization + EKF + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
+| `lekiwi_realsense_mapping.yaml` | base-only 建图：底盘 + RealSense + RTAB-Map mapping + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping` |
+| `lekiwi_realsense_navigation.yaml` | 完整导航：加载静态地图 + Nav2 + RTAB-Map localization + EKF + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop` |
 
-建图和导航使用独立配置文件。`lekiwi_mapping` 只负责建图主链；`lekiwi_navi` 消费保存好的地图做定位与导航。
+RealSense 建图和导航使用独立配置文件。`lekiwi_realsense_mapping` 只负责建图主链；`lekiwi_realsense_navigation` 消费保存好的地图做定位与导航。
 
-`lekiwi_navi.yaml` 中导航相关配置形态如下：
+`lekiwi_realsense_navigation.yaml` 中导航相关配置形态如下：
 
 ```yaml
 navigation:
   enabled: true
+  motion_envelope:
+    velocity:
+      vx: {min: -0.13, max: 0.13}
+      vy: {min: -0.11, max: 0.11}
+      wz: {min: -0.44, max: 0.44}
+    acceleration:
+      vx: {min: -0.65, max: 0.65}
+      vy: {min: -0.55, max: 0.55}
+      wz: {min: -2.2, max: 2.2}
   nav2_bringup:
     enabled: true
     map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"
+    # MPPI promotion 前保持 DWB 为实机默认值。
+    params_file: "$(find robot_navigation)/config/nav2_params_dwb.yaml"
   ekf_rtabmap:
     enabled: true
     rtabmap:
@@ -419,14 +436,34 @@ navigation:
     enabled: true
 ```
 
+MPPI 未通过完整门禁时，`lekiwi_realsense_navigation.yaml` 保持选择
+`$(find robot_navigation)/config/nav2_params_dwb.yaml`。验证 MPPI 候选时显式选择
+`nav2_params.yaml`，全部门禁通过后才可将它设为实机默认值。仿真对应
+`nav2_sim_params.yaml` 与 `nav2_sim_params_dwb.yaml`。切换前必须终止当前导航目标并
+重启 Nav2；切换不会改变 `NavigateToPose`、`FollowPath`、costmap 或 `/cmd_vel` 接口。
+
+DWB/MPPI 对照矩阵和 promotion gate 定义在
+`config/nav2/controller_regression.yaml`。采集的 baseline/candidate JSON 均包含 `runs`
+数组后，可执行：
+
+```bash
+ros2 run robot_navigation evaluate_controller_regression \
+  --matrix $(ros2 pkg prefix robot_navigation)/share/robot_navigation/config/nav2/controller_regression.yaml \
+  --baseline /path/to/dwb.json \
+  --candidate /path/to/mppi.json
+```
+
+只有成功率不下降、无新增碰撞或持续振荡、无命令越界且 controller computation
+P95 严格低于 50 ms 时才返回成功。仅有 `/cmd_vel` 到达间隔不能替代 computation trace。
+
 ## 建图流程
 
-建图入口使用 `lekiwi_mapping.yaml`，链路包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。它不会自动启动键盘遥控，需要另一个终端发布 `/cmd_vel`。
+建图入口使用 `lekiwi_realsense_mapping.yaml`，链路包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。它不会自动启动键盘遥控，需要另一个终端发布 `/cmd_vel`。
 
 终端 A 启动建图主链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_mapping
 ```
 
 终端 B 启动键盘遥控：
@@ -435,7 +472,7 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_map
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
 
-`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。常用键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止；`w/x/e/c/q/z` 是速度倍率调整键。
+`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_realsense_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。常用键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止；`w/x/e/c/q/z` 是速度倍率调整键。
 
 终端 C 保存地图：
 
@@ -457,14 +494,14 @@ ros2 run nav2_map_server map_saver_cli -t /rtabmap/map -f ~/.ros/ibrobot/maps/rt
 ~/.ros/ibrobot/maps/rtabmap.db       # RTAB-Map localization 复用
 ```
 
-后续导航默认从 `lekiwi_navi.yaml` 的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载地图。
+后续导航默认从 `lekiwi_realsense_navigation.yaml` 的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载地图。
 
 ## 导航流程
 
 启动导航主链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=teleop
 ```
 
 RViz 启动后，使用 `2D Goal Pose` 或 `Nav2 Goal` 在地图上点击目标。Nav2 会规划全局路径并通过配置的速度链驱动底盘；
@@ -473,7 +510,7 @@ MID-360 navigation 使用 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bri
 如果需要导航评估模式并联动推理链：
 
 ```bash
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=navi
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_realsense_navigation control_mode:=navi
 ```
 
 ## PC 端 RViz 观察
@@ -504,7 +541,7 @@ ros2 launch robot_navigation lekiwi_realsense_mapping_rviz.launch.py
 ros2 launch robot_navigation lekiwi_realsense_navigation_rviz.launch.py
 ```
 
-开发板上已经启动 `lekiwi_mapping` 或 `lekiwi_navi` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
+开发板上已经启动 `lekiwi_realsense_mapping` 或 `lekiwi_realsense_navigation` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
 
 PC 端同样需要先加载 ROS 和工作区环境，具体方式参考 IB Robot 仓主目录下的 README。如果 PC 本地也有同一份工作区，并希望使用工作区里的 launch/config，再 source 该 overlay。两端 `ROS_DOMAIN_ID` 必须一致，例如 `<your_id>`。
 
@@ -596,7 +633,7 @@ ros2 daemon start
 
 ```bash
 # Nav2 子系统入口：map_server + Nav2 navigation_launch.py
-# 通常由 robot_config 根据 lekiwi_navi.yaml 间接包含
+# 通常由 robot_config 根据 lekiwi_realsense_navigation.yaml 间接包含
 ros2 launch robot_navigation nav2_bringup.launch.py
 
 # 指定地图
@@ -747,22 +784,59 @@ LiDAR navigation 阶段提供独立于上层任务框架的单线执行接口：
 
 #### CLI 用法
 
-CLI 的平移参数单位为米，转向参数单位为度：
+CLI 的平移参数单位为米，转向参数单位为度。`--action-name` 现在是必填参数，默认值为
+`/navigation/execute`，必须与 `robot_config.navigation.command_server.action_name` 保持一致：
 
 ```bash
-ros2 run robot_navigation nav_cmd status
-ros2 run robot_navigation nav_cmd forward 0.10
-ros2 run robot_navigation nav_cmd backward 0.10
-ros2 run robot_navigation nav_cmd leftward 0.10
-ros2 run robot_navigation nav_cmd rightward 0.10
-ros2 run robot_navigation nav_cmd turn-left 10
-ros2 run robot_navigation nav_cmd turn-right 10
-ros2 run robot_navigation nav_cmd absolute 1.0 0.5 90
-ros2 run robot_navigation nav_cmd cancel
+ros2 run robot_navigation nav_cmd status --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd forward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd backward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd leftward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd rightward 0.10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd turn-left 10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd turn-right 10 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd absolute 1.0 0.5 90 --action-name /navigation/execute
+ros2 run robot_navigation nav_cmd cancel --action-name /navigation/execute
 ```
 
 `status` 同时检查 `/navigation/execute` 和 Nav2 `/navigate_to_pose` 是否可用；`cancel` 会等待
 当前导航任务结束并确认安全速度输出归零。
+
+##### Action name SSOT
+
+`/navigation/execute` 的 action name 来自 `robot_config.navigation.command_server.action_name`
+配置（SSOT）。`robot_config.loader` 会在加载阶段校验该字段，并将其作为
+`robot_execution_endpoints` 的 `navigation_action_name` 投影进 canonical execution-context
+digest。下游节点（`navigation_command_server`、`nav_cmd`、`skill_library` 的
+`ExecuteNavigation` dispatch）必须从该 SSOT 读取，不允许在节点参数或代码中重新声明该 action name。
+旧字段 `embodied.execution.navigation_action_name` 已退役，loader 检测到该键时直接报错。
+
+##### Costmap readiness 检查
+
+`navigation_command_server` 在向 Nav2 发送 `NavigateToPose` goal 前，会先检查
+`/global_costmap/costmap` 数据是否非空（避免在空 costmap 上规划）。检查以
+`costmap_readiness_timeout` 参数控制，默认 `60.0` 秒：
+
+- 在该超时窗口内一直探测 `/global_costmap/costmap`，直到拿到非空 occupancy grid 才向 Nav2
+  发送 goal；
+- 超时仍未拿到非空 costmap 时，`ExecuteNavigation` 直接以 `NAV2_UNAVAILABLE` 终态返回，
+  不会向 Nav2 发送 goal，也不会取得 root lease；
+- 该检查只覆盖 costmap 数据可用性，不保证定位收敛或 planner/controller 已就绪，调用方仍需
+  自行确认 `map -> base_link` 稳定与 Nav2 lifecycle active。
+
+##### Cancel / cleanup 语义
+
+`/navigation/cancel_current` 与 `ExecuteNavigation` goal 取消遵循同一清理路径：
+cancel 请求会等待 Nav2 取消当前 goal、并等待底盘速度指令稳定到零。若速度未能在
+`cancel_cleanup_timeout_sec` 内收敛到零（典型原因：Collision Monitor 仍在发布非零速度、
+底盘 bridge 仍在执行残余指令、或下游 controller 拒绝取消），action 进入
+`STOP_TIMEOUT` 终态：
+
+- `STOP_TIMEOUT` 是 fail-closed 终态：`ExecuteNavigation.Result.success=false`、
+  `error_code=STOP_TIMEOUT`，调用方**不得**释放 root lease，必须显式 finalization 才能恢复；
+- `INTERNAL_ERROR` 终态同样不释放 root lease，由 coordinator ledger terminal record
+  保留 lease 直到操作员介入或后续 `FinalizeWorkflowExecution` 以匹配终态幂等收敛；
+- 正常 `SUCCEEDED`/`CANCELLED` 终态才会释放 root lease 与 runtime bundle retention。
 
 #### ROS 2 Action API
 

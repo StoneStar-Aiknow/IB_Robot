@@ -67,17 +67,44 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | --- | --- | --- |
 | `robot_config` | `so101_single_arm` | robot_config 中的机器人配置名 |
 | `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
-| `control_mode` | `moveit_planning` | 具身闭环当前要求 MoveIt 兼容控制模式 |
+| `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
+| `nav_stage` | 空 | 配置声明的工作阶段；导航配置支持 `mapping`/`navigation`，移动抓取统一配置还支持 `grasp` |
 | `use_sim` | `false` | 是否启动仿真路径 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |
-| `with_embodied` | `true` | 是否启动具身运行时节点 |
+| `with_embodied` | 空 | 默认启动具身运行时；`nav_stage=mapping` 时默认关闭，可显式覆盖 |
 | `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
 | `authorize_motion` | `false` | 操作员运动授权；唯一运行时授权来源 |
 
 ## 已知限制
 
-- 当前具身闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。
+- 运动技能闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。仅启用视觉游戏时
+  可在其他控制模式启动 Gateway + perception，不启动 safety/skill/planner/executor 等运动节点。
+- 机械臂 profile 要求 MoveIt 兼容控制模式；`lekiwi_lidar` 导航 profile 精确要求 `base_navigation`。
+- 自然语言规则入口只支持观察、回位、夹爪开合、相对移动和夹爪旋转等最小闭环动作。
+- 抓取、放置、目标物操作当前不由规则入口直接生成；应通过后续 VLM/显式技能链路完善。
+- 视觉趣味游戏（分院帽等）的能力开关来自 `embodied.visual_games`；camera/VLM 由
+  `embodied.perception` 管理，生命周期 timeout 由
+  `embodied.timeouts` 管理。
+- Gateway、perception 和 announcer 属于 controller-independent 视觉闭包，启动时不等待
+  ros2_control controller readiness；运动节点与 IK worker 仍在 controller ready 后启动。
+  视觉游戏只允许 Agent 通过 `robot-skill` 调用并列的 `visual_game_gateway_node` start/query 服务。
+  节点接收统一的 visual-game timeout/retention、robot name 和服务名，
+  并向 `embodied.visual_game_event_topic` 发布 accepted/terminal 事件；同时从同一配置计算覆盖 handler、transport、timeout、retention 和 ledger capacity 的 game capability digest。同一时刻只允许一个 pending 游戏，
+  不同 request ID 的并发请求返回 `GAME_BUSY`，终态 ledger 仍按配置保留。
+  启用 `announce: true` 的视觉游戏会在 TTS runtime 配置完整时启动
+  `visual_game_announcer_node`；TTS 未配置时不启动 announcer，运行中的 TTS 或播放服务暂时不可用时
+  最多等待 3 秒再跳过播报，游戏仍可使用 start/query 控制面。
+  播报终态统一经事件、TTS 合成服务和本机播放服务处理；announcer 使用合成返回的 WAV 临时文件调用
+  现有 `/voice_tts/play`，Agent 不再自行播报结果。
+  启用某游戏需置 `embodied.perception.enabled: true` 与该游戏的
+  `enabled: true`；若 launch
+  override（如 `with_perception:=false`）造成不一致，`embodied_pipeline.launch.py` 会在生成节点前 fail-fast
+  拒绝启动，避免生成不一致的运行时节点图。
+- 只要启用任一视觉游戏，Gateway、perception 和 announcer（如需）就会作为同一个
+  controller-independent 视觉闭包在 controller readiness 之前启动；MoveIt 混合拓扑也遵循这一规则。
+  controller readiness 只延迟 safety、Skill Gateway、Agent plan、抓取执行和 IK worker 等运动闭包节点，
+  不会让已经可发现的视觉游戏 start service 因 perception 尚未启动而暂时返回 `PERCEPTION_UNAVAILABLE`。
 - `lekiwi_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
 - 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

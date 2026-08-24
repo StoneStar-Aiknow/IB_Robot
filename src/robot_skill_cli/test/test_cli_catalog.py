@@ -1,17 +1,105 @@
 import argparse
 import builtins
+import copy
 import importlib
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from embodied_common.skill_request import canonical_skill_payload, skill_payload_hash
+from embodied_common.visual_game_contracts import build_visual_game_capability_view
 from robot_config.loader import load_robot_config_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+
+
+def _enabled_game_view() -> dict:
+    return build_visual_game_capability_view(
+        "test_robot",
+        {
+            "sorting_hat": {
+                "enabled": True,
+                "handler": "sorting_hat_v1",
+                "summary": "Choose a Hogwarts house.",
+            }
+        },
+        timeout_sec=130.0,
+        result_retention_sec=300.0,
+        result_capacity=128,
+        start_service="/embodied/start_visual_game",
+        result_service="/embodied/get_visual_game_result",
+    )
+
+
+def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
+    from robot_config import loader
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    root = Path(__file__).resolve().parents[3]
+    config_path = root / "src/robot_config/config/robots/lekiwi_lidar.yaml"
+    mount_path = root / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+    original_resolver = loader.resolve_ros_path
+
+    def resolve_path(value):
+        if value == "$(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml":
+            return str(mount_path)
+        return original_resolver(value)
+
+    monkeypatch.setattr(loader, "resolve_ros_path", resolve_path)
+    navigation = loader.load_robot_config_dict(config_path, nav_stage="navigation")
+
+    snapshot = compile_local_snapshot(navigation, config_path)
+
+    assert snapshot.robot_context.context_schema_version == 2
+    assert snapshot.robot_context.execution_endpoints["navigation_action"] == "/navigation/execute"
+    assert set(snapshot.enabled_skill_names) == {
+        "nav_abs_coordinate",
+        "nav_straight",
+        "nav_turn",
+    }
+
+
+def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    root = Path(__file__).resolve().parents[3]
+    config_path = root / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
+    config = load_robot_config_dict(config_path)
+
+    snapshot = compile_local_snapshot(config, config_path)
+
+    assert snapshot.robot_context.context_schema_version == 3
+    assert snapshot.robot_context.supported_control_modes == ("moveit_planning", "base_navigation")
+    control_modes = {
+        skill_name: snapshot.capability_view[skill_name]["required_control_mode"]
+        for skill_name in snapshot.enabled_skill_names
+    }
+    assert {name for name, mode in control_modes.items() if mode == "base_navigation"} == {
+        "nav_abs_coordinate",
+        "nav_straight",
+        "nav_turn",
+    }
+    assert {name for name, mode in control_modes.items() if mode == "moveit_planning"} >= {
+        "pick_object",
+        "place_in_container",
+        "open_gripper_skill",
+    }
+
+
+def test_non_navigation_profile_keeps_v1_robot_context():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    config = load_robot_config_dict(CONFIG_PATH)
+    snapshot = compile_local_snapshot(config, CONFIG_PATH)
+
+    assert snapshot.robot_context.context_schema_version == 1
+    assert "navigation_action" not in snapshot.robot_context.execution_endpoints
 
 
 def test_catalog_import_does_not_load_rclpy(monkeypatch):
@@ -40,6 +128,72 @@ def test_agent_control_timeout_preserves_larger_configured_value():
 
     context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 40.0}}})()
     assert _plan_rpc_timeout(context) == 40.0
+
+
+@pytest.mark.parametrize(
+    "workflow_step",
+    [
+        {
+            "schema_version": 1,
+            "skill_name": "nav_abs_coordinate",
+            "has_x": False,
+            "x": 0.0,
+        },
+        {
+            "schema_version": 2,
+            "skill_name": "open_gripper_skill",
+        },
+    ],
+)
+def test_plan_workflow_forwards_explicit_step_version_without_domain_inference(workflow_step):
+    from robot_skill_cli.cli import _run_plan_workflow
+
+    context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 2.0}})
+    bridge = Mock()
+    bridge.plan_agent_command.return_value = {"success": True}
+    args = SimpleNamespace(
+        request_id="versioned-workflow",
+        raw_command="submit an explicit workflow",
+        workflow_json=json.dumps([workflow_step]),
+    )
+
+    result = _run_plan_workflow(args, context, bridge)
+
+    assert result == {"success": True}
+    bridge.plan_agent_command.assert_called_once_with(
+        request_id="versioned-workflow",
+        raw_command="submit an explicit workflow",
+        workflow_steps=[workflow_step],
+        timeout_sec=30.0,
+    )
+
+
+def test_plan_workflow_rejects_unversioned_typed_step_instead_of_domain_rewriting():
+    from robot_skill_cli.cli import _CliArgumentError, _run_plan_workflow
+
+    context = SimpleNamespace(
+        view={
+            "timeout_policy": {"rpc_timeout_sec": 2.0},
+            "skills": [
+                {
+                    "name": "nav_abs_coordinate",
+                    "schema_version": 2,
+                    "domain": "navigation",
+                }
+            ],
+        }
+    )
+    bridge = Mock()
+    args = SimpleNamespace(
+        request_id="unversioned-workflow",
+        raw_command="submit an unversioned workflow",
+        workflow_json=json.dumps([{"skill_name": "nav_abs_coordinate", "x": 0.0}]),
+    )
+
+    with pytest.raises(_CliArgumentError, match="schema_version"):
+        _run_plan_workflow(args, context, bridge)
+
+    bridge.plan_agent_command.assert_not_called()
 
 
 def test_load_catalog_uses_exported_config_resolver(monkeypatch):
@@ -84,6 +238,7 @@ def test_list_skills_uses_every_profile_enabled_entry_and_only_public_fields():
         set(skill)
         == {
             "name",
+            "contract_schema_version",
             "summary",
             "domain",
             "moves_robot",
@@ -106,6 +261,268 @@ def test_list_skills_uses_every_profile_enabled_entry_and_only_public_fields():
         assert forbidden not in encoded
 
 
+def test_list_games_exposes_only_enabled_control_plane_metadata():
+    from robot_skill_cli.catalog import list_games
+
+    game_view = _enabled_game_view()
+    data = list_games(game_view)
+
+    assert data == {
+        "robot_name": "test_robot",
+        "config_digest": game_view["config_digest"],
+        "games": [
+            {
+                "name": "sorting_hat",
+                "summary": "Choose a Hogwarts house.",
+                "result_field": "scene_summary",
+            }
+        ],
+    }
+
+
+def test_visual_game_context_does_not_compile_motion_catalog(monkeypatch):
+    from robot_skill_cli import catalog
+
+    def fail_if_compiled(*_args, **_kwargs):
+        raise AssertionError("visual-game commands must not compile the motion Skill catalog")
+
+    monkeypatch.setattr(catalog, "compile_local_snapshot", fail_if_compiled)
+
+    context = catalog.load_visual_game_context(config_path=CONFIG_PATH)
+    runtime_context, transport = catalog.load_visual_game_runtime_context(config_path=CONFIG_PATH)
+
+    assert context.game_view["robot_name"] == "so101_single_arm"
+    assert runtime_context.game_view == context.game_view
+    assert transport.start_visual_game_service == "/embodied/start_visual_game"
+
+
+def test_visual_game_context_hides_games_when_embodied_is_disabled(monkeypatch):
+    from robot_skill_cli import catalog
+    from robot_skill_cli.catalog import list_games
+
+    config = load_robot_config_dict(CONFIG_PATH)
+    config["embodied"]["enabled"] = False
+    config["embodied"]["visual_games"]["sorting_hat"]["enabled"] = True
+    monkeypatch.setattr(catalog, "load_robot_config_dict", lambda _path: copy.deepcopy(config))
+
+    context = catalog.load_visual_game_context(config_path=CONFIG_PATH)
+
+    assert list_games(context.game_view)["games"] == []
+
+
+def test_list_games_rejects_enabled_game_without_perception(tmp_path, capsys):
+    from robot_skill_cli.cli import main
+
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    config["robot"]["embodied"]["enabled"] = True
+    config["robot"]["embodied"]["perception"]["enabled"] = False
+    config["robot"]["embodied"]["visual_games"]["sorting_hat"]["enabled"] = True
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    assert main(["--config-path", str(config_path), "list-games"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_ARGUMENT"
+    assert "embodied.perception.enabled" in result["error"]["message"]
+
+
+def test_start_game_rejects_disabled_embodied_before_starting_ros(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    def fail_if_bridge_created(_transport):
+        raise AssertionError("disabled visual game must fail before ROS bridge creation")
+
+    monkeypatch.setattr(cli, "_create_bridge", fail_if_bridge_created)
+
+    assert (
+        cli.main(
+            [
+                "--config-path",
+                str(CONFIG_PATH),
+                "start-game",
+                "sorting_hat",
+                "--request-id",
+                "disabled-game-test",
+            ]
+        )
+        == 2
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "UNKNOWN_GAME"
+
+
+def test_visual_game_timeouts_do_not_change_motion_catalog_digest():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    original = load_robot_config_dict(CONFIG_PATH)
+    changed = copy.deepcopy(original)
+    changed["embodied"].setdefault("timeouts", {})["visual_game_timeout_sec"] = 142.0
+    changed["embodied"]["timeouts"]["visual_game_result_retention_sec"] = 84.0
+
+    assert (
+        compile_local_snapshot(original, CONFIG_PATH).capability_digest
+        == compile_local_snapshot(changed, CONFIG_PATH).capability_digest
+    )
+
+
+def test_game_catalog_commands_use_game_only_context(monkeypatch, capsys):
+    from robot_skill_cli import catalog
+    from robot_skill_cli.cli import main
+
+    enabled_config = load_robot_config_dict(CONFIG_PATH)
+    enabled_config["embodied"]["enabled"] = True
+    enabled_config["embodied"]["perception"]["enabled"] = True
+    enabled_config["embodied"]["visual_games"]["sorting_hat"]["enabled"] = True
+    monkeypatch.setattr(catalog, "load_robot_config_dict", lambda _path: copy.deepcopy(enabled_config))
+    monkeypatch.setattr(
+        catalog,
+        "compile_local_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("game catalog command compiled motion Skills"),
+    )
+
+    for arguments in (["list-games"], ["describe-game", "sorting_hat"]):
+        assert main(["--config-path", str(CONFIG_PATH), *arguments]) == 0
+        assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+@pytest.mark.parametrize("command", ["start-game", "game-result"])
+def test_game_runtime_commands_use_game_only_context(monkeypatch, capsys, command):
+    from robot_skill_cli import catalog, cli
+
+    enabled_config = load_robot_config_dict(CONFIG_PATH)
+    enabled_config["embodied"]["enabled"] = True
+    enabled_config["embodied"]["perception"]["enabled"] = True
+    enabled_config["embodied"]["visual_games"]["sorting_hat"]["enabled"] = True
+    monkeypatch.setattr(catalog, "load_robot_config_dict", lambda _path: copy.deepcopy(enabled_config))
+    monkeypatch.setattr(
+        catalog,
+        "compile_local_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("game runtime command compiled motion Skills"),
+    )
+    bridge = Mock()
+    bridge.start.return_value = True
+    bridge.start_visual_game.return_value = {
+        "accepted": True,
+        "duplicate": False,
+        "request_id": "game-test-1",
+        "config_digest": catalog.load_visual_game_context(config_path=CONFIG_PATH).game_view["config_digest"],
+        "error_code": "",
+        "message": "accepted",
+    }
+    bridge.get_visual_game_result.return_value = {
+        "found": True,
+        "terminal": False,
+        "success": False,
+        "game_name": "sorting_hat",
+        "scene_summary": "",
+        "result_json": "",
+        "config_digest": bridge.start_visual_game.return_value["config_digest"],
+        "error_code": "",
+        "message": "running",
+    }
+    monkeypatch.setattr(cli, "_create_bridge", lambda _transport: bridge)
+    arguments = (
+        ["start-game", "sorting_hat", "--request-id", "game-test-1"]
+        if command == "start-game"
+        else ["game-result", "--request-id", "game-test-1"]
+    )
+
+    assert cli.main(["--config-path", str(CONFIG_PATH), *arguments]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    bridge.close.assert_called_once_with()
+
+
+def test_start_game_returns_request_id_without_waiting_for_result():
+    from robot_skill_cli.cli import _run_start_game
+
+    context = SimpleNamespace(
+        game_view=_enabled_game_view(),
+        view={"timeout_policy": {"rpc_timeout_sec": 2.0}},
+    )
+    bridge = Mock()
+    bridge.start_visual_game.return_value = {
+        "accepted": True,
+        "duplicate": False,
+        "request_id": "game-test-1",
+        "config_digest": context.game_view["config_digest"],
+        "error_code": "",
+        "message": "visual game request accepted",
+    }
+
+    result = _run_start_game(SimpleNamespace(game="sorting_hat", request_id="game-test-1"), context, bridge)
+
+    assert result["request_id"] == "game-test-1"
+    bridge.start_visual_game.assert_called_once_with(
+        "sorting_hat",
+        request_id="game-test-1",
+        expected_config_digest=context.game_view["config_digest"],
+        timeout_sec=2.0,
+    )
+    assert "scene_summary" not in result
+
+
+def test_game_result_exposes_structured_house_result():
+    from robot_skill_cli.cli import _run_game_result
+
+    context = SimpleNamespace(
+        game_view=_enabled_game_view(),
+        view={"timeout_policy": {"rpc_timeout_sec": 2.0}},
+    )
+    bridge = Mock()
+    bridge.get_visual_game_result.return_value = {
+        "found": True,
+        "terminal": True,
+        "success": True,
+        "game_name": "sorting_hat",
+        "scene_summary": "格兰芬多",
+        "config_digest": context.game_view["config_digest"],
+        "error_code": "",
+        "message": "completed",
+    }
+
+    result = _run_game_result(SimpleNamespace(request_id="game-test-1"), context, bridge)
+
+    assert result["request_id"] == "game-test-1"
+    assert result["scene_summary"] == "格兰芬多"
+    bridge.get_visual_game_result.assert_called_once_with("game-test-1", timeout_sec=2.0)
+
+
+def test_game_result_checks_digest_before_not_found():
+    from robot_skill_cli.cli import _CommandError, _run_game_result
+
+    context = SimpleNamespace(
+        game_view=_enabled_game_view(),
+        view={"timeout_policy": {"rpc_timeout_sec": 2.0}},
+    )
+    bridge = Mock()
+    bridge.get_visual_game_result.return_value = {
+        "found": False,
+        "config_digest": "stale-digest",
+        "error_code": "GAME_REQUEST_NOT_FOUND",
+        "message": "not found",
+    }
+
+    with pytest.raises(_CommandError, match="configuration does not match") as exc_info:
+        _run_game_result(SimpleNamespace(request_id="game-test-1"), context, bridge)
+
+    assert exc_info.value.code == "CONFIG_MISMATCH"
+
+
+def test_describe_game_exposes_result_contract_timeout_and_digest():
+    from robot_skill_cli.catalog import describe_game
+
+    game_view = _enabled_game_view()
+    described = describe_game(game_view, "sorting_hat")
+
+    assert described["required_inputs"] == ["primary_image"]
+    assert described["result_schema"]["field"] == "scene_summary"
+    assert described["timeout_sec"] == 130.0
+    assert described["result_capacity"] == 128
+    assert described["config_digest"] == game_view["config_digest"]
+
+
 def test_catalog_list_and_describe_project_explicit_capability_fields():
     from robot_skill_cli.catalog import describe_skill, list_skills, load_capability_catalog
 
@@ -115,6 +532,7 @@ def test_catalog_list_and_describe_project_explicit_capability_fields():
 
     assert set(listed["skills"][0]) == {
         "name",
+        "contract_schema_version",
         "summary",
         "domain",
         "moves_robot",
@@ -151,9 +569,11 @@ def test_describe_exposes_derived_schema_timeout_policy_and_digest():
         "unit": "meters",
     }
     assert rotation["parameters"]["properties"]["motion_distance"]["unit"] == "degrees"
-    assert relative["timeout_policy"] == resolve_embodied_timeout_policy(
-        load_robot_config_dict(CONFIG_PATH)["embodied"]
-    )
+    resolved_timeouts = resolve_embodied_timeout_policy(load_robot_config_dict(CONFIG_PATH)["embodied"])
+    assert relative["timeout_policy"] == {
+        name: value for name, value in resolved_timeouts.items() if not name.startswith("visual_game_")
+    }
+    assert relative["timeout_sec"] == 120.0
     assert relative["config_digest"] == view["capability_digest"]
 
 
@@ -195,6 +615,7 @@ def test_catalog_uses_capability_metadata_without_legacy_descriptions():
 
     assert listed == {
         "name": "fallback",
+        "contract_schema_version": 1,
         "summary": "Open the fallback gripper.",
         "domain": "manipulation",
         "moves_robot": True,
@@ -228,7 +649,7 @@ def test_unknown_skill_has_stable_error_and_exit_code(capsys):
 def test_catalog_commands_emit_one_json_document(capsys):
     from robot_skill_cli.cli import main
 
-    for arguments in (["list-skills"], ["describe", "move_relative_ee"], ["list-poses"]):
+    for arguments in (["list-skills"], ["list-games"], ["describe", "move_relative_ee"], ["list-poses"]):
         exit_code = main(["--config-path", str(CONFIG_PATH), *arguments])
         captured = capsys.readouterr()
 
@@ -274,6 +695,65 @@ def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
 
 
 @pytest.mark.parametrize(
+    ("skill_name", "arguments", "properties", "expected"),
+    [
+        (
+            "nav_straight",
+            ["--direction", "left", "--distance", "1.25"],
+            {
+                "direction": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                "distance": {"type": "number", "exclusiveMinimum": 0},
+            },
+            {"direction": "left", "distance": 1.25},
+        ),
+        (
+            "nav_turn",
+            ["--direction", "right", "--degree", "450"],
+            {
+                "direction": {"type": "string", "enum": ["left", "right"]},
+                "degree": {"type": "number", "exclusiveMinimum": 0},
+            },
+            {"direction": "right", "degree": 450.0},
+        ),
+        (
+            "nav_abs_coordinate",
+            ["--x", "0", "--y", "-2.5", "--yaw", "0"],
+            {"x": {"type": "number"}, "y": {"type": "number"}, "yaw": {"type": "number"}},
+            {"x": 0.0, "y": -2.5, "yaw": 0.0},
+        ),
+        (
+            "resolve_object_pose",
+            ["--target-name", "Paper Ball", "--stand-off-distance-m", "0.3"],
+            {
+                "target_name": {"type": "string", "enum": ["banana", "paper ball"]},
+                "stand_off_distance_m": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+            },
+            {"target_name": "paper ball", "stand_off_distance_m": 0.3},
+        ),
+    ],
+)
+def test_navigation_cli_parser_validates_all_public_parameters(skill_name, arguments, properties, expected):
+    from robot_skill_cli.cli import _build_parser, _validate_schema
+
+    args = _build_parser().parse_args(["validate", skill_name, *arguments])
+    skill = {
+        "name": skill_name,
+        "parameters": {
+            "properties": properties,
+            "required": list(properties),
+        },
+    }
+
+    _validate_schema(skill, args)
+
+    for field_name, value in expected.items():
+        actual = getattr(args, field_name)
+        assert actual == pytest.approx(value) if isinstance(value, float) else actual == value
+    assert args.motion_direction is None
+    assert args.motion_distance is None
+
+
+@pytest.mark.parametrize(
     ("error_code", "exit_code"),
     [
         ("SKILL_PACKAGE_NOT_FOUND", 10),
@@ -305,12 +785,14 @@ def test_runtime_capability_view_rejects_tampered_snapshot() -> None:
 def test_skill_payload_normalization_and_default_timeout_identity():
     omitted = canonical_skill_payload(
         " move_relative_ee ",
+        schema_version=1,
         motion_direction=" FoRwArD ",
         motion_distance=-0.0,
         default_timeout_sec=30.0,
     )
     explicit = canonical_skill_payload(
         "move_relative_ee",
+        schema_version=1,
         motion_direction="forward",
         motion_distance=0.0,
         timeout_sec=30,
@@ -333,7 +815,7 @@ def test_skill_payload_normalization_and_default_timeout_identity():
 )
 def test_skill_payload_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):
-        canonical_skill_payload(default_timeout_sec=30.0, **kwargs)
+        canonical_skill_payload(schema_version=1, default_timeout_sec=30.0, **kwargs)
 
 
 def test_schema_allows_omitted_optional_declared_parameter():
@@ -780,6 +1262,17 @@ def test_validate_uses_status_default_timeout_and_shared_payload_hash(monkeypatc
     assert omitted["data"]["payload"] == explicit["data"]["payload"]
     assert omitted["data"]["payload_hash"] == explicit["data"]["payload_hash"]
     assert bridge.validate_payloads[0] == bridge.validate_payloads[1]
+
+
+def test_omitted_timeout_uses_skill_implementation_limit():
+    from robot_skill_cli.catalog import describe_skill, load_capability_catalog
+    from robot_skill_cli.cli import _validate_timeout
+
+    view = load_capability_catalog(config_path=CONFIG_PATH)
+    skill = describe_skill(view, "move_relative_ee")
+    status = {"default_skill_timeout_sec": 300.0, "task_budget_sec": 360.0}
+
+    assert _validate_timeout(status, None, skill_timeout_cap=skill["timeout_sec"]) == 120.0
 
 
 def test_validate_uses_action_wire_zero_for_omitted_motion_distance(monkeypatch, capsys):

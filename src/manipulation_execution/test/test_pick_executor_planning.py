@@ -38,7 +38,6 @@ def test_candidate_budget_is_applied_after_cheap_geometry_filters(monkeypatch):
         return CandidatePlan(
             approach=(float(index), 0.0, 0.12),
             grasp=(float(index), 0.0, 0.05),
-            lift=(float(index), 0.0, 0.10),
             quaternion=(0.0, 0.0, 0.0, 1.0),
             approach_axis=(0.0, 0.0, -1.0),
             target_contact_ee=(0.0, 0.0, 0.0),
@@ -145,7 +144,6 @@ def test_all_workspace_rejections_return_fail_fast_error(monkeypatch):
     plan = CandidatePlan(
         approach=(0.8, 0.0, 0.12),
         grasp=(0.8, 0.0, 0.05),
-        lift=(0.8, 0.0, 0.10),
         quaternion=(0.0, 0.0, 0.0, 1.0),
         approach_axis=(0.0, 0.0, -1.0),
         target_contact_ee=(0.0, 0.0, 0.0),

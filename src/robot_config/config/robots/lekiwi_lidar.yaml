@@ -24,6 +24,17 @@ robot:
         mode: teleop
         queue_size: 100
         control_frequency: 50.0
+    base_navigation:
+      description: "Autonomous navigation with MID-360 localization"
+      description_cn: "使用 MID-360 定位的自主导航模式"
+      controllers: [joint_state_broadcaster, base_velocity_controller]
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: base_navigation
+        queue_size: 100
+        control_frequency: 50.0
 
   simulation:
     platform: gazebo
@@ -144,6 +155,27 @@ robot:
           publish_tf: false
           cmd_vel_topic: /cmd_vel
     navigation:
+      default_control_mode: base_navigation
+      skill_required_control_mode: base_navigation
+      embodied:
+        enabled: false
+        entry_mode: hermes
+        skill_catalog_source_mode: development
+        skill_catalog_source_root: src/skill_catalog
+        skill_catalog_profile: lekiwi_lidar
+        skill_action_name: /embodied/execute_skill
+        primitive_action_name: /embodied/execute_primitive
+        validate_skill_service: /embodied/validate_skill
+        validate_primitive_service: /embodied/validate_primitive
+        skill_gateway_status_service: /embodied/get_skill_gateway_status
+        timeouts:
+          task_budget_sec: 360.0
+          default_skill_timeout_sec: 300.0
+          robot_state_freshness_sec: 0.5
+          scene_freshness_sec: 0.5
+          model_idle_timeout_sec: 120.0
+          rpc_timeout_sec: 15.0
+          gripper_settle_sec: 1.5
       navigation:
         enabled: true
         fast_lio:

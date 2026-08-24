@@ -1,5 +1,6 @@
 """Translate the robot_config semantic mapping SSOT into ROS node parameters."""
 
+import json
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -41,6 +42,7 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
     target_watch = mapping["target_watch"]
     interfaces = mapping["interfaces"]
     roles = perception["semantic_roles"]
+    query_only = bool(mapping.get("query_only", False))
     mapping_backend = perception["mapping_backend"]
     runtime = parse_perception_runtime_config(config) if mapping_backend == "service" else None
     services = {} if runtime is None else {service.instance_id: service for service in runtime.enabled_services}
@@ -69,6 +71,7 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "coordinate_convention": slam["coordinate_convention"],
         "database_path": persistence["database_path"],
         "configuration_generation": generation,
+        "online_processing_enabled": not query_only,
         "sync_slop_sec": queue["sync_slop_sec"],
         "max_masks_per_frame": queue.get("max_masks_per_frame", 32),
         "max_masks_per_batch": queue["max_masks_per_batch"],
@@ -85,6 +88,7 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "ground_max_bottom_clearance_m": filtering.get("ground_max_bottom_clearance_m", 0.15),
         "ground_max_object_height_m": filtering.get("ground_max_object_height_m", 0.75),
         "ground_max_footprint_m": filtering.get("ground_max_footprint_m", 1.2),
+        "max_object_extent_m": filtering.get("max_object_extent_m", 0.65),
         "max_object_distance_m": filtering.get("max_object_distance_m", 2.5),
         "association_distance_m": lifecycle["association_distance_m"],
         "association_max_size_ratio": lifecycle["association_max_size_ratio"],
@@ -93,6 +97,9 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "label_switch_confidence_margin": lifecycle["label_switch_confidence_margin"],
         "min_label_confidence": labels["min_confidence"],
         "max_label_candidates_per_mask": labels["max_candidates_per_mask"],
+        "label_recurrence_count_ratio": labels.get("recurrence_count_ratio", 3.0),
+        "label_high_confidence_override_margin": labels.get("high_confidence_override_margin", 0.08),
+        "allowed_label_aliases_json": json.dumps(labels.get("allowed_labels", {}), sort_keys=True),
         "excluded_labels": labels["excluded_labels"],
         "label_refinement_enabled": label_refinement["enabled"],
         "label_refinement_model": label_refinement["model"],
@@ -150,6 +157,13 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
             "stale_after_sec": lifecycle["stale_after_sec"],
             "move_stability_m": lifecycle["move_stability_m"],
             "move_confirmations": lifecycle["move_confirmations"],
+            "track_state_topic": target_watch["track_state_topic"],
+            "track_state_frame": target_watch["track_state_frame"],
+            "track_state_updates_enabled": target_watch["track_state_updates_enabled"],
+            "track_state_max_age_sec": target_watch["track_state_max_age_sec"],
+            "track_state_max_covariance_m2": target_watch["track_state_max_covariance_m2"],
+            "track_state_confirmation_gap_sec": target_watch["track_state_confirmation_gap_sec"],
+            "track_state_persist_interval_sec": target_watch["track_state_persist_interval_sec"],
             "footprint_ready_topic": target_watch["footprint_ready_topic"],
             "obstacle_map_ready_topic": target_watch["obstacle_map_ready_topic"],
             "reachability_ready_topic": target_watch["reachability_ready_topic"],
@@ -160,6 +174,8 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
 
 def semantic_perception_nodes(config: dict, *, offline: bool = False) -> list:
     """Build generic model hosts required by the selected semantic workflow."""
+    if config["semantic_mapping"].get("query_only", False):
+        return []
     perception = config["semantic_mapping"]["perception"]
     if perception["mapping_backend"] == "embedded":
         return []

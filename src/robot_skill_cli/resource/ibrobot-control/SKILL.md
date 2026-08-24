@@ -1,6 +1,6 @@
 ---
 name: ibrobot-control
-description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires the exact plan to be presented and flushed before any physical motion; the user aborts a wrong plan with 别动 during execution; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
+description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, stop, or query IB-Robot capabilities and visual games through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', 'play a visual game', 'query a game result', '执行机器人动作', '取消动作', '停止机器人', '玩视觉游戏', '查询游戏结果', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires the exact motion plan to be presented and flushed before physical motion; the user aborts a wrong plan with 别动 during execution. Never bypass the Gateway or call raw ros2 / MoveIt / controller commands directly."
 ---
 
 # IB-Robot Control
@@ -39,9 +39,12 @@ By default, omit `--timeout-sec` from both commands so both use the current Gate
 budget from `default_skill_timeout_sec`. Only when the user explicitly requests a smaller budget, append the same
 `--timeout-sec SEC` value to both commands. Never change the budget after confirmation.
 
-`workflow-json` is an array of flat `WorkflowStep` objects. Skill arguments are top-level fields, for example
-`[{"skill_name":"pick_object","target_name":"marker"}]`. Never use `skill`, a nested `parameters` object, or a bare
-object. Invoke `plan-workflow` once with all three required options; do not probe it with an incomplete command.
+`workflow-json` is an array of flat `WorkflowStep` objects. Every object must include an explicit `schema_version`.
+Use `schema_version: 1` for legacy non-navigation contracts and `schema_version: 2` for navigation contracts. Skill
+arguments are top-level fields, for example
+`[{"schema_version":1,"skill_name":"pick_object","target_name":"marker"}]`. Never use `skill`, a nested
+`parameters` object, or a bare object. Never infer or rewrite `WorkflowStep.schema_version` from the skill domain. Invoke
+`plan-workflow` once with all three required options; do not probe it with an incomplete command.
 
 Construct request IDs and task IDs directly in the conversation and `robot-skill` arguments. Do not call Python,
 `uuidgen`, `date`, a shell, or any other helper tool to generate them. A command approval, including session-wide
@@ -62,7 +65,8 @@ exact result and stop; do not retry alternate phrasings and do not split the req
 
 When the operator asks to activate edited robot Skill YAML without restarting the robot, run exactly one
 `robot-skill reload-catalog --request-id REQUEST_ID --force`. This reloads only the Gateway's configured catalog source;
-it does not accept another path. Report `old_generation`, `generation`, `changed_skills`, and diagnostics. Then run
+it does not accept another path and does not reload visual-game configuration or handlers. Report `old_generation`,
+`generation`, `changed_skills`, and diagnostics. Then run
 `robot-skill status` and require its registry identity to match the reload result before creating any new plan. A reload
 timeout has an unknown activation result: stop and ask for a new user request before checking or retrying.
 
@@ -119,6 +123,90 @@ A reference implementation of this loop (catalog discovery, out-of-catalog rejec
 stop-to-definite-terminal, and fresh-state continuation) lives in
 `robot_skill_cli.interactive_control.InteractiveController` and is unit-tested without a ROS stack.
 
+## Perception Reads
+
+For requests that need a runtime perception value (e.g., "转向我" needs the
+user's azimuth), read it via the `ibrobot-perceive` wrapper **before** calling
+`plan-workflow`, then inject the returned literal into `workflow_json`.
+
+```
+ibrobot-perceive --source voice_direction --field azimuth_rad
+ibrobot-perceive --source arm_joint_position --field position [--config-name NAME]
+```
+
+- `ibrobot-perceive` is the **only** allowed path to read ROS topics. Never call `ros2 topic echo`,
+  `ros2 topic list`, `ros2 param get`, or any other `ros2` subcommand directly — not even as a
+  suggestion, fallback, or "alternative" when `ibrobot-perceive` rejects a source.
+- If `ibrobot-perceive` rejects a source (e.g., `cmd_vel`) because it is not in
+  the allowlist, report "该 source 未授权读取" and stop. Do **not** suggest `ros2 topic echo` or
+  any other `ros2` command as a workaround; the rejection is a security boundary, not a missing
+  feature.
+- The wrapper's source/field allowlist is hard-coded in source; you cannot widen it by editing config.
+  `--source` is a semantic alias, not a ROS topic name. The actual topic for config-backed sources
+  (`arm_joint_position`) is resolved from `robot_config.moveit.joint_state_topic` at runtime
+  (so101 -> `/joint_states`, lekiwi_handeye -> `/arm_joint_state_broadcaster/joint_states`); pass
+  `--config-name` to match the robot the pipeline is running.
+- `ros2 topic echo --once` returns the *next* published message, a single point-in-time sample, not a
+  persistent snapshot. For volatile event sources such as `voice_direction` (published only on
+  voice activity) the value may be absent within the timeout or already stale when consumed.
+- The wrapper prints the value on stdout (e.g., `0.5236`) and errors on stderr. On any error,
+  timeout, or missing field, report "无法感知" to the user and stop; do not fabricate a value.
+- For requests asking for current motor or joint angles, run
+  `ibrobot-perceive --source arm_joint_position --field position`. Return the raw position array in radians;
+  do not invent joint names or reorder values because this minimal interface does not return the companion `name` field.
+- The returned literal becomes a frozen plan parameter. It may be stale by execution time
+  (open-loop, no correction); execution result is authoritative.
+
+Example flow for "转向我" (requires a robot with a mobile base, e.g. lekiwi):
+
+1. `ibrobot-perceive --source voice_direction --field azimuth_rad` -> `0.5236`
+2. Convert azimuth_rad (radians, REP-103: 0=front, +π/2=left, -π/2=right) to
+   direction and degree: positive => left, negative => right;
+   degree = abs(azimuth_rad) * 180 / pi  (e.g. 0.5236 rad => 30.0 degrees).
+3. `robot-skill describe nav_turn` (confirm it takes `direction` and `degree`)
+4. `robot-skill plan-workflow --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
+5. validate-plan -> confirm-plan -> execute-plan as usual.
+
+Do **not** map "转向我" to `rotate_gripper_cw`/`rotate_gripper_ccw` — those
+rotate the wrist/gripper, not the robot base, and will not face the user.
+For a single-arm robot without a mobile base (e.g. so101), "转向我" is not
+available; report that the robot has no base rotation and ask the user for a
+different request.
+
+If the user says "left" or "right" with an explicit small nudge for the
+end-effector (not base rotation), use `move_relative_ee` with **both**
+`motion_direction` and `motion_distance` (the skill requires both):
+
+```
+[{"schema_version":1,"skill_name":"move_relative_ee","motion_direction":"left","motion_distance":0.05}]
+```
+
+## Visual Games
+
+Visual games are non-motion capabilities with a separate asynchronous control surface:
+
+1. Discover enabled games with `robot-skill list-games`.
+2. Read the selected contract with `robot-skill describe-game GAME`.
+3. Create a fresh caller-owned request ID, then run
+   `robot-skill start-game GAME --request-id ID`.
+4. Poll `robot-skill game-result --request-id ID` about once per second. Stop after the described
+   `timeout_sec`; make one final query and report timeout or uncertainty if no terminal result is available.
+5. Report the terminal structured result to the caller. Do not invoke an Agent TTS tool: when configured, the runtime
+   announcer sends terminal text through `VisualGameEvent`, `/voice_tts/synthesize`, and the existing local
+   `/voice_tts/play` service.
+
+The CLI only starts and queries games. It must not play audio, wait indefinitely inside `start-game`, or retry a failed
+game with a new request ID. If `start-game` loses its service response, querying or repeating the exact same game and
+request ID within the advertised result-retention window is allowed: the Gateway treats that as idempotent recovery and
+does not start a second request while the retained record exists. After retention expires the ID is no longer reserved,
+so callers must not reuse it.
+
+Game discovery exposes every enabled game. Visual games are started only through this Agent control surface; ASR and
+task entry do not trigger them. `PERCEPTION_UNAVAILABLE` means the configured perception request topic has
+no live subscriber; do not launch or restart infrastructure. `GAME_CAPACITY_EXHAUSTED` means the retained-result ledger
+is full; records inside the advertised retention window are never evicted early, so wait for expiry or report the
+capacity failure instead of retrying with a new request ID.
+
 ## Hard Boundaries
 
 - The Agent **must not launch or restart the pipeline**.
@@ -128,7 +216,7 @@ stop-to-definite-terminal, and fresh-state continuation) lives in
 - The Agent **must not call Python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task IDs**.
 - The Agent **must not call primitive, MoveIt, controller, or raw ros2 motion commands**.
 - The Agent must not copy `docs/ib_robot_social_skill.md` as a control Skill.
-- The Agent **must not automatically retry after failure, timeout, or unknown result**, including with a new task ID.
+- The Agent **must not automatically retry after failure, timeout, or unknown result** with a new task/request ID.
 
 ## Quick Reference
 
@@ -136,6 +224,9 @@ stop-to-definite-terminal, and fresh-state continuation) lives in
 |---|---|
 | Catalog-only request | Use catalog commands; no motion confirmation is needed. |
 | Runtime unavailable/unauthorized | Report the CLI error; do not start or alter infrastructure. |
+| Visual-game perception unavailable | Report `PERCEPTION_UNAVAILABLE`; do not launch or restart perception. |
+| Visual-game result ledger full | Report `GAME_CAPACITY_EXHAUSTED`; retained terminal results are not evicted early. |
+| No clearly visible person | Report `NO_PERSON`; do not announce or invent a game result. |
 | Terminal result | Report only public status/error fields. |
 | Stop state unknown | Report uncertainty and send no new motion. |
 

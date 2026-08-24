@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
+from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity, workflow_step
 
 
 def test_delegated_executor_identity_requires_complete_model_identity():
@@ -49,3 +49,17 @@ def test_manifest_identity_loader_uses_user_supplied_bundle(monkeypatch, tmp_pat
     )
 
     assert identity["model_fingerprint"] == validated.fingerprint
+
+
+def test_navigation_workflow_step_encodes_coordinate_presence():
+    step = workflow_step(
+        schema_version=2,
+        skill_name="nav_abs_coordinate",
+        x=0.0,
+        yaw=-90.0,
+    )
+
+    assert step.schema_version == 2
+    assert (step.has_x, step.x) == (True, 0.0)
+    assert (step.has_y, step.y) == (False, 0.0)
+    assert (step.has_yaw, step.yaw) == (True, -90.0)

@@ -4,7 +4,7 @@
   <!--
     Assembled URDF: simplified chassis + SO101 arm.
     Replaces CAD-exported lekiwi_car.urdf for real-robot hardware driving.
-    Joint names "1"-"9" match lekiwi_navi controllers.
+    Joint names "1"-"9" match the full LeKiwi controller configuration.
   -->
 
   <!-- Arguments -->

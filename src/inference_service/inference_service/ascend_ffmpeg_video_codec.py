@@ -493,6 +493,8 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
             str({"baseline": 0, "main": 1, "high": 2}[self._profile]),
             "-rc_mode",
             "0",
+            "-bf",
+            "0",
             "-gop",
             str(self._gop),
             "-frame_rate",

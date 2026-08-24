@@ -14,6 +14,7 @@
 # root_lease_nonce for correlation, but safety_guard must not treat it as
 # authorization. dispatch_nonce must be empty here. schema_version is 1 in v1.
 
+uint32 schema_version
 DispatchBinding dispatch_binding
 string skill_name
 string target_name
@@ -21,6 +22,15 @@ string container_name
 string place_name
 string motion_direction
 float32 motion_distance
+string direction
+float64 distance
+float64 degree
+bool has_x
+float64 x
+bool has_y
+float64 y
+bool has_yaw
+float64 yaw
 ---
 bool allowed
 string reason

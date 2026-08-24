@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -9,7 +10,12 @@ import pytest
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
-from skill_catalog.digest import derive_capability_digest, to_canonical_json
+from skill_catalog.digest import (
+    derive_capability_digest,
+    derive_capability_view_from_registry,
+    derive_registry_digest,
+    to_canonical_json,
+)
 from skill_catalog.models import SkillCompileContext, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
 
@@ -98,18 +104,29 @@ primitive_sequence:
     return compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=context)
 
 
-def _response(snapshot, *, payload=None, capability_digest=None):
+def _response(snapshot, *, payload=None, registry_digest=None, capability_digest=None):
     return SimpleNamespace(
         success=True,
         error_code="",
         message="",
         registry_epoch="epoch",
         generation=1,
-        registry_digest=snapshot.registry_digest,
+        registry_digest=registry_digest or snapshot.registry_digest,
         capability_digest=capability_digest or snapshot.capability_digest,
         provenance_digest=snapshot.provenance_digest,
         snapshot_json=to_canonical_json(payload) if payload is not None else snapshot.snapshot_json,
     )
+
+
+def _raw_digest(preimage):
+    return hashlib.sha256(to_canonical_json(preimage).encode("utf-8")).hexdigest()
+
+
+def _set_capability_entry_version(payload, version):
+    registry_capability = payload["registry_preimage"]["skills"][0]["template"]["capability"]
+    public_capability = payload["capability_preimage"]["capability_view"]["open_gripper_skill"]
+    registry_capability["schema_version"] = version
+    public_capability["schema_version"] = version
 
 
 def test_consumer_accepts_compiler_snapshot(tmp_path):
@@ -144,4 +161,83 @@ def test_consumer_rejects_capability_view_not_derived_from_registry(tmp_path):
         verify_snapshot_response(
             _response(snapshot, payload=payload, capability_digest=capability_digest),
             CatalogIdentity("epoch", 1, snapshot.registry_digest),
+        )
+
+
+def test_derived_capability_view_v1_omits_version_and_v2_includes_two(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    registry = json.loads(snapshot.registry_preimage_json)
+
+    v1_view = derive_capability_view_from_registry(registry)
+    registry["skills"][0]["template"]["capability"]["schema_version"] = 2
+    v2_view = derive_capability_view_from_registry(registry)
+
+    assert "schema_version" not in v1_view["open_gripper_skill"]
+    assert v2_view["open_gripper_skill"]["schema_version"] == 2
+
+
+@pytest.mark.parametrize("version", [0, 1, 3])
+def test_derived_capability_view_rejects_noncanonical_explicit_versions(tmp_path, version):
+    snapshot = _snapshot(tmp_path)
+    registry = json.loads(snapshot.registry_preimage_json)
+    registry["skills"][0]["template"]["capability"]["schema_version"] = version
+
+    with pytest.raises(ValueError, match="capability fields"):
+        derive_capability_view_from_registry(registry)
+
+
+def test_derived_capability_view_rejects_extra_fields_for_v1_and_v2(tmp_path):
+    snapshot = _snapshot(tmp_path)
+
+    for version in (None, 2):
+        registry = json.loads(snapshot.registry_preimage_json)
+        capability = registry["skills"][0]["template"]["capability"]
+        if version is not None:
+            capability["schema_version"] = version
+        capability["unknown"] = True
+
+        with pytest.raises(ValueError, match="capability fields"):
+            derive_capability_view_from_registry(registry)
+
+
+def test_consumer_accepts_exact_v2_derived_capability_fields(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    payload = json.loads(snapshot.snapshot_json)
+    _set_capability_entry_version(payload, 2)
+    registry_digest = derive_registry_digest(payload["registry_preimage"])
+    capability_digest = derive_capability_digest(payload["capability_preimage"])
+
+    view = verify_snapshot_response(
+        _response(
+            snapshot,
+            payload=payload,
+            registry_digest=registry_digest,
+            capability_digest=capability_digest,
+        ),
+        CatalogIdentity("epoch", 1, registry_digest),
+    )
+
+    assert view.capability_view["open_gripper_skill"]["schema_version"] == 2
+
+
+@pytest.mark.parametrize(("version", "extra_field"), [(0, None), (1, None), (3, None), (2, "unknown")])
+def test_consumer_rejects_noncanonical_capability_field_sets(tmp_path, version, extra_field):
+    snapshot = _snapshot(tmp_path)
+    payload = json.loads(snapshot.snapshot_json)
+    _set_capability_entry_version(payload, version)
+    if extra_field is not None:
+        payload["registry_preimage"]["skills"][0]["template"]["capability"][extra_field] = True
+        payload["capability_preimage"]["capability_view"]["open_gripper_skill"][extra_field] = True
+    registry_digest = _raw_digest(payload["registry_preimage"])
+    capability_digest = _raw_digest(payload["capability_preimage"])
+
+    with pytest.raises(CatalogConsumerError, match="capability fields"):
+        verify_snapshot_response(
+            _response(
+                snapshot,
+                payload=payload,
+                registry_digest=registry_digest,
+                capability_digest=capability_digest,
+            ),
+            CatalogIdentity("epoch", 1, registry_digest),
         )

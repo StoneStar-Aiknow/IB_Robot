@@ -88,7 +88,7 @@ def _start_runtime_after_controller_readiness(runtime_actions):
     return _handler
 
 
-def _load_config(robot_config_name: str, config_path_override: str) -> dict:
+def _load_config(robot_config_name: str, config_path_override: str, nav_stage: str = "") -> dict:
     try:
         robot_config_share = get_package_share_directory("robot_config")
     except Exception:
@@ -99,7 +99,7 @@ def _load_config(robot_config_name: str, config_path_override: str) -> dict:
         if config_path_override
         else Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml"
     )
-    config = load_robot_config_dict(config_path)
+    config = load_robot_config_dict(config_path, nav_stage=nav_stage)
     config["_config_path"] = str(config_path)
     return config
 
@@ -137,17 +137,22 @@ def launch_setup(context, *_args, **_kwargs):
     robot_config_name = context.launch_configurations.get("robot_config", "so101_single_arm")
     config_path_override = context.launch_configurations.get("config_path", "")
     control_mode_override = context.launch_configurations.get("control_mode", "")
-    with_embodied_str = context.launch_configurations.get("with_embodied", "true")
+    nav_stage = context.launch_configurations.get("nav_stage", "").strip()
+    with_embodied_str = context.launch_configurations.get("with_embodied", "")
     with_perception_str = context.launch_configurations.get("with_perception", "")
     entry_mode_override = context.launch_configurations.get("entry_mode", "")
     authorize_motion_str = context.launch_configurations.get("authorize_motion", "false")
 
-    config = _load_config(robot_config_name, config_path_override)
+    config = _load_config(robot_config_name, config_path_override, nav_stage)
     if control_mode_override:
         config["default_control_mode"] = control_mode_override
 
     embodied_config = config.setdefault("embodied", {})
-    embodied_config["enabled"] = parse_bool(with_embodied_str, default=True)
+    embodied_config["enabled"] = (
+        bool(embodied_config.get("enabled", False))
+        if with_embodied_str == ""
+        else parse_bool(with_embodied_str, default=True)
+    )
     if entry_mode_override:
         embodied_config["entry_mode"] = entry_mode_override
     if with_perception_str != "":
@@ -166,6 +171,14 @@ def launch_setup(context, *_args, **_kwargs):
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     motion_authorized = parse_bool(authorize_motion_str, default=False)
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
+    requested_moveit = context.launch_configurations.get("with_moveit", "")
+    if (
+        requested_moveit == ""
+        and config.get("nav_stage") == "hybrid"
+        and active_control_mode == "base_navigation"
+        and "moveit" in str(config.get("skill_required_control_mode", "")).lower()
+    ):
+        requested_moveit = "true"
     base_launch_arguments = {
         "robot_config": robot_config_name,
         "config_path": config_path_override,
@@ -173,7 +186,8 @@ def launch_setup(context, *_args, **_kwargs):
         "use_mock": context.launch_configurations.get("use_mock", "false"),
         "auto_start_controllers": context.launch_configurations.get("auto_start_controllers", "true"),
         "control_mode": active_control_mode,
-        "with_moveit": context.launch_configurations.get("with_moveit", ""),
+        "nav_stage": nav_stage,
+        "with_moveit": requested_moveit,
         "moveit_display": context.launch_configurations.get("moveit_display", "false"),
         "with_embodied": "false",
         "with_perception": "false",
@@ -187,6 +201,18 @@ def launch_setup(context, *_args, **_kwargs):
     ]
     if embodied_config["enabled"]:
         logger.info("Preparing embodied runtime nodes from embodied_bringup")
+        visual_games = embodied_config.get("visual_games", {})
+        visual_games_enabled = isinstance(visual_games, dict) and any(
+            isinstance(policy, dict) and policy.get("enabled") is True for policy in visual_games.values()
+        )
+        visual_actions = generate_embodied_nodes(
+            config,
+            active_control_mode,
+            motion_authorized=motion_authorized,
+            include_motion=False,
+            include_perception=visual_games_enabled,
+        )
+        actions.extend(visual_actions)
         runtime_actions = []
         worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
         if worker_action is not None:
@@ -196,6 +222,8 @@ def launch_setup(context, *_args, **_kwargs):
                 config,
                 active_control_mode,
                 motion_authorized=motion_authorized,
+                include_visual_games=False,
+                include_perception=not visual_games_enabled,
             )
         )
         use_sim = parse_bool(base_launch_arguments["use_sim"], default=False)
@@ -213,7 +241,10 @@ def launch_setup(context, *_args, **_kwargs):
                 )
             )
             actions.append(ready_waiter)
-            logger.info(f"Deferring {len(runtime_actions)} embodied runtime action(s) until controllers are active")
+            logger.info(
+                f"Started {len(visual_actions)} visual runtime action(s); "
+                f"deferring {len(runtime_actions)} motion runtime action(s) until controllers are active"
+            )
     else:
         logger.info("Embodied runtime disabled by with_embodied:=false")
     return actions
@@ -234,10 +265,11 @@ def generate_launch_description():
             DeclareLaunchArgument("use_sim", default_value="false"),
             DeclareLaunchArgument("use_mock", default_value="false"),
             DeclareLaunchArgument("auto_start_controllers", default_value="true"),
-            DeclareLaunchArgument("control_mode", default_value="moveit_planning"),
+            DeclareLaunchArgument("control_mode", default_value=""),
+            DeclareLaunchArgument("nav_stage", default_value=""),
             DeclareLaunchArgument("with_moveit", default_value=""),
             DeclareLaunchArgument("moveit_display", default_value="false"),
-            DeclareLaunchArgument("with_embodied", default_value="true"),
+            DeclareLaunchArgument("with_embodied", default_value=""),
             DeclareLaunchArgument("with_perception", default_value=""),
             DeclareLaunchArgument("entry_mode", default_value=""),
             DeclareLaunchArgument("authorize_motion", default_value="false"),

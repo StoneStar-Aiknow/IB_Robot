@@ -155,8 +155,8 @@ def test_frontend_import_failure_is_reported(tmp_path, monkeypatch):
 
 
 def test_ellipsis_is_treated_as_sentence_punctuation():
-    assert _ChineseTokenizer._map_punctuation("等等...") == "等等…"
-    assert _ChineseTokenizer.chunk_tokens(["deng3", "…", "hao3", "."], 3) == [
-        ["deng3", "…"],
+    assert _ChineseTokenizer._map_punctuation("等等……") == "等等."
+    assert _ChineseTokenizer.chunk_tokens(["deng3", ".", "hao3", "."], 3) == [
+        ["deng3", "."],
         ["hao3", "."],
     ]

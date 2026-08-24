@@ -4,6 +4,7 @@ Generates Nav2 stack IncludeLaunchDescription from navigation config.
 """
 
 import os
+from pathlib import Path
 from typing import Any
 
 from ament_index_python.packages import get_package_share_directory
@@ -79,6 +80,9 @@ def generate_nav2_nodes(
         else:
             params_file = resolve_ros_path(params_file)
 
+        if not params_file or "$(" in params_file or not Path(params_file).is_file():
+            raise RuntimeError(f"Invalid Nav2 params_file: {params_file!r}")
+
         launch_args = {
             "use_sim_time": str(use_sim).lower(),
             "map": map_file,
@@ -100,6 +104,8 @@ def generate_nav2_nodes(
         )
         logger.info(f"Added Nav2 bringup (map: {map_file}, sim: {use_sim})")
 
+    except RuntimeError:
+        raise
     except Exception as e:
         logger.error(f"Failed to add required Nav2 bringup: {e}")
         raise

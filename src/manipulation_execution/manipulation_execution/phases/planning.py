@@ -335,7 +335,7 @@ class PlanningPhase:
             ):
                 reject("HEIGHT_OR_APPROACH_REJECTED")
                 continue
-            if any(not xyz_within_workspace(xyz, self._workspace)[0] for xyz in (plan.approach, plan.grasp, plan.lift)):
+            if any(not xyz_within_workspace(xyz, self._workspace)[0] for xyz in (plan.approach, plan.grasp)):
                 reject("WORKSPACE_REJECTED")
                 continue
             fixed_finger_base_side = None

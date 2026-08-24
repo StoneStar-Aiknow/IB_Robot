@@ -115,6 +115,7 @@ def delegated_executor_identity_matches(message: DelegatedExecutorIdentity, iden
 
 def workflow_step(
     *,
+    schema_version: int = 1,
     skill_name: str,
     target_name: str = "",
     container_name: str = "",
@@ -122,9 +123,15 @@ def workflow_step(
     motion_direction: str = "",
     motion_distance: float = 0.0,
     timeout_sec: float = 0.0,
+    direction: str = "",
+    distance: float = 0.0,
+    degree: float = 0.0,
+    x: float | None = None,
+    y: float | None = None,
+    yaw: float | None = None,
 ) -> WorkflowStep:
     step = WorkflowStep()
-    step.schema_version = 1
+    step.schema_version = schema_version
     step.skill_name = skill_name
     step.target_name = target_name
     step.container_name = container_name
@@ -132,6 +139,15 @@ def workflow_step(
     step.motion_direction = motion_direction
     step.motion_distance = float(motion_distance)
     step.timeout_sec = float(timeout_sec)
+    step.direction = direction
+    step.distance = float(distance)
+    step.degree = float(degree)
+    step.has_x = x is not None
+    step.x = 0.0 if x is None else float(x)
+    step.has_y = y is not None
+    step.y = 0.0 if y is None else float(y)
+    step.has_yaw = yaw is not None
+    step.yaw = 0.0 if yaw is None else float(yaw)
     return step
 
 

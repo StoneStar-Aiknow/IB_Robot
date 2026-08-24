@@ -283,6 +283,53 @@ def test_compute_stream_manager_assigns_unique_ascend_decoder_channels():
     assert sorted(options["channel_id"] for options in decoder_options) == [1, 2]
 
 
+def test_recording_only_manager_skips_decoder_creation_and_wires_recorder():
+    spec = _spec()
+    decoder_options = []
+    registry = VideoCodecRegistry()
+    registry.register(
+        "software",
+        priority=0,
+        probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
+        decoder_factory=lambda **options: decoder_options.append(options) or _Decoder(),
+    )
+
+    class Coordinator:
+        def __init__(self):
+            self.recorders = {}
+
+        def register_recorder(self, key, recorder):
+            self.recorders[key] = recorder
+
+    coordinator = Coordinator()
+    receivers = []
+
+    def receiver_factory(**options):
+        receivers.append(_Receiver(**options))
+        return receivers[-1]
+
+    manager = ComputeVideoStreamManager(
+        pipeline_id="recording",
+        session_id="session",
+        session_generation=1,
+        contract_fingerprint="contract",
+        deployment_fingerprint="recording",
+        observation_specs=(spec,),
+        rate_hz=30.0,
+        codec_registry=registry,
+        receiver_factory=receiver_factory,
+        recording_coordinator=coordinator,
+        decode=False,
+        validate_deployment_fingerprint=False,
+    )
+    descriptor = replace(_descriptor(spec), pipeline_id="recording")
+    assert manager.observe_descriptor(descriptor)
+
+    assert decoder_options == []
+    assert receivers[0].options["decode"] is False
+    assert receivers[0].options["recorder"] is coordinator.recorders[spec.key]
+
+
 def test_compute_stream_manager_pads_multi_step_history_from_first_keyframe():
     spec = _spec()
     manager, receivers = _manager((spec,), n_obs_steps=3)

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Add robot_config to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from robot_config.loader import load_robot_config, validate_config
+from robot_config.loader import load_robot_config, validate_config  # noqa: E402
 
 
 def main():
@@ -35,10 +35,24 @@ def main():
 
         logger.info(f"  Robot: {config.name} ({config.robot_type})")
         logger.info(f"  Hardware plugin: {config.ros2_control.hardware_plugin}")
-        logger.info(f"  Cameras: {len(config.peripherals)}")
+        cameras = [peripheral for peripheral in config.peripherals if hasattr(peripheral, "width")]
+        microphones = [peripheral for peripheral in config.peripherals if peripheral.type == "microphone"]
+        logger.info(f"  Cameras: {len(cameras)}")
+        logger.info(f"  Microphones: {len(microphones)}")
 
-        for cam in config.peripherals:
+        for cam in cameras:
             logger.info(f"    - {cam.name}: {cam.driver} @ {cam.width}x{cam.height} {cam.fps}fps")
+        for microphone in microphones:
+            logger.info(
+                f"    - {microphone.name}: {microphone.driver} ({microphone.params.get('arecord_device', 'n/a')})"
+            )
+
+        if config.speech_direction.enabled:
+            logger.info(
+                "  Speech direction: enabled (%s, microphone=%s)",
+                config.speech_direction.profile,
+                config.speech_direction.microphone,
+            )
 
         errors = validate_config(config)
 
@@ -57,6 +71,7 @@ def main():
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

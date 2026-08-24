@@ -47,6 +47,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AgentPlan.msg"
   "msg/SceneAnalysisRequest.msg"
   "msg/SceneAnalysisResult.msg"
+  "msg/VisualGameEvent.msg"
   "msg/SceneObject.msg"
   "msg/SceneObservation.msg"
   "msg/AttentionWeights.msg"
@@ -56,6 +57,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ModelRuntimeInfo.msg"
   "msg/MaskEmbedding.msg"
   "msg/TextEmbedding.msg"
+  "msg/TrackState.msg"
   "msg/SemanticMapMetadata.msg"
   "msg/SemanticObject3D.msg"
   "msg/SemanticObject3DArray.msg"
@@ -91,6 +93,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanAgentCommand.srv"
   "srv/ValidateAgentPlan.srv"
   "srv/ConfirmAgentPlan.srv"
+  "srv/StartVisualGame.srv"
+  "srv/GetVisualGameResult.srv"
   "srv/EchoModel.srv"
   "srv/GenerateMasks.srv"
   "srv/GenerateGrasps.srv"
@@ -106,6 +110,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ResolveSemanticTarget.srv"
   "srv/SynthesizeSpeech.srv"
   "srv/PlayAudioFile.srv"
+  "srv/StartTracking.srv"
+  "srv/StopTracking.srv"
+  "srv/GetTrackState.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

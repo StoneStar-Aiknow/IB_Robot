@@ -322,6 +322,7 @@ class EpisodeRecorderServer(Node):
 
         self._flags = Flags()
         self._ws = WriterState()
+        self._video_recording_coordinator = None
 
         # Executor/callback group (reentrant so timers/subs/actions can co-exist)
         self._cbg = ReentrantCallbackGroup()
@@ -832,6 +833,12 @@ class EpisodeRecorderServer(Node):
 
     # ---------- main action loop ----------
 
+    def set_video_recording_coordinator(self, coordinator: Any) -> None:
+        """Attach the in-process RTP recording coordinator."""
+        if self._flags.is_recording:
+            raise RuntimeError("Cannot replace video recording coordinator during an episode")
+        self._video_recording_coordinator = coordinator
+
     def execute_callback(self, goal_handle: Any) -> RecordEpisode.Result:
         """Execute a single recording episode to completion.
 
@@ -873,7 +880,11 @@ class EpisodeRecorderServer(Node):
                 self._ws.writer = self._open_writer(str(bag_dir), storage)
                 for t, typ, _ in self._topics:
                     self._register_topic(t, typ)
+            if self._video_recording_coordinator is not None:
+                self._video_recording_coordinator.start_episode(bag_dir)
         except (RuntimeError, OSError, ValueError) as exc:
+            with self._ws.writer_lock:
+                self._ws.writer = None
             self._flags.is_recording = False
             self._current_goal_handle = None
             goal_handle.abort()
@@ -903,8 +914,11 @@ class EpisodeRecorderServer(Node):
         total_written = self._get_total_messages_written()
         was_fatal_error = self._flags.fatal_error
         was_stop_requested = self._flags.stop_requested or goal_handle.is_cancel_requested
+        video_valid = True
+        if self._video_recording_coordinator is not None and self._video_recording_coordinator.is_recording():
+            video_valid = self._video_recording_coordinator.stop_episode()
         self._finalize_episode(bag_dir, prompt, episode_index)
-        if not was_fatal_error:
+        if not was_fatal_error and video_valid:
             self._last_episode_dir = bag_dir
             self._last_episode_index = episode_index
             self._last_episode_messages = total_written
@@ -915,6 +929,9 @@ class EpisodeRecorderServer(Node):
         if was_fatal_error:
             goal_handle.abort()
             return RecordEpisode.Result(success=False, message="Writer error")
+        elif not video_valid:
+            goal_handle.abort()
+            return RecordEpisode.Result(success=False, message="RTP video integrity failure")
         elif was_stop_requested:
             # Always succeed even if stopped early, because a partial episode is still a valid bag.
             # Calling canceled() is prone to race conditions if the state hasn't transitioned to CANCELING yet.

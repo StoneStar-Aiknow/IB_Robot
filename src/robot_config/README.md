@@ -27,11 +27,12 @@ ros2_control 和外设的统一机器人配置系统。
 
 ### ros2_control 启动门禁
 
-真机控制器由 `robot_config/controller_spawner` 串行加载、配置和激活；该入口修复 ROS 2 Humble 官方 spawner
-未向 `load_controller` 传递 service call timeout 的问题，并在调用超时后重新读取 lifecycle 状态，接受服务端
-已经完成的加载。随后统一的 `wait_for_controllers` 再确认 robot YAML 为当前控制模式声明的全部 controller 都是
-`active`，通过后才启动 MoveIt、teleop 或 task executor。发现、service call 和 switch 的等待上限都来自
-robot YAML 的 `robot.controller_startup_timeout.hardware`，不再维护第二套 hardware lifecycle readiness 判定。
+真机控制器由单个 `robot_config/controller_spawner` 进程逐个加载和配置，再通过一次 `switch_controller` 调用统一
+激活当前控制模式要求的 controller，并在同一次切换中停用配置为 inactive 的 controller，避免部分激活窗口。该入口
+修复 ROS 2 Humble 官方 spawner 未向 `load_controller` 传递 service call timeout 的问题，并在调用超时后重新读取
+lifecycle 状态，接受服务端已经完成的操作。组 spawner 成功退出即作为控制器启动屏障，通过后才启动 MoveIt、teleop
+或 task executor。发现、service call 和 switch 的等待上限都来自 robot YAML 的
+`robot.controller_startup_timeout.hardware`，不再维护第二套 hardware lifecycle readiness 判定。
 
 ## 架构
 
@@ -199,6 +200,7 @@ observations:
         color_range: limited
       buffer: {sender_queue_frames: 2, receiver_queue_packets: 256, decoded_frame_capacity: 32, retention_ms: 1000}
       readiness: {keyframe_timeout_ms: 3000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 50}
+      recording: {integrity_mode: strict}
       security: none
 ```
 
@@ -212,6 +214,14 @@ integrity protection and is limited to a trusted robot network. Use an explicit
 Development examples are available in `config/robots/dev_rtp_single_camera.yaml`
 and `config/robots/dev_rtp_multi_camera.yaml`; production profiles remain DDS by
 default.
+
+`transport.recording.integrity_mode` controls episode-level RTP recording integrity:
+
+- `strict` is the default. Any RTP packet gap, timestamp mapping failure, or session
+  generation change rejects the episode and removes every RTP stream recorded for it.
+- `tolerant` preserves the episode and records gaps in each `.h264.json` NDJSON sidecar.
+- All RTP observations in one contract must use the same mode. Mixed strict/tolerant
+  declarations are rejected during contract validation.
 
 `nvidia` 当前仅支持 encoder，典型组合是 edge 使用 `encoder_backend: nvidia`，310B cloud 使用
 `decoder_backend: ascend`。`auto` 的 encoder 探测顺序为 `ascend`、`nvidia`、`software`；显式选择
@@ -298,7 +308,7 @@ pass = gap_deficit <= measurement_tolerance_m
 当前两个 SO101 RealSense 抓取 profile 都将该开关设为 `false`，因此下降后直接闭爪。
 
 `candidate_target_offset_base_m` 是候选目标在 `base_frame` 中的三轴平移补偿。它统一作用于 grasp、approach、
-lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
+grasp 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
 验证过的 `[0.0, 0.0, -0.008]`；该值属于机器人/手眼执行几何，因此由 robot YAML 管理，action 客户端不提供
 覆盖参数。
 
@@ -331,7 +341,7 @@ ik_orientation_guard:
 
 HOME joint5 由同一 robot YAML 的 `ros2_control.reset_positions["5"]` 提供。初始候选只检查
 `abs(candidate_joint5 - home_joint5) <= joint5_home_max_delta_rad + joint5_limit_epsilon_rad`，不把观察位
-joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、grasp 和 lift 才使用阶段连续性门阻止真正的
+joint5 当作抓取安全原点；候选选定以后，approach、pregrasp 和 grasp 才使用阶段连续性门阻止真正的
 半圈翻腕。Hermes 与监督式客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal。
 
 MoveIt LMA 仍使用 `position_only_ik: true`。当前 SO101 profile 不启用
@@ -396,14 +406,19 @@ LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令�
 motion_mode:
   enabled: true
   navigation_enabled_on_startup: false
-  navigation_enabled_topic: /motion_mode/navigation_enabled
-  navigation_mode_ack_topic: /motion_mode/base_navigation_enabled
-  set_navigation_enabled_service: /motion_mode/set_navigation_enabled
+  navigation_enabled_topic: motion_mode/navigation_enabled
+  navigation_mode_ack_topic: motion_mode/base_navigation_enabled
+  set_navigation_enabled_service: motion_mode/set_navigation_enabled
+  manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+  navigation_controllers: [base_velocity_controller]
+  manipulation_control_mode: moveit_planning
+  navigation_control_mode: base_navigation
   transition_timeout_s: 2.0
 ```
 
-`moveit_planning` 同时启动机械臂轨迹、夹爪轨迹、底盘速度、全量关节状态和机械臂专用关节状态控制器。
-任务切换只调用上述服务改变新命令的授权，不停止控制器或重启硬件节点。
+默认抓取模式激活机械臂/夹爪控制器并把底盘控制器保持 inactive。任务切换只调用上述服务；
+MoveIt Gateway 按顺序停止当前运动域、切换 controller manager 中的 active/inactive 控制器集合，并等待
+底盘 bridge 的零速确认。硬件节点不重启，且 1～6 轴与 7～9 轴始终互斥。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -411,6 +426,97 @@ motion_mode:
 `robust_gap_headroom_scale_m` 进一步把 IK/FK 预测接触残差对应的安全间隙余量归一化后纳入排序；
 软排序本身只改变执行顺序。启用 `fixed_finger_robust_gap` 时，独立硬门禁使用下降后的低位实测残差，
 不直接使用准备阶段的预测余量。
+
+## 导航端点 SSOT
+
+`robot.navigation.command_server.action_name` 是 `ExecuteNavigation` action 名的**唯一**配置来源
+（默认 `/navigation/execute`）。`robot_config.loader` 在加载阶段把它投影到
+`robot_execution_endpoints.navigation_action_name`，并参与 canonical execution-context digest。
+
+旧字段 `embodied.execution.navigation_action_name` 已退役。`load_robot_config_dict()` 检测到该键时直接
+报错，要求改用 `robot.navigation.command_server.action_name`。`skill_library` 的 nav_* primitive
+dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` CLI 都从该 SSOT 读取，
+不允许在节点参数或代码里重新声明该 action name。
+
+### 公开 API
+
+`robot_config.loader` 暴露以下与导航端点相关的公开 API：
+
+- `navigation_endpoint_projection(robot_config_dict)`：从完整 robot YAML 解析出导航端点身份
+  （`action_name`、`costmap_readiness_timeout`、`cancel_cleanup_timeout_sec`、`active` 布尔）。
+  只在 `robot.navigation.command_server` 存在且 `action_name` 非空时返回非空 projection。
+- `robot_context_schema_version(robot_config_dict)`：根据解析后的 stage 与 endpoint projection 决定
+  `context_schema_version`。`hybrid` stage 返回 `3`，独立 navigation stage 返回 `2`，其他 stage 返回 `1`。
+  返回值写入 `SkillRobotContext.context_schema_version`，并进入
+  canonical execution-context digest preimage；切换版本会强制新 registry generation。
+- `robot_execution_endpoints(robot_config_dict)`：返回 V1 10-role endpoint map，加上 V2/V3 时的
+  `navigation_action_name`。V1 profile 上 `navigation_action_name` 必须为空，V2/V3 profile 上必须非空。
+- `validate_navigation_endpoint_contract(robot_config_dict)`：在 loader 阶段校验导航端点契约的
+  一致性。拒绝下列情况：V1 profile 上声明非空 `navigation.command_server.action_name`、
+  V2 profile 上 `action_name` 为空、`action_name` 与 `embodied.execution.navigation_action_name`
+  同时存在但取值不一致、或 `costmap_readiness_timeout` 非正。任一不满足时 `load_robot_config_dict()`
+  在返回配置前直接报错。
+
+### `nav_stage` 参数与 stage 解析
+
+`nav_stage` 是 `robot.launch.py` 的 launch argument。标准导航配置声明 `mapping` / `navigation`；
+移动抓取与导航统一配置 `lekiwi_nav_grasp` 还声明 `grasp` 和 `hybrid`。缺省时由
+`robot.default_nav_stage` 决定。stage 在 canonical loader 中解析，builder 和具身运行时只会看到
+解析后的单一配置：
+
+- `grasp`：兼容入口，仅选择腕部 RealSense 与 MoveIt 机械臂/夹爪控制器；
+  `base_velocity_controller` 保持 inactive，不启动 MID-360、FAST-LIO 或 Nav2。
+- `mapping`：启动 SLAM Toolbox（LiDAR）或 RTAB-Map mapping（RealSense），不启动 Nav2 / AMCL /
+  Collision Monitor。统一配置只选择 MID-360 与底盘控制器，并关闭抓取/放置运行时；`/cmd_vel`
+  直接由 `cmd_vel_bridge` 消费。
+- `navigation`：兼容入口，启动 AMCL、Nav2 完整栈与 `navigation_command_server`，但不启动 Hermes；
+  `/cmd_vel` 经 Collision Monitor 收口为 `/cmd_vel_safe` 再交由 bridge 消费。
+- `hybrid`：统一配置的默认入口，同时保留腕部 RealSense、MID-360、抓取/放置依赖、AMCL、Nav2、
+  `navigation_command_server` 和单一 Hermes runtime。统一 skill catalog 同时暴露操作与导航技能，
+  skill executor 在每个技能执行前通过 `motion_mode/set_navigation_enabled` 切换控制权。
+
+统一配置通过 active/inactive controller 集合与 `motion_mode` bridge gate 双重隔离 1～6 轴和 7～9 轴。
+`hybrid` 支持一次启动后交替执行抓取和导航，但不允许两类运动并发。
+
+`grasp` / `mapping` 使用 V1 context，独立 `navigation` 使用 V2 context，`hybrid` 使用 V3 context。
+V3 同时携带 V1 操作 primitive 与 V2 导航 primitive，并在 digest preimage 中加入
+`supported_control_modes`，防止与旧 snapshot 混用。
+
+### `base_navigation` 控制模式
+
+`base_navigation` 是 V2/V3 context 授权导航 primitive 的控制模式。它在 `control_modes` 中声明
+底盘速度控制器集合（典型为 `joint_state_broadcaster` + `base_velocity_controller`）。V2 runtime
+要求 `active_control_mode == 'base_navigation'`；V3 hybrid runtime 则在每个 nav_* 技能下发前通过
+`motion_mode` 切换到该模式。
+
+```yaml
+robot:
+  default_control_mode: "base_navigation"
+
+  control_modes:
+    base_navigation:
+      description: "底盘导航控制模式（V2/V3 context）"
+      controllers:
+        - joint_state_broadcaster
+        - base_velocity_controller
+      inference:
+        enabled: false
+```
+
+`base_navigation` 与 `moveit_planning`、`teleop`、`model_inference` 互斥（同一时刻只能激活一种
+控制模式）。V1/V2 profile 仍要求启动模式与 profile 一致；V3 hybrid profile 允许 catalog 中的技能
+分别声明 `moveit_planning` 或 `base_navigation`，由 skill executor 在安全校验后、下发 primitive 或
+delegated executor 前调用 `motion_mode` 服务。切换失败时技能 fail closed，不下发运动。
+
+### context_schema_version 与 digest preimage
+
+`context_schema_version` 由解析后的 stage 与 `navigation_endpoint_projection` 决定，并写入
+`SkillRobotContext.context_schema_version`。`robot_config.loader.robot_config_digest` 把
+`context_schema_version`、`execution_endpoints`（含 `navigation_action_name`）、命名位姿/目标、
+关节限位、工作空间、控制模式、timeout policy 与相对运动语义一起纳入 digest preimage。
+V3 额外包含 `supported_control_modes`。切换 `context_schema_version` 会改变 digest，强制
+`skill_catalog` 重新编译并生成新 registry generation。V1、V2 与 V3 snapshot 在 registry 层
+永远不可互换校验。
 
 ## 控制模式配置
 
@@ -756,6 +862,11 @@ TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加
 WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
 不是 `robot_config` 的隐式后端选择。
 
+`voice_tts` 同时维护三个语义不同的超时字段：`playback_timeout_sec` 是 `/voice_tts/play`
+同步播放超时；`synthesis_timeout_sec` 是 Hermes `post_llm_call` TTS hook 等待
+`/voice_tts/synthesize` 返回合成结果的超时（由 `hermes-robot-configure` 写入 wrapper 环境变量）；
+`tts_timeout_sec` 是 `embodied_agent` 视觉游戏播报节点的内部 RPC 超时。三者互不替代。
+
 ### 真机手眼配置
 
 SO101 抓取使用同级独立配置 `config/robots/lekiwi_handeye_realsense_grasp.yaml`。用户应直接在
@@ -804,6 +915,8 @@ robot:
       task_budget_sec: 180.0         # 任务端到端总预算
       scene_freshness_sec: 0.5       # 图像/深度新鲜度门槛
       model_idle_timeout_sec: 120.0  # 大模型输出空闲超时
+      visual_game_timeout_sec: 130.0  # 视觉游戏 accepted 到 terminal 的总 deadline
+      visual_game_result_retention_sec: 300.0  # terminal 查询记录最长保留时间
       rpc_timeout_sec: 5.0           # action/server/service 统一 RPC 超时
       gripper_settle_sec: 1.5        # 夹爪稳定等待时间
 
@@ -824,11 +937,13 @@ robot:
         model: Qwen3.5-9B
         api_key_env: ""
 
-    entry:
-      visual_games:
-        sorting_hat:
-          enabled: false        # 趣味视觉游戏默认关闭
-          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+    visual_game_result_capacity: 128  # ledger 满时拒绝新请求，不提前驱逐 retention 内结果
+    visual_game_event_topic: /embodied/visual_game_events
+    visual_games:
+      sorting_hat:
+        enabled: false        # 趣味视觉游戏默认关闭
+        handler: sorting_hat_v1
+        summary: 根据主相机中的人物形象判断其霍格沃茨学院
 
     execution:
       relative_motion_reference_frame: base
@@ -864,7 +979,6 @@ robot:
         observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-        lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
 
 #### Capability Gateway 接线契约
@@ -892,11 +1006,37 @@ digest；它刻意排除 `skill_catalog_source_mode` / `skill_catalog_source_roo
 `config/robots/`；显式路径必须存在。primitive sequence、关节/笛卡尔坐标和目标绑定仍是 `skill_catalog`
 私有实现数据；运行时 ROS service/action endpoint 则由 `robot_config` 配置并进入 canonical execution context。
 
-#### entry.visual_games 一致性
+#### visual_games 一致性
 
-`embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
-camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：
-任一游戏 `enabled=true` 而 `embodied.perception.enabled=false` 时返回错误，配置阶段即拦截。
+`embodied.visual_games` 声明非运动视觉能力（如分院帽）的 handler、公开描述、播报策略与开关。
+视觉游戏只通过 Agent 的 `robot-skill start-game` 控制面触发；`trigger_mode`、`trigger_aliases` 和
+`embodied.entry` 已移除，loader 遇到这些旧字段会明确拒绝配置，避免形成不可见的失效入口。
+camera/VLM 由 `embodied.perception` 管理，游戏 deadline/retention 由 `embodied.timeouts` 管理。启用
+`announce: true` 的视觉游戏会在 TTS service 可用时由 announcer 调用该 service；未配置或不可用时跳过播报，游戏控制面不受影响。
+静默游戏不依赖 TTS。需要播报的终态统一由 announcer 消费事件后调用该 service，调用方不得重复播报。
+`validate_config()` 强制一致性：
+任一游戏 `enabled=true` 而 perception 条件不满足时返回错误，配置阶段即拦截。
+`start_visual_game_service` 与 `get_visual_game_result_service` 声明 Agent 的异步 start/query 控制面，
+`visual_game_event_topic` 声明供 TTS/UI/日志订阅的 accepted/terminal 事件边界；
+`summary` 是公开描述，`handler` 必须引用共享 visual-game registry 中存在的实现契约。loader 同时校验
+enabled、summary 和 handler，并拒绝不受支持的游戏。游戏 capability digest 覆盖启用的
+游戏契约、timeout/retention、ledger capacity 和服务名，与运动 capability digest 相互独立。已知游戏缺省
+handler/summary 由统一 registry 补齐。视觉游戏只读取上述规范字段。
+
+触发入口固定为 Agent：使用 `robot-skill start-game GAME --request-id ID` 发起，并通过
+`robot-skill game-result --request-id ID` 查询终态。修改游戏 YAML 后需重启 pipeline。
+
+#### skill 加载与热更新边界
+
+这里的“热加载”指进程不重启时更新运行时定义。运动 Skill catalog 支持受控的显式热加载：
+`robot-skill reload-catalog --request-id ID --force` 请求 Gateway 从当前配置的 catalog source 重新编译，
+并原子激活完整的新 snapshot。它不是文件系统自动监听，不会重新加载 ROS interface、robot config、节点参数
+或 Python 实现；这些变化仍需重新构建并重启对应 pipeline。Hermes 的 `/reload-skills` 只更新 Agent 指令文件，
+也不更新运动 catalog。
+
+视觉游戏当前不支持热加载。`visual_games_json`、timeout policy、game capability digest 和 handler
+registry 都在相关节点启动时冻结。修改机器人 YAML 后需重启 pipeline；修改 Python handler 后需重新构建并
+重启。`robot-skill reload-catalog` 不会影响视觉游戏。
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)

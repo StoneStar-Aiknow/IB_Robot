@@ -37,6 +37,7 @@ setup(
             "pure_inference_node = inference_service.pure_inference_node:main",
             "global_inference_scheduler_node = inference_service.global_inference_scheduler_node:main",
             "model_service_node = inference_service.model_service_node:main",
+            "recording_node = inference_service.recording_node:main",
         ],
     },
 )

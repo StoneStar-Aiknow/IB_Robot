@@ -19,6 +19,7 @@ _MOCK_SKIPPED_SUBSYSTEMS = frozenset(
     {
         "control",  # contract_mock owns /joint_states; no controller_manager
         "perception",  # contract_mock publishes synthetic camera / lidar topics
+        "speech_direction",  # real microphone capture is out of mock scope
         "voice_asr",  # voice ASR is out of mock scope
         "navigation",  # navigation stack is out of mock scope
     }

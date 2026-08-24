@@ -2,6 +2,32 @@
 
 `ibrobot_msgs` 是 IB-Robot 系统的**统一接口定义包**，包含所有 ROS 2 消息（msg）、动作（action）和服务（srv）的定义。
 
+## 0. 公开请求类型的 schema 版本分离（v1 / v2）
+
+四个公开请求类型——`SkillCommand.Goal`、`PrimitiveCommand.Goal`、`ValidateSkill.Request` 和
+`ValidatePrimitive.Request`——现在都以 `uint32 schema_version` 作为**首字段**。该字段取值集合为
+`{1, 2}`，其他值返回 `SKILL_SCHEMA_INVALID`。
+
+- **v1**：仅承载 manipulation 字段（`motion_direction` / `motion_distance` 等）与原 3 种控制模式、10 个
+  primitive；v1 请求**拒绝**任何导航字段（`direction` / `distance` / `degree` / `x` / `y` / `yaw`）。
+- **v2**：在 v1 字段集合之上**并集**新增导航字段（`direction`、`distance`、`degree`、`has_x`、`x`、
+  `has_y`、`y`、`has_yaw`、`yaw`），并允许 `base_navigation` 控制模式与 3 个导航 primitive
+  （`nav_straight` / `nav_turn` / `nav_abs_coordinate`）。v2 请求**必须**显式设置 `schema_version=2`，
+  不得依赖默认零值。
+
+这是一个 **breaking IDL change**：修改同名 `.action` / `.srv` 的字段集合会改变 ROS type hash，
+不提供旧二进制 wire compatibility，因此必须**原子重建并部署**全部 workspace producer / consumer
+（`skill_library`、`safety_guard`、`embodied_agent`、`robot_skill_cli` 等），不得混跑 v1 与 v2 二进制。
+
+`embodied_common.wire_contracts.validate_public_request_wire_contracts()` 在节点启动时对该契约执行
+preflight 校验：四个请求类型必须以 `schema_version` 为首字段，且取值属于 `{1, 2}`；不匹配时节点不进入
+ready，并以 `SKILL_SCHEMA_INVALID` 报告。该 preflight 与运行期 `primitive_contract_digest` 校验共同构成
+schema / 契约二重门禁，防止 v1 与 v2 二进制混跑。
+
+下游 `WorkflowStep.schema_version` 取值同样从固定 `1` 扩展为 `{1, 2}`，并与所属 capability 的
+schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
+`docs/lightweight_skill_package_registry_design_zh.md` 的 Schema 版本演进一节）。
+
 ## 1. 消息定义（msg/）
 
 ### `TaskCommand.msg`
@@ -125,6 +151,21 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `summary` | `string` | 场景文本摘要 |
 | `objects_json` | `string` | 检测到的物体列表（JSON） |
 | `error_message` | `string` | 失败时的错误信息 |
+
+### 视觉游戏控制服务
+
+`StartVisualGame.srv` 按调用方 `request_id`、`game_name` 和 `expected_config_digest` 幂等发起视觉游戏，
+并返回 `accepted`、`duplicate`、实际 `config_digest` 和错误字段；
+`GetVisualGameResult.srv` 按 `request_id` 返回 `found`、`terminal`、`success`、`game_name`、
+通用 `result_json`、常用结果便捷字段 `scene_summary`、`config_digest` 和错误字段。两者是 Agent/CLI 的纯控制面，
+不传图像、raw response 或音频，
+也不负责 TTS。
+
+`VisualGameEvent.msg` 是视觉游戏的异步事件通知边界，发布到
+`/embodied/visual_game_events`。它包含调用方 `request_id`、每次真实准入生成的 `execution_id`、游戏名、版本化 handler、是否要求播报（`announce`）、
+`accepted`/`succeeded`/`failed` 状态、结果摘要、错误码和配置摘要，供 TTS、UI 或日志消费者订阅。
+执行 TTS 等外部副作用的消费者应使用 live-only 订阅，并按 `execution_id` 去重，不能在重启后回放旧事件；
+同一 request ID 在 ledger retention 过期后重新准入时会得到新的 execution ID。
 
 ### `Detection2D.msg`
 
@@ -253,18 +294,35 @@ catalog entry 重置。`schema_version` v1 固定为 `1`。
 
 planned Workflow 或 Agent plan 的一条 typed step。`skill_name` 是兼容字段名，可指向
 `semantic_level=atomic_operator` 或 `skill` 的 catalog entry。step 不自带 registry identity，而是继承所属
-planned `TaskCommand.dispatch_binding` 的 exact snapshot。`schema_version` v1 固定为 `1`。
+planned `TaskCommand.dispatch_binding` 的 exact snapshot。`schema_version` 取值集合为 `{1, 2}`，由所属
+capability 的 schema 版本决定（v1 capability 产生 `schema_version=1` step，v2 capability 产生
+`schema_version=2` step），不再固定为 `1`。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `schema_version` | `uint32` | schema 版本，v1 固定为 `1` |
+| `schema_version` | `uint32` | schema 版本，取值 `{1, 2}`；由所属 capability 的 schema 版本决定，不再固定为 `1` |
 | `skill_name` | `string` | 兼容字段名，引用 atomic_operator 或 skill catalog entry |
 | `target_name` | `string` | 命名目标 |
 | `container_name` | `string` | 指定容器；对 `place_in_container` 是释放后的视觉检测 query |
 | `place_name` | `string` | 命名放置位 |
-| `motion_direction` | `string` | 相对运动方向 |
-| `motion_distance` | `float32` | 相对运动距离 |
+| `motion_direction` | `string` | 相对运动方向（v1 manipulation 字段） |
+| `motion_distance` | `float32` | 相对运动距离（v1 manipulation 字段） |
+| `direction` | `string` | 导航方向（v2 新增）；v1 step 必须为空 |
+| `distance` | `float32` | 导航距离（v2 新增）；v1 step 必须为 `0.0` |
+| `degree` | `float32` | 导航旋转角度（v2 新增）；v1 step 必须为 `0.0` |
+| `has_x` | `bool` | 是否显式提供 `x`（v2 新增）；用于区分“未提供”与“显式零” |
+| `x` | `float32` | 导航目标 x 坐标（v2 新增）；`has_x=false` 时忽略 |
+| `has_y` | `bool` | 是否显式提供 `y`（v2 新增）；用于区分“未提供”与“显式零” |
+| `y` | `float32` | 导航目标 y 坐标（v2 新增）；`has_y=false` 时忽略 |
+| `has_yaw` | `bool` | 是否显式提供 `yaw`（v2 新增）；用于区分“未提供”与“显式零” |
+| `yaw` | `float32` | 导航目标 yaw（v2 新增）；`has_yaw=false` 时忽略 |
 | `timeout_sec` | `float32` | `<=0` 使用 entry 默认；正值仍受 Skill cap 和共享 `TaskBudget` 约束 |
+
+v1 step 不得携带任何导航字段（`direction` / `distance` / `degree` / `has_x` / `x` / `has_y` / `y` /
+`has_yaw` / `yaw`），校验失败返回 `SKILL_SCHEMA_INVALID`。v2 step 的 `has_x` / `has_y` / `has_yaw` 三个
+bool 字段用于区分**字段缺失**与**显式零值**：`has_*=false` 表示调用方未提供该坐标分量，executor 不得
+将其当作合法零目标；`has_*=true` 时对应的 `x` / `y` / `yaw` 才是有效输入。该设计避免把“未设置”静默
+当作“移动到 (0, 0, 0)”的导航目标。
 
 ### `DelegatedExecutorIdentity.msg`
 
@@ -331,13 +389,23 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 
 | 字段 | 说明 |
 | --- | --- |
+| `schema_version` | schema 版本，取值 `{1, 2}`；首字段，v2 必须显式设置为 `2`，不得依赖默认零值 |
 | `dispatch_binding` | 完整任务/版本信封（含 `task_id`、`task_budget` 与 exact registry identity） |
 | `skill_name` | 技能名（如 `pick_object`、`move_relative_ee`） |
 | `target_name` | 命名目标；对 `pick_object` 表示运行时视觉文本查询 |
 | `container_name` | 指定容器；对 `place_in_container` 表示释放后的视觉检测 query，不参与运动规划 |
 | `place_name` | 命名放置位 |
-| `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`） |
-| `motion_distance` | 相对运动距离（米） |
+| `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`）；v1 manipulation 字段 |
+| `motion_distance` | 相对运动距离（米）；v1 manipulation 字段 |
+| `direction` | 导航方向（v2 新增）；v1 请求必须为空 |
+| `distance` | 导航距离（v2 新增）；v1 请求必须为 `0.0` |
+| `degree` | 导航旋转角度（v2 新增）；v1 请求必须为 `0.0` |
+| `has_x` | 是否显式提供 `x`（v2 新增）；区分“未提供”与“显式零” |
+| `x` | 导航目标 x 坐标（v2 新增）；`has_x=false` 时忽略 |
+| `has_y` | 是否显式提供 `y`（v2 新增）；区分“未提供”与“显式零” |
+| `y` | 导航目标 y 坐标（v2 新增）；`has_y=false` 时忽略 |
+| `has_yaw` | 是否显式提供 `yaw`（v2 新增）；区分“未提供”与“显式零” |
+| `yaw` | 导航目标 yaw（v2 新增）；`has_yaw=false` 时忽略 |
 | `timeout_sec` | per-catalog-entry 请求超时上限，受共享 `task_budget` 剩余预算约束 |
 
 **Result 字段**
@@ -376,9 +444,10 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 
 | 字段 | 说明 |
 | --- | --- |
+| `schema_version` | schema 版本，取值 `{1, 2}`；首字段，v2 必须显式设置为 `2`，不得依赖默认零值 |
 | `dispatch_binding` | 完整任务/版本信封；外部 root Primitive 由 Gateway 在取得 root lease 后 canonicalize |
 | `execution_token` | 父 `PickObject` goal UUID 派生的关联 token；授权始终以 `dispatch_binding` 为准 |
-| `primitive_name` | 原子动作名，包括 `move_to_named_pose`、`move_to_pose`、`move_to_configuration`、`move_relative_ee`、`move_to_joint_positions`、`move_through_joint_positions`、`open_gripper`、`close_gripper`、`rotate_gripper_cw` 和 `rotate_gripper_ccw` |
+| `primitive_name` | 原子动作名。v1 白名单为 `move_to_named_pose`、`move_to_pose`、`move_to_configuration`、`move_relative_ee`、`move_to_joint_positions`、`move_through_joint_positions`、`open_gripper`、`close_gripper`、`rotate_gripper_cw` 和 `rotate_gripper_ccw`（共 10 个）。v2 在 v1 白名单之上**新增** `nav_straight`、`nav_turn`、`nav_abs_coordinate` 三个导航 primitive；v1 请求不得引用这三个名称，否则返回 `SKILL_UNKNOWN_PRIMITIVE` |
 | `pose_name` | 命名位姿（`move_to_named_pose` 使用） |
 | `target_pose` | 动态 base-frame 位姿（`move_to_pose` 使用） |
 | `relative_dx/dy/dz` | 相对增量（`move_relative_ee` 使用，单位米） |
@@ -390,6 +459,9 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `joint_waypoints` | 扁平化关节路点序列，按 `joint_names` 顺序展开 |
 | `joint_waypoint_count` | `joint_waypoints` 中包含的路点数量 |
 | `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
+| `navigation_command_type` | 导航 primitive 类型枚举（v2 新增）；仅 `nav_straight` / `nav_turn` / `nav_abs_coordinate` 使用，v1 请求必须为空 |
+| `navigation_target_pose` | 导航目标位姿（v2 新增）；导航 primitive 的目标 `geometry_msgs/Pose`，v1 请求必须为默认值 |
+| `navigation_value` | 导航标量参数（v2 新增）；`nav_straight` 的距离或 `nav_turn` 的角度，v1 请求必须为 `0.0` |
 | `timeout_sec` | primitive 超时时间，受共享 `task_budget` 剩余预算约束 |
 
 **Result 字段**
@@ -431,8 +503,7 @@ Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway �
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
 | `supervised_direct` | 仅人工真机测试 client 为 `true`；Hermes/catalog 固定为 `false` |
 | `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
-| `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
-| `release_drop_height_m` | 非负时先下降到指定高度再开爪；负值在最终 lift 位释放 |
+| `release_after_success` | 验证成功并运输到 place container 后是否开爪 |
 
 **Result 字段**
 
@@ -618,19 +689,30 @@ snapshot、entry 参数和当前机器人状态，但不查询或修改 coordina
 Gateway action admission 发生，因此 validation 通过不保证 admission 成功。`dispatch_binding` 在 planned
 TaskCommand/SkillCommand validation 时必须提供完整期望 identity；Workflow child validation 可携带
 `root_lease_nonce` 用于关联，但 safety_guard 不得将其视为授权。`dispatch_nonce` 必须为空。
-`schema_version` v1 固定为 `1`。
+`schema_version` 取值集合为 `{1, 2}`，作为请求首字段；v1 请求只携带 manipulation 字段，v2 请求
+允许携带导航字段并必须显式设置为 `2`。
 
 **请求**
 
 | 字段 | 说明 |
 | --- | --- |
+| `schema_version` | schema 版本，取值 `{1, 2}`；首字段，v2 必须显式设置为 `2`，不得依赖默认零值 |
 | `dispatch_binding` | `DispatchBinding`，提供完整期望 registry identity（`root_lease_nonce` 仅用于关联） |
 | `skill_name` | 待执行技能名 |
 | `target_name` | 命名目标 |
 | `container_name` | 指定容器；对放置技能是释放后的视觉检测 query |
 | `place_name` | 命名放置位 |
-| `motion_direction` | `string`，相对运动方向 |
-| `motion_distance` | `float32`，相对运动距离 |
+| `motion_direction` | `string`，相对运动方向（v1 manipulation 字段） |
+| `motion_distance` | `float32`，相对运动距离（v1 manipulation 字段） |
+| `direction` | `string`，导航方向（v2 新增）；v1 请求必须为空 |
+| `distance` | `float32`，导航距离（v2 新增）；v1 请求必须为 `0.0` |
+| `degree` | `float32`，导航旋转角度（v2 新增）；v1 请求必须为 `0.0` |
+| `has_x` | `bool`，是否显式提供 `x`（v2 新增）；区分“未提供”与“显式零” |
+| `x` | `float32`，导航目标 x 坐标（v2 新增）；`has_x=false` 时忽略 |
+| `has_y` | `bool`，是否显式提供 `y`（v2 新增）；区分“未提供”与“显式零” |
+| `y` | `float32`，导航目标 y 坐标（v2 新增）；`has_y=false` 时忽略 |
+| `has_yaw` | `bool`，是否显式提供 `yaw`（v2 新增）；区分“未提供”与“显式零” |
+| `yaw` | `float32`，导航目标 yaw（v2 新增）；`has_yaw=false` 时忽略 |
 
 **响应**
 
@@ -650,14 +732,17 @@ TaskCommand/SkillCommand validation 时必须提供完整期望 identity；Workf
 
 原子动作安全校验服务，路径 `/embodied/validate_primitive`，由 `safety_guard_node` 提供。请求必须携带
 exact registry identity 和非空 `dispatch_nonce`；server 在已验证的 exact snapshot 上做白名单 + 工作空间 +
-关节限位静态校验。`schema_version` v1 固定为 `1`。
+关节限位静态校验。`schema_version` 取值集合为 `{1, 2}`，作为请求首字段；v1 请求只允许引用 v1 primitive
+白名单，v2 请求允许引用 `nav_straight` / `nav_turn` / `nav_abs_coordinate` 三个导航 primitive 并必须显式
+设置为 `2`。
 
 **请求**
 
 | 字段 | 说明 |
 | --- | --- |
+| `schema_version` | schema 版本，取值 `{1, 2}`；首字段，v2 必须显式设置为 `2`，不得依赖默认零值 |
 | `dispatch_binding` | `DispatchBinding`，必须携带完整期望 registry identity 和非空 `dispatch_nonce` |
-| `primitive_name` | 原子动作名 |
+| `primitive_name` | 原子动作名；v1 白名单为 10 个 manipulation primitive，v2 额外允许 `nav_straight` / `nav_turn` / `nav_abs_coordinate` |
 | `pose_name` | 命名位姿名 |
 | `relative_dx/dy/dz` | 相对位移增量 |
 | `target_x/y/z` | 执行层解析出的目标末端位置 |
@@ -670,6 +755,9 @@ exact registry identity 和非空 `dispatch_nonce`；server 在已验证的 exac
 | `joint_waypoints` | 扁平化关节路点序列 |
 | `joint_waypoint_count` | 关节路点数量 |
 | `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
+| `navigation_command_type` | 导航 primitive 类型枚举（v2 新增）；仅导航 primitive 使用，v1 请求必须为空 |
+| `navigation_target_pose` | 导航目标位姿（v2 新增）；导航 primitive 的目标位姿，v1 请求必须为默认值 |
+| `navigation_value` | 导航标量参数（v2 新增）；`nav_straight` 的距离或 `nav_turn` 的角度，v1 请求必须为 `0.0` |
 
 **响应**
 

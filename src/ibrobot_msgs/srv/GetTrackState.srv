@@ -1,0 +1,5 @@
+string session_id
+---
+bool found
+TrackState state
+string message

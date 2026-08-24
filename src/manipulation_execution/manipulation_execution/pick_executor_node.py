@@ -24,6 +24,7 @@ from embodied_common.dispatch_binding import (
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
 from ibrobot_msgs.srv import MoveToConfiguration, PlanGrasp, VerifyGrasp
 from manipulation_execution.phases.execution import ExecutionPhase
@@ -76,16 +77,14 @@ class PickExecutorNode(
         "descend": 0.60,
         "close": 0.68,
         "verify_close": 0.74,
-        "probe_lift": 0.80,
-        "verify_probe": 0.84,
-        "lift": 0.92,
-        "verify_lift": 0.97,
+        "transport": 0.98,
         "release": 0.99,
         "completed": 1.0,
     }
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("pick_executor_node", parameter_overrides=parameter_overrides)
+        validate_public_request_wire_contracts()
         self.declare_parameter("action_name", "/manipulation/execute_pick")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("grasp_execution_json", "{}")
@@ -149,7 +148,10 @@ class PickExecutorNode(
         callback_group = ReentrantCallbackGroup()
         self._joint_state_lock = threading.Lock()
         self._latest_joint_state: JointState | None = None
-        self._ik_worker_verification: tuple[tuple[object, ...], float] | None = None
+        self._ik_worker_verification: tuple[tuple[bool, ...], int] | None = None
+        self._ik_worker_verification_lock = threading.Lock()
+        self._ik_worker_service_state: tuple[bool, ...] | None = None
+        self._ik_worker_service_generation = 0
         self._kinematics_health_lock = threading.Lock()
         self._kinematics_unhealthy_workers: set[int] = set()
         self.create_subscription(
@@ -188,6 +190,15 @@ class PickExecutorNode(
             )
             for index in range(self._ik_worker_count)
         ]
+        self._ik_worker_service_timer = (
+            self.create_timer(
+                0.1,
+                self._refresh_ik_worker_service_generation,
+                callback_group=callback_group,
+            )
+            if self._ik_worker_clients
+            else None
+        )
         self._primitive_client = ActionClient(
             self,
             PrimitiveCommand,
@@ -259,8 +270,6 @@ class PickExecutorNode(
             PickObject.Goal.MODE_PLAN_ONLY,
             PickObject.Goal.MODE_OBSERVE_ONLY,
         }:
-            return GoalResponse.REJECT
-        if not math.isfinite(float(goal_request.release_drop_height_m)):
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:

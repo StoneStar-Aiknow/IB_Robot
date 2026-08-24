@@ -465,7 +465,13 @@ def test_timeout_policy_uses_legacy_execution_values_and_rejects_default_over_bu
 
 @pytest.mark.parametrize(
     "timeout_name",
-    ["default_skill_timeout_sec", "task_budget_sec", "rpc_timeout_sec", "robot_state_freshness_sec"],
+    [
+        "default_skill_timeout_sec",
+        "task_budget_sec",
+        "rpc_timeout_sec",
+        "robot_state_freshness_sec",
+        "visual_game_timeout_sec",
+    ],
 )
 def test_timeout_policy_rejects_gateway_timeout_values_outside_float32_range(timeout_name):
     timeouts = {timeout_name: 1e39}
@@ -484,6 +490,7 @@ def test_timeout_policy_accepts_humble_float32_maximum_for_gateway_runtime_timeo
                 "task_budget_sec": HUMBLE_FLOAT32_MAX,
                 "rpc_timeout_sec": HUMBLE_FLOAT32_MAX,
                 "robot_state_freshness_sec": HUMBLE_FLOAT32_MAX,
+                "visual_game_timeout_sec": HUMBLE_FLOAT32_MAX,
             }
         }
     )
@@ -492,6 +499,20 @@ def test_timeout_policy_accepts_humble_float32_maximum_for_gateway_runtime_timeo
     assert policy["task_budget_sec"] == HUMBLE_FLOAT32_MAX
     assert policy["rpc_timeout_sec"] == HUMBLE_FLOAT32_MAX
     assert policy["robot_state_freshness_sec"] == HUMBLE_FLOAT32_MAX
+    assert policy["visual_game_timeout_sec"] == HUMBLE_FLOAT32_MAX
+
+
+def test_visual_game_timeout_boundary_matches_scene_request_setter():
+    from ibrobot_msgs.msg import SceneAnalysisRequest
+
+    request = SceneAnalysisRequest()
+    policy = resolve_embodied_timeout_policy({"timeouts": {"visual_game_timeout_sec": HUMBLE_FLOAT32_MAX}})
+    request.timeout_sec = policy["visual_game_timeout_sec"]
+
+    with pytest.raises(AssertionError):
+        request.timeout_sec = IEEE_FLOAT32_MAX
+    with pytest.raises(ValueError, match="visual_game_timeout_sec.*float32"):
+        resolve_embodied_timeout_policy({"timeouts": {"visual_game_timeout_sec": HUMBLE_FLOAT32_OVERFLOW}})
 
 
 @pytest.mark.parametrize("timeout_name", ["default_skill_timeout_sec", "task_budget_sec", "rpc_timeout_sec"])
@@ -547,12 +568,13 @@ def test_load_single_arm_config():
     assert config.voice_asr.device_name == ""
     assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
-    assert config.voice_tts.enabled is False
+    assert config.voice_tts.enabled is True
     assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
-    assert config.voice_tts.deployment == ""
+    assert config.voice_tts.deployment == "ubuntu_onnx"
     assert config.voice_tts.service_name == "/voice_tts/synthesize"
     assert config.voice_tts.playback_service_name == "/voice_tts/play"
     assert config.voice_tts.playback_timeout_sec == 300.0
+    assert config.voice_tts.synthesis_timeout_sec == 90.0
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
     assert config.skill_gateway.default_skill_timeout_sec == 120.0

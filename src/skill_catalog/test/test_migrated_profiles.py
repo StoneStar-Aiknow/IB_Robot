@@ -10,6 +10,7 @@ import yaml
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from robot_config.loader import load_robot_config_dict, robot_config_digest
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_skill_cli.catalog import compile_local_snapshot
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
@@ -23,6 +24,9 @@ PROFILES = (
     "lekiwi_handeye_realsense_grasp_pc",
     "so101_rtp_distributed",
 )
+SO101_V1_BASE_COMMIT = "18bbaa419d16b91a66f6a5857d096ff21f3f0549"
+SO101_V1_REGISTRY_DIGEST = "c8c29a1ed666289b41f236d3ae84c84883cfd6b38f1282f67224c8e81d2394b6"
+SO101_V1_CAPABILITY_DIGEST = "9899815166f5684ba69b8401c94e623a90c41460be308e7250d3d3850395f6a4"
 
 
 def _context(config: dict, capability_digest: str) -> SkillCompileContext:
@@ -189,3 +193,12 @@ def test_equivalent_so101_profiles_select_shared_stable_implementation_variant()
             (CATALOG_ROOT / "config" / "profiles" / f"{profile}.yaml").read_text(encoding="utf-8")
         )
         assert all(entry["implementation"] == "so101_arm_v1" for entry in profile_config["enabled_skills"])
+
+
+def test_so101_v1_registry_and_capability_digests_match_base_identity(monkeypatch) -> None:
+    monkeypatch.setenv("WORKSPACE", str(ROOT.parent))
+    config_path = ROBOT_CONFIG_DIR / "so101_single_arm.yaml"
+    snapshot = compile_local_snapshot(load_robot_config_dict(config_path), config_path)
+
+    assert snapshot.registry_digest == SO101_V1_REGISTRY_DIGEST, SO101_V1_BASE_COMMIT
+    assert snapshot.capability_digest == SO101_V1_CAPABILITY_DIGEST, SO101_V1_BASE_COMMIT

@@ -91,9 +91,13 @@ class SegmentationMask:
 
 class SAM2Adapter(PerceptionAdapter):
     identity = AdapterIdentity(
-        "sam2", "sam2-rgb-uint8-v1", "automatic-masks-v1", frozenset({"torch_cpu", "torch_cuda"}), operation="automatic"
+        "sam2",
+        "sam2-rgb-uint8-v1",
+        "automatic-masks-v1",
+        frozenset({"torch_cpu", "torch_cuda", "ascend_310p"}),
+        operation="automatic",
     )
-    compiled_abi_finalized = False
+    compiled_abi_finalized = True
 
     @classmethod
     def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> SAM2Adapter:

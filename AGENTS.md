@@ -63,14 +63,23 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 - 人类贡献者必须逐项审查并对正确性、安全性、许可证合规和可维护性承担最终责任。
 - Commit Message 必须在 `Signed-off-by` 之前包含
   `Co-Authored-By: <AI 模型名称及版本>`；只记录模型本身（如 `gpt-5.6-sol`），不携带
-  `provider/` 前缀，且必须与 PR 披露完全一致。
+  `provider/` 前缀。不同 commit 可以记录各自实际使用的模型，PR 披露必须完整覆盖这些模型。
 - PR 必须披露 Agent 平台及版本、模型名称及版本、Prompt 摘要、人工审查情况，以及第三方材料和
   许可证信息（没有第三方材料时也要明确说明）。
+- Agent 平台版本不得手工臆填。提交/更新 PR 前，coding agent 必须自行执行实际工具的
+  `<tool> --version`（或该工具等价的版本命令），再将命令输出中的工具名和版本传给 PR 工具。仓库不维护
+  工具白名单，也不替未知工具执行命令；脚本只拒绝占位值、缺少版本、控制/注入字符和无法解析的格式。
 - 禁止提交无法解释或维护的 AI 输出、未经授权或许可证不兼容的第三方材料，以及商业秘密、
   个人信息、敏感数据、私有代码、内部文档或未公开漏洞信息。
 - 必须完成与变更风险匹配的测试、构建、许可证和安全检查；不得由 Agent 无人工实质参与地批量提交。
 
 完整政策：<https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>
+
+### WIP PR 双平台验证
+
+当变更触发 Ubuntu/openEuler 双平台 Docker 门禁时，运行验证前必须询问用户 PR 是临时 WIP 还是
+准备交给 reviewer 正式检视。WIP 标题统一为 `[WIP] <title>` 并暂缓双平台 Docker；移除 `[WIP]`
+转为正式检视时，必须补齐当前 Git tree 的两平台验证。WIP 不豁免 DCO、AI 披露、其他测试或 CI。
 
 ## 关键约定
 
@@ -97,6 +106,36 @@ source .shrc_local && <your_command>
 遇到 `ModuleNotFoundError`、`ros2: command not found` 等**环境类报错**时，不要自行构造
 环境变量修复：正确做法是加载 `ibrobot-env` skill 按其模式处理；在 git worktree 中则加载
 `ibrobot-worktree-env`。
+
+### 跨发行版 ROS 包版本一致性（硬性规则）
+
+遇到 ROS 运行时错误且只在 Ubuntu 或只在 openEuler 一侧复现时（典型信号：
+`spawner: error: unrecognized arguments`、`--activate-as-group` 不被接受、ros2 二进制
+段错误、链接期 ABI/`undefined symbol` 报错、CLI flag 或服务接口行为不一致），
+**必须先比对两侧同名 `ros-humble-*` 包版本，再决定是否改代码**：
+
+- Ubuntu（deb）：`dpkg-query -W -f='${Package} ${Version}\n' 'ros-humble-*'`
+- openEuler（rpm）：`rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ros-humble-*'`
+
+若两侧版本不一致，**禁止在代码里向低版本对齐作为兜底**（先例见 #67 / #105 / #187：
+`controller_manager` spawner 的 `--activate-as-group` 兼容性当时以代码降级临时收尾，
+后续同类问题必须走环境升级路径）。正确处置：
+
+1. 在 openEuler 侧卸载全部 ROS 包并重装：
+   ```bash
+   sudo dnf remove 'ros-humble-*'
+   ./scripts/setup.sh   # 内部调用 scripts/install_ros.sh
+   ```
+2. 升级完成后**再次**比对两侧同名包版本，确认一致（或 openEuler 严格更新）。
+3. 若升级后版本仍不一致（openEuler 仓库尚未同步 Ubuntu 上游版本），**不得**回退到
+   代码兜底，而是由用户向 openEuler ROS 包维护者提交 issue/PR 请求版本同步，并附上：
+   - 不一致的包名与两侧版本号（粘贴 dpkg / rpm 原始输出）
+   - 具体错误日志（如 `spawner: error: unrecognized arguments: ...` 整段及前后文）
+   - Ubuntu 侧对应的上游版本与 changelog 链接（packages.ubuntu.com / ROS index）
+   - 对 IB_Robot 的影响（哪条 launch / 哪个节点 / 哪个控制器失败）
+
+详细排查清单与样例日志见
+[`ibrobot-launch` troubleshooting](.agents/skills/ibrobot-launch/references/troubleshooting.md)。
 
 ### libs/lerobot 修改规则
 
@@ -149,7 +188,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、mock/契约测试、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 | [ibrobot-robot-skill-design](.agents/skills/ibrobot-robot-skill-design) | 交互式设计/新增机器人 skill、Hermes/Agent 动作、真机验证方案 |
-| [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 发现、校验、执行或取消现有机器人高层技能 |
+| [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 操作现有机器人高层技能或异步视觉游戏 |
 
 ### 板端（OpenHarmony）
 
@@ -176,8 +215,8 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 |------|---------|
 | [ibrobot-git-flow](.agents/skills/ibrobot-git-flow) | git commit、git push、DCO sign-off |
 | [ibrobot-lerobot-patch](.agents/skills/ibrobot-lerobot-patch) | 导出 lerobot patch、patch 栈管理 |
-| [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build |
-| [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证 |
+| [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build；作者侧 `[WIP]` PR 暂缓 |
+| [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证；作者侧 `[WIP]` PR 暂缓 |
 | [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
 | [skill-creator](.agents/skills/skill-creator) | 新建/重构 Agent skill、编写 SKILL.md、按 agentskills.io 规范校验 |
 
@@ -194,7 +233,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | 技能 | 触发场景 |
 |------|---------|
 | [atomgit-collaboration](.agents/skills/atomgit-collaboration) | 泛化协作请求路由（先识别再分流） |
-| [atomgit-pr](.agents/skills/atomgit-pr) | 创建 PR、更新 PR 描述、生成 PR 摘要 |
+| [atomgit-pr](.agents/skills/atomgit-pr) | 创建/更新 PR、选择 WIP/正式检视阶段、生成 PR 摘要 |
 | [atomgit-issue](.agents/skills/atomgit-issue) | 创建/查看/更新/关闭 Issue |
 | [atomgit-pr-review](.agents/skills/atomgit-pr-review) | 代码审查、PR review、检查 Bug |
 | [atomgit-pr-architecture-review](.agents/skills/atomgit-pr-architecture-review) | 架构审查、SSOT 合规、契约检查 |

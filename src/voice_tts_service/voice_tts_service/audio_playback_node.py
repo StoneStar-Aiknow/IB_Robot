@@ -19,10 +19,12 @@ class AudioPlaybackNode(Node):
         super().__init__("voice_tts_audio_player")
         self.declare_parameter("service_name", "/voice_tts/play")
         self.declare_parameter("timeout_sec", 300.0)
+        self.declare_parameter("player", "aplay")
 
         self._player = AudioFilePlayer(
             AudioPlaybackConfig(
                 timeout_sec=float(self.get_parameter("timeout_sec").value),
+                player=str(self.get_parameter("player").value),
             )
         )
         service_name = str(self.get_parameter("service_name").value)

@@ -42,6 +42,7 @@ class SileroVadEngine:
         model_path: str,
         sample_rate: int = SILERO_SAMPLE_RATE,
         backend: str = "raw_acl",
+        acl_runner=None,
     ):
         """
         Args:
@@ -49,6 +50,10 @@ class SileroVadEngine:
             sample_rate: 输入采样率(默认 16000)
             backend: 推理后端 "raw_acl"(Ascend NPU,默认) 或
                      "onnx"(CPU,onnxruntime,Ubuntu 回归基线)；"om" 归一化为 "raw_acl"
+            acl_runner: 可选,注入已构造好的 raw_acl 推理器(需实现 infer/reset/close,
+                        如 manifest/RuntimeContext 驱动的 SpeechDirectionRoleRunner)。
+                        提供时复用其已加载的 OM/会话,不再另建 SileroVadAclRunner,
+                        避免同一模型被重复加载;仅在 backend="raw_acl" 时生效。
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Silero VAD 模型不存在: {model_path}")
@@ -61,6 +66,20 @@ class SileroVadEngine:
         self._acl_runner = None
 
         if self.backend == "raw_acl":
+            if acl_runner is not None:
+                # 复用调用方已构造的 raw_acl 推理器(如 manifest 驱动的 SpeechDirectionRoleRunner)，
+                # 仅借用本类的 context 拼接逻辑，不重复加载 OM。
+                self._acl_runner = acl_runner
+                self._sess = None
+                self._input_names = []
+                self._output_names = []
+                self._audio_in = self._state_in = self._sr_in = None
+                self._out_name = self._state_out = None
+                self._state = self._zero_state()
+                self._context_size = 64 if sample_rate == 16000 else 32
+                self._context = np.zeros(self._context_size, dtype=np.float32)
+                logger.info("Silero VAD 已加载(复用外部 raw_acl 推理器): sr=%d, backend=%s", sample_rate, backend)
+                return
             # 310P 生产路径直接使用 raw ACL，Silero 的 LSTM state 保留在 Device。
             from .silero_acl import SileroVadAclRunner
 

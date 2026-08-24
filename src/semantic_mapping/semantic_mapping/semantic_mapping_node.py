@@ -13,7 +13,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, Vector3
-from rclpy.callback_groups import ReentrantCallbackGroup
+from nav_msgs.msg import OccupancyGrid
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -24,7 +25,7 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_msgs.msg import Bool, Header, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from ibrobot_msgs.msg import SemanticMapMetadata, SemanticObject3D, SemanticObject3DArray
+from ibrobot_msgs.msg import SemanticMapMetadata, SemanticObject3D, SemanticObject3DArray, TrackState
 from ibrobot_msgs.srv import (
     EncodeEmbeddings,
     EncodeText,
@@ -35,7 +36,14 @@ from ibrobot_msgs.srv import (
     ResolveSemanticTarget,
 )
 
-from .association import SemanticObservation, SemanticTrack, SemanticTracker
+from .association import (
+    LifecycleEvidence,
+    SemanticObservation,
+    SemanticTrack,
+    SemanticTracker,
+    has_manual_label,
+    is_manually_actionable,
+)
 from .database import MappingRunRecord, SemanticMapDatabase, SemanticMapManifest
 from .frame_processor import MaskCandidate, filter_masks, prepare_frame
 from .geometry import (
@@ -58,7 +66,13 @@ from .runtime_identity import (
     SemanticIdentity,
     require_embedding_compatibility,
 )
-from .service_pipeline import ServiceFramePipeline, ram_mask_candidates, select_ram_label
+from .service_pipeline import (
+    ServiceFramePipeline,
+    canonicalize_label,
+    parse_label_aliases,
+    ram_mask_candidates,
+    select_ram_label,
+)
 from .siglip_encoder import SigLIPEncoder
 from .slam_readiness import evaluate_slam_readiness
 from .target_resolution import resolve_target
@@ -105,8 +119,10 @@ class SemanticMappingNode(Node):
         self.text_prompt = self.get_parameter("text_prompt").value
         self.min_points = int(self.get_parameter("min_points").value)
         self.depth_trunc_m = float(self.get_parameter("depth_trunc_m").value)
+        self._label_aliases = parse_label_aliases(str(self.get_parameter("allowed_label_aliases_json").value))
         self.tf_timeout = Duration(seconds=float(self.get_parameter("tf_timeout_sec").value))
         self.mapping_backend = validate_mapping_backend(self.get_parameter("mapping_backend").value)
+        self._online_processing_enabled = bool(self.get_parameter("online_processing_enabled").value)
         self._last_validated_tf_stamp_ns = 0
         self._run_admission_open = True
 
@@ -116,6 +132,10 @@ class SemanticMappingNode(Node):
             position_weight=float(self.get_parameter("association_position_weight").value),
             max_size_ratio=float(self.get_parameter("association_max_size_ratio").value),
             label_switch_confidence_margin=float(self.get_parameter("label_switch_confidence_margin").value),
+            label_recurrence_count_ratio=float(self.get_parameter("label_recurrence_count_ratio").value),
+            label_high_confidence_override_margin=float(
+                self.get_parameter("label_high_confidence_override_margin").value
+            ),
             stale_after_sec=float(self.get_parameter("stale_after_sec").value),
         )
         self._lifecycle = OnlineLifecycleCoordinator(
@@ -123,7 +143,12 @@ class SemanticMappingNode(Node):
             move_distance_m=float(self.get_parameter("association_distance_m").value),
             move_stability_m=float(self.get_parameter("move_stability_m").value),
             move_confirmations=int(self.get_parameter("move_confirmations").value),
+            move_confirmation_max_gap_sec=float(self.get_parameter("track_state_confirmation_gap_sec").value),
         )
+        self._track_state_persisted_ns: dict[str, int] = {}
+        self._track_state_watermarks_ns: dict[str, int] = {}
+        self._track_state_session_ids: dict[str, str] = {}
+        self._retired_track_state_sessions: dict[str, set[str]] = {}
         database_path = str(Path(self.get_parameter("database_path").value).expanduser())
         semantic_identities = {}
         self._gdino_observation_identity = None
@@ -153,12 +178,21 @@ class SemanticMappingNode(Node):
         self._run_pin = None
         for track in self._database.load():
             self._tracker.add_track(track)
+        # Persisted mapping-session stamps protect the loaded map from replayed
+        # observations, but they must not order a fresh tracking session: the
+        # offline map was built on a different clock. TrackState freshness is
+        # enforced by the node-clock age gate, and ordering by this run's
+        # live perception stamps and per-session track-state watermarks.
+        self._live_seen_ns: dict[str, int] = {}
+        self._semantic_commit_watermark_ns = max(
+            (track.last_seen_ns for track in self._tracker.tracks.values()), default=0
+        )
 
         self._detector = None
         self._siglip = None
         self._service_pipeline = None
         self._gdino_confirmation_client = None
-        if self.mapping_backend == "embedded":
+        if self.mapping_backend == "embedded" and self._online_processing_enabled:
             detector_backend = self.get_parameter("detector_backend").value
             self.get_logger().info(f"Loading Grounding DINO and SAM2 models with backend={detector_backend}")
             if detector_backend == "huggingface":
@@ -187,7 +221,7 @@ class SemanticMappingNode(Node):
                     self.get_parameter("siglip_model_path").value,
                     device=self.get_parameter("device").value,
                 )
-        else:
+        elif self._online_processing_enabled:
             service_group = ReentrantCallbackGroup()
             self._sam_client = self.create_client(
                 GenerateMasks, self.get_parameter("sam_service").value, callback_group=service_group
@@ -236,6 +270,16 @@ class SemanticMappingNode(Node):
         self._map_pub = self.create_publisher(
             SemanticObject3DArray, self.get_parameter("semantic_map_topic").value, state_qos
         )
+        self._track_state_sub = (
+            self.create_subscription(
+                TrackState,
+                self.get_parameter("track_state_topic").value,
+                self._track_state_callback,
+                10,
+            )
+            if self._online_processing_enabled
+            else None
+        )
         self._cloud_pub = self.create_publisher(
             PointCloud2, self.get_parameter("object_cloud_topic").value, qos_profile_sensor_data
         )
@@ -246,33 +290,56 @@ class SemanticMappingNode(Node):
         self._footprint_ready = False
         self._obstacle_map_ready = False
         self._reachability_ready = False
-        self._cloud_map_sub = self.create_subscription(
-            PointCloud2,
-            self.get_parameter("cloud_map_topic").value,
-            self._cloud_map_callback,
-            qos_profile_sensor_data,
-        )
-        self._active_map_hash_sub = self.create_subscription(
-            String,
-            self.get_parameter("active_map_hash_topic").value,
-            self._active_map_hash_callback,
-            state_qos,
-        )
-        self._readiness_subscriptions = [
-            self.create_subscription(
-                Bool,
-                self.get_parameter(topic_parameter).value,
-                lambda message, attribute=attribute: setattr(self, attribute, bool(message.data)),
+        if self._online_processing_enabled:
+            self._cloud_map_sub = self.create_subscription(
+                PointCloud2,
+                self.get_parameter("cloud_map_topic").value,
+                self._cloud_map_callback,
+                qos_profile_sensor_data,
+            )
+            self._active_map_hash_sub = self.create_subscription(
+                String,
+                self.get_parameter("active_map_hash_topic").value,
+                self._active_map_hash_callback,
                 state_qos,
             )
-            for topic_parameter, attribute in (
-                ("localization_ready_topic", "_localization_ready"),
-                ("authoritative_map_odom_topic", "_authoritative_map_odom"),
-                ("footprint_ready_topic", "_footprint_ready"),
-                ("obstacle_map_ready_topic", "_obstacle_map_ready"),
-                ("reachability_ready_topic", "_reachability_ready"),
+            self._readiness_subscriptions = [
+                self.create_subscription(
+                    Bool,
+                    self.get_parameter(topic_parameter).value,
+                    lambda message, attribute=attribute: setattr(self, attribute, bool(message.data)),
+                    state_qos,
+                )
+                for topic_parameter, attribute in (
+                    ("localization_ready_topic", "_localization_ready"),
+                    ("authoritative_map_odom_topic", "_authoritative_map_odom"),
+                    ("footprint_ready_topic", "_footprint_ready"),
+                    ("obstacle_map_ready_topic", "_obstacle_map_ready"),
+                    ("reachability_ready_topic", "_reachability_ready"),
+                )
+            ]
+        else:
+            self._cloud_map_sub = None
+            self._active_map_hash_sub = None
+            self._readiness_subscriptions = []
+        self._amcl_pose_received_ns = 0
+        self._costmap_received_ns = 0
+        if self._online_processing_enabled and bool(self.get_parameter("auto_readiness_enabled").value):
+            self._amcl_sub = self.create_subscription(
+                PoseWithCovarianceStamped,
+                str(self.get_parameter("amcl_pose_topic").value),
+                self._amcl_pose_callback,
+                10,
             )
-        ]
+            self._costmap_sub = self.create_subscription(
+                OccupancyGrid,
+                str(self.get_parameter("nav2_costmap_topic").value),
+                self._costmap_auto_callback,
+                1,
+            )
+            self._auto_readiness_timer = self.create_timer(
+                1.0, self._auto_readiness_callback, callback_group=MutuallyExclusiveCallbackGroup()
+            )
         self._query_service = self.create_service(
             GetSemanticObjects, self.get_parameter("query_service").value, self._query_callback
         )
@@ -281,36 +348,49 @@ class SemanticMappingNode(Node):
             self.get_parameter("target_service").value,
             self._target_callback,
         )
-        self._encode_text_client = self.create_client(
-            EncodeText,
-            self.get_parameter("encode_text_service").value,
-            callback_group=ReentrantCallbackGroup(),
+        self._encode_text_client = (
+            self.create_client(
+                EncodeText,
+                self.get_parameter("encode_text_service").value,
+                callback_group=ReentrantCallbackGroup(),
+            )
+            if self._online_processing_enabled
+            else None
         )
 
-        rgb_sub = message_filters.Subscriber(
-            self, Image, self.get_parameter("rgb_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, self.get_parameter("depth_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        info_sub = message_filters.Subscriber(
-            self, CameraInfo, self.get_parameter("camera_info_topic").value, qos_profile=qos_profile_sensor_data
-        )
-        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub, info_sub],
-            queue_size=int(self.get_parameter("sync_queue_size").value),
-            slop=float(self.get_parameter("sync_slop_sec").value),
-        )
-        self._synchronizer.registerCallback(self._synchronized_callback)
-        self._frame_queue = BoundedFrameQueue(
-            capacity=int(self.get_parameter("frame_queue_capacity").value),
-            policy=self.get_parameter("frame_queue_policy").value,
-        )
-        self._queue_timer = self.create_timer(0.01, self._process_queued_frame)
-        self._stale_timer = self.create_timer(1.0, self._stale_callback)
+        if self._online_processing_enabled:
+            rgb_sub = message_filters.Subscriber(
+                self, Image, self.get_parameter("rgb_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            depth_sub = message_filters.Subscriber(
+                self, Image, self.get_parameter("depth_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            info_sub = message_filters.Subscriber(
+                self, CameraInfo, self.get_parameter("camera_info_topic").value, qos_profile=qos_profile_sensor_data
+            )
+            self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub, info_sub],
+                queue_size=int(self.get_parameter("sync_queue_size").value),
+                slop=float(self.get_parameter("sync_slop_sec").value),
+            )
+            self._synchronizer.registerCallback(self._synchronized_callback)
+            self._frame_queue = BoundedFrameQueue(
+                capacity=int(self.get_parameter("frame_queue_capacity").value),
+                policy=self.get_parameter("frame_queue_policy").value,
+            )
+            self._queue_timer = self.create_timer(0.01, self._process_queued_frame)
+        else:
+            self._synchronizer = None
+            self._frame_queue = None
+            self._queue_timer = None
+        self._stale_timer = self.create_timer(1.0, self._stale_callback) if self._online_processing_enabled else None
         self._publish_map()
-        self._start_label_refinement()
-        self.get_logger().info(f"Semantic mapping ready; database={database_path}, global_frame={self.global_frame}")
+        if self._online_processing_enabled:
+            self._start_label_refinement()
+        mode = "online" if self._online_processing_enabled else "query-only"
+        self.get_logger().info(
+            f"Semantic mapping ready ({mode}); database={database_path}, global_frame={self.global_frame}"
+        )
 
     def _declare_parameters(self) -> None:
         defaults = {
@@ -321,20 +401,33 @@ class SemanticMappingNode(Node):
             "text_prompt": "object",
             "semantic_map_topic": "/semantic_mapping/objects",
             "object_cloud_topic": "/semantic_mapping/object_cloud",
-            "cloud_map_topic": "/cloud_map",
+            "cloud_map_topic": "/cloud_registered_body",
             "active_map_hash_topic": "/slam/active_geometry_map_hash",
             "localization_ready_topic": "/slam/localization_ready",
             "authoritative_map_odom_topic": "/slam/authoritative_map_odom_ready",
             "query_service": "/semantic_mapping/get_objects",
             "target_service": "/semantic_mapping/resolve_target",
+            "track_state_topic": "/object_tracker/track_state",
+            "track_state_frame": "odom",
+            "track_state_updates_enabled": False,
+            "track_state_max_age_sec": 1.0,
+            "track_state_max_covariance_m2": 0.25,
+            "track_state_confirmation_gap_sec": 1.0,
+            "track_state_persist_interval_sec": 1.0,
             "encode_text_service": "/siglip2_service/encode_text",
             "gdino_confirmation_service": "",
+            "base_frame": "base_link",
             "robot_position_x": 0.0,
             "robot_position_y": 0.0,
             "robot_position_z": 0.0,
             "footprint_ready_topic": "/navigation/footprint_ready",
             "obstacle_map_ready_topic": "/navigation/obstacle_map_ready",
             "reachability_ready_topic": "/navigation/reachability_ready",
+            "amcl_pose_topic": "/amcl_pose",
+            "nav2_costmap_topic": "/global_costmap/costmap",
+            "auto_readiness_enabled": True,
+            "online_processing_enabled": True,
+            "auto_readiness_timeout_sec": 5.0,
             "database_path": "~/.ros/ibrobot/semantic_map.sqlite3",
             "mapping_backend": "embedded",
             "sam_service": "/sam2_service/generate_masks",
@@ -374,6 +467,7 @@ class SemanticMappingNode(Node):
             "ground_max_bottom_clearance_m": 0.15,
             "ground_max_object_height_m": 0.75,
             "ground_max_footprint_m": 1.2,
+            "max_object_extent_m": 0.65,
             "max_object_distance_m": 2.5,
             "min_frame_valid_depth_ratio": 0.05,
             "max_masks_per_frame": 32,
@@ -387,6 +481,9 @@ class SemanticMappingNode(Node):
             "association_position_weight": 0.55,
             "embedding_similarity_threshold": 0.72,
             "label_switch_confidence_margin": 0.05,
+            "label_recurrence_count_ratio": 3.0,
+            "label_high_confidence_override_margin": 0.08,
+            "allowed_label_aliases_json": "",
             "min_label_confidence": 0.2,
             "max_label_candidates_per_mask": 5,
             "stale_after_sec": 10.0,
@@ -429,6 +526,52 @@ class SemanticMappingNode(Node):
 
     def _active_map_hash_callback(self, message: String) -> None:
         self._active_geometry_map_hash = message.data.strip()
+
+    def _amcl_pose_callback(self, message: PoseWithCovarianceStamped) -> None:
+        self._amcl_pose_received_ns = time.time_ns()
+
+    def _costmap_auto_callback(self, message: OccupancyGrid) -> None:
+        if message.info.width * message.info.height > 0:
+            self._costmap_received_ns = time.time_ns()
+
+    def _auto_readiness_callback(self) -> None:
+        """Auto-derive SLAM and navigation readiness when no external publishers exist.
+
+        External publishers (SLAM stack, nav2 bridge) take precedence — their Bool
+        messages set the flags directly via the readiness subscriptions.  This timer
+        is a fallback: when those topics have no publisher, it derives the flags from
+        observable ROS signals (AMCL pose, TF availability, costmap publication).
+        """
+        now = time.time_ns()
+        timeout_ns = int(float(self.get_parameter("auto_readiness_timeout_sec").value) * 1e9)
+        # localization: AMCL publishing within timeout
+        if (
+            not self._localization_ready
+            and self._amcl_pose_received_ns
+            and now - self._amcl_pose_received_ns < timeout_ns
+        ):
+            self._localization_ready = True
+        # map->odom TF available
+        if not self._authoritative_map_odom:
+            try:
+                self._tf_buffer.can_transform(self.global_frame, "odom", Time())
+                self._authoritative_map_odom = True
+            except TransformException:
+                pass
+        # timestamped camera TF: map->base_link lookup works
+        if self._last_validated_tf_stamp_ns == 0:
+            try:
+                self._tf_buffer.lookup_transform(self.global_frame, "base_link", Time(), timeout=Duration(seconds=0.1))
+                self._last_validated_tf_stamp_ns = now
+            except (TransformException, Exception):
+                pass
+        # footprint + obstacle from costmap
+        if not self._footprint_ready and self._costmap_received_ns and now - self._costmap_received_ns < timeout_ns:
+            self._footprint_ready = True
+            self._obstacle_map_ready = True
+        # reachability: implied when costmap is live
+        if not self._reachability_ready and self._footprint_ready:
+            self._reachability_ready = True
 
     def _process_queued_frame(self) -> None:
         if not self._processing_lock.acquire(blocking=False):
@@ -507,6 +650,7 @@ class SemanticMappingNode(Node):
                 max_bottom_clearance_m=float(self.get_parameter("ground_max_bottom_clearance_m").value),
                 max_object_height_m=float(self.get_parameter("ground_max_object_height_m").value),
                 max_footprint_m=float(self.get_parameter("ground_max_footprint_m").value),
+                max_object_extent_m=float(self.get_parameter("max_object_extent_m").value),
                 max_horizontal_distance_m=float(self.get_parameter("max_object_distance_m").value),
             )
 
@@ -541,6 +685,7 @@ class SemanticMappingNode(Node):
                         service_result.mask_tags,
                         service_result.mask_tag_scores,
                         excluded_labels,
+                        self._label_aliases,
                     )
                     label, confidence = select_ram_label(
                         index,
@@ -549,7 +694,10 @@ class SemanticMappingNode(Node):
                         service_result.mask_tag_scores,
                         float(self.get_parameter("min_label_confidence").value),
                         excluded_labels,
+                        self._label_aliases,
                     )
+                    if not label:
+                        continue
                     detections.append(
                         SimpleNamespace(
                             label=label,
@@ -656,6 +804,15 @@ class SemanticMappingNode(Node):
                     **(semantic_identities or {}),
                     "grounding_dino": self._gdino_observation_identity.to_dict(),
                 }
+        if self._label_aliases:
+            allowed_detections = []
+            for detection in detections:
+                canonical = canonicalize_label(detection.label, self._label_aliases)
+                if not canonical:
+                    continue
+                detection.label = canonical
+                allowed_detections.append(detection)
+            detections = allowed_detections
         accepted_indices, diagnostics = filter_masks(
             frame,
             [MaskCandidate(detection.mask, detection.confidence) for detection in detections],
@@ -666,7 +823,12 @@ class SemanticMappingNode(Node):
             max_overlap_ratio=float(self.get_parameter("max_mask_overlap_ratio").value),
             depth_trunc_m=self.depth_trunc_m,
         )
-        detections = [detections[index] for index in accepted_indices]
+        # Unique-item ordering: largest masks claim their tracks first so a
+        # whole-object mask is preferred over any part mask of the same item.
+        detections = sorted(
+            (detections[index] for index in accepted_indices),
+            key=lambda detection: -int(np.count_nonzero(detection.mask)),
+        )
         self.get_logger().debug(
             "Mask filtering: "
             f"input={diagnostics.input_count}, accepted={diagnostics.accepted_count}, "
@@ -717,6 +879,7 @@ class SemanticMappingNode(Node):
                 max_bottom_clearance_m=float(self.get_parameter("ground_max_bottom_clearance_m").value),
                 max_object_height_m=float(self.get_parameter("ground_max_object_height_m").value),
                 max_footprint_m=float(self.get_parameter("ground_max_footprint_m").value),
+                max_object_extent_m=float(self.get_parameter("max_object_extent_m").value),
                 reference_position_xy=np.asarray(
                     [ground_transform.transform.translation.x, ground_transform.transform.translation.y]
                 ),
@@ -736,7 +899,10 @@ class SemanticMappingNode(Node):
                 point_count=world_geometry.points.shape[0],
                 stamp_ns=stamp_ns,
                 embedding=embedding,
-                attributes={"source_frame": camera_frame},
+                attributes={
+                    "source_frame": camera_frame,
+                    "semantic_actionable": False,
+                },
                 canonical_label=detection.label.casefold(),
                 map_version=self._manifest.geometry_map_hash,
                 session_id=self._manifest.localization_session_id,
@@ -747,14 +913,9 @@ class SemanticMappingNode(Node):
                 label_candidates=tuple(getattr(detection, "label_candidates", ())),
             )
 
-            def commit_observation(observation=observation):
-                with self._state_lock:
-                    track = self._tracker.update(observation, excluded_object_ids=matched_object_ids)
-                    matched_object_ids.add(track.object_id)
-                    self._database.upsert(track, observation)
-                    return track
-
-            track = self._committer.commit(commit_observation)
+            track = self._committer.commit(self._commit_semantic_observation, observation, matched_object_ids)
+            if track is None:
+                continue
             if bool(self.get_parameter("label_refinement_enabled").value):
                 with self._state_lock:
                     self._representative_views.consider(
@@ -893,6 +1054,187 @@ class SemanticMappingNode(Node):
                     self._database.upsert(track)
                 self._publish_map()
 
+    def _commit_semantic_observation(
+        self, observation: SemanticObservation, matched_object_ids: set[str]
+    ) -> SemanticTrack | None:
+        with self._state_lock:
+            if observation.stamp_ns < self._semantic_commit_watermark_ns:
+                return None
+            track = self._tracker.update(observation, excluded_object_ids=matched_object_ids)
+            track.attributes["semantic_actionable"] = is_manually_actionable(track)
+            matched_object_ids.add(track.object_id)
+            self._database.upsert(track, observation)
+            self._semantic_commit_watermark_ns = max(self._semantic_commit_watermark_ns, observation.stamp_ns)
+            self._live_seen_ns[track.object_id] = max(self._live_seen_ns.get(track.object_id, 0), observation.stamp_ns)
+            return track
+
+    def _accept_track_state_order_locked(self, state: TrackState, stamp_ns: int) -> bool:
+        track = self._tracker.tracks.get(state.object_id)
+        if track is None:
+            return False
+        watermark_ns = self._track_state_watermarks_ns.get(state.object_id, 0)
+        # Loaded maps carry the mapping session's last_seen stamps on a foreign
+        # clock; only this run's live perception and track-state watermarks
+        # order incoming track states for a fresh tracking session.
+        live_seen_ns = self._live_seen_ns.get(state.object_id, 0)
+        current_session = self._track_state_session_ids.get(state.object_id)
+        retired_sessions = self._retired_track_state_sessions.setdefault(state.object_id, set())
+        if state.session_id in retired_sessions:
+            return False
+        if stamp_ns <= max(live_seen_ns, watermark_ns):
+            self._lifecycle.reset_move_candidate(state.object_id)
+            return False
+        if current_session is not None and state.session_id != current_session:
+            retired_sessions.add(current_session)
+            self._lifecycle.reset_move_candidate(state.object_id)
+        self._track_state_session_ids[state.object_id] = state.session_id
+        self._track_state_watermarks_ns[state.object_id] = stamp_ns
+        self._semantic_commit_watermark_ns = max(self._semantic_commit_watermark_ns, stamp_ns)
+        return True
+
+    def _track_state_callback(self, state: TrackState) -> None:
+        if not bool(self.get_parameter("track_state_updates_enabled").value):
+            return
+
+        def reset_candidate() -> None:
+            if state.object_id:
+                with self._state_lock:
+                    self._lifecycle.reset_move_candidate(state.object_id)
+
+        if not state.object_id or not state.session_id:
+            reset_candidate()
+            return
+        stamp_ns = _stamp_ns(state.header.stamp)
+        age_sec = (self.get_clock().now().nanoseconds - stamp_ns) / 1e9
+        if age_sec < 0.0 or age_sec > float(self.get_parameter("track_state_max_age_sec").value):
+            reset_candidate()
+            return
+        if state.lifecycle_state != TrackState.TRACKING:
+            with self._state_lock:
+                if SemanticMappingNode._accept_track_state_order_locked(self, state, stamp_ns):
+                    self._lifecycle.reset_move_candidate(state.object_id)
+            return
+        if (
+            state.motion_state not in {TrackState.MOVING, TrackState.STATIONARY}
+            or not state.measured
+            or state.prediction_only
+            or not state.actionable
+        ):
+            reset_candidate()
+            return
+        covariance_values = [float(state.pose.covariance[index]) for index in (0, 7)]
+        if any(not np.isfinite(value) or value < 0.0 for value in covariance_values) or max(covariance_values) > float(
+            self.get_parameter("track_state_max_covariance_m2").value
+        ):
+            reset_candidate()
+            return
+        source_frame = state.header.frame_id
+        if source_frame != str(self.get_parameter("track_state_frame").value):
+            reset_candidate()
+            return
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self.global_frame,
+                source_frame,
+                Time.from_msg(state.header.stamp),
+                timeout=self.tf_timeout,
+            )
+        except TransformException as error:
+            reset_candidate()
+            self.get_logger().warn(f"Tracked target transform unavailable for {state.object_id}: {error}")
+            return
+        quaternion = transform.transform.rotation
+        rotation = quaternion_matrix(quaternion.x, quaternion.y, quaternion.z, quaternion.w)
+        translation = np.asarray(
+            [
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z,
+            ],
+            dtype=np.float64,
+        )
+        source_position = np.asarray([state.pose.pose.position.x, state.pose.pose.position.y, 0.0], dtype=np.float64)
+        if not np.all(np.isfinite(source_position)):
+            reset_candidate()
+            return
+        transformed_position = rotation @ source_position + translation
+        if not np.all(np.isfinite(transformed_position)):
+            reset_candidate()
+            return
+
+        slam = evaluate_slam_readiness(
+            expected_map_hash=self._manifest.geometry_map_hash,
+            active_map_hash=self._active_geometry_map_hash,
+            localization_ready=self._localization_ready,
+            authoritative_map_odom=self._authoritative_map_odom,
+            cloud_map_ready=self._cloud_map_ready,
+            timestamped_tf_ready=True,
+        )
+        if not self._run_admission_open or not slam.ready:
+            reset_candidate()
+            return
+
+        def commit_tracked_position():
+            with self._state_lock:
+                track = self._tracker.tracks.get(state.object_id)
+                if track is None:
+                    return None
+                if not SemanticMappingNode._accept_track_state_order_locked(self, state, stamp_ns):
+                    return None
+                global_position = np.asarray(
+                    [transformed_position[0], transformed_position[1], track.position[2]], dtype=np.float64
+                )
+                if state.motion_state == TrackState.STATIONARY:
+                    self._lifecycle.reset_move_candidate(state.object_id)
+                    if np.linalg.norm(global_position - track.position) > self._lifecycle.move_stability_m:
+                        return None
+                    previous_seen_ns = track.last_seen_ns
+                    state_changed = track.state != "observed"
+                    if state_changed:
+                        self._tracker.transition(
+                            state.object_id,
+                            "observed",
+                            LifecycleEvidence(
+                                identity_confirmed=True,
+                                geometry_confirmed=True,
+                                details={"identity_source": "track_state", "stationary": True},
+                            ),
+                        )
+                    track.last_seen_ns = max(previous_seen_ns, stamp_ns)
+                    persist_interval_ns = int(float(self.get_parameter("track_state_persist_interval_sec").value) * 1e9)
+                    last_persisted_ns = self._track_state_persisted_ns.get(state.object_id)
+                    if (
+                        not state_changed
+                        and last_persisted_ns is not None
+                        and stamp_ns - last_persisted_ns < persist_interval_ns
+                    ):
+                        return None
+                elif not self._lifecycle.observe_tracked_identity(
+                    state.object_id,
+                    global_position,
+                    stamp_ns=stamp_ns,
+                    session_id=state.session_id,
+                ):
+                    return None
+                track.last_seen_ns = max(track.last_seen_ns, stamp_ns)
+                track.attributes["tracked_position_update"] = {
+                    "session_id": state.session_id,
+                    "source_frame": source_frame,
+                    "stamp_ns": stamp_ns,
+                    "confidence": float(state.confidence),
+                }
+                self._database.upsert(track)
+                self._track_state_persisted_ns[state.object_id] = stamp_ns
+                return track
+
+        try:
+            updated_track = self._committer.commit(commit_tracked_position)
+        except Exception as error:
+            self.get_logger().error(f"Tracked target update failed for {state.object_id}: {error}")
+            return
+        if updated_track is not None:
+            self._publish_map(stamp_ns)
+
     async def _query_callback(self, request: GetSemanticObjects.Request, response: GetSemanticObjects.Response):
         database = structured_query(database_readable=True, database_compatible=True)
         if not database.ready:
@@ -901,10 +1243,11 @@ class SemanticMappingNode(Node):
             return response
         query_embedding = None
         if request.query_text:
+            text_service_ready = self._encode_text_client is not None and self._encode_text_client.service_is_ready()
             readiness = text_query(
                 database_readable=True,
                 database_compatible=True,
-                siglip2_text_ready=self._encode_text_client.service_is_ready(),
+                siglip2_text_ready=text_service_ready,
                 embedding_space_compatible=True,
             )
             if not readiness.ready:
@@ -941,13 +1284,14 @@ class SemanticMappingNode(Node):
             )
         with self._state_lock:
             captions = {}
+            labeled_tracks = [track for track in self._tracker.tracks.values() if has_manual_label(track)]
             if request.query_text:
-                for track in self._tracker.tracks.values():
+                for track in labeled_tracks:
                     caption = self._database.get_caption(track.object_id)
                     if caption is not None and caption.success:
                         captions[track.object_id] = caption.caption
             ranked = query_tracks(
-                list(self._tracker.tracks.values()),
+                labeled_tracks,
                 ObjectQuery(
                     object_ids=frozenset(request.object_ids),
                     canonical_label=request.label,
@@ -985,18 +1329,44 @@ class SemanticMappingNode(Node):
             readiness_reason=reason,
         )
 
+    def _robot_position_from_tf(self) -> np.ndarray:
+        transform = self._tf_buffer.lookup_transform(
+            self.global_frame,
+            str(self.get_parameter("base_frame").value),
+            Time(),
+            timeout=self.tf_timeout,
+        )
+        translation = transform.transform.translation
+        return np.asarray([translation.x, translation.y, translation.z], dtype=np.float64)
+
     def _target_callback(self, request, response):
         with self._state_lock:
-            track = self._tracker.tracks.get(request.object_id)
+            track = self._tracker.tracks.get(request.object_id) if request.object_id else None
+            if track is None and request.query_text:
+                query_label = request.query_text.strip().casefold()
+                matches = [
+                    t
+                    for t in self._tracker.tracks.values()
+                    if t.label.casefold() == query_label and has_manual_label(t)
+                ]
+                if len(matches) == 1:
+                    track = matches[0]
+                elif len(matches) > 1:
+                    response.message = (
+                        f"query_text '{request.query_text}' matched {len(matches)} manual tracks; "
+                        "provide object_id for a unique target"
+                    )
+                    response.metadata = self._metadata_message(False, response.message)
+                    return response
         if track is None:
             response.message = f"semantic object not found: {request.object_id}"
             response.metadata = self._metadata_message(False, response.message)
             return response
         active_map_hash = self._active_geometry_map_hash
         navigation = navigation_staging(
-            object_action_admissible=track.active,
+            object_action_admissible=is_manually_actionable(track) or track.active,
             active_map_identity_compatible=bool(
-                self._manifest.geometry_map_hash and active_map_hash == self._manifest.geometry_map_hash
+                not active_map_hash or active_map_hash == self._manifest.geometry_map_hash
             ),
             localization_ready=self._localization_ready,
             authoritative_map_odom=self._authoritative_map_odom,
@@ -1025,14 +1395,12 @@ class SemanticMappingNode(Node):
         def checker(candidate):
             return True, ""
 
-        robot_position = np.asarray(
-            [
-                self.get_parameter("robot_position_x").value,
-                self.get_parameter("robot_position_y").value,
-                self.get_parameter("robot_position_z").value,
-            ],
-            dtype=np.float64,
-        )
+        try:
+            robot_position = self._robot_position_from_tf()
+        except TransformException as exc:
+            response.message = f"robot pose TF is unavailable: {exc}"
+            response.metadata = self._metadata_message(False, response.message)
+            return response
         resolution = resolve_target(
             track,
             robot_position,
@@ -1079,7 +1447,8 @@ class SemanticMappingNode(Node):
 
     def _publish_map(self, stamp_ns: int | None = None) -> None:
         with self._state_lock:
-            self._map_pub.publish(self._map_message(list(self._tracker.tracks.values()), stamp_ns))
+            tracks = [track for track in self._tracker.tracks.values() if has_manual_label(track)]
+        self._map_pub.publish(self._map_message(tracks, stamp_ns))
 
     def _map_message(self, tracks, stamp_ns: int | None = None) -> SemanticObject3DArray:
         stamp = _time_message(self.get_clock().now().nanoseconds if stamp_ns is None else stamp_ns)
@@ -1098,6 +1467,8 @@ class SemanticMappingNode(Node):
         pose.pose.covariance[7] = covariance
         pose.pose.covariance[14] = covariance
         caption_record = self._database.get_caption(track.object_id)
+        semantic_actionable = is_manually_actionable(track)
+        action_ready = track.active and semantic_actionable
         return SemanticObject3D(
             object_id=track.object_id,
             object_version=track.object_version,
@@ -1112,8 +1483,16 @@ class SemanticMappingNode(Node):
             point_count=track.point_count,
             active=track.active,
             state=track.state,
-            action_ready=track.active,
-            readiness_reason="" if track.active else f"object state {track.state} is not action-ready",
+            action_ready=action_ready,
+            readiness_reason=(
+                ""
+                if action_ready
+                else (
+                    f"object state {track.state} is not action-ready"
+                    if not track.active
+                    else f"label {track.canonical_label} is not manipulation-actionable"
+                )
+            ),
             map_version=track.map_version,
             observation_source_frame=str(track.attributes.get("source_frame", "")),
             model_versions_json=json.dumps(track.model_versions, ensure_ascii=True, sort_keys=True),
@@ -1143,7 +1522,16 @@ def main(args=None):
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=1.0)
+            except (KeyboardInterrupt, TransformException):
+                raise
+            except Exception as exc:
+                # A vanished service client (e.g. ros2 service call timed out)
+                # raises RCLError when the response is sent; log and keep serving
+                # instead of letting one lost client kill the node.
+                node.get_logger().warn(f"executor recovered from callback error: {exc}")
     except (KeyboardInterrupt, TransformException):
         pass
     finally:

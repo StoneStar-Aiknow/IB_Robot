@@ -3,7 +3,7 @@
 <package format="3">
   <name>robot_skill_cli</name>
   <version>0.1.0</version>
-  <description>Stable JSON command-line adapter for the IB-Robot Capability Gateway.</description>
+  <description>Controlled CLI surface for LLM/Agent ROS access in IB-Robot.</description>
   <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 
@@ -15,6 +15,7 @@
   <depend>embodied_common</depend>
   <depend>ament_index_python</depend>
   <depend>skill_catalog</depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

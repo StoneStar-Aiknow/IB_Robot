@@ -11,7 +11,10 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from inference_service.h264_stream_recorder import H264StreamRecorder
 
 from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
 from inference_service.video_codec import EncodedPacket, VideoCodecError, VideoDecoder, VideoFrame
@@ -477,6 +480,8 @@ class H264RtpReceiver:
         endpoint: tuple[str, int] | None = None,
         datagram_receiver: DatagramReceiver | None = None,
         max_datagram_size: int = 65535,
+        recorder: H264StreamRecorder | None = None,
+        decode: bool = True,
     ) -> None:
         if not stream_id or not observation_key or session_generation < 1 or packet_queue_capacity <= 0:
             raise ValueError("RTP receiver requires stream identity, session, and positive queue capacity")
@@ -489,6 +494,10 @@ class H264RtpReceiver:
         self.timestamp_mapper = timestamp_mapper
         self.session_generation = session_generation
         self.selected_backend = selected_backend
+        self._recorder = recorder
+        self._decode = decode
+        self._frame_count = 0
+        self._recording_generation: int | None = None
         if max_datagram_size <= _RTP_HEADER.size:
             raise ValueError("max_datagram_size must exceed the RTP header size")
         if datagram_receiver is not None and endpoint is None:
@@ -608,6 +617,15 @@ class H264RtpReceiver:
             self._keyframe_ready = False
             self._degrade("packet_loss", f"lost {lost_packets} RTP packets", lost_packets=lost_packets)
         if access_unit is None:
+            if lost_packets:
+                self._record_access_unit(
+                    b"",
+                    capture_timestamp_ns=None,
+                    rtp_timestamp=packet.timestamp,
+                    keyframe=False,
+                    lost_packets=lost_packets,
+                    dropped="rtp_sequence_gap",
+                )
             return []
         self._have_sps = self._have_sps or access_unit.has_sps
         self._have_pps = self._have_pps or access_unit.has_pps
@@ -625,8 +643,28 @@ class H264RtpReceiver:
                 session_generation=self.session_generation,
             )
         except ObservationSynchronizationError as exc:
+            self._record_access_unit(
+                access_unit.payload,
+                capture_timestamp_ns=None,
+                rtp_timestamp=access_unit.timestamp,
+                keyframe=access_unit.keyframe,
+                lost_packets=lost_packets,
+                dropped="timestamp_unmapped",
+            )
             self._keyframe_ready = False
             self._degrade("timestamp_mapping_unavailable", str(exc))
+            return []
+        self._record_access_unit(
+            access_unit.payload,
+            capture_timestamp_ns=capture_timestamp_ns,
+            rtp_timestamp=access_unit.timestamp,
+            keyframe=access_unit.keyframe,
+            lost_packets=lost_packets,
+        )
+        if not self._decode:
+            with self._lock:
+                self._state = StreamLifecycleState.READY
+                self._last_error = ""
             return []
         try:
             frames = self.decoder.decode(
@@ -669,6 +707,7 @@ class H264RtpReceiver:
             self.frame_buffer.reset()
             self.timestamp_mapper.reset(session_generation)
             self.session_generation = session_generation
+            self._frame_count = 0
             self._have_sps = False
             self._have_pps = False
             self._keyframe_ready = False
@@ -701,6 +740,43 @@ class H264RtpReceiver:
             self._queue.clear()
             self._state = StreamLifecycleState.STOPPED
             self._metrics = replace(self._metrics, queued_packets=0)
+
+    def _record_access_unit(
+        self,
+        payload: bytes,
+        *,
+        capture_timestamp_ns: int | None,
+        rtp_timestamp: int,
+        keyframe: bool,
+        lost_packets: int,
+        dropped: str | None = None,
+    ) -> None:
+        """Record one reconstructed access unit without disrupting reception on I/O errors."""
+        if self._recorder is None:
+            return
+        recording_generation = self._recorder.recording_generation()
+        if recording_generation is None:
+            self._recording_generation = None
+            return
+        if recording_generation != self._recording_generation:
+            self._frame_count = 0
+            self._recording_generation = recording_generation
+        frame_index = self._frame_count
+        self._frame_count += 1
+        try:
+            self._recorder.write_access_unit(
+                payload=payload,
+                capture_timestamp_ns=capture_timestamp_ns,
+                rtp_timestamp=rtp_timestamp,
+                frame_index=frame_index,
+                keyframe=keyframe,
+                lost_packets=lost_packets,
+                session_generation=self.session_generation,
+                dropped=dropped,
+            )
+        except (OSError, ValueError) as exc:
+            with self._lock:
+                self._last_error = f"recording_failed: {exc}"
 
     def _receive_loop(self) -> None:
         assert self._socket is not None

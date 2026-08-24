@@ -1,9 +1,4 @@
-"""Cross-package visual-game contract integration tests.
-
-This lives in embodied_bringup (the orchestration package) rather than
-perception_service so the generic perception package does not test-depend on the
-entry-layer business package.
-"""
+"""Cross-package visual-game request/response contract regression tests."""
 
 import json
 
@@ -12,20 +7,11 @@ from embodied_common.scene_analysis import SceneAnalysis
 from perception_service.perception_service_node import PerceptionServiceNode
 
 
-def _analysis(scene_summary: str) -> SceneAnalysis:
-    return SceneAnalysis(
-        scene_summary=scene_summary,
-        visible_objects=[],
-        robot_state_summary="",
-        ee_pose_interpretation="",
-        risks=[],
-        confidence=1.0,
-    )
-
-
-def test_sorting_hat_request_contract_matches_perception_enforcer():
-    request = build_game_request("sorting_hat")
+def test_game_request_contract_matches_perception_enforcer():
+    request = build_game_request("sorting_hat", request_id="contract-test-1")
     context = json.loads(request.context_json)
 
-    assert PerceptionServiceNode._check_response_contract(context, _analysis("赫奇帕奇")) is None
-    assert PerceptionServiceNode._check_response_contract(context, _analysis("不存在的学院")) is not None
+    valid = SceneAnalysis("赫奇帕奇", [], "", "", [], 1.0)
+    invalid = SceneAnalysis("不存在的学院", [], "", "", [], 1.0)
+    assert PerceptionServiceNode._check_response_contract(context, valid) is None
+    assert PerceptionServiceNode._check_response_contract(context, invalid) is not None

@@ -30,6 +30,35 @@ from manipulation_execution.so101_geometry import axis_error_deg, quaternion_err
 class ExecutionPhase:
     """Execute one prepared candidate and enforce post-motion safety checks."""
 
+    def _post_grasp_motion_target(self) -> tuple[dict, JointState]:
+        config = self._config.get("post_grasp_motion", {})
+        if not isinstance(config, dict):
+            raise PickFlowError("INVALID_GRASP_CONFIG", "post_grasp_motion must be a mapping")
+        names = [str(name) for name in config.get("joint_names", [])]
+        positions_by_name = config.get("joint_positions", {})
+        if not names or not isinstance(positions_by_name, dict) or set(names) != set(positions_by_name):
+            raise PickFlowError(
+                "INVALID_GRASP_CONFIG",
+                "post_grasp_motion must define matching joint_names and joint_positions",
+            )
+        if len(set(names)) != len(names) or any(
+            not isinstance(value, int | float) or not math.isfinite(float(value))
+            for value in positions_by_name.values()
+        ):
+            raise PickFlowError(
+                "INVALID_GRASP_CONFIG",
+                "post_grasp_motion joint names must be unique and positions finite",
+            )
+        if set(names) != set(self._arm_joint_names):
+            raise PickFlowError(
+                "INVALID_GRASP_CONFIG",
+                "post_grasp_motion must target exactly the configured arm joints",
+            )
+        target = JointState()
+        target.name = names
+        target.position = [float(positions_by_name[name]) for name in names]
+        return config, target
+
     def _record_verification(
         self,
         state: FlowState,
@@ -42,8 +71,6 @@ class ExecutionPhase:
         record = {
             "label": {
                 "verify_close": "close",
-                "verify_probe": "probe_lift",
-                "verify_lift": "lift",
             }.get(phase, phase.removeprefix("verify_")),
             "success": bool(response.success),
             "status": status,
@@ -137,7 +164,7 @@ class ExecutionPhase:
             task_id,
             "move_to_pose",
             pose=self._pose(retreat, prepared.plan.quaternion),
-            velocity_scaling=float(self._config.get("lift_velocity_scaling", 0.05)),
+            velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.05)),
         )
         self._run_primitive(
             goal_handle,
@@ -160,101 +187,6 @@ class ExecutionPhase:
                     pose_name=observe_pose,
                     velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
                 )
-
-    def _recover_after_retention_failure(
-        self,
-        goal_handle,
-        deadline: float,
-        task_id: str,
-        state: FlowState | None = None,
-    ) -> None:
-        self._run_primitive(
-            goal_handle,
-            deadline,
-            task_id,
-            "open_gripper",
-            gripper_position=self._gripper_open,
-        )
-        if state is not None:
-            self._move_to_observe(goal_handle, deadline, state, task_id)
-            state.recovery_completed = True
-        else:
-            observe_pose = str(self._config.get("observe_pose", "observe_table"))
-            if observe_pose:
-                self._run_primitive(
-                    goal_handle,
-                    deadline,
-                    task_id,
-                    "move_to_named_pose",
-                    pose_name=observe_pose,
-                    velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
-                )
-
-    def _recover_after_release_failure(self, goal_handle, deadline: float, task_id: str, plan) -> None:
-        """Best-effort cleanup after a verified pick fails during post-success release."""
-
-        opened = False
-        try:
-            self._run_primitive(
-                goal_handle,
-                deadline,
-                task_id,
-                "open_gripper",
-                gripper_position=self._gripper_open,
-            )
-            opened = True
-        except PickFlowError as exc:
-            self.get_logger().error(f"release cleanup could not open gripper: {exc.code}: {exc}")
-
-        try:
-            if opened:
-                observe_pose = str(self._config.get("observe_pose", "observe_table"))
-                if observe_pose:
-                    self._run_primitive(
-                        goal_handle,
-                        deadline,
-                        task_id,
-                        "move_to_named_pose",
-                        pose_name=observe_pose,
-                        velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
-                    )
-            else:
-                self._run_primitive(
-                    goal_handle,
-                    deadline,
-                    task_id,
-                    "move_to_pose",
-                    pose=self._pose(plan.lift, plan.quaternion),
-                    velocity_scaling=float(self._config.get("lift_velocity_scaling", 0.05)),
-                )
-        except PickFlowError as exc:
-            self.get_logger().error(f"release cleanup retreat failed: {exc.code}: {exc}")
-
-    def _release_after_success_with_recovery(
-        self,
-        goal_handle,
-        deadline: float,
-        state: FlowState,
-        task_id: str,
-        plan,
-        active_joint_state: JointState | None,
-    ) -> None:
-        """Run post-success release and preserve its failure as an explicit result."""
-
-        try:
-            self._release_after_success(goal_handle, deadline, state, task_id, plan, active_joint_state)
-        except PickCancelled:
-            raise
-        except PickFlowError as exc:
-            self.get_logger().error(f"post-success release failed: {exc.code}: {exc}")
-            recovery_started = time.monotonic()
-            try:
-                self._recover_after_release_failure(goal_handle, deadline, task_id, plan)
-            except Exception as recovery_exc:
-                self.get_logger().error(f"release cleanup raised unexpectedly: {recovery_exc}")
-            finally:
-                state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
-            raise PickFlowError("RELEASE_FAILED", str(exc)) from exc
 
     def _current_ee_pose(self) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
         try:
@@ -397,58 +329,6 @@ class ExecutionPhase:
         )
         return payload
 
-    def _move_and_verify_retention(
-        self,
-        goal_handle,
-        deadline: float,
-        state: FlowState,
-        task_id: str,
-        target_query: str,
-        prepared: PreparedCandidate,
-        *,
-        phase: str,
-        feedback_phase: str,
-        feedback_detail: str,
-        xyz: tuple[float, float, float],
-        quaternion: tuple[float, float, float, float],
-        velocity_scaling: float,
-        seed: JointState | None,
-        validate_orientation: bool = True,
-    ) -> IKPayload:
-        self._publish_feedback(goal_handle, state, feedback_phase, feedback_detail)
-        try:
-            payload = self._move_branch_locked_pose(
-                goal_handle,
-                deadline,
-                task_id,
-                xyz,
-                quaternion,
-                velocity_scaling,
-                seed,
-                validate_orientation=validate_orientation,
-            )
-            self._verify(
-                goal_handle,
-                deadline,
-                state,
-                f"verify_{phase}",
-                task_id,
-                target_query,
-                prepared.ranked.index,
-                prepared.ranked.candidate,
-            )
-        except PickCancelled:
-            raise
-        except PickFlowError:
-            if bool(self._config.get("recover_after_retention_failure", True)):
-                recovery_started = time.monotonic()
-                try:
-                    self._recover_after_retention_failure(goal_handle, deadline, task_id, state)
-                finally:
-                    state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
-            raise
-        return payload
-
     def _realign_contact(
         self,
         goal_handle,
@@ -543,7 +423,6 @@ class ExecutionPhase:
         scene_base: BaseSceneGeometry,
         *,
         release_after_success: bool = False,
-        release_drop_height_m: float = -1.0,
     ) -> None:
         candidate_seed = prepared.final_joint_state
         prepared = self._prepare_candidate(
@@ -615,11 +494,6 @@ class ExecutionPhase:
                 plan.grasp[0] + realign_delta_x,
                 plan.grasp[1] + realign_delta_y,
                 plan.grasp[2] + realign_delta_z,
-            ),
-            lift=(
-                plan.lift[0] + realign_delta_x,
-                plan.lift[1] + realign_delta_y,
-                plan.lift[2] + realign_delta_z,
             ),
         )
         # Contact compensation is complete. Re-run only IK/FK and safety checks
@@ -783,148 +657,38 @@ class ExecutionPhase:
                     state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
             raise
 
-        probe_height = max(0.0, float(self._config.get("probe_lift_height_m", 0.03)))
-        if probe_height > 0.0 and plan.lift[2] > plan.grasp[2] + 1e-6:
-            probe_xyz = (plan.lift[0], plan.lift[1], min(plan.lift[2], plan.grasp[2] + probe_height))
-            if probe_xyz[2] < plan.lift[2] - 1e-6:
-                probe_payload = self._move_and_verify_retention(
-                    goal_handle,
-                    deadline,
-                    state,
-                    task_id,
-                    target_query,
-                    prepared,
-                    phase="probe",
-                    feedback_phase="probe_lift",
-                    feedback_detail="performing slow retention-check lift",
-                    xyz=probe_xyz,
-                    quaternion=plan.quaternion,
-                    velocity_scaling=float(self._config.get("probe_lift_velocity_scaling", 0.02)),
-                    seed=current_joint_state,
-                )
-                current_joint_state = probe_payload.joint_state
-                self._record_pose_diagnostic(
-                    goal_handle,
-                    deadline,
-                    state,
-                    "probe_lift",
-                    probe_xyz,
-                    plan.quaternion,
-                    plan.target_contact_ee,
-                )
-
-        lift_payload = self._move_and_verify_retention(
-            goal_handle,
-            deadline,
-            state,
-            task_id,
-            target_query,
-            prepared,
-            phase="lift",
-            feedback_phase="lift",
-            feedback_detail="lifting verified target",
-            xyz=plan.lift,
-            quaternion=plan.quaternion,
-            velocity_scaling=float(self._config.get("lift_velocity_scaling", 0.05)),
-            seed=current_joint_state,
-            validate_orientation=False,
-        )
-        current_joint_state = lift_payload.joint_state
-        self._record_pose_diagnostic(
-            goal_handle,
-            deadline,
-            state,
-            "lift",
-            plan.lift,
-            plan.quaternion,
-            plan.target_contact_ee,
-        )
-        if release_after_success:
-            try:
-                self._release_verified_pick(
-                    goal_handle,
-                    deadline,
-                    state,
-                    task_id,
-                    prepared,
-                    current_joint_state,
-                    release_drop_height_m,
-                )
-            except PickCancelled:
-                raise
-            except PickFlowError as exc:
-                self.get_logger().error(f"post-success release failed: {exc.code}: {exc}")
-                recovery_started = time.monotonic()
-                try:
-                    self._recover_after_release_failure(goal_handle, deadline, task_id, plan)
-                except Exception as recovery_exc:
-                    self.get_logger().error(f"release cleanup raised unexpectedly: {recovery_exc}")
-                finally:
-                    state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
-                raise PickFlowError("RELEASE_FAILED", str(exc)) from exc
-
-    def _release_after_success(
-        self,
-        goal_handle,
-        deadline: float,
-        state: FlowState,
-        task_id: str,
-        plan,
-        active_joint_state: JointState | None,
-    ) -> None:
-        """Put a verified target back down so consecutive picks keep a target."""
-        goal = goal_handle.request
-        if not bool(goal.release_after_success):
-            return
-        ExecutionPhase._release_verified_pick(
-            self,
-            goal_handle,
-            deadline,
-            state,
-            task_id,
-            plan,
-            active_joint_state,
-            float(goal.release_drop_height_m),
-        )
-
-    def _release_verified_pick(
-        self,
-        goal_handle,
-        deadline: float,
-        state: FlowState,
-        task_id: str,
-        prepared: PreparedCandidate,
-        active_joint_state: JointState | None,
-        drop_height: float,
-    ) -> None:
-        """Release a verified candidate using the supplied post-lift state."""
-        plan = getattr(prepared, "plan", prepared)
-        release_xyz = plan.lift
-        if float(drop_height) >= 0.0:
-            # Releasing from the full lift height makes the target bounce; drop
-            # from just above the grasp pose instead.
-            release_xyz = (plan.lift[0], plan.lift[1], min(plan.lift[2], plan.grasp[2] + float(drop_height)))
-        self._publish_feedback(goal_handle, state, "release", f"releasing target at z={release_xyz[2]:.4f}")
-        if release_xyz[2] < plan.lift[2] - 1e-6:
-            self._move_branch_locked_pose(
-                goal_handle,
-                deadline,
-                task_id,
-                release_xyz,
-                plan.quaternion,
-                float(self._config.get("release_velocity_scaling", 0.05)),
-                active_joint_state,
-                validate_orientation=False,
-            )
+        post_grasp_motion, transport_state = self._post_grasp_motion_target()
+        self._publish_feedback(goal_handle, state, "transport", "moving verified grasp to configured container pose")
         self._run_primitive(
             goal_handle,
             deadline,
             task_id,
-            "open_gripper",
-            gripper_position=self._gripper_open,
+            "move_to_joint_positions",
+            joint_state=transport_state,
+            velocity_scaling=float(post_grasp_motion.get("velocity_scaling", 0.05)),
+            duration_sec=float(post_grasp_motion.get("duration_sec", 5.0)),
         )
-        self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("release_settle_sec", 0.3)))
-        state.released_after_success = True
         self.get_logger().info(
-            f"released target after success: release_xyz={release_xyz} drop_height_m={drop_height:.4f}"
+            f"post-grasp transport completed: pose={post_grasp_motion.get('pose_name', '')} "
+            f"joints={list(transport_state.name)}"
         )
+        if release_after_success:
+            self._release_at_transport_pose(goal_handle, deadline, state, task_id)
+
+    def _release_at_transport_pose(self, goal_handle, deadline: float, state: FlowState, task_id: str) -> None:
+        """Open the gripper at the configured container pose without another arm motion."""
+        self._publish_feedback(goal_handle, state, "release", "opening gripper at transported container pose")
+        try:
+            self._run_primitive(
+                goal_handle,
+                deadline,
+                task_id,
+                "open_gripper",
+                gripper_position=self._gripper_open,
+            )
+            self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("release_settle_sec", 0.3)))
+        except PickCancelled:
+            raise
+        except PickFlowError as exc:
+            raise PickFlowError("RELEASE_FAILED", str(exc)) from exc
+        state.released_after_success = True

@@ -20,7 +20,7 @@ def test_render_final_labels_maps_observations_to_accepted_masks(tmp_path):
             {
                 "stamp_ns": 123,
                 "accepted_masks": [2],
-                "masks": {"2": {"bbox": [10, 10, 80, 60]}},
+                "masks": {"2": {"bbox": [10, 10, 80, 60], "area": 2400, "object_id": "object-12345678"}},
             }
         ),
         encoding="utf-8",
@@ -41,9 +41,13 @@ def test_render_final_labels_maps_observations_to_accepted_masks(tmp_path):
         INSERT INTO mapping_runs VALUES ('run-1', 1);
         INSERT INTO semantic_objects VALUES (
             'object-12345678', 'banana', 0.93,
-            '{"label_refinement":{"source":"cloud_vlm"}}'
+            '{"manual_label":{"label":"banana","actionable":true},"label_refinement":{"source":"cloud_vlm"}}'
+        );
+        INSERT INTO semantic_objects VALUES (
+            'object-unlabeled', 'haystack', 0.9, '{}'
         );
         INSERT INTO semantic_observations VALUES (1, 123, 'object-12345678', 'hay', 0.69, 'run-1');
+        INSERT INTO semantic_observations VALUES (2, 123, 'object-unlabeled', 'straw', 0.75, 'run-1');
         """
     )
     connection.commit()

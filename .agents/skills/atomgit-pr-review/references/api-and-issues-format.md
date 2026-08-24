@@ -94,7 +94,7 @@ python3 pr_review.py --pr 123
 - 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
 - 先读取 `.pr.mandatory_review_checks`。如果包含 `lerobot_gitlink_changed`，必须按
   `references/ibrobot-mandatory-checks.md` 验证其是否为完整、可获取、已迁移 patch stack 的上游基线升级
-- 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁；触发门禁时默认只检查 PR 描述里的开发者验证声明，除非用户明确要求 agent 实际执行验证，否则不得调用 docker verification skills
+- 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁；标准 `[WIP]` 标题暂缓 Docker 证据检查，移除前缀后恢复。正式检视时默认只检查 PR 描述里的开发者验证声明，除非用户明确要求 agent 实际执行验证，否则不得调用 docker verification skills
 - 如果需要"回复某一条已有 review 意见"而不是提交新的审查结果，请切换到 `atomgit-review-resolution`，使用 `--reply-comment <comment_id>`；不要在本 skill 中伪造普通 PR 级评论。
 
 ### 提交审查结果

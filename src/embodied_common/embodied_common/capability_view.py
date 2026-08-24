@@ -16,6 +16,25 @@ _PUBLIC_CAPABILITY_FIELDS = (
     "moves_robot",
     "required_control_mode",
 )
+_CAPABILITY_TIMEOUT_FIELDS = (
+    "task_budget_sec",
+    "default_skill_timeout_sec",
+    "robot_state_freshness_sec",
+    "scene_freshness_sec",
+    "model_idle_timeout_sec",
+    "rpc_timeout_sec",
+    "gripper_settle_sec",
+)
+
+
+def project_capability_timeout_policy(timeout_policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Project shared timeout policy onto fields owned by motion capabilities."""
+    resolved_timeout_policy = _mapping(timeout_policy, "timeout_policy")
+    return {
+        name: copy.deepcopy(resolved_timeout_policy[name])
+        for name in _CAPABILITY_TIMEOUT_FIELDS
+        if name in resolved_timeout_policy
+    }
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -66,9 +85,7 @@ def build_capability_view(robot_config: Mapping[str, Any], *, timeout_policy: Ma
         "robot_name": robot_name,
         "skills": skills,
         "pose_names": pose_names,
-        "timeout_policy": {
-            name: copy.deepcopy(resolved_timeout_policy[name]) for name in sorted(resolved_timeout_policy)
-        },
+        "timeout_policy": project_capability_timeout_policy(resolved_timeout_policy),
     }
     public_view["capability_digest"] = hashlib.sha256(_canonical_json(public_view)).hexdigest()
     return public_view

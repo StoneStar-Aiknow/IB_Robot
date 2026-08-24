@@ -195,6 +195,7 @@ def _validate_global_localization_provider(nav_stage: str, navigation_config: di
     valid = {
         "mapping": slam_enabled and not nav2_enabled,
         "navigation": not slam_enabled and amcl_enabled,
+        "hybrid": not slam_enabled and amcl_enabled,
     }
 
     if not valid.get(nav_stage, False):

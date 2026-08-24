@@ -4,31 +4,82 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 from pr_review import CodeReviewer
+from verification_gate import format_verification_metadata
 
 
 def gated_files() -> list[dict]:
-    return [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@"}]
+    return [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-old\n+new"}]
 
 
-def test_verification_commit_check_accepts_current_pr_head():
-    head = "a" * 40
-    pr = {"head": {"sha": head}, "body": f"**Verified commit:** `{head}`"}
+def _inputs_sha() -> str:
+    from verification_gate import compute_verification_inputs
 
-    assert CodeReviewer._build_verification_commit_checks(pr, gated_files()) == []
-
-
-def test_verification_commit_check_blocks_missing_or_stale_sha():
-    head = "a" * 40
-    missing = CodeReviewer._build_verification_commit_checks({"head": {"sha": head}, "body": ""}, gated_files())
-    stale = CodeReviewer._build_verification_commit_checks(
-        {"head": {"sha": head}, "body": f"**Verified commit:** `{'b' * 40}`"}, gated_files()
-    )
-
-    assert [check["id"] for check in missing] == ["docker_verification_commit_missing"]
-    assert [check["id"] for check in stale] == ["docker_verification_commit_mismatch"]
+    return compute_verification_inputs(gated_files())
 
 
-def test_verification_commit_check_skips_non_gated_pr():
+def _env() -> str:
+    return "ubuntu:ros-humble-desktop-full-jammy|openeuler:ibrobot-dev-env|policy:1"
+
+
+def _full_block(tree: str, inputs: str) -> str:
+    return format_verification_metadata("full", inputs, tree, _env())
+
+
+def _reused_block(old_tree: str, inputs: str) -> str:
+    return format_verification_metadata("reused-environment", inputs, old_tree, _env())
+
+
+def test_full_verification_matches_current_tree():
+    tree = "c" * 40
+    inputs = _inputs_sha()
+    pr = {"head": {"sha": "a" * 40}, "body": _full_block(tree, inputs)}
+
+    assert CodeReviewer._build_verification_tree_checks(pr, gated_files(), tree) == []
+
+
+def test_missing_verification_block_blocks():
+    tree = "c" * 40
+    pr = {"head": {"sha": "a" * 40}, "body": ""}
+
+    checks = CodeReviewer._build_verification_tree_checks(pr, gated_files(), tree)
+    assert [c["id"] for c in checks] == ["docker_verification_missing"]
+
+
+def test_mismatched_tree_blocks():
+    tree = "c" * 40
+    inputs = _inputs_sha()
+    pr = {"head": {"sha": "a" * 40}, "body": _full_block("d" * 40, inputs)}
+
+    checks = CodeReviewer._build_verification_tree_checks(pr, gated_files(), tree)
+    assert [c["id"] for c in checks] == ["docker_verification_mismatch"]
+
+
+def test_reused_environment_accepts_old_tree_when_inputs_match():
+    old_tree = "c" * 40
+    new_tree = "d" * 40
+    inputs = _inputs_sha()
+    pr = {"head": {"sha": "b" * 40}, "body": _reused_block(old_tree, inputs)}
+
+    assert CodeReviewer._build_verification_tree_checks(pr, gated_files(), new_tree) == []
+
+
+def test_reused_environment_rejects_changed_inputs():
+    old_tree = "c" * 40
+    new_tree = "d" * 40
+    inputs = "0" * 40
+    pr = {"head": {"sha": "b" * 40}, "body": _reused_block(old_tree, inputs)}
+
+    checks = CodeReviewer._build_verification_tree_checks(pr, gated_files(), new_tree)
+    assert [c["id"] for c in checks] == ["docker_verification_mismatch"]
+
+
+def test_wip_pr_skips_dual_docker_evidence_check():
+    pr = {"title": "[WIP] agents: update workflow", "body": ""}
+
+    assert CodeReviewer._build_verification_tree_checks(pr, gated_files(), None) == []
+
+
+def test_non_gated_pr_skips_verification_check():
     files = [{"filename": "docs/README.md", "patch": "+text"}]
 
-    assert CodeReviewer._build_verification_commit_checks({"head": {"sha": "a" * 40}, "body": ""}, files) == []
+    assert CodeReviewer._build_verification_tree_checks({"head": {"sha": "a" * 40}, "body": ""}, files, None) == []

@@ -27,7 +27,6 @@ DelegatedExecutorIdentity expected_executor
 bool supervised_direct
 uint8 mode
 bool release_after_success
-float32 release_drop_height_m
 ---
 # --- Result ---
 uint8 VERIFICATION_NOT_RUN=0

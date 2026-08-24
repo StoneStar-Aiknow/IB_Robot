@@ -395,7 +395,7 @@ When `navigation_mode=true`, the system starts in a stopped state and waits for 
 
 ```bash
 # Launch system (when navigation_mode=true)
-ros2 launch robot_config robot.launch.py robot_config:=lekiwi_navi control_mode:=navi
+ros2 launch robot_config robot.launch.py robot_config:=lekiwi_realsense_navigation control_mode:=navi
 
 # After Nav2 reaches destination, start execution
 ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger

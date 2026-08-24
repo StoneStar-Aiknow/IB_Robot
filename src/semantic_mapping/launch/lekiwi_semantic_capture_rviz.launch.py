@@ -9,7 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     package_dir = FindPackageShare(package="semantic_mapping").find("semantic_mapping")
-    default_rviz_config = os.path.join(package_dir, "rviz", "lekiwi_semantic_mapping.rviz")
+    default_rviz_config = os.path.join(package_dir, "rviz", "lekiwi_semantic_capture.rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
 
@@ -31,7 +31,7 @@ def generate_launch_description():
     rviz = Node(
         package="rviz2",
         executable="rviz2",
-        name="lekiwi_semantic_mapping_rviz",
+        name="lekiwi_semantic_capture_rviz",
         arguments=["-d", rviz_config],
         parameters=[{"use_sim_time": use_sim_time}],
         output="screen",
@@ -42,7 +42,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "rviz_config",
                 default_value=default_rviz_config,
-                description="Full path to the semantic mapping RViz config",
+                description="Full path to the semantic capture RViz config",
             ),
             DeclareLaunchArgument(
                 "use_sim_time",

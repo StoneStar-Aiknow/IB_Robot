@@ -9,8 +9,12 @@ import time
 import uuid
 from typing import Any
 
-from embodied_common.skill_request import skill_goal_uuid
+from embodied_common.skill_request import skill_goal_uuid, validate_request_schema_version
 from robot_skill_cli.output import EXIT_ROS_UNAVAILABLE, EXIT_TIMEOUT
+
+_NAVIGATION_WORKFLOW_FIELDS = frozenset(
+    {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
+)
 
 
 class BridgeError(RuntimeError):
@@ -31,20 +35,28 @@ class RosBridge:
         reload_service: str = "/embodied/reload_skill_catalog",
         validate_skill_service: str,
         skill_action: str,
+        primitive_action: str = "/embodied/execute_primitive",
+        validate_primitive_service: str = "/embodied/validate_primitive",
         plan_service: str = "/embodied/plan_agent_command",
         validate_plan_service: str = "/embodied/validate_agent_plan",
         confirm_plan_service: str = "/embodied/confirm_agent_plan",
         execute_plan_action: str = "/embodied/execute_agent_plan",
+        start_visual_game_service: str = "/embodied/start_visual_game",
+        get_visual_game_result_service: str = "/embodied/get_visual_game_result",
     ) -> None:
         self._status_service = status_service
         self._snapshot_service = snapshot_service
         self._reload_service = reload_service
         self._validate_skill_service = validate_skill_service
         self._skill_action = skill_action.rstrip("/")
+        self._primitive_action = primitive_action.rstrip("/")
+        self._validate_primitive_service = validate_primitive_service
         self._plan_service = plan_service
         self._validate_plan_service = validate_plan_service
         self._confirm_plan_service = confirm_plan_service
         self._execute_plan_action = execute_plan_action.rstrip("/")
+        self._start_visual_game_service = start_visual_game_service
+        self._get_visual_game_result_service = get_visual_game_result_service
         self._node = None
         self._executor = None
         self._spin_thread = None
@@ -54,6 +66,8 @@ class RosBridge:
         self._reload_client = None
         self._validate_client = None
         self._skill_client = None
+        self._validate_primitive_client = None
+        self._primitive_client = None
         self._plan_client = None
         self._validate_plan_client = None
         self._confirm_plan_client = None
@@ -61,6 +75,8 @@ class RosBridge:
         self._cancel_client = None
         self._cancel_plan_client = None
         self._plan_result_client = None
+        self._start_visual_game_client = None
+        self._get_visual_game_result_client = None
         self._GetSkillGatewayStatus = None
         self._GetSkillSnapshot = None
         self._ReloadSkillCatalog = None
@@ -72,6 +88,8 @@ class RosBridge:
         self._ExecuteAgentPlan = None
         self._CancelGoal = None
         self._WorkflowStep = None
+        self._StartVisualGame = None
+        self._GetVisualGameResult = None
 
     def start(self) -> bool:
         try:
@@ -81,17 +99,23 @@ class RosBridge:
             from rclpy.callback_groups import ReentrantCallbackGroup
             from rclpy.executors import MultiThreadedExecutor
 
-            from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
+            from embodied_common.wire_contracts import validate_public_request_wire_contracts
+            from ibrobot_msgs.action import ExecuteAgentPlan, PrimitiveCommand, SkillCommand
             from ibrobot_msgs.msg import WorkflowStep
             from ibrobot_msgs.srv import (
                 ConfirmAgentPlan,
                 GetSkillGatewayStatus,
                 GetSkillSnapshot,
+                GetVisualGameResult,
                 PlanAgentCommand,
                 ReloadSkillCatalog,
+                StartVisualGame,
                 ValidateAgentPlan,
+                ValidatePrimitive,
                 ValidateSkill,
             )
+
+            validate_public_request_wire_contracts()
         except Exception:
             return False
 
@@ -124,6 +148,17 @@ class RosBridge:
                 self._skill_action,
                 callback_group=callback_group,
             )
+            self._validate_primitive_client = self._node.create_client(
+                ValidatePrimitive,
+                self._validate_primitive_service,
+                callback_group=callback_group,
+            )
+            self._primitive_client = ActionClient(
+                self._node,
+                PrimitiveCommand,
+                self._primitive_action,
+                callback_group=callback_group,
+            )
             self._plan_client = self._node.create_client(
                 PlanAgentCommand, self._plan_service, callback_group=callback_group
             )
@@ -154,6 +189,16 @@ class RosBridge:
                 f"{self._execute_plan_action}/_action/get_result",
                 callback_group=callback_group,
             )
+            self._start_visual_game_client = self._node.create_client(
+                StartVisualGame,
+                self._start_visual_game_service,
+                callback_group=callback_group,
+            )
+            self._get_visual_game_result_client = self._node.create_client(
+                GetVisualGameResult,
+                self._get_visual_game_result_service,
+                callback_group=callback_group,
+            )
             self._GetSkillGatewayStatus = GetSkillGatewayStatus
             self._GetSkillSnapshot = GetSkillSnapshot
             self._ReloadSkillCatalog = ReloadSkillCatalog
@@ -165,6 +210,8 @@ class RosBridge:
             self._ExecuteAgentPlan = ExecuteAgentPlan
             self._CancelGoal = CancelGoal
             self._WorkflowStep = WorkflowStep
+            self._StartVisualGame = StartVisualGame
+            self._GetVisualGameResult = GetVisualGameResult
             self._executor = MultiThreadedExecutor(num_threads=2)
             self._executor.add_node(self._node)
             self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -285,6 +332,7 @@ class RosBridge:
         if self._ValidateSkill is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         request = self._ValidateSkill.Request()
+        request.schema_version = self._payload_schema_version(payload)
         request.dispatch_binding.schema_version = 1
         request.dispatch_binding.task_id = str(payload.get("_task_id", ""))
         request.dispatch_binding.root_task_id = str(payload.get("_root_task_id", request.dispatch_binding.task_id))
@@ -302,6 +350,7 @@ class RosBridge:
         request.place_name = payload["place_name"]
         request.motion_direction = payload["motion_direction"]
         request.motion_distance = float(payload["motion_distance"] or 0.0)
+        self._copy_navigation_fields(request, payload)
         response = self._call_service(
             self._validate_client,
             request,
@@ -409,6 +458,15 @@ class RosBridge:
             "place_name": str(step.place_name),
             "motion_direction": str(step.motion_direction),
             "motion_distance": float(step.motion_distance),
+            "direction": str(step.direction),
+            "distance": float(step.distance),
+            "degree": float(step.degree),
+            "has_x": bool(step.has_x),
+            "x": float(step.x),
+            "has_y": bool(step.has_y),
+            "y": float(step.y),
+            "has_yaw": bool(step.has_yaw),
+            "yaw": float(step.yaw),
             "timeout_sec": float(step.timeout_sec),
         }
 
@@ -466,15 +524,44 @@ class RosBridge:
                 "ROS_UNAVAILABLE", "WorkflowStep interface is unavailable", exit_code=EXIT_ROS_UNAVAILABLE
             )
         message = self._WorkflowStep()
-        message.schema_version = int(step.get("schema_version", 1))
+        message.schema_version = self._payload_schema_version(step)
         message.skill_name = str(step.get("skill_name", ""))
         message.target_name = str(step.get("target_name", ""))
         message.container_name = str(step.get("container_name", ""))
         message.place_name = str(step.get("place_name", ""))
         message.motion_direction = str(step.get("motion_direction", ""))
         message.motion_distance = float(step.get("motion_distance", 0.0))
+        self._copy_navigation_fields(message, step)
         message.timeout_sec = float(step.get("timeout_sec", 0.0))
         return message
+
+    @staticmethod
+    def _payload_schema_version(values: dict[str, Any]) -> int:
+        if "schema_version" in values:
+            try:
+                return validate_request_schema_version(values["schema_version"])
+            except ValueError as exc:
+                raise BridgeError("SKILL_SCHEMA_INVALID", str(exc), exit_code=EXIT_ROS_UNAVAILABLE) from exc
+        if _NAVIGATION_WORKFLOW_FIELDS.intersection(values):
+            raise BridgeError(
+                "SKILL_SCHEMA_INVALID",
+                "navigation fields require an explicit schema_version 2",
+                exit_code=EXIT_ROS_UNAVAILABLE,
+            )
+        return 1
+
+    @staticmethod
+    def _copy_navigation_fields(message, values: dict[str, Any]) -> None:
+        message.direction = str(values.get("direction", ""))
+        message.distance = float(values.get("distance", 0.0) or 0.0)
+        message.degree = float(values.get("degree", 0.0) or 0.0)
+        for field_name in ("x", "y", "yaw"):
+            has_field = f"has_{field_name}"
+            presence = values.get(has_field)
+            if presence is None:
+                presence = field_name in values and values[field_name] is not None
+            setattr(message, has_field, bool(presence))
+            setattr(message, field_name, float(values.get(field_name, 0.0) or 0.0))
 
     def validate_agent_plan(self, *, plan_token: str, timeout_sec: float) -> dict[str, Any]:
         if self._ValidateAgentPlan is None:
@@ -573,6 +660,28 @@ class RosBridge:
             and remaining > 0.0
             and self._execute_plan_client.wait_for_server(timeout_sec=remaining)
         )
+
+    def wait_for_public_request_interfaces(self, *, timeout_sec: float) -> bool:
+        """Return whether all versioned Skill and Primitive public endpoints are discoverable."""
+        deadline = time.monotonic() + timeout_sec
+        for client in (self._validate_client, self._validate_primitive_client):
+            remaining = deadline - time.monotonic()
+            if client is None or remaining <= 0.0 or not client.wait_for_service(timeout_sec=remaining):
+                return False
+        for client in (self._skill_client, self._primitive_client):
+            remaining = deadline - time.monotonic()
+            if client is None or remaining <= 0.0 or not client.wait_for_server(timeout_sec=remaining):
+                return False
+        return True
+
+    def wait_for_visual_game_interfaces(self, *, timeout_sec: float) -> bool:
+        """Return whether the independent visual-game start/query services are discoverable."""
+        deadline = time.monotonic() + timeout_sec
+        for client in (self._start_visual_game_client, self._get_visual_game_result_client):
+            remaining = deadline - time.monotonic()
+            if client is None or remaining <= 0.0 or not client.wait_for_service(timeout_sec=remaining):
+                return False
+        return True
 
     def send_agent_plan_goal(
         self, *, plan_token: str, confirmation_token: str, task_id: str, timeout_sec: float, feedback_callback=None
@@ -675,6 +784,7 @@ class RosBridge:
         if self._skill_client is None or self._SkillCommand is None:
             raise BridgeError("ROS_UNAVAILABLE", "skill action client is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         goal = self._SkillCommand.Goal()
+        goal.schema_version = self._payload_schema_version(payload)
         goal.dispatch_binding.schema_version = 1
         goal.dispatch_binding.task_id = task_id
         goal.dispatch_binding.root_task_id = task_id
@@ -687,6 +797,7 @@ class RosBridge:
         goal.place_name = payload["place_name"]
         goal.motion_direction = payload["motion_direction"]
         goal.motion_distance = float(payload["motion_distance"] or 0.0)
+        self._copy_navigation_fields(goal, payload)
         goal.timeout_sec = float(payload["timeout_sec"])
 
         def on_feedback(feedback) -> None:
@@ -715,6 +826,58 @@ class RosBridge:
         return {
             "accepted": int(response.return_code) == 0 and bool(response.goals_canceling),
             "return_code": int(response.return_code),
+        }
+
+    def start_visual_game(
+        self,
+        game_name: str,
+        *,
+        request_id: str,
+        expected_config_digest: str,
+        timeout_sec: float,
+    ) -> dict[str, Any]:
+        if self._StartVisualGame is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._StartVisualGame.Request()
+        request.request_id = request_id
+        request.game_name = game_name
+        request.expected_config_digest = expected_config_digest
+        response = self._call_service(
+            self._start_visual_game_client,
+            request,
+            service_name=self._start_visual_game_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "accepted": bool(response.accepted),
+            "duplicate": bool(response.duplicate),
+            "request_id": response.request_id,
+            "config_digest": response.config_digest,
+            "error_code": response.error_code,
+            "message": response.message,
+        }
+
+    def get_visual_game_result(self, request_id: str, *, timeout_sec: float) -> dict[str, Any]:
+        if self._GetVisualGameResult is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._GetVisualGameResult.Request()
+        request.request_id = request_id
+        response = self._call_service(
+            self._get_visual_game_result_client,
+            request,
+            service_name=self._get_visual_game_result_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "found": bool(response.found),
+            "terminal": bool(response.terminal),
+            "success": bool(response.success),
+            "game_name": response.game_name,
+            "scene_summary": response.scene_summary,
+            "result_json": response.result_json,
+            "config_digest": response.config_digest,
+            "error_code": response.error_code,
+            "message": response.message,
         }
 
     def cancel_goal(self, goal_handle, result_future, *, timeout_sec: float) -> bool:

@@ -9,7 +9,7 @@ import yaml
 from perception_bundle_fixture import configure_perception_bundles
 
 PACKAGE_ROOT = Path(__file__).parents[1]
-ROBOT_CONFIG = PACKAGE_ROOT.parent / "robot_config" / "config" / "robots" / "lekiwi_mapping.yaml"
+ROBOT_CONFIG = PACKAGE_ROOT.parent / "robot_config" / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
 
 
 @dataclass
@@ -139,3 +139,24 @@ def test_embedded_online_launch_starts_no_generic_model_services(tmp_path: Path)
 
     assert len(actions) == 1
     assert _node_parameters(actions[0])["mapping_backend"] == "embedded"
+
+
+def test_query_only_launch_starts_only_mapping_node_with_overrides(tmp_path: Path) -> None:
+    module = _load_launch("semantic_mapping.launch.py")
+    actions = module.launch_setup(
+        _LaunchContext(
+            {
+                "robot_config": "unused",
+                "config_path": str(_enabled_config(tmp_path)),
+                "mode": "query_only",
+                "database_path": "/data/semantic_map.sqlite3",
+                "artifact_output_dir": "/data/artifacts",
+            }
+        )
+    )
+
+    assert len(actions) == 1
+    parameters = _node_parameters(actions[0])
+    assert parameters["database_path"] == "/data/semantic_map.sqlite3"
+    assert parameters["artifact_output_dir"] == "/data/artifacts"
+    assert parameters["geometry_map_hash"] == "geometry-hash"

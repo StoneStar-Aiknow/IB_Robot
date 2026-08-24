@@ -39,3 +39,14 @@ def test_slam_gate_accepts_complete_compatible_contract():
         cloud_map_ready=True,
         timestamped_tf_ready=True,
     ).ready
+
+
+def test_slam_gate_accepts_missing_active_hash_for_legacy_publishers():
+    assert evaluate_slam_readiness(
+        expected_map_hash="map-hash",
+        active_map_hash="",
+        localization_ready=True,
+        authoritative_map_odom=True,
+        cloud_map_ready=True,
+        timestamped_tf_ready=True,
+    ).ready

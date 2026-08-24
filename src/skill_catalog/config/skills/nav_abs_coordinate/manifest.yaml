@@ -1,0 +1,45 @@
+schema_version: 2
+name: nav_abs_coordinate
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Navigate the mobile base to an absolute map-frame pose.
+  category: navigation
+  when_to_use:
+  - move the robot to known map coordinates
+  - set the robot position and heading from an absolute target
+  aliases_en:
+  - navigate to coordinates
+  - go to map pose
+  motion_scope:
+  - base
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 30.0
+  requires_motion_params: true
+capability:
+  schema_version: 2
+  summary: Navigate to an absolute x, y, and yaw in the map frame.
+  domain: navigation
+  moves_robot: true
+  required_control_mode: base_navigation
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      x:
+        type: number
+        unit: meters
+      y:
+        type: number
+        unit: meters
+      yaw:
+        type: number
+        unit: degrees
+    required:
+    - x
+    - y
+    - yaw
+  recovery_policy: ask_user
+implementations:
+  lekiwi_navigation_v2: implementations/lekiwi_navigation_v2.yaml

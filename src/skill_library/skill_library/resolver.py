@@ -1,10 +1,12 @@
 """Helpers for resolving skills, targets, and named poses."""
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
 from embodied_common.skill_templates import DEFAULT_WAYPOINT_DURATION_SEC, get_skill_templates
+from ibrobot_msgs.action import ExecuteNavigation
 
 __all__ = ["PrimitiveSpec", "load_json_mapping", "direction_to_delta", "resolve_skill_primitives"]
 
@@ -22,6 +24,7 @@ class PrimitiveSpec:
     joint_waypoints: list[list[float]] = field(default_factory=list)
     duration_sec: float = 0.0
     waypoint_duration_sec: float = 0.0
+    navigation_goal: ExecuteNavigation.Goal | None = None
 
 
 def direction_to_delta(
@@ -73,6 +76,26 @@ def _resolve_pose_name(
     raise KeyError("skill template move_to_named_pose step is missing pose reference")
 
 
+def _positive_navigation_value(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be a positive finite number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return result
+
+
+def _navigation_coordinate(value: Any, field_name: str) -> float:
+    if value is None:
+        raise ValueError(f"{field_name} is required for absolute navigation")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be a finite number")
+    return 0.0 if result == 0.0 else result
+
+
 def resolve_skill_primitives(
     skill_name: str,
     target_name: str,
@@ -86,6 +109,13 @@ def resolve_skill_primitives(
     direction_mapping: dict[str, Any] | None = None,
     current_joint_positions: dict[str, float] | None = None,
     arm_joint_names: list[str] | None = None,
+    *,
+    direction: str = "",
+    distance: float = 0.0,
+    degree: float = 0.0,
+    x: float | None = None,
+    y: float | None = None,
+    yaw: float | None = None,
 ) -> list[PrimitiveSpec]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -143,6 +173,70 @@ def resolve_skill_primitives(
                     relative_dz=delta_z,
                 )
             )
+            continue
+
+        if primitive_name == "nav_straight":
+            resolved_direction = step.get("direction", "")
+            if step.get("direction_from_request"):
+                resolved_direction = direction
+            if not isinstance(resolved_direction, str):
+                raise ValueError("direction must be a string")
+            normalized_direction = resolved_direction.strip().lower()
+            command_types = {
+                "forward": ExecuteNavigation.Goal.FORWARD,
+                "backward": ExecuteNavigation.Goal.BACKWARD,
+                "left": ExecuteNavigation.Goal.STRAFE_LEFT,
+                "right": ExecuteNavigation.Goal.STRAFE_RIGHT,
+            }
+            if normalized_direction not in command_types:
+                raise ValueError(f"unsupported navigation direction: {normalized_direction}")
+            resolved_distance = step.get("distance", 0.0)
+            if step.get("distance_from_request"):
+                resolved_distance = distance
+            navigation_goal = ExecuteNavigation.Goal()
+            navigation_goal.command_type = command_types[normalized_direction]
+            navigation_goal.value = _positive_navigation_value(resolved_distance, "distance")
+            primitives.append(PrimitiveSpec(primitive_name=primitive_name, navigation_goal=navigation_goal))
+            continue
+
+        if primitive_name == "nav_turn":
+            resolved_direction = step.get("direction", "")
+            if step.get("direction_from_request"):
+                resolved_direction = direction
+            if not isinstance(resolved_direction, str):
+                raise ValueError("direction must be a string")
+            normalized_direction = resolved_direction.strip().lower()
+            command_types = {
+                "left": ExecuteNavigation.Goal.TURN_LEFT,
+                "right": ExecuteNavigation.Goal.TURN_RIGHT,
+            }
+            if normalized_direction not in command_types:
+                raise ValueError(f"unsupported navigation direction: {normalized_direction}")
+            resolved_degree = step.get("degree", 0.0)
+            if step.get("degree_from_request"):
+                resolved_degree = degree
+            navigation_goal = ExecuteNavigation.Goal()
+            navigation_goal.command_type = command_types[normalized_direction]
+            navigation_goal.value = math.radians(_positive_navigation_value(resolved_degree, "degree"))
+            primitives.append(PrimitiveSpec(primitive_name=primitive_name, navigation_goal=navigation_goal))
+            continue
+
+        if primitive_name == "nav_abs_coordinate":
+            resolved_x = x if step.get("x_from_request") else step.get("x")
+            resolved_y = y if step.get("y_from_request") else step.get("y")
+            resolved_yaw = yaw if step.get("yaw_from_request") else step.get("yaw")
+            target_x = _navigation_coordinate(resolved_x, "x")
+            target_y = _navigation_coordinate(resolved_y, "y")
+            target_yaw = _navigation_coordinate(resolved_yaw, "yaw")
+            yaw_radians = math.radians(target_yaw)
+            navigation_goal = ExecuteNavigation.Goal()
+            navigation_goal.command_type = ExecuteNavigation.Goal.ABSOLUTE_POSE
+            navigation_goal.target_pose.header.frame_id = "map"
+            navigation_goal.target_pose.pose.position.x = target_x
+            navigation_goal.target_pose.pose.position.y = target_y
+            navigation_goal.target_pose.pose.orientation.z = math.sin(yaw_radians / 2.0)
+            navigation_goal.target_pose.pose.orientation.w = math.cos(yaw_radians / 2.0)
+            primitives.append(PrimitiveSpec(primitive_name=primitive_name, navigation_goal=navigation_goal))
             continue
 
         if primitive_name == "open_gripper":

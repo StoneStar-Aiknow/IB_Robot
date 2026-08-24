@@ -6,6 +6,7 @@ This launch file loads robot configuration from YAML and dynamically generates:
 - Camera drivers (usb_cam, realsense2_camera)
 - Static TF publishers for camera frames
 - Voice ASR node (optional, configured from robot.voice_asr)
+- Speech direction node (optional, configured from robot.speech_direction)
 - Voice TTS service (optional, configured from robot.voice_tts)
 - Inference service and action dispatcher (optional, auto-detected)
 - MoveIt motion planning (optional, auto-detected)
@@ -68,7 +69,7 @@ Launch Arguments:
     sim_platform: Optional CLI override for robot YAML simulation.platform
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
-    nav_stage: Select a navigation workflow stage (mapping or navigation)
+    nav_stage: Select a workflow stage declared by the robot config
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
     inference_pipeline: Pipeline ID targeted by inference launch overrides
     inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
@@ -258,8 +259,10 @@ def _serialize_process_startup(processes, sequence_name: str):
 
 
 def _controller_readiness_barrier(deferred_spawners, readiness_waiter):
-    """Use the last strict spawner as the barrier when this launch owns startup."""
-    return deferred_spawners[-1] if deferred_spawners else readiness_waiter
+    """Use the single strict group spawner as the owned-startup barrier."""
+    if len(deferred_spawners) > 1:
+        raise ValueError("Controller startup must use a single controller group spawner.")
+    return deferred_spawners[0] if deferred_spawners else readiness_waiter
 
 
 def _resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> float:
@@ -607,6 +610,22 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating model service nodes: {e}")
         raise
 
+    # ========== 6.5 Semantic Mapping Node (online updates) ==========
+    try:
+        from robot_config.launch_builders.semantic_mapping import generate_semantic_mapping_nodes
+
+        semantic_mapping_nodes = generate_semantic_mapping_nodes(robot_config)
+        if semantic_mapping_nodes:
+            if controller_ready_barrier is not None:
+                controller_dependent_actions.extend(semantic_mapping_nodes)
+                logger.info("Deferring semantic mapping node until required controllers are active")
+            else:
+                actions.extend(semantic_mapping_nodes)
+            logger.info(f"Added {len(semantic_mapping_nodes)} semantic mapping node(s)")
+    except Exception as e:
+        logger.error(f"generating semantic mapping nodes: {e}")
+        raise
+
     # ========== 7. Generate Teleop Nodes (if in teleop mode) ==========
     logger.info("========== Checking Teleop Mode ==========")
     try:
@@ -665,6 +684,22 @@ def launch_setup(context, *args, **kwargs):
     except Exception as e:
         logger.error(f"generating voice TTS nodes: {e}")
         raise
+
+    # ========== 9.5 Generate Speech Direction Node ==========
+    logger.info("========== Checking Speech Direction ==========")
+    if mock_mode_skips_subsystem(mock_backend_active, "speech_direction"):
+        logger.info("hardware_mock active: skipping speech direction node (out of mock scope)")
+    else:
+        try:
+            from robot_config.launch_builders.speech_direction import generate_speech_direction_actions
+
+            speech_direction_actions = generate_speech_direction_actions(robot_config)
+            actions.extend(speech_direction_actions)
+            if speech_direction_actions:
+                logger.info("Added speech direction launch")
+        except Exception as e:
+            logger.error(f"generating speech direction node: {e}")
+            raise
 
     # ========== 10. Generate Navigation Nodes ==========
     logger.info("========== Checking Navigation ==========")
@@ -838,7 +873,8 @@ def launch_setup(context, *args, **kwargs):
                 f"Controller readiness barrier armed for "
                 f"{len(controller_dependent_actions)} control-dependent action(s)"
             )
-            actions.append(
+            actions.insert(
+                0,
                 RegisterEventHandler(
                     event_handler=OnProcessExit(
                         target_action=controller_ready_barrier,
@@ -848,7 +884,7 @@ def launch_setup(context, *args, **kwargs):
                             failure_reason="Controller readiness probe failed; aborting launch.",
                         ),
                     )
-                )
+                ),
             )
         else:
             actions.extend(controller_dependent_actions)
@@ -902,7 +938,9 @@ def generate_launch_description():
                 "nav_stage",
                 default_value="",
                 description=(
-                    "Select a navigation workflow stage: mapping or navigation. Empty uses default_nav_stage."
+                    "Select a workflow stage declared by the robot config. "
+                    "Navigation profiles use mapping/navigation; combined mobile-manipulator profiles may also "
+                    "declare grasp/hybrid. Empty uses default_nav_stage."
                 ),
             ),
             DeclareLaunchArgument(

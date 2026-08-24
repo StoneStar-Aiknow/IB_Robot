@@ -8,7 +8,7 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
+from embodied_common.primitive_contracts import primitive_contract_for_version
 from skill_catalog.consumer import CatalogIdentity, verify_snapshot_response
 from skill_catalog.digest import (
     deep_freeze,
@@ -37,6 +37,8 @@ class VerifiedSafetySnapshot:
     identity: SnapshotIdentity
     capability_digest: str
     provenance_digest: str
+    primitive_contract_digest: str
+    primitive_descriptors: MappingProxyType
     templates: MappingProxyType
     robot_context: MappingProxyType
     payload: MappingProxyType
@@ -109,16 +111,20 @@ class SafetySnapshotCache:
             verify_snapshot_response(response, CatalogIdentity(registry_epoch, generation, registry_digest))
         except Exception as exc:
             raise SnapshotCacheError("SKILL_SNAPSHOT_DIGEST_MISMATCH", str(exc)) from exc
-        if registry_preimage.get("primitive_contract_digest") != PRIMITIVE_CONTRACT_DIGEST:
-            raise SnapshotCacheError(
-                "SKILL_SNAPSHOT_DIGEST_MISMATCH", "primitive contract digest does not match local SSOT"
-            )
         skills = registry_preimage.get("skills")
         robot_context = registry_preimage.get("robot_context")
         if not isinstance(robot_context, dict):
             raise SnapshotCacheError("SKILL_SCHEMA_INVALID", "registry robot_context must be an object")
         if not isinstance(skills, list):
             raise SnapshotCacheError("SKILL_SCHEMA_INVALID", "registry skills must be an array")
+        try:
+            primitive_contract = primitive_contract_for_version(robot_context.get("context_schema_version"))
+        except ValueError as exc:
+            raise SnapshotCacheError("SKILL_SCHEMA_INVALID", str(exc)) from exc
+        if registry_preimage.get("primitive_contract_digest") != primitive_contract.digest:
+            raise SnapshotCacheError(
+                "SKILL_SNAPSHOT_DIGEST_MISMATCH", "primitive contract digest does not match selected context contract"
+            )
         templates: dict[str, dict[str, Any]] = {}
         for entry in skills:
             if (
@@ -137,6 +143,8 @@ class SafetySnapshotCache:
             identity=identity,
             capability_digest=capability_digest,
             provenance_digest=provenance_digest,
+            primitive_contract_digest=primitive_contract.digest,
+            primitive_descriptors=MappingProxyType(dict(primitive_contract.descriptors)),
             templates=deep_freeze(templates),
             robot_context=deep_freeze(robot_context),
             payload=deep_freeze(payload),

@@ -107,6 +107,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "timeout_sec": float(
                         config.get("playback_timeout_sec", defaults.get("playback_timeout_sec", 300.0))
                     ),
+                    "player": str(config.get("player", "aplay")),
                 }
             ],
         ),

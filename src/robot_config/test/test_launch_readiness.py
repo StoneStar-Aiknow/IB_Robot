@@ -161,31 +161,25 @@ def test_missing_inactive_controllers_returns_only_non_active():
     assert pending == ["arm_position_controller", "missing_controller"]
 
 
-def test_generate_controller_spawners_uses_repository_timeout_aware_process_per_controller():
+def test_generate_controller_spawners_uses_one_timeout_aware_group_process():
     spawners = generate_controller_spawners(
         ["joint_state_broadcaster", "arm_position_controller"],
         use_sim=True,
         controller_manager_timeout=42.5,
     )
 
-    assert len(spawners) == 2
-    for spawner, controller_name in zip(
-        spawners,
-        ["joint_state_broadcaster", "arm_position_controller"],
-        strict=True,
-    ):
-        assert isinstance(spawner, Node)
-        assert spawner.node_package == "robot_config"
-        assert spawner.node_executable == "controller_spawner"
-        cmd_text = [item[0].text for item in spawner.cmd if item and hasattr(item[0], "text")]
-        assert controller_name in cmd_text
-        assert "--controller-manager" in cmd_text
-        assert "controller_manager" in cmd_text
-        assert "--service-call-timeout" in cmd_text
-        assert "--switch-timeout" in cmd_text
-        assert "42.5" in cmd_text
-        assert "10.0" in cmd_text
-        assert "--activate-as-group" not in cmd_text
+    assert len(spawners) == 1
+    spawner = spawners[0]
+    assert isinstance(spawner, Node)
+    assert spawner.node_package == "robot_config"
+    assert spawner.node_executable == "controller_spawner"
+    cmd_text = [item[0].text for item in spawner.cmd if item and hasattr(item[0], "text")]
+    assert "joint_state_broadcaster" in cmd_text
+    assert "arm_position_controller" in cmd_text
+    assert "--controller-manager" in cmd_text
+    assert "controller_manager" in cmd_text
+    assert cmd_text[cmd_text.index("--service-call-timeout") + 1] == "10.0"
+    assert cmd_text[cmd_text.index("--switch-timeout") + 1] == "42.5"
 
 
 def test_generate_controller_spawners_supports_inactive_controller_group():
@@ -196,11 +190,19 @@ def test_generate_controller_spawners_supports_inactive_controller_group():
         inactive_controller_names=["base_velocity_controller"],
     )
 
-    assert len(spawners) == 2
-    active_arguments = _text(spawners[0]._Node__arguments)
-    inactive_arguments = _text(spawners[1]._Node__arguments)
-    assert "--inactive" not in active_arguments
-    assert "--inactive" in inactive_arguments
+    assert len(spawners) == 1
+    arguments = _text(spawners[0]._Node__arguments)
+    assert "arm_trajectory_controller" in arguments
+    assert "--inactive-controller" in arguments
+    assert "base_velocity_controller" in arguments
+
+
+def test_generate_controller_spawners_rejects_overlapping_groups():
+    with pytest.raises(ValueError, match="both active and inactive"):
+        generate_controller_spawners(
+            ["base_velocity_controller"],
+            inactive_controller_names=["base_velocity_controller"],
+        )
 
 
 def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
@@ -221,12 +223,36 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
         "arm_trajectory_controller",
         "gripper_trajectory_controller",
     ]
-    assert len(deferred_spawners) == len(controller_names) + 1
-    assert "--inactive" in _text(deferred_spawners[-1]._Node__arguments)
+    assert len(deferred_spawners) == 1
+    assert "--inactive-controller" in _text(deferred_spawners[0]._Node__arguments)
     assert all(spawner.node_package == "robot_config" for spawner in deferred_spawners)
     assert all(spawner.node_executable == "controller_spawner" for spawner in deferred_spawners)
     assert all(node.node_executable != "controller_spawner" for node in nodes)
-    assert all("120.0" in _text(spawner._Node__arguments) for spawner in deferred_spawners)
+    assert "120.0" in _text(deferred_spawners[0]._Node__arguments)
+
+
+def test_hybrid_real_hardware_spawner_keeps_arm_state_stream_active():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    robot_config = load_robot_config_dict(config_path)
+
+    _nodes, controller_names, deferred_spawners, _robot_description = generate_ros2_control_nodes(
+        robot_config,
+        use_sim=False,
+        auto_start_controllers="true",
+        controller_startup_timeout=120.0,
+    )
+
+    assert controller_names == [
+        "joint_state_broadcaster",
+        "arm_joint_state_broadcaster",
+        "base_velocity_controller",
+    ]
+    assert len(deferred_spawners) == 1
+    arguments = [_text(argument) for argument in deferred_spawners[0]._Node__arguments]
+    inactive_controllers = [
+        arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--inactive-controller"
+    ]
+    assert inactive_controllers == ["arm_trajectory_controller", "gripper_trajectory_controller"]
 
 
 def test_controller_startup_processes_are_serialized():
@@ -239,14 +265,25 @@ def test_controller_startup_processes_are_serialized():
     assert actions[-1] is processes[0]
 
 
-def test_last_strict_spawner_is_the_controller_readiness_barrier():
-    spawners = [ExecuteProcess(cmd=["true"]) for _ in range(3)]
+def test_group_spawner_is_the_controller_readiness_barrier():
+    group_spawner = ExecuteProcess(cmd=["true"])
     fallback_waiter = ExecuteProcess(cmd=["false"])
 
-    barrier = robot_launch._controller_readiness_barrier(spawners, fallback_waiter)
+    barrier = robot_launch._controller_readiness_barrier([group_spawner], fallback_waiter)
 
-    assert barrier is spawners[-1]
+    assert barrier is group_spawner
     assert robot_launch._controller_readiness_barrier([], fallback_waiter) is fallback_waiter
+
+    with pytest.raises(ValueError, match="single controller group spawner"):
+        robot_launch._controller_readiness_barrier([group_spawner, ExecuteProcess(cmd=["true"])], fallback_waiter)
+
+
+def test_controller_readiness_handler_is_registered_before_barrier_can_start():
+    source = _LAUNCH_PATH.read_text(encoding="utf-8")
+    block = source[source.index("if controller_dependent_actions:") : source.index("# ========== N. Tracing")]
+
+    assert "actions.insert(" in block
+    assert "target_action=controller_ready_barrier" in block
 
 
 def _relay_targets(nodes):

@@ -26,7 +26,6 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["verification"] == "required"
     assert grasp_execution["max_execution_attempts"] == 3
     assert grasp_execution["recover_after_close_failure"] is True
-    assert grasp_execution["recover_after_retention_failure"] is True
     assert grasp_execution["approach_distance_m"] == 0.09
     assert grasp_execution["planner"] == {
         "confidence_threshold": 0.30,
@@ -44,6 +43,8 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["ik"]["rpc_timeout_sec"] == 3.0
     assert grasp_execution["ik"]["worker_count"] == 4
     assert grasp_execution["ik"]["worker_namespace_prefix"] == "/ik_worker"
+    assert grasp_execution["ik"]["verification_position_tolerance_m"] == 0.001
+    assert grasp_execution["ik"]["verification_orientation_tolerance_deg"] == 1.0
     orientation_guard = grasp_execution["target_gripper"]["ik_orientation_guard"]
     assert "joint5_abs_max" not in orientation_guard
     assert orientation_guard["joint5_constraints_enabled"] is True
@@ -274,6 +275,25 @@ def test_grasp_execution_config_rejects_excessive_worker_count(tmp_path: Path) -
     path = _write_config(tmp_path, lambda config: config["ik"].update({"worker_count": 9}))
 
     with pytest.raises(ValueError, match="worker_count"):
+        load_robot_config_dict(path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("verification_position_tolerance_m", -1e-6),
+        ("verification_orientation_tolerance_deg", -1e-6),
+        ("verification_orientation_tolerance_deg", 180.001),
+    ],
+)
+def test_grasp_execution_config_rejects_invalid_ik_fk_verification_tolerance(
+    tmp_path: Path,
+    key: str,
+    value: float,
+) -> None:
+    path = _write_config(tmp_path, lambda config: config["ik"].update({key: value}))
+
+    with pytest.raises(ValueError, match=key):
         load_robot_config_dict(path)
 
 

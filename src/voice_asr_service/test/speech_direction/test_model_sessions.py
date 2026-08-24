@@ -21,6 +21,8 @@ from inference_service.backends import RuntimeContext  # noqa: E402
 from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, StatefulAscendOmModelSession  # noqa: E402
 from voice_asr_service.model_session_builders import register_speech_direction_session_builder  # noqa: E402
 from voice_asr_service.speech_direction.model_sessions import SpeechDirectionRoleRunner  # noqa: E402
+from voice_asr_service.speech_direction.node import _build_acl_runtime_options  # noqa: E402
+from voice_asr_service.speech_direction.speech_gate import SileroVadEngine  # noqa: E402
 
 
 class _Execution:
@@ -49,6 +51,50 @@ class _Session:
     def execute_role(self, role, values, request):
         self.execute_role_calls.append((role, values, request))
         return {"host.silero.prob": np.array([[0.75]], dtype=np.float32)}
+
+
+class _VadRunner:
+    def __init__(self) -> None:
+        self.inputs = []
+        self.reset_calls = 0
+        self.close_calls = 0
+
+    def infer(self, audio: np.ndarray) -> float:
+        self.inputs.append(audio)
+        return 0.5
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.mark.parametrize(
+    ("acl_config_path", "expected"),
+    [
+        ("", {"device_id": 0}),
+        ("   ", {"device_id": 0}),
+        (" /etc/acl.json ", {"device_id": 0, "acl_config_path": "/etc/acl.json"}),
+    ],
+)
+def test_acl_runtime_options_omit_empty_default_path(acl_config_path, expected) -> None:
+    assert _build_acl_runtime_options(0, acl_config_path) == expected
+
+
+def test_silero_engine_reuses_runner_and_adds_context(tmp_path) -> None:
+    model_path = tmp_path / "silero.om"
+    model_path.write_bytes(b"mock-om")
+    runner = _VadRunner()
+    engine = SileroVadEngine(str(model_path), acl_runner=runner)
+
+    assert engine.inference(np.zeros(512, dtype=np.float32)) == pytest.approx(0.5)
+    assert runner.inputs[0].shape == (1, 576)
+
+    engine.reset_state()
+    engine.close()
+    assert runner.reset_calls == 1
+    assert runner.close_calls == 1
 
 
 def test_fullsubnet_roles_share_one_session_execution_scope() -> None:

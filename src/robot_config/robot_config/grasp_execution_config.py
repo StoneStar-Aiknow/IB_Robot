@@ -83,16 +83,11 @@ _SCHEMA: dict[str, Any] = {
     "verification_timeout_sec": _POSITIVE,
     "verification_wait_sec": _NON_NEGATIVE,
     "recover_after_close_failure": _bool(),
-    "recover_after_retention_failure": _bool(),
     "max_execution_attempts": _integer(0),
     "approach_distance_m": _NON_NEGATIVE,
-    "lift_distance_m": _NON_NEGATIVE,
     "observe_velocity_scaling": _VELOCITY,
     "approach_velocity_scaling": _VELOCITY,
     "descend_velocity_scaling": _VELOCITY,
-    "probe_lift_velocity_scaling": _VELOCITY,
-    "lift_velocity_scaling": _VELOCITY,
-    "release_velocity_scaling": _VELOCITY,
     # Robot-specific candidate correction expressed in the planning base frame.
     "candidate_target_offset_base_m": _vector(),
     "observe_settle_sec": _NON_NEGATIVE,
@@ -107,7 +102,6 @@ _SCHEMA: dict[str, Any] = {
         "gripper_tolerance_rad": _NON_NEGATIVE,
         "gripper_joint": _string(),
     },
-    "probe_lift_height_m": _NON_NEGATIVE,
     "descend_duration_sec": _POSITIVE,
     "camera": {
         "frame_id": _string(),
@@ -146,6 +140,8 @@ _SCHEMA: dict[str, Any] = {
         "worker_count": _integer(0, 8),
         "worker_namespace_prefix": _string(allow_empty=True),
         "auto_start_workers": _bool(),
+        "verification_position_tolerance_m": _NON_NEGATIVE,
+        "verification_orientation_tolerance_deg": _number(0.0, 180.0),
     },
     "contact_compensation": {
         "enabled": _bool(),

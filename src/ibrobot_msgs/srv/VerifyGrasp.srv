@@ -1,6 +1,6 @@
 # Verify whether the latest executed grasp is holding an object.
 #
-# This service is intended for post-close or post-lift verification. The
+# This service is intended for post-close verification. The
 # verifier samples its configured sensor topics at service time and returns a
 # fused result. A wrist camera occlusion is diagnostic evidence, not a hard
 # failure.

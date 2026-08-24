@@ -75,7 +75,7 @@ def test_failed_when_gripper_fully_closes_and_current_is_low():
     assert result.confidence >= 0.6
 
 
-def test_failed_after_object_slips_out_during_lift():
+def test_failed_when_closed_gripper_has_no_contact_evidence():
     result = evaluate_grasp(_input(gripper_position=0.0031, gripper_current_abs_a=0.0))
 
     assert result.status == STATUS_FAILED

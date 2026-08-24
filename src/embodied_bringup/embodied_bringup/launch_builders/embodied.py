@@ -6,7 +6,14 @@ from typing import Any
 
 from launch_ros.actions import Node
 
-from robot_config.loader import robot_config_digest
+from embodied_common.visual_game_contracts import normalize_visual_game_policies
+from robot_config.loader import (
+    navigation_endpoint_projection,
+    robot_config_digest,
+    robot_context_schema_version,
+    robot_supported_control_modes,
+    validate_navigation_endpoint_contract,
+)
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
@@ -60,6 +67,9 @@ def generate_embodied_nodes(
     active_control_mode: str,
     *,
     motion_authorized: bool = False,
+    include_motion: bool = True,
+    include_visual_games: bool = True,
+    include_perception: bool = True,
 ) -> list[Node]:
     """Generate embodied minimum-closure nodes from robot_config YAML."""
     embodied_config = robot_config.get("embodied", {})
@@ -67,16 +77,27 @@ def generate_embodied_nodes(
         logger.info("Embodied minimal closure disabled, skipping")
         return []
 
-    if "moveit" not in active_control_mode.lower():
-        raise ValueError(
-            "embodied minimal closure currently requires control_mode:=moveit_planning "
-            "or with_moveit-compatible moveit control mode."
-        )
+    required_control_mode = str(robot_config.get("skill_required_control_mode", "moveit_planning")).strip()
+    supported_control_modes = robot_supported_control_modes(robot_config)
+    moveit_compatible = "moveit" in required_control_mode.lower() and "moveit" in active_control_mode.lower()
+    motion_mode_compatible = (
+        active_control_mode == required_control_mode
+        or moveit_compatible
+        or (active_control_mode in supported_control_modes and required_control_mode in supported_control_modes)
+    )
+    required_mode_error = (
+        "embodied minimal closure requires a MoveIt-compatible control mode"
+        if "moveit" in required_control_mode.lower()
+        else f"embodied minimal closure requires control_mode:={required_control_mode}"
+    )
 
     execution = embodied_config.get("execution", {})
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
     if entry_mode != "hermes":
         raise ValueError("embodied.entry_mode must be hermes")
+    endpoint_errors = validate_navigation_endpoint_contract(robot_config)
+    if endpoint_errors:
+        raise ValueError("; ".join(endpoint_errors))
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
     safety = embodied_config.get("safety", {})
@@ -85,9 +106,22 @@ def generate_embodied_nodes(
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
     placement_execution = robot_config.get("placement_execution", {})
+    semantic_mapping = robot_config.get("semantic_mapping", {})
+    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
+        motion = placement_execution.get("motion", {})
+        if isinstance(motion, dict):
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["post_grasp_motion"] = {
+                "pose_name": motion.get("place_pose", "place_container"),
+                "joint_names": motion.get("place_joint_names", []),
+                "joint_positions": motion.get("place_joint_positions", {}),
+                "duration_sec": motion.get("place_duration_sec", 5.0),
+                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
+            }
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
+    visual_games = normalize_visual_game_policies(embodied_config.get("visual_games", {}))
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
     skill_catalog_source_mode = embodied_config.get("skill_catalog_source_mode", "installed")
     skill_catalog_source_root = embodied_config.get("skill_catalog_source_root", "")
@@ -99,7 +133,23 @@ def generate_embodied_nodes(
             skill_catalog_source_root = ""
         else:
             skill_catalog_source_root = str(resolved_source_root)
-
+    enabled_visual_games = {name: policy for name, policy in visual_games.items() if policy["enabled"]}
+    announcing_visual_games = {name: policy for name, policy in enabled_visual_games.items() if policy["announce"]}
+    voice_tts = robot_config.get("voice_tts", {})
+    if not isinstance(voice_tts, dict):
+        voice_tts = {}
+    has_tts_runtime = (
+        voice_tts.get("enabled") is True
+        and bool(str(voice_tts.get("bundle_path", "")).strip())
+        and bool(str(voice_tts.get("deployment", "")).strip())
+        and str(voice_tts.get("service_name", "")).startswith("/")
+        and str(voice_tts.get("playback_service_name", "")).startswith("/")
+    )
+    start_visual_game_service = embodied_config.get("start_visual_game_service", "/embodied/start_visual_game")
+    get_visual_game_result_service = embodied_config.get(
+        "get_visual_game_result_service", "/embodied/get_visual_game_result"
+    )
+    visual_game_event_topic = embodied_config.get("visual_game_event_topic", "/embodied/visual_game_events")
     common_params = {
         "debug_tracing": embodied_config.get("debug_tracing", True),
         "named_poses_json": json.dumps(named_poses),
@@ -117,6 +167,12 @@ def generate_embodied_nodes(
         "motion_authorized": motion_authorized,
         "active_control_mode": active_control_mode,
         "skill_required_control_mode": robot_config.get("skill_required_control_mode", ""),
+        "supported_control_modes_json": json.dumps(list(supported_control_modes)),
+        "motion_mode_service": str(
+            robot_config.get("motion_mode", {}).get(
+                "set_navigation_enabled_service", "motion_mode/set_navigation_enabled"
+            )
+        ),
         "skill_gateway_status_service": embodied_config.get(
             "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
         ),
@@ -134,6 +190,7 @@ def generate_embodied_nodes(
             "finalize_workflow_service", "/embodied/finalize_workflow_execution"
         ),
         "robot_name": robot_config.get("name", "unknown"),
+        "context_schema_version": robot_context_schema_version(robot_config),
         "config_digest": robot_config_digest(robot_config),
         "default_skill_timeout_sec": timeout_policy["default_skill_timeout_sec"],
         "task_budget_sec": timeout_policy["task_budget_sec"],
@@ -156,6 +213,16 @@ def generate_embodied_nodes(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
     }
+    navigation_action_name = navigation_endpoint_projection(robot_config)
+    if navigation_action_name is not None:
+        common_params["navigation_action_name"] = navigation_action_name
+    if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
+        common_params["semantic_map_target_service"] = semantic_mapping.get("interfaces", {}).get(
+            "query_service", "/semantic_mapping/get_objects"
+        )
+        common_params["semantic_map_stand_off_distance_m"] = float(
+            semantic_mapping.get("target_watch", {}).get("stand_off_distance_m", 0.3)
+        )
     perception_node = None
     if perception.get("enabled", False):
         perception_node = Node(
@@ -201,6 +268,74 @@ def generate_embodied_nodes(
             ],
         )
 
+    visual_game_gateway_node = None
+    visual_game_announcer_node = None
+    if enabled_visual_games:
+        visual_game_gateway_node = Node(
+            package="embodied_agent",
+            executable="visual_game_gateway_node",
+            name="visual_game_gateway_node",
+            output="screen",
+            parameters=[
+                {
+                    "debug_tracing": embodied_config.get("debug_tracing", True),
+                    "robot_name": robot_config.get("name", "unknown"),
+                    "perception_enabled": perception.get("enabled", False),
+                    "visual_games_json": json.dumps(visual_games),
+                    "perception_request_topic": perception.get("request_topic", "/embodied/perception_request"),
+                    "perception_result_topic": perception.get("result_topic", "/embodied/perception_result"),
+                    "start_service": start_visual_game_service,
+                    "result_service": get_visual_game_result_service,
+                    "event_topic": visual_game_event_topic,
+                    "model_idle_timeout_sec": timeout_policy["model_idle_timeout_sec"],
+                    "visual_game_timeout_sec": timeout_policy["visual_game_timeout_sec"],
+                    "result_retention_sec": timeout_policy["visual_game_result_retention_sec"],
+                    "result_capacity": embodied_config.get("visual_game_result_capacity", 128),
+                }
+            ],
+        )
+        if announcing_visual_games and has_tts_runtime:
+            visual_game_announcer_node = Node(
+                package="embodied_agent",
+                executable="visual_game_announcer_node",
+                name="visual_game_announcer_node",
+                output="screen",
+                parameters=[
+                    {
+                        "event_topic": visual_game_event_topic,
+                        "tts_service": voice_tts["service_name"],
+                        "playback_service": voice_tts["playback_service_name"],
+                        "tts_timeout_sec": voice_tts.get("tts_timeout_sec", 15.0),
+                        "playback_timeout_sec": voice_tts.get("playback_timeout_sec", 300.0),
+                        "debug_tracing": embodied_config.get("debug_tracing", True),
+                    }
+                ],
+            )
+
+    visual_nodes = []
+    if include_visual_games:
+        if visual_game_gateway_node is not None:
+            visual_nodes.append(visual_game_gateway_node)
+        if visual_game_announcer_node is not None:
+            visual_nodes.append(visual_game_announcer_node)
+        if perception_node is not None and include_perception:
+            visual_nodes.append(perception_node)
+
+    has_visual_closure = visual_game_gateway_node is not None
+
+    if not include_motion:
+        if not motion_mode_compatible and not has_visual_closure:
+            raise ValueError(required_mode_error)
+        return visual_nodes
+
+    if not motion_mode_compatible:
+        if not include_visual_games:
+            return []
+        if not has_visual_closure:
+            raise ValueError(required_mode_error)
+        logger.info("Embodied visual-game closure enabled without motion nodes")
+        return visual_nodes
+
     logger.info("Embodied minimal closure enabled, launching task/safety/skill nodes")
 
     nodes = [
@@ -242,7 +377,10 @@ def generate_embodied_nodes(
             ],
         ),
     ]
-    if perception_node is not None:
+    if include_visual_games:
+        nodes.extend(visual_nodes)
+    elif include_perception and perception_node is not None:
+        # Preserve the legacy perception placement in the controller-gated motion closure.
         nodes.append(perception_node)
     if grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})

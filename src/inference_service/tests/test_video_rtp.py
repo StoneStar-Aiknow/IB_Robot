@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import time
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
+from inference_service.h264_stream_recorder import H264StreamRecorder
 from inference_service.observation_sync import RtpTimestampMapper
 from inference_service.software_video_codec import SoftwareH264Decoder, SoftwareH264Encoder
 from inference_service.video_codec import EncodedPacket, VideoFrame
@@ -266,6 +268,106 @@ def test_receiver_reset_clears_buffer_mapping_and_readiness():
     receiver.close()
 
 
+def test_recording_only_receiver_writes_mapped_and_dropped_sidecar_entries(tmp_path):
+    recorder = H264StreamRecorder(integrity_mode="tolerant")
+    recorder.start_episode(tmp_path, "observation.images.top")
+    receiver, _ = _receiver(recorder=recorder, decode=False)
+    receiver.start()
+    encoder = _encoder(gop_frames=1)
+    memory = _MemoryDatagramSender([])
+    sender = _sender(memory, queue_capacity=2)
+
+    capture_ns = 1_000_000_000
+    receiver.timestamp_mapper.update(90_000, capture_ns, 2_000_000_000, session_generation=1)
+    for packet in encoder.encode(
+        VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), capture_ns, capture_ns, 64, 48, "rgb24")
+    ):
+        sender.enqueue(packet)
+        sender.send_pending()
+    assert _deliver(memory.datagrams, receiver, start_receive_ns=2_000_000_000) == []
+
+    receiver.timestamp_mapper.reset(1)
+    memory.datagrams.clear()
+    capture_ns += 50_000_000
+    for packet in encoder.encode(
+        VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), capture_ns, capture_ns, 64, 48, "rgb24")
+    ):
+        sender.enqueue(packet)
+        sender.send_pending()
+    _deliver(memory.datagrams, receiver, start_receive_ns=2_050_000_000)
+
+    assert recorder.stop_episode() is True
+    sidecar = tmp_path / "observation.images.top.h264.json"
+    entries = [json.loads(line) for line in sidecar.read_text().splitlines()]
+    assert entries[0]["capture_timestamp_ns"] == 1_000_000_000
+    assert entries[1]["capture_timestamp_ns"] is None
+    assert entries[1]["dropped"] == "timestamp_unmapped"
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_recording_receiver_resets_frame_index_for_each_episode(tmp_path):
+    recorder = H264StreamRecorder(integrity_mode="tolerant")
+    receiver, _ = _receiver(recorder=recorder, decode=False)
+    receiver.start()
+    encoder = _encoder(gop_frames=1)
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    for episode in range(2):
+        episode_dir = tmp_path / str(episode)
+        recorder.start_episode(episode_dir, "observation.images.top")
+        memory = _MemoryDatagramSender([])
+        sender = _sender(memory, queue_capacity=2)
+        capture_ns = 1_000_000_000 + episode * 50_000_000
+        for packet in encoder.encode(
+            VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), capture_ns, capture_ns, 64, 48, "rgb24")
+        ):
+            sender.enqueue(packet)
+            sender.send_pending()
+        _deliver(memory.datagrams, receiver, start_receive_ns=2_000_000_000 + episode * 50_000_000)
+        assert recorder.stop_episode() is True
+        sender.close()
+
+    for episode in range(2):
+        sidecar = tmp_path / str(episode) / "observation.images.top.h264.json"
+        assert json.loads(sidecar.read_text().splitlines()[0])["frame_index"] == 0
+    encoder.close()
+    receiver.close()
+
+
+@pytest.mark.parametrize(("integrity_mode", "kept"), [("strict", False), ("tolerant", True)])
+def test_recording_packet_loss_injection_applies_integrity_policy(tmp_path, integrity_mode, kept):
+    recorder = H264StreamRecorder(integrity_mode=integrity_mode)
+    recorder.start_episode(tmp_path, "observation.images.top")
+    receiver, _ = _receiver(recorder=recorder, decode=False)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+    datagrams, encoder, sender = _encoded_stream(frame_count=3, gop_frames=1, max_datagram_size=180)
+    packets = [RtpPacket.from_bytes(item) for item in datagrams]
+    damaged_timestamp = sorted({packet.timestamp for packet in packets})[1]
+    dropped = False
+    delivered = []
+    for datagram, packet in zip(datagrams, packets, strict=True):
+        if packet.timestamp == damaged_timestamp and not dropped:
+            dropped = True
+            continue
+        delivered.append(datagram)
+
+    _deliver(delivered, receiver, start_receive_ns=2_000_000_000)
+
+    assert recorder.stop_episode() is kept
+    sidecar = tmp_path / "observation.images.top.h264.json"
+    if kept:
+        entries = [json.loads(line) for line in sidecar.read_text().splitlines()]
+        assert any(entry["lost_packets"] > 0 and entry["dropped"] == "rtp_sequence_gap" for entry in entries)
+    else:
+        assert not sidecar.exists()
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
 def test_local_udp_sender_receiver_threads_deliver_stream_and_stop_cleanly():
     udp_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_receiver.bind(("127.0.0.1", 0))
@@ -341,7 +443,9 @@ def _sender(
     )
 
 
-def _receiver(*, packet_queue_capacity: int = 64) -> tuple[H264RtpReceiver, StreamBuffer]:
+def _receiver(
+    *, packet_queue_capacity: int = 64, recorder=None, decode: bool = True
+) -> tuple[H264RtpReceiver, StreamBuffer]:
     buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000, retention_ns=2_000_000_000)
     mapper = RtpTimestampMapper(
         2_000_000_000,
@@ -358,6 +462,8 @@ def _receiver(*, packet_queue_capacity: int = 64) -> tuple[H264RtpReceiver, Stre
             timestamp_mapper=mapper,
             session_generation=1,
             packet_queue_capacity=packet_queue_capacity,
+            recorder=recorder,
+            decode=decode,
         ),
         buffer,
     )

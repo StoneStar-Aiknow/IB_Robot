@@ -1,0 +1,46 @@
+schema_version: 2
+name: nav_straight
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Translate the mobile base in a requested direction by a requested distance.
+  category: navigation
+  when_to_use:
+  - move the robot forward or backward by a known distance
+  - strafe the robot left or right by a known distance
+  aliases_en:
+  - drive straight
+  - move the base
+  motion_scope:
+  - base
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: true
+capability:
+  schema_version: 2
+  summary: Translate the mobile base in one of four directions.
+  domain: navigation
+  moves_robot: true
+  required_control_mode: base_navigation
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      direction:
+        type: string
+        enum:
+        - forward
+        - backward
+        - left
+        - right
+      distance:
+        type: number
+        exclusiveMinimum: 0
+        unit: meters
+    required:
+    - direction
+    - distance
+  recovery_policy: ask_user
+implementations:
+  lekiwi_navigation_v2: implementations/lekiwi_navigation_v2.yaml

@@ -211,6 +211,7 @@ class PickFlowPhase:
         duration_sec: float = 0.0,
     ) -> None:
         primitive_goal = PrimitiveCommand.Goal()
+        primitive_goal.schema_version = 1
         primitive_goal.dispatch_binding = copy_binding(self._dispatch_binding)
         if getattr(self, "_supervised_direct", False):
             self._direct_primitive_index = int(getattr(self, "_direct_primitive_index", 0)) + 1
@@ -583,7 +584,6 @@ class PickFlowPhase:
                         prepared,
                         scene_base,
                         release_after_success=bool(goal.release_after_success),
-                        release_drop_height_m=float(goal.release_drop_height_m),
                     )
                     self._publish_feedback(goal_handle, state, "completed", "object grasped and verified")
                     result = self._result_from_state(state)

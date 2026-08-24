@@ -1,0 +1,11 @@
+string request_id
+---
+bool found
+bool terminal
+bool success
+string game_name
+string scene_summary
+string result_json
+string config_digest
+string error_code
+string message

@@ -89,6 +89,14 @@ SO101 当前配置示例：
 | `close_gripper` | 闭合夹爪 |
 | `rotate_gripper_cw` | 绕当前末端局部 Z 轴顺时针旋转 |
 | `rotate_gripper_ccw` | 绕当前末端局部 Z 轴逆时针旋转 |
+| `nav_straight` | V2 request schema；V2/V3 context 可用；按方向枚举直行/横移指定距离，委托 `ExecuteNavigation` action |
+| `nav_turn` | V2 request schema；V2/V3 context 可用；按 `turn-left` / `turn-right` 方向旋转指定角度，委托 `ExecuteNavigation` action |
+| `nav_abs_coordinate` | V2 request schema；V2/V3 context 可用；导航到 `map` frame 绝对坐标 (x, y, yaw)，委托 `ExecuteNavigation` action |
+
+`nav_*` 三个 primitive 委托到 `/navigation/execute`（`ibrobot_msgs/action/ExecuteNavigation`）。
+它们只在 V2/V3 context 中可用；V1 请求携带 `nav_*` primitive 名直接返回
+`SKILL_SCHEMA_INVALID`，不会进入 dispatch 阶段。详见
+[导航 action dispatch](#9-导航-action-dispatch)。
 
 ## 4. 技能到 primitive 的映射方式
 
@@ -119,7 +127,7 @@ SO101 当前配置示例：
 
 `pick_object` 不展开静态 `named_targets` 位姿，而是委托给
 `/manipulation/execute_pick`。GraspGen 在运行时生成动态 6-DOF 候选，执行器再通过安全 primitive
-完成 approach、补偿下降、夹爪闭合和 lift。
+完成 approach、补偿下降、夹爪闭合和到 place container 位姿的运输。
 
 `place_in_container` 同样只允许从 `/embodied/execute_skill` 进入。Gateway
 将完整 `DispatchBinding` 和 `placement_pipeline` identity 传给
@@ -155,6 +163,8 @@ exact identity，再构造 direct root binding（`task_id == root_task_id`、零
 | `dispatch_binding.task_id` / `root_task_id` | direct root 两者相等 |
 | `dispatch_binding.task_budget` | direct root 可为零值，Gateway 在 admission 时 stamp canonical 预算 |
 | `dispatch_binding.expected_registry_epoch/generation/digest` | exact snapshot identity |
+| `dispatch_binding.schema_version` | wire contract schema version，仅接受 `{1, 2}`；由 `validate_request_schema_version` 校验，与请求体顶层 `schema_version` 必须一致 |
+| `schema_version` | 请求体顶层 schema version，仅接受 `{1, 2}`；V1 不得携带 navigation_* 字段，V2 由导航技能下发；与 `dispatch_binding.schema_version` 必须一致 |
 | `skill_name` | 技能名，如 `pick_object` |
 | `target_name` | 目标引用；对 `pick_object` 表示运行时视觉文本查询，如 `banana` |
 | `container_name` | 对 `place_in_container` 表示释放后用于视觉验收的容器文本查询，如 `black bowl`；不改变放置轨迹 |
@@ -162,6 +172,15 @@ exact identity，再构造 direct root binding（`task_id == root_task_id`、零
 | `motion_direction` | 相对运动方向 |
 | `motion_distance` | 相对运动距离 |
 | `timeout_sec` | per-entry 超时，受共享 `task_budget` 剩余预算约束 |
+| `direction` | V2 导航方向枚举（`forward`/`backward`/`leftward`/`rightward`/`turn-left`/`turn-right`）；仅 `nav_*` 技能下发 |
+| `distance` | V2 直行距离 (m)，仅 `nav_straight` 必填，必须为有限正数 |
+| `degree` | V2 转向角度 (deg)，仅 `nav_turn` 必填，必须为有限数 |
+| `x` | V2 绝对坐标 X (m)，仅 `nav_abs_coordinate` 使用 |
+| `y` | V2 绝对坐标 Y (m)，仅 `nav_abs_coordinate` 使用 |
+| `yaw` | V2 绝对坐标 yaw (rad)，仅 `nav_abs_coordinate` 使用 |
+| `has_x` | V2 presence flag，标识 `x` 是否由调用方显式提供 |
+| `has_y` | V2 presence flag，标识 `y` 是否由调用方显式提供 |
+| `has_yaw` | V2 presence flag，标识 `yaw` 是否由调用方显式提供 |
 
 例如挥手：
 
@@ -350,10 +369,14 @@ primitive result 在成功、失败、abort、cancel cleanup timeout 和 lease f
   已捕获 EE pose 的最终新鲜度在各自实际 send 边界前检查，而不是在校验前使用单一、通用的 readiness gate。
   直接/外部 primitive 不会额外调用 `/embodied/validate_skill`。
 
-admission 还会校验 `dispatch_binding` 的 exact registry identity：`schema_version=1`、`task_id == root_task_id`、
+admission 还会校验 `dispatch_binding` 的 exact registry identity：`schema_version` 通过
+`validate_request_schema_version` 校验、必须落在接受集合 `{1, 2}` 内且与请求体顶层 `schema_version`
+一致、`task_id == root_task_id`、
 `workflow_step_index=0`（root-scope canonical sentinel）、两个 nonce 为空、`expected_registry_epoch/generation/digest`
 与当前 runtime bundle 完全匹配，否则返回 `SKILL_REGISTRY_VERSION_MISMATCH`（binding 结构非法返回
-`SKILL_SCHEMA_INVALID`）。direct root `SkillCommand` 和外部 `PrimitiveCommand` 允许零值 `task_budget`：
+`SKILL_SCHEMA_INVALID`）。V1 请求携带任何 navigation_* 字段、或 V2 请求在
+`context_schema_version=1` 的 snapshot 上执行 nav_* primitive，同样以 `SKILL_SCHEMA_INVALID`
+拒绝。direct root `SkillCommand` 和外部 `PrimitiveCommand` 允许零值 `task_budget`：
 Gateway 成为 owner，在 admission 时 stamp canonical `task_budget_sec` 预算（canonical zero-budget direct root）；
 非零 budget 必须满足当前 policy，否则返回 `SKILL_SCHEMA_INVALID`。请求 `timeout_sec` 或 effective default
 超过剩余 task budget 时返回 `TIMEOUT_EXCEEDS_POLICY`，不静默 clamp。
@@ -454,12 +477,45 @@ terminal record。
 
 `pick_object` 技能把入口委托给 `/manipulation/execute_pick`（`PickObject` action）。Gateway 在 dispatch 时
 把同一 root 的 `dispatch_binding`（含共享 `task_budget` 和 exact identity）和 `expected_executor`
-传给 delegated executor。delegated server 在 goal acceptance 时校验 `dispatch_binding.schema_version=1`、
-非空 `task_id`/`root_task_id`、完整期望 identity、`task_budget.schema_version=1`、deadline 未过期且
+传给 delegated executor。delegated server 在 goal acceptance 时校验 `dispatch_binding.schema_version` 落在 `validate_request_schema_version` 接受集合 `{1, 2}` 内、
+非空 `task_id`/`root_task_id`、完整期望 identity、`task_budget.schema_version` 与请求体一致、deadline 未过期且
 `timeout_sec` 不超过剩余 budget；执行时用 `min(timeout_sec, deadline - now)` 作为实际预算，预算已过期
 返回 `TASK_TIMEOUT` 并 abort。Hermes/catalog goal 的 `supervised_direct` 固定为 `false` 且必须有非空
 delegated nonce；只有人工 bring-up client 可使用 `supervised_direct=true` 和空 nonce。详见
 `manipulation_execution` README。
+
+### 8.6 导航 action dispatch
+
+`nav_straight` / `nav_turn` / `nav_abs_coordinate` 三个 primitive（V2 request schema，V2/V3 context
+可用）的 dispatch 入口是
+`/navigation/execute`（`ibrobot_msgs/action/ExecuteNavigation`）。该 action name 由
+`robot_config.navigation.command_server.action_name` SSOT 提供，经
+`robot_execution_endpoints.navigation_action_name` 投影到 `SkillRobotContext`，并随
+`context_schema_version` 进入 canonical execution-context digest。
+
+Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admission：
+
+1. **wire contract 校验**：请求体 `schema_version` 与 `dispatch_binding.schema_version` 都必须等于 `2`，
+   由 `validate_request_schema_version` 校验；任一为 `1` 而请求携带 navigation_* 字段，或
+   `context_schema_version=1` 的 snapshot 上执行 nav_* primitive，返回 `SKILL_SCHEMA_INVALID`。
+2. **context version 选择**：snapshot 的 `context_schema_version` 必须为 `2` 或 `3`，否则即使 wire
+   `schema_version=2` 也以 `SKILL_SCHEMA_INVALID` 拒绝（防止 V1 snapshot 上通过 wire 字段绕过 contract）。
+3. **控制模式**：V2 snapshot 要求 `active_control_mode == base_navigation`；V3 hybrid snapshot 在下发
+   前通过 `motion_mode/set_navigation_enabled` 切换到 `base_navigation`。切换失败返回
+   `CONTROL_MODE_MISMATCH`，不发送 ExecuteNavigation goal。
+4. **navigation_ready**：Gateway 在 dispatch 前等待 `navigation_ready=true`，即
+   `navigation_command_server` 已声明 Action 可发现且 `/global_costmap/costmap` 非空。该 readiness
+   门不同于 motion 授权或 EE pose 新鲜度，专门用于导航 primitive。
+5. **costmap readiness**：`navigation_command_server` 自身在向 Nav2 发送 `NavigateToPose` 前会用
+   `costmap_readiness_timeout`（默认 60s）轮询 `/global_costmap/costmap`，超时仍未拿到非空数据时直接
+   以 `NAV2_UNAVAILABLE` 终态返回，不会取得 root lease。Gateway 不会重试。
+6. **ExecuteNavigation goal**：Gateway 把同一 root 的 `dispatch_binding`、共享 `task_budget` 与
+   exact identity 透传到 `ExecuteNavigation.Goal`；执行器负责把
+   `direction` / `distance` / `degree` 或 `(x, y, yaw)` 翻译成 Nav2 target。
+
+`ExecuteNavigation` 是单任务 action，Gateway 一次只允许一个 nav_* primitive 在途；需要切换目标时，
+调用方必须先等待 `ExecuteNavigation` 进入终态或调用 `/navigation/cancel_current` 成功。cancel 路径
+详见 [§9 取消终态契约](#取消终态契约)。
 
 ## 9. 主要参数
 
@@ -521,6 +577,16 @@ delegated nonce；只有人工 bring-up client 可使用 `supervised_direct=true
   `error_code` 也保持为 `SKILL_CANCEL_TIMEOUT`。
 - PrimitiveCommand 的底层清理信号仍可使用 `CANCEL_CLEANUP_TIMEOUT`，但不会作为 SkillCommand 的
   公共错误码暴露。
+- `STOP_TIMEOUT`（ExecuteNavigation 速度未在 `cancel_cleanup_timeout_sec` 内稳定到零）与
+  `INTERNAL_ERROR` 都是 fail-closed 终态：调用方与 Gateway **不得**释放 root lease，
+  `_active_skill_admission` / `_active_skill_owner` / `_active_audit_context` /
+  `_active_runtime_bundle` / `_retained_admission_cleanup` 全部保留，runtime bundle retention
+  也不回收。Coordinator ledger 先写 terminal record，再由后续
+  `FinalizeWorkflowExecution` 以匹配终态幂等收敛后才释放 root lease 与 bundle retention。
+  这避免在底盘速度未归零时把 root lease 交给下一个请求；调用方必须显式终态化才能恢复。
+- `nav_*` primitive 在 cancel/cleanup 路径上的 lease 保留语义与上面通用 primitive 一致；
+  `ExecuteNavigation` 进入 `STOP_TIMEOUT` 时，对应 `SkillCommand` 终态保持 `SKILL_CANCEL_TIMEOUT`，
+  root lease 同样不被释放。
 
 ### SkillCommand feedback
 

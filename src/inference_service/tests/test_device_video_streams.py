@@ -1,3 +1,4 @@
+import threading
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
@@ -91,13 +92,13 @@ class _Sender:
         self.closed = True
 
 
-def _spec(mode="rtp"):
+def _spec(mode="rtp", *, key="observation.images.top", stream_id="top", port=5004):
     transport = ObservationTransportSpec()
     if mode == "rtp":
         transport = ObservationTransportSpec(
             mode="rtp",
-            stream_id="top",
-            endpoint=RtpEndpointSpec("127.0.0.1", 5004),
+            stream_id=stream_id,
+            endpoint=RtpEndpointSpec("127.0.0.1", port),
             h264=H264Spec(gop_frames=10),
             encoder_backend="software",
             decoder_backend="software",
@@ -106,7 +107,7 @@ def _spec(mode="rtp"):
             readiness=VideoReadinessSpec(),
         )
     return SpecView(
-        key="observation.images.top" if mode == "rtp" else "observation.state",
+        key=key if mode == "rtp" else "observation.state",
         topic="/camera/top" if mode == "rtp" else "/joint_states",
         ros_type="sensor_msgs/msg/Image" if mode == "rtp" else "sensor_msgs/msg/JointState",
         is_action=False,
@@ -219,6 +220,62 @@ def test_device_stream_manager_drops_non_monotonic_capture_timestamps():
     )
     assert len(encoder.frames) == 1
     assert manager.statuses()[0].dropped_frames == 1
+
+
+def test_device_stream_manager_rejects_frames_after_session_clear():
+    manager, encoder, _senders = _manager()
+    manager.bind_session("session", 1)
+    manager.clear_session()
+
+    assert not manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=11
+    )
+    assert encoder.frames == []
+
+
+def test_device_stream_manager_encodes_distinct_streams_concurrently():
+    registry = VideoCodecRegistry()
+    encode_barrier = threading.Barrier(2, timeout=2)
+
+    class _ConcurrentEncoder(_Encoder):
+        def encode(self, frame):
+            encode_barrier.wait()
+            return super().encode(frame)
+
+    registry.register(
+        "software",
+        priority=0,
+        probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
+        encoder_factory=lambda **options: _ConcurrentEncoder(**options),
+    )
+    manager = DeviceVideoStreamManager(
+        pipeline_id="policy",
+        contract_fingerprint="contract",
+        deployment_fingerprint="deployment",
+        observation_specs=(
+            _spec(),
+            _spec(key="observation.images.wrist", stream_id="wrist", port=5006),
+        ),
+        codec_registry=registry,
+        sender_factory=_Sender,
+    )
+    manager.bind_session("session", 1)
+    results = []
+
+    def submit(key):
+        results.append(manager.submit_ros_image(key, _image(), capture_timestamp_ns=10, receive_timestamp_ns=11))
+
+    threads = [
+        threading.Thread(target=submit, args=("observation.images.top",)),
+        threading.Thread(target=submit, args=("observation.images.wrist",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert results == [True, True]
 
 
 def test_device_stream_diagnostic_snapshot_is_immutable_deterministic_and_tracks_readiness():

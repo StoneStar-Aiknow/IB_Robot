@@ -5,10 +5,22 @@ up a ROS node. Keep this package-level test generic: it must not import entry
 business packages such as ``embodied_agent``.
 """
 
+import subprocess
+import sys
+
 from embodied_common.scene_analysis import SceneAnalysis
 from perception_service.perception_service_node import PerceptionServiceNode
 
 HOUSES = ["斯莱特林", "格兰芬多", "拉文克劳", "赫奇帕奇"]
+
+
+def test_perception_service_import_does_not_load_visual_game_registry():
+    script = (
+        "import sys; import perception_service.perception_service_node; "
+        "assert 'embodied_common.visual_game_contracts' not in sys.modules"
+    )
+
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 def _context(**overrides):
@@ -40,6 +52,18 @@ def _check(context: dict, scene_summary: str):
 
 def test_valid_house_passes():
     assert _check(_context(), "格兰芬多") is None
+
+
+def test_shared_string_number_and_string_array_contracts_pass():
+    analysis = _analysis("格兰芬多")
+    contracts = [
+        {"field": "scene_summary", "kind": "string"},
+        {"field": "confidence", "kind": "number"},
+        {"field": "risks", "kind": "string_array"},
+    ]
+
+    for contract in contracts:
+        assert PerceptionServiceNode._check_response_contract({"response_contract": contract}, analysis) is None
 
 
 def test_empty_value_is_rejected():

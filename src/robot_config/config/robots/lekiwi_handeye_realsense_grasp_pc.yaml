@@ -108,22 +108,15 @@ robot:
     verification_timeout_sec: 5.0
     verification_wait_sec: 0.1
     recover_after_close_failure: true
-    recover_after_retention_failure: true
     max_execution_attempts: 3
     approach_distance_m: 0.09
-    lift_distance_m: 0.050
     # Keep the PC planning profile geometrically identical to the validated
     # 310P marker profile.
     candidate_target_offset_base_m: [0.0, 0.0, 0.0]
     observe_velocity_scaling: 0.40
     approach_velocity_scaling: 0.35
     descend_velocity_scaling: 0.20
-    probe_lift_velocity_scaling: 0.05
-    lift_velocity_scaling: 0.08
-    # Post-success release: lower the verified target back onto the table
-    # instead of keeping it in the gripper, so consecutive picks still have
-    # a target. Only used when the goal sets release_after_success.
-    release_velocity_scaling: 0.05
+    # Only used when release_after_success opens the gripper at place_container.
     release_settle_sec: 0.5
     observe_settle_sec: 0.4
     open_settle_sec: 0.2
@@ -138,7 +131,6 @@ robot:
       joint_delta_rad: 0.004
       gripper_tolerance_rad: 0.05
       gripper_joint: "6"
-    probe_lift_height_m: 0.03
     camera:
       frame_id: camera_wrist_optical_frame
       rgb_topic: /camera/wrist/image_raw
@@ -186,6 +178,8 @@ robot:
       avoid_collisions: false
       check_orientation: false
       worker_count: 4
+      verification_position_tolerance_m: 0.001
+      verification_orientation_tolerance_deg: 1.0
       worker_namespace_prefix: /ik_worker
       auto_start_workers: true
     contact_compensation:
@@ -335,7 +329,7 @@ robot:
         joint5_home_max_delta_rad: 1.5707963267948966
         joint5_limit_epsilon_rad: 0.001
         # After candidate selection, preserve the chosen branch through
-        # approach/pregrasp/grasp/lift and reject a true half-turn jump.
+        # approach/pregrasp/grasp and reject a true half-turn jump.
         joint5_stage_continuity: true
         joint5_stage_max_delta_rad: 1.5707963267948966
         max_approach_error_deg: 40.0

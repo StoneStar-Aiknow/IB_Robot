@@ -7,6 +7,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
+from embodied_common.skill_request import validate_request_schema_version
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from ibrobot_msgs.msg import SkillRegistryEvent
 from ibrobot_msgs.srv import GetSkillGatewayStatus, GetSkillSnapshot, ValidatePrimitive, ValidateSkill
 from safety_guard.rules import (
@@ -22,6 +24,7 @@ class SafetyGuardNode(Node):
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("safety_guard_node", parameter_overrides=parameter_overrides)
+        validate_public_request_wire_contracts()
         self.declare_parameter("validate_skill_service", "/embodied/validate_skill")
         self.declare_parameter("validate_primitive_service", "/embodied/validate_primitive")
         self.declare_parameter("skill_gateway_status_service", "/embodied/get_skill_gateway_status")
@@ -291,6 +294,14 @@ class SafetyGuardNode(Node):
         robot_context = self._thaw(snapshot.robot_context)
         skill_templates = self._thaw(snapshot.templates)
         try:
+            request_schema_version = validate_request_schema_version(request.schema_version)
+        except ValueError as exc:
+            response.allowed = False
+            response.reason = str(exc)
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            self._set_actual_identity(response, snapshot.identity)
+            return response
+        try:
             allowed, reason = validate_skill_request(
                 request.skill_name,
                 request.target_name,
@@ -303,6 +314,14 @@ class SafetyGuardNode(Node):
                 robot_context.get("arm_joint_names", []),
                 robot_context.get("joint_limits", {}),
                 container_name=request.container_name,
+                direction=request.direction,
+                distance=request.distance,
+                degree=request.degree,
+                x=request.x if request.has_x else None,
+                y=request.y if request.has_y else None,
+                yaw=request.yaw if request.has_yaw else None,
+                schema_version=request_schema_version,
+                primitive_descriptors=snapshot.primitive_descriptors,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
@@ -355,6 +374,14 @@ class SafetyGuardNode(Node):
             return response
         robot_context = self._thaw(snapshot.robot_context)
         try:
+            request_schema_version = validate_request_schema_version(request.schema_version)
+        except ValueError as exc:
+            response.allowed = False
+            response.reason = str(exc)
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            self._set_actual_identity(response, snapshot.identity)
+            return response
+        try:
             allowed, reason = validate_primitive_request(
                 request.primitive_name,
                 request.pose_name,
@@ -380,6 +407,18 @@ class SafetyGuardNode(Node):
                 request.target_qz,
                 request.target_qw,
                 request.velocity_scaling,
+                request.navigation_command_type,
+                request.navigation_target_pose.header.frame_id,
+                request.navigation_target_pose.pose.position.x,
+                request.navigation_target_pose.pose.position.y,
+                request.navigation_target_pose.pose.position.z,
+                request.navigation_target_pose.pose.orientation.x,
+                request.navigation_target_pose.pose.orientation.y,
+                request.navigation_target_pose.pose.orientation.z,
+                request.navigation_target_pose.pose.orientation.w,
+                request.navigation_value,
+                schema_version=request_schema_version,
+                primitive_descriptors=snapshot.primitive_descriptors,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")

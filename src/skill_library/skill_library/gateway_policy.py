@@ -31,12 +31,14 @@ _CAPABILITY_ORDER = (
     "task_executor",
     "arm_trajectory",
     "fresh_ee_pose",
+    "navigation",
 )
 _CAPABILITY_UNAVAILABLE_MESSAGES = {
     "validate_skill": "validate skill service unavailable",
     "task_executor": "task executor action unavailable",
     "arm_trajectory": "arm trajectory action unavailable",
     "fresh_ee_pose": "ee pose unavailable or stale",
+    "navigation": "navigation action unavailable",
 }
 _REQUEST_PARAMETER_FIELDS = (
     "target_name",
@@ -44,6 +46,12 @@ _REQUEST_PARAMETER_FIELDS = (
     "place_name",
     "motion_direction",
     "motion_distance",
+    "direction",
+    "distance",
+    "degree",
+    "x",
+    "y",
+    "yaw",
 )
 
 __all__ = [
@@ -82,11 +90,21 @@ class GatewayRequest:
 
     task_id: Any
     skill_name: Any
+    schema_version: Any = 1
     target_name: Any = None
     container_name: Any = None
     place_name: Any = None
     motion_direction: Any = None
     motion_distance: Any = None
+    direction: Any = None
+    distance: Any = None
+    degree: Any = None
+    x: Any = None
+    y: Any = None
+    yaw: Any = None
+    has_x: Any = None
+    has_y: Any = None
+    has_yaw: Any = None
     timeout_sec: Any = None
 
 
@@ -103,6 +121,8 @@ class RuntimeSnapshot:
     task_executor_ready: bool = False
     arm_trajectory_ready: bool = False
     ee_pose_fresh: bool = False
+    navigation_ready: bool = False
+    control_mode_switching_enabled: bool = False
 
     @property
     def is_busy(self) -> bool:
@@ -118,6 +138,7 @@ class SkillRequirements:
     task_executor: bool = False
     arm_trajectory: bool = False
     fresh_ee_pose: bool = False
+    navigation: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,7 +167,7 @@ class PreparedRequest:
     """A request after canonical payload resolution by embodied_common."""
 
     identity: RequestIdentity
-    payload: Mapping[str, str | float | None]
+    payload: Mapping[str, str | float | bool | None]
     effective_timeout_sec: float
 
 
@@ -411,10 +432,16 @@ class LedgerQuery:
     error_code: str = ""
 
 
-def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dict[str, SkillRequirements]:
+def build_skill_requirements(
+    expanded_skill_templates: Mapping[str, Any],
+    primitive_descriptors: Mapping[str, Any] | None = None,
+) -> dict[str, SkillRequirements]:
     """Build private capability requirements from already-expanded skill templates."""
     if not isinstance(expanded_skill_templates, Mapping):
         raise ValueError("expanded_skill_templates must be a mapping")
+    descriptors = PRIMITIVE_DESCRIPTORS if primitive_descriptors is None else primitive_descriptors
+    if not isinstance(descriptors, Mapping):
+        raise ValueError("primitive_descriptors must be a mapping")
 
     requirements: dict[str, SkillRequirements] = {}
     for skill_name, template in expanded_skill_templates.items():
@@ -425,6 +452,7 @@ def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dic
             "task_executor": bool(str(template.get("initial_gripper_state", "")).strip()),
             "arm_trajectory": False,
             "fresh_ee_pose": False,
+            "navigation": False,
         }
         primitive_sequence = template.get("primitive_sequence", [])
         if not isinstance(primitive_sequence, list):
@@ -434,7 +462,7 @@ def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dic
             if not isinstance(step, Mapping):
                 raise ValueError(f"skill template '{skill_name}' contains a non-object step")
             primitive_name = str(step.get("primitive_name", "")).strip()
-            descriptor = PRIMITIVE_DESCRIPTORS.get(primitive_name)
+            descriptor = descriptors.get(primitive_name)
             if descriptor is None:
                 raise ValueError(f"skill template '{skill_name}' uses unknown primitive '{primitive_name}'")
             for field_name in descriptor.required_runtime_capabilities:
@@ -446,6 +474,7 @@ def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dic
             task_executor=merged["task_executor"],
             arm_trajectory=merged["arm_trajectory"],
             fresh_ee_pose=merged["fresh_ee_pose"],
+            navigation=merged["navigation"],
         )
     return requirements
 
@@ -485,7 +514,17 @@ def build_request_identity(request: GatewayRequest, *, default_timeout_sec: floa
         place_name=request.place_name,
         motion_direction=request.motion_direction,
         motion_distance=request.motion_distance,
+        direction=request.direction,
+        distance=request.distance,
+        degree=request.degree,
+        x=request.x,
+        y=request.y,
+        yaw=request.yaw,
+        has_x=request.has_x,
+        has_y=request.has_y,
+        has_yaw=request.has_yaw,
         timeout_sec=request.timeout_sec,
+        schema_version=request.schema_version,
         default_timeout_sec=default_timeout_sec,
     )
     payload_hash = skill_request.skill_payload_hash(payload)
@@ -508,6 +547,8 @@ class GatewayPolicy:
         *,
         parameter_schemas: Mapping[str, Mapping[str, Any]],
         skill_timeout_caps: Mapping[str, float] | None = None,
+        skill_schema_versions: Mapping[str, int] | None = None,
+        skill_control_modes: Mapping[str, str] | None = None,
         ledger: BoundedRequestLedger | None = None,
         lease: RootExecutionLease | None = None,
     ) -> None:
@@ -528,6 +569,8 @@ class GatewayPolicy:
             raise ValueError("parameter_schemas must be a mapping")
         self._parameter_schemas = dict(parameter_schemas)
         self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
+        self._skill_schema_versions = self._validate_schema_versions(skill_schema_versions or {})
+        self._skill_control_modes = {str(name): str(mode) for name, mode in (skill_control_modes or {}).items()}
         self._ledger = ledger
         self._lease = lease
         self._transition_lock = RLock()
@@ -546,6 +589,8 @@ class GatewayPolicy:
         *,
         parameter_schemas: Mapping[str, Mapping[str, Any]],
         skill_timeout_caps: Mapping[str, float] | None = None,
+        skill_schema_versions: Mapping[str, int] | None = None,
+        skill_control_modes: Mapping[str, str] | None = None,
     ) -> None:
         """Replace immutable admission indexes for the next root request.
 
@@ -567,6 +612,8 @@ class GatewayPolicy:
             self._skill_requirements = dict(skill_requirements)
             self._parameter_schemas = dict(parameter_schemas)
             self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
+            self._skill_schema_versions = self._validate_schema_versions(skill_schema_versions or {})
+            self._skill_control_modes = {str(name): str(mode) for name, mode in (skill_control_modes or {}).items()}
 
     def _validate_timeout_caps(self, values: Mapping[str, float]) -> dict[str, float]:
         if not isinstance(values, Mapping):
@@ -575,6 +622,17 @@ class GatewayPolicy:
         if any(value > self._task_budget_sec for value in caps.values()):
             raise ValueError("skill timeout cap must not exceed task_budget_sec")
         return caps
+
+    @staticmethod
+    def _validate_schema_versions(values: Mapping[str, int]) -> dict[str, int]:
+        if not isinstance(values, Mapping):
+            raise ValueError("skill_schema_versions must be a mapping")
+        versions: dict[str, int] = {}
+        for name, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2}:
+                raise ValueError(f"skill_schema_versions.{name} must be 1 or 2")
+            versions[str(name)] = value
+        return versions
 
     def evaluate(
         self,
@@ -587,6 +645,16 @@ class GatewayPolicy:
         """Evaluate admission with fixed motion, mode, busy, timeout, readiness priority."""
         try:
             prepared = self.prepare(request)
+            skill_name = str(prepared.payload["skill_name"])
+            expected_schema_version = self._skill_schema_versions.get(skill_name, 1)
+            if prepared.payload["schema_version"] != expected_schema_version:
+                return GatewayDecision(
+                    admitted=False,
+                    error_code="SKILL_SCHEMA_INVALID",
+                    message=(f"skill '{skill_name}' requires schema_version {expected_schema_version}"),
+                    effective_timeout_sec=prepared.effective_timeout_sec,
+                    prepared_request=prepared,
+                )
             requirements = self._requirements_for(prepared)
             if validate_parameters:
                 self._validate_parameters(prepared)
@@ -610,7 +678,10 @@ class GatewayPolicy:
                 message="operator authorization is disabled",
                 **decision_args,
             )
-        if snapshot.active_control_mode != snapshot.required_control_mode:
+        if (
+            not snapshot.control_mode_switching_enabled
+            and snapshot.active_control_mode != snapshot.required_control_mode
+        ):
             return GatewayDecision(
                 admitted=False,
                 error_code=CONTROL_MODE_MISMATCH,
@@ -748,7 +819,10 @@ class GatewayPolicy:
         with self._transition_lock:
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
-            if snapshot.active_control_mode != snapshot.required_control_mode:
+            if (
+                not snapshot.control_mode_switching_enabled
+                and snapshot.active_control_mode != snapshot.required_control_mode
+            ):
                 return CONTROL_MODE_MISMATCH, None
             if lease.owner is not None:
                 return SKILL_BUSY, None
@@ -796,7 +870,10 @@ class GatewayPolicy:
                 return SKILL_REJECTED, None
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
-            if snapshot.active_control_mode != snapshot.required_control_mode:
+            if (
+                not snapshot.control_mode_switching_enabled
+                and snapshot.active_control_mode != snapshot.required_control_mode
+            ):
                 return CONTROL_MODE_MISMATCH, None
             if snapshot.is_busy and not _is_active_owner(owner, snapshot.active_task_id):
                 return SKILL_BUSY, None
@@ -842,6 +919,10 @@ class GatewayPolicy:
         except KeyError as exc:
             raise ValueError(f"unknown skill '{skill_name}'") from exc
 
+    def required_control_mode(self, skill_name: str) -> str:
+        """Return the mode declared by the immutable catalog capability."""
+        return self._skill_control_modes.get(str(skill_name), "")
+
     def _validate_parameters(self, prepared: PreparedRequest) -> None:
         skill_name = str(prepared.payload["skill_name"])
         try:
@@ -854,18 +935,26 @@ class GatewayPolicy:
             raise ValueError(f"invalid parameter schema for skill '{skill_name}'")
 
         for field_name in _REQUEST_PARAMETER_FIELDS:
-            value = prepared.payload[field_name]
-            missing = value is None or (isinstance(value, str) and not value)
-            definition = properties.get(field_name)
+            value = prepared.payload.get(field_name)
+            if field_name in {"x", "y", "yaw"}:
+                missing = not bool(prepared.payload.get(f"has_{field_name}", False))
+            else:
+                missing = value is None or (isinstance(value, str) and not value)
+            schema_field_name = (
+                "stand_off_distance_m"
+                if field_name == "distance" and "distance" not in properties and "stand_off_distance_m" in properties
+                else field_name
+            )
+            definition = properties.get(schema_field_name)
             if definition is None:
-                if missing or (field_name == "motion_distance" and value == 0.0):
+                if missing or (field_name in {"motion_distance", "distance", "degree"} and value == 0.0):
                     continue
                 raise ValueError(f"{field_name} is not accepted by skill '{skill_name}'")
             if not isinstance(definition, Mapping):
                 raise ValueError(f"invalid parameter schema for skill '{skill_name}'")
             if missing:
-                if field_name in required:
-                    raise ValueError(f"{field_name} is required for skill '{skill_name}'")
+                if schema_field_name in required:
+                    raise ValueError(f"{schema_field_name} is required for skill '{skill_name}'")
                 continue
             if definition.get("type") == "string":
                 if definition.get("freeform") is True:
@@ -878,14 +967,16 @@ class GatewayPolicy:
                 continue
             if definition.get("type") == "number":
                 exclusive_minimum = definition.get("exclusiveMinimum")
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int | float)
-                    or isinstance(exclusive_minimum, bool)
+                invalid_number = (
+                    isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+                )
+                if exclusive_minimum is not None and (
+                    isinstance(exclusive_minimum, bool)
                     or not isinstance(exclusive_minimum, int | float)
-                    or not math.isfinite(value)
-                    or value <= exclusive_minimum
+                    or (not invalid_number and value <= exclusive_minimum)
                 ):
+                    invalid_number = True
+                if invalid_number:
                     raise ValueError(f"{field_name} is invalid for skill '{skill_name}'")
                 continue
             raise ValueError(f"invalid parameter schema for skill '{skill_name}'")
@@ -914,6 +1005,7 @@ def _readiness_reason(requirements: SkillRequirements, snapshot: RuntimeSnapshot
         "task_executor": snapshot.task_executor_ready,
         "arm_trajectory": snapshot.arm_trajectory_ready,
         "fresh_ee_pose": snapshot.ee_pose_fresh,
+        "navigation": snapshot.navigation_ready,
     }
     required = tuple(name for name in _CAPABILITY_ORDER if getattr(requirements, name))
     unavailable = tuple(name for name in required if not available[name])

@@ -9,9 +9,12 @@ def generate_navigation_command_nodes(nav_config: dict[str, Any], use_sim: bool 
     command_config = nav_config.get("command_server", {})
     if not command_config.get("enabled", False) or use_sim:
         return []
+    action_name = command_config.get("action_name")
+    if not isinstance(action_name, str) or not action_name.strip():
+        raise ValueError("navigation.command_server.action_name must be a non-empty string")
 
     parameters = {
-        "action_name": command_config.get("action_name", "/navigation/execute"),
+        "action_name": action_name,
         "cancel_service_name": command_config.get("cancel_service_name", "/navigation/cancel_current"),
         "nav2_action_name": command_config.get("nav2_action_name", "/navigate_to_pose"),
         "stop_velocity_topic": command_config.get("stop_velocity_topic", "/cmd_vel_safe"),

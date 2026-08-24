@@ -262,6 +262,8 @@ def negotiate_video_streams(
     requirements: StreamNegotiationRequirements,
     capabilities: VideoTransportCapabilities,
     descriptors: tuple[VideoStreamDescriptor, ...],
+    *,
+    validate_deployment_fingerprint: bool = True,
 ) -> dict[str, VideoStreamDescriptor]:
     """Validate startup capabilities and descriptors without transport fallback."""
     if capabilities.protocol_version != PROTOCOL_VERSION:
@@ -329,7 +331,8 @@ def negotiate_video_streams(
                 "contract_fingerprint",
             ),
             (
-                descriptor.deployment_fingerprint == requirements.deployment_fingerprint,
+                not validate_deployment_fingerprint
+                or descriptor.deployment_fingerprint == requirements.deployment_fingerprint,
                 "deployment_fingerprint_mismatch",
                 "deployment_fingerprint",
             ),
@@ -412,13 +415,23 @@ class VideoStreamNegotiator:
         self,
         requirements: StreamNegotiationRequirements,
         capabilities: VideoTransportCapabilities,
+        *,
+        validate_deployment_fingerprint: bool = True,
     ) -> None:
         self.requirements = requirements
         self.capabilities = capabilities
+        self._validate_deployment_fingerprint = validate_deployment_fingerprint
         self._lock = threading.RLock()
         self._descriptors: dict[str, VideoStreamDescriptor] = {}
         self._negotiated: dict[str, VideoStreamDescriptor] | None = (
-            negotiate_video_streams(requirements, capabilities, ()) if requirements.transport_mode == "dds" else None
+            negotiate_video_streams(
+                requirements,
+                capabilities,
+                (),
+                validate_deployment_fingerprint=validate_deployment_fingerprint,
+            )
+            if requirements.transport_mode == "dds"
+            else None
         )
 
     @property
@@ -462,6 +475,7 @@ class VideoStreamNegotiator:
                 self.requirements,
                 self.capabilities,
                 tuple(self._descriptors.values()),
+                validate_deployment_fingerprint=self._validate_deployment_fingerprint,
             )
             return True
 

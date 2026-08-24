@@ -34,7 +34,7 @@ def generate_controller_spawners(
     controller_manager_timeout=None,
     inactive_controller_names=(),
 ):
-    """Generate controller spawner nodes.
+    """Generate one timeout-aware controller group spawner.
 
     Args:
         controller_names: Controller names to load, configure, and activate
@@ -44,7 +44,7 @@ def generate_controller_spawners(
         inactive_controller_names: Controller names to load/configure but leave inactive
 
     Returns:
-        List of Node actions for controller spawners
+        Empty list or a single Node action for atomic controller group activation
     """
     is_sim = parse_bool(use_sim, default=True)
 
@@ -52,41 +52,43 @@ def generate_controller_spawners(
     inactive_controller_names = list(inactive_controller_names)
     if not controller_names and not inactive_controller_names:
         return []
+    if len(set(controller_names)) != len(controller_names):
+        raise ValueError("Active controller names must be unique")
+    if len(set(inactive_controller_names)) != len(inactive_controller_names):
+        raise ValueError("Inactive controller names must be unique")
+    overlap = set(controller_names) & set(inactive_controller_names)
+    if overlap:
+        raise ValueError(f"Controllers cannot be both active and inactive: {sorted(overlap)}")
 
     timeout = float(controller_manager_timeout) if controller_manager_timeout is not None else (60 if is_sim else 10)
     if timeout <= 0.0:
         raise ValueError("controller_manager_timeout must be greater than zero")
     service_call_timeout = min(timeout, 10.0)
-    switch_timeout = min(timeout, 10.0)
-    spawners = []
-    for controller_name, inactive in [
-        *((name, False) for name in controller_names),
-        *((name, True) for name in inactive_controller_names),
-    ]:
-        arguments = [
-            controller_name,
-            "--controller-manager",
-            controller_manager_name,
-            "--controller-manager-timeout",
-            str(timeout),
-            "--service-call-timeout",
-            str(service_call_timeout),
-            "--switch-timeout",
-            str(switch_timeout),
-        ]
-        if inactive:
-            arguments.append("--inactive")
-        spawners.append(
-            Node(
-                package="robot_config",
-                executable="controller_spawner",
-                name=f"spawner_{controller_name}",
-                parameters=[{"use_sim_time": is_sim}],
-                arguments=arguments,
-                output="screen",
-            )
+    switch_timeout = timeout
+    arguments = [
+        *controller_names,
+        "--controller-manager",
+        controller_manager_name,
+        "--controller-manager-timeout",
+        str(timeout),
+        "--service-call-timeout",
+        str(service_call_timeout),
+        "--switch-timeout",
+        str(switch_timeout),
+    ]
+    for controller_name in inactive_controller_names:
+        arguments.extend(["--inactive-controller", controller_name])
+
+    return [
+        Node(
+            package="robot_config",
+            executable="controller_spawner",
+            name="spawner_controller_group",
+            parameters=[{"use_sim_time": is_sim}],
+            arguments=arguments,
+            output="screen",
         )
-    return spawners
+    ]
 
 
 def generate_ros2_control_nodes(

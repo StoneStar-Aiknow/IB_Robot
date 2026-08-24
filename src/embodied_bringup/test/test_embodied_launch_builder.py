@@ -10,6 +10,27 @@ from robot_config.launch_builders.perception_models import generate_perception_m
 from robot_config.loader import load_robot_config_dict
 
 
+def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
+    return {
+        "enabled": enabled,
+        "announce": announce,
+        "handler": "sorting_hat_v1",
+        "summary": "Sort",
+    }
+
+
+def _voice_tts(**overrides) -> dict:
+    return {
+        "enabled": True,
+        "bundle_path": "models/voice_tts/zipvoice",
+        "deployment": "test_deployment",
+        "service_name": "/voice_tts/synthesize",
+        "playback_service_name": "/voice_tts/play",
+        "playback_timeout_sec": 300.0,
+        **overrides,
+    }
+
+
 def _normalize_launch_param_mapping(raw_params):
     normalized = {}
     for raw_key, raw_value in raw_params.items():
@@ -145,6 +166,8 @@ def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
     assert _decode_launch_string(params["skill_required_control_mode"]) == "moveit_planning"
     assert _decode_launch_string(params["skill_gateway_status_service"]) == "/test/gateway_status"
     assert _decode_launch_string(params["robot_name"]) == "test_robot"
+    assert params.get("context_schema_version") == 1
+    assert "navigation_action_name" not in params
     assert params["default_skill_timeout_sec"] == 12.0
     assert params["task_budget_sec"] == 90.0
     assert params["robot_state_freshness_sec"] == 0.25
@@ -152,6 +175,127 @@ def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
     assert params["model_idle_timeout_sec"] == 45.0
     assert params["rpc_timeout_sec"] == 2.0
     assert params["gripper_settle_sec"] == 0.8
+
+
+def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
+    robot_config = {
+        "name": "lekiwi_lidar",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "hermes",
+            "skill_catalog_profile": "lekiwi_lidar",
+        },
+        "navigation": {
+            "enabled": True,
+            "command_server": {
+                "enabled": True,
+                "action_name": "/robot/navigation/execute",
+            },
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+    params = _skill_executor_params(nodes)
+
+    assert _decode_launch_string(params["active_control_mode"]) == "base_navigation"
+    assert _decode_launch_string(params["skill_required_control_mode"]) == "base_navigation"
+    assert _decode_launch_string(params["navigation_action_name"]) == "/robot/navigation/execute"
+    assert params.get("context_schema_version") == 2
+    assert all(vars(node).get("_Node__package") != "robot_moveit" for node in nodes)
+
+
+def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    config = load_robot_config_dict(config_path)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+
+    assert params["context_schema_version"] == 3
+    assert _decode_launch_json_string(params["supported_control_modes_json"]) == [
+        "moveit_planning",
+        "base_navigation",
+    ]
+    assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
+    assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/resolve_target"
+    assert params["semantic_map_stand_off_distance_m"] == 0.3
+
+
+def test_navigation_endpoint_missing_action_name_raises():
+    import pytest
+
+    robot_config = {
+        "name": "lekiwi_lidar",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {"enabled": True, "entry_mode": "hermes", "skill_catalog_profile": "lekiwi_lidar"},
+        "navigation": {
+            "enabled": True,
+            "command_server": {"enabled": True, "action_name": ""},
+        },
+    }
+    with pytest.raises(ValueError, match="action_name"):
+        generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+
+
+def test_navigation_endpoint_relative_name_raises():
+    import pytest
+
+    robot_config = {
+        "name": "lekiwi_lidar",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {"enabled": True, "entry_mode": "hermes", "skill_catalog_profile": "lekiwi_lidar"},
+        "navigation": {
+            "enabled": True,
+            "command_server": {"enabled": True, "action_name": "navigation/execute"},
+        },
+    }
+    with pytest.raises(ValueError, match="absolute ROS name"):
+        generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+
+
+def test_legacy_navigation_endpoint_field_raises():
+    import pytest
+
+    robot_config = {
+        "name": "lekiwi_lidar",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "hermes",
+            "skill_catalog_profile": "lekiwi_lidar",
+            "execution": {"navigation_action_name": "/robot/navigation/execute"},
+        },
+        "navigation": {
+            "enabled": True,
+            "command_server": {"enabled": True, "action_name": "/robot/navigation/execute"},
+        },
+    }
+    with pytest.raises(ValueError, match="navigation_action_name is retired"):
+        generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+
+
+def test_disabled_command_server_uses_v1_context_without_navigation_endpoint():
+    robot_config = {
+        "name": "lekiwi_lidar",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {"enabled": True, "entry_mode": "hermes", "skill_catalog_profile": "lekiwi_lidar"},
+        "navigation": {"enabled": True, "command_server": {"enabled": False}},
+    }
+
+    params = _skill_executor_params(generate_embodied_nodes(robot_config, active_control_mode="base_navigation"))
+
+    assert params.get("context_schema_version") == 1
+    assert "navigation_action_name" not in params
 
 
 def test_installed_profile_falls_back_to_ament_skill_catalog_source():
@@ -183,19 +327,21 @@ def test_direct_builder_defaults_gateway_motion_authorization_to_false():
 
 def test_no_interaction_skills_node_is_generated():
     robot_config = {
+        "voice_tts": _voice_tts(),
         "embodied": {
             "enabled": True,
             "entry_mode": "hermes",
             "execution": {},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
             "perception": {"enabled": True},
-        }
+        },
     }
 
     nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
 
     node_names = [vars(node)["_Node__node_name"] for node in nodes]
     assert "interaction_skills_node" not in node_names
+    assert "visual_game_gateway_node" in node_names
 
     node_names = {vars(node)["_Node__node_name"] for node in nodes}
     assert "task_entry_node" not in node_names
@@ -231,6 +377,115 @@ def test_non_hermes_entry_mode_is_rejected():
         )
 
 
+def test_non_moveit_game_launches_only_gateway_and_perception():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+
+    assert {vars(node)["_Node__node_name"] for node in nodes} == {
+        "visual_game_gateway_node",
+        "perception_service_node",
+    }
+
+
+def test_tts_enabled_game_adds_announcer_using_existing_service_config():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(
+            service_name="/custom/tts",
+            playback_service_name="/custom/play",
+            tts_timeout_sec=8.0,
+            playback_timeout_sec=9.0,
+        ),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+            "visual_game_event_topic": "/custom/game_events",
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+    announcer = next(node for node in nodes if vars(node)["_Node__node_name"] == "visual_game_announcer_node")
+    params = _normalize_launch_param_mapping(announcer._Node__parameters[0])
+
+    assert _decode_launch_string(params["event_topic"]) == "/custom/game_events"
+    assert _decode_launch_string(params["tts_service"]) == "/custom/tts"
+    assert _decode_launch_string(params["playback_service"]) == "/custom/play"
+    assert float(params["tts_timeout_sec"]) == 8.0
+    assert float(params["playback_timeout_sec"]) == 9.0
+
+
+def test_tts_enabled_game_adds_shared_announcer():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+
+    assert "visual_game_announcer_node" in {vars(node)["_Node__node_name"] for node in nodes}
+
+
+@pytest.mark.parametrize(
+    "voice_tts",
+    [
+        {"enabled": False},
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/zipvoice",
+            "deployment": "",
+            "service_name": "/voice_tts/synthesize",
+            "playback_service_name": "/voice_tts/play",
+        },
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/zipvoice",
+            "deployment": "test_deployment",
+            "service_name": "/voice_tts/synthesize",
+            "playback_service_name": "",
+        },
+    ],
+)
+def test_enabled_visual_game_without_complete_tts_config_skips_announcer(voice_tts):
+    robot_config = {
+        "voice_tts": voice_tts,
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+    assert "visual_game_announcer_node" not in {vars(node)["_Node__node_name"] for node in nodes}
+
+
+def test_non_moveit_without_enabled_game_preserves_motion_mode_error():
+    robot_config = {
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(enabled=False)},
+        }
+    }
+
+    with pytest.raises(ValueError, match="MoveIt-compatible"):
+        generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+
+
 class _FakeLaunchContext:
     def __init__(self, launch_configurations):
         self.launch_configurations = launch_configurations
@@ -259,6 +514,149 @@ def test_authorize_motion_launch_argument_defaults_to_false():
     assert authorize_motion.default_value[0].text == "false"
 
 
+def test_navigation_stage_launch_argument_is_declared_and_forwarded(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    nav_stage = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument) and entity.name == "nav_stage"
+    )
+    assert nav_stage.default_value[0].text == ""
+    control_mode = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument) and entity.name == "control_mode"
+    )
+    assert control_mode.default_value[0].text == ""
+
+    captured = {}
+
+    def load_config(robot_name, config_path, selected_stage):
+        captured["load"] = (robot_name, config_path, selected_stage)
+        return {
+            "default_control_mode": "base_navigation",
+            "control_modes": {"base_navigation": {"controllers": []}},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        }
+
+    monkeypatch.setattr(module, "_load_config", load_config)
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_lidar",
+                "nav_stage": "navigation",
+                "control_mode": control_mode.default_value[0].text,
+                "with_embodied": "false",
+            }
+        )
+    )
+
+    assert captured["load"] == ("lekiwi_lidar", "", "navigation")
+    base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert base_launch_arguments["nav_stage"] == "navigation"
+    assert base_launch_arguments["control_mode"] == "base_navigation"
+
+
+def test_hybrid_navigation_entry_starts_moveit_for_complete_runtime(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args: {
+            "name": "lekiwi_handeye_realsense_grasp_lidar",
+            "nav_stage": "hybrid",
+            "default_control_mode": "base_navigation",
+            "skill_required_control_mode": "moveit_planning",
+            "control_modes": {"base_navigation": {"controllers": []}},
+            "navigation": {"enabled": True},
+            "grasp_execution": {"enabled": True},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        },
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_nav_grasp",
+                "with_embodied": "false",
+            }
+        )
+    )
+
+    base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert base_launch_arguments["with_moveit"] == "true"
+
+
+def test_hybrid_teleop_override_does_not_auto_start_moveit(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args: {
+            "name": "lekiwi_handeye_realsense_grasp_lidar",
+            "nav_stage": "hybrid",
+            "default_control_mode": "base_navigation",
+            "skill_required_control_mode": "moveit_planning",
+            "control_modes": {"teleop": {"controllers": []}},
+            "navigation": {"enabled": True},
+            "grasp_execution": {"enabled": True},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        },
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_nav_grasp",
+                "control_mode": "teleop",
+                "with_embodied": "false",
+            }
+        )
+    )
+
+    base_launch_arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert base_launch_arguments["with_moveit"] == ""
+
+
+def test_mapping_stage_defaults_embodied_runtime_off(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    with_embodied = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument) and entity.name == "with_embodied"
+    )
+    generated = []
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args: {
+            "default_control_mode": "teleop",
+            "control_modes": {"teleop": {"controllers": []}},
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+        },
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+    monkeypatch.setattr(module, "generate_embodied_nodes", lambda *_args, **_kwargs: generated.append(True))
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "lekiwi_lidar",
+                "nav_stage": "mapping",
+                "with_embodied": with_embodied.default_value[0].text,
+            }
+        )
+    )
+
+    assert len(actions) == 1
+    assert generated == []
+
+
 def test_pipeline_forces_udp_transport_for_fastdds_service_discovery():
     module = _load_launch_module()
     description = module.generate_launch_description()
@@ -277,11 +675,12 @@ def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
     module = _load_launch_module()
 
     fake_config = {
+        "voice_tts": _voice_tts(),
         "embodied": {
             "enabled": True,
             "perception": {"enabled": True},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
-        }
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+        },
     }
     module._load_config = lambda *args, **kwargs: fake_config
 
@@ -308,8 +707,25 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
     monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
     generated = []
 
-    def capture_nodes(robot_config, active_control_mode, *, motion_authorized=False):
-        generated.append((robot_config, active_control_mode, motion_authorized))
+    def capture_nodes(
+        robot_config,
+        active_control_mode,
+        *,
+        motion_authorized=False,
+        include_motion=True,
+        include_visual_games=True,
+        include_perception=True,
+    ):
+        generated.append(
+            {
+                "robot_config": robot_config,
+                "active_control_mode": active_control_mode,
+                "motion_authorized": motion_authorized,
+                "include_motion": include_motion,
+                "include_visual_games": include_visual_games,
+                "include_perception": include_perception,
+            }
+        )
         return []
 
     monkeypatch.setattr(module, "generate_embodied_nodes", capture_nodes)
@@ -323,8 +739,58 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
 
     module.launch_setup(_FakeLaunchContext(launch_configurations))
 
-    assert len(generated) == 1
-    assert generated[0][1:] == ("moveit_runtime_override", expected)
+    assert len(generated) == 2
+    assert all(item["active_control_mode"] == "moveit_runtime_override" for item in generated)
+    assert all(item["motion_authorized"] is expected for item in generated)
+
+
+def test_moveit_visual_closure_starts_perception_before_controller_readiness(monkeypatch):
+    module = _load_launch_module()
+    config = {
+        "default_control_mode": "moveit_planning",
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+        },
+    }
+    module._load_config = lambda *_args, **_kwargs: config
+    monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
+    generated = []
+
+    def capture_nodes(
+        _robot_config,
+        _active_control_mode,
+        *,
+        motion_authorized=False,
+        include_motion=True,
+        include_visual_games=True,
+        include_perception=True,
+    ):
+        generated.append(
+            {
+                "include_motion": include_motion,
+                "include_visual_games": include_visual_games,
+                "include_perception": include_perception,
+            }
+        )
+        return []
+
+    monkeypatch.setattr(module, "generate_embodied_nodes", capture_nodes)
+    module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "so101_single_arm",
+                "control_mode": "moveit_planning",
+                "with_embodied": "true",
+            }
+        )
+    )
+
+    assert generated == [
+        {"include_motion": False, "include_visual_games": True, "include_perception": True},
+        {"include_motion": True, "include_visual_games": False, "include_perception": False},
+    ]
 
 
 def test_handeye_grasp_config_launches_pick_and_place_pipelines():
@@ -388,6 +854,20 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     pick_executor_params = _normalize_launch_param_mapping(pick_executor._Node__parameters[0])
     home_joint_positions = _decode_launch_json_string(str(pick_executor_params["home_joint_positions_json"]))
     assert home_joint_positions["5"] == 0.0
+    grasp_execution_json = _decode_launch_json_string(str(pick_executor_params["grasp_execution_json"]))
+    assert grasp_execution_json["post_grasp_motion"] == {
+        "pose_name": "place_container",
+        "joint_names": ["1", "2", "3", "4", "5"],
+        "joint_positions": {
+            "1": -0.047553,
+            "2": -0.073631,
+            "3": -0.840621,
+            "4": 1.497165,
+            "5": -1.570790,
+        },
+        "duration_sec": 5.0,
+        "velocity_scaling": 0.08,
+    }
     place_executor = next(node for node in nodes if vars(node).get("_Node__node_name") == "placement_executor_node")
     place_params = _normalize_launch_param_mapping(place_executor._Node__parameters[0])
     placement_json = _decode_launch_json_string(str(place_params["placement_execution_json"]))

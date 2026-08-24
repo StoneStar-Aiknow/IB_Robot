@@ -1,0 +1,6 @@
+string session_id
+string reason
+---
+bool success
+uint8 final_state
+string message

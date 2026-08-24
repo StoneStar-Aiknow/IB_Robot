@@ -472,7 +472,6 @@ robot-skill --config-name lekiwi_handeye_realsense_grasp cancel --task-id pick-m
 {"event":"feedback", ...}
 {"event":"result","data":{"success":true,...},...}
 PIPELINE_TIMING stage=graspgen_request ...
-grasp verification phase=verify_lift ...
 ```
 
 只有 terminal result 能证明任务已经收敛。超时、连接中断或没有 terminal result 时，任务状态视为未知，
@@ -483,8 +482,7 @@ grasp verification phase=verify_lift ...
 正式 executor 会自动完成三个验证阶段：
 
 1. `close`：闭爪后、抬升前确认夹持；
-2. `probe_lift`：以低速抬升 3 cm，检查是否立即滑脱；
-3. `lift`：抬升到 5 cm，确认目标仍在夹爪中。
+2. `transport`：抓取验证成功后移动到固定 `place_container` 关节位置。
 
 `STATUS_FAILED(0)` 或 `STATUS_UNCERTAIN(2)` 在 `verification: required` 策略下都会使任务失败。
 executor 会按 robot config 执行保守恢复，不会把恢复完成视为抓取成功。
@@ -502,7 +500,7 @@ ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp \
 - `STATUS_FAILED(0)`：融合证据支持抓取失败；
 - `STATUS_UNCERTAIN(2)`：证据不足，应重新观察并人工决策。
 
-重点检查 `gripper_position`、`gripper_current_abs_a` 和 `wrist_visibility`。close-to-lift 阶段不会重新分割目标，
+重点检查 `gripper_position`、`gripper_current_abs_a` 和 `wrist_visibility`。close-to-transport 阶段不会重新分割目标，
 因为夹爪靠近目标后会明显遮挡腕部相机。
 
 ### 6.3 调试证据
@@ -514,7 +512,7 @@ ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp \
 | `prepared_candidate_ranking.json` | 候选排序、固定指间隙和各评分项 |
 | `pick_pose_diagnostics.json` | 实际位姿误差和接触点 residual |
 | `pick_frame_diagnostics.json` | capture-time TF 时间戳和回退模式 |
-| `grasp_verification.json` | close、probe lift、最终 lift 的融合证据 |
+| `grasp_verification.json` | close 验证证据 |
 
 需要点云和源候选时，临时将 `planner.debug_output_mode` 改为 `full` 并重启 pipeline。
 

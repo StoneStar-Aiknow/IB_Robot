@@ -18,12 +18,14 @@ from inference_service.distributed.video_streams import (
     VideoStreamRuntimeStatus,
     VideoTransportCapabilities,
 )
+from inference_service.h264_stream_recorder import H264StreamRecorder
 from inference_service.observation_sync import (
     RtpTimestampMapper,
     StreamSelection,
     select_synchronized_streams,
 )
 from inference_service.video_codec import VideoCodecRegistry, VideoFrame, create_default_video_codec_registry
+from inference_service.video_recording_coordinator import VideoRecordingCoordinator
 from inference_service.video_rtp import H264RtpReceiver
 from robot_config.contract_utils import SpecView, StreamBuffer
 from robot_config.observation_transport import ObservationTransportSpec, effective_observation_transport
@@ -38,6 +40,16 @@ class _ComputeStream:
     mapper: RtpTimestampMapper
     buffer: StreamBuffer
     receiver: H264RtpReceiver
+
+
+class _RecordingOnlyDecoder:
+    """Minimal decoder lifecycle used when the receiver only records access units."""
+
+    def reset(self) -> None:
+        pass
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        pass
 
 
 class ComputeVideoStreamManager:
@@ -56,6 +68,9 @@ class ComputeVideoStreamManager:
         n_obs_steps: int = 1,
         codec_registry: VideoCodecRegistry | None = None,
         receiver_factory=H264RtpReceiver,
+        recording_coordinator: VideoRecordingCoordinator | None = None,
+        decode: bool = True,
+        validate_deployment_fingerprint: bool = True,
     ) -> None:
         if rate_hz <= 0 or n_obs_steps < 1:
             raise ValueError("compute video streams require a positive rate and observation history length")
@@ -65,6 +80,8 @@ class ComputeVideoStreamManager:
         self.rate_hz = float(rate_hz)
         self.n_obs_steps = int(n_obs_steps)
         self._receiver_factory = receiver_factory
+        self._decode = decode
+        self._recorders: dict[str, H264StreamRecorder] = {}
         self._lock = threading.RLock()
         self._receiver_start_lock = threading.Lock()
         self._specs: dict[str, tuple[SpecView, ObservationTransportSpec]] = {}
@@ -72,6 +89,11 @@ class ComputeVideoStreamManager:
             transport = effective_observation_transport(spec.transport)
             if transport.mode == "rtp":
                 self._specs[spec.key] = (spec, transport)
+                if recording_coordinator is not None:
+                    integrity_mode = transport.recording.integrity_mode if transport.recording is not None else "strict"
+                    recorder = H264StreamRecorder(integrity_mode=integrity_mode)
+                    recording_coordinator.register_recorder(spec.key, recorder)
+                    self._recorders[spec.key] = recorder
         registry = codec_registry or create_default_video_codec_registry()
         self._registry = registry
         self._resolved_decoders = {
@@ -94,6 +116,7 @@ class ComputeVideoStreamManager:
         self.negotiator = VideoStreamNegotiator(
             requirements,
             VideoTransportCapabilities(decoder_backends=selected_decoder_backends or ("software",)),
+            validate_deployment_fingerprint=validate_deployment_fingerprint,
         )
         self._descriptors: dict[str, VideoStreamDescriptor] = {}
         self._streams: dict[str, _ComputeStream] = {}
@@ -282,9 +305,7 @@ class ComputeVideoStreamManager:
         }
         if resolved.name == "ascend":
             decoder_options["channel_id"] = self._decoder_channel_ids[spec.key]
-        decoder = resolved.create(
-            **decoder_options,
-        )
+        decoder = resolved.create(**decoder_options) if self._decode else _RecordingOnlyDecoder()
         step_ns = round(1_000_000_000 / self.rate_hz)
         buffer = StreamBuffer(
             spec.resample_policy,
@@ -311,6 +332,8 @@ class ComputeVideoStreamManager:
             payload_type=descriptor.payload_type,
             selected_backend=resolved.name,
             endpoint=(descriptor.endpoint_host, descriptor.endpoint_port),
+            recorder=self._recorders.get(spec.key),
+            decode=self._decode,
         )
         try:
             receiver.start()

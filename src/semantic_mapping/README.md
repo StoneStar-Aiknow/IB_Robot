@@ -3,16 +3,24 @@
 `semantic_mapping` 基于固定安装在底盘上的 D435 同步 RGB-D 数据构建独立、持久化的 3D 语义目标地图。它只依赖
 时间戳对应的 TF，不依赖 FAST-LIO、FAST-LIVO2 或其他 SLAM 的内部地图表示。
 
+本文区分三个阶段，避免将导航几何建图和语义对象建图混为同一个 `mapping`：
+
+| 阶段 | 入口 | 产物/职责 |
+|---|---|---|
+| Capture | `robot_config:=lekiwi_semantic_capture` | 同步采集 MID-360、D435i、TF 和标定证据，同时保存并提升导航二维地图 |
+| Offline mapping | `offline_mapping.launch.py` | 从 capture bag 构建或更新持久化 3D 语义对象数据库 |
+| Online mapping/query | `semantic_mapping.launch.py` | 对实时 RGB-D 做语义对象更新，并提供查询和目标解析接口 |
+
 ## RGB-D LiDAR 数据采集
 
-联合采集使用独立 profile。开始前必须已批准 D435i/MID-360 标定，确保
+联合采集使用独立 capture profile。开始前必须已批准 D435i/MID-360 标定，确保
 `~/.ros/ibrobot/calib/current/base_to_front_camera.yaml` 存在且状态为 `approved`。
 
 开发板终端 A 启动采集主链，并在保存结束前保持运行：
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-  robot_config:=lekiwi_semantic_mapping
+  robot_config:=lekiwi_semantic_capture
 ```
 
 该 profile 直接启用 MID-360、FAST-LIO、slam_toolbox、D435i 和 continuous MCAP 录制，不需要额外选择
@@ -27,7 +35,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 在同一 ROS domain 的 PC 端启动低带宽 RViz 预览：
 
 ```bash
-ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+ros2 launch semantic_mapping lekiwi_semantic_capture_rviz.launch.py
 ```
 
 开发板在本地将 RealSense RGB 压缩为 8 FPS、JPEG quality 70，并将 MID-360 registered cloud 限制为每帧
@@ -41,8 +49,9 @@ ros2 run semantic_mapping save_semantic_map
 ```
 
 该命令停止 recorder、保存当前 slam_toolbox 地图、执行 MCAP reindex、生成标定快照和根目录元数据、
-校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，最后以 gzip level 1 流式创建同名 `.tar.gz`。压缩过程不会先生成
-同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
+校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，并以 gzip level 1 流式创建同名 `.tar.gz`；归档和离线
+校验都成功后，才将同一 YAML/PGM 地图成对、失败可回滚地提升到 `~/.ros/ibrobot/maps/map.yaml` 和 `map.pgm`。
+压缩过程不会先生成同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
 
 recorder 在 rosbag 启动前固定 MID-360 mount YAML 和当时存在的 approved camera artifact 字节与 SHA-256；
 finalizer 只读取这些 pinned bytes，不会重新读取可能已被替换的 `current/` 源文件。camera artifact 缺失时仍生成
@@ -52,8 +61,8 @@ bag、manifest、checksum 和压缩归档，但状态明确为 `calibration_inco
 默认输出目录和归档为：
 
 ```text
-~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>/
-~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>.tar.gz
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_capture_<timestamp>/
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_capture_<timestamp>.tar.gz
 ```
 
 当前 session handoff 保存在 `~/.ros/ibrobot/semantic_mapping/current.json`。session 目录包含：
@@ -69,12 +78,15 @@ SHA256SUMS
 README.md
 ```
 
+默认导航地图只有在 checksum 和离线几何校验成功后才会更新；promotion 失败时 session handoff
+状态为 `navigation_map_promotion_failed`，原有默认地图保持不变。
+
 20 秒静止烟测只验证工程闭环，不评价地图质量：
 
 ```bash
 # Terminal A: leave this launch running for the map save service.
 ros2 launch robot_config robot.launch.py \
-  robot_config:=lekiwi_semantic_mapping
+  robot_config:=lekiwi_semantic_capture
 
 # Terminal B: wait about 20 seconds, then save and validate everything.
 sleep 20
@@ -86,7 +98,7 @@ ros2 run semantic_mapping save_semantic_map
 
 reindex 后的 `metadata.yaml` 是 topic/type/count 的唯一事实源。LiDAR、IMU、FAST-LIO raw/filtered odometry、
 registered cloud、scan、map、RGB、raw/aligned depth、三路 CameraInfo、`/tf` 和 `/tf_static` 必须类型匹配且非零。
-当前 mapping profile 禁止 cmd bridge 发布另一套 wheel odometry，且 20 秒静止烟测可以没有操作员命令，因此
+当前 capture profile 禁止 cmd bridge 发布另一套 wheel odometry，且 20 秒静止烟测可以没有操作员命令，因此
 `/wheel/odom` 和 `/cmd_vel` 只做 reported/optional，不会造成无害的静止烟测失败；`/diagnostics` 不录制也不检查。
 metadata 有 per-file 时间时，顶层 start/duration 必须覆盖所有 split；旧 Humble metadata 没有 per-file 时间时只记录
 coverage unavailable。
@@ -118,6 +130,27 @@ coverage unavailable。
 | Service | `/semantic_mapping/resolve_target` | 返回相互区分的目标物体姿态和 Nav2 stand-off 姿态 |
 
 数据库默认位于 `~/.ros/ibrobot/semantic_map.sqlite3`，不保存 SLAM 几何点云或 SLAM 状态。
+
+`resolve_target` 使用 live TF `global_frame -> base_frame`（默认 `map -> base_link`）
+选择机器人当前所在一侧的停靠候选，并让最终 yaw 指向目标物体；TF 不可用时 fail closed，
+不会回退到 map 原点或静态机器人坐标参数。
+
+静态地图使用者可以通过 `semantic_map_standoff` 查询人工标注物品并输出紧凑的
+`[x, y, theta_degrees]` 停靠位。该工具只查询 `get_objects`，不依赖 TF 或 live
+readiness；默认以 map 原点作为接近参考点，也可以传入一个 map-frame 参考点：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=77
+ros2 run semantic_mapping semantic_map_standoff banana 0.2
+# [0.6536,-0.9555,-55.6]
+
+ros2 run semantic_mapping semantic_map_standoff banana 0.2 \
+  --reference-x 0.24 --reference-y 0.09
+```
+
+输出角度以度为单位，`0` 表示 map-frame 的 `x` 正轴，正方向为逆时针。
+查询失败时输出 `[]`。该工具只生成几何目标，不替代 Nav2 的可达性和安全门控。
 
 ## Configuration
 
@@ -155,7 +188,7 @@ semantic_mapping:
 ```
 
 完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、labels、target-watch 和 public interface
-参数，参考 `robot_config/config/robots/lekiwi_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
+参数，参考 `robot_config/config/robots/lekiwi_realsense_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
 `perception_services.services`；每个 role 指向一个 enabled service ID，不再直接配置 backend、endpoint 或模型
 identity。service 模式下 loader 从 schema-v2 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
 policy，并拒绝 SigLIP2 image/text embedding metadata 不兼容的配置。检查入库的 service entries 是 disabled
@@ -217,6 +250,29 @@ export ROS_DOMAIN_ID=42
 ros2 launch semantic_mapping semantic_mapping.launch.py \
   config_path:=/path/to/enabled-lekiwi-mapping.yaml
 ```
+
+`mode:=query_only` 只启动 `semantic_mapping_node`，不启动 SAM2/RAM++/SigLIP2 模型服务；
+用于在导航板上加载预建静态语义地图并提供 `get_objects` 和 `resolve_target` 查询：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=42
+ros2 launch semantic_mapping semantic_mapping.launch.py \
+  mode:=query_only \
+  config_path:=/path/to/enabled-lekiwi-mapping.yaml \
+  database_path:=/data/semantic_map.sqlite3 \
+  artifact_output_dir:=/data/artifacts
+```
+
+`resolve_target` 支持 `query_text` 按人工标签查询（返回唯一匹配的停靠位）：
+
+```bash
+ros2 service call /semantic_mapping/resolve_target \
+  ibrobot_msgs/srv/ResolveSemanticTarget \
+  "{query_text: banana, stand_off_distance_m: 0.5, require_manipulation_ready: false}"
+```
+
+多个同名人工轨迹匹配时返回明确的歧义错误，要求提供 `object_id`。
 
 离线入口额外要求 rosbag 路径；它从同一配置读取 camera topics、map/model identities、filtering 和 services：
 

@@ -7,8 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from embodied_common.primitive_contracts import (
-    PRIMITIVE_CONTRACT_DIGEST,
-    PRIMITIVE_DESCRIPTORS,
+    primitive_contract_for_version,
 )
 from skill_catalog.digest import compute_skill_package_digest
 from skill_catalog.models import (
@@ -115,7 +114,7 @@ class SkillCatalogCompiler:
         aliases: dict[str, tuple[str, ...]] = {}
         parameter_schemas: dict[str, Mapping[str, Any]] = {}
         requirements: dict[str, frozenset[str]] = {}
-        capability_view: dict[str, Mapping[str, Any]] = {}
+        capability_view: dict[str, dict[str, Any]] = {}
         enabled_names: list[str] = []
         planner_visible_names: list[str] = []
         manifests: dict[str, Mapping[str, Any]] = {}
@@ -231,11 +230,21 @@ class SkillCatalogCompiler:
 
             capability = manifest["capability"]
             description = selected_description
-            if capability["required_control_mode"] != context.robot.required_control_mode:
+            # A unified mobile-manipulator profile may expose skills from more
+            # than one mutually-exclusive motion domain.  The capability's
+            # required mode is selected at execution time; only validate that
+            # it is a mode supported by the robot context.
+            supported_control_modes = getattr(context.robot, "supported_control_modes", ())
+            mode_mismatch = (
+                capability["required_control_mode"] not in supported_control_modes
+                if supported_control_modes
+                else capability["required_control_mode"] != context.robot.required_control_mode
+            )
+            if mode_mismatch:
                 diagnostics.append(
                     SkillDiagnostic.error(
                         "SKILL_LIMIT_VIOLATION",
-                        "capability control mode does not match robot context",
+                        "capability control mode is not supported by robot context",
                         source_relative_path=manifest_relative_path,
                         field_path="capability.required_control_mode",
                     )
@@ -277,6 +286,8 @@ class SkillCatalogCompiler:
                 "parameters": capability["parameters"],
                 "recovery_policy": capability["recovery_policy"],
             }
+            if manifest["schema_version"] == 2:
+                capability_view[skill_name]["schema_version"] = 2
             enabled_names.append(skill_name)
             if planner_visible is True:
                 planner_visible_names.append(skill_name)
@@ -319,15 +330,23 @@ class SkillCatalogCompiler:
     @staticmethod
     def _validate_compile_context(context: SkillCompileContext) -> list[SkillDiagnostic]:
         diagnostics = validate_robot_context(context.robot)
-        if context.primitive_contract_digest != PRIMITIVE_CONTRACT_DIGEST:
+        try:
+            selected_contract = primitive_contract_for_version(context.robot.context_schema_version)
+        except ValueError as exc:
+            diagnostics.append(SkillDiagnostic.error("SKILL_SCHEMA_INVALID", str(exc)))
+            selected_contract = None
+        if selected_contract is not None and context.primitive_contract_digest != selected_contract.digest:
             diagnostics.append(
                 SkillDiagnostic.error(
                     "SKILL_SNAPSHOT_DIGEST_MISMATCH", "primitive contract digest does not match local SSOT"
                 )
             )
-        if set(context.primitive_contracts) != set(PRIMITIVE_DESCRIPTORS) or any(
-            context.primitive_contracts.get(name) is not descriptor
-            for name, descriptor in PRIMITIVE_DESCRIPTORS.items()
+        if selected_contract is not None and (
+            set(context.primitive_contracts) != set(selected_contract.descriptors)
+            or any(
+                context.primitive_contracts.get(name) is not descriptor
+                for name, descriptor in selected_contract.descriptors.items()
+            )
         ):
             diagnostics.append(
                 SkillDiagnostic.error(

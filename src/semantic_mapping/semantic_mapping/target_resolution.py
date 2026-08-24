@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .association import ACTION_READY_STATES, SemanticTrack
+from .association import ACTION_READY_STATES, SemanticTrack, is_manually_actionable
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ def resolve_target(
     *,
     require_manipulation_ready: bool = False,
 ) -> TargetResolution:
-    if track.state not in ACTION_READY_STATES:
+    if track.state not in ACTION_READY_STATES and not is_manually_actionable(track):
         return TargetResolution(False, f"object state {track.state} is not action-ready", track)
     if require_manipulation_ready and track.state != "observed":
         return TargetResolution(False, "manipulation requires a freshly observed object", track)

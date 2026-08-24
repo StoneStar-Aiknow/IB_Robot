@@ -24,7 +24,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
-| **ibrobot-control** | 通过 `robot-skill` 发现、校验、执行或取消现有机器人高层技能 |
+| **ibrobot-control** | 通过 `robot-skill` 操作现有机器人高层技能或异步视觉游戏 |
 
 ### 🔌 板端（OpenHarmony）
 
@@ -51,8 +51,8 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | :--- | :--- |
 | **ibrobot-git-flow** | 规范提交代码（openEuler DCO/Commit 规范、PR commit ≤ 5、review 修复用 fixup+autosquash），push 后自动同步 PR 描述 |
 | **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
-| **ibrobot-docker-verify** | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh |
-| **ibrobot-docker-verify-oee** | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh |
+| **ibrobot-docker-verify** | 在干净 Ubuntu 22.04 Docker 中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓 |
+| **ibrobot-docker-verify-oee** | 在 openEuler Embedded Docker 中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓 |
 | **sync-github** | 将 AtomGit master 分支同步推送到 GitHub |
 | **skill-creator** | 按 agentskills.io 规范新建/重构 Agent skill，编写 SKILL.md，校验 frontmatter 与渐进式披露 |
 
@@ -77,7 +77,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **atomgit-pr** | 创建、读取或更新合并请求（PR），自动生成/同步描述 |
+| **atomgit-pr** | 创建、读取或更新 PR，选择 WIP/正式检视阶段并自动同步描述；工具版本由 coding agent 执行版本命令后传入 |
 | **atomgit-issue** | 创建、读取或管理 Issue，报告 Bug、提出建议 |
 
 ---
@@ -113,6 +113,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 启动机器人仿真或 OpenHarmony 板端运行 → ibrobot-launch
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
+让 Agent 玩分院帽视觉游戏         → ibrobot-control
 初始化环境                      → ibrobot-env
 跑一下测试 / pytest             → ibrobot-env（环境前缀由它保证）
 在 worktree 中跑代码             → ibrobot-worktree-env

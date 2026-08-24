@@ -1,15 +1,15 @@
 ---
 name: ibrobot-docker-verify
-description: "Execute setup.sh + build.sh in a clean Ubuntu 22.04 ROS desktop-full Docker container with a host pip cache mount and stage timing. Use when the user explicitly asks for Docker/setup/build verification, or when author-side PR creation/update workflows trigger the dependency/setup verification gate. Do not use automatically during PR review; review should check developer-provided Verification in the PR description."
+description: "Execute setup.sh + build.sh in a clean Ubuntu 22.04 ROS desktop-full Docker container with a host pip cache mount and stage timing. Use when the user explicitly asks for Docker/setup/build verification, or after an author-side PR gate asks WIP vs review and the user confirms review-ready. Skip author-side [WIP] PRs; do not run automatically during PR review."
 ---
 
 # IB-Robot Docker Verification Skill
 
 Full end-to-end validation of `setup.sh` and `build.sh` inside a clean Ubuntu
-22.04 container based on ROS 2 Humble desktop-full. The default flow copies the
-current host workspace so uncommitted changes can be tested, while removing
-host-built artifacts before creating a fresh venv and colcon workspace. A
-clean remote clone is available only when the user explicitly requests it.
+22.04 container based on ROS 2 Humble desktop-full. Local testing may copy the
+current workspace, while PR evidence must use an isolated snapshot of one
+committed Git tree. Both modes remove host-built artifacts before creating a
+fresh venv and colcon workspace.
 
 The ROS-ready image deliberately skips ROS first-install testing. Changes to
 `scripts/install_ros.sh`, ROS repository setup, or ROS GPG-key handling require
@@ -19,12 +19,15 @@ the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:
 
 - User explicitly requests "Docker 验证" / "container test" / "实际验证 setup/build".
 - An author-side PR creation/update workflow (`atomgit-pr` or `ibrobot-git-flow`)
-  triggers the dependency/setup verification gate and needs real results for the
-  PR description.
+  triggers the dependency/setup verification gate, the user confirms the PR is
+  ready for reviewer inspection, and real results are needed for the description.
 - The current task is to validate local changes to `scripts/setup.sh`,
   `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`,
   `scripts/install_ros.sh`, or pip/apt dependency resolution.
 - Do not infer this skill from PR review alone.
+- Before an author-side gate invokes this skill, ask whether the PR is WIP or
+  review-ready. A `[WIP]` PR skips both Docker skills until promotion; explicit
+  standalone Docker requests still run normally.
 
 ## Review Boundary
 
@@ -38,24 +41,29 @@ the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:
 - Only run this skill in a review session when the user explicitly asks the
   agent to perform the actual Ubuntu Docker setup/build verification.
 
-## Commit Binding for PR Verification
+## Tree Binding for PR Verification
 
 When an author-side PR gate triggers both Docker skills, verification evidence
 must describe one exact committed tree:
 
-1. Require a clean worktree, then record `VERIFIED_COMMIT="$(git rev-parse HEAD)"`
-   before starting the first platform. Use the full 40-character SHA.
-2. Ubuntu and openEuler must both test that same commit. The local-copy mode is
-   allowed only after confirming there are no tracked or untracked source changes.
-3. Include `Verified commit: <full SHA>` in this skill's result. The PR workflow
-   converts it to the canonical `**Verified commit:** \`<full SHA>\`` field.
-4. After the run, require `git rev-parse HEAD` to still equal
-   `VERIFIED_COMMIT`. A new commit makes the result stale and both platforms
-   must be rerun; never carry the old SHA forward into a new PR description.
+1. Resolve the target commit and record
+   `VERIFIED_TREE="$(git rev-parse "${VERIFIED_COMMIT}^{tree}")"` before the
+   first platform. The user's current worktree may contain unrelated changes.
+2. Materialize an isolated standalone snapshot of `VERIFIED_COMMIT`; Ubuntu and
+   openEuler must both test snapshots whose tree equals `VERIFIED_TREE`.
+3. Include `Verified tree: <full SHA>` in this skill's result. The PR workflow
+   assembles it into the structured `## Docker Verification` block.
+4. At PR creation/update, compare the field with the remote head commit's tree.
+   Re-run only when that tree changes. Commit-message, author, or trailer-only
+   rewrites retain the same tree and do not invalidate the result.
+5. Directly copying a dirty workspace remains valid for local diagnosis, but
+   that result must not be used as PR verification evidence.
 
 ## Prerequisites
 
 - Docker CLI installed on the host (check with `command -v docker`).
+- Git LFS installed on the host for PR-evidence snapshots; the procedure runs
+  `git lfs pull` and `git lfs fsck` so a clean tree cannot hide pointer-only files.
 - The current user has permission to run containers.
 - The IB-Robot workspace has uncommitted or committed changes to validate.
 - If the user explicitly requests a remote commit or branch, its repository is
@@ -128,12 +136,13 @@ corresponding phase section.
 
 ### Phase 3 Source Modes
 
-- **Default — local workspace copy**: `docker cp` the current host workspace
-  into the container, then `rm -rf venv build install log`. Preserves
-  uncommitted and untracked changes.
-- **Optional — remote clean clone**: only when the user explicitly asks to
-  validate a pushed commit/branch. Replace placeholders with exact remote and
-  branch; never default silently.
+- **PR evidence — isolated committed snapshot**: create a standalone snapshot
+  of the target commit outside the user's worktree, verify its tree SHA, then
+  `docker cp` it into the container. Required for author-side PR gates.
+- **Local diagnosis — current workspace copy**: preserves uncommitted and
+  untracked changes. It cannot produce reusable PR evidence.
+- **Explicit remote clone**: use only when the user specifically requests a
+  remote commit or branch; resolve and report the exact commit and tree.
 
 Record the selected mode and source details in the verification result and in
 the PR description's Verification section.

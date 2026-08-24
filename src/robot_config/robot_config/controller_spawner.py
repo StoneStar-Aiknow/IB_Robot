@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Load and activate one ros2_control controller with explicit service timeouts."""
+"""Prepare ros2_control controllers and switch the requested group atomically."""
 
 import argparse
 import inspect
@@ -68,17 +68,14 @@ def _list_controller_state(
     return _controller_state(response.controller, controller_name)
 
 
-def spawn_controller(
+def _prepare_controller(
     node: Node,
     controller_manager: str,
     controller_name: str,
     controller_manager_timeout: float,
     service_call_timeout: float,
-    switch_timeout: float,
-    *,
-    activate: bool = True,
-) -> None:
-    """Ensure one controller is loaded/configured and optionally active."""
+) -> str:
+    """Ensure one controller is loaded and configured without changing activation."""
     state = _list_controller_state(
         node,
         controller_manager,
@@ -122,21 +119,6 @@ def spawn_controller(
                 if state is None:
                     raise RuntimeError(f"Failed to load controller '{controller_name}'")
 
-    if state == "active" and activate:
-        node.get_logger().info(f"Controller '{controller_name}' is already active")
-        return
-
-    if state == "active" and not activate:
-        response = _call_controller_manager(
-            switch_controllers,
-            (node, controller_manager, [controller_name], [], True, True, switch_timeout, service_call_timeout),
-            (node, controller_manager, [controller_name], [], True, True, switch_timeout),
-        )
-        if not response.ok:
-            raise RuntimeError(f"Failed to deactivate controller '{controller_name}'")
-        node.get_logger().info(f"Deactivated controller '{controller_name}'")
-        return
-
     if state == "unconfigured":
         try:
             response = _call_controller_manager(
@@ -155,7 +137,7 @@ def spawn_controller(
                 controller_manager_timeout,
                 service_call_timeout,
             )
-            if state != "inactive":
+            if state not in {"inactive", "active"}:
                 raise RuntimeError(f"Failed to configure controller '{controller_name}'") from exc
         else:
             if response.ok:
@@ -168,47 +150,147 @@ def spawn_controller(
                     controller_manager_timeout,
                     service_call_timeout,
                 )
-                if state != "inactive":
+                if state not in {"inactive", "active"}:
                     raise RuntimeError(f"Failed to configure controller '{controller_name}'")
 
-    if state != "inactive":
+    if state not in {"inactive", "active"}:
         raise RuntimeError(f"Controller '{controller_name}' has unsupported lifecycle state '{state}'")
 
-    if not activate:
-        node.get_logger().info(f"Configured controller '{controller_name}' in inactive state")
-        return
+    node.get_logger().info(f"Controller '{controller_name}' is prepared in '{state}' state")
+    return state
 
-    try:
-        response = _call_controller_manager(
-            switch_controllers,
-            (node, controller_manager, [], [controller_name], True, True, switch_timeout, service_call_timeout),
-            (node, controller_manager, [], [controller_name], True, True, switch_timeout),
-        )
-    except RuntimeError as exc:
-        node.get_logger().warning(
-            f"switch_controller did not return successfully for '{controller_name}'; checking manager state"
-        )
-        state = _list_controller_state(
+
+def _group_has_requested_states(
+    node: Node,
+    controller_manager: str,
+    active_controller_names: tuple[str, ...],
+    inactive_controller_names: tuple[str, ...],
+    controller_manager_timeout: float,
+    service_call_timeout: float,
+) -> bool:
+    response = _call_controller_manager(
+        list_controllers,
+        (node, controller_manager, controller_manager_timeout, service_call_timeout),
+        (node, controller_manager),
+    )
+    states = {controller.name: controller.state for controller in response.controller}
+    return all(states.get(name) == "active" for name in active_controller_names) and all(
+        states.get(name) == "inactive" for name in inactive_controller_names
+    )
+
+
+def _normalized_controller_names(controller_names: Iterable[str], group_name: str) -> tuple[str, ...]:
+    names = tuple(controller_names)
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError(f"{group_name} controller names must be non-empty strings")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{group_name} controller names must be unique")
+    return names
+
+
+def spawn_controllers(
+    node: Node,
+    controller_manager: str,
+    controller_names: Iterable[str],
+    inactive_controller_names: Iterable[str],
+    controller_manager_timeout: float,
+    service_call_timeout: float,
+    switch_timeout: float,
+) -> None:
+    """Prepare all controllers, then apply the requested states in one switch call."""
+    active_names = _normalized_controller_names(controller_names, "active")
+    inactive_names = _normalized_controller_names(inactive_controller_names, "inactive")
+    overlap = set(active_names) & set(inactive_names)
+    if overlap:
+        raise ValueError(f"Controllers cannot be both active and inactive: {sorted(overlap)}")
+    if not active_names and not inactive_names:
+        raise ValueError("At least one controller name is required")
+
+    prepared_states = {
+        controller_name: _prepare_controller(
             node,
             controller_manager,
             controller_name,
             controller_manager_timeout,
             service_call_timeout,
         )
-        if state != "active":
-            raise RuntimeError(f"Failed to activate controller '{controller_name}'") from exc
+        for controller_name in (*active_names, *inactive_names)
+    }
+    activate_names = [name for name in active_names if prepared_states[name] != "active"]
+    deactivate_names = [name for name in inactive_names if prepared_states[name] == "active"]
+
+    if not activate_names and not deactivate_names:
+        node.get_logger().info("Controller group already has the requested activation states")
+        return
+
+    if activate_names and deactivate_names:
+        failure_message = "Failed to switch controller group"
+    elif activate_names:
+        failure_message = "Failed to activate controller group"
     else:
-        if not response.ok:
-            state = _list_controller_state(
+        failure_message = "Failed to deactivate controller group"
+
+    try:
+        response = _call_controller_manager(
+            switch_controllers,
+            (
                 node,
                 controller_manager,
-                controller_name,
-                controller_manager_timeout,
-                service_call_timeout,
-            )
-            if state != "active":
-                raise RuntimeError(f"Failed to activate controller '{controller_name}'")
-    node.get_logger().info(f"Configured and activated controller '{controller_name}'")
+                deactivate_names,
+                activate_names,
+                True,
+                True,
+                switch_timeout,
+                max(service_call_timeout, switch_timeout),
+            ),
+            (node, controller_manager, deactivate_names, activate_names, True, True, switch_timeout),
+        )
+    except RuntimeError as exc:
+        node.get_logger().warning("switch_controller did not return successfully for the group; checking manager state")
+        if not _group_has_requested_states(
+            node,
+            controller_manager,
+            active_names,
+            inactive_names,
+            controller_manager_timeout,
+            service_call_timeout,
+        ):
+            raise RuntimeError(failure_message) from exc
+    else:
+        if not response.ok and not _group_has_requested_states(
+            node,
+            controller_manager,
+            active_names,
+            inactive_names,
+            controller_manager_timeout,
+            service_call_timeout,
+        ):
+            raise RuntimeError(failure_message)
+    node.get_logger().info(
+        f"Applied controller group state: active={list(active_names)}, inactive={list(inactive_names)}"
+    )
+
+
+def spawn_controller(
+    node: Node,
+    controller_manager: str,
+    controller_name: str,
+    controller_manager_timeout: float,
+    service_call_timeout: float,
+    switch_timeout: float,
+    *,
+    activate: bool = True,
+) -> None:
+    """Compatibility wrapper for callers that manage one controller."""
+    spawn_controllers(
+        node,
+        controller_manager,
+        [controller_name] if activate else [],
+        [] if activate else [controller_name],
+        controller_manager_timeout,
+        service_call_timeout,
+        switch_timeout,
+    )
 
 
 def _positive_timeout(value: str) -> float:
@@ -220,7 +302,7 @@ def _positive_timeout(value: str) -> float:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("controller_name", help="Controller to load, configure, and activate.")
+    parser.add_argument("controller_names", nargs="*", help="Controllers to load, configure, and activate together.")
     parser.add_argument(
         "--controller-manager",
         default="controller_manager",
@@ -247,9 +329,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--inactive",
         action="store_true",
-        help="Load and configure the controller without activating it.",
+        help="Load and configure all positional controllers without activating them.",
     )
-    return parser.parse_args(rclpy.utilities.remove_ros_args(args=argv)[1:])
+    parser.add_argument(
+        "--inactive-controller",
+        dest="inactive_controller_names",
+        action="append",
+        default=[],
+        help="Controller to load/configure but leave inactive. Repeat for multiple controllers.",
+    )
+    args = parser.parse_args(rclpy.utilities.remove_ros_args(args=argv)[1:])
+    if args.inactive:
+        args.inactive_controller_names = [*args.controller_names, *args.inactive_controller_names]
+        args.controller_names = []
+    if not args.controller_names and not args.inactive_controller_names:
+        parser.error("at least one controller name is required")
+    return args
 
 
 def _resolve_controller_manager(node: Node, controller_manager: str) -> str:
@@ -264,20 +359,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     rclpy.init(args=argv)
-    node = Node(f"controller_spawner_{args.controller_name}")
+    node = Node("controller_spawner_group")
     controller_manager = _resolve_controller_manager(node, args.controller_manager)
     try:
-        spawn_controller(
+        spawn_controllers(
             node,
             controller_manager,
-            args.controller_name,
+            args.controller_names,
+            args.inactive_controller_names,
             args.controller_manager_timeout,
             args.service_call_timeout,
             args.switch_timeout,
-            activate=not args.inactive,
         )
         return 0
-    except (RuntimeError, ServiceNotFoundError) as exc:
+    except (RuntimeError, ValueError, ServiceNotFoundError) as exc:
         node.get_logger().fatal(str(exc))
         return 1
     finally:

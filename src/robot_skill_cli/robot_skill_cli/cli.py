@@ -51,6 +51,9 @@ _AGENT_TIMEOUT_CODES = {
     "SKILL_TASK_DEADLINE_EXPIRED",
     "SKILL_CANCEL_TIMEOUT",
 }
+_NAVIGATION_WORKFLOW_FIELDS = frozenset(
+    {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
+)
 
 
 def _agent_error_exit_code(error_code: str) -> int:
@@ -94,6 +97,9 @@ def _build_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--config-path", help="explicit robot_config YAML path")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("list-skills", help="list enabled high-level skills")
+    subparsers.add_parser("list-games", help="list enabled visual games")
+    describe_game_parser = subparsers.add_parser("describe-game", help="describe one enabled visual game")
+    describe_game_parser.add_argument("game")
     describe_parser = subparsers.add_parser("describe", help="describe one enabled skill")
     describe_parser.add_argument("skill")
     subparsers.add_parser("list-poses", help="list configured named poses")
@@ -130,15 +136,27 @@ def _build_parser() -> argparse.ArgumentParser:
     cancel_plan_parser = subparsers.add_parser("cancel-plan", help="cancel an active Agent plan by task ID")
     cancel_plan_parser.add_argument("--task-id", required=True)
     _add_agent_terminal_expectation(cancel_plan_parser)
+    start_game_parser = subparsers.add_parser("start-game", help="start one visual game")
+    start_game_parser.add_argument("game")
+    start_game_parser.add_argument("--request-id", required=True)
+    game_result_parser = subparsers.add_parser("game-result", help="query one visual game request")
+    game_result_parser.add_argument("--request-id", required=True)
     return parser
 
 
 def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-name")
+    parser.add_argument("--stand-off-distance-m", dest="stand_off_distance_m", type=float)
     parser.add_argument("--container-name")
     parser.add_argument("--place-name")
     parser.add_argument("--motion-direction")
     parser.add_argument("--motion-distance", type=float)
+    parser.add_argument("--direction")
+    parser.add_argument("--distance", type=float)
+    parser.add_argument("--degree", type=float)
+    parser.add_argument("--x", type=float)
+    parser.add_argument("--y", type=float)
+    parser.add_argument("--yaw", type=float)
     parser.add_argument("--timeout-sec", type=float)
 
 
@@ -151,15 +169,23 @@ def _add_agent_terminal_expectation(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-step-count", required=True, type=int)
 
 
-def _run_catalog_command(args: argparse.Namespace, view: dict[str, Any]) -> dict:
+def _run_catalog_command(args: argparse.Namespace, context) -> dict:
     from robot_skill_cli.catalog import describe_skill, list_poses, list_skills
 
     if args.command == "list-skills":
-        return list_skills(view)
+        return list_skills(context.view)
+    if args.command == "list-games":
+        from robot_skill_cli.catalog import list_games
+
+        return list_games(context.game_view)
+    if args.command == "describe-game":
+        from robot_skill_cli.catalog import describe_game
+
+        return describe_game(context.game_view, args.game)
     if args.command == "describe":
-        return describe_skill(view, args.skill)
+        return describe_skill(context.view, args.skill)
     if args.command == "list-poses":
-        return list_poses(view)
+        return list_poses(context.view)
     raise _CliArgumentError(f"unsupported command: {args.command}")
 
 
@@ -172,10 +198,14 @@ def _create_bridge(transport):
         reload_service=transport.reload_service,
         validate_skill_service=transport.validate_skill_service,
         skill_action=transport.skill_action_name,
+        primitive_action=transport.primitive_action_name,
+        validate_primitive_service=transport.validate_primitive_service,
         plan_service=transport.plan_service,
         validate_plan_service=transport.validate_plan_service,
         confirm_plan_service=transport.confirm_plan_service,
         execute_plan_action=transport.execute_plan_action,
+        start_visual_game_service=transport.start_visual_game_service,
+        get_visual_game_result_service=transport.get_visual_game_result_service,
     )
 
 
@@ -184,11 +214,18 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
     properties = parameters["properties"]
     required = set(parameters["required"])
     values = {
-        "target_name": args.target_name,
+        "target_name": getattr(args, "target_name", None),
+        "stand_off_distance_m": getattr(args, "stand_off_distance_m", None),
         "container_name": getattr(args, "container_name", None),
-        "place_name": args.place_name,
-        "motion_direction": args.motion_direction,
-        "motion_distance": args.motion_distance,
+        "place_name": getattr(args, "place_name", None),
+        "motion_direction": getattr(args, "motion_direction", None),
+        "motion_distance": getattr(args, "motion_distance", None),
+        "direction": getattr(args, "direction", None),
+        "distance": getattr(args, "distance", None),
+        "degree": getattr(args, "degree", None),
+        "x": getattr(args, "x", None),
+        "y": getattr(args, "y", None),
+        "yaw": getattr(args, "yaw", None),
     }
     for name, value in values.items():
         if name not in properties:
@@ -201,20 +238,55 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
                 raise _CliArgumentError(f"{name} is required for skill {skill['name']}")
             if value is None:
                 continue
-        if schema["type"] == "string" and "enum" in schema and value.strip().lower() not in schema["enum"]:
-            raise _CliArgumentError(f"{name} must be one of: {', '.join(schema['enum'])}")
+        if schema["type"] == "string" and "enum" in schema:
+            normalized_value = value.strip().lower()
+            if normalized_value not in schema["enum"]:
+                raise _CliArgumentError(f"{name} must be one of: {', '.join(schema['enum'])}")
+            setattr(args, name, normalized_value)
         if schema["type"] == "number" and (
             isinstance(value, bool) or not math.isfinite(value) or value <= schema.get("exclusiveMinimum", -math.inf)
         ):
             raise _CliArgumentError(f"{name} must be a finite number greater than zero")
 
 
-def _validate_timeout(status: dict[str, Any], timeout_sec: float | None) -> float:
-    effective_timeout = status["default_skill_timeout_sec"] if timeout_sec is None else timeout_sec
+def _contract_schema_version(skill: dict[str, Any]) -> int:
+    version = skill.get("schema_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
+        raise _CliArgumentError("skill contract schema_version must be 1 or 2")
+    return version
+
+
+def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], context) -> list[dict[str, Any]]:
+    normalized = []
+    for step in workflow_steps:
+        if not isinstance(step, dict):
+            raise _CliArgumentError("each workflow step must be an object")
+        if "schema_version" in step:
+            # The Agent plan boundary compares explicit versions against its
+            # snapshot. Do not rewrite a submitted mismatch at the CLI edge.
+            normalized.append(step)
+            continue
+        if _NAVIGATION_WORKFLOW_FIELDS.intersection(step):
+            raise _CliArgumentError("navigation typed workflow steps require explicit schema_version")
+        normalized.append({**step, "schema_version": 1})
+    return normalized
+
+
+def _validate_timeout(
+    status: dict[str, Any], timeout_sec: float | None, *, skill_timeout_cap: float | None = None
+) -> float:
+    default_timeout = status["default_skill_timeout_sec"]
+    if skill_timeout_cap is not None:
+        if not math.isfinite(skill_timeout_cap) or skill_timeout_cap <= 0.0:
+            raise _CliArgumentError("skill timeout cap must be finite and positive")
+        default_timeout = min(default_timeout, skill_timeout_cap)
+    effective_timeout = default_timeout if timeout_sec is None else timeout_sec
     if not math.isfinite(effective_timeout) or effective_timeout <= 0.0:
         raise _CliArgumentError("timeout_sec must be a finite number greater than zero")
     if effective_timeout > status["task_budget_sec"]:
         raise _CliArgumentError("timeout_sec must not exceed the Gateway task budget")
+    if skill_timeout_cap is not None and effective_timeout > skill_timeout_cap:
+        raise _CliArgumentError("timeout_sec must not exceed the skill timeout cap")
     return effective_timeout
 
 
@@ -245,7 +317,12 @@ def _prepare_request(
         ) from exc
     skill = describe_skill(runtime_view, args.skill)
     _validate_schema(skill, args)
-    effective_timeout = _validate_timeout(status, args.timeout_sec)
+    skill_timeout_cap = skill.get("timeout_sec")
+    effective_timeout = _validate_timeout(
+        status,
+        args.timeout_sec,
+        skill_timeout_cap=float(skill_timeout_cap) if skill_timeout_cap is not None else None,
+    )
     capability = next((item for item in status["capabilities"] if item["name"] == skill["name"]), None)
     if capability is None or not capability["ready"]:
         reason = capability["reason"] if capability is not None and capability["reason"] else "CAPABILITY_NOT_READY"
@@ -260,11 +337,22 @@ def _prepare_request(
         raise _CommandError(error_code, reason, exit_code=EXIT_GATEWAY_REJECTED)
     payload = canonical_skill_payload(
         skill["name"],
+        schema_version=_contract_schema_version(skill),
         target_name=args.target_name,
         container_name=args.container_name,
         place_name=args.place_name,
         motion_direction=args.motion_direction,
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,
+        direction=args.direction,
+        distance=(
+            float(getattr(args, "stand_off_distance_m", None))
+            if getattr(args, "stand_off_distance_m", None) is not None
+            else (0.0 if args.distance is None else args.distance)
+        ),
+        degree=0.0 if args.degree is None else args.degree,
+        x=args.x,
+        y=args.y,
+        yaw=args.yaw,
         timeout_sec=effective_timeout,
         default_timeout_sec=status["default_skill_timeout_sec"],
     )
@@ -366,6 +454,7 @@ def _run_plan_workflow(args: argparse.Namespace, context, bridge) -> dict[str, A
         raise _CliArgumentError("workflow_json must be valid JSON") from exc
     if not isinstance(workflow_steps, list) or not 1 <= len(workflow_steps) <= 16:
         raise _CliArgumentError("workflow_json must contain between 1 and 16 steps")
+    workflow_steps = _workflow_steps_with_schema_versions(workflow_steps, context)
     result = bridge.plan_agent_command(
         request_id=request_id,
         raw_command=raw_command,
@@ -1049,9 +1138,65 @@ def _run_cancel(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
     )
 
 
+def _run_start_game(args: argparse.Namespace, context, bridge, *, game: dict[str, Any] | None = None) -> dict[str, Any]:
+    from robot_skill_cli.catalog import require_enabled_game
+
+    if game is None:
+        game = require_enabled_game(context.game_view, args.game)
+    request_id = args.request_id.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    timeout_sec = context.view["timeout_policy"]["rpc_timeout_sec"]
+    result = bridge.start_visual_game(
+        game["name"],
+        request_id=request_id,
+        expected_config_digest=context.game_view["config_digest"],
+        timeout_sec=timeout_sec,
+    )
+    if not result["accepted"]:
+        raise _CommandError(
+            result["error_code"] or "GAME_REJECTED",
+            result["message"] or "visual game request rejected",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    if result["config_digest"] != context.game_view["config_digest"]:
+        raise _CommandError(
+            "CONFIG_MISMATCH",
+            "local visual game configuration does not match the running gateway",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return result
+
+
+def _run_game_result(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    request_id = args.request_id.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    timeout_sec = context.view["timeout_policy"]["rpc_timeout_sec"]
+    result = bridge.get_visual_game_result(request_id, timeout_sec=timeout_sec)
+    if result["config_digest"] != context.game_view["config_digest"]:
+        raise _CommandError(
+            "CONFIG_MISMATCH",
+            "local visual game configuration does not match the running gateway",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    if not result["found"]:
+        raise _CommandError(
+            result["error_code"] or "GAME_REQUEST_NOT_FOUND",
+            result["message"] or f"visual game request not found: {request_id}",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return {"request_id": request_id, **result}
+
+
 def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[str, Any] | _CommandExit:
     from robot_skill_cli.ros_bridge import BridgeError
 
+    game = None
+    if args.command == "start-game":
+        from robot_skill_cli.catalog import require_enabled_game
+
+        game = require_enabled_game(context.game_view, args.game)
     bridge = _create_bridge(transport)
     if not bridge.start():
         raise BridgeError("ROS_UNAVAILABLE", "failed to initialize ROS bridge", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -1076,6 +1221,10 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
             return _run_execute_plan(args, context, bridge)
         if args.command == "cancel-plan":
             return _run_cancel_plan(args, context, bridge)
+        if args.command == "start-game":
+            return _run_start_game(args, context, bridge, game=game)
+        if args.command == "game-result":
+            return _run_game_result(args, context, bridge)
         raise _CliArgumentError(f"unsupported command: {args.command}")
     finally:
         bridge.close()
@@ -1087,11 +1236,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         command = args.command
-        from robot_skill_cli.catalog import load_catalog_context, load_runtime_context
+        from robot_skill_cli.catalog import (
+            load_catalog_context,
+            load_runtime_context,
+            load_visual_game_context,
+            load_visual_game_runtime_context,
+        )
 
-        if command in {"list-skills", "describe", "list-poses"}:
+        if command in {"list-games", "describe-game"}:
+            context = load_visual_game_context(config_name=args.config_name, config_path=args.config_path)
+            data = _run_catalog_command(args, context)
+        elif command in {"start-game", "game-result"}:
+            context, transport = load_visual_game_runtime_context(
+                config_name=args.config_name,
+                config_path=args.config_path,
+            )
+            data = _run_runtime_command(args, context, transport)
+        elif command in {"list-skills", "describe", "list-poses"}:
             context = load_catalog_context(config_name=args.config_name, config_path=args.config_path)
-            data = _run_catalog_command(args, context.view)
+            data = _run_catalog_command(args, context)
         else:
             context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
             data = _run_runtime_command(args, context, transport)

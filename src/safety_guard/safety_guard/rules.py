@@ -1,13 +1,16 @@
 """Pure safety rules for the embodied minimal closure."""
 
 import math
+from collections.abc import Mapping
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
-from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, SUPPORTED_SKILL_EXECUTORS, get_skill_templates
+from embodied_common.primitive_contracts import primitive_contract_for_version
+from embodied_common.skill_request import validate_request_schema_version
+from embodied_common.skill_templates import SUPPORTED_SKILL_EXECUTORS, get_skill_templates
+from ibrobot_msgs.action import ExecuteNavigation
 
 __all__ = [
-    "SUPPORTED_PRIMITIVES",
     "get_skill_templates",
     "load_json_mapping",
     "validate_xyz_within_workspace",
@@ -123,11 +126,37 @@ def validate_skill_request(
     arm_joint_names: list[str] | None = None,
     joint_limits: dict[str, Any] | None = None,
     container_name: str = "",
+    direction: str = "",
+    distance: float = 0.0,
+    degree: float = 0.0,
+    x: float | None = None,
+    y: float | None = None,
+    yaw: float | None = None,
+    schema_version: int | None = None,
+    primitive_descriptors: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
     if template is None:
         return False, f"unsupported skill: {skill_name}"
+
+    if schema_version is not None:
+        try:
+            submitted_schema_version = validate_request_schema_version(schema_version)
+        except ValueError as exc:
+            return False, str(exc)
+        capability = template.get("capability", {})
+        expected_schema_version = capability.get("schema_version", 1) if isinstance(capability, Mapping) else 1
+        if submitted_schema_version != expected_schema_version:
+            return False, f"skill schema_version must be {expected_schema_version}"
+
+    if primitive_descriptors is None:
+        try:
+            primitive_descriptors = primitive_contract_for_version(schema_version or 2).descriptors
+        except ValueError as exc:
+            return False, str(exc)
+    if not isinstance(primitive_descriptors, Mapping):
+        return False, "primitive descriptors must be a mapping"
 
     executor_name = str(template.get("executor", "")).strip()
     if executor_name:
@@ -156,7 +185,7 @@ def validate_skill_request(
             return False, f"skill template '{skill_name}' contains a non-object step"
 
         primitive_name = str(step.get("primitive_name", "")).strip()
-        if primitive_name not in SUPPORTED_PRIMITIVES:
+        if primitive_name not in primitive_descriptors:
             return False, f"skill template '{skill_name}' uses unsupported primitive: {primitive_name}"
 
         if primitive_name == "move_to_named_pose":
@@ -203,6 +232,32 @@ def validate_skill_request(
                 return False, "motion_distance must be non-negative"
             if resolved_direction and resolved_distance == 0.0:
                 return False, "motion_distance must be greater than zero"
+
+        if primitive_name == "nav_straight":
+            resolved_direction = direction if step.get("direction_from_request") else step.get("direction", "")
+            if resolved_direction not in {"forward", "backward", "left", "right"}:
+                return False, f"unsupported navigation direction: {resolved_direction}"
+            resolved_distance = distance if step.get("distance_from_request") else step.get("distance", 0.0)
+            if not _is_finite_number(resolved_distance) or float(resolved_distance) <= 0.0:
+                return False, "distance must be a positive finite number"
+
+        if primitive_name == "nav_turn":
+            resolved_direction = direction if step.get("direction_from_request") else step.get("direction", "")
+            if resolved_direction not in {"left", "right"}:
+                return False, f"unsupported navigation direction: {resolved_direction}"
+            resolved_degree = degree if step.get("degree_from_request") else step.get("degree", 0.0)
+            if not _is_finite_number(resolved_degree) or float(resolved_degree) <= 0.0:
+                return False, "degree must be a positive finite number"
+
+        if primitive_name == "nav_abs_coordinate":
+            coordinates = {
+                "x": x if step.get("x_from_request") else step.get("x"),
+                "y": y if step.get("y_from_request") else step.get("y"),
+                "yaw": yaw if step.get("yaw_from_request") else step.get("yaw"),
+            }
+            for field_name, value in coordinates.items():
+                if not _is_finite_number(value):
+                    return False, f"{field_name} must be a finite number"
 
         if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
             # Rotation angle is carried on motion_distance for these primitives.
@@ -293,23 +348,75 @@ def validate_primitive_request(
     target_qz: float = 0.0,
     target_qw: float = 0.0,
     velocity_scaling: float = 0.0,
+    navigation_command_type: int = 0,
+    navigation_target_frame: str = "",
+    navigation_target_x: float = 0.0,
+    navigation_target_y: float = 0.0,
+    navigation_target_z: float = 0.0,
+    navigation_target_qx: float = 0.0,
+    navigation_target_qy: float = 0.0,
+    navigation_target_qz: float = 0.0,
+    navigation_target_qw: float = 0.0,
+    navigation_value: float = 0.0,
+    schema_version: int | None = None,
+    primitive_descriptors: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    if primitive_name not in {
-        "move_to_named_pose",
-        "move_to_pose",
-        "move_to_configuration",
-        "move_relative_ee",
-        "move_to_joint_positions",
-        "move_through_joint_positions",
-        "open_gripper",
-        "close_gripper",
-        "rotate_gripper_cw",
-        "rotate_gripper_ccw",
-    }:
+    if primitive_descriptors is None:
+        try:
+            primitive_descriptors = primitive_contract_for_version(schema_version or 2).descriptors
+        except ValueError as exc:
+            return False, str(exc)
+    if not isinstance(primitive_descriptors, Mapping):
+        return False, "primitive descriptors must be a mapping"
+    descriptor = primitive_descriptors.get(primitive_name)
+    if descriptor is None:
         return False, f"unsupported primitive: {primitive_name}"
+    if schema_version is not None:
+        try:
+            submitted_schema_version = validate_request_schema_version(schema_version)
+        except ValueError as exc:
+            return False, str(exc)
+        if descriptor.schema_version != submitted_schema_version:
+            return False, f"primitive schema_version must be {descriptor.schema_version}"
 
     if velocity_scaling < 0.0 or velocity_scaling > 1.0:
         return False, "velocity_scaling must be in [0.0, 1.0]"
+
+    if primitive_name in {"nav_straight", "nav_turn"}:
+        expected_commands = (
+            {
+                ExecuteNavigation.Goal.FORWARD,
+                ExecuteNavigation.Goal.BACKWARD,
+                ExecuteNavigation.Goal.STRAFE_LEFT,
+                ExecuteNavigation.Goal.STRAFE_RIGHT,
+            }
+            if primitive_name == "nav_straight"
+            else {ExecuteNavigation.Goal.TURN_LEFT, ExecuteNavigation.Goal.TURN_RIGHT}
+        )
+        if isinstance(navigation_command_type, bool) or navigation_command_type not in expected_commands:
+            return False, f"navigation command type does not match {primitive_name}"
+        if not _is_finite_number(navigation_value) or float(navigation_value) <= 0.0:
+            return False, "navigation value must be positive finite"
+        return True, ""
+
+    if primitive_name == "nav_abs_coordinate":
+        if navigation_command_type != ExecuteNavigation.Goal.ABSOLUTE_POSE:
+            return False, "navigation command type does not match nav_abs_coordinate"
+        if navigation_target_frame != "map":
+            return False, "absolute navigation target must use the map frame"
+        for field_name, value in (
+            ("x", navigation_target_x),
+            ("y", navigation_target_y),
+            ("z", navigation_target_z),
+        ):
+            if not _is_finite_number(value):
+                return False, f"navigation target {field_name} must be finite"
+        return _validate_quaternion(
+            navigation_target_qx,
+            navigation_target_qy,
+            navigation_target_qz,
+            navigation_target_qw,
+        )
 
     if primitive_name == "move_to_named_pose":
         pose = named_poses.get(pose_name)

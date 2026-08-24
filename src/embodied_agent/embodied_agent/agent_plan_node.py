@@ -22,6 +22,7 @@ from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlan
 from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
+from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from embodied_common.workflow_contracts import (
     CanonicalWorkflowStep,
     compute_workflow_digest,
@@ -91,6 +92,7 @@ class AgentPlanNode(Node):
         )
         self._store_lock = RLock()
 
+        validate_public_request_wire_contracts()
         callback_group = ReentrantCallbackGroup()
         self._status_client = self.create_client(
             GetSkillGatewayStatus, self._status_service, callback_group=callback_group
@@ -271,44 +273,63 @@ class AgentPlanNode(Node):
     @staticmethod
     def _to_workflow_step_message(step: CanonicalWorkflowStep):
         return workflow_step(
+            schema_version=step.schema_version,
             skill_name=step.skill_name,
             target_name=step.target_name,
             container_name=step.container_name,
             place_name=step.place_name,
             motion_direction=step.motion_direction,
             motion_distance=step.motion_distance,
+            direction=step.direction,
+            distance=step.distance,
+            degree=step.degree,
+            x=step.x,
+            y=step.y,
+            yaw=step.yaw,
             timeout_sec=step.timeout_sec,
         )
 
     def _normalize_steps(self, workflow_steps, status, catalog) -> tuple[CanonicalWorkflowStep, ...]:
         try:
             requested_steps = normalize_workflow_steps(workflow_steps)
-            steps = tuple(
-                CanonicalWorkflowStep(
-                    schema_version=1,
-                    skill_name=step.skill_name,
-                    target_name=step.target_name,
-                    container_name=step.container_name,
-                    place_name=step.place_name,
-                    motion_direction=step.motion_direction.strip().lower(),
-                    motion_distance=self._float32(step.motion_distance),
-                    timeout_sec=self._float32(step.timeout_sec),
+            steps = []
+            for step in requested_steps:
+                capability = catalog.capability_view.get(step.skill_name)
+                if (
+                    step.skill_name not in catalog.planner_visible_names
+                    or capability is None
+                    or capability.get("semantic_level") not in {"atomic_operator", "skill"}
+                ):
+                    raise AgentPlanError("SKILL_REFERENCE_MISSING", f"skill is not planner-visible: {step.skill_name}")
+                capability_version = capability.get("schema_version", 1)
+                if capability_version not in {1, 2} or step.schema_version != capability_version:
+                    raise AgentPlanError(
+                        "SKILL_SCHEMA_INVALID",
+                        f"workflow step schema_version does not match capability: {step.skill_name}",
+                    )
+                steps.append(
+                    CanonicalWorkflowStep(
+                        schema_version=step.schema_version,
+                        skill_name=step.skill_name,
+                        target_name=step.target_name,
+                        container_name=step.container_name,
+                        place_name=step.place_name,
+                        motion_direction=step.motion_direction.strip().lower(),
+                        motion_distance=self._float32(step.motion_distance),
+                        timeout_sec=self._float32(step.timeout_sec),
+                        direction=step.direction.strip().lower(),
+                        distance=step.distance,
+                        degree=step.degree,
+                        x=step.x,
+                        y=step.y,
+                        yaw=step.yaw,
+                    )
                 )
-                for step in requested_steps
-            )
+            steps = tuple(steps)
         except (TypeError, ValueError, OverflowError, struct.error) as exc:
             raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
         if any(step.timeout_sec < 0.0 for step in requested_steps):
             raise AgentPlanError("SKILL_SCHEMA_INVALID", "workflow step timeout must not be negative")
-        for step in steps:
-            skill_name = step.skill_name
-            capability = catalog.capability_view.get(skill_name)
-            if (
-                skill_name not in catalog.planner_visible_names
-                or capability is None
-                or capability.get("semantic_level") not in {"atomic_operator", "skill"}
-            ):
-                raise AgentPlanError("SKILL_REFERENCE_MISSING", f"skill is not planner-visible: {skill_name}")
         return steps
 
     def _plan_command(self, request, response):
@@ -345,6 +366,7 @@ class AgentPlanNode(Node):
 
     def _validate_step(self, plan: AgentPlan, step: CanonicalWorkflowStep):
         request = ValidateSkill.Request()
+        request.schema_version = step.schema_version
         request.dispatch_binding = new_binding(task_id=plan.plan_id)
         request.dispatch_binding.expected_registry_epoch = plan.registry_epoch
         request.dispatch_binding.expected_registry_generation = plan.registry_generation
@@ -355,7 +377,18 @@ class AgentPlanNode(Node):
         request.place_name = step.place_name
         request.motion_direction = step.motion_direction
         request.motion_distance = step.motion_distance
+        self._copy_navigation_step(request, step)
         return self._call_service(self._validate_skill_client, request, self._validate_skill_service)
+
+    @staticmethod
+    def _copy_navigation_step(message, step: CanonicalWorkflowStep) -> None:
+        message.direction = step.direction
+        message.distance = step.distance
+        message.degree = step.degree
+        for field_name in ("x", "y", "yaw"):
+            value = getattr(step, field_name)
+            setattr(message, f"has_{field_name}", value is not None)
+            setattr(message, field_name, float(value) if value is not None else 0.0)
 
     def _validate_plan(self, request, response):
         try:
@@ -491,6 +524,7 @@ class AgentPlanNode(Node):
         if wait_timeout <= 0.0 or not self._skill_client.wait_for_server(timeout_sec=wait_timeout):
             raise AgentPlanError("CAPABILITY_NOT_READY")
         goal = SkillCommand.Goal()
+        goal.schema_version = step.schema_version
         goal.dispatch_binding = binding
         goal.skill_name = step.skill_name
         goal.target_name = step.target_name
@@ -498,6 +532,7 @@ class AgentPlanNode(Node):
         goal.place_name = step.place_name
         goal.motion_direction = step.motion_direction
         goal.motion_distance = step.motion_distance
+        self._copy_navigation_step(goal, step)
         goal.timeout_sec = step.timeout_sec
         send_future = self._skill_client.send_goal_async(goal)
         send_timeout = min(self._rpc_timeout, max(0.0, child_deadline - time.monotonic()))

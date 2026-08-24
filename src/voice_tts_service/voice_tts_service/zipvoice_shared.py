@@ -18,7 +18,7 @@ from voice_tts_service.errors import BackendInferenceError, BackendLoadError
 
 _PINYIN_TAG = re.compile(r"<([A-Za-z]+[1-5])>")
 _ASCII_LETTER = re.compile(r"[A-Za-z]")
-_PUNCTUATION = {";", ":", ",", ".", "!", "?", "…"}
+_PUNCTUATION = {";", ":", ",", ".", "!", "?"}
 
 
 @dataclass(frozen=True)
@@ -79,14 +79,15 @@ class ChineseTokenizer:
             "“": '"',
             "”": '"',
             "’": "'",
-            "⋯": "…",
-            "···": "…",
-            "・・・": "…",
-            "...": "…",
+            "⋯": ".",
+            "…": ".",
+            "···": ".",
+            "・・・": ".",
+            "...": ".",
         }
         for source, target in replacements.items():
             text = text.replace(source, target)
-        return text
+        return re.sub(r"\.{2,}", ".", text)
 
     def _split_pinyin(self, syllable: str) -> list[str]:
         initial = self._to_initials(syllable, strict=False)

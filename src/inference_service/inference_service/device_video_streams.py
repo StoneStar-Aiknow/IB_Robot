@@ -38,6 +38,7 @@ class _EdgeStream:
     ssrc: int
     lock: threading.Lock
     sender_factory: Callable[..., H264RtpSender]
+    active_session_generation: int = 0
     last_capture_timestamp_ns: int = 0
     last_input_capture_timestamp_ns: int = 0
     last_rtp_timestamp: int = 0
@@ -131,8 +132,8 @@ class DeviceVideoStreamManager:
             self._session_id = ""
             self._session_generation = 0
             for stream in tuple(self._streams.values()):
-                stream.sender.close()
                 with stream.lock:
+                    stream.sender.close()
                     stream.encoder.reset()
                     stream.ssrc = secrets.randbits(32)
                     stream.sender = self._create_sender(stream)
@@ -141,12 +142,16 @@ class DeviceVideoStreamManager:
                     stream.last_rtp_timestamp = 0
                     stream.keyframe_sent = False
                     stream.last_error = ""
+                    stream.active_session_generation = session_generation
             self._session_id = session_id
             self._session_generation = session_generation
         return True
 
     def clear_session(self) -> None:
         with self._lock:
+            for stream in tuple(self._streams.values()):
+                with stream.lock:
+                    stream.active_session_generation = 0
             self._session_id = ""
             self._session_generation = 0
 
@@ -164,35 +169,38 @@ class DeviceVideoStreamManager:
         with self._lock:
             if not self._session_id or not self._session_generation:
                 return False
-            with stream.lock:
-                if capture_timestamp_ns <= stream.last_input_capture_timestamp_ns:
-                    stream.dropped_frames += 1
-                    return False
-                try:
-                    frame = ros_image_to_hwc_uint8(
-                        message,
-                        output_encoding="rgb8",
-                        resize=(stream.transport.media.height, stream.transport.media.width),
+            session_generation = self._session_generation
+        with stream.lock:
+            if stream.active_session_generation != session_generation:
+                return False
+            if capture_timestamp_ns <= stream.last_input_capture_timestamp_ns:
+                stream.dropped_frames += 1
+                return False
+            try:
+                frame = ros_image_to_hwc_uint8(
+                    message,
+                    output_encoding="rgb8",
+                    resize=(stream.transport.media.height, stream.transport.media.width),
+                )
+                packets = stream.encoder.encode(
+                    VideoFrame(
+                        frame,
+                        capture_timestamp_ns,
+                        receive_timestamp_ns,
+                        stream.transport.media.width,
+                        stream.transport.media.height,
+                        "rgb24",
+                        color_space=stream.transport.media.color_space,
+                        color_range=stream.transport.media.color_range,
                     )
-                    packets = stream.encoder.encode(
-                        VideoFrame(
-                            frame,
-                            capture_timestamp_ns,
-                            receive_timestamp_ns,
-                            stream.transport.media.width,
-                            stream.transport.media.height,
-                            "rgb24",
-                            color_space=stream.transport.media.color_space,
-                            color_range=stream.transport.media.color_range,
-                        )
-                    )
-                    for packet in packets:
-                        stream.sender.enqueue(packet)
-                    stream.last_input_capture_timestamp_ns = capture_timestamp_ns
-                    stream.last_error = ""
-                except Exception as exc:
-                    stream.last_error = str(exc)
-                    raise
+                )
+                for packet in packets:
+                    stream.sender.enqueue(packet)
+                stream.last_input_capture_timestamp_ns = capture_timestamp_ns
+                stream.last_error = ""
+            except Exception as exc:
+                stream.last_error = str(exc)
+                raise
         return True
 
     def descriptors(self) -> tuple[VideoStreamDescriptor, ...]:

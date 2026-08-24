@@ -18,7 +18,10 @@ def evaluate_slam_readiness(
     cloud_map_ready: bool,
     timestamped_tf_ready: bool,
 ) -> SlamReadiness:
-    if not expected_map_hash or active_map_hash != expected_map_hash:
+    # Some SLAM deployments do not publish a map identity topic. In that case
+    # retain the manifest identity as the local contract; if a publisher does
+    # provide a value, still fail closed on an explicit mismatch.
+    if not expected_map_hash or (active_map_hash and active_map_hash != expected_map_hash):
         return SlamReadiness(False, "active SLAM map identity is incompatible")
     if not localization_ready:
         return SlamReadiness(False, "global localization is not ready")
