@@ -26,7 +26,7 @@ priority=1
 
 [openEulerROS-humble]
 name=openEulerROS-humble
-baseurl=https://eulermaker.compass-ci.openeuler.openatom.cn/api/ems1/repositories/ROS-SIG-Multi-Version_ros-humble_openEuler-24.03-LTS-TEST4/openEuler%3A24.03-LTS/$basearch/
+baseurl=https://repo.huaweicloud.com/openeuler/openEuler-24.03-LTS/EPOL/multi_version/ROS/humble/$basearch/
 enabled=1
 gpgcheck=0
 priority=2

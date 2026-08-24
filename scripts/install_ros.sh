@@ -172,7 +172,7 @@ setup_os_variables() {
         # during the repository migration window. install_openeuler_ros()
         # writes the authoritative repo configuration.
         OPENEULER_ROS_PRIMARY_REPO_URL="https://eur.openeuler.openatom.cn/results/openEuler_Embedded/IB_Robot-ROS_humble-release_1/openeuler-24.03_LTS-${ARCH}/"
-        OPENEULER_ROS_FALLBACK_REPO_URL="https://eulermaker.compass-ci.openeuler.openatom.cn/api/ems1/repositories/ROS-SIG-Multi-Version_ros-${ROS_DISTRO}_openEuler-24.03-LTS-TEST4/openEuler%3A24.03-LTS/${ARCH}/"
+        OPENEULER_ROS_FALLBACK_REPO_URL="https://repo.huaweicloud.com/openeuler/openEuler-24.03-LTS/EPOL/multi_version/ROS/${ROS_DISTRO}/${ARCH}/"
     fi
 }
 
