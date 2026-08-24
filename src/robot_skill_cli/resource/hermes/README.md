@@ -13,6 +13,7 @@
 | `POLICY.md` | 强制策略：运动只能走 `robot-skill` + Gateway；感知读取只能走 `ibrobot-perceive`；裸 `ros2` 子命令被禁止；TTS 由 `post_llm_call` hook 自动完成 |
 | `hooks/ibrobot-block-raw-ros` | Hermes `pre_tool_call` hook，用 `shlex` 分词拦截裸 `ros2`/`rclpy`/`roslaunch` 调用 |
 | `hooks/ibrobot-speak` | Hermes `post_llm_call` speech hook wrapper，source `.shrc_local` 后 `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT |
+| `hooks/ibrobot-lifecycle-speech` | Hermes `pre_tool_call` / `post_tool_call` hook；只投递状态检查、规划和计划授权事件，文案生成、TTS 合成和播放均在后台执行 |
 | `sync_hermes.sh` | 手动同步入口（等价于 `hermes-robot-configure`） |
 
 ## `ibrobot-perceive`（感知读取唯一入口）
@@ -100,6 +101,8 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
   加入 `PATH`。排查「Hermes 不再 source 我的 bashrc」时先看此文件与该开关。
 - `hooks/ibrobot-speak`：`post_llm_call` speech hook wrapper，source `.shrc_local` 后
   `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT。
+- `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，source `.shrc_local` 后
+  异步生成文案并投递状态检查、规划和计划授权成功三类语音事件。
 
 `--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
 `hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经
@@ -135,6 +138,11 @@ hermes hooks doctor
 
 最终自然语言回复通过 `post_llm_call` 自动调用 `/voice_tts/synthesize` 和 `/voice_tts/play`，本地扬声器
 播放结果。诊断日志位于 `/tmp/hermes-speak.log`。
+
+生命周期语音不会阻塞 `robot-skill`：`pre_llm_call` 只暂存用户原话，确认该回合调用 `status` 后才在
+后台启动文案模型，普通对话不会产生额外调用。每个机器人任务最多调用一次 `LLMClientService` 生成三条文案，
+TTS 合成在后台执行，音频播放通过单设备锁串行化，避免多个进程争用同一声卡；TTS 或文案模型失败
+只使用 fallback 或记录日志，不改变规划、执行和安全门禁。
 
 ## 升级
 

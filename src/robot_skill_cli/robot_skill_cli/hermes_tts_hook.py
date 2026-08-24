@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -22,6 +23,7 @@ _MAX_LOG_BYTES = 256 * 1024
 # robot_config SSOT (voice_tts.synthesis_timeout_sec / playback_timeout_sec).
 _DEFAULT_SYNTHESIS_TIMEOUT_SEC = 90.0
 _DEFAULT_PLAYBACK_TIMEOUT_SEC = 300.0
+_PLAYBACK_LOCK_PATH = Path(os.environ.get("IBROBOT_TTS_PLAYBACK_LOCK", "/tmp/ibrobot-tts-playback.lock"))
 
 
 class SpeechHookError(RuntimeError):
@@ -154,24 +156,27 @@ def speak(text: str, *, session_id: str = "") -> None:
             raise SpeechHookError("speech synthesis returned no audio segments")
         _log(f"SYNTHESIZED session={session_id} segments={len(result.audio_segments)}")
 
-        for segment in result.audio_segments:
-            audio_data = bytes(segment.audio_data)
-            duration_sec = _wav_duration_sec(audio_data)
-            path = _write_wav(audio_data)
-            try:
-                play_request = PlayAudioFile.Request()
-                play_request.file_path = str(path)
-                playback_timeout = min(playback_cap, max(30.0, duration_sec + 15.0))
-                played = _wait_for_future(
-                    node,
-                    playback.call_async(play_request),
-                    playback_timeout,
-                    "audio playback",
-                )
-                if not played.success:
-                    raise SpeechHookError(f"audio playback failed [{played.error_code}]: {played.message}")
-            finally:
-                path.unlink(missing_ok=True)
+        with _PLAYBACK_LOCK_PATH.open("a+") as playback_lock:
+            fcntl.flock(playback_lock.fileno(), fcntl.LOCK_EX)
+            for segment in result.audio_segments:
+                audio_data = bytes(segment.audio_data)
+                duration_sec = _wav_duration_sec(audio_data)
+                path = _write_wav(audio_data)
+                try:
+                    play_request = PlayAudioFile.Request()
+                    play_request.file_path = str(path)
+                    playback_timeout = min(playback_cap, max(30.0, duration_sec + 15.0))
+                    played = _wait_for_future(
+                        node,
+                        playback.call_async(play_request),
+                        playback_timeout,
+                        "audio playback",
+                    )
+                    if not played.success:
+                        raise SpeechHookError(f"audio playback failed [{played.error_code}]: {played.message}")
+                finally:
+                    path.unlink(missing_ok=True)
+            fcntl.flock(playback_lock.fileno(), fcntl.LOCK_UN)
         _log(f"PLAYED session={session_id} segments={len(result.audio_segments)}")
     finally:
         node.destroy_node()

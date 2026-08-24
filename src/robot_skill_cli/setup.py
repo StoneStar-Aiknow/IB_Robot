@@ -39,6 +39,7 @@ setup(
             "hermes-robot = robot_skill_cli.hermes_launcher:main",
             "hermes-robot-configure = robot_skill_cli.hermes_configure:main",
             "hermes-robot-speak = robot_skill_cli.hermes_tts_hook:main",
+            "hermes-robot-lifecycle-speech = robot_skill_cli.hermes_lifecycle_speech:main",
             "ibrobot-perceive = robot_skill_cli.perceive_cli:main",
         ]
     },
