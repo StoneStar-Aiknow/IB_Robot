@@ -57,6 +57,7 @@ _PARAMETER_TYPES = {
     "device_name_contains": Parameter.Type.STRING,
     "arecord_device": Parameter.Type.STRING,
     "sample_rate": Parameter.Type.INTEGER,
+    "srp_update_interval_hops": Parameter.Type.INTEGER,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
     "angle_step_degree": Parameter.Type.INTEGER,
     "input_source": Parameter.Type.STRING,
@@ -173,6 +174,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     sample_rate = _convert_int(values, "sample_rate")
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
+    srp_update_interval_hops = _require_positive_int(values, "srp_update_interval_hops")
 
     channel_indices = _convert_int_list(values, "channel_indices")
     # 当前 FullSubNet、缓冲区和 SRP 阵列均固定处理四路麦克风信号。
@@ -280,6 +282,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.audio.arecord_device = arecord_device
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
+    cfg.pipeline.srp_update_interval_hops = srp_update_interval_hops
     cfg.vad.sample_rate = sample_rate
     cfg.doa.sample_rate = sample_rate
     if any(value >= cfg.audio.channels for value in channel_indices):
@@ -515,6 +518,7 @@ class SpeechDirectionNode(Node):
                 sample_rate=cfg.pipeline.sample_rate,
                 processing_samples=cfg.pipeline.processing_hop_samples,
                 model_batch_samples=cfg.pipeline.model_batch_samples,
+                srp_update_interval_hops=cfg.pipeline.srp_update_interval_hops,
                 input_channels=tuple(cfg.pipeline.input_channels),
                 srp_frame_samples=cfg.doa.frame_size,
                 srp_hop_samples=cfg.doa.hop_size,

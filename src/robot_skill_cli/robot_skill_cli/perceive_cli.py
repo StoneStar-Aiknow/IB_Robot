@@ -75,6 +75,7 @@ PERCEPTION_ALLOWLIST: dict[str, dict[str, Any]] = {
 LOG_PATH = Path("/tmp/hermes-perceive.log")
 TIMEOUT_SEC = 5
 _DEFAULT_ARM_JOINT_TOPIC = "/joint_states"
+_VOICE_DIRECTION_TYPE = "ibrobot_msgs/msg/SpeechDirection"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -133,9 +134,15 @@ def _resolve_topic(source: str, robot_config: dict[str, Any] | None) -> str:
 
 
 def _extract_field(stdout: str, field: str) -> object | None:
-    marker = stdout.find("---\n")
-    payload = stdout[marker:] if marker >= 0 else stdout
-    docs = list(yaml.safe_load_all(payload))
+    # ros2 topic echo prints the message first and a trailing document separator;
+    # parsing from the first separator would discard that message entirely.
+    try:
+        docs = list(yaml.safe_load_all(stdout))
+    except yaml.YAMLError:
+        marker = stdout.find("---\n")
+        if marker < 0:
+            raise
+        docs = list(yaml.safe_load_all(stdout[marker:]))
     for doc in docs:
         if isinstance(doc, dict) and field in doc:
             return doc[field]
@@ -168,10 +175,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     topic = _resolve_topic(args.source, robot_config)
+    command = ["ros2", "topic", "echo", "--once"]
+    if args.source == "voice_direction":
+        command.extend(
+            [
+                "--qos-reliability",
+                "reliable",
+                "--qos-history",
+                "keep_last",
+                "--qos-depth",
+                "1",
+                "--qos-durability",
+                "volatile",
+                topic,
+                _VOICE_DIRECTION_TYPE,
+            ]
+        )
+    else:
+        command.append(topic)
 
     try:
         result = subprocess.run(
-            ["ros2", "topic", "echo", "--once", topic],
+            command,
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SEC,

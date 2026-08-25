@@ -6,6 +6,8 @@ speech_direction_node:
     arecord_device: "hw:0,0"
     sample_rate: 16000
     channel_indices: [1, 2, 3, 4]
+    # FullSubNet/VAD remain continuous; SRP-PHAT updates every two model hops.
+    srp_update_interval_hops: 2
 
     # 阵列安装偏角和四麦二维坐标；ROS 2 参数使用一维浮点数组。
     mount_yaw_deg: 0.0

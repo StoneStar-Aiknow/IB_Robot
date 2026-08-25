@@ -44,6 +44,7 @@ class PipelineConfig:
     # runtime 每 256 samples 调度一次；两个 tick 聚合为一次 T=2 模型调用。
     processing_hop_samples: int = 256
     model_batch_samples: int = 512
+    srp_update_interval_hops: int = 2
     frame_size: int = 4096  # 兼容旧调用方，语义等同 srp_frame_samples
     hop_size: int = 512  # 兼容旧调用方，语义等同 srp_hop_samples，禁止作为 processing tick
     fft_size: int = 4096

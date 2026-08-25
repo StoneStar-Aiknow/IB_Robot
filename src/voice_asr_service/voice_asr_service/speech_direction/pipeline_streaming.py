@@ -24,6 +24,7 @@ class StreamingPipelineParams:
     sample_rate: int = 16000
     processing_samples: int = 256
     model_batch_samples: int = 512
+    srp_update_interval_hops: int = 2
     input_channels: tuple[int, int, int, int] = (1, 2, 3, 4)
     srp_frame_samples: int = 4096
     srp_hop_samples: int = 512
@@ -99,6 +100,7 @@ class StreamingSpeechDirectionPipeline:
         self._candidate_start = 0
         self._input_pending = np.zeros((0, 4), np.float32)
         self._pending_raw_start: int | None = None
+        self._model_hop_count = 0
 
     def process_block(self, data: np.ndarray, *, capture_start_sample: int | None = None) -> HopResult:
         """处理一个[6,256] tick；两个tick合并后调用一次T=2 stateful 模型。"""
@@ -135,6 +137,7 @@ class StreamingSpeechDirectionPipeline:
                 session_sample=model_raw_start,
                 hop_t=model_raw_start / self.sr,
             )
+        self._model_hop_count += 1
         # T=2输出512样本，对应前一个完整512输入块；下游VAD和SRP也按512推进。
         enhanced = enhanced_full
         output_start = model_raw_start - self.model_batch_samples
@@ -150,7 +153,12 @@ class StreamingSpeechDirectionPipeline:
         score = None
         frame_doa = None
         srp_ms = 0.0
-        if self._srp_history.shape[0] == self.params.srp_frame_samples:
+        should_update_srp = (
+            self._srp_history.shape[0] == self.params.srp_frame_samples
+            and decision.is_gray
+            and self._model_hop_count % self.params.srp_update_interval_hops == 0
+        )
+        if should_update_srp:
             srp_start = time.perf_counter()
             spectrum = self.srp.stft_4ch(self._srp_history)
             score = self.srp.compute_all_scores(spectrum)[0]
@@ -283,7 +291,8 @@ class StreamingSpeechDirectionPipeline:
 
         if previous_state == "ACTIVE" and decision.gate_state == "IDLE":
             segment_samples = self._last_gray_end - self._segment_start
-            accumulated_samples = len(self._scores) * self.params.srp_hop_samples
+            score_coverage_samples = self.params.srp_hop_samples * self.params.srp_update_interval_hops
+            accumulated_samples = len(self._scores) * score_coverage_samples
             result = None
             if (
                 segment_samples >= self.params.min_segment_samples
@@ -327,6 +336,7 @@ class StreamingSpeechDirectionPipeline:
             raise RuntimeError("流式 speech_direction pipeline 已关闭")
         self._reset_temporal_context()
         self._samples_processed = int(next_capture_sample)
+        self._model_hop_count = 0
 
     def reset(self) -> None:
         with self._lock:
@@ -334,6 +344,7 @@ class StreamingSpeechDirectionPipeline:
                 return
             self._reset_temporal_context()
             self._samples_processed = 0
+            self._model_hop_count = 0
             self._output_seq = 0
             self._segment_seq = 0
             self._history = []
