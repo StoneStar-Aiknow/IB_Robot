@@ -1,30 +1,32 @@
-"""Strict unified manifest loading before backend initialization."""
+"""Strict schema v3 manifest loading before backend initialization."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from inference_manifest.errors import ManifestValidationError
+from inference_manifest.errors import ManifestIntegrityError, ManifestValidationError
 from inference_manifest.integrity import (
     deployment_fingerprint,
+    integrity_status_for_deployment,
+    runtime_profile_fingerprint,
     verify_bundle_digest,
+    verify_deployment_artifacts,
 )
 from inference_manifest.json_utils import load_json_strict
 from inference_manifest.metadata import PolicyFeature, PolicyMetadata, load_policy_metadata
 from inference_manifest.models import (
     HOST_SEMANTIC_PREFIX,
     INTERNAL_SEMANTIC_PREFIX,
-    CompiledDeployment,
     Deployment,
     InferenceManifest,
     ModelDescriptor,
     SemanticTensor,
     TensorBinding,
+    ValidatedDeployment,
 )
 from inference_manifest.paths import normalize_unique_paths, resolve_bundle_file
 from inference_manifest.schema import validate_manifest_schema
@@ -32,30 +34,44 @@ from inference_manifest.schema import validate_manifest_schema
 MANIFEST_FILENAME = "inference_manifest.json"
 
 
-@dataclass(frozen=True)
-class ValidatedManifest:
-    bundle_root: Path
-    manifest_path: Path
-    manifest: InferenceManifest
-    deployment_name: str
-    deployment: Deployment
-    policy: PolicyMetadata | None
-    fingerprint: str
+# This alias is intentionally source-level only.  The returned object is the
+# v3 ValidatedDeployment snapshot and no v2 parser or field mapping remains.
+ValidatedManifest = ValidatedDeployment
 
 
-def load_inference_manifest(bundle_root: str | Path, deployment_name: str) -> ValidatedManifest:
+def load_inference_manifest(
+    bundle_root: str | Path,
+    deployment_name: str,
+    *,
+    verify_on_demand: bool = False,
+) -> ValidatedDeployment:
     """Validate one bundle and selected deployment without importing a backend SDK."""
 
-    return _load_inference_manifest(
+    validated = _load_inference_manifest(
         bundle_root,
         deployment_name,
         verify_all_bundle_files=True,
         verify_deployment_artifacts=True,
         require_native_weights=None,
     )
+    if verify_on_demand:
+        report = verify_deployment_artifacts(validated.bundle_root, deployment_name, mode="verify_on_demand")
+        if report.state == "mismatch":
+            raise ManifestIntegrityError(
+                f"artifact_digest_mismatch for deployment {deployment_name!r}: {report.mismatch_details}"
+            )
+        # Keep the snapshot immutable while exposing the explicit verification
+        # result to callers that requested it.
+        return ValidatedDeployment(
+            **{
+                **validated.__dict__,
+                "integrity_status": report,
+            }
+        )
+    return validated
 
 
-def load_inference_manifest_metadata(bundle_root: str | Path, deployment_name: str) -> ValidatedManifest:
+def load_inference_manifest_metadata(bundle_root: str | Path, deployment_name: str) -> ValidatedDeployment:
     """Validate edge-owned semantics and identity without requiring cloud-only artifacts."""
 
     return _load_inference_manifest(
@@ -74,22 +90,19 @@ def _load_inference_manifest(
     verify_all_bundle_files: bool,
     verify_deployment_artifacts: bool,
     require_native_weights: bool | None,
-) -> ValidatedManifest:
+) -> ValidatedDeployment:
     root = Path(bundle_root)
     manifest_path = root / MANIFEST_FILENAME
     raw = load_json_strict(manifest_path)
     if not isinstance(raw, dict):
         raise ManifestValidationError(f"Inference manifest must be a JSON object: {manifest_path}")
 
+    # Check the version before schema validation, policy metadata, artifact
+    # resolution, or any operation that could import a runtime dependency.
     schema_version = raw.get("schema_version")
-    if schema_version != 2:
-        guidance = (
-            " Schema-v1 artifacts are unsupported; rerun the owning exporter or packager to create a schema-v2 bundle."
-            if schema_version == 1
-            else ""
-        )
+    if schema_version != 3:
         raise ManifestValidationError(
-            f"Unsupported schema_version {schema_version!r} in {manifest_path}; supported versions: [2].{guidance}"
+            f"unsupported schema_version {schema_version!r} in {manifest_path}; supported versions: [3]"
         )
     validate_manifest_schema(raw, str(manifest_path))
     manifest = _parse_typed_manifest(raw, manifest_path)
@@ -103,17 +116,19 @@ def _load_inference_manifest(
         ) from exc
 
     bundle_entries = tuple(manifest.bundle.files)
-    selected_artifacts = tuple(deployment.artifacts.values()) if isinstance(deployment, CompiledDeployment) else ()
+    selected_artifacts = tuple(deployment.artifacts.values())
     bundle_paths = set(normalize_unique_paths((entry.path for entry in bundle_entries), "bundle.files"))
     artifact_paths = {artifact.path for artifact in selected_artifacts}
     overlap = sorted(bundle_paths & artifact_paths)
     if overlap:
         raise ManifestValidationError(f"bundle files and deployment artifacts must use distinct paths: {overlap}")
 
-    is_policy = manifest.model.kind == "policy"
+    is_policy = manifest.model.interface == "policy"
     if require_native_weights is None:
         require_native_weights = is_policy and any(
-            candidate.backend == "torch" for candidate in manifest.deployments.values()
+            profile.backend == "torch"
+            for candidate in manifest.deployments.values()
+            for profile in _deployment_profiles(candidate)
         )
 
     if verify_all_bundle_files:
@@ -129,9 +144,10 @@ def _load_inference_manifest(
 
     policy = load_policy_metadata(root, require_native_weights=require_native_weights) if is_policy else None
     if policy is not None:
-        if manifest.model.family not in {"lerobot", policy.policy_type}:
+        if manifest.model.model_type != policy.policy_type:
             raise ManifestValidationError(
-                f"Policy model family {manifest.model.family!r} does not match LeRobot policy type {policy.policy_type!r}"
+                f"Policy model_type {manifest.model.model_type!r} does not match "
+                f"LeRobot config type {policy.policy_type!r}"
             )
         _validate_required_bundle_files(
             manifest,
@@ -149,30 +165,73 @@ def _load_inference_manifest(
         for entry in entries_to_verify:
             resolve_bundle_file(root, entry.path)
 
-    if verify_deployment_artifacts and isinstance(deployment, CompiledDeployment):
-        for artifact in deployment.artifacts.values():
-            resolve_bundle_file(root, artifact.path)
+    resolved_artifacts: dict[str, Path] = {}
+    if verify_deployment_artifacts:
+        for role, artifact in deployment.artifacts.items():
+            resolved_artifacts[role] = resolve_bundle_file(root, artifact.path)
 
-    if isinstance(deployment, CompiledDeployment):
-        _validate_semantic_contract(deployment, manifest.model)
+    if deployment.execution:
         if policy is not None:
             _validate_policy_deployment(deployment, policy)
+        else:
+            _validate_semantic_contract(deployment, manifest.model)
 
+    role_identities = dict(deployment.role_identities or {})
+    role_runtime_profiles = dict(deployment.role_runtime_profiles or {})
+    integrity_status = integrity_status_for_deployment(root, deployment_name, deployment)
     fingerprint = deployment_fingerprint(
         manifest.schema_version,
         manifest.bundle.digest.value,
         deployment_name,
         deployment,
+        identity=manifest.model.identity,
+        semantic_contract=manifest.model,
+        role_identities=role_identities,
+        role_runtime_profiles=role_runtime_profiles or None,
     )
-    return ValidatedManifest(
-        bundle_root=root.resolve(strict=True),
-        manifest_path=manifest_path.resolve(strict=True),
+    profile_fingerprint = runtime_profile_fingerprint(
+        manifest.schema_version,
+        manifest.bundle.digest.value,
+        deployment_name,
+        deployment,
+        role_runtime_profiles=role_runtime_profiles or None,
+    )
+    bundle_root = root.resolve(strict=True)
+    resolved_manifest_path = manifest_path.resolve(strict=True)
+    return ValidatedDeployment(
+        bundle_root=bundle_root,
+        manifest_path=resolved_manifest_path,
         manifest=manifest,
         deployment_name=deployment_name,
         deployment=deployment,
+        top_level_identity=manifest.model.identity,
+        role_identities=role_identities,
+        role_runtime_profiles=role_runtime_profiles,
+        selected_deployment=deployment,
+        semantic_contract=manifest.model,
+        resolved_artifacts=resolved_artifacts,
+        role_artifact_bindings=dict(deployment.bindings),
+        declared_metadata={
+            "bundle": manifest.bundle.model_dump(mode="json"),
+            "deployment": deployment.metadata,
+            "artifacts": {
+                role: artifact.model_dump(mode="json", exclude_none=True)
+                for role, artifact in deployment.artifacts.items()
+            },
+        },
+        integrity_status=integrity_status,
+        deployment_fingerprint=fingerprint,
+        runtime_profile_fingerprint=profile_fingerprint,
         policy=policy,
-        fingerprint=fingerprint,
     )
+
+
+def _deployment_profiles(deployment: Deployment) -> tuple[Any, ...]:
+    if deployment.role_runtime_profiles:
+        return tuple(deployment.role_runtime_profiles.values())
+    if deployment.runtime_profile is not None:
+        return (deployment.runtime_profile,)
+    return ()
 
 
 def _parse_typed_manifest(raw: dict[str, Any], manifest_path: Path) -> InferenceManifest:
@@ -215,7 +274,7 @@ def _is_reserved_semantic_path(path: str) -> bool:
     )
 
 
-def _validate_feature_compatibility(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
+def _validate_feature_compatibility(deployment: Deployment, policy: PolicyMetadata) -> None:
     for role in deployment.execution:
         group = deployment.bindings[role]
         for binding in (*group.inputs, *group.outputs):
@@ -229,7 +288,7 @@ def _validate_feature_compatibility(deployment: CompiledDeployment, policy: Poli
                 )
 
 
-def _validate_policy_deployment(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
+def _validate_policy_deployment(deployment: Deployment, policy: PolicyMetadata) -> None:
     output_semantics = {
         binding.semantic for role in deployment.execution for binding in deployment.bindings[role].outputs
     }
@@ -238,7 +297,7 @@ def _validate_policy_deployment(deployment: CompiledDeployment, policy: PolicyMe
     _validate_feature_compatibility(deployment, policy)
 
 
-def _validate_semantic_contract(deployment: CompiledDeployment, model: ModelDescriptor) -> None:
+def _validate_semantic_contract(deployment: Deployment, model: ModelDescriptor) -> None:
     if not model.inputs and not model.outputs:
         return
 
@@ -251,14 +310,7 @@ def _validate_semantic_contract(deployment: CompiledDeployment, model: ModelDesc
     _validate_contract_direction("output", declared_outputs, bound_outputs, host_orchestrated=orchestrated)
 
 
-def _is_host_orchestrated(deployment: CompiledDeployment) -> bool:
-    """Report whether the host, not the compiled graph, joins this deployment's roles.
-
-    A deployment whose roles consume or produce ``host.*`` tensors is driven role by role
-    with host computation in between - PointNet++ grouping, a diffusion loop, pose
-    integration - so the tensors the service declares need not each be an input or output
-    slot on some OM. The straight-through deployments keep the strict 1:1 mapping.
-    """
+def _is_host_orchestrated(deployment: Deployment) -> bool:
     return any(
         binding.semantic.startswith(HOST_SEMANTIC_PREFIX)
         for role in deployment.execution
@@ -266,7 +318,7 @@ def _is_host_orchestrated(deployment: CompiledDeployment) -> bool:
     )
 
 
-def _external_bindings(deployment: CompiledDeployment, direction: str) -> dict[str, list[tuple[str, TensorBinding]]]:
+def _external_bindings(deployment: Deployment, direction: str) -> dict[str, list[tuple[str, TensorBinding]]]:
     bindings: dict[str, list[tuple[str, TensorBinding]]] = {}
     for role in deployment.execution:
         for binding in getattr(deployment.bindings[role], direction):
@@ -297,7 +349,12 @@ def _validate_contract_direction(
                 mismatches.append(f"dtype expected {descriptor.dtype}, actual {binding.dtype}")
             if not _shapes_compatible(binding.shape, descriptor.shape):
                 mismatches.append(f"shape expected {descriptor.shape}, actual {binding.shape}")
-            if binding.layout != descriptor.layout:
+            batch_added_image_layout = (
+                descriptor.layout is None
+                and binding.layout in {"NCHW", "NHWC"}
+                and len(binding.shape) == len(descriptor.shape) + 1
+            )
+            if binding.layout != descriptor.layout and not batch_added_image_layout:
                 mismatches.append(f"layout expected {descriptor.layout}, actual {binding.layout}")
             if mismatches:
                 raise ManifestValidationError(
@@ -307,14 +364,16 @@ def _validate_contract_direction(
 
 
 def _shapes_compatible(actual: tuple[int, ...], expected: tuple[int, ...]) -> bool:
-    return len(actual) == len(expected) and all(
+    if len(actual) < len(expected):
+        return False
+    actual_suffix = actual[-len(expected) :]
+    return all(
         actual_dimension == -1 or expected_dimension == -1 or actual_dimension == expected_dimension
-        for actual_dimension, expected_dimension in zip(actual, expected, strict=True)
+        for actual_dimension, expected_dimension in zip(actual_suffix, expected, strict=True)
     )
 
 
 def _policy_feature_for_semantic(semantic: str, policy: PolicyMetadata) -> PolicyFeature | None:
-    # Tokenizer processors derive these tensors; they are not raw LeRobot input_features.
     if policy.policy_type in {"pi05", "smolvla"} and semantic in {
         "observation.language.tokens",
         "observation.language.attention_mask",

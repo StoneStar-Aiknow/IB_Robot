@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import threading
@@ -551,7 +552,7 @@ class SpeechDirectionPipeline:
         self._output_seq = 0
         self._seg_history = []
 
-    def close(self) -> None:
+    def close(self, *, close_backends: bool = True) -> None:
         """best-effort terminal 关闭：尽力释放 legacy 增强器与 Silero，一个失败仍继续关闭另一个，末尾汇总异常。
 
         重入只在清理已尝试完毕后才直接返回；属 best-effort terminal，非可重试。
@@ -566,10 +567,31 @@ class SpeechDirectionPipeline:
                 if close is None:
                     continue
                 try:
-                    close()
+                    if component is self.speech_gate:
+                        close(close_silero=close_backends)
+                    elif close_backends:
+                        close()
+                    else:
+                        try:
+                            supports_ownership_flag = "close_executor" in inspect.signature(close).parameters
+                        except (TypeError, ValueError):
+                            supports_ownership_flag = False
+                        close_host = getattr(component, "close_host", None)
+                        if callable(close_host):
+                            close_host()
+                        elif supports_ownership_flag:
+                            close(close_executor=False)
                 except Exception as exc:
                     errors.append(str(exc) or type(exc).__name__)
         finally:
+            self._enh_buf4 = np.zeros((0, 4), np.float32)
+            self._prev_block = np.zeros((0, 4), np.float32)
+            self._enh_full4_blocks = []
+            self._enh_full4_total = 0
+            self._seg_scores = []
+            self._seg_rms = []
+            self._seg_sub_rms = []
+            self._seg_history = []
             self._cleanup_complete = True
         if errors:
             raise RuntimeError("; ".join(errors))

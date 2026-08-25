@@ -13,15 +13,19 @@ import pytest
 
 from inference_manifest import load_inference_manifest
 from inference_service.backends import (
-    BACKEND_REGISTRY,
+    STATIC_BACKEND_DESCRIPTORS,
     BackendLoadError,
+    BackendRegistry,
     BackendRegistryError,
     BackendState,
     InferenceRequest,
     RuntimeContext,
 )
-from inference_service.pipeline import MODEL_SESSION_FACTORY_REGISTRY
+from inference_service.runtime_composition import build_policy_runtime_dependencies
+from inference_service.unified_runtime import ModelRuntimeKey
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+
+_STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 
 
 def _make_context(
@@ -409,19 +413,30 @@ def test_torch_backend_rejects_invalid_runtime_options(monkeypatch, tmp_path, ru
 def test_static_registry_marks_torch_as_session_only(tmp_path):
     context = _make_context(tmp_path / "bundle")
 
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
 
     assert descriptor.factory is None
     with pytest.raises(BackendRegistryError) as error:
-        BACKEND_REGISTRY.create(context)
-    assert error.value.code == "backend_factory_unavailable"
+        _STATIC_BACKEND_REGISTRY._create_legacy_backend(context)
+    assert error.value.code == "legacy_backend_unavailable"
 
 
-def test_model_session_factory_registry_routes_torch_policy_without_backend_creation(tmp_path):
-    builder = MODEL_SESSION_FACTORY_REGISTRY.get("act", "torch")
+def test_runtime_assembler_registry_routes_torch_policy_without_backend_creation(tmp_path):
+    dependencies = build_policy_runtime_dependencies()
+    try:
+        descriptor = dependencies.registry_set.runtime_assembler_registry.get(
+            ModelRuntimeKey("policy", "act", "predict", "torch", "request-direct")
+        )
 
-    assert builder is not None
-    assert MODEL_SESSION_FACTORY_REGISTRY.get("unknown", "torch") is None
+        assert descriptor is not None
+        assert (
+            dependencies.registry_set.runtime_assembler_registry.get(
+                ModelRuntimeKey("policy", "unknown", "predict", "torch", "request-direct")
+            )
+            is None
+        )
+    finally:
+        dependencies.providers.close()
 
 
 def test_two_cpu_torch_pipelines_construct_and_serialize_shared_device_domain(monkeypatch, tmp_path):

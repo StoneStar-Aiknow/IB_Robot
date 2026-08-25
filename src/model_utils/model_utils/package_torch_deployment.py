@@ -6,7 +6,14 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from inference_manifest import TorchDeployment, ValidatedManifest
+from inference_manifest import (
+    DeploymentTarget,
+    ExecutionContract,
+    RoleRuntimeProfile,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    ValidatedManifest,
+)
 from model_utils.inference_manifest_export import upsert_deployment
 
 _TORCH_DEVICES = ("cpu", "cuda", "mps", "npu")
@@ -35,7 +42,18 @@ def package_torch_deployments(
         upsert_deployment(
             bundle_root,
             f"{deployment_prefix}-{device}",
-            TorchDeployment(backend="torch", device=device),
+            TorchDeployment(
+                execution_contract=ExecutionContract(
+                    state_scope="request",
+                    execution_structure="direct",
+                    cancellation_granularity="request_boundary",
+                ),
+                runtime_profile=RoleRuntimeProfile(
+                    backend="torch",
+                    target=DeploymentTarget(runtime="torch"),
+                    profile=TorchRuntimeProfile(device=device),
+                ),
+            ),
         )
         for device in selected_devices
     )

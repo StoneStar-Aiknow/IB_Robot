@@ -58,8 +58,6 @@ class FullSubNetConfig:
 
     # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
     ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.tar"))
-    # FullSubNet 静态 om(旧8192/2048回退链路,文件名为 fullsubnet_v6_310p_mixed16.om)
-    om_path: str = field(default_factory=lambda: _model_path("fullsubnet/fullsubnet_v6_310p_mixed16.om"))
     # cumulative stateful T=2 拆分 OM；每次处理512 samples并显式续传FB/SB h/c。
     stateful_fb_om_path: str = field(
         default_factory=lambda: _model_path("fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om")
@@ -72,10 +70,9 @@ class FullSubNetConfig:
     )
     inference_bundle: str = field(default_factory=lambda: _model_path("voice_asr"))
     device_id: int = 0
-    acl_config_path: str = ""
     device: str = "cuda"  # Ubuntu stateful Torch 固定 CUDA；禁止静默回退 CPU
-    # canonical 后端:stateful_raw_acl / stateful_torch_cuda
-    backend: str = "stateful_raw_acl"
+    # ACL is the backend identity; statefulness is selected by the streaming execution path.
+    backend: str = "ascend"
     num_freqs: int = 257
     n_fft: int = 512  # FullSubNet 内部 STFT(固定)
     hop: int = 256
@@ -86,13 +83,13 @@ class FullSubNetConfig:
 class VadConfig:
     """Silero VAD 参数。"""
 
-    # Silero VAD OM 在 310P 使用 raw ACL(文件名 silero_vad_v6_310p_mixed16.om);ONNX 用于 Ubuntu 的相同门控流程。
+    # Silero VAD OM 在 310P 使用 Ascend ACL；ONNX 用于 Ubuntu 的相同门控流程。
     model_path: str = field(default_factory=lambda: _model_path("voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"))
     sample_rate: int = 16000
     frame_size: int = 512  # Silero 子帧 = 32ms @ 16kHz
     input_source: str = "enh_mic1_mono"  # 增强 ch1 单麦
-    # 推理后端:raw_acl(Ascend NPU,默认) 或 onnx(Ubuntu)
-    backend: str = "raw_acl"
+    # 推理后端:ascend(Ascend NPU,默认) 或 onnx(Ubuntu)
+    backend: str = "ascend"
 
 
 @dataclass

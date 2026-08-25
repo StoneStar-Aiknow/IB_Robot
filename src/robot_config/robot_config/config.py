@@ -215,7 +215,7 @@ class VoiceTTSConfig:
     """Typed Voice TTS service configuration managed by robot_config."""
 
     enabled: bool = False
-    bundle_path: str = "models/voice_tts/zipvoice"
+    bundle_path: str = "models/zipvoice"
     deployment: str = ""
     service_name: str = "/voice_tts/synthesize"
     playback_service_name: str = "/voice_tts/play"

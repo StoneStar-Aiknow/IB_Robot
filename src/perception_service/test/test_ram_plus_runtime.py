@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorResult, RuntimeLatency
+from inference_service._legacy_named_tensor import DeploymentIdentity, NamedTensorResult, RuntimeLatency
 from perception_service.ram_plus_adapter import (
     RAM_PLUS_POSTPROCESSING,
     RAM_PLUS_PREPROCESSING,
@@ -19,7 +19,9 @@ def _write_assets(root, preprocessing=RAM_PLUS_PREPROCESSING) -> None:
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "ram_plus",
+                "interface": "tensor_model",
+                "model_type": "ram_plus",
+                "operation": "recognize_tags",
                 "preprocessing": preprocessing,
                 "postprocessing": RAM_PLUS_POSTPROCESSING,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_ram_plus",

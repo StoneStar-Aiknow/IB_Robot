@@ -32,22 +32,18 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment):
             raise BackendLoadError("stateful Ascend sessions require a compiled deployment")
-        if not deployment.state_links:
+        typed_links = deployment.execution_contract.state_links
+        if not typed_links:
             raise BackendLoadError(
                 "stateful Ascend sessions require manifest state_links", code="invalid_state_contract"
             )
-        state_indices = {}
-        for role in deployment.execution:
-            links = deployment.state_links.get(role, ())
-            bindings = deployment.bindings[role]
-            inputs = {binding.semantic: int(binding.index) for binding in bindings.inputs if binding.index is not None}
-            outputs = {
-                binding.semantic: int(binding.index) for binding in bindings.outputs if binding.index is not None
-            }
-            state_indices[role] = tuple((inputs[link.input_semantic], outputs[link.output_semantic]) for link in links)
-        self._state_indices = state_indices
-        super()._load(context, rollback)
-        self._update_loaded_capabilities(resettable=True, stateful=True)
+        # The v3 state-link contract intentionally carries logical ownership,
+        # not runtime tensor names or indices.  The old double-buffer adapter
+        # still needs an explicit ABI binding map; do not infer one from names.
+        raise BackendLoadError(
+            "stateful Ascend tensor-bank execution requires a v3 state-link ABI adapter",
+            code="state_link_abi_adapter_unavailable",
+        )
 
     def _prepare_models(self, deployment: CompiledDeployment, models: Mapping[str, AclModel]) -> None:
         if deployment.device_links:

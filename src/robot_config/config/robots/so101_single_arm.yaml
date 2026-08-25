@@ -148,7 +148,7 @@ robot:
   # MODEL_NOT_READY instead of crashing the pipeline.
   voice_tts:
     enabled: true
-    bundle_path: "models/voice_tts/zipvoice"
+    bundle_path: "models/zipvoice"
     deployment: "ubuntu_onnx"
     service_name: /voice_tts/synthesize
     playback_service_name: /voice_tts/play

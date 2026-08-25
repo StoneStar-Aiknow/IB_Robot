@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from inference_manifest import TensorBinding, TorchDeployment, load_inference_manifest
+from inference_manifest import (
+    DeploymentTarget,
+    ExecutionContract,
+    RoleRuntimeProfile,
+    TensorBinding,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    load_inference_manifest,
+)
+from model_utils.acl_abi_inspection import write_acl_om_abi
 from model_utils.inference_manifest_export import (
     RuntimeABI,
     RuntimeTensor,
@@ -18,7 +27,6 @@ from model_utils.inference_manifest_export import (
     read_tcim_abi,
     refresh_bundle_revision,
     upsert_deployment,
-    write_acl_om_abi,
 )
 from model_utils.package_compiled_deployment import package_compiled_deployment
 from model_utils.package_torch_deployment import package_torch_deployments
@@ -64,12 +72,27 @@ def _act_bindings():
     )
 
 
+def _torch_deployment(device: str = "cpu") -> TorchDeployment:
+    return TorchDeployment(
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="torch",
+            target=DeploymentTarget(runtime="torch"),
+            profile=TorchRuntimeProfile(device=device),
+        ),
+    )
+
+
 def test_upsert_deployment_preserves_existing_deployments_and_structural_identity(tmp_path):
     _create_bundle(tmp_path)
     artifact = tmp_path / "artifacts" / "policy.rknn"
     artifact.parent.mkdir()
     artifact.write_bytes(b"rknn")
-    torch_deployment = TorchDeployment(backend="torch", device="cpu")
+    torch_deployment = _torch_deployment()
     with pytest.raises(ValueError, match="model.safetensors"):
         upsert_deployment(tmp_path, "cpu", torch_deployment)
 
@@ -111,11 +134,10 @@ def test_upsert_deployment_preserves_uuid_and_automatically_revises_structural_c
 
     first = upsert_deployment(tmp_path, "rknn", deployment)
     no_op = upsert_deployment(tmp_path, "rknn", deployment)
-    changed = upsert_deployment(
-        tmp_path,
-        "rknn",
-        deployment.model_copy(update={"target": deployment.target.model_copy(update={"runtime": "rknn-lite2-2.3"})}),
+    changed_profile = deployment.runtime_profile.model_copy(
+        update={"target": deployment.runtime_profile.target.model_copy(update={"runtime": "rknn-lite2-2.3"})}
     )
+    changed = upsert_deployment(tmp_path, "rknn", deployment.model_copy(update={"runtime_profile": changed_profile}))
 
     assert no_op.deployment.uuid == first.deployment.uuid
     assert no_op.deployment.revision == first.deployment.revision
@@ -127,7 +149,7 @@ def test_upsert_deployment_preserves_uuid_and_automatically_revises_structural_c
 def test_refresh_bundle_revision_preserves_uuid_and_changes_deployment_fingerprint(tmp_path):
     _create_bundle(tmp_path)
     (tmp_path / "model.safetensors").write_bytes(b"weights")
-    first = upsert_deployment(tmp_path, "cpu", TorchDeployment(backend="torch", device="cpu"))
+    first = upsert_deployment(tmp_path, "cpu", _torch_deployment())
     config_path = tmp_path / "config.json"
     config_path.write_text(config_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
 
@@ -371,8 +393,8 @@ def test_write_acl_om_abi_lazily_uses_runtime_descriptor(tmp_path, monkeypatch):
         mdl = FakeModel()
 
         @staticmethod
-        def init():
-            calls.append(("init",))
+        def init(config_path=None):
+            calls.append(("init", config_path))
             return 0
 
         @staticmethod
@@ -380,17 +402,113 @@ def test_write_acl_om_abi_lazily_uses_runtime_descriptor(tmp_path, monkeypatch):
             calls.append(("finalize",))
             return 0
 
-    monkeypatch.setattr("model_utils.inference_manifest_export.importlib.import_module", lambda name: FakeACL())
+    monkeypatch.setattr("model_utils.acl_abi_inspection.importlib.import_module", lambda name: FakeACL())
 
     output = write_acl_om_abi(model, tmp_path / "model.om.abi.json")
     abi = read_runtime_abi(output)
 
     assert abi.inputs == (RuntimeTensor("image", 0, "float16", (1, 3, 16, 24)),)
     assert abi.outputs == (RuntimeTensor("action", 0, "float32", (1, 2, 8)),)
-    assert calls[0] == ("init",)
+    assert calls[0] == ("init", None)
     assert ("create_context", 0) in calls
     assert ("destroy_context", "context") in calls
     assert calls[-1] == ("finalize",)
+
+
+def test_acl_config_path_is_limited_to_offline_abi_inspection(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeACL:
+        class rt:
+            @staticmethod
+            def set_device(_device_id):
+                return 0
+
+            @staticmethod
+            def reset_device(_device_id):
+                return 0
+
+            @staticmethod
+            def create_context(_device_id):
+                return "context", 0
+
+            @staticmethod
+            def set_context(_context):
+                return 0
+
+            @staticmethod
+            def destroy_context(_context):
+                return 0
+
+        class mdl:
+            @staticmethod
+            def load_from_file(_path):
+                return 1, 0
+
+            @staticmethod
+            def create_desc():
+                return object()
+
+            @staticmethod
+            def get_desc(_descriptor, _model_id):
+                return 0
+
+            @staticmethod
+            def get_num_inputs(_descriptor):
+                return 1
+
+            @staticmethod
+            def get_num_outputs(_descriptor):
+                return 1
+
+            @staticmethod
+            def get_input_name_by_index(_descriptor, _index):
+                return "input"
+
+            @staticmethod
+            def get_output_name_by_index(_descriptor, _index):
+                return "output"
+
+            @staticmethod
+            def get_input_dims(_descriptor, _index):
+                return {"dims": [1]}, 0
+
+            @staticmethod
+            def get_output_dims(_descriptor, _index):
+                return {"dims": [1]}, 0
+
+            @staticmethod
+            def get_input_data_type(_descriptor, _index):
+                return 0
+
+            @staticmethod
+            def get_output_data_type(_descriptor, _index):
+                return 0
+
+            @staticmethod
+            def destroy_desc(_descriptor):
+                return 0
+
+            @staticmethod
+            def unload(_model_id):
+                return 0
+
+        @staticmethod
+        def init(config_path=None):
+            calls.append(config_path)
+            return 0
+
+        @staticmethod
+        def finalize():
+            return 0
+
+    model = tmp_path / "model.om"
+    model.write_bytes(b"om")
+    monkeypatch.setattr("model_utils.acl_abi_inspection.importlib.import_module", lambda _name: FakeACL)
+
+    write_acl_om_abi(model, tmp_path / "abi.json", acl_config_path="inspection.json")
+
+    assert calls == ["inspection.json"]
 
 
 def test_write_acl_om_abi_explains_missing_acl_runtime(tmp_path, monkeypatch):
@@ -400,7 +518,7 @@ def test_write_acl_om_abi_explains_missing_acl_runtime(tmp_path, monkeypatch):
     def missing_acl(name):
         raise ModuleNotFoundError(name)
 
-    monkeypatch.setattr("model_utils.inference_manifest_export.importlib.import_module", missing_acl)
+    monkeypatch.setattr("model_utils.acl_abi_inspection.importlib.import_module", missing_acl)
 
     with pytest.raises(RuntimeError, match="source the CANN environment or provide a pre-generated"):
         write_acl_om_abi(om_path, tmp_path / "policy.om.abi.json")
@@ -470,12 +588,12 @@ def test_upsert_deployment_restores_previous_manifest_on_strict_validation_failu
 def test_manifest_writer_preserves_existing_mode_and_uses_readable_default(tmp_path):
     _create_bundle(tmp_path)
     (tmp_path / "model.safetensors").write_bytes(b"weights")
-    first = upsert_deployment(tmp_path, "cpu", TorchDeployment(backend="torch", device="cpu"))
+    first = upsert_deployment(tmp_path, "cpu", _torch_deployment())
     path = first.manifest_path
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
     path.chmod(0o640)
-    upsert_deployment(tmp_path, "cuda", TorchDeployment(backend="torch", device="cuda"))
+    upsert_deployment(tmp_path, "cuda", _torch_deployment("cuda"))
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 

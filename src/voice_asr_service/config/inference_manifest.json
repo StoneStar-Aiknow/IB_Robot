@@ -26,7 +26,52 @@
           "path": "artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
         }
       },
-      "backend": "ascend",
+      "execution_contract": {
+        "state_scope": "stream",
+        "execution_structure": "direct",
+        "cancellation_granularity": "checkpoint",
+        "stateful": true,
+        "state_links": [
+          {
+            "role": "__runtime__",
+            "state_name": "hidden",
+            "owner": "session",
+            "source": "state.hidden_in",
+            "target": "state.hidden_out",
+            "scope": "runtime",
+            "state_bank": "fullsubnet_fb.bank"
+          },
+          {
+            "role": "__runtime__",
+            "state_name": "cell",
+            "owner": "session",
+            "source": "state.cell_in",
+            "target": "state.cell_out",
+            "scope": "runtime",
+            "state_bank": "fullsubnet_fb.bank"
+          },
+          {
+            "role": "__runtime__",
+            "state_name": "hidden",
+            "owner": "session",
+            "source": "state.hidden_in",
+            "target": "state.hidden_out",
+            "scope": "runtime",
+            "state_bank": "fullsubnet_sb.bank"
+          },
+          {
+            "role": "__runtime__",
+            "state_name": "cell",
+            "owner": "session",
+            "source": "state.cell_in",
+            "target": "state.cell_out",
+            "scope": "runtime",
+            "state_bank": "fullsubnet_sb.bank"
+          }
+        ],
+        "state_bank_mode": "runtime_exclusive",
+        "max_open_streams": 1
+      },
       "bindings": {
         "fullsubnet_fb": {
           "inputs": [
@@ -167,35 +212,25 @@
         "fullsubnet_sb"
       ],
       "revision": 2,
-      "state_links": {
-        "fullsubnet_fb": [
-          {
-            "input_semantic": "host.fullsubnet.fb_hidden_in",
-            "output_semantic": "host.fullsubnet.fb_hidden_out",
-            "initialization": "zero"
-          },
-          {
-            "input_semantic": "host.fullsubnet.fb_cell_in",
-            "output_semantic": "host.fullsubnet.fb_cell_out",
-            "initialization": "zero"
-          }
-        ],
-        "fullsubnet_sb": [
-          {
-            "input_semantic": "host.fullsubnet.sb_hidden_in",
-            "output_semantic": "host.fullsubnet.sb_hidden_out",
-            "initialization": "zero"
-          },
-          {
-            "input_semantic": "host.fullsubnet.sb_cell_in",
-            "output_semantic": "host.fullsubnet.sb_cell_out",
-            "initialization": "zero"
-          }
-        ]
+      "role_identities": {
+        "fullsubnet_fb": {
+          "interface": "tensor_model",
+          "model_type": "fullsubnet",
+          "operation": "enhance"
+        }
       },
-      "target": {
-        "runtime": "raw_acl",
-        "soc": "Ascend310P1"
+      "role_runtime_profiles": {
+        "fullsubnet_fb": {
+          "backend": "ascend",
+          "target": {
+            "runtime": "acl",
+            "runtime_abi": "cann-8.1.RC1",
+            "soc": "Ascend310P1"
+          },
+          "profile": {
+            "device_id": 0
+          }
+        }
       },
       "uuid": "a6e75684-e26c-4b0d-8f1d-dcb20c438489"
     },
@@ -206,7 +241,25 @@
           "path": "artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om"
         }
       },
-      "backend": "ascend",
+      "execution_contract": {
+        "state_scope": "stream",
+        "execution_structure": "direct",
+        "cancellation_granularity": "checkpoint",
+        "stateful": true,
+        "state_links": [
+          {
+            "role": "silero_vad",
+            "state_name": "hidden",
+            "owner": "session",
+            "source": "state.hidden_in",
+            "target": "state.hidden_out",
+            "scope": "runtime",
+            "state_bank": "silero_vad.bank"
+          }
+        ],
+        "state_bank_mode": "runtime_exclusive",
+        "max_open_streams": 1
+      },
       "bindings": {
         "silero_vad": {
           "inputs": [
@@ -258,24 +311,33 @@
         "silero_vad"
       ],
       "revision": 2,
-      "state_links": {
-        "silero_vad": [
-          {
-            "input_semantic": "host.silero.state_in",
-            "output_semantic": "host.silero.state_out",
-            "initialization": "zero"
-          }
-        ]
+      "role_identities": {
+        "silero_vad": {
+          "interface": "tensor_model",
+          "model_type": "silero_vad",
+          "operation": "vad"
+        }
       },
-      "target": {
-        "runtime": "raw_acl",
-        "soc": "Ascend310P1"
+      "role_runtime_profiles": {
+        "silero_vad": {
+          "backend": "ascend",
+          "target": {
+            "runtime": "acl",
+            "runtime_abi": "cann-8.1.RC1",
+            "soc": "Ascend310P1"
+          },
+          "profile": {
+            "device_id": 0
+          }
+        }
       },
       "uuid": "6a4d7a7d-5fb8-4b60-8bce-79f0003315b4"
     }
   },
   "model": {
-    "family": "fullsubnet_cumulative_stateful",
+    "interface": "tensor_model",
+    "model_type": "speech_direction",
+    "operation": "enhance_and_vad",
     "inputs": [
       {
         "dtype": "float32",
@@ -286,7 +348,6 @@
         ]
       }
     ],
-    "kind": "perception",
     "outputs": [
       {
         "dtype": "float32",
@@ -305,10 +366,10 @@
       }
     ],
     "semantic_identity": {
-      "logical_model_revision": "fullsubnet_cumulative_stateful@v1",
+      "logical_model_revision": "fullsubnet@cumulative-218epochs-v1",
       "output_semantics": "cirm_decompressed_ola",
       "preprocessing_contract": "cumulative_laplace_norm"
     }
   },
-  "schema_version": 2
+  "schema_version": 3
 }

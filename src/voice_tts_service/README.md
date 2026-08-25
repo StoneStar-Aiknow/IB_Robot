@@ -75,7 +75,9 @@ ros2 launch voice_tts_service voice_tts.launch.py \
 ```text
 SynthesizeSpeech 请求
   -> 请求校验与文本分段
-  -> 通用宿主加载所选 deployment
+  -> ModelRequest + ExecutionContext
+  -> ModelRuntimeHandle.execute
+  -> 启动时加载并常驻的 ZipVoice ModelSession resource
   -> ZipVoice tokenizer
   -> Text Encoder OM
   -> Flow Decoder OM（主机侧 4-step Euler）
@@ -94,7 +96,9 @@ PlayAudioFile 请求（播放端本机绝对路径）
   -> success / error_code / message
 ```
 
-公共 `ModelSession` 串行执行模型推理，并统一管理准入、健康状态、失败状态和关闭等待。
+`ZipVoiceSynthesizePlugin` 把 `ModelSession` resource 放入 `RuntimeAssembly`，再将所有权转移给
+`ModelRuntimeHandle`。Handle 串行准入请求并管理公开生命周期、健康状态、取消和关闭等待；session 只持有
+并释放 ZipVoice 的 vendor 模型与设备资源。
 
 ## 4. ROS 接口
 
@@ -151,22 +155,23 @@ ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
 
 | 阶段 | 类型 | 行为 |
 | --- | --- | --- |
-| 节点启动 | 通用 model service host | 校验 bundle 并加载 plugin/session |
-| 节点退出 | 通用 model service host | 关闭 plugin/session 并释放模型资源 |
+| 节点启动 | 通用宿主 + TTS plugin | 校验 bundle，构造 session、`RuntimeAssembly` 和 handle，并调用 `handle.load()` |
+| 节点退出 | plugin 的 `ModelRuntimeHandle` | 停止准入、等待 active inference，并关闭 assembly-owned session resource |
 
 生命周期如下：
 
 ```text
-节点启动 -> 通用宿主校验 bundle 并加载 plugin/session
-synthesize -> 复用常驻模型
-节点退出 -> 释放 OM、ACL lease、Vocos、tokenizer 和 prompt
+节点启动 -> 通用宿主校验 bundle -> plugin 构造 RuntimeAssembly/ModelRuntimeHandle -> handle.load()
+synthesize -> handle.execute(ModelRequest, ExecutionContext) -> 复用常驻 ModelSession resource
+节点退出 -> handle.close() -> session 释放 OM、ACL lease、Vocos、tokenizer 和 prompt
 ```
 
-模型准入与资源释放由公共 `ModelSession` 管理，宿主关闭 plugin 时等待推理结束并释放 session。
+模型准入、公开生命周期、健康、取消和关闭 drain 由 `ModelRuntimeHandle` 管理。`ModelSession` 是
+handle-owned resource，负责 ZipVoice vendor 资源的加载、执行与释放；宿主关闭 plugin 时由 handle 等待推理结束。
 
 `exit_on_init_failure=false`（对应通用宿主的 `required=false`）只保证初始化失败后 typed endpoint 继续在线并
 返回 `MODEL_NOT_READY`。当前宿主不会在后续请求中自动重试初始化；修复 bundle、依赖或设备后必须重启节点。
-`INVALID_TEXT`、`UNSUPPORTED_PROMPT` 等请求级错误不会改变 session 健康状态，也不会阻塞后续有效请求。
+`INVALID_TEXT`、`UNSUPPORTED_PROMPT` 等请求级错误不会改变 handle 健康状态，也不会阻塞后续有效请求。
 
 ## 5. 模型 bundle 与 deployment
 
@@ -174,14 +179,14 @@ synthesize -> 复用常驻模型
 `WORKSPACE` 为根目录解析。例如：
 
 ```yaml
-bundle_path: models/voice_tts/zipvoice
+bundle_path: models/zipvoice
 deployment: ascend_310p
 ```
 
 对应模型目录为：
 
 ```text
-$WORKSPACE/models/voice_tts/zipvoice/
+$WORKSPACE/models/zipvoice/
 ├── inference_manifest.json
 ├── assets/
 │   └── ...
@@ -191,9 +196,8 @@ $WORKSPACE/models/voice_tts/zipvoice/
 
 bundle 必须满足：
 
-- manifest schema 为 v2。
-- `model.kind` 为 `generic`。
-- `model.family` 为 `zipvoice`。
+- manifest schema 为 v3。
+- 模型身份为 `interface=tensor_model`、`model_type=zipvoice`、`operation=synthesize`。
 - `deployment` 必须是 manifest 中存在的命名 deployment。
 
 ### 5.1 已验证的 deployment
@@ -221,7 +225,7 @@ source .shrc_local
 ZIPVOICE_SOURCE_DIR=/path/to/zipvoice-delivery
 ros2 run voice_tts_service package_zipvoice_310p \
   --source "$ZIPVOICE_SOURCE_DIR" \
-  --destination "$WORKSPACE/models/voice_tts/zipvoice"
+  --destination "$WORKSPACE/models/zipvoice"
 ```
 
 打包工具会校验 Text Encoder OM、Flow Decoder OM、Vocos checkpoint、token table 和默认 prompt，并生成
@@ -239,7 +243,7 @@ ros2 run voice_tts_service package_zipvoice_310p \
 ```yaml
 voice_tts:
   enabled: true
-  bundle_path: models/voice_tts/zipvoice
+  bundle_path: models/zipvoice
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
@@ -292,8 +296,10 @@ voice_tts:
 - ASCII 英文单词会明确失败。
 - 使用 bundle 中的固定默认 prompt，不支持请求级音色克隆。
 
-`ZipVoiceAscendSession` 继承公共 `AscendOmModelSession`，通过标准 `session.infer()` 复用 ACL lease、OM 资源、
-准入、健康状态和关闭等待，不会在同一进程中重复初始化全局 ACL。
+`ZipVoiceAscendSession` 继承公共 `AscendOmModelSession`，作为 `RuntimeAssembly` 中的 `ModelSession`
+resource 持有 ACL lease、OM、Vocos、tokenizer 和 prompt。Plugin 调用
+`ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)`；handle 负责准入、生命周期、健康、取消和关闭等待，
+session 负责 vendor 资源，不会在同一进程中重复初始化全局 ACL。
 
 ## 8. 稳定错误码
 
@@ -305,7 +311,7 @@ voice_tts:
 | `PROMPT_TOO_LARGE` | 参考音频超过字节数或时长上限 |
 | `REQUEST_TOO_LARGE` | 文本或分段数量超过请求上限 |
 | `RESPONSE_TOO_LARGE` | 合成音频超过响应字节上限 |
-| `MODEL_NOT_READY` | bundle、deployment 或模型 session 加载失败 |
+| `MODEL_NOT_READY` | bundle、deployment 或模型 runtime 加载失败 |
 | `INFERENCE_FAILED` | 模型推理失败 |
 | `INVALID_AUDIO_OUTPUT` | 模型输出为空或包含 NaN/Inf |
 | `UNSUPPORTED_PROMPT` | 所选 deployment 不支持请求级音色克隆 |

@@ -16,7 +16,6 @@ from inference_manifest import (
     ManifestPathError,
     ManifestValidationError,
     SemanticIdentity,
-    StateLink,
     canonical_bundle_digest,
     canonical_manifest_bytes,
     canonical_semantic_identity_json,
@@ -80,9 +79,9 @@ def test_schema_version_unknown_fields_aliases_and_duplicate_json_keys(tmp_path)
     paths = create_policy_bundle(tmp_path)
     manifest = make_manifest(tmp_path, paths)
 
-    manifest["schema_version"] = 3
+    manifest["schema_version"] = 2
     write_manifest(tmp_path, manifest)
-    with pytest.raises(ManifestValidationError, match=r"Unsupported schema_version 3.*inference_manifest.json"):
+    with pytest.raises(ManifestValidationError, match=r"unsupported schema_version 2.*inference_manifest.json"):
         load_inference_manifest(tmp_path, "cpu")
 
     manifest = make_manifest(tmp_path, paths)
@@ -92,13 +91,13 @@ def test_schema_version_unknown_fields_aliases_and_duplicate_json_keys(tmp_path)
         load_inference_manifest(tmp_path, "cpu")
 
     manifest = make_manifest(tmp_path, paths)
-    manifest["deployments"]["cpu"] = {"backend": "ascend_om", "device": "cpu"}
+    manifest["deployments"]["cpu"]["runtime_profile"]["target"]["runtime"] = "ascend_om"
     write_manifest(tmp_path, manifest)
     with pytest.raises(ManifestValidationError, match="ascend_om"):
         load_inference_manifest(tmp_path, "cpu")
 
     (tmp_path / "inference_manifest.json").write_text(
-        '{"schema_version":2,"schema_version":2}',
+        '{"schema_version":3,"schema_version":3}',
         encoding="utf-8",
     )
     with pytest.raises(ManifestValidationError, match="duplicate JSON key 'schema_version'"):
@@ -121,44 +120,52 @@ def test_schema_v1_requires_regeneration(tmp_path):
         artifact["sha256"] = "2" * 64
     write_manifest(tmp_path, manifest)
 
-    with pytest.raises(ManifestValidationError, match="unsupported.*rerun the owning exporter or packager"):
+    with pytest.raises(ManifestValidationError, match=r"unsupported schema_version 1.*supported versions"):
         load_inference_manifest(tmp_path, "rk3588")
 
 
-def test_historical_v2_deployment_fingerprint_is_stable_without_state_links() -> None:
-    deployment = CompiledDeployment.model_validate_json(
-        json.dumps(
-            {
-                "uuid": "123e4567-e89b-42d3-a456-426614174001",
-                "revision": 1,
-                "backend": "ascend",
-                "target": {"soc": "Ascend310P1", "runtime": "raw_acl"},
-                "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
-                "execution": ["model"],
-                "bindings": {
-                    "model": {
-                        "inputs": [{"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]}],
-                        "outputs": [{"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]}],
-                    }
-                },
-            }
+def test_historical_v2_deployment_is_rejected_before_typed_construction() -> None:
+    with pytest.raises(Exception, match="execution_contract"):
+        CompiledDeployment.model_validate_json(
+            json.dumps(
+                {
+                    "uuid": "123e4567-e89b-42d3-a456-426614174001",
+                    "revision": 1,
+                    "backend": "ascend",
+                    "target": {"soc": "Ascend310P1", "runtime": "acl"},
+                }
+            )
         )
-    )
-
-    assert deployment.state_links is None
-    assert "state_links" not in deployment.model_dump(mode="json", exclude_none=True)
-    assert (
-        deployment_fingerprint(2, "0" * 64, "ascend", deployment)
-        == "1e7fa50bcf609ff928aa0386872a0aec23ad3f33419f5b607758289b8dc96888"
-    )
 
 
 def _stateful_deployment() -> dict:
     return {
         "uuid": "123e4567-e89b-42d3-a456-426614174001",
         "revision": 1,
-        "backend": "ascend",
-        "target": {"soc": "Ascend310P1", "runtime": "raw_acl"},
+        "execution_contract": {
+            "state_scope": "stream",
+            "execution_structure": "direct",
+            "cancellation_granularity": "checkpoint",
+            "stateful": True,
+            "state_links": [
+                {
+                    "role": "model",
+                    "state_name": "recurrent.state",
+                    "owner": "session",
+                    "source": "state.in",
+                    "target": "state.out",
+                    "scope": "runtime",
+                    "state_bank": "model.bank",
+                }
+            ],
+            "state_bank_mode": "runtime_exclusive",
+            "max_open_streams": 1,
+        },
+        "runtime_profile": {
+            "backend": "ascend",
+            "target": {"soc": "Ascend310P1", "runtime": "acl"},
+            "profile": {"device_id": 0},
+        },
         "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
         "execution": ["model"],
         "bindings": {
@@ -173,30 +180,14 @@ def _stateful_deployment() -> dict:
                 ],
             }
         },
-        "state_links": {
-            "model": [
-                {
-                    "input_semantic": "host.state_in",
-                    "output_semantic": "host.state_out",
-                    "initialization": "zero",
-                }
-            ]
-        },
     }
 
 
 def test_state_links_pair_host_state_by_semantic() -> None:
     deployment = CompiledDeployment.model_validate_json(json.dumps(_stateful_deployment()))
 
-    assert deployment.state_links == {
-        "model": (
-            StateLink(
-                input_semantic="host.state_in",
-                output_semantic="host.state_out",
-                initialization="zero",
-            ),
-        )
-    }
+    assert deployment.execution_contract.state_links[0].role == "model"
+    assert deployment.execution_contract.state_links[0].state_bank == "model.bank"
 
 
 def test_state_links_may_cover_only_stateful_execution_roles() -> None:
@@ -210,41 +201,20 @@ def test_state_links_may_cover_only_stateful_execution_roles() -> None:
 
     deployment = CompiledDeployment.model_validate_json(json.dumps(value))
 
-    assert set(deployment.state_links) == {"model"}
+    assert {link.role for link in deployment.execution_contract.state_links} == {"model"}
     assert deployment.execution == ("model", "stateless")
 
 
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        (lambda value: value.update(state_links={}), "must be omitted instead of empty"),
-        (lambda value: value["state_links"].update(unknown=value["state_links"].pop("model")), "unknown execution"),
+        (lambda value: value["execution_contract"].update(state_bank_mode="per_stream"), "scope='stream'"),
+        (lambda value: value["execution_contract"].update(max_open_streams=2), "max_open_streams=1"),
         (
-            lambda value: value["state_links"]["model"][0].update(input_semantic="host.missing"),
-            "declared input/output semantics",
+            lambda value: value["execution_contract"]["state_links"][0].update(state_name="device-3-bank"),
+            "invalid_state_link_identifier",
         ),
-        (
-            lambda value: value["bindings"]["model"]["outputs"][1].update(shape=[1, 8]),
-            "changes dtype or shape",
-        ),
-        (
-            lambda value: value["state_links"]["model"].append(value["state_links"]["model"][0].copy()),
-            "reuse a state input or output",
-        ),
-        (
-            lambda value: value.update(
-                device_links=[
-                    {
-                        "semantic": "internal.state",
-                        "producer": "model",
-                        "consumer": "model",
-                        "transport": "device_pointer",
-                        "owner": "producer",
-                    }
-                ]
-            ),
-            "cannot be combined with device_links",
-        ),
+        (lambda value: value["execution_contract"].update(state_scope="request"), "request execution"),
     ],
 )
 def test_state_links_reject_invalid_contracts(mutation, expected) -> None:
@@ -260,31 +230,24 @@ def test_missing_manifest_fails_before_bundle_metadata_loading(tmp_path):
         load_inference_manifest(tmp_path, "cpu")
 
 
-def test_legacy_and_explicit_policy_manifests_retain_strict_lerobot_validation(tmp_path):
+def test_v3_policy_manifests_retain_strict_lerobot_validation(tmp_path):
     paths = create_policy_bundle(tmp_path)
-    legacy = make_manifest(tmp_path, paths)
-    write_manifest(tmp_path, legacy)
+    manifest = make_manifest(tmp_path, paths)
+    write_manifest(tmp_path, manifest)
 
-    legacy_validated = load_inference_manifest(tmp_path, "cpu")
-    assert legacy_validated.manifest.model.kind == "policy"
-    assert legacy_validated.manifest.model.family == "lerobot"
-    assert legacy_validated.policy is not None
+    validated = load_inference_manifest(tmp_path, "cpu")
+    assert validated.manifest.model.interface == "policy"
+    assert validated.manifest.model.model_type == "act"
+    assert validated.manifest.model.operation == "predict"
+    assert validated.policy is not None
 
-    explicit = copy.deepcopy(legacy)
-    explicit["model"] = {"kind": "policy", "family": "act", "inputs": [], "outputs": []}
-    write_manifest(tmp_path, explicit)
-    explicit_validated = load_inference_manifest(tmp_path, "cpu")
-    assert explicit_validated.manifest.model.family == "act"
-    assert explicit_validated.policy.policy_type == "act"
-    assert explicit_validated.fingerprint == legacy_validated.fingerprint
-
-    mismatched = copy.deepcopy(explicit)
-    mismatched["model"]["family"] = "smolvla"
+    mismatched = copy.deepcopy(manifest)
+    mismatched["model"]["model_type"] = "smolvla"
     write_manifest(tmp_path, mismatched)
-    with pytest.raises(ManifestValidationError, match=r"family 'smolvla'.*policy type 'act'"):
+    with pytest.raises(ManifestValidationError, match=r"model_type 'smolvla'.*LeRobot config type 'act'"):
         load_inference_manifest(tmp_path, "cpu")
 
-    write_manifest(tmp_path, explicit)
+    write_manifest(tmp_path, manifest)
     (tmp_path / "policy_preprocessor.json").unlink()
     with pytest.raises(ManifestPathError, match="policy_preprocessor.json"):
         load_inference_manifest(tmp_path, "cpu")
@@ -296,7 +259,7 @@ def test_unknown_model_kind_is_rejected(tmp_path):
     manifest["model"]["kind"] = "detector"
     write_manifest(tmp_path, manifest)
 
-    with pytest.raises(ManifestValidationError, match=r"model.kind.*detector"):
+    with pytest.raises(ManifestValidationError, match=r"model.*kind"):
         load_inference_manifest(tmp_path, "ascend")
 
 
@@ -383,8 +346,8 @@ def test_compiled_non_policy_bundle_accepts_declared_semantic_outputs(tmp_path, 
     validated = load_inference_manifest(tmp_path, "ascend")
 
     assert validated.policy is None
-    assert validated.manifest.model.kind == "perception"
-    assert validated.manifest.model.family == "ram_plus"
+    assert validated.manifest.model.interface == "tensor_model"
+    assert validated.manifest.model.model_type == "ram_plus"
     assert validated.manifest.model.outputs[0].semantic == output_semantic
     assert validated.deployment.bindings["model"].outputs[0].semantic == output_semantic
     assert not (tmp_path / "config.json").exists()
@@ -399,8 +362,16 @@ def test_torch_non_policy_bundle_does_not_require_lerobot_files(tmp_path):
     manifest["deployments"]["cpu"] = {
         "uuid": manifest["deployments"]["cpu"]["uuid"],
         "revision": 1,
-        "backend": "torch",
-        "device": "cpu",
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "direct",
+            "cancellation_granularity": "request_boundary",
+        },
+        "runtime_profile": {
+            "backend": "torch",
+            "target": {"runtime": "torch"},
+            "profile": {"device": "cpu"},
+        },
     }
     write_manifest(tmp_path, manifest)
 
@@ -416,7 +387,7 @@ def test_compiled_policy_bundle_still_requires_action_output(tmp_path):
     manifest["deployments"]["rk3588"]["bindings"]["policy"]["outputs"][0]["semantic"] = "tag_logits"
     write_manifest(tmp_path, manifest)
 
-    with pytest.raises(ManifestValidationError, match="policy deployment must declare an action output"):
+    with pytest.raises(ManifestValidationError, match="action"):
         load_inference_manifest(tmp_path, "rk3588")
 
 
@@ -496,7 +467,7 @@ def test_bundle_identity_requires_canonical_uuid_and_positive_integer_revision(t
 def test_removed_backend_aliases_are_rejected(tmp_path, alias):
     paths = create_policy_bundle(tmp_path)
     manifest = make_manifest(tmp_path, paths)
-    manifest["deployments"]["cpu"] = {"backend": alias, "device": "cpu"}
+    manifest["deployments"]["cpu"]["runtime_profile"]["target"]["runtime"] = alias
     write_manifest(tmp_path, manifest)
 
     with pytest.raises(ManifestValidationError, match=alias):
@@ -543,10 +514,18 @@ def test_deployment_fingerprint_is_stable_and_tracks_identity_changes():
     deployment = CompiledDeployment.model_validate_json(
         json.dumps(
             {
-                "backend": "rknn",
                 "uuid": "123e4567-e89b-42d3-a456-426614174001",
                 "revision": 1,
-                "target": {"soc": "rk3588", "runtime": "rknn-lite"},
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "rknn",
+                    "target": {"soc": "rk3588", "runtime": "rknn-lite"},
+                    "profile": {"target_name": "rk3588", "core_mask": 7, "device_id": 0},
+                },
                 "artifacts": {"policy": {"path": "policy.rknn", "format": "rknn"}},
                 "execution": ["policy"],
                 "bindings": {
@@ -573,15 +552,18 @@ def test_deployment_fingerprint_is_stable_and_tracks_identity_changes():
         )
     )
 
-    baseline = deployment_fingerprint(2, "4" * 64, "rk3588", deployment)
-    assert baseline == deployment_fingerprint(2, "4" * 64, "rk3588", deployment)
-    assert baseline != deployment_fingerprint(2, "5" * 64, "rk3588", deployment)
-    assert baseline != deployment_fingerprint(2, "4" * 64, "other", deployment)
+    baseline = deployment_fingerprint(3, "4" * 64, "rk3588", deployment)
+    assert baseline == deployment_fingerprint(3, "4" * 64, "rk3588", deployment)
+    assert baseline != deployment_fingerprint(3, "5" * 64, "rk3588", deployment)
+    assert baseline != deployment_fingerprint(3, "4" * 64, "other", deployment)
 
-    changed = deployment.model_copy(update={"target": deployment.target.model_copy(update={"runtime": "rknn-lite-2"})})
-    assert baseline != deployment_fingerprint(2, "4" * 64, "rk3588", changed)
+    changed_profile = deployment.runtime_profile.model_copy(
+        update={"target": deployment.runtime_profile.target.model_copy(update={"runtime": "rknn-lite-2"})}
+    )
+    changed = deployment.model_copy(update={"runtime_profile": changed_profile})
+    assert baseline != deployment_fingerprint(3, "4" * 64, "rk3588", changed)
     revised = deployment.model_copy(update={"revision": 2})
-    assert baseline != deployment_fingerprint(2, "4" * 64, "rk3588", revised)
+    assert baseline != deployment_fingerprint(3, "4" * 64, "rk3588", revised)
 
 
 def test_device_link_source_defaults_preserve_canonical_identity():
@@ -633,7 +615,7 @@ def test_compiled_execution_bindings_and_feature_compatibility(tmp_path):
     invalid_roles = copy.deepcopy(manifest)
     invalid_roles["deployments"]["rk3588"]["execution"] = ["missing"]
     write_manifest(tmp_path, invalid_roles)
-    with pytest.raises(ManifestValidationError, match="artifact roles must contain every execution role"):
+    with pytest.raises(ManifestValidationError, match="binding roles must exactly match execution roles"):
         load_inference_manifest(tmp_path, "rk3588")
 
     invalid_layout = copy.deepcopy(manifest)
@@ -659,7 +641,7 @@ def test_compiled_deployment_allows_verified_auxiliary_artifacts_and_sparse_outp
     paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
     manifest = make_manifest(tmp_path, paths, deployment_name="hisilicon", compiled=True, backend="hisilicon")
     deployment = manifest["deployments"]["hisilicon"]
-    deployment["target"] = {"soc": "sd3403", "runtime": "hisilicon-worker"}
+    deployment["runtime_profile"]["target"] = {"soc": "sd3403", "runtime": "hisilicon-worker"}
     deployment["artifacts"]["policy"]["format"] = "om"
     deployment["bindings"]["policy"]["outputs"][0]["index"] = 1
 
@@ -837,6 +819,7 @@ def test_rank_four_layout_is_scoped_to_image_semantics(tmp_path):
     image_binding = manifest["deployments"]["rk3588"]["bindings"]["policy"]["inputs"][1]
 
     image_binding["semantic"] = "depth.frame"
+    manifest["model"]["inputs"][1]["semantic"] = "depth.frame"
     del image_binding["layout"]
     write_manifest(tmp_path, manifest)
     validated = load_inference_manifest(tmp_path, "rk3588")
@@ -848,6 +831,7 @@ def test_rank_four_layout_is_scoped_to_image_semantics(tmp_path):
     assert validated.deployment.bindings["policy"].inputs[1].layout == "NCHW"
 
     image_binding["semantic"] = "observation.images.top"
+    manifest["model"]["inputs"][1]["semantic"] = "observation.images.top"
     del image_binding["layout"]
     write_manifest(tmp_path, manifest)
     with pytest.raises(ManifestValidationError, match=r"layout.*required"):
@@ -886,7 +870,12 @@ def test_canonical_writer_is_deterministic_and_replaces_atomically(tmp_path):
     first_content = first.read_bytes()
     assert first_content == canonical_manifest_bytes(manifest)
 
-    reordered = {"deployments": manifest["deployments"], "bundle": manifest["bundle"], "schema_version": 2}
+    reordered = {
+        "deployments": manifest["deployments"],
+        "model": manifest["model"],
+        "bundle": manifest["bundle"],
+        "schema_version": 3,
+    }
     write_inference_manifest(destination, reordered)
     assert destination.read_bytes() == first_content
     assert not list(destination.parent.glob("*.tmp"))

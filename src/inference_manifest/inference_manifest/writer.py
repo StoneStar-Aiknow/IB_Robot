@@ -18,7 +18,12 @@ from inference_manifest.schema import validate_manifest_schema
 
 def canonical_manifest_bytes(manifest: InferenceManifest | dict[str, Any]) -> bytes:
     if isinstance(manifest, InferenceManifest):
-        value = manifest.model_dump(mode="json", exclude_none=True)
+        value = manifest.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+        value["bundle"]["uuid"] = manifest.bundle.uuid
+        value["bundle"]["revision"] = manifest.bundle.revision
+        for name, deployment in manifest.deployments.items():
+            value["deployments"][name]["uuid"] = deployment.uuid
+            value["deployments"][name]["revision"] = deployment.revision
     else:
         value = manifest
     validate_manifest_schema(value, "manifest writer input")
@@ -26,7 +31,15 @@ def canonical_manifest_bytes(manifest: InferenceManifest | dict[str, Any]) -> by
         typed = InferenceManifest.model_validate_json(json.dumps(value, ensure_ascii=False))
     except ValidationError as exc:
         raise ManifestValidationError(f"Typed manifest validation failed for writer input: {exc}") from exc
-    canonical = typed.model_dump(mode="json", exclude_none=True)
+    canonical = typed.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+    # UUID/revision are stable publication identity, even when a Pydantic
+    # default supplied them during construction.  Keep them explicit in the
+    # wire manifest while omitting non-semantic execution defaults.
+    canonical["bundle"]["uuid"] = typed.bundle.uuid
+    canonical["bundle"]["revision"] = typed.bundle.revision
+    for name, deployment in typed.deployments.items():
+        canonical["deployments"][name]["uuid"] = deployment.uuid
+        canonical["deployments"][name]["revision"] = deployment.revision
     return json.dumps(canonical, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
 
 

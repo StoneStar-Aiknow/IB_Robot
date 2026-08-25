@@ -28,8 +28,9 @@ def test_torch_packager_writes_strict_cuda_identity_bundle(tmp_path):
     package_graspgen_torch_bundle(root, source_root=source)
 
     validated = load_inference_manifest(root, "torch_cuda")
-    assert validated.manifest.model.kind == "perception"
-    assert validated.manifest.model.family == "graspgen"
+    assert validated.manifest.model.interface == "tensor_model"
+    assert validated.manifest.model.model_type == "graspgen"
+    assert validated.manifest.model.operation == "generate_grasps"
     assert validated.manifest.model.outputs[0].shape == (-1, 4, 4)
     assert validated.manifest.model.outputs[1].shape == (-1,)
     assert validated.deployment.device == "cuda"

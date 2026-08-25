@@ -27,7 +27,7 @@ def _bundle(root: Path) -> Path:
     marker.write_text("dummy-echo", encoding="utf-8")
     entry = BundleFile(path=marker.name)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": "123e4567-e89b-42d3-a456-426614174000",
             "revision": 1,
@@ -40,8 +40,9 @@ def _bundle(root: Path) -> Path:
             },
         },
         "model": {
-            "kind": "perception",
-            "family": "dummy_echo",
+            "interface": "tensor_model",
+            "model_type": "dummy_echo",
+            "operation": "echo",
             "inputs": [{"semantic": "echo.input", "dtype": "float32", "shape": [2]}],
             "outputs": [{"semantic": "echo.output", "dtype": "float32", "shape": [2]}],
             "semantic_identity": {
@@ -54,8 +55,16 @@ def _bundle(root: Path) -> Path:
             "cpu": {
                 "uuid": "123e4567-e89b-42d3-a456-426614174001",
                 "revision": 1,
-                "backend": "torch",
-                "device": "cpu",
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "torch",
+                    "target": {"runtime": "torch"},
+                    "profile": {"device": "cpu"},
+                },
             }
         },
     }

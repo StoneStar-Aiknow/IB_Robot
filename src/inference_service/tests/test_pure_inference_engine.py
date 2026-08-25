@@ -18,7 +18,6 @@ from inference_service.backends import (
     BackendCapabilities,
     BackendDescriptor,
     BackendRegistry,
-    BackendResult,
     ConformanceEvidence,
     InferenceRequest,
     LifecycleBackend,
@@ -26,6 +25,7 @@ from inference_service.backends import (
     ResourceDomainAdmissions,
     RuntimeContext,
 )
+from inference_service.backends._legacy import BackendResult
 from inference_service.core.pure_inference_engine import PureInferenceEngine
 from inference_service.distributed import DistributedProtocolError, Operation, StructuredError
 from inference_service.pipeline_policy_node import (
@@ -1082,7 +1082,7 @@ def _registry(monkeypatch, created: list[_FacadeBackend]) -> BackendRegistry:
             "torch": BackendDescriptor(
                 name="torch",
                 factory="tests.pure_facade_backend:create_backend",
-                supported_policy_families=frozenset({"act"}),
+                supported_identities=frozenset({("policy", "act", "predict")}),
                 conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
                 target_validator=lambda deployment: None,
             )

@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from conftest import GRASPGEN_DEPLOYMENT
 
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorResult, RuntimeLatency
+from inference_service._legacy_named_tensor import DeploymentIdentity, NamedTensorResult, RuntimeLatency
 from perception_service.graspgen_adapter import (
     GRASPGEN_POSTPROCESSING,
     GRASPGEN_PREPROCESSING,
@@ -31,7 +31,9 @@ from perception_service.graspgen_adapter import (
 )
 
 _ASSETS = {
-    "family": "graspgen",
+    "interface": "tensor_model",
+    "model_type": "graspgen",
+    "operation": "generate_grasps",
     "preprocessing": GRASPGEN_PREPROCESSING,
     "postprocessing": GRASPGEN_POSTPROCESSING,
     "kappa": 2.0,
@@ -62,7 +64,7 @@ def _result(poses: np.ndarray, confidence: np.ndarray) -> NamedTensorResult:
 def test_the_identity_names_the_contracts_the_packager_stamps_into_the_bundle():
     identity = GraspGenAdapter.identity
 
-    assert identity.family == "graspgen"
+    assert identity.model_type == "graspgen"
     assert identity.preprocessing == GRASPGEN_PREPROCESSING
     assert identity.postprocessing == GRASPGEN_POSTPROCESSING
     assert identity.supported_deployments == frozenset({"torch_cuda", "ascend_310p", "ascend_310b"})

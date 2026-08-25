@@ -7,6 +7,7 @@
 - types.py:         公共数据类型
 - config.py:        配置加载与参数
 - runtime.py:       音频采集 + worker 线程生命周期
+- streaming_runtime.py: unified-runtime stream ownership adapter
 - pipeline.py:      增强 + 人声门控 + DOA 处理链
 - speech_gate.py:   Silero + RMS 灰区段判定
 - wav_input.py:     离线 WAV 输入(切块写 ringbuf)

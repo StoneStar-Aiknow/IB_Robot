@@ -7,8 +7,11 @@ pipeline ID，并支持单体和边云分布式执行。
 运行时从 bundle 中唯一的 `inference_manifest.json` 读取模型类型、语义 tensor、命名 deployment、artifact、
 执行顺序和 runtime ABI bindings。Launch 和 robot YAML 通过 deployment 名称选择运行配置。
 
-非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。它通过 `NamedTensorRequest`、
-`NamedTensorResult` 和 `ModelSession` 使用同一套生命周期、准入、健康状态、deployment fingerprint 与资源回收。
+非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。公共本地执行通过
+`ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)` 进入，成功结果统一为 `ModelResult`；
+`ModelRuntimeFactory` 是注册式构造入口，不是请求边界。`ModelRuntimeHandle` 接受 `RuntimeAssembly` 的
+所有权转移，负责公开生命周期、准入、deadline、取消、健康状态和关闭等待。`ModelSession` 是 assembly
+中的资源，只负责加载、执行和释放 vendor 模型对象、设备 lease、buffer 或 worker。
 模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
 
 manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。常规 loader
@@ -47,14 +50,22 @@ IB-Robot 只读这些文件，不会添加字段、删字段、重写 device 或
 一个 manifest 可以为同一策略声明多个命名 deployment，例如 `cpu`、`cuda`、
 `rk3588`、`ascend_310p3` 或 `lq50`。Pipeline 选择的是 deployment 名称，而不是后端名。
 
-Torch deployment 直接声明运行设备：
+部署通过显式的 v3 runtime profile 声明后端、target 和运行实例字段：
 
 ```json
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 1,
-  "backend": "torch",
-  "device": "cpu"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "torch",
+    "target": {"runtime": "torch"},
+    "profile": {"device": "cpu"}
+  }
 }
 ```
 
@@ -64,10 +75,22 @@ Torch deployment 直接声明运行设备：
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 3,
-  "backend": "rknn",
-  "target": {
-    "soc": "rk3588",
-    "runtime": "rknn-lite2"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "rknn",
+    "target": {
+      "soc": "rk3588",
+      "runtime": "rknn-lite2"
+    },
+    "profile": {
+      "target_name": "rk3588",
+      "core_mask": 7,
+      "device_id": 0
+    }
   },
   "artifacts": {
     "policy": {
@@ -122,14 +145,15 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 - 策略 bundle 和命名 deployment
 - LeRobot preprocessor / postprocessor
 - policy codec 与 binding execution plan
-- 后端实例、准入状态和生命周期
+- `ModelRuntimeHandle` 及其独立准入状态和生命周期
 - Action、reset、health、action output 和分布式 transport endpoints
 
-`GenericModelPipeline` 是策略、感知、Echo 等模型共用的公开运行时入口，统一生命周期、准入、
-deadline、cancellation 和 health。`PipelineRuntimeCore` 是其内部可复用的状态机与并发控制实现。
-`InferencePipeline` 是策略模型 facade，在通用运行时之上增加 LeRobot processor、policy codec 和
-action 结果适配。编译模型由 `SequentialModelExecutor` 按 `InferenceStage` 序列执行；循环 family
-通过 `IterativeStage` 驱动多个 role，并在一个 `ModelSessionExecution` scope 中共享设备资源。
+`InferencePipeline` 是策略模型 facade，把既有 policy 请求/结果契约适配到
+`ModelRuntimeHandle`。Handle 统一生命周期、准入、deadline、cancellation、health 和 diagnostics，并按
+`RuntimeAssembly` 的 owned component 顺序加载、反向释放资源。编译模型由
+`SequentialModelExecutor` 按 `InferenceStage` 序列执行；循环 family 通过 `IterativeStage` 驱动多个 role。
+同一个 `ExecutionContext` 把 request ID、deadline 和 cancellation token 传到各 stage 与
+`ModelSession` resource；session 持有跨 role 复用的 vendor 设备资源。
 
 默认 endpoint：
 
@@ -165,7 +189,7 @@ action 结果适配。编译模型由 `SequentialModelExecutor` 按 `InferenceSt
   进程退出后的全局 Shutdown；optional pipeline 退出后由 readiness 和路由逻辑将其排除。该路径当前只接受
   `execution_mode: monolithic`。
 
-生产执行路径只支持 schema v2 whole-graph plan。公开 Open 只建立 route-independent 的逻辑 session 和
+生产执行路径只支持 schema v3 whole-graph plan。公开 Open 只建立 route-independent 的逻辑 session 和
 logical generation，不选择模型、不检查 fallback，也不访问 pipeline。每个 Dispatch 都携带自己的 target
 pipeline、fallback chain、priority 和 deadline；候选首次被该 session 选中时，Global 才向对应 pipeline
 下发私有 Open/reset 并记录其 pipeline generation。同一个逻辑 session 可按需建立多个 pipeline binding。
@@ -198,7 +222,7 @@ Global 会生成独立的内部 request timeout 并传给 pipeline，用于约�
 通用 wire 取值为非负 int32，不施加 backend-specific 上限。只有支持多优先级的 backend 才暴露显式的
 generic-to-native priority mapping capability；没有该 capability 的 backend 为单优先级，只接受 priority 0。
 当前只有 Ascend 暴露多优先级 mapping。
-AscendBackend 在 scheduled 模式加载时查询 `acl.rt.device_get_stream_priority_range()`，并通过
+`AscendOmModelSession` 在 scheduled 模式加载时查询 `acl.rt.device_get_stream_priority_range()`，并通过
 `acl.rt.create_stream_with_config()` 为硬件支持的每一级优先级创建可复用 stream。Ascend 接受 `[0, 7]`，并将
 通用 priority 一一映射到同编号 ACL priority；大于 `7` 的请求在模型执行前直接拒绝。模型通过
 `acl.mdl.execute_async()` 下发，并在读取输出或复用 dataset/buffer 前调用
@@ -291,12 +315,12 @@ result 或 heartbeat overrides。
 ```text
 ROS observations
   -> contract adapter
-  -> LeRobot preprocessor
-  -> semantic batch
-  -> native policy, or policy codec + shared stage executor
-  -> Backend.infer, or ModelSession role execution
-  -> semantic action
-  -> LeRobot postprocessor
+  -> InferencePipeline policy facade
+  -> ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)
+  -> SequentialModelExecutor stages
+       -> LeRobot preprocessor + policy codec
+       -> ModelSession execute / role execution
+       -> action decode + LeRobot postprocessor
   -> DispatchInfer result and /actions/<pipeline_id>
 ```
 
@@ -443,15 +467,15 @@ ros2 launch inference_service local_distributed_inference.launch.py \
 
 Edge 可由 robot YAML 中 `execution_mode: distributed` 创建，也可由上述显式 launch override
 创建。成功握手后会绑定唯一 session ID 和 generation。Heartbeat 超时、cloud 重启、
-fingerprint 改变或 backend 离开 `READY` 都会立即撤销 readiness、拒绝新请求，并使
+fingerprint 改变或 runtime handle 离开 `READY` 都会立即撤销 readiness、拒绝新请求，并使
 in-flight request 返回结构化 unavailable 错误。不属于当前 session ID 和 generation 的
 response 会被丢弃，连接恢复后必须重新握手。
 
-重新握手不是 stateful backend 的完整恢复条件。替换已有 session 时，Cloud 会先停止旧
-session 准入并等待其 runtime 操作结束；stateless backend 随后可直接创建新 generation，
-stateful backend 则必须先成功 reset，并确认 backend 回到 `READY`，才能发布新 generation。
-Reset 失败时 Cloud 会持续 fail-closed，后续 heartbeat 不能绕过该恢复屏障。若 stateful
-backend 声明 `resettable: false`，session rollover 无法通过重新握手恢复，必须重启或重建
+重新握手不是 stateful runtime 的完整恢复条件。替换已有 distributed session 时，Cloud 会先停止旧
+distributed session 的请求准入，并等待其 `ModelRuntimeHandle` 操作结束；stateless runtime 随后可直接创建
+新 generation，stateful runtime 则必须先通过 handle 成功 reset，并确认 handle 回到 `READY`，才能发布新
+generation。Reset 失败时 Cloud 会持续 fail-closed，后续 heartbeat 不能绕过该恢复屏障。若 stateful
+runtime 声明 `resettable: false`，session rollover 无法通过重新握手恢复，必须重启或重建
 Cloud runtime 后才能重新提供服务。
 
 ## 后端与支持矩阵
@@ -467,23 +491,26 @@ Canonical backend 只有以下五个：
 | `hmm` | Houmo TCIM 执行 HMM 多模块 artifact |
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
-`AscendOmModelSession` 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
-tensor 复制回主机；设备生命周期、buffer ownership 和串行准入仍由 shared runtime 统一管理。
+Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
+tensor 复制回主机；`AscendOmModelSession` resource 拥有 ACL lease、模型和 device buffer，
+`ModelRuntimeHandle` 负责准入、公开生命周期、健康、取消和关闭 drain。
 
-编译 PI0.5 与 SmolVLA 不再由旧 backend 类持有 family 循环。它们通过
-`GenericModelPipeline -> SequentialModelExecutor -> InferenceStage -> ModelSession` 执行；对应
-`AscendBackend`、`HMMBackend` 和 `RKNNBackend` 对已迁移 family fail-closed。以下矩阵在启动时
+所有本地 policy family 都通过
+`InferencePipeline -> ModelRuntimeHandle -> RuntimeAssembly.runtime_executor` 执行。编译 PI0.5 与
+SmolVLA 的 family 循环属于共享 executor stage；各 `ModelSession` resource 只负责 vendor artifact 加载与
+模型或 role 执行。以下矩阵在启动时
 强制校验，不在表中的组合会被拒绝：
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
-| ACT | Backend | Backend | Backend | Backend | 不支持 |
-| Diffusion Policy | Backend | 不支持 | 不支持 | 不支持 | 不支持 |
-| PI0.5 | Backend | ModelSession | 不支持 | 不支持 | ModelSession |
-| SmolVLA | Backend | 不支持 | 不支持 | ModelSession | ModelSession |
+| ACT | Runtime | Runtime | Runtime | Runtime | 不支持 |
+| Diffusion Policy | Runtime | 不支持 | 不支持 | 不支持 | 不支持 |
+| PI0.5 | Runtime | Runtime | 不支持 | 不支持 | Runtime |
+| SmolVLA | Runtime | 不支持 | 不支持 | Runtime | Runtime |
 
-`Backend` 表示直接调用 `*Backend.infer()`；`ModelSession` 表示共享 family executor 按 role 调用
-`*ModelSession`。感知 family 的 registry 支持矩阵如下：
+`Runtime` 表示通过统一 `ModelRequest/ExecutionContext` 执行，由 handle 负责生命周期、准入、健康、取消和
+恢复，由 session resource 负责 vendor 模型资源。
+感知 family 的 registry 支持矩阵如下：
 
 | Perception family | `torch` | `ascend` |
 | --- | --- | --- |
@@ -508,8 +535,9 @@ NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。显式参�
 `--fast-gelu` 等价于全局 `all`。近似路径可能降低动作精度，必须针对既有 baseline 验证。
 
 新 Action Expert OM 的 runtime output 名为 `velocity` 或 `v_t`，Manifest 仍将其映射为策略
-semantic `action`。Ascend backend 从选中 deployment 的 `denoising_schedule` artifact 读取严格
-递减的 timesteps，并在 host 侧执行 `x_next = x_t + (next_t - t) * velocity` Euler integration，
+semantic `action`。策略 runtime assembler 从选中 deployment 的 `denoising_schedule` artifact 读取严格
+递减的 timesteps，共享 `IterativeStage` 在 host 侧执行
+`x_next = x_t + (next_t - t) * velocity` Euler integration，
 最终才返回 action。Exporter 未提供 `--schedule-file` 时，根据 `config.num_inference_steps` 打包
 uniform schedule；提供时只接受严格的 `pi05-denoising-schedule-v1` JSON。
 
@@ -534,15 +562,17 @@ Hisilicon worker dependency；只有选择相应 deployment 时才检查依赖�
 
 ## 生命周期、健康与能力
 
-Backend 状态包括 `CREATED`、`LOADING`、`READY`、`DEGRADED`、`RECOVERING`、
-`FAILED`、`CLOSING` 和 `CLOSED`。只有 `READY` 接受请求。`close()` 必须幂等，部分加载
-失败也必须释放已经创建的 context、model handle、device buffer 或 worker。
+`ModelRuntimeHandle` 的公开状态包括 `CREATED`、`LOADING`、`READY`、`RESET_REQUIRED`、
+`RESETTING`、`FAILED`、`CLOSING` 和 `CLOSED`。只有 `READY` 接受请求。Handle 在 reset/close 前停止
+准入并等待 active execution，统一记录健康与恢复要求；`close()` 幂等，并按 `RuntimeAssembly` 的反向
+所有权顺序释放已经加载的 component。
 
-Pipeline 状态包括 `CREATED`、`LOADING`、`HANDSHAKING`、`READY`、`RESETTING`、
-`DEGRADED`、`FAILED`、`CLOSING` 和 `CLOSED`。Reset 期间阻止新请求；`CLOSING` 和
-`CLOSED` 是终态。
+`ModelSession` 是 handle-owned resource，而不是公开生命周期 owner。它持有并释放 context、vendor model
+handle、device buffer、worker、tokenizer 或其他模型专属资产，并实现
+`execute(ModelRequest, ExecutionContext)` 或 role execution。策略 `InferencePipeline` 将 handle 状态投影为
+pipeline diagnostics；distributed `HANDSHAKING` 属于节点协议状态，不是 model resource 生命周期。
 
-Backend capabilities 决定：
+Session/deployment capabilities 供 handle 决定：
 
 - 是否 stateful、resettable、thread-safe
 - 单实例最大 in-flight 请求数
@@ -551,13 +581,14 @@ Backend capabilities 决定：
 - 是否支持 attention 和 cancellation
 
 默认采用保守串行限制。只有 conformance tests 证明重叠调用、输出隔离、故障隔离和确定性
-清理后，backend 才能声明更高并发。不同 pipeline 有独立准入状态，但共享 accelerator
+清理后，runtime 才能声明更高并发。不同 handle 有独立准入状态，但共享 accelerator
 resource domain 时仍可能被后端串行化。
 
 ## Manifest Identity
 
 启动顺序是：严格 JSON/schema 校验，deployment 选择，UUID/revision 与轻量 bundle digest 校验，
-路径安全和普通文件校验，LeRobot metadata，binding compatibility，最后创建 backend runtime。
+路径安全和普通文件校验，LeRobot metadata，binding compatibility，最后构造 session resource、
+`RuntimeAssembly` 和 `ModelRuntimeHandle`。
 常规 Runtime 不读取 OM、RKNN、HMM 或 safetensors 计算内容 SHA-256；scheduled 本地 compiled deployment
 由 `robot_config` 在 launch 构造前额外验证 manifest 中声明的 artifact SHA-256。
 
@@ -575,8 +606,8 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 
 ```json
 {
-  "format": "ibrobot.deployment-structure-v2",
-  "schema_version": 2,
+  "format": "ibrobot.deployment-structure-v3",
+  "schema_version": 3,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -599,7 +630,7 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 应重新运行拥有该 artifact 的 exporter 或 packaging workflow。Exporter 负责复制 artifact、
 读取 compiler/runtime ABI、生成 bindings、更新 UUID/revision 和轻量结构摘要，并通过生产 loader
 重新验证 manifest。Schema v1 和旧版 artifact 不受支持，必须使用当前 exporter 或 packager
-重新生成完整 schema-v2 whole-graph bundle。
+重新生成完整 schema-v3 whole-graph bundle。
 
 ## Exporter 入口
 
@@ -639,9 +670,11 @@ pytest -q src/inference_service/tests
 只对本次修改的 Python 文件执行 Ruff。项目或 ROS 命令前必须先加载 `.shrc_local`。
 ## Typed Model Services
 
-`model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v2
-bundle, one named deployment, and one `ModelServicePlugin`; the plugin owns domain request/response mapping while the
-shared `ModelSession` owns admission, health, accelerator lifetime, and cleanup.
+`model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v3
+bundle、一个命名 deployment 和一个 `ModelServicePlugin`；plugin 负责领域请求/响应映射，构造
+`ModelSession`，将其放入 `RuntimeAssembly`，并把 assembly 的所有权转交给 `ModelRuntimeHandle`。
+Handle 负责准入、公开生命周期、健康、取消、恢复和清理顺序；session resource 负责 accelerator SDK 和
+模型资源。
 
 `robot_config` launches the same host for RAM++, SigLIP2, GraspGen, and ZipVoice TTS. Model packages provide plugins;
 they must not implement parallel ROS nodes or duplicate `ModelRuntimeInfo` projection.
@@ -649,4 +682,4 @@ they must not implement parallel ROS nodes or duplicate `ModelRuntimeInfo` proje
 When `required=false`, an initialization failure leaves the typed endpoint online so callers receive a not-ready
 response and diagnostics. The host does not retry plugin initialization on later requests. After repairing a missing
 bundle, dependency, or device, restart the node to recover. Request validation and other request-scoped failures do
-not change runtime health; only plugin/session health determines whether the runtime is failed.
+not change runtime health; model resource failures are projected through handle health.

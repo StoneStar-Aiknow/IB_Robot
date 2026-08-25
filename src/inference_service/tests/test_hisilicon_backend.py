@@ -9,10 +9,11 @@ import pytest
 
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
-    BACKEND_REGISTRY,
+    STATIC_BACKEND_DESCRIPTORS,
     BackendCapabilityError,
     BackendInferenceError,
     BackendLoadError,
+    BackendRegistry,
     BackendRegistryError,
     BackendState,
     InferenceRequest,
@@ -22,7 +23,16 @@ from inference_service.backends.hisilicon.sd3403_protocol import SD3403Response,
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import HisiliconModelSession
 from inference_service.pipeline import PipelineValidationError, create_inference_pipeline
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    TEST_DEPLOYMENT_UUID,
+    create_policy_bundle,
+    policy_model,
+    v3_runtime_deployment,
+    write_manifest,
+)
+
+_STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 
 
 class FakeProtocol:
@@ -68,7 +78,7 @@ def hisilicon_context(tmp_path, *, executable: bool = True, runtime_options=None
     worker.chmod(0o755 if executable else 0o644)
     entries = [BundleFile(path=path) for path in bundle_paths]
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": TEST_BUNDLE_UUID,
             "revision": 1,
@@ -81,51 +91,54 @@ def hisilicon_context(tmp_path, *, executable: bool = True, runtime_options=None
             },
         },
         "deployments": {
-            "hisilicon": {
-                "uuid": TEST_DEPLOYMENT_UUID,
-                "revision": 1,
-                "backend": "hisilicon",
-                "target": {"soc": "sd3403", "runtime": "hisilicon-worker"},
-                "artifacts": {
-                    "policy": {"path": "artifacts/model.om", "format": "om"},
-                    "worker": {
-                        "path": "artifacts/worker",
-                        "format": "executable",
+            "hisilicon": v3_runtime_deployment(
+                {
+                    "uuid": TEST_DEPLOYMENT_UUID,
+                    "revision": 1,
+                    "backend": "hisilicon",
+                    "target": {"soc": "sd3403", "runtime": "hisilicon-worker"},
+                    "artifacts": {
+                        "policy": {"path": "artifacts/model.om", "format": "om"},
+                        "worker": {
+                            "path": "artifacts/worker",
+                            "format": "executable",
+                        },
                     },
-                },
-                "execution": ["policy"],
-                "bindings": {
-                    "policy": {
-                        "inputs": [
-                            {
-                                "semantic": "observation.images.top",
-                                "runtime_name": "camera",
-                                "index": 1,
-                                "dtype": "float32",
-                                "shape": [1, 3, 16, 24],
-                                "layout": "NCHW",
-                            },
-                            {
-                                "semantic": "observation.state",
-                                "runtime_name": "state",
-                                "index": 0,
-                                "dtype": "float32",
-                                "shape": [1, 6],
-                            },
-                        ],
-                        "outputs": [
-                            {
-                                "semantic": "action",
-                                "runtime_name": "action",
-                                "index": 1,
-                                "dtype": "float32",
-                                "shape": [1, 4, 6],
-                            }
-                        ],
-                    }
-                },
-            }
+                    "execution": ["policy"],
+                    "bindings": {
+                        "policy": {
+                            "inputs": [
+                                {
+                                    "semantic": "observation.images.top",
+                                    "runtime_name": "camera",
+                                    "index": 1,
+                                    "dtype": "float32",
+                                    "shape": [1, 3, 16, 24],
+                                    "layout": "NCHW",
+                                },
+                                {
+                                    "semantic": "observation.state",
+                                    "runtime_name": "state",
+                                    "index": 0,
+                                    "dtype": "float32",
+                                    "shape": [1, 6],
+                                },
+                            ],
+                            "outputs": [
+                                {
+                                    "semantic": "action",
+                                    "runtime_name": "action",
+                                    "index": 1,
+                                    "dtype": "float32",
+                                    "shape": [1, 4, 6],
+                                }
+                            ],
+                        }
+                    },
+                }
+            )
         },
+        "model": policy_model("act"),
     }
     write_manifest(tmp_path, manifest)
     return RuntimeContext(load_inference_manifest(tmp_path, "hisilicon"), runtime_options=runtime_options or {})
@@ -383,8 +396,8 @@ def test_hisilicon_session_rejects_invalid_operational_options(tmp_path, runtime
 def test_registry_marks_hisilicon_as_session_only(tmp_path):
     context = hisilicon_context(tmp_path)
 
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
     assert descriptor.factory is None
     with pytest.raises(BackendRegistryError) as error:
-        BACKEND_REGISTRY.create(context)
-    assert error.value.code == "backend_factory_unavailable"
+        _STATIC_BACKEND_REGISTRY._create_legacy_backend(context)
+    assert error.value.code == "legacy_backend_unavailable"

@@ -1,4 +1,4 @@
-"""FullSubNet FB/SB raw ACL 状态常驻执行器。"""
+"""FullSubNet FB/SB Ascend ACL 状态常驻执行器。"""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
-from inference_manifest import speech_direction_bindings
-from inference_service.backends.ascend.acl_runtime import ACL_RUNTIME_MANAGER, AclRuntimeManager
+from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
+from voice_asr_service.speech_direction.contract import speech_direction_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +66,9 @@ class _StatefulAclStage:
 
 
 class StatefulAclFullSubNetRunner:
-    """FB/SB OM、dataset和状态buffer全生命周期常驻的 raw ACL executor。"""
+    """FB/SB OM、dataset和状态buffer全生命周期常驻的 Ascend ACL executor。"""
 
-    backend = "stateful_raw_acl"
+    backend = "ascend"
 
     def __init__(
         self,
@@ -76,20 +76,21 @@ class StatefulAclFullSubNetRunner:
         sb_om_path: str,
         *,
         device_id: int = 0,
-        acl_config_path: str = "",
-        runtime_manager: AclRuntimeManager = ACL_RUNTIME_MANAGER,
+        runtime_manager: AclRuntimeManager | None = None,
         timing_enabled: bool = False,
     ):
         for path in (fb_om_path, sb_om_path):
             if not Path(path).is_file():
-                raise FileNotFoundError(f"FullSubNet raw ACL OM不存在: {path}")
+                raise FileNotFoundError(f"FullSubNet Ascend ACL OM不存在: {path}")
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理
         self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
         self._poisoned = False
         self._timing_enabled = bool(timing_enabled)
         self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
-        self._lease = runtime_manager.acquire(device_id, acl_config_path or None)
+        if runtime_manager is None:
+            raise RuntimeError("StatefulAclFullSubNetRunner requires an explicitly injected ACL runtime provider")
+        self._lease = runtime_manager.acquire(device_id)
         self._fb_model: AclModel | None = None
         self._sb_model: AclModel | None = None
         try:
@@ -106,7 +107,7 @@ class StatefulAclFullSubNetRunner:
         except Exception:
             self.close()
             raise
-        logger.info("FullSubNet raw ACL状态常驻已加载: fb=%s sb=%s", fb_om_path, sb_om_path)
+        logger.info("FullSubNet Ascend ACL状态常驻已加载: fb=%s sb=%s", fb_om_path, sb_om_path)
 
     @property
     def last_timing_ms(self):
@@ -132,9 +133,9 @@ class StatefulAclFullSubNetRunner:
     def _run(self, stage: _StatefulAclStage, frame: np.ndarray) -> np.ndarray:
         with self._lock:
             if self._closed:
-                raise RuntimeError("FullSubNet raw ACL runner已关闭")
+                raise RuntimeError("FullSubNet Ascend ACL runner已关闭")
             if self._poisoned:
-                raise RuntimeError("FullSubNet raw ACL状态不确定，必须先reset")
+                raise RuntimeError("FullSubNet Ascend ACL状态不确定，必须先reset")
             try:
                 return stage.run(frame)
             except Exception:

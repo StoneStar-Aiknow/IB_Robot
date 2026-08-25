@@ -71,7 +71,9 @@ ros2 launch voice_tts_service voice_tts.launch.py \
 ```text
 SynthesizeSpeech request
   -> request validation and text segmentation
-  -> load the selected deployment on first use
+  -> ModelRequest + ExecutionContext
+  -> ModelRuntimeHandle.execute
+  -> resident ZipVoice ModelSession resource loaded at startup
   -> ZipVoice tokenizer
   -> Text Encoder OM
   -> Flow Decoder OM (four host-scheduled Euler steps)
@@ -90,7 +92,9 @@ PlayAudioFile request (absolute path on the playback host)
   -> success / error_code / message
 ```
 
-The shared `ModelSession` serializes inference and owns admission, health, failure state, and close waiting.
+`ZipVoiceSynthesizePlugin` places its `ModelSession` resource in a `RuntimeAssembly` and transfers ownership to a
+`ModelRuntimeHandle`. The handle serializes admission and owns public lifecycle, health, cancellation, and close
+draining; the session only owns and releases ZipVoice vendor model and device resources.
 
 ## 4. ROS Interfaces
 
@@ -139,24 +143,25 @@ ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
 
 | Stage | Owner | Behavior |
 | --- | --- | --- |
-| Node startup | Shared model-service host | Validate the bundle and load the plugin/session |
-| Node shutdown | Shared model-service host | Close the plugin/session and release model resources |
+| Node startup | Shared host + TTS plugin | Validate the bundle, construct the session, `RuntimeAssembly`, and handle, then call `handle.load()` |
+| Node shutdown | Plugin's `ModelRuntimeHandle` | Stop admission, drain active inference, and close the assembly-owned session resource |
 
 The shared model-service host loads the named deployment at node startup:
 
 ```text
-node startup -> validate the bundle and load the plugin/session
-synthesize -> reuse the resident model
-node shutdown -> release OM sessions, ACL leases, Vocos, tokenizer, and prompt
+node startup -> validate bundle -> construct RuntimeAssembly/ModelRuntimeHandle -> handle.load()
+synthesize -> handle.execute(ModelRequest, ExecutionContext) -> reuse the resident ModelSession resource
+node shutdown -> handle.close() -> session releases OM resources, ACL leases, Vocos, tokenizer, and prompt
 ```
 
-The shared `ModelSession` owns model admission and cleanup. Host shutdown waits for active inference before closing
-the session.
+`ModelRuntimeHandle` owns admission, public lifecycle, health, cancellation, and close draining. `ModelSession` is a
+handle-owned resource responsible for loading, executing, and releasing ZipVoice vendor resources. The handle waits
+for active inference when host shutdown closes the plugin.
 
 `exit_on_init_failure=false` (the shared host's `required=false`) only keeps the typed endpoint online and reports
 `MODEL_NOT_READY` after initialization failure. The host does not retry initialization on later requests; restart the
 node after repairing the bundle, dependency, or device. Request-scoped errors such as `INVALID_TEXT` and
-`UNSUPPORTED_PROMPT` do not change session health or block later valid requests.
+`UNSUPPORTED_PROMPT` do not change handle health or block later valid requests.
 
 ## 5. Model Bundle and Deployment
 
@@ -164,14 +169,15 @@ The model path is configured through `robot_config.bundle_path`; it is never har
 against the absolute `WORKSPACE` set by `.shrc_local`:
 
 ```yaml
-bundle_path: models/voice_tts/zipvoice
+bundle_path: models/zipvoice
 deployment: ascend_310p
 ```
 
-This selects `$WORKSPACE/models/voice_tts/zipvoice`. The bundle contains `inference_manifest.json`, deployment
+This selects `$WORKSPACE/models/zipvoice`. The bundle contains `inference_manifest.json`, deployment
 artifacts, tokenizer assets, prompt profiles, and the vocoder checkpoint.
 
-The bundle must use manifest schema v2, declare `model.kind=generic` and `model.family=zipvoice`, and contain the
+The bundle must use manifest schema v3, declare `interface=tensor_model`, `model_type=zipvoice`, and
+`operation=synthesize`, and contain the
 selected named deployment.
 
 ### 5.1 Verified deployments
@@ -201,7 +207,7 @@ source .shrc_local
 ZIPVOICE_SOURCE_DIR=/path/to/zipvoice-delivery
 ros2 run voice_tts_service package_zipvoice_310p \
   --source "$ZIPVOICE_SOURCE_DIR" \
-  --destination "$WORKSPACE/models/voice_tts/zipvoice"
+  --destination "$WORKSPACE/models/zipvoice"
 ```
 
 The packager validates the Text Encoder OM, Flow Decoder OM, Vocos checkpoint, token table, and default prompt
@@ -221,7 +227,7 @@ Production configuration lives under `robot.voice_tts` in the robot YAML:
 ```yaml
 voice_tts:
   enabled: true
-  bundle_path: models/voice_tts/zipvoice
+  bundle_path: models/zipvoice
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
@@ -260,8 +266,10 @@ The current `ascend_310p` deployment:
 - Rejects ASCII English words explicitly.
 - Uses a fixed bundle prompt and does not support request-scoped voice cloning.
 
-`ZipVoiceAscendSession` subclasses the shared `AscendOmModelSession` and uses standard `session.infer()` to reuse
-the ACL lease, OM resources, admission, health, and close waiting without initializing a second global ACL runtime.
+`ZipVoiceAscendSession` subclasses the shared `AscendOmModelSession` and is the `ModelSession` resource in the
+plugin's `RuntimeAssembly`. It owns the ACL lease, OM resources, Vocos, tokenizer, and prompt. The plugin calls
+`ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)`; the handle owns admission, lifecycle, health,
+cancellation, and close waiting without initializing a second global ACL runtime.
 
 ## 8. Stable Error Codes
 
@@ -273,7 +281,7 @@ the ACL lease, OM resources, admission, health, and close waiting without initia
 | `PROMPT_TOO_LARGE` | The prompt exceeds its byte or duration limit |
 | `REQUEST_TOO_LARGE` | Text or segment count exceeds request limits |
 | `RESPONSE_TOO_LARGE` | Synthesized audio exceeds the response-byte limit |
-| `MODEL_NOT_READY` | Bundle, deployment, or model-session loading failed |
+| `MODEL_NOT_READY` | Bundle, deployment, or model-runtime loading failed |
 | `INFERENCE_FAILED` | Model inference failed |
 | `INVALID_AUDIO_OUTPUT` | Model output is empty or contains NaN/Inf |
 | `UNSUPPORTED_PROMPT` | The selected deployment does not support request-scoped voice cloning |

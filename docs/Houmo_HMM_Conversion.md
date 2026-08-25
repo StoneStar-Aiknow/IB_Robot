@@ -209,7 +209,7 @@ package-hmm-deployment \
     --bundle-root models/<policy_bundle> \
     --deployment hmm_lq50 \
     --target-soc lq50 \
-    --target-runtime tcim-lite \
+    --target-runtime tcim \
     --spec /path/to/hmm-package-spec.json
 ```
 
@@ -221,7 +221,7 @@ python3 -m model_utils.hmm_export \
     --bundle-root models/<policy_bundle> \
     --deployment hmm_lq50 \
     --target-soc lq50 \
-    --target-runtime tcim-lite \
+    --target-runtime tcim \
     --spec /path/to/hmm-package-spec.json
 ```
 

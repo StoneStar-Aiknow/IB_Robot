@@ -1,693 +1,341 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ibrobot.example/schemas/inference_manifest.schema.json",
-  "title": "IB-Robot Unified Inference Manifest",
+  "title": "IB-Robot Unified Inference Manifest v3",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "bundle",
-    "deployments"
-  ],
+  "required": ["schema_version", "bundle", "model", "deployments"],
   "properties": {
-    "schema_version": {
-      "const": 2
-    },
-    "bundle": {
-      "$ref": "#/$defs/bundle"
-    },
-    "model": {
-      "$ref": "#/$defs/model"
-    },
+    "schema_version": {"const": 3},
+    "bundle": {"$ref": "#/$defs/bundle"},
+    "model": {"$ref": "#/$defs/model"},
     "deployments": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": {
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
-      },
-      "additionalProperties": {
-        "oneOf": [
-          {
-            "$ref": "#/$defs/torch_deployment"
-          },
-          {
-            "$ref": "#/$defs/compiled_deployment"
-          }
-        ]
-      }
+      "propertyNames": {"pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"},
+      "additionalProperties": {"$ref": "#/$defs/deployment"}
     }
   },
   "$defs": {
-    "non_empty_string": {
-      "type": "string",
-      "minLength": 1
-    },
-    "sha256": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
-    },
+    "non_empty_string": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "uuid": {
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
-    "revision": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "role": {
+    "role": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"},
+    "logical_identifier": {
       "type": "string",
-      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
+      "not": {"pattern": "(^|[_.-])(device|stream|lease|provider|pid|socket|resource|handle)([_.-]|$)"}
     },
     "bundle_file": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "path"
-      ],
-      "properties": {
-        "path": {
-          "$ref": "#/$defs/non_empty_string"
-        }
-      }
+      "required": ["path"],
+      "properties": {"path": {"$ref": "#/$defs/non_empty_string"}}
     },
     "digest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "algorithm",
-        "scope",
-        "value"
-      ],
+      "required": ["algorithm", "scope", "value"],
       "properties": {
-        "algorithm": {
-          "const": "sha256"
-        },
-        "scope": {
-          "const": "structure"
-        },
-        "value": {
-          "$ref": "#/$defs/sha256"
-        }
+        "algorithm": {"const": "sha256"},
+        "scope": {"const": "structure"},
+        "value": {"$ref": "#/$defs/sha256"}
       }
     },
     "bundle": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "uuid",
-        "revision",
-        "name",
-        "files",
-        "digest"
-      ],
+      "required": ["uuid", "revision", "name", "files", "digest"],
       "properties": {
-        "uuid": {
-          "$ref": "#/$defs/uuid"
-        },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "name": {
-          "$ref": "#/$defs/non_empty_string"
-        },
+        "uuid": {"$ref": "#/$defs/uuid"},
+        "revision": {"type": "integer", "minimum": 1},
+        "name": {"$ref": "#/$defs/non_empty_string"},
         "files": {
           "type": "array",
           "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/bundle_file"
-          }
+          "items": {"$ref": "#/$defs/bundle_file"}
         },
-        "digest": {
-          "$ref": "#/$defs/digest"
-        }
+        "digest": {"$ref": "#/$defs/digest"}
       }
     },
-    "target": {
+    "identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "soc",
-        "runtime"
-      ],
+      "required": ["interface", "model_type", "operation"],
       "properties": {
-        "soc": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "runtime": {
-          "$ref": "#/$defs/non_empty_string"
-        }
+        "interface": {"enum": ["policy", "tensor_model"]},
+        "model_type": {"$ref": "#/$defs/non_empty_string"},
+        "operation": {"$ref": "#/$defs/non_empty_string"}
       }
     },
-    "artifact": {
+    "semantic_tensor": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "path",
-        "format"
-      ],
+      "required": ["semantic", "dtype", "shape"],
       "properties": {
-        "path": {
-          "$ref": "#/$defs/non_empty_string"
+        "semantic": {"$ref": "#/$defs/non_empty_string"},
+        "dtype": {
+          "enum": [
+            "bool", "uint8", "int8", "int16", "int32", "int64",
+            "float16", "bfloat16", "float32", "float64"
+          ]
         },
-        "format": {
-          "$ref": "#/$defs/non_empty_string"
+        "shape": {
+          "type": "array",
+          "items": {"oneOf": [{"const": -1}, {"type": "integer", "minimum": 1}]}
         },
-        "share_group": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
-        }
-      }
-    },
-    "shape_dimension": {
-      "oneOf": [
+        "layout": {"enum": ["NCHW", "NHWC"]}
+      },
+      "allOf": [
         {
-          "const": -1
+          "if": {
+            "properties": {
+              "shape": {"minItems": 4, "maxItems": 4},
+              "semantic": {"pattern": "^observation\\.images?(\\.|$)"}
+            }
+          },
+          "then": {"required": ["layout"]}
         },
         {
-          "type": "integer",
-          "minimum": 1
+          "if": {"properties": {"shape": {"maxItems": 3}}},
+          "then": {"not": {"required": ["layout"]}}
         }
       ]
     },
     "binding": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "semantic",
-        "dtype",
-        "shape"
-      ],
+      "required": ["semantic", "dtype", "shape"],
       "properties": {
-        "semantic": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "runtime_name": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "index": {
-          "type": "integer",
-          "minimum": 0
-        },
+        "semantic": {"$ref": "#/$defs/non_empty_string"},
+        "runtime_name": {"$ref": "#/$defs/non_empty_string"},
+        "index": {"type": "integer", "minimum": 0},
         "dtype": {
           "enum": [
-            "bool",
-            "uint8",
-            "int8",
-            "int16",
-            "int32",
-            "int64",
-            "float16",
-            "bfloat16",
-            "float32",
-            "float64"
+            "bool", "uint8", "int8", "int16", "int32", "int64",
+            "float16", "bfloat16", "float32", "float64"
           ]
         },
         "shape": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/shape_dimension"
-          }
+          "items": {"oneOf": [{"const": -1}, {"type": "integer", "minimum": 1}]}
         },
-        "layout": {
-          "enum": [
-            "NCHW",
-            "NHWC"
-          ]
-        }
+        "layout": {"enum": ["NCHW", "NHWC"]}
       },
-      "anyOf": [
+      "anyOf": [{"required": ["runtime_name"]}, {"required": ["index"]}],
+      "allOf": [
         {
-          "required": [
-            "runtime_name"
-          ]
-        },
-        {
-          "required": [
-            "index"
-          ]
-        }
-      ],
-      "if": {
-        "allOf": [
-          {
+          "if": {
             "properties": {
-              "shape": {
-                "minItems": 4,
-                "maxItems": 4
-              }
+              "shape": {"minItems": 4, "maxItems": 4},
+              "semantic": {"pattern": "^observation\\.images?(\\.|$)"}
             }
           },
-          {
-            "properties": {
-              "semantic": {
-                "pattern": "^observation\\.images?(\\.|$)"
-              }
-            }
-          }
-        ]
-      },
-      "then": {
-        "required": [
-          "layout"
-        ]
-      },
-      "else": {
-        "if": {
-          "properties": {
-            "shape": {
-              "minItems": 4,
-              "maxItems": 4
-            }
-          }
+          "then": {"required": ["layout"]}
         },
-        "then": true,
-        "else": {
-          "not": {
-            "required": [
-              "layout"
-            ]
-          }
+        {
+          "if": {"properties": {"shape": {"maxItems": 3}}},
+          "then": {"not": {"required": ["layout"]}}
         }
-      }
-    },
-    "semantic_tensor": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "semantic",
-        "dtype",
-        "shape"
-      ],
-      "properties": {
-        "semantic": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "dtype": {
-          "enum": [
-            "bool",
-            "uint8",
-            "int8",
-            "int16",
-            "int32",
-            "int64",
-            "float16",
-            "bfloat16",
-            "float32",
-            "float64"
-          ]
-        },
-        "shape": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/shape_dimension"
-          }
-        },
-        "layout": {
-          "enum": [
-            "NCHW",
-            "NHWC"
-          ]
-        }
-      },
-      "if": {
-        "allOf": [
-          {
-            "properties": {
-              "shape": {
-                "minItems": 4,
-                "maxItems": 4
-              }
-            }
-          },
-          {
-            "properties": {
-              "semantic": {
-                "pattern": "^observation\\.images?(\\.|$)"
-              }
-            }
-          }
-        ]
-      },
-      "then": {
-        "required": [
-          "layout"
-        ]
-      },
-      "else": {
-        "if": {
-          "properties": {
-            "shape": {
-              "minItems": 4,
-              "maxItems": 4
-            }
-          }
-        },
-        "then": true,
-        "else": {
-          "not": {
-            "required": [
-              "layout"
-            ]
-          }
-        }
-      }
+      ]
     },
     "embedding_metadata": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "embedding_space_id",
-        "dimension",
-        "normalization",
-        "image_preprocessing",
-        "text_preprocessing"
+        "embedding_space_id", "dimension", "normalization",
+        "image_preprocessing", "text_preprocessing"
       ],
       "properties": {
-        "embedding_space_id": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "dimension": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "normalization": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "image_preprocessing": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "text_preprocessing": {
-          "$ref": "#/$defs/non_empty_string"
-        }
+        "embedding_space_id": {"$ref": "#/$defs/non_empty_string"},
+        "dimension": {"type": "integer", "minimum": 1},
+        "normalization": {"$ref": "#/$defs/non_empty_string"},
+        "image_preprocessing": {"$ref": "#/$defs/non_empty_string"},
+        "text_preprocessing": {"$ref": "#/$defs/non_empty_string"}
       }
     },
     "semantic_identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "logical_model_revision",
-        "preprocessing_contract",
-        "output_semantics"
-      ],
+      "required": ["logical_model_revision", "preprocessing_contract", "output_semantics"],
       "properties": {
-        "logical_model_revision": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "preprocessing_contract": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "output_semantics": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "embedding": {
-          "$ref": "#/$defs/embedding_metadata"
-        }
+        "logical_model_revision": {"$ref": "#/$defs/non_empty_string"},
+        "preprocessing_contract": {"$ref": "#/$defs/non_empty_string"},
+        "output_semantics": {"$ref": "#/$defs/non_empty_string"},
+        "embedding": {"$ref": "#/$defs/embedding_metadata"}
       }
     },
     "model": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "family",
-        "inputs",
-        "outputs"
-      ],
+      "required": ["interface", "model_type", "operation"],
       "properties": {
-        "kind": {
-          "enum": [
-            "policy",
-            "perception",
-            "generic"
-          ]
+        "interface": {"enum": ["policy", "tensor_model"]},
+        "model_type": {"$ref": "#/$defs/non_empty_string"},
+        "operation": {"$ref": "#/$defs/non_empty_string"},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/semantic_tensor"}},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/semantic_tensor"}},
+        "architecture_class": {"$ref": "#/$defs/non_empty_string"},
+        "domain": {"$ref": "#/$defs/non_empty_string"},
+        "lineage": {"$ref": "#/$defs/non_empty_string"},
+        "metadata": {"type": "object"},
+        "semantic_identity": {"$ref": "#/$defs/semantic_identity"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime"],
+      "properties": {
+        "soc": {"$ref": "#/$defs/non_empty_string"},
+        "runtime": {"$ref": "#/$defs/non_empty_string"},
+        "runtime_abi": {"$ref": "#/$defs/non_empty_string"}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {"$ref": "#/$defs/non_empty_string"},
+        "device_id": {"type": "integer", "minimum": 0},
+        "dtype": {"$ref": "#/$defs/non_empty_string"},
+        "thread_count": {"type": "integer", "exclusiveMinimum": 0},
+        "target_name": {"$ref": "#/$defs/non_empty_string"},
+        "core_mask": {"type": "integer", "minimum": 0},
+        "role": {"$ref": "#/$defs/non_empty_string"},
+        "link": {"$ref": "#/$defs/non_empty_string"},
+        "quantization": {"$ref": "#/$defs/non_empty_string"},
+        "precision": {"$ref": "#/$defs/non_empty_string"},
+        "tcim_abi": {"$ref": "#/$defs/non_empty_string"},
+        "protocol": {"$ref": "#/$defs/non_empty_string"},
+        "worker_abi": {"$ref": "#/$defs/non_empty_string"},
+        "worker_path": {"$ref": "#/$defs/non_empty_string"},
+        "worker_pid": {"type": "integer", "minimum": 1},
+        "worker_socket": {"$ref": "#/$defs/non_empty_string"},
+        "provider": {"$ref": "#/$defs/non_empty_string"},
+        "optimization_level": {"$ref": "#/$defs/non_empty_string"},
+        "engine_version": {"$ref": "#/$defs/non_empty_string"}
+      }
+    },
+    "runtime_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "target"],
+      "anyOf": [{"required": ["profile"]}, {"required": ["backend_profile"]}],
+      "properties": {
+        "backend": {
+          "enum": ["torch", "ascend", "rknn", "hmm", "hisilicon", "onnx", "tensorrt"]
         },
-        "family": {
-          "$ref": "#/$defs/non_empty_string"
-        },
-        "operation": {
-          "type": "string"
-        },
-        "inputs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/semantic_tensor"
-          }
-        },
-        "outputs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/semantic_tensor"
-          }
-        },
-        "semantic_identity": {
-          "$ref": "#/$defs/semantic_identity"
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "kind": {
-                "not": {
-                  "const": "policy"
-                }
-              }
-            },
-            "required": [
-              "kind"
-            ]
-          },
-          "then": {
-            "properties": {
-              "inputs": {
-                "minItems": 1
-              },
-              "outputs": {
-                "minItems": 1
-              }
-            }
-          }
-        }
-      ]
+        "target": {"$ref": "#/$defs/target"},
+        "profile": {"$ref": "#/$defs/profile"},
+        "backend_profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "state_link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "state_name", "owner", "source", "target", "scope", "state_bank"],
+      "properties": {
+        "role": {"oneOf": [{"$ref": "#/$defs/role"}, {"const": "__runtime__"}]},
+        "state_name": {"$ref": "#/$defs/logical_identifier"},
+        "owner": {"enum": ["session", "streaming_runtime"]},
+        "source": {"$ref": "#/$defs/logical_identifier"},
+        "target": {"$ref": "#/$defs/logical_identifier"},
+        "scope": {"enum": ["stream", "runtime"]},
+        "state_bank": {"$ref": "#/$defs/logical_identifier"}
+      }
+    },
+    "execution_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state_scope", "execution_structure", "cancellation_granularity"],
+      "properties": {
+        "state_scope": {"enum": ["request", "stream"]},
+        "execution_structure": {"enum": ["direct", "iterative"]},
+        "orchestration_visibility": {"enum": ["executor", "session"]},
+        "cancellation_granularity": {"enum": ["stage", "checkpoint", "request_boundary"]},
+        "stateful": {"type": "boolean"},
+        "state_links": {"type": "array", "items": {"$ref": "#/$defs/state_link"}},
+        "state_bank_mode": {"enum": ["per_stream", "runtime_exclusive"]},
+        "max_open_streams": {"type": "integer", "exclusiveMinimum": 0}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "format"],
+      "properties": {
+        "path": {"$ref": "#/$defs/non_empty_string"},
+        "format": {"$ref": "#/$defs/non_empty_string"},
+        "share_group": {"$ref": "#/$defs/non_empty_string"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
     },
     "artifact_bindings": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "inputs",
-        "outputs"
-      ],
+      "required": ["inputs", "outputs"],
       "properties": {
-        "inputs": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/binding"
-          }
-        },
-        "outputs": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/binding"
-          }
-        }
+        "inputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/binding"}},
+        "outputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/binding"}}
       }
     },
     "device_link": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "semantic",
-        "producer",
-        "consumer",
-        "transport",
-        "owner"
-      ],
+      "required": ["semantic", "producer", "consumer", "transport", "owner"],
       "properties": {
-        "semantic": {
-          "type": "string",
-          "pattern": "^internal\\.[A-Za-z0-9_.-]+$"
-        },
-        "producer": {
-          "$ref": "#/$defs/role"
-        },
-        "consumer": {
-          "$ref": "#/$defs/role"
-        },
-        "producer_binding": {
-          "enum": [
-            "output",
-            "input"
-          ],
-          "default": "output"
-        },
-        "transport": {
-          "const": "device_pointer"
-        },
-        "owner": {
-          "enum": [
-            "producer",
-            "consumer"
-          ]
-        },
-        "lifetime": {
-          "const": "inference"
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "producer_binding": {
-                "const": "input"
-              }
-            },
-            "required": [
-              "producer_binding"
-            ]
-          },
-          "then": {
-            "properties": {
-              "owner": {
-                "const": "producer"
-              }
-            }
-          }
-        }
-      ]
-    },
-    "state_link": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "input_semantic",
-        "output_semantic"
-      ],
-      "properties": {
-        "input_semantic": {
-          "type": "string",
-          "pattern": "^host\\.[A-Za-z0-9_.-]+$"
-        },
-        "output_semantic": {
-          "type": "string",
-          "pattern": "^host\\.[A-Za-z0-9_.-]+$"
-        },
-        "initialization": {
-          "const": "zero",
-          "default": "zero"
-        }
+        "semantic": {"type": "string", "pattern": "^internal\\.[A-Za-z0-9_.-]+$"},
+        "producer": {"$ref": "#/$defs/role"},
+        "consumer": {"$ref": "#/$defs/role"},
+        "producer_binding": {"enum": ["output", "input"]},
+        "transport": {"const": "device_pointer"},
+        "owner": {"enum": ["producer", "consumer"]},
+        "lifetime": {"const": "inference"}
       }
     },
-    "torch_deployment": {
+    "deployment": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "uuid",
-        "revision",
-        "backend",
-        "device"
-      ],
+      "required": ["uuid", "revision", "execution_contract"],
       "properties": {
-        "uuid": {
-          "$ref": "#/$defs/uuid"
+        "uuid": {"$ref": "#/$defs/uuid"},
+        "revision": {"type": "integer", "minimum": 1},
+        "execution_contract": {"$ref": "#/$defs/execution_contract"},
+        "runtime_profile": {"$ref": "#/$defs/runtime_profile"},
+        "profile": {"$ref": "#/$defs/runtime_profile"},
+        "role_identities": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/role"},
+          "additionalProperties": {"$ref": "#/$defs/identity"}
         },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "backend": {
-          "const": "torch"
-        },
-        "device": {
-          "enum": [
-            "cpu",
-            "cuda",
-            "mps",
-            "npu"
-          ]
-        }
-      }
-    },
-    "compiled_deployment": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "uuid",
-        "revision",
-        "backend",
-        "target",
-        "artifacts",
-        "execution",
-        "bindings"
-      ],
-      "properties": {
-        "uuid": {
-          "$ref": "#/$defs/uuid"
-        },
-        "revision": {
-          "$ref": "#/$defs/revision"
-        },
-        "backend": {
-          "enum": [
-            "ascend",
-            "hisilicon",
-            "rknn",
-            "hmm"
-          ]
-        },
-        "target": {
-          "$ref": "#/$defs/target"
+        "role_runtime_profiles": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/role"},
+          "additionalProperties": {"$ref": "#/$defs/runtime_profile"}
         },
         "artifacts": {
           "type": "object",
-          "minProperties": 1,
-          "propertyNames": {
-            "$ref": "#/$defs/role"
-          },
-          "additionalProperties": {
-            "$ref": "#/$defs/artifact"
-          }
+          "propertyNames": {"$ref": "#/$defs/role"},
+          "additionalProperties": {"$ref": "#/$defs/artifact"}
         },
         "execution": {
           "type": "array",
-          "minItems": 1,
           "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/role"
-          }
+          "items": {"$ref": "#/$defs/role"}
         },
         "bindings": {
           "type": "object",
-          "minProperties": 1,
-          "propertyNames": {
-            "$ref": "#/$defs/role"
-          },
-          "additionalProperties": {
-            "$ref": "#/$defs/artifact_bindings"
-          }
+          "propertyNames": {"$ref": "#/$defs/role"},
+          "additionalProperties": {"$ref": "#/$defs/artifact_bindings"}
         },
-        "device_links": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/device_link"
-          }
-        },
-        "state_links": {
-          "type": "object",
-          "minProperties": 1,
-          "propertyNames": {
-            "$ref": "#/$defs/role"
-          },
-          "additionalProperties": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-              "$ref": "#/$defs/state_link"
-            }
-          }
-        }
+        "device_links": {"type": "array", "items": {"$ref": "#/$defs/device_link"}},
+        "metadata": {"type": "object"}
       }
     }
   }

@@ -785,7 +785,7 @@ control_modes:
         max_backoff_ms: 500
 ```
 
-Scheduler 开启时只接受 schema v2 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
+Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
 分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
 priority-0 的每个请求独立使用自己的 target、fallback chain 和 deadline 做
@@ -935,7 +935,7 @@ TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加
 合成结束并释放模型资源。
 该配置不会启用请求级初始化重试；修复 bundle、依赖或设备后必须重启 TTS 节点才能恢复。
 相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
-`$WORKSPACE/models/voice_tts/zipvoice`。
+`$WORKSPACE/models/zipvoice`。
 当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
 WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
 不是 `robot_config` 的隐式后端选择。

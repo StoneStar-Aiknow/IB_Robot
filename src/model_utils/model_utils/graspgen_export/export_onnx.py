@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import yaml
 
-from inference_manifest import (
+from model_utils.graspgen_contract import (
     GRASPGEN_CONTRACT_VERSION,
     GRASPGEN_EXECUTION,
     GRASPGEN_NPOINTS,

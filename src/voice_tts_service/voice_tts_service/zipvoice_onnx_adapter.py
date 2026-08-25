@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 class ZipVoiceOnnxSession(ModelSession):
     """Run the ZipVoice-Distill ONNX pipeline with onnxruntime on Ubuntu."""
 
+    execution_contract = "request-iterative"
+    orchestration_visibility = "session"
+
     def __init__(self, *, prompt_profile: str = "default", **kwargs) -> None:
         super().__init__(
             "zipvoice-onnx",
@@ -39,6 +42,7 @@ class ZipVoiceOnnxSession(ModelSession):
                 supports_cancellation=False,
                 thread_safe=False,
             ),
+            domains=kwargs.pop("domains", None),
         )
         self._root: Path | None = None
         self._prompt_profile_name = prompt_profile
@@ -77,9 +81,9 @@ class ZipVoiceOnnxSession(ModelSession):
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
-        if model.kind != "generic" or model.family != "zipvoice":
-            raise SessionLoadError("ZipVoice session requires model.kind=generic and model.family=zipvoice")
-        if not isinstance(deployment, TorchDeployment) or deployment.backend != "torch":
+        if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
+            raise SessionLoadError("ZipVoice session requires tensor_model/zipvoice/synthesize")
+        if not isinstance(deployment, TorchDeployment) or context.backend != "torch":
             raise SessionLoadError("ZipVoice ONNX session requires a compiled torch deployment")
         self._root = context.validated_manifest.bundle_root
         self._config = self._load_json(self._root / "assets" / "zipvoice_onnx.json")

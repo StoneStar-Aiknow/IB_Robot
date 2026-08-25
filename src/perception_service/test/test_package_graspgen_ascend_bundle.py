@@ -33,11 +33,11 @@ from conftest import (
     write_json,
 )
 
-from inference_manifest import (
+from inference_manifest import load_inference_manifest
+from model_utils.graspgen_contract import (
     GRASPGEN_CONTRACT_VERSION,
     GRASPGEN_EXECUTION,
     graspgen_geometry,
-    load_inference_manifest,
 )
 from model_utils.inference_manifest_export import RuntimeABI, RuntimeTensor
 from perception_service.graspgen_adapter import GraspGenAdapter
@@ -51,8 +51,9 @@ def test_the_bundle_declares_a_perception_model_and_no_lerobot_assets(graspgen_e
     bundle = graspgen_export.bundle
     assert manifest_path == bundle / "inference_manifest.json"
     validated = load_inference_manifest(bundle, GRASPGEN_DEPLOYMENT)
-    assert validated.manifest.model.kind == "perception"
-    assert validated.manifest.model.family == "graspgen"
+    assert validated.manifest.model.interface == "tensor_model"
+    assert validated.manifest.model.model_type == "graspgen"
+    assert validated.manifest.model.operation == "generate_grasps"
     assert validated.policy is None
     for asset in _LEROBOT_ASSETS:
         assert not (bundle / asset).exists()

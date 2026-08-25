@@ -25,7 +25,6 @@ def _prepend_env(current: str, entries: tuple[Path, ...]) -> str:
 _MODEL_PATH_KEYS = (
     "silero_vad_model_path",
     "fullsubnet_ckpt",
-    "fullsubnet_om_path",
     "fullsubnet_stateful_fb_om_path",
     "fullsubnet_stateful_sb_om_path",
     "fullsubnet_stateful_manifest_path",
@@ -71,7 +70,7 @@ def _load_profile_overrides(profiles_path: str | Path, profile: str) -> dict[str
 def _validate_profile_combination(profile: str, params: Mapping[str, object]) -> None:
     """在 launch 边界拒绝半切换配置，避免后端与模型路径错配。"""
     if profile == "ascend_310p":
-        expected = {"silero_vad_backend": "raw_acl", "fullsubnet_backend": "stateful_raw_acl"}
+        expected = {"silero_vad_backend": "ascend", "fullsubnet_backend": "ascend"}
     elif profile == "ubuntu_cuda":
         expected = {
             "silero_vad_backend": "onnx",
@@ -167,9 +166,9 @@ def _launch_setup(context):
         profiles_path=profiles_path,
         parameter_overrides=parameter_overrides,
     )
-    # 只有 raw ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
+    # 只有 Ascend ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
     environment = {}
-    if params.get("silero_vad_backend") == "raw_acl" or params.get("fullsubnet_backend") == "stateful_raw_acl":
+    if params.get("silero_vad_backend") == "ascend" or params.get("fullsubnet_backend") == "ascend":
         environment = {
             "ASCEND_HOME_PATH": str(_CANN_ROOT),
             "PYTHONPATH": _prepend_env(os.environ.get("PYTHONPATH", ""), (_CANN_ROOT / "python" / "site-packages",)),

@@ -16,7 +16,6 @@ from inference_service.backends import (
     BackendCancellationError,
     BackendCapabilities,
     BackendInferenceError,
-    BackendResult,
     BackendState,
     InferenceRequest,
     LifecycleBackend,
@@ -24,6 +23,7 @@ from inference_service.backends import (
     ResourceDomainAdmissions,
     RuntimeContext,
 )
+from inference_service.backends._legacy import BackendResult
 from inference_service.codecs import BindingPolicyCodec, BoundInputs, ExecutionPlan
 from inference_service.pipeline import (
     InferencePipeline,

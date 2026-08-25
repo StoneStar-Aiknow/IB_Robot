@@ -97,7 +97,9 @@ class BindingDecision:
 
 
 class SchedulerError(Exception):
-    pass
+    def __init__(self, message: str, *, code: str = "scheduler_error") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class GlobalSchedulerCore:

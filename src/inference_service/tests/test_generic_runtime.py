@@ -5,14 +5,14 @@ from types import MappingProxyType
 import numpy as np
 import pytest
 
-from inference_service.backends import BackendState
-from inference_service.generic_runtime import (
+from inference_service._legacy_named_tensor import (
     DeploymentIdentity,
-    NamedTensorRequest,
     NamedTensorResult,
     RuntimeErrorInfo,
     RuntimeLatency,
 )
+from inference_service.backends import BackendState
+from inference_service.generic_runtime import NamedTensorRequest
 
 
 def _deployment() -> DeploymentIdentity:

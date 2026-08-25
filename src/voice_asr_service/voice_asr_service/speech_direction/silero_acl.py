@@ -1,4 +1,4 @@
-"""Silero VAD OM 的 raw ACL 状态常驻执行器。"""
+"""Silero VAD OM 的 Ascend ACL 状态常驻执行器。"""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from pathlib import Path
 
 import numpy as np
 
-from inference_manifest import SILERO_AUDIO_SHAPE, speech_direction_bindings
-from inference_service.backends.ascend.acl_runtime import ACL_RUNTIME_MANAGER, AclRuntimeManager
+from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
+from voice_asr_service.speech_direction.contract import SILERO_AUDIO_SHAPE, speech_direction_bindings
 
 # Silero VAD OM（silero_vad_v6_310p_mixed16，openvino_16k 变体）固定静态 ABI。
 # 该 OM 已把采样率折叠为常量，仅保留音频和 LSTM state 两入两出。
@@ -19,25 +19,26 @@ _AUDIO_SHAPE = SILERO_AUDIO_SHAPE
 
 
 class SileroVadAclRunner:
-    """Silero OM、dataset 和 state 双 bank 全生命周期常驻的 raw ACL runner。"""
+    """Silero OM、dataset 和 state 双 bank 全生命周期常驻的 Ascend ACL runner。"""
 
     def __init__(
         self,
         model_path: str,
         *,
         device_id: int = 0,
-        acl_config_path: str = "",
-        runtime_manager: AclRuntimeManager = ACL_RUNTIME_MANAGER,
+        runtime_manager: AclRuntimeManager | None = None,
     ) -> None:
         path = Path(model_path)
         if not path.is_file():
-            raise FileNotFoundError(f"Silero VAD raw ACL OM 不存在: {path}")
+            raise FileNotFoundError(f"Silero VAD Ascend ACL OM 不存在: {path}")
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理（reset/inference 见此标志即拒绝）
         self._cleanup_complete = False  # 所有可执行清理已尝试完毕（含失败项），重入据此返回
         self._poisoned = False
         self._bank = 0
-        self._lease = runtime_manager.acquire(device_id, acl_config_path or None)
+        if runtime_manager is None:
+            raise RuntimeError("SileroVadAclRunner requires an explicitly injected ACL runtime provider")
+        self._lease = runtime_manager.acquire(device_id)
         self._model: AclModel | None = None
         self._states: tuple[AclDeviceBuffer, AclDeviceBuffer] = ()
         try:
@@ -73,12 +74,12 @@ class SileroVadAclRunner:
         """执行一帧并在 Device 内推进 state，只将概率标量复制回 Host。"""
         value = np.asarray(audio, dtype=np.float32)
         if value.shape != _AUDIO_SHAPE:
-            raise ValueError(f"Silero VAD raw ACL 输入必须为{_AUDIO_SHAPE}，得到{value.shape}")
+            raise ValueError(f"Silero VAD Ascend ACL 输入必须为{_AUDIO_SHAPE}，得到{value.shape}")
         with self._lock:
             if self._closed:
-                raise RuntimeError("Silero VAD raw ACL runner 已关闭")
+                raise RuntimeError("Silero VAD Ascend ACL runner 已关闭")
             if self._poisoned:
-                raise RuntimeError("Silero VAD raw ACL 状态不确定，必须先 reset")
+                raise RuntimeError("Silero VAD Ascend ACL 状态不确定，必须先 reset")
             try:
                 probability = self._model.execute_bank(self._bank, {0: np.ascontiguousarray(value)})[0]
                 self._bank = 1 - self._bank

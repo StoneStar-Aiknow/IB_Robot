@@ -40,7 +40,7 @@ def test_packager_preserves_lineage_and_bumps_bundle_for_asset_replacement(tmp_p
     assert spec.required_paths[0] in digests
 
 
-def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) -> None:
+def test_ram_plus_packager_promotes_available_ascend_deployments(tmp_path) -> None:
     spec = _specs()["ram_plus"]
     root = tmp_path / spec.name
     _write_required_assets(root, spec)
@@ -87,8 +87,8 @@ def test_ram_plus_packager_omits_unavailable_ascend_deployment(tmp_path) -> None
 def test_grounded_sam2_bundle_uses_source_bound_architecture_config() -> None:
     spec = _specs()["grounded_sam2"]
 
-    assert (spec.model.family, spec.model.operation) == ("grounding_dino", "combined")
-    assert (spec.adapter["family"], spec.adapter["operation"]) == ("grounding_dino", "combined")
+    assert (spec.model.model_type, spec.model.operation) == ("grounding_dino", "detect")
+    assert (spec.adapter["model_type"], spec.adapter["operation"]) == ("grounding_dino", "detect")
     assert "gdino_config" not in spec.adapter
     assert all(not path.endswith(".py") for path in spec.required_paths)
 

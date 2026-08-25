@@ -35,7 +35,7 @@ YAML 的模型相对路径以 models 目录为根，不再包含额外的 `model
 
 | profile | 默认 | 适用平台 | 后端组合 |
 | --- | --- | --- | --- |
-| `ascend_310p` | 是 | Atlas 310P 推理盒 | Silero `raw_acl` + FullSubNet `stateful_raw_acl` |
+| `ascend_310p` | 是 | Atlas 310P 推理盒 | Silero `ascend` + FullSubNet `ascend` |
 | `ubuntu_cuda` | 否 | x86 + NVIDIA CUDA | Silero `onnx` + FullSubNet `stateful_torch_cuda` |
 | `custom` | 否 | 自定义 | 用户自行填写，仍受半组合校验约束 |
 
@@ -43,11 +43,11 @@ YAML 的模型相对路径以 models 目录为根，不再包含额外的 `model
 ros2 launch voice_asr_service speech_direction.launch.py profile:=ubuntu_cuda
 ```
 
-profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsubnet_backend`、`fullsubnet_device` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，避免后端与模型路径错配的半切换配置。仅 `raw_acl` 相关后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。
+profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsubnet_backend`、`fullsubnet_device` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，避免后端与模型路径错配的半切换配置。仅 `ascend` 后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。
 
 ### 模型资产下载
 
-执行 `python3 scripts/verify_speech_direction_assets.py` 时，脚本走两条校验：先用 `load_inference_manifest_metadata` 标准入口校验 `config/inference_manifest.json` 的 bundle 结构、deployment bindings/execution 与 semantic_identity（不校验文件存在），再读 `config/assets/adapter.json` 逐资产校验 310P 资产的 `algorithm_contract`（family、norm_type、time_steps、input_samples 等）、文件大小与 SHA-256。标准 manifest schema 不收留 sha256/size/algorithm_contract，这些字段由 `assets/adapter.json` 承载，仍由 Python 的 `STATEFUL_FULLSUBNET_CONTRACT` 做 SSOT 校验。脚本只校验不下载，资产不在本仓库管理，需从 NAS 手动获取后放入 `models/` 对应路径；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 两平台共用同一 cumulative 218epochs checkpoint 权重：310P 预导出为 stateful FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
+执行 `python3 scripts/verify_speech_direction_assets.py` 时，脚本走两条校验：先用 `load_inference_manifest_metadata` 标准入口校验 `config/inference_manifest.json` 的 bundle 结构、deployment bindings/execution 与 semantic_identity（不校验文件存在），再读 `config/assets/adapter.json` 逐资产校验 310P 资产的 `algorithm_contract`（model_type、norm_type、time_steps、input_samples 等）、文件大小与 SHA-256。标准 manifest schema 不收留 sha256/size/algorithm_contract，这些字段由 `assets/adapter.json` 承载，仍由 Python 的 `STATEFUL_FULLSUBNET_CONTRACT` 做 SSOT 校验。脚本只校验不下载，资产不在本仓库管理，需从 NAS 手动获取后放入 `models/` 对应路径；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 两平台共用同一 cumulative 218epochs checkpoint 权重：310P 预导出为 FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
 
 ### 配置所有权
 
@@ -64,16 +64,14 @@ profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsu
 | 输入源 | `wav_path` | WAV 输入路径；`input_source=wav` 时必填。离线输入与实时 ReSpeaker 原始流使用同一入口契约，文件必须是 `16 kHz / 6 通道` WAV，并保留设备输入的 ch0～ch5；pipeline 随后按 `channel_indices=[1,2,3,4]` 选取四个麦克风通道。文中的“4 通道增强/DOA”是内部算法通道数，不表示接受 4 通道 WAV |
 | 输入源 | `wav_replay_rate` | `1.0`，WAV 回放倍率，必须大于 0。有效音频播放到 EOF 后，回放器会根据增强窗口尾部、hop 大小和段末静音门限追加若干个内部 6 通道零帧，使现有 VAD/状态机自然结算最后一个语音段；无需在测试文件末尾手工添加静音 |
 | 模型 | `silero_vad_model_path` | Silero VAD 模型路径 |
-| 模型 | `silero_vad_backend` | `raw_acl`（310P OM）；Ubuntu profile 覆盖为 `onnx` |
+| 模型 | `silero_vad_backend` | `ascend`（310P OM）；Ubuntu profile 覆盖为 `onnx` |
 | 模型 | `fullsubnet_ckpt` | FullSubNet cumulative 218epochs checkpoint，两平台共用同一权重 |
-| 模型 | `fullsubnet_backend` | `stateful_raw_acl`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda` |
+| 模型 | `fullsubnet_backend` | `ascend`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda` |
 | 模型 | `fullsubnet_device` | `cuda`；Ubuntu Torch 后端固定 CUDA，禁止静默回退 CPU |
 | 模型 | `fullsubnet_device_id` | `0`；310P ACL 设备 ID，多卡场景下指定目标卡 |
-| 模型 | `fullsubnet_acl_config_path` | `""`；ACL 配置文件路径，空表示用默认配置 |
-| 模型 | `fullsubnet_stateful_fb_om_path` | stateful raw_acl 的 FullBand 拆分 OM 路径，相对 `models/` |
-| 模型 | `fullsubnet_stateful_sb_om_path` | stateful raw_acl 的 SubBand 拆分 OM 路径，相对 `models/` |
+| 模型 | `fullsubnet_stateful_fb_om_path` | Ascend ACL 的 FullBand 拆分 OM 路径，相对 `models/` |
+| 模型 | `fullsubnet_stateful_sb_om_path` | Ascend ACL 的 SubBand 拆分 OM 路径，相对 `models/` |
 | 模型 | `fullsubnet_stateful_manifest_path` | stateful cumulative manifest 路径（声明 norm/checkpoint 契约），相对 `models/` |
-| 模型 | `fullsubnet_om_path` | legacy 单体 OM 回退路径，相对 `models/`；仅 legacy backend 使用 |
 | 运行时效 | `speech_direction_max_age_ms` | `1300` ms，方向结果最大保鲜时间 |
 
 这些参数均由 `voice_asr_service` 独占管理。`sound_follow` 只维护底盘最小集和跟随行为参数，其完整 launch 通过无参数 include 复用本包的 `speech_direction.launch.py`，不读取或转发任何音频参数。
@@ -144,16 +142,16 @@ source .shrc_local && speech_direction_report \
 它不是事务锁或 journal，第二次替换失败时可能留下半套新输出，请检查后带
 `--overwrite` 顺序重跑。
 
-### 链路分叉：stateful 生产链路与 legacy 显式对照链路
+### 链路分叉：stateful 生产链路与显式对照链路
 
-本 PR 同时保留两套门控 + 两套 pipeline，`node.py` 按 `fullsubnet_backend.startswith("stateful_")` 选择哪一套，二者不静默回退：
+本 PR 同时保留两套门控 + 两套 pipeline，`node.py` 按后端是否使用 stateful 执行器选择哪一套，二者不静默回退：
 
 | 链路 | 后端 | 门控 | pipeline | 时序参数 |
 | --- | --- | --- | --- | --- |
-| **生产链路** | `stateful_raw_acl` / `stateful_torch_*` | `TemporalSpeechGate`（状态机帧级） | `StreamingSpeechDirectionPipeline` | tick=256、model_batch=512、SRP frame=4096/hop=512 |
-| 显式对照 | `legacy_om` / `legacy_torch` | `SpeechGate`（Top-2 hop 级） | `SpeechDirectionPipeline` | hop=2048、enh_block=8192 |
+| **生产链路** | `ascend` / `stateful_torch_*` | `TemporalSpeechGate`（状态机帧级） | `StreamingSpeechDirectionPipeline` | tick=256、model_batch=512、SRP frame=4096/hop=512 |
+| 显式对照 | `torch` | `SpeechGate`（Top-2 hop 级） | `SpeechDirectionPipeline` | hop=2048、enh_block=8192 |
 
-- 生产部署用 `stateful_*`，走 `StreamingSpeechDirectionPipeline` + `TemporalSpeechGate`；`legacy_*` 仅作显式对照保留，启动时按后端名严格选择，**不会从 stateful 静默回退到 legacy**，后端与路径错配会在 `_build_and_start` 抛 `ValueError`。
+- 生产部署用 `ascend` 或 `stateful_torch_*`，走 `StreamingSpeechDirectionPipeline` + `TemporalSpeechGate`；`torch` 仅作显式对照保留，启动时按后端名严格选择，**不会从 stateful 静默回退到对照链路**，后端与路径错配会在 `_build_and_start` 抛 `ValueError`。
 - 两套 pipeline 都消费同一组 `VadState` / `DoaState`，但调用节奏不同：streaming 每 256 样本 tick 一次 `vad_state.update`（两个 tick 合并为一次 T=2 模型推理），legacy 每 2048 样本 hop 一次。两者都向 `DoaState.update` 写段级 DOA，`meta.type` 取值相同（`mid_long_seg` / `seg_end`），但 `mid_long_seg` 的触发条件不同——streaming 按 `max_accum_samples`（样本计数），legacy 按 `max_accum_dur_s`（墙钟时长）。`node._poll_and_publish` 按 `result["type"]` 区分段末与中间方向，上游消费者无需感知链路分叉。
 - `SpeechGate` 的 Top-2 选择对 hop_size 敏感（旧值 2048 vs 新值 512 会改变 Top-2 候选），故 legacy 链路固定用 2048 hop，不沿用 stateful 的 512；两套链路的时序参数各自独立，不共享。
 

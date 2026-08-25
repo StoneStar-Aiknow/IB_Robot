@@ -8,7 +8,7 @@ import numpy as np
 
 from inference_service.backends import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest, NamedTensorResult
+from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import ModelSession
 from inference_service.pipeline import (
@@ -19,6 +19,7 @@ from inference_service.pipeline import (
     SequentialModelExecutor,
     StageFrame,
 )
+from inference_service.unified_runtime import ModelResult, RegistrySet, RuntimeProviders
 
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
@@ -27,10 +28,11 @@ class EchoAdapter(PerceptionAdapter):
     """Translate a typed ``value`` field to and from an identity tensor graph."""
 
     identity = AdapterIdentity(
-        family="dummy_echo",
+        model_type="dummy_echo",
         preprocessing="identity-float32-v1",
         postprocessing="identity-float32-v1",
         supported_deployments=frozenset({"cpu"}),
+        operation="echo",
     )
 
     def preprocess(self, value: object) -> Mapping[str, np.ndarray]:
@@ -39,7 +41,7 @@ class EchoAdapter(PerceptionAdapter):
             raise ValueError("dummy echo input must contain two finite values")
         return {"echo.input": tensor}
 
-    def postprocess(self, result: NamedTensorResult, **options) -> list[float]:
+    def postprocess(self, result: ModelResult, **options) -> list[float]:
         del options
         output = np.asarray(result.outputs["echo.output"], dtype=np.float32)
         if output.shape != (2,):
@@ -48,7 +50,7 @@ class EchoAdapter(PerceptionAdapter):
 
 
 class _EchoSession(ModelSession):
-    def __init__(self) -> None:
+    def __init__(self, domains) -> None:
         super().__init__(
             "model-session:dummy-echo",
             BackendCapabilities(
@@ -61,12 +63,17 @@ class _EchoSession(ModelSession):
                     independent_close=True,
                 ),
             ),
+            domains=domains,
         )
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         del rollback
-        if context.model.family != EchoAdapter.identity.family:
-            raise ValueError(f"dummy echo requires family {EchoAdapter.identity.family!r}")
+        if (context.interface, context.model_type, context.operation) != (
+            "tensor_model",
+            EchoAdapter.identity.model_type,
+            EchoAdapter.identity.operation,
+        ):
+            raise ValueError("dummy echo requires tensor_model/dummy_echo/echo")
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
         return {"echo.output": np.asarray(request.inputs["echo.input"], dtype=np.float32).copy()}
@@ -80,20 +87,30 @@ class EchoServicePlugin(ModelServicePlugin):
 
     service_type = "ibrobot_msgs/srv/EchoModel"
 
-    def __init__(self, host, validated, options) -> None:
+    def __init__(
+        self,
+        host,
+        validated,
+        options,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
         del host
+        if registry_set is None or providers is None:
+            raise ValueError("dummy echo requires explicitly injected runtime dependencies")
         if options:
             raise ValueError(f"dummy echo does not accept runtime options: {sorted(options)}")
         self.adapter = EchoAdapter()
         self.adapter.validate_deployment(validated.deployment_name)
-        self.session = _EchoSession()
-        context = RuntimeContext(validated)
+        self.session = _EchoSession(providers.resource_admission_provider)
+        context = RuntimeContext(validated, runtime_profile=validated.runtime_profile)
 
         class _EchoResultAdapter:
             def adapt(_self, frame: StageFrame) -> list[float]:
                 result = frame.values["_model_result"]
-                if not isinstance(result, NamedTensorResult):
-                    raise TypeError("dummy echo model stage did not return a NamedTensorResult")
+                if not isinstance(result, ModelResult):
+                    raise TypeError("dummy echo model stage did not return a ModelResult")
                 return self.adapter.postprocess(result)
 
             def adapt_error(_self, error: ExecutionError) -> object:

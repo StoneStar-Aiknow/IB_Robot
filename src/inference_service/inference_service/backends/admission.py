@@ -7,7 +7,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import ClassVar
 
 from inference_service.backends.errors import BackendAdmissionError
 from inference_service.backends.types import BackendCapabilities
@@ -30,20 +29,10 @@ class _InstanceRecord:
 class ResourceDomainAdmissions:
     """Own shared gates keyed by a backend-declared process resource domain."""
 
-    _shared: ClassVar[ResourceDomainAdmissions | None] = None
-    _shared_lock: ClassVar[threading.Lock] = threading.Lock()
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._domains: dict[str, _DomainGate] = {}
         self._instances: dict[str, _InstanceRecord] = {}
-
-    @classmethod
-    def shared(cls) -> ResourceDomainAdmissions:
-        with cls._shared_lock:
-            if cls._shared is None:
-                cls._shared = cls()
-            return cls._shared
 
     def register(self, domain: str, limit: int) -> ResourceDomainLease:
         if not domain:
@@ -177,7 +166,12 @@ class BackendAdmission:
         *,
         domains: ResourceDomainAdmissions | None = None,
     ) -> None:
-        manager = domains or ResourceDomainAdmissions.shared()
+        if domains is None:
+            raise BackendAdmissionError(
+                "ResourceDomainAdmissions must be explicitly injected",
+                code="resource_admission_provider_required",
+            )
+        manager = domains
         self._instance_lease = manager.register_instance(backend_name, capabilities.supports_multiple_instances)
         self._instance_limit = capabilities.max_in_flight_per_instance
         self._instance_gate = threading.BoundedSemaphore(self._instance_limit)

@@ -81,14 +81,23 @@ class RKNNModelSession(ModelSession):
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "rknn":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "rknn":
             raise BackendLoadError("RKNNModelSession requires a compiled rknn deployment", code="invalid_deployment")
         if deployment.device_links:
             raise BackendLoadError(
                 "RKNNLite does not support manifest device-pointer links; declare host-visible internal bindings",
                 code="unsupported_device_links",
             )
-        options = validate_runtime_options(context.runtime_options)
+        profile = context.backend_profile
+        profile_options = dict(context.runtime_options)
+        if profile is not None:
+            target_name = getattr(profile, "target_name", None)
+            core_mask = getattr(profile, "core_mask", None)
+            if target_name is not None:
+                profile_options.setdefault("target", target_name)
+            if core_mask is not None:
+                profile_options.setdefault("core_mask", core_mask)
+        options = validate_runtime_options(profile_options)
 
         host_roles: list[str] = []
         for role in deployment.execution:

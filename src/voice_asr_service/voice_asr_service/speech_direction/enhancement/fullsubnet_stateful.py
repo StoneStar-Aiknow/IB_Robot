@@ -51,6 +51,7 @@ class StatefulFullSubNetEnhancer:
         *,
         manifest_path: str = "",
         timing_enabled: bool = False,
+        initialize_backend: bool = True,
     ):
         if manifest_path:
             self._verify_manifest(manifest_path)
@@ -58,6 +59,7 @@ class StatefulFullSubNetEnhancer:
         self.backend = executor.backend
         self.input_samples = INPUT_SAMPLES
         self.timing_enabled = bool(timing_enabled)
+        self._initialize_backend = bool(initialize_backend)
         self._lock = threading.RLock()
         self._closed = False  # 关闭一旦开始即禁新推理（process/reset 见此即拒绝）
         self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
@@ -66,7 +68,9 @@ class StatefulFullSubNetEnhancer:
         # periodic Hann 与当前 FullSubNet/历史 B4 验证保持一致。
         self._window = np.hanning(N_FFT + 1)[:-1].astype(np.float32)
         self._window_square = self._window * self._window
-        self.reset()
+        self._reset_host_state()
+        if self._initialize_backend:
+            self._executor.reset()
         logger.info("FullSubNet stateful 公共增强器已加载: backend=%s", self.backend)
 
     @staticmethod
@@ -107,22 +111,28 @@ class StatefulFullSubNetEnhancer:
                     f"期望={want!r}（与 STATEFUL_FULLSUBNET_CONTRACT 不一致）: {path}"
                 )
 
+    def _reset_host_state(self) -> None:
+        """Clear STFT, normalization, and overlap-add state without touching the backend."""
+
+        self._fb_sum = np.zeros(BATCH, np.float64)
+        self._fb_count = np.zeros(BATCH, np.float64)
+        self._sb_sum = np.zeros((BATCH, NUM_FREQS), np.float64)
+        self._sb_count = np.zeros((BATCH, NUM_FREQS), np.float64)
+        self._stft_tail = np.zeros((HOP, BATCH), np.float32)
+        self._raw_spectrum: deque[np.ndarray] = deque()
+        self._ola_numerator = np.zeros((HOP, BATCH), np.float64)
+        self._ola_denominator = np.zeros(HOP, np.float64)
+        self._output_frame_index = 0
+        self._timing_sample_counter = 0
+        self.last_timing_ms = {}
+
     def reset(self) -> None:
-        """清空所有只能跨连续音频复用的模型、频谱和 OLA 状态。"""
+        """Clear host state and reset recurrent backend state in place."""
+
         with self._lock:
             if self._closed:
                 return
-            self._fb_sum = np.zeros(BATCH, np.float64)
-            self._fb_count = np.zeros(BATCH, np.float64)
-            self._sb_sum = np.zeros((BATCH, NUM_FREQS), np.float64)
-            self._sb_count = np.zeros((BATCH, NUM_FREQS), np.float64)
-            self._stft_tail = np.zeros((HOP, BATCH), np.float32)
-            self._raw_spectrum: deque[np.ndarray] = deque()
-            self._ola_numerator = np.zeros((HOP, BATCH), np.float64)
-            self._ola_denominator = np.zeros(HOP, np.float64)
-            self._output_frame_index = 0
-            self._timing_sample_counter = 0
-            self.last_timing_ms = {}
+            self._reset_host_state()
             self._executor.reset()
 
     def _stft_two_frames(self, audio4: np.ndarray) -> np.ndarray:
@@ -257,7 +267,7 @@ class StatefulFullSubNetEnhancer:
                 )
         return result
 
-    def close(self) -> None:
+    def close(self, *, close_executor: bool = True) -> None:
         """best-effort terminal 关闭：释放后端 executor 资源。
 
         关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
@@ -268,15 +278,34 @@ class StatefulFullSubNetEnhancer:
                 # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
                 return
             self._closed = True  # 禁新推理
+            self._clear_host_state()
             try:
-                self._executor.close()
+                if close_executor:
+                    self._executor.close()
             finally:
-                # 此层"已尝试调用清理"即视为 terminal，异常透传给上层汇总。
-                self._cleanup_complete = True
+                # A host-only close leaves backend ownership to the assembly;
+                # the later backend-resource close must still be able to run.
+                if close_executor:
+                    self._cleanup_complete = True
+
+    def close_host(self) -> None:
+        """Invalidate host state while leaving the backend executor open."""
+
+        with self._lock:
+            if self._cleanup_complete:
+                return
+            self._closed = True
+            self._clear_host_state()
+
+    def _clear_host_state(self) -> None:
+        self._fb_sum = np.zeros(0, np.float64)
+        self._fb_count = np.zeros(0, np.float64)
+        self._sb_sum = np.zeros((0, 0), np.float64)
+        self._sb_count = np.zeros((0, 0), np.float64)
+        self._stft_tail = np.zeros((0, BATCH), np.float32)
+        self._raw_spectrum.clear()
+        self._ola_numerator = np.zeros((0, BATCH), np.float64)
+        self._ola_denominator = np.zeros(0, np.float64)
 
 
-# 兼容已迁入代码中的旧类型名；新装配统一使用 StatefulFullSubNetEnhancer。
-StatefulOmFullSubNetEnhancer = StatefulFullSubNetEnhancer
-
-
-__all__ = ["StatefulFullSubNetEnhancer", "StatefulOmFullSubNetEnhancer"]
+__all__ = ["StatefulFullSubNetEnhancer"]

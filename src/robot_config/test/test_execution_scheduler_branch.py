@@ -42,11 +42,26 @@ def _create_bundle(root: Path) -> Path:
     (root / "model.safetensors").write_bytes(b"test-weights")
     paths = ("config.json", "model.safetensors", "policy_postprocessor.json", "policy_preprocessor.json")
     entries = [BundleFile(path=path) for path in paths]
-    deployment_values = {"cpu": {"uuid": _DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}}
+    deployment_values = {
+        "cpu": {
+            "uuid": _DEPLOYMENT_UUID,
+            "revision": 1,
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": "torch",
+                "target": {"runtime": "torch"},
+                "profile": {"device": "cpu"},
+            },
+        }
+    }
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": _BUNDLE_UUID,
                 "revision": 1,
@@ -57,6 +72,13 @@ def _create_bundle(root: Path) -> Path:
                     "scope": "structure",
                     "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
                 },
+            },
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [{"semantic": "observation.state", "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
             },
             "deployments": deployment_values,
         },

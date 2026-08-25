@@ -24,8 +24,8 @@ NORM_TYPE = "cumulative_laplace_norm"
 HOST_DTYPE = np.dtype(np.float32)
 
 # FullSubNet cumulative 218epochs checkpoint 的逻辑模型身份；与 manifest 的
-# algorithm_contract.family / checkpoint 字段对齐，SSOT，散落处不再各自硬编码。
-FAMILY = "fullsubnet_cumulative_stateful"
+# algorithm_contract.model_type / checkpoint 字段对齐，SSOT，散落处不再各自硬编码。
+MODEL_TYPE = "fullsubnet"
 CHECKPOINT = "cum_fullsubnet_best_model_218epochs"
 
 # SRP-PHAT DOA 的帧/步长，与 manifest 的 srp_* 字段对齐。
@@ -48,7 +48,7 @@ class StatefulFullSubNetContract:
     校验脚本与 _verify_manifest 据此逐项比对，避免 Python/JSON/shell 三处各写一份。
     """
 
-    family: str = FAMILY
+    model_type: str = MODEL_TYPE
     checkpoint: str = CHECKPOINT
     n_fft: int = N_FFT
     stft_hop: int = STFT_HOP
@@ -93,7 +93,7 @@ class StatefulFullSubNetExecutor(Protocol):
 __all__ = [
     "BATCH",
     "CHECKPOINT",
-    "FAMILY",
+    "MODEL_TYPE",
     "FB_FRAME_SHAPE",
     "FB_HIDDEN",
     "FB_OUTPUT_SHAPE",

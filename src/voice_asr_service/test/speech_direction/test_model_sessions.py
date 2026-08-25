@@ -18,10 +18,11 @@ for package_root in (_SRC, _WORKSPACE_SRC / "inference_manifest", _WORKSPACE_SRC
 
 from inference_manifest import load_inference_manifest  # noqa: E402
 from inference_service.backends import RuntimeContext  # noqa: E402
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, StatefulAscendOmModelSession  # noqa: E402
+from inference_service.model_sessions import StatefulAscendOmModelSession  # noqa: E402
+from inference_service.runtime_composition import build_runtime_dependencies  # noqa: E402
 from voice_asr_service.model_session_builders import register_speech_direction_session_builder  # noqa: E402
+from voice_asr_service.speech_direction.config import FullSubNetConfig, VadConfig  # noqa: E402
 from voice_asr_service.speech_direction.model_sessions import SpeechDirectionRoleRunner  # noqa: E402
-from voice_asr_service.speech_direction.node import _build_acl_runtime_options  # noqa: E402
 from voice_asr_service.speech_direction.speech_gate import SileroVadEngine  # noqa: E402
 
 
@@ -70,16 +71,10 @@ class _VadRunner:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize(
-    ("acl_config_path", "expected"),
-    [
-        ("", {"device_id": 0}),
-        ("   ", {"device_id": 0}),
-        (" /etc/acl.json ", {"device_id": 0, "acl_config_path": "/etc/acl.json"}),
-    ],
-)
-def test_acl_runtime_options_omit_empty_default_path(acl_config_path, expected) -> None:
-    assert _build_acl_runtime_options(0, acl_config_path) == expected
+def test_voice_asr_uses_canonical_backend_names_without_runtime_acl_options() -> None:
+    assert FullSubNetConfig().backend == "ascend"
+    assert VadConfig().backend == "ascend"
+    assert not hasattr(FullSubNetConfig(), "acl_config_path")
 
 
 def test_silero_engine_reuses_runner_and_adds_context(tmp_path) -> None:
@@ -144,8 +139,20 @@ def test_checked_in_speech_manifest_selects_generic_stateful_session(tmp_path, d
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"mock-om")
 
-    context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0})
-    register_speech_direction_session_builder()
-    session = MODEL_SESSION_BUILDER_REGISTRY.create(context)
+    role = "fullsubnet_fb" if deployment_name.endswith("fullsubnet") else "silero_vad"
+    context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0}, role=role)
+    assert context.target_runtime == "acl"
+    assert context.runtime_abi == "cann-8.1.RC1"
+    dependencies = build_runtime_dependencies(
+        lambda session_registry, _assembler_registry: register_speech_direction_session_builder(session_registry)
+    )
+    try:
+        session = dependencies.registry_set.session_builder_registry.create(
+            context,
+            backend_registry=dependencies.registry_set.backend_registry,
+            providers=dependencies.providers,
+        )
+    finally:
+        dependencies.providers.close()
 
     assert isinstance(session, StatefulAscendOmModelSession)

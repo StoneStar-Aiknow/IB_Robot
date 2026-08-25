@@ -104,18 +104,18 @@ def _descriptors(role):
 
 def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
     plugin, adapter_type = FAMILIES[role]
-    family = plugin.family
+    family = plugin.model_type
     operation = plugin.operation
     assets = root / "assets"
     assets.mkdir(parents=True)
     identity = adapter_type.identity
     adapter_record = {
-        "family": family,
+        "interface": "tensor_model",
+        "model_type": identity.model_type,
+        "operation": operation,
         "preprocessing": adapter_preprocessing or identity.preprocessing,
         "postprocessing": identity.postprocessing,
     }
-    if operation:
-        adapter_record["operation"] = operation
     (assets / "adapter.json").write_text(
         json.dumps(adapter_record),
         encoding="utf-8",
@@ -149,7 +149,7 @@ def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
     bundle_uuid = "8fa9838a-2e15-4cf4-a9d5-4fb876c10eb7"
     name = f"{role}-test"
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": bundle_uuid,
             "revision": 1,
@@ -162,8 +162,8 @@ def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
             },
         },
         "model": {
-            "kind": "perception",
-            "family": family,
+            "interface": "tensor_model",
+            "model_type": identity.model_type,
             "operation": operation,
             "inputs": inputs,
             "outputs": outputs,
@@ -173,8 +173,16 @@ def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
             "torch_cpu": {
                 "uuid": "26547f4a-1d02-4ea1-b4dc-c887ca557a68",
                 "revision": 1,
-                "backend": "torch",
-                "device": "cpu",
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "torch",
+                    "target": {"runtime": "torch"},
+                    "profile": {"device": "cpu"},
+                },
             }
         },
     }
@@ -280,7 +288,7 @@ def fake_sessions(monkeypatch):
     monkeypatch.setattr(
         _SessionPlugin,
         "_session_factory",
-        staticmethod(lambda _family, adapter, _validated, _options: _FakeSession(adapter)),
+        staticmethod(lambda _model_type, adapter, _validated, _options: _FakeSession(adapter)),
     )
 
 
@@ -395,7 +403,7 @@ def test_siglip_image_and_text_use_independent_sessions_and_execute_named_reques
     assert image_plugin.session is not text_plugin.session
     assert type(image_plugin.adapter) is SigLIP2ImageAdapter
     assert type(text_plugin.adapter) is SigLIP2TextAdapter
-    assert image_plugin.adapter.identity.family == text_plugin.adapter.identity.family == "siglip2"
+    assert image_plugin.adapter.identity.model_type == text_plugin.adapter.identity.model_type == "siglip2"
     assert image_identity == text_identity
     assert image_identity.embedding_space_id == "siglip2-test-space"
     assert image_identity.dimension == 4
@@ -482,7 +490,7 @@ def test_unfinished_compiled_family_fails_before_session_creation_without_fallba
     )
     with pytest.raises(RuntimeError, match="ABI is not finalized"):
         context = SimpleNamespace(
-            model=SimpleNamespace(family="grounding_dino"),
+            model=SimpleNamespace(model_type="grounding_dino"),
             deployment=deployment,
             runtime_options={},
         )
@@ -492,7 +500,7 @@ def test_unfinished_compiled_family_fails_before_session_creation_without_fallba
 def test_only_conformant_adapters_promote_compiled_abi() -> None:
     adapters = (RAMPlusAdapter, SAM2Adapter, SigLIP2ImageAdapter, SigLIP2TextAdapter, GroundingDINOAdapter)
 
-    assert {adapter.identity.family for adapter in adapters if adapter.compiled_abi_finalized} == {
+    assert {adapter.identity.model_type for adapter in adapters if adapter.compiled_abi_finalized} == {
         "ram_plus",
         "sam2",
         "siglip2",
@@ -504,8 +512,16 @@ def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> Non
         {
             "uuid": "26547f4a-1d02-4ea1-b4dc-c887ca557a68",
             "revision": 1,
-            "backend": "ascend",
-            "target": {"soc": "Ascend310P3", "runtime": "acl"},
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": "ascend",
+                "target": {"soc": "Ascend310P3", "runtime": "acl"},
+                "profile": {"device_id": 0},
+            },
             "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
             "execution": ("model",),
             "bindings": {
@@ -518,7 +534,7 @@ def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> Non
     )
 
     context = SimpleNamespace(
-        model=SimpleNamespace(family="ram_plus"),
+        model=SimpleNamespace(model_type="ram_plus"),
         deployment=deployment,
         runtime_options={},
     )
@@ -552,7 +568,7 @@ def test_plugin_fails_closed_when_registry_lacks_conformance_evidence(tmp_path, 
                 name="torch",
                 factory="tests.fake_backend_factory:create_backend",
                 target_validator=lambda deployment: None,
-                supported_model_families=frozenset({"sam2"}),
+                supported_identities=frozenset({("tensor_model", "sam2", "automatic")}),
             )
         }
     )
@@ -587,13 +603,14 @@ def test_plugin_pins_operation_so_distinct_service_contracts_do_not_collide(tmp_
 
 
 def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_registry(tmp_path) -> None:
-    # A compiled Ascend bundle now carries the base family (sam2/grounding_dino) plus an
-    # operation (prompt/raw), so it passes the static registry that _SessionPlugin uses,
-    # without minting an unsupported family name.
-    from inference_service.backends import BACKEND_REGISTRY
+    # A compiled Ascend bundle carries the canonical model type and operation, so it
+    # passes the static registry without minting a variant model type.
+    from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry
     from inference_service.backends.types import RuntimeContext
 
-    for family, operation in (("sam2", "prompt"), ("grounding_dino", "raw")):
+    backend_registry = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
+
+    for family, operation in (("sam2", "prompt"), ("grounding_dino", "detect")):
         root = tmp_path / family
         assets = root / "assets"
         assets.mkdir(parents=True)
@@ -603,7 +620,7 @@ def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_regi
         artifact.write_bytes(b"compiled")
         files = [BundleFile(path="assets/adapter.json")]
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": "8fa9838a-2e15-4cf4-a9d5-4fb876c10eb7",
                 "revision": 1,
@@ -618,8 +635,8 @@ def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_regi
                 },
             },
             "model": {
-                "kind": "perception",
-                "family": family,
+                "interface": "tensor_model",
+                "model_type": family,
                 "operation": operation,
                 "inputs": [{"semantic": "image", "dtype": "float32", "shape": [1, 3, 1024, 1024], "layout": "NCHW"}],
                 "outputs": [
@@ -630,8 +647,16 @@ def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_regi
                 "ascend_310p": {
                     "uuid": "26547f4a-1d02-4ea1-b4dc-c887ca557a68",
                     "revision": 1,
-                    "backend": "ascend",
-                    "target": {"soc": "Ascend310P1", "runtime": "acl"},
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "ascend",
+                        "target": {"soc": "Ascend310P1", "runtime": "acl"},
+                        "profile": {"device_id": 0},
+                    },
                     "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
                     "execution": ["model"],
                     "bindings": {
@@ -663,6 +688,6 @@ def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_regi
         validated = load_inference_manifest(root, "ascend_310p")
         context = RuntimeContext(validated_manifest=validated, runtime_options={"device_id": 0})
 
-        assert BACKEND_REGISTRY.validate(context).name == "ascend"
-        assert validated.manifest.model.family == family
+        assert backend_registry.validate(context).name == "ascend"
+        assert validated.manifest.model.model_type == family
         assert validated.manifest.model.operation == operation

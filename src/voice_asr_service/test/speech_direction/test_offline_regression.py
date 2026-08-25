@@ -225,7 +225,7 @@ class TestOfflineRegression:
             pytest.skip(f"音频不存在: {wav_path}")
 
         # 重置 pipeline 状态(每个文件独立测,丢弃上个文件残留)
-        runtime.pipeline.reset()
+        runtime.reset()
         runtime.doa_state._angle = None
         runtime.doa_state._wall_clock_ts = 0.0
         runtime.doa_state._seq_id = 0

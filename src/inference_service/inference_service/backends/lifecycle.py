@@ -24,10 +24,10 @@ from inference_service.backends.types import (
     BackendCapabilities,
     BackendHealth,
     BackendPriorityMapping,
-    BackendResult,
     BackendState,
     InferenceRequest,
     RuntimeContext,
+    _LegacyBackendResult,
 )
 
 
@@ -164,7 +164,7 @@ class LifecycleBackend(ABC):
                 self._loading = False
                 self._condition.notify_all()
 
-    def infer(self, request: InferenceRequest) -> BackendResult:
+    def infer(self, request: InferenceRequest) -> _LegacyBackendResult:
         self._require_ready("infer")
         self._validate_request(request)
         with self._admission.admit(request.deadline):
@@ -173,9 +173,9 @@ class LifecycleBackend(ABC):
                 self._active_operations += 1
             try:
                 result = self._infer(request)
-                if not isinstance(result, BackendResult):
+                if not isinstance(result, _LegacyBackendResult):
                     raise BackendInferenceError(
-                        f"backend {self.name!r} returned {type(result).__name__}, expected BackendResult",
+                        f"backend {self.name!r} returned {type(result).__name__}, expected a legacy result",
                         code="invalid_backend_result",
                     )
             except Exception as exc:
@@ -379,7 +379,7 @@ class LifecycleBackend(ABC):
         """Allocate and validate runtime resources, registering partial cleanup in rollback."""
 
     @abstractmethod
-    def _infer(self, request: InferenceRequest) -> BackendResult:
+    def _infer(self, request: InferenceRequest) -> _LegacyBackendResult:
         """Execute one admitted request."""
 
     @abstractmethod

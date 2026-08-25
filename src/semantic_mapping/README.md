@@ -190,7 +190,7 @@ semantic_mapping:
 完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、labels、target-watch 和 public interface
 参数，参考 `robot_config/config/robots/lekiwi_realsense_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
 `perception_services.services`；每个 role 指向一个 enabled service ID，不再直接配置 backend、endpoint 或模型
-identity。service 模式下 loader 从 schema-v2 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
+identity。service 模式下 loader 从 schema-v3 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
 policy，并拒绝 SigLIP2 image/text embedding metadata 不兼容的配置。检查入库的 service entries 是 disabled
 templates，因此没有 production model assets 时 YAML 仍可加载；启用建图时必须提供有效 bundle 和 named deployment。
 
@@ -316,7 +316,7 @@ service bundles，也不要求 service semantic identities；service 模式仍�
 ./scripts/download_perception_models.sh
 ```
 
-下载脚本默认准备 semantic mapping 的四个 schema-v2 bundle：
+下载脚本默认准备 semantic mapping 的四个 schema-v3 bundle：
 
 ```text
 models/
@@ -393,7 +393,7 @@ trip、fusion commit 和 end-to-end 的 P50/P95，同时报告 throughput 和 dr
 初始 production promotion gate 要求至少 100 个 timing samples、mask batch 不超过 8、model inference P50 不
 超过 326 ms。在线模式还要求 end-to-end P95 ≤ 750 ms、queue-wait P95 ≤ 100 ms、drop ratio ≤ 5%；离线
 模式要求 throughput ≥ 1 frame/s。所有 stage-specific conformance 必须先通过。阈值是初始软件 gate，必须在
-目标硬件上记录实际报告后才能 promotion；当前未验证的 `ascend_om` 仍保持 not-ready。
+目标硬件上记录实际报告后才能 promotion；当前未验证的 Ascend deployment 仍保持 not-ready。
 
 无需 ROS 或真实设备，可在 IB-Robot 仓库根目录使用 RealSense RGB-D fixture 运行模型验证：
 

@@ -51,6 +51,7 @@ class StreamingSpeechDirectionPipeline:
         vad_threshold: float = 0.65,
         rms_threshold: float = 0.002,
         diagnostics=None,
+        initialize_backend: bool = True,
     ):
         self.fullnet = fullnet
         self.srp = srp
@@ -71,6 +72,7 @@ class StreamingSpeechDirectionPipeline:
             rms_threshold=rms_threshold,
             candidate_window_samples=params.candidate_window_samples,
             exit_gap_samples=params.segment_end_gap_samples,
+            initialize_backend=initialize_backend,
         )
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理（process/reset 见此即拒绝）
@@ -84,11 +86,12 @@ class StreamingSpeechDirectionPipeline:
         # 仅在真正执行 fullnet+vad+srp 的 tick(偶数 hop,累积满 512 样本)记录,
         # 早退 tick 不计入,故可直接用做"单次块处理时延"基线。reset 清空。
         self._block_latency_ms: deque[float] = deque(maxlen=8192)
-        self._reset_temporal_context()
+        self._reset_temporal_context(reset_backend=initialize_backend)
 
-    def _reset_temporal_context(self) -> None:
-        self.fullnet.reset()
-        self.gate.reset()
+    def _reset_temporal_context(self, *, reset_backend: bool = True) -> None:
+        if reset_backend:
+            self.fullnet.reset()
+            self.gate.reset()
         self._srp_history = np.zeros((0, 4), np.float32)
         self._state = "IDLE"
         self._scores: list[np.ndarray] = []
@@ -350,7 +353,7 @@ class StreamingSpeechDirectionPipeline:
             self._history = []
             self._block_latency_ms.clear()
 
-    def close(self) -> None:
+    def close(self, *, close_backends: bool = True) -> None:
         """best-effort terminal 关闭：尽力释放 enhancer 与 Silero，一个失败仍继续关闭另一个，末尾汇总异常。
 
         关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
@@ -365,11 +368,26 @@ class StreamingSpeechDirectionPipeline:
         try:
             for component in (self.gate, self.fullnet):
                 try:
-                    component.close()
+                    if component is self.gate:
+                        component.close(close_silero=close_backends)
+                    elif close_backends:
+                        component.close(close_executor=close_backends)
+                    else:
+                        close_host = getattr(component, "close_host", None)
+                        if callable(close_host):
+                            close_host()
+                        else:
+                            component.close(close_executor=False)
                 except Exception as exc:
                     errors.append(str(exc) or type(exc).__name__)
         finally:
             # 整个遍历已尝试完毕（含部分失败项），重入据此返回。
+            self._srp_history = np.zeros((0, 4), np.float32)
+            self._scores = []
+            self._rms = []
+            self._input_pending = np.zeros((0, 4), np.float32)
+            self._history = []
+            self._block_latency_ms.clear()
             self._cleanup_complete = True
         if errors:
             raise RuntimeError("; ".join(errors))

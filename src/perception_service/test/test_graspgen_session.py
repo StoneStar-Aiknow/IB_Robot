@@ -31,10 +31,11 @@ from conftest import (
     package_graspgen_export,
 )
 
-from inference_manifest import GRASPGEN_EXECUTION, load_inference_manifest
+from inference_manifest import load_inference_manifest
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.types import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
+from model_utils.graspgen_contract import GRASPGEN_EXECUTION
 from perception_service.graspgen_adapter import GraspGenAdapter
 from perception_service.graspgen_session import GraspGenAscendSession
 

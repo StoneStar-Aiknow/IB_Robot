@@ -39,7 +39,7 @@ _PIXEL_OFFSET = 0.5
 class SAM2AutomaticAscendSession(AscendOmModelSession):
     """Drive encoder + decoder OMs to produce automatic masks on Ascend."""
 
-    allowed_runtime_options = frozenset({"device_id", "acl_config_path"})
+    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options
 
     def _load(self, context, rollback) -> None:
         deployment = context.deployment

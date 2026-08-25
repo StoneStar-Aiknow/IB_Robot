@@ -13,6 +13,11 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from inference_service.runtime_composition import (
+    require_runtime_dependencies,
+)
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
+
 try:
     import torch
 except ModuleNotFoundError as exc:
@@ -147,7 +152,7 @@ _DEFAULT_MODEL_DIR = _WORKSPACE_ROOT / "models" / "grasp"
 class LocalPipelineBackend:
     """In-process GraspGen inference through the unified generic pipeline.
 
-    GraspGen is a ``kind=perception`` model, so its semantics live in
+    GraspGen is a ``tensor_model/graspgen/generate_grasps`` model, so its semantics live in
     ``perception_service.GraspGenAdapter`` (point-cloud preparation and grasp
     decoding). The selected model session owns either Torch CUDA execution or the
     eight-role Ascend execution. This class only drives that pair in-process;
@@ -161,6 +166,8 @@ class LocalPipelineBackend:
         deployment_name: str = "ascend_310p",
         device_id: int = 0,
         random_seed: int | None = None,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
     ):
         if not manifest_path.strip():
             raise ValueError("local GraspGen manifest_path must not be empty")
@@ -170,6 +177,13 @@ class LocalPipelineBackend:
         self._deployment_name = deployment_name.strip() or "ascend_310p"
         self._device_id = int(device_id)
         self._random_seed = random_seed
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
         self._session = None
         self._pipeline = None
         self._adapter = None
@@ -180,49 +194,52 @@ class LocalPipelineBackend:
             return
         from inference_manifest import load_inference_manifest
         from inference_service.backends.types import RuntimeContext
-        from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
-        from inference_service.pipeline import (
-            GenericModelPipeline,
-            ModelResultAdapter,
-            ModelStage,
-            SequentialModelExecutor,
+        from inference_service.unified_runtime import (
+            ModelRuntimeHandle,
+            RuntimeAssembly,
         )
         from perception_service.graspgen_adapter import GraspGenAdapter
-        from perception_service.model_session_builders import register_perception_session_builders
 
         bundle_root = Path(self._manifest_path).expanduser().resolve()
         manifest_root = bundle_root.parent if bundle_root.name == "inference_manifest.json" else bundle_root
         validated = load_inference_manifest(manifest_root, self._deployment_name)
         model = validated.manifest.model
-        if model.kind != "perception" or model.family != "graspgen":
+        if (model.interface, model.model_type, model.operation) != (
+            "tensor_model",
+            "graspgen",
+            "generate_grasps",
+        ):
             raise ValueError(
-                f"local pipeline requires a perception/graspgen bundle, got {model.kind!r}/{model.family!r}"
+                "local pipeline requires tensor_model/graspgen/generate_grasps, "
+                f"got {model.interface}/{model.model_type}/{model.operation}"
             )
         adapter = GraspGenAdapter.from_bundle(validated.bundle_root, model.semantic_identity, model=model)
         adapter.validate_identity(model.semantic_identity)
         adapter.validate_deployment(self._deployment_name)
 
         runtime_options: dict[str, object] = {}
-        if validated.deployment.backend == "ascend":
-            runtime_options["device_id"] = self._device_id
         if self._random_seed is not None and validated.deployment.backend == "ascend":
             runtime_options["random_seed"] = self._random_seed
-        context = RuntimeContext(validated_manifest=validated, runtime_options=runtime_options)
-        register_perception_session_builders()
-        session = MODEL_SESSION_BUILDER_REGISTRY.create(
+        context = RuntimeContext(
+            validated_manifest=validated,
+            runtime_options=runtime_options,
+            runtime_profile=validated.runtime_profile,
+        )
+        session = self._registry_set.session_builder_registry.create(
             context,
             allowed_deployments=adapter.identity.supported_deployments,
+            backend_registry=self._registry_set.backend_registry,
+            providers=self._providers,
             builder_options={"adapter": adapter},
         )
-        pipeline = GenericModelPipeline(
-            f"manipulation-graspgen-{validated.deployment.backend}-local",
-            context,
-            SequentialModelExecutor(
-                (ModelStage("model", session),),
-                ModelResultAdapter(),
-                components=(session,),
-            ),
-            supports_cancellation=session.capabilities.supports_cancellation,
+        pipeline = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=session,
+                session=session,
+                execution_contract="request-direct",
+                runtime_id=f"manipulation-graspgen-{validated.deployment.backend}-local",
+                load_context=context,
+            )
         )
         pipeline.load()
         self._adapter = adapter
@@ -247,8 +264,8 @@ class LocalPipelineBackend:
         max_tries: int = 4,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         self._ensure_loaded()
-        from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
-        from inference_service.generic_runtime import NamedTensorRequest
+        from inference_service.unified_runtime import ExecutionContext, ModelRequest
+        from model_utils.graspgen_contract import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
 
         points = np.asarray(object_pc, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
@@ -282,10 +299,8 @@ class LocalPipelineBackend:
                 target_count = min(min_grasps, batch_size)
                 for attempt in range(1, max_tries + 1):
                     result = self._pipeline.execute(
-                        NamedTensorRequest(
-                            request_id=f"graspgen_local_{uuid.uuid4().hex}",
-                            inputs=inputs,
-                        )
+                        ModelRequest(inputs),
+                        ExecutionContext(f"graspgen_local_{uuid.uuid4().hex}"),
                     )
                     # Current GraspGen OM files have a static batch of 1000. For a
                     # partial final batch, retain only the requested number of raw
@@ -1223,12 +1238,19 @@ class GraspGenWrapper:
         ascend_local_deployment_name: str = "ascend_310p",
         ascend_local_device_id: int = 0,
         ascend_local_random_seed: int | None = None,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
     ):
         backend = inference_backend.strip().lower()
         if backend not in _VALID_INFERENCE_BACKENDS:
             raise ValueError(
                 f"invalid inference_backend {inference_backend!r}; expected one of {_VALID_INFERENCE_BACKENDS}"
             )
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
         self.inference_backend = backend
 
         base = Path(model_dir) if model_dir else _DEFAULT_MODEL_DIR
@@ -1259,6 +1281,8 @@ class GraspGenWrapper:
             self._ascend_local_client = LocalPipelineBackend(
                 local_manifest_path,
                 deployment_name=local_deployment_name or "torch_cuda",
+                registry_set=registry_set,
+                providers=providers,
             )
             logger.info("GraspGen Torch pipeline ready (gripper=%s)", self._gripper_name)
         elif backend == "ascend_local":
@@ -1269,6 +1293,8 @@ class GraspGenWrapper:
                 deployment_name=local_deployment_name or ascend_local_deployment_name,
                 device_id=ascend_local_device_id,
                 random_seed=ascend_local_random_seed,
+                registry_set=registry_set,
+                providers=providers,
             )
             logger.info(
                 "Ascend local GraspGen backend ready (manifest=%s, deployment=%s, gripper=%s)",

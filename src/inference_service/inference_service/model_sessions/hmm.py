@@ -67,16 +67,23 @@ class HMMModelSession(ModelSession):
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hmm":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "hmm":
             raise BackendLoadError("HMMModelSession requires a compiled hmm deployment", code="invalid_deployment")
-        if not (deployment.target.runtime.startswith("hmm") or deployment.target.runtime.startswith("tcim")):
+        if context.target_runtime not in {"hmm", "tcim"}:
             raise BackendLoadError(
-                f"HMM target.runtime {deployment.target.runtime!r} is not in the TCIM runtime family",
+                f"HMM target.runtime {context.target_runtime!r} is not the canonical TCIM runtime family",
                 code="incompatible_backend_target",
             )
-        device_id = context.runtime_options.get("device_id", self._device_id)
+        profile_device_id = context.device_id
+        device_id = context.runtime_options.get(
+            "device_id", self._device_id if profile_device_id is None else profile_device_id
+        )
         if type(device_id) is not int or device_id != self._device_id:
             raise BackendLoadError("HMM device_id does not match the session", code="deployment_context_mismatch")
+        if profile_device_id is not None and profile_device_id != self._device_id:
+            raise BackendLoadError(
+                "HMM device_id does not match the typed runtime profile", code="deployment_context_mismatch"
+            )
         unknown_options = sorted(set(context.runtime_options) - {"device_id"})
         if unknown_options:
             raise BackendLoadError(

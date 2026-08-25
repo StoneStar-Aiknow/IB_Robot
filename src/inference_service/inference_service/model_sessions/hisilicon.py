@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from inference_manifest import CompiledDeployment, TensorBinding
+from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.hisilicon.sd3403_protocol import (
     DEFAULT_GRACEFUL_CLOSE_TIMEOUT,
@@ -63,7 +64,12 @@ def validate_runtime_options(options: Mapping[str, object]) -> dict[str, object]
 class HisiliconModelSession(ModelSession):
     """Execute the manifest policy role through one SD3403 worker process."""
 
-    def __init__(self, *, protocol_factory: ProtocolFactory = SD3403Protocol) -> None:
+    def __init__(
+        self,
+        *,
+        protocol_factory: ProtocolFactory = SD3403Protocol,
+        domains: ResourceDomainAdmissions | None = None,
+    ) -> None:
         super().__init__(
             "model-session:hisilicon",
             BackendCapabilities(
@@ -78,6 +84,7 @@ class HisiliconModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
+            domains=domains,
         )
         self._protocol_factory = protocol_factory
         self._protocol: SD3403Protocol | None = None
@@ -95,13 +102,13 @@ class HisiliconModelSession(ModelSession):
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hisilicon":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "hisilicon":
             raise BackendLoadError(
                 "HisiliconModelSession requires a compiled hisilicon deployment", code="invalid_deployment"
             )
-        if context.policy.policy_type != "act":
+        if context.interface != "policy" or context.model_type != "act" or context.operation != "predict":
             raise BackendLoadError(
-                f"HisiliconModelSession does not support policy family {context.policy.policy_type!r}",
+                "HisiliconModelSession requires policy/act/predict",
                 code="unsupported_policy_backend_pair",
             )
         if deployment.target.soc != "sd3403" or deployment.target.runtime != "hisilicon-worker":

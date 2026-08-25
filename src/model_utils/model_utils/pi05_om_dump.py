@@ -102,20 +102,31 @@ def _prepare_batch(batches, batch_index: int, task: str) -> dict[str, object]:
 
 
 def _create_engine(*, policy_path: str, deployment: str, capture: DiagnosticCapture, engine_factory):
+    dependencies = None
     if engine_factory is None:
         from inference_service.core import PureInferenceEngine
         from inference_service.model_sessions import AscendOmModelSession
+        from inference_service.runtime_composition import build_policy_runtime_dependencies
+
+        dependencies = build_policy_runtime_dependencies()
 
         def create_session(context, options):
             device_id = context.runtime_options.get("device_id", 0)
             del options
-            return AscendOmModelSession(int(device_id), diagnostic_capture=capture)
+            return AscendOmModelSession(
+                int(device_id),
+                diagnostic_capture=capture,
+                runtime_manager=dependencies.providers.acl_runtime_provider,
+                domains=dependencies.providers.resource_admission_provider,
+            )
 
         engine = PureInferenceEngine(
             model_path=policy_path,
             deployment=deployment,
             pipeline_id="pi05-om-dump",
             runtime_options={},
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
             model_session_factory=create_session,
         )
     else:
@@ -125,7 +136,7 @@ def _create_engine(*, policy_path: str, deployment: str, capture: DiagnosticCapt
             pipeline_id="pi05-om-dump",
             diagnostic_capture=capture,
         )
-    return engine
+    return engine, dependencies
 
 
 def _dump_one(
@@ -236,8 +247,9 @@ def _dump_batches(
     first_output = staging / f"sample_{batch_indices[0]:04d}" if sample_directories else staging
     capture = DiagnosticCapture(first_output)
     engine = None
+    dependencies = None
     try:
-        engine = _create_engine(
+        engine, dependencies = _create_engine(
             policy_path=policy_path,
             deployment=deployment,
             capture=capture,
@@ -275,6 +287,8 @@ def _dump_batches(
                 _remove_path(staging)
             except OSError as exc:
                 LOGGER.warning("Unable to remove PI05 dump staging path %s: %s", staging, exc)
+        if dependencies is not None:
+            dependencies.providers.close()
 
     if sample_directories:
         return [root / f"sample_{batch_index:04d}" for batch_index in batch_indices]

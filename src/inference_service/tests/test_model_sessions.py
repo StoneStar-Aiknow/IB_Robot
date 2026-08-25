@@ -42,12 +42,13 @@ def _torch_context(tmp_path: Path, *, device: str = "cpu") -> RuntimeContext:
     bundle_files = create_non_policy_bundle(tmp_path)
     manifest = make_manifest(tmp_path, bundle_files, deployment_name=f"torch_{device}")
     manifest["model"] = {
-        "kind": "generic",
-        "family": "fake_torch",
+        "interface": "tensor_model",
+        "model_type": "fake_torch",
+        "operation": "infer",
         "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
         "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
     }
-    manifest["deployments"][f"torch_{device}"]["device"] = device
+    manifest["deployments"][f"torch_{device}"]["runtime_profile"]["profile"]["device"] = device
     write_manifest(tmp_path, manifest)
     return RuntimeContext(load_inference_manifest(tmp_path, f"torch_{device}"))
 
@@ -226,8 +227,8 @@ class _FakeRuntimeManager:
         self.lease = _FakeLease()
         self.acquire_calls = []
 
-    def acquire(self, device_id: int, config_path: str | None = None):
-        self.acquire_calls.append((device_id, config_path))
+    def acquire(self, device_id: int):
+        self.acquire_calls.append(device_id)
         if self.error is not None:
             raise self.error
         return self.lease
@@ -296,7 +297,7 @@ def test_ascend_session_validates_abi_executes_named_outputs_and_closes_once(tmp
 
     session.load(context)
     result = session.infer(
-        NamedTensorRequest("acl-1", {"observation.image": np.zeros((1, 3, 384, 384), dtype=np.float32)})
+        NamedTensorRequest("request-1", {"observation.image": np.zeros((1, 3, 384, 384), dtype=np.float32)})
     )
 
     assert result.outputs["tag_logits"].shape == (1, 4585)
@@ -316,7 +317,7 @@ def test_ascend_session_builder_selects_execution_mode_from_manifest(tmp_path) -
 
     root = tmp_path / "stateful"
     bundle_files = create_non_policy_bundle(root)
-    manifest = make_non_policy_manifest(root, bundle_files, family="stateful_test", output_semantic="scores")
+    manifest = make_non_policy_manifest(root, bundle_files, model_type="stateful_test", output_semantic="scores")
     deployment = manifest["deployments"]["ascend"]
     deployment["bindings"]["model"] = {
         "inputs": [
@@ -328,10 +329,29 @@ def test_ascend_session_builder_selects_execution_mode_from_manifest(tmp_path) -
             {"semantic": "host.state_out", "index": 1, "dtype": "float32", "shape": [1, 4]},
         ],
     }
-    deployment["state_links"] = {"model": [{"input_semantic": "host.state_in", "output_semantic": "host.state_out"}]}
+    deployment["execution_contract"] = {
+        "state_scope": "stream",
+        "execution_structure": "direct",
+        "cancellation_granularity": "checkpoint",
+        "stateful": True,
+        "state_links": [
+            {
+                "role": "model",
+                "state_name": "recurrent.state",
+                "owner": "session",
+                "source": "state.in",
+                "target": "state.out",
+                "scope": "runtime",
+                "state_bank": "model.bank",
+            }
+        ],
+        "state_bank_mode": "runtime_exclusive",
+        "max_open_streams": 1,
+    }
     manifest["model"] = {
-        "kind": "perception",
-        "family": "stateful_test",
+        "interface": "tensor_model",
+        "model_type": "stateful_test",
+        "operation": "infer",
         "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
         "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
     }
@@ -348,8 +368,9 @@ def test_ascend_session_routes_device_links_without_host_round_trip(tmp_path) ->
     manifest = make_non_policy_manifest(tmp_path, bundle_files)
     (tmp_path / "artifacts/consumer.om").write_bytes(b"consumer")
     manifest["model"] = {
-        "kind": "generic",
-        "family": "linked",
+        "interface": "tensor_model",
+        "model_type": "linked",
+        "operation": "infer",
         "inputs": [
             {"semantic": "features", "dtype": "float32", "shape": [1, 2]},
             {"semantic": "bias", "dtype": "float32", "shape": [1, 2]},
@@ -412,8 +433,9 @@ def test_ascend_session_executes_linked_roles_individually(tmp_path) -> None:
     manifest = make_non_policy_manifest(tmp_path, bundle_files)
     (tmp_path / "artifacts/consumer.om").write_bytes(b"consumer")
     manifest["model"] = {
-        "kind": "generic",
-        "family": "linked",
+        "interface": "tensor_model",
+        "model_type": "linked",
+        "operation": "infer",
         "inputs": [
             {"semantic": "features", "dtype": "float32", "shape": [1, 2]},
             {"semantic": "bias", "dtype": "float32", "shape": [1, 2]},
@@ -533,7 +555,7 @@ def test_ascend_diagnostic_capture_reads_linked_outputs_without_returning_them(t
     session.close()
 
 
-def test_stateful_ascend_session_accepts_raw_acl_and_manages_device_state_banks(tmp_path) -> None:
+def test_stateful_ascend_session_accepts_canonical_acl_and_manages_device_state_banks(tmp_path) -> None:
     class StatefulModel(_FakeAclModel):
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
@@ -568,9 +590,9 @@ def test_stateful_ascend_session_accepts_raw_acl_and_manages_device_state_banks(
 
     StatefulModel.instances = []
     bundle_files = create_non_policy_bundle(tmp_path)
-    manifest = make_non_policy_manifest(tmp_path, bundle_files, family="stateful_test", output_semantic="features")
+    manifest = make_non_policy_manifest(tmp_path, bundle_files, model_type="stateful_test", output_semantic="features")
     deployment = manifest["deployments"]["ascend"]
-    deployment["target"]["runtime"] = "raw_acl"
+    deployment["runtime_profile"]["target"]["runtime"] = "acl"
     deployment["bindings"]["model"] = {
         "inputs": [
             {"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]},
@@ -581,18 +603,29 @@ def test_stateful_ascend_session_accepts_raw_acl_and_manages_device_state_banks(
             {"semantic": "host.state_out", "index": 1, "dtype": "float32", "shape": [1, 4]},
         ],
     }
-    deployment["state_links"] = {
-        "model": [
+    deployment["execution_contract"] = {
+        "state_scope": "stream",
+        "execution_structure": "direct",
+        "cancellation_granularity": "checkpoint",
+        "stateful": True,
+        "state_links": [
             {
-                "input_semantic": "host.state_in",
-                "output_semantic": "host.state_out",
-                "initialization": "zero",
+                "role": "model",
+                "state_name": "recurrent.state",
+                "owner": "session",
+                "source": "state.in",
+                "target": "state.out",
+                "scope": "runtime",
+                "state_bank": "model.bank",
             }
-        ]
+        ],
+        "state_bank_mode": "runtime_exclusive",
+        "max_open_streams": 1,
     }
     manifest["model"] = {
-        "kind": "perception",
-        "family": "stateful_test",
+        "interface": "tensor_model",
+        "model_type": "stateful_test",
+        "operation": "infer",
         "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
         "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
     }
@@ -824,7 +857,7 @@ def test_ascend_resource_domain_serializes_sessions(tmp_path) -> None:
                     type(self).active -= 1
 
     class LeaseManager:
-        def acquire(self, _device_id, _config_path=None):
+        def acquire(self, _device_id):
             return _FakeLease()
 
     domains = ResourceDomainAdmissions()
@@ -860,7 +893,7 @@ def test_ascend_partial_load_closes_prior_models_in_reverse_order(tmp_path) -> N
         artifact.write_bytes(name.encode())
     entries = [BundleFile(path=path) for path in bundle_paths]
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": TEST_BUNDLE_UUID,
             "revision": 1,
@@ -873,8 +906,9 @@ def test_ascend_partial_load_closes_prior_models_in_reverse_order(tmp_path) -> N
             },
         },
         "model": {
-            "kind": "generic",
-            "family": "two_role",
+            "interface": "tensor_model",
+            "model_type": "two_role",
+            "operation": "infer",
             "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
             "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
         },
@@ -882,8 +916,16 @@ def test_ascend_partial_load_closes_prior_models_in_reverse_order(tmp_path) -> N
             "ascend": {
                 "uuid": TEST_DEPLOYMENT_UUID,
                 "revision": 1,
-                "backend": "ascend",
-                "target": {"soc": "fake", "runtime": "acl"},
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "ascend",
+                    "target": {"soc": "fake", "runtime": "acl"},
+                    "profile": {"device_id": 0},
+                },
                 "artifacts": {
                     "first": {"path": "artifacts/first.om", "format": "om"},
                     "second": {"path": "artifacts/second.om", "format": "om"},

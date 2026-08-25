@@ -35,7 +35,7 @@ def write_hmm_deployment(
     state_projection_path: str | Path | None = None,
     deployment_name: str = "hmm",
     target_soc: str = "lq50",
-    target_runtime: str = "tcim-lite",
+    target_runtime: str = "tcim",
     vision_layout: str = "NCHW",
 ) -> Path:
     """Dispatch HMM packaging by policy family and reject unsupported ACT packages."""
@@ -77,7 +77,7 @@ def write_pi05_hmm_deployment(
     role_artifacts: Mapping[str, tuple[str | Path, str | Path]],
     deployment_name: str = "hmm",
     target_soc: str = "lq50",
-    target_runtime: str = "tcim-lite",
+    target_runtime: str = "tcim",
     vision_layout: str = "NCHW",
 ) -> Path:
     """Package the PI0.5 vision/prefill/decode projection graph."""
@@ -265,7 +265,7 @@ def write_smolvla_hmm_deployment(
     role_artifacts: Mapping[str, tuple[str | Path, str | Path]],
     deployment_name: str = "hmm",
     target_soc: str = "lq50",
-    target_runtime: str = "tcim-lite",
+    target_runtime: str = "tcim",
     vision_layout: str = "NCHW",
 ) -> Path:
     """Package the SmolVLA vision/prefill/action graph."""
@@ -663,7 +663,7 @@ def main() -> int:
     parser.add_argument("--bundle-root", required=True)
     parser.add_argument("--deployment", default="hmm")
     parser.add_argument("--target-soc", default="lq50")
-    parser.add_argument("--target-runtime", default="tcim-lite")
+    parser.add_argument("--target-runtime", default="tcim")
     parser.add_argument("--spec", required=True, help="Path-only HMM packaging JSON")
     args = parser.parse_args()
     manifest = package_hmm_deployment(

@@ -31,26 +31,38 @@ class TemporalSpeechGate:
         rms_threshold: float = 0.002,
         candidate_window_samples: int = 1024,
         exit_gap_samples: int = 2400,
+        initialize_backend: bool = True,
     ):
         self.silero = silero_engine
         self.vad_threshold = float(vad_threshold)
         self.rms_threshold = float(rms_threshold)
         self.candidate_window_samples = int(candidate_window_samples)
         self.exit_gap_samples = int(exit_gap_samples)
-        self.reset()
+        self._reset_host_state()
+        if initialize_backend:
+            self.silero.reset_state()
 
-    def reset(self) -> None:
-        """重置门控和 Silero 隐藏状态；gap后不得跨不连续音频复用。"""
+    def _reset_host_state(self) -> None:
         self._state = "IDLE"
         self._candidate_first_end: int | None = None
         self._non_gray_start: int | None = None
+
+    def reset(self) -> None:
+        """重置门控和 Silero 隐藏状态；gap后不得跨不连续音频复用。"""
+        self._reset_host_state()
         self.silero.reset_state()
 
-    def close(self) -> None:
-        """释放 Silero 后端资源；具体 ONNX/raw ACL 差异由引擎内部处理。"""
+    def close(self, *, close_silero: bool = True) -> None:
+        """释放 Silero 后端资源；具体 ONNX/Ascend ACL 差异由引擎内部处理。"""
+        self._reset_host_state()
         close = getattr(self.silero, "close", None)
-        if close is not None:
-            close()
+        if close_silero:
+            if close is not None:
+                close()
+        else:
+            close_host = getattr(self.silero, "close_host", None)
+            if close_host is not None:
+                close_host()
 
     def process_frame(self, audio512: np.ndarray, *, frame_start_sample: int) -> TemporalGateResult:
         value = np.asarray(audio512, dtype=np.float32)

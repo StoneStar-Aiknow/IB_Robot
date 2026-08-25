@@ -11,7 +11,7 @@
 #   ./scripts/download_voice_tts_models.sh [--bundle-dir DIR]
 #
 # Defaults:
-#   BUNDLE_DIR = $WORKSPACE/models/voice_tts/zipvoice
+#   BUNDLE_DIR = $WORKSPACE/models/zipvoice
 #
 # The manifest merge preserves an existing bundle uuid and any existing
 # deployments (e.g. ascend_310p).  Run this script in the same bundle
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
-BUNDLE_DIR="${WORKSPACE}/models/voice_tts/zipvoice"
+BUNDLE_DIR="${WORKSPACE}/models/zipvoice"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,15 +47,14 @@ ONNX_DIR="${BUNDLE_DIR}/artifacts/onnx"
 ASSETS_DIR="${BUNDLE_DIR}/assets"
 mkdir -p "${ONNX_DIR}" "${ASSETS_DIR}/vocos" "${ASSETS_DIR}/prompts"
 
-# Expected SHA-256 digests for downloaded assets.  Leave empty to skip
-# verification on first run; the script prints the computed digest so you
-# can record it here after a trusted download.  Mirrors
-# scripts/download_speech_direction_models.sh convention.
-TEXT_ENCODER_SHA256=""
-FM_DECODER_SHA256=""
-TOKENS_SHA256=""
-VOCOS_SHA256=""
-PROMPT_SHA256=""
+# Expected SHA-256 digests for downloaded assets.  Values recorded from the
+# official k2-fsa/ZipVoice ModelScope release; re-verify after any upstream
+# bump.  Mirrors scripts/download_speech_direction_models.sh convention.
+TEXT_ENCODER_SHA256="495eca2d5f8a911f5c361bcce5bd55cdd2508ccdd26ce3e9bf1d3c29eb974861"
+FM_DECODER_SHA256="4510d4f5f049f14ef80207fca695e13c820e2cea61635f402954950bc62b1e3c"
+TOKENS_SHA256="ce98c1afc5f7a20c2484dffdd68a1fff0a4a2cc707328833750c4476c37cdbda"
+VOCOS_SHA256="97ec976ad1fd67a33ab2682d29c0ac7df85234fae875aefcc5fb215681a91b2a"
+PROMPT_SHA256="706be5f309ef8e76a323a0640b288d91c6e2a62902e9a343b0e1bde507f125f1"
 
 verify_file() {
     local path="$1" expected_sha="$2" desc="$3"
@@ -129,69 +128,64 @@ import sys
 import uuid
 from pathlib import Path
 
+from inference_manifest import BundleFile, TorchDeployment, canonical_bundle_digest, load_inference_manifest
+
 bundle_dir = Path(sys.argv[1])
 manifest_path = bundle_dir / "inference_manifest.json"
 
 UBUNTU_ONNX_DEPLOYMENT_NAME = "ubuntu_onnx"
 BUNDLE_NAME_ONNX_ONLY = "zipvoice-distill-ubuntu-onnx"
 
-
-def canonical_bundle_digest(bundle_uuid, bundle_revision, bundle_name, file_paths):
-    """Hash the lightweight bundle declaration without reading bundle files.
-
-    Mirrors inference_manifest.integrity.canonical_bundle_digest so the
-    value matches the official loader.  Prefers the installed package;
-    falls back to the inline implementation below.
-    """
-    try:
-        from inference_manifest import canonical_bundle_digest as _impl
-        from inference_manifest.models import BundleFile
-        files = [BundleFile(path=p) for p in file_paths]
-        return _impl(bundle_uuid, bundle_revision, bundle_name, files)
-    except ImportError:
-        payload = {
-            "format": "ibrobot.bundle-structure-v2",
-            "uuid": bundle_uuid,
-            "revision": bundle_revision,
-            "name": bundle_name,
-            "files": sorted(file_paths),
-        }
-        payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-        return hashlib.sha256(payload).hexdigest()
+ONNX_ARTIFACTS = {
+    "text_encoder": {"format": "onnx", "path": "artifacts/onnx/text_encoder.onnx"},
+    "flow_decoder": {"format": "onnx", "path": "artifacts/onnx/fm_decoder.onnx"},
+}
 
 
-def deployment_fingerprint(schema_version, bundle_digest, deployment_name, deployment):
-    """Mirrors inference_manifest.integrity.deployment_fingerprint."""
-    try:
-        from inference_manifest import deployment_fingerprint as _impl
-        return _impl(schema_version, bundle_digest, deployment_name, deployment)
-    except ImportError:
-        payload = {
-            "format": "ibrobot.deployment-structure-v2",
-            "schema_version": schema_version,
-            "bundle_digest": bundle_digest,
-            "deployment_name": deployment_name,
-            "deployment": deployment,
-        }
-        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-        return hashlib.sha256(serialized).hexdigest()
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-file_paths = sorted(
-    [p.relative_to(bundle_dir).as_posix() for p in bundle_dir.joinpath("assets").rglob("*") if p.is_file()]
-    + [p.relative_to(bundle_dir).as_posix() for p in bundle_dir.joinpath("artifacts").rglob("*") if p.is_file()]
-)
-
-ubuntu_onnx_deployment = {
-    "uuid": str(uuid.uuid4()),
-    "revision": 1,
-    "backend": "torch",
-    "device": "cpu",
+for _spec in ONNX_ARTIFACTS.values():
+    _spec["sha256"] = _sha256(bundle_dir / _spec["path"])
+ONNX_BINDINGS = {
+    "text_encoder": {
+        "inputs": [
+            {"semantic": "host.zipvoice.tokens", "dtype": "int64", "index": 0, "shape": [1, 256]},
+            {"semantic": "host.zipvoice.tokens_len", "dtype": "int64", "index": 1, "shape": []},
+            {"semantic": "host.zipvoice.prompt_tokens", "dtype": "int64", "index": 2, "shape": [1, 29]},
+            {"semantic": "host.zipvoice.prompt_features_len", "dtype": "int64", "index": 3, "shape": []},
+            {"semantic": "host.zipvoice.speed", "dtype": "float32", "index": 4, "shape": []},
+        ],
+        "outputs": [
+            {"semantic": "host.zipvoice.text_condition", "dtype": "float32", "index": 0, "shape": [-1, 100]},
+            {"semantic": "host.zipvoice.features_len", "dtype": "int64", "index": 1, "shape": []},
+            {"semantic": "host.zipvoice.padding_mask", "dtype": "float32", "index": 2, "shape": [-1]},
+        ],
+    },
+    "flow_decoder": {
+        "inputs": [
+            {"semantic": "host.zipvoice.t", "dtype": "float32", "index": 0, "shape": []},
+            {"semantic": "host.zipvoice.flow_x", "dtype": "float32", "index": 1, "shape": [-1, 100]},
+            {"semantic": "host.zipvoice.flow_text_condition", "dtype": "float32", "index": 2, "shape": [-1, 100]},
+            {"semantic": "host.zipvoice.speech_condition", "dtype": "float32", "index": 3, "shape": [-1, 100]},
+            {"semantic": "host.zipvoice.flow_padding_mask", "dtype": "float32", "index": 4, "shape": [-1]},
+            {"semantic": "host.zipvoice.guidance_scale", "dtype": "float32", "index": 5, "shape": []},
+        ],
+        "outputs": [
+            {"semantic": "host.zipvoice.velocity", "dtype": "float32", "index": 0, "shape": [-1, 100]},
+        ],
+    },
 }
 
 model_block = {
-    "kind": "generic",
-    "family": "zipvoice",
+    "interface": "tensor_model",
+    "model_type": "zipvoice",
+    "operation": "synthesize",
     "inputs": [
         {"semantic": "tts.text", "dtype": "uint8", "shape": [-1]},
         {"semantic": "tts.prompt_audio", "dtype": "float32", "shape": [-1]},
@@ -208,34 +202,61 @@ model_block = {
 
 if manifest_path.is_file():
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 3:
+        raise RuntimeError("existing ZipVoice manifest is not schema v3; repackage it before merging")
     bundle = manifest.setdefault("bundle", {})
     bundle_uuid = bundle.get("uuid", str(uuid.uuid4()))
     bundle_revision = bundle.get("revision", 1)
     bundle_name = bundle.get("name", BUNDLE_NAME_ONNX_ONLY)
-    manifest.setdefault("schema_version", 2)
-    manifest.setdefault("model", model_block)
+    manifest["schema_version"] = 3
+    manifest["model"] = model_block
     deployments = manifest.setdefault("deployments", {})
     preserved = list(deployments.keys() - {UBUNTU_ONNX_DEPLOYMENT_NAME})
-    deployments[UBUNTU_ONNX_DEPLOYMENT_NAME] = ubuntu_onnx_deployment
     print(f"merging into existing manifest (preserved deployments: {preserved or 'none'})")
 else:
     bundle_uuid = str(uuid.uuid4())
     bundle_revision = 1
     bundle_name = BUNDLE_NAME_ONNX_ONLY
-    manifest = {
-        "schema_version": 2,
-        "model": model_block,
-    }
-    manifest["deployments"] = {UBUNTU_ONNX_DEPLOYMENT_NAME: ubuntu_onnx_deployment}
+    manifest = {"schema_version": 3, "model": model_block}
+    manifest["deployments"] = {}
     print("creating new manifest (ubuntu_onnx only)")
 
-bundle_digest = canonical_bundle_digest(bundle_uuid, bundle_revision, bundle_name, file_paths)
-fingerprint = deployment_fingerprint(
-    manifest.get("schema_version", 2),
-    bundle_digest,
-    UBUNTU_ONNX_DEPLOYMENT_NAME,
-    ubuntu_onnx_deployment,
+# The schema forbids overlap between bundle.files and deployment artifacts, so
+# every path declared by any deployment artifact (existing Ascend OMs included)
+# must stay out of the structural file list.
+declared_artifacts = {
+    spec["path"]
+    for deployment in manifest["deployments"].values()
+    for spec in (deployment.get("artifacts") or {}).values()
+    if isinstance(spec, dict) and spec.get("path")
+}
+declared_artifacts |= {spec["path"] for spec in ONNX_ARTIFACTS.values()}
+
+file_paths = sorted(
+    p.relative_to(bundle_dir).as_posix()
+    for sub in ("assets", "artifacts")
+    for p in bundle_dir.joinpath(sub).rglob("*")
+    if p.is_file() and ".cache" not in p.parts and p.relative_to(bundle_dir).as_posix() not in declared_artifacts
 )
+
+manifest["deployments"][UBUNTU_ONNX_DEPLOYMENT_NAME] = {
+    "uuid": str(uuid.uuid4()),
+    "revision": 1,
+    "artifacts": ONNX_ARTIFACTS,
+    "bindings": ONNX_BINDINGS,
+    "execution": ["text_encoder", "flow_decoder"],
+    "execution_contract": {
+        "state_scope": "request",
+        "execution_structure": "iterative",
+        "orchestration_visibility": "session",
+        "cancellation_granularity": "checkpoint",
+    },
+    "runtime_profile": {
+        "backend": "torch",
+        "target": {"runtime": "torch"},
+        "profile": {"device": "cpu"},
+    },
+}
 
 manifest["bundle"] = {
     "uuid": bundle_uuid,
@@ -245,15 +266,17 @@ manifest["bundle"] = {
     "digest": {
         "algorithm": "sha256",
         "scope": "structure",
-        "value": bundle_digest,
+        "value": canonical_bundle_digest(bundle_uuid, bundle_revision, bundle_name, [BundleFile(path=p) for p in file_paths]),
     },
 }
 
 manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+for deployment_name in manifest["deployments"]:
+    load_inference_manifest(bundle_dir, deployment_name)
 print(f"manifest written to {manifest_path}")
 print(f"bundle uuid: {bundle_uuid}")
-print(f"bundle digest: {bundle_digest}")
-print(f"ubuntu_onnx fingerprint: {fingerprint}")
+print(f"bundle digest: {manifest['bundle']['digest']['value']}")
+print(f"deployments: {sorted(manifest['deployments'])}")
 PY
 
 echo "Done. Models and bundle metadata generated in ${BUNDLE_DIR}"

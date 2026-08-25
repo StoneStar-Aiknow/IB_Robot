@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""310P raw_acl 端到端时延测试：用生产链路的 StatefulAclFullSubNetRunner + Host 编排。
+"""310P Ascend ACL 端到端时延测试：用生产链路的 StatefulAclFullSubNetRunner + Host 编排。
 
 走真实生产路径：inference_service.backends.ascend.AclModel.execute_bank
 （acl.mdl.execute C 扩展）+ dataset bank dual hidden/cell 回环 + Host STFT/norm/OLA。
 
 用法（310P 上）：
-    source /opt/ros/humble/setup.bash
-    source <repo>/install/setup.bash
-    cd <repo>
-    python3 scripts/run_310p_raw_acl_latency.py --wav <raw6ch.wav> [--fb-om ... --sb-om ... --manifest ...]
+    source .shrc_local
+    python3 scripts/run_310p_acl_latency.py --wav <raw6ch.wav> [--fb-om ... --sb-om ... --manifest ...]
 
 --wav 必传（无默认）：raw6ch 麦克风阵列录音，可用节点跑诊断生成（见 diagnostics）。
 模型默认相对仓库根 models/fullsubnet/（mixed16 OM + 218epochs manifest）。
@@ -86,7 +84,6 @@ def main() -> int:
         fb_om_path=args.fb_om,
         sb_om_path=args.sb_om,
         device_id=args.device_id,
-        acl_config_path="",
         timing_enabled=True,
     )
     enhancer = StatefulFullSubNetEnhancer(
@@ -129,7 +126,7 @@ def main() -> int:
                         timings[k].append(float(t.get(k, 0.0)))
 
     print()
-    print("=== raw_acl 端到端分段时延（预热后，单位 ms）===")
+    print("=== Ascend ACL 端到端分段时延（预热后，单位 ms）===")
     for k in keys:
         s = _stat(timings[k])
         if s:
@@ -163,14 +160,14 @@ def main() -> int:
     total = _stat(timings["fullsubnet_total_ms"])
     if total:
         print()
-        print("=== raw_acl 端到端实时性 ===")
+        print("=== Ascend ACL 端到端实时性 ===")
         print(f"  p99={total['p99']:.2f}ms  max={total['max']:.2f}ms  预算=32ms")
         overrun = sum(1 for v in timings["fullsubnet_total_ms"] if v > 32.0)
         print(
             f"  超 32ms 的 block: {overrun}/{len(timings['fullsubnet_total_ms'])} ({overrun / len(timings['fullsubnet_total_ms']) * 100:.1f}%)"
         )
         if total["p99"] < 32.0:
-            print(f"  结论: raw_acl p99={total['p99']:.2f}ms < 32ms，生产链路 OM 推理+Host 编排可实时")
+            print(f"  结论: Ascend ACL p99={total['p99']:.2f}ms < 32ms，生产链路 OM 推理+Host 编排可实时")
     runner.close()
     return 0
 

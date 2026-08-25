@@ -2,7 +2,7 @@
 
 speech_direction 在 310P 上由三段 OM 组成：Silero VAD 与 FullSubNet 的 FB/SB
 两个子网。三段各有自己的 LSTM recurrent state，且每段 state 的 producer 与
-consumer 是同一个 role（state_out 喂回 state_in），属于 ``CompiledDeployment``
+consumer 是同一个 role（state_out 喂回 state_in），属于 v3 ``Deployment``
 禁止的 device link 自循环，因此 state 一律走 session 内 ``allocate_device_buffer``
 + ``prepare_dataset_banks`` 双 bank，在 Device 内 ping-pong，不声明任何
 ``DeviceLink``。FB 的输出不直接喂给 SB，而是回到 Host 经 STFT 归一化、sub-band

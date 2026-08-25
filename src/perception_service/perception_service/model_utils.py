@@ -65,7 +65,7 @@ def inspect_backend(backend: str) -> BackendStatus:
         except ModuleNotFoundError:
             return BackendStatus(backend, False, "", "torch is not installed")
         return BackendStatus(backend, True, str(torch.__version__))
-    if backend == "ascend_om":
+    if backend == "ascend":
         if importlib.util.find_spec("acl") is None:
             return BackendStatus(backend, False, "", "Ascend ACL Python runtime is not installed")
         try:
@@ -73,7 +73,7 @@ def inspect_backend(backend: str) -> BackendStatus:
         except (ImportError, OSError) as exc:
             return BackendStatus(backend, False, "", f"Ascend ACL import failed: {exc}")
         return BackendStatus(backend, True, str(getattr(acl, "__version__", "unknown")))
-    raise ValueError("backend must be 'cpu', 'cuda', or 'ascend_om'")
+    raise ValueError("backend must be 'cpu', 'cuda', or 'ascend'")
 
 
 def build_model_manifest(

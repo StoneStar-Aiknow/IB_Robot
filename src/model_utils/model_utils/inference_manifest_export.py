@@ -1,11 +1,18 @@
-"""Shared helpers for producing strict unified inference manifests."""
+"""Exporter helpers for producing strict unified inference manifests.
+
+This module is a manifest-packaging tool boundary.  ACL ABI inspection lives
+in the separate ``acl_abi_inspection`` module so its optional initialization
+configuration cannot become part of ``InferenceManifest``,
+``DeploymentTarget``, or a runtime profile.  Runtime code imports the
+hardware-independent ``inference_manifest`` package and never imports either
+tool module.
+"""
 
 from __future__ import annotations
 
 import errno
 import fcntl
 import filecmp
-import importlib
 import json
 import shutil
 import stat
@@ -14,13 +21,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 from uuid import uuid4
 
 import onnx
 
 from inference_manifest import (
     ArtifactBindings,
+    AscendRuntimeProfile,
+    BackendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
     Deployment,
@@ -28,10 +36,18 @@ from inference_manifest import (
     DeploymentTarget,
     DeviceLink,
     Digest,
+    ExecutionContract,
+    HisiliconRuntimeProfile,
+    HMMRuntimeProfile,
     InferenceManifest,
     ManifestBundle,
+    ModelDescriptor,
+    RKNNRuntimeProfile,
+    RoleRuntimeProfile,
+    SemanticTensor,
     StateLink,
     TensorBinding,
+    TorchRuntimeProfile,
     ValidatedManifest,
     canonical_bundle_digest,
     load_inference_manifest,
@@ -75,23 +91,6 @@ class RuntimeABI:
     outputs: tuple[RuntimeTensor, ...]
 
 
-_ACL_DTYPES = {
-    0: "float32",
-    1: "float16",
-    2: "int8",
-    3: "int32",
-    4: "uint8",
-    6: "int16",
-    7: "uint16",
-    8: "uint32",
-    9: "int64",
-    10: "uint64",
-    11: "float64",
-    12: "bool",
-    27: "bfloat16",
-}
-
-
 def read_onnx_abi(path: str | Path) -> RuntimeABI:
     """Read the positional tensor ABI from an ONNX graph."""
 
@@ -120,117 +119,6 @@ def read_runtime_abi(path: str | Path) -> RuntimeABI:
         inputs=_parse_runtime_tensors(value.get("inputs"), "inputs", metadata_path),
         outputs=_parse_runtime_tensors(value.get("outputs"), "outputs", metadata_path),
     )
-
-
-def write_acl_om_abi(
-    om_path: str | Path,
-    output_path: str | Path,
-    *,
-    device_id: int = 0,
-    acl_config_path: str | None = None,
-) -> Path:
-    """Inspect one OM with ACL and write its actual runtime tensor ABI."""
-
-    model_path = Path(om_path).expanduser().resolve(strict=True)
-    destination = Path(output_path).expanduser().resolve()
-    try:
-        acl = importlib.import_module("acl")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "ACL Python runtime is unavailable; source the CANN environment or provide a pre-generated OM ABI sidecar"
-        ) from exc
-    model_id = None
-    descriptor = None
-    context = None
-    initialized = False
-    device_set = False
-    pending_error: Exception | None = None
-    try:
-        _acl_check(acl.init(acl_config_path) if acl_config_path else acl.init(), "acl.init")
-        initialized = True
-        _acl_check(acl.rt.set_device(device_id), "acl.rt.set_device")
-        device_set = True
-        context = _acl_result(acl.rt.create_context(device_id), "acl.rt.create_context")
-        _acl_check(acl.rt.set_context(context), "acl.rt.set_context")
-        model_id = _acl_result(acl.mdl.load_from_file(str(model_path)), "acl.mdl.load_from_file")
-        descriptor = acl.mdl.create_desc()
-        if descriptor is None:
-            raise RuntimeError("acl.mdl.create_desc returned no descriptor")
-        _acl_check(acl.mdl.get_desc(descriptor, model_id), "acl.mdl.get_desc")
-        value = {
-            "inputs": _acl_tensors(acl, descriptor, "input"),
-            "outputs": _acl_tensors(acl, descriptor, "output"),
-        }
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-        read_runtime_abi(destination)
-        return destination
-    except Exception as exc:
-        pending_error = exc
-        raise
-    finally:
-        cleanup_errors: list[str] = []
-        if descriptor is not None:
-            try:
-                acl.mdl.destroy_desc(descriptor)
-            except Exception as exc:
-                cleanup_errors.append(f"acl.mdl.destroy_desc: {exc}")
-        if model_id is not None:
-            try:
-                acl.mdl.unload(model_id)
-            except Exception as exc:
-                cleanup_errors.append(f"acl.mdl.unload: {exc}")
-        if context is not None:
-            try:
-                acl.rt.destroy_context(context)
-            except Exception as exc:
-                cleanup_errors.append(f"acl.rt.destroy_context: {exc}")
-        if device_set:
-            try:
-                acl.rt.reset_device(device_id)
-            except Exception as exc:
-                cleanup_errors.append(f"acl.rt.reset_device: {exc}")
-        if initialized:
-            try:
-                acl.finalize()
-            except Exception as exc:
-                cleanup_errors.append(f"acl.finalize: {exc}")
-        if cleanup_errors and pending_error is None:
-            raise RuntimeError("; ".join(cleanup_errors))
-
-
-def _acl_tensors(acl: Any, descriptor: object, direction: str) -> list[dict[str, object]]:
-    count = getattr(acl.mdl, f"get_num_{direction}s")(descriptor)
-    tensors = []
-    for index in range(count):
-        name = getattr(acl.mdl, f"get_{direction}_name_by_index")(descriptor, index)
-        dims = _acl_result(
-            getattr(acl.mdl, f"get_{direction}_dims")(descriptor, index),
-            f"ACL {direction} dims",
-        )
-        shape = dims.get("dims") if isinstance(dims, dict) else dims
-        if not isinstance(shape, list | tuple):
-            raise ValueError(f"ACL {direction} {name!r} returned invalid shape {shape!r}")
-        dtype_code = getattr(acl.mdl, f"get_{direction}_data_type")(descriptor, index)
-        try:
-            dtype = _ACL_DTYPES[dtype_code]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported ACL dtype code {dtype_code!r} for {direction} {name!r}") from exc
-        tensors.append({"name": name, "index": index, "dtype": dtype, "shape": list(shape)})
-    return tensors
-
-
-def _acl_result(value: object, operation: str) -> object:
-    if isinstance(value, tuple) and len(value) == 2:
-        result, status = value
-        _acl_check(status, operation)
-        return result
-    return value
-
-
-def _acl_check(status: object, operation: str) -> None:
-    if status not in (None, 0):
-        raise RuntimeError(f"{operation} failed with ACL status {status}")
 
 
 def read_tcim_abi(path: str | Path) -> RuntimeABI:
@@ -357,19 +245,26 @@ def compiled_deployment(
     backend: str,
     target_soc: str,
     target_runtime: str,
+    runtime_abi: str | None = None,
     artifacts: Mapping[str, tuple[str | Path, str]],
     execution: Sequence[str],
     bindings: Mapping[str, ArtifactBindings],
     device_links: Sequence[DeviceLink] = (),
     state_links: Mapping[str, Sequence[StateLink]] | None = None,
     artifact_share_groups: Mapping[str, str] | None = None,
+    runtime_profile: BackendRuntimeProfile | None = None,
+    execution_contract: ExecutionContract | None = None,
 ) -> CompiledDeployment:
     """Build a typed compiled deployment from structural artifact descriptors."""
 
+    if state_links is not None:
+        raise ValueError("state_links must be declared as typed execution_contract.state_links")
     share_groups = dict(artifact_share_groups or {})
+    target = DeploymentTarget(soc=target_soc, runtime=target_runtime, runtime_abi=runtime_abi)
+    profile = runtime_profile or _default_runtime_profile(backend, target_soc)
     return CompiledDeployment(
-        backend=backend,
-        target=DeploymentTarget(soc=target_soc, runtime=target_runtime),
+        execution_contract=execution_contract or _request_direct_contract(),
+        runtime_profile=RoleRuntimeProfile(backend=backend, target=target, profile=profile),
         artifacts={
             role: deployment_artifact(
                 bundle_root,
@@ -382,7 +277,45 @@ def compiled_deployment(
         execution=tuple(execution),
         bindings=dict(bindings),
         device_links=tuple(device_links),
-        state_links=None if state_links is None else {role: tuple(links) for role, links in state_links.items()},
+    )
+
+
+def _request_direct_contract() -> ExecutionContract:
+    return ExecutionContract(
+        state_scope="request",
+        execution_structure="direct",
+        cancellation_granularity="request_boundary",
+    )
+
+
+def _default_runtime_profile(backend: str, target_soc: str) -> BackendRuntimeProfile:
+    """Return the smallest typed profile needed by a packaged compiled deployment."""
+
+    if backend == "ascend":
+        return AscendRuntimeProfile(device_id=0)
+    if backend == "rknn":
+        return RKNNRuntimeProfile(target_name=target_soc, device_id=0)
+    if backend == "hmm":
+        return HMMRuntimeProfile(role="policy", tcim_abi="tcim-v1", device_id=0)
+    if backend == "hisilicon":
+        return HisiliconRuntimeProfile(protocol="sd3403")
+    if backend == "torch":
+        return TorchRuntimeProfile(device="cpu")
+    raise ValueError(f"unsupported compiled deployment backend {backend!r}")
+
+
+def _policy_model_descriptor(policy) -> ModelDescriptor:
+    def tensor(semantic: str, feature) -> SemanticTensor:
+        feature_type = feature.type.upper()
+        dtype = "int64" if feature_type in {"LANGUAGE", "TEXT", "TOKEN", "TOKENS"} else "float32"
+        return SemanticTensor(semantic=semantic, dtype=dtype, shape=feature.shape)
+
+    return ModelDescriptor(
+        interface="policy",
+        model_type=policy.policy_type,
+        operation="predict",
+        inputs=tuple(tensor(name, feature) for name, feature in policy.input_features.items()),
+        outputs=tuple(tensor(name, feature) for name, feature in policy.output_features.items()),
     )
 
 
@@ -469,7 +402,7 @@ def _upsert_deployment_unlocked(
         candidate_structure = (name, tuple(entry.path for entry in bundle_files))
         bundle_revision = existing.bundle.revision + (candidate_structure != previous_structure)
     manifest = InferenceManifest(
-        schema_version=2,
+        schema_version=3,
         bundle=ManifestBundle(
             uuid=bundle_uuid,
             revision=bundle_revision,
@@ -481,6 +414,7 @@ def _upsert_deployment_unlocked(
                 value=canonical_bundle_digest(bundle_uuid, bundle_revision, name, bundle_files),
             ),
         ),
+        model=existing.model if existing is not None else _policy_model_descriptor(policy),
         deployments=deployments,
     )
     if existing is not None and manifest == existing:

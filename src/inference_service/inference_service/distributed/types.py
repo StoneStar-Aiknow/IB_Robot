@@ -16,6 +16,24 @@ from inference_manifest import PolicyMetadata, ValidatedManifest
 PROTOCOL_VERSION = 3
 
 
+class UnsupportedDistributedRuntimeError(ValueError):
+    """The distributed wire contract is intentionally policy-only."""
+
+    code = "distributed_tensor_model_unsupported"
+    stage = "validation"
+    recoverable = False
+
+    def __init__(self, interface: object, model_type: object = "") -> None:
+        self.details = {
+            "interface": str(interface),
+            "model_type": str(model_type),
+        }
+        super().__init__(
+            "distributed inference supports only interface='policy'; "
+            f"tensor_model runtime {interface!s}/{model_type!s} is unsupported"
+        )
+
+
 def _immutable_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(dict(value))
 
@@ -97,6 +115,8 @@ class PipelineIdentity:
 
 @dataclass(frozen=True)
 class StructuredError:
+    """Policy-only distributed wire error; not a local runtime result type."""
+
     code: str
     message: str
     stage: str
@@ -241,6 +261,10 @@ def summarize_policy(policy: PolicyMetadata) -> PolicySummary:
 
 
 def build_pipeline_identity(pipeline_id: str, validated_manifest: ValidatedManifest) -> PipelineIdentity:
+    model = getattr(getattr(validated_manifest, "manifest", None), "model", None)
+    interface = getattr(model, "interface", None)
+    if interface is not None and interface != "policy":
+        raise UnsupportedDistributedRuntimeError(interface, getattr(model, "model_type", ""))
     return PipelineIdentity(
         pipeline_id=pipeline_id,
         manifest_schema_version=validated_manifest.manifest.schema_version,
@@ -314,6 +338,12 @@ def structured_error_from_exception(exc: Exception, stage: str) -> StructuredErr
         value = getattr(exc, field_name, None)
         if isinstance(value, bool):
             details = {**details, field_name: value}
+    evidence = getattr(exc, "evidence", None)
+    if evidence is not None and callable(getattr(evidence, "to_dict", None)):
+        details = {**details, "evidence": evidence.to_dict()}
+    recovery = getattr(exc, "recovery", None)
+    if recovery is not None and callable(getattr(recovery, "to_dict", None)):
+        details = {**details, "recovery": recovery.to_dict()}
     return StructuredError(
         code=str(getattr(exc, "code", "operation_failed")),
         message=str(exc) or type(exc).__name__,

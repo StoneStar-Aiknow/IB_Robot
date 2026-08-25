@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import numpy as np
 
-from inference_manifest import CompiledDeployment, TensorBinding, TorchDeployment, ValidatedManifest
+from inference_manifest import (
+    AscendRuntimeProfile,
+    CompiledDeployment,
+    HisiliconRuntimeProfile,
+    HMMRuntimeProfile,
+    RKNNRuntimeProfile,
+    TensorBinding,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    ValidatedManifest,
+)
 from inference_manifest.json_utils import load_json_strict
-from inference_service.backends import BACKEND_REGISTRY, BackendLoadError, BackendRegistry, RuntimeContext
+from inference_service.backends import BackendLoadError, BackendRegistry, RuntimeContext
 from inference_service.backends.rknn.runtime import validate_runtime_options as validate_rknn_runtime_options
 from inference_service.codecs import build_execution_plan, create_policy_codec
 from inference_service.model_sessions import (
-    MODEL_SESSION_BUILDER_REGISTRY,
     AscendOmModelSession,
     HisiliconModelSession,
     HMMModelSession,
@@ -39,89 +48,243 @@ from inference_service.pipeline.smolvla import (
     load_smolvla_policy_config,
 )
 from inference_service.pipeline.stages import ModelStage
+from inference_service.unified_runtime import (
+    ModelRuntimeKey,
+    RegistrySet,
+    RuntimeAssemblerRegistry,
+    RuntimeAssembly,
+    RuntimeDependencyError,
+    RuntimeDescriptor,
+    RuntimeProviders,
+    SessionBuilderKey,
+)
 
-_ALLOWED_ASCEND_OPTIONS = frozenset({"device_id", "acl_config_path"})
+_ALLOWED_ASCEND_OPTIONS = frozenset({"device_id"})
 _ALLOWED_PI05_OPTIONS = _ALLOWED_ASCEND_OPTIONS | frozenset({"random_seed", "curvature_log_path"})
 _ALLOWED_HMM_OPTIONS = frozenset({"device_id", "random_seed"})
 _ALLOWED_RKNN_OPTIONS = frozenset({"target", "core_mask", "random_seed"})
 
 
-def _new_lerobot_torch_session(context: RuntimeContext, *, options: Mapping[str, object]) -> LeRobotTorchModelSession:
+def _new_lerobot_torch_session(
+    context: RuntimeContext,
+    *,
+    options: Mapping[str, object],
+    providers: RuntimeProviders | None = None,
+) -> LeRobotTorchModelSession:
     del options
     deployment = context.deployment
     if not isinstance(deployment, TorchDeployment):
         raise BackendLoadError("LeRobot Torch policy requires a Torch deployment", code="invalid_deployment")
+    if context.device is None:
+        raise BackendLoadError("LeRobot Torch policy requires a typed Torch runtime profile", code="invalid_deployment")
     return LeRobotTorchModelSession(
-        deployment.device,
+        context.device,
         priority_scheduling=context.priority_scheduling,
+        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
-def _new_ascend_session(context: RuntimeContext, *, options: Mapping[str, object]) -> AscendOmModelSession:
+def _new_ascend_session(
+    context: RuntimeContext,
+    *,
+    options: Mapping[str, object],
+    providers: RuntimeProviders | None = None,
+) -> AscendOmModelSession:
+    device_id = context.device_id
+    if device_id is None:
+        device_id = options.get("device_id", 0)
     return AscendOmModelSession(
-        device_id=int(options["device_id"]),
+        device_id=int(device_id),
         priority_scheduling=context.priority_scheduling,
+        runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
+        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
-def _new_hmm_session(context: RuntimeContext, *, options: Mapping[str, object]) -> HMMModelSession:
-    del context
-    return HMMModelSession(device_id=int(options["device_id"]))
+def _new_hmm_session(
+    context: RuntimeContext,
+    *,
+    options: Mapping[str, object],
+    providers: RuntimeProviders | None = None,
+) -> HMMModelSession:
+    device_id = context.device_id
+    if device_id is None:
+        device_id = options.get("device_id", 0)
+    return HMMModelSession(
+        device_id=int(device_id),
+        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
+    )
 
 
-def _new_rknn_session(context: RuntimeContext, *, options: Mapping[str, object]) -> RKNNModelSession:
+def _new_rknn_session(
+    context: RuntimeContext,
+    *,
+    options: Mapping[str, object],
+    providers: RuntimeProviders | None = None,
+) -> RKNNModelSession:
     del context, options
-    return RKNNModelSession()
+    return RKNNModelSession(
+        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
+    )
 
 
-def _new_hisilicon_session(context: RuntimeContext, *, options: Mapping[str, object]) -> HisiliconModelSession:
+def _new_hisilicon_session(
+    context: RuntimeContext,
+    *,
+    options: Mapping[str, object],
+    providers: RuntimeProviders | None = None,
+) -> HisiliconModelSession:
     del context, options
-    return HisiliconModelSession()
+    return HisiliconModelSession(
+        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
+    )
 
 
-def _create_policy_session(context: RuntimeContext, options: Mapping[str, object], model_session_factory=None):
+def _create_policy_session(
+    context: RuntimeContext,
+    options: Mapping[str, object],
+    model_session_factory=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers: RuntimeProviders | None = None,
+):
     override = None
     if model_session_factory is not None:
 
         def override(builder_context, **_kwargs):
             return model_session_factory(builder_context, options)
 
-    return MODEL_SESSION_BUILDER_REGISTRY.create(
+    if session_registry is None:
+        raise RuntimeDependencyError(
+            "policy session construction requires an explicit session builder registry",
+            code="session_builder_registry_required",
+        )
+    return session_registry.create(
         context,
+        backend_registry=backend_registry,
+        providers=providers,
         override=override,
         builder_options={"options": options},
     )
 
 
-class ModelSessionFactoryRegistry:
-    """Registry for session-backed policy execution handles."""
+class _PolicyRuntimeAssembly(RuntimeAssembly):
+    """Private bridge for the policy facade's remaining stage-based executor."""
 
-    def __init__(self) -> None:
-        self._builders: dict[tuple[str, str], Callable[..., _PolicySessionHandle]] = {}
+    def __init__(self, policy_handle: _PolicySessionHandle, contract: str) -> None:
+        self.policy_handle = policy_handle
+        super().__init__(
+            runtime_executor=policy_handle.model_executor,
+            session=policy_handle._capability_source,
+            execution_contract=contract,
+            declared_capabilities={"stateful": False, "execution_contract": contract},
+        )
 
-    def register(self, policy_family: str, backend: str, builder: Callable[..., _PolicySessionHandle]) -> None:
-        key = (policy_family, backend)
-        if key in self._builders:
-            raise ValueError(f"model session builder {key!r} is already registered")
-        self._builders[key] = builder
 
-    def get(self, policy_family: str, backend: str) -> Callable[..., _PolicySessionHandle] | None:
-        return self._builders.get((policy_family, backend))
+def _policy_contract_name(context: RuntimeContext) -> str:
+    declared = getattr(context.deployment, "execution_contract", None)
+    name = getattr(declared, "name", None)
+    if name is None and isinstance(declared, Mapping):
+        name = declared.get("name") or declared.get("contract_name")
+        if name is None and {"state_scope", "execution_structure"}.issubset(declared):
+            name = f"{declared['state_scope']}-{declared['execution_structure']}"
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    if context.model_type == "act":
+        return "request-direct"
+    return "request-iterative"
 
-    def create(
-        self,
-        context: RuntimeContext,
+
+def _policy_visibility(context: RuntimeContext, contract: str) -> str | None:
+    if contract.endswith("-direct"):
+        return None
+    declared = getattr(context.deployment, "execution_contract", None)
+    value = getattr(declared, "orchestration_visibility", None)
+    if value in {"executor", "session"}:
+        return value
+    return "session" if context.model_type == "diffusion" else "executor"
+
+
+def _policy_runtime_key(context: RuntimeContext) -> ModelRuntimeKey:
+    contract = _policy_contract_name(context)
+    return ModelRuntimeKey(
+        context.interface,
+        context.model_type,
+        context.operation,
+        context.backend,
+        contract,
+        _policy_visibility(context, contract),
+    )
+
+
+def _policy_runtime_assembler(builder, contract: str):
+    """Adapt one legacy policy stage builder to the public assembly boundary."""
+
+    def assemble(
+        context,
         model_session_factory=None,
-        diagnostic_schedule: PI05DenoisingSchedule | None = None,
-        diagnostic_schedule_source: str | None = None,
-    ) -> _PolicySessionHandle | None:
-        builder = self.get(context.policy.policy_type, context.deployment.backend)
-        if builder is None:
-            return None
-        return builder(context, model_session_factory, diagnostic_schedule, diagnostic_schedule_source)
+        diagnostic_schedule=None,
+        diagnostic_schedule_source=None,
+        *,
+        session_registry,
+        backend_registry,
+        providers,
+    ) -> RuntimeAssembly:
+        handle = builder(
+            context,
+            model_session_factory=model_session_factory,
+            diagnostic_schedule=diagnostic_schedule,
+            diagnostic_schedule_source=diagnostic_schedule_source,
+            session_registry=session_registry,
+            backend_registry=backend_registry,
+            providers=providers,
+        )
+        if not isinstance(handle, _PolicySessionHandle):
+            raise BackendLoadError(
+                f"policy runtime assembler returned {type(handle).__name__}, expected a private policy handle",
+                code="invalid_policy_assembly",
+            )
+        return _PolicyRuntimeAssembly(handle, contract)
+
+    assemble.execution_contract = contract
+    return assemble
 
 
-MODEL_SESSION_FACTORY_REGISTRY = ModelSessionFactoryRegistry()
+def _resolve_pipeline_dependencies(
+    *,
+    registry_set: RegistrySet | None,
+    providers: RuntimeProviders | None,
+    backend_registry: BackendRegistry | None,
+) -> tuple[BackendRegistry | object, object, RuntimeAssemblerRegistry, RuntimeProviders]:
+    """Require the complete construction dependency set at the composition boundary."""
+
+    if registry_set is None:
+        raise RuntimeDependencyError(
+            "create_inference_pipeline requires an explicitly injected RegistrySet",
+            code="registry_set_required",
+        )
+    if providers is None:
+        raise RuntimeDependencyError(
+            "create_inference_pipeline requires explicitly injected RuntimeProviders",
+            code="runtime_providers_required",
+        )
+    if not isinstance(registry_set, RegistrySet):
+        raise RuntimeDependencyError(
+            "create_inference_pipeline registry_set must be a RegistrySet",
+            code="registry_set_invalid",
+        )
+    if not isinstance(providers, RuntimeProviders):
+        raise RuntimeDependencyError(
+            "create_inference_pipeline providers must be a RuntimeProviders value",
+            code="runtime_providers_invalid",
+        )
+    return (
+        registry_set.backend_registry if backend_registry is None else backend_registry,
+        registry_set.session_builder_registry,
+        registry_set.runtime_assembler_registry,
+        providers,
+    )
 
 
 def create_inference_pipeline(
@@ -133,7 +296,9 @@ def create_inference_pipeline(
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
     priority_scheduling: bool = False,
-    registry: BackendRegistry = BACKEND_REGISTRY,
+    registry: BackendRegistry | None = None,
+    registry_set: RegistrySet | None = None,
+    providers: RuntimeProviders | None = None,
     model_session_factory=None,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
@@ -148,12 +313,17 @@ def create_inference_pipeline(
     ``model_session_factory`` optionally overrides session construction for tests.
     """
 
+    selected_registry, session_registry, assembler_registry, selected_providers = _resolve_pipeline_dependencies(
+        registry_set=registry_set,
+        providers=providers,
+        backend_registry=registry,
+    )
     context = RuntimeContext(
         validated_manifest,
         runtime_options=runtime_options or {},
         priority_scheduling=priority_scheduling,
     )
-    registry.validate(context)
+    selected_registry.validate(context)
     preprocessor = None
     postprocessor = None
     codec = None
@@ -165,6 +335,10 @@ def create_inference_pipeline(
         model_session_factory,
         pi05_diagnostic_schedule,
         pi05_diagnostic_schedule_source,
+        session_registry=session_registry,
+        backend_registry=selected_registry,
+        assembler_registry=assembler_registry,
+        providers=selected_providers,
     )
     if handle is not None:
         preprocessor = handle.preprocessor or preprocessor
@@ -179,9 +353,11 @@ def create_inference_pipeline(
             request_timeout=request_timeout,
             default_task=default_task,
             execution_mode=execution_mode,
+            runtime_providers=selected_providers,
         )
     raise BackendLoadError(
-        f"policy family {context.policy.policy_type!r} with backend {context.deployment.backend!r} "
+        f"v3 identity {context.interface}/{context.model_type}/{context.operation} with backend "
+        f"{context.backend!r} "
         "has no registered model session factory",
         code="model_session_factory_unavailable",
     )
@@ -196,7 +372,9 @@ def create_pipeline_manager(
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
     priority_scheduling: bool = False,
-    registry: BackendRegistry = BACKEND_REGISTRY,
+    registry: BackendRegistry | None = None,
+    registry_set: RegistrySet | None = None,
+    providers: RuntimeProviders | None = None,
     model_session_factory=None,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
@@ -210,6 +388,8 @@ def create_pipeline_manager(
         runtime_options=runtime_options,
         priority_scheduling=priority_scheduling,
         registry=registry,
+        registry_set=registry_set,
+        providers=providers,
         model_session_factory=model_session_factory,
         pi05_diagnostic_schedule=pi05_diagnostic_schedule,
         pi05_diagnostic_schedule_source=pi05_diagnostic_schedule_source,
@@ -224,6 +404,11 @@ def _build_session_handle(
     model_session_factory=None,
     diagnostic_schedule: PI05DenoisingSchedule | None = None,
     diagnostic_schedule_source: str | None = None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    assembler_registry: RuntimeAssemblerRegistry | None = None,
+    providers: RuntimeProviders | None = None,
 ):
     """Construct the session-driven executor handle for compiled family backends.
 
@@ -233,12 +418,43 @@ def _build_session_handle(
     construction for tests.
     """
 
-    return MODEL_SESSION_FACTORY_REGISTRY.create(
-        context,
-        model_session_factory,
-        diagnostic_schedule,
-        diagnostic_schedule_source,
-    )
+    if assembler_registry is None:
+        raise RuntimeDependencyError(
+            "policy pipeline construction requires an explicit runtime assembler registry",
+            code="runtime_assembler_registry_required",
+        )
+    key = _policy_runtime_key(context)
+    try:
+        assembly = assembler_registry.assemble(
+            key,
+            context,
+            model_session_factory,
+            diagnostic_schedule,
+            diagnostic_schedule_source,
+            session_registry=session_registry,
+            backend_registry=backend_registry,
+            providers=providers,
+        )
+    except Exception as exc:
+        if isinstance(exc, BackendLoadError):
+            raise
+        raise BackendLoadError(
+            f"unable to assemble policy runtime for {key!r}: {exc}",
+            code=getattr(exc, "code", "runtime_assembler_unavailable"),
+        ) from exc
+    if not isinstance(assembly, RuntimeAssembly):
+        raise BackendLoadError(
+            f"runtime assembler for {key!r} returned {type(assembly).__name__}, expected RuntimeAssembly",
+            code="invalid_runtime_assembly",
+        )
+    policy_handle = getattr(assembly, "policy_handle", None)
+    if not isinstance(policy_handle, _PolicySessionHandle):
+        raise BackendLoadError(
+            f"runtime assembler for {key!r} returned no private policy stage bridge",
+            code="invalid_policy_assembly",
+        )
+    assembly.claim_ownership()
+    return policy_handle
 
 
 def _build_torch_policy_handle(
@@ -246,6 +462,10 @@ def _build_torch_policy_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct a native LeRobot policy through its Torch model session."""
 
@@ -254,7 +474,14 @@ def _build_torch_policy_handle(
     if not isinstance(deployment, TorchDeployment):
         raise BackendLoadError("LeRobot Torch policy requires a Torch deployment", code="invalid_deployment")
     LeRobotTorchModelSession.validate_runtime_options(context.runtime_options)
-    session = _create_policy_session(context, context.runtime_options, model_session_factory)
+    session = _create_policy_session(
+        context,
+        context.runtime_options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     model_executor = SequentialModelExecutor(
         (ModelStage("policy", session),),
         _RawActionResultAdapter("action"),
@@ -280,6 +507,10 @@ def _build_ascend_pi05_handle(
     model_session_factory=None,
     diagnostic_schedule: PI05DenoisingSchedule | None = None,
     diagnostic_schedule_source: str | None = None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the session-driven PI0.5 executor handle for compiled Ascend."""
 
@@ -297,7 +528,14 @@ def _build_ascend_pi05_handle(
     )
     _validate_schedule_compatibility(schedule, options["curvature_log_path"])
     num_inference_steps = _pi05_num_inference_steps(context)
-    session = _create_ascend_session(context, options, model_session_factory)
+    session = _create_ascend_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     velocity_trace: list[np.ndarray] | None = [] if options["curvature_log_path"] is not None else None
     model_executor = create_pi05_executor(
         plan,
@@ -327,6 +565,10 @@ def _build_ascend_act_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the single-role ACT executor through ``AscendOmModelSession``."""
 
@@ -340,7 +582,14 @@ def _build_ascend_act_handle(
         )
     plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
     action_binding = _session_action_binding(plan)
-    session = _create_ascend_session(context, options, model_session_factory)
+    session = _create_ascend_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     model_executor = SequentialModelExecutor(
         (ModelStage("policy", session),),
         _RawActionResultAdapter(action_binding.semantic),
@@ -364,6 +613,10 @@ def _build_hisilicon_act_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the single-role ACT executor through ``HisiliconModelSession``."""
 
@@ -379,7 +632,14 @@ def _build_hisilicon_act_handle(
         )
     plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
     action_binding = _session_action_binding(plan)
-    session = _create_policy_session(context, options, model_session_factory)
+    session = _create_policy_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     model_executor = SequentialModelExecutor(
         (ModelStage("policy", session),),
         _RawActionResultAdapter(action_binding.semantic),
@@ -408,6 +668,10 @@ def _build_hmm_pi05_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the session-driven PI0.5 executor handle for compiled HMM.
 
@@ -425,7 +689,14 @@ def _build_hmm_pi05_handle(
     action_binding = _session_action_binding(plan)
     num_inference_steps = _hmm_pi05_num_inference_steps(policy_config)
     schedule = uniform_pi05_schedule(num_inference_steps)
-    session = _create_hmm_session(context, options, model_session_factory)
+    session = _create_hmm_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     family_resource = PI05HMMFamilyResource(deployment, policy_config)
     embedding_stage = build_embedding_stage(deployment, family_resource, policy_config)
     time_prep_stage = build_time_prep_stage(deployment, policy_config)
@@ -459,9 +730,6 @@ def _validate_pi05_options(options: Mapping[str, object]) -> dict[str, object]:
     device_id = options.get("device_id", 0)
     if type(device_id) is not int or device_id < 0:
         raise BackendLoadError("Ascend device_id must be a non-negative integer", code="invalid_runtime_options")
-    acl_config_path = options.get("acl_config_path")
-    if acl_config_path is not None and (type(acl_config_path) is not str or not acl_config_path.strip()):
-        raise BackendLoadError("Ascend acl_config_path must be a non-empty string", code="invalid_runtime_options")
     random_seed = options.get("random_seed")
     if random_seed is not None and type(random_seed) is not int:
         raise BackendLoadError("Ascend random_seed must be an integer or null", code="invalid_runtime_options")
@@ -476,7 +744,6 @@ def _validate_pi05_options(options: Mapping[str, object]) -> dict[str, object]:
         path.open("a", encoding="utf-8").close()
     return {
         "device_id": device_id,
-        "acl_config_path": acl_config_path,
         "random_seed": random_seed,
         "curvature_log_path": curvature_log_path,
     }
@@ -489,10 +756,7 @@ def _validate_ascend_options(options: Mapping[str, object]) -> dict[str, object]
     device_id = options.get("device_id", 0)
     if type(device_id) is not int or device_id < 0:
         raise BackendLoadError("Ascend device_id must be a non-negative integer", code="invalid_runtime_options")
-    acl_config_path = options.get("acl_config_path")
-    if acl_config_path is not None and (type(acl_config_path) is not str or not acl_config_path.strip()):
-        raise BackendLoadError("Ascend acl_config_path must be a non-empty string", code="invalid_runtime_options")
-    return {"device_id": device_id, "acl_config_path": acl_config_path}
+    return {"device_id": device_id}
 
 
 def _session_action_binding(plan) -> TensorBinding:
@@ -596,18 +860,28 @@ def _create_ascend_session(
     context: RuntimeContext,
     options: Mapping[str, object],
     model_session_factory=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ) -> AscendOmModelSession:
-    return _create_policy_session(context, options, model_session_factory)
+    return _create_policy_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
 
 
 def _build_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
     session_options: dict[str, object] = {"device_id": options["device_id"]}
-    if options["acl_config_path"] is not None:
-        session_options["acl_config_path"] = options["acl_config_path"]
     return RuntimeContext(
         context.validated_manifest,
         runtime_options=session_options,
         priority_scheduling=context.priority_scheduling,
+        runtime_profile=context.runtime_profile,
     )
 
 
@@ -638,8 +912,19 @@ def _create_hmm_session(
     context: RuntimeContext,
     options: Mapping[str, object],
     model_session_factory=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ) -> HMMModelSession:
-    return _create_policy_session(context, options, model_session_factory)
+    return _create_policy_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
 
 
 def _build_hmm_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
@@ -672,6 +957,10 @@ def _build_hmm_smolvla_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the session-driven SmolVLA executor handle for compiled HMM.
 
@@ -690,7 +979,14 @@ def _build_hmm_smolvla_handle(
     plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
     action_binding = _session_action_binding(plan)
     num_inference_steps = _smolvla_num_inference_steps(policy_config)
-    session = _create_hmm_session(context, options, model_session_factory)
+    session = _create_hmm_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     resource = SmolVLAFamilyResource(deployment, policy_config)
     model_executor = create_smolvla_executor(
         plan,
@@ -717,6 +1013,10 @@ def _build_rknn_smolvla_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the session-driven SmolVLA executor handle for compiled RKNN.
 
@@ -733,7 +1033,14 @@ def _build_rknn_smolvla_handle(
     plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
     action_binding = _session_action_binding(plan)
     num_inference_steps = _smolvla_num_inference_steps(policy_config)
-    session = _create_rknn_session(context, options, model_session_factory)
+    session = _create_rknn_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     resource = SmolVLAFamilyResource(deployment, policy_config)
     model_executor = create_smolvla_executor(
         plan,
@@ -760,6 +1067,10 @@ def _build_rknn_act_handle(
     model_session_factory=None,
     diagnostic_schedule=None,
     diagnostic_schedule_source=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ):
     """Construct the single-role ACT executor through ``RKNNModelSession``."""
 
@@ -773,7 +1084,14 @@ def _build_rknn_act_handle(
         )
     plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
     action_binding = _session_action_binding(plan)
-    session = _create_rknn_session(context, options, model_session_factory)
+    session = _create_rknn_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
     model_executor = SequentialModelExecutor(
         (ModelStage("policy", session),),
         _RawActionResultAdapter(action_binding.semantic),
@@ -826,8 +1144,19 @@ def _create_rknn_session(
     context: RuntimeContext,
     options: Mapping[str, object],
     model_session_factory=None,
+    *,
+    session_registry=None,
+    backend_registry=None,
+    providers=None,
 ) -> RKNNModelSession:
-    return _create_policy_session(context, options, model_session_factory)
+    return _create_policy_session(
+        context,
+        options,
+        model_session_factory,
+        session_registry=session_registry,
+        backend_registry=backend_registry,
+        providers=providers,
+    )
 
 
 def _build_rknn_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
@@ -855,7 +1184,7 @@ def _compiled_deployment(context: RuntimeContext, family: str) -> CompiledDeploy
     return deployment
 
 
-for _policy_family, _backend, _builder in (
+_POLICY_EXECUTOR_BUILDERS = (
     ("act", "torch", _build_torch_policy_handle),
     ("act", "ascend", _build_ascend_act_handle),
     ("act", "rknn", _build_rknn_act_handle),
@@ -867,10 +1196,9 @@ for _policy_family, _backend, _builder in (
     ("smolvla", "hmm", _build_hmm_smolvla_handle),
     ("smolvla", "rknn", _build_rknn_smolvla_handle),
     ("smolvla", "torch", _build_torch_policy_handle),
-):
-    MODEL_SESSION_FACTORY_REGISTRY.register(_policy_family, _backend, _builder)
+)
 
-for _policy_family, _backend, _session_builder in (
+_POLICY_SESSION_BUILDERS = (
     ("act", "torch", _new_lerobot_torch_session),
     ("act", "ascend", _new_ascend_session),
     ("act", "rknn", _new_rknn_session),
@@ -882,5 +1210,73 @@ for _policy_family, _backend, _session_builder in (
     ("smolvla", "hmm", _new_hmm_session),
     ("smolvla", "rknn", _new_rknn_session),
     ("smolvla", "torch", _new_lerobot_torch_session),
-):
-    MODEL_SESSION_BUILDER_REGISTRY.register("policy", _policy_family, "", _backend, _session_builder)
+)
+
+
+_POLICY_PROFILE_TYPES = {
+    "torch": TorchRuntimeProfile,
+    "ascend": AscendRuntimeProfile,
+    "hmm": HMMRuntimeProfile,
+    "rknn": RKNNRuntimeProfile,
+    "hisilicon": HisiliconRuntimeProfile,
+}
+_POLICY_TARGET_RUNTIMES = {
+    "torch": frozenset({"torch"}),
+    "ascend": frozenset({"acl"}),
+    "hmm": frozenset({"hmm", "tcim"}),
+    "rknn": frozenset({"rknn", "rknn-lite", "rknn-lite2"}),
+    "hisilicon": frozenset({"hisilicon-worker"}),
+}
+_POLICY_CONTRACTS = {
+    "act": "request-direct",
+    "diffusion": "request-iterative",
+    "pi05": "request-iterative",
+    "smolvla": "request-iterative",
+}
+
+
+def register_policy_session_builders(
+    session_registry=None,
+    assembler_registry: RuntimeAssemblerRegistry | None = None,
+) -> None:
+    """Register policy Sessions and role assemblers into an explicit RegistrySet."""
+
+    if session_registry is None:
+        raise RuntimeDependencyError(
+            "register_policy_session_builders requires a session registry",
+            code="session_builder_registry_required",
+        )
+    if assembler_registry is None:
+        raise RuntimeDependencyError(
+            "register_policy_session_builders requires a runtime assembler registry",
+            code="runtime_assembler_registry_required",
+        )
+    for model_type, backend, session_builder in _POLICY_SESSION_BUILDERS:
+        if session_registry.get("policy", model_type, "predict", backend) is None:
+            session_registry.register("policy", model_type, "predict", backend, session_builder)
+
+    for model_type, backend, builder in _POLICY_EXECUTOR_BUILDERS:
+        contract = _POLICY_CONTRACTS[model_type]
+        visibility = "session" if model_type == "diffusion" else "executor"
+        key = ModelRuntimeKey(
+            "policy",
+            model_type,
+            "predict",
+            backend,
+            contract,
+            visibility if contract.endswith("iterative") else None,
+        )
+        if assembler_registry.get(key) is not None:
+            continue
+        profile_type = _POLICY_PROFILE_TYPES[backend]
+        assembler_registry.register(
+            RuntimeDescriptor(
+                key=key,
+                session_builder_key=SessionBuilderKey("policy", model_type, "predict", backend),
+                profile_type=profile_type,
+                assembler=_policy_runtime_assembler(builder, contract),
+                execution_contract=contract,
+                declared_capabilities={"stateful": False, "execution_contract": contract},
+                supported_target_runtimes=_POLICY_TARGET_RUNTIMES[backend],
+            )
+        )

@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--deployment", default="hmm")
     parser.add_argument("--target-soc", default="lq50")
-    parser.add_argument("--target-runtime", default="tcim-lite")
+    parser.add_argument("--target-runtime", default="tcim")
     args = parser.parse_args()
 
     bundle_root = Path(args.bundle_root).resolve()

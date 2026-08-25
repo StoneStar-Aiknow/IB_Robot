@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 import numpy as np
 
@@ -15,10 +15,11 @@ from inference_service.model_sessions import ModelSession
 class SpeechDirectionRoleRunner:
     """Protocol adapter retained for the Host FullSubNet and VAD layers."""
 
-    def __init__(self, session: ModelSession, context: RuntimeContext) -> None:
+    def __init__(self, session: ModelSession, context: RuntimeContext, *, owns_session: bool = False) -> None:
         self.session = session
         self.context = context
-        self.backend = "stateful_raw_acl"
+        self.backend = "ascend"
+        self._owns_session = bool(owns_session)
         self._request_counter = 0
         self._execution = None
 
@@ -77,7 +78,74 @@ class SpeechDirectionRoleRunner:
         self.session.reset()
 
     def close(self) -> None:
-        self.session.close()
+        # Production Sessions are owned by ModelRuntimeHandle.  Keeping this
+        # adapter non-owning prevents the host pipeline and the handle from
+        # closing the same device resource twice.  Standalone callers can opt
+        # into the old convenience behavior explicitly.
+        if self._owns_session:
+            self.session.close()
 
 
-__all__ = ["SpeechDirectionRoleRunner"]
+class SpeechDirectionSessionResources:
+    """Lifecycle owner for the role Sessions used by one Speech stream."""
+
+    def __init__(self, sessions: Mapping[str, tuple[ModelSession, RuntimeContext]]) -> None:
+        if not sessions:
+            raise ValueError("Speech Direction requires at least one model Session")
+        self._entries = tuple((str(role), session, context) for role, (session, context) in sessions.items())
+        if any(not role or session is None or context is None for role, session, context in self._entries):
+            raise ValueError("Speech Direction Session entries must contain role, session, and context")
+        self._loaded = False
+        self._closed = False
+
+    @property
+    def sessions(self) -> Mapping[str, ModelSession]:
+        return {role: session for role, session, _context in self._entries}
+
+    @property
+    def loaded(self) -> bool:
+        return self._loaded
+
+    def add(self, role: str, session: ModelSession, context: RuntimeContext) -> None:
+        """Register a role before handle ownership is transferred."""
+
+        if self._loaded or self._closed:
+            raise RuntimeError("cannot add a Session after resources are loaded or closed")
+        if not role or session is None or context is None:
+            raise ValueError("Speech Direction Session entries must contain role, session, and context")
+        if any(existing_role == role for existing_role, _session, _context in self._entries):
+            raise ValueError(f"duplicate Speech Direction Session role: {role}")
+        self._entries = (*self._entries, (role, session, context))
+
+    def load(self, _context: object = None) -> None:
+        if self._closed:
+            raise RuntimeError("Speech Direction Session resources are closed")
+        if self._loaded:
+            return
+        loaded: list[ModelSession] = []
+        try:
+            for _role, session, context in self._entries:
+                session.load(context)
+                loaded.append(session)
+        except Exception:
+            for session in reversed(loaded):
+                with suppress(Exception):
+                    session.close()
+            raise
+        self._loaded = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+        for _role, session, _context in reversed(self._entries):
+            try:
+                session.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError(f"Speech Direction Session cleanup failed: {errors[0]}") from errors[0]
+
+
+__all__ = ["SpeechDirectionRoleRunner", "SpeechDirectionSessionResources"]

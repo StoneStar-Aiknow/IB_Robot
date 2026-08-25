@@ -22,7 +22,7 @@ def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
 def _voice_tts(**overrides) -> dict:
     return {
         "enabled": True,
-        "bundle_path": "models/voice_tts/zipvoice",
+        "bundle_path": "models/zipvoice",
         "deployment": "test_deployment",
         "service_name": "/voice_tts/synthesize",
         "playback_service_name": "/voice_tts/play",
@@ -446,14 +446,14 @@ def test_tts_enabled_game_adds_shared_announcer():
         {"enabled": False},
         {
             "enabled": True,
-            "bundle_path": "models/voice_tts/zipvoice",
+            "bundle_path": "models/zipvoice",
             "deployment": "",
             "service_name": "/voice_tts/synthesize",
             "playback_service_name": "/voice_tts/play",
         },
         {
             "enabled": True,
-            "bundle_path": "models/voice_tts/zipvoice",
+            "bundle_path": "models/zipvoice",
             "deployment": "test_deployment",
             "service_name": "/voice_tts/synthesize",
             "playback_service_name": "",

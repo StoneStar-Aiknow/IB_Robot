@@ -12,11 +12,13 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from inference_manifest import (
+    BackendRuntimeProfile,
     CompiledDeployment,
     Deployment,
     DeploymentTarget,
     ModelDescriptor,
     PolicyMetadata,
+    RoleRuntimeProfile,
     ValidatedManifest,
     resolve_bundle_file,
 )
@@ -141,22 +143,42 @@ class BackendCapabilities:
 
 @dataclass(frozen=True)
 class RuntimeContext:
-    """Validated manifest selection and local operational options for a backend."""
+    """Validated manifest selection and local operational options for a backend.
+
+    ``runtime_options`` is retained for facade/executor options that have not
+    moved into the typed v3 profile yet.  Backend identity and device placement
+    are resolved from ``runtime_profile`` first, so a builder does not need to
+    reconstruct them from an untyped mapping.
+    """
 
     validated_manifest: ValidatedManifest
     runtime_options: Mapping[str, object] = field(default_factory=dict)
     priority_scheduling: bool = False
+    runtime_profile: RoleRuntimeProfile | BackendRuntimeProfile | None = None
+    role: str | None = None
     resolved_artifacts: Mapping[str, Path] = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.priority_scheduling, bool):
             raise TypeError("priority_scheduling must be a bool")
         deployment = self.validated_manifest.deployment
+        selected_profile = self.runtime_profile
+        if selected_profile is None:
+            role_profiles = getattr(self.validated_manifest, "role_runtime_profiles", {})
+            if self.role is not None:
+                selected_profile = role_profiles.get(self.role)
+            if selected_profile is None:
+                selected_profile = getattr(deployment, "runtime_profile", None)
+        if selected_profile is not None and not isinstance(
+            selected_profile, RoleRuntimeProfile | BackendRuntimeProfile
+        ):
+            raise TypeError("runtime_profile must be a typed v3 backend or role runtime profile")
         artifacts: dict[str, Path] = {}
         if isinstance(deployment, CompiledDeployment):
             for role, artifact in deployment.artifacts.items():
                 artifacts[role] = resolve_bundle_file(self.validated_manifest.bundle_root, artifact.path)
         object.__setattr__(self, "runtime_options", _immutable_mapping(self.runtime_options))
+        object.__setattr__(self, "runtime_profile", selected_profile)
         object.__setattr__(self, "resolved_artifacts", MappingProxyType(artifacts))
 
     @property
@@ -172,7 +194,7 @@ class RuntimeContext:
         policy = self.validated_manifest.policy
         if policy is None:
             raise ValueError(
-                f"RuntimeContext.policy is unavailable for {self.model.kind!r} model family {self.model.family!r}"
+                f"RuntimeContext.policy is unavailable for {self.interface}/{self.model_type}/{self.operation}"
             )
         return policy
 
@@ -182,8 +204,75 @@ class RuntimeContext:
 
     @property
     def target(self) -> DeploymentTarget | None:
+        profile = self.runtime_profile
+        if isinstance(profile, RoleRuntimeProfile):
+            return profile.target
         deployment = self.deployment
-        return deployment.target if isinstance(deployment, CompiledDeployment) else None
+        return getattr(deployment, "target", None) if isinstance(deployment, CompiledDeployment) else None
+
+    @property
+    def identity(self):
+        """Return the top-level or selected role v3 identity."""
+
+        if self.role is not None:
+            role_identities = getattr(self.validated_manifest, "role_identities", {})
+            identity = role_identities.get(self.role)
+            if identity is not None:
+                return identity
+        return self.validated_manifest.top_level_identity
+
+    @property
+    def interface(self) -> str:
+        return self.identity.interface
+
+    @property
+    def model_type(self) -> str:
+        return self.identity.model_type
+
+    @property
+    def operation(self) -> str:
+        return self.identity.operation
+
+    @property
+    def backend_profile(self) -> BackendRuntimeProfile | None:
+        profile = self.runtime_profile
+        if isinstance(profile, RoleRuntimeProfile):
+            return profile.backend_profile
+        if isinstance(profile, BackendRuntimeProfile):
+            return profile
+        return None
+
+    @property
+    def backend(self) -> str:
+        profile = self.backend_profile
+        if profile is not None:
+            return profile.backend
+        deployment_backend = getattr(self.deployment, "backend", None)
+        if isinstance(deployment_backend, str) and deployment_backend:
+            return deployment_backend
+        raise ValueError("runtime context does not expose a typed backend profile")
+
+    @property
+    def target_runtime(self) -> str | None:
+        target = self.target
+        return None if target is None else target.runtime
+
+    @property
+    def runtime_abi(self) -> str | None:
+        target = self.target
+        return None if target is None else target.runtime_abi
+
+    @property
+    def device_id(self) -> int | None:
+        profile = self.backend_profile
+        value = getattr(profile, "device_id", None)
+        return value if type(value) is int else None
+
+    @property
+    def device(self) -> str | None:
+        profile = self.backend_profile
+        value = getattr(profile, "device", None)
+        return value if isinstance(value, str) else None
 
     @property
     def deployment_fingerprint(self) -> str:
@@ -210,7 +299,7 @@ class InferenceRequest:
 
 
 @dataclass(frozen=True)
-class BackendResult:
+class _LegacyBackendResult:
     action: object
     actual_chunk_size: int
     backend_latency_ms: float
@@ -242,7 +331,7 @@ class BackendHealth:
 
 
 @runtime_checkable
-class InferenceBackend(Protocol):
+class _LegacyBackendProtocol(Protocol):
     @property
     def name(self) -> str: ...
 
@@ -251,7 +340,7 @@ class InferenceBackend(Protocol):
 
     def load(self, context: RuntimeContext) -> None: ...
 
-    def infer(self, request: InferenceRequest) -> BackendResult: ...
+    def infer(self, request: InferenceRequest) -> _LegacyBackendResult: ...
 
     def reset(self, deadline: datetime | None = None) -> None: ...
 
@@ -269,9 +358,7 @@ __all__ = [
     "BackendCapabilities",
     "BackendHealth",
     "BackendPriorityMapping",
-    "BackendResult",
     "BackendState",
-    "InferenceBackend",
     "InferenceRequest",
     "RuntimeContext",
 ]

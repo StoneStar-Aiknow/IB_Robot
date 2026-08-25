@@ -20,6 +20,7 @@ from tests.manifest_fixtures import (
     TEST_DEPLOYMENT_UUID,
     create_non_policy_bundle,
     make_non_policy_manifest,
+    v3_runtime_deployment,
     write_manifest,
 )
 from tests.test_hmm_backend import FakeModuleSpec, FakeTCIMEnvironment, _tensor
@@ -66,10 +67,11 @@ def _write_hmm_manifest(
     marker.write_bytes(b"hmm-session")
     entries = [BundleFile(path="model.marker")]
     full_deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
+    full_deployment = v3_runtime_deployment(full_deployment, default_backend="hmm")
     write_manifest(
         root,
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -89,8 +91,9 @@ def _write_hmm_manifest(
 
 
 _LINKED_MODEL = {
-    "kind": "generic",
-    "family": "linked_hmm",
+    "interface": "tensor_model",
+    "model_type": "linked_hmm",
+    "operation": "infer",
     "inputs": [
         {"semantic": "observation.image", "dtype": "float16", "shape": [1, 3, 4, 4], "layout": "NCHW"},
         {"semantic": "bias", "dtype": "float16", "shape": [1, 4]},
@@ -102,7 +105,7 @@ _LINKED_MODEL = {
 def _linked_deployment(root: Path) -> dict[str, object]:
     return {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {
             "encoder": _hmm_artifact(root, "encoder"),
             "head": _hmm_artifact(root, "head"),
@@ -214,8 +217,9 @@ def test_hmm_session_sequential_execute_threads_device_linked_roles(tmp_path) ->
 
 
 _PRODUCER_INPUT_MODEL = {
-    "kind": "generic",
-    "family": "producer_input_hmm",
+    "interface": "tensor_model",
+    "model_type": "producer_input_hmm",
+    "operation": "infer",
     "inputs": [{"semantic": "features", "dtype": "float16", "shape": [1, 4]}],
     "outputs": [{"semantic": "scores", "dtype": "float16", "shape": [1, 4]}],
 }
@@ -224,7 +228,7 @@ _PRODUCER_INPUT_MODEL = {
 def _producer_input_deployment(root: Path) -> dict[str, object]:
     return {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {
             "feeder": _hmm_artifact(root, "feeder"),
             "reader": _hmm_artifact(root, "reader"),
@@ -309,8 +313,9 @@ def test_hmm_session_supports_producer_input_device_links(tmp_path) -> None:
 
 
 _HOST_ROLE_MODEL = {
-    "kind": "generic",
-    "family": "host_role_hmm",
+    "interface": "tensor_model",
+    "model_type": "host_role_hmm",
+    "operation": "infer",
     "inputs": [{"semantic": "observation.image", "dtype": "float16", "shape": [1, 3, 4, 4], "layout": "NCHW"}],
     "outputs": [{"semantic": "scores", "dtype": "float16", "shape": [1, 4]}],
 }
@@ -319,7 +324,7 @@ _HOST_ROLE_MODEL = {
 def _host_role_deployment(root: Path) -> dict[str, object]:
     return {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {
             "encoder": _hmm_artifact(root, "encoder"),
             "embedding": _hmm_artifact(root, "embedding", "pt"),
