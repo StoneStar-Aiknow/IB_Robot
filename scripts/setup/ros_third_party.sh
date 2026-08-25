@@ -112,7 +112,7 @@ ensure_ros_third_party_patch_stacks() {
     _require_ros_submodule_commit \
         "${livox_driver_src}" "13eb05e4e6dd7a765b934d0c5fd6236676a57b49" "livox_ros_driver2" || return 1
     _require_ros_submodule_commit \
-        "${fast_lio_src}" "a4743b095409588842a5b30ddfa27e29d2f99164" "FAST-LIO" || return 1
+        "${fast_lio_src}" "fa220db3dbb30d2928b13b3aa2e3b2c5b774b001" "FAST-LIO" || return 1
     _require_ros_submodule_commit \
         "${fast_calib_src}" "7747dfc6109c04b4bf81d2e3661e41626c8392e1" "FAST-Calib" || return 1
     _require_ros_submodule_commit \
