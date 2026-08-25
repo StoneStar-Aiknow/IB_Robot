@@ -174,14 +174,14 @@ synthesize -> 复用常驻模型
 `WORKSPACE` 为根目录解析。例如：
 
 ```yaml
-bundle_path: models/voice_tts/zipvoice
+bundle_path: models/zipvoice
 deployment: ascend_310p
 ```
 
 对应模型目录为：
 
 ```text
-$WORKSPACE/models/voice_tts/zipvoice/
+$WORKSPACE/models/zipvoice/
 ├── inference_manifest.json
 ├── assets/
 │   └── ...
@@ -191,9 +191,8 @@ $WORKSPACE/models/voice_tts/zipvoice/
 
 bundle 必须满足：
 
-- manifest schema 为 v2。
-- `model.kind` 为 `generic`。
-- `model.family` 为 `zipvoice`。
+- manifest schema 为 v3。
+- 模型身份为 `interface=tensor_model`、`model_type=zipvoice`、`operation=synthesize`。
 - `deployment` 必须是 manifest 中存在的命名 deployment。
 
 ### 5.1 已验证的 deployment
@@ -221,7 +220,7 @@ source .shrc_local
 ZIPVOICE_SOURCE_DIR=/path/to/zipvoice-delivery
 ros2 run voice_tts_service package_zipvoice_310p \
   --source "$ZIPVOICE_SOURCE_DIR" \
-  --destination "$WORKSPACE/models/voice_tts/zipvoice"
+  --destination "$WORKSPACE/models/zipvoice"
 ```
 
 打包工具会校验 Text Encoder OM、Flow Decoder OM、Vocos checkpoint、token table 和默认 prompt，并生成
@@ -239,7 +238,7 @@ ros2 run voice_tts_service package_zipvoice_310p \
 ```yaml
 voice_tts:
   enabled: true
-  bundle_path: models/voice_tts/zipvoice
+  bundle_path: models/zipvoice
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize

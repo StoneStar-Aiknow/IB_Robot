@@ -185,7 +185,8 @@ def main() -> int:
     om_manifest = {
         "schema_version": 1,
         "model_type": "graspgen",
-        "backend": "ascend_om",
+        "backend": "ascend",
+        "target_runtime": "acl",
         "artifacts": compiled,
         "execution": execution,
         "backend_config": manifest.get("backend_config", {}),

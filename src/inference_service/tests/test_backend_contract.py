@@ -13,7 +13,7 @@ import pytest
 
 from inference_manifest import load_inference_manifest
 from inference_service.backends import (
-    BACKEND_REGISTRY,
+    STATIC_BACKEND_DESCRIPTORS,
     BackendAdmissionError,
     BackendAdmissionEvidence,
     BackendCancellationError,
@@ -26,7 +26,6 @@ from inference_service.backends import (
     BackendPriorityMapping,
     BackendRegistry,
     BackendRegistryError,
-    BackendResult,
     BackendState,
     ConformanceEvidence,
     InferenceRequest,
@@ -35,6 +34,7 @@ from inference_service.backends import (
     ResourceDomainAdmissions,
     RuntimeContext,
 )
+from inference_service.backends._legacy import BackendResult
 from tests.manifest_fixtures import (
     create_non_policy_bundle,
     create_policy_bundle,
@@ -42,6 +42,8 @@ from tests.manifest_fixtures import (
     make_non_policy_manifest,
     write_manifest,
 )
+
+_STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 
 _MULTI_INSTANCE_EVIDENCE = BackendAdmissionEvidence(
     sdk_initialization=True,
@@ -208,7 +210,7 @@ def _make_context(
         }
         soc, runtime, file_format = defaults[backend]
         deployment = manifest["deployments"][backend]
-        deployment["target"] = {
+        deployment["runtime_profile"]["target"] = {
             "soc": target_soc or soc,
             "runtime": target_runtime or runtime,
         }
@@ -237,7 +239,7 @@ def _request(request_id: str = "request-1") -> InferenceRequest:
 def _make_non_policy_context(root: Path, *, family: str = "ram_plus") -> RuntimeContext:
     root.mkdir()
     bundle_paths = create_non_policy_bundle(root)
-    write_manifest(root, make_non_policy_manifest(root, bundle_paths, family=family))
+    write_manifest(root, make_non_policy_manifest(root, bundle_paths, model_type=family))
     return RuntimeContext(load_inference_manifest(root, "ascend"))
 
 
@@ -552,7 +554,7 @@ def test_registry_validation_is_lazy_and_fake_factory_is_loaded_only_on_create(m
         return original_import_module(name, package)
 
     monkeypatch.setattr(importlib, "import_module", guarded_import_module)
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
     assert descriptor.name == "torch"
     assert attempted_imports == []
 
@@ -571,14 +573,14 @@ def test_registry_validation_is_lazy_and_fake_factory_is_loaded_only_on_create(m
             "torch": BackendDescriptor(
                 name="torch",
                 factory="tests.fake_backend_factory:create_backend",
-                supported_policy_families=frozenset({"act"}),
-                conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
+                supported_identities=frozenset({("policy", "act", "predict")}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "act", "predict")}),
                 target_validator=lambda deployment: None,
             )
         }
     )
 
-    backend = registry.create(context)
+    backend = registry._create_legacy_backend(context)
     assert attempted_imports == ["tests.fake_backend_factory"]
     assert backend is created[0]
     backend.close()
@@ -591,8 +593,8 @@ def test_registry_does_not_instantiate_unavailable_backend_during_validation(tmp
             "rknn": BackendDescriptor(
                 name="rknn",
                 factory="tests.unavailable_backend_factory:create_backend",
-                supported_policy_families=frozenset({"act"}),
-                conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
+                supported_identities=frozenset({("policy", "act", "predict")}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "act", "predict")}),
                 target_validator=lambda deployment: None,
             )
         }
@@ -600,7 +602,7 @@ def test_registry_does_not_instantiate_unavailable_backend_during_validation(tmp
 
     assert registry.validate(context).name == "rknn"
     with pytest.raises(BackendRegistryError, match="factory module.*unavailable") as error:
-        registry.create(context)
+        registry._create_legacy_backend(context)
     assert error.value.code == "factory_unavailable"
 
 
@@ -633,14 +635,14 @@ def test_registry_enforces_exact_policy_support_matrix(tmp_path, policy_type, ba
     context = _make_context(tmp_path / "bundle", policy_type=policy_type, backend=backend)
 
     if supported:
-        assert BACKEND_REGISTRY.validate(context).name == backend
+        assert _STATIC_BACKEND_REGISTRY.validate(context).name == backend
     else:
         with pytest.raises(BackendCompatibilityError, match="does not support") as error:
-            BACKEND_REGISTRY.validate(context)
+            _STATIC_BACKEND_REGISTRY.validate(context)
         assert error.value.code == "unsupported_policy_backend_pair"
 
 
-def test_registry_accepts_non_policy_model_family_support(tmp_path):
+def test_registry_accepts_non_policy_model_identity_support(tmp_path):
     context = _make_non_policy_context(tmp_path / "bundle")
     registry = BackendRegistry(
         {
@@ -648,65 +650,52 @@ def test_registry_accepts_non_policy_model_family_support(tmp_path):
                 name="ascend",
                 factory="tests.fake_backend_factory:create_backend",
                 target_validator=lambda deployment: None,
-                supported_model_families=frozenset({"ram_plus"}),
-                conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
+                supported_identities=frozenset({("tensor_model", "ram_plus", "recognize_tags")}),
+                conformance_evidence=frozenset({ConformanceEvidence("tensor_model", "ram_plus", "recognize_tags")}),
             )
         }
     )
 
     assert registry.validate(context).name == "ascend"
-    assert context.model.family == "ram_plus"
+    assert context.model.model_type == "ram_plus"
     with pytest.raises(ValueError, match=r"RuntimeContext\.policy is unavailable.*ram_plus"):
         _ = context.policy
 
 
-def test_registry_accepts_non_policy_model_kind_support(tmp_path):
-    context = _make_non_policy_context(tmp_path / "bundle")
-    registry = BackendRegistry(
-        {
-            "ascend": BackendDescriptor(
-                name="ascend",
-                factory="tests.fake_backend_factory:create_backend",
-                target_validator=lambda deployment: None,
-                supported_model_kinds=frozenset({"perception"}),
-                supported_model_families=frozenset({"ram_plus"}),
-                conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
-            )
-        }
-    )
-
-    assert registry.validate(context).name == "ascend"
+def test_registry_rejects_legacy_non_policy_identity_support():
+    with pytest.raises(ValueError, match="interface must be one of"):
+        ConformanceEvidence("perception", "ram_plus", "recognize_tags")
 
 
 def test_registry_accepts_declared_non_policy_model_support(tmp_path):
     context = _make_non_policy_context(tmp_path / "bundle", family="siglip2")
 
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
 
     assert descriptor.name == "ascend"
 
 
-def test_descriptor_can_declare_model_support_without_policy_support():
+def test_descriptor_can_declare_tensor_model_support_without_policy_support():
     descriptor = BackendDescriptor(
         name="ascend",
         factory="tests.fake_backend_factory:create_backend",
         target_validator=lambda deployment: None,
-        supported_model_families=frozenset({"ram_plus"}),
+        supported_identities=frozenset({("tensor_model", "ram_plus", "recognize_tags")}),
+        conformance_evidence=frozenset({ConformanceEvidence("tensor_model", "ram_plus", "recognize_tags")}),
     )
 
     descriptor.validate_definition()
 
 
 def test_descriptor_rejects_unknown_perception_family():
-    with pytest.raises(BackendRegistryError, match="unknown model families") as error:
+    with pytest.raises(BackendRegistryError, match="must declare conformance evidence") as error:
         BackendDescriptor(
             name="ascend",
             factory="tests.fake_backend_factory:create_backend",
             target_validator=lambda deployment: None,
-            supported_model_families=frozenset({"unknown_perception"}),
         ).validate_definition()
 
-    assert error.value.code == "unknown_model_family"
+    assert error.value.code == "missing_conformance_evidence"
 
 
 def _make_perception_context(
@@ -718,13 +707,21 @@ def _make_perception_context(
 ) -> RuntimeContext:
     root.mkdir()
     bundle_paths = create_non_policy_bundle(root)
-    manifest = make_non_policy_manifest(root, bundle_paths, family=family)
+    manifest = make_non_policy_manifest(root, bundle_paths, model_type=family)
     if backend == "torch":
         manifest["deployments"][deployment_name] = {
             "uuid": "123e4567-e89b-42d3-a456-426614174001",
             "revision": 1,
-            "backend": "torch",
-            "device": "cpu",
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": "torch",
+                "target": {"runtime": "torch"},
+                "profile": {"device": "cpu"},
+            },
         }
     else:
         manifest["deployments"][deployment_name] = manifest["deployments"]["ascend"]
@@ -734,9 +731,9 @@ def _make_perception_context(
 
 @pytest.mark.parametrize("backend", ["torch", "ascend", "hisilicon", "rknn", "hmm"])
 def test_static_registry_evidence_matches_declared_policy_matrix(backend):
-    descriptor = BACKEND_REGISTRY.descriptor(backend)
-    declared = descriptor.supported_policy_families
-    evidenced = {family for kind, family in descriptor.evidence_pairs if kind == "policy"}
+    descriptor = _STATIC_BACKEND_REGISTRY.descriptor(backend)
+    declared = {identity for identity in descriptor.supported_identities if identity[0] == "policy"}
+    evidenced = {identity for identity in descriptor.evidence_pairs if identity[0] == "policy"}
     assert declared == evidenced
 
 
@@ -752,20 +749,20 @@ def test_static_registry_evidence_matches_declared_policy_matrix(backend):
         ("graspgen", "ascend"),
         ("sam2", "ascend"),
         ("grounding_dino", "ascend"),
-        ("fullsubnet_cumulative_stateful", "ascend"),
+        ("fullsubnet", "ascend"),
     ],
 )
 def test_registry_supports_declared_perception_deployments(tmp_path, family, backend):
     context = _make_perception_context(tmp_path / "bundle", backend=backend, family=family)
 
-    assert BACKEND_REGISTRY.validate(context).name == backend
+    assert _STATIC_BACKEND_REGISTRY.validate(context).name == backend
 
 
 @pytest.mark.parametrize("family", ["sam2", "siglip2", "grounding_dino"])
 def test_registry_accepts_perception_family_with_compiled_ascend_support(tmp_path, family):
     context = _make_perception_context(tmp_path / "bundle", backend="ascend", family=family)
 
-    assert BACKEND_REGISTRY.validate(context).name == "ascend"
+    assert _STATIC_BACKEND_REGISTRY.validate(context).name == "ascend"
 
 
 def test_registry_validate_fails_closed_when_evidence_absent(tmp_path):
@@ -776,7 +773,7 @@ def test_registry_validate_fails_closed_when_evidence_absent(tmp_path):
                 name="ascend",
                 factory="tests.fake_backend_factory:create_backend",
                 target_validator=lambda deployment: None,
-                supported_model_families=frozenset({"ram_plus"}),
+                supported_identities=frozenset({("tensor_model", "ram_plus", "recognize_tags")}),
             )
         }
     )
@@ -790,48 +787,42 @@ def test_registry_validate_rejects_adapter_deployment_mismatch(tmp_path):
     context = _make_perception_context(tmp_path / "bundle", backend="ascend", family="ram_plus")
 
     with pytest.raises(BackendCompatibilityError, match="not in the adapter supported deployments") as error:
-        BACKEND_REGISTRY.validate(context, allowed_deployments=frozenset({"torch_cpu"}))
+        _STATIC_BACKEND_REGISTRY.validate(context, allowed_deployments=frozenset({"torch_cpu"}))
     assert error.value.code == "adapter_deployment_mismatch"
 
 
 def test_descriptor_definition_rejects_evidence_overclaiming_support():
-    with pytest.raises(BackendRegistryError, match="claims undeclared policy family") as error:
+    with pytest.raises(BackendRegistryError, match="claims undeclared identity") as error:
         BackendDescriptor(
             name="ascend",
             factory="tests.fake_backend_factory:create_backend",
             target_validator=lambda deployment: None,
-            supported_policy_families=frozenset({"act"}),
-            conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
+            supported_identities=frozenset({("policy", "act", "predict")}),
+            conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05", "predict")}),
         ).validate_definition()
     assert error.value.code == "evidence_overclaims_support"
 
 
-def test_descriptor_definition_rejects_non_policy_evidence_without_kind_or_family():
-    with pytest.raises(BackendRegistryError, match="claims undeclared model") as error:
+def test_descriptor_definition_rejects_non_policy_evidence_without_v3_identity():
+    with pytest.raises(ValueError, match="interface must be one of"):
         BackendDescriptor(
             name="ascend",
             factory="tests.fake_backend_factory:create_backend",
             target_validator=lambda deployment: None,
-            supported_model_families=frozenset({"ram_plus"}),
-            conformance_evidence=frozenset({ConformanceEvidence("perception", "sam2")}),
+            supported_identities=frozenset({("tensor_model", "ram_plus", "recognize_tags")}),
+            conformance_evidence=frozenset({ConformanceEvidence("perception", "sam2", "detect")}),
         ).validate_definition()
-    assert error.value.code == "evidence_overclaims_support"
 
 
-def test_evidence_coherence_accepts_kind_backed_non_policy_evidence():
-    BackendDescriptor(
-        name="ascend",
-        factory="tests.fake_backend_factory:create_backend",
-        target_validator=lambda deployment: None,
-        supported_model_kinds=frozenset({"perception"}),
-        conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
-    ).validate_definition()
+def test_evidence_coherence_requires_v3_non_policy_identity():
+    with pytest.raises(ValueError, match="interface must be one of"):
+        ConformanceEvidence("perception", "ram_plus", "recognize_tags")
 
 
 @pytest.mark.parametrize("alias", ["ascend_om", "ascend_om_3403", "3403", "om"])
 def test_registry_rejects_noncanonical_backend_names_without_aliases(alias):
     with pytest.raises(BackendRegistryError, match="not registered"):
-        BACKEND_REGISTRY.descriptor(alias)
+        _STATIC_BACKEND_REGISTRY.descriptor(alias)
 
 
 @pytest.mark.parametrize(
@@ -862,7 +853,7 @@ def test_registry_validates_explicit_backend_targets(
     )
 
     with pytest.raises(BackendCompatibilityError, match=message) as error:
-        BACKEND_REGISTRY.validate(context)
+        _STATIC_BACKEND_REGISTRY.validate(context)
     assert error.value.code == "incompatible_backend_target"
 
 

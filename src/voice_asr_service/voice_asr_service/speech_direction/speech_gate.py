@@ -41,19 +41,19 @@ class SileroVadEngine:
         self,
         model_path: str,
         sample_rate: int = SILERO_SAMPLE_RATE,
-        backend: str = "raw_acl",
+        backend: str = "ascend",
         acl_runner=None,
     ):
         """
         Args:
             model_path: 模型路径(.om 走 NPU,.onnx 走 CPU)
             sample_rate: 输入采样率(默认 16000)
-            backend: 推理后端 "raw_acl"(Ascend NPU,默认) 或
-                     "onnx"(CPU,onnxruntime,Ubuntu 回归基线)；"om" 归一化为 "raw_acl"
-            acl_runner: 可选,注入已构造好的 raw_acl 推理器(需实现 infer/reset/close,
-                        如 manifest/RuntimeContext 驱动的 SpeechDirectionRoleRunner)。
-                        提供时复用其已加载的 OM/会话,不再另建 SileroVadAclRunner,
-                        避免同一模型被重复加载;仅在 backend="raw_acl" 时生效。
+            backend: 推理后端 "ascend"(Ascend NPU,默认) 或
+                     "onnx"(CPU,onnxruntime,Ubuntu 回归基线)
+            acl_runner: 可选,注入已构造好的 Ascend ACL 推理器(需实现 infer/reset/close,
+                         如 manifest/RuntimeContext 驱动的 SpeechDirectionRoleRunner)。
+                         提供时复用其已加载的 OM/会话,不再另建 SileroVadAclRunner,
+                         避免同一模型被重复加载;仅在 backend="ascend" 时生效。
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Silero VAD 模型不存在: {model_path}")
@@ -61,13 +61,14 @@ class SileroVadEngine:
         self.model_path = model_path
         self.sample_rate = sample_rate
         self.frame_size = SILERO_FRAME_SIZE
-        # "om" 为兼容旧值，构造时归一化为 canonical "raw_acl"；之后内部只判断 canonical 值。
-        self.backend = "raw_acl" if backend == "om" else backend
+        self.backend = backend
         self._acl_runner = None
+        self._closed = False
+        self._backend_closed = False
 
-        if self.backend == "raw_acl":
+        if self.backend == "ascend":
             if acl_runner is not None:
-                # 复用调用方已构造的 raw_acl 推理器(如 manifest 驱动的 SpeechDirectionRoleRunner)，
+                # 复用调用方已构造的 Ascend ACL 推理器(如 manifest 驱动的 SpeechDirectionRoleRunner)，
                 # 仅借用本类的 context 拼接逻辑，不重复加载 OM。
                 self._acl_runner = acl_runner
                 self._sess = None
@@ -78,9 +79,9 @@ class SileroVadEngine:
                 self._state = self._zero_state()
                 self._context_size = 64 if sample_rate == 16000 else 32
                 self._context = np.zeros(self._context_size, dtype=np.float32)
-                logger.info("Silero VAD 已加载(复用外部 raw_acl 推理器): sr=%d, backend=%s", sample_rate, backend)
+                logger.info("Silero VAD 已加载(复用外部 Ascend ACL 推理器): sr=%d, backend=%s", sample_rate, backend)
                 return
-            # 310P 生产路径直接使用 raw ACL，Silero 的 LSTM state 保留在 Device。
+            # 310P 生产路径直接使用 Ascend ACL，Silero 的 LSTM state 保留在 Device。
             from .silero_acl import SileroVadAclRunner
 
             self._acl_runner = SileroVadAclRunner(model_path)
@@ -108,7 +109,7 @@ class SileroVadEngine:
                 else next((n for n in self._output_names if n != self._out_name), None)
             )
         else:
-            raise ValueError(f"不支持的 Silero VAD backend: {backend}(仅支持 raw_acl/onnx)")
+            raise ValueError(f"不支持的 Silero VAD backend: {backend}(仅支持 ascend/onnx)")
 
         # 隐藏状态 [2, 1, 128],跨帧传递
         self._state = self._zero_state()
@@ -146,8 +147,8 @@ class SileroVadEngine:
         x = np.concatenate([self._context, chunk]).astype(np.float32)
         audio_in = x.reshape(1, -1)
 
-        if self.backend == "raw_acl":
-            # raw_acl 走 ACL runner；仅 onnx 走 ONNX Runtime。
+        if self.backend == "ascend":
+            # Ascend ACL 走 ACL runner；仅 onnx 走 ONNX Runtime。
             prob = self._acl_runner.infer(audio_in)
             out_map = {}
         else:
@@ -161,7 +162,7 @@ class SileroVadEngine:
 
             # 概率输出 shape 通常 [1, 1] 或 [1]
             prob = float(np.asarray(out_map[self._out_name]).reshape(-1)[0])
-            # ONNX 兼容后端由 Host 保存状态；OM 状态由 raw ACL Device 双 bank 保存。
+            # ONNX 兼容后端由 Host 保存状态；OM 状态由 Ascend ACL Device 双 bank 保存。
             if self._state_out is not None and self._state_out in out_map:
                 self._state = np.asarray(out_map[self._state_out])
         # 更新 context:取本帧末尾 context_size 样本供下一帧拼接
@@ -171,15 +172,29 @@ class SileroVadEngine:
 
     def reset_state(self):
         """重置隐藏状态为零(段间切换 / 冷启动 / 长静音后复位)。"""
+        if self._closed:
+            return
         self._state = self._zero_state()
         self._context = np.zeros(self._context_size, dtype=np.float32)
         if self._acl_runner is not None:
             self._acl_runner.reset()
 
-    def close(self) -> None:
-        """释放 raw ACL Silero 资源；ONNX Runtime 会话由其运行库管理。"""
-        if self._acl_runner is not None:
+    def close(self, *, close_runner: bool = True) -> None:
+        """释放 Ascend ACL Silero 资源；ONNX Runtime 会话由其运行库管理。"""
+        if self._backend_closed:
+            return
+        self._closed = True
+        if close_runner and self._acl_runner is not None:
             self._acl_runner.close()
+        if close_runner:
+            self._backend_closed = True
+
+    def close_host(self) -> None:
+        """Invalidate host context while leaving an injected runner owned elsewhere."""
+
+        if self._backend_closed:
+            return
+        self._closed = True
 
 
 @dataclass
@@ -217,7 +232,7 @@ class SpeechGate:
         sample_rate: int = 16000,
         vad_threshold: float = 0.65,
         rms_threshold: float = 0.002,
-        backend: str = "raw_acl",
+        backend: str = "ascend",
         silero_engine=None,
     ):
         """
@@ -226,9 +241,13 @@ class SpeechGate:
             sample_rate: 采样率(16000)
             vad_threshold: 灰区 VAD 门限(增强 ch1 的 Silero 概率)
             rms_threshold: 灰区 RMS 门限(增强 ch1 RMS,真语音段约 0.02 量级)
-            backend: 推理后端 "raw_acl"(NPU,默认) 或 "onnx"(CPU 基线)；"om" 归一化为 "raw_acl"
+            backend: 推理后端 "ascend"(NPU,默认) 或 "onnx"(CPU 基线)
         """
-        self.silero = silero_engine or SileroVadEngine(model_path=model_path, sample_rate=sample_rate, backend=backend)
+        self.silero = silero_engine or SileroVadEngine(
+            model_path=model_path,
+            sample_rate=sample_rate,
+            backend=backend,
+        )
         self.vad_threshold = vad_threshold
         self.rms_threshold = rms_threshold
         self.silero_frame = SILERO_FRAME_SIZE
@@ -283,9 +302,14 @@ class SpeechGate:
         """重置 Silero 状态(段间切换 / 冷启动 / 长静音后复位)。"""
         self.silero.reset_state()
 
-    def close(self) -> None:
+    def close(self, *, close_silero: bool = True) -> None:
         """释放 Silero 后端资源。"""
-        self.silero.close()
+        if close_silero:
+            self.silero.close()
+        else:
+            close_host = getattr(self.silero, "close_host", None)
+            if callable(close_host):
+                close_host()
 
 
 __all__ = ["SileroVadEngine", "SpeechGate", "GateResult", "SILERO_FRAME_SIZE", "SILERO_CONTEXT_SIZE_16K"]

@@ -17,7 +17,7 @@ the dual DDPM schedulers and the SO(3) helpers live next to it in
 ``perception_service.graspgen_geometry``.
 
 The role order, the sampling geometry and the binding semantics all three of
-them share come from ``inference_manifest.graspgen``.
+them share come from ``model_utils.graspgen_contract``.
 """
 
 from model_utils.graspgen_export.export_onnx import ARTIFACT_ORDER as ONNX_ARTIFACT_ORDER

@@ -9,15 +9,25 @@ import pytest
 
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
-    BACKEND_REGISTRY,
+    STATIC_BACKEND_DESCRIPTORS,
     BackendLoadError,
+    BackendRegistry,
     BackendRegistryError,
     InferenceRequest,
     RuntimeContext,
 )
 from inference_service.backends.hmm import validate_runtime_options
 from inference_service.backends.hmm.host_utils import to_numpy_weight
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    TEST_DEPLOYMENT_UUID,
+    create_policy_bundle,
+    policy_model,
+    v3_runtime_deployment,
+    write_manifest,
+)
+
+_STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 
 
 @dataclass(frozen=True)
@@ -216,10 +226,12 @@ def _bundle_entries(root: Path, paths: tuple[str, ...]) -> list[BundleFile]:
 def _write_compiled_manifest(root: Path, bundle_paths: tuple[str, ...], deployment: dict) -> None:
     entries = _bundle_entries(root, bundle_paths)
     deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
+    deployment = v3_runtime_deployment(deployment)
+    policy_type = json.loads((root / "config.json").read_text(encoding="utf-8")).get("type", "pi05")
     write_manifest(
         root,
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -231,6 +243,7 @@ def _write_compiled_manifest(root: Path, bundle_paths: tuple[str, ...], deployme
                     "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "hmm-test", entries),
                 },
             },
+            "model": policy_model(policy_type),
             "deployments": {"houmo": deployment},
         },
     )
@@ -328,7 +341,7 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
     cache_target = _binding("internal.past_key.0", "past_key_0", 4, "float16", [1, 1])
     deployment = {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {role: _artifact(tmp_path, role, "pt" if role == "embedding" else "hmm") for role in roles},
         "execution": list(roles),
         "bindings": {
@@ -445,7 +458,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
 
     deployment = {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {
             "vision_top": _artifact(tmp_path, "vision_top"),
             "embedding": _artifact(tmp_path, "embedding", "pt"),
@@ -924,11 +937,11 @@ def test_hmm_smolvla_seed_reproduces_sampled_noise_across_instances(tmp_path, mo
 def test_hmm_registry_descriptor_is_session_only(tmp_path):
     context = _smolvla_context(tmp_path)
 
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
     assert descriptor.factory is None
     with pytest.raises(BackendRegistryError) as error:
-        BACKEND_REGISTRY.create(context)
-    assert error.value.code == "backend_factory_unavailable"
+        _STATIC_BACKEND_REGISTRY._create_legacy_backend(context)
+    assert error.value.code == "legacy_backend_unavailable"
 
 
 @pytest.mark.parametrize(

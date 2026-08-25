@@ -22,6 +22,11 @@ from std_msgs.msg import Header
 
 from ibrobot_msgs.msg import DetectionArray, GraspCandidate, GraspCandidateArray
 from ibrobot_msgs.srv import DetectSegment, GroundingDetect, PlanGrasp, SegmentDetections
+from inference_service.runtime_composition import (
+    build_model_service_runtime_dependencies,
+    require_runtime_dependencies,
+)
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 
 from .graspgen_wrapper import (
     DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
@@ -913,8 +918,20 @@ def _write_full_debug_artifacts(
 
 
 class GraspPlannerNode(Node):
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ):
         super().__init__("grasp_planner")
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
 
         self._bridge = CvBridge()
         self._lock = threading.Lock()
@@ -1030,6 +1047,8 @@ class GraspPlannerNode(Node):
                 if self.get_parameter("ascend_local_random_seed").get_parameter_value().integer_value < 0
                 else self.get_parameter("ascend_local_random_seed").get_parameter_value().integer_value
             ),
+            registry_set=self._registry_set,
+            providers=self._providers,
         )
         self.get_logger().info(
             f"GraspGen backend loaded (backend={inference_backend}, "
@@ -1839,7 +1858,11 @@ class GraspPlannerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GraspPlannerNode()
+    dependencies = build_model_service_runtime_dependencies()
+    node = GraspPlannerNode(
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
@@ -1848,6 +1871,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
+        dependencies.providers.close()
         rclpy.try_shutdown()
 
 

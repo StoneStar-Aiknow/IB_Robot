@@ -22,6 +22,7 @@ from tests.manifest_fixtures import (
     TEST_DEPLOYMENT_UUID,
     create_non_policy_bundle,
     make_non_policy_manifest,
+    v3_runtime_deployment,
     write_manifest,
 )
 from tests.test_rknn_backend import FakeRKNNEnvironment, FakeRKNNModel
@@ -68,10 +69,11 @@ def _write_rknn_manifest(
     marker.write_bytes(b"rknn-session")
     entries = [BundleFile(path="model.marker")]
     full_deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
+    full_deployment = v3_runtime_deployment(full_deployment, default_backend="rknn")
     write_manifest(
         root,
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -91,8 +93,9 @@ def _write_rknn_manifest(
 
 
 _LINKED_MODEL = {
-    "kind": "generic",
-    "family": "linked_rknn",
+    "interface": "tensor_model",
+    "model_type": "linked_rknn",
+    "operation": "infer",
     "inputs": [
         {"semantic": "observation.image", "dtype": "float32", "shape": [1, 3, 4, 4], "layout": "NCHW"},
         {"semantic": "bias", "dtype": "float32", "shape": [1, 4]},
@@ -200,8 +203,9 @@ def test_rknn_session_sequential_execute_threads_roles_and_returns_semantic_outp
 
 
 _SHARED_MODEL = {
-    "kind": "generic",
-    "family": "shared_rknn",
+    "interface": "tensor_model",
+    "model_type": "shared_rknn",
+    "operation": "infer",
     "inputs": [
         {"semantic": "observation.images.a", "dtype": "float32", "shape": [1, 2, 2, 3], "layout": "NHWC"},
         {"semantic": "observation.images.b", "dtype": "float32", "shape": [1, 2, 2, 3], "layout": "NHWC"},
@@ -300,8 +304,9 @@ def test_rknn_session_reuses_share_group_artifact_for_shared_roles(tmp_path) -> 
 
 
 _HOST_ROLE_MODEL = {
-    "kind": "generic",
-    "family": "host_role_rknn",
+    "interface": "tensor_model",
+    "model_type": "host_role_rknn",
+    "operation": "infer",
     "inputs": [{"semantic": "observation.image", "dtype": "float32", "shape": [1, 3, 4, 4], "layout": "NCHW"}],
     "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 4]}],
 }

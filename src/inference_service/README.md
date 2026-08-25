@@ -7,8 +7,10 @@ pipeline ID，并支持单体和边云分布式执行。
 运行时从 bundle 中唯一的 `inference_manifest.json` 读取模型类型、语义 tensor、命名 deployment、artifact、
 执行顺序和 runtime ABI bindings。Launch 和 robot YAML 通过 deployment 名称选择运行配置。
 
-非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。它通过 `NamedTensorRequest`、
-`NamedTensorResult` 和 `ModelSession` 使用同一套生命周期、准入、健康状态、deployment fingerprint 与资源回收。
+非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。公共本地执行通过
+`ModelRequest`、`ExecutionContext`、`ModelRuntimeFactory` 和 `ModelRuntimeHandle` 进入，成功结果统一为
+`ModelResult`；`NamedTensorRequest` 只作为尚未完成迁移的 session 内部适配值保留。
+生命周期、准入、健康状态、deployment fingerprint 与资源回收由 handle 负责。
 模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
 
 manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。常规 loader
@@ -47,14 +49,22 @@ IB-Robot 只读这些文件，不会添加字段、删字段、重写 device 或
 一个 manifest 可以为同一策略声明多个命名 deployment，例如 `cpu`、`cuda`、
 `rk3588`、`ascend_310p3` 或 `lq50`。Pipeline 选择的是 deployment 名称，而不是后端名。
 
-Torch deployment 直接声明运行设备：
+部署通过显式的 v3 runtime profile 声明后端、target 和运行实例字段：
 
 ```json
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 1,
-  "backend": "torch",
-  "device": "cpu"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "torch",
+    "target": {"runtime": "torch"},
+    "profile": {"device": "cpu"}
+  }
 }
 ```
 
@@ -64,10 +74,22 @@ Torch deployment 直接声明运行设备：
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 3,
-  "backend": "rknn",
-  "target": {
-    "soc": "rk3588",
-    "runtime": "rknn-lite2"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "rknn",
+    "target": {
+      "soc": "rk3588",
+      "runtime": "rknn-lite2"
+    },
+    "profile": {
+      "target_name": "rk3588",
+      "core_mask": 7,
+      "device_id": 0
+    }
   },
   "artifacts": {
     "policy": {
@@ -165,7 +187,7 @@ action 结果适配。编译模型由 `SequentialModelExecutor` 按 `InferenceSt
   进程退出后的全局 Shutdown；optional pipeline 退出后由 readiness 和路由逻辑将其排除。该路径当前只接受
   `execution_mode: monolithic`。
 
-生产执行路径只支持 schema v2 whole-graph plan。公开 Open 只建立 route-independent 的逻辑 session 和
+生产执行路径只支持 schema v3 whole-graph plan。公开 Open 只建立 route-independent 的逻辑 session 和
 logical generation，不选择模型、不检查 fallback，也不访问 pipeline。每个 Dispatch 都携带自己的 target
 pipeline、fallback chain、priority 和 deadline；候选首次被该 session 选中时，Global 才向对应 pipeline
 下发私有 Open/reset 并记录其 pipeline generation。同一个逻辑 session 可按需建立多个 pipeline binding。
@@ -575,8 +597,8 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 
 ```json
 {
-  "format": "ibrobot.deployment-structure-v2",
-  "schema_version": 2,
+  "format": "ibrobot.deployment-structure-v3",
+  "schema_version": 3,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -599,7 +621,7 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 应重新运行拥有该 artifact 的 exporter 或 packaging workflow。Exporter 负责复制 artifact、
 读取 compiler/runtime ABI、生成 bindings、更新 UUID/revision 和轻量结构摘要，并通过生产 loader
 重新验证 manifest。Schema v1 和旧版 artifact 不受支持，必须使用当前 exporter 或 packager
-重新生成完整 schema-v2 whole-graph bundle。
+重新生成完整 schema-v3 whole-graph bundle。
 
 ## Exporter 入口
 
@@ -639,7 +661,7 @@ pytest -q src/inference_service/tests
 只对本次修改的 Python 文件执行 Ruff。项目或 ROS 命令前必须先加载 `.shrc_local`。
 ## Typed Model Services
 
-`model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v2
+`model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v3
 bundle, one named deployment, and one `ModelServicePlugin`; the plugin owns domain request/response mapping while the
 shared `ModelSession` owns admission, health, accelerator lifetime, and cleanup.
 

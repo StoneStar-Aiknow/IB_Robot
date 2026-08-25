@@ -2,15 +2,33 @@
 
 from __future__ import annotations
 
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, build_ascend_model_session
+from inference_service.model_sessions import (
+    ModelSessionBuilderKey,
+    build_ascend_model_session,
+)
+from inference_service.unified_runtime import RuntimeDependencyError
+
+SPEECH_DIRECTION_IDENTITY = ("tensor_model", "speech_direction", "enhance_and_vad")
+SPEECH_DIRECTION_ROLE_IDENTITIES = (
+    ("fullsubnet", "enhance"),
+    ("silero_vad", "vad"),
+)
 
 
-def register_speech_direction_session_builder() -> None:
-    key = ("perception", "fullsubnet_cumulative_stateful", "", "ascend")
-    if MODEL_SESSION_BUILDER_REGISTRY.get(*key) is None:
-        MODEL_SESSION_BUILDER_REGISTRY.register(*key, build_ascend_model_session)
+def register_speech_direction_session_builder(registry=None) -> None:
+    if registry is None:
+        raise RuntimeDependencyError(
+            "register_speech_direction_session_builder requires an explicit session registry",
+            code="session_builder_registry_required",
+        )
+    for model_type, operation in SPEECH_DIRECTION_ROLE_IDENTITIES:
+        key = ModelSessionBuilderKey("tensor_model", model_type, operation, "ascend")
+        if registry.get(key) is None:
+            registry.register(key, build_ascend_model_session)
 
 
-register_speech_direction_session_builder()
-
-__all__ = ["register_speech_direction_session_builder"]
+__all__ = [
+    "SPEECH_DIRECTION_IDENTITY",
+    "SPEECH_DIRECTION_ROLE_IDENTITIES",
+    "register_speech_direction_session_builder",
+]

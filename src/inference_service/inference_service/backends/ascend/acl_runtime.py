@@ -171,29 +171,21 @@ class AclRuntimeManager:
         self._module_loader = module_loader or self._import_acl
         self._lock = threading.RLock()
         self._acl: Any | None = None
-        self._config_path: str | None = None
         self._references = 0
         self._device_references: dict[int, int] = {}
 
-    def acquire(self, device_id: int, config_path: str | None = None) -> AclRuntimeLease:
+    def acquire(self, device_id: int) -> AclRuntimeLease:
         with self._lock:
             acl = self._acl or self._module_loader()
-            normalized_config = config_path or None
             initialized_here = False
             device_set_here = False
             context: object | None = None
             try:
                 if self._references == 0:
-                    ret = acl.init(normalized_config) if normalized_config is not None else acl.init()
+                    ret = acl.init()
                     check_acl_ret(ret, "acl.init")
                     self._acl = acl
-                    self._config_path = normalized_config
                     initialized_here = True
-                elif normalized_config != self._config_path:
-                    raise BackendLoadError(
-                        "Ascend ACL is already initialized with a different acl_config_path",
-                        code="acl_config_conflict",
-                    )
 
                 if self._device_references.get(device_id, 0) == 0:
                     check_acl_ret(acl.rt.set_device(device_id), "acl.rt.set_device")
@@ -211,7 +203,6 @@ class AclRuntimeManager:
                     with suppress(Exception):
                         acl.finalize()
                     self._acl = None
-                    self._config_path = None
                 raise
 
             self._references += 1
@@ -247,7 +238,6 @@ class AclRuntimeManager:
                     errors.append(str(exc))
                 finally:
                     self._acl = None
-                    self._config_path = None
                     self._device_references.clear()
 
             if errors:
@@ -262,6 +252,3 @@ class AclRuntimeManager:
                 f"Ascend ACL dependency 'acl' is unavailable: {exc}",
                 code="missing_dependency",
             ) from exc
-
-
-ACL_RUNTIME_MANAGER = AclRuntimeManager()

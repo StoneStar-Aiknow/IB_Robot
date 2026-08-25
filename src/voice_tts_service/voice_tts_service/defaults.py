@@ -2,7 +2,7 @@
 
 VOICE_TTS_DEFAULTS = {
     "enabled": False,
-    "bundle_path": "models/voice_tts/zipvoice",
+    "bundle_path": "models/zipvoice",
     "deployment": "",
     "service_name": "/voice_tts/synthesize",
     "playback_service_name": "/voice_tts/play",

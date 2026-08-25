@@ -26,7 +26,8 @@ from inference_service.backends.errors import (
 )
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendCapabilities, BackendHealth, BackendState, RuntimeContext
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorRequest, NamedTensorResult, RuntimeLatency
+from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ModelResult, OutcomeEvidence, RuntimeLatency
 
 
 class ModelSessionExecution:
@@ -161,7 +162,7 @@ class ModelSession(ABC):
             with self._condition:
                 self._state = BackendState.READY
 
-    def infer(self, request: NamedTensorRequest) -> NamedTensorResult:
+    def infer(self, request: NamedTensorRequest) -> ModelResult:
         if not isinstance(request, NamedTensorRequest):
             raise TypeError("model sessions require a NamedTensorRequest")
         self._require_ready()
@@ -181,14 +182,17 @@ class ModelSession(ABC):
                 backend_ms = (time.perf_counter() - started) * 1000.0
                 self._raise_if_deadline_expired(request.deadline)
                 self._validate_values(outputs, context.validated_manifest.manifest.model.outputs, "output")
-                result = NamedTensorResult(
+                result = ModelResult(
                     outputs=outputs,
-                    deployment=self._deployment_identity(context),
                     latency=RuntimeLatency(total_ms=backend_ms, backend_ms=backend_ms),
+                    evidence=OutcomeEvidence.completed("backend"),
                     metadata={
                         "request_id": request.request_id,
-                        "model_kind": context.validated_manifest.manifest.model.kind,
-                        "model_family": context.validated_manifest.manifest.model.family,
+                        "interface": context.interface,
+                        "model_type": context.model_type,
+                        "operation": context.operation,
+                        "deployment": context.deployment_name,
+                        "deployment_fingerprint": context.deployment_fingerprint,
                         "runtime_state": BackendState.READY.value,
                     },
                 )
@@ -555,18 +559,3 @@ class ModelSession(ABC):
                     f"{direction} {semantic!r} shape {array.shape} does not match {descriptor.shape}",
                     code=f"{direction}_shape_mismatch",
                 )
-
-    @staticmethod
-    def _deployment_identity(context: RuntimeContext) -> DeploymentIdentity:
-        manifest = context.validated_manifest.manifest
-        deployment = context.deployment
-        return DeploymentIdentity(
-            bundle=manifest.bundle.name,
-            bundle_uuid=manifest.bundle.uuid,
-            bundle_revision=manifest.bundle.revision,
-            deployment=context.deployment_name,
-            deployment_uuid=deployment.uuid,
-            deployment_revision=deployment.revision,
-            deployment_fingerprint=context.deployment_fingerprint,
-            backend=deployment.backend,
-        )

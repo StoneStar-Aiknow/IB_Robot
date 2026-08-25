@@ -365,7 +365,10 @@ def test_replace_pi05_schedule_rejects_concurrent_deployment_revision(tmp_path, 
     def concurrent_package(*args, **kwargs):
         packaged = real_package(*args, **kwargs)
         current = load_inference_manifest(bundle, "ascend").deployment
-        changed = current.model_copy(update={"target": current.target.model_copy(update={"runtime": "acl-v2"})})
+        changed_profile = current.runtime_profile.model_copy(
+            update={"profile": current.runtime_profile.profile.model_copy(update={"device_id": 1})}
+        )
+        changed = current.model_copy(update={"runtime_profile": changed_profile})
         from model_utils.inference_manifest_export import upsert_deployment
 
         upsert_deployment(bundle, "ascend", changed)

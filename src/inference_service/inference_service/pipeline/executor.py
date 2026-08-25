@@ -25,6 +25,8 @@ class SequentialModelExecutor(ModelExecutor):
         error_handler: Callable[[Exception, bool], None] | None = None,
         health_override: Callable[[], BackendHealth | None] | None = None,
         defer_session_execution: bool = False,
+        execution_contract: str | None = None,
+        orchestration_visibility: str | None = None,
     ) -> None:
         self._stages = tuple(stages)
         if not self._stages:
@@ -36,6 +38,8 @@ class SequentialModelExecutor(ModelExecutor):
         self._error_handler = error_handler
         self._health_override = health_override
         self._defer_session_execution = defer_session_execution
+        self._execution_contract = execution_contract
+        self._orchestration_visibility = orchestration_visibility
         self._context: RuntimeContext | None = None
 
     @property
@@ -49,6 +53,14 @@ class SequentialModelExecutor(ModelExecutor):
     @property
     def execution_plan(self):
         return self._execution_plan
+
+    @property
+    def execution_contract(self) -> str | None:
+        return self._execution_contract
+
+    @property
+    def orchestration_visibility(self) -> str | None:
+        return self._orchestration_visibility
 
     @property
     def component_contexts(self) -> Mapping[int, RuntimeContext]:

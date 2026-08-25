@@ -7,7 +7,6 @@ from inference_service.model_sessions.hisilicon import HisiliconModelSession
 from inference_service.model_sessions.hmm import HMMModelSession
 from inference_service.model_sessions.lerobot_torch import LeRobotTorchModelSession
 from inference_service.model_sessions.registry import (
-    MODEL_SESSION_BUILDER_REGISTRY,
     ModelSessionBuilder,
     ModelSessionBuilderKey,
     ModelSessionBuilderRegistry,
@@ -20,7 +19,6 @@ __all__ = [
     "HMMModelSession",
     "HisiliconModelSession",
     "LeRobotTorchModelSession",
-    "MODEL_SESSION_BUILDER_REGISTRY",
     "ModelSession",
     "ModelSessionBuilder",
     "ModelSessionBuilderKey",

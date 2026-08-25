@@ -47,9 +47,19 @@ import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from inference_manifest import CompiledDeployment, DeploymentArtifact, DeviceLink, load_inference_manifest
+from inference_manifest import (
+    AscendRuntimeProfile,
+    CompiledDeployment,
+    DeploymentArtifact,
+    DeploymentTarget,
+    DeviceLink,
+    ExecutionContract,
+    RoleRuntimeProfile,
+    load_inference_manifest,
+)
 from inference_manifest.json_utils import load_json_strict
 from inference_service.pi05_schedule import load_pi05_schedule, uniform_pi05_schedule, write_pi05_schedule
+from model_utils.acl_abi_inspection import write_acl_om_abi
 from model_utils.inference_manifest_export import (
     artifact_bindings,
     deployment_artifact,
@@ -57,7 +67,6 @@ from model_utils.inference_manifest_export import (
     read_runtime_abi,
     update_deployment,
     upsert_deployment,
-    write_acl_om_abi,
 )
 from model_utils.pi05_export._cli_ui import Stage, print_summary, setup_logging
 
@@ -416,8 +425,17 @@ def _upsert_pi05_deployment(
         for role, artifact in artifacts.items()
     }
     deployment = CompiledDeployment(
-        backend="ascend",
-        target={"soc": soc_version, "runtime": "acl"},
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="iterative",
+            orchestration_visibility="executor",
+            cancellation_granularity="checkpoint",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="ascend",
+            target=DeploymentTarget(soc=soc_version, runtime="acl"),
+            profile=AscendRuntimeProfile(device_id=0),
+        ),
         artifacts=artifact_values,
         execution=("vlm", "action_expert"),
         bindings={"vlm": vlm_bindings, "action_expert": action_bindings},

@@ -1,9 +1,12 @@
 {
-  "family": "fullsubnet_cumulative_stateful",
+  "interface": "tensor_model",
+  "model_type": "fullsubnet",
+  "operation": "enhance",
   "checkpoint": "cum_fullsubnet_best_model_218epochs",
   "contract_version": 1,
   "algorithm_contract": {
-    "family": "fullsubnet_cumulative_stateful",
+    "model_type": "fullsubnet",
+    "operation": "enhance",
     "checkpoint": "cum_fullsubnet_best_model_218epochs",
     "n_fft": 512,
     "stft_hop": 256,
@@ -17,8 +20,8 @@
   },
   "target": {
     "soc": "Ascend310P1",
-    "runtime": "raw_acl",
-    "cann": "8.1.RC1"
+    "runtime": "acl",
+    "runtime_abi": "cann-8.1.RC1"
   },
   "assets": [
     {

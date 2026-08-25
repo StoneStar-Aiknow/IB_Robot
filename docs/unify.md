@@ -1,7 +1,7 @@
 # 统一模型推理架构
 
 本文描述 IB_Robot 当前已经实现的统一模型推理架构。策略模型、感知模型和抓取模型共享同一套
-运行时控制面；模型差异保留在 family executor、adapter、`ModelSession` 和设备 runtime 层。
+运行时控制面；模型差异保留在 model-type executor、adapter、`ModelSession` 和设备 runtime 层。
 
 ## 设计结论
 
@@ -9,7 +9,7 @@
 
 ```text
 业务入口 / Global Scheduler
-  -> Inference Manifest v2 + named deployment
+  -> Inference Manifest v3 + named deployment
   -> RuntimeContext
   -> BackendRegistry admission
   -> Product session / scheduler admission
@@ -23,10 +23,10 @@
 
 核心约束：
 
-- `Inference Manifest v2` 是模型身份、语义契约、部署和编译 ABI 的唯一事实来源。
-- `model.family` 表示稳定业务模型身份，`model.operation` 表示同一 family 下的服务契约。
+- `Inference Manifest v3` 是模型身份、语义契约、部署和编译 ABI 的唯一事实来源。
+- `model.interface`、`model.model_type` 和 `model.operation` 共同构成稳定 dispatch identity。
 - 业务代码只能选择 Manifest 中存在的 named deployment，不能传入裸 backend 或 fallback。
-- `BackendRegistry` 同时校验 backend、family、target、deployment 和 `ConformanceEvidence`。
+- `BackendRegistry` 同时校验 backend、model_type、target、deployment 和 `ConformanceEvidence`。
 - `GenericModelPipeline` 统一生命周期、准入、串行化、deadline、cancellation、health 和 diagnostics。
 - Global Scheduler 负责跨 pipeline 的 product session、请求路由、fallback、幂等 ledger、deadline
   reservation 和公开容量；它不执行模型循环，也不替代 pipeline/session 生命周期。
@@ -34,7 +34,7 @@
   独立容量，调度 priority 通过 `NamedTensorRequest` 传入 pipeline，并由具体 `ModelSession` 映射到设备能力。
 - product session 的 Open/Close barrier、generation fencing、lease 和 quarantine 由纯 Python
   `ProductSessionController` 实现，ROS action 只负责协议适配。
-- 编译 family 的迭代循环由共享 `IterativeStage` 驱动，不允许回到 backend 私有循环。
+- 编译 model_type 的迭代循环由共享 `IterativeStage` 驱动，不允许回到 backend 私有循环。
 - 感知插件和本地 GraspGen 路径不得直接调用 `session.infer()` 或 `GraspGenSampler`。
 
 ## 总体架构
@@ -83,8 +83,8 @@ flowchart TB
 
     subgraph SSOT["模型部署与配置 SSOT"]
         ROBOT_CONFIG["robot_config<br/>scheduler + endpoint wiring"]
-        MANIFEST["Inference Manifest v2"]
-        DESCRIPTOR["ModelDescriptor<br/>kind + family + operation"]
+         MANIFEST["Inference Manifest v3"]
+         DESCRIPTOR["ModelDescriptor<br/>interface + model_type + operation"]
         IDENTITY["SemanticIdentity<br/>preprocess + output semantics"]
         DEPLOYMENT["Named Deployment<br/>artifacts + execution + bindings"]
         LINKS["Device Links<br/>buffer ownership + lifetime"]
@@ -190,26 +190,25 @@ GlobalInferenceSchedulerNode
 
 | 字段 | 含义 |
 | --- | --- |
-| `kind` | `policy`、`perception` 或 `generic` |
-| `family` | 稳定模型身份，例如 `sam2`、`grounding_dino` |
-| `operation` | family 内的服务契约；单契约 family 为空字符串 |
+| `interface` | `policy` 或 `tensor_model` |
+| `model_type` | 全局唯一的具体模型身份，例如 `sam2`、`grounding_dino` |
+| `operation` | 模型类型的服务契约；policy 固定为 `predict` |
 | `inputs` / `outputs` | 与 deployment 无关的公共语义 tensor |
 | `semantic_identity` | 模型 revision、预处理、输出语义和 embedding space |
 
-family 和 operation 必须分离：
+model_type 和 operation 必须分离：
 
 | Family | Operation | 业务契约 |
 | --- | --- | --- |
 | `sam2` | `automatic` | 自动掩码生成 |
 | `sam2` | `prompt` | box-prompt segmentation |
-| `grounding_dino` | `combined` | Grounding DINO + SAM2 boxes/masks |
-| `grounding_dino` | `raw` | 编译 Grounding DINO raw detection |
-| `ram_plus` | 空 | 标签识别 |
-| `siglip2` | 空 | 图像/文本双编码器 |
-| `graspgen` | 空 | 6-DoF grasp generation |
+| `grounding_dino` | `detect` | Torch 或编译 Grounding DINO detection |
+| `ram_plus` | `recognize_tags` | 标签识别 |
+| `siglip2` | `encode` | 图像/文本双编码器 |
+| `graspgen` | `generate_grasps` | 6-DoF grasp generation |
 
-因此 `sam2_prompt`、`siglip2_dual_encoder` 和 `grounding_dino_raw` 不再是 registry 中的独立
-family。编译拓扑由 deployment 的 `execution`、`bindings` 和 `device_links` 描述，服务差异由
+因此 prompt、dual-encoder 和 compiled detection 变体不再生成独立 model_type 或 registry
+key。编译拓扑由 deployment 的 `execution`、`bindings` 和 `device_links` 描述，服务差异由
 `operation` 描述。
 
 ## 策略 Facade
@@ -238,52 +237,52 @@ postprocess 组成同一个 `SequentialModelExecutor` stage 序列。PI0.5 Ascen
 executor 的 stage/resource。Torch、Ascend 与 RKNN 的旧 policy backend 已删除；registry descriptor
 只负责兼容性校验，实例构造由 session factory registry 负责。
 
-总架构图不展开 `Grounding DINO combined` 这类高层组合服务，也不为复用同一感知执行路径的
+总架构图不展开 Grounding DINO 的高层组合服务，也不为复用同一感知执行路径的
 RAM++、Grounding DINO 和 SAM2 分别建立节点；三者统一在 `通用感知模型` 节点内枚举。各模型的
 完整后端和 operation 支持仍以本文的感知支持矩阵为准。
 
 ## 感知 Facade
 
-所有 `_SessionPlugin` 都创建单模型 executor：
+所有 `_SessionPlugin` 都通过统一 runtime factory 创建单模型 handle。旧 session 请求只在私有
+transition adapter 内转换：
 
 ```text
-SequentialModelExecutor(
-    stages=(ModelStage("model", session),),
-    result_adapter=ModelResultAdapter(),
-    components=(session,),
-)
+ModelRuntimeFactory.create(
+    ModelRuntimeSpec(...),
+    registry_set,
+    providers,
+) -> ModelRuntimeHandle
 ```
 
 ```mermaid
 flowchart LR
     REQUEST["Typed ROS Request"] --> PLUGIN["ModelServicePlugin"]
     PLUGIN --> ADAPTER_PRE["PerceptionAdapter.preprocess"]
-    ADAPTER_PRE --> NAMED["NamedTensorRequest"]
-    NAMED --> PIPELINE["GenericModelPipeline.execute"]
-    PIPELINE --> CORE["PipelineRuntimeCore"]
-    CORE --> EXECUTOR["SequentialModelExecutor"]
-    EXECUTOR --> STAGE["ModelStage"]
-    STAGE --> SESSION{"Selected ModelSession"}
-    SESSION --> RESULT["NamedTensorResult"]
+    ADAPTER_PRE --> REQUEST["ModelRequest + ExecutionContext"]
+    REQUEST --> FACTORY["ModelRuntimeFactory"]
+    FACTORY --> HANDLE["ModelRuntimeHandle"]
+    HANDLE --> SESSION{"Selected ModelSession / private adapter"}
+    SESSION --> RESULT["ModelResult"]
     RESULT --> ADAPTER_POST["PerceptionAdapter.postprocess"]
     ADAPTER_POST --> RESPONSE["Typed ROS Response"]
 ```
 
-`ModelResultAdapter` 从 stage frame 的 `_model_result` 取回 `NamedTensorResult`，并保留底层异常原因。
-插件生命周期通过 `pipeline.load()`、`pipeline.close()` 和 `pipeline.diagnostics()` 管理。
+成功结果只发布 `ModelResult`，失败由 `ExecutionFailureFactory` 规范化；本地异常 cause 不进入 ROS
+序列化。插件生命周期通过 handle 的 `load()`、`close()` 和 `diagnostics()` 管理，旧的
+`GenericModelPipeline` 视图仅用于尚未迁移的调用方。
 
 ## 感知支持矩阵
 
-五个感知 family 均在 Torch 和 Ascend registry 中声明并提供 `ConformanceEvidence`。这表示 family
+五个感知 model_type 均在 Torch 和 Ascend registry 中声明并提供 `ConformanceEvidence`。这表示 model_type
 具备两类后端能力，不表示同一 operation 或 artifact 可跨后端互换。
 
 | Family | Torch | Ascend OM | Operation / 说明 |
 | --- | --- | --- | --- |
 | RAM++ `ram_plus` | `torch_cpu`, `torch_cuda` | `ascend_310p`, `ascend_310b` | 单一标签识别契约 |
-| SAM2 `sam2` | `automatic` | `prompt` | 同一 family 的两个服务契约 |
+| SAM2 `sam2` | `automatic` | `prompt` | 同一 model_type 的两个服务契约 |
 | SigLIP2 `siglip2` | `torch_cpu`, `torch_cuda` | `ascend_310p`, `ascend_310b` | 公共 embedding space |
-| Grounding DINO `grounding_dino` | `combined` | `raw` | Torch 含 SAM2，Ascend 输出 raw detection |
-| GraspGen `graspgen` | `torch_cuda` | `ascend_310p`, `ascend_310b` | 同一点云和 grasp 输出语义 |
+| Grounding DINO `grounding_dino` | `detect` | `detect` | deployment/bindings 表达 Torch 组合或 Ascend 图 |
+| GraspGen `graspgen` | `generate_grasps` | `generate_grasps` | 同一点云和 grasp 输出语义 |
 
 ### RAM++
 
@@ -304,7 +303,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    FAMILY["family = sam2"] --> OP{"model.operation"}
+    FAMILY["model_type = sam2"] --> OP{"model.operation"}
     OP -->|"automatic"| TORCH["TorchModelSession<br/>Automatic Mask Generator"]
     TORCH --> AUTO_OUT["masks + boxes + scores + stability"]
     OP -->|"prompt"| ASCEND["AscendOmModelSession"]
@@ -344,10 +343,10 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    FAMILY["family = grounding_dino"] --> OP{"model.operation"}
-    OP -->|"combined"| TORCH["TorchModelSession<br/>Grounding DINO + SAM2"]
+    FAMILY["model_type = grounding_dino"] --> OP{"model.operation"}
+    OP -->|"detect"| TORCH["TorchModelSession<br/>Grounding DINO + SAM2"]
     TORCH --> COMBINED["boxes + scores + labels + masks"]
-    OP -->|"raw"| ASCEND["AscendOmModelSession"]
+    OP -->|"detect"| ASCEND["AscendOmModelSession"]
     ASCEND --> TEXT["Text Encoder OM"]
     ASCEND --> VISION["Vision Backbone + Flatten OM"]
     TEXT --> ENCODERS["Encoder 0..5 OM"]
@@ -446,7 +445,7 @@ Manifest/deployment 是最终事实来源。
 
 新增模型的最小流程：
 
-1. 定义稳定 `kind`、`family`、可选 `operation` 和公共 tensor 语义。
+1. 定义 `interface`、全局唯一 `model_type`、`operation` 和公共 tensor 语义。
 2. 定义 named deployment、artifacts、execution、bindings 和 device links。
 3. 增加 registry 声明和 `ConformanceEvidence`。
 4. 实现 adapter；只有存在 host orchestration 时才新增专用 `ModelSession`。

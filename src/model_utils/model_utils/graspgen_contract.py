@@ -53,7 +53,7 @@ GRASPGEN_BALL_QUERY_ORDER = "input_index"
 
 # The service contract: one object point cloud in, a batch of 4x4 grasp poses and their
 # confidences out. These are the only GraspGen semantics a caller ever sees, and they are
-# what the perception ``ModelDescriptor`` declares.
+# what the tensor-model ``ModelDescriptor`` declares.
 GRASPGEN_POINT_CLOUD_SEMANTIC = "observation.object_points"
 GRASPGEN_POSE_SEMANTIC = "grasp.poses"
 GRASPGEN_CONFIDENCE_SEMANTIC = "grasp.confidence"

@@ -14,6 +14,7 @@ from inference_service.distributed.types import (
     PipelineIdentity,
     PipelineStatus,
     StructuredError,
+    UnsupportedDistributedRuntimeError,
     structured_error_from_exception,
 )
 from inference_service.distributed.video_streams import VideoStreamNegotiator
@@ -38,7 +39,20 @@ class DistributedCloudService:
         startup_error: StructuredError | None = None,
         stream_negotiator: VideoStreamNegotiator | None = None,
         stream_manager: _StreamManager | None = None,
+        runtime_interface: str = "policy",
+        runtime_model_type: str = "",
     ) -> None:
+        if runtime_interface != "policy":
+            raise UnsupportedDistributedRuntimeError(runtime_interface, runtime_model_type)
+        runtime_identity = getattr(runtime, "identity", None) if runtime is not None else None
+        runtime_interface = getattr(runtime_identity, "interface", None)
+        if runtime_interface is None and runtime is not None:
+            runtime_interface = getattr(runtime, "interface", None)
+        if runtime_interface is not None and runtime_interface != "policy":
+            raise UnsupportedDistributedRuntimeError(
+                runtime_interface,
+                getattr(runtime_identity, "model_type", getattr(runtime, "model_type", "")),
+            )
         if runtime is None and startup_error is None:
             raise ValueError("startup_error is required when the cloud runtime is unavailable")
         self.identity = identity

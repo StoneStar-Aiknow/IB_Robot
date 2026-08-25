@@ -26,6 +26,9 @@ _ChineseTokenizer = ChineseTokenizer
 class ZipVoiceAscendSession(AscendOmModelSession):
     """Run the complete ZipVoice host-orchestrated pipeline in one model session."""
 
+    execution_contract = "request-iterative"
+    orchestration_visibility = "session"
+
     def __init__(self, device_id: int = 0, *, prompt_profile: str = "default", **kwargs) -> None:
         super().__init__(device_id, **kwargs)
         self._root: Path | None = None
@@ -64,10 +67,12 @@ class ZipVoiceAscendSession(AscendOmModelSession):
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
-        if model.kind != "generic" or model.family != "zipvoice":
-            raise SessionLoadError("ZipVoice session requires model.kind=generic and model.family=zipvoice")
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+        if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
+            raise SessionLoadError("ZipVoice session requires tensor_model/zipvoice/synthesize")
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "ascend":
             raise SessionLoadError("ZipVoice Ascend session requires a compiled Ascend deployment")
+        if context.target_runtime != "acl":
+            raise SessionLoadError("ZipVoice Ascend session requires target.runtime='acl'")
         if deployment.target.soc != "Ascend310P1":
             raise SessionLoadError(f"verified ZipVoice OM requires Ascend310P1, got {deployment.target.soc!r}")
         self._root = context.validated_manifest.bundle_root

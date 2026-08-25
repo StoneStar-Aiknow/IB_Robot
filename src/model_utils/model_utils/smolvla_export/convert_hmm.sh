@@ -123,5 +123,5 @@ PY
             --output-dir /workspace/${WORK_REL} \
             --deployment hmm \
             --target-soc lq50 \
-            --target-runtime tcim-lite
+            --target-runtime tcim
     "

@@ -19,7 +19,7 @@ from inference_service.backends import (
     RuntimeContext,
 )
 from inference_service.codecs import ExecutionFrame, ExecutionPlan
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorRequest, NamedTensorResult, RuntimeLatency
+from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.pipeline.errors import (
     PipelineCanceledError,
     PipelineConfigurationError,
@@ -28,6 +28,7 @@ from inference_service.pipeline.errors import (
     PipelineTimeoutError,
 )
 from inference_service.pipeline.state import PipelineState, PipelineStateMachine
+from inference_service.unified_runtime import ModelResult, RuntimeLatency
 
 
 @runtime_checkable
@@ -87,6 +88,20 @@ class ExecutionError:
         if not self.code or not self.request_id or not self.stage or not self.message:
             raise ValueError("execution error code, request_id, stage, and message must be non-empty")
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+
+
+@dataclass(frozen=True)
+class _PipelineDeploymentIdentity:
+    """Pipeline-local diagnostic identity, separate from execution results."""
+
+    bundle: str
+    bundle_uuid: str
+    bundle_revision: int
+    deployment: str
+    deployment_uuid: str
+    deployment_revision: int
+    deployment_fingerprint: str
+    backend: str
 
 
 class StageFrame:
@@ -156,7 +171,7 @@ class PipelineRuntimeDiagnostics:
     """Model-neutral aggregate pipeline diagnostics."""
 
     pipeline_id: str
-    deployment: DeploymentIdentity
+    deployment: _PipelineDeploymentIdentity
     state: PipelineState
     executor_health: BackendHealth
     active_requests: int
@@ -363,7 +378,11 @@ class PipelineRuntimeCore:
                 active_requests=self._active_requests,
                 request_timeout=self._request_timeout,
                 last_latency=self._last_latency,
-                metadata={"model_kind": self._context.model.kind, "model_family": self._context.model.family},
+                metadata={
+                    "interface": self._context.interface,
+                    "model_type": self._context.model_type,
+                    "operation": self._context.operation,
+                },
             )
 
     def health(self) -> PipelineRuntimeDiagnostics:
@@ -531,10 +550,10 @@ class PipelineRuntimeCore:
                 state=self._state_machine.state.value,
             )
 
-    def _deployment_identity(self) -> DeploymentIdentity:
+    def _deployment_identity(self) -> _PipelineDeploymentIdentity:
         manifest = self._context.validated_manifest.manifest
         deployment = self._context.deployment
-        return DeploymentIdentity(
+        return _PipelineDeploymentIdentity(
             bundle=manifest.bundle.name,
             bundle_uuid=manifest.bundle.uuid,
             bundle_revision=manifest.bundle.revision,
@@ -546,9 +565,13 @@ class PipelineRuntimeCore:
         )
 
     def _with_pipeline_latency(self, result: object, total_ms: float) -> object:
-        if not isinstance(result, NamedTensorResult):
+        if not isinstance(result, ModelResult):
             return result
-        latency = replace(result.latency, total_ms=total_ms)
+        latency = (
+            replace(result.latency, total_ms=total_ms)
+            if isinstance(result.latency, RuntimeLatency)
+            else RuntimeLatency(total_ms=total_ms, backend_ms=float(result.latency))
+        )
         return replace(
             result,
             latency=latency,
@@ -557,7 +580,7 @@ class PipelineRuntimeCore:
 
     @staticmethod
     def _result_latency(result: object, total_ms: float) -> RuntimeLatency:
-        if isinstance(result, NamedTensorResult):
+        if isinstance(result, ModelResult):
             return result.latency
         return RuntimeLatency(total_ms=total_ms, backend_ms=total_ms)
 

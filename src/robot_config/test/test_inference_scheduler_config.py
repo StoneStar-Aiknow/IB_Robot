@@ -45,11 +45,24 @@ def _create_bundle(root: Path, deployment: str = "cpu") -> Path:
 
     bundle_paths = ("config.json", "model.safetensors", "policy_postprocessor.json", "policy_preprocessor.json")
     entries = [BundleFile(path=path) for path in bundle_paths]
-    deployment_value = {"uuid": _DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}
+    deployment_value = {
+        "uuid": _DEPLOYMENT_UUID,
+        "revision": 1,
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "direct",
+            "cancellation_granularity": "request_boundary",
+        },
+        "runtime_profile": {
+            "backend": "torch",
+            "target": {"runtime": "torch"},
+            "profile": {"device": "cpu"},
+        },
+    }
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": _BUNDLE_UUID,
                 "revision": 1,
@@ -60,6 +73,13 @@ def _create_bundle(root: Path, deployment: str = "cpu") -> Path:
                     "scope": "structure",
                     "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
                 },
+            },
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [{"semantic": "observation.state", "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
             },
             "deployments": {deployment: deployment_value},
         },
@@ -88,7 +108,7 @@ def _create_compiled_bundle(root: Path, *, artifact_sha256: str | None) -> Path:
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": _BUNDLE_UUID,
                 "revision": 1,
@@ -100,12 +120,27 @@ def _create_compiled_bundle(root: Path, *, artifact_sha256: str | None) -> Path:
                     "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
                 },
             },
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [{"semantic": "observation.state", "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+            },
             "deployments": {
                 "npu": {
                     "uuid": _DEPLOYMENT_UUID,
                     "revision": 1,
-                    "backend": "ascend",
-                    "target": {"soc": "ascend310", "runtime": "acl"},
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "ascend",
+                        "target": {"soc": "ascend310", "runtime": "acl"},
+                        "profile": {"device_id": 0},
+                    },
                     "artifacts": {"policy": artifact},
                     "execution": ["policy"],
                     "bindings": {

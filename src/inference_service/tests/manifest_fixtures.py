@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,62 @@ POLICY_FEATURES = {
     },
     "output_features": {"action": {"type": "ACTION", "shape": [6]}},
 }
+
+
+def v3_runtime_deployment(value: dict[str, Any], *, default_backend: str = "torch") -> dict[str, Any]:
+    """Normalize a test deployment into the strict v3 runtime envelope."""
+
+    deployment = copy.deepcopy(value)
+    if "runtime_profile" in deployment:
+        return deployment
+    backend = deployment.pop("backend", default_backend)
+    target = deployment.pop("target", {})
+    device = deployment.pop("device", "cpu")
+    runtime = target.get(
+        "runtime",
+        {
+            "ascend": "acl",
+            "hisilicon": "hisilicon-worker",
+            "hmm": "tcim",
+            "rknn": "rknn-lite",
+        }.get(backend, "torch"),
+    )
+    profile: dict[str, Any] = {}
+    if backend == "torch":
+        profile["device"] = device
+    elif backend == "ascend":
+        profile["device_id"] = 0
+    elif backend == "rknn":
+        profile.update(target_name=target.get("soc", "rk3588"), core_mask=7, device_id=0)
+    elif backend == "hmm":
+        profile.update(role="policy", tcim_abi="tcim-v1", device_id=0)
+    elif backend == "hisilicon":
+        profile["protocol"] = "sd3403"
+    deployment["execution_contract"] = {
+        "state_scope": "request",
+        "execution_structure": "direct",
+        "cancellation_granularity": "request_boundary",
+        **deployment.pop("execution_contract", {}),
+    }
+    deployment["runtime_profile"] = {
+        "backend": backend,
+        "target": {**target, "runtime": runtime},
+        "profile": profile,
+    }
+    return deployment
+
+
+def policy_model(policy_type: str) -> dict[str, Any]:
+    return {
+        "interface": "policy",
+        "model_type": policy_type,
+        "operation": "predict",
+        "inputs": [
+            {"semantic": "observation.state", "dtype": "float32", "shape": [6]},
+            {"semantic": "observation.images.top", "dtype": "float32", "shape": [3, 16, 24]},
+        ],
+        "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+    }
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -113,6 +170,11 @@ def make_manifest(
     backend: str = "rknn",
     policy_type: str = "act",
 ) -> dict[str, Any]:
+    config_path = root / "config.json"
+    if config_path.is_file():
+        configured_type = json.loads(config_path.read_text(encoding="utf-8")).get("type")
+        if isinstance(configured_type, str) and configured_type:
+            policy_type = configured_type
     entries = [BundleFile(path=path) for path in bundle_paths]
     if compiled:
         artifact_path = "artifacts/policy.rknn"
@@ -122,8 +184,28 @@ def make_manifest(
         deployment: dict[str, Any] = {
             "uuid": TEST_DEPLOYMENT_UUID,
             "revision": 1,
-            "backend": backend,
-            "target": {"soc": "rk3588", "runtime": "rknn-lite"},
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": backend,
+                "target": {
+                    "soc": "sd3403" if backend == "hisilicon" else "rk3588",
+                    "runtime": {
+                        "ascend": "acl",
+                        "hisilicon": "hisilicon-worker",
+                        "hmm": "tcim",
+                    }.get(backend, "rknn-lite"),
+                },
+                "profile": {
+                    **({"device_id": 0} if backend in {"ascend", "rknn", "hmm"} else {}),
+                    **({"target_name": "rk3588", "core_mask": 7} if backend == "rknn" else {}),
+                    **({"protocol": "sd3403"} if backend == "hisilicon" else {}),
+                    **({"role": "policy", "tcim_abi": "tcim-v1"} if backend == "hmm" else {}),
+                },
+            },
             "artifacts": {
                 "policy": {
                     "path": artifact_path,
@@ -163,10 +245,23 @@ def make_manifest(
             },
         }
     else:
-        deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}
+        deployment = {
+            "uuid": TEST_DEPLOYMENT_UUID,
+            "revision": 1,
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": "torch",
+                "target": {"runtime": "torch"},
+                "profile": {"device": "cpu"},
+            },
+        }
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": TEST_BUNDLE_UUID,
             "revision": 1,
@@ -178,6 +273,16 @@ def make_manifest(
                 "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, f"test-{deployment_name}", entries),
             },
         },
+        "model": {
+            "interface": "policy",
+            "model_type": policy_type,
+            "operation": "predict",
+            "inputs": [
+                {"semantic": "observation.state", "dtype": "float32", "shape": [6]},
+                {"semantic": "observation.images.top", "dtype": "float32", "shape": [3, 16, 24]},
+            ],
+            "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+        },
         "deployments": {deployment_name: deployment},
     }
 
@@ -187,7 +292,7 @@ def make_non_policy_manifest(
     bundle_paths: tuple[str, ...],
     *,
     deployment_name: str = "ascend",
-    family: str = "ram_plus",
+    model_type: str = "ram_plus",
     output_semantic: str = "tag_logits",
 ) -> dict[str, Any]:
     entries = [BundleFile(path=path) for path in bundle_paths]
@@ -196,7 +301,7 @@ def make_non_policy_manifest(
     artifact_file.parent.mkdir(parents=True, exist_ok=True)
     artifact_file.write_bytes(b"compiled-ram-plus")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": TEST_BUNDLE_UUID,
             "revision": 1,
@@ -209,8 +314,19 @@ def make_non_policy_manifest(
             },
         },
         "model": {
-            "kind": "perception",
-            "family": family,
+            "interface": "tensor_model",
+            "model_type": model_type,
+            "operation": {
+                "ram_plus": "recognize_tags",
+                "sam2": "prompt",
+                "siglip2": "encode",
+                "grounding_dino": "detect",
+                "dummy_echo": "echo",
+                "graspgen": "generate_grasps",
+                "fullsubnet": "enhance",
+                "silero_vad": "vad",
+                "speech_direction": "enhance_and_vad",
+            }.get(model_type, "infer"),
             "inputs": [
                 {
                     "semantic": "observation.image",
@@ -225,8 +341,16 @@ def make_non_policy_manifest(
             deployment_name: {
                 "uuid": TEST_DEPLOYMENT_UUID,
                 "revision": 1,
-                "backend": "ascend",
-                "target": {"soc": "Ascend310P3", "runtime": "acl"},
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "ascend",
+                    "target": {"soc": "Ascend310P3", "runtime": "acl"},
+                    "profile": {"device_id": 0},
+                },
                 "artifacts": {"model": {"path": artifact_path, "format": "om"}},
                 "execution": ["model"],
                 "bindings": {

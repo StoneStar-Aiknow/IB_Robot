@@ -92,7 +92,7 @@ def prepare_smoke_runtime(*, video_transport: bool = False, video_encoder_backen
     _write_json(
         bundle / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": _BUNDLE_UUID,
                 "revision": 1,
@@ -104,7 +104,32 @@ def prepare_smoke_runtime(*, video_transport: bool = False, video_encoder_backen
                     "value": canonical_bundle_digest(_BUNDLE_UUID, 1, "ci-smoke-act", entries),
                 },
             },
-            "deployments": {"cpu": {"uuid": _DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}},
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [
+                    {"semantic": "observation.state", "dtype": "float32", "shape": [6]},
+                    {"semantic": "observation.images.top", "dtype": "float32", "shape": [3, 16, 24]},
+                ],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+            },
+            "deployments": {
+                "cpu": {
+                    "uuid": _DEPLOYMENT_UUID,
+                    "revision": 1,
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "torch",
+                        "target": {"runtime": "torch"},
+                        "profile": {"device": "cpu"},
+                    },
+                }
+            },
         },
     )
 

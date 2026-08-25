@@ -12,10 +12,11 @@ import pytest
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_manifest.models import DeviceLink
 from inference_service.backends import (
-    BACKEND_REGISTRY,
+    STATIC_BACKEND_DESCRIPTORS,
     BackendAdmissionError,
     BackendInferenceError,
     BackendLoadError,
+    BackendRegistry,
     BackendRegistryError,
     InferenceRequest,
     RuntimeContext,
@@ -28,7 +29,16 @@ from inference_service.model_sessions import AscendOmModelSession
 from inference_service.pi05_schedule import load_pi05_schedule
 from inference_service.pipeline import InferencePipeline, PipelineCanceledError, PipelineState
 from inference_service.pipeline import factory as pipeline_factory
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    TEST_DEPLOYMENT_UUID,
+    create_policy_bundle,
+    policy_model,
+    v3_runtime_deployment,
+    write_manifest,
+)
+
+_STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 
 _DTYPE_CODES = {
     np.dtype("float32"): 0,
@@ -322,8 +332,8 @@ class FakeAcl:
         self._identifier += 1
         return self._identifier
 
-    def init(self, config_path=None):
-        self.init_calls.append(config_path)
+    def init(self):
+        self.init_calls.append(None)
         return 0
 
     def finalize(self):
@@ -359,10 +369,12 @@ def _write_compiled_manifest(
 ) -> None:
     entries = _bundle_entries(root, bundle_paths)
     deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
+    deployment = v3_runtime_deployment(deployment)
+    policy_type = json.loads((root / "config.json").read_text(encoding="utf-8")).get("type", "act")
     write_manifest(
         root,
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -374,6 +386,7 @@ def _write_compiled_manifest(
                     "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "ascend-test", entries),
                 },
             },
+            "model": policy_model(policy_type),
             "deployments": {deployment_name: deployment},
         },
     )
@@ -1515,17 +1528,16 @@ def test_ascend_rejects_invalid_pi05_policy_config_without_leaks(tmp_path, key, 
     assert acl.init_calls == []
 
 
-def test_ascend_runtime_manager_rejects_conflicting_acl_config_paths():
+def test_ascend_runtime_manager_uses_one_default_process_initialization():
     acl = FakeAcl({})
     manager = AclRuntimeManager(lambda: acl)
-    first = manager.acquire(0, "first.json")
+    first = manager.acquire(0)
+    second = manager.acquire(0)
 
-    with pytest.raises(BackendLoadError) as error:
-        manager.acquire(0, "second.json")
-
-    assert error.value.code == "acl_config_conflict"
-    assert acl.init_calls == ["first.json"]
+    assert acl.init_calls == [None]
     first.close()
+    assert acl.finalize_calls == 0
+    second.close()
     assert acl.finalize_calls == 1
 
 
@@ -1553,12 +1565,12 @@ def test_ascend_rejects_runtime_descriptor_mismatch_before_dataset_allocation(tm
 
 def test_ascend_registry_descriptor_is_session_only(tmp_path):
     context = _act_context(tmp_path)
-    descriptor = BACKEND_REGISTRY.validate(context)
+    descriptor = _STATIC_BACKEND_REGISTRY.validate(context)
 
     assert descriptor.factory is None
     with pytest.raises(BackendRegistryError) as error:
-        BACKEND_REGISTRY.create(context)
-    assert error.value.code == "backend_factory_unavailable"
+        _STATIC_BACKEND_REGISTRY._create_legacy_backend(context)
+    assert error.value.code == "legacy_backend_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -1566,7 +1578,6 @@ def test_ascend_registry_descriptor_is_session_only(tmp_path):
     [
         {"device_id": -1},
         {"device_id": "0"},
-        {"acl_config_path": ""},
         {"random_seed": 1.5},
         {"unknown": True},
     ],

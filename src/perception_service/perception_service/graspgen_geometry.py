@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from inference_manifest import GRASPGEN_NPOINTS, GRASPGEN_NSAMPLES, GRASPGEN_RADII
+from model_utils.graspgen_contract import GRASPGEN_NPOINTS, GRASPGEN_NSAMPLES, GRASPGEN_RADII
 
 
 def furthest_point_sample(xyz: np.ndarray, npoint: int) -> np.ndarray:

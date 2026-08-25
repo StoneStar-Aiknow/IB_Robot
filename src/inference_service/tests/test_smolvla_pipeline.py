@@ -29,7 +29,14 @@ from inference_service.pipeline import (
     load_smolvla_embedding_weights,
 )
 from inference_service.pipeline.smolvla import _embedding_operation
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    TEST_DEPLOYMENT_UUID,
+    create_policy_bundle,
+    policy_model,
+    v3_runtime_deployment,
+    write_manifest,
+)
 
 _HIDDEN = 4
 _STATE_DIM = 8
@@ -202,6 +209,8 @@ def test_smolvla_executor_runs_device_link_and_host_link_plans(device_links):
         _ResultAdapter(),
         num_inference_steps=_NUM_STEPS,
     )
+    assert executor.execution_contract == "request-iterative"
+    assert executor.orchestration_visibility == "executor"
 
     result = executor.execute(_request(), deadline=None, control=ExecutionControl("smolvla"))
 
@@ -442,7 +451,7 @@ def _smolvla_context(tmp_path: Path) -> object:
     }
     deployment = {
         "backend": "hmm",
-        "target": {"soc": "lq50", "runtime": "tcim-lite"},
+        "target": {"soc": "lq50", "runtime": "tcim"},
         "artifacts": {
             "vision": _artifact_dict(tmp_path, "vision", "bin"),
             "embedding": _artifact_dict(tmp_path, "embedding", "pt"),
@@ -470,10 +479,13 @@ def _smolvla_context(tmp_path: Path) -> object:
         ],
     }
     entries = tuple(BundleFile(path=path) for path in bundle_paths)
+    deployment = v3_runtime_deployment(
+        {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}, default_backend="hmm"
+    )
     write_manifest(
         tmp_path,
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -485,7 +497,8 @@ def _smolvla_context(tmp_path: Path) -> object:
                     "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "smolvla-test", entries),
                 },
             },
-            "deployments": {"houmo": {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}},
+            "model": policy_model("smolvla"),
+            "deployments": {"houmo": deployment},
         },
     )
     return RuntimeContext(load_inference_manifest(tmp_path, "houmo"))

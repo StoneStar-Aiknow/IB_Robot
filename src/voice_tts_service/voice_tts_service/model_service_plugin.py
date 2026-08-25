@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from array import array
 
+from inference_service._runtime_compat import _UnifiedPipelineView, build_session_runtime_handle
 from inference_service.backends import BackendError, RuntimeContext
+from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_plugin import ModelServiceError, ModelServicePlugin, PluginRuntimeStatus
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, ModelSession
-from inference_service.pipeline import GenericModelPipeline, ModelResultAdapter, ModelStage, SequentialModelExecutor
+from inference_service.model_sessions import ModelSession
+from inference_service.runtime_composition import require_runtime_dependencies
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionFailure,
+    ModelRequest,
+    RegistrySet,
+    RuntimeProviders,
+)
 
 from .defaults import VOICE_TTS_DEFAULTS
 from .errors import TTSError
-from .model_session_builders import register_zipvoice_session_builder
 from .service_core import TTSLimits, TTSServiceCore
 
 
@@ -19,15 +27,33 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
     """Expose ZipVoice through the family-neutral typed model-service host."""
 
     service_type = "ibrobot_msgs/srv/SynthesizeSpeech"
+    interface = "tensor_model"
+    model_type = "zipvoice"
+    operation = "synthesize"
 
-    def __init__(self, _host, validated, options) -> None:
-        register_zipvoice_session_builder()
+    def __init__(
+        self,
+        _host,
+        validated,
+        options,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
         model = validated.manifest.model
-        if model.kind != "generic" or model.family != "zipvoice":
-            raise ValueError("ZipVoice plugin requires model.kind=generic and model.family=zipvoice")
+        if (
+            model.interface != self.interface
+            or model.model_type != self.model_type
+            or model.operation != self.operation
+        ):
+            raise ValueError(f"ZipVoice plugin requires {self.interface}/{self.model_type}/{self.operation}")
 
         allowed = {
-            "acl_config_path",
             "device_id",
             "prompt_profile",
             "segment_max_chars",
@@ -42,23 +68,32 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         if unknown:
             raise ValueError(f"unknown ZipVoice runtime options: {unknown}")
 
-        context = RuntimeContext(validated_manifest=validated, runtime_options=options)
-        self._session: ModelSession = MODEL_SESSION_BUILDER_REGISTRY.create(context)
-        session_options = {name: options[name] for name in ("acl_config_path", "device_id") if name in options}
-        session_context = RuntimeContext(validated_manifest=validated, runtime_options=session_options)
-        self._pipeline = GenericModelPipeline(
-            "voice-tts-zipvoice",
-            context,
-            SequentialModelExecutor(
-                (ModelStage("model", self._session),),
-                ModelResultAdapter(),
-                components=(self._session,),
-                component_contexts={id(self._session): session_context},
-            ),
-            supports_cancellation=self._session.capabilities.supports_cancellation,
+        runtime_profile = getattr(validated, "runtime_profile", None)
+        if runtime_profile is None:
+            role_profiles = getattr(validated, "role_runtime_profiles", {})
+            runtime_profile = next(iter(role_profiles.values()), None)
+        context = RuntimeContext(
+            validated_manifest=validated,
+            runtime_options=options,
+            runtime_profile=runtime_profile,
         )
+        self._session: ModelSession = registry_set.session_builder_registry.create(
+            context,
+            backend_registry=registry_set.backend_registry,
+            providers=providers,
+        )
+        self._runtime_handle = build_session_runtime_handle(
+            self._session,
+            context,
+            providers,
+            execution_structure="iterative",
+            orchestration_visibility="session",
+            runtime_id="voice-tts-zipvoice",
+        )
+        self.pipeline = _UnifiedPipelineView(self._runtime_handle, context, "voice-tts-zipvoice")
+        self._pipeline = self.pipeline
         self._core = TTSServiceCore(
-            self._pipeline.execute,
+            self._infer,
             TTSLimits(
                 **{
                     name: options.get(name, VOICE_TTS_DEFAULTS[name])
@@ -69,11 +104,17 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         )
         self._closed = False
         try:
-            self._pipeline.load()
+            self._runtime_handle.load(context)
         except Exception:
-            self._pipeline.close()
+            self._runtime_handle.close()
             self._closed = True
             raise
+
+    def _infer(self, request: NamedTensorRequest):
+        return self._runtime_handle.execute(
+            ModelRequest(request.inputs, request.metadata),
+            ExecutionContext(request.request_id, request.deadline),
+        )
 
     def handle(self, request, response) -> str:
         try:
@@ -89,7 +130,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
                 code = exc.code
             elif isinstance(exc, BackendError) and code == "unsupported_prompt":
                 code = "UNSUPPORTED_PROMPT"
-            elif isinstance(exc, BackendError):
+            elif isinstance(exc, BackendError | ExecutionFailure):
                 code = "INFERENCE_FAILED"
             else:
                 code = "INTERNAL_ERROR"
@@ -123,7 +164,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         return f"synthesized {len(output.segments)} audio segment(s)"
 
     def runtime_status(self) -> PluginRuntimeStatus:
-        health = self._pipeline.diagnostics().executor_health
+        health = self._runtime_handle.diagnostics().health
         state = health.state.value if hasattr(health.state, "value") else str(health.state)
         runtime_version = self._session.runtime_version
         ready = health.ready and bool(runtime_version)
@@ -143,7 +184,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._pipeline.close()
+            self._runtime_handle.close()
 
 
 __all__ = ["ZipVoiceSynthesizePlugin"]

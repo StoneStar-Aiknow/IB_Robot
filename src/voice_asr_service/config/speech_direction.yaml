@@ -29,19 +29,16 @@ speech_direction_node:
     wav_path: ""
     wav_replay_rate: 1.0
 
-    # 生产后端:stateful_raw_acl(310P) 或 stateful_torch_cuda(Ubuntu);旧值仅兼容映射。
-    silero_vad_backend: "raw_acl"
+    # 生产后端:ascend(310P) 或 stateful_torch_cuda(Ubuntu)。
+    silero_vad_backend: "ascend"
     silero_vad_model_path: "voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"
-    fullsubnet_backend: "stateful_raw_acl"
-    # 生产模式固定使用 raw ACL，hidden/cell 在 Device 双 bank 常驻。
+    fullsubnet_backend: "ascend"
+    # 生产模式固定使用 Ascend ACL，hidden/cell 在 Device 双 bank 常驻。
     fullsubnet_device_id: 0
-    fullsubnet_acl_config_path: ""
     fullsubnet_stateful_fb_om_path: "fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
     fullsubnet_stateful_sb_om_path: "fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
     fullsubnet_stateful_manifest_path: "fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
     speech_direction_inference_bundle: "voice_asr"
-    # 旧静态OM回退路径，stateful门禁失败时不自动切换
-    fullsubnet_om_path: "fullsubnet/fullsubnet_v6_310p_mixed16.om"
     # Ubuntu stateful Torch 使用同一个 218epochs cumulative checkpoint。
     # FullSubNet 源码(model.py + audio_zen)由 ibrobot-fullsubnet wheel 提供。
     fullsubnet_ckpt: "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"

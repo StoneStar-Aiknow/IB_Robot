@@ -31,7 +31,7 @@ def _sorting_hat_policy(*, enabled: bool, announce: bool = False) -> dict:
 def _voice_tts(**overrides) -> dict:
     return {
         "enabled": True,
-        "bundle_path": "models/voice_tts/zipvoice",
+        "bundle_path": "models/zipvoice",
         "deployment": "test_deployment",
         "service_name": "/voice_tts/synthesize",
         **overrides,

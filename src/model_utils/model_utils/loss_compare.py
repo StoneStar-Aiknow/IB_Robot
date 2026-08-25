@@ -14,6 +14,7 @@ np = None  # type: ignore
 torch = None  # type: ignore
 tqdm = None  # type: ignore
 PureInferenceEngine = None  # type: ignore
+runtime_dependencies = None
 
 
 def generate_pi05_noise(shape: tuple[int, ...], seed: int):
@@ -265,6 +266,8 @@ class LossUtils:
             deployment=self.args.deployment,
             pipeline_id="loss_compare",
             runtime_options=runtime_options,
+            registry_set=runtime_dependencies.registry_set,
+            providers=runtime_dependencies.providers,
             **diagnostic_options,
         )
         print(
@@ -529,17 +532,19 @@ def _import_heavy_deps():
     invocations stay fast.  Assign to module globals so LossUtils (defined at
     module level) can reference them as before.
     """
-    global np, torch, tqdm, PureInferenceEngine
+    global np, torch, tqdm, PureInferenceEngine, runtime_dependencies
     import numpy as _np
     import torch as _torch
     from tqdm import tqdm as _tqdm
 
     from inference_service.core import PureInferenceEngine as _Engine
+    from inference_service.runtime_composition import build_policy_runtime_dependencies
 
     np = _np
     torch = _torch
     tqdm = _tqdm
     PureInferenceEngine = _Engine
+    runtime_dependencies = build_policy_runtime_dependencies()
 
 
 def main():
@@ -577,6 +582,8 @@ def main():
         loss_compare_cli.write_last(resolved)
     finally:
         loss_utils.engine.close()
+        if runtime_dependencies is not None:
+            runtime_dependencies.providers.close()
 
 
 if __name__ == "__main__":

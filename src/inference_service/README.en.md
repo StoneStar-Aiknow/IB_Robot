@@ -41,14 +41,22 @@ directory. All deployment metadata belongs in `inference_manifest.json`.
 One manifest may declare multiple named deployments for the same policy, such as `cpu`, `cuda`, `rk3588`,
 `ascend_310p3`, or `lq50`. A pipeline selects a deployment name, not a backend name.
 
-A Torch deployment directly declares its runtime device:
+A deployment uses an explicit v3 runtime profile for the backend, target, and instance fields:
 
 ```json
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 1,
-  "backend": "torch",
-  "device": "cpu"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "torch",
+    "target": {"runtime": "torch"},
+    "profile": {"device": "cpu"}
+  }
 }
 ```
 
@@ -58,10 +66,22 @@ A compiled deployment declares its target, artifacts, execution order, and compl
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 3,
-  "backend": "rknn",
-  "target": {
-    "soc": "rk3588",
-    "runtime": "rknn-lite2"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "rknn",
+    "target": {
+      "soc": "rk3588",
+      "runtime": "rknn-lite2"
+    },
+    "profile": {
+      "target_name": "rk3588",
+      "core_mask": 7,
+      "device_id": 0
+    }
   },
   "artifacts": {
     "policy": {
@@ -498,8 +518,8 @@ The selected deployment fingerprint is SHA-256 over this canonical object:
 
 ```json
 {
-  "format": "ibrobot.deployment-structure-v2",
-  "schema_version": 2,
+  "format": "ibrobot.deployment-structure-v3",
+  "schema_version": 3,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -522,7 +542,7 @@ Do not edit identities manually when startup reports:
 Rerun the exporter or packaging workflow that owns the artifact. Exporters copy artifacts, read compiler/runtime
 ABI metadata, generate bindings, update UUIDs/revisions and lightweight structural identities, and validate the
 result through the production loader. Schema-v1 bundles and legacy artifacts are unsupported; regenerate a complete
-schema-v2 bundle with the current exporter or packager.
+schema-v3 bundle with the current exporter or packager.
 
 ## Exporter Entry Points
 

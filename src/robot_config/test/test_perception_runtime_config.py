@@ -17,7 +17,7 @@ def _bundle(root: Path, family: str, *, deployment: str = "torch_cpu") -> Path:
     marker.write_text(family, encoding="utf-8")
     entry = BundleFile(path="assets/identity.txt")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": "123e4567-e89b-42d3-a456-426614174000",
             "revision": 1,
@@ -30,8 +30,9 @@ def _bundle(root: Path, family: str, *, deployment: str = "torch_cpu") -> Path:
             },
         },
         "model": {
-            "kind": "perception",
-            "family": family,
+            "interface": "tensor_model",
+            "model_type": family,
+            "operation": "infer",
             "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1]}],
             "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1]}],
             "semantic_identity": {
@@ -44,8 +45,16 @@ def _bundle(root: Path, family: str, *, deployment: str = "torch_cpu") -> Path:
             deployment: {
                 "uuid": "123e4567-e89b-42d3-a456-426614174001",
                 "revision": 1,
-                "backend": "torch",
-                "device": "cpu",
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "torch",
+                    "target": {"runtime": "torch"},
+                    "profile": {"device": "cpu"},
+                },
             }
         },
     }
@@ -112,7 +121,7 @@ def test_raw_backend_selection_is_rejected(tmp_path: Path, legacy: str) -> None:
 
 def test_unknown_family_is_accepted_and_missing_deployment_fails_before_launch(tmp_path: Path) -> None:
     unknown = _config(_bundle(tmp_path / "unknown", "future_multimodal_family"))
-    assert parse_perception_runtime_config(unknown).services[0].validated_manifest.manifest.model.family == (
+    assert parse_perception_runtime_config(unknown).services[0].validated_manifest.manifest.model.model_type == (
         "future_multimodal_family"
     )
 

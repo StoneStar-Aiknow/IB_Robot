@@ -164,14 +164,15 @@ The model path is configured through `robot_config.bundle_path`; it is never har
 against the absolute `WORKSPACE` set by `.shrc_local`:
 
 ```yaml
-bundle_path: models/voice_tts/zipvoice
+bundle_path: models/zipvoice
 deployment: ascend_310p
 ```
 
-This selects `$WORKSPACE/models/voice_tts/zipvoice`. The bundle contains `inference_manifest.json`, deployment
+This selects `$WORKSPACE/models/zipvoice`. The bundle contains `inference_manifest.json`, deployment
 artifacts, tokenizer assets, prompt profiles, and the vocoder checkpoint.
 
-The bundle must use manifest schema v2, declare `model.kind=generic` and `model.family=zipvoice`, and contain the
+The bundle must use manifest schema v3, declare `interface=tensor_model`, `model_type=zipvoice`, and
+`operation=synthesize`, and contain the
 selected named deployment.
 
 ### 5.1 Verified deployments
@@ -201,7 +202,7 @@ source .shrc_local
 ZIPVOICE_SOURCE_DIR=/path/to/zipvoice-delivery
 ros2 run voice_tts_service package_zipvoice_310p \
   --source "$ZIPVOICE_SOURCE_DIR" \
-  --destination "$WORKSPACE/models/voice_tts/zipvoice"
+  --destination "$WORKSPACE/models/zipvoice"
 ```
 
 The packager validates the Text Encoder OM, Flow Decoder OM, Vocos checkpoint, token table, and default prompt
@@ -221,7 +222,7 @@ Production configuration lives under `robot.voice_tts` in the robot YAML:
 ```yaml
 voice_tts:
   enabled: true
-  bundle_path: models/voice_tts/zipvoice
+  bundle_path: models/zipvoice
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize

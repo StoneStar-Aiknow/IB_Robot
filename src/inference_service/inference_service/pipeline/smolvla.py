@@ -367,6 +367,8 @@ def create_smolvla_executor(
         result_adapter,
         components=(session, resource, *extra_components),
         execution_plan=plan,
+        execution_contract="request-iterative",
+        orchestration_visibility="executor",
     )
 
 

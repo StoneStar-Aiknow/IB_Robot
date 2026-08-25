@@ -394,7 +394,7 @@ python3 -m model_utils.pi05_export.convert_om \
 
 前两步（导出与编译）是 `model_utils` 的工具，记录在本节；**第 3 步打包由
 `perception_service` 提供**——GraspGen 的业务归属是抓取，模型目录固定在 `models/grasp/`；
-当前通用模型运行时暂时复用 `kind="perception"` 作为兼容分类，bundle 的读者是
+当前通用模型运行时使用 `interface="tensor_model"` 和具体 `model_type/operation`，bundle 的读者是
 perception_service 中现有的 adapter 与 typed `GenerateGrasps` service。
 bundle 布局、adapter asset、named deployment 与 conformance 见
 `src/perception_service/README.md` 的 GraspGen 章节。GraspGen **不是** policy family，
@@ -464,7 +464,7 @@ device 的打包主机上需要提前生成全部 sidecar，并传入 `--no-insp
 runtime index 绑定 GraspGen semantic，并保留 ACL 实际暴露的 tensor name、dtype 和 shape。
 八个角色全部解析成功后才落盘，任一 OM 或 ABI 缺失都不会留下半成品 bundle。
 
-打包产物属于抓取模型域；当前通用运行时 manifest 暂时使用 `kind="perception"` 兼容分类。
+打包产物属于抓取模型域；manifest 使用 `tensor_model/graspgen/generate_grasps` 身份。
 bundle 不含任何 LeRobot 资产（没有 `config.json` / `policy_preprocessor.json` /
 `policy_postprocessor.json`）；模型常量写在
 `assets/adapter.json` 里，由 `perception_service.graspgen_adapter.GraspGenAdapter`
@@ -472,7 +472,7 @@ bundle 不含任何 LeRobot 资产（没有 `config.json` / `policy_preprocessor
 
 Packager 会把运行时 artifact 复制到唯一 generation，并在 manifest 中记录
 bundle-relative path。发布和部署时应手动传输完整 bundle 目录；板端不需要保留 `--om-dir`
-或 `--om-abi-dir` 指向的构建输入。schema v2 不对大文件记录或启动时计算 SHA-256；identity
+或 `--om-abi-dir` 指向的构建输入。schema v3 不对大文件记录或启动时计算 SHA-256；identity
 由 UUID、revision 和轻量结构摘要组成。
 
 ## HMM Packaging
@@ -487,7 +487,7 @@ ros2 run model_utils package-hmm-deployment \
     --bundle-root /path/to/policy_bundle \
     --deployment lq50 \
     --target-soc lq50 \
-    --target-runtime tcim-lite \
+    --target-runtime tcim \
     --spec /path/to/hmm-package-spec.json
 ```
 
@@ -751,7 +751,7 @@ python3 -c "from inference_manifest import load_inference_manifest; print(load_i
 | --- | --- |
 | deployment 不存在 | 使用 manifest 中实际的 deployment 名称或重新运行 exporter |
 | `Bundle digest mismatch` | Manifest identity/路径声明与 digest 不一致；重新运行 owning exporter |
-| schema v1 | 旧版 bundle/artifact 不受支持；使用当前 exporter 或 packager 重新生成 schema v2 |
+| schema v1/v2 | 旧版 bundle/artifact 不受支持；使用当前 exporter 或 packager 重新生成 schema v3 |
 | artifact SDK load failure | artifact 可能损坏或 ABI 不兼容；重新打包并发布新 revision |
 | missing semantic dependency | 将 processor/tokenizer dependency vendored 到 bundle 后重新打包 |
 | binding name/shape/layout mismatch | 用 compiler/runtime 实际 ABI 重新生成 bindings |
@@ -761,7 +761,7 @@ python3 -c "from inference_manifest import load_inference_manifest; print(load_i
 
 初始支持矩阵：
 
-| Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
+| Policy model_type | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
 | ACT | 支持 | 支持 | 支持 | 支持 | 不支持 |
 | PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |

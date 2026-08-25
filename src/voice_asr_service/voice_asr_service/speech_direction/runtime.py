@@ -21,6 +21,18 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionContract,
+    LifecycleState,
+    ModelRequest,
+    ModelRuntimeHandle,
+    OwnedComponent,
+    RuntimeAssembly,
+)
+
+from .streaming_runtime import SpeechDirectionStreamingRuntime
+
 logger = logging.getLogger(__name__)
 
 
@@ -528,6 +540,7 @@ class SpeechDirectionRuntime:
         *,
         enable_capture: bool = True,
         on_fatal_error: Callable[[str], None] | None = None,
+        model_runtime_handle: ModelRuntimeHandle | None = None,
     ):
         """
         Args:
@@ -535,9 +548,36 @@ class SpeechDirectionRuntime:
             pipeline: SpeechDirectionPipeline 实例
             enable_capture: 是否启用采集(True=实时,False=离线灌数据)
             on_fatal_error: 不可恢复错误回调；每个 runtime 最多调用一次
+            model_runtime_handle: optional unified-runtime owner.  When it is
+                omitted, a compatibility handle is created around the pipeline.
         """
         self.config = config
         self.pipeline = pipeline
+        if model_runtime_handle is None:
+            streaming_runtime = SpeechDirectionStreamingRuntime(pipeline, close_backends=True)
+            model_runtime_handle = ModelRuntimeHandle(
+                RuntimeAssembly(
+                    runtime_executor=streaming_runtime,
+                    streaming_runtime=streaming_runtime,
+                    owned_components=(OwnedComponent(streaming_runtime, "speech_direction_streaming_runtime"),),
+                    stateful=True,
+                    resettable=True,
+                    state_scope="stream",
+                    state_bank_mode="runtime_exclusive",
+                    max_open_streams=1,
+                    execution_contract=ExecutionContract(
+                        state_scope="stream",
+                        execution_structure="direct",
+                        cancellation_granularity="checkpoint",
+                        state_bank_mode="runtime_exclusive",
+                        max_open_streams=1,
+                    ),
+                    identity=("tensor_model", "speech_direction", "enhance_and_vad"),
+                    runtime_id="speech-direction-compat",
+                )
+            )
+        self._model_runtime_handle = model_runtime_handle
+        self._stream_handle = None
         self.vad_state = pipeline.vad_state
         self.doa_state = pipeline.doa_state
         self.max_age_ms = config.speech_direction_max_age_ms
@@ -574,6 +614,7 @@ class SpeechDirectionRuntime:
         self._threads: list[threading.Thread] = []
         self._reader_id: int | None = None
         self._pipeline_closed = False
+        self._handle_closed = False
 
     def _record_raw_chunk(self, result: RingWriteResult) -> None:
         """把采集侧完整 raw 块非阻塞投递到 diagnostics。"""
@@ -603,6 +644,7 @@ class SpeechDirectionRuntime:
         """启动采集与 worker 线程。"""
         if self._running:
             return
+        self._ensure_stream_runtime()
         self._running = True
         logger.info("SpeechDirection runtime 启动中...")
 
@@ -642,6 +684,42 @@ class SpeechDirectionRuntime:
                         self.capture = None
             self._report_fatal_error(reason)
 
+    def _ensure_stream_runtime(self) -> None:
+        """Load the handle and open the one runtime-exclusive stream."""
+
+        if self._handle_closed:
+            raise RuntimeError("Speech Direction runtime handle is closed")
+        state = self._model_runtime_handle.state
+        if state is LifecycleState.CREATED:
+            self._model_runtime_handle.load(ExecutionContext("speech-direction-load"))
+        elif state is not LifecycleState.READY:
+            raise RuntimeError(f"Speech Direction runtime handle is not ready: {state.value}")
+        if self._stream_handle is None:
+            self._stream_handle = self._model_runtime_handle.open_stream(ExecutionContext("speech-direction-open"))
+
+    @property
+    def runtime_handle(self) -> ModelRuntimeHandle:
+        """Expose the lifecycle owner for diagnostics and controlled reset."""
+
+        return self._model_runtime_handle
+
+    @property
+    def stream_handle(self):
+        """Return the active unified stream identity, if the runtime is started."""
+
+        return self._stream_handle
+
+    def reset(self) -> None:
+        """Reset the active stream without changing its stable stream ID."""
+
+        if self._stream_handle is None:
+            self.pipeline.reset()
+            return
+        self._model_runtime_handle.reset_stream(
+            self._stream_handle,
+            ExecutionContext("speech-direction-reset"),
+        )
+
     def _start_thread(self, target: Callable, name: str) -> None:
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()
@@ -667,10 +745,15 @@ class SpeechDirectionRuntime:
                     gap_frames = max(0, item.start_sample - expected_sample)
                     self._pipeline_gap_count += 1
                     self._pipeline_gap_frames += gap_frames
-                    # Ring 覆盖后不能把不相邻音频继续拼进增强上下文和 STFT overlap。
-                    self.pipeline.reset_for_gap(
-                        next_capture_sample=item.start_sample,
-                        dropped_samples=gap_frames,
+                    # Ring 覆盖后不能把不相邻音频继续拼进增强上下文和
+                    # STFT overlap.  The next request carries the absolute
+                    # capture position, so the adapter can restart its host
+                    # state without exposing a second stream identity.
+                    if self._stream_handle is None:
+                        raise RuntimeError("Speech Direction stream is not open")
+                    self._model_runtime_handle.reset_stream(
+                        self._stream_handle,
+                        ExecutionContext(f"speech-direction-gap-{item.start_sample}"),
                     )
                     logger.warning(
                         "RingBuffer 覆盖导致 pipeline 跳过 %d 帧(%.3fs)，从 sample=%d 冷启动",
@@ -679,9 +762,18 @@ class SpeechDirectionRuntime:
                         item.start_sample,
                     )
                 try:
-                    self.pipeline.process_block(
-                        item.samples,
-                        capture_start_sample=item.start_sample,
+                    if self._stream_handle is None:
+                        raise RuntimeError("Speech Direction stream is not open")
+                    self._model_runtime_handle.step(
+                        self._stream_handle,
+                        ModelRequest(
+                            {
+                                "audio": item.samples,
+                                "capture_start_sample": item.start_sample,
+                            },
+                            {"request_id": f"speech-direction-{item.start_sample}"},
+                        ),
+                        ExecutionContext(f"speech-direction-step-{item.start_sample}"),
                     )
                     expected_sample = item.end_sample
                 except Exception as e:
@@ -702,7 +794,7 @@ class SpeechDirectionRuntime:
 
     def stop(self) -> None:
         """幂等停止线程并释放资源，即使单项清理失败也完成其余收尾。"""
-        if not self._running and self.capture is None and not self._threads and self._pipeline_closed:
+        if not self._running and self.capture is None and not self._threads and self._handle_closed:
             return
         logger.info("正在停止 SpeechDirection runtime...")
         self._running = False
@@ -753,16 +845,30 @@ class SpeechDirectionRuntime:
                 cleanup_error = RuntimeError("SpeechDirection worker 未全部退出，pipeline 资源保留供后续 stop() 重试")
             logger.warning("SpeechDirection worker 仍未退出，跳过 pipeline.close 避免竞态")
         else:
+            stream_handle = self._stream_handle
+            if stream_handle is not None:
+                try:
+                    self._model_runtime_handle.close_stream(
+                        stream_handle,
+                        ExecutionContext("speech-direction-close-stream"),
+                    )
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    logger.warning("关闭 speech_direction stream 失败", exc_info=True)
+                finally:
+                    self._stream_handle = None
             try:
-                self.pipeline.close()
+                self._model_runtime_handle.close()
             except Exception as exc:
-                # close 失败时不标记 _pipeline_closed：底层 close 各层为 best-effort，
-                # 是否能真正补做取决于各层 close 契约；runtime 此处仅避免把失败误标为成功。
                 if cleanup_error is None:
                     cleanup_error = exc
-                logger.warning("关闭 speech_direction pipeline 失败", exc_info=True)
-            else:
-                # 仅 close 正常返回才标记，避免半失败后被早退条件挡住重试入口。
+                logger.warning("关闭 speech_direction runtime handle 失败", exc_info=True)
+            finally:
+                # Handle close is terminal even when one owned component
+                # reports a cleanup error; subsequent stop() calls are
+                # idempotent and cannot close Sessions a second time.
+                self._handle_closed = True
                 self._pipeline_closed = True
         logger.info("SpeechDirection runtime 已停止")
         if cleanup_error is not None:
@@ -840,4 +946,5 @@ __all__ = [
     "MultiChannelRingBuffer",
     "AudioCapture",
     "SpeechDirectionRuntime",
+    "SpeechDirectionStreamingRuntime",
 ]

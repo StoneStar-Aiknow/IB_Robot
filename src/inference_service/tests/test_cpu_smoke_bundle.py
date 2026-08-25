@@ -42,7 +42,7 @@ def _create_tracked_equivalent_bundle(root: Path) -> Path:
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -54,7 +54,32 @@ def _create_tracked_equivalent_bundle(root: Path) -> Path:
                     "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, MODEL_NAME, entries),
                 },
             },
-            "deployments": {"cpu": {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}},
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [
+                    {"semantic": "observation.state", "dtype": "float32", "shape": [6]},
+                    {"semantic": "observation.images.top", "dtype": "float32", "shape": [3, 16, 24]},
+                ],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+            },
+            "deployments": {
+                "cpu": {
+                    "uuid": TEST_DEPLOYMENT_UUID,
+                    "revision": 1,
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "torch",
+                        "target": {"runtime": "torch"},
+                        "profile": {"device": "cpu"},
+                    },
+                }
+            },
         },
     )
     return root

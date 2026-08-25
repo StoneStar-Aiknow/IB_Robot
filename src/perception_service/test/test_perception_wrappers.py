@@ -144,4 +144,4 @@ def test_siglip2_wrapper_rejects_unbounded_or_empty_masks():
 @pytest.mark.parametrize("wrapper", [SAM2Wrapper, SigLIP2Wrapper, RAMPlusWrapper])
 def test_raw_wrappers_require_named_ascend_deployment(wrapper):
     with pytest.raises(RuntimeError, match="manifest named deployment"):
-        wrapper(backend="ascend_om")
+        wrapper(backend="ascend")

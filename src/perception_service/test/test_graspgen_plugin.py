@@ -102,9 +102,9 @@ def _response():
     return SimpleNamespace(grasps=None)
 
 
-def test_the_plugin_declares_the_typed_grasp_service_and_its_own_family():
+def test_the_plugin_declares_the_typed_grasp_service_and_its_model_type():
     assert GraspGenGenerateGraspsPlugin.service_type == "ibrobot_msgs/srv/GenerateGrasps"
-    assert GraspGenGenerateGraspsPlugin.family == "graspgen"
+    assert GraspGenGenerateGraspsPlugin.model_type == "graspgen"
     assert GraspGenGenerateGraspsPlugin.adapter_class is GraspGenAdapter
     assert issubclass(GraspGenGenerateGraspsPlugin, ModelServicePlugin)
 

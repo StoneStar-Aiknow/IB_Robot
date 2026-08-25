@@ -139,6 +139,8 @@ def test_pi05_executor_runs_validated_topologies_with_shared_euler_update(plan):
     session = _FakeSession()
     schedule = PI05DenoisingSchedule(name="test", timesteps=(1.0, 0.6, 0.0))
     executor = create_pi05_executor(plan, session, schedule, _ResultAdapter())
+    assert executor.execution_contract == "request-iterative"
+    assert executor.orchestration_visibility == "executor"
     request = NamedTensorRequest(
         "pi05",
         {"observation.state": np.ones((1, 2), dtype=np.float32), "noise": np.ones((1, 2, 3), dtype=np.float32)},
