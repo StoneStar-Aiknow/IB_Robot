@@ -44,7 +44,7 @@ JSON 文件必须是一个**数组**，直接包含问题对象：
 | `title` | string | 问题标题（简洁明了） |
 | `description` | string | 问题描述（可包含 `\n` 换行） |
 | `severity` | string | 严重性：`critical` / `error` / `warning` / `suggestion` |
-| `pillar` | string | 架构支柱：`ssot` / `contract` / `control_mode` / `tensormsg` / `ros2` / `python` / `docs` 等 |
+| `pillar` | string | 架构支柱：`ssot` / `contract` / `control_mode` / `tensormsg` / `ros2` / `python` / `docs` / `reuse`（复用与重复造轮子）等 |
 
 ### 可选字段
 

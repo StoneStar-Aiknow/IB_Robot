@@ -74,7 +74,24 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
          *   正式检视阶段触发上述门禁时，Agent 记录目标 commit 的完整 `git rev-parse HEAD^{tree}`，再调用两个 Docker skill 验证该 tree 的隔离快照。当前工作区无需 clean，但直接复制 dirty 工作区的结果只能用于本地调试，不能作为 PR 证据。Verification 必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段，并写入两平台真实结果。
          *   创建或更新 PR 时，脚本会将该 tree SHA 与已推送分支或 AtomGit PR 最新 head commit 的 tree 比对。源码 tree 改变会阻止创建/更新并要求重跑；只修改 commit message、作者或 trailer 而 tree 不变时，已有结果仍然有效。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
          *   在真正启动双平台 Docker 前，Agent 必须询问用户当前 PR 是临时 WIP 还是准备交给 reviewer 正式检视。命中门禁时，`pr_creation.py` / `pr_management.py` 要求显式传入 `--pr-stage wip|review`：`wip` 会把标题规范化为 `[WIP] <title>` 并暂缓 Docker；`review` 会移除 `[WIP]` 并恢复 tree-bound 门禁。WIP 只豁免双平台 Docker 证据，不豁免 DCO、AI 披露、其他测试或 CI。
-4.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
+4.  **大型 PR 复用自查（超过 2000 行强制）**:
+    *   **触发条件**: PR 变更行数（additions + deletions，按 `git diff --stat` / API 统计）**超过 2000 行**时，描述必须包含一个结构化 `## Reuse Self-Check` 章节，由 `pr_creation.py` / `pr_management.py` 脚本强制校验，缺失或不完整会阻止创建/更新。`[WIP]` **不豁免**本门禁：它是纯文档要求，且复用问题越早声明、越能避免在错误方向上继续堆代码。
+    *   **必须回答的四个问题**（字段标签固定为英文，正文默认中文，逐项给出具体答案；"无"也要显式写明，禁止留空）:
+        *   `**Reinvented workflows:**` **是否重新发明了现有流程**——新增的 setup / 数据集 / 评测 / 推理 / 部署管线，是否与仓库既有流程或 `libs/lerobot` 已有能力功能重叠？无重叠写"无"，有则逐项列出重叠点。
+        *   `**Reused components:**` **是否沿用了当前仓库中已有的内容**——包括 `libs/lerobot`（数据集、policies、benchmarks 等）、`robot_config` SSOT、既有 ROS 包与 `scripts/`；列出复用点及其位置（文件 / 模块 / 接口）。
+        *   `**Reinvention justification:**` **是否有必要重新发明流程**——若存在重叠实现，论证既有内容为何不能满足需求（接口缺失、性能、许可证、平台限制等），以及是否评估过扩展既有实现而非另起炉灶；未重新发明时写"无（未重新发明现有流程）"。
+        *   `**Architecture conformance:**` **是否符合当前仓库中类似功能的架构**——新增代码对齐了哪个同类模块的包职责、契约、数据流与配置来源（SSOT）；有偏离要解释原因。
+    *   **动机**: 历史 PR 中出现过引入 `libs/lerobot` 已支持能力的全套重复 setup 流程、以及绕开仓库既有推理框架另建一套实现的问题（如 [PR #309](https://atomgit.com/openeuler/IB_Robot/pull/309)、[PR #317](https://atomgit.com/openeuler/IB_Robot/pull/317)）。这类"重新造轮子"问题很难靠逐行 diff 在 review 阶段发现，必须由作者显式自查声明，再由 reviewer 对照 diff 审计（见 `atomgit-pr-review`）。
+    *   块格式示例:
+        ```markdown
+        ## Reuse Self-Check
+
+        **Reinvented workflows:** 无：评测直接复用 libs/lerobot 的 benchmark 能力，未新增平行的 setup 管线
+        **Reused components:** lerobot.datasets（数据加载）、robot_config SSOT（关节/频率契约）、inference_service 既有推理入口与 manifest 结构
+        **Reinvention justification:** 无（未重新发明现有流程）
+        **Architecture conformance:** 对齐 inference_service 的模型 bundle + manifest 架构；配置一律来自 robot_config，未新增配置来源
+        ```
+5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
 
 ```bash
 # 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
@@ -84,6 +101,9 @@ git diff upstream/master..HEAD
 # 根据 commit 内容选择合适章节；仅在做过真实验证时包含 Verification。
 # Mermaid 仅用于能显著提升理解的复杂流程或架构变更。
 # 如果变更影响用户使用方式，要判断并同步 README / 使用文档。
+# 如果变更超过 2000 行（additions+deletions），描述必须包含 ## Reuse Self-Check
+# 章节（Reinvented workflows / Reused components / Reinvention justification /
+# Architecture conformance 四个固定字段），见「PR 描述强制要求」第 4 条。
 # 如果变更触发双平台门禁，先询问用户并选择 --pr-stage wip 或 review。
 # WIP 自动添加 [WIP] 前缀并跳过 Docker；review 才验证隔离 tree 快照并写入
 # **Verified tree:** `<40位 SHA>` → 现在改为结构化 `## Docker Verification` 块。
@@ -135,7 +155,7 @@ python3 pr_management.py --pr 123 --fetch-info
 python3 pr_management.py --pr 123 --fetch-info --no-comments
 ```
 Agent 会读取生成的 `tmp/{repo}_pr_123_context.json`，其中默认包含提交记录、修改文件、代码 Diff (patch) 以及 PR 评论。
-`metadata.head_sha` 用于定位 PR 最新 commit，`metadata.head_tree` 是正式检视门禁比较的 tree SHA；`metadata.wip` 和 `metadata.dual_docker_gate_required` 分别标识 WIP 状态和文件门禁。仅 commit 元数据变化且 tree 不变时可以沿用 Docker 结果。
+`metadata.head_sha` 用于定位 PR 最新 commit，`metadata.head_tree` 是正式检视门禁比较的 tree SHA；`metadata.wip` 和 `metadata.dual_docker_gate_required` 分别标识 WIP 状态和文件门禁。仅 commit 元数据变化且 tree 不变时可以沿用 Docker 结果。`metadata.reuse_self_check` 含 `changed_lines` / `required` / `status`：当 `required` 为 true 时，重新生成或更新描述必须保留完整的 `## Reuse Self-Check` 章节（`status` 为 complete），否则更新会被拒绝。
 
 **步骤 2: Agent 分析与同步**
 Agent 分析完 Diff 后，会生成一份 `description.json`:
@@ -219,10 +239,12 @@ PR 描述通常应包含与本次提交最相关的内容，而不是固定模�
 - **方案概述 / 技术细节**：改了什么、为什么这样改
 - **README / 文档联动**：用户可见使用方式变更时，说明同步更新了哪些文档；若无需更新，也应基于变更内容判断
 - **影响范围**：影响范围与风险
+- **复用自查（超过 2000 行必填）**：结构化 `## Reuse Self-Check` 块，回答是否重新发明现有流程、是否沿用仓库与 `libs/lerobot` 已有内容、重新发明是否必要、是否符合同类功能架构
 - **验证结果（可选）**：仅在存在真实验证时写清场景、方法与结果
 
 对于纯文档、注释、`.gitignore`、说明文字等不涉及运行时行为的 PR，可以不写 Verification。
 但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程（含 `requirements/*.txt`），Agent 必须先询问 PR 阶段。`[WIP]` PR 可暂缓双平台 Docker；正式检视 PR 的 Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。正式检视前，Agent 必须记录目标 commit 的完整 tree SHA，让两个 Docker skill 验证该 tree 的隔离快照，并写入结构化 `## Docker Verification` 块（含 mode、Verified inputs、Tested source tree、Docker environment 四字段）。脚本校验该块的 inputs 指纹和 tested tree；移除 `[WIP]` 时门禁立即恢复。非门禁文件变化时可复用旧证据（`reused-environment` 模式）。
+复用自查门禁只看变更行数，与 Docker 门禁相互独立：超过 2000 行的 PR 无论是否触发 Docker 门禁、无论是否 `[WIP]`，都必须包含完整的 `## Reuse Self-Check` 块。
 
 ## 注意事项
 

@@ -16,6 +16,7 @@ import sys
 
 from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
+from reuse_gate import REUSE_SELF_CHECK_THRESHOLD, count_changed_lines, reuse_gate_required, validate_reuse_self_check
 from verification_gate import (
     compute_verification_inputs,
     resolve_pr_stage,
@@ -289,6 +290,24 @@ def main():
         sys.exit(1)
     if gate_required and not gate_triggered:
         print("ℹ️  [WIP] PR 跳过双平台 Docker 验证；移除 [WIP] 转为正式检视时门禁会恢复。")
+    try:
+        validate_reuse_self_check(description, file_infos)
+    except ValueError as e:
+        print(f"❌ 大型 PR 复用自查未通过: {e}")
+        print(
+            "   描述中需补充如下章节（标签固定，正文默认中文，逐项给出具体答案）：\n"
+            "   ## Reuse Self-Check\n"
+            "   **Reinvented workflows:** ...\n"
+            "   **Reused components:** ...\n"
+            "   **Reinvention justification:** ...\n"
+            "   **Architecture conformance:** ..."
+        )
+        sys.exit(1)
+    if reuse_gate_required(file_infos):
+        print(
+            f"ℹ️  变更 {count_changed_lines(file_infos)} 行（> {REUSE_SELF_CHECK_THRESHOLD}）："
+            "已包含 ## Reuse Self-Check 复用自查章节。"
+        )
     remote_head = None
     verified_tree = None
     if gate_triggered:
