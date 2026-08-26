@@ -14,10 +14,7 @@
 
 from __future__ import annotations
 
-import contextlib
-import importlib.util
 import logging
-import os
 
 import numpy as np
 import torch
@@ -47,7 +44,6 @@ class FullSubNetEnhancer:
 
     def __init__(
         self,
-        repo_dir: str,
         ckpt: str,
         device: str = "cuda",
         n_fft: int = N_FFT,
@@ -57,7 +53,6 @@ class FullSubNetEnhancer:
     ):
         """
         Args:
-            repo_dir: models/fullsubnet_repo 路径(FullSubNet 源码,git clone 产物)
             ckpt: models/fullsubnet/fullsubnet_best_model_58epochs.tar 路径
             device: cuda / cpu / auto(auto=优先 CUDA,无 CUDA 提示风险退 CPU)
             n_fft/hop/win: FullSubNet 内部 STFT 参数(固定 512/256/512)
@@ -81,51 +76,14 @@ class FullSubNetEnhancer:
         self.win = win
         self.num_freqs = num_freqs
 
-        # FullSubNet 的 model.py 位于 recipes/dns_interspeech_2020/fullsubnet/ 下,
-        # 是独立 .py 文件而非 Python 包。model.py 内部 `from audio_zen...` 依赖
-        # repo_dir 根目录下的 audio_zen 包(标准 import,需在 sys.path 上才能找到)。
-        # 不再用 sys.path.insert 长期污染全局搜索路径(避免多实例堆叠、遮蔽同名
-        # model.py、单测无法隔离 sys.path 全局状态);改为按路径显式加载 model.py,
-        # 仅在 exec_module 期间临时把 repo_dir 加入 sys.path、加载后立即移除。
-        repo_dir_abs = os.path.abspath(str(repo_dir))
-        self._model_py_path = os.path.join(repo_dir_abs, "recipes", "dns_interspeech_2020", "fullsubnet", "model.py")
-        self._repo_dir_abs = repo_dir_abs
-
         self._model = self._load_model(ckpt)
         # 预创建 Hann 窗(避免每帧重建)
         self._window = torch.hann_window(self.win, device=device)
         logger.info("FullSubNet 已加载: ckpt=%s device=%s", ckpt, device)
 
-    def _load_model_class(self):
-        """按路径显式加载 FullSubNet 的 model.Model 类,不长期污染 sys.path。
-
-        model.py 不是 Python 包,无法用普通 import 找到;且其内部 `from audio_zen...`
-        依赖 repo_dir 下的 audio_zen 包。解法:
-          1. spec_from_file_location 按绝对路径加载 model.py(不再全局 `from model import`);
-          2. exec_module 前**临时**把 repo_dir append 到 sys.path 尾部,使 audio_zen
-             可被解析;exec_module 后 try/finally 立即移除,不遗留全局状态。
-        临时 append 到尾部(而非 insert 头部)降低遮蔽同名模块的风险。
-        """
-        import sys
-
-        model_path = self._model_py_path
-        spec = importlib.util.spec_from_file_location("fullsubnet_model", model_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"无法加载 FullSubNet model.py: {model_path}")
-        module = importlib.util.module_from_spec(spec)
-        repo = self._repo_dir_abs
-        sys.path.append(repo)
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            # 只移除本次注入的条目,不动其他;list.remove 只删首个匹配,安全
-            with contextlib.suppress(ValueError):
-                sys.path.remove(repo)
-        return module.Model
-
     def _load_model(self, ckpt: str):
         """加载 FullSubNet 模型(参数与算法基线一致)。"""
-        Model = self._load_model_class()
+        from fullsubnet.model import Model
 
         m = Model(
             num_freqs=self.num_freqs,

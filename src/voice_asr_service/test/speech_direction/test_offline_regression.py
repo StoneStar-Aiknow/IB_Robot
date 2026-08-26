@@ -105,7 +105,6 @@ def _build_pipeline():
     # Ubuntu 仅替换模型执行后端，算法编排和 256/512/4096/512 时序不变。
     cfg.fullnet.backend = "stateful_torch_cuda"
     cfg.fullnet.device = "cuda"
-    cfg.fullnet.repo_dir = str(_SRC.parents[1] / "models/fullsubnet_repo")
     cfg.fullnet.ckpt = str(_SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar")
     cfg.fullnet.stateful_manifest_path = str(
         _SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
@@ -120,7 +119,6 @@ def _build_pipeline():
     try:
         require_configured_models(
             cfg.vad.model_path,
-            cfg.fullnet.repo_dir,
             cfg.fullnet.ckpt,
             silero_backend=cfg.vad.backend,
             fullsubnet_backend=cfg.fullnet.backend,
@@ -131,7 +129,6 @@ def _build_pipeline():
 
     fullnet = build_stateful_fullsubnet(
         backend=cfg.fullnet.backend,
-        repo_dir=cfg.fullnet.repo_dir,
         checkpoint_path=cfg.fullnet.ckpt,
         manifest_path=cfg.fullnet.stateful_manifest_path,
         device=cfg.fullnet.device,

@@ -65,7 +65,6 @@ profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsu
 | 输入源 | `wav_replay_rate` | `1.0`，WAV 回放倍率，必须大于 0。有效音频播放到 EOF 后，回放器会根据增强窗口尾部、hop 大小和段末静音门限追加若干个内部 6 通道零帧，使现有 VAD/状态机自然结算最后一个语音段；无需在测试文件末尾手工添加静音 |
 | 模型 | `silero_vad_model_path` | Silero VAD 模型路径 |
 | 模型 | `silero_vad_backend` | `raw_acl`（310P OM）；Ubuntu profile 覆盖为 `onnx` |
-| 模型 | `fullsubnet_repo_dir` | FullSubNet 源码目录（Ubuntu Torch 后端加载 `model.py`） |
 | 模型 | `fullsubnet_ckpt` | FullSubNet cumulative 218epochs checkpoint，两平台共用同一权重 |
 | 模型 | `fullsubnet_backend` | `stateful_raw_acl`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda` |
 | 模型 | `fullsubnet_device` | `cuda`；Ubuntu Torch 后端固定 CUDA，禁止静默回退 CPU |

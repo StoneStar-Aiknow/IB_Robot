@@ -4,20 +4,19 @@
 # 职责：只负责 Ubuntu 环境依赖（均来自 GitHub，不入库，放 models/ 下）：
 #   1. Silero VAD ONNX    — models/voice_asr/silero-vad/silero_vad.onnx (~2.3MB)
 #                          官方 snakers4/silero-vad master 分支，与 voice_asr_service 共用
-#   2. FullSubNet 源码仓  — models/fullsubnet_repo/ (git clone，需 model.py)
-#   3. FullSubNet ckpt    — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar (~67MB)
+#   2. FullSubNet ckpt    — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar (~67MB)
 #                          Audio-WestlakeU/FullSubNet v0.2 release，cumulative 218epochs
 #
-# 310P 专用 OM 资产（FB/SB/manifest 等）不在本仓库管理，需从 NAS 手动获取后
-# 放入 models/ 对应路径；scripts/verify_speech_direction_assets.py 仅做资产清单
-# 校验（family/norm/time_steps 等契约、文件大小、SHA-256），不下载，不在本脚本范围。
+# FullSubNet 源码（model.py + audio_zen）已打包为 ibrobot-fullsubnet wheel，
+# 通过 scripts/setup.sh 安装到 venv；本脚本不再 clone 上游源码仓。
 #
-# 下载后校验文件大小和 SHA-256，与 manifest 契约对齐。
+# 310P 专用 OM 资产（FB/SB/manifest 等）已发布到 HuggingFace openEuler/fullsubnet，
+# 可通过 huggingface_hub.snapshot_download 拉取；本脚本只管 Ubuntu CUDA 依赖。
 #
 # Usage:
 #   ./scripts/download_speech_direction_models.sh                 # 下载全部
 #   ./scripts/download_speech_direction_models.sh --silero-only   # 仅 Silero VAD
-#   ./scripts/download_speech_direction_models.sh --fullsubnet-only # 仅 FullSubNet(repo + ckpt)
+#   ./scripts/download_speech_direction_models.sh --fullsubnet-only # 仅 FullSubNet ckpt
 #   ./scripts/download_speech_direction_models.sh --target /custom/path  # 自定义 models 根目录
 set -euo pipefail
 
@@ -35,12 +34,9 @@ SILERO_URL="https://cdn.jsdelivr.net/gh/snakers4/silero-vad@master/src/silero_va
 SILERO_SHA256="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 SILERO_SIZE=2327524
 
-# FullSubNet 源码仓及与 v0.2 checkpoint 验证配套的不可变提交。
-FULLSUBNET_REPO_URL="https://github.com/Audio-WestlakeU/FullSubNet.git"
-FULLSUBNET_REPO_REV="e97448375cd1e883276ad583317b1828318910dc"
-
 # FullSubNet cumulative ckpt（Audio-WestlakeU/FullSubNet v0.2 release，218epochs cumulative）。
 # 必须与 cumulative_laplace_norm 配对，不能用于 offline_laplace_norm。
+# FullSubNet 源码（model.py + audio_zen）由 ibrobot-fullsubnet wheel 提供，不在本脚本范围。
 FULLSUBNET_CKPT_URL="https://github.com/Audio-WestlakeU/FullSubNet/releases/download/v0.2/cum_fullsubnet_best_model_218epochs.tar"
 FULLSUBNET_CKPT_SHA256="d08d09107eb276b8dc3d2d9fff995f4354a51fa3347125f52f8b9aea7c339f81"
 FULLSUBNET_CKPT_SIZE=67667419
@@ -54,17 +50,16 @@ Usage:
 
 Options:
   --silero-only         Download Silero VAD ONNX only
-  --fullsubnet-only     Download FullSubNet (repo + ckpt) only
+  --fullsubnet-only     Download FullSubNet ckpt only
   --target DIR          Target models directory (default: models/)
-  -h, --help            Show this help
+  -h, --help            Show the help
 
 Models downloaded (all from GitHub, for Ubuntu CUDA):
   - Silero VAD ONNX (~2.3 MB, shared with voice_asr_service)
-  - FullSubNet source repo (git clone, ~tens of MB)
   - FullSubNet cumulative ckpt 218epochs (~67 MB)
 
-310P OM assets are NOT handled here — they are not managed in this repo; fetch them
-from NAS manually. Run verify_speech_direction_assets.py to validate the manifest.
+FullSubNet source (model.py + audio_zen) is installed as ibrobot-fullsubnet wheel
+via scripts/setup.sh. 310P OM assets: openEuler/fullsubnet on HuggingFace.
 Models already present and verified are skipped.
 EOF
 }
@@ -154,54 +149,6 @@ download_silero() {
     download_file "${SILERO_URL}" "${dest}" "Silero VAD ONNX" "${SILERO_SIZE}" "${SILERO_SHA256}"
 }
 
-download_fullnet_repo() {
-    local dest="${MODELS_DIR}/fullsubnet_repo"
-    local tmp="${dest}.part"
-    local backup="${dest}.backup"
-    local model_rel="recipes/dns_interspeech_2020/fullsubnet/model.py"
-
-    # 只有关键文件和固定 revision 同时匹配才视为已就绪。
-    if [[ -f "${dest}/${model_rel}" ]] \
-        && [[ "$(git -C "${dest}" rev-parse HEAD 2>/dev/null || true)" == "${FULLSUBNET_REPO_REV}" ]]; then
-        echo "[skip] FullSubNet repo already exists at ${FULLSUBNET_REPO_REV}: ${dest}"
-        return 0
-    fi
-
-    echo "[clone] FullSubNet repo ${FULLSUBNET_REPO_REV} -> ${dest}"
-    mkdir -p "${MODELS_DIR}"
-    rm -rf "${tmp}" "${backup}"
-    git init "${tmp}"
-    git -C "${tmp}" remote add origin "${FULLSUBNET_REPO_URL}"
-    git -C "${tmp}" fetch --depth 1 origin "${FULLSUBNET_REPO_REV}"
-    git -C "${tmp}" checkout --detach FETCH_HEAD
-
-    # 安装前同时校验 revision 和运行时实际导入的关键文件。
-    if [[ "$(git -C "${tmp}" rev-parse HEAD)" != "${FULLSUBNET_REPO_REV}" ]]; then
-        echo "[error] FullSubNet repo revision 校验失败"
-        rm -rf "${tmp}"
-        return 1
-    fi
-    if [[ ! -f "${tmp}/${model_rel}" ]]; then
-        echo "[error] FullSubNet repo 缺少 ${model_rel}"
-        rm -rf "${tmp}"
-        return 1
-    fi
-
-    # 先保留旧目录，替换成功后再删除；失败时可恢复，不在目标路径留下半成品。
-    if [[ -e "${dest}" ]]; then
-        mv "${dest}" "${backup}"
-    fi
-    if mv "${tmp}" "${dest}"; then
-        rm -rf "${backup}"
-    else
-        if [[ -e "${backup}" ]]; then
-            mv "${backup}" "${dest}"
-        fi
-        return 1
-    fi
-    echo "[done] FullSubNet repo @ ${FULLSUBNET_REPO_REV}"
-}
-
 download_fullnet_ckpt() {
     local dest="${MODELS_DIR}/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
     download_file "${FULLSUBNET_CKPT_URL}" "${dest}" "FullSubNet ckpt 218epochs (~67MB)" \
@@ -226,7 +173,6 @@ main() {
     fi
 
     if [[ "${download_fullsubnet}" == true ]]; then
-        download_fullnet_repo
         download_fullnet_ckpt
     fi
 
@@ -236,9 +182,11 @@ main() {
         echo "  Silero VAD:      ${MODELS_DIR}/voice_asr/silero-vad/silero_vad.onnx"
     fi
     if [[ "${download_fullsubnet}" == true ]]; then
-        echo "  FullSubNet repo: ${MODELS_DIR}/fullsubnet_repo/"
         echo "  FullSubNet ckpt: ${MODELS_DIR}/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
     fi
+    echo ""
+    echo "Note: FullSubNet source (model.py + audio_zen) is installed as ibrobot-fullsubnet"
+    echo "wheel via scripts/setup.sh. 310P OM assets: openEuler/fullsubnet on HuggingFace."
 }
 
 main "$@"

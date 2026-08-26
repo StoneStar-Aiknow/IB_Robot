@@ -10,7 +10,6 @@ from .fullsubnet_stateful import StatefulFullSubNetEnhancer
 def build_stateful_fullsubnet(
     *,
     backend: str,
-    repo_dir: str = "",
     checkpoint_path: str = "",
     manifest_path: str = "",
     fb_om_path: str = "",
@@ -51,7 +50,6 @@ def build_stateful_fullsubnet(
             if canonical == "stateful_torch_cuda" and requested_device != "cuda":
                 raise ValueError("stateful_torch_cuda 必须配置 fullsubnet_device=cuda")
             executor = StatefulTorchFullSubNetExecutor(
-                repo_dir,
                 checkpoint_path,
                 manifest_path,
                 device=requested_device,

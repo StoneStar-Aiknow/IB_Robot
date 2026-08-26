@@ -43,7 +43,7 @@ speech_direction_node:
     # 旧静态OM回退路径，stateful门禁失败时不自动切换
     fullsubnet_om_path: "fullsubnet/fullsubnet_v6_310p_mixed16.om"
     # Ubuntu stateful Torch 使用同一个 218epochs cumulative checkpoint。
-    fullsubnet_repo_dir: "fullsubnet_repo"
+    # FullSubNet 源码(model.py + audio_zen)由 ibrobot-fullsubnet wheel 提供。
     fullsubnet_ckpt: "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
     fullsubnet_device: "cuda"
 

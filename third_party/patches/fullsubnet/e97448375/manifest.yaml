@@ -1,0 +1,22 @@
+upstream:
+  repository: https://github.com/Audio-WestlakeU/FullSubNet.git
+  commit: e97448375cd1e883276ad583317b1828318910dc
+distribution:
+  name: ibrobot-fullsubnet
+  version: 0.0.1+ibrobot.1
+  import_package: fullsubnet
+  wheel: ../../../wheels/fullsubnet/e97448375/ibrobot_fullsubnet-0.0.1+ibrobot.1-py3-none-any.whl
+build:
+  python: ">=3.10"
+  source_date_epoch: 1739846159
+  command: scripts/build_fullsubnet_wheel.sh
+runtime:
+  torch: ">=2.1"
+  numpy: ">=1.21"
+  notes: >
+    Pure-Python wheel packaging the audio_zen framework and the FullSubNet
+    cumulative model definition (recipes/dns_interspeech_2020/fullsubnet/model.py)
+    as a top-level importable package. No CUDA ops; Torch CPU/CUDA only.
+patches:
+  - file: 0001-add-setup-py-for-wheel-packaging.patch
+    purpose: Add setup.py so the upstream source tree can be built into a pip wheel without restructuring.

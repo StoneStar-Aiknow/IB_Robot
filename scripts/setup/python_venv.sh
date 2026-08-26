@@ -327,6 +327,21 @@ EOF
     fi
     run_cmd "${pip_install[@]}" --no-deps "${gdino_wheel}" --quiet
 
+    # FullSubNet speech enhancement model (audio_zen + model.py) as an audited
+    # wheel. Pure-Python; the Torch backend loads Model from the installed
+    # package instead of cloning the upstream source tree into models/.
+    local fullsubnet_wheel_root="${WORKSPACE}/third_party/wheels/fullsubnet/e97448375"
+    local fullsubnet_wheel="${fullsubnet_wheel_root}/ibrobot_fullsubnet-0.0.1+ibrobot.1-py3-none-any.whl"
+    if [[ -f "${fullsubnet_wheel_root}/SHA256SUMS" ]]; then
+        if ! (cd "${fullsubnet_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "FullSubNet wheel checksum verification failed."
+            exit 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${fullsubnet_wheel}" --quiet
+    else
+        log_warn "FullSubNet wheel not found at ${fullsubnet_wheel_root}; skipping (speech_direction Torch backend unavailable)."
+    fi
+
     # GraspGen runtime dependencies are part of the default install contract:
     # manipulation_service is part of the default workspace build. Skip on
     # openEuler Embedded because GraspGen's pointnet2_ops CUDA extension is

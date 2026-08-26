@@ -9,10 +9,12 @@
 自检与兼容入口,不再代表生产资产清单。
 
 生产资产(均不入库,放 models/ 下,通过 python3 scripts/verify_speech_direction_assets.py 校验):
-  1. Silero VAD OM/ONNX — 310P raw_acl 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
-  2. FullSubNet 源码仓     — models/fullsubnet_repo/(Ubuntu Torch 后端需 model.py)
-  3. FullSubNet cumulative ckpt — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
-  4. stateful FB/SB 拆分 OM + manifest(310P raw_acl 专用,由 HF 脚本拉取)
+   1. Silero VAD OM/ONNX — 310P raw_acl 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
+   2. FullSubNet cumulative ckpt — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
+   3. stateful FB/SB 拆分 OM + manifest(310P raw_acl 专用,由 HF 脚本拉取)
+
+FullSubNet 源码(model.py + audio_zen)已打包为 ibrobot-fullsubnet wheel,
+通过 scripts/setup.sh 安装到 venv;不再需要 git clone 上游源码仓到 models/ 下。
 """
 
 from __future__ import annotations
@@ -29,12 +31,6 @@ _DEFAULT_MODELS_ROOT = _WORKSPACE_ROOT / "models"
 
 # Silero VAD(与 voice_asr_service 共用目录);310P 用 OM,Ubuntu 用 ONNX,具体文件名由 yaml 指定。
 SILERO_VAD_REL = "voice_asr/silero-vad/silero_vad.onnx"
-
-# FullSubNet 源码仓(git clone 产物,只需 recipes/dns_interspeech_2020/fullsubnet/model.py)
-# 源仓 clone 地址与 checkpoint 下载源由 scripts/ 下脚本各管各的，本模块只做路径校验，
-# 不持有可能过期的下载 URL（218epochs cumulative ckpt 的真实交付源是 HF manifest）。
-FULLSUBNET_REPO_REL = "fullsubnet_repo"
-FULLSUBNET_MODEL_REL = "recipes/dns_interspeech_2020/fullsubnet/model.py"
 
 # FullSubNet cumulative ckpt(218epochs,两平台共用同一权重)
 FULLSUBNET_CKPT_REL = "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
@@ -57,12 +53,11 @@ class ModelStatus:
     """模型校验结果。"""
 
     silero_vad: ModelAsset
-    fullsubnet_repo: ModelAsset
     fullsubnet_ckpt: ModelAsset
 
     def missing(self) -> list[ModelAsset]:
         """返回缺失的资产列表。"""
-        return [a for a in (self.silero_vad, self.fullsubnet_repo, self.fullsubnet_ckpt) if not a.exists()]
+        return [a for a in (self.silero_vad, self.fullsubnet_ckpt) if not a.exists()]
 
     def all_present(self) -> bool:
         return not self.missing()
@@ -84,39 +79,9 @@ def resolve_assets(models_root: Path | None = None) -> ModelStatus:
             path=root / SILERO_VAD_REL,
             required_for="人声门控(Silero VAD 推理)",
         ),
-        fullsubnet_repo=ModelAsset(
-            name="FullSubNet 源码模型入口",
-            path=root / FULLSUBNET_REPO_REL / FULLSUBNET_MODEL_REL,
-            required_for="语音增强(FullSubNet Model 定义)",
-        ),
         fullsubnet_ckpt=ModelAsset(
             name="FullSubNet ckpt",
             path=root / FULLSUBNET_CKPT_REL,
-            required_for="语音增强(模型权重,~67MB)",
-        ),
-    )
-
-
-def resolve_configured_assets(
-    silero_vad_path: str | Path,
-    fullsubnet_repo_dir: str | Path,
-    fullsubnet_ckpt_path: str | Path,
-) -> ModelStatus:
-    """按 ROS 配置给出的最终路径构造模型资产状态。"""
-    return ModelStatus(
-        silero_vad=ModelAsset(
-            name="Silero VAD",
-            path=Path(silero_vad_path),
-            required_for="人声门控(Silero VAD 推理)",
-        ),
-        fullsubnet_repo=ModelAsset(
-            name="FullSubNet 源码模型入口",
-            path=Path(fullsubnet_repo_dir) / FULLSUBNET_MODEL_REL,
-            required_for="语音增强(FullSubNet Model 定义)",
-        ),
-        fullsubnet_ckpt=ModelAsset(
-            name="FullSubNet ckpt",
-            path=Path(fullsubnet_ckpt_path),
             required_for="语音增强(模型权重,~67MB)",
         ),
     )
@@ -128,7 +93,6 @@ def _raise_missing(status: ModelStatus, location_summary: str) -> None:
     if not missing:
         return
 
-    # 逐项列出缺失(对齐 perception 的 "X not found: <path>" 风格)。
     detail = "\n".join(f"{asset.name} not found: {asset.path}" for asset in missing)
     raise FileNotFoundError(
         f"speech_direction 模型缺失(共 {len(missing)} 项):\n{detail}\n"
@@ -139,7 +103,6 @@ def _raise_missing(status: ModelStatus, location_summary: str) -> None:
 
 def require_configured_models(
     silero_vad_path: str | Path,
-    fullsubnet_repo_dir: str | Path,
     fullsubnet_ckpt_path: str | Path,
     *,
     silero_backend: str = "om",
@@ -153,12 +116,11 @@ def require_configured_models(
 
     om 后端(默认,310P1 部署形态):
       - silero 校验 silero_vad_path 指向的 .om 文件
-      - fullsubnet 校验 fullsubnet_om_path 指向的 .om 文件(repo_dir/ckpt 可省)
+      - fullsubnet 校验 fullsubnet_om_path 指向的 .om 文件(ckpt 可省)
     torch/onnx 后端(回归基线):
-      - 校验 silero .onnx、fullsubnet_repo model.py、fullsubnet ckpt 三件套
+      - 校验 silero .onnx、fullsubnet ckpt;Model 类由 ibrobot-fullsubnet wheel 提供
     """
-    # 构造待校验资产列表(按后端决定校验哪些)
-    assets = []
+    assets: list[ModelAsset] = []
 
     # Silero VAD:raw_acl/兼容om校验 .om，onnx 校验 .onnx。
     silero_path = Path(silero_vad_path)
@@ -179,7 +141,7 @@ def require_configured_models(
             )
         )
 
-    # FullSubNet:raw ACL 校验 FB/SB/manifest；stateful Torch 校验 repo/ckpt/manifest。
+    # FullSubNet:raw ACL 校验 FB/SB/manifest；stateful Torch 校验 ckpt/manifest。
     if fullsubnet_backend in {"stateful_om", "stateful_raw_acl"}:
         for name, path, purpose in (
             ("FullSubNet cumulative FB stateful om", fullsubnet_stateful_fb_om_path, "FB stateful推理"),
@@ -200,15 +162,7 @@ def require_configured_models(
             )
         )
     else:
-        # stateful Torch 与 legacy Torch 都先校验 repo/ckpt；真正的算法选择由 factory 完成。
-        repo_path = Path(fullsubnet_repo_dir) / FULLSUBNET_MODEL_REL
-        assets.append(
-            ModelAsset(
-                name="FullSubNet 源码模型入口",
-                path=repo_path,
-                required_for="语音增强(FullSubNet Model 定义)",
-            )
-        )
+        # stateful Torch 与 legacy Torch 校验 ckpt;Model 类来自 wheel 包。
         assets.append(
             ModelAsset(
                 name="FullSubNet ckpt",
@@ -269,8 +223,8 @@ def main() -> int:
     status = resolve_assets(args.models_root)
     print(f"Models root: {args.models_root}")
     print()
-    for a in (status.silero_vad, status.fullsubnet_repo, status.fullsubnet_ckpt):
-        mark = "✓" if a.exists() else "✗"
+    for a in (status.silero_vad, status.fullsubnet_ckpt):
+        mark = "OK" if a.exists() else "MISSING"
         print(f"  [{mark}] {a.name}")
         print(f"       path: {a.path}")
         print(f"       use: {a.required_for}")

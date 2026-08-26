@@ -56,8 +56,6 @@ class PipelineConfig:
 class FullSubNetConfig:
     """FullSubNet 4ch 增强参数。"""
 
-    # 模型路径用绝对路径(基于工作区根推算),避免相对路径 cwd 敏感
-    repo_dir: str = field(default_factory=lambda: _model_path("fullsubnet_repo"))
     # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
     ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.tar"))
     # FullSubNet 静态 om(旧8192/2048回退链路,文件名为 fullsubnet_v6_310p_mixed16.om)
