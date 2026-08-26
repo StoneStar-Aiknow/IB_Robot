@@ -1064,6 +1064,9 @@ class SessionBuilderRegistry:
 
     def create(self, key_or_context: SessionBuilderKey | object, *args: object, **kwargs: object) -> object:
         override = kwargs.pop("override", None)
+        builder_options = kwargs.pop("builder_options", None)
+        if builder_options:
+            kwargs.update(dict(builder_options))
         if isinstance(key_or_context, SessionBuilderKey):
             key = key_or_context
             context = kwargs.pop("context", None)
