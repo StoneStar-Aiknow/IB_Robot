@@ -13,7 +13,7 @@ from inference_service.model_service_node import (
     _runtime_info,
     _validate_service_contract,
 )
-from perception_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
+from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 
 
 def _validated_manifest():

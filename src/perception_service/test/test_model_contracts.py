@@ -4,7 +4,6 @@ import pytest
 
 from perception_service.model_contracts import (
     MAX_DETECTIONS,
-    ModelManifest,
     rank_detections,
     validate_detection_batch,
     validate_mask_batch,
@@ -40,16 +39,6 @@ def _rgb():
 
 def _mask():
     return _Image(2, 3, "mono8", 3, bytes(6))
-
-
-def test_model_manifest_fingerprint_is_stable_and_sensitive():
-    manifest = ModelManifest("siglip2", "v1", "weights", "config", "cuda", "torch", "pre", 512, "l2")
-
-    assert manifest.fingerprint() == manifest.fingerprint()
-    assert (
-        manifest.fingerprint()
-        != ModelManifest("siglip2", "v2", "weights", "config", "cuda", "torch", "pre", 512, "l2").fingerprint()
-    )
 
 
 def test_mask_batch_accepts_matching_mono8_images():

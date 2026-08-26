@@ -7,7 +7,6 @@ module must never import ACL, RKNNLite, TCIM, Torch, or a worker executable.
 
 from __future__ import annotations
 
-import importlib
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,7 +23,7 @@ from inference_manifest import (
     TorchRuntimeProfile,
 )
 from inference_service.backends.errors import BackendCompatibilityError, BackendRegistryError
-from inference_service.backends.types import RuntimeContext, _LegacyBackendProtocol
+from inference_service.backends.types import RuntimeContext
 
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
 VALID_INTERFACES = frozenset({"policy", "tensor_model"})
@@ -383,60 +382,6 @@ class BackendRegistry:
                 code="adapter_deployment_mismatch",
             )
         return descriptor
-
-    def _create_legacy_backend(self, context: RuntimeContext) -> _LegacyBackendProtocol:
-        descriptor = self.validate(context)
-        if descriptor.factory is None:
-            raise BackendRegistryError(
-                f"backend {descriptor.name!r} is session-only and has no legacy backend adapter",
-                code="legacy_backend_unavailable",
-            )
-        factory = self._load_factory(descriptor)
-        try:
-            backend = factory(context)
-        except Exception as exc:
-            raise BackendRegistryError(
-                f"factory {descriptor.factory!r} failed to create backend {descriptor.name!r}: {exc}",
-                code="factory_failed",
-            ) from exc
-        if not isinstance(backend, _LegacyBackendProtocol):
-            raise BackendRegistryError(
-                f"legacy backend adapter {descriptor.factory!r} returned an invalid backend",
-                code="invalid_factory_result",
-            )
-        if backend.name != descriptor.name:
-            raise BackendRegistryError(
-                f"factory {descriptor.factory!r} returned backend {backend.name!r}, expected {descriptor.name!r}",
-                code="factory_backend_mismatch",
-            )
-        return backend
-
-    @staticmethod
-    def _load_factory(descriptor: BackendDescriptor) -> Callable[[RuntimeContext], _LegacyBackendProtocol]:
-        if descriptor.factory is None:
-            raise BackendRegistryError(
-                f"backend {descriptor.name!r} has no legacy backend adapter", code="legacy_backend_unavailable"
-            )
-        module_name, attribute = descriptor.factory.split(":", maxsplit=1)
-        try:
-            module = importlib.import_module(module_name)
-        except (ImportError, OSError) as exc:
-            raise BackendRegistryError(
-                f"backend {descriptor.name!r} factory module {module_name!r} is unavailable: {exc}",
-                code="factory_unavailable",
-            ) from exc
-        try:
-            factory = getattr(module, attribute)
-        except AttributeError as exc:
-            raise BackendRegistryError(
-                f"backend {descriptor.name!r} factory {descriptor.factory!r} is not defined",
-                code="factory_unavailable",
-            ) from exc
-        if not callable(factory):
-            raise BackendRegistryError(
-                f"backend {descriptor.name!r} factory {descriptor.factory!r} is not callable", code="invalid_factory"
-            )
-        return factory
 
 
 def _target(deployment: object) -> object | None:

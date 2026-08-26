@@ -4,12 +4,12 @@ import numpy as np
 import pytest
 
 from inference_service.backends.errors import BackendInferenceError
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from perception_service.siglip2_ascend_session import SigLIP2AscendSession
 
 
 def _session(calls):
-    session = SigLIP2AscendSession()
+    session = SigLIP2AscendSession(runtime_manager=object())
     session._text_batch_size = MethodType(lambda _self: 4, session)
     session._embedding_dimension = MethodType(lambda _self, _role: 3, session)
 
@@ -28,9 +28,8 @@ def _session(calls):
 def test_siglip2_ascend_splits_images_and_pads_text_to_compiled_batches():
     calls = []
     session = _session(calls)
-    request = NamedTensorRequest(
-        request_id="siglip2",
-        inputs={
+    request = ModelRequest(
+        {
             "masked_images": np.stack(
                 [np.ones((3, 2, 2), dtype=np.float32), np.full((3, 2, 2), 2.0, dtype=np.float32)]
             ),
@@ -39,7 +38,7 @@ def test_siglip2_ascend_splits_images_and_pads_text_to_compiled_batches():
         },
     )
 
-    result = session._execute(request)
+    result = session._execute(request, ExecutionContext("siglip2"))
 
     assert [role for role, _values in calls] == ["vision", "vision", "text", "text"]
     assert calls[-1][1]["host.siglip2.input_ids"].shape == (4, 5)
@@ -52,9 +51,8 @@ def test_siglip2_ascend_splits_images_and_pads_text_to_compiled_batches():
 
 def test_siglip2_ascend_rejects_mismatched_token_and_attention_shapes():
     session = _session([])
-    request = NamedTensorRequest(
-        request_id="siglip2",
-        inputs={
+    request = ModelRequest(
+        {
             "masked_images": np.empty((0, 3, 384, 384), dtype=np.float32),
             "text_tokens": np.empty((2, 64), dtype=np.int64),
             "text_attention_mask": np.empty((1, 64), dtype=np.int64),
@@ -62,4 +60,4 @@ def test_siglip2_ascend_rejects_mismatched_token_and_attention_shapes():
     )
 
     with pytest.raises(BackendInferenceError, match="token and attention shapes differ"):
-        session._execute(request)
+        session._execute(request, ExecutionContext("siglip2"))

@@ -7,8 +7,8 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
 
 class SigLIP2AscendSession(AscendOmModelSession):
@@ -23,7 +23,8 @@ class SigLIP2AscendSession(AscendOmModelSession):
             )
         super()._load(context, rollback)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         images = np.asarray(request.inputs["masked_images"], dtype=np.float32)
         tokens = np.asarray(request.inputs["text_tokens"], dtype=np.int64)
         attention = np.asarray(request.inputs["text_attention_mask"], dtype=np.int64)

@@ -10,17 +10,15 @@ from contextlib import nullcontext, suppress
 from typing import Any
 
 from inference_manifest import TorchRuntimeProfile
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.lerobot_assets import (
     TOKENIZER_REFERENCE_KEYS,
     VLM_REFERENCE_KEYS,
     resolve_local_semantic_reference,
 )
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 _ACTION_METHODS = frozenset({"predict_action_chunk", "select_action"})
 _NOISE_KEYS = ("_noise", "action.noise", "noise")
@@ -35,7 +33,6 @@ class LeRobotTorchModelSession(ModelSession):
         device_name: str,
         *,
         priority_scheduling: bool = False,
-        domains: ResourceDomainAdmissions | None = None,
     ) -> None:
         super().__init__(
             "model-session:lerobot-torch",
@@ -53,7 +50,6 @@ class LeRobotTorchModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._configured_device_name = device_name
         self._torch: Any | None = None
@@ -92,7 +88,7 @@ class LeRobotTorchModelSession(ModelSession):
             return {}
         return dict(self._last_metadata)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         profile = context.backend_profile
         if (
             context.backend != "torch"
@@ -178,12 +174,25 @@ class LeRobotTorchModelSession(ModelSession):
             supports_attention=self.observes_attention(policy),
         )
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         policy = self._policy
         torch_module = self._torch
         if policy is None or torch_module is None:
             raise BackendInferenceError("LeRobot Torch model session is not loaded", code="runtime_not_loaded")
-        batch = {key: self._move_input(value) for key, value in request.inputs.items()}
+        input_descriptors = {d.semantic: d for d in self._require_context().validated_manifest.manifest.model.inputs}
+        batch = {}
+        for key, value in request.inputs.items():
+            tensor = self._move_input(value)
+            descriptor = input_descriptors.get(key)
+            if (
+                descriptor is not None
+                and hasattr(tensor, "dim")
+                and hasattr(tensor, "shape")
+                and tensor.dim() == len(descriptor.shape)
+            ):
+                tensor = tensor.unsqueeze(0)
+            batch[key] = tensor
         action_method = request.metadata.get("action_method", "predict_action_chunk")
         if not isinstance(action_method, str) or action_method not in _ACTION_METHODS:
             raise BackendInferenceError(
@@ -203,7 +212,7 @@ class LeRobotTorchModelSession(ModelSession):
             action = callback(batch, **kwargs)
         action = self._remove_batch_dimension(action)
         self._last_metadata = {
-            "request_id": request.request_id,
+            "request_id": context.request_id,
             "policy_type": self._require_context().model_type,
             "device": self._configured_device_name,
             "action_method": action_method,

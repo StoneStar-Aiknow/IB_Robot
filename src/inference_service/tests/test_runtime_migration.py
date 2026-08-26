@@ -5,21 +5,15 @@ from types import SimpleNamespace
 import numpy as np
 
 from inference_manifest import TorchRuntimeProfile
-from inference_service import generic_runtime
-from inference_service._legacy_named_tensor import NamedTensorResult, RuntimeErrorInfo
-from inference_service._runtime_compat import build_session_runtime_handle
-from inference_service.distributed import StructuredError, structured_error_from_exception
+from inference_service.distributed import StructuredError
 from inference_service.pipeline.runtime import _create_unified_policy_handle
 from inference_service.unified_runtime import (
     ExecutionContext,
     ModelRequest,
     ModelResult,
     ModelRuntimeHandle,
-    OutcomeEvidence,
     OutcomeState,
-    RecoveryAction,
-    RecoveryRequirement,
-    RecoveryScope,
+    RuntimeAssembly,
     RuntimeProviders,
 )
 
@@ -54,6 +48,7 @@ def _context(model_type: str, operation: str = "predict") -> SimpleNamespace:
 
 class _IterativeExecutor:
     stages = (SimpleNamespace(plan=(), state_adapter=object()),)
+    components = ()
 
     def __init__(self) -> None:
         self.loaded = False
@@ -63,76 +58,21 @@ class _IterativeExecutor:
     def load(self, _context: object) -> None:
         self.loaded = True
 
-    def execute(self, request, *, deadline, control):
-        del deadline
-        control.raise_if_canceled("test")
-        self.calls.append(request.request_id)
-        return {"value": request.inner.inputs["value"]}
-
-    def cancel(self, _request_id: str, deadline=None) -> None:
-        del deadline
-
-    def reset(self, deadline=None) -> None:
-        del deadline
-
-    def health(self):
-        return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+    def execute(self, request, context):
+        context.check("test")
+        self.calls.append(context.request_id)
+        return {"value": request.inputs["value"]}
 
     def close(self) -> None:
         self.closed = True
-
-
-class _Session:
-    capabilities = SimpleNamespace(stateful=False, resettable=False)
-
-    def __init__(self) -> None:
-        self.loaded = False
-        self.closed = False
-        self.load_count = 0
-        self.close_count = 0
-
-    def load(self, _context: object) -> None:
-        self.load_count += 1
-        self.loaded = True
-
-    def infer(self, request) -> ModelResult:
-        return ModelResult(
-            outputs={"audio": np.asarray(request.inputs["audio"])},
-            latency=1.0,
-            evidence=OutcomeEvidence.completed("backend"),
-        )
-
-    def health(self):
-        return SimpleNamespace(
-            ready=True,
-            state=SimpleNamespace(value="ready"),
-            failure_count=0,
-            reason_code=None,
-            message=None,
-            recoverable=False,
-        )
-
-    def close(self) -> None:
-        self.close_count += 1
-        self.closed = True
-
-
-def test_named_results_are_compatibility_only() -> None:
-    assert generic_runtime.__all__ == ["NamedTensorRequest"]
-    assert NamedTensorResult.__module__.endswith("_legacy_named_tensor")
-    assert RuntimeErrorInfo.__module__.endswith("_legacy_named_tensor")
-    assert not hasattr(generic_runtime, "NamedTensorResult")
 
 
 def test_policy_iterative_path_uses_factory_handle_and_model_result() -> None:
     executor = _IterativeExecutor()
-    context = _context("pi05")
-    handle = _create_unified_policy_handle(context, executor, _providers(), resettable=False)
+    handle = _create_unified_policy_handle(_context("pi05"), executor, _providers(), resettable=False)
 
     assert isinstance(handle, ModelRuntimeHandle)
     assert handle.assembly.execution_contract.name == "request-iterative"
-    assert handle.assembly.execution_contract.orchestration_visibility == "executor"
-
     handle.load()
     result = handle.execute(ModelRequest({"value": 7}), ExecutionContext("pi05-request"))
 
@@ -143,29 +83,37 @@ def test_policy_iterative_path_uses_factory_handle_and_model_result() -> None:
     assert executor.closed
 
 
-def test_session_visible_iterative_path_publishes_unified_result() -> None:
-    session = _Session()
-    context = _context("zipvoice", "synthesize")
-    handle = build_session_runtime_handle(
-        session,
-        context,
-        _providers(),
-        execution_structure="iterative",
-        orchestration_visibility="session",
-        runtime_id="zipvoice-test",
-    )
+def test_native_session_runtime_owns_one_session_lifecycle() -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.load_count = 0
+            self.close_count = 0
 
-    assert handle.assembly.execution_contract.name == "request-iterative"
-    assert handle.assembly.execution_contract.orchestration_visibility == "session"
-    assert handle.assembly.session is session
+        def load(self, _context: object) -> None:
+            self.load_count += 1
+
+        def execute(self, request, _context):
+            return {"audio": np.asarray(request.inputs["audio"])}
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    session = Session()
+    handle = ModelRuntimeHandle(
+        RuntimeAssembly(
+            runtime_executor=session,
+            session=session,
+            execution_contract="request-iterative",
+            runtime_id="zipvoice-test",
+        )
+    )
     handle.load()
-    assert session.load_count == 1
     result = handle.execute(ModelRequest({"audio": np.ones(2, dtype=np.float32)}), ExecutionContext("tts-1"))
 
     assert isinstance(result, ModelResult)
     np.testing.assert_array_equal(result.outputs["audio"], np.ones(2, dtype=np.float32))
     handle.close()
-    assert session.closed
+    assert session.load_count == 1
     assert session.close_count == 1
 
 
@@ -174,20 +122,3 @@ def test_structured_error_remains_the_policy_distributed_wire_value() -> None:
 
     assert error.code == "cancel_failed"
     assert error.stage == "cancel"
-
-
-def test_distributed_mapping_keeps_unified_evidence_and_recovery_in_details() -> None:
-    from inference_service.unified_runtime import ExecutionFailure
-
-    failure = ExecutionFailure(
-        "backend_async_failure",
-        "device outcome is unknown",
-        recoverable=True,
-        recovery=RecoveryRequirement(RecoveryScope.REQUEST, RecoveryAction.RESET_RUNTIME),
-        evidence=OutcomeEvidence.started("acl_async", outcome_known=False, state_mutated=True),
-    )
-
-    wire_error = structured_error_from_exception(failure, "backend")
-
-    assert wire_error.details["evidence"]["state"] == "started"
-    assert wire_error.details["recovery"] == {"scope": "request", "action": "reset_runtime"}

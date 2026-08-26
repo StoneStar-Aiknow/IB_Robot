@@ -460,7 +460,6 @@ class RuntimeRoleSelector:
 
 CompositeRoleSelector = RuntimeRoleSelector
 RoleSelector = RuntimeRoleSelector
-ModelSessionBuilderKey = SessionBuilderKey
 
 
 @dataclass(frozen=True, slots=True)
@@ -1064,13 +1063,14 @@ class SessionBuilderRegistry:
         return self._builders.get(selected_key)
 
     def create(self, key_or_context: SessionBuilderKey | object, *args: object, **kwargs: object) -> object:
+        override = kwargs.pop("override", None)
         if isinstance(key_or_context, SessionBuilderKey):
             key = key_or_context
             context = kwargs.pop("context", None)
         else:
             context = key_or_context
             key = SessionBuilderKey.from_context(context)
-        builder = self._builders.get(key)
+        builder = override or self._builders.get(key)
         if builder is None:
             raise RuntimeRegistryError(
                 f"session builder {key!r} is unavailable",
@@ -1078,6 +1078,15 @@ class SessionBuilderRegistry:
             )
         if context is None:
             return builder(*args, **kwargs)
+        try:
+            signature = inspect.signature(builder)
+        except (TypeError, ValueError):
+            return builder(context, *args, **kwargs)
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+        )
+        if not accepts_kwargs:
+            kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
         return builder(context, *args, **kwargs)
 
     def freeze(self) -> SessionBuilderRegistry:
@@ -1836,7 +1845,6 @@ __all__ = [
     "CompositeRuntimeKey",
     "CompositeRuntimeMatrixEntry",
     "ModelRuntimeKey",
-    "ModelSessionBuilderKey",
     "RegistryFrozenError",
     "RegistrySet",
     "RoleBackendProfile",

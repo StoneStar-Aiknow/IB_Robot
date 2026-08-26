@@ -7,27 +7,23 @@ import pytest
 from sensor_msgs.msg import Image
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from inference_service._legacy_named_tensor import DeploymentIdentity, NamedTensorResult, RuntimeLatency
-from inference_service.backends import BackendState
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ModelRequest,
+    ModelResult,
+    ModelRuntimeHandle,
+    OutcomeEvidence,
+    RuntimeLatency,
+)
 from perception_service.model_service_plugins import SegmentDetectionsPlugin
 from perception_service.semantic_model_adapters import GroundingDINORawAdapter, SAM2PromptAdapter
 
 
 def _result(outputs):
-    return NamedTensorResult(
+    return ModelResult(
         outputs=outputs,
-        deployment=DeploymentIdentity(
-            bundle="test",
-            bundle_uuid="bundle-uuid",
-            bundle_revision=1,
-            deployment="ascend_310p",
-            deployment_uuid="deployment-uuid",
-            deployment_revision=1,
-            deployment_fingerprint="fingerprint",
-            backend="ascend",
-        ),
         latency=RuntimeLatency(total_ms=1.0, backend_ms=1.0),
-        state=BackendState.READY,
+        evidence=OutcomeEvidence.completed("adaptation"),
     )
 
 
@@ -406,9 +402,10 @@ class _StubSession:
         self.batch_size = batch_size
         self.prompts = []
 
-    def infer(self, request):
+    def execute(self, request: ModelRequest, context: ExecutionContext):
+        context.check("backend")
         self.prompts.append(np.asarray(request.inputs["point_coords"]).copy())
-        return _result({"mask_logits": np.ones((self.batch_size, 1, 256, 256), dtype=np.float32)})
+        return {"mask_logits": np.ones((self.batch_size, 1, 256, 256), dtype=np.float32)}
 
 
 def _segment_plugin(batch_size: int):
@@ -416,9 +413,12 @@ def _segment_plugin(batch_size: int):
     adapter.batch_size = batch_size
     plugin = object.__new__(SegmentDetectionsPlugin)
     plugin.adapter = adapter
-    plugin.host = SimpleNamespace(bridge=_Bridge())
+    plugin.bridge = _Bridge()
+    plugin.host = SimpleNamespace(bridge=plugin.bridge)
     plugin.session = _StubSession(batch_size)
-    plugin.pipeline = SimpleNamespace(execute=plugin.session.infer)
+    plugin._runtime_handle = ModelRuntimeHandle(plugin.session)
+    plugin._runtime_handle.load()
+    plugin.pipeline = plugin._runtime_handle
     plugin._requests = itertools.count(1)
     return plugin
 

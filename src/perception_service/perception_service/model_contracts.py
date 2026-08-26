@@ -1,10 +1,5 @@
 """Shared validation and identity helpers for perception model services."""
 
-import hashlib
-import json
-from dataclasses import asdict, dataclass
-from pathlib import Path
-
 import numpy as np
 
 MAX_MASK_BATCH = 8
@@ -13,31 +8,6 @@ MAX_DETECTIONS = 16
 MAX_POINT_CLOUD_POINTS = 1_000_000
 SUPPORTED_IMAGE_ENCODINGS = {"bgr8", "rgb8"}
 _POINT_FIELD_FLOAT32 = 7
-
-
-@dataclass(frozen=True)
-class ModelManifest:
-    model_name: str
-    model_version: str
-    weights_hash: str
-    config_hash: str
-    backend: str
-    runtime_version: str
-    preprocessing_hash: str
-    embedding_dim: int = 0
-    normalization: str = ""
-
-    def fingerprint(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_image_message(image) -> None:

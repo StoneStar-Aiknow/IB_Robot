@@ -28,10 +28,18 @@ import pytest
 from conftest import FakeAclModel, FakeAclRuntimeManager
 from sensor_msgs.msg import PointCloud2, PointField
 
-from inference_manifest import load_inference_manifest
-from inference_service.backends import RuntimeContext
+from inference_manifest import TorchRuntimeProfile, load_inference_manifest
+from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry, ResourceDomainAdmissions
+from inference_service.backends.types import RuntimeContext
 from inference_service.model_service_plugin import ModelServicePlugin
 from inference_service.model_sessions import TorchModelSession
+from inference_service.runtime_composition import RuntimeDependencies
+from inference_service.unified_runtime import (
+    RegistrySet,
+    RuntimeAssemblerRegistry,
+    RuntimeProviders,
+    SessionBuilderRegistry,
+)
 from perception_service.graspgen_adapter import GraspGenAdapter
 from perception_service.graspgen_session import GraspGenAscendSession
 from perception_service.model_service_plugins import GraspGenGenerateGraspsPlugin
@@ -41,21 +49,46 @@ GRASPGEN_DEPLOYMENT = "ascend_310p"
 
 
 @pytest.fixture
-def plugin(graspgen_bundle, fake_acl, monkeypatch):
-    """The real plugin over the real bundle, with only the ACL device replaced."""
-    monkeypatch.setattr(
-        GraspGenGenerateGraspsPlugin,
-        "_session_factory",
-        staticmethod(
-            lambda _family, adapter, validated, options: GraspGenAscendSession(
-                config=adapter.config,
-                runtime_manager=FakeAclRuntimeManager(),
-                model_factory=fake_acl,
-            )
-        ),
+def runtime_dependencies(fake_acl):
+    def build_fake_session(context, *, adapter, allowed_deployments, backend_registry, providers, **_kwargs):
+        backend_registry.validate(context, allowed_deployments=allowed_deployments)
+        return GraspGenAscendSession(
+            device_id=context.device_id if context.device_id is not None else 0,
+            config=adapter.config,
+            runtime_manager=providers.acl_runtime_provider,
+            model_factory=fake_acl,
+        )
+
+    backend_registry = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
+    session_registry = SessionBuilderRegistry()
+    session_registry.register(
+        "tensor_model",
+        "graspgen",
+        "generate_grasps",
+        "ascend",
+        build_fake_session,
     )
+    registry_set = RegistrySet(backend_registry, session_registry, RuntimeAssemblerRegistry()).freeze()
+    providers = RuntimeProviders.create(FakeAclRuntimeManager(), ResourceDomainAdmissions())
+    yield RuntimeDependencies(registry_set, providers)
+    providers.close()
+
+
+def _plugin(validated, options, dependencies):
+    return GraspGenGenerateGraspsPlugin(
+        SimpleNamespace(bridge=None),
+        validated,
+        options,
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
+
+
+@pytest.fixture
+def plugin(graspgen_bundle, runtime_dependencies):
+    """The real plugin over the real bundle, with only the ACL device replaced."""
     validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
-    instance = GraspGenGenerateGraspsPlugin(SimpleNamespace(bridge=None), validated, {"random_seed": 0})
+    instance = _plugin(validated, {"random_seed": 0}, runtime_dependencies)
     yield instance
     instance.close()
 
@@ -213,53 +246,61 @@ def test_a_cloud_that_is_not_a_point_cloud_is_refused_before_the_device(plugin):
         plugin.handle(SimpleNamespace(object_points=cloud, max_grasps=1, min_confidence=0.0), _response())
 
 
-def test_the_session_factory_rejects_an_unknown_graspgen_deployment_type(graspgen_bundle):
-    validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
-    torch_deployment = SimpleNamespace(backend="torch", device="cpu")
+def test_the_session_factory_rejects_a_non_cuda_torch_profile(graspgen_bundle, runtime_dependencies):
+    validated = load_inference_manifest(graspgen_bundle, "torch_cuda")
+    context = RuntimeContext(validated, runtime_profile=TorchRuntimeProfile(device="cpu"))
 
-    with pytest.raises(RuntimeError, match="requires a Torch CUDA or compiled Ascend deployment"):
+    with pytest.raises(RuntimeError, match="requires a typed cuda profile"):
         build_graspgen_session(
-            SimpleNamespace(
-                model=validated.manifest.model,
-                deployment=torch_deployment,
-                runtime_options={},
-            ),
+            context,
             adapter=GraspGenAdapter.from_bundle(graspgen_bundle),
+            providers=runtime_dependencies.providers,
         )
 
 
-def test_the_session_factory_accepts_a_seed_but_still_closes_the_option_set(graspgen_bundle):
+def test_the_session_factory_accepts_a_seed_but_still_closes_the_option_set(graspgen_bundle, runtime_dependencies):
     """Widening the allowed options for ``random_seed`` must not open the set."""
     validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
     adapter = GraspGenAdapter.from_bundle(graspgen_bundle)
 
     session = build_graspgen_session(
-        RuntimeContext(validated, runtime_options={"random_seed": 7, "device_id": 3}),
+        RuntimeContext(validated, runtime_options={"random_seed": 7, "device_id": 0}),
         adapter=adapter,
+        providers=runtime_dependencies.providers,
     )
     assert isinstance(session, GraspGenAscendSession)
 
-    with pytest.raises(ValueError, match=r"unknown Ascend runtime options: \['curvature_log_path'\]"):
-        build_graspgen_session(RuntimeContext(validated, runtime_options={"curvature_log_path": "x"}), adapter=adapter)
+    with pytest.raises(ValueError, match=r"unknown graspgen runtime options: \['curvature_log_path'\]"):
+        build_graspgen_session(
+            RuntimeContext(validated, runtime_options={"curvature_log_path": "x"}),
+            adapter=adapter,
+            providers=runtime_dependencies.providers,
+        )
 
 
-def test_the_session_factory_selects_torch_cuda_without_runtime_options(graspgen_bundle):
+def test_the_session_factory_selects_torch_cuda_without_runtime_options(graspgen_bundle, runtime_dependencies):
     validated = load_inference_manifest(graspgen_bundle, "torch_cuda")
     adapter = GraspGenAdapter.from_bundle(graspgen_bundle)
 
-    session = build_graspgen_session(RuntimeContext(validated), adapter=adapter)
+    session = build_graspgen_session(
+        RuntimeContext(validated), adapter=adapter, providers=runtime_dependencies.providers
+    )
 
     assert isinstance(session, TorchModelSession)
     with pytest.raises(ValueError, match="does not accept runtime options"):
-        build_graspgen_session(RuntimeContext(validated, runtime_options={"device_id": 0}), adapter=adapter)
+        build_graspgen_session(
+            RuntimeContext(validated, runtime_options={"device_id": 0}),
+            adapter=adapter,
+            providers=runtime_dependencies.providers,
+        )
 
 
-def test_the_plugin_refuses_a_raw_backend_selection(graspgen_bundle):
+def test_the_plugin_refuses_a_raw_backend_selection(graspgen_bundle, runtime_dependencies):
     """A named deployment is the only way in; raw backend/device never reaches the session."""
     validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
 
     with pytest.raises(ValueError, match="only a validated named deployment"):
-        GraspGenGenerateGraspsPlugin(SimpleNamespace(bridge=None), validated, {"backend": "ascend"})
+        _plugin(validated, {"backend": "ascend"}, runtime_dependencies)
 
 
 def test_closing_the_plugin_is_idempotent_and_releases_every_role(plugin, fake_acl):

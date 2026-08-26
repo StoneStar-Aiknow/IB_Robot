@@ -18,8 +18,8 @@ from inference_manifest import (
 )
 from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry
 from inference_service.backends.registry import _validate_ascend
-from inference_service.model_sessions import ModelSessionBuilderKey
 from inference_service.runtime_composition import build_model_service_runtime_dependencies
+from inference_service.unified_runtime import SessionBuilderKey
 from inference_service.unified_runtime.factory import RuntimeFactoryError, _canonical_target_runtime
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]
@@ -42,10 +42,10 @@ def test_production_session_builders_use_v3_keys() -> None:
         assert all(key.interface in {"policy", "tensor_model"} for key in keys)
         assert all(key.operation for key in keys)
         assert all(key.operation == "predict" for key in keys if key.interface == "policy")
-        assert ModelSessionBuilderKey("tensor_model", "zipvoice", "synthesize", "torch") in keys
-        assert ModelSessionBuilderKey("tensor_model", "fullsubnet", "enhance", "ascend") in keys
-        assert ModelSessionBuilderKey("tensor_model", "silero_vad", "vad", "ascend") in keys
-        assert ModelSessionBuilderKey("tensor_model", "graspgen", "generate_grasps", "ascend") in keys
+        assert SessionBuilderKey("tensor_model", "zipvoice", "synthesize", "torch") in keys
+        assert SessionBuilderKey("tensor_model", "fullsubnet", "enhance", "ascend") in keys
+        assert SessionBuilderKey("tensor_model", "silero_vad", "vad", "ascend") in keys
+        assert SessionBuilderKey("tensor_model", "graspgen", "generate_grasps", "ascend") in keys
         assert not any(key.interface in {"perception", "generic"} for key in keys)
     finally:
         dependencies.providers.close()

@@ -9,12 +9,10 @@ from contextlib import nullcontext, suppress
 from typing import Any
 
 from inference_manifest import TorchRuntimeProfile
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendError, BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
 class TorchModelSession(ModelSession):
@@ -25,7 +23,6 @@ class TorchModelSession(ModelSession):
         module_loader: Callable[[RuntimeContext], object],
         *,
         torch_loader: Callable[[], Any] | None = None,
-        domains: ResourceDomainAdmissions | None = None,
     ) -> None:
         if not callable(module_loader):
             raise TypeError("module_loader must be callable")
@@ -41,7 +38,6 @@ class TorchModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._module_loader = module_loader
         self._torch_loader = torch_loader or self._import_torch
@@ -54,7 +50,7 @@ class TorchModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(self._torch)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         profile = context.backend_profile
         if (
             context.backend != "torch"
@@ -105,7 +101,8 @@ class TorchModelSession(ModelSession):
             if evaluated is not None:
                 self._module = evaluated
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        del context
         module = self._module
         torch_module = self._torch
         if module is None or torch_module is None:

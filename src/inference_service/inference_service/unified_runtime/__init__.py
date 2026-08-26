@@ -5,6 +5,7 @@ registry, lifecycle, and execution APIs.
 """
 
 from .adapters import ModelResultAdapter, ResultAdapter, ResultAdapterProtocol, SuccessResultAdapter
+from .admission import NativeAdmission
 from .assembly import Closable, Loadable, OwnedComponent, RuntimeAssembly, RuntimeExecutor, RuntimeProviders
 from .contracts import (
     CancellationGranularity,
@@ -58,6 +59,7 @@ from .factory import (
     assemble_request_iterative,
 )
 from .handle import ModelRuntimeHandle
+from .loading import LoadRollback
 from .registry import (
     CompositeRoleCompatibility,
     CompositeRoleSelector,
@@ -66,7 +68,6 @@ from .registry import (
     CompositeRuntimeKey,
     CompositeRuntimeMatrixEntry,
     ModelRuntimeKey,
-    ModelSessionBuilderKey,
     RegistryFrozenError,
     RegistrySet,
     RoleBackendProfile,
@@ -107,9 +108,10 @@ __all__ = [
     "ModelRequest",
     "ModelResult",
     "ModelRuntimeKey",
-    "ModelSessionBuilderKey",
     "ModelResultAdapter",
     "ModelRuntimeHandle",
+    "NativeAdmission",
+    "LoadRollback",
     "ModelRuntimeFactory",
     "ModelRuntimeState",
     "OutcomeEvidence",

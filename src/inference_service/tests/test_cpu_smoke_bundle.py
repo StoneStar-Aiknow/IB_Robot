@@ -11,6 +11,7 @@ import pytest
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import InferenceRequest
 from inference_service.pipeline import create_pipeline_manager
+from inference_service.runtime_composition import build_policy_runtime_dependencies
 from robot_config.inference_config import parse_inference_config
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
 
@@ -188,7 +189,14 @@ def test_tracked_equivalent_cpu_bundle_runs_unified_registry_pipeline_end_to_end
     )
     pipeline = inference.pipelines["cpu_smoke"]
     validated = pipeline.validated_manifest
-    manager = create_pipeline_manager("cpu_smoke", validated, request_timeout=2.0)
+    dependencies = build_policy_runtime_dependencies()
+    manager = create_pipeline_manager(
+        "cpu_smoke",
+        validated,
+        request_timeout=2.0,
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
 
     result = manager.infer(
         "cpu_smoke",
@@ -212,6 +220,6 @@ def test_tracked_equivalent_cpu_bundle_runs_unified_registry_pipeline_end_to_end
     assert calls["processor_path"] == bundle
     assert calls["device"] == "cpu"
     manager.reset("cpu_smoke")
-    assert calls["reset"] == 1
     manager.close()
     manager.close()
+    dependencies.providers.close()

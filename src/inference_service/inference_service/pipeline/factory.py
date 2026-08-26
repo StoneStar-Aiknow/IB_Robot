@@ -80,7 +80,6 @@ def _new_lerobot_torch_session(
     return LeRobotTorchModelSession(
         context.device,
         priority_scheduling=context.priority_scheduling,
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
@@ -97,7 +96,6 @@ def _new_ascend_session(
         device_id=int(device_id),
         priority_scheduling=context.priority_scheduling,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
@@ -112,7 +110,6 @@ def _new_hmm_session(
         device_id = options.get("device_id", 0)
     return HMMModelSession(
         device_id=int(device_id),
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
@@ -123,9 +120,7 @@ def _new_rknn_session(
     providers: RuntimeProviders | None = None,
 ) -> RKNNModelSession:
     del context, options
-    return RKNNModelSession(
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
-    )
+    return RKNNModelSession()
 
 
 def _new_hisilicon_session(
@@ -135,9 +130,7 @@ def _new_hisilicon_session(
     providers: RuntimeProviders | None = None,
 ) -> HisiliconModelSession:
     del context, options
-    return HisiliconModelSession(
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
-    )
+    return HisiliconModelSession()
 
 
 def _create_policy_session(
@@ -165,7 +158,7 @@ def _create_policy_session(
         backend_registry=backend_registry,
         providers=providers,
         override=override,
-        builder_options={"options": options},
+        options=options,
     )
 
 
@@ -327,7 +320,7 @@ def create_inference_pipeline(
     preprocessor = None
     postprocessor = None
     codec = None
-    if isinstance(context.deployment, CompiledDeployment):
+    if isinstance(context.deployment, CompiledDeployment) and context.deployment.execution:
         preprocessor, postprocessor = create_lerobot_processor_views()
         codec = create_policy_codec(context.policy)
     handle = _build_session_handle(
@@ -453,7 +446,6 @@ def _build_session_handle(
             f"runtime assembler for {key!r} returned no private policy stage bridge",
             code="invalid_policy_assembly",
         )
-    assembly.claim_ownership()
     return policy_handle
 
 
