@@ -7,7 +7,6 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_manifest import INTERNAL_SEMANTIC_PREFIX, CompiledDeployment, TensorBinding
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.ascend.acl_runtime import (
     AclPriorityStreamPool,
     AclRuntimeLease,
@@ -20,15 +19,14 @@ from inference_service.backends.errors import (
     BackendLifecycleError,
     BackendLoadError,
 )
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import (
     BackendAdmissionEvidence,
     BackendCapabilities,
     BackendPriorityMapping,
     RuntimeContext,
 )
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
 class AscendOmModelSession(ModelSession):
@@ -47,7 +45,6 @@ class AscendOmModelSession(ModelSession):
         *,
         runtime_manager: AclRuntimeManager | None = None,
         model_factory=AclModel,
-        domains: ResourceDomainAdmissions | None = None,
         priority_scheduling: bool = False,
         diagnostic_capture=None,
     ) -> None:
@@ -77,7 +74,6 @@ class AscendOmModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._device_id = device_id
         self._priority_scheduling = priority_scheduling
@@ -93,7 +89,7 @@ class AscendOmModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(None if self._lease is None else self._lease.acl)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         if context.priority_scheduling != self._priority_scheduling:
             raise BackendLoadError(
                 "Ascend model-session priority mode differs from its runtime context",
@@ -197,12 +193,13 @@ class AscendOmModelSession(ModelSession):
                 input_overrides[int(consumer_binding.index)] = producer_buffer
             models[role].prepare_datasets(input_overrides=input_overrides)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
-            for semantic, output in self._run_role(role_index, role, values, request=request).items():
+            for semantic, output in self._run_role(role_index, role, values, request=request, context=context).items():
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     public_outputs[semantic] = output
         return public_outputs
@@ -219,7 +216,8 @@ class AscendOmModelSession(ModelSession):
         role: str,
         values: dict[str, object],
         *,
-        request: NamedTensorRequest | None = None,
+        request: ModelRequest | None = None,
+        context: ExecutionContext | None = None,
     ) -> dict[str, np.ndarray]:
         """Execute one manifest role and write its outputs back into ``values``.
 
@@ -233,7 +231,7 @@ class AscendOmModelSession(ModelSession):
             "read_outputs": self._role_read_indices(role_index, role),
         }
         if request is not None:
-            stream = self._request_stream(request)
+            stream = self._request_stream(request, context)
             if stream is not None:
                 execute_options["stream"] = stream
         role_inputs = self._role_inputs(role, values)
@@ -345,7 +343,8 @@ class AscendOmModelSession(ModelSession):
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
         deployment = self._loaded_deployment()
         try:
@@ -354,12 +353,14 @@ class AscendOmModelSession(ModelSession):
             raise BackendInferenceError(
                 f"unknown or unloaded Ascend role {role!r}", code="unknown_execution_role"
             ) from exc
-        return self._run_role(role_index, role, dict(inputs), request=request)
+        return self._run_role(role_index, role, dict(inputs), request=request, context=context)
 
-    def _request_stream(self, request: NamedTensorRequest) -> object | None:
+    def _request_stream(self, request: ModelRequest, context: ExecutionContext | None = None) -> object | None:
+        del context
         streams = self._priority_streams
         if streams is None:
-            if request.priority != 0:
+            priority = request.metadata.get("priority", 0)
+            if priority != 0:
                 raise BackendAdmissionError(
                     "non-zero Ascend priority requires scheduler-enabled priority streams",
                     code="hardware_priority_unavailable",
@@ -372,7 +373,7 @@ class AscendOmModelSession(ModelSession):
                 code="hardware_priority_unavailable",
             )
         try:
-            native_priority = mapping.map_generic(request.priority)
+            native_priority = mapping.map_generic(priority)
         except ValueError as exc:
             raise BackendAdmissionError(str(exc), code="unsupported_priority") from exc
         if not streams.supports(native_priority):
@@ -382,7 +383,8 @@ class AscendOmModelSession(ModelSession):
             )
         return streams.select(native_priority)
 
-    def _validate_request(self, request: NamedTensorRequest) -> None:
+    def _validate_request(self, request: ModelRequest, context: ExecutionContext) -> None:
+        del context
         self._request_stream(request)
 
     def _close(self) -> None:
@@ -466,5 +468,4 @@ def build_ascend_model_session(
         device_id=device_id,
         priority_scheduling=context.priority_scheduling,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )

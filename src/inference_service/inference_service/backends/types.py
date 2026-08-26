@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
 
 from inference_manifest import (
     BackendRuntimeProfile,
@@ -299,21 +297,6 @@ class InferenceRequest:
 
 
 @dataclass(frozen=True)
-class _LegacyBackendResult:
-    action: object
-    actual_chunk_size: int
-    backend_latency_ms: float
-    metadata: Mapping[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.actual_chunk_size < 1:
-            raise ValueError("actual_chunk_size must be at least one")
-        if not math.isfinite(self.backend_latency_ms) or self.backend_latency_ms < 0:
-            raise ValueError("backend_latency_ms must be finite and non-negative")
-        object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
-
-
-@dataclass(frozen=True)
 class BackendHealth:
     state: BackendState
     ready: bool
@@ -328,29 +311,6 @@ class BackendHealth:
             raise ValueError("backend readiness must match the READY state")
         if self.failure_count < 0:
             raise ValueError("failure_count cannot be negative")
-
-
-@runtime_checkable
-class _LegacyBackendProtocol(Protocol):
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def capabilities(self) -> BackendCapabilities: ...
-
-    def load(self, context: RuntimeContext) -> None: ...
-
-    def infer(self, request: InferenceRequest) -> _LegacyBackendResult: ...
-
-    def reset(self, deadline: datetime | None = None) -> None: ...
-
-    def cancel(self, request_id: str, deadline: datetime | None = None) -> None: ...
-
-    def health(self) -> BackendHealth: ...
-
-    def recover(self) -> None: ...
-
-    def close(self) -> None: ...
 
 
 __all__ = [

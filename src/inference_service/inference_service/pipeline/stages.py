@@ -201,20 +201,22 @@ class ModelStage:
             raise ValueError("model stage role must be non-empty")
 
     def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
-        from inference_service.generic_runtime import NamedTensorRequest
-
         model_request = frame.values.get("_model_request")
         request = model_request or frame.request
         frame.control.raise_if_canceled(f"model.{self.role}")
-        if not isinstance(request, NamedTensorRequest):
-            raise TypeError("ModelStage requires a NamedTensorRequest")
-        if frame.execution_frame is None:
-            from dataclasses import replace
+        from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
+        if not isinstance(request, ModelRequest):
+            raise TypeError("ModelStage requires a ModelRequest")
+        execution_context = frame.values.get("_execution_context")
+        if not isinstance(execution_context, ExecutionContext):
+            raise TypeError("ModelStage requires the native ExecutionContext")
+        if frame.execution_frame is None:
             inputs = request.inputs if model_request is not None else frame.values
-            result = self.session.infer(replace(request, inputs=inputs, deadline=deadline))
+            result = self.session.execute(ModelRequest(inputs, request.metadata), execution_context)
+            outputs = result.outputs if hasattr(result, "outputs") else result
             frame.values["_model_result"] = result
-            frame.values.update(result.outputs)
+            frame.values.update(outputs)
             return
         role_inputs = frame.execution_frame.begin_role(self.role)
         values = {**role_inputs, **frame.values}
@@ -228,21 +230,15 @@ class ModelStage:
             for semantic in host_semantics
             if semantic in values
         }
-        execution = frame.session_execution(self.session)
-        if execution is None:
-            execution = frame.open_session_execution(self.session, request, deadline)
-        if execution is None:
-            result = self.session.infer(
-                NamedTensorRequest(
-                    request.request_id,
-                    selected_values,
-                    deadline=deadline,
-                    priority=getattr(request, "priority", 0),
-                )
-            )
-            outputs = result.outputs
-        else:
-            outputs = execution.invoke(self.role, selected_values)
+        execute_role = getattr(self.session, "execute_role", None)
+        if not callable(execute_role):
+            raise TypeError(f"session {type(self.session).__name__} does not support role execution")
+        outputs = execute_role(
+            self.role,
+            selected_values,
+            ModelRequest(selected_values, request.metadata),
+            execution_context,
+        )
         frame.execution_frame.finish_role(self.role, outputs)
         frame.values.update(
             {semantic: value for semantic, value in outputs.items() if not semantic.startswith("internal.")}

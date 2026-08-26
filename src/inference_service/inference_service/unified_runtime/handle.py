@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .adapters import ResultAdapter
+from .admission import NativeAdmission
 from .assembly import OwnedComponent, RuntimeAssembly
 from .contracts import (
     Deadline,
@@ -321,6 +322,8 @@ class ModelRuntimeHandle:
             selected_integrity = source.artifact_integrity
             selected_version = source.runtime_version
             entries = source.component_entries()
+            provider = getattr(source.providers, "resource_admission_provider", None)
+            capabilities = source.session or source.capabilities or source.declared_capabilities
         else:
             if assembly is not None and executor is None and runtime_executor is None:
                 executor = assembly
@@ -399,6 +402,8 @@ class ModelRuntimeHandle:
             )
             self._assembly = generated_assembly
             entries = generated_assembly.component_entries()
+            provider = getattr(generated_assembly.providers, "resource_admission_provider", None)
+            capabilities = session or capabilities
 
         self._executor = selected_executor
         self._streaming_runtime = selected_streaming
@@ -433,6 +438,13 @@ class ModelRuntimeHandle:
         self._artifact_integrity = selected_integrity
         self._runtime_version = selected_version
         self._entries = tuple(entries)
+        self._admission = (
+            NativeAdmission(provider, str(getattr(capabilities, "name", self._runtime_id)), capabilities)
+            if provider is not None
+            and callable(getattr(provider, "register_instance", None))
+            and capabilities is not None
+            else None
+        )
 
         self._validate_configuration()
 
@@ -450,6 +462,7 @@ class ModelRuntimeHandle:
         self._active_executions = 0
         self._active_stream_steps = 0
         self._active_threads: dict[int, int] = {}
+        self._execution_contexts: dict[str, ExecutionContext] = {}
         self._loaded_entries: tuple[OwnedComponent, ...] = ()
         self._released_ids: set[int] = set()
         self._failure_count = 0
@@ -740,6 +753,7 @@ class ModelRuntimeHandle:
                 )
             self._active_executions += 1
             self._active_threads[threading.get_ident()] = self._active_threads.get(threading.get_ident(), 0) + 1
+            self._execution_contexts[context.request_id] = context
 
         started = False
         started_at = time.perf_counter()
@@ -747,7 +761,11 @@ class ModelRuntimeHandle:
             context.check("request")
             tracker.mark_started("backend", state_mutated=self._stateful, outcome_known=not self._stateful)
             started = True
-            frame = _call_executor(self._executor, request, context)
+            if self._admission is not None:
+                with self._admission.admit(context.deadline):
+                    frame = _call_executor(self._executor, request, context)
+            else:
+                frame = _call_executor(self._executor, request, context)
             if isinstance(frame, ExecutionFailure):
                 raise frame
             tracker.mark_completed("backend")
@@ -844,7 +862,26 @@ class ModelRuntimeHandle:
                     self._active_threads[thread_id] = count
                 else:
                     self._active_threads.pop(thread_id, None)
+                self._execution_contexts.pop(context.request_id, None)
                 self._condition.notify_all()
+
+    def cancel(self, request_id: str, *, deadline: Deadline | None = None) -> None:
+        """Cancel an active request through the shared native cancellation token."""
+
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("runtime cancellation requires a non-empty request_id")
+        with self._condition:
+            context = self._execution_contexts.get(request_id)
+            if context is None:
+                return
+            context.cancellation_token.cancel("runtime cancellation requested")
+        executor_cancel = getattr(self._executor, "cancel", None)
+        if not callable(executor_cancel):
+            return
+        try:
+            executor_cancel(request_id, deadline=deadline.deadline_at if deadline is not None else None)
+        except TypeError:
+            executor_cancel(request_id)
 
     def _apply_uncertain_request_failure(self, failure: ExecutionFailure, started: bool) -> None:
         evidence = failure.evidence
@@ -1055,6 +1092,9 @@ class ModelRuntimeHandle:
                     errors.append(exc)
             entries_to_release = self._loaded_entries or (self._entries if release_unloaded else ())
             errors.extend(self._release_entries(tuple(reversed(entries_to_release))))
+            if self._admission is not None:
+                with suppress(BaseException):
+                    self._admission.close()
             with self._condition:
                 self._loaded_entries = ()
                 self._admission_open = False

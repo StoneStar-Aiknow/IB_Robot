@@ -9,8 +9,8 @@ pipeline ID，并支持单体和边云分布式执行。
 
 非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。公共本地执行通过
 `ModelRequest`、`ExecutionContext`、`ModelRuntimeFactory` 和 `ModelRuntimeHandle` 进入，成功结果统一为
-`ModelResult`；`NamedTensorRequest` 只作为尚未完成迁移的 session 内部适配值保留。
-生命周期、准入、健康状态、deployment fingerprint 与资源回收由 handle 负责。
+`ModelResult`。所有模型资源都实现 native runtime executor 接口，不再存在 named-tensor session 兼容层。
+生命周期、准入、deadline、取消、健康状态、deployment fingerprint 与资源回收全部由 handle 负责。
 模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
 
 manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。常规 loader
@@ -489,23 +489,23 @@ Canonical backend 只有以下五个：
 | `hmm` | Houmo TCIM 执行 HMM 多模块 artifact |
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
-`AscendOmModelSession` 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
-tensor 复制回主机；设备生命周期、buffer ownership 和串行准入仍由 shared runtime 统一管理。
+Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
+tensor 复制回主机；设备生命周期、buffer ownership 和串行准入由 `ModelRuntimeHandle` 统一管理。
 
-编译 PI0.5 与 SmolVLA 不再由旧 backend 类持有 family 循环。它们通过
-`GenericModelPipeline -> SequentialModelExecutor -> InferenceStage -> ModelSession` 执行；对应
-`AscendBackend`、`HMMBackend` 和 `RKNNBackend` 对已迁移 family fail-closed。以下矩阵在启动时
+编译 PI0.5 与 SmolVLA 不再由 backend 类持有 family 循环。它们通过
+`ModelRuntimeFactory -> RuntimeAssembly -> ModelRuntimeHandle` 执行；各后端 native runtime 只负责
+vendor artifact 加载与模型执行。以下矩阵在启动时
 强制校验，不在表中的组合会被拒绝：
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
 | ACT | Backend | Backend | Backend | Backend | 不支持 |
 | Diffusion Policy | Backend | 不支持 | 不支持 | 不支持 | 不支持 |
-| PI0.5 | Backend | ModelSession | 不支持 | 不支持 | ModelSession |
-| SmolVLA | Backend | 不支持 | 不支持 | ModelSession | ModelSession |
+| PI0.5 | Runtime | Runtime | 不支持 | 不支持 | Runtime |
+| SmolVLA | Runtime | 不支持 | 不支持 | Runtime | Runtime |
 
-`Backend` 表示直接调用 `*Backend.infer()`；`ModelSession` 表示共享 family executor 按 role 调用
-`*ModelSession`。感知 family 的 registry 支持矩阵如下：
+`Runtime` 表示通过统一 `ModelRequest/ExecutionContext` 执行，并由 handle 负责生命周期、准入和恢复。
+感知 family 的 registry 支持矩阵如下：
 
 | Perception family | `torch` | `ascend` |
 | --- | --- | --- |
@@ -663,7 +663,7 @@ pytest -q src/inference_service/tests
 
 `model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v3
 bundle, one named deployment, and one `ModelServicePlugin`; the plugin owns domain request/response mapping while the
-shared `ModelSession` owns admission, health, accelerator lifetime, and cleanup.
+`ModelRuntimeHandle` owns admission, health, accelerator lifetime, recovery, and cleanup.
 
 `robot_config` launches the same host for RAM++, SigLIP2, GraspGen, and ZipVoice TTS. Model packages provide plugins;
 they must not implement parallel ROS nodes or duplicate `ModelRuntimeInfo` projection.

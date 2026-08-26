@@ -7,13 +7,8 @@ import json
 
 from inference_manifest import TorchRuntimeProfile
 from inference_service.backends import RuntimeContext
-from inference_service.model_sessions import (
-    AscendOmModelSession,
-    ModelSession,
-    ModelSessionBuilderRegistry,
-    TorchModelSession,
-)
-from inference_service.unified_runtime import RuntimeDependencyError, RuntimeProviders
+from inference_service.model_sessions import AscendOmModelSession, TorchModelSession
+from inference_service.unified_runtime import RuntimeDependencyError, RuntimeProviders, SessionBuilderRegistry
 
 from .graspgen_session import GraspGenAscendSession
 from .sam2_automatic_ascend_session import SAM2AutomaticAscendSession
@@ -54,18 +49,17 @@ def build_perception_session(
     *,
     adapter,
     providers: RuntimeProviders | None = None,
-) -> ModelSession:
+):
     model_type = context.model_type
     options = context.runtime_options
     if context.backend == "ascend":
         device_id = _ascend_device_id(model_type, adapter, context, options, {"device_id"})
         runtime_manager = getattr(providers, "acl_runtime_provider", None) if providers is not None else None
-        domains = getattr(providers, "resource_admission_provider", None) if providers is not None else None
         if model_type == "siglip2":
-            return SigLIP2AscendSession(device_id=device_id, runtime_manager=runtime_manager, domains=domains)
+            return SigLIP2AscendSession(device_id=device_id, runtime_manager=runtime_manager)
         if model_type == "sam2" and adapter.identity.operation == "automatic":
-            return SAM2AutomaticAscendSession(device_id=device_id, runtime_manager=runtime_manager, domains=domains)
-        return AscendOmModelSession(device_id=device_id, runtime_manager=runtime_manager, domains=domains)
+            return SAM2AutomaticAscendSession(device_id=device_id, runtime_manager=runtime_manager)
+        return AscendOmModelSession(device_id=device_id, runtime_manager=runtime_manager)
     if context.backend == "torch":
         if options:
             raise ValueError(
@@ -76,7 +70,6 @@ def build_perception_session(
             raise RuntimeError("generic Torch perception sessions support only typed cpu/cuda profiles")
         return TorchModelSession(
             lambda runtime_context: _load_torch_module(model_type, runtime_context),
-            domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
         )
     raise RuntimeError(f"{model_type} deployment backend {context.backend!r} is unsupported")
 
@@ -86,7 +79,7 @@ def build_graspgen_session(
     *,
     adapter,
     providers: RuntimeProviders | None = None,
-) -> ModelSession:
+):
     """Build a Torch CUDA or host-orchestrated Ascend GraspGen session."""
 
     model_type = context.model_type
@@ -99,7 +92,6 @@ def build_graspgen_session(
             raise RuntimeError("GraspGen Torch requires a typed cuda profile")
         return TorchModelSession(
             lambda runtime_context: _load_torch_module(model_type, runtime_context),
-            domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
         )
     if context.backend != "ascend":
         raise RuntimeError(f"{model_type} requires a Torch CUDA or ACL deployment")
@@ -114,11 +106,10 @@ def build_graspgen_session(
         device_id=device_id,
         config=adapter.config,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
-        domains=(getattr(providers, "resource_admission_provider", None) if providers is not None else None),
     )
 
 
-def register_perception_session_builders(registry: ModelSessionBuilderRegistry | None = None) -> None:
+def register_perception_session_builders(registry: SessionBuilderRegistry | None = None) -> None:
     if registry is None:
         raise RuntimeDependencyError(
             "register_perception_session_builders requires an explicit session registry",

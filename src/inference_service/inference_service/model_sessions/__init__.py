@@ -2,15 +2,10 @@
 
 from inference_service.model_sessions.ascend import AscendOmModelSession, build_ascend_model_session
 from inference_service.model_sessions.ascend_stateful import StatefulAscendOmModelSession
-from inference_service.model_sessions.base import ModelSession, ModelSessionExecution
+from inference_service.model_sessions.base import ModelSession
 from inference_service.model_sessions.hisilicon import HisiliconModelSession
 from inference_service.model_sessions.hmm import HMMModelSession
 from inference_service.model_sessions.lerobot_torch import LeRobotTorchModelSession
-from inference_service.model_sessions.registry import (
-    ModelSessionBuilder,
-    ModelSessionBuilderKey,
-    ModelSessionBuilderRegistry,
-)
 from inference_service.model_sessions.rknn import RKNNModelSession
 from inference_service.model_sessions.torch import TorchModelSession
 
@@ -20,10 +15,6 @@ __all__ = [
     "HisiliconModelSession",
     "LeRobotTorchModelSession",
     "ModelSession",
-    "ModelSessionBuilder",
-    "ModelSessionBuilderKey",
-    "ModelSessionBuilderRegistry",
-    "ModelSessionExecution",
     "RKNNModelSession",
     "StatefulAscendOmModelSession",
     "TorchModelSession",

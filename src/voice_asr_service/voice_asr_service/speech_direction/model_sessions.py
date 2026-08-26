@@ -8,8 +8,8 @@ from contextlib import contextmanager, suppress
 import numpy as np
 
 from inference_service.backends import RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import ModelSession
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
 
 class SpeechDirectionRoleRunner:
@@ -21,38 +21,32 @@ class SpeechDirectionRoleRunner:
         self.backend = "ascend"
         self._owns_session = bool(owns_session)
         self._request_counter = 0
-        self._execution = None
+        self._execution_context: ExecutionContext | None = None
 
     @property
     def last_timing_ms(self) -> dict[str, float]:
         return {}
 
     def _invoke(self, role: str, values: Mapping[str, object]) -> Mapping[str, object]:
-        if self._execution is not None:
-            return self._execution.invoke(role, values)
+        if self._execution_context is not None:
+            request = ModelRequest(values, {"role": role})
+            return self.session.execute_role(role, values, request, self._execution_context)
         self._request_counter += 1
-        request = NamedTensorRequest(
-            f"speech-direction-{self._request_counter}",
-            {"observation.audio_4ch": np.zeros((1, 4), dtype=np.float32)},
-        )
-        return self.session.execute_role(role, values, request)
+        context = ExecutionContext(f"speech-direction-{self._request_counter}")
+        request = ModelRequest(values, {"role": role})
+        return self.session.execute_role(role, values, request, context)
 
     @contextmanager
     def execution_scope(self):
         """Keep FB, Host feature assembly, and SB in one admitted request."""
-        if self._execution is not None:
+        if self._execution_context is not None:
             raise RuntimeError("speech direction execution scope is already active")
         self._request_counter += 1
-        request = NamedTensorRequest(
-            f"speech-direction-{self._request_counter}",
-            {"observation.audio_4ch": np.zeros((1, 4), dtype=np.float32)},
-        )
-        with self.session.execution(request) as execution:
-            self._execution = execution
-            try:
-                yield
-            finally:
-                self._execution = None
+        self._execution_context = ExecutionContext(f"speech-direction-{self._request_counter}")
+        try:
+            yield
+        finally:
+            self._execution_context = None
 
     def infer_named(self, values: Mapping[str, object]) -> Mapping[str, object]:
         return self._invoke("silero_vad", values)
@@ -75,7 +69,7 @@ class SpeechDirectionRoleRunner:
         self.reset()
 
     def reset(self) -> None:
-        self.session.reset()
+        self.session.reset(ExecutionContext(f"speech-direction-reset-{self._request_counter}"))
 
     def close(self) -> None:
         # Production Sessions are owned by ModelRuntimeHandle.  Keeping this

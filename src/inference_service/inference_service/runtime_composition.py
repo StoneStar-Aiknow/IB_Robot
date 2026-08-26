@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry
 from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
-from inference_service.model_sessions.registry import ModelSessionBuilderRegistry
 from inference_service.unified_runtime import (
     RegistrySet,
     RuntimeAssemblerRegistry,
     RuntimeDependencyError,
     RuntimeProviders,
+    SessionBuilderRegistry,
 )
 
 
@@ -57,7 +57,7 @@ def require_runtime_dependencies(
 
 
 def build_runtime_dependencies(
-    register_builtins: Callable[[ModelSessionBuilderRegistry, RuntimeAssemblerRegistry], None] | None = None,
+    register_builtins: Callable[[SessionBuilderRegistry, RuntimeAssemblerRegistry], None] | None = None,
     *,
     backend_registry: BackendRegistry | None = None,
     providers: RuntimeProviders | None = None,
@@ -75,7 +75,7 @@ def build_runtime_dependencies(
     if callable(validate_static_registry):
         validate_static_registry()
 
-    session_registry = ModelSessionBuilderRegistry()
+    session_registry = SessionBuilderRegistry()
     assembler_registry = RuntimeAssemblerRegistry()
 
     if register_builtins is not None:
@@ -103,7 +103,7 @@ def build_runtime_dependencies(
 def build_policy_runtime_dependencies(**kwargs: object) -> RuntimeDependencies:
     """Build an isolated composition containing the policy compatibility builders."""
 
-    def register(session_registry: ModelSessionBuilderRegistry, assembler_registry: RuntimeAssemblerRegistry) -> None:
+    def register(session_registry: SessionBuilderRegistry, assembler_registry: RuntimeAssemblerRegistry) -> None:
         from inference_service.pipeline.factory import register_policy_session_builders
 
         register_policy_session_builders(session_registry, assembler_registry)
@@ -114,7 +114,7 @@ def build_policy_runtime_dependencies(**kwargs: object) -> RuntimeDependencies:
 def build_model_service_runtime_dependencies(**kwargs: object) -> RuntimeDependencies:
     """Build the explicit composition used by generic model-service plugins."""
 
-    def register(session_registry: ModelSessionBuilderRegistry, assembler_registry: RuntimeAssemblerRegistry) -> None:
+    def register(session_registry: SessionBuilderRegistry, assembler_registry: RuntimeAssemblerRegistry) -> None:
         from inference_service.pipeline.factory import register_policy_session_builders
 
         register_policy_session_builders(session_registry, assembler_registry)

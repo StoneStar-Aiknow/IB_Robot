@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from inference_service.model_sessions import (
-    ModelSessionBuilderKey,
-    build_ascend_model_session,
-)
-from inference_service.unified_runtime import RuntimeDependencyError
+from inference_service.model_sessions import build_ascend_model_session
+from inference_service.unified_runtime import RuntimeDependencyError, SessionBuilderKey
 
 SPEECH_DIRECTION_IDENTITY = ("tensor_model", "speech_direction", "enhance_and_vad")
 SPEECH_DIRECTION_ROLE_IDENTITIES = (
@@ -22,7 +19,7 @@ def register_speech_direction_session_builder(registry=None) -> None:
             code="session_builder_registry_required",
         )
     for model_type, operation in SPEECH_DIRECTION_ROLE_IDENTITIES:
-        key = ModelSessionBuilderKey("tensor_model", model_type, operation, "ascend")
+        key = SessionBuilderKey("tensor_model", model_type, operation, "ascend")
         if registry.get(key) is None:
             registry.register(key, build_ascend_model_session)
 

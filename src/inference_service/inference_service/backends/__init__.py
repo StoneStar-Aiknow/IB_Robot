@@ -1,6 +1,6 @@
 """Common lifecycle contracts and lazy registry for inference backends."""
 
-from inference_service.backends.admission import BackendAdmission, ResourceDomainAdmissions
+from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import (
     BackendAdmissionError,
     BackendCancellationError,
@@ -13,7 +13,6 @@ from inference_service.backends.errors import (
     BackendNotReadyError,
     BackendRegistryError,
 )
-from inference_service.backends.lifecycle import LifecycleBackend, PartialLoadRollback
 from inference_service.backends.registry import (
     CANONICAL_BACKENDS,
     MODEL_TYPE_OPERATIONS,
@@ -41,7 +40,6 @@ __all__ = [
     "PERCEPTION_FAMILIES",
     "STATIC_BACKEND_DESCRIPTORS",
     "VALID_INTERFACES",
-    "BackendAdmission",
     "BackendAdmissionError",
     "BackendAdmissionEvidence",
     "BackendCapabilities",
@@ -60,8 +58,6 @@ __all__ = [
     "BackendRegistryError",
     "BackendState",
     "InferenceRequest",
-    "LifecycleBackend",
-    "PartialLoadRollback",
     "ResourceDomainAdmissions",
     "RuntimeContext",
 ]

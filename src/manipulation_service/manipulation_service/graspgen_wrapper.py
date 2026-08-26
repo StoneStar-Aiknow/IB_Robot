@@ -264,8 +264,8 @@ class LocalPipelineBackend:
         max_tries: int = 4,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         self._ensure_loaded()
+        from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
         from inference_service.unified_runtime import ExecutionContext, ModelRequest
-        from model_utils.graspgen_contract import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
 
         points = np.asarray(object_pc, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:

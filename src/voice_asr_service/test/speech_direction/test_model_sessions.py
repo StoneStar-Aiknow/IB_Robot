@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -39,18 +38,14 @@ class _Execution:
 
 class _Session:
     def __init__(self) -> None:
-        self.execution_calls = 0
         self.execute_role_calls = []
-        self.last_execution = None
 
-    @contextmanager
-    def execution(self, request):
-        self.execution_calls += 1
-        self.last_execution = _Execution()
-        yield self.last_execution
-
-    def execute_role(self, role, values, request):
-        self.execute_role_calls.append((role, values, request))
+    def execute_role(self, role, values, request, context):
+        self.execute_role_calls.append((role, values, request, context))
+        if role == "fullsubnet_fb":
+            return {"host.fullsubnet.fb_features": np.zeros((4, 2, 257), dtype=np.float32)}
+        if role == "fullsubnet_sb":
+            return {"host.fullsubnet.sb_mask": np.zeros((1028, 2, 2), dtype=np.float32)}
         return {"host.silero.prob": np.array([[0.75]], dtype=np.float32)}
 
 
@@ -102,9 +97,8 @@ def test_fullsubnet_roles_share_one_session_execution_scope() -> None:
 
     assert fb.shape == (4, 2, 257)
     assert sb.shape == (1028, 2, 2)
-    assert session.execution_calls == 1
-    assert [call[0] for call in session.last_execution.calls] == ["fullsubnet_fb", "fullsubnet_sb"]
-    assert session.execute_role_calls == []
+    assert [call[0] for call in session.execute_role_calls] == ["fullsubnet_fb", "fullsubnet_sb"]
+    assert len({id(call[3]) for call in session.execute_role_calls}) == 1
 
 
 def test_role_runner_rejects_nested_execution_scopes() -> None:
@@ -121,7 +115,6 @@ def test_silero_inference_uses_standalone_session_execution() -> None:
     probability = runner.infer(np.zeros((1, 576), dtype=np.float32))
 
     assert probability == pytest.approx(0.75)
-    assert session.execution_calls == 0
     assert [call[0] for call in session.execute_role_calls] == ["silero_vad"]
 
 

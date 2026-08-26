@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ModelRequest
 from voice_tts_service.audio_utils import float_pcm_to_wav
 from voice_tts_service.errors import TTSError
 from voice_tts_service.prompt_audio import PromptAudio, decode_prompt
@@ -60,7 +60,7 @@ class TTSServiceCore:
 
     def __init__(
         self,
-        infer: Callable[[NamedTensorRequest], object] | None,
+        infer: Callable[[ModelRequest], object] | None,
         limits: TTSLimits,
         *,
         sample_rate: int = 24000,
@@ -163,18 +163,20 @@ class TTSServiceCore:
         prompt: PromptAudio | None,
         prompt_text: str,
         segment_index: int,
-    ) -> NamedTensorRequest:
+    ) -> ModelRequest:
         prompt_samples = () if prompt is None else prompt.samples
         prompt_rate = 0 if prompt is None else prompt.sample_rate
-        return NamedTensorRequest(
-            request_id=f"voice-tts-{segment_index}-{time.monotonic_ns()}",
+        return ModelRequest(
             inputs={
                 "tts.text": np.frombuffer(text.encode("utf-8"), dtype=np.uint8),
                 "tts.prompt_audio": np.asarray(prompt_samples, dtype=np.float32),
                 "tts.prompt_sample_rate": np.asarray(prompt_rate, dtype=np.int64),
                 "tts.prompt_text": np.frombuffer(prompt_text.encode("utf-8"), dtype=np.uint8),
             },
-            metadata={"service_type": "ibrobot_msgs/srv/SynthesizeSpeech"},
+            metadata={
+                "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
+                "request_id": f"voice-tts-{segment_index}-{time.monotonic_ns()}",
+            },
         )
 
 

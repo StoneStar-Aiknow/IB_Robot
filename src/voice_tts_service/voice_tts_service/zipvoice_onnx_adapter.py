@@ -20,9 +20,8 @@ from inference_manifest import TorchDeployment
 from inference_service.backends import BackendCapabilities, RuntimeContext
 from inference_service.backends.errors import BackendInferenceError as SessionInferenceError
 from inference_service.backends.errors import BackendLoadError as SessionLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 from voice_tts_service.errors import BackendLoadError
 from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
 
@@ -42,7 +41,6 @@ class ZipVoiceOnnxSession(ModelSession):
                 supports_cancellation=False,
                 thread_safe=False,
             ),
-            domains=kwargs.pop("domains", None),
         )
         self._root: Path | None = None
         self._prompt_profile_name = prompt_profile
@@ -78,7 +76,7 @@ class ZipVoiceOnnxSession(ModelSession):
             raise BackendLoadError(f"ZipVoice asset is unavailable: {path}")
         return path
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
         if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
@@ -158,7 +156,8 @@ class ZipVoiceOnnxSession(ModelSession):
         self._torch = torch
         self._vocos = vocos.eval()
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         if any(
             value is None
             for value in (self._tokenizer, self._prompt, self._torch, self._vocos, self._text_encoder, self._fm_decoder)

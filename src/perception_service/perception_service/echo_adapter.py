@@ -7,19 +7,19 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_service.backends import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import ModelSession
-from inference_service.pipeline import (
-    ExecutionError,
-    GenericModelPipeline,
-    ModelStage,
-    PreprocessStage,
-    SequentialModelExecutor,
-    StageFrame,
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionContract,
+    LoadRollback,
+    ModelRequest,
+    ModelResult,
+    ModelRuntimeHandle,
+    RegistrySet,
+    RuntimeAssembly,
+    RuntimeProviders,
 )
-from inference_service.unified_runtime import ModelResult, RegistrySet, RuntimeProviders
 
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
@@ -50,7 +50,7 @@ class EchoAdapter(PerceptionAdapter):
 
 
 class _EchoSession(ModelSession):
-    def __init__(self, domains) -> None:
+    def __init__(self) -> None:
         super().__init__(
             "model-session:dummy-echo",
             BackendCapabilities(
@@ -63,10 +63,9 @@ class _EchoSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         del rollback
         if (context.interface, context.model_type, context.operation) != (
             "tensor_model",
@@ -75,7 +74,8 @@ class _EchoSession(ModelSession):
         ):
             raise ValueError("dummy echo requires tensor_model/dummy_echo/echo")
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         return {"echo.output": np.asarray(request.inputs["echo.input"], dtype=np.float32).copy()}
 
     def _close(self) -> None:
@@ -102,65 +102,48 @@ class EchoServicePlugin(ModelServicePlugin):
         if options:
             raise ValueError(f"dummy echo does not accept runtime options: {sorted(options)}")
         self.adapter = EchoAdapter()
+        self.validated = validated
         self.adapter.validate_deployment(validated.deployment_name)
-        self.session = _EchoSession(providers.resource_admission_provider)
+        self.session = _EchoSession()
         context = RuntimeContext(validated, runtime_profile=validated.runtime_profile)
-
-        class _EchoResultAdapter:
-            def adapt(_self, frame: StageFrame) -> list[float]:
-                result = frame.values["_model_result"]
-                if not isinstance(result, ModelResult):
-                    raise TypeError("dummy echo model stage did not return a ModelResult")
-                return self.adapter.postprocess(result)
-
-            def adapt_error(_self, error: ExecutionError) -> object:
-                if error.cause is not None:
-                    raise error.cause
-                raise RuntimeError(error.message)
-
-        def preprocess(values):
-            result = self.adapter.preprocess(values["value"])
-            values.clear()
-            return result
-
-        executor = SequentialModelExecutor(
-            (
-                PreprocessStage(preprocess),
-                ModelStage("model", self.session),
-            ),
-            _EchoResultAdapter(),
-            components=(self.session,),
-        )
-        self.pipeline = GenericModelPipeline("dummy-echo", context, executor)
-        self.pipeline.load()
-
-    def handle(self, request, response) -> str:
-        response.value = self.pipeline.execute(
-            NamedTensorRequest(
-                request_id=str(request.request_id),
-                inputs={"value": request.value},
+        self._runtime_handle = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=self.session,
+                session=self.session,
+                execution_contract=ExecutionContract(),
+                runtime_id="dummy-echo",
+                load_context=context,
             )
         )
+        self._runtime_handle.load(context)
+
+    def handle(self, request, response) -> str:
+        model_inputs = self.adapter.preprocess(request.value)
+        result = self._runtime_handle.execute(
+            ModelRequest(model_inputs, metadata={"service_type": self.service_type}),
+            ExecutionContext(str(request.request_id)),
+        )
+        response.value = self.adapter.postprocess(result)
         return "echoed 2 values"
 
     def runtime_status(self) -> PluginRuntimeStatus:
-        diagnostics = self.pipeline.diagnostics()
+        diagnostics = self._runtime_handle.diagnostics()
         return PluginRuntimeStatus(
             state=diagnostics.state.value,
-            ready=diagnostics.ready,
-            failure_reason=diagnostics.executor_health.message or "",
+            ready=diagnostics.health.ready,
+            failure_reason=diagnostics.health.message or "",
             metadata={
                 "runtime_version": "dummy-echo-v1",
-                "pipeline_id": diagnostics.pipeline_id,
-                "bundle": diagnostics.deployment.bundle,
-                "deployment": diagnostics.deployment.deployment,
-                "backend": diagnostics.deployment.backend,
-                "deployment_fingerprint": diagnostics.deployment.deployment_fingerprint,
+                "pipeline_id": "dummy-echo",
+                "bundle": self.validated.manifest.bundle.name,
+                "deployment": self.validated.deployment_name,
+                "backend": self.validated.deployment.backend,
+                "deployment_fingerprint": self.validated.deployment_fingerprint,
             },
         )
 
     def close(self) -> None:
-        self.pipeline.close()
+        self._runtime_handle.close()
 
 
 __all__ = ["EchoAdapter", "EchoServicePlugin"]

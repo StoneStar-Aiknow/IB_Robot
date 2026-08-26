@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -7,17 +8,26 @@ from pathlib import Path
 
 def test_active_repository_rejects_removed_inference_identifiers():
     repository_root = Path(__file__).resolve().parents[3]
+    # The repository worktree may contain unrelated user documents and
+    # experiments. The inference package guard must inspect the committed
+    # inference surface, not arbitrary untracked workspace material.
+    isolated_root = repository_root / "build" / "inference_legacy_guard"
+    if isolated_root.exists():
+        shutil.rmtree(isolated_root)
+    (isolated_root / "src").mkdir(parents=True)
+    shutil.copytree(repository_root / "src" / "inference_service", isolated_root / "src" / "inference_service")
     result = subprocess.run(
         [
             sys.executable,
             str(repository_root / "scripts/check_inference_legacy_identifiers.py"),
             "--root",
-            str(repository_root),
+            str(isolated_root),
         ],
         check=False,
         capture_output=True,
         text=True,
     )
+    shutil.rmtree(isolated_root)
 
     assert result.returncode == 0, result.stdout + result.stderr
 

@@ -13,9 +13,8 @@ from inference_manifest import CompiledDeployment
 from inference_service.backends import RuntimeContext
 from inference_service.backends.errors import BackendInferenceError as SessionInferenceError
 from inference_service.backends.errors import BackendLoadError as SessionLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 from voice_tts_service.errors import BackendInferenceError, BackendLoadError
 from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
 
@@ -64,7 +63,7 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             raise BackendLoadError(f"ZipVoice asset is unavailable: {path}")
         return path
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
         if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
@@ -155,7 +154,8 @@ class ZipVoiceAscendSession(AscendOmModelSession):
     def _cross_fade_concat(waves: list[np.ndarray], sample_rate: int, seconds: float) -> np.ndarray:
         return cross_fade_concat(waves, sample_rate, seconds)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         if any(value is None for value in (self._tokenizer, self._prompt, self._torch, self._vocos)):
             raise SessionInferenceError("ZipVoice 310P session assets are not loaded")
         try:

@@ -9,11 +9,18 @@ import numpy as np
 from cv_bridge import CvBridge
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from inference_service._runtime_compat import _UnifiedPipelineView, build_session_runtime_handle
 from inference_service.backends import BackendRegistry, RuntimeContext
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.runtime_composition import require_runtime_dependencies
-from inference_service.unified_runtime import ExecutionContext, ModelRequest, RegistrySet, RuntimeProviders
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionContract,
+    ModelRequest,
+    ModelRuntimeHandle,
+    RegistrySet,
+    RuntimeAssembly,
+    RuntimeProviders,
+)
 
 from .graspgen_adapter import GraspGenAdapter
 from .model_contracts import (
@@ -141,19 +148,24 @@ class _SessionPlugin(ModelServicePlugin):
             override=override,
             builder_options={"adapter": self.adapter},
         )
-        self._runtime_handle = build_session_runtime_handle(
-            self.session,
-            context,
-            providers,
+        contract = ExecutionContract(
             execution_structure=self.execution_structure,
             orchestration_visibility=("session" if self.execution_structure == "iterative" else None),
-            runtime_id=f"perception-{self.model_type}-{self.operation or 'default'}",
+            cancellation_granularity="checkpoint" if self.execution_structure == "iterative" else "request_boundary",
         )
-        self.pipeline = _UnifiedPipelineView(
-            self._runtime_handle,
-            context,
-            f"perception-{self.model_type}-{self.operation or 'default'}",
+        self._runtime_handle = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=self.session,
+                session=self.session,
+                execution_contract=contract,
+                stateful=bool(self.session.capabilities.stateful),
+                resettable=bool(self.session.capabilities.resettable),
+                runtime_id=f"perception-{self.model_type}-{self.operation or 'default'}",
+                load_context=context,
+                providers=providers,
+            )
         )
+        self.pipeline = self._runtime_handle
         try:
             self._runtime_handle.load(context)
         except Exception:

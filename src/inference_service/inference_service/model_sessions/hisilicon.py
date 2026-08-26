@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from inference_manifest import CompiledDeployment, TensorBinding
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.hisilicon.sd3403_protocol import (
     DEFAULT_GRACEFUL_CLOSE_TIMEOUT,
@@ -18,10 +17,9 @@ from inference_service.backends.hisilicon.sd3403_protocol import (
     SD3403WorkerError,
     SD3403WorkerExitedError,
 )
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 LOGGER = logging.getLogger(__name__)
 _ALLOWED_RUNTIME_OPTIONS = frozenset({"perf_enabled", "perf_log_every", "graceful_close_timeout", "force_close"})
@@ -68,7 +66,6 @@ class HisiliconModelSession(ModelSession):
         self,
         *,
         protocol_factory: ProtocolFactory = SD3403Protocol,
-        domains: ResourceDomainAdmissions | None = None,
     ) -> None:
         super().__init__(
             "model-session:hisilicon",
@@ -84,7 +81,6 @@ class HisiliconModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._protocol_factory = protocol_factory
         self._protocol: SD3403Protocol | None = None
@@ -100,7 +96,7 @@ class HisiliconModelSession(ModelSession):
             return {}
         return dict(self._last_metadata)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or context.backend != "hisilicon":
             raise BackendLoadError(
@@ -164,15 +160,17 @@ class HisiliconModelSession(ModelSession):
         self._action_binding = action_bindings[0]
         self._options = options
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
-        return self._execute_role("policy", request.inputs, request)
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        return self._execute_role("policy", request.inputs, request, context)
 
     def _execute_role(
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
+        context.check(f"model.{role}")
         protocol = self._protocol
         action_binding = self._action_binding
         if protocol is None or action_binding is None:
@@ -206,14 +204,14 @@ class HisiliconModelSession(ModelSession):
         if bool(self._options["perf_enabled"]) and self._inference_count % int(self._options["perf_log_every"]) == 0:
             LOGGER.info(
                 "Hisilicon inference request_id=%s worker_request_id=%s e2e_ms=%.3f worker_ms=%.3f",
-                request.request_id,
+                context.request_id,
                 response.request_id,
                 latency_ms,
                 response.worker_latency_us / 1000.0,
             )
         context = self._require_context()
         self._last_metadata = {
-            "request_id": request.request_id,
+            "request_id": context.request_id,
             "worker_request_id": response.request_id,
             "worker_latency_ms": response.worker_latency_us / 1000.0,
             "worker_model_load_ms": protocol.model_load_ms,

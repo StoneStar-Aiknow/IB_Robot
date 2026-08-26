@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from array import array
 
-from inference_service._runtime_compat import _UnifiedPipelineView, build_session_runtime_handle
 from inference_service.backends import BackendError, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_plugin import ModelServiceError, ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import ModelSession
 from inference_service.runtime_composition import require_runtime_dependencies
 from inference_service.unified_runtime import (
     ExecutionContext,
+    ExecutionContract,
     ExecutionFailure,
     ModelRequest,
+    ModelRuntimeHandle,
     RegistrySet,
+    RuntimeAssembly,
     RuntimeProviders,
 )
 
@@ -82,16 +83,24 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
             backend_registry=registry_set.backend_registry,
             providers=providers,
         )
-        self._runtime_handle = build_session_runtime_handle(
-            self._session,
-            context,
-            providers,
-            execution_structure="iterative",
-            orchestration_visibility="session",
-            runtime_id="voice-tts-zipvoice",
+        self._runtime_handle = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=self._session,
+                session=self._session,
+                execution_contract=ExecutionContract(
+                    execution_structure="iterative",
+                    orchestration_visibility="session",
+                    cancellation_granularity="checkpoint",
+                ),
+                stateful=bool(self._session.capabilities.stateful),
+                resettable=bool(self._session.capabilities.resettable),
+                runtime_id="voice-tts-zipvoice",
+                load_context=context,
+                providers=providers,
+            )
         )
-        self.pipeline = _UnifiedPipelineView(self._runtime_handle, context, "voice-tts-zipvoice")
-        self._pipeline = self.pipeline
+        self.pipeline = self._runtime_handle
+        self._pipeline = self._runtime_handle
         self._core = TTSServiceCore(
             self._infer,
             TTSLimits(
@@ -110,10 +119,13 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
             self._closed = True
             raise
 
-    def _infer(self, request: NamedTensorRequest):
+    def _infer(self, request: ModelRequest):
+        request_id = request.metadata.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("ZipVoice ModelRequest metadata must contain request_id")
         return self._runtime_handle.execute(
-            ModelRequest(request.inputs, request.metadata),
-            ExecutionContext(request.request_id, request.deadline),
+            request,
+            ExecutionContext(request_id),
         )
 
     def handle(self, request, response) -> str:

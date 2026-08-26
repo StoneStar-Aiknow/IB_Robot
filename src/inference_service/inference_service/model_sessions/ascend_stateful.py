@@ -9,10 +9,9 @@ import numpy as np
 from inference_manifest import CompiledDeployment
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.ascend import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
 class StatefulAscendOmModelSession(AscendOmModelSession):
@@ -28,7 +27,7 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         self._state_buffers: dict[str, tuple[tuple[AclDeviceBuffer, ...], ...]] = {}
         self._state_banks: dict[str, int] = {}
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment):
             raise BackendLoadError("stateful Ascend sessions require a compiled deployment")
@@ -96,7 +95,8 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
                 for buffer in bank:
                     models[role].zero_device_buffer(buffer)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         deployment = self._loaded_deployment()
         if len(deployment.execution) != 1:
             raise BackendInferenceError(
@@ -104,18 +104,20 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
                 code="host_orchestration_required",
             )
         role = deployment.execution[0]
-        return self._execute_role(role, request.inputs, request)
+        return self._execute_role(role, request.inputs, request, context)
 
     def _execute_role(
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
+        context.check(f"model.{role}")
         deployment = self._loaded_deployment()
         if role not in self._state_indices:
             raise BackendInferenceError(f"unknown stateful role {role!r}", code="unknown_execution_role")
-        stream = self._request_stream(request)
+        stream = self._request_stream(request, context)
         if stream is not None:
             raise BackendInferenceError(
                 "stateful dataset-bank execution does not support priority streams",
@@ -170,19 +172,6 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         host_outputs = tuple(binding for binding in bindings.outputs if binding.index not in state_output_indices)
         self._validate_values(inputs, host_inputs, f"role_{role}_input")
         self._validate_values(outputs, host_outputs, f"role_{role}_output")
-
-    def execute_role(
-        self, role: str, inputs: Mapping[str, object], request: NamedTensorRequest
-    ) -> Mapping[str, object]:
-        """Execute one role inside an already admitted request scope.
-
-        Host-orchestrated callers should normally use ``session.execution``;
-        this small public adapter is useful for legacy streaming facades while
-        keeping admission and lifecycle ownership in the session.
-        """
-
-        with self.execution(request) as execution:
-            return execution.invoke(role, inputs)
 
     def _reset(self) -> None:
         self._zero_state()
