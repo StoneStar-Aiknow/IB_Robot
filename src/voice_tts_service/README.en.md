@@ -20,7 +20,7 @@ The package:
 4. Applies bounded long-text segmentation and wraps model output as WAV PCM16.
 5. Orchestrates the Text Encoder OM, Flow Decoder OM, and CPU Vocos on Ascend 310P.
 6. Enforces request, segment-count, and response-size limits.
-7. Plays validated local WAV files through ALSA's system-default output and reports a stable result.
+7. Publishes validated local WAV files through the shared `audio_common` playback path and reports a stable result.
 
 It does not manage microphone capture, device discovery, hotplug, mixing, ASR, dialogue state, business workflows,
 backend fallback, or runtime inference through SSH.
@@ -88,7 +88,7 @@ Playback is independent of model inference:
 ```text
 PlayAudioFile request (absolute path on the playback host)
   -> validate WAV file
-  -> ALSA aplay
+  -> audio_common audio_play (shared by Ubuntu and openEuler)
   -> success / error_code / message
 ```
 
@@ -131,7 +131,7 @@ voice cloning. It returns `UNSUPPORTED_PROMPT` when prompt fields are supplied.
 | Input | Absolute WAV path on the machine hosting the playback service |
 
 The call blocks until playback completes and then returns `success=true`. A missing path, invalid WAV, unavailable
-ALSA device, timeout, or nonzero `aplay` exit status returns `success=false` with a stable `error_code` and message.
+playback node, or timeout returns `success=false` with a stable `error_code` and message.
 The service does not fetch files over SSH or interpret a path from the caller's machine.
 
 ```bash

@@ -1,15 +1,16 @@
 # VoiceASRNode 节点说明
 
 `voice_asr_node.py` 是 `voice_asr_service` 包中的运行时 ROS 2 语音识别节点。
-它负责把麦克风音频或音频文件转换成文本，并统一管理音频采集、VAD、sherpa-onnx 模型加载、ROS 接口以及内部状态机。
+它负责把 ROS 音频或音频文件转换成文本，并统一管理音频缓冲、VAD、sherpa-onnx 模型加载、ROS 接口以及内部状态机。
 
-这份 README 同时说明两个独立节点：本文第 1～14 节描述 `VoiceASRNode`；下方“Speech Direction 独立节点”一节描述 `SpeechDirectionNode`。两者当前没有共享音频采集链路。
+这份 README 同时说明两个独立节点：本文第 1～14 节描述 `VoiceASRNode`；下方“Speech Direction 独立节点”一节描述 `SpeechDirectionNode`。两者共享由 `robot_config` 直接编排的 `audio_common` ROS 音频链路。
 
 ## Speech Direction 独立节点
 
 `speech_direction_node` 属于 `voice_asr_service`，与上文所述的 `VoiceASRNode` 是两个独立节点。它负责多通道人声音频增强、语音门控和方向估计，不执行 ASR，也不控制底盘。
 
-麦克风、阵列、输入源、模型和运行时效参数统一由以下包内配置管理：
+阵列、模型和运行时效参数由以下包内配置管理；音频设备和 Topic 由
+`robot_config.audio_io` 统一管理：
 
 ```text
 src/voice_asr_service/config/speech_direction.yaml
@@ -53,16 +54,13 @@ profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsu
 
 | 类别 | YAML 参数 | 当前配置 / 含义 |
 | --- | --- | --- |
-| 麦克风与音频 | `device_name_contains` | `ReSpeaker`，实时设备名匹配条件 |
+| 麦克风与音频 | `audio_topic` | `/audio/capture_stamped`，由 `audio_capture_node` 发布的多通道 PCM |
+| 麦克风与音频 | `audio_channels` | `6`，由 `robot_config` 的 microphone peripheral 覆盖 |
 | 麦克风与音频 | `sample_rate` | `16000` Hz；当前 speech-direction 完整算法链仅支持此采样率，其他值会在参数校验阶段被拒绝 |
 | 麦克风与音频 | `channel_indices` | `[1, 2, 3, 4]`，参与处理的输入通道 |
-| 麦克风与音频 | `arecord_device` | `hw:0,0`，arecord 直采的 ALSA 硬件设备；310P/Ubuntu 均用 arecord 子进程直采，不再依赖 PyAudio，系统需安装 `alsa-utils` |
 | 阵列 | `mount_yaw_deg` | `0.0`，阵列安装偏角（度），逆时针为正。把阵列坐标系角度对齐到小车坐标系，详见下方[坐标系与安装偏角](#坐标系与安装偏角) |
 | 阵列 | `angle_step_degree` | `5`，SRP-PHAT 扫描角度步长（度），DOA 输出只能为该步长的整数倍；必须为 360 的正整数约数。详见下方[SRP 角度精度](#srp-角度精度) |
 | 阵列 | `mic_positions` | 四麦二维坐标的一维展开数组，长度必须为通道数的两倍 |
-| 输入源 | `input_source` | `device`；也支持 `wav` |
-| 输入源 | `wav_path` | WAV 输入路径；`input_source=wav` 时必填。离线输入与实时 ReSpeaker 原始流使用同一入口契约，文件必须是 `16 kHz / 6 通道` WAV，并保留设备输入的 ch0～ch5；pipeline 随后按 `channel_indices=[1,2,3,4]` 选取四个麦克风通道。文中的“4 通道增强/DOA”是内部算法通道数，不表示接受 4 通道 WAV |
-| 输入源 | `wav_replay_rate` | `1.0`，WAV 回放倍率，必须大于 0。有效音频播放到 EOF 后，回放器会根据增强窗口尾部、hop 大小和段末静音门限追加若干个内部 6 通道零帧，使现有 VAD/状态机自然结算最后一个语音段；无需在测试文件末尾手工添加静音 |
 | 模型 | `silero_vad_model_path` | Silero VAD 模型路径 |
 | 模型 | `silero_vad_backend` | `ascend`（310P OM）；Ubuntu profile 覆盖为 `onnx` |
 | 模型 | `fullsubnet_ckpt` | FullSubNet cumulative 218epochs checkpoint，两平台共用同一权重 |
@@ -197,22 +195,14 @@ ros_azimuth = radians(阵列角度) - π/2 + radians(mount_yaw_deg)
 
 真正限制角度精度的是阵列孔径与频段（参见 `doa/srp_phat.py` 的几何与频段参数），而非扫描步长。要追求更高角度精度，需换更大孔径或更多麦克风的阵列，不是单靠调小 `angle_step_degree`。默认 `5` 是与当前基线匹配的务实值。
 
-### 实时音频采集兼容性
+### 实时音频采集
 
-`speech_direction_node` 通过受控 `arecord` 子进程直接采集 ALSA `hw` 设备，
-并把原始交错多通道 int16 PCM 写入内部 RingBuffer。该路径不再依赖 PyAudio，
-用于规避 Ubuntu 22.04 apt 默认 PyAudio 0.2.11 的 callback ABI 路径；音频后端异常通过
-受控 fatal 通道上报，不会从 callback C bridge 异步注入 ROS executor。采集线程只负责
-读取和缓冲，VAD、增强与 DOA 仍在独立 worker 中执行。当前已完成软件单元测试、构建
-与并发生命周期验证，尚未使用真实 ReSpeaker 硬件完成采集验证。
+Ubuntu 和 openEuler 均由 `robot_config` 启动唯一的 `audio_capture_node`。Voice ASR 和
+Speech Direction 固定订阅 `/audio/capture_stamped`，不直接打开 ALSA，因此可以同时使用
+同一个 ReSpeaker。音频设备参数仅在 `robot_config` 的 microphone peripheral 中配置，
+生产运行时不提供其他设备后端。
 
-> 部署依赖变更：音频采集后端已由 PyAudio 切换为 `arecord`（`alsa-utils` 提供）。
-> 310P 与 Ubuntu 平台均使用 arecord 子进程直采 ALSA，系统需安装 `alsa-utils`；
-> 采集设备由 `arecord_device` 参数（如 `hw:0,0`）指定，选择方式见下表。
-
-### 麦克风资源互斥
-
-`VoiceASRNode` 与 `SpeechDirectionNode` 当前各自建立音频采集链路，并未共享采集。两者不能同时占用同一个 ReSpeaker 实时输入设备；启动方向节点前，应停止正在使用该设备进行实时识别的 `VoiceASRNode`，反之亦然。WAV / 文件输入不等同于占用实时麦克风设备。
+离线回归测试可直接向 runtime 注入 PCM/WAV 数据；这是测试入口，不是生产平台 fallback。
 
 ## 1. VoiceASRNode 节点职责
 
@@ -478,8 +468,9 @@ models/voice_asr/
 | `sample_rate` | `16000` | 当前完整 Voice ASR 链路仅支持 16000 Hz；其他值属于无效配置，节点会拒绝初始化 |
 | `chunk_size` | `512` | 当前完整 Voice ASR 链路仅支持 512 样本帧；其他值属于无效配置，节点会拒绝初始化 |
 | `buffer_seconds` | `5.0` | 音频环形缓冲区时长 |
-| `device_index` | `-1` | 显式音频设备索引；`-1` 表示默认设备 |
-| `device_name` | `""` | 优先按设备名匹配，失败后回退到索引 |
+| `audio_topic` | `/audio/capture_stamped` | `audio_common_msgs/AudioDataStamped` 输入 Topic |
+| `audio_channels` | `6` | ROS PCM 的交错通道数 |
+| `audio_input_channel` | `1` | Voice ASR 从多通道 PCM 中选取的单通道索引 |
 
 当前 16kHz/512 是实时麦克风、文件识别、VAD 后端和 ASR 模型共同遵守的系统级硬限制；
 Silero ONNX 后端会在 512 样本音频帧前额外拼接 64 个内部 context 样本，该 context 由 VAD 内部跨帧维护，不应配置到 `chunk_size` 中。
@@ -550,9 +541,22 @@ robot:
     sample_rate: 16000
     chunk_size: 512
     buffer_seconds: 5.0
-    device_index: -1
-    device_name: ""
     exit_on_init_failure: true
+
+  audio_io:
+    enabled: true
+    microphone: respeaker
+    capture_stamped_topic: /audio/capture_stamped
+
+  peripherals:
+    - type: microphone
+      name: respeaker
+      driver: alsa
+      params:
+        device: "hw:0,0"
+        channels: 6
+        sample_rate: 16000
+        sample_format: S16LE
 ```
 
 默认建议把 `enabled` 保持为 `false`，只在需要时通过 `voice_asr_auto_start:=true` 临时启用；如果你的机器人就是要长期带语音入口，再把 YAML 改成 `enabled: true` 即可。
@@ -566,7 +570,7 @@ robot:
 | 节点能启动，但实时识别始终不可用 | 加载的是离线模型 | 查看日志里是否出现 `Offline ASR model loaded` |
 | `start_recognition` 被拒绝 | ASR 未就绪，或当前模型是离线模型 | 查看 `_asr_init_error` 相关日志和模型类型 |
 | 文件识别立即失败 | 文件路径错误或解码失败 | 确认文件存在且格式受支持 |
-| 麦克风没有音频输入 | 设备选择不对 | 检查启动时的设备日志，使用 `device_name` 或 `device_index` 指定 |
+| 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 `audio_io.microphone` 引用的 `device`/`channels` |
 | 模型路径缺失 | bundle 尚未下载完成 | 开启 `auto_download_model`，并在首次启动 ASR 节点时等待自动下载完成 |
 
 ## 14. 当前已验证行为

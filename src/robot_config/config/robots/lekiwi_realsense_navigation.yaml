@@ -111,7 +111,14 @@ robot:
     auto_download_model: true
     publish_partial: true
     output_topic: /voice_command
-    device_index: 9
+    audio_input_channel: 0
+
+  audio_io:
+    enabled: true
+    microphone: microphone
+    capture_topic: /audio/capture
+    capture_stamped_topic: /audio/capture_stamped
+    audio_info_topic: /audio/info
 
   # ============================================
   # Navigation Configuration
@@ -291,6 +298,16 @@ robot:
   # Peripheral devices
   # ============================================
   peripherals:
+    - type: microphone
+      name: microphone
+      driver: alsa
+      params:
+        device: "default"
+        channels: 1
+        sample_rate: 16000
+        sample_format: S16LE
+        channel_indices: [0, 0, 0, 0]
+
     - type: camera
       name: front
       driver: opencv

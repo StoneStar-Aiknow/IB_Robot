@@ -25,9 +25,6 @@ def _model_path(rel: str) -> str:
 class AudioConfig:
     """音频采集参数(硬件固定值,不可更改)。"""
 
-    device_name: str = "ReSpeaker"
-    device_index: int = -1  # -1 表示按名称自动搜索
-    arecord_device: str = "hw:0,0"  # 310P 已验证可用的 ALSA 直采设备
     sample_rate: int = 16000  # 硬件固定
     channels: int = 6  # 6_channels_firmware
     chunk_size: int = 160  # 10ms @ 16kHz
@@ -171,9 +168,7 @@ class SpeechDirectionConfig:
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
     # 运行时控制
-    input_source: str = "device"  # device | wav
-    wav_path: str = ""
-    wav_replay_rate: float = 1.0
+    audio_topic: str = "/audio/capture_stamped"
     mount_yaw_deg: float = 0.0  # 阵列安装偏角(度)
     speech_direction_max_age_ms: int = 1300
 

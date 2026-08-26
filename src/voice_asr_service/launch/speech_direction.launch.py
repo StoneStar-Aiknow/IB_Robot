@@ -125,30 +125,23 @@ def _launch_setup(context):
     channel_indices = LaunchConfiguration("microphone_channel_indices").perform(context).strip()
     parameter_overrides: dict[str, object] = {}
     for launch_name, parameter_name in (
-        ("microphone_device_name_contains", "device_name_contains"),
-        ("microphone_arecord_device", "arecord_device"),
+        ("microphone_channels", "audio_channels"),
         ("microphone_sample_rate", "sample_rate"),
+        ("speech_direction_audio_topic", "audio_topic"),
     ):
         value = LaunchConfiguration(launch_name).perform(context).strip()
         if value:
-            parameter_overrides[parameter_name] = int(value) if parameter_name == "sample_rate" else value
+            parameter_overrides[parameter_name] = (
+                int(value) if parameter_name in {"sample_rate", "audio_channels"} else value
+            )
     if channel_indices:
         parsed_channels = yaml.safe_load(channel_indices)
         if not isinstance(parsed_channels, list):
             raise ValueError("microphone_channel_indices must be a YAML list")
         parameter_overrides["channel_indices"] = parsed_channels
-    for launch_name, parameter_name in (
-        ("speech_direction_input_source", "input_source"),
-        ("speech_direction_mount_yaw_deg", "mount_yaw_deg"),
-        ("speech_direction_wav_path", "wav_path"),
-        ("speech_direction_wav_replay_rate", "wav_replay_rate"),
-    ):
-        value = LaunchConfiguration(launch_name).perform(context).strip()
-        if value:
-            if parameter_name in {"mount_yaw_deg", "wav_replay_rate"}:
-                parameter_overrides[parameter_name] = float(value)
-            else:
-                parameter_overrides[parameter_name] = value
+    mount_yaw_deg = LaunchConfiguration("speech_direction_mount_yaw_deg").perform(context).strip()
+    if mount_yaw_deg:
+        parameter_overrides["mount_yaw_deg"] = float(mount_yaw_deg)
     params = _load_speech_direction_parameters(
         config_path,
         models_root,
@@ -206,14 +199,11 @@ def generate_launch_description():
                 default_value=str(_workspace_root() / "models"),
                 description="模型根目录；YAML 中相对模型路径以此为基准",
             ),
-            DeclareLaunchArgument("microphone_device_name_contains", default_value=""),
-            DeclareLaunchArgument("microphone_arecord_device", default_value=""),
             DeclareLaunchArgument("microphone_sample_rate", default_value=""),
+            DeclareLaunchArgument("microphone_channels", default_value=""),
+            DeclareLaunchArgument("speech_direction_audio_topic", default_value=""),
             DeclareLaunchArgument("microphone_channel_indices", default_value=""),
-            DeclareLaunchArgument("speech_direction_input_source", default_value=""),
             DeclareLaunchArgument("speech_direction_mount_yaw_deg", default_value=""),
-            DeclareLaunchArgument("speech_direction_wav_path", default_value=""),
-            DeclareLaunchArgument("speech_direction_wav_replay_rate", default_value=""),
             OpaqueFunction(function=_launch_setup),
         ]
     )

@@ -63,9 +63,10 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
         "name": "respeaker",
         "driver": "alsa",
         "params": {
-            "device_name_contains": "ReSpeaker",
-            "arecord_device": "hw:0,0",
+            "device": "hw:0,0",
+            "channels": 6,
             "sample_rate": 16000,
+            "sample_format": "S16LE",
             "channel_indices": [1, 2, 3, 4],
         },
     }

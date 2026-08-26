@@ -1,7 +1,7 @@
 """speech_direction_node ROS 适配层。
 
 ~250 行,职责:
-    - ROS 参数:device_name_contains, sample_rate, mount_yaw_deg, input_source, wav_path, 模型路径
+    - ROS 参数:sample_rate, mount_yaw_deg, audio_topic, 模型路径
     - 构造 FullSubNetEnhancer + SpeechGate + StftSrpPhat + SpeechDirectionPipeline + Runtime
     - 定时器轮询 get_speech_direction(pull 模型,~10Hz)
     - 坐标转换:阵列坐标系(度) → REP-103(弧度)(统一角度单位,显式 deg2rad)
@@ -57,7 +57,6 @@ from .pipeline_streaming import StreamingPipelineParams, StreamingSpeechDirectio
 from .runtime import SpeechDirectionRuntime
 from .speech_gate import SileroVadEngine, SpeechGate
 from .streaming_runtime import SpeechDirectionStreamingRuntime
-from .wav_input import WavInput
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +64,12 @@ logger = logging.getLogger(__name__)
 POLL_PERIOD_SEC = 0.1
 
 _PARAMETER_TYPES = {
-    "device_name_contains": Parameter.Type.STRING,
-    "arecord_device": Parameter.Type.STRING,
+    "audio_channels": Parameter.Type.INTEGER,
     "sample_rate": Parameter.Type.INTEGER,
     "srp_update_interval_hops": Parameter.Type.INTEGER,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
     "angle_step_degree": Parameter.Type.INTEGER,
-    "input_source": Parameter.Type.STRING,
-    "wav_path": Parameter.Type.STRING,
-    "wav_replay_rate": Parameter.Type.DOUBLE,
+    "audio_topic": Parameter.Type.STRING,
     "speech_direction_inference_bundle": Parameter.Type.STRING,
     "silero_vad_backend": Parameter.Type.STRING,
     "fullsubnet_backend": Parameter.Type.STRING,
@@ -161,8 +157,7 @@ def _convert_float_list(values: Mapping[str, Any], name: str) -> list[float]:
 
 def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirectionConfig:
     """将已读取的 ROS 参数校验并映射为算法配置。"""
-    device_name = _require_non_empty_string(values, "device_name_contains")
-    arecord_device = _require_non_empty_string(values, "arecord_device")
+    audio_channels = _require_positive_int(values, "audio_channels")
     sample_rate = _convert_int(values, "sample_rate")
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
@@ -181,17 +176,6 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if not all(math.isfinite(value) for value in flat_positions):
         raise ValueError("参数 mic_positions 必须全部为有限浮点数")
     mic_positions = [flat_positions[index : index + 2] for index in range(0, len(flat_positions), 2)]
-
-    input_source = _require_string(values, "input_source")
-    if input_source not in {"device", "wav"}:
-        raise ValueError("参数 input_source 只能为 device 或 wav")
-    wav_path = _require_string(values, "wav_path", allow_empty=True)
-    if input_source == "wav" and not wav_path:
-        raise ValueError("input_source=wav 时参数 wav_path 不能为空")
-
-    wav_replay_rate = _convert_float(values, "wav_replay_rate")
-    if not math.isfinite(wav_replay_rate) or wav_replay_rate <= 0:
-        raise ValueError("参数 wav_replay_rate 必须是大于 0 的有限数")
 
     silero_backend_raw = _require_string(values, "silero_vad_backend")
     if silero_backend_raw not in {"ascend", "onnx"}:
@@ -228,8 +212,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
 
     # 仅使用上述归一化变量构造配置，避免未校验输入进入算法链。
     cfg = SpeechDirectionConfig()
-    cfg.audio.device_name = device_name
-    cfg.audio.arecord_device = arecord_device
+    cfg.audio.channels = audio_channels
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
     cfg.pipeline.srp_update_interval_hops = srp_update_interval_hops
@@ -247,9 +230,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     )
     cfg.fullnet.backend = fullsubnet_backend
     cfg.vad.backend = silero_backend
-    cfg.input_source = input_source
-    cfg.wav_path = wav_path
-    cfg.wav_replay_rate = wav_replay_rate
+    cfg.audio_topic = _require_non_empty_string(values, "audio_topic")
     cfg.mount_yaw_deg = mount_yaw_deg
     cfg.doa.angle_step_degree = angle_step_degree
     cfg.speech_direction_max_age_ms = max_age_ms
@@ -295,6 +276,7 @@ class SpeechDirectionNode(Node):
         # 方向 topic 用 KEEP_LAST(1),只保留最新方向
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self._direction_pub = self.create_publisher(SpeechDirection, "/voice/speech_direction", qos)
+        self._audio_subscription = None
         # 在线状态(诊断)
         self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
@@ -308,7 +290,6 @@ class SpeechDirectionNode(Node):
         self._runtime_handle: ModelRuntimeHandle | None = None
         self._session_resources: SpeechDirectionSessionResources | None = None
         self._pending_backend_resources: tuple[object, ...] = ()
-        self._wav_input: WavInput | None = None
         self._diagnostics_recorder: DiagnosticsRecorder | None = None
         self._diagnostics_status = RecorderStatus(False, "disabled", None, None, 0)
         self._diagnostics_session_dir = ""
@@ -347,7 +328,7 @@ class SpeechDirectionNode(Node):
         self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
 
         self.get_logger().info(
-            f"speech_direction_node 已启动: input_source={cfg.input_source}, "
+            f"speech_direction_node 已启动: audio_topic={cfg.audio_topic}, "
             f"mount_yaw_deg={cfg.mount_yaw_deg}, degraded={self._degraded}"
         )
 
@@ -697,27 +678,25 @@ class SpeechDirectionNode(Node):
         self._session_resources = None
         self._pending_backend_resources = ()
 
-        # runtime(input_source=wav 时 enable_capture=False)
-        enable_capture = cfg.input_source == "device"
         self._runtime = SpeechDirectionRuntime(
             cfg,
             pipeline,
-            enable_capture=enable_capture,
             on_fatal_error=self._enter_degraded,
             model_runtime_handle=self._runtime_handle,
         )
         self._runtime.start()
 
-        # 离线 WAV 输入
-        if cfg.input_source == "wav":
-            if not cfg.wav_path:
-                raise ValueError("input_source=wav 时 wav_path 必填")
-            self._wav_input = WavInput(
-                self._runtime,
-                cfg.wav_path,
-                replay_rate=cfg.wav_replay_rate,
-            )
-            self._wav_input.start()
+        from audio_common_msgs.msg import AudioDataStamped
+
+        self._audio_subscription = self.create_subscription(
+            AudioDataStamped, cfg.audio_topic, self._on_audio_message, 50
+        )
+
+    def _on_audio_message(self, message) -> None:
+        """Feed interleaved shared PCM into the existing multi-channel ring."""
+        if self._runtime is None:
+            return
+        self._runtime.feed_audio(bytes(message.audio.data))
 
     # ------------------------------------------------------------------ 轮询发布
     def _poll_and_publish(self) -> None:
@@ -828,8 +807,8 @@ class SpeechDirectionNode(Node):
                 KeyValue(key="latest_angle", value=str(full.get("angle"))),
                 KeyValue(key="seq_id", value=str(full.get("seq_id"))),
                 KeyValue(
-                    key="capture_running",
-                    value=str(self._runtime.capture is not None and self._runtime.capture.is_running()),
+                    key="audio_subscription",
+                    value=str(self._audio_subscription is not None),
                 ),
             ]
             if recorder_status.state == "diagnostics_disabled":
@@ -889,11 +868,6 @@ class SpeechDirectionNode(Node):
         cleanup_error = None
         result = False
         try:
-            if self._wav_input is not None:
-                try:
-                    self._wav_input.stop()
-                except Exception as exc:
-                    cleanup_error = exc
             if self._runtime is not None:
                 try:
                     self._runtime.stop()

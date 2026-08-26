@@ -1,9 +1,7 @@
-"""Validated local WAV playback through ALSA."""
+"""Validate WAV files before publishing them through audio_common."""
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,20 +17,19 @@ class AudioPlaybackError(RuntimeError):
 
 @dataclass(frozen=True)
 class AudioPlaybackConfig:
-    """Configuration for one synchronous ALSA playback operation."""
+    """Configuration for one synchronous audio_common publication."""
 
     timeout_sec: float = 300.0
-    player: str = "aplay"
 
 
 class AudioFilePlayer:
-    """Validate and play server-local WAV files without invoking a shell."""
+    """Validate server-local WAV files for the shared playback topic."""
 
     def __init__(self, config: AudioPlaybackConfig | None = None) -> None:
         self.config = config or AudioPlaybackConfig()
 
     @staticmethod
-    def _validate_file(file_path: str) -> Path:
+    def validate_file(file_path: str) -> Path:
         value = file_path.strip()
         if not value:
             raise AudioPlaybackError("INVALID_PATH", "file_path must not be empty")
@@ -55,39 +52,31 @@ class AudioFilePlayer:
             raise AudioPlaybackError("INVALID_AUDIO_FILE", f"invalid WAV file: {exc}") from exc
         return path
 
-    def play(self, file_path: str) -> Path:
-        """Play one WAV file and return its validated path after completion."""
+    @classmethod
+    def validate_pcm_format(
+        cls,
+        file_path: str,
+        *,
+        sample_rate: int,
+        channels: int,
+        sample_width: int = 2,
+    ) -> Path:
+        """Validate a WAV against the fixed raw PCM contract used by audio_play."""
 
-        path = self._validate_file(file_path)
-        player = shutil.which(self.config.player)
-        if player is None:
-            raise AudioPlaybackError("PLAYER_NOT_FOUND", f"audio player is unavailable: {self.config.player}")
-        if self.config.timeout_sec <= 0:
-            raise AudioPlaybackError("INVALID_TIMEOUT", "audio playback timeout must be positive")
-
-        command = [player, "-q", str(path)]
+        path = cls.validate_file(file_path)
         try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_sec,
-            )
-        except subprocess.TimeoutExpired as exc:
+            with wave.open(str(path), "rb") as stream:
+                actual = (stream.getframerate(), stream.getnchannels(), stream.getsampwidth(), stream.getcomptype())
+        except (EOFError, OSError, wave.Error) as exc:
+            raise AudioPlaybackError("INVALID_AUDIO_FILE", f"invalid WAV file: {exc}") from exc
+        expected = (sample_rate, channels, sample_width, "NONE")
+        if actual != expected:
             raise AudioPlaybackError(
-                "PLAYBACK_TIMEOUT",
-                f"audio playback exceeded {self.config.timeout_sec:g} seconds",
-            ) from exc
-        except OSError as exc:
-            raise AudioPlaybackError("PLAYBACK_FAILED", f"failed to start audio player: {exc}") from exc
-
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            message = f"audio player exited with status {completed.returncode}"
-            if detail:
-                message = f"{message}: {detail}"
-            raise AudioPlaybackError("PLAYBACK_FAILED", message)
+                "UNSUPPORTED_AUDIO_FORMAT",
+                "audio_common playback requires "
+                f"{sample_rate} Hz, {channels} channel(s), {sample_width * 8}-bit PCM; "
+                f"got {actual[0]} Hz, {actual[1]} channel(s), {actual[2] * 8}-bit, {actual[3]}",
+            )
         return path
 
 

@@ -179,7 +179,7 @@ def _build_pipeline():
         vad_threshold=cfg.gray_region.vad_threshold,
         rms_threshold=cfg.gray_region.rms_threshold,
     )
-    runtime = SpeechDirectionRuntime(cfg, pipeline, enable_capture=False)
+    runtime = SpeechDirectionRuntime(cfg, pipeline, offline=True)
     return runtime, pipeline
 
 

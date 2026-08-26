@@ -1,9 +1,8 @@
 speech_direction_node:
   ros__parameters:
-    # 以下值是独立启动时的默认值；由 robot_config 启动时，设备参数由机器人 SSOT 覆盖。
-    device_name_contains: "ReSpeaker"
-    # 310P 上已验证正常的 ALSA 直采设备；在线采集不再经过 PyAudio。
-    arecord_device: "hw:0,0"
+    # 以下值是独立启动时的默认值；由 robot_config 启动时，音频参数由机器人 SSOT 覆盖。
+    audio_topic: "/audio/capture_stamped"
+    audio_channels: 6
     sample_rate: 16000
     channel_indices: [1, 2, 3, 4]
     # FullSubNet/VAD remain continuous; SRP-PHAT updates every two model hops.
@@ -23,11 +22,6 @@ speech_direction_node:
       -0.02285, -0.02285,
       0.02285, -0.02285
     ]
-
-    input_source: "device"
-    # 在线模式不读取离线 WAV；保留空路径供参数契约使用。
-    wav_path: ""
-    wav_replay_rate: 1.0
 
     # 模型 bundle；具体 deployment、backend、device 和 artifact 由 manifest/profile 决定。
     speech_direction_inference_bundle: "voice_asr"

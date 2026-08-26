@@ -43,9 +43,7 @@ def main():
         for cam in cameras:
             logger.info(f"    - {cam.name}: {cam.driver} @ {cam.width}x{cam.height} {cam.fps}fps")
         for microphone in microphones:
-            logger.info(
-                f"    - {microphone.name}: {microphone.driver} ({microphone.params.get('arecord_device', 'n/a')})"
-            )
+            logger.info(f"    - {microphone.name}: {microphone.driver} ({microphone.params.get('device', 'n/a')})")
 
         if config.speech_direction.enabled:
             logger.info(

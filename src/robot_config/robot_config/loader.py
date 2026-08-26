@@ -16,7 +16,9 @@ from embodied_common.skill_templates import (
     SUPPORTED_SKILL_EXECUTORS,
 )
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
+from robot_config.audio_contract import find_microphones, is_audio_io_enabled
 from robot_config.config import (
+    AudioIOConfig,
     CameraConfig,
     ContractAction,
     ContractExtensionConfig,
@@ -64,12 +66,13 @@ _EXTENDED_NAV_STAGES = frozenset({"grasp", "mapping", "navigation"})
 _HYBRID_NAV_STAGES = frozenset({"grasp", "mapping", "navigation", "hybrid"})
 _ROS_ABSOLUTE_NAME_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
 _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES = {
-    "arecord_device",
     "channel_indices",
-    "device_name_contains",
+    "channels",
+    "device",
+    "sample_format",
     "sample_rate",
 }
-_SPEECH_DIRECTION_OVERRIDE_NAMES = {"input_source", "mount_yaw_deg", "wav_path", "wav_replay_rate"}
+_SPEECH_DIRECTION_OVERRIDE_NAMES = {"mount_yaw_deg"}
 
 
 def _deep_merge_config(
@@ -239,7 +242,7 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
         errors.append(f"speech direction microphone params is missing: {sorted(missing)}")
         return errors
 
-    for name in ("device_name_contains", "arecord_device"):
+    for name in ("device", "sample_format"):
         value = microphone_parameters.get(name)
         if not isinstance(value, str) or not value.strip():
             errors.append(f"speech direction microphone params.{name} must be a non-empty string")
@@ -255,9 +258,13 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
     ):
         errors.append("speech direction microphone params.channel_indices must contain 4 unique non-negative integers")
 
-    input_source = parameters.get("input_source", "device")
-    if input_source not in {"device", "wav"}:
-        errors.append("speech_direction.parameters.input_source must be device or wav")
+    channels = microphone_parameters.get("channels")
+    if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
+        errors.append("speech direction microphone params.channels must be a positive integer")
+    elif isinstance(channel_indices, list) and any(
+        isinstance(value, int) and not isinstance(value, bool) and value >= channels for value in channel_indices
+    ):
+        errors.append("speech direction microphone params.channel_indices must be smaller than params.channels")
     mount_yaw_deg = parameters.get("mount_yaw_deg", 0.0)
     if isinstance(mount_yaw_deg, bool) or not isinstance(mount_yaw_deg, int | float):
         errors.append("speech_direction.parameters.mount_yaw_deg must be numeric")
@@ -1733,8 +1740,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         sample_rate=data.get("sample_rate", defaults.sample_rate),
         chunk_size=data.get("chunk_size", defaults.chunk_size),
         buffer_seconds=data.get("buffer_seconds", defaults.buffer_seconds),
-        device_index=data.get("device_index", defaults.device_index),
-        device_name=data.get("device_name", defaults.device_name),
+        audio_input_channel=data.get("audio_input_channel", defaults.audio_input_channel),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
     )
 
@@ -1763,6 +1769,24 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         tts_timeout_sec=data.get("tts_timeout_sec", defaults.tts_timeout_sec),
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+    )
+
+
+def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
+    """Load shared audio_common I/O settings without enabling them implicitly."""
+
+    defaults = AudioIOConfig()
+    return AudioIOConfig(
+        enabled=data.get("enabled", defaults.enabled),
+        microphone=data.get("microphone", defaults.microphone),
+        capture_topic=data.get("capture_topic", defaults.capture_topic),
+        capture_stamped_topic=data.get("capture_stamped_topic", defaults.capture_stamped_topic),
+        audio_info_topic=data.get("audio_info_topic", defaults.audio_info_topic),
+        playback_topic=data.get("playback_topic", defaults.playback_topic),
+        playback_device=data.get("playback_device", defaults.playback_device),
+        playback_channels=data.get("playback_channels", defaults.playback_channels),
+        playback_sample_rate=data.get("playback_sample_rate", defaults.playback_sample_rate),
+        playback_sample_format=data.get("playback_sample_format", defaults.playback_sample_format),
     )
 
 
@@ -1901,6 +1925,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    audio_io = load_audio_io_config(robot_data.get("audio_io", {}))
     speech_direction = load_speech_direction_config(robot_data.get("speech_direction", {}))
     voice_tts = load_voice_tts_config(robot_data.get("voice_tts", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
@@ -1926,6 +1951,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        audio_io=audio_io,
         speech_direction=speech_direction,
         voice_tts=voice_tts,
         embodied=embodied,
@@ -2086,6 +2112,61 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+    capture_required = config.voice_asr.enabled or config.speech_direction.enabled
+    playback_required = config.voice_tts.enabled
+    if (capture_required or playback_required) and not is_audio_io_enabled(config.audio_io):
+        errors.append("audio_io.enabled must be true when voice ASR, speech direction, or voice TTS is enabled")
+    if config.audio_io.enabled:
+        for name in (
+            "capture_topic",
+            "capture_stamped_topic",
+            "audio_info_topic",
+            "playback_topic",
+        ):
+            if not getattr(config.audio_io, name).startswith("/"):
+                errors.append(f"audio_io.{name} must be an absolute ROS topic name")
+        if capture_required and not config.audio_io.microphone:
+            errors.append("audio_io.microphone is required when shared audio capture is enabled")
+        elif capture_required:
+            microphone_matches = [
+                peripheral
+                for peripheral in find_microphones(config.peripherals, config.audio_io.microphone)
+                if not isinstance(peripheral, CameraConfig)
+            ]
+            if len(microphone_matches) != 1:
+                errors.append(
+                    "audio_io.microphone must reference exactly one peripheral with type=microphone: "
+                    f"{config.audio_io.microphone!r}"
+                )
+            else:
+                microphone_params = microphone_matches[0].params
+                device = microphone_params.get("device")
+                channels = microphone_params.get("channels")
+                sample_rate = microphone_params.get("sample_rate")
+                sample_format = microphone_params.get("sample_format")
+                if not isinstance(device, str) or not device.strip():
+                    errors.append("audio_io microphone params.device must be a non-empty string")
+                if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
+                    errors.append("audio_io microphone params.channels must be a positive integer")
+                if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+                    errors.append("audio_io microphone params.sample_rate must be a positive integer")
+                if sample_format != "S16LE":
+                    errors.append("audio_io microphone params.sample_format must be S16LE")
+                if config.voice_asr.enabled and isinstance(channels, int) and not isinstance(channels, bool):
+                    input_channel = config.voice_asr.audio_input_channel
+                    if (
+                        isinstance(input_channel, bool)
+                        or not isinstance(input_channel, int)
+                        or input_channel < 0
+                        or input_channel >= channels
+                    ):
+                        errors.append("voice_asr.audio_input_channel must reference an available microphone channel")
+        if config.audio_io.playback_channels <= 0:
+            errors.append("audio_io.playback_channels must be a positive integer")
+        if config.audio_io.playback_sample_rate <= 0:
+            errors.append("audio_io.playback_sample_rate must be a positive integer")
+        if config.audio_io.playback_sample_format != "S16LE":
+            errors.append("audio_io.playback_sample_format must be S16LE")
     speech_direction = config.speech_direction
     errors.extend(
         validate_speech_direction_config(

@@ -904,19 +904,17 @@ ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray 
 ros2 launch robot_config robot.launch.py \
   robot_config:=so101_single_arm \
   voice_asr_auto_start:=true \
-  voice_asr_device_name:=Blackwire \
   voice_asr_realtime_pre_roll_seconds:=0.5
 ```
 
 | Launch 参数 | 作用 |
 | --- | --- |
 | `voice_asr_auto_start` | 临时覆盖 `robot.voice_asr.enabled`，设为 `true` 时强制启动 ASR 节点 |
-| `voice_asr_device_index` | 临时覆盖 `robot.voice_asr.device_index` |
-| `voice_asr_device_name` | 临时覆盖 `robot.voice_asr.device_name`，优先按设备名匹配 |
 | `voice_asr_realtime_pre_roll_seconds` | 临时覆盖实时识别 pre-roll 时长 |
 
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
-具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
+具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。实时麦克风设备由
+`robot.audio_io` 及其引用的 microphone peripheral 统一配置。
 
 ### Voice TTS（语音合成）
 
@@ -927,7 +925,8 @@ ros2 launch robot_config robot.launch.py \
 TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
 并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
 `MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
-同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 ALSA 同步播放并返回明确的
+同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 `audio_common`
+共享播放 Topic 同步发布并返回明确的
 成功状态、错误码和消息；该播放节点不依赖模型 session。
 launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle 并加载 session，因而
 `exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；

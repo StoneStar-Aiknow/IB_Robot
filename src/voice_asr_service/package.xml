@@ -12,9 +12,9 @@
   <depend>std_srvs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>diagnostic_msgs</depend>
+  <depend>audio_common_msgs</depend>
 
   <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-pyaudio</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
   <!-- Plotly/Matplotlib 仅 speech_direction_report 离线 CLI 渲染用,不在 base.txt;

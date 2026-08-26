@@ -565,8 +565,6 @@ def test_load_single_arm_config():
     assert config.voice_asr.model_path.endswith("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
     assert config.voice_asr.realtime_pre_roll_seconds == 0.5
     assert not Path(config.voice_asr.model_path).is_absolute()
-    assert config.voice_asr.device_name == ""
-    assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
     assert config.voice_tts.enabled is True
     assert config.voice_tts.bundle_path == "models/zipvoice"
@@ -1107,7 +1105,7 @@ def test_load_voice_asr_config_preserves_empty_model_path_for_launch_builder():
     )
 
     assert config.model_path == ""
-    assert config.device_name == ""
+    assert config.audio_input_channel == 1
     assert config.exit_on_init_failure is True
 
 
@@ -1200,8 +1198,6 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]
     assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
     assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
-    assert config_defaults.device_index == VOICE_ASR_DEFAULTS["device_index"]
-    assert config_defaults.device_name == VOICE_ASR_DEFAULTS["device_name"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
 
 

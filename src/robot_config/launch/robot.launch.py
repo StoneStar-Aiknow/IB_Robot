@@ -181,14 +181,6 @@ def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
     if enabled_override != "":
         voice_asr_config["enabled"] = parse_bool(enabled_override, default=False)
 
-    device_index_override = context.launch_configurations.get("voice_asr_device_index", "")
-    if device_index_override != "":
-        voice_asr_config["device_index"] = int(device_index_override)
-
-    device_name_override = context.launch_configurations.get("voice_asr_device_name", "")
-    if device_name_override != "":
-        voice_asr_config["device_name"] = device_name_override
-
     pre_roll_override = context.launch_configurations.get(
         "voice_asr_realtime_pre_roll_seconds",
         "",
@@ -439,7 +431,6 @@ def launch_setup(context, *args, **kwargs):
     logger.info(
         "Voice ASR override state: "
         f"enabled={voice_asr_config.get('enabled', False)}, "
-        f"device_index={voice_asr_config.get('device_index', -1)}, "
         f"realtime_pre_roll_seconds={voice_asr_config.get('realtime_pre_roll_seconds', 0.5)}"
     )
 
@@ -693,6 +684,17 @@ def launch_setup(context, *args, **kwargs):
             logger.info(f"Skipping teleop nodes (mode is {active_control_mode})")
     except Exception as e:
         logger.error(f"checking teleop mode: {e}")
+        raise
+
+    # ========== 7.5 Generate shared Audio IO ==========
+    logger.info("========== Checking shared Audio IO ==========")
+    try:
+        from robot_config.launch_builders.audio_io import generate_audio_io_actions
+
+        audio_io_actions = generate_audio_io_actions(robot_config)
+        actions.extend(audio_io_actions)
+    except Exception as e:
+        logger.error(f"generating shared audio IO: {e}")
         raise
 
     # ========== 8. Generate Voice ASR Nodes ==========
@@ -986,16 +988,6 @@ def generate_launch_description():
                 "hand_profile",
                 default_value="",
                 description="Select a hand profile declared by the robot YAML (for example right, left, or dual).",
-            ),
-            DeclareLaunchArgument(
-                "voice_asr_device_index",
-                default_value="",
-                description="Optional override for robot.voice_asr.device_index.",
-            ),
-            DeclareLaunchArgument(
-                "voice_asr_device_name",
-                default_value="",
-                description="Optional override for robot.voice_asr.device_name.",
             ),
             DeclareLaunchArgument(
                 "voice_asr_realtime_pre_roll_seconds",

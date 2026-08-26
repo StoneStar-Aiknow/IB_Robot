@@ -15,6 +15,9 @@ def generate_launch_description():
             DeclareLaunchArgument("service_name", default_value="/voice_tts/synthesize"),
             DeclareLaunchArgument("playback_service_name", default_value="/voice_tts/play"),
             DeclareLaunchArgument("playback_timeout_sec", default_value="300.0"),
+            DeclareLaunchArgument("audio_topic", default_value="/audio/play"),
+            DeclareLaunchArgument("playback_sample_rate", default_value="24000"),
+            DeclareLaunchArgument("playback_channels", default_value="1"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -47,6 +50,9 @@ def generate_launch_description():
                     {
                         "service_name": LaunchConfiguration("playback_service_name"),
                         "timeout_sec": LaunchConfiguration("playback_timeout_sec"),
+                        "audio_topic": LaunchConfiguration("audio_topic"),
+                        "playback_sample_rate": LaunchConfiguration("playback_sample_rate"),
+                        "playback_channels": LaunchConfiguration("playback_channels"),
                     }
                 ],
             ),

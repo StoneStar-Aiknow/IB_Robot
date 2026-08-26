@@ -176,8 +176,9 @@ class VoiceASRNode(Node):
         self.declare_parameter("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"])
         self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
         self.declare_parameter("realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"])
-        self.declare_parameter("device_index", VOICE_ASR_DEFAULTS["device_index"])
-        self.declare_parameter("device_name", VOICE_ASR_DEFAULTS["device_name"])
+        self.declare_parameter("audio_topic", "/audio/capture_stamped")
+        self.declare_parameter("audio_channels", 6)
+        self.declare_parameter("audio_input_channel", VOICE_ASR_DEFAULTS["audio_input_channel"])
         self.declare_parameter("exit_on_init_failure", VOICE_ASR_DEFAULTS["exit_on_init_failure"])
 
         self._active_mode = self.get_parameter("active_mode").value
@@ -195,9 +196,9 @@ class VoiceASRNode(Node):
         self._chunk_size = self.get_parameter("chunk_size").value
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
         self._realtime_pre_roll_seconds = max(0.0, float(self.get_parameter("realtime_pre_roll_seconds").value))
-        device_index = self.get_parameter("device_index").value
-        self._device_index = device_index if device_index >= 0 else None
-        self._device_name = self.get_parameter("device_name").value
+        self._audio_topic = str(self.get_parameter("audio_topic").value)
+        self._audio_channels = int(self.get_parameter("audio_channels").value)
+        self._audio_input_channel = int(self.get_parameter("audio_input_channel").value)
         self._exit_on_init_failure = self.get_parameter("exit_on_init_failure").value
 
     def _init_modules(self):
@@ -206,37 +207,15 @@ class VoiceASRNode(Node):
         self._state_machine.set_mode_str(self._active_mode)
 
         audio_config = AudioConfig(
-            sample_rate=self._sample_rate, chunk_size=self._chunk_size, buffer_seconds=self._buffer_seconds
+            sample_rate=self._sample_rate,
+            chunk_size=self._chunk_size,
+            buffer_seconds=self._buffer_seconds,
+            input_channel=self._audio_input_channel,
         )
         self._audio_capture = AudioCaptureModule(audio_config)
         self._audio_capture.set_error_callback(self._on_audio_error)
 
-        # 打印可用音频设备
-        devices = AudioCaptureModule.list_audio_devices()
-        if devices:
-            self.get_logger().info("Available audio input devices:")
-            for dev in devices:
-                self.get_logger().info(
-                    f"  [{dev['index']}] {dev['name']} "
-                    f"(channels={dev['channels']}, sr={dev['sample_rate']}, backend={dev['backend']})"
-                )
-        else:
-            self.get_logger().warn("No audio input devices found")
-
-        # 优先按名称匹配，否则按 index
-        if self._device_name:
-            if self._audio_capture.set_device_by_name(self._device_name):
-                self.get_logger().info(
-                    f"Audio device selected by name '{self._device_name}' -> index {self._audio_capture._device_index}"
-                )
-            else:
-                self.get_logger().error(
-                    f"Failed to find audio device matching '{self._device_name}'. "
-                    f"Falling back to device_index={self._device_index or 'default'}"
-                )
-                self._audio_capture.set_device(self._device_index)
-        else:
-            self._audio_capture.set_device(self._device_index)
+        self.get_logger().info(f"Voice ASR using shared audio_common topic {self._audio_topic!r}")
 
         self._file_input = FileInputModule()
         self._file_input.set_progress_callback(self._on_file_progress)
@@ -335,6 +314,9 @@ class VoiceASRNode(Node):
 
         self._sub_control = self.create_subscription(String, "/voice_control", self._on_voice_control, 10)
         self._sub_file_input = self.create_subscription(String, "/voice_file_input", self._on_file_input, 10)
+        from audio_common_msgs.msg import AudioDataStamped
+
+        self._sub_audio = self.create_subscription(AudioDataStamped, self._audio_topic, self._on_audio_message, 50)
 
         self._cb_group = MutuallyExclusiveCallbackGroup()
         self._srv_start = self.create_service(
@@ -355,6 +337,11 @@ class VoiceASRNode(Node):
         self._state_machine.register_callback(NodeState.LISTENING, self._on_state_change)
         self._state_machine.register_callback(NodeState.RECOGNIZING, self._on_state_change)
         self._state_machine.register_callback(NodeState.ERROR, self._on_state_change)
+
+    def _on_audio_message(self, message) -> None:
+        """Convert a shared AudioDataStamped message into ASR frames."""
+        if self._audio_capture.feed_audio(bytes(message.audio.data), self._audio_channels):
+            self._last_audio_chunk_time = time.monotonic()
 
     def _init_control_loop(self):
         """初始化控制循环"""

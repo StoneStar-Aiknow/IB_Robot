@@ -19,7 +19,7 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 4. 对长文本进行有界分段，并把模型输出统一封装为 WAV PCM16。
 5. 在 Ascend 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos。
 6. 对请求大小、分段数量和响应音频大小设置明确上限。
-7. 通过 ALSA 和系统默认音频输出同步播放本机 WAV 文件，并返回稳定的成功或失败状态。
+7. 通过 `audio_common` 共享播放链路同步发布本机 WAV 文件，并返回稳定的成功或失败状态。
 
 不属于本包的职责：
 
@@ -92,13 +92,17 @@ SynthesizeSpeech 请求
 ```text
 PlayAudioFile 请求（播放端本机绝对路径）
   -> WAV 文件校验
-  -> ALSA aplay
+  -> audio_common audio_play（Ubuntu/openEuler 共享链路）
   -> success / error_code / message
 ```
 
 `ZipVoiceSynthesizePlugin` 把 `ModelSession` resource 放入 `RuntimeAssembly`，再将所有权转移给
 `ModelRuntimeHandle`。Handle 串行准入请求并管理公开生命周期、健康状态、取消和关闭等待；session 只持有
 并释放 ZipVoice 的 vendor 模型与设备资源。
+
+共享播放采用固定原始 PCM 契约，默认与 ZipVoice 输出一致：24 kHz、单声道、16-bit little-endian。
+`audio_play` 无法从 `AudioData` 消息感知每个文件的格式，因此服务会在发布前校验 WAV；格式不匹配时
+返回 `UNSUPPORTED_AUDIO_FORMAT`，不会静默以错误采样率播放。
 
 ## 4. ROS 接口
 
@@ -142,9 +146,12 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 | 服务类型 | `ibrobot_msgs/srv/PlayAudioFile` |
 | 输入 | 播放服务所在机器上的 WAV 文件绝对路径 |
 
-服务同步等待整段音频播放完成，再返回 `success=true`。路径不存在、WAV 无效、ALSA 设备不可用、播放超时或
-`aplay` 返回非零状态时返回 `success=false`，并填写稳定的 `error_code` 和 `message`。服务不会通过 SSH 拉取
-文件，也不会解释调用端本机路径。
+服务同步等待整段音频发布/播放完成，再返回 `success=true`。`audio_common` 链路会先等待播放节点
+连接，按实时速率发布并等待可靠发布确认；等待连接、发布和播放等待均受 `playback_timeout_sec` 限制。
+由于 `audio_common` 的 `AudioData` 接口没有硬件播放完成回调，共享模式的成功语义是数据已可靠送达并
+完成对应时长的等待，不代表声卡提供了独立的硬件完成事件。路径不存在、WAV 无效、播放节点未就绪、
+播放超时或播放节点不可用时返回 `success=false`，并填写稳定的 `error_code` 和
+`message`。服务不会通过 SSH 拉取文件，也不会解释调用端本机路径。
 
 ```bash
 ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
