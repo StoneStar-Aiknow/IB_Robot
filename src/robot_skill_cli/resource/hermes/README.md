@@ -101,8 +101,8 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
   加入 `PATH`。排查「Hermes 不再 source 我的 bashrc」时先看此文件与该开关。
 - `hooks/ibrobot-speak`：`post_llm_call` speech hook wrapper，source `.shrc_local` 后
   `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT。
-- `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，source `.shrc_local` 后
-  异步生成文案并投递状态检查、规划和计划授权成功三类语音事件。
+- `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，使用当前 IB-Robot
+  workspace 中的 `robot_skill_cli` 和 `embodied_agent` 异步生成文案，并投递状态检查、规划和计划授权成功三类语音事件。
 
 `--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
 `hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经
@@ -115,6 +115,38 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
 - 当前终端已 source 目标 IB-Robot workspace（`source .shrc_local`）。
 - 启用语音时，目标 robot config 的 `voice_tts.enabled` 必须为 `true`。
 - 真机运动仍必须由操作员在启动 pipeline 时显式设置 `authorize_motion:=true`。
+
+### 生命周期文案模型环境
+
+生命周期 Hook 使用 IB-Robot 已提供的 `robot_skill_cli`、`embodied_agent`、`embodied_common` 和
+`rclpy`，不会从 Hermes 或其他目录加载 Python 包。Hook 只需要访问文案模型的 API key。
+
+Hook 固定使用 `gpt-5.6-sol` 路由，该路由在 `embodied_common/config/vlm_models.yaml` 中声明：
+
+```yaml
+api_key_env: XUNXING_API_KEY
+```
+
+推荐在启动 Hermes 的环境中直接设置：
+
+```bash
+export XUNXING_API_KEY='你的实际密钥'
+```
+
+如果现有 Hermes 已经把密钥保存在自己的 `.env` 中，可以指定该文件：
+
+```bash
+export HERMES_ENV_FILE=/path/to/hermes/data/.env
+```
+
+文件中可以直接配置 `XUNXING_API_KEY`；对于当前 Hermes 的自定义 provider，也支持：
+
+```dotenv
+HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY=你的实际密钥
+```
+
+Hook 会在没有 `XUNXING_API_KEY` 时将该变量映射为 `XUNXING_API_KEY`。310P 的现有路径是
+`/root/claw/hermes/data/.env`，其他机器应改成自己的 Hermes `.env` 路径。真实 API key 不得提交到仓库。
 
 ## 生效与验证
 

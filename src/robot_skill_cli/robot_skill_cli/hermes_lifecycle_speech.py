@@ -179,7 +179,12 @@ def _generate(output: Path, task: str) -> None:
         "第一句表示收到并观察环境，第二句表示正在规划，第三句只能表示即将执行，"
         "不能声称已经完成，不要输出解释或 Markdown。用户任务：" + task
     )
-    result = LLMClientService().reply(prompt)
+    # Use the same configured Xunxing route as Hermes.  The shared service
+    # defaults to qwen-vl-plus, which requires a separate Aliyun key and is
+    # not available in the Hermes runtime environment.
+    result = LLMClientService(model="gpt-5.6-sol").reply(prompt)
+    if isinstance(result, dict) and result.get("status") != "ok":
+        raise RuntimeError(str(result.get("error") or "lifecycle copy model request failed"))
     content = result.get("content", "") if isinstance(result, dict) else ""
     if not isinstance(content, str):
         raise RuntimeError("lifecycle copy model returned no text")

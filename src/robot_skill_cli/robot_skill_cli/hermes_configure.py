@@ -183,6 +183,13 @@ def _tts_hook_wrapper(
             "#!/usr/bin/env bash",
             "set -eo pipefail",
             _MANAGED_FILE_HEADER,
+            'hermes_env="${HERMES_ENV_FILE:-/root/claw/hermes/data/.env}"',
+            'if [ -f "$hermes_env" ]; then',
+            '  set -a; . "$hermes_env"; set +a',
+            "fi",
+            'if [ -z "${XUNXING_API_KEY:-}" ] && [ -n "${HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY:-}" ]; then',
+            '  export XUNXING_API_KEY="$HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY"',
+            "fi",
             f"cd {shlex.quote(str(workspace))}",
             f"source {shlex.quote(str(shrc))} >/dev/null",
             f"export ROS_DOMAIN_ID={shlex.quote(ros_domain_id)}",
@@ -198,13 +205,16 @@ def _tts_hook_wrapper(
 
 
 def _lifecycle_hook_wrapper(*, workspace: Path, shrc: Path) -> str:
+    # Hermes is launched from the fully initialized workspace environment.  The
+    # lifecycle hook has a two-second deadline, so sourcing ROS/CANN again here
+    # can consume the entire budget before the asynchronous handoff runs.
+    del shrc
     return "\n".join(
         (
             "#!/usr/bin/env bash",
             "set -eo pipefail",
             _MANAGED_FILE_HEADER,
             f"cd {shlex.quote(str(workspace))}",
-            f"source {shlex.quote(str(shrc))} >/dev/null",
             "exec python3 -m robot_skill_cli.hermes_lifecycle_speech",
             "",
         )

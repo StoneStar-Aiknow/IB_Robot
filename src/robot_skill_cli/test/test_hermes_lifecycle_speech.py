@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 from robot_skill_cli import hermes_lifecycle_speech as speech
@@ -80,6 +81,33 @@ def test_model_generation_is_spawned_once_per_turn(tmp_path: Path, monkeypatch) 
     speech._spawn_model(tmp_path, "turn-1", "打开夹爪")
 
     assert len(spawned) == 1
+
+
+def test_generate_uses_hermes_model_route(tmp_path: Path, monkeypatch) -> None:
+    selected_models = []
+
+    class FakeLLMClientService:
+        def __init__(self, *, model: str) -> None:
+            selected_models.append(model)
+
+        def reply(self, _prompt: str) -> dict:
+            return {
+                "status": "ok",
+                "content": json.dumps(speech.FALLBACK_COPY, ensure_ascii=False),
+            }
+
+    package = types.ModuleType("embodied_agent")
+    package.__path__ = []
+    client_module = types.ModuleType("embodied_agent.llm_client_service")
+    client_module.LLMClientService = FakeLLMClientService
+    monkeypatch.setitem(sys.modules, "embodied_agent", package)
+    monkeypatch.setitem(sys.modules, "embodied_agent.llm_client_service", client_module)
+
+    output = tmp_path / "copy.json"
+    speech._generate(output, "打开夹爪")
+
+    assert selected_models == ["gpt-5.6-sol"]
+    assert json.loads(output.read_text(encoding="utf-8")) == speech.FALLBACK_COPY
 
 
 def test_hook_entrypoint_accepts_payload(tmp_path: Path) -> None:

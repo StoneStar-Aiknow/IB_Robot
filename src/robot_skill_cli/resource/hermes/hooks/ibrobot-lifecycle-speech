@@ -1,3 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+hermes_env="${HERMES_ENV_FILE:-/root/claw/hermes/data/.env}"
+if [ -f "$hermes_env" ]; then
+  set -a; . "$hermes_env"; set +a
+fi
+if [ -z "${XUNXING_API_KEY:-}" ] && [ -n "${HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY:-}" ]; then
+  export XUNXING_API_KEY="$HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY"
+fi
 exec python3 -m robot_skill_cli.hermes_lifecycle_speech
