@@ -40,13 +40,18 @@ ros2 launch robot_config robot.launch.py  # ← PYTHONPATH and ROS_DOMAIN_ID los
 source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.launch.py
 ```
 
-## Issue: colcon build error - "install directory was created with the layout 'merged'"
+## Issue: Build error - "install directory was created with the layout 'merged'"
 
-**Root Cause**: Workspace uses merged install layout, but command doesn't include `--merge-install`
+**Root Cause**: Workspace uses merged install layout, but a hand-assembled `colcon build` omitted `--merge-install`
 
-**Solution**: Add `--merge-install` flag:
+**Solution**: Always build through the project script, which applies the correct layout automatically:
 ```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
+source .shrc_local && ./scripts/build.sh -- --packages-select robot_config
+```
+
+If the workspace layout state is already inconsistent, reset it with a clean build:
+```bash
+source .shrc_local && ./scripts/build.sh --clean
 ```
 
 ## Issue: Build Errors - venv not found
@@ -62,9 +67,9 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 
 **Root Cause**: Environment not refreshed after build
 
-**Solution**: Source setup in same command:
+**Solution**: Build and refresh in the same command:
 ```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config && source install/setup.zsh && python3 -c "import lerobot; print('OK')"
+source .shrc_local && ./scripts/build.sh -- --packages-select robot_config && source install/setup.zsh && python3 -c "import lerobot; print('OK')"
 ```
 
 ## Issue: Link-time ABI / undefined symbol errors against ROS libraries

@@ -19,7 +19,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | Skill | 一句话描述 |
 | :--- | :--- |
 | **ibrobot-launch** | 分平台启动 Ubuntu/openEuler 或 OpenHarmony 板端机器人、仿真、推理与遥操作 |
-| **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
+| **ibrobot-build** | 编译整个工作空间或指定 package（`./scripts/build.sh`） |
 | **ibrobot-env** | 初始化/修复运行环境：跑测试、运行脚本、ros2 命令前加载 `.shrc_local`，禁止手动拼装 PYTHONPATH/ROS 环境 |
 | **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
