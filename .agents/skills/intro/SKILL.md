@@ -25,6 +25,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
 | **ibrobot-control** | 通过 `robot-skill` 操作现有机器人高层技能或异步视觉游戏 |
+| **ibrobot-inference-verify** | 统一推理运行时端到端验证（本机 Torch + 板端 OM ROS mock typed service） |
 
 ### 🔌 板端（OpenHarmony）
 
@@ -114,6 +115,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
 让 Agent 玩分院帽视觉游戏         → ibrobot-control
+验证推理 runtime 端到端            → ibrobot-inference-verify
 初始化环境                      → ibrobot-env
 跑一下测试 / pytest             → ibrobot-env（环境前缀由它保证）
 在 worktree 中跑代码             → ibrobot-worktree-env
