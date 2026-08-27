@@ -7,6 +7,15 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_manifest import (
+    CompiledDeployment,
+    TensorBinding,
+)
+from inference_service.backends.ascend.model import numpy_dtype
+from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.types import RuntimeContext
+from inference_service.model_sessions.ascend import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from model_utils.graspgen_contract import (
     GRASPGEN_CONFIDENCE_SEMANTIC,
     GRASPGEN_DIFFUSION_SAMPLE,
     GRASPGEN_DIFFUSION_TIME,
@@ -20,14 +29,7 @@ from inference_manifest import (
     GRASPGEN_PREDICTED_NOISE,
     GRASPGEN_STAGE2_FEATURES,
     GRASPGEN_STAGE_FEATURES,
-    CompiledDeployment,
-    TensorBinding,
 )
-from inference_service.backends.ascend.model import numpy_dtype
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.types import RuntimeContext
-from inference_service.model_sessions.ascend import AscendOmModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 from .graspgen_adapter import GraspGenConfig
 from .graspgen_geometry import (

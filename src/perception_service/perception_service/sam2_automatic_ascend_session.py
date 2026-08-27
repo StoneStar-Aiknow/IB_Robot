@@ -201,8 +201,8 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         masks_out, boxes_out, scores_out, stability_out = [], [], [], []
         for logits, iou, stability in items:
             mask_canvas = (logits > _MASK_THRESHOLD).astype(np.uint8)
-            mask = np.zeros((height, width), dtype=np.uint8)
-            mask[:new_h, :new_w] = mask_canvas[:new_h, :new_w]
+            resized = cv2.resize(mask_canvas, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(resized, (width, height), interpolation=cv2.INTER_NEAREST)
             ys, xs = np.where(mask > 0)
             if len(xs) == 0:
                 continue

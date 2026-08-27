@@ -54,19 +54,9 @@ from inference_service.unified_runtime import (
     LifecycleState,
     ModelRequest,
     ModelResult,
-    ModelRuntimeFactory,
     ModelRuntimeHandle,
-    ModelRuntimeKey,
     OwnedComponent,
-    RegistrySet,
-    RequestDirectAssembler,
-    RequestIterativeAssembler,
-    RuntimeAssemblerRegistry,
     RuntimeAssembly,
-    RuntimeDescriptor,
-    RuntimeProviders,
-    SessionBuilderKey,
-    SessionBuilderRegistry,
 )
 
 Processor = Callable[[Mapping[str, object]], Mapping[str, object]]
@@ -456,10 +446,6 @@ _PROMPT_KEY = "__ibrobot_policy_prompt"
 _PRIORITY_KEY = "__ibrobot_policy_priority"
 
 
-class _FactorySessionMarker:
-    """Non-resource session marker used by the private factory bridge."""
-
-
 def _policy_contract(context: RuntimeContext, executor: SequentialModelExecutor) -> ExecutionContract:
     """Derive the request contract for the migrated local policy executor."""
 
@@ -481,14 +467,14 @@ def _policy_contract(context: RuntimeContext, executor: SequentialModelExecutor)
     )
 
 
-def _create_unified_policy_handle(
+def _finalize_policy_assembly(
+    assembly: RuntimeAssembly,
     context: RuntimeContext,
     executor: SequentialModelExecutor,
-    providers: RuntimeProviders,
     *,
     resettable: bool,
-) -> ModelRuntimeHandle:
-    """Construct a local handle through ModelRuntimeFactory during migration."""
+) -> RuntimeAssembly:
+    """Attach policy facade stages and ownership to a registered assembly."""
 
     profile = context.backend_profile
     if profile is None:
@@ -498,77 +484,40 @@ def _create_unified_policy_handle(
             code="runtime_profile_required",
         )
     contract = _policy_contract(context, executor)
-    backend = context.backend
-    identity = context.identity
-    runtime_key = ModelRuntimeKey(
-        identity.interface,
-        identity.model_type,
-        identity.operation,
-        backend,
-        contract.name,
-        contract.orchestration_visibility,
+    capability_source = assembly.session or next(
+        (
+            component
+            for component in executor.components
+            if callable(getattr(component, "execute", None)) and callable(getattr(component, "health", None))
+        ),
+        None,
     )
-    session_key = SessionBuilderKey(identity.interface, identity.model_type, identity.operation, backend)
-    session_registry = SessionBuilderRegistry()
-    session_registry.register(session_key, lambda _role_context: _FactorySessionMarker())
-    assembler_registry = RuntimeAssemblerRegistry()
-    assembler = RequestIterativeAssembler() if contract.execution_structure == "iterative" else RequestDirectAssembler()
-
-    def assemble(*, contract: object, **_kwargs: object) -> RuntimeAssembly:
-        assembly = assembler.assemble(executor=executor, contract=contract)
-        assembly.session = next(
-            (
-                component
-                for component in getattr(executor, "components", ())
-                if callable(getattr(component, "execute", None)) and callable(getattr(component, "health", None))
-            ),
-            None,
+    if capability_source is None:
+        raise PipelineConfigurationError(
+            f"pipeline {context.deployment_name!r} has no native session component",
+            pipeline_id=context.deployment_name,
+            code="runtime_session_required",
         )
-        assembly.stateful = False
-        assembly.resettable = resettable
-        assembly.owned_components = tuple(
-            OwnedComponent(
-                component,
-                f"policy_component:{index}",
-                load_context=executor.component_contexts.get(id(component), context),
-            )
-            for index, component in enumerate(executor.components)
-        ) + (OwnedComponent(executor, "policy_executor"),)
-        return assembly
-
-    assembler_registry.register(
-        RuntimeDescriptor(
-            key=runtime_key,
-            session_builder_key=session_key,
-            profile_type=type(profile),
-            assembler=assemble,
-            execution_contract=contract.name,
-            declared_capabilities={"stateful": False, "execution_contract": contract.name},
-        )
-    )
-    registry_set = RegistrySet(SimpleNamespace(names=(backend,)), session_registry, assembler_registry)
-    registry_set.freeze()
-    validated = getattr(context, "validated_manifest", None)
-    to_runtime_spec = getattr(validated, "to_runtime_spec", None)
-    if callable(to_runtime_spec):
-        candidate = to_runtime_spec()
-        selected = getattr(getattr(validated, "deployment", None), "execution_contract", None)
-        if getattr(selected, "name", None) == contract.name:
-            return ModelRuntimeFactory.create(candidate, registry_set, providers)
-    spec_values = {
-        "identity": identity,
-        "deployment": context.deployment,
-        "execution_contract": contract,
-        "runtime_profile": profile,
-        "target_runtime": context.target_runtime,
-        "runtime_abi": context.runtime_abi,
-        "_load_context": context,
+    assembly.runtime_executor = executor
+    assembly.executor = executor
+    assembly.session = capability_source
+    assembly.execution_contract = contract
+    assembly.stateful = False
+    assembly.resettable = resettable
+    assembly.declared_capabilities = {
+        **dict(assembly.declared_capabilities),
+        "stateful": False,
+        "execution_contract": contract.name,
     }
-    validated_deployment = getattr(context, "validated_manifest", None)
-    if validated_deployment is not None:
-        spec_values["validated_deployment"] = validated_deployment
-    spec = SimpleNamespace(**spec_values)
-    return ModelRuntimeFactory.create(spec, registry_set, providers)
+    assembly.owned_components = tuple(
+        OwnedComponent(
+            component,
+            f"policy_component:{index}",
+            load_context=executor.component_contexts.get(id(component), context),
+        )
+        for index, component in enumerate(executor.components)
+    ) + (OwnedComponent(executor, "policy_executor"),)
+    return assembly
 
 
 class _PolicySessionHandle:
@@ -638,6 +587,7 @@ class InferencePipeline:
         pipeline_id: str,
         runtime_context: RuntimeContext,
         *,
+        runtime_assembly: RuntimeAssembly,
         session_handle: _PolicySessionHandle,
         preprocessor: Processor | None = None,
         postprocessor: Postprocessor | None = None,
@@ -645,7 +595,6 @@ class InferencePipeline:
         request_timeout: float | None = None,
         default_task: str | None = None,
         execution_mode: str = "monolithic",
-        runtime_providers: RuntimeProviders | None = None,
     ) -> None:
         if not pipeline_id:
             raise PipelineConfigurationError("pipeline_id must be non-empty")
@@ -662,7 +611,7 @@ class InferencePipeline:
                 pipeline_id=pipeline_id,
                 details={"request_timeout": request_timeout},
             )
-        if not isinstance(session_handle, _PolicySessionHandle):
+        if not isinstance(runtime_assembly, RuntimeAssembly) or not isinstance(session_handle, _PolicySessionHandle):
             raise PipelineConfigurationError(
                 f"pipeline {pipeline_id!r} requires a native policy runtime assembly",
                 pipeline_id=pipeline_id,
@@ -671,6 +620,7 @@ class InferencePipeline:
 
         self._pipeline_id = pipeline_id
         self._context = runtime_context
+        self._runtime_assembly = runtime_assembly
         self._session_handle = session_handle
         self._pi05_handle = (
             session_handle
@@ -694,18 +644,13 @@ class InferencePipeline:
         self._bind_processors()
 
         resolved_executor: ModelExecutor = self._build_session_executor(session_handle)
-        if runtime_providers is None:
-            raise PipelineConfigurationError(
-                f"pipeline {pipeline_id!r} requires explicitly injected RuntimeProviders",
-                pipeline_id=pipeline_id,
-                code="runtime_providers_required",
-            )
-        self._unified_handle = _create_unified_policy_handle(
+        _finalize_policy_assembly(
+            runtime_assembly,
             runtime_context,
             resolved_executor,
-            runtime_providers,
             resettable=bool(self.capabilities.resettable),
         )
+        self._unified_handle = ModelRuntimeHandle(runtime_assembly)
         self._pipeline = None
 
     def _build_session_executor(self, handle: _PolicySessionHandle) -> SequentialModelExecutor:
@@ -744,7 +689,6 @@ class InferencePipeline:
             component_contexts=component_contexts,
             error_handler=self._record_policy_failure,
             health_override=lambda: self._policy_failure,
-            defer_session_execution=True,
             execution_contract=model_executor.execution_contract,
             orchestration_visibility=model_executor.orchestration_visibility,
         )
