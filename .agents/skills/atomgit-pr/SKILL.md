@@ -72,6 +72,16 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         *   对纯文档、注释、gitignore、纯元数据等**不涉及运行时行为**的提交，可以省略 Verification，而不是生硬补一个无意义小节。
         *   如果正式检视 PR 修改了 ROS 包的 `package.xml` 依赖声明，或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/setup/python_venv.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml`、`requirements/*.txt` 等直接影响 pip/rosdep 依赖安装的文件），则 Verification **必须提供**，且必须包含双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。ROS 包内的 `setup.py` 普通改动不单独触发该门禁。
          *   正式检视阶段触发上述门禁时，Agent 记录目标 commit 的完整 `git rev-parse HEAD^{tree}`，再调用两个 Docker skill 验证该 tree 的隔离快照。当前工作区无需 clean，但直接复制 dirty 工作区的结果只能用于本地调试，不能作为 PR 证据。Verification 必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段，并写入两平台真实结果。
+         *   **Docker Verification 字段速查**（格式错误是最高频失败原因，务必按此表填写）:
+
+            | 字段 | 值 | 来源 |
+            |---|---|---|
+            | `Docker verification mode` | 只能是 `full` 或 `reused-environment` | 首次双平台验证写 `full`；inputs 未变的后续更新可写 `reused-environment` |
+            | `Verified inputs` | 40 位十六进制指纹 | **不是 commit SHA 也不是 tree SHA**——由 gate 从 PR 文件名列表 + patch 内容计算（`verification_gate.compute_verification_inputs`）。Agent 无法自行算出：首次创建 PR 时**省略整个块**先提交，gate 报错会给出期望值；或从上一次成功运行的描述中复制 |
+            | `Tested source tree` | 40 位十六进制 = `git rev-parse HEAD^{tree}` | 目标 commit 的 tree SHA，两个 Docker skill 必须验证同一 tree |
+            | `Docker environment` | 反引号包裹的平台摘要 | 如 `` `Ubuntu 22.04 + openEuler Embedded aarch64` `` |
+
+            **格式要求**：四个字段写成无序列表前缀的粗体行（`**Docker verification mode:** \`full\``），带 `- ` 前缀也会被接受并自动规范化；每个字段在全文中必须恰好出现一次。两平台细节（setup/build 耗时、ERROR 分类）写在块之后的普通小节里，不要并入这四行。
          *   创建或更新 PR 时，脚本会将该 tree SHA 与已推送分支或 AtomGit PR 最新 head commit 的 tree 比对。源码 tree 改变会阻止创建/更新并要求重跑；只修改 commit message、作者或 trailer 而 tree 不变时，已有结果仍然有效。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
          *   在真正启动双平台 Docker 前，Agent 必须询问用户当前 PR 是临时 WIP 还是准备交给 reviewer 正式检视。命中门禁时，`pr_creation.py` / `pr_management.py` 要求显式传入 `--pr-stage wip|review`：`wip` 会把标题规范化为 `[WIP] <title>` 并暂缓 Docker；`review` 会移除 `[WIP]` 并恢复 tree-bound 门禁。WIP 只豁免双平台 Docker 证据，不豁免 DCO、AI 披露、其他测试或 CI。
 4.  **大型 PR 复用自查（超过 2000 行强制）**:
