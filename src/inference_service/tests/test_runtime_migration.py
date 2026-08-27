@@ -6,15 +6,19 @@ import numpy as np
 
 from inference_manifest import TorchRuntimeProfile
 from inference_service.distributed import StructuredError
-from inference_service.pipeline.runtime import _create_unified_policy_handle
+from inference_service.pipeline.factory import register_policy_session_builders
+from inference_service.pipeline.runtime import _finalize_policy_assembly
 from inference_service.unified_runtime import (
     ExecutionContext,
     ModelRequest,
     ModelResult,
     ModelRuntimeHandle,
+    ModelRuntimeKey,
     OutcomeState,
+    RuntimeAssemblerRegistry,
     RuntimeAssembly,
     RuntimeProviders,
+    SessionBuilderRegistry,
 )
 
 
@@ -54,6 +58,8 @@ class _IterativeExecutor:
         self.loaded = False
         self.closed = False
         self.calls: list[str] = []
+        self.components = (self,)
+        self.component_contexts = {}
 
     def load(self, _context: object) -> None:
         self.loaded = True
@@ -63,13 +69,22 @@ class _IterativeExecutor:
         self.calls.append(context.request_id)
         return {"value": request.inputs["value"]}
 
+    def health(self):
+        return SimpleNamespace(ready=True)
+
     def close(self) -> None:
         self.closed = True
 
 
 def test_policy_iterative_path_uses_factory_handle_and_model_result() -> None:
     executor = _IterativeExecutor()
-    handle = _create_unified_policy_handle(_context("pi05"), executor, _providers(), resettable=False)
+    assembly = RuntimeAssembly(
+        runtime_executor=executor,
+        session=executor,
+        execution_contract="request-iterative",
+    )
+    _finalize_policy_assembly(assembly, _context("pi05"), executor, resettable=False)
+    handle = ModelRuntimeHandle(assembly)
 
     assert isinstance(handle, ModelRuntimeHandle)
     assert handle.assembly.execution_contract.name == "request-iterative"
@@ -81,6 +96,16 @@ def test_policy_iterative_path_uses_factory_handle_and_model_result() -> None:
     assert result.evidence.state is OutcomeState.COMPLETED
     handle.close()
     assert executor.closed
+
+
+def test_torch_vla_policy_assemblers_use_direct_request_contract() -> None:
+    session_registry = SessionBuilderRegistry()
+    assembler_registry = RuntimeAssemblerRegistry()
+    register_policy_session_builders(session_registry, assembler_registry)
+
+    for model_type in ("pi05", "smolvla"):
+        key = ModelRuntimeKey("policy", model_type, "predict", "torch", "request-direct", None)
+        assert assembler_registry.get(key) is not None
 
 
 def test_native_session_runtime_owns_one_session_lifecycle() -> None:

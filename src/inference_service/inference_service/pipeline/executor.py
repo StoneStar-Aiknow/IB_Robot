@@ -24,7 +24,6 @@ class SequentialModelExecutor(ModelExecutor):
         component_contexts: Mapping[int, RuntimeContext] | None = None,
         error_handler: Callable[[Exception, bool], None] | None = None,
         health_override: Callable[[], BackendHealth | None] | None = None,
-        defer_session_execution: bool = False,
         execution_contract: str | None = None,
         orchestration_visibility: str | None = None,
     ) -> None:
@@ -37,7 +36,6 @@ class SequentialModelExecutor(ModelExecutor):
         self._component_contexts = dict(component_contexts or {})
         self._error_handler = error_handler
         self._health_override = health_override
-        self._defer_session_execution = defer_session_execution
         self._execution_contract = execution_contract
         self._orchestration_visibility = orchestration_visibility
         self._context: RuntimeContext | None = None
@@ -67,9 +65,8 @@ class SequentialModelExecutor(ModelExecutor):
         return self._component_contexts
 
     def load(self, context: RuntimeContext) -> None:
-        self._context = context
-        # Components are owned and loaded by ModelRuntimeHandle.  Keeping this
-        # executor lifecycle-free prevents a session from being loaded twice.
+        del context
+        # Components are owned and loaded by ModelRuntimeHandle.
 
     def execute(self, request: ModelRequest, context: ExecutionContext) -> object:
         if not isinstance(request, ModelRequest):

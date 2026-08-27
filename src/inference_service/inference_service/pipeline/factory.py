@@ -323,7 +323,7 @@ def create_inference_pipeline(
     if isinstance(context.deployment, CompiledDeployment) and context.deployment.execution:
         preprocessor, postprocessor = create_lerobot_processor_views()
         codec = create_policy_codec(context.policy)
-    handle = _build_session_handle(
+    assembly = _build_runtime_assembly(
         context,
         model_session_factory,
         pi05_diagnostic_schedule,
@@ -333,12 +333,19 @@ def create_inference_pipeline(
         assembler_registry=assembler_registry,
         providers=selected_providers,
     )
-    if handle is not None:
+    if assembly is not None:
+        handle = getattr(assembly, "policy_handle", None)
+        if not isinstance(handle, _PolicySessionHandle):
+            raise BackendLoadError(
+                "policy runtime assembly does not expose its policy facade configuration",
+                code="invalid_policy_assembly",
+            )
         preprocessor = handle.preprocessor or preprocessor
         postprocessor = handle.postprocessor or postprocessor
         return InferencePipeline(
             pipeline_id,
             context,
+            runtime_assembly=assembly,
             session_handle=handle,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
@@ -346,7 +353,6 @@ def create_inference_pipeline(
             request_timeout=request_timeout,
             default_task=default_task,
             execution_mode=execution_mode,
-            runtime_providers=selected_providers,
         )
     raise BackendLoadError(
         f"v3 identity {context.interface}/{context.model_type}/{context.operation} with backend "
@@ -392,7 +398,7 @@ def create_pipeline_manager(
     return manager
 
 
-def _build_session_handle(
+def _build_runtime_assembly(
     context: RuntimeContext,
     model_session_factory=None,
     diagnostic_schedule: PI05DenoisingSchedule | None = None,
@@ -440,13 +446,12 @@ def _build_session_handle(
             f"runtime assembler for {key!r} returned {type(assembly).__name__}, expected RuntimeAssembly",
             code="invalid_runtime_assembly",
         )
-    policy_handle = getattr(assembly, "policy_handle", None)
-    if not isinstance(policy_handle, _PolicySessionHandle):
+    if not isinstance(getattr(assembly, "policy_handle", None), _PolicySessionHandle):
         raise BackendLoadError(
             f"runtime assembler for {key!r} returned no private policy stage bridge",
             code="invalid_policy_assembly",
         )
-    return policy_handle
+    return assembly
 
 
 def _build_torch_policy_handle(
@@ -1222,8 +1227,10 @@ _POLICY_TARGET_RUNTIMES = {
 _POLICY_CONTRACTS = {
     "act": "request-direct",
     "diffusion": "request-iterative",
-    "pi05": "request-iterative",
-    "smolvla": "request-iterative",
+    # Torch LeRobot policies execute one complete prediction per request. The
+    # iterative contract is reserved for compiled family runtimes.
+    "pi05": "request-direct",
+    "smolvla": "request-direct",
 }
 
 
@@ -1249,7 +1256,7 @@ def register_policy_session_builders(
 
     for model_type, backend, builder in _POLICY_EXECUTOR_BUILDERS:
         contract = _POLICY_CONTRACTS[model_type]
-        visibility = "session" if model_type == "diffusion" else "executor"
+        visibility = "session" if contract.endswith("iterative") else None
         key = ModelRuntimeKey(
             "policy",
             model_type,

@@ -131,3 +131,23 @@ def test_sequential_executor_is_an_orchestrator_without_resource_ownership() -> 
     assert runtime.loaded == 0
     executor.close()
     assert runtime.closed == 0
+
+
+def test_policy_and_tensor_model_share_the_same_native_handle_contract() -> None:
+    policy_runtime = _Runtime()
+    tensor_runtime = _Runtime()
+
+    policy = _handle(policy_runtime)
+    tensor = _handle(tensor_runtime)
+
+    policy_result = policy.execute(ModelRequest({"input": np.float32(1)}), ExecutionContext("policy"))
+    tensor_result = tensor.execute(ModelRequest({"input": np.float32(2)}), ExecutionContext("tensor"))
+
+    assert isinstance(policy_result, ModelResult)
+    assert isinstance(tensor_result, ModelResult)
+    assert policy_result.outputs["output"] == 2
+    assert tensor_result.outputs["output"] == 3
+    assert policy.assembly.runtime_executor is not None
+    assert tensor.assembly.runtime_executor is not None
+    policy.close()
+    tensor.close()
