@@ -250,6 +250,31 @@ def test_bind_session_recovers_dead_sender_and_failed_encoder():
     assert senders[1].closed
 
 
+def test_latest_sent_capture_ns_tracks_wire_sends_and_clears_on_rollover():
+    manager, encoder, senders = _manager()
+    manager.bind_session("session-a", 1)
+
+    # Nothing on the wire yet, and unknown streams never report a send.
+    assert manager.latest_sent_capture_ns("observation.images.top") == 0
+    assert manager.latest_sent_capture_ns("observation.images.unknown") == 0
+
+    assert manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=1_000_000_000, receive_timestamp_ns=1_000_000_000
+    )
+    assert manager.flush()
+    # The fake sender invokes on_sent inline with the encoder's packet, so
+    # the last-sent capture is the frame's capture timestamp, not its
+    # receive timestamp or its local buffer arrival.
+    assert manager.latest_sent_capture_ns("observation.images.top") == 1_000_000_000
+
+    # A session rollover clears the record: pre-rollover frames must not be
+    # mistaken for fresh ones by the decision gate.
+    assert manager.bind_session("session-b", 2)
+    assert manager.latest_sent_capture_ns("observation.images.top") == 0
+
+    manager.close()
+
+
 def test_device_stream_manager_drops_non_monotonic_capture_timestamps():
     manager, encoder, _senders = _manager()
     manager.bind_session("session", 1)

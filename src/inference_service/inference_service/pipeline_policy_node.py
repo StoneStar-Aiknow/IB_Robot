@@ -648,6 +648,31 @@ class PipelinePolicyNode(Node):
         return buffer
 
     @staticmethod
+    def _rtp_video_send_issue(node: object, state: _SubState, now_ns: int) -> dict[str, object] | None:
+        """Gate RTP-video freshness on what the sender actually put on the wire.
+
+        The local subscription buffer says what the device received; the
+        compute side can only see frames that were encoded and sent.  Frames
+        lost to encode failures, queue overflow, or session rollovers must
+        therefore read as "not fresh" here, mirroring the compute side's
+        snapshot instead of the local buffer.
+        """
+        manager = getattr(node, "_video_stream_manager", None)
+        sent_ns = manager.latest_sent_capture_ns(state.spec.key) if manager is not None else 0
+        if sent_ns <= 0:
+            return {"key": state.spec.key, "topic": state.spec.topic, "reason": "video_not_sent"}
+        age_ns = now_ns - sent_ns
+        if state.max_age_ns > 0 and age_ns > state.max_age_ns:
+            return {
+                "key": state.spec.key,
+                "topic": state.spec.topic,
+                "reason": "video_send_stale",
+                "age_ms": age_ns / 1_000_000,
+                "max_age_ms": state.max_age_ns / 1_000_000,
+            }
+        return None
+
+    @staticmethod
     def _sample_observation(
         state: _SubState,
         sample_time_ns: int,
@@ -693,8 +718,16 @@ class PipelinePolicyNode(Node):
         return values, None
 
     def _sample_observations(
-        self, sample_time_ns: int, *, skip_decode_keys: frozenset[str] = frozenset()
+        self, sample_time_ns: int, *, rtp_video_keys: frozenset[str] = frozenset()
     ) -> dict[str, Any]:
+        """Sample subscribed observations at ``sample_time_ns``.
+
+        Keys in ``rtp_video_keys`` (distributed RTP video streams) are never
+        consumed from the local buffer -- the policy samples their decoded
+        frames on the compute side -- so their freshness gate reads the
+        sender's last-sent capture timestamp instead of the buffer entry.
+        A fresh buffer with nothing on the wire correctly fails closed.
+        """
         selected: dict[str, object] = {}
         issues: list[dict[str, object]] = []
         now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
@@ -702,6 +735,12 @@ class PipelinePolicyNode(Node):
         sample_times_ns = [sample_time_ns - step_ns * offset for offset in reversed(range(self._n_obs_steps))]
         with self._observation_lock:
             for key, state in self._subs.items():
+                if state.spec.key in rtp_video_keys:
+                    selected[key] = None
+                    issue = PipelinePolicyNode._rtp_video_send_issue(self, state, now_ns)
+                    if issue is not None:
+                        issues.append(issue)
+                    continue
                 if self._n_obs_steps == 1:
                     value, issue = self._sample_observation(state, sample_time_ns, now_ns)
                 else:
@@ -717,7 +756,7 @@ class PipelinePolicyNode(Node):
         decode_issues: list[dict[str, object]] = []
         for key, message in selected.items():
             state = self._subs[key]
-            if state.spec.key in skip_decode_keys:
+            if state.spec.key in rtp_video_keys:
                 continue
             messages = message if self._n_obs_steps > 1 else [message]
             values = [decode_value(state.spec.ros_type, item, state.spec) for item in messages]
@@ -933,7 +972,7 @@ class PipelinePolicyNode(Node):
             if self._config.execution_mode == "distributed" and self._video_stream_manager is not None
             else frozenset()
         )
-        observations = self._sample_observations(sample_time, skip_decode_keys=video_keys)
+        observations = self._sample_observations(sample_time, rtp_video_keys=video_keys)
         self._raise_if_deadline_expired(deadline, request_id)
         if "observation.state" in observations:
             observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])

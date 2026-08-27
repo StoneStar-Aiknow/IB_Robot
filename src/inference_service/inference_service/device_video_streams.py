@@ -152,6 +152,23 @@ class DeviceVideoStreamManager:
     def observation_keys(self) -> frozenset[str]:
         return frozenset(self._streams)
 
+    def latest_sent_capture_ns(self, observation_key: str) -> int:
+        """Capture timestamp of the newest access unit actually put on the wire.
+
+        Freshness decisions on the device side must reflect what the compute
+        side can actually see, not what the local subscription received:
+        frames that failed to encode or never left the sender queue do not
+        exist remotely, so they must not count as "new".  The value updates
+        only from the sender thread's post-send callback and reads as 0 when
+        the stream is unknown or nothing has been sent yet -- including right
+        after a session rollover, which clears the record so pre-rollover
+        frames are never mistaken for fresh.
+        """
+        stream = self._streams.get(observation_key)
+        if stream is None:
+            return 0
+        return stream.last_capture_timestamp_ns
+
     @property
     def session(self) -> tuple[str, int]:
         with self._lock:
