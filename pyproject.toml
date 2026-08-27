@@ -1,3 +1,12 @@
+[dependency-groups]
+# pytest 7.x baseline: ROS Humble launch_testing plugins still use the old
+# pytest_pycollect_makemodule(path, parent) hookspec removed in pytest 8.
+test = [
+    "pytest>=7.4,<8",
+    "pytest-rerunfailures>=13,<15",
+    "pytest-cov>=4,<7",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120
