@@ -16,20 +16,12 @@ OPENEULER_ROS_REPO_FILE="/etc/yum.repos.d/openEulerROS.repo"
 # dnf expands it at resolve time.
 _openeuler_ros_repo_content() {
     cat << 'REPOEOF'
-[openEuler-Embedded-ROS-humble]
-name=openEuler-Embedded-ROS-humble
-baseurl=https://eur.openeuler.openatom.cn/results/openEuler_Embedded/IB_Robot-ROS_humble-release_1/openeuler-24.03_LTS-$basearch/
-skip_if_unavailable=True
+[openEuler-Embedded-ROS2-humble]
+name=openEuler-Embedded-ROS2-humble
+baseurl=https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-release3/openEuler%3A24.03-LTS/$basearch/
 enabled=1
 gpgcheck=0
 priority=1
-
-[openEulerROS-humble]
-name=openEulerROS-humble
-baseurl=https://repo.huaweicloud.com/openeuler/openEuler-24.03-LTS/EPOL/multi_version/ROS/humble/$basearch/
-enabled=1
-gpgcheck=0
-priority=2
 REPOEOF
 }
 
@@ -45,7 +37,7 @@ ensure_openeuler_ros_repo() {
     _openeuler_ros_repo_content > "${tmp}"
 
     if [[ -f "${OPENEULER_ROS_REPO_FILE}" ]] && cmp -s "${tmp}" "${OPENEULER_ROS_REPO_FILE}"; then
-        log_info "openEuler ROS Humble repos already configured and up to date."
+        log_info "openEuler ROS Humble repo already configured and up to date."
         rm -f "${tmp}"
         return 0
     fi
