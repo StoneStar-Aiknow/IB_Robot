@@ -57,16 +57,26 @@ class FullSubNetConfig:
     """FullSubNet 4ch 增强参数。"""
 
     # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
-    ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.tar"))
+    ckpt: str = field(
+        default_factory=lambda: _model_path(
+            "voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+        )
+    )
     # cumulative stateful T=2 拆分 OM；每次处理512 samples并显式续传FB/SB h/c。
     stateful_fb_om_path: str = field(
-        default_factory=lambda: _model_path("fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om")
+        default_factory=lambda: _model_path(
+            "voice_asr/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
+        )
     )
     stateful_sb_om_path: str = field(
-        default_factory=lambda: _model_path("fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om")
+        default_factory=lambda: _model_path(
+            "voice_asr/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
+        )
     )
     stateful_manifest_path: str = field(
-        default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json")
+        default_factory=lambda: _model_path(
+            "voice_asr/artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+        )
     )
     inference_bundle: str = field(default_factory=lambda: _model_path("voice_asr"))
     device_id: int = 0
@@ -84,7 +94,9 @@ class VadConfig:
     """Silero VAD 参数。"""
 
     # Silero VAD OM 在 310P 使用 Ascend ACL；ONNX 用于 Ubuntu 的相同门控流程。
-    model_path: str = field(default_factory=lambda: _model_path("voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"))
+    model_path: str = field(
+        default_factory=lambda: _model_path("voice_asr/artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om")
+    )
     sample_rate: int = 16000
     frame_size: int = 512  # Silero 子帧 = 32ms @ 16kHz
     input_source: str = "enh_mic1_mono"  # 增强 ch1 单麦
