@@ -11,6 +11,10 @@ from robot_skill_cli import hermes_launcher
 from robot_skill_cli.ros_bridge import BridgeError
 
 
+def test_hermes_local_command_timeout_allows_slow_embedded_targets() -> None:
+    assert hermes_launcher._HERMES_LOCAL_COMMAND_TIMEOUT_SEC == 60
+
+
 def test_packaged_control_skill_matches_workspace_canonical_copy() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     canonical = repository_root / ".agents" / "skills" / "ibrobot-control" / "SKILL.md"

@@ -60,7 +60,7 @@ class RosBridge:
         self._node = None
         self._executor = None
         self._spin_thread = None
-        self._owns_rclpy_context = False
+        self._context = None
         self._status_client = None
         self._snapshot_client = None
         self._reload_client = None
@@ -90,6 +90,7 @@ class RosBridge:
         self._WorkflowStep = None
         self._StartVisualGame = None
         self._GetVisualGameResult = None
+        self.start_error = ""
 
     def start(self) -> bool:
         try:
@@ -97,6 +98,7 @@ class RosBridge:
             from action_msgs.srv import CancelGoal
             from rclpy.action import ActionClient
             from rclpy.callback_groups import ReentrantCallbackGroup
+            from rclpy.context import Context
             from rclpy.executors import MultiThreadedExecutor
 
             from embodied_common.wire_contracts import validate_public_request_wire_contracts
@@ -116,15 +118,15 @@ class RosBridge:
             )
 
             validate_public_request_wire_contracts()
-        except Exception:
+        except Exception as exc:
+            self.start_error = f"{type(exc).__name__}: {exc}"
             return False
 
         try:
-            self._owns_rclpy_context = not rclpy.ok()
-            if self._owns_rclpy_context:
-                rclpy.init()
+            self._context = Context()
+            rclpy.init(context=self._context)
             suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-            self._node = rclpy.create_node(f"robot_skill_cli_{suffix}")
+            self._node = rclpy.create_node(f"robot_skill_cli_{suffix}", context=self._context)
             callback_group = ReentrantCallbackGroup()
             self._status_client = self._node.create_client(
                 GetSkillGatewayStatus,
@@ -212,11 +214,12 @@ class RosBridge:
             self._WorkflowStep = WorkflowStep
             self._StartVisualGame = StartVisualGame
             self._GetVisualGameResult = GetVisualGameResult
-            self._executor = MultiThreadedExecutor(num_threads=2)
+            self._executor = MultiThreadedExecutor(num_threads=2, context=self._context)
             self._executor.add_node(self._node)
             self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
             self._spin_thread.start()
-        except Exception:
+        except Exception as exc:
+            self.start_error = f"{type(exc).__name__}: {exc}"
             self.close()
             return False
         return True
@@ -904,12 +907,10 @@ class RosBridge:
         with contextlib.suppress(Exception):
             if self._node is not None:
                 self._node.destroy_node()
-        if self._owns_rclpy_context:
-            with contextlib.suppress(Exception):
-                import rclpy
-
-                if rclpy.ok():
-                    rclpy.shutdown()
+        with contextlib.suppress(Exception):
+            if self._context is not None and self._context.ok():
+                self._context.shutdown()
         self._node = None
         self._executor = None
         self._spin_thread = None
+        self._context = None
