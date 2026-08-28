@@ -74,14 +74,7 @@ _PARAMETER_TYPES = {
     "input_source": Parameter.Type.STRING,
     "wav_path": Parameter.Type.STRING,
     "wav_replay_rate": Parameter.Type.DOUBLE,
-    "fullsubnet_device": Parameter.Type.STRING,
-    "silero_vad_model_path": Parameter.Type.STRING,
-    "fullsubnet_ckpt": Parameter.Type.STRING,
-    "fullsubnet_stateful_fb_om_path": Parameter.Type.STRING,
-    "fullsubnet_stateful_sb_om_path": Parameter.Type.STRING,
-    "fullsubnet_stateful_manifest_path": Parameter.Type.STRING,
     "speech_direction_inference_bundle": Parameter.Type.STRING,
-    "fullsubnet_device_id": Parameter.Type.INTEGER,
     "silero_vad_backend": Parameter.Type.STRING,
     "fullsubnet_backend": Parameter.Type.STRING,
     "speech_direction_max_age_ms": Parameter.Type.INTEGER,
@@ -200,12 +193,6 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if not math.isfinite(wav_replay_rate) or wav_replay_rate <= 0:
         raise ValueError("参数 wav_replay_rate 必须是大于 0 的有限数")
 
-    fullsubnet_device_raw = _require_string(values, "fullsubnet_device")
-    if fullsubnet_device_raw not in {"cuda", "cpu"}:
-        raise ValueError("参数 fullsubnet_device 只能为 cuda 或 cpu")
-    # 各 stateful 后端对 device 有硬性要求（见 factory），此处只做边界校验不做静默归一化。
-    fullsubnet_device = fullsubnet_device_raw
-
     silero_backend_raw = _require_string(values, "silero_vad_backend")
     if silero_backend_raw not in {"ascend", "onnx"}:
         raise ValueError("参数 silero_vad_backend 只能为 ascend 或 onnx")
@@ -214,19 +201,8 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     fullsubnet_backend = _require_string(values, "fullsubnet_backend")
     if fullsubnet_backend not in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
         raise ValueError("参数 fullsubnet_backend 不是受支持的 Ascend/Torch 后端")
-    stateful_fb_path = _require_string(values, "fullsubnet_stateful_fb_om_path", allow_empty=True)
-    stateful_sb_path = _require_string(values, "fullsubnet_stateful_sb_om_path", allow_empty=True)
-    stateful_manifest = _require_string(values, "fullsubnet_stateful_manifest_path", allow_empty=True)
-    fullsubnet_device_id = _convert_int(values, "fullsubnet_device_id")
-    if fullsubnet_device_id < 0:
-        raise ValueError("参数 fullsubnet_device_id 不能为负数")
-    if fullsubnet_backend == "ascend" and not all((stateful_fb_path, stateful_sb_path, stateful_manifest)):
-        raise ValueError("fullsubnet_backend=ascend 时FB/SB OM和manifest均不能为空")
-    silero_path = _require_non_empty_string(values, "silero_vad_model_path")
+    bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
     # Torch stateful 后端需要 checkpoint + manifest；Model 类由 ibrobot-fullsubnet wheel 提供。
-    ckpt_path = _require_string(values, "fullsubnet_ckpt", allow_empty=True)
-    if fullsubnet_backend in {"stateful_torch_cuda", "stateful_torch_cpu"} and not all((ckpt_path, stateful_manifest)):
-        raise ValueError("stateful Torch 后端要求 cumulative checkpoint 和 manifest")
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
     if max_age_ms <= 0:
         raise ValueError("参数 speech_direction_max_age_ms 必须大于 0")
@@ -265,15 +241,11 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.pipeline.input_channels = list(channel_indices)
     cfg.doa.input_channels = list(channel_indices)
     cfg.doa.mic_positions = mic_positions
-    cfg.vad.model_path = silero_path
-    cfg.fullnet.ckpt = ckpt_path
-    cfg.fullnet.device = fullsubnet_device
+    cfg.fullnet.inference_bundle = bundle
+    cfg.fullnet.device = {"stateful_torch_cuda": "cuda", "stateful_torch_cpu": "cpu", "torch": "cpu"}.get(
+        fullsubnet_backend, "cuda"
+    )
     cfg.fullnet.backend = fullsubnet_backend
-    cfg.fullnet.stateful_fb_om_path = stateful_fb_path
-    cfg.fullnet.stateful_sb_om_path = stateful_sb_path
-    cfg.fullnet.stateful_manifest_path = stateful_manifest
-    cfg.fullnet.inference_bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
-    cfg.fullnet.device_id = fullsubnet_device_id
     cfg.vad.backend = silero_backend
     cfg.input_source = input_source
     cfg.wav_path = wav_path
@@ -315,6 +287,7 @@ class SpeechDirectionNode(Node):
         # 部署参数必须由 launch/YAML 注入，节点代码不提供业务默认值。
         self._declare_parameters()
         cfg = self._load_config_from_parameters()
+        self._apply_bundle_artifacts(cfg)
         self._config = cfg
         self._mount_yaw_deg = cfg.mount_yaw_deg
 
@@ -387,6 +360,25 @@ class SpeechDirectionNode(Node):
         """读取 ROS 参数并通过纯函数完成集中校验与配置构造。"""
         values = {name: self.get_parameter(name).value for name in _PARAMETER_NAMES}
         return build_config_from_parameter_values(values)
+
+    @staticmethod
+    def _apply_bundle_artifacts(cfg: SpeechDirectionConfig) -> None:
+        """Derive Ascend artifact paths from the selected speech bundle manifest."""
+        if cfg.fullnet.backend != "ascend":
+            return
+        bundle = Path(cfg.fullnet.inference_bundle)
+        fullsubnet = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
+        silero = load_inference_manifest(bundle, "ascend_310p_silero")
+        full_artifacts = fullsubnet.deployment.artifacts
+        silero_artifacts = silero.deployment.artifacts
+        full_profile = fullsubnet.role_runtime_profiles.get("fullsubnet_fb")
+        if full_profile is None:
+            raise ValueError("speech_direction FullSubNet deployment has no runtime profile")
+        cfg.fullnet.device_id = int(full_profile.profile.device_id)
+        cfg.fullnet.stateful_fb_om_path = str(bundle / full_artifacts["fullsubnet_fb"].path)
+        cfg.fullnet.stateful_sb_om_path = str(bundle / full_artifacts["fullsubnet_sb"].path)
+        cfg.fullnet.stateful_manifest_path = str(bundle / full_artifacts["fullsubnet_checkpoint_manifest"].path)
+        cfg.vad.model_path = str(bundle / silero_artifacts["silero_vad"].path)
 
     # ------------------------------------------------------------------ 算法链构建
     def _make_session_dir(self) -> str:

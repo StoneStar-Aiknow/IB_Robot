@@ -120,12 +120,14 @@ def test_silero_inference_uses_standalone_session_execution() -> None:
 
 @pytest.mark.parametrize("deployment_name", ["ascend_310p_fullsubnet", "ascend_310p_silero"])
 def test_checked_in_speech_manifest_selects_generic_stateful_session(tmp_path, deployment_name) -> None:
-    config_root = _SRC / "config"
+    config_root = _WORKSPACE_SRC.parent / "models" / "voice_asr"
     manifest = json.loads((config_root / "inference_manifest.json").read_text(encoding="utf-8"))
+    for deployment in manifest["deployments"].values():
+        for artifact in deployment["artifacts"].values():
+            artifact.pop("sha256", None)
     (tmp_path / "inference_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    adapter_dir = tmp_path / "assets"
-    adapter_dir.mkdir()
-    (adapter_dir / "adapter.json").write_bytes((config_root / "assets" / "adapter.json").read_bytes())
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "README.md").write_text("test bundle\n", encoding="utf-8")
     for deployment in manifest["deployments"].values():
         for artifact in deployment["artifacts"].values():
             path = tmp_path / artifact["path"]

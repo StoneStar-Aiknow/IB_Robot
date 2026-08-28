@@ -22,14 +22,7 @@ def _prepend_env(current: str, entries: tuple[Path, ...]) -> str:
     return os.pathsep.join(values)
 
 
-_MODEL_PATH_KEYS = (
-    "silero_vad_model_path",
-    "fullsubnet_ckpt",
-    "fullsubnet_stateful_fb_om_path",
-    "fullsubnet_stateful_sb_om_path",
-    "fullsubnet_stateful_manifest_path",
-    "speech_direction_inference_bundle",
-)
+_MODEL_PATH_KEYS = ("speech_direction_inference_bundle",)
 
 
 def _workspace_root() -> Path:
@@ -57,9 +50,7 @@ def _load_profile_overrides(profiles_path: str | Path, profile: str) -> dict[str
         raise ValueError(f"平台 profile {profile} 必须是 mapping")
     allowed = {
         "silero_vad_backend",
-        "silero_vad_model_path",
         "fullsubnet_backend",
-        "fullsubnet_device",
     }
     unexpected = set(overrides) - allowed
     if unexpected:
@@ -75,7 +66,6 @@ def _validate_profile_combination(profile: str, params: Mapping[str, object]) ->
         expected = {
             "silero_vad_backend": "onnx",
             "fullsubnet_backend": "stateful_torch_cuda",
-            "fullsubnet_device": "cuda",
         }
     else:
         return

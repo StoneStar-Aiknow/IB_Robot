@@ -9,7 +9,7 @@
     python3 scripts/run_310p_acl_latency.py --wav <raw6ch.wav> [--fb-om ... --sb-om ... --manifest ...]
 
 --wav 必传（无默认）：raw6ch 麦克风阵列录音，可用节点跑诊断生成（见 diagnostics）。
-模型默认相对仓库根 models/fullsubnet/（mixed16 OM + 218epochs manifest）。
+模型默认位于 models/voice_asr bundle（mixed16 OM + 218epochs manifest）。
 预算 32ms/block（512 samples = 2 tick）。
 对照：test_offline_regression.py 内置时延断言（Ubuntu CUDA 侧 Host 编排 baseline）。
 
@@ -35,7 +35,7 @@ INPUT_SAMPLES = 512
 
 # 仓库根（scripts/ 上两级），模型默认路径相对此根，不依赖具体部署位置。
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MODEL_DIR = _REPO_ROOT / "models" / "fullsubnet"
+_MODEL_DIR = _REPO_ROOT / "models" / "voice_asr" / "artifacts" / "ascend" / "fullsubnet"
 
 
 def _stat(values: list[float]) -> dict:
@@ -55,7 +55,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # wav 必传：raw6ch 录音是运行时产物，不应硬编码默认路径
     parser.add_argument("--wav", required=True, help="raw6ch 麦克风阵列录音 wav 路径")
-    # 模型默认相对仓库根 models/fullsubnet/，mixed16（310P 实测与 fp16 差异很小）
+    # 模型默认位于 models/voice_asr bundle，mixed16（310P 实测与 fp16 差异很小）
     parser.add_argument(
         "--fb-om",
         default=str(_MODEL_DIR / "fullsubnet_cum_stateful_fb_b4_t2_mixed16.om"),

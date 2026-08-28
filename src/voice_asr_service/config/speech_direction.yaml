@@ -29,20 +29,8 @@ speech_direction_node:
     wav_path: ""
     wav_replay_rate: 1.0
 
-    # 生产后端:ascend(310P) 或 stateful_torch_cuda(Ubuntu)。
-    silero_vad_backend: "ascend"
-    silero_vad_model_path: "voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"
-    fullsubnet_backend: "ascend"
-    # 生产模式固定使用 Ascend ACL，hidden/cell 在 Device 双 bank 常驻。
-    fullsubnet_device_id: 0
-    fullsubnet_stateful_fb_om_path: "fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
-    fullsubnet_stateful_sb_om_path: "fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
-    fullsubnet_stateful_manifest_path: "fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+    # 模型 bundle；具体 deployment、backend、device 和 artifact 由 manifest/profile 决定。
     speech_direction_inference_bundle: "voice_asr"
-    # Ubuntu stateful Torch 使用同一个 218epochs cumulative checkpoint。
-    # FullSubNet 源码(model.py + audio_zen)由 ibrobot-fullsubnet wheel 提供。
-    fullsubnet_ckpt: "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
-    fullsubnet_device: "cuda"
 
     speech_direction_max_age_ms: 1300
 
