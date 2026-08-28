@@ -106,6 +106,9 @@ from robot_config.utils import (
 )
 from tensormsg.converter import TensorMsgConverter
 
+_CLOUD_HANDSHAKE_WARNING_DELAY_S = 5.0
+_CLOUD_HANDSHAKE_WARNING_THROTTLE_S = 10.0
+
 
 @dataclass(frozen=True)
 class PipelineNodeConfig:
@@ -259,6 +262,8 @@ class PipelinePolicyNode(Node):
         self._inference_count = 0
         self._last_error = ""
         self._remote_state = "unavailable"
+        self._distributed_started_monotonic = time.monotonic()
+        self._last_cloud_status_received_monotonic: float | None = None
         # Preserve the legacy operation lock unchanged. Scheduled Dispatch uses
         # separate capacity slots validated against backend capabilities.
         self._operation_lock = threading.Lock()
@@ -1863,8 +1868,17 @@ class PipelinePolicyNode(Node):
             return
         try:
             status = status_from_message(message)
+            self._last_cloud_status_received_monotonic = time.monotonic()
+            was_ready = self._require_edge_session().ready
             update = self._require_edge_session().observe_cloud(status)
             self._remote_state = status.runtime_state
+            if not status.ready:
+                self.get_logger().warning(
+                    "Cloud pipeline discovered but is not ready: "
+                    f"runtime_state={status.runtime_state!r}; waiting for cloud backend readiness "
+                    "before binding the distributed session",
+                    throttle_duration_sec=_CLOUD_HANDSHAKE_WARNING_THROTTLE_S,
+                )
             self._complete_invalidated(update.invalidated_request_ids, update.error)
             video_manager = self._video_stream_manager
             if video_manager is not None:
@@ -1874,6 +1888,11 @@ class PipelinePolicyNode(Node):
                         self._publish_video_stream_control()
                 else:
                     video_manager.clear_session()
+            if not was_ready and self._require_edge_session().ready:
+                session_id, session_generation = self._require_edge_session().session
+                self.get_logger().info(
+                    f"Cloud handshake established: session_id={session_id}, session_generation={session_generation}"
+                )
         except Exception as exc:
             self._last_error = f"invalid cloud status: {exc}"
             self.get_logger().error(self._last_error)
@@ -1889,10 +1908,25 @@ class PipelinePolicyNode(Node):
             self._last_error = f"failed to publish distributed status: {exc}"
 
     def _check_heartbeat(self) -> None:
-        update = self._require_edge_session().expire_heartbeat()
+        session = self._require_edge_session()
+        if not session.ready and self._last_cloud_status_received_monotonic is None:
+            elapsed = time.monotonic() - self._distributed_started_monotonic
+            if elapsed >= _CLOUD_HANDSHAKE_WARNING_DELAY_S:
+                self.get_logger().warning(
+                    "Distributed pipeline is running locally but no cloud heartbeat has been received "
+                    f"for {elapsed:.1f}s; start pure_inference_node and verify the heartbeat topic "
+                    f"{self._config.heartbeat_topic!r} and ROS 2 discovery settings",
+                    throttle_duration_sec=_CLOUD_HANDSHAKE_WARNING_THROTTLE_S,
+                )
+        update = session.expire_heartbeat()
         self._complete_invalidated(update.invalidated_request_ids, update.error)
-        if update.error is not None and self._video_stream_manager is not None:
-            self._video_stream_manager.clear_session()
+        if update.error is not None:
+            if self._video_stream_manager is not None:
+                self._video_stream_manager.clear_session()
+            if update.error.code == "heartbeat_expired":
+                self.get_logger().warning(
+                    "Cloud heartbeat expired; distributed session was cleared and is waiting for handshake recovery"
+                )
 
     def _publish_video_stream_control(self) -> None:
         manager = self._video_stream_manager
