@@ -98,6 +98,24 @@ install_lerobot_editable() {
     "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep]"
 }
 
+install_graspgen_torch_abi() {
+    # The checked-in pointnet2_ops wheel is built against this exact Torch ABI.
+    # Keep CUDA hosts on their existing Torch installation so the source-build
+    # path remains available, but make the no-nvcc path self-contained.
+    if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
+        return 0
+    fi
+    if command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
+        return 0
+    fi
+
+    log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
+    run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
+        "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
+        --index-url "https://download.pytorch.org/whl/cu126" \
+        --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
+}
+
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
@@ -182,6 +200,8 @@ setup_python_venv() {
     if [[ -d "${lerobot_dir}" ]]; then
         ensure_lerobot_patch_stack_applied
     fi
+
+    install_graspgen_torch_abi
 
     # Install LeRobot in editable mode
     # Note: Do not pass the -c numpy==1.26.4 constraint. The lerobot dependency graph
