@@ -346,14 +346,10 @@ EOF
     # manipulation_service is part of the default workspace build. Skip on
     # openEuler Embedded because GraspGen's pointnet2_ops CUDA extension is
     # validated on Ubuntu only; the Ascend OM path does not cover Torch grasp.
-    # Also skip on Ubuntu hosts without a CUDA toolkit (nvcc) so the default
-    # setup does not hard-fail on CPU-only machines — GraspGen's CUDA
-    # extension cannot be compiled without nvcc (same pattern as SAM2_BUILD_CUDA=0).
+    # On Ubuntu hosts without nvcc, install_graspgen_pip falls back to the
+    # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
     if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
-    elif ! command -v nvcc >/dev/null 2>&1 && [[ ! -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
-        log_warn "No CUDA toolkit (nvcc) found; skipping GraspGen pointnet2_ops (grasp CUDA backend unavailable)."
-        log_warn "Install a CUDA toolkit and re-run ./scripts/setup.sh to enable the default grasp install."
     else
         log_info "Installing grasp dependencies (GraspGen)..."
         # shellcheck disable=SC1091
@@ -388,8 +384,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]] \
-       && { command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; }; then
+    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 

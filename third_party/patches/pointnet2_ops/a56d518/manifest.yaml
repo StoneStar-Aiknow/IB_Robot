@@ -1,0 +1,30 @@
+upstream:
+  repository: https://github.com/NVlabs/GraspGen.git
+  commit: a56d518f3b76ea2a432b5b838b3c68027d29be49
+distribution:
+  name: pointnet2_ops
+  version: 3.0.0+ibrobot.1
+  import_package: pointnet2_ops
+  wheel: ../../../wheels/pointnet2_ops/a56d518/pointnet2_ops-3.0.0+ibrobot.1-cp310-cp310-manylinux_2_17_x86_64.whl
+  license: NVIDIA License
+  license_file: LICENSE
+build:
+  python: "3.10"
+  torch: "2.7.1+cu126"
+  cuda: "12.6"
+  cuda_arch: "8.6"
+  source_date_epoch: 1739846159
+  command: scripts/build_pointnet2ops_wheel.sh
+runtime:
+  python: "3.10"
+  torch: "==2.7.1+cu126"
+  cuda: "12.6"
+  cuda_arch: "sm_86"
+  platform: manylinux_2_17_x86_64
+  notes: >
+    Binary CUDA extension wheel for the pinned GraspGen pointnet2_ops source.
+    The artifact is restricted by the NVIDIA License to non-commercial research
+    or evaluation use and must be redistributed with the complete LICENSE file.
+patches:
+  - file: 0001-package-pointnet2-ops-wheel.patch
+    purpose: Add the complete NVIDIA License to the package and pin audited wheel metadata.
