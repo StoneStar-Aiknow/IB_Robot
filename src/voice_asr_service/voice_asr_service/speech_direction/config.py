@@ -44,6 +44,7 @@ class PipelineConfig:
     # runtime 每 256 samples 调度一次；两个 tick 聚合为一次 T=2 模型调用。
     processing_hop_samples: int = 256
     model_batch_samples: int = 512
+    srp_update_interval_hops: int = 2
     frame_size: int = 4096  # 兼容旧调用方，语义等同 srp_frame_samples
     hop_size: int = 512  # 兼容旧调用方，语义等同 srp_hop_samples，禁止作为 processing tick
     fft_size: int = 4096
@@ -55,8 +56,6 @@ class PipelineConfig:
 class FullSubNetConfig:
     """FullSubNet 4ch 增强参数。"""
 
-    # 模型路径用绝对路径(基于工作区根推算),避免相对路径 cwd 敏感
-    repo_dir: str = field(default_factory=lambda: _model_path("fullsubnet_repo"))
     # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
     ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.tar"))
     # FullSubNet 静态 om(旧8192/2048回退链路,文件名为 fullsubnet_v6_310p_mixed16.om)

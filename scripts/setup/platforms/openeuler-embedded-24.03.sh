@@ -18,9 +18,9 @@ platform_prepare_host() {
 
     ensure_openeuler_volatile_dirs
     ensure_openeuler_builtin_repos
+    ensure_openeuler_ros_repo
     ensure_openeuler_ca_certificates
     ensure_openeuler_extras_repo
-    ensure_openeuler_ros_repo
     warn_openeuler_duplicate_ros_repos
     ensure_openeuler_gpg_key
 

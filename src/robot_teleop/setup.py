@@ -6,6 +6,8 @@ from glob import glob
 from setuptools import find_packages, setup
 
 package_name = "robot_teleop"
+vendor_root = os.path.join("..", "..", "third_party", "vendor", "mhandpro", "3.0.20")
+vendor_metadata = [path for path in glob(os.path.join(vendor_root, "*")) if os.path.isfile(path)]
 
 setup(
     name=package_name,
@@ -15,8 +17,12 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
-        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        (os.path.join("share", package_name, "config"), glob("config/*.yaml") + glob("config/*.json")),
         (os.path.join("share", package_name, "web"), glob("web/*")),
+        (
+            os.path.join("share", package_name, "vendor", "mhandpro", "3.0.20"),
+            vendor_metadata,
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -27,6 +33,9 @@ setup(
     entry_points={
         "console_scripts": [
             "teleop_node = robot_teleop.teleop_node:main",
+            "calibrate_glove = robot_teleop.calibrate_glove:main",
+            "analyze_glove_capture = robot_teleop.analyze_glove_capture:main",
+            "mhandpro_source_node = robot_teleop.mhandpro_source_node:main",
             "vr_teleop = robot_teleop.vr_teleop:main",
         ],
     },

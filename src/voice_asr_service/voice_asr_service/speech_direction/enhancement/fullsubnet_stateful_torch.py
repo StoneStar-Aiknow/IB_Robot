@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
-import importlib.util
 import json
 import logging
-import sys
 import threading
 import time
 from pathlib import Path
@@ -29,7 +26,6 @@ from .fullsubnet_stateful_executor import (
 
 logger = logging.getLogger(__name__)
 
-_MODEL_REL = Path("recipes/dns_interspeech_2020/fullsubnet/model.py")
 _MODEL_KW = {
     "num_freqs": NUM_FREQS,
     "look_ahead": 2,
@@ -54,22 +50,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_model_class(repo_dir: Path):
-    """按绝对路径加载上游 Model，且不长期污染 sys.path。"""
-    model_path = repo_dir / _MODEL_REL
-    if not model_path.is_file():
-        raise FileNotFoundError(f"FullSubNet model.py 不存在: {model_path}")
-    spec = importlib.util.spec_from_file_location("fullsubnet_cumulative_runtime_model", model_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载 FullSubNet model.py: {model_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.path.append(str(repo_dir))
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        with contextlib.suppress(ValueError):
-            sys.path.remove(str(repo_dir))
-    return module.Model
+def _load_model_class():
+    """Load the upstream FullSubNet Model class from the installed wheel package."""
+    from fullsubnet.model import Model
+
+    return Model
 
 
 class StatefulFullBandT2(nn.Module):
@@ -106,7 +91,6 @@ class StatefulTorchFullSubNetExecutor:
 
     def __init__(
         self,
-        repo_dir: str,
         checkpoint_path: str,
         manifest_path: str = "",
         *,
@@ -126,7 +110,6 @@ class StatefulTorchFullSubNetExecutor:
         self._timing_enabled = bool(timing_enabled)
         self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
 
-        repo = Path(repo_dir)
         checkpoint = Path(checkpoint_path)
         if not checkpoint.is_file():
             raise FileNotFoundError(f"FullSubNet cumulative checkpoint 不存在: {checkpoint}")
@@ -142,7 +125,7 @@ class StatefulTorchFullSubNetExecutor:
             if expected_sha and _sha256(checkpoint) != expected_sha:
                 raise ValueError(f"FullSubNet cumulative checkpoint SHA-256 错误: {checkpoint}")
 
-        Model = _load_model_class(repo)
+        Model = _load_model_class()
         model = Model(**_MODEL_KW)
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         result = model.load_state_dict(payload["model"], strict=True)

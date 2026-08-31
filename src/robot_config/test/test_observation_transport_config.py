@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.contract_utils import contract_fingerprint
+from robot_config.contract_utils import contract_fingerprint, resolve_image_encoding
 from robot_config.generators.contract import (
     build_contract_from_robot_config_dict,
     generate_contract_from_robot_config,
@@ -292,3 +292,24 @@ def test_development_profile_typed_and_raw_contracts_match():
     raw_contract = build_contract_from_robot_config_dict(raw)
 
     assert typed_contract.observations == raw_contract.observations
+
+
+def test_resolve_image_encoding_passes_through_ros_encodings():
+    for encoding in ("rgb8", "bgr8", "RGB8", " mono8 ", "rgba8", "32fc1"):
+        assert resolve_image_encoding(encoding) == encoding.strip().lower()
+
+
+def test_resolve_image_encoding_maps_driver_pixel_formats_to_wire_encoding():
+    # usb_cam 0.8.1 publishes RGB8 for its mjpeg2rgb conversion; consumers
+    # must mirror the real driver instead of guessing bgr8.
+    assert resolve_image_encoding("mjpeg2rgb") == "rgb8"
+    assert resolve_image_encoding("MJPEG2RGB") == "rgb8"
+
+
+def test_resolve_image_encoding_fails_closed_on_unknown_values():
+    for encoding in ("", "  "):
+        with pytest.raises(ValueError, match="must not be empty"):
+            resolve_image_encoding(encoding)
+    for encoding in ("yuyv", "mjpeg", "not-an-encoding"):
+        with pytest.raises(ValueError, match="unknown image encoding"):
+            resolve_image_encoding(encoding)

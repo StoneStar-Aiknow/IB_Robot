@@ -164,7 +164,7 @@ def test_package_torch_deployments_supports_device_selection_and_prefix(tmp_path
     assert validated[0].deployment.device == "cpu"
 
 
-def test_package_deployment_artifact_creates_immutable_generation(tmp_path):
+def test_package_deployment_artifact_reuses_identical_immutable_generation(tmp_path):
     source = tmp_path / "policy.rknn"
     source.write_bytes(b"rknn")
 
@@ -188,8 +188,48 @@ def test_package_deployment_artifact_creates_immutable_generation(tmp_path):
         deployment_name="rk3588",
         role="policy",
     )
-    assert repackaged != packaged
-    assert repackaged.read_bytes() == packaged.read_bytes()
+    assert repackaged == packaged
+
+    source.chmod(0o755)
+    executable = package_deployment_artifact(
+        tmp_path,
+        source,
+        backend="rknn",
+        deployment_name="rk3588-executable",
+        role="policy",
+    )
+    assert executable != packaged
+    assert executable.stat().st_mode & 0o111
+
+
+def test_package_deployment_artifact_prefers_target_deployments_current_generation(tmp_path):
+    _create_bundle(tmp_path)
+    older = tmp_path / "artifacts/rknn/older/generations/000/policy.rknn"
+    current = tmp_path / "artifacts/rknn/target/generations/999/policy.rknn"
+    source = tmp_path / "source.rknn"
+    for path in (older, current, source):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"same")
+    deployment = compiled_deployment(
+        tmp_path,
+        backend="rknn",
+        target_soc="rk3588",
+        target_runtime="rknn-lite2",
+        artifacts={"policy": (current, "rknn")},
+        execution=("policy",),
+        bindings={"policy": _act_bindings()},
+    )
+    upsert_deployment(tmp_path, "target", deployment)
+
+    packaged = package_deployment_artifact(
+        tmp_path,
+        source,
+        backend="rknn",
+        deployment_name="target",
+        role="policy",
+    )
+
+    assert packaged == current
 
 
 def test_artifact_binding_requires_complete_semantic_and_layout_mapping():

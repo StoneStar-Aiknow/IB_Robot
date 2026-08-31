@@ -2,21 +2,24 @@
 
 本目录用于存放 **IB_Robot 对上游第三方依赖的受控定制内容**。
 
-当前目录维护 LeRobot 补丁栈，以及由固定上游版本和补丁构建的第三方 wheel：
+当前目录维护 LeRobot 补丁栈、由固定上游版本和补丁构建的第三方 wheel，以及需要单独
+核对许可证和平台约束的厂商制品清单：
 
 ```text
 third_party/
 ├── patches/
 │   ├── lerobot/
-│         ├── INDEX.yaml
-│         └── v0.5.1/
-│             ├── 0001-*.patch
-│             ├── 0002-*.patch
-│             ├── ...
-│             ├── manifest.yaml
-│             ├── series.txt
-│             ├── series.master-parity-candidates.txt
-│   │       └── series.openharmony-5.1.0-musl.txt
+│       ├── INDEX.yaml
+│       ├── v0.6.0/                     # 当前激活 tag（兼容/推理/导出补丁）
+│       │   ├── 0001-*.patch
+│       │   ├── 0002-*.patch
+│       │   ├── ...
+│       │   ├── manifest.yaml
+│       │   ├── series.txt
+│       │   ├── series.master-parity-candidates.txt
+│       │   └── series.openharmony-5.1.0-musl.txt
+│       └── v0.5.1/                      # archived，保留完整训练补丁栈供参考/回退
+│           └── ...
 │   ├── recognize-anything/<commit>/
 │   │   ├── manifest.yaml
 │   │   ├── series.txt
@@ -25,13 +28,19 @@ third_party/
 │       ├── manifest.yaml
 │       ├── series.txt
 │       └── 0001-*.patch
-└── wheels/
+├── wheels/
     ├── recognize-anything/<commit>/
     │   ├── ibrobot_ram-*.whl
     │   └── SHA256SUMS
     └── groundingdino/<commit>/
         ├── ibrobot_groundingdino-*.whl
         └── SHA256SUMS
+└── vendor/
+    └── mhandpro/<version>/
+        ├── manifest.yaml
+        ├── README.md
+        ├── NOTICE
+        └── LICENSE_STATUS.md
 ```
 
 RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。GroundingDINO wheel 通过
@@ -40,6 +49,10 @@ RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上�
 CUDA 用户如需最优性能可单独构建 `_C` 扩展）。setup 使用 `--no-deps` 安装这些 wheel，Python runtime 依赖仍由
 `requirements/perception.txt` 统一解析，避免第三方元数据覆盖
 IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
+
+`vendor/` 中的 manifest 记录厂商制品的技术身份、授权状态和预期外部路径，不自动授予
+许可证。未获公开再分发授权的二进制不得进入提交或发布包；用户必须从合法来源取得外部
+副本。取得厂商书面再分发授权后，必须同时提交授权文本、NOTICE、制品哈希和适用平台说明。
 
 ## 设计目标
 
@@ -60,8 +73,8 @@ IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 作用：
 
 1. 作为 **LeRobot patch stack 的上层索引**。
-2. 指定当前激活的上游 tag，例如 `active_tag: v0.5.1`。
-3. 将 tag 字符串映射到实际目录，例如 `v0.5.1 -> third_party/patches/lerobot/v0.5.1/`。
+2. 指定当前激活的上游 tag，例如 `active_tag: v0.6.0`。
+3. 将 tag 字符串映射到实际目录，例如 `v0.6.0 -> third_party/patches/lerobot/v0.6.0/`。
 4. 记录该 tag 对应的上游 commit 与默认分支名。
 
 它是整个补丁栈的入口。`scripts/setup/lerobot_patches.sh` 不会直接硬编码某个 tag 目录，而是先通过 `scripts/setup/lerobot_resolve_active.py` 解析 `INDEX.yaml`，再进入对应版本目录。
@@ -178,7 +191,7 @@ LeRobot patch stack 的生效路径大致如下：
 
 1. `scripts/setup/lerobot_patches.sh` 读取 `third_party/patches/lerobot/INDEX.yaml`。
 2. `scripts/setup/lerobot_resolve_active.py` 解析当前激活 tag。
-3. 进入对应目录，例如 `third_party/patches/lerobot/v0.5.1/`。
+3. 进入对应目录，例如 `third_party/patches/lerobot/v0.6.0/`。
 4. 根据目标 profile 选择一条 `series*.txt`。
 5. 使用 `scripts/setup/lerobot_filter_series.py` 按 `manifest.yaml` 中的 `python_min/python_max/profiles` 过滤 patch。
 6. 对保留下来的 patch 按顺序执行 `git am`。
@@ -200,7 +213,7 @@ LeRobot patch stack 的生效路径大致如下：
 
 ## 当前目录的建议理解方式
 
-如果只看 `third_party/patches/lerobot/v0.5.1/`，可以把里面的文件理解为三层：
+如果只看 `third_party/patches/lerobot/v0.6.0/`，可以把里面的文件理解为三层：
 
 1. `000x-*.patch`：真正的代码改动。
 2. `series*.txt`：针对不同场景的 patch 装配清单。
@@ -223,10 +236,11 @@ LeRobot patch stack 的生效路径大致如下：
 ## 相关文件
 
 - `third_party/patches/lerobot/INDEX.yaml`
-- `third_party/patches/lerobot/v0.5.1/manifest.yaml`
-- `third_party/patches/lerobot/v0.5.1/series.txt`
-- `third_party/patches/lerobot/v0.5.1/series.master-parity-candidates.txt`
-- `third_party/patches/lerobot/v0.5.1/series.openharmony-5.1.0-musl.txt`
+- `third_party/patches/lerobot/v0.6.0/manifest.yaml`
+- `third_party/patches/lerobot/v0.6.0/series.txt`
+- `third_party/patches/lerobot/v0.6.0/series.master-parity-candidates.txt`
+- `third_party/patches/lerobot/v0.6.0/series.openharmony-5.1.0-musl.txt`
+- `third_party/patches/lerobot/v0.5.1/` (archived, 完整训练补丁栈)
 - `scripts/setup/lerobot_patches.sh`
 - `scripts/setup/lerobot_resolve_active.py`
 - `scripts/setup/lerobot_filter_series.py`

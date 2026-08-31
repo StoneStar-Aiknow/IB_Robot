@@ -119,6 +119,8 @@ class EulerIterationStateAdapter:
     velocity_trace: list[np.ndarray] | None = None
 
     def initialize(self, frame: StageFrame) -> None:
+        if self.velocity_trace is not None:
+            self.velocity_trace.clear()
         value = frame.values.get(self.state_semantic)
         if value is None and self.initializer is not None:
             value = self.initializer(frame.values)

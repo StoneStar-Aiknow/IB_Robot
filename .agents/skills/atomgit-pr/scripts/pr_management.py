@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
+from reuse_gate import count_changed_lines, reuse_gate_required, reuse_self_check_status, validate_reuse_self_check
 from verification_gate import (
     compute_verification_inputs,
     extract_verification_metadata,
@@ -86,6 +87,11 @@ def mode_fetch_info(args, api: AtomGitClient):
                 "wip": is_wip_title(pr.get("title") or ""),
                 "verification_inputs": verification_inputs,
                 "verification": verification_metadata,
+                "reuse_self_check": {
+                    "changed_lines": count_changed_lines(files),
+                    "required": reuse_gate_required(files),
+                    "status": reuse_self_check_status(pr.get("body") or ""),
+                },
                 "stats": {
                     "files_changed": len(files),
                     "additions": additions,
@@ -184,6 +190,11 @@ def mode_update_pr(args, api: AtomGitClient):
                 verification_inputs,
                 current_tree,
             )
+
+        try:
+            validate_reuse_self_check(description, files)
+        except ValueError as e:
+            raise ValueError(f"large-PR reuse self-check failed: {e}") from e
 
         if not args.human_reviewed and not args.dry_run:
             raise ValueError("更新 PR 前必须由开发者人工审查，并显式传入 --human-reviewed")

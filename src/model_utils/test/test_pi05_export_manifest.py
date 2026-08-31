@@ -12,6 +12,7 @@ from inference_manifest import load_inference_manifest
 from inference_service.pi05_schedule import load_pi05_schedule
 from model_utils.pi05_export import _cli
 from model_utils.pi05_export.convert_om import (
+    _run_atc,
     build_arg_parser,
     convert_role,
     replace_pi05_ascend_schedule,
@@ -88,6 +89,56 @@ def test_convert_role_removes_stale_om_before_atc(tmp_path, monkeypatch):
         )
 
     assert not om_path.exists()
+
+
+def test_run_atc_resolves_external_data_from_onnx_directory(tmp_path, monkeypatch):
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    onnx_path = onnx_dir / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+    recorded = {}
+
+    def fake_run(command, *, check, cwd):
+        recorded.update(command=command, check=check, cwd=cwd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("model_utils.pi05_export.convert_om.subprocess.run", fake_run)
+
+    assert _run_atc(
+        onnx_path,
+        tmp_path / "model.om",
+        "Ascend310P3",
+        extra_args=[],
+        input_shape_mode="none",
+    )
+    assert recorded["check"] is False
+    assert recorded["cwd"] == onnx_dir
+    assert f"--model={onnx_path}" in recorded["command"]
+
+
+def test_run_atc_resolves_relative_model_before_changing_cwd(tmp_path, monkeypatch):
+    onnx_dir = tmp_path / "run" / "onnx"
+    onnx_dir.mkdir(parents=True)
+    onnx_path = onnx_dir / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+    recorded = {}
+
+    def fake_run(command, *, check, cwd):
+        recorded.update(command=command, check=check, cwd=cwd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("model_utils.pi05_export.convert_om.subprocess.run", fake_run)
+
+    assert _run_atc(
+        Path("run/onnx/model.onnx"),
+        tmp_path / "model.om",
+        "Ascend310P3",
+        extra_args=[],
+        input_shape_mode="none",
+    )
+    assert recorded["cwd"] == onnx_dir
+    assert f"--model={onnx_path}" in recorded["command"]
 
 
 def test_write_pi05_ascend_deployment_uses_compiled_abis_and_strict_loader(tmp_path):
@@ -446,24 +497,23 @@ def _resolved(tmp_path: Path, steps: str) -> SimpleNamespace:
     _create_pi05_bundle(policy)
     args = Namespace(
         policy_path=str(policy),
-        output_dir=str(tmp_path / "onnx"),
-        runtime_save_dir=str(tmp_path / "runtime"),
-        om_dir=str(tmp_path / "om"),
+        work_dir=str(tmp_path / "work"),
         dtype="fp16",
         device="cpu",
         donor_device="cpu",
         fast_gelu=False,
+        fast_gelu_scope="none",
         soc_version="Ascend310P3",
         schedule_file=None,
         deployment="ascend",
-        quant_deployment="ascend-w8a8",
         abi_device_id=0,
         acl_config_path=None,
         steps=steps,
         batch_path=str(tmp_path / "batches.json"),
-        calib_dir=None,
         num_calib=2,
         amp_num=0,
+        amp_rank_samples=1,
+        amp_scratch_dir=None,
         task="pick",
         log_level="INFO",
     )
@@ -475,6 +525,7 @@ def _mock_pipeline(monkeypatch, resolved, *, skip_product: str | None = None):
     monkeypatch.setattr(pipeline._cli, "print_effective", lambda value: None)
     monkeypatch.setattr(pipeline._cli, "write_last", lambda value: None)
     monkeypatch.setattr(pipeline, "print_summary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_capture_ae_calibration", lambda _ctx: None)
 
     def runner(step):
         def run(ctx):
@@ -526,16 +577,122 @@ def _mock_pipeline(monkeypatch, resolved, *, skip_product: str | None = None):
     monkeypatch.setattr(pipeline, "_run_module", run_module)
 
 
+def test_pipeline_defaults_to_normalized_work_directory(tmp_path, monkeypatch):
+    resolved = _resolved(tmp_path, "vlm_onnx")
+    resolved.args.work_dir = None
+    _mock_pipeline(monkeypatch, resolved)
+
+    assert pipeline.main() == 0
+
+    expected = tmp_path / "_work" / "bundle" / "ascend" / "pi05" / "onnx"
+    assert (expected / "pi05-vlm_op17_nodyn_fp16_cpu.onnx").is_file()
+
+
+def test_pipeline_rejects_bundle_local_work_directory_before_creation(tmp_path, monkeypatch):
+    resolved = _resolved(tmp_path, "vlm_onnx")
+    unsafe = Path(resolved.args.policy_path) / "work"
+    resolved.args.work_dir = str(unsafe)
+    monkeypatch.setattr(pipeline._cli, "resolve", lambda: resolved)
+    monkeypatch.setattr(pipeline._cli, "print_effective", lambda value: None)
+
+    with pytest.raises(SystemExit, match="must be outside"):
+        pipeline.main()
+
+    assert not unsafe.exists()
+
+
+def test_pipeline_rejects_bundle_local_amp_scratch_before_creation(tmp_path, monkeypatch):
+    resolved = _resolved(tmp_path, "vlm_onnx")
+    unsafe = Path(resolved.args.policy_path) / "amp"
+    resolved.args.amp_scratch_dir = str(unsafe)
+    monkeypatch.setattr(pipeline._cli, "resolve", lambda: resolved)
+    monkeypatch.setattr(pipeline._cli, "print_effective", lambda value: None)
+
+    with pytest.raises(SystemExit, match="must be outside"):
+        pipeline.main()
+
+    assert not unsafe.exists()
+
+
 def test_default_pipeline_mock_produces_onnx_om_abi_and_manifest(tmp_path, monkeypatch):
     resolved = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
     _mock_pipeline(monkeypatch, resolved)
 
     assert pipeline.main() == 0
 
-    assert len(list((tmp_path / "onnx").glob("*.onnx"))) == 2
-    assert len(list((tmp_path / "om").glob("*.om"))) == 2
-    assert len(list((tmp_path / "om").glob("*.abi.json"))) == 2
+    assert len(list((tmp_path / "work" / "onnx").glob("*.onnx"))) == 2
+    assert len(list((tmp_path / "work" / "om").glob("*.om"))) == 2
+    assert len(list((tmp_path / "work" / "om").glob("*.abi.json"))) == 2
     assert load_inference_manifest(tmp_path / "bundle", "ascend").deployment.execution == ("vlm", "action_expert")
+
+
+def test_profiled_mixed_deployment_packages_fp_vlm_and_quantized_ae(tmp_path, monkeypatch):
+    steps = "vlm_onnx,ae_onnx,vlm_om,ae_om,ae_quant,ae_quant_om"
+    resolved = _resolved(tmp_path, steps)
+    resolved.args.device = "npu"
+    resolved.args.fast_gelu_scope = "vlm-text"
+    resolved.quantization_profile = pipeline._cli.resolve_quantization_profile("pi05-vlm-text-ae-attn-mlp-sq-v1", {})
+    _mock_pipeline(monkeypatch, resolved)
+
+    assert pipeline.main() == 0
+
+    selected = load_inference_manifest(tmp_path / "bundle", "ascend")
+    vlm = tmp_path / "bundle" / selected.deployment.artifacts["vlm"].path
+    action_expert = tmp_path / "bundle" / selected.deployment.artifacts["action_expert"].path
+    assert vlm.read_bytes() == b"vlm_om"
+    assert action_expert.read_bytes() == b"ae_quant_om"
+
+
+def test_profile_with_fp_only_steps_publishes_named_deployment(tmp_path, monkeypatch):
+    resolved = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
+    resolved.args.device = "npu"
+    resolved.args.fast_gelu_scope = "vlm-text"
+    resolved.quantization_profile = pipeline._cli.resolve_quantization_profile("pi05-vlm-text-ae-attn-mlp-sq-v1", {})
+    _mock_pipeline(monkeypatch, resolved)
+
+    assert pipeline.main() == 0
+
+    manifest = json.loads((tmp_path / "bundle" / "inference_manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest["deployments"]) == {"ascend"}
+
+
+def test_profiled_full_rerun_reuses_identical_artifacts(tmp_path, monkeypatch):
+    profile = pipeline._cli.resolve_quantization_profile("pi05-vlm-text-ae-attn-mlp-sq-v1", {})
+    initial = _resolved(tmp_path, "vlm_onnx,ae_onnx,vlm_om,ae_om,ae_quant,ae_quant_om")
+    initial.args.device = "npu"
+    initial.args.fast_gelu_scope = "vlm-text"
+    initial.quantization_profile = profile
+    _mock_pipeline(monkeypatch, initial)
+    assert pipeline.main() == 0
+    first = load_inference_manifest(tmp_path / "bundle", "ascend")
+
+    rerun = _resolved(tmp_path, "vlm_onnx,ae_onnx,vlm_om,ae_om,ae_quant,ae_quant_om")
+    rerun.args.device = "npu"
+    rerun.args.fast_gelu_scope = "vlm-text"
+    rerun.quantization_profile = profile
+    _mock_pipeline(monkeypatch, rerun)
+    assert pipeline.main() == 0
+    second = load_inference_manifest(tmp_path / "bundle", "ascend")
+
+    assert second.deployment.artifacts["vlm"] == first.deployment.artifacts["vlm"]
+    assert second.deployment.artifacts["action_expert"] == first.deployment.artifacts["action_expert"]
+    assert second.deployment.revision == first.deployment.revision
+
+
+def test_partial_quant_publication_skips_missing_target_deployment(tmp_path, monkeypatch):
+    initial = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
+    _mock_pipeline(monkeypatch, initial)
+    assert pipeline.main() == 0
+
+    rerun = _resolved(tmp_path, "vlm_quant_om")
+    quant_onnx = tmp_path / "work" / "onnx" / "pi05-vlm_op17_nodyn_fp16_cpu_w8a8.onnx"
+    quant_onnx.parent.mkdir(parents=True, exist_ok=True)
+    quant_onnx.write_bytes(b"quantized")
+    _mock_pipeline(monkeypatch, rerun)
+
+    assert pipeline.main() == 0
+    manifest = json.loads((tmp_path / "bundle" / "inference_manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest["deployments"]) == {"ascend"}
 
 
 def test_individual_om_rerun_finalizes_with_existing_counterpart(tmp_path, monkeypatch):
@@ -566,7 +723,49 @@ def test_action_expert_only_rerun_reuses_existing_vlm_generation(tmp_path, monke
     second = load_inference_manifest(tmp_path / "bundle", "ascend")
     assert second.deployment.artifacts["vlm"] == vlm_artifact
     assert second.deployment.uuid == first.deployment.uuid
+    assert second.deployment.revision == first.deployment.revision
+
+
+def test_action_expert_content_change_updates_existing_deployment(tmp_path, monkeypatch):
+    initial = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
+    _mock_pipeline(monkeypatch, initial)
+    assert pipeline.main() == 0
+    first = load_inference_manifest(tmp_path / "bundle", "ascend")
+
+    rerun = _resolved(tmp_path, "ae_om")
+    _mock_pipeline(monkeypatch, rerun)
+    original = pipeline._RUNNERS["ae_om"]
+
+    def changed_action_expert(ctx):
+        original(ctx)
+        ctx.ae_om.write_bytes(b"changed-action-expert")
+
+    pipeline._RUNNERS["ae_om"] = changed_action_expert
+    assert pipeline.main() == 0
+
+    second = load_inference_manifest(tmp_path / "bundle", "ascend")
+    assert second.deployment.uuid == first.deployment.uuid
     assert second.deployment.revision == first.deployment.revision + 1
+    assert second.deployment.artifacts["vlm"] == first.deployment.artifacts["vlm"]
+    assert second.deployment.artifacts["action_expert"] != first.deployment.artifacts["action_expert"]
+
+
+def test_new_deployment_name_is_added_and_reuses_identical_artifacts(tmp_path, monkeypatch):
+    initial = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
+    _mock_pipeline(monkeypatch, initial)
+    assert pipeline.main() == 0
+    first = load_inference_manifest(tmp_path / "bundle", "ascend")
+
+    added = _resolved(tmp_path, ",".join(_cli.DEFAULT_STEPS))
+    added.args.deployment = "ascend-copy"
+    _mock_pipeline(monkeypatch, added)
+    assert pipeline.main() == 0
+    second = load_inference_manifest(tmp_path / "bundle", "ascend-copy")
+
+    assert set(second.manifest.deployments) == {"ascend", "ascend-copy"}
+    assert second.deployment.uuid != first.deployment.uuid
+    assert second.deployment.revision == 1
+    assert second.deployment.artifacts == first.deployment.artifacts
 
 
 @pytest.mark.parametrize(
@@ -583,7 +782,7 @@ def test_partial_rerun_does_not_require_reused_role_work_files(tmp_path, monkeyp
     first = load_inference_manifest(tmp_path / "bundle", "ascend")
     expected = first.deployment.artifacts[reused_role]
     pattern = "pi05-vlm*" if removed_role == "vlm" else "pi05-action_expert*"
-    for path in (tmp_path / "om").glob(pattern):
+    for path in (tmp_path / "work" / "om").glob(pattern):
         path.unlink()
 
     rerun = _resolved(tmp_path, step)
@@ -652,14 +851,14 @@ def test_convert_om_cli_skips_reused_role_work_files(tmp_path, monkeypatch):
 
 def test_single_om_without_counterpart_keeps_artifact_without_manifest(tmp_path, monkeypatch):
     resolved = _resolved(tmp_path, "ae_quant_om")
-    quant_onnx = tmp_path / "onnx" / "pi05-action_expert_op17_nodyn_fp16_cpu_w8a8.onnx"
-    quant_onnx.parent.mkdir()
+    quant_onnx = tmp_path / "work" / "onnx" / "pi05-action_expert_op17_nodyn_fp16_cpu_w8a8.onnx"
+    quant_onnx.parent.mkdir(parents=True)
     quant_onnx.write_bytes(b"quantized")
     _mock_pipeline(monkeypatch, resolved)
 
     assert pipeline.main() == 0
 
-    assert list((tmp_path / "om").glob("pi05-action_expert*_w8a8.om"))
+    assert list((tmp_path / "work" / "om").glob("pi05-action_expert*_w8a8.om"))
     assert not (tmp_path / "bundle" / "inference_manifest.json").exists()
 
 
@@ -686,9 +885,9 @@ def test_individual_onnx_and_om_step_combinations(tmp_path, monkeypatch, steps):
 
     requested = set(steps.split(","))
     if "vlm_onnx" in requested:
-        assert list((tmp_path / "onnx").glob("pi05-vlm*.onnx"))
+        assert list((tmp_path / "work" / "onnx").glob("pi05-vlm*.onnx"))
     if "ae_onnx" in requested:
-        assert list((tmp_path / "onnx").glob("pi05-action_expert*.onnx"))
+        assert list((tmp_path / "work" / "onnx").glob("pi05-action_expert*.onnx"))
     if requested & {"vlm_om", "ae_om"}:
         assert load_inference_manifest(tmp_path / "bundle", "ascend").deployment.execution == (
             "vlm",
@@ -698,8 +897,8 @@ def test_individual_onnx_and_om_step_combinations(tmp_path, monkeypatch, steps):
 
 def test_requested_stage_cannot_succeed_from_stale_output(tmp_path, monkeypatch):
     resolved = _resolved(tmp_path, "vlm_onnx")
-    stale = tmp_path / "onnx" / "pi05-vlm_op17_nodyn_fp16_cpu.onnx"
-    stale.parent.mkdir()
+    stale = tmp_path / "work" / "onnx" / "pi05-vlm_op17_nodyn_fp16_cpu.onnx"
+    stale.parent.mkdir(parents=True)
     stale.write_bytes(b"stale")
     _mock_pipeline(monkeypatch, resolved, skip_product="vlm_onnx")
 
@@ -711,10 +910,10 @@ def test_requested_stage_cannot_succeed_from_stale_output(tmp_path, monkeypatch)
 
 def test_ae_onnx_alone_requires_runtime_handoff_tensors(tmp_path, monkeypatch):
     resolved = _resolved(tmp_path, "ae_onnx")
-    ae_onnx = tmp_path / "onnx" / "pi05-action_expert_op17_nodyn_fp16_cpu.onnx"
-    ae_onnx.parent.mkdir()
+    ae_onnx = tmp_path / "work" / "onnx" / "pi05-action_expert_op17_nodyn_fp16_cpu.onnx"
+    ae_onnx.parent.mkdir(parents=True)
     ae_onnx.write_bytes(b"existing")
-    vlm_onnx = tmp_path / "onnx" / "pi05-vlm_op17_nodyn_fp16_cpu.onnx"
+    vlm_onnx = tmp_path / "work" / "onnx" / "pi05-vlm_op17_nodyn_fp16_cpu.onnx"
     vlm_onnx.write_bytes(b"existing")
     _mock_pipeline(monkeypatch, resolved)
 
@@ -722,7 +921,7 @@ def test_ae_onnx_alone_requires_runtime_handoff_tensors(tmp_path, monkeypatch):
         pipeline.main()
 
 
-def test_quantized_onnx_and_om_use_distinct_deployment(tmp_path, monkeypatch):
+def test_quantized_onnx_and_om_publish_only_requested_deployment(tmp_path, monkeypatch):
     steps = "vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_om,ae_om,vlm_quant_om,ae_quant_om"
     resolved = _resolved(tmp_path, steps)
     _mock_pipeline(monkeypatch, resolved)
@@ -730,13 +929,16 @@ def test_quantized_onnx_and_om_use_distinct_deployment(tmp_path, monkeypatch):
     assert pipeline.main() == 0
 
     manifest = load_inference_manifest(tmp_path / "bundle", "ascend").manifest
-    assert set(manifest.deployments) == {"ascend", "ascend-w8a8"}
-    assert manifest.deployments["ascend"].artifacts["vlm"] != manifest.deployments["ascend-w8a8"].artifacts["vlm"]
+    assert set(manifest.deployments) == {"ascend"}
+    vlm = tmp_path / "bundle" / manifest.deployments["ascend"].artifacts["vlm"].path
+    action = tmp_path / "bundle" / manifest.deployments["ascend"].artifacts["action_expert"].path
+    assert vlm.read_bytes() == b"vlm_quant_om"
+    assert action.read_bytes() == b"ae_quant_om"
 
 
 @pytest.mark.parametrize("steps", ["vlm_quant", "ae_quant", "vlm_quant_om", "ae_quant_om"])
 def test_individual_quantized_steps_can_be_rerun(tmp_path, monkeypatch, steps):
-    initial_steps = "vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om"
+    initial_steps = "vlm_onnx,ae_onnx,vlm_quant,vlm_om,ae_om,ae_quant,vlm_quant_om,ae_quant_om"
     initial = _resolved(tmp_path, initial_steps)
     _mock_pipeline(monkeypatch, initial)
     assert pipeline.main() == 0
@@ -746,7 +948,7 @@ def test_individual_quantized_steps_can_be_rerun(tmp_path, monkeypatch, steps):
     assert pipeline.main() == 0
 
     if steps.endswith("_om"):
-        assert load_inference_manifest(tmp_path / "bundle", "ascend-w8a8").deployment.execution == (
+        assert load_inference_manifest(tmp_path / "bundle", "ascend").deployment.execution == (
             "vlm",
             "action_expert",
         )

@@ -127,3 +127,7 @@ class BaseTeleopDevice(ABC):
     def emergency_stop(self) -> None:
         """Stop device-owned motion immediately when the node receives E-stop."""
         return None
+
+    def emergency_stop_released(self) -> None:
+        """Notify the device that E-stop was released and output may re-arm."""
+        return None

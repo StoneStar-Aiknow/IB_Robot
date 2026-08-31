@@ -27,9 +27,10 @@ def test_random_generation_is_deterministic_and_inclusive():
 
 def test_legacy_json_preserves_strings(tmp_path):
     path = tmp_path / "legacy.json"
-    path.write_text(json.dumps({"samples": [{"task": "pick", "state": [1, 2]}]}), encoding="utf-8")
+    sample = {"task": "pick", "state": [1, 2], "mask": [True, False], "optional": None}
+    path.write_text(json.dumps({"samples": [sample]}), encoding="utf-8")
     batch = load_observation_batch(path)
-    assert batch[0] == {"task": "pick", "state": [1, 2]}
+    assert batch[0] == sample
     assert batch.sample_provenance == {}
 
 

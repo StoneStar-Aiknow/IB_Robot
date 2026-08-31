@@ -24,7 +24,6 @@ def _prepend_env(current: str, entries: tuple[Path, ...]) -> str:
 
 _MODEL_PATH_KEYS = (
     "silero_vad_model_path",
-    "fullsubnet_repo_dir",
     "fullsubnet_ckpt",
     "fullsubnet_om_path",
     "fullsubnet_stateful_fb_om_path",

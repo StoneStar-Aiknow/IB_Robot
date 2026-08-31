@@ -30,6 +30,16 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 
 ## 1. 消息定义（msg/）
 
+### `MHandProFrame.msg` / `HumanHandState.msg`
+
+`MHandProFrame` 是可选的 mHandPro 厂商原始数据边界，保存左右侧、帧序号、设备电量、
+源频率、20 个 position/quaternion、5 个虚拟指尖、逐节点 sensor state、角速度、线加速度和
+线速度。它用于显式启用的录制、诊断和后续算法迭代，不包含目标机械手语义；生产配置默认不发布。
+
+`HumanHandState` 是厂商无关的手部契约：保留 landmarks/orientations/virtual tips，并用稳定字段名
+发布尺度无关的解剖角度、置信度、张开分数和有效状态。机械手 retargeter 只依赖这个消息，因此
+mHandPro 不感知 Aero Hand 的 7 个通道或 Amazing Hand 的 3 个通道。
+
 ### `TaskCommand.msg`
 
 具身 AI 链路的主要任务数据载体，贯穿任务入口、规划和执行全流程。`task_id` 已移入

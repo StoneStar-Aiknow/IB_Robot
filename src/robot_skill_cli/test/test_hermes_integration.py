@@ -109,6 +109,7 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
         playback_timeout_sec=300.0,
         synthesis_timeout_sec=90.0,
     )
+    lifecycle_hook = hermes_configure._lifecycle_hook_wrapper(workspace=workspace, shrc=shrc)
     robot_skill = hermes_configure._robot_skill_wrapper(
         workspace=workspace,
         shrc=shrc,
@@ -131,6 +132,9 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
     assert "IBROBOT_TTS_SYNTHESIS_TIMEOUT_SEC=90" in hook
     assert "IBROBOT_TTS_PLAYBACK_TIMEOUT_SEC=300" in hook
     assert "venv/bin/python3" not in hook
+    assert str(shrc) not in lifecycle_hook
+    assert "HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY" in lifecycle_hook
+    assert "exec python3 -m robot_skill_cli.hermes_lifecycle_speech" in lifecycle_hook
     assert "-m robot_skill_cli.cli" in robot_skill
     assert "source /opt/ros/humble/setup.bash" not in robot_skill
     assert "exec python3 -m robot_skill_cli.cli" in robot_skill

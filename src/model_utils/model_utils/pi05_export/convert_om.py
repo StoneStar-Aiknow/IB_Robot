@@ -122,6 +122,7 @@ def _run_atc(
     ``atc`` appends ``.om`` itself, so ``--output`` is the path without suffix.
     The subprocess inherits stdout/stderr so the user sees ATC progress live.
     """
+    onnx_path = onnx_path.expanduser().resolve(strict=True)
     output_stem = str(om_output.with_suffix(""))
     om_output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +149,9 @@ def _run_atc(
 
     LOGGER.info("  $ %s", " ".join(command))
     # nosec B603 — command is built from validated paths / args, not shell.
-    return subprocess.run(command, check=False).returncode == 0
+    # CANN 8.1 resolves ONNX external-data locations relative to the process
+    # working directory rather than the --model path.
+    return subprocess.run(command, check=False, cwd=onnx_path.parent).returncode == 0
 
 
 def convert_role(
@@ -191,6 +194,8 @@ def write_pi05_ascend_deployment(
     action_om: Path,
     schedule_file: Path | None = None,
     reuse_artifact_roles: frozenset[str] = frozenset(),
+    *,
+    prefer_hardlink: bool = False,
 ) -> Path:
     """Write one complete PI0.5 Ascend deployment from compiled runtime ABIs."""
 
@@ -313,6 +318,7 @@ def write_pi05_ascend_deployment(
             deployment_name=deployment_name,
             role=role,
             force_copy=True,
+            prefer_hardlink=prefer_hardlink,
         )
         created_artifacts.append(artifact)
         return artifact

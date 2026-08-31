@@ -90,9 +90,17 @@ python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_ar
 5. **README Documentation Consistency**
    - **核心原则**: 每个包的 `README.md` 是该包对外暴露的本地架构契约，必须与代码行为、职责边界、启动方式、配置入口、数据流和限制保持同步。
    - **关键检查**:
-     - 如果 PR 修改了某个包的核心职责、公开接口、launch 参数、配置项、数据流、依赖边界或使用方式，必须检查该包 README 是否同步更新。
-     - 如果 README 在 PR 中被修改，必须反向检查 README 描述是否真实反映代码实现，避免文档夸大、过时或描述未实现能力。
-     - 如果代码变更使 README 关键说明失效、缺失或误导使用者，应作为架构问题提出，而不是当作普通文档风格问题忽略。
+      - 如果 PR 修改了某个包的核心职责、公开接口、launch 参数、配置项、数据流、依赖边界或使用方式，必须检查该包 README 是否同步更新。
+      - 如果 README 在 PR 中被修改，必须反向检查 README 描述是否真实反映代码实现，避免文档夸大、过时或描述未实现能力。
+      - 如果代码变更使 README 关键说明失效、缺失或误导使用者，应作为架构问题提出，而不是当作普通文档风格问题忽略。
+
+6. **Reuse & Reinvention (复用与重复造轮子)**
+   - **核心原则**: 新增能力必须优先复用仓库与 `libs/lerobot` 已有实现（数据集、policies、benchmarks、推理框架、SSOT、契约），而不是另起平行流程；确需重新发明时必须有充分论证。历史教训：为 lerobot 已支持的 benchmark 重建整套 setup（[PR #309](https://atomgit.com/openeuler/IB_Robot/pull/309)）、绕开仓库既有推理框架自建一套（[PR #317](https://atomgit.com/openeuler/IB_Robot/pull/317)），这类问题逐行 diff 很难发现。
+   - **关键检查**:
+      - 超过 2000 行的 PR 必须在描述中包含完整的 `## Reuse Self-Check` 块（`Reinvented workflows` / `Reused components` / `Reinvention justification` / `Architecture conformance` 四个固定字段）；缺失或不完整是阻塞性问题（详细规则见 `atomgit-pr-review` 的 `references/ibrobot-mandatory-checks.md` §6）。
+      - 即使块完整，也必须对照 diff 审计声明是否属实：声称"未重新发明"但存在与 lerobot / 既有包功能重叠的平行实现，输出 `pillar: "reuse"` 的架构问题（severity 至少 error）。
+      - 必要性论证空泛（如"现有代码不好改"）、复用清单装饰性罗列、架构一致性声明与实际不符，均应作为架构问题提出；论证充分且合理的重新发明可放行，残余架构不一致降级为 warning/suggestion。
+      - 修复建议优先给出复用路径：改用 lerobot 对应模块、接入 `inference_service` / `robot_config` SSOT / `tensormsg`；属于 `libs/lerobot` 的改动走 `ibrobot-lerobot-patch` 导出 patch，而非在仓库内复制一份。
 
 ## 架构审查协议 (Mandatory Protocol)
 
@@ -110,7 +118,11 @@ python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_ar
    - 对比 README 与本次代码改动，判断 README 是否仍准确描述包职责、关键 API/CLI/launch/config、数据流、依赖边界和已知限制。
    - 若代码变更影响用户使用或架构契约但 README 未同步，必须输出 `pillar: "docs"` 的架构问题。
    - 若 README 被修改但与代码实现不一致，也必须输出 `pillar: "docs"` 的架构问题。
-7. **输出审查结果**: 生成符合 JSON 格式的 `arch_issues.json`。
+7. **复用自查审计 (Mandatory, >2000 行)**:
+   - PR 变更超过 2000 行（additions + deletions）时，先检查描述中的 `## Reuse Self-Check` 块是否存在且四字段完整；缺失/不完整为阻塞性问题。
+   - 再对照 diff 验证四项声明：是否有与 `libs/lerobot` 或仓库既有流程重叠的平行实现、复用清单是否真实被调用、重新发明论证是否充分、架构是否确与声明对齐的同类模块一致。
+   - 发现不实声明或无必要重复实现时，输出 `pillar: "reuse"` 的架构问题，并在 fix 中给出复用路径（lerobot 模块 / inference_service / robot_config / tensormsg，lerobot 侧改动走 patch 栈）。
+8. **输出审查结果**: 生成符合 JSON 格式的 `arch_issues.json`。
 
 ## API 说明
 

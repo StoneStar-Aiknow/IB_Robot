@@ -129,7 +129,7 @@ Safety Path: robot-skill -> /embodied/execute_skill -> skill_executor -> safety_
 Validation Plan:
 - ruff check <files>
 - pytest <tests>
-- colcon build --packages-select <packages>
+- ./scripts/build.sh -- --packages-select <packages>
 - optional RViz/real robot validate_skill + execute_skill + recover_safe_pose
 ```
 
@@ -173,7 +173,7 @@ Run only on modified files/packages. Always source the project environment from 
 ```bash
 source .shrc_local && ruff check <modified-python-files>
 source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest <related-tests>
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select <packages>
+source .shrc_local && ./scripts/build.sh -- --packages-select <packages>
 ```
 
 For real robot + RViz verification, use the user-requested ROS domain. If unspecified, ask before running hardware.

@@ -44,6 +44,8 @@ from pathlib import Path
 import numpy as np
 
 from model_utils.pi05_export.quant import w8a8_common as common
+from model_utils.pi05_export.quant.profiles import write_quantization_metadata
+from model_utils.pi05_export.quant.smoothquant import prepare_smoothquant_pair, verify_smoothquant_outputs
 
 LOGGER = logging.getLogger("quantize_vlm")
 
@@ -93,8 +95,9 @@ _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
     #    anchors avoid hitting q_proj/k_proj/v_proj/o_proj (those stay int8).
     r"rotary_emb",
     r"self_attn/MatMul(_\d+)?$",
-    # NPU export fuses gate_proj + up_proj into one [up;gate] MatMul feeding
-    # NPUGeglu, so Route A cannot transplant their separate donor int8 nodes.
+    # Legacy donors expose separate gate/up MatMuls while the NPU graph fuses
+    # them. The Route-A fused donor instead exposes ``mlp/MatMul`` and therefore
+    # does not match this safety exclusion; its fused MatMul can be quantized.
     r"mlp/(gate_proj|up_proj)/MatMul",
 )
 
@@ -217,6 +220,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Extra src=dst batch key remaps, e.g. observation.images.top_view=observation.images.top",
     )
+    p.add_argument(
+        "--fused-geglu-donor",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--require-npu-geglu",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--expected-npu-geglu-nodes", type=int, default=None, help=argparse.SUPPRESS)
     return p
 
 
@@ -237,6 +251,13 @@ def main() -> int:
         format="%(levelname)s: %(message)s",
     )
 
+    if args.expected_npu_geglu_nodes is not None and not args.require_npu_geglu:
+        LOGGER.error("--expected-npu-geglu-nodes requires --require-npu-geglu")
+        return 1
+    if (args.fused_geglu_donor or args.require_npu_geglu) and not args.npu_onnx_path:
+        LOGGER.error("GeGLU Route-A validation requires --npu-onnx-path")
+        return 1
+
     onnx_path = Path(args.onnx_path).expanduser().resolve()
     if not onnx_path.is_file():
         LOGGER.error("ONNX not found: %s", onnx_path)
@@ -253,6 +274,14 @@ def main() -> int:
         disable_convs=not args.quantize_convs,
         disable_index_below=args.disable_index_below,
     )
+    selection = common.select_quantizable_nodes(
+        quantizable,
+        disable_names,
+        args.quantize_regex,
+        expected_regex_matches=args.quantize_regex_expected,
+        expected_selected_nodes=args.expected_selected_nodes,
+    )
+    disable_names = list(selection.disabled_names)
 
     if args.list_nodes:
         common.list_nodes_and_exit(quantizable, disable_names, disable_regexes)
@@ -272,6 +301,9 @@ def main() -> int:
         return 1
 
     output_path = common.resolve_output_path(args.output_path, onnx_path)
+    profile_fields = (args.quant_profile_name, args.quant_profile_hash, args.quant_role, args.quant_metadata_path)
+    if any(profile_fields) and not all(profile_fields):
+        raise ValueError("Quantization metadata requires profile name, hash, role, and output path")
 
     npu_graph_path = None
     if args.npu_onnx_path:
@@ -279,6 +311,11 @@ def main() -> int:
         if not npu_graph_path.is_file():
             LOGGER.error("--npu-onnx-path not found: %s", npu_graph_path)
             return 1
+        npu_model = common.load_onnx(npu_graph_path)
+        if args.require_npu_geglu:
+            common.validate_npu_geglu_deployment(npu_model, args.expected_npu_geglu_nodes)
+        if args.fused_geglu_donor:
+            common.validate_fused_geglu_route(model_proto, npu_model)
 
     calib_data = build_calib_data(
         onnx_path=onnx_path,
@@ -290,17 +327,93 @@ def main() -> int:
         device_str=args.device,
     )
 
-    common.run_msmodelslim_w8a8(
-        input_onnx=onnx_path,
-        output_onnx=output_path,
-        calib_data=calib_data,
-        disable_names=disable_names,
-        amp_num=args.amp_num,
-        npu_graph=npu_graph_path,
-    )
-    if not output_path.is_file():
-        raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
-    common.load_onnx(output_path)
+    quant_donor_path = onnx_path
+    quant_npu_path = npu_graph_path
+    if args.smoothquant_alpha is not None:
+        if npu_graph_path is None:
+            raise ValueError("--smoothquant-alpha requires --npu-onnx-path")
+        quantizable_ops = dict(quantizable)
+        smoothquant_names = [name for name in selection.selected_names if quantizable_ops[name] in {"MatMul", "Gemm"}]
+        skipped_smoothquant_names = sorted(set(selection.selected_names) - set(smoothquant_names))
+        if skipped_smoothquant_names:
+            LOGGER.info(
+                "SmoothQuant skips %d unsupported selected node(s): %s",
+                len(skipped_smoothquant_names),
+                skipped_smoothquant_names,
+            )
+        smoothquant_dir = (
+            args.smoothquant_output_dir.expanduser().resolve()
+            if args.smoothquant_output_dir
+            else output_path.parent / f"{output_path.stem}.smoothquant"
+        )
+        smoothquant = prepare_smoothquant_pair(
+            onnx_path,
+            npu_graph_path,
+            smoothquant_dir,
+            calib_data,
+            smoothquant_names,
+            args.smoothquant_alpha,
+            args.smoothquant_epsilon,
+            output_prefix=output_path.stem,
+        )
+        verification = verify_smoothquant_outputs(
+            onnx_path,
+            smoothquant.donor_path,
+            calib_data,
+            rtol=args.smoothquant_verify_rtol,
+            atol=args.smoothquant_verify_atol,
+        )
+        LOGGER.info(
+            "SmoothQuant prepared %d node(s) in %d activation group(s), scale range=[%.6g, %.6g], plan=%s",
+            smoothquant.node_count,
+            smoothquant.group_count,
+            smoothquant.scale_min,
+            smoothquant.scale_max,
+            smoothquant.plan_digest,
+        )
+        LOGGER.info("SmoothQuant donor equivalence passed across %d calibration sample(s)", verification.sample_count)
+        quant_donor_path = smoothquant.donor_path
+        quant_npu_path = smoothquant.npu_path
+
+    if args.quant_metadata_path:
+        args.quant_metadata_path.unlink(missing_ok=True)
+    try:
+        actual_quantized_nodes = common.run_msmodelslim_w8a8(
+            input_onnx=quant_donor_path,
+            output_onnx=output_path,
+            calib_data=calib_data,
+            disable_names=disable_names,
+            amp_num=args.amp_num,
+            amp_rank_samples=args.amp_rank_samples,
+            amp_scratch_dir=args.amp_scratch_dir,
+            npu_graph=quant_npu_path,
+        )
+        if args.expected_quantized_nodes is not None and actual_quantized_nodes != args.expected_quantized_nodes:
+            raise RuntimeError(
+                f"Final ONNX contains {actual_quantized_nodes} quantized node(s), "
+                f"expected {args.expected_quantized_nodes}"
+            )
+        if not output_path.is_file():
+            raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
+        common.load_onnx(output_path)
+        if args.quant_metadata_path:
+            write_quantization_metadata(
+                path=args.quant_metadata_path,
+                profile_name=args.quant_profile_name,
+                profile_hash=args.quant_profile_hash,
+                role=args.quant_role,
+                policy_path=Path(args.policy_path).expanduser().resolve(),
+                donor_onnx=onnx_path,
+                npu_onnx=npu_graph_path,
+                output_onnx=output_path,
+                selected_nodes=list(selection.selected_names),
+                actual_quantized_nodes=actual_quantized_nodes,
+            )
+    except Exception:
+        if args.quant_metadata_path:
+            common.remove_onnx_external_pair(output_path)
+            args.quant_metadata_path.unlink(missing_ok=True)
+        raise
 
     LOGGER.info(
         "Done. Next: ATC-compile %s on the board, then run verify_vlm_cpu_vs_om.py "

@@ -59,6 +59,37 @@ def test_successful_read_prints_literal(capsys, monkeypatch, tmp_path) -> None:
     assert "0.5236" in log
 
 
+def test_voice_direction_uses_explicit_reliable_qos_and_message_type(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(perceive_cli, "LOG_PATH", tmp_path / "perceive.log")
+    captured: dict = {}
+
+    def _fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _ok_run("---\nazimuth_rad: 0.5236\nseq_id: 42\n")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    code = perceive_cli.main(["--source", "voice_direction", "--field", "azimuth_rad"])
+
+    assert code == 0
+    assert captured["cmd"] == [
+        "ros2",
+        "topic",
+        "echo",
+        "--once",
+        "--qos-reliability",
+        "reliable",
+        "--qos-history",
+        "keep_last",
+        "--qos-depth",
+        "1",
+        "--qos-durability",
+        "volatile",
+        "/voice/speech_direction",
+        "ibrobot_msgs/msg/SpeechDirection",
+    ]
+
+
 def test_voice_direction_does_not_load_robot_config(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(perceive_cli, "LOG_PATH", tmp_path / "perceive.log")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _ok_run("---\nazimuth_rad: 0.1\nseq_id: 1\n"))
@@ -205,6 +236,20 @@ def test_config_name_and_config_path_are_mutually_exclusive(capsys, monkeypatch,
 def test_extract_field_handles_multiple_yaml_documents() -> None:
     stdout = "---\nseq_id: 1\n---\nazimuth_rad: 0.1\nseq_id: 2\n"
     assert perceive_cli._extract_field(stdout, "azimuth_rad") == 0.1
+
+
+def test_extract_field_handles_ros2_echo_message_before_document_separator() -> None:
+    stdout = (
+        "header:\n"
+        "  stamp:\n"
+        "    sec: 1787553991\n"
+        "    nanosec: 726186377\n"
+        "  frame_id: base_link\n"
+        "azimuth_rad: 0.6981316804885864\n"
+        "seq_id: 1\n"
+        "---\n"
+    )
+    assert perceive_cli._extract_field(stdout, "azimuth_rad") == 0.6981316804885864
 
 
 def test_extract_field_ignores_fastdds_diagnostics_before_yaml() -> None:

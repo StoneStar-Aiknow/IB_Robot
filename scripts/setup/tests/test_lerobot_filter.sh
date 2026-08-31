@@ -20,6 +20,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 FILTER="${REPO_ROOT}/scripts/setup/lerobot_filter_series.py"
 RESOLVER="${REPO_ROOT}/scripts/setup/lerobot_resolve_active.py"
 INDEX="${REPO_ROOT}/third_party/patches/lerobot/INDEX.yaml"
+# The filter / validator fixtures below intentionally use the archived v0.5.1
+# manifest + series as a STABLE content-complete fixture (rich profile
+# coverage: training, distillation, mt-act, ...). They exercise the filter and
+# shell-validator LOGIC and do not depend on the in-tree active_tag, which is
+# covered by the single in-tree baseline assertion further down.
 MANIFEST="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/manifest.yaml"
 DEFAULT_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.txt"
 OPENHARMONY_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.openharmony-5.1.0-musl.txt"
@@ -221,9 +226,9 @@ run_resolver_fail() {
     fi
 }
 
-# Baseline: in-tree INDEX.yaml resolves cleanly to v0.5.1.
-run_resolver_pass "resolver / in-tree INDEX picks v0.5.1" \
-    "${INDEX}" "v0.5.1"
+# Baseline: in-tree INDEX.yaml resolves cleanly to v0.6.0 (the active tag).
+run_resolver_pass "resolver / in-tree INDEX picks v0.6.0" \
+    "${INDEX}" "v0.6.0"
 
 # Build a synthetic multi-tag INDEX in a temp dir to verify selection
 # semantics without touching the in-tree layout.

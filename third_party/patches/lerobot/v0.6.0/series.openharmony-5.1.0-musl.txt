@@ -1,0 +1,10 @@
+# OpenHarmony 5.1.0 musl board-runtime series for lerobot v0.6.0.
+#
+# The board runs Python 3.12 and is inference-only, so the Python 3.10/3.11
+# down-grade patches (0001-0003) and the typing backport (0006) are omitted
+# (Self/Unpack are native on 3.12). The Ascend NPU detection patch (0004) is
+# omitted as in v0.5.1. Carried over: SmolVLA graph-export compatibility, and
+# the knowledge-distillation config fields (0007) so the board can load
+# KD-trained checkpoints. Training patches remain out of scope for the board.
+0005-smolvla-improve-graph-export-compatibility.patch
+0007-feature-knowledge-distillation.patch

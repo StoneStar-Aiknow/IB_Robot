@@ -243,6 +243,13 @@ class AscendOmModelSession(ModelSession):
             values[binding.semantic] = output
             outputs[binding.semantic] = output
         self._capture_role_outputs(role, outputs)
+        if self._diagnostic_capture is not None:
+            linked_outputs = {
+                link.semantic
+                for link in self._loaded_deployment().device_links
+                if link.producer == role and link.transport == "device_pointer"
+            }
+            outputs = {semantic: value for semantic, value in outputs.items() if semantic not in linked_outputs}
         return outputs
 
     def _capture_role_inputs(self, role: str, inputs: Mapping[int, np.ndarray]) -> None:

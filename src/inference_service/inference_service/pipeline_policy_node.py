@@ -106,6 +106,9 @@ from robot_config.utils import (
 )
 from tensormsg.converter import TensorMsgConverter
 
+_CLOUD_HANDSHAKE_WARNING_DELAY_S = 5.0
+_CLOUD_HANDSHAKE_WARNING_THROTTLE_S = 10.0
+
 
 @dataclass(frozen=True)
 class PipelineNodeConfig:
@@ -259,6 +262,8 @@ class PipelinePolicyNode(Node):
         self._inference_count = 0
         self._last_error = ""
         self._remote_state = "unavailable"
+        self._distributed_started_monotonic = time.monotonic()
+        self._last_cloud_status_received_monotonic: float | None = None
         # Preserve the legacy operation lock unchanged. Scheduled Dispatch uses
         # separate capacity slots validated against backend capabilities.
         self._operation_lock = threading.Lock()
@@ -643,6 +648,31 @@ class PipelinePolicyNode(Node):
         return buffer
 
     @staticmethod
+    def _rtp_video_send_issue(node: object, state: _SubState, now_ns: int) -> dict[str, object] | None:
+        """Gate RTP-video freshness on what the sender actually put on the wire.
+
+        The local subscription buffer says what the device received; the
+        compute side can only see frames that were encoded and sent.  Frames
+        lost to encode failures, queue overflow, or session rollovers must
+        therefore read as "not fresh" here, mirroring the compute side's
+        snapshot instead of the local buffer.
+        """
+        manager = getattr(node, "_video_stream_manager", None)
+        sent_ns = manager.latest_sent_capture_ns(state.spec.key) if manager is not None else 0
+        if sent_ns <= 0:
+            return {"key": state.spec.key, "topic": state.spec.topic, "reason": "video_not_sent"}
+        age_ns = now_ns - sent_ns
+        if state.max_age_ns > 0 and age_ns > state.max_age_ns:
+            return {
+                "key": state.spec.key,
+                "topic": state.spec.topic,
+                "reason": "video_send_stale",
+                "age_ms": age_ns / 1_000_000,
+                "max_age_ms": state.max_age_ns / 1_000_000,
+            }
+        return None
+
+    @staticmethod
     def _sample_observation(
         state: _SubState,
         sample_time_ns: int,
@@ -688,8 +718,16 @@ class PipelinePolicyNode(Node):
         return values, None
 
     def _sample_observations(
-        self, sample_time_ns: int, *, skip_decode_keys: frozenset[str] = frozenset()
+        self, sample_time_ns: int, *, rtp_video_keys: frozenset[str] = frozenset()
     ) -> dict[str, Any]:
+        """Sample subscribed observations at ``sample_time_ns``.
+
+        Keys in ``rtp_video_keys`` (distributed RTP video streams) are never
+        consumed from the local buffer -- the policy samples their decoded
+        frames on the compute side -- so their freshness gate reads the
+        sender's last-sent capture timestamp instead of the buffer entry.
+        A fresh buffer with nothing on the wire correctly fails closed.
+        """
         selected: dict[str, object] = {}
         issues: list[dict[str, object]] = []
         now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
@@ -697,6 +735,12 @@ class PipelinePolicyNode(Node):
         sample_times_ns = [sample_time_ns - step_ns * offset for offset in reversed(range(self._n_obs_steps))]
         with self._observation_lock:
             for key, state in self._subs.items():
+                if state.spec.key in rtp_video_keys:
+                    selected[key] = None
+                    issue = PipelinePolicyNode._rtp_video_send_issue(self, state, now_ns)
+                    if issue is not None:
+                        issues.append(issue)
+                    continue
                 if self._n_obs_steps == 1:
                     value, issue = self._sample_observation(state, sample_time_ns, now_ns)
                 else:
@@ -712,7 +756,7 @@ class PipelinePolicyNode(Node):
         decode_issues: list[dict[str, object]] = []
         for key, message in selected.items():
             state = self._subs[key]
-            if state.spec.key in skip_decode_keys:
+            if state.spec.key in rtp_video_keys:
                 continue
             messages = message if self._n_obs_steps > 1 else [message]
             values = [decode_value(state.spec.ros_type, item, state.spec) for item in messages]
@@ -928,7 +972,7 @@ class PipelinePolicyNode(Node):
             if self._config.execution_mode == "distributed" and self._video_stream_manager is not None
             else frozenset()
         )
-        observations = self._sample_observations(sample_time, skip_decode_keys=video_keys)
+        observations = self._sample_observations(sample_time, rtp_video_keys=video_keys)
         self._raise_if_deadline_expired(deadline, request_id)
         if "observation.state" in observations:
             observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
@@ -1863,8 +1907,17 @@ class PipelinePolicyNode(Node):
             return
         try:
             status = status_from_message(message)
+            self._last_cloud_status_received_monotonic = time.monotonic()
+            was_ready = self._require_edge_session().ready
             update = self._require_edge_session().observe_cloud(status)
             self._remote_state = status.runtime_state
+            if not status.ready:
+                self.get_logger().warning(
+                    "Cloud pipeline discovered but is not ready: "
+                    f"runtime_state={status.runtime_state!r}; waiting for cloud backend readiness "
+                    "before binding the distributed session",
+                    throttle_duration_sec=_CLOUD_HANDSHAKE_WARNING_THROTTLE_S,
+                )
             self._complete_invalidated(update.invalidated_request_ids, update.error)
             video_manager = self._video_stream_manager
             if video_manager is not None:
@@ -1874,6 +1927,11 @@ class PipelinePolicyNode(Node):
                         self._publish_video_stream_control()
                 else:
                     video_manager.clear_session()
+            if not was_ready and self._require_edge_session().ready:
+                session_id, session_generation = self._require_edge_session().session
+                self.get_logger().info(
+                    f"Cloud handshake established: session_id={session_id}, session_generation={session_generation}"
+                )
         except Exception as exc:
             self._last_error = f"invalid cloud status: {exc}"
             self.get_logger().error(self._last_error)
@@ -1889,10 +1947,25 @@ class PipelinePolicyNode(Node):
             self._last_error = f"failed to publish distributed status: {exc}"
 
     def _check_heartbeat(self) -> None:
-        update = self._require_edge_session().expire_heartbeat()
+        session = self._require_edge_session()
+        if not session.ready and self._last_cloud_status_received_monotonic is None:
+            elapsed = time.monotonic() - self._distributed_started_monotonic
+            if elapsed >= _CLOUD_HANDSHAKE_WARNING_DELAY_S:
+                self.get_logger().warning(
+                    "Distributed pipeline is running locally but no cloud heartbeat has been received "
+                    f"for {elapsed:.1f}s; start pure_inference_node and verify the heartbeat topic "
+                    f"{self._config.heartbeat_topic!r} and ROS 2 discovery settings",
+                    throttle_duration_sec=_CLOUD_HANDSHAKE_WARNING_THROTTLE_S,
+                )
+        update = session.expire_heartbeat()
         self._complete_invalidated(update.invalidated_request_ids, update.error)
-        if update.error is not None and self._video_stream_manager is not None:
-            self._video_stream_manager.clear_session()
+        if update.error is not None:
+            if self._video_stream_manager is not None:
+                self._video_stream_manager.clear_session()
+            if update.error.code == "heartbeat_expired":
+                self.get_logger().warning(
+                    "Cloud heartbeat expired; distributed session was cleared and is waiting for handshake recovery"
+                )
 
     def _publish_video_stream_control(self) -> None:
         manager = self._video_stream_manager

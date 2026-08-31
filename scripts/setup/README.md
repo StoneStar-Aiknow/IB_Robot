@@ -54,8 +54,8 @@ IBR_LEROBOT_FORCE_UNFILTERED=1 ./scripts/setup.sh --yes
 IBR_HOST_PYTHON_VERSION=3.11 \
 IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
   python3 scripts/setup/lerobot_filter_series.py \
-    --manifest third_party/patches/lerobot/v0.5.1/manifest.yaml \
-    --series   third_party/patches/lerobot/v0.5.1/series.txt
+    --manifest third_party/patches/lerobot/v0.6.0/manifest.yaml \
+    --series   third_party/patches/lerobot/v0.6.0/series.txt
 ```
 
 ### 何时新增一个补丁
@@ -72,7 +72,7 @@ IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
 ```text
 third_party/patches/lerobot/
 ├── INDEX.yaml                  # active_tag + supported_tags + archived_tags
-├── v0.5.1/                     # 每个支持的 tag 一个目录
+├── v0.6.0/                     # 当前 active tag，每个支持的 tag 一个目录
 │   ├── manifest.yaml           # 声明 lerobot_tag + lerobot_commit_range
 │   ├── series.txt
 │   └── 0001-*.patch ...

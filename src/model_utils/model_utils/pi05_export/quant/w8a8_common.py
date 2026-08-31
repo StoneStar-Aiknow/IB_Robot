@@ -27,7 +27,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -106,6 +110,144 @@ def build_disable_names(
             seen.add(n)
             out.append(n)
     return out
+
+
+def restrict_quantizable_nodes(
+    quantizable: list[tuple[str, str]],
+    disable_names: list[str],
+    quantize_regexes: list[str] | None,
+    *,
+    expected_regex_matches: list[int] | None = None,
+    expected_selected_nodes: int | None = None,
+) -> list[str]:
+    """Keep non-matching nodes in fp16 when an explicit quantization allowlist is supplied."""
+    return list(
+        select_quantizable_nodes(
+            quantizable,
+            disable_names,
+            quantize_regexes,
+            expected_regex_matches=expected_regex_matches,
+            expected_selected_nodes=expected_selected_nodes,
+        ).disabled_names
+    )
+
+
+@dataclass(frozen=True)
+class QuantizationSelection:
+    disabled_names: tuple[str, ...]
+    selected_names: tuple[str, ...]
+    regex_matches: tuple[int, ...]
+
+
+def select_quantizable_nodes(
+    quantizable: list[tuple[str, str]],
+    disable_names: list[str],
+    quantize_regexes: list[str] | None,
+    *,
+    expected_regex_matches: list[int] | None = None,
+    expected_selected_nodes: int | None = None,
+) -> QuantizationSelection:
+    """Apply an allowlist and optionally enforce its per-regex and total match contract."""
+    disabled = set(disable_names)
+    if not quantize_regexes:
+        selected = tuple(name for name, _ in quantizable if name not in disabled)
+        if expected_regex_matches:
+            raise ValueError("Expected per-regex match counts require --quantize-regex")
+        if expected_selected_nodes is not None and len(selected) != expected_selected_nodes:
+            raise ValueError(
+                f"Quantization profile selected {len(selected)} node(s), expected {expected_selected_nodes}"
+            )
+        return QuantizationSelection(tuple(disable_names), selected, ())
+    import re
+
+    compiled = [re.compile(pattern, re.IGNORECASE) for pattern in quantize_regexes]
+    if expected_regex_matches is not None and len(expected_regex_matches) != len(compiled):
+        raise ValueError("--quantize-regex-expected must contain one count per --quantize-regex")
+    eligible = [(name, op_type) for name, op_type in quantizable if name not in disabled]
+    regex_matches = tuple(sum(bool(pattern.search(name)) for name, _ in eligible) for pattern in compiled)
+    allowed = {name for name, _ in eligible if any(pattern.search(name) for pattern in compiled)}
+    if not allowed:
+        raise ValueError("None of the --quantize-regex patterns matched a quantizable node")
+    if expected_regex_matches is not None:
+        mismatches = [
+            f"[{index}] matched {actual}, expected {expected}"
+            for index, (actual, expected) in enumerate(zip(regex_matches, expected_regex_matches, strict=True))
+            if actual != expected
+        ]
+        if mismatches:
+            raise ValueError("Quantization profile regex match mismatch: " + "; ".join(mismatches))
+    if expected_selected_nodes is not None and len(allowed) != expected_selected_nodes:
+        raise ValueError(f"Quantization profile selected {len(allowed)} node(s), expected {expected_selected_nodes}")
+    disabled.update(name for name, _ in quantizable if name not in allowed)
+    LOGGER.info("Quantization allowlist matched %d node(s).", len(allowed - disabled))
+    return QuantizationSelection(
+        tuple(name for name, _ in quantizable if name in disabled),
+        tuple(name for name, _ in quantizable if name in allowed and name not in disabled),
+        regex_matches,
+    )
+
+
+def validate_fused_geglu_route(donor, npu):  # noqa: ANN001
+    """Require each NPU fused GeGLU MatMul to have an identical donor target."""
+    npu_producer = {output: node for node in npu.graph.node for output in node.output}
+    donor_names = [node.name for node in donor.graph.node if node.name]
+    if len(donor_names) != len(set(donor_names)):
+        raise RuntimeError("Fused GeGLU donor contains duplicate node names")
+    donor_by_name = {node.name: node for node in donor.graph.node}
+    donor_init = {initializer.name: initializer for initializer in donor.graph.initializer}
+    npu_init = {initializer.name: initializer for initializer in npu.graph.initializer}
+    fused_targets = []
+    for geglu in npu.graph.node:
+        if geglu.op_type != "NPUGeglu" or not geglu.input:
+            continue
+        producer = npu_producer.get(geglu.input[0])
+        if producer is None or producer.op_type not in {"MatMul", "Gemm"}:
+            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
+        donor_node = donor_by_name.get(producer.name)
+        if donor_node is None or donor_node.op_type != producer.op_type:
+            raise RuntimeError(f"Fused GeGLU donor is missing {producer.op_type} {producer.name!r}")
+        if len(donor_node.input) < 2 or len(producer.input) < 2:
+            raise RuntimeError(f"Fused GeGLU MatMul {producer.name!r} has no weight input")
+        donor_weight = donor_init.get(donor_node.input[1])
+        npu_weight = npu_init.get(producer.input[1])
+        if donor_weight is None or npu_weight is None or list(donor_weight.dims) != list(npu_weight.dims):
+            raise RuntimeError(f"Fused GeGLU weight shape mismatch for {producer.name!r}")
+        fused_targets.append(producer.name)
+    if not fused_targets:
+        raise RuntimeError("NPU graph has no NPUGeglu nodes to quantize")
+    LOGGER.info("Validated %d fused GeGLU MatMul donor target(s).", len(fused_targets))
+    return fused_targets
+
+
+def validate_npu_geglu_deployment(npu, expected: int | None = None):  # noqa: ANN001
+    """Require every NPUGeglu site in the deployment graph to consume a weight MatMul/Gemm."""
+    import re
+
+    producer = {output: node for node in npu.graph.node for output in node.output}
+    initializers = {initializer.name for initializer in npu.graph.initializer}
+    separate_projection = re.compile(r"/mlp/(?:gate_proj|up_proj)/MatMul$")
+    mixed = [node.name for node in npu.graph.node if separate_projection.search(node.name)]
+    if mixed:
+        raise RuntimeError(f"NPU deployment graph mixes NPUGeglu with separate gate/up projections: {mixed[:5]}")
+    targets = []
+    for geglu in npu.graph.node:
+        if geglu.op_type != "NPUGeglu":
+            continue
+        parent = producer.get(geglu.input[0]) if geglu.input else None
+        if (
+            parent is None
+            or parent.op_type not in {"MatMul", "Gemm"}
+            or len(parent.input) < 2
+            or parent.input[1] not in initializers
+        ):
+            raise RuntimeError(f"NPUGeglu {geglu.name!r} is not fed by a MatMul/Gemm")
+        targets.append(parent.name)
+    if not targets:
+        raise RuntimeError("NPU deployment graph has no NPUGeglu nodes")
+    if expected is not None and len(targets) != expected:
+        raise RuntimeError(f"NPU deployment graph has {len(targets)} NPUGeglu nodes, expected {expected}")
+    LOGGER.info("Validated %d NPU GeGLU deployment site(s).", len(targets))
+    return targets
 
 
 def ordered_input_names(onnx_path: Path) -> list[str]:
@@ -230,6 +372,169 @@ def install_onnx_mapping_shim() -> None:
 _PROTOBUF_INLINE_LIMIT = 1_900_000_000
 
 
+def _iter_tensors(proto):  # noqa: ANN001
+    from google.protobuf.descriptor import FieldDescriptor
+    from onnx import TensorProto
+
+    def tensors(message):  # noqa: ANN001
+        if isinstance(message, TensorProto):
+            yield message
+            return
+        for field, value in message.ListFields():
+            if field.type != FieldDescriptor.TYPE_MESSAGE:
+                continue
+            is_repeated = getattr(field, "is_repeated", None)
+            if is_repeated is None:
+                is_repeated = field.label == FieldDescriptor.LABEL_REPEATED
+            if is_repeated:
+                for item in value:
+                    yield from tensors(item)
+            else:
+                yield from tensors(value)
+
+    yield from tensors(proto)
+
+
+def _has_unloaded_external_data(proto) -> bool:  # noqa: ANN001
+    """Return whether a model still references tensor bytes not loaded in memory."""
+    from onnx.external_data_helper import uses_external_data
+
+    return any(uses_external_data(tensor) and not tensor.HasField("raw_data") for tensor in _iter_tensors(proto))
+
+
+def _validate_external_data_pair(model_path: Path, data_name: str) -> None:
+    """Validate protobuf parsing and every external-data reference without loading tensor bytes."""
+    import math
+
+    import onnx
+    from onnx import TensorProto, helper
+    from onnx.external_data_helper import uses_external_data
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    data_path = model_path.with_name(data_name)
+    data_size = data_path.stat().st_size if data_path.is_file() else None
+    for tensor in _iter_tensors(model):
+        if not uses_external_data(tensor):
+            continue
+        metadata = {entry.key: entry.value for entry in tensor.external_data}
+        if metadata.get("location") != data_name or data_size is None:
+            raise RuntimeError(f"Invalid external data reference for tensor {tensor.name!r}")
+        try:
+            offset = int(metadata.get("offset", "0"))
+            length = int(metadata["length"])
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(f"Invalid external data bounds for tensor {tensor.name!r}") from exc
+        element_count = math.prod(tensor.dims)
+        dtype_name = TensorProto.DataType.Name(tensor.data_type)
+        packed_bits = (
+            4 if dtype_name in {"INT4", "UINT4", "FLOAT4E2M1"} else 2 if dtype_name in {"INT2", "UINT2"} else 0
+        )
+        if packed_bits:
+            expected_length = (element_count * packed_bits + 7) // 8
+        elif dtype_name == "BFLOAT16":
+            expected_length = element_count * 2
+        elif dtype_name.startswith("FLOAT8"):
+            expected_length = element_count
+        else:
+            try:
+                expected_length = element_count * helper.tensor_dtype_to_np_dtype(tensor.data_type).itemsize
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Unsupported external tensor dtype for {tensor.name!r}") from exc
+        if offset < 0 or length != expected_length or offset + length > data_size:
+            raise RuntimeError(f"External data bounds exceed {data_name} for tensor {tensor.name!r}")
+
+
+def _save_external_data_pair(
+    save_model,  # noqa: ANN001
+    proto,  # noqa: ANN001
+    output_path: Path,
+    data_name: str,
+    *args,
+    **kwargs,
+) -> None:
+    """Stage, validate, and replace an ONNX/external-data pair."""
+    from onnx import TensorProto
+    from onnx.external_data_helper import uses_external_data
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if Path(data_name).name != data_name or data_name.startswith(".") or data_name == output_path.name:
+        raise ValueError("External ONNX data_name must be a distinct, non-hidden file name")
+    if _has_unloaded_external_data(proto):
+        raise ValueError("Cannot save an ONNX model with unloaded external tensors; load external data first")
+
+    data_path = output_path.with_name(data_name)
+
+    # Loaded external tensors may retain an old location. Normalize them to
+    # inline storage so this save owns every external reference it creates.
+    for tensor in _iter_tensors(proto):
+        if uses_external_data(tensor):
+            tensor.data_location = TensorProto.DEFAULT
+            del tensor.external_data[:]
+
+    with tempfile.TemporaryDirectory(prefix=f".{output_path.name}.", dir=output_path.parent) as tmp_dir:
+        staging = Path(tmp_dir)
+        staged_model = staging / output_path.name
+        staged_data = staging / data_name
+        unique_data_name = f".{data_name}.{uuid4().hex}"
+        unique_staged_data = staging / unique_data_name
+        save_kwargs = dict(kwargs)
+        save_kwargs.update(
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=unique_data_name,
+            convert_attribute=True,
+        )
+        save_model(proto, str(staged_model), *args, **save_kwargs)
+        if not staged_model.is_file():
+            raise RuntimeError(f"ONNX save did not produce {staged_model}")
+
+        has_staged_data = unique_staged_data.is_file()
+        external_tensors = [tensor for tensor in _iter_tensors(proto) if uses_external_data(tensor)]
+        if external_tensors and not has_staged_data:
+            raise RuntimeError(f"ONNX save did not produce external data {unique_staged_data}")
+        for tensor in external_tensors:
+            for entry in tensor.external_data:
+                if entry.key == "location":
+                    entry.value = data_name
+        save_model(proto, str(staged_model))
+        if has_staged_data:
+            os.replace(unique_staged_data, staged_data)
+
+        _validate_external_data_pair(staged_model, data_name)
+
+        destinations = [(staged_data, data_path)] if has_staged_data else []
+        destinations.append((staged_model, output_path))
+        backup_destinations = [destination for _, destination in destinations]
+        if not has_staged_data:
+            backup_destinations.append(data_path)
+        backups: dict[Path, Path] = {}
+        installed: list[Path] = []
+        for destination in backup_destinations:
+            if destination.exists():
+                backup = staging / f"backup-{uuid4().hex}"
+                os.link(destination, backup)
+                backups[destination] = backup
+        try:
+            for staged, destination in destinations:
+                os.replace(staged, destination)
+                installed.append(destination)
+            if not has_staged_data and data_path.exists():
+                data_path.unlink()
+                installed.append(data_path)
+        except Exception:
+            for destination in reversed(installed):
+                backup = backups.get(destination)
+                if backup is not None:
+                    os.replace(backup, destination)
+                else:
+                    try:  # noqa: SIM105
+                        destination.unlink()
+                    except FileNotFoundError:
+                        pass
+            raise
+
+
 def install_large_model_save_patch() -> None:
     """Force ``onnx.save`` to use external data for >2 GB models.
 
@@ -250,27 +555,55 @@ def install_large_model_save_patch() -> None:
     _orig_save_model = onnx.save_model
 
     def _patched_save_model(proto, f, *args, **kwargs):  # noqa: ANN001
-        already_external = kwargs.get("save_as_external_data", False)
-        if not already_external:
+        if isinstance(proto, bytes):
+            return _orig_save_model(proto, f, *args, **kwargs)
+        if not isinstance(f, str | os.PathLike) or Path(f).suffix.lower() != ".onnx":
+            return _orig_save_model(proto, f, *args, **kwargs)
+
+        save_format = kwargs.get("format", args[0] if args else None)
+        save_as_external = kwargs.get("save_as_external_data", args[1] if len(args) > 1 else False)
+        other_external_options = {
+            "all_tensors_to_one_file",
+            "location",
+            "size_threshold",
+            "convert_attribute",
+        }
+        can_intercept = (
+            save_format in (None, "protobuf")
+            and not save_as_external
+            and len(args) <= 2
+            and not any(name in kwargs for name in other_external_options)
+        )
+        if can_intercept:
             try:
                 too_big = proto.ByteSize() > _PROTOBUF_INLINE_LIMIT
             except Exception:  # noqa: BLE001
                 # ByteSize() raises EncodeError (>2 GB) on some protobuf builds —
                 # that overflow IS the signal that we must use external data.
                 too_big = True
-            if too_big and isinstance(f, (str, Path)):  # noqa: UP038
+            if too_big and isinstance(f, str | os.PathLike):
                 location = Path(f).name + ".data"
-                kwargs.update(
-                    save_as_external_data=True,
-                    all_tensors_to_one_file=True,
-                    location=location,
-                    size_threshold=1024,
-                )
+                if _has_unloaded_external_data(proto):
+                    raise ValueError(
+                        "Cannot rewrite a large ONNX model with unloaded external tensors; "
+                        "load external data before saving"
+                    )
                 LOGGER.info(
                     "Large model (>%.1f GB inline limit): saving %s with external data → %s",
                     _PROTOBUF_INLINE_LIMIT / 1e9,
                     Path(f).name,
                     location,
+                )
+                clean_kwargs = dict(kwargs)
+                clean_kwargs.pop("format", None)
+                clean_kwargs.pop("save_as_external_data", None)
+                return _save_external_data_pair(
+                    _orig_save_model,
+                    proto,
+                    Path(f),
+                    location,
+                    size_threshold=1024,
+                    **clean_kwargs,
                 )
         return _orig_save_model(proto, f, *args, **kwargs)
 
@@ -289,26 +622,20 @@ def save_onnx_external(model, output_path: Path, data_name: str | None = None) -
     recorded against the appended position — but the leading bytes become dead
     weight). Our pipeline re-saves the same path more than once
     (``run_quantize`` → dequant-pin, and transplant → dequant-pin), so we must
-    delete any stale ``.onnx`` + ``.data`` *before* writing. The in-memory model
-    is unaffected: ``onnx.load`` already pulled every external tensor into
-    ``raw_data`` before we get here.
+    avoid writing directly over that stale pair. The input proto is consumed in
+    the same way as ``onnx.save_model(..., save_as_external_data=True)`` and must
+    not be reused after this call.
     """
     import onnx
 
     output_path = Path(output_path)
     if data_name is None:
         data_name = output_path.name + ".data"
-    for stale in (output_path, output_path.with_name(data_name)):
-        try:  # noqa: SIM105
-            stale.unlink()
-        except FileNotFoundError:
-            pass
-    onnx.save_model(
+    _save_external_data_pair(
+        onnx.save_model,
         model,
-        str(output_path),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_name,
+        output_path,
+        data_name,
         size_threshold=1024,
     )
 
@@ -384,8 +711,156 @@ def install_msmodelslim_calib_patch() -> None:
     LOGGER.info("Installed msModelSlim DataReader calibration patch (2 GB + bool-input safe).")
 
 
-def install_msmodelslim_amp_patch(calib_sample: list[np.ndarray]) -> None:
-    """Make ``amp_num`` rollback rank layers on REAL calib data, not random noise.
+def _create_external_data_ort_session(model, scratch_dir: Path | None = None):  # noqa: ANN001
+    """Create an ORT session without serializing a multi-GB model to bytes."""
+    import onnxruntime
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="pi05_amp_", dir=scratch_dir)
+    try:
+        tmp_dir = temp_dir.name
+        model_path = Path(tmp_dir) / "model.onnx"
+        save_onnx_external(model, model_path)
+        session = onnxruntime.InferenceSession(str(model_path))
+    except Exception:
+        temp_dir.cleanup()
+        raise
+    # ORT may reload the model when providers change, so retain the pair for
+    # exactly as long as the session rather than deleting it on return.
+    session._pi05_external_data_tempdir = temp_dir
+    return session
+
+
+def _make_fp16_qdq_ort_compatible(model) -> tuple[int, int]:  # noqa: ANN001
+    """Wrap fp16 Q/DQ edges for ORT's opset-17 CPU implementation."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    initializers = {initializer.name: initializer for initializer in model.graph.initializer}
+    scale_names = set()
+    for node in model.graph.node:
+        if node.op_type in ("QuantizeLinear", "DequantizeLinear") and len(node.input) > 1:
+            scale_names.add(node.input[1])
+        elif node.op_type in ("QLinearMatMul", "QLinearConv"):
+            scale_names.update(node.input[index] for index in (1, 4, 6) if len(node.input) > index)
+        elif node.domain == "com.microsoft" and node.op_type == "QGemm":
+            scale_names.update(node.input[index] for index in (1, 4, 7) if len(node.input) > index)
+    fp16_scales = {
+        name
+        for name in scale_names
+        if (scale := initializers.get(name)) is not None and scale.data_type == TensorProto.FLOAT16
+    }
+    for name in fp16_scales:
+        scale = initializers[name]
+        scale.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(scale).astype(np.float32), name=name))
+
+    quantize_count = 0
+    dequantize_count = 0
+    nodes = []
+    used_tensor_names = {name for node in model.graph.node for name in (*node.input, *node.output) if name}
+    used_tensor_names.update(value.name for value in model.graph.input)
+    used_tensor_names.update(value.name for value in model.graph.output)
+    used_tensor_names.update(value.name for value in model.graph.value_info)
+    used_tensor_names.update(initializers)
+    used_node_names = {node.name for node in model.graph.node if node.name}
+    input_casts: dict[str, str] = {}
+
+    def unique_name(base: str, used: set[str]) -> str:
+        candidate = base
+        suffix = 1
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        return candidate
+
+    for node in model.graph.node:
+        if node.op_type == "QuantizeLinear" and node.input[1] in fp16_scales:
+            source = node.input[0]
+            cast_output = input_casts.get(source)
+            if cast_output is None:
+                cast_output = unique_name(source + "_amp_fp32", used_tensor_names)
+                input_casts[source] = cast_output
+                nodes.append(
+                    helper.make_node(
+                        "Cast",
+                        [source],
+                        [cast_output],
+                        name=unique_name((node.name or node.output[0]) + "/amp_input_cast", used_node_names),
+                        to=TensorProto.FLOAT,
+                    )
+                )
+            node.input[0] = cast_output
+            quantize_count += 1
+        if node.op_type == "DequantizeLinear" and node.input[1] in fp16_scales:
+            output = node.output[0]
+            fp32_output = unique_name(output + "_amp_fp32", used_tensor_names)
+            node.output[0] = fp32_output
+            nodes.append(node)
+            nodes.append(
+                helper.make_node(
+                    "Cast",
+                    [fp32_output],
+                    [output],
+                    name=unique_name((node.name or output) + "/amp_output_cast", used_node_names),
+                    to=TensorProto.FLOAT16,
+                )
+            )
+            dequantize_count += 1
+            continue
+        nodes.append(node)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    return quantize_count, dequantize_count
+
+
+def _activation_l2_error(float_array: np.ndarray, quant_array: np.ndarray) -> float:
+    """Compute sensitivity without overflowing ModelSlim's fp16 norm."""
+    if float_array.shape != quant_array.shape:
+        raise ValueError(
+            f"AMP activation shapes do not match: float={float_array.shape}, quantized={quant_array.shape}"
+        )
+    float_array = float_array.astype(np.float32)
+    quant_array = quant_array.astype(np.float32)
+    if not np.all(np.isfinite(float_array)) or not np.all(np.isfinite(quant_array)):
+        raise ValueError("AMP activation arrays must contain only finite values")
+    error = float(np.linalg.norm((float_array - quant_array).reshape(-1)))
+    if not np.isfinite(error):
+        raise ValueError("AMP activation L2 error is not finite")
+    return error
+
+
+def _validate_amp_rollback_count(amp_num: int, rankable_count: int) -> None:
+    if not 0 < amp_num < rankable_count:
+        raise ValueError(f"amp_num must be smaller than the {rankable_count} rankable quantized layers; got {amp_num}")
+
+
+def _set_msmodelslim_amp_calib_samples(rollback_module, calib_samples: list[list[np.ndarray]]) -> None:  # noqa: ANN001
+    rollback_module._pi05_calib_samples = calib_samples
+
+
+def _set_msmodelslim_amp_scratch_dir(rollback_module, scratch_dir: Path) -> None:  # noqa: ANN001
+    rollback_module._pi05_amp_scratch_dir = scratch_dir
+
+
+def _update_activation_l2_sums(
+    error_sums: np.ndarray,
+    float_arrays: list[np.ndarray],
+    quant_arrays: list[np.ndarray],
+) -> None:
+    if len(float_arrays) != len(error_sums) or len(quant_arrays) != len(error_sums):
+        raise ValueError("AMP activation output counts do not match")
+    for index, (float_array, quant_array) in enumerate(zip(float_arrays, quant_arrays, strict=True)):
+        error_sums[index] += _activation_l2_error(float_array, quant_array)
+
+
+def _restore_opset_imports(model, opsets: list[tuple[str, int]]) -> None:  # noqa: ANN001
+    import onnx
+
+    del model.opset_import[:]
+    model.opset_import.extend(onnx.helper.make_opsetid(domain, version) for domain, version in opsets)
+
+
+def install_msmodelslim_amp_patch(calib_samples: list[list[np.ndarray]], scratch_dir: Path) -> None:
+    """Make ``amp_num`` rollback work with real data and multi-GB models.
 
     ``amp_num > 0`` asks msModelSlim to auto-roll-back the most
     quantization-sensitive layers to fp16. To rank them it runs the float and
@@ -404,33 +879,142 @@ def install_msmodelslim_amp_patch(calib_sample: list[np.ndarray]) -> None:
        ``INPUT_DTYPE_DICT`` has no ``tensor(bool)`` entry → ``.astype(None)``
        yields float64 for our bool masks, which ORT rejects / mis-feeds.
 
-    We replace ``gen_model_inputs`` with one that returns our first real
-    calibration sample, bound positionally to the model inputs with their
-    declared dtypes (bool included). This makes ``--amp-num`` meaningful and
-    safe. The error session itself runs on the ORT-runnable donor (no NPU ops),
-    and the AE donor is well under 2 GB so its ``SerializeToString`` is fine; if
-    a future >2 GB donor needs amp, also wrap
-    ``get_session_for_intermediate_output`` to spill to a temp file.
+    We replace ``gen_model_inputs`` with one that returns real calibration data,
+    bound positionally to the model inputs with their declared dtypes (bool
+    included). We also replace the activation matcher:
+    stock ModelSlim calls ``model.SerializeToString()`` and exposes every graph
+    node as an output. The former fails for the multi-GB VLM donor, while the
+    latter exhausts 32 GB of RAM. The replacement loads temporary external-data
+    models by path, fetches only quantized-layer outputs, and releases the float
+    session before creating the quantized session. For multi-sample ranking,
+    float outputs are staged on disk so only one model and one sample's
+    activations are resident at a time.
     """
     install_onnx_mapping_shim()
 
+    import gc
+
+    import onnx
+    from msmodelslim.onnx.post_training_quant.label_free import quantize_tool as _qt
     from msmodelslim.onnx.post_training_quant.label_free import rollback_quant_nodes as _rb
 
+    if not calib_samples:
+        raise ValueError("AMP rollback requires at least one calibration sample")
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    _set_msmodelslim_amp_calib_samples(_rb, calib_samples)
+    _set_msmodelslim_amp_scratch_dir(_rb, scratch_dir)
     if getattr(_rb, "_pi05_amp_patched", False):
         return
 
     def _patched_gen_model_inputs(inputs, quant_config=None):  # noqa: ANN001
-        if len(calib_sample) != len(inputs):
+        current_sample = _rb._pi05_calib_samples[0]
+        if len(current_sample) != len(inputs):
             raise ValueError(
-                f"amp rollback: calib sample has {len(calib_sample)} array(s) but model has {len(inputs)} input(s)."
+                f"amp rollback: calib sample has {len(current_sample)} array(s) but model has {len(inputs)} input(s)."
             )
-        return {inp.name: arr for inp, arr in zip(inputs, calib_sample, strict=False)}
+        return {inp.name: arr for inp, arr in zip(inputs, current_sample, strict=False)}
+
+    def _bind_sample(inputs, sample):  # noqa: ANN001
+        if len(sample) != len(inputs):
+            raise ValueError(
+                f"amp rollback: calib sample has {len(sample)} array(s) but model has {len(inputs)} input(s)."
+            )
+        return {inp.name: arr for inp, arr in zip(inputs, sample, strict=False)}
+
+    def _patched_create_session(model):  # noqa: ANN001
+        return _create_external_data_ort_session(model, _rb._pi05_amp_scratch_dir)
+
+    def _patched_match_activations(float_model_path, quant_model_path, quantized_nodes=None, quant_config=None):
+        quantized_node_names = set(quantized_nodes or ())
+        float_topology = onnx.load(float_model_path, load_external_data=False)
+        output_to_node = {
+            output: node.name
+            for node in float_topology.graph.node
+            if node.name in quantized_node_names
+            for output in node.output
+        }
+        float_outputs = [
+            output for node in float_topology.graph.node if node.name in quantized_node_names for output in node.output
+        ]
+        quant_topology = onnx.load(quant_model_path, load_external_data=False)
+        quant_outputs = {
+            output for node in quant_topology.graph.node if node.op_type == "DequantizeLinear" for output in node.output
+        }
+        quant_ir_version = quant_topology.ir_version
+        quant_opsets = [(entry.domain, entry.version) for entry in quant_topology.opset_import]
+        output_names = list(dict.fromkeys(name for name in float_outputs if name in quant_outputs))
+        if not output_names:
+            raise RuntimeError("amp rollback found no shared quantized-layer outputs to compare.")
+        _validate_amp_rollback_count(quant_config.amp_num, len(output_names))
+        rank_samples = _rb._pi05_calib_samples
+        LOGGER.info(
+            "AMP rollback: comparing %d quantized-layer output(s) across %d sample(s).",
+            len(output_names),
+            len(rank_samples),
+        )
+        del float_topology, quant_topology
+
+        def expose_outputs(model):  # noqa: ANN001
+            del model.graph.output[:]
+            model.graph.output.extend(onnx.ValueInfoProto(name=name) for name in output_names)
+
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory(prefix="pi05_amp_outputs_", dir=_rb._pi05_amp_scratch_dir) as output_dir:
+            output_root = Path(output_dir)
+            float_model = onnx.load(float_model_path)
+            expose_outputs(float_model)
+            float_session = _patched_create_session(float_model)
+            float_inputs = float_session.get_inputs()
+            for sample_index, sample in enumerate(rank_samples):
+                input_dict = _bind_sample(float_inputs, sample)
+                float_arrays = float_session.run(output_names, input_dict)
+                for output_index, array in enumerate(float_arrays):
+                    np.save(output_root / f"{sample_index}_{output_index}.npy", array, allow_pickle=False)
+                del float_arrays
+            del float_session, float_model
+            gc.collect()
+
+            quant_model = _rb.preprocess_quant_model(onnx.load(quant_model_path))
+            quant_model.ir_version = quant_ir_version
+            _restore_opset_imports(quant_model, quant_opsets)
+            q_count, dq_count = _make_fp16_qdq_ort_compatible(quant_model)
+            LOGGER.info(
+                "AMP rollback: wrapped %d QuantizeLinear and %d DequantizeLinear fp16 edge(s).",
+                q_count,
+                dq_count,
+            )
+            expose_outputs(quant_model)
+            quant_session = _patched_create_session(quant_model)
+            quant_inputs = quant_session.get_inputs()
+            error_sums = np.zeros(len(output_names), dtype=np.float64)
+            for sample_index, sample in enumerate(rank_samples):
+                input_dict = _bind_sample(quant_inputs, sample)
+                quant_arrays = quant_session.run(output_names, input_dict)
+                float_arrays = [
+                    np.load(output_root / f"{sample_index}_{output_index}.npy", mmap_mode="r")
+                    for output_index in range(len(output_names))
+                ]
+                _update_activation_l2_sums(error_sums, float_arrays, quant_arrays)
+                del float_arrays, quant_arrays
+            del quant_session, quant_model
+            gc.collect()
+
+        errors = {name: float(error_sums[index] / len(rank_samples)) for index, name in enumerate(output_names)}
+        LOGGER.info(
+            "AMP rollback sensitivity ranking: %s",
+            [(output_to_node[name], float(error)) for name, error in sorted(errors.items(), key=lambda item: -item[1])],
+        )
+        return errors
 
     _rb.gen_model_inputs = _patched_gen_model_inputs
+    _rb.get_session_for_intermediate_output = _patched_create_session
+    _rb.match_activations = _patched_match_activations
+    _qt.match_activations = _patched_match_activations
     _rb._pi05_amp_patched = True  # type: ignore[attr-defined]
     LOGGER.info(
         "Installed msModelSlim amp-rollback patch: layer-sensitivity ranking uses "
-        "REAL calibration data (bool-safe) instead of random noise."
+        "real calibration data and external-data ORT sessions."
     )
 
 
@@ -583,8 +1167,10 @@ def run_msmodelslim_w8a8(
     calib_data: list[list[np.ndarray]],
     disable_names: list[str],
     amp_num: int,
+    amp_rank_samples: int = 1,
+    amp_scratch_dir: Path | None = None,
     npu_graph: Path | None = None,
-) -> None:
+) -> int:
     """Calibrate and export a W8A8 quantized ONNX via msModelSlim.
 
     Isolated so it is the only place to touch when adapting to a different
@@ -611,7 +1197,10 @@ def run_msmodelslim_w8a8(
     # amp_num rollback ranks layers on its own (random) data path — make it use
     # our real calibration sample so --amp-num is meaningful and bool-safe.
     if amp_num > 0:
-        install_msmodelslim_amp_patch(calib_data[0])
+        if amp_rank_samples <= 0:
+            raise ValueError("amp_rank_samples must be positive")
+        scratch_dir = (amp_scratch_dir or output_onnx.parent).expanduser().resolve()
+        install_msmodelslim_amp_patch(calib_data[:amp_rank_samples], scratch_dir)
     # msModelSlim hard-codes opset 11 when saving the quantized model; force it
     # back to the input model's opset so ATC accepts LayerNormalization (>=17).
     _target_opset = onnx_default_opset(input_onnx) or 17
@@ -673,12 +1262,6 @@ def run_msmodelslim_w8a8(
     else:
         donor_onnx = output_onnx
 
-    for stale in (donor_onnx, donor_onnx.with_name(donor_onnx.name + ".data")):
-        try:  # noqa: SIM105
-            stale.unlink()
-        except FileNotFoundError:
-            pass
-
     run_quantize(str(quant_input), str(donor_onnx), quant_config)
     LOGGER.info("W8A8 donor ONNX written to %s", donor_onnx)
 
@@ -687,11 +1270,19 @@ def run_msmodelslim_w8a8(
     fix_ascend_dequant_output_dtype(donor_onnx)
 
     if npu_graph is not None:
-        transplant_int8_into_npu_graph(donor_onnx, npu_graph, output_onnx)
+        quantized_nodes = transplant_int8_into_npu_graph(donor_onnx, npu_graph, output_onnx)
         # Re-pin: the transplant renamed every dequant output to the NPU graph's
         # downstream tensor, so the fp16 value_info must be re-declared on those.
         fix_ascend_dequant_output_dtype(output_onnx)
         LOGGER.info("Final NPU + W8A8 ONNX written to %s", output_onnx)
+        return quantized_nodes
+    return count_quantized_nodes(output_onnx)
+
+
+def count_quantized_nodes(output_onnx: Path) -> int:
+    """Count quantized compute sites by their one-to-one AscendDequant outputs."""
+    model = load_onnx(output_onnx)
+    return sum(node.op_type == "AscendDequant" for node in model.graph.node)
 
 
 def fix_ascend_dequant_output_dtype(output_onnx: Path) -> None:
@@ -806,15 +1397,15 @@ def topo_sort_graph(graph) -> None:
     graph.node.extend(ordered)
 
 
-def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx: Path) -> None:
+def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx: Path) -> int:
     """Graft the donor's int8 Linears onto the NPU-op graph (Route A).
 
     Quantization (``AscendQuant → MatMul-int8 → AscendDequant``) only ever
     touches ``MatMul``/``Gemm``/``Conv``; the NPU fused ops we substitute
     (``NPURmsNorm``/``NPURotaryMul``/``NPUFastGelu``/...) are all *non*-quantized
-    and live in the fp16 region *between* Linears. So the two graphs are
-    identical in their quantizable subgraph and differ only in the norm/rope/
-    activation islands. We therefore calibrate+quantize the ORT-runnable graph
+    and live in the fp16 region *between* Linears. For ``NPUGeglu``, the
+    ORT-runnable donor uses the same fused ``[up, gate]`` MatMul followed by an
+    exact standard-ONNX GeGLU decomposition. We therefore calibrate+quantize the ORT-runnable graph
     (the *donor*, which msModelSlim can actually run on CPU) and then move each
     int8 triplet onto the NPU graph, matching Linears by their **node-name
     stem** — node names come from the module hierarchy (``/layers.0/self_attn/
@@ -995,7 +1586,6 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
             f"to the NPU graph. The NPU export likely renamed/removed a Linear that "
             f"quantization touched. First mismatches:\n  {preview}"
         )
-
     # Drop the fp16 MatMuls that were replaced.
     kept_nodes = [n for n in ng.node if n.name not in npu_nodes_to_remove]
     del ng.node[:]
@@ -1045,6 +1635,7 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
         freed_bytes / 1e9,
         output_onnx,
     )
+    return transplanted
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1658,12 @@ def resolve_output_path(output_arg: str | None, input_onnx: Path) -> Path:
             out = out.with_name(out.name + ".onnx")
         return out
     return input_onnx.with_name(input_onnx.stem + "_w8a8.onnx")
+
+
+def remove_onnx_external_pair(output_path: Path) -> None:
+    """Remove an ONNX protobuf and its conventional external-data sidecar."""
+    for path in (output_path, output_path.with_name(output_path.name + ".data")):
+        path.unlink(missing_ok=True)
 
 
 def add_common_quant_args(p: argparse.ArgumentParser) -> None:
@@ -1097,6 +1694,36 @@ def add_common_quant_args(p: argparse.ArgumentParser) -> None:
         "Overrides the built-in defaults when provided.",
     )
     p.add_argument(
+        "--quantize-regex",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional regex allowlist for quantized node names. Non-matching nodes stay fp16; built-in exclusions still win.",
+    )
+    p.add_argument(
+        "--quantize-regex-expected",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Expected eligible-node match count for each --quantize-regex entry.",
+    )
+    p.add_argument(
+        "--expected-selected-nodes",
+        type=int,
+        default=None,
+        help="Expected number of unique nodes selected before quantization.",
+    )
+    p.add_argument(
+        "--expected-quantized-nodes",
+        type=int,
+        default=None,
+        help="Expected number of quantized compute sites in the final ONNX.",
+    )
+    p.add_argument("--quant-profile-name", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--quant-profile-hash", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--quant-role", choices=("vlm", "ae"), default=None, help=argparse.SUPPRESS)
+    p.add_argument("--quant-metadata-path", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument(
         "--quantize-convs",
         action="store_true",
         help="Also quantize Conv nodes. Off by default to protect accuracy.",
@@ -1113,6 +1740,48 @@ def add_common_quant_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=0,
         help="msModelSlim auto mixed-precision fp16 fallback layer count (ranked on real calib data).",
+    )
+    p.add_argument(
+        "--amp-rank-samples",
+        type=int,
+        default=1,
+        help="Number of calibration samples used to rank AMP rollback layers.",
+    )
+    p.add_argument(
+        "--amp-scratch-dir",
+        type=Path,
+        default=None,
+        help="Disk-backed scratch directory for AMP model and activation staging (defaults to the output directory).",
+    )
+    p.add_argument(
+        "--smoothquant-alpha",
+        type=float,
+        default=None,
+        help="Prepare matched donor/NPU graphs with SmoothQuant before W8A8 PTQ (disabled when omitted).",
+    )
+    p.add_argument(
+        "--smoothquant-epsilon",
+        type=float,
+        default=1e-5,
+        help="Positive floor used while deriving SmoothQuant channel scales.",
+    )
+    p.add_argument(
+        "--smoothquant-output-dir",
+        type=Path,
+        default=None,
+        help="Directory for prepared SmoothQuant graph pairs and the scale plan sidecar.",
+    )
+    p.add_argument(
+        "--smoothquant-verify-rtol",
+        type=float,
+        default=2e-3,
+        help="Relative tolerance for original-vs-smoothed portable donor equivalence.",
+    )
+    p.add_argument(
+        "--smoothquant-verify-atol",
+        type=float,
+        default=2e-3,
+        help="Absolute tolerance for original-vs-smoothed portable donor equivalence.",
     )
     p.add_argument(
         "--list-nodes", action="store_true", help="Print the quantizable node inventory and exit (no quantization)."

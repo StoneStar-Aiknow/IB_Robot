@@ -106,6 +106,27 @@ fingerprint 和 semantic identity fingerprint 共同生成与路径和列表顺�
 
 ## 配置示例
 
+### 机器人配置 overlay
+
+当一个机器人配置只扩展现有机器人时，可在 `robot` 下声明 `base_config`，避免复制完整 YAML：
+
+```yaml
+robot:
+  name: so101_with_extension
+  base_config: so101_single_arm
+  teleoperation:
+    devices:
+      __append__:
+        - name: extension_device
+          type: custom
+```
+
+`base_config` 只允许引用同目录的机器人 YAML；相对路径以当前 overlay 文件为基准，无扩展名时补
+`.yaml`。这个边界保证继承配置中的相对资源路径仍具有唯一语义。mapping 递归合并，scalar 和 list 默认
+替换；list 只有使用仅含 `__append__` 的 mapping 才追加。loader 拒绝循环引用、mapping/list
+容器类型不匹配，以及含额外字段的 `__append__`。规范化结果以 `_config_path` 标记最外层配置，并按基线到 overlay 的顺序
+在 `_config_sources` 保留完整来源链，供诊断和审计使用。
+
 ```yaml
 robot:
   name: so101_single_arm
@@ -570,6 +591,63 @@ robot:
 设备可通过 `target` 指定要控制的关节组和控制器命令话题；未指定时回退到机器人级
 `joints.arm` / `joints.gripper` 以及默认单臂控制器话题。
 
+通用 `target.publish_groups` 可声明任意有序关节组；`target.actuator` 可直接引用
+`auxiliary_actuators` 的关节顺序与命令话题，避免重复配置。launch 会拒绝多个 active devices
+占用同一 command topic，但允许 topic 不重叠的 arm 与 hand 输入并存。非 ros2_control
+执行器配置在 `auxiliary_actuators`，driver package/executable 和关节数不受 Aero 7 维限制；其关节放在 `joints.hand`，不得加入
+`joints.all`。外部 source/actuator 可用 `active_control_modes` 声明所属控制模式；仿真会跳过
+`mock: false` 的真实外设，但仍可启动显式 `mock: true` 的离线组件。Aero Hand 配置将两个外设
+限定在 `teleop` 真机路径，且不会在该路径静默降级为 mock。启动前设置外部手套 SDK 路径：
+
+```bash
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+export AERO_HAND_RIGHT_PORT=/dev/serial/by-id/<aero-hand-id>
+ros2 run robot_teleop calibrate_glove --side right --lib-path "$MHANDPRO_SDK_LIB" \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+默认完整标定写入 `feature_schema: aero_compact_v3`，使用 20 个骨骼节点和 5 个厂商虚拟指尖。
+用户标定保存四个原始拇指特征及 MCP/IP 组合坐标的 neutral/active 端点；robot_config 保存
+MCP/IP 肌腱权重、Aero 输出比例、deadband 和最大步长。经真机轴向验证，掌内 pitch/yaw 分别驱动 CMC 外展/屈曲轴，
+MCP/IP 屈曲只驱动组合腱轴。
+`hand_sources.mhandpro` 独占厂商进程并发布统一 `HumanHandState`，`hand_retarget` 再通过
+目标插件生成 Aero 7 维或其他机械手的任意维度输出。`hand_retarget` 必须声明 `side`，可用
+`source_name` 绑定发布者；消费端同时校验 `human_hand_geometry_v1` schema，防止跨手或跨语义接线。
+厂商姿态偏置不能跨 SDK 进程复用。真实遥操
+启动后，手套输出保持锁定。`startup_p_pose: interactive` 由统一 launch 在启动硬件前提示一次，source
+节点随后在同一个 SDK 进程自动完成 P-pose 及质量检查；`startup_p_pose: manual`（默认）则通过：
+`ros2 run robot_teleop calibrate_glove --side right --runtime-service
+/hand_sources/mhandpro/calibrate_p_pose`。映射 JSON 与 raw capture 仍可长期复用；后续
+retarget 调参使用 `ros2 run robot_teleop analyze_glove_capture
+--input ~/.calibrate/aero_hand_right_sdk_capture.json --side right --update-calibration
+~/.calibrate/aero_hand_right_calibrate.json` 离线完成，不重复采集手势。
+
+真实 launch 会统一检查 `ros2_control`、active teleop devices、`auxiliary_actuators` 和
+`hand_sources` 的串口或 `exclusive_resources`，任何重复资源都会在节点启动前拒绝。一个
+mHandPro source 用 `sides: [right]`、`[left]` 或 `[left, right]` 选择单手或双手；双手默认
+`failure_policy: require_all`，任一侧断连都会锁住两侧输出。`allow_available` 允许仅连接或保留任一
+可用侧，不会为恢复缺失侧而中断健康侧。source 保持健康话题
+`/hand_sources/mhandpro/<side>/health`，并在线程中按有界指数退避自动重连，避免阻塞 ROS timer；需要
+P-pose 的配置在重连后重新进入门禁。真实 Aero auxiliary actuator 还必须能从当前控制模式的
+safety SSOT 解析全部关节限位；launch 将有序上下限传给硬件节点，由硬件边界再次限幅。缺少任一
+关节限位时拒绝启动。
+`aero_hand_teleop.yaml` 用一个 `hand_profiles` SSOT 同时声明 `right`、`left`、`dual`，统一 launch 的
+`hand_profile` 参数只选择 profile，不复制 SDK、频率、安全或重定向参数；双手 profile 仍只启动一个
+共享 source worker。厂商原始 `MHandProFrame` 默认关闭；只有诊断或原始录制配置显式设置
+`hand_sources.mhandpro.publish_raw_frame: true` 时才发布，并应同时把对应 `/frame` topic 加入录制清单。
+
+SO-101 集成配置 `so101_arm_aero_hand.yaml` 使用 `base_config: so101_single_arm` 加 hand-specific
+overlay；不得再复制整份 SO-101 YAML。loader 会先解析基线，再应用显式 overlay，`teleoperation.devices`
+等有序列表只有通过 `__append__` 才会追加。生产路径固定为
+`hand_sources.mhandpro -> HumanHandState -> hand_retarget -> auxiliary_actuators`；旧的
+`mhandpro_glove` 设备类型已移除，作为 active teleop device 会在 launch validation 阶段明确拒绝。
+完整的首次标定、日常启动步骤和真机安全注意事项见
+[`robot_teleop` 真机快速使用流程](../robot_teleop/README.md#真机快速使用流程)。
+
+无硬件测试应在测试配置中显式设置 Aero actuator 和 `hand_sources.mhandpro` 的 `mock: true`，并将 retarget device
+`calib_file` 指向 `$(find robot_teleop)/config/mhandpro_mock_right_calibration.json`。不要把测试
+fixture 用作真实设备标定。
+
 **启动命令：**
 ```bash
 # 遥操作模式（episodic 录制）
@@ -872,8 +950,8 @@ WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。�
 SO101 抓取使用同级独立配置 `config/robots/lekiwi_handeye_realsense_grasp.yaml`。用户应直接在
 这份 YAML 中填写从动臂串口、相机序列号和 leader 配置；`scripts/handeye_calibrator.py` 质量检查
 通过后会就地更新 `peripherals[name=wrist].transform`。多台物理机器人应分别复制独立 YAML，避免
-不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML，
-但不再支持第三层 overlay 合成。
+不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML；
+overlay 只在同一目录内解析 sibling `base_config`，不跨目录拼接资源路径语义不同的配置。
 
 ### 具身 AI 流水线（Embodied AI Pipeline）
 

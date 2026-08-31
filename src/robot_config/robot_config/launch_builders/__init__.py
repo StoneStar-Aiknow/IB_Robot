@@ -12,10 +12,12 @@ from robot_config.launch_builders.control import (
     generate_controller_spawners,
     generate_ros2_control_nodes,
     validate_joint_config,
+    validate_runtime_resources,
 )
 from robot_config.launch_builders.description import (
     generate_robot_description,
 )
+from robot_config.launch_builders.hand_sources import generate_hand_source_nodes
 from robot_config.launch_builders.hardware_mock import (
     generate_hardware_mock_nodes,
     mock_mode_skips_subsystem,
@@ -56,6 +58,8 @@ __all__ = [
     # Control
     "generate_ros2_control_nodes",
     "generate_controller_spawners",
+    "generate_hand_source_nodes",
+    "validate_runtime_resources",
     "validate_joint_config",
     # Perception
     "generate_camera_nodes",

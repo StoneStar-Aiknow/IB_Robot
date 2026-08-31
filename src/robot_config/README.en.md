@@ -85,6 +85,29 @@ robot:
           resize: [480, 640]
 ```
 
+## Robot Configuration Overlays
+
+When a robot configuration only extends an existing robot, declare `base_config` under `robot` instead
+of copying the complete YAML:
+
+```yaml
+robot:
+  name: so101_with_extension
+  base_config: so101_single_arm
+  teleoperation:
+    devices:
+      __append__:
+        - name: extension_device
+          type: custom
+```
+
+`base_config` may reference only a sibling robot YAML. Relative references resolve from the overlay file
+and gain a `.yaml` suffix when omitted; the sibling boundary keeps relative resource paths unambiguous.
+Mappings merge recursively, while scalars and lists replace by default. A list is appended only by a mapping
+whose sole key is `__append__`. The loader rejects cycles, mapping/list container type mismatches, and
+ambiguous append mappings. Normalized output keeps the outer file in `_config_path` and the complete base-to-overlay
+provenance chain in `_config_sources` for diagnostics and audits.
+
 ## Capability Gateway Public Contract
 
 Versioned packages under `skill_catalog/config/skills/` are the public Capability Gateway SSOT. Robot YAML selects an
@@ -253,6 +276,69 @@ WebPhone has no account authentication and is supported only on a trusted intern
 network. Origin and single-client checks do not establish operator identity. Do
 not use public forwarding, reverse/cloud tunnels, guest Wi-Fi, or untrusted VPNs;
 restrict HTTP/WSS access to the robot control subnet and stop the service when idle.
+
+For multiple inputs, `active_devices` may select devices whose final command topics are disjoint.
+Explicit `target.publish_groups` define ordered command groups; `target.actuator` reuses an auxiliary
+actuator's joint order and command topic without duplication. Launch rejects duplicate topic ownership.
+Non-`ros2_control` hardware belongs under `auxiliary_actuators`; its configured driver and channel count
+are target-independent. Aero Hand joints stay in `joints.hand`, outside `joints.all` and the unified
+`/joint_states` stream. External components may declare `active_control_modes`; simulation skips real
+`mock: false` devices while retaining explicit mocks. The Aero Hand configuration limits both devices
+to real `teleop` launches and does not silently fall back to mock mode there. Set the external SDK path
+and calibrate before launch:
+
+```bash
+export MHANDPRO_SDK_LIB=/absolute/path/libVDMocapSDK_mHandPro.so
+export AERO_HAND_RIGHT_PORT=/dev/serial/by-id/<aero-hand-id>
+ros2 run robot_teleop calibrate_glove --side right --lib-path "$MHANDPRO_SDK_LIB" \
+  --raw-output ~/.calibrate/aero_hand_right_sdk_capture.json
+```
+
+The default full calibration writes `feature_schema: aero_compact_v3` and uses 20 skeleton nodes plus
+five vendor virtual fingertips. User calibration stores neutral/active endpoints for four raw thumb
+features plus the MCP/IP projection, while robot_config owns the MCP/IP tendon weights, Aero output
+coverage, deadbands, and maximum steps. Hardware validation maps palm-local pitch/yaw to CMC
+abduction/flexion, while
+MCP/IP flexion drives only the combined tendon axis. Vendor pose offsets do not survive an
+SDK process restart. `hand_sources.mhandpro` owns acquisition and publishes reusable `HumanHandState`;
+the `hand_retarget` device converts that state to Aero or another target hand. Each retarget device
+declares its side and may bind `source_name`; consumers also require the `human_hand_geometry_v1`
+schema so cross-hand or cross-schema wiring fails closed. Real output therefore
+remains locked after teleop startup until P-pose alignment and automatic frame quality checks pass.
+With `startup_p_pose: interactive`, unified launch prompts once before hardware starts and the source
+then calibrates in the same SDK process. The default `startup_p_pose: manual` instead uses
+`ros2 run robot_teleop calibrate_glove --side right --runtime-service
+/hand_sources/mhandpro/calibrate_p_pose` in that same worker. After retaining
+the raw capture, use
+`ros2 run robot_teleop analyze_glove_capture --input
+~/.calibrate/aero_hand_right_sdk_capture.json --side right --update-calibration
+~/.calibrate/aero_hand_right_calibrate.json` for offline retarget iteration instead of asking the
+operator to repeat gestures.
+Real launch validates serial and `exclusive_resources` ownership across `ros2_control`, active teleop
+devices, `auxiliary_actuators`, and `hand_sources` before starting nodes. One mHandPro source selects
+one or both gloves with `sides: [right]`, `[left]`, or `[left, right]`; dual-hand control defaults to
+`failure_policy: require_all`, so either disconnect locks both outputs. `allow_available` accepts or
+retains any connected side without interrupting it to recover a missing peer. Per-side health is
+published on `/hand_sources/mhandpro/<side>/health`. Reconnect runs outside the ROS timer with bounded
+exponential backoff; configurations requiring P-pose return to that gate after reconnect.
+Each real Aero auxiliary actuator must also resolve every hardware joint from the active safety SSOT.
+Launch passes ordered limits to the hardware node for a second clamp and rejects incomplete limits.
+`aero_hand_teleop.yaml` declares `right`, `left`, and `dual` in one `hand_profiles` SSOT. Unified launch's
+`hand_profile` argument selects a profile without duplicating SDK, timing, safety, or retarget settings;
+the dual profile still launches one shared source worker. Raw vendor `MHandProFrame` publication is off
+by default; diagnostic or raw-recording profiles must explicitly set `publish_raw_frame: true` and add
+the corresponding `/frame` topic to their recording list.
+The SO-101 integration profile `so101_arm_aero_hand.yaml` uses `base_config: so101_single_arm` and
+contains only the hand-specific overlay. The loader resolves the base first; ordered lists such as
+`teleoperation.devices` are appended only through the explicit `__append__` form. The production path is
+`hand_sources.mhandpro -> HumanHandState -> hand_retarget -> auxiliary_actuators`; the legacy
+`mhandpro_glove` device type has been removed and is rejected when selected as an active teleop device.
+See the [`robot_teleop` real-hardware quick start](../robot_teleop/README.en.md#real-hardware-quick-start)
+for first-time calibration, normal startup, and safety precautions.
+
+Hardware-free tests must explicitly set both the Aero actuator and `hand_sources.mhandpro` to `mock: true` and use
+`$(find robot_teleop)/config/mhandpro_mock_right_calibration.json`. The fixture is not a real-device
+calibration.
 
 **Launch command:**
 ```bash

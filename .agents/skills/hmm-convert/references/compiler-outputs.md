@@ -77,7 +77,7 @@ The repository keeps one public dispatcher, `scripts/convert_hmm.sh <policy>`. P
 orchestration belongs beside its exporter under `model_utils/<policy>_export/`; do not add a new
 root-level `scripts/convert_<policy>_hmm.sh` for each policy.
 
-The SmolVLA workflow verifies the patched LeRobot v0.5.1 source, prefers `transformers==5.3.0` with `4.57.1` as a
+The SmolVLA workflow verifies the patched LeRobot v0.6.0 source, prefers `transformers==5.3.0` with `4.57.1` as a
 loading fallback, exports all modules, quantizes them, compiles TCIM HMM files, writes provenance,
 and packages a strict deployment under `models/smolvla_hmm_standard` by default.
 `MODEL_BUNDLE_ROOT` is required, has no default, and must identify an existing workspace-relative

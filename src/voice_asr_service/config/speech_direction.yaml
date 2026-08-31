@@ -6,6 +6,8 @@ speech_direction_node:
     arecord_device: "hw:0,0"
     sample_rate: 16000
     channel_indices: [1, 2, 3, 4]
+    # FullSubNet/VAD remain continuous; SRP-PHAT updates every two model hops.
+    srp_update_interval_hops: 2
 
     # 阵列安装偏角和四麦二维坐标；ROS 2 参数使用一维浮点数组。
     mount_yaw_deg: 0.0
@@ -41,7 +43,7 @@ speech_direction_node:
     # 旧静态OM回退路径，stateful门禁失败时不自动切换
     fullsubnet_om_path: "fullsubnet/fullsubnet_v6_310p_mixed16.om"
     # Ubuntu stateful Torch 使用同一个 218epochs cumulative checkpoint。
-    fullsubnet_repo_dir: "fullsubnet_repo"
+    # FullSubNet 源码(model.py + audio_zen)由 ibrobot-fullsubnet wheel 提供。
     fullsubnet_ckpt: "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
     fullsubnet_device: "cuda"
 

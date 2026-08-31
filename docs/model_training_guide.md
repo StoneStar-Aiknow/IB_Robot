@@ -4,7 +4,7 @@
 
 前提条件：
 
-- 训练框架：仓库内 `libs/lerobot` 子模块（基于 LeRobot v0.5.1 的定制版本），以 editable 方式安装，源码位于 `libs/lerobot/src`。子模块 HEAD 已内置自适应加权（`ada_weight`/`ada_weight_freq`/`damping_coefficient`）与知识蒸馏（`kd`/`teacher_train_config`/`decoder_out_dim`）支持，无需额外应用 patch。
+- 训练框架：仓库内 `libs/lerobot` 子模块（当前基于 LeRobot v0.6.0 的定制版本，参见 `third_party/patches/lerobot/INDEX.yaml` 的 `active_tag`），以 editable 方式安装，源码位于 `libs/lerobot/src`。**注意**：v0.6.0 是分阶段迁移，目前只移植了兼容/推理/导出补丁；自适应加权（`ada_weight`/`ada_weight_freq`/`damping_coefficient`）与知识蒸馏（`kd`/`teacher_train_config`/`decoder_out_dim`）等训练特性仍只在 archived 的 v0.5.1 补丁栈中（见 `third_party/patches/lerobot/v0.5.1/`），尚未针对 v0.6.0 重构后的训练循环重新移植。如需这些训练特性，请暂时沿用 v0.5.1 栈或等待后续补丁就绪。
 - 环境加载：训练前必须 `source .shrc_local`。该脚本激活 `venv/`、设置 `PYTHONNOUSERSITE=1` 屏蔽用户目录下可能存在的其他 lerobot 版本，并把 `libs/lerobot/src` 前置到 `PYTHONPATH`，确保 `lerobot-train` 与 `import lerobot` 都解析到子模块源码（详见 [.shrc_local](https://gitcode.com/openeuler/IB_Robot/blob/master/.shrc_local)）。
 - 训练入口：`lerobot-train`，由 `libs/lerobot/pyproject.toml` 的 `[project.scripts]` 注册，指向 [lerobot_train.py:main](https://gitcode.com/openeuler/IB_Robot/blob/master/libs/lerobot/src/lerobot/scripts/lerobot_train.py#L701)。
 - 帧检测工具：`dataset_tools` 包提供的 ROS 2 节点 `frame_detector`，用于在训练前为数据集帧打上训练权重。入口为 [frame_detector.py:main](https://gitcode.com/openeuler/IB_Robot/blob/master/src/dataset_tools/dataset_tools/frame_detector.py#L804)，注册于 [dataset_tools/setup.py](https://gitcode.com/openeuler/IB_Robot/blob/master/src/dataset_tools/setup.py#L33)。

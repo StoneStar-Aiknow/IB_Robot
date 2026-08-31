@@ -1,0 +1,133 @@
+From 530cb9494a60936b11e5cbe6697bea58941c80eb Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Sat, 8 Aug 2026 20:29:18 +0800
+Subject: [PATCH 12/12] train: integrate KD dispatch into lerobot_train.py
+
+Port the remaining lerobot_train.py piece of v0.5.1 patch 0011 onto
+v0.6.0, completing the knowledge-distillation migration (the earlier
+deferral was a porting-order artifact, not a fundamental blocker now
+that 0009/0010 settled the update_policy structure).
+
+  - import get_teacher_model from .knowledge_distillation
+  - update_policy: add teacher_policy param; when set, dispatch the
+    student forward through the policy teacher hooks (diffusion via
+    teacher_feature, others via teacher_policy) and backward through
+    output_dict['total_kd_loss']. Raise NotImplementedError if KD is
+    combined with sample weighting (RA-BC).
+  - train(): build the frozen teacher when cfg.policy.kd is set, add a
+    total_kd_loss AverageMeter, and pass teacher_policy to update_policy.
+
+KD can now run both via lerobot-train (with cfg.policy.kd) and via the
+standalone scripts/knowledge_distillation.py compression entry.
+---
+ src/lerobot/scripts/lerobot_train.py | 43 ++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index db0d22d6..76dff09e 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -70,6 +70,7 @@ from lerobot.utils.utils import (
+     inside_slurm,
+ )
+ 
++from .knowledge_distillation import get_teacher_model
+ from .lerobot_eval import eval_policy_all
+ 
+ 
+@@ -83,6 +84,7 @@ def update_policy(
+     lr_scheduler=None,
+     lock=None,
+     sample_weighter=None,
++    teacher_policy=None,
+ ) -> tuple[MetricsTracker, dict | None]:
+     """
+     Performs a single training step to update the policy's weights.
+@@ -100,6 +102,11 @@ def update_policy(
+         lr_scheduler: An optional learning rate scheduler.
+         lock: An optional lock for thread-safe optimizer updates.
+         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
++        teacher_policy: Optional frozen teacher policy for knowledge distillation.
++            When set, the student forward is dispatched through the policy's
++            teacher_policy / teacher_feature hooks and backward uses
++            output_dict["total_kd_loss"]. Combining KD with sample weighting
++            (RA-BC) is not supported.
+ 
+     Returns:
+         A tuple containing:
+@@ -118,9 +125,21 @@ def update_policy(
+     if sample_weighter is not None:
+         sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
+ 
++    policy_type = accelerator.unwrap_model(policy, keep_fp32_wrapper=True).config.type
++    if teacher_policy is not None and sample_weights is not None:
++        raise NotImplementedError("Combining knowledge distillation with sample weighting is not supported.")
++
+     # Let accelerator handle mixed precision
+     with accelerator.autocast():
+-        if sample_weights is not None:
++        if teacher_policy is not None:
++            # Knowledge distillation: dispatch through the policy's teacher hooks.
++            # Diffusion takes a teacher feature; ACT/PI05 take the teacher policy directly.
++            if policy_type == "diffusion":
++                teacher_feature = teacher_policy.forward(batch, get_feature=True)
++                loss, output_dict = policy.forward(batch, teacher_feature=teacher_feature)
++            else:
++                loss, output_dict = policy.forward(batch, teacher_policy=teacher_policy)
++        elif sample_weights is not None:
+             # Use per-sample loss for weighted training
+             # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
+             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+@@ -143,7 +162,13 @@ def update_policy(
+         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+ 
+     # Use accelerator's backward method
+-    accelerator.backward(loss)
++    if teacher_policy is not None:
++        total_kd_loss = output_dict["total_kd_loss"]
++        accelerator.backward(total_kd_loss)
++        train_metrics.total_kd_loss = total_kd_loss.item()
++        output_dict["total_kd_loss"] = total_kd_loss.item()
++    else:
++        accelerator.backward(loss)
+ 
+     # Clip gradients if specified
+     if grad_clip_norm > 0:
+@@ -274,6 +299,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+         logging.info("Creating env")
+         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+ 
++    # Knowledge distillation: build the frozen teacher when cfg.policy.kd is set.
++    teacher_policy = None
++    if getattr(cfg.policy, "kd", False):
++        if is_main_process:
++            logging.info("Creating KD teacher policy")
++        teacher_policy = get_teacher_model(cfg.policy.teacher_train_config, dataset, cfg.batch_size)
++        teacher_policy.to(device)
++        teacher_policy.eval()
++        for param in teacher_policy.parameters():
++            param.requires_grad_(False)
++
+     if cfg.is_reward_model_training:
+         if is_main_process:
+             logging.info("Creating reward model")
+@@ -560,6 +596,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+     if torch.cuda.is_available():
+         # max() because headroom is gated by the worst-case rank.
+         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
++    if getattr(cfg.policy, "kd", False):
++        train_metrics["total_kd_loss"] = AverageMeter("total_kd_loss", ":.3f", reduction="mean")
+ 
+     # Keep global batch size for logging; MetricsTracker handles world size internally.
+     effective_batch_size = cfg.batch_size * accelerator.num_processes
+@@ -603,6 +641,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+             accelerator=accelerator,
+             lr_scheduler=lr_scheduler,
+             sample_weighter=sample_weighter,
++            teacher_policy=teacher_policy,
+         )
+ 
+         if cfg.weight_clipping and quant_constraint is not None:
+-- 
+2.34.1
+

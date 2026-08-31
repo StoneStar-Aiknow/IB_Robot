@@ -374,10 +374,25 @@ Cloud 必须收到匹配 protocol/session generation、contract fingerprint 和 
 缺少 codec 时会 fail closed。NVIDIA backend 会实际打开一个 `h264_nvenc` session，使用 ultra-low-latency、
 zero-delay、无 B-frame 和重复 SPS/PPS 的 H.264 配置；RGB/BGR 到 NV12 的转换仍由 FFmpeg 完成，不是
 CUDA zero-copy。Ascend backend
-仅在选择或自动探测时查找私有 FFmpeg 4.4 `h264_ascend`，可用
-`IBROBOT_ASCEND_FFMPEG` 或 `IBROBOT_ASCEND_FFMPEG_PREFIX` 指定，不替换系统 FFmpeg，也不引入
-ACL/DVPP Python 依赖。启动日志和 `/diagnostics` 报告 configured/selected backend、endpoint、
-fingerprint、lifecycle 和 readiness。
+仅在选择或自动探测时查找私有 FFmpeg `h264_ascend`，可用
+`IBROBOT_ASCEND_FFMPEG` 或 `IBROBOT_ASCEND_FFMPEG_PREFIX` 指定；标准 RPM 安装的
+`/usr/bin/ffmpeg-ascend` 也会自动探测，不替换系统 FFmpeg，也不引入
+ACL/DVPP Python 依赖。启动日志（"Video stream startup" 行）报告 configured/selected
+backend、endpoint、fingerprint、lifecycle 和 readiness。
+
+RPM 安装的 ffmpeg-ascend（`/usr/bin/ffmpeg-ascend`、`/usr/local/bin/ffmpeg-ascend`
+及其 dispatch 的 `/usr/local/ffmpeg-ascend-*/bin/ffmpeg` payload）默认以隔离环境启动：
+子进程会剔除继承自其他 CANN toolkit 的安装路径变量
+（`ASCEND_TOOLKIT_HOME`、`ASCEND_HOME_PATH`、`ASCEND_AICPU_PATH`、`ASCEND_OPP_PATH`、
+`ASCEND_NNRT_HOME`、`ASCEND_NNAE_HOME`、`TOOLCHAIN_HOME`），但保留设备运行时变量
+（如 `ASCEND_RT_VISIBLE_DEVICES`、`ASCEND_DEVICE_ID`），以保留多 NPU 配置。私有构建默认不隔离，
+可用 `IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV=1` 强制开启、`=0` 关闭 RPM 默认隔离；
+不带隔离探测 RPM payload 已知会在首帧挂起。
+
+Ascend DVPP VENC 通道是 per-device 硬件资源，`DeviceVideoStreamManager` 按
+观察值 key 排序对 Ascend 流紧凑编号 1..N（≤128），`device_id` 当前固定为 0
+（单 NPU 场景）；多 NPU 需在 pipeline/资源层引入 device 分配契约，不在
+manager 硬编码。
 
 `auto` 按 `ascend`、`nvidia`、`software` 顺序探测。310B 优先使用 Ascend，本机 NVIDIA GPU 可用时
 自动选择 NVENC，其他 Linux 主机回退 software；显式 backend 失败时不会回退。
@@ -488,9 +503,9 @@ Registry 还要求每个 family/backend 声明 `ConformanceEvidence`；仅列出
 camera-major prefix。该优化不改变外部 VLM ABI：runtime bindings、逐相机 observation semantic、
 raw image shape 和 ROS camera topic 契约保持不变。
 
-NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。只有显式导出参数
-`--fast-gelu` 才以近似 `NPUFastGelu` 覆盖该路径；它可能降低动作精度，必须针对既有 baseline
-验证。
+NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。显式参数
+`--fast-gelu-scope vision|vlm-text|ae|all` 可将近似 `NPUFastGelu` 限制到指定模型区域；旧参数
+`--fast-gelu` 等价于全局 `all`。近似路径可能降低动作精度，必须针对既有 baseline 验证。
 
 新 Action Expert OM 的 runtime output 名为 `velocity` 或 `v_t`，Manifest 仍将其映射为策略
 semantic `action`。Ascend backend 从选中 deployment 的 `denoising_schedule` artifact 读取严格

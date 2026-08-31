@@ -144,7 +144,7 @@ CONTROLS:
 
     def _load_mapping(self, name: str) -> dict[str, Any]:
         try:
-            share_dir = get_package_share_directory("robot_config")
+            share_dir = get_package_share_directory("robot_teleop")
             mapping_file = os.path.join(share_dir, "config", f"{name}.yaml")
             if os.path.exists(mapping_file):
                 with open(mapping_file) as f:

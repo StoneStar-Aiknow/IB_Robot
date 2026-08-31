@@ -8,10 +8,11 @@ systems that have a normal glibc source workspace. It does not apply to OpenHarm
 Load `ibrobot-build` and build from the repository root. For a targeted launch change:
 
 ```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
+source .shrc_local && ./scripts/build.sh -- --packages-select robot_config
 ```
 
 Use `source .shrc_local && ./scripts/build.sh` when the change affects the complete workspace.
+Never invoke raw `colcon build`; the build script applies layout and CMake settings itself.
 Build and launch must be separate tool calls so a failed build stops the workflow.
 
 ## 2. Launch in One Shell

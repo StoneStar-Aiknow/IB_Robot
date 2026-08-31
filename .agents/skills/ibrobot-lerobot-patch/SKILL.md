@@ -52,8 +52,8 @@ printed `manifest.yaml` snippet, see `references/helper-script.md`.
 - `series.openharmony-5.1.0-musl.txt`: OpenHarmony board-specific runtime stack.
 
 Patch numbering is global inside one tag directory. If the highest file in
-`third_party/patches/lerobot/v0.5.1/` is `0014-*.patch`, the next new patch is
-`0015-*`, even if it only belongs to a non-default series file.
+`third_party/patches/lerobot/v0.6.0/` is `0005-*.patch`, the next new patch is
+`0006-*`, even if it only belongs to a non-default series file.
 
 ## Internal References
 

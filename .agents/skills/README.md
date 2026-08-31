@@ -9,10 +9,11 @@
 | [intro](./intro) | 引导 | 「介绍」「有哪些功能」「help」「入门」「intro」等，作为所有 skill 的导航入口。 |
 | [ibrobot-env](./ibrobot-env) | 环境 | 跑测试、运行脚本或 ROS 2 命令前加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError`；禁止手动拼装 ROS/PYTHONPATH 环境。 |
 | [ibrobot-worktree-env](./ibrobot-worktree-env) | 环境 | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支。 |
-| [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`colcon build`)、构建特定 package 或修复编译错误。 |
+| [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`./scripts/build.sh`)、构建特定 package 或修复编译错误。 |
 | [ibrobot-launch](./ibrobot-launch) | 操作 | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人系统、仿真、mock/契约测试、推理与遥操作。 |
 | [ibrobot-robot-skill-design](./ibrobot-robot-skill-design) | 操作 | 交互式设计机器人 skill，澄清 anchor/motion space/safety/catalog 暴露并生成验证计划。 |
 | [ibrobot-control](./ibrobot-control) | 操作 | Hermes/Agent 通过 `robot-skill` 操作现有高层技能或异步视觉游戏。 |
+| [ibrobot-inference-verify](./ibrobot-inference-verify) | 工作流 | 统一推理运行时端到端验证：本机 CPU/CUDA Torch policy + 感知 ROS mock、板端 Ascend OM + ROS typed service。 |
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
 | [oh-build-roboframe](./oh-build-roboframe) | 板端 | 使用 `build_roboframe_oh.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |

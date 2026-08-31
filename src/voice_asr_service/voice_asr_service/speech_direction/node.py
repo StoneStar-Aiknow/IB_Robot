@@ -57,6 +57,7 @@ _PARAMETER_TYPES = {
     "device_name_contains": Parameter.Type.STRING,
     "arecord_device": Parameter.Type.STRING,
     "sample_rate": Parameter.Type.INTEGER,
+    "srp_update_interval_hops": Parameter.Type.INTEGER,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
     "angle_step_degree": Parameter.Type.INTEGER,
     "input_source": Parameter.Type.STRING,
@@ -64,7 +65,6 @@ _PARAMETER_TYPES = {
     "wav_replay_rate": Parameter.Type.DOUBLE,
     "fullsubnet_device": Parameter.Type.STRING,
     "silero_vad_model_path": Parameter.Type.STRING,
-    "fullsubnet_repo_dir": Parameter.Type.STRING,
     "fullsubnet_ckpt": Parameter.Type.STRING,
     "fullsubnet_om_path": Parameter.Type.STRING,
     "fullsubnet_stateful_fb_om_path": Parameter.Type.STRING,
@@ -173,6 +173,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     sample_rate = _convert_int(values, "sample_rate")
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
+    srp_update_interval_hops = _require_positive_int(values, "srp_update_interval_hops")
 
     channel_indices = _convert_int_list(values, "channel_indices")
     # 当前 FullSubNet、缓冲区和 SRP 阵列均固定处理四路麦克风信号。
@@ -242,15 +243,10 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if fullsubnet_backend == "stateful_raw_acl" and not all((stateful_fb_path, stateful_sb_path, stateful_manifest)):
         raise ValueError("fullsubnet_backend=stateful_raw_acl 时FB/SB OM和manifest均不能为空")
     silero_path = _require_non_empty_string(values, "silero_vad_model_path")
-    # Torch stateful/legacy 后端需要 repo 与 checkpoint，raw ACL 不依赖上游源码。
-    repo_dir = _require_string(values, "fullsubnet_repo_dir", allow_empty=True)
+    # Torch stateful 后端需要 checkpoint + manifest，raw ACL 不依赖上游源码。
     ckpt_path = _require_string(values, "fullsubnet_ckpt", allow_empty=True)
-    if (
-        stateful_backend
-        and fullsubnet_backend.startswith("stateful_torch")
-        and not all((repo_dir, ckpt_path, stateful_manifest))
-    ):
-        raise ValueError("stateful Torch 后端要求 repo、cumulative checkpoint 和 manifest")
+    if stateful_backend and fullsubnet_backend.startswith("stateful_torch") and not all((ckpt_path, stateful_manifest)):
+        raise ValueError("stateful Torch 后端要求 cumulative checkpoint 和 manifest")
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
     if max_age_ms <= 0:
         raise ValueError("参数 speech_direction_max_age_ms 必须大于 0")
@@ -280,6 +276,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.audio.arecord_device = arecord_device
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
+    cfg.pipeline.srp_update_interval_hops = srp_update_interval_hops
     cfg.vad.sample_rate = sample_rate
     cfg.doa.sample_rate = sample_rate
     if any(value >= cfg.audio.channels for value in channel_indices):
@@ -289,7 +286,6 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.doa.input_channels = list(channel_indices)
     cfg.doa.mic_positions = mic_positions
     cfg.vad.model_path = silero_path
-    cfg.fullnet.repo_dir = repo_dir
     cfg.fullnet.ckpt = ckpt_path
     cfg.fullnet.device = fullsubnet_device
     cfg.fullnet.backend = fullsubnet_backend
@@ -365,7 +361,6 @@ class SpeechDirectionNode(Node):
 
         require_configured_models(
             cfg.vad.model_path,
-            cfg.fullnet.repo_dir,
             cfg.fullnet.ckpt,
             silero_backend=cfg.vad.backend,
             fullsubnet_backend=cfg.fullnet.backend,
@@ -442,7 +437,6 @@ class SpeechDirectionNode(Node):
         elif stateful_backend:
             fullnet = build_stateful_fullsubnet(
                 backend=cfg.fullnet.backend,
-                repo_dir=cfg.fullnet.repo_dir,
                 checkpoint_path=cfg.fullnet.ckpt,
                 manifest_path=cfg.fullnet.stateful_manifest_path,
                 device=cfg.fullnet.device,
@@ -451,7 +445,6 @@ class SpeechDirectionNode(Node):
         else:
             # legacy 仅保留显式对照，不允许 stateful 构造失败后自动进入此分支。
             fullnet = FullSubNetEnhancer(
-                repo_dir=cfg.fullnet.repo_dir,
                 ckpt=cfg.fullnet.ckpt,
                 device=cfg.fullnet.device,
             )
@@ -515,6 +508,7 @@ class SpeechDirectionNode(Node):
                 sample_rate=cfg.pipeline.sample_rate,
                 processing_samples=cfg.pipeline.processing_hop_samples,
                 model_batch_samples=cfg.pipeline.model_batch_samples,
+                srp_update_interval_hops=cfg.pipeline.srp_update_interval_hops,
                 input_channels=tuple(cfg.pipeline.input_channels),
                 srp_frame_samples=cfg.doa.frame_size,
                 srp_hop_samples=cfg.doa.hop_size,

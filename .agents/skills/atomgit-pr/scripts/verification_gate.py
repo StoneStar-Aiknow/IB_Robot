@@ -20,22 +20,27 @@ _VERIFIED_TREE_RE = re.compile(
     re.IGNORECASE,
 )
 _WIP_PREFIX_RE = re.compile(r"^(?:\s*\[WIP\]\s*)+", re.IGNORECASE)
+# Field lines accept an optional Markdown list prefix ("- " or "* ") so Agents
+# can write them inside bullet lists without triggering duplicate-block errors.
+# upsert_verification_metadata strips both forms before appending the canonical
+# block, so formatting never yields two copies of the same field.
+_FIELD_LINE_PREFIX = r"(?:-\s+)?"
 _VERIFICATION_MODE_RE = re.compile(
-    rf"\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*\s*`?(full|reused-environment)`?",
+    rf"{_FIELD_LINE_PREFIX}\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*\s*`?(full|reused-environment)`?",
     re.IGNORECASE,
 )
 _VERIFICATION_SHA_FIELDS = {
     VERIFIED_INPUTS_LABEL: re.compile(
-        rf"\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
+        rf"{_FIELD_LINE_PREFIX}\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
         re.IGNORECASE,
     ),
     TESTED_SOURCE_TREE_LABEL: re.compile(
-        rf"\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
+        rf"{_FIELD_LINE_PREFIX}\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
         re.IGNORECASE,
     ),
 }
 _VERIFICATION_ENVIRONMENT_RE = re.compile(
-    rf"\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*\s*`([^`\n]+)`",
+    rf"{_FIELD_LINE_PREFIX}\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*\s*`([^`\n]+)`",
     re.IGNORECASE,
 )
 _PACKAGE_DEPENDENCY_RE = re.compile(
@@ -160,9 +165,17 @@ def extract_verification_metadata(description: str) -> dict | None:
         legacy_tree = extract_verified_tree(description)
         return {"mode": "legacy", "tested_tree": legacy_tree} if legacy_tree else None
     if len(mode_matches) != 1 or len(input_matches) != 1 or len(tree_matches) != 1 or len(environment_matches) != 1:
+        counts = {
+            VERIFICATION_MODE_LABEL: len(mode_matches),
+            VERIFIED_INPUTS_LABEL: len(input_matches),
+            TESTED_SOURCE_TREE_LABEL: len(tree_matches),
+            VERIFICATION_ENVIRONMENT_LABEL: len(environment_matches),
+        }
+        bad_fields = ", ".join(f"{label}={count}" for label, count in counts.items() if count != 1)
         raise ValueError(
-            "Docker verification metadata requires exactly one mode, one '**Verified inputs:**' field, "
-            "one '**Tested source tree:**' field, and one '**Docker environment:**' field"
+            "Docker verification metadata requires exactly one of each field; "
+            f"found: {bad_fields}. Each field must appear exactly once as "
+            "'**<label>:** <value>' (a leading '- ' list prefix is also accepted)."
         )
     return {
         "mode": mode_matches[0].lower(),
@@ -197,11 +210,11 @@ def upsert_verification_metadata(
     environment: str,
 ) -> str:
     line_patterns = [
-        rf"^\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*.*(?:\n|$)",
-        rf"^\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*.*(?:\n|$)",
-        rf"^\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*.*(?:\n|$)",
-        rf"^\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*.*(?:\n|$)",
-        rf"^\*\*{re.escape(VERIFIED_TREE_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^(?:-\s+)?\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^(?:-\s+)?\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^(?:-\s+)?\*\*{re.escape(TESTED_SOURCE_TREE_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^(?:-\s+)?\*\*{re.escape(VERIFICATION_ENVIRONMENT_LABEL)}:\*\*.*(?:\n|$)",
+        rf"^(?:-\s+)?\*\*{re.escape(VERIFIED_TREE_LABEL)}:\*\*.*(?:\n|$)",
     ]
     cleaned = description
     for pattern in line_patterns:
@@ -232,7 +245,10 @@ def validate_verification_metadata(
         raise ValueError("legacy Docker evidence must be migrated to full verification metadata")
     if metadata["verified_inputs"] != expected_inputs.lower():
         raise ValueError(
-            f"Docker verification inputs {metadata['verified_inputs']} do not match current inputs {expected_inputs}"
+            f"Docker verification inputs {metadata['verified_inputs']} do not match current inputs "
+            f"{expected_inputs.lower()}. The expected value is a fingerprint computed from the PR "
+            "file list and patches, not the commit or tree SHA. Rerun the update so the gate reports "
+            "the expected fingerprint, or reuse the fingerprint recorded by the last gate run."
         )
     if not metadata.get("environment"):
         raise ValueError("Docker verification environment is missing")
@@ -243,7 +259,9 @@ def validate_verification_metadata(
     if metadata["mode"] == VERIFICATION_MODE_FULL:
         if expected_tree and metadata["tested_tree"] != expected_tree.lower():
             raise ValueError(
-                f"full Docker verification tested tree {metadata['tested_tree']} does not match current tree {expected_tree}"
+                f"full Docker verification tested tree {metadata['tested_tree']} does not match current tree "
+                f"{expected_tree.lower()}. The tested tree must equal the PR head tree; re-run both "
+                "platform verifications against that tree."
             )
     elif metadata["mode"] == VERIFICATION_MODE_REUSED:
         if not allow_reuse:
@@ -276,9 +294,18 @@ def prepare_update_verification(
 
     if current and current["mode"] == VERIFICATION_MODE_FULL:
         if current.get("verified_inputs") != expected_inputs.lower():
-            raise ValueError("full Docker verification inputs do not match the current PR inputs")
+            raise ValueError(
+                f"full Docker verification inputs {current.get('verified_inputs')} do not match the "
+                f"current PR inputs {expected_inputs.lower()}. The expected inputs fingerprint is "
+                "computed from the PR file list and patches; take it from the previous gate error or "
+                "ask the maintainer workflow to print it, then rerun both platform verifications."
+            )
         if current.get("tested_tree") != current_tree.lower():
-            raise ValueError("full Docker verification tested tree does not match the current PR tree")
+            raise ValueError(
+                f"full Docker verification tested tree {current.get('tested_tree')} does not match the "
+                f"current PR tree {current_tree.lower()}. Re-run both platform verifications against "
+                "the PR head tree."
+            )
         if not current.get("environment"):
             raise ValueError("full Docker verification environment is missing")
         validate_verification_metadata(description, expected_inputs, current_tree)
@@ -336,7 +363,12 @@ def prepare_update_verification(
             previous["environment"],
         ), metadata
 
-    raise ValueError("a full Docker verification is required; no reusable evidence matches the current inputs")
+    raise ValueError(
+        "a full Docker verification is required; no reusable evidence matches the current inputs. "
+        "Run both platform verifications (Ubuntu + openEuler) against the PR head tree, then set "
+        f"**{VERIFIED_INPUTS_LABEL}:** to {expected_inputs.lower()} — the fingerprint of the PR file "
+        "list and patches, NOT the commit or tree SHA — and **Tested source tree:** to the head tree."
+    )
 
 
 def _run_git(args: list[str], cwd: str) -> str:

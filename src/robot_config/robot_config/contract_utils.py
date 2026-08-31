@@ -145,6 +145,63 @@ class SpecView:
     transport: ObservationTransportSpec | None
 
 
+# Driver pixel_format names that are not ROS Image encodings but have a
+# well-defined encoding on the wire. usb_cam 0.8.1 publishes RGB8 for its
+# ``mjpeg2rgb`` conversion, so mirroring that driver means rgb8, not bgr8.
+# This mapping is the SSOT for every consumer that must publish or decode
+# what the real driver would have published.
+_DRIVER_PIXEL_FORMAT_ENCODINGS: dict[str, str] = {
+    "mjpeg2rgb": "rgb8",
+}
+
+# ROS Image encodings recognized by this codebase. Anything else fails
+# closed: silently republishing an unrecognized encoding as bgr8 hides
+# contract drift between the config and the consuming nodes.
+_KNOWN_IMAGE_ENCODINGS: frozenset[str] = frozenset(
+    {
+        "mono8",
+        "mono16",
+        "bgr8",
+        "rgb8",
+        "bgr16",
+        "rgb16",
+        "bgra8",
+        "rgba8",
+        "bgra16",
+        "rgba16",
+        "yuv422",
+        "32fc1",
+    }
+)
+
+
+def resolve_image_encoding(encoding: str) -> str:
+    """Resolve a contract image encoding to the ROS Image encoding on the wire.
+
+    Driver pixel-format names (``mjpeg2rgb``) map to the encoding the real
+    driver publishes. Unknown values raise ``ValueError`` so misconfigured
+    contracts fail at launch instead of silently publishing a different
+    pixel layout than every consumer expects.
+
+    Args:
+        encoding: Raw encoding or driver pixel format from the contract.
+
+    Returns:
+        The lowercase ROS Image encoding.
+
+    Raises:
+        ValueError: If the encoding is neither a known ROS Image encoding
+            nor a mapped driver pixel format.
+    """
+    normalized = str(encoding).strip().lower()
+    if not normalized:
+        raise ValueError("image encoding must not be empty")
+    resolved = _DRIVER_PIXEL_FORMAT_ENCODINGS.get(normalized, normalized)
+    if resolved not in _KNOWN_IMAGE_ENCODINGS:
+        raise ValueError(f"unknown image encoding {encoding!r}")
+    return resolved
+
+
 def _num_channels_from_encoding(encoding: str) -> int:
     """Infer channel count from ROS image encoding."""
     enc = encoding.lower()

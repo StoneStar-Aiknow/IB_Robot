@@ -183,6 +183,13 @@ def _tts_hook_wrapper(
             "#!/usr/bin/env bash",
             "set -eo pipefail",
             _MANAGED_FILE_HEADER,
+            'hermes_env="${HERMES_ENV_FILE:-/root/claw/hermes/data/.env}"',
+            'if [ -f "$hermes_env" ]; then',
+            '  set -a; . "$hermes_env"; set +a',
+            "fi",
+            'if [ -z "${XUNXING_API_KEY:-}" ] && [ -n "${HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY:-}" ]; then',
+            '  export XUNXING_API_KEY="$HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY"',
+            "fi",
             f"cd {shlex.quote(str(workspace))}",
             f"source {shlex.quote(str(shrc))} >/dev/null",
             f"export ROS_DOMAIN_ID={shlex.quote(ros_domain_id)}",
@@ -192,6 +199,23 @@ def _tts_hook_wrapper(
             f"export IBROBOT_TTS_SYNTHESIS_TIMEOUT_SEC={synthesis_timeout_sec:g}",
             f"export IBROBOT_TTS_PLAYBACK_TIMEOUT_SEC={playback_timeout_sec:g}",
             "exec python3 -m robot_skill_cli.hermes_tts_hook",
+            "",
+        )
+    )
+
+
+def _lifecycle_hook_wrapper(*, workspace: Path, shrc: Path) -> str:
+    # Hermes is launched from the fully initialized workspace environment.  The
+    # lifecycle hook has a two-second deadline, so sourcing ROS/CANN again here
+    # can consume the entire budget before the asynchronous handoff runs.
+    del shrc
+    return "\n".join(
+        (
+            "#!/usr/bin/env bash",
+            "set -eo pipefail",
+            _MANAGED_FILE_HEADER,
+            f"cd {shlex.quote(str(workspace))}",
+            "exec python3 -m robot_skill_cli.hermes_lifecycle_speech",
             "",
         )
     )
@@ -348,6 +372,7 @@ def _update_config(
     environment_file: Path,
     hook_path: Path,
     speech_enabled: bool,
+    lifecycle_hook_path: Path | None = None,
 ) -> dict[str, Any]:
     plugins = config.setdefault("plugins", {})
     if not isinstance(plugins, dict):
@@ -390,6 +415,21 @@ def _update_config(
         hooks["post_llm_call"] = post
     else:
         hooks.pop("post_llm_call", None)
+    if lifecycle_hook_path is not None:
+        for event in ("pre_llm_call", "pre_tool_call", "post_tool_call"):
+            entries = hooks.get(event, [])
+            if not isinstance(entries, list):
+                raise ConfigureError(f"Hermes hooks.{event} must be a list")
+            entries = [entry for entry in entries if not _is_managed_hook(entry, lifecycle_hook_path)]
+            if speech_enabled:
+                entry: dict[str, Any] = {"command": str(lifecycle_hook_path), "timeout": 2}
+                if event in {"pre_tool_call", "post_tool_call"}:
+                    entry["matcher"] = "^terminal$"
+                entries.append(entry)
+            if entries:
+                hooks[event] = entries
+            else:
+                hooks.pop(event, None)
     return config
 
 
@@ -422,11 +462,14 @@ def _hook_registered(hermes: str, hook_path: Path) -> bool:
     return str(hook_path) in (listed.stdout or "")
 
 
-def _approve_hooks(hermes: str, hook_path: Path) -> None:
-    revoked = _run([hermes, "hooks", "revoke", str(hook_path)])
-    if revoked.returncode != 0 and _hook_registered(hermes, hook_path):
-        detail = (revoked.stderr or revoked.stdout).strip()
-        raise ConfigureError(f"Hermes hook approval refresh failed: {detail}")
+def _approve_hooks(hermes: str, hook_paths: Sequence[Path] | Path) -> None:
+    if isinstance(hook_paths, Path):
+        hook_paths = [hook_paths]
+    for hook_path in hook_paths:
+        revoked = _run([hermes, "hooks", "revoke", str(hook_path)])
+        if revoked.returncode != 0 and _hook_registered(hermes, hook_path):
+            detail = (revoked.stderr or revoked.stdout).strip()
+            raise ConfigureError(f"Hermes hook approval refresh failed: {detail}")
     result = subprocess.run(
         [hermes, "--accept-hooks", "hooks", "doctor"],
         capture_output=True,
@@ -464,6 +507,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         shrc = _workspace_shrc(install_prefix)
         profile_config_path = profile / "config.yaml"
         hook_path = profile / "hooks" / "ibrobot-speak"
+        lifecycle_hook_path = profile / "hooks" / "ibrobot-lifecycle-speech"
         environment_file = profile / "ibrobot" / "ibrobot-env.sh"
         profile_bin = profile / "ibrobot" / "bin"
         robot_skill_path = profile_bin / "robot-skill"
@@ -477,6 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             playback_timeout_sec=robot.voice_tts.playback_timeout_sec,
             synthesis_timeout_sec=robot.voice_tts.synthesis_timeout_sec,
         )
+        desired_lifecycle_hook = _lifecycle_hook_wrapper(workspace=workspace, shrc=shrc)
         desired_environment = _shell_environment(
             workspace=workspace,
             shrc=shrc,
@@ -496,6 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             workspace=workspace,
             environment_file=environment_file,
             hook_path=hook_path,
+            lifecycle_hook_path=lifecycle_hook_path,
             speech_enabled=not args.disable_speech,
         )
         soul_changed, soul_backup = _sync_soul(profile, resource, args.soul_mode, dry_run=args.dry_run)
@@ -510,11 +556,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.disable_speech
             else (not hook_path.is_file() or hook_path.read_text(encoding="utf-8") != desired_hook)
         )
+        lifecycle_changed = (
+            lifecycle_hook_path.is_file()
+            if args.disable_speech
+            else (
+                not lifecycle_hook_path.is_file()
+                or lifecycle_hook_path.read_text(encoding="utf-8") != desired_lifecycle_hook
+            )
+        )
         writes_needed = (
             not skill_target.is_file()
             or skill_target.read_bytes()
             != (install_prefix / "share/robot_skill_cli/skills/ibrobot-control/SKILL.md").read_bytes()
             or hook_changed
+            or lifecycle_changed
             or plugin_removal_needed
             or not environment_file.is_file()
             or environment_file.read_text(encoding="utf-8") != desired_environment
@@ -539,8 +594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _atomic_write(robot_skill_path, desired_robot_skill, executable=True)
         if args.disable_speech:
             hook_path.unlink(missing_ok=True)
+            lifecycle_hook_path.unlink(missing_ok=True)
         else:
             _atomic_write(hook_path, desired_hook, executable=True)
+            _atomic_write(lifecycle_hook_path, desired_lifecycle_hook, executable=True)
         if _yaml_config(profile_config_path) != desired_config:
             config_backup = _backup(profile_config_path)
             _write_yaml(profile_config_path, desired_config)
@@ -548,7 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config_backup = None
 
         if args.accept_hooks and not args.disable_speech:
-            _approve_hooks(hermes, hook_path)
+            _approve_hooks(hermes, [hook_path, lifecycle_hook_path])
         if args.restart_gateway:
             result = _run([hermes, "gateway", "restart"], timeout=60.0)
             if result.returncode != 0:

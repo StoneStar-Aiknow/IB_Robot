@@ -1036,7 +1036,7 @@ robot:
     # parameters remain owned by voice_asr_service/config/*.yaml.
     parameters:
       input_source: device
-      mount_yaw_deg: 0.0
+      mount_yaw_deg: 90.0
 
   embodied:
     enabled: false

@@ -70,6 +70,14 @@ def resolve_ros_path(path):
     return path
 
 
+def resolve_mhandpro_sdk_path(path: object) -> str:
+    """Resolve an explicitly configured external mHandPro SDK path."""
+    resolved = str(resolve_ros_path(str(path or "")) or "").strip()
+    if resolved:
+        return str(Path(resolved).expanduser())
+    return str(Path(os.environ["MHANDPRO_SDK_LIB"]).expanduser()) if os.environ.get("MHANDPRO_SDK_LIB") else ""
+
+
 def prepare_writable_file_path(path):
     """Resolve a file path and ensure its parent directory exists.
 

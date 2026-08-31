@@ -13,6 +13,7 @@
   <depend>ibrobot_msgs</depend>
   <depend>robot_config</depend>
   <depend>embodied_common</depend>
+  <exec_depend>embodied_agent</exec_depend>
   <depend>ament_index_python</depend>
   <depend>skill_catalog</depend>
   <exec_depend>python3-yaml</exec_depend>

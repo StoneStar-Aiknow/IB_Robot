@@ -6,6 +6,8 @@
 - 提取 PR 上下文后，看到 `.pr.mandatory_review_checks` 含 `lerobot_gitlink_changed` 时
 - 判断 PR 是否触发双平台 Docker Verification 门禁时
 - PR 或 commit 表明存在 AI 辅助贡献时
+- PR 变更超过 2000 行（`.pr.reuse_self_check.required` 为 true）或
+  `.pr.mandatory_review_checks` 含 `large_pr_reuse_self_check_*` 时
 
 ## 1. `libs/lerobot` gitlink 强制检查（阻塞性）
 
@@ -109,3 +111,59 @@
   - 如怀疑某行有 lint / 类型 / 风格问题，**直接在 inline 评论中指出并附修复建议**，由开发者在下一次提交时让 pre-commit 自动修复，不要在本地复跑
   - 静态阅读 diff 与本仓库源码（`Read` / `Grep` / `Glob`）始终允许且推荐——这是判断架构/逻辑/命名问题的正常手段
 - **例外**：用户在当前请求中明确要求"你帮我跑一下 ruff / typecheck / build 看看"时才执行相应命令；"review 这个 PR""帮我看看这个 PR"本身**不构成**授权。
+
+## 6. 大型 PR 复用自查门禁（阻塞性）
+
+### 触发条件与脚本信号
+
+- **阈值**：PR 变更行数（additions + deletions，由 `pr_review.py` 按 PR 文件统计求和，统计缺失时按 patch 的 +/- 行计数兜底）**超过 2000 行**即触发。
+- `[WIP]` **不豁免**本门禁：与双平台 Docker 门禁不同，复用自查是纯文档要求，且复用/重复造轮子问题在 WIP 阶段暴露价值最大——作者还没在错误方向上投入太多。
+- `pr_review.py --extract-info` 会自动生成 `.pr.mandatory_review_checks`：
+  - `large_pr_reuse_self_check_missing`：描述中没有 `## Reuse Self-Check` 章节。
+  - `large_pr_reuse_self_check_incomplete`：章节存在，但四个字段有缺失或空值。
+  - `large_pr_reuse_self_check_invalid`：章节格式歧义（多个同名标题或重复字段）。
+  - 三者均为 severity=error 的阻塞性检查，`.pr.reuse_self_check` 额外给出
+    `changed_lines` / `required` / `status`。
+
+### 必需的块格式
+
+描述中必须且只能包含一个如下结构（字段标签固定英文，正文默认中文，"无"也要显式写明）：
+
+```markdown
+## Reuse Self-Check
+
+**Reinvented workflows:** <是否重新发明了现有流程；无重叠写"无"，有则列出>
+**Reused components:** <是否沿用仓库与 libs/lerobot 已有内容；列出复用点及位置>
+**Reinvention justification:** <重新发明的必要性论证；未重新发明时写"无（未重新发明现有流程）">
+**Architecture conformance:** <对齐的同类功能架构及一致性说明，或偏离原因>
+```
+
+### Reviewer 审计协议（块完整时仍必须执行）
+
+脚本只能校验"块存在且字段非空"，**无法判断声明是否属实**。看到大型 PR 时，即使
+`status == complete`，也必须对照 diff 审计四项声明：
+
+1. **验证"没有重新发明"的声明**：
+   - 新增的 setup / 数据集 / 评测 benchmark / 推理 / 部署管线，先查 `libs/lerobot`
+     （datasets、policies、benchmarks 等模块）是否已原生支持（参考
+     [PR #309](https://atomgit.com/openeuler/IB_Robot/pull/309)：为 lerobot 已支持的
+     benchmark 另建一整套 setup 流程）。
+   - 再查仓库既有能力：`inference_service` 推理框架、`robot_config` SSOT、`tensormsg`
+     契约、`dataset_tools`、`model_utils`、既有 `scripts/`。绕过既有框架另起平行实现
+     是典型违例（参考 [PR #317](https://atomgit.com/openeuler/IB_Robot/pull/317)）。
+   - 声明"无重叠"但 diff 中存在功能重复实现的，提交 severity=error 的阻塞性 issue，
+     定位到重复实现的具体文件，fix 建议给出复用路径（如改用 lerobot 对应模块、接入
+     inference_service；改动确实属于 `libs/lerobot` 的走 `ibrobot-lerobot-patch` 导出 patch）。
+2. **验证复用清单**：`Reused components` 列出的模块/接口在 diff 中确实被调用，而不是
+   装饰性罗列。
+3. **评估必要性论证**：`Reinvention justification` 需给出既有内容不满足的具体原因
+   （接口缺失、性能、许可证、平台限制等）及"是否评估过扩展既有实现"。空泛理由
+   （"现有代码不好改""顺手重写更快"）不构成正当理由，应作为 error 提出；论证充分且
+   合理的重新发明可以放行，但架构不一致处降级为 warning/suggestion 指出。
+4. **验证架构一致性声明**：对照 `atomgit-pr-architecture-review` 的支柱（SSOT、契约、
+   包职责、数据流）检查 `Architecture conformance` 声称对齐的同类模块是否真实对齐。
+
+### 与其他门禁的关系
+
+- 本门禁只依赖变更行数，与 §3 的文件触发型 Docker 门禁相互独立；一个 PR 可以同时触发两者。
+- 声明不属实属于**阻塞性问题**；块缺失/不完整时不要代替作者编造声明，应要求作者补充。

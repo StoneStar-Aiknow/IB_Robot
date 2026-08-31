@@ -22,6 +22,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from comment_formatter import CommentFormatter
 from llm_reviewer import LLMCodeReviewer
+from reuse_gate import (
+    REUSE_FIELD_LABELS,
+    REUSE_SELF_CHECK_THRESHOLD,
+    count_changed_lines,
+    extract_reuse_self_check,
+    missing_reuse_fields,
+    reuse_gate_required,
+    reuse_self_check_status,
+)
 from verification_gate import (
     VERIFICATION_MODE_REUSED,
     compute_verification_inputs,
@@ -192,6 +201,59 @@ class CodeReviewer:
         return checks
 
     @staticmethod
+    def _build_reuse_self_check_checks(pr: dict, files: list[dict]) -> list[dict]:
+        """Require a complete Reuse Self-Check section on PRs above the line threshold."""
+        if not reuse_gate_required(files):
+            return []
+
+        body = pr.get("body") or ""
+        try:
+            fields = extract_reuse_self_check(body)
+        except ValueError as exc:
+            return [
+                {
+                    "id": "large_pr_reuse_self_check_invalid",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": str(exc),
+                }
+            ]
+        if fields is None:
+            return [
+                {
+                    "id": "large_pr_reuse_self_check_missing",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": (
+                        f"This PR changes more than {REUSE_SELF_CHECK_THRESHOLD} lines and must document a "
+                        "'## Reuse Self-Check' section stating whether existing workflows were reinvented, "
+                        "what was reused from this repository and libs/lerobot, whether any reinvention is "
+                        "justified, and how the change follows the architecture of similar features."
+                    ),
+                }
+            ]
+        missing = missing_reuse_fields(fields)
+        if missing:
+            return [
+                {
+                    "id": "large_pr_reuse_self_check_incomplete",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": (
+                        "The Reuse Self-Check section is incomplete; every field ("
+                        + ", ".join(f"'**{label}:**'" for label in REUSE_FIELD_LABELS)
+                        + ") must carry a concrete answer. Missing: "
+                        + ", ".join(missing)
+                        + "."
+                    ),
+                }
+            ]
+        return []
+
+    @staticmethod
     def _build_verification_tree_checks(pr: dict, files: list[dict], head_tree: str | None) -> list[dict]:
         """Validate Docker verification evidence against the current PR inputs and tree."""
         if is_wip_title(pr.get("title") or ""):
@@ -276,6 +338,7 @@ class CodeReviewer:
                 head_tree = resolve_pr_head_tree(pr)
         mandatory_review_checks.extend(self._build_verification_tree_checks(pr, files, head_tree))
         mandatory_review_checks.extend(self._build_ai_metadata_checks(pr, commits))
+        mandatory_review_checks.extend(self._build_reuse_self_check_checks(pr, files))
 
         changed_files = []
         for f in files:
@@ -312,6 +375,11 @@ class CodeReviewer:
                 "head_tree": head_tree,
                 "wip": is_wip_title(pr.get("title") or ""),
                 "mandatory_review_checks": mandatory_review_checks,
+                "reuse_self_check": {
+                    "changed_lines": count_changed_lines(files),
+                    "required": reuse_gate_required(files),
+                    "status": reuse_self_check_status(pr.get("body") or ""),
+                },
                 "stats": {
                     "files_changed": len(changed_files),
                     "commits": len(commits),

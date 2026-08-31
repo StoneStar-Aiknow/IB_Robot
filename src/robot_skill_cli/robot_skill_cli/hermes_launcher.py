@@ -28,9 +28,15 @@ _VERSION_PATTERN = re.compile(r"Hermes Agent v(\d+)\.(\d+)\.(\d+)")
 _PREFLIGHT_TIMEOUT_FLOOR_SEC = 15.0
 _PREFLIGHT_ATTEMPTS = 2
 _PREFLIGHT_RETRY_DELAY_SEC = 0.25
+_HERMES_LOCAL_COMMAND_TIMEOUT_SEC = 60
 _HERMES_SKILL_NAME = "ibrobot-control"
 _MANAGED_SKILL_MARKER = ".ibrobot-managed"
 _MANAGED_SKILL_MARKER_CONTENT = "robot_skill_cli:ibrobot-control\n"
+
+
+def _trace_stage(message: str) -> None:
+    if os.environ.get("IBROBOT_HERMES_LAUNCH_TRACE") == "1":
+        print(f"hermes-robot: stage: {message}", file=sys.stderr, flush=True)
 
 
 class LauncherError(RuntimeError):
@@ -82,7 +88,7 @@ def _check_hermes_version(hermes_path: str) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_HERMES_LOCAL_COMMAND_TIMEOUT_SEC,
             env=_hermes_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -124,7 +130,7 @@ def _hermes_skills_directory(hermes_path: str) -> Path:
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_HERMES_LOCAL_COMMAND_TIMEOUT_SEC,
             env=_hermes_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -175,7 +181,7 @@ def _check_hermes_skill_discovery(hermes_path: str) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_HERMES_LOCAL_COMMAND_TIMEOUT_SEC,
             env=_hermes_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -265,7 +271,11 @@ def _check_robot_runtime(config_name: str | None, config_path: str | None, mode:
     for attempt in range(_PREFLIGHT_ATTEMPTS):
         bridge = _create_bridge(transport)
         if not bridge.start():
-            raise LauncherError("ROS_UNAVAILABLE", "failed to initialize the robot Gateway bridge")
+            detail = str(getattr(bridge, "start_error", "")).strip()
+            message = "failed to initialize the robot Gateway bridge"
+            if detail:
+                message = f"{message}: {detail}"
+            raise LauncherError("ROS_UNAVAILABLE", message)
         try:
             public_interfaces = getattr(bridge, "wait_for_public_request_interfaces", None)
             if public_interfaces is not None and not public_interfaces(timeout_sec=timeout_sec):
@@ -302,22 +312,29 @@ def _check_robot_runtime(config_name: str | None, config_path: str | None, mode:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        _trace_stage("resolving executables")
         hermes_path = _require_binary("hermes")
         robot_skill_path = _require_binary("robot-skill")
+        _trace_stage("checking Hermes version")
         _check_hermes_version(hermes_path)
+        _trace_stage("validating ROS wire contracts")
         try:
             validate_public_request_wire_contracts()
         except LauncherError:
             raise
         except Exception as exc:
             raise LauncherError("WIRE_CONTRACT_INVALID", str(exc)) from exc
+        _trace_stage("checking robot runtime")
         if args.mode == "auto":
             config_path = _check_robot_runtime(args.config_name, args.config_path)
         else:
             config_path = _check_robot_runtime(args.config_name, args.config_path, args.mode)
+        _trace_stage("resolving Hermes profile")
         workspace = _prepare_hermes_workspace()
         skills_directory = _hermes_skills_directory(hermes_path)
+        _trace_stage("registering IB-Robot skill")
         register_hermes_skill(_installed_skill_path(), skills_directory)
+        _trace_stage("checking Hermes skill discovery")
         _check_hermes_skill_discovery(hermes_path)
         hermes_arguments = _build_hermes_arguments(hermes_path, args.hermes_args)
     except (FileNotFoundError, ValueError) as exc:
@@ -337,6 +354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment["ROBOT_CONFIG"] = str(config_path)
     wrapper_dir = _prepare_robot_skill_wrapper(workspace, robot_skill_path, python_path, config_path, environment)
     environment["PATH"] = f"{wrapper_dir}{os.pathsep}{environment.get('PATH', '')}"
+    _trace_stage("starting Hermes Gateway")
     os.chdir(workspace)
     os.execvpe(hermes_path, hermes_arguments, environment)
     return 0

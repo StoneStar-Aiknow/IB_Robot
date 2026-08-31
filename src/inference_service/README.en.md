@@ -305,9 +305,26 @@ be selected as a decoder. The software backend uses PyAV 15 and probes its FFmpe
 decoder. The NVIDIA backend opens a real `h264_nvenc` session and uses ultra-low-latency, zero-delay, no-B-frame
 H.264 with repeated SPS/PPS. RGB/BGR-to-NV12 conversion still occurs through FFmpeg and is not CUDA zero-copy.
 The optional Ascend backend lazily discovers a
-private FFmpeg 4.4 `h264_ascend` installation through `IBROBOT_ASCEND_FFMPEG` or
-`IBROBOT_ASCEND_FFMPEG_PREFIX`; it neither replaces system FFmpeg nor adds ACL/DVPP Python dependencies. Startup
-logs and `/diagnostics` report configured and selected backends, endpoints, fingerprints, lifecycle, and readiness.
+private FFmpeg `h264_ascend` installation through `IBROBOT_ASCEND_FFMPEG` or
+`IBROBOT_ASCEND_FFMPEG_PREFIX`; the standard RPM entry point `/usr/bin/ffmpeg-ascend` is also detected. It neither
+replaces system FFmpeg nor adds ACL/DVPP Python dependencies. Startup
+logs (the "Video stream startup" lines) report configured and selected backends, endpoints, fingerprints,
+lifecycle, and readiness.
+
+RPM-installed ffmpeg-ascend runtimes (`/usr/bin/ffmpeg-ascend`, `/usr/local/bin/ffmpeg-ascend`, and the
+versioned `/usr/local/ffmpeg-ascend-*/bin/ffmpeg` payload they dispatch to) start with an isolated
+environment by default: the child process drops installation-path variables inherited from an unrelated
+CANN toolkit (`ASCEND_TOOLKIT_HOME`, `ASCEND_HOME_PATH`, `ASCEND_AICPU_PATH`, `ASCEND_OPP_PATH`,
+`ASCEND_NNRT_HOME`, `ASCEND_NNAE_HOME`, `TOOLCHAIN_HOME`) while preserving device runtime variables
+(such as `ASCEND_RT_VISIBLE_DEVICES` and `ASCEND_DEVICE_ID`) so multi-NPU pinning keeps working.
+Private builds are not isolated by default; `IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV=1` forces isolation for
+any binary and `=0` opts out of the RPM default. Probing the RPM payload without isolation is known to
+hang on the first frame.
+
+Ascend DVPP VENC channels are a per-device hardware resource; `DeviceVideoStreamManager`
+assigns dense 1..N IDs (≤128) to Ascend streams by sorted observation key. `device_id`
+is currently fixed at 0 (single-NPU scope); multi-NPU support needs a resource allocation
+contract at the pipeline/resource layer, not a code change in the manager.
 
 `auto` probes `ascend`, then `nvidia`, then `software`. Ascend boards retain DVPP priority, NVIDIA hosts select
 NVENC when a real session opens, and other Linux hosts fall back to software. Explicit backend failure never falls
@@ -408,9 +425,10 @@ The optimized PI0.5 VLM combines all camera images into one temporary vision bat
 camera-major prefix before the handoff. This optimization does not change the external VLM ABI: runtime bindings,
 per-camera observation semantics, raw image shapes, and ROS camera-topic contracts remain unchanged.
 
-NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP by default. Only the explicit
-`--fast-gelu` export option replaces it with approximate `NPUFastGelu`; this may reduce action accuracy and must be
-validated against an existing baseline.
+NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP by default. The explicit
+`--fast-gelu-scope vision|vlm-text|ae|all` option limits approximate `NPUFastGelu` to one model region; the legacy
+`--fast-gelu` option means global `all`. The approximate path may reduce action accuracy and must be validated
+against an existing baseline.
 
 A new Action Expert OM has a runtime output named `velocity` or `v_t`, while the Manifest still maps that tensor
 to the policy `action` semantic. The Ascend backend reads strictly decreasing timesteps from the selected

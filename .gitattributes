@@ -1,3 +1,4 @@
 src/lekiwi_description/meshes/*.stl filter=lfs diff=lfs merge=lfs -text
 third_party/wheels/**/*.whl binary
+third_party/vendor/**/*.so binary
 third_party/patches/fast_calib/**/*.patch whitespace=-blank-at-eol

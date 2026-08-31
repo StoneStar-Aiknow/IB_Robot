@@ -1,0 +1,51 @@
+diff --git a/audio_zen/acoustics/feature.py b/audio_zen/acoustics/feature.py
+index e1464a0..2458cde 100644
+--- a/audio_zen/acoustics/feature.py
++++ b/audio_zen/acoustics/feature.py
+@@ -1,6 +1,9 @@
+ import os
+ 
+-import librosa
++try:
++    import librosa
++except ImportError:
++    librosa = None  # only needed by load_wav; drop_band does not use it
+ import numpy as np
+ import torch
+ import torch.nn as nn
+diff --git a/setup.py b/setup.py
+new file mode 100644
+index 0000000..b1fe709
+--- /dev/null
++++ b/setup.py
+@@ -0,0 +1,30 @@
++import os
++
++from setuptools import setup, find_packages
++
++setup(
++    name="ibrobot-fullsubnet",
++    version="0.0.1+ibrobot.1",
++    description="FullSubNet speech enhancement model (audio_zen + model.py) for IB-Robot",
++    license="MIT",
++    python_requires=">=3.10",
++    packages=["audio_zen"] + [
++        f"audio_zen.{sub}"
++        for sub in (
++            "acoustics",
++            "dataset",
++            "inferencer",
++            "model",
++            "model.module",
++            "trainer",
++        )
++    ] + ["fullsubnet"],
++    package_dir={
++        "fullsubnet": "recipes/dns_interspeech_2020/fullsubnet",
++    },
++    install_requires=[
++        "torch>=2.1",
++        "numpy>=1.21",
++    ],
++    include_package_data=True,
++)

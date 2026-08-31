@@ -1,0 +1,47 @@
+name: pi05-q40-v1
+format: pi05-quant-profile-v1
+status: checkpoint-validated
+target_soc: Ascend310P3
+export_device: npu
+export_dtype: fp16
+donor_device: cpu
+fast_gelu_scope: none
+
+vlm:
+  enabled: true
+  expected_selected_nodes: 136
+  expected_quantized_nodes: 136
+  expected_npu_geglu_nodes: 17
+  quantize_convs: false
+  fused_geglu_donor: false
+  disable_regex:
+    - patch_embed
+    - multi_modal_projector
+    - rotary_emb
+    - 'self_attn/MatMul(_[0-9]+)?$'
+    - 'mlp/(gate_proj|up_proj)/MatMul'
+  selectors:
+    - name: gemma_q_proj
+      regex: '^/layers\.(?:[0-9]|1[0-6])/self_attn/q_proj/MatMul$'
+      expected: 17
+    - name: gemma_k_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/k_proj/MatMul$'
+      expected: 18
+    - name: gemma_v_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/v_proj/MatMul$'
+      expected: 18
+    - name: gemma_o_proj
+      regex: '^/layers\.(?:[0-9]|1[0-6])/self_attn/o_proj/MatMul$'
+      expected: 17
+    - name: gemma_down_proj
+      regex: '^/layers\.(?:0|[2-6]|8|1[0-2]|14|16)/mlp/down_proj/MatMul$'
+      expected: 12
+    - name: vision_q_proj
+      regex: '^/vision_tower/vision_model/encoder/layers\.(?:[0-9]|1[0-9]|2[0-6])/self_attn/q_proj/MatMul$'
+      expected: 27
+    - name: vision_v_proj
+      regex: '^/vision_tower/vision_model/encoder/layers\.(?:[0-9]|1[0-9]|2[0-6])/self_attn/v_proj/MatMul$'
+      expected: 27
+
+action_expert:
+  enabled: false

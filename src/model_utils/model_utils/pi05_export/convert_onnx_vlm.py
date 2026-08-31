@@ -197,6 +197,8 @@ def export_onnx(
     constant_folding: bool = True,
     use_npu_ops: bool = False,
     fast_gelu: bool = False,
+    fast_gelu_scope: str | None = None,
+    fused_geglu_donor: bool = False,
 ) -> None:
     onnx_output_path.parent.mkdir(parents=True, exist_ok=True)
     dummy_keys = list(observation.keys())
@@ -209,7 +211,12 @@ def export_onnx(
     wrapper.policy.eval()
     # 注意: dynamo=True 时 opset_version 参数会被忽略, 实际固定使用 opset 18
     # Apply Ascend ATC compatibility patches during ONNX export
-    with ascend_onnx_export_patches(use_npu_ops=use_npu_ops, fast_gelu=fast_gelu):
+    with ascend_onnx_export_patches(
+        use_npu_ops=use_npu_ops,
+        fast_gelu=fast_gelu,
+        fast_gelu_scope=fast_gelu_scope,
+        fused_geglu_donor=fused_geglu_donor,
+    ):
         torch.onnx.export(
             wrapper,
             tuple(observation_values),
@@ -456,6 +463,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
         "This is faster but not numerically identical to PyTorch tanh GELU.",
     )
+    p.add_argument(
+        "--fast-gelu-scope",
+        choices=["none", "all", "vision", "text"],
+        default=None,
+        help="Limit NPUFastGelu to SigLIP vision or Gemma text MLPs. Default: none; --fast-gelu means all.",
+    )
+    p.add_argument(
+        "--fused-geglu-donor",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--skip-runtime-save",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     p.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return p
@@ -463,6 +486,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    if args.fast_gelu and args.fast_gelu_scope not in (None, "all"):
+        raise ValueError("--fast-gelu is an alias for --fast-gelu-scope all")
+    fast_gelu_scope = args.fast_gelu_scope or ("all" if args.fast_gelu else "none")
+    patch_scope = "gemma" if fast_gelu_scope == "text" else fast_gelu_scope
     setup_logging(args.log_level)
 
     policy_path = args.pretrained_policy_path
@@ -474,6 +501,8 @@ def main() -> int:
     # NPU-affine fused ops (RoPE, etc.) are used automatically when exporting
     # on an NPU device; cpu/cuda exports keep the ORT-runnable fallbacks.
     use_npu_ops = device.type == "npu"
+    if args.fused_geglu_donor and (use_npu_ops or fast_gelu_scope != "none"):
+        raise ValueError("--fused-geglu-donor requires a non-NPU device and --no-fast-gelu")
 
     suffix = _build_onnx_config_suffix(actual_opset, args.dynamo, export_dtype, device.type)
     if args.output is not None:
@@ -556,17 +585,20 @@ def main() -> int:
         dynamo=bool(args.dynamo),
         constant_folding=bool(args.constant_folding),
         use_npu_ops=use_npu_ops,
-        fast_gelu=bool(args.fast_gelu),
+        fast_gelu_scope=patch_scope,
+        fused_geglu_donor=bool(args.fused_geglu_donor),
     )
     LOGGER.info("ONNX export finished")
 
-    # Always save runtime tensors — action-expert export depends on them.
-    save_runtime_tensors(
-        wrapper=wrapper,
-        observation=observation,
-        runtime_save_dir=runtime_save_dir,
-        seed=int(args.seed),
-    )
+    if not args.skip_runtime_save:
+        save_runtime_tensors(
+            wrapper=wrapper,
+            observation=observation,
+            runtime_save_dir=runtime_save_dir,
+            seed=int(args.seed),
+        )
+    else:
+        LOGGER.info("Skipped runtime tensor generation for donor-only export")
 
     return 0
 

@@ -249,3 +249,82 @@ def test_resolve_pr_head_tree_rejects_non_https_repo():
 
     with pytest.raises(ValueError, match="HTTPS repository URL"):
         resolve_pr_head_tree(pr)
+
+
+def test_extract_accepts_list_prefix_fields():
+    """Regression: Agents naturally write Markdown bullet lists; the gate must
+    accept '- **label:**' and upsert must strip it before appending canonical
+    lines, otherwise the description ends up with duplicate blocks."""
+    from verification_gate import extract_verification_metadata
+
+    inputs = _inputs_sha()
+    tree = "b" * 40
+    description = (
+        "## Docker Verification\n\n"
+        f"- **Docker verification mode:** `full`\n"
+        f"- **Verified inputs:** `{inputs}`\n"
+        f"- **Tested source tree:** `{tree}`\n"
+        f"- **Docker environment:** `ubuntu|openeuler`"
+    )
+
+    metadata = extract_verification_metadata(description)
+    assert metadata == {
+        "mode": "full",
+        "verified_inputs": inputs,
+        "tested_tree": tree,
+        "environment": "ubuntu|openeuler",
+    }
+
+    # Upsert must recognise the list-format lines as the same block (not new
+    # fields), so no duplicates remain afterwards.
+    updated = upsert_verification_metadata(description, "full", inputs, tree, "ubuntu|openeuler")
+    import re
+
+    for label in (
+        verification_gate.VERIFICATION_MODE_LABEL,
+        verification_gate.VERIFIED_INPUTS_LABEL,
+        verification_gate.TESTED_SOURCE_TREE_LABEL,
+        verification_gate.VERIFICATION_ENVIRONMENT_LABEL,
+    ):
+        pattern = r"\*\*" + re.escape(label) + r":\*\*"
+        total = len(re.findall(pattern, updated))
+        list_form = len(re.findall(r"- " + pattern, updated))
+        assert total == 1, f"{label} appears {total} times after upsert"
+        assert list_form == 0, f"{label} still uses list format after upsert"
+
+
+def test_mismatch_errors_report_expected_values():
+    """Regression: mismatch errors used to hide the expected fingerprint/tree,
+    forcing the Agent to monkey-patch internal helpers to discover them."""
+    from verification_gate import validate_verification_metadata
+
+    inputs = _inputs_sha()
+    good_tree = "b" * 40
+    bad_tree = "c" * 40
+    block = format_verification_metadata("full", inputs, bad_tree, _ENV)
+
+    with pytest.raises(ValueError, match=good_tree):
+        validate_verification_metadata(block, inputs, good_tree)
+
+    other_inputs = compute_verification_inputs(
+        [{"filename": "scripts/setup.sh", "patch": "@@ -1 +1 @@\n-different\n+patch"}]
+    )
+    wrong_inputs_block = format_verification_metadata("full", other_inputs, good_tree, _ENV)
+    with pytest.raises(ValueError, match=other_inputs):
+        validate_verification_metadata(wrong_inputs_block, inputs, good_tree)
+
+
+def test_duplicate_field_error_lists_actual_counts():
+    from verification_gate import extract_verification_metadata
+
+    inputs = _inputs_sha()
+    duplicated = (
+        format_verification_metadata("full", inputs, "b" * 40, _ENV) + "\n\n**Docker verification mode:** `full`\n"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        extract_verification_metadata(duplicated)
+    message = str(excinfo.value)
+    # Only the offending fields are listed, with their actual counts.
+    assert "Docker verification mode=2" in message
+    assert "Verified inputs" not in message

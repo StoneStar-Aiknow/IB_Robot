@@ -86,8 +86,34 @@ install_lerobot_editable() {
     check_lerobot_ros_numpy_compat
 
     # [smolvla,pi] extras pull in policy-specific deps; kinematics pulls in
-    # placo for SO-101 Placo Cartesian teleop. See libs/lerobot/pyproject.toml.
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics]"
+    # placo for SO-101 Placo Cartesian teleop; diffusion pulls in diffusers
+    # for Diffusion Policy training/inference; dataset pulls in datasets +
+    # torchcodec (video decoding) for training/dataset loading; deepdiff-dep
+    # supplies the deepdiff package lerobot's motors_bus needs (v0.6.0+). We
+    # deliberately use deepdiff-dep rather than the feetech extra because
+    # so101_hardware already provides the Python feetech-servo-sdk via its
+    # setup.py install_requires, and the C++ ftservo_sdk is built by
+    # so101_hardware's CMake for the ros2_control node — neither should be
+    # re-installed via pip here. See libs/lerobot/pyproject.toml.
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep]"
+}
+
+install_graspgen_torch_abi() {
+    # The checked-in pointnet2_ops wheel is built against this exact Torch ABI.
+    # Keep CUDA hosts on their existing Torch installation so the source-build
+    # path remains available, but make the no-nvcc path self-contained.
+    if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
+        return 0
+    fi
+    if command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
+        return 0
+    fi
+
+    log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
+    run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
+        "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
+        --index-url "https://download.pytorch.org/whl/cu126" \
+        --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
 }
 
 setup_python_venv() {
@@ -174,6 +200,8 @@ setup_python_venv() {
     if [[ -d "${lerobot_dir}" ]]; then
         ensure_lerobot_patch_stack_applied
     fi
+
+    install_graspgen_torch_abi
 
     # Install LeRobot in editable mode
     # Note: Do not pass the -c numpy==1.26.4 constraint. The lerobot dependency graph
@@ -319,18 +347,29 @@ EOF
     fi
     run_cmd "${pip_install[@]}" --no-deps "${gdino_wheel}" --quiet
 
+    # FullSubNet speech enhancement model (audio_zen + model.py) as an audited
+    # wheel. Pure-Python; the Torch backend loads Model from the installed
+    # package instead of cloning the upstream source tree into models/.
+    local fullsubnet_wheel_root="${WORKSPACE}/third_party/wheels/fullsubnet/e97448375"
+    local fullsubnet_wheel="${fullsubnet_wheel_root}/ibrobot_fullsubnet-0.0.1+ibrobot.1-py3-none-any.whl"
+    if [[ -f "${fullsubnet_wheel_root}/SHA256SUMS" ]]; then
+        if ! (cd "${fullsubnet_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "FullSubNet wheel checksum verification failed."
+            exit 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${fullsubnet_wheel}" --quiet
+    else
+        log_warn "FullSubNet wheel not found at ${fullsubnet_wheel_root}; skipping (speech_direction Torch backend unavailable)."
+    fi
+
     # GraspGen runtime dependencies are part of the default install contract:
     # manipulation_service is part of the default workspace build. Skip on
     # openEuler Embedded because GraspGen's pointnet2_ops CUDA extension is
     # validated on Ubuntu only; the Ascend OM path does not cover Torch grasp.
-    # Also skip on Ubuntu hosts without a CUDA toolkit (nvcc) so the default
-    # setup does not hard-fail on CPU-only machines — GraspGen's CUDA
-    # extension cannot be compiled without nvcc (same pattern as SAM2_BUILD_CUDA=0).
+    # On Ubuntu hosts without nvcc, install_graspgen_pip falls back to the
+    # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
     if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
-    elif ! command -v nvcc >/dev/null 2>&1 && [[ ! -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
-        log_warn "No CUDA toolkit (nvcc) found; skipping GraspGen pointnet2_ops (grasp CUDA backend unavailable)."
-        log_warn "Install a CUDA toolkit and re-run ./scripts/setup.sh to enable the default grasp install."
     else
         log_info "Installing grasp dependencies (GraspGen)..."
         # shellcheck disable=SC1091
@@ -365,8 +404,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]] \
-       && { command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; }; then
+    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 

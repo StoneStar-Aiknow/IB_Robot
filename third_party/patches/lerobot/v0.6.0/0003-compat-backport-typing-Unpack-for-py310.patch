@@ -1,0 +1,173 @@
+From 0156d22233d4eea965cd73f7f2d988f1a9b3e7bd Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Thu, 16 Apr 2026 11:36:35 +0800
+Subject: [PATCH 03/12] compat: backport typing Unpack for py310
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ pyproject.toml                                     | 1 +
+ src/lerobot/policies/factory.py                    | 3 ++-
+ src/lerobot/policies/pi0/modeling_pi0.py           | 3 ++-
+ src/lerobot/policies/pi05/modeling_pi05.py         | 3 ++-
+ src/lerobot/policies/pi0_fast/modeling_pi0_fast.py | 3 ++-
+ src/lerobot/policies/pretrained.py                 | 3 ++-
+ src/lerobot/policies/smolvla/modeling_smolvla.py   | 3 ++-
+ src/lerobot/utils/typing_compat.py                 | 8 ++++++++
+ 8 files changed, 21 insertions(+), 6 deletions(-)
+ create mode 100644 src/lerobot/utils/typing_compat.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 1ce5beeb..897be2f5 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -64,6 +64,7 @@ dependencies = [
+     "torch>=2.7,<2.12.0",
+     "torchvision>=0.22.0,<0.27.0",
+     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
++    "typing-extensions>=4.9.0,<5.0.0; python_version < '3.11'",
+     "opencv-python-headless>=4.9.0,<4.14.0",
+     "Pillow>=10.0.0,<13.0.0",
+     "einops>=0.8.0,<0.9.0",
+diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
+index 73fd9455..253c2685 100644
+--- a/src/lerobot/policies/factory.py
++++ b/src/lerobot/policies/factory.py
+@@ -18,7 +18,7 @@ from __future__ import annotations
+ 
+ import importlib
+ import logging
+-from typing import TYPE_CHECKING, Any, TypedDict, Unpack
++from typing import TYPE_CHECKING, Any, TypedDict
+ 
+ import torch
+ 
+@@ -43,6 +43,7 @@ from lerobot.utils.constants import (
+     POLICY_PREPROCESSOR_DEFAULT_NAME,
+ )
+ from lerobot.utils.feature_utils import dataset_to_policy_features
++from lerobot.utils.typing_compat import Unpack
+ 
+ from .act.configuration_act import ACTConfig
+ from .diffusion.configuration_diffusion import DiffusionConfig
+diff --git a/src/lerobot/policies/pi0/modeling_pi0.py b/src/lerobot/policies/pi0/modeling_pi0.py
+index f6f4212f..c0f56b90 100644
+--- a/src/lerobot/policies/pi0/modeling_pi0.py
++++ b/src/lerobot/policies/pi0/modeling_pi0.py
+@@ -19,7 +19,7 @@ import logging
+ import math
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -57,6 +57,7 @@ from lerobot.utils.constants import (
+     OBS_STATE,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ from ..pretrained import PreTrainedPolicy, T
+ from ..rtc.modeling_rtc import RTCProcessor
+diff --git a/src/lerobot/policies/pi05/modeling_pi05.py b/src/lerobot/policies/pi05/modeling_pi05.py
+index aabd04c6..03bfc7cc 100644
+--- a/src/lerobot/policies/pi05/modeling_pi05.py
++++ b/src/lerobot/policies/pi05/modeling_pi05.py
+@@ -19,7 +19,7 @@ import logging
+ import math
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -54,6 +54,7 @@ from lerobot.utils.constants import (
+     OBS_LANGUAGE_TOKENS,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ from ..pretrained import PreTrainedPolicy, T
+ from ..rtc.modeling_rtc import RTCProcessor
+diff --git a/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py b/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
+index d9342eb2..c0eb661b 100644
+--- a/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
++++ b/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
+@@ -18,7 +18,7 @@ import builtins
+ import logging
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import numpy as np
+ import torch
+@@ -57,6 +57,7 @@ from lerobot.utils.constants import (
+     OBS_LANGUAGE_TOKENS,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ from ..pretrained import PreTrainedPolicy, T
+ from ..rtc.modeling_rtc import RTCProcessor
+diff --git a/src/lerobot/policies/pretrained.py b/src/lerobot/policies/pretrained.py
+index 702569b8..e9f1e6ed 100644
+--- a/src/lerobot/policies/pretrained.py
++++ b/src/lerobot/policies/pretrained.py
+@@ -21,7 +21,7 @@ import os
+ from importlib.resources import files
+ from pathlib import Path
+ from tempfile import TemporaryDirectory
+-from typing import TYPE_CHECKING, TypedDict, TypeVar, Unpack
++from typing import TYPE_CHECKING, TypedDict, TypeVar
+ 
+ import packaging
+ import safetensors
+@@ -35,6 +35,7 @@ from lerobot.__version__ import __version__
+ from lerobot.configs import PreTrainedConfig
+ from lerobot.configs.train import TrainPipelineConfig
+ from lerobot.utils.hub import HubMixin
++from lerobot.utils.typing_compat import Unpack
+ 
+ from .utils import log_model_loading_keys
+ 
+diff --git a/src/lerobot/policies/smolvla/modeling_smolvla.py b/src/lerobot/policies/smolvla/modeling_smolvla.py
+index 8fd60c1f..b1f88c68 100644
+--- a/src/lerobot/policies/smolvla/modeling_smolvla.py
++++ b/src/lerobot/policies/smolvla/modeling_smolvla.py
+@@ -54,7 +54,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+ 
+ import math
+ from collections import deque
+-from typing import TypedDict, Unpack
++from typing import TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -63,6 +63,7 @@ from torch import Tensor, nn
+ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+ from lerobot.utils.device_utils import get_safe_dtype
+ from lerobot.utils.import_utils import require_package
++from lerobot.utils.typing_compat import Unpack
+ 
+ from ..pretrained import PreTrainedPolicy
+ from ..rtc.modeling_rtc import RTCProcessor
+diff --git a/src/lerobot/utils/typing_compat.py b/src/lerobot/utils/typing_compat.py
+new file mode 100644
+index 00000000..e02ffcb0
+--- /dev/null
++++ b/src/lerobot/utils/typing_compat.py
+@@ -0,0 +1,8 @@
++from __future__ import annotations
++
++try:
++    from typing import Unpack
++except ImportError:
++    from typing_extensions import Unpack
++
++__all__ = ["Unpack"]
+-- 
+2.34.1
+

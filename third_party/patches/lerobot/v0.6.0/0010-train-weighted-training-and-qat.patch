@@ -1,0 +1,315 @@
+From fdc4a11a1b750e21374f6492da912e6a9a5e9777 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Sat, 8 Aug 2026 18:11:15 +0800
+Subject: [PATCH 10/12] train: port weighted-training + QAT onto v0.6.0
+
+Port the non-redundant parts of v0.5.1 patch 0010:
+
+  - qat.py: QuantConstraint (Hisilicon quantization-aware weight clipping),
+    ported as a new module. Wired into lerobot_train.py: instantiated when
+    cfg.weight_clipping is set, clip_weights() called each step after the
+    optimizer update. Config knobs weight_clipping / clipping_min /
+    clipping_max added to TrainPipelineConfig.
+  - custom_weights: instead of v0.5.1's set_train_sample_weights + WeightSampler
+    (superseded by v0.6.0's SampleWeighter framework), add a 'custom' weighter
+    type to sample_weighting.py. CustomWeighter loads the dataset's
+    training_weight column (written by frame_detector) and looks up per-sample
+    weights via batch['index'] (v0.6.0's native frame-index channel). Enable
+    with sample_weighting.type='custom'.
+
+The v0.5.1 ada_weight/damping_coefficient knobs and WeightSampler class are
+dropped: v0.6.0 ships a native SampleWeighter/SampleWeightingConfig system.
+---
+ src/lerobot/configs/train.py          |   4 +
+ src/lerobot/scripts/lerobot_train.py  |  16 +++
+ src/lerobot/utils/qat.py              | 149 ++++++++++++++++++++++++++
+ src/lerobot/utils/sample_weighting.py |  50 ++++++++-
+ 4 files changed, 218 insertions(+), 1 deletion(-)
+ create mode 100644 src/lerobot/utils/qat.py
+
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index e3d35469..c0c005fa 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -93,6 +93,10 @@ class TrainPipelineConfig(HubMixin):
+     # `seed` is used for training (eg: model initialization, dataset shuffling)
+     # AND for the evaluation environments.
+     seed: int | None = 1000
++    # Weight clipping toggle for quantization-sensitive (Hisilicon QAT) training.
++    weight_clipping: bool = False
++    clipping_min: float = 5.96e-08
++    clipping_max: float = 1.31e05
+     # Set to True to use deterministic cuDNN algorithms for reproducibility.
+     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
+     cudnn_deterministic: bool = False
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 6e845852..61b6d93a 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -59,6 +59,7 @@ from lerobot.rewards import make_reward_pre_post_processors
+ from lerobot.utils.collate import lerobot_collate_fn
+ from lerobot.utils.import_utils import register_third_party_plugins
+ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
++from lerobot.utils.qat import QuantConstraint
+ from lerobot.utils.random_utils import set_seed
+ from lerobot.utils.utils import (
+     cycle,
+@@ -380,6 +381,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+             dataset_repo_id=cfg.dataset.repo_id,
+         )
+ 
++    # Quantization-aware weight clipping (Hisilicon QAT). Only active when
++    # cfg.weight_clipping is True; otherwise the constraint is not built.
++    quant_constraint = None
++    if cfg.weight_clipping:
++        quant_constraint = QuantConstraint(
++            policy=policy,
++            accelerator=accelerator,
++            quant_param_min=cfg.clipping_min,
++            quant_param_max=cfg.clipping_max,
++            hisi_log_path="./haisi.log",
++        )
++
+     step = 0  # number of policy updates (forward + backward + optim)
+ 
+     if cfg.resume:
+@@ -583,6 +596,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+             sample_weighter=sample_weighter,
+         )
+ 
++        if cfg.weight_clipping and quant_constraint is not None:
++            quant_constraint.clip_weights()
++
+         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+         # increment `step` here.
+         step += 1
+diff --git a/src/lerobot/utils/qat.py b/src/lerobot/utils/qat.py
+new file mode 100644
+index 00000000..d639a771
+--- /dev/null
++++ b/src/lerobot/utils/qat.py
+@@ -0,0 +1,149 @@
++import argparse
++import logging
++import re
++import sys
++from collections import defaultdict
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++
++def parse_hisi_om_log(log_file_path):
++    op_pattern = re.compile(r"Op\[(/[\w/\.]+/Conv)\]")
++    weight_scale_pattern = re.compile(r"Weight\[\d+\] Scale\[([\d\.e+-]+)\]")
++
++    layer_weight_scale = {}
++    current_layer = None
++
++    with open(log_file_path, encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            op_match = op_pattern.search(line)
++            if op_match:
++                current_layer = op_match.group(1)
++            if current_layer and "Weight" in line and "Scale" in line:
++                scale_match = weight_scale_pattern.search(line)
++                if scale_match:
++                    scale_value = float(scale_match.group(1))
++                    layer_weight_scale[current_layer] = scale_value
++                    current_layer = None
++
++    layer_weight_scale = dict(layer_weight_scale)
++    print(f"Parsed {len(layer_weight_scale)} layer scales from log")
++    return layer_weight_scale
++
++
++class QuantConstraint:
++    def __init__(
++        self, policy, accelerator, quant_param_min=5.96e-08, quant_param_max=1.31e05, hisi_log_path=None
++    ):
++        self.policy = policy
++        self.accelerator = accelerator
++        self.quant_param_min = quant_param_min
++        self.quant_param_max = quant_param_max
++        self.violation_log = defaultdict(list)
++        self._target_modules = None
++        self.layer_weight_scale = {}
++
++        if hisi_log_path:
++            try:
++                self.layer_weight_scale = parse_hisi_om_log(hisi_log_path)
++            except Exception as e:
++                logging.warning(f"Failed to parse hisi log, falling back to dynamic scale: {e}")
++
++    def _get_all_weighted_modules(self):
++        raw_model = self.accelerator.unwrap_model(self.policy, keep_fp32_wrapper=True)
++        model = raw_model.model
++        target_modules = {}
++        for name, module in model.named_modules():
++            if hasattr(module, "weight") and module.weight is not None:
++                target_modules[name] = module
++        return target_modules
++
++    def _calculate_layer_scale_dynamically(self, module_weights):
++        quant_range = 2047 - (-2048)
++        weights_min = torch.min(module_weights).item()
++        weights_max = torch.max(module_weights).item()
++        return (weights_max - weights_min) / (quant_range + 1e-15)
++
++    def clip_weights(self):
++        if self._target_modules is None:
++            self._target_modules = self._get_all_weighted_modules()
++            if not self._target_modules:
++                logging.warning("No weighted modules matched for quant clipping")
++                return
++
++        with torch.no_grad(), self.accelerator.autocast():
++            for name, module in self._target_modules.items():
++                weights = module.weight.data
++                device = weights.device
++                if not torch.is_floating_point(weights):
++                    weights = weights.float()
++
++                if name in self.layer_weight_scale:
++                    weight_scale = self.layer_weight_scale[name]
++                else:
++                    weight_scale = self._calculate_layer_scale_dynamically(weights)
++                    self.layer_weight_scale[name] = weight_scale
++
++                actual_min = self.quant_param_min * weight_scale
++                actual_max = self.quant_param_max * weight_scale
++
++                abs_weights = torch.abs(weights)
++                below_min_mask = (abs_weights < actual_min) & (abs_weights > 1e-15)
++                if torch.any(below_min_mask):
++                    weights[below_min_mask] = torch.sign(weights[below_min_mask]) * actual_min
++
++                above_max_mask = abs_weights > actual_max
++                if torch.any(above_max_mask):
++                    weights[above_max_mask] = torch.sign(weights[above_max_mask]) * actual_max
++
++                module.weight.data = weights.to(device)
++
++
++def check_quant_range_violations(model, quant_min=0.008, quant_max=1.31e05, device="cpu"):
++    violation_info = {}
++    for name, module in model.named_modules():
++        if hasattr(module, "weight") and module.weight is not None:
++            weight = module.weight.detach().to(device)
++            abs_weight = torch.abs(weight)
++            below_min = ((abs_weight < quant_min) & (abs_weight > 0)).sum().item()
++            above_max = (abs_weight > quant_max).sum().item()
++            if below_min > 0 or above_max > 0:
++                violation_info[name] = {
++                    "layer_type": str(type(module)),
++                    "weight_shape": tuple(weight.shape),
++                    "total_weights": weight.numel(),
++                    "below_min": {"count": below_min},
++                    "above_max": {"count": above_max},
++                    "weight_stats": {
++                        "abs_min": abs_weight.min().item(),
++                        "abs_max": abs_weight.max().item(),
++                        "abs_mean": abs_weight.mean().item(),
++                    },
++                }
++    return violation_info
++
++
++def save_violation_report(violation_info, save_path):
++    with open(save_path, "w", encoding="utf-8") as f:
++        f.write(f"Found {len(violation_info)} violating layers\n\n")
++        for name, info in violation_info.items():
++            f.write(f"Layer: {name}\n")
++            f.write(f"  Type: {info['layer_type']}\n")
++            f.write(f"  Shape: {info['weight_shape']}\n")
++            f.write(f"  Total weights: {info['total_weights']}\n")
++            f.write(f"  Below min: {info['below_min']['count']}\n")
++            f.write(f"  Above max: {info['above_max']['count']}\n")
++            f.write("\n")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description="Check model quant range violations")
++    parser.add_argument("--model_path", type=str, help="Model training config path")
++    if len(sys.argv) == 1:
++        parser.print_help()
++        sys.exit(1)
++    args = parser.parse_args()
++    print(args.model_path)
+diff --git a/src/lerobot/utils/sample_weighting.py b/src/lerobot/utils/sample_weighting.py
+index 83eec312..ee29512e 100644
+--- a/src/lerobot/utils/sample_weighting.py
++++ b/src/lerobot/utils/sample_weighting.py
+@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
++import logging
+ import torch
+ 
+ if TYPE_CHECKING:
+@@ -129,7 +130,12 @@ def make_sample_weighter(
+         # No-op weighter that returns uniform weights
+         return UniformWeighter(device=device)
+ 
+-    raise ValueError(f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'uniform'")
++    if config.type == "custom":
++        return CustomWeighter(device=device, dataset_root=dataset_root, dataset_repo_id=dataset_repo_id)
++
++    raise ValueError(
++        f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'uniform', 'custom'"
++    )
+ 
+ 
+ def _make_rabc_weighter(
+@@ -237,3 +243,45 @@ class UniformWeighter(SampleWeighter):
+     def get_stats(self) -> dict:
+         """Return empty stats for uniform weighting."""
+         return {"type": "uniform"}
++
++
++class CustomWeighter(SampleWeighter):
++    """Load per-frame weights from the dataset's ``training_weight`` column.
++
++    Ports the v0.5.1 ``custom_weights`` feature onto v0.6.0's native
++    SampleWeighter framework. The ``frame_detector`` tool writes a
++    ``training_weight`` column per frame; this weighter looks it up by the
++    batch's ``index`` key (global frame indices) and returns per-sample
++    weights for loss reweighting.
++    """
++
++    def __init__(self, device: torch.device, dataset_root: str | None = None, dataset_repo_id: str | None = None):
++        self.device = device
++        self.weights = None
++        self._load_weights(dataset_root, dataset_repo_id)
++
++    def _load_weights(self, dataset_root, dataset_repo_id):
++        from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
++        ds = LeRobotDataset(repo_id=dataset_repo_id, root=dataset_root)
++        if "training_weight" not in ds.hf_dataset.features:
++            raise ValueError(
++                "CustomWeighter requires a 'training_weight' column in the dataset "
++                f"(repo_id={dataset_repo_id}, root={dataset_root}). Run frame_detector first."
++            )
++        col = ds.hf_dataset["training_weight"]
++        self.weights = torch.tensor([float(x) for x in col], dtype=torch.float32, device=self.device)
++        if is_main_process := (int(__import__("os").environ.get("RANK", "0")) == 0):
++            logging.info(f"CustomWeighter loaded {len(self.weights)} training_weight values "
++                         f"(min={self.weights.min().item():.4f}, max={self.weights.max().item():.4f})")
++
++    def compute_batch_weights(self, batch: dict) -> tuple[torch.Tensor, dict]:
++        if "index" not in batch:
++            raise ValueError("CustomWeighter needs batch['index'] (global frame indices); "
++                             "ensure the dataset/collate populates it.")
++        indices = batch["index"].to(self.device).long()
++        weights = self.weights[indices]
++        return weights, {"mean_weight": weights.mean().item(), "type": "custom"}
++
++    def get_stats(self) -> dict:
++        return {"type": "custom"}
+-- 
+2.34.1
+

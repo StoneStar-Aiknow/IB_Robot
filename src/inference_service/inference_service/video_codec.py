@@ -116,6 +116,16 @@ class VideoEncoder(ABC):
     @abstractmethod
     def close(self, timeout_s: float = 1.0) -> None: ...
 
+    def discard_pending_output(self) -> None:
+        """Drop encoded output still buffered inside the codec.
+
+        Called at session rollover so access units of the retired session
+        that are still in flight through a pipelined codec (e.g. the Ascend
+        DVPP pipeline delay) do not surface as the first output of the new
+        session. Backends without internal output buffering keep the no-op.
+        """
+        return
+
 
 class VideoDecoder(ABC):
     @property

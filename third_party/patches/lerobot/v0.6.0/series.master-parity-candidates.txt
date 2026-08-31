@@ -1,0 +1,8 @@
+# Master-parity candidate series for lerobot v0.6.0.
+#
+# EMPTY on purpose. The v0.5.1 master-parity patches (adaptive weighting,
+# weighted training, knowledge distillation, mt_act, training logs, and the
+# now-redundant diffusion observation histories) are pending a redesign
+# against the restructured v0.6.0 training loop. They are NOT ported in this
+# phased migration. Track the training-feature port as a follow-up effort and
+# repopulate this file as each patch is revalidated on the v0.6.0 base.

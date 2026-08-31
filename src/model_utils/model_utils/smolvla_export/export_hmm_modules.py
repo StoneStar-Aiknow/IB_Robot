@@ -109,7 +109,7 @@ def _write_provenance(args: argparse.Namespace, output_dir: Path) -> Path:
             "source": str(Path(args.lerobot_src).resolve()),
             "branch": _git_output(lerobot_root, "branch", "--show-current"),
             "head": _git_output(lerobot_root, "rev-parse", "HEAD"),
-            "base": _git_output(lerobot_root, "merge-base", "HEAD", "v0.5.1"),
+            "base": _git_output(lerobot_root, "merge-base", "HEAD", "v0.6.0"),
             "dirty_files": _git_output(lerobot_root, "status", "--short").splitlines(),
         },
         "checkpoint": {

@@ -548,6 +548,31 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
 # if action accuracy degrades.
 
 
+_FAST_GELU_SCOPES = {"none", "all", "vision", "gemma"}
+
+
+def _resolve_fast_gelu_scope(*, fast_gelu: bool, fast_gelu_scope: str | None) -> str:
+    scope = fast_gelu_scope or ("all" if fast_gelu else "none")
+    if scope not in _FAST_GELU_SCOPES:
+        raise ValueError(f"Unknown FastGELU scope {scope!r}; expected one of {sorted(_FAST_GELU_SCOPES)}")
+    if fast_gelu and scope != "all":
+        raise ValueError("fast_gelu=True is the legacy alias for fast_gelu_scope='all'")
+    return scope
+
+
+def _make_npu_fast_gelu():
+    class _NpuFastGelu(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return torch.ops.npu.fast_gelu(x)
+
+        @staticmethod
+        def symbolic(g, x):
+            return g.op("npu::NPUFastGelu", x)
+
+    return _NpuFastGelu
+
+
 def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
     """Route ``gelu_pytorch_tanh`` activations through ``torch_npu.fast_gelu``.
 
@@ -589,8 +614,6 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
         )
         return undo_log
 
-    import torch as _torch
-
     # Single-output custom symbolic.  fast_gelu is already a 1-output op, so
     # there is no dead-output problem (unlike npu_rms_norm's (y, rstd)); we
     # still declare our own Function to keep the symbolic self-contained and
@@ -598,14 +621,7 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
     # Emit npu::NPUFastGelu (default-domain registered at opset 11-18); the
     # convert script's domain strip leaves a bare NPUFastGelu op_type the ATC
     # plugin resolves.
-    class _NpuFastGelu(_torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x):
-            return _torch.ops.npu.fast_gelu(x)
-
-        @staticmethod
-        def symbolic(g, x):
-            return g.op("npu::NPUFastGelu", x)
+    npu_fast_gelu = _make_npu_fast_gelu()
 
     try:
         from transformers.activations import PytorchGELUTanh
@@ -618,7 +634,7 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
 
     orig_forward = PytorchGELUTanh.forward
 
-    def _patched_forward(self, input, _gelu=_NpuFastGelu):  # noqa: A002
+    def _patched_forward(self, input, _gelu=npu_fast_gelu):  # noqa: A002
         return _gelu.apply(input)
 
     PytorchGELUTanh.forward = _patched_forward
@@ -628,6 +644,81 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
         "(torch_npu.fast_gelu -> NPUFastGelu; sigmoid approx, validate accuracy)"
     )
 
+    return undo_log
+
+
+def _patch_siglip_fast_gelu_npu() -> list[tuple[Any, str, Any]]:
+    """Use NPUFastGelu only in SigLIP vision MLPs."""
+    import importlib
+
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError as exc:
+        LOGGER.warning("vision fast gelu patch requested but torch_npu is unavailable (%s); skipping", exc)
+        return []
+
+    npu_fast_gelu = _make_npu_fast_gelu()
+    undo_log: list[tuple[Any, str, Any]] = []
+    targets = [
+        ("transformers.models.siglip.modeling_siglip", "SiglipMLP"),
+        ("transformers.models.siglip2.modeling_siglip2", "Siglip2MLP"),
+    ]
+    for mod_path, cls_name in targets:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
+        original_forward = cls.forward
+
+        def _vision_fast_gelu_forward(self, hidden_states, _original=original_forward, _gelu=npu_fast_gelu):
+            if not all(hasattr(self, name) for name in ("fc1", "fc2")):
+                return _original(self, hidden_states)
+            return self.fc2(_gelu.apply(self.fc1(hidden_states)))
+
+        cls.forward = _vision_fast_gelu_forward
+        undo_log.append((cls, "forward", original_forward))
+        LOGGER.info("Patched %s.%s.forward (vision-only NPUFastGelu)", mod_path, cls_name)
+    return undo_log
+
+
+def _patch_gemma_fast_gelu_npu() -> list[tuple[Any, str, Any]]:
+    """Use NPUFastGelu only in Gemma gated MLPs."""
+    import importlib
+
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError as exc:
+        LOGGER.warning("Gemma fast gelu patch requested but torch_npu is unavailable (%s); skipping", exc)
+        return []
+
+    npu_fast_gelu = _make_npu_fast_gelu()
+    undo_log: list[tuple[Any, str, Any]] = []
+    targets = [
+        ("transformers.models.gemma.modeling_gemma", "GemmaMLP"),
+        ("transformers.models.gemma2.modeling_gemma2", "Gemma2MLP"),
+        ("transformers.models.gemma3.modeling_gemma3", "Gemma3MLP"),
+    ]
+    for mod_path, cls_name in targets:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
+        original_forward = cls.forward
+
+        def _gemma_fast_gelu_forward(self, x, _original=original_forward, _gelu=npu_fast_gelu):
+            if not all(hasattr(self, name) for name in ("gate_proj", "up_proj", "down_proj")):
+                return _original(self, x)
+            return self.down_proj(_gelu.apply(self.gate_proj(x)) * self.up_proj(x))
+
+        cls.forward = _gemma_fast_gelu_forward
+        undo_log.append((cls, "forward", original_forward))
+        LOGGER.info("Patched %s.%s.forward (Gemma-only NPUFastGelu)", mod_path, cls_name)
     return undo_log
 
 
@@ -672,13 +763,12 @@ def _patch_gemma_geglu_npu() -> list[tuple[Any, str, Any]]:
         def symbolic(g, x):
             return g.op("npu::NPUGeglu", x, dim_i=-1, approximate_i=1, activate_left_i=0)
 
-    def _make_forward(geglu):
+    def _make_forward(geglu, original_forward):
         def _geglu_forward(self, x):
             # ATC computes left * gelu(right), so concatenate [up, gate].
-            fused = getattr(self, "_npu_up_gate_weight", None)
+            fused = _fused_up_gate_weight(self)
             if fused is None:
-                fused = _torch.cat([self.up_proj.weight, self.gate_proj.weight], dim=0)
-                self._npu_up_gate_weight = fused
+                return original_forward(self, x)
             up_gate = _F.linear(x, fused)
             return self.down_proj(geglu.apply(up_gate))
 
@@ -698,9 +788,72 @@ def _patch_gemma_geglu_npu() -> list[tuple[Any, str, Any]]:
         if cls is None:
             continue
         orig_forward = cls.forward
-        cls.forward = _make_forward(_NpuGeglu)
+        cls.forward = _make_forward(_NpuGeglu, orig_forward)
         undo_log.append((cls, "forward", orig_forward))
         LOGGER.info("Patched %s.%s.forward (fused gate_up + NPUGeglu, tanh GeGLU)", mod_path, cls_name)
+
+    return undo_log
+
+
+def _exact_fused_geglu(up_gate: torch.Tensor) -> torch.Tensor:
+    """Apply Gemma's exact tanh GeGLU to a fused ``[up, gate]`` projection."""
+    up, gate = up_gate.chunk(2, dim=-1)
+    return up * torch.nn.functional.gelu(gate, approximate="tanh")
+
+
+def _fused_up_gate_weight(module) -> torch.Tensor | None:  # noqa: ANN001
+    """Return ``cat([up, gate])`` for plain projections, else request fallback."""
+    up_weight = getattr(getattr(module, "up_proj", None), "weight", None)
+    gate_weight = getattr(getattr(module, "gate_proj", None), "weight", None)
+    if up_weight is None or gate_weight is None:
+        return None
+    return torch.cat([up_weight, gate_weight], dim=0)
+
+
+def _patch_gemma_geglu_donor() -> list[tuple[Any, str, Any]]:
+    """Fuse gate/up MatMuls while keeping an ORT-runnable exact GeGLU.
+
+    The fused MatMul is identical to the NPU graph produced by
+    :func:`_patch_gemma_geglu_npu`; only the following activation differs:
+    standard ONNX operators replace ``NPUGeglu`` so ModelSlim can calibrate the
+    graph on CPU. Route A can then transplant the quantized fused MatMul onto
+    the NPU graph by its shared module-scope node name.
+    """
+    import importlib
+
+    import torch.nn.functional as _F
+
+    undo_log: list[tuple[Any, str, Any]] = []
+    targets = [
+        ("transformers.models.gemma.modeling_gemma", "GemmaMLP"),
+        ("transformers.models.gemma2.modeling_gemma2", "Gemma2MLP"),
+        ("transformers.models.gemma3.modeling_gemma3", "Gemma3MLP"),
+    ]
+    try:
+        for mod_path, cls_name in targets:
+            try:
+                mod = importlib.import_module(mod_path)
+            except ImportError:
+                continue
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                continue
+            orig_forward = cls.forward
+
+            def _fused_forward(self, x, _original_forward=orig_forward):
+                # Ascend NPUGeglu computes left * gelu(right), hence [up, gate].
+                fused = _fused_up_gate_weight(self)
+                if fused is None:
+                    return _original_forward(self, x)
+                return self.down_proj(_exact_fused_geglu(_F.linear(x, fused)))
+
+            cls.forward = _fused_forward
+            undo_log.append((cls, "forward", orig_forward))
+            LOGGER.info("Patched %s.%s.forward (fused gate_up + exact ORT GeGLU donor)", mod_path, cls_name)
+    except Exception:
+        for cls, attr, original in reversed(undo_log):
+            setattr(cls, attr, original)
+        raise
 
     return undo_log
 
@@ -1834,6 +1987,8 @@ def _build_patch_registry(
     softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
+    fast_gelu_scope: str | None = None,
+    fused_geglu_donor: bool = False,
 ) -> list[tuple[str, Any]]:
     """Return the active patch registry for the requested export mode.
 
@@ -1848,10 +2003,13 @@ def _build_patch_registry(
     attention optimisations threaded into :func:`_patch_gemma_eager_attention`;
     they default off so the VLM export (host-side fp32 prefix mask) is unchanged.
 
-    ``fast_gelu`` routes gelu_pytorch_tanh through Ascend NPUFastGelu.  It is
-    faster but numerically different from the tanh GELU used by PyTorch, so it
-    defaults off and must be enabled explicitly after end-to-end validation.
+    ``fast_gelu_scope`` limits approximate NPUFastGelu to all activation sites,
+    SigLIP vision MLPs, or Gemma MLPs. The legacy ``fast_gelu`` switch maps to
+    ``all``. FastGELU defaults off and requires end-to-end validation.
     """
+    gelu_scope = _resolve_fast_gelu_scope(fast_gelu=fast_gelu, fast_gelu_scope=fast_gelu_scope)
+    if fused_geglu_donor and (use_npu_ops or gelu_scope != "none"):
+        raise ValueError("fused_geglu_donor requires a non-NPU export with FastGELU disabled")
     rope_patch = (
         ("apply_rotary_pos_emb (torch_npu.npu_rotary_mul)", _patch_gemma_rotary_pos_emb_npu)
         if use_npu_ops
@@ -1907,11 +2065,16 @@ def _build_patch_registry(
         # disabled on 310P (see above), so qkv fusion has no upside here.
         # ("fused qkv projection", _patch_gemma_fused_qkv),
     ]
-    if use_npu_ops and fast_gelu:
+    if fused_geglu_donor:
+        registry.append(("GemmaMLP fused gate_up (exact ORT GeGLU donor)", _patch_gemma_geglu_donor))
+    elif use_npu_ops and gelu_scope == "all":
         registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
-    # NPUGeglu is the accuracy-preserving NPU default. An explicit fast_gelu
-    # request takes precedence for every gelu_pytorch_tanh site, including Gemma.
-    if use_npu_ops and not fast_gelu:
+    elif use_npu_ops and gelu_scope == "vision":
+        registry.append(("SigLIP MLP (vision-only NPUFastGelu)", _patch_siglip_fast_gelu_npu))
+    elif use_npu_ops and gelu_scope == "gemma":
+        registry.append(("Gemma MLP (Gemma-only NPUFastGelu)", _patch_gemma_fast_gelu_npu))
+    # NPUGeglu remains the accuracy-preserving Gemma default for none/vision.
+    if use_npu_ops and gelu_scope in {"none", "vision"}:
         registry.append(("GemmaMLP gelu(gate)*up (torch_npu.npu_geglu -> NPUGeglu)", _patch_gemma_geglu_npu))
     return registry
 
@@ -1928,6 +2091,8 @@ def ascend_onnx_export_patches(
     softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
+    fast_gelu_scope: str | None = None,
+    fused_geglu_donor: bool = False,
 ):
     """Context manager that applies **all** registered Ascend patches.
 
@@ -1949,6 +2114,11 @@ def ascend_onnx_export_patches(
             multi-query layers and rely on matmul broadcasting instead.
         fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
             because it is an approximation and can degrade PI05 action accuracy.
+        fast_gelu_scope: Optional scoped replacement: ``none``, ``all``,
+            ``vision``, or ``gemma``. The legacy ``fast_gelu`` flag means ``all``.
+        fused_geglu_donor: Fuse Gemma gate/up projections into the same
+            ``[up, gate]`` MatMul used by the NPU graph, but keep the exact GeGLU
+            in standard ONNX operators so ModelSlim can run it on CPU.
 
     On NPU, the Gemma text MLP gelu(gate)*up is fused into one NPUGeglu by
     default (GeGluV2, numerically exact tanh). When ``fast_gelu`` is true,
@@ -1960,21 +2130,43 @@ def ascend_onnx_export_patches(
         with ascend_onnx_export_patches():
             torch.onnx.export(model, ...)
     """
+    gelu_scope = _resolve_fast_gelu_scope(fast_gelu=fast_gelu, fast_gelu_scope=fast_gelu_scope)
+    if fused_geglu_donor and (use_npu_ops or gelu_scope != "none"):
+        raise ValueError("fused_geglu_donor requires an ORT-runnable non-NPU export with FastGELU disabled")
+
     all_undo: list[tuple[Any, str, Any]] = []
     applied: list[str] = []
+    required_npu_activation_patches = {
+        _patch_pytorch_gelu_tanh_npu,
+        _patch_siglip_fast_gelu_npu,
+        _patch_gemma_fast_gelu_npu,
+        _patch_gemma_geglu_npu,
+    }
 
     for label, patch_fn in _build_patch_registry(
         use_npu_ops,
         softmax_in_model_dtype=softmax_in_model_dtype,
         mqa_broadcast=mqa_broadcast,
         fast_gelu=fast_gelu,
+        fast_gelu_scope=fast_gelu_scope,
+        fused_geglu_donor=fused_geglu_donor,
     ):
+        required_activation = use_npu_ops and patch_fn in required_npu_activation_patches
         try:
             undo = patch_fn()
+            if fused_geglu_donor and patch_fn is _patch_gemma_geglu_donor and not undo:
+                raise RuntimeError("fused GeGLU donor patch found no supported Gemma MLP class")
+            if required_activation and not undo:
+                raise RuntimeError(f"required NPU activation patch {label!r} found no supported model class")
             all_undo.extend(undo)
             if undo:
                 applied.append(label)
         except Exception as exc:
+            if required_activation or (fused_geglu_donor and patch_fn is _patch_gemma_geglu_donor):
+                for mod, attr, orig in reversed(all_undo):
+                    setattr(mod, attr, orig)
+                requirement = "NPU activation" if required_activation else "fused GeGLU donor"
+                raise RuntimeError(f"Could not install the required {requirement} patch") from exc
             LOGGER.warning("Failed to apply patch '%s': %s", label, exc)
 
     if applied:

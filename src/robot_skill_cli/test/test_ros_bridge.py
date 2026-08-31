@@ -190,6 +190,18 @@ def bridge_rig():
         rclpy.shutdown()
 
 
+def test_bridge_context_can_be_recreated_in_one_process() -> None:
+    _assert_isolated_ros_domain()
+    for _ in range(2):
+        bridge = RosBridge(
+            status_service="/unused/status",
+            validate_skill_service="/unused/validate_skill",
+            skill_action="/unused/execute_skill",
+        )
+        assert bridge.start() is True, bridge.start_error
+        bridge.close()
+
+
 def test_status_preserves_gateway_contract_fields(bridge_rig):
     bridge, _names, _requests, _status_control, _action_control = bridge_rig
 

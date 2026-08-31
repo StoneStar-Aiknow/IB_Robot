@@ -55,8 +55,8 @@ The applier prints a `[CTX] python=X.Y profiles=...` audit line and a
 IBR_HOST_PYTHON_VERSION=3.11 \
 IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
   python3 scripts/setup/lerobot_filter_series.py \
-    --manifest third_party/patches/lerobot/v0.5.1/manifest.yaml \
-    --series   third_party/patches/lerobot/v0.5.1/series.txt
+    --manifest third_party/patches/lerobot/v0.6.0/manifest.yaml \
+    --series   third_party/patches/lerobot/v0.6.0/series.txt
 ```
 
 ### When to add a new patch
@@ -82,7 +82,7 @@ binding so the resolver can fail closed on drift:
 ```text
 third_party/patches/lerobot/
 ├── INDEX.yaml                  # active_tag + supported_tags + archived_tags
-├── v0.5.1/                     # one directory per supported tag
+├── v0.6.0/                     # current active tag, one directory per supported tag
 │   ├── manifest.yaml           # declares lerobot_tag + lerobot_commit_range
 │   ├── series.txt
 │   └── 0001-*.patch ...

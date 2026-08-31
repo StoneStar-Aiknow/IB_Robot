@@ -345,6 +345,11 @@ class H264RtpSender:
         self._last_error = ""
         self._stopping = False
         self._thread: threading.Thread | None = None
+        # Bumped by reset() so an access unit dequeued before a session
+        # rollover no longer fires its on_sent callback afterwards; the
+        # callback would otherwise re-populate bookkeeping that the rollover
+        # just cleared, mixing old-session data into the new session.
+        self._epoch = 0
 
     @property
     def status(self) -> StreamStatus:
@@ -385,6 +390,7 @@ class H264RtpSender:
     def reset(self) -> None:
         with self._send_lock, self._condition:
             self._queue.clear()
+            self._epoch += 1
             self._metrics = replace(
                 self._metrics,
                 queued_frames=0,
@@ -418,6 +424,7 @@ class H264RtpSender:
                 if not self._queue:
                     return False
                 access_unit = self._queue.popleft()
+                epoch = self._epoch
                 self._metrics = replace(self._metrics, queued_frames=len(self._queue))
             try:
                 packets, self._sequence = packetize_h264(
@@ -435,15 +442,18 @@ class H264RtpSender:
                     self._last_error = str(exc)
                     self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
                 raise VideoRtpError("send_failed", str(exc), stream_id=self.stream_id, recoverable=True) from exc
-        with self._condition:
-            self._state = StreamLifecycleState.READY
-            self._metrics = replace(
-                self._metrics,
-                sent_frames=self._metrics.sent_frames + 1,
-                sent_packets=self._metrics.sent_packets + len(packets),
-            )
-        if self._on_sent is not None:
-            self._on_sent(access_unit)
+            with self._condition:
+                self._state = StreamLifecycleState.READY
+                self._metrics = replace(
+                    self._metrics,
+                    sent_frames=self._metrics.sent_frames + 1,
+                    sent_packets=self._metrics.sent_packets + len(packets),
+                )
+            # The epoch check stays inside _send_lock so reset() cannot rotate
+            # the session between the send and the callback, which would let a
+            # retired access unit re-populate bookkeeping the rollover cleared.
+            if self._on_sent is not None and epoch == self._epoch:
+                self._on_sent(access_unit)
         return True
 
     def _run(self) -> None:

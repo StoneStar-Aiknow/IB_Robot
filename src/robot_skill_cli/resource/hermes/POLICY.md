@@ -23,3 +23,6 @@
   stop-confirmed terminal result。
 - TTS 是系统自动功能，不是机器人 Skill。最终自然语言回复由 `post_llm_call` hook 合成并播放，不得在
   workflow 中加入“播报”“语音”或“发声”步骤。
+- 机器人任务生命周期语音由受管 hook 自动触发：状态检查前、规划前和计划确认成功后各最多一次。
+  文案生成、语音合成和播放必须在后台执行，不得等待、修改或阻断 status/plan/confirm/execute 主链路；
+  规划、校验或确认失败时不得播报“开始执行”。

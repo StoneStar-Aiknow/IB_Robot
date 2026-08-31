@@ -1,0 +1,47 @@
+name: pi05-vlm-text-ae-attn-mlp-sq-v1
+format: pi05-quant-profile-v1
+status: experimental
+target_soc: Ascend310P3
+export_device: npu
+export_dtype: fp16
+donor_device: cpu
+fast_gelu_scope: vlm-text
+
+vlm:
+  enabled: false
+
+action_expert:
+  enabled: true
+  donor_dtype: fp16
+  expected_selected_nodes: 108
+  expected_quantized_nodes: 108
+  expected_calibration_steps: 10
+  expected_npu_geglu_nodes: 18
+  quantize_convs: false
+  fused_geglu_donor: true
+  smoothquant_alpha: 0.5
+  smoothquant_epsilon: 1.0e-5
+  disable_regex:
+    - rotary_emb
+    - 'self_attn/MatMul(_[0-9]+)?$'
+    - 'mlp/(gate_proj|up_proj)/MatMul'
+    - action_out_proj
+  selectors:
+    - name: ae_q_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/q_proj/MatMul$'
+      expected: 18
+    - name: ae_k_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/k_proj/MatMul$'
+      expected: 18
+    - name: ae_v_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/v_proj/MatMul$'
+      expected: 18
+    - name: ae_o_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/self_attn/o_proj/MatMul$'
+      expected: 18
+    - name: ae_fused_mlp
+      regex: '^/layers\.(?:[0-9]|1[0-7])/mlp/MatMul$'
+      expected: 18
+    - name: ae_down_proj
+      regex: '^/layers\.(?:[0-9]|1[0-7])/mlp/down_proj/MatMul$'
+      expected: 18

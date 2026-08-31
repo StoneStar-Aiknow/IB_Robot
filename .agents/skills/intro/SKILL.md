@@ -19,12 +19,13 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | Skill | 一句话描述 |
 | :--- | :--- |
 | **ibrobot-launch** | 分平台启动 Ubuntu/openEuler 或 OpenHarmony 板端机器人、仿真、推理与遥操作 |
-| **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
+| **ibrobot-build** | 编译整个工作空间或指定 package（`./scripts/build.sh`） |
 | **ibrobot-env** | 初始化/修复运行环境：跑测试、运行脚本、ros2 命令前加载 `.shrc_local`，禁止手动拼装 PYTHONPATH/ROS 环境 |
 | **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
 | **ibrobot-control** | 通过 `robot-skill` 操作现有机器人高层技能或异步视觉游戏 |
+| **ibrobot-inference-verify** | 统一推理运行时端到端验证（本机 Torch + 板端 OM ROS mock typed service） |
 
 ### 🔌 板端（OpenHarmony）
 
@@ -114,6 +115,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
 让 Agent 玩分院帽视觉游戏         → ibrobot-control
+验证推理 runtime 端到端            → ibrobot-inference-verify
 初始化环境                      → ibrobot-env
 跑一下测试 / pytest             → ibrobot-env（环境前缀由它保证）
 在 worktree 中跑代码             → ibrobot-worktree-env

@@ -1,0 +1,70 @@
+From 2fb29ad4cc984a972da1c1cd20c42951c4d64fb1 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Sat, 8 Aug 2026 18:05:29 +0800
+Subject: [PATCH 09/12] train: ACT forward supports reduction='none' for v0.6.0
+ sample weighting
+
+Port the non-redundant core of v0.5.1 patch 0009 onto v0.6.0. Upstream
+v0.6.0 already ships a native sample-weighting system (SampleWeighter /
+SampleWeightingConfig / make_train_eval_datasets) integrated into
+update_policy via policy.forward(batch, reduction='none'). pi0/pi05/evo1
+already implement the reduction='none' contract; ACT did not.
+
+Add reduction='mean' | 'none' to ACTPolicy.forward. When reduction='none'
+return per-sample l1 losses of shape (B,) so v0.6.0's RA-BC SampleWeighter
+can reweight ACT batches. The v0.5.1 0009 knobs (ada_weight /
+ada_weight_freq / damping_coefficient), the WeightSampler class, the
+random_split train/val view, and the separate val_loader are intentionally
+dropped: they are superseded by v0.6.0's native SampleWeightingConfig and
+make_train_eval_datasets/eval_dataloader. ACT index tracking is no longer
+needed because v0.6.0 weights by batch content, not by per-sample loss
+history.
+---
+ src/lerobot/policies/act/modeling_act.py | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/lerobot/policies/act/modeling_act.py b/src/lerobot/policies/act/modeling_act.py
+index e82083f9..5b8537c5 100644
+--- a/src/lerobot/policies/act/modeling_act.py
++++ b/src/lerobot/policies/act/modeling_act.py
+@@ -146,9 +146,20 @@ class ACTPolicy(PreTrainedPolicy):
+         return nn.MSELoss()(decoder_out, teacher_decoder_out)
+ 
+     def forward(
+-        self, batch: dict[str, Tensor], teacher_policy=None, teacher_feature=None
++        self,
++        batch: dict[str, Tensor],
++        teacher_policy=None,
++        teacher_feature=None,
++        reduction: str = "mean",
+     ) -> tuple[Tensor, dict]:
+-        """Run the batch through the model and compute the loss for training or validation."""
++        """Run the batch through the model and compute the loss for training or validation.
++
++        Args:
++            reduction: How to reduce the loss. ``"mean"`` returns the scalar mean loss
++                (default, backward compatible). ``"none"`` returns per-sample losses of
++                shape ``(batch_size,)`` so v0.6.0's native sample weighting (RA-BC
++                ``SampleWeighter``) can reweight the batch.
++        """
+         if self.config.image_features:
+             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+@@ -181,6 +192,14 @@ class ACTPolicy(PreTrainedPolicy):
+ 
+         loss_dict["total_kd_loss"] = loss + (kd_loss if kd_loss is not None else 0.0)
+ 
++        if reduction == "none":
++            # Per-sample l1 loss (B,) for v0.6.0 native sample weighting (RA-BC).
++            per_sample_loss = (abs_err * valid_mask).sum(dim=[1, 2]) / valid_mask.sum(
++                dim=[1, 2]
++            ).clamp_min(1)
++            loss_dict["loss"] = per_sample_loss.mean().item()
++            return per_sample_loss, loss_dict
++
+         return loss, loss_dict
+ 
+ 
+-- 
+2.34.1
+

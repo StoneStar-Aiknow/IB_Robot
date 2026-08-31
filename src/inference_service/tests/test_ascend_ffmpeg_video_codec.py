@@ -128,6 +128,37 @@ class _FakeSocket:
         self.closed = True
 
 
+class _DrainProbeSocket(_FakeSocket):
+    """Fail if drain waits again after receiving a complete access unit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts = []
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+        super().settimeout(timeout)
+
+    def recvfrom(self, size):
+        if self.datagrams:
+            return super().recvfrom(size)
+        if self.timeout == 0:
+            raise BlockingIOError
+        raise AssertionError("drain waited after a complete access unit")
+
+
+class _DrainTimeoutProbeSocket(_FakeSocket):
+    """Record settimeout values to verify drain wait/skip decisions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[float | None] = []
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+        super().settimeout(timeout)
+
+
 def test_module_import_has_no_pyav_or_ascend_dependency():
     script = (
         "import sys; "
@@ -179,6 +210,117 @@ def test_child_environment_can_isolate_ascend_toolkit_variables(tmp_path: Path):
     assert "ASCEND_HOME_PATH" not in child
     assert "ASCEND_OPP_PATH" not in child
     assert "TOOLCHAIN_HOME" not in child
+
+
+def test_standard_ascend_wrapper_isolated_by_default(tmp_path: Path):
+    del tmp_path
+    wrapper = Path("/usr/bin/ffmpeg-ascend")
+    environment = {
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+        "ASCEND_OPP_PATH": "/cann-8.3/opp",
+        "TOOLCHAIN_HOME": "/toolchain",
+        "LD_LIBRARY_PATH": "/inherited",
+        "PYTHONPATH": "/python",
+    }
+
+    child = build_ascend_child_environment(str(wrapper), environment)
+
+    assert "ASCEND_TOOLKIT_HOME" not in child
+    assert "ASCEND_OPP_PATH" not in child
+    assert "TOOLCHAIN_HOME" not in child
+    assert child["LD_LIBRARY_PATH"] == "/inherited"
+    assert child["PYTHONPATH"] == "/python"
+    assert environment["ASCEND_TOOLKIT_HOME"] == "/cann-8.3"
+
+
+def test_standard_ascend_wrapper_can_opt_out_of_default_isolation(tmp_path: Path):
+    del tmp_path
+    wrapper = Path("/usr/bin/ffmpeg-ascend")
+    environment = {
+        "IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV": "0",
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+        "TOOLCHAIN_HOME": "/toolchain",
+    }
+
+    child = build_ascend_child_environment(str(wrapper), environment)
+
+    assert child["ASCEND_TOOLKIT_HOME"] == "/cann-8.3"
+    assert child["TOOLCHAIN_HOME"] == "/toolchain"
+
+
+def test_private_ffmpeg_keeps_existing_environment_without_isolation(tmp_path: Path):
+    ffmpeg = _executable(tmp_path / "private" / "bin" / "ffmpeg")
+    environment = {
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+        "TOOLCHAIN_HOME": "/toolchain",
+    }
+
+    child = build_ascend_child_environment(str(ffmpeg), environment)
+
+    assert child["ASCEND_TOOLKIT_HOME"] == "/cann-8.3"
+    assert child["TOOLCHAIN_HOME"] == "/toolchain"
+
+
+def test_rpm_payload_ffmpeg_is_isolated_by_default_and_keeps_device_env(tmp_path: Path):
+    """The versioned payload binary behind the RPM wrapper gets the same
+    default isolation as the wrapper itself: probing it unisolated was shown
+    to hang on the first frame on the real board."""
+    del tmp_path
+    payload = Path("/usr/local/ffmpeg-ascend-611/bin/ffmpeg")
+    environment = {
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+        "ASCEND_OPP_PATH": "/cann-8.3/opp",
+        "TOOLCHAIN_HOME": "/toolchain",
+        "ASCEND_RT_VISIBLE_DEVICES": "1",
+        "ASCEND_DEVICE_ID": "1",
+    }
+
+    child = build_ascend_child_environment(str(payload), environment)
+
+    assert "ASCEND_TOOLKIT_HOME" not in child
+    assert "ASCEND_OPP_PATH" not in child
+    assert "TOOLCHAIN_HOME" not in child
+    # Device visibility and selection policy are runtime resource
+    # configuration, not installation paths; isolation must never strip
+    # them or multi-NPU deployments lose their device pinning.
+    assert child["ASCEND_RT_VISIBLE_DEVICES"] == "1"
+    assert child["ASCEND_DEVICE_ID"] == "1"
+
+    environment["IBROBOT_ASCEND_FFMPEG_ISOLATE_ENV"] = "0"
+    child = build_ascend_child_environment(str(payload), environment)
+    assert child["ASCEND_TOOLKIT_HOME"] == "/cann-8.3"
+
+
+def test_wrapper_isolation_preserves_ascend_device_variables(tmp_path: Path):
+    del tmp_path
+    wrapper = Path("/usr/bin/ffmpeg-ascend")
+    environment = {
+        "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+        "ASCEND_DEVICE_ID": "0",
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+    }
+
+    child = build_ascend_child_environment(str(wrapper), environment)
+
+    assert child["ASCEND_RT_VISIBLE_DEVICES"] == "0,1"
+    assert child["ASCEND_DEVICE_ID"] == "0"
+    assert "ASCEND_TOOLKIT_HOME" not in child
+
+
+def test_standard_ascend_wrapper_honors_explicit_prefix(tmp_path: Path):
+    wrapper = Path("/usr/bin/ffmpeg-ascend")
+    prefix = tmp_path / "explicit-ffmpeg"
+    (prefix / "lib").mkdir(parents=True)
+    environment = {
+        "IBROBOT_ASCEND_FFMPEG_PREFIX": str(prefix),
+        "ASCEND_TOOLKIT_HOME": "/cann-8.3",
+        "LD_LIBRARY_PATH": "/inherited",
+    }
+
+    child = build_ascend_child_environment(str(wrapper), environment)
+
+    assert "ASCEND_TOOLKIT_HOME" not in child
+    assert child["LD_LIBRARY_PATH"] == f"{prefix / 'lib'}:/inherited"
 
 
 @pytest.mark.parametrize(
@@ -275,7 +417,8 @@ def test_encoder_command_environment_rtp_and_timestamp_pairing(tmp_path: Path):
     assert _option(command, "-c:v") == "h264_ascend"
     assert _option(command, "-device_id") == "2"
     assert _option(command, "-channel_id") == "3"
-    assert _option(command, "-pix_fmt") == "nv12"
+    assert _option(command, "-pix_fmt") == "rgb24"
+    assert _option(command, "-vf") == "scale=out_color_matrix=bt709:out_range=tv,format=nv12"
     assert _option(command, "-bf") == "0"
     assert command[-1].startswith("rtp://127.0.0.1:24000?")
     assert kwargs["env"]["LD_LIBRARY_PATH"].startswith(str(prefix / "lib"))
@@ -288,7 +431,7 @@ def test_encoder_command_environment_rtp_and_timestamp_pairing(tmp_path: Path):
     assert fake_socket.closed is True
 
 
-def test_encoder_writes_raw_nv12_and_reset_recreates_process_and_socket(tmp_path: Path):
+def test_encoder_writes_raw_rgb_and_reset_recreates_process_and_socket(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
     sockets = [_FakeSocket(), _FakeSocket()]
     for item in sockets:
@@ -314,7 +457,7 @@ def test_encoder_writes_raw_nv12_and_reset_recreates_process_and_socket(tmp_path
     image = np.full((2, 4, 3), 30, dtype=np.uint8)
     encoder.encode(VideoFrame(image, 20, 20, 4, 2, "rgb24"))
 
-    assert processes[0].stdin.getvalue() == hwc_uint8_to_nv12(image).tobytes()
+    assert processes[0].stdin.getvalue() == image.tobytes()
     encoder.reset()
     assert len(processes) == 2
     assert sockets[0].closed is True
@@ -619,4 +762,285 @@ def test_encoder_steady_state_drains_one_packet_per_call(tmp_path: Path):
     assert total_output == 4, "5 frames, 1 priming delay → 4 output packets"
     assert encoder.metrics.input_frames == 5
     assert encoder.metrics.output_frames == 4
+    encoder.close()
+
+
+def test_encoder_stops_drain_wait_after_complete_access_unit(tmp_path: Path):
+    """A complete AU must not consume the remaining drain timeout."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _DrainProbeSocket()
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 100, 1, b"\x65frame").to_bytes())
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=2,
+        drain_timeout_s=0.08,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    packets = encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24"))
+
+    assert len(packets) == 1
+    assert 0.0 in fake_socket.timeouts
+    encoder.close()
+
+
+def test_encoder_skips_drain_wait_after_fruitless_drain(tmp_path: Path):
+    """After one fruitless drain, the next drain must return immediately: a
+    fixed drain_timeout_s would cap the encode cadence at 1/timeout (20fps
+    for the default 50ms), below the 30fps stream target."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _DrainTimeoutProbeSocket()
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=2,
+        drain_timeout_s=0.08,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    # Frame 1: pipeline priming; the drain is allowed to wait its window.
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+    assert any(t and t > 0 for t in fake_socket.timeouts), "first drain should wait"
+
+    # Frame 2: nothing queued; the drain must return without waiting.
+    marker = len(fake_socket.timeouts)
+    assert encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24")) == []
+    assert fake_socket.timeouts[marker:] and all(t == 0.0 for t in fake_socket.timeouts[marker:]), (
+        "drain after a fruitless drain must not wait"
+    )
+
+    # Frame 3: queued output is still collected despite the skipped wait,
+    # and finding output re-enables waiting for the next call.
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 9_000, 1, b"\x65frame1").to_bytes())
+    packets = encoder.encode(VideoFrame(image, 3_000, 3_000, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets] == [1_000]
+
+    marker = len(fake_socket.timeouts)
+    assert encoder.encode(VideoFrame(image, 4_000, 4_000, 4, 2, "rgb24")) == []
+    assert any(t and t > 0 for t in fake_socket.timeouts[marker:]), "wait must be re-enabled after output flows"
+
+    encoder.close()
+
+
+def test_encoder_retires_timestamp_of_access_unit_lost_to_packet_loss(tmp_path: Path):
+    """A datagram gap kills one access unit; the timestamp FIFO must skip the
+    matching input frame instead of shifting every later frame by one."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _FakeSocket()
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=10,
+        drain_timeout_s=0.01,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    # Frame 1 primes the pipeline and produces no output.
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+
+    # Frame 2 drains frame 1's access unit (RTP timestamp step is 9000 at 10fps).
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 9_000, 1, b"\x65frame1").to_bytes())
+    packets2 = encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets2] == [1_000]
+
+    # Frame 3's access unit is lost (sequence jumps from 7 to 9).  The next
+    # surviving unit carries an RTP timestamp two frames ahead, so frame 2's
+    # timestamp must be retired rather than paired with frame 3's payload.
+    fake_socket.datagrams.append(RtpPacket(96, True, 9, 27_000, 1, b"\x65frame3").to_bytes())
+    packets3 = encoder.encode(VideoFrame(image, 3_000, 3_000, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets3] == [3_000]
+
+    encoder.close()
+
+
+def test_encoder_retires_timestamps_for_multiple_lost_access_units(tmp_path: Path):
+    """Consecutive lost access units retire one timestamp per missing frame."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _FakeSocket()
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=10,
+        drain_timeout_s=0.01,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 9_000, 1, b"\x65frame1").to_bytes())
+    assert encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))[0].capture_timestamp_ns == 1_000
+
+    # Frames 3 and 4 are submitted but their datagrams never arrive; the
+    # datagram for frame 5 shows up with an RTP timestamp four frames ahead
+    # of frame 1's unit, so two queued timestamps must be retired.
+    assert encoder.encode(VideoFrame(image, 3_000, 3_000, 4, 2, "rgb24")) == []
+    assert encoder.encode(VideoFrame(image, 4_000, 4_000, 4, 2, "rgb24")) == []
+    fake_socket.datagrams.append(RtpPacket(96, True, 11, 45_000, 1, b"\x65frame5").to_bytes())
+    packets = encoder.encode(VideoFrame(image, 5_000, 5_000, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets] == [5_000]
+
+    encoder.close()
+
+
+def test_decoder_skips_output_wait_after_fruitless_wait(tmp_path: Path):
+    """After one full output wait times out, subsequent empty calls return
+    immediately instead of burning the wait window on every decode()."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
+    decoder = AscendFfmpegH264Decoder(
+        width=4,
+        height=2,
+        frame_rate_hz=20,
+        io_timeout_s=0.5,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(stdout=_QueuePipe()),
+        socket_factory=lambda *_args: sockets.pop(0),
+    )
+    packet = EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True)
+
+    started = time.monotonic()
+    assert decoder.decode(packet) == []
+    waited = time.monotonic() - started
+    assert waited >= 0.02, "first empty decode must wait the bounded output window"
+
+    started = time.monotonic()
+    assert decoder.decode(packet) == []
+    skipped = time.monotonic() - started
+    assert skipped < 0.01, "second empty decode must not wait again"
+
+    decoder.close()
+
+
+def _encoder_with_fake_socket(tmp_path: Path, fake_socket: _FakeSocket) -> AscendFfmpegH264Encoder:
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    return AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=10,
+        drain_timeout_s=0.01,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        socket_factory=lambda *_args: fake_socket,
+    )
+
+
+def test_encoder_fails_closed_when_packet_loss_precedes_first_output(tmp_path: Path):
+    """When output is lost before the first surviving access unit, the number
+    of missing outputs is unknowable; pairing the FIFO against the encoded
+    output cannot be proven and must fail closed instead of silently pairing
+    the second frame's payload with the first frame's timestamp."""
+    fake_socket = _FakeSocket()
+    encoder = _encoder_with_fake_socket(tmp_path, fake_socket)
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    # Frame 1 primes the pipeline and produces no output yet.
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+
+    # The first access unit is damaged (a fragment is missing), so the first
+    # complete output arrives only after packet loss was observed.
+    fake_socket.datagrams.append(RtpPacket(96, False, 7, 9_000, 1, b"\x41partial").to_bytes())
+    fake_socket.datagrams.append(RtpPacket(96, True, 9, 27_000, 1, b"\x65survivor").to_bytes())
+
+    with pytest.raises(VideoCodecError, match="packet loss before the first encoded output"):
+        encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))
+    assert encoder.state is CodecLifecycleState.FAILED
+
+    encoder.close()
+
+
+def test_encoder_retire_survives_rtp_timestamp_wraparound(tmp_path: Path):
+    """RTP timestamps wrap every ~13h15m at the 90kHz clock; the retire delta
+    must be computed modulo 2**32 or the FIFO never retires again and every
+    later frame stays misaligned by one."""
+    fake_socket = _FakeSocket()
+    encoder = _encoder_with_fake_socket(tmp_path, fake_socket)
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+
+    # Access unit 1 lands just below the uint32 boundary.
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 0xFFFF_FF00, 1, b"\x65frame1").to_bytes())
+    assert encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))[0].capture_timestamp_ns == 1_000
+
+    # Access unit 3 is two frames ahead across the wrap; one queued
+    # timestamp must be retired modulo 2**32.
+    assert encoder.encode(VideoFrame(image, 3_000, 3_000, 4, 2, "rgb24")) == []
+    wrapped = (0xFFFF_FF00 + 18_000) & 0xFFFF_FFFF
+    fake_socket.datagrams.append(RtpPacket(96, True, 9, wrapped, 1, b"\x65frame3").to_bytes())
+    packets = encoder.encode(VideoFrame(image, 4_000, 4_000, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets] == [3_000]
+
+    encoder.close()
+
+
+def test_encoder_fails_closed_on_backwards_rtp_timestamp(tmp_path: Path):
+    """An RTP timestamp that moves backwards by half the modulo space or more
+    indicates corrupt or out-of-order input and must fail closed."""
+    fake_socket = _FakeSocket()
+    encoder = _encoder_with_fake_socket(tmp_path, fake_socket)
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    assert encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24")) == []
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 18_000, 1, b"\x65frame1").to_bytes())
+    assert encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))[0].capture_timestamp_ns == 1_000
+
+    fake_socket.datagrams.append(RtpPacket(96, True, 9, 9_000, 1, b"\x65backwards").to_bytes())
+    with pytest.raises(VideoCodecError, match="moved backwards"):
+        encoder.encode(VideoFrame(image, 3_000, 3_000, 4, 2, "rgb24"))
+    assert encoder.state is CodecLifecycleState.FAILED
+
+    encoder.close()
+
+
+def test_encoder_discard_pending_output_prevents_cross_session_pairing(tmp_path: Path):
+    """Access units of a retired session still in flight through the DVPP
+    pipeline must not surface as the first output of the new session; session
+    rollover discards them and re-pairs the next output with the next input."""
+    fake_socket = _FakeSocket()
+    encoder = _encoder_with_fake_socket(tmp_path, fake_socket)
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    # Frame 111 of the retired session is submitted and its access unit is
+    # in flight through the hardware pipeline when the session rolls over.
+    assert encoder.encode(VideoFrame(image, 111, 111, 4, 2, "rgb24")) == []
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 9_000, 1, b"\x65retired").to_bytes())
+
+    encoder.discard_pending_output()
+
+    # The new session's first frame must pair with its own timestamp, never
+    # with the retired session's frame 111.
+    assert encoder.encode(VideoFrame(image, 222, 222, 4, 2, "rgb24")) == []
+    fake_socket.datagrams.append(RtpPacket(96, True, 9, 27_000, 1, b"\x65fresh").to_bytes())
+    packets = encoder.encode(VideoFrame(image, 333, 333, 4, 2, "rgb24"))
+    assert [packet.capture_timestamp_ns for packet in packets] == [222]
+
     encoder.close()

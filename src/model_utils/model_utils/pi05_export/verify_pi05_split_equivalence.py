@@ -375,8 +375,19 @@ def load_real_batches_raw(batch_path: str) -> list[dict[str, Any]]:
     """
     from model_utils.observation_batch import load_observation_batch
 
+    def convert_numeric(value: Any) -> Any:
+        if isinstance(value, str):
+            return value
+        array = np.asarray(value)
+        if np.issubdtype(array.dtype, np.bool_):
+            return array
+        return array.astype(np.float32) if np.issubdtype(array.dtype, np.number) else value
+
     LOGGER.info("Loading batches from %s …", batch_path)
-    samples = load_observation_batch(batch_path).samples
+    samples = [
+        {name: convert_numeric(value) for name, value in sample.items()}
+        for sample in load_observation_batch(batch_path).samples
+    ]
     LOGGER.info("Loaded %d raw batch(es)", len(samples))
     return samples
 
@@ -430,14 +441,14 @@ def preprocess_real_batches(
 
     from inference_service.lerobot_assets import TOKENIZER_REFERENCE_KEYS, resolve_local_semantic_reference
 
-    preprocessor_overrides = None
+    preprocessor_overrides = {"device_processor": {"device": str(device)}}
     tokenizer_path = resolve_local_semantic_reference(
         Path(policy_path).resolve(),
         "policy_preprocessor.json",
         TOKENIZER_REFERENCE_KEYS,
     )
     if tokenizer_path is not None:
-        preprocessor_overrides = {"tokenizer_processor": {"tokenizer_name": tokenizer_path}}
+        preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_path}
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=full_policy,
         pretrained_path=policy_path,
@@ -449,11 +460,15 @@ def preprocess_real_batches(
     for raw_batch in raw_batches:
         obs = copy(raw_batch)  # avoid mutating the original
         batch_task = obs.pop("task", "")
-        obs = prepare_observation_for_inference(obs, device, task or batch_task)
+        robot_type = obs.pop("robot_type", "")
+        ignored = [name for name, value in obs.items() if not isinstance(value, np.ndarray)]
+        if ignored:
+            LOGGER.debug("Ignoring non-array observation metadata: %s", ignored)
+        obs = {name: value for name, value in obs.items() if isinstance(value, np.ndarray)}
+        prepare_kwargs = {"robot_type": robot_type} if robot_type else {}
+        obs = prepare_observation_for_inference(obs, device, task or batch_task, **prepare_kwargs)
         obs = preprocessor(obs)
-        # The preprocessor's DeviceProcessorStep may move tensors to the
-        # device stored in the checkpoint config (e.g. cuda:0).  Ensure
-        # everything lands on the user-requested device.
+        # Ensure custom processor steps also leave tensors on the requested device.
         # Also strip non-tensor entries (e.g. "task", "robot_type" strings)
         # that were consumed by the preprocessor.
         clean: dict[str, Tensor] = {}

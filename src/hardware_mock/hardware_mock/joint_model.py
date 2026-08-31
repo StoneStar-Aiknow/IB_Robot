@@ -2,7 +2,7 @@
 
 Single source of truth for joint positions. Action subscribers write into it;
 JointState publishers read from it. Thread-safety is provided by the caller
-(rclpy single-threaded executor in practice).
+(all joint callbacks share one MutuallyExclusiveCallbackGroup in the mock node).
 """
 
 from __future__ import annotations

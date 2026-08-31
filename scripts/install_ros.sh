@@ -168,11 +168,8 @@ setup_os_variables() {
     elif [[ "$OS_ID" == "openeuler" ]]; then
         PACKAGE_MANAGER="dnf"
         ROS_DISTRO="humble"
-        # openEuler ROS packages are provided by two complementary repos
-        # during the repository migration window. install_openeuler_ros()
-        # writes the authoritative repo configuration.
-        OPENEULER_ROS_PRIMARY_REPO_URL="https://eur.openeuler.openatom.cn/results/openEuler_Embedded/IB_Robot-ROS_humble-release_1/openeuler-24.03_LTS-${ARCH}/"
-        OPENEULER_ROS_FALLBACK_REPO_URL="https://eulermaker.compass-ci.openeuler.openatom.cn/api/ems1/repositories/ROS-SIG-Multi-Version_ros-${ROS_DISTRO}_openEuler-24.03-LTS-TEST4/openEuler%3A24.03-LTS/${ARCH}/"
+        # install_openeuler_ros() writes the authoritative repo configuration.
+        OPENEULER_ROS_REPO_URL="https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-release3/openEuler%3A24.03-LTS/${ARCH}/"
     fi
 }
 
@@ -399,8 +396,7 @@ handle_installation_error() {
         log_error "For Ubuntu, ensure you can access: $ROS_REPO_URL"
     elif [[ "$OS_ID" == "openeuler" ]]; then
         log_error "For openEuler, check /etc/yum.repos.d/openEulerROS.repo:"
-        log_error "  - openEuler-Embedded-ROS-humble: $OPENEULER_ROS_PRIMARY_REPO_URL"
-        log_error "  - openEulerROS-humble: $OPENEULER_ROS_FALLBACK_REPO_URL"
+        log_error "  - openEuler-Embedded-ROS2-humble: $OPENEULER_ROS_REPO_URL"
     fi
 }
 

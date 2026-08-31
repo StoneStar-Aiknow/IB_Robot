@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import filecmp
 import importlib
 import json
 import shutil
+import stat
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -301,6 +303,7 @@ def package_deployment_artifact(
     deployment_name: str,
     role: str,
     force_copy: bool = False,
+    prefer_hardlink: bool = False,
 ) -> Path:
     """Copy a compiler output into one immutable artifact generation when needed."""
 
@@ -310,13 +313,37 @@ def package_deployment_artifact(
         raise ValueError(f"Deployment artifact is not a regular file: {source}")
     del force_copy  # Kept for CLI compatibility; normal publication always creates a generation.
     suffix = "".join(source.suffixes)
+    artifacts_root = root / "artifacts" / backend
+    manifest = _load_existing_manifest(root / "inference_manifest.json")
+    if manifest is not None:
+        deployment = manifest.deployments.get(deployment_name)
+        if isinstance(deployment, CompiledDeployment) and deployment.backend == backend:
+            current = deployment.artifacts.get(role)
+            if current is not None:
+                current_path = root.joinpath(*current.path.split("/"))
+                if _same_file(source, current_path):
+                    return current_path
+    if artifacts_root.is_dir():
+        for existing in artifacts_root.glob(f"*/generations/*/{role}{suffix}"):
+            if _same_file(source, existing):
+                return existing
     generation = str(uuid4())
     relative = normalize_bundle_path(f"artifacts/{backend}/{deployment_name}/generations/{generation}/{role}{suffix}")
     destination = root.joinpath(*relative.split("/"))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid4()}.tmp")
     try:
-        shutil.copy2(source, temporary)
+        if prefer_hardlink:
+            try:
+                temporary.hardlink_to(source)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
+                    raise
+                shutil.copy2(source, temporary)
+        else:
+            shutil.copy2(source, temporary)
+        if stat.S_IMODE(source.stat().st_mode) != stat.S_IMODE(temporary.stat().st_mode):
+            temporary.chmod(stat.S_IMODE(source.stat().st_mode))
         temporary.replace(destination)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -572,7 +599,11 @@ def _refresh_bundle_revision_unlocked(root: Path) -> InferenceManifest:
 
 
 def _same_file(source: Path, destination: Path) -> bool:
-    return destination.is_file() and filecmp.cmp(source, destination, shallow=False)
+    return (
+        destination.is_file()
+        and stat.S_IMODE(source.stat().st_mode) == stat.S_IMODE(destination.stat().st_mode)
+        and filecmp.cmp(source, destination, shallow=False)
+    )
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
