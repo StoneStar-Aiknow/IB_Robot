@@ -20,7 +20,7 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 - 作者侧创建/更新 PR 流程触发依赖/setup 门禁，且用户确认 PR 已准备交给 reviewer 正式检视，需要真实结果写入描述。
 - 当前任务是验证本地对 `scripts/setup/platforms/openeuler-embedded-24.03.sh`、`scripts/setup.sh`、`scripts/setup/lerobot_patches.sh` 或 dnf/rosdep 相关逻辑的修改。
 - 不要仅因为 PR review 触发本 skill。
-- 作者侧门禁调用本 skill 前必须询问 WIP/正式检视阶段；`[WIP]` PR 暂缓两个 Docker skill，直到用户将其转为正式检视。用户单独明确要求实际 Docker 验证时仍正常执行。
+- 作者侧门禁调用本 skill 前必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）询问 WIP/正式检视阶段，不得只在文本中询问或替用户默认选择；`[WIP]` PR 暂缓两个 Docker skill，直到用户将其转为正式检视。用户单独明确要求实际 Docker 验证时仍正常执行。
 
 ## Review Boundary
 
@@ -72,6 +72,13 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 > **关于 ROS 安装：** `:env` 镜像已预装 ROS 2 Humble，因此本流程验证 setup.sh 的
 > ROS 检测和复用路径。若要验证从零安装 ROS，必须另用不含 ROS 的基础镜像，不能把
 > 本流程的成功结果描述为完整验证了 `install_ros.sh`。
+>
+> **ROS 源切换预清理（强制）：** 当验证的变更切换了 ROS 包源（`install_ros.sh` /
+> 平台脚本修改了 openEuler ROS repo、EUR 源地址或 GPG key）时，`:env` 镜像中预装的
+> `ros-humble-*` 包来自旧源，会被 setup.sh 的 ROS 检测直接复用，新源的安装路径
+> 根本没有被执行。必须先按 Phase 4.5 在 chroot 中 `dnf remove 'ros-humble-*'`
+> 移除全部 ROS 包后再跑 setup.sh；属于环境预清理（只删除、不安装），不违反
+> Core Principle。
 
 所有 `docker exec` 命令需要通过 `chroot /root/openeuler_rootfs` 进入 arm64 环境。
 
@@ -157,6 +164,7 @@ corresponding phase section.
 | **3** | Inspect chroot environment (git, python3, dnf, ROS 2) | Environment confirmed |
 | **3.5** | Verify & repair base image integrity (RPM DB vs on-disk binary mismatch) — see [Base Image Integrity Pre-flight](#base-image-integrity-pre-flight) | Base packages consistent |
 | **4** | Prepare workspace — **choose one mode** (docker cp or git clone) | `SOURCE_MODE` |
+| **4.5** | ROS source-switch pre-clean (conditional) — remove all `ros-humble-*` in chroot when the change switches the ROS source | No ROS packages left |
 | **5** | Run `setup.sh --yes --no-sudo`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
 | **6** | Run `build.sh`, capture log | `/tmp/build.log` |
 | **7** | Collect ERROR lines, clean up container | Final report |
@@ -170,8 +178,12 @@ corresponding phase section.
 
 ## Variants
 
+- **ROS source switch**（变更切换 ROS repo / 镜像 / GPG key）:
+  **必须**先执行 Phase 4.5 的 ROS 源切换预清理（chroot 内移除全部 `ros-humble-*` 包），
+  再运行 setup.sh，见 [references/procedure.md](references/procedure.md)。
 - **Iterative local testing** (re-run without full Phase 0-3):
   use the [quick-run one-liner](references/quick-run.md) to copy changed scripts and re-run setup.
+  若两次运行之间 ROS 源发生变化，同样必须先重跑 Phase 4.5 预清理。
 
 ## Key Differences from Ubuntu Verification
 

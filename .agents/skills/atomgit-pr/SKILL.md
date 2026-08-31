@@ -47,7 +47,7 @@ upstream  git@atomgit.com:openEuler/IB_Robot.git (push)
 
 Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32) 的极高专业水准。描述文件应围绕本次提交真正的审阅重点组织内容；复杂流程或架构变化优先使用 **Mermaid 图表**，简单或纯文档类变更不要机械套用重型模板。
 
-当变更命中双平台 Docker 门禁时，在调用任何 Docker skill 前必须用交互问题让用户选择：
+当变更命中双平台 Docker 门禁时，在调用任何 Docker skill 前必须**通过交互式 ask-user 工具**（opencode 中的 `question` 工具）向用户提问 WIP 还是正式检视。禁止只在对话文本中随口询问、禁止在用户未答复时默认选择任一阶段：
 
 - **WIP 初步提交**：传 `--pr-stage wip`，标题自动变为 `[WIP] <title>`，暂缓双平台 Docker。
 - **正式检视**：传 `--pr-stage review`，移除 `[WIP]`，执行并校验当前 tree 的双平台 Docker。
@@ -83,7 +83,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
 
             **格式要求**：四个字段写成无序列表前缀的粗体行（`**Docker verification mode:** \`full\``），带 `- ` 前缀也会被接受并自动规范化；每个字段在全文中必须恰好出现一次。两平台细节（setup/build 耗时、ERROR 分类）写在块之后的普通小节里，不要并入这四行。
          *   创建或更新 PR 时，脚本会将该 tree SHA 与已推送分支或 AtomGit PR 最新 head commit 的 tree 比对。源码 tree 改变会阻止创建/更新并要求重跑；只修改 commit message、作者或 trailer 而 tree 不变时，已有结果仍然有效。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
-         *   在真正启动双平台 Docker 前，Agent 必须询问用户当前 PR 是临时 WIP 还是准备交给 reviewer 正式检视。命中门禁时，`pr_creation.py` / `pr_management.py` 要求显式传入 `--pr-stage wip|review`：`wip` 会把标题规范化为 `[WIP] <title>` 并暂缓 Docker；`review` 会移除 `[WIP]` 并恢复 tree-bound 门禁。WIP 只豁免双平台 Docker 证据，不豁免 DCO、AI 披露、其他测试或 CI。
+         *   在真正启动双平台 Docker 前，Agent 必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）询问用户当前 PR 是临时 WIP 还是准备交给 reviewer 正式检视，不得只在文本中询问或替用户默认选择。命中门禁时，`pr_creation.py` / `pr_management.py` 要求显式传入 `--pr-stage wip|review`：`wip` 会把标题规范化为 `[WIP] <title>` 并暂缓 Docker；`review` 会移除 `[WIP]` 并恢复 tree-bound 门禁。WIP 只豁免双平台 Docker 证据，不豁免 DCO、AI 披露、其他测试或 CI。
 4.  **大型 PR 复用自查（超过 2000 行强制）**:
     *   **触发条件**: PR 变更行数（additions + deletions，按 `git diff --stat` / API 统计）**超过 2000 行**时，描述必须包含一个结构化 `## Reuse Self-Check` 章节，由 `pr_creation.py` / `pr_management.py` 脚本强制校验，缺失或不完整会阻止创建/更新。`[WIP]` **不豁免**本门禁：它是纯文档要求，且复用问题越早声明、越能避免在错误方向上继续堆代码。
     *   **必须回答的四个问题**（字段标签固定为英文，正文默认中文，逐项给出具体答案；"无"也要显式写明，禁止留空）:
@@ -101,7 +101,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         **Reinvention justification:** 无（未重新发明现有流程）
         **Architecture conformance:** 对齐 inference_service 的模型 bundle + manifest 架构；配置一律来自 robot_config，未新增配置来源
         ```
-5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
+5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。人工审查确认（`--human-reviewed`）必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）向用户逐项确认 AI 生成/处理的内容已由人工审查，不得凭对话上下文默认用户已审查。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
 
 ```bash
 # 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
@@ -200,13 +200,13 @@ python3 pr_management.py --pr 123 --update-pr description.json \
 - `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
 - `--url`: AtomGit / GitCode 仓库或 PR 链接（可选，自动解析 `owner/repo`）
 - `--draft`: 创建草稿 PR（可选）
-- `--pr-stage`: `wip` 或 `review`；命中双平台门禁时必须在询问用户后指定。`wip` 自动添加 `[WIP]` 标题前缀并跳过 Docker，`review` 移除前缀并执行门禁
+- `--pr-stage`: `wip` 或 `review`；命中双平台门禁时必须先通过 ask-user 工具（opencode `question` 工具）询问用户后再指定。`wip` 自动添加 `[WIP]` 标题前缀并跳过 Docker，`review` 移除前缀并执行门禁
 - `--dry-run`: 仅显示计划，不创建
 - `--agent-tool`: coding agent 通过实际 `<tool> --version`（或等价命令）确认后的工具名和版本（必需，如 `OpenCode 1.17.20`）。脚本不维护工具白名单，只校验具体版本格式和安全字符；不得传裸工具 ID、`latest`、`unknown` 或臆填版本
 - `--ai-model`: AI 模型名称及版本（必需，不含 provider 前缀；多个模型用逗号分隔，必须覆盖 commit trailer 中的所有 AI 模型）
 - `--prompt-summary`: 核心提示词或核心意图摘要（必需）
 - `--third-party-materials`: 第三方材料、来源及许可证；没有时明确写“无”（必需）
-- `--human-reviewed`: 确认开发者已人工审查；非 dry-run 创建时必需
+- `--human-reviewed`: 确认开发者已人工审查（须先通过 ask-user 工具向用户确认）；非 dry-run 创建时必需
 
 **示例**:
 ```bash
@@ -234,9 +234,9 @@ python3 pr_creation.py --branch feat/new-feature --fork-owner BreezeWu \
 - `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
 - `--output-dir`: JSON 输出目录 (默认: ./tmp)
 - `--no-comments`: 在 `--fetch-info` 模式下跳过 PR 评论抓取
-- `--pr-stage`: `wip` 或 `review`；更新命中门禁的 PR 时必须显式指定
+- `--pr-stage`: `wip` 或 `review`；更新命中门禁的 PR 时必须先通过 ask-user 工具询问用户并显式指定
 - `--agent-tool` / `--ai-model` / `--prompt-summary` / `--third-party-materials`: 更新 PR 时必需的 openEuler AI 披露元数据；工具版本须由 coding agent 在调用前自行执行版本命令确认
-- `--human-reviewed`: 确认开发者已人工审查；非 dry-run 更新时必需
+- `--human-reviewed`: 确认开发者已人工审查（须先通过 ask-user 工具向用户确认）；非 dry-run 更新时必需
 - `--dry-run`: 预览生成的描述但不执行更新
 
 ## PR 描述格式
