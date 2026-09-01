@@ -102,6 +102,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         **Architecture conformance:** 对齐 inference_service 的模型 bundle + manifest 架构；配置一律来自 robot_config，未新增配置来源
         ```
 5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。人工审查确认（`--human-reviewed`）必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）向用户逐项确认 AI 生成/处理的内容已由人工审查，不得凭对话上下文默认用户已审查。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
+    *   **披露块由脚本统一生成，禁止手写**：PR 描述文件（`--description-file` / `description.json`）中**不得**包含任何手写的 AI 披露内容（如「AI 披露」「当前PR是否有AI参与」「希望检视人员了解」等章节）。`pr_creation.py` / `pr_management.py` 会根据 CLI 参数自动在描述**头部**生成/替换带机器标记（`<!-- openEuler-ai-disclosure:start/end -->`）的标准披露块，并在披露块与正文之间自动插入 `---` 分隔线。披露块固定放头部：reviewer 打开 PR 第一眼即可看到 AI 参与勾选框，符合 openEuler 披露可见性要求；放尾部容易被长正文淹没。手写披露会与自动块重复，脚本检测到标记块之外的披露内容会直接拒绝创建/更新。
 
 ```bash
 # 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
