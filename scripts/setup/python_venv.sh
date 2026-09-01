@@ -95,13 +95,26 @@ install_lerobot_editable() {
     # setup.py install_requires, and the C++ ftservo_sdk is built by
     # so101_hardware's CMake for the ros2_control node — neither should be
     # re-installed via pip here. See libs/lerobot/pyproject.toml.
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep]"
+    #
+    # The inference profile keeps diffusion/dataset (policy inference and
+    # video decoding for the streamed observation path) but drops kinematics,
+    # which only serves teleop.
+    local lerobot_extras="smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep"
+    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
+        lerobot_extras="smolvla,pi,diffusion,dataset,deepdiff-dep"
+    fi
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[${lerobot_extras}]"
 }
 
 install_graspgen_torch_abi() {
     # The checked-in pointnet2_ops wheel is built against this exact Torch ABI.
     # Keep CUDA hosts on their existing Torch installation so the source-build
     # path remains available, but make the no-nvcc path self-contained.
+    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
+        # The GraspGen pointnet2_ops ABI pin is a manipulation-stack concern;
+        # the inference profile keeps the Torch build selected by lerobot.
+        return 0
+    fi
     if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
         return 0
     fi
@@ -128,6 +141,15 @@ setup_python_venv() {
 
     local venv_path="${WORKSPACE}/venv"
     local lerobot_dir="${WORKSPACE}/libs/lerobot"
+
+    # Convenience flag for profile gating below: the inference profile skips
+    # every dependency group that is not required to load policy bundles and
+    # serve inference requests (hardware, teleop, perception, grasp, voice,
+    # sim, dev tooling).
+    local full_profile=true
+    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
+        full_profile=false
+    fi
 
     # 0. Python interpreter preflight
     local host_python_path host_python_version host_py_major host_py_minor
@@ -217,12 +239,17 @@ setup_python_venv() {
     run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/base.txt" --quiet
 
     # Install hardware dependencies
-    log_info "Installing hardware dependencies..."
-    run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/hardware.txt" --quiet
+    if [[ "${full_profile}" == true ]]; then
+        log_info "Installing hardware dependencies..."
+        run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/hardware.txt" --quiet
+    else
+        log_info "Skipping hardware dependencies (inference profile)."
+    fi
 
     # Install the optional built-in WebPhone dependency
-    log_info "Installing optional phone teleoperation dependencies..."
-    if [[ "${AUTO_YES}" == true ]]; then
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping WebPhone teleoperation dependency (inference profile)."
+    elif [[ "${AUTO_YES}" == true ]]; then
         log_info "Auto-yes mode: installing WebPhone dependency (websockets)..."
         run_cmd "${pip_install[@]}" websockets --quiet
         log_done "Phone teleoperation dependency installed (websockets)"
@@ -252,20 +279,34 @@ setup_python_venv() {
     fi
 
     # Install development and training tools
-    log_info "Installing dev-tools (tensorboard, rerun, gitlint, ruff, pre-commit)..."
-    run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/dev-tools.txt" --quiet
+    if [[ "${full_profile}" == true ]]; then
+        log_info "Installing dev-tools (tensorboard, rerun, gitlint, ruff, pre-commit)..."
+        run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/dev-tools.txt" --quiet
+    else
+        log_info "Skipping dev-tools (inference profile)."
+    fi
 
     # Install platform-specific dependencies (ONNX tooling, etc.)
     case "${SETUP_PLATFORM_ID}" in
         ubuntu-22.04)
-            run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
+            if [[ "${full_profile}" == true ]]; then
+                run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
+            else
+                # Inference profile: only the ONNX toolchain; skip mujoco (sim)
+                # and atomgit_sdk (collaboration CLI).
+                log_info "Installing inference ONNX tooling (inference profile)..."
+                run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/inference.txt" --quiet
+            fi
             ;;
         openeuler-embedded-24.03)
+            # Installed whole in both profiles: onnx/onnxruntime (ONNX policy
+            # path), torch_npu (Ascend NPU inference), and pygraphviz (required
+            # by verify_env on this platform) are all inference-relevant.
             run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/openeuler-24.03.txt" --quiet
             ;;
     esac
 
-    if [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
+    if [[ "${full_profile}" == true ]] && [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
         "${VENV_PYTHON}" -m pre_commit install
     fi
 
@@ -318,9 +359,13 @@ EOF
     # Install the ZipVoice frontend after creating the ROS ABI constraints.
     # Vocos itself is maintained in voice_tts_service.vocos_backend because
     # the PyPI package can replace the workspace Torch/torchaudio ABI.
-    log_info "Installing voice TTS frontend dependencies..."
-    run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
-        -r "${WORKSPACE}/requirements/voice-tts.txt" --quiet
+    if [[ "${full_profile}" == true ]]; then
+        log_info "Installing voice TTS frontend dependencies..."
+        run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/voice-tts.txt" --quiet
+    else
+        log_info "Skipping voice TTS frontend dependencies (inference profile)."
+    fi
 
     # Perception runtime dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2) are
     # part of the default install contract: perception_service and
@@ -328,31 +373,39 @@ EOF
     # RAM++ / GroundingDINO wheels ship in third_party/. Install them on every
     # platform that runs the local workspace build, including openEuler Embedded
     # (the Ascend OM path does not replace the Torch perception runtime).
+    # The inference profile skips them: edge-cloud inference verification uses
+    # the perception ROS mock instead of the real perception stack.
     local ram_wheel_root="${WORKSPACE}/third_party/wheels/recognize-anything/7cb804a"
     local ram_wheel="${ram_wheel_root}/ibrobot_ram-0.0.1+ibrobot.1-py3-none-any.whl"
     local gdino_wheel_root="${WORKSPACE}/third_party/wheels/groundingdino/313392a"
     local gdino_wheel="${gdino_wheel_root}/ibrobot_groundingdino-0.1.0+ibrobot.1-py3-none-any.whl"
-    log_info "Installing perception dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2)..."
-    run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
-        "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
-        -r "${WORKSPACE}/requirements/perception.txt" --quiet
-    if ! (cd "${ram_wheel_root}" && sha256sum --check SHA256SUMS); then
-        log_error "RAM++ wheel checksum verification failed."
-        exit 1
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping perception dependencies (inference profile)."
+    else
+        log_info "Installing perception dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2)..."
+        run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
+            "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/perception.txt" --quiet
+        if ! (cd "${ram_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "RAM++ wheel checksum verification failed."
+            exit 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${ram_wheel}" --quiet
+        if ! (cd "${gdino_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "GroundingDINO wheel checksum verification failed."
+            exit 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${gdino_wheel}" --quiet
     fi
-    run_cmd "${pip_install[@]}" --no-deps "${ram_wheel}" --quiet
-    if ! (cd "${gdino_wheel_root}" && sha256sum --check SHA256SUMS); then
-        log_error "GroundingDINO wheel checksum verification failed."
-        exit 1
-    fi
-    run_cmd "${pip_install[@]}" --no-deps "${gdino_wheel}" --quiet
 
     # FullSubNet speech enhancement model (audio_zen + model.py) as an audited
     # wheel. Pure-Python; the Torch backend loads Model from the installed
     # package instead of cloning the upstream source tree into models/.
     local fullsubnet_wheel_root="${WORKSPACE}/third_party/wheels/fullsubnet/e97448375"
     local fullsubnet_wheel="${fullsubnet_wheel_root}/ibrobot_fullsubnet-0.0.1+ibrobot.1-py3-none-any.whl"
-    if [[ -f "${fullsubnet_wheel_root}/SHA256SUMS" ]]; then
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping FullSubNet wheel (inference profile)."
+    elif [[ -f "${fullsubnet_wheel_root}/SHA256SUMS" ]]; then
         if ! (cd "${fullsubnet_wheel_root}" && sha256sum --check SHA256SUMS); then
             log_error "FullSubNet wheel checksum verification failed."
             exit 1
@@ -368,7 +421,9 @@ EOF
     # validated on Ubuntu only; the Ascend OM path does not cover Torch grasp.
     # On Ubuntu hosts without nvcc, install_graspgen_pip falls back to the
     # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
-    if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping grasp dependencies (inference profile)."
+    elif [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
     else
         log_info "Installing grasp dependencies (GraspGen)..."
@@ -404,7 +459,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
+    if [[ "${full_profile}" == true ]] && [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 
@@ -416,14 +471,19 @@ print("Grasp dependencies smoke test passed")
 PY
     fi
 
-    local commit_msg_hook
-    commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg 2>/dev/null || true)"
-    if [[ -f "${commit_msg_hook}" ]] && grep -qi "gitlint" "${commit_msg_hook}"; then
-        log_warn "gitlint commit-msg hook already exists at ${commit_msg_hook}; keeping it."
+    # gitlint ships in dev-tools.txt, which the inference profile skips.
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping gitlint commit-msg hook (inference profile)."
     else
-        log_info "Installing gitlint commit-msg hook..."
-        # gitlint is installed in the venv, which is currently activated
-        printf 'y\n' | gitlint install-hook || log_warn "Failed to install gitlint hook"
+        local commit_msg_hook
+        commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg 2>/dev/null || true)"
+        if [[ -f "${commit_msg_hook}" ]] && grep -qi "gitlint" "${commit_msg_hook}"; then
+            log_warn "gitlint commit-msg hook already exists at ${commit_msg_hook}; keeping it."
+        else
+            log_info "Installing gitlint commit-msg hook..."
+            # gitlint is installed in the venv, which is currently activated
+            printf 'y\n' | gitlint install-hook || log_warn "Failed to install gitlint hook"
+        fi
     fi
 
     # Venv summary: print the key facts users need to debug "wrong python /

@@ -9,6 +9,9 @@
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
 #   ./scripts/setup.sh --only-patch                  # Only apply LeRobot patches
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
+#   ./scripts/setup.sh --profile <name>              # Dependency scope: full (default) or
+#                                                    # inference (edge-cloud inference
+#                                                    # verification runtime only)
 #   ./scripts/setup.sh --help                        # Show help
 #
 # Auto-yes defaults:
@@ -48,6 +51,11 @@ SETUP_DISK_FREE_SUMMARY="unknown"
 SETUP_ROS_SUMMARY="unknown"
 SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
+# Dependency-scope profile: "full" (default, complete development workspace) or
+# "inference" (minimal runtime to run policy inference only, used for
+# edge-cloud collaborative inference verification hosts). Resolution order:
+# --profile CLI argument > IBR_SETUP_PROFILE env > "full".
+SETUP_PROFILE="${IBR_SETUP_PROFILE:-full}"
 
 SKIP_VERIFY=false
 ONLY_PATCH=${ONLY_PATCH:-false}
@@ -204,6 +212,15 @@ Options:
                          apply the managed LeRobot patch stack. Use
                          IBR_LEROBOT_FORCE_REBUILD=1 to rebuild from the
                          recorded upstream base.
+      --profile NAME     Dependency-scope profile (default: full; env:
+                         IBR_SETUP_PROFILE).
+                           full      complete development workspace
+                           inference minimal policy-inference runtime for
+                                      edge-cloud collaborative inference
+                                      verification: skips hardware, teleop,
+                                      perception, grasp, voice, sim, and
+                                      dev tooling; narrows rosdep and
+                                      submodules to the inference packages
       --platform ID      Override platform detection
       --lerobot-profiles CSV
                          Override lerobot patch profile selection
@@ -228,6 +245,14 @@ parse_args() {
 
             --skip-verify) SKIP_VERIFY=true ;;
             --only-patch) ONLY_PATCH=true ;;
+            --profile)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "--profile requires a profile name (full|inference)."
+                    exit 1
+                fi
+                SETUP_PROFILE="$1"
+                ;;
             --platform)
                 shift
                 if [[ $# -eq 0 ]]; then
@@ -258,6 +283,35 @@ parse_args() {
         esac
         shift
     done
+}
+
+validate_setup_profile() {
+    case "${SETUP_PROFILE}" in
+        full|inference) ;;
+        *)
+            log_error "Unknown setup profile: '${SETUP_PROFILE}' (expected 'full' or 'inference')."
+            exit 1
+            ;;
+    esac
+    # Exported so verify_env.sh (sourced later) and child processes follow the
+    # same dependency scope.
+    export SETUP_PROFILE
+}
+
+# Rosdep resolution scope per profile. The full profile resolves keys for every
+# workspace package. The inference profile limits rosdep to the packages
+# required to build and run inference_service, so bringup-only dependencies
+# (nav2, slam_toolbox, gz_ros2_control, tracing, cameras, LiDARs, MoveIt) are
+# not pulled onto edge-cloud inference verification hosts. robot_config is
+# intentionally excluded here: it must still be BUILT (it carries the SSOT
+# YAML), but its package.xml exec_depends describe full-robot bringup, not the
+# inference runtime; its Python-level needs are covered by the venv install.
+setup_profile_rosdep_paths() {
+    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+        echo "src/ibrobot_msgs src/tensormsg src/inference_manifest src/inference_service src/model_utils src/dataset_tools"
+    else
+        echo "src"
+    fi
 }
 
 system_package_installed() {
@@ -444,9 +498,15 @@ platform_install_rosdeps() {
         skip_args+=("--skip-keys=${key}")
     done
 
+    local rosdep_paths
+    read -ra rosdep_paths <<< "$(setup_profile_rosdep_paths)"
+    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+        log_info "Inference profile: rosdep scope limited to: ${rosdep_paths[*]}"
+    fi
+
     if ! run_with_live_output "Installing ROS dependencies..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdep_cmd}" install \
         "${rosdep_install_extra_args[@]}" \
-        --from-paths src \
+        --from-paths "${rosdep_paths[@]}" \
         --ignore-src \
         --rosdistro=humble \
         -y -r \
@@ -457,6 +517,17 @@ platform_install_rosdeps() {
         SYSTEM_DEPS_STATUS="rosdep-errors"
     fi
 
+    maybe_platform_post_install_rosdeps
+}
+
+# Tracing tools (lttng-tools, python3-lttngust, babeltrace2) are full-workspace
+# diagnostics installed unconditionally by the platform post-install hook; the
+# inference profile skips them together with verify_tracing.
+maybe_platform_post_install_rosdeps() {
+    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+        log_info "Skipping tracing post-install hook (inference profile)."
+        return 0
+    fi
     platform_post_install_rosdeps
 }
 
@@ -541,6 +612,7 @@ main() {
     trap 'on_setup_failure $? ${BASH_LINENO[0]}' ERR
     trap 'on_setup_interrupt' INT
     parse_args "$@"
+    validate_setup_profile
     check_foreign_env
 
     cd "${WORKSPACE}"
@@ -551,12 +623,19 @@ main() {
     set_stage "checking system dependencies"
     print_dependency_preview
     
-    log_info "Setting up workspace at ${WORKSPACE}"
+    log_info "Setting up workspace at ${WORKSPACE} (profile: ${SETUP_PROFILE})"
     
     # Update submodules
     set_stage "syncing submodules"
     update_submodules
-    ensure_ros_third_party_patch_stacks
+    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+        # LiDAR/ROS third-party patch stacks operate on submodules that stay
+        # uninitialized in the inference profile (see submodules.sh).
+        log_info "Skipping ROS third-party patch stacks (inference profile)."
+        log_skipped "ROS third-party patch stacks (inference profile)"
+    else
+        ensure_ros_third_party_patch_stacks
+    fi
 
     if [[ "${ONLY_PATCH}" != true ]]; then
         # Install dependencies
@@ -606,6 +685,9 @@ main() {
     done
     echo ""
     local completion_message="Setup complete! Run ./scripts/build.sh to build the workspace."
+    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+        completion_message="Setup complete (inference profile)! Build the inference subset with: ./scripts/build.sh --packages-up-to inference_service"
+    fi
     if [[ "${ONLY_PATCH}" == true ]]; then
         completion_message="LeRobot patch stack check complete."
     fi

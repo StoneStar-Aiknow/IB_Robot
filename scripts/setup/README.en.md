@@ -11,6 +11,29 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `lerobot_filter_series.py` | Reads `manifest.yaml` + host facts, prints the patch series that actually applies. |
 | `tests/test_lerobot_filter.sh` | Regression fixtures pinned to the canonical 3-platform matrix + tag-binding cases. |
 
+## Setup profiles (dependency-scope parameterization)
+
+`setup.sh` controls the dependency installation scope via `--profile <name>`
+(or the `IBR_SETUP_PROFILE` environment variable):
+
+| Profile | Purpose |
+| --- | --- |
+| `full` (default) | Complete development workspace: hardware, teleop, perception, grasp, voice, sim, and dev tooling. |
+| `inference` | Minimal policy-inference runtime for edge-cloud collaborative inference verification hosts. |
+
+Differences of `inference` vs. `full`:
+
+- **Submodules**: only `libs/lerobot` is initialized (LiDAR / bringup submodules and the ROS third-party patch stacks are skipped).
+- **rosdep**: scope narrowed to `ibrobot_msgs`, `tensormsg`, `inference_manifest`, `inference_service`, `model_utils`, `dataset_tools`; `robot_config` is still built (SSOT YAML) but excluded from rosdep resolution so nav2 / slam_toolbox / gz / camera / LiDAR bringup dependencies are not pulled in.
+- **Python venv**: skips `hardware.txt`, WebPhone, `dev-tools.txt`, voice-tts, perception (SAM2 / Grounding-DINO / RAM++ / SigLIP2 and the audited wheels), FullSubNet, GraspGen, and the pre-commit / gitlint hooks; Ubuntu installs only `requirements/inference.txt` (ONNX toolchain) while openEuler keeps the full `openeuler-24.03.txt` (it carries inference-required `onnx` / `torch_npu` / `pygraphviz`); the lerobot editable install drops the teleop-only `kinematics` extra.
+- **Verification**: tracing checks are skipped (lttng / tracetools are full-workspace diagnostics), and so is the Ubuntu tracing-tools post-install hook (`platform_post_install_rosdeps`).
+
+```bash
+# Edge-cloud collaborative inference verification host:
+./scripts/setup.sh --yes --profile inference
+./scripts/build.sh --packages-up-to inference_service
+```
+
 ## LeRobot patch dispatch
 
 `libs/lerobot` ships one patch series per supported upstream tag under
