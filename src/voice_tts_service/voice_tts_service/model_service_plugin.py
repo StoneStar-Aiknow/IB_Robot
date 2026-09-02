@@ -69,13 +69,17 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         if unknown:
             raise ValueError(f"unknown ZipVoice runtime options: {unknown}")
 
+        # Service limits belong to TTSServiceCore, not to the vendor model
+        # session. Keep the full options for the core but narrow the context
+        # passed to Ascend/Torch session builders to their own contract.
+        session_options = {name: options[name] for name in ("device_id", "prompt_profile") if name in options}
         runtime_profile = getattr(validated, "runtime_profile", None)
         if runtime_profile is None:
             role_profiles = getattr(validated, "role_runtime_profiles", {})
             runtime_profile = next(iter(role_profiles.values()), None)
         context = RuntimeContext(
             validated_manifest=validated,
-            runtime_options=options,
+            runtime_options=session_options,
             runtime_profile=runtime_profile,
         )
         self._session: ModelSession = registry_set.session_builder_registry.create(

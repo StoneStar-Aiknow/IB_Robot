@@ -23,6 +23,60 @@ def test_zipvoice_plugin_implements_the_shared_typed_service_contract():
     assert ZipVoiceSynthesizePlugin.service_type == "ibrobot_msgs/srv/SynthesizeSpeech"
 
 
+def test_zipvoice_plugin_keeps_service_limits_out_of_model_session_context(monkeypatch):
+    captured = {}
+
+    class FakeBuilderRegistry:
+        def create(self, context, **_kwargs):
+            captured["options"] = dict(context.runtime_options)
+            return SimpleNamespace(capabilities=SimpleNamespace(stateful=False, resettable=False))
+
+    class FakeRegistrySet:
+        session_builder_registry = FakeBuilderRegistry()
+        backend_registry = object()
+
+    class FakeHandle:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load(self, _context):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("voice_tts_service.model_service_plugin.ModelRuntimeHandle", FakeHandle)
+    monkeypatch.setattr(
+        "voice_tts_service.model_service_plugin.require_runtime_dependencies",
+        lambda *_args, **_kwargs: (FakeRegistrySet(), None),
+    )
+    validated = SimpleNamespace(
+        manifest=SimpleNamespace(
+            model=SimpleNamespace(interface="tensor_model", model_type="zipvoice", operation="synthesize")
+        ),
+        deployment=SimpleNamespace(artifacts={}),
+        bundle_root=None,
+        runtime_profile=None,
+        role_runtime_profiles={},
+    )
+
+    ZipVoiceSynthesizePlugin(
+        None,
+        validated,
+        {
+            "device_id": 0,
+            "prompt_profile": "default",
+            "max_request_chars": 100,
+            "max_prompt_audio_bytes": 1024,
+            "max_prompt_duration_sec": 3.0,
+        },
+        registry_set=FakeRegistrySet(),
+        providers=None,
+    )
+
+    assert captured["options"] == {"device_id": 0, "prompt_profile": "default"}
+
+
 def test_zipvoice_session_builder_is_registered_by_manifest_identity():
     from voice_tts_service.model_session_builders import build_zipvoice_session
 

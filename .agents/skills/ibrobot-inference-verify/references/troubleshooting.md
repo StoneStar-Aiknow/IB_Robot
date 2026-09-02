@@ -90,16 +90,21 @@ encoder layers to produce mismatched shapes.
 when the input tensor's dimension count equals the manifest-declared shape
 dimension count (via `unsqueeze(0)`).
 
-### SAM2 operation mismatch on board
+### Perception adapter identity mismatch on board
 
-**Symptom**: "plugin requires tensor_model/sam2/automatic, got
-tensor_model/sam2/prompt".
+**Symptom**: a grasp or semantic perception plugin reports that its required
+adapter identity does not match the bundle, for example
+`tensor_model/sam2/prompt` versus `tensor_model/sam2/automatic`.
 
-**Cause**: Board's `sam2_hiera_tiny_ascend` bundle has `operation: prompt`
-(box-prompt mode), but `SAM2GenerateMasksPlugin` expects `operation: automatic`.
+**Cause**: SAM2 box-prompt grasp segmentation and SAM2 automatic semantic
+mapping are different service contracts. Grounding-DINO grasp detection is
+also the raw `grounding_dino/detect` contract. Do not deploy these bundles under
+one shared path or overwrite one with another.
 
-**Fix**: Remove SAM2 from the board's `perception_services` list, or use a
-bundle with `operation: automatic` for the automatic mask generator.
+**Fix**: Use `models/sam2.1_hiera_tiny_prompt_ascend` for
+`SegmentDetectionsPlugin` and the official `sam2/automatic` bundle for
+`SAM2GenerateMasksPlugin`. Verify the selected bundle's manifest and
+`assets/adapter.json` before starting the model service.
 
 ### Board contract_mock crash with minimal YAML
 

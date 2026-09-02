@@ -322,7 +322,12 @@ ros2 run perception_service package_ascend_perception_bundles \
 
 `--models-root` 必须与 robot config 的 bundle 根目录一致。打包器从 `models/_work/` 中读取已经验证的候选，
 并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720_ascend/` 和
-`models/sam2_hiera_tiny_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
+`models/sam2.1_hiera_tiny_prompt_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
+
+SAM2 的 operation 是 v3 manifest 的 bundle 级模型身份，不是 deployment 属性：
+`models/sam2.1_hiera_tiny/` 只承载 `sam2/automatic`，可以在该语义下提供 CPU、CUDA 或 Ascend named
+deployment；`models/sam2.1_hiera_tiny_prompt_ascend/` 承载抓取所需的 `sam2/prompt`。两者可以复用同一
+模型族的权重来源，但输入、输出和预后处理契约不同，不能合并到同一个 manifest。
 
 Grounding-DINO bundle 记录并校验 12 个 OM、`encoder_tgt.npy`、bundle-local WordPiece vocab 和 D2D links；
 SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固定输入为
@@ -338,7 +343,7 @@ perception_services:
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/GroundingDetect
     - id: grasp_segmentation
-      bundle_path: models/sam2_hiera_tiny_ascend
+      bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/SegmentDetections
 ```

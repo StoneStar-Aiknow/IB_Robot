@@ -60,6 +60,14 @@ def test_packager_rejects_existing_legacy_bundles(tmp_path):
             package_bundle(tmp_path, spec)
 
 
+def test_sam2_ascend_bundle_name_identifies_box_prompt_contract():
+    spec = _specs()["sam2"]
+
+    assert spec.name == "sam2.1_hiera_tiny_prompt_ascend"
+    assert spec.operation == "prompt"
+    assert spec.name != "sam2.1_hiera_tiny"
+
+
 def test_siglip2_ascend_bundle_declares_loadable_embedding_identity(tmp_path, monkeypatch):
     spec = _specs()["siglip2"]
     _write_sources(tmp_path, spec)

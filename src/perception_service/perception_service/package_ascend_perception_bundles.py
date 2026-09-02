@@ -398,7 +398,10 @@ def _grounding_dino_deployment() -> DeploymentSpec:
 def _specs() -> dict[str, BundleSpec]:
     return {
         "sam2": BundleSpec(
-            name="sam2_hiera_tiny_ascend",
+            # This is the box-prompt deployment of the same SAM2.1 model
+            # family. Its bundle stays separate because v3 operation identity
+            # is bundle-level, not deployment-level.
+            name="sam2.1_hiera_tiny_prompt_ascend",
             model_type="sam2",
             operation="prompt",
             inputs=(

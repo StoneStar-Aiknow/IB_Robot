@@ -280,7 +280,7 @@ robot:
       - id: grasp_segmentation
         enabled: true
         required: true
-        bundle_path: models/sam2_hiera_tiny_ascend
+        bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
         service_type: ibrobot_msgs/srv/SegmentDetections
@@ -783,7 +783,7 @@ robot:
           - id: grasp_segmentation
             enabled: true
             required: true
-            bundle_path: models/sam2_hiera_tiny_ascend
+            bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
             deployment: ascend_310p
             adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
             service_type: ibrobot_msgs/srv/SegmentDetections

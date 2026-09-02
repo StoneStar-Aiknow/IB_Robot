@@ -88,14 +88,14 @@ PC 额外下载 Grounded-SAM2 Torch bundle：
 | PC | 检测与分割 | `models/grounded_sam2_swint_ogc/` | `torch_cuda` | `download_perception_models.sh --gdino-only` |
 | PC | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `torch_cuda` | 从已审核 checkpoint 生成 |
 | 310P | Grounding-DINO | `models/grounding_dino_swint_seq8_1280x720_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
-| 310P | SAM2 | `models/sam2_hiera_tiny_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | SAM2 prompt | `models/sam2.1_hiera_tiny_prompt_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
 | 310P | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
 
 310P 不在板端临时编译模型。将发布流程产出的三个完整 bundle 同步到 `models/` 后检查：
 
 ```bash
 test -f models/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
-test -f models/sam2_hiera_tiny_ascend/inference_manifest.json
+test -f models/sam2.1_hiera_tiny_prompt_ascend/inference_manifest.json
 test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
 ```
 

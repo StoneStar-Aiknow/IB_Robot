@@ -66,3 +66,42 @@ def test_voice_tts_builder_routes_shared_playback_format(monkeypatch, tmp_path):
     assert playback["audio_topic"] == "/shared/play"
     assert playback["playback_sample_rate"] == 24000
     assert playback["playback_channels"] == 1
+
+
+def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_path):
+    defaults = {
+        "enabled": False,
+        "bundle_path": "models/zipvoice",
+        "deployment": "",
+        "device_id": 0,
+        "prompt_profile": "default",
+        "max_request_chars": 4000,
+        "max_prompt_audio_bytes": 10 * 1024 * 1024,
+        "max_prompt_duration_sec": 30.0,
+        "segment_max_chars": 200,
+        "segment_pause_ms": 150,
+        "max_segments": 32,
+        "max_response_audio_bytes": 64 * 1024 * 1024,
+        "exit_on_init_failure": False,
+    }
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: defaults)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "zipvoice"),
+                "deployment": "ascend_310p",
+                "device_id": 0,
+                "max_request_chars": 100,
+                "max_prompt_audio_bytes": 1024,
+                "max_prompt_duration_sec": 3.0,
+                "exit_on_init_failure": False,
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+
+    runtime_options = _node_parameters(nodes[0])["runtime_options_json"]
+    assert '"max_request_chars": 100' in runtime_options
+    assert '"max_prompt_audio_bytes": 1024' in runtime_options

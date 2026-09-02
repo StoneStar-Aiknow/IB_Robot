@@ -120,6 +120,7 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert services["grasp_grounding"]["service_type"] == "ibrobot_msgs/srv/GroundingDetect"
     assert services["grasp_segmentation"]["deployment"] == "ascend_310p"
     assert services["grasp_segmentation"]["service_type"] == "ibrobot_msgs/srv/SegmentDetections"
+    assert services["grasp_segmentation"]["bundle_path"].endswith("sam2.1_hiera_tiny_prompt_ascend")
     assert grasp_execution["planner_node"]["inference_backend"] == "ascend_local"
     assert grasp_execution["planner_node"]["ascend_local_manifest_path"].endswith(
         "/models/grasp/graspgen_robotiq_2f_140"
