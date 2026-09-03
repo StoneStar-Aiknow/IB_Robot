@@ -1,0 +1,52 @@
+schema_version: 1
+name: imitate_human_motion
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Imitate a person's arm motion for a requested time using the selected arm side.
+  category: human_robot_interaction
+  when_to_use:
+  - imitate a person's arm movement
+  - follow a human motion for a limited time
+  do_not_use:
+  - condition: return the arm to a safe home pose
+    instead_use: recover_safe_pose
+  aliases_zh:
+  - 模仿动作
+  - 模仿人类动作
+  - 跟我做动作
+  aliases_en:
+  - imitate human motion
+  - follow my motion
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 25.0
+  requires_motion_params: true
+capability:
+  schema_version: 1
+  summary: Imitate a person's arm motion from the selected side for a requested duration.
+  domain: human_robot_interaction
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      arm_side:
+        type: string
+        enum:
+        - left
+        - right
+        - auto
+      imitation_duration_sec:
+        type: number
+        exclusiveMinimum: 0
+        unit: seconds
+    required:
+    - arm_side
+    - imitation_duration_sec
+  recovery_policy: ask_user
+implementations:
+  lekiwi_handeye_realsense_grasp_lidar: implementations/lekiwi_handeye_realsense_grasp_lidar.yaml

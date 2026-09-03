@@ -72,6 +72,7 @@ SO101 当前配置示例：
 | 社交与娱乐 | `dance_basic`、`wave_hello`、`nod_yes`、`shake_no`、`celebrate`、`greet_observe_raise`、`act_cute`、`happy_spin_upright` |
 | 抓取 | `pick_object`（仅抓取配置，要求显式传入 `target_name`） |
 | 抓取与放置 | `pick_object`、`place_in_container`（固定位置释放，要求显式传入 `target_name` 和 `container_name` 做验证） |
+| 人机交互 Mock | `imitate_human_motion`（要求 `arm_side` 和 `imitation_duration_sec`） |
 
 ## 3. 当前支持的 primitive
 
@@ -483,6 +484,11 @@ terminal record。
 返回 `TASK_TIMEOUT` 并 abort。Hermes/catalog goal 的 `supervised_direct` 固定为 `false` 且必须有非空
 delegated nonce；只有人工 bring-up client 可使用 `supervised_direct=true` 和空 nonce。详见
 `manipulation_execution` README。
+
+`imitate_human_motion` 使用同一套 delegated binding、executor identity、共享绝对 budget、取消和
+late-cleanup 规则，转发到内部 `/hri/imitate_human_motion` Action。内部 runtime 只通过
+`PrimitiveCommand` 执行 Mock 动画和 `move_to_named_pose(home)` 恢复；Agent 不直接调用该 Action，
+也不读取 warmup 状态。
 
 ### 8.6 导航 action dispatch
 

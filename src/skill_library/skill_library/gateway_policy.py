@@ -46,6 +46,8 @@ _REQUEST_PARAMETER_FIELDS = (
     "place_name",
     "motion_direction",
     "motion_distance",
+    "arm_side",
+    "imitation_duration_sec",
     "direction",
     "distance",
     "degree",
@@ -96,6 +98,8 @@ class GatewayRequest:
     place_name: Any = None
     motion_direction: Any = None
     motion_distance: Any = None
+    arm_side: Any = None
+    imitation_duration_sec: Any = None
     direction: Any = None
     distance: Any = None
     degree: Any = None
@@ -514,6 +518,10 @@ def build_request_identity(request: GatewayRequest, *, default_timeout_sec: floa
         place_name=request.place_name,
         motion_direction=request.motion_direction,
         motion_distance=request.motion_distance,
+        arm_side=request.arm_side,
+        imitation_duration_sec=(
+            None if request.imitation_duration_sec in (None, 0, 0.0) else request.imitation_duration_sec
+        ),
         direction=request.direction,
         distance=request.distance,
         degree=request.degree,
@@ -947,7 +955,9 @@ class GatewayPolicy:
             )
             definition = properties.get(schema_field_name)
             if definition is None:
-                if missing or (field_name in {"motion_distance", "distance", "degree"} and value == 0.0):
+                if missing or (
+                    field_name in {"motion_distance", "imitation_duration_sec", "distance", "degree"} and value == 0.0
+                ):
                     continue
                 raise ValueError(f"{field_name} is not accepted by skill '{skill_name}'")
             if not isinstance(definition, Mapping):

@@ -164,6 +164,7 @@ class EmbodiedConfig:
     relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
     perception: dict[str, Any] = field(default_factory=dict)
     visual_games: dict[str, Any] = field(default_factory=dict)
+    imitate_human_motion: dict[str, Any] = field(default_factory=dict)
     gripper_open_position: float = 1.0
     gripper_closed_position: float = 0.0
     skill_templates: dict[str, Any] = field(default_factory=dict)

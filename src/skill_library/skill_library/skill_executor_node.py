@@ -26,6 +26,9 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -46,6 +49,7 @@ from embodied_common.workflow_contracts import CanonicalWorkflowStep, compute_wo
 from ibrobot_msgs.action import (
     ExecuteNavigation,
     ExecuteTaskPlan,
+    ImitateHumanMotion,
     PickObject,
     PlaceObject,
     PrimitiveCommand,
@@ -64,9 +68,6 @@ from ibrobot_msgs.srv import (
     ValidateSkill,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -375,6 +376,8 @@ class SkillExecutorNode(Node):
         self.declare_parameter("task_executor_action_name", "/task_executor/execute_task_plan")
         self.declare_parameter("pick_action_name", "/manipulation/execute_pick")
         self.declare_parameter("place_action_name", "/manipulation/execute_place")
+        self.declare_parameter("imitate_human_motion_action_name", "/hri/imitate_human_motion")
+        self.declare_parameter("imitate_human_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -451,6 +454,10 @@ class SkillExecutorNode(Node):
         )
         self._pick_action_name = self.get_parameter("pick_action_name").get_parameter_value().string_value
         self._place_action_name = self.get_parameter("place_action_name").get_parameter_value().string_value
+        self._imitate_human_motion_action_name = (
+            self.get_parameter("imitate_human_motion_action_name").get_parameter_value().string_value
+        )
+        self._imitate_human_motion_enabled = self.get_parameter("imitate_human_motion_enabled").value
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
         self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
         self._semantic_map_target_service = self.get_parameter("semantic_map_target_service").value
@@ -661,6 +668,12 @@ class SkillExecutorNode(Node):
         self._motion_mode_client = self.create_client(SetBool, self._motion_mode_service, callback_group=callback_group)
         self._pick_client = ActionClient(self, PickObject, self._pick_action_name, callback_group=callback_group)
         self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
+        self._imitate_human_motion_client = ActionClient(
+            self,
+            ImitateHumanMotion,
+            self._imitate_human_motion_action_name,
+            callback_group=callback_group,
+        )
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
@@ -800,6 +813,10 @@ class SkillExecutorNode(Node):
         executor_configs = {
             "grasp_pipeline": (self._pick_action_name, self._grasp_execution),
             "placement_pipeline": (self._place_action_name, self._placement_execution),
+            "imitate_human_motion": (
+                getattr(self, "_imitate_human_motion_action_name", "/hri/imitate_human_motion"),
+                {"implementation": "mock_v1"},
+            ),
         }
         configured_executors = {
             str(template.get("executor", "")).strip()
@@ -810,6 +827,8 @@ class SkillExecutorNode(Node):
             configured_executors.add("grasp_pipeline")
         if self._placement_execution.get("enabled", False):
             configured_executors.add("placement_pipeline")
+        if getattr(self, "_imitate_human_motion_enabled", False):
+            configured_executors.add("imitate_human_motion")
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
@@ -1472,6 +1491,8 @@ class SkillExecutorNode(Node):
                         place_name=step.place_name,
                         motion_direction=step.motion_direction,
                         motion_distance=step.motion_distance,
+                        arm_side=step.arm_side,
+                        imitation_duration_sec=step.imitation_duration_sec,
                         direction=step.direction,
                         distance=step.distance,
                         degree=step.degree,
@@ -1808,6 +1829,8 @@ class SkillExecutorNode(Node):
                 task_id=f"status-{skill_name}",
                 skill_name=skill_name,
                 schema_version=self._skill_schema_version(bundle, skill_name),
+                arm_side="",
+                imitation_duration_sec=0.0,
             ),
             snapshot,
             validate_parameters=False,
@@ -2144,6 +2167,8 @@ class SkillExecutorNode(Node):
         container_name: str = "",
         motion_direction: str = "",
         motion_distance: float = 0.0,
+        arm_side: str = "",
+        imitation_duration_sec: float = 0.0,
         direction: str = "",
         distance: float = 0.0,
         degree: float = 0.0,
@@ -2166,6 +2191,8 @@ class SkillExecutorNode(Node):
         request.place_name = place_name
         request.motion_direction = motion_direction
         request.motion_distance = float(motion_distance)
+        request.arm_side = arm_side
+        request.imitation_duration_sec = float(imitation_duration_sec)
         request.direction = direction
         request.distance = float(distance)
         request.degree = float(degree)
@@ -3759,6 +3786,208 @@ class SkillExecutorNode(Node):
         goal_handle.succeed()
         return result
 
+    def _execute_imitate_human_motion_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+    ) -> SkillCommand.Result:
+        """Delegate one public request to the registered internal HRI Action."""
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+        if not self._imitate_human_motion_client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "IMITATE_HUMAN_MOTION_SERVER_UNAVAILABLE",
+                f"imitate human motion action server unavailable: {self._imitate_human_motion_action_name}",
+            )
+
+        completed_phases: list[str] = []
+
+        def feedback_cb(feedback_msg) -> None:
+            hri_feedback = feedback_msg.feedback
+            phase = str(hri_feedback.phase)
+            if phase and (not completed_phases or completed_phases[-1] != phase):
+                completed_phases.append(phase)
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = f"imitate_human_motion:{phase}:{hri_feedback.detail}"
+            goal_handle.publish_feedback(feedback)
+
+        hri_goal = ImitateHumanMotion.Goal()
+        hri_goal.dispatch_binding = copy_binding(goal.dispatch_binding)
+        hri_goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
+        bundle = self._active_runtime_bundle
+        executor = bundle.snapshot.delegated_executors.get("imitate_human_motion")
+        if executor is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+                "imitate human motion executor missing",
+            )
+        expected_executor = {
+            "name": executor.name,
+            "contract_version": executor.contract_version,
+            "endpoint_kind": executor.endpoint_kind,
+            "endpoint_name": executor.endpoint_name,
+            "configuration_digest": executor.configuration_digest,
+            "model_deployment_name": executor.model_deployment_name,
+            "model_fingerprint": executor.model_fingerprint,
+            "model_bundle_digest": executor.model_bundle_digest,
+        }
+        fill_delegated_executor_identity(hri_goal.expected_executor, expected_executor)
+        hri_goal.arm_side = goal.arm_side
+        hri_goal.imitation_duration_sec = goal.imitation_duration_sec
+        hri_goal.timeout_sec = timeout_sec
+
+        delegated_admission = self._active_skill_admission
+        delegated_nonce = hri_goal.dispatch_binding.dispatch_nonce
+        cleanup_key = self._register_delegated_dispatch(
+            delegated_nonce,
+            delegated_admission,
+            hri_goal.dispatch_binding,
+        )
+        delegated_terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(
+            lambda: self._confirm_delegated_terminal(delegated_admission, delegated_nonce, cleanup_key)
+        )
+        try:
+            send_future = self._imitate_human_motion_client.send_goal_async(
+                hri_goal,
+                feedback_callback=feedback_cb,
+            )
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, self._best_effort_cancel_goal)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "imitate human motion goal response timed out: delegated execution state is unknown",
+                )
+            hri_handle = send_future.result()
+            if hri_handle is None or not hri_handle.accepted:
+                delegated_terminal = True
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    "IMITATE_HUMAN_MOTION_GOAL_REJECTED",
+                    "imitate human motion executor rejected the goal",
+                )
+
+            result_future = hri_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested:
+                    if not self._cancel_goal(hri_handle, result_future, late_cleanup):
+                        return self._abort_skill(
+                            result,
+                            goal_handle,
+                            completed_phases,
+                            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                            "imitate human motion cancellation state is unknown",
+                        )
+                    delegated_terminal = True
+                    return self._cancel_skill(
+                        result,
+                        goal_handle,
+                        [f"imitate_human_motion:{phase}" for phase in completed_phases],
+                        goal.skill_name,
+                    )
+                if time.monotonic() >= deadline:
+                    if not self._cancel_goal(hri_handle, result_future, late_cleanup):
+                        return self._abort_skill(
+                            result,
+                            goal_handle,
+                            completed_phases,
+                            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                            "imitate human motion timeout cleanup state is unknown",
+                        )
+                    delegated_terminal = True
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        [f"imitate_human_motion:{phase}" for phase in completed_phases],
+                        "SKILL_TIMEOUT",
+                        "imitate human motion skill deadline exceeded",
+                    )
+                time.sleep(0.05)
+            if not result_future.done():
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "imitate human motion execution state is unknown",
+                )
+            delegated_terminal = True
+            late_cleanup.confirm()
+            action_result = result_future.result()
+            hri_result = action_result.result if action_result is not None else None
+        except Exception:
+            self.get_logger().error(f"delegated imitate human motion execution failed:\n{traceback.format_exc()}")
+            if (
+                "hri_handle" in locals()
+                and hri_handle is not None
+                and "result_future" in locals()
+                and self._cancel_goal(hri_handle, result_future, late_cleanup)
+            ):
+                delegated_terminal = True
+            return self._abort_skill(
+                result,
+                goal_handle,
+                completed_phases,
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                "delegated imitate human motion execution state is unknown",
+            )
+        finally:
+            if delegated_terminal:
+                late_cleanup.confirm()
+
+        result.executed_primitives = [f"imitate_human_motion:{phase}" for phase in completed_phases]
+        if hri_result is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                "MISSING_IMITATE_HUMAN_MOTION_RESULT",
+                "imitate human motion executor returned no result",
+            )
+        if not delegated_executor_identity_matches(hri_result.actual_executor, expected_executor):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+                "imitate human motion executor identity does not match the registry snapshot",
+            )
+        if goal_handle.is_cancel_requested and hri_result.error_code == "CANCELED":
+            return self._cancel_skill(result, goal_handle, result.executed_primitives, goal.skill_name)
+        if not hri_result.success:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                hri_result.error_code or "IMITATE_HUMAN_MOTION_FAILED",
+                hri_result.message,
+            )
+
+        result.success = True
+        result.error_code = ""
+        result.message = hri_result.message
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
+
     @staticmethod
     def _place_public_error(place_result) -> str:
         """Preserve the irreversible release state in the public error code."""
@@ -3996,6 +4225,8 @@ class SkillExecutorNode(Node):
             place_name=goal.place_name,
             motion_direction=goal.motion_direction,
             motion_distance=goal.motion_distance,
+            arm_side=getattr(goal, "arm_side", ""),
+            imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
             direction=goal.direction,
             distance=goal.distance,
             degree=goal.degree,
@@ -4119,6 +4350,8 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                arm_side=getattr(goal, "arm_side", ""),
+                imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -4273,6 +4506,8 @@ class SkillExecutorNode(Node):
                     place_name=goal.place_name,
                     motion_direction=goal.motion_direction,
                     motion_distance=goal.motion_distance,
+                    arm_side=getattr(goal, "arm_side", ""),
+                    imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
                     timeout_sec=goal.timeout_sec,
                     direction=goal.direction,
                     distance=goal.distance,
@@ -4341,6 +4576,8 @@ class SkillExecutorNode(Node):
                     place_name=goal.place_name,
                     motion_direction=goal.motion_direction,
                     motion_distance=goal.motion_distance,
+                    arm_side=getattr(goal, "arm_side", ""),
+                    imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
                     direction=goal.direction,
                     distance=goal.distance,
                     degree=goal.degree,
@@ -4392,6 +4629,8 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                arm_side=getattr(goal, "arm_side", ""),
+                imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -4498,6 +4737,8 @@ class SkillExecutorNode(Node):
                 container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
+                arm_side=getattr(goal, "arm_side", ""),
+                imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -4529,6 +4770,12 @@ class SkillExecutorNode(Node):
             )
         if str(template.get("executor", "")).strip() == "placement_pipeline":
             return self._execute_place_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == "imitate_human_motion":
+            return self._execute_imitate_human_motion_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,

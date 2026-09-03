@@ -39,6 +39,8 @@ CAPABILITY_PARAMETER_NAMES_V1 = frozenset(
         "place_name",
         "motion_direction",
         "motion_distance",
+        "arm_side",
+        "imitation_duration_sec",
     }
 )
 CAPABILITY_PARAMETER_NAMES = frozenset(
@@ -760,6 +762,7 @@ def _validate_parameter_schema(
             continue
         positive_numeric_units = {
             "motion_distance": {"meters", "degrees"},
+            "imitation_duration_sec": {"seconds"},
             "distance": {"meters"},
             "degree": {"degrees"},
             "stand_off_distance_m": {"meters"},
@@ -838,6 +841,16 @@ def _validate_parameter_schema(
                     diagnostics,
                     "SKILL_SCHEMA_INVALID",
                     "direction enum is invalid",
+                    source_relative_path=path,
+                    field_path=f"{field_path}.properties.{name}",
+                )
+            if name == "arm_side" and any(
+                item not in {"left", "right", "auto"} for item in property_schema.get("enum", [])
+            ):
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    "arm_side enum is invalid",
                     source_relative_path=path,
                     field_path=f"{field_path}.properties.{name}",
                 )

@@ -28,7 +28,9 @@ below); it does not enable any manipulation primitive.
 
 Both hand-eye profiles expose `pick_object` and `place_in_container` through
 the Gateway. 310P binds grasping to the `ascend_310p` manifest deployment;
-the PC profile binds it to the `torch_cuda` manifest deployment.
+the PC profile binds it to the `torch_cuda` manifest deployment. The unified
+`lekiwi_handeye_realsense_grasp_lidar` profile additionally exposes
+`imitate_human_motion` through its launch-managed delegated executor.
 
 ## Source Modes
 

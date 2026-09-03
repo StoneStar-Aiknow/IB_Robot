@@ -122,6 +122,8 @@ def workflow_step(
     place_name: str = "",
     motion_direction: str = "",
     motion_distance: float = 0.0,
+    arm_side: str = "",
+    imitation_duration_sec: float = 0.0,
     timeout_sec: float = 0.0,
     direction: str = "",
     distance: float = 0.0,
@@ -138,6 +140,8 @@ def workflow_step(
     step.place_name = place_name
     step.motion_direction = motion_direction
     step.motion_distance = float(motion_distance)
+    step.arm_side = str(arm_side)
+    step.imitation_duration_sec = float(imitation_duration_sec)
     step.timeout_sec = float(timeout_sec)
     step.direction = direction
     step.distance = float(distance)

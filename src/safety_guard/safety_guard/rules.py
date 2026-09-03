@@ -126,6 +126,8 @@ def validate_skill_request(
     arm_joint_names: list[str] | None = None,
     joint_limits: dict[str, Any] | None = None,
     container_name: str = "",
+    arm_side: str = "",
+    imitation_duration_sec: float = 0.0,
     direction: str = "",
     distance: float = 0.0,
     degree: float = 0.0,
@@ -167,6 +169,17 @@ def validate_skill_request(
             return False, "target_name is required"
         if "container_name" in required_args and not container_name.strip():
             return False, "container_name is required"
+        normalized_arm_side = str(arm_side).strip().lower()
+        if "arm_side" in required_args:
+            if normalized_arm_side not in {"left", "right", "auto"}:
+                return False, "arm_side must be left, right, or auto"
+        elif normalized_arm_side:
+            return False, f"arm_side is not accepted by {skill_name}"
+        if "imitation_duration_sec" in required_args:
+            if not _is_finite_number(imitation_duration_sec) or float(imitation_duration_sec) <= 0.0:
+                return False, "imitation_duration_sec must be a positive finite number"
+        elif imitation_duration_sec:
+            return False, f"imitation_duration_sec is not accepted by {skill_name}"
         if container_name and "container_name" not in required_args:
             return False, f"container_name is not accepted by {skill_name}"
         if place_name:
@@ -174,6 +187,9 @@ def validate_skill_request(
         if motion_direction or motion_distance:
             return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""
+
+    if arm_side or imitation_duration_sec:
+        return False, f"HRI parameters are not accepted by {skill_name}"
 
     primitive_sequence = template.get("primitive_sequence", [])
     if not isinstance(primitive_sequence, list) or not primitive_sequence:

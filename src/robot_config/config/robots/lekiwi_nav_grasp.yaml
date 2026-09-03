@@ -1062,6 +1062,10 @@ robot:
     primitive_action_name: /embodied/execute_primitive
     validate_skill_service: /embodied/validate_skill
     validate_primitive_service: /embodied/validate_primitive
+    imitate_human_motion:
+      enabled: true
+      action_name: /hri/imitate_human_motion
+      startup_warmup: true
     default_target_name: ""
     default_place_name: home
     timeouts:

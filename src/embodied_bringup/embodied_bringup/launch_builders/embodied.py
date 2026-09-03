@@ -92,6 +92,9 @@ def generate_embodied_nodes(
     )
 
     execution = embodied_config.get("execution", {})
+    hri_runtime = embodied_config.get("imitate_human_motion", {})
+    if not isinstance(hri_runtime, dict):
+        raise ValueError("embodied.imitate_human_motion must be a mapping")
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
     if entry_mode != "hermes":
         raise ValueError("embodied.entry_mode must be hermes")
@@ -209,6 +212,8 @@ def generate_embodied_nodes(
         "grasp_execution_json": json.dumps(grasp_execution),
         "place_action_name": placement_execution.get("action_name", "/manipulation/execute_place"),
         "placement_execution_json": json.dumps(placement_execution),
+        "imitate_human_motion_action_name": hri_runtime.get("action_name", "/hri/imitate_human_motion"),
+        "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
         "move_configuration_service": execution.get(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
@@ -377,6 +382,28 @@ def generate_embodied_nodes(
             ],
         ),
     ]
+    if hri_runtime.get("enabled", False):
+        nodes.append(
+            Node(
+                package="manipulation_execution",
+                executable="imitate_human_motion_executor_node",
+                name="imitate_human_motion_executor_node",
+                output="screen",
+                parameters=[
+                    {
+                        "action_name": common_params["imitate_human_motion_action_name"],
+                        "primitive_action_name": common_params["primitive_action_name"],
+                        "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                        "startup_warmup": hri_runtime.get("startup_warmup", True),
+                        "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
+                        "reset_positions_json": json.dumps(
+                            robot_config.get("ros2_control", {}).get("reset_positions", {})
+                        ),
+                        "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
+                    }
+                ],
+            )
+        )
     if include_visual_games:
         nodes.extend(visual_nodes)
     elif include_perception and perception_node is not None:

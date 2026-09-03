@@ -314,6 +314,8 @@ class SafetyGuardNode(Node):
                 robot_context.get("arm_joint_names", []),
                 robot_context.get("joint_limits", {}),
                 container_name=request.container_name,
+                arm_side=request.arm_side,
+                imitation_duration_sec=request.imitation_duration_sec,
                 direction=request.direction,
                 distance=request.distance,
                 degree=request.degree,

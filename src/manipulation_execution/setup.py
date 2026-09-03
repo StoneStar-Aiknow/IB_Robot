@@ -21,6 +21,7 @@ setup(
             "pick_action_client = manipulation_execution.pick_action_client:main",
             "pick_executor_node = manipulation_execution.pick_executor_node:main",
             "place_executor_node = manipulation_execution.placement_executor_node:main",
+            "imitate_human_motion_executor_node = manipulation_execution.imitate_human_motion_executor_node:main",
             "placement_replay = manipulation_execution.placement_replay:main",
         ],
     },

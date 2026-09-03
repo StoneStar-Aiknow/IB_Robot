@@ -54,13 +54,21 @@ _VALID_MOTION_SCOPES = {"base", "shoulder", "elbow", "wrist", "gripper", "arm"}
 _VALID_INTENSITIES = {"subtle", "moderate", "large"}
 _SUPPORTED_CONTROL_MODES = {"teleop", "model_inference", "moveit_planning"}
 _VALID_RECOVERY_POLICIES = {"never_retry", "ask_user", "recover_safe_pose"}
-_PUBLIC_REQUEST_FIELDS = {"target_name", "place_name", "motion_direction", "motion_distance"}
-_STRING_REQUEST_FIELDS = {"target_name", "place_name", "motion_direction"}
+_PUBLIC_REQUEST_FIELDS = {
+    "target_name",
+    "place_name",
+    "motion_direction",
+    "motion_distance",
+    "arm_side",
+    "imitation_duration_sec",
+}
+_STRING_REQUEST_FIELDS = {"target_name", "place_name", "motion_direction", "arm_side"}
 _VALID_MOTION_DIRECTIONS = {"forward", "backward", "left", "right", "up", "down"}
 _PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "required"}
 _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
+_VALID_DURATION_UNITS = {"seconds"}
 _NAV_STAGES = frozenset({"mapping", "navigation"})
 _EXTENDED_NAV_STAGES = frozenset({"grasp", "mapping", "navigation"})
 _HYBRID_NAV_STAGES = frozenset({"grasp", "mapping", "navigation", "hybrid"})
@@ -1011,15 +1019,20 @@ def _validate_capability_parameter_property(
             unknown_directions = sorted(set(enum) - _VALID_MOTION_DIRECTIONS)
             if unknown_directions:
                 errors.append(f"{prefix}.enum contains unsupported direction(s): {', '.join(unknown_directions)}")
+        if property_name == "arm_side" and enum is not None:
+            unknown_sides = sorted(set(enum) - {"left", "right", "auto"})
+            if unknown_sides:
+                errors.append(f"{prefix}.enum contains unsupported arm side(s): {', '.join(unknown_sides)}")
         return
 
-    if property_name == "motion_distance":
+    if property_name in {"motion_distance", "imitation_duration_sec"}:
         exclusive_minimum = definition.get("exclusiveMinimum")
         if not _is_finite_number(exclusive_minimum) or float(exclusive_minimum) != 0.0:
             errors.append(f"{prefix}.exclusiveMinimum must equal 0")
         unit = definition.get("unit")
-        if not isinstance(unit, str) or unit not in _VALID_DISTANCE_UNITS:
-            errors.append(f"{prefix}.unit must be one of {sorted(_VALID_DISTANCE_UNITS)}")
+        valid_units = _VALID_DURATION_UNITS if property_name == "imitation_duration_sec" else _VALID_DISTANCE_UNITS
+        if not isinstance(unit, str) or unit not in valid_units:
+            errors.append(f"{prefix}.unit must be one of {sorted(valid_units)}")
 
 
 def _validate_capability_parameters(parameters: dict[str, Any], prefix: str, errors: list[str]) -> None:
@@ -1867,6 +1880,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         relative_motion_direction_mapping=direction_mapping,
         perception=perception,
         visual_games=data.get("visual_games", {}),
+        imitate_human_motion=data.get("imitate_human_motion", {}),
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         skill_templates=data.get("skill_templates", {}),
