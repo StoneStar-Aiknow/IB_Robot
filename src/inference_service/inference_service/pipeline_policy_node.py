@@ -1076,6 +1076,10 @@ class PipelinePolicyNode(Node):
         self._last_inference_time = time.time()
         self._inference_count += 1
         self._last_error = ""
+        self.get_logger().info(
+            f"Inference succeeded: request={request_id}, mode={self._config.execution_mode}, "
+            f"chunk={chunk_size}, latency={total_latency_ms:.1f}ms, backend={backend_latency_ms:.1f}ms"
+        )
         return response
 
     def _reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
@@ -1769,6 +1773,10 @@ class PipelinePolicyNode(Node):
             self._last_inference_time = time.time()
             self._inference_count += 1
             self._last_error = ""
+            self.get_logger().info(
+                f"Inference succeeded: request={goal.request_id}, mode=scheduled, "
+                f"chunk={chunk_size}, latency={total_latency_ms:.1f}ms, backend={backend_latency_ms:.1f}ms"
+            )
             goal_handle.succeed()
         except Exception as exc:
             self._last_error = str(exc)
