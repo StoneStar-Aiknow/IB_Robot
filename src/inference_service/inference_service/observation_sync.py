@@ -39,7 +39,16 @@ class ObservationSynchronizationError(RuntimeError):
                 for issue in issues
             ]
         }
-        summary = ", ".join(f"{issue.stream_id} ({issue.observation_key}): {issue.reason}" for issue in issues)
+        summary = ", ".join(
+            f"{issue.stream_id} ({issue.observation_key}): {issue.reason}"
+            + (
+                f" ({issue.details['selected_timestamp_ns'] / 1_000_000:.3f}ms, "
+                f"skew={issue.details['skew_ns'] / 1_000_000:.3f}ms)"
+                if issue.reason == "skewed"
+                else ""
+            )
+            for issue in issues
+        )
         super().__init__(f"streamed observations are not ready: {summary}")
 
 
@@ -155,6 +164,104 @@ def select_synchronized_streams(
     """Select all required streams against one target or fail as one operation."""
     if max_inter_camera_skew_ns < 0:
         raise ValueError("max_inter_camera_skew_ns cannot be negative")
+    selected, issues = _select_stream_entries(streams, target_timestamp_ns, now_ns=now_ns)
+    if issues:
+        raise ObservationSynchronizationError(issues)
+    timestamps = [item.capture_timestamp_ns for item in selected.values()]
+    if not timestamps or max(timestamps) - min(timestamps) <= max_inter_camera_skew_ns:
+        return selected
+
+    aligned = _find_latest_aligned_selection(
+        streams,
+        target_timestamp_ns,
+        now_ns=now_ns,
+        max_inter_camera_skew_ns=max_inter_camera_skew_ns,
+    )
+    if aligned is not None:
+        return aligned
+
+    minimum_timestamp_ns = min(timestamps)
+    maximum_timestamp_ns = max(timestamps)
+    skew_ns = maximum_timestamp_ns - minimum_timestamp_ns
+    issues = [
+        _stream_issue(
+            streams[key],
+            "skewed",
+            selected_timestamp_ns=item.capture_timestamp_ns,
+            minimum_timestamp_ns=minimum_timestamp_ns,
+            maximum_timestamp_ns=maximum_timestamp_ns,
+            skew_ns=skew_ns,
+            max_inter_camera_skew_ns=max_inter_camera_skew_ns,
+        )
+        for key, item in selected.items()
+    ]
+    raise ObservationSynchronizationError(issues)
+
+
+def _find_latest_aligned_selection(
+    streams: Mapping[str, StreamSelection],
+    target_timestamp_ns: int,
+    *,
+    now_ns: int,
+    max_inter_camera_skew_ns: int,
+) -> dict[str, SelectedStreamValue] | None:
+    """Find the newest real timestamp combination within the skew bound.
+
+    Do not use the normal ``hold`` lookup for this search: hold can return an
+    older sample for one stream and a newer sample for another, which recreates
+    the very cross-camera skew this fallback is meant to avoid.
+    """
+    histories = {
+        key: tuple(entry for entry in stream.buffer.entries() if entry[0] <= target_timestamp_ns)
+        for key, stream in streams.items()
+    }
+    if any(not entries for entries in histories.values()):
+        return None
+    best: tuple[int, int, dict[str, SelectedStreamValue]] | None = None
+    for entries in histories.values():
+        for candidate_timestamp_ns, _receive_timestamp_ns, _value in entries:
+            chosen: dict[str, SelectedStreamValue] = {}
+            for observation_key, stream in streams.items():
+                entry = _nearest_entry(stream.buffer.entries(), candidate_timestamp_ns)
+                if entry is None:
+                    break
+                capture_timestamp_ns, receive_timestamp_ns, value = entry
+                chosen[observation_key] = SelectedStreamValue(
+                    observation_key=observation_key,
+                    stream_id=stream.stream_id,
+                    capture_timestamp_ns=capture_timestamp_ns,
+                    receive_timestamp_ns=receive_timestamp_ns,
+                    value=value,
+                )
+            if len(chosen) != len(streams):
+                continue
+            timestamps = [item.capture_timestamp_ns for item in chosen.values()]
+            skew_ns = max(timestamps) - min(timestamps)
+            if skew_ns > max_inter_camera_skew_ns:
+                continue
+            newest_ns = min(timestamps)
+            candidate = (newest_ns, -skew_ns, chosen)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    return None if best is None else best[2]
+
+
+def _nearest_entry(
+    entries: tuple[tuple[int, int, object], ...], target_timestamp_ns: int
+) -> tuple[int, int, object] | None:
+    return min(
+        (entry for entry in entries if abs(entry[0] - target_timestamp_ns) <= 50_000_000),
+        key=lambda entry: (abs(entry[0] - target_timestamp_ns), -entry[0]),
+        default=None,
+    )
+
+
+def _select_stream_entries(
+    streams: Mapping[str, StreamSelection],
+    target_timestamp_ns: int,
+    *,
+    now_ns: int,
+) -> tuple[dict[str, SelectedStreamValue], list[SynchronizationIssue]]:
     selected: dict[str, SelectedStreamValue] = {}
     issues: list[SynchronizationIssue] = []
     for observation_key, stream in streams.items():
@@ -187,24 +294,7 @@ def select_synchronized_streams(
             receive_timestamp_ns=receive_timestamp_ns,
             value=value,
         )
-    if issues:
-        raise ObservationSynchronizationError(issues)
-
-    timestamps = [item.capture_timestamp_ns for item in selected.values()]
-    if timestamps and max(timestamps) - min(timestamps) > max_inter_camera_skew_ns:
-        issues = [
-            _stream_issue(
-                streams[key],
-                "skewed",
-                selected_timestamp_ns=item.capture_timestamp_ns,
-                minimum_timestamp_ns=min(timestamps),
-                maximum_timestamp_ns=max(timestamps),
-                max_inter_camera_skew_ns=max_inter_camera_skew_ns,
-            )
-            for key, item in selected.items()
-        ]
-        raise ObservationSynchronizationError(issues)
-    return selected
+    return selected, issues
 
 
 def _stream_issue(stream: StreamSelection, reason: str, **details: object) -> SynchronizationIssue:

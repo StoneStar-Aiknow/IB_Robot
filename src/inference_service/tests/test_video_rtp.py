@@ -297,6 +297,28 @@ def test_receiver_preserves_capture_timestamp_from_delayed_decoder_output():
     receiver.close()
 
 
+def test_delayed_decoder_output_is_fresh_from_decode_availability():
+    datagrams, encoder, sender = _encoded_stream(frame_count=2, gop_frames=1)
+    decode_available_ns = 2_000_700_000
+    receiver, buffer = _receiver(decoder=_OneFrameDelayedDecoder(), clock=lambda: decode_available_ns)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    decoded = _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert len(decoded) == 1
+    assert decoded[0].capture_timestamp_ns == 1_000_000_000
+    assert decoded[0].receive_timestamp_ns == decode_available_ns
+    entry, issue = buffer.select_entry(1_000_000_000, now_ns=decode_available_ns + 400_000_000)
+    assert issue is None
+    assert entry is not None
+    assert entry[0] == 1_000_000_000
+    assert entry[1] == decode_available_ns
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
 def test_late_join_waits_for_repeated_headers_and_next_idr():
     datagrams, encoder, sender = _encoded_stream(frame_count=5, gop_frames=2)
     receiver, buffer = _receiver()
@@ -535,7 +557,12 @@ def _sender(
 
 
 def _receiver(
-    *, packet_queue_capacity: int = 64, recorder=None, decode: bool = True, decoder: VideoDecoder | None = None
+    *,
+    packet_queue_capacity: int = 64,
+    recorder=None,
+    decode: bool = True,
+    decoder: VideoDecoder | None = None,
+    clock=None,
 ) -> tuple[H264RtpReceiver, StreamBuffer]:
     buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000, retention_ns=2_000_000_000)
     mapper = RtpTimestampMapper(
@@ -555,6 +582,7 @@ def _receiver(
             packet_queue_capacity=packet_queue_capacity,
             recorder=recorder,
             decode=decode,
+            clock=clock,
         ),
         buffer,
     )

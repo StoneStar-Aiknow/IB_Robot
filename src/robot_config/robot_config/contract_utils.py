@@ -522,6 +522,11 @@ class StreamBuffer:
         with self._lock:
             return self.history[0] if self.history else None
 
+    def entries(self) -> tuple[tuple[int, int, Any], ...]:
+        """Return a stable snapshot of the timestamped history."""
+        with self._lock:
+            return tuple(self.history)
+
     @staticmethod
     def _stale_issue(
         constraint: str,
