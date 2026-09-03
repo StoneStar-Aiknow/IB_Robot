@@ -239,6 +239,15 @@ class PureInferenceNode(Node):
         stamp = self.get_clock().now().to_msg()
         for status in self._stream_manager.statuses():
             self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+        for observation_key, metrics in self._stream_manager.decoder_diagnostics():
+            self.get_logger().info(
+                f"Decoder runtime: observation={observation_key}, "
+                f"input_frames={metrics.input_frames}, output_frames={metrics.output_frames}, "
+                f"input_fps={metrics.input_frame_rate_hz:.2f}, output_fps={metrics.output_frame_rate_hz:.2f}, "
+                f"backlog={metrics.decoder_backlog_depth}, output_age_ms={metrics.decoder_output_age_ns / 1e6:.1f}, "
+                f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}",
+                throttle_duration_sec=2.0,
+            )
 
     def _request_callback(self, message: DistributedInferenceRequest) -> None:
         request = None

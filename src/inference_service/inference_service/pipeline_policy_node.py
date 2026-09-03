@@ -1998,6 +1998,12 @@ class PipelinePolicyNode(Node):
                 self._video_descriptor_pub.publish(video_descriptor_to_message(descriptor, stamp=stamp))
             for status in manager.statuses():
                 self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+            diagnostics = manager.sender_diagnostics()
+            if diagnostics:
+                self.get_logger().info(
+                    "Video sender runtime: " + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
+                    throttle_duration_sec=2.0,
+                )
         except Exception as exc:
             self._last_error = f"failed to publish video stream control status: {exc}"
             self.get_logger().error(self._last_error, throttle_duration_sec=1.0)

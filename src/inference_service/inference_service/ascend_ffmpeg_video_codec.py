@@ -338,10 +338,14 @@ class _StdinWriter:
 
 
 class _FixedFrameReader:
-    def __init__(self, pipe: Any, frame_bytes: int) -> None:
+    def __init__(self, pipe: Any, frame_bytes: int, max_frames: int = 3) -> None:
+        if max_frames <= 0:
+            raise ValueError("max_frames must be positive")
         self._pipe = pipe
         self._frame_bytes = frame_bytes
+        self._max_frames = max_frames
         self._frames: deque[bytes] = deque()
+        self._dropped_frames = 0
         self._buffer = bytearray()
         self._error: Exception | None = None
         self._eof = False
@@ -371,6 +375,17 @@ class _FixedFrameReader:
             self._frames.clear()
             return frames
 
+    @property
+    def depth(self) -> int:
+        with self._condition:
+            return len(self._frames)
+
+    def take_dropped_count(self) -> int:
+        with self._condition:
+            dropped = self._dropped_frames
+            self._dropped_frames = 0
+            return dropped
+
     def join(self, timeout_s: float) -> None:
         self._thread.join(max(0.0, timeout_s))
 
@@ -386,6 +401,9 @@ class _FixedFrameReader:
                 with self._condition:
                     self._buffer.extend(chunk)
                     while len(self._buffer) >= self._frame_bytes:
+                        if len(self._frames) >= self._max_frames:
+                            self._frames.popleft()
+                            self._dropped_frames += 1
                         self._frames.append(bytes(self._buffer[: self._frame_bytes]))
                         del self._buffer[: self._frame_bytes]
                     self._condition.notify_all()
@@ -858,20 +876,17 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
         self._skip_next_output_wait = False
         self._socket_factory = socket_factory
         self._socket: Any = None
-        self._output_pipe: _DatagramPipe | None = None
+        self._output_pipe: Any = None
         self._input_endpoint: tuple[str, int] | None = None
         self._frame_metadata: deque[tuple[int, bool]] = deque()
+        self._raw_output_frames = 0
+        self._metrics_started_ns = time.monotonic_ns()
         self._reader: _FixedFrameReader | None = None
         self._start()
 
     def _start(self) -> None:
         udp_socket = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.bind(("127.0.0.1", 0))
-        output_socket = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
-        output_socket.bind(("127.0.0.1", 0))
-        output_socket.settimeout(0.1)
-        output_host, output_port = output_socket.getsockname()[:2]
-        output_pipe = _DatagramPipe(output_socket)
         reservation = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
         reservation.bind(("127.0.0.1", 0))
         host, port = reservation.getsockname()[:2]
@@ -906,19 +921,22 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             "nv12",
             "-vsync",
             "0",
-            f"udp://{output_host}:{output_port}?pkt_size=60000",
+            "pipe:1",
         ]
         try:
             self._socket = udp_socket
-            self._output_pipe = output_pipe
-            self._spawn(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            process = self._spawn(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+            if process.stdout is None:
+                raise VideoCodecError("process_start_failed", "FFmpeg stdout pipe was not created", backend=_BACKEND)
+            self._output_pipe = process.stdout
         except Exception:
             udp_socket.close()
-            output_pipe.close()
+            if self._output_pipe is not None:
+                self._output_pipe.close()
             self._socket = None
             self._output_pipe = None
             raise
-        self._reader = _FixedFrameReader(output_pipe, self._width * self._height * 3 // 2)
+        self._reader = _FixedFrameReader(self._output_pipe, self._width * self._height * 3 // 2, max_frames=3)
 
     def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
         self._require_running()
@@ -929,6 +947,7 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             for offset in range(0, len(packet.payload), 1200):
                 self._socket.sendto(packet.payload[offset : offset + 1200], self._input_endpoint)
             assert self._reader is not None
+            self._retire_reader_drops()
             frames = self._reader.drain()
             if not frames:
                 # The DVPP decoder pipelines output, so most calls find nothing
@@ -947,19 +966,70 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             raise
         except Exception as exc:
             self._fail("decode_failed", str(exc), cause=exc)
-        decoded = [self._convert_frame(nv12) for nv12 in frames]
-        self._metrics = replace(
-            self._metrics,
-            input_frames=self._metrics.input_frames + 1,
-            output_frames=self._metrics.output_frames + len(decoded),
-            output_packets=self._metrics.output_packets + 1,
+        reader_drops = self._retire_reader_drops()
+        self._raw_output_frames += len(frames) + reader_drops
+        decoded = []
+        for nv12 in frames:
+            metadata = self._take_metadata()
+            if metadata is None:
+                break
+            capture_timestamp_ns, keyframe = metadata
+            decoded.append(self._convert_frame(nv12, capture_timestamp_ns, keyframe))
+        self._update_decoder_metrics(
+            input_frames=1,
+            output_frames=len(decoded),
+            output_packets=1,
         )
         return decoded
 
-    def _convert_frame(self, nv12: bytes) -> VideoFrame:
+    def _update_decoder_metrics(
+        self,
+        *,
+        input_frames: int = 0,
+        output_frames: int = 0,
+        output_packets: int = 0,
+        output_age_ns: int | None = None,
+        dropped_frames: int = 0,
+    ) -> None:
+        elapsed_s = max((time.monotonic_ns() - self._metrics_started_ns) / 1e9, 1e-9)
+        total_input = self._metrics.input_frames + input_frames
+        total_output = self._metrics.output_frames + output_frames
+        self._metrics = replace(
+            self._metrics,
+            input_frames=total_input,
+            output_frames=total_output,
+            output_packets=self._metrics.output_packets + output_packets,
+            decoder_backlog_depth=len(self._frame_metadata),
+            decoder_output_age_ns=(self._metrics.decoder_output_age_ns if output_age_ns is None else output_age_ns),
+            dropped_stale_decoder_frames=self._metrics.dropped_stale_decoder_frames + dropped_frames,
+            metadata_fifo_depth=len(self._frame_metadata),
+            input_frame_rate_hz=total_input / elapsed_s,
+            output_frame_rate_hz=self._raw_output_frames / elapsed_s,
+        )
+
+    def _take_metadata(self) -> tuple[int, bool] | None:
         if not self._frame_metadata:
+            return None
+        return self._frame_metadata.popleft()
+
+    def _retire_reader_drops(self) -> int:
+        if self._reader is None:
+            return 0
+        dropped = self._reader.take_dropped_count()
+        for _ in range(min(dropped, len(self._frame_metadata))):
+            self._frame_metadata.popleft()
+        if dropped:
+            self._metrics = replace(
+                self._metrics,
+                dropped_stale_decoder_frames=self._metrics.dropped_stale_decoder_frames + dropped,
+                decoder_backlog_depth=len(self._frame_metadata),
+                metadata_fifo_depth=len(self._frame_metadata),
+            )
+        return dropped
+
+    def _convert_frame(self, nv12: bytes, capture_timestamp_ns: int, keyframe: bool) -> VideoFrame:
+        if capture_timestamp_ns < 0:
             self._fail("timestamp_underflow", "decoded output has no input timestamp")
-        capture_timestamp_ns, keyframe = self._frame_metadata.popleft()
         image = nv12_to_hwc_uint8(
             nv12,
             width=self._width,

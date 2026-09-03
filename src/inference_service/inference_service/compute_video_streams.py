@@ -189,6 +189,11 @@ class ComputeVideoStreamManager:
             )
         return tuple(statuses)
 
+    def decoder_diagnostics(self) -> tuple[tuple[str, object], ...]:
+        with self._lock:
+            streams = tuple(sorted(self._streams.values(), key=lambda item: item.spec.key))
+        return tuple((stream.spec.key, stream.receiver.decoder.metrics) for stream in streams)
+
     def reset_session(self, session_id: str, session_generation: int) -> None:
         self.negotiator.reset(session_id, session_generation)
         with self._lock:

@@ -73,9 +73,30 @@ class CodecMetrics:
     output_packets: int = 0
     dropped_frames: int = 0
     errors: int = 0
+    decoder_backlog_depth: int = 0
+    decoder_output_age_ns: int = 0
+    dropped_stale_decoder_frames: int = 0
+    metadata_fifo_depth: int = 0
+    input_frame_rate_hz: float = 0.0
+    output_frame_rate_hz: float = 0.0
 
     def __post_init__(self) -> None:
-        if min(self.input_frames, self.output_frames, self.output_packets, self.dropped_frames, self.errors) < 0:
+        if (
+            min(
+                self.input_frames,
+                self.output_frames,
+                self.output_packets,
+                self.dropped_frames,
+                self.errors,
+                self.decoder_backlog_depth,
+                self.decoder_output_age_ns,
+                self.dropped_stale_decoder_frames,
+                self.metadata_fifo_depth,
+                self.input_frame_rate_hz,
+                self.output_frame_rate_hz,
+            )
+            < 0
+        ):
             raise ValueError("codec metrics cannot be negative")
 
 

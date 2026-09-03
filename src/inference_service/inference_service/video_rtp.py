@@ -694,15 +694,23 @@ class H264RtpReceiver:
         received_frames = []
         for frame in frames:
             received_frame = replace(
-                frame, capture_timestamp_ns=capture_timestamp_ns, receive_timestamp_ns=receive_time_ns
+                frame,
+                receive_timestamp_ns=receive_time_ns,
             )
-            self.frame_buffer.push(capture_timestamp_ns, received_frame, receive_time_ns=receive_time_ns)
+            self.frame_buffer.push(
+                received_frame.capture_timestamp_ns,
+                received_frame,
+                receive_time_ns=receive_time_ns,
+            )
             received_frames.append(received_frame)
         with self._lock:
             if frames:
                 self._state = StreamLifecycleState.READY
                 self._last_error = ""
-            elif self._state is not StreamLifecycleState.DEGRADED:
+            elif self._state not in {StreamLifecycleState.READY, StreamLifecycleState.DEGRADED}:
+                # Pipelined hardware decoders may accept an access unit without
+                # producing its frame synchronously. Once a frame has made the
+                # stream ready, an empty drain is not a new keyframe boundary.
                 self._state = StreamLifecycleState.WAITING_FOR_KEYFRAME
             self._metrics = replace(self._metrics, decoded_frames=self._metrics.decoded_frames + len(frames))
         return received_frames
