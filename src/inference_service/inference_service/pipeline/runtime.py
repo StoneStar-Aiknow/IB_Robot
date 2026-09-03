@@ -270,6 +270,7 @@ class _PolicyModelRequestStage:
         frame.values["_model_inputs"] = semantic_values
         frame.values["_role_inputs"] = role_inputs if self._facade._execution_plan is not None else None
         frame.values.update(semantic_values)
+        frame.values["_backend_start"] = time.perf_counter()
 
 
 class _PolicyModelResultStage:
@@ -311,10 +312,12 @@ class _PolicyModelResultStage:
             metadata["hardware_priority"] = priority_mapping.map_generic(int(request.inputs.get(_PRIORITY_KEY, 0)))
         if self._denoising_schedule_metadata is not None:
             metadata["denoising_schedule"] = self._denoising_schedule_metadata
+        backend_start = frame.values.get("_backend_start")
+        backend_latency_ms = 0.0 if backend_start is None else (time.perf_counter() - backend_start) * 1000.0
         frame.values["_backend_result"] = _PolicyFrameResult(
             action=raw_action,
             actual_chunk_size=chunk_size,
-            backend_latency_ms=0.0,
+            backend_latency_ms=backend_latency_ms,
             metadata=metadata,
         )
 
