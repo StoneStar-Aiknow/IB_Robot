@@ -139,9 +139,14 @@ def canonical_skill_payload(
         "place_name": _normalized_string(place_name, "place_name"),
         "motion_direction": _normalized_string(motion_direction, "motion_direction", lowercase=True),
         "motion_distance": normalized_distance,
-        "arm_side": normalized_arm_side,
-        "imitation_duration_sec": normalized_imitation_duration,
     }
+    if normalized_arm_side or normalized_imitation_duration:
+        payload.update(
+            {
+                "arm_side": normalized_arm_side,
+                "imitation_duration_sec": normalized_imitation_duration,
+            }
+        )
     if (
         normalized_direction
         or normalized_nav_distance

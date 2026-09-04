@@ -579,7 +579,7 @@ plan/registry identity 和 expected step count，用于校验随后返回的终�
 
 ### `ImitateHumanMotion.action`
 
-HRI 的内部 delegated Mock action，由 `manipulation_execution/imitate_human_motion_executor_node`
+HRI 的内部 delegated action，由 `manipulation_execution/imitate_human_motion_executor_node`
 提供，默认路径为 `/hri/imitate_human_motion`。它不是 Agent 或 CLI 的公共入口；公共调用必须先进入
 `SkillCommand`，再由 `skill_library` 通过现有 delegated Gateway 转发。goal 携带完整
 `DispatchBinding`、`expected_executor`、`arm_side`、`imitation_duration_sec` 和独立的 `timeout_sec`。

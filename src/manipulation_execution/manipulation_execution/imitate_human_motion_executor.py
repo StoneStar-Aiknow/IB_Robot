@@ -1,4 +1,4 @@
-"""Small, dependency-light mock executor for the internal HRI action."""
+"""Dependency-light mock executor for the internal HRI action."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ class AnimationPlayer(Protocol):
 
 
 class MockAnimationPlayer:
-    """Time-based mock player used by the standalone internal Action node."""
+    """Time-based mock player used by the internal HRI Action node."""
 
     def __init__(
         self,
@@ -154,7 +154,7 @@ def build_mock_animations(
     reset_positions: Mapping[str, float],
     joint_limits: Mapping[str, Mapping[str, float] | Sequence[float]],
 ) -> dict[str, AnimationPlan]:
-    """Build three distinct mock animations from the robot-config SSOT values."""
+    """Build three distinct mock animations from the robot configuration SSOT."""
     names, reset, limits = _normalized_motion_config(joint_names, reset_positions, joint_limits)
     first_joint, second_joint = names[:2]
     home = tuple(reset[name] for name in names)
@@ -310,7 +310,12 @@ class MockExecutor:
         deadline = self._clock() + goal.timeout_sec
         result: MockResult | None = None
         reset_ok = False
-        playback_started = False
+        playback_started_at: float | None = None
+
+        def playback_duration() -> float:
+            if playback_started_at is None:
+                return 0.0
+            return min(actual_duration, max(0.0, self._clock() - playback_started_at))
 
         def phase(name: str, detail: str) -> None:
             if not phases or phases[-1] != name:
@@ -358,7 +363,7 @@ class MockExecutor:
             self.status.active_animation_id = plan.animation_id
 
         try:
-            phase("prepare", "我要准备一下哦，听到“开始吧”再和我一起做动作。")
+            phase("prepare", "Preparing for human-motion imitation")
             if is_cancel_requested():
                 result = self._result(
                     success=False,
@@ -412,7 +417,7 @@ class MockExecutor:
                         phases=phases,
                     )
                 else:
-                    phase("start", "开始吧。")
+                    phase("start", "Human-motion imitation started")
                     if is_cancel_requested():
                         result = self._result(
                             success=False,
@@ -434,8 +439,8 @@ class MockExecutor:
                             phases=phases,
                         )
                     else:
-                        phase("mock_playback", f"playing {plan.animation_id}")
-                        playback_started = True
+                        phase("mock_playback", f"Executing {plan.animation_id}")
+                        playback_started_at = self._clock()
                         outcome = active_player.play(
                             plan,
                             actual_duration,
@@ -447,7 +452,7 @@ class MockExecutor:
                             "CANCELED": ("CANCELED", "imitation cancelled during playback"),
                             "TIMEOUT": ("SKILL_TIMEOUT", "imitation timeout during playback"),
                             "UNKNOWN": (CANCEL_CLEANUP_TIMEOUT, "primitive execution state is unknown"),
-                            "COMPLETED": ("", "mock imitation completed"),
+                            "COMPLETED": ("", "Mock imitation completed"),
                         }.get(outcome, ("MOCK_PLAYBACK_FAILED", "mock playback failed"))
                         result = self._result(
                             success=not error_code,
@@ -455,7 +460,7 @@ class MockExecutor:
                             message=message,
                             plan=plan,
                             requested_duration=goal.imitation_duration_sec,
-                            actual_duration=actual_duration if playback_started else 0.0,
+                            actual_duration=playback_duration(),
                             phases=phases,
                         )
         except PrimitiveStateUnknown as exc:
@@ -465,7 +470,7 @@ class MockExecutor:
                 message=str(exc),
                 plan=plan,
                 requested_duration=goal.imitation_duration_sec,
-                actual_duration=actual_duration if playback_started else 0.0,
+                actual_duration=playback_duration(),
                 phases=phases,
             )
         except Exception as exc:
@@ -475,14 +480,14 @@ class MockExecutor:
                 message=str(exc),
                 plan=plan,
                 requested_duration=goal.imitation_duration_sec,
-                actual_duration=actual_duration if playback_started else 0.0,
+                actual_duration=playback_duration(),
                 phases=phases,
             )
         finally:
             recovery_safe = result is None or result.error_code != CANCEL_CLEANUP_TIMEOUT
             recovery_unknown = False
             if recovery_safe:
-                phase("reset", "recovering safe pose")
+                phase("reset", "Returning to safe pose")
                 try:
                     reset_ok = bool(active_recover())
                 except PrimitiveStateUnknown:
@@ -497,7 +502,7 @@ class MockExecutor:
                     message="mock executor returned no result",
                     plan=plan,
                     requested_duration=goal.imitation_duration_sec,
-                    actual_duration=actual_duration if playback_started else 0.0,
+                    actual_duration=playback_duration(),
                     phases=phases,
                 )
             if recovery_unknown:

@@ -1,6 +1,6 @@
 # manipulation_execution
 
-`manipulation_execution` 是抓取、放置和 HRI Mock 的闭环执行层。它把一次 `PickObject` action 请求编排为
+`manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
 GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
 `ImitateHumanMotion` 则提供不含 RGB-D/人体算法的最小 delegated Mock 生命周期。
 
@@ -73,7 +73,7 @@ Gateway 自行构造 delegated `PickObject` 请求。
 | `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 对外技能入口；放置使用 `place_in_container`、`target_name` 和 `container_name` |
 | `/manipulation/execute_pick` | `ibrobot_msgs/action/PickObject` | Gateway 内部 delegated 抓取执行，不是外部入口 |
 | `/manipulation/execute_place` | `ibrobot_msgs/action/PlaceObject` | Gateway 内部固定位置释放与视觉确认，不是外部入口 |
-| `/hri/imitate_human_motion` | `ibrobot_msgs/action/ImitateHumanMotion` | Gateway 内部 HRI Mock 执行，不是外部入口 |
+| `/hri/imitate_human_motion` | `ibrobot_msgs/action/ImitateHumanMotion` | Gateway 内部 HRI 模拟执行，不是外部入口 |
 
 goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、exact registry identity）、
 `target_query`、`timeout_sec`、`expected_executor` 和仅供 supervised bring-up 的 `supervised_direct`。
@@ -98,7 +98,7 @@ catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求
 
 ## 配置
 
-HRI Mock runtime 由 `robot.embodied.imitate_human_motion` 启用。关节顺序来自 `robot.joints.arm`，
+HRI 模拟执行由 `robot.embodied.imitate_human_motion` 启用。关节顺序来自 `robot.joints.arm`，
 prepare 起点来自 `robot.ros2_control.reset_positions`，限位来自
 `robot.teleoperation.safety.joint_limits`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
 

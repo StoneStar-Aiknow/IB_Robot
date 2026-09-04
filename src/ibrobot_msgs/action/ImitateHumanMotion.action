@@ -1,5 +1,5 @@
-# Internal delegated action for the first mock implementation of
-# imitate_human_motion. Public callers still enter through SkillCommand.
+# Internal delegated action for imitate_human_motion. Public callers still
+# enter through SkillCommand.
 # The goal keeps the same binding and executor-identity shape as PickObject and
 # PlaceObject, while carrying only HRI-specific internal arguments.
 

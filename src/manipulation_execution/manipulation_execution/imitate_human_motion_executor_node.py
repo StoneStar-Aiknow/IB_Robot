@@ -1,4 +1,4 @@
-"""ROS Action server for the internal imitate_human_motion mock executor."""
+"""ROS Action server for the internal imitate_human_motion executor."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from manipulation_execution.imitate_human_motion_executor import (
     AnimationPlan,
     MockExecutor,
     MockGoal,
+    MockResult,
     PrimitiveStateUnknown,
 )
 
@@ -32,7 +33,7 @@ _PREPARE_DURATION_SEC = 2.0
 
 
 class _GuardedPrimitivePlayer:
-    """Translate the mock lifecycle into the existing guarded primitives."""
+    """Translate the HRI lifecycle into the existing guarded primitives."""
 
     def __init__(
         self,
@@ -198,7 +199,7 @@ class _GuardedPrimitivePlayer:
                 return outcome
             remaining -= active_duration
             progress = min(1.0, (duration_sec - remaining) / duration_sec)
-            feedback("mock_playback", progress, f"playing {plan.animation_id}")
+            feedback("mock_playback", progress, f"Executing {plan.animation_id}")
         return "COMPLETED"
 
     def reset(self) -> bool:
@@ -214,7 +215,7 @@ class _GuardedPrimitivePlayer:
 
 
 class ImitateHumanMotionExecutorNode(Node):
-    """Serve the internal delegated Action as a launch-managed runtime."""
+    """Serve the internal delegated HRI Action as a launch-managed runtime."""
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("imitate_human_motion_executor_node", parameter_overrides=parameter_overrides)
@@ -265,7 +266,7 @@ class ImitateHumanMotionExecutorNode(Node):
             cancel_callback=self._handle_cancel,
             callback_group=callback_group,
         )
-        self.get_logger().info(f"imitate_human_motion mock executor ready: action={self._action_name}")
+        self.get_logger().info(f"imitate_human_motion executor ready: action={self._action_name}")
         if self._startup_warmup:
             self._run_startup_warmup()
 
@@ -323,7 +324,7 @@ class ImitateHumanMotionExecutorNode(Node):
         accepted, reason = self._mock.can_accept(goal)
         if not accepted:
             if "warmup" in reason:
-                self.get_logger().info("我还在准备哦，等等我鸭。")
+                self.get_logger().info("imitate_human_motion warmup is in progress")
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:
@@ -373,6 +374,27 @@ class ImitateHumanMotionExecutorNode(Node):
                 player=runner,
                 prepare=runner.prepare,
                 recover_safe_pose=runner.reset,
+            )
+        except PrimitiveStateUnknown as exc:
+            result_value = MockResult(
+                success=False,
+                error_code=CANCEL_CLEANUP_TIMEOUT,
+                message=str(exc),
+                animation_id="",
+                requested_duration_sec=goal.imitation_duration_sec,
+                actual_duration_sec=0.0,
+                completed_phases=(),
+            )
+        except Exception as exc:
+            self.get_logger().error(f"imitate_human_motion execution failed: {exc}")
+            result_value = MockResult(
+                success=False,
+                error_code="MOCK_PLAYBACK_FAILED",
+                message=str(exc),
+                animation_id="",
+                requested_duration_sec=goal.imitation_duration_sec,
+                actual_duration_sec=0.0,
+                completed_phases=(),
             )
         finally:
             with self._goal_lock:

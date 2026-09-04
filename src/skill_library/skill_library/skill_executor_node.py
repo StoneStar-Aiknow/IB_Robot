@@ -802,11 +802,22 @@ class SkillExecutorNode(Node):
             primitive_contract_digest=getattr(self, "_primitive_contract_digest", PRIMITIVE_CONTRACT_V1.digest),
             delegated_executors=self._delegated_executor_descriptors(),
         )
-        return SkillCatalogCompiler().compile(
+        snapshot = SkillCatalogCompiler().compile(
             source,
             profile_name=self._skill_catalog_profile,
             context=context,
         )
+        self._validate_hri_runtime_catalog_consistency(snapshot)
+        return snapshot
+
+    def _validate_hri_runtime_catalog_consistency(self, snapshot) -> None:
+        runtime_enabled = bool(getattr(self, "_imitate_human_motion_enabled", False))
+        catalog_enabled = "imitate_human_motion" in snapshot.enabled_skill_names
+        if runtime_enabled != catalog_enabled:
+            raise ValueError(
+                "imitate_human_motion configuration mismatch: "
+                f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
+            )
 
     def _delegated_executor_descriptors(self):
         descriptors = {}

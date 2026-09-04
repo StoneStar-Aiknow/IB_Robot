@@ -72,7 +72,7 @@ SO101 当前配置示例：
 | 社交与娱乐 | `dance_basic`、`wave_hello`、`nod_yes`、`shake_no`、`celebrate`、`greet_observe_raise`、`act_cute`、`happy_spin_upright` |
 | 抓取 | `pick_object`（仅抓取配置，要求显式传入 `target_name`） |
 | 抓取与放置 | `pick_object`、`place_in_container`（固定位置释放，要求显式传入 `target_name` 和 `container_name` 做验证） |
-| 人机交互 Mock | `imitate_human_motion`（要求 `arm_side` 和 `imitation_duration_sec`） |
+| 人机交互模拟执行 | `imitate_human_motion`（要求 `arm_side` 和 `imitation_duration_sec`） |
 
 ## 3. 当前支持的 primitive
 

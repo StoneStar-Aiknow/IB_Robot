@@ -10,7 +10,7 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 提供 `embodied_pipeline.launch.py` 公开入口。
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
-- 按配置启动独立 `perception_service`、抓取执行依赖和 launch-managed HRI Mock runtime。
+- 按配置启动独立 `perception_service`、抓取执行依赖和 launch-managed HRI runtime。
 - 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为

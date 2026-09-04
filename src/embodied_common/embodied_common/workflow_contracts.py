@@ -91,6 +91,8 @@ class CanonicalWorkflowStep:
             raise ValueError("navigation parameters require WorkflowStep schema_version 2")
 
     def to_dict(self) -> dict[str, Any]:
+        normalized_arm_side = self.arm_side.strip().lower()
+        normalized_imitation_duration = _finite_float(self.imitation_duration_sec)
         result = {
             "schema_version": self.schema_version,
             "skill_name": self.skill_name.strip(),
@@ -99,10 +101,15 @@ class CanonicalWorkflowStep:
             "place_name": self.place_name.strip(),
             "motion_direction": self.motion_direction.strip().lower(),
             "motion_distance": _finite_float(self.motion_distance),
-            "arm_side": self.arm_side.strip().lower(),
-            "imitation_duration_sec": _finite_float(self.imitation_duration_sec),
             "timeout_sec": _finite_float(self.timeout_sec),
         }
+        if normalized_arm_side or normalized_imitation_duration:
+            result.update(
+                {
+                    "arm_side": normalized_arm_side,
+                    "imitation_duration_sec": normalized_imitation_duration,
+                }
+            )
         if self.schema_version == 2:
             result.update(
                 {
