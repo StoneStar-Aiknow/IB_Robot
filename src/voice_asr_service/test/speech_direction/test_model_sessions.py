@@ -72,6 +72,30 @@ def test_voice_asr_uses_canonical_backend_names_without_runtime_acl_options() ->
     assert not hasattr(FullSubNetConfig(), "acl_config_path")
 
 
+def test_stateful_ascend_maps_recurrent_bindings_by_semantic_suffix() -> None:
+    bindings = type(
+        "Bindings",
+        (),
+        {
+            "inputs": (
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_spectrum", "index": 0})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_in", "index": 1})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_in", "index": 2})(),
+            ),
+            "outputs": (
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_features", "index": 0})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_out", "index": 1})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_out", "index": 2})(),
+            ),
+        },
+    )()
+
+    hidden_link = type("Link", (), {"state_name": "hidden"})()
+    cell_link = type("Link", (), {"state_name": "cell"})()
+    assert StatefulAscendOmModelSession._state_indices_for_role(bindings, hidden_link, "fullsubnet_fb") == ((1, 1),)
+    assert StatefulAscendOmModelSession._state_indices_for_role(bindings, cell_link, "fullsubnet_fb") == ((2, 2),)
+
+
 def test_silero_engine_reuses_runner_and_adds_context(tmp_path) -> None:
     model_path = tmp_path / "silero.om"
     model_path.write_bytes(b"mock-om")

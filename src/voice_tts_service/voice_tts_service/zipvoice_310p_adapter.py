@@ -25,6 +25,7 @@ _ChineseTokenizer = ChineseTokenizer
 class ZipVoiceAscendSession(AscendOmModelSession):
     """Run the complete ZipVoice host-orchestrated pipeline in one model session."""
 
+    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options | {"prompt_profile"}
     execution_contract = "request-iterative"
     orchestration_visibility = "session"
 

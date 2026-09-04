@@ -36,13 +36,45 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
             raise BackendLoadError(
                 "stateful Ascend sessions require manifest state_links", code="invalid_state_contract"
             )
-        # The v3 state-link contract intentionally carries logical ownership,
-        # not runtime tensor names or indices.  The old double-buffer adapter
-        # still needs an explicit ABI binding map; do not infer one from names.
-        raise BackendLoadError(
-            "stateful Ascend tensor-bank execution requires a v3 state-link ABI adapter",
-            code="state_link_abi_adapter_unavailable",
-        )
+        state_indices: dict[str, tuple[tuple[int, int], ...]] = {}
+        for link in typed_links:
+            role = link.role
+            if role == "__runtime__":
+                role = link.state_bank.removesuffix(".bank")
+            if role not in deployment.bindings:
+                raise BackendLoadError(f"state link references undeclared role {role!r}", code="invalid_state_contract")
+            pairs = self._state_indices_for_role(deployment.bindings[role], link, role)
+            previous = state_indices.get(role)
+            state_indices[role] = tuple(sorted(set(previous or ()) | set(pairs)))
+        if not state_indices:
+            raise BackendLoadError("stateful Ascend sessions require model state links", code="invalid_state_contract")
+        self._state_indices = state_indices
+        super()._load(context, rollback)
+
+    @staticmethod
+    def _state_indices_for_role(bindings, link, role: str) -> tuple[tuple[int, int], ...]:
+        """Resolve one recurrent ABI pair from a logical v3 state link."""
+
+        state_kind = link.state_name
+        input_matches = [
+            binding
+            for binding in bindings.inputs
+            if binding.index is not None and binding.semantic.rsplit(".", 1)[-1].endswith(f"_{state_kind}_in")
+        ]
+        output_matches = [
+            binding
+            for binding in bindings.outputs
+            if binding.index is not None and binding.semantic.rsplit(".", 1)[-1].endswith(f"_{state_kind}_out")
+        ]
+        if state_kind == "hidden" and not input_matches:
+            input_matches = [binding for binding in bindings.inputs if binding.semantic.endswith(".state_in")]
+            output_matches = [binding for binding in bindings.outputs if binding.semantic.endswith(".state_out")]
+        if len(input_matches) != 1 or len(output_matches) != 1:
+            raise BackendLoadError(
+                f"state link for role {role!r} has no unique ABI mapping for {state_kind!r}",
+                code="invalid_state_link_abi",
+            )
+        return ((int(input_matches[0].index), int(output_matches[0].index)),)
 
     def _prepare_models(self, deployment: CompiledDeployment, models: Mapping[str, AclModel]) -> None:
         if deployment.device_links:

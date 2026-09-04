@@ -112,9 +112,9 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["detect_service"] == "/perception/grasp/grounding_detect"
     assert grasp_execution["fallback_detect_service"] == "/grasp_planner/detect_and_segment"
     assert grasp_execution["segment_service"] == "/perception/grasp/segment_detections"
-    assert grasp_execution["model_bundle_path"].endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert grasp_execution["model_bundle_path"].endswith("/models/graspgen")
     assert grasp_execution["model_deployment"] == "ascend_310p"
-    assert grasp_execution["planner_model_dir"].endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert grasp_execution["planner_model_dir"].endswith("/models/graspgen")
     services = {service["id"]: service for service in config["perception_services"]["services"]}
     assert services["grasp_grounding"]["deployment"] == "ascend_310p"
     assert services["grasp_grounding"]["service_type"] == "ibrobot_msgs/srv/GroundingDetect"
@@ -122,9 +122,7 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert services["grasp_segmentation"]["service_type"] == "ibrobot_msgs/srv/SegmentDetections"
     assert services["grasp_segmentation"]["bundle_path"].endswith("sam2.1_hiera_tiny_prompt_ascend")
     assert grasp_execution["planner_node"]["inference_backend"] == "ascend_local"
-    assert grasp_execution["planner_node"]["ascend_local_manifest_path"].endswith(
-        "/models/grasp/graspgen_robotiq_2f_140"
-    )
+    assert grasp_execution["planner_node"]["ascend_local_manifest_path"].endswith("/models/graspgen")
     assert grasp_execution["planner_node"]["startup_warmup"] is True
     assert grasp_execution["planner_node"]["num_grasps"] == 5000
     assert grasp_execution["planner_node"]["topk_num_grasps"] == 1000
@@ -147,7 +145,7 @@ def test_pc_profile_requires_final_fk_fixed_finger_inward_clearance() -> None:
     config = load_robot_config_dict(PC_CONFIG)
     orientation_guard = config["grasp_execution"]["target_gripper"]["ik_orientation_guard"]
 
-    assert config["grasp_execution"]["model_bundle_path"].endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert config["grasp_execution"]["model_bundle_path"].endswith("/models/graspgen")
     assert config["grasp_execution"]["model_deployment"] == "torch_cuda"
     assert config["grasp_execution"]["approach_distance_m"] == 0.09
     assert config["grasp_execution"]["contact_realign"]["pregrasp_clearance_m"] == 0.030
