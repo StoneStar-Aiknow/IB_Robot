@@ -148,6 +148,7 @@ def test_three_camera_fixture_enforces_skew_and_bounds_each_retained_history():
             max_inter_camera_skew_ns=9_000_000,
         )
     assert {issue["reason"] for issue in error.value.details["streams"]} == {"skewed"}
+    assert {issue["skew_ns"] for issue in error.value.details["streams"]} == {10_000_000}
 
 
 def test_sustained_localhost_udp_stream_recovers_in_new_session_epoch():

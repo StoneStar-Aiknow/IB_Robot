@@ -139,8 +139,18 @@ IDL、生成的 ROS 接口、`embodied_common` wire preflight、执行器、CLI 
 原子部署。启动时发现生成接口不是同一版本会在创建 ROS client、subscription、action 或 readiness 之前失败；不要把
 旧生成接口与新节点或新 CLI 混装。
 
-可用 typed flags 为 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance` 和
-`--timeout-sec`。CLI 根据当前技能显式 `capability.parameters` schema 拒绝缺失参数和不属于该技能的参数。
+可用 typed flags 包括 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance`、
+`--arm-side`、`--imitation-duration-sec` 和 `--timeout-sec`。CLI 根据当前技能显式
+`capability.parameters` schema 拒绝缺失参数和不属于该技能的参数。
+
+`imitate_human_motion` 在 `lekiwi_handeye_realsense_grasp_lidar` profile 中公开，调用示例：
+
+```bash
+robot-skill --config-name lekiwi_nav_grasp validate imitate_human_motion \
+  --arm-side auto --imitation-duration-sec 5
+```
+
+该命令只进入现有 Gateway；内部 HRI Action 不是 CLI 公共入口。
 
 ### 公开 catalog 字段
 

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from inference_service.backends.errors import BackendInferenceError
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from voice_tts_service.errors import BackendLoadError
 from voice_tts_service.zipvoice_onnx_adapter import ZipVoiceOnnxSession
 
@@ -123,8 +123,7 @@ def _onnx_session(*, velocity_fn=None, config=None):
 
 
 def _request(text="机器人", *, prompt=False):
-    return NamedTensorRequest(
-        "tts-test",
+    return ModelRequest(
         {
             "tts.text": np.frombuffer(text.encode(), dtype=np.uint8),
             "tts.prompt_audio": np.ones(1, dtype=np.float32) if prompt else np.empty(0, dtype=np.float32),
@@ -132,14 +131,18 @@ def _request(text="机器人", *, prompt=False):
             "tts.prompt_text": np.frombuffer("参考".encode(), dtype=np.uint8)
             if prompt
             else np.empty(0, dtype=np.uint8),
-        },
+        }
     )
+
+
+def _context():
+    return ExecutionContext("tts-test")
 
 
 def test_onnx_session_runs_eight_flow_steps_and_returns_pcm():
     session = _onnx_session()
 
-    outputs = session._execute(_request())
+    outputs = session._execute(_request(), _context())
 
     assert outputs["tts.audio"].shape == (240,)
     assert outputs["tts.audio"].dtype == np.float32
@@ -147,7 +150,7 @@ def test_onnx_session_runs_eight_flow_steps_and_returns_pcm():
 
 def test_onnx_session_explicitly_rejects_request_prompt():
     with pytest.raises(BackendInferenceError, match="fixed prompt profile") as error:
-        _onnx_session()._execute(_request(prompt=True))
+        _onnx_session()._execute(_request(prompt=True), _context())
     assert error.value.code == "unsupported_prompt"
 
 
@@ -156,23 +159,22 @@ def test_onnx_session_rejects_unloaded_assets():
     session._text_encoder = None
 
     with pytest.raises(BackendInferenceError, match="assets are not loaded"):
-        session._execute(_request())
+        session._execute(_request(), _context())
 
 
 def test_onnx_session_rejects_invalid_utf8_text():
     session = _onnx_session()
-    bad_request = NamedTensorRequest(
-        "tts-test",
+    bad_request = ModelRequest(
         {
             "tts.text": np.array([0xFF, 0xFE], dtype=np.uint8),
             "tts.prompt_audio": np.empty(0, dtype=np.float32),
             "tts.prompt_sample_rate": np.asarray(0, dtype=np.int64),
             "tts.prompt_text": np.empty(0, dtype=np.uint8),
-        },
+        }
     )
 
     with pytest.raises(BackendInferenceError, match="not valid UTF-8") as error:
-        session._execute(bad_request)
+        session._execute(bad_request, _context())
     assert error.value.code == "invalid_text"
 
 
@@ -184,7 +186,7 @@ def test_onnx_session_detects_nan_velocity():
     session = _onnx_session(velocity_fn=nan_velocity)
 
     with pytest.raises(BackendInferenceError, match="NaN or Inf"):
-        session._execute(_request())
+        session._execute(_request(), _context())
 
 
 def test_load_json_rejects_non_object(tmp_path):

@@ -12,9 +12,9 @@
   <depend>std_srvs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>diagnostic_msgs</depend>
+  <depend>audio_common_msgs</depend>
 
   <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-pyaudio</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
   <!-- Plotly/Matplotlib 仅 speech_direction_report 离线 CLI 渲染用,不在 base.txt;
@@ -28,7 +28,7 @@
   <exec_depend>python3-onnxruntime</exec_depend>
   <!-- speech_direction 走标准 inference_manifest 契约 + inference_service ACL/Torch 后端。
        inference_manifest 是 bindings 契约的静态导入源（setup.py 不 import，节点运行时必导）。
-       inference_service.backends.ascend 仅 raw_acl backend 运行时动态导入（torch/onnx 后端不导入），
+        inference_service.backends.ascend 仅 Ascend ACL backend 运行时动态导入（torch/onnx 后端不导入），
        属可选运行时依赖；不在 package.xml 声明 exec_depend，否则会与 inference_service→robot_config→
        voice_asr_service 的既有 depend 链形成环，破坏 colcon 拓扑排序。 -->
   <exec_depend>inference_manifest</exec_depend>

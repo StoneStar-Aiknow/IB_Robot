@@ -18,6 +18,8 @@ string container_name
 string place_name
 string motion_direction
 float32 motion_distance
+string arm_side
+float32 imitation_duration_sec
 float32 timeout_sec
 string direction
 float64 distance

@@ -16,6 +16,7 @@ import pytest
 from inference_service.ascend_ffmpeg_video_codec import (
     AscendFfmpegH264Decoder,
     AscendFfmpegH264Encoder,
+    _FixedFrameReader,
     build_ascend_child_environment,
     probe_ascend_codec_diagnostic,
     register_ascend_backend,
@@ -467,10 +468,10 @@ def test_encoder_writes_raw_rgb_and_reset_recreates_process_and_socket(tmp_path:
 
 def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
-    process = _FakeProcess()
+    output_pipe = _QueuePipe()
+    process = _FakeProcess(stdout=output_pipe)
     spawned = []
-    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
-    output_socket = sockets[1]
+    sockets = [_FakeSocket(), _FakeSocket()]
 
     def process_factory(command, **kwargs):
         spawned.append((command, kwargs))
@@ -488,17 +489,19 @@ def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: 
         socket_factory=lambda *_args: sockets.pop(0),
     )
     nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
-    output_socket.datagrams.append(nv12)
+    output_pipe.put(nv12)
 
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
 
     command = spawned[0][0]
-    assert command[-1].startswith("udp://127.0.0.1:24000?")
+    assert command[-1] == "pipe:1"
     assert _option(command, "-device_id") == "4"
     assert _option(command, "-channel_id") == "5"
     assert _option(command, "-fflags") == "nobuffer"
     assert _option(command, "-analyzeduration") == "0"
     assert _option(command, "-probesize") == "32"
+    assert _option(command, "-vsync") == "0"
+    assert spawned[0][1]["stdout"] is subprocess.PIPE
     assert _option(command, "-i").startswith("udp://127.0.0.1:24000?")
     assert frames[0].capture_timestamp_ns == 123_456
     assert frames[0].pixel_format == "rgb24"
@@ -508,11 +511,59 @@ def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: 
     decoder.close()
 
 
+def test_fixed_frame_reader_drops_oldest_frames_when_backlog_is_full():
+    pipe = _QueuePipe()
+    frame_bytes = 4
+    reader = _FixedFrameReader(pipe, frame_bytes, max_frames=2)
+    pipe.put(b"aaaa")
+    pipe.put(b"bbbb")
+    pipe.put(b"cccc")
+
+    deadline = time.monotonic() + 1.0
+    while reader.depth < 2 and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert reader.depth == 2
+    assert reader.drain() == [b"bbbb", b"cccc"]
+    assert reader.take_dropped_count() == 1
+    pipe.close()
+    reader.join(1.0)
+
+
+def test_decoder_preserves_delayed_output_and_matching_metadata(tmp_path: Path):
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    sockets = [_FakeSocket(), _FakeSocket()]
+    output_pipe = _QueuePipe()
+    decoder = AscendFfmpegH264Decoder(
+        width=4,
+        height=2,
+        frame_rate_hz=20,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(stdout=output_pipe),
+        socket_factory=lambda *_args: sockets.pop(0),
+    )
+    nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
+
+    old_timestamp = time.time_ns() - 1_000_000_000
+    current_timestamp = time.time_ns()
+    assert decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65old", 999, old_timestamp)) == []
+    output_pipe.put(nv12)
+    output_pipe.put(nv12)
+    time.sleep(0.01)
+    frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65new", 999, current_timestamp))
+
+    assert [frame.capture_timestamp_ns for frame in frames] == [old_timestamp, current_timestamp]
+    assert decoder.metrics.dropped_stale_decoder_frames == 0
+    assert decoder.metrics.metadata_fifo_depth == 0
+    decoder.close()
+
+
 def test_decoder_waits_for_asynchronous_ffmpeg_output(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
-    process = _FakeProcess()
-    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
-    output_socket = sockets[1]
+    output_pipe = _QueuePipe()
+    process = _FakeProcess(stdout=output_pipe)
+    sockets = [_FakeSocket(), _FakeSocket()]
     decoder = AscendFfmpegH264Decoder(
         width=4,
         height=2,
@@ -525,7 +576,7 @@ def test_decoder_waits_for_asynchronous_ffmpeg_output(tmp_path: Path):
     )
     nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
 
-    producer = threading.Thread(target=lambda: (time.sleep(0.01), output_socket.datagrams.append(nv12)))
+    producer = threading.Thread(target=lambda: (time.sleep(0.01), output_pipe.put(nv12)))
     producer.start()
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
     producer.join()
@@ -537,7 +588,7 @@ def test_decoder_waits_for_asynchronous_ffmpeg_output(tmp_path: Path):
 
 def test_decoder_output_wait_is_bounded_by_frame_rate(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
-    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
+    sockets = [_FakeSocket(), _FakeSocket()]
     decoder = AscendFfmpegH264Decoder(
         width=4,
         height=2,
@@ -560,19 +611,20 @@ def test_decoder_output_wait_is_bounded_by_frame_rate(tmp_path: Path):
 
 def test_decoder_reader_reassembles_output_datagrams(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
-    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
-    output_socket = sockets[1]
+    sockets = [_FakeSocket(), _FakeSocket()]
+    output_pipe = _QueuePipe()
     decoder = AscendFfmpegH264Decoder(
         width=4,
         height=2,
         frame_rate_hz=20,
         ffmpeg_path=str(ffmpeg),
         environ=environment,
-        process_factory=lambda *_args, **_kwargs: _FakeProcess(),
+        process_factory=lambda *_args, **_kwargs: _FakeProcess(stdout=output_pipe),
         socket_factory=lambda *_args: sockets.pop(0),
     )
     nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
-    output_socket.datagrams.extend((nv12[:5], nv12[5:]))
+    output_pipe.put(nv12[:5])
+    output_pipe.put(nv12[5:])
 
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
 
@@ -911,7 +963,7 @@ def test_decoder_skips_output_wait_after_fruitless_wait(tmp_path: Path):
     """After one full output wait times out, subsequent empty calls return
     immediately instead of burning the wait window on every decode()."""
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
-    sockets = [_FakeSocket(), _FakeSocket(), _FakeSocket()]
+    sockets = [_FakeSocket(), _FakeSocket()]
     decoder = AscendFfmpegH264Decoder(
         width=4,
         height=2,
@@ -934,6 +986,38 @@ def test_decoder_skips_output_wait_after_fruitless_wait(tmp_path: Path):
     skipped = time.monotonic() - started
     assert skipped < 0.01, "second empty decode must not wait again"
 
+    decoder.close()
+
+
+def test_decoder_allows_normal_hardware_pipeline_depth(tmp_path: Path):
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    processes = []
+    sockets = [_FakeSocket(), _FakeSocket()]
+
+    def process_factory(_command, **_kwargs):
+        process = _FakeProcess(stdout=_QueuePipe())
+        processes.append(process)
+        return process
+
+    decoder = AscendFfmpegH264Decoder(
+        width=4,
+        height=2,
+        frame_rate_hz=30,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=process_factory,
+        socket_factory=lambda *_args: sockets.pop(0),
+    )
+    start_ns = time.time_ns()
+
+    for index in range(12):
+        packet = EncodedPacket(b"\x00\x00\x00\x01\x41x", index, start_ns + index * 33_333_333)
+        assert decoder.decode(packet) == []
+    keyframe = EncodedPacket(b"\x00\x00\x00\x01\x65x", 12, start_ns + 12 * 33_333_333, keyframe=True)
+    assert decoder.decode(keyframe) == []
+
+    assert len(processes) == 1
+    assert decoder.metrics.metadata_fifo_depth == 13
     decoder.close()
 
 

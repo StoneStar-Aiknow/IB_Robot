@@ -6,13 +6,11 @@ import importlib
 from collections.abc import Callable, Mapping, Sequence
 
 from inference_manifest import CompiledDeployment, TensorBinding
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.hmm.backend import HMMModule
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 _HOST_ARTIFACT_FORMATS = frozenset({"pt", "pytorch"})
 
@@ -33,7 +31,6 @@ class HMMModelSession(ModelSession):
         device_id: int = 0,
         *,
         runtime_loader: Callable[[], object] | None = None,
-        domains: ResourceDomainAdmissions | None = None,
     ) -> None:
         if type(device_id) is not int or device_id < 0:
             raise ValueError("device_id must be a non-negative integer")
@@ -51,7 +48,6 @@ class HMMModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._device_id = device_id
         self._runtime_loader = runtime_loader
@@ -65,18 +61,25 @@ class HMMModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(self._runtime)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hmm":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "hmm":
             raise BackendLoadError("HMMModelSession requires a compiled hmm deployment", code="invalid_deployment")
-        if not (deployment.target.runtime.startswith("hmm") or deployment.target.runtime.startswith("tcim")):
+        if context.target_runtime not in {"hmm", "tcim"}:
             raise BackendLoadError(
-                f"HMM target.runtime {deployment.target.runtime!r} is not in the TCIM runtime family",
+                f"HMM target.runtime {context.target_runtime!r} is not the canonical TCIM runtime family",
                 code="incompatible_backend_target",
             )
-        device_id = context.runtime_options.get("device_id", self._device_id)
+        profile_device_id = context.device_id
+        device_id = context.runtime_options.get(
+            "device_id", self._device_id if profile_device_id is None else profile_device_id
+        )
         if type(device_id) is not int or device_id != self._device_id:
             raise BackendLoadError("HMM device_id does not match the session", code="deployment_context_mismatch")
+        if profile_device_id is not None and profile_device_id != self._device_id:
+            raise BackendLoadError(
+                "HMM device_id does not match the typed runtime profile", code="deployment_context_mismatch"
+            )
         unknown_options = sorted(set(context.runtime_options) - {"device_id"})
         if unknown_options:
             raise BackendLoadError(
@@ -147,7 +150,8 @@ class HMMModelSession(ModelSession):
         self._host_roles = frozenset(host_roles)
         self._device_handles = tuple(handles)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or not self._modules:
@@ -157,7 +161,7 @@ class HMMModelSession(ModelSession):
         for role in deployment.execution:
             if role in self._host_roles:
                 continue
-            outputs = self._execute_role(role, values, request)
+            outputs = self._execute_role(role, values, request, context)
             values.update(outputs)
             for semantic, value in outputs.items():
                 if not semantic.startswith("internal."):
@@ -168,9 +172,11 @@ class HMMModelSession(ModelSession):
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
+        context.check(f"model.{role}")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or role not in self._modules:

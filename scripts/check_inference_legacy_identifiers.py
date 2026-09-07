@@ -31,6 +31,10 @@ PATTERNS = {
     "legacy_ros_surface": re.compile(r"/act_inference_node(?:/|\b)|/(?:[A-Za-z0-9_]+/)*reset_policy_state(?:\b|/)"),
     "legacy_launch_argument": re.compile(r"(?<![A-Za-z0-9_])(?:execution_mode|cloud_local|policy_path):="),
     "legacy_distributed_topic": re.compile(r"/preprocessed/batch(?:\b|/)|/inference/action(?:\b|/)"),
+    "removed_native_migration_surface": re.compile(
+        r"inference_service\.(?:_legacy_named_tensor|generic_runtime|backends\.lifecycle)"
+        r"|(?<![A-Za-z0-9_])(?:GenericModelPipeline|NamedTensorRequest|NamedTensorResult)(?![A-Za-z0-9_])"
+    ),
 }
 
 # These tests intentionally prove that removed backend aliases are rejected.
@@ -41,7 +45,6 @@ ALLOWLIST = {
     "src/inference_service/tests/test_legacy_identifier_guard.py": frozenset(
         {"legacy_launch_argument", "legacy_runtime_surface"}
     ),
-    "src/inference_service/tests/LEGACY_COVERAGE.md": frozenset({"removed_backend_alias"}),
     "docs/Houmo_HMM_Conversion.md": frozenset({"per_backend_manifest", "legacy_artifact_override"}),
 }
 

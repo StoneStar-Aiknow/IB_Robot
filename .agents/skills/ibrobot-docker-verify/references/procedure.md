@@ -344,6 +344,46 @@ The remote-clone status must contain only the branch/tracking line before
 setup. For either mode, record `git rev-parse HEAD`; for a local copy, also
 preserve and report the pre-setup dirty status.
 
+## Phase 3.5 — ROS Source-Switch Pre-Clean (conditional)
+
+> **Trigger:** the verified change switches the ROS package source — repo URL,
+> mirror, or GPG key in `scripts/install_ros.sh` or setup scripts. Execute this
+> phase whenever the container already has `ros-*` packages installed
+> (desktop-full image, or a quick-run container from a previous verification).
+
+The desktop-full image ships ROS packages from the OLD source. If they remain
+installed, `setup.sh`'s ROS detection reuses them and the new-source install
+path in `install_ros.sh` is never exercised — the verification result would be
+invalid. Removing packages is environment pre-clean, not software installation;
+everything is still installed solely by `setup.sh`.
+
+```bash
+# Run as root inside the container before Phase 4.
+docker exec "${CONTAINER}" bash -c '
+  set -e
+  ros_pkgs="$(dpkg-query -W -f="\${Package}\n" "ros-*" 2>/dev/null || true)"
+  if [ -n "${ros_pkgs}" ]; then
+    printf "Removing %s ros-* packages before source-switch verification\n" \
+      "$(printf "%s\n" "${ros_pkgs}" | wc -l)"
+    apt-get purge -y "ros-*"
+    apt-get autoremove -y --purge
+    rm -rf /opt/ros
+  else
+    echo "No ros-* packages installed; nothing to pre-clean."
+  fi
+  # Hard check: no ROS package and no /opt/ros residue may remain.
+  test -z "$(dpkg-query -W -f="\${Package}\n" "ros-*" 2>/dev/null || true)"
+  test ! -e /opt/ros/humble
+  echo "ROS source-switch pre-clean complete."
+'
+```
+
+Report this pre-clean in the verification result (package count removed) so
+reviewers know the setup validated a full reinstall from the new source. For
+complete first-install coverage (apt source setup, GPG key handling), the
+[bootstrap variant](bootstrap-variant.md) with `ubuntu:22.04` is still
+required in addition.
+
 ## Phase 4 — Run setup.sh
 
 ```bash

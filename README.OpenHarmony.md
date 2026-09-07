@@ -138,6 +138,9 @@ hdc -t <board-ip>:8710 shell 'passwd root'  # 设置密码
 ssh root@<board-ip>
 ```
 
+更详细的开发板连接、HDC/TCP 调试和 SSH 配置流程，请参考
+[docs/OpenHarmony_EmbodiedAI_Board_Setup.md](docs/OpenHarmony_EmbodiedAI_Board_Setup.md)。
+
 ## 三、板端安装 ROS 2 Humble 运行时
 
 RoboOH 1.0.1 固件已预装 ROS 2 Humble 运行时和系统依赖库（sysdeps），通常**无需额外安装**。
@@ -165,7 +168,16 @@ hdc -t <board-ip>:8710 shell 'cd /data && tar -zxpvf ohos-humble-build-*.tar.gz 
   - `ohos-sdk-18-linux-aarch64-*.tar.gz`（OHOS SDK）
   - `ohos-*-sysdeps-*.tar.gz`（系统依赖）
   - `ohos-humble-build-aarch64-*.tar.gz`（ROS 2 运行时）
-- Python 依赖（pysite）由 [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库发布，直接下载 release 包即可，无需手动构建
+- Python 依赖（`pysite`）由 [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库以 Release 资产形式发布，无需在本地手动构建，请按下面的步骤进入 Release 页面并获取完整依赖包：
+
+  1. 打开 [lerobot_deps 仓库](https://atomgit.com/openharmony-robot/lerobot_deps)，在页面右侧找到“发行版”（Releases）区域，点击最新版本（例如 `RoboFrame 依赖包 v1.0.5-robopi-20260807`），操作位置如下图所示：
+
+     ![在 lerobot_deps 仓库主页进入最新发行版](docs/pictures/lerobot_deps_repository.png)
+
+  2. 进入发行版详情页后，在“下载”区域找到与 RoboPi/OpenHarmony 版本匹配的压缩包，例如 `roboframe-deps-1.0.5-robopi-20260807.tar.gz`，点击该文件下载。
+
+     ![在发行版详情页下载 roboframe-deps 资产](docs/pictures/lerobot_deps_release_asset.png)
+
 
 ### 4.2 主机目录布局
 
@@ -174,17 +186,20 @@ hdc -t <board-ip>:8710 shell 'cd /data && tar -zxpvf ohos-humble-build-*.tar.gz 
 ├── downloads/
 │   ├── sdk/         ohos-sdk-18-linux-aarch64-*.tar.gz
 │   ├── sysdeps/     ohos-*-sysdeps-*.tar.gz
-│   └── runtime/     ohos-humble-build-aarch64-*.tar.gz
+│   ├── runtime/     ohos-humble-build-aarch64-*.tar.gz
+│   └── deps/        roboframe-deps-*-robopi-*.tar.gz
 └── custom_build_root/
     ├── ibrobot_oh_ws/install/   ← 交叉编译产物
     ├── ohos-robot-toolchain/18/ ← OHOS SDK
     └── ...
 ```
 
-### 4.3 交叉编译 11 个包
+### 4.3 交叉编译 13 个包
 
 ```bash
 export OH_ROOT="<your-oh-root>"
+export DEPS_ARCHIVE="$OH_ROOT/downloads/deps/roboframe-deps-1.0.5-robopi-20260807.tar.gz"
+# 请将上面的文件名替换为实际下载的 roboframe-deps 版本
 
 ./scripts/openharmony/build_roboframe_oh.sh \
   --oh-root "$OH_ROOT"
@@ -208,6 +223,7 @@ export OH_ROOT="<your-oh-root>"
 ```bash
 ./scripts/pack_roboframe_release.sh \
     --build-install "$OH_ROOT/custom_build_root/ibrobot_oh_ws/install" \
+    --deps-archive "$DEPS_ARCHIVE" \
     --output roboframe-robopi-$(date +%Y%m%d).tar.gz
 ```
 
@@ -222,22 +238,12 @@ roboframe-ohos/
 └── install.sh            # 一键部署
 ```
 
-> Python 依赖（pysite，含 torch/transformers/tokenizers/regex 等 ~200MB）由
-> [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库独立发布，
-> 需单独下载部署。
-
 ### 4.5 部署到板端
 
 ```bash
-# 1. 下载 RoboFrame 发布包（install + scripts）
+#下载 RoboFrame 发布包（install + scripts）
 scp roboframe-robopi-*.tar.gz root@<board-ip>:/data/local/tmp/
 ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && cd roboframe-ohos && sh install.sh'
-
-# 2. 下载 Python 依赖包（pysite）并部署
-curl -L -o roboframe-deps.tar.gz \
-    https://atomgit.com/openharmony-robot/lerobot_deps/releases/download/v1.0.0/roboframe-deps-1.0.0-robopi-20260703.tar.gz
-scp roboframe-deps.tar.gz root@<board-ip>:/data/roboframe/
-ssh root@<board-ip> 'cd /data/roboframe && tar xzf roboframe-deps.tar.gz'
 ```
 
 部署完成后板端目录结构：

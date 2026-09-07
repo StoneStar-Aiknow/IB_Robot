@@ -1,0 +1,23 @@
+# Internal delegated action for imitate_human_motion. Public callers still
+# enter through SkillCommand.
+# The goal keeps the same binding and executor-identity shape as PickObject and
+# PlaceObject, while carrying only HRI-specific internal arguments.
+
+DispatchBinding dispatch_binding
+string arm_side
+float32 imitation_duration_sec
+float32 timeout_sec
+DelegatedExecutorIdentity expected_executor
+---
+bool success
+string error_code
+string message
+string animation_id
+float32 requested_duration_sec
+float32 actual_duration_sec
+string[] completed_phases
+DelegatedExecutorIdentity actual_executor
+---
+string phase
+float32 progress
+string detail

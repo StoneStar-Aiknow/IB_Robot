@@ -192,7 +192,8 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 
 正式运行由 robot-config `perception_services.services` 为每个 named deployment 启动一个 host。PC 配置选择组合
 Grounded-SAM2 Torch deployment，通过 `GroundingDetect` 一次返回 bbox 和 mask；310P 配置分别选择
-`grounding_dino_raw` 与 `sam2_prompt` bundle，通过 `GroundingDetect -> SegmentDetections` 返回相同语义结果。
+`grounding_dino` 与 `sam2` bundle，通过 `GroundingDetect -> SegmentDetections` 返回相同语义结果；
+编译变体由 named deployment 和 bindings 表达。
 
 ### 7.1 310P 原始执行图的张量契约
 
@@ -252,8 +253,8 @@ masked-image、SigLIP2 text 和可选 Grounding DINO confirmation。每个进程
 named deployment；SigLIP2 image/text 不共享进程，但必须声明兼容的 embedding space。
 
 每个 generic host 通过 response `ModelRuntimeInfo` 报告 readiness、semantic identity 和 deployment
-provenance。Ascend OM 只能通过 schema-v2 manifest named deployment 进入 shared `AscendOmModelSession`；raw
-wrapper 的 `backend=ascend_om` 路径不再提供。CUDA 不可用时必须在 SSOT 中选择另一个已经验证的 named
+provenance。Ascend OM 只能通过 schema-v3 manifest named deployment 进入 shared `AscendOmModelSession`；
+wrapper 不接受旧的 backend alias。CUDA 不可用时必须在 SSOT 中选择另一个已经验证的 named
 deployment，节点不会自动切换 backend。
 
 感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接在 `models/` 顶层生成四个 bundle
@@ -303,7 +304,7 @@ generic 感知服务不读取深度，因此其 `Detection2D` 只保证 bbox 与
 
 ### 9.1 Ascend 310P 抓取感知
 
-310P 抓取感知使用两个 schema-v2 bundle 和 shared `AscendOmModelSession`，不进入 policy `AscendBackend`。
+310P 抓取感知使用两个 schema-v3 bundle 和 shared `AscendOmModelSession`，不进入 policy `AscendBackend`。
 板端只依赖 NumPy、OpenCV、`inference_manifest`、`inference_service` 和 CANN ACL，不导入
 GroundingDINO、SAM2、TorchVision 或对应 CUDA 扩展。用仓库打包器从已验证候选生成独立 bundle：
 
@@ -313,15 +314,20 @@ GroundingDINO、SAM2、TorchVision 或对应 CUDA 扩展。用仓库打包器从
 source .shrc_local
 ros2 run perception_service package_ascend_perception_bundles \
   --models-root models \
-  --family grounding_dino
+  --model-type grounding_dino
 ros2 run perception_service package_ascend_perception_bundles \
   --models-root models \
-  --family sam2
+  --model-type sam2
 ```
 
 `--models-root` 必须与 robot config 的 bundle 根目录一致。打包器从 `models/_work/` 中读取已经验证的候选，
 并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720_ascend/` 和
-`models/sam2_hiera_tiny_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
+`models/sam2.1_hiera_tiny_prompt_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
+
+SAM2 的 operation 是 v3 manifest 的 bundle 级模型身份，不是 deployment 属性：
+`models/sam2.1_hiera_tiny/` 只承载 `sam2/automatic`，可以在该语义下提供 CPU、CUDA 或 Ascend named
+deployment；`models/sam2.1_hiera_tiny_prompt_ascend/` 承载抓取所需的 `sam2/prompt`。两者可以复用同一
+模型族的权重来源，但输入、输出和预后处理契约不同，不能合并到同一个 manifest。
 
 Grounding-DINO bundle 记录并校验 12 个 OM、`encoder_tgt.npy`、bundle-local WordPiece vocab 和 D2D links；
 SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固定输入为
@@ -337,7 +343,7 @@ perception_services:
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/GroundingDetect
     - id: grasp_segmentation
-      bundle_path: models/sam2_hiera_tiny_ascend
+      bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/SegmentDetections
 ```
@@ -359,7 +365,7 @@ typed endpoint、`ModelSession`——所以既不出现在 `inference_service` �
 | Service type | `ibrobot_msgs/srv/GenerateGrasps` |
 | Plugin | `perception_service.model_service_plugins:GraspGenGenerateGraspsPlugin` |
 | Adapter | `perception_service.graspgen_adapter:GraspGenAdapter` |
-| Family | `graspgen`（`ModelDescriptor.kind == "perception"`） |
+| Model identity | `tensor_model/graspgen/generate_grasps` |
 
 Request 是 `sensor_msgs/PointCloud2 object_points` 加 `max_grasps` / `min_confidence`；
 Response 是 `GraspCandidateArray grasps` 加通用诊断字段 `model` / `inference_time_ms` /
@@ -403,20 +409,20 @@ outputs = [grasp.poses      float32 [-1, 4, 4],
 
 `grasp.poses` 是主机积分出来的，不绑定到任何 OM 输出张量。
 
-Runtime options 在通用 Ascend 的 `acl_config_path` / `device_id` 之外多接受一个
+Runtime options 在通用 Ascend 的 `device_id` 之外多接受一个
 `random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。统一 bundle 同时声明
 `torch_cuda` 与 `ascend_310p`；两者共享 adapter、配置和 checkpoint 身份，但运行时必须显式选择
 named deployment。Ascend 的八个 OM 与它们之间的主机数学仍是一个整体契约。
 
 ### 10.3 Bundle 与 promotion
 
-Bundle 属于抓取模型域，不含任何 LeRobot 资产；当前通用运行时仍以
-`kind="perception"` 作为兼容分类，不代表它应放在 `models/perception/`：
+Bundle 属于抓取模型域，不含任何 LeRobot 资产；通用运行时使用
+`interface="tensor_model"`，不代表它应放在 `models/perception/`：
 
 ```
 models/grasp/graspgen_robotiq_2f_140/
-  inference_manifest.json          # schema v2, model.kind=perception, family=graspgen
-  assets/adapter.json              # family/identity + kappa, diffusion_steps,
+  inference_manifest.json          # schema v3, tensor_model/graspgen/generate_grasps
+  assets/adapter.json              # model identity + kappa, diffusion_steps,
                                    # grasp_batch_size, point_count, geometry
   assets/graspgen_config.yml
   assets/generator_checkpoint.pth

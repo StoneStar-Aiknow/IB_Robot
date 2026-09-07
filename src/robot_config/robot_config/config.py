@@ -164,6 +164,7 @@ class EmbodiedConfig:
     relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
     perception: dict[str, Any] = field(default_factory=dict)
     visual_games: dict[str, Any] = field(default_factory=dict)
+    imitate_human_motion: dict[str, Any] = field(default_factory=dict)
     gripper_open_position: float = 1.0
     gripper_closed_position: float = 0.0
     skill_templates: dict[str, Any] = field(default_factory=dict)
@@ -192,9 +193,24 @@ class VoiceASRConfig:
     sample_rate: int = 16000
     chunk_size: int = 512
     buffer_seconds: float = 5.0
-    device_index: int = -1
-    device_name: str = ""
+    audio_input_channel: int = 1
     exit_on_init_failure: bool = True
+
+
+@dataclass
+class AudioIOConfig:
+    """Cross-platform audio_common device-owner configuration."""
+
+    enabled: bool = False
+    microphone: str = ""
+    capture_topic: str = "/audio/capture"
+    capture_stamped_topic: str = "/audio/capture_stamped"
+    audio_info_topic: str = "/audio/info"
+    playback_topic: str = "/audio/play"
+    playback_device: str = ""
+    playback_channels: int = 1
+    playback_sample_rate: int = 24000
+    playback_sample_format: str = "S16LE"
 
 
 @dataclass
@@ -215,7 +231,7 @@ class VoiceTTSConfig:
     """Typed Voice TTS service configuration managed by robot_config."""
 
     enabled: bool = False
-    bundle_path: str = "models/voice_tts/zipvoice"
+    bundle_path: str = "models/zipvoice"
     deployment: str = ""
     service_name: str = "/voice_tts/synthesize"
     playback_service_name: str = "/voice_tts/play"
@@ -270,6 +286,7 @@ class RobotConfig:
     peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
+    audio_io: AudioIOConfig = field(default_factory=AudioIOConfig)
     speech_direction: SpeechDirectionConfig = field(default_factory=SpeechDirectionConfig)
     voice_tts: VoiceTTSConfig = field(default_factory=VoiceTTSConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)

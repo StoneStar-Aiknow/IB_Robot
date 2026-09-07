@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from inference_manifest import load_inference_manifest
 from perception_service.package_ascend_perception_bundles import _specs, package_bundle
 from perception_service.semantic_model_adapters import SigLIP2ImageAdapter
@@ -40,34 +42,30 @@ def test_compiled_ascend_bundle_specs_validate(tmp_path):
             assert validated.deployment.bindings["flatten"].outputs[0].runtime_name == "/Concat_4:0:visual"
 
 
-def test_packager_migrates_existing_bundles_after_candidate_cleanup(tmp_path):
+def test_packager_rejects_existing_legacy_bundles(tmp_path):
     expected_identities = {
         "sam2": ("sam2_prompt", "sam2", "prompt"),
         "grounding_dino": ("grounding_dino_raw", "grounding_dino", "raw"),
     }
-    for family, (legacy_family, expected_family, expected_operation) in expected_identities.items():
+    for family, (legacy_family, _expected_family, _expected_operation) in expected_identities.items():
         spec = _specs()[family]
         _write_sources(tmp_path, spec)
         manifest_path = package_bundle(tmp_path, spec)
-        first = load_inference_manifest(manifest_path.parent, spec.deployments[0].name).manifest
-
         legacy = json.loads(manifest_path.read_text(encoding="utf-8"))
         legacy["model"]["family"] = legacy_family
         legacy["model"].pop("operation", None)
         manifest_path.write_text(json.dumps(legacy), encoding="utf-8")
 
-        for deployment in spec.deployments:
-            for artifact in deployment.artifacts:
-                (tmp_path / artifact.source).unlink()
-        for source, _destination in spec.assets:
-            (tmp_path / source).unlink()
+        with pytest.raises(Exception, match="schema_version|model_type|interface"):
+            package_bundle(tmp_path, spec)
 
-        package_bundle(tmp_path, spec)
-        migrated = load_inference_manifest(manifest_path.parent, spec.deployments[0].name).manifest
 
-        assert migrated.bundle.uuid == first.bundle.uuid
-        assert migrated.bundle.revision == first.bundle.revision + 1
-        assert (migrated.model.family, migrated.model.operation) == (expected_family, expected_operation)
+def test_sam2_ascend_bundle_name_identifies_box_prompt_contract():
+    spec = _specs()["sam2"]
+
+    assert spec.name == "sam2.1_hiera_tiny_prompt_ascend"
+    assert spec.operation == "prompt"
+    assert spec.name != "sam2.1_hiera_tiny"
 
 
 def test_siglip2_ascend_bundle_declares_loadable_embedding_identity(tmp_path, monkeypatch):

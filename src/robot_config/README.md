@@ -785,7 +785,7 @@ control_modes:
         max_backoff_ms: 500
 ```
 
-Scheduler 开启时只接受 schema v2 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
+Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
 分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
 priority-0 的每个请求独立使用自己的 target、fallback chain 和 deadline 做
@@ -904,19 +904,17 @@ ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray 
 ros2 launch robot_config robot.launch.py \
   robot_config:=so101_single_arm \
   voice_asr_auto_start:=true \
-  voice_asr_device_name:=Blackwire \
   voice_asr_realtime_pre_roll_seconds:=0.5
 ```
 
 | Launch 参数 | 作用 |
 | --- | --- |
 | `voice_asr_auto_start` | 临时覆盖 `robot.voice_asr.enabled`，设为 `true` 时强制启动 ASR 节点 |
-| `voice_asr_device_index` | 临时覆盖 `robot.voice_asr.device_index` |
-| `voice_asr_device_name` | 临时覆盖 `robot.voice_asr.device_name`，优先按设备名匹配 |
 | `voice_asr_realtime_pre_roll_seconds` | 临时覆盖实时识别 pre-roll 时长 |
 
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
-具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
+具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。实时麦克风设备由
+`robot.audio_io` 及其引用的 microphone peripheral 统一配置。
 
 ### Voice TTS（语音合成）
 
@@ -927,7 +925,8 @@ ros2 launch robot_config robot.launch.py \
 TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
 并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
 `MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
-同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 ALSA 同步播放并返回明确的
+同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 `audio_common`
+共享播放 Topic 同步发布并返回明确的
 成功状态、错误码和消息；该播放节点不依赖模型 session。
 launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle 并加载 session，因而
 `exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；
@@ -935,7 +934,7 @@ TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加
 合成结束并释放模型资源。
 该配置不会启用请求级初始化重试；修复 bundle、依赖或设备后必须重启 TTS 节点才能恢复。
 相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
-`$WORKSPACE/models/voice_tts/zipvoice`。
+`$WORKSPACE/models/zipvoice`。
 当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
 WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
 不是 `robot_config` 的隐式后端选择。

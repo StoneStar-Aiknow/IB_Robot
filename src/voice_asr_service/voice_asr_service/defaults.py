@@ -17,7 +17,6 @@ VOICE_ASR_DEFAULTS = {
     "sample_rate": 16000,
     "chunk_size": 512,
     "buffer_seconds": 5.0,
-    "device_index": -1,
-    "device_name": "",
+    "audio_input_channel": 1,
     "exit_on_init_failure": True,
 }

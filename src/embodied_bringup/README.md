@@ -10,7 +10,7 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 提供 `embodied_pipeline.launch.py` 公开入口。
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
-- 按配置启动独立 `perception_service` 与抓取执行依赖。
+- 按配置启动独立 `perception_service`、抓取执行依赖和 launch-managed HRI runtime。
 - 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
@@ -106,5 +106,7 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
   controller readiness 只延迟 safety、Skill Gateway、Agent plan、抓取执行和 IK worker 等运动闭包节点，
   不会让已经可发现的视觉游戏 start service 因 perception 尚未启动而暂时返回 `PERCEPTION_UNAVAILABLE`。
 - `lekiwi_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
+- `lekiwi_nav_grasp` hybrid stage 启用 `embodied.imitate_human_motion` 时，bringup 会把 arm 关节顺序、
+  reset positions 和 joint limits 从同一份 `robot_config` 注入 HRI runtime，并在启动时默认尝试一次 warmup。
 - 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

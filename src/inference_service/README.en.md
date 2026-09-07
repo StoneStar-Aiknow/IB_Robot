@@ -1,12 +1,19 @@
 # inference_service
 
-`inference_service` is IB-Robot's unified inference runtime. It selects one policy bundle, one named deployment,
-and one stable pipeline ID, then runs that pipeline through Torch, Ascend, Hisilicon, RKNN, or HMM in either
-monolithic or distributed edge/cloud mode.
+`inference_service` is IB-Robot's unified inference runtime. It selects one model bundle and one named deployment,
+then runs the model through Torch, Ascend, Hisilicon, RKNN, or HMM. Policy models additionally use a stable pipeline
+ID and support monolithic or distributed edge/cloud execution.
 
 There is no compatibility layer for the removed runtime architecture. A backend is not selected with a launch
 `device` argument. The runtime does not load per-backend sidecar manifests, scan directories for conventional
 artifact names, or use environment variables to override artifacts.
+
+Local requests use `ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)` and return `ModelResult`.
+`ModelRuntimeFactory` is a registered construction surface, not the request boundary. A policy reaches the handle
+through its `InferencePipeline` facade. A typed plugin constructs a `ModelSession`, places it in a
+`RuntimeAssembly`, and transfers the assembly to a handle. The handle owns public lifecycle, admission, deadlines,
+cancellation, health, and close draining; the session resource owns and releases vendor model objects, device
+leases, buffers, and workers.
 
 ## Core Concepts
 
@@ -41,14 +48,22 @@ directory. All deployment metadata belongs in `inference_manifest.json`.
 One manifest may declare multiple named deployments for the same policy, such as `cpu`, `cuda`, `rk3588`,
 `ascend_310p3`, or `lq50`. A pipeline selects a deployment name, not a backend name.
 
-A Torch deployment directly declares its runtime device:
+A deployment uses an explicit v3 runtime profile for the backend, target, and instance fields:
 
 ```json
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 1,
-  "backend": "torch",
-  "device": "cpu"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "torch",
+    "target": {"runtime": "torch"},
+    "profile": {"device": "cpu"}
+  }
 }
 ```
 
@@ -58,10 +73,22 @@ A compiled deployment declares its target, artifacts, execution order, and compl
 {
   "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
   "revision": 3,
-  "backend": "rknn",
-  "target": {
-    "soc": "rk3588",
-    "runtime": "rknn-lite2"
+  "execution_contract": {
+    "state_scope": "request",
+    "execution_structure": "direct",
+    "cancellation_granularity": "request_boundary"
+  },
+  "runtime_profile": {
+    "backend": "rknn",
+    "target": {
+      "soc": "rk3588",
+      "runtime": "rknn-lite2"
+    },
+    "profile": {
+      "target_name": "rk3588",
+      "core_mask": 7,
+      "device_id": 0
+    }
   },
   "artifacts": {
     "policy": {
@@ -116,15 +143,17 @@ The pipeline ID is the stable model-instance and ROS-routing identity. It must m
 - its policy bundle and named deployment
 - its LeRobot preprocessor and postprocessor
 - its policy codec and binding execution plan
-- its backend instance, admission state, and lifecycle
+- its `ModelRuntimeHandle`, admission state, and lifecycle
 - its action, reset, health, action-output, and distributed transport endpoints
 
-`GenericModelPipeline` is the public model-neutral runtime used by policy, perception, Echo, and future model
-families. It owns lifecycle, admission, deadlines, cancellation, and health. `PipelineRuntimeCore` is its reusable
-internal state-machine and concurrency implementation. `InferencePipeline` is the policy facade that adds LeRobot
-processors, policy codecs, and action adaptation. Compiled models run through a `SequentialModelExecutor` sequence
-of `InferenceStage` objects; iterative families use `IterativeStage` to invoke roles within one shared
-`ModelSessionExecution` device-resource scope.
+`InferencePipeline` is the policy facade that adapts the existing policy contract to `ModelRuntimeHandle` while
+adding LeRobot processors, policy codecs, and action adaptation. The handle owns lifecycle, admission, deadlines,
+cancellation, health, and diagnostics, and loads then releases the components transferred in its `RuntimeAssembly`.
+Compiled models run through a `SequentialModelExecutor` sequence of `InferenceStage` objects; iterative families
+use `IterativeStage` to invoke roles. One `ExecutionContext` carries the request ID, deadline, and cancellation token
+through every stage and `ModelSession` resource, while the session owns vendor resources shared across those roles.
+Perception, Echo, TTS, and other typed plugins use the direct
+`ModelServicePlugin -> RuntimeAssembly/ModelRuntimeHandle -> ModelSession resource` composition path.
 
 Default endpoints:
 
@@ -234,12 +263,12 @@ heartbeat overrides.
 ```text
 ROS observations
   -> contract adapter
-  -> LeRobot preprocessor
-  -> semantic batch
-  -> native policy, or policy codec + shared stage executor
-  -> Backend.infer, or ModelSession role execution
-  -> semantic action
-  -> LeRobot postprocessor
+  -> InferencePipeline policy facade
+  -> ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)
+  -> SequentialModelExecutor stages
+       -> LeRobot preprocessor + policy codec
+       -> ModelSession execute / role execution
+       -> action decode + LeRobot postprocessor
   -> DispatchInfer result and action topic
 ```
 
@@ -369,15 +398,16 @@ ros2 launch inference_service local_distributed_inference.launch.py \
 
 The edge can be created from robot YAML with `execution_mode: distributed` or through the explicit launch
 override above. A successful handshake binds a unique
-session ID and generation. Heartbeat expiry, cloud restart, fingerprint change, or a backend leaving `READY`
+session ID and generation. Heartbeat expiry, cloud restart, fingerprint change, or the runtime handle leaving `READY`
 immediately revokes readiness, rejects new requests, and fails in-flight requests with a structured unavailable
 error. Responses from old sessions are discarded, and recovery requires a new handshake.
 
-A new handshake is not sufficient to recover a stateful backend. When replacing an existing session, the cloud
-first stops admission for the old session and drains its runtime operations. A stateless backend may then create
-the new generation directly. A stateful backend must first reset successfully and return to `READY` before the
-cloud publishes a new generation. Reset failure remains fail-closed and subsequent heartbeats cannot bypass this
-recovery barrier. If a stateful backend declares `resettable: false`, session rollover cannot recover through
+A new handshake is not sufficient to recover a stateful runtime. When replacing an existing distributed session,
+the cloud first stops request admission for that session and drains its `ModelRuntimeHandle` operations. A stateless
+runtime may then create the new generation directly. A stateful runtime must first reset successfully through the
+handle and return to `READY` before the cloud publishes a new generation. Reset failure remains fail-closed and
+subsequent heartbeats cannot bypass this recovery barrier. If a stateful runtime declares `resettable: false`,
+session rollover cannot recover through
 handshaking; the cloud runtime must be restarted or rebuilt before it can serve requests again.
 
 ## Backends And Support Matrix
@@ -392,20 +422,21 @@ The only canonical backend names are:
 | `rknn` | RKNNLite execution of RKNN artifacts |
 | `hmm` | Houmo TCIM execution of HMM multi-module artifacts |
 
-Compiled PI0.5 and SmolVLA loops are no longer owned by legacy backend classes. They execute through
-`GenericModelPipeline -> SequentialModelExecutor -> InferenceStage -> ModelSession`; the corresponding
-`AscendBackend`, `HMMBackend`, and `RKNNBackend` fail closed for migrated families. The following matrix is
-normative and enforced at startup:
+Compiled PI0.5 and SmolVLA loops are owned by shared executor stages, not model-session resources. They execute through
+`InferencePipeline -> ModelRuntimeHandle -> SequentialModelExecutor -> InferenceStage -> ModelSession resource`.
+The handle owns control-plane state, while each session owns only its vendor runtime and model resources. The
+following matrix is normative and enforced at startup:
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
-| ACT | Backend | Backend | Backend | Backend | unsupported |
-| Diffusion Policy | Backend | unsupported | unsupported | unsupported | unsupported |
-| PI0.5 | Backend | ModelSession | unsupported | unsupported | ModelSession |
-| SmolVLA | Backend | unsupported | unsupported | ModelSession | ModelSession |
+| ACT | Runtime | Runtime | Runtime | Runtime | unsupported |
+| Diffusion Policy | Runtime | unsupported | unsupported | unsupported | unsupported |
+| PI0.5 | Runtime | Runtime | unsupported | unsupported | Runtime |
+| SmolVLA | Runtime | unsupported | unsupported | Runtime | Runtime |
 
-`Backend` means direct `*Backend.infer()` execution. `ModelSession` means role execution through a shared family
-executor. The registry-enforced perception matrix is:
+`Runtime` means execution through `ModelRequest` and `ExecutionContext`, with handle-owned lifecycle, admission,
+health, cancellation, and recovery and session-owned vendor model resources. The registry-enforced perception
+matrix is:
 
 | Perception family | `torch` | `ascend` |
 | --- | --- | --- |
@@ -431,8 +462,8 @@ NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP b
 against an existing baseline.
 
 A new Action Expert OM has a runtime output named `velocity` or `v_t`, while the Manifest still maps that tensor
-to the policy `action` semantic. The Ascend backend reads strictly decreasing timesteps from the selected
-deployment's `denoising_schedule` artifact and performs host-side Euler integration as
+to the policy `action` semantic. The policy runtime assembler reads strictly decreasing timesteps from the selected
+deployment's `denoising_schedule` artifact, and the shared `IterativeStage` performs host-side Euler integration as
 `x_next = x_t + (next_t - t) * velocity` before returning the final action. When export does not specify
 `--schedule-file`, the exporter packages a uniform schedule derived from `config.num_inference_steps`; an explicit
 file must be strict `pi05-denoising-schedule-v1` JSON.
@@ -458,14 +489,17 @@ or Hisilicon worker dependencies. A missing dependency fails only when its deplo
 
 ## Lifecycle, Health, And Capabilities
 
-Backend states are `CREATED`, `LOADING`, `READY`, `DEGRADED`, `RECOVERING`, `FAILED`, `CLOSING`, and
-`CLOSED`. Only `READY` admits requests. `close()` is idempotent, and partial startup failure releases every
-already-created context, model handle, device buffer, or worker.
+Public `ModelRuntimeHandle` states are `CREATED`, `LOADING`, `READY`, `RESET_REQUIRED`, `RESETTING`, `FAILED`,
+`CLOSING`, and `CLOSED`. Only `READY` admits requests. The handle closes admission and drains active execution
+before reset or close, records health and recovery requirements, and idempotently releases `RuntimeAssembly`
+components in reverse ownership order.
 
-Pipeline states are `CREATED`, `LOADING`, `HANDSHAKING`, `READY`, `RESETTING`, `DEGRADED`, `FAILED`,
-`CLOSING`, and `CLOSED`. Reset blocks new admission. `CLOSING` and `CLOSED` are terminal.
+`ModelSession` is a handle-owned resource, not the public lifecycle owner. It owns and releases contexts, vendor
+model handles, device buffers, workers, tokenizers, and other model-specific assets, and implements
+`execute(ModelRequest, ExecutionContext)` or role execution. The policy facade projects handle state into pipeline
+diagnostics; distributed `HANDSHAKING` is a node-protocol state, not a model-resource lifecycle state.
 
-Backend capabilities report:
+Session and deployment capabilities let the handle determine:
 
 - whether the backend is stateful, resettable, and thread-safe
 - maximum in-flight requests per instance
@@ -473,15 +507,16 @@ Backend capabilities report:
 - shared resource-domain identity and limit
 - attention and cancellation support
 
-Defaults are conservative and serialized. A backend may declare higher concurrency only after conformance tests
-prove overlapping calls, output isolation, failure isolation, and deterministic cleanup. Different pipelines have
+Defaults are conservative and serialized. A runtime may declare higher concurrency only after conformance tests
+prove overlapping calls, output isolation, failure isolation, and deterministic cleanup. Different handles have
 independent admission state, but a shared accelerator resource domain may still serialize them.
 
 ## Manifest Identity
 
 Startup performs strict JSON/schema validation, deployment selection, UUID/revision and lightweight bundle-digest
 validation, path-safety and regular-file checks, LeRobot metadata loading, and binding compatibility checks before
-creating a backend runtime. Runtime does not read OM, RKNN, HMM, or safetensors files to hash their contents.
+constructing the session resource, `RuntimeAssembly`, and `ModelRuntimeHandle`. Runtime does not read OM, RKNN,
+HMM, or safetensors files to hash their contents.
 
 `bundle.digest` is calculated as follows:
 
@@ -498,8 +533,8 @@ The selected deployment fingerprint is SHA-256 over this canonical object:
 
 ```json
 {
-  "format": "ibrobot.deployment-structure-v2",
-  "schema_version": 2,
+  "format": "ibrobot.deployment-structure-v3",
+  "schema_version": 3,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -522,7 +557,7 @@ Do not edit identities manually when startup reports:
 Rerun the exporter or packaging workflow that owns the artifact. Exporters copy artifacts, read compiler/runtime
 ABI metadata, generate bindings, update UUIDs/revisions and lightweight structural identities, and validate the
 result through the production loader. Schema-v1 bundles and legacy artifacts are unsupported; regenerate a complete
-schema-v2 bundle with the current exporter or packager.
+schema-v3 bundle with the current exporter or packager.
 
 ## Exporter Entry Points
 

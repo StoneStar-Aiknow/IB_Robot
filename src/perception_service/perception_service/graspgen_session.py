@@ -7,6 +7,15 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_manifest import (
+    CompiledDeployment,
+    TensorBinding,
+)
+from inference_service.backends.ascend.model import numpy_dtype
+from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.types import RuntimeContext
+from inference_service.model_sessions.ascend import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from model_utils.graspgen_contract import (
     GRASPGEN_CONFIDENCE_SEMANTIC,
     GRASPGEN_DIFFUSION_SAMPLE,
     GRASPGEN_DIFFUSION_TIME,
@@ -20,15 +29,7 @@ from inference_manifest import (
     GRASPGEN_PREDICTED_NOISE,
     GRASPGEN_STAGE2_FEATURES,
     GRASPGEN_STAGE_FEATURES,
-    CompiledDeployment,
-    TensorBinding,
 )
-from inference_service.backends.ascend.model import numpy_dtype
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.backends.types import RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
-from inference_service.model_sessions.ascend import AscendOmModelSession
 
 from .graspgen_adapter import GraspGenConfig
 from .graspgen_geometry import (
@@ -53,6 +54,9 @@ class GraspGenAscendSession(AscendOmModelSession):
     tensors crossing the ``ModelSession`` boundary are the two the manifest declares.
     """
 
+    execution_contract = "request-iterative"
+    orchestration_visibility = "session"
+
     allowed_runtime_options = AscendOmModelSession.allowed_runtime_options | {"random_seed"}
 
     def __init__(self, device_id: int = 0, *, config: GraspGenConfig, **kwargs) -> None:
@@ -60,7 +64,7 @@ class GraspGenAscendSession(AscendOmModelSession):
         self._config = config
         self._random: np.random.Generator | None = None
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         if isinstance(deployment, CompiledDeployment) and deployment.execution != GRASPGEN_EXECUTION:
             raise BackendLoadError(
@@ -77,7 +81,8 @@ class GraspGenAscendSession(AscendOmModelSession):
         self._random = None
         super()._close()
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         config = self._config
         points = np.asarray(request.inputs[GRASPGEN_POINT_CLOUD_SEMANTIC], dtype=np.float32)
         geometry = build_pointnet_geometry(points, npoints=config.npoints, radii=config.radii, nsamples=config.nsamples)

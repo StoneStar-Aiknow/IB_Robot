@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -18,10 +17,11 @@ for package_root in (_SRC, _WORKSPACE_SRC / "inference_manifest", _WORKSPACE_SRC
 
 from inference_manifest import load_inference_manifest  # noqa: E402
 from inference_service.backends import RuntimeContext  # noqa: E402
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, StatefulAscendOmModelSession  # noqa: E402
+from inference_service.model_sessions import StatefulAscendOmModelSession  # noqa: E402
+from inference_service.runtime_composition import build_runtime_dependencies  # noqa: E402
 from voice_asr_service.model_session_builders import register_speech_direction_session_builder  # noqa: E402
+from voice_asr_service.speech_direction.config import FullSubNetConfig, VadConfig  # noqa: E402
 from voice_asr_service.speech_direction.model_sessions import SpeechDirectionRoleRunner  # noqa: E402
-from voice_asr_service.speech_direction.node import _build_acl_runtime_options  # noqa: E402
 from voice_asr_service.speech_direction.speech_gate import SileroVadEngine  # noqa: E402
 
 
@@ -38,18 +38,14 @@ class _Execution:
 
 class _Session:
     def __init__(self) -> None:
-        self.execution_calls = 0
         self.execute_role_calls = []
-        self.last_execution = None
 
-    @contextmanager
-    def execution(self, request):
-        self.execution_calls += 1
-        self.last_execution = _Execution()
-        yield self.last_execution
-
-    def execute_role(self, role, values, request):
-        self.execute_role_calls.append((role, values, request))
+    def execute_role(self, role, values, request, context):
+        self.execute_role_calls.append((role, values, request, context))
+        if role == "fullsubnet_fb":
+            return {"host.fullsubnet.fb_features": np.zeros((4, 2, 257), dtype=np.float32)}
+        if role == "fullsubnet_sb":
+            return {"host.fullsubnet.sb_mask": np.zeros((1028, 2, 2), dtype=np.float32)}
         return {"host.silero.prob": np.array([[0.75]], dtype=np.float32)}
 
 
@@ -70,16 +66,34 @@ class _VadRunner:
         self.close_calls += 1
 
 
-@pytest.mark.parametrize(
-    ("acl_config_path", "expected"),
-    [
-        ("", {"device_id": 0}),
-        ("   ", {"device_id": 0}),
-        (" /etc/acl.json ", {"device_id": 0, "acl_config_path": "/etc/acl.json"}),
-    ],
-)
-def test_acl_runtime_options_omit_empty_default_path(acl_config_path, expected) -> None:
-    assert _build_acl_runtime_options(0, acl_config_path) == expected
+def test_voice_asr_uses_canonical_backend_names_without_runtime_acl_options() -> None:
+    assert FullSubNetConfig().backend == "ascend"
+    assert VadConfig().backend == "ascend"
+    assert not hasattr(FullSubNetConfig(), "acl_config_path")
+
+
+def test_stateful_ascend_maps_recurrent_bindings_by_semantic_suffix() -> None:
+    bindings = type(
+        "Bindings",
+        (),
+        {
+            "inputs": (
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_spectrum", "index": 0})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_in", "index": 1})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_in", "index": 2})(),
+            ),
+            "outputs": (
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_features", "index": 0})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_out", "index": 1})(),
+                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_out", "index": 2})(),
+            ),
+        },
+    )()
+
+    hidden_link = type("Link", (), {"state_name": "hidden"})()
+    cell_link = type("Link", (), {"state_name": "cell"})()
+    assert StatefulAscendOmModelSession._state_indices_for_role(bindings, hidden_link, "fullsubnet_fb") == ((1, 1),)
+    assert StatefulAscendOmModelSession._state_indices_for_role(bindings, cell_link, "fullsubnet_fb") == ((2, 2),)
 
 
 def test_silero_engine_reuses_runner_and_adds_context(tmp_path) -> None:
@@ -107,9 +121,8 @@ def test_fullsubnet_roles_share_one_session_execution_scope() -> None:
 
     assert fb.shape == (4, 2, 257)
     assert sb.shape == (1028, 2, 2)
-    assert session.execution_calls == 1
-    assert [call[0] for call in session.last_execution.calls] == ["fullsubnet_fb", "fullsubnet_sb"]
-    assert session.execute_role_calls == []
+    assert [call[0] for call in session.execute_role_calls] == ["fullsubnet_fb", "fullsubnet_sb"]
+    assert len({id(call[3]) for call in session.execute_role_calls}) == 1
 
 
 def test_role_runner_rejects_nested_execution_scopes() -> None:
@@ -126,26 +139,39 @@ def test_silero_inference_uses_standalone_session_execution() -> None:
     probability = runner.infer(np.zeros((1, 576), dtype=np.float32))
 
     assert probability == pytest.approx(0.75)
-    assert session.execution_calls == 0
     assert [call[0] for call in session.execute_role_calls] == ["silero_vad"]
 
 
 @pytest.mark.parametrize("deployment_name", ["ascend_310p_fullsubnet", "ascend_310p_silero"])
 def test_checked_in_speech_manifest_selects_generic_stateful_session(tmp_path, deployment_name) -> None:
-    config_root = _SRC / "config"
+    config_root = _WORKSPACE_SRC.parent / "models" / "voice_asr"
     manifest = json.loads((config_root / "inference_manifest.json").read_text(encoding="utf-8"))
+    for deployment in manifest["deployments"].values():
+        for artifact in deployment["artifacts"].values():
+            artifact.pop("sha256", None)
     (tmp_path / "inference_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    adapter_dir = tmp_path / "assets"
-    adapter_dir.mkdir()
-    (adapter_dir / "adapter.json").write_bytes((config_root / "assets" / "adapter.json").read_bytes())
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "README.md").write_text("test bundle\n", encoding="utf-8")
     for deployment in manifest["deployments"].values():
         for artifact in deployment["artifacts"].values():
             path = tmp_path / artifact["path"]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"mock-om")
 
-    context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0})
-    register_speech_direction_session_builder()
-    session = MODEL_SESSION_BUILDER_REGISTRY.create(context)
+    role = "fullsubnet_fb" if deployment_name.endswith("fullsubnet") else "silero_vad"
+    context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0}, role=role)
+    assert context.target_runtime == "acl"
+    assert context.runtime_abi == "cann-8.1.RC1"
+    dependencies = build_runtime_dependencies(
+        lambda session_registry, _assembler_registry: register_speech_direction_session_builder(session_registry)
+    )
+    try:
+        session = dependencies.registry_set.session_builder_registry.create(
+            context,
+            backend_registry=dependencies.registry_set.backend_registry,
+            providers=dependencies.providers,
+        )
+    finally:
+        dependencies.providers.close()
 
     assert isinstance(session, StatefulAscendOmModelSession)

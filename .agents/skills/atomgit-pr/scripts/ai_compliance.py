@@ -50,6 +50,42 @@ def _require_models(value: str) -> list[str]:
     return list(dict.fromkeys(models))
 
 
+_DISCLOSURE_BLOCK_RE = re.compile(
+    rf"{re.escape(DISCLOSURE_START)}.*?{re.escape(DISCLOSURE_END)}",
+    re.DOTALL,
+)
+_HANDWRITTEN_DISCLOSURE_RE = re.compile(r"当前PR是否有AI参与|希望检视人员了解|Agent平台信息（Tool）")
+
+
+def _ensure_disclosure_separator(description: str) -> str:
+    """Keep exactly one horizontal rule between the disclosure block and the body."""
+    head, marker, tail = description.partition(DISCLOSURE_END)
+    if not marker:
+        return description
+    tail = tail.rstrip()
+    if not tail:
+        return head + DISCLOSURE_END
+    # Strip blank lines and stray horizontal rules after the managed block, then
+    # re-insert exactly one separator.
+    tail = re.sub(r"\A(?:\s|-{3,}[ \t]*\n\s*)*", "", tail)
+    return f"{head}{DISCLOSURE_END}\n\n---\n\n{tail}"
+
+
+def reject_handwritten_disclosure(description: str) -> None:
+    """Reject AI disclosure content written outside the managed marker block.
+
+    The disclosure is generated exclusively by ``add_ai_disclosure`` from CLI
+    metadata. A hand-written section would duplicate the managed block.
+    """
+    outside_block = _DISCLOSURE_BLOCK_RE.sub("", description)
+    if _HANDWRITTEN_DISCLOSURE_RE.search(outside_block):
+        raise ValueError(
+            "hand-written AI disclosure content detected in the PR description; remove it — the openEuler "
+            "disclosure block is generated automatically from --agent-tool/--ai-model/--prompt-summary/"
+            "--third-party-materials and must stay inside the managed marker block"
+        )
+
+
 def add_ai_disclosure(
     description: str,
     *,
@@ -80,16 +116,14 @@ def add_ai_disclosure(
 代码或文档由 AI 辅助开发者完成，最终正确性、安全性、合规性和维护责任由人类贡献者承担。
 {DISCLOSURE_END}"""
 
-    if DISCLOSURE_START in description or DISCLOSURE_END in description:
-        pattern = re.compile(
-            rf"{re.escape(DISCLOSURE_START)}.*?{re.escape(DISCLOSURE_END)}",
-            re.DOTALL,
-        )
-        if pattern.search(description) is None:
+    body = description.strip()
+    if not body:
+        return disclosure
+    if _DISCLOSURE_BLOCK_RE.search(description) is None:
+        if DISCLOSURE_START in description or DISCLOSURE_END in description:
             raise ValueError("PR description contains an incomplete openEuler AI disclosure block")
-        return pattern.sub(disclosure, description, count=1)
-
-    return f"{disclosure}\n\n{description.strip()}"
+        return _ensure_disclosure_separator(f"{disclosure}\n\n{body}")
+    return _ensure_disclosure_separator(_DISCLOSURE_BLOCK_RE.sub(lambda _m: disclosure, description, count=1))
 
 
 def _commit_message(commit: dict) -> str:

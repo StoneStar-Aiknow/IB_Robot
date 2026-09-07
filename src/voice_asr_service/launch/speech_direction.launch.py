@@ -22,15 +22,7 @@ def _prepend_env(current: str, entries: tuple[Path, ...]) -> str:
     return os.pathsep.join(values)
 
 
-_MODEL_PATH_KEYS = (
-    "silero_vad_model_path",
-    "fullsubnet_ckpt",
-    "fullsubnet_om_path",
-    "fullsubnet_stateful_fb_om_path",
-    "fullsubnet_stateful_sb_om_path",
-    "fullsubnet_stateful_manifest_path",
-    "speech_direction_inference_bundle",
-)
+_MODEL_PATH_KEYS = ("speech_direction_inference_bundle",)
 
 
 def _workspace_root() -> Path:
@@ -58,9 +50,7 @@ def _load_profile_overrides(profiles_path: str | Path, profile: str) -> dict[str
         raise ValueError(f"平台 profile {profile} 必须是 mapping")
     allowed = {
         "silero_vad_backend",
-        "silero_vad_model_path",
         "fullsubnet_backend",
-        "fullsubnet_device",
     }
     unexpected = set(overrides) - allowed
     if unexpected:
@@ -71,12 +61,11 @@ def _load_profile_overrides(profiles_path: str | Path, profile: str) -> dict[str
 def _validate_profile_combination(profile: str, params: Mapping[str, object]) -> None:
     """在 launch 边界拒绝半切换配置，避免后端与模型路径错配。"""
     if profile == "ascend_310p":
-        expected = {"silero_vad_backend": "raw_acl", "fullsubnet_backend": "stateful_raw_acl"}
+        expected = {"silero_vad_backend": "ascend", "fullsubnet_backend": "ascend"}
     elif profile == "ubuntu_cuda":
         expected = {
             "silero_vad_backend": "onnx",
             "fullsubnet_backend": "stateful_torch_cuda",
-            "fullsubnet_device": "cuda",
         }
     else:
         return
@@ -136,30 +125,23 @@ def _launch_setup(context):
     channel_indices = LaunchConfiguration("microphone_channel_indices").perform(context).strip()
     parameter_overrides: dict[str, object] = {}
     for launch_name, parameter_name in (
-        ("microphone_device_name_contains", "device_name_contains"),
-        ("microphone_arecord_device", "arecord_device"),
+        ("microphone_channels", "audio_channels"),
         ("microphone_sample_rate", "sample_rate"),
+        ("speech_direction_audio_topic", "audio_topic"),
     ):
         value = LaunchConfiguration(launch_name).perform(context).strip()
         if value:
-            parameter_overrides[parameter_name] = int(value) if parameter_name == "sample_rate" else value
+            parameter_overrides[parameter_name] = (
+                int(value) if parameter_name in {"sample_rate", "audio_channels"} else value
+            )
     if channel_indices:
         parsed_channels = yaml.safe_load(channel_indices)
         if not isinstance(parsed_channels, list):
             raise ValueError("microphone_channel_indices must be a YAML list")
         parameter_overrides["channel_indices"] = parsed_channels
-    for launch_name, parameter_name in (
-        ("speech_direction_input_source", "input_source"),
-        ("speech_direction_mount_yaw_deg", "mount_yaw_deg"),
-        ("speech_direction_wav_path", "wav_path"),
-        ("speech_direction_wav_replay_rate", "wav_replay_rate"),
-    ):
-        value = LaunchConfiguration(launch_name).perform(context).strip()
-        if value:
-            if parameter_name in {"mount_yaw_deg", "wav_replay_rate"}:
-                parameter_overrides[parameter_name] = float(value)
-            else:
-                parameter_overrides[parameter_name] = value
+    mount_yaw_deg = LaunchConfiguration("speech_direction_mount_yaw_deg").perform(context).strip()
+    if mount_yaw_deg:
+        parameter_overrides["mount_yaw_deg"] = float(mount_yaw_deg)
     params = _load_speech_direction_parameters(
         config_path,
         models_root,
@@ -167,9 +149,9 @@ def _launch_setup(context):
         profiles_path=profiles_path,
         parameter_overrides=parameter_overrides,
     )
-    # 只有 raw ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
+    # 只有 Ascend ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
     environment = {}
-    if params.get("silero_vad_backend") == "raw_acl" or params.get("fullsubnet_backend") == "stateful_raw_acl":
+    if params.get("silero_vad_backend") == "ascend" or params.get("fullsubnet_backend") == "ascend":
         environment = {
             "ASCEND_HOME_PATH": str(_CANN_ROOT),
             "PYTHONPATH": _prepend_env(os.environ.get("PYTHONPATH", ""), (_CANN_ROOT / "python" / "site-packages",)),
@@ -217,14 +199,11 @@ def generate_launch_description():
                 default_value=str(_workspace_root() / "models"),
                 description="模型根目录；YAML 中相对模型路径以此为基准",
             ),
-            DeclareLaunchArgument("microphone_device_name_contains", default_value=""),
-            DeclareLaunchArgument("microphone_arecord_device", default_value=""),
             DeclareLaunchArgument("microphone_sample_rate", default_value=""),
+            DeclareLaunchArgument("microphone_channels", default_value=""),
+            DeclareLaunchArgument("speech_direction_audio_topic", default_value=""),
             DeclareLaunchArgument("microphone_channel_indices", default_value=""),
-            DeclareLaunchArgument("speech_direction_input_source", default_value=""),
             DeclareLaunchArgument("speech_direction_mount_yaw_deg", default_value=""),
-            DeclareLaunchArgument("speech_direction_wav_path", default_value=""),
-            DeclareLaunchArgument("speech_direction_wav_replay_rate", default_value=""),
             OpaqueFunction(function=_launch_setup),
         ]
     )

@@ -12,8 +12,8 @@
   <depend>rclpy</depend>
   <depend>ibrobot_msgs</depend>
   <depend>inference_manifest</depend>
+  <depend>audio_common_msgs</depend>
   <exec_depend>inference_service</exec_depend>
-  <exec_depend>alsa-utils</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

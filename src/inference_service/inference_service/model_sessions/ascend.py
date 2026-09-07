@@ -7,9 +7,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from inference_manifest import INTERNAL_SEMANTIC_PREFIX, CompiledDeployment, TensorBinding
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.ascend.acl_runtime import (
-    ACL_RUNTIME_MANAGER,
     AclPriorityStreamPool,
     AclRuntimeLease,
     AclRuntimeManager,
@@ -21,15 +19,14 @@ from inference_service.backends.errors import (
     BackendLifecycleError,
     BackendLoadError,
 )
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import (
     BackendAdmissionEvidence,
     BackendCapabilities,
     BackendPriorityMapping,
     RuntimeContext,
 )
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
 class AscendOmModelSession(ModelSession):
@@ -37,15 +34,17 @@ class AscendOmModelSession(ModelSession):
 
     # Subclasses that need extra knobs (a denoising seed, say) widen this rather than
     # reimplementing _load; anything not listed is still rejected at load time.
-    allowed_runtime_options: frozenset[str] = frozenset({"device_id", "acl_config_path"})
+    # Device placement is represented by AscendRuntimeProfile.  ``device_id``
+    # remains a narrow source-level option for older pipeline callers and must
+    # agree with the typed profile when both are present.
+    allowed_runtime_options: frozenset[str] = frozenset({"device_id"})
 
     def __init__(
         self,
         device_id: int = 0,
         *,
-        runtime_manager: AclRuntimeManager = ACL_RUNTIME_MANAGER,
+        runtime_manager: AclRuntimeManager | None = None,
         model_factory=AclModel,
-        domains: ResourceDomainAdmissions | None = None,
         priority_scheduling: bool = False,
         diagnostic_capture=None,
     ) -> None:
@@ -55,6 +54,11 @@ class AscendOmModelSession(ModelSession):
             raise TypeError("priority_scheduling must be a bool")
         if diagnostic_capture is not None and not callable(diagnostic_capture):
             raise TypeError("diagnostic_capture must be callable or None")
+        if runtime_manager is None:
+            raise BackendLoadError(
+                "AscendOmModelSession requires an explicitly injected ACL runtime provider",
+                code="acl_runtime_provider_required",
+            )
         super().__init__(
             "model-session:ascend",
             BackendCapabilities(
@@ -70,7 +74,6 @@ class AscendOmModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._device_id = device_id
         self._priority_scheduling = priority_scheduling
@@ -86,14 +89,14 @@ class AscendOmModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(None if self._lease is None else self._lease.acl)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         if context.priority_scheduling != self._priority_scheduling:
             raise BackendLoadError(
                 "Ascend model-session priority mode differs from its runtime context",
                 code="deployment_context_mismatch",
             )
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "ascend":
             raise BackendLoadError(
                 "AscendOmModelSession requires a compiled Ascend deployment", code="invalid_deployment"
             )
@@ -102,18 +105,21 @@ class AscendOmModelSession(ModelSession):
             raise BackendLoadError(
                 f"unknown Ascend model-session options: {unknown_options}", code="invalid_runtime_options"
             )
-        device_id = context.runtime_options.get("device_id", self._device_id)
+        profile_device_id = context.device_id
+        device_id = context.runtime_options.get(
+            "device_id", self._device_id if profile_device_id is None else profile_device_id
+        )
         if type(device_id) is not int or device_id != self._device_id:
             raise BackendLoadError("Ascend device_id does not match the session", code="deployment_context_mismatch")
+        if profile_device_id is not None and profile_device_id != self._device_id:
+            raise BackendLoadError(
+                "Ascend device_id does not match the typed runtime profile", code="deployment_context_mismatch"
+            )
         if any(deployment.artifacts[role].format != "om" for role in deployment.execution):
             raise BackendLoadError("Ascend execution artifacts must use format 'om'", code="invalid_artifact_format")
-        if not (
-            deployment.target.runtime == "raw_acl"
-            or deployment.target.runtime.startswith("acl")
-            or deployment.target.runtime.startswith("ascend")
-        ):
+        if context.target_runtime != "acl":
             raise BackendLoadError(
-                f"Ascend target runtime {deployment.target.runtime!r} is not ACL-compatible",
+                f"Ascend target runtime {context.target_runtime!r} must be the canonical 'acl' family",
                 code="incompatible_backend_target",
             )
         if any(link.producer_binding == "input" for link in deployment.device_links):
@@ -121,10 +127,7 @@ class AscendOmModelSession(ModelSession):
                 "Ascend model sessions do not support input-sourced device links",
                 code="unsupported_device_link_source",
             )
-        config_path = context.runtime_options.get("acl_config_path")
-        if config_path is not None and (not isinstance(config_path, str) or not config_path.strip()):
-            raise BackendLoadError("acl_config_path must be a non-empty string", code="invalid_runtime_options")
-        lease = self._runtime_manager.acquire(self._device_id, config_path)
+        lease = self._runtime_manager.acquire(self._device_id)
         rollback.defer(lease.close)
         priority_streams = AclPriorityStreamPool.create(lease) if self._priority_scheduling else None
         if priority_streams is not None:
@@ -190,12 +193,13 @@ class AscendOmModelSession(ModelSession):
                 input_overrides[int(consumer_binding.index)] = producer_buffer
             models[role].prepare_datasets(input_overrides=input_overrides)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
-            for semantic, output in self._run_role(role_index, role, values, request=request).items():
+            for semantic, output in self._run_role(role_index, role, values, request=request, context=context).items():
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     public_outputs[semantic] = output
         return public_outputs
@@ -212,7 +216,8 @@ class AscendOmModelSession(ModelSession):
         role: str,
         values: dict[str, object],
         *,
-        request: NamedTensorRequest | None = None,
+        request: ModelRequest | None = None,
+        context: ExecutionContext | None = None,
     ) -> dict[str, np.ndarray]:
         """Execute one manifest role and write its outputs back into ``values``.
 
@@ -226,7 +231,7 @@ class AscendOmModelSession(ModelSession):
             "read_outputs": self._role_read_indices(role_index, role),
         }
         if request is not None:
-            stream = self._request_stream(request)
+            stream = self._request_stream(request, context)
             if stream is not None:
                 execute_options["stream"] = stream
         role_inputs = self._role_inputs(role, values)
@@ -338,7 +343,8 @@ class AscendOmModelSession(ModelSession):
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
         deployment = self._loaded_deployment()
         try:
@@ -347,12 +353,14 @@ class AscendOmModelSession(ModelSession):
             raise BackendInferenceError(
                 f"unknown or unloaded Ascend role {role!r}", code="unknown_execution_role"
             ) from exc
-        return self._run_role(role_index, role, dict(inputs), request=request)
+        return self._run_role(role_index, role, dict(inputs), request=request, context=context)
 
-    def _request_stream(self, request: NamedTensorRequest) -> object | None:
+    def _request_stream(self, request: ModelRequest, context: ExecutionContext | None = None) -> object | None:
+        del context
         streams = self._priority_streams
         if streams is None:
-            if request.priority != 0:
+            priority = request.metadata.get("priority", 0)
+            if priority != 0:
                 raise BackendAdmissionError(
                     "non-zero Ascend priority requires scheduler-enabled priority streams",
                     code="hardware_priority_unavailable",
@@ -365,7 +373,7 @@ class AscendOmModelSession(ModelSession):
                 code="hardware_priority_unavailable",
             )
         try:
-            native_priority = mapping.map_generic(request.priority)
+            native_priority = mapping.map_generic(priority)
         except ValueError as exc:
             raise BackendAdmissionError(str(exc), code="unsupported_priority") from exc
         if not streams.supports(native_priority):
@@ -375,7 +383,8 @@ class AscendOmModelSession(ModelSession):
             )
         return streams.select(native_priority)
 
-    def _validate_request(self, request: NamedTensorRequest) -> None:
+    def _validate_request(self, request: ModelRequest, context: ExecutionContext) -> None:
+        del context
         self._request_stream(request)
 
     def _close(self) -> None:
@@ -427,23 +436,36 @@ class AscendOmModelSession(ModelSession):
         return matches[0]
 
 
-def build_ascend_model_session(context: RuntimeContext) -> AscendOmModelSession:
+def build_ascend_model_session(
+    context: RuntimeContext,
+    *,
+    providers=None,
+) -> AscendOmModelSession:
     """Select the Ascend session execution mode from the deployment contract."""
 
     deployment = context.deployment
-    if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+    if not isinstance(deployment, CompiledDeployment) or context.backend != "ascend":
         raise BackendLoadError(
             "Ascend session construction requires a compiled Ascend deployment", code="invalid_deployment"
         )
-    device_id = context.runtime_options.get("device_id", 0)
+    if context.target_runtime != "acl":
+        raise BackendLoadError(
+            "Ascend session construction requires target.runtime='acl'",
+            code="incompatible_backend_target",
+        )
+    device_id = context.device_id
+    if device_id is None:
+        device_id = context.runtime_options.get("device_id", 0)
     if type(device_id) is not int or device_id < 0:
         raise BackendLoadError("Ascend device_id must be a non-negative integer", code="invalid_runtime_options")
     session_type = AscendOmModelSession
-    if deployment.state_links:
+    contract = deployment.execution_contract
+    if contract.stateful or contract.state_links:
         from inference_service.model_sessions.ascend_stateful import StatefulAscendOmModelSession
 
         session_type = StatefulAscendOmModelSession
     return session_type(
         device_id=device_id,
         priority_scheduling=context.priority_scheduling,
+        runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
     )

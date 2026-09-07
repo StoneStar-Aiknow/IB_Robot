@@ -39,6 +39,11 @@ from inference_service.distributed.ros_protocol import (
     video_status_from_message,
     video_status_to_message,
 )
+from inference_service.runtime_composition import (
+    build_policy_runtime_dependencies,
+    require_runtime_dependencies,
+)
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 from robot_config.contract_utils import contract_fingerprint, iter_specs
 
 
@@ -60,8 +65,22 @@ class CloudNodeConfig:
 class PureInferenceNode(Node):
     """Own one cloud backend and its session-scoped request transport."""
 
-    def __init__(self, config: CloudNodeConfig, *, node_name: str) -> None:
+    def __init__(
+        self,
+        config: CloudNodeConfig,
+        *,
+        node_name: str,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
         super().__init__(node_name)
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
         try:
             runtime_options = json.loads(config.runtime_options_json)
         except json.JSONDecodeError as exc:
@@ -98,6 +117,8 @@ class PureInferenceNode(Node):
                 validated,
                 request_timeout=config.request_timeout,
                 runtime_options=runtime_options,
+                registry_set=self._registry_set,
+                providers=self._providers,
             )
         except Exception as exc:
             runtime = None
@@ -218,6 +239,15 @@ class PureInferenceNode(Node):
         stamp = self.get_clock().now().to_msg()
         for status in self._stream_manager.statuses():
             self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+        for observation_key, metrics in self._stream_manager.decoder_diagnostics():
+            self.get_logger().info(
+                f"Decoder runtime: observation={observation_key}, "
+                f"input_frames={metrics.input_frames}, output_frames={metrics.output_frames}, "
+                f"input_fps={metrics.input_frame_rate_hz:.2f}, output_fps={metrics.output_frame_rate_hz:.2f}, "
+                f"backlog={metrics.decoder_backlog_depth}, output_age_ms={metrics.decoder_output_age_ns / 1e6:.1f}, "
+                f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}",
+                throttle_duration_sec=2.0,
+            )
 
     def _request_callback(self, message: DistributedInferenceRequest) -> None:
         request = None
@@ -278,9 +308,16 @@ def _read_config() -> tuple[CloudNodeConfig, str]:
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node: PureInferenceNode | None = None
+    dependencies = None
     try:
         config, node_name = _read_config()
-        node = PureInferenceNode(config, node_name=node_name)
+        dependencies = build_policy_runtime_dependencies()
+        node = PureInferenceNode(
+            config,
+            node_name=node_name,
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+        )
         executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)
         executor.spin()
@@ -289,6 +326,8 @@ def main(args: list[str] | None = None) -> None:
     finally:
         if node is not None:
             node.destroy_node()
+        if dependencies is not None:
+            dependencies.providers.close()
         if rclpy.ok():
             rclpy.shutdown()
 

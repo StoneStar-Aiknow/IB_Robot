@@ -78,6 +78,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PrimitiveCommand.action"
   "action/PickObject.action"
   "action/PlaceObject.action"
+  "action/ImitateHumanMotion.action"
   "action/ArmReturnHome.action"
   "action/ExecuteAgentPlan.action"
   "action/ExecuteNavigation.action"

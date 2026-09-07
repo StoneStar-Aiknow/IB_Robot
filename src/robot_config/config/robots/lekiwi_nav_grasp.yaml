@@ -280,7 +280,7 @@ robot:
       - id: grasp_segmentation
         enabled: true
         required: true
-        bundle_path: models/sam2_hiera_tiny_ascend
+        bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
         service_type: ibrobot_msgs/srv/SegmentDetections
@@ -345,10 +345,10 @@ robot:
     auto_start_dependencies: true
     # The 310P planner and the Gateway must bind the same immutable deployment
     # identity.  This bundle is produced by the GraspGen Ascend packager.
-    model_bundle_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    model_bundle_path: "$(env WORKSPACE)/models/graspgen"
     model_deployment: ascend_310p
     # Both planner metadata and named deployments come from the same bundle.
-    planner_model_dir: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    planner_model_dir: "$(env WORKSPACE)/models/graspgen"
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect
@@ -487,9 +487,9 @@ robot:
       enabled: true
     planner_node:
       inference_backend: ascend_local
-      local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+      local_manifest_path: "$(env WORKSPACE)/models/graspgen"
       local_deployment_name: ascend_310p
-      ascend_local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+      ascend_local_manifest_path: "$(env WORKSPACE)/models/graspgen"
       ascend_local_deployment_name: ascend_310p
       ascend_local_device_id: 0
       ascend_local_random_seed: 0
@@ -783,7 +783,7 @@ robot:
           - id: grasp_segmentation
             enabled: true
             required: true
-            bundle_path: models/sam2_hiera_tiny_ascend
+            bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
             deployment: ascend_310p
             adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
             service_type: ibrobot_msgs/srv/SegmentDetections
@@ -1018,8 +1018,6 @@ robot:
     chunk_size: 512
     buffer_seconds: 5.0
     output_topic: /voice_command
-    device_index: -1
-    device_name: ""
     exit_on_init_failure: false
 
   # Start the ReSpeaker direction-of-arrival pipeline with this robot. Common
@@ -1035,8 +1033,19 @@ robot:
     # Runtime overrides are limited to deployment-level values; DSP and model
     # parameters remain owned by voice_asr_service/config/*.yaml.
     parameters:
-      input_source: device
       mount_yaw_deg: 90.0
+
+  # Ubuntu and openEuler use the same audio_common device owners and ROS topics.
+  audio_io:
+    enabled: true
+    microphone: respeaker
+    capture_topic: /audio/capture
+    capture_stamped_topic: /audio/capture_stamped
+    audio_info_topic: /audio/info
+    playback_topic: /audio/play
+    playback_sample_rate: 24000
+    playback_channels: 1
+    playback_sample_format: S16LE
 
   embodied:
     enabled: false
@@ -1053,6 +1062,10 @@ robot:
     primitive_action_name: /embodied/execute_primitive
     validate_skill_service: /embodied/validate_skill
     validate_primitive_service: /embodied/validate_primitive
+    imitate_human_motion:
+      enabled: true
+      action_name: /hri/imitate_human_motion
+      startup_warmup: true
     default_target_name: ""
     default_place_name: home
     timeouts:
@@ -1130,9 +1143,10 @@ robot:
       name: respeaker
       driver: alsa
       params:
-        device_name_contains: "ReSpeaker"
-        arecord_device: "hw:0,0"
+        device: "hw:0,0"
+        channels: 6
         sample_rate: 16000
+        sample_format: S16LE
         channel_indices: [1, 2, 3, 4]
 
     - type: camera
@@ -1360,10 +1374,9 @@ robot:
 
   voice_tts:
     enabled: true
-    bundle_path: "models/voice_tts/zipvoice"
+    bundle_path: "models/zipvoice"
     deployment: "ascend_310p"
     service_name: /voice_tts/synthesize
     playback_service_name: /voice_tts/play
     playback_timeout_sec: 300.0
     prompt_profile: default
-    player: /usr/local/bin/tts-bt-play

@@ -407,6 +407,8 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`）；v1 manipulation 字段 |
 | `motion_distance` | 相对运动距离（米）；v1 manipulation 字段 |
+| `arm_side` | HRI 模仿来源侧别：`left`、`right` 或 `auto` |
+| `imitation_duration_sec` | HRI 从 `start` 开始的采集/跟随时长，单位秒；必须为正数 |
 | `direction` | 导航方向（v2 新增）；v1 请求必须为空 |
 | `distance` | 导航距离（v2 新增）；v1 请求必须为 `0.0` |
 | `degree` | 导航旋转角度（v2 新增）；v1 请求必须为 `0.0` |
@@ -574,6 +576,23 @@ plan/registry identity 和 expected step count，用于校验随后返回的终�
 `task_budget_sec`；该值必须为有限正数且不超过 Gateway task budget。成功响应返回
 `confirmation_token`、规范化后的 `confirmed_task_budget_sec` 以及冻结的 `task_budget_started_at/deadline`。
 执行 action 必须复用该精确绝对预算，确认到执行之间的等待会真实消耗预算。
+
+### `ImitateHumanMotion.action`
+
+HRI 的内部 delegated action，由 `manipulation_execution/imitate_human_motion_executor_node`
+提供，默认路径为 `/hri/imitate_human_motion`。它不是 Agent 或 CLI 的公共入口；公共调用必须先进入
+`SkillCommand`，再由 `skill_library` 通过现有 delegated Gateway 转发。goal 携带完整
+`DispatchBinding`、`expected_executor`、`arm_side`、`imitation_duration_sec` 和独立的 `timeout_sec`。
+内部 runtime 按 `prepare -> start -> mock_playback -> reset` 编排，并通过 `PrimitiveCommand` 执行动作和
+`move_to_named_pose(home)` 恢复；请求时长超过 20 秒时只执行 20 秒，不循环。
+
+| 字段 | 说明 |
+| --- | --- |
+| `arm_side` | `left`、`right` 或 `auto`，分别选择可区分的 Mock 动画 |
+| `imitation_duration_sec` | 从 start 开始的采集/跟随时长；不等同于 action `timeout_sec` |
+| `timeout_sec` | 整个内部 delegated 任务的执行预算，受 `DispatchBinding.task_budget` 约束 |
+| `expected_executor` / `actual_executor` | Gateway 与 runtime 双向校验的 executor identity |
+| `completed_phases` | 已进入的生命周期阶段；取消、失败或 reset 异常也会返回明确终态 |
 
 ### `PlaceObject.action`
 

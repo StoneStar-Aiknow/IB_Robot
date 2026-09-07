@@ -1,8 +1,8 @@
-"""Write the schema-v2 bundle used by the CUDA GraspGen executor.
+"""Write the schema-v3 bundle used by the CUDA GraspGen executor.
 
-GraspGen is stored in the grasp model domain. The generic model runtime currently
-represents its executable contract with ``kind="perception"`` for compatibility,
-but that runtime category does not determine the on-disk domain directory.
+GraspGen is stored in the grasp model domain. The generic model runtime represents
+its executable contract with the canonical tensor-model identity; that identity does
+not determine the on-disk domain directory.
 """
 
 from __future__ import annotations
@@ -17,6 +17,23 @@ from uuid import uuid4
 import yaml
 
 from inference_manifest import (
+    BundleFile,
+    DeploymentTarget,
+    Digest,
+    ExecutionContract,
+    InferenceManifest,
+    ManifestBundle,
+    ModelDescriptor,
+    RoleRuntimeProfile,
+    SemanticIdentity,
+    SemanticTensor,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    canonical_bundle_digest,
+    load_inference_manifest,
+    write_inference_manifest,
+)
+from model_utils.graspgen_contract import (
     GRASPGEN_CONFIDENCE_SEMANTIC,
     GRASPGEN_CONTRACT_VERSION,
     GRASPGEN_NPOINTS,
@@ -24,17 +41,6 @@ from inference_manifest import (
     GRASPGEN_POINT_CLOUD_SEMANTIC,
     GRASPGEN_POSE_SEMANTIC,
     GRASPGEN_RADII,
-    BundleFile,
-    Digest,
-    InferenceManifest,
-    ManifestBundle,
-    ModelDescriptor,
-    SemanticIdentity,
-    SemanticTensor,
-    TorchDeployment,
-    canonical_bundle_digest,
-    load_inference_manifest,
-    write_inference_manifest,
 )
 
 from .graspgen_adapter import GRASPGEN_POSTPROCESSING, GRASPGEN_PREPROCESSING
@@ -60,8 +66,9 @@ def _sha256(path: Path) -> str:
 def _model_descriptor(point_count: int, grasp_batch_size: int) -> ModelDescriptor:
     del point_count, grasp_batch_size
     return ModelDescriptor(
-        kind="perception",
-        family="graspgen",
+        interface="tensor_model",
+        model_type="graspgen",
+        operation="generate_grasps",
         inputs=(SemanticTensor(semantic=GRASPGEN_POINT_CLOUD_SEMANTIC, dtype="float32", shape=(-1, 3)),),
         outputs=(
             SemanticTensor(semantic=GRASPGEN_POSE_SEMANTIC, dtype="float32", shape=(-1, 4, 4)),
@@ -87,7 +94,9 @@ def _adapter_assets(
     if not isinstance(diffusion, dict):
         raise ValueError("GraspGen config diffusion must be a mapping")
     return {
-        "family": "graspgen",
+        "interface": "tensor_model",
+        "model_type": "graspgen",
+        "operation": "generate_grasps",
         "preprocessing": GRASPGEN_PREPROCESSING,
         "postprocessing": GRASPGEN_POSTPROCESSING,
         "kappa": float(diffusion.get("kappa", 2.02217)),
@@ -179,14 +188,25 @@ def package_graspgen_torch_bundle(
         or previous_adapter != adapter_document
     )
     bundle_revision = previous_revision + int(changed) if existing is not None else 1
-    deployment = TorchDeployment(backend="torch", device="cuda")
+    deployment = TorchDeployment(
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="torch",
+            target=DeploymentTarget(runtime="torch"),
+            profile=TorchRuntimeProfile(device="cuda"),
+        ),
+    )
     previous_deployment = existing.deployments.get(deployment_name) if existing is not None else None
     if isinstance(previous_deployment, TorchDeployment):
         deployment = deployment.model_copy(
             update={"uuid": previous_deployment.uuid, "revision": previous_deployment.revision}
         )
     manifest = InferenceManifest(
-        schema_version=2,
+        schema_version=3,
         bundle=ManifestBundle(
             uuid=bundle_uuid,
             revision=bundle_revision,

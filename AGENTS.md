@@ -189,6 +189,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 | [ibrobot-robot-skill-design](.agents/skills/ibrobot-robot-skill-design) | 交互式设计/新增机器人 skill、Hermes/Agent 动作、真机验证方案 |
 | [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 操作现有机器人高层技能或异步视觉游戏 |
+| [ibrobot-inference-verify](.agents/skills/ibrobot-inference-verify) | 统一推理运行时端到端验证：本机 CPU/CUDA Torch policy + 感知 ROS mock、板端 Ascend OM + ROS typed service |
 
 ### 板端（OpenHarmony）
 

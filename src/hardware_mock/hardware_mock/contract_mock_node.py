@@ -111,17 +111,6 @@ class ContractMockNode(Node):
             if obs.kind == "image":
                 gen = make_generator(obs.image)
                 self._image_publishers.append((obs, pub, gen))
-                # Per-camera callback group: a slow synthetic frame on one
-                # camera must not stall the other cameras' timers.  Under the
-                # single-threaded executor the top camera's 30 Hz timer could
-                # starve the wrist camera down to ~26 Hz on a loaded board.
-                self._image_timers.append(
-                    self.create_timer(
-                        period,
-                        lambda o=obs, p=pub, g=gen: self._publish_image(o, p, g),
-                        callback_group=MutuallyExclusiveCallbackGroup(),
-                    )
-                )
             elif obs.kind == "joint_state":
                 self._joint_state_publishers.append((obs, pub))
                 # One shared timer per joint_state observation is fine: usually
@@ -137,6 +126,32 @@ class ContractMockNode(Node):
                     period,
                     lambda o=obs, p=pub: self._publish_joint_current(o, p),
                     callback_group=self._joint_group,
+                )
+
+        image_rates = {obs.rate_hz for obs, _pub, _gen in self._image_publishers}
+        if len(image_rates) == 1 and self._image_publishers:
+            # Publish one synchronized capture tick when all configured image
+            # streams share a rate. This gives every camera in the batch the
+            # same source timestamp while keeping encoding asynchronous.
+            period = 1.0 / max(next(iter(image_rates)), 1e-6)
+            self._image_timers.append(
+                self.create_timer(
+                    period,
+                    self._publish_images,
+                    callback_group=MutuallyExclusiveCallbackGroup(),
+                )
+            )
+        else:
+            # Preserve independent rates for contracts that intentionally mix
+            # camera frequencies and cannot claim synchronized capture ticks.
+            for obs, pub, gen in self._image_publishers:
+                period = 1.0 / max(obs.rate_hz, 1e-6)
+                self._image_timers.append(
+                    self.create_timer(
+                        period,
+                        lambda o=obs, p=pub, g=gen: self._publish_image(o, p, g),
+                        callback_group=MutuallyExclusiveCallbackGroup(),
+                    )
                 )
 
     def _setup_subscribers(self) -> None:
@@ -166,10 +181,17 @@ class ContractMockNode(Node):
     # -- callbacks -----------------------------------------------------------
 
     def _publish_image(self, obs: ObservationSpec, pub, gen) -> None:
+        self._publish_image_with_stamp(obs, pub, gen, self.get_clock().now().to_msg())
+
+    def _publish_images(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+        for obs, pub, gen in self._image_publishers:
+            self._publish_image_with_stamp(obs, pub, gen, stamp)
+
+    def _publish_image_with_stamp(self, obs: ObservationSpec, pub, gen, stamp) -> None:
         frame = gen()
         assert obs.image is not None
         msg: Image = self._bridge.cv2_to_imgmsg(frame, encoding=obs.image.encoding)
-        stamp = self.get_clock().now().to_msg()
         msg.header.stamp = stamp
         msg.header.frame_id = obs.frame_id
         pub.publish(msg)

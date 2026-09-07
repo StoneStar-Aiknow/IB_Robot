@@ -14,6 +14,13 @@ fresh venv and colcon workspace.
 The ROS-ready image deliberately skips ROS first-install testing. Changes to
 `scripts/install_ros.sh`, ROS repository setup, or ROS GPG-key handling require
 the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:22.04`.
+When such a change **switches the ROS package source** (repo URL, mirror, or
+GPG key) and verification must reuse a container that already has ROS packages
+installed (desktop-full image or a quick-run container), remove ALL ROS
+packages first per Phase 3.5 in
+[references/procedure.md](references/procedure.md) — pre-installed packages
+belong to the old source and would be silently reused by `setup.sh`'s ROS
+detection, making the new-source install path untested.
 
 ## When to Use
 
@@ -26,7 +33,8 @@ the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:
   `scripts/install_ros.sh`, or pip/apt dependency resolution.
 - Do not infer this skill from PR review alone.
 - Before an author-side gate invokes this skill, ask whether the PR is WIP or
-  review-ready. A `[WIP]` PR skips both Docker skills until promotion; explicit
+  review-ready — via the interactive ask-user tool (the `question` tool in
+  opencode), not a prose question and not an assumed default. A `[WIP]` PR skips both Docker skills until promotion; explicit
   standalone Docker requests still run normally.
 
 ## Review Boundary
@@ -130,6 +138,7 @@ corresponding phase section.
 | **1** | Pull `osrf/ros:humble-desktop-full-jammy` image | `IMAGE_SECONDS` |
 | **2** | Create container, configure mirrors, create `testuser`, verify cache write | `CONTAINER_SECONDS` |
 | **3** | Prepare source workspace — **choose one mode** | `SOURCE_MODE`, `SOURCE_DETAILS` |
+| **3.5** | ROS source-switch pre-clean (conditional) — remove all `ros-*` packages when the change switches the ROS source | No ROS packages left |
 | **4** | Run `setup.sh --yes`, capture log and timing | `/tmp/setup.log`, `SETUP_ELAPSED_SECONDS` |
 | **5** | Run `build.sh`, capture log and timing | `/tmp/build.log`, `BUILD_ELAPSED_SECONDS` |
 | **6** | Collect ERROR lines, report timing, clean up container | Final report |
@@ -151,9 +160,12 @@ the PR description's Verification section.
 
 - **ROS installation changes** (modify `install_ros.sh`, ROS repo, GPG key):
   use the [bootstrap variant](references/bootstrap-variant.md) with
-  `ubuntu:22.04` base image.
+  `ubuntu:22.04` base image. If the change switches the ROS source and you
+  keep the desktop-full image instead, the Phase 3.5 ROS pre-clean in
+  [references/procedure.md](references/procedure.md) is **mandatory**.
 - **Iterative local testing** (re-run without full Phase 0-2):
-  use the [quick-run one-liner](references/quick-run.md).
+  use the [quick-run one-liner](references/quick-run.md). If the ROS source
+  changed between runs, re-run the Phase 3.5 ROS pre-clean before `setup.sh`.
 
 ## Troubleshooting
 

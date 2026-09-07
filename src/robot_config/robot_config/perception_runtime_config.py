@@ -225,7 +225,7 @@ def _validate_bundle(path: Path, deployment: str, service_path: str) -> Validate
         raise PerceptionRuntimeConfigError(
             f"{service_path} failed bundle validation for deployment {deployment!r}: {exc}"
         ) from exc
-    if validated.manifest.model.kind == "policy":
+    if validated.manifest.model.interface == "policy":
         raise PerceptionRuntimeConfigError(f"{service_path} cannot expose a policy bundle as a model service")
     return validated
 

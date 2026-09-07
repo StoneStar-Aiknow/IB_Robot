@@ -18,6 +18,28 @@
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
+## Setup Profile（依赖范围参数化）
+
+`setup.sh` 通过 `--profile <name>`（或环境变量 `IBR_SETUP_PROFILE`）控制依赖安装范围：
+
+| Profile | 用途 |
+| --- | --- |
+| `full`（默认） | 完整开发工作区：硬件、遥操作、感知、抓取、语音、仿真与开发工具全量安装。 |
+| `inference` | 仅运行策略推理的最小运行时，面向端边协同推理验证主机。 |
+
+`inference` profile 相对 `full` 的差异：
+
+- **submodules**：只初始化 `libs/lerobot`（跳过 LiDAR / bringup 子模块与 ROS 第三方 patch 栈）。
+- **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
+- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍整装 `openeuler-24.03.txt`（含推理必需的 `onnx` / `torch_npu` / `pygraphviz`）；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
+- **验证**：跳过 tracing 校验（lttng / tracetools 属于全工作区诊断能力），并跳过 Ubuntu 平台的 tracing 工具安装钩子（`platform_post_install_rosdeps`）。
+
+```bash
+# 端边协同推理验证主机：
+./scripts/setup.sh --yes --profile inference
+./scripts/build.sh --packages-up-to inference_service
+```
+
 ## LeRobot 补丁分发
 
 `libs/lerobot` 在 `third_party/patches/lerobot/<tag>/` 下为每一个支持的上游 tag 提供一份补丁序列。决定哪个 tag 当前生效的**单一事实源**是 `third_party/patches/lerobot/INDEX.yaml`（见下文 [多 tag 布局](#多-tag-布局)）。在生效的 tag 内，**并非每个补丁都适用于所有主机**。应用器通过 `lerobot_filter_series.py` 过滤原始 `series.txt`，按 `manifest.yaml` 中独立声明的谓词为每个补丁打门：

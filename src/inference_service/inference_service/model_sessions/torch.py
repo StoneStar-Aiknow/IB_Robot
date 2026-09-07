@@ -8,12 +8,11 @@ from collections.abc import Callable, Mapping
 from contextlib import nullcontext, suppress
 from typing import Any
 
-from inference_manifest import TorchDeployment
+from inference_manifest import TorchRuntimeProfile
 from inference_service.backends.errors import BackendError, BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
 class TorchModelSession(ModelSession):
@@ -51,11 +50,17 @@ class TorchModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(self._torch)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
-        deployment = context.deployment
-        if not isinstance(deployment, TorchDeployment) or deployment.device not in {"cpu", "cuda"}:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
+        profile = context.backend_profile
+        if (
+            context.backend != "torch"
+            or context.interface != "tensor_model"
+            or not isinstance(profile, TorchRuntimeProfile)
+            or profile.device not in {"cpu", "cuda"}
+        ):
             raise BackendLoadError(
-                "TorchModelSession requires a validated CPU or CUDA Torch deployment", code="invalid_deployment"
+                "TorchModelSession requires a tensor_model deployment with a typed cpu/cuda Torch profile",
+                code="invalid_deployment",
             )
         unknown_options = sorted(context.runtime_options)
         if unknown_options:
@@ -64,12 +69,13 @@ class TorchModelSession(ModelSession):
             )
 
         torch_module = self._torch_loader()
-        if deployment.device == "cuda":
+        device_name = profile.device
+        if device_name == "cuda":
             is_available = getattr(getattr(torch_module, "cuda", None), "is_available", None)
             if not callable(is_available) or not is_available():
                 raise BackendLoadError("Torch CUDA device is unavailable", code="device_unavailable")
         try:
-            device = torch_module.device(deployment.device)
+            device = torch_module.device(device_name)
             module = self._module_loader(context)
         except BackendError:
             raise
@@ -80,7 +86,7 @@ class TorchModelSession(ModelSession):
 
         self._torch = torch_module
         self._device = device
-        self._device_name = deployment.device
+        self._device_name = device_name
         self._module = module
         rollback.defer(self._release)
         move = getattr(module, "to", None)
@@ -95,7 +101,8 @@ class TorchModelSession(ModelSession):
             if evaluated is not None:
                 self._module = evaluated
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        del context
         module = self._module
         torch_module = self._torch
         if module is None or torch_module is None:

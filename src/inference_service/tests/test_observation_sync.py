@@ -82,6 +82,60 @@ def test_select_synchronized_streams_rejects_inter_camera_skew():
     assert {item["stream_id"] for item in error.value.details["streams"]} == {"top", "wrist"}
 
 
+def test_select_synchronized_streams_retries_at_shared_capture_tick():
+    top = _stream("observation.images.top", "top", 1_000, "top-shared")
+    top.buffer.push(1_100, "top-newer", receive_time_ns=1_100)
+    wrist = _stream("observation.images.wrist", "wrist", 1_000, "wrist-shared")
+
+    selected = select_synchronized_streams(
+        {top.observation_key: top, wrist.observation_key: wrist},
+        1_100,
+        now_ns=1_100,
+        max_inter_camera_skew_ns=20,
+    )
+
+    assert selected[top.observation_key].capture_timestamp_ns == 1_000
+    assert selected[wrist.observation_key].capture_timestamp_ns == 1_000
+    assert selected[top.observation_key].value == "top-shared"
+
+
+def test_select_synchronized_streams_retries_within_allowed_skew_window():
+    top = _stream("observation.images.top", "top", 1_000, "top-old")
+    top.buffer.push(1_100, "top-new", receive_time_ns=1_100)
+    wrist = _stream("observation.images.wrist", "wrist", 1_040, "wrist-old")
+    wrist.buffer.push(1_170, "wrist-new", receive_time_ns=1_170)
+
+    selected = select_synchronized_streams(
+        {top.observation_key: top, wrist.observation_key: wrist},
+        1_170,
+        now_ns=1_170,
+        max_inter_camera_skew_ns=50,
+    )
+
+    assert selected[top.observation_key].capture_timestamp_ns == 1_000
+    assert selected[wrist.observation_key].capture_timestamp_ns == 1_040
+
+
+def test_select_synchronized_streams_uses_latest_common_tick_after_asymmetric_drop():
+    top = _stream("observation.images.top", "top", 1_000, "top-0")
+    top.buffer.push(1_100, "top-1", receive_time_ns=1_100)
+    top.buffer.push(1_200, "top-2", receive_time_ns=1_200)
+    top.buffer.push(1_300, "top-3", receive_time_ns=1_300)
+    wrist = _stream("observation.images.wrist", "wrist", 1_000, "wrist-0")
+    wrist.buffer.push(1_200, "wrist-2", receive_time_ns=1_200)
+
+    selected = select_synchronized_streams(
+        {top.observation_key: top, wrist.observation_key: wrist},
+        1_300,
+        now_ns=1_300,
+        max_inter_camera_skew_ns=20,
+    )
+
+    assert selected[top.observation_key].capture_timestamp_ns == 1_200
+    assert selected[wrist.observation_key].capture_timestamp_ns == 1_200
+    assert selected[top.observation_key].value == "top-2"
+
+
 @pytest.mark.parametrize(
     ("mapping_ready", "keyframe_ready", "reason"),
     [(False, True, "unmapped"), (True, False, "pre_keyframe")],

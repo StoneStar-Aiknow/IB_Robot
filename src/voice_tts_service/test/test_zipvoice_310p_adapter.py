@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from inference_service.backends.errors import BackendInferenceError
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from voice_tts_service.errors import BackendLoadError
 from voice_tts_service.zipvoice_310p_adapter import ZipVoiceAscendSession, _ChineseTokenizer
 
@@ -93,8 +93,7 @@ def _session():
 
 
 def _request(text="机器人", *, prompt=False):
-    return NamedTensorRequest(
-        "tts-test",
+    return ModelRequest(
         {
             "tts.text": np.frombuffer(text.encode(), dtype=np.uint8),
             "tts.prompt_audio": np.ones(1, dtype=np.float32) if prompt else np.empty(0, dtype=np.float32),
@@ -102,14 +101,18 @@ def _request(text="机器人", *, prompt=False):
             "tts.prompt_text": np.frombuffer("参考".encode(), dtype=np.uint8)
             if prompt
             else np.empty(0, dtype=np.uint8),
-        },
+        }
     )
+
+
+def _context():
+    return ExecutionContext("tts-test")
 
 
 def test_verified_310p_session_runs_four_flow_steps_and_returns_pcm():
     session = _session()
 
-    outputs = session._execute(_request())
+    outputs = session._execute(_request(), _context())
 
     assert outputs["tts.audio"].shape == (240,)
     assert session.roles == [(0, "text_encoder")] + [(1, "flow_decoder_1537")] * 4
@@ -117,7 +120,7 @@ def test_verified_310p_session_runs_four_flow_steps_and_returns_pcm():
 
 def test_verified_310p_deployment_explicitly_rejects_request_prompt():
     with pytest.raises(BackendInferenceError, match="fixed prompt") as error:
-        _session()._execute(_request(prompt=True))
+        _session()._execute(_request(prompt=True), _context())
     assert error.value.code == "unsupported_prompt"
 
 

@@ -9,6 +9,30 @@ from typing import Any
 
 from embodied_common.canon import sha256_text, to_canonical_json
 
+_WORKFLOW_STEP_FIELDS = frozenset(
+    {
+        "schema_version",
+        "skill_name",
+        "target_name",
+        "container_name",
+        "place_name",
+        "motion_direction",
+        "motion_distance",
+        "arm_side",
+        "imitation_duration_sec",
+        "timeout_sec",
+        "direction",
+        "distance",
+        "degree",
+        "has_x",
+        "x",
+        "has_y",
+        "y",
+        "has_yaw",
+        "yaw",
+    }
+)
+
 
 @dataclass(frozen=True)
 class CanonicalWorkflowStep:
@@ -19,6 +43,8 @@ class CanonicalWorkflowStep:
     place_name: str = ""
     motion_direction: str = ""
     motion_distance: float = 0.0
+    arm_side: str = ""
+    imitation_duration_sec: float = 0.0
     timeout_sec: float = 0.0
     direction: str = ""
     distance: float = 0.0
@@ -34,15 +60,17 @@ class CanonicalWorkflowStep:
             raise TypeError("WorkflowStep.skill_name must be a string")
         if not self.skill_name.strip():
             raise ValueError("WorkflowStep.skill_name must be non-empty")
-        for field_name in ("target_name", "container_name", "place_name", "motion_direction", "direction"):
+        for field_name in ("target_name", "container_name", "place_name", "motion_direction", "arm_side", "direction"):
             if not isinstance(getattr(self, field_name), str):
                 raise TypeError(f"WorkflowStep.{field_name} must be a string")
         object.__setattr__(self, "skill_name", self.skill_name.strip())
         for field_name in ("target_name", "container_name", "place_name"):
             object.__setattr__(self, field_name, getattr(self, field_name).strip())
-        for field_name in ("motion_direction", "direction"):
+        for field_name in ("motion_direction", "arm_side", "direction"):
             object.__setattr__(self, field_name, getattr(self, field_name).strip().lower())
-        for field_name in ("motion_distance", "timeout_sec", "distance", "degree"):
+        if self.arm_side and self.arm_side not in {"left", "right", "auto"}:
+            raise ValueError("WorkflowStep.arm_side must be left, right, or auto")
+        for field_name in ("motion_distance", "imitation_duration_sec", "timeout_sec", "distance", "degree"):
             value = getattr(self, field_name)
             if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
                 raise ValueError(f"WorkflowStep.{field_name} must be finite")
@@ -63,6 +91,8 @@ class CanonicalWorkflowStep:
             raise ValueError("navigation parameters require WorkflowStep schema_version 2")
 
     def to_dict(self) -> dict[str, Any]:
+        normalized_arm_side = self.arm_side.strip().lower()
+        normalized_imitation_duration = _finite_float(self.imitation_duration_sec)
         result = {
             "schema_version": self.schema_version,
             "skill_name": self.skill_name.strip(),
@@ -73,6 +103,13 @@ class CanonicalWorkflowStep:
             "motion_distance": _finite_float(self.motion_distance),
             "timeout_sec": _finite_float(self.timeout_sec),
         }
+        if normalized_arm_side or normalized_imitation_duration:
+            result.update(
+                {
+                    "arm_side": normalized_arm_side,
+                    "imitation_duration_sec": normalized_imitation_duration,
+                }
+            )
         if self.schema_version == 2:
             result.update(
                 {
@@ -95,6 +132,9 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         return step
     if isinstance(step, Mapping):
         values = step
+        unknown_fields = sorted(set(values) - _WORKFLOW_STEP_FIELDS)
+        if unknown_fields:
+            raise ValueError(f"WorkflowStep contains unsupported fields: {', '.join(unknown_fields)}")
     else:
         values = {
             field: getattr(step, field, default)
@@ -106,6 +146,8 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
                 ("place_name", ""),
                 ("motion_direction", ""),
                 ("motion_distance", 0.0),
+                ("arm_side", ""),
+                ("imitation_duration_sec", 0.0),
                 ("timeout_sec", 0.0),
                 ("direction", ""),
                 ("distance", 0.0),
@@ -126,6 +168,8 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         place_name=str(values.get("place_name", "")),
         motion_direction=str(values.get("motion_direction", "")),
         motion_distance=_finite_float(values.get("motion_distance", 0.0)),
+        arm_side=str(values.get("arm_side", "")),
+        imitation_duration_sec=_finite_float(values.get("imitation_duration_sec", 0.0)),
         timeout_sec=_finite_float(values.get("timeout_sec", 0.0)),
         direction=str(values.get("direction", "")),
         distance=_finite_float(values.get("distance", 0.0)),

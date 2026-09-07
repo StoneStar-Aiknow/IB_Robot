@@ -9,17 +9,16 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
 from typing import Any
 
-from inference_manifest import TorchDeployment
+from inference_manifest import TorchRuntimeProfile
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.lerobot_assets import (
     TOKENIZER_REFERENCE_KEYS,
     VLM_REFERENCE_KEYS,
     resolve_local_semantic_reference,
 )
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 _ACTION_METHODS = frozenset({"predict_action_chunk", "select_action"})
 _NOISE_KEYS = ("_noise", "action.noise", "noise")
@@ -29,7 +28,12 @@ _MODEL_DTYPES = {"native": None, "fp16": "half", "bf16": "bfloat16", "fp32": "fl
 class LeRobotTorchModelSession(ModelSession):
     """Own one native LeRobot policy and its device-aware processors."""
 
-    def __init__(self, device_name: str, *, priority_scheduling: bool = False) -> None:
+    def __init__(
+        self,
+        device_name: str,
+        *,
+        priority_scheduling: bool = False,
+    ) -> None:
         super().__init__(
             "model-session:lerobot-torch",
             BackendCapabilities(
@@ -84,25 +88,33 @@ class LeRobotTorchModelSession(ModelSession):
             return {}
         return dict(self._last_metadata)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
-        deployment = context.deployment
-        if not isinstance(deployment, TorchDeployment):
-            raise BackendLoadError("LeRobotTorchModelSession requires a Torch deployment", code="invalid_deployment")
-        if deployment.device != self._configured_device_name:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
+        profile = context.backend_profile
+        if (
+            context.backend != "torch"
+            or context.interface != "policy"
+            or context.operation != "predict"
+            or not isinstance(profile, TorchRuntimeProfile)
+        ):
+            raise BackendLoadError(
+                "LeRobotTorchModelSession requires policy/*/predict with a typed Torch profile",
+                code="invalid_deployment",
+            )
+        if profile.device != self._configured_device_name:
             raise BackendLoadError(
                 "Torch deployment device does not match the session", code="deployment_context_mismatch"
             )
         model_dtype = self.validate_runtime_options(context.runtime_options)
         torch_module = self._import_required("torch", "PyTorch")
-        self._validate_device(torch_module, deployment.device)
-        if deployment.device == "npu":
+        self._validate_device(torch_module, profile.device)
+        if profile.device == "npu":
             self._import_required("torch_npu", "torch_npu")
             self._validate_npu(torch_module)
         try:
-            device = torch_module.device(deployment.device)
+            device = torch_module.device(profile.device)
         except Exception as exc:
             raise BackendLoadError(
-                f"cannot construct Torch device {deployment.device!r}: {exc}", code="invalid_device"
+                f"cannot construct Torch device {profile.device!r}: {exc}", code="invalid_device"
             ) from exc
 
         config_type = self._import_attribute(
@@ -114,7 +126,7 @@ class LeRobotTorchModelSession(ModelSession):
         bundle_path = str(context.validated_manifest.bundle_root)
         policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
         try:
-            policy_config.device = deployment.device
+            policy_config.device = profile.device
         except (AttributeError, TypeError) as exc:
             raise BackendLoadError(
                 "LeRobot policy config does not permit runtime device placement", code="incompatible_policy_config"
@@ -130,7 +142,7 @@ class LeRobotTorchModelSession(ModelSession):
             raise BackendLoadError(str(exc), code="invalid_policy_assets") from exc
         if local_vlm_path is not None:
             policy_config.vlm_model_name = local_vlm_path
-        policy_class = get_policy_class(context.policy.policy_type)
+        policy_class = get_policy_class(context.model_type)
         policy = policy_class.from_pretrained(bundle_path, config=policy_config, local_files_only=True)
 
         self._torch = torch_module
@@ -162,12 +174,25 @@ class LeRobotTorchModelSession(ModelSession):
             supports_attention=self.observes_attention(policy),
         )
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         policy = self._policy
         torch_module = self._torch
         if policy is None or torch_module is None:
             raise BackendInferenceError("LeRobot Torch model session is not loaded", code="runtime_not_loaded")
-        batch = {key: self._move_input(value) for key, value in request.inputs.items()}
+        input_descriptors = {d.semantic: d for d in self._require_context().validated_manifest.manifest.model.inputs}
+        batch = {}
+        for key, value in request.inputs.items():
+            tensor = self._move_input(value)
+            descriptor = input_descriptors.get(key)
+            if (
+                descriptor is not None
+                and hasattr(tensor, "dim")
+                and hasattr(tensor, "shape")
+                and tensor.dim() == len(descriptor.shape)
+            ):
+                tensor = tensor.unsqueeze(0)
+            batch[key] = tensor
         action_method = request.metadata.get("action_method", "predict_action_chunk")
         if not isinstance(action_method, str) or action_method not in _ACTION_METHODS:
             raise BackendInferenceError(
@@ -187,8 +212,8 @@ class LeRobotTorchModelSession(ModelSession):
             action = callback(batch, **kwargs)
         action = self._remove_batch_dimension(action)
         self._last_metadata = {
-            "request_id": request.request_id,
-            "policy_type": self._require_context().policy.policy_type,
+            "request_id": context.request_id,
+            "policy_type": self._require_context().model_type,
             "device": self._configured_device_name,
             "action_method": action_method,
             "external_noise": noise is not None and "noise" in kwargs,

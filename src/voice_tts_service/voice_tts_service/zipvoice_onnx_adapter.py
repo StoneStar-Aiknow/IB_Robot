@@ -20,9 +20,8 @@ from inference_manifest import TorchDeployment
 from inference_service.backends import BackendCapabilities, RuntimeContext
 from inference_service.backends.errors import BackendInferenceError as SessionInferenceError
 from inference_service.backends.errors import BackendLoadError as SessionLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 from voice_tts_service.errors import BackendLoadError
 from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
 
@@ -31,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 class ZipVoiceOnnxSession(ModelSession):
     """Run the ZipVoice-Distill ONNX pipeline with onnxruntime on Ubuntu."""
+
+    execution_contract = "request-iterative"
+    orchestration_visibility = "session"
 
     def __init__(self, *, prompt_profile: str = "default", **kwargs) -> None:
         super().__init__(
@@ -74,12 +76,12 @@ class ZipVoiceOnnxSession(ModelSession):
             raise BackendLoadError(f"ZipVoice asset is unavailable: {path}")
         return path
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
-        if model.kind != "generic" or model.family != "zipvoice":
-            raise SessionLoadError("ZipVoice session requires model.kind=generic and model.family=zipvoice")
-        if not isinstance(deployment, TorchDeployment) or deployment.backend != "torch":
+        if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
+            raise SessionLoadError("ZipVoice session requires tensor_model/zipvoice/synthesize")
+        if not isinstance(deployment, TorchDeployment) or context.backend != "torch":
             raise SessionLoadError("ZipVoice ONNX session requires a compiled torch deployment")
         self._root = context.validated_manifest.bundle_root
         self._config = self._load_json(self._root / "assets" / "zipvoice_onnx.json")
@@ -154,7 +156,8 @@ class ZipVoiceOnnxSession(ModelSession):
         self._torch = torch
         self._vocos = vocos.eval()
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         if any(
             value is None
             for value in (self._tokenizer, self._prompt, self._torch, self._vocos, self._text_encoder, self._fm_decoder)

@@ -197,8 +197,16 @@ def test_multi_deployment_bundle_keeps_native_weights_when_compiled_is_selected(
     manifest["deployments"]["cpu"] = {
         "uuid": TEST_DEPLOYMENT_UUID,
         "revision": 1,
-        "backend": "torch",
-        "device": "cpu",
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "direct",
+            "cancellation_granularity": "request_boundary",
+        },
+        "runtime_profile": {
+            "backend": "torch",
+            "target": {"runtime": "torch"},
+            "profile": {"device": "cpu"},
+        },
     }
     write_manifest(tmp_path, manifest)
 
@@ -214,8 +222,16 @@ def test_metadata_only_loader_does_not_require_cloud_artifacts_or_native_weights
     manifest["deployments"]["cpu"] = {
         "uuid": TEST_DEPLOYMENT_UUID,
         "revision": 1,
-        "backend": "torch",
-        "device": "cpu",
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "direct",
+            "cancellation_granularity": "request_boundary",
+        },
+        "runtime_profile": {
+            "backend": "torch",
+            "target": {"runtime": "torch"},
+            "profile": {"device": "cpu"},
+        },
     }
     write_manifest(tmp_path, manifest)
     (tmp_path / "artifacts/policy.rknn").unlink()

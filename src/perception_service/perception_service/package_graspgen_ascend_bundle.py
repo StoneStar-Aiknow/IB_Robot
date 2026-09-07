@@ -5,12 +5,12 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""Package the eight compiled GraspGen OM artifacts as a schema-v2 grasp bundle.
+"""Package the eight compiled GraspGen OM artifacts as a schema-v3 grasp bundle.
 
 This bridges the Huawei GraspGen toolchain - which emits a flat ``graspgen.onnx.json``
 plus one OM per role - and the unified bundle the generic model runtime loads. GraspGen
-belongs to the grasp model domain; the current runtime carries a
-``ModelDescriptor(kind="perception")`` only as its existing compatibility category.
+belongs to the grasp model domain and uses the canonical
+``tensor_model/graspgen/generate_grasps`` identity.
 The model's own constants live in ``assets/adapter.json`` and no LeRobot policy asset is
 written or required.
 
@@ -33,6 +33,30 @@ from typing import Any
 from uuid import uuid4
 
 from inference_manifest import (
+    ArtifactBindings,
+    AscendRuntimeProfile,
+    BundleFile,
+    CompiledDeployment,
+    DeploymentArtifact,
+    DeploymentTarget,
+    DeviceLink,
+    Digest,
+    ExecutionContract,
+    InferenceManifest,
+    ManifestBundle,
+    ModelDescriptor,
+    RoleRuntimeProfile,
+    SemanticIdentity,
+    SemanticTensor,
+    TensorBinding,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    canonical_bundle_digest,
+    load_inference_manifest,
+    write_inference_manifest,
+)
+from model_utils.acl_abi_inspection import write_acl_om_abi
+from model_utils.graspgen_contract import (
     GRASPGEN_CONFIDENCE_SEMANTIC,
     GRASPGEN_CONTRACT_VERSION,
     GRASPGEN_DISCRIMINATOR_EMBEDDING,
@@ -40,28 +64,11 @@ from inference_manifest import (
     GRASPGEN_GENERATOR_EMBEDDING,
     GRASPGEN_POINT_CLOUD_SEMANTIC,
     GRASPGEN_POSE_SEMANTIC,
-    ArtifactBindings,
-    BundleFile,
-    CompiledDeployment,
-    DeploymentArtifact,
-    DeploymentTarget,
-    DeviceLink,
-    Digest,
-    InferenceManifest,
-    ManifestBundle,
-    ModelDescriptor,
-    SemanticIdentity,
-    SemanticTensor,
-    TensorBinding,
-    TorchDeployment,
-    canonical_bundle_digest,
     graspgen_geometry,
     graspgen_input_semantics,
     graspgen_output_semantics,
-    load_inference_manifest,
-    write_inference_manifest,
 )
-from model_utils.inference_manifest_export import read_runtime_abi, write_acl_om_abi
+from model_utils.inference_manifest_export import read_runtime_abi
 
 from .graspgen_adapter import GRASPGEN_POSTPROCESSING, GRASPGEN_PREPROCESSING, GraspGenAdapter
 
@@ -218,7 +225,9 @@ def _adapter_assets(onnx_manifest: Mapping[str, object], *, grasp_batch_size: in
     """
     backend_config = dict(onnx_manifest.get("backend_config") or {})
     return {
-        "family": GraspGenAdapter.identity.family,
+        "interface": "tensor_model",
+        "model_type": "graspgen",
+        "operation": "generate_grasps",
         "preprocessing": GRASPGEN_PREPROCESSING,
         "postprocessing": GRASPGEN_POSTPROCESSING,
         "kappa": float(backend_config.get("kappa", 2.02217)),
@@ -257,15 +266,16 @@ def _copy_torch_assets(root: Path, onnx_manifest: Mapping[str, object]) -> None:
 def _model_descriptor(grasp_batch_size: int) -> ModelDescriptor:
     del grasp_batch_size
     return ModelDescriptor(
-        kind="perception",
-        family=GraspGenAdapter.identity.family,
+        interface="tensor_model",
+        model_type="graspgen",
+        operation="generate_grasps",
         inputs=(SemanticTensor(semantic=GRASPGEN_POINT_CLOUD_SEMANTIC, dtype="float32", shape=(-1, 3)),),
         outputs=(
             SemanticTensor(semantic=GRASPGEN_POSE_SEMANTIC, dtype="float32", shape=(-1, 4, 4)),
             SemanticTensor(semantic=GRASPGEN_CONFIDENCE_SEMANTIC, dtype="float32", shape=(-1,)),
         ),
         semantic_identity=SemanticIdentity(
-            logical_model_revision=f"{GraspGenAdapter.identity.family}@v{GRASPGEN_CONTRACT_VERSION}",
+            logical_model_revision=f"{GraspGenAdapter.identity.model_type}@v{GRASPGEN_CONTRACT_VERSION}",
             preprocessing_contract=GRASPGEN_PREPROCESSING,
             output_semantics=GRASPGEN_POSTPROCESSING,
         ),
@@ -286,6 +296,7 @@ def write_graspgen_ascend_bundle(
     abi_device_id: int = 0,
     acl_config_path: str | None = None,
 ) -> Path:
+    """Package an Ascend bundle; ACL config is accepted only for missing-ABI inspection."""
     require_contract_version(onnx_manifest)
     roles = _resolve_roles(
         deployment_name=deployment_name,
@@ -325,8 +336,16 @@ def write_graspgen_ascend_bundle(
     bundle_revision = existing.bundle.revision + int(structure_changed) if existing is not None else 1
 
     deployment = CompiledDeployment(
-        backend="ascend",
-        target=DeploymentTarget(soc=soc_version, runtime="acl"),
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="ascend",
+            target=DeploymentTarget(soc=soc_version, runtime="acl"),
+            profile=AscendRuntimeProfile(device_id=0),
+        ),
         artifacts={artifact.role: DeploymentArtifact(path=artifact.destination, format="om") for artifact in roles},
         execution=GRASPGEN_EXECUTION,
         bindings={artifact.role: artifact.bindings for artifact in roles},
@@ -339,14 +358,25 @@ def write_graspgen_ascend_bundle(
         )
         deployment = deployment.model_copy(update={"uuid": previous.uuid, "revision": previous.revision + int(changed)})
 
-    torch_deployment = TorchDeployment(backend="torch", device="cuda")
+    torch_deployment = TorchDeployment(
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="torch",
+            target=DeploymentTarget(runtime="torch"),
+            profile=TorchRuntimeProfile(device="cuda"),
+        ),
+    )
     previous_torch = existing.deployments.get("torch_cuda") if existing is not None else None
     if isinstance(previous_torch, TorchDeployment):
         torch_deployment = torch_deployment.model_copy(
             update={"uuid": previous_torch.uuid, "revision": previous_torch.revision}
         )
     manifest = InferenceManifest(
-        schema_version=2,
+        schema_version=3,
         bundle=ManifestBundle(
             uuid=bundle_uuid,
             revision=bundle_revision,
@@ -389,7 +419,7 @@ def _load_onnx_manifest(path: Path) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Package compiled GraspGen OM artifacts as a schema-v2 grasp-domain bundle.",
+        description="Package compiled GraspGen OM artifacts as a schema-v3 grasp-domain bundle.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--bundle-root", required=True, help="Target bundle directory.")

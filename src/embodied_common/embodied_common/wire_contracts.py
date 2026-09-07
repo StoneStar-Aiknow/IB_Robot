@@ -26,3 +26,10 @@ def validate_public_request_wire_contracts() -> None:
             raise RuntimeError(
                 f"public request wire contract mismatch for {type_name}: first field must be uint32 schema_version"
             )
+        if type_name in {"SkillCommand.Goal", "ValidateSkill.Request"}:
+            field_types = dict(fields)
+            if field_types.get("arm_side") != "string" or field_types.get("imitation_duration_sec") != "float":
+                raise RuntimeError(
+                    f"public request wire contract mismatch for {type_name}: schema_version contract must include "
+                    "string arm_side and float32 imitation_duration_sec"
+                )

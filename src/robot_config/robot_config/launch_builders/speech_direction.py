@@ -7,6 +7,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
+from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
@@ -46,20 +47,9 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
 
     microphone_name = str(config.get("microphone", "")).strip()
     peripherals = robot_config.get("peripherals", [])
-    microphone = next(
-        (
-            peripheral
-            for peripheral in peripherals
-            if isinstance(peripheral, dict)
-            and peripheral.get("name") == microphone_name
-            and peripheral.get("type") == "microphone"
-        ),
-        None,
-    )
-    microphone_params = microphone.get("params", {}) if isinstance(microphone, dict) else {}
+    microphone_params = find_microphone_params(peripherals, microphone_name)
     launch_argument_names = {
-        "device_name_contains": "microphone_device_name_contains",
-        "arecord_device": "microphone_arecord_device",
+        "channels": "microphone_channels",
         "sample_rate": "microphone_sample_rate",
         "channel_indices": "microphone_channel_indices",
     }
@@ -68,14 +58,18 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
             value = microphone_params[parameter_name]
             launch_arguments[launch_name] = str(value) if parameter_name != "channel_indices" else repr(value)
     parameter_launch_names = {
-        "input_source": "speech_direction_input_source",
         "mount_yaw_deg": "speech_direction_mount_yaw_deg",
-        "wav_path": "speech_direction_wav_path",
-        "wav_replay_rate": "speech_direction_wav_replay_rate",
     }
     for parameter_name, launch_name in parameter_launch_names.items():
         if parameter_name in config.get("parameters", {}):
             launch_arguments[launch_name] = str(config["parameters"][parameter_name])
+
+    audio_io = robot_config.get("audio_io", {})
+    if not is_audio_io_enabled(audio_io):
+        raise ValueError("speech_direction.enabled=true requires audio_io.enabled=true")
+    launch_arguments["speech_direction_audio_topic"] = str(
+        audio_io.get("capture_stamped_topic", "/audio/capture_stamped")
+    )
 
     logger.info(f"Speech direction enabled with profile {profile!r}")
     return [

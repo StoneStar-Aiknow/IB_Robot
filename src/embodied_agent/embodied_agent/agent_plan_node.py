@@ -17,6 +17,7 @@ from rclpy.action.server import GoalEvent
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
 from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
@@ -42,7 +43,6 @@ from ibrobot_msgs.srv import (
     ValidateAgentPlan,
     ValidateSkill,
 )
-from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 
 class _ChildStateUnknown(AgentPlanError):
@@ -280,6 +280,8 @@ class AgentPlanNode(Node):
             place_name=step.place_name,
             motion_direction=step.motion_direction,
             motion_distance=step.motion_distance,
+            arm_side=step.arm_side,
+            imitation_duration_sec=step.imitation_duration_sec,
             direction=step.direction,
             distance=step.distance,
             degree=step.degree,
@@ -316,6 +318,8 @@ class AgentPlanNode(Node):
                         place_name=step.place_name,
                         motion_direction=step.motion_direction.strip().lower(),
                         motion_distance=self._float32(step.motion_distance),
+                        arm_side=step.arm_side,
+                        imitation_duration_sec=self._float32(step.imitation_duration_sec),
                         timeout_sec=self._float32(step.timeout_sec),
                         direction=step.direction.strip().lower(),
                         distance=step.distance,
@@ -377,6 +381,8 @@ class AgentPlanNode(Node):
         request.place_name = step.place_name
         request.motion_direction = step.motion_direction
         request.motion_distance = step.motion_distance
+        request.arm_side = step.arm_side
+        request.imitation_duration_sec = step.imitation_duration_sec
         self._copy_navigation_step(request, step)
         return self._call_service(self._validate_skill_client, request, self._validate_skill_service)
 
@@ -532,6 +538,8 @@ class AgentPlanNode(Node):
         goal.place_name = step.place_name
         goal.motion_direction = step.motion_direction
         goal.motion_distance = step.motion_distance
+        goal.arm_side = step.arm_side
+        goal.imitation_duration_sec = step.imitation_duration_sec
         self._copy_navigation_step(goal, step)
         goal.timeout_sec = step.timeout_sec
         send_future = self._skill_client.send_goal_async(goal)

@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from conftest import GRASPGEN_DEPLOYMENT
 
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorResult, RuntimeLatency
+from inference_service.unified_runtime import ModelResult, OutcomeEvidence, RuntimeLatency
 from perception_service.graspgen_adapter import (
     GRASPGEN_POSTPROCESSING,
     GRASPGEN_PREPROCESSING,
@@ -31,7 +31,9 @@ from perception_service.graspgen_adapter import (
 )
 
 _ASSETS = {
-    "family": "graspgen",
+    "interface": "tensor_model",
+    "model_type": "graspgen",
+    "operation": "generate_grasps",
     "preprocessing": GRASPGEN_PREPROCESSING,
     "postprocessing": GRASPGEN_POSTPROCESSING,
     "kappa": 2.0,
@@ -47,22 +49,22 @@ def _adapter(**overrides) -> GraspGenAdapter:
     return GraspGenAdapter(GraspGenConfig.from_assets(assets))
 
 
-def _named_result(outputs: dict[str, np.ndarray]) -> NamedTensorResult:
-    return NamedTensorResult(
+def _model_result(outputs: dict[str, np.ndarray]) -> ModelResult:
+    return ModelResult(
         outputs=outputs,
-        deployment=DeploymentIdentity("bundle", "uuid", 1, "ascend_310p", "uuid", 1, "fingerprint", "ascend"),
         latency=RuntimeLatency(1.0, 1.0),
+        evidence=OutcomeEvidence.completed("adaptation"),
     )
 
 
-def _result(poses: np.ndarray, confidence: np.ndarray) -> NamedTensorResult:
-    return _named_result({"grasp.poses": poses, "grasp.confidence": confidence})
+def _result(poses: np.ndarray, confidence: np.ndarray) -> ModelResult:
+    return _model_result({"grasp.poses": poses, "grasp.confidence": confidence})
 
 
 def test_the_identity_names_the_contracts_the_packager_stamps_into_the_bundle():
     identity = GraspGenAdapter.identity
 
-    assert identity.family == "graspgen"
+    assert identity.model_type == "graspgen"
     assert identity.preprocessing == GRASPGEN_PREPROCESSING
     assert identity.postprocessing == GRASPGEN_POSTPROCESSING
     assert identity.supported_deployments == frozenset({"torch_cuda", "ascend_310p", "ascend_310b"})
@@ -219,7 +221,7 @@ def test_postprocess_leaves_the_poses_alone_when_no_centre_is_given():
 )
 def test_postprocess_names_the_semantic_the_runtime_failed_to_return(outputs, expected):
     with pytest.raises(RuntimeError, match=expected):
-        _adapter().postprocess(_named_result(outputs))
+        _adapter().postprocess(_model_result(outputs))
 
 
 @pytest.mark.parametrize(

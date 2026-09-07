@@ -6,9 +6,9 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 
 from inference_service.backends.types import BackendHealth, BackendState, RuntimeContext
-from inference_service.model_sessions.base import ModelSession
 from inference_service.pipeline.runtime_core import ExecutionControl, ExecutionError, ModelExecutor, StageFrame
 from inference_service.pipeline.stages import InferenceStage, ResultAdapter
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
 
 class SequentialModelExecutor(ModelExecutor):
@@ -24,7 +24,8 @@ class SequentialModelExecutor(ModelExecutor):
         component_contexts: Mapping[int, RuntimeContext] | None = None,
         error_handler: Callable[[Exception, bool], None] | None = None,
         health_override: Callable[[], BackendHealth | None] | None = None,
-        defer_session_execution: bool = False,
+        execution_contract: str | None = None,
+        orchestration_visibility: str | None = None,
     ) -> None:
         self._stages = tuple(stages)
         if not self._stages:
@@ -35,7 +36,8 @@ class SequentialModelExecutor(ModelExecutor):
         self._component_contexts = dict(component_contexts or {})
         self._error_handler = error_handler
         self._health_override = health_override
-        self._defer_session_execution = defer_session_execution
+        self._execution_contract = execution_contract
+        self._orchestration_visibility = orchestration_visibility
         self._context: RuntimeContext | None = None
 
     @property
@@ -51,38 +53,37 @@ class SequentialModelExecutor(ModelExecutor):
         return self._execution_plan
 
     @property
+    def execution_contract(self) -> str | None:
+        return self._execution_contract
+
+    @property
+    def orchestration_visibility(self) -> str | None:
+        return self._orchestration_visibility
+
+    @property
     def component_contexts(self) -> Mapping[int, RuntimeContext]:
         return self._component_contexts
 
     def load(self, context: RuntimeContext) -> None:
-        self._context = context
-        loaded: list[object] = []
-        try:
-            for component in self._components:
-                load = getattr(component, "load", None)
-                if callable(load):
-                    load(self._component_contexts.get(id(component), context))
-                    loaded.append(component)
-        except Exception:
-            for component in reversed(loaded):
-                close = getattr(component, "close", None)
-                if callable(close):
-                    close()
-            raise
+        del context
+        # Components are owned and loaded by ModelRuntimeHandle.
 
-    def execute(self, request: object, *, deadline: datetime | None, control: ExecutionControl) -> object:
-        inputs = getattr(request, "inputs", None)
-        if not isinstance(inputs, Mapping):
-            raise TypeError("SequentialModelExecutor request must expose mapping inputs")
-        frame = StageFrame(request, execution_plan=self._execution_plan, values=inputs, control=control)
+    def execute(self, request: ModelRequest, context: ExecutionContext) -> object:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("SequentialModelExecutor requires a ModelRequest")
+        if not isinstance(context, ExecutionContext):
+            raise TypeError("SequentialModelExecutor requires an ExecutionContext")
+        control = ExecutionControl(context.request_id, context.cancellation_token)
+        frame = StageFrame(
+            request,
+            execution_plan=self._execution_plan,
+            values={**request.inputs, "_execution_context": context},
+            control=control,
+        )
         try:
-            if not self._defer_session_execution:
-                for component in self._components:
-                    if frame.execution_frame is None and isinstance(component, ModelSession):
-                        continue
-                    frame.open_session_execution(component, request, deadline)
             for stage in self._stages:
-                stage.execute(frame, deadline=deadline)
+                context.check("stage")
+                stage.execute(frame, deadline=context.deadline.expires_at)
             return self._result_adapter.adapt(frame)
         except Exception as exc:
             if self._error_handler is not None:
@@ -139,28 +140,10 @@ class SequentialModelExecutor(ModelExecutor):
         )
 
     def reset(self, deadline: datetime | None = None) -> None:
-        for component in self._components:
-            reset = getattr(component, "reset", None)
-            if callable(reset):
-                try:
-                    reset(deadline=deadline)
-                except TypeError as exc:
-                    if "deadline" not in str(exc):
-                        raise
-                    reset()
+        del deadline
 
     def close(self) -> None:
-        errors: list[Exception] = []
-        for component in reversed(self._components):
-            close = getattr(component, "close", None)
-            if not callable(close):
-                continue
-            try:
-                close()
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise RuntimeError("; ".join(str(error) for error in errors))
+        return None
 
     @staticmethod
     def _unique(components: tuple[object, ...]) -> tuple[object, ...]:

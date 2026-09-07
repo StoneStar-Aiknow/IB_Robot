@@ -1,4 +1,4 @@
-"""Finalize downloaded perception assets as schema-v2 inference bundles."""
+"""Finalize downloaded perception assets as schema-v3 inference bundles."""
 
 from __future__ import annotations
 
@@ -12,19 +12,23 @@ from uuid import uuid4
 
 from inference_manifest import (
     ArtifactBindings,
+    AscendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
     DeploymentArtifact,
     DeploymentTarget,
     Digest,
     EmbeddingMetadata,
+    ExecutionContract,
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
     TensorBinding,
     TorchDeployment,
+    TorchRuntimeProfile,
     canonical_bundle_digest,
     load_inference_manifest,
     write_inference_manifest,
@@ -36,7 +40,7 @@ from .semantic_model_adapters import GroundingDINOAdapter, SAM2Adapter, SigLIP2I
 
 @dataclass(frozen=True)
 class BundleSpec:
-    family: str
+    model_type: str
     name: str
     adapter: dict[str, object]
     model: ModelDescriptor
@@ -65,9 +69,48 @@ def _tensor(semantic: str, dtype: str, shape: tuple[int, ...], layout: str | Non
     return SemanticTensor(semantic=semantic, dtype=dtype, shape=shape, layout=layout)
 
 
-def _identity(family: str, preprocessing: str, output_semantics: str, embedding=None) -> SemanticIdentity:
+def _request_contract() -> ExecutionContract:
+    return ExecutionContract(
+        state_scope="request",
+        execution_structure="direct",
+        cancellation_granularity="request_boundary",
+    )
+
+
+def _torch_deployment(device: str) -> TorchDeployment:
+    return TorchDeployment(
+        execution_contract=_request_contract(),
+        runtime_profile=RoleRuntimeProfile(
+            backend="torch",
+            target=DeploymentTarget(runtime="torch"),
+            profile=TorchRuntimeProfile(device=device),
+        ),
+    )
+
+
+def _ascend_deployment(
+    *,
+    target_soc: str,
+    artifacts: dict[str, DeploymentArtifact],
+    bindings: dict[str, ArtifactBindings],
+) -> CompiledDeployment:
+    roles = tuple(artifacts)
+    return CompiledDeployment(
+        execution_contract=_request_contract(),
+        runtime_profile=RoleRuntimeProfile(
+            backend="ascend",
+            target=DeploymentTarget(soc=target_soc, runtime="acl"),
+            profile=AscendRuntimeProfile(device_id=0),
+        ),
+        artifacts=artifacts,
+        execution=roles,
+        bindings=bindings,
+    )
+
+
+def _identity(model_type: str, preprocessing: str, output_semantics: str, embedding=None) -> SemanticIdentity:
     return SemanticIdentity(
-        logical_model_revision=family,
+        logical_model_revision=model_type,
         preprocessing_contract=preprocessing,
         output_semantics=output_semantics,
         embedding=embedding,
@@ -84,10 +127,11 @@ def _specs() -> dict[str, BundleSpec]:
     )
     return {
         "sam2": BundleSpec(
-            family="sam2",
+            model_type="sam2",
             name="sam2.1_hiera_tiny",
             adapter={
-                "family": "sam2",
+                "interface": "tensor_model",
+                "model_type": "sam2",
                 "operation": "automatic",
                 "preprocessing": SAM2Adapter.identity.preprocessing,
                 "postprocessing": SAM2Adapter.identity.postprocessing,
@@ -100,8 +144,8 @@ def _specs() -> dict[str, BundleSpec]:
                 "stability_score_thresh": 0.90,
             },
             model=ModelDescriptor(
-                kind="perception",
-                family="sam2",
+                interface="tensor_model",
+                model_type="sam2",
                 operation="automatic",
                 inputs=(_tensor("observation.image", "uint8", (-1, -1, 3)),),
                 outputs=(
@@ -119,10 +163,12 @@ def _specs() -> dict[str, BundleSpec]:
             required_paths=("assets/sam2.1_hiera_tiny.pt",),
         ),
         "ram_plus": BundleSpec(
-            family="ram_plus",
+            model_type="ram_plus",
             name="ram_plus_swin_large_14m",
             adapter={
-                "family": "ram_plus",
+                "interface": "tensor_model",
+                "model_type": "ram_plus",
+                "operation": "recognize_tags",
                 "preprocessing": RAM_PLUS_PREPROCESSING,
                 "postprocessing": RAM_PLUS_POSTPROCESSING,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_ram_plus",
@@ -130,8 +176,9 @@ def _specs() -> dict[str, BundleSpec]:
                 "text_encoder": "assets/bert-base-uncased",
             },
             model=ModelDescriptor(
-                kind="perception",
-                family="ram_plus",
+                interface="tensor_model",
+                model_type="ram_plus",
+                operation="recognize_tags",
                 inputs=(_tensor("observation.image", "float32", (-1, 3, 384, 384), "NCHW"),),
                 outputs=(_tensor("tag_logits", "float32", (-1, 4585)),),
                 semantic_identity=_identity(
@@ -162,18 +209,21 @@ def _specs() -> dict[str, BundleSpec]:
             ),
         ),
         "siglip2": BundleSpec(
-            family="siglip2",
+            model_type="siglip2",
             name="siglip2_so400m_patch14_384",
             adapter={
-                "family": "siglip2",
+                "interface": "tensor_model",
+                "model_type": "siglip2",
+                "operation": "encode",
                 "preprocessing": SigLIP2ImageAdapter.identity.preprocessing,
                 "postprocessing": SigLIP2ImageAdapter.identity.postprocessing,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_siglip2",
                 "model_path": "assets/model",
             },
             model=ModelDescriptor(
-                kind="perception",
-                family="siglip2",
+                interface="tensor_model",
+                model_type="siglip2",
+                operation="encode",
                 inputs=(
                     _tensor("masked_images", "float32", (-1, 3, 384, 384), "NCHW"),
                     _tensor("text_tokens", "int64", (-1, 64)),
@@ -193,11 +243,12 @@ def _specs() -> dict[str, BundleSpec]:
             required_paths=("assets/model/config.json", "assets/model/model.safetensors"),
         ),
         "grounded_sam2": BundleSpec(
-            family="grounding_dino",
+            model_type="grounding_dino",
             name="grounded_sam2_swint_ogc",
             adapter={
-                "family": "grounding_dino",
-                "operation": "combined",
+                "interface": "tensor_model",
+                "model_type": "grounding_dino",
+                "operation": "detect",
                 "preprocessing": GroundingDINOAdapter.identity.preprocessing,
                 "postprocessing": GroundingDINOAdapter.identity.postprocessing,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_grounded_sam2",
@@ -207,9 +258,9 @@ def _specs() -> dict[str, BundleSpec]:
                 "sam_config": "configs/sam2.1/sam2.1_hiera_t.yaml",
             },
             model=ModelDescriptor(
-                kind="perception",
-                family="grounding_dino",
-                operation="combined",
+                interface="tensor_model",
+                model_type="grounding_dino",
+                operation="detect",
                 inputs=(
                     _tensor("observation.image", "uint8", (-1, -1, 3)),
                     _tensor("text_prompt", "uint8", (-1,)),
@@ -267,11 +318,11 @@ def _promote_compiled_artifact(root: Path, compiled: CompiledSpec) -> Path | Non
 
 def package_bundle(root: Path, spec: BundleSpec) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    if spec.family == "grounding_dino":
+    if spec.model_type == "grounding_dino":
         (root / "assets" / "GroundingDINO_SwinT_OGC.py").unlink(missing_ok=True)
     for relative in spec.required_paths:
         if not (root / relative).is_file():
-            raise FileNotFoundError(f"required {spec.family} bundle asset is missing: {root / relative}")
+            raise FileNotFoundError(f"required {spec.model_type} bundle asset is missing: {root / relative}")
 
     adapter_path = root / "assets" / "adapter.json"
     adapter_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +357,7 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
     bundle_revision = existing.bundle.revision + int(structure_changed) if existing is not None else 1
     deployments = dict(existing.deployments) if existing is not None else {}
     for name, device in (("torch_cpu", "cpu"), ("torch_cuda", "cuda")):
-        candidate = TorchDeployment(backend="torch", device=device)
+        candidate = _torch_deployment(device)
         previous = deployments.get(name)
         if previous is not None:
             candidate = candidate.model_copy(update={"uuid": previous.uuid, "revision": previous.revision})
@@ -317,11 +368,9 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
         if compiled_artifact is None:
             deployments.pop(name, None)
         else:
-            candidate = CompiledDeployment(
-                backend="ascend",
-                target=DeploymentTarget(soc=compiled.target_soc, runtime="acl"),
+            candidate = _ascend_deployment(
+                target_soc=compiled.target_soc,
                 artifacts={"model": DeploymentArtifact(path=compiled.artifact, format="om")},
-                execution=("model",),
                 bindings={"model": compiled.bindings},
             )
             previous = deployments.get(name)
@@ -337,7 +386,7 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
                 )
             deployments[name] = candidate
     manifest = InferenceManifest(
-        schema_version=2,
+        schema_version=3,
         bundle=ManifestBundle(
             uuid=bundle_uuid,
             revision=bundle_revision,
@@ -361,10 +410,10 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models-root", type=Path, required=True)
-    parser.add_argument("--family", choices=tuple(_specs()) + ("all",), default="all")
+    parser.add_argument("--model-type", choices=tuple(_specs()) + ("all",), default="all")
     args = parser.parse_args()
     specs = _specs()
-    selected = specs if args.family == "all" else {args.family: specs[args.family]}
+    selected = specs if args.model_type == "all" else {args.model_type: specs[args.model_type]}
     for spec in selected.values():
         print(package_bundle(args.models_root / spec.name, spec))
     return 0

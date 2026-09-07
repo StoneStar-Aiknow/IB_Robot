@@ -5,7 +5,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
-from ai_compliance import DISCLOSURE_START, add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
+from ai_compliance import (
+    DISCLOSURE_END,
+    DISCLOSURE_START,
+    add_ai_disclosure,
+    reject_handwritten_disclosure,
+    validate_agent_tool,
+    validate_commit_ai_model,
+)
 
 
 def test_validate_agent_tool_accepts_arbitrary_tool_report():
@@ -32,7 +39,21 @@ def test_add_ai_disclosure_records_required_metadata():
     assert "Agent平台信息（Tool）: OpenCode 1.17.20" in body
     assert "模型信息 (Model): gpt-5.6-sol" in body
     assert "人工审查情况" in body
+    assert f"{DISCLOSURE_END}\n\n---\n\n## Changes" in body
     assert body.endswith("## Changes\n\nFocused update.")
+
+
+def test_add_ai_disclosure_separates_block_from_body_with_single_rule():
+    body = add_ai_disclosure(
+        "---\n\n## Changes\n\nBody already starts with a rule.",
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the requested policy",
+        third_party_materials="无",
+    )
+
+    assert body.count("\n---\n") == 1
+    assert f"{DISCLOSURE_END}\n\n---\n\n## Changes" in body
 
 
 def test_add_ai_disclosure_replaces_existing_block():
@@ -55,6 +76,28 @@ def test_add_ai_disclosure_replaces_existing_block():
     assert "OpenCode 1.17.20" not in updated
     assert "模型信息 (Model): model-v2" in updated
     assert "Agent平台信息（Tool）: Claude Code 2.1.223" in updated
+    assert f"{DISCLOSURE_END}\n\n---\n\nDescription" in updated
+
+
+def test_reject_handwritten_disclosure_outside_managed_block():
+    managed = add_ai_disclosure(
+        "## Changes\n\nBody.",
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the policy",
+        third_party_materials="无",
+    )
+    # The managed block itself must not trigger the rejection.
+    reject_handwritten_disclosure(managed)
+
+    for handwritten in (
+        "# AI 披露\n\n1. Agent平台信息（Tool）: OpenCode 1.17.20",
+        "### 当前PR是否有AI参与\n- [x] 是",
+        "### 希望检视人员了解\n内容由 AI 辅助完成",
+        managed + "\n\n## AI 披露\n\n1. Agent平台信息（Tool）: OpenCode 1.17.20",
+    ):
+        with pytest.raises(ValueError, match="hand-written AI disclosure"):
+            reject_handwritten_disclosure(handwritten)
 
 
 def test_validate_commit_ai_model_accepts_matching_trailers():

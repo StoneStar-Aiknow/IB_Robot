@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorResult, RuntimeLatency
+from inference_service.unified_runtime import ModelResult, OutcomeEvidence, RuntimeLatency
 from perception_service.ram_plus_adapter import (
     RAM_PLUS_POSTPROCESSING,
     RAM_PLUS_PREPROCESSING,
@@ -19,7 +19,9 @@ def _write_assets(root, preprocessing=RAM_PLUS_PREPROCESSING) -> None:
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "ram_plus",
+                "interface": "tensor_model",
+                "model_type": "ram_plus",
+                "operation": "recognize_tags",
                 "preprocessing": preprocessing,
                 "postprocessing": RAM_PLUS_POSTPROCESSING,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_ram_plus",
@@ -36,16 +38,16 @@ def _write_assets(root, preprocessing=RAM_PLUS_PREPROCESSING) -> None:
     np.savetxt(assets / "ram_tag_list_threshold.txt", thresholds)
 
 
-def _result(logits) -> NamedTensorResult:
+def _result(logits) -> ModelResult:
     rows = np.asarray(logits, dtype=np.float32)
     if rows.ndim == 1:
         rows = rows[None, :]
     values = np.full((len(rows), 4585), -80.0, dtype=np.float32)
     values[:, : rows.shape[1]] = rows
-    return NamedTensorResult(
+    return ModelResult(
         outputs={"tag_logits": values},
-        deployment=DeploymentIdentity("bundle", "uuid", 1, "torch_cpu", "uuid", 1, "fingerprint", "torch"),
         latency=RuntimeLatency(1.0, 1.0),
+        evidence=OutcomeEvidence.completed("adaptation"),
     )
 
 

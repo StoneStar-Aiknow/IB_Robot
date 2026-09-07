@@ -11,6 +11,7 @@ import pytest
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import InferenceRequest
 from inference_service.pipeline import create_pipeline_manager
+from inference_service.runtime_composition import build_policy_runtime_dependencies
 from robot_config.inference_config import parse_inference_config
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
 
@@ -42,7 +43,7 @@ def _create_tracked_equivalent_bundle(root: Path) -> Path:
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": TEST_BUNDLE_UUID,
                 "revision": 1,
@@ -54,7 +55,32 @@ def _create_tracked_equivalent_bundle(root: Path) -> Path:
                     "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, MODEL_NAME, entries),
                 },
             },
-            "deployments": {"cpu": {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}},
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [
+                    {"semantic": "observation.state", "dtype": "float32", "shape": [6]},
+                    {"semantic": "observation.images.top", "dtype": "float32", "shape": [3, 16, 24]},
+                ],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+            },
+            "deployments": {
+                "cpu": {
+                    "uuid": TEST_DEPLOYMENT_UUID,
+                    "revision": 1,
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "torch",
+                        "target": {"runtime": "torch"},
+                        "profile": {"device": "cpu"},
+                    },
+                }
+            },
         },
     )
     return root
@@ -163,7 +189,14 @@ def test_tracked_equivalent_cpu_bundle_runs_unified_registry_pipeline_end_to_end
     )
     pipeline = inference.pipelines["cpu_smoke"]
     validated = pipeline.validated_manifest
-    manager = create_pipeline_manager("cpu_smoke", validated, request_timeout=2.0)
+    dependencies = build_policy_runtime_dependencies()
+    manager = create_pipeline_manager(
+        "cpu_smoke",
+        validated,
+        request_timeout=2.0,
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
 
     result = manager.infer(
         "cpu_smoke",
@@ -187,6 +220,6 @@ def test_tracked_equivalent_cpu_bundle_runs_unified_registry_pipeline_end_to_end
     assert calls["processor_path"] == bundle
     assert calls["device"] == "cpu"
     manager.reset("cpu_smoke")
-    assert calls["reset"] == 1
     manager.close()
     manager.close()
+    dependencies.providers.close()

@@ -7,6 +7,7 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.audio_contract import is_audio_io_enabled
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
@@ -82,6 +83,12 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "runtime_options_json": json.dumps(runtime_options, sort_keys=True),
     }
     node_name = str(config.get("node_name", "model_service_voice_tts"))
+    audio_io = robot_config.get("audio_io", {})
+    if not is_audio_io_enabled(audio_io):
+        raise ValueError("voice_tts.enabled=true requires audio_io.enabled=true")
+    audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
+    playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
+    playback_channels = int(audio_io.get("playback_channels", 1))
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(
@@ -107,7 +114,9 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "timeout_sec": float(
                         config.get("playback_timeout_sec", defaults.get("playback_timeout_sec", 300.0))
                     ),
-                    "player": str(config.get("player", "aplay")),
+                    "audio_topic": audio_topic,
+                    "playback_sample_rate": playback_sample_rate,
+                    "playback_channels": playback_channels,
                 }
             ],
         ),

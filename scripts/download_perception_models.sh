@@ -227,8 +227,8 @@ PY
 }
 
 prepare_bundle_metadata() {
-    local family="$1"
-    case "${family}" in
+    local model_type="$1"
+    case "${model_type}" in
         sam2)
             ;;
         grounding_dino)
@@ -255,9 +255,9 @@ PY
 }
 
 finalize_bundle() {
-    local family="$1"
+    local model_type="$1"
     local bundle_root
-    bundle_root="$("${PYTHON_BIN}" - "${family}" <<'PY'
+    bundle_root="$("${PYTHON_BIN}" - "${model_type}" <<'PY'
 import sys
 
 from perception_service.package_perception_bundles import _specs
@@ -268,7 +268,7 @@ PY
     prune_snapshot_cache "${MODEL_DIR}/${bundle_root}/assets"
     PYTHONPATH="${WORKSPACE}/src/perception_service:${WORKSPACE}/src/inference_manifest:${WORKSPACE}/src/inference_service:${PYTHONPATH:-}" \
         "${PYTHON_BIN}" -m perception_service.package_perception_bundles \
-        --models-root "${MODEL_DIR}" --family "${family}"
+        --models-root "${MODEL_DIR}" --model-type "${model_type}"
 }
 
 main() {

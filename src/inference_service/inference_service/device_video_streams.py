@@ -67,9 +67,12 @@ class _EdgeStream:
     last_capture_timestamp_ns: int = 0
     last_input_capture_timestamp_ns: int = 0
     last_rtp_timestamp: int = 0
+    last_sent_mapping: tuple[int, int] = (0, 0)
     keyframe_sent: bool = False
     dropped_frames: int = 0
     failed_frames: int = 0
+    submitted_frames: int = 0
+    metrics_started_ns: int = field(default_factory=time.monotonic_ns)
     last_error: str = ""
 
 
@@ -167,7 +170,11 @@ class DeviceVideoStreamManager:
         stream = self._streams.get(observation_key)
         if stream is None:
             return 0
-        return stream.last_capture_timestamp_ns
+        return stream.last_sent_mapping[1]
+
+    def latest_sent_mapping(self, observation_key: str) -> tuple[int, int]:
+        stream = self._streams.get(observation_key)
+        return stream.last_sent_mapping if stream is not None else (0, 0)
 
     @property
     def session(self) -> tuple[str, int]:
@@ -243,9 +250,12 @@ class DeviceVideoStreamManager:
                         stream.last_capture_timestamp_ns = 0
                         stream.last_input_capture_timestamp_ns = 0
                         stream.last_rtp_timestamp = 0
+                        stream.last_sent_mapping = (0, 0)
                         stream.keyframe_sent = False
                         stream.last_error = ""
                         stream.failed_frames = 0
+                        stream.submitted_frames = 0
+                        stream.metrics_started_ns = time.monotonic_ns()
                         stream.active_session_generation = 0
                         # Register for rollback before releasing the lock so a
                         # failure in a later stream's prepare still rolls this
@@ -336,6 +346,7 @@ class DeviceVideoStreamManager:
                 stream.dropped_frames += 1
                 return False
             stream.last_input_capture_timestamp_ns = capture_timestamp_ns
+            stream.submitted_frames += 1
             item = (message, capture_timestamp_ns, receive_timestamp_ns, session_generation, stream.lifecycle_epoch)
             while True:
                 try:
@@ -438,6 +449,29 @@ class DeviceVideoStreamManager:
             for stream in sorted(self._streams.values(), key=lambda item: item.spec.key)
         )
 
+    def sender_diagnostics(self) -> tuple[dict[str, object], ...]:
+        diagnostics = []
+        for stream in sorted(self._streams.values(), key=lambda item: item.spec.key):
+            elapsed_s = max((time.monotonic_ns() - stream.metrics_started_ns) / 1e9, 1e-9)
+            encoder_metrics = stream.encoder.metrics
+            sender_metrics = stream.sender.status.metrics
+            diagnostics.append(
+                {
+                    "observation": stream.spec.key,
+                    "submitted_fps": stream.submitted_frames / elapsed_s,
+                    "encoded_fps": encoder_metrics.output_frames / elapsed_s,
+                    "sent_fps": sender_metrics.sent_frames / elapsed_s,
+                    "submitted_frames": stream.submitted_frames,
+                    "encoded_frames": encoder_metrics.output_frames,
+                    "sent_frames": sender_metrics.sent_frames,
+                    "sent_packets": sender_metrics.sent_packets,
+                    "encode_queue_depth": stream.encode_queue.qsize(),
+                    "sender_queue_depth": sender_metrics.queued_frames,
+                    "dropped_frames": sender_metrics.dropped_frames + stream.dropped_frames + stream.failed_frames,
+                }
+            )
+        return tuple(diagnostics)
+
     def reset(self) -> None:
         for stream in tuple(self._streams.values()):
             with stream.lock:
@@ -451,9 +485,12 @@ class DeviceVideoStreamManager:
                 stream.last_capture_timestamp_ns = 0
                 stream.last_input_capture_timestamp_ns = 0
                 stream.last_rtp_timestamp = 0
+                stream.last_sent_mapping = (0, 0)
                 stream.keyframe_sent = False
                 stream.last_error = ""
                 stream.failed_frames = 0
+                stream.submitted_frames = 0
+                stream.metrics_started_ns = time.monotonic_ns()
 
     @staticmethod
     def _drain_encode_queue(stream: _EdgeStream) -> None:
@@ -627,6 +664,7 @@ class DeviceVideoStreamManager:
         sender_status = stream.sender.status
         sender_metrics = sender_status.metrics
         encoder_metrics = stream.encoder.metrics
+        mapping_rtp_timestamp, mapping_capture_timestamp_ns = stream.last_sent_mapping
         # Ready requires the whole chain to be healthy: the sender, an
         # acknowledged keyframe, a running encoder, a live encode worker, and
         # no outstanding encode error.  A dead encoder or a swallowed encode
@@ -650,9 +688,9 @@ class DeviceVideoStreamManager:
                 and not stream.last_error
             ),
             selected_backend=stream.selected_backend,
-            timestamp_mapping_valid=stream.last_capture_timestamp_ns > 0,
-            mapping_rtp_timestamp=stream.last_rtp_timestamp,
-            mapping_capture_timestamp_ns=stream.last_capture_timestamp_ns,
+            timestamp_mapping_valid=mapping_capture_timestamp_ns > 0,
+            mapping_rtp_timestamp=mapping_rtp_timestamp,
+            mapping_capture_timestamp_ns=mapping_capture_timestamp_ns,
             keyframe_ready=stream.keyframe_sent,
             encoded_frames=encoder_metrics.input_frames,
             sent_packets=sender_metrics.sent_packets,
@@ -672,7 +710,7 @@ def _mark_sent_unlocked(stream: _EdgeStream, packet) -> None:
     and capture timestamp are single-word writes, and keyframe acknowledgement
     is a monotonic flag.
     """
-    stream.last_capture_timestamp_ns = packet.capture_timestamp_ns
-    stream.last_rtp_timestamp = packet.rtp_timestamp
+    stream.last_sent_mapping = (packet.rtp_timestamp, packet.capture_timestamp_ns)
+    stream.last_rtp_timestamp, stream.last_capture_timestamp_ns = stream.last_sent_mapping
     if packet.keyframe:
         stream.keyframe_sent = True

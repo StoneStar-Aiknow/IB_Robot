@@ -176,7 +176,7 @@ import os
 from pathlib import Path
 
 from model_utils.export_onnx_atc import convert_onnx_to_om, write_ascend_deployment
-from model_utils.inference_manifest_export import write_acl_om_abi
+from model_utils.acl_abi_inspection import write_acl_om_abi
 
 bundle = Path("RESOLVED_MODEL_PATH").expanduser().resolve(strict=True)
 work_dir = Path("RESOLVED_WORK_DIR").expanduser().resolve(strict=True)
@@ -193,6 +193,8 @@ soc_version = "RESOLVED_SOC_VERSION"
 if not convert_onnx_to_om(config, str(onnx_path), str(om_path), soc_version):
     raise RuntimeError("ACT ATC conversion failed")
 
+# ``ACL_CONFIG_PATH`` is an optional tool-only override for this offline ABI
+# inspection call; it is never written to the runtime manifest.
 write_acl_om_abi(
     om_path,
     abi_path,

@@ -22,7 +22,7 @@ def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
 def _voice_tts(**overrides) -> dict:
     return {
         "enabled": True,
-        "bundle_path": "models/voice_tts/zipvoice",
+        "bundle_path": "models/zipvoice",
         "deployment": "test_deployment",
         "service_name": "/voice_tts/synthesize",
         "playback_service_name": "/voice_tts/play",
@@ -446,14 +446,14 @@ def test_tts_enabled_game_adds_shared_announcer():
         {"enabled": False},
         {
             "enabled": True,
-            "bundle_path": "models/voice_tts/zipvoice",
+            "bundle_path": "models/zipvoice",
             "deployment": "",
             "service_name": "/voice_tts/synthesize",
             "playback_service_name": "/voice_tts/play",
         },
         {
             "enabled": True,
-            "bundle_path": "models/voice_tts/zipvoice",
+            "bundle_path": "models/zipvoice",
             "deployment": "test_deployment",
             "service_name": "/voice_tts/synthesize",
             "playback_service_name": "",
@@ -833,11 +833,9 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
 
     planner = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_planner")
     planner_params = _normalize_launch_param_mapping(planner._Node__parameters[0])
-    assert _decode_launch_string(str(planner_params["model_dir"])).endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert _decode_launch_string(str(planner_params["model_dir"])).endswith("/models/graspgen")
     assert str(planner_params["inference_backend"]).splitlines()[0] == "ascend_local"
-    assert _decode_launch_string(str(planner_params["ascend_local_manifest_path"])).endswith(
-        "/models/grasp/graspgen_robotiq_2f_140"
-    )
+    assert _decode_launch_string(str(planner_params["ascend_local_manifest_path"])).endswith("/models/graspgen")
     assert planner_params["startup_warmup"] is True
     assert _decode_launch_string(str(planner_params["legacy_detect_service"])) == ("/grasp_planner/detect_and_segment")
     assert "remote_310p_host" not in planner_params
@@ -915,11 +913,11 @@ def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     assert _decode_launch_string(str(planner_params["inference_backend"])) == "local_cuda"
     local_manifest_path = _decode_launch_string(str(planner_params["local_manifest_path"]))
     assert Path(local_manifest_path).is_absolute()
-    assert local_manifest_path.endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert local_manifest_path.endswith("/models/graspgen")
     assert "$(env " not in local_manifest_path
     planner_model_dir = _decode_launch_string(str(planner_params["model_dir"]))
     assert Path(planner_model_dir).is_absolute()
-    assert planner_model_dir.endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert planner_model_dir.endswith("/models/graspgen")
     assert "$(env " not in planner_model_dir
     skill_params = _skill_executor_params(nodes)
     assert _decode_launch_string(str(skill_params["skill_catalog_profile"])) == ("lekiwi_handeye_realsense_grasp_pc")

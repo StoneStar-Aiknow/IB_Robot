@@ -140,8 +140,6 @@ robot:
     chunk_size: 512
     buffer_seconds: 5.0
     output_topic: /voice_command
-    device_index: -1
-    device_name: ""
     exit_on_init_failure: true
 
   semantic_mapping:
@@ -309,7 +307,7 @@ robot:
       index: 2
       width: 640
       height: 480
-      fps: 60
+      fps: 30
       pixel_format: mjpeg2rgb
       frame_id: camera_wrist_frame
       optical_frame_id: camera_wrist_optical_frame

@@ -59,6 +59,18 @@ Must strictly follow this structure with exactly one blank line between sections
 
 ### 2. Mandatory Requirements
 - **All commits must be signed**: Use `git commit -s` to auto-add `Signed-off-by` to footer. Ensure this line is last.
+- **Sign-off provenance — never fabricate identities**: The `Signed-off-by` identity must come exclusively from
+  `git commit -s`, which reads the committer's `git config user.name` / `git config user.email`.
+  - Before committing, confirm the identity is configured: `git config user.name && git config user.email`.
+  - **NEVER hand-write, guess, or copy a `Signed-off-by: Name <email>` line** into a `-m` / `-F` message body
+    or a message file. A hand-written line is exactly how fabricated foreign sign-offs sneak into history
+    (e.g., signing a commit as a colleague who never touched it).
+  - **NEVER add a `Signed-off-by` for another person** unless that person explicitly signed off on the change
+    (DCO). When the intended author differs from `git config` identity, ask the user how to proceed instead of
+    inventing a trailer.
+  - After committing, verify trailers: every `Signed-off-by` must be attributable (`git commit -s` output or an
+    explicit DCO confirmation). Treat an unexplained extra or mismatched sign-off as an error to rewrite
+    **before push**, not after reviewers see it.
 - **Disclose AI participation**: When an Agent generated or automatically processed any staged code, documentation,
   configuration, test, or script, record the actual model name and version in the commit. Never use placeholders such
   as `AI`, `agent`, or an unversioned product family, and never include a `provider/` prefix. Use this footer order:
@@ -74,7 +86,9 @@ Must strictly follow this structure with exactly one blank line between sections
   must not maintain an exhaustive tool allowlist or execute arbitrary unknown tools; the workflow only validates
   that the supplied provenance is concrete, versioned, and safe to include in Markdown.
 - **Human responsibility and provenance**: Before submission, require the human contributor to confirm review of the
-  AI-assisted changes and disclose third-party materials and licenses. Refuse unreviewed, unexplained, sensitive,
+  AI-assisted changes and disclose third-party materials and licenses. The review confirmation MUST be obtained by
+  invoking the interactive ask-user tool (the `question` tool in opencode) — do not assume consent, and do not treat
+  silence or conversational prose as confirmation. Refuse unreviewed, unexplained, sensitive,
   confidential, or license-incompatible content. Follow the openEuler policy at
   <https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>.
 - **Remote repositories**:
@@ -134,7 +148,7 @@ These add noise to git history, bloat the PR, and make the change set harder to 
 
 - If the staged changes modify a ROS package `package.xml` dependency declaration (`depend`, `exec_depend`, `build_depend`, `test_depend`, etc.), or global setup/build workflow files such as `scripts/setup.sh`, `scripts/build.sh`, `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`, `scripts/install_ros.sh`, top-level `CMakeLists.txt`, top-level `pyproject.toml`, or `requirements/*.txt` (pip dependency files that affect setup/install), the eventual PR description must include real Ubuntu 22.04 and openEuler Embedded Docker `setup.sh + build.sh` verification results.
 - ROS package-local `setup.py` changes do **not** by themselves trigger this dual-platform setup/build gate. Examples that do not trigger it alone: console entry points, Python package metadata, or Python-only `install_requires` edits.
-- When the gate is triggered, ask the user before Docker execution whether the PR is temporary WIP or ready for reviewer inspection. Pass the explicit answer as `--pr-stage wip|review` to the PR workflow. WIP normalizes the title to `[WIP] <title>` and defers both Docker runs; it does not waive DCO, AI disclosure, other tests, or CI. Review stage removes `[WIP]`, records `git rev-parse HEAD^{tree}`, and makes both Docker skills test an isolated snapshot. The PR description then contains a structured `## Docker Verification` block with mode, Verified inputs, Tested source tree, and Docker environment fields. When only non-gated source changes, the workflow reuses prior evidence as `reused-environment` mode.
+- When the gate is triggered, ask the user before Docker execution whether the PR is temporary WIP or ready for reviewer inspection. The question MUST be asked by invoking the interactive ask-user tool (the `question` tool in opencode), not by casually mentioning it in prose and not by assuming a default answer. Pass the explicit answer as `--pr-stage wip|review` to the PR workflow. WIP normalizes the title to `[WIP] <title>` and defers both Docker runs; it does not waive DCO, AI disclosure, other tests, or CI. Review stage removes `[WIP]`, records `git rev-parse HEAD^{tree}`, and makes both Docker skills test an isolated snapshot. The PR description then contains a structured `## Docker Verification` block with mode, Verified inputs, Tested source tree, and Docker environment fields. When only non-gated source changes, the workflow reuses prior evidence as `reused-environment` mode.
 
 ## Execution Steps
 
@@ -148,9 +162,10 @@ If user explicitly requests **local commit only** (e.g., "commit to local", "onl
 ### Phase 2: Compose Commit Message
 1. Help user draft commit message (Title, Body, Footer) following specifications above.
 2. **Validate**: Check title length, format, blank lines, Chinese characters, DCO sign-off, and AI metadata when AI
-   participated. Confirm the real model name and version; do not infer or abbreviate it.
+   participated. Confirm the real model name and version; do not infer or abbreviate it. Verify sign-off
+   provenance: no hand-written `Signed-off-by` lines; the `-s` sign-off must match `git config user.name <user.email>`.
 3. **Confirm staging scope**: Show the user which files will be committed, explicitly noting any excluded files (especially `libs/lerobot`).
-4. **Check verification gate**: Inspect the staged file list for ROS package `package.xml` dependency changes or global setup/build workflow changes. If triggered, ask whether this is a `[WIP]` PR or ready for reviewer inspection before invoking Docker.
+4. **Check verification gate**: Inspect the staged file list for ROS package `package.xml` dependency changes or global setup/build workflow changes. If triggered, ask whether this is a `[WIP]` PR or ready for reviewer inspection before invoking Docker — via the interactive ask-user tool (`question` in opencode), never a prose question or an assumed default.
 
 ### Phase 3: Execute Commit and Push
 

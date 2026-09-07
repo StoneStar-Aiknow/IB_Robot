@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from inference_service.generic_runtime import NamedTensorResult
+from inference_service.unified_runtime import ModelResult
 
 from .grounding_dino_tokenizer import BertWordPieceTokenizer
 from .model_contracts import MAX_MASK_BATCH, MAX_TEXT_BATCH
@@ -27,16 +27,17 @@ def _read_adapter_identity(root: Path, expected: AdapterIdentity) -> None:
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot load adapter identity {path}: {exc}") from exc
     required = {
-        "family": expected.family,
+        "interface": "tensor_model",
+        "model_type": expected.model_type,
         "preprocessing": expected.preprocessing,
         "postprocessing": expected.postprocessing,
     }
     if any(value.get(name) != expected_value for name, expected_value in required.items()):
-        raise ValueError(f"{expected.family} adapter identity mismatch: expected {required}, got {value}")
-    declared_operation = value.get("operation", "")
+        raise ValueError(f"{expected.model_type} adapter identity mismatch: expected {required}, got {value}")
+    declared_operation = value.get("operation")
     if declared_operation != expected.operation:
         raise ValueError(
-            f"{expected.family} adapter operation mismatch: expected {expected.operation!r}, got {declared_operation!r}"
+            f"{expected.model_type} adapter operation mismatch: expected {expected.operation!r}, got {declared_operation!r}"
         )
 
 
@@ -48,7 +49,7 @@ def _load_siglip2_tokenizer(model_path: Path):
     return AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
 
-def _output(result: NamedTensorResult, semantic: str, dtype=np.float32) -> np.ndarray:
+def _output(result: ModelResult, semantic: str, dtype=np.float32) -> np.ndarray:
     try:
         value = np.asarray(result.outputs[semantic], dtype=dtype)
     except KeyError as exc:
@@ -110,7 +111,7 @@ class SAM2Adapter(PerceptionAdapter):
             raise ValueError("image must be an RGB uint8 HxWx3 array")
         return {"observation.image": np.ascontiguousarray(image_rgb)}
 
-    def postprocess(self, result: NamedTensorResult, *, image_shape=None, **_options) -> list[SegmentationMask]:
+    def postprocess(self, result: ModelResult, *, image_shape=None, **_options) -> list[SegmentationMask]:
         masks = _output(result, "masks", np.uint8)
         boxes = _output(result, "boxes", np.float32)
         scores = _output(result, "scores", np.float32).reshape(-1)
@@ -192,6 +193,7 @@ class SigLIP2ImageAdapter(_SigLIP2Adapter):
         "siglip2-dual-encoder-v2",
         "normalized-embedding-v1",
         frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
+        operation="encode",
     )
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
@@ -217,7 +219,7 @@ class SigLIP2ImageAdapter(_SigLIP2Adapter):
             "text_attention_mask": attention,
         }
 
-    def postprocess(self, result: NamedTensorResult, *, candidate_labels=(), **_options) -> list[MaskEncoding]:
+    def postprocess(self, result: ModelResult, *, candidate_labels=(), **_options) -> list[MaskEncoding]:
         image_features = _normalize(_output(result, "image_embeddings"), self.dimension)
         text_features = _normalize(_output(result, "text_embeddings"), self.dimension) if candidate_labels else None
         if text_features is not None and len(text_features) != len(candidate_labels):
@@ -241,6 +243,7 @@ class SigLIP2TextAdapter(_SigLIP2Adapter):
         "siglip2-dual-encoder-v2",
         "normalized-embedding-v1",
         frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
+        operation="encode",
     )
 
     def preprocess(self, texts: object) -> dict[str, np.ndarray]:
@@ -254,7 +257,7 @@ class SigLIP2TextAdapter(_SigLIP2Adapter):
             "text_attention_mask": attention,
         }
 
-    def postprocess(self, result: NamedTensorResult, **_options) -> np.ndarray:
+    def postprocess(self, result: ModelResult, **_options) -> np.ndarray:
         return _normalize(_output(result, "text_embeddings"), self.dimension)
 
 
@@ -272,7 +275,7 @@ class GroundingDINOAdapter(PerceptionAdapter):
         "grounded-sam2-rgb-text-thresholds-v2",
         "boxes-scores-labels-masks-v1",
         frozenset({"torch_cpu", "torch_cuda"}),
-        operation="combined",
+        operation="detect",
     )
     compiled_abi_finalized = False
 
@@ -294,9 +297,7 @@ class GroundingDINOAdapter(PerceptionAdapter):
             "text_threshold": np.asarray([text_threshold or 0.25], dtype=np.float32),
         }
 
-    def postprocess(
-        self, result: NamedTensorResult, *, image_shape=None, labels=(), **_options
-    ) -> list[GroundingDetection]:
+    def postprocess(self, result: ModelResult, *, image_shape=None, labels=(), **_options) -> list[GroundingDetection]:
         boxes = _output(result, "boxes", np.float32)
         scores = _output(result, "scores", np.float32).reshape(-1)
         masks = _output(result, "masks", np.uint8)
@@ -383,8 +384,8 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         "grounding_dino",
         "grounding-dino-swint-rgb720x1280-bert-seq8-v1",
         "grounding-dino-raw-logits-cxcywh-v1",
-        frozenset({"ascend_310p"}),
-        operation="raw",
+        frozenset({"ascend_310p", "torch_cpu", "torch_cuda"}),
+        operation="detect",
     )
     compiled_abi_finalized = True
 
@@ -448,7 +449,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
 
     def postprocess(
         self,
-        result: NamedTensorResult,
+        result: ModelResult,
         *,
         image_shape=None,
         prompt="",
@@ -609,7 +610,7 @@ class SAM2PromptAdapter(PerceptionAdapter):
             "has_mask_input": np.zeros((self.batch_size,), dtype=np.int8),
         }
 
-    def postprocess(self, result: NamedTensorResult, *, image_shape=None, count=1, **_options) -> list[np.ndarray]:
+    def postprocess(self, result: ModelResult, *, image_shape=None, count=1, **_options) -> list[np.ndarray]:
         logits = np.asarray(_output(result, "mask_logits"), dtype=np.float32)
         if logits.ndim != 4 or logits.shape[1] != 1:
             raise RuntimeError(f"SAM2 prompt output has incompatible mask shape {logits.shape}")

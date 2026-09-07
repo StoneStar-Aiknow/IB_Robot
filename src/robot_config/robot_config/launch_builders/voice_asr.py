@@ -5,6 +5,7 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
@@ -199,12 +200,20 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
         "chunk_size": voice_asr_config.get("chunk_size", voice_asr_defaults["chunk_size"]),
         "buffer_seconds": voice_asr_config.get("buffer_seconds", voice_asr_defaults["buffer_seconds"]),
-        "device_index": voice_asr_config.get("device_index", voice_asr_defaults["device_index"]),
-        "device_name": voice_asr_config.get("device_name", voice_asr_defaults["device_name"]),
         "exit_on_init_failure": voice_asr_config.get(
             "exit_on_init_failure", voice_asr_defaults["exit_on_init_failure"]
         ),
     }
+    audio_io = robot_config.get("audio_io", {})
+    if not is_audio_io_enabled(audio_io):
+        raise ValueError("voice_asr.enabled=true requires audio_io.enabled=true")
+    microphone_name = str(audio_io.get("microphone", ""))
+    microphone_params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
+    node_params["audio_topic"] = str(audio_io.get("capture_stamped_topic", "/audio/capture_stamped"))
+    node_params["audio_channels"] = int(microphone_params.get("channels", 1))
+    node_params["audio_input_channel"] = int(
+        voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))
+    )
 
     node_name = voice_asr_config.get("node_name", "voice_asr_node")
     logger.info(f"Voice ASR enabled, launching node '{node_name}'")

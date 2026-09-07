@@ -5,8 +5,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model_contracts import ModelManifest, sha256_file
-
 
 def find_workspace_root() -> Path:
     path = Path(__file__).resolve()
@@ -65,7 +63,7 @@ def inspect_backend(backend: str) -> BackendStatus:
         except ModuleNotFoundError:
             return BackendStatus(backend, False, "", "torch is not installed")
         return BackendStatus(backend, True, str(torch.__version__))
-    if backend == "ascend_om":
+    if backend == "ascend":
         if importlib.util.find_spec("acl") is None:
             return BackendStatus(backend, False, "", "Ascend ACL Python runtime is not installed")
         try:
@@ -73,31 +71,4 @@ def inspect_backend(backend: str) -> BackendStatus:
         except (ImportError, OSError) as exc:
             return BackendStatus(backend, False, "", f"Ascend ACL import failed: {exc}")
         return BackendStatus(backend, True, str(getattr(acl, "__version__", "unknown")))
-    raise ValueError("backend must be 'cpu', 'cuda', or 'ascend_om'")
-
-
-def build_model_manifest(
-    *,
-    model_name: str,
-    model_version: str,
-    weights_path: str | Path,
-    config_path: str | Path | None,
-    backend: str,
-    preprocessing_hash: str,
-    embedding_dim: int = 0,
-    normalization: str = "",
-) -> ModelManifest:
-    status = inspect_backend(backend)
-    weights = Path(weights_path)
-    config = None if config_path is None else Path(config_path)
-    return ModelManifest(
-        model_name=model_name,
-        model_version=model_version,
-        weights_hash=sha256_file(weights),
-        config_hash="" if config is None else sha256_file(config),
-        backend=backend,
-        runtime_version=status.runtime_version,
-        preprocessing_hash=preprocessing_hash,
-        embedding_dim=embedding_dim,
-        normalization=normalization,
-    )
+    raise ValueError("backend must be 'cpu', 'cuda', or 'ascend'")

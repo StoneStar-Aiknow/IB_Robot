@@ -95,13 +95,41 @@ Not every PR needs all tiers. Use the table below to pick tiers.
 
 1. **Tier 1 — Unit tests**: `pytest -q src/inference_service/tests`
 2. **Tier 2 — Build**: `./scripts/build.sh --clean` (never raw `colcon build`)
-3. **Tier 3 — Policy mock**: Launch ROS mock with ACT, check `action_dispatcher`
-   reports `First inference received`
-4. **Tier 4 — Perception service**: Launch ROS mock with perception_services,
-   call each typed service with a synthetic RGB image
+3. **Tier 3 — Policy mock**: generate YAML with
+   `scripts/generate_verify_yaml.py policy`, launch with
+   `scripts/run_policy_mock.sh` (zsh), check `RESULT=PASS`
+   (`action_dispatcher` reports `First inference received`)
+4. **Tier 4 — Perception service**: generate YAML with
+   `scripts/generate_verify_yaml.py perception`, launch + call each typed
+   service via `scripts/run_perception_services.sh` (launch and calls must
+   stay in one shell invocation)
+4b. **Tier 4b — Speech models**: fullsubnet via
+   `scripts/run_fullsubnet.sh` (streaming pipeline, topic-based evidence) +
+   `scripts/bench_fullsubnet.py`; zipvoice via `scripts/run_zipvoice.sh`
+   (typed service). See `references/host.md` Tier 4b for prerequisites.
 5. **Tier 5 — Board OM**: SSH to the resolved board target (default `OPi_20T`,
    see "Board Access Resolution"), run OM script per model
 6. **Tier 6 — Board ROS mock**: Launch ROS mock on board, call typed services
+
+## Skill Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/generate_verify_yaml.py` | Generate mock YAML for policy / perception tiers; auto-resolves the deployment key from each bundle manifest (`--device cpu\|cuda`) |
+| `scripts/run_policy_mock.sh` | zsh: launch policy mock, poll for `First inference received`, tear down; prints `RESULT=PASS/TIMEOUT/FAIL` |
+| `scripts/run_perception_services.sh` | zsh: launch perception mock, wait for all endpoints, run the caller, tear down |
+| `scripts/call_perception_services.py` | Call siglip2 / ram_plus / sam2 typed services with a synthetic image (handles stamp matching and response layouts) |
+| `scripts/make_speech_wav.py` | Build a real-speech 6ch 16k wav (LibriSpeech via HF hub + Silero pre-scoring; synthetic audio fails VAD) |
+| `scripts/run_fullsubnet.sh` | zsh: speech_direction wav-replay run (cpu/cuda config generated inline); pass = degraded=False + direction messages |
+| `scripts/bench_fullsubnet.py` | Per-hop fb/sb latency for the stateful torch executor (node timing logs are suppressed) |
+| `scripts/run_zipvoice.sh` | zsh: typed `/voice_tts/synthesize` run; cuda mode flips providers (restored on exit) + mounts torch CUDA libs + nvidia-smi proof |
+| `scripts/call_tts.py` | SynthesizeSpeech caller with segment details |
+| `scripts/run_board_tier6.sh` | POSIX sh: board ROS mock orchestration (launch + typed service calls + teardown) |
+
+Harness rules: run shell scripts with **zsh** (bash + `set -u` breaks
+`.shrc_local` sourcing) and keep launch + verification in one shell
+invocation. Detail: `references/host.md` and
+`references/troubleshooting.md`.
 
 ## Internal References
 
@@ -109,4 +137,4 @@ Not every PR needs all tiers. Use the table below to pick tiers.
 |---------|-----------|
 | Host verification commands (tiers 1–4): pytest, build, mock YAML, service call scripts | `references/host.md` |
 | Board verification commands (tiers 5–6): SSH, OM scripts, board ROS mock | `references/board.md` |
-| Pass/fail criteria, known issues, troubleshooting (DDS stale, adapter.json, batch dim) | `references/troubleshooting.md` |
+| Pass/fail criteria, known issues, troubleshooting (DDS stale, adapter.json, batch dim, harness pitfalls) | `references/troubleshooting.md` |

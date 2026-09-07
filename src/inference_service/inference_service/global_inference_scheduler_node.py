@@ -22,6 +22,10 @@ from ibrobot_msgs.action import (
     ScheduledDispatchInfer,
 )
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus
+from inference_service.runtime_composition import (
+    build_model_service_runtime_dependencies,
+    require_runtime_dependencies,
+)
 from inference_service.scheduler.action_idempotency import (
     ResolutionErrorCodes,
     execute_resolved_action,
@@ -52,6 +56,7 @@ from inference_service.scheduler.result_identity import result_identity_error
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.scheduler.work_classes import WorkClass, work_class_name
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 
 _SESSION_OPEN_CLOSURE = "session_open"
 _FULL_INFER_CLOSURE = "full_infer"
@@ -74,8 +79,23 @@ class _DownstreamCall:
 class GlobalInferenceSchedulerNode(Node):
     """Own logical sessions, per-request routing, and scheduled public endpoints."""
 
-    def __init__(self, *, parameter_overrides=None) -> None:
+    def __init__(
+        self,
+        *,
+        parameter_overrides=None,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
         super().__init__("global_inference_scheduler", parameter_overrides=parameter_overrides)
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        # This node is a transport/control-plane proxy. It never resolves a
+        # Session or runtime itself; downstream pipeline nodes own construction.
+        self._registry_set = registry_set
+        self._providers = providers
         self._load_parameters()
         self._candidates = self._build_candidates()
         self._candidate_by_id = {candidate.pipeline_id: candidate for candidate in self._candidates}
@@ -261,6 +281,12 @@ class GlobalInferenceSchedulerNode(Node):
     def _build_candidates(self) -> list[PipelineCandidate]:
         candidates: list[PipelineCandidate] = []
         for entry in json.loads(self._pipelines_json):
+            interface = str(entry.get("interface", "policy")).strip()
+            if interface != "policy":
+                raise SchedulerError(
+                    "global scheduler accepts policy pipelines only",
+                    code="distributed_tensor_model_unsupported",
+                )
             capacities = {name: int(value["max_in_flight"]) for name, value in entry.get("public_capacity", {}).items()}
             candidates.append(
                 PipelineCandidate(
@@ -1454,7 +1480,11 @@ class GlobalInferenceSchedulerNode(Node):
 
 def main(argv=None) -> None:
     rclpy.init(args=argv)
-    node = GlobalInferenceSchedulerNode()
+    dependencies = build_model_service_runtime_dependencies()
+    node = GlobalInferenceSchedulerNode(
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
     executor = MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     try:
@@ -1463,6 +1493,7 @@ def main(argv=None) -> None:
         pass
     finally:
         node.destroy_node()
+        dependencies.providers.close()
         rclpy.shutdown()
 
 

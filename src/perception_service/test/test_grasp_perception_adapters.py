@@ -7,37 +7,49 @@ import pytest
 from sensor_msgs.msg import Image
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from inference_service.backends import BackendState
-from inference_service.generic_runtime import DeploymentIdentity, NamedTensorResult, RuntimeLatency
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ModelRequest,
+    ModelResult,
+    ModelRuntimeHandle,
+    OutcomeEvidence,
+    RuntimeLatency,
+)
 from perception_service.model_service_plugins import SegmentDetectionsPlugin
 from perception_service.semantic_model_adapters import GroundingDINORawAdapter, SAM2PromptAdapter
 
 
 def _result(outputs):
-    return NamedTensorResult(
+    return ModelResult(
         outputs=outputs,
-        deployment=DeploymentIdentity(
-            bundle="test",
-            bundle_uuid="bundle-uuid",
-            bundle_revision=1,
-            deployment="ascend_310p",
-            deployment_uuid="deployment-uuid",
-            deployment_revision=1,
-            deployment_fingerprint="fingerprint",
-            backend="ascend",
-        ),
         latency=RuntimeLatency(total_ms=1.0, backend_ms=1.0),
-        state=BackendState.READY,
+        evidence=OutcomeEvidence.completed("adaptation"),
     )
 
 
 def _compiled(roles, execution):
     """Build a compiled deployment carrying only the bindings a test cares about."""
-    from inference_manifest import ArtifactBindings, CompiledDeployment, DeploymentArtifact, DeploymentTarget
+    from inference_manifest import (
+        ArtifactBindings,
+        AscendRuntimeProfile,
+        CompiledDeployment,
+        DeploymentArtifact,
+        DeploymentTarget,
+        ExecutionContract,
+        RoleRuntimeProfile,
+    )
 
     return CompiledDeployment(
-        backend="ascend",
-        target=DeploymentTarget(soc="Ascend310P1", runtime="ascend"),
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="ascend",
+            target=DeploymentTarget(soc="Ascend310P1", runtime="acl"),
+            profile=AscendRuntimeProfile(device_id=0),
+        ),
         artifacts={role: DeploymentArtifact(path=f"artifacts/test/{role}.om", format="om") for role in execution},
         execution=tuple(execution),
         bindings={
@@ -53,7 +65,8 @@ def _write_sam2_prompt_bundle(root):
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "sam2",
+                "interface": "tensor_model",
+                "model_type": "sam2",
                 "operation": "prompt",
                 "preprocessing": "sam2-longest-side1024-imagenet-box-prompt-v1",
                 "postprocessing": "sam2-mask-logits-iou-v1",
@@ -119,8 +132,9 @@ def _write_grounding_bundle(root):
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "grounding_dino",
-                "operation": "raw",
+                "interface": "tensor_model",
+                "model_type": "grounding_dino",
+                "operation": "detect",
                 "preprocessing": "grounding-dino-swint-rgb720x1280-bert-seq8-v1",
                 "postprocessing": "grounding-dino-raw-logits-cxcywh-v1",
             }
@@ -166,9 +180,9 @@ def test_grounding_dino_raw_adapter_derives_abi_shapes_from_manifest(tmp_path):
 
     _write_grounding_bundle(tmp_path)
     model = ModelDescriptor(
-        kind="perception",
-        family="grounding_dino",
-        operation="raw",
+        interface="tensor_model",
+        model_type="grounding_dino",
+        operation="detect",
         inputs=(
             SemanticTensor(semantic="input_ids", dtype="int64", shape=(1, 8)),
             SemanticTensor(semantic="encoder_tgt", dtype="float32", shape=(1, 900, 256)),
@@ -388,9 +402,10 @@ class _StubSession:
         self.batch_size = batch_size
         self.prompts = []
 
-    def infer(self, request):
+    def execute(self, request: ModelRequest, context: ExecutionContext):
+        context.check("backend")
         self.prompts.append(np.asarray(request.inputs["point_coords"]).copy())
-        return _result({"mask_logits": np.ones((self.batch_size, 1, 256, 256), dtype=np.float32)})
+        return {"mask_logits": np.ones((self.batch_size, 1, 256, 256), dtype=np.float32)}
 
 
 def _segment_plugin(batch_size: int):
@@ -398,9 +413,12 @@ def _segment_plugin(batch_size: int):
     adapter.batch_size = batch_size
     plugin = object.__new__(SegmentDetectionsPlugin)
     plugin.adapter = adapter
-    plugin.host = SimpleNamespace(bridge=_Bridge())
+    plugin.bridge = _Bridge()
+    plugin.host = SimpleNamespace(bridge=plugin.bridge)
     plugin.session = _StubSession(batch_size)
-    plugin.pipeline = SimpleNamespace(execute=plugin.session.infer)
+    plugin._runtime_handle = ModelRuntimeHandle(plugin.session)
+    plugin._runtime_handle.load()
+    plugin.pipeline = plugin._runtime_handle
     plugin._requests = itertools.count(1)
     return plugin
 

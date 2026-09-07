@@ -7,9 +7,7 @@ from collections.abc import Callable, Mapping
 import numpy as np
 
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
-from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.rknn.runtime import (
     RKNNSession,
     convert_runtime_value,
@@ -21,8 +19,8 @@ from inference_service.backends.rknn.runtime import (
     validate_runtime_options,
 )
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 _HOST_ARTIFACT_FORMATS = frozenset({"pt", "pytorch"})
 
@@ -49,7 +47,6 @@ class RKNNModelSession(ModelSession):
         self,
         *,
         rknn_loader: Callable[[], type] | None = None,
-        domains: ResourceDomainAdmissions | None = None,
     ) -> None:
         super().__init__(
             "model-session:rknn",
@@ -65,7 +62,6 @@ class RKNNModelSession(ModelSession):
                     independent_close=True,
                 ),
             ),
-            domains=domains,
         )
         self._rknn_loader = rknn_loader or import_rknn_type
         self._rknn_type: type | None = None
@@ -79,16 +75,25 @@ class RKNNModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(self._rknn_type)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "rknn":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "rknn":
             raise BackendLoadError("RKNNModelSession requires a compiled rknn deployment", code="invalid_deployment")
         if deployment.device_links:
             raise BackendLoadError(
                 "RKNNLite does not support manifest device-pointer links; declare host-visible internal bindings",
                 code="unsupported_device_links",
             )
-        options = validate_runtime_options(context.runtime_options)
+        profile = context.backend_profile
+        profile_options = dict(context.runtime_options)
+        if profile is not None:
+            target_name = getattr(profile, "target_name", None)
+            core_mask = getattr(profile, "core_mask", None)
+            if target_name is not None:
+                profile_options.setdefault("target", target_name)
+            if core_mask is not None:
+                profile_options.setdefault("core_mask", core_mask)
+        options = validate_runtime_options(profile_options)
 
         host_roles: list[str] = []
         for role in deployment.execution:
@@ -157,7 +162,8 @@ class RKNNModelSession(ModelSession):
         self._target = target
         self._core_mask = core_mask
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or not self._sessions:
@@ -167,7 +173,7 @@ class RKNNModelSession(ModelSession):
         for role in deployment.execution:
             if role in self._host_roles:
                 continue
-            outputs = self._execute_role(role, values, request)
+            outputs = self._execute_role(role, values, request, context)
             values.update(outputs)
             for semantic, value in outputs.items():
                 if not semantic.startswith("internal."):
@@ -178,9 +184,11 @@ class RKNNModelSession(ModelSession):
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
+        context.check(f"model.{role}")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or role not in self._sessions:

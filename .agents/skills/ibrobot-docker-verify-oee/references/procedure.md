@@ -260,6 +260,41 @@ docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 ```
 
+## Phase 4.5 — ROS 源切换预清理（条件执行）
+
+> **触发条件：** 验证的变更切换了 ROS 包源——`install_ros.sh`、平台脚本或 repo 配置
+> 修改了 openEuler ROS repo（Embedded + SIG）、EUR 源地址、镜像或 GPG key。容器中
+> 已有 ROS 包（`:env` 镜像预装或上次验证残留）时**必须执行本 Phase**。
+
+`:env` 镜像预装的 `ros-humble-*` 包来自旧源。不移除的话，setup.sh 的 ROS 检测会
+直接复用旧包，`install_ros.sh` 从新源安装的路径完全没有被验证。本 Phase 只删除
+包、不安装任何软件，安装仍由 setup.sh 唯一完成，不违反 Core Principle
+（与 AGENTS.md「跨发行版 ROS 包版本一致性」中 openEuler 侧 `dnf remove 'ros-humble-*'`
+后重装的处置一致）。
+
+```bash
+# 以 root 在 chroot 中执行；在 Phase 5 运行 setup.sh 之前完成。
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  set -e
+  ros_count=\$(rpm -qa --qf \"%{NAME}\\n\" | grep -c \"^ros-humble-\" || true)
+  if [ \"\${ros_count}\" -gt 0 ]; then
+    echo \"Removing \${ros_count} ros-humble-* packages before source-switch verification\"
+    dnf remove -y \"ros-humble-*\"
+    rm -rf /opt/ros/humble
+  else
+    echo \"No ros-humble-* packages installed; nothing to pre-clean.\"
+  fi
+  # Hard check: no ROS package and no /opt/ros residue may remain.
+  test -z \"\$(rpm -qa --qf \"%{NAME}\\n\" | grep \"^ros-humble-\" || true)\"
+  test ! -e /opt/ros/humble
+  echo \"ROS source-switch pre-clean complete.\"
+"'
+```
+
+验证报告中必须写明本步骤（移除的包数量），让 reviewer 知道 setup.sh 验证的是
+从新源完整安装。同时注意：本 Phase 只覆盖"新源可完整安装"；若变更还涉及从零
+配置 repo/GPG（无 ROS 基础镜像场景），需另行使用不含 ROS 的基础镜像验证。
+
 ## Phase 5 — Run setup.sh
 
 ```bash

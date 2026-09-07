@@ -56,6 +56,8 @@ def _workflow_step(args: argparse.Namespace, skill: str) -> dict[str, Any]:
         "place_name": args.place_name or "",
         "motion_direction": args.motion_direction or "",
         "motion_distance": args.motion_distance or 0.0,
+        "arm_side": args.arm_side or "",
+        "imitation_duration_sec": args.imitation_duration_sec or 0.0,
         "direction": args.direction or "",
         "distance": args.distance or 0.0,
         "degree": args.degree or 0.0,
@@ -98,6 +100,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--place-name", default="")
     parser.add_argument("--motion-direction", default="")
     parser.add_argument("--motion-distance", type=float, default=0.0)
+    parser.add_argument("--arm-side", default="")
+    parser.add_argument("--imitation-duration-sec", type=float, default=0.0)
     parser.add_argument("--direction")
     parser.add_argument("--distance", type=float)
     parser.add_argument("--degree", type=float)

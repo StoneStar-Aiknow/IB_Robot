@@ -23,8 +23,8 @@ import cv2
 import numpy as np
 
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
 _MASK_THRESHOLD = 0.0
 _STABILITY_OFFSET = 1.0
@@ -39,7 +39,7 @@ _PIXEL_OFFSET = 0.5
 class SAM2AutomaticAscendSession(AscendOmModelSession):
     """Drive encoder + decoder OMs to produce automatic masks on Ascend."""
 
-    allowed_runtime_options = frozenset({"device_id", "acl_config_path"})
+    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options
 
     def _load(self, context, rollback) -> None:
         deployment = context.deployment
@@ -64,7 +64,8 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         self._stability_thresh = float(adapter.get("stability_score_thresh", _DEFAULT_STABILITY_THRESH))
         self._decoder_batch = self._decoder_batch_size(deployment)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         image_rgb = np.asarray(request.inputs["observation.image"], dtype=np.uint8)
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
             raise BackendInferenceError("SAM2 automatic requires an RGB uint8 HxWx3 image", code="input_shape_mismatch")
@@ -200,8 +201,8 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         masks_out, boxes_out, scores_out, stability_out = [], [], [], []
         for logits, iou, stability in items:
             mask_canvas = (logits > _MASK_THRESHOLD).astype(np.uint8)
-            mask = np.zeros((height, width), dtype=np.uint8)
-            mask[:new_h, :new_w] = mask_canvas[:new_h, :new_w]
+            resized = cv2.resize(mask_canvas, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(resized, (width, height), interpolation=cv2.INTER_NEAREST)
             ys, xs = np.where(mask > 0)
             if len(xs) == 0:
                 continue

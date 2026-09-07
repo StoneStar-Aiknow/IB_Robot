@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import time
 
@@ -17,6 +18,11 @@ from inference_manifest import (
     load_inference_manifest,
     semantic_identity_fingerprint,
 )
+from inference_service.runtime_composition import (
+    build_model_service_runtime_dependencies,
+    require_runtime_dependencies,
+)
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 
 from .model_service_plugin import ModelServiceError, ModelServicePlugin, PluginRuntimeStatus
 
@@ -50,14 +56,38 @@ def _validate_service_contract(service_type) -> None:
         raise RuntimeError(f"model service response is missing common diagnostic fields: {missing}")
 
 
-def _instantiate_plugin(plugin_class, service_type_name: str, host, validated, options) -> ModelServicePlugin:
+def _instantiate_plugin(
+    plugin_class,
+    service_type_name: str,
+    host,
+    validated,
+    options,
+    *,
+    registry_set: RegistrySet | None = None,
+    providers: RuntimeProviders | None = None,
+) -> ModelServicePlugin:
     if not isinstance(plugin_class, type) or not issubclass(plugin_class, ModelServicePlugin):
         raise RuntimeError("configured plugin must implement ModelServicePlugin")
     if plugin_class.service_type != service_type_name:
         raise RuntimeError(
             f"plugin declares service type {plugin_class.service_type!r}, configured {service_type_name!r}"
         )
-    return plugin_class(host, validated, options)
+    try:
+        signature = inspect.signature(plugin_class)
+    except (TypeError, ValueError):
+        signature = None
+    kwargs = {}
+    if signature is None:
+        kwargs = {"registry_set": registry_set, "providers": providers}
+    else:
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+        )
+        if accepts_kwargs or "registry_set" in signature.parameters:
+            kwargs["registry_set"] = registry_set
+        if accepts_kwargs or "providers" in signature.parameters:
+            kwargs["providers"] = providers
+    return plugin_class(host, validated, options, **kwargs)
 
 
 def _runtime_info(
@@ -97,8 +127,20 @@ def _runtime_info(
 class ModelServiceNode(Node):
     """Load one configured plugin without knowing its model family or service shape."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ):
         super().__init__("model_service")
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
         for name, default in (
             ("instance_id", ""),
             ("bundle_path", ""),
@@ -144,7 +186,15 @@ class ModelServiceNode(Node):
                 raise RuntimeError("selected model manifest does not declare semantic_identity")
             self.validated_manifest = validated_manifest
             plugin_class = _load_class(str(self.get_parameter("adapter_class").value))
-            self.plugin = _instantiate_plugin(plugin_class, service_type_name, self, self.validated_manifest, options)
+            self.plugin = _instantiate_plugin(
+                plugin_class,
+                service_type_name,
+                self,
+                self.validated_manifest,
+                options,
+                registry_set=getattr(self, "_registry_set", None),
+                providers=getattr(self, "_providers", None),
+            )
             self.failure_reason = ""
         except Exception as exc:  # Keep the typed service alive to report non-readiness.
             self.failure_reason = str(exc)
@@ -210,15 +260,22 @@ class ModelServiceNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ModelServiceNode()
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
+    dependencies = build_model_service_runtime_dependencies()
+    node = None
     try:
+        node = ModelServiceNode(
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+        )
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
+        dependencies.providers.close()
         rclpy.try_shutdown()
 
 

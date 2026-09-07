@@ -353,6 +353,8 @@ class RosBridge:
         request.place_name = payload["place_name"]
         request.motion_direction = payload["motion_direction"]
         request.motion_distance = float(payload["motion_distance"] or 0.0)
+        request.arm_side = str(payload.get("arm_side", ""))
+        request.imitation_duration_sec = float(payload.get("imitation_duration_sec", 0.0) or 0.0)
         self._copy_navigation_fields(request, payload)
         response = self._call_service(
             self._validate_client,
@@ -461,6 +463,8 @@ class RosBridge:
             "place_name": str(step.place_name),
             "motion_direction": str(step.motion_direction),
             "motion_distance": float(step.motion_distance),
+            "arm_side": str(step.arm_side),
+            "imitation_duration_sec": float(step.imitation_duration_sec),
             "direction": str(step.direction),
             "distance": float(step.distance),
             "degree": float(step.degree),
@@ -534,6 +538,8 @@ class RosBridge:
         message.place_name = str(step.get("place_name", ""))
         message.motion_direction = str(step.get("motion_direction", ""))
         message.motion_distance = float(step.get("motion_distance", 0.0))
+        message.arm_side = str(step.get("arm_side", ""))
+        message.imitation_duration_sec = float(step.get("imitation_duration_sec", 0.0) or 0.0)
         self._copy_navigation_fields(message, step)
         message.timeout_sec = float(step.get("timeout_sec", 0.0))
         return message
@@ -800,6 +806,8 @@ class RosBridge:
         goal.place_name = payload["place_name"]
         goal.motion_direction = payload["motion_direction"]
         goal.motion_distance = float(payload["motion_distance"] or 0.0)
+        goal.arm_side = str(payload.get("arm_side", ""))
+        goal.imitation_duration_sec = float(payload.get("imitation_duration_sec", 0.0) or 0.0)
         self._copy_navigation_fields(goal, payload)
         goal.timeout_sec = float(payload["timeout_sec"])
 

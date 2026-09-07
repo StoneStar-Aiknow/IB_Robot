@@ -1,4 +1,4 @@
-"""Small schema-v2 perception bundles for semantic-mapping tests."""
+"""Small schema-v3 perception bundles for semantic-mapping tests."""
 
 import json
 from pathlib import Path
@@ -31,7 +31,7 @@ def configure_perception_bundles(robot: dict, root: Path) -> None:
         entry = BundleFile(path="assets/identity.txt")
         bundle_uuid = f"123e4567-e89b-42d3-a456-42661417400{index}"
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": bundle_uuid,
                 "revision": 1,
@@ -44,8 +44,14 @@ def configure_perception_bundles(robot: dict, root: Path) -> None:
                 },
             },
             "model": {
-                "kind": "perception",
-                "family": family,
+                "interface": "tensor_model",
+                "model_type": family,
+                "operation": {
+                    "sam2": "automatic",
+                    "ram_plus": "recognize_tags",
+                    "siglip2": "encode",
+                    "grounding_dino": "detect",
+                }[family],
                 "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1]}],
                 "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1]}],
                 "semantic_identity": {
@@ -71,8 +77,16 @@ def configure_perception_bundles(robot: dict, root: Path) -> None:
                 "torch_cpu": {
                     "uuid": f"123e4567-e89b-42d3-a456-42661417401{index}",
                     "revision": 1,
-                    "backend": "torch",
-                    "device": "cpu",
+                    "execution_contract": {
+                        "state_scope": "request",
+                        "execution_structure": "direct",
+                        "cancellation_granularity": "request_boundary",
+                    },
+                    "runtime_profile": {
+                        "backend": "torch",
+                        "target": {"runtime": "torch"},
+                        "profile": {"device": "cpu"},
+                    },
                 }
             },
         }

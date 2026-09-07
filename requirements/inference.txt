@@ -1,0 +1,13 @@
+# Python dependencies for the inference-only setup profile
+# (./scripts/setup.sh --profile inference), used on hosts that only run
+# policy inference for edge-cloud collaborative inference verification.
+#
+# Covers the unified inference runtime ONNX toolchain: model inspection /
+# simplification (onnx, onnxsim) and CPU ONNX Runtime execution checks.
+# Torch and LeRobot policy dependencies come from the lerobot editable
+# install; ROS message/runtime dependencies come from rosdep and the
+# system site-packages; Ascend NPU support on openEuler is covered by
+# requirements/openeuler-24.03.txt (torch_npu).
+onnx
+onnxsim
+onnxruntime

@@ -9,11 +9,18 @@ import numpy as np
 from cv_bridge import CvBridge
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from inference_service.backends import BACKEND_REGISTRY, BackendRegistry, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.backends import BackendRegistry, RuntimeContext
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
-from inference_service.pipeline import GenericModelPipeline, ModelResultAdapter, ModelStage, SequentialModelExecutor
+from inference_service.runtime_composition import require_runtime_dependencies
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionContract,
+    ModelRequest,
+    ModelRuntimeHandle,
+    RegistrySet,
+    RuntimeAssembly,
+    RuntimeProviders,
+)
 
 from .graspgen_adapter import GraspGenAdapter
 from .model_contracts import (
@@ -24,7 +31,6 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
-from .model_session_builders import register_perception_session_builders
 from .ram_plus_adapter import RAMPlusAdapter, masked_image_crop, select_mask_tags
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
@@ -71,21 +77,39 @@ def _filter_masks(records, image_area: int, max_masks: int, min_pixels: int, min
 
 class _SessionPlugin(ModelServicePlugin):
     service_type = ""
-    family = ""
-    # ``operation`` pairs with ``family`` to pin one service contract (SAM2 automatic vs
-    # prompt, Grounding combined vs raw). Empty for single-contract families.
+    model_type = ""
+    # ``operation`` is the v3 service contract.  Grounding-DINO deployment
+    # variants share ``detect`` and remain an adapter/deployment detail.
     operation = ""
+    execution_structure = "direct"
     adapter_class = None
     _session_factory: Callable | None = None
-    _registry: BackendRegistry = BACKEND_REGISTRY
+    _registry: BackendRegistry | None = None
 
-    def __init__(self, host, validated, options) -> None:
-        register_perception_session_builders()
+    def __init__(
+        self,
+        host,
+        validated,
+        options,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=f"{type(self).__name__}",
+        )
         model = validated.manifest.model
-        if model.kind != "perception" or model.family != self.family or model.operation != self.operation:
+        expected_model_type = self.model_type
+        if (
+            model.interface != "tensor_model"
+            or model.model_type != expected_model_type
+            or model.operation != self.operation
+        ):
             raise ValueError(
-                f"plugin requires perception family {self.family!r} operation {self.operation!r}, "
-                f"got {model.kind!r}/{model.family!r}/{model.operation!r}"
+                f"plugin requires tensor_model/{expected_model_type}/{self.operation}, "
+                f"got {model.interface}/{model.model_type}/{model.operation}"
             )
         if any(name in options for name in ("backend", "device", "model_backend", "fallback")):
             raise ValueError(
@@ -100,44 +124,59 @@ class _SessionPlugin(ModelServicePlugin):
         self.adapter.validate_identity(model.semantic_identity)
         self._closed = False
         self._requests = itertools.count(1)
-        context = RuntimeContext(validated_manifest=validated, runtime_options=options)
+        runtime_profile = getattr(validated, "runtime_profile", None)
+        if runtime_profile is None:
+            role_profiles = getattr(validated, "role_runtime_profiles", {})
+            runtime_profile = next(iter(role_profiles.values()), None)
+        context = RuntimeContext(
+            validated_manifest=validated,
+            runtime_options=options,
+            runtime_profile=runtime_profile,
+        )
         override = None
         if self._session_factory is not None:
 
             def override(_context, **_kwargs):
-                return self._session_factory(self.family, self.adapter, validated, options)
+                return self._session_factory(self.model_type, self.adapter, validated, options)
 
-        self.session = MODEL_SESSION_BUILDER_REGISTRY.create(
+        self._registry = self._registry or registry_set.backend_registry
+        self.session = registry_set.session_builder_registry.create(
             context,
             allowed_deployments=self.adapter.identity.supported_deployments,
             backend_registry=self._registry,
+            providers=providers,
             override=override,
             builder_options={"adapter": self.adapter},
         )
-        executor = SequentialModelExecutor(
-            (ModelStage("model", self.session),),
-            ModelResultAdapter(),
-            components=(self.session,),
+        contract = ExecutionContract(
+            execution_structure=self.execution_structure,
+            orchestration_visibility=("session" if self.execution_structure == "iterative" else None),
+            cancellation_granularity="checkpoint" if self.execution_structure == "iterative" else "request_boundary",
         )
-        self.pipeline = GenericModelPipeline(
-            f"perception-{self.family}-{self.operation or 'default'}",
-            context,
-            executor,
-            supports_cancellation=self.session.capabilities.supports_cancellation,
+        self._runtime_handle = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=self.session,
+                session=self.session,
+                execution_contract=contract,
+                stateful=bool(self.session.capabilities.stateful),
+                resettable=bool(self.session.capabilities.resettable),
+                runtime_id=f"perception-{self.model_type}-{self.operation or 'default'}",
+                load_context=context,
+                providers=providers,
+            )
         )
+        self.pipeline = self._runtime_handle
         try:
-            self.pipeline.load()
+            self._runtime_handle.load(context)
         except Exception:
             self._closed = True
             raise
 
     def _infer(self, inputs):
-        return self.pipeline.execute(
-            NamedTensorRequest(
-                request_id=f"{self.family}-{next(self._requests)}",
-                inputs=inputs,
-                metadata={"service_type": self.service_type},
-            )
+        request_id = f"{self.model_type}-{next(self._requests)}"
+        return self._runtime_handle.execute(
+            ModelRequest(inputs, metadata={"service_type": self.service_type}),
+            ExecutionContext(request_id),
         )
 
     def image_rgb(self, image):
@@ -145,8 +184,8 @@ class _SessionPlugin(ModelServicePlugin):
         return np.asarray(self.bridge.imgmsg_to_cv2(image, desired_encoding="rgb8"), dtype=np.uint8)
 
     def runtime_status(self) -> PluginRuntimeStatus:
-        diagnostics = self.pipeline.diagnostics()
-        health = diagnostics.executor_health
+        diagnostics = self._runtime_handle.diagnostics()
+        health = diagnostics.health
         state = diagnostics.state.value
         runtime_version = self.session.runtime_version
         ready = health.ready and bool(runtime_version)
@@ -166,12 +205,13 @@ class _SessionPlugin(ModelServicePlugin):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self.pipeline.close()
+            self._runtime_handle.close()
 
 
 class RAMPlusRecognizeTagsPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/RecognizeTags"
-    family = "ram_plus"
+    model_type = "ram_plus"
+    operation = "recognize_tags"
     adapter_class = RAMPlusAdapter
 
     def handle(self, request, response) -> str:
@@ -211,7 +251,7 @@ class RAMPlusRecognizeTagsPlugin(_SessionPlugin):
 
 class SAM2GenerateMasksPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/GenerateMasks"
-    family = "sam2"
+    model_type = "sam2"
     operation = "automatic"
     adapter_class = SAM2Adapter
 
@@ -232,7 +272,8 @@ class SAM2GenerateMasksPlugin(_SessionPlugin):
 
 class SigLIP2EncodeEmbeddingsPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/EncodeEmbeddings"
-    family = "siglip2"
+    model_type = "siglip2"
+    operation = "encode"
     adapter_class = SigLIP2ImageAdapter
 
     def handle(self, request, response) -> str:
@@ -270,7 +311,8 @@ class SigLIP2EncodeEmbeddingsPlugin(_SessionPlugin):
 
 class SigLIP2EncodeTextPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/EncodeText"
-    family = "siglip2"
+    model_type = "siglip2"
+    operation = "encode"
     adapter_class = SigLIP2TextAdapter
 
     def handle(self, request, response) -> str:
@@ -295,8 +337,8 @@ class SigLIP2EncodeTextPlugin(_SessionPlugin):
 
 class GroundingDetectPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/GroundingDetect"
-    family = "grounding_dino"
-    operation = "combined"
+    model_type = "grounding_dino"
+    operation = "detect"
     adapter_class = GroundingDINOAdapter
 
     def handle(self, request, response) -> str:
@@ -327,8 +369,8 @@ class GroundingDINORawDetectPlugin(_SessionPlugin):
     """Text detection service for a compiled raw Grounding-DINO deployment."""
 
     service_type = "ibrobot_msgs/srv/GroundingDetect"
-    family = "grounding_dino"
-    operation = "raw"
+    model_type = "grounding_dino"
+    operation = "detect"
     adapter_class = GroundingDINORawAdapter
 
     def handle(self, request, response) -> str:
@@ -357,7 +399,7 @@ class SegmentDetectionsPlugin(_SessionPlugin):
     """Fill masks for detections using a manifest-bound SAM2 box-prompt service."""
 
     service_type = "ibrobot_msgs/srv/SegmentDetections"
-    family = "sam2"
+    model_type = "sam2"
     operation = "prompt"
     adapter_class = SAM2PromptAdapter
 
@@ -406,7 +448,9 @@ class SegmentDetectionsPlugin(_SessionPlugin):
 
 class GraspGenGenerateGraspsPlugin(_SessionPlugin):
     service_type = "ibrobot_msgs/srv/GenerateGrasps"
-    family = "graspgen"
+    model_type = "graspgen"
+    operation = "generate_grasps"
+    execution_structure = "iterative"
     adapter_class = GraspGenAdapter
 
     def handle(self, request, response) -> str:

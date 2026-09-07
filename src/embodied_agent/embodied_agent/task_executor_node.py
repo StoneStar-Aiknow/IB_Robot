@@ -380,6 +380,8 @@ class TaskExecutorNode(BaseTaskNode):
                 goal.place_name = step.place_name
                 goal.motion_direction = step.motion_direction
                 goal.motion_distance = step.motion_distance
+                goal.arm_side = step.arm_side
+                goal.imitation_duration_sec = step.imitation_duration_sec
                 goal.direction = step.direction
                 goal.distance = step.distance
                 goal.degree = step.degree

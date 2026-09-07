@@ -14,6 +14,7 @@ from typing import Any
 _FLOAT32_MAX = 3.402823466e38
 _SUPPORTED_REQUEST_SCHEMA_VERSIONS = frozenset({1, 2})
 _SCHEMA_VERSION_ERROR = "SKILL_SCHEMA_INVALID: schema_version must be 1 or 2"
+_ALLOWED_ARM_SIDES = frozenset({"left", "right", "auto"})
 
 
 def validate_request_schema_version(value: Any) -> int:
@@ -94,6 +95,8 @@ def canonical_skill_payload(
     place_name: Any = None,
     motion_direction: Any = None,
     motion_distance: Any = None,
+    arm_side: Any = None,
+    imitation_duration_sec: Any = None,
     timeout_sec: Any = None,
     *,
     schema_version: Any,
@@ -113,6 +116,14 @@ def canonical_skill_payload(
     normalized_distance = None
     if motion_distance is not None:
         normalized_distance = _finite_float(motion_distance, "motion_distance", positive=False, float32=True)
+    normalized_arm_side = _normalized_string(arm_side, "arm_side", lowercase=True)
+    if normalized_arm_side and normalized_arm_side not in _ALLOWED_ARM_SIDES:
+        raise ValueError("arm_side must be left, right, or auto")
+    normalized_imitation_duration = 0.0
+    if imitation_duration_sec is not None:
+        normalized_imitation_duration = _finite_float(
+            imitation_duration_sec, "imitation_duration_sec", positive=True, float32=True
+        )
     coordinate_x = _optional_coordinate(x, has_x, "x")
     coordinate_y = _optional_coordinate(y, has_y, "y")
     coordinate_yaw = _optional_coordinate(yaw, has_yaw, "yaw")
@@ -129,6 +140,13 @@ def canonical_skill_payload(
         "motion_direction": _normalized_string(motion_direction, "motion_direction", lowercase=True),
         "motion_distance": normalized_distance,
     }
+    if normalized_arm_side or normalized_imitation_duration:
+        payload.update(
+            {
+                "arm_side": normalized_arm_side,
+                "imitation_duration_sec": normalized_imitation_duration,
+            }
+        )
     if (
         normalized_direction
         or normalized_nav_distance

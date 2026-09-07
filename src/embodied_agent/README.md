@@ -53,7 +53,9 @@ Agent 必须通过 `robot-skill plan-workflow` 提交结构化步骤；机器人
 
 每个 `WorkflowStep` 必须显式携带 `schema_version`。非导航旧合同使用 v1，导航 typed step 使用 v2；CLI 拒绝缺少
 版本的导航步骤，不会从 `domain` 推导或重写版本。IDL/生成接口、wire preflight、执行器、CLI 和 Agent skill 文档
-按同一版本原子部署，避免新旧 public request wire 混装。
+按同一版本原子部署，避免新旧 public request wire 混装。`imitate_human_motion` 的 typed step 使用
+v1，并携带 `arm_side` 与 `imitation_duration_sec`；warmup、prepare、start 和 reset 仍由 delegated runtime
+内部编排，不扩展 Agent 状态机。
 
 ## 边界
 

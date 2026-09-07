@@ -14,7 +14,12 @@ import os
 import subprocess
 import sys
 
-from ai_compliance import add_ai_disclosure, validate_agent_tool, validate_commit_ai_model
+from ai_compliance import (
+    add_ai_disclosure,
+    reject_handwritten_disclosure,
+    validate_agent_tool,
+    validate_commit_ai_model,
+)
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 from reuse_gate import REUSE_SELF_CHECK_THRESHOLD, count_changed_lines, reuse_gate_required, validate_reuse_self_check
 from verification_gate import (
@@ -268,6 +273,7 @@ def main():
 
     try:
         agent_tool = validate_agent_tool(args.agent_tool)
+        reject_handwritten_disclosure(description)
         description = add_ai_disclosure(
             description,
             agent_tool=agent_tool,

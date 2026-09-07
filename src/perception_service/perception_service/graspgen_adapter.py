@@ -9,7 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
-from inference_manifest import (
+from inference_service.unified_runtime import ModelResult
+from model_utils.graspgen_contract import (
     GRASPGEN_CONFIDENCE_SEMANTIC,
     GRASPGEN_NPOINTS,
     GRASPGEN_NSAMPLES,
@@ -17,7 +18,6 @@ from inference_manifest import (
     GRASPGEN_POSE_SEMANTIC,
     GRASPGEN_RADII,
 )
-from inference_service.generic_runtime import NamedTensorResult
 
 from .graspgen_geometry import positive_float, positive_int, remove_point_cloud_outliers
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
@@ -78,10 +78,11 @@ class GraspGenConfig:
 
 class GraspGenAdapter(PerceptionAdapter):
     identity = AdapterIdentity(
-        family="graspgen",
+        model_type="graspgen",
         preprocessing=GRASPGEN_PREPROCESSING,
         postprocessing=GRASPGEN_POSTPROCESSING,
         supported_deployments=frozenset({"torch_cuda", "ascend_310p", "ascend_310b"}),
+        operation="generate_grasps",
     )
 
     compiled_abi_finalized = True
@@ -95,13 +96,14 @@ class GraspGenAdapter(PerceptionAdapter):
         root = Path(bundle_root)
         assets = json.loads((root / "assets" / "adapter.json").read_text(encoding="utf-8"))
         expected = {
-            "family": cls.identity.family,
+            "interface": "tensor_model",
+            "model_type": cls.identity.model_type,
             "preprocessing": cls.identity.preprocessing,
             "postprocessing": cls.identity.postprocessing,
         }
         if any(assets.get(name) != value for name, value in expected.items()):
             raise ValueError(f"GraspGen adapter identity mismatch: expected {expected}, got {assets}")
-        if assets.get("operation", "") != cls.identity.operation:
+        if assets.get("operation") != cls.identity.operation:
             raise ValueError(
                 f"GraspGen adapter operation mismatch: expected {cls.identity.operation!r}, "
                 f"got {assets.get('operation', '')!r}"
@@ -139,7 +141,7 @@ class GraspGenAdapter(PerceptionAdapter):
 
     def postprocess(
         self,
-        result: NamedTensorResult,
+        result: ModelResult,
         *,
         object_center: np.ndarray | None = None,
         max_grasps: int = 0,
@@ -165,7 +167,7 @@ class GraspGenAdapter(PerceptionAdapter):
         return candidates[:max_grasps] if max_grasps > 0 else candidates
 
     @staticmethod
-    def _required(result: NamedTensorResult, semantic: str) -> np.ndarray:
+    def _required(result: ModelResult, semantic: str) -> np.ndarray:
         try:
             return np.asarray(result.outputs[semantic], dtype=np.float32)
         except KeyError as exc:

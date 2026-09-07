@@ -17,10 +17,9 @@ from inference_service.backends.hisilicon.sd3403_protocol import (
     SD3403WorkerError,
     SD3403WorkerExitedError,
 )
-from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 LOGGER = logging.getLogger(__name__)
 _ALLOWED_RUNTIME_OPTIONS = frozenset({"perf_enabled", "perf_log_every", "graceful_close_timeout", "force_close"})
@@ -63,7 +62,11 @@ def validate_runtime_options(options: Mapping[str, object]) -> dict[str, object]
 class HisiliconModelSession(ModelSession):
     """Execute the manifest policy role through one SD3403 worker process."""
 
-    def __init__(self, *, protocol_factory: ProtocolFactory = SD3403Protocol) -> None:
+    def __init__(
+        self,
+        *,
+        protocol_factory: ProtocolFactory = SD3403Protocol,
+    ) -> None:
         super().__init__(
             "model-session:hisilicon",
             BackendCapabilities(
@@ -93,15 +96,15 @@ class HisiliconModelSession(ModelSession):
             return {}
         return dict(self._last_metadata)
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hisilicon":
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "hisilicon":
             raise BackendLoadError(
                 "HisiliconModelSession requires a compiled hisilicon deployment", code="invalid_deployment"
             )
-        if context.policy.policy_type != "act":
+        if context.interface != "policy" or context.model_type != "act" or context.operation != "predict":
             raise BackendLoadError(
-                f"HisiliconModelSession does not support policy family {context.policy.policy_type!r}",
+                "HisiliconModelSession requires policy/act/predict",
                 code="unsupported_policy_backend_pair",
             )
         if deployment.target.soc != "sd3403" or deployment.target.runtime != "hisilicon-worker":
@@ -157,15 +160,17 @@ class HisiliconModelSession(ModelSession):
         self._action_binding = action_bindings[0]
         self._options = options
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
-        return self._execute_role("policy", request.inputs, request)
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        return self._execute_role("policy", request.inputs, request, context)
 
     def _execute_role(
         self,
         role: str,
         inputs: Mapping[str, object],
-        request: NamedTensorRequest,
+        request: ModelRequest,
+        context: ExecutionContext,
     ) -> Mapping[str, object]:
+        context.check(f"model.{role}")
         protocol = self._protocol
         action_binding = self._action_binding
         if protocol is None or action_binding is None:
@@ -199,14 +204,14 @@ class HisiliconModelSession(ModelSession):
         if bool(self._options["perf_enabled"]) and self._inference_count % int(self._options["perf_log_every"]) == 0:
             LOGGER.info(
                 "Hisilicon inference request_id=%s worker_request_id=%s e2e_ms=%.3f worker_ms=%.3f",
-                request.request_id,
+                context.request_id,
                 response.request_id,
                 latency_ms,
                 response.worker_latency_us / 1000.0,
             )
         context = self._require_context()
         self._last_metadata = {
-            "request_id": request.request_id,
+            "request_id": context.request_id,
             "worker_request_id": response.request_id,
             "worker_latency_ms": response.worker_latency_us / 1000.0,
             "worker_model_load_ms": protocol.model_load_ms,

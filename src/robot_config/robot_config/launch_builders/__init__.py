@@ -37,6 +37,10 @@ from robot_config.launch_builders.simulation import generate_gazebo_nodes
 
 
 def __getattr__(name: str):
+    if name == "generate_audio_io_actions":
+        from robot_config.launch_builders.audio_io import generate_audio_io_actions
+
+        return generate_audio_io_actions
     if name == "generate_voice_asr_nodes":
         from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 
@@ -73,6 +77,7 @@ __all__ = [
     "generate_moveit_nodes",
     # Voice ASR
     "generate_voice_asr_nodes",
+    "generate_audio_io_actions",
     "generate_voice_tts_nodes",
     "generate_speech_direction_actions",
     # Navigation

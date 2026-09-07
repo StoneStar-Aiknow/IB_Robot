@@ -13,9 +13,8 @@ from inference_manifest import CompiledDeployment
 from inference_service.backends import RuntimeContext
 from inference_service.backends.errors import BackendInferenceError as SessionInferenceError
 from inference_service.backends.errors import BackendLoadError as SessionLoadError
-from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 from voice_tts_service.errors import BackendInferenceError, BackendLoadError
 from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
 
@@ -25,6 +24,10 @@ _ChineseTokenizer = ChineseTokenizer
 
 class ZipVoiceAscendSession(AscendOmModelSession):
     """Run the complete ZipVoice host-orchestrated pipeline in one model session."""
+
+    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options | {"prompt_profile"}
+    execution_contract = "request-iterative"
+    orchestration_visibility = "session"
 
     def __init__(self, device_id: int = 0, *, prompt_profile: str = "default", **kwargs) -> None:
         super().__init__(device_id, **kwargs)
@@ -61,13 +64,15 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             raise BackendLoadError(f"ZipVoice asset is unavailable: {path}")
         return path
 
-    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+    def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         deployment = context.deployment
         model = context.validated_manifest.manifest.model
-        if model.kind != "generic" or model.family != "zipvoice":
-            raise SessionLoadError("ZipVoice session requires model.kind=generic and model.family=zipvoice")
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+        if (model.interface, model.model_type, model.operation) != ("tensor_model", "zipvoice", "synthesize"):
+            raise SessionLoadError("ZipVoice session requires tensor_model/zipvoice/synthesize")
+        if not isinstance(deployment, CompiledDeployment) or context.backend != "ascend":
             raise SessionLoadError("ZipVoice Ascend session requires a compiled Ascend deployment")
+        if context.target_runtime != "acl":
+            raise SessionLoadError("ZipVoice Ascend session requires target.runtime='acl'")
         if deployment.target.soc != "Ascend310P1":
             raise SessionLoadError(f"verified ZipVoice OM requires Ascend310P1, got {deployment.target.soc!r}")
         self._root = context.validated_manifest.bundle_root
@@ -150,7 +155,8 @@ class ZipVoiceAscendSession(AscendOmModelSession):
     def _cross_fade_concat(waves: list[np.ndarray], sample_rate: int, seconds: float) -> np.ndarray:
         return cross_fade_concat(waves, sample_rate, seconds)
 
-    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        context.check("backend")
         if any(value is None for value in (self._tokenizer, self._prompt, self._torch, self._vocos)):
             raise SessionInferenceError("ZipVoice 310P session assets are not loaded")
         try:

@@ -20,8 +20,8 @@ class RAMPlusWrapper:
         transform=None,
         logits_inference=None,
     ):
-        if backend == "ascend_om":
-            raise RuntimeError("Ascend OM requires a manifest named deployment")
+        if backend == "ascend":
+            raise RuntimeError("Ascend requires a manifest named deployment")
         status = inspect_backend(backend)
         if not status.ready:
             raise RuntimeError(status.message)

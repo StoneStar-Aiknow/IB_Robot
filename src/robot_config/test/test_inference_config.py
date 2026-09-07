@@ -41,12 +41,26 @@ def _create_bundle(root: Path, deployments: dict[str, dict[str, str]] | None = N
     entries = [BundleFile(path=path) for path in bundle_paths]
     deployment_values = deployments or {"cpu": {"backend": "torch", "device": "cpu"}}
     deployment_values = {
-        name: {"uuid": _DEPLOYMENT_UUID, "revision": 1, **value} for name, value in deployment_values.items()
+        name: {
+            "uuid": _DEPLOYMENT_UUID,
+            "revision": 1,
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {
+                "backend": value.get("backend", "torch"),
+                "target": {"runtime": "torch"},
+                "profile": {"device": value.get("device", "cpu")},
+            },
+        }
+        for name, value in deployment_values.items()
     }
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle": {
                 "uuid": _BUNDLE_UUID,
                 "revision": 1,
@@ -57,6 +71,13 @@ def _create_bundle(root: Path, deployments: dict[str, dict[str, str]] | None = N
                     "scope": "structure",
                     "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
                 },
+            },
+            "model": {
+                "interface": "policy",
+                "model_type": "act",
+                "operation": "predict",
+                "inputs": [{"semantic": "observation.state", "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
             },
             "deployments": deployment_values,
         },

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from inference_manifest import GRASPGEN_CONTRACT_VERSION, GRASPGEN_EXECUTION, graspgen_geometry
+from model_utils.graspgen_contract import GRASPGEN_CONTRACT_VERSION, GRASPGEN_EXECUTION, graspgen_geometry
 from model_utils.inference_manifest_export import RuntimeABI, RuntimeTensor
 
 GRASPGEN_BATCH = 1000
@@ -204,10 +204,10 @@ class FakeAclLease:
 class FakeAclRuntimeManager:
     def __init__(self) -> None:
         self.lease = FakeAclLease()
-        self.acquire_calls: list[tuple[int, str | None]] = []
+        self.acquire_calls: list[int] = []
 
-    def acquire(self, device_id: int, config_path: str | None = None):
-        self.acquire_calls.append((device_id, config_path))
+    def acquire(self, device_id: int):
+        self.acquire_calls.append(device_id)
         return self.lease
 
 

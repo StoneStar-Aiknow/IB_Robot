@@ -14,10 +14,9 @@ from inference_service.pipeline.errors import (
 )
 from inference_service.pipeline.executor import SequentialModelExecutor
 from inference_service.pipeline.factory import (
-    MODEL_SESSION_FACTORY_REGISTRY,
-    ModelSessionFactoryRegistry,
     create_inference_pipeline,
     create_pipeline_manager,
+    register_policy_session_builders,
 )
 from inference_service.pipeline.manager import InferencePipelineManager
 from inference_service.pipeline.pi05 import PI05Topology, PI05TopologyError, create_pi05_executor, derive_pi05_topology
@@ -25,9 +24,7 @@ from inference_service.pipeline.runtime import InferencePipeline, Postprocessor,
 from inference_service.pipeline.runtime_core import (
     ExecutionControl,
     ExecutionError,
-    GenericModelPipeline,
     ModelExecutor,
-    PipelineRuntimeCore,
     PipelineRuntimeDiagnostics,
     StageFrame,
 )
@@ -67,7 +64,6 @@ __all__ = [
     "ExecutionControl",
     "ExecutionError",
     "EulerIterationStateAdapter",
-    "GenericModelPipeline",
     "HostComputeStage",
     "HostRoleStage",
     "InferencePipeline",
@@ -77,8 +73,6 @@ __all__ = [
     "IterationStep",
     "IterativeStage",
     "ModelExecutor",
-    "ModelSessionFactoryRegistry",
-    "MODEL_SESSION_FACTORY_REGISTRY",
     "ModelResultAdapter",
     "ModelStage",
     "PipelineConfigurationError",
@@ -90,7 +84,6 @@ __all__ = [
     "PipelineNotFoundError",
     "PipelineNotReadyError",
     "PipelineResult",
-    "PipelineRuntimeCore",
     "PipelineRuntimeDiagnostics",
     "PipelineState",
     "PipelineStateMachine",
@@ -114,6 +107,7 @@ __all__ = [
     "create_inference_pipeline",
     "create_pi05_executor",
     "create_pipeline_manager",
+    "register_policy_session_builders",
     "create_smolvla_executor",
     "derive_pi05_topology",
     "derive_smolvla_topology",

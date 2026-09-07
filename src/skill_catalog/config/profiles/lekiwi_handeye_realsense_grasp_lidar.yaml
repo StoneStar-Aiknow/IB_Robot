@@ -26,6 +26,9 @@ enabled_skills:
 - name: recover_safe_pose
   implementation: lekiwi_handeye_realsense_grasp
   planner_visible: true
+- name: imitate_human_motion
+  implementation: lekiwi_handeye_realsense_grasp_lidar
+  planner_visible: true
 - name: recover_zero_pose
   implementation: lekiwi_handeye_realsense_grasp
   planner_visible: true

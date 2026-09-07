@@ -66,6 +66,10 @@ from inference_service.distributed.ros_protocol import (
     video_status_to_message,
 )
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
+from inference_service.runtime_composition import (
+    build_policy_runtime_dependencies,
+    require_runtime_dependencies,
+)
 from inference_service.scheduler.action_idempotency import (
     ResolutionErrorCodes,
     execute_resolved_action,
@@ -86,6 +90,7 @@ from inference_service.scheduler.ledger import (
 )
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 from robot_config.contract_utils import (
     SpecView,
     StreamBuffer,
@@ -235,8 +240,22 @@ class DeadlineExceededError(RuntimeError):
 class PipelinePolicyNode(Node):
     """Own exactly one pipeline process and its pipeline-scoped ROS interfaces."""
 
-    def __init__(self, config: PipelineNodeConfig, *, node_name: str) -> None:
+    def __init__(
+        self,
+        config: PipelineNodeConfig,
+        *,
+        node_name: str,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
         super().__init__(node_name)
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
         if config.execution_mode not in {"monolithic", "distributed"}:
             raise RuntimeError(f"unsupported pipeline execution mode {config.execution_mode!r}")
         if config.scheduler_enabled and config.execution_mode != "monolithic":
@@ -310,6 +329,8 @@ class PipelinePolicyNode(Node):
                 default_task=config.default_task or None,
                 runtime_options=runtime_options,
                 priority_scheduling=config.scheduler_enabled,
+                registry_set=self._registry_set,
+                providers=self._providers,
             )
         else:
             for name in ("request_topic", "result_topic", "heartbeat_topic"):
@@ -1055,6 +1076,10 @@ class PipelinePolicyNode(Node):
         self._last_inference_time = time.time()
         self._inference_count += 1
         self._last_error = ""
+        self.get_logger().info(
+            f"Inference succeeded: request={request_id}, mode={self._config.execution_mode}, "
+            f"chunk={chunk_size}, latency={total_latency_ms:.1f}ms, backend={backend_latency_ms:.1f}ms"
+        )
         return response
 
     def _reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
@@ -1748,6 +1773,10 @@ class PipelinePolicyNode(Node):
             self._last_inference_time = time.time()
             self._inference_count += 1
             self._last_error = ""
+            self.get_logger().info(
+                f"Inference succeeded: request={goal.request_id}, mode=scheduled, "
+                f"chunk={chunk_size}, latency={total_latency_ms:.1f}ms, backend={backend_latency_ms:.1f}ms"
+            )
             goal_handle.succeed()
         except Exception as exc:
             self._last_error = str(exc)
@@ -1977,6 +2006,12 @@ class PipelinePolicyNode(Node):
                 self._video_descriptor_pub.publish(video_descriptor_to_message(descriptor, stamp=stamp))
             for status in manager.statuses():
                 self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+            diagnostics = manager.sender_diagnostics()
+            if diagnostics:
+                self.get_logger().info(
+                    "Video sender runtime: " + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
+                    throttle_duration_sec=2.0,
+                )
         except Exception as exc:
             self._last_error = f"failed to publish video stream control status: {exc}"
             self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
@@ -2331,9 +2366,16 @@ def _pipeline_executor_threads(config: PipelineNodeConfig) -> int:
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node: PipelinePolicyNode | None = None
+    dependencies = None
     try:
         config, node_name = _read_config()
-        node = PipelinePolicyNode(config, node_name=node_name)
+        dependencies = build_policy_runtime_dependencies()
+        node = PipelinePolicyNode(
+            config,
+            node_name=node_name,
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+        )
         executor = MultiThreadedExecutor(num_threads=_pipeline_executor_threads(config))
         executor.add_node(node)
         executor.spin()
@@ -2342,6 +2384,8 @@ def main(args: list[str] | None = None) -> None:
     finally:
         if node is not None:
             node.destroy_node()
+        if dependencies is not None:
+            dependencies.providers.close()
         if rclpy.ok():
             rclpy.shutdown()
 

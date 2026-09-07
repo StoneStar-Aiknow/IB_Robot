@@ -1,7 +1,7 @@
 """speech_direction_node ROS 适配层。
 
 ~250 行,职责:
-    - ROS 参数:device_name_contains, sample_rate, mount_yaw_deg, input_source, wav_path, 模型路径
+    - ROS 参数:sample_rate, mount_yaw_deg, audio_topic, 模型路径
     - 构造 FullSubNetEnhancer + SpeechGate + StftSrpPhat + SpeechDirectionPipeline + Runtime
     - 定时器轮询 get_speech_direction(pull 模型,~10Hz)
     - 坐标转换:阵列坐标系(度) → REP-103(弧度)(统一角度单位,显式 deg2rad)
@@ -33,20 +33,30 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from ibrobot_msgs.msg import SpeechDirection
 from inference_manifest import load_inference_manifest
 from inference_service.backends import RuntimeContext
-from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
+from inference_service.runtime_composition import (
+    build_model_service_runtime_dependencies,
+    require_runtime_dependencies,
+)
+from inference_service.unified_runtime import (
+    ExecutionContract,
+    ModelRuntimeHandle,
+    OwnedComponent,
+    RegistrySet,
+    RuntimeAssembly,
+    RuntimeProviders,
+)
 
-from ..model_session_builders import register_speech_direction_session_builder
 from .config import SpeechDirectionConfig
 from .diagnostics import DiagnosticsRecorder, RecorderStatus
 from .doa.srp_phat import StftSrpPhat
 from .enhancement.factory import build_stateful_fullsubnet
 from .enhancement.fullsubnet import FullSubNetEnhancer
-from .model_sessions import SpeechDirectionRoleRunner
+from .model_sessions import SpeechDirectionRoleRunner, SpeechDirectionSessionResources
 from .pipeline import DoaState, PipelineParams, SpeechDirectionPipeline, VadState
 from .pipeline_streaming import StreamingPipelineParams, StreamingSpeechDirectionPipeline
 from .runtime import SpeechDirectionRuntime
 from .speech_gate import SileroVadEngine, SpeechGate
-from .wav_input import WavInput
+from .streaming_runtime import SpeechDirectionStreamingRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -54,25 +64,13 @@ logger = logging.getLogger(__name__)
 POLL_PERIOD_SEC = 0.1
 
 _PARAMETER_TYPES = {
-    "device_name_contains": Parameter.Type.STRING,
-    "arecord_device": Parameter.Type.STRING,
+    "audio_channels": Parameter.Type.INTEGER,
     "sample_rate": Parameter.Type.INTEGER,
     "srp_update_interval_hops": Parameter.Type.INTEGER,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
     "angle_step_degree": Parameter.Type.INTEGER,
-    "input_source": Parameter.Type.STRING,
-    "wav_path": Parameter.Type.STRING,
-    "wav_replay_rate": Parameter.Type.DOUBLE,
-    "fullsubnet_device": Parameter.Type.STRING,
-    "silero_vad_model_path": Parameter.Type.STRING,
-    "fullsubnet_ckpt": Parameter.Type.STRING,
-    "fullsubnet_om_path": Parameter.Type.STRING,
-    "fullsubnet_stateful_fb_om_path": Parameter.Type.STRING,
-    "fullsubnet_stateful_sb_om_path": Parameter.Type.STRING,
-    "fullsubnet_stateful_manifest_path": Parameter.Type.STRING,
+    "audio_topic": Parameter.Type.STRING,
     "speech_direction_inference_bundle": Parameter.Type.STRING,
-    "fullsubnet_device_id": Parameter.Type.INTEGER,
-    "fullsubnet_acl_config_path": Parameter.Type.STRING,
     "silero_vad_backend": Parameter.Type.STRING,
     "fullsubnet_backend": Parameter.Type.STRING,
     "speech_direction_max_age_ms": Parameter.Type.INTEGER,
@@ -105,15 +103,6 @@ def _require_string(values: Mapping[str, Any], name: str, *, allow_empty: bool =
 def _require_non_empty_string(values: Mapping[str, Any], name: str) -> str:
     """读取并校验必填字符串参数。"""
     return _require_string(values, name)
-
-
-def _build_acl_runtime_options(device_id: int, acl_config_path: str) -> dict[str, object]:
-    """Build Ascend runtime options while preserving the default ACL initialization contract."""
-    runtime_options: dict[str, object] = {"device_id": device_id}
-    normalized_path = acl_config_path.strip()
-    if normalized_path:
-        runtime_options["acl_config_path"] = normalized_path
-    return runtime_options
 
 
 def _convert_int(values: Mapping[str, Any], name: str) -> int:
@@ -168,8 +157,7 @@ def _convert_float_list(values: Mapping[str, Any], name: str) -> list[float]:
 
 def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirectionConfig:
     """将已读取的 ROS 参数校验并映射为算法配置。"""
-    device_name = _require_non_empty_string(values, "device_name_contains")
-    arecord_device = _require_non_empty_string(values, "arecord_device")
+    audio_channels = _require_positive_int(values, "audio_channels")
     sample_rate = _convert_int(values, "sample_rate")
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
@@ -189,64 +177,16 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
         raise ValueError("参数 mic_positions 必须全部为有限浮点数")
     mic_positions = [flat_positions[index : index + 2] for index in range(0, len(flat_positions), 2)]
 
-    input_source = _require_string(values, "input_source")
-    if input_source not in {"device", "wav"}:
-        raise ValueError("参数 input_source 只能为 device 或 wav")
-    wav_path = _require_string(values, "wav_path", allow_empty=True)
-    if input_source == "wav" and not wav_path:
-        raise ValueError("input_source=wav 时参数 wav_path 不能为空")
-
-    wav_replay_rate = _convert_float(values, "wav_replay_rate")
-    if not math.isfinite(wav_replay_rate) or wav_replay_rate <= 0:
-        raise ValueError("参数 wav_replay_rate 必须是大于 0 的有限数")
-
-    fullsubnet_device_raw = _require_string(values, "fullsubnet_device")
-    if fullsubnet_device_raw not in {"cuda", "cpu"}:
-        raise ValueError("参数 fullsubnet_device 只能为 cuda 或 cpu")
-    # 各 stateful 后端对 device 有硬性要求（见 factory），此处只做边界校验不做静默归一化。
-    fullsubnet_device = fullsubnet_device_raw
-
-    # 旧值只在配置边界归一化，主流程内部统一使用 canonical backend 名称。
-    silero_backend_aliases = {"om": "raw_acl", "raw_acl": "raw_acl", "onnx": "onnx"}
     silero_backend_raw = _require_string(values, "silero_vad_backend")
-    if silero_backend_raw not in silero_backend_aliases:
-        raise ValueError("参数 silero_vad_backend 只能为 raw_acl、onnx 或兼容值 om")
-    silero_backend = silero_backend_aliases[silero_backend_raw]
+    if silero_backend_raw not in {"ascend", "onnx"}:
+        raise ValueError("参数 silero_vad_backend 只能为 ascend 或 onnx")
+    silero_backend = silero_backend_raw
 
-    fullsubnet_backend_aliases = {
-        "stateful_om": "stateful_raw_acl",
-        "stateful_raw_acl": "stateful_raw_acl",
-        "stateful_torch": "stateful_torch_cuda",
-        "stateful_torch_cuda": "stateful_torch_cuda",
-        "stateful_torch_cpu": "stateful_torch_cpu",
-        "om": "legacy_om",
-        "torch": "legacy_torch",
-        "legacy_om": "legacy_om",
-        "legacy_torch": "legacy_torch",
-    }
-    fullsubnet_backend_raw = _require_string(values, "fullsubnet_backend")
-    if fullsubnet_backend_raw not in fullsubnet_backend_aliases:
-        raise ValueError("参数 fullsubnet_backend 不是受支持的 stateful/legacy 后端")
-    fullsubnet_backend = fullsubnet_backend_aliases[fullsubnet_backend_raw]
-    stateful_backend = fullsubnet_backend.startswith("stateful_")
-    # stateful_raw_acl 使用拆分FB/SB模型；legacy_om 仅作为显式对照保留。
-    fullsubnet_om_path = _require_string(values, "fullsubnet_om_path", allow_empty=True)
-    stateful_fb_path = _require_string(values, "fullsubnet_stateful_fb_om_path", allow_empty=True)
-    stateful_sb_path = _require_string(values, "fullsubnet_stateful_sb_om_path", allow_empty=True)
-    stateful_manifest = _require_string(values, "fullsubnet_stateful_manifest_path", allow_empty=True)
-    fullsubnet_device_id = _convert_int(values, "fullsubnet_device_id")
-    if fullsubnet_device_id < 0:
-        raise ValueError("参数 fullsubnet_device_id 不能为负数")
-    fullsubnet_acl_config_path = _require_string(values, "fullsubnet_acl_config_path", allow_empty=True)
-    if fullsubnet_backend == "legacy_om" and not fullsubnet_om_path:
-        raise ValueError("fullsubnet_backend=legacy_om 时参数 fullsubnet_om_path 不能为空")
-    if fullsubnet_backend == "stateful_raw_acl" and not all((stateful_fb_path, stateful_sb_path, stateful_manifest)):
-        raise ValueError("fullsubnet_backend=stateful_raw_acl 时FB/SB OM和manifest均不能为空")
-    silero_path = _require_non_empty_string(values, "silero_vad_model_path")
-    # Torch stateful 后端需要 checkpoint + manifest，raw ACL 不依赖上游源码。
-    ckpt_path = _require_string(values, "fullsubnet_ckpt", allow_empty=True)
-    if stateful_backend and fullsubnet_backend.startswith("stateful_torch") and not all((ckpt_path, stateful_manifest)):
-        raise ValueError("stateful Torch 后端要求 cumulative checkpoint 和 manifest")
+    fullsubnet_backend = _require_string(values, "fullsubnet_backend")
+    if fullsubnet_backend not in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
+        raise ValueError("参数 fullsubnet_backend 不是受支持的 Ascend/Torch 后端")
+    bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
+    # Torch stateful 后端需要 checkpoint + manifest；Model 类由 ibrobot-fullsubnet wheel 提供。
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
     if max_age_ms <= 0:
         raise ValueError("参数 speech_direction_max_age_ms 必须大于 0")
@@ -272,8 +212,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
 
     # 仅使用上述归一化变量构造配置，避免未校验输入进入算法链。
     cfg = SpeechDirectionConfig()
-    cfg.audio.device_name = device_name
-    cfg.audio.arecord_device = arecord_device
+    cfg.audio.channels = audio_channels
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
     cfg.pipeline.srp_update_interval_hops = srp_update_interval_hops
@@ -285,21 +224,13 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.pipeline.input_channels = list(channel_indices)
     cfg.doa.input_channels = list(channel_indices)
     cfg.doa.mic_positions = mic_positions
-    cfg.vad.model_path = silero_path
-    cfg.fullnet.ckpt = ckpt_path
-    cfg.fullnet.device = fullsubnet_device
+    cfg.fullnet.inference_bundle = bundle
+    cfg.fullnet.device = {"stateful_torch_cuda": "cuda", "stateful_torch_cpu": "cpu", "torch": "cpu"}.get(
+        fullsubnet_backend, "cuda"
+    )
     cfg.fullnet.backend = fullsubnet_backend
-    cfg.fullnet.om_path = fullsubnet_om_path
-    cfg.fullnet.stateful_fb_om_path = stateful_fb_path
-    cfg.fullnet.stateful_sb_om_path = stateful_sb_path
-    cfg.fullnet.stateful_manifest_path = stateful_manifest
-    cfg.fullnet.inference_bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
-    cfg.fullnet.device_id = fullsubnet_device_id
-    cfg.fullnet.acl_config_path = fullsubnet_acl_config_path
     cfg.vad.backend = silero_backend
-    cfg.input_source = input_source
-    cfg.wav_path = wav_path
-    cfg.wav_replay_rate = wav_replay_rate
+    cfg.audio_topic = _require_non_empty_string(values, "audio_topic")
     cfg.mount_yaw_deg = mount_yaw_deg
     cfg.doa.angle_step_degree = angle_step_degree
     cfg.speech_direction_max_age_ms = max_age_ms
@@ -318,13 +249,26 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
 class SpeechDirectionNode(Node):
     """speech_direction ROS 节点。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
+    ) -> None:
         super().__init__("speech_direction_node")
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._registry_set = registry_set
+        self._providers = providers
 
         # ============================ 声明并加载 ROS 参数 ============================
         # 部署参数必须由 launch/YAML 注入，节点代码不提供业务默认值。
         self._declare_parameters()
         cfg = self._load_config_from_parameters()
+        self._apply_bundle_artifacts(cfg)
         self._config = cfg
         self._mount_yaw_deg = cfg.mount_yaw_deg
 
@@ -332,6 +276,7 @@ class SpeechDirectionNode(Node):
         # 方向 topic 用 KEEP_LAST(1),只保留最新方向
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self._direction_pub = self.create_publisher(SpeechDirection, "/voice/speech_direction", qos)
+        self._audio_subscription = None
         # 在线状态(诊断)
         self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
@@ -342,8 +287,9 @@ class SpeechDirectionNode(Node):
 
         # ============================ 构建算法链(可能失败 → 降级)============================
         self._runtime: SpeechDirectionRuntime | None = None
-        self._model_sessions = []
-        self._wav_input: WavInput | None = None
+        self._runtime_handle: ModelRuntimeHandle | None = None
+        self._session_resources: SpeechDirectionSessionResources | None = None
+        self._pending_backend_resources: tuple[object, ...] = ()
         self._diagnostics_recorder: DiagnosticsRecorder | None = None
         self._diagnostics_status = RecorderStatus(False, "disabled", None, None, 0)
         self._diagnostics_session_dir = ""
@@ -364,7 +310,6 @@ class SpeechDirectionNode(Node):
             cfg.fullnet.ckpt,
             silero_backend=cfg.vad.backend,
             fullsubnet_backend=cfg.fullnet.backend,
-            fullsubnet_om_path=cfg.fullnet.om_path,
             fullsubnet_stateful_fb_om_path=cfg.fullnet.stateful_fb_om_path,
             fullsubnet_stateful_sb_om_path=cfg.fullnet.stateful_sb_om_path,
             fullsubnet_stateful_manifest_path=cfg.fullnet.stateful_manifest_path,
@@ -383,7 +328,7 @@ class SpeechDirectionNode(Node):
         self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
 
         self.get_logger().info(
-            f"speech_direction_node 已启动: input_source={cfg.input_source}, "
+            f"speech_direction_node 已启动: audio_topic={cfg.audio_topic}, "
             f"mount_yaw_deg={cfg.mount_yaw_deg}, degraded={self._degraded}"
         )
 
@@ -396,6 +341,25 @@ class SpeechDirectionNode(Node):
         """读取 ROS 参数并通过纯函数完成集中校验与配置构造。"""
         values = {name: self.get_parameter(name).value for name in _PARAMETER_NAMES}
         return build_config_from_parameter_values(values)
+
+    @staticmethod
+    def _apply_bundle_artifacts(cfg: SpeechDirectionConfig) -> None:
+        """Derive Ascend artifact paths from the selected speech bundle manifest."""
+        if cfg.fullnet.backend != "ascend":
+            return
+        bundle = Path(cfg.fullnet.inference_bundle)
+        fullsubnet = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
+        silero = load_inference_manifest(bundle, "ascend_310p_silero")
+        full_artifacts = fullsubnet.deployment.artifacts
+        silero_artifacts = silero.deployment.artifacts
+        full_profile = fullsubnet.role_runtime_profiles.get("fullsubnet_fb")
+        if full_profile is None:
+            raise ValueError("speech_direction FullSubNet deployment has no runtime profile")
+        cfg.fullnet.device_id = int(full_profile.profile.device_id)
+        cfg.fullnet.stateful_fb_om_path = str(bundle / full_artifacts["fullsubnet_fb"].path)
+        cfg.fullnet.stateful_sb_om_path = str(bundle / full_artifacts["fullsubnet_sb"].path)
+        cfg.fullnet.stateful_manifest_path = str(bundle / full_artifacts["fullsubnet_checkpoint_manifest"].path)
+        cfg.vad.model_path = str(bundle / silero_artifacts["silero_vad"].path)
 
     # ------------------------------------------------------------------ 算法链构建
     def _make_session_dir(self) -> str:
@@ -414,25 +378,45 @@ class SpeechDirectionNode(Node):
         本方法只负责加载与线程启动;此处的加载/推理失败走降级(运行时故障降级策略)。
         """
         cfg = self._config
+        session_entries: dict[str, tuple[object, RuntimeContext]] = {}
+        backend_resources: list[object] = []
 
         # 两个平台仅在 executor 选择上分叉，随后共用 cumulative Host 增强器。
-        stateful_backend = cfg.fullnet.backend.startswith("stateful_")
-        if stateful_backend and cfg.fullnet.backend == "stateful_raw_acl":
-            register_speech_direction_session_builder()
+        stateful_backend = cfg.fullnet.backend in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu"}
+        if stateful_backend and cfg.fullnet.backend == "ascend":
             bundle = Path(cfg.fullnet.inference_bundle)
             fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
+            fullsubnet_role = next(
+                (
+                    role
+                    for role, identity in fullsubnet_manifest.role_identities.items()
+                    if identity.model_type == "fullsubnet"
+                ),
+                None,
+            )
+            if fullsubnet_role is None:
+                raise ValueError("speech_direction FullSubNet deployment has no fullsubnet role identity")
             fullsubnet_context = RuntimeContext(
                 fullsubnet_manifest,
-                _build_acl_runtime_options(cfg.fullnet.device_id, cfg.fullnet.acl_config_path),
+                {"device_id": cfg.fullnet.device_id},
+                runtime_profile=fullsubnet_manifest.role_runtime_profiles.get(fullsubnet_role),
+                role=fullsubnet_role,
             )
-            fullsubnet_session = MODEL_SESSION_BUILDER_REGISTRY.create(fullsubnet_context)
-            fullsubnet_session.load(fullsubnet_context)
-            self._model_sessions.append(fullsubnet_session)
+            fullsubnet_session = self._registry_set.session_builder_registry.create(
+                fullsubnet_context,
+                backend_registry=self._registry_set.backend_registry,
+                providers=self._providers,
+            )
+            session_entries["fullsubnet"] = (fullsubnet_session, fullsubnet_context)
+            self._session_resources = SpeechDirectionSessionResources(
+                {"fullsubnet": (fullsubnet_session, fullsubnet_context)}
+            )
             fullnet = build_stateful_fullsubnet(
                 backend=cfg.fullnet.backend,
                 manifest_path=cfg.fullnet.stateful_manifest_path,
                 timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
-                executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context),
+                initialize_backend=False,
+                executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context, owns_session=False),
             )
         elif stateful_backend:
             fullnet = build_stateful_fullsubnet(
@@ -442,24 +426,38 @@ class SpeechDirectionNode(Node):
                 device=cfg.fullnet.device,
                 timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
             )
+            backend_resources.append(fullnet)
         else:
-            # legacy 仅保留显式对照，不允许 stateful 构造失败后自动进入此分支。
+            # The non-stateful Torch path is an explicit comparison mode; it is never
+            # selected as a fallback after a stateful runtime failure.
             fullnet = FullSubNetEnhancer(
                 ckpt=cfg.fullnet.ckpt,
                 device=cfg.fullnet.device,
             )
+            backend_resources.append(fullnet)
 
         vad_runner = None
-        if cfg.fullnet.backend == "stateful_raw_acl" and cfg.vad.backend == "raw_acl":
+        if cfg.fullnet.backend == "ascend" and cfg.vad.backend == "ascend":
             vad_manifest = load_inference_manifest(Path(cfg.fullnet.inference_bundle), "ascend_310p_silero")
             vad_context = RuntimeContext(
                 vad_manifest,
-                _build_acl_runtime_options(cfg.fullnet.device_id, cfg.fullnet.acl_config_path),
+                {"device_id": cfg.fullnet.device_id},
+                runtime_profile=vad_manifest.role_runtime_profiles.get("silero_vad")
+                if "silero_vad" in vad_manifest.role_runtime_profiles
+                else vad_manifest.runtime_profile,
+                role="silero_vad" if "silero_vad" in vad_manifest.role_identities else None,
             )
-            vad_session = MODEL_SESSION_BUILDER_REGISTRY.create(vad_context)
-            vad_session.load(vad_context)
-            self._model_sessions.append(vad_session)
-            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context)
+            vad_session = self._registry_set.session_builder_registry.create(
+                vad_context,
+                backend_registry=self._registry_set.backend_registry,
+                providers=self._providers,
+            )
+            session_entries["silero_vad"] = (vad_session, vad_context)
+            if self._session_resources is None:
+                self._session_resources = SpeechDirectionSessionResources({"silero_vad": (vad_session, vad_context)})
+            else:
+                self._session_resources.add("silero_vad", vad_session, vad_context)
+            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context, owns_session=False)
 
         # 人声门控(复用 common/vad/silero)
         # vad_runner(manifest 驱动)只做裸推理转发，不含 SileroVadEngine 的帧间 context 拼接
@@ -484,6 +482,8 @@ class SpeechDirectionNode(Node):
             backend=cfg.vad.backend,
             silero_engine=silero_engine,
         )
+        if silero_engine is None and speech_gate.silero is not None:
+            backend_resources.append(speech_gate.silero)
 
         # SRP-PHAT(阵列几何与声学参数从配置传入,配置驱动)
         angles = np.arange(0, 360, cfg.doa.angle_step_degree, dtype=np.float32)
@@ -588,6 +588,7 @@ class SpeechDirectionNode(Node):
                 vad_threshold=cfg.gray_region.vad_threshold,
                 rms_threshold=cfg.gray_region.rms_threshold,
                 diagnostics=diagnostics,
+                initialize_backend=False,
             )
         else:
             assert params is not None
@@ -595,26 +596,107 @@ class SpeechDirectionNode(Node):
                 fullnet, speech_gate, srp, params, vad_state, doa_state, diagnostics=diagnostics
             )
 
-        # runtime(input_source=wav 时 enable_capture=False)
-        enable_capture = cfg.input_source == "device"
+        self._pending_backend_resources = tuple(backend_resources)
+
+        streaming_runtime = SpeechDirectionStreamingRuntime(pipeline, close_backends=False)
+        owned_components: list[OwnedComponent] = []
+        if self._session_resources is not None:
+            for role, (session, context) in session_entries.items():
+                owned_components.append(
+                    OwnedComponent(session, f"speech_direction_session:{role}", load_context=context)
+                )
+        for index, resource in enumerate(backend_resources):
+            owned_components.append(OwnedComponent(resource, f"speech_direction_backend:{index}"))
+        owned_components.append(OwnedComponent(streaming_runtime, "speech_direction_streaming_runtime"))
+
+        state_links = [
+            {
+                "role": "__runtime__",
+                "state_name": "host.stft_ola",
+                "owner": "streaming_runtime",
+                "source": "host.stft",
+                "target": "host.ola",
+                "scope": "runtime",
+                "state_bank": "speech_direction.host",
+            },
+            {
+                "role": "__runtime__",
+                "state_name": "host.segment",
+                "owner": "streaming_runtime",
+                "source": "host.gate",
+                "target": "host.segment",
+                "scope": "runtime",
+                "state_bank": "speech_direction.host",
+            },
+        ]
+        state_links.extend(
+            {
+                "role": role,
+                "state_name": "recurrent",
+                "owner": "session",
+                "source": "state.in",
+                "target": "state.out",
+                "scope": "runtime",
+                "state_bank": f"{role}.bank",
+            }
+            for role in sorted(session_entries)
+        )
+        execution_contract = ExecutionContract(
+            state_scope="stream",
+            execution_structure="direct",
+            cancellation_granularity="checkpoint",
+            state_bank_mode="runtime_exclusive",
+            max_open_streams=1,
+            state_links=tuple(state_links),
+        )
+        assembly = RuntimeAssembly(
+            runtime_executor=streaming_runtime,
+            streaming_runtime=streaming_runtime,
+            session=next((session for session, _context in session_entries.values()), None),
+            role_assemblies={role: session for role, (session, _context) in session_entries.items()},
+            owned_components=tuple(owned_components),
+            stateful=True,
+            resettable=True,
+            state_scope="stream",
+            state_bank_mode="runtime_exclusive",
+            max_open_streams=1,
+            cancellation_granularity="checkpoint",
+            execution_contract=execution_contract,
+            identity=("tensor_model", "speech_direction", "enhance_and_vad"),
+            declared_capabilities={
+                "state_owner": "streaming_runtime",
+                "state_bank_mode": "runtime_exclusive",
+                "max_open_streams": 1,
+                "host_state": ("stft", "ola", "gate", "segment"),
+            },
+            runtime_id="speech-direction",
+        )
+        self._runtime_handle = ModelRuntimeHandle(assembly)
+        # Session ownership has transferred to the handle's concrete owned
+        # components; the construction-failure cleanup wrapper is no longer
+        # used by the node.
+        self._session_resources = None
+        self._pending_backend_resources = ()
+
         self._runtime = SpeechDirectionRuntime(
             cfg,
             pipeline,
-            enable_capture=enable_capture,
             on_fatal_error=self._enter_degraded,
+            model_runtime_handle=self._runtime_handle,
         )
         self._runtime.start()
 
-        # 离线 WAV 输入
-        if cfg.input_source == "wav":
-            if not cfg.wav_path:
-                raise ValueError("input_source=wav 时 wav_path 必填")
-            self._wav_input = WavInput(
-                self._runtime,
-                cfg.wav_path,
-                replay_rate=cfg.wav_replay_rate,
-            )
-            self._wav_input.start()
+        from audio_common_msgs.msg import AudioDataStamped
+
+        self._audio_subscription = self.create_subscription(
+            AudioDataStamped, cfg.audio_topic, self._on_audio_message, 50
+        )
+
+    def _on_audio_message(self, message) -> None:
+        """Feed interleaved shared PCM into the existing multi-channel ring."""
+        if self._runtime is None:
+            return
+        self._runtime.feed_audio(bytes(message.audio.data))
 
     # ------------------------------------------------------------------ 轮询发布
     def _poll_and_publish(self) -> None:
@@ -725,8 +807,8 @@ class SpeechDirectionNode(Node):
                 KeyValue(key="latest_angle", value=str(full.get("angle"))),
                 KeyValue(key="seq_id", value=str(full.get("seq_id"))),
                 KeyValue(
-                    key="capture_running",
-                    value=str(self._runtime.capture is not None and self._runtime.capture.is_running()),
+                    key="audio_subscription",
+                    value=str(self._audio_subscription is not None),
                 ),
             ]
             if recorder_status.state == "diagnostics_disabled":
@@ -786,23 +868,31 @@ class SpeechDirectionNode(Node):
         cleanup_error = None
         result = False
         try:
-            if self._wav_input is not None:
-                try:
-                    self._wav_input.stop()
-                except Exception as exc:
-                    cleanup_error = exc
             if self._runtime is not None:
                 try:
                     self._runtime.stop()
                 except Exception as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
-            for session in self._model_sessions:
+            # Model Sessions are owned by the unified runtime handle.  If
+            # assembly failed before a SpeechDirectionRuntime was installed,
+            # release the pending Session owner here as a construction-failure
+            # fallback; never close Sessions a second time after handle stop.
+            if self._runtime is None and self._session_resources is not None:
                 try:
-                    session.close()
+                    self._session_resources.close()
                 except Exception as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
+            if self._runtime is None:
+                for resource in reversed(self._pending_backend_resources):
+                    try:
+                        close = getattr(resource, "close", None)
+                        if callable(close):
+                            close()
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
             # 在线节点只关闭高通量记录会话；报告生成严格留给离线 CLI。
             if self._diagnostics_recorder is not None:
                 try:
@@ -830,13 +920,18 @@ class SpeechDirectionNode(Node):
 def main(args=None) -> None:
     """speech_direction_node 入口。"""
     rclpy.init(args=args)
-    node = SpeechDirectionNode()
+    dependencies = build_model_service_runtime_dependencies()
+    node = SpeechDirectionNode(
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info("用户中断,正在停止...")
     finally:
         node.destroy_node()
+        dependencies.providers.close()
         rclpy.shutdown()
 
 

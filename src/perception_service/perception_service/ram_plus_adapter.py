@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from inference_service.generic_runtime import NamedTensorResult
+from inference_service.unified_runtime import ModelResult
 
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
@@ -67,10 +67,11 @@ def masked_image_crop(image: np.ndarray, mask: np.ndarray, *, padding_ratio: flo
 
 class RAMPlusAdapter(PerceptionAdapter):
     identity = AdapterIdentity(
-        family="ram_plus",
+        model_type="ram_plus",
         preprocessing=RAM_PLUS_PREPROCESSING,
         postprocessing=RAM_PLUS_POSTPROCESSING,
         supported_deployments=frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
+        operation="recognize_tags",
     )
 
     compiled_abi_finalized = True
@@ -93,13 +94,14 @@ class RAMPlusAdapter(PerceptionAdapter):
         root = Path(bundle_root)
         identity = json.loads((root / "assets" / "adapter.json").read_text(encoding="utf-8"))
         expected = {
-            "family": cls.identity.family,
+            "interface": "tensor_model",
+            "model_type": cls.identity.model_type,
             "preprocessing": cls.identity.preprocessing,
             "postprocessing": cls.identity.postprocessing,
         }
         if any(identity.get(name) != value for name, value in expected.items()):
             raise ValueError(f"RAM++ adapter identity mismatch: expected {expected}, got {identity}")
-        if identity.get("operation", "") != cls.identity.operation:
+        if identity.get("operation") != cls.identity.operation:
             raise ValueError(
                 f"RAM++ adapter operation mismatch: expected {cls.identity.operation!r}, "
                 f"got {identity.get('operation', '')!r}"
@@ -126,7 +128,7 @@ class RAMPlusAdapter(PerceptionAdapter):
         value = (value - mean) / std
         return {"observation.image": np.ascontiguousarray(value.transpose(0, 3, 1, 2), dtype=np.float32)}
 
-    def _scores(self, result: NamedTensorResult) -> np.ndarray:
+    def _scores(self, result: ModelResult) -> np.ndarray:
         try:
             logits = np.asarray(result.outputs["tag_logits"], dtype=np.float32)
         except KeyError as exc:
@@ -139,7 +141,7 @@ class RAMPlusAdapter(PerceptionAdapter):
             raise RuntimeError("RAM++ logits contain non-finite values")
         return 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
 
-    def postprocess_batch(self, result: NamedTensorResult, *, score_threshold: float = 0.0):
+    def postprocess_batch(self, result: ModelResult, *, score_threshold: float = 0.0):
         scores = self._scores(result)
         thresholds = self.thresholds
         if score_threshold > 0.0:
@@ -153,7 +155,7 @@ class RAMPlusAdapter(PerceptionAdapter):
             output.append([RecognizedTag(str(self.labels[index]), float(row[index])) for index in indices])
         return output
 
-    def postprocess(self, result: NamedTensorResult, *, score_threshold: float = 0.0) -> list[RecognizedTag]:
+    def postprocess(self, result: ModelResult, *, score_threshold: float = 0.0) -> list[RecognizedTag]:
         values = self.postprocess_batch(result, score_threshold=score_threshold)
         if len(values) != 1:
             raise RuntimeError("RAM++ single-image postprocess received batched output")

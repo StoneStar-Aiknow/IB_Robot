@@ -11,7 +11,7 @@ import pytest
 from inference_service.h264_stream_recorder import H264StreamRecorder
 from inference_service.observation_sync import RtpTimestampMapper
 from inference_service.software_video_codec import SoftwareH264Decoder, SoftwareH264Encoder
-from inference_service.video_codec import EncodedPacket, VideoFrame
+from inference_service.video_codec import CodecLifecycleState, CodecMetrics, EncodedPacket, VideoDecoder, VideoFrame
 from inference_service.video_rtp import (
     H264Depacketizer,
     H264RtpReceiver,
@@ -46,6 +46,44 @@ class _MemoryDatagramSender:
 class _FailingDatagramSender(_MemoryDatagramSender):
     def sendto(self, _data: bytes, _endpoint: tuple[str, int]) -> int:
         raise OSError("network unavailable")
+
+
+class _OneFrameDelayedDecoder(VideoDecoder):
+    """Return each packet's frame on the next decode call."""
+
+    def __init__(self) -> None:
+        self._pending: EncodedPacket | None = None
+
+    @property
+    def state(self) -> CodecLifecycleState:
+        return CodecLifecycleState.RUNNING
+
+    @property
+    def metrics(self) -> CodecMetrics:
+        return CodecMetrics()
+
+    def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
+        output = self._pending
+        self._pending = packet
+        if output is None:
+            return []
+        return [
+            VideoFrame(
+                np.zeros((48, 64, 3), dtype=np.uint8),
+                output.capture_timestamp_ns,
+                output.capture_timestamp_ns,
+                64,
+                48,
+                "rgb24",
+                keyframe=output.keyframe,
+            )
+        ]
+
+    def reset(self) -> None:
+        self._pending = None
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        self._pending = None
 
 
 def test_rtp_packet_round_trip_validates_fixed_header_and_identity():
@@ -237,6 +275,45 @@ def test_software_rtp_interoperability_preserves_count_timestamps_and_quality():
         )
         < 3
     )
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_receiver_preserves_capture_timestamp_from_delayed_decoder_output():
+    datagrams, encoder, sender = _encoded_stream(frame_count=2, gop_frames=1)
+    receiver, buffer = _receiver(decoder=_OneFrameDelayedDecoder())
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    decoded = _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert len(decoded) == 1
+    assert decoded[0].capture_timestamp_ns == 1_000_000_000
+    assert buffer.history[0][0] == 1_000_000_000
+    assert receiver.status.state is StreamLifecycleState.READY
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_delayed_decoder_output_is_fresh_from_decode_availability():
+    datagrams, encoder, sender = _encoded_stream(frame_count=2, gop_frames=1)
+    decode_available_ns = 2_000_700_000
+    receiver, buffer = _receiver(decoder=_OneFrameDelayedDecoder(), clock=lambda: decode_available_ns)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    decoded = _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert len(decoded) == 1
+    assert decoded[0].capture_timestamp_ns == 1_000_000_000
+    assert decoded[0].receive_timestamp_ns == decode_available_ns
+    entry, issue = buffer.select_entry(1_000_000_000, now_ns=decode_available_ns + 400_000_000)
+    assert issue is None
+    assert entry is not None
+    assert entry[0] == 1_000_000_000
+    assert entry[1] == decode_available_ns
     encoder.close()
     sender.close()
     receiver.close()
@@ -480,7 +557,12 @@ def _sender(
 
 
 def _receiver(
-    *, packet_queue_capacity: int = 64, recorder=None, decode: bool = True
+    *,
+    packet_queue_capacity: int = 64,
+    recorder=None,
+    decode: bool = True,
+    decoder: VideoDecoder | None = None,
+    clock=None,
 ) -> tuple[H264RtpReceiver, StreamBuffer]:
     buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000, retention_ns=2_000_000_000)
     mapper = RtpTimestampMapper(
@@ -493,13 +575,14 @@ def _receiver(
             stream_id="top",
             observation_key="observation.images.top",
             ssrc=_SSRC,
-            decoder=SoftwareH264Decoder(),
+            decoder=decoder or SoftwareH264Decoder(),
             frame_buffer=buffer,
             timestamp_mapper=mapper,
             session_generation=1,
             packet_queue_capacity=packet_queue_capacity,
             recorder=recorder,
             decode=decode,
+            clock=clock,
         ),
         buffer,
     )

@@ -49,6 +49,12 @@ class StreamMetrics:
     decode_errors: int = 0
     errors: int = 0
     reconnect_count: int = 0
+    decoder_backlog_depth: int = 0
+    decoder_output_age_ns: int = 0
+    dropped_stale_decoder_frames: int = 0
+    metadata_fifo_depth: int = 0
+    decoder_input_frame_rate_hz: float = 0.0
+    decoder_output_frame_rate_hz: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +498,7 @@ class H264RtpReceiver:
         max_datagram_size: int = 65535,
         recorder: H264StreamRecorder | None = None,
         decode: bool = True,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         if not stream_id or not observation_key or session_generation < 1 or packet_queue_capacity <= 0:
             raise ValueError("RTP receiver requires stream identity, session, and positive queue capacity")
@@ -506,6 +513,7 @@ class H264RtpReceiver:
         self.selected_backend = selected_backend
         self._recorder = recorder
         self._decode = decode
+        self._clock = time.time_ns if clock is None else clock
         self._frame_count = 0
         self._recording_generation: int | None = None
         if max_datagram_size <= _RTP_HEADER.size:
@@ -692,19 +700,39 @@ class H264RtpReceiver:
             self._degrade("decode_failed", str(exc), decode_errors=1)
             return []
         received_frames = []
-        for frame in frames:
-            received_frame = replace(
-                frame, capture_timestamp_ns=capture_timestamp_ns, receive_timestamp_ns=receive_time_ns
-            )
-            self.frame_buffer.push(capture_timestamp_ns, received_frame, receive_time_ns=receive_time_ns)
-            received_frames.append(received_frame)
+        if frames:
+            decoded_receive_time_ns = self._clock()
+            for frame in frames:
+                received_frame = replace(
+                    frame,
+                    receive_timestamp_ns=decoded_receive_time_ns,
+                )
+                self.frame_buffer.push(
+                    received_frame.capture_timestamp_ns,
+                    received_frame,
+                    receive_time_ns=decoded_receive_time_ns,
+                )
+                received_frames.append(received_frame)
         with self._lock:
             if frames:
                 self._state = StreamLifecycleState.READY
                 self._last_error = ""
-            elif self._state is not StreamLifecycleState.DEGRADED:
+            elif self._state not in {StreamLifecycleState.READY, StreamLifecycleState.DEGRADED}:
+                # Pipelined hardware decoders may accept an access unit without
+                # producing its frame synchronously. Once a frame has made the
+                # stream ready, an empty drain is not a new keyframe boundary.
                 self._state = StreamLifecycleState.WAITING_FOR_KEYFRAME
             self._metrics = replace(self._metrics, decoded_frames=self._metrics.decoded_frames + len(frames))
+            decoder_metrics = self.decoder.metrics
+            self._metrics = replace(
+                self._metrics,
+                decoder_backlog_depth=decoder_metrics.decoder_backlog_depth,
+                decoder_output_age_ns=decoder_metrics.decoder_output_age_ns,
+                dropped_stale_decoder_frames=decoder_metrics.dropped_stale_decoder_frames,
+                metadata_fifo_depth=decoder_metrics.metadata_fifo_depth,
+                decoder_input_frame_rate_hz=decoder_metrics.input_frame_rate_hz,
+                decoder_output_frame_rate_hz=decoder_metrics.output_frame_rate_hz,
+            )
         return received_frames
 
     def reset(self, session_generation: int) -> None:

@@ -100,6 +100,12 @@ class InferencePipelineManager:
         self._require_started()
         return self._pipeline(pipeline_id).capabilities
 
+    def runtime_handle(self, pipeline_id: str):
+        """Return the migrated unified handle, if this pipeline has one."""
+
+        self._require_started()
+        return self._pipeline(pipeline_id).runtime_handle
+
     def health(self, pipeline_id: str) -> PipelineDiagnostics:
         self._require_started()
         return self._pipeline(pipeline_id).diagnostics()

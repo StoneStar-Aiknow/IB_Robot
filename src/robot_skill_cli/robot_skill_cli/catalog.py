@@ -238,6 +238,17 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         )
         delegated[descriptor.name] = descriptor
 
+    hri_runtime = embodied.get("imitate_human_motion", {})
+    if isinstance(hri_runtime, dict) and hri_runtime.get("enabled", False):
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="imitate_human_motion",
+                endpoint_name=hri_runtime.get("action_name", "/hri/imitate_human_motion"),
+                configuration={"implementation": "mock_v1"},
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
     semantic_mapping = robot_config.get("semantic_mapping", {})
     if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
         interfaces = semantic_mapping.get("interfaces", {})

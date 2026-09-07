@@ -103,7 +103,7 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
         )
     ]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "uuid": bundle_uuid,
             "revision": 1,
@@ -116,8 +116,9 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
             },
         },
         "model": {
-            "kind": "generic",
-            "family": "zipvoice",
+            "interface": "tensor_model",
+            "model_type": "zipvoice",
+            "operation": "synthesize",
             "inputs": model_inputs,
             "outputs": [{"semantic": "tts.audio", "dtype": "float32", "shape": [-1]}],
             "semantic_identity": {
@@ -130,8 +131,23 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
             "ascend_310p": {
                 "uuid": deployment_uuid,
                 "revision": 1,
-                "backend": "ascend",
-                "target": {"soc": "Ascend310P1", "runtime": "acl-8.1.RC1"},
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "iterative",
+                    "orchestration_visibility": "session",
+                    "cancellation_granularity": "checkpoint",
+                },
+                "runtime_profile": {
+                    "backend": "ascend",
+                    "target": {
+                        "soc": "Ascend310P1",
+                        "runtime": "acl",
+                        "runtime_abi": "cann-8.1.RC1",
+                    },
+                    "profile": {
+                        "device_id": 0,
+                    },
+                },
                 "artifacts": {
                     "text_encoder": {
                         "path": "artifacts/ascend/ascend_310p/text_encoder_t256_p29_f3072.om",

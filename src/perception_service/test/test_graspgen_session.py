@@ -31,10 +31,11 @@ from conftest import (
     package_graspgen_export,
 )
 
-from inference_manifest import GRASPGEN_EXECUTION, load_inference_manifest
+from inference_manifest import load_inference_manifest
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.types import RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest
+from model_utils.graspgen_contract import GRASPGEN_EXECUTION
 from perception_service.graspgen_adapter import GraspGenAdapter
 from perception_service.graspgen_session import GraspGenAscendSession
 
@@ -58,7 +59,10 @@ def _points(count: int = _POINT_COUNT) -> np.ndarray:
 
 
 def _infer(session: GraspGenAscendSession):
-    return session.infer(NamedTensorRequest("grasp-1", {"observation.object_points": _points()}))
+    return session.execute(
+        ModelRequest({"observation.object_points": _points()}),
+        ExecutionContext("grasp-1"),
+    )
 
 
 def test_the_session_publishes_only_the_two_declared_service_outputs(graspgen_bundle, fake_acl):
@@ -66,10 +70,10 @@ def test_the_session_publishes_only_the_two_declared_service_outputs(graspgen_bu
 
     result = _infer(session)
 
-    assert set(result.outputs) == {"grasp.poses", "grasp.confidence"}
-    assert result.outputs["grasp.poses"].shape == (GRASPGEN_BATCH, 4, 4)
-    assert result.outputs["grasp.confidence"].shape == (GRASPGEN_BATCH,)
-    assert not [name for name in result.outputs if name.startswith(("host.", "internal."))]
+    assert set(result) == {"grasp.poses", "grasp.confidence"}
+    assert result["grasp.poses"].shape == (GRASPGEN_BATCH, 4, 4)
+    assert result["grasp.confidence"].shape == (GRASPGEN_BATCH,)
+    assert not [name for name in result if name.startswith(("host.", "internal."))]
     session.close()
 
 
@@ -126,13 +130,13 @@ def test_the_denoiser_walks_its_timesteps_down_to_zero(graspgen_bundle, fake_acl
 
 def test_a_seeded_session_denoises_reproducibly(graspgen_bundle, fake_acl):
     first, _ = _session(graspgen_bundle, fake_acl, random_seed=7)
-    poses = _infer(first).outputs["grasp.poses"]
+    poses = _infer(first)["grasp.poses"]
     first.close()
 
     FakeAclModel.instances = {}
     FakeAclModel.order = []
     second, _ = _session(graspgen_bundle, fake_acl, random_seed=7)
-    repeat = _infer(second).outputs["grasp.poses"]
+    repeat = _infer(second)["grasp.poses"]
     second.close()
 
     np.testing.assert_array_equal(poses, repeat)
@@ -142,7 +146,7 @@ def test_the_grasp_poses_are_valid_rigid_transforms(graspgen_bundle, fake_acl):
     """``rt_to_matrix`` is the only producer of ``grasp.poses``; nothing else validates it."""
     session, _ = _session(graspgen_bundle, fake_acl, random_seed=0)
 
-    poses = _infer(session).outputs["grasp.poses"]
+    poses = _infer(session)["grasp.poses"]
 
     rotations = poses[:, :3, :3]
     identity = np.einsum("nij,nkj->nik", rotations, rotations)

@@ -12,6 +12,10 @@
 #   USE_SUDO           — "true" or "false"
 #   SETUP_ROS_SETUP_PATH — path to ROS 2 setup script (e.g. /opt/ros/humble/setup.bash)
 #
+# Optional variables (default to the full-workspace behavior when unset):
+#   SETUP_PROFILE       — "full" (default) or "inference"; gates checks whose
+#                         dependencies are outside the inference profile scope
+#
 # Colors (imported from setup.sh context):
 #   RED, GREEN, YELLOW, NC, log_info, log_warn, log_error, log_done
 #
@@ -157,6 +161,14 @@ verify_openeuler_yaml_cpp_abi() {
 verify_tracing() {
     local venv_python="${VENV_PYTHON}"
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
+
+    # Tracing packages (lttng-ust, babeltrace2, tracetools_analysis) are pulled
+    # in via robot_config's rosdep keys, which the inference profile does not
+    # install; tracing is a full-workspace diagnostics feature.
+    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
+        log_info "Skipping tracing verification (inference profile)."
+        return 0
+    fi
 
     log_info "Verifying tracing tools..."
 

@@ -30,9 +30,21 @@ def manifest_validator() -> Validator:
 
 def validate_manifest_schema(value: Any, source: str) -> None:
     errors = sorted(manifest_validator().iter_errors(value), key=lambda error: list(error.absolute_path))
-    if not errors:
-        return
-    raise ManifestValidationError(_format_schema_error(_most_specific_error(errors[0]), source))
+    if errors:
+        raise ManifestValidationError(_format_schema_error(_most_specific_error(errors[0]), source))
+
+    # JSON Schema expresses the v3 shape and closed object boundaries.  The
+    # typed model performs the cross-field rules (contract combinations,
+    # profile/backend pairing, logical state-link safety, and composite role
+    # matching) before a caller can proceed to runtime construction.
+    from pydantic import ValidationError as PydanticValidationError
+
+    from inference_manifest.models import InferenceManifest
+
+    try:
+        InferenceManifest.model_validate_json(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (PydanticValidationError, ValueError) as exc:
+        raise ManifestValidationError(f"Typed manifest validation failed for {source}: {exc}") from exc
 
 
 def _most_specific_error(error: ValidationError) -> ValidationError:

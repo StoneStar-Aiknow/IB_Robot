@@ -1,7 +1,8 @@
 # manipulation_execution
 
-`manipulation_execution` 是抓取能力的闭环执行层。它把一次 `PickObject` action 请求编排为
-GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证。
+`manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
+GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
+`ImitateHumanMotion` 则提供不含 RGB-D/人体算法的最小 delegated Mock 生命周期。
 
 `PickObject` 是 delegated action：goal 必须携带 `dispatch_binding`（`DispatchBinding`，含同一 root 的
 共享 `task_budget` 和 exact registry identity）以及 `expected_executor`（`DelegatedExecutorIdentity`）；
@@ -72,6 +73,7 @@ Gateway 自行构造 delegated `PickObject` 请求。
 | `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 对外技能入口；放置使用 `place_in_container`、`target_name` 和 `container_name` |
 | `/manipulation/execute_pick` | `ibrobot_msgs/action/PickObject` | Gateway 内部 delegated 抓取执行，不是外部入口 |
 | `/manipulation/execute_place` | `ibrobot_msgs/action/PlaceObject` | Gateway 内部固定位置释放与视觉确认，不是外部入口 |
+| `/hri/imitate_human_motion` | `ibrobot_msgs/action/ImitateHumanMotion` | Gateway 内部 HRI 模拟执行，不是外部入口 |
 
 goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、exact registry identity）、
 `target_query`、`timeout_sec`、`expected_executor` 和仅供 supervised bring-up 的 `supervised_direct`。
@@ -96,7 +98,11 @@ catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求
 
 ## 配置
 
-所有运行参数来自 robot YAML 的 `robot.grasp_execution`。关键配置包括：
+HRI 模拟执行由 `robot.embodied.imitate_human_motion` 启用。关节顺序来自 `robot.joints.arm`，
+prepare 起点来自 `robot.ros2_control.reset_positions`，限位来自
+`robot.teleoperation.safety.joint_limits`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
+
+所有抓取运行参数来自 robot YAML 的 `robot.grasp_execution`。关键配置包括：
 
 - GraspGen、验证器、IK/FK 服务名。
 - 相机 topic 和 base/EE frame。
@@ -158,6 +164,12 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
 模型 identity 缺失、manifest 不可用或两端不一致时 fail closed，不接受抓取 goal。
 
 ## 安全边界
+
+- `ImitateHumanMotion` 只接受 Gateway delegated binding 和匹配的 executor identity；goal timeout 必须为正且
+  不超过共享 task budget 的剩余时间。
+- Mock prepare/play/reset 都通过 `/embodied/execute_primitive`；若 primitive 取消或终态无法确认，runtime
+  返回 `CANCEL_CLEANUP_TIMEOUT`、保持 pose state 为 unknown，并且不继续发送 reset，避免重叠运动。
+- 正常、已确认失败或已确认取消后使用 `move_to_named_pose(home)` 恢复；下一次任务仍从 prepare 开始。
 
 - goal acceptance 先比对 `expected_executor` 与本节点实际 `DelegatedExecutorIdentity`，不匹配直接
   reject；再校验 `dispatch_binding`：`schema_version=1`、非空 `task_id`/`root_task_id`、完整期望

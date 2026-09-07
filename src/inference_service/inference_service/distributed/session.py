@@ -21,6 +21,7 @@ from .types import (
     PipelineStatus,
     StreamReference,
     StructuredError,
+    UnsupportedDistributedRuntimeError,
     identity_error,
 )
 
@@ -44,7 +45,16 @@ class SessionUpdate:
 class EdgeSession:
     """Own the edge view of one revocable cloud handshake session."""
 
-    def __init__(self, identity: PipelineIdentity, *, heartbeat_timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        identity: PipelineIdentity,
+        *,
+        heartbeat_timeout: float = 2.0,
+        runtime_interface: str = "policy",
+        runtime_model_type: str = "",
+    ) -> None:
+        if runtime_interface != "policy":
+            raise UnsupportedDistributedRuntimeError(runtime_interface, runtime_model_type)
         if heartbeat_timeout <= 0:
             raise ValueError("heartbeat_timeout must be positive")
         self.identity = identity
@@ -419,7 +429,11 @@ class CloudSession:
         identity: PipelineIdentity,
         *,
         request_stream_validator: Callable[[tuple[StreamReference, ...]], None] | None = None,
+        runtime_interface: str = "policy",
+        runtime_model_type: str = "",
     ) -> None:
+        if runtime_interface != "policy":
+            raise UnsupportedDistributedRuntimeError(runtime_interface, runtime_model_type)
         self.identity = identity
         self._request_stream_validator = request_stream_validator
         self._lock = threading.RLock()

@@ -12,8 +12,10 @@ import torch
 from torch import Tensor
 
 from inference_manifest import PolicyMetadata, load_inference_manifest
-from inference_service.backends import BACKEND_REGISTRY, BackendCapabilities, BackendRegistry, InferenceRequest
+from inference_service.backends import BackendCapabilities, BackendRegistry, InferenceRequest
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
+from inference_service.runtime_composition import require_runtime_dependencies
+from inference_service.unified_runtime import ModelRuntimeHandle, RegistrySet, RuntimeProviders
 
 
 def resolve_device(device: str = "auto") -> torch.device:
@@ -99,11 +101,19 @@ class PureInferenceEngine:
         default_task: str | None = None,
         runtime_options: Mapping[str, object] | None = None,
         priority_scheduling: bool = False,
-        registry: BackendRegistry = BACKEND_REGISTRY,
+        registry: BackendRegistry | None = None,
+        registry_set: RegistrySet | None = None,
+        providers: RuntimeProviders | None = None,
         model_session_factory=None,
         pi05_diagnostic_schedule=None,
         pi05_diagnostic_schedule_source: str | None = None,
     ) -> None:
+        registry_set, providers = require_runtime_dependencies(
+            registry_set,
+            providers,
+            owner=type(self).__name__,
+        )
+        self._providers = providers
         validated_manifest = load_inference_manifest(model_path, deployment)
         self._pipeline_id = pipeline_id
         self._context = validated_manifest
@@ -116,6 +126,8 @@ class PureInferenceEngine:
             runtime_options=runtime_options,
             priority_scheduling=priority_scheduling,
             registry=registry,
+            registry_set=registry_set,
+            providers=providers,
             model_session_factory=model_session_factory,
             pi05_diagnostic_schedule=pi05_diagnostic_schedule,
             pi05_diagnostic_schedule_source=pi05_diagnostic_schedule_source,
@@ -168,6 +180,12 @@ class PureInferenceEngine:
     @property
     def capabilities(self) -> BackendCapabilities:
         return self._manager.capabilities(self._pipeline_id)
+
+    @property
+    def runtime_handle(self) -> ModelRuntimeHandle | None:
+        """Expose the unified handle for diagnostics and controlled recovery."""
+
+        return self._manager.runtime_handle(self._pipeline_id)
 
     @property
     def policy_metadata(self) -> PolicyMetadata:

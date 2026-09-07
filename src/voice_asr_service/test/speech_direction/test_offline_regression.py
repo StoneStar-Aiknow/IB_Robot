@@ -105,12 +105,15 @@ def _build_pipeline():
     # Ubuntu 仅替换模型执行后端，算法编排和 256/512/4096/512 时序不变。
     cfg.fullnet.backend = "stateful_torch_cuda"
     cfg.fullnet.device = "cuda"
-    cfg.fullnet.ckpt = str(_SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar")
+    cfg.fullnet.ckpt = str(
+        _SRC.parents[1] / "models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+    )
     cfg.fullnet.stateful_manifest_path = str(
-        _SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+        _SRC.parents[1]
+        / "models/voice_asr/artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
     )
     cfg.vad.backend = "onnx"
-    cfg.vad.model_path = str(_SRC.parents[1] / "models/voice_asr/silero-vad/silero_vad.onnx")
+    cfg.vad.model_path = str(_SRC.parents[1] / "models/voice_asr/artifacts/torch/silero-vad/silero_vad.onnx")
     if not __import__("torch").cuda.is_available():
         pytest.skip("Ubuntu 主流程回归要求 CUDA，不允许静默回退 CPU")
 
@@ -176,7 +179,7 @@ def _build_pipeline():
         vad_threshold=cfg.gray_region.vad_threshold,
         rms_threshold=cfg.gray_region.rms_threshold,
     )
-    runtime = SpeechDirectionRuntime(cfg, pipeline, enable_capture=False)
+    runtime = SpeechDirectionRuntime(cfg, pipeline, offline=True)
     return runtime, pipeline
 
 
@@ -225,7 +228,7 @@ class TestOfflineRegression:
             pytest.skip(f"音频不存在: {wav_path}")
 
         # 重置 pipeline 状态(每个文件独立测,丢弃上个文件残留)
-        runtime.pipeline.reset()
+        runtime.reset()
         runtime.doa_state._angle = None
         runtime.doa_state._wall_clock_ts = 0.0
         runtime.doa_state._seq_id = 0

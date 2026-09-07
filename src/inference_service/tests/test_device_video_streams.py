@@ -198,6 +198,7 @@ def test_device_stream_manager_sends_raw_uint8_frames_independent_of_requests():
     assert status.timestamp_mapping_valid
     assert status.keyframe_ready
     assert status.mapping_capture_timestamp_ns == 2_000_000
+    assert manager.latest_sent_mapping("observation.images.top") == (2_000, 2_000_000)
 
 
 def test_device_stream_manager_descriptors_and_reset_are_session_scoped():

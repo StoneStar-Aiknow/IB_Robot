@@ -9,9 +9,9 @@
 自检与兼容入口,不再代表生产资产清单。
 
 生产资产(均不入库,放 models/ 下,通过 python3 scripts/verify_speech_direction_assets.py 校验):
-   1. Silero VAD OM/ONNX — 310P raw_acl 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
-   2. FullSubNet cumulative ckpt — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
-   3. stateful FB/SB 拆分 OM + manifest(310P raw_acl 专用,由 HF 脚本拉取)
+   1. Silero VAD OM/ONNX — 310P Ascend ACL 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
+   2. FullSubNet cumulative ckpt — models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
+   3. stateful FB/SB 拆分 OM + manifest(310P Ascend ACL 专用,由 HF 脚本拉取)
 
 FullSubNet 源码(model.py + audio_zen)已打包为 ibrobot-fullsubnet wheel,
 通过 scripts/setup.sh 安装到 venv;不再需要 git clone 上游源码仓到 models/ 下。
@@ -30,10 +30,10 @@ _WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_MODELS_ROOT = _WORKSPACE_ROOT / "models"
 
 # Silero VAD(与 voice_asr_service 共用目录);310P 用 OM,Ubuntu 用 ONNX,具体文件名由 yaml 指定。
-SILERO_VAD_REL = "voice_asr/silero-vad/silero_vad.onnx"
+SILERO_VAD_REL = "voice_asr/artifacts/torch/silero-vad/silero_vad.onnx"
 
 # FullSubNet cumulative ckpt(218epochs,两平台共用同一权重)
-FULLSUBNET_CKPT_REL = "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+FULLSUBNET_CKPT_REL = "voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
 
 
 @dataclass(frozen=True)
@@ -105,26 +105,30 @@ def require_configured_models(
     silero_vad_path: str | Path,
     fullsubnet_ckpt_path: str | Path,
     *,
-    silero_backend: str = "om",
-    fullsubnet_backend: str = "om",
-    fullsubnet_om_path: str | Path = "",
+    silero_backend: str = "onnx",
+    fullsubnet_backend: str = "torch",
     fullsubnet_stateful_fb_om_path: str | Path = "",
     fullsubnet_stateful_sb_om_path: str | Path = "",
     fullsubnet_stateful_manifest_path: str | Path = "",
 ) -> None:
     """校验 ROS 参数指定的模型资产路径。
 
-    om 后端(默认,310P1 部署形态):
+    ascend 后端(310P1 部署形态):
       - silero 校验 silero_vad_path 指向的 .om 文件
-      - fullsubnet 校验 fullsubnet_om_path 指向的 .om 文件(ckpt 可省)
+      - fullsubnet 校验 FB/SB/manifest 三件套
     torch/onnx 后端(回归基线):
       - 校验 silero .onnx、fullsubnet ckpt;Model 类由 ibrobot-fullsubnet wheel 提供
     """
     assets: list[ModelAsset] = []
 
-    # Silero VAD:raw_acl/兼容om校验 .om，onnx 校验 .onnx。
+    if silero_backend not in {"ascend", "onnx"}:
+        raise ValueError(f"不支持的 Silero VAD backend: {silero_backend}")
+    if fullsubnet_backend not in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
+        raise ValueError(f"不支持的 FullSubNet backend: {fullsubnet_backend}")
+
+    # Silero VAD: Ascend ACL 校验 .om，onnx 校验 .onnx。
     silero_path = Path(silero_vad_path)
-    if silero_backend in {"om", "raw_acl"}:
+    if silero_backend == "ascend":
         assets.append(
             ModelAsset(
                 name="Silero VAD om",
@@ -141,26 +145,16 @@ def require_configured_models(
             )
         )
 
-    # FullSubNet:raw ACL 校验 FB/SB/manifest；stateful Torch 校验 ckpt/manifest。
-    if fullsubnet_backend in {"stateful_om", "stateful_raw_acl"}:
+    # FullSubNet: Ascend ACL 校验 FB/SB/manifest；stateful Torch 校验 ckpt/manifest。
+    if fullsubnet_backend == "ascend":
         for name, path, purpose in (
-            ("FullSubNet cumulative FB stateful om", fullsubnet_stateful_fb_om_path, "FB stateful推理"),
-            ("FullSubNet cumulative SB stateful om", fullsubnet_stateful_sb_om_path, "SB stateful推理"),
+            ("FullSubNet cumulative FB Ascend artifact", fullsubnet_stateful_fb_om_path, "FB stateful推理"),
+            ("FullSubNet cumulative SB Ascend artifact", fullsubnet_stateful_sb_om_path, "SB stateful推理"),
             ("FullSubNet cumulative manifest", fullsubnet_stateful_manifest_path, "checkpoint/norm契约校验"),
         ):
             if not path:
-                raise ValueError(f"fullsubnet stateful raw ACL 后端未提供{name}")
+                raise ValueError(f"fullsubnet Ascend ACL 后端未提供{name}")
             assets.append(ModelAsset(name=name, path=Path(path), required_for=purpose))
-    elif fullsubnet_backend in {"om", "legacy_om"}:
-        if not fullsubnet_om_path:
-            raise ValueError("fullsubnet_backend=om 但未提供 fullsubnet_om_path")
-        assets.append(
-            ModelAsset(
-                name="FullSubNet om",
-                path=Path(fullsubnet_om_path),
-                required_for="语音增强(FullSubNet om 推理,NPU)",
-            )
-        )
     else:
         # stateful Torch 与 legacy Torch 校验 ckpt;Model 类来自 wheel 包。
         assets.append(
@@ -170,7 +164,7 @@ def require_configured_models(
                 required_for="语音增强(模型权重)",
             )
         )
-        if fullsubnet_backend in {"stateful_torch", "stateful_torch_cuda", "stateful_torch_cpu"}:
+        if fullsubnet_backend in {"stateful_torch_cuda", "stateful_torch_cpu"}:
             if not fullsubnet_stateful_manifest_path:
                 raise ValueError("stateful Torch 后端未提供 cumulative manifest")
             assets.append(

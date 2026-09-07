@@ -72,5 +72,5 @@ docker run --rm --device nvidia.com/gpu=all --ipc=host \
             --output-dir /workspace/${WORK_REL}/outputs/xh2 \
             --deployment hmm \
             --target-soc lq50 \
-            --target-runtime tcim-lite
+            --target-runtime tcim
     "

@@ -1,4 +1,4 @@
-"""Package audited Ascend perception OM candidates as schema-v2 bundles."""
+"""Package audited Ascend perception OM candidates as schema-v3 bundles."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from inference_manifest import (
     ArtifactBindings,
+    AscendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
     DeploymentArtifact,
@@ -19,9 +20,11 @@ from inference_manifest import (
     DeviceLink,
     Digest,
     EmbeddingMetadata,
+    ExecutionContract,
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
     TensorBinding,
@@ -50,7 +53,7 @@ class DeploymentSpec:
 @dataclass(frozen=True)
 class BundleSpec:
     name: str
-    family: str
+    model_type: str
     inputs: tuple[SemanticTensor, ...]
     outputs: tuple[SemanticTensor, ...]
     preprocessing: str
@@ -81,6 +84,14 @@ def _binding(
         dtype=dtype,
         shape=shape,
         layout=layout,
+    )
+
+
+def _request_contract() -> ExecutionContract:
+    return ExecutionContract(
+        state_scope="request",
+        execution_structure="direct",
+        cancellation_granularity="request_boundary",
     )
 
 
@@ -387,8 +398,11 @@ def _grounding_dino_deployment() -> DeploymentSpec:
 def _specs() -> dict[str, BundleSpec]:
     return {
         "sam2": BundleSpec(
-            name="sam2_hiera_tiny_ascend",
-            family="sam2",
+            # This is the box-prompt deployment of the same SAM2.1 model
+            # family. Its bundle stays separate because v3 operation identity
+            # is bundle-level, not deployment-level.
+            name="sam2.1_hiera_tiny_prompt_ascend",
+            model_type="sam2",
             operation="prompt",
             inputs=(
                 _semantic("image", "float32", (1, 3, 1024, 1024), "NCHW"),
@@ -411,7 +425,8 @@ def _specs() -> dict[str, BundleSpec]:
         ),
         "siglip2": BundleSpec(
             name="siglip2_so400m_patch14_384_ascend",
-            family="siglip2",
+            model_type="siglip2",
+            operation="encode",
             inputs=(
                 _semantic("masked_images", "float32", (-1, 3, 384, 384), "NCHW"),
                 _semantic("text_tokens", "int64", (-1, 64)),
@@ -464,8 +479,8 @@ def _specs() -> dict[str, BundleSpec]:
         ),
         "grounding_dino": BundleSpec(
             name="grounding_dino_swint_seq8_1280x720_ascend",
-            family="grounding_dino",
-            operation="raw",
+            model_type="grounding_dino",
+            operation="detect",
             inputs=(
                 _semantic("image", "float32", (1, 3, 720, 1280), "NCHW"),
                 _semantic("input_ids", "int64", (1, 8)),
@@ -533,12 +548,12 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     adapter = root / "assets/adapter.json"
     adapter.parent.mkdir(parents=True, exist_ok=True)
     adapter_identity = {
-        "family": spec.family,
+        "interface": "tensor_model",
+        "model_type": spec.model_type,
+        "operation": spec.operation or "infer",
         "preprocessing": spec.preprocessing,
         "postprocessing": spec.postprocessing,
     }
-    if spec.operation:
-        adapter_identity["operation"] = spec.operation
     adapter.write_text(
         json.dumps(
             adapter_identity,
@@ -582,13 +597,13 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     )
 
     model = ModelDescriptor(
-        kind="perception",
-        family=spec.family,
-        operation=spec.operation,
+        interface="tensor_model",
+        model_type=spec.model_type,
+        operation=spec.operation or "infer",
         inputs=spec.inputs,
         outputs=spec.outputs,
         semantic_identity=SemanticIdentity(
-            logical_model_revision=spec.logical_model_revision or f"{spec.family}@v1",
+            logical_model_revision=spec.logical_model_revision or f"{spec.model_type}@v1",
             preprocessing_contract=spec.preprocessing,
             output_semantics=spec.postprocessing,
             embedding=spec.embedding,
@@ -606,8 +621,12 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     for deployment in available:
         previous = existing.deployments.get(deployment.name) if existing else None
         value = CompiledDeployment(
-            backend="ascend",
-            target=DeploymentTarget(soc=deployment.soc, runtime="acl"),
+            execution_contract=_request_contract(),
+            runtime_profile=RoleRuntimeProfile(
+                backend="ascend",
+                target=DeploymentTarget(soc=deployment.soc, runtime="acl"),
+                profile=AscendRuntimeProfile(device_id=0),
+            ),
             artifacts={
                 artifact.role: DeploymentArtifact(path=artifact.destination, format="om")
                 for artifact in deployment.artifacts
@@ -633,7 +652,7 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
         deployments[deployment.name] = value
 
     manifest = InferenceManifest(
-        schema_version=2,
+        schema_version=3,
         bundle=ManifestBundle(
             uuid=bundle_uuid,
             revision=bundle_revision,
@@ -657,10 +676,10 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models-root", type=Path, required=True)
-    parser.add_argument("--family", choices=tuple(_specs()) + ("all",), default="all")
+    parser.add_argument("--model-type", choices=tuple(_specs()) + ("all",), default="all")
     args = parser.parse_args()
     specs = _specs()
-    selected = specs if args.family == "all" else {args.family: specs[args.family]}
+    selected = specs if args.model_type == "all" else {args.model_type: specs[args.model_type]}
     for spec in selected.values():
         print(package_bundle(args.models_root, spec))
     return 0
