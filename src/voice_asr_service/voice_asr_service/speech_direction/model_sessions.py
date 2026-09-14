@@ -15,17 +15,27 @@ from inference_service.unified_runtime import ExecutionContext, ModelRequest
 class SpeechDirectionRoleRunner:
     """Protocol adapter retained for the Host FullSubNet and VAD layers."""
 
-    def __init__(self, session: ModelSession, context: RuntimeContext, *, owns_session: bool = False) -> None:
+    def __init__(
+        self,
+        session: ModelSession,
+        context: RuntimeContext,
+        *,
+        owns_session: bool = False,
+    ) -> None:
         self.session = session
         self.context = context
-        self.backend = "ascend"
+        self.backend = getattr(context, "backend", "ascend") if context is not None else "ascend"
         self._owns_session = bool(owns_session)
         self._request_counter = 0
         self._execution_context: ExecutionContext | None = None
 
     @property
     def last_timing_ms(self) -> dict[str, float]:
-        return {}
+        # Forward the underlying session's per-request timing (e.g. the Torch
+        # FullSubNet session's fb/sb hop latencies) to host consumers; sessions
+        # without timing support yield an empty mapping.
+        timing = getattr(self.session, "last_timing_ms", None)
+        return dict(timing) if isinstance(timing, dict) else {}
 
     def _invoke(self, role: str, values: Mapping[str, object]) -> Mapping[str, object]:
         if self._execution_context is not None:
@@ -60,7 +70,19 @@ class SpeechDirectionRoleRunner:
         return np.asarray(output["host.fullsubnet.sb_mask"], dtype=np.float32)
 
     def infer(self, audio: np.ndarray) -> float:
-        output = self._invoke("silero_vad", {"host.silero.audio": np.ascontiguousarray(audio)})
+        values: dict[str, object] = {"host.silero.audio": np.ascontiguousarray(audio)}
+        # Only supply inputs the deployment actually declares: ONNX deployments
+        # bind host.silero.sample_rate (sourced from the audio contract), while
+        # Ascend OM deployments fold the sample rate into the graph and reject
+        # unexpected semantics at validation time.
+        deployment = getattr(self.context, "deployment", None) if self.context is not None else None
+        bindings = getattr(deployment, "bindings", {}).get("silero_vad") if deployment is not None else None
+        declared = {binding.semantic for binding in bindings.inputs} if bindings is not None else set()
+        if "host.silero.sample_rate" in declared:
+            contract = getattr(deployment, "audio_contract", None)
+            if contract is not None and contract.sample_rate_hz is not None:
+                values["host.silero.sample_rate"] = np.asarray(contract.sample_rate_hz, dtype=np.int64)
+        output = self._invoke("silero_vad", values)
         return float(np.asarray(output["host.silero.prob"]).reshape(-1)[0])
 
     inference = infer

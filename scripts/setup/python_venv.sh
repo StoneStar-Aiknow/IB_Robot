@@ -75,7 +75,7 @@ if version not in spec:
 
 install_lerobot_editable() {
     local pip_runner=("$@")
-    
+
     if ! check_lerobot_python_compat; then
         log_error "Cannot install lerobot: Python version is incompatible."
         log_error "Ensure patches 0001/0002 from scripts/setup/lerobot_patches.sh are applied"
@@ -94,16 +94,28 @@ install_lerobot_editable() {
     # so101_hardware already provides the Python feetech-servo-sdk via its
     # setup.py install_requires, and the C++ ftservo_sdk is built by
     # so101_hardware's CMake for the ros2_control node — neither should be
-    # re-installed via pip here. See libs/lerobot/pyproject.toml.
-    #
-    # The inference profile keeps diffusion/dataset (policy inference and
-    # video decoding for the streamed observation path) but drops kinematics,
-    # which only serves teleop.
-    local lerobot_extras="smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep"
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        lerobot_extras="smolvla,pi,diffusion,dataset,deepdiff-dep"
+    # re-installed via pip here. See libs/lerobot/pyproject.toml. LIBERO is
+    # Ubuntu-only and opt-in. Remove the legacy editable ``libero``
+    # distribution before installing hf-libero so the two providers never
+    # coexist under the same top-level Python package.
+    local lerobot_extras=(smolvla pi diffusion dataset deepdiff-dep)
+    if [[ "${SETUP_PROFILE:-full}" != "inference" ]]; then
+        lerobot_extras+=(kinematics)
     fi
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[${lerobot_extras}]"
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID:-unknown}" == "ubuntu-22.04" ]]; then
+        log_info "Removing the legacy libs/libero editable provider, if installed..."
+        "${pip_runner[@]}" uninstall -y libero >/dev/null 2>&1 || true
+        lerobot_extras+=(libero)
+        log_info "Enabling the local LeRobot libero extra for Ubuntu benchmark setup."
+    fi
+
+    local lerobot_extras_csv
+    lerobot_extras_csv="$(IFS=,; printf '%s' "${lerobot_extras[*]}")"
+    local constraint_args=()
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && -n "${BENCHMARK_PIP_CONSTRAINTS:-}" ]]; then
+        constraint_args+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
+    fi
+    "${pip_runner[@]}" install "${constraint_args[@]}" -e "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
 }
 
 install_graspgen_torch_abi() {
@@ -154,14 +166,17 @@ setup_python_venv() {
     # 0. Python interpreter preflight
     local host_python_path host_python_version host_py_major host_py_minor
     host_python_path="$(command -v python3 || true)"
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        host_python_path="${SETUP_BOOTSTRAP_PYTHON_BIN:-${host_python_path}}"
+    fi
     if [[ -z "${host_python_path}" ]]; then
-        log_error "python3 not found on PATH. Install python3 (>=3.10) before running setup.sh."
+        log_error "No bootstrap Python was selected. Install a platform-supported Python before running setup.sh."
         exit 1
     fi
-    host_python_version="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")"
-    log_info "Using host python3: ${host_python_path} (version ${host_python_version})"
-    host_py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
-    host_py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
+    host_python_version="$(${host_python_path} -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")"
+    log_info "Using setup bootstrap Python: ${host_python_path} (version ${host_python_version})"
+    host_py_major="$(${host_python_path} -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
+    host_py_minor="$(${host_python_path} -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
     if (( host_py_major < 3 )) || { (( host_py_major == 3 )) && (( host_py_minor < 10 )); }; then
         log_error "Python ${host_python_version} is too old. setup.sh requires Python >= 3.10."
         log_error "On openEuler: 'sudo dnf install -y python3.10 python3.10-devel' and re-run."
@@ -197,8 +212,25 @@ setup_python_venv() {
         exit 1
     fi
 
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        local bootstrap_python_mm venv_python_mm
+        bootstrap_python_mm="$(${host_python_path} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        venv_python_mm="$(${VENV_PYTHON} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [[ "${venv_python_mm}" != "${bootstrap_python_mm}" ]]; then
+            log_error "Existing workspace venv uses Python ${venv_python_mm}, but Benchmark setup requires Python ${bootstrap_python_mm}."
+            log_error "Remove ${venv_path} and rerun setup; setup will not mutate a foreign-ABI venv in place."
+            exit 1
+        fi
+    fi
+
     local pip_install=("${VENV_PYTHON}" -m pip install)
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
+    local ros_abi_pin_packages=("numpy==1.26.4" "opencv-python-headless<4.12")
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
+        # hf-libero requires the GUI OpenCV distribution. Keep both wheels on
+        # the same NumPy-1-compatible line in benchmark environments.
+        ros_abi_pin_packages+=("opencv-python<4.12")
+    fi
 
     # Upgrade pip
     run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
@@ -223,7 +255,14 @@ setup_python_venv() {
         ensure_lerobot_patch_stack_applied
     fi
 
-    install_graspgen_torch_abi
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
+        benchmark_prepare_torch_profile "${VENV_PYTHON}" "${venv_path}/benchmark_torch_constraints.txt"
+        # Protect the validated Torch/TorchVision/TorchCodec ABI during every
+        # subsequent dependency install, not only the LeRobot editable step.
+        pip_install+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
+    else
+        install_graspgen_torch_abi
+    fi
 
     # Install LeRobot in editable mode
     # Note: Do not pass the -c numpy==1.26.4 constraint. The lerobot dependency graph
@@ -346,15 +385,18 @@ PY
     # Only install the headless OpenCV wheel by default; keep opencv-python in
     # the constraints file below so optional dependencies cannot pull 4.12+ and
     # force NumPy 2.x back into the ROS environment.
-    log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python-headless<4.12" --quiet
+    log_info "Pinning NumPy/OpenCV to the ROS 2 Humble ABI-compatible versions..."
+    run_cmd "${pip_install[@]}" --force-reinstall "${ros_abi_pin_packages[@]}" --quiet
+    benchmark_install_runtime_abi "${VENV_PYTHON}" -m pip install
 
     cat > "${ros_abi_constraints}" <<'EOF'
 numpy==1.26.4
 opencv-python<4.12
 opencv-python-headless<4.12
 EOF
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        cat "${BENCHMARK_PIP_CONSTRAINTS}" >> "${ros_abi_constraints}"
+    fi
 
     # Install the ZipVoice frontend after creating the ROS ABI constraints.
     # Vocos itself is maintained in voice_tts_service.vocos_backend because
@@ -423,6 +465,8 @@ EOF
     # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping grasp dependencies (inference profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping GraspGen/manipulation dependencies for Benchmark-only setup."
     elif [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
     else
@@ -444,11 +488,41 @@ EOF
         log_info "Skipping optional speech_direction report dependencies. Re-run setup with --with-diagnostics if needed."
     fi
 
+    # ------------------------------------------------------------------
+    # Benchmark (LIBERO) optional resource configuration.
+    #
+    # The conditional LeRobot libero extra above installs the sole hf-libero
+    # provider. This layer only prepares the workspace-owned config/assets;
+    # provider identity and runtime API checks belong to the LIBERO adapter.
+    # ------------------------------------------------------------------
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
+            log_warn "Skipping optional benchmark dependencies on ${SETUP_PLATFORM_ID}; LIBERO/MuJoCo are validated on Ubuntu only."
+        else
+            log_info "Configuring optional benchmark (LIBERO) runtime..."
+            export WORKSPACE="${WORKSPACE}"
+
+            # Generate workspace-owned config and fetch/reuse official assets
+            # before importing hf-libero. This prevents the provider's legacy
+            # first-import prompt and makes get_assets_path() deterministic.
+            local libero_config_script="${SCRIPT_DIR}/setup/libero_config.py"
+            local libero_config_dir="${venv_path}/ibrobot_libero"
+            log_info "Preparing workspace-owned hf-libero config and assets..."
+            if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_config_script}" \
+                > "${venv_path}/benchmark_libero_config_output.txt" 2>&1; then
+                log_error "Failed to prepare workspace-owned hf-libero config/assets."
+                cat "${venv_path}/benchmark_libero_config_output.txt" 2>/dev/null || true
+                exit 1
+            fi
+            export LIBERO_CONFIG_PATH="${libero_config_dir}"
+            log_info "hf-libero config/assets ready at ${libero_config_dir}"
+        fi
+    fi
+
     # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
     log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python-headless<4.12" --quiet
+    run_cmd "${pip_install[@]}" --force-reinstall "${ros_abi_pin_packages[@]}" --quiet
 
     log_info "Running NumPy/OpenCV dependency smoke test..."
     PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
@@ -459,7 +533,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${full_profile}" == true ]] && [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true && "${full_profile}" == true && "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 
@@ -470,7 +544,6 @@ except Exception as exc:
 print("Grasp dependencies smoke test passed")
 PY
     fi
-
     # gitlint ships in dev-tools.txt, which the inference profile skips.
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping gitlint commit-msg hook (inference profile)."
@@ -524,4 +597,5 @@ PY
     fi
 
     PYTHON_ENV_STATUS="done"
+
 }

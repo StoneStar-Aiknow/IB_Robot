@@ -73,7 +73,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+        bundle_path: models/grounding_dino_swint_seq8_1280x720
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
@@ -99,10 +99,10 @@ robot:
     auto_start_dependencies: true
     # The 310P planner and the Gateway must bind the same immutable deployment
     # identity.  This bundle is produced by the GraspGen Ascend packager.
-    model_bundle_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    model_bundle_path: "$(env WORKSPACE)/models/graspgen"
     model_deployment: ascend_310p
     # Both planner metadata and named deployments come from the same bundle.
-    planner_model_dir: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    planner_model_dir: "$(env WORKSPACE)/models/graspgen"
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect
@@ -240,9 +240,9 @@ robot:
       enabled: true
     planner_node:
       inference_backend: ascend_local
-      local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+      local_manifest_path: "$(env WORKSPACE)/models/graspgen"
       local_deployment_name: ascend_310p
-      ascend_local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+      ascend_local_manifest_path: "$(env WORKSPACE)/models/graspgen"
       ascend_local_deployment_name: ascend_310p
       ascend_local_device_id: 0
       ascend_local_random_seed: 0
@@ -504,13 +504,10 @@ robot:
 
   voice_asr:
     enabled: false
-    auto_download_model: true
     active_mode: continuous
     language: zh
-    model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
-    tokens_path: ""
-    provider: cpu
-    model_type: streaming
+    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
     realtime_pre_roll_seconds: 0.5
@@ -612,11 +609,10 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # librealsense serial for the 310P wrist D435i. Explicit binding avoids
-      # selecting another RealSense when multiple devices are connected.
-      # This is the librealsense serial reported by the currently installed
-      # D435i; it intentionally differs from the USB descriptor serial.
-      serial_number: "349522071345"
+      # Device-specific serials belong in a deployment instance override.
+      # Leave the generic profile empty so other LeKiwi units can bind safely;
+      # the loader warns when multiple same-driver cameras stay unbound.
+      serial_number: ""
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
       initial_reset: false

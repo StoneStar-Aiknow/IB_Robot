@@ -43,10 +43,30 @@ modify ROS/Python environment variables, search for robot configs or repositorie
 `robot-skill` path, or add `--config-name`/`--config-path`. On any nonzero exit, report the exact CLI error and stop; a
 failed command never proves that a status check completed.
 
-## Natural-Language Plan Workflow
+## Composite Workflow Entry
 
-Run natural-language motion requests in this order. Resolve required semantic values before freezing the motion plan;
-never put placeholders into `workflow-json`.
+For every normal natural-language motion request, use the deterministic composite entry:
+
+```text
+robot-skill run-workflow [--request-id REQUEST_ID] --text TEXT --workflow-json JSON
+```
+
+Hermes produces the complete typed workflow once. `run-workflow` then performs discovery, catalog
+visibility checks, planning, validation, presentation, confirmation, execution, and terminal-result
+collection internally in one controlled call. Do not call the lifecycle commands separately for the
+same normal request. They remain available for diagnostics and protocol tests.
+
+For a single-step request, use one flat typed step, for example:
+
+```bash
+robot-skill run-workflow --text "打开夹爪" \
+  --workflow-json '[{"schema_version":1,"skill_name":"open_gripper_skill"}]'
+```
+
+## Diagnostic Plan Workflow
+
+When explicitly testing the lifecycle commands directly, resolve required semantic values before freezing the motion
+plan and never put placeholders into `workflow-json`.
 
 1. Query the Gateway: `robot-skill status`.
 2. Discover capabilities: `robot-skill list-skills`.
@@ -79,13 +99,13 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
 by `confirm-plan` immediately after the presentation flush.
 
-Natural-language single-Skill and Workflow requests both use the plan workflow above. The internal `confirm-plan` call is
+Natural-language single-Skill and Workflow requests both use `run-workflow` through the composite entry. The internal `confirm-plan` call is
 the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
 selected single skill, the direct `describe -> validate -> execute` path remains valid.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.
-For an ordered multi-Skill request, call `plan-workflow` exactly once for the motion steps with the user's original
+For an ordered multi-Skill request, call `run-workflow` exactly once with the user's original
 wording and typed steps. Read-only semantic queries needed to obtain literal coordinates happen before this call and
 are not workflow steps. The returned single plan must contain all ordered motion `workflow_steps`. If planning omits,
 reorders, or rejects a requested step, report that exact result and stop; do not retry alternate phrasings and do not
@@ -193,9 +213,7 @@ Example flow for "转向我" (requires a robot with a mobile base, e.g. lekiwi):
 2. Convert azimuth_rad (radians, REP-103: 0=front, +π/2=left, -π/2=right) to
    direction and degree: positive => left, negative => right;
    degree = abs(azimuth_rad) * 180 / pi  (e.g. 0.5236 rad => 30.0 degrees).
-3. `robot-skill describe nav_turn` (confirm it takes `direction` and `degree`)
-4. `robot-skill plan-workflow --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
-5. validate-plan -> confirm-plan -> execute-plan as usual.
+3. `robot-skill run-workflow --text "转向我" --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
 
 Do **not** map "转向我" to `rotate_gripper_cw`/`rotate_gripper_ccw` — those
 rotate the wrist/gripper, not the robot base, and will not face the user.

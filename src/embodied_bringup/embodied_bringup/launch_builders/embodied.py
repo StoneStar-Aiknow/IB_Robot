@@ -1,12 +1,14 @@
 """Embodied minimal-closure launch builder."""
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from launch_ros.actions import Node
 
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
+from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
     navigation_endpoint_projection,
     robot_config_digest,
@@ -343,6 +345,11 @@ def generate_embodied_nodes(
 
     logger.info("Embodied minimal closure enabled, launching task/safety/skill nodes")
 
+    idle_behaviors = embodied_config.get("idle_behaviors", {})
+    sound_orientation = idle_behaviors.get("sound_orientation", {}) if isinstance(idle_behaviors, dict) else {}
+    if not isinstance(sound_orientation, dict):
+        sound_orientation = {}
+
     nodes = [
         Node(
             package="safety_guard",
@@ -402,6 +409,34 @@ def generate_embodied_nodes(
                         "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
                     }
                 ],
+            )
+        )
+    if sound_orientation.get("enabled", False):
+        # Defaults come from the single SoundOrientationConfig source of truth;
+        # the validated config dict only overrides fields it explicitly sets.
+        sound_defaults = asdict(SoundOrientationConfig())
+        sound_params = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in sound_defaults.items()
+            if key != "enabled"
+        }
+        for key in sound_params:
+            if key in sound_orientation:
+                sound_params[key] = sound_orientation[key]
+        sound_params.update(
+            {
+                "gateway_status_service": common_params["skill_gateway_status_service"],
+                "skill_action_name": common_params["skill_action_name"],
+                "debug_tracing": common_params["debug_tracing"],
+            }
+        )
+        nodes.append(
+            Node(
+                package="embodied_agent",
+                executable="sound_orientation_node",
+                name="sound_orientation_node",
+                output="screen",
+                parameters=[sound_params],
             )
         )
     if include_visual_games:

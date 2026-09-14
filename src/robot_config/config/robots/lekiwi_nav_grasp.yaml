@@ -74,8 +74,8 @@ robot:
     controller_switch_service: controller_manager/switch_controller
     manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
     navigation_controllers: [base_velocity_controller]
-    transition_timeout_s: 2.0
-    bridge_heartbeat_timeout_s: 1.0
+    transition_timeout_s: 5.0
+    bridge_heartbeat_timeout_s: 5.0
     manipulation_control_mode: moveit_planning
     navigation_control_mode: base_navigation
 
@@ -88,7 +88,7 @@ robot:
     # camera by accident.
     enabled: true
     # Keep the persisted map queryable while disabling online RGB-D updates.
-    query_only: false
+    query_only: true
     camera:
       peripheral: front
       mounting: fixed
@@ -269,7 +269,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+        bundle_path: models/grounding_dino_swint_seq8_1280x720
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
@@ -317,7 +317,7 @@ robot:
       - id: semantic_siglip2_image
         enabled: true
         required: true
-        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        bundle_path: models/siglip2_so400m_patch14_384
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeEmbeddingsPlugin
         service_type: ibrobot_msgs/srv/EncodeEmbeddings
@@ -330,7 +330,7 @@ robot:
         # image service and must stay non-required per the role policy.
         enabled: true
         required: false
-        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        bundle_path: models/siglip2_so400m_patch14_384
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeTextPlugin
         service_type: ibrobot_msgs/srv/EncodeText
@@ -754,6 +754,7 @@ robot:
 
   nav_stages:
     grasp:
+      name: lekiwi_handeye_realsense_grasp
       default_control_mode: moveit_planning
       skill_required_control_mode: moveit_planning
       mid360_mount_file: ""
@@ -772,7 +773,7 @@ robot:
           - id: grasp_grounding
             enabled: true
             required: true
-            bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+            bundle_path: models/grounding_dino_swint_seq8_1280x720
             deployment: ascend_310p
             adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
             service_type: ibrobot_msgs/srv/GroundingDetect
@@ -797,6 +798,7 @@ robot:
         navigation_control_mode: base_navigation
       embodied:
         enabled: false
+        skill_catalog_profile: lekiwi_handeye_realsense_grasp
       navigation:
         enabled: false
         cmd_vel_bridge:
@@ -1003,13 +1005,10 @@ robot:
 
   voice_asr:
     enabled: false
-    auto_download_model: true
     active_mode: continuous
     language: zh
-    model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
-    tokens_path: ""
-    provider: cpu
-    model_type: streaming
+    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
     realtime_pre_roll_seconds: 0.5
@@ -1054,6 +1053,26 @@ robot:
     skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
     debug_tracing: true
+    idle_behaviors:
+      sound_orientation:
+        # Disabled until concurrent VoiceASRNode + speech_direction_node access
+        # to the deployed ReSpeaker has been validated or a shared capture path
+        # is available. The ROS launch integration remains ready for opt-in.
+        enabled: false
+        trigger_phrases: ["转向我"]
+        direction_topic: /voice/speech_direction
+        command_topic: /voice_command
+        skill_name: nav_turn
+        direction_frame: base_link
+        deadband_deg: 15.0
+        max_direction_age_sec: 1.3
+        direction_wait_sec: 0.5
+        cooldown_sec: 1.5
+        max_turn_deg: 180.0
+        turn_timeout_sec: 10.0
+        action_acceptance_timeout_sec: 2.0
+        status_retry_sec: 0.5
+        reset_status_max_age_sec: 2.0
     task_input_topic: /voice_command
     task_command_topic: /embodied/task_command
     planned_task_topic: /embodied/planned_task
@@ -1152,8 +1171,8 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # Set the librealsense serial for the wrist camera when multiple
-      # RealSense devices are connected.
+      # Device-specific serials belong in a deployment instance override.
+      # Leave the generic profile empty so other LeKiwi units can bind safely.
       serial_number: ""
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
@@ -1195,8 +1214,7 @@ robot:
       name: front
       driver: realsense
       driver_camera_name: front
-      # Set the librealsense serial for the fixed front camera when multiple
-      # RealSense devices are connected.
+      # Device-specific serials belong in a deployment instance override.
       serial_number: ""
       width: 640
       height: 480

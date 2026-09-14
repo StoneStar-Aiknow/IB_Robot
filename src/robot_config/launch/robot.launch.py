@@ -96,9 +96,15 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.inference_config import scheduler_enabled_from_raw_config
+from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
+from robot_config.inference_config import (
+    InferenceConfigError,
+    parse_inference_config,
+    scheduler_enabled_from_raw_config,
+)
 
 # Import node generators from launch_builders modules
+from robot_config.launch_builders.benchmark import generate_benchmark_nodes
 from robot_config.launch_builders.control import (
     generate_auxiliary_actuator_nodes,
     generate_ros2_control_nodes,
@@ -134,6 +140,7 @@ from robot_config.launch_builders.tracing import (
 )
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
+from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
 
 # Import utility functions
 from robot_config.utils import parse_bool
@@ -166,7 +173,11 @@ def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    robot_config = load_robot_config_dict(config_path, nav_stage=nav_stage)
+    robot_config = load_robot_config_dict(
+        config_path,
+        nav_stage=nav_stage,
+        materialize_benchmark_transport=False,
+    )
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -189,6 +200,69 @@ def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
         voice_asr_config["realtime_pre_roll_seconds"] = float(pre_roll_override)
 
     robot_config["voice_asr"] = voice_asr_config
+
+
+def _validate_benchmark_inference_closure(
+    robot_config: dict,
+    *,
+    control_mode: str,
+    with_inference: bool,
+) -> None:
+    """Fail fast when Benchmark evaluation cannot reach the policy/action path."""
+    benchmark = robot_config.get("benchmark", {})
+    evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
+    if not isinstance(evaluation, dict) or not bool(evaluation.get("enabled", False)):
+        return
+    if not with_inference:
+        raise ValueError("benchmark evaluation requires with_inference:=true")
+
+    mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
+    if not isinstance(mode_config, dict):
+        raise ValueError(f"benchmark evaluation control mode {control_mode!r} is not configured")
+    executor = mode_config.get("executor", {})
+    if not isinstance(executor, dict) or executor.get("type") != "benchmark":
+        raise ValueError("benchmark evaluation requires control_modes.<mode>.executor.type=benchmark")
+    dispatch = mode_config.get("dispatch", {}) or {}
+    if not isinstance(dispatch, dict) or dispatch.get("scheduler", "continuous") != "wait_for_feedback":
+        raise ValueError("benchmark evaluation requires dispatch.scheduler=wait_for_feedback")
+
+    try:
+        inference = parse_inference_config(robot_config, control_mode)
+    except InferenceConfigError as exc:
+        raise ValueError(f"benchmark evaluation inference configuration is invalid: {exc}") from exc
+    if not inference.enabled or not inference.pipelines:
+        raise ValueError("benchmark evaluation requires an enabled inference pipeline")
+    selected = executor.get("inference_pipeline")
+    if selected is None:
+        if len(inference.pipelines) != 1:
+            raise ValueError("benchmark evaluation requires executor.inference_pipeline when multiple pipelines exist")
+        selected = next(iter(inference.pipelines))
+    if not isinstance(selected, str) or selected not in inference.pipelines:
+        raise ValueError(f"benchmark evaluation selects unknown inference pipeline {selected!r}")
+    pipeline = inference.pipelines[selected]
+    if pipeline.execution_mode not in {"monolithic", "distributed"}:
+        raise ValueError(f"benchmark evaluation selected pipeline {selected!r} has invalid execution mode")
+    transport = pipeline.transport
+    required_endpoints = {
+        "action_server": transport.action_server,
+        "reset_service": transport.reset_service,
+        "health_topic": transport.health_topic,
+    }
+    if pipeline.execution_mode == "distributed":
+        required_endpoints.update(
+            {
+                "request_topic": transport.request_topic,
+                "result_topic": transport.result_topic,
+                "heartbeat_topic": transport.heartbeat_topic,
+                "video_descriptor_topic": transport.video_descriptor_topic,
+                "video_status_topic": transport.video_status_topic,
+            }
+        )
+    missing = sorted(name for name, value in required_endpoints.items() if not isinstance(value, str) or not value)
+    if missing:
+        raise ValueError(
+            f"benchmark evaluation selected pipeline {selected!r} is missing required endpoints: {missing}"
+        )
 
 
 def _apply_inference_cli_overrides(context, robot_config: dict, control_mode: str) -> None:
@@ -332,7 +406,7 @@ def launch_setup(context, *args, **kwargs):
     # ========== 1. Get and normalize launch parameters ==========
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
-    use_sim_str = context.launch_configurations.get("use_sim", "false")
+    use_sim_str = context.launch_configurations.get("use_sim", "")
     sim_platform_override = context.launch_configurations.get("sim_platform", "").strip().lower()
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
@@ -341,13 +415,12 @@ def launch_setup(context, *args, **kwargs):
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "")
     with_perception_str = context.launch_configurations.get("with_perception", "")
-
-    use_sim = parse_bool(use_sim_str, default=False)
+    runtime_target_override = context.launch_configurations.get("runtime_target", "")
 
     logger.info("========== Launch Parameters ==========")
     logger.info(f"robot_config: {robot_config_name}")
     logger.info(f"config_path: {config_path_override if config_path_override else '(none)'}")
-    logger.info(f"use_sim: {use_sim} (from '{use_sim_str}')")
+    logger.info(f"use_sim: {use_sim_str if use_sim_str else '(infer from runtime target)'}")
     logger.info(f"sim_platform: {sim_platform_override if sim_platform_override else '(from config)'}")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
@@ -356,6 +429,7 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
     logger.info(f"with_embodied: {with_embodied_str if with_embodied_str else '(from config)'}")
     logger.info(f"with_perception: {with_perception_str if with_perception_str else '(from config)'}")
+    logger.info(f"runtime_target: {runtime_target_override if runtime_target_override else '(from SSOT or use_sim)'}")
 
     # ========== 2. Load robot configuration ==========
     try:
@@ -378,16 +452,42 @@ def launch_setup(context, *args, **kwargs):
             robot_config_share = str(Path(__file__).parent.parent)
         robot_config["_config_path"] = str(Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml")
 
+    # ========== 2.5 Resolve runtime target (SSOT) ==========
+    # resolve_runtime_target is the single authority for the runtime target.
+    # An omitted use_sim argument is represented by None; the resolved target
+    # then determines the virtual/hardware embodiment used by the launch plan.
+    requested_use_sim = None if use_sim_str == "" else parse_bool(use_sim_str, default=False)
+    runtime_target = resolve_runtime_target(robot_config, runtime_target_override, requested_use_sim)
+    use_sim = runtime_target is not RuntimeTarget.HARDWARE
+    is_benchmark = runtime_target is RuntimeTarget.BENCHMARK
+    logger.info(f"Runtime target: {runtime_target}")
+    logger.info(f"Effective use_sim: {use_sim}")
+    if is_benchmark:
+        print("[IBROBOT_BENCHMARK][RUNTIME_TARGET] benchmark")
+        print("[IBROBOT_BENCHMARK][SKIP] ros2_control")
+        print("[IBROBOT_BENCHMARK][SKIP] simulation_backend")
+        print("[IBROBOT_BENCHMARK][SKIP] physical_perception")
+
     sim_platform = str(robot_config.get("simulation", {}).get("platform", "gazebo")).lower()
     if sim_platform_override:
         logger.info(f"CLI override: simulation.platform={sim_platform_override} (was {sim_platform})")
         sim_platform = sim_platform_override
         robot_config.setdefault("simulation", {})["platform"] = sim_platform
-    backend_caps = get_backend_caps(sim_platform) if use_sim else {"provides_clock": False, "needs_ros2_control": True}
-    mock_backend_active = use_sim and sim_platform == "mock"
+    if is_benchmark:
+        backend_caps = {"provides_clock": False, "needs_ros2_control": False}
+    else:
+        backend_caps = (
+            get_backend_caps(sim_platform)
+            if use_sim
+            else {
+                "provides_clock": False,
+                "needs_ros2_control": True,
+            }
+        )
+    mock_backend_active = (use_sim and sim_platform == "mock") and not is_benchmark
     node_use_sim_time = use_sim and backend_caps["provides_clock"]
-    sim_backend_needs_ros2_control = (not use_sim) or backend_caps["needs_ros2_control"]
-    if use_sim and not backend_caps["needs_ros2_control"]:
+    sim_backend_needs_ros2_control = ((not use_sim) or backend_caps["needs_ros2_control"]) and not is_benchmark
+    if use_sim and not backend_caps["needs_ros2_control"] and not is_benchmark:
         auto_start_controllers = "false"
         logger.info(f"simulation.platform={sim_platform}: backend does not use ros2_control")
 
@@ -404,9 +504,9 @@ def launch_setup(context, *args, **kwargs):
         voice_asr_cfg = robot_config.setdefault("voice_asr", {})
         voice_asr_cfg["enabled"] = True
         voice_asr_cfg["active_mode"] = "continuous"
-        voice_asr_cfg.setdefault("auto_download_model", True)
         logger.info(
-            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous, voice_asr.auto_download_model=true"
+            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous; "
+            "bundle_path and deployment must be configured explicitly"
         )
 
     if with_embodied_str != "":
@@ -450,6 +550,16 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"Final with_inference={with_inference}")
     scheduler_enabled = with_inference and scheduler_enabled_from_raw_config(robot_config, active_control_mode)
 
+    # Benchmark-specific transport is derived only after all launch overlays and
+    # the effective runtime target are known. The generic loader stays neutral.
+    if is_benchmark:
+        materialize_benchmark_observation_transport(robot_config)
+        _validate_benchmark_inference_closure(
+            robot_config,
+            control_mode=active_control_mode,
+            with_inference=with_inference,
+        )
+
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
     validate_runtime_resources(robot_config, use_sim=use_sim, control_mode=active_control_mode)
@@ -461,7 +571,12 @@ def launch_setup(context, *args, **kwargs):
     deferred_controller_spawners = []
     controller_names = []
     robot_description = {}
-    if not sim_backend_needs_ros2_control:
+    if is_benchmark:
+        # ros2_control skipped by benchmark target; the
+        # [IBROBOT_BENCHMARK][SKIP] ros2_control marker is already printed at
+        # runtime target resolution.
+        logger.info("benchmark target: skipping ros2_control / controller spawners")
+    elif not sim_backend_needs_ros2_control:
         logger.info(f"simulation.platform={sim_platform}: skipping ros2_control / controller spawners")
     else:
         try:
@@ -511,7 +626,7 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 5. Generate Simulation Nodes (only in simulation mode) ==========
     gz_create_entity = None
-    if use_sim:
+    if use_sim and not is_benchmark:
         logger.info("========== Generating Simulation Nodes ==========")
         logger.info(f"Sim platform: {sim_platform}")
         try:
@@ -551,6 +666,12 @@ def launch_setup(context, *args, **kwargs):
         except Exception as e:
             logger.error(f"generating simulation nodes: {e}")
             raise
+    elif is_benchmark:
+        # simulation_backend skipped by benchmark target; the
+        # [IBROBOT_BENCHMARK][SKIP] simulation_backend marker is already
+        # printed at runtime target resolution. Benchmark must never enter the
+        # SimBackendAdapter registry even though use_sim=true.
+        logger.info("benchmark target: skipping simulation backend (SimBackendAdapter)")
 
     if deferred_controller_spawners:
         startup_processes = list(deferred_controller_spawners)
@@ -579,7 +700,12 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 6. Generate Perception Nodes ==========
     logger.info("========== Generating Perception Nodes ==========")
-    if mock_mode_skips_subsystem(mock_backend_active, "perception"):
+    if is_benchmark:
+        # physical_perception skipped by benchmark target; the
+        # [IBROBOT_BENCHMARK][SKIP] physical_perception marker is already
+        # printed at runtime target resolution.
+        logger.info("benchmark target: skipping camera / lidar / virtual-relay / TF nodes")
+    elif mock_mode_skips_subsystem(mock_backend_active, "perception"):
         logger.info("hardware_mock active: skipping camera / lidar / virtual-relay / TF nodes")
         logger.info("simulation.platform=mock: contract_mock started by simulation backend")
     else:
@@ -622,6 +748,12 @@ def launch_setup(context, *args, **kwargs):
         except Exception as e:
             logger.error(f"generating perception nodes: {e}")
             raise
+
+    # ========== 6.5 Benchmark nodes (benchmark target only) ==========
+    if is_benchmark:
+        benchmark_nodes = generate_benchmark_nodes(robot_config)
+        actions.extend(benchmark_nodes)
+        logger.info(f"Added {len(benchmark_nodes)} benchmark nodes")
 
     try:
         model_service_nodes = generate_perception_model_nodes(robot_config)
@@ -785,6 +917,7 @@ def launch_setup(context, *args, **kwargs):
                 active_control_mode,
                 use_sim,
                 use_sim_time=node_use_sim_time,
+                runtime_target=runtime_target,
             )
             if controller_ready_barrier is not None:
                 logger.info("Deferring execution nodes until required controllers are active...")
@@ -957,8 +1090,11 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "use_sim",
-                default_value="false",
-                description="Use simulation mode; backend comes from robot YAML simulation.platform",
+                default_value="",
+                description=(
+                    "Override virtual embodiment (true/false). Empty infers true for "
+                    "runtime.target benchmark/simulation and false for hardware."
+                ),
             ),
             DeclareLaunchArgument(
                 "sim_platform",
@@ -1058,6 +1194,17 @@ def generate_launch_description():
                 "record_visualizer",
                 default_value="none",
                 description="Recording visualizer: 'rerun' (launch Rerun sidecar for live cameras/joints/actions) or 'none' (no visualizer)",
+            ),
+            DeclareLaunchArgument(
+                "runtime_target",
+                default_value="",
+                description=(
+                    "Override the runtime target (hardware, simulation or benchmark). "
+                    "Empty uses the SSOT runtime.target, then the historical use_sim "
+                    "fallback, then the default hardware. benchmark + use_sim:=true "
+                    "stays benchmark and skips ros2_control, simulation backend and "
+                    "physical perception."
+                ),
             ),
             DeclareLaunchArgument(
                 "enable_tracing",

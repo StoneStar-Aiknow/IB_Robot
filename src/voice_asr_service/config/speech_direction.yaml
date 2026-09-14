@@ -23,8 +23,11 @@ speech_direction_node:
       0.02285, -0.02285
     ]
 
-    # 模型 bundle；具体 deployment、backend、device 和 artifact 由 manifest/profile 决定。
-    speech_direction_inference_bundle: "voice_asr"
+    # FullSubNet/Silero bundle 与 deployment；具体 deployment、backend 和 artifact 由 manifest/profile 决定。
+    speech_direction_inference_bundle: "fullsubnet"
+    fullsubnet_deployment: "ascend_310p"
+    silero_vad_inference_bundle: "silero-vad"
+    silero_vad_deployment: "ascend_310p"
 
     speech_direction_max_age_ms: 1300
 

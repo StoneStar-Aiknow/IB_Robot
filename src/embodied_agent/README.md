@@ -8,6 +8,7 @@
 | 节点 | 主要职责 |
 | --- | --- |
 | `agent_plan_node` | plan / validate / confirm / execute 生命周期，按顺序调用 Skill Gateway |
+| `sound_orientation_node` | 固定触发词与新鲜声源方向的确定性路由；仅通过 Skill Gateway 调用 `nav_turn`，不经过 LLM/Agent plan |
 | `visual_game_gateway_node` | 非运动视觉游戏（分院帽等）的异步 start/query 控制平面，复用 `perception_service`，自带有界 ledger、结果校验和 `VisualGameEvent` 事件发布 |
 | `visual_game_announcer_node` | 视觉游戏终态的有界去重与 TTS 调用；不拥有声卡播放、不参与游戏准入或结果判定 |
 | `task_entry_node` | legacy ASR task adapter；不参与视觉游戏路由，当前不由 Hermes-only bringup 启动 |
@@ -48,7 +49,7 @@ PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 - execute 复用确认时冻结的预算，通过 Gateway 执行 Skill 或 Workflow。
 - child 接受、取消或终态未知时保持 plan 为 `ACCEPTED`，不得自动重试或释放可能仍有效的 root lease。
 
-Agent 必须通过 `robot-skill plan-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
+Agent 必须通过 `robot-skill run-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
 `raw_command` 只作为审计文本和幂等请求摘要的一部分。
 
 每个 `WorkflowStep` 必须显式携带 `schema_version`。非导航旧合同使用 v1，导航 typed step 使用 v2；CLI 拒绝缺少
@@ -60,6 +61,9 @@ v1，并携带 `arm_side` 与 `imitation_duration_sec`；warmup、prepare、star
 ## 边界
 
 - 本包不得调用 primitive、MoveIt 或 controller。
+- `sound_orientation_node` 只能调用 `/embodied/execute_skill`，不得直接调用导航 Action 或发布 `/cmd_vel`。
+- 声源转向是低优先级、非排队行为；Gateway busy 或未知终态时不得自动重试。
+- `sound_orientation_node` 的 `~/reset_fault` 需要新鲜 Gateway status 且 `busy=false`；Action canceled 不代表安全停止。
 - motion authorization 只能来自操作员 launch 参数。
 - 所有执行必须经过 `skill_library` 和 `safety_guard`。
 - `perception_service` 是独立服务，不由已停用的 voice adapter 自动路由。

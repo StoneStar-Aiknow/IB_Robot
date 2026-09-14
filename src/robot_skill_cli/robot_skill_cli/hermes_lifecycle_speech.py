@@ -22,7 +22,7 @@ from typing import Any
 FALLBACK_COPY = {
     "status_check_started": "任务已收到，小鸭子正在观察环境嘎嘎。",
     "planning_started": "看清楚了，让小鸭子先想想怎么执行。",
-    "plan_authorized": "小鸭子知道了，开始工作嘎嘎。",
+    "plan_confirmed": "计划已绑定，正在等待执行检查嘎嘎。",
 }
 EVENTS = frozenset(FALLBACK_COPY)
 _LOG_PATH = Path(os.environ.get("IBROBOT_LIFECYCLE_SPEECH_LOG", "/tmp/hermes-lifecycle-speech.log"))
@@ -69,11 +69,32 @@ def _event(payload: dict[str, Any]) -> str | None:
             return "status_check_started"
         if " plan-workflow" in command:
             return "planning_started"
+        if " run-workflow" in command:
+            return "planning_started"
     if hook_event == "post_tool_call" and " confirm-plan" in command:
         extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
         if str(extra.get("status") or "") == "ok" and _result_success(extra.get("result")):
-            return "plan_authorized"
+            return "plan_confirmed"
+    if hook_event == "post_tool_call" and " run-workflow" in command:
+        return None
     return None
+
+
+def notify_plan_confirmed(*, session_id: str, turn_id: str = "") -> None:
+    """Emit the technical confirmation event for a composite workflow."""
+    handle(
+        {
+            "hook_event_name": "post_tool_call",
+            "session_id": session_id,
+            "tool_name": "terminal",
+            "tool_input": {"command": "robot-skill confirm-plan --internal"},
+            "extra": {
+                "turn_id": turn_id or session_id,
+                "status": "ok",
+                "result": '{"ok":true,"command":"confirm-plan","data":{"confirmed":true}}',
+            },
+        }
+    )
 
 
 def _result_success(result: Any) -> bool:
@@ -91,12 +112,16 @@ def _result_success(result: Any) -> bool:
         return value.get("success") is True or value.get("confirmed") is True
 
     if isinstance(result, dict):
+        if result.get("event") == "workflow_terminal":
+            result = result.get("data")
+        if isinstance(result, dict) and isinstance(result.get("result"), dict):
+            result = result["result"]
         return confirmed(result)
     if not isinstance(result, str):
         return False
     candidate = result.rpartition("Final output:")[2] if "Final output:" in result else result
     try:
-        return confirmed(json.loads(candidate.strip()))
+        return _result_success(json.loads(candidate.strip()))
     except json.JSONDecodeError:
         return False
 
@@ -174,7 +199,7 @@ def _generate(output: Path, task: str) -> None:
 
     prompt = (
         "请为机器人任务生成三个简短的中文生命周期播报，严格只输出 JSON 对象，键为 "
-        "status_check_started、planning_started、plan_authorized。"
+        "status_check_started、planning_started、plan_confirmed。"
         "每句10到28个汉字；允许零到两句自然提及用户任务，不要每句都提。"
         "第一句表示收到并观察环境，第二句表示正在规划，第三句只能表示即将执行，"
         "不能声称已经完成，不要输出解释或 Markdown。用户任务：" + task

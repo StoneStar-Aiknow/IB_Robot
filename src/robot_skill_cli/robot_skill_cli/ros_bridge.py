@@ -9,6 +9,7 @@ import time
 import uuid
 from typing import Any
 
+from embodied_common.agent_execution_contract import INTERACTIVE_CONFIRMATION
 from embodied_common.skill_request import skill_goal_uuid, validate_request_schema_version
 from robot_skill_cli.output import EXIT_ROS_UNAVAILABLE, EXIT_TIMEOUT
 
@@ -455,7 +456,7 @@ class RosBridge:
 
     @staticmethod
     def _workflow_step_dict(step) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": int(step.schema_version),
             "skill_name": str(step.skill_name),
             "target_name": str(step.target_name),
@@ -465,17 +466,23 @@ class RosBridge:
             "motion_distance": float(step.motion_distance),
             "arm_side": str(step.arm_side),
             "imitation_duration_sec": float(step.imitation_duration_sec),
-            "direction": str(step.direction),
-            "distance": float(step.distance),
-            "degree": float(step.degree),
-            "has_x": bool(step.has_x),
-            "x": float(step.x),
-            "has_y": bool(step.has_y),
-            "y": float(step.y),
-            "has_yaw": bool(step.has_yaw),
-            "yaw": float(step.yaw),
             "timeout_sec": float(step.timeout_sec),
         }
+        if int(step.schema_version) == 2:
+            result.update(
+                {
+                    "direction": str(step.direction),
+                    "distance": float(step.distance),
+                    "degree": float(step.degree),
+                    "has_x": bool(step.has_x),
+                    "x": float(step.x),
+                    "has_y": bool(step.has_y),
+                    "y": float(step.y),
+                    "has_yaw": bool(step.has_yaw),
+                    "yaw": float(step.yaw),
+                }
+            )
+        return result
 
     @classmethod
     def _agent_plan_dict(cls, plan) -> dict[str, Any]:
@@ -490,6 +497,7 @@ class RosBridge:
             "registry_epoch": str(plan.registry_epoch),
             "registry_generation": int(plan.registry_generation),
             "registry_digest": str(plan.registry_digest),
+            "execution_mode": str(plan.execution_mode),
             "expires_at": {
                 "sec": int(plan.expires_at.sec),
                 "nanosec": int(plan.expires_at.nanosec),
@@ -503,6 +511,7 @@ class RosBridge:
         raw_command: str,
         workflow_steps: list[dict[str, Any]],
         timeout_sec: float,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
     ) -> dict[str, Any]:
         if self._PlanAgentCommand is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -511,6 +520,7 @@ class RosBridge:
         request.request_id = request_id
         request.raw_command = raw_command
         request.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
+        request.execution_mode = execution_mode
         response = self._call_service(
             self._plan_client,
             request,
@@ -602,6 +612,7 @@ class RosBridge:
         status: dict[str, Any],
         task_budget_sec: float,
         timeout_sec: float,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
     ) -> dict[str, Any]:
         if self._ConfirmAgentPlan is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -614,6 +625,7 @@ class RosBridge:
         request.registry_generation = int(status["registry_generation"])
         request.registry_digest = status["registry_digest"]
         request.task_budget_sec = float(task_budget_sec)
+        request.execution_mode = execution_mode
         response = self._call_service(
             self._confirm_plan_client,
             request,

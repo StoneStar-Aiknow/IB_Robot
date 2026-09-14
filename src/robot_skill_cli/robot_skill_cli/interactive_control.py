@@ -21,6 +21,10 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from embodied_common.agent_execution_contract import (
+    INTERACTIVE_CONFIRMATION,
+    validate_agent_execution_mode,
+)
 from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from embodied_common.workflow_contracts import normalize_workflow_steps
 
@@ -144,6 +148,7 @@ class InteractiveController:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         view_resolver: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
     ) -> None:
         self._bridge = bridge
         self._rpc_timeout_sec = max(
@@ -154,6 +159,7 @@ class InteractiveController:
         self._monotonic = monotonic
         self._sleep = sleep
         self._resolve_view = view_resolver or _default_view_resolver
+        self._execution_mode = validate_agent_execution_mode(execution_mode)
         self._fresh_status: dict[str, Any] | None = None
         self._fresh_view: dict[str, Any] | None = None
         self._fresh_identity: tuple[str, int, str] | None = None
@@ -176,6 +182,12 @@ class InteractiveController:
     def state(self) -> str:
         with self._state_lock:
             return self._state
+
+    @property
+    def terminal(self) -> dict[str, Any] | None:
+        """Return the terminal recorded for the current workflow, if any."""
+        with self._state_lock:
+            return dict(self._terminal) if self._terminal is not None else None
 
     def _rpc(self) -> float:
         return self._rpc_timeout_sec
@@ -249,19 +261,24 @@ class InteractiveController:
                     "SKILL_REFERENCE_MISSING", f"skill semantic level is not plannable: {skill_name}"
                 )
 
-    def prepare_workflow(self, raw_command: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    def prepare_workflow(
+        self, raw_command: str, steps: list[dict[str, Any]], *, request_id: str | None = None
+    ) -> dict[str, Any]:
         """Feature 3 (create + present): plan one workflow and bind the pending plan in-session."""
         if self._fresh_view is None:
             raise IllegalStateError("ILLEGAL_STATE", "discover() must run before prepare_workflow()")
         self.reject_out_of_catalog(steps)
         normalized = [step.to_dict() for step in normalize_workflow_steps(steps)]
-        request_id = self._id_factory()
+        request_id = request_id.strip() if isinstance(request_id, str) else self._id_factory()
+        if not request_id:
+            raise InteractiveControlError("SKILL_SCHEMA_INVALID", "request_id must be non-empty")
         task_id = self._id_factory()
         result = self._bridge.plan_agent_command(
             request_id=request_id,
             raw_command=raw_command,
             workflow_steps=normalized,
             timeout_sec=self._rpc(),
+            execution_mode=self._execution_mode,
         )
         if not result.get("success"):
             raise InteractiveControlError(
@@ -284,6 +301,11 @@ class InteractiveController:
             raise InteractiveControlError(
                 "SKILL_SNAPSHOT_DIGEST_MISMATCH",
                 "planned workflow uses a different registry identity",
+            )
+        if validate_agent_execution_mode(plan.get("execution_mode", "")) != self._execution_mode:
+            raise InteractiveControlError(
+                "SKILL_REQUEST_ID_CONFLICT",
+                "planned workflow uses a different execution mode",
             )
         pending = {
             "plan_token": plan["plan_token"],
@@ -350,7 +372,7 @@ class InteractiveController:
                 "registry_digest": registry_identity[2],
             },
             "task_id": self._pending["task_id"],
-            "execution_mode": "immediate_after_presentation",
+            "execution_mode": self._execution_mode,
         }
 
     def confirm_plan(self) -> dict[str, Any]:
@@ -411,6 +433,7 @@ class InteractiveController:
                 status=self._fresh_status,
                 task_budget_sec=task_budget_sec,
                 timeout_sec=self._status_timeout_sec,
+                execution_mode=self._execution_mode,
             )
         except Exception as exc:
             terminal = self._record_unknown(
@@ -456,7 +479,9 @@ class InteractiveController:
         raw_command: str,
         steps: list[dict[str, Any]],
         *,
+        request_id: str | None = None,
         presentation_callback: Callable[[dict[str, Any]], None],
+        authorization_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -500,7 +525,7 @@ class InteractiveController:
                     self._state = IDLE
                 raise
         try:
-            presentation = self.prepare_workflow(raw_command, steps)
+            presentation = self.prepare_workflow(raw_command, steps, request_id=request_id)
         except Exception:
             with self._state_lock:
                 self._clear_operation()
@@ -512,7 +537,17 @@ class InteractiveController:
             task_id = self._pending["task_id"] if self._pending is not None else ""
             self._record_terminal(task_id, FAILED, "PRESENTATION_FAILED", "plan presentation failed")
             raise InteractiveControlError("PRESENTATION_FAILED", "plan presentation failed") from exc
-        self.confirm_plan()
+        with self._state_lock:
+            if self._stop_requested_now():
+                return self._record_local_stop(self._pending["task_id"], "stopped after plan presentation")
+            if self._state != PREPARED or self._pending is None:
+                raise IllegalStateError("ILLEGAL_STATE", "workflow presentation did not complete")
+        confirmation = self.confirm_plan()
+        if authorization_callback is not None and self.state == CONFIRMED:
+            authorization_callback(confirmation)
+        with self._state_lock:
+            if self._stop_requested_now() and not self._submission_started:
+                return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
         return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
 
     def execute(
@@ -523,7 +558,7 @@ class InteractiveController:
     ) -> dict[str, Any]:
         """Feature 4: execute the confirmed plan; interruptible via ``stop_event``."""
         with self._state_lock:
-            if self._state == STOPPING and self._confirmed is None and self._pending is not None:
+            if self._state == STOPPING and not self._submission_started and self._pending is not None:
                 return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
             if self._state != CONFIRMED or self._confirmed is None or self._pending is None:
                 raise IllegalStateError("ILLEGAL_STATE", "no confirmed workflow to execute")
@@ -772,7 +807,7 @@ class InteractiveController:
             "task_id": task_id,
             "error_code": "SKILL_CANCELLED",
             "message": message,
-            "result": {},
+            "result": {"success": False, "error_code": "SKILL_CANCELLED", "message": message},
             "stopped_before_execution": True,
         }
         with self._state_lock:
@@ -793,7 +828,7 @@ class InteractiveController:
             "task_id": task_id,
             "error_code": "SKILL_CANCEL_TIMEOUT",
             "message": message,
-            "result": {},
+            "result": {"success": False, "error_code": "SKILL_CANCEL_TIMEOUT", "message": message},
         }
         with self._state_lock:
             self._terminal = terminal

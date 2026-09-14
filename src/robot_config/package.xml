@@ -29,9 +29,6 @@
   <exec_depend>robot_teleop</exec_depend>
   <exec_depend>aero_hand_hardware</exec_depend>
 
-  <!-- MoveIt task-level execution (launched by launch_builders/task_execution.py) -->
-  <exec_depend>task_dispatch</exec_depend>
-
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>camera_ros</exec_depend>
@@ -72,6 +69,9 @@
   <!-- Navigation bringup -->
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>robot_navigation</exec_depend>
+
+  <!-- Benchmark runtime launched when runtime.target=benchmark -->
+  <exec_depend>benchmark_runtime</exec_depend>
 
   <!-- Tracing -->
   <exec_depend>tracetools</exec_depend>
