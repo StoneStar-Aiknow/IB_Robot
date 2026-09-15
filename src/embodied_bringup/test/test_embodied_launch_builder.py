@@ -260,6 +260,11 @@ def test_sound_orientation_node_is_projected_from_robot_config():
     assert params["deadband_deg"] == 20.0
     assert _decode_launch_string(params["skill_name"]) == "nav_turn"
     assert _decode_launch_string(params["skill_action_name"]) == "/embodied/execute_skill"
+    assert _skill_executor_params(nodes)["sound_following_enabled"] is False
+
+    robot_config["embodied"]["idle_behaviors"]["sound_orientation"]["mode"] = "periodic"
+    periodic_nodes = generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+    assert _skill_executor_params(periodic_nodes)["sound_following_enabled"] is True
 
 
 # Drives a robot config whose perception services reference a gitignored model
