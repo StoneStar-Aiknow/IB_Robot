@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # verify_runtime_independence.sh — the two-direction independence gate
-# (robot-runtime-packaging spec, design D9; so101-runtime-migration task 6.4).
+# (robot-runtime-packaging spec, design D9; so101-runtime-migration task 6.4,
+# lekiwi-runtime-migration task 7.5).
 #
 # Usage:
 #   scripts/verify_runtime_independence.sh runtime so101_robot [--profile so101_single_arm]
+#   scripts/verify_runtime_independence.sh runtime lekiwi_robot [--profile lekiwi_lidar]
 #   scripts/verify_runtime_independence.sh runtime aimdk_robot [--profile x2_ultra]
 #   scripts/verify_runtime_independence.sh core
 #
-# runtime mode: build so101_robot in an ISOLATED workspace containing only its
+# runtime mode: build <robot>_robot in an ISOLATED workspace containing only its
 #   declared dependency closure. The closure is audited against a FIXED
 #   allow-list (runtime members + the contract layer + vendored third-party);
 #   membership is NOT derived from the closure itself. The isolated build uses
@@ -50,6 +52,14 @@ SO101_RUNTIME_MEMBERS=(
   so101_robot so101_sdk so101_hardware so101_description so101_motion so101_suite
   feetech_sdk
 )
+LEKIWI_RUNTIME_MEMBERS=(
+  lekiwi_robot lekiwi_sdk lekiwi_hardware lekiwi_description lekiwi_calibration
+  feetech_sdk
+  # The LeKiwi arm IS an SO-101 arm, so its runtime reuses these rather than
+  # forking them. Declared by name, never by an so101_* prefix rule, so an
+  # unrelated SO-101 package appearing in the closure still fails the gate.
+  so101_description so101_sdk so101_hardware so101_motion
+)
 # The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
 # description or motion package of its own. aimdk_msgs is supplied by the
 # developer's AimDK overlay and is never vendored into this repository.
@@ -58,7 +68,7 @@ AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
 # Third-party/vendored packages that may appear in a runtime closure without
 # being IB-Robot generic packages (they are not listed by `colcon list` in the
 # main workspace src/ tree anyway; this list documents intent).
-THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs)
+THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs livox_ros_driver2 fast_lio fast_calib)
 
 # Generic packages that must build WITHOUT any robot package (core gate).
 CORE_EXCLUDED_SUFFIXES=("_robot" "_sdk" "_hardware" "_motion" "_suite")
@@ -129,6 +139,11 @@ runtime_gate() {
       profile_dir="$MAIN_WORKSPACE/src/robots/so101/so101_robot/profiles"
       default_profile="so101_single_arm"
       ;;
+    lekiwi_robot)
+      members=("${LEKIWI_RUNTIME_MEMBERS[@]}")
+      profile_dir="$MAIN_WORKSPACE/src/robots/lekiwi/lekiwi_robot/profiles"
+      default_profile="lekiwi_lidar"
+      ;;
     aimdk_robot)
       members=("${AIMDK_RUNTIME_MEMBERS[@]}")
       profile_dir="$MAIN_WORKSPACE/src/robots/aimdk/aimdk_robot/profiles"
@@ -151,7 +166,8 @@ runtime_gate() {
       VENDOR_OVERLAY_SETUP="${AIMDK_OVERLAY_SETUP:-}"
       ;;
     *)
-      log_error "unknown runtime package: ${robot_pkg}"
+      log_error "no runtime allow-list declared for '${robot_pkg}'"
+      log_error "add one to this script rather than relaxing the audit."
       exit 2
       ;;
   esac
@@ -368,6 +384,14 @@ finally:
         launch.wait(timeout=15)
     except subprocess.TimeoutExpired:
         launch.kill()
+    # The launch output is the only diagnosis when reconciliation never
+    # happens; without this the gate fails with a bare assertion and no
+    # indication of which node refused to come up.
+    if sys.exc_info()[0] is not None:
+        output = launch.stdout.read() if launch.stdout else ""
+        tail = output.splitlines()[-60:]
+        print("--- launch output (tail) ---", file=sys.stderr)
+        print("\n".join(tail), file=sys.stderr)
 PY
   ) || {
     log_error "core gate contract-chain check failed; tail of the launch log follows"

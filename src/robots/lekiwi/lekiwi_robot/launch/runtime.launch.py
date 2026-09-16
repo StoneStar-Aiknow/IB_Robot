@@ -65,12 +65,19 @@ def _launch_setup(context, *_args, **_kwargs):
         output="screen",
         parameters=[base_params],
     )
-    motion = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
-        ),
-        launch_arguments=motion_launch_arguments(profile, profile_path, simulated, display).items(),
-    )
+    # A base-only deployment has no arm, so it declares no `motion` section and
+    # must not start the arm motion services. Composing them anyway would make
+    # the runtime advertise FK/IK for joints the hardware never opens.
+    motion_actions = []
+    if profile.get("motion"):
+        motion_actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
+                ),
+                launch_arguments=motion_launch_arguments(profile, profile_path, simulated, display).items(),
+            )
+        )
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     fast_lio_config = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
@@ -87,7 +94,7 @@ def _launch_setup(context, *_args, **_kwargs):
             LaunchConfiguration("instance_id").perform(context).strip(),
         ),
         base_node,
-        motion,
+        *motion_actions,
         *peripherals,
     ]
 

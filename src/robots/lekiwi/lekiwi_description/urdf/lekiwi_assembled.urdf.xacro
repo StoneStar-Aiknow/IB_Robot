@@ -12,6 +12,11 @@
   <xacro:arg name="port" default="/dev/ttyACM0"/>
   <xacro:arg name="calib_file" default=""/>
   <xacro:arg name="base_only" default="false"/>
+  <!-- simulated: run the LeKiwi hardware plugin on the SDK simulated
+       transport. This is NOT use_sim, which swaps in a physics-engine
+       plugin instead; simulated keeps the production adapter path and
+       only replaces the serial bus, which is what conformance exercises. -->
+  <xacro:arg name="simulated" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="mujoco_model" default=""/>
 
@@ -182,6 +187,7 @@
         <plugin>lekiwi_hardware/LeKiwiSystemHardware</plugin>
         <param name="port">$(arg port)</param>
         <param name="calib_file">$(arg calib_file)</param>
+        <param name="simulated">$(arg simulated)</param>
       </hardware>
     </xacro:unless>
 
