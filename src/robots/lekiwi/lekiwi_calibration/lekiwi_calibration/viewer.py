@@ -16,14 +16,14 @@ def rviz_command(mode: str, share: Path) -> list[str]:
 
 
 def preview_decoder_command() -> list[str]:
-    return ["ros2", "run", "robot_calibration", "calib_preview_decode"]
+    return ["ros2", "run", "lekiwi_calibration", "calib_preview_decode"]
 
 
 def overlay_decoder_command() -> list[str]:
     return [
         "ros2",
         "run",
-        "robot_calibration",
+        "lekiwi_calibration",
         "calib_preview_decode",
         "--input-topic",
         "/calib/overlay/compressed",
@@ -45,7 +45,7 @@ def package_share() -> Path:
     try:
         from ament_index_python.packages import get_package_share_directory
 
-        return Path(get_package_share_directory("robot_calibration"))
+        return Path(get_package_share_directory("lekiwi_calibration"))
     except (ImportError, LookupError):
         return Path(__file__).parents[1]
 
@@ -78,7 +78,7 @@ def start_viewer(mode: str, log_path: Path | None = None) -> ViewerSession | Non
     except RuntimeError:
         print(
             f"无图形环境，未自动打开 RViz。可在同一 ROS 环境的 PC 端运行: "
-            f"ros2 run robot_calibration calib_view --mode {mode}"
+            f"ros2 run lekiwi_calibration calib_view --mode {mode}"
         )
         return None
     decoder = None

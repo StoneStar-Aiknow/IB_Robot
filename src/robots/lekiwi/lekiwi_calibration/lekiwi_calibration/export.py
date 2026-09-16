@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from robot_calibration.bag import REQUIRED_TOPIC_TYPES, camera_coefficients, validate_fast_calib_bag
-from robot_calibration.offline import REQUIRED_SCENES
+from lekiwi_calibration.bag import REQUIRED_TOPIC_TYPES, camera_coefficients, validate_fast_calib_bag
+from lekiwi_calibration.offline import REQUIRED_SCENES
 
 
 def _transform(translation: list[float], quaternion: list[float]) -> np.ndarray:

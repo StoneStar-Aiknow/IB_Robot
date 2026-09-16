@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from robot_calibration.sensor_calibration import _load_artifact
+from lekiwi_calibration.sensor_calibration import _load_artifact
 
 CANDIDATE_FILES = {
     "base_to_front_camera.candidate.yaml": "base_to_front_camera.yaml",

@@ -2,7 +2,7 @@ from glob import glob
 
 from setuptools import find_packages, setup
 
-package_name = "robot_calibration"
+package_name = "lekiwi_calibration"
 
 setup(
     name=package_name,
@@ -24,17 +24,17 @@ setup(
     extras_require={"test": ["pytest"]},
     entry_points={
         "console_scripts": [
-            "calib_check = robot_calibration.sensor_calibration:main",
-            "calib_capture_finalize = robot_calibration.capture:finalize_cli",
-            "calib_offline = robot_calibration.cli:main",
-            "calib_capture = robot_calibration.workflow:capture_main",
-            "calib_capture_preview = robot_calibration.capture_preview:main",
-            "calib_preview_decode = robot_calibration.preview_decode:main",
-            "calib_process = robot_calibration.workflow:solve_main",
-            "calib_validate = robot_calibration.validation:main",
-            "calib_view = robot_calibration.viewer:main",
-            "calib_overlay = robot_calibration.live_overlay:main",
-            "calib_approve = robot_calibration.approval:main",
+            "calib_check = lekiwi_calibration.sensor_calibration:main",
+            "calib_capture_finalize = lekiwi_calibration.capture:finalize_cli",
+            "calib_offline = lekiwi_calibration.cli:main",
+            "calib_capture = lekiwi_calibration.workflow:capture_main",
+            "calib_capture_preview = lekiwi_calibration.capture_preview:main",
+            "calib_preview_decode = lekiwi_calibration.preview_decode:main",
+            "calib_process = lekiwi_calibration.workflow:solve_main",
+            "calib_validate = lekiwi_calibration.validation:main",
+            "calib_view = lekiwi_calibration.viewer:main",
+            "calib_overlay = lekiwi_calibration.live_overlay:main",
+            "calib_approve = lekiwi_calibration.approval:main",
         ],
     },
 )

@@ -1,7 +1,7 @@
 import pytest
 import yaml
 
-from robot_calibration.bag import REQUIRED_TOPIC_TYPES, camera_coefficients, validate_fast_calib_bag
+from lekiwi_calibration.bag import REQUIRED_TOPIC_TYPES, camera_coefficients, validate_fast_calib_bag
 
 
 def _bag(root, *, duration_ns=10_000_000_000):

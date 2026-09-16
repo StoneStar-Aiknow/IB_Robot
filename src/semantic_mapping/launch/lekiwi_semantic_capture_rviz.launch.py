@@ -17,7 +17,7 @@ def generate_launch_description():
         cmd=[
             "ros2",
             "run",
-            "robot_calibration",
+            "lekiwi_calibration",
             "calib_preview_decode",
             "--input-topic",
             "/semantic_mapping/preview/image/compressed",

@@ -4,14 +4,14 @@ import tarfile
 
 import pytest
 
-from robot_calibration.capture import (
+from lekiwi_calibration.capture import (
     REQUIRED_SCENES,
     REQUIRED_TOPICS,
     CaptureError,
     finalize_capture,
     import_legacy_capture,
 )
-from robot_calibration.store import ArtifactStore, StoreError
+from lekiwi_calibration.store import ArtifactStore, StoreError
 
 # Import rather than transcribe: every fixture in this file is built from these
 # two tables, so a verbatim copy let the whole file drift silently when the

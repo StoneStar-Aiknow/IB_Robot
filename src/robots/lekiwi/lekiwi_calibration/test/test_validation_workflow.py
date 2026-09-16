@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from robot_calibration import validation
-from robot_calibration.validation import validate_artifact_archive, validation_lock
+from lekiwi_calibration import validation
+from lekiwi_calibration.validation import validate_artifact_archive, validation_lock
 
 
 def test_validate_artifact_archive_accepts_single_user_archive(tmp_path):
@@ -24,7 +24,7 @@ def test_validation_summary_has_no_production_activation(tmp_path):
 
 def test_validation_cli_exposes_only_archive_input():
     completed = subprocess.run(
-        ["python3", "-c", "from robot_calibration.validation import main; main(['--help'])"],
+        ["python3", "-c", "from lekiwi_calibration.validation import main; main(['--help'])"],
         capture_output=True,
         text=True,
         check=False,

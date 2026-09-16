@@ -28,7 +28,7 @@
   <exec_depend>embodied_common</exec_depend>
   <exec_depend>perception_service</exec_depend>
   <exec_depend>robot_config</exec_depend>
-  <exec_depend>robot_calibration</exec_depend>
+  <exec_depend>lekiwi_calibration</exec_depend>
   <exec_depend>robot_navigation</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

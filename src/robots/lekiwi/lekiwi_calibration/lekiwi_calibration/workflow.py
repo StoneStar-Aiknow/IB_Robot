@@ -23,20 +23,20 @@ import rclpy
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rosidl_runtime_py.utilities import get_message
 
-from robot_calibration.bag import REQUIRED_TOPIC_TYPES, validate_fast_calib_bag
-from robot_calibration.capture import REQUIRED_SCENES, CaptureError, finalize_capture
-from robot_calibration.detector import run_detector
-from robot_calibration.export import export_capture
-from robot_calibration.offline import create_candidate_artifact, create_supporting_artifacts, solve_joint_calibration
-from robot_calibration.store import ArtifactStore
-from robot_calibration.viewer import start_viewer, stop_viewer
+from lekiwi_calibration.bag import REQUIRED_TOPIC_TYPES, validate_fast_calib_bag
+from lekiwi_calibration.capture import REQUIRED_SCENES, CaptureError, finalize_capture
+from lekiwi_calibration.detector import run_detector
+from lekiwi_calibration.export import export_capture
+from lekiwi_calibration.offline import create_candidate_artifact, create_supporting_artifacts, solve_joint_calibration
+from lekiwi_calibration.store import ArtifactStore
+from lekiwi_calibration.viewer import start_viewer, stop_viewer
 
 LOGICAL_SENSORS = {"camera_front": "front", "front_camera": "front", "wrist_camera": "wrist"}
 REQUIRED_TOPICS = tuple(REQUIRED_TOPIC_TYPES)
 CAPTURE_PREVIEW_COMMAND = [
     "ros2",
     "run",
-    "robot_calibration",
+    "lekiwi_calibration",
     "calib_capture_preview",
     "--max-fps",
     "8.0",
@@ -97,8 +97,20 @@ def resolve_capture_input(value: Path) -> tuple[str, Path]:
     raise ValueError(f"capture input must be a sealed directory or .raw.tar archive: {path}")
 
 
+def _package_root() -> Path:
+    """Directory of the ROS package (…/src/robots/lekiwi/lekiwi_calibration)."""
+    return Path(__file__).resolve().parents[1]
+
+
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    # Derived from the package root rather than a hardcoded parent depth, so
+    # relocating the package does not silently resolve to the wrong tree.
+    root = _package_root()
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    # Fallback: the package currently lives at src/robots/<robot>/<package>.
+    return root.parents[2]
 
 
 def _git_commit() -> str:
@@ -118,7 +130,7 @@ def _default_workspace() -> Path:
 
 
 def _default_templates() -> Path:
-    return _repo_root() / "src/robot_calibration/config/fast_calib/scenes"
+    return _package_root() / "config/fast_calib/scenes"
 
 
 def _default_mount() -> Path:
@@ -399,7 +411,7 @@ def solve_user_workflow(
             parameters_sha256=_parameters_sha256(observations),
             output=artifact_path,
         )
-        from robot_calibration.overlay import render_test_overlay
+        from lekiwi_calibration.overlay import render_test_overlay
 
         overlay = output / "test-overlay.png"
         projected = render_test_overlay(output / "extrinsic.yaml", exported / "scene-04-test", overlay)

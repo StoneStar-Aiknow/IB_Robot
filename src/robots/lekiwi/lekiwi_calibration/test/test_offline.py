@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 import yaml
 
-from robot_calibration.detector import prepare_detector_parameters
-from robot_calibration.offline import (
+from lekiwi_calibration import workflow
+from lekiwi_calibration.detector import prepare_detector_parameters
+from lekiwi_calibration.offline import (
     PATCH_DIFF_SHA256,
     _matrix_from_quaternion,
     _quaternion_from_matrix,
@@ -81,7 +82,7 @@ OBSERVATIONS = {
 
 
 def test_setup_and_offline_share_fast_calib_patch_hash():
-    repository = Path(__file__).parents[3]
+    repository = workflow._repo_root()
     setup_script = (repository / "scripts/setup/ros_third_party.sh").read_text(encoding="utf-8")
     match = re.search(r'local expected_diff_sha256="([0-9a-f]{64})"', setup_script)
 
@@ -93,7 +94,7 @@ def test_offline_module_exposes_cli_help():
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).parents[1])
     completed = subprocess.run(
-        [sys.executable, "-m", "robot_calibration.cli", "--help"],
+        [sys.executable, "-m", "lekiwi_calibration.cli", "--help"],
         check=False,
         capture_output=True,
         text=True,

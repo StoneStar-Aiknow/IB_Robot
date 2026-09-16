@@ -3,7 +3,7 @@ import tarfile
 import pytest
 import yaml
 
-from robot_calibration.approval import approve
+from lekiwi_calibration.approval import approve
 
 CANDIDATE_FILES = {
     "base_to_front_camera.candidate.yaml",

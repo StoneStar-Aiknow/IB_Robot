@@ -1,6 +1,6 @@
 import numpy as np
 
-from robot_calibration.export import _resolve_body_from_livox
+from lekiwi_calibration.export import _resolve_body_from_livox
 
 
 def test_resolve_body_from_livox_accepts_recorded_direct_static_edge():

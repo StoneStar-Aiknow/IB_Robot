@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_calibration.viewer import (
+from lekiwi_calibration.viewer import (
     display_environment,
     overlay_decoder_command,
     preview_decoder_command,
@@ -14,7 +14,7 @@ from robot_calibration.viewer import (
 
 
 def test_rviz_command_selects_capture_and_validate_configs():
-    share = Path("/opt/share/robot_calibration")
+    share = Path("/opt/share/lekiwi_calibration")
 
     assert rviz_command("capture", share) == ["rviz2", "-d", str(share / "rviz/calib_capture.rviz")]
     assert rviz_command("validate", share) == ["rviz2", "-d", str(share / "rviz/calib_validate.rviz")]
@@ -24,7 +24,7 @@ def test_capture_preview_decoder_uses_compressed_transport():
     assert preview_decoder_command() == [
         "ros2",
         "run",
-        "robot_calibration",
+        "lekiwi_calibration",
         "calib_preview_decode",
     ]
 
@@ -33,7 +33,7 @@ def test_overlay_decoder_uses_compressed_transport():
     assert overlay_decoder_command() == [
         "ros2",
         "run",
-        "robot_calibration",
+        "lekiwi_calibration",
         "calib_preview_decode",
         "--input-topic",
         "/calib/overlay/compressed",
@@ -54,10 +54,10 @@ def test_validate_viewer_starts_preview_decoder(monkeypatch, tmp_path):
         def poll(self):
             return None
 
-    monkeypatch.setattr("robot_calibration.viewer.display_environment", lambda: {"DISPLAY": ":0"})
-    monkeypatch.setattr("robot_calibration.viewer.package_share", lambda: tmp_path)
+    monkeypatch.setattr("lekiwi_calibration.viewer.display_environment", lambda: {"DISPLAY": ":0"})
+    monkeypatch.setattr("lekiwi_calibration.viewer.package_share", lambda: tmp_path)
     monkeypatch.setattr(
-        "robot_calibration.viewer.subprocess.Popen",
+        "lekiwi_calibration.viewer.subprocess.Popen",
         lambda command, **kwargs: calls.append((command, kwargs)) or FakeProcess(command),
     )
 
@@ -87,10 +87,10 @@ def test_viewer_can_redirect_child_output_to_capture_log(monkeypatch, tmp_path):
         def poll(self):
             return None
 
-    monkeypatch.setattr("robot_calibration.viewer.display_environment", lambda: {"DISPLAY": ":0"})
-    monkeypatch.setattr("robot_calibration.viewer.package_share", lambda: tmp_path)
+    monkeypatch.setattr("lekiwi_calibration.viewer.display_environment", lambda: {"DISPLAY": ":0"})
+    monkeypatch.setattr("lekiwi_calibration.viewer.package_share", lambda: tmp_path)
     monkeypatch.setattr(
-        "robot_calibration.viewer.subprocess.Popen",
+        "lekiwi_calibration.viewer.subprocess.Popen",
         lambda command, **kwargs: calls.append((command, kwargs)) or FakeProcess(command),
     )
 

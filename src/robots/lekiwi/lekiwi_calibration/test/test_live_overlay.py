@@ -3,7 +3,7 @@ from collections import deque
 import cv2
 import numpy as np
 
-from robot_calibration.live_overlay import LiveOverlay, _overlay
+from lekiwi_calibration.live_overlay import LiveOverlay, _overlay
 
 
 class CameraInfo:
@@ -42,7 +42,7 @@ def test_live_overlay_accumulates_three_recent_clouds(monkeypatch):
     node = LiveOverlay.__new__(LiveOverlay)
     node._cloud_history = deque(maxlen=3)
     monkeypatch.setattr(
-        "robot_calibration.live_overlay.point_cloud2.read_points_numpy",
+        "lekiwi_calibration.live_overlay.point_cloud2.read_points_numpy",
         lambda message, **_kwargs: message,
     )
 

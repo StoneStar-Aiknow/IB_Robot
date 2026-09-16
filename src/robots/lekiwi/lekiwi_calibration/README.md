@@ -1,4 +1,4 @@
-# robot_calibration
+# lekiwi_calibration
 
 IB-Robot 的 D435i/MID-360 外参标定工具。`robot_config` 是硬件配置和传感器安装关系的唯一事实来源。
 
@@ -17,7 +17,7 @@ IB-Robot 的 D435i/MID-360 外参标定工具。`robot_config` 是硬件配置�
 和底盘控制链就绪后再进入第一个 Enter：
 
 ```bash
-ros2 run robot_calibration calib_capture
+ros2 run lekiwi_calibration calib_capture
 ```
 
 该等待没有自动超时。命令会每 15 秒列出尚未收到消息的必需 topic；开发板冷启动较慢时继续等待即可，
@@ -77,7 +77,7 @@ scene-04-test
 将 `<capture-id>.raw.tar` 复制到 PC 后执行：
 
 ```bash
-ros2 run robot_calibration calib_process --input <capture-id>.raw.tar
+ros2 run lekiwi_calibration calib_process --input <capture-id>.raw.tar
 ```
 
 默认使用当前 IB-Robot 工作区中的 `src/fast_calib` 和默认 merged install 路径
@@ -129,7 +129,7 @@ calibration_summary.json
 将 `<capture-id>.candidate.tar` 复制回板端后执行：
 
 ```bash
-ros2 run robot_calibration calib_validate \
+ros2 run lekiwi_calibration calib_validate \
   --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 
@@ -153,7 +153,7 @@ ros2 run robot_calibration calib_validate \
 确认实时投影正确后执行：
 
 ```bash
-ros2 run robot_calibration calib_approve \
+ros2 run lekiwi_calibration calib_approve \
   --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 
@@ -184,8 +184,8 @@ PC 侧叠加检查，再执行批准。
 在网络可达、沿用当前工作区默认 ROS 2 环境且有图形环境的 ROS PC 上执行：
 
 ```bash
-ros2 run robot_calibration calib_view --mode capture
-ros2 run robot_calibration calib_view --mode validate
+ros2 run lekiwi_calibration calib_view --mode capture
+ros2 run lekiwi_calibration calib_view --mode validate
 ```
 
 `capture` 模式显示低带宽 RealSense 和 MID-360 预览；`validate` 模式额外显示 `/calib/overlay`。
@@ -210,7 +210,7 @@ robot:
 检查配置中声明的标定产物：
 
 ```bash
-ros2 run robot_calibration calib_check <robot-config.yaml>
+ros2 run lekiwi_calibration calib_check <robot-config.yaml>
 ```
 
 退出码含义：
@@ -245,7 +245,7 @@ ros2 run robot_calibration calib_check <robot-config.yaml>
 导入历史采集数据前，工具会校验传输清单、四个 MCAP 文件、四个 rosbag 元数据文件、必需 topic 和 9.5 至 11.0 秒的时长合同：
 
 ```bash
-ros2 run robot_calibration calib_offline legacy-import <capture-dir> \
+ros2 run lekiwi_calibration calib_offline legacy-import <capture-dir> \
   --output ~/.ros/ibrobot/calib/raw \
   --lidar-serial <lidar-serial> --camera-serial <camera-serial>
 ```
@@ -256,14 +256,14 @@ ros2 run robot_calibration calib_offline legacy-import <capture-dir> \
 将四个密封场景解码为 RGB 图像、CameraInfo、累计点云和单消息 `/cloud_dense_body` rosbag：
 
 ```bash
-ros2 run robot_calibration calib_offline export <sealed-capture> \
+ros2 run lekiwi_calibration calib_offline export <sealed-capture> \
   --output <export-dir>
 ```
 
 检测器只能使用源码提交和完整补丁状态均符合固定身份的 FAST-Calib 工作区。运行时会复制模板并绑定导出数据，不会原地修改仓库中的模板：
 
 ```bash
-ros2 run robot_calibration calib_offline detect \
+ros2 run lekiwi_calibration calib_offline detect \
   --workspace <fast-calib-workspace> \
   --templates <scene-template-dir> \
   --exported <export-dir> --output <observation-dir>
@@ -272,7 +272,7 @@ ros2 run robot_calibration calib_offline detect \
 生成四个 `observation.yaml` 后，使用场景 01 至 03 计算，使用场景 04 独立测试：
 
 ```bash
-ros2 run robot_calibration calib_offline solve \
+ros2 run lekiwi_calibration calib_offline solve \
   --scene-01 <scene-01-observation.yaml> \
   --scene-02 <scene-02-observation.yaml> \
   --scene-03 <scene-03-observation.yaml> \

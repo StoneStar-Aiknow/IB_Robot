@@ -10,8 +10,8 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
-from robot_calibration.viewer import start_viewer, stop_viewer
-from robot_calibration.workflow import (
+from lekiwi_calibration.viewer import start_viewer, stop_viewer
+from lekiwi_calibration.workflow import (
     _start_capture_preview,
     _start_sensor_calibration,
     _stop_owned_process,
@@ -74,7 +74,7 @@ def run_validation(value: Path, *, mount: Path | None = None, output_topic: str 
             command = [
                 "ros2",
                 "run",
-                "robot_calibration",
+                "lekiwi_calibration",
                 "calib_overlay",
                 "--artifact",
                 str(artifact),

@@ -391,13 +391,11 @@ IB_Robot/
 │   ├── voice_asr_service/       # 语音识别与声源方向
 │   ├── voice_tts_service/       # 语音合成服务
 │   ├── robot_teleop/            # 遥操作输入与机器人公开接口桥接
-│   ├── robot_calibration/       # 标定采集、验证与激活
 │   ├── robots/                  # 机器人本体适配与 SDK
 │   │   ├── so101/               # SO-101 SDK / hardware / motion / runtime
+│   │   ├── lekiwi/              # LeKiwi SDK / hardware / description / calibration / runtime
 │   │   ├── feetech/             # Feetech 舵机 SDK
 │   │   └── aimdk/               # 灵犀 X2 厂商 MC 运行时适配
-│   ├── lekiwi_hardware/         # LeKiwi ros2_control 硬件接口
-│   ├── lekiwi_description/      # LeKiwi 模型描述
 │   ├── aero_hand_hardware/      # 灵巧手命令与状态桥接
 │   ├── hardware_mock/           # 契约驱动的模拟硬件数据
 │   ├── sim_models/              # 仿真场景资源与编译

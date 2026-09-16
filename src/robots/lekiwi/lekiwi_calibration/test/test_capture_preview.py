@@ -3,7 +3,7 @@ from sensor_msgs.msg import PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 
-from robot_calibration.capture_preview import create_preview_cloud, parser, select_preview_points
+from lekiwi_calibration.capture_preview import create_preview_cloud, parser, select_preview_points
 
 
 def test_capture_preview_defaults_are_low_bandwidth():

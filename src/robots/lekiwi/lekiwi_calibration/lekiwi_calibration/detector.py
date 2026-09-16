@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from robot_calibration.offline import PATCH_DIFF_SHA256, REQUIRED_SCENES, SOLVER_COMMIT, _load_observation
+from lekiwi_calibration.offline import PATCH_DIFF_SHA256, REQUIRED_SCENES, SOLVER_COMMIT, _load_observation
 
 
 def _command_output(command: list[str]) -> str:

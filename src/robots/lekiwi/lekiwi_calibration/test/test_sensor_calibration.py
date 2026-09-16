@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_calibration.sensor_calibration import (
+from lekiwi_calibration.sensor_calibration import (
     CalibrationContractError,
     invert_transform,
     main,

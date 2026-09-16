@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>robot_calibration</name>
+  <name>lekiwi_calibration</name>
   <version>0.0.1</version>
   <description>Sensor calibration capture, artifact, validation, and activation workflows</description>
   <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>

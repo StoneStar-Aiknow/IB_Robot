@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_calibration import workflow
-from robot_calibration.workflow import capture_initialization_message, logical_sensor_name, resolve_capture_input
+from lekiwi_calibration import workflow
+from lekiwi_calibration.workflow import capture_initialization_message, logical_sensor_name, resolve_capture_input
 
 
 def test_user_workflow_uses_logical_sensor_names_without_serial_arguments():
@@ -29,7 +29,7 @@ def test_resolve_capture_input_accepts_sealed_directory_and_archive(tmp_path):
 
 def test_solve_cli_help_exposes_one_input_workflow():
     completed = subprocess.run(
-        ["python3", "-c", "from robot_calibration.workflow import solve_main; solve_main(['--help'])"],
+        ["python3", "-c", "from lekiwi_calibration.workflow import solve_main; solve_main(['--help'])"],
         capture_output=True,
         text=True,
         check=False,
@@ -42,7 +42,7 @@ def test_solve_cli_help_exposes_one_input_workflow():
 
 def test_capture_cli_help_does_not_require_capture_identifier():
     completed = subprocess.run(
-        ["python3", "-c", "from robot_calibration.workflow import capture_main; capture_main(['--help'])"],
+        ["python3", "-c", "from lekiwi_calibration.workflow import capture_main; capture_main(['--help'])"],
         capture_output=True,
         text=True,
         check=False,
@@ -169,7 +169,7 @@ def test_default_fast_calib_workspace_is_repository_relative(monkeypatch):
 
 def test_default_mount_is_the_active_robot_profile_source():
     assert workflow._default_mount() == (
-        Path(__file__).parents[2] / "robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+        workflow._repo_root() / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
     )
 
 
@@ -254,7 +254,7 @@ def test_solve_archive_contains_three_candidate_artifacts_from_mount_and_camera_
         output.write_bytes(b"png")
         return 7
 
-    monkeypatch.setattr("robot_calibration.overlay.render_test_overlay", fake_overlay)
+    monkeypatch.setattr("lekiwi_calibration.overlay.render_test_overlay", fake_overlay)
     (tmp_path / "process").mkdir()
 
     archive = workflow.solve_user_workflow(

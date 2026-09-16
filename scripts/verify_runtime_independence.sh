@@ -63,7 +63,7 @@ THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs)
 # Generic packages that must build WITHOUT any robot package (core gate).
 CORE_EXCLUDED_SUFFIXES=("_robot" "_sdk" "_hardware" "_motion" "_suite")
 CORE_EXCLUDED_PACKAGES=(
-  so101_description moveit lekiwi_description robot_calibration
+  so101_description moveit lekiwi_description lekiwi_calibration
   livox_ros_driver2 fast_lio fast_calib omni_wheel_controller rosclaw pymoveit2
 )
 CORE_BUILD_PACKAGES=(

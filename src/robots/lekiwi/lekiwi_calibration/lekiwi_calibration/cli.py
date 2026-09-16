@@ -6,11 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from robot_calibration.capture import CaptureError, import_legacy_capture
-from robot_calibration.detector import run_detector
-from robot_calibration.export import export_capture
-from robot_calibration.offline import REQUIRED_SCENES, create_candidate_artifact, solve_joint_calibration
-from robot_calibration.store import ArtifactStore, StoreError
+from lekiwi_calibration.capture import CaptureError, import_legacy_capture
+from lekiwi_calibration.detector import run_detector
+from lekiwi_calibration.export import export_capture
+from lekiwi_calibration.offline import REQUIRED_SCENES, create_candidate_artifact, solve_joint_calibration
+from lekiwi_calibration.store import ArtifactStore, StoreError
 
 
 def _parser() -> argparse.ArgumentParser:
