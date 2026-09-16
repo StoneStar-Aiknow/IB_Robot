@@ -16,6 +16,8 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nlohmann-json-dev</depend>
+  <depend>feetech_sdk</depend>
+  <depend>so101_sdk</depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
 

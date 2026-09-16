@@ -1,20 +1,32 @@
+// Copyright 2026 IB_Robot Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "lekiwi_hardware/lekiwi_system_hardware.hpp"
 
-#include <cmath>
-#include <fstream>
+#include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+#include <rclcpp/rclcpp.hpp>
 
-#include "SMS_STS.h"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
-#include "lekiwi_hardware/lekiwi_conversions.hpp"
-#include "rclcpp/rclcpp.hpp"
 
 namespace lekiwi_hardware
 {
 
-hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
-  const hardware_interface::HardwareInfo & info)
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_init(const hardware_interface::HardwareInfo & info)
 {
   if (hardware_interface::SystemInterface::on_init(info) !=
     hardware_interface::CallbackReturn::SUCCESS)
@@ -22,128 +34,131 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  const size_t n = info_.joints.size();
-  num_joints_ = n;
-  if (n == FULL_JOINTS) {
-    base_only_mode_ = false;
-    num_arm_joints_ = FULL_ARM_JOINTS;
-    num_base_joints_ = FULL_BASE_JOINTS;
-  } else if (n == FULL_BASE_JOINTS) {
-    base_only_mode_ = true;
-    num_arm_joints_ = 0;
-    num_base_joints_ = FULL_BASE_JOINTS;
-  } else {
+  port_ = info_.hardware_parameters.count("port") ?
+    info_.hardware_parameters.at("port") : "/dev/ttyACM0";
+  calib_file_ = info_.hardware_parameters.count("calib_file") ?
+    info_.hardware_parameters.at("calib_file") : "";
+  {
+    const auto it = info_.hardware_parameters.find("simulated");
+    simulated_ = it != info_.hardware_parameters.end() &&
+      (it->second == "1" || it->second == "true" || it->second == "True" || it->second == "TRUE");
+  }
+
+  num_joints_ = info_.joints.size();
+  base_only_mode_ = (num_joints_ == FULL_BASE_JOINTS);
+  if (!base_only_mode_ && num_joints_ != FULL_JOINTS) {
     RCLCPP_ERROR(
       rclcpp::get_logger("LeKiwiSystemHardware"),
       "Expected %zu joints (full) or %zu joints (base-only), got %zu",
-      FULL_JOINTS, FULL_BASE_JOINTS, n);
+      FULL_JOINTS, FULL_BASE_JOINTS, num_joints_);
     return hardware_interface::CallbackReturn::ERROR;
   }
+  num_arm_joints_ = base_only_mode_ ? 0 : FULL_ARM_JOINTS;
+  num_base_joints_ = base_only_mode_ ? num_joints_ : FULL_BASE_JOINTS;
 
-  port_ = info_.hardware_parameters["port"];
-  calib_file_ = info_.hardware_parameters["calib_file"];
+  hw_positions_.resize(num_joints_, 0.0);
+  hw_velocities_.resize(num_joints_, 0.0);
+  hw_commands_.resize(num_joints_, 0.0);
 
-  hw_positions_.resize(n, 0.0);
-  hw_velocities_.resize(n, 0.0);
-  hw_commands_.resize(n, 0.0);
-  motor_ids_.resize(n);
-
-  // Arm write buffers
-  arm_target_positions_.resize(num_arm_joints_, 0);
-  arm_target_speeds_.resize(num_arm_joints_, 0);
-  arm_target_accs_.resize(num_arm_joints_, 0);
-
-  for (size_t i = 0; i < n; i++) {
-    motor_ids_[i] = std::stoi(info_.joints[i].parameters.at("id"));
-    if (!base_only_mode_ && i < num_arm_joints_) {
-      arm_motor_ids_.push_back(motor_ids_[i]);
+  for (size_t i = 0; i < num_joints_; i++) {
+    if (i < num_arm_joints_) {
+      arm_ids_.push_back(
+        static_cast<std::uint8_t>(std::stoi(info_.joints[i].parameters.at("id"))));
     } else {
-      base_motor_ids_.push_back(motor_ids_[i]);
+      wheel_ids_.push_back(
+        static_cast<std::uint8_t>(std::stoi(info_.joints[i].parameters.at("id"))));
     }
   }
-
-  RCLCPP_INFO(
-    rclcpp::get_logger("LeKiwiSystemHardware"),
-    "Initialized: %zu arm joints + %zu base joints on port %s",
-    arm_motor_ids_.size(), base_motor_ids_.size(), port_.c_str());
 
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
-  const rclcpp_lifecycle::State &)
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_configure(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configuring...");
 
-  const bool base_only = base_only_mode_;
-  auto set_default_limits = [this]() {
-      for (size_t i = 0; i < motor_ids_.size(); i++) {
-        u8 id = motor_ids_[i];
-        homing_offsets_[id] = 0;
-        range_mins_[id] = 0;
-        range_maxes_[id] = 4095;
+  // Load arm calibration (LeKiwi "id"-field format is accepted by the SDK's
+  // Calibration::load alongside the SO-101 keyed format).
+  so101::Calibration calibration;
+  std::vector<feetech::MotorConfig> arm_motors;
+  if (!base_only_mode_) {
+    try {
+      std::vector<std::string> joint_order;
+      for (size_t i = 0; i < num_arm_joints_; i++) {
+        joint_order.push_back(info_.joints[i].name);
       }
-    };
-
-  if (base_only) {
-    set_default_limits();
-    RCLCPP_INFO(
-      rclcpp::get_logger("LeKiwiSystemHardware"),
-      "Base-only mode detected, skipping arm calibration requirements.");
-    RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configured!");
-    return hardware_interface::CallbackReturn::SUCCESS;
+      calibration = so101::Calibration::load(calib_file_, joint_order);
+    } catch (const so101::CalibError & e) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
+        "Calibration error: %s (%s%s)", e.what(), e.path.c_str(),
+        e.joint.empty() ? "" : (" joint " + e.joint).c_str());
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      const std::string & name = info_.joints[i].name;
+      feetech::MotorConfig motor;
+      motor.id = arm_ids_[i];
+      motor.name = name;
+      const auto & jc = calibration.at(name);
+      motor.homing_offset = jc.homing_offset;
+      motor.range_min = jc.range_min;
+      motor.range_max = jc.range_max;
+      arm_motors.push_back(motor);
+      arm_command_map_[name] = 0.0;
+    }
   }
 
-  std::ifstream f(calib_file_);
-  if (!f.is_open()) {
-    RCLCPP_WARN(
+  // One shared bus: arm (position) + wheels (velocity).
+  feetech::BusOptions options;
+  options.port = port_;
+  options.simulated = simulated_;
+  options.motors = arm_motors;
+  for (const std::uint8_t id : wheel_ids_) {
+    feetech::MotorConfig motor;
+    motor.id = id;
+    motor.name = "wheel_" + std::to_string(id);
+    motor.mode = feetech::Mode::Wheel;
+    options.motors.push_back(motor);
+  }
+
+  bus_ = std::make_unique<feetech::Bus>(options);
+  if (!bus_->open()) {
+    RCLCPP_ERROR(
       rclcpp::get_logger("LeKiwiSystemHardware"),
-      "Calibration file not found: %s", calib_file_.c_str());
+      "Failed to connect to motors on port %s", port_.c_str());
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  auto calib = nlohmann::json::parse(f);
-
-  // Build a lookup table: motor id -> calibration entry
-  // The JSON keys can be motor IDs ("1","2") or names ("shoulder_pan","arm_shoulder_pan"),
-  // so we match by the "id" field inside each entry.
-  std::map<u8, nlohmann::json> calib_by_id;
-  for (auto & [key, entry] : calib.items()) {
-    if (entry.contains("id")) {
-      u8 mid = entry["id"].get<u8>();
-      calib_by_id[mid] = entry;
+  if (!base_only_mode_) {
+    so101::ArmConfig arm_config;
+    arm_config.port = port_;
+    arm_config.simulated = simulated_;
+    arm_config.calibration_file = calib_file_;
+    arm_config.joint_order.clear();  // drop the SDK default "1".."6" before appending
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      arm_config.joint_order.push_back(info_.joints[i].name);
     }
-  }
-
-  for (size_t i = 0; i < motor_ids_.size(); i++) {
-    u8 id = motor_ids_[i];
-    // Base motors (wheel mode) don't need calibration data
-    if (base_only || i >= num_arm_joints_) {
-      homing_offsets_[id] = 0;
-      range_mins_[id] = 0;
-      range_maxes_[id] = 4095;
-      continue;
-    }
-    if (calib_by_id.find(id) == calib_by_id.end()) {
+    arm_ = std::make_unique<so101::Arm>(arm_config);
+    if (!arm_->attach_shared_bus(*bus_, calibration)) {
       RCLCPP_ERROR(
         rclcpp::get_logger("LeKiwiSystemHardware"),
-        "Calibration entry not found for arm motor %d", id);
+        "Failed to attach arm to the shared bus");
+      bus_.reset();
       return hardware_interface::CallbackReturn::ERROR;
     }
-    auto & entry = calib_by_id[id];
-    homing_offsets_[id] = entry["homing_offset"];
-    range_mins_[id] = entry["range_min"];
-    range_maxes_[id] = entry["range_max"];
   }
 
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configured!");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-std::vector<hardware_interface::StateInterface> LeKiwiSystemHardware::export_state_interfaces()
+std::vector<hardware_interface::StateInterface>
+LeKiwiSystemHardware::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
-  for (size_t i = 0; i < info_.joints.size(); i++) {
+  for (size_t i = 0; i < num_joints_; i++) {
     state_interfaces.emplace_back(
       info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_positions_[i]);
     state_interfaces.emplace_back(
@@ -152,11 +167,11 @@ std::vector<hardware_interface::StateInterface> LeKiwiSystemHardware::export_sta
   return state_interfaces;
 }
 
-std::vector<hardware_interface::CommandInterface> LeKiwiSystemHardware::export_command_interfaces()
+std::vector<hardware_interface::CommandInterface>
+LeKiwiSystemHardware::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
-  for (size_t i = 0; i < info_.joints.size(); i++) {
-    // Arm joints (0-5): position command; Base joints (6-8): velocity command
+  for (size_t i = 0; i < num_joints_; i++) {
     if (i < num_arm_joints_) {
       command_interfaces.emplace_back(
         info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_[i]);
@@ -168,228 +183,254 @@ std::vector<hardware_interface::CommandInterface> LeKiwiSystemHardware::export_c
   return command_interfaces;
 }
 
-hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
-  const rclcpp_lifecycle::State &)
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_activate(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Activating...");
 
-  if (!sms_sts_.begin(1000000, port_.c_str())) {
+  // Motors are pinged as part of the scoped activation paths below: arm motors
+  // by the arm's own activation, wheel motors by apply_configs. Nothing to ping
+  // separately here (fail-closed behaviour comes from those two calls).
+
+  // Arm: scoped configuration + initial sync (fail-closed with rollback).
+  if (arm_ && !arm_->activate()) {
+    const auto & health = arm_->health();
     RCLCPP_ERROR(
       rclcpp::get_logger("LeKiwiSystemHardware"),
-      "Failed to connect to motors on port %s", port_.c_str());
+      "Arm activation failed: %s (fault=%d)", health.detail.c_str(),
+      static_cast<int>(health.fault));
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  // Give motors time to initialize after serial connection
-  usleep(500000);  // 500ms delay
-
-  // Ping each motor
-  for (size_t i = 0; i < motor_ids_.size(); i++) {
-    u8 id = motor_ids_[i];
-    int retry = 3;
-    bool found = false;
-    while (retry--) {
-      if (sms_sts_.Ping(id) != -1) {
-        found = true;
-        break;
-      }
-      usleep(10000);
-    }
-    if (!found) {
+  // Wheels: scoped configuration (wheel mode).
+  const auto wheel_result = bus_->apply_configs(wheel_ids_);
+  if (!wheel_result.ok) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Wheel activation failed: %s", wheel_result.detail.c_str());
+    bus_->emergency_release(wheel_ids_);
+    // The arm activated successfully a few lines above, so it is holding
+    // torque right now. Activation as a whole has failed, and leaving half a
+    // robot energized is exactly the state fail-closed exists to prevent:
+    // release the arm too before reporting ERROR.
+    if (arm_ && !arm_->stop(so101::StopPolicy::TorqueOff)) {
       RCLCPP_ERROR(
         rclcpp::get_logger("LeKiwiSystemHardware"),
-        "Motor ID %d is NOT responding!", id);
-      return hardware_interface::CallbackReturn::FAILURE;
+        "Arm torque release during wheel-failure rollback also failed: %s",
+        arm_->health().detail.c_str());
     }
-    RCLCPP_DEBUG(rclcpp::get_logger("LeKiwiSystemHardware"), "Motor ID %d found.", id);
+    return hardware_interface::CallbackReturn::ERROR;
   }
 
-  // Configure arm motors (IDs 1-6): position mode
-  for (size_t i = 0; i < arm_motor_ids_.size(); i++) {
-    u8 id = arm_motor_ids_[i];
-    sms_sts_.EnableTorque(id, 0);
-    usleep(2000);
-    sms_sts_.unLockEprom(id);
-    usleep(2000);
-
-    int offset = homing_offsets_[id];
-    u16 encoded_offset = encode_homing_offset(offset);
-    sms_sts_.writeWord(id, 31, encoded_offset);
-    sms_sts_.writeWord(id, 9, range_mins_[id]);
-    sms_sts_.writeWord(id, 11, range_maxes_[id]);
-    sms_sts_.writeByte(id, 7, 0);
-    sms_sts_.writeByte(id, 21, 16);
-    sms_sts_.writeByte(id, 22, 32);
-    sms_sts_.writeByte(id, 23, 0);
-
-    sms_sts_.LockEprom(id);
-    usleep(2000);
-    sms_sts_.EnableTorque(id, 1);
-    usleep(2000);
+  // Seed wheel commands to zero.
+  std::vector<feetech::MotorTarget> stop_targets;
+  for (const std::uint8_t id : wheel_ids_) {
+    feetech::MotorTarget t;
+    t.id = id;
+    t.velocity = 0.0;
+    stop_targets.push_back(t);
   }
+  bus_->sync_write_velocities(stop_targets);
 
-  // Configure base motors (IDs 7-9): wheel (velocity) mode
-  for (size_t i = 0; i < base_motor_ids_.size(); i++) {
-    u8 id = base_motor_ids_[i];
-    sms_sts_.EnableTorque(id, 0);
-    usleep(2000);
-    sms_sts_.unLockEprom(id);
-    usleep(2000);
-
-    // Set to wheel mode (continuous rotation)
-    sms_sts_.WheelMode(id);
-    usleep(2000);
-
-    sms_sts_.LockEprom(id);
-    usleep(2000);
-    sms_sts_.EnableTorque(id, 1);
-    usleep(2000);
-  }
-
-  // Initialize sync read for all 9 motors (position: 2 bytes at register 56)
-  sms_sts_.syncReadBegin(motor_ids_.size(), 2, 10);
-
-  // Initial read for arm positions
-  if (sms_sts_.syncReadPacketTx(
-      motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L,
-      2) > 0)
-  {
-    for (size_t i = 0; i < motor_ids_.size(); i++) {
-      u8 data[2];
-      if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-        s16 pos = decode_motor_register(data[0], data[1]);
-        double rad = ticks_to_radians(pos);
-        hw_positions_[i] = rad;
-        if (i < num_arm_joints_) {
-          hw_commands_[i] = rad;  // hold current position
-        }
+  // Seed the ros2_control command buffer from the SDK's hold targets before
+  // the first write(). Arm::activate() leaves the arm holding its measured
+  // pose, but hw_commands_ still holds zeros from on_init (or the previous
+  // activation's values on an inactive -> active re-entry). Without this the
+  // very first write() commands those stale values, driving a non-zero arm
+  // toward zero while the runtime is still idle. Wheels are seeded to zero to
+  // match the stop written above.
+  if (arm_) {
+    so101::ArmState state;
+    if (!arm_->read(state)) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
+        "Arm read failed while seeding hold targets: %s", arm_->health().detail.c_str());
+      bus_->emergency_release(wheel_ids_);
+      arm_->stop(so101::StopPolicy::TorqueOff);
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    const auto & targets = arm_->command_targets();
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      const std::string & name = info_.joints[i].name;
+      const auto reading = state.joints.find(name);
+      const auto target = targets.find(name);
+      if (reading == state.joints.end() || target == targets.end()) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("LeKiwiSystemHardware"),
+          "Arm joint %s missing while seeding hold targets", name.c_str());
+        bus_->emergency_release(wheel_ids_);
+        arm_->stop(so101::StopPolicy::TorqueOff);
+        return hardware_interface::CallbackReturn::ERROR;
       }
+      hw_positions_[i] = reading->second.position;
+      hw_velocities_[i] = reading->second.velocity;
+      hw_commands_[i] = target->second;
+      arm_command_map_[name] = hw_commands_[i];
     }
+  }
+  for (size_t i = 0; i < wheel_ids_.size(); i++) {
+    hw_commands_[num_arm_joints_ + i] = 0.0;
   }
 
   RCLCPP_INFO(
     rclcpp::get_logger("LeKiwiSystemHardware"),
     "Activated! %zu arm + %zu base motors running.",
-    arm_motor_ids_.size(), base_motor_ids_.size());
+    arm_ids_.size(), wheel_ids_.size());
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-hardware_interface::CallbackReturn LeKiwiSystemHardware::on_deactivate(
-  const rclcpp_lifecycle::State &)
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Deactivating...");
-
-  // Stop base motors first
-  if (!base_motor_ids_.empty()) {
-    s16 zero_speeds[3] = {0, 0, 0};
-    u8 zero_accs[3] = {0, 0, 0};
-    sms_sts_.SyncWriteSpe(base_motor_ids_.data(), base_motor_ids_.size(), zero_speeds, zero_accs);
+  // inactive -> active re-enters on_activate() without on_configure(), so the
+  // shared bus must stay open: stop wheels and release torque only.
+  RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Deactivating (torque off, bus kept)...");
+  if (!bus_) {
+    return hardware_interface::CallbackReturn::SUCCESS;
   }
 
-  // Disable torque on all motors
-  for (size_t i = 0; i < motor_ids_.size(); i++) {
-    sms_sts_.EnableTorque(motor_ids_[i], 0);
+  // Stop wheels first.
+  std::vector<feetech::MotorTarget> stop_targets;
+  for (const std::uint8_t id : wheel_ids_) {
+    feetech::MotorTarget t;
+    t.id = id;
+    t.velocity = 0.0;
+    stop_targets.push_back(t);
   }
-  usleep(100000);
-  sms_sts_.syncReadEnd();
-  sms_sts_.end();
+  const auto stop_result = bus_->sync_write_velocities(stop_targets);
+  if (!stop_result.ok) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Wheel stop command failed: %s", stop_result.detail.c_str());
+  }
 
+  // Both releases are attempted even when the first one fails -- a subsystem
+  // that can still be released must be. The outcomes are aggregated: this
+  // callback's return value is what /runtime/stop reports to its caller, so
+  // swallowing a failed release here would confirm a stop while a motor is
+  // still energized. In base-only mode there is no arm, which is precisely
+  // when an ignored wheel-release result had nothing left to fail on.
+  const auto wheel_release = bus_->emergency_release(wheel_ids_);
+  if (!wheel_release.ok) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Wheel torque release failed: %s", wheel_release.detail.c_str());
+  }
+  bool arm_released = true;
+  if (arm_ && !arm_->stop(so101::StopPolicy::TorqueOff)) {
+    arm_released = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Arm torque release failed: %s", arm_->health().detail.c_str());
+  }
+  if (!wheel_release.ok || !arm_released) {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-hardware_interface::return_type LeKiwiSystemHardware::read(
-  const rclcpp::Time &, const rclcpp::Duration &)
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_cleanup(const rclcpp_lifecycle::State &)
+{
+  RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Cleaning up (closing bus)...");
+  teardown_bus();
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn
+LeKiwiSystemHardware::on_shutdown(const rclcpp_lifecycle::State &)
+{
+  teardown_bus();
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+void LeKiwiSystemHardware::teardown_bus()
+{
+  if (!bus_) {
+    return;
+  }
+  bus_->emergency_release(wheel_ids_);
+  if (arm_) {
+    arm_->deactivate();  // scoped release (shared bus: close is a no-op here)
+  }
+  bus_->close();
+  bus_.reset();
+  arm_.reset();
+}
+
+hardware_interface::return_type
+LeKiwiSystemHardware::read(const rclcpp::Time &, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
-  // Read positions from all motors
-  int read_len = sms_sts_.syncReadPacketTx(
-    motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L, 2);
-  if (read_len <= 0) {
-    RCLCPP_ERROR_THROTTLE(
-      rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
-      "SyncRead PacketTx FAILED");
-    return hardware_interface::return_type::ERROR;
-  }
-
-  auto next_positions = hw_positions_;
-  for (size_t i = 0; i < motor_ids_.size(); i++) {
-    u8 data[2];
-    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
+  // Arm: scoped read (wheel failures do not affect the arm subsystem).
+  if (arm_) {
+    so101::ArmState state;
+    if (!arm_->read(state)) {
       RCLCPP_ERROR_THROTTLE(
-        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
-        "SyncRead position response missing for motor ID %d", motor_ids_[i]);
+        rclcpp::get_logger("LeKiwiSystemHardware"),
+        steady_clock, 500, "Arm read failed");
       return hardware_interface::return_type::ERROR;
     }
-    s16 pos = decode_motor_register(data[0], data[1]);
-
-    if (i < num_arm_joints_) {
-      // Arm: convert ticks to radians
-      next_positions[i] = ticks_to_radians(pos);
-    } else {
-      // Base: store raw position tick (accumulated rotation in wheel mode)
-      next_positions[i] = static_cast<double>(pos);
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      const auto it = state.joints.find(info_.joints[i].name);
+      if (it == state.joints.end()) {
+        return hardware_interface::return_type::ERROR;
+      }
+      hw_positions_[i] = it->second.position;
+      hw_velocities_[i] = it->second.velocity;
     }
   }
 
-  // Also read speeds for arm motors
-  read_len = sms_sts_.syncReadPacketTx(
-    motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_SPEED_L, 2);
-  if (read_len <= 0) {
+  // Wheels: scoped read.
+  std::vector<feetech::MotorSample> wheel_samples;
+  const auto wheel_result = bus_->sync_read(wheel_samples, wheel_ids_);
+  if (!wheel_result.ok) {
     RCLCPP_ERROR_THROTTLE(
-      rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
-      "SyncRead speed PacketTx FAILED");
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      steady_clock, 500, "Wheel read failed: %s", wheel_result.detail.c_str());
     return hardware_interface::return_type::ERROR;
   }
-
-  auto next_velocities = hw_velocities_;
-  for (size_t i = 0; i < motor_ids_.size(); i++) {
-    u8 data[2];
-    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
-      RCLCPP_ERROR_THROTTLE(
-        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
-        "SyncRead speed response missing for motor ID %d", motor_ids_[i]);
-      return hardware_interface::return_type::ERROR;
-    }
-    s16 speed = decode_motor_register(data[0], data[1]);
-    next_velocities[i] = steps_to_rad_s(speed);
+  for (size_t i = 0; i < wheel_ids_.size(); i++) {
+    const size_t idx = num_arm_joints_ + i;
+    hw_positions_[idx] = wheel_samples[i].position;
+    hw_velocities_[idx] = wheel_samples[i].velocity;
   }
 
-  hw_positions_ = next_positions;
-  hw_velocities_ = next_velocities;
   return hardware_interface::return_type::OK;
 }
 
-hardware_interface::return_type LeKiwiSystemHardware::write(
-  const rclcpp::Time &, const rclcpp::Duration &)
+hardware_interface::return_type
+LeKiwiSystemHardware::write(const rclcpp::Time &, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
-  // ---- Arm motors: position control (SyncWritePosEx) ----
-  for (size_t i = 0; i < num_arm_joints_; i++) {
-    arm_target_positions_[i] = radians_to_ticks(hw_commands_[i]);
-    arm_target_speeds_[i] = 2400;
-    arm_target_accs_[i] = 50;
-  }
-
-  if (!arm_motor_ids_.empty()) {
-    sms_sts_.SyncWritePosEx(
-      arm_motor_ids_.data(), arm_motor_ids_.size(),
-      arm_target_positions_.data(), arm_target_speeds_.data(), arm_target_accs_.data());
-  }
-
-  // ---- Base motors: velocity control (SyncWriteSpe) ----
-  if (!base_motor_ids_.empty()) {
-    std::vector<s16> base_speeds(num_base_joints_);
-    std::vector<u8> base_accs(num_base_joints_);
-    for (size_t i = 0; i < num_base_joints_; i++) {
-      // hw_commands_[num_arm_joints_ + i] is velocity in rad/s (ros2_control convention).
-      // Convert to raw steps/s for the STS3215 speed register.
-      base_speeds[i] = rad_s_to_steps(hw_commands_[num_arm_joints_ + i]);
-      base_accs[i] = 50;
+  if (arm_) {
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      arm_command_map_[info_.joints[i].name] = hw_commands_[i];
     }
-    sms_sts_.SyncWriteSpe(
-      base_motor_ids_.data(), base_motor_ids_.size(), base_speeds.data(), base_accs.data());
+    if (!arm_->write_targets(arm_command_map_)) {
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
+        steady_clock, 500, "Arm write failed");
+      return hardware_interface::return_type::ERROR;
+    }
+  }
+
+  if (!wheel_ids_.empty()) {
+    std::vector<feetech::MotorTarget> targets;
+    for (size_t i = 0; i < wheel_ids_.size(); i++) {
+      feetech::MotorTarget t;
+      t.id = wheel_ids_[i];
+      t.velocity = hw_commands_[num_arm_joints_ + i];
+      targets.push_back(t);
+    }
+    if (!bus_->sync_write_velocities(targets).ok) {
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
+        steady_clock, 500, "Wheel write failed");
+      return hardware_interface::return_type::ERROR;
+    }
   }
 
   return hardware_interface::return_type::OK;
@@ -399,4 +440,5 @@ hardware_interface::return_type LeKiwiSystemHardware::write(
 
 #include "pluginlib/class_list_macros.hpp"
 PLUGINLIB_EXPORT_CLASS(
-  lekiwi_hardware::LeKiwiSystemHardware, hardware_interface::SystemInterface)
+  lekiwi_hardware::LeKiwiSystemHardware,
+  hardware_interface::SystemInterface)
