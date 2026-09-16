@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>lekiwi_sdk</name>
+  <version>0.1.0</version>
+  <description>
+    ROS-free LeKiwi mobile manipulator SDK: omni base velocity control and
+    odometry, composed with the SO-101 arm on one shared Feetech bus.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>feetech_sdk</depend>
+  <depend>so101_sdk</depend>
+
+  <!-- Required, not optional: lekiwi_robot's base node imports lekiwi_sdk_py
+       unconditionally, so the bindings must always be built. -->
+  <build_depend>python3-dev</build_depend>
+  <build_depend>pybind11-dev</build_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

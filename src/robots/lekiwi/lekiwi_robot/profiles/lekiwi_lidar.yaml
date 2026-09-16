@@ -1,0 +1,162 @@
+# LeKiwi runtime profile: SO-101 arm + omni-wheel base on one shared bus.
+
+runtime:
+  name: lekiwi_robot
+  version: 0.1.0
+
+simulated: false
+controller_manager: controller_manager
+joint_state_topic: /joint_states
+joints: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+arm_joints: ["1", "2", "3", "4", "5"]
+
+description:
+  xacro: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+  xacro_args:
+    use_sim: "false"
+
+hardware:
+  port: /dev/ttyACM0
+  calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+  reset_positions:
+    "1": 0.0
+    "2": -1.5854
+    "3": 1.5708
+    "4": 0.7854
+    "5": 0.0
+
+ros2_control:
+  controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
+  broadcasters: [joint_state_broadcaster, arm_joint_state_broadcaster]
+  hardware_components: [RobotSystem]
+
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: [stream, trajectory, base_navigation]
+  stream:
+    controllers: [arm_position_controller, gripper_position_controller]
+    allows_stream: true
+    transitions: [idle, trajectory]
+  trajectory:
+    controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+    allows_trajectory: true
+    transitions: [idle, stream, base_navigation]
+  base_navigation:
+    controllers: [base_velocity_controller]
+    allows_base: true
+    transitions: [idle, trajectory]
+
+command_channels:
+  - channel: arm_stream
+    topic: /arm_position_controller/commands
+    joints: ["1", "2", "3", "4", "5"]
+    modes: [stream]
+  - channel: gripper_stream
+    topic: /gripper_position_controller/commands
+    joints: ["6"]
+    modes: [stream]
+  - channel: base_cmd_vel
+    topic: /cmd_vel
+    type: twist
+    modes: [base_navigation]
+    navigation_gated: true
+
+trajectory_actions:
+  - /arm_trajectory_controller/follow_joint_trajectory
+  - /gripper_trajectory_controller/follow_joint_trajectory
+
+motion:
+  arm_group_name: arm
+  base_link: base
+  ee_link: gripper
+  shoulder_link: shoulder
+  # MoveIt consumes the arm-only broadcaster (wheels excluded from the model).
+  joint_state_topic: /arm_joint_state_broadcaster/joint_states
+  ik_worker_count: 0
+  motion_feedback_timeout_s: 0.3
+  motion_feedback_tolerance_rad: 0.12
+  motion_require_tf_sync: true
+  motion_hardware_feedback_topic: /so101_follower/joint_currents
+
+base:
+  wheel_joints: ["7", "8", "9"]
+  wheel_radius: 0.05
+  base_radius: 0.125
+  max_wheel_radps: 4.602
+  control_frequency: 50.0
+  odom_frame: odom
+  base_frame: base_link
+  publish_tf: true
+  navigation_enabled_on_startup: false
+
+capabilities:
+  joint.state: {joint_count: 9, rate_hz: 100.0}
+  joint.position_stream: {joint_count: 6, rate_hz: 100.0}
+  joint.trajectory: {joint_count: 6}
+  gripper.1d: {count: 1}
+  motion.fk: {ee_link: gripper, endpoints: [/motion/compute_fk]}
+  motion.ik: {endpoints: [/motion/compute_ik]}
+  motion.move_to_joint: {}
+  motion.move_to_pose: {}
+  base.cmd_vel: {max_vx: 0.5, max_vy: 0.5, max_wz: 1.5, staleness_s: 0.5}
+  base.odom: {}
+  base.navigation_gate: {}
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+
+# D12: the robot's default sensor surface. Deployment robot YAMLs override
+# entries by (type, name) via the runtime `peripherals` launch argument.
+peripherals:
+- type: lidar
+  name: mid360
+  driver: livox_mid360
+  frame_id: livox_frame
+  lidar_ip: 192.168.1.139
+  host_ip: 192.168.1.5
+  pointcloud_topic: /livox/lidar
+  imu_topic: /livox/imu
+  user_config_path: $(find livox_ros_driver2)/config/MID360_config.json
+  xfer_format: 1
+  multi_topic: 0
+  data_src: 0
+  publish_freq: 10.0
+  output_data_type: 0
+  cmdline_input_bd_code: livox0000000001
+  respawn: true
+  scan_converter:
+    enabled: true
+    queue_size: 1
+    pointcloud_topic: /cloud_registered_body
+    scan_topic: /scan
+    target_frame: body
+    transform_tolerance: 0.01
+    min_height: -0.05
+    max_height: 0.5
+    angle_min: -3.14159265
+    angle_max: 3.14159265
+    angle_increment: 0.00872665
+    scan_time: 0.1
+    range_min: 0.1
+    range_max: 8.0
+    use_inf: true
+    inf_epsilon: 1.0
+    respawn: true
+
+# D12: lidar odometry chain defaults (lekiwi runtime composes fastlio_mapping
+# plus the odom bridge; deployment overrides merge on top).
+fast_lio:
+  enabled: false
+  params_file: $(find lekiwi_robot)/config/fast_lio_mid360.yaml
+  lidar_topic: /livox/lidar
+  imu_topic: /livox/imu
+  raw_odom_topic: /fast_lio/odometry_raw
+  output_topic: /odometry/filtered
+  source_odom_frame: camera_init
+  source_body_frame: body
+  odom_frame: odom
+  base_frame: base_link
+  publish_tf: true
+  planar_output: false
+  max_future_skew_sec: 0.1
+  respawn: true
