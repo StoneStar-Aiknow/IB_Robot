@@ -12,6 +12,9 @@
   <!-- Runtime dependency for processing xacro files -->
   <exec_depend>xacro</exec_depend>
   <exec_depend>lekiwi_hardware</exec_depend>
+  <!-- lekiwi_assembled.urdf.xacro includes the SO-101 arm description: the
+       LeKiwi arm IS an SO-101 arm, so the geometry is reused, not forked. -->
+  <exec_depend>so101_description</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

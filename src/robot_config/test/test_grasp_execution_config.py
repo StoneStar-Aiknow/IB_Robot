@@ -166,7 +166,7 @@ def test_pc_profile_requires_final_fk_fixed_finger_inward_clearance() -> None:
 
 
 def test_lekiwi_controller_config_has_full_and_arm_only_state_streams() -> None:
-    path = Path(__file__).parents[2] / "lekiwi_hardware" / "config" / "lekiwi_controllers.yaml"
+    path = Path(__file__).parents[2] / "robots" / "lekiwi" / "lekiwi_hardware" / "config" / "lekiwi_controllers.yaml"
     controller_config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     manager = controller_config["controller_manager"]["ros__parameters"]

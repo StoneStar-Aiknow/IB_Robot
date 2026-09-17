@@ -26,7 +26,7 @@
 
   <xacro:unless value="$(arg base_only)">
     <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
-    <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_base.xacro"/>
+    <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_base.xacro"/>
   </xacro:unless>
 
   <!-- ============================================ -->
