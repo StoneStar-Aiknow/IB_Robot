@@ -11,7 +11,7 @@ def local_bundle(tmp_path):
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     return {
-        "config": SimpleNamespace(num_inference_steps=10, dtype="float32"),
+        "config": SimpleNamespace(num_inference_steps=10, dtype="float32", tokenizer_max_length=200),
         "bundle_root": tmp_path,
         "tokenizer_path": str(tokenizer),
         "device_name": "Ascend310P1",
@@ -71,3 +71,13 @@ def test_provider_owns_optional_stage_metadata():
     assert selected.execution_metadata(policy) == {}
     records.append({"prefix_ms": 143.0, "denoise_total_ms": 80.0})
     assert selected.execution_metadata(policy) == {"pi05_stage_timing": records[-1]}
+
+
+def test_cpu_resize_rejects_nonidentity_visual_normalization(monkeypatch, local_bundle):
+    from lerobot.configs import FeatureType, NormalizationMode
+
+    monkeypatch.setattr(provider, "package_version", lambda _name: "5.3.0")
+    local_bundle["config"].ascend_cpu_image_resize = True
+    local_bundle["config"].normalization_mapping = {FeatureType.VISUAL: NormalizationMode.MEAN_STD}
+    with pytest.raises(ValueError, match="IDENTITY visual normalization"):
+        provider.create_provider().validate(**local_bundle)

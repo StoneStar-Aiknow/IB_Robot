@@ -8,6 +8,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
+from torch_models.pi05_ascend_310p.input_optimization import configure_input_processors, resize_host_images
 from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
     PI05Ascend310PPolicy,
     configure_pi05_ascend_310p_config,
@@ -32,6 +33,11 @@ def validate_pi05_ascend_310p(*, config, bundle_root: Path, tokenizer_path: str 
         raise ValueError(f"unable to identify Transformers: {exc}") from exc
     if transformers_version.base_version != "5.3.0":
         raise ValueError(f"PI05 Ascend310P provider requires Transformers 5.3.0, got {transformers_version}")
+    if getattr(config, "ascend_cpu_image_resize", False):
+        from lerobot.configs import FeatureType, NormalizationMode
+
+        if config.normalization_mapping.get(FeatureType.VISUAL) != NormalizationMode.IDENTITY:
+            raise ValueError("PI05 CPU image resize requires IDENTITY visual normalization")
 
 
 def prepare_pi05_ascend_310p(*, policy, deployment_fingerprint, torch_module, torch_npu_module, device_name):
@@ -56,6 +62,8 @@ def create_provider() -> PolicyProvider:
         prepare=prepare_pi05_ascend_310p,
         load_options=PI05_ASCEND_310P_LOAD_OPTIONS,
         execution_metadata=_execution_metadata,
+        preprocess_inputs=resize_host_images,
+        configure_processors=configure_input_processors,
     )
 
 

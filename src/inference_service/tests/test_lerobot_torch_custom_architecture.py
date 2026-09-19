@@ -38,6 +38,30 @@ def test_npu_device_name_uses_physical_sku() -> None:
     assert LeRobotTorchModelSession._npu_device_name(torch_module) == "Ascend310P1"
 
 
+def test_model_owned_input_hook_runs_before_lerobot_processor():
+    session = LeRobotTorchModelSession("cpu")
+    config = object()
+    calls = []
+    session._policy_config = config
+
+    def transform(inputs, *, config):
+        calls.append(("provider", config))
+        return {**inputs, "resized": True}
+
+    def processor(inputs):
+        calls.append(("processor", inputs["resized"]))
+        return inputs
+
+    session._policy_provider = SimpleNamespace(preprocess_inputs=transform)
+    session._preprocessor = processor
+    source = {"task": "pick"}
+    result = session.preprocess(source)
+
+    assert result == {"task": "pick", "resized": True}
+    assert source == {"task": "pick"}
+    assert calls == [("provider", config), ("processor", True)]
+
+
 def test_npu_device_name_fails_closed_without_api() -> None:
     with pytest.raises(BackendLoadError, match="does not expose get_device_name"):
         LeRobotTorchModelSession._npu_device_name(SimpleNamespace(npu=SimpleNamespace()))

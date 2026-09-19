@@ -66,6 +66,7 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+from .input_optimization import CPU_IMAGE_RESIZE_ENV, CPU_OUTPUT_ENV, language_token_limit, trim_language_padding
 from .vision_siglip_npu import PI05SiglipVisionModel
 
 
@@ -84,6 +85,7 @@ _TORCHAIR_CACHE_HOME_ENV = "IBROBOT_PI05_TORCHAIR_CACHE_HOME"
 _GRAPH_COMPILE_ENV = "IBROBOT_PI05_GRAPH_COMPILE"
 _NPU_FUSED_OPS_ENV = "IBROBOT_PI05_NPU_FUSED_OPS"
 _STAGE_TIMING_ENV = "IBROBOT_PI05_STAGE_TIMING"
+_VISION_FFN_ENV = "IBROBOT_PI05_VISION_FFN"
 _CONFIG_DEFAULTS = {
     "compile_inference_graph": True,
     "compile_inference_backend": "torchair",
@@ -134,6 +136,9 @@ def configure_pi05_ascend_310p_config(config: PI05Config, *, model_dtype: str = 
         raise ValueError(f"unsupported PI05 Ascend310P model dtype: {model_dtype!r}") from exc
     for name, value in _CONFIG_DEFAULTS.items():
         setattr(config, name, value)
+    config.ascend_language_token_limit = language_token_limit(config.tokenizer_max_length)
+    config.ascend_cpu_image_resize = _env_flag(CPU_IMAGE_RESIZE_ENV, default=False)
+    config.ascend_cpu_output = _env_flag(CPU_OUTPUT_ENV, default=False)
     return config
 
 
@@ -235,6 +240,8 @@ def _torchair_cache_dir(
     prefix_graph_mode: str,
     npu_fused_ops: bool,
     vision_npu_fused_ops: bool,
+    language_capacity: int | None = None,
+    vision_ffn: bool = False,
 ) -> Path | None:
     if not _env_flag(_TORCHAIR_CACHE_ENV, default=True):
         return None
@@ -256,6 +263,8 @@ def _torchair_cache_dir(
         f"prefix-{prefix_graph_mode}",
         f"npu-fused-{npu_fused_ops}",
         f"vision-fused-{vision_npu_fused_ops}",
+        *([f"language-capacity-{language_capacity}"] if language_capacity is not None else []),
+        *(["vision-ffn-v1"] if vision_ffn else []),
         deployment_fingerprint,
     )
     return root.expanduser().joinpath(*(_cache_component(value) for value in components)).resolve()
@@ -1605,6 +1614,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         enable_npu_fused_ops: bool = False,
         enable_graph_compile: bool | None = None,
         enable_qkv_fusion: bool | None = None,
+        enable_vision_ffn: bool = False,
         torchair_cache_dir: str | Path | None = None,
     ) -> dict[str, Any]:
         """Finalize optional PI0.5 inference optimizations after weights are loaded."""
@@ -1660,6 +1670,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             optimization_info["adarms_npu_mode"] = "dynamic_weight"
         if enable_graph_compile:
             self._refresh_fixed_denoise_lookup_tables()
+        if enable_vision_ffn:
+            vision_tower = self.paligemma_with_expert.paligemma.model.vision_tower
+            if not enable_graph_compile or not isinstance(vision_tower, PI05SiglipVisionModel):
+                raise ValueError("PI05 vision FFN requires the compiled local vision tower")
+            optimization_info["vision_tower_npu_fused_ops"]["ffn_layers"] = vision_tower.prepare_npu_ffn()
         if enable_npu_fused_ops or enable_graph_compile:
             optimization_info["npu_internal_format_weights"] = self._prepare_npu_internal_format_weights()
         if enable_graph_compile:
@@ -2806,6 +2821,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 "PI0.5 graph inference compiles denoise as one fixed 10-step TorchAir graph; "
                 f"got num_steps={num_steps}."
             )
+        capacity = getattr(self.config, "ascend_language_token_limit", None)
+        if capacity is not None:
+            tokens, masks = trim_language_padding(tokens, masks, capacity)
         device = tokens.device
         x_t = self._cast_action_tensor(noise)
         if (
@@ -3051,6 +3069,7 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         enable_npu_fused_ops: bool = False,
         enable_graph_compile: bool | None = None,
         enable_qkv_fusion: bool | None = None,
+        enable_vision_ffn: bool = False,
         torchair_cache_dir: str | Path | None = None,
     ) -> dict[str, Any]:
         """Finalize optional PI0.5 inference optimizations after loading or device placement."""
@@ -3060,6 +3079,7 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
             enable_npu_fused_ops=enable_npu_fused_ops,
             enable_graph_compile=enable_graph_compile,
             enable_qkv_fusion=enable_qkv_fusion,
+            enable_vision_ffn=enable_vision_ffn,
             torchair_cache_dir=torchair_cache_dir,
         )
 
@@ -3076,8 +3096,16 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         enable_graph_compile = _env_flag(_GRAPH_COMPILE_ENV, default=True)
         enable_npu_fused_ops = _env_flag(_NPU_FUSED_OPS_ENV, default=True)
         enable_vision_npu_fused_ops = _env_flag(PI05_ENABLE_VISION_NPU_FUSED_OPS_ENV, default=True)
-        self.model.enable_action_fused_stage_timing(_env_flag(_STAGE_TIMING_ENV, default=False))
+        enable_vision_ffn = _env_flag(_VISION_FFN_ENV, default=False)
         prefix_graph_mode = self.model._prefix_graph_mode()
+        if enable_vision_ffn and (
+            not enable_graph_compile
+            or not enable_vision_npu_fused_ops
+            or prefix_graph_mode == "eager_vision_split"
+            or self.config.dtype != "float16"
+        ):
+            raise ValueError(f"{_VISION_FFN_ENV} requires FP16 with the compiled local vision tower")
+        self.model.enable_action_fused_stage_timing(_env_flag(_STAGE_TIMING_ENV, default=False))
         cache_dir = _torchair_cache_dir(
             deployment_fingerprint=deployment_fingerprint,
             torch_module=torch_module,
@@ -3087,11 +3115,14 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
             prefix_graph_mode=prefix_graph_mode,
             npu_fused_ops=enable_npu_fused_ops,
             vision_npu_fused_ops=enable_vision_npu_fused_ops,
+            language_capacity=getattr(self.config, "ascend_language_token_limit", None),
+            vision_ffn=enable_vision_ffn,
         )
         return self.prepare_inference_optimizations(
             enable_graph_compile=enable_graph_compile,
             enable_npu_fused_ops=enable_npu_fused_ops,
             enable_qkv_fusion=False,
+            enable_vision_ffn=enable_vision_ffn,
             torchair_cache_dir=cache_dir if enable_graph_compile else None,
         )
 
@@ -3411,7 +3442,7 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        return actions
+        return actions.cpu() if getattr(self.config, "ascend_cpu_output", False) else actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.

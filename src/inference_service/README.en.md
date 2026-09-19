@@ -474,6 +474,12 @@ models may register a stable `(model_type, backend, device)` provider; PI0.5
 Ascend310P uses `(pi05, torch, npu)`. The generic runtime does not maintain
 model-specific platform branches; each provider owns its configuration,
 platform validation, and runtime preparation.
+The optional provider hook `preprocess_inputs(inputs, config=...)` runs
+model-owned CPU input optimization before the LeRobot processor. Its cost
+remains included in pipeline preprocessing; image rules stay out of the generic session.
+The optional `configure_processors(preprocessor=..., postprocessor=..., config=...)`
+hook configures model-specific LeRobot steps at load time, such as checking
+language capacity before upload or keeping small action tensors on the CPU.
 
 Compiled PI0.5 and SmolVLA loops are owned by shared executor stages, not model-session resources. They execute through
 `InferencePipeline -> ModelRuntimeHandle -> SequentialModelExecutor -> InferenceStage -> ModelSession resource`.

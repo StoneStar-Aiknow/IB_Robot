@@ -34,7 +34,8 @@ from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
 
 
 @pytest.mark.parametrize("training", [False, True])
-def test_predict_action_chunk_only_switches_mode_when_training(training):
+@pytest.mark.parametrize("cpu_output", [False, True])
+def test_predict_action_chunk_only_switches_mode_when_training(training, cpu_output):
     from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
     policy = PI05Ascend310PPolicy.__new__(PI05Ascend310PPolicy)
@@ -48,7 +49,9 @@ def test_predict_action_chunk_only_switches_mode_when_training(training):
         return policy
 
     policy.eval = enter_eval
-    policy.config = SimpleNamespace(output_features={"action": SimpleNamespace(shape=(6,))})
+    policy.config = SimpleNamespace(
+        output_features={"action": SimpleNamespace(shape=(6,))}, ascend_cpu_output=cpu_output
+    )
     policy._preprocess_images = lambda batch: ([], [])
     action = torch.arange(50 * 32, dtype=torch.float32).reshape(1, 50, 32)
     policy.model = SimpleNamespace(sample_actions=lambda *args, **kwargs: action)
@@ -113,6 +116,12 @@ def test_torchair_cache_separates_npu_graph_variants(monkeypatch, tmp_path) -> N
     assert fused != unfused
     assert "Ascend310P1" in fused.parts
     assert fused.is_relative_to(tmp_path / "cache")
+    compact = _torchair_cache_dir(**common, vision_npu_fused_ops=True, language_capacity=48)
+    assert compact != fused
+    assert "language-capacity-48" in compact.parts
+    ffn = _torchair_cache_dir(**common, vision_npu_fused_ops=True, language_capacity=48, vision_ffn=True)
+    assert ffn != compact
+    assert "vision-ffn-v1" in ffn.parts
 
 
 @pytest.mark.parametrize(

@@ -89,6 +89,8 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 | `load_options` | 该模型特有的 `from_pretrained` 参数 |
 | `prepare(policy=..., deployment_fingerprint=..., torch_module=..., torch_npu_module=..., device_name=...)` | 模型放置设备并转换 dtype 后准备推理优化 |
 | `execution_metadata(policy)` | 可选的模型诊断 metadata，默认无 |
+| `preprocess_inputs(inputs, config=...)` | 可选的 CPU 输入优化；在 LeRobot processor 之前执行，耗时计入 pipeline preprocess，默认不改变输入 |
+| `configure_processors(preprocessor=..., postprocessor=..., config=...)` | 可选；加载阶段为该模型组装 LeRobot processor steps，默认不修改 processor |
 
 `ModelSession` 继续管理权重加载、设备放置、processor、取消和资源释放。Provider 不依赖
 ROS，也不导入 `inference_service`。模型源码、兼容矩阵和使用说明归属模型目录。

@@ -622,6 +622,10 @@ Canonical backend 只有以下五个：
 稳定的 `(model_type, backend, device)` provider；例如 PI0.5 Ascend310P 使用
 `(pi05, torch, npu)`。通用 runtime 不按模型名称维护平台分支，provider 自己负责模型
 配置、平台校验和运行时准备。
+Provider 可选的 `preprocess_inputs(inputs, config=...)` 在 LeRobot processor 之前执行
+模型自己的 CPU 输入优化，仍计入 pipeline 的 preprocess 耗时；通用 session 不包含模型图像规则。
+可选的 `configure_processors(preprocessor=..., postprocessor=..., config=...)` 在加载阶段
+配置模型特定的 LeRobot steps，例如在上传之前检查语言容量、在 CPU 上处理小动作张量。
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
 Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间

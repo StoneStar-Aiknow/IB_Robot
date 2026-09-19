@@ -89,6 +89,9 @@ class LeRobotTorchModelSession(ModelSession):
         if self._preprocessor is None:
             raise BackendInferenceError("LeRobot preprocessor is not loaded", code="runtime_not_loaded")
         prepared = dict(inputs)
+        transform = getattr(self._policy_provider, "preprocess_inputs", None)
+        if transform is not None:
+            prepared = dict(transform(prepared, config=self._policy_config))
         if self._configured_device_name == "npu":
             # HWC->CHW views are cheap on the host but costly for a strided NPU
             # upload. Pack before LeRobot's device processor; include this copy
@@ -269,6 +272,11 @@ class LeRobotTorchModelSession(ModelSession):
             preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": {"device": str(device)}},
         )
+        configure_processors = getattr(provider, "configure_processors", None)
+        if configure_processors is not None:
+            configure_processors(
+                preprocessor=self._preprocessor, postprocessor=self._postprocessor, config=policy_config
+            )
         self._model_dtype = model_dtype
         resettable = callable(getattr(policy, "reset", None))
         self._update_loaded_capabilities(
