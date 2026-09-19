@@ -68,6 +68,12 @@ Diagnostic switches:
 - `IBROBOT_PI05_GRAPH_COMPILE=0` disables graph compilation for isolation tests.
 - `IBROBOT_PI05_NPU_FUSED_OPS=0` disables NPU fused operations for isolation tests.
 - `IBROBOT_PI05_STAGE_TIMING=1` adds synchronized prefix/denoise timings to result metadata.
+- `IBROBOT_PI05_TORCHAIR_CACHE_HOME=/path/to/cache` isolates experimental graphs;
+  confirm the actual cache path in the startup log before comparing variants.
 
 The graph/fused-op overrides are intended for diagnostics. Do not use
 synchronized stage timing in formal latency measurements.
+
+Evaluation mode is set at load/prepare time; predictions only switch mode if
+the policy has explicitly returned to training. Repeated recursive `eval()`
+traversals add measurable host overhead on Ascend310P1 without changing the graph.

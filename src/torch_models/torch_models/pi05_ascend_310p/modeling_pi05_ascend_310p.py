@@ -3381,7 +3381,8 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         """Select a single action given environment observations."""
         assert not self._rtc_enabled(), "RTC is not supported for select_action, use it with predict_action_chunk"
 
-        self.eval()
+        if self.training:
+            self.eval()
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
@@ -3394,7 +3395,10 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        self.eval()
+        # Construction and runtime preparation already enter evaluation mode.
+        # Rewalking every submodule on each request costs ~18 ms on 310P1.
+        if self.training:
+            self.eval()
 
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)

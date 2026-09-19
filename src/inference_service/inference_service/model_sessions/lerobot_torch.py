@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
 from typing import Any
 
+import numpy as np
+
 from inference_manifest import TorchRuntimeProfile
 from inference_service.auto_horizon_runtime import build_action_attention_collector
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
@@ -86,7 +88,18 @@ class LeRobotTorchModelSession(ModelSession):
     def preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         if self._preprocessor is None:
             raise BackendInferenceError("LeRobot preprocessor is not loaded", code="runtime_not_loaded")
-        return self._preprocessor(dict(inputs))
+        prepared = dict(inputs)
+        if self._configured_device_name == "npu":
+            # HWC->CHW views are cheap on the host but costly for a strided NPU
+            # upload. Pack before LeRobot's device processor; include this copy
+            # in normal preprocessing timing and leave device tensors alone.
+            is_tensor = getattr(self._torch, "is_tensor", lambda value: False)
+            for name, value in prepared.items():
+                if isinstance(value, np.ndarray):
+                    prepared[name] = np.ascontiguousarray(value) if value.ndim else value
+                elif is_tensor(value) and value.device.type == "cpu":
+                    prepared[name] = value.contiguous()
+        return self._preprocessor(prepared)
 
     def postprocess(self, action: object) -> object:
         if self._postprocessor is None:

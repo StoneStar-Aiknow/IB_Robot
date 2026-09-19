@@ -33,6 +33,34 @@ from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
 )
 
 
+@pytest.mark.parametrize("training", [False, True])
+def test_predict_action_chunk_only_switches_mode_when_training(training):
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    policy = PI05Ascend310PPolicy.__new__(PI05Ascend310PPolicy)
+    nn.Module.__init__(policy)
+    policy.training = training
+    calls = []
+
+    def enter_eval():
+        calls.append("eval")
+        policy.training = False
+        return policy
+
+    policy.eval = enter_eval
+    policy.config = SimpleNamespace(output_features={"action": SimpleNamespace(shape=(6,))})
+    policy._preprocess_images = lambda batch: ([], [])
+    action = torch.arange(50 * 32, dtype=torch.float32).reshape(1, 50, 32)
+    policy.model = SimpleNamespace(sample_actions=lambda *args, **kwargs: action)
+    batch = {OBS_LANGUAGE_TOKENS: torch.ones(1, 10), OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 10)}
+
+    for _ in range(2):
+        actual = policy.predict_action_chunk(batch)
+        torch.testing.assert_close(actual, action[:, :, :6])
+
+    assert calls == (["eval"] if training else [])
+
+
 def test_cann_version_reads_arch_specific_install_metadata(monkeypatch, tmp_path):
     toolkit = tmp_path / "latest"
     metadata = toolkit / "aarch64-linux" / "ascend_toolkit_install.info"
@@ -66,7 +94,7 @@ def test_config_rejects_non_ten_step_denoise() -> None:
 
 
 def test_torchair_cache_separates_npu_graph_variants(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("IBROBOT_TORCHAIR_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("IBROBOT_PI05_TORCHAIR_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("ASCEND_TOOLKIT_HOME", str(tmp_path / "missing-cann"))
     module = SimpleNamespace(__version__="2.5.1")
     common = {
@@ -84,6 +112,7 @@ def test_torchair_cache_separates_npu_graph_variants(monkeypatch, tmp_path) -> N
 
     assert fused != unfused
     assert "Ascend310P1" in fused.parts
+    assert fused.is_relative_to(tmp_path / "cache")
 
 
 @pytest.mark.parametrize(
