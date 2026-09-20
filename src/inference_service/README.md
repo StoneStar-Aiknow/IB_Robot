@@ -626,6 +626,10 @@ Provider 可选的 `preprocess_inputs(inputs, config=...)` 在 LeRobot processor
 模型自己的 CPU 输入优化，仍计入 pipeline 的 preprocess 耗时；通用 session 不包含模型图像规则。
 可选的 `configure_processors(preprocessor=..., postprocessor=..., config=...)` 在加载阶段
 配置模型特定的 LeRobot steps，例如在上传之前检查语言容量、在 CPU 上处理小动作张量。
+Deployment 的 `extra_parameters` 是模型拥有的通用 JSON 参数。原生 Torch session 将其副本
+传给可选 `resolve_load_options(config=..., extra_parameters=...)`，返回值用于本次模型构造。
+Session 不解释模型字段；没有对应 provider consumer 时拒绝非空参数，且不允许返回值覆盖
+严格权重加载/本地加载约束。参数参与部署与性能配置身份，不要求额外参数文件或内容校验值。
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
 Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间

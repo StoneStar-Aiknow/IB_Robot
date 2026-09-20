@@ -355,6 +355,7 @@
         },
         "device_links": {"type": "array", "items": {"$ref": "#/$defs/device_link"}},
         "audio_contract": {"$ref": "#/$defs/audio_contract"},
+        "extra_parameters": {"type": "object"},
         "metadata": {"type": "object"}
       }
     }

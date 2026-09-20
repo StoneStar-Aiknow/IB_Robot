@@ -29,6 +29,7 @@ from model_utils.inference_manifest_export import (
     upsert_deployment,
 )
 from model_utils.package_compiled_deployment import package_compiled_deployment
+from model_utils.package_pi05_ascend_deployments import package_pi05_ascend_deployments
 from model_utils.package_torch_deployment import package_torch_deployments
 
 
@@ -196,6 +197,65 @@ def test_native_devices_share_one_model_descriptor_without_selector(tmp_path, po
     assert set(result.manifest.deployments) == {"torch-cpu", "torch-cuda", "torch-npu"}
     assert result.manifest.model.model_type == policy_type
     assert result.manifest.model.architecture_class is None
+
+
+def test_generic_torch_packager_preserves_model_owned_extra_parameters(tmp_path):
+    _create_bundle(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    parameters = {"unknown_to_manifest": {"future_options": [True, 3, None]}}
+    result = package_torch_deployments(
+        tmp_path, devices=("cpu",), deployment_name="custom-mode", extra_parameters=parameters
+    )[0]
+    assert result.deployment.extra_parameters == parameters
+    assert load_inference_manifest(tmp_path, "custom-mode").deployment.extra_parameters == parameters
+    assert result.deployment.artifacts == {}
+    with pytest.raises(ValueError, match="one device"):
+        package_torch_deployments(tmp_path, deployment_name="ambiguous")
+
+
+def test_pi05_named_deployments_share_bundle_and_preserve_legacy_mode(tmp_path):
+    _create_bundle(tmp_path, policy_type="pi05")
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"weights")
+    config_before = (tmp_path / "config.json").read_bytes()
+    inode_before = weights.stat().st_ino
+    legacy = package_torch_deployments(tmp_path, devices=("npu",))[0]
+    results = package_pi05_ascend_deployments(tmp_path)
+    fidelity = load_inference_manifest(tmp_path, "torch-npu-fidelity")
+    fast = load_inference_manifest(tmp_path, "torch-npu-fast")
+    assert [r.deployment_name for r in results] == ["torch-npu-fidelity", "torch-npu-fast"]
+    assert fidelity.deployment.extra_parameters["denoising"] == {"solver": "euler", "schedule": "uniform", "steps": 10}
+    assert fast.deployment.extra_parameters["denoising"] == {"solver": "ab2", "schedule": "uniform", "steps": 3}
+    assert fidelity.deployment.extra_parameters["language_capacity"] == 200
+    assert fast.deployment.extra_parameters["language_capacity"] == 48
+    assert fidelity.deployment_fingerprint != fast.deployment_fingerprint
+    assert fidelity.manifest.bundle.uuid == fast.manifest.bundle.uuid == legacy.manifest.bundle.uuid
+    assert fidelity.manifest.bundle.revision == legacy.manifest.bundle.revision
+    assert load_inference_manifest(tmp_path, "torch-npu").deployment_fingerprint == legacy.deployment_fingerprint
+    assert weights.stat().st_ino == inode_before and weights.read_bytes() == b"weights"
+    assert (tmp_path / "config.json").read_bytes() == config_before
+    assert fidelity.deployment.artifacts == fast.deployment.artifacts == {}
+    again = package_pi05_ascend_deployments(tmp_path)
+    assert [r.deployment.revision for r in again] == [r.deployment.revision for r in results]
+
+
+def test_pi05_packaging_rejects_non_pi05_bundle_before_writing(tmp_path):
+    _create_bundle(tmp_path, policy_type="act")
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    with pytest.raises(ValueError, match="pi05 bundle"):
+        package_pi05_ascend_deployments(tmp_path)
+    assert not (tmp_path / "inference_manifest.json").exists()
+
+
+def test_extra_parameter_update_revises_only_selected_deployment(tmp_path):
+    _create_bundle(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    first = package_torch_deployments(tmp_path, devices=("cpu",), extra_parameters={"arbitrary": 1})[0]
+    second = package_torch_deployments(tmp_path, devices=("cpu",), extra_parameters={"arbitrary": 2})[0]
+    assert first.deployment.uuid == second.deployment.uuid
+    assert second.deployment.revision == first.deployment.revision + 1
+    assert first.manifest.bundle.digest == second.manifest.bundle.digest
+    assert first.deployment_fingerprint != second.deployment_fingerprint
 
 
 def test_package_deployment_artifact_reuses_identical_immutable_generation(tmp_path):

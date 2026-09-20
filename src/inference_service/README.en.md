@@ -480,6 +480,13 @@ remains included in pipeline preprocessing; image rules stay out of the generic 
 The optional `configure_processors(preprocessor=..., postprocessor=..., config=...)`
 hook configures model-specific LeRobot steps at load time, such as checking
 language capacity before upload or keeping small action tensors on the CPU.
+Deployment `extra_parameters` is a generic model-owned JSON object. The native
+Torch session passes a copy to optional `resolve_load_options(config=...,
+extra_parameters=...)` and uses the returned options for model construction.
+The session does not interpret model fields. Non-empty parameters require a
+provider consumer, which cannot override strict/local checkpoint loading.
+Parameters affect deployment and latency identity without extra parameter files
+or user-maintained content checksums.
 
 Compiled PI0.5 and SmolVLA loops are owned by shared executor stages, not model-session resources. They execute through
 `InferencePipeline -> ModelRuntimeHandle -> SequentialModelExecutor -> InferenceStage -> ModelSession resource`.

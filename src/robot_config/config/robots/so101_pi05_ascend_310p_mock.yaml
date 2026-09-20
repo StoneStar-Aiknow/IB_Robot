@@ -19,7 +19,10 @@ robot:
         pipelines:
           policy:
             model_path: models/pi05/pi05-doublecam-fp32/019200-torch-npu
-            deployment: torch-npu
+            # Register both modes with package-pi05-ascend-deployments first.
+            # Keep only one deployment line uncommented when switching modes.
+            deployment: torch-npu-fast  # AB2, 3 evaluations; language capacity 48.
+            # deployment: torch-npu-fidelity  # Euler, 10 evaluations; language capacity 200.
             execution_mode: monolithic
             # A first CANN 8.1 cache miss can spend more than 20 minutes compiling.
             request_timeout: 1800.0

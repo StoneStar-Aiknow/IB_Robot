@@ -1,4 +1,4 @@
-"""Validated input reductions for the fixed-shape Ascend310P runtime."""
+"""Input capacity and layout handling for the fixed-shape Ascend310P runtime."""
 
 from __future__ import annotations
 
@@ -6,9 +6,11 @@ import os
 
 import numpy as np
 import torch
-from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.processor.device_processor import DeviceProcessorStep
+from lerobot.processor.normalize_processor import NormalizerProcessorStep
 from lerobot.processor.pipeline import ProcessorStep
+from lerobot.processor.tokenizer_processor import TokenizerProcessorStep
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
@@ -32,15 +34,22 @@ def language_token_limit(maximum: int) -> int | None:
     return limit
 
 
-def trim_language_padding(tokens: torch.Tensor, mask: torch.Tensor, limit: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remove only masked tail positions, with one stable compiled input shape."""
+def trim_language_padding(
+    tokens: torch.Tensor, mask: torch.Tensor, limit: int, *, pad_token_id: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit a fixed input shape without removing valid tokens; optionally pad short inputs."""
 
     if tokens.ndim != 2 or mask.ndim != 2 or tokens.shape != mask.shape:
         raise ValueError("PI05 language tokens and mask must have the same [batch, length] shape")
     if mask.dtype != torch.bool:
         raise ValueError("PI05 language attention mask must be boolean")
     if tokens.shape[1] < limit:
-        raise ValueError(f"PI05 language input length {tokens.shape[1]} is shorter than static capacity {limit}")
+        if pad_token_id is None:
+            raise ValueError(f"PI05 language input length {tokens.shape[1]} is shorter than static capacity {limit}")
+        padding_shape = (tokens.shape[0], limit - tokens.shape[1])
+        padding = tokens.new_full(padding_shape, pad_token_id)
+        padding_mask = mask.new_zeros(padding_shape)
+        return torch.cat((tokens, padding), dim=1), torch.cat((mask, padding_mask), dim=1)
     if tokens.shape[1] == limit:
         return tokens, mask
     # This executes outside the compiled graphs. Inspect the mask, not the
@@ -48,21 +57,26 @@ def trim_language_padding(tokens: torch.Tensor, mask: torch.Tensor, limit: int) 
     if bool(mask[:, limit:].detach().to(device="cpu").any()):
         raise ValueError(
             f"PI05 language input exceeds the configured {limit}-token capacity; "
-            f"increase {LANGUAGE_TOKEN_LIMIT_ENV} and prepare a separate graph cache"
+            "increase deployment.extra_parameters.language_capacity "
+            f"(or {LANGUAGE_TOKEN_LIMIT_ENV} for legacy deployments) and prepare a separate graph cache"
         )
     return tokens[:, :limit].contiguous(), mask[:, :limit].contiguous()
 
 
 class LanguageCapacityStep(ProcessorStep):
-    """Validate and trim language padding on CPU before the device transfer."""
+    """Check untruncated tokens and form a fixed-size input before the device transfer."""
 
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, *, pad_token_id: int | None = None):
         self.limit = limit
+        self.pad_token_id = pad_token_id
 
     def __call__(self, transition):
         observation = dict(transition[TransitionKey.OBSERVATION])
         tokens, mask = trim_language_padding(
-            observation[OBS_LANGUAGE_TOKENS], observation[OBS_LANGUAGE_ATTENTION_MASK], self.limit
+            observation[OBS_LANGUAGE_TOKENS],
+            observation[OBS_LANGUAGE_ATTENTION_MASK],
+            self.limit,
+            pad_token_id=self.pad_token_id,
         )
         observation[OBS_LANGUAGE_TOKENS] = tokens
         observation[OBS_LANGUAGE_ATTENTION_MASK] = mask
@@ -75,7 +89,50 @@ class LanguageCapacityStep(ProcessorStep):
         return {**features, PipelineFeatureType.OBSERVATION: observations}
 
 
+def _validate_loaded_visual_normalization(steps, config):
+    """The loaded processor owns the effective normalization, not config.json."""
+    for step in steps:
+        if not isinstance(step, NormalizerProcessorStep):
+            continue
+        for name in config.image_features:
+            feature = step.features.get(name)
+            if feature is None or feature.type == FeatureType.ACTION:
+                continue
+            if step.normalize_observation_keys is not None and name not in step.normalize_observation_keys:
+                continue
+            mode = step.norm_map.get(feature.type, NormalizationMode.IDENTITY)
+            if mode != NormalizationMode.IDENTITY:
+                raise ValueError(
+                    f"PI05 CPU resize requires IDENTITY normalization in the loaded preprocessor for {name!r}; "
+                    f"got {mode}"
+                )
+
+
 def configure_input_processors(*, preprocessor, postprocessor, config):
+    steps = list(preprocessor.steps)
+    if getattr(config, "ascend_cpu_image_resize", False):
+        _validate_loaded_visual_normalization(steps, config)
+    limit = getattr(config, "ascend_language_token_limit", None)
+    if limit is not None:
+        devices = [i for i, step in enumerate(steps) if isinstance(step, DeviceProcessorStep)]
+        if len(devices) != 1:
+            raise ValueError("PI05 language compaction requires exactly one device processor")
+        tokenizers = [i for i, step in enumerate(steps) if isinstance(step, TokenizerProcessorStep)]
+        if len(tokenizers) != 1 or tokenizers[0] >= devices[0]:
+            raise ValueError("PI05 language capacity requires exactly one tokenizer before the device processor")
+        tokenizer = steps[tokenizers[0]]
+        if tokenizer.padding_side != "right":
+            raise ValueError("PI05 language capacity requires right tokenizer padding")
+        pad_token_id = tokenizer.input_tokenizer.pad_token_id
+        if type(pad_token_id) is not int:
+            raise ValueError("PI05 language capacity requires a tokenizer pad_token_id")
+        # Tokenize once without truncating. Longest padding keeps mixed-length
+        # batches rectangular, even if one row exceeds the checkpoint maximum.
+        # The capacity step then rejects overflow or pads to the static shape.
+        tokenizer.truncation = False
+        tokenizer.padding = "longest"
+        steps.insert(devices[0], LanguageCapacityStep(limit, pad_token_id=pad_token_id))
+        preprocessor.steps = steps
     if getattr(config, "ascend_cpu_output", False):
         # The policy returns CPU actions in this mode. Keep LeRobot's original
         # unnormalization math on the host and avoid uploading the result again.
@@ -85,15 +142,6 @@ def configure_input_processors(*, preprocessor, postprocessor, config):
             else step
             for step in postprocessor.steps
         ]
-    limit = getattr(config, "ascend_language_token_limit", None)
-    if limit is None:
-        return
-    steps = list(preprocessor.steps)
-    indices = [i for i, step in enumerate(steps) if isinstance(step, DeviceProcessorStep)]
-    if len(indices) != 1:
-        raise ValueError("PI05 language compaction requires exactly one device processor")
-    steps.insert(indices[0], LanguageCapacityStep(limit))
-    preprocessor.steps = steps
 
 
 def resize_host_images(inputs, *, config):

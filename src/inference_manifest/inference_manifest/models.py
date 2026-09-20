@@ -22,6 +22,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
@@ -915,7 +916,15 @@ class Deployment(StrictFrozenModel):
     bindings: dict[ExecutionRole, ArtifactBindings] = Field(default_factory=dict)
     device_links: tuple[DeviceLink, ...] = ()
     audio_contract: AudioContract | None = None
+    extra_parameters: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("extra_parameters", mode="before")
+    @classmethod
+    def validate_extra_parameters(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("deployment.extra_parameters must be a JSON object")
+        return _json_safe(value, "deployment.extra_parameters")
 
     @property
     def is_composite(self) -> bool:

@@ -66,7 +66,14 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
-from .input_optimization import CPU_IMAGE_RESIZE_ENV, CPU_OUTPUT_ENV, language_token_limit, trim_language_padding
+from .inference_config import DenoisingConfig, PI05AscendInferenceConfig
+from .input_optimization import (
+    CPU_IMAGE_RESIZE_ENV,
+    CPU_OUTPUT_ENV,
+    LANGUAGE_TOKEN_LIMIT_ENV,
+    language_token_limit,
+    trim_language_padding,
+)
 from .vision_siglip_npu import PI05SiglipVisionModel
 
 
@@ -79,7 +86,7 @@ class ActionSelectKwargs(TypedDict, total=False):
 PI05_GRAPH_DENOISE_STEPS = 10
 PI05_COMPILE_VISION_EMBED_ENV = "LEROBOT_PI05_COMPILE_VISION_EMBED"
 PI05_ENABLE_VISION_NPU_FUSED_OPS_ENV = "LEROBOT_PI05_ENABLE_VISION_NPU_FUSED_OPS"
-PI05_TORCHAIR_CACHE_ABI = "pi05-ascend-310p-two-graph-v2"
+PI05_TORCHAIR_CACHE_ABI = "pi05-ascend-310p-configured-denoise-v3"
 _TORCHAIR_CACHE_ENV = "IBROBOT_PI05_TORCHAIR_CACHE"
 _TORCHAIR_CACHE_HOME_ENV = "IBROBOT_PI05_TORCHAIR_CACHE_HOME"
 _GRAPH_COMPILE_ENV = "IBROBOT_PI05_GRAPH_COMPILE"
@@ -117,13 +124,36 @@ _PI05_NO_INIT_FUNCTIONS = (
 )
 
 
-def configure_pi05_ascend_310p_config(config: PI05Config, *, model_dtype: str = "fp16") -> PI05Config:
-    """Apply the fixed Ascend310P inference contract to a standard PI0.5 config."""
+def configure_pi05_ascend_310p_config(
+    config: PI05Config,
+    *,
+    model_dtype: str = "fp16",
+    inference_config: PI05AscendInferenceConfig | None = None,
+) -> PI05Config:
+    """Resolve model-owned settings once for this policy instance."""
 
-    if config.num_inference_steps != PI05_GRAPH_DENOISE_STEPS:
-        raise ValueError(
-            f"PI05 Ascend310P requires num_inference_steps={PI05_GRAPH_DENOISE_STEPS}; got {config.num_inference_steps}"
+    if inference_config is not None:
+        config.ascend_explicit_deployment = True
+    settings = inference_config if inference_config is not None else getattr(config, "ascend_inference_config", None)
+    if settings is None:
+        # Preserve the historical contract for deployments without extra_parameters.
+        if config.num_inference_steps != PI05_GRAPH_DENOISE_STEPS:
+            raise ValueError(
+                f"PI05 Ascend310P requires num_inference_steps={PI05_GRAPH_DENOISE_STEPS}; got {config.num_inference_steps}"
+            )
+        settings = PI05AscendInferenceConfig(
+            denoising=DenoisingConfig(),
+            language_capacity=language_token_limit(config.tokenizer_max_length),
+            vision_ffn=_env_flag(_VISION_FFN_ENV, default=False),
+            image_preprocessing="layout_aware" if _env_flag(CPU_IMAGE_RESIZE_ENV, default=False) else "native",
+            action_output_device="cpu" if _env_flag(CPU_OUTPUT_ENV, default=False) else "npu",
         )
+    if not isinstance(settings, PI05AscendInferenceConfig):
+        raise ValueError("inference_config must be a PI05AscendInferenceConfig")
+    if settings.language_capacity is not None and settings.language_capacity > config.tokenizer_max_length:
+        raise ValueError("PI05 language_capacity exceeds tokenizer_max_length")
+    if getattr(config, "ascend_explicit_deployment", False):
+        _validate_deployment_environment(settings)
     dtype_by_runtime = {
         "native": config.dtype,
         "fp16": "float16",
@@ -134,11 +164,18 @@ def configure_pi05_ascend_310p_config(config: PI05Config, *, model_dtype: str = 
         config.dtype = dtype_by_runtime[model_dtype]
     except KeyError as exc:
         raise ValueError(f"unsupported PI05 Ascend310P model dtype: {model_dtype!r}") from exc
+    if getattr(config, "ascend_explicit_deployment", False) and config.dtype != "float16":
+        raise ValueError("configured PI05 Ascend310P deployments require model_dtype=fp16")
+    if settings.denoising.solver == "ab2" and getattr(getattr(config, "rtc_config", None), "enabled", False):
+        raise ValueError("PI05 AB2 inference does not support RTC")
     for name, value in _CONFIG_DEFAULTS.items():
         setattr(config, name, value)
-    config.ascend_language_token_limit = language_token_limit(config.tokenizer_max_length)
-    config.ascend_cpu_image_resize = _env_flag(CPU_IMAGE_RESIZE_ENV, default=False)
-    config.ascend_cpu_output = _env_flag(CPU_OUTPUT_ENV, default=False)
+    config.ascend_inference_config = settings
+    config.num_inference_steps = settings.denoising.steps
+    # Processor hooks use these derived views of the same immutable settings.
+    config.ascend_language_token_limit = settings.language_capacity
+    config.ascend_cpu_image_resize = settings.image_preprocessing == "layout_aware"
+    config.ascend_cpu_output = settings.action_output_device == "cpu"
     return config
 
 
@@ -152,6 +189,26 @@ def _env_flag(name: str, *, default: bool) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean-like value, got {raw!r}")
+
+
+def _validate_deployment_environment(settings: PI05AscendInferenceConfig) -> None:
+    """A named deployment cannot silently inherit conflicting legacy switches."""
+    flags = {
+        CPU_IMAGE_RESIZE_ENV: settings.image_preprocessing == "layout_aware",
+        CPU_OUTPUT_ENV: settings.action_output_device == "cpu",
+        _VISION_FFN_ENV: settings.vision_ffn,
+        _GRAPH_COMPILE_ENV: True,
+        _NPU_FUSED_OPS_ENV: True,
+        PI05_COMPILE_VISION_EMBED_ENV: True,
+        PI05_ENABLE_VISION_NPU_FUSED_OPS_ENV: True,
+    }
+    for name, expected in flags.items():
+        if os.environ.get(name, "").strip() and _env_flag(name, default=expected) != expected:
+            raise ValueError(f"{name} conflicts with PI05 deployment.extra_parameters; unset the environment override")
+    if os.environ.get(LANGUAGE_TOKEN_LIMIT_ENV, "").strip():
+        maximum = settings.language_capacity or 1
+        if language_token_limit(maximum) != settings.language_capacity:
+            raise ValueError(f"{LANGUAGE_TOKEN_LIMIT_ENV} conflicts with PI05 deployment.extra_parameters")
 
 
 def _cache_component(value: object) -> str:
@@ -242,6 +299,7 @@ def _torchair_cache_dir(
     vision_npu_fused_ops: bool,
     language_capacity: int | None = None,
     vision_ffn: bool = False,
+    inference_settings_key: str | None = None,
 ) -> Path | None:
     if not _env_flag(_TORCHAIR_CACHE_ENV, default=True):
         return None
@@ -265,6 +323,7 @@ def _torchair_cache_dir(
         f"vision-fused-{vision_npu_fused_ops}",
         *([f"language-capacity-{language_capacity}"] if language_capacity is not None else []),
         *(["vision-ffn-v1"] if vision_ffn else []),
+        *([inference_settings_key] if inference_settings_key is not None else []),
         deployment_fingerprint,
     )
     return root.expanduser().joinpath(*(_cache_component(value) for value in components)).resolve()
@@ -1514,9 +1573,18 @@ class PaliGemmaWithExpertModel(
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
-    def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(
+        self,
+        config: PI05Config,
+        rtc_processor: RTCProcessor | None = None,
+        *,
+        inference_config: PI05AscendInferenceConfig | None = None,
+    ):
         super().__init__()
         self.config = config
+        self.inference_config = (
+            inference_config or getattr(config, "ascend_inference_config", None) or PI05AscendInferenceConfig()
+        )
         self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
@@ -1584,7 +1652,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self._compiled_action_vision_embed = None
         self._compiled_action_prefix_prefill = None
         self._compiled_action_prefix_forward = None
-        self._compiled_action_denoise_10_steps = None
+        self._compiled_action_denoise_steps = None
         self._sample_actions_graph_compile_info: dict[str, Any] = {}
         self._action_fused_stage_timing_enabled = False
         self._action_fused_stage_timing_call_index = 0
@@ -1779,7 +1847,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         shift_table = self._action_denoise_adarms_shift_table
         gate_table = self._action_denoise_adarms_gate_table
         return {
-            "denoise_steps": PI05_GRAPH_DENOISE_STEPS,
+            "denoise_steps": self.inference_config.denoising.steps,
+            "denoise_solver": self.inference_config.denoising.solver,
             "dt_shape": list(self._action_denoise_dt.shape),
             "timestep_table_shape": list(self._action_denoise_timestep_table.shape),
             "adarms_cond_table_shape": list(self._action_denoise_adarms_cond_table.shape),
@@ -1872,14 +1941,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Precompute fixed PI0.5 denoise timestep, AdaRMS condition and modulation tables."""
         device = _module_device(self.time_mlp_in)
         target_dtype = self._action_compute_dtype(device)
+        num_steps = self.inference_config.denoising.steps
         timestep_table_f32 = (
             1.0
             - torch.arange(
-                PI05_GRAPH_DENOISE_STEPS,
+                num_steps,
                 dtype=torch.float32,
                 device=device,
             )
-            / PI05_GRAPH_DENOISE_STEPS
+            / num_steps
         )
         time_embedding_f32 = create_sinusoidal_pos_embedding(
             timestep_table_f32,
@@ -1899,7 +1969,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         gate_tables: list[torch.Tensor] = []
         for layernorm in self._action_expert_adarms_layernorms():
             modulation = layernorm.dense(adarms_cond)
-            scale, shift, gate = modulation.reshape(PI05_GRAPH_DENOISE_STEPS, 3, -1).unbind(dim=1)
+            scale, shift, gate = modulation.reshape(num_steps, 3, -1).unbind(dim=1)
             scale_weight_tables.append((1 + scale).to(dtype=target_dtype).contiguous())
             shift_tables.append(shift[:, None, None, :].to(dtype=target_dtype).contiguous())
             gate_tables.append(gate[:, None, None, :].to(dtype=target_dtype).contiguous())
@@ -1908,7 +1978,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         adarms_gate_table = torch.stack(gate_tables, dim=1).contiguous()
 
         self._action_denoise_dt = torch.tensor(
-            -1.0 / PI05_GRAPH_DENOISE_STEPS,
+            -1.0 / num_steps,
             dtype=target_dtype,
             device=device,
         )
@@ -2018,7 +2088,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         tiling_schedule_optimize: bool | None = None,
         torchair_cache_dir: str | Path | None = None,
     ) -> dict[str, Any]:
-        """Compile PI0.5 prefix and fixed 10-step denoise fragments."""
+        """Compile PI0.5 prefix and the instance's fixed-length denoise loop."""
         if not hasattr(torch, "compile"):
             raise RuntimeError("torch.compile is not available in this PyTorch build")
         self._force_eager_attention_for_graph_compile()
@@ -2073,7 +2143,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if prefix_graph_mode == "compiled_vision_split":
                 self._compiled_action_vision_embed = compile_target(self.paligemma_with_expert.embed_image)
             self._compiled_action_prefix_prefill = compile_target(self._action_prefix_prefill_for_compile)
-        self._compiled_action_denoise_10_steps = compile_target(self._action_denoise_10_steps_for_compile)
+        self._compiled_action_denoise_steps = compile_target(self._action_denoise_steps_for_compile)
         self._sample_actions_graph_compile_enabled = True
         self._sample_actions_graph_compile_info = {
             "enabled": True,
@@ -2087,7 +2157,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             }[prefix_graph_mode],
             "prefix_compiled": True,
             "prefix_vision_compiled": prefix_graph_mode != "eager_vision_split",
-            "denoise_steps": PI05_GRAPH_DENOISE_STEPS,
+            "denoise_steps": self.inference_config.denoising.steps,
+            "denoise_solver": self.inference_config.denoising.solver,
             "denoise_compilation": "single_graph",
             "frozen_parameter": frozen_parameter,
             "tiling_schedule_optimize": tiling_schedule_optimize,
@@ -2100,7 +2171,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     if prefix_graph_mode == "full_prefix"
                     else ["_action_prefix_prefill_for_compile"]
                 ),
-                "_action_denoise_10_steps_for_compile",
+                "_action_denoise_steps_for_compile",
             ],
         }
         return dict(self._sample_actions_graph_compile_info)
@@ -2288,7 +2359,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return (
             self._sample_actions_graph_compile_enabled
             and (self._compiled_action_prefix_forward is not None or self._compiled_action_prefix_prefill is not None)
-            and self._compiled_action_denoise_10_steps is not None
+            and self._compiled_action_denoise_steps is not None
             and self.rtc_processor is None
             and not rtc_kwargs
         )
@@ -2785,7 +2856,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             position_ids=position_ids,
         )
 
-    def _action_denoise_10_steps_for_compile(
+    def _action_denoise_steps_for_compile(
         self,
         prefix_pad_masks,
         past_key_values,
@@ -2795,7 +2866,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         adarms_cond_table = self._action_denoise_adarms_cond_table
         adarms_modulation_steps = self._action_denoise_adarms_modulation_steps
         full_att_2d_masks_4d, position_ids = self._prepare_denoise_mask_context_for_compile(prefix_pad_masks, x_t)
-        for step in range(PI05_GRAPH_DENOISE_STEPS):
+        num_steps = self.inference_config.denoising.steps
+        use_ab2 = self.inference_config.denoising.solver == "ab2"
+        previous_velocity = None
+        for step in range(num_steps):
             v_t = self._denoise_step_with_prepared_mask_context(
                 past_key_values=past_key_values,
                 x_t=x_t,
@@ -2804,7 +2878,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 full_att_2d_masks_4d=full_att_2d_masks_4d,
                 position_ids=position_ids,
             )
-            x_t = x_t + dt_tensor * v_t
+            if use_ab2:
+                # Preserve the arithmetic of the measured three-evaluation
+                # candidate. History is local to this request, never shared.
+                update = v_t if previous_velocity is None else v_t * 1.5 - previous_velocity * 0.5
+                x_t = x_t - update / num_steps
+                previous_velocity = v_t
+            else:
+                x_t = x_t + dt_tensor * v_t
         return x_t
 
     def _sample_actions_graph_inference(
@@ -2816,9 +2897,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise,
         num_steps,
     ):
-        if int(num_steps) != PI05_GRAPH_DENOISE_STEPS:
+        if num_steps != self.inference_config.denoising.steps:
             raise ValueError(
-                "PI0.5 graph inference compiles denoise as one fixed 10-step TorchAir graph; "
+                f"PI0.5 graph inference uses the configured {self.inference_config.denoising.steps}-step graph; "
                 f"got num_steps={num_steps}."
             )
         capacity = getattr(self.config, "ascend_language_token_limit", None)
@@ -2828,8 +2909,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = self._cast_action_tensor(noise)
         if (
             self._compiled_action_prefix_forward is None and self._compiled_action_prefix_prefill is None
-        ) or self._compiled_action_denoise_10_steps is None:
-            raise RuntimeError("graph inference requires compiled prefix and 10-step denoise callables")
+        ) or self._compiled_action_denoise_steps is None:
+            raise RuntimeError("graph inference requires compiled prefix and configured denoise callables")
 
         stage_record = self._start_action_fused_stage_timing(
             num_steps=num_steps,
@@ -2854,14 +2935,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if stage_record is not None:
             self._sync_action_fused_stage_timing_device(device)
             denoise_start = time_module.perf_counter()
-            x_t = self._compiled_action_denoise_10_steps(prefix_pad_masks, past_key_values, x_t)
+            x_t = self._compiled_action_denoise_steps(prefix_pad_masks, past_key_values, x_t)
             self._sync_action_fused_stage_timing_device(device)
             denoise_ms = (time_module.perf_counter() - denoise_start) * 1000.0
             stage_record["denoise_graph_ms"] = denoise_ms
             stage_record["denoise_total_ms"] = denoise_ms
-            stage_record["denoise_steps"] = PI05_GRAPH_DENOISE_STEPS
+            stage_record["denoise_steps"] = self.inference_config.denoising.steps
+            stage_record["denoise_solver"] = self.inference_config.denoising.solver
         else:
-            x_t = self._compiled_action_denoise_10_steps(prefix_pad_masks, past_key_values, x_t)
+            x_t = self._compiled_action_denoise_steps(prefix_pad_masks, past_key_values, x_t)
         self._finish_action_fused_stage_timing(stage_record)
         return x_t
 
@@ -2878,7 +2960,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
-            num_steps = self.config.num_inference_steps
+            num_steps = self.inference_config.denoising.steps
+        if type(num_steps) is not int or num_steps != self.inference_config.denoising.steps:
+            raise ValueError("num_steps must match the deployment's configured denoising steps")
+        use_ab2 = self.inference_config.denoising.solver == "ab2"
+        if use_ab2 and (self._rtc_enabled() or kwargs):
+            raise ValueError("PI05 AB2 does not support RTC or per-request denoising overrides")
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -2895,7 +2982,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self._cast_action_tensor(noise)
 
         if self._can_use_compiled_action_inference(kwargs):
-            # Use the compiled prefix graph and fixed ten-step denoise graph.
+            # Use the compiled prefix graph and this instance's denoise graph.
             return self._sample_actions_graph_inference(
                 images,
                 img_masks,
@@ -2910,6 +2997,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self._sync_action_fused_stage_timing_device(device)
             prefix_start = time_module.perf_counter()
 
+        capacity = self.inference_config.language_capacity
+        if capacity is not None:
+            tokens, masks = trim_language_padding(tokens, masks, capacity)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -2943,6 +3033,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         dt = -1.0 / num_steps
 
         x_t = noise
+        previous_velocity = None
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -2971,7 +3062,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else:
                 v_t = denoise_step_partial_call(x_t)
 
-            x_t = x_t + dt * v_t
+            if use_ab2:
+                update = v_t if previous_velocity is None else v_t * 1.5 - previous_velocity * 0.5
+                x_t = x_t - update / num_steps
+                previous_velocity = v_t
+            else:
+                x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -3035,6 +3131,8 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI05Config,
+        *,
+        inference_config: PI05AscendInferenceConfig | None = None,
         **kwargs,
     ):
         """
@@ -3043,15 +3141,18 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         """
         require_package("transformers", extra="pi")
         configure_pi05_ascend_310p_config(
-            config, model_dtype={"float16": "fp16", "bfloat16": "bf16"}.get(config.dtype, "fp32")
+            config,
+            model_dtype={"float16": "fp16", "bfloat16": "bf16"}.get(config.dtype, "fp32"),
+            inference_config=inference_config,
         )
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.inference_config = config.ascend_inference_config
 
         # Initialize the core PI05 model
         self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor, inference_config=self.inference_config)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -3091,12 +3192,14 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         torch_npu_module: object,
         device_name: str,
     ) -> dict[str, Any]:
-        """Finalize the fixed Ascend310P fused-op and two-graph runtime."""
+        """Finalize the instance's Ascend310P fused-op and graph runtime."""
 
+        if getattr(self.config, "ascend_explicit_deployment", False):
+            _validate_deployment_environment(self.inference_config)
         enable_graph_compile = _env_flag(_GRAPH_COMPILE_ENV, default=True)
         enable_npu_fused_ops = _env_flag(_NPU_FUSED_OPS_ENV, default=True)
         enable_vision_npu_fused_ops = _env_flag(PI05_ENABLE_VISION_NPU_FUSED_OPS_ENV, default=True)
-        enable_vision_ffn = _env_flag(_VISION_FFN_ENV, default=False)
+        enable_vision_ffn = self.inference_config.vision_ffn
         prefix_graph_mode = self.model._prefix_graph_mode()
         if enable_vision_ffn and (
             not enable_graph_compile
@@ -3117,6 +3220,7 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
             vision_npu_fused_ops=enable_vision_npu_fused_ops,
             language_capacity=getattr(self.config, "ascend_language_token_limit", None),
             vision_ffn=enable_vision_ffn,
+            inference_settings_key=self.inference_config.cache_key,
         )
         return self.prepare_inference_optimizations(
             enable_graph_compile=enable_graph_compile,
@@ -3132,6 +3236,7 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
         pretrained_name_or_path: str | Path,
         *,
         config: PreTrainedConfig | None = None,
+        inference_config: PI05AscendInferenceConfig | None = None,
         force_download: bool = False,
         resume_download: bool | None = None,
         proxies: dict | None = None,
@@ -3168,6 +3273,9 @@ class PI05Ascend310PPolicy(PreTrainedPolicy):
 
         if skip_weight_init and not strict:
             raise ValueError("skip_weight_init requires strict=True")
+
+        if inference_config is not None:
+            kwargs["inference_config"] = inference_config
 
         original_device = config.device
         if skip_weight_init:

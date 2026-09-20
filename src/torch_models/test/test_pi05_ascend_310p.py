@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch import nn
 
+from torch_models.pi05_ascend_310p.inference_config import PI05AscendInferenceConfig
 from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
     PaliGemmaWithExpertModel,
     PI05Ascend310PPolicy,
@@ -130,19 +131,19 @@ def test_torchair_cache_separates_npu_graph_variants(monkeypatch, tmp_path) -> N
         (
             "full_prefix",
             "compiled_full_prefix_denoise",
-            ["_action_prefix_forward_for_compile", "_action_denoise_10_steps_for_compile"],
+            ["_action_prefix_forward_for_compile", "_action_denoise_steps_for_compile"],
             True,
         ),
         (
             "compiled_vision_split",
             "compiled_vision_compiled_prefill_denoise",
-            ["embed_image", "_action_prefix_prefill_for_compile", "_action_denoise_10_steps_for_compile"],
+            ["embed_image", "_action_prefix_prefill_for_compile", "_action_denoise_steps_for_compile"],
             True,
         ),
         (
             "eager_vision_split",
             "eager_vision_compiled_prefill_denoise",
-            ["_action_prefix_prefill_for_compile", "_action_denoise_10_steps_for_compile"],
+            ["_action_prefix_prefill_for_compile", "_action_denoise_steps_for_compile"],
             False,
         ),
     ],
@@ -156,6 +157,7 @@ def test_graph_compile_selects_platform_prefix_boundary(
 ):
     model = PI05Pytorch.__new__(PI05Pytorch)
     nn.Module.__init__(model)
+    model.inference_config = PI05AscendInferenceConfig()
     model.register_parameter("device_anchor", nn.Parameter(torch.zeros(())))
     model.config = SimpleNamespace(
         compile_inference_fullgraph=True,
@@ -166,7 +168,7 @@ def test_graph_compile_selects_platform_prefix_boundary(
     model.paligemma_with_expert = SimpleNamespace(embed_image=lambda images: images)
     model._action_prefix_forward_for_compile = lambda *args: args
     model._action_prefix_prefill_for_compile = lambda *args: args
-    model._action_denoise_10_steps_for_compile = lambda *args: args
+    model._action_denoise_steps_for_compile = lambda *args: args
     model._force_eager_attention_for_graph_compile = MethodType(lambda self: None, model)
     model._prefix_graph_mode = MethodType(lambda self: prefix_mode, model)
     model._build_inference_compile_kwargs = MethodType(
@@ -188,7 +190,7 @@ def test_graph_compile_selects_platform_prefix_boundary(
         "embed_image": model.paligemma_with_expert.embed_image,
         "_action_prefix_forward_for_compile": model._action_prefix_forward_for_compile,
         "_action_prefix_prefill_for_compile": model._action_prefix_prefill_for_compile,
-        "_action_denoise_10_steps_for_compile": model._action_denoise_10_steps_for_compile,
+        "_action_denoise_steps_for_compile": model._action_denoise_steps_for_compile,
     }
     assert compiled_targets == [expected_callables[target] for target in expected_targets]
     assert info["graph_path"] == expected_graph_path
@@ -199,6 +201,7 @@ def test_graph_compile_selects_platform_prefix_boundary(
 def test_graph_compile_uses_persistent_torchair_cache(monkeypatch, tmp_path):
     model = PI05Pytorch.__new__(PI05Pytorch)
     nn.Module.__init__(model)
+    model.inference_config = PI05AscendInferenceConfig()
     model.register_parameter("device_anchor", nn.Parameter(torch.zeros(())))
     model.config = SimpleNamespace(
         compile_inference_fullgraph=True,
@@ -209,7 +212,7 @@ def test_graph_compile_uses_persistent_torchair_cache(monkeypatch, tmp_path):
     model.paligemma_with_expert = SimpleNamespace(embed_image=lambda images: images)
     model._action_prefix_forward_for_compile = lambda *args: args
     model._action_prefix_prefill_for_compile = lambda *args: args
-    model._action_denoise_10_steps_for_compile = lambda *args: args
+    model._action_denoise_steps_for_compile = lambda *args: args
     model._force_eager_attention_for_graph_compile = MethodType(lambda self: None, model)
     model._prefix_graph_mode = MethodType(lambda self: "full_prefix", model)
     model._build_inference_compile_kwargs = MethodType(
@@ -230,7 +233,7 @@ def test_graph_compile_uses_persistent_torchair_cache(monkeypatch, tmp_path):
 
     assert [target for target, _kwargs in cached_targets] == [
         model._action_prefix_forward_for_compile,
-        model._action_denoise_10_steps_for_compile,
+        model._action_denoise_steps_for_compile,
     ]
     assert all(kwargs["compiler_config"] is compiler_config for _target, kwargs in cached_targets)
     assert all(kwargs["cache_root"] == tmp_path for _target, kwargs in cached_targets)

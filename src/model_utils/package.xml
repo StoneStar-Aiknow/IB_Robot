@@ -13,6 +13,7 @@
   <depend>std_msgs</depend>
   <depend>inference_manifest</depend>
   <depend>inference_service</depend>
+  <exec_depend>torch_models</exec_depend>
   <depend>python3-yaml</depend>
 
   <test_depend>python3-pytest</test_depend>

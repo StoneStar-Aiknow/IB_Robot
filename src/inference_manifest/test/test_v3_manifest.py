@@ -116,6 +116,37 @@ def _request_deployment(*, device_id: int = 0, artifact: bool = False) -> dict:
     return value
 
 
+def test_extra_parameters_are_generic_json_and_change_deployment_identity(tmp_path):
+    raw = _request_deployment()
+    value = _bundle(tmp_path, raw)
+    original = Deployment.model_validate(raw)
+    raw["extra_parameters"] = {"future_model": {"threshold": 0.4, "labels": ["a", None, True]}}
+    validate_manifest_schema(value, "extra parameters")
+    configured = Deployment.model_validate(raw)
+    assert configured.extra_parameters == raw["extra_parameters"]
+    assert deployment_fingerprint(3, "bundle", "test", original) != deployment_fingerprint(
+        3, "bundle", "test", configured
+    )
+    assert runtime_profile_fingerprint(3, "bundle", "test", original) != runtime_profile_fingerprint(
+        3, "bundle", "test", configured
+    )
+    raw["extra_parameters"] = {}
+    empty = Deployment.model_validate(raw)
+    assert deployment_fingerprint(3, "bundle", "test", original) == deployment_fingerprint(3, "bundle", "test", empty)
+
+
+@pytest.mark.parametrize("parameters", [None, [], {"invalid": float("nan")}, {"invalid": object()}])
+def test_extra_parameters_reject_non_json_values(parameters):
+    with pytest.raises(ValueError):
+        Deployment.model_validate({**_request_deployment(), "extra_parameters": parameters})
+
+
+def test_extra_parameters_identity_is_independent_of_key_order():
+    first = Deployment.model_validate({**_request_deployment(), "extra_parameters": {"a": 1, "b": {"x": True}}})
+    second = Deployment.model_validate({**_request_deployment(), "extra_parameters": {"b": {"x": True}, "a": 1}})
+    assert deployment_fingerprint(3, "bundle", "test", first) == deployment_fingerprint(3, "bundle", "test", second)
+
+
 def test_schema_v2_and_legacy_identity_are_rejected(tmp_path: Path):
     value = _bundle(tmp_path, _request_deployment())
     value["schema_version"] = 2

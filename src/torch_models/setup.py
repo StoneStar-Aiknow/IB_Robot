@@ -12,6 +12,7 @@ setup(
         ("share/" + package_name, ["package.xml", "README.md", "LICENSE", "NOTICE"]),
     ],
     install_requires=["setuptools", "torch", "typing_extensions"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="yidahao",
     maintainer_email="haoyida@huawei.com",

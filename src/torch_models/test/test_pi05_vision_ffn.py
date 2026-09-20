@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from torch_models.pi05_ascend_310p.inference_config import PI05AscendInferenceConfig
 from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import PI05Ascend310PPolicy
 from torch_models.pi05_ascend_310p.vision_siglip_npu import PI05SiglipMLP
 
@@ -72,6 +73,7 @@ def test_ffn_option_rejects_incompatible_runtime(monkeypatch, setting, value, dt
     policy = PI05Ascend310PPolicy.__new__(PI05Ascend310PPolicy)
     nn.Module.__init__(policy)
     policy.config = SimpleNamespace(dtype=dtype)
+    policy.inference_config = PI05AscendInferenceConfig(vision_ffn=True)
     policy.model = SimpleNamespace(_prefix_graph_mode=lambda: mode)
     with pytest.raises(ValueError, match="requires FP16 with the compiled local vision tower"):
         policy.prepare_for_inference(

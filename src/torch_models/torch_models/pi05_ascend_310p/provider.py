@@ -8,6 +8,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
+from torch_models.pi05_ascend_310p.inference_config import PI05AscendInferenceConfig
 from torch_models.pi05_ascend_310p.input_optimization import configure_input_processors, resize_host_images
 from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
     PI05Ascend310PPolicy,
@@ -16,6 +17,17 @@ from torch_models.pi05_ascend_310p.modeling_pi05_ascend_310p import (
 from torch_models.policy_provider import PolicyProvider
 
 PI05_ASCEND_310P_LOAD_OPTIONS = {"skip_weight_init": True}
+
+
+def resolve_pi05_load_options(*, config, extra_parameters):
+    if not extra_parameters:
+        return {}
+    inference_config = PI05AscendInferenceConfig.parse(extra_parameters)
+    # The session owns this fresh config object. Pass the same immutable
+    # settings to construction and processors instead of re-reading env vars.
+    config.ascend_inference_config = inference_config
+    config.ascend_explicit_deployment = True
+    return {"inference_config": inference_config}
 
 
 def validate_pi05_ascend_310p(*, config, bundle_root: Path, tokenizer_path: str | None, device_name: str) -> None:
@@ -51,7 +63,11 @@ def prepare_pi05_ascend_310p(*, policy, deployment_fingerprint, torch_module, to
 
 def _execution_metadata(policy) -> dict[str, object]:
     records = policy.model.get_action_fused_stage_timing_records()
-    return {"pi05_stage_timing": records[-1]} if records else {}
+    metadata = {"pi05_stage_timing": records[-1]} if records else {}
+    inference_config = getattr(policy, "inference_config", None)
+    if inference_config is not None:
+        metadata["pi05_inference_config"] = inference_config.to_dict()
+    return metadata
 
 
 def create_provider() -> PolicyProvider:
@@ -64,6 +80,7 @@ def create_provider() -> PolicyProvider:
         execution_metadata=_execution_metadata,
         preprocess_inputs=resize_host_images,
         configure_processors=configure_input_processors,
+        resolve_load_options=resolve_pi05_load_options,
     )
 
 

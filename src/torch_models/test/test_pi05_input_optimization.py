@@ -3,6 +3,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.processor.device_processor import DeviceProcessorStep
+from lerobot.processor.normalize_processor import NormalizerProcessorStep
+from lerobot.processor.pipeline import PolicyProcessorPipeline
+from lerobot.processor.tokenizer_processor import TokenizerProcessorStep
 
 from torch_models.pi05_ascend_310p.input_optimization import (
     LANGUAGE_TOKEN_LIMIT_ENV,
@@ -12,6 +17,27 @@ from torch_models.pi05_ascend_310p.input_optimization import (
     resize_host_images,
     trim_language_padding,
 )
+
+
+@pytest.fixture
+def tokenizer_step():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1, "word": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]")
+    return TokenizerProcessorStep(tokenizer=tokenizer, max_length=200, padding="max_length", truncation=True)
+
+
+def language_pipeline(tokenizer_step, capacity):
+    pipeline = PolicyProcessorPipeline(steps=[tokenizer_step, DeviceProcessorStep(device="cpu")])
+    configure_input_processors(
+        preprocessor=pipeline, postprocessor=None, config=SimpleNamespace(ascend_language_token_limit=capacity)
+    )
+    return pipeline
 
 
 def test_language_capacity_is_explicit_and_bounded(monkeypatch):
@@ -91,19 +117,19 @@ def test_cpu_resize_rejects_unnormalized_integer_input():
         resize_host_images({"image": np.zeros((7, 11, 3), dtype=np.uint8)}, config=config)
 
 
-def test_language_step_is_before_upload_and_preserves_input_transition():
+def test_language_step_is_before_upload_and_preserves_input_transition(tokenizer_step):
     from lerobot.processor.device_processor import DeviceProcessorStep
     from lerobot.types import TransitionKey
     from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
     marker = object()
     device = DeviceProcessorStep(device="cpu")
-    processor = SimpleNamespace(steps=[marker, device])
+    processor = SimpleNamespace(steps=[marker, tokenizer_step, device])
     configure_input_processors(
         preprocessor=processor, postprocessor=None, config=SimpleNamespace(ascend_language_token_limit=4)
     )
     assert processor.steps[0] is marker and processor.steps[-1] is device
-    step = processor.steps[1]
+    step = processor.steps[2]
     assert isinstance(step, LanguageCapacityStep)
     source = {
         TransitionKey.OBSERVATION: {
@@ -125,6 +151,115 @@ def test_language_step_requires_known_upload_boundary():
             postprocessor=None,
             config=SimpleNamespace(ascend_language_token_limit=48),
         )
+
+
+@pytest.mark.parametrize("capacity", [48, 200])
+@pytest.mark.parametrize("prompt_lengths", [(201,), (3, 201)])
+def test_complete_tokenization_rejects_overflow_before_any_truncation(tokenizer_step, capacity, prompt_lengths):
+    pipeline = language_pipeline(tokenizer_step, capacity)
+    tasks = [" ".join(["word"] * length) for length in prompt_lengths]
+    with pytest.raises(ValueError, match=f"exceeds the configured {capacity}-token capacity"):
+        pipeline({"task": tasks})
+
+
+@pytest.mark.parametrize("capacity", [48, 200])
+def test_tokenization_pads_short_prompts_to_static_capacity(tokenizer_step, capacity):
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    pipeline = language_pipeline(tokenizer_step, capacity)
+    result = pipeline({"task": ["word", "word word word"]})
+    expected_tokens = torch.ones((2, capacity), dtype=torch.int64)
+    expected_tokens[0, :1] = 2
+    expected_tokens[1, :3] = 2
+    expected_mask = torch.zeros((2, capacity), dtype=torch.bool)
+    expected_mask[0, :1] = True
+    expected_mask[1, :3] = True
+    torch.testing.assert_close(result[OBS_LANGUAGE_TOKENS], expected_tokens)
+    torch.testing.assert_close(result[OBS_LANGUAGE_ATTENTION_MASK], expected_mask)
+
+
+@pytest.mark.parametrize("capacity", [48, 200])
+def test_tokenization_keeps_exact_capacity_prompts(tokenizer_step, capacity):
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    result = language_pipeline(tokenizer_step, capacity)({"task": " ".join(["word"] * capacity)})
+    torch.testing.assert_close(result[OBS_LANGUAGE_TOKENS], torch.full((1, capacity), 2, dtype=torch.int64))
+    assert bool(result[OBS_LANGUAGE_ATTENTION_MASK].all())
+
+
+def test_language_capacity_requires_tokenizer_before_upload(tokenizer_step):
+    for steps in ([DeviceProcessorStep(device="cpu")], [DeviceProcessorStep(device="cpu"), tokenizer_step]):
+        with pytest.raises(ValueError, match="exactly one tokenizer before the device"):
+            configure_input_processors(
+                preprocessor=SimpleNamespace(steps=steps),
+                postprocessor=None,
+                config=SimpleNamespace(ascend_language_token_limit=48),
+            )
+
+
+def test_language_capacity_rejects_left_padding(tokenizer_step):
+    tokenizer_step.padding_side = "left"
+    with pytest.raises(ValueError, match="right tokenizer padding"):
+        language_pipeline(tokenizer_step, 48)
+
+
+def test_cpu_resize_checks_loaded_normalizer_not_only_model_config():
+    image = "observation.images.top"
+    feature = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 4))
+    config = SimpleNamespace(
+        ascend_cpu_image_resize=True,
+        image_features={image: feature},
+        normalization_mapping={FeatureType.VISUAL: NormalizationMode.IDENTITY},
+    )
+    normalizer = NormalizerProcessorStep(
+        features={image: feature},
+        norm_map={FeatureType.VISUAL: NormalizationMode.MEAN_STD},
+        stats={image: {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}},
+    )
+    identity = NormalizerProcessorStep(
+        features={image: feature}, norm_map={FeatureType.VISUAL: NormalizationMode.IDENTITY}
+    )
+    with pytest.raises(ValueError, match="IDENTITY normalization in the loaded preprocessor"):
+        configure_input_processors(
+            preprocessor=SimpleNamespace(steps=[identity, normalizer]), postprocessor=None, config=config
+        )
+
+
+@pytest.mark.parametrize("exclude_image", [False, True])
+def test_cpu_resize_allows_identity_visual_processing_and_state_normalization(exclude_image):
+    image = "observation.images.top"
+    features = {
+        image: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 4)),
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+    }
+    normalizer = NormalizerProcessorStep(
+        features=features,
+        norm_map={
+            FeatureType.VISUAL: NormalizationMode.MEAN_STD if exclude_image else NormalizationMode.IDENTITY,
+            FeatureType.STATE: NormalizationMode.MEAN_STD,
+        },
+        normalize_observation_keys={"observation.state"} if exclude_image else None,
+    )
+    processor = SimpleNamespace(steps=[normalizer])
+    configure_input_processors(
+        preprocessor=processor,
+        postprocessor=None,
+        config=SimpleNamespace(ascend_cpu_image_resize=True, image_features={image: features[image]}),
+    )
+    assert processor.steps == [normalizer]
+
+
+def test_native_image_path_does_not_require_identity_normalization():
+    image = "observation.images.top"
+    feature = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 4))
+    normalizer = NormalizerProcessorStep(
+        features={image: feature}, norm_map={FeatureType.VISUAL: NormalizationMode.MEAN_STD}
+    )
+    configure_input_processors(
+        preprocessor=SimpleNamespace(steps=[normalizer]),
+        postprocessor=None,
+        config=SimpleNamespace(ascend_cpu_image_resize=False),
+    )
 
 
 def test_cpu_output_preserves_postprocessor_order_and_dtype():

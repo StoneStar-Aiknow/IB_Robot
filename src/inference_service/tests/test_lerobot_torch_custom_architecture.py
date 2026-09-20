@@ -65,3 +65,36 @@ def test_model_owned_input_hook_runs_before_lerobot_processor():
 def test_npu_device_name_fails_closed_without_api() -> None:
     with pytest.raises(BackendLoadError, match="does not expose get_device_name"):
         LeRobotTorchModelSession._npu_device_name(SimpleNamespace(npu=SimpleNamespace()))
+
+
+def test_extra_parameters_are_passed_to_provider_without_mutating_manifest():
+    original = {"arbitrary_future_model": {"values": [1, 2], "enabled": True}}
+    config = object()
+    token = object()
+    expected_config = config
+
+    def resolve(*, config, extra_parameters):
+        assert config is expected_config
+        assert extra_parameters == original
+        extra_parameters["arbitrary_future_model"]["values"].append(3)
+        return {"inference_config": token}
+
+    options = LeRobotTorchModelSession._provider_load_options(
+        SimpleNamespace(resolve_load_options=resolve), config, original
+    )
+    assert options == {"inference_config": token}
+    assert original["arbitrary_future_model"]["values"] == [1, 2]
+
+
+def test_extra_parameters_require_a_model_consumer():
+    assert LeRobotTorchModelSession._provider_load_options(None, object(), {}) == {}
+    with pytest.raises(BackendLoadError, match="does not support"):
+        LeRobotTorchModelSession._provider_load_options(None, object(), {"solver": "ab2"})
+    with pytest.raises(BackendLoadError, match="does not support"):
+        LeRobotTorchModelSession._provider_load_options(SimpleNamespace(), object(), {"anything": 1})
+
+
+def test_provider_extra_parameters_cannot_disable_strict_weight_loading():
+    provider = SimpleNamespace(resolve_load_options=lambda **kwargs: {"strict": False})
+    with pytest.raises(ValueError, match="cannot replace"):
+        LeRobotTorchModelSession._provider_load_options(provider, object(), {"anything": 1})

@@ -87,6 +87,7 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 | `configure_config(config, model_dtype=...)` | 加载权重前配置模型并检查固定契约 |
 | `validate(config=..., bundle_root=..., tokenizer_path=..., device_name=...)` | 模型内部的平台与依赖兼容检查 |
 | `load_options` | 该模型特有的 `from_pretrained` 参数 |
+| `resolve_load_options(config=..., extra_parameters=...)` | 可选；解释本次 deployment 的通用 JSON 参数，返回模型自己的 `from_pretrained` 参数。不得覆盖 config、strict 或本地加载约束 |
 | `prepare(policy=..., deployment_fingerprint=..., torch_module=..., torch_npu_module=..., device_name=...)` | 模型放置设备并转换 dtype 后准备推理优化 |
 | `execution_metadata(policy)` | 可选的模型诊断 metadata，默认无 |
 | `preprocess_inputs(inputs, config=...)` | 可选的 CPU 输入优化；在 LeRobot processor 之前执行，耗时计入 pipeline preprocess，默认不改变输入 |
@@ -95,6 +96,11 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 `ModelSession` 继续管理权重加载、设备放置、processor、取消和资源释放。Provider 不依赖
 ROS，也不导入 `inference_service`。模型源码、兼容矩阵和使用说明归属模型目录。
 新增模型时应覆盖 lazy 解析、未匹配路由、加载失败和模型特有约束，并在相应设备上验证。
+
+`extra_parameters` 是 deployment 级通用容器，通用 manifest/session 不定义其中字段。
+Session 传递独立的参数副本；provider 可为本次新建的配置对象绑定不可变推理设置，并将同一设置
+作为构造参数返回。配置不得保存到共享 provider 单例或进程全局变量。PI05 实现使用
+`PI05AscendInferenceConfig`，两档命名部署共享权重，分别选择 Euler10 与 AB2 三次求值。
 
 ## 轻量验证
 

@@ -129,6 +129,24 @@ profile。
 
 ## 产物完整性
 
+每个 deployment 可携带 `extra_parameters`，默认 `{}`。它是模型拥有的任意 JSON 对象，
+可嵌套数组、对象、数字、字符串、布尔值和 null；manifest 只检查 JSON 结构与有限数值，
+不认识其中的模型字段。对应 provider 负责解释、默认值与支持范围的校验。
+
+```json
+"extra_parameters": {
+  "denoising": {"solver": "ab2", "schedule": "uniform", "steps": 3},
+  "language_capacity": 48
+}
+```
+
+参数直接内嵌，无需额外参数文件或用户维护的 SHA-256 校验值。非空参数参与 deployment 与
+runtime profile 的缓存身份，使同名部署重新导出后不会复用旧配置的图或性能档案；空对象与
+未声明时保持旧身份。参数不是可执行类路径，不从 manifest 动态导入代码。
+当前原生 LeRobot Torch session 将其交给 `PolicyProvider.resolve_load_options`；没有消费者时
+非空参数会报错。其他模型/后端可实现各自消费入口，manifest 不预设统一参数语义。
+新增字段需要支持它的运行时；旧版 strict schema 会拒绝该字段，而不是静默切换算法。
+
 常规加载只校验声明的摘要、路径与结构，不对大文件计算 hash。
 `verify_deployment_artifacts(bundle_root, deployment_name)` 执行显式内容校验，并在旁边写入
 `inference_integrity.json` 报告。不匹配以稳定代码 `artifact_digest_mismatch` 上报；发布
