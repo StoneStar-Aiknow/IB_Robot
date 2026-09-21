@@ -545,7 +545,7 @@ def test_robot_state_freshness_defaults_independently_from_perception_scene_fres
 def test_load_single_arm_config():
     """Test loading SO-101 single arm configuration."""
     # This test assumes the example config exists
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -592,7 +592,7 @@ def test_load_single_arm_config():
 
 
 def test_load_single_arm_config_dict_preserves_launch_schema():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -610,7 +610,7 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
 
 
 def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     config = load_robot_config_dict(config_path)
 
@@ -618,7 +618,7 @@ def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
 
 
 def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     config = load_robot_config_dict(config_path)
     policy_keys = {"observation.state", "observation.images.top", "observation.images.wrist"}
@@ -631,7 +631,7 @@ def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
 
 
 def test_dict_contract_builder_matches_typed_contract_shape():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -717,7 +717,7 @@ def test_align_rejects_negative_max_age():
 
 
 def test_so101_single_arm_contract_includes_motor_current_observation():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -1300,7 +1300,7 @@ def test_validate_embodied_relative_motion_direction_mapping():
     assert any("missing directions: down" in error for error in errors)
 
 
-def test_validate_embodied_requires_hermes_entry_mode():
+def test_validate_embodied_rejects_removed_skill_templates():
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -1626,3 +1626,43 @@ def test_validate_embodied_skill_template_requires_pose_source():
     errors = validate_config(config)
 
     assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
+
+
+def test_resolve_joint_names_strips_field_selectors_under_public_model():
+    from robot_config.utils import resolve_joint_names_from_config
+
+    robot_config = {
+        "robot_model": {"joint_groups": {"all": ["1", "2", "3", "4", "5", "6"]}},
+        "contract": {
+            "observations": [
+                {"key": "observation.images.front", "interface": "camera.front.color"},
+                {
+                    "key": "observation.state",
+                    "interface": "joint.state",
+                    "selector": {
+                        "names": ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"]
+                    },
+                },
+                {
+                    "key": "observation.current",
+                    "interface": "joint.current",
+                    "selector": {"names": ["current.1", "current.6"]},
+                },
+            ]
+        },
+    }
+
+    # Field selectors carry the joint name in the suffix; returning them raw
+    # made every public conversion lookup fail with "missing contract joints".
+    assert resolve_joint_names_from_config(robot_config) == ["1", "2", "3", "4", "5", "6"]
+
+
+def test_resolve_joint_names_keeps_bare_selector_names():
+    from robot_config.utils import resolve_joint_names_from_config
+
+    robot_config = {
+        "robot_model": {"joint_groups": {"all": ["left_arm", "right_arm"]}},
+        "contract": {"observations": [{"key": "observation.state", "selector": {"names": ["left_arm", "right_arm"]}}]},
+    }
+
+    assert resolve_joint_names_from_config(robot_config) == ["left_arm", "right_arm"]

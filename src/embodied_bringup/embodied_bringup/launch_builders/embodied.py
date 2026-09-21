@@ -14,11 +14,13 @@ from robot_config.loader import (
     robot_config_digest,
     robot_context_schema_version,
     robot_supported_control_modes,
+    validate_agent_entry_config,
     validate_navigation_endpoint_contract,
 )
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
+from robot_runtime import contract as RUNTIME
 
 logger = get_colored_logger("embodied_bringup")
 
@@ -72,6 +74,7 @@ def generate_embodied_nodes(
     include_motion: bool = True,
     include_visual_games: bool = True,
     include_perception: bool = True,
+    use_sim: bool = False,
 ) -> list[Node]:
     """Generate embodied minimum-closure nodes from robot_config YAML."""
     embodied_config = robot_config.get("embodied", {})
@@ -98,8 +101,11 @@ def generate_embodied_nodes(
     if not isinstance(hri_runtime, dict):
         raise ValueError("embodied.imitate_human_motion must be a mapping")
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
-    if entry_mode != "hermes":
-        raise ValueError("embodied.entry_mode must be hermes")
+    if entry_mode not in {"hermes", "agent"}:
+        raise ValueError("embodied.entry_mode must be hermes or agent")
+    launch_errors = validate_agent_entry_config(embodied_config)
+    if launch_errors:
+        raise ValueError("; ".join(launch_errors))
     endpoint_errors = validate_navigation_endpoint_contract(robot_config)
     if endpoint_errors:
         raise ValueError("; ".join(endpoint_errors))
@@ -108,6 +114,39 @@ def generate_embodied_nodes(
     safety = embodied_config.get("safety", {})
     joint_config = robot_config.get("joints", {})
     teleoperation = robot_config.get("teleoperation", {})
+    runtime = robot_config.get("runtime", {})
+    runtime_enabled = bool(runtime.get("provider"))
+    runtime_motion = runtime_enabled and include_motion and motion_mode_compatible
+    description = runtime.get("interface_description", {}) if runtime_enabled else {}
+    joint_limits = teleoperation.get("safety", {}).get("joint_limits", {})
+    home_positions = robot_config.get("ros2_control", {}).get("reset_positions", {})
+    if runtime_motion:
+        from robot_runtime.interface_description import validate_description
+
+        validate_description(description)
+        model = robot_config.get("robot_model")
+        if model != description.get("model") or not model:
+            raise ValueError("embodied motion requires bound robot_model from the public description")
+        home_positions = model["home_positions"]
+        effective_limits = {name: dict(bounds) for name, bounds in model["joint_limits"].items()}
+        for name, bounds in joint_limits.items():
+            physical = effective_limits.get(name)
+            if physical is None or bounds["min"] < physical["min"] or bounds["max"] > physical["max"]:
+                raise ValueError(f"application joint limit must narrow the public model: {name}")
+            effective_limits[name] = dict(bounds)
+        joint_limits = effective_limits
+
+    def public_endpoint(interface_id, kind, message_type):
+        interface = description["interfaces"].get(interface_id, {})
+        direction = "publish" if kind == "topic" else "serve"
+        if (interface.get("kind"), interface.get("direction"), interface.get("message_type")) != (
+            kind,
+            direction,
+            message_type,
+        ):
+            raise ValueError(f"embodied runtime requires public {interface_id}: {message_type}")
+        return interface["endpoint"]
+
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
     placement_execution = robot_config.get("placement_execution", {})
@@ -161,7 +200,7 @@ def generate_embodied_nodes(
         "named_targets_json": json.dumps(named_targets),
         "workspace_json": json.dumps(safety.get("workspace", {})),
         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
-        "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
+        "joint_limits_json": json.dumps(joint_limits),
         "default_target_name": embodied_config.get("default_target_name", "demo_object"),
         "default_place_name": embodied_config.get("default_place_name", "home"),
         "skill_action_name": embodied_config.get("skill_action_name", "/embodied/execute_skill"),
@@ -216,10 +255,38 @@ def generate_embodied_nodes(
         "placement_execution_json": json.dumps(placement_execution),
         "imitate_human_motion_action_name": hri_runtime.get("action_name", "/hri/imitate_human_motion"),
         "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
-        "move_configuration_service": execution.get(
-            "move_configuration_service", "/moveit_gateway/move_to_configuration"
-        ),
+        "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
     }
+    if runtime_motion:
+        common_params.update(
+            runtime_enabled=True,
+            runtime_name=description["robot"]["runtime_name"],
+            runtime_status_topic=public_endpoint("runtime.status", "topic", "ibrobot_msgs/msg/RuntimeStatus"),
+            runtime_mode_service=public_endpoint("runtime.set_mode", "service", "ibrobot_msgs/srv/SetRuntimeMode"),
+            runtime_status_qos_json=json.dumps(description["interfaces"]["runtime.status"]["qos"]),
+            runtime_mode_map_json=json.dumps(
+                {
+                    name: mode["runtime_mode"]
+                    for name, mode in robot_config.get("control_modes", {}).items()
+                    if isinstance(mode, dict) and mode.get("runtime_mode")
+                }
+            ),
+            move_configuration_service=public_endpoint(
+                "motion.move_to_joint", "service", "ibrobot_msgs/srv/MoveToConfiguration"
+            ),
+            joint_state_topic=public_endpoint("joint.state", "topic", "sensor_msgs/msg/JointState"),
+            ee_pose_topic=public_endpoint("motion.ee_pose", "topic", "geometry_msgs/msg/PoseStamped"),
+        )
+        trajectory = [
+            item
+            for item in description["interfaces"].values()
+            if item.get("kind") == "action"
+            and item.get("message_type") == "control_msgs/action/FollowJointTrajectory"
+            and item.get("target_group") == "arm"
+        ]
+        if len(trajectory) != 1:
+            raise ValueError("embodied runtime requires one public arm trajectory action")
+        common_params["arm_trajectory_action_name"] = trajectory[0]["endpoint"]
     navigation_action_name = navigation_endpoint_projection(robot_config)
     if navigation_action_name is not None:
         common_params["navigation_action_name"] = navigation_action_name
@@ -389,6 +456,54 @@ def generate_embodied_nodes(
             ],
         ),
     ]
+    if entry_mode == "agent":
+        agent_config = embodied_config.get("agent", {})
+        if not isinstance(agent_config, dict) or agent_config.get("enabled", True) is not True:
+            raise ValueError("embodied.agent.enabled must be true for entry_mode=agent")
+        nodes.append(
+            Node(
+                package="ibrobot_agent",
+                executable="ibrobot_agent_node",
+                name="ibrobot_agent_node",
+                output="screen",
+                parameters=[
+                    {
+                        "request_topic": agent_config.get("request_topic", "/agent/request"),
+                        "event_topic": agent_config.get("event_topic", "/agent/event"),
+                        "response_topic": agent_config.get("response_topic", "/agent/response"),
+                        "control_topic": agent_config.get("control_topic", "/agent/control"),
+                        "robot_scope": str(robot_config.get("name", "unknown")),
+                        "channel_id": agent_config.get("channel_id", "agent_incubation"),
+                        "principal_id": agent_config.get("principal_id", "local_operator"),
+                        "ledger_path": agent_config.get("ledger_path", ""),
+                        "conversation_path": agent_config.get("conversation_path", ""),
+                        "deployment_lock_path": agent_config.get("deployment_lock_path", ""),
+                        "execution_enabled": agent_config.get("execution_enabled", False),
+                        "max_session_turns": agent_config.get("max_session_turns", 12),
+                        "clarification_ttl_sec": agent_config.get("clarification_ttl_sec", 300.0),
+                        "event_queue_size": agent_config.get("event_queue_size", 128),
+                        "allowed_skills_json": json.dumps(list(agent_config.get("test_allowlist", []))),
+                        "simulation_mode": bool(use_sim),
+                        "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                        "task_budget_sec": timeout_policy["task_budget_sec"],
+                        "planner_config_json": json.dumps(agent_config.get("planner", {"mode": "rule"})),
+                        "gateway_status_service": common_params["skill_gateway_status_service"],
+                        "gateway_validate_skill_service": common_params["validate_skill_service"],
+                        "gateway_skill_action": common_params["skill_action_name"],
+                        "gateway_plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                        "gateway_validate_plan_service": embodied_config.get(
+                            "validate_plan_service", "/embodied/validate_agent_plan"
+                        ),
+                        "gateway_confirm_plan_service": embodied_config.get(
+                            "confirm_plan_service", "/embodied/confirm_agent_plan"
+                        ),
+                        "gateway_execute_plan_action": embodied_config.get(
+                            "execute_plan_action", "/embodied/execute_agent_plan"
+                        ),
+                    }
+                ],
+            )
+        )
     if hri_runtime.get("enabled", False):
         nodes.append(
             Node(
@@ -403,10 +518,8 @@ def generate_embodied_nodes(
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                         "startup_warmup": hri_runtime.get("startup_warmup", True),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
-                        "reset_positions_json": json.dumps(
-                            robot_config.get("ros2_control", {}).get("reset_positions", {})
-                        ),
-                        "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
+                        "reset_positions_json": json.dumps(home_positions),
+                        "joint_limits_json": json.dumps(joint_limits),
                     }
                 ],
             )
@@ -517,10 +630,10 @@ def generate_embodied_nodes(
                             "primitive_action_name", "/embodied/execute_primitive"
                         ),
                         "grasp_execution_json": json.dumps(grasp_execution),
+                        "kinematics_backend": "runtime" if runtime_enabled else "legacy_moveit",
+                        "interface_description_json": json.dumps(description),
                         "workspace_json": json.dumps(safety.get("workspace", {})),
-                        "home_joint_positions_json": json.dumps(
-                            robot_config.get("ros2_control", {}).get("reset_positions", {})
-                        ),
+                        "home_joint_positions_json": json.dumps(home_positions),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "gripper_open_position": execution.get("gripper_open_position", 1.0),
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),

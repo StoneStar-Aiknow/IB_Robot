@@ -86,6 +86,59 @@ class _OneFrameDelayedDecoder(VideoDecoder):
         self._pending = None
 
 
+class _ResetCountingDecoder(VideoDecoder):
+    """Wrap a decoder and count reset() invocations."""
+
+    def __init__(self, inner: VideoDecoder) -> None:
+        self._inner = inner
+        self.reset_count = 0
+
+    @property
+    def state(self) -> CodecLifecycleState:
+        return self._inner.state
+
+    @property
+    def metrics(self) -> CodecMetrics:
+        return self._inner.metrics
+
+    def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
+        return self._inner.decode(packet)
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        self._inner.reset()
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        self._inner.close(timeout_s)
+
+
+class _StarvedDecoder(VideoDecoder):
+    """Accept every access unit and never produce output."""
+
+    def __init__(self, reset_error: Exception | None = None) -> None:
+        self.reset_count = 0
+        self._reset_error = reset_error
+
+    @property
+    def state(self) -> CodecLifecycleState:
+        return CodecLifecycleState.RUNNING
+
+    @property
+    def metrics(self) -> CodecMetrics:
+        return CodecMetrics()
+
+    def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
+        return []
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        if self._reset_error is not None:
+            raise self._reset_error
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        pass
+
+
 def test_rtp_packet_round_trip_validates_fixed_header_and_identity():
     packet = RtpPacket(96, True, 65535, 0xFFFF_FFFE, _SSRC, b"payload")
 
@@ -94,6 +147,47 @@ def test_rtp_packet_round_trip_validates_fixed_header_and_identity():
     assert parsed == packet
     with pytest.raises(ValueError, match="version"):
         RtpPacket.from_bytes(bytes((0,)) + packet.to_bytes()[1:])
+
+
+def test_split_annex_b_returns_payload_unchanged_without_a_start_code():
+    assert split_annex_b(b"\x41no start code here") == [b"\x41no start code here"]
+    assert split_annex_b(b"") == []
+
+
+def test_split_annex_b_handles_three_and_four_byte_start_codes():
+    payload = b"\x00\x00\x01" + b"\x67abc" + b"\x00\x00\x00\x01" + b"\x65defg"
+
+    assert split_annex_b(payload) == [b"\x67abc", b"\x65defg"]
+
+
+def test_split_annex_b_treats_an_extra_leading_zero_as_a_four_byte_start_code():
+    # 00 00 00 00 01 must anchor at offset 1 so the surplus zero stays outside
+    # the NAL body, matching how H.264 Annex-B trailing_zero_8bits is emitted.
+    assert split_annex_b(b"\x00\x00\x00\x00\x01\x65payload") == [b"\x65payload"]
+
+
+def test_split_annex_b_discards_bytes_before_the_first_start_code():
+    assert split_annex_b(b"junk\x00\x00\x00\x01\x65body") == [b"\x65body"]
+
+
+def test_split_annex_b_skips_empty_nal_units_between_adjacent_start_codes():
+    payload = b"\x00\x00\x00\x01" + b"\x00\x00\x00\x01" + b"\x65body" + b"\x00\x00\x00\x01"
+
+    assert split_annex_b(payload) == [b"\x65body"]
+
+
+def test_split_annex_b_splits_a_megabyte_access_unit_without_per_byte_scanning():
+    # The sender splits every access unit inline on the encode worker, so a
+    # per-byte Python scan shows up directly as lost capture frame rate on the
+    # edge board. 1 MiB must stay far below one frame period at 30 FPS.
+    payload = b"".join(b"\x00\x00\x00\x01\x41" + bytes(4095) for _ in range(256))
+
+    start = time.perf_counter()
+    nal_units = split_annex_b(payload)
+    elapsed_s = time.perf_counter() - start
+
+    assert len(nal_units) == 256
+    assert elapsed_s < 0.020, f"split_annex_b took {elapsed_s * 1000:.1f} ms for {len(payload)} bytes"
 
 
 def test_h264_packetization_round_trip_handles_single_nal_and_fu_a():
@@ -366,6 +460,67 @@ def test_packet_loss_degrades_stream_then_next_repeated_header_idr_recovers():
     receiver.close()
 
 
+def test_keyframe_recovery_after_loss_does_not_reset_decoder():
+    datagrams, encoder, sender = _encoded_stream(frame_count=5, gop_frames=2, max_datagram_size=180)
+    decoder = _ResetCountingDecoder(SoftwareH264Decoder())
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+    packets = [RtpPacket.from_bytes(item) for item in datagrams]
+    damaged_timestamp = sorted({packet.timestamp for packet in packets})[1]
+    dropped = False
+    delivered = []
+    for datagram, packet in zip(datagrams, packets, strict=True):
+        if packet.timestamp == damaged_timestamp and not dropped:
+            dropped = True
+            continue
+        delivered.append(datagram)
+
+    _deliver(delivered, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 0
+    assert receiver.status.state is StreamLifecycleState.READY
+    assert receiver.status.metrics.decoded_frames >= 3
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_starved_decoder_triggers_rate_limited_reset():
+    datagrams, encoder, sender = _encoded_stream(frame_count=40, gop_frames=1, max_datagram_size=180)
+    decoder = _StarvedDecoder()
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 1
+    assert receiver.status.state is StreamLifecycleState.WAITING_FOR_KEYFRAME
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_starved_decoder_reset_failure_degrades_stream():
+    datagrams, encoder, sender = _encoded_stream(frame_count=40, gop_frames=1, max_datagram_size=180)
+    from observation_transport.video_codec import VideoCodecError
+
+    decoder = _StarvedDecoder(reset_error=VideoCodecError("decode_failed", "decoder wedged", backend="software"))
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 1
+    assert receiver.status.state is StreamLifecycleState.DEGRADED
+    assert receiver.status.metrics.decode_errors == 1
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
 def test_receiver_reset_clears_buffer_mapping_and_readiness():
     receiver, buffer = _receiver()
     receiver.start()
@@ -622,3 +777,44 @@ def _deliver(datagrams: list[bytes], receiver: H264RtpReceiver, *, start_receive
     for index, datagram in enumerate(datagrams):
         decoded.extend(receiver.process_datagram(datagram, receive_time_ns=start_receive_ns + index * 1_000_000))
     return decoded
+
+
+def test_recording_receiver_keeps_frame_index_monotonic_across_session_resets(tmp_path):
+    """A heartbeat flap re-handshakes the RTP session mid-episode.
+
+    frame_index belongs to the recording, not to the RTP session, so it must keep
+    counting across the reset. Restarting at 0 makes the whole episode unconvertible.
+    """
+    recorder = H264StreamRecorder(integrity_mode="tolerant")
+    receiver, _ = _receiver(recorder=recorder, decode=False)
+    receiver.start()
+    encoder = _encoder(gop_frames=1)
+    recorder.start_episode(tmp_path, "observation.images.top")
+
+    for generation in (1, 2, 3):
+        if generation > 1:
+            receiver.reset(generation)  # what a heartbeat expiry triggers
+        receiver.timestamp_mapper.update(
+            90_000 * generation,
+            1_000_000_000 * generation,
+            2_000_000_000 * generation,
+            session_generation=generation,
+        )
+        memory = _MemoryDatagramSender([])
+        sender = _sender(memory, queue_capacity=2)
+        capture_ns = 1_000_000_000 * generation
+        for packet in encoder.encode(
+            VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), capture_ns, capture_ns, 64, 48, "rgb24")
+        ):
+            sender.enqueue(packet)
+            sender.send_pending()
+        _deliver(memory.datagrams, receiver, start_receive_ns=2_000_000_000 * generation)
+        sender.close()
+
+    assert recorder.stop_episode() is True
+    sidecar = tmp_path / "observation.images.top.h264.json"
+    indices = [json.loads(line)["frame_index"] for line in sidecar.read_text().splitlines()]
+    assert len(indices) == 3
+    assert indices == list(range(len(indices)))
+    encoder.close()
+    receiver.close()

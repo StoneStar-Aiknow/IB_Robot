@@ -1,9 +1,12 @@
-"""Launch-graph branch tests for the scheduler.enable switch.
+"""Launch-graph branch tests for the scheduler.enable and executor.enabled switches.
 
 Asserts the false/absent branch produces the legacy `action_dispatcher_node` set
 byte-for-byte unchanged, and the true branch produces the scheduled topology
 (`pipeline_policy_node` + `global_inference_scheduler_node` +
 `scheduled_action_dispatcher_node`). The two dispatchers never coexist.
+
+Also asserts `executor.enabled: false` drops the dispatcher while keeping the
+pipeline node, which is what a recording-only deployment needs.
 """
 
 from __future__ import annotations
@@ -18,7 +21,10 @@ from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.dispatch_strategies import DispatchStrategyError
-from robot_config.launch_builders.execution import generate_execution_nodes
+from robot_config.inference_config import InferenceConfigError
+from robot_config.launch_builders.execution import generate_action_dispatcher_node, generate_execution_nodes
+from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
+from robot_config.runtime_target import RuntimeTarget
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -193,6 +199,35 @@ def _scheduled_robot_config(config_path: Path, bundle: Path, profile: Path) -> d
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("use_sim", [True, "true", False])
+def test_simulation_rejects_enabled_inference_scheduler(tmp_path: Path, use_sim) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+
+    with pytest.raises(InferenceConfigError, match="simulation does not support"):
+        generate_execution_nodes(config, use_sim=use_sim, runtime_target=RuntimeTarget.SIMULATION)
+
+
+def test_legacy_use_sim_argument_rejects_enabled_inference_scheduler(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+
+    with pytest.raises(InferenceConfigError, match="simulation does not support"):
+        generate_execution_nodes(config, use_sim="true")
+
+
+@pytest.mark.parametrize("explicit_false", [False, True])
+def test_simulation_uses_legacy_inference_without_scheduler(tmp_path: Path, explicit_false) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    if explicit_false:
+        config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+
+    nodes = generate_execution_nodes(config, use_sim=True, runtime_target=RuntimeTarget.SIMULATION)
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
 def test_absent_scheduler_produces_legacy_dispatcher_only(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
@@ -207,6 +242,50 @@ def test_absent_scheduler_produces_legacy_dispatcher_only(tmp_path: Path) -> Non
     assert "global_inference_scheduler_node" not in executables
 
 
+@pytest.mark.parametrize(
+    "filename,expected_joints",
+    [
+        ("test_single_arm_single_cam.yaml", ["1", "2", "3", "4", "5", "6"]),
+        ("dev_rtp_single_camera.yaml", []),
+        ("dev_rtp_multi_camera.yaml", []),
+    ],
+)
+def test_repository_configs_load_and_build_dispatcher(tmp_path, filename, expected_joints):
+    path = Path(__file__).resolve().parents[1] / "config" / "robots" / filename
+    config = load_robot_config_dict(path)
+    contract = build_contract_from_robot_config_dict(config)
+    assert config["joints"]["all"] == expected_joints
+    if expected_joints:
+        state = next(obs for obs in config["contract"]["observations"] if obs["key"] == "observation.state")
+        assert expected_joints == state["selector"]["names"]
+        assert len(contract.actions) == 2
+    else:
+        assert not contract.actions
+
+    # Supply a local bundle for the development placeholder or the contract-only profile.
+    bundle = _create_bundle(tmp_path / "bundle")
+    if "control_modes" not in config:
+        config["control_modes"] = _legacy_robot_config(path, bundle)["control_modes"]
+    else:
+        config["control_modes"]["model_inference"]["inference"]["pipelines"]["dev_policy"]["model_path"] = str(bundle)
+    nodes = generate_execution_nodes(config, "model_inference")
+    dispatcher = next(node for node in nodes if node.node_executable == "action_dispatcher_node")
+    params = _node_parameters(dispatcher)
+    if expected_joints:
+        assert params["joint_names"] == expected_joints
+    else:
+        assert "joint_names" not in params
+
+
+def test_missing_joint_list_error_links_to_existing_documentation(tmp_path):
+    config = {"name": "missing_joints", "_config_path": str(tmp_path / "robot.yaml")}
+    with pytest.raises(ValueError, match=r"robot\.joints\.all is required") as error:
+        generate_action_dispatcher_node(config, "model_inference")
+    docs_path = "docs/robot_interface_schema.md"
+    assert docs_path in str(error.value)
+    assert (Path(__file__).resolve().parents[3] / docs_path).is_file()
+
+
 def test_scheduler_enable_false_produces_legacy_dispatcher_only(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
@@ -216,6 +295,50 @@ def test_scheduler_enable_false_produces_legacy_dispatcher_only(tmp_path: Path) 
 
     executables = [node.node_executable for node in nodes]
     assert executables == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
+def test_executor_enabled_false_drops_the_dispatcher_but_keeps_the_pipeline(tmp_path: Path) -> None:
+    """A recording-only deployment streams video but must never request inference.
+
+    The cloud peer runs no inference backend, so a dispatched request can only
+    time out; that timeout invalidates the distributed session and the edge
+    stops sending video altogether. `executor.enabled: false` is how a config
+    declares "stream, do not dispatch" — the pipeline node must survive because
+    it owns the RTP sender.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    robot_config["control_modes"]["model_inference"]["executor"]["enabled"] = False
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node"]
+
+
+def test_executor_enabled_absent_keeps_the_dispatcher(tmp_path: Path) -> None:
+    """Absent means enabled: the switch must not change any existing config."""
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    assert "enabled" not in robot_config["control_modes"]["model_inference"]["executor"]
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
+def test_executor_disabled_with_scheduler_enabled_is_rejected(tmp_path: Path) -> None:
+    """The scheduled topology exists to feed a dispatcher, so the pair is incoherent.
+
+    Honouring the switch on only one branch is how a config silently means two
+    different things, so refuse the combination instead of ignoring it.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    robot_config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, profile)
+    robot_config["control_modes"]["model_inference"]["executor"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="executor.enabled"):
+        generate_execution_nodes(robot_config, "model_inference")
 
 
 def test_scheduler_enable_false_matches_absent_scheduler_launch_graph(tmp_path: Path) -> None:
@@ -264,6 +387,21 @@ def test_complete_scheduled_config_needs_only_enable_false_for_legacy_launch(tmp
         "terminal_session_retention_ns",
     ):
         assert key not in pipeline_params
+
+
+def test_edf_policy_is_forwarded_to_global_scheduler(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    config_path = tmp_path / "robot.yaml"
+    robot_config = _scheduled_robot_config(config_path, bundle, profile)
+    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"]["global_policy"] = "edf"
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+    scheduler = next(node for node in nodes if node.node_executable == "global_inference_scheduler_node")
+    parameters = _node_parameters(scheduler)
+
+    assert parameters["global_policy"] == "edf"
+    assert parameters["priority_zero_deadline_admission_enabled"] is False
 
 
 def test_scheduler_disabled_matches_63d80599_legacy_launch_contract(tmp_path: Path) -> None:
@@ -448,6 +586,7 @@ def test_scheduled_dispatcher_receives_global_endpoints_and_runtime_policy(tmp_p
     pipeline_params = _node_parameters(pipeline)
     assert "scheduler_enabled" not in pipeline_params
     assert pipeline_params["runtime_policy_json"]
+    assert json.loads(pipeline_params["pipeline_scheduling_json"])["stages"]["policy"]["max_snapshot_age_ms"] == 5000
     assert pipeline_params["max_prompt_bytes"] == 4096
     assert pipeline_params["max_error_message_bytes"] == 1024
     assert pipeline_params["max_error_details_bytes"] == 8192

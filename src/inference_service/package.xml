@@ -21,14 +21,18 @@
   <depend>trajectory_msgs</depend>
   <depend>rosbag2_py</depend>
   <depend>std_srvs</depend>
+  <depend>unique_identifier_msgs</depend>
 
   <depend>ibrobot_msgs</depend>
   <depend>inference_manifest</depend>
   <exec_depend>python3-numpy</exec_depend>
   <depend>tensormsg</depend>
   <depend>observation_transport</depend>
+  <depend>torch_models</depend>
   <depend>robot_config</depend>
+  <depend>robot_runtime</depend>
   <depend>dataset_tools</depend>
+  <depend>ibrobot_tracing</depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

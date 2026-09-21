@@ -90,6 +90,7 @@ class ContractObservation:
     align: dict[str, Any] | None = None
     qos: dict[str, Any] | None = None
     transport: ObservationTransportSpec | None = None
+    _interface_source: dict[str, Any] | None = None
 
 
 @dataclass
@@ -157,6 +158,7 @@ class EmbodiedConfig:
 
     enabled: bool = False
     entry_mode: str = "hermes"
+    agent: dict[str, Any] = field(default_factory=dict)
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"
@@ -315,7 +317,9 @@ class RobotConfig:
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
     semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)
     perception_services: "PerceptionRuntimeConfig | None" = None
-    placement_execution: dict[str, Any] = field(default_factory=dict)
+    placement_execution: dict[str, Any] | None = None
+    runtime: dict[str, Any] = field(default_factory=dict)
+    robot_model: dict[str, Any] = field(default_factory=dict)
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""
@@ -343,7 +347,7 @@ class RobotConfig:
             # Prefer explicit type from YAML; fall back to inference
             topic_type = obs.type or "sensor_msgs/msg/JointState"
 
-            if obs.peripheral:
+            if obs.peripheral and obs._interface_source is None:
                 cam = self.get_camera(obs.peripheral)
                 if cam:
                     topic_type = "sensor_msgs/msg/Image"
@@ -358,6 +362,7 @@ class RobotConfig:
                 camera_width=cam.width if cam else None,
                 camera_height=cam.height if cam else None,
                 camera_fps=cam.fps if cam else None,
+                interface_source=obs._interface_source,
             )
 
             obs_specs.append(
@@ -370,6 +375,7 @@ class RobotConfig:
                     align=_as_align(obs.align),
                     qos=obs.qos,
                     transport=transport,
+                    _interface_source=obs._interface_source,
                 )
             )
 
@@ -389,6 +395,7 @@ class RobotConfig:
                     publish_qos=pub.get("qos"),
                     publish_strategy=pub.get("strategy"),
                     safety_behavior=sb,
+                    _interface_source=pub.get("_interface_source"),
                 )
             )
 

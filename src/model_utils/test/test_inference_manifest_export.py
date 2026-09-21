@@ -186,6 +186,18 @@ def test_package_torch_deployments_supports_device_selection_and_prefix(tmp_path
     assert validated[0].deployment.device == "cpu"
 
 
+@pytest.mark.parametrize("policy_type", ["act", "pi05"])
+def test_native_devices_share_one_model_descriptor_without_selector(tmp_path, policy_type):
+    _create_bundle(tmp_path, policy_type=policy_type)
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    package_torch_deployments(tmp_path, devices=("cpu", "cuda"))
+    result = package_torch_deployments(tmp_path, devices=("npu",))[0]
+
+    assert set(result.manifest.deployments) == {"torch-cpu", "torch-cuda", "torch-npu"}
+    assert result.manifest.model.model_type == policy_type
+    assert result.manifest.model.architecture_class is None
+
+
 def test_package_deployment_artifact_reuses_identical_immutable_generation(tmp_path):
     source = tmp_path / "policy.rknn"
     source.write_bytes(b"rknn")

@@ -21,6 +21,11 @@ override 注入序列号，避免把某一台实物设备绑定到所有同型�
 
 ## 特性
 
+未配置 runtime provider 的 pick / skill / task 链路默认连接中立运动服务
+`/motion/move_to_joint` 和 `/motion/move_to_pose`，不再使用已删除的
+`/moveit_gateway/*`。这些默认值不会自动启动运动服务；SO-101 部署必须独立启动
+`so101_motion` 的 `motion_server` 及其所需控制栈后才能执行运动。
+
 - **单一 YAML 配置**：在一个文件中定义 ros2_control、相机和 ML 契约
 - **使用现有 ROS2 相机驱动**：
   - `usb_cam` 用于 USB 相机（基于 OpenCV）
@@ -791,6 +796,8 @@ robot:
 ### 推理调度控制面
 
 调度只有一个功能开关：`control_modes.<mode>.inference.scheduler.enable`，缺失时按 `false` 处理。
+仿真暂不支持启用该开关：`runtime_target=simulation`（含 Gazebo、MuJoCo、mock）运行推理时必须设置
+`scheduler.enable=false`，否则 launch 在生成控制与仿真节点前报错。仿真场景不管理调度 session/binding。
 `inference.enabled` 仍只表示该控制模式是否启用推理，不是调度模式开关。
 
 当 `scheduler.enable` 缺失或为 `false` 时，launch graph 与原路径相同：
@@ -856,19 +863,30 @@ control_modes:
 ```
 
 Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
+对于 `scheduling.stage_policy: independent`，可在 `scheduling.stages.<producer>` 下设置
+`max_snapshot_age_ms: 5000`（默认值，正整数）。producer 是 manifest `execution` 中的第一个角色；
+terminal 或 sequential stage 不允许设置该字段。时效从观测采样开始计算，包含 producer 排队与执行时间，
+阈值进入 runtime policy fingerprint 并经 launch 下发。刷新不能使过期的同一观测重新有效。
 分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
-priority-0 的每个请求独立使用自己的 target、fallback chain 和 deadline 做
-准入；同一 `hardware_resource_id` 上已准入的 priority-0 会按 reservation FIFO 串行下发，并在实际轮到执行时
-重新检查 deadline，但不设置 pipeline 数量上限。`hardware_profile_fingerprint` 独立标识离线标定环境，不能使用
+默认 `global_policy: fifo` 且 `priority_zero_deadline_admission.enable: false` 时，priority-0 直接下发 target，
+不建立资源等待队列、不使用 profile，也不接受非空 fallback chain；启用 scheduler 后该无效组合会在配置加载时报错。
+FIFO 开启 profile 准入时，同一 `hardware_resource_id` 上已准入的 priority-0 按 reservation FIFO 串行下发，
+实际轮到执行时重新检查 deadline，支持 fallback，但仅支持 sequential pipeline。
+`global_policy: edf` 按绝对 deadline 排序尚未开始的 priority-0，同 deadline 按 FIFO，支持 fallback；
+EDF 必须关闭 profile 准入，不抢占执行中的请求，不预测或保证完成时间。
+deadline 驱动（EDF 或 FIFO profile 准入）的 priority-0 只服务 sequential pipeline：
+independent pipeline 把一个请求拆到两个 worker 重叠执行，per-request deadline 排序无法评估也无法兑现。
+`inference_priority=0` 时 target 或 fallback 链选择 independent pipeline 会在配置加载时报错，
+Global 也会按 serving status 能力在运行时跳过 independent 候选。
+`hardware_profile_fingerprint` 独立标识离线标定环境，不能使用
 资源 ID 代替。
 profile entry 使用 `global_proxy` scope。action-generation entry 必须声明 pipeline serving status 发布的
 `input_contract_fingerprint` 和标定覆盖的 `prompt_bytes_max`；session-control entry 使用空 fingerprint 和
 `prompt_bytes_max: 0`。profile identity 使用 `profile_compatibility_fingerprint`，不再绑定 endpoint 名称、
 required 状态或 compatibility group。其他 priority 只下发 target，
-不做 fallback 或 deadline 准入。缺失或无效 profile 不影响 readiness 和非零优先级请求；priority-0 实际遍历到
-该候选时会将其判为不可准入并继续 fallback，所有候选都不可准入时返回 `no_feasible_deadline`。Global/pipeline
-不保存等待队列，每个
+不做 fallback 或 deadline 准入。缺失或无效 profile 不影响 readiness、EDF 和非零优先级请求；仅在 FIFO
+profile 准入实际遍历到该候选时将其判为不可准入并继续 fallback，全部不可准入时返回 `no_feasible_deadline`。
 Global Dispatch ingress 共四个有界 context，lower-priority 最多占两个；因此低优先级请求不能耗尽 priority-0
 保留容量。Open/Close 和 pipeline-local endpoint 仍各使用两个有界 context。
 公开 Open 只创建逻辑 session，不使用 `executor.inference_pipeline` 或 fallback 做初始模型绑定；pipeline
@@ -963,6 +981,30 @@ ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray 
 以及 shutdown 时的 stop/destroy 生命周期都由
 `robot_config/launch_builders/tracing.py` 统一管理。
 
+`enable_tracing:=true` 仅为本次 launch 的业务子进程设置 `IB_TRACE_ENABLED=1`，
+包括带独立环境的推理进程和 controller readiness 后启动的进程。移除提前对父进程
+`os.environ` 的赋值，使用退出时恢复的 launch scope，避免污染同进程后续 launch。
+不改变 control mode、节点参数或模型加载策略。
+保留既有失败契约：LTTng 会话检查、创建、事件启用或 start 失败仍中止 launch；
+失败清理只针对本次成功 create 的会话，不销毁同名已有会话。不新增 strict 配置。
+
+启动不再自动导出 topology sidecar，也不依赖 topology 模块。普通 trace 分析无需机器人
+YAML 或 topology 元数据。需要配置声明图时，可独立使用已有 `load_robot_section`
+展开 sibling `base_config`，不经过包含模型可用性检查的完整业务 loader：
+
+```bash
+source .shrc_local
+ros2 run robot_config ibrobot-trace-topology \
+    src/robot_config/config/robots/so101_arm_aero_hand.yaml \
+    --control-mode model_inference > /tmp/ibrobot-topology.json
+```
+
+该命令只生成可选元数据，不启动机器人、不加载模型、不放宽业务 loader 的校验。
+输出标注 `metadata.provenance=declared`、`runtime_verified=false`，不是实际
+started nodes 清单；不应用 launch CLI 覆盖（除显式 `--control-mode`）、nav stage 或
+运行时派生配置。独立导出失败不会拒绝机器人启动，也不会停止或销毁已成功录制的 LTTng 会话。
+`ibrobot_tracing` Core 不直接读取机器人 YAML。
+
 ### Voice ASR（语音识别）
 
 `robot_config` 通过 `robot.voice_asr` 作为语音识别节点的机器人级单一配置来源，并由
@@ -1056,6 +1098,7 @@ robot:
 
   embodied:
     enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
+    entry_mode: hermes          # hermes（默认）| agent（自然语言 Agent 孵化入口）
     debug_tracing: true
 
     timeouts:
@@ -1126,7 +1169,62 @@ robot:
         observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+
+    # entry_mode: agent 时的孵化 Agent 运行时（由 embodied_bringup 注入
+    # ibrobot_agent_node 参数；字段约束见下方「Agent 孵化入口」一节）
+    agent:
+      enabled: true
+      incubation: true            # 孵化期强制标记，必须为 true
+      execution_enabled: false    # 运动默认关闭；开启需非空 test_allowlist
+      channel_id: agent_cli
+      principal_id: local_operator
+      request_topic: /agent/request
+      response_topic: /agent/response
+      event_topic: /agent/event
+      control_topic: /agent/control
+      test_allowlist: [wave_hello, nod_yes]   # 执行白名单；execution_enabled=true 时必须非空
+      ledger_path: /tmp/ibrobot-agent/requests.sqlite3        # 请求 ledger（SQLite WAL）
+      conversation_path: /tmp/ibrobot-agent/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent/agent.lock     # 部署锁，防双实例
+      max_session_turns: 12       # 会话记忆滚动窗口
+      clarification_ttl_sec: 300.0  # 一次性澄清上下文有效期
+      event_queue_size: 128
+      planner:
+        mode: vlm                 # rule（仅仿真执行）| vlm
+        provider: kimicode        # kimicode | openai_compatible
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY   # 密钥只允许环境变量名；字面 api_key 会被校验拒绝
+        model: kimi-for-coding
+        temperature: 1.0          # kimi-for-coding 强制 temperature=1
 ```
+
+#### Agent 孵化入口（entry_mode: agent）
+
+`embodied.entry_mode: agent` 由 `validate_agent_entry_config()`（`robot_config.loader`）
+在 raw-dict launch 门禁与 typed `validate_config()` 两层统一校验，字段约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `embodied.entry_mode` | `hermes` 或 `agent`；其他值报错 |
+| `agent.enabled` | `entry_mode=agent` 时必须为 `true` |
+| `agent.incubation` | 必须为 `true`（孵化期强制标记） |
+| `agent.execution_enabled` | 布尔；为 `true` 时 `test_allowlist` 必须非空 |
+| `agent.test_allowlist` | 非空字符串列表；执行白名单 |
+| `agent.request_topic` / `agent.event_topic` | 必须是以 `/` 开头的绝对 ROS topic 名 |
+| `agent.ledger_path` / `conversation_path` / `deployment_lock_path` | 非空路径 |
+| `agent.max_session_turns` / `event_queue_size` | 正整数 |
+| `agent.clarification_ttl_sec` | 正数 |
+| `agent.planner.mode` | `rule` 或 `vlm` |
+| `agent.planner.provider` | vlm 模式下 `kimicode` 或 `openai_compatible` |
+| `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
+| `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
+| `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+
+仓库自带 SO-101 孵化 profile：`so101_agent_manual`（真机手动无运动）、
+`so101_agent_manual_hardware`（真机手动执行）、`so101_single_arm_agent_test`
+（rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
+`so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
+（真机停止验证）。运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约
 
@@ -1370,6 +1468,9 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:
 # 契约级 mock 仿真
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
 
+# Ascend310P PI0.5 native Torch end-to-end validation with hardware_mock
+ros2 launch robot_config robot.launch.py robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
+
 # MoveIt 规划模式（带 RViz）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
 
@@ -1401,6 +1502,11 @@ python3 src/robot_config/robot_config/scripts/validate_config.py \
 ```
 
 ## 相机驱动
+
+`peripherals[]` 条目支持 `disabled: true` 标志：设置后该外设在 `load_robot_config()`
+与 perception launch builder 中被整体跳过（不加载配置、不生成相机节点）。用于
+Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意统一的禁用开关
+是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键不被识别）。
 
 ### USB 相机（通过 `usb_cam`）
 

@@ -443,6 +443,30 @@ def generate_inference_node(
             parameters["terminal_result_cache_entries"] = scheduler.terminal_result_cache_entries
             parameters["max_duplicate_waiters_per_request"] = scheduler.max_duplicate_waiters_per_request
             parameters["terminal_session_retention_ns"] = scheduler.terminal_session_retention_ns
+            scheduling = pipeline.scheduling
+            parameters["pipeline_stage_policy"] = scheduling.stage_policy if scheduling else "sequential"
+            parameters["pipeline_scheduling_json"] = (
+                json.dumps(
+                    {
+                        "stage_policy": scheduling.stage_policy,
+                        "frame_base_priority": scheduling.frame_base_priority,
+                        "max_supported_public_priority": scheduling.max_supported_public_priority,
+                        "stages": {
+                            stage_id: {
+                                "priority_offset": stage.priority_offset,
+                                "instance_count": stage.instance_count,
+                                "max_snapshot_age_ms": stage.max_snapshot_age_ms,
+                            }
+                            for stage_id, stage in scheduling.stages.items()
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if scheduling
+                else ""
+            )
+            parameters["max_supported_public_priority"] = scheduling.max_supported_public_priority if scheduling else 7
             parameters["public_capacity_json"] = json.dumps(
                 {wc.work_class: {"max_in_flight": wc.max_in_flight} for wc in pipeline.public_capacity.values()},
                 sort_keys=True,
@@ -497,6 +521,18 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
 
+    # Robot-agnostic-core fail-fast checks (before any pipeline resolution
+    # so misconfiguration surfaces with the clearest error first).
+    robot_name = robot_config.get("name")
+    if not robot_name:
+        raise ValueError("robot.name is required: declare the robot name explicitly in the robot configuration")
+    robot_joints = robot_config.get("joints", {})
+    if robot_joints.get("all") is None:
+        raise ValueError(
+            "robot.joints.all is required: declare the joint list explicitly in the "
+            "robot configuration (see docs/robot_interface_schema.md)"
+        )
+
     inference = _validated_inference(robot_config, control_mode)
     pipeline = _selected_executor_pipeline(robot_config, control_mode, inference)
     mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
@@ -531,17 +567,14 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
 
     # benchmark setup: resolve joint_names. When joints.all is an explicit empty list
     # (benchmark YAMLs with no joint consumer), omit the parameter entirely
-    # so it does not serialize as an invalid ROS empty tuple. The
-    # action_dispatcher_node does not declare joint_names; omitting it is
-    # safe and the node uses its internal default. Non-benchmark YAMLs
-    # either omit joints.all (gets the schema default) or provide a real
-    # joint list, so their behavior is unchanged.
-    joint_names = robot_joints.get("all", ["1", "2", "3", "4", "5", "6"])
+    # An explicitly empty joints.all is preserved as None for the
+    # dispatcher's internal default.
+    joint_names = robot_joints.get("all")
     if not joint_names:
         joint_names = None
 
     dispatcher_parameters: dict[str, object] = {
-        "robot_name": robot_config.get("name", "so101"),
+        "robot_name": robot_name,
         "queue_size": executor_config.get("queue_size", 100),
         "watermark_threshold": executor_config.get("watermark_threshold", 20),
         "min_queue_size": executor_config.get("min_queue_size", 10),
@@ -607,6 +640,16 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         parameters=[dispatcher_parameters],
         output="screen",
     )
+
+
+def _executor_enabled(robot_config: dict, control_mode: str) -> bool:
+    """Report whether this control mode wants an action dispatcher at all.
+
+    Absent means enabled, so every configuration written before this switch
+    existed keeps its current launch graph.
+    """
+    executor_config = robot_config.get("control_modes", {}).get(control_mode, {}).get("executor", {}) or {}
+    return parse_bool(executor_config.get("enabled", True), default=True)
 
 
 def generate_robot_evaluate_node(robot_config: dict, control_mode: str, use_sim: object = False) -> Node:
@@ -693,6 +736,18 @@ def generate_execution_nodes(
 
     # scheduler.enable=true selects the scheduled topology.
     if scheduler is not None and scheduler.enable:
+        if not _executor_enabled(robot_config, control_mode):
+            raise ValueError(
+                f"control mode {control_mode!r} sets executor.enabled=false with inference.scheduler.enable=true; "
+                "the scheduled topology exists to feed a dispatcher, so disable one or the other rather than "
+                "leaving the switch to mean two different things"
+            )
+        if runtime_target is RuntimeTarget.SIMULATION or (
+            runtime_target is not RuntimeTarget.BENCHMARK and parse_bool(use_sim, default=False)
+        ):
+            raise InferenceConfigError(
+                "simulation does not support inference.scheduler.enable=true; set scheduler.enable=false"
+            )
         inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
         scheduler_node = generate_global_inference_scheduler_node(
             robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
@@ -733,6 +788,12 @@ def generate_execution_nodes(
 
     # False or absent selects the unchanged legacy behavior.
     inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
+    if not _executor_enabled(robot_config, control_mode):
+        # A recording-only deployment streams video but has no inference backend
+        # to answer a request. Dispatching one anyway lets it time out, and the
+        # timeout invalidates the distributed session, which stops the RTP
+        # sender for good. The pipeline node stays because it owns that sender.
+        return list(inference_nodes)
     dispatcher = generate_action_dispatcher_node(
         robot_config,
         control_mode,
@@ -786,6 +847,10 @@ def generate_global_inference_scheduler_node(
                 "runtime_policy_fingerprint": pipeline.runtime_policy_fingerprint or "",
                 "profile_compatibility_fingerprint": pipeline.profile_compatibility_fingerprint or "",
                 "profile_path": str(pipeline.profile_path) if pipeline.profile_path else "",
+                "max_supported_public_priority": (
+                    pipeline.scheduling.max_supported_public_priority if pipeline.scheduling else 7
+                ),
+                "stage_policy": pipeline.scheduling.stage_policy.upper() if pipeline.scheduling else "SEQUENTIAL",
                 "public_capacity": {
                     capacity.work_class: {
                         "max_in_flight": capacity.max_in_flight,
@@ -828,6 +893,11 @@ def generate_global_inference_scheduler_node(
                 "terminal_session_retention_ns": scheduler.terminal_session_retention_ns,
                 "max_session_records": scheduler.max_session_records,
                 "default_priority": inference.inference_priority,
+                "global_policy": scheduler.global_policy,
+                "priority_zero_deadline_admission_enabled": scheduler.priority_zero_deadline_admission.enable,
+                "priority_zero_deadline_admission_safety_margin_ms": (
+                    scheduler.priority_zero_deadline_admission.safety_margin_ms
+                ),
                 "use_sim_time": use_sim_time,
             }
         ],

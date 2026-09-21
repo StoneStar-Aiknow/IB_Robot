@@ -31,6 +31,13 @@ source .shrc_local
 进入运动执行。`immediate_after_presentation` 只取消二次用户确认等待，不绕过 Gateway validation、operator
 `authorize_motion` 或 action admission。可选 `--request-id` 是调用方幂等键；timeout 或结果未知时不得自动重放。
 
+`run-workflow` 底层的 `InteractiveController` 也是库级集成入口（如 `ibrobot_agent` 复用）。展示回调收到的
+presentation dict 除步骤、plan digest、registry identity 与 task ID 外，还包含 `plan_kind` 和
+`proposed_task_budget_sec`（fresh status 的任务预算快照）。库调用方可传入构造参数 `submission_callback`，在
+goal 提交前收到展示 tuple（task/plan ID、plan digest、registry identity、expected step count）；回调抛错会以
+`SUBMISSION_PERSISTENCE_FAILED` 终态阻断 goal 提交。`run(..., expected_registry_identity=...)` 会在 planning
+前校验 live catalog 身份，与快照不一致时按 `SKILL_SNAPSHOT_DIGEST_MISMATCH` fail closed，不发送 goal。
+
 每个命令可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
 配置解析完全复用 `robot_config.resolve_robot_config_path()`，CLI 不维护第二套路径优先级：底层选择顺序是
 显式 path、显式 name、`ROBOT_CONFIG`、`ROBOT_NAME`、默认 `so101_single_arm`。按名称先查安装目录，再查
@@ -165,8 +172,8 @@ robot-skill --config-name lekiwi_nav_grasp validate imitate_human_motion \
 primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 CLI catalog。
 
 `list-games` 只公开已启用游戏的 `name`、`summary`、`result_field` 和视觉游戏 `config_digest`；
-四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求 MoveIt 或
-`robot_description` 才能完成发现、启动和查询。
+四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求运动服务或
+机器人 description 包才能完成发现、启动和查询。
 `describe-game` 进一步公开 required inputs、结果 schema、timeout、retention 与 ledger capacity。视觉游戏不属于运动 capability，因此不进入
 `list-skills`、`ValidateSkill` 或 `SkillCommand`。
 

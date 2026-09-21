@@ -3,13 +3,15 @@
 import builtins
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 from launch import LaunchContext
-from launch.actions import ExecuteProcess, RegisterEventHandler
+from launch.actions import ExecuteProcess, GroupAction, OpaqueFunction, RegisterEventHandler
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
@@ -527,7 +529,7 @@ def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
 
 
 def test_shared_loader_preserves_source_path_metadata():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
     robot_config = load_robot_config_dict(config_path)
 
     assert robot_config["name"] == "so101_single_arm"
@@ -536,10 +538,10 @@ def test_shared_loader_preserves_source_path_metadata():
 
 
 def test_launch_loader_uses_shared_dict_loader():
-    robot_config = robot_launch.load_robot_config("so101_single_arm")
+    robot_config = robot_launch.load_robot_config("so101_single_arm_legacy")
 
     assert robot_config["name"] == "so101_single_arm"
-    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm.yaml")
+    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm_legacy.yaml")
 
 
 def test_default_trace_session_auto_suffixes_on_collision(monkeypatch, tmp_path):
@@ -570,6 +572,167 @@ def test_custom_trace_session_collision_fails(monkeypatch, tmp_path):
         assert "custom_trace" in str(exc)
     else:
         raise AssertionError("Expected custom tracing session collision to raise RuntimeError")
+
+
+def test_tracing_startup_does_not_import_or_write_topology(monkeypatch, tmp_path):
+    monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
+    monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: False)
+    commands = []
+    monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda command, _reason: commands.append(command))
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"ibrobot_tracing.topology", "robot_config.tracing_topology"}:
+            raise ImportError("optional topology is unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    spec = importlib.util.spec_from_file_location("tracing_without_topology", tracing_builder.__file__)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+    actions = tracing_builder.generate_tracing_actions(True, "test_trace", tmp_path)
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], RegisterEventHandler)
+    assert [command[1] for command in commands] == ["create", "enable-event", "enable-event", "start"]
+    assert not (tmp_path / "test_trace" / "ibrobot-topology.json").exists()
+    assert "IB_TRACE_ENABLED" not in os.environ
+
+
+@pytest.mark.parametrize("previous_flag", [None, "0", "1"])
+@pytest.mark.parametrize("fail_in_scope", [False, True])
+def test_tracing_environment_is_scoped_for_immediate_and_deferred_processes(monkeypatch, previous_flag, fail_in_scope):
+    if previous_flag is None:
+        monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("IB_TRACE_ENABLED", previous_flag)
+    context = LaunchContext()
+    original_environment = dict(context.environment)
+    original_handlers = tuple(context._event_handlers)
+    runtime_environment = {"RUNTIME_OPTION": "keep", "IB_TRACE_ENABLED": "0"}
+    inherited = ExecuteProcess(cmd=["true"])
+    explicit = ExecuteProcess(cmd=["true"], env=runtime_environment)
+    additional = ExecuteProcess(cmd=["true"], additional_env={"IB_TRACE_ENABLED": "0", "EXTRA": "keep"})
+    deferred = ExecuteProcess(cmd=["true"])
+    deferred_explicit = ExecuteProcess(cmd=["true"], env=runtime_environment)
+    deferred_handler = robot_launch._start_actions_on_success(
+        [tracing_builder.scope_tracing_environment([deferred, deferred_explicit])],
+        success_message="ready",
+        failure_reason="not ready",
+    )
+    constructed_later = []
+
+    def build_in_scope(context):
+        assert context.environment["IB_TRACE_ENABLED"] == "1"
+        if fail_in_scope:
+            raise RuntimeError("business launch failed")
+        constructed_later.append(ExecuteProcess(cmd=["true"]))
+        return constructed_later
+
+    def prepare(action):
+        if isinstance(action, ExecuteProcess):
+            action.process_description.prepare(context, action)
+        else:
+            for child in action.execute(context) or []:
+                prepare(child)
+
+    group = tracing_builder.scope_tracing_environment(
+        [inherited, explicit, additional, OpaqueFunction(function=build_in_scope)]
+    )
+    if fail_in_scope:
+        with pytest.raises(RuntimeError, match="business launch failed"):
+            prepare(group)
+        shutdown = Shutdown(reason="business launch failed")
+        for handler in tuple(context._event_handlers):
+            if handler.matches(shutdown):
+                for action in handler.handle(shutdown, context):
+                    prepare(action)
+        assert context.environment == original_environment
+        assert LaunchContext().environment.get("IB_TRACE_ENABLED") == previous_flag
+        return
+
+    prepare(group)
+    assert context.environment == original_environment
+    assert tuple(context._event_handlers) == original_handlers
+    for action in deferred_handler(SimpleNamespace(returncode=0), context):
+        prepare(action)
+
+    for process in [inherited, explicit, additional, deferred, deferred_explicit, *constructed_later]:
+        assert process.process_description.final_env["IB_TRACE_ENABLED"] == "1"
+    assert explicit.process_description.final_env["RUNTIME_OPTION"] == "keep"
+    assert additional.process_description.final_env["EXTRA"] == "keep"
+    assert runtime_environment == {"RUNTIME_OPTION": "keep", "IB_TRACE_ENABLED": "0"}
+    assert context.environment == original_environment
+    assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
+    subsequent = ExecuteProcess(cmd=["true"])
+    prepare(subsequent)
+    assert subsequent.process_description.final_env.get("IB_TRACE_ENABLED") == previous_flag
+    assert LaunchContext().environment.get("IB_TRACE_ENABLED") == previous_flag
+
+
+@pytest.mark.parametrize("previous_flag", [None, "0", "1"])
+@pytest.mark.parametrize("failure_stage", ["create", "ust", "python", "start"])
+def test_tracing_failure_cleans_only_owned_session_without_changing_environment(
+    monkeypatch, tmp_path, previous_flag, failure_stage
+):
+    if previous_flag is None:
+        monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("IB_TRACE_ENABLED", previous_flag)
+    monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: False)
+    startup_commands = [
+        ["lttng", "create", "test_trace", "--output", str(tmp_path / "test_trace")],
+        ["lttng", "enable-event", "--session", "test_trace", "--userspace", "ros2:*"],
+        ["lttng", "enable-event", "--session", "test_trace", "--python", "ib_trace.*"],
+        ["lttng", "start", "test_trace"],
+    ]
+    failure_index = ["create", "ust", "python", "start"].index(failure_stage)
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
+        failed = failure_index < len(startup_commands) and command == startup_commands[failure_index]
+        return SimpleNamespace(returncode=int(failed), stderr=f"{failure_stage} failed" if failed else "", stdout="")
+
+    monkeypatch.setattr(tracing_builder.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        tracing_builder.generate_tracing_actions(True, "test_trace", tmp_path)
+
+    assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
+    expected_commands = startup_commands[: failure_index + 1]
+    if failure_stage != "create":
+        expected_commands += [["lttng", "stop", "test_trace"], ["lttng", "destroy", "test_trace"]]
+    assert commands == expected_commands
+
+
+@pytest.mark.parametrize("previous_flag", [None, "0", "1"])
+def test_tracing_keeps_startup_error_when_cleanup_raises(monkeypatch, tmp_path, previous_flag):
+    if previous_flag is None:
+        monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("IB_TRACE_ENABLED", previous_flag)
+    monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: False)
+
+    def run(command, _reason):
+        if command[1] == "start":
+            raise RuntimeError("start failed")
+
+    def cleanup(*_args):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(tracing_builder, "_run_trace_command", run)
+    monkeypatch.setattr(
+        tracing_builder,
+        "_make_trace_shutdown_handler",
+        lambda _name: cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        tracing_builder.generate_tracing_actions(True, "test_trace", tmp_path)
+
+    assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
 
 
 def test_generate_navigation_nodes_for_lekiwi_mode():
@@ -635,8 +798,40 @@ def test_launch_setup_enables_navigation_when_requested():
     assert len(nav_nodes) == 1
 
 
-def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
+def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    # The migrated provider config binds logical interfaces against the live
+    # runtime at launch time; offline structural loads defer that binding.
+    robot_config = load_robot_config_dict(src_config_path, defer_interface_binding=True)
+    robot_config.pop("_config_path", None)
+    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
+    config_path = tmp_path / "scheduled_sim.yaml"
+    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        config_path=str(config_path),
+        use_sim="true",
+        # The migrated provider config supports the SDK simulated transport;
+        # the scheduler/simulation rejection below must fire before any nodes.
+        sim_platform="sdk",
+        control_mode="model_inference",
+        with_inference="true",
+    )
+
+    def unexpected_control_generation(*args, **kwargs):
+        pytest.fail("control generation must not run for unsupported scheduled simulation")
+
+    monkeypatch.setattr(robot_launch, "generate_ros2_control_nodes", unexpected_control_generation)
+    with pytest.raises(ValueError, match="simulation does not support"):
+        robot_launch.launch_setup(context)
+
+
+@pytest.mark.parametrize("enable_tracing", [False, True])
+def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp_path, enable_tracing):
+    monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
+    monkeypatch.setattr(tracing_builder, "_resolve_trace_session", lambda name, _root: (name, tmp_path / name))
+    monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda _command, _reason: None)
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
     bundle = _create_inference_bundle(tmp_path / "model")
@@ -646,15 +841,21 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
 
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "so101_single_arm"
+    context.launch_configurations["robot_config"] = "so101_single_arm_legacy"
     context.launch_configurations["config_path"] = str(config_path)
     context.launch_configurations["use_sim"] = "true"
     context.launch_configurations["sim_platform"] = "mock"
     context.launch_configurations["auto_start_controllers"] = "true"
     context.launch_configurations["control_mode"] = "model_inference"
     context.launch_configurations["with_navigation"] = "false"
+    context.launch_configurations["enable_tracing"] = str(enable_tracing).lower()
 
     actions = robot_launch.launch_setup(context)
+    assert "IB_TRACE_ENABLED" not in os.environ
+    if enable_tracing:
+        assert len(actions) == 1
+        assert isinstance(actions[0], GroupAction)
+        actions = actions[0].get_sub_entities()
     node_packages = [action.node_package for action in actions if isinstance(action, Node)]
 
     assert node_packages.count("hardware_mock") == 1
@@ -664,13 +865,15 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     timed_nodes = [
         action
         for action in actions
-        if isinstance(action, Node) and action.node_package in {"inference_service", "action_dispatch"}
+        if isinstance(action, Node) and action.node_executable in {"pipeline_policy_node", "action_dispatcher_node"}
     ]
     assert len(timed_nodes) == 2
     assert all(_node_parameters(node)["use_sim_time"] is False for node in timed_nodes)
 
     inference_nodes = [node for node in timed_nodes if node.node_package == "inference_service"]
     assert _node_parameters(inference_nodes[0])["use_sim"] is True
+    inference_environment = {_text(key): _text(value) for key, value in inference_nodes[0].env}
+    assert inference_environment.get("IB_TRACE_ENABLED") == ("1" if enable_tracing else None)
 
 
 def test_launch_loader_preserves_config_path_for_runtime_consumers():
@@ -1594,7 +1797,7 @@ def test_phone_placo_uses_explicit_arm_group_topic():
             "moveit": {
                 "base_link": "base",
                 "ee_link": "gripper",
-                "so101_placo_servo_config_path": "$(find robot_moveit)/config/so101_placo_servo.yaml",
+                "so101_placo_servo_config_path": "$(find so101_motion)/config/so101_placo_servo.yaml",
             },
             "ros2_control": {"reset_positions": {"1": 0.0, "2": 0.0}},
             "teleoperation": {

@@ -61,6 +61,9 @@ IB-Robot 构建了一个从感知、决策到执行的端到端闭环体系，�
 
 ## 仓库结构
 
+追踪功能见 [Core 使用说明](src/ibrobot_tracing/README.md)；可选性能工作台见
+[Web 工具说明](tools/ibrobot_tracing_web/README.md)，需显式准备依赖和构建，不进入默认业务安装。
+
 ```text
 IB_Robot/                           # 主工作空间 (本仓库)
 ├── .gitmodules                     # Git 子模块配置
@@ -80,14 +83,15 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── task_dispatch/              # 任务调度与分发服务
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
 │   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action/Service)
+│   ├── ibrobot_tracing/            # 非侵入埋点与离线 trace 分析
 │   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
 │   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
-│   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
+│   ├── robot_runtime/              # 机器人运行时契约（RuntimeStatus/能力/接口描述）
 │   ├── lekiwi_description/         # Lekiwi 底盘 URDF/Mesh 模型描述
-│   ├── robot_moveit/               # MoveIt 2 运动规划集成
 │   ├── robot_navigation/           # 导航功能包
 │   ├── inference_service/          # 多模型推理与部署服务
-│   ├── so101_hardware/             # SO-101 电机驱动接口
+│   ├── robots/so101/               # SO-101 运行时套件 (sdk/hardware/description/motion/robot)
+│   ├── robots/feetech/             # 飞特舵机 SDK
 │   ├── lekiwi_hardware/            # Lekiwi 底盘硬件驱动接口
 │   ├── hardware_mock/              # 硬件模拟 (Mock) 接口
 │   ├── omni_wheel_controller/      # 全向轮控制器插件
@@ -95,6 +99,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── rosclaw/                    # [子模块] OpenClaw 社交控制集成
 │   ├── sim_models/                 # 仿真场景模型 (Gazebo/MuJoCo)
 │   ├── model_utils/                # 模型工具库
+│   ├── torch_models/               # 自研 PyTorch 模型源码，每个模型独立目录
 │   ├── attention_viz/              # 注意力可视化工具
 │   ├── voice_asr_service/          # 语音识别服务
 │   ├── workflows/                  # CI/CD 配置
@@ -104,6 +109,8 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
 │   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
 │
+├── tools/ibrobot_tracing_web/       # 显式启用的 Web API 工具包
+├── web/ibrobot_tracing_ui/          # Vue trace 性能工作台
 ├── docs/                           # 深度架构文档与开发指南
 │   ├── pictures/                   # 架构图与演示 GIF
 │   └── videos/                     # 演示视频 (源文件)
@@ -194,7 +201,7 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 | 文档 | 简短说明 |
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
-| [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
+| [`src/robots/so101/so101_motion/README.md`](src/robots/so101/so101_motion/README.md) | SO-101 运动服务（motion_server / Placo servo / IK workers）与 headless 启动方式 |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
 
 ### 一、Ubuntu 仿真场景

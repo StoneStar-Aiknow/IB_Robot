@@ -48,7 +48,7 @@ robot:
     base_link: base
     ee_link: gripper
     shoulder_link: shoulder
-    so101_placo_servo_config_path: $(find robot_moveit)/config/so101_placo_servo.yaml
+    so101_placo_servo_config_path: $(find so101_motion)/config/so101_placo_servo.yaml
 
   # Control mode management
   default_control_mode: "model_inference"
@@ -258,7 +258,7 @@ robot:
       "3": 1.5708    # elbow_flex:    ~+90° (folded)
       "4": 0.7854    # wrist_flex:    ~+45° (tilted)
       "5": 0.0       # wrist_roll:    centered
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
 
     # Controllers configuration
     # Path to the controllers configuration file (YAML format)
