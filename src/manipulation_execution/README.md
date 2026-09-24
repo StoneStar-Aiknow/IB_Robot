@@ -3,7 +3,7 @@
 `manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
 GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
 `ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。采集窗口内每一条 PEAR 结果都会逐帧留存在节点内存里，供后续重定向阶段消费；
-窗口关闭后 executor 会驱动**真实机械臂**回放一段预置动画。也就是说该 executor 既消费视频也产生运动输出。
+窗口关闭后 executor 把录到的 PEAR 帧重定向成 SO-101 手臂关节轨迹（`imitation_retargeting` 子包），驱动**真实机械臂**回放；重定向失败时回退为预置动画。也就是说该 executor 既消费视频也产生运动输出。
 
 ### HRI RGB 输入与人体感知链
 
@@ -29,7 +29,7 @@ HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，
 | --- | --- | --- |
 | prepare | 是，`move_to_joint_positions` 走到模仿起始位姿 | `_PREPARE_DURATION_SEC` = 2.5 s |
 | capture | 否，停在起始位姿不动，只录 RGB/PEAR | `imitation_duration_sec`，上限 `MAX_IMITATION_DURATION_SEC` = 20 s |
-| playback | 是，逐段回放预置动画 | 同 capture 窗口长度 |
+| playback | 是，重定向轨迹作为一条 `move_through_joint_positions` 下发；失败时逐段回放预置动画 | 同 capture 窗口长度 |
 | reset | 是，`move_to_named_pose(home)` | 由 primitive 决定 |
 
 `imitation_duration_sec` **只是采集窗口**，不含 prepare、playback 和 reset。整条任务的墙钟时长约为
