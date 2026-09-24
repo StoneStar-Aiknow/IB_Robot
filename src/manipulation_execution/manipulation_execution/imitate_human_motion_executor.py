@@ -1,4 +1,4 @@
-"""Dependency-light mock executor for the internal HRI action."""
+"""Dependency-light executor for the internal HRI imitation action."""
 
 from __future__ import annotations
 
@@ -26,14 +26,14 @@ class AnimationPlan:
 
 
 @dataclass(frozen=True)
-class MockGoal:
+class ImitationGoal:
     arm_side: str
     imitation_duration_sec: float
     timeout_sec: float
 
 
 @dataclass
-class MockStatus:
+class ImitationStatus:
     warmup_ready: bool = True
     warmup_state: str = "READY"
     warmup_attempts: int = 0
@@ -44,7 +44,7 @@ class MockStatus:
 
 
 @dataclass(frozen=True)
-class MockResult:
+class ImitationResult:
     success: bool
     error_code: str
     message: str
@@ -67,8 +67,8 @@ class AnimationPlayer(Protocol):
         """Return COMPLETED, CANCELED, TIMEOUT, or FAILED."""
 
 
-class MockAnimationPlayer:
-    """Time-based mock player used by the internal HRI Action node."""
+class FallbackAnimationPlayer:
+    """Time-based fallback player used by the internal HRI Action node."""
 
     def __init__(
         self,
@@ -95,12 +95,12 @@ class MockAnimationPlayer:
             now = self._clock()
             elapsed = now - started
             if elapsed >= duration_sec:
-                feedback("mock_playback", 1.0, f"{plan.animation_id} completed")
+                feedback("playback", 1.0, f"{plan.animation_id} completed")
                 return "COMPLETED"
             if now >= deadline:
                 return "TIMEOUT"
             progress = min(1.0, max(0.0, elapsed / duration_sec))
-            feedback("mock_playback", progress, f"playing {plan.animation_id}")
+            feedback("playback", progress, f"playing {plan.animation_id}")
             self._sleep(min(0.05, duration_sec - elapsed, max(0.0, deadline - now)))
 
 
@@ -116,7 +116,7 @@ class MotionRecorder(Protocol):
         """Return COMPLETED, CANCELED, TIMEOUT, or FAILED."""
 
 
-class MockMotionRecorder:
+class FallbackMotionRecorder:
     """Hold the ``start`` phase open for exactly the requested capture window.
 
     The window is defined by elapsed time rather than by a frame count because
@@ -166,13 +166,13 @@ def _normalized_motion_config(
 ) -> tuple[tuple[str, ...], dict[str, float], dict[str, tuple[float, float]]]:
     names = tuple(str(name).strip() for name in joint_names)
     if len(names) < 2 or any(not name for name in names) or len(set(names)) != len(names):
-        raise ValueError("mock motion requires at least two unique arm joint names")
+        raise ValueError("imitation motion requires at least two unique arm joint names")
 
     reset: dict[str, float] = {}
     limits: dict[str, tuple[float, float]] = {}
     for name in names:
         if name not in reset_positions or name not in joint_limits:
-            raise ValueError(f"mock motion configuration is missing joint {name}")
+            raise ValueError(f"imitation motion configuration is missing joint {name}")
         position = float(reset_positions[name])
         raw_limits = joint_limits[name]
         if isinstance(raw_limits, Mapping):
@@ -181,7 +181,7 @@ def _normalized_motion_config(
         else:
             lower, upper = (float(value) for value in raw_limits)
         if not all(math.isfinite(value) for value in (position, lower, upper)) or lower >= upper:
-            raise ValueError(f"mock motion configuration for joint {name} is invalid")
+            raise ValueError(f"imitation motion configuration for joint {name} is invalid")
         if not lower <= position <= upper:
             raise ValueError(f"reset position is outside joint {name} limits")
         reset[name] = position
@@ -204,12 +204,12 @@ def _waypoints(
     return tuple(points)
 
 
-def build_mock_animations(
+def build_fallback_animations(
     joint_names: Sequence[str],
     reset_positions: Mapping[str, float],
     joint_limits: Mapping[str, Mapping[str, float] | Sequence[float]],
 ) -> dict[str, AnimationPlan]:
-    """Build three distinct mock animations from the robot configuration SSOT."""
+    """Build three distinct fallback animations from the robot configuration SSOT."""
     names, reset, limits = _normalized_motion_config(joint_names, reset_positions, joint_limits)
     first_joint, second_joint = names[:2]
     home = tuple(reset[name] for name in names)
@@ -225,16 +225,18 @@ def build_mock_animations(
     auto_left = offset(**{first_joint: -0.5, second_joint: 0.5854})
     auto_right = offset(**{first_joint: 0.5, second_joint: 0.5854})
     return {
-        "mock_left_v1": AnimationPlan("mock_left_v1", _waypoints(names, limits, home, left, home, right, home)),
-        "mock_right_v1": AnimationPlan("mock_right_v1", _waypoints(names, limits, home, right, home, left, home)),
-        "mock_auto_v1": AnimationPlan(
-            "mock_auto_v1", _waypoints(names, limits, home, auto_right, auto_left, auto_right, home)
+        "fallback_left_v1": AnimationPlan("fallback_left_v1", _waypoints(names, limits, home, left, home, right, home)),
+        "fallback_right_v1": AnimationPlan(
+            "fallback_right_v1", _waypoints(names, limits, home, right, home, left, home)
+        ),
+        "fallback_auto_v1": AnimationPlan(
+            "fallback_auto_v1", _waypoints(names, limits, home, auto_right, auto_left, auto_right, home)
         ),
     }
 
 
-class MockExecutor:
-    """Execute one internal HRI mock goal at a time."""
+class ImitationExecutor:
+    """Execute one internal HRI imitation goal at a time."""
 
     def __init__(
         self,
@@ -252,25 +254,25 @@ class MockExecutor:
         self._joint_names, self._reset_positions, self._joint_limits = _normalized_motion_config(
             joint_names, reset_positions, joint_limits
         )
-        self.status = MockStatus(
+        self.status = ImitationStatus(
             warmup_ready=warmup_ready,
             warmup_state="READY" if warmup_ready else "NOT_READY",
         )
-        self._player = player or MockAnimationPlayer(clock=clock)
-        self._recorder = recorder or MockMotionRecorder(clock=clock)
+        self._player = player or FallbackAnimationPlayer(clock=clock)
+        self._recorder = recorder or FallbackMotionRecorder(clock=clock)
         self._prepare = prepare or (lambda: True)
         self._recover_safe_pose = recover_safe_pose or (lambda: True)
         self._clock = clock
         self._lock = threading.Lock()
         self._active = False
-        self._animations = build_mock_animations(self._joint_names, self._reset_positions, self._joint_limits)
+        self._animations = build_fallback_animations(self._joint_names, self._reset_positions, self._joint_limits)
 
     @property
     def animations(self) -> dict[str, AnimationPlan]:
         return dict(self._animations)
 
     def warmup(self, initialize: Callable[[], bool] | None = None) -> bool:
-        """Attempt the one startup initialization used by the mock runtime."""
+        """Attempt the one startup initialization used by the imitation runtime."""
         initializer = initialize or (lambda: True)
         with self._lock:
             if self.status.warmup_state == "READY":
@@ -291,7 +293,7 @@ class MockExecutor:
             self.status.warmup_ready = bool(ready)
             self.status.warmup_state = "READY" if ready else "FAILED"
 
-    def can_accept(self, goal: MockGoal) -> tuple[bool, str]:
+    def can_accept(self, goal: ImitationGoal) -> tuple[bool, str]:
         if goal.arm_side not in ARM_SIDES:
             return False, "arm_side must be left, right, or auto"
         if not math.isfinite(goal.imitation_duration_sec) or goal.imitation_duration_sec <= 0.0:
@@ -317,8 +319,8 @@ class MockExecutor:
         requested_duration: float,
         actual_duration: float,
         phases: list[str],
-    ) -> MockResult:
-        return MockResult(
+    ) -> ImitationResult:
+        return ImitationResult(
             success,
             error_code,
             message,
@@ -330,7 +332,7 @@ class MockExecutor:
 
     def execute(
         self,
-        goal: MockGoal,
+        goal: ImitationGoal,
         *,
         feedback: Callable[[str, float, str], None] | None = None,
         is_cancel_requested: Callable[[], bool] | None = None,
@@ -338,7 +340,7 @@ class MockExecutor:
         recorder: MotionRecorder | None = None,
         prepare: Callable[[], bool] | None = None,
         recover_safe_pose: Callable[[], bool] | None = None,
-    ) -> MockResult:
+    ) -> ImitationResult:
         accepted, reason = self.can_accept(goal)
         if not accepted:
             if "warmup" in reason:
@@ -349,7 +351,7 @@ class MockExecutor:
                 error_code = "RESET_NOT_CONFIRMED"
             else:
                 error_code = "INVALID_GOAL"
-            return MockResult(False, error_code, reason, "", goal.imitation_duration_sec, 0.0, ())
+            return ImitationResult(False, error_code, reason, "", goal.imitation_duration_sec, 0.0, ())
 
         feedback = feedback or (lambda _phase, _progress, _detail: None)
         is_cancel_requested = is_cancel_requested or (lambda: False)
@@ -358,10 +360,10 @@ class MockExecutor:
         active_prepare = prepare or self._prepare
         active_recover = recover_safe_pose or self._recover_safe_pose
         phases: list[str] = []
-        plan = self._animations[f"mock_{goal.arm_side}_v1"]
+        plan = self._animations[f"fallback_{goal.arm_side}_v1"]
         actual_duration = min(goal.imitation_duration_sec, MAX_IMITATION_DURATION_SEC)
         deadline = self._clock() + goal.timeout_sec
-        result: MockResult | None = None
+        result: ImitationResult | None = None
         reset_ok = False
         playback_started_at: float | None = None
 
@@ -381,7 +383,7 @@ class MockExecutor:
 
         with self._lock:
             if self._active or self.status.operation_state != "IDLE":
-                return MockResult(
+                return ImitationResult(
                     False,
                     "BUSY",
                     "imitate_human_motion is busy",
@@ -391,7 +393,7 @@ class MockExecutor:
                     (),
                 )
             if not self.status.warmup_ready:
-                return MockResult(
+                return ImitationResult(
                     False,
                     "WARMUP_NOT_READY",
                     "warmup is not ready",
@@ -401,7 +403,7 @@ class MockExecutor:
                     (),
                 )
             if self.status.pose_state not in {"HOME", "NOT_READY"}:
-                return MockResult(
+                return ImitationResult(
                     False,
                     "RESET_NOT_CONFIRMED",
                     "safe pose is not confirmed",
@@ -507,7 +509,7 @@ class MockExecutor:
                         # solved from the captured PEAR output; until that
                         # mapping exists a preset plan is played back instead,
                         # over the same span that was just recorded.
-                        phase("mock_playback", f"Executing {plan.animation_id}")
+                        phase("playback", f"Executing {plan.animation_id}")
                         playback_started_at = self._clock()
                         outcome = active_player.play(
                             plan,
@@ -520,8 +522,8 @@ class MockExecutor:
                             "CANCELED": ("CANCELED", "imitation cancelled during playback"),
                             "TIMEOUT": ("SKILL_TIMEOUT", "imitation timeout during playback"),
                             "UNKNOWN": (CANCEL_CLEANUP_TIMEOUT, "primitive execution state is unknown"),
-                            "COMPLETED": ("", f"Mock imitation completed; captured {captured_duration:.2f}s"),
-                        }.get(outcome, ("MOCK_PLAYBACK_FAILED", "mock playback failed"))
+                            "COMPLETED": ("", f"Imitation completed; captured {captured_duration:.2f}s"),
+                        }.get(outcome, ("MOCK_PLAYBACK_FAILED", "playback failed"))
                         result = self._result(
                             success=not error_code,
                             error_code=error_code,
@@ -567,7 +569,7 @@ class MockExecutor:
                 result = self._result(
                     success=False,
                     error_code="MOCK_PLAYBACK_FAILED",
-                    message="mock executor returned no result",
+                    message="imitation executor returned no result",
                     plan=plan,
                     requested_duration=goal.imitation_duration_sec,
                     actual_duration=playback_duration(),

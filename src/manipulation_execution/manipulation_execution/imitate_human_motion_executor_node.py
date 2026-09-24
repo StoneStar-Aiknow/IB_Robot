@@ -29,9 +29,9 @@ from ibrobot_msgs.srv import PearParameterPredict, YoloXDetect
 from manipulation_execution.imitate_human_motion_executor import (
     CANCEL_CLEANUP_TIMEOUT,
     AnimationPlan,
-    MockExecutor,
-    MockGoal,
-    MockResult,
+    ImitationExecutor,
+    ImitationGoal,
+    ImitationResult,
     PrimitiveStateUnknown,
 )
 
@@ -53,7 +53,7 @@ _MAX_CAPTURED_PEAR_FRAMES = 2000
 # frame: the wrist camera is mounted on its side, and a person lying sideways
 # in the image is not what the person detector was trained on.
 # Deliberately independent of ros2_control.reset_positions: that table is also
-# pick_executor_node's post-grasp home and the baseline the mock animation is
+# pick_executor_node's post-grasp home and the baseline the fallback animation is
 # clamped against, so the imitation start pose cannot be expressed there without
 # moving the grasp home with it.
 # The gripper joint "6" is driven by gripper_trajectory_controller and is left
@@ -350,7 +350,7 @@ class _GuardedPrimitivePlayer:
                 return outcome
             remaining -= active_duration
             progress = min(1.0, (duration_sec - remaining) / duration_sec)
-            feedback("mock_playback", progress, f"Executing {plan.animation_id}")
+            feedback("playback", progress, f"Executing {plan.animation_id}")
         return "COMPLETED"
 
     def reset(self) -> bool:
@@ -414,7 +414,7 @@ class ImitateHumanMotionExecutorNode(Node):
             endpoint_name=self._action_name,
             configuration={"implementation": "mock_v1"},
         )
-        self._mock = MockExecutor(
+        self._executor = ImitationExecutor(
             joint_names=self._joint_names,
             reset_positions=self._reset_positions,
             joint_limits=self._joint_limits,
@@ -871,9 +871,9 @@ class ImitateHumanMotionExecutorNode(Node):
     def _run_startup_warmup(self) -> bool:
         """Perform the single launch-time warmup; tasks never repeat it."""
         if self._startup_warmup_attempted:
-            return self._mock.status.warmup_ready
+            return self._executor.status.warmup_ready
         self._startup_warmup_attempted = True
-        ready = self._mock.warmup()
+        ready = self._executor.warmup()
         if ready:
             self.get_logger().info("imitate_human_motion warmup READY")
         else:
@@ -928,7 +928,7 @@ class ImitateHumanMotionExecutorNode(Node):
         )
 
     def _handle_goal(self, request):
-        goal = MockGoal(
+        goal = ImitationGoal(
             arm_side=str(request.arm_side).strip().lower(),
             imitation_duration_sec=float(request.imitation_duration_sec),
             timeout_sec=float(request.timeout_sec),
@@ -937,7 +937,7 @@ class ImitateHumanMotionExecutorNode(Node):
             return GoalResponse.REJECT
         if not delegated_executor_identity_matches(request.expected_executor, self._executor_identity):
             return GoalResponse.REJECT
-        accepted, reason = self._mock.can_accept(goal)
+        accepted, reason = self._executor.can_accept(goal)
         if not accepted:
             if "warmup" in reason:
                 self.get_logger().info("imitate_human_motion warmup is in progress")
@@ -954,7 +954,7 @@ class ImitateHumanMotionExecutorNode(Node):
 
     def _execute(self, goal_handle):
         request = goal_handle.request
-        goal = MockGoal(
+        goal = ImitationGoal(
             arm_side=str(request.arm_side).strip().lower(),
             imitation_duration_sec=float(request.imitation_duration_sec),
             timeout_sec=float(request.timeout_sec),
@@ -1020,7 +1020,7 @@ class ImitateHumanMotionExecutorNode(Node):
 
         capture_recorder = _CaptureRecorder(self)
         try:
-            result_value = self._mock.execute(
+            result_value = self._executor.execute(
                 goal,
                 feedback=lambda phase, progress, detail: publish_feedback(
                     phase, progress, f"{detail}; rgb_frames={self._frame_count}"
@@ -1032,7 +1032,7 @@ class ImitateHumanMotionExecutorNode(Node):
                 recover_safe_pose=runner.reset,
             )
         except PrimitiveStateUnknown as exc:
-            result_value = MockResult(
+            result_value = ImitationResult(
                 success=False,
                 error_code=CANCEL_CLEANUP_TIMEOUT,
                 message=str(exc),
@@ -1043,7 +1043,7 @@ class ImitateHumanMotionExecutorNode(Node):
             )
         except Exception as exc:
             self.get_logger().error(f"imitate_human_motion execution failed: {exc}")
-            result_value = MockResult(
+            result_value = ImitationResult(
                 success=False,
                 error_code="MOCK_PLAYBACK_FAILED",
                 message=str(exc),

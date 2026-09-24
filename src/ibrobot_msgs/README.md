@@ -632,7 +632,7 @@ HRI 的内部 delegated action，由 `manipulation_execution/imitate_human_motio
 提供，默认路径为 `/hri/imitate_human_motion`。它不是 Agent 或 CLI 的公共入口；公共调用必须先进入
 `SkillCommand`，再由 `skill_library` 通过现有 delegated Gateway 转发。goal 携带完整
 `DispatchBinding`、`expected_executor`、`arm_side`、`imitation_duration_sec` 和独立的 `timeout_sec`。
-内部 runtime 按 `prepare -> start -> mock_playback -> reset` 编排，并通过 `PrimitiveCommand` 执行动作和
+内部 runtime 按 `prepare -> start -> playback -> reset` 编排，并通过 `PrimitiveCommand` 执行动作和
 `move_to_named_pose(home)` 恢复；请求时长超过 20 秒时只执行 20 秒，不循环。
 
 | 字段 | 说明 |
