@@ -252,6 +252,7 @@ class ImitationExecutor:
         prepare: Callable[[], bool] | None = None,
         recover_safe_pose: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        plan_provider: Callable[[ImitationGoal, float], tuple[AnimationPlan, str]] | None = None,
     ) -> None:
         self._joint_names, self._reset_positions, self._joint_limits = _normalized_motion_config(
             joint_names, reset_positions, joint_limits
@@ -265,6 +266,9 @@ class ImitationExecutor:
         self._prepare = prepare or (lambda: True)
         self._recover_safe_pose = recover_safe_pose or (lambda: True)
         self._clock = clock
+        # Builds the playback plan from the capture that just finished. Without
+        # one, the preset plan for the arm side is played.
+        self._plan_provider = plan_provider
         self._lock = threading.Lock()
         self._active = False
         self._animations = build_fallback_animations(self._joint_names, self._reset_positions, self._joint_limits)
@@ -272,6 +276,28 @@ class ImitationExecutor:
     @property
     def animations(self) -> dict[str, AnimationPlan]:
         return dict(self._animations)
+
+    def _provided_plan(
+        self, goal: ImitationGoal, duration_sec: float, preset: AnimationPlan
+    ) -> tuple[AnimationPlan, str]:
+        """Ask the plan provider for the playback plan; keep ``preset`` if it fails.
+
+        A provider is expected to handle bad captures itself. Anything that
+        still escapes it -- or a plan the arm must not be sent -- keeps the
+        preset plan, so a retargeting defect never turns into a failed task.
+        """
+        if self._plan_provider is None:
+            return preset, ""
+        try:
+            plan, note = self._plan_provider(goal, duration_sec)
+            if not plan.waypoints:
+                raise ValueError("plan has no waypoints")
+            _waypoints(self._joint_names, self._joint_limits, *plan.waypoints)
+            if not (math.isfinite(plan.grid_period_sec) and plan.grid_period_sec >= 0.0):
+                raise ValueError("plan grid period must be finite and non-negative")
+            return plan, str(note)
+        except Exception as exc:
+            return preset, f"plan provider failed, playing {preset.animation_id}: {type(exc).__name__}: {exc}"
 
     def warmup(self, initialize: Callable[[], bool] | None = None) -> bool:
         """Attempt the one startup initialization used by the imitation runtime."""
@@ -507,10 +533,10 @@ class ImitationExecutor:
                             phases=phases,
                         )
                     else:
-                        # Stand-in for the animation that will eventually be
-                        # solved from the captured PEAR output; until that
-                        # mapping exists a preset plan is played back instead,
-                        # over the same span that was just recorded.
+                        # The animation is solved from the capture that just
+                        # closed and spans the same length; with no provider
+                        # the preset plan is played instead.
+                        plan, plan_note = self._provided_plan(goal, actual_duration, plan)
                         phase("playback", f"Executing {plan.animation_id}")
                         playback_started_at = self._clock()
                         outcome = active_player.play(
@@ -524,7 +550,11 @@ class ImitationExecutor:
                             "CANCELED": ("CANCELED", "imitation cancelled during playback"),
                             "TIMEOUT": ("SKILL_TIMEOUT", "imitation timeout during playback"),
                             "UNKNOWN": (CANCEL_CLEANUP_TIMEOUT, "primitive execution state is unknown"),
-                            "COMPLETED": ("", f"Imitation completed; captured {captured_duration:.2f}s"),
+                            "COMPLETED": (
+                                "",
+                                f"Imitation completed; captured {captured_duration:.2f}s"
+                                + (f"; {plan_note}" if plan_note else ""),
+                            ),
                         }.get(outcome, ("MOCK_PLAYBACK_FAILED", "playback failed"))
                         result = self._result(
                             success=not error_code,

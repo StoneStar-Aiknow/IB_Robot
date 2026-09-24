@@ -34,6 +34,7 @@ from manipulation_execution.imitate_human_motion_executor import (
     ImitationResult,
     PrimitiveStateUnknown,
 )
+from manipulation_execution.imitation_retargeting import retarget_capture
 
 _PREPARE_DURATION_SEC = 2.5
 _PEAR_CROP_EXPANSION = 1.25
@@ -264,6 +265,9 @@ class _GuardedPrimitivePlayer:
         deadline: float,
         duration_sec: float = 0.0,
         joint_positions: tuple[float, ...] = (),
+        joint_waypoints: tuple[float, ...] = (),
+        joint_waypoint_count: int = 0,
+        waypoint_duration_sec: float = 0.0,
         pose_name: str = "",
         honor_cancel: bool = True,
     ) -> str:
@@ -277,9 +281,12 @@ class _GuardedPrimitivePlayer:
         goal.execution_token = self._execution_token
         goal.primitive_name = primitive_name
         goal.pose_name = pose_name
-        goal.joint_names = list(self._joint_names) if joint_positions else []
+        goal.joint_names = list(self._joint_names) if joint_positions or joint_waypoints else []
         goal.joint_positions = list(joint_positions)
         goal.primitive_duration_sec = float(duration_sec)
+        goal.joint_waypoints = list(joint_waypoints)
+        goal.joint_waypoint_count = int(joint_waypoint_count)
+        goal.waypoint_duration_sec = float(waypoint_duration_sec)
         goal.timeout_sec = deadline - time.monotonic()
         try:
             send_future = self._client.send_goal_async(goal)
@@ -326,6 +333,8 @@ class _GuardedPrimitivePlayer:
         return outcome == "COMPLETED"
 
     def play(self, plan: AnimationPlan, duration_sec: float, *, feedback, is_cancel_requested, deadline) -> str:
+        if plan.grid_period_sec > 0.0:
+            return self._play_batched(plan, duration_sec, feedback=feedback, deadline=deadline)
         segment_duration = plan.duration_sec / (len(plan.waypoints) - 1)
         remaining = duration_sec
         # Pairwise: the waypoint list is deliberately one longer than the
@@ -352,6 +361,25 @@ class _GuardedPrimitivePlayer:
             progress = min(1.0, (duration_sec - remaining) / duration_sec)
             feedback("playback", progress, f"Executing {plan.animation_id}")
         return "COMPLETED"
+
+    def _play_batched(self, plan: AnimationPlan, duration_sec: float, *, feedback, deadline) -> str:
+        # A retargeted plan is a uniform grid that already starts at the prepare
+        # pose and respects the joint speed limit between neighbours, so it goes
+        # out as one trajectory: splitting it into hundreds of point-to-point
+        # moves would stop the arm at every grid point. The grid spans the
+        # recorded window; it is only cut if less than that is asked for.
+        count = min(len(plan.waypoints), max(1, round(duration_sec / plan.grid_period_sec)))
+        feedback("playback", 0.0, f"Executing {plan.animation_id}: {count} waypoints")
+        outcome = self._run(
+            primitive_name="move_through_joint_positions",
+            joint_waypoints=tuple(value for point in plan.waypoints[:count] for value in point),
+            joint_waypoint_count=count,
+            waypoint_duration_sec=plan.grid_period_sec,
+            deadline=deadline,
+        )
+        if outcome == "COMPLETED":
+            feedback("playback", 1.0, f"Executing {plan.animation_id}")
+        return outcome
 
     def reset(self) -> bool:
         outcome = self._run(
@@ -419,6 +447,7 @@ class ImitateHumanMotionExecutorNode(Node):
             reset_positions=self._reset_positions,
             joint_limits=self._joint_limits,
             warmup_ready=False,
+            plan_provider=self._imitation_plan,
         )
         self._startup_warmup_attempted = False
         self._goal_lock = threading.Lock()
@@ -867,6 +896,25 @@ class ImitateHumanMotionExecutorNode(Node):
         """
         with self._capture_lock:
             return list(self._pear_frames)
+
+    def _imitation_plan(self, goal: ImitationGoal, duration_sec: float) -> tuple[AnimationPlan, str]:
+        """Solve the playback plan from the PEAR window that just closed.
+
+        The plan starts from the pose prepare drove the arm to, which is where
+        the arm has been holding for the whole capture. Unusable captures come
+        back as the idle sway, not as an error; the note says which it was.
+        """
+        result = retarget_capture(
+            self._captured_pear_frames(),
+            arm_side=goal.arm_side,
+            duration_sec=duration_sec,
+            joint_names=self._joint_names,
+            joint_limits=self._joint_limits,
+            prepare_positions={name: _PREPARE_JOINT_POSITIONS.get(name, 0.0) for name in self._joint_names},
+        )
+        log = self.get_logger().warning if result.fell_back else self.get_logger().info
+        log(f"imitate_human_motion retargeting {result.message}")
+        return result.plan, result.message
 
     def _run_startup_warmup(self) -> bool:
         """Perform the single launch-time warmup; tasks never repeat it."""
