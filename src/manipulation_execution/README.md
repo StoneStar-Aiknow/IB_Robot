@@ -38,7 +38,7 @@ HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，
 不报错。
 
 prepare 位姿是执行器内的常量 `_PREPARE_JOINT_POSITIONS`，**不取自** `robot.ros2_control.reset_positions`：
-后者同时是 `pick_executor_node` 的抓后 home 和 mock 动画的钳制基线，模仿起始位姿放进去就会把抓取 home 一起
+后者同时是 `pick_executor_node` 的抓后 home 和兜底动画的钳制基线，模仿起始位姿放进去就会把抓取 home 一起
 挪走。该位姿把 joint 3 后仰 45° 让腕部相机抬到站立人头高度，joint 5 滚转 90° 抵消相机侧装。夹爪关节 `6` 由
 `gripper_trajectory_controller` 驱动，`move_to_joint_positions` 够不到，prepare 不碰它。
 
@@ -166,7 +166,7 @@ catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求
 ## 配置
 
 HRI 执行由 `robot.embodied.imitate_human_motion` 启用，`rgb_topic` 与两个模型服务端点见上文表格。关节顺序来自 `robot.joints.arm`，
-限位来自 `robot.teleoperation.safety.joint_limits`，`move_to_named_pose(home)` 的 home 与 mock 动画的钳制基线来自
+限位来自 `robot.teleoperation.safety.joint_limits`，`move_to_named_pose(home)` 的 home 与兜底动画的钳制基线来自
 `robot.ros2_control.reset_positions`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
 prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节。
 
@@ -235,7 +235,7 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
 
 - `ImitateHumanMotion` 只接受 Gateway delegated binding 和匹配的 executor identity；goal timeout 必须为正且
   不超过共享 task budget 的剩余时间。
-- Mock prepare/play/reset 都通过 `/embodied/execute_primitive`；若 primitive 取消或终态无法确认，runtime
+- prepare/play/reset 都通过 `/embodied/execute_primitive`；若 primitive 取消或终态无法确认，runtime
   返回 `CANCEL_CLEANUP_TIMEOUT`、保持 pose state 为 unknown，并且不继续发送 reset，避免重叠运动。
 - 正常、已确认失败或已确认取消后使用 `move_to_named_pose(home)` 恢复；下一次任务仍从 prepare 开始。
 

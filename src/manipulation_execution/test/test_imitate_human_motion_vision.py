@@ -10,9 +10,9 @@ import manipulation_execution.imitate_human_motion_executor_node as vision_modul
 from ibrobot_msgs.msg import Detection2D, DetectionArray, DispatchBinding
 from manipulation_execution.imitate_human_motion_executor import (
     MAX_IMITATION_DURATION_SEC,
-    MockExecutor,
-    MockGoal,
-    MockResult,
+    ImitationExecutor,
+    ImitationGoal,
+    ImitationResult,
 )
 from manipulation_execution.imitate_human_motion_executor_node import (
     _MAX_CAPTURED_PEAR_FRAMES,
@@ -927,8 +927,8 @@ class _FakeRunner:
         return True
 
 
-class _StubMock:
-    """Replays the phase order MockExecutor uses, minus the animation itself.
+class _StubExecutor:
+    """Replays the phase order ImitationExecutor uses, minus the animation itself.
 
     RGB frames are delivered in every phase, so the test sees which of them the
     node actually counts. Only the ``start`` phase is the recording: prepare
@@ -947,7 +947,7 @@ class _StubMock:
         self._node._deliver_frames(20)
         feedback("prepare", 0.25, "imitation start pose reached")
         if not prepared:
-            return MockResult(
+            return ImitationResult(
                 success=False,
                 error_code="PREPARE_FAILED",
                 message="prepare failed",
@@ -963,7 +963,7 @@ class _StubMock:
             is_cancel_requested=is_cancel_requested,
             deadline=time.monotonic() + goal.timeout_sec,
         )
-        feedback("mock_playback", 0.5, "playing animation")
+        feedback("playback", 0.5, "playing animation")
         player.play(
             _StubPlan(),
             goal.imitation_duration_sec,
@@ -974,14 +974,14 @@ class _StubMock:
         feedback("reset", 0.9, "returning to safe pose")
         self._node._deliver_frames(30)
         recover_safe_pose()
-        return MockResult(
+        return ImitationResult(
             success=True,
             error_code="",
             message="ok",
             animation_id="stub",
             requested_duration_sec=goal.imitation_duration_sec,
             actual_duration_sec=goal.imitation_duration_sec,
-            completed_phases=("prepare", "start", "mock_playback", "reset"),
+            completed_phases=("prepare", "start", "playback", "reset"),
         )
 
 
@@ -1002,7 +1002,7 @@ def _execute_harness(monkeypatch):
     node._reset_positions = {name: 0.0 for name in node._joint_names}
     node._executor_identity = {}
     node._primitive_client = None
-    node._mock = _StubMock(node)
+    node._executor = _StubExecutor(node)
     node._wait_for_vision_services = lambda _deadline: []
     node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=0))
     node._deliver_frames = lambda count: [node._on_rgb_frame(Image(width=640, height=480)) for _ in range(count)]
@@ -1073,7 +1073,7 @@ def test_only_the_capture_window_is_recorded(monkeypatch):
     assert counts["start"] == [0, 0, 10, 20]
     # 50 frames arrive during playback and 30 during reset. Neither phase is
     # part of the recording, so the total never moves past the window's 20.
-    assert counts["mock_playback"] == [20]
+    assert counts["playback"] == [20]
     assert counts["reset"] == [20]
     assert '"frames": 20' in result.message
 
@@ -1147,7 +1147,7 @@ def test_capture_runs_to_completion_before_the_animation_plays():
     the person for the whole recording.
     """
     names, reset, limits = _motion_config()
-    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    executor = ImitationExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
     events = []
 
     class _Recorder:
@@ -1162,7 +1162,7 @@ def test_capture_runs_to_completion_before_the_animation_plays():
             return "COMPLETED"
 
     result = executor.execute(
-        MockGoal(arm_side="auto", imitation_duration_sec=7.0, timeout_sec=300.0),
+        ImitationGoal(arm_side="auto", imitation_duration_sec=7.0, timeout_sec=300.0),
         recorder=_Recorder(),
         player=_Player(),
         prepare=lambda: events.append("prepare") or True,
@@ -1170,7 +1170,7 @@ def test_capture_runs_to_completion_before_the_animation_plays():
     )
 
     assert events == ["prepare", "record_start:7.0", "record_end", "play_start:7.0", "reset"]
-    assert result.completed_phases == ("prepare", "start", "mock_playback", "reset")
+    assert result.completed_phases == ("prepare", "start", "playback", "reset")
     assert result.success is True
 
 
@@ -1187,7 +1187,7 @@ def test_capture_failure_skips_playback_but_still_resets(outcome, error_code):
     before prepare leaves the arm untouched, and there is nothing to undo.
     """
     names, reset, limits = _motion_config()
-    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    executor = ImitationExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
     played = []
     reset_calls = []
 
@@ -1201,7 +1201,7 @@ def test_capture_failure_skips_playback_but_still_resets(outcome, error_code):
             return "COMPLETED"
 
     result = executor.execute(
-        MockGoal(arm_side="auto", imitation_duration_sec=5.0, timeout_sec=300.0),
+        ImitationGoal(arm_side="auto", imitation_duration_sec=5.0, timeout_sec=300.0),
         recorder=_Recorder(),
         player=_Player(),
         prepare=lambda: True,
@@ -1225,8 +1225,8 @@ def test_playback_spans_every_segment_at_the_maximum_duration():
     instead of a finished animation.
     """
     names, reset, limits = _motion_config()
-    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
-    plan = executor.animations["mock_auto_v1"]
+    executor = ImitationExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    plan = executor.animations["fallback_auto_v1"]
     runner = _GuardedPrimitivePlayer(
         None,
         _GoalHandle(SimpleNamespace(_feedback=[])),
