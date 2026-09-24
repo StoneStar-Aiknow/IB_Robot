@@ -1,0 +1,47 @@
+# Ascend 910B latency profile for the public PI0.5 LIBERO checkpoint.
+#
+# The simulator, benchmark, state/action contract, and evaluation settings come
+# from franka_libero_evaluation.yaml. This overlay owns only the additional
+# padded camera semantic and the native Torch-NPU deployment delta.
+
+robot:
+  name: franka_libero_pi05_910b_latency
+  base_config: franka_libero_evaluation
+
+  benchmark:
+    evaluation:
+      output:
+        run_name: pi05_910b_latency
+
+  contract:
+    observations:
+      __append__:
+        # PI0.5 declares a padded third camera in its strict manifest contract.
+        # Benchmark clients publish a zero-filled frame for this semantic.
+        - key: observation.images.empty_camera_0
+          topic: /benchmark/libero/observation/images/empty_camera_0
+          type: sensor_msgs/msg/Image
+          qos:
+            reliability: reliable
+            durability: transient_local
+            depth: 1
+          image:
+            encoding: rgb8
+            resize: [224, 224]
+          align:
+            strategy: hold
+            stamp: header
+            max_age_ms: 5000
+
+  control_modes:
+    model_inference:
+      inference:
+        pipelines:
+          policy:
+            # Generate this bundle from the public BF16 checkpoint by following
+            # docs/pi05_npu_910b_inference_latency_zh.md.
+            model_path: models/pi05/pi05_libero_finetuned_v044_sel99_int8_910b_ab2_6
+            deployment: torch-npu
+            execution_mode: monolithic
+            request_timeout: 60.0
+            default_task: ""

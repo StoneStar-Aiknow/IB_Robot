@@ -137,7 +137,6 @@ class LeRobotTorchModelSession(ModelSession):
         get_policy_class = self._require_attribute(factory, "get_policy_class", "LeRobot policy factory")
         make_processors = self._require_attribute(factory, "make_pre_post_processors", "LeRobot processor factory")
         bundle_path = str(context.validated_manifest.bundle_root)
-        policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
         provider_module = self._import_required("torch_models.policy_provider", "torch_models policy provider")
         resolve_provider = self._require_attribute(
             provider_module,
@@ -145,11 +144,26 @@ class LeRobotTorchModelSession(ModelSession):
             "torch_models policy provider",
         )
         try:
-            provider = resolve_provider(context.model_type, context.backend, profile.device)
+            provider = resolve_provider(
+                context.model_type,
+                context.backend,
+                profile.device,
+                device_name=device_name,
+            )
         except (AttributeError, ImportError, ValueError) as exc:
             raise BackendLoadError(
                 f"unable to resolve Torch policy provider for {context.model_type}/{context.backend}/{profile.device}: {exc}",
                 code="unsupported_policy_provider",
+            ) from exc
+        try:
+            if provider is not None and provider.load_config is not None:
+                policy_config = provider.load_config(bundle_path=bundle_path, config_type=config_type)
+            else:
+                policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
+        except (AttributeError, ImportError, OSError, TypeError, ValueError) as exc:
+            raise BackendLoadError(
+                f"unable to load Torch policy configuration: {exc}",
+                code="incompatible_policy_config",
             ) from exc
         if provider is not None:
             try:

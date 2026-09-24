@@ -60,8 +60,8 @@ assert torch.isfinite(output).all()
 
 Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install_requires`。
 这样 colcon 能按依赖顺序构建，Python 打包元数据也保持一致。模型 provider 通过稳定的
-`(model_type, backend, device)` 组合注册，实际服务接入复用现有 `ModelSession` 和统一
-推理运行时。
+`(model_type, backend, device)` 组合注册；NPU 模型再按运行时探测到的物理 SKU 分流。
+实际服务接入复用现有 `ModelSession` 和统一推理运行时。
 
 ## 模型索引
 
@@ -69,21 +69,24 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 |---|---|---|
 | DemoTorchModel | `torch_models/demo_torch_model` | CPU smoke example |
 | [PI0.5 Ascend310P](torch_models/pi05_ascend_310p/README.md) | `torch_models/pi05_ascend_310p` | `model_type=pi05` + `backend=torch` + `device=npu` |
+| [PI0.5 Ascend910B](torch_models/pi05_ascend_910b/README.md) | `torch_models/pi05_ascend_910b` | 同上，并要求物理设备名包含 `Ascend910B` 或 `Ascend910_93` |
 
-每个模型目录负责自己的配置校验、运行时准备和平台约束。统一推理服务只按稳定的
-`model_type/backend/device` 组合解析 provider，不在通用 manifest exporter 中维护模型特判。
+每个模型目录负责自己的配置校验、运行时准备和平台约束。统一推理服务先按稳定的
+`model_type/backend/device` 组合解析 provider；NPU provider 再使用 `torch.npu.get_device_name(0)`
+返回的物理型号选择 310P 或 910B，未知型号失败关闭。通用 manifest exporter 不维护模型特判。
 
 ## Provider 扩展
 
 1. 在模型目录新增 `provider.py`，导出 `create_provider() -> PolicyProvider`。
-2. 在 `torch_models/policy_provider.py` 的 `_PROVIDERS` 中增加一条
-   `(model_type, backend, device): "torch_models.<model_name>.provider"` 映射。
+2. 在 `torch_models/policy_provider.py` 中增加稳定运行时映射；同一 NPU 运行时存在多个硬件实现时，
+   同时增加物理 SKU 到 provider 的映射。
    模块仅在匹配该组合时导入；不匹配时继续使用 LeRobot factory，匹配后加载失败不会静默回退。
 3. 通过 `PolicyProvider` 的 hooks 提供模型行为，不修改通用 session 或 manifest exporter：
 
 | 字段 | 职责 |
 |---|---|
 | `policy_class` | 实现 LeRobot policy 接口的本地模型类 |
+| `load_config(bundle_path=..., config_type=...)` | 可选的模型专用配置加载器；用于兼容扩展配置字段 |
 | `configure_config(config, model_dtype=...)` | 加载权重前配置模型并检查固定契约 |
 | `validate(config=..., bundle_root=..., tokenizer_path=..., device_name=...)` | 模型内部的平台与依赖兼容检查 |
 | `load_options` | 该模型特有的 `from_pretrained` 参数 |

@@ -17,7 +17,16 @@ def test_unregistered_runtime_uses_default_policy_provider(monkeypatch, identity
     assert policy_provider.resolve_policy_provider(*identity) is None
 
 
-def test_pi05_npu_provider_is_loaded_lazily(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("device_name", "module_name"),
+    [
+        (None, "torch_models.pi05_ascend_310p.provider"),
+        ("Ascend310P1", "torch_models.pi05_ascend_310p.provider"),
+        ("Ascend910B3", "torch_models.pi05_ascend_910b.provider"),
+        ("Ascend910_9362", "torch_models.pi05_ascend_910b.provider"),
+    ],
+)
+def test_pi05_npu_provider_is_loaded_lazily(monkeypatch, device_name, module_name) -> None:
     policy_class = type("Policy", (), {})
     configure = object()
     validate = object()
@@ -33,9 +42,9 @@ def test_pi05_npu_provider_is_loaded_lazily(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(policy_provider, "import_module", lambda name: calls.append(name) or module)
 
-    provider = policy_provider.resolve_policy_provider("pi05", "torch", "npu")
+    provider = policy_provider.resolve_policy_provider("pi05", "torch", "npu", device_name=device_name)
 
-    assert calls == ["torch_models.pi05_ascend_310p.provider"]
+    assert calls == [module_name]
     assert provider.policy_class is policy_class
     assert provider.configure_config is configure
     assert provider.validate is validate
@@ -54,3 +63,12 @@ def test_registered_provider_import_failure_is_not_a_fallback(monkeypatch) -> No
     monkeypatch.setattr(policy_provider, "import_module", broken_import)
     with pytest.raises(ImportError, match="missing model dependency"):
         policy_provider.resolve_policy_provider("pi05", "torch", "npu")
+
+
+def test_unknown_npu_sku_is_not_a_fallback(monkeypatch) -> None:
+    def unexpected_import(_name):
+        pytest.fail("unknown NPU routing must fail before importing a provider")
+
+    monkeypatch.setattr(policy_provider, "import_module", unexpected_import)
+    with pytest.raises(ValueError, match="unsupported PI0.5 native Torch NPU device"):
+        policy_provider.resolve_policy_provider("pi05", "torch", "npu", device_name="AscendXYZ")
