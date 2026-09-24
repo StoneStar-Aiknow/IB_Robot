@@ -23,6 +23,8 @@ class AnimationPlan:
     animation_id: str
     waypoints: tuple[tuple[float, ...], ...]
     duration_sec: float = MAX_IMITATION_DURATION_SEC
+    # > 0: waypoints form a uniform grid with this period, played as one batch.
+    grid_period_sec: float = 0.0
 
 
 @dataclass(frozen=True)
