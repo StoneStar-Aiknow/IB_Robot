@@ -94,6 +94,32 @@ compile_tiling_schedule_optimize=true
 因此，“AB2、6 steps”是当前优化 bundle 的配置，不是对所有 PI0.5 检查点强制覆盖的全局默认值。
 修改求解器或步数会改变图缓存、精度和时延，修改 `config.json` 后还必须同步更新并校验 manifest 摘要。
 
+### 3.2 文本 token 上限与时延
+
+当前公开 BF16 检查点及本项目生成的 Selective-99 INT8 bundle 均使用：
+
+```json
+{
+  "tokenizer_max_length": 200
+}
+```
+
+Tokenizer 使用右侧补齐、`padding="max_length"` 和 `truncation=true`，因此模型图中的文本 token 张量
+固定为 200；请求中的实际有效 token 可以少于 200，但仍会补齐到该长度。当前代码和部署 bundle 没有
+把 183 设置为 token 上限。
+
+在保持权重、输入内容、AB2 和其他运行条件一致的单变量测试中，183 token 的时延性能更好：
+
+| token 上限 | 平均时延 |
+|---:|---:|
+| 183 | 48.492 ms |
+| 200 | 49.052 ms |
+
+将上限从 200 调整为 183，在该次测试中平均减少约 0.560 ms。原因是固定图需要处理的文本序列更短。
+但 183 不是当前默认值，也不能只为降低时延直接修改：必须确认所有任务文本和状态编码均可放入 183
+token，避免截断造成语义或控制精度损失。修改 `tokenizer_max_length` 后，需要重新生成或校验 manifest
+摘要、重新编译 TorchAir 图，并重新完成动作精度和端到端时延验证。
+
 ## 4. 权重与 bundle 要求
 
 ### 4.1 BF16 bundle
