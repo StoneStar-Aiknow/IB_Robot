@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -88,6 +88,7 @@ class ComputeVideoStreamManager:
         self._selection_diagnostics: tuple[tuple[str, int, float, float], ...] = ()
         self._last_state_alignment_delta_ns: int | None = None
         self._receiver_start_lock = threading.Lock()
+        self._status_listener: Callable[[], None] | None = None
         self._specs: dict[str, tuple[SpecView, ObservationTransportSpec]] = {}
         for spec in observation_specs:
             transport = effective_observation_transport(spec.transport)
@@ -124,6 +125,19 @@ class ComputeVideoStreamManager:
         )
         self._descriptors: dict[str, VideoStreamDescriptor] = {}
         self._streams: dict[str, _ComputeStream] = {}
+
+    def set_status_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register a non-blocking callback fired when a stream's readiness may have changed.
+
+        Called from receiver threads; the listener must only schedule work
+        (e.g. trigger a guard condition), never publish inline.
+        """
+        self._status_listener = listener
+
+    def _notify_status_change(self) -> None:
+        listener = self._status_listener
+        if listener is not None:
+            listener()
 
     def diagnostic_snapshots(self) -> tuple[VideoStreamDiagnosticSnapshot, ...]:
         snapshots = []
@@ -304,6 +318,7 @@ class ComputeVideoStreamManager:
         if status.status_origin != "sender":
             return False
         if status.timestamp_mapping_valid and status.encoded_frames > 0:
+            mapper_was_ready = stream.mapper.ready
             stream.mapper.update(
                 status.mapping_rtp_timestamp,
                 status.mapping_capture_timestamp_ns,
@@ -311,6 +326,8 @@ class ComputeVideoStreamManager:
                 session_generation=status.session_generation,
             )
             stream.sender_status = status
+            if stream.mapper.ready != mapper_was_ready:
+                self._notify_status_change()
         return True
 
     def assemble_inputs(self, target_timestamp_ns: int, *, now_ns: int | None = None) -> dict[str, np.ndarray]:
@@ -425,6 +442,7 @@ class ComputeVideoStreamManager:
             endpoint=(descriptor.endpoint_host, descriptor.endpoint_port),
             recorder=self._recorders.get(spec.key),
             decode=self._decode,
+            on_state_change=self._notify_status_change,
         )
         try:
             receiver.start()

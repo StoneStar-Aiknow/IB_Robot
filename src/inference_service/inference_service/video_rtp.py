@@ -59,6 +59,7 @@ class H264RtpReceiver:
         recorder: H264StreamRecorder | None = None,
         decode: bool = True,
         clock: Callable[[], int] | None = None,
+        on_state_change: Callable[[], None] | None = None,
     ) -> None:
         if not stream_id or not observation_key or session_generation < 1 or packet_queue_capacity <= 0:
             raise ValueError("RTP receiver requires stream identity, session, and positive queue capacity")
@@ -91,7 +92,8 @@ class H264RtpReceiver:
         self._lock = self._condition
         self._processing_lock = threading.RLock()
         self._depacketizer = H264Depacketizer()
-        self._state = StreamLifecycleState.CONFIGURED
+        self._on_state_change = on_state_change
+        self._lifecycle_state = StreamLifecycleState.CONFIGURED
         self._metrics = StreamMetrics()
         self._last_error = ""
         self._have_sps = False
@@ -103,6 +105,20 @@ class H264RtpReceiver:
         self._stopping = False
         self._receive_thread: threading.Thread | None = None
         self._process_thread: threading.Thread | None = None
+
+    @property
+    def _state(self) -> StreamLifecycleState:
+        return self._lifecycle_state
+
+    @_state.setter
+    def _state(self, state: StreamLifecycleState) -> None:
+        changed = state is not self._lifecycle_state
+        self._lifecycle_state = state
+        if changed and self._on_state_change is not None:
+            # Lifecycle transitions drive sender-side admission and keyframe
+            # recovery, so they are published immediately rather than waiting
+            # for the periodic status timer.
+            self._on_state_change()
 
     @property
     def status(self) -> StreamStatus:

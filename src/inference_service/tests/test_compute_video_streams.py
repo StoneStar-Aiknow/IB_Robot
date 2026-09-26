@@ -168,10 +168,12 @@ def _status(descriptor, capture_timestamp_ns):
         lifecycle_state="ready",
         ready=True,
         selected_backend="software",
+        status_origin="sender",
         timestamp_mapping_valid=True,
         mapping_rtp_timestamp=90_000,
         mapping_capture_timestamp_ns=capture_timestamp_ns,
         keyframe_ready=True,
+        encoded_frames=1,
     )
 
 
@@ -398,5 +400,22 @@ def test_compute_stream_status_reports_receiver_metrics():
 
     assert status.pipeline_id == "policy"
     assert status.selected_backend == "software"
-    assert not status.timestamp_mapping_valid
+    assert status.timestamp_mapping_valid
     assert status.decoded_buffer_depth == 1
+
+
+def test_compute_stream_manager_signals_readiness_changes_to_its_status_listener():
+    spec = _spec()
+    manager, receivers = _manager((spec,))
+    notifications = []
+    manager.set_status_listener(lambda: notifications.append("changed"))
+    descriptor = _descriptor(spec)
+    assert manager.observe_descriptor(descriptor)
+
+    receivers[0].options["on_state_change"]()
+    manager.observe_status(_status(descriptor, 1_000_000_000), receive_time_ns=1_000_000_000)
+    manager.observe_status(_status(descriptor, 1_050_000_000), receive_time_ns=1_050_000_000)
+
+    # One receiver lifecycle transition plus the first timestamp mapping; a
+    # refreshed mapping does not change readiness and stays silent.
+    assert notifications == ["changed", "changed"]

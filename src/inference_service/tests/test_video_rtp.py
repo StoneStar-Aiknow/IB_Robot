@@ -636,6 +636,37 @@ def test_recording_packet_loss_injection_applies_integrity_policy(tmp_path, inte
     receiver.close()
 
 
+def test_receiver_reports_every_lifecycle_transition_to_its_listener():
+    transitions = []
+    datagrams, encoder, sender = _encoded_stream(frame_count=3, gop_frames=2)
+    buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000, retention_ns=2_000_000_000)
+    mapper = RtpTimestampMapper(2_000_000_000, observation_key="observation.images.top", stream_id="top")
+    receiver = H264RtpReceiver(
+        stream_id="top",
+        observation_key="observation.images.top",
+        ssrc=_SSRC,
+        decoder=SoftwareH264Decoder(),
+        frame_buffer=buffer,
+        timestamp_mapper=mapper,
+        session_generation=1,
+        packet_queue_capacity=64,
+        on_state_change=lambda: transitions.append(receiver.status.state),
+    )
+    receiver.start()
+    mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert transitions == [
+        StreamLifecycleState.STARTING,
+        StreamLifecycleState.WAITING_FOR_KEYFRAME,
+        StreamLifecycleState.READY,
+    ]
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
 def test_local_udp_sender_receiver_threads_deliver_stream_and_stop_cleanly():
     udp_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_receiver.bind(("127.0.0.1", 0))

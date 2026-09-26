@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import traceback
 from dataclasses import dataclass
 
@@ -45,6 +46,13 @@ from inference_service.runtime_composition import (
 )
 from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 from robot_config.contract_utils import contract_fingerprint, iter_specs
+
+# Receiver status is a heartbeat plus diagnostics; lifecycle transitions are
+# published immediately through a guard condition, so the periodic cadence
+# only bounds how stale the counters can get. A faster timer takes the GIL
+# away from the RTP receive/decode threads in the same process.
+_VIDEO_STATUS_PERIOD_S = 0.25
+_VIDEO_DIAGNOSTICS_PERIOD_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,14 @@ class PureInferenceNode(Node):
             callback_group=ReentrantCallbackGroup(),
         )
         self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
+        self._video_status_lock = threading.Lock()
+        self._video_status_signatures: dict[str, tuple[object, ...]] = {}
+        self._video_status_trigger = self.create_guard_condition(
+            self._publish_changed_video_status,
+            callback_group=ReentrantCallbackGroup(),
+        )
+        if stream_manager is not None:
+            stream_manager.set_status_listener(self._video_status_trigger.trigger)
         self._status_pub = self.create_publisher(InferencePipelineStatus, config.heartbeat_topic, status_qos)
         self.create_subscription(
             InferencePipelineStatus,
@@ -175,7 +191,10 @@ class PureInferenceNode(Node):
             callback_group=ReentrantCallbackGroup(),
         )
         self._status_timer = self.create_timer(0.5, self._publish_status)
-        self._video_status_timer = self.create_timer(0.02, self._publish_video_status)
+        self._video_status_timer = self.create_timer(_VIDEO_STATUS_PERIOD_S, self._publish_video_status)
+        self._video_diagnostics_timer = self.create_timer(
+            _VIDEO_DIAGNOSTICS_PERIOD_S, self._log_video_runtime_diagnostics
+        )
         self._log_video_stream_diagnostics()
         self.get_logger().info(
             f"Distributed cloud pipeline loaded: id={config.pipeline_id}, deployment={config.deployment}, "
@@ -223,7 +242,9 @@ class PureInferenceNode(Node):
             self.get_logger().error(f"invalid video stream descriptor: {exc}")
 
     def _video_status_callback(self, message: VideoStreamStatus) -> None:
-        if self._stream_manager is None:
+        # The topic is bidirectional: skip this node's own receiver statuses
+        # before paying for the full value conversion.
+        if self._stream_manager is None or message.status_origin != "sender":
             return
         try:
             self._stream_manager.observe_status(
@@ -234,32 +255,48 @@ class PureInferenceNode(Node):
             self.get_logger().error(f"invalid video stream status: {exc}")
 
     def _publish_video_status(self) -> None:
+        self._publish_video_statuses(changed_only=False)
+
+    def _publish_changed_video_status(self) -> None:
+        self._publish_video_statuses(changed_only=True)
+
+    def _publish_video_statuses(self, *, changed_only: bool) -> None:
         if self._stream_manager is None:
             return
-        stamp = self.get_clock().now().to_msg()
-        for status in self._stream_manager.statuses():
-            self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+        with self._video_status_lock:
+            stamp = self.get_clock().now().to_msg()
+            for status in self._stream_manager.statuses():
+                signature = (
+                    status.session_id,
+                    status.session_generation,
+                    status.lifecycle_state,
+                    status.ready,
+                    status.keyframe_ready,
+                )
+                if changed_only and self._video_status_signatures.get(status.observation_key) == signature:
+                    continue
+                self._video_status_signatures[status.observation_key] = signature
+                self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+
+    def _log_video_runtime_diagnostics(self) -> None:
+        if self._stream_manager is None:
+            return
         for observation_key, metrics in self._stream_manager.decoder_diagnostics():
             self.get_logger().info(
                 f"Decoder runtime: observation={observation_key}, "
                 f"input_frames={metrics.input_frames}, output_frames={metrics.output_frames}, "
                 f"input_fps={metrics.input_frame_rate_hz:.2f}, output_fps={metrics.output_frame_rate_hz:.2f}, "
                 f"backlog={metrics.decoder_backlog_depth}, output_age_ms={metrics.decoder_output_age_ns / 1e6:.1f}, "
-                f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}",
-                throttle_duration_sec=2.0,
+                f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}"
             )
         alignment_delta_ns = self._stream_manager.state_alignment_delta_ns()
         if alignment_delta_ns is not None:
-            self.get_logger().info(
-                f"State alignment: delta_ms={alignment_delta_ns / 1e6:.1f}",
-                throttle_duration_sec=2.0,
-            )
+            self.get_logger().info(f"State alignment: delta_ms={alignment_delta_ns / 1e6:.1f}")
         for observation_key, capture_ns, capture_age_ms, live_age_ms in self._stream_manager.selection_diagnostics():
             self.get_logger().info(
                 f"Video selection: observation={observation_key}, "
                 f"capture_age_ms={capture_age_ms:.1f}, live_age_ms={live_age_ms:.1f}, "
-                f"selected_capture_ns={capture_ns}",
-                throttle_duration_sec=2.0,
+                f"selected_capture_ns={capture_ns}"
             )
 
     def _request_callback(self, message: DistributedInferenceRequest) -> None:
