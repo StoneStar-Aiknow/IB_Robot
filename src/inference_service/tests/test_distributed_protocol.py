@@ -904,6 +904,70 @@ def test_aligned_history_round_trips_through_the_request_message(tmp_path):
     np.testing.assert_allclose(decoded.aligned_tensors[1]["observation.state"], np.array([0.5, 1.5]))
 
 
+def _aligned_request(identity, entries):
+    return DistributedRequest(
+        operation=Operation.INFER,
+        pipeline_id=identity.pipeline_id,
+        request_id="request",
+        session_id="session",
+        session_generation=1,
+        deployment_fingerprint=identity.deployment_fingerprint,
+        observation_timestamp_ns=1,
+        stream_references=(StreamReference("observation.images.top", "top"),),
+        aligned_timestamps_ns=tuple(1_000 + 50 * index for index in range(len(entries))),
+        aligned_tensors=tuple(entries),
+    )
+
+
+def test_aligned_history_is_one_k_stacked_variant_per_key_on_the_wire(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    entries = [
+        {
+            "observation.state": np.full(6, index, dtype=np.float32),
+            "observation.current": np.full(6, -index, dtype=np.float32),
+        }
+        for index in range(22)
+    ]
+
+    message = request_to_message(_aligned_request(identity, entries))
+
+    variants = {variant.key: variant for variant in message.aligned_tensors.variants}
+    assert sorted(variants) == ["observation.current", "observation.state"]
+    assert [dim.size for dim in variants["observation.state"].float_32_array.layout.dim] == [22, 6]
+    decoded = request_from_message(message)
+    assert len(decoded.aligned_tensors) == 22
+    np.testing.assert_allclose(decoded.aligned_tensors[7]["observation.current"], np.full(6, -7))
+
+
+def test_aligned_history_rejects_entries_that_cannot_share_a_k_axis(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    with pytest.raises(ValueError, match="changes shape or dtype"):
+        request_to_message(
+            _aligned_request(
+                identity,
+                [{"observation.state": np.zeros(6, dtype=np.float32)}, {"observation.state": np.zeros(5, np.float32)}],
+            )
+        )
+    with pytest.raises(ValueError, match="same observation keys"):
+        request_to_message(
+            _aligned_request(
+                identity,
+                [{"observation.state": np.zeros(6, dtype=np.float32)}, {"observation.current": np.zeros(6)}],
+            )
+        )
+
+
+def test_request_decoder_rejects_history_whose_k_axis_does_not_match_the_timestamps(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    message = request_to_message(
+        _aligned_request(identity, [{"observation.state": np.zeros(6, dtype=np.float32)} for _ in range(3)])
+    )
+    message.aligned_timestamps_ns = [1_000, 1_050]
+
+    with pytest.raises(ValueError, match="leading dimension"):
+        request_from_message(message)
+
+
 def test_aligned_history_requires_stream_references_and_equal_arrays(tmp_path):
     identity = _identity(tmp_path / "bundle")
     base = dict(

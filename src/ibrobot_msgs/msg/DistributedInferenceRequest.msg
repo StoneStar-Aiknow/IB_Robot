@@ -23,5 +23,8 @@ VariantsList tensors
 # Timestamped history of non-streamed observations for post-hoc alignment
 # with the cloud-selected video capture. Empty when no RTP stream is
 # referenced (pure DDS mode stays on the request tick anchor).
+# The history is stacked along a leading K axis: every variant in
+# aligned_tensors has shape [K, ...] with K == len(aligned_timestamps_ns), so
+# the message size in objects stays constant as the window grows.
 uint64[] aligned_timestamps_ns
-VariantsList[] aligned_tensors
+VariantsList aligned_tensors

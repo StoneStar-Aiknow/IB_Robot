@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
+
+import numpy as np
 
 from ibrobot_msgs.msg import (
     DistributedInferenceRequest,
@@ -115,7 +118,7 @@ def request_to_message(request: DistributedRequest) -> DistributedInferenceReque
     message.stream_ids = [reference.stream_id for reference in request.stream_references]
     message.tensors = TensorMsgConverter.to_variant(dict(request.inputs))
     message.aligned_timestamps_ns = list(request.aligned_timestamps_ns)
-    message.aligned_tensors = [TensorMsgConverter.to_variant(dict(entry)) for entry in request.aligned_tensors]
+    message.aligned_tensors = TensorMsgConverter.to_variant(stack_aligned_history(request.aligned_tensors))
     return message
 
 
@@ -137,7 +140,10 @@ def request_from_message(message: DistributedInferenceRequest) -> DistributedReq
         deployment_fingerprint=message.deployment_fingerprint,
         inputs=TensorMsgConverter.from_variant(message.tensors),
         aligned_timestamps_ns=tuple(message.aligned_timestamps_ns),
-        aligned_tensors=tuple(TensorMsgConverter.from_variant(entry) for entry in message.aligned_tensors),
+        aligned_tensors=unstack_aligned_history(
+            TensorMsgConverter.from_variant(message.aligned_tensors),
+            len(message.aligned_timestamps_ns),
+        ),
         prompt=message.prompt or None,
         deadline=deadline,
         observation_timestamp_ns=_time_to_nanoseconds(message.observation_timestamp),
@@ -150,6 +156,49 @@ def request_from_message(message: DistributedInferenceRequest) -> DistributedReq
             )
         ),
     )
+
+
+def stack_aligned_history(entries: tuple[Mapping[str, object], ...]) -> dict[str, np.ndarray]:
+    """Stack per-timestamp history entries into one ``[K, ...]`` array per key.
+
+    Each ``Variant`` costs a fixed set of nested ROS messages to serialize and
+    deserialize, so one variant per key keeps the request cost independent of
+    the history length K.
+    """
+    if not entries:
+        return {}
+    keys = tuple(entries[0])
+    stacked: dict[str, np.ndarray] = {}
+    for key in keys:
+        values = []
+        for entry in entries:
+            if tuple(entry) != keys:
+                raise ValueError("aligned history entries must carry the same observation keys in the same order")
+            value = entry[key]
+            if hasattr(value, "detach"):
+                value = value.detach().cpu().numpy()
+            if not isinstance(value, np.ndarray):
+                raise ValueError(f"aligned history value {key!r} must be an array, got {type(value).__name__}")
+            if value.dtype == np.bool_:
+                raise ValueError(f"aligned history value {key!r} cannot be boolean")
+            values.append(value)
+        if any(value.shape != values[0].shape or value.dtype != values[0].dtype for value in values):
+            raise ValueError(f"aligned history value {key!r} changes shape or dtype across entries")
+        stacked[key] = np.stack(values)
+    return stacked
+
+
+def unstack_aligned_history(stacked: Mapping[str, Any], count: int) -> tuple[dict[str, Any], ...]:
+    """Split a ``[K, ...]`` stacked history back into K per-timestamp entries."""
+    if not stacked:
+        if count:
+            raise ValueError("aligned history timestamps were sent without tensors")
+        return ()
+    for key, value in stacked.items():
+        shape = tuple(getattr(value, "shape", ()))
+        if not shape or shape[0] != count:
+            raise ValueError(f"aligned history tensor {key!r} has leading dimension {shape[:1]} but {count} timestamps")
+    return tuple({key: value[index] for key, value in stacked.items()} for index in range(count))
 
 
 def video_descriptor_to_message(
