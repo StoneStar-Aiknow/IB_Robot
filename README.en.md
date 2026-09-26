@@ -39,7 +39,7 @@ The mainline workflow now supports three runtime platforms:
 
 ## System Architecture
 
-![IB-Robot Architecture](docs/pictures/architecture.png)
+![IB-Robot Architecture](docs/pictures/ib-robot-architecture.drawio.svg)
 
 ### Architecture Deep Dive
 

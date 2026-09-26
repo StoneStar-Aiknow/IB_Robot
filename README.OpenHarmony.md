@@ -65,7 +65,7 @@ ros2 launch inference_service eval_inference.launch.py \
 
 ## 系统架构
 
-![RoboFrame 架构图](docs/pictures/architecture.png)
+![RoboFrame 架构图](docs/pictures/ib-robot-architecture.drawio.svg)
 
 RoboFrame 构建从感知、决策到执行的端到端闭环：
 
