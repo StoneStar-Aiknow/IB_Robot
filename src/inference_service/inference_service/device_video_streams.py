@@ -273,4 +273,5 @@ class DeviceVideoStreamManager:
             sender_queue_frames=transport.buffer.sender_queue_frames,
             raw_queue_frames=_DEVICE_RAW_QUEUE_FRAMES,
             queue_policy="latest",
+            packetization=transport.packetization,
         )

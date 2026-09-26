@@ -343,6 +343,7 @@ def _frame_ingress_parameters(robot_config: dict, benchmark: dict) -> dict[str, 
                 "sender_queue_frames": transport.buffer.sender_queue_frames,
                 "raw_queue_frames": transport.buffer.sender_queue_frames,
                 "queue_policy": "strict",
+                "packetization": transport.packetization,
             }
         )
     enabled = bool(streams)

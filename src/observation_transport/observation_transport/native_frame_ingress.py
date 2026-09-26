@@ -781,6 +781,7 @@ class NativeFrameIngress:
             selected_backend=stream.selected_backend,
             on_sent=mark_sent,
             background_delivery=False,
+            packetization=stream.config.packetization,
         )
         sender.start()
         holder["sender"] = sender
@@ -848,6 +849,7 @@ class NativeFrameIngress:
                 stream.selected_backend,
                 session.contract_fingerprint,
                 session.deployment_fingerprint,
+                config.packetization,
             )
 
     def _status(self, stream: _Stream, session: StreamSessionView) -> DirectFrameStreamStatus:

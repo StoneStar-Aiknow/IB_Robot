@@ -16,6 +16,11 @@ _STREAM_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 VIDEO_CODEC_BACKENDS = frozenset({"auto", "software", "ascend", "nvidia", "vaapi", "v4l2m2m", "rkmpp"})
 _PROFILES = {"baseline", "main", "high"}
 _COLOR_RANGES = {"limited", "full"}
+# RTP wire packetization. ``rfc6184`` (default) keeps every datagram under the
+# path MTU; ``access_unit`` sends one whole access unit per datagram and relies
+# on IP fragmentation, so it is opt-in for trusted, fragment-clean LANs.
+RTP_PACKETIZATION_DEFAULT = "rfc6184"
+RTP_PACKETIZATION_MODES = frozenset({RTP_PACKETIZATION_DEFAULT, "access_unit"})
 
 # ``dropped`` reasons that describe normal stream entry rather than a transport fault.
 # The recorder consults this when it computes ``has_gap``; the offline converter consults
@@ -84,6 +89,7 @@ class ObservationTransportSpec:
     readiness: VideoReadinessSpec | None = None
     recording: RecordingSpec | None = None
     security: str = "none"
+    packetization: str = RTP_PACKETIZATION_DEFAULT
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -118,6 +124,7 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
             "readiness",
             "recording",
             "security",
+            "packetization",
         },
         "transport",
     )
@@ -209,6 +216,7 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
         readiness=readiness,
         recording=recording,
         security=str(data.get("security", "none")).lower(),
+        packetization=str(data.get("packetization", RTP_PACKETIZATION_DEFAULT)).lower(),
     )
 
 
@@ -222,6 +230,9 @@ def observation_transport_to_dict(value: ObservationTransportSpec) -> dict[str, 
     payload = asdict(value)
     if value.recording is None:
         payload.pop("recording")
+    if value.packetization == RTP_PACKETIZATION_DEFAULT:
+        # Keep contract fingerprints of existing RTP configurations unchanged.
+        payload.pop("packetization")
     return payload
 
 
@@ -328,6 +339,11 @@ def validate_observation_transports(
             errors.append(f"Observation '{key}' has unsupported transport media format or color metadata")
         if value.encoder_backend not in VIDEO_CODEC_BACKENDS or value.decoder_backend not in VIDEO_CODEC_BACKENDS:
             errors.append(f"Observation '{key}' has unsupported video codec backend")
+        if value.packetization not in RTP_PACKETIZATION_MODES:
+            errors.append(
+                f"Observation '{key}' transport.packetization must be one of: "
+                f"{', '.join(sorted(RTP_PACKETIZATION_MODES))}"
+            )
         if value.security != "none":
             errors.append(f"Observation '{key}' transport.security currently must be none")
         integrity_mode = value.recording.integrity_mode if value.recording is not None else "strict"
@@ -440,6 +456,7 @@ _COMPILE_RTP_FIELDS = frozenset(
         "buffer",
         "readiness",
         "security",
+        "packetization",
         "streams",
     }
 )
@@ -455,6 +472,7 @@ _COMPILE_STREAM_FIELDS = frozenset(
         "buffer",
         "readiness",
         "security",
+        "packetization",
     }
 )
 
@@ -503,6 +521,9 @@ def materialize_observation_transports(
     global_encoder = _compile_exact_string(profile.get("encoder_backend", "auto"), "rtp.encoder_backend").lower()
     global_decoder = _compile_exact_string(profile.get("decoder_backend", "auto"), "rtp.decoder_backend").lower()
     global_security = _compile_exact_string(profile.get("security", "none"), "rtp.security").lower()
+    global_packetization = _compile_exact_string(
+        profile.get("packetization", RTP_PACKETIZATION_DEFAULT), "rtp.packetization"
+    ).lower()
     global_h264 = _compile_profile_section(profile.get("h264"), "rtp.h264", {"profile", "bitrate_bps", "gop_frames"})
     global_media = _compile_profile_section(
         profile.get("media"),
@@ -587,6 +608,7 @@ def materialize_observation_transports(
             "buffer": stream_buffer,
             "readiness": stream_readiness,
             "security": override.get("security", global_security),
+            "packetization": override.get("packetization", global_packetization),
         }
         try:
             parsed = parse_observation_transport(raw_transport)

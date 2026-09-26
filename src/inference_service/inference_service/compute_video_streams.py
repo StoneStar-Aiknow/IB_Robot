@@ -549,4 +549,5 @@ class ComputeVideoStreamManager:
             pixel_format=transport.media.pixel_format,
             color_space=transport.media.color_space,
             color_range=transport.media.color_range,
+            packetization=transport.packetization,
         )

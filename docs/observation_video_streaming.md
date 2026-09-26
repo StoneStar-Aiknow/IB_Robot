@@ -78,6 +78,16 @@ contract:
 | `h264.bitrate_bps` | H.264 码率（bps），建议 2-6 Mbps；过低影响推理精度，过高占用带宽 |
 | `h264.gop_frames` | GOP 长度（I 帧间隔），建议 10-20；过短增加码率，过长延长冷启动 |
 | `readiness.max_inter_camera_skew_ms` | 多相机同步容差（默认 100ms）；超过则拒绝推理请求 |
+| `packetization` | RTP 打包方式：`rfc6184`（默认，单 NAL / FU-A，每个报文不超过 MTU）或 `access_unit`（整帧单报文，见下文） |
+
+**整帧单报文（`packetization: access_unit`）**：每个 H.264 access unit 作为一个 RTP 报文发送，
+由 IP 层分片承载，接收端无需 FU-A 重组。它省去了逐包打包、发送和重组的 CPU 开销，但只适用于
+**不丢弃 IP 分片的可信局域网**：
+- 任一 IP 分片丢失即整帧丢失（与 RFC 6184 下丢包整帧作废的语义一致），但部分分片会在内核重组队列中
+  驻留至 `net.ipv4.ipfrag_time`（默认 30s）；持续丢包时可能触及 `ipfrag_high_thresh`，导致所有分片报文被丢弃。
+- VPN、隧道、防火墙或 NAT 常会丢弃 IP 分片，跨这类网络请保持 `rfc6184`。
+- 超过单个 UDP 报文上限（约 64KB）的 access unit 会自动退回 RFC 6184 分片；接收端两种格式都能处理。
+- 机器人侧和推理侧必须配置一致，协商时 descriptor 的 `packetization` 不一致会以 `descriptor_mismatch` 拒绝。
 
 ### 2. 机器人侧和云端必须使用相同配置
 

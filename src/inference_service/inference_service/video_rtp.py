@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import select
 import socket
 import threading
 import time
@@ -35,6 +36,10 @@ _RTP_HEADER_SIZE = 12
 _DECODER_STARVATION_AUS = 30
 _DECODER_FAILURE_RESET_THRESHOLD = 3
 _DECODER_RESET_MIN_INTERVAL_S = 3.0
+# Datagrams drained from the socket per wakeup. One access unit arrives as a
+# burst; handing the burst over in one step avoids a lock/notify/GIL handoff
+# per packet between the receive and decode threads.
+_RECEIVE_BATCH_DATAGRAMS = 64
 
 
 class H264RtpReceiver:
@@ -94,6 +99,11 @@ class H264RtpReceiver:
         self._depacketizer = H264Depacketizer()
         self._on_state_change = on_state_change
         self._lifecycle_state = StreamLifecycleState.CONFIGURED
+        # Per-packet receive counters are folded into ``_metrics`` once per
+        # processed batch instead of rebuilding the frozen snapshot per packet.
+        self._pending_received_packets = 0
+        self._last_receive_monotonic_ns = 0
+        self._jitter_ns = 0
         self._metrics = StreamMetrics()
         self._last_error = ""
         self._have_sps = False
@@ -123,12 +133,22 @@ class H264RtpReceiver:
     @property
     def status(self) -> StreamStatus:
         with self._lock:
+            metrics = self._metrics
+            pending = self._pending_received_packets
+            if pending:
+                # Read-only view: only the processing thread folds the counters.
+                metrics = replace(
+                    metrics,
+                    received_packets=metrics.received_packets + pending,
+                    receive_monotonic_ns=self._last_receive_monotonic_ns,
+                    jitter_ns=self._jitter_ns,
+                )
             return StreamStatus(
                 self.stream_id,
                 self._state,
                 self._state is StreamLifecycleState.READY,
                 self.selected_backend,
-                self._metrics,
+                metrics,
                 self._last_error,
             )
 
@@ -177,6 +197,24 @@ class H264RtpReceiver:
                 self._last_error = "receiver_queue_overflow"
             self._condition.notify()
 
+    def _enqueue_datagrams(self, datagrams: list[bytes], receive_time_ns: int) -> None:
+        with self._lock:
+            if self._state in {StreamLifecycleState.FAILED, StreamLifecycleState.STOPPED}:
+                raise VideoRtpError("invalid_state", f"receiver is {self._state.value}", stream_id=self.stream_id)
+            self._queue.extend((datagram, receive_time_ns) for datagram in datagrams)
+            dropped = max(0, len(self._queue) - self._capacity)
+            for _ in range(dropped):
+                self._queue.popleft()
+            self._metrics = replace(
+                self._metrics,
+                queued_packets=len(self._queue),
+                dropped_packets=self._metrics.dropped_packets + dropped,
+                receiver_queue_overflow_drops=self._metrics.receiver_queue_overflow_drops + dropped,
+            )
+            if dropped:
+                self._last_error = "receiver_queue_overflow"
+            self._condition.notify()
+
     def process_pending(self) -> bool:
         with self._processing_lock:
             pending = self._pop_pending()
@@ -184,7 +222,35 @@ class H264RtpReceiver:
                 return False
             datagram, receive_time_ns = pending
             self._process_datagram_locked(datagram, receive_time_ns=receive_time_ns)
+            with self._lock:
+                self._flush_packet_metrics()
             return True
+
+    def _process_pending_batch(self) -> bool:
+        with self._processing_lock:
+            with self._lock:
+                if not self._queue:
+                    return False
+                batch = list(self._queue)
+                self._queue.clear()
+                self._metrics = replace(self._metrics, queued_packets=0)
+            for datagram, receive_time_ns in batch:
+                self._process_datagram_locked(datagram, receive_time_ns=receive_time_ns)
+            with self._lock:
+                self._flush_packet_metrics()
+            return True
+
+    def _flush_packet_metrics(self) -> None:
+        """Fold per-packet receive counters into the metrics snapshot; call under ``_lock``."""
+        if not self._pending_received_packets:
+            return
+        self._metrics = replace(
+            self._metrics,
+            received_packets=self._metrics.received_packets + self._pending_received_packets,
+            receive_monotonic_ns=self._last_receive_monotonic_ns,
+            jitter_ns=self._jitter_ns,
+        )
+        self._pending_received_packets = 0
 
     def _drop_queued_datagrams(self) -> int:
         # Datagrams queued while the decoder is being reset belong to the
@@ -245,7 +311,10 @@ class H264RtpReceiver:
 
     def process_datagram(self, datagram: bytes, *, receive_time_ns: int) -> list[VideoFrame]:
         with self._processing_lock:
-            return self._process_datagram_locked(datagram, receive_time_ns=receive_time_ns)
+            frames = self._process_datagram_locked(datagram, receive_time_ns=receive_time_ns)
+            with self._lock:
+                self._flush_packet_metrics()
+            return frames
 
     def _process_datagram_locked(self, datagram: bytes, *, receive_time_ns: int) -> list[VideoFrame]:
         receive_monotonic_ns = time.monotonic_ns()
@@ -259,14 +328,11 @@ class H264RtpReceiver:
                 "stream_identity_mismatch", "RTP SSRC or payload type does not match descriptor", dropped_packets=1
             )
             return []
-        with self._lock:
-            jitter_ns = self._updated_jitter_ns(packet.timestamp, receive_monotonic_ns)
-            self._metrics = replace(
-                self._metrics,
-                received_packets=self._metrics.received_packets + 1,
-                receive_monotonic_ns=receive_monotonic_ns,
-                jitter_ns=jitter_ns,
-            )
+        # Only the processing thread writes these; readers fold them in under
+        # ``_lock`` through ``_flush_packet_metrics``.
+        self._jitter_ns = self._updated_jitter_ns(packet.timestamp, receive_monotonic_ns)
+        self._last_receive_monotonic_ns = receive_monotonic_ns
+        self._pending_received_packets += 1
         access_unit, lost_packets = self._depacketizer.push(packet)
         if self._depacketizer.last_reordered:
             dropped_capture_timestamp_ns = self._map_dropped_timestamp(packet.timestamp, receive_time_ns)
@@ -510,6 +576,43 @@ class H264RtpReceiver:
 
     def _receive_loop(self) -> None:
         assert self._socket is not None
+        if not isinstance(self._socket, socket.socket):
+            self._receive_loop_single()
+            return
+        udp_socket = self._socket
+        # Wait with poll and drain without blocking: an access unit arrives as
+        # a burst, and taking the whole burst per wakeup avoids one
+        # lock/notify/GIL handoff per packet to the decode thread. A socket
+        # timeout cannot be used here because CPython waits for the timeout
+        # before honouring MSG_DONTWAIT.
+        udp_socket.setblocking(False)
+        poller = select.poll()
+        poller.register(udp_socket.fileno(), select.POLLIN)
+        while True:
+            with self._lock:
+                if self._stopping:
+                    return
+            batch: list[bytes] = []
+            try:
+                if not poller.poll(100):
+                    continue
+                while len(batch) < _RECEIVE_BATCH_DATAGRAMS:
+                    try:
+                        datagram, _source = udp_socket.recvfrom(self._max_datagram_size)
+                    except BlockingIOError:
+                        break
+                    batch.append(datagram)
+            except OSError as exc:
+                with self._lock:
+                    if self._stopping:
+                        return
+                self.fail(exc)
+                return
+            if batch:
+                self._enqueue_datagrams(batch, time.time_ns())
+
+    def _receive_loop_single(self) -> None:
+        assert self._socket is not None
         while True:
             with self._lock:
                 if self._stopping:
@@ -534,7 +637,7 @@ class H264RtpReceiver:
                 if self._stopping:
                     return
             try:
-                self.process_pending()
+                self._process_pending_batch()
             except Exception as exc:
                 self.fail(exc)
                 return
@@ -572,9 +675,9 @@ class H264RtpReceiver:
         previous = getattr(self, "_last_transit_ns", None)
         self._last_transit_ns = transit_ns
         if previous is None:
-            return self._metrics.jitter_ns
+            return self._jitter_ns
         delta = abs(transit_ns - previous)
-        return round(self._metrics.jitter_ns + (delta - self._metrics.jitter_ns) / 16)
+        return round(self._jitter_ns + (delta - self._jitter_ns) / 16)
 
 
 __all__ = [

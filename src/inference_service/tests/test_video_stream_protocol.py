@@ -35,9 +35,10 @@ from inference_service.distributed.ros_protocol import (
 
 
 def test_protocol_version_is_bumped_for_video_stream_contract():
-    # v6 adds the result-level execution_horizon to the distributed wire
-    # contract; the video stream transport shares the same protocol version.
-    assert PROTOCOL_VERSION == 6
+    # v7 stacks the aligned request history along a K axis and adds the
+    # descriptor packetization mode; the video stream transport shares the
+    # distributed protocol version.
+    assert PROTOCOL_VERSION == 7
 
 
 def test_video_descriptor_and_status_ros_messages_round_trip():
@@ -52,6 +53,7 @@ def test_video_descriptor_and_status_ros_messages_round_trip():
         lifecycle_state="ready",
         ready=True,
         selected_backend="software",
+        status_origin="sender",
         timestamp_mapping_valid=True,
         mapping_rtp_timestamp=90_000,
         mapping_capture_timestamp_ns=1_000_000_000,
@@ -70,6 +72,11 @@ def test_video_descriptor_and_status_ros_messages_round_trip():
     )
 
     assert video_descriptor_from_message(video_descriptor_to_message(descriptor)) == descriptor
+    access_unit_descriptor = replace(descriptor, packetization="access_unit")
+    assert (
+        video_descriptor_from_message(video_descriptor_to_message(access_unit_descriptor)).packetization
+        == "access_unit"
+    )
     assert video_status_from_message(video_status_to_message(status)) == status
 
 
@@ -88,6 +95,7 @@ def test_matching_rtp_negotiation_checks_both_fingerprints():
         ("contract_fingerprint", "wrong", "contract_fingerprint_mismatch"),
         ("deployment_fingerprint", "wrong", "deployment_fingerprint_mismatch"),
         ("stream_id", "wrong", "descriptor_mismatch"),
+        ("packetization", "access_unit", "descriptor_mismatch"),
     ],
 )
 def test_rtp_negotiation_rejects_descriptor_mismatch(field_name, value, code):

@@ -8,6 +8,7 @@ from dataclasses import dataclass, fields
 from types import MappingProxyType
 
 from inference_service.distributed.types import PROTOCOL_VERSION, StreamReference
+from observation_transport.rtp_sender import PACKETIZATION_MODES, PACKETIZATION_RFC6184
 
 
 class StreamNegotiationError(RuntimeError):
@@ -44,6 +45,7 @@ class VideoStreamDescriptor:
     encoder_backend: str
     contract_fingerprint: str
     deployment_fingerprint: str
+    packetization: str = PACKETIZATION_RFC6184
 
     def __post_init__(self) -> None:
         required = (
@@ -73,6 +75,8 @@ class VideoStreamDescriptor:
             raise ValueError("descriptor dimensions and RTP clock rate must be positive")
         if not math.isfinite(self.frame_rate_hz) or self.frame_rate_hz <= 0:
             raise ValueError("descriptor frame rate must be finite and positive")
+        if self.packetization not in PACKETIZATION_MODES:
+            raise ValueError("descriptor packetization must be rfc6184 or access_unit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +241,7 @@ class VideoStreamRequirement:
     pixel_format: str = "nv12"
     color_space: str = "bt709"
     color_range: str = "limited"
+    packetization: str = PACKETIZATION_RFC6184
 
     def __post_init__(self) -> None:
         if any(
@@ -401,6 +406,7 @@ def negotiate_video_streams(
             (descriptor.pixel_format == required.pixel_format, "descriptor_mismatch", "pixel_format"),
             (descriptor.color_space == required.color_space, "descriptor_mismatch", "color_space"),
             (descriptor.color_range == required.color_range, "descriptor_mismatch", "color_range"),
+            (descriptor.packetization == required.packetization, "descriptor_mismatch", "packetization"),
             (
                 required.encoder_backend == "auto" or descriptor.encoder_backend == required.encoder_backend,
                 "descriptor_mismatch",

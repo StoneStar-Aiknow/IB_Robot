@@ -22,6 +22,7 @@ from inference_service.video_rtp import (
     packetize_h264,
     split_annex_b,
 )
+from observation_transport.rtp_sender import PACKETIZATION_ACCESS_UNIT, packetize_h264_datagrams
 from robot_config.contract_utils import StreamBuffer
 
 pytest.importorskip("av")
@@ -636,6 +637,78 @@ def test_recording_packet_loss_injection_applies_integrity_policy(tmp_path, inte
     receiver.close()
 
 
+def test_access_unit_packetization_sends_one_datagram_per_access_unit():
+    small = b"\x67" + b"s" * 8
+    large = b"\x65" + bytes(range(256)) * 40
+    access_unit = EncodedPacket(b"\x00\x00\x00\x01" + small + b"\x00\x00\x01" + large, 90_000, 1, keyframe=True)
+
+    datagrams, next_sequence = packetize_h264_datagrams(
+        access_unit,
+        ssrc=_SSRC,
+        payload_type=96,
+        sequence=65535,
+        max_payload_size=1188,
+        packetization=PACKETIZATION_ACCESS_UNIT,
+    )
+
+    assert len(datagrams) == 1
+    assert next_sequence == 0
+    packet = RtpPacket.from_bytes(datagrams[0])
+    assert packet.marker is True
+    assert packet.payload == access_unit.payload
+    reconstructed, lost = H264Depacketizer().push(packet)
+    assert lost == 0
+    assert reconstructed is not None
+    assert reconstructed.payload == access_unit.payload
+    assert (reconstructed.has_sps, reconstructed.has_pps, reconstructed.keyframe) == (True, False, True)
+
+
+def test_access_unit_packetization_falls_back_to_fu_a_beyond_one_udp_datagram():
+    access_unit = EncodedPacket(b"\x00\x00\x00\x01\x65" + bytes(70_000), 90, 1, keyframe=True)
+
+    datagrams, _ = packetize_h264_datagrams(
+        access_unit,
+        ssrc=_SSRC,
+        payload_type=96,
+        sequence=0,
+        max_payload_size=1388,
+        packetization=PACKETIZATION_ACCESS_UNIT,
+    )
+
+    assert len(datagrams) > 1
+    assert max(len(item) for item in datagrams) <= 1400
+    depacketizer = H264Depacketizer()
+    outputs = [depacketizer.push(RtpPacket.from_bytes(item))[0] for item in datagrams]
+    assert outputs[-1] is not None
+    assert outputs[-1].payload == access_unit.payload
+
+
+def test_depacketizer_rejects_an_access_unit_datagram_inside_a_fragmented_access_unit():
+    depacketizer = H264Depacketizer()
+    fragment = RtpPacket(96, False, 1, 90, _SSRC, bytes((0x7C, 0x85)) + b"x" * 10)
+    whole = RtpPacket(96, True, 2, 90, _SSRC, b"\x00\x00\x00\x01\x41body")
+
+    assert depacketizer.push(fragment) == (None, 0)
+    assert depacketizer.push(whole) == (None, 0)
+
+
+def test_software_stream_decodes_through_access_unit_packetization():
+    datagrams, encoder, sender = _encoded_stream(frame_count=5, gop_frames=2, packetization=PACKETIZATION_ACCESS_UNIT)
+    receiver, buffer = _receiver()
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    decoded = _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert len(datagrams) == 5
+    assert len(decoded) == 5
+    assert receiver.status.metrics.received_packets == 5
+    assert receiver.status.state is StreamLifecycleState.READY
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
 def test_receiver_reports_every_lifecycle_transition_to_its_listener():
     transitions = []
     datagrams, encoder, sender = _encoded_stream(frame_count=3, gop_frames=2)
@@ -665,6 +738,59 @@ def test_receiver_reports_every_lifecycle_transition_to_its_listener():
     encoder.close()
     sender.close()
     receiver.close()
+
+
+@pytest.mark.parametrize("packetization", ["rfc6184", PACKETIZATION_ACCESS_UNIT])
+def test_local_udp_threads_deliver_bursts_without_waiting_for_the_poll_timeout(packetization):
+    udp_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_receiver.bind(("127.0.0.1", 0))
+    endpoint = udp_receiver.getsockname()
+    buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000, retention_ns=2_000_000_000)
+    mapper = RtpTimestampMapper(2_000_000_000, observation_key="observation.images.top", stream_id="top")
+    receiver = H264RtpReceiver(
+        stream_id="top",
+        observation_key="observation.images.top",
+        ssrc=_SSRC,
+        decoder=SoftwareH264Decoder(),
+        frame_buffer=buffer,
+        timestamp_mapper=mapper,
+        session_generation=1,
+        packet_queue_capacity=256,
+        endpoint=endpoint,
+        datagram_receiver=udp_receiver,
+    )
+    # A small datagram budget forces multi-packet RFC 6184 bursts.
+    sender = H264RtpSender(
+        stream_id="top",
+        endpoint=endpoint,
+        ssrc=_SSRC,
+        queue_capacity=4,
+        max_datagram_size=200,
+        packetization=packetization,
+    )
+    encoder = _encoder(gop_frames=2)
+    receiver.start()
+    sender.start()
+    mapper.update(90_000, 1_000_000_000, time.time_ns(), session_generation=1)
+
+    started = time.monotonic()
+    for index in range(4):
+        capture_ns = 1_000_000_000 + index * 50_000_000
+        image = np.random.default_rng(index).integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        for access_unit in encoder.encode(VideoFrame(image, capture_ns, capture_ns, 64, 48, "rgb24")):
+            sender.enqueue(access_unit)
+    deadline = started + 2.0
+    while len(buffer) < 3 and time.monotonic() < deadline:
+        time.sleep(0.002)
+    elapsed_s = time.monotonic() - started
+
+    assert len(buffer) >= 3
+    assert elapsed_s < 0.1, f"burst delivery took {elapsed_s * 1000:.0f} ms"
+    assert receiver.status.metrics.lost_packets == 0
+    encoder.close()
+    sender.close()
+    receiver.close()
+    assert receiver.status.state is StreamLifecycleState.STOPPED
 
 
 def test_local_udp_sender_receiver_threads_deliver_stream_and_stop_cleanly():
@@ -730,6 +856,7 @@ def _sender(
     *,
     queue_capacity: int,
     max_datagram_size: int = 1200,
+    packetization: str = "rfc6184",
 ) -> H264RtpSender:
     return H264RtpSender(
         stream_id="top",
@@ -739,6 +866,7 @@ def _sender(
         datagram_sender=datagram_sender,
         initial_sequence=10,
         max_datagram_size=max_datagram_size,
+        packetization=packetization,
     )
 
 
@@ -789,10 +917,11 @@ def _encoded_stream(
     frame_count: int,
     gop_frames: int,
     max_datagram_size: int = 1200,
+    packetization: str = "rfc6184",
 ) -> tuple[list[bytes], SoftwareH264Encoder, H264RtpSender]:
     encoder = _encoder(gop_frames=gop_frames)
     memory = _MemoryDatagramSender([])
-    sender = _sender(memory, queue_capacity=2, max_datagram_size=max_datagram_size)
+    sender = _sender(memory, queue_capacity=2, max_datagram_size=max_datagram_size, packetization=packetization)
     for index in range(frame_count):
         capture_ns = 1_000_000_000 + index * 50_000_000
         rng = np.random.default_rng(index)

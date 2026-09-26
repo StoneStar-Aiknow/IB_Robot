@@ -21,3 +21,6 @@ string color_range
 string encoder_backend
 string contract_fingerprint
 string deployment_fingerprint
+# RTP wire packetization: "rfc6184" (MTU-sized single NAL/FU-A datagrams) or
+# "access_unit" (one whole Annex-B access unit per IP-fragmented datagram).
+string packetization

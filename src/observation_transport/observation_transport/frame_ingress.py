@@ -276,6 +276,7 @@ class DirectFrameStreamConfig:
     raw_queue_frames: int | None = None
     queue_policy: QueuePolicy = "latest"
     optional: bool = False
+    packetization: str = "rfc6184"
 
     def __post_init__(self) -> None:
         if not self.observation_key or not self.stream_id or not self.endpoint_host:
@@ -296,6 +297,8 @@ class DirectFrameStreamConfig:
             raise ValueError("direct-frame raw queue capacity must be positive")
         if self.queue_policy not in {"strict", "latest"}:
             raise ValueError("direct-frame queue policy must be strict or latest")
+        if self.packetization not in {"rfc6184", "access_unit"}:
+            raise ValueError("direct-frame packetization must be rfc6184 or access_unit")
 
     @property
     def effective_raw_queue_frames(self) -> int:
@@ -326,6 +329,7 @@ class DirectFrameStreamDescriptor:
     encoder_backend: str
     contract_fingerprint: str
     deployment_fingerprint: str
+    packetization: str = "rfc6184"
 
 
 @dataclass(frozen=True, slots=True)

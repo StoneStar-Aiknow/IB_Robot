@@ -18,7 +18,9 @@ from inference_manifest import PolicyMetadata, ValidatedManifest
 # not wire-compatible across this boundary, so every edge/cloud deployment and
 # all three regenerated interfaces must move together; peers still on v5 are
 # rejected during the heartbeat identity handshake.
-PROTOCOL_VERSION = 6
+# v7: VideoStreamDescriptor adds the negotiated RTP ``packetization`` mode. The
+# ROS interface changes, so v6 peers are rejected the same way.
+PROTOCOL_VERSION = 7
 
 
 class UnsupportedDistributedRuntimeError(ValueError):

@@ -158,6 +158,7 @@ def test_transport_validation_rejects_duplicate_streams_and_endpoints():
         ("security", "srtp", "security"),
         ("codec", "hevc", "codec"),
         ("encoder_backend", "unknown", "backend"),
+        ("packetization", "rtp_over_tcp", "packetization"),
     ],
 )
 def test_transport_validation_rejects_unsupported_claims(field, value, expected):
@@ -236,6 +237,22 @@ def test_transport_and_image_semantics_change_contract_fingerprint():
     assert contract_fingerprint(base) != contract_fingerprint(changed_range)
     assert contract_fingerprint(base) != contract_fingerprint(changed_endpoint)
     assert contract_fingerprint(base) != contract_fingerprint(changed_image)
+
+
+def test_packetization_defaults_to_rfc6184_without_changing_existing_fingerprints():
+    base = _contract(_rtp_observation())
+    explicit_default = _rtp_observation()
+    explicit_default["transport"]["packetization"] = "rfc6184"
+    access_unit = _rtp_observation()
+    access_unit["transport"]["packetization"] = "access_unit"
+
+    assert base.observations[0].transport.packetization == "rfc6184"
+    assert "packetization" not in observation_transport_to_dict(base.observations[0].transport)
+    assert contract_fingerprint(base) == contract_fingerprint(_contract(explicit_default))
+    parsed = _contract(access_unit).observations[0].transport
+    assert parsed.packetization == "access_unit"
+    assert observation_transport_to_dict(parsed)["packetization"] == "access_unit"
+    assert contract_fingerprint(base) != contract_fingerprint(_contract(access_unit))
 
 
 def test_omitted_and_explicit_default_dds_have_equal_fingerprints():

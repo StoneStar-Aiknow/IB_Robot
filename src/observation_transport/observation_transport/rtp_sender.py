@@ -21,6 +21,16 @@ _RTP_VERSION = 2
 _RTP_HEADER = struct.Struct("!BBHII")
 _ANNEX_B_START = b"\x00\x00\x00\x01"
 _ANNEX_B_SHORT_START = b"\x00\x00\x01"
+# Largest UDP payload an IPv4 datagram can carry (65535 - 20 IP - 8 UDP).
+_MAX_UDP_PAYLOAD = 65_507
+
+# Wire packetization modes negotiated through the stream descriptor.
+# ``rfc6184`` keeps every datagram under the path MTU (single NAL / FU-A).
+# ``access_unit`` sends one whole Annex-B access unit per RTP datagram and lets
+# the IP layer fragment it; it is only meant for trusted, fragment-clean LANs.
+PACKETIZATION_RFC6184 = "rfc6184"
+PACKETIZATION_ACCESS_UNIT = "access_unit"
+PACKETIZATION_MODES = frozenset({PACKETIZATION_RFC6184, PACKETIZATION_ACCESS_UNIT})
 
 
 class StreamLifecycleState(str, Enum):
@@ -143,52 +153,108 @@ def packetize_h264(
     max_payload_size: int,
 ) -> tuple[list[RtpPacket], int]:
     """Packetize one Annex-B access unit using single NAL or FU-A packets."""
+    datagrams, next_sequence = packetize_h264_datagrams(
+        access_unit,
+        ssrc=ssrc,
+        payload_type=payload_type,
+        sequence=sequence,
+        max_payload_size=max_payload_size,
+    )
+    return [RtpPacket.from_bytes(datagram) for datagram in datagrams], next_sequence
+
+
+def packetize_h264_datagrams(
+    access_unit: EncodedPacket,
+    *,
+    ssrc: int,
+    payload_type: int,
+    sequence: int,
+    max_payload_size: int,
+    packetization: str = PACKETIZATION_RFC6184,
+) -> tuple[list[bytes], int]:
+    """Build the RTP datagrams for one Annex-B access unit.
+
+    This is the sender hot path: it emits wire bytes directly instead of one
+    validated ``RtpPacket`` object per datagram, whose construction dominated
+    the per-frame send cost on the edge board. In ``access_unit`` mode the
+    whole access unit travels in one datagram with its start codes intact; an
+    access unit too large for one UDP datagram falls back to RFC 6184.
+    """
     if max_payload_size < 3:
         raise ValueError("max_payload_size must leave room for FU-A headers")
-    nal_units = split_annex_b(access_unit.payload)
-    if not nal_units:
+    if packetization not in PACKETIZATION_MODES:
+        raise ValueError(f"unsupported RTP packetization {packetization!r}")
+    if not 0 <= payload_type <= 127:
+        raise ValueError("RTP payload type must fit in 7 bits")
+    timestamp = access_unit.rtp_timestamp
+    payload = access_unit.payload
+    if (
+        packetization == PACKETIZATION_ACCESS_UNIT
+        and payload
+        and _RTP_HEADER.size + len(payload) <= _MAX_UDP_PAYLOAD
+        and _annex_b_start_length(payload)
+    ):
+        header = _RTP_HEADER.pack(0x80, payload_type | 0x80, sequence, timestamp, ssrc)
+        return [header + payload], (sequence + 1) & 0xFFFF
+    nal_units = split_annex_b(payload)
+    if not any(nal_units):
         raise ValueError("H.264 access unit contains no NAL units")
-    packets: list[RtpPacket] = []
+    datagrams: list[bytes] = []
     current_sequence = sequence
+    last_index = max(index for index, nal in enumerate(nal_units) if nal)
+    marker_type = payload_type | 0x80
+    chunk_size = max_payload_size - 2
     for nal_index, nal in enumerate(nal_units):
         if not nal:
             continue
-        is_last_nal = nal_index == len(nal_units) - 1
+        is_last_nal = nal_index == last_index
         if len(nal) <= max_payload_size:
-            packets.append(
-                RtpPacket(
-                    payload_type,
-                    is_last_nal,
-                    current_sequence,
-                    access_unit.rtp_timestamp,
-                    ssrc,
-                    nal,
-                )
-            )
+            second = marker_type if is_last_nal else payload_type
+            datagrams.append(_RTP_HEADER.pack(0x80, second, current_sequence, timestamp, ssrc) + nal)
             current_sequence = (current_sequence + 1) & 0xFFFF
             continue
-        nal_header = nal[0]
-        fu_indicator = (nal_header & 0xE0) | 28
-        nal_type = nal_header & 0x1F
-        chunks = [nal[index : index + max_payload_size - 2] for index in range(1, len(nal), max_payload_size - 2)]
-        for chunk_index, chunk in enumerate(chunks):
+        view = memoryview(nal)
+        fu_indicator = (nal[0] & 0xE0) | 28
+        nal_type = nal[0] & 0x1F
+        for start in range(1, len(nal), chunk_size):
+            end = min(start + chunk_size, len(nal))
             fu_header = nal_type
-            if chunk_index == 0:
+            if start == 1:
                 fu_header |= 0x80
-            if chunk_index == len(chunks) - 1:
+            final = end == len(nal)
+            if final:
                 fu_header |= 0x40
-            packets.append(
-                RtpPacket(
-                    payload_type,
-                    is_last_nal and chunk_index == len(chunks) - 1,
-                    current_sequence,
-                    access_unit.rtp_timestamp,
-                    ssrc,
-                    bytes((fu_indicator, fu_header)) + chunk,
+            second = marker_type if is_last_nal and final else payload_type
+            datagrams.append(
+                b"".join(
+                    (
+                        _RTP_HEADER.pack(0x80, second, current_sequence, timestamp, ssrc),
+                        bytes((fu_indicator, fu_header)),
+                        view[start:end],
+                    )
                 )
             )
             current_sequence = (current_sequence + 1) & 0xFFFF
-    return packets, current_sequence
+    return datagrams, current_sequence
+
+
+def _annex_b_start_length(payload: bytes) -> int:
+    """Return the length of a leading Annex-B start code, or 0 when absent."""
+    if payload.startswith(_ANNEX_B_START):
+        return 4
+    if payload.startswith(_ANNEX_B_SHORT_START):
+        return 3
+    return 0
+
+
+def annex_b_nal_types(payload: bytes) -> frozenset[int]:
+    """Return the NAL unit types of an Annex-B buffer without copying NAL bodies."""
+    types = set()
+    index = payload.find(_ANNEX_B_SHORT_START)
+    while index != -1 and index + 3 < len(payload):
+        types.add(payload[index + 3] & 0x1F)
+        index = payload.find(_ANNEX_B_SHORT_START, index + 3)
+    return frozenset(types)
 
 
 def split_annex_b(payload: bytes) -> list[bytes]:
@@ -252,6 +318,21 @@ class H264Depacketizer:
         if self._timestamp is not None and packet.timestamp != self._timestamp:
             self._discard_access_unit()
         self._timestamp = packet.timestamp
+
+        if _annex_b_start_length(packet.payload):
+            # ``access_unit`` packetization: RFC 6184 never starts a payload
+            # with a zero byte (NAL type 0 is reserved), so a leading start
+            # code unambiguously marks one complete access unit. It must close
+            # the access unit on its own; anything else is a damaged stream.
+            complete = packet.marker and not self._nal_units and self._fragment is None and not self._damaged
+            self._discard_access_unit()
+            if not complete:
+                return None, lost_packets
+            nal_types = annex_b_nal_types(packet.payload)
+            return (
+                H264AccessUnit(packet.timestamp, packet.payload, 7 in nal_types, 8 in nal_types, 5 in nal_types),
+                lost_packets,
+            )
 
         nal_type = packet.payload[0] & 0x1F
         if 1 <= nal_type <= 23:
@@ -343,22 +424,26 @@ class H264RtpSender:
         ssrc: int,
         queue_capacity: int,
         payload_type: int = 96,
-        max_datagram_size: int = 1200,
+        max_datagram_size: int = 1400,
         selected_backend: str = "software",
         datagram_sender: DatagramSender | None = None,
         initial_sequence: int | None = None,
         on_sent: Callable[[EncodedPacket], None] | None = None,
         background_delivery: bool = True,
+        packetization: str = PACKETIZATION_RFC6184,
     ) -> None:
         if not stream_id or not endpoint[0] or not 1 <= endpoint[1] <= 65535:
             raise ValueError("RTP sender requires stream identity and a valid endpoint")
         if queue_capacity <= 0 or max_datagram_size <= _RTP_HEADER.size + 2:
             raise ValueError("RTP sender queue and datagram size must be positive")
+        if packetization not in PACKETIZATION_MODES:
+            raise ValueError(f"unsupported RTP packetization {packetization!r}")
         self.stream_id = stream_id
         self.endpoint = endpoint
         self.ssrc = ssrc
         self.payload_type = payload_type
         self.max_payload_size = max_datagram_size - _RTP_HEADER.size
+        self.packetization = packetization
         self.selected_backend = selected_backend
         self._queue_capacity = queue_capacity
         self._queue: deque[EncodedPacket] = deque()
@@ -366,6 +451,9 @@ class H264RtpSender:
         self._send_lock = threading.Lock()
         self._socket = datagram_sender or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if datagram_sender is None:
+            # Whole access units exceed the MTU by design. The default Linux
+            # UDP PMTU mode (IP_PMTUDISC_WANT) fragments them locally; only
+            # DO/PROBE would fail with EMSGSIZE, so no socket option is needed.
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         self._sequence = secrets.randbelow(1 << 16) if initial_sequence is None else initial_sequence
         self._on_sent = on_sent
@@ -459,15 +547,18 @@ class H264RtpSender:
                 epoch = self._epoch
                 self._metrics = replace(self._metrics, queued_frames=len(self._queue))
             try:
-                packets, self._sequence = packetize_h264(
+                datagrams, self._sequence = packetize_h264_datagrams(
                     access_unit,
                     ssrc=self.ssrc,
                     payload_type=self.payload_type,
                     sequence=self._sequence,
                     max_payload_size=self.max_payload_size,
+                    packetization=self.packetization,
                 )
-                for packet in packets:
-                    self._socket.sendto(packet.to_bytes(), self.endpoint)
+                sendto = self._socket.sendto
+                endpoint = self.endpoint
+                for datagram in datagrams:
+                    sendto(datagram, endpoint)
             except OSError as exc:
                 with self._condition:
                     self._state = StreamLifecycleState.FAILED
@@ -479,7 +570,7 @@ class H264RtpSender:
                 self._metrics = replace(
                     self._metrics,
                     sent_frames=self._metrics.sent_frames + 1,
-                    sent_packets=self._metrics.sent_packets + len(packets),
+                    sent_packets=self._metrics.sent_packets + len(datagrams),
                 )
             # Keep the epoch check inside the send lock so reset() cannot
             # rotate the session between the UDP send and this callback.
