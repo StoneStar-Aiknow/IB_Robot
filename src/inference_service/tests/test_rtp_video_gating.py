@@ -105,3 +105,44 @@ def test_rtp_video_gate_without_manager_fails_closed():
         PipelinePolicyNode._sample_observations(node, 1_000_000_000, rtp_video_keys={"observation.images.top"})
 
     assert error.value.details["observations"][0]["reason"] == "video_not_sent"
+
+
+@pytest.mark.parametrize("require_target", [False, True])
+def test_state_sampling_preserves_live_hold_but_benchmark_waits_for_current_state(require_target):
+    from ibrobot_msgs.msg import StampedFloat32MultiArray
+    from robot_config.contract_utils import StreamBuffer
+
+    node = _rtp_video_node({}, buffer_entry=None)
+    node._subs.clear()
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/state",
+        ros_type="ibrobot_msgs/msg/StampedFloat32MultiArray",
+        image_resize=None,
+        names=["joint"],
+    )
+    buffer = StreamBuffer("hold", 50_000_000, max_age_ns=1_000_000_000)
+    state = SimpleNamespace(spec=spec, buffer=buffer, step_ns=50_000_000)
+    node._subs[spec.key] = state
+    node._require_target_observation = require_target
+    node._buffer_for_state = PipelinePolicyNode._buffer_for_state
+    old = StampedFloat32MultiArray()
+    old.value.data = [1.0]
+    current = StampedFloat32MultiArray()
+    current.value.data = [2.0]
+    buffer.push(980_000_000, old, receive_time_ns=1_000_000_000)
+    if require_target:
+        with pytest.raises(ObservationNotReadyError):
+            PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+    else:
+        result = PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+        assert result["observation.state"][0] == 1.0
+    buffer.push(1_000_000_000, current, receive_time_ns=1_000_000_000)
+    result = PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+    assert result["observation.state"][0] == 2.0
+    if require_target:
+        # Later DDS updates must not replace the state already sampled for T.
+        buffer.push(1_020_000_000, old, receive_time_ns=1_020_000_000)
+        timestamps, history = PipelinePolicyNode._build_aligned_history(node, result, 1_000_000_000)
+        assert timestamps == (1_000_000_000,)
+        assert history[0]["observation.state"][0] == 2.0

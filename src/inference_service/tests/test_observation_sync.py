@@ -210,3 +210,16 @@ def _mapper(*, max_mapping_age_ns: int) -> RtpTimestampMapper:
         observation_key="observation.images.top",
         stream_id="top",
     )
+
+
+@pytest.mark.parametrize("late_key", ["image", "image2"])
+def test_target_observation_waits_for_late_camera_instead_of_using_old_pair(late_key):
+    streams = {key: _stream(key, key, 1000, key + " old") for key in ("image", "image2")}
+    other_key = "image2" if late_key == "image" else "image"
+    streams[other_key].buffer.push(1040, "current", receive_time_ns=1040)
+    with pytest.raises(ObservationSynchronizationError) as error:
+        select_synchronized_streams(streams, 1040, now_ns=1040, max_inter_camera_skew_ns=50, require_target=True)
+    assert error.value.recoverable
+    streams[late_key].buffer.push(1040, "current", receive_time_ns=1041)
+    selected = select_synchronized_streams(streams, 1040, now_ns=1041, max_inter_camera_skew_ns=50, require_target=True)
+    assert {item.capture_timestamp_ns for item in selected.values()} == {1040}

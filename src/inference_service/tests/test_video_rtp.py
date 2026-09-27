@@ -537,7 +537,7 @@ def test_receiver_reset_clears_buffer_mapping_and_readiness():
     receiver.close()
 
 
-def test_recording_only_receiver_writes_mapped_and_dropped_sidecar_entries(tmp_path):
+def test_recording_only_receiver_preserves_source_timestamps_without_mapping(tmp_path):
     recorder = H264StreamRecorder(integrity_mode="tolerant")
     recorder.start_episode(tmp_path, "observation.images.top")
     receiver, _ = _receiver(recorder=recorder, decode=False)
@@ -569,8 +569,8 @@ def test_recording_only_receiver_writes_mapped_and_dropped_sidecar_entries(tmp_p
     sidecar = tmp_path / "observation.images.top.h264.json"
     entries = [json.loads(line) for line in sidecar.read_text().splitlines()]
     assert entries[0]["capture_timestamp_ns"] == 1_000_000_000
-    assert entries[1]["capture_timestamp_ns"] is None
-    assert entries[1]["dropped"] == "timestamp_unmapped"
+    assert entries[1]["capture_timestamp_ns"] == 1_050_000_000
+    assert not entries[1].get("dropped")
     encoder.close()
     sender.close()
     receiver.close()
@@ -978,3 +978,114 @@ def test_recording_receiver_keeps_frame_index_monotonic_across_session_resets(tm
     assert indices == list(range(len(indices)))
     encoder.close()
     receiver.close()
+
+
+@pytest.mark.parametrize("packetization", ["rfc6184", "access_unit"])
+def test_source_timestamp_survives_codec_and_wire_without_mapping(packetization):
+    encoder = _encoder(gop_frames=1)
+    receiver, buffer = _receiver()
+    receiver.start()
+    timestamps = [1_039_999_877, 1_100_000_321]
+    try:
+        sequence = 1
+        for timestamp in timestamps:
+            frame = VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), timestamp, timestamp, 64, 48, "rgb24")
+            for encoded in encoder.encode(frame):
+                datagrams, sequence = packetize_h264_datagrams(
+                    encoded,
+                    ssrc=_SSRC,
+                    payload_type=96,
+                    sequence=sequence,
+                    max_payload_size=300,
+                    packetization=packetization,
+                )
+                _deliver(datagrams, receiver, start_receive_ns=timestamp + 100_000)
+        assert [entry[0] for entry in buffer.entries()] == timestamps
+        assert not receiver.timestamp_mapper.ready
+        assert receiver.status.ready
+    finally:
+        encoder.close()
+        receiver.close()
+
+
+def test_fragments_with_conflicting_source_timestamps_are_not_decoded():
+    from dataclasses import replace
+
+    encoded = EncodedPacket(b"\x00\x00\x00\x01\x65" + b"x" * 2000, 90000, 1_000_000_123)
+    packets, _ = packetize_h264(encoded, ssrc=_SSRC, payload_type=96, sequence=1, max_payload_size=300)
+    packets[1] = replace(packets[1], capture_timestamp_ns=1_000_000_124)
+    depacketizer = H264Depacketizer()
+    for packet in packets:
+        access_unit, _ = depacketizer.push(packet)
+        assert access_unit is None
+
+
+def test_receiver_rejects_missing_source_timestamp():
+    receiver, buffer = _receiver()
+    try:
+        receiver.start()
+        packet = RtpPacket(96, True, 1, 90000, _SSRC, b"\x65body")
+        assert receiver.process_datagram(packet.to_bytes(), receive_time_ns=1_000_000_000) == []
+        assert not buffer.entries()
+        assert receiver.status.last_error.startswith("capture_timestamp_missing:")
+    finally:
+        receiver.close()
+
+
+@pytest.mark.parametrize("payload_size", [40, 2000, 65484, 65485, 70000])
+@pytest.mark.parametrize("packetization", ["rfc6184", "access_unit"])
+def test_capture_extension_respects_mtu_and_whole_access_unit_boundary(payload_size, packetization):
+    encoded = EncodedPacket(b"\x00\x00\x00\x01\x65" + b"x" * (payload_size - 5), 0xFFFFFFFF, 1_790_000_000_123_456_789)
+    wire, _ = packetize_h264_datagrams(
+        encoded, ssrc=_SSRC, payload_type=96, sequence=65535, max_payload_size=1188, packetization=packetization
+    )
+    if packetization == "access_unit" and payload_size <= 65483:
+        assert len(wire) == 1 and len(wire[0]) <= 65507
+    else:
+        assert max(map(len, wire)) <= 1200
+    receiver = H264Depacketizer()
+    for data in wire:
+        packet = RtpPacket.from_bytes(data)
+        assert packet.capture_timestamp_ns == encoded.capture_timestamp_ns
+        output, lost = receiver.push(packet)
+        assert lost == 0
+    assert output.payload == encoded.payload
+    assert output.capture_timestamp_ns == encoded.capture_timestamp_ns
+
+
+def test_capture_extension_rejects_invalid_length_and_truncation():
+    import struct
+
+    packet = RtpPacket(96, True, 1, 90000, _SSRC, b"\x65body", 1_000_000_123)
+    wire = bytearray(packet.to_bytes())
+    struct.pack_into("!H", wire, 14, 1)
+    with pytest.raises(ValueError, match="capture timestamp extension"):
+        RtpPacket.from_bytes(bytes(wire))
+    with pytest.raises(ValueError, match="capture timestamp extension"):
+        RtpPacket.from_bytes(packet.to_bytes()[:20])
+
+
+def test_sequence_gap_does_not_label_intact_recovery_frame_as_dropped():
+    receiver, buffer = _receiver()
+    encoder = _encoder(gop_frames=1)
+    receiver.start()
+    try:
+        old_time, target = 1_000_000_123, 1_040_000_123
+        for sequence, stamp in [(1, old_time), (10, target)]:
+            image = VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), stamp, stamp, 64, 48, "rgb24")
+            for encoded in encoder.encode(image):
+                datagrams, _ = packetize_h264_datagrams(
+                    encoded,
+                    ssrc=_SSRC,
+                    payload_type=96,
+                    sequence=sequence,
+                    max_payload_size=1188,
+                    packetization="access_unit",
+                )
+                _deliver(datagrams, receiver, start_receive_ns=stamp + 1)
+        assert buffer.entries()[-1][0] == target
+        assert receiver.status.metrics.last_dropped_capture_timestamp_ns != target
+        assert receiver.status.ready
+    finally:
+        encoder.close()
+        receiver.close()

@@ -715,6 +715,11 @@ class PipelinePolicyNode(Node):
 
         robot_config = load_robot_config_dict(config_path)
         self._contract = build_contract_from_robot_config_dict(robot_config)
+        from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
+
+        self._require_target_observation = resolve_runtime_target(robot_config, "", None) is RuntimeTarget.BENCHMARK
+        if self._require_target_observation and self._n_obs_steps != 1:
+            raise ValueError("benchmark exact observations currently require n_obs_steps=1")
         self._frequency = float(self._contract.rate_hz)
 
         required_inputs = set(self._manifest.policy.input_features)
@@ -774,6 +779,19 @@ class PipelinePolicyNode(Node):
         return 0
 
     def _build_aligned_history(
+        self, observations: dict[str, object], sample_time: int
+    ) -> tuple[tuple[int, ...], tuple[dict[str, object], ...]]:
+        if getattr(self, "_require_target_observation", False):
+            values = {
+                key: value
+                for key, value in observations.items()
+                if self._subs.get(key) is not None and self._subs[key].spec.image_resize is None
+            }
+            return ((sample_time,), (values,)) if values else ((), ())
+        with self._observation_lock:
+            return self._build_aligned_history_locked(observations, sample_time)
+
+    def _build_aligned_history_locked(
         self, observations: dict[str, object], sample_time: int
     ) -> tuple[tuple[int, ...], tuple[dict[str, object], ...]]:
         """Collect timestamped history of small non-streamed observations.
@@ -1277,7 +1295,18 @@ class PipelinePolicyNode(Node):
                     if issue is not None:
                         issues.append(issue)
                     continue
-                if self._n_obs_steps == 1:
+                if getattr(self, "_require_target_observation", False):
+                    entry, issue = self._buffer_for_state(state).select_entry(sample_time_ns, now_ns=now_ns)
+                    if issue is None and entry[0] != sample_time_ns:
+                        issue = {
+                            "reason": "target_not_ready",
+                            "sample_timestamp_ns": sample_time_ns,
+                            "selected_timestamp_ns": entry[0],
+                        }
+                    if issue is not None:
+                        issue = {"key": state.spec.key, "topic": state.spec.topic, **issue}
+                    value = entry[2] if entry is not None else None
+                elif self._n_obs_steps == 1:
                     value, issue = self._sample_observation(state, sample_time_ns, now_ns)
                 else:
                     value, issue = self._sample_observation_history(state, sample_times_ns, now_ns)

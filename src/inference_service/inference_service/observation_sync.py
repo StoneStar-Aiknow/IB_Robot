@@ -190,6 +190,7 @@ def select_synchronized_streams(
     *,
     now_ns: int,
     max_inter_camera_skew_ns: int,
+    require_target: bool = False,
 ) -> dict[str, SelectedStreamValue]:
     """Select all required streams against one target or fail as one operation."""
     if max_inter_camera_skew_ns < 0:
@@ -197,6 +198,19 @@ def select_synchronized_streams(
     selected, issues = _select_stream_entries(streams, target_timestamp_ns, now_ns=now_ns)
     if issues:
         raise ObservationSynchronizationError(issues)
+    if require_target:
+        mismatched = [
+            _stream_issue(
+                streams[key],
+                "target_not_ready",
+                target_timestamp_ns=target_timestamp_ns,
+                selected_timestamp_ns=item.capture_timestamp_ns,
+            )
+            for key, item in selected.items()
+            if item.capture_timestamp_ns != target_timestamp_ns
+        ]
+        if mismatched:
+            raise ObservationSynchronizationError(mismatched)
     timestamps = [item.capture_timestamp_ns for item in selected.values()]
     if not timestamps or max(timestamps) - min(timestamps) <= max_inter_camera_skew_ns:
         return selected

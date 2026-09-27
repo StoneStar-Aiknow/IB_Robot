@@ -102,9 +102,16 @@ class PureInferenceNode(Node):
 
         startup_error = None
         stream_manager = None
+        require_target_observation = False
         try:
             if config.robot_config_path:
-                contract = build_contract_from_robot_config_dict(load_robot_config_dict(config.robot_config_path))
+                from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
+
+                robot_config = load_robot_config_dict(config.robot_config_path)
+                require_target_observation = resolve_runtime_target(robot_config, "", None) is RuntimeTarget.BENCHMARK
+                if require_target_observation and metadata.policy.n_obs_steps != 1:
+                    raise ValueError("benchmark exact observations currently require n_obs_steps=1")
+                contract = build_contract_from_robot_config_dict(robot_config)
                 required_inputs = set(metadata.policy.input_features)
                 observation_specs = tuple(
                     spec for spec in iter_specs(contract) if not spec.is_action and spec.key in required_inputs
@@ -118,6 +125,7 @@ class PureInferenceNode(Node):
                     observation_specs=observation_specs,
                     rate_hz=float(contract.rate_hz),
                     n_obs_steps=metadata.policy.n_obs_steps,
+                    require_target_observation=require_target_observation,
                 )
             validated = load_inference_manifest(config.model_path, config.deployment)
             runtime = CloudBackendRuntime(
@@ -139,6 +147,7 @@ class PureInferenceNode(Node):
             runtime,
             startup_error=startup_error,
             stream_manager=stream_manager,
+            require_target_observation=require_target_observation,
         )
         self._fingerprint = metadata.fingerprint
         self._result_pub = self.create_publisher(DistributedInferenceResult, config.result_topic, 10)

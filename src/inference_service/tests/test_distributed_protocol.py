@@ -1135,6 +1135,10 @@ def test_build_aligned_history_decodes_raw_ros_messages():
 
     spec = SimpleNamespace(key="observation.state", ros_type="sensor_msgs/msg/JointState", image_resize=None)
     host = SimpleNamespace(
+        _observation_lock=threading.RLock(),
+        _build_aligned_history_locked=lambda observations, stamp: PipelinePolicyNode._build_aligned_history_locked(
+            host, observations, stamp
+        ),
         _state_alignment_window_ns=2_000_000_000,
         _state_specs=[spec],
         _subs={"observation.state": SimpleNamespace(spec=spec, buffer=buffer)},
@@ -1159,6 +1163,10 @@ def test_build_aligned_history_falls_back_with_multiple_state_sources():
 
     spec = SimpleNamespace(key="observation.state", ros_type="sensor_msgs/msg/JointState", image_resize=None)
     host = SimpleNamespace(
+        _observation_lock=threading.RLock(),
+        _build_aligned_history_locked=lambda observations, stamp: PipelinePolicyNode._build_aligned_history_locked(
+            host, observations, stamp
+        ),
         _state_alignment_window_ns=2_000_000_000,
         _state_specs=[
             spec,
@@ -1200,3 +1208,30 @@ def test_distributed_session_guard_fails_fast_when_session_is_down():
     host._config = SimpleNamespace(execution_mode="monolithic")
     host._require_edge_session = lambda: (_ for _ in ()).throw(AssertionError("session must not be touched"))
     PipelinePolicyNode._ensure_distributed_session_ready(host)
+
+
+@pytest.mark.parametrize("history", [(), (1_020_000_000,)])
+def test_exact_state_alignment_requires_rebuilt_request_after_late_state(history):
+    old_inputs = {"observation.state": np.array([1.0])}
+    with pytest.raises(DistributedProtocolError) as error:
+        align_inputs_to_selection(
+            old_inputs,
+            aligned_timestamps_ns=history,
+            aligned_tensors=tuple(old_inputs for _ in history),
+            selected_capture_ns=1_040_000_000,
+            tolerance_ns=25_000_000,
+            require_exact=True,
+        )
+    assert error.value.error.code == "observation_not_ready"
+    assert error.value.error.recoverable
+    current = {"observation.state": np.array([2.0])}
+    result, delta = align_inputs_to_selection(
+        old_inputs,
+        aligned_timestamps_ns=(*history, 1_040_000_000),
+        aligned_tensors=(*tuple(old_inputs for _ in history), current),
+        selected_capture_ns=1_040_000_000,
+        tolerance_ns=25_000_000,
+        require_exact=True,
+    )
+    np.testing.assert_array_equal(result["observation.state"], current["observation.state"])
+    assert delta == 0

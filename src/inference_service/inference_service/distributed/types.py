@@ -12,6 +12,7 @@ from enum import IntEnum
 from types import MappingProxyType
 
 from inference_manifest import PolicyMetadata, ValidatedManifest
+from observation_transport.frame_ingress import DISTRIBUTED_PROTOCOL_VERSION
 
 # v6: DistributedInferenceResult, DispatchInfer and ScheduledDispatchInfer add
 # the result-level ``execution_horizon`` field. ROS interface definitions are
@@ -22,7 +23,9 @@ from inference_manifest import PolicyMetadata, ValidatedManifest
 # one K-axis stacked VariantsList instead of one VariantsList per entry, and
 # VideoStreamDescriptor adds the negotiated RTP ``packetization`` mode. Both
 # change the ROS interfaces, so v6 peers are rejected the same way.
-PROTOCOL_VERSION = 7
+# The v7 development contract also carries each original capture timestamp in
+# an RTP header extension. Pre-fix v7 deployments must update both peers together.
+PROTOCOL_VERSION = DISTRIBUTED_PROTOCOL_VERSION
 
 
 class UnsupportedDistributedRuntimeError(ValueError):

@@ -47,6 +47,7 @@ def align_inputs_to_selection(
     aligned_tensors: tuple[Mapping[str, object], ...],
     selected_capture_ns: int,
     tolerance_ns: int,
+    require_exact: bool = False,
 ) -> tuple[dict[str, object], int]:
     """Replace tick-anchored inputs with the history entry matching the capture.
 
@@ -57,6 +58,16 @@ def align_inputs_to_selection(
     consistent instant. No entry within tolerance is a hard failure: the
     dispatcher retries instead of silently pairing mismatched instants.
     """
+    if require_exact and (not aligned_timestamps_ns or selected_capture_ns not in aligned_timestamps_ns):
+        raise DistributedProtocolError(
+            StructuredError(
+                code="observation_not_ready",
+                message="request has no state history at the required image timestamp",
+                stage="observation_sync",
+                recoverable=True,
+                details={"target_timestamp_ns": selected_capture_ns},
+            )
+        )
     if not aligned_timestamps_ns or selected_capture_ns <= 0:
         return inputs, 0
     best_index = min(
@@ -93,6 +104,7 @@ class DistributedCloudService:
         stream_manager: _StreamManager | None = None,
         runtime_interface: str = "policy",
         runtime_model_type: str = "",
+        require_target_observation: bool = False,
     ) -> None:
         if runtime_interface != "policy":
             raise UnsupportedDistributedRuntimeError(runtime_interface, runtime_model_type)
@@ -114,6 +126,7 @@ class DistributedCloudService:
         if stream_manager is not None and stream_negotiator is not None:
             raise ValueError("provide stream_manager or stream_negotiator, not both")
         self.stream_manager = stream_manager
+        self._require_target_observation = require_target_observation
         self.stream_negotiator = stream_manager.negotiator if stream_manager is not None else stream_negotiator
         self.session = CloudSession(
             identity,
@@ -199,13 +212,16 @@ class DistributedCloudService:
                                 now_ns=time.time_ns(),
                             )
                         )
-                        if request.aligned_timestamps_ns:
+                        if request.aligned_timestamps_ns or (
+                            self._require_target_observation and request.stream_references
+                        ):
                             inputs, alignment_delta_ns = align_inputs_to_selection(
                                 inputs,
                                 aligned_timestamps_ns=request.aligned_timestamps_ns,
                                 aligned_tensors=request.aligned_tensors,
                                 selected_capture_ns=self.stream_manager.selection_anchor_ns(),
                                 tolerance_ns=self.stream_manager.state_alignment_tolerance_ns(),
+                                require_exact=self._require_target_observation,
                             )
                             self.stream_manager.record_state_alignment(alignment_delta_ns)
                     stream_assembly_end_monotonic_ns = time.monotonic_ns()

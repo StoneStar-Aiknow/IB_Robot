@@ -14,6 +14,10 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
+# Shared by generic/managed frame producers and the distributed inference protocol.
+# Keep the wire version below inference_service so producers do not import it.
+DISTRIBUTED_PROTOCOL_VERSION = 7
+
 QueuePolicy = Literal["strict", "latest"]
 
 
@@ -412,7 +416,7 @@ def create_frame_ingress(
     codec_registry: Any | None = None,
     sender_factory: Callable[..., Any] | None = None,
     on_control_update: Callable[[], None] | None = None,
-    protocol_version: int = 5,
+    protocol_version: int = DISTRIBUTED_PROTOCOL_VERSION,
 ) -> FrameIngress:
     """Create the single native production ingress without exposing internals."""
 

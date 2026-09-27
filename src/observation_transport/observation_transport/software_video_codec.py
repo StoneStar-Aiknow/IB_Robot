@@ -248,7 +248,7 @@ class SoftwareH264Decoder(VideoDecoder):
             av_packet.time_base = _RTP_TIME_BASE
             self._capture_timestamps[packet.rtp_timestamp] = packet.capture_timestamp_ns
             decoded = self._codec.decode(av_packet)
-            frames = [self._convert_frame(frame, packet.capture_timestamp_ns) for frame in decoded]
+            frames = [self._convert_frame(frame) for frame in decoded]
         except Exception as exc:
             self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
             raise VideoCodecError("decode_failed", str(exc), backend="software", recoverable=True) from exc
@@ -283,9 +283,13 @@ class SoftwareH264Decoder(VideoDecoder):
         codec.open()
         return codec
 
-    def _convert_frame(self, frame: Any, fallback_capture_timestamp_ns: int) -> VideoFrame:
+    def _convert_frame(self, frame: Any) -> VideoFrame:
         rtp_timestamp = int(frame.pts) if frame.pts is not None else None
-        capture_timestamp_ns = self._capture_timestamps.pop(rtp_timestamp, fallback_capture_timestamp_ns)
+        if rtp_timestamp not in self._capture_timestamps:
+            raise VideoCodecError(
+                "timestamp_unmapped", "decoded frame has no matching input timestamp", backend="software"
+            )
+        capture_timestamp_ns = self._capture_timestamps.pop(rtp_timestamp)
         array = frame.to_ndarray(format=self._output_pixel_format)
         if self._expected_size is not None and (frame.width, frame.height) != self._expected_size:
             raise VideoCodecError(

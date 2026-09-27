@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from observation_transport.frame_ingress import (
+    DISTRIBUTED_PROTOCOL_VERSION,
     DirectFrameStreamConfig,
     DirectFrameStreamDescriptor,
     DirectFrameStreamStatus,
@@ -108,7 +109,7 @@ class NativeFrameIngress:
         codec_registry: VideoCodecRegistry | None = None,
         sender_factory: Callable[..., Any] = H264RtpSender,
         on_control_update: Callable[[], None] | None = None,
-        protocol_version: int = 5,
+        protocol_version: int = DISTRIBUTED_PROTOCOL_VERSION,
     ) -> None:
         if not pipeline_id or not contract_fingerprint or not deployment_fingerprint:
             raise ValueError("frame ingress requires pipeline and fingerprint identity")

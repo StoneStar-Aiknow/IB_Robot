@@ -127,7 +127,7 @@ def _descriptor(spec, session_id="session", generation=1, ssrc=123):
     )
 
 
-def _manager(specs, *, n_obs_steps=1):
+def _manager(specs, *, n_obs_steps=1, require_target=False):
     registry = VideoCodecRegistry()
     registry.register(
         "software",
@@ -151,6 +151,7 @@ def _manager(specs, *, n_obs_steps=1):
         observation_specs=specs,
         rate_hz=30.0,
         n_obs_steps=n_obs_steps,
+        require_target_observation=require_target,
         codec_registry=registry,
         receiver_factory=receiver_factory,
     )
@@ -359,7 +360,7 @@ def test_compute_stream_manager_pads_multi_step_history_from_first_keyframe():
     np.testing.assert_array_equal(inputs[spec.key][0, 0], inputs[spec.key][0, 2])
 
 
-def test_compute_stream_diagnostic_snapshots_are_sorted_and_require_mapping_for_readiness():
+def test_compute_stream_diagnostic_snapshots_use_receiver_readiness_without_mapping():
     top = _spec()
     wrist = _spec("observation.images.wrist", "wrist", 5006)
     manager, receivers = _manager((wrist, top))
@@ -376,11 +377,11 @@ def test_compute_stream_diagnostic_snapshots_are_sorted_and_require_mapping_for_
     assert not manager.observe_descriptor(top_descriptor)
     assert manager.observe_descriptor(wrist_descriptor)
     assert all(receiver.started for receiver in receivers)
-    assert not any(snapshot.ready for snapshot in manager.diagnostic_snapshots())
+    assert all(snapshot.ready for snapshot in manager.diagnostic_snapshots())
 
     manager.observe_status(_status(top_descriptor, 1_000_000_000), receive_time_ns=1_000_000_000)
     readiness = {snapshot.observation_key: snapshot.ready for snapshot in manager.diagnostic_snapshots()}
-    assert readiness == {top.key: True, wrist.key: False}
+    assert readiness == {top.key: True, wrist.key: True}
 
 
 def test_compute_stream_status_reports_receiver_metrics():
@@ -419,3 +420,69 @@ def test_compute_stream_manager_signals_readiness_changes_to_its_status_listener
     # One receiver lifecycle transition plus the first timestamp mapping; a
     # refreshed mapping does not change readiness and stays silent.
     assert notifications == ["changed", "changed"]
+
+
+@pytest.mark.parametrize("late_input", ["state", "top", "wrist"])
+def test_benchmark_cloud_waits_before_infer_and_accepts_refreshed_request(late_input):
+    import time
+
+    from inference_service.distributed import DistributedCloudService, EdgeSession, Operation, StreamReference
+    from inference_service.distributed.ros_protocol import request_from_message, request_to_message
+    from tests.test_observation_video_integration import _identity, _Runtime
+
+    specs = (_spec(), _spec("observation.images.wrist", "wrist", 5006))
+    manager, receivers = _manager(specs, require_target=True)
+    runtime = _Runtime()
+    identity = _identity()
+    cloud = DistributedCloudService(identity, runtime, stream_manager=manager, require_target_observation=True)
+    edge = EdgeSession(identity)
+    edge.start()
+    status = cloud.observe_edge(edge.local_status())
+    edge.observe_cloud(status)
+    for index, spec in enumerate(specs):
+        manager.observe_descriptor(_descriptor(spec, status.session_id, status.session_generation, ssrc=123 + index))
+    target = time.time_ns()
+    old = target - 20_000_000
+
+    def push(receiver, stamp):
+        frame = VideoFrame(np.zeros((2, 4, 3), dtype=np.uint8), stamp, target, 4, 2, "rgb24")
+        receiver.options["frame_buffer"].push(stamp, frame, receive_time_ns=target)
+
+    for spec, receiver in zip(specs, receivers, strict=True):
+        push(receiver, old)
+        if spec.transport.stream_id != late_input:
+            push(receiver, target)
+    old_state = {"observation.state": np.array([1.0], dtype=np.float32)}
+    new_state = {"observation.state": np.array([2.0], dtype=np.float32)}
+    refs = tuple(StreamReference(spec.key, spec.transport.stream_id) for spec in specs)
+
+    def request(request_id, complete):
+        base = edge.prepare_request(
+            Operation.INFER,
+            request_id,
+            inputs=new_state,
+            observation_timestamp_ns=target,
+            stream_references=refs,
+        )
+        return replace(
+            base,
+            aligned_timestamps_ns=(old, target) if complete else (old,),
+            aligned_tensors=(old_state, new_state) if complete else (old_state,),
+        )
+
+    try:
+        first = request_from_message(request_to_message(request("first", late_input != "state")))
+        result = cloud.handle(first)
+        assert not result.success and result.error.code == "observation_not_ready"
+        assert result.error.recoverable
+        assert runtime.inputs is None  # A failed readiness check must not mutate the policy.
+        for receiver in receivers:
+            push(receiver, target)
+        second = request_from_message(request_to_message(request("retry", True)))
+        result = cloud.handle(second)
+        assert result.success
+        np.testing.assert_array_equal(runtime.inputs["observation.state"], new_state["observation.state"])
+        assert {row[1] for row in manager.selection_diagnostics()} == {target}
+        assert manager.state_alignment_delta_ns() == 0
+    finally:
+        cloud.close()

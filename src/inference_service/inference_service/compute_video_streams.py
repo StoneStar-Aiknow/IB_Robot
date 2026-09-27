@@ -68,6 +68,7 @@ class ComputeVideoStreamManager:
         observation_specs: Iterable[SpecView],
         rate_hz: float,
         n_obs_steps: int = 1,
+        require_target_observation: bool = False,
         codec_registry: VideoCodecRegistry | None = None,
         receiver_factory=H264RtpReceiver,
         recording_coordinator: VideoRecordingCoordinator | None = None,
@@ -89,6 +90,7 @@ class ComputeVideoStreamManager:
         self._last_state_alignment_delta_ns: int | None = None
         self._receiver_start_lock = threading.Lock()
         self._status_listener: Callable[[], None] | None = None
+        self._require_target_observation = require_target_observation
         self._specs: dict[str, tuple[SpecView, ObservationTransportSpec]] = {}
         for spec in observation_specs:
             transport = effective_observation_transport(spec.transport)
@@ -156,7 +158,7 @@ class ComputeVideoStreamManager:
                 else:
                     receiver_status = stream.receiver.status
                     lifecycle_state = receiver_status.state.value
-                    ready = receiver_status.ready and stream.mapper.ready
+                    ready = receiver_status.ready
                 snapshots.append(
                     VideoStreamDiagnosticSnapshot(
                         observation_key=observation_key,
@@ -193,7 +195,7 @@ class ComputeVideoStreamManager:
                     observation_key=stream.spec.key,
                     stream_id=stream.descriptor.stream_id,
                     lifecycle_state=receiver_status.state.value,
-                    ready=receiver_status.ready and stream.mapper.ready,
+                    ready=receiver_status.ready,
                     selected_backend=receiver_status.selected_backend,
                     status_origin="receiver",
                     timestamp_mapping_valid=bool(sender_status and sender_status.timestamp_mapping_valid),
@@ -346,6 +348,7 @@ class ComputeVideoStreamManager:
                 timestamp_ns,
                 now_ns=current_time_ns,
                 max_inter_camera_skew_ns=max_skew_ns,
+                require_target=self._require_target_observation,
             )
             for observation_key, item in selected.items():
                 stream = self._streams[observation_key]
@@ -465,13 +468,11 @@ class ComputeVideoStreamManager:
                     key,
                     stream.descriptor.stream_id,
                     stream.buffer,
-                    timestamp_mapping_ready=stream.mapper.ready,
+                    timestamp_mapping_ready=True,
                     keyframe_ready=stream.receiver.status.ready,
                     pad_before_first=self.n_obs_steps > 1,
-                    # A 90 kHz RTP timestamp quantizes capture time to about
-                    # 11.1 us. Accept only that tiny future offset so a shared
-                    # multi-camera reset frame cannot split across epochs.
-                    future_tolerance_ns=(1_000_000_000 + 90_000 - 1) // 90_000,
+                    # Source timestamps are now transmitted exactly; no RTP quantization tolerance.
+                    future_tolerance_ns=0,
                     session_generation=stream.descriptor.session_generation,
                     last_dropped_capture_timestamp_ns=max(
                         stream.sender_status.last_dropped_capture_timestamp_ns if stream.sender_status else 0,

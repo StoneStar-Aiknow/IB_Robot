@@ -19,6 +19,10 @@ from observation_transport.video_codec import EncodedPacket
 
 _RTP_VERSION = 2
 _RTP_HEADER = struct.Struct("!BBHII")
+# IB-Robot v7 wire contract: private RTP extension profile, two 32-bit words
+# containing the original unsigned capture timestamp in nanoseconds.
+_CAPTURE_EXTENSION_PROFILE = 0x4942
+_CAPTURE_EXTENSION = struct.Struct("!HHQ")
 _ANNEX_B_START = b"\x00\x00\x00\x01"
 _ANNEX_B_SHORT_START = b"\x00\x00\x01"
 # Largest UDP payload an IPv4 datagram can carry (65535 - 20 IP - 8 UDP).
@@ -102,6 +106,7 @@ class RtpPacket:
     timestamp: int
     ssrc: int
     payload: bytes
+    capture_timestamp_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not 0 <= self.payload_type <= 127:
@@ -112,10 +117,21 @@ class RtpPacket:
             raise ValueError("RTP timestamp and SSRC must fit in uint32")
         if not self.payload:
             raise ValueError("RTP payload cannot be empty")
+        if self.capture_timestamp_ns is not None and not 0 <= self.capture_timestamp_ns < 1 << 64:
+            raise ValueError("capture timestamp must fit in uint64")
 
     def to_bytes(self) -> bytes:
         second = self.payload_type | (0x80 if self.marker else 0)
-        return _RTP_HEADER.pack(0x80, second, self.sequence, self.timestamp, self.ssrc) + self.payload
+        extension = (
+            _CAPTURE_EXTENSION.pack(_CAPTURE_EXTENSION_PROFILE, 2, self.capture_timestamp_ns)
+            if self.capture_timestamp_ns is not None
+            else b""
+        )
+        return (
+            _RTP_HEADER.pack(0x90 if extension else 0x80, second, self.sequence, self.timestamp, self.ssrc)
+            + extension
+            + self.payload
+        )
 
     @classmethod
     def from_bytes(cls, data: bytes) -> RtpPacket:
@@ -128,10 +144,15 @@ class RtpPacket:
         offset = _RTP_HEADER.size + csrc_count * 4
         if len(data) < offset:
             raise ValueError("truncated RTP CSRC list")
+        capture_timestamp_ns = None
         if first & 0x10:
             if len(data) < offset + 4:
                 raise ValueError("truncated RTP extension header")
-            extension_words = struct.unpack_from("!H", data, offset + 2)[0]
+            profile, extension_words = struct.unpack_from("!HH", data, offset)
+            if profile == _CAPTURE_EXTENSION_PROFILE:
+                if extension_words != 2 or len(data) < offset + _CAPTURE_EXTENSION.size:
+                    raise ValueError("invalid capture timestamp extension")
+                capture_timestamp_ns = struct.unpack_from("!Q", data, offset + 4)[0]
             offset += 4 + extension_words * 4
             if len(data) < offset:
                 raise ValueError("truncated RTP extension payload")
@@ -141,7 +162,9 @@ class RtpPacket:
             if padding == 0 or padding > end - offset:
                 raise ValueError("invalid RTP padding")
             end -= padding
-        return cls(second & 0x7F, bool(second & 0x80), sequence, timestamp, ssrc, data[offset:end])
+        return cls(
+            second & 0x7F, bool(second & 0x80), sequence, timestamp, ssrc, data[offset:end], capture_timestamp_ns
+        )
 
 
 def packetize_h264(
@@ -187,14 +210,21 @@ def packetize_h264_datagrams(
     if not 0 <= payload_type <= 127:
         raise ValueError("RTP payload type must fit in 7 bits")
     timestamp = access_unit.rtp_timestamp
+    if not 0 <= access_unit.capture_timestamp_ns < 1 << 64:
+        raise ValueError("capture timestamp must fit in uint64")
+    extension = _CAPTURE_EXTENSION.pack(_CAPTURE_EXTENSION_PROFILE, 2, access_unit.capture_timestamp_ns)
+    # Preserve the previous datagram size budget when adding metadata.
+    max_payload_size -= len(extension)
+    if max_payload_size < 3:
+        raise ValueError("RTP payload budget must leave room for capture metadata and FU-A")
     payload = access_unit.payload
     if (
         packetization == PACKETIZATION_ACCESS_UNIT
         and payload
-        and _RTP_HEADER.size + len(payload) <= _MAX_UDP_PAYLOAD
+        and _RTP_HEADER.size + len(extension) + len(payload) <= _MAX_UDP_PAYLOAD
         and _annex_b_start_length(payload)
     ):
-        header = _RTP_HEADER.pack(0x80, payload_type | 0x80, sequence, timestamp, ssrc)
+        header = _RTP_HEADER.pack(0x90, payload_type | 0x80, sequence, timestamp, ssrc) + extension
         return [header + payload], (sequence + 1) & 0xFFFF
     nal_units = split_annex_b(payload)
     if not any(nal_units):
@@ -210,7 +240,7 @@ def packetize_h264_datagrams(
         is_last_nal = nal_index == last_index
         if len(nal) <= max_payload_size:
             second = marker_type if is_last_nal else payload_type
-            datagrams.append(_RTP_HEADER.pack(0x80, second, current_sequence, timestamp, ssrc) + nal)
+            datagrams.append(_RTP_HEADER.pack(0x90, second, current_sequence, timestamp, ssrc) + extension + nal)
             current_sequence = (current_sequence + 1) & 0xFFFF
             continue
         view = memoryview(nal)
@@ -228,7 +258,8 @@ def packetize_h264_datagrams(
             datagrams.append(
                 b"".join(
                     (
-                        _RTP_HEADER.pack(0x80, second, current_sequence, timestamp, ssrc),
+                        _RTP_HEADER.pack(0x90, second, current_sequence, timestamp, ssrc),
+                        extension,
                         bytes((fu_indicator, fu_header)),
                         view[start:end],
                     )
@@ -287,6 +318,7 @@ class H264AccessUnit:
     has_sps: bool
     has_pps: bool
     keyframe: bool
+    capture_timestamp_ns: int | None = None
 
 
 class H264Depacketizer:
@@ -296,16 +328,19 @@ class H264Depacketizer:
     def reset(self) -> None:
         self._expected_sequence: int | None = None
         self._timestamp: int | None = None
+        self._capture_timestamp_ns: int | None = None
         self._nal_units: list[bytes] = []
         self._fragment: bytearray | None = None
         self._damaged = False
         self.last_reordered = False
         self.last_sequence_gap = False
+        self.last_dropped_capture_timestamp_ns = 0
 
     def push(self, packet: RtpPacket) -> tuple[H264AccessUnit | None, int]:
         lost_packets = 0
         self.last_reordered = False
         self.last_sequence_gap = False
+        self.last_dropped_capture_timestamp_ns = 0
         if self._expected_sequence is not None and packet.sequence != self._expected_sequence:
             delta = (packet.sequence - self._expected_sequence) & 0xFFFF
             if delta >= 0x8000 and self._timestamp is not None and packet.timestamp <= self._timestamp:
@@ -313,10 +348,15 @@ class H264Depacketizer:
                 return None, 0
             lost_packets = delta
             self.last_sequence_gap = True
+            self.last_dropped_capture_timestamp_ns = self._capture_timestamp_ns or 0
             self._discard_access_unit()
         self._expected_sequence = (packet.sequence + 1) & 0xFFFF
         if self._timestamp is not None and packet.timestamp != self._timestamp:
             self._discard_access_unit()
+        if self._timestamp is None:
+            self._capture_timestamp_ns = packet.capture_timestamp_ns
+        elif self._capture_timestamp_ns != packet.capture_timestamp_ns:
+            self._damaged = True
         self._timestamp = packet.timestamp
 
         if _annex_b_start_length(packet.payload):
@@ -330,7 +370,14 @@ class H264Depacketizer:
                 return None, lost_packets
             nal_types = annex_b_nal_types(packet.payload)
             return (
-                H264AccessUnit(packet.timestamp, packet.payload, 7 in nal_types, 8 in nal_types, 5 in nal_types),
+                H264AccessUnit(
+                    packet.timestamp,
+                    packet.payload,
+                    7 in nal_types,
+                    8 in nal_types,
+                    5 in nal_types,
+                    packet.capture_timestamp_ns,
+                ),
                 lost_packets,
             )
 
@@ -357,6 +404,7 @@ class H264Depacketizer:
                 7 in nal_types,
                 8 in nal_types,
                 5 in nal_types,
+                self._capture_timestamp_ns,
             )
         self._discard_access_unit()
         return access_unit, lost_packets
@@ -394,6 +442,7 @@ class H264Depacketizer:
 
     def _discard_access_unit(self) -> None:
         self._timestamp = None
+        self._capture_timestamp_ns = None
         self._nal_units.clear()
         self._fragment = None
         self._damaged = False

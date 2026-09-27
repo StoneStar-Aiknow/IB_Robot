@@ -43,6 +43,11 @@
   <test_depend>ament_index_python</test_depend>
   <test_depend>launch_testing</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>observation_transport</test_depend>
+  <test_depend>robot_config</test_depend>
+  <test_depend>tensormsg</test_depend>
+  <test_depend>inference_manifest</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

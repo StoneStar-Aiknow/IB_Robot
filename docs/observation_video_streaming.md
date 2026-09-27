@@ -243,52 +243,47 @@ $IBROBOT_ASCEND_FFMPEG -codecs 2>/dev/null | grep h264_ascend
 
 视频流传输后，推理请求仍需指定目标时间戳，云端根据时间戳从缓冲区取帧。同步机制如下：
 
-### 1. 机器人侧建立 RTP ↔ ROS 时间映射
+### 1. 每帧原始时间戳随 RTP 包传输
 
-机器人侧每秒通过 DDS 发布 `VideoStreamStatus`，包含：
+通用 FrameIngress、benchmark producer 与推理握手共用同一个 v7 版本常量，避免默认值漂移。
 
-```yaml
-mapping_rtp_timestamp: 2194729234          # 当前 RTP 时间戳（90kHz 时钟）
-mapping_capture_time:                      # 对应的 ROS 采集时间
-  sec: 1785490012
-  nanosec: 686427000
-```
+分布式协议 v7 保留标准的 90 kHz RTP timestamp，同时在 RTP 头扩展中携带原始
+`capture_timestamp_ns`（uint64，网络字节序）。扩展 profile 为 `0x4942`，数据长度为两个
+32 位字；含扩展头共增加 12 字节。RFC6184 分包和 `access_unit` 整帧路径均携带此字段，
+分包路径从 payload 预算中扣除扩展开销，整帧路径将扩展计入 UDP 长度上限。
 
-这个映射关系建立了 RTP 时间域和 ROS 时间域之间的锚点。
+接收端重组时校验同帧分包的原始时间戳一致，解码输出按其 PTS 关联原始时间戳。
+观测采样直接使用这个整数，不再通过状态消息中的 RTP/ROS 映射重建。
+原始时间戳扩展作为 v7 开发阶段的后续修复，不新增协议版本。缺少扩展或身份关联失败的图像不能用于推理。
+修复前的 v7 端云需一起更新；同为 v7 的新旧开发版本无法通过版本握手区分，不能混用。
+`VideoStreamStatus` 中的映射字段仍用于发送进度与诊断，不再作为解码帧时间来源或就绪门槛。
 
-### 2. 推理请求带目标 ROS 时间
+### 2. 推理请求与 state 历史
 
-机器人侧在发送推理请求时，从 DDS 获取 `/joint_states` 的时间戳，作为 `observation_timestamp` 发送给云端：
+请求的 `observation_timestamp` 表示目标观测时间。非图像观测继续通过请求中的
+`tensors` 和 `aligned_timestamps_ns` / `aligned_tensors` 传递；历史沿 K 轴堆叠，
+保留 v7 的序列化优化。历史是请求发出时的快照，端侧后来收到的 DDS state 不会修改已发送请求。
 
-```yaml
-DistributedInferenceRequest:
-  observation_timestamp:
-    sec: 1785490015
-    nanosec: 123456789
-  stream_observation_keys: ["observation.images.top", "observation.images.wrist"]
-  stream_ids: ["top", "wrist"]
-  tensors: [observation.state]  # 只有 joint state 走 DDS
-```
+### 3. 观测就绪检查
 
-### 3. 云端逆向计算并取帧
+普通硬件和连续 mock 保持现有 `hold/asof/drop` 与跨相机、state 时间容差。
+`runtime.target=benchmark` 的 pipeline 自动使用已有 step 响应时间作为目标：
 
-云端收到推理请求后：
+1. 端侧只采样目标时刻的 DDS observation，并将已采样的 state 原样纳入请求历史，避免二次取样。
+2. 云侧只接受目标时刻的所有必需图片，并要求请求中的 state 历史也包含该时刻。
+3. 缺项返回可恢复的 `observation_not_ready`，在调用模型前结束本次尝试。
+4. 现有 benchmark 调度器保持目标时间，重新取样并发送新请求，直到数据到齐或超过截止时间。
 
-1. **提取 RTP 时间戳**：从环形缓冲区的每个解码帧提取 RTP 时间戳（来自 RTP 包头）
-2. **转换回 ROS 时间**：用最新的 mapping 关系将 RTP 时间戳转回 ROS 时间：
-   ```python
-   ros_time_ns = mapping_capture_time_ns + (rtp_timestamp - mapping_rtp_timestamp) * 1e9 / 90000
-   ```
-3. **选择最接近帧**：找到 ROS 时间最接近 `observation_timestamp` 的帧（允许容差 `max_age_ms`，默认 500ms）
-4. **多相机同步校验**：检查所有相机的帧时间戳偏差是否 < `max_inter_camera_skew_ms`（默认 100ms）
-5. **组装观测**：若同步成功，返回多相机对齐的观测；否则拒绝推理请求并报错 `observation_not_ready`
+此检查不增加 YAML 开关或新的批次编号。当前 benchmark 精确路径仅支持 `n_obs_steps=1`；
+多步 observation 的离散历史语义尚未实现，启动时明确拒绝，避免把固定墙钟间隔当成仿真 step。
+跨设备源时间戳仍需属于一致的时钟域；传输保真不等于设备时钟同步，也不等于 H.264 像素无损。
 
 ### 4. 失败模式
 
 | 失败原因 | 错误码 | 说明 |
 |----------|--------|------|
-| `unmapped` | `observation_not_ready` | 云端尚未收到机器人侧的 timestamp mapping |
-| `stale` | `observation_not_ready` | Mapping 超过 `max_mapping_age_ms`（默认 1000ms），可能机器人侧断连 |
+| `target_not_ready` | `observation_not_ready` | benchmark 目标图片尚未解码或目标 state 尚未进入请求 |
+| `stale` | `observation_not_ready` | 所选观测超过契约允许的接收新鲜度 |
 | `pre_keyframe` | `observation_not_ready` | 云端尚未收到首个 I 帧（GOP 起始），等待中 |
 | `missing` | `observation_not_ready` | 缓冲区中没有足够接近目标时间戳的帧（可能丢包或帧率不足） |
 | `skewed` | `observation_not_ready` | 多相机时间偏差超过 `max_inter_camera_skew_ms`，无法对齐 |
@@ -506,3 +501,5 @@ DistributedInferenceRequest:
 - [视频编解码后端开发](../src/inference_service/inference_service/video_codec.py)
 - [RTP 协议实现](../src/inference_service/inference_service/video_rtp.py)
 - [时间戳同步](../src/inference_service/inference_service/observation_sync.py)
+
+实机验证记录见 [LIBERO → openEuler 310B ACT OM 观测传输验证](libero_310b_transport_validation.md)。

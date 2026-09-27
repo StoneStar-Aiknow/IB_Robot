@@ -357,3 +357,52 @@ class _Runtime:
     @staticmethod
     def close():
         return None
+
+
+@pytest.mark.parametrize("factory_name", ["public", "native"])
+def test_generic_frame_ingress_defaults_negotiate_current_protocol(factory_name):
+    from inference_service.video_codec import CodecCapabilities, VideoCodecRegistry
+    from observation_transport.frame_ingress import DirectFrameStreamConfig, StreamSessionView, create_frame_ingress
+    from observation_transport.native_frame_ingress import NativeFrameIngress
+    from tests.test_device_video_streams import _Encoder, _Sender
+
+    registry = VideoCodecRegistry()
+    registry.register(
+        "software",
+        priority=0,
+        probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
+        encoder_factory=lambda **kwargs: _Encoder(**kwargs),
+    )
+    config = DirectFrameStreamConfig(
+        observation_key="observation.images.top",
+        stream_id="top",
+        endpoint_host="127.0.0.1",
+        endpoint_port=5004,
+        width=64,
+        height=48,
+        frame_rate_hz=20.0,
+    )
+    factory = create_frame_ingress if factory_name == "public" else NativeFrameIngress
+    ingress = factory(
+        pipeline_id="policy",
+        contract_fingerprint="contract",
+        deployment_fingerprint="deployment",
+        streams=(config,),
+        codec_registry=registry,
+        sender_factory=lambda **kwargs: _Sender(**kwargs),
+    )
+    try:
+        ingress.bind_session(
+            StreamSessionView(
+                pipeline_id="policy",
+                session_id="session",
+                generation=1,
+                contract_fingerprint="contract",
+                deployment_fingerprint="deployment",
+            )
+        )
+        descriptor = ingress.descriptors()[0]
+        assert descriptor.protocol_version == PROTOCOL_VERSION == 7
+        assert ingress.statuses()[0].protocol_version == PROTOCOL_VERSION
+    finally:
+        ingress.close()

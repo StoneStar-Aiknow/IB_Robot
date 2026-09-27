@@ -139,3 +139,14 @@ def _annex_b_nal_types(payload: bytes) -> list[int]:
         else:
             index += 1
     return [payload[start] & 0x1F for start in starts if start < len(payload)]
+
+
+def test_decoder_does_not_invent_timestamp_for_output_without_matching_pts():
+    from types import SimpleNamespace
+
+    decoder = SoftwareH264Decoder()
+    try:
+        with pytest.raises(VideoCodecError, match="matching input timestamp"):
+            decoder._convert_frame(SimpleNamespace(pts=123))
+    finally:
+        decoder.close()

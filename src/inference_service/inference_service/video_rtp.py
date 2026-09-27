@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from inference_service.h264_stream_recorder import H264StreamRecorder
 
-from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
+from inference_service.observation_sync import RtpTimestampMapper
 from observation_transport.rtp_sender import (
     DatagramReceiver,
     DatagramSender,
@@ -328,6 +328,9 @@ class H264RtpReceiver:
                 "stream_identity_mismatch", "RTP SSRC or payload type does not match descriptor", dropped_packets=1
             )
             return []
+        if packet.capture_timestamp_ns is None:
+            self._degrade("capture_timestamp_missing", "RTP frame is missing its source timestamp", dropped_packets=1)
+            return []
         # Only the processing thread writes these; readers fold them in under
         # ``_lock`` through ``_flush_packet_metrics``.
         self._jitter_ns = self._updated_jitter_ns(packet.timestamp, receive_monotonic_ns)
@@ -335,7 +338,7 @@ class H264RtpReceiver:
         self._pending_received_packets += 1
         access_unit, lost_packets = self._depacketizer.push(packet)
         if self._depacketizer.last_reordered:
-            dropped_capture_timestamp_ns = self._map_dropped_timestamp(packet.timestamp, receive_time_ns)
+            dropped_capture_timestamp_ns = packet.capture_timestamp_ns
             with self._lock:
                 self._metrics = replace(
                     self._metrics,
@@ -345,7 +348,11 @@ class H264RtpReceiver:
                 self._last_error = "rtp_reordered_packet"
             return []
         if lost_packets:
-            dropped_capture_timestamp_ns = self._map_dropped_timestamp(packet.timestamp, receive_time_ns)
+            # A gap can precede an intact recovery IDR. Do not mark that new
+            # frame as dropped merely because its sequence exposed an earlier loss.
+            dropped_capture_timestamp_ns = self._depacketizer.last_dropped_capture_timestamp_ns
+            if not dropped_capture_timestamp_ns and access_unit is None:
+                dropped_capture_timestamp_ns = packet.capture_timestamp_ns
             with self._lock:
                 self._metrics = replace(
                     self._metrics,
@@ -385,24 +392,10 @@ class H264RtpReceiver:
                     self._metrics,
                     recovery_keyframes=self._metrics.recovery_keyframes + 1,
                 )
-        try:
-            capture_timestamp_ns = self.timestamp_mapper.map(
-                access_unit.timestamp,
-                now_ns=receive_time_ns,
-                session_generation=self.session_generation,
-            )
-        except ObservationSynchronizationError as exc:
-            self._record_access_unit(
-                access_unit.payload,
-                capture_timestamp_ns=None,
-                rtp_timestamp=access_unit.timestamp,
-                keyframe=access_unit.keyframe,
-                lost_packets=lost_packets,
-                dropped="timestamp_unmapped",
-            )
-            self._keyframe_ready = False
-            self._degrade("timestamp_mapping_unavailable", str(exc))
-            return []
+        # v7 carries the original timestamp with every fragment. Never reconstruct
+        # it from a 90 kHz mapping, even when a sender status anchor is available.
+        capture_timestamp_ns = access_unit.capture_timestamp_ns
+        assert capture_timestamp_ns is not None
         self._record_access_unit(
             access_unit.payload,
             capture_timestamp_ns=capture_timestamp_ns,
@@ -526,16 +519,6 @@ class H264RtpReceiver:
             self._queue.clear()
             self._state = StreamLifecycleState.STOPPED
             self._metrics = replace(self._metrics, queued_packets=0)
-
-    def _map_dropped_timestamp(self, rtp_timestamp: int, receive_time_ns: int) -> int:
-        try:
-            return self.timestamp_mapper.map(
-                rtp_timestamp,
-                now_ns=receive_time_ns,
-                session_generation=self.session_generation,
-            )
-        except ObservationSynchronizationError:
-            return 0
 
     def _record_access_unit(
         self,
