@@ -49,8 +49,6 @@ directory.
 Run from the repository root:
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
-
 source .shrc_local && python3 scripts/npu/pi05_910b/make_int8_rtn_perchannel_source.py \
   --fp-model-path /path/to/pi05_bf16 \
   --output-dir /path/to/pi05_sel99_rtn_source
@@ -71,7 +69,6 @@ then synchronizes the NPU immediately before and after
 `policy.predict_action_chunk()`:
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 source .shrc_local && python3 scripts/npu/pi05_910b/benchmark_pi05.py \
   --bundle /path/to/pi05_sel99_int8 \
   --deployment torch-npu \
@@ -88,6 +85,17 @@ asynchronous; the framework's unsynchronized `backend_latency_ms` is enqueue
 time and must not be used as model execution latency.
 
 ## Verified 910B environment
+
+Use the same repository-owned environment entry point as the Ascend310P path:
+
+```bash
+./scripts/setup.sh --yes --profile inference
+source .shrc_local
+```
+
+The released 910B inference path is installed, validated, and run only in the
+workspace `venv`; it does not use Conda. The provider does not inspect or reject
+the caller's environment.
 
 The source guide records Ascend 910B3, Driver 25.5.0, CANN 9.2 package tree
 (runtime/GE/OPP metadata 9.1), Python 3.12.13, PyTorch 2.10.0+cpu,

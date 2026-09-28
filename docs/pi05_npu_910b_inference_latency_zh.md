@@ -6,7 +6,7 @@
 ## 1. 测试结论
 
 当前 PI0.5 NPU 支线已经使用 Selective-99 INT8 权重、TorchAir fullgraph 和 AB2/6。约 53 ms 的
-统一框架时延不是量化权重、AB2、模型移植代码、noise 生成或 Conda 环境退化造成的：同一已加载
+统一框架时延不是量化权重、AB2、模型移植代码、noise 生成或 Python 环境退化造成的：同一已加载
 模型实例绕过统一框架执行完整 preprocessor → policy → postprocessor 时为 49.043 ms，通过
 `manager.infer` 时为 52.895 ms。
 
@@ -24,7 +24,7 @@ ROS 2 客户端从发送 goal 到收到结果平均需要 61.859 ms，其中服�
 | 项目 | 配置 |
 |---|---|
 | NPU | Ascend 910B，设备名 `Ascend910_9362` |
-| Conda 环境 | `IB_Robot_ros` |
+| Python 环境 | 表内数据为历史结果；发布与验证只使用项目 `venv`，不使用 Conda |
 | 开源模型 | [LeRobot PI0.5 LIBERO finetuned v0.4.4](https://huggingface.co/lerobot/pi05_libero_finetuned_v044) |
 | 推理 bundle | 使用本项目脚本从开源 BF16 权重量化并按 schema-v3 manifest 打包，不随仓库分发权重文件 |
 | 量化 | Selective-99 INT8，81 个投影层，qweight 预打包为 `FRACTAL_NZ` |
@@ -75,7 +75,6 @@ hf download lerobot/pi05_libero_finetuned_v044 \
 与未量化 BF16 张量、处理器和 tokenizer 合并成完整原生 Torch 检查点：
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 export PI05_RTN_SOURCE_DIR="<RTN 中间产物目录>"
 export PI05_INT8_MODEL_DIR="<最终 INT8 模型目录>"
 
@@ -104,7 +103,6 @@ INT8 投影。权重使用每输出通道对称 RTN INT8，激活在运行时执
 纯模型同步时延测试可使用：
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 source .shrc_local && python3 scripts/npu/pi05_910b/benchmark_pi05.py \
   --bundle "${PI05_INT8_MODEL_DIR}" \
   --deployment torch-npu \
@@ -174,7 +172,7 @@ client_wall_ms - server_inference_ms = 61.859 - 53.305 = 8.554 ms
 | 官方 E2E，token=200 | 49.052 | 48.929 | 49.767 | 与当前 bundle 的 token length 对齐 |
 | 官方 E2E，token=200，策略内部生成 noise | 49.003 | 48.928 | 49.027 | noise 生成不是时延上升原因 |
 | 官方 E2E，token=200，不替换 FastGELU | 48.976 | 48.906 | 49.022 | FastGELU 差异不是时延上升原因 |
-| 官方代码 + `IB_Robot_ros` Conda | 48.892 | 48.928 | 49.800 | Conda 环境不是时延上升原因 |
+| 官方代码 + 旧版隔离环境 | 48.892 | 48.928 | 49.800 | 历史环境对照；当前发布测试不使用 Conda |
 | IB_Robot 同实例 direct E2E | 49.043 | 48.954 | 49.742 | 完整 preprocessor → policy → postprocessor |
 | IB_Robot 同实例 manager E2E | 52.895 | 52.842 | 52.879 | 相比 direct 增加 3.852 ms |
 | IB_Robot 独立 framework benchmark | 53.248 | 53.608 | 53.676 | 包含统一框架完整调用与外层同步 |

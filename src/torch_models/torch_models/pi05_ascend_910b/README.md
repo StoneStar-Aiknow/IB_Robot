@@ -172,11 +172,14 @@ model interface: policy/pi05/predict
 | Transformers | `>=5.4,<5.6` |
 | 模型 dtype | `native` 或 `bf16`，运行时使用 BF16 |
 
-推荐使用项目 Conda 环境初始化依赖和 ROS 工作区：
+环境配置与现有 Ascend310P 路径保持一致：使用项目脚本创建仓库 `venv`，再由
+`.shrc_local` 统一加载 ROS 2、workspace overlay、CANN 和项目源码。910B 发布版本只在仓库
+`venv` 中安装、验证和运行，不使用 Conda；provider 不额外探测或拒绝调用方环境：
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
+./scripts/setup.sh --yes --profile inference
 source .shrc_local
+test "${VIRTUAL_ENV}" = "${PWD}/venv"
 ```
 
 provider 会在加载模型前检查设备型号、PyTorch、Torch-NPU、Transformers、tokenizer 和
@@ -189,7 +192,6 @@ provider 会在加载模型前检查设备型号、PyTorch、Torch-NPU、Transfo
 从仓库根目录执行：
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 export PI05_FP_MODEL_DIR="<BF16 模型目录>"
 export PI05_RTN_SOURCE_DIR="<RTN 中间产物目录>"
 export PI05_INT8_MODEL_DIR="<最终 INT8 模型目录>"
@@ -213,7 +215,6 @@ bundle 的 manifest 仍需按实际部署信息生成，并保证其摘要与量
 ### 6.2 运行纯模型同步时延测试
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 source .shrc_local && python3 scripts/npu/pi05_910b/benchmark_pi05.py \
   --bundle "${PI05_INT8_MODEL_DIR}" \
   --deployment torch-npu \

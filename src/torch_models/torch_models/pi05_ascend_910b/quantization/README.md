@@ -93,8 +93,6 @@ NPU 使用 `torch_npu.npu_dynamic_quant(..., quant_mode="pertoken")` 和
 `model.safetensors`；输出目录必须不存在。
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
-
 source .shrc_local && python3 \
   scripts/npu/pi05_910b/make_int8_rtn_perchannel_source.py \
   --fp-model-path /path/to/pi05_bf16 \
@@ -153,8 +151,10 @@ Torch-NPU 的基础版本都是 **2.10.0**；Transformers 为 **>=5.4,<5.6**；
 模型数据类型为 `native` 或 `bf16`，实际计算为 BF16。已记录的验证环境为 Ascend
 910B3、驱动 25.5.0、CANN 9.2（运行时/GE/OPP 软件包树显示 9.1）、Python 3.12.13、
 PyTorch 2.10.0+cpu、Torch-NPU 2.10.0、TorchAir（`torch_npu.dynamo.torchair`）。
-当前验证使用 Python 3.12.14 Conda 环境 `IB_Robot_ros`，并安装 PyTorch 2.10.0、Torch-NPU 2.10.0、
-TorchVision 0.25.0、Transformers 5.5.4、LeRobot 0.6.0 和 pytest 8.4.2。这里列出的
+当前验证使用项目脚本创建的仓库 `venv`，Python 3.12.14，并安装 PyTorch 2.10.0、
+Torch-NPU 2.10.0、TorchVision 0.25.0、Transformers 5.5.4、LeRobot 0.6.0 和 pytest 8.4.2。
+910B 发布版本只在仓库 `venv` 中安装、验证和运行，不使用 Conda；provider 不额外探测或拒绝
+调用方环境。这里列出的
 源环境与仓库环境是版本记录和“失败即终止”条件，不代表任意 910B 主机都已验证；
 部署前必须由目标机自行确认驱动/CANN/Torch-NPU ABI 兼容，不能仅凭型号宣称性能。
 
@@ -164,7 +164,6 @@ TorchVision 0.25.0、Transformers 5.5.4、LeRobot 0.6.0 和 pytest 8.4.2。这�
 
 ```bash
 cd /path/to/IB_Robot
-export IBROBOT_CONDA_ENV=IB_Robot_ros
 
 source .shrc_local && python3 -m pytest -q \
   src/torch_models/test/test_pi05_ascend_910b_quantization.py
@@ -180,7 +179,8 @@ source .shrc_local && python3 -m pytest -q \
 
 ## 8. 真实 910B 验证清单
 
-在目标机设置 `IBROBOT_CONDA_ENV=IB_Robot_ros` 并执行 `source .shrc_local` 后，至少留存以下证据：
+在目标机执行 `./scripts/setup.sh --yes --profile inference`，再执行 `source .shrc_local` 后，
+至少留存以下证据：
 
 * `npu-smi info` 输出的硬件型号和驱动信息；使用 `python3 -c` 打印 `torch`、`torch_npu`、
   `transformers`、TorchAir 版本；确认满足上一节合约。
@@ -196,23 +196,21 @@ source .shrc_local && python3 -m pytest -q \
 * 进行任务级准确率、动作成功率回归和数值差异检查；分别抽样视觉、前缀大语言模型、
   动作专家路径。只通过算子冒烟测试不足以证明模型质量。
 
-### 本次验证记录（2026-09-20）
+### 当前仓库 venv 验证记录（2026-09-28）
 
-当前项目 Conda 环境 `IB_Robot_ros` 已补齐 Torch-NPU/CANN Python 依赖，`python3 -m pip check`
-返回“未发现损坏的依赖关系”（原始输出为 `No broken requirements found`）。在
-`Ascend910_9362`（CANN/Torch-NPU 的 910B 93 系列
-设备名）上完成了以下验证：
+仓库 `venv` 中 `python3 -m pip check` 返回“未发现损坏的依赖关系”（原始输出为
+`No broken requirements found`）。环境可通过 Torch-NPU 识别 `Ascend910_9362` 并导入
+`torch_npu.dynamo.torchair`；完整 Torch 模型测试集共 **65 项通过**，覆盖 910B provider、量化、
+图像预处理和设备路由。
 
-* 完整 `src/torch_models/test` 回归测试 **64 项通过**（其中策略提供器、910B
-  提供器与量化单元测试合计 32 项）；
-* 使用临时小尺寸 BF16 safetensors 文件执行完整两阶段离线工具，得到
-  `selected_linear_count=99`、分组 `27/18/54`、`active_projection_count=81`、
-  `loaded_quant_tensor_count=198`，并验证非选中 BF16 权重及分词器配套文件得到保留；
-* 在真实 `npu:0` 上以 `[4,256] @ [256,256]` 运行动态逐词元量化、
-  `FRACTAL_NZ` 预排布和 `npu_quant_matmul`，输出 `[4,256]` BF16，有限性检查通过。
+同日在仓库 `venv` 中完成一次真实 910B 模型端到端功能验证，进程内不存在 Conda 环境变量。
+Selective-99 权重成功加载，81 个实际 INT8 投影完成约 2.02 GB 的 `FRACTAL_NZ` 预排布，
+TorchAir prefix/denoise 双图、AB2/6 和 NPU 融合算子均成功启用。首次图编译预热为
+55.844 s；随后 3 次 preprocessor → policy → postprocessor 同步调用分别为
+51.742 ms、49.782 ms 和 49.793 ms，平均 50.439 ms；动作输出形状为 `[50, 7]` 且全部为有限值。
 
-以上是环境、离线产物合约和 NPU 算子的冒烟测试；由于本次没有提供实际 PI0.5
-BF16/INT8 模型包，尚未执行完整模型加载、去噪、精度或端到端时延验证。
+测试时设备上另有评测任务，因此这 3 次数据只证明 venv-only 优化链路可运行，不作为正式性能基线，
+也不包含统一框架或 ROS 传输。正式时延仍需在空闲 NPU 上按基准脚本的预热和迭代口径复测。
 
 ## 9. 失败模式、限制与性能/精度注意事项
 

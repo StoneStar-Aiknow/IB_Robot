@@ -79,22 +79,18 @@ python3 scripts/npu/pi05_910b/benchmark_pi05.py \
 
 ### 2.5 环境初始化更新
 
-`.shrc_local` 增加可移植的 Conda 发现逻辑，优先级如下：
-
-1. 显式设置的 `IBROBOT_CONDA_SH`；
-2. 当前 `CONDA_EXE` 对应的 Conda；
-3. `conda info --base` 返回的安装目录；
-4. 工作区附近、用户目录和 `/opt/conda` 下的常见安装位置。
-
-推荐使用项目环境：
+910B 与现有 310P NPU 路径统一使用仓库 `venv`。`scripts/setup.sh` 负责创建环境和安装与平台/CANN
+匹配的依赖。运行 910B 路径时不要设置 `IBROBOT_CONDA_ENV`；`.shrc_local` 使用默认分支激活仓库
+`venv`，并统一加载 ROS 2、workspace overlay、CANN 和项目源码：
 
 ```bash
-export IBROBOT_CONDA_ENV=IB_Robot_ros
+./scripts/setup.sh --yes --profile inference
 source .shrc_local
 ```
 
-910B 优化路径要求兼容的 PyTorch、`torch_npu`、CANN、TorchAir 和 Transformers 版本。当前 provider 对
-关键版本与设备类型执行显式校验，环境不满足时会给出错误，而不是继续运行不可复现的降级路径。
+910B 优化路径要求兼容的 PyTorch、`torch_npu`、CANN、TorchAir 和 Transformers 版本。发布版本只在
+仓库 `venv` 中安装、验证和运行，不使用 Conda；provider 不探测或拒绝调用方环境，但仍会显式校验
+关键版本与设备类型，环境不满足时会给出错误，而不是继续运行不可复现的降级路径。
 
 ### 2.6 新增示例配置和回归测试
 
@@ -123,11 +119,13 @@ source .shrc_local
 
 提交前已完成以下验证：
 
-- Torch 模型与统一 session 相关测试：`67 passed`；
+- 完整 Torch 模型测试集（含 910B provider、量化、图像预处理和路由）：`65 passed`；
+- 仓库 `venv` 下真实 910B 模型端到端功能验证通过，3 次稳定调用平均 `50.439 ms`，输出为
+  `[50, 7]` 有限值；测试时设备存在其他负载，该结果不作为正式性能基线；
 - Selective-99 全量模拟转换：选择 99 层，生成 198 个量化张量，并保留 BF16 张量；
 - 嵌套 tokenizer 目录复制验证通过；
 - 示例配置继承、空相机输入补充、`torch-npu` 部署和单体执行模式解析通过；
-- `.shrc_local` 的 Bash/Zsh 语法、Conda 自动发现与 `pip check` 通过；
+- `.shrc_local` 的 Bash/Zsh 语法、默认仓库 `venv` 激活与 `pip check` 通过；
 - 代码差异空白检查通过，`libs/lerobot` 子模块无修改。
 
 相关 NPU 实机历史结果为：纯 PI0.5 优化路径约 48～49 ms，统一框架约 53 ms，ROS 客户端端到端约
