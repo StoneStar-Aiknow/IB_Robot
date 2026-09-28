@@ -1,0 +1,16 @@
+# Independent stop control for a Gateway-owned execution.  The service marks a
+# monotonic stop request before execution workers observe it.  A successful
+# response means cancellation was requested, not that the robot is stationary.
+
+uint32 schema_version
+string caller_scope
+string robot_id
+string request_id
+string execution_id
+---
+bool accepted
+string execution_id
+string state
+uint64 stop_generation
+string error_code
+string message

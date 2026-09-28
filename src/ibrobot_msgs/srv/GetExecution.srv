@@ -1,0 +1,29 @@
+# Query a Gateway-owned execution by stable identity.  caller_scope and
+# robot_id are part of the lookup boundary and cannot be inferred from a public
+# capability view.
+
+uint32 schema_version
+string caller_scope
+string robot_id
+string request_id
+string execution_id
+---
+bool found
+string execution_id
+string request_id
+string caller_scope
+string robot_id
+string state
+string program_digest
+WorkflowStep[] canonical_steps
+uint32 completed_step_count
+bool stop_requested
+uint64 last_event_sequence
+string error_code
+string message
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+# UNKNOWN remains the original outcome; reconciliation only releases quarantine.
+bool reconciled
+string reconciliation_evidence

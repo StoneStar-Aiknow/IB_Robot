@@ -1,0 +1,45 @@
+# ExecuteProgram.action - Public typed entry point owned by the Skill Gateway.
+#
+# A request is complete and executable as submitted.  The Gateway freezes the
+# canonical Program, performs exact-snapshot and policy admission, persists the
+# commit intent, and then executes it.  Presentation consumes ExecutionEvent
+# asynchronously and is never an execution gate.
+#
+# request_id is idempotent within (caller_scope, robot_id).  Reusing it with a
+# different canonical payload is a conflict and never dispatches motion.
+
+# --- Goal ---
+uint32 schema_version
+string request_id
+string caller_scope
+string robot_id
+string raw_command
+string expected_registry_epoch
+uint64 expected_registry_generation
+string expected_registry_digest
+WorkflowStep[] workflow_steps
+float32 task_budget_sec
+string trace_id
+---
+# --- Result ---
+bool success
+string execution_id
+string request_id
+string program_digest
+string workflow_digest
+uint32 completed_step_count
+string state
+string error_code
+string message
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+---
+# --- Feedback ---
+string execution_id
+uint64 sequence
+string state
+uint32 workflow_step_index
+string current_skill
+string detail
+string program_digest
