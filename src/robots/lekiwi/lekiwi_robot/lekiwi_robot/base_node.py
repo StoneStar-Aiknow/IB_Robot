@@ -11,7 +11,8 @@ functions), so the ros2_control path and the SDK share one implementation.
 - ``/joint_states`` wheel feedback -> ``/odom`` + TF (odom -> base_link).
 - Navigation gating (``base.navigation_gate``): ``SetBool`` service that
   clears pending commands and stops the base before acknowledging, plus an
-  acknowledgment heartbeat. Names are the ones navigation stacks already use.
+  acknowledgment heartbeat on the contract names
+  (``robot_runtime.contract.NAVIGATION_*``).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from nav_msgs.msg import Odometry
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray
@@ -40,19 +42,22 @@ from robot_runtime import contract as C
 class LeKiwiBaseNode(Node):
     def __init__(self):
         super().__init__("lekiwi_base")
-        self.declare_parameter("wheel_joints", ["7", "8", "9"])
-        self.declare_parameter("wheel_radius", 0.05)
-        self.declare_parameter("base_radius", 0.125)
-        self.declare_parameter("max_wheel_radps", 4.602)
-        self.declare_parameter("control_frequency", 50.0)
-        self.declare_parameter("staleness_s", 0.5)
+        # Chassis geometry has no defaults: it comes from the runtime profile
+        # (lekiwi_robot.base_profile), and an unset value fails at startup
+        # naming the parameter instead of driving with built-in constants.
+        self.declare_parameter("wheel_joints", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("wheel_radius", Parameter.Type.DOUBLE)
+        self.declare_parameter("base_radius", Parameter.Type.DOUBLE)
+        self.declare_parameter("max_wheel_radps", Parameter.Type.DOUBLE)
+        self.declare_parameter("control_frequency", Parameter.Type.DOUBLE)
+        self.declare_parameter("staleness_s", Parameter.Type.DOUBLE)
         self.declare_parameter("cmd_vel_topic", C.CMD_VEL_TOPIC)
         self.declare_parameter("wheel_command_topic", "/base_velocity_controller/commands")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("odom_topic", C.ODOM_TOPIC)
-        self.declare_parameter("odom_frame", "odom")
-        self.declare_parameter("base_frame", "base_link")
-        self.declare_parameter("publish_tf", True)
+        self.declare_parameter("odom_frame", Parameter.Type.STRING)
+        self.declare_parameter("base_frame", Parameter.Type.STRING)
+        self.declare_parameter("publish_tf", Parameter.Type.BOOL)
         self.declare_parameter("runtime_status_topic", C.STATUS_TOPIC)
         self.declare_parameter("base_modes", ["base_navigation"])
         self.declare_parameter("navigation_enable_service", C.NAVIGATION_ENABLE_SERVICE)

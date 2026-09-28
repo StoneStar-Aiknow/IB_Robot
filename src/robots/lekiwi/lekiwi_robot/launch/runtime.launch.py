@@ -21,8 +21,8 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from lekiwi_robot.base_profile import arm_motion_model, base_node_parameters, lidar_odometry_owns_tf
 from robot_runtime.launch_support import (
-    RuntimeProfileError,
     motion_launch_arguments,
     peripheral_stack_actions,
     resolve_profile_argument,
@@ -39,25 +39,14 @@ def _launch_setup(context, *_args, **_kwargs):
     simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
 
-    base = profile.get("base") or {}
-    if not base.get("wheel_joints"):
-        raise RuntimeProfileError(f"runtime profile missing required key 'base.wheel_joints': {profile_path}")
-    base_params = {
-        "wheel_joints": [str(j) for j in base["wheel_joints"]],
-        "wheel_radius": float(base.get("wheel_radius", 0.05)),
-        "base_radius": float(base.get("base_radius", 0.125)),
-        "max_wheel_radps": float(base.get("max_wheel_radps", 4.602)),
-        "control_frequency": float(base.get("control_frequency", 50.0)),
-        "staleness_s": float((profile["capabilities"].get("base.cmd_vel") or {}).get("staleness_s", 0.5)),
-        "joint_states_topic": str(profile["joint_state_topic"]),
-        "odom_frame": str(base.get("odom_frame", "odom")),
-        "base_frame": str(base.get("base_frame", "base_link")),
-        "publish_tf": bool(base.get("publish_tf", True)),
-        "navigation_enabled_on_startup": bool(base.get("navigation_enabled_on_startup", False)),
-        "base_modes": [
-            name for name, spec in profile["modes"].items() if name != "initial" and (spec or {}).get("allows_base")
-        ],
-    }
+    peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
+    fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
+    fast_lio_config = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
+    # Chassis geometry comes from the profile only; a missing key or a limit
+    # the wheels cannot realize fails here, naming it (lekiwi_robot.base_profile).
+    base_params = base_node_parameters(profile, profile_path)
+    if lidar_odometry_owns_tf(fast_lio_config, simulated):
+        base_params["publish_tf"] = False
     base_node = Node(
         package="lekiwi_robot",
         executable="base_node",
@@ -75,12 +64,12 @@ def _launch_setup(context, *_args, **_kwargs):
                 PythonLaunchDescriptionSource(
                     os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
                 ),
-                launch_arguments=motion_launch_arguments(profile, profile_path, simulated, display).items(),
+                launch_arguments={
+                    **motion_launch_arguments(profile, profile_path, simulated, display),
+                    "robot_description": arm_motion_model(profile, profile_path, simulated),
+                }.items(),
             )
         )
-    peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
-    fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
-    fast_lio_config = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
     peripherals = [
         *peripheral_stack_actions(profile, peripherals_file, simulated),
         *fast_lio_nodes(fast_lio_config, bridge_package="lekiwi_robot", use_sim=simulated),

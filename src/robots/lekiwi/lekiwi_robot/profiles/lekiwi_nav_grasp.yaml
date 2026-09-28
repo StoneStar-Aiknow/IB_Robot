@@ -72,7 +72,12 @@ motion:
   base_link: base
   ee_link: gripper
   shoulder_link: shoulder
-  # MoveIt consumes the arm-only broadcaster (wheels excluded from the model).
+  # MoveIt plans for the SO-101 arm alone: its model is the SO-101 arm URDF
+  # (matching so101_motion's SRDF), rendered with this profile's hardware
+  # arguments, and it consumes the arm-only broadcaster. Without an explicit
+  # model move_group falls back to /robot_description -- the whole LeKiwi with
+  # wheels it never receives state for -- and FK/IK/planning all fail.
+  model_xacro: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
   joint_state_topic: /arm_joint_state_broadcaster/joint_states
   ik_worker_count: 1
   motion_feedback_timeout_s: 0.3
@@ -100,7 +105,10 @@ capabilities:
   motion.ik: {endpoints: ['/motion/compute_ik', '/ik_worker_0/motion/compute_ik']}
   motion.move_to_joint: {}
   motion.move_to_pose: {}
-  base.cmd_vel: {max_vx: 0.5, max_vy: 0.5, max_wz: 1.5, staleness_s: 0.5}
+  # Linear limits are what the wheels can realize: max_wheel_radps x
+  # wheel_radius over each axis' largest wheel projection (0.2657 / 0.2301 m/s,
+  # checked at launch by lekiwi_robot.base_profile).
+  base.cmd_vel: {max_vx: 0.26, max_vy: 0.23, max_wz: 1.5, staleness_s: 0.5}
   base.odom: {}
   base.navigation_gate: {}
   runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
