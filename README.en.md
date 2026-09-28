@@ -39,7 +39,7 @@ The mainline workflow now supports three runtime platforms:
 
 ## System Architecture
 
-![IB-Robot Architecture](docs/pictures/architecture.png)
+![IB-Robot Architecture](docs/pictures/ib-robot-architecture.drawio.svg)
 
 ### Architecture Deep Dive
 
@@ -84,12 +84,11 @@ IB_Robot/                           # Main Workspace
 │   ├── dataset_tools/              # Dataset collection & conversion (Episode Recorder)
 │   ├── robot_teleop/               # Teleoperation (Leader Arm/Xbox controller)
 │   ├── robot_runtime/              # Robot runtime contract (RuntimeStatus / capabilities / interface description)
-│   ├── lekiwi_description/         # Lekiwi chassis URDF/Mesh model descriptions
 │   ├── robot_navigation/           # Navigation package
 │   ├── inference_service/          # Multi-model inference & deployment service
 │   ├── robots/so101/               # SO-101 runtime suite (sdk/hardware/description/motion/robot)
+│   ├── robots/lekiwi/              # LeKiwi runtime suite (sdk/hardware/description/calibration/robot)
 │   ├── robots/feetech/             # Feetech servo SDK
-│   ├── lekiwi_hardware/            # Lekiwi chassis hardware driver interface
 │   ├── hardware_mock/              # Hardware mock interface
 │   ├── omni_wheel_controller/      # Omni-wheel controller plugin
 │   ├── pymoveit2/                  # [Submodule] MoveIt2 Python interface
@@ -426,7 +425,6 @@ After recording, convert the episodic dataset to LeRobot format:
 ```bash
 ros2 run dataset_tools bag_to_lerobot \
     --bags-dir ~/rosbag/episodes/so101_single_arm \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
     --out /path/to/output_dataset
 ```
 

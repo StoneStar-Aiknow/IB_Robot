@@ -129,7 +129,7 @@ source install/setup.sh
 
 ```bash
 ./scripts/build.sh -- --packages-up-to \
-  ibrobot_msgs robot_calibration semantic_mapping robot_navigation robot_config
+  ibrobot_msgs lekiwi_calibration semantic_mapping robot_navigation robot_config
 ```
 
 两种导航模式使用独立 profile、地图和 RViz 预设：
@@ -146,11 +146,11 @@ RealSense 模式使用 D435 和 RTAB-Map；LiDAR 模式使用 MID-360、FAST-LIO
 
 ### 2. D435i/MID-360 标定
 
-详细采集要求和产物契约见 [`robot_calibration/README.md`](../robot_calibration/README.md)。标定期间不要同时启动
+详细采集要求和产物契约见 [`lekiwi_calibration/README.md`](../robots/lekiwi/lekiwi_calibration/README.md)。标定期间不要同时启动
 导航主链。开发板执行采集：
 
 ```bash
-ros2 run robot_calibration calib_capture
+ros2 run lekiwi_calibration calib_capture
 ```
 
 需要移动机器人时，在开发板另一个终端运行键盘遥控；每次录制前停稳机器人：
@@ -162,7 +162,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 原始包默认写入 `~/.ros/ibrobot/calib/raw/<capture-id>.raw.tar`。将原始包复制到 PC 后处理：
 
 ```bash
-ros2 run robot_calibration calib_process \
+ros2 run lekiwi_calibration calib_process \
   --input <path-to>/<capture-id>.raw.tar
 
 xdg-open ~/.ros/ibrobot/calib/process/<capture-id>/test-overlay.png
@@ -174,20 +174,20 @@ scp ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar \
 开发板启动候选实时验证，并保持该进程运行：
 
 ```bash
-ros2 run robot_calibration calib_validate \
+ros2 run lekiwi_calibration calib_validate \
   --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 
 PC 侧在同一 ROS domain 中观察实时叠加：
 
 ```bash
-ros2 run robot_calibration calib_view --mode validate
+ros2 run lekiwi_calibration calib_view --mode validate
 ```
 
 确认投影正确后，在开发板结束验证进程并批准候选：
 
 ```bash
-ros2 run robot_calibration calib_approve \
+ros2 run lekiwi_calibration calib_approve \
   --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 

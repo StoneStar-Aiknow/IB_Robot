@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # verify_runtime_independence.sh — the two-direction independence gate
-# (robot-runtime-packaging spec, design D9; so101-runtime-migration task 6.4).
+# (robot-runtime-packaging spec, design D9; so101-runtime-migration task 6.4,
+# lekiwi-runtime-migration task 7.5).
 #
 # Usage:
 #   scripts/verify_runtime_independence.sh runtime so101_robot [--profile so101_single_arm]
+#   scripts/verify_runtime_independence.sh runtime lekiwi_robot [--profile lekiwi_lidar]
+#   scripts/verify_runtime_independence.sh runtime aimdk_robot [--profile x2_ultra]
 #   scripts/verify_runtime_independence.sh core
 #
-# runtime mode: build so101_robot in an ISOLATED workspace containing only its
+# runtime mode: build <robot>_robot in an ISOLATED workspace containing only its
 #   declared dependency closure. The closure is audited against a FIXED
 #   allow-list (runtime members + the contract layer + vendored third-party);
 #   membership is NOT derived from the closure itself. The isolated build uses
@@ -32,6 +35,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_WORKSPACE="${MAIN_WORKSPACE:-$(dirname "$SCRIPT_DIR")}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+# The workspace venv, or an explicit one. A worktree that shares the main
+# repository's venv (the documented worktree flow) has no venv/ of its own, so
+# RUNTIME_GATE_PYTHON points the gate at the interpreter it should use.
+GATE_PYTHON="${RUNTIME_GATE_PYTHON:-$MAIN_WORKSPACE/venv/bin/python3}"
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
@@ -45,15 +52,28 @@ SO101_RUNTIME_MEMBERS=(
   so101_robot so101_sdk so101_hardware so101_description so101_motion so101_suite
   feetech_sdk
 )
+LEKIWI_RUNTIME_MEMBERS=(
+  lekiwi_robot lekiwi_sdk lekiwi_hardware lekiwi_description lekiwi_calibration
+  feetech_sdk
+  # The LeKiwi arm IS an SO-101 arm, so its runtime reuses these rather than
+  # forking them. Declared by name, never by an so101_* prefix rule, so an
+  # unrelated SO-101 package appearing in the closure still fails the gate.
+  so101_description so101_sdk so101_hardware so101_motion
+)
+# The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
+# description or motion package of its own. aimdk_msgs is supplied by the
+# developer's AimDK overlay and is never vendored into this repository.
+AIMDK_RUNTIME_MEMBERS=(aimdk_robot)
+AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
 # Third-party/vendored packages that may appear in a runtime closure without
 # being IB-Robot generic packages (they are not listed by `colcon list` in the
 # main workspace src/ tree anyway; this list documents intent).
-THIRD_PARTY_ALLOWED=(pymoveit2)
+THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs livox_ros_driver2 fast_lio fast_calib)
 
 # Generic packages that must build WITHOUT any robot package (core gate).
 CORE_EXCLUDED_SUFFIXES=("_robot" "_sdk" "_hardware" "_motion" "_suite")
 CORE_EXCLUDED_PACKAGES=(
-  so101_description moveit lekiwi_description robot_calibration
+  so101_description moveit lekiwi_description lekiwi_calibration
   livox_ros_driver2 fast_lio fast_calib omni_wheel_controller rosclaw pymoveit2
 )
 CORE_BUILD_PACKAGES=(
@@ -79,8 +99,12 @@ package_dir_for() {
 # ---------------------------------------------------------------------------
 isolated_colcon_build() {
   local ws="$1"; shift
-  local venv_python="$MAIN_WORKSPACE/venv/bin/python3"
-  [[ -x "$venv_python" ]] || { log_error "workspace venv not found at $venv_python"; exit 1; }
+  local venv_python="$GATE_PYTHON"
+  [[ -x "$venv_python" ]] || {
+    log_error "gate interpreter not found at $venv_python"
+    log_error "set RUNTIME_GATE_PYTHON to the venv python when the worktree shares another venv"
+    exit 1
+  }
   (
     cd "$ws"
     set +u; source /opt/ros/humble/setup.sh; set -u
@@ -98,7 +122,7 @@ isolated_colcon_build() {
 # ---------------------------------------------------------------------------
 runtime_gate() {
   local robot_pkg="$1"; shift
-  local profile="so101_single_arm"
+  local profile=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile) profile="$2"; shift 2;;
@@ -106,7 +130,50 @@ runtime_gate() {
     esac
   done
 
-  local allowlist=("${CONTRACT_PACKAGES[@]}" "${SO101_RUNTIME_MEMBERS[@]}" "${THIRD_PARTY_ALLOWED[@]}")
+  # Per-robot members and profile location. Membership is declared here, never
+  # derived from the closure under audit.
+  local members=() profile_dir="" default_profile=""
+  case "$robot_pkg" in
+    so101_robot)
+      members=("${SO101_RUNTIME_MEMBERS[@]}")
+      profile_dir="$MAIN_WORKSPACE/src/robots/so101/so101_robot/profiles"
+      default_profile="so101_single_arm"
+      ;;
+    lekiwi_robot)
+      members=("${LEKIWI_RUNTIME_MEMBERS[@]}")
+      profile_dir="$MAIN_WORKSPACE/src/robots/lekiwi/lekiwi_robot/profiles"
+      default_profile="lekiwi_lidar"
+      ;;
+    aimdk_robot)
+      members=("${AIMDK_RUNTIME_MEMBERS[@]}")
+      profile_dir="$MAIN_WORKSPACE/src/robots/aimdk/aimdk_robot/profiles"
+      default_profile="x2_ultra"
+      # The vendor overlay is a developer-supplied dependency. Without it this
+      # gate cannot run; say so by name instead of failing or silently passing.
+      # AIMDK_OVERLAY_SETUP may point at the overlay's local_setup.sh so the
+      # isolated workspace can see aimdk_msgs too.
+      if [[ -n "${AIMDK_OVERLAY_SETUP:-}" && ! -f "${AIMDK_OVERLAY_SETUP}" ]]; then
+        log_error "AIMDK_OVERLAY_SETUP is set but not a file: ${AIMDK_OVERLAY_SETUP}"
+        exit 1
+      fi
+      if ! python3 -c "import aimdk_msgs" >/dev/null 2>&1 && [[ -z "${AIMDK_OVERLAY_SETUP:-}" ]]; then
+        log_warn "SKIPPED: the AimDK overlay is not on the ROS 2 path (aimdk_msgs missing)."
+        log_warn "Build and source the vendor workspace, then re-run:"
+        log_warn "  cd ~/aimdk && colcon build && source install/local_setup.bash"
+        log_warn "  (or set AIMDK_OVERLAY_SETUP=<aimdk>/install/local_setup.sh)"
+        exit 0
+      fi
+      VENDOR_OVERLAY_SETUP="${AIMDK_OVERLAY_SETUP:-}"
+      ;;
+    *)
+      log_error "no runtime allow-list declared for '${robot_pkg}'"
+      log_error "add one to this script rather than relaxing the audit."
+      exit 2
+      ;;
+  esac
+  profile="${profile:-$default_profile}"
+
+  local allowlist=("${CONTRACT_PACKAGES[@]}" "${members[@]}" "${THIRD_PARTY_ALLOWED[@]}")
 
   log_info "runtime gate: computing dependency closure of ${robot_pkg}"
   local closure
@@ -151,7 +218,7 @@ runtime_gate() {
   isolated_colcon_build "$tmp"
 
   # Launch the runtime through its own entry and run conformance.
-  local profile_path="$MAIN_WORKSPACE/src/robots/so101/so101_robot/profiles/${profile}.yaml"
+  local profile_path="${profile_dir}/${profile}.yaml"
   [[ -f "$profile_path" ]] || { log_error "profile not found: $profile_path"; exit 1; }
   export CONFORMANCE_LAUNCH="ros2 launch ${robot_pkg} runtime.launch.py profile:=${profile} simulated:=true"
   export CONFORMANCE_PROFILE="$profile_path"
@@ -161,9 +228,13 @@ runtime_gate() {
   log_info "running conformance against ${robot_pkg} (profile=${profile}, simulated transport)"
   (
     cd "$tmp"
-    set +u; source /opt/ros/humble/setup.sh; source "$tmp/install/setup.sh"; set -u
+    set +u
+    source /opt/ros/humble/setup.sh
+    [[ -n "${VENDOR_OVERLAY_SETUP:-}" ]] && source "$VENDOR_OVERLAY_SETUP"
+    source "$tmp/install/setup.sh"
+    set -u
     cd "$MAIN_WORKSPACE"
-    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$MAIN_WORKSPACE/venv/bin/python3" -m pytest \
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$GATE_PYTHON" -m pytest \
       "$MAIN_WORKSPACE/src/robot_runtime/test/test_conformance.py" -q -p no:cacheprovider
   )
   log_info "runtime gate PASSED for ${robot_pkg} (fixed allow-list, isolated build, simulated conformance)"
@@ -313,6 +384,14 @@ finally:
         launch.wait(timeout=15)
     except subprocess.TimeoutExpired:
         launch.kill()
+    # The launch output is the only diagnosis when reconciliation never
+    # happens; without this the gate fails with a bare assertion and no
+    # indication of which node refused to come up.
+    if sys.exc_info()[0] is not None:
+        output = launch.stdout.read() if launch.stdout else ""
+        tail = output.splitlines()[-60:]
+        print("--- launch output (tail) ---", file=sys.stderr)
+        print("\n".join(tail), file=sys.stderr)
 PY
   ) || {
     log_error "core gate contract-chain check failed; tail of the launch log follows"

@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>lekiwi_robot</name>
+  <version>0.1.0</version>
+  <description>
+    LeKiwi robot runtime: SO-101 arm on an omni-wheel base, one shared
+    Feetech bus. Dependency closure = description, SDKs, ros2_control
+    adapter, controllers, so101_motion (the arm is an SO-101), the base node
+    (cmd_vel projection, wheel odometry, navigation gating) and the runtime
+    facade. launch/runtime.launch.py brings the robot to ACTIVE from a
+    runtime profile with no IB-Robot generic package present.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+
+  <exec_depend>lekiwi_description</exec_depend>
+  <exec_depend>so101_description</exec_depend>
+  <exec_depend>lekiwi_sdk</exec_depend>
+  <exec_depend>so101_sdk</exec_depend>
+  <exec_depend>lekiwi_hardware</exec_depend>
+  <exec_depend>lekiwi_calibration</exec_depend>
+  <!-- D12: sensor peripherals owned by the runtime -->
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>usb_cam</exec_depend>
+  <!-- camera_ros is intentionally absent: neither migrated configuration uses
+       it (lekiwi_lidar has no camera, lekiwi_nav_grasp uses realsense). It is
+       only selected by the unmigrated lekiwi.yaml, whose driver ownership
+       stays in robot_config. -->
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>so101_motion</exec_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>position_controllers</exec_depend>
+  <exec_depend>velocity_controllers</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

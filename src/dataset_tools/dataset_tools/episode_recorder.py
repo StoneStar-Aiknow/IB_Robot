@@ -95,7 +95,7 @@ from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import RecordEpisode
-from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
+from robot_config.contract_utils import contract_fingerprint, contract_to_dict, qos_profile_from_dict
 from robot_config.observation_transport import effective_observation_transport
 from robot_config.utils import (
     build_lerobot_conversion_metadata,
@@ -879,7 +879,6 @@ class EpisodeRecorderServer(Node):
         meta.setdefault("layout_version", DATASET_LAYOUT_VERSION)
         meta.setdefault("name", self._dataset_name)
         meta.setdefault("recording_type", "episodic")
-        meta.setdefault("robot_config", str(self._robot_config_path))
         meta.setdefault("robot_type", getattr(self._contract, "robot_type", ""))
         meta.setdefault("contract_name", getattr(self._contract, "name", ""))
         meta.setdefault(
@@ -896,6 +895,11 @@ class EpisodeRecorderServer(Node):
             meta.setdefault("task_family", self._task_family)
         if self._contract_fingerprint:
             meta.setdefault("contract_fingerprint", self._contract_fingerprint)
+            # The fingerprint alone cannot reconstruct the contract, so offline
+            # conversion had to reload the robot YAML and re-resolve it. Embed
+            # the resolved contract itself: it carries concrete endpoints and
+            # makes the dataset independent of the source tree.
+            meta.setdefault("contract", contract_to_dict(self._contract))
         if self._lerobot_conversion_meta:
             lerobot_meta = meta.get("lerobot") if isinstance(meta.get("lerobot"), dict) else {}
             conversions = lerobot_meta.get("conversions") if isinstance(lerobot_meta.get("conversions"), dict) else {}
@@ -1166,7 +1170,6 @@ class EpisodeRecorderServer(Node):
                 custom["ibrobot.dataset_name"] = self._dataset_name
                 custom["ibrobot.episode_index"] = str(episode_index)
                 custom["ibrobot.episode_dir"] = bag_dir.name
-                custom["ibrobot.robot_config"] = str(self._robot_config_path)
                 custom["ibrobot.contract_name"] = str(getattr(self._contract, "name", ""))
                 if self._control_mode:
                     custom["ibrobot.control_mode"] = self._control_mode

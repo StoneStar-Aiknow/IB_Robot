@@ -18,6 +18,19 @@ robot:
   type: lekiwi
   robot_type: lekiwi
 
+  # Runtime provider selection (lekiwi-runtime-migration task 5.2, first stage).
+  # Motion services come from the robot runtime: generic launch ships no
+  # planner, so a moveit control mode without a provider fails fast.
+  #
+  # require_model is deliberately NOT set yet. Setting it additionally demands
+  # that ros2_control, peripherals and control_modes.*.controllers move into the
+  # runtime profile; that ownership transfer is the remaining part of task 5.2
+  # and is not done here. Binding the provider first restores motion planning
+  # without pretending the hardware fields have already moved.
+  runtime:
+    provider: lekiwi_robot
+    profile: lekiwi_nav_grasp
+
   # The default hybrid stage keeps grasp and navigation services alive in one
   # Hermes runtime.  Motion ownership remains mutually exclusive: arm/gripper
   # controllers own joints 1-6, while base_velocity_controller owns joints 7-9.

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import av
 import numpy as np
 import pytest
+import yaml
 from lerobot.datasets.io_utils import write_info
 from lerobot.datasets.utils import DatasetInfo
 
@@ -20,6 +21,7 @@ from dataset_tools.bag_to_lerobot import (  # noqa: E402
     IntegrityReport,
     _build_feature_conversion_table,
     _clean_float_array,
+    _contract_from_dataset_metadata,
     _dataset_feature_names_for_spec,
     _estimate_stream_rate_hz,
     _image_to_hwc,
@@ -27,12 +29,13 @@ from dataset_tools.bag_to_lerobot import (  # noqa: E402
     _merge_integrity_report,
     _persist_custom_info,
     _plan_streams,
+    _preflight_bags,
     _resolve_video_codec,
     _selected_indices_for_ticks,
     discover_video_adapters,
     export_bags_to_lerobot,
+    parse_args,
 )
-from robot_config.utils import resolve_calibration_source_specs_from_config  # noqa: E402
 
 
 def test_resolve_video_codec_prefers_h264_in_auto_mode(monkeypatch):
@@ -357,8 +360,20 @@ def test_export_merges_annex_b_video_with_dds_action_and_state(tmp_path, monkeyp
         actions=[],
     )
 
-    monkeypatch.setattr("dataset_tools.bag_to_lerobot._load_contract_from_robot_config", lambda _path: contract)
-    monkeypatch.setattr("dataset_tools.bag_to_lerobot._resolve_fallback_conversion_config", lambda _path: {})
+    monkeypatch.setattr(
+        "dataset_tools.bag_to_lerobot._preflight_bags",
+        lambda bags: (
+            contract,
+            [
+                {
+                    "dataset_meta": {},
+                    "info": yaml.safe_load((bag / "metadata.yaml").read_text())["rosbag2_bagfile_information"],
+                    "tables": {},
+                }
+                for bag in bags
+            ],
+        ),
+    )
     monkeypatch.setattr(
         "dataset_tools.bag_to_lerobot.iter_specs", lambda _contract: [image_spec, state_spec, action_spec]
     )
@@ -385,7 +400,6 @@ def test_export_merges_annex_b_video_with_dds_action_and_state(tmp_path, monkeyp
 
     export_bags_to_lerobot(
         [episode_dir],
-        tmp_path / "robot.yaml",
         out_root=tmp_path / "output",
         use_videos=False,
     )
@@ -437,104 +451,6 @@ def test_clean_float_array_silent_for_current(caplog):
     with caplog.at_level("WARNING"):
         _clean_float_array([1.0, np.nan, 2.0], np.float32, feature_name="observation.current")
     assert not any("non-finite" in rec.message for rec in caplog.records if rec.levelno >= 30)
-
-
-def test_fallback_conversion_table_prefers_explicit_source_specs_over_legacy_pathsep(tmp_path):
-    front = tmp_path / "front.json"
-    left = tmp_path / "left.json"
-    right = tmp_path / "right.json"
-    legacy = tmp_path / "legacy.json"
-    for index, path in enumerate((front, left, right, legacy), start=1):
-        path.write_text(json.dumps({"1": {"range_min": 1000 + index, "range_max": 3000 + index}}))
-
-    specs = resolve_calibration_source_specs_from_config(
-        {
-            "ros2_control": {
-                "xacro_args": {
-                    "calib_file_front": str(front),
-                    "calib_file_left": str(left),
-                    "calib_file_right": str(right),
-                }
-            }
-        }
-    )
-
-    table = _build_feature_conversion_table(
-        feature_names=["joint1_front", "joint1_left", "joint1_right"],
-        conversion_meta={},
-        fallback_config={
-            "norm_mode": "range_m100_100",
-            "gripper_joints": [],
-            "calibration_source_specs": specs,
-            "calibration_file": str(legacy),
-        },
-    )
-
-    assert len(table) == 3
-    front_rad_min, front_rad_max, *_ = table[0]
-    left_rad_min, left_rad_max, *_ = table[1]
-    right_rad_min, right_rad_max, *_ = table[2]
-
-    ticks_per_rad = 4096.0 / (2.0 * np.pi)
-    assert front_rad_min == (1001 - 2048.0) / ticks_per_rad
-    assert front_rad_max == (3001 - 2048.0) / ticks_per_rad
-    assert left_rad_min == (1002 - 2048.0) / ticks_per_rad
-    assert left_rad_max == (3002 - 2048.0) / ticks_per_rad
-    assert right_rad_min == (1003 - 2048.0) / ticks_per_rad
-    assert right_rad_max == (3003 - 2048.0) / ticks_per_rad
-
-
-def test_lekiwi_navi_conversion_maps_arm_and_preserves_base_values(tmp_path):
-    calibration = tmp_path / "follower.json"
-    calibration.write_text(
-        json.dumps({str(index): {"range_min": 1000 + index, "range_max": 3000 + index} for index in range(1, 7)}),
-        encoding="utf-8",
-    )
-    fallback = {
-        "norm_mode": "range_m100_100",
-        "gripper_joints": ["6"],
-        "calibration_source_specs": [],
-        "calibration_file": str(calibration),
-        "joint_names": [str(index) for index in range(1, 7)],
-    }
-
-    state_table = _build_feature_conversion_table(
-        feature_names=[
-            "position.1",
-            "position.2",
-            "position.3",
-            "position.4",
-            "position.5",
-            "position.6",
-            "velocity.7",
-            "velocity.8",
-            "velocity.9",
-        ],
-        conversion_meta={},
-        fallback_config=fallback,
-        feature_kind="state",
-    )
-    action_table = _build_feature_conversion_table(
-        feature_names=[f"action.{index}" for index in range(9)],
-        conversion_meta={},
-        fallback_config=fallback,
-        feature_kind="action",
-    )
-
-    assert len(state_table) == 9
-    assert len(action_table) == 9
-    ticks_per_rad = 4096.0 / (2.0 * np.pi)
-    assert state_table[0][:2] == (
-        (1001 - 2048.0) / ticks_per_rad,
-        (3001 - 2048.0) / ticks_per_rad,
-    )
-    assert state_table[5][:2] == (
-        (1006 - 2048.0) / ticks_per_rad,
-        (3006 - 2048.0) / ticks_per_rad,
-    )
-    assert state_table[6:] == [(0.0, 1.0, 1.0, 0.0)] * 3
-    assert action_table[5][0] < action_table[5][1]
-    assert action_table[6:] == [(0.0, 1.0, 1.0, 0.0)] * 3
 
 
 def _write_annex_b_episode(episode_dir: Path, frame_indices: list[int]) -> Path:
@@ -682,8 +598,20 @@ def _install_export_stubs(monkeypatch) -> None:
     )
     contract = SimpleNamespace(rate_hz=10, robot_type="test", observations=[], actions=[])
 
-    monkeypatch.setattr("dataset_tools.bag_to_lerobot._load_contract_from_robot_config", lambda _path: contract)
-    monkeypatch.setattr("dataset_tools.bag_to_lerobot._resolve_fallback_conversion_config", lambda _path: {})
+    monkeypatch.setattr(
+        "dataset_tools.bag_to_lerobot._preflight_bags",
+        lambda bags: (
+            contract,
+            [
+                {
+                    "dataset_meta": {},
+                    "info": yaml.safe_load((bag / "metadata.yaml").read_text())["rosbag2_bagfile_information"],
+                    "tables": {},
+                }
+                for bag in bags
+            ],
+        ),
+    )
     monkeypatch.setattr(
         "dataset_tools.bag_to_lerobot.iter_specs", lambda _contract: [image_spec, state_spec, action_spec]
     )
@@ -733,7 +661,6 @@ def test_export_skips_a_bag_whose_frames_fail_to_decode(tmp_path, monkeypatch, c
 
     export_bags_to_lerobot(
         [bad_bag, good_bag],
-        tmp_path / "robot.yaml",
         out_root=tmp_path / "output",
         use_videos=False,
     )
@@ -753,7 +680,6 @@ def test_export_raises_instead_of_reporting_ok_when_every_bag_is_skipped(tmp_pat
     with pytest.raises(RuntimeError) as excinfo:
         export_bags_to_lerobot(
             [bad_bag],
-            tmp_path / "robot.yaml",
             out_root=tmp_path / "output",
             use_videos=False,
         )
@@ -772,7 +698,6 @@ def test_export_summarizes_skipped_bags_when_some_succeed(tmp_path, monkeypatch,
 
     export_bags_to_lerobot(
         [bad_bag, good_bag],
-        tmp_path / "robot.yaml",
         out_root=tmp_path / "output",
         use_videos=False,
     )
@@ -793,7 +718,6 @@ def test_export_removes_the_dataset_it_created_when_every_bag_is_skipped(tmp_pat
     with pytest.raises(RuntimeError):
         export_bags_to_lerobot(
             [bad_bag],
-            tmp_path / "robot.yaml",
             out_root=out_root,
             use_videos=False,
         )
@@ -812,7 +736,6 @@ def test_export_keeps_a_preexisting_output_directory_when_every_bag_is_skipped(t
     with pytest.raises(RuntimeError):
         export_bags_to_lerobot(
             [bad_bag],
-            tmp_path / "robot.yaml",
             out_root=out_root,
             use_videos=False,
         )
@@ -820,118 +743,15 @@ def test_export_keeps_a_preexisting_output_directory_when_every_bag_is_skipped(t
     assert (out_root / "preexisting.txt").read_text(encoding="utf-8") == "keep me"
 
 
-def test_conversion_table_uses_contract_joint_names_not_numeric_indices(tmp_path):
-    """Joint names come from the contract; they are not required to be digits.
-
-    The LeKiWi profile happens to name its joints "1".."6", which is what made the
-    hardcoded 1..6 range and the action index +1 arithmetic look correct. A robot with
-    named joints must convert just the same.
-    """
-    joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-    calibration = tmp_path / "follower.json"
-    calibration.write_text(
-        json.dumps(
-            {name: {"range_min": 1000 + index, "range_max": 3000 + index} for index, name in enumerate(joint_names, 1)}
-        ),
-        encoding="utf-8",
-    )
-    fallback = {
-        "norm_mode": "range_m100_100",
-        "gripper_joints": ["gripper"],
-        "calibration_source_specs": [],
-        "calibration_file": str(calibration),
-        "joint_names": joint_names,
-    }
-
-    state_table = _build_feature_conversion_table(
-        feature_names=[f"position.{name}" for name in joint_names] + ["velocity.7", "velocity.8", "velocity.9"],
-        conversion_meta={},
-        fallback_config=fallback,
-        feature_kind="state",
-    )
-    action_table = _build_feature_conversion_table(
-        feature_names=[f"action.{index}" for index in range(9)],
-        conversion_meta={},
-        fallback_config=fallback,
-        feature_kind="action",
-    )
-
-    ticks_per_rad = 4096.0 / (2.0 * np.pi)
-    # Every named arm joint is converted, not silently passed through as raw radians.
-    assert state_table[0][:2] == ((1001 - 2048.0) / ticks_per_rad, (3001 - 2048.0) / ticks_per_rad)
-    assert state_table[5][:2] == ((1006 - 2048.0) / ticks_per_rad, (3006 - 2048.0) / ticks_per_rad)
-    assert state_table[:6] != [(0.0, 1.0, 1.0, 0.0)] * 6
-    # Base wheels stay in native rad/s.
-    assert state_table[6:] == [(0.0, 1.0, 1.0, 0.0)] * 3
-    # action.<i> indexes the arm joints in declared order.
-    assert action_table[0][:2] == ((1001 - 2048.0) / ticks_per_rad, (3001 - 2048.0) / ticks_per_rad)
-    assert action_table[6:] == [(0.0, 1.0, 1.0, 0.0)] * 3
-
-
-def test_conversion_table_passes_joint_velocity_through_unconverted(tmp_path):
-    """A joint's angular velocity must not be scaled by that joint's position range.
-
-    ``range_min``/``range_max`` describe travel in ticks, so applying them to a rad/s
-    value is a silent dimensional error. The contract allows ``velocity.<joint_name>``
-    for any joint in ``joint_names``, which is where position and velocity stop being
-    distinguishable by suffix alone.
-    """
-    calibration = tmp_path / "follower.json"
-    calibration.write_text(json.dumps({"1": {"range_min": 1000, "range_max": 3000}}), encoding="utf-8")
-
-    table = _build_feature_conversion_table(
-        feature_names=["position.1", "velocity.1"],
-        conversion_meta={},
-        fallback_config={
-            "norm_mode": "range_m100_100",
-            "gripper_joints": [],
-            "calibration_source_specs": [],
-            "calibration_file": str(calibration),
-            "joint_names": ["1"],
-        },
-        feature_kind="state",
-    )
-
-    assert table[0] != (0.0, 1.0, 1.0, 0.0)
-    assert table[1] == (0.0, 1.0, 1.0, 0.0)
-
-
-def test_conversion_table_warns_before_passing_a_feature_through_unconverted(tmp_path, capsys):
-    """An identity tuple writes raw radians into a field declared as normalized units.
-
-    That is exactly the silent dimensional error 70dd30b set out to fix, so a feature
-    that resolves to no calibration entry has to say so.
-    """
-    calibration = tmp_path / "follower.json"
-    calibration.write_text(json.dumps({"1": {"range_min": 1000, "range_max": 3000}}), encoding="utf-8")
-
-    table = _build_feature_conversion_table(
-        feature_names=["position.1", "position.mystery_joint"],
-        conversion_meta={},
-        fallback_config={
-            "norm_mode": "range_m100_100",
-            "gripper_joints": [],
-            "calibration_source_specs": [],
-            "calibration_file": str(calibration),
-            "joint_names": ["1"],
-        },
-        feature_kind="state",
-    )
-
-    assert table[1] == (0.0, 1.0, 1.0, 0.0)
-    assert table[0] != (0.0, 1.0, 1.0, 0.0)
-    assert "mystery_joint" in capsys.readouterr().out
-
-
-def _public_conversion_meta():
+def _public_conversion_meta(joints=None):
     """A recorded public snapshot generated by the real builder (round-trip valid)."""
     from robot_runtime.interface_description import description_digest
     from robot_runtime.model_metadata import build_public_conversion_metadata, joint_conversions_fingerprint
 
-    joints = ["1", "2", "3", "4", "5", "6"]
+    joints = joints or ["1", "2", "3", "4", "5", "6"]
 
     def _entry(index: int, name: str) -> dict:
-        span, offset = (100.0, 0.0) if name == "6" else (200.0, -100.0)
+        span, offset = (100.0, 0.0) if name == joints[-1] else (200.0, -100.0)
         return {"min": -1.0 + index, "max": 1.0 + index, "span": span, "offset": offset}
 
     conversions = {
@@ -947,7 +767,7 @@ def _public_conversion_meta():
     model = {
         "schema_version": 1,
         "authority": "calibration",
-        "joint_groups": {"all": list(joints), "arm": joints[:5], "gripper": ["6"], "base": []},
+        "joint_groups": {"all": list(joints), "arm": joints[:5], "gripper": [joints[-1]], "base": []},
         "joint_limits": {name: {"min": -1.0 + index, "max": 1.0 + index} for index, name in enumerate(joints)},
         "home_positions": {},
         "frames": {"base_link": "base", "ee_link": "gripper"},
@@ -987,7 +807,6 @@ def test_public_conversion_table_maps_field_selectors_to_joints():
     table = _build_feature_conversion_table(
         feature_names=[f"position.{name}" for name in ["1", "2", "3", "4", "5", "6"]],
         conversion_meta=meta,
-        fallback_config={},
         feature_kind="state",
     )
     assert [row[0] for row in table] == [-1.0 + index for index in range(6)]
@@ -1000,7 +819,6 @@ def test_public_conversion_table_detects_real_order_conflicts_through_mapping():
         _build_feature_conversion_table(
             feature_names=[f"position.{name}" for name in ["2", "1", "3", "4", "5", "6"]],
             conversion_meta=meta,
-            fallback_config={},
             feature_kind="state",
         )
 
@@ -1010,8 +828,375 @@ def test_public_conversion_table_maps_action_indices_to_joints():
     table = _build_feature_conversion_table(
         feature_names=["action.0", "action.1", "action.2", "action.3", "action.4", "action.5"],
         conversion_meta=meta,
-        fallback_config={},
         feature_kind="action",
     )
     assert len(table) == 6
     assert [row[0] for row in table] == [-1.0 + index for index in range(6)]
+
+
+# ---------------------------------------------------------------------------
+# Dataset-embedded contract snapshots
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_contract_document() -> dict:
+    """A resolved contract mapping shaped like what the recorder embeds."""
+    return {
+        "name": "snapshot_contract",
+        "version": 1,
+        "rate_hz": 20.0,
+        "max_duration_s": 30.0,
+        "robot_type": "so_101",
+        "timestamp_source": "header",
+        "recording": {},
+        "process": {},
+        "tasks": [],
+        "observations": [
+            {
+                "key": "observation.state",
+                "topic": "/joint_states",
+                "type": "sensor_msgs/msg/JointState",
+                "selector": {"names": ["position.1", "position.2"]},
+                "align": {"strategy": "hold", "stamp": "header", "tol_ms": 100},
+            }
+        ],
+        "actions": [
+            {
+                "key": "action",
+                "selector": {"names": ["action.0", "action.1"]},
+                "safety_behavior": "hold",
+                "publish": {
+                    "topic": "/arm_position_controller/commands",
+                    "type": "std_msgs/msg/Float64MultiArray",
+                },
+            }
+        ],
+    }
+
+
+def _dataset_metadata_with_snapshot() -> dict:
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict
+
+    document = _snapshot_contract_document()
+    contract = contract_from_dict(document)
+    return {
+        "contract": document,
+        "contract_fingerprint": contract_fingerprint(contract),
+    }
+
+
+def test_contract_snapshot_round_trips_through_the_recorder_serializer():
+    """contract_to_dict and contract_from_dict must preserve identity."""
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict, contract_to_dict
+
+    original = contract_from_dict(_snapshot_contract_document())
+    restored = contract_from_dict(contract_to_dict(original))
+
+    assert contract_fingerprint(restored) == contract_fingerprint(original)
+    assert restored.rate_hz == original.rate_hz
+    assert restored.robot_type == original.robot_type
+    assert [obs.topic for obs in restored.observations] == [obs.topic for obs in original.observations]
+    assert [act.publish_topic for act in restored.actions] == [act.publish_topic for act in original.actions]
+
+
+def test_contract_snapshot_rebuilds_without_the_source_tree():
+    contract = _contract_from_dataset_metadata(_dataset_metadata_with_snapshot())
+
+    assert contract is not None
+    assert contract.rate_hz == 20.0
+    assert contract.observations[0].topic == "/joint_states"
+    assert contract.actions[0].publish_topic == "/arm_position_controller/commands"
+
+
+def test_contract_snapshot_rejects_a_mismatched_fingerprint():
+    """A snapshot that no longer round-trips must not be silently used."""
+    meta = _dataset_metadata_with_snapshot()
+    meta["contract"]["observations"][0]["topic"] = "/somewhere_else"
+
+    with pytest.raises(ValueError, match="does not match its fingerprint"):
+        _contract_from_dataset_metadata(meta)
+
+
+def _recorded_bag(tmp_path, name="dataset", *, mode="none", image_only=False):
+    meta = _dataset_metadata_with_snapshot()
+    if image_only:
+        meta["contract"]["actions"] = []
+        meta["contract"]["observations"] = [
+            {
+                "key": "observation.images.top",
+                "topic": "/image",
+                "type": "sensor_msgs/msg/Image",
+                "image": {"resize": [16, 16]},
+            }
+        ]
+        from robot_config.contract_utils import contract_fingerprint, contract_from_dict
+
+        meta["contract_fingerprint"] = contract_fingerprint(contract_from_dict(meta["contract"]))
+    conversion = {"norm_mode": mode}
+    meta["lerobot"] = {"default_conversion_fingerprint": "conversion", "conversions": {"conversion": conversion}}
+    bag = tmp_path / name / "episodes" / "episode_000001"
+    bag.mkdir(parents=True)
+    info = {
+        "custom_data": {
+            "ibrobot.contract_fingerprint": meta["contract_fingerprint"],
+            "ibrobot.lerobot_conversion_fingerprint": "conversion",
+        }
+    }
+    _write_recorded_metadata(bag, meta, info)
+    return bag, meta, info
+
+
+def _write_recorded_metadata(bag, meta, info):
+    (bag.parent.parent / "dataset.yaml").write_text(yaml.safe_dump(meta))
+    (bag / "metadata.yaml").write_text(yaml.safe_dump({"rosbag2_bagfile_information": info}))
+
+
+@pytest.mark.parametrize("snapshot", [None, {}, [], "bad"])
+def test_absent_or_malformed_contract_is_rejected(snapshot):
+    with pytest.raises(ValueError, match="contract snapshot"):
+        _contract_from_dataset_metadata({"contract": snapshot})
+
+
+@pytest.mark.parametrize("field", ["name", "rate_hz", "timestamp_source", "observations", "actions", "tasks"])
+def test_snapshot_required_fields_do_not_default(field):
+    meta = _dataset_metadata_with_snapshot()
+    del meta["contract"][field]
+    with pytest.raises(ValueError, match=field):
+        _contract_from_dataset_metadata(meta)
+
+
+@pytest.mark.parametrize("rate", [0, -1, 20.5, float("nan"), float("inf"), True, "20"])
+def test_invalid_snapshot_rate(rate):
+    meta = _dataset_metadata_with_snapshot()
+    meta["contract"]["rate_hz"] = rate
+    with pytest.raises(ValueError, match="rate_hz"):
+        _contract_from_dataset_metadata(meta)
+
+
+def test_preflight_accepts_explicit_none_without_calibration(tmp_path):
+    bag, _, _ = _recorded_bag(tmp_path)
+    _, episodes = _preflight_bags([bag])
+    assert episodes[0]["tables"] == {"observation.state": [], "action": []}
+
+
+def test_image_only_needs_no_conversion_metadata(tmp_path):
+    bag, meta, info = _recorded_bag(tmp_path, image_only=True)
+    del meta["lerobot"]
+    del info["custom_data"]["ibrobot.lerobot_conversion_fingerprint"]
+    _write_recorded_metadata(bag, meta, info)
+    _, episodes = _preflight_bags([bag])
+    assert episodes[0]["tables"] == {}
+
+
+@pytest.mark.parametrize("change", ["episode_contract", "conversion_fp", "lookup", "metadata", "mode"])
+def test_second_bag_metadata_failure_precedes_output_creation(tmp_path, monkeypatch, change):
+    first, _, _ = _recorded_bag(tmp_path, "first")
+    second, meta, info = _recorded_bag(tmp_path, "second")
+    if change == "episode_contract":
+        info["custom_data"]["ibrobot.contract_fingerprint"] = "wrong"
+    elif change == "conversion_fp":
+        del info["custom_data"]["ibrobot.lerobot_conversion_fingerprint"]
+    elif change == "lookup":
+        meta["lerobot"]["conversions"] = {}
+    elif change == "metadata":
+        del meta["lerobot"]
+    else:
+        meta["lerobot"]["conversions"]["conversion"] = {}
+    _write_recorded_metadata(second, meta, info)
+
+    def fail_create(**kwargs):
+        pytest.fail("output created before all episodes passed preflight")
+
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.LeRobotDataset.create", fail_create)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match=str(second)):
+        export_bags_to_lerobot([first, second], out_root=out)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("field", ["description", "joint_names", "feature_names", "joint_conversions", "norm_mode"])
+def test_incomplete_normalization_metadata_rejected(tmp_path, field):
+    bag, meta, info = _recorded_bag(tmp_path)
+    conversion = _public_conversion_meta()
+    fingerprint = conversion["conversion_fingerprint"]
+    del conversion[field]
+    # Even a legacy calibration block must not provide a downgrade path.
+    conversion["calibration"] = {"1": {"range_min": 1000, "range_max": 3000}}
+    meta["lerobot"]["conversions"] = {fingerprint: conversion}
+    info["custom_data"]["ibrobot.lerobot_conversion_fingerprint"] = fingerprint
+    _write_recorded_metadata(bag, meta, info)
+    with pytest.raises(ValueError):
+        _preflight_bags([bag])
+
+
+def test_mixed_rates_rejected_even_though_fingerprint_excludes_rate(tmp_path):
+    first, _, _ = _recorded_bag(tmp_path, "first")
+    second, meta, info = _recorded_bag(tmp_path, "second")
+    meta["contract"]["rate_hz"] = 30
+    _write_recorded_metadata(second, meta, info)
+    with pytest.raises(ValueError, match="incompatible contract snapshots"):
+        _preflight_bags([first, second])
+
+
+def test_removed_robot_config_cli_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["bag_to_lerobot", "--bag", "bag", "--out", "out", "--robot-config", "robot.yaml"])
+    with pytest.raises(SystemExit) as exc:
+        parse_args()
+    assert exc.value.code == 2
+
+
+def test_normalization_keeps_velocity_native_and_rejects_missing_positions():
+    meta = _public_conversion_meta()
+    names = [f"position.{i}" for i in range(1, 7)] + ["velocity.1"]
+    table = _build_feature_conversion_table(names, meta, feature_kind="state")
+    assert table[-1] == (0.0, 1.0, 1.0, 0.0)
+    assert table[0] != table[-1]
+    with pytest.raises(ValueError, match="calibration mapping"):
+        _build_feature_conversion_table(names + ["position.missing"], meta, feature_kind="state")
+    with pytest.raises(ValueError, match="calibration mapping"):
+        _build_feature_conversion_table(["action.99"], meta, feature_kind="action")
+
+
+@pytest.mark.parametrize("joints", [["1", "2", "3", "4", "5", "6"], ["pan", "lift", "elbow", "wrist", "roll", "grip"]])
+def test_complete_normalization_snapshot_preflight(tmp_path, joints):
+    bag, meta, info = _recorded_bag(tmp_path)
+    conversion = _public_conversion_meta(joints)
+    fingerprint = conversion["conversion_fingerprint"]
+    meta["contract"]["observations"][0]["selector"]["names"] = [f"position.{name}" for name in joints]
+    meta["contract"]["actions"][0]["selector"]["names"] = [f"action.{i}" for i in range(6)]
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict
+
+    meta["contract_fingerprint"] = contract_fingerprint(contract_from_dict(meta["contract"]))
+    info["custom_data"]["ibrobot.contract_fingerprint"] = meta["contract_fingerprint"]
+    info["custom_data"]["ibrobot.lerobot_conversion_fingerprint"] = fingerprint
+    meta["lerobot"]["conversions"] = {fingerprint: conversion}
+    _write_recorded_metadata(bag, meta, info)
+    _, episodes = _preflight_bags([bag])
+    tables = episodes[0]["tables"]
+    assert tables["observation.state"] == tables["action"]
+    assert len(tables["action"]) == 6
+    assert tables["action"][0] != (0.0, 1.0, 1.0, 0.0)
+
+
+def test_none_does_not_bypass_malformed_public_snapshot(tmp_path):
+    bag, meta, info = _recorded_bag(tmp_path)
+    meta["lerobot"]["conversions"]["conversion"]["description"] = {}
+    _write_recorded_metadata(bag, meta, info)
+    with pytest.raises(ValueError, match="public conversion metadata"):
+        _preflight_bags([bag])
+
+
+def test_incomplete_second_normalization_snapshot_prevents_output(tmp_path, monkeypatch):
+    first, _, _ = _recorded_bag(tmp_path, "first")
+    second, meta, info = _recorded_bag(tmp_path, "second", mode="degrees")
+    _write_recorded_metadata(second, meta, info)
+
+    def fail_create(**kwargs):
+        pytest.fail("created output for incomplete normalization metadata")
+
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.LeRobotDataset.create", fail_create)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="public conversion metadata"):
+        export_bags_to_lerobot([first, second], out_root=out)
+    assert not out.exists()
+
+
+def test_malformed_episode_yaml_reports_bag_context(tmp_path):
+    bag, _, _ = _recorded_bag(tmp_path)
+    (bag / "metadata.yaml").write_text("broken: [")
+    with pytest.raises(ValueError, match=str(bag)):
+        _preflight_bags([bag])
+
+
+@pytest.mark.parametrize(
+    ("mode", "integrity_mode"),
+    [("omitted", None), ("dds", None), ("rtp", None), ("rtp", "strict"), ("rtp", "tolerant")],
+)
+def test_transport_snapshot_yaml_round_trip(tmp_path, mode, integrity_mode):
+    """Recorded transport survives YAML and the converter's snapshot loader."""
+    from dataclasses import asdict
+
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict, contract_to_dict
+    from robot_config.observation_transport import effective_observation_transport
+
+    document = _snapshot_contract_document()
+    observation = {
+        "key": "observation.images.top",
+        "topic": "/camera/top/image_raw",
+        "type": "sensor_msgs/msg/Image",
+        "image": {"resize": [240, 320], "encoding": "rgb8"},
+    }
+    transport = {
+        "mode": "rtp",
+        "stream_id": "top-recorded",
+        "endpoint": {"host": "192.0.2.17", "port": 5012},
+        "h264": {"profile": "main", "bitrate_bps": 2_500_000, "gop_frames": 12},
+        "media": {
+            "width": 640,
+            "height": 480,
+            "frame_rate_hz": 25,
+            "pixel_format": "nv12",
+            "color_space": "bt709",
+            "color_range": "full",
+        },
+        "buffer": {
+            "sender_queue_frames": 3,
+            "receiver_queue_packets": 512,
+            "decoded_frame_capacity": 48,
+            "retention_ms": 1600,
+        },
+        "readiness": {
+            "keyframe_timeout_ms": 4500,
+            "timestamp_mapping_max_age_ms": 1500,
+            "max_inter_camera_skew_ms": 60,
+            "state_alignment_window_ms": 2500,
+            "state_alignment_tolerance_ms": 35,
+        },
+    }
+    if mode == "dds":
+        observation["transport"] = {"mode": "dds"}
+    elif mode == "rtp":
+        if integrity_mode is not None:
+            transport["recording"] = {"integrity_mode": integrity_mode}
+        observation["transport"] = transport
+    document["observations"] = [observation]
+    original = contract_from_dict(document)
+    snapshot = contract_to_dict(original)
+    path = tmp_path / "dataset.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "contract": snapshot,
+                "contract_fingerprint": contract_fingerprint(original),
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    restored = _contract_from_dataset_metadata(recorded)
+
+    before = original.observations[0].transport
+    after = restored.observations[0].transport
+    assert after == before
+    assert effective_observation_transport(after) == effective_observation_transport(before)
+    assert restored.observations[0].image == observation["image"]
+    assert contract_fingerprint(restored) == contract_fingerprint(original)
+    serialized = recorded["contract"]["observations"][0]
+    if mode == "omitted":
+        assert "transport" not in serialized
+        assert after is None
+        assert effective_observation_transport(after).mode == "dds"
+    elif mode == "dds":
+        assert serialized["transport"] == {"mode": "dds"}
+        assert after.mode == "dds"
+    else:
+        actual = asdict(after)
+        for field in ("mode", "stream_id", "endpoint", "h264", "media", "buffer", "readiness"):
+            assert actual[field] == transport[field], field
+            assert serialized["transport"][field] == transport[field], field
+        if integrity_mode is None:
+            assert "recording" not in serialized["transport"]
+            assert after.recording is None
+        else:
+            assert serialized["transport"]["recording"] == {"integrity_mode": integrity_mode}
+            assert after.recording.integrity_mode == integrity_mode

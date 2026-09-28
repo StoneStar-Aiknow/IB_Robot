@@ -257,6 +257,24 @@ class DeadlineExceededError(RuntimeError):
     stage = "deadline"
 
 
+class DistributedSessionNotReadyError(RuntimeError):
+    """Session-level failure raised while no distributed session exists.
+
+    After the cloud heartbeat expires (or before the first handshake) no
+    observation can reach the backend; reporting that through the per-
+    observation readiness path surfaces misleading "video_not_sent" noise
+    instead of the actual transport outage. The recoverable flag lets the
+    dispatcher retry once the session is re-established.
+    """
+
+    code = "not_ready"
+    recoverable = True
+    stage = "transport"
+
+    def __init__(self, state: str) -> None:
+        super().__init__(f"distributed pipeline is not ready ({state})")
+
+
 class _ExternalVideoProducerView:
     """Request-side session view for an out-of-process frame producer.
 
@@ -506,12 +524,18 @@ class PipelinePolicyNode(Node):
                     deployment_fingerprint=self._manifest.fingerprint,
                 )
             else:
-                self._video_stream_manager = DeviceVideoStreamManager(
-                    pipeline_id=config.pipeline_id,
-                    contract_fingerprint=contract_fingerprint(self._contract),
-                    deployment_fingerprint=self._manifest.fingerprint,
-                    observation_specs=self._obs_specs,
-                )
+                from robot_config.observation_transport import effective_observation_transport
+
+                if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
+                    self._video_stream_manager = DeviceVideoStreamManager(
+                        pipeline_id=config.pipeline_id,
+                        contract_fingerprint=contract_fingerprint(self._contract),
+                        deployment_fingerprint=self._manifest.fingerprint,
+                        observation_specs=self._obs_specs,
+                    )
+                # Pipelines whose observations all ride the request (pure DDS
+                # transport) have no video streams to manage; the frame ingress
+                # rejects an empty stream set, so the manager stays unset.
 
         self._action_pub = None
         if not config.scheduler_enabled:
@@ -523,8 +547,9 @@ class PipelinePolicyNode(Node):
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
+            video_manager = self._video_stream_manager
             descriptor_qos = QoSProfile(
-                depth=max(1, len(self._video_stream_manager.diagnostic_snapshots())),
+                depth=max(1, len(video_manager.diagnostic_snapshots())) if video_manager is not None else 1,
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
@@ -772,6 +797,13 @@ class PipelinePolicyNode(Node):
         window_ns = self._state_alignment_window_ns
         if window_ns <= 0:
             return (), ()
+        if len(self._state_specs) > 1:
+            self.get_logger().warning(
+                "multiple observation.state sources are not supported by the alignment history;"
+                " falling back to the tick-anchored sample",
+                throttle_duration_sec=30.0,
+            )
+            return (), ()
         keys: list[str] = []
         for key in observations:
             state = self._subs.get(key)
@@ -800,12 +832,16 @@ class PipelinePolicyNode(Node):
         for timestamp_ns in anchor_entries:
             entry: dict[str, object] = {}
             for key in keys:
-                value, issue = self._subs[key].buffer.select(timestamp_ns)
-                if value is None:
-                    del issue
+                state = self._subs[key]
+                message, _issue = state.buffer.select(timestamp_ns)
+                if message is None:
                     entry = {}
                     break
-                if key == "observation.state":
+                value = decode_value(state.spec.ros_type, message, state.spec)
+                if value is None:
+                    entry = {}
+                    break
+                if state.spec.key == "observation.state":
                     value = self._rad_to_lerobot(value)
                 entry[key] = value
             if entry:
@@ -1580,6 +1616,22 @@ class PipelinePolicyNode(Node):
             "observation_monotonic_ns": now_mono_ns - age_ns,
         }
 
+    def _ensure_distributed_session_ready(self) -> None:
+        """Fail fast while the distributed session is not established.
+
+        A cleared session (cloud heartbeat expired, handshake recovery
+        pending) means no observation can reach the backend, so the request
+        fails with the session-level not_ready code before observation
+        sampling produces per-observation readiness noise.
+        """
+        if self._config.execution_mode != "distributed":
+            return
+        session = self._require_edge_session()
+        if session.ready:
+            return
+        state = getattr(session.state, "value", str(session.state))
+        raise DistributedSessionNotReadyError(state)
+
     def _execute_inference_request(
         self,
         goal_handle: object,
@@ -1593,6 +1645,7 @@ class PipelinePolicyNode(Node):
         if deadline is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
         self._raise_if_deadline_expired(deadline, request_id)
+        self._ensure_distributed_session_ready()
         trace.flow_receive(
             "dispatch_to_observation",
             request_id,
