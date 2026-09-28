@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 AtomGit Issue Management Tool
+
+Platform access goes through the official AtomGit CLI via the shared boundary
+in ``.agents/skills/_shared/atomgit_cli.py`` (OpenSpec change
+``migrate-atomgit-skills-to-cli``). Authentication is owned by the CLI:
+``gitcode auth login --hostname atomgit.com --with-token``.
 """
 
 import argparse
@@ -8,14 +13,9 @@ import json
 import sys
 from pathlib import Path
 
-try:
-    from atomgit_sdk import AtomGitClient, IssueService, resolve_atomgit_context
-except ImportError:
-    print(
-        "Error: AtomGit SDK not found. Please install project requirements by running setup.sh, "
-        "or install atomgit-sdk in the active environment."
-    )
-    sys.exit(1)
+sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
+
+import atomgit_cli
 
 
 def parse_args():
@@ -34,7 +34,11 @@ def parse_args():
         action="store_true",
         help="Skip fetching issue comments in --fetch-info mode",
     )
-    parser.add_argument("--config", default="config.json", help="Path to config.json")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config.json (optional atomgit.owner/repo defaults; no longer used for authentication)",
+    )
     parser.add_argument("--owner", help="Target repository owner override")
     parser.add_argument("--repo", help="Target repository name override")
     parser.add_argument("--url", help="Issue or repository URL for auto-resolving owner/repo/issue")
@@ -44,22 +48,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def issue_url(target: atomgit_cli.RepoTarget, issue_number: int) -> str:
+    """Construct the web URL locally (no platform call; registered web host only)."""
+    return f"https://{atomgit_cli.DEFAULT_WEB_HOST}/{target.owner}/{target.repo}/issues/{issue_number}"
+
+
+def run_or_raise(argv: list[str], cli: str, *, stdin_text: str | None = None) -> atomgit_cli.CLIResult:
+    """Run one CLI invocation; a nonzero exit raises its classified failure."""
+    result = atomgit_cli.run(argv, cli=cli, stdin_text=stdin_text)
+    failure = result.failure()
+    if failure is not None:
+        raise failure
+    return result
+
+
 def main():
     args = parse_args()
 
     # Load configuration
     try:
-        config, parsed_url = resolve_atomgit_context(args.config, owner=args.owner, repo=args.repo, url=args.url)
-        client = AtomGitClient(config)
-        service = IssueService(client)
-    except Exception as e:
-        print(f"Error initializing AtomGit SDK: {e}")
+        cli = atomgit_cli.resolve_cli()
+        atomgit_cli.check_cli_identity(cli)
+        target = atomgit_cli.resolve_target(
+            owner=args.owner,
+            repo=args.repo,
+            url=args.url,
+            config_path=args.config or "config.json",
+            explicit_config=args.config is not None,
+            remotes=atomgit_cli.read_git_remotes(),
+        )
+    except (atomgit_cli.CLIError, atomgit_cli.TargetResolutionError) as e:
+        print(f"Error initializing AtomGit CLI access: {e}")
         sys.exit(1)
 
-    if args.issue is None:
-        args.issue = parsed_url.get("issue_number")
+    if args.issue is None and target.url_info:
+        args.issue = target.url_info.get("issue_number")
 
-    print(f"Target repo: {config.owner}/{config.repo}")
+    print(f"Target repo: {target.slug}")
     if args.url:
         print(f"Resolved from URL: {args.url}")
 
@@ -71,13 +96,59 @@ def main():
 
         print(f"Fetching info for issue #{args.issue}...")
         try:
-            issue_data = service.get_issue(args.issue)
+            view = atomgit_cli.run_json(
+                ["issue", "view", str(args.issue), "-R", target.slug, "--json"],
+                cli=cli,
+            )
+            issue_data = view.require_data()
+            if not isinstance(issue_data, dict):
+                raise atomgit_cli.CLIJSONError(
+                    f"issue view returned {type(issue_data).__name__} instead of a JSON object",
+                    argv=view.argv,
+                    returncode=view.returncode,
+                    stdout=view.stdout,
+                    stderr=view.stderr,
+                )
             if not args.no_comments:
-                issue_data["comments_detail"] = service.get_issue_comments(args.issue)
+                comments = atomgit_cli.run_json(
+                    [
+                        "issue",
+                        "comments",
+                        str(args.issue),
+                        "-R",
+                        target.slug,
+                        "--json",
+                        "--limit",
+                        "0",
+                        "--order",
+                        "asc",
+                    ],
+                    cli=cli,
+                )
+                comment_list = comments.require_data()
+                if not isinstance(comment_list, list):
+                    raise atomgit_cli.CLIJSONError(
+                        f"issue comments returned {type(comment_list).__name__} instead of a JSON array",
+                        argv=comments.argv,
+                        returncode=comments.returncode,
+                        stdout=comments.stdout,
+                        stderr=comments.stderr,
+                    )
+                non_object_entries = [comment for comment in comment_list if not isinstance(comment, dict)]
+                if non_object_entries:
+                    raise atomgit_cli.CLIJSONError(
+                        f"issue comments array contains {len(non_object_entries)} non-object entries; "
+                        "refusing to write a partial issue context",
+                        argv=comments.argv,
+                        returncode=comments.returncode,
+                        stdout=comments.stdout,
+                        stderr=comments.stderr,
+                    )
+                issue_data["comments_detail"] = comment_list
 
             output_dir = Path(args.output_dir)
             output_dir.mkdir(exist_ok=True)
-            repo_name = config.repo.lower().replace("-", "_")
+            repo_name = target.repo.lower().replace("-", "_")
             output_file = output_dir / f"{repo_name}_issue_{args.issue}_context.json"
 
             with open(output_file, "w", encoding="utf-8") as f:
@@ -87,7 +158,7 @@ def main():
             if not args.no_comments:
                 print(f"Included {len(issue_data.get('comments_detail', []))} issue comments")
             return
-        except Exception as e:
+        except atomgit_cli.CLIError as e:
             print(f"Error fetching issue info: {e}")
             sys.exit(1)
 
@@ -101,11 +172,24 @@ def main():
             print(f"[DRY RUN] Comment: {args.comment}")
             return
         try:
-            service.submit_issue_comment(args.issue, args.comment)
+            run_or_raise(
+                [
+                    "issue",
+                    "comment",
+                    str(args.issue),
+                    "-R",
+                    target.slug,
+                    "--body-file",
+                    "-",
+                    "--json",
+                ],
+                cli=cli,
+                stdin_text=args.comment,
+            )
             print(f"Successfully commented on issue #{args.issue}")
-            print(f"URL: {service.get_issue_url(args.issue)}")
+            print(f"URL: {issue_url(target, args.issue)}")
             return
-        except Exception as e:
+        except atomgit_cli.CLIError as e:
             print(f"Error commenting on issue: {e}")
             sys.exit(1)
 
@@ -122,15 +206,25 @@ def main():
             return
 
         try:
-            result = service.update_issue(args.issue, title=args.title, body=args.body, state=args.state)
+            argv = ["issue", "edit", str(args.issue), "-R", target.slug]
+            stdin_text = None
+            if args.title:
+                argv += ["--title", args.title]
+            if args.body is not None:
+                argv += ["--body-file", "-"]
+                stdin_text = args.body
+            if args.state:
+                argv += ["--state", args.state, "--yes"]
+            argv += ["--json"]
+            run_or_raise(argv, cli=cli, stdin_text=stdin_text)
             print(f"Successfully updated issue #{args.issue}")
-            print(f"URL: {service.get_issue_url(args.issue)}")
+            print(f"URL: {issue_url(target, args.issue)}")
             return
-        except Exception as e:
+        except atomgit_cli.CLIError as e:
             print(f"Error updating issue: {e}")
             sys.exit(1)
 
-    # 3. Create issue mode
+    # 4. Create issue mode
     if not args.title:
         print("Error: --title is required to create a new issue")
         sys.exit(1)
@@ -143,11 +237,33 @@ def main():
         return
 
     try:
-        result = service.create_issue(title=args.title, body=args.body or "")
-        issue_number = result.get("number")
+        result = atomgit_cli.run_json(
+            [
+                "issue",
+                "create",
+                "-R",
+                target.slug,
+                "--title",
+                args.title,
+                "--body-file",
+                "-",
+                "--json",
+            ],
+            cli=cli,
+            stdin_text=args.body or "",
+        )
+        data = result.require_data()
+        if not isinstance(data, dict) or data.get("number") is None:
+            # rc=0 means the mutation was very likely applied; never auto-retry.
+            print(
+                "Error: issue create succeeded but returned no issue number in its JSON output; "
+                "the issue may already exist — check the repository issue list before retrying"
+            )
+            sys.exit(1)
+        issue_number = data["number"]
         print(f"Successfully created issue #{issue_number}")
-        print(f"URL: {service.get_issue_url(issue_number)}")
-    except Exception as e:
+        print(f"URL: {issue_url(target, issue_number)}")
+    except atomgit_cli.CLIError as e:
         print(f"Error creating issue: {e}")
         sys.exit(1)
 

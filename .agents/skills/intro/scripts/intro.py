@@ -12,14 +12,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+PR_SAMPLE_LIMIT = 5  # 抽样上限（CLI 能力矩阵 A18）：仅检查前 N 个 open PR 的评论
+
 
 def get_project_root() -> Path:
     """获取项目根目录（通过 git rev-parse）"""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True
-        )
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True)
         return Path(result.stdout.strip())
     except subprocess.CalledProcessError:
         return Path.cwd()
@@ -28,13 +27,10 @@ def get_project_root() -> Path:
 def check_uncommitted_changes() -> dict:
     """检测是否有未提交的代码改动"""
     try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, check=True
-        )
-        lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
-        staged = [l for l in lines if l[0] in ("A", "M", "D", "R", "C")]
-        unstaged = [l for l in lines if l[1] in ("M", "D")]
+        result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
+        lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
+        staged = [line for line in lines if line[0] in ("A", "M", "D", "R", "C")]
+        unstaged = [line for line in lines if line[1] in ("M", "D")]
 
         return {
             "has_changes": len(lines) > 0,
@@ -63,50 +59,88 @@ def check_build_artifacts(project_root: Path) -> dict:
 
 
 def check_open_prs_with_comments() -> dict:
-    """检测是否有 open 的 PR 且有未回复评论（需要 AtomGit SDK）"""
+    """检测 open PR 及其评论（官方 CLI 抽样检查，非阻塞）
+
+    spec ``atomgit-collaboration-workflows``（Intro remains a nonblocking
+    sampled check）：CLI 缺失/未认证/目标不可解析时不中断报告，仅标记
+    PR 检查不可用；抽样范围显式暴露，检查失败不声称全仓库无待处理工作。
+    """
     result = {
         "has_open_prs": False,
         "prs_with_comments": [],
         "available": False,
+        "sample_limit": PR_SAMPLE_LIMIT,
     }
 
     try:
-        from atomgit_sdk.config import AtomGitConfig
-        from atomgit_sdk.client import AtomGitClient
+        sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
+        import atomgit_cli
     except ImportError:
-        result["error"] = (
-            "无法导入 Python 模块 atomgit_sdk；请先运行 ./scripts/setup.sh，"
-            "或在当前 Python 环境安装 PyPI 包 atomgit-sdk"
-        )
+        result["error"] = "无法导入共享 CLI 边界模块 atomgit_cli"
         return result
 
     try:
-        config = AtomGitConfig.from_json("config.json")
-        client = AtomGitClient(config)
-        result["available"] = True
+        cli = atomgit_cli.resolve_cli()
+        atomgit_cli.check_cli_identity(cli)
+        target = atomgit_cli.resolve_target(remotes=atomgit_cli.read_git_remotes())
+    except (atomgit_cli.CLIError, atomgit_cli.TargetResolutionError) as e:
+        result["error"] = f"AtomGit CLI 不可用: {e}"
+        return result
 
-        prs = client.get_pull_requests(state="open")
-        if not prs:
-            return result
+    result["target_repo"] = target.slug
 
-        result["has_open_prs"] = True
+    try:
+        listed = atomgit_cli.run_json(
+            ["pr", "list", "-R", target.slug, "--state", "open", "--json", "-L", str(PR_SAMPLE_LIMIT)],
+            cli=cli,
+        )
+        prs = listed.require_data()
+    except atomgit_cli.CLIError as e:
+        result["error"] = f"AtomGit CLI 调用失败: {e}"
+        return result
+    if not isinstance(prs, list):
+        result["error"] = f"pr list 返回了非列表 JSON（{type(prs).__name__}）"
+        return result
 
-        for pr in prs[:5]:  # 最多检查 5 个 PR
-            pr_number = pr.get("number")
-            title = pr.get("title", "")
-            try:
-                comments = client.get_pr_comments(pr_number)
-                if comments:
-                    result["prs_with_comments"].append({
-                        "number": pr_number,
-                        "title": title,
-                        "comment_count": len(comments),
-                    })
-            except Exception:
-                continue
+    # 列表调用成功且形态验证通过后才标记 PR 检查可用；此前任何失败
+    # （CLI 缺失/未认证/目标不可解析/列表调用失败/非列表 JSON）保持 available=False。
+    result["available"] = True
+    result["has_open_prs"] = len(prs) > 0
+    # 达到抽样上限时可能还有更多 open PR 未抽查，不声称全仓库无待处理工作
+    result["sample_truncated"] = len(prs) >= PR_SAMPLE_LIMIT
+    result["checked_prs"] = []
+    result["unchecked_prs"] = []
+    result["invalid_prs"] = []
 
-    except Exception as e:
-        result["error"] = f"AtomGit API 调用失败: {str(e)}"
+    for pr in prs[:PR_SAMPLE_LIMIT]:
+        if not isinstance(pr, dict):
+            result["invalid_prs"].append(pr)
+            continue
+        pr_number = pr.get("number")
+        if pr_number is None:
+            result["invalid_prs"].append(pr)
+            continue
+        try:
+            comments = atomgit_cli.run_json(
+                ["pr", "comments", str(pr_number), "-R", target.slug, "--json", "--limit", "0"],
+                cli=cli,
+            )
+            comment_list = comments.require_data()
+        except atomgit_cli.CLIError:
+            result["unchecked_prs"].append(pr_number)
+            continue
+        if not isinstance(comment_list, list):
+            result["unchecked_prs"].append(pr_number)
+            continue
+        result["checked_prs"].append(pr_number)
+        if comment_list:
+            result["prs_with_comments"].append(
+                {
+                    "number": pr_number,
+                    "title": pr.get("title", ""),
+                    "comment_count": len(comment_list),
+                }
+            )
 
     return result
 
@@ -114,17 +148,13 @@ def check_open_prs_with_comments() -> dict:
 def check_current_branch() -> dict:
     """获取当前分支信息"""
     try:
-        result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True, text=True, check=True
-        )
+        result = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, check=True)
         branch = result.stdout.strip()
 
         # 检查是否有未推送的 commit
         try:
             ahead_result = subprocess.run(
-                ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
-                capture_output=True, text=True, check=True
+                ["git", "rev-list", "--count", f"origin/{branch}..HEAD"], capture_output=True, text=True, check=True
             )
             unpushed = int(ahead_result.stdout.strip())
         except (subprocess.CalledProcessError, ValueError):
@@ -149,49 +179,59 @@ def generate_recommendations(
 
     # 优先级 1: 编译产物缺失
     if build.get("needs_build"):
-        recommendations.append({
-            "skill": "ibrobot-build",
-            "reason": "编译产物缺失（install/ 目录为空或不存在），建议先编译项目",
-            "priority": "🔴 高",
-            "trigger": "编译一下项目",
-        })
+        recommendations.append(
+            {
+                "skill": "ibrobot-build",
+                "reason": "编译产物缺失（install/ 目录为空或不存在），建议先编译项目",
+                "priority": "🔴 高",
+                "trigger": "编译一下项目",
+            }
+        )
 
     # 优先级 2: 有未回复评论的 PR（最多显示一个）
     if prs.get("prs_with_comments"):
         for pr_info in prs["prs_with_comments"][:1]:
-            recommendations.append({
-                "skill": "atomgit-review-resolution",
-                "reason": f"PR #{pr_info['number']}「{pr_info['title']}」有 {pr_info['comment_count']} 条评论待处理",
-                "priority": "🟡 中",
-                "trigger": f"修复 #{pr_info['number']} 号 PR 的评审意见",
-            })
+            recommendations.append(
+                {
+                    "skill": "atomgit-review-resolution",
+                    "reason": f"PR #{pr_info['number']}「{pr_info['title']}」有 {pr_info['comment_count']} 条评论待处理",
+                    "priority": "🟡 中",
+                    "trigger": f"修复 #{pr_info['number']} 号 PR 的评审意见",
+                }
+            )
 
     # 优先级 3: 有未提交的改动
     if changes.get("has_changes"):
-        recommendations.append({
-            "skill": "ibrobot-git-flow",
-            "reason": f"检测到 {changes['total_files']} 个文件有未提交的改动",
-            "priority": "🟡 中",
-            "trigger": "提交代码",
-        })
+        recommendations.append(
+            {
+                "skill": "ibrobot-git-flow",
+                "reason": f"检测到 {changes['total_files']} 个文件有未提交的改动",
+                "priority": "🟡 中",
+                "trigger": "提交代码",
+            }
+        )
 
     # 优先级 4: 有未推送的 commit
     if branch.get("unpushed_commits", 0) > 0:
-        recommendations.append({
-            "skill": "atomgit-pr",
-            "reason": f"当前分支 `{branch['branch']}` 有 {branch['unpushed_commits']} 个未推送的 commit",
-            "priority": "🟢 低",
-            "trigger": "帮我提交一个 PR",
-        })
+        recommendations.append(
+            {
+                "skill": "atomgit-pr",
+                "reason": f"当前分支 `{branch['branch']}` 有 {branch['unpushed_commits']} 个未推送的 commit",
+                "priority": "🟢 低",
+                "trigger": "帮我提交一个 PR",
+            }
+        )
 
     # 默认推荐
     if not recommendations:
-        recommendations.append({
-            "skill": "ibrobot-launch",
-            "reason": "当前工作区状态良好！可以试试启动机器人仿真环境进行开发测试",
-            "priority": "💡 推荐",
-            "trigger": "启动机器人仿真",
-        })
+        recommendations.append(
+            {
+                "skill": "ibrobot-launch",
+                "reason": "当前工作区状态良好！可以试试启动机器人仿真环境进行开发测试",
+                "priority": "💡 推荐",
+                "trigger": "启动机器人仿真",
+            }
+        )
 
     return recommendations
 
@@ -240,13 +280,22 @@ def print_report(
     if not prs.get("available"):
         error = prs.get("error", "未知错误")
         print(f"   ⏭️  跳过（{error}）")
-    elif prs.get("prs_with_comments"):
-        for pr_info in prs["prs_with_comments"]:
-            print(f"   📝 PR #{pr_info['number']}「{pr_info['title']}」- {pr_info['comment_count']} 条评论")
-    elif prs.get("has_open_prs"):
-        print("   ✅ 有 open PR，但无待处理评论")
     else:
-        print("   ℹ️  无 open 状态的 PR")
+        if prs.get("prs_with_comments"):
+            for pr_info in prs["prs_with_comments"]:
+                print(f"   📝 PR #{pr_info['number']}「{pr_info['title']}」- {pr_info['comment_count']} 条评论")
+        elif prs.get("has_open_prs"):
+            checked = len(prs.get("checked_prs", []))
+            line = f"   ✅ 抽查了前 {checked} 个 open PR，无待处理评论"
+            if prs.get("sample_truncated"):
+                line += f"（抽样上限 {prs.get('sample_limit')}，可能还有更多 open PR 未抽查）"
+            print(line)
+        else:
+            print("   ℹ️  无 open 状态的 PR")
+        if prs.get("invalid_prs"):
+            print(f"   ⚠️  pr list 返回 {len(prs['invalid_prs'])} 条无效记录（非对象或缺 number），未计入本轮抽查")
+        if prs.get("unchecked_prs"):
+            print(f"   ⚠️  PR {prs['unchecked_prs']} 评论读取失败，本轮未检查")
     print()
 
     # 推荐
@@ -258,7 +307,7 @@ def print_report(
     for i, rec in enumerate(recommendations, 1):
         print(f"  {i}. [{rec['priority']}] {rec['skill']}")
         print(f"     原因: {rec['reason']}")
-        print(f"     触发: \"{rec['trigger']}\"")
+        print(f'     触发: "{rec["trigger"]}"')
         print()
 
     print("=" * 60)

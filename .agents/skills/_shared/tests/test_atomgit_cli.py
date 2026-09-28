@@ -12,6 +12,7 @@ CLI authentication, and none of these tests depend on it.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,12 +42,14 @@ from atomgit_cli import (
     load_config,
     normalize_host,
     parse_atomgit_url,
+    read_git_remotes,
     resolve_cli,
     resolve_source,
     resolve_target,
     run,
     run_json,
     run_paginated,
+    validate_config_base_url,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -357,6 +360,33 @@ def test_run_nonzero_exit_with_json_is_not_success_but_keeps_data(fake: FakeCLI,
     assert len(fake.invocations()) == 1  # no retry
 
 
+def test_require_data_raises_on_nonzero_exit_even_when_json_decoded(fake: FakeCLI, fake_env):
+    fake.configure(
+        [
+            {
+                "argv_contains": ["pr", "view"],
+                "stdout": '{"number": 7, "title": "partial"}',
+                "stderr": "enrichment failed",
+                "exit": 3,
+            }
+        ]
+    )
+
+    result = run_json(["pr", "view", "7", "-R", "o/r", "--json"], env=fake_env)
+
+    assert result.data == {"number": 7, "title": "partial"}  # partial data stays inspectable
+    with pytest.raises(CLINotFoundError):
+        result.require_data()  # but is never accepted as complete success
+
+
+def test_require_data_returns_decoded_json_on_success(fake: FakeCLI, fake_env):
+    fake.configure([{"argv_contains": ["pr", "view"], "stdout": '{"number": 7}', "exit": 0}])
+
+    result = run_json(["pr", "view", "7", "-R", "o/r", "--json"], env=fake_env)
+
+    assert result.require_data() == {"number": 7}
+
+
 def test_run_json_invalid_output_sets_json_error(fake: FakeCLI, fake_env):
     fake.configure([{"argv_contains": ["pr", "view"], "stdout": "not-json{{", "exit": 0}])
 
@@ -410,6 +440,30 @@ def test_failure_on_ok_result_is_none(fake: FakeCLI, fake_env):
     assert result.ok and result.failure() is None
 
 
+def test_failure_message_omits_bodies_flags_and_raw_cli_output(fake: FakeCLI, fake_env):
+    secret_body = "SECRET reply body $(id:fake)"
+    fake.configure(
+        [
+            {
+                "argv_contains": ["pr", "comment"],
+                "stderr": "Error: raw-cli-stderr-marker",
+                "exit": 1,
+            }
+        ]
+    )
+
+    result = run(["pr", "comment", "123", "-R", "o/r", "--body", secret_body], env=fake_env)
+    failure = result.failure()
+    message = str(failure)
+
+    assert secret_body not in message  # body never leaks via message text
+    assert "--body" not in message  # flags and their values are omitted
+    assert "raw-cli-stderr-marker" not in message  # raw CLI output is omitted
+    assert "[arguments omitted]" in message
+    assert failure.argv[-2] == secret_body  # full argv stays in the structured attribute
+    assert failure.stderr == "Error: raw-cli-stderr-marker"  # raw output kept for deliberate logging
+
+
 def test_write_timeout_raises_once_with_reconciliation_context(fake: FakeCLI, fake_env):
     fake.configure([{"argv_contains": ["pr", "comment"], "sleep": 2, "exit": 0}])
 
@@ -421,6 +475,21 @@ def test_write_timeout_raises_once_with_reconciliation_context(fake: FakeCLI, fa
     assert "reconcile" in str(error)
     assert error.argv[:3] == [str(fake.exe), "pr", "comment"]
     assert len(fake.invocations()) == 1  # uncertain write recorded once, never blindly retried
+
+
+def test_timeout_message_sanitized_but_argv_preserved(fake: FakeCLI, fake_env):
+    secret_body = "SECRET timeout body"
+    fake.configure([{"argv_contains": ["pr", "comment"], "sleep": 2, "exit": 0}])
+
+    with pytest.raises(CLITimeoutError) as excinfo:
+        run(["pr", "comment", "123", "-R", "o/r", "--body", secret_body], env=fake_env, timeout=0.5)
+
+    error = excinfo.value
+    message = str(error)
+    assert secret_body not in message
+    assert "--body" not in message
+    assert "[arguments omitted]" in message
+    assert error.argv[-2] == secret_body  # full argv preserved structurally for reconciliation
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +604,63 @@ def test_parse_url_rejects_missing_or_malformed_parts():
 
 
 # --------------------------------------------------------------------------- #
+# Local Git remote reading (task 2.2, upstream targeting tier)
+# --------------------------------------------------------------------------- #
+
+
+def _git(args: list[str], cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=True)
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "--quiet"], repo)
+    return repo
+
+
+def test_read_git_remotes_deduplicates_identical_fetch_push_urls(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    _git(["remote", "add", "origin", "https://atomgit.com/BreezeWu/IB_Robot.git"], repo)
+    _git(["remote", "set-url", "--push", "origin", "https://atomgit.com/BreezeWu/IB_Robot.git"], repo)
+
+    remotes = read_git_remotes(cwd=repo)
+
+    assert remotes == {"origin": ["https://atomgit.com/BreezeWu/IB_Robot.git"]}  # fetch==push collapses
+
+
+def test_read_git_remotes_keeps_distinct_fetch_push_urls_verbatim(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    _git(["remote", "add", "upstream", "git@atomgit.com:openEuler/IB_Robot.git"], repo)
+    _git(["remote", "set-url", "--push", "upstream", "https://atomgit.com/openEuler/IB_Robot.git"], repo)
+
+    remotes = read_git_remotes(cwd=repo)
+
+    # URLs stay verbatim (ssh and https forms); interpretation belongs to resolve_target
+    assert remotes == {
+        "upstream": ["git@atomgit.com:openEuler/IB_Robot.git", "https://atomgit.com/openEuler/IB_Robot.git"]
+    }
+
+
+def test_read_git_remotes_non_repository_returns_empty_mapping(tmp_path: Path):
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    assert read_git_remotes(cwd=plain) == {}  # fallback tier: absence, not an error
+
+
+def test_resolve_target_consumes_read_git_remotes_upstream_fallback(tmp_path: Path):
+    repo = _init_repo(tmp_path)
+    _git(["remote", "add", "origin", "https://atomgit.com/BreezeWu/IB_Robot.git"], repo)
+    _git(["remote", "add", "upstream", "git@atomgit.com:openEuler/IB_Robot.git"], repo)
+
+    target = resolve_target(config_path=tmp_path / "absent.json", remotes=read_git_remotes(cwd=repo))
+
+    assert target.slug == "openEuler/IB_Robot"  # upstream wins; origin fork is never the target
+    assert target.origin == "upstream"
+
+
+# --------------------------------------------------------------------------- #
 # Target resolution (task 2.2)
 # --------------------------------------------------------------------------- #
 
@@ -600,6 +726,60 @@ def test_resolve_target_config_without_token_key_is_sufficient(tmp_path: Path):
 
     config_data = load_config(config)
     assert config_repo_defaults(config_data) == ("openEuler", "IB_Robot")  # token never validated (D2)
+
+
+def _write_config(tmp_path: Path, atomgit: dict) -> Path:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"atomgit": atomgit}), encoding="utf-8")
+    return config
+
+
+def test_config_base_url_api_host_accepted(tmp_path: Path):
+    config = _write_config(tmp_path, {"owner": "openEuler", "repo": "IB_Robot", "baseUrl": "https://api.atomgit.com"})
+
+    validate_config_base_url(load_config(config))
+    assert resolve_target(config_path=config).slug == "openEuler/IB_Robot"
+
+
+def test_config_base_url_web_host_alias_accepted(tmp_path: Path):
+    config = _write_config(tmp_path, {"owner": "openEuler", "repo": "IB_Robot", "baseUrl": "https://www.atomgit.com/"})
+
+    validate_config_base_url(load_config(config))
+    assert resolve_target(config_path=config).slug == "openEuler/IB_Robot"
+
+
+def test_config_base_url_missing_null_or_empty_accepted(tmp_path: Path):
+    no_key = _write_config(tmp_path, {"owner": "o", "repo": "r"})
+    validate_config_base_url(load_config(no_key))
+
+    null_url = _write_config(tmp_path, {"owner": "o", "repo": "r", "baseUrl": None})
+    validate_config_base_url(load_config(null_url))
+
+    empty_url = _write_config(tmp_path, {"owner": "o", "repo": "r", "baseUrl": "  "})
+    validate_config_base_url(load_config(empty_url))
+
+
+@pytest.mark.parametrize(
+    "bad_base_url",
+    [
+        "https://api.gitcode.com",
+        "https://github.com",
+        "https://api.atomgit.com.evil.example.com",  # suffix attack: exact-host matching
+        "api.gitcode.com",  # no scheme
+    ],
+)
+def test_config_base_url_unregistered_host_rejected_before_request(tmp_path: Path, bad_base_url):
+    config = _write_config(tmp_path, {"owner": "openEuler", "repo": "IB_Robot", "baseUrl": bad_base_url})
+
+    with pytest.raises(AtomgitURLError, match="not a registered AtomGit service"):
+        resolve_target(config_path=config)
+
+
+def test_resolve_target_validates_base_url_even_when_explicit_target_wins(tmp_path: Path):
+    config = _write_config(tmp_path, {"owner": "cfg-owner", "repo": "cfg-repo", "baseUrl": "https://api.gitcode.com"})
+
+    with pytest.raises(AtomgitURLError, match="not a registered AtomGit service"):
+        resolve_target(owner="openEuler", repo="IB_Robot", config_path=config)
 
 
 def test_resolve_target_explicit_config_path_missing_errors(tmp_path: Path):

@@ -37,8 +37,11 @@ Migration semantics that this module intentionally does NOT implement:
 - No owner/repo case folding for platform targeting: canonical identity is
   only provable via the platform itself (design.md D2); unresolved case
   differences are reported as conflicts.
-- ``config.json``'s ``atomgit.baseUrl`` is not consumed: host selection is
-  pinned through ``GC_HOST`` to the registered mapping above.
+- ``config.json``'s ``atomgit.baseUrl`` never routes requests (host selection
+  is pinned through ``GC_HOST`` to the registered mapping above), but its host
+  is validated against that mapping whenever a config participates in
+  targeting: an unregistered service is rejected before any request instead
+  of being silently ignored.
 
 Consumers import this module by putting the ``_shared`` directory on
 ``sys.path`` (mirroring the existing ``lib`` convention), e.g. from a skill
@@ -86,12 +89,36 @@ _VERSION_RE = re.compile(r"gitcode version (\d+)\.(\d+)\.(\d+)")
 _COMMIT_RE = re.compile(r"^\s*commit:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
 
 
+def _command_summary(argv: list[str]) -> str:
+    """Build a redacted command shape for error message text.
+
+    Message text must never carry bodies, file paths or raw CLI output:
+    the CLI may echo them on stderr, and the boundary does not control
+    what the platform writes back. Only the executable name and the
+    leading positional tokens (up to the first flag and at most four
+    words) are exposed. The full argv remains in ``CLIError.argv`` as a
+    controlled structure so callers can log it deliberately.
+    """
+    if not argv:
+        return "<not invoked>"
+    parts = [Path(argv[0]).name]
+    for arg in argv[1:]:
+        if arg.startswith("-") or len(parts) >= 4:
+            parts.append("[arguments omitted]")
+            break
+        parts.append(arg)
+    return " ".join(parts)
+
+
 class CLIError(RuntimeError):
     """Base class for every error raised by this boundary.
 
-    Messages never embed credentials: the boundary reads no tokens, and
-    captured CLI output is included verbatim only when the caller built
-    argv from project data.
+    Message text is sanitized: it never embeds full argv, comment bodies
+    or raw CLI output (stderr may echo bodies or credentials, and the
+    boundary cannot assume otherwise). Transaction context that callers
+    need for reconciliation lives in the structured attributes
+    (``argv``/``stdout``/``stderr``/``returncode``/``timeout``) and is
+    logged only under caller control, never via ``str(error)``.
     """
 
     def __init__(
@@ -158,7 +185,7 @@ class MissingTargetError(TargetResolutionError):
 
 
 class AtomgitURLError(TargetResolutionError):
-    """A URL/remote does not belong to a registered AtomGit web host."""
+    """A URL, remote or configured baseUrl does not belong to a registered AtomGit service."""
 
 
 # --------------------------------------------------------------------------- #
@@ -332,13 +359,17 @@ class CLIResult:
         return self.returncode == 0
 
     def failure(self) -> CLIExecutionError | None:
-        """Classified error for a nonzero exit, or None when ``ok``."""
+        """Classified error for a nonzero exit, or None when ``ok``.
+
+        Message text is sanitized (see :func:`_command_summary`): raw CLI
+        output and flag values never enter the message, because stderr may
+        echo bodies or credentials we do not control. Full argv/stdout/
+        stderr stay in the structured attributes for caller-controlled
+        reconciliation logging.
+        """
         if self.ok:
             return None
-        message = f"AtomGit CLI failed with exit code {self.returncode}: {' '.join(self.argv)}"
-        detail = (self.stderr or self.stdout).strip()
-        if detail:
-            message = f"{message}\n{detail[:2000]}"
+        message = f"AtomGit CLI failed with exit code {self.returncode}: {_command_summary(self.argv)}"
         if self.returncode == EXIT_AUTH:
             message = (
                 f"{message}\nnot authenticated or lacking permission; if not logged in, run: {AUTH_LOGIN_GUIDANCE}"
@@ -353,11 +384,21 @@ class CLIResult:
         return error_class(message, argv=self.argv, returncode=self.returncode, stdout=self.stdout, stderr=self.stderr)
 
     def require_data(self) -> Any:
-        """Return decoded JSON or raise CLIJSONError (task 2.3)."""
+        """Return decoded JSON only for a complete successful read (task 2.3).
+
+        Enforces the spec completeness constraint: a nonzero exit or an
+        undecodable payload is never accepted as complete success, even
+        when partial JSON parsed. Partial data remains on ``self.data``
+        for explicit diagnostics: callers needing it must inspect the
+        result object directly instead of going through this entry point.
+        """
+        failure = self.failure()
+        if failure is not None:
+            raise failure
         if self.data is None:
             reason = self.json_error or "empty stdout"
             raise CLIJSONError(
-                f"AtomGit CLI produced no usable JSON ({reason}): {' '.join(self.argv)}",
+                f"AtomGit CLI produced no usable JSON ({reason}): {_command_summary(self.argv)}",
                 argv=self.argv,
                 returncode=self.returncode,
                 stdout=self.stdout,
@@ -411,7 +452,7 @@ def run(
         stderr = _safe_text(exc.stderr)
         raise CLITimeoutError(
             f"AtomGit CLI invocation timed out after {timeout}s "
-            f"(outcome unknown — reconcile before any retry): {' '.join(argv)}",
+            f"(outcome unknown — reconcile before any retry): {_command_summary(argv)}",
             argv=argv,
             stdout=stdout,
             stderr=stderr,
@@ -600,6 +641,48 @@ def parse_git_remote_url(url: str) -> dict[str, Any] | None:
     return {"owner": owner, "repo": repo, "host": host}
 
 
+def read_git_remotes(cwd: str | Path | None = None) -> dict[str, list[str]]:
+    """Read local Git remotes for the ``upstream`` targeting tier (task 2.2).
+
+    Runs ``git remote -v`` and maps each remote name to its unique URLs
+    (fetch and push collapsed). Local Git reads stay outside the platform
+    API requirement, so this is a plain local subprocess — no CLI, no
+    network. It is a best-effort input to the *last* targeting tier: when
+    Git is not installed, ``cwd`` is not a repository, or the command
+    fails, an empty mapping is returned instead of raising, so explicit,
+    URL and config targets keep working in non-repository contexts
+    (design.md D2: “缺 upstream 但有明确/config 目标时可工作”). URL forms
+    are preserved verbatim; host/owner/repo interpretation belongs to
+    :func:`parse_git_remote_url` and :func:`resolve_target`.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "remote", "-v"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=cwd,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    remotes: dict[str, list[str]] = {}
+    for line in completed.stdout.splitlines():
+        if not line.strip() or "\t" not in line:
+            continue
+        name, rest = line.split("\t", 1)
+        # Each line is "<name>\t<url> (fetch|push)"; strip the parenthesized kind.
+        url = rest.rsplit("(", 1)[0].strip() if rest.rstrip().endswith(")") else rest.strip()
+        entries = remotes.setdefault(name.strip(), [])
+        if url and url not in entries:
+            entries.append(url)
+    return remotes
+
+
 def load_config(config_path: str | Path = "config.json", *, required: bool = False) -> dict[str, Any] | None:
     """Load config.json for non-sensitive owner/repo defaults only.
 
@@ -637,6 +720,36 @@ def config_repo_defaults(config: Mapping[str, Any]) -> tuple[str | None, str | N
     return owner, repo
 
 
+def validate_config_base_url(config: Mapping[str, Any]) -> None:
+    """Validate ``atomgit.baseUrl`` against the registered service mapping.
+
+    The boundary never routes requests through ``baseUrl`` (``GC_HOST`` pins
+    the web host), but a config pointing at an unregistered service disagrees
+    with the service every command will actually access, so it is rejected
+    before any request instead of being silently ignored (design.md D2). Both
+    sides of the registered mapping are accepted: the API host
+    ``api.atomgit.com`` and the web-host alias ``atomgit.com``. A missing,
+    null or empty ``baseUrl`` is not an error.
+    """
+    atomgit = config.get("atomgit")
+    if not isinstance(atomgit, Mapping):
+        return
+    base_url = atomgit.get("baseUrl")
+    if base_url is None or not str(base_url).strip():
+        return
+    text = str(base_url).strip()
+    if "://" not in text:
+        text = f"https://{text}"
+    host = normalize_host(urlparse(text).hostname or "")
+    registered = set(WEB_HOST_TO_API_HOST) | set(WEB_HOST_TO_API_HOST.values())
+    if host not in registered:
+        raise AtomgitURLError(
+            f"config atomgit.baseUrl host {host!r} is not a registered AtomGit service "
+            f"(registered: {sorted(registered)}); requests are pinned to the atomgit.com "
+            "service via GC_HOST and never redirected — fix or remove baseUrl"
+        )
+
+
 def resolve_target(
     *,
     owner: str | None = None,
@@ -653,6 +766,10 @@ def resolve_target(
     unique ``upstream`` remote. ``origin`` is never used as the target: it
     only identifies the fork source. When nothing resolves both fields the
     error explains what to supply instead of guessing.
+
+    Whenever a config file participates, its ``atomgit.baseUrl`` host must
+    match the registered service mapping (:func:`validate_config_base_url`),
+    even when another tier supplies the owner/repo.
 
     Comparisons are exact strings: canonical owner/repo identity is only
     provable via the platform (design.md D2), so case-only differences are
@@ -672,6 +789,7 @@ def resolve_target(
     config = load_config(config_path, required=explicit_config)
     config_owner = config_repo = None
     if config is not None:
+        validate_config_base_url(config)
         config_owner, config_repo = config_repo_defaults(config)
 
     resolved_owner = owner or (url_info or {}).get("owner") or config_owner

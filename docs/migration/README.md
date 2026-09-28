@@ -120,16 +120,18 @@ python .agents/skills/deepwiki-translator/scripts/deepwiki_processor.py \
 python .agents/skills/doc-link-validator/scripts/link_validator.py \
     docs/migration/ib_robot_zh \
     --root docs/migration/ib_robot_zh \
-    --report docs/migration/reports/link_validation.json \
-    --config config.json
+    --report docs/migration/reports/link_validation.json
 ```
 
-如需要校验 AtomGit 私有或受限接口，确保 `config.json` 中的 `atomgit.token` 可通过 `$ATOMGIT_TOKEN` 展开，或显式传入 `--access-token`。
+AtomGit 链接校验通过官方 CLI（`gitcode`）做只读探测，运行前先执行
+`gitcode auth login --hostname atomgit.com --with-token` 完成认证。CLI 缺失或未认证时
+AtomGit 链接一律标记 `inconclusive`（不会误报 `broken`），本地与第三方外部链接照常检查。
+旧的 `--config`/`--access-token` 参数已退役，传入即报错退出。
 
 检查结果应重点关注：
 
 - `broken`: 必须修复。
-- `auth_error`: 确认是否缺少访问权限或 token。
+- `auth_error`: 确认是否缺少访问权限。
 - `inconclusive`: 根据网络环境和发布要求决定是否复核；如需严格阻断，可增加 `--fail-on-inconclusive`。
 
 ## Mermaid 语法检查与优化

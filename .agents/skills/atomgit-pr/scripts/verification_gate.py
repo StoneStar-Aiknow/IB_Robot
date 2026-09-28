@@ -13,7 +13,26 @@ TESTED_SOURCE_TREE_LABEL = "Tested source tree"
 VERIFICATION_ENVIRONMENT_LABEL = "Docker environment"
 VERIFICATION_MODE_FULL = "full"
 VERIFICATION_MODE_REUSED = "reused-environment"
-VERIFICATION_POLICY_VERSION = "1"
+# Fingerprint policies (spec: verification fingerprints remain transport
+# compatible; reviews/round-3.md R3-01 option (b)). Both policies hash the
+# same dependency-relevant records — non-dependency files never enter the
+# fingerprint, so unrelated changes cannot invalidate recorded evidence.
+# The payload's policy field is the only difference: v1 is the fixed legacy
+# calculator kept byte-identical for migration judgment, and new evidence
+# uses v2 to mark that it was computed over provably complete inputs (see
+# verification_inputs_placeholder_tainted). Complete-input recomputation
+# under both policies is how a legacy record is recognized and reused
+# without rewriting its hash.
+VERIFICATION_POLICY_VERSION = "2"
+LEGACY_VERIFICATION_POLICY_VERSION = "1"
+PATCH_UNAVAILABLE_PLACEHOLDER = "<patch-unavailable>"
+# Task 3.2 review: known truncation markers on a changed-file entry, or diff
+# hunks whose declared line counts do not add up, mark the patch incomplete
+# until the CLI-side capability to re-fetch complete diffs is verified
+# (task 1.4). Entry-level flags are the authoritative truncation indicator;
+# a non-empty patch without hunk headers is treated as structurally valid.
+_PATCH_TRUNCATION_KEYS = ("patch_truncated", "truncated", "too_large", "is_truncated")
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 WIP_PREFIX = "[WIP]"
 _VERIFICATION_HEADING_RE = re.compile(r"^##[ \t]+Docker Verification[ \t]*\r?$", re.MULTILINE | re.IGNORECASE)
 _VERIFIED_TREE_RE = re.compile(
@@ -98,31 +117,186 @@ def verification_input_record(filename: str, patch: str | dict | None = "") -> t
     patch = _normalise_patch(patch)
     if filename == "package.xml" or filename.endswith("/package.xml"):
         if not patch:
-            return filename, "<patch-unavailable>"
+            return filename, PATCH_UNAVAILABLE_PLACEHOLDER
         dependency_lines = [line for line in _changed_lines(patch) if _PACKAGE_DEPENDENCY_RE.search(line)]
         return (filename, "\n".join(sorted(dependency_lines))) if dependency_lines else None
     if file_triggers_dual_docker_gate(filename, patch):
         if not patch:
-            return filename, "<patch-unavailable>"
+            return filename, PATCH_UNAVAILABLE_PLACEHOLDER
         return filename, "\n".join(_changed_lines(patch))
     return None
 
 
-def compute_verification_inputs(files: list[dict]) -> str | None:
-    records = []
+def _hunk_line_counts_add_up(patch: str) -> bool:
+    """True when every hunk's declared line counts match its body lines.
+
+    A truncated patch (platform-side diff size limits) usually loses body
+    lines, so hunks whose declared counts do not add up mark the patch
+    incomplete. A non-empty patch without any hunk header is treated as
+    structurally valid here: entry-level truncation flags are the only
+    authoritative indicator for such patches, and refusing every non-hunk
+    patch would break byte-compatibility with the legacy v1 calculator,
+    which extracted dependency lines from them. Empty patches are handled
+    by the placeholder logic.
+    """
+    lines = patch.splitlines()
+    index = 0
+    while index < len(lines):
+        match = _HUNK_HEADER_RE.match(lines[index])
+        index += 1
+        if match is None:
+            continue  # diff header lines (diff --git / index / --- / +++)
+        old_expected = int(match.group(2) if match.group(2) is not None else 1)
+        new_expected = int(match.group(4) if match.group(4) is not None else 1)
+        old_actual = new_actual = 0
+        while index < len(lines) and not _HUNK_HEADER_RE.match(lines[index]):
+            line = lines[index]
+            if not line.startswith("\\"):  # "\ No newline at end of file"
+                if line.startswith("-") and not line.startswith("---"):
+                    old_actual += 1
+                elif line.startswith("+") and not line.startswith("+++"):
+                    new_actual += 1
+                else:
+                    old_actual += 1
+                    new_actual += 1
+            index += 1
+        if old_actual != old_expected or new_actual != new_expected:
+            return False
+    return True
+
+
+def _file_patch_and_incompleteness(file_info: dict) -> tuple[str, str | None]:
+    """Return (patch, incompleteness reason or None) for one changed-file entry.
+
+    A known truncation flag on the entry, or diff hunks whose declared line
+    counts do not add up, marks the patch as not provably complete; the
+    fingerprint layer then treats it as a placeholder for gate-relevant
+    files instead of trusting its visible content (task 3.2 review: a
+    truncated package.xml patch with no visible depend lines must not
+    bypass the gate, and truncated requirements patches must not enter the
+    fingerprint as if they were complete).
+    """
+    for key in _PATCH_TRUNCATION_KEYS:
+        if file_info.get(key):
+            return _normalise_patch(file_info.get("patch")), f"entry declares {key}"
+    patch = _normalise_patch(file_info.get("patch"))
+    if patch and not _hunk_line_counts_add_up(patch):
+        return patch, "diff hunk line counts do not add up (truncated patch)"
+    return patch, None
+
+
+def _may_contribute_gate_inputs(filename: str, patch: str) -> bool:
+    """Could this file trigger the dual Docker gate or produce a record?"""
+    if filename == "package.xml" or filename.endswith("/package.xml"):
+        # The package.xml gate decision depends on patch content; an
+        # incomplete patch can neither confirm nor exclude dependency changes.
+        return True
+    return file_triggers_dual_docker_gate(filename, patch)
+
+
+def _collect_verification_inputs(files: list[dict]) -> list[tuple[str, str]]:
+    """Return the dependency records for one input set.
+
+    Files whose patch is missing or not provably complete contribute a
+    placeholder record when they could affect the gate, so truncation can
+    never silently shrink the fingerprint or bypass the package.xml check.
+    """
+    records: list[tuple[str, str]] = []
     for file_info in files:
         filename = file_info.get("filename") or file_info.get("new_path") or ""
-        record = verification_input_record(filename, file_info.get("patch") or "")
+        patch, incomplete = _file_patch_and_incompleteness(file_info)
+        if incomplete and _may_contribute_gate_inputs(filename, patch):
+            records.append((filename, PATCH_UNAVAILABLE_PLACEHOLDER))
+            continue
+        record = verification_input_record(filename, patch)
         if record is not None:
             records.append(record)
-    if not records:
-        return None
-    payload = {
-        "policy": VERIFICATION_POLICY_VERSION,
-        "records": sorted(set(records)),
-    }
+    return records
+
+
+def _fingerprint(policy: str, records: list[tuple[str, str]]) -> str:
+    payload = {"policy": policy, "records": sorted(set(records))}
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
     return hashlib.sha1(encoded).hexdigest()
+
+
+def compute_verification_inputs(files: list[dict]) -> str | None:
+    """Fingerprint of the PR's dependency-relevant changes under policy v2.
+
+    v2 hashes the same dependency records as the legacy v1 calculator —
+    non-dependency files never enter it (task 3.2 review reverted the
+    file-list extension); the payload's policy field is the only
+    difference, marking that this hash was computed over provably complete
+    inputs. Returns None only when no gate-relevant record exists (the
+    gate-trigger decision is unchanged from v1). Missing or truncated
+    patches stay gate-relevant through the ``<patch-unavailable>``
+    placeholder record, but callers must refuse to reuse fingerprint-based
+    evidence while any record is a placeholder
+    (:func:`verification_inputs_placeholder_tainted`).
+    """
+    records = _collect_verification_inputs(files)
+    if not records:
+        return None
+    return _fingerprint(VERIFICATION_POLICY_VERSION, records)
+
+
+def compute_legacy_verification_inputs(files: list[dict]) -> str | None:
+    """Fingerprint under the fixed legacy policy v1 (R3-01 option (b)).
+
+    Byte-identical to the pre-migration calculator so a complete legacy
+    four-field record can be recognized by recomputation and reused as v1
+    evidence — without rewriting its hash as v2 or claiming a new
+    verification happened.
+    """
+    records = _collect_verification_inputs(files)
+    if not records:
+        return None
+    return _fingerprint(LEGACY_VERIFICATION_POLICY_VERSION, records)
+
+
+def verification_inputs_placeholder_tainted(files: list[dict]) -> bool:
+    """True when a gate-relevant input is missing or not provably complete.
+
+    Missing patches and non-empty-but-truncated patches (entry truncation
+    flags such as ``patch_truncated``, or hunk line counts that do not add
+    up) both count (task 3.2 review). Such inputs keep the gate triggered
+    (conservative) but must not be used for evidence reuse: the spec
+    requires renewed verification from complete inputs instead of automatic
+    reuse.
+    """
+    for file_info in files:
+        filename = file_info.get("filename") or file_info.get("new_path") or ""
+        patch, incomplete = _file_patch_and_incompleteness(file_info)
+        if incomplete and _may_contribute_gate_inputs(filename, patch):
+            return True
+        record = verification_input_record(filename, patch)
+        if record is not None and record[1] == PATCH_UNAVAILABLE_PLACEHOLDER:
+            return True
+    return False
+
+
+def detect_verification_policy(
+    recorded_inputs: str | None,
+    expected_inputs: str | None,
+    legacy_inputs: str | None,
+) -> str | None:
+    """Unique policy whose recomputed fingerprint equals the recorded hash.
+
+    R3-01 option (b): for a legacy four-field record with no policy field,
+    complete inputs are recomputed under both supported policies; only a
+    unique match may enter the original tree/mode/environment checks. None
+    (no match or ambiguous) means the evidence cannot be reused and renewed
+    verification is required.
+    """
+    if not recorded_inputs:
+        return None
+    recorded = recorded_inputs.lower()
+    matches: list[str] = []
+    if expected_inputs is not None and recorded == expected_inputs.lower():
+        matches.append(VERIFICATION_POLICY_VERSION)
+    if legacy_inputs is not None and recorded == legacy_inputs.lower():
+        matches.append(LEGACY_VERIFICATION_POLICY_VERSION)
+    return matches[0] if len(matches) == 1 else None
 
 
 def is_wip_title(title: str) -> bool:
@@ -240,8 +414,17 @@ def validate_verification_metadata(
     *,
     allow_reuse: bool = False,
     expected_environment: str | None = None,
+    legacy_inputs: str | None = None,
 ) -> dict:
     """Validate Docker verification metadata.
+
+    Fingerprints are policy-versioned (R3-01 option (b)). The recorded inputs
+    must uniquely match one of the recomputed supported fingerprints — the
+    current v2, plus the fixed legacy v1 when the caller supplies it — and the
+    detected policy is reported as ``detected_policy`` without rewriting the
+    recorded hash. A matched legacy v1 record still passes through every
+    original tree/mode/environment check; no match at all means the evidence
+    requires renewed verification.
 
     For reused-environment mode, prior-evidence existence is verified by the
     author-side ``prepare_update_verification``; the reviewer only checks that
@@ -254,13 +437,21 @@ def validate_verification_metadata(
         if metadata.get("tested_tree", "").lower() != expected_tree.lower():
             raise ValueError("legacy Docker verification only matches the current source tree")
         raise ValueError("legacy Docker evidence must be migrated to full verification metadata")
-    if metadata["verified_inputs"] != expected_inputs.lower():
+    detected_policy = detect_verification_policy(metadata["verified_inputs"], expected_inputs, legacy_inputs)
+    if detected_policy is None:
+        expected_values = f"v{VERIFICATION_POLICY_VERSION} {expected_inputs.lower()}"
+        if legacy_inputs is not None:
+            expected_values += (
+                f" or legacy v{LEGACY_VERIFICATION_POLICY_VERSION} {legacy_inputs.lower()}" if legacy_inputs else ""
+            )
         raise ValueError(
-            f"Docker verification inputs {metadata['verified_inputs']} do not match current inputs "
-            f"{expected_inputs.lower()}. The expected value is a fingerprint computed from the PR "
-            "file list and patches, not the commit or tree SHA. Rerun the update so the gate reports "
-            "the expected fingerprint, or reuse the fingerprint recorded by the last gate run."
+            f"Docker verification inputs {metadata['verified_inputs']} do not match the current inputs "
+            f"({expected_values}). The expected value is a fingerprint computed from the PR "
+            "file list and patches, not the commit or tree SHA. Evidence that matches no supported "
+            "policy requires renewed verification: rerun the update so the gate reports the expected "
+            "fingerprint, or reuse the fingerprint recorded by the last gate run."
         )
+    metadata["detected_policy"] = detected_policy
     if not metadata.get("environment"):
         raise ValueError("Docker verification environment is missing")
     if expected_environment is not None and metadata.get("environment") != expected_environment:
@@ -287,6 +478,8 @@ def prepare_update_verification(
     previous_description: str,
     expected_inputs: str,
     current_tree: str,
+    *,
+    legacy_inputs: str | None = None,
 ) -> tuple[str, dict]:
     """Carry forward reusable evidence or require a fresh full verification.
 
@@ -296,6 +489,11 @@ def prepare_update_verification(
     ``reused-environment`` block so reviewers see explicit provenance instead of a
     silent gap. A new ``full`` block is only required when the inputs changed or no
     reusable evidence exists.
+
+    Fingerprint comparisons use R3-01 option (b): a recorded hash uniquely
+    matching either the current v2 or the fixed legacy v1 recomputation counts
+    as reusable, and the carried-forward block keeps the recorded hash — a
+    matched v1 record stays v1 evidence and is never rewritten as v2.
     """
     current = extract_verification_metadata(description)
     try:
@@ -303,11 +501,20 @@ def prepare_update_verification(
     except ValueError:
         previous = None
 
+    def recorded_policy(metadata: dict | None) -> str | None:
+        if not metadata:
+            return None
+        return detect_verification_policy(metadata.get("verified_inputs"), expected_inputs, legacy_inputs)
+
     if current and current["mode"] == VERIFICATION_MODE_FULL:
-        if current.get("verified_inputs") != expected_inputs.lower():
+        current_policy = recorded_policy(current)
+        if current_policy is None:
+            expected_values = f"v{VERIFICATION_POLICY_VERSION} {expected_inputs.lower()}"
+            if legacy_inputs:
+                expected_values += f" or legacy v{LEGACY_VERIFICATION_POLICY_VERSION} {legacy_inputs.lower()}"
             raise ValueError(
                 f"full Docker verification inputs {current.get('verified_inputs')} do not match the "
-                f"current PR inputs {expected_inputs.lower()}. The expected inputs fingerprint is "
+                f"current PR inputs ({expected_values}). The expected inputs fingerprint is "
                 "computed from the PR file list and patches; take it from the previous gate error or "
                 "ask the maintainer workflow to print it, then rerun both platform verifications."
             )
@@ -319,19 +526,22 @@ def prepare_update_verification(
             )
         if not current.get("environment"):
             raise ValueError("full Docker verification environment is missing")
-        validate_verification_metadata(description, expected_inputs, current_tree)
+        validate_verification_metadata(description, expected_inputs, current_tree, legacy_inputs=legacy_inputs)
+        # Keep the recorded hash: a v1 match must stay v1 evidence; a v2 match is
+        # already the current fingerprint. Upsert only normalizes formatting.
         return upsert_verification_metadata(
             description,
             VERIFICATION_MODE_FULL,
-            expected_inputs,
+            current["verified_inputs"],
             current_tree,
             current["environment"],
-        ), current
+        ), {**current, "detected_policy": current_policy}
 
+    previous_policy = recorded_policy(previous)
     previous_reusable = bool(
         previous
         and previous.get("mode") in {VERIFICATION_MODE_FULL, VERIFICATION_MODE_REUSED}
-        and previous.get("verified_inputs") == expected_inputs.lower()
+        and previous_policy is not None
         and previous.get("tested_tree")
         and previous.get("environment")
     )
@@ -343,33 +553,41 @@ def prepare_update_verification(
             raise ValueError("reused-environment tested tree must match the previously verified tree")
         if not current.get("environment"):
             raise ValueError("reused-environment verification environment is missing")
+        current_policy = recorded_policy(current)
+        if current_policy is None:
+            raise ValueError(
+                "reused-environment verification inputs do not match the current PR inputs under any "
+                "supported fingerprint policy; renewed verification is required"
+            )
         validate_verification_metadata(
             description,
             expected_inputs,
             current_tree,
             allow_reuse=True,
+            legacy_inputs=legacy_inputs,
         )
         return upsert_verification_metadata(
             description,
             VERIFICATION_MODE_REUSED,
-            expected_inputs,
+            current["verified_inputs"],
             current["tested_tree"],
             current["environment"],
-        ), current
+        ), {**current, "detected_policy": current_policy}
 
     if previous_reusable:
         mode = VERIFICATION_MODE_FULL if previous["tested_tree"] == current_tree else VERIFICATION_MODE_REUSED
         tested_tree = current_tree if mode == VERIFICATION_MODE_FULL else previous["tested_tree"]
         metadata = {
             "mode": mode,
-            "verified_inputs": expected_inputs,
+            "verified_inputs": previous["verified_inputs"],
             "tested_tree": tested_tree,
             "environment": previous["environment"],
+            "detected_policy": previous_policy,
         }
         return upsert_verification_metadata(
             description,
             mode,
-            expected_inputs,
+            previous["verified_inputs"],
             tested_tree,
             previous["environment"],
         ), metadata

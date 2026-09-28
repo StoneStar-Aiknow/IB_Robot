@@ -17,9 +17,17 @@ license: MIT
 
 ## ⚠️ 依赖准备
 
-本 skill 依赖 PyPI 包 `atomgit-sdk`，其 Python 导入模块名为 `atomgit_sdk`。
-仓库默认通过 `requirements/*.txt` 安装；如果当前环境未安装，请先运行
-`./scripts/setup.sh`，或在当前 Python 环境中安装 `atomgit-sdk`。
+本 skill 的平台访问走官方 AtomGit CLI（共享边界
+`.agents/skills/_shared/atomgit_cli.py`），**不再依赖** PyPI 包 `atomgit-sdk`。
+
+- CLI 可执行文件：`gitcode`（在 PATH 上），或用环境变量
+  `IBROBOT_ATOMGIT_CLI` 指向其**绝对路径**（Graphviz 的 `gc` 会被身份检查拒绝，不要使用）
+- 认证（由 CLI 负责，脚本不读取任何 token）：
+  ```bash
+  gitcode auth login --hostname atomgit.com --with-token
+  ```
+- 目标仓库解析优先级：显式 `--owner/--repo` 或 `--url` → `config.json` 的
+  `atomgit.owner/repo` 默认值（不再用于认证）→ 唯一 `upstream` remote
 
 ## ⚠️ 获取仓库配置（必需）
 
@@ -137,6 +145,6 @@ python3 issue_management.py --issue 123 --title "已修正: 编译错误" --body
 
 ## 注意事项
 
-1. **环境配置**: 确保 `ATOMGIT_TOKEN` 已正确配置在环境变量中。
+1. **环境配置**: 认证由官方 CLI 管理（`gitcode auth login --hostname atomgit.com --with-token`）；脚本不读取 `ATOMGIT_TOKEN` 或 `config.json` 中的 token。CLI 缺失/未认证时脚本以退出码 1 报错并给出安装/认证指引。
 2. **Issue 规范**: 建议在标题中使用清晰的前缀，如 `[Bug]`, `[Feature]`, `[Task]` 等。
 3. **标签管理**: 只使用 openEuler 社区预定义标签（见上方「标签规范」）。`kind/*`、`priority/*` 通过 `/kind`、`/priority` 斜杠命令（评论）由社区机器人添加，**不要**自造裸名标签（`bug`/`feature` 等）。CLI 不提供打标签参数，一律走斜杠命令。

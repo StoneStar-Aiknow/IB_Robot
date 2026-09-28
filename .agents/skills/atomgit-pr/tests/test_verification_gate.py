@@ -8,7 +8,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 import verification_gate
 from verification_gate import (
+    compute_legacy_verification_inputs,
     compute_verification_inputs,
+    detect_verification_policy,
     file_triggers_dual_docker_gate,
     format_verification_metadata,
     is_wip_title,
@@ -18,6 +20,7 @@ from verification_gate import (
     resolve_pr_stage,
     upsert_verification_metadata,
     validate_verification_metadata,
+    verification_inputs_placeholder_tainted,
 )
 
 _ENV = "ubuntu:ros-humble-desktop-full-jammy|openeuler:ibrobot-dev-env|policy:1"
@@ -356,3 +359,141 @@ def test_duplicate_field_error_lists_actual_counts():
     # Only the offending fields are listed, with their actual counts.
     assert "Docker verification mode=2" in message
     assert "Verified inputs" not in message
+
+
+# --------------------------------------------------------------------------- #
+# Policy-versioned fingerprints (task 3.2, reviews/round-3.md R3-01 option (b),
+# design.md D3): complete v1 reusable, complete v2, placeholder v1, unknown
+# hash and missing data are fixed fixtures.
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_verification_policy_matches_complete_v1_and_v2():
+    files = _gated_files()
+    v2 = compute_verification_inputs(files)
+    v1 = compute_legacy_verification_inputs(files)
+    assert v1 and v2 and v1 != v2  # same records; the policy field is the only difference
+    assert detect_verification_policy(v1, v2, v1) == "1"
+    assert detect_verification_policy(v2, v2, v1) == "2"
+
+
+def test_unrelated_file_changes_do_not_affect_either_fingerprint():
+    """Task 3.2 review: v2 must stay scoped to dependency-relevant records.
+
+    An unrelated doc change (or a rename touching no gate-relevant file)
+    must not invalidate recorded evidence — the reverted file-list binding
+    broke exactly this reuse semantic."""
+    gated = _gated_files()
+    with_unrelated = gated + [
+        {"filename": "docs/notes.md", "patch": "@@ -1 +1 @@\n-old\n+docs change"},
+        {"filename": "src/other.py", "patch": "@@ -1 +1 @@\n-old\n+unrelated"},
+    ]
+    assert compute_verification_inputs(with_unrelated) == compute_verification_inputs(gated)
+    assert compute_legacy_verification_inputs(with_unrelated) == compute_legacy_verification_inputs(gated)
+
+
+def test_truncated_requirements_patch_taints_inputs_and_keeps_gate():
+    """Task 3.2 review: non-empty patches are never treated as complete.
+
+    The hunk below declares 3 old/new lines but carries only one body line —
+    a truncated patch must enter the fingerprint as a placeholder (gate stays
+    triggered) and never match a hash recorded over complete inputs."""
+    truncated = [{"filename": "requirements/ubuntu.txt", "patch": "@@ -1,3 +1,3 @@\n-old\n+new"}]
+    assert verification_inputs_placeholder_tainted(truncated) is True
+    truncated_v2 = compute_verification_inputs(truncated)
+    truncated_v1 = compute_legacy_verification_inputs(truncated)
+    assert truncated_v2 is not None and truncated_v1 is not None  # gate stays triggered
+    assert detect_verification_policy(_inputs_sha(), truncated_v2, truncated_v1) is None
+
+
+def test_flagged_truncation_taints_even_with_complete_hunks():
+    """An entry that declares itself truncated taints even when the visible
+    hunk structure looks complete — the platform says content was dropped."""
+    flagged = [{"filename": "requirements/ubuntu.txt", "patch_truncated": True, "patch": "@@ -1 +1 @@\n-old\n+new"}]
+    assert verification_inputs_placeholder_tainted(flagged) is True
+    assert compute_verification_inputs(flagged) is not None
+
+
+def test_truncated_package_xml_cannot_bypass_gate():
+    """Task 3.2 review: a truncated package.xml patch whose visible part has
+    no dependency lines must NOT skip the gate — the truncation is exactly
+    where the depend lines could hide."""
+    truncated = [{"filename": "package.xml", "patch": "@@ -1,5 +1,5 @@\n+  <description>Update</description>"}]
+    assert verification_inputs_placeholder_tainted(truncated) is True
+    # The placeholder record keeps the gate triggered instead of returning None.
+    assert compute_verification_inputs(truncated) is not None
+    assert compute_legacy_verification_inputs(truncated) is not None
+
+
+def test_detect_verification_policy_rejects_unknown_hash_and_missing_data():
+    files = _gated_files()
+    v2 = compute_verification_inputs(files)
+    v1 = compute_legacy_verification_inputs(files)
+    # An unknown recorded hash matches no supported policy.
+    assert detect_verification_policy("e" * 40, v2, v1) is None
+    # A missing recorded hash is not evidence at all.
+    assert detect_verification_policy(None, v2, v1) is None
+    # Missing recomputation inputs: neither policy can be recomputed.
+    assert detect_verification_policy(_inputs_sha(), None, None) is None
+    # An ambiguous match (both policies recomputing to the same hash) is refused.
+    ambiguous = _inputs_sha()
+    assert detect_verification_policy(ambiguous, ambiguous, ambiguous) is None
+
+
+def test_validate_recognizes_complete_v1_evidence_and_keeps_original_checks():
+    files = _gated_files()
+    v2 = compute_verification_inputs(files)
+    v1 = compute_legacy_verification_inputs(files)
+    tree = "a" * 40
+    body = _full_block(tree, v1)  # a legacy four-field record carrying a v1 hash
+
+    metadata = validate_verification_metadata(body, v2, tree, legacy_inputs=v1)
+    assert metadata["detected_policy"] == "1"
+
+    # Even a matched v1 record still passes through the original tree check.
+    with pytest.raises(ValueError, match="does not match current tree"):
+        validate_verification_metadata(_full_block("b" * 40, v1), v2, tree, legacy_inputs=v1)
+    # Without the legacy recomputation the same v1 record requires renewed verification.
+    with pytest.raises(ValueError, match="do not match the current inputs"):
+        validate_verification_metadata(body, v2, tree)
+
+
+def test_prepare_update_reuses_complete_v1_evidence_without_rewriting_hash():
+    files = _gated_files()
+    v2 = compute_verification_inputs(files)
+    v1 = compute_legacy_verification_inputs(files)
+    tree = "a" * 40
+    previous = _full_block(tree, v1)  # v1-era evidence on the same inputs
+    description = "## Changes\n\nFix a typo.\n"
+
+    updated, metadata = prepare_update_verification(description, previous, v2, tree, legacy_inputs=v1)
+
+    assert metadata["detected_policy"] == "1"
+    # The carried-forward block keeps the recorded v1 hash — never rewritten as v2.
+    assert v1 in updated
+    assert v2 not in updated
+
+
+def test_placeholder_tainted_inputs_keep_gate_but_never_support_reuse():
+    placeholder_files = [{"filename": "scripts/setup.sh", "patch": ""}]  # missing patch
+    assert verification_inputs_placeholder_tainted(placeholder_files) is True
+    # A placeholder record keeps the gate triggered (conservative)...
+    placeholder_v2 = compute_verification_inputs(placeholder_files)
+    placeholder_v1 = compute_legacy_verification_inputs(placeholder_files)
+    assert placeholder_v2 is not None and placeholder_v1 is not None
+    # ...but a hash recorded over complete inputs never matches the placeholder
+    # recomputation, so placeholder-derived evidence cannot be reused.
+    complete_hash = _inputs_sha()
+    assert detect_verification_policy(complete_hash, placeholder_v2, placeholder_v1) is None
+
+
+def test_full_verification_without_legacy_recomputation_rejects_v1_hash():
+    """Without complete inputs to recompute v1, an old-style record cannot be
+    distinguished from an unknown hash and requires renewed verification."""
+    files = _gated_files()
+    v1 = compute_legacy_verification_inputs(files)
+    tree = "a" * 40
+    body = _full_block(tree, v1)
+
+    with pytest.raises(ValueError, match="do not match the current inputs"):
+        validate_verification_metadata(body, _inputs_sha(), tree, legacy_inputs=None)
