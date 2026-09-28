@@ -148,12 +148,10 @@ src/
 ├── voice_tts_service/       # Manifest-backed ZipVoice TTS typed service
 ├── robots/so101/            # SO-101 runtime suite: so101_sdk, so101_hardware, so101_description, so101_motion, so101_suite, so101_robot
 ├── robots/feetech/          # feetech_sdk (pinned Feetech servo SDK)
-├── lekiwi_hardware/         # ros2_control hardware plugin (LeKiwi base + arm)
+├── robots/lekiwi/           # LeKiwi runtime suite: lekiwi_sdk, lekiwi_hardware, lekiwi_description, lekiwi_calibration, lekiwi_robot
 ├── aero_hand_hardware/      # Aero Hand command/state bridge
 ├── hardware_mock/           # Contract-driven mock backend (no real hardware)
-├── lekiwi_description/      # LeKiwi URDF/meshes
 ├── sim_models/              # Scene assets + scene compiler (Gazebo/MuJoCo)
-├── robot_calibration/       # Sensor calibration capture/validate/activate workflows
 ├── attention_viz/           # ACT attention weight visualization
 ├── fast_lio/ fast_calib/ livox_ros_driver2/ omni_wheel_controller/  # (git submodules)
 ├── pymoveit2/ rosclaw/      # (git submodules, vendored)

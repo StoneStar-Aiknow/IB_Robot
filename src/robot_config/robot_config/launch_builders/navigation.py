@@ -113,13 +113,24 @@ def _generate_real_navigation(
     if "nav_stage" in robot_config:
         _validate_global_localization_provider(robot_config["nav_stage"], navigation_config)
     _validate_navigation_velocity_contract(robot_config, navigation_config)
+    _validate_provider_velocity_path(robot_config, navigation_config)
 
     logger.info("Navigation enabled, generating nodes...")
     nodes = []
 
-    from robot_config.launch_builders.fast_lio import generate_fast_lio_nodes
+    # Under a runtime provider the lidar odometry chain belongs to the robot
+    # runtime: launch_builders.runtime hands the stage's fast_lio section to
+    # the provider, which launches FAST-LIO and its odom bridge. Launching them
+    # here too would run two FAST-LIO instances and two odom -> base_link
+    # publishers.
+    from robot_config.launch_builders.runtime import runtime_provider
 
-    nodes.extend(generate_fast_lio_nodes(navigation_config, use_sim=use_sim))
+    if runtime_provider(robot_config):
+        logger.info("runtime.provider configured: FAST-LIO left to the robot runtime")
+    else:
+        from robot_config.launch_builders.fast_lio import generate_fast_lio_nodes
+
+        nodes.extend(generate_fast_lio_nodes(navigation_config, use_sim=use_sim))
 
     # Lazy imports for sub-builders (only needed in real-hardware mode)
     from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
@@ -149,6 +160,9 @@ def _generate_real_navigation(
             motion_mode_config=robot_config.get("motion_mode", {}),
             ekf_enabled=ekf_enabled,
             use_sim=use_sim,
+            # Lets the builder skip the bridge under a runtime provider, whose
+            # base node already owns cmd_vel; without it both drove the wheels.
+            robot_config=robot_config,
         )
     )
 
@@ -219,6 +233,33 @@ def _validate_navigation_velocity_contract(robot_config: dict[str, Any], navigat
         raise ValueError("dynamic LiDAR navigation must use cmd_vel_topic=/cmd_vel_safe")
     if stop_topic != bridge_topic:
         raise ValueError("dynamic LiDAR navigation stop_velocity_topic must match cmd_vel_topic")
+
+
+def _validate_provider_velocity_path(robot_config: dict[str, Any], navigation_config: dict[str, Any]) -> None:
+    """Refuse a provider stage whose collision-filtered velocity cannot reach the base.
+
+    Under a runtime provider the base is driven only through the runtime's
+    ``/cmd_vel`` channel (the generic bridge is skipped). The dynamic-avoidance
+    chain makes Nav2 publish ``/cmd_vel`` *unfiltered* and puts Collision
+    Monitor's output on ``/cmd_vel_safe``, which nothing forwards to the
+    runtime -- so launching it would let unfiltered planner output drive the
+    base. Routing Collision Monitor into the contract channel is the LeKiwi
+    application migration's job; until then such a stage fails here.
+    """
+    from robot_config.launch_builders.runtime import runtime_provider
+
+    provider = runtime_provider(robot_config)
+    nav2_config = navigation_config.get("nav2_bringup", {}) or {}
+    if not provider or not nav2_config.get("enabled", False) or not nav2_config.get("dyn_avoid_enabled", False):
+        return
+    stage = robot_config.get("nav_stage", "")
+    raise ValueError(
+        f"nav_stage '{stage}' enables the Nav2 collision monitor (nav2_bringup.dyn_avoid_enabled), whose filtered "
+        f"output /cmd_vel_safe does not reach the base under runtime.provider={provider!r}: the runtime admits base "
+        "commands only on /cmd_vel, where Nav2 publishes unfiltered. Disable dyn_avoid_enabled for this stage or "
+        "use a provider-less configuration until collision monitor output is routed into the runtime channel "
+        "(openspec lekiwi-application-migration, task 3.2)."
+    )
 
 
 def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> list:

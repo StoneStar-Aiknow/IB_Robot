@@ -67,7 +67,8 @@
 | `robot_runtime` | Runtime contract layer: RuntimeStatus, capabilities, interface description, mock runtime |
 | `robot_teleop` | Teleop bridges (50 Hz serial-to-controller), glove/VR/mhandpro sources |
 | `robot_navigation` | Nav2 client, `navigation_command_server` (`ExecuteNavigation`), cmd_vel bridge |
-| `robot_calibration` | Sensor calibration capture/artifact/validation/activation workflows |
+| `robots/lekiwi/lekiwi_robot` | LeKiwi runtime unit (`runtime.launch.py` + profiles, base node: cmd_vel, wheel odometry, navigation gate) |
+| `robots/lekiwi/lekiwi_calibration` | LeKiwi D435i/MID-360 calibration capture/artifact/validation/activation workflows |
 | `voice_asr_service` | sherpa-onnx ASR + speech direction nodes |
 | `voice_tts_service` | Manifest-backed ZipVoice TTS typed service |
 

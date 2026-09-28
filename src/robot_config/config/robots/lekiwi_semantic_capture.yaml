@@ -5,7 +5,7 @@ robot:
   robot_type: lekiwi
 
   default_control_mode: teleop
-  mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+  mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
 
   sensor_calibration:
     artifacts:

@@ -48,11 +48,11 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
 
     root = Path(__file__).resolve().parents[3]
     config_path = root / "src/robot_config/config/robots/lekiwi_lidar.yaml"
-    mount_path = root / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+    mount_path = root / "src/robots/lekiwi/lekiwi_description/config/lekiwi_mid360_mount.yaml"
     original_resolver = loader.resolve_ros_path
 
     def resolve_path(value):
-        if value == "$(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml":
+        if value == "$(find lekiwi_description)/config/lekiwi_mid360_mount.yaml":
             return str(mount_path)
         return original_resolver(value)
 

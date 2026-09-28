@@ -1,6 +1,13 @@
 # lekiwi_calibration
 
-IB-Robot 的 D435i/MID-360 外参标定工具。`robot_config` 是硬件配置和传感器安装关系的唯一事实来源。
+LeKiwi 的 D435i/MID-360 外参标定工具。MID-360 安装关系的唯一事实来源是
+`lekiwi_description/config/lekiwi_mid360_mount.yaml`，传感器配置仍由 `robot_config` 提供。
+
+> 本包由原通用包 `robot_calibration` 迁移而来（它只标定 LeKiwi 的 MID-360）。迁移只改变了
+> 调用方式：命令由 `ros2 run robot_calibration <cmd>` 改为 `ros2 run lekiwi_calibration <cmd>`，
+> 安装关系文件随机器人描述迁到 `lekiwi_description`。采集、处理、验证、审批流程与产物
+> （`base_to_mid360.yaml`、`base_to_front_camera.yaml`、`front_camera_intrinsics.yaml`，
+> 以及 `~/.ros/ibrobot/calib/current/` 布局）均未改变，已批准的产物无需重新生成。
 
 ## 现场流程
 
@@ -312,7 +319,8 @@ ros2 run lekiwi_calibration calib_offline solve \
 
 ## 安装方向与 ROI
 
-权威安装关系定义在 `robot_config/config/hardware/lekiwi_mid360_mount.yaml`：
+权威安装关系由 LeKiwi 机器人描述提供，定义在 `lekiwi_description/config/lekiwi_mid360_mount.yaml`
+（通过 ament 索引解析，仅安装、无源码树的部署同样可用）：
 
 ```yaml
 translation_m: [-0.08, 0.0, 0.20]
@@ -322,7 +330,7 @@ rpy_deg: [0.0, 0.0, 90.0]
 当前物理安装对应 `base_link -> body` 偏航角 `+90` 度。同一安装来源派生
 `base_link -> livox_frame`、`base_link -> body` 和反向 `body -> base_link`，不存在独立的 FAST-Calib 偏航参数。
 
-`calib_process` 直接加载上述 `robot_config` 文件并将其转换为候选 `base_to_mid360.yaml`；
+`calib_process` 直接加载上述 `lekiwi_description` 文件并将其转换为候选 `base_to_mid360.yaml`；
 `config/examples/` 仅说明格式，不参与本次测量或求解。
 
 在当前安装下，MID-360 的 `body -Y` 大致朝向车辆前方 `base_link +X`，因此标定板 ROI 位于 `body y` 负方向。
@@ -330,7 +338,7 @@ rpy_deg: [0.0, 0.0, 90.0]
 
 传感器发生移动、旋转或高度变化时：
 
-1. 测量并更新 `robot_config` 中的安装平移和 `rpy_deg`，明确保持 `base_link -> body` 方向。
+1. 测量并更新 `lekiwi_description` 中的安装平移和 `rpy_deg`，明确保持 `base_link -> body` 方向。
 2. 在新的 `body` 坐标系下重新导出稠密点云，不能仅通过改变坐标符号复用旧 ROI。
 3. 检查完整点云并更新每个场景的 `x_min/x_max`、`y_min/y_max` 和 `z_min/z_max`，使标定板位于带有少量实测余量的范围内。
 4. 除非物理标定板尺寸发生变化，否则保持竖直平面、标定板几何和完整平面检测参数不变。

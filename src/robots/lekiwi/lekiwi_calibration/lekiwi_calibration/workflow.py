@@ -134,7 +134,13 @@ def _default_templates() -> Path:
 
 
 def _default_mount() -> Path:
-    return _repo_root() / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+    # The MID-360 mount is a mechanical fact of the robot, shipped by the LeKiwi
+    # description rather than read from a source checkout: an install-only
+    # deployment has no source tree, and the application configuration
+    # directory is not the authority for how the lidar is bolted on.
+    from ament_index_python.packages import get_package_share_directory
+
+    return Path(get_package_share_directory("lekiwi_description")) / "config/lekiwi_mid360_mount.yaml"
 
 
 def _capture_summary(capture_root: Path, capture_id: str) -> list[dict[str, Any]]:

@@ -36,7 +36,7 @@ robot:
   # controllers own joints 1-6, while base_velocity_controller owns joints 7-9.
   # The legacy grasp/mapping/navigation stages remain available for migration.
   default_nav_stage: hybrid
-  mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+  mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
 
   sensor_calibration:
     artifacts:
@@ -937,7 +937,7 @@ robot:
     hybrid:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
-      mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+      mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
       peripheral_names: [respeaker, wrist, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true

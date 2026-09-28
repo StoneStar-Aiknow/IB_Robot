@@ -22,8 +22,10 @@ MOVE_TO_JOINT_SERVICE = "/motion/move_to_joint"
 # --- base channels (robot-runtime-contract spec) -----------------------------
 CMD_VEL_TOPIC = "/cmd_vel"
 ODOM_TOPIC = "/odom"
-# Navigation gating keeps the names navigation stacks already use (the former
-# motion-mode handshake); only the implementation behind them moved.
+# Navigation gating: an enable service plus an acknowledgment topic, both
+# absolute. The former application motion-mode handshake used the same names
+# relative (so they coincide only in the root namespace) and also had an enable
+# topic, which the runtime does not serve.
 NAVIGATION_ENABLE_SERVICE = "/motion_mode/set_navigation_enabled"
 NAVIGATION_ACK_TOPIC = "/motion_mode/base_navigation_enabled"
 
