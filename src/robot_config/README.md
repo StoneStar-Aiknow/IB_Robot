@@ -1715,3 +1715,13 @@ ros2 launch robot_config robot.launch.py \
 ## 许可证
 
 Apache-2.0
+
+## 交互 demo：逻辑接口绑定与统一入口
+
+选择 `robot_config:=aimdk_x2_interaction_demo` 可从原有 `robot.launch.py` 启动 X2 runtime
+和独立 demo 节点。派生 YAML 只声明启用、超时和逻辑接口 `speech.speak` / `motion.named`；
+运行时接口描述负责解析实际 endpoint，绑定成功后 launch 才注入并启动业务节点。
+
+文本、语言、优先级、动作名和目标侧由每次 `runtime-demo speak` / `runtime-demo motion`
+请求传入，不在机器人 YAML 中固化。业务包只依赖中立 `ibrobot_msgs`，不依赖 robot_config、
+robot_runtime 或厂商 SDK。详细命令见 [交互示范指南](../../docs/aimdk_interaction_demo.md)。

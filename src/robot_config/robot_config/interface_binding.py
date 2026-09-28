@@ -41,9 +41,31 @@ def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
             yield item, f"{path} interface={interface_id!r}", direction
 
 
+def _endpoint_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str]]:
+    """Yield non-topic consumer bindings such as business services and actions."""
+    demo = config.get("interaction_demo")
+    if demo is None:
+        return
+    if not isinstance(demo, Mapping):
+        raise InterfaceBindingError("invalid_binding", "interaction_demo", "must be a mapping")
+    interfaces = demo.get("interfaces", {})
+    if not isinstance(interfaces, Mapping):
+        raise InterfaceBindingError("invalid_binding", "interaction_demo.interfaces", "must be a mapping")
+    for role, item in interfaces.items():
+        path = f"interaction_demo.interfaces.{role}"
+        if not isinstance(item, dict):
+            raise InterfaceBindingError("invalid_binding", path, "must be a mapping")
+        interface_id = item.get("interface")
+        if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+            raise InterfaceBindingError("invalid_interface", path, "interface must be a non-empty logical ID")
+        yield item, f"{path} interface={interface_id!r}"
+
+
 def required_interface_ids(config: Mapping[str, Any]) -> list[str]:
     """Return all explicitly bound interfaces, in contract order (never guessed from topics)."""
-    return list(dict.fromkeys(item["interface"] for item, _, _ in _bindings(config)))
+    ids = [item["interface"] for item, _, _ in _bindings(config)]
+    ids.extend(item["interface"] for item, _ in _endpoint_bindings(config))
+    return list(dict.fromkeys(ids))
 
 
 def _requirements(value: Any, path: str) -> Mapping[str, Any]:
@@ -57,7 +79,9 @@ def _requirements(value: Any, path: str) -> Mapping[str, Any]:
 
 def required_interface_requirements(config: Mapping[str, Any]) -> dict:
     requirements = {}
-    for item, path, _ in _bindings(config):
+    bindings = [(item, path) for item, path, _ in _bindings(config)]
+    bindings.extend(_endpoint_bindings(config))
+    for item, path in bindings:
         merged = requirements.setdefault(item["interface"], {})
         for key, value in _requirements(item.get("requires"), path).items():
             if key in merged and key != "min_fps" and merged[key] != value:
@@ -247,6 +271,53 @@ def bind_robot_interfaces(
             "uncertainty": uncertainty,
         }
 
+    for item, path in _endpoint_bindings(result):
+        interface_id = item["interface"]
+        interface = descriptor["interfaces"].get(interface_id)
+        if interface is None:
+            raise InterfaceBindingError("unknown_interface", path, "ID is not in the runtime description")
+        expected_kind = item.get("kind")
+        if expected_kind not in {"service", "action"}:
+            raise InterfaceBindingError("invalid_binding", path, "kind must be service or action")
+        if interface["kind"] != expected_kind:
+            raise InterfaceBindingError(
+                "kind_mismatch", path, f"expected {expected_kind!r}, described {interface['kind']!r}"
+            )
+        if interface["direction"] != "serve":
+            raise InterfaceBindingError(
+                "direction_mismatch", path, f"expected provider 'serve', described {interface['direction']!r}"
+            )
+        expected_type = item.get("type")
+        if not isinstance(expected_type, str) or not expected_type:
+            raise InterfaceBindingError("invalid_binding", path, "type must be a non-empty ROS interface type")
+        if interface["message_type"] != expected_type:
+            raise InterfaceBindingError(
+                "type_mismatch", path, f"expected type {expected_type!r}, described {interface['message_type']!r}"
+            )
+        explicit_endpoint = item.get("endpoint")
+        if explicit_endpoint is not None and explicit_endpoint != interface["endpoint"]:
+            raise InterfaceBindingError(
+                "endpoint_mismatch",
+                path,
+                f"explicit endpoint {explicit_endpoint!r} differs from {interface['endpoint']!r}",
+            )
+        from robot_runtime.interface_description import check_interface_requirements
+
+        try:
+            check_interface_requirements(interface, None, _requirements(item.get("requires"), path))
+        except ValueError as exc:
+            raise InterfaceBindingError("requirement_unsatisfied", path, str(exc)) from exc
+        item["endpoint"] = interface["endpoint"]
+        item["capability"] = interface["capability"]
+        item["_interface_source"] = {
+            "id": interface_id,
+            "description_digest": digest,
+            "kind": interface["kind"],
+            "direction": interface["direction"],
+            "endpoint": interface["endpoint"],
+            "message_type": interface["message_type"],
+        }
+
     runtime["interface_description"] = copy.deepcopy(descriptor)
     result.pop("_interfaces_deferred", None)
     return result
@@ -254,10 +325,13 @@ def bind_robot_interfaces(
 
 def resolve_robot_interfaces(config: dict[str, Any], *, defer: bool = False) -> dict[str, Any]:
     """Resolve an embedded or file-backed snapshot. Deferral is explicit and structural only."""
-    bindings = list(_bindings(config))
-    if not bindings and not (config.get("runtime") or {}).get("require_model"):
+    topic_bindings = list(_bindings(config))
+    endpoint_bindings = list(_endpoint_bindings(config))
+    if not topic_bindings and not endpoint_bindings and not (config.get("runtime") or {}).get("require_model"):
         return config
-    for item, path, _ in bindings:
+    for item, path, _ in topic_bindings:
+        _requirements(item.get("requires"), path)
+    for item, path in endpoint_bindings:
         _requirements(item.get("requires"), path)
     if defer:
         result = copy.deepcopy(config)

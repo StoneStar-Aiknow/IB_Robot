@@ -95,6 +95,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MoveToPose.srv"
   "srv/SetRuntimeMode.srv"
   "srv/GetRuntimeStatus.srv"
+  "srv/ExecuteInteractionDemo.srv"
   "srv/StopRuntime.srv"
   "srv/ComputeFk.srv"
   "srv/ComputeIk.srv"

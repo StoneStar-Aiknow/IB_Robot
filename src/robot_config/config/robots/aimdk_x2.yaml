@@ -12,7 +12,9 @@
 
 robot:
   name: aimdk_x2
-  type: aimdk
+  # Must match the selected runtime profile's public robot identity. Vendor
+  # family metadata remains robot_type=agibot_x2 below.
+  type: x2_ultra
   robot_type: agibot_x2  # For LeRobot dataset metadata
 
   simulation:

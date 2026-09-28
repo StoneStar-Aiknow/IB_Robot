@@ -44,6 +44,11 @@ def test_it_selects_the_x2_runtime_provider(config, raw):
     assert raw["runtime"]["profile"] == "x2_ultra"
 
 
+def test_application_type_matches_runtime_public_identity(raw, profile):
+    assert raw["type"] == profile["runtime"]["type"] == "x2_ultra"
+    assert raw["robot_type"] == "agibot_x2"
+
+
 def test_required_capabilities_are_registered_names(raw):
     required = set(raw["capabilities"]["requires"])
     assert required

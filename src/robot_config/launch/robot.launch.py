@@ -1113,6 +1113,11 @@ def _construct_robot_nodes(
         logger.error(f"setting up rerun visualizer: {e}")
         logger.info("Continuing without recording visualizer...")
 
+    # Business code lives in its own package; start after runtime readiness.
+    from robot_config.launch_builders.interaction_demo import generate_interaction_demo_nodes
+
+    controller_dependent_actions.extend(generate_interaction_demo_nodes(robot_config))
+
     enable_tracing = parse_bool(context.launch_configurations.get("enable_tracing", "false"), default=False)
     if controller_dependent_actions:
         if enable_tracing:
