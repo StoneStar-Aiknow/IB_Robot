@@ -8,6 +8,20 @@ license: MIT
 
 提取适合 review 的完整 PR 上下文，并提交代码审查评论到 AtomGit。
 
+## ⚠️ 依赖准备
+
+本 skill 的平台访问走官方 AtomGit CLI（共享边界
+`.agents/skills/_shared/atomgit_cli.py`），**不再依赖** PyPI 包 `atomgit-sdk`。
+
+- CLI 可执行文件：`gitcode`（在 PATH 上），或用环境变量
+  `IBROBOT_ATOMGIT_CLI` 指向其**绝对路径**（Graphviz 的 `gc` 会被身份检查拒绝，不要使用）
+- 认证（由 CLI 负责，脚本不读取任何 token）：
+  ```bash
+  gitcode auth login --hostname atomgit.com --with-token
+  ```
+- 目标仓库解析优先级：显式 `--owner/--repo` 或 `--url` → `config.json` 的
+  `atomgit.owner/repo` 默认值（不再用于认证）→ 唯一 `upstream` remote
+
 ## 默认执行协议：三步法是门禁，不是可选建议
 
 **每次代码评审都自动执行「理解问题 → 独立方案 → 实现对比」，无需用户强调“三步法”。**

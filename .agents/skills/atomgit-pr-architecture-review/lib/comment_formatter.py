@@ -3,7 +3,25 @@
 负责将架构问题格式化为 AtomGit PR 评论
 """
 
-from atomgit_sdk import ArchitectureIssue
+from dataclasses import dataclass
+
+
+@dataclass
+class ArchitectureIssue:
+    """架构审查 finding（本地数据类，替代已退役的 atomgit_sdk.ArchitectureIssue）。
+
+    字段与 SDK pydantic 模型保持一致。
+    """
+
+    file: str
+    line: int
+    title: str = ""
+    description: str = ""
+    severity: str = "warning"
+    pillar: str = "python"
+    fix: str | None = None
+    context_code: str | None = None
+
 
 # IB-Robot 架构参考资料
 ARCHITECTURE_REFERENCES = {

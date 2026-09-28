@@ -5,6 +5,12 @@ AtomGit Architecture Review Workflow
 1. --extract-info: 提取 PR 信息（输出JSON）- AI Agent 使用
 2. --submit-review: 提交审查结果（从JSON读取）- AI Agent 使用
 3. --auto: 自动审查（调用LLM）- CI 使用，需要配置 LLM
+
+Platform access goes through the official AtomGit CLI via the shared boundary
+in ``.agents/skills/_shared/atomgit_cli.py`` (OpenSpec change
+``migrate-atomgit-skills-to-cli``); review-specific argv building lives in
+``.agents/skills/_shared/review_helpers.py``. Authentication is owned by the
+CLI: ``gitcode auth login --hostname atomgit.com --with-token``.
 """
 
 import argparse
@@ -12,19 +18,21 @@ import json
 import sys
 from pathlib import Path, PurePosixPath
 
+sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
-from atomgit_sdk import ArchitectureIssue, AtomGitClient, AtomGitConfig
-from atomgit_sdk.utils import add_line_numbers
-from comment_formatter import CommentFormatter
+import atomgit_cli
+import review_helpers
+from comment_formatter import ArchitectureIssue, CommentFormatter
 from llm_architecture_reviewer import LLMArchitectureReviewer
 
 
 class ArchitectureReviewer:
     """架构审查器"""
 
-    def __init__(self, client: AtomGitClient, formatter: CommentFormatter):
-        self.client = client
+    def __init__(self, cli: str, target: atomgit_cli.RepoTarget, formatter: CommentFormatter):
+        self.cli = cli
+        self.target = target
         self.formatter = formatter
 
     def _candidate_readme_paths(self, file_path: str) -> list[str]:
@@ -46,10 +54,10 @@ class ArchitectureReviewer:
         errors = []
         for candidate in candidates:
             try:
-                content = self.client.get_file_content(candidate, ref)
+                content = review_helpers.fetch_file_content(self.cli, self.target, candidate, ref)
                 return {
                     "path": candidate,
-                    "content": add_line_numbers(content),
+                    "content": review_helpers.add_line_numbers(content),
                     "candidates": candidates,
                 }
             except Exception as e:
@@ -64,8 +72,8 @@ class ArchitectureReviewer:
 
     def extract_pr_info(self, pr_number: int) -> dict:
         """提取 PR 信息"""
-        pr = self.client.get_pull_request(pr_number)
-        files = self.client.get_pr_files(pr_number)
+        pr = review_helpers.fetch_pr_record(self.cli, self.target, pr_number)
+        files = review_helpers.fetch_pr_files(self.cli, self.target, pr_number)
         head_sha = pr.get("head", {}).get("sha", "HEAD")
 
         changed_files = []
@@ -83,8 +91,8 @@ class ArchitectureReviewer:
 
                 # 获取文件内容（使用 PR 的 head SHA）
                 try:
-                    content = self.client.get_file_content(filename, head_sha)
-                    file_data["content"] = add_line_numbers(content)
+                    content = review_helpers.fetch_file_content(self.cli, self.target, filename, head_sha)
+                    file_data["content"] = review_helpers.add_line_numbers(content)
                 except Exception as e:
                     file_data["content"] = f"# Error fetching content: {e}"
 
@@ -128,12 +136,13 @@ class ArchitectureReviewer:
         """提交审查结果"""
         if not issues:
             summary = self.formatter.format_summary(issues)
-            self.client.submit_pr_comment(pr_number, summary)
+            review_helpers.submit_pr_comment(self.cli, self.target, pr_number, summary)
             print(f"✅ 提交架构审查通过评论到 PR #{pr_number}")
             return
 
-        pr_files = self.client.get_pr_files(pr_number)
-        changed_filenames = {f.get("filename") for f in pr_files}
+        pr_files = review_helpers.fetch_pr_files(self.cli, self.target, pr_number)
+        diffs = {str(f.get("filename") or ""): f for f in pr_files}
+        changed_filenames = set(diffs)
 
         inline_issues = []
         pr_level_issues = []
@@ -144,8 +153,18 @@ class ArchitectureReviewer:
                 pr_level_issues.append(issue)
 
         if inline_issues:
-            comments = self.formatter.format_issues(inline_issues)
-            results = self.client.submit_batch_comments(pr_number, comments)
+            # 与 pr_review 相同的 CLI 定位语义：``pr comment --position`` 接受
+            # new 侧文件行号，仅 diff new 侧可见的行可携带行内评论；不可见行
+            # 由 submit_inline_comments 逐条显式报告失败（无平台调用）。
+            positions: dict[str, dict[int, int]] = {}
+            for issue in inline_issues:
+                patch = diffs.get(issue.file, {}).get("patch") or ""
+                if isinstance(patch, dict):
+                    patch = patch.get("diff") or ""
+                if issue.line in review_helpers.diff_new_side_lines(patch):
+                    positions.setdefault(issue.file, {})[issue.line] = issue.line
+            comments = self.formatter.format_issues(inline_issues, positions)
+            results = review_helpers.submit_inline_comments(self.cli, self.target, pr_number, comments)
 
             success_count = sum(1 for r in results if r["success"])
             print(f"✅ 提交 {success_count}/{len(results)} 条行内评论到 PR #{pr_number}")
@@ -157,7 +176,7 @@ class ArchitectureReviewer:
         if pr_level_issues:
             body = self.formatter.format_pr_level_issues(pr_level_issues)
             try:
-                self.client.submit_pr_comment(pr_number, body)
+                review_helpers.submit_pr_comment(self.cli, self.target, pr_number, body)
                 print(f"✅ 提交 {len(pr_level_issues)} 条 PR 评论到 PR #{pr_number}（非变更文件，降级为 PR 级评论）")
             except Exception as e:
                 print(f"  ❌ PR 评论提交失败: {e}")
@@ -175,7 +194,7 @@ def mode_extract_info(args, reviewer: ArchitectureReviewer):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 从配置中获取仓库名称
-    repo_name = reviewer.client.config.repo.lower().replace("-", "_")
+    repo_name = reviewer.target.repo.lower().replace("-", "_")
     output_file = output_dir / f"{repo_name}_pr_{args.pr}_arch_info.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(pr_info, f, indent=2, ensure_ascii=False)
@@ -225,10 +244,10 @@ def mode_submit_review(args, reviewer: ArchitectureReviewer):
     print("=" * 60 + "\n")
     print("📊 统计:")
     print(f"   总问题数: {len(issues)}")
-    print(f"\n🔗 PR 链接: {reviewer.client.get_pr_url(args.pr)}\n")
+    print(f"\n🔗 PR 链接: {review_helpers.pr_url(reviewer.target, args.pr)}\n")
 
 
-def mode_auto(args, client: AtomGitClient, reviewer: ArchitectureReviewer, config: dict):
+def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: ArchitectureReviewer, config: dict):
     """模式3: 自动审查（CI 使用，需要 LLM 配置）"""
     print("\n" + "=" * 60)
     print("🤖 模式: 自动审查（LLM驱动）")
@@ -256,11 +275,11 @@ def mode_auto(args, client: AtomGitClient, reviewer: ArchitectureReviewer, confi
     )
 
     # 获取 PR 信息以获取 head_sha
-    pr_info = client.get_pull_request(args.pr)
+    pr_info = review_helpers.fetch_pr_record(cli, target, args.pr)
     head_sha = pr_info.get("head", {}).get("sha", "HEAD")
 
     print("\n📝 获取 PR 文件变更...")
-    files = client.get_pr_files(args.pr)
+    files = review_helpers.fetch_pr_files(cli, target, args.pr)
 
     all_issues = []
 
@@ -286,7 +305,7 @@ def mode_auto(args, client: AtomGitClient, reviewer: ArchitectureReviewer, confi
 
         try:
             # 获取文件内容（使用 head_sha）
-            content = client.get_file_content(file_path, head_sha)
+            content = review_helpers.fetch_file_content(cli, target, file_path, head_sha)
             diff = file_info.get("patch", "")
             readme_context = reviewer.get_readme_context(file_path, head_sha)
 
@@ -339,7 +358,7 @@ def mode_auto(args, client: AtomGitClient, reviewer: ArchitectureReviewer, confi
         print("✅ 审查完成 - 未发现架构问题")
         print("=" * 60)
 
-    print(f"\n🔗 PR 链接: {client.get_pr_url(args.pr)}\n")
+    print(f"\n🔗 PR 链接: {review_helpers.pr_url(target, args.pr)}\n")
 
 
 def main():
@@ -367,7 +386,12 @@ def main():
     mode_group.add_argument("--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）")
 
     # 通用参数
-    parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="配置文件路径 (默认: config.json；仅作 owner/repo 默认与 --auto 模式 LLM 配置，不再用于认证)",
+    )
     parser.add_argument("--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)")
     parser.add_argument(
         "--ai-model",
@@ -406,24 +430,37 @@ def main():
     print("🔍 AtomGit 架构审查工具")
     print("=" * 60)
 
-    # 加载配置
+    # 初始化 CLI 边界与目标仓库
     try:
-        with open(args.config, encoding="utf-8") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        print(f"\n❌ 配置文件不存在: {args.config}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ 加载配置失败: {e}")
+        cli = atomgit_cli.resolve_cli()
+        atomgit_cli.check_cli_identity(cli)
+        target = atomgit_cli.resolve_target(
+            config_path=args.config or "config.json",
+            explicit_config=args.config is not None,
+            remotes=atomgit_cli.read_git_remotes(),
+        )
+    except (atomgit_cli.CLIError, atomgit_cli.TargetResolutionError) as e:
+        print(f"\n❌ 初始化失败: {e}")
         sys.exit(1)
 
-    # 创建 API 实例
-    api = AtomGitClient(AtomGitConfig.from_json(args.config))
+    # config.json 只为 --auto 模式提供 LLM 配置；owner/repo 默认已由
+    # resolve_target 读取，认证由 CLI 自己管理（design.md D2）。
+    config = {}
+    if args.auto:
+        try:
+            with open(args.config or "config.json", encoding="utf-8") as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            pass  # mode_auto 会给出缺少 Anthropic API Key 的指引
+        except Exception as e:
+            print(f"\n❌ 加载配置失败: {e}")
+            sys.exit(1)
+
     formatter = CommentFormatter(ai_model=args.ai_model)
-    reviewer = ArchitectureReviewer(api, formatter)
+    reviewer = ArchitectureReviewer(cli, target, formatter)
 
     print(f"\n📋 PR: #{args.pr}")
-    print(f"🏠 仓库: {api.config.owner}/{api.config.repo}")
+    print(f"🏠 仓库: {target.slug}")
     print(f"🤖 AI模型: {args.ai_model}")
 
     # 检查模式
@@ -448,7 +485,7 @@ def main():
     elif args.submit_review:
         mode_submit_review(args, reviewer)
     elif args.auto:
-        mode_auto(args, api, reviewer, config)
+        mode_auto(args, cli, target, reviewer, config)
 
 
 if __name__ == "__main__":

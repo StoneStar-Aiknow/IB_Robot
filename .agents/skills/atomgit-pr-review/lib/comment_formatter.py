@@ -3,8 +3,31 @@
 负责将代码问题格式化为 AtomGit PR 评论
 """
 
-from typing import Dict, List, Optional
-from atomgit_sdk import CodeIssue
+from dataclasses import dataclass
+
+
+@dataclass
+class CodeIssue:
+    """代码审查 finding（本地数据类，替代已退役的 atomgit_sdk.CodeIssue）。
+
+    字段与 SDK pydantic 模型保持一致；confidence 的 0-100 范围校验
+    （SDK ``ge=0 le=100``）以 ``__post_init__`` 保留。
+    """
+
+    file: str
+    line: int
+    type: str = "bug"
+    severity: str = "warning"
+    confidence: int = 80
+    title: str = ""
+    description: str = ""
+    context_code: str | None = None
+    fix_code: str | None = None
+    fix_explanation: str | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.confidence <= 100:
+            raise ValueError(f"confidence must be within 0-100, got {self.confidence}")
 
 
 # 官方参考资料
@@ -97,9 +120,7 @@ class CommentFormatter:
 
         return body
 
-    def format_issue(
-        self, issue: CodeIssue, position: Optional[int] = None
-    ) -> Optional[dict]:
+    def format_issue(self, issue: CodeIssue, position: int | None = None) -> dict | None:
         """格式化单个问题为行内评论"""
         if issue.confidence < self.confidence_threshold:
             return None
@@ -134,9 +155,9 @@ class CommentFormatter:
 
     def format_issues(
         self,
-        issues: List[CodeIssue],
-        positions: Optional[Dict[str, Dict[int, int]]] = None,
-    ) -> List[dict]:
+        issues: list[CodeIssue],
+        positions: dict[str, dict[int, int]] | None = None,
+    ) -> list[dict]:
         """格式化问题列表"""
         if positions is None:
             positions = {}
@@ -153,19 +174,12 @@ class CommentFormatter:
 
         return comments
 
-    def format_summary(
-        self, issues: List[CodeIssue], pr_number: int, pr_title: str
-    ) -> str:
+    def format_summary(self, issues: list[CodeIssue], pr_number: int, pr_title: str) -> str:
         """格式化代码审查总结"""
         if not issues:
-            return (
-                "## 代码审查完成\n\n✅ 未发现问题。代码变更质量良好。"
-                + self.ai_signature
-            )
+            return "## 代码审查完成\n\n✅ 未发现问题。代码变更质量良好。" + self.ai_signature
 
-        filtered_issues = [
-            i for i in issues if i.confidence >= self.confidence_threshold
-        ]
+        filtered_issues = [i for i in issues if i.confidence >= self.confidence_threshold]
 
         if not filtered_issues:
             return (
@@ -199,7 +213,7 @@ class CommentFormatter:
 
         return body
 
-    def deduplicate(self, issues: List[CodeIssue]) -> List[CodeIssue]:
+    def deduplicate(self, issues: list[CodeIssue]) -> list[CodeIssue]:
         """去重"""
         seen = set()
         unique = []
