@@ -15,8 +15,10 @@
 #ifndef FEETECH__SIM_SMS_STS_HPP_
 #define FEETECH__SIM_SMS_STS_HPP_
 
+#include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -45,8 +47,10 @@ public:
     bool wheel_mode = false;
     std::int32_t pos_ticks = 2048;      // present position (raw)
     std::int32_t goal_ticks = 2048;     // position command (raw)
-    std::int32_t wheel_speed_steps = 0; // wheel velocity command (signed)
+    std::int32_t wheel_speed_steps = 0; // wheel velocity command (signed, steps/s)
     std::int32_t last_move_ticks = 0;   // delta applied by the last read
+    std::int32_t present_speed = 0;     // reported speed word (see advance_time)
+    double wheel_residual_ticks = 0.0;  // sub-tick wheel travel carried to the next read
     // Static register storage for write/readback of config registers.
     std::map<std::uint8_t, std::uint8_t> regs;
     // Register-precise write rejection: `rejected[addr]` is the set of first
@@ -66,6 +70,12 @@ public:
   /// Position convergence applied per group read, in ticks.
   std::int32_t converge_step_ticks = 64;
 
+  /// Wheel-mode motors advance by commanded speed x elapsed time. By default
+  /// elapsed time is the steady clock; tests switch to a manual clock and move
+  /// it with advance_clock() so motion is independent of wall time.
+  void use_manual_clock();
+  void advance_clock(std::chrono::nanoseconds elapsed);
+
 protected:
   int writeSCS(unsigned char * nDat, int nLen) override;
   int writeSCS(unsigned char bDat) override;
@@ -78,6 +88,11 @@ private:
   std::map<std::uint8_t, Motor> motors_;
   std::vector<std::uint8_t> rx_;     // pending response bytes
   std::vector<std::uint8_t> frame_;  // frame accumulator
+  bool manual_clock_ = false;
+  std::chrono::steady_clock::time_point manual_now_{};
+  std::optional<std::chrono::steady_clock::time_point> last_advance_;
+
+  std::chrono::steady_clock::time_point now() const;
 
   void on_frame(const std::vector<std::uint8_t> & frame);
   void queue_bytes(const std::vector<std::uint8_t> & bytes);

@@ -81,6 +81,11 @@ public:
     std::int32_t position_ticks(std::uint8_t id) const;
     /// Position convergence applied per group read, in ticks.
     void set_converge_step_ticks(std::int32_t step);
+    /// Wheel-mode motors advance by commanded speed x elapsed time. Switch the
+    /// simulation to a manual clock, then move it with advance_clock(), so a
+    /// test controls elapsed time independently of wall time and read rate.
+    void use_manual_clock();
+    void advance_clock(std::chrono::nanoseconds elapsed);
     /// Motor state inspection (torque enabled / EPROM locked).
     bool torque_enabled(std::uint8_t id) const;
     bool eprom_locked(std::uint8_t id) const;

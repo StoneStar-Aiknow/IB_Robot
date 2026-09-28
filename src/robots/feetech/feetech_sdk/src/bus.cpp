@@ -199,6 +199,20 @@ void Bus::SimControl::set_converge_step_ticks(std::int32_t step)
   }
 }
 
+void Bus::SimControl::use_manual_clock()
+{
+  if (impl_ && impl_->sim) {
+    impl_->sim->use_manual_clock();
+  }
+}
+
+void Bus::SimControl::advance_clock(std::chrono::nanoseconds elapsed)
+{
+  if (impl_ && impl_->sim) {
+    impl_->sim->advance_clock(elapsed);
+  }
+}
+
 bool Bus::SimControl::torque_enabled(std::uint8_t id) const
 {
   if (impl_ && impl_->sim) {

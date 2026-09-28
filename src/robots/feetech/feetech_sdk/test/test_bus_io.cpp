@@ -14,8 +14,9 @@
 
 #include <gtest/gtest.h>
 
-#include <vector>
+#include <chrono>
 #include <limits>
+#include <vector>
 
 #include "feetech/bus.hpp"
 #include "feetech/conversion.hpp"
@@ -201,12 +202,51 @@ TEST(BusIO, WheelVelocityCommandAccumulatesPosition)
   targets.push_back(target);
   ASSERT_TRUE(bus.sync_write_velocities(targets).ok);
 
+  // The wheel rotates at the commanded speed for the elapsed time, not by one
+  // second's worth per read.
+  bus.sim().use_manual_clock();
   std::vector<feetech::MotorSample> samples;
+  ASSERT_TRUE(bus.sync_read(samples).ok);  // establishes the time origin
+  EXPECT_NEAR(samples[6].position, 0.0, 1e-9);
+  bus.sim().advance_clock(std::chrono::milliseconds(250));
   ASSERT_TRUE(bus.sync_read(samples).ok);
-  // Each read advances the wheel by one step of the commanded speed.
-  const double expected = feetech::steps_to_rad_per_s(feetech::rad_per_s_to_steps(1.0));
-  EXPECT_NEAR(samples[6].position, expected, 1e-6);
-  EXPECT_NEAR(samples[6].velocity, expected, 1e-6);
+  const double speed = feetech::steps_to_rad_per_s(feetech::rad_per_s_to_steps(1.0));
+  const double one_tick = feetech::accumulated_ticks_to_radians(1);
+  EXPECT_NEAR(samples[6].position, speed * 0.25, one_tick);
+  // Present speed is reported in steps per second, like the real servo.
+  EXPECT_NEAR(samples[6].velocity, speed, 1e-6);
+}
+
+// Regression: the simulated wheel used to advance one second of rotation per
+// read round, so a 100 Hz reader saw the wheel turn 100x too fast and the
+// distance depended on how often it was read.
+TEST(BusIO, WheelMotionDoesNotScaleWithReadRate)
+{
+  const auto travelled_ticks = [](int reads, std::chrono::milliseconds period) {
+      feetech::Bus bus(mobile_options());
+      EXPECT_TRUE(bus.open());
+      EXPECT_TRUE(bus.apply_all_configs().ok);
+      bus.sim().set_position_ticks(7, 0);
+      bus.sim().use_manual_clock();
+      feetech::MotorTarget target;
+      target.id = 7;
+      target.velocity = 1.0;  // rad/s
+      EXPECT_TRUE(bus.sync_write_velocities({target}).ok);
+      std::vector<feetech::MotorSample> samples;
+      EXPECT_TRUE(bus.sync_read(samples, {7}).ok);
+      for (int i = 0; i < reads; ++i) {
+        bus.sim().advance_clock(period);
+        EXPECT_TRUE(bus.sync_read(samples, {7}).ok);
+      }
+      return bus.sim().position_ticks(7);
+    };
+
+  // Half a second either way: 50 reads at 100 Hz, 5 reads at 10 Hz.
+  const std::int32_t fast = travelled_ticks(50, std::chrono::milliseconds(10));
+  const std::int32_t slow = travelled_ticks(5, std::chrono::milliseconds(100));
+  const std::int32_t expected = feetech::rad_per_s_to_steps(1.0) / 2;
+  EXPECT_NEAR(fast, expected, 1);
+  EXPECT_NEAR(slow, expected, 1);
 }
 
 TEST(BusIO, ScopedReadIgnoresUnresponsiveOutOfSubsetMotor)

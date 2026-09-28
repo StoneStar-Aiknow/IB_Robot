@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -215,27 +216,39 @@ TEST(OmniBase, BodyVelocityUsesConfiguredGeometry)
   }
 }
 
+// Drive `base` at a fixed body velocity for `seconds` of simulated time,
+// integrating odometry every `period`. Returns the x after every step.
+std::vector<double> drive(
+  feetech::Bus & bus, lekiwi::OmniBase & base, lekiwi::BasePose & pose,
+  double vx, double vy, double vtheta, double seconds, std::chrono::milliseconds period)
+{
+  bus.sim().use_manual_clock();
+  EXPECT_TRUE(base.set_body_velocity(vx, vy, vtheta));
+  EXPECT_TRUE(base.update_odometry(pose));  // seed read, time origin
+  std::vector<double> xs;
+  const int steps = static_cast<int>(std::lround(seconds * 1000.0 / period.count()));
+  for (int i = 0; i < steps; ++i) {
+    bus.sim().advance_clock(period);
+    EXPECT_TRUE(base.update_odometry(pose));
+    xs.push_back(pose.x);
+  }
+  return xs;
+}
+
 TEST(OmniBase, OdometryAdvancesConsistentlyWithWheelFeedback)
 {
   feetech::Bus bus(wheel_bus_options());
   ASSERT_TRUE(bus.open());
   ASSERT_TRUE(bus.apply_all_configs().ok);
-  const lekiwi::BaseGeometry geometry = test_geometry();
-  lekiwi::OmniBase base(bus, {7, 8, 9}, geometry);
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
 
-  // Pure forward drive: pose must advance along +x after odometry seeding.
-  // The pseudo-inverse recovers the commanded body velocity per read step
-  // (each simulated read advances the wheels by one step of the commanded
-  // speed), so one integrated step equals vx.
-  ASSERT_TRUE(base.set_body_velocity(0.2, 0.0, 0.0));
+  // A quarter second of pure forward drive at the runtime's 100 Hz read rate:
+  // the pose advances by vx * t, bounded by the one-step-per-second command
+  // quantisation of each wheel. (Short enough that no wheel crosses the
+  // encoder wrap; OdometryIsContinuousAcrossEncoderWrap covers that.)
   lekiwi::BasePose pose;
-  ASSERT_TRUE(base.update_odometry(pose));  // seed read
-  ASSERT_TRUE(base.update_odometry(pose));  // first integrated step
-
-  // One integrated step recovers the commanded body velocity, bounded by the
-  // one-tick command quantisation (~1.5e-3 rad/s per wheel).
-  EXPECT_GT(pose.x, 0.0);
-  EXPECT_NEAR(pose.x, 0.2, 1e-3);
+  drive(bus, base, pose, 0.2, 0.0, 0.0, 0.25, std::chrono::milliseconds(10));
+  EXPECT_NEAR(pose.x, 0.05, 1e-3);
   EXPECT_NEAR(pose.y, 0.0, 1e-3);
   EXPECT_NEAR(pose.theta, 0.0, 1e-3);
 }
@@ -245,16 +258,13 @@ TEST(OmniBase, OdometryPureSpinAdvancesThetaOnly)
   feetech::Bus bus(wheel_bus_options());
   ASSERT_TRUE(bus.open());
   ASSERT_TRUE(bus.apply_all_configs().ok);
-  const lekiwi::BaseGeometry geometry = test_geometry();
-  lekiwi::OmniBase base(bus, {7, 8, 9}, geometry);
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
 
-  ASSERT_TRUE(base.set_body_velocity(0.0, 0.0, 0.5));
   lekiwi::BasePose pose;
-  ASSERT_TRUE(base.update_odometry(pose));  // seed
-  ASSERT_TRUE(base.update_odometry(pose));  // step
+  drive(bus, base, pose, 0.0, 0.0, 0.5, 0.25, std::chrono::milliseconds(10));
   EXPECT_NEAR(pose.x, 0.0, 1e-3);
   EXPECT_NEAR(pose.y, 0.0, 1e-3);
-  EXPECT_NEAR(pose.theta, 0.5, 1e-3);
+  EXPECT_NEAR(pose.theta, 0.125, 1e-3);
 }
 
 TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
