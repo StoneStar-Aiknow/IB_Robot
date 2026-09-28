@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "feetech/conversion.hpp"
+
 namespace lekiwi
 {
 
@@ -78,6 +80,19 @@ bool wheel_deltas_to_body(
   dtheta = (j11 * (j22 * b3 - b2 * j23) - j12 * (j12 * b3 - b1 * j23) +
             b1 * (j12 * j23 - j22 * j13)) / det;
   return true;
+}
+
+std::array<double, 3> wheel_position_deltas(
+  const std::array<double, 3> & current, const std::array<double, 3> & previous)
+{
+  // One encoder revolution in the radians the bus reports.
+  constexpr double kRevolution = feetech::kTicksPerRevolution / feetech::kTicksPerRad;
+  std::array<double, 3> deltas{};
+  for (std::size_t i = 0; i < 3; ++i) {
+    // remainder() maps the raw difference into [-half turn, +half turn].
+    deltas[i] = std::remainder(current[i] - previous[i], kRevolution);
+  }
+  return deltas;
 }
 
 void integrate_pose(BasePose & pose, double dx, double dy, double dtheta)
@@ -172,10 +187,7 @@ bool OmniBase::update_odometry(BasePose & pose)
     return true;
   }
 
-  std::array<double, 3> deltas{};
-  for (std::size_t i = 0; i < 3; ++i) {
-    deltas[i] = positions[i] - last_positions_[i];
-  }
+  const auto deltas = wheel_position_deltas(positions, last_positions_);
   last_positions_ = positions;
 
   double dx = 0.0, dy = 0.0, dtheta = 0.0;

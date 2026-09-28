@@ -267,6 +267,30 @@ TEST(OmniBase, OdometryPureSpinAdvancesThetaOnly)
   EXPECT_NEAR(pose.theta, 0.125, 1e-3);
 }
 
+// Regression: odometry differenced raw encoder angles, so every wheel
+// revolution injected a spurious full turn and the pose jumped. Five seconds
+// at 0.2 m/s turns the wheels through several revolutions, from a start tick
+// close to the wrap point so the first crossing comes early.
+TEST(OmniBase, OdometryIsContinuousAcrossEncoderWrap)
+{
+  feetech::Bus bus(wheel_bus_options());
+  ASSERT_TRUE(bus.open());
+  ASSERT_TRUE(bus.apply_all_configs().ok);
+  for (const std::uint8_t id : {7, 8, 9}) {
+    bus.sim().set_position_ticks(id, 4000);
+  }
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
+
+  lekiwi::BasePose pose;
+  const auto xs = drive(bus, base, pose, 0.2, 0.0, 0.0, 5.0, std::chrono::milliseconds(20));
+  for (std::size_t i = 1; i < xs.size(); ++i) {
+    ASSERT_GT(xs[i], xs[i - 1]) << "odometry went backwards at step " << i;
+    ASSERT_LT(xs[i] - xs[i - 1], 0.01) << "odometry jumped at step " << i;
+  }
+  EXPECT_NEAR(pose.x, 1.0, 1e-2);
+  EXPECT_NEAR(pose.y, 0.0, 1e-2);
+}
+
 TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
 {
   feetech::Bus bus(wheel_bus_options());
@@ -291,6 +315,21 @@ TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
 }
 
 }  // namespace
+
+TEST(OmniBaseKinematics, WheelPositionDeltasTakeTheShortPathAcrossTheWrap)
+{
+  const double turn = 2.0 * M_PI;
+  const double near_top = turn - 0.05;
+  // Forward across the wrap: top of the range -> just past zero.
+  const auto forward = lekiwi::wheel_position_deltas({0.03, 1.0, 0.0}, {near_top, 0.9, 0.0});
+  EXPECT_NEAR(forward[0], 0.08, 1e-9);
+  EXPECT_NEAR(forward[1], 0.1, 1e-9);
+  EXPECT_NEAR(forward[2], 0.0, 1e-9);
+  // Backward across the wrap: just past zero -> top of the range.
+  const auto backward = lekiwi::wheel_position_deltas({near_top, 0.9, 0.0}, {0.03, 1.0, 0.0});
+  EXPECT_NEAR(backward[0], -0.08, 1e-9);
+  EXPECT_NEAR(backward[1], -0.1, 1e-9);
+}
 
 TEST(OmniBaseKinematics, PureFunctionsRoundTripWithoutBus)
 {

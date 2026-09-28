@@ -201,7 +201,9 @@ class LeKiwiBaseNode(Node):
         if self._last_wheel_positions is None:
             self._last_wheel_positions = positions
             return
-        deltas = [p - q for p, q in zip(positions, self._last_wheel_positions, strict=True)]
+        # Wheel positions are raw encoder angles that wrap once per turn; the
+        # SDK unwraps them the same way OmniBase does.
+        deltas = lk.wheel_position_deltas(positions, self._last_wheel_positions)
         self._last_wheel_positions = positions
         body = lk.wheel_deltas_to_body(deltas, self._geometry)
         if body is None:

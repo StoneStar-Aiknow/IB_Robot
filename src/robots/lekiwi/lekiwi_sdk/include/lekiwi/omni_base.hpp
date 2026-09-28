@@ -68,6 +68,15 @@ bool wheel_deltas_to_body(
   const std::array<double, 3> & wheel_deltas, const BaseGeometry & geometry,
   double & dx, double & dy, double & dtheta);
 
+/// Pure (no bus): per-wheel rotation (rad) between two wheel position
+/// readings along the shortest signed path. Wheel-mode positions are raw
+/// encoder angles that wrap once per revolution (feetech
+/// `accumulated_ticks_to_radians` does not accumulate), so a plain difference
+/// turns every wrap crossing into a spurious full turn. Valid while each wheel
+/// turns less than half a revolution between readings.
+std::array<double, 3> wheel_position_deltas(
+  const std::array<double, 3> & current, const std::array<double, 3> & previous);
+
 /// Pure kinematics (no bus): integrate a body-frame displacement into a
 /// world-frame pose.
 void integrate_pose(BasePose & pose, double dx, double dy, double dtheta);
