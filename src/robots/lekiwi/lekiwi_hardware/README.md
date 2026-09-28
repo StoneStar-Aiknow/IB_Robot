@@ -66,11 +66,12 @@ lekiwi_hardware/
 
 ```bash
 cd ~/workspace/IB_Robot
-colcon build --packages-select lekiwi_hardware
+./scripts/build.sh --lekiwi
 source install/setup.bash
 ```
 
-> 构建时会自动通过 CMake FetchContent 从 Gitee 拉取 [Feetech SDK](https://gitee.com/ftservo/FTServo_Linux.git)。
+> Feetech 舵机访问来自共享包 `robots/feetech/feetech_sdk`，它把 [FTServo_Linux](https://gitee.com/ftservo/FTServo_Linux.git)
+> 固定在 `06fd3356`。本包不再自行拉取 SDK，同一工作区里 SO-101 与 LeKiwi 只有这一个 FTServo 版本。
 
 ### 2. 运行单元测试
 
@@ -79,9 +80,9 @@ colcon test --packages-select lekiwi_hardware
 colcon test-result --verbose
 ```
 
-包含 55 个 gtest 用例，覆盖坐标转换、符号位解码、回零偏移编码及往返一致性（见 `test/test_lekiwi_conversions.cpp`）。
-
-> 构建时会自动通过 CMake FetchContent 从 Gitee 拉取 [Feetech SDK](https://gitee.com/ftservo/FTServo_Linux.git)。
+`test/test_lekiwi_conversions.cpp` 覆盖坐标转换、符号位解码、回零偏移编码及往返一致性；
+`test/test_lekiwi_lifecycle.cpp` 在 SDK 仿真传输上覆盖生命周期的失败即关闭（fail closed）语义：激活失败回滚、
+停用与拆除时释放被拒绝必须报错、停用期间 `write()` 不发送命令、重新 configure 先释放旧总线。
 
 ### 2. 串口权限
 
@@ -261,7 +262,7 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_rea
 
 | 库 | 来源 | 用途 |
 |----|------|------|
-| Feetech SDK (FTServo_Linux) | Gitee FetchContent | SMS_STS 串口通信协议 |
+| `feetech_sdk`（FTServo_Linux @ `06fd3356`） | 工作区包 `robots/feetech/feetech_sdk` | SMS_STS 串口通信协议、仿真传输 |
 
 ## 常见问题
 

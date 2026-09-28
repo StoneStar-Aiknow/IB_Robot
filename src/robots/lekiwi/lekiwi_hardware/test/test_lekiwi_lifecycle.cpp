@@ -314,6 +314,102 @@ TEST(LeKiwiHardwareAdapter, FullRobotDeactivationFailsWhenWheelReleaseIsRefused)
   }
 }
 
+// Regression: teardown discarded both release results, so on_cleanup() and
+// on_shutdown() reported SUCCESS after a wheel refused to release torque.
+TEST(LeKiwiHardwareAdapter, CleanupFailsWhenWheelReleaseIsRefused)
+{
+  lekiwi_hardware::LeKiwiSystemHardware hw;
+  const rclcpp_lifecycle::State unused;
+  ASSERT_EQ(
+    hw.on_init(make_info({{"simulated", "true"}}, false)),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+
+  auto & bus = lekiwi_hardware::LeKiwiHardwareTestAccess::bus(hw);
+  const auto wheel_ids = lekiwi_hardware::LeKiwiHardwareTestAccess::wheel_ids(hw);
+  bus.sim().set_write_ack(wheel_ids.front(), false);
+
+  EXPECT_EQ(hw.on_cleanup(unused), hardware_interface::CallbackReturn::ERROR)
+    << "a refused wheel torque release was reported as a clean teardown";
+}
+
+TEST(LeKiwiHardwareAdapter, ShutdownFailsWhenArmReleaseIsRefused)
+{
+  TempCalibFile calib;
+  lekiwi_hardware::LeKiwiSystemHardware hw;
+  const rclcpp_lifecycle::State unused;
+  ASSERT_EQ(
+    hw.on_init(make_info({{"simulated", "true"}, {"calib_file", calib.path()}}, true)),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+
+  auto & bus = lekiwi_hardware::LeKiwiHardwareTestAccess::bus(hw);
+  const auto arm_ids = lekiwi_hardware::LeKiwiHardwareTestAccess::arm_ids(hw);
+  bus.sim().set_write_ack(arm_ids.front(), false);
+
+  EXPECT_EQ(hw.on_shutdown(unused), hardware_interface::CallbackReturn::ERROR)
+    << "a refused arm torque release was reported as a clean shutdown";
+}
+
+// Regression: after a TORQUE_OFF stop, Humble keeps calling write() on the
+// inactive component. write() sent arm targets to the stopped arm, failed, and
+// the resulting I/O error dropped the component to unconfigured.
+TEST(LeKiwiHardwareAdapter, WriteWhileInactiveSendsNothingAndSucceeds)
+{
+  TempCalibFile calib;
+  lekiwi_hardware::LeKiwiSystemHardware hw;
+  const rclcpp_lifecycle::State unused;
+  ASSERT_EQ(
+    hw.on_init(make_info({{"simulated", "true"}, {"calib_file", calib.path()}}, true)),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_deactivate(unused), hardware_interface::CallbackReturn::SUCCESS);
+
+  auto & bus = lekiwi_hardware::LeKiwiHardwareTestAccess::bus(hw);
+  const auto arm_ids = lekiwi_hardware::LeKiwiHardwareTestAccess::arm_ids(hw);
+  bus.sim().set_converge_step_ticks(8192);
+  const std::int32_t parked = bus.sim().position_ticks(arm_ids.front());
+  auto interfaces = hw.export_command_interfaces();
+  for (auto & interface : interfaces) {
+    const bool position = interface.get_interface_name() == hardware_interface::HW_IF_POSITION;
+    interface.set_value(position ? 1.0 : 2.0);
+  }
+
+  EXPECT_EQ(hw.write(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+  EXPECT_EQ(hw.read(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+  EXPECT_EQ(bus.sim().position_ticks(arm_ids.front()), parked)
+    << "inactive hardware forwarded an arm target";
+  for (const std::uint8_t id : arm_ids) {
+    EXPECT_FALSE(bus.sim().torque_enabled(id))
+      << "inactive write re-energized arm motor " << static_cast<int>(id);
+  }
+}
+
+// Regression: re-configuring a configured component replaced bus_ while arm_
+// still pointed into it, and ~Arm() then released torque through the freed
+// bus (segfault in the controller manager during /runtime/stop clear).
+TEST(LeKiwiHardwareAdapter, ReconfigureReleasesThePreviousBusFirst)
+{
+  TempCalibFile calib;
+  lekiwi_hardware::LeKiwiSystemHardware hw;
+  const rclcpp_lifecycle::State unused;
+  ASSERT_EQ(
+    hw.on_init(make_info({{"simulated", "true"}, {"calib_file", calib.path()}}, true)),
+    hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw.on_deactivate(unused), hardware_interface::CallbackReturn::SUCCESS);
+
+  EXPECT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(hw.read(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+  EXPECT_EQ(hw.write(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+  EXPECT_EQ(hw.on_deactivate(unused), hardware_interface::CallbackReturn::SUCCESS);
+}
+
 TEST(LeKiwiHardwareAdapter, SimulatedBaseOnlyLifecycle)
 {
   lekiwi_hardware::LeKiwiSystemHardware hw;
