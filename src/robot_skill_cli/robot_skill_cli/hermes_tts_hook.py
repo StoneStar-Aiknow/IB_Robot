@@ -1,4 +1,4 @@
-"""Hermes ``post_llm_call`` bridge to the IB-Robot TTS services."""
+"""Deliver a validated structured speech event to the IB-Robot TTS services."""
 
 from __future__ import annotations
 
@@ -6,14 +6,15 @@ import fcntl
 import io
 import json
 import os
-import re
 import sys
 import tempfile
 import unicodedata
 import wave
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+
+from robot_skill_cli.hermes_response import ResponseFormatError, SpeechEvent, load_json, parse_event
+from robot_skill_cli.hermes_speech_delivery import claim_event, event_is_current
 
 _LOG_PATH = Path(os.environ.get("IBROBOT_HERMES_TTS_LOG", "/tmp/hermes-speak.log"))
 _MAX_LOG_BYTES = 256 * 1024
@@ -41,36 +42,12 @@ def _log(message: str) -> None:
         pass
 
 
-def extract_response(payload: dict[str, Any]) -> str:
-    """Return the final assistant response from a Hermes hook payload."""
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        for key in ("assistant_response", "response", "output", "text"):
-            value = extra.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    for key in ("assistant_response", "response", "output", "text", "content"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-_ASCII_LETTER_RUN = re.compile(r"[A-Za-z]+")
-_LONG_DIGIT_RUN = re.compile(r"\d{7,}")
-
-
-def sanitize_for_tts(text: str) -> str:
-    """Strip English letter runs the ZipVoice Chinese frontend cannot speak.
-
-    Hermes responses routinely contain English (robot names, acronyms, code
-    tokens). The 310P/ONNX ZipVoice frontend rejects ASCII letters, so those
-    runs are removed before synthesis; Chinese, digits, and punctuation are
-    preserved and the service-side segmenter inserts pauses as needed.
-    """
+def prepare_for_tts(text: str) -> str:
+    """Check frontend compatibility without deleting or rewriting content."""
     normalized = unicodedata.normalize("NFKC", text)
-    normalized = _ASCII_LETTER_RUN.sub("", normalized)
-    return _LONG_DIGIT_RUN.sub("", normalized)
+    if any("A" <= char <= "Z" or "a" <= char <= "z" for char in normalized):
+        raise SpeechHookError("ZipVoice Chinese frontend does not support ASCII letters in speech")
+    return normalized
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -127,7 +104,7 @@ def _write_wav(audio_data: bytes) -> Path:
     return path
 
 
-def speak(text: str, *, session_id: str = "") -> None:
+def speak(text: str, *, session_id: str = "", event: SpeechEvent | None = None) -> None:
     """Synthesize and synchronously play one extracted response."""
     import rclpy
     from rclpy.node import Node
@@ -139,6 +116,15 @@ def speak(text: str, *, session_id: str = "") -> None:
     synthesis_timeout = _positive_float_env("IBROBOT_TTS_SYNTHESIS_TIMEOUT_SEC", _DEFAULT_SYNTHESIS_TIMEOUT_SEC)
     playback_cap = _positive_float_env("IBROBOT_TTS_PLAYBACK_TIMEOUT_SEC", _DEFAULT_PLAYBACK_TIMEOUT_SEC)
 
+    def expired():
+        if event is not None and not event_is_current(event):
+            _log(f"SKIP session={session_id} turn={event.turn_id} phase={event.phase} reason=turn_finished")
+            return True
+        return False
+
+    if expired():
+        return
+
     rclpy.init()
     node = Node(f"hermes_speak_{os.getpid()}")
     try:
@@ -149,6 +135,8 @@ def speak(text: str, *, session_id: str = "") -> None:
         if not playback.wait_for_service(timeout_sec=10.0):
             raise SpeechHookError(f"{playback_service} is unavailable")
 
+        if expired():
+            return
         request = SynthesizeSpeech.Request()
         request.text = text
         result = _wait_for_future(node, synthesize.call_async(request), synthesis_timeout, "speech synthesis")
@@ -161,6 +149,8 @@ def speak(text: str, *, session_id: str = "") -> None:
         with _PLAYBACK_LOCK_PATH.open("a+") as playback_lock:
             fcntl.flock(playback_lock.fileno(), fcntl.LOCK_EX)
             for segment in result.audio_segments:
+                if expired():
+                    return
                 audio_data = bytes(segment.audio_data)
                 duration_sec = _wav_duration_sec(audio_data)
                 path = _write_wav(audio_data)
@@ -186,25 +176,25 @@ def speak(text: str, *, session_id: str = "") -> None:
 
 
 def main() -> int:
-    """Read one Hermes hook payload from stdin and play its final response."""
+    """Read one validated speech event; raw assistant replies are never spoken."""
     raw = sys.stdin.read()
     if not raw.strip():
         return 0
     try:
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            raise SpeechHookError("hook payload must be a JSON object")
-        text = extract_response(payload)
-        if not text:
+        event = parse_event(load_json(raw))
+        if not event.response.speech:
             return 0
-        session_id = str(payload.get("session_id", ""))
-        sanitized = sanitize_for_tts(text)
-        if not sanitized.strip():
-            _log(f"SKIP session={session_id} reason=no_speakable_text chars={len(text)}")
+        text = prepare_for_tts(event.response.speech)
+        identity = f"session={event.session_id} turn={event.turn_id} phase={event.phase}"
+        if not event_is_current(event):
+            _log(f"SKIP {identity} reason=turn_finished")
             return 0
-        _log(f"START session={session_id} chars={len(text)} speakable={len(sanitized)}")
-        speak(sanitized, session_id=session_id)
-    except (json.JSONDecodeError, ImportError, OSError, SpeechHookError) as exc:
+        if not claim_event(event):
+            _log(f"SKIP {identity} reason=duplicate_event")
+            return 0
+        _log(f"START {identity} chars={len(text)} speech={json.dumps(text, ensure_ascii=False)}")
+        speak(text, session_id=event.session_id, event=event)
+    except (ResponseFormatError, ImportError, OSError, SpeechHookError) as exc:
         _log(f"ERROR {type(exc).__name__}: {exc}")
         print(str(exc), file=sys.stderr)
         return 1

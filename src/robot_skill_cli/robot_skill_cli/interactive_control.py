@@ -28,6 +28,7 @@ from embodied_common.agent_execution_contract import (
 from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from embodied_common.tracing import create_trace_logger, sanitize_trace_id, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+from robot_skill_cli.stop_contract import STOP_PHRASES
 
 _trace = create_trace_logger("ib_trace.agent_control")
 
@@ -46,7 +47,6 @@ _CONFIRM_PHRASES = (
     "是的",
     "confirm",
 )
-_STOP_PHRASES = ("别动了", "别动", "停止", "停下", "停", "stop", "halt")
 _CONTINUE_PHRASES = ("继续吧", "继续", "接着来", "go on", "continue")
 
 INTENT_CONFIRM = "confirm"
@@ -119,7 +119,7 @@ def classify(text: str) -> str:
     normalized = _normalize_text(text)
     if not normalized:
         return INTENT_UNKNOWN
-    if normalized in _STOP_PHRASES:
+    if normalized in STOP_PHRASES:
         return INTENT_STOP
     if normalized in _CONTINUE_PHRASES:
         return INTENT_CONTINUE
@@ -519,6 +519,7 @@ class InteractiveController:
         authorization_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+        submission_guard=None,
     ) -> dict[str, Any]:
         """No-gate one-shot flow: discover → prepare → auto confirm_plan → execute.
 
@@ -591,13 +592,16 @@ class InteractiveController:
         with self._state_lock:
             if self._stop_requested_now() and not self._submission_started:
                 return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
-        return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
+        return self.execute(
+            stop_event=stop_event, feedback_callback=feedback_callback, submission_guard=submission_guard
+        )
 
     def execute(
         self,
         *,
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+        submission_guard=None,
     ) -> dict[str, Any]:
         """Feature 4: execute the confirmed plan; interruptible via ``stop_event``."""
         with self._state_lock:
@@ -665,14 +669,21 @@ class InteractiveController:
                     "goal submission was blocked because durable state could not be recorded",
                 )
         try:
-            goal_future = self._bridge.send_agent_plan_goal(
-                plan_token=plan_token,
-                confirmation_token=confirmation_token,
-                task_id=task_id,
-                timeout_sec=timeout_sec,
-                trace_id=self._pending["trace_id"],
-                feedback_callback=guarded_feedback,
-            )
+            with submission_guard() if submission_guard is not None else contextlib.nullcontext():
+                with self._state_lock:
+                    if self._state not in {EXECUTING, STOPPING} or self._active_task_id != task_id:
+                        raise IllegalStateError("ILLEGAL_STATE", "execution ownership was lost")
+                    if self._stop_requested_now():
+                        return self._record_local_stop(task_id, "stopped before goal admission")
+                    self._submission_started = True
+                goal_future = self._bridge.send_agent_plan_goal(
+                    plan_token=plan_token,
+                    confirmation_token=confirmation_token,
+                    task_id=task_id,
+                    timeout_sec=timeout_sec,
+                    trace_id=self._pending["trace_id"],
+                    feedback_callback=guarded_feedback,
+                )
         except Exception as exc:
             submit_error = exc
             goal_future = None

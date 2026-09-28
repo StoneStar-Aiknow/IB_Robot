@@ -22,6 +22,8 @@ from robot_config.loader import load_robot_config
 from robot_skill_cli.hermes_launcher import LauncherError, register_hermes_skill
 
 _LEGACY_PLUGIN = "ibrobot-robot-control"
+_RESPONSE_PLUGIN = "ibrobot-response"
+_MOTION_PLUGIN = "ibrobot-motion"
 _SOUL_BEGIN = "<!-- IBROBOT-MANAGED-BEGIN -->"
 _SOUL_END = "<!-- IBROBOT-MANAGED-END -->"
 _MANAGED_FILE_HEADER = "# Managed by hermes-robot-configure. Re-run the command instead of editing this file."
@@ -43,6 +45,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soul-mode", choices=("merge", "replace", "skip"), default="merge")
     parser.add_argument("--disable-speech", action="store_true")
     parser.add_argument("--accept-hooks", action="store_true")
+    parser.add_argument(
+        "--install-runtime-adapter",
+        action="store_true",
+        help="Install the Hermes source adapter required for managed motion and priority stop",
+    )
     parser.add_argument("--restart-gateway", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -72,6 +79,7 @@ def _resource_root() -> Path:
     required = (
         resource / "SOUL.md",
         resource / "POLICY.md",
+        resource / "RESPONSE_PROTOCOL.md",
         resource / "hooks" / "ibrobot-speak",
     )
     if not all(path.is_file() for path in required):
@@ -204,18 +212,22 @@ def _tts_hook_wrapper(
     )
 
 
-def _lifecycle_hook_wrapper(*, workspace: Path, shrc: Path) -> str:
-    # Hermes is launched from the fully initialized workspace environment.  The
-    # lifecycle hook has a two-second deadline, so sourcing ROS/CANN again here
-    # can consume the entire budget before the asynchronous handoff runs.
-    del shrc
+def _lifecycle_hook_wrapper(*, workspace: Path, shrc: Path, speaker_path: Path | None = None) -> str:
+    # Read the small hook payload, then initialize ROS in a detached worker so
+    # the two-second control-path observer never waits for environment setup.
+    speaker = speaker_path or workspace / "build/robot_skill_cli/hermes-speak"
     return "\n".join(
         (
             "#!/usr/bin/env bash",
             "set -eo pipefail",
             _MANAGED_FILE_HEADER,
+            'payload="$(</dev/stdin)"',
+            "(",
             f"cd {shlex.quote(str(workspace))}",
+            f"source {shlex.quote(str(shrc))} >/dev/null",
+            f"export IBROBOT_HERMES_TTS_HOOK={shlex.quote(str(speaker))}",
             "exec python3 -m robot_skill_cli.hermes_lifecycle_speech",
+            ') <<< "$payload" >/dev/null 2>&1 &',
             "",
         )
     )
@@ -237,6 +249,89 @@ def _interim_hook_wrapper(*, workspace: Path, shrc: Path, speaker_path: Path | N
     )
 
 
+def _response_plugin_files(resource: Path) -> dict[str, str]:
+    """Publish only standard-library modules into Hermes' own Python environment."""
+    files = {
+        "__init__.py": f"{_MANAGED_FILE_HEADER}\nfrom .hermes_response_plugin import register\n",
+        "plugin.yaml": (
+            f"{_MANAGED_FILE_HEADER}\nname: {_RESPONSE_PLUGIN}\nversion: 1.0.0\n"
+            "description: Structured IB-Robot display and speech responses\n"
+            "provides_hooks: [pre_llm_call, transform_llm_output, post_llm_call, on_interim_message, on_session_end, on_control_turn_end, on_control_input]\n"
+        ),
+        "RESPONSE_PROTOCOL.md": (resource / "RESPONSE_PROTOCOL.md").read_text(encoding="utf-8"),
+    }
+    for name in ("hermes_response.py", "hermes_response_plugin.py", "hermes_speech_delivery.py", "stop_contract.py"):
+        files[name] = Path(__file__).with_name(name).read_text(encoding="utf-8")
+    return files
+
+
+def _sync_response_plugin(profile: Path, resource: Path, *, dry_run: bool) -> bool:
+    target = profile / "plugins" / _RESPONSE_PLUGIN
+    if target.exists() and not _is_managed_plugin(target):
+        raise ConfigureError(f"response plugin conflicts with a user-managed directory: {target}")
+    files = _response_plugin_files(resource)
+    changed = False
+    for name, text in files.items():
+        path = target / name
+        if not path.is_file() or path.read_text(encoding="utf-8") != text:
+            changed = True
+            if not dry_run:
+                _atomic_write(path, text)
+    return changed
+
+
+def _sync_motion_plugin(profile: Path, *, dry_run: bool) -> bool:
+    from embodied_common import agent_terminal_contract
+
+    target = profile / "plugins" / _MOTION_PLUGIN
+    if target.exists() and not _is_managed_plugin(target):
+        raise ConfigureError(f"motion plugin conflicts with a user-managed directory: {target}")
+    files = {
+        "__init__.py": f"{_MANAGED_FILE_HEADER}\nfrom .hermes_motion_plugin import register\n",
+        "plugin.yaml": (
+            f"{_MANAGED_FILE_HEADER}\nname: {_MOTION_PLUGIN}\nversion: 1.0.0\n"
+            "description: Managed robot workflows and priority stop input\n"
+            "provides_hooks: [on_control_input, on_control_turn_start, on_control_turn_end, execute_managed_tool, finalize_tool_batch, is_priority_control_text]\n"
+        ),
+        "agent_terminal_contract.py": Path(agent_terminal_contract.__file__).read_text(),
+    }
+    for name in (
+        "stop_contract.py",
+        "hermes_stop_state.py",
+        "hermes_robot_runner.py",
+        "hermes_motion_plugin.py",
+        "hermes_response.py",
+        "hermes_workflow_response.py",
+    ):
+        files[name] = Path(__file__).with_name(name).read_text()
+    changed = False
+    for name, content in files.items():
+        path = target / name
+        if not path.is_file() or path.read_text() != content:
+            changed = True
+            if not dry_run:
+                _atomic_write(path, content)
+    return changed
+
+
+def _sync_runtime_adapter(hermes: str, resource: Path, *, dry_run: bool) -> bool:
+    from robot_skill_cli.hermes_runtime_adapter import sync_runtime
+
+    result = _run([hermes, "--version"])
+    roots = [
+        line.partition(":")[2].strip() for line in result.stdout.splitlines() if line.startswith("Install directory:")
+    ]
+    if result.returncode or len(roots) != 1 or not Path(roots[0]).is_absolute():
+        raise ConfigureError("cannot determine the Hermes runtime installation directory")
+    return sync_runtime(
+        Path(roots[0]),
+        resource / "adapter/robot_control.py",
+        dry_run=dry_run,
+        write=_atomic_write,
+        backup=_backup,
+    )
+
+
 def _robot_skill_wrapper(*, workspace: Path, shrc: Path, config_path: Path, ros_domain_id: str) -> str:
     return "\n".join(
         (
@@ -255,7 +350,8 @@ def _robot_skill_wrapper(*, workspace: Path, shrc: Path, config_path: Path, ros_
             f"source {shlex.quote(str(shrc))} >/dev/null",
             f"export ROS_DOMAIN_ID={shlex.quote(ros_domain_id)}",
             f"export ROBOT_CONFIG={shlex.quote(str(config_path))}",
-            "export IBROBOT_HERMES_LIFECYCLE_SPEECH=1",
+            "export IBROBOT_HERMES_LIFECYCLE_SPEECH=0",
+            "export IBROBOT_HERMES_MANAGED_REQUIRED=1",
             'exec python3 -m robot_skill_cli.cli --config-path "$ROBOT_CONFIG" "$@"',
             "",
         )
@@ -389,6 +485,7 @@ def _update_config(
     environment_file: Path,
     hook_path: Path,
     speech_enabled: bool,
+    motion_enabled: bool = True,
     lifecycle_hook_path: Path | None = None,
     interim_hook_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -399,8 +496,54 @@ def _update_config(
     disabled = plugins.get("disabled", [])
     if not isinstance(enabled, list) or not isinstance(disabled, list):
         raise ConfigureError("Hermes plugins.enabled and plugins.disabled must be lists")
-    plugins["enabled"] = _filter_legacy(enabled)
-    plugins["disabled"] = _filter_legacy(disabled)
+    enabled = [item for item in _filter_legacy(enabled) if item != _MOTION_PLUGIN or motion_enabled]
+    managed_plugins = [_RESPONSE_PLUGIN, *([_MOTION_PLUGIN] if motion_enabled else [])]
+    plugins["enabled"] = list(dict.fromkeys([*enabled, *managed_plugins]))
+    plugins["disabled"] = [item for item in _filter_legacy(disabled) if item not in managed_plugins]
+    if not motion_enabled:
+        plugins["disabled"] = list(dict.fromkeys([*plugins["disabled"], _MOTION_PLUGIN]))
+    entries = plugins.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        raise ConfigureError("Hermes plugins.entries must be a mapping")
+    entry = entries.setdefault(_RESPONSE_PLUGIN, {})
+    if not isinstance(entry, dict):
+        raise ConfigureError("Hermes response plugin entry must be a mapping")
+    settings = entry.setdefault("settings", {})
+    if not isinstance(settings, dict):
+        raise ConfigureError("Hermes response plugin settings must be a mapping")
+    settings.update({"speaker": str(hook_path) if speech_enabled else "", "timeout_sec": _HOOK_TIMEOUT_SEC})
+    if motion_enabled:
+        motion = entries.setdefault(_MOTION_PLUGIN, {})
+        if not isinstance(motion, dict) or not isinstance(motion.setdefault("settings", {}), dict):
+            raise ConfigureError("Hermes motion plugin settings must be a mapping")
+        motion["settings"].update(
+            {
+                "state_dir": str(environment_file.parent / "control-state"),
+                "executable": str(environment_file.parent / "bin/robot-skill"),
+                "environment": {
+                    name: os.environ[name]
+                    for name in ("RMW_IMPLEMENTATION", "CYCLONEDDS_URI", "ROS_LOCALHOST_ONLY")
+                    if name in os.environ
+                },
+            }
+        )
+    else:
+        entries.pop(_MOTION_PLUGIN, None)
+
+    # Transform hooks run after model streaming; don't expose raw JSON before
+    # the response has passed validation and been rendered for the user.
+    display = config.setdefault("display", {})
+    streaming = config.setdefault("streaming", {})
+    if not isinstance(display, dict) or not isinstance(streaming, dict):
+        raise ConfigureError("Hermes display and streaming config must be mappings")
+    display.update({"streaming": False, "show_reasoning": False, "interim_assistant_messages": "off"})
+    streaming["enabled"] = False
+    platforms = display.get("platforms", {})
+    if not isinstance(platforms, dict):
+        raise ConfigureError("Hermes display.platforms must be a mapping")
+    for platform in platforms.values():
+        if isinstance(platform, dict):
+            platform.update({"streaming": False, "interim_assistant_messages": "off"})
 
     toolsets = config.get("toolsets", [])
     if not isinstance(toolsets, list):
@@ -427,8 +570,8 @@ def _update_config(
     if not isinstance(post, list):
         raise ConfigureError("Hermes hooks.post_llm_call must be a list")
     post = [entry for entry in post if not _is_managed_hook(entry, hook_path)]
-    if speech_enabled:
-        post.append({"command": str(hook_path), "timeout": _HOOK_TIMEOUT_SEC})
+    # The native plugin is the sole final/interim producer. The shell wrapper
+    # remains its ROS-environment delivery endpoint, not a second event hook.
     if post:
         hooks["post_llm_call"] = post
     else:
@@ -439,11 +582,8 @@ def _update_config(
             if not isinstance(entries, list):
                 raise ConfigureError(f"Hermes hooks.{event} must be a list")
             entries = [entry for entry in entries if not _is_managed_hook(entry, lifecycle_hook_path)]
-            if speech_enabled:
-                entry: dict[str, Any] = {"command": str(lifecycle_hook_path), "timeout": 2}
-                if event in {"pre_tool_call", "post_tool_call"}:
-                    entry["matcher"] = "^terminal$"
-                entries.append(entry)
+            # The model's structured interim is the progress speech producer.
+            # Retire fixed lifecycle narration and its extra copywriting request.
             if entries:
                 hooks[event] = entries
             else:
@@ -453,8 +593,6 @@ def _update_config(
         if not isinstance(entries, list):
             raise ConfigureError("Hermes hooks.on_interim_message must be a list")
         entries = [entry for entry in entries if not _is_managed_hook(entry, interim_hook_path)]
-        if speech_enabled:
-            entries.append({"command": str(interim_hook_path), "timeout": 2})
         if entries:
             hooks["on_interim_message"] = entries
         else:
@@ -465,51 +603,6 @@ def _update_config(
 def _write_yaml(path: Path, config: dict[str, Any]) -> None:
     rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     _atomic_write(path, rendered)
-
-
-def _approval_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["HERMES_ACCEPT_HOOKS"] = "1"
-    return environment
-
-
-def _hook_registered(hermes: str, hook_path: Path) -> bool:
-    """Return True if Hermes currently tracks ``hook_path`` as an approved hook.
-
-    ``hermes hooks revoke`` is best-effort: on first install the hook was never
-    approved, so revoke has nothing to remove and may exit non-zero. Before
-    treating a revoke failure as fatal, confirm the hook is actually registered
-    via ``hermes hooks list``. When the listing itself fails, conservatively
-    return True so a real revoke failure is not silently swallowed. The match
-    is by the hook's absolute path; if Hermes lists hooks by name only the
-    check reports False and the subsequent ``hooks doctor`` remains the
-    authoritative approval gate.
-    """
-    listed = _run([hermes, "hooks", "list"])
-    if listed.returncode != 0:
-        return True
-    return str(hook_path) in (listed.stdout or "")
-
-
-def _approve_hooks(hermes: str, hook_paths: Sequence[Path] | Path) -> None:
-    if isinstance(hook_paths, Path):
-        hook_paths = [hook_paths]
-    for hook_path in hook_paths:
-        revoked = _run([hermes, "hooks", "revoke", str(hook_path)])
-        if revoked.returncode != 0 and _hook_registered(hermes, hook_path):
-            detail = (revoked.stderr or revoked.stdout).strip()
-            raise ConfigureError(f"Hermes hook approval refresh failed: {detail}")
-    result = subprocess.run(
-        [hermes, "--accept-hooks", "hooks", "doctor"],
-        capture_output=True,
-        text=True,
-        timeout=60.0,
-        check=False,
-        env=_approval_environment(),
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ConfigureError(f"Hermes hook approval failed: {detail}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -531,6 +624,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         profile = _active_profile(hermes)
         resource = _resource_root()
+        runtime_changed = (
+            _sync_runtime_adapter(hermes, resource, dry_run=args.dry_run) if args.install_runtime_adapter else False
+        )
         install_prefix = _install_prefix()
         workspace = install_prefix.parent.resolve()
         shrc = _workspace_shrc(install_prefix)
@@ -551,7 +647,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             playback_timeout_sec=robot.voice_tts.playback_timeout_sec,
             synthesis_timeout_sec=robot.voice_tts.synthesis_timeout_sec,
         )
-        desired_lifecycle_hook = _lifecycle_hook_wrapper(workspace=workspace, shrc=shrc)
+        desired_lifecycle_hook = _lifecycle_hook_wrapper(workspace=workspace, shrc=shrc, speaker_path=hook_path)
         desired_interim_hook = _interim_hook_wrapper(workspace=workspace, shrc=shrc, speaker_path=hook_path)
         desired_environment = _shell_environment(
             workspace=workspace,
@@ -575,8 +671,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             lifecycle_hook_path=lifecycle_hook_path,
             interim_hook_path=interim_hook_path,
             speech_enabled=not args.disable_speech,
+            motion_enabled=args.install_runtime_adapter,
         )
+        from robot_skill_cli.interactive_control import _RPC_TIMEOUT_FLOOR_SEC
+
+        rpc_timeout = float(getattr(getattr(robot, "skill_gateway", None), "rpc_timeout_sec", 5.0))
+        if args.install_runtime_adapter:
+            desired_config["plugins"]["entries"][_MOTION_PLUGIN]["settings"]["cancel_timeout_sec"] = (
+                2 * max(rpc_timeout, _RPC_TIMEOUT_FLOOR_SEC) + 15.0
+            )
         soul_changed, soul_backup = _sync_soul(profile, resource, args.soul_mode, dry_run=args.dry_run)
+        response_plugin_changed = _sync_response_plugin(profile, resource, dry_run=args.dry_run)
+        motion_plugin_changed = (
+            _sync_motion_plugin(profile, dry_run=args.dry_run) if args.install_runtime_adapter else False
+        )
         plugin_removal_needed = _has_managed_plugin(profile)
         plugin_removed = _remove_stale_plugin(profile) if not args.dry_run else False
         if not args.dry_run:
@@ -616,6 +724,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             or robot_skill_path.read_text(encoding="utf-8") != desired_robot_skill
             or _yaml_config(profile_config_path) != desired_config
             or soul_changed
+            or response_plugin_changed
+            or motion_plugin_changed
+            or runtime_changed
         )
         if args.dry_run:
             print(f"profile={profile}")
@@ -645,8 +756,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             config_backup = None
 
-        if args.accept_hooks and not args.disable_speech:
-            _approve_hooks(hermes, [hook_path, lifecycle_hook_path, interim_hook_path])
+        # All managed speech now uses native plugin callbacks. No shell observer
+        # needs approval; --accept-hooks remains accepted for existing commands.
         if args.restart_gateway:
             result = _run([hermes, "gateway", "restart"], timeout=60.0)
             if result.returncode != 0:
@@ -655,6 +766,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Hermes profile synchronized: {profile}")
         print(f"IB-Robot workspace: {workspace}")
         print(f"Speech hook: {'disabled' if args.disable_speech else 'enabled'}")
+        print(
+            "Priority robot stop adapter: enabled (restart any existing Hermes CLI)"
+            if args.install_runtime_adapter
+            else "Managed motion and priority stop: disabled (use --install-runtime-adapter to enable)"
+        )
         if soul_backup:
             print(f"SOUL backup: {soul_backup}")
         if config_backup:
@@ -663,6 +779,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Retired ibrobot-robot-control plugin quarantined")
         if not args.restart_gateway:
             print("Restart the messaging Gateway to apply changes: hermes gateway restart")
+        if not args.install_runtime_adapter:
+            print("Managed motion and priority stop remain disabled; rerun with --install-runtime-adapter to enable")
         return 0
     except (ConfigureError, FileNotFoundError, LauncherError, ValueError) as exc:
         print(f"hermes-robot-configure: {exc}", file=sys.stderr)

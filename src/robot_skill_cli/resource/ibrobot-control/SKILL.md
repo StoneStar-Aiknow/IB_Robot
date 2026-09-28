@@ -10,6 +10,14 @@ description: "Use when a user asks Hermes or an Agent to discover, validate, exe
 Use only `robot-skill` and the ROS Capability Gateway. Discover before acting, present the exact plan before execution,
 and report only what the CLI proves.
 
+### User-facing results
+
+When the host injects `IB-Robot 回复协议`, use that exact versioned `speech/details` output contract.
+Explain the verified outcome naturally in `speech`; keep tool errors, IDs and exact plan evidence in `details`.
+The runtime renders the display and speaks only `speech`. Never put HTML wrappers around the JSON or call TTS tools.
+Without that host protocol, explain the verified outcome naturally and keep diagnostic evidence separate.
+Keep failures, partial completion and an unconfirmed stop explicit; never turn them into success.
+
 ## Skill Composition
 
 Treat Skills as typed operators, not as a list of user phrases:
@@ -40,8 +48,9 @@ invent a special-case recipe while handling a task.
 When launched by `hermes-robot`, the `robot-skill` executable on `PATH` is already bound to the preflighted robot config
 and ROS domain. Invoke that exact executable directly. Never source `.shrc_local` or another setup script, inspect or
 modify ROS/Python environment variables, search for robot configs or repositories, load `ibrobot-env`, use an absolute
-`robot-skill` path, or add `--config-name`/`--config-path`. On any nonzero exit, report the exact CLI error and stop; a
-failed command never proves that a status check completed.
+`robot-skill` path, or add `--config-name`/`--config-path`. On any nonzero exit, stop and explain the verified outcome
+using the user-facing result rules above, retaining the exact CLI error in the details; a failed command never proves
+that a status check completed.
 
 ## Composite Workflow Entry
 
@@ -127,6 +136,13 @@ This is separate from Hermes `/reload-skills`, which only reloads Agent instruct
 Changing `nod_yes` implementation or manifest YAML requires `reload-catalog`, not `/reload-skills`.
 
 ## Cancellation
+
+With the installed `ibrobot-motion` adapter, the host handles exact stop phrases before conversational routing.
+Its managed `run-workflow` owner cancels the root plan and returns the validated terminal. When the host reports
+that stop is already being handled, wait for that result; do not issue another cancel command or signal. A
+`STOP_LATCHED` or `ROBOT_STOP_UNKNOWN` result forbids further motion in this turn. A new independent user request is
+required after a definite terminal. Keep motion calls as one foreground `robot-skill run-workflow` invocation;
+do not compose shell commands or run the motion tool in the background.
 
 Stop the right goal with the right command. The two executors are different actions; the wrong command cannot
 reach the active goal and will time out as `SKILL_CANCEL_TIMEOUT` while the robot keeps moving.
@@ -277,11 +293,11 @@ capacity failure instead of retrying with a new request ID.
 | Situation | Response |
 |---|---|
 | Catalog-only request | Use catalog commands; no motion confirmation is needed. |
-| Runtime unavailable/unauthorized | Report the CLI error; with explicit user confirmation the Agent may launch the pipeline and enable motion authorization, then retry. Without confirmation, do not start or alter infrastructure. |
+| Runtime unavailable/unauthorized | Explain the unavailable capability in plain language; retain the CLI error in details. Do not start or alter infrastructure. |
 | Visual-game perception unavailable | Report `PERCEPTION_UNAVAILABLE`; do not launch or restart perception. |
 | Visual-game result ledger full | Report `GAME_CAPACITY_EXHAUSTED`; retained terminal results are not evicted early. |
 | No clearly visible person | Report `NO_PERSON`; do not announce or invent a game result. |
-| Terminal result | Report only public status/error fields. |
+| Terminal result | Summarize the verified outcome in natural language; retain public status/error fields in details. |
 | Stop state unknown | Report uncertainty and send no new motion. |
 
 ## Rationalization Check

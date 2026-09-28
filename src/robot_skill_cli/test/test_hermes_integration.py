@@ -47,13 +47,16 @@ def test_update_config_removes_managed_plugin_and_replaces_managed_hook(tmp_path
         speech_enabled=True,
     )
 
-    assert result["plugins"] == {"enabled": ["other"], "disabled": []}
+    assert result["plugins"]["enabled"] == ["other", "ibrobot-response", "ibrobot-motion"]
+    assert result["plugins"]["disabled"] == []
+    assert result["plugins"]["entries"]["ibrobot-response"]["settings"]["speaker"] == str(hook_path)
+    assert result["display"]["streaming"] is False
+    assert result["streaming"]["enabled"] is False
     assert result["toolsets"] == ["other"]
     assert result["terminal"]["cwd"] == str(tmp_path / "workspace")
     assert result["terminal"]["shell_init_files"] == ["/keep.sh", str(environment_file)]
     assert result["hooks"]["post_llm_call"] == [
         {"command": "/other/hook", "timeout": 5},
-        {"command": str(hook_path), "timeout": hermes_configure._HOOK_TIMEOUT_SEC},
     ]
     assert "pre_tool_call" not in result["hooks"]
 
@@ -68,6 +71,55 @@ def test_update_config_can_disable_speech(tmp_path: Path) -> None:
     )
 
     assert "post_llm_call" not in result["hooks"]
+    assert result["plugins"]["entries"]["ibrobot-response"]["settings"]["speaker"] == ""
+
+
+def test_update_config_disables_motion_without_runtime_adapter(tmp_path: Path) -> None:
+    result = hermes_configure._update_config(
+        {"plugins": {"enabled": ["ibrobot-motion"]}},
+        workspace=tmp_path,
+        environment_file=tmp_path / "env.sh",
+        hook_path=tmp_path / "hook",
+        speech_enabled=False,
+        motion_enabled=False,
+    )
+
+    assert "ibrobot-motion" not in result["plugins"]["enabled"]
+    assert "ibrobot-motion" in result["plugins"]["disabled"]
+    assert "ibrobot-motion" not in result["plugins"]["entries"]
+
+
+def test_configure_parser_keeps_hook_flag_and_requires_explicit_runtime_adapter():
+    args = hermes_configure._build_parser().parse_args(["--accept-hooks"])
+    assert args.accept_hooks is True
+    assert args.install_runtime_adapter is False
+
+    args = hermes_configure._build_parser().parse_args(["--install-runtime-adapter"])
+    assert args.install_runtime_adapter is True
+
+
+def test_response_plugin_sync_is_idempotent_and_contains_no_ros_dependencies(tmp_path):
+    resource = tmp_path / "resource"
+    resource.mkdir()
+    (resource / "RESPONSE_PROTOCOL.md").write_text("protocol")
+    profile = tmp_path / "profile"
+    assert hermes_configure._sync_response_plugin(profile, resource, dry_run=True)
+    assert not profile.exists()
+    assert hermes_configure._sync_response_plugin(profile, resource, dry_run=False)
+    assert not hermes_configure._sync_response_plugin(profile, resource, dry_run=False)
+    target = profile / "plugins" / "ibrobot-response"
+    assert (target / "RESPONSE_PROTOCOL.md").read_text() == "protocol"
+    assert "rclpy" not in (target / "hermes_response_plugin.py").read_text()
+
+
+def test_response_plugin_sync_preserves_user_owned_plugin(tmp_path):
+    target = tmp_path / "plugins" / "ibrobot-response"
+    target.mkdir(parents=True)
+    owned = target / "__init__.py"
+    owned.write_text("# user plugin")
+    with pytest.raises(hermes_configure.ConfigureError, match="user-managed"):
+        hermes_configure._sync_response_plugin(tmp_path, tmp_path / "unused", dry_run=False)
+    assert owned.read_text() == "# user plugin"
 
 
 def test_remove_stale_plugin_quarantines_managed_copy(tmp_path: Path) -> None:
@@ -135,7 +187,8 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
     assert "IBROBOT_TTS_SYNTHESIS_TIMEOUT_SEC=90" in hook
     assert "IBROBOT_TTS_PLAYBACK_TIMEOUT_SEC=300" in hook
     assert "venv/bin/python3" not in hook
-    assert str(shrc) not in lifecycle_hook
+    assert str(shrc) in lifecycle_hook
+    assert '<<< "$payload"' in lifecycle_hook
     assert str(shrc) in interim_hook
     assert str(tmp_path / "profile" / "hooks" / "ibrobot-speak") in interim_hook
     assert "exec python3 -m robot_skill_cli.hermes_interim_speech" in interim_hook
@@ -143,7 +196,7 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
     assert "-m robot_skill_cli.cli" in robot_skill
     assert "source /opt/ros/humble/setup.bash" not in robot_skill
     assert "exec python3 -m robot_skill_cli.cli" in robot_skill
-    assert "IBROBOT_HERMES_LIFECYCLE_SPEECH=1" in robot_skill
+    assert "IBROBOT_HERMES_LIFECYCLE_SPEECH=0" in robot_skill
     assert '--config-path "$ROBOT_CONFIG"' in robot_skill
     assert "configuration is bound" in robot_skill
     assert "source /opt/ros/humble/setup.bash" not in environment
@@ -159,6 +212,7 @@ def test_configure_dry_run_does_not_create_profile_files(tmp_path: Path, monkeyp
     (resource / "hooks").mkdir(parents=True)
     (resource / "SOUL.md").write_text("soul\n", encoding="utf-8")
     (resource / "POLICY.md").write_text("policy\n", encoding="utf-8")
+    (resource / "RESPONSE_PROTOCOL.md").write_text("protocol\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-speak").write_text("hook\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-interim-speech").write_text("interim\n", encoding="utf-8")
     skill = install / "share" / "robot_skill_cli" / "skills" / "ibrobot-control" / "SKILL.md"
@@ -200,6 +254,7 @@ def test_configure_dry_run_reports_stale_managed_plugin(tmp_path: Path, monkeypa
     (resource / "hooks").mkdir(parents=True)
     (resource / "SOUL.md").write_text("soul\n", encoding="utf-8")
     (resource / "POLICY.md").write_text("policy\n", encoding="utf-8")
+    (resource / "RESPONSE_PROTOCOL.md").write_text("protocol\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-speak").write_text("hook\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-interim-speech").write_text("interim\n", encoding="utf-8")
     skill = install / "share" / "robot_skill_cli" / "skills" / "ibrobot-control" / "SKILL.md"
@@ -238,121 +293,6 @@ def test_configure_dry_run_reports_stale_managed_plugin(tmp_path: Path, monkeypa
     assert retired_plugin.is_dir(), "dry-run must not touch the managed plugin"
 
 
-def test_approve_hooks_revokes_stale_mtime_before_auto_approval(tmp_path: Path, monkeypatch) -> None:
-    calls = []
-    hook_path = tmp_path / "hook"
-    monkeypatch.setattr(
-        hermes_configure,
-        "_run",
-        lambda arguments, **_kwargs: (
-            calls.append((arguments, None)) or SimpleNamespace(returncode=0, stderr="", stdout="")
-        ),
-    )
-    monkeypatch.setattr(
-        hermes_configure.subprocess,
-        "run",
-        lambda arguments, **kwargs: (
-            calls.append((arguments, kwargs["env"])) or SimpleNamespace(returncode=0, stderr="", stdout="")
-        ),
-    )
-
-    hermes_configure._approve_hooks("/bin/hermes", hook_path)
-
-    assert calls[0][0] == ["/bin/hermes", "hooks", "revoke", str(hook_path)]
-    assert calls[1][0] == ["/bin/hermes", "--accept-hooks", "hooks", "doctor"]
-    assert calls[1][1]["HERMES_ACCEPT_HOOKS"] == "1"
-
-
-def test_approve_hooks_continues_when_hook_not_yet_registered(tmp_path: Path, monkeypatch) -> None:
-    """First install: revoke finds nothing to revoke, hook is unlisted, doctor still runs."""
-    hook_path = tmp_path / "hook"
-    run_calls: list[list[str]] = []
-    subprocess_calls: list[list[str]] = []
-
-    def fake_run(arguments: list[str], **_kwargs):
-        run_calls.append(list(arguments))
-        if arguments[1:] == ["hooks", "revoke", str(hook_path)]:
-            return SimpleNamespace(returncode=1, stderr="no such hook", stdout="")
-        if arguments[1:] == ["hooks", "list"]:
-            return SimpleNamespace(returncode=0, stderr="", stdout="")
-        return SimpleNamespace(returncode=0, stderr="", stdout="")
-
-    monkeypatch.setattr(hermes_configure, "_run", fake_run)
-    monkeypatch.setattr(
-        hermes_configure.subprocess,
-        "run",
-        lambda arguments, **_kwargs: (
-            subprocess_calls.append(list(arguments)) or SimpleNamespace(returncode=0, stderr="", stdout="")
-        ),
-    )
-
-    hermes_configure._approve_hooks("/bin/hermes", hook_path)
-
-    assert run_calls[0][1:] == ["hooks", "revoke", str(hook_path)]
-    assert run_calls[1][1:] == ["hooks", "list"]
-    assert subprocess_calls[0][1:] == ["--accept-hooks", "hooks", "doctor"]
-
-
-def test_approve_hooks_raises_when_registered_hook_revoke_fails(tmp_path: Path, monkeypatch) -> None:
-    """Reupgrade: hook is registered but revoke fails -> raise before reaching doctor."""
-    hook_path = tmp_path / "hook"
-    run_calls: list[list[str]] = []
-    subprocess_calls: list[list[str]] = []
-
-    def fake_run(arguments: list[str], **_kwargs):
-        run_calls.append(list(arguments))
-        if arguments[1:] == ["hooks", "revoke", str(hook_path)]:
-            return SimpleNamespace(returncode=1, stderr="revoke denied", stdout="")
-        if arguments[1:] == ["hooks", "list"]:
-            return SimpleNamespace(returncode=0, stderr="", stdout=f"approved hooks:\n{hook_path}\n")
-        return SimpleNamespace(returncode=0, stderr="", stdout="")
-
-    monkeypatch.setattr(hermes_configure, "_run", fake_run)
-    monkeypatch.setattr(
-        hermes_configure.subprocess,
-        "run",
-        lambda arguments, **_kwargs: (
-            subprocess_calls.append(list(arguments)) or SimpleNamespace(returncode=0, stderr="", stdout="")
-        ),
-    )
-
-    with pytest.raises(hermes_configure.ConfigureError, match="approval refresh failed"):
-        hermes_configure._approve_hooks("/bin/hermes", hook_path)
-
-    assert run_calls[0][1:] == ["hooks", "revoke", str(hook_path)]
-    assert run_calls[1][1:] == ["hooks", "list"]
-    assert subprocess_calls == [], "doctor must not run when revoke fails for a registered hook"
-
-
-@pytest.mark.parametrize(
-    ("payload", "expected"),
-    [
-        ({"extra": {"assistant_response": "你好，nod_yes ✓！"}}, "你好，nod_yes ✓！"),
-        ({"assistant_response": "打开夹爪。"}, "打开夹爪。"),
-        ({"extra": {"assistant_response": "```robot-skill status```"}}, "```robot-skill status```"),
-    ],
-)
-def test_tts_payload_extraction_preserves_text_for_voice_tts(payload: dict, expected: str) -> None:
-    assert hermes_tts_hook.extract_response(payload) == expected
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("你好，我是 IB-Robot 语音助手。", "你好,我是 - 语音助手。"),
-        ("TTS 真机验证成功", " 真机验证成功"),
-        ("打开 SO-101 夹爪", "打开 -101 夹爪"),
-        ("你好世界", "你好世界"),
-        ("v1.0 发布", "1.0 发布"),
-        ("```robot-skill status```", "```- ```"),
-        ("任务 71faa17ea1e843f2aeb800d3184ec320 完成", "任务  完成"),
-        ("完成 123456 次", "完成 123456 次"),
-    ],
-)
-def test_sanitize_for_tts_strips_english_letters(text: str, expected: str) -> None:
-    assert hermes_tts_hook.sanitize_for_tts(text) == expected
-
-
 def test_write_wav_requires_complete_wav_header(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(hermes_tts_hook.tempfile, "mkstemp", lambda **_: (999, str(tmp_path / "audio.wav")))
     with pytest.raises(hermes_tts_hook.SpeechHookError, match="invalid WAV"):
@@ -364,3 +304,23 @@ def test_wait_for_future_rejects_service_exception(monkeypatch) -> None:
     future = SimpleNamespace(done=lambda: True, exception=lambda: RuntimeError("boom"), result=lambda: None)
     with pytest.raises(hermes_tts_hook.SpeechHookError, match="service failed"):
         hermes_tts_hook._wait_for_future(SimpleNamespace(), future, 1.0, "operation")
+
+
+def test_configure_retires_only_managed_lifecycle_hooks(tmp_path):
+    lifecycle = tmp_path / "ibrobot-lifecycle-speech"
+    user_hook = {"command": "/user-hook", "timeout": 3}
+    config = {
+        "hooks": {
+            event: [{"command": str(lifecycle), "timeout": 2}, user_hook.copy()]
+            for event in ("pre_llm_call", "pre_tool_call", "post_tool_call")
+        }
+    }
+    hermes_configure._update_config(
+        config,
+        workspace=tmp_path,
+        environment_file=tmp_path / "env.sh",
+        hook_path=tmp_path / "ibrobot-speak",
+        speech_enabled=True,
+        lifecycle_hook_path=lifecycle,
+    )
+    assert all(entries == [user_hook] for entries in config["hooks"].values())
