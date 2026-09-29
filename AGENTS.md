@@ -241,8 +241,9 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 
 | 技能 | 触发场景 |
 |------|---------|
-| [deepwiki-config](.agents/skills/deepwiki-config) | 生成 DeepWiki `doc_config.json` 配置 |
-| [deepwiki-translator](.agents/skills/deepwiki-translator) | DeepWiki Markdown 中文翻译、配置标题本地化 |
+| [deepwiki-config](.agents/skills/deepwiki-config) | 生成/更新 DeepWiki `doc_config.json` 配置 |
+| [deepwiki-translator](.agents/skills/deepwiki-translator) | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点） |
+| [doc-link-validator](.agents/skills/doc-link-validator) | 文档链接校验（本地/外部/AtomGit）、断链检查、交付前链接体检 |
 | [mermaid-syntax-validation](.agents/skills/mermaid-syntax-validation) | Mermaid 图语法检查、修复与渲染验证 |
 
 ### AtomGit 协作

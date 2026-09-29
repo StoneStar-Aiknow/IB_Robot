@@ -28,14 +28,24 @@ Read only the references needed for the current step:
 
 | Purpose | Reference |
 |---------|-----------|
-| 必做上下文检查的脚本（统计 fence、找含 Mermaid 的 HTML、检查 script 标签） | `references/context-checks.md` |
-| 静态风险扫描脚本、高风险模式表、flowchart/state diagram 修复规则 | `references/static-scan-and-fix-rules.md` |
+| 上下文检查的 WARNING 处置与人工核对清单、5 项检查的手工定义（文档栈、runtime、fence、HTML 页面、script 标签） | `references/context-checks.md` |
+| 语法修复的条件性门禁规则、高风险模式表、flowchart/state diagram 修复规则、静态语法初筛回退 | `references/syntax-scan-and-fix-rules.md` |
 
 Do not expose these references as separate skills.
 
 ## 必做上下文检查
 
-执行修复前必须完成 5 项上下文检查（确认文档栈、确认本地 runtime 资源、统计 Mermaid fence、找含 Mermaid 的 HTML、检查 script 标签）。详细脚本见 `references/context-checks.md`。
+执行任何修复前，先运行技能脚本完成 5 项上下文检查（文档栈、本地 runtime 资源、fence 统计、含图 HTML 页面、script 标签/CDN 引用）。命令中的 `<skill_dir>` 指本技能目录（本 SKILL.md 所在目录，即 `scripts/`、`references/` 的父目录），执行时替换为实际路径；`--docs-root` 等目标路径参数以当前工作目录为基准：
+
+```bash
+python -X utf8 <skill_dir>/scripts/context_check.py --docs-root docs [--build-dir docs/build/html]
+```
+
+门禁规则：
+
+1. 没有脚本输出，不得开始编辑任何 Markdown 文件。
+2. 最终报告的「已检查的 Mermaid runtime 文件」「docs 构建结果」「浏览器验证统计」等字段必须取自脚本输出或其后的构建/浏览器验证，不得凭记忆或推测填写。
+3. 脚本报告 `WARNING`（如 CDN 引用），或存在脚本未覆盖的人工判断项（conf.py monkey patch / override 语义、Sphinx 配置组合）时，必须阅读 `references/context-checks.md` 并按其规则处理。
 
 ## Runtime 预期
 
@@ -50,9 +60,27 @@ Do not expose these references as separate skills.
 
 如果存在可运行的 Mermaid JS 环境，语法级检查优先使用 `mermaid.parse(text, { suppressErrors: true })`。静态 grep 适合初筛，但 `parse()` 和浏览器渲染是更强的证据。
 
-## 静态风险扫描
+## 语法风险扫描与修复
 
-编辑前先做源文件扫描。该扫描不能替代浏览器验证。扫描脚本、高风险模式表和修复规则见 `references/static-scan-and-fix-rules.md`。
+编辑前完成「诊断 → 预览 → 修复 → 复验」循环（幂等、仅改语法；`parse()` 与浏览器渲染使用同一解析器，复验全绿即等价于渲染通过）：
+
+```bash
+node <skill_dir>/scripts/parse_check.mjs <target_dir>                   # 1. 诊断：定位失败块
+python -X utf8 <skill_dir>/scripts/fix_labels.py <target_dir> --dry-run  # 2. 预览将修改的内容
+python -X utf8 <skill_dir>/scripts/fix_labels.py <target_dir>            # 3. 应用自动修复（graph/flowchart 标签语法：引号翻倍、内部引号转义、特殊字符未加引号、匿名节点分配 ID、边标签加引号）
+node <skill_dir>/scripts/parse_check.mjs <target_dir>                   # 4. 复验：必须全绿
+```
+
+依赖 `mermaid`、`jsdom` 从当前工作目录解析，缺失时必须站在目标目录之外（如仓库根）执行 `npm install mermaid jsdom`——npm 会在执行目录创建 `node_modules`，站在目标内执行会给目标目录新增文件。
+
+门禁规则：
+
+1. 循环顺序固定为 1→4；第 4 步不全绿不得进入构建验证。
+2. 第 3 步应用后 `parse_check.mjs` 仍有失败块时，禁止凭经验直接手工编辑——必须阅读 `references/syntax-scan-and-fix-rules.md`，按其高风险模式表定位失败模式并按其修复规则处理。
+3. 无 JS runtime（无法运行 `parse_check.mjs`）时，按该 reference 的「静态语法初筛」回退诊断，并在报告中说明未做 parse 验证的原因。
+4. 存在手工修复时，最终报告的「修复的具体语法类别」必须注明依据（`references/syntax-scan-and-fix-rules.md` 中高风险模式表的行或其「修复规则」章节的条目）。
+
+该环节不能替代浏览器验证，复验全绿后再走构建与浏览器验证。
 
 ## 构建验证
 
@@ -62,54 +90,32 @@ Do not expose these references as separate skills.
 sphinx-build -M html source build
 ```
 
-或从仓库根目录运行：
+或从文档项目根目录运行：
 
 ```bash
 python3 -m sphinx -b html docs/source docs/build/html
 ```
 
-同时扫描生成 HTML 中的 Mermaid 错误文本：
+用技能脚本扫描生成 HTML（bash 与 Windows PowerShell 均可直接运行；匹配文件逐行输出到 stdout，扫描统计输出到 stderr）：
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-pattern = re.compile(r"Syntax error in text|Parse error|mermaid version|Diagram error")
-for path in sorted(Path("docs/build/html").rglob("*.html")):
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    if pattern.search(text):
-        print(path)
-PY
+python -X utf8 <skill_dir>/scripts/html_scan.py --build-dir docs/build/html --scan errors
+python -X utf8 <skill_dir>/scripts/html_scan.py --build-dir docs/build/html --scan cdn
 ```
 
-期望无输出。
+- `--scan errors`：扫描 Mermaid 错误文本（`Syntax error in text` / `Parse error` / `mermaid version` / `Diagram error`）。期望退出码 0 且 stdout 无匹配文件；出现任何匹配都是失败。
+- `--scan cdn`：扫描是否意外引入在线 runtime 依赖（`cdn.jsdelivr.net` / `unpkg.com`）。对要求离线可用的文档，期望退出码 0 且 stdout 无匹配文件；允许在线的文档出现匹配时，须在报告中说明在线依赖及处置。
+- 构建目录缺失或其中没有 HTML 文件时，脚本以退出码 2 报错——此时不得视为验证通过，应先修正 `--build-dir` 或重新构建。
 
-扫描生成 HTML 是否意外引入在线 runtime 依赖：
+用同一脚本确认本地 runtime 文件已复制到生成产物的 `_static` 目录（stdout 逐项列出找到的资产，可直接作为报告「已检查的 Mermaid runtime 文件」字段的证据）：
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-pattern = re.compile(r"cdn\.jsdelivr\.net|unpkg\.com")
-for path in sorted(Path("docs/build/html").rglob("*.html")):
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    if pattern.search(text):
-        print(path)
-PY
+python -X utf8 <skill_dir>/scripts/html_scan.py --build-dir docs/build/html --scan runtime
 ```
 
-对于要求离线可用的文档，期望无输出。
-
-确认本地 runtime 文件已复制到生成产物的 `_static` 目录，例如：
-
-```bash
-test -f docs/build/html/_static/js/mermaid.min.js
-test -f docs/build/html/_static/js/mermaid-run.js
-```
-
-如果项目使用 ESM Mermaid，还要确认生成产物中存在 `.mjs` 入口和 `chunks/` 目录。
+- 使用本地浏览器 runtime 的项目（UMD：`mermaid.min.js` + runner；ESM：`.mjs` 入口 + `chunks/`）期望退出码 0。
+- ESM 入口存在但旁边没有 `chunks/` 目录时，脚本输出 WARNING 并以退出码 1 提示核查 ESM runtime 是否完整。
+- 服务端渲染（png/svg 直出）的项目没有浏览器 runtime 属正常，退出码 1 不代表失败，但须在报告中说明渲染方式。
 
 ## 浏览器验证
 
@@ -145,8 +151,10 @@ kill "$SERVER_PID"
 
 最终报告必须包含：
 
+- `context_check.py` 的输出摘要（文档栈、runtime 文件、fence 数、含图页面数）——缺失该项即视为未执行门禁步骤
 - 修改的文件
 - 修复的具体语法类别
+- `parse_check.mjs` 结果（N/N 块通过）——缺失该项即视为未完成语法风险扫描与修复的复验；存在手工修复时，语法类别须注明依据（`references/syntax-scan-and-fix-rules.md` 中高风险模式表的行或其「修复规则」章节的条目）
 - 已检查的 Mermaid runtime 文件，包括本地/ CDN 结果
 - docs 构建结果
 - 浏览器验证统计：检查页数、Mermaid 图数量、失败数
@@ -157,6 +165,8 @@ kill "$SERVER_PID"
 示例：
 
 ```text
+Context check: myst_parser + sphinxcontrib.mermaid, 211 fences, local runtime mermaid.min.js + mermaid-run.js, 56 HTML pages with mermaid, no CDN.
+Parse check: 211/211 mermaid blocks passed (3 manual fixes per pattern table rows: subgraph legacy syntax, stateDiagram colon).
 Changed 4 Markdown files, syntax-only Mermaid edits.
 Runtime check: local mermaid.min.js + mermaid-run.js copied, no CDN runtime references.
 Sphinx build: passed.

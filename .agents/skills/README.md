@@ -30,8 +30,9 @@
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
 | [ohloha-build-pkg](./ohloha-build-pkg) | 板端 | 用 `tools_ohloha_pkgs` / `builder.sh` 交叉编译第三方包（bash、zsh、vim、ncurses 等）到 OpenHarmony 板端。 |
 | [oh-rebuild-kernel](./oh-rebuild-kernel) | 板端 | 重新编译并刷入 OpenHarmony 内核 (boot_linux.img)，启用 USB ACM 等驱动。 |
-| [deepwiki-config](./deepwiki-config) | 文档 | 根据 DeepWiki 目录结构生成 `deepwiki_processor.py` 所需的 `doc_config.json`。 |
-| [deepwiki-translator](./deepwiki-translator) | 文档 | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档。 |
+| [deepwiki-config](./deepwiki-config) | 文档 | 根据 DeepWiki 目录结构生成或更新 `deepwiki_processor.py` 所需的 `doc_config.json`。 |
+| [deepwiki-translator](./deepwiki-translator) | 文档 | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点）。 |
+| [doc-link-validator](./doc-link-validator) | 文档 | 校验 Markdown/RST 文档树中的本地、外部与 AtomGit 链接有效性；断链检查、交付前链接体检。 |
 | [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML 不再渲染 Mermaid 错误 SVG。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、选择 WIP/正式检视阶段、更新标题/描述；工具版本由 coding agent 先行执行版本命令后传入。 |
@@ -72,10 +73,11 @@
 - **OH 内核重编 ([oh-rebuild-kernel](./oh-rebuild-kernel))**: 重新编译并刷入 OpenHarmony 板的 Linux 内核 (boot_linux.img)，用于启用 USB ACM（SO-101 机械臂）、游戏手柄等内核驱动。
 
 ### 📚 DeepWiki 文档工具
-这些技能用于生成 DeepWiki 处理配置，并把 DeepWiki 输出文档本地化为中文。
+这些技能用于生成 DeepWiki 处理配置，把 DeepWiki 输出文档本地化为中文，并保障交付文档质量。
 
-- **配置生成 ([deepwiki-config](./deepwiki-config))**: 从 DeepWiki 目录结构生成 `doc_config.json`，保持 `deepwiki_processor.py` 可识别的层级与标签。
-- **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 先本地化配置标题，再翻译 Markdown 页面，确保 H1、链接、文件名和处理器规则一致。
+- **配置生成 ([deepwiki-config](./deepwiki-config))**: 从 DeepWiki 目录结构生成或增量更新 `doc_config.json`，保持 `deepwiki_processor.py` 可识别的层级与标签。
+- **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 配置优先流程：本地化配置标题后逐页翻译，再构建目录与索引并校验链接锚点，全程保持 H1、文件名与处理器规则一致。
+- **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；单脚本零内部依赖，可整体拷贝到其他 docs 仓库复用。
 - **Mermaid 语法验证 ([mermaid-syntax-validation](./mermaid-syntax-validation))**: 对 Markdown/Sphinx 文档中的 Mermaid 图执行语法风险扫描、最小修复、Sphinx 构建和浏览器端渲染验证。
 
 ### 🌐 AtomGit 自动化工具
