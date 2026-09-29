@@ -1,11 +1,19 @@
-# 必做上下文检查脚本
+# 必做上下文检查——条件性规则与手工定义
+
+命令与无条件门禁（无输出不得编辑、报告字段取自脚本输出）见 SKILL.md「必做上下文检查」；本文件只保留按条件触发的规则与手工核对清单。
 
 ## When to Read
 
-- 执行"必做上下文检查"环节时
-- 需要统计 Mermaid fence 数量时
-- 需要找出生成 HTML 中包含 Mermaid 的页面时
-- 需要检查 HTML script 标签引用的 runtime 时
+- `context_check.py` 报告 `WARNING`，需要确定处置方式时
+- 需要人工核对脚本未覆盖的检查项（conf.py monkey patch / override 语义、Sphinx 配置组合）时
+- 需要理解 `context_check.py` 各检查项的原始定义时
+- 需要手工执行某项检查（fence 统计、含图 HTML 页面、script 标签）时
+
+## 门禁规则（触发上述场景时必须满足）
+
+1. 脚本报告 `WARNING`（如 CDN 引用、有 mermaid 容器但无本地 runtime 引用）时，必须在报告中明确列出并说明处置。
+2. 脚本未覆盖的人工判断项（conf.py 中 monkey patch / override 的语义、Sphinx 配置组合是否合理），按下方第 1、2 节清单逐项核对，并在报告中说明。
+3. 脚本输出是第 1–5 项检查的证据基线；手工核对结论与脚本输出不一致时，以脚本输出为准并排查差异原因。
 
 ## 1. 确认文档栈
 

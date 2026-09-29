@@ -1,11 +1,11 @@
 ---
 name: "deepwiki-config"
-description: "根据 DeepWiki MCP 的 read_wiki_structure 返回内容，自动生成 deepwiki_processor 所需的 doc_config.json。当用户需要为新的 DeepWiki 仓库生成配置文件时调用。"
+description: "将 DeepWiki 仓库的 Wiki 页面结构转换为 doc_config.json，供 deepwiki-translator 翻译流水线使用；支持新仓库生成与已有配置更新。Use when users mention 'generate doc_config', 'DeepWiki config', 'DeepWiki 配置', '生成 doc_config', '更新 doc_config', or '重新生成配置'."
 ---
 
 # DeepWiki 配置生成器
 
-根据 DeepWiki MCP 的 `read_wiki_structure` 返回内容，自动生成 `deepwiki_processor.py` 所需的 `doc_config.json` 配置文件。
+调用 `mcp_deepwiki_read_wiki_structure` 获取仓库 Wiki 结构，交给技能脚本 `generate_config.py` 生成 `doc_config.json` 配置文件。该配置的消费者是 **deepwiki-translator 技能**的 `deepwiki_processor.py` 脚本，hierarchy 与 label 格式以其输入约定为权威。
 
 ## 何时调用
 
@@ -28,7 +28,7 @@ Read only the references needed for the current step:
 
 | Purpose | Reference |
 |---------|-----------|
-| 第 2-7 步详细执行步骤（解析 Wiki 结构、生成 label、生成 hierarchy、组装 JSON、一致性验证、写入文件） | `references/detailed-steps.md` |
+| `generate_config.py` 的规则设计说明（解析、label、hierarchy、三向验证的意图、边界处理与示例），维护/调试/评审脚本时，或第 2 步退出码为 `1` 且用户要求定位修复时阅读 | `references/script-design.md` |
 
 Do not expose these references as separate skills.
 
@@ -42,13 +42,13 @@ Do not expose these references as separate skills.
 | `title_to_label` | 原始标题 → label |
 | `hierarchy` | 输出文件/目录树（叶子节点为 `<label>.md`，目录节点含 `title` + `subs`） |
 
+hierarchy 混合模式：无子页面的一级章节为叶子节点 `<label>.md`；有子页面的一级章节为目录节点 `<label>`，其 `subs` 为子页面 `<sub_label>.md` → 子页面标题。目录节点自身的 label 在 `deepwiki_processor.py` 输出时映射为 `<label>/overview.md`（配置中不含该 key）。
+
 ## 工作流程
 
 ### 第 1 步 — 获取 Wiki 结构
 
-调用 `mcp_deepwiki_read_wiki_structure`，参数 `repoName = <repo>`。
-
-MCP 返回类似如下格式的页面列表：
+调用 `mcp_deepwiki_read_wiki_structure`，参数 `repoName = <repo>`。将返回的页面列表保存到临时文件（如 `tmp/wiki_structure.txt`），格式形如：
 
 ```
 - 1 IB-Robot Overview
@@ -60,71 +60,31 @@ MCP 返回类似如下格式的页面列表：
 ...
 ```
 
-### 第 2 步 — 解析 Wiki 结构
+### 第 2 步 — 运行技能脚本
 
-逐行解析返回内容，构建页面对照表（每条记录含章节 ID、标题、层级、父章节 ID）。
+```bash
+python -X utf8 <skill_dir>/scripts/generate_config.py tmp/wiki_structure.txt --output <output_path> [--repo <repo>]
+```
 
-详细的解析规则见 `references/detailed-steps.md` 第 2 步。
+`<skill_dir>` 指本技能目录（本 SKILL.md 所在目录，即 `scripts/` 的父目录），执行时替换为实际路径。
 
-### 第 3 步 — 生成 label
+解析、label 生成、hierarchy 组装、一致性验证、写入的全部规则均内聚在脚本中，不要绕过脚本手工编写 doc_config.json。规则的设计意图与示例见 `references/script-design.md`，仅在维护或调试脚本时阅读，执行时无需。
 
-对每个页面生成简洁 label。**更新场景下保留已有标签**，仅对新页面生成 label。
+退出码约定：
 
-label 生成规则：去除 `(xxx)` 括号内容 + slug 生成 + 去除常见虚词（and/or/of/the/for/with/a/an/in/on/to）。
+- `0` — 成功，stdout 输出摘要（页面总数、叶子/目录节点、label 对照表、验证结果、冲突/跳过报告、已写入路径）
+- `1` — 一致性验证失败，stderr 输出结构化错误清单，未写入文件
+- `2` — 输入错误（文件不存在、未解析到页面、重复标题、悬空二级子页面、已存在的输出文件损坏）
 
-详细规则和 10 行示例见 `references/detailed-steps.md` 第 3 步。
+### 第 3 步 — 处理脚本输出
 
-### 第 4 步 — 生成 hierarchy
-
-采用**混合模式**：
-
-- 无子页面的一级章节 → 叶子节点（直接输出 `<label>.md`）
-- 有子页面的一级章节 → 目录节点（含 `overview.md` + 子页面 `<sub_label>.md`）
-
-节点类型判断、目录名生成、hierarchy 组装结构详见 `references/detailed-steps.md` 第 4 步。
-
-### 第 5 步 — 组装完整 doc_config.json
-
-将 `id_to_label`、`title_to_label`、`hierarchy` 三部分组装为完整 JSON。
-
-完整 JSON 示例见 `references/detailed-steps.md` 第 5 步。
-
-### 第 6 步 — 一致性验证
-
-在写入文件之前，验证三者完全一致：
-
-- **6a**: `id_to_label` ↔ `title_to_label` 双向校验
-- **6b**: `id_to_label` ↔ `hierarchy` 标签集合校验（孤立/缺失 label 检测）
-- **6c**: `title_to_label` ↔ `hierarchy` 标题映射校验
-- **6d**: 全部通过 → 继续第 7 步；任一失败 → 报告所有不一致项并停止
-
-验证逻辑和错误报告示例见 `references/detailed-steps.md` 第 6 步。
-
-### 第 7 步 — 写入文件
-
-将生成的 JSON 写入 `output_path`（默认 `doc_config.json`），使用 4 空格缩进，`ensure_ascii=False`。
-
-### 第 8 步 — 输出摘要
-
-生成完成后，输出以下信息：
-
-- 页面总数
-- 叶子节点数量和列表
-- 目录节点数量和列表（含子页面数）
-- 生成的 label 对照表（供用户检查是否需要手动调整）
-- 验证结果：三者一致，或列出不一致项
-- 提示用户：label 自动生成；更新场景下已有标签会被保留，如需调整可手动编辑 `doc_config.json`
+- 退出码 `0`：向用户转述脚本摘要；提示 label 为自动生成（更新场景下已有标签已保留），如需调整可手动编辑 `doc_config.json`
+- 退出码 `1`（一致性验证失败）：属脚本自身缺陷而非输入问题（正常路径验证必然通过）——向用户报告 stderr 错误清单后停止；不重试输入，不手工编写 `doc_config.json` 绕过。用户要求修复时进入脚本维护模式：先读 `references/script-design.md` 对应规则定位偏差（规格基准），再修改 `scripts/generate_config.py` 并重跑
+- 退出码 `2`（输入错误）：转述 stderr 中的错误，按错误类别处理（补充父章节、修复或删除损坏的输出文件等）后重跑；禁止手工改写脚本已拒绝的产物
 
 ## 错误处理
 
 - 如果 `read_wiki_structure` 调用失败，报告错误并停止执行
-- 如果解析过程中遇到无法识别的行格式，跳过该行并在摘要中报告
-- 如果生成的 label 存在冲突（不同页面生成相同 label），在冲突的 label 后追加 `_2`、`_3` 等后缀，并在摘要中报告
-
-## 约束
-
-- label 通过去除括号内容 + slug 去虚词生成
-- 更新场景（已存在 `doc_config.json`）下，保留已有章节 ID 的旧 label，仅对新页面生成 label
-- hierarchy 采用混合模式：无子页面的一级章节为叶子节点，有子页面的为目录节点
-- 生成的 JSON 必须与 `deepwiki_processor.py` 的输入格式完全兼容
-- 目录名和文件名中的连字符统一转为下划线
+- label 冲突（不同页面生成相同 label）由脚本自动追加 `_2`、`_3` 等后缀，并在摘要中报告
+- 无法识别的行由脚本跳过并在摘要中报告
+- 重复标题、悬空二级子页面、已有输出文件损坏，均由脚本以退出码 `2` 拒绝执行

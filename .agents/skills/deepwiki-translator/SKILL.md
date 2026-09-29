@@ -1,6 +1,6 @@
 ---
 name: "deepwiki-translator"
-description: "使用配置优先流程将 DeepWiki Markdown 翻译为中文：先本地化 doc_config.json 标题，再让页面 H1 严格使用本地化配置中的标题，同时保持 label、文件名、链接和处理脚本兼容。支持全量和增量翻译模式。"
+description: "将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（全量/增量翻译、构建目录与索引、校验链接与锚点）。Use when users mention 'translate DeepWiki markdown', 'DeepWiki 翻译', '汉化 DeepWiki', 'localize doc_config', '全量翻译', '增量翻译', or 'incremental translation'."
 ---
 
 # DeepWiki 翻译器
@@ -33,9 +33,10 @@ Read only the references needed for the current step:
 
 | Purpose | Reference |
 |---------|-----------|
-| 内容保护规则、术语表、链接安全分析 | `references/content-protection.md` |
-| 配置本地化详细步骤（第 1-3 步） | `references/config-localization.md` |
-| 输出生成与验证（第 5-6 步） | `references/verification.md` |
+| 内容保护规则、术语表、链接安全分析，执行第 4 步翻译前必读 | `references/content-protection.md` |
+| 配置本地化细则、校验清单、映射构建规则、目录 overview「概述」后缀规则的完整 JSON 示例，执行第 2 步前必读 | `references/config-localization.md` |
+| 生成命令、输出验证清单、失败处置，执行第 5 步前必读 | `references/output-pipeline.md` |
+| 三层防护、链接修复循环、源链接形态规范、已知坑，第 6 步退出码非 0 或出现 `(dangling anchor)` 条目时必读 | `references/link-repair.md` |
 
 Do not expose these references as separate skills.
 
@@ -62,23 +63,27 @@ Do not expose these references as separate skills.
 - 所有 label 值必须原样保留。
 - 所有 hierarchy key、目录名和 Markdown 文件名必须原样保留。
 
+目录 overview 标题后缀规则：`hierarchy` 条目含 `subs` 字段（目录 overview 页面）时，翻译后的 `title` 必须以"概述"结尾（如 "Getting Started" → "入门指南概述"），避免与章节同名；叶子页面不加后缀。完整规则与 JSON 示例见 `references/config-localization.md`。
+
 这样可以兼容 `deepwiki_processor.py`，因为它本来就要求 `title_to_label` 与 `hierarchy` 中的标题和输入 Markdown 的 H1 完全一致。
 
-## 推荐流程
+## 执行流程
 
-1. 使用 `split_md.py` 将 DeepWiki 原始内容拆分成英文 `raw_md/*.md`。
-2. 翻译 `source_config` 中的标题，生成同 schema 的 `target_config`（详见 `references/config-localization.md`）。
-3. 从 `target_config.hierarchy` 构建"文件名 -> 中文 H1"映射。
-4. 翻译每个英文 Markdown 到 `target_dir`，文件名保持不变（根据 `mode` 选择全量或增量）。
-5. 每个译文文件的第一个 H1 必须设置为 `target_config` 中对应的中文标题。
-6. 使用 `--input-dir=target_dir --config-file=target_config` 运行 `deepwiki_processor.py`（详见 `references/verification.md`）。
-7. 检查 warnings 和 `link_conversions.xlsx`。
+本技能唯一权威流程。`scripts/` 下 `deepwiki_config` / `deepwiki_generator` / `deepwiki_links` / `deepwiki_pages` 为内部模块（无 CLI，仅被命令行脚本导入，不可独立执行）。命令中的 `<skill_dir>` 指本技能目录（本 SKILL.md 所在目录，即 `scripts/`、`references/` 的父目录），执行时替换为实际路径；脚本默认参数（如 `raw_md/`、`doc_config.json`）以当前工作目录为基准。
 
-不要让页面翻译过程自行发挥生成 H1。配置是页面标题的唯一事实来源。
+### 第 1 步 — 拆分原始 Markdown
 
-## 翻译模式
+运行 `python -X utf8 <skill_dir>/scripts/split_md.py <raw_md_file> <source_dir>`，将 DeepWiki 导出的 `# Page: <Title>` 原始 Markdown 拆分为扁平页面文件（文件名由标题 slug 生成并自动补全 H1）。
 
-### 全量翻译（`mode=full`）
+### 第 2 步 — 本地化配置与构建映射
+
+**执行本步前必须完整阅读 `references/config-localization.md`**。按其要求生成同 schema 的 `target_config` 并完成校验（增量模式下已存在则直接复用，跳过生成与校验）；随后从 `target_config.hierarchy` 构建"文件名 -> 中文 H1"映射。
+
+### 第 3 步 — 确定翻译范围
+
+按 `mode` 选择翻译范围，文件判定逻辑仅在此定义。
+
+#### 全量翻译（`mode=full`）
 
 从零翻译所有页面。适用场景：
 
@@ -86,15 +91,9 @@ Do not expose these references as separate skills.
 - 源内容变化较大，需要完全重新翻译。
 - 用户明确要求全量重翻。
 
-流程：
+翻译范围：`source_dir` 中每一个 `.md` 文件。
 
-1. 本地化 `doc_config.json` → `target_config`（如已存在则覆盖）。
-2. 校验本地化配置。
-3. 构建文件名到 H1 的映射。
-4. 翻译 `source_dir` 中**每一个** `.md` 文件，写入 `target_dir`。
-5. 运行 `deepwiki_processor.py` 并验证。
-
-### 增量翻译（`mode=incremental`）
+#### 增量翻译（`mode=incremental`）
 
 仅翻译新增或修改的页面，保留已有翻译。适用场景：
 
@@ -102,50 +101,52 @@ Do not expose these references as separate skills.
 - 特定页面有更新需要重新翻译。
 - 用户希望避免重复翻译已完成的页面。
 
-流程：
+先用 Glob 分别列出 `source_dir` 和 `target_dir` 中的 `.md` 文件，再按下表逐文件判定：
 
-1. 如果 `target_config` 不存在，先本地化 `doc_config.json`；否则复用已有的 `target_config`。
-2. 校验本地化配置。
-3. 使用 Glob 分别列出 `source_dir` 和 `target_dir` 中的文件。
-4. 判断哪些文件需要翻译：
-   - 在 `source_dir` 中但**不在** `target_dir` 中 → 新页面，必须翻译。
-   - 两个目录都存在的文件 → 默认跳过；仅在用户明确要求或确认源文件已变更时重新翻译。
-   - 在 `target_dir` 中但**不在** `source_dir` 中 → 报告为可能过时的文件，未经用户确认不删除。
-5. 对每个需要翻译的文件，执行读取、翻译、写入。
-6. 运行 `deepwiki_processor.py` 并验证。
+| 文件状态 | 判定 |
+|---|---|
+| 在 `source_dir` 中但不在 `target_dir` 中 | 新页面，必须翻译 |
+| 两个目录都存在 | 默认跳过；仅在用户明确要求或确认源文件已变更时重新翻译 |
+| 在 `target_dir` 中但不在 `source_dir` 中 | 报告为可能过时的文件，未经用户确认不删除 |
 
-## 翻译方式约束
+增量只减少待翻译文件，不缩小后续步骤范围：第 5 步始终读取整个 `target_dir`（旧译文 + 新译文）重新生成并整体重建 `output_dir`，第 5-6 步的输出检查与锚点校验始终覆盖整个 `output_dir`。
 
-**禁止编写脚本来执行翻译工作。** LLM 本身就是翻译引擎。对每个需要翻译的文件：
+### 第 4 步 — 逐文件翻译
 
-1. 使用 **Read** 工具从 `source_dir` 读取源 Markdown 文件。
-2. LLM 就地翻译内容，遵循所有内容保护规则和术语表（详见 `references/content-protection.md`）。
-3. 使用 **Write** 工具将翻译后的内容写入 `target_dir`，文件名不变，UTF-8 编码。
+**禁止编写脚本执行翻译，LLM 本身就是翻译引擎**，Read → 翻译 → Write 循环在对话中逐文件执行。本步同时适用于全量和增量模式。
 
-此约束同时适用于全量和增量模式。禁止创建 Python、Bash 或任何其他脚本来自动化翻译循环。Read → LLM 翻译 → Write 的循环在对话中逐文件执行。
+**执行本步前必须完整阅读 `references/content-protection.md`**。对每个待翻译文件：
 
-## 第 4 步：翻译 Markdown 页面
+1. 根据文件名从映射中找到对应中文 H1（缺失时停止并报告，不得编造）。
+2. 使用 **Read** 工具从 `source_dir` 完整读取源 Markdown。
+3. 按 `references/content-protection.md` 的规则翻译为简洁技术中文，保持 Markdown 结构。
+4. 将第一个 H1 替换为 `# <target_config 中的中文标题>`。
+5. 使用 **Write** 工具以相同文件名和 UTF-8 编码写入 `target_dir`。
 
-### 全量模式
+### 第 5 步 — 生成中文文档并检查输出
 
-对 `source_dir` 中每个英文文件：
+**执行本步前必须完整阅读 `references/output-pipeline.md`**。按其命令生成中文文档（**输出目录会被重建，先清空**）并按其「验证清单」检查输出；汇总全部失败项，统一修复源（`raw_md_zh` 或 `target_config`）后重新生成并完整重检，本步全绿后才进入第 6 步。
 
-1. 根据文件名从映射中找到对应中文 H1。
-2. 使用 **Read** 工具完整读取源 Markdown。
-3. 保持 Markdown 结构。
-4. 将自然语言内容翻译为简洁技术中文。
-5. 将第一个 H1 替换为 `# <target_config 中的中文标题>`。
-6. 使用 **Write** 工具以相同文件名和 UTF-8 编码写入 `target_dir`。
+### 第 6 步 — 锚点与链接校验
 
-### 增量模式
+运行 `python -X utf8 <skill_dir>/scripts/verify_anchors.py --output-dir <output_dir>` 对生成结果做锚点与相对链接全量校验，并检查 `link_conversions.json` 中的 `(dangling anchor)` 条目；退出码 0 且无该类条目为干净。
 
-1. 使用 Glob 分别列出 `source_dir` 和 `target_dir` 中所有 `.md` 文件。
-2. 识别新文件（在 `source_dir` 中但不在 `target_dir` 中）。
-3. 对每个新文件，执行与全量模式相同的 Read → 翻译 → Write 流程。
-4. 两个目录都存在的文件，默认跳过；仅在用户明确要求时重新翻译。
-5. 报告 `target_dir` 中已不在 `source_dir` 中的文件为可能过时的文件。
+**出现任一问题时必须完整阅读 `references/link-repair.md`**，按其「链接修复循环」处理。
 
-如果某个源文件无法在本地化配置中找到标题，停止并报告。不要自行编造标题。
+生成文档的外部 URL 与 AtomGit 源链接校验由独立的 `doc-link-validator` 技能承担，用户要求交付前链接体检或检查 AtomGit 链接时调用。
+
+不要让页面翻译过程自行发挥生成 H1。配置是页面标题的唯一事实来源。
+
+## 输出摘要
+
+完成后输出：
+
+- 使用的翻译模式（全量或增量）与本地化配置路径（新建或复用）。
+- 翻译的配置标题数量、翻译的 Markdown 文件数量（增量模式含跳过的文件数）。
+- 缺少配置映射的源文件、空标题或重复标题情况。
+- `references/output-pipeline.md`「验证清单」检查结果（如有失败项）。
+- `verify_anchors.py` 校验结果（扫描文件数、问题数）。
+- 生成目录和链接转换报告路径。
 
 ## 约束
 
@@ -154,4 +155,4 @@ Do not expose these references as separate skills.
 - 不翻译代码、命令、包名、API 名、文件路径、URL、anchor 或 Mermaid 图的任何内容（包括展示标签和节点文本）。
 - 不以生成后的 `ib_robot/` 作为主要翻译源。
 - 不手工修改生成结果；应修复 `target_config` 或 `raw_md_zh` 后重新生成。
-- 禁止编写脚本执行翻译。使用 Read 工具读取源文件，使用 LLM 能力翻译，使用 Write 工具写入结果。
+- 禁止编写脚本执行翻译（见第 4 步）。

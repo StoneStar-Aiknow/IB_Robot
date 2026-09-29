@@ -25,7 +25,7 @@ def build_directory_index(display_title, sub_toctree):
 def build_main_index(index_toctree):
     main_index = ".. _ib_robot_intro:\n\nIB-Robot 具身智能套件\n################################\n\n"
     main_index += "IB-Robot（Intelligence Boom Robot）是一个将 Hugging Face LeRobot 机器学习生态系统与 ROS 2 机器人中间件连接起来的集成开发框架，旨在实现端到端的具身智能（Embodied AI）工作流。\n\n"
-    main_index += ".. toctree::\n   :maxdepth: 2\n   :caption: 内容\n\n"
+    main_index += ".. toctree::\n   :maxdepth: 2\n\n"
     for item in index_toctree:
         main_index += f"   {item}\n"
     return main_index

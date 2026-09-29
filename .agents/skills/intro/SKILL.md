@@ -61,8 +61,9 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **deepwiki-config** | 根据 DeepWiki 目录结构生成 `deepwiki_processor.py` 所需的 `doc_config.json` |
-| **deepwiki-translator** | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档 |
+| **deepwiki-config** | 根据 DeepWiki 目录结构生成或更新 `deepwiki_processor.py` 所需的 `doc_config.json` |
+| **deepwiki-translator** | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点） |
+| **doc-link-validator** | 校验文档中本地、外部与 AtomGit 链接有效性；断链检查、交付前链接体检 |
 | **mermaid-syntax-validation** | 检查、修复并验证 Markdown/Sphinx 文档中的 Mermaid 图语法 |
 
 ### 🔍 代码协作
@@ -128,6 +129,7 @@ Docker 验证一下 setup 和 build   → ibrobot-docker-verify
 新建或重构一个 skill            → skill-creator
 生成 DeepWiki 配置               → deepwiki-config
 翻译 DeepWiki 文档               → deepwiki-translator
+检查文档断链/死链               → doc-link-validator
 检查 Mermaid 图语法              → mermaid-syntax-validation
 检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
