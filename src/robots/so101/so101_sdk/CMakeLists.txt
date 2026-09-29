@@ -44,6 +44,13 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(pybind11 REQUIRED)
 pybind11_add_module(so101_sdk_py python/bindings.cpp)
 target_link_libraries(so101_sdk_py PRIVATE ${PROJECT_NAME})
+# Python3::Module leaves C-API symbols to the runtime interpreter, which the
+# OpenHarmony SDK toolchain's -Wl,--no-undefined rejects. That toolchain sets
+# CMAKE_SYSTEM_NAME=Linux, so it can only be identified by its own OHOS_ARCH
+# marker plus CMAKE_CROSSCOMPILING; native builds keep the default module link.
+if(CMAKE_CROSSCOMPILING AND OHOS_ARCH)
+  target_link_libraries(so101_sdk_py PRIVATE Python3::Python)
+endif()
 install(TARGETS so101_sdk_py
   DESTINATION lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages)
 
