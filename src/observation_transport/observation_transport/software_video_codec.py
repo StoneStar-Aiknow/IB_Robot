@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from fractions import Fraction
 from typing import Any
@@ -228,6 +229,7 @@ class SoftwareH264Decoder(VideoDecoder):
         self._codec = self._create_codec()
         self._state = CodecLifecycleState.RUNNING
         self._metrics = CodecMetrics()
+        self._metrics_started_ns = time.monotonic_ns()
         self._capture_timestamps: dict[int, int] = {}
 
     @property
@@ -252,10 +254,16 @@ class SoftwareH264Decoder(VideoDecoder):
         except Exception as exc:
             self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
             raise VideoCodecError("decode_failed", str(exc), backend="software", recoverable=True) from exc
+        elapsed_s = max((time.monotonic_ns() - self._metrics_started_ns) / 1e9, 1e-9)
+        total_input = self._metrics.input_frames + 1
+        total_output = self._metrics.output_frames + len(frames)
         self._metrics = replace(
             self._metrics,
-            output_frames=self._metrics.output_frames + len(frames),
+            input_frames=total_input,
+            output_frames=total_output,
             output_packets=self._metrics.output_packets + 1,
+            input_frame_rate_hz=total_input / elapsed_s,
+            output_frame_rate_hz=total_output / elapsed_s,
         )
         return frames
 

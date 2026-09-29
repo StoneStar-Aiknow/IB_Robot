@@ -19,6 +19,7 @@ from inference_service.software_video_codec import SoftwareH264Decoder
 from inference_service.video_codec import (
     CodecCapabilities,
     CodecLifecycleState,
+    EncodedPacket,
     VideoCodecError,
     VideoCodecRegistry,
     VideoFrame,
@@ -249,13 +250,90 @@ def test_nvenc_to_cuvid_hardware_round_trip_preserves_keyframes():
         for packet in packets:
             decoded.extend(decoder.decode(packet))
 
-    assert len(decoded) >= 10  # CUVID buffers initial frames
+    assert len(decoded) == 15
     assert all(frame.data.shape == (480, 640, 3) for frame in decoded)
     assert all(frame.width == 640 and frame.height == 480 for frame in decoded)
     assert any(frame.keyframe for frame in decoded)
     assert encoder.metrics.input_frames == 15
+    assert decoder.metrics.input_frames == 15
     assert decoder.metrics.output_frames == len(decoded)
     assert decoder.metrics.errors == 0
 
     encoder.close()
+    decoder.close()
+
+
+@pytest.mark.skipif(
+    probe_nvidia_codec("encoder") is None or probe_nvidia_codec("decoder") is None,
+    reason="NVENC or CUVID hardware is unavailable",
+)
+def test_cuvid_returns_each_access_unit_without_waiting_for_the_next():
+    # A request-driven loop sends the next frame only after this one is decoded,
+    # so a decoder that holds any frame back deadlocks it.
+    encoder = NvidiaH264Encoder(width=256, height=256, frame_rate_hz=20, bitrate_bps=4_000_000, gop_frames=15)
+    decoder = NvidiaH264Decoder(width=256, height=256, output_pixel_format="rgb24")
+
+    for index in range(20):
+        timestamp_ns = 1_000_000_000 + index * 50_000_000
+        image = np.full((256, 256, 3), (index * 37) % 256, dtype=np.uint8)
+        packets = encoder.encode(VideoFrame(image, timestamp_ns, timestamp_ns, 256, 256, "rgb24"))
+        decoded = [frame for packet in packets for frame in decoder.decode(packet)]
+
+        assert [frame.capture_timestamp_ns for frame in decoded] == [timestamp_ns], f"access unit {index}"
+        assert abs(float(decoded[0].data.mean()) - (index * 37) % 256) <= 2.0
+
+    assert decoder.metrics.input_frames == decoder.metrics.output_frames == 20
+    encoder.close()
+    decoder.close()
+
+
+class _DecodedFrame:
+    def __init__(self, pts: int) -> None:
+        self.pts = pts
+        self.width = 64
+        self.height = 48
+        self.key_frame = True
+
+    def to_ndarray(self, format: str) -> np.ndarray:
+        return np.zeros((48, 64, 3), dtype=np.uint8)
+
+
+class _AvPacket:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+
+class _CuvidCodec:
+    def __init__(self) -> None:
+        self.payloads = []
+        self.fail = False
+
+    def decode(self, packet):
+        if packet is None:
+            return []
+        if self.fail:
+            raise RuntimeError("corrupt access unit")
+        self.payloads.append(packet.payload)
+        return [_DecodedFrame(packet.pts)]
+
+
+def test_nvidia_decoder_terminates_each_access_unit_and_counts_its_input(monkeypatch):
+    codec = _CuvidCodec()
+    monkeypatch.setattr(nvidia_codec, "_load_av", lambda: SimpleNamespace(Packet=_AvPacket))
+    monkeypatch.setattr(nvidia_codec, "_create_cuvid_context", lambda _av, **_options: codec)
+    monkeypatch.setattr(nvidia_codec, "_close_codec_context", lambda _codec: None)
+    decoder = NvidiaH264Decoder(width=64, height=48, output_pixel_format="rgb24")
+    access_unit = b"\x00\x00\x00\x01\x65idr"
+
+    frames = decoder.decode(EncodedPacket(access_unit, 90_000, 1_000_000_000, keyframe=True))
+    codec.fail = True
+    with pytest.raises(VideoCodecError):
+        decoder.decode(EncodedPacket(access_unit, 93_000, 1_033_333_333, keyframe=True))
+
+    assert codec.payloads == [access_unit + b"\x00\x00\x00\x01\x09\xf0" * 2]
+    assert [frame.capture_timestamp_ns for frame in frames] == [1_000_000_000]
+    assert decoder.metrics.input_frames == decoder.metrics.output_frames == 1
+    assert decoder.metrics.errors == 1
+    assert decoder.metrics.input_frame_rate_hz > 0
+    assert decoder.metrics.output_frame_rate_hz > 0
     decoder.close()

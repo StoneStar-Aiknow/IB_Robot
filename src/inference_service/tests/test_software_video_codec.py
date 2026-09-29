@@ -39,7 +39,10 @@ def test_software_h264_round_trip_preserves_frame_metadata_and_timestamps():
     assert np.max(np.abs(decoded[-1].data.astype(np.int16) - 120)) <= 2
     assert encoder.metrics.input_frames == 4
     assert encoder.metrics.output_frames == 4
+    assert decoder.metrics.input_frames == 4
     assert decoder.metrics.output_frames == 4
+    assert decoder.metrics.input_frame_rate_hz > 0
+    assert decoder.metrics.output_frame_rate_hz > 0
 
     encoder.close()
     decoder.close()
@@ -90,6 +93,7 @@ def test_software_decoder_reports_corrupt_h264_as_recoverable_error():
     assert error.value.code == "decode_failed"
     assert error.value.recoverable is True
     assert decoder.metrics.errors == 1
+    assert decoder.metrics.input_frames == 0
     decoder.close()
 
 

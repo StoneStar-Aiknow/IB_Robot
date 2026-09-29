@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
@@ -26,6 +27,14 @@ _RTP_TIME_BASE = Fraction(1, 90_000)
 _BT709 = 1
 _COLOR_RANGE_MPEG = 1
 _COLOR_RANGE_JPEG = 2
+# Two H.264 access unit delimiters (NAL type 9). The h264_cuvid parser only
+# treats a picture as complete once it sees the start code of a following NAL
+# unit, so without a trailer frames come out one or more decode() calls late.
+# One delimiter is not enough: it is itself held back until the next start
+# code. Measured with PyAV 15.1.0 / libavcodec 61.19.101 on RTX 3090: without a
+# trailer frame N comes out 1 call late at 256x256 and 2 calls late at 640x480;
+# with two delimiters it comes out of the call that fed it.
+_ACCESS_UNIT_TRAILER = b"\x00\x00\x00\x01\x09\xf0" * 2
 
 
 def probe_nvidia_codec(kind: str) -> CodecCapabilities | None:
@@ -325,6 +334,7 @@ class NvidiaH264Decoder(VideoDecoder):
         )
         self._state = CodecLifecycleState.RUNNING
         self._metrics = CodecMetrics()
+        self._metrics_started_ns = time.monotonic_ns()
         self._capture_timestamps: dict[int, int] = {}
 
     @property
@@ -339,7 +349,7 @@ class NvidiaH264Decoder(VideoDecoder):
         if self._state is not CodecLifecycleState.RUNNING:
             raise VideoCodecError("invalid_state", f"decoder is {self._state.value}", backend=_BACKEND)
         try:
-            av_packet = self._av.Packet(packet.payload)
+            av_packet = self._av.Packet(packet.payload + _ACCESS_UNIT_TRAILER)
             av_packet.pts = packet.rtp_timestamp
             av_packet.dts = packet.rtp_timestamp
             av_packet.time_base = _RTP_TIME_BASE
@@ -349,10 +359,16 @@ class NvidiaH264Decoder(VideoDecoder):
         except Exception as exc:
             self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
             raise VideoCodecError("decode_failed", str(exc), backend=_BACKEND, recoverable=True) from exc
+        elapsed_s = max((time.monotonic_ns() - self._metrics_started_ns) / 1e9, 1e-9)
+        total_input = self._metrics.input_frames + 1
+        total_output = self._metrics.output_frames + len(frames)
         self._metrics = replace(
             self._metrics,
-            output_frames=self._metrics.output_frames + len(frames),
+            input_frames=total_input,
+            output_frames=total_output,
             output_packets=self._metrics.output_packets + 1,
+            input_frame_rate_hz=total_input / elapsed_s,
+            output_frame_rate_hz=total_output / elapsed_s,
         )
         return frames
 
@@ -415,9 +431,10 @@ def _create_cuvid_context(av: Any, *, width: int, height: int, output_pixel_form
     codec.width = width
     codec.height = height
     codec.pix_fmt = output_pixel_format
-    # CUVID otherwise buffers several frames before returning the first image.
-    # A request-driven robot loop cannot produce those future frames until the
-    # first observation is decoded, so force FFmpeg's low-delay path.
+    # A request-driven robot loop cannot produce future frames until the current
+    # observation is decoded, so the decoder must not hold frames back. The
+    # low-delay flag alone does not achieve that: the parser still waits for the
+    # next start code, which is why decode() appends _ACCESS_UNIT_TRAILER.
     codec.flags |= av.codec.context.Flags.low_delay
     codec.open()
     return codec
