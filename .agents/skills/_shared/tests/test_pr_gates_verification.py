@@ -1,29 +1,29 @@
+import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
-import verification_gate
-from verification_gate import (
-    compute_legacy_verification_inputs,
+import pr_gates
+from pr_gates import (
+    collect_diff_file_infos,
     compute_verification_inputs,
-    detect_verification_policy,
     file_triggers_dual_docker_gate,
     format_verification_metadata,
     is_wip_title,
     normalize_pr_title,
     prepare_update_verification,
-    resolve_pr_head_tree,
     resolve_pr_stage,
     upsert_verification_metadata,
     validate_verification_metadata,
     verification_inputs_placeholder_tainted,
 )
 
-_ENV = "ubuntu:ros-humble-desktop-full-jammy|openeuler:ibrobot-dev-env|policy:1"
+_ENV = "ubuntu:ros-humble-desktop-full-jammy|openeuler:ibrobot-dev-env"
 
 
 def _gated_files():
@@ -77,18 +77,6 @@ def test_gate_detects_global_and_package_dependency_changes():
     assert not file_triggers_dual_docker_gate("src/demo/package.xml", "+  <description>Updated</description>")
     assert file_triggers_dual_docker_gate("src/demo/package.xml")
     assert not file_triggers_dual_docker_gate("src/demo/setup.py")
-
-
-def test_pr_creation_requires_description_file():
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).parents[1] / "scripts" / "pr_creation.py"), "--help"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    assert "--description-file" in result.stdout
-    assert "--body" not in result.stdout
 
 
 def test_wip_title_normalization_is_explicit_and_reversible():
@@ -210,83 +198,20 @@ def test_prepare_update_accepts_new_full_block():
     assert metadata["mode"] == "full"
 
 
-def test_upsert_replaces_legacy_verified_tree():
+def test_upsert_replaces_stale_verified_tree_field():
     tree = "a" * 40
     inputs = _inputs_sha()
-    legacy = f"## Verification\n\n**Verified tree:** `{tree}`\n"
-    updated = upsert_verification_metadata(legacy, "full", inputs, tree, _ENV)
+    stale = f"## Verification\n\n**Verified tree:** `{tree}`\n"
+    updated = upsert_verification_metadata(stale, "full", inputs, tree, _ENV)
     assert "**Verified tree:**" not in updated
     assert "**Verified inputs:**" in updated
-
-
-def test_resolve_pr_head_tree_fetches_source_branch(monkeypatch):
-    head = "b" * 40
-    tree = "c" * 40
-    calls = []
-
-    def fake_run_git(args, cwd):
-        calls.append(args)
-        if args == ["rev-parse", "FETCH_HEAD"]:
-            return head
-        if args == ["rev-parse", "FETCH_HEAD^{tree}"]:
-            return tree
-        return ""
-
-    monkeypatch.setattr(verification_gate, "_run_git", fake_run_git)
-    pr = {
-        "head": {
-            "sha": head,
-            "ref": "feature/example",
-            "repo": {"html_url": "https://atomgit.com/example/IB_Robot.git"},
-        }
-    }
-
-    assert resolve_pr_head_tree(pr) == tree
-    assert [
-        "fetch",
-        "--no-tags",
-        "--depth=1",
-        pr["head"]["repo"]["html_url"],
-        "refs/heads/feature/example",
-    ] in calls
-
-
-def test_resolve_pr_head_tree_rejects_racing_head(monkeypatch):
-    monkeypatch.setattr(
-        verification_gate,
-        "_run_git",
-        lambda args, cwd: "b" * 40 if args == ["rev-parse", "FETCH_HEAD"] else "",
-    )
-    pr = {
-        "head": {
-            "sha": "a" * 40,
-            "ref": "feature/example",
-            "repo": {"html_url": "https://atomgit.com/example/IB_Robot.git"},
-        }
-    }
-
-    with pytest.raises(ValueError, match="head changed"):
-        resolve_pr_head_tree(pr)
-
-
-def test_resolve_pr_head_tree_rejects_non_https_repo():
-    pr = {
-        "head": {
-            "sha": "a" * 40,
-            "ref": "feature/example",
-            "repo": {"html_url": "file:///tmp/IB_Robot"},
-        }
-    }
-
-    with pytest.raises(ValueError, match="HTTPS repository URL"):
-        resolve_pr_head_tree(pr)
 
 
 def test_extract_accepts_list_prefix_fields():
     """Regression: Agents naturally write Markdown bullet lists; the gate must
     accept '- **label:**' and upsert must strip it before appending canonical
     lines, otherwise the description ends up with duplicate blocks."""
-    from verification_gate import extract_verification_metadata
+    from pr_gates import extract_verification_metadata
 
     inputs = _inputs_sha()
     tree = "b" * 40
@@ -312,10 +237,10 @@ def test_extract_accepts_list_prefix_fields():
     import re
 
     for label in (
-        verification_gate.VERIFICATION_MODE_LABEL,
-        verification_gate.VERIFIED_INPUTS_LABEL,
-        verification_gate.TESTED_SOURCE_TREE_LABEL,
-        verification_gate.VERIFICATION_ENVIRONMENT_LABEL,
+        pr_gates.VERIFICATION_MODE_LABEL,
+        pr_gates.VERIFIED_INPUTS_LABEL,
+        pr_gates.TESTED_SOURCE_TREE_LABEL,
+        pr_gates.VERIFICATION_ENVIRONMENT_LABEL,
     ):
         pattern = r"\*\*" + re.escape(label) + r":\*\*"
         total = len(re.findall(pattern, updated))
@@ -327,7 +252,7 @@ def test_extract_accepts_list_prefix_fields():
 def test_mismatch_errors_report_expected_values():
     """Regression: mismatch errors used to hide the expected fingerprint/tree,
     forcing the Agent to monkey-patch internal helpers to discover them."""
-    from verification_gate import validate_verification_metadata
+    from pr_gates import validate_verification_metadata
 
     inputs = _inputs_sha()
     good_tree = "b" * 40
@@ -346,7 +271,7 @@ def test_mismatch_errors_report_expected_values():
 
 
 def test_duplicate_field_error_lists_actual_counts():
-    from verification_gate import extract_verification_metadata
+    from pr_gates import extract_verification_metadata
 
     inputs = _inputs_sha()
     duplicated = (
@@ -362,38 +287,39 @@ def test_duplicate_field_error_lists_actual_counts():
 
 
 # --------------------------------------------------------------------------- #
-# Policy-versioned fingerprints (task 3.2, reviews/round-3.md R3-01 option (b),
-# design.md D3): complete v1 reusable, complete v2, placeholder v1, unknown
-# hash and missing data are fixed fixtures.
+# Fingerprint policy: the single current v2 calculator is frozen, evidence
+# recorded under the retired v1 policy no longer verifies, and incomplete
+# patches never support reuse.
 # --------------------------------------------------------------------------- #
 
 
-def test_detect_verification_policy_matches_complete_v1_and_v2():
-    files = _gated_files()
-    v2 = compute_verification_inputs(files)
-    v1 = compute_legacy_verification_inputs(files)
-    assert v1 and v2 and v1 != v2  # same records; the policy field is the only difference
-    assert detect_verification_policy(v1, v2, v1) == "1"
-    assert detect_verification_policy(v2, v2, v1) == "2"
+def test_verification_inputs_hash_is_frozen():
+    """The v2 calculator must stay byte-stable: changing record collection,
+    serialization or hashing would invalidate every recorded Docker
+    evidence hash (values cross-checked against the pre-cleanup baseline)."""
+    assert compute_verification_inputs(_gated_files()) == "7394246cb24fc1ab3e91e961eda5cf61588d6619"
+    assert (
+        compute_verification_inputs([{"filename": "requirements/ubuntu.txt", "patch": "@@ -1 +1 @@\n-old\n+new"}])
+        == "068e80ffcd1ef1aa9a8843d3c83a154d22201f7b"
+    )
+    assert compute_verification_inputs([{"filename": "requirements/ubuntu.txt", "patch": ""}]) == (
+        "e184793d3fa66fa633a8ec99105ef8d63a6ab91e"
+    )
 
 
-def test_unrelated_file_changes_do_not_affect_either_fingerprint():
-    """Task 3.2 review: v2 must stay scoped to dependency-relevant records.
-
-    An unrelated doc change (or a rename touching no gate-relevant file)
-    must not invalidate recorded evidence — the reverted file-list binding
-    broke exactly this reuse semantic."""
+def test_unrelated_file_changes_do_not_affect_the_fingerprint():
+    """v2 must stay scoped to dependency-relevant records: an unrelated doc
+    change must not invalidate recorded evidence."""
     gated = _gated_files()
     with_unrelated = gated + [
         {"filename": "docs/notes.md", "patch": "@@ -1 +1 @@\n-old\n+docs change"},
         {"filename": "src/other.py", "patch": "@@ -1 +1 @@\n-old\n+unrelated"},
     ]
     assert compute_verification_inputs(with_unrelated) == compute_verification_inputs(gated)
-    assert compute_legacy_verification_inputs(with_unrelated) == compute_legacy_verification_inputs(gated)
 
 
 def test_truncated_requirements_patch_taints_inputs_and_keeps_gate():
-    """Task 3.2 review: non-empty patches are never treated as complete.
+    """Non-empty patches are never treated as complete.
 
     The hunk below declares 3 old/new lines but carries only one body line —
     a truncated patch must enter the fingerprint as a placeholder (gate stays
@@ -401,9 +327,8 @@ def test_truncated_requirements_patch_taints_inputs_and_keeps_gate():
     truncated = [{"filename": "requirements/ubuntu.txt", "patch": "@@ -1,3 +1,3 @@\n-old\n+new"}]
     assert verification_inputs_placeholder_tainted(truncated) is True
     truncated_v2 = compute_verification_inputs(truncated)
-    truncated_v1 = compute_legacy_verification_inputs(truncated)
-    assert truncated_v2 is not None and truncated_v1 is not None  # gate stays triggered
-    assert detect_verification_policy(_inputs_sha(), truncated_v2, truncated_v1) is None
+    assert truncated_v2 is not None  # gate stays triggered
+    assert truncated_v2 != _inputs_sha()  # never matches a hash over complete inputs
 
 
 def test_flagged_truncation_taints_even_with_complete_hunks():
@@ -415,63 +340,61 @@ def test_flagged_truncation_taints_even_with_complete_hunks():
 
 
 def test_truncated_package_xml_cannot_bypass_gate():
-    """Task 3.2 review: a truncated package.xml patch whose visible part has
-    no dependency lines must NOT skip the gate — the truncation is exactly
-    where the depend lines could hide."""
+    """A truncated package.xml patch whose visible part has no dependency
+    lines must NOT skip the gate — the truncation is exactly where the
+    depend lines could hide."""
     truncated = [{"filename": "package.xml", "patch": "@@ -1,5 +1,5 @@\n+  <description>Update</description>"}]
     assert verification_inputs_placeholder_tainted(truncated) is True
     # The placeholder record keeps the gate triggered instead of returning None.
     assert compute_verification_inputs(truncated) is not None
-    assert compute_legacy_verification_inputs(truncated) is not None
 
 
-def test_detect_verification_policy_rejects_unknown_hash_and_missing_data():
+def _v1_style_hash(files: list[dict]) -> str:
+    """Hash under the retired v1 policy, constructed inline for the regression
+    tests only — production code no longer computes or accepts it."""
+    records = pr_gates._collect_verification_inputs(files)
+    payload = json.dumps({"policy": "1", "records": sorted(set(records))}, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode()).hexdigest()
+
+
+def test_v1_hash_evidence_requires_renewed_verification():
+    """Evidence recorded under the retired v1 policy no longer verifies: the
+    gate reports a mismatch and demands renewed verification instead of
+    silently relabelling or reusing it."""
     files = _gated_files()
     v2 = compute_verification_inputs(files)
-    v1 = compute_legacy_verification_inputs(files)
-    # An unknown recorded hash matches no supported policy.
-    assert detect_verification_policy("e" * 40, v2, v1) is None
-    # A missing recorded hash is not evidence at all.
-    assert detect_verification_policy(None, v2, v1) is None
-    # Missing recomputation inputs: neither policy can be recomputed.
-    assert detect_verification_policy(_inputs_sha(), None, None) is None
-    # An ambiguous match (both policies recomputing to the same hash) is refused.
-    ambiguous = _inputs_sha()
-    assert detect_verification_policy(ambiguous, ambiguous, ambiguous) is None
-
-
-def test_validate_recognizes_complete_v1_evidence_and_keeps_original_checks():
-    files = _gated_files()
-    v2 = compute_verification_inputs(files)
-    v1 = compute_legacy_verification_inputs(files)
+    v1 = _v1_style_hash(files)
     tree = "a" * 40
-    body = _full_block(tree, v1)  # a legacy four-field record carrying a v1 hash
+    assert v1 != v2
 
-    metadata = validate_verification_metadata(body, v2, tree, legacy_inputs=v1)
-    assert metadata["detected_policy"] == "1"
-
-    # Even a matched v1 record still passes through the original tree check.
-    with pytest.raises(ValueError, match="does not match current tree"):
-        validate_verification_metadata(_full_block("b" * 40, v1), v2, tree, legacy_inputs=v1)
-    # Without the legacy recomputation the same v1 record requires renewed verification.
     with pytest.raises(ValueError, match="do not match the current inputs"):
-        validate_verification_metadata(body, v2, tree)
+        validate_verification_metadata(_full_block(tree, v1), v2, tree)
+
+    # A previous body carrying v1-era evidence is not reusable either.
+    with pytest.raises(ValueError, match="full Docker verification is required"):
+        prepare_update_verification("## Changes\n\nFix a typo.\n", _full_block(tree, v1), v2, tree)
 
 
-def test_prepare_update_reuses_complete_v1_evidence_without_rewriting_hash():
-    files = _gated_files()
-    v2 = compute_verification_inputs(files)
-    v1 = compute_legacy_verification_inputs(files)
+def test_reused_environment_cannot_swap_environment():
+    """Reused evidence must keep the previously recorded environment: the same
+    inputs and tree with a different environment string claims reuse over an
+    environment that was never verified."""
+    old_tree = "a" * 40
+    new_tree = "b" * 40
+    inputs = _inputs_sha()
+    previous = _reused_block(old_tree, inputs)
+    swapped = format_verification_metadata("reused-environment", inputs, old_tree, "never-verified-env")
+
+    with pytest.raises(ValueError, match="does not match current environment"):
+        prepare_update_verification(swapped, previous, inputs, new_tree)
+
+
+def test_environment_mismatch_is_rejected():
+    inputs = _inputs_sha()
     tree = "a" * 40
-    previous = _full_block(tree, v1)  # v1-era evidence on the same inputs
-    description = "## Changes\n\nFix a typo.\n"
-
-    updated, metadata = prepare_update_verification(description, previous, v2, tree, legacy_inputs=v1)
-
-    assert metadata["detected_policy"] == "1"
-    # The carried-forward block keeps the recorded v1 hash — never rewritten as v2.
-    assert v1 in updated
-    assert v2 not in updated
+    body = _full_block(tree, inputs)
+    with pytest.raises(ValueError, match="does not match current environment"):
+        validate_verification_metadata(body, inputs, tree, expected_environment="other-env")
 
 
 def test_placeholder_tainted_inputs_keep_gate_but_never_support_reuse():
@@ -479,21 +402,105 @@ def test_placeholder_tainted_inputs_keep_gate_but_never_support_reuse():
     assert verification_inputs_placeholder_tainted(placeholder_files) is True
     # A placeholder record keeps the gate triggered (conservative)...
     placeholder_v2 = compute_verification_inputs(placeholder_files)
-    placeholder_v1 = compute_legacy_verification_inputs(placeholder_files)
-    assert placeholder_v2 is not None and placeholder_v1 is not None
+    assert placeholder_v2 is not None
     # ...but a hash recorded over complete inputs never matches the placeholder
     # recomputation, so placeholder-derived evidence cannot be reused.
-    complete_hash = _inputs_sha()
-    assert detect_verification_policy(complete_hash, placeholder_v2, placeholder_v1) is None
+    assert placeholder_v2 != _inputs_sha()
 
 
-def test_full_verification_without_legacy_recomputation_rejects_v1_hash():
-    """Without complete inputs to recompute v1, an old-style record cannot be
-    distinguished from an unknown hash and requires renewed verification."""
-    files = _gated_files()
-    v1 = compute_legacy_verification_inputs(files)
-    tree = "a" * 40
-    body = _full_block(tree, v1)
+# --------------------------------------------------------------------------- #
+# Deterministic local-git diff inputs (shared author/reviewer fingerprint
+# source; platform files-API rename pairing diverges from local git).
+# --------------------------------------------------------------------------- #
 
-    with pytest.raises(ValueError, match="do not match the current inputs"):
-        validate_verification_metadata(body, _inputs_sha(), tree, legacy_inputs=None)
+
+def _scratch_repo(tmp_path, base_files, moves=None, head_files=None):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, f"git {args}: {result.stderr}"
+        return result.stdout
+
+    def write(files):
+        for path, content in files.items():
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+    def commit(message):
+        git("add", "-A")
+        git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", message)
+
+    git("init", "-q")
+    write(base_files)
+    commit("chore: base")
+    base = git("rev-parse", "HEAD").strip()
+    for old, new in moves or []:
+        (repo / new).parent.mkdir(parents=True, exist_ok=True)
+        git("mv", "--", old, new)
+    write(head_files or {})
+    commit("feat: head")
+    head = git("rev-parse", "HEAD").strip()
+    return repo, base, head
+
+
+def _collect_from(repo, base, head):
+    def git(args):
+        result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    return collect_diff_file_infos(git, base, head)
+
+
+def test_collect_expands_pure_rename_to_full_delete_and_add(tmp_path):
+    """With pairing disabled, a pure rename is a full delete of the old path
+    plus a full add of the new path — complete content on both sides, never
+    a similarity-trimmed rename diff."""
+    repo, base, head = _scratch_repo(
+        tmp_path,
+        base_files={"requirements/ubuntu.txt": "old-a\nold-b\n"},
+        moves=[("requirements/ubuntu.txt", "requirements/server.txt")],
+    )
+    infos = _collect_from(repo, base, head)
+    by_name = {info["filename"]: info["patch"] for info in infos}
+    assert set(by_name) == {"requirements/ubuntu.txt", "requirements/server.txt"}
+    assert "+old-a\n+old-b" in by_name["requirements/server.txt"]
+    assert "-old-a\n-old-b" in by_name["requirements/ubuntu.txt"]
+
+
+def test_collect_keeps_gate_trigger_for_rename_out_of_gated_path(tmp_path):
+    """requirements/ubuntu.txt -> docs/ubuntu.txt: the delete record of the
+    old gated path keeps the gate triggered even though the new path is not
+    gate-relevant and a rename-paired entry would list only docs/ubuntu.txt."""
+    repo, base, head = _scratch_repo(
+        tmp_path,
+        base_files={"requirements/ubuntu.txt": "old-a\n"},
+        moves=[("requirements/ubuntu.txt", "docs/ubuntu.txt")],
+    )
+    infos = _collect_from(repo, base, head)
+    names = {info["filename"] for info in infos}
+    assert "requirements/ubuntu.txt" in names  # old gated path stays visible as a delete
+    assert compute_verification_inputs(infos) is not None
+
+
+def test_collect_ignores_user_diff_configuration(tmp_path):
+    """The fixed flag set must override user diff configuration so author and
+    reviewer derive identical inputs from any clone."""
+    repo, base, head = _scratch_repo(
+        tmp_path,
+        base_files={"requirements/ubuntu.txt": "old-a\nold-b\n"},
+        moves=[("requirements/ubuntu.txt", "requirements/server.txt")],
+        head_files={"requirements/server.txt": "old-a\nold-b\nserver-c\n"},
+    )
+    baseline = _collect_from(repo, base, head)
+    for key, value in (
+        ("diff.renames", "false"),
+        ("diff.renames", "copies"),
+        ("diff.algorithm", "histogram"),
+        ("diff.indentHeuristic", "true"),
+    ):
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, timeout=60)
+    assert _collect_from(repo, base, head) == baseline

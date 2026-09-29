@@ -4,171 +4,46 @@ description: "AtomGit PR 架构评审工具。当用户需要“架构审查PR�
 license: MIT
 ---
 
-# AtomGit PR Architecture Review
+# AtomGit PR 架构评审
 
-提取 PR 信息并提交 IB_Robot 架构合规审查评论到 AtomGit。
+用于 IB_Robot 的 SSOT、契约、包职责及架构一致性审查。普通 Bug/逻辑审查使用
+`atomgit-pr-review`。平台操作直接调用官方 `gitcode`，不再使用项目自动 LLM 评审脚本。
 
-在 IB_Robot 仓库中，只要用户提到 PR 的架构评审、SSOT 合规性、契约驱动检查且未明确指定 GitHub，默认视为 AtomGit 架构评审流程并优先使用本 skill。
+## 执行方式
 
-如果只是通用代码 review、逻辑检查或“帮我看看这个 PR”，应优先使用 `atomgit-pr-review`，不要直接进入本 skill。
+复用 [通用评审流程](../atomgit-pr-review/SKILL.md)：先展示问题与目标、独立方案，
+再读取实现并做比较；同样执行项目专项检查、完整性核对和发布前源仓库/head SHA 核对。
+认证、CLI 读取、分页与评论命令不在此重复，参数按 `--help` 查询。
 
-## ⚠️ 依赖准备
+分析各包前，读取 `ibrobot-architecture` 及目标分支基线的包 README，确定既有职责。
+进入实现比较后，再读取 PR head 的代码与 README，避免把 PR 的架构主张当既有约定。
+重点检查：
 
-本 skill 的平台访问走官方 AtomGit CLI（共享边界
-`.agents/skills/_shared/atomgit_cli.py`），**不再依赖** PyPI 包 `atomgit-sdk`。
+| 维度 | 要求 |
+| --- | --- |
+| SSOT | 配置来自 `robot_config` 等权威来源，不增加平行配置和硬编码 |
+| 契约 | 接口、状态和数据流明确，依赖注入与验证符合既有契约 |
+| 控制模式 | 控制模式分离、状态管理一致，安全/授权边界不被绕过 |
+| 包职责 | 按硬件/驱动/业务/模型层检查依赖；例如轻量 teleop 不吸纳重型运动规划 |
+| README | 公开接口、启动参数、配置、职责、数据流和限制与实现一致；必要变更未同步视为问题 |
+| 复用 | 先查仓库与 LeRobot 已有能力；平行 setup/推理/数据集流程必须有具体必要性论证 |
 
-- CLI 可执行文件：`gitcode`（在 PATH 上），或用环境变量
-  `IBROBOT_ATOMGIT_CLI` 指向其**绝对路径**（Graphviz 的 `gc` 会被身份检查拒绝，不要使用）
-- 认证（由 CLI 负责，脚本不读取任何 token）：
-  ```bash
-  gitcode auth login --hostname atomgit.com --with-token
-  ```
-- 目标仓库解析优先级：`config.json` 的 `atomgit.owner/repo` 默认值
-  （不再用于认证）→ 唯一 `upstream` remote
+变更量 >2000 行时审计 `## Reuse Self-Check` 四项声明，不仅看字段齐全：复用模块是否真的
+调用、重复实现是否必要、架构是否确实一致。虚假/空泛声明作为阻塞发现，优先建议接入
+已有 `inference_service`、`robot_config`、`tensormsg` 或 LeRobot 能力。
+LeRobot 源码修改走 patch 栈，不以普通根仓库 gitlink 提交替代。
 
-## ⚠️ 文件读取说明
+默认静态审查，不自行跑 lint、类型检查、build 或 Docker；用户明确要求验证时才按相应
+skill 执行。不要仅因存在 pre-commit 就宣称代码必然通过，应核对作者证据与实际 diff。
 
-**输出文件位于项目 `./tmp` 目录**，AI Agent 应使用 shell 命令读取：
+## 结果与发布
 
-```bash
-# 读取 PR 信息
-cat ./tmp/ib_robot_pr_123_arch_info.json
+按具体文件/职责给出发现，说明所属维度、影响及最小修复路径。使用
+[架构发现格式](references/review-findings.md)，直接以 Markdown 提交发现，无须生成 JSON。
+先向用户展示结果并获得发布确认，再按通用评审 skill 直接用 CLI 发表评论。
 
-# 读取架构审查结果（提交前确认）
-cat ./tmp/ib_robot_pr_123_arch_issues.json
-```
-
-**PR 正文**（AI 声明、Verification 等）在 `.pr.body` 字段。
-
-## 快速使用
-
-```bash
-# 步骤1: 提取 PR 信息
-python3 architecture_review.py --pr 123
-
-# 步骤2: 你分析代码架构并生成 arch_issues.json
-
-# 步骤3: 人类确认审查结果
-
-# 步骤4: 提交审查结果（⚠️ 必须指定 --ai-model）
-python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model glm-5.2
-```
-
-**重要**: 
-- 在步骤3，你必须将审查结果展示给人类确认后再提交
-- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `glm-5.2`、`glm-5.1`、`gpt-5.6-sol`、`gpt-5.6-terra`、`claude-fable-5`、`claude-opus-5`）
-- 文件名格式：`./tmp/{repo}_pr_{number}_arch_issues.json`
-
-## ⚠️ 禁止本地重复执行 pre-commit 已覆盖的检查
-
-- IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；开发者提交时必然已通过 ruff 校验，**PR 上线代码不会再有 `ruff check` / `ruff format` 报错**。
-- 架构审查关注的是 SSOT / 契约 / 控制流 / 包职责 / README 一致性，这些**全部可以通过静态阅读 diff 与本仓库源码（`Read` / `Grep` / `Glob`）判断**，不需要执行任何命令。
-- 因此 review 时**禁止**在本地做以下动作：
-  - `git apply` / `git checkout` / `git diff` 拼接 PR diff 后跑 `ruff check` / `ruff format --check` / `pyright` / `mypy` / `py_compile`
-  - 切到 PR 分支跑 `colcon build` 来“验证”代码能否编译——验证属于开发者侧 Verification，由代码 review skill 的门禁条款管理
-- 如怀疑某行存在风格 / 类型 / 命名问题，**直接在 inline 评论中指出并附修复建议**，由开发者在下一次提交时让 pre-commit 自动修复，不要在本地复跑。
-- **例外**：用户在当前请求中明确要求“你帮我跑一下 ruff / typecheck / build 看看”时才执行相应命令；“架构审查这个 PR”“review 架构合规”本身**不构成**授权。
-
-## 架构审查支柱
-
-此工具会检查以下 IB_Robot 架构支柱：
-
-1. **SSOT (Single Source of Truth)**
-   - 配置来源唯一性
-   - 数据流一致性
-   - API 契约统一性
-
-2. **Contract-Driven Design**
-   - 接口定义完整性
-   - 依赖注入模式
-   - 契约验证
-
-3. **Control Mode Architecture**
-   - 控制模式分离
-   - 状态管理一致性
-   - 控制流清晰度
-
-4. **Package-Specific Architecture Compliance**
-   - **核心原则**: 每个 ROS 包必须遵循其在 `ibrobot-architecture` 中定义的职责边界。
-   - **关键检查**: 
-     - 检查改动是否符合该包的设计初衷（如 `robot_teleop` 应保持轻量，不应引入运动学 IK 或重型规划逻辑）。
-     - 验证包之间的依赖是否符合分层设计，严禁职责越界。
-     - 识别“职责蔓延”：如果一个简单的驱动包开始处理复杂的业务逻辑，必须提出警告。
-
-5. **README Documentation Consistency**
-   - **核心原则**: 每个包的 `README.md` 是该包对外暴露的本地架构契约，必须与代码行为、职责边界、启动方式、配置入口、数据流和限制保持同步。
-   - **关键检查**:
-      - 如果 PR 修改了某个包的核心职责、公开接口、launch 参数、配置项、数据流、依赖边界或使用方式，必须检查该包 README 是否同步更新。
-      - 如果 README 在 PR 中被修改，必须反向检查 README 描述是否真实反映代码实现，避免文档夸大、过时或描述未实现能力。
-      - 如果代码变更使 README 关键说明失效、缺失或误导使用者，应作为架构问题提出，而不是当作普通文档风格问题忽略。
-
-6. **Reuse & Reinvention (复用与重复造轮子)**
-   - **核心原则**: 新增能力必须优先复用仓库与 `libs/lerobot` 已有实现（数据集、policies、benchmarks、推理框架、SSOT、契约），而不是另起平行流程；确需重新发明时必须有充分论证。历史教训：为 lerobot 已支持的 benchmark 重建整套 setup（[PR #309](https://atomgit.com/openeuler/IB_Robot/pull/309)）、绕开仓库既有推理框架自建一套（[PR #317](https://atomgit.com/openeuler/IB_Robot/pull/317)），这类问题逐行 diff 很难发现。
-   - **关键检查**:
-      - 超过 2000 行的 PR 必须在描述中包含完整的 `## Reuse Self-Check` 块（`Reinvented workflows` / `Reused components` / `Reinvention justification` / `Architecture conformance` 四个固定字段）；缺失或不完整是阻塞性问题（详细规则见 `atomgit-pr-review` 的 `references/ibrobot-mandatory-checks.md` §6）。
-      - 即使块完整，也必须对照 diff 审计声明是否属实：声称"未重新发明"但存在与 lerobot / 既有包功能重叠的平行实现，输出 `pillar: "reuse"` 的架构问题（severity 至少 error）。
-      - 必要性论证空泛（如"现有代码不好改"）、复用清单装饰性罗列、架构一致性声明与实际不符，均应作为架构问题提出；论证充分且合理的重新发明可放行，残余架构不一致降级为 warning/suggestion。
-      - 修复建议优先给出复用路径：改用 lerobot 对应模块、接入 `inference_service` / `robot_config` SSOT / `tensormsg`；属于 `libs/lerobot` 的改动走 `ibrobot-lerobot-patch` 导出 patch，而非在仓库内复制一份。
-
-## 架构审查协议 (Mandatory Protocol)
-
-在分析代码前，你 **必须** 遵循以下协议以确保对各包职责有准确认知：
-
-1. **同步上下文 (Context Sync)**: 
-   - 针对 PR 涉及的每一个包（如 `robot_teleop`），首先调用 `ibrobot-architecture` skill 或读取该包根目录下的 `README.md`。
-   - 确认该包的设计初衷、职责边界及禁止的行为（如禁止引入运动学、禁止直接操作硬件等）。
-2. **定位变更层级**: 判断变更文件位于哪一层（硬件层、驱动层、业务层、模型层）。
-3. **依赖审计**: 检查是否引入了不符合分层原则的跨包依赖。
-4. **SSOT 验证**: 检查配置是否统一来自 `robot_config`，严禁硬编码。
-5. **职责合规性判断**: 根据步骤 1 获取的契约，判断当前改动是否导致了“职责蔓延”或“架构违越”。
-6. **README 一致性审计 (Mandatory)**:
-   - 对 PR 涉及的每个包，必须读取最近的包级 `README.md`（通常为 `src/<package>/README.md`）。
-   - 对比 README 与本次代码改动，判断 README 是否仍准确描述包职责、关键 API/CLI/launch/config、数据流、依赖边界和已知限制。
-   - 若代码变更影响用户使用或架构契约但 README 未同步，必须输出 `pillar: "docs"` 的架构问题。
-   - 若 README 被修改但与代码实现不一致，也必须输出 `pillar: "docs"` 的架构问题。
-7. **复用自查审计 (Mandatory, >2000 行)**:
-   - PR 变更超过 2000 行（additions + deletions）时，先检查描述中的 `## Reuse Self-Check` 块是否存在且四字段完整；缺失/不完整为阻塞性问题。
-   - 再对照 diff 验证四项声明：是否有与 `libs/lerobot` 或仓库既有流程重叠的平行实现、复用清单是否真实被调用、重新发明论证是否充分、架构是否确与声明对齐的同类模块一致。
-   - 发现不实声明或无必要重复实现时，输出 `pillar: "reuse"` 的架构问题，并在 fix 中给出复用路径（lerobot 模块 / inference_service / robot_config / tensormsg，lerobot 侧改动走 patch 栈）。
-8. **输出审查结果**: 生成符合 JSON 格式的 `arch_issues.json`。
-
-## API 说明
-
-### 提取 PR 信息
-
-```bash
-python3 architecture_review.py --pr 123
-```
-
-**输出**: 项目临时目录 `./tmp/{repo}_pr_{number}_arch_info.json`
-
-### 提交架构审查
-
-```bash
-python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model glm-5.2
-```
-
-提交前脚本会做上下文绑定校验：本 PR 的 `--extract-info` 上下文必须存在且 `target`
-身份、head_source、逐文件内容完整，head SHA 仍与当前 PR head 一致；不满足即零平台
-写入拒绝并要求重新提取。
-
-## ⚠️ JSON 格式规范
-
-`arch_issues.json` 必须是数组格式（非对象），每项含 `file` / `line` / `title` / `description` / `severity` / `pillar` 必填字段。完整字段说明、JSON 示例和验证命令见 `references/json-format.md`。
-
-## 架构问题严重性
-
-- 🔴 **critical**: 违反核心架构原则
-- 🟠 **error**: 重要架构问题
-- 🟡 **warning**: 架构建议改进
-- 💡 **suggestion**: 最佳实践建议
-
-## Internal References
-
-Read only the references needed for the current scenario:
-
-| Purpose | Reference |
-|---------|-----------|
-| arch_issues.json 完整字段说明、JSON 示例、验证命令 | `references/json-format.md` |
-
-Do not expose these references as separate skills.
+发布前再次确认目标仓库/PR、源仓库与完整 head SHA 未变化，相关上下文完整。
+可定位的问题使用当前 diff new-side 行内评论；跨文件架构问题明确用 PR 级评论。
+注意 `pr comments` 回读可能缺 `path`/`position`：缺定位只是「定位未知」，不能据此
+断言某条行内评论实为 PR 级；需定位核验时在网页确认。
+读失败、版本漂移或行内位置不可证明时停止，不能发“架构通过”摘要。

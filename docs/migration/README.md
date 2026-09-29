@@ -123,7 +123,8 @@ python .agents/skills/doc-link-validator/scripts/link_validator.py \
     --report docs/migration/reports/link_validation.json
 ```
 
-AtomGit 链接校验通过官方 CLI（`gitcode`）做只读探测，运行前先执行
+链接校验是保留的批处理脚本，通过官方 CLI（`gitcode`）只读探测 AtomGit 资源；
+日常 PR/Issue 操作直接使用 CLI。运行链接校验前先执行
 `gitcode auth login --hostname atomgit.com --with-token` 完成认证。CLI 缺失或未认证时
 AtomGit 链接一律标记 `inconclusive`（不会误报 `broken`），本地与第三方外部链接照常检查。
 旧的 `--config`/`--access-token` 参数已退役，传入即报错退出。

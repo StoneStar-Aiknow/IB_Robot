@@ -429,39 +429,34 @@ IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCo
 controller 命令。自然语言 Workflow 必须先展示并 flush，随后立即进入 Gateway 校验和执行；运行中的 Agent
 不得开启 `authorize_motion`。
 
-### config.json 配置文件与 AtomGit 认证
+### AtomGit 认证与目标仓库
 
-`config.json` 用于存储 AI Agent 所需的配置信息，目前仅提供 AtomGit 目标仓库默认值：
-
-```json
-{
-  "atomgit": {
-    "owner": "openEuler",
-    "repo": "IB_Robot",
-    "baseUrl": "https://api.atomgit.com"
-  }
-}
-```
-
-AtomGit 平台访问（PR/Issue/评审评论等协作操作）全部通过官方 AtomGit CLI 完成，认证也由
-CLI 自己管理；脚本不再读取 `config.json` 中的 token，也不再使用 `ATOMGIT_TOKEN` 环境
-变量。若旧配置中仍残留 `token` 字段，它会被忽略，请自行清理。
+Agent 直接使用官方 `gitcode` 处理 PR、Issue 和评审。
+仓库根目录的 `config.json` 及 token/owner/repo/baseUrl 读取逻辑已删除。
+认证仍由 CLI 自己的配置管理，不删除 CLI 登录配置。
+操作时显式指定 `-R owner/repo`（目标仓库不要从个人 fork 的 `origin` 推断）。
+模型配置和 DeepWiki 的 `doc_config.json` 不受影响。
 
 **安装与认证**：
 
-1. 安装官方 AtomGit CLI（项目内隔离安装在 `tmp/tools/atomgit-cli/`，`gitcode` 入口，
-   已验证版本 v0.14.1；不要覆盖系统的 Graphviz `gc` 命令）。
+1. 将官方 AtomGit CLI 安装到 `/usr/local/bin/gitcode` 并确保该目录在 PATH 上。
+   升级时更新同一个可执行文件；保留系统 Graphviz 的 `/usr/bin/gc`。
+   具体步骤见[安装说明](docs/atomgit_cli_migration.md#正式安装linux)。
 2. 访问 <https://atomgit.com> → 右上角头像 → 个人设置 → 「访问令牌」→ 新建访问令牌
    （勾选 `repo` 和 `pull_request` 权限），**立即复制保存**（只显示一次）。
-3. 完成认证（token 经 stdin 传入，不落盘）：
+3. 在私密终端完成认证（凭证存储由 CLI 管理；stdin 输入不代表不会持久保存）：
 
 ```bash
 gitcode auth login --hostname atomgit.com --with-token
-gitcode auth status   # 验证认证状态
+GC_HOST=atomgit.com gitcode auth status   # 验证 AtomGit 认证状态
 ```
 
-CLI 缺失或未认证时，协作脚本会以非零退出码报错并给出上述指引；`intro` 等非阻塞检查
-则把平台部分标记为不可用，不影响本地功能。
+CLI 缺失、非官方或未认证时，链接校验把受影响的 AtomGit 链接明确报告为 inconclusive
+（不会误报断链）；inconclusive 本身默认不导致失败，`--fail-on-inconclusive`
+可将其视为失败，详见 [doc-link-validator](.agents/skills/doc-link-validator/SKILL.md)。
+同一批中的真实断链——包括 `/bolb/` 路由拼写等离线即可判定的错误——仍照常判
+broken 并使校验失败，不因 CLI 不可用而被掩盖。
+`intro` 为纯本地检查，不访问平台，也不依赖 CLI 认证。
 
 ### 支持的 Agent
 

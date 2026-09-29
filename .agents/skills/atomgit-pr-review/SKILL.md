@@ -4,126 +4,84 @@ description: "AtomGit PR 评审工具。当用户需要在本仓库或 AtomGit �
 license: MIT
 ---
 
-# AtomGit PR Review
+# AtomGit PR 评审
 
-提取适合 review 的完整 PR 上下文，并提交代码审查评论到 AtomGit。
+Agent 直接使用官方 `gitcode` 获取上下文和发布评论，参数按需查 `--help`。
+本仓库 PR 默认指 AtomGit；先确认目标 owner/repo/编号，每次指定 `GC_HOST=atomgit.com`
+和 `-R owner/repo`，不能把个人 fork 的 `origin` 当作目标。认证由 CLI 管理。
 
-## ⚠️ 依赖准备
+## 三步法（默认必做）
 
-本 skill 的平台访问走官方 AtomGit CLI（共享边界
-`.agents/skills/_shared/atomgit_cli.py`），**不再依赖** PyPI 包 `atomgit-sdk`。
+1. **问题与目标**：只读标题、正文、关联 Issue 和 commit message，说明问题、预期行为及成功标准。
+2. **独立方案**：在读 PR 实现前给出自己的最小方案；必要时只读目标分支基线的文档/接口。
+3. **实现对比**：先做专项检查，再读 patch、源代码、测试和既有评论，对照方案判断正确性。
 
-- CLI 可执行文件：`gitcode`（在 PATH 上），或用环境变量
-  `IBROBOT_ATOMGIT_CLI` 指向其**绝对路径**（Graphviz 的 `gc` 会被身份检查拒绝，不要使用）
-- 认证（由 CLI 负责，脚本不读取任何 token）：
-  ```bash
-  gitcode auth login --hostname atomgit.com --with-token
-  ```
-- 目标仓库解析优先级：显式 `--owner/--repo` 或 `--url` → `config.json` 的
-  `atomgit.owner/repo` 默认值（不再用于认证）→ 唯一 `upstream` remote
+前两步的简短产出必须展示给用户，再进入第三步，无需额外确认。前两步不读 patch、
+变更后源码或 review 评论，也不委派读取实现。抓取数据到文件不等于允许提前阅读。
+小 PR、快速审查和“无问题”结论也遵循此顺序。上下文已经暴露实现时说明独立性受限，
+仍先写目标与候选方案，不声称未读过实现。中断后沿用已展示的产出。
 
-## 默认执行协议：三步法是门禁，不是可选建议
+## 读取与审计
 
-**每次代码评审都自动执行「理解问题 → 独立方案 → 实现对比」，无需用户强调“三步法”。**
-“快速看一下”“只找 Bug”、小 PR、无问题结论以及从其他 skill 转入，都不豁免该顺序；可以缩短产出，不能省略阶段。
-仅提取信息或提交已经确认的结果不算新一轮代码评审，不得借此声称完成了三步法。
-
-- 开始评审时建立三个顺序任务：理解问题、独立方案、实现对比；同时只推进一个阶段。
-- **读取实现前，必须先向用户展示「第 1 步：问题与目标」和「第 2 步：独立方案」的简短产出**，不能只在内部思考，也不能读完代码再倒填。两项可以合并在同一条进度消息中，无需等待确认即可进入第 3 步。
-- 前两步禁止读取 PR 的 patch、变更后源码、已有 review 评论，禁止启动读实现的子 agent；提取脚本把这些内容写入文件不等于允许读取。使用下方的字段投影，不要直接打开整个 `info.json`。
-- 第 3 步才处理专项门禁、读实现和评论。发现阻塞问题也不能用元数据检查替代代码评审；上下文不足则明确报告未完成范围。
-- 用户消息或先前上下文已暴露实现时，明确说明独立性受限，仍先写问题与候选方案，再开始对比；不得声称“未看实现”。中断恢复时保留已展示的前两步产出；缺失时先补齐并披露已读范围。
-- 本 skill 的 Agent 评审使用提取/人工确认/提交路径，不使用直接逐文件调用 LLM 的 `--auto` 路径代替三步法。
-
-在 IB_Robot 仓库中，只要用户提到 review / 审查 / 审阅 PR 且未明确指定 GitHub，默认视为 AtomGit PR 评审流程并优先使用本 skill。
-
-本 skill 支持对 **任意 AtomGit 仓库的 PR** 做通用代码审查：
-
-- `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
-- `--url`: 从 AtomGit / GitCode 的 PR 链接自动解析 `owner/repo/pr_number`
-
-当用户的目标是"**review 一个 PR / 帮我看看这个 PR 有没有问题**"时，优先使用本 skill。**不需要**先切到 `atomgit-pr` 获取上下文；本 skill 的提取模式默认就会带出 PR 现有评论。
-
-## Internal References
-
-Read only the references needed for the current step:
-
-| Purpose | Reference |
-|---------|-----------|
-| IB_Robot 专项审查要求（lerobot gitlink / README 联动 / Verification / AI 元数据 / pre-commit 信任） | `references/ibrobot-mandatory-checks.md` |
-| API 参考与 issues.json 格式（提取上下文、提交结果、字段说明） | `references/api-and-issues-format.md` |
-
-Do not expose these references as separate skills.
-
-## IB_Robot 专项审查要求（摘要）
-
-在 IB_Robot 仓库做 review 时，必须遵守以下 6 项专项要求（详细规则见 `references/ibrobot-mandatory-checks.md`）：
-
-1. **`libs/lerobot` gitlink 强制检查（阻塞性）**：每个 PR 都必须检查 `libs/lerobot` 是否发生 gitlink 指针变化；违规指针变更应提交 severity=error 的阻塞性 issue。
-2. **README / 文档联动检查**：根据变更是否影响用户可见的使用方式决定是否要求同步更新文档，不机械要求所有 PR 都改 README。
-3. **依赖 / setup / build 变更的 Verification 强制门禁**：标题以 `[WIP]` 开头时暂缓双平台 Docker 证据检查，表示 PR 尚未准备好正式检视。移除 `[WIP]` 后，相关 PR 必须提供双平台 Verification，且结构化 `## Docker Verification` 块中的 `Verified inputs` 必须匹配当前输入指纹。`full` 模式还要求 `Tested source tree` 匹配最新 head tree；`reused-environment` 模式允许复用旧 tree。review 默认只检查声明，不自动执行验证。
-4. **禁止本地重复执行 pre-commit 已覆盖的检查**：信任 pre-commit 已通过的 ruff/format；不要本地复跑 lint/build；静态阅读 diff 始终允许。
-5. **openEuler AI 元数据检查（阻塞性）**：AI 参与时检查 PR 的 Tool/Model/Prompt Summary、人工审查、第三方材料/许可证披露，以及 Agent 工具字段是否为具体名称和版本、PR 模型集合是否覆盖所有 commit 的 AI `Co-Authored-By`。不同 commit 可以使用不同模型；人类 `Name <email>` trailer 不参与模型比较。
-6. **大型 PR 复用自查门禁（阻塞性）**：变更超过 2000 行（additions + deletions）的 PR 必须在描述中包含完整的结构化 `## Reuse Self-Check` 块（四个固定字段：`Reinvented workflows` / `Reused components` / `Reinvention justification` / `Architecture conformance`）；缺失、不完整或格式歧义分别由 `large_pr_reuse_self_check_missing` / `large_pr_reuse_self_check_incomplete` / `large_pr_reuse_self_check_invalid` 标记。`[WIP]` 不豁免本门禁。块存在且完整时，reviewer 还必须**对照 diff 审计四项声明是否属实**（是否真的没有重新发明 `libs/lerobot` 或仓库既有流程、架构是否确与同类功能一致），发现不实声明按阻塞性问题处理。
-
-## 评审三步法
-
-| 阶段 | 允许读取与执行 | 必须展示的产出 / 放行条件 |
-|------|----------------|-------------------------|
-| 第 1 步：问题与目标 | PR 标题、描述、关联 Issue、commit message；区分作者的问题陈述与实现主张 | 用一两句话说明问题、预期行为和成功标准；无法确定时先澄清，不进入下一步 |
-| 第 2 步：独立方案 | 基于目标提出自己的最小方案；需要背景时只读可确认属于目标分支基线的文档、接口或源码，记录来源，不读 PR head | 说明模块/职责边界、复用点、数据流或接口契约，以及关键验证场景；小修改可压缩成几句，不能仅写“按现有实现修改” |
-| 第 3 步：实现对比 | 先处理专项检查，再细读 patch、必要的完整源码、提交历史和已有评论；此时才可并行分配代码审查 | 对照第 2 步逐项判断：是否解决目标、差异及取舍、边界场景、验证缺口；给出有文件/行号证据的发现 |
-
-独立方案是比较基准，不是唯一正确答案。作者方案更优或同样合理时明确接受；纯方案偏好只作建议，不能直接判为 Bug。
-已有评论在第 3 步用于复核和去重，不能代替独立评审。委派时向子 agent 传递问题陈述与独立方案，主 agent 负责汇总对比。
-
-最终结果以发现为先，随后附简短的「方案对比」和验证/未覆盖范围；无发现时也必须说明对比结果，不能只写“LGTM”。
-生成 `issues.json` 时沿用现有字段，对比依据写入相关问题的描述/修复说明，不为凑三步法新增虚构问题或 JSON 字段。
-
-## 执行命令
-
-在目标工作区根目录运行；Python 命令前加载 `ibrobot-env`，worktree 中加载 `ibrobot-worktree-env`，并在同次调用中 `source .shrc_local`。
-以下以 PR 123 为例，URL / owner / repo 模式保持相同流程。
+以下以 PR 123 为例，执行前替换为确认的目标，先创建 `tmp/`。
 
 ```bash
-# 准备：提取上下文到文件，不直接读取完整 JSON
-source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/pr_review.py --pr 123
-
-# 第 1 步：只投影问题背景，关联 Issue 需另外读取
-jq '{pr: (.pr | {number, title, body, head_sha}), commits: [.commits[] | {sha, message}]}' ./tmp/ib_robot_pr_123_info.json
-
-# 第 2 步：向用户展示问题与独立方案后，才可执行下列读取
-
-# 第 3 步：专项检查、实现与已有评论
-jq '.pr.mandatory_review_checks, .pr.changed_files, .comments' ./tmp/ib_robot_pr_123_info.json
-
-# 收尾：生成 issues.json，将结果展示给人类确认
-
-# 仅在确认后提交；模型参数替换为真实模型名称
-source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model <your-model-name>
+GC_HOST=atomgit.com gitcode pr view 123 -R openEuler/IB_Robot --json > tmp/pr.json
+# 第一步只读元数据，不打开整个带实现信息的文件
+jq '{number,title,body,head: (.head | {sha,ref,repo})}' tmp/pr.json
+GC_HOST=atomgit.com gitcode api 'repos/openEuler/IB_Robot/pulls/123/commits?page=1&per_page=100' > tmp/commits-page1.json
+# 第三步再读取文件 diff 和已有评论
+GC_HOST=atomgit.com gitcode api 'repos/openEuler/IB_Robot/pulls/123/files?page=1&per_page=100' > tmp/files-page1.json
+GC_HOST=atomgit.com gitcode pr comments 123 -R openEuler/IB_Robot --limit 0 --json > tmp/comments.json
 ```
 
-**重要**: 
-- 提交前必须将具体审查结果展示给人类并获得确认；“review 这个 PR”不等于确认发布结果
-- **提交必须指定 `--ai-model` 参数**，使用你的真实模型名称
-- 提交前脚本会做上下文绑定校验：本 PR 的 `--extract-info` 上下文必须存在且 `target`
-  身份、head_source、逐文件内容完整，head SHA 仍与当前 PR head 一致；不满足即零平台
-  写入拒绝并要求重新提取（PR 更新后需重新走提取与审查）
-- 文件名格式：`./tmp/{repo}_pr_{number}_issues.json`（例如：`./tmp/ib_robot_pr_123_issues.json`）
-- 进行 IB_Robot PR review 时，必须在第 3 步开始时处理 `.pr.mandatory_review_checks`，重点检查
-  `libs/lerobot` gitlink；此外还要检查 README / 文档是否应随变更同步，以及 PR 描述中的
-  非 WIP PR 的 Verification 是否覆盖双平台，以及结构化 `## Docker Verification` 块是否有效；
-  超过 2000 行的 PR 还要处理 `large_pr_reuse_self_check_*` 检查项并审计
-  `## Reuse Self-Check` 声明与 diff 的一致性（`.pr.reuse_self_check` 给出行数与状态）
+`api` 原生输出 JSON，**没有 `--json` 或 `--paginate` 参数**。逐页读取并将完整集合保存为
+`tmp/files.json` / `tmp/commits.json`，按唯一 filename/sha 核对 `pr.json` 的
+`changed_files` / `commits` 总数。重复页不证明完整，失败/缺字段不能当空数据。
+`pr diff --json` 是统计摘要；完整 patch 使用 files 中的 `patch.diff`。
 
-API 参数详情、issues.json 字段说明、大文件处理技巧和 config.json 配置见 `references/api-and-issues-format.md`。
+记录目标仓库/PR、head 的源仓库身份与完整 SHA。源码读取必须来自该源仓库及 SHA，
+不能从目标仓库 HEAD 猜测；相关文件上下文无法完整读取时，标明未评审范围，不发布通过结论。
 
-## Related Skills
+第三步用本地审计入口处理项目检查，然后继续代码分析：
 
-- `atomgit-pr`: 创建 PR、同步标题/描述、获取 PR 管理上下文；**不负责**通用 review 判定
-- `atomgit-review-resolution`: 处理检视意见
-- `atomgit-pr-architecture-review`: 架构审查
-- `ibrobot-docker-verify`: Ubuntu 22.04 纯净容器 setup/build 验证；review 默认不得调用，除非用户明确要求 agent 实际执行验证
-- `ibrobot-docker-verify-oee`: openEuler Embedded 纯净容器 setup/build 验证；review 默认不得调用，除非用户明确要求 agent 实际执行验证
+```bash
+source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/review_gates.py \
+  --pr-json tmp/pr.json --files-json tmp/files.json --commits-json tmp/commits.json \
+  --output tmp/review-checks.json
+```
 
-> **注意**: `atomgit-pr-architecture-review` 仍然是 **IB_Robot 专用** 的架构规范审查，不会随着本 skill 一起泛化到其他仓库。
+退出 0 表示审计执行完，不表示通过：`checks` 中的阻塞项必须处理或列为发现。
+Docker 指纹来自作者/评审共用的本地确定性 diff（非 WIP 时 base、head 均需先 fetch 到
+本地；固定 flag 集禁用 rename 配对）；`pr.json` 的 base/head SHA 任一不可本地解析时给出
+`docker_verification_inputs_unavailable` 阻塞项，不得用平台 files 顶替或拿任意本地 HEAD
+充当 PR head。平台 files 的 rename 配对与本地 git 可能不同（PR460 实测平台 61、本地默认
+62、`--no-renames` 65）；计数差异不能只引用该现象放行——逐路径比对并以 base/head 树核对
+确认差异确为 rename 配对，核对后仍无法解释的差异按清单不完整处理。
+
+专项检查：LeRobot gitlink/patch 管理、README 联动、非 WIP 的 Docker 证据、DCO/AI 披露、
+大型 PR 的复用自查；具体判定见 [专项检查](references/ibrobot-mandatory-checks.md)。
+只做 review 默认静态分析，不重复执行 lint/build/Docker；用户明确要求验证时按对应 skill 执行。
+
+## 结论与发布
+
+先展示具体发现，包含严重性、文件/行号、触发条件、影响和修复方向，附简短方案对比及
+验证/未覆盖范围。没有发现也说明对比结果，不能仅写 LGTM。
+**发布必须有针对具体审查结果的人类确认**；单纯“review PR”不等于授权发表评论。
+
+发布前重新 `pr view`，核对目标、源仓库和完整 head SHA 与审查时一致；版本变化或身份
+不可证明时停止并重新评审。行内位置必须在当前 diff 的 new 侧可见，删除行不猜定位。
+跨文件问题可明确发 PR 级评论；无法定位的行内问题不能静默降级。
+
+```bash
+GC_HOST=atomgit.com gitcode pr comment 123 -R openEuler/IB_Robot --body-file tmp/review.md --json --no-interactive
+GC_HOST=atomgit.com gitcode pr comment 123 -R openEuler/IB_Robot --path src/example.py \
+  --position 42 --body-file tmp/finding.md --json --no-interactive
+```
+
+评论末尾标注 `🤖 generated by ai@<真实模型名>`，格式见
+[读取与评论说明](references/api-and-issues-format.md)。发布后回读核对；注意回读不返回
+`path`/`position`——缺定位只能记为「定位未知」，不能据此断言 PR 级，需定位核验时在网页
+确认。发布响应与列表的 id 类型可能不同（本次观察到十六进制与数字并存），按各响应保留
+原值、不互转，线程关联用 `discussion_id`；超时/非零退出可能已发表，不自动重发。修复和线程跟进走 `atomgit-review-resolution`；
+SSOT/包职责专题使用 `atomgit-pr-architecture-review`。

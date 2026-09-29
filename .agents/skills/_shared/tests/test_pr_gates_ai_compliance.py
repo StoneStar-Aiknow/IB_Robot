@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from ai_compliance import (
+from pr_gates import (
     DISCLOSURE_END,
     DISCLOSURE_START,
     add_ai_disclosure,

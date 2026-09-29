@@ -1,6 +1,6 @@
 ---
 name: ibrobot-git-flow
-description: "Handles Git commit and push workflow with Euler compliance. Use when user asks to 'git commit', 'git push', '提交代码', '推送代码', 'git status', 'commit -s', 'DCO sign-off', 'check git message', 'euler compliance', '符合规范'. Triggers for 'push to fork', 'commit changes', '提交', '检查提交信息', '整理 PR commits', 'fixup', 'autosquash', 'squash', 'PR commit太多', or when preparing code for submission. For AtomGit review comment resolution (replying to comments, applying review fixes via the resolution script), use atomgit-review-resolution instead."
+description: "Handles Git commit and push workflow with Euler compliance. Use when user asks to 'git commit', 'git push', '提交代码', '推送代码', 'git status', 'commit -s', 'DCO sign-off', 'check git message', 'euler compliance', '符合规范'. Triggers for 'push to fork', 'commit changes', '提交', '检查提交信息', '整理 PR commits', 'fixup', 'autosquash', 'squash', 'PR commit太多', or when preparing code for submission. For AtomGit review comment resolution (replying to comments, following up on review fixes with the CLI), use atomgit-review-resolution instead."
 ---
 
 # IB_Robot Git Workflow Guide
@@ -83,15 +83,16 @@ Must strictly follow this structure with exactly one blank line between sections
   in a commit but absent from the PR disclosure is a blocking error. Purely human commits need no AI trailer.
   The model set is defined over **all commits of the PR**: when pushing new commits to a branch that already has an
   open PR — including commits authored in another session or by another agent — merge the new commit models into the
-  disclosure. After the push, immediately refresh the PR description via `pr_management.py --update-pr`; the script
-  re-validates coverage against the remote PR commits and rejects any missing model.
+  disclosure. After the push, immediately refresh the PR description: regenerate the body through
+  `pr_body_gate.py` (it re-validates the model union against all local PR commits and rejects any missing model),
+  then publish with `gitcode pr edit`.
 - **Verify Agent tool provenance**: Before invoking the PR workflow, the coding agent must run the actual tool's
   `--version` (or equivalent) command and pass the observed tool name/version as `--agent-tool`. The repository
   must not maintain an exhaustive tool allowlist or execute arbitrary unknown tools; the workflow only validates
   that the supplied provenance is concrete, versioned, and safe to include in Markdown.
-- **Human responsibility and provenance**: The user's explicit request to commit, push, or submit a PR in the current
-  conversation counts as the human review confirmation of the AI-assisted changes; third-party materials and licenses
-  are taken from what the user provides. Do NOT block the flow with interactive ask-user prompts for confirmation.
+- **Human responsibility and provenance**: The user's explicit request authorizes commit, push or PR publication. It does not prove
+  that substantive human review is complete. Record human review as pending unless the developer explicitly
+  confirms completion; do not ask again for publication authorization that is already present.
   Still refuse clearly unexplained, sensitive, confidential, or license-incompatible content. Follow the openEuler
   policy at <https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>.
 - **Remote repositories**:
@@ -194,15 +195,15 @@ For root repository:
 6. If NOT "local commit only":
    - Execute `git push origin <branch>` for a normal fast-forward push. For amend/rebase pushes, capture the remote OID **before** rewriting and use the explicit OID-bound lease from §3; a bare `--force-with-lease` is not allowed.
    - **Get remote info**: Extract username and repo name via `git remote get-url origin`.
-   - **Check for existing PR**: After push, check whether this branch already has an open PR on the target repo. If the push output or remote hook response contains a PR/MR URL, extract the PR number. Otherwise, query via `pr_management.py --fetch-info` or check AtomGit UI.
+   - **Check for existing PR**: After push, check whether this branch already has an open PR on the target repo. If the push output or remote hook response contains a PR/MR URL, extract the PR number. Otherwise, query via `GC_HOST=atomgit.com gitcode pr list -R <target-owner/repo> --state open --paginate --json`.
    - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
-     1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
+     1. Use `GC_HOST=atomgit.com gitcode pr view <NUM> -R <target-owner/repo> --json` and the CLI API files/commits endpoints; check pagination completeness.
      2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
      3. Before updating, collect the `Co-Authored-By` models from **every** PR commit (including commits pushed by
         other sessions or agents) and pass the full union via `--ai-model`; the update script validates coverage
-        against the remote PR commits and rejects missing models.
+        against the fetched local PR commit range and rejects missing models. Confirm local and remote head/base identity before use.
      4. If the PR context triggers the verification gate, ask for WIP/review stage. For WIP, keep `[WIP]` and skip Docker. For review, run both Docker skills against the latest remote head tree and include the structured `## Docker Verification` block. When inputs unchanged, the workflow auto-inserts a `reused-environment` block.
-     4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json --pr-stage <wip|review>`.
+     4. Generate the final Markdown body with `pr_body_gate.py` as documented in `atomgit-pr`, then run `GC_HOST=atomgit.com gitcode pr edit <NUM> -R <target-owner/repo> --body-file <gated-body.md> --title <gated-title> --draft <true|false> --json`. Read back title, body, head and draft state.
    - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
 
 For submodule `libs/lerobot` (only when user explicitly asks):

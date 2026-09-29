@@ -1,7 +1,7 @@
-"""Fake AtomGit CLI used by the shared-boundary behavior tests (task 2.4).
+"""Fake AtomGit CLI used by the doc-link-validator behavior tests.
 
 This module is executed through a generated launcher script (shebang points
-at the current Python interpreter) so the boundary treats it exactly like a
+at the current Python interpreter) so the validator treats it exactly like a
 real executable: argv arrives via execve, stdin is a real pipe/DEVNULL, and
 the exit code is a real process exit. Every invocation is appended as one
 JSON line to ``$FAKE_CLI_RECORD`` for assertions.

@@ -5,7 +5,7 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
 
 # 链接校验器
 
-对文档树做只读链接体检：本地相对链接查目标文件与锚点存在性，外部 URL 发真实 HTTP 请求，AtomGit 链接通过官方 CLI 逐类验证存在性。入口为 `scripts/link_validator.py`，复用相邻的 `_shared/atomgit_cli.py`；迁移到其他仓库时需一并提供共享边界与官方 CLI。
+对文档树做只读链接体检：本地相对链接查目标文件与锚点存在性，外部 URL 发真实 HTTP 请求，AtomGit 链接通过官方 CLI 逐类验证存在性。入口为 `scripts/link_validator.py`，脚本内自含最小只读 CLI 调用（argv 列表、超时、`GC_HOST` 钉定、`gitcode version` 身份探测），不依赖任何跨技能共享模块；迁移到其他仓库时携带本技能目录（含 `scripts/` 与 `tests/`）与官方 CLI 即可独立运行。
 
 ## 何时调用
 
@@ -48,19 +48,21 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
 | `error` | 网络层失败或超时 | 排查网络后重跑，不计为文档缺陷 |
 | `inconclusive` | 无法确认：CLI 不可用或未认证的 AtomGit 链接、fragment 近似算法未命中 | 按发布要求决定是否人工复核；需严格阻断时加 `--fail-on-inconclusive` |
 
-退出码：`0` 通过（允许存在 inconclusive）；`1` 存在 `broken` / `auth_error` / `error`（或开启 `--fail-on-inconclusive` 时的 inconclusive）；`2` 参数错误（包括已退役的 `--config` / `--access-token`）。
+退出码：`0` 通过（允许存在 inconclusive）；`1` 存在 `broken` / `auth_error` / `error`（或开启 `--fail-on-inconclusive` 时的 inconclusive）；`2` 参数错误。
 
 **`broken` 与 `inconclusive` 必须区分对待**：前者是确定缺陷，后者是"没法确认"——把 inconclusive 当 broken 修或直接忽略，都是本技能最常见的误用方式。
 
 ## CLI 认证（AtomGit）
 
-安装官方 CLI（已验证 v0.14.1），确保 `gitcode` 在 PATH，或使用 `IBROBOT_ATOMGIT_CLI`
-指定绝对路径。运行 `gitcode auth login --hostname atomgit.com` 完成认证；凭证由 CLI 管理，
-脚本不读取 token。旧 `--config` / `--access-token` 参数已退役，传入即退出 2。
+安装官方 CLI（历史验证版本 v0.14.1，不作为版本约束；脚本只校验可执行文件身份），确保
+`gitcode` 在 PATH，或使用 `IBROBOT_ATOMGIT_CLI` 指定绝对路径。运行
+`gitcode auth login --hostname atomgit.com` 完成认证；凭证由 CLI 管理，脚本不读取 token，
+也不接受任何 token 参数。
 
-AtomGit 平台不存在（CLI exit 3）才判为 broken；CLI 缺失、未认证、权限不足或网络失败均明确
-报告 inconclusive，不误报断链；本地和第三方外部链接仍照常校验。结果不确定时可以通过
-`--fail-on-inconclusive` 阻止交付。正式安装说明见 `docs/atomgit_cli_migration.md`。
+AtomGit 平台不存在（CLI exit 3）才判为 broken；CLI 缺失、非官方同名可执行文件、未认证、
+权限不足或网络失败均明确报告 inconclusive，不误报断链；本地和第三方外部链接仍照常校验。
+结果不确定时可以通过 `--fail-on-inconclusive` 阻止交付。正式安装说明见
+`docs/atomgit_cli_migration.md`。
 
 ## 行为边界
 

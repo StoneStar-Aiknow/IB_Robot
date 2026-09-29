@@ -4,147 +4,55 @@ description: "AtomGit Issue 工作流工具。当用户需要在本仓库或 Ato
 license: MIT
 ---
 
-# AtomGit Issue Workflow Tool
+# AtomGit Issue
 
-创建、读取、更新或关闭 Issue。
+Agent 直接使用官方 `gitcode`，不调用项目 CRUD 包装脚本。参数按需查看
+`gitcode issue <command> --help`。本仓库的 Issue 默认指 AtomGit，除非用户明确指定 GitHub。
 
-在 IB_Robot 仓库中，只要用户提到 Issue / bug / feature request 且未明确指定 GitHub，默认视为 AtomGit 工作流并优先使用本 skill。
+## 目标与认证
 
-本 skill 支持对 **任意 AtomGit 仓库** 指定目标：
+- 从用户链接/明确指定的仓库确认 owner/repo/Issue 编号；信息冲突时先澄清。
+  未指定仓库时可参考唯一 `upstream`，再显式传入 `-R`。
+  `origin` 是个人 fork，不能自动当作目标；仓库级 `config.json` 已删除。
+- 使用 PATH 上的 `gitcode`（不是 Graphviz `gc`），每次指定 `GC_HOST=atomgit.com`。
+- 未认证时指引用户在私密终端运行 `gitcode auth login --hostname atomgit.com`；
+  不读取旧 token，不把凭证写进命令正文或日志。
 
-- `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
-- `--url`: 从 AtomGit / GitCode 的 Issue 或仓库链接自动解析 `owner/repo/issue_number`
+## 常用操作
 
-## ⚠️ 依赖准备
-
-本 skill 的平台访问走官方 AtomGit CLI（共享边界
-`.agents/skills/_shared/atomgit_cli.py`），**不再依赖** PyPI 包 `atomgit-sdk`。
-
-- CLI 可执行文件：`gitcode`（在 PATH 上），或用环境变量
-  `IBROBOT_ATOMGIT_CLI` 指向其**绝对路径**（Graphviz 的 `gc` 会被身份检查拒绝，不要使用）
-- 认证（由 CLI 负责，脚本不读取任何 token）：
-  ```bash
-  gitcode auth login --hostname atomgit.com --with-token
-  ```
-- 目标仓库解析优先级：显式 `--owner/--repo` 或 `--url` → `config.json` 的
-  `atomgit.owner/repo` 默认值（不再用于认证）→ 唯一 `upstream` remote
-
-## ⚠️ 获取仓库配置（必需）
-
-在使用前，建议通过 `git remote -v` 确认仓库的 owner 和 repo：
+以下以 `openEuler/IB_Robot` 的 Issue 123 为例，执行前替换为已确认的目标。
+正文写入本地文件，保持换行和特殊字符原样。
 
 ```bash
-git remote -v
+GC_HOST=atomgit.com gitcode issue view 123 -R openEuler/IB_Robot --json
+GC_HOST=atomgit.com gitcode issue comments 123 -R openEuler/IB_Robot --limit 0 --order asc --json
+GC_HOST=atomgit.com gitcode issue create -R openEuler/IB_Robot --title '具体问题' --body-file tmp/issue.md --json --no-interactive
+GC_HOST=atomgit.com gitcode issue comment 123 -R openEuler/IB_Robot --body-file tmp/comment.md --json --no-interactive
+GC_HOST=atomgit.com gitcode issue edit 123 -R openEuler/IB_Robot --body-file tmp/issue.md --json --no-interactive
+GC_HOST=atomgit.com gitcode issue edit 123 -R openEuler/IB_Robot --state closed --yes --json --no-interactive
+# 重开：将上行 --state closed 改为 --state reopen
 ```
 
-脚本会自动从环境变量或 `git remote` 中推断，也可以通过参数指定。
+写入后回读资源，确认目标、正文和状态。创建超时、非零退出或未返回编号都可能已经写入，
+先查询核对，不能盲目重复创建或评论。读取失败不能当作“没有 Issue/评论”。
+`issue list` 的分页参数以本机 help 为准，不假定支持 `--paginate`。
 
-## 🏷️ 标签规范（openEuler 社区预定义，必读）
+## IB_Robot 分类规则
 
-IB_Robot 沿用 [openEuler 社区标签约定](https://atomgit.com/openeuler/community/blob/master/zh/sig-infrastructure/label.md)。创建 / 分类 Issue 时**只能**从下列预定义标签中选取，**严禁**自造 `bug`、`feature`、`enhancement` 等裸名标签——仓库里不存在这些标签，SDK 的 `_validate_labels_exist` 会直接报 `Unknown labels`。
+分类只用下列词表，不通过列出仓库全部标签来猜分类，也不自造裸名 `bug`、`feature`：
 
-#### ⚠️ 直接使用下方词表，禁止自己去 API 获取 label
+- `kind/`：`api-change`、`bug`、`cleanup`、`design`、`documentation`、`failing-test`、`feature`、`enhancement`。
+- `priority/`：`high`、`medium`、`low`。
+- 其他社区标签：`help-wanted`、`invalid`、`question`、`newcomer`；仓库未预置时由管理员处理。
 
-下列词表就是 IB_Robot issue 标签的**唯一来源（SSOT）**，选取标签时**直接查表**即可，**严禁**再通过 API（如 `client.get_labels()`、`GET /repos/:owner/:repo/labels`、或任何「列出仓库全部标签」的调用）去「发现」可用标签。原因：
-
-- 仓库实际标签列表混合了大量个人 `lgtm-*`、`sig/*`、CI 类（`cam_*` / `ai_*` / `docs-ci-*`）标签，与 issue 分类无关，直接拉取会严重干扰判断；
-- SDK 的 `get_labels()` **不分页**，只能取回第一页，对第二页及之后的标签会误判为不存在（已实证：`kind/feature` 在第二页，被误报 `Unknown labels`）；
-- 词表已经过裁剪和校验，是 issue 分类应使用的正确子集。
-
-正确流程永远是：**看下方词表 → 选定 `kind/<x>` / `priority/<x>` → 用 slash 命令让机器人打标**，不要绕道 API。
-
-允许的标签词表：
-
-- **Kind**（类型，`kind/<x>`）：`api-change`、`bug`、`cleanup`、`design`、`documentation`、`failing-test`、`feature`、`enhancement`
-- **Priority**（优先级，`priority/<x>`）：`high`、`medium`、`low`
-- **平台 / 社区默认**：`help-wanted`（寻求帮助）、`invalid`（无效的 PR/Issue）、`question`（此 Issue 为一个问题）、`newcomer`（第一次在社区提 PR/Issue）
-
-> 命名注意：类型标签是 `kind/bug`、`kind/feature`，**不是**裸的 `bug`/`feature`。
-
-### ⚠️ 应用方式
-
-这些标签在 IB_Robot 仓库**默认不存在**，且当前 AtomGit 平台对协作 token/CLI 没有开放直接写标签的权限（`create-repo-labels` 返回 `403`）。因此 `issue_management.py` **不提供任何打标签的参数**（AtomGit 对 `kind/*` / `priority/*` 直传必然校验失败），标签一律通过 slash 命令添加：
-
-- **正确做法**：先创建 Issue，再用 **slash command 评论**让 openEuler 社区机器人打标签：
+IB_Robot 使用社区机器人 slash 评论进行分类和指派；CLI 有标签/assignee 参数不代表
+当前账号具备权限，也不改变这里的社区流程。先创建，再按用户意图发表评论：
 
 ```bash
-# 创建 Issue（不打标签）
-python3 issue_management.py --title "[Bug] xxx" --body "..."
-
-# 用斜杠命令让机器人添加 kind/*/priority/* 标签（机器人会自动建标并打上）
-python3 issue_management.py --issue <N> --comment "/kind bug"
-python3 issue_management.py --issue <N> --comment "/priority high"
-# 移除：/remove-kind bug、/remove-priority high
+GC_HOST=atomgit.com gitcode issue comment 123 -R openEuler/IB_Robot --body '/kind bug' --no-interactive
+GC_HOST=atomgit.com gitcode issue comment 123 -R openEuler/IB_Robot --body '/priority high' --no-interactive
+# 指派：/assign @username；自己：/assign；取消：/unassign
+# 移除分类：/remove-kind bug、/remove-priority high
 ```
 
-- 平台默认标签（`help-wanted`/`invalid`/`question`/`newcomer`）若仓库未预置，需仓库 admin 在 Settings → Labels 中先创建，再由 slash 命令或网页端添加。
-- **指派（assignees）同样不提供 CLI 参数**：AtomGit 的 PATCH issue 接口不接受 `assignees` 字段，直传必然 400。指派走 slash 命令：
-
-```bash
-python3 issue_management.py --issue <N> --comment "/assign @someone"
-# 指派给自己用 /assign；取消指派用 /unassign
-```
-
-## 快速使用
-
-### 创建 Issue
-
-```bash
-# 提交一个简单的 Issue（标签请通过下方 slash 命令添加，不要在这里直接传 kind/*）
-python3 issue_management.py --title "发现一个 Bug" --body "在执行 build.sh 时报错..."
-
-# 创建后用社区 slash 命令打标签（机器人会添加 kind/bug）
-python3 issue_management.py --issue <N> --comment "/kind bug"
-
-# 跨仓库：直接指定 owner/repo
-python3 issue_management.py --owner some-org --repo some-repo --title "[Bug] xxx"
-```
-
-### 获取 Issue 信息 (Agent 驱动)
-
-当需要分析已有 Issue 时，Agent 可以调用：
-
-```bash
-python3 issue_management.py --issue 123 --fetch-info
-
-# 直接从链接解析
-python3 issue_management.py --url https://atomgit.com/some-org/some-repo/issues/123 --fetch-info
-
-# 如只需要 Issue 主体，显式关闭评论抓取
-python3 issue_management.py --issue 123 --fetch-info --no-comments
-```
-默认会一并抓取 Issue 评论并写入 `comments_detail` 字段。Agent 会读取生成的 `tmp/{repo}_issue_123_context.json`。
-
-## API 说明
-
-### issue_management.py
-
-创建或更新 Issue。
-
-**参数**:
-- `--title`: Issue 标题（创建时**必需**）
-- `--body`: Issue 描述
-- `--issue`: Issue 编号（用于更新或获取信息，可由 `--url` 自动解析）
-- `--state`: Issue 状态（open 或 closed，用于更新）
-- `--fetch-info`: 提取 Issue 详情到 JSON 文件
-- `--comment`: 在已有 Issue 下发表评论或社区斜杠命令（如 `/kind bug`）
-- `--no-comments`: 在 `--fetch-info` 模式下跳过评论抓取
-- `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
-- `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
-- `--url`: Issue 或仓库链接（可选，自动解析 `owner/repo/issue_number`）
-- `--dry-run`: 仅显示计划，不执行实际操作
-
-**示例**:
-```bash
-# 更新 Issue 状态
-python3 issue_management.py --issue 123 --state closed
-
-# 修改 Issue 标题和内容
-python3 issue_management.py --issue 123 --title "已修正: 编译错误" --body "通过更新依赖已解决。"
-```
-
-## 注意事项
-
-1. **环境配置**: 认证由官方 CLI 管理（`gitcode auth login --hostname atomgit.com --with-token`）；脚本不读取 `ATOMGIT_TOKEN` 或 `config.json` 中的 token。CLI 缺失/未认证时脚本以退出码 1 报错并给出安装/认证指引。
-2. **Issue 规范**: 建议在标题中使用清晰的前缀，如 `[Bug]`, `[Feature]`, `[Task]` 等。
-3. **标签管理**: 只使用 openEuler 社区预定义标签（见上方「标签规范」）。`kind/*`、`priority/*` 通过 `/kind`、`/priority` 斜杠命令（评论）由社区机器人添加，**不要**自造裸名标签（`bug`/`feature` 等）。CLI 不提供打标签参数，一律走斜杠命令。
+跨仓库操作遵循目标仓库自己的约定，不把 IB_Robot 的机器人命令强加给其他仓库。

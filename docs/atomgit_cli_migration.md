@@ -1,108 +1,146 @@
-# AtomGit 协作工具迁移与验证
+# AtomGit CLI 使用与迁移说明
 
-## 运行入口
+## 日常操作直接使用 CLI
 
-项目的 AtomGit 平台 API 访问统一使用官方 CLI v0.14.1；`gitcode` 是项目入口名，
-可链接至官方二进制，也可通过 `IBROBOT_ATOMGIT_CLI` 设置绝对路径。不能用系统 Graphviz 的 `gc`。
-CLI 认证由用户在私密终端完成；不得在聊天、PR、日志中粘贴 token。
+Agent 按对应 skill 直接调用官方 `gitcode` CLI 完成 PR、Issue 和评审操作；命令参数按需查
+`gitcode <command> --help`。不再经由项目 Python 脚本转发普通平台读写。
 
 ```bash
-export IBROBOT_ATOMGIT_CLI=/absolute/path/to/gitcode
-gitcode auth login --hostname atomgit.com
+GC_HOST=atomgit.com gitcode pr view 460 -R openEuler/IB_Robot --json
+GC_HOST=atomgit.com gitcode pr comments 460 -R openEuler/IB_Robot --limit 0 --json
 ```
 
-`config.json` 保留非敏感仓库默认值及原有 LLM 配置，但不再承担 AtomGit 认证。
-显式目标优先于配置，再回退至唯一 upstream；origin 只供源仓库识别。
+显式确认目标仓库，再传入 `-R owner/repo`；个人 fork 的 `origin` 是推送来源，
+不能自动当作 PR 的目标仓库。仓库级 `config.json` 已删除。
 
-## 保留的项目行为
+认证由用户在私密终端完成，凭证由 CLI 管理，不在聊天、PR 或日志中传递：
 
-- 六个协作 skill 的路由与职责，AI 披露、DCO 提交流程、人工审查确认、WIP、复用检查。
-- 评审上下文绑定目标 owner/repo/PR、源仓库、完整 head SHA 与可读文件内容。
-- 修复中的本地事务回滚、精确源 URL/OID lease、推送验证成功后回复、逐条持久化账本。
-- 新恢复状态使用 schema v2 和来源标记；SDK 时代及中间 CLI 版本的 v1 状态不自动恢复。
-- 写入结果不确定时不自动重发；marker/正文哈希对账不能证明结果时需人工检查。
+```bash
+gitcode auth login --hostname atomgit.com
+GC_HOST=atomgit.com gitcode auth status
+```
 
-## 实测版本与边界（2026-09-29）
+普通调用使用 PATH 上的 `gitcode`，不要使用 Graphviz 的 `gc`。
+保留脚本还支持通过 `IBROBOT_ATOMGIT_CLI` 指定 CLI 的绝对路径；该变量是项目脚本的约定，
+不会改变 Agent 直接执行 `gitcode` 时的 PATH 查找。
 
-官方 CLI v0.14.1，构建 commit `21e19618984ec0628192f6283bca066c76e12511`。
-只读平台样本包含主仓库 PR #456–459 和 Issue #141。
+## 正式安装（Linux）
 
-| 场景 | 已确认的行为 |
+日常使用不依赖工作树的 `tmp/`，直接安装到 PATH 目录，不维护版本目录和符号链接：
+
+```text
+/usr/local/bin/gitcode   官方二进制
+/usr/bin/gc              保留 Graphviz
+```
+
+从官方 Release 获取与你的系统架构匹配的独立二进制，核验来源和 checksum 后安装。
+以下命令以 Linux x86_64、当前目录已有 `gc_linux_amd64` 为例；ARM 主机必须选择对应架构发行物。
+若目标已经存在，先核对它的安装来源，不要覆盖其他安装渠道管理的文件。
+升级沿用同一安装命令，并对照所下载版本的官方校验值核验文件。
+
+```bash
+sha256sum gc_linux_amd64
+# 与所下载版本的官方校验值比较后安装
+sudo install -m 0755 gc_linux_amd64 /usr/local/bin/gitcode
+command -v gitcode
+gitcode version
+GC_HOST=atomgit.com gitcode auth status
+```
+
+这里的安装仅部署二进制和入口，不搬运、覆盖或复制认证配置；同一用户仍通过 CLI 管理认证。
+确保 `/usr/local/bin` 在 PATH 上；不同 worktree 可以复用同一安装，不需要逐仓设置可执行文件路径。
+项目不限定 CLI 发布版本；脚本只检查可执行文件身份，命令或参数不兼容时报告实际错误。
+下文的版本号记录历史验证范围，不是安装或升级约束。
+原先 `tmp/tools/atomgit-cli/` 仅为迁移验证阶段的临时安装位置，历史证据保留该路径。
+
+## 项目脚本的边界
+
+| 工作 | 执行方式 |
 | --- | --- |
-| PR/Issue number | PR 为整数，Issue 为数字字符串；入口显式检查资源身份 |
-| 文件 patch | files API 返回 `patch.diff`；`pr diff --json` 是摘要，不替代完整 patch |
-| 大 PR 文件读取 | #456 返回 127 文件；该端点重复返回集合。重复页本身不证明完整性，需与独立 PR 总数核对 |
-| 跨 fork 内容 | 用 head.repo 的源仓库和完整 head SHA 读取，不回退到目标仓库 HEAD |
-| 评论 | 可读 `discussion_id`、`user.login`、布尔 `resolved`；不能假设 `resolved_at` 存在 |
-| 错误 | 不存在的 PR/Issue 实测退出 3；未认证实测退出 4；非零退出携 JSON 仍属失败 |
-| 正文 | 优先文件/stdin；仅支持 --body 的命令使用参数数组，绝不经过 shell 拼接 |
+| PR/Issue 创建、读取、修改，评审读取和发布 | Agent 直接使用官方 CLI；具体流程见对应 skill |
+| PR 描述生成与发布前检查 | `atomgit-pr/scripts/pr_body_gate.py` 读取本地 Git，生成通过项目检查的正文；Agent 再调用 CLI 发布 |
+| PR 专项检查 | `atomgit-pr-review/scripts/review_gates.py` 检查通过 CLI 获取的数据；Docker 指纹改从本地确定性 diff 推导（base/head 均 fetch 到本地，与作者侧同源）；分析和发布仍由 Agent 执行 |
+| 批量链接校验 | 保留专用脚本；脚本内自含最小只读 CLI 调用（argv/超时/`GC_HOST`/身份探测），无跨技能共享包装，可随技能独立携带 |
+| intro 状态引导 | 纯本地脚本（git 状态、编译产物、分支）；不再远端抽查 PR，需要平台状态时 Agent 直接用 CLI |
+| 评审意见修复与线程跟进 | Agent 编辑与验证，复用 Git 提交推送流程，直接通过 CLI 回复/resolve |
 
-## 验证层次
+PR 作者侧和评审侧共用 `_shared/pr_gates.py`，统一 AI 披露、模型集合、复用自查和
+WIP/Docker 验证规则。该模块不负责平台读写，唯一子进程用途是两侧共用的确定性本地
+diff 助手（`collect_diff_file_infos`：refs 先解析为完整 OID，再从显式 merge-base 以
+固定 flag 集 `--no-renames --no-ext-diff --no-textconv --no-indent-heuristic
+--diff-algorithm=myers` diff，`-z` 解析路径、`--literal-pathspecs` 传路径）——作者与
+评审由此对同一 base/head 得到完全相同的指纹输入，平台 files 的 rename 配对差异不再
+影响指纹。普通评审不再通过项目内置 LLM 自动评审器，而由当前 Agent 按三步流程执行。
 
-1. 本地行为测试由可执行 fake CLI 驱动，并用真实 import blocker 禁止 SDK 导入，
-   覆盖入口子进程；这不等同于真实平台验收。
-2. 已认证只读验证核对响应形状、分页、内容与 verification 指纹。
-3. 远端写入验证只在个人 fork 的专用测试 PR/Issue 上执行，资源编号与结果在 PR 描述中列出。
-4. 独立 Agent 根据 skill/help/reference 完成命令发现演练，不阅读实现源码。
-5. Docker 验证按用户要求暂缓；依赖/setup 变化仍需在正式检视前补齐双平台证据。
+链接校验脚本内自含最小只读 CLI 调用；跨技能共享的 `_shared/atomgit_cli.py` 包装已删除。
+intro 状态引导改为纯本地检查，不再远端抽查 PR 评论。根目录 `config.json` 和相关读取逻辑已删除。
+CLI 自己的认证配置、模型配置和 DeepWiki `doc_config.json` 保留。
+项目 requirements 不再安装 AtomGit SDK，也不再保留其移植代码或配套许可证目录。
 
-完整仓库入口有已知环境/基线限制，不能将局部测试通过称为全仓验收通过：
-`test_canonical_skill_contract_passes` 为已有失败；三个测试文件此前因
-huggingface_hub、jsonschema.protocols、onnx 依赖缺口被排除，最终结果在 PR 中如实记录。
+### 已删除入口与替代方式
 
-## 证据与规格
+- `issue_management.py`、`pr_creation.py`、`pr_management.py`：改为 CLI 直接操作；
+  PR 发布前检查收敛到 `pr_body_gate.py`。
+- `pr_review.py`、`architecture_review.py` 及自动 LLM/评论格式化库：改为 Agent 读取、
+  分析和发布；专项项目检查复用 `review_gates.py`。
+- 旧包装入口和自动评审器的测试随对应实现删除。项目规则测试迁移到共享规则模块和新的
+  本地检查入口；链接校验测试继续保留，intro 平台抽查测试与通用 CLI 包装测试随功能删除。
+- `review_resolution.py`、`review_helpers.py` 及其测试、旧 JSON 协议和 SDK import blocker
+  已删除。自动执行/恢复行为不再提供，改为 Agent 按 skill 直接执行。
 
-OpenSpec 使用主仓库集中保存方式，当前 worktree 的 `openspec/` 被忽略。
-迁移 change 为 `migrate-atomgit-skills-to-cli`，包含三轮设计评审、版本绑定的
-能力矩阵、实际 help 和独立演练记录。提交的本文提供可公开审阅的摘要；
-不把认证文件、原始敏感平台数据、临时 CLI 二进制或本机路径当作公开交付物。
+直接评审必须记录目标 owner/repo/PR、源仓库及完整 head SHA，读取相关文件的完整上下文；
+发布前再次核对源仓库和 head SHA。无法证明内容完整或版本已变时，停止发布并重新评审。
+这些步骤由 skill 指导 Agent 执行，不再由旧上下文导出/发布包装器代办。
 
-SDK 适配代码的来源和许可见 `third_party/licenses/atomgit-sdk/README.md`。
+## 已验证的平台行为与限制
 
-## 真实写入 smoke 结果
+以下结果来自 CLI v0.14.1 的 help、已认证只读检查及个人 fork 的写入 smoke，
+不是对未来 CLI 版本的保证。主仓库只读样本为 PR #456–460 和 Issue #141。
 
-2026-09-29 在个人 fork `BreezeWu/IB_Robot` 本次新建的 Issue #1、PR #1 上验证，
-测试完成后两项资源均关闭，临时分支 `test/atomgit-cli-20260929-rs1` 已删除：
-
-- Issue 创建/读取/评论/关闭/重开/再次关闭；修复了入口缺少 `reopen` 枚举的问题。
-- PR 创建、更新、回读、提取上下文、摘要及第 8 行行内评论发表；支持同仓测试 PR，跨 fork 发布仍独立验证。
-- 行内 discussion 的 resolve/unresolve 写入与布尔 resolved 读回闭环。
-- PR 级 visible 回复的事务 marker 原文读回成功。
-
-真实平台限制（不是已通过能力）：
-
-- threaded 回复写入成功且网页可见，但测试过的 CLI/API 读取通道未返回嵌套回复。
-  该模式的 uncertain 写入不能自动对账，必须人工核对；绝不因列表没找到 marker 而重发。
-- `diff_comment` 的 `diff_position` 是含 new-side 行号的对象，但本次读回没有文件路径。
-  对这类评论进行 visible 行内回复时明确 unsupported，不能猜文件或退成顶层评论。
-
-提交前主 Agent 独立结果：SDK 阻断下协作测试 **402 passed**；三个 setup shell harness
-分别 **18/16/3 passed**；OpenSpec strict 与 `git diff --check` 通过。
-不排除文件的全仓测试在收集时因 huggingface_hub 缺失退出 3；排除前述三个环境缺口文件后
-**408 passed、1 failed、退出 1**。既有失败为
-`scripts/test_check_agent_skill.py::test_canonical_skill_contract_passes`，不称全仓通过。
-
-## 测试精简后的边界（2026-09-29）
-
-官方 CLI 的命令实现由上游维护；本仓库保留项目适配和工作流回归，不以 fake CLI
-证明官方实现本身正确。迁移初版中重复的基础成功响应、登录提示、命令参数快照和
-格式化辅助函数测试已移除；对应实际命令已有前述平台 smoke 证据。
-
-| 精简项 | 保留的覆盖 |
+| 场景 | 行为与处理 |
 | --- | --- |
-| 两份自动评审测试合并 | `test_auto_review_gates.py` 参数化覆盖两种评审，保留缺 head、部分/全部读取失败、dry-run、完整结果发布 |
-| 多组 PR 超时测试共用准备逻辑 | 唯一匹配、错误正文、同 owner 不同 repo、身份缺失/歧义均保留，且只允许一次创建尝试 |
-| 重复 fake CLI 类移除 | 边界和入口共用 `entrypoint_fixture.py`；主机绑定、正文参数数组保真、Graphviz 冲突仍有测试 |
-| 基础 JSON/成功/登录提示重复用例移除 | 非零退出携 JSON 不可当成功、读取不完整不可发布、仓库/来源绑定和无写入门禁继续覆盖 |
-| SDK blocker 自检缩减 | 保留父进程与子进程的真实 SDK 导入阻断；全部入口回归仍在阻断环境下执行 |
+| URL 形式 | v0.14.1 实测 `repo view` 接受 atomgit.com/gitcode.com 仓库 URL；`pr view` 只接受编号。链接校验识别两个主机和数字 pull/pulls/merge_requests 路径，资源查询交给 CLI，不自建 API 域名映射 |
+| 完整 diff | files API 的 patch 位于 `patch.diff`；`pr diff --json` 是统计摘要，不可当完整 patch |
+| 分页 | PR #456 的 files 端点重复返回 127 个文件；重复页本身不证明完整，需核对独立 PR 总数 |
+| 跨 fork 源码 | 使用 head.repo 的源仓库与完整 head SHA，不回退到目标仓库 HEAD |
+| 评论 | 可读 `discussion_id`、`user.login`、布尔 `resolved`；不要假定存在 `resolved_at` |
+| 正文传递 | 优先 `--body-file`；仅支持 `--body` 时安全传入参数，不拼接正文成 shell 代码 |
+| 写入不确定 | 请求失败或缺返回编号仍可能已写入；先只读核对，不能盲目再创建或回复 |
+| threaded 回复 | smoke 中网页可见，但已测试 CLI/API 读回未返回嵌套回复；uncertain 结果须人工核对 |
+| visible 行内回复 | 读回 `diff_position` 有 new-side 行号但缺文件路径时，拒绝猜测定位或自动降级为顶层评论 |
+| files rename 配对 | PR460 实测：`pr view` changed_files=61，本地 `git diff --name-only` 默认 62、`--no-renames` 65；平台把「删旧 + 增新」合成 `status=renamed` 且 `previous_filename` 为空，配对阈值与本地不同。指纹统一走本地确定性 diff，平台清单仅自洽校验；不据 `previous_filename` 虚构删除文件 |
+| 行内评论回读定位 | PR460 实测回读缺 `path`/`position`（发布时带）；缺定位=定位未知，不能断言 PR 级；带定位发表的两条经网页核验确为 inline 挂载（细节见当轮 tmp 证据）。发表后保存响应与稳定 `discussion_id` 并 UI 回读 |
+| ID 形态 | PR460 观察到发布响应 id 与列表 id 类型不同（十六进制/数字）；`discussion_id` 稳定。关联线程只用 `discussion_id`，不互转不假设一致 |
+| 计数对账 | 平台 changed_files/commits 计数仅平台自洽；与本地清单不一致时逐路径比对并以 base/head 树核对确认实际 rename 配对，核对后仍无法解释的差异按不完整处理 |
 
-文件事务、精确 Git lease、schema v2 准入、未知回复不重发、重复页完整性证明、
-真实平台 `diff_position` 适配的测试没有删除。测试用例数降低不表示这些保护被移除。
+2026-09-29 在个人 fork `BreezeWu/IB_Robot` 的测试 Issue #1、PR #1 完成创建、读取、
+更新、评论、关闭/重开、行内发表、resolve/unresolve 和 visible marker 读回。
+两项资源已关闭，测试分支已删除。上述历史 smoke 覆盖 CLI/platform 能力，
+不替代精简后项目工具的回归测试。
 
+旧修复状态文件不再自动恢复或迁移。中断后重新核对远端 head 与评论，
+无法确定回复是否已发表时人工核对，不能因列表没找到回复就重发。
 
-## 与上游文档工具重组对齐
+## 验证范围
 
-基于 `23913118` 的目录重组，链接校验器及对应测试位于
-`.agents/skills/doc-link-validator/`。DeepWiki 翻译流程仍通过该独立 skill 进行后置校验；
-AtomGit 访问继续走共享 CLI，第三方 HTTP 链接保留上游新增的非 ASCII URL 百分号编码行为。
-旧 `deepwiki-translator/scripts/link_validator.py` 路径不再提供入口。
+保留脚本使用可执行 fake CLI 验证项目自己的逻辑。
+测试不重复证明官方 CLI 的基础命令实现。当前变更的实际测试命令与结果
+记录在 PR 描述中。
+
+仓库级测试此前存在 `test_canonical_skill_contract_passes` 既有失败，以及
+`huggingface_hub`、`jsonschema.protocols`、`onnx` 缺失引起的收集限制。
+局部回归通过不表示全仓测试通过。
+
+PR 按用户选择保持 WIP；Ubuntu/openEuler Docker 验证暂缓，正式检视前补齐。
+
+## 迁移证据与许可
+
+历史 OpenSpec change `migrate-atomgit-skills-to-cli` 和平台证据在主仓库集中保存，
+`openspec/` 被 Git 忽略。本文描述当前架构；历史的完整包装层设计不再作为日常调用方式。
+不提交认证文件、原始敏感平台数据或 CLI 二进制。
+
+原 SDK 派生实现及其配套许可证目录已经一并移除。官方 CLI 独立安装，
+仓库不分发其源码或二进制。
+
+链接校验器及测试位于 `.agents/skills/doc-link-validator/`；保留上游 Unicode URL
+百分号编码，DeepWiki 翻译通过该独立 skill 做交付检查。

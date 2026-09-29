@@ -2,17 +2,14 @@
 """
 IB-Robot INTRO Skill - 仓库状态检测与 Skill 推荐脚本
 
-根据当前仓库状态（git status、编译产物、PR 评论等）
+根据当前仓库状态（git status、编译产物等）
 智能推荐用户最应该使用的 skill。
 """
 
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
-
-PR_SAMPLE_LIMIT = 5  # 抽样上限（CLI 能力矩阵 A18）：仅检查前 N 个 open PR 的评论
 
 
 def get_project_root() -> Path:
@@ -58,93 +55,6 @@ def check_build_artifacts(project_root: Path) -> dict:
     }
 
 
-def check_open_prs_with_comments() -> dict:
-    """检测 open PR 及其评论（官方 CLI 抽样检查，非阻塞）
-
-    spec ``atomgit-collaboration-workflows``（Intro remains a nonblocking
-    sampled check）：CLI 缺失/未认证/目标不可解析时不中断报告，仅标记
-    PR 检查不可用；抽样范围显式暴露，检查失败不声称全仓库无待处理工作。
-    """
-    result = {
-        "has_open_prs": False,
-        "prs_with_comments": [],
-        "available": False,
-        "sample_limit": PR_SAMPLE_LIMIT,
-    }
-
-    try:
-        sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
-        import atomgit_cli
-    except ImportError:
-        result["error"] = "无法导入共享 CLI 边界模块 atomgit_cli"
-        return result
-
-    try:
-        cli = atomgit_cli.resolve_cli()
-        atomgit_cli.check_cli_identity(cli)
-        target = atomgit_cli.resolve_target(remotes=atomgit_cli.read_git_remotes())
-    except (atomgit_cli.CLIError, atomgit_cli.TargetResolutionError) as e:
-        result["error"] = f"AtomGit CLI 不可用: {e}"
-        return result
-
-    result["target_repo"] = target.slug
-
-    try:
-        listed = atomgit_cli.run_json(
-            ["pr", "list", "-R", target.slug, "--state", "open", "--json", "-L", str(PR_SAMPLE_LIMIT)],
-            cli=cli,
-        )
-        prs = listed.require_data()
-    except atomgit_cli.CLIError as e:
-        result["error"] = f"AtomGit CLI 调用失败: {e}"
-        return result
-    if not isinstance(prs, list):
-        result["error"] = f"pr list 返回了非列表 JSON（{type(prs).__name__}）"
-        return result
-
-    # 列表调用成功且形态验证通过后才标记 PR 检查可用；此前任何失败
-    # （CLI 缺失/未认证/目标不可解析/列表调用失败/非列表 JSON）保持 available=False。
-    result["available"] = True
-    result["has_open_prs"] = len(prs) > 0
-    # 达到抽样上限时可能还有更多 open PR 未抽查，不声称全仓库无待处理工作
-    result["sample_truncated"] = len(prs) >= PR_SAMPLE_LIMIT
-    result["checked_prs"] = []
-    result["unchecked_prs"] = []
-    result["invalid_prs"] = []
-
-    for pr in prs[:PR_SAMPLE_LIMIT]:
-        if not isinstance(pr, dict):
-            result["invalid_prs"].append(pr)
-            continue
-        pr_number = pr.get("number")
-        if pr_number is None:
-            result["invalid_prs"].append(pr)
-            continue
-        try:
-            comments = atomgit_cli.run_json(
-                ["pr", "comments", str(pr_number), "-R", target.slug, "--json", "--limit", "0"],
-                cli=cli,
-            )
-            comment_list = comments.require_data()
-        except atomgit_cli.CLIError:
-            result["unchecked_prs"].append(pr_number)
-            continue
-        if not isinstance(comment_list, list):
-            result["unchecked_prs"].append(pr_number)
-            continue
-        result["checked_prs"].append(pr_number)
-        if comment_list:
-            result["prs_with_comments"].append(
-                {
-                    "number": pr_number,
-                    "title": pr.get("title", ""),
-                    "comment_count": len(comment_list),
-                }
-            )
-
-    return result
-
-
 def check_current_branch() -> dict:
     """获取当前分支信息"""
     try:
@@ -171,7 +81,6 @@ def check_current_branch() -> dict:
 def generate_recommendations(
     changes: dict,
     build: dict,
-    prs: dict,
     branch: dict,
 ) -> list:
     """根据仓库状态生成推荐列表"""
@@ -188,19 +97,7 @@ def generate_recommendations(
             }
         )
 
-    # 优先级 2: 有未回复评论的 PR（最多显示一个）
-    if prs.get("prs_with_comments"):
-        for pr_info in prs["prs_with_comments"][:1]:
-            recommendations.append(
-                {
-                    "skill": "atomgit-review-resolution",
-                    "reason": f"PR #{pr_info['number']}「{pr_info['title']}」有 {pr_info['comment_count']} 条评论待处理",
-                    "priority": "🟡 中",
-                    "trigger": f"修复 #{pr_info['number']} 号 PR 的评审意见",
-                }
-            )
-
-    # 优先级 3: 有未提交的改动
+    # 优先级 2: 有未提交的改动
     if changes.get("has_changes"):
         recommendations.append(
             {
@@ -211,7 +108,7 @@ def generate_recommendations(
             }
         )
 
-    # 优先级 4: 有未推送的 commit
+    # 优先级 3: 有未推送的 commit
     if branch.get("unpushed_commits", 0) > 0:
         recommendations.append(
             {
@@ -239,7 +136,6 @@ def generate_recommendations(
 def print_report(
     changes: dict,
     build: dict,
-    prs: dict,
     branch: dict,
     recommendations: list,
 ):
@@ -275,29 +171,6 @@ def print_report(
         print("   ✅ 编译产物存在")
     print()
 
-    # PR 状态
-    print("🌐 AtomGit PR 状态:")
-    if not prs.get("available"):
-        error = prs.get("error", "未知错误")
-        print(f"   ⏭️  跳过（{error}）")
-    else:
-        if prs.get("prs_with_comments"):
-            for pr_info in prs["prs_with_comments"]:
-                print(f"   📝 PR #{pr_info['number']}「{pr_info['title']}」- {pr_info['comment_count']} 条评论")
-        elif prs.get("has_open_prs"):
-            checked = len(prs.get("checked_prs", []))
-            line = f"   ✅ 抽查了前 {checked} 个 open PR，无待处理评论"
-            if prs.get("sample_truncated"):
-                line += f"（抽样上限 {prs.get('sample_limit')}，可能还有更多 open PR 未抽查）"
-            print(line)
-        else:
-            print("   ℹ️  无 open 状态的 PR")
-        if prs.get("invalid_prs"):
-            print(f"   ⚠️  pr list 返回 {len(prs['invalid_prs'])} 条无效记录（非对象或缺 number），未计入本轮抽查")
-        if prs.get("unchecked_prs"):
-            print(f"   ⚠️  PR {prs['unchecked_prs']} 评论读取失败，本轮未检查")
-    print()
-
     # 推荐
     print("=" * 60)
     print("🎯 推荐操作")
@@ -325,13 +198,12 @@ def main():
     changes = check_uncommitted_changes()
     build = check_build_artifacts(project_root)
     branch = check_current_branch()
-    prs = check_open_prs_with_comments()
 
     # 生成推荐
-    recommendations = generate_recommendations(changes, build, prs, branch)
+    recommendations = generate_recommendations(changes, build, branch)
 
     # 输出报告
-    print_report(changes, build, prs, branch, recommendations)
+    print_report(changes, build, branch, recommendations)
 
     # 同时输出 JSON 格式到 tmp 目录（供 Agent 解析）
     tmp_dir = project_root / "tmp"
@@ -340,7 +212,6 @@ def main():
         "branch": branch,
         "changes": changes,
         "build": build,
-        "prs": prs,
         "recommendations": recommendations,
     }
     report_path = tmp_dir / "intro_report.json"

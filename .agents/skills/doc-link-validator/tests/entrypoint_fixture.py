@@ -1,11 +1,9 @@
-"""Executable fake-CLI fixture shared by entrypoint behavior tests.
+"""Executable fake-CLI fixture for doc-link-validator behavior tests.
 
-Extracted from ``test_entrypoint_fake_cli.py`` (task 3.1) so later migration
-tasks can drive their real script entry points against the same harness
-without duplicating the launcher logic. The launcher points its ``sys.path``
-at this directory so the subprocess imports the shared ``fake_cli.py``
-executable (task 2.4); everything else — scenario configuration, environment
-shaping and invocation recording — is identical for every skill.
+The launcher points its ``sys.path`` at this directory so the subprocess
+imports the adjacent ``fake_cli.py`` executable; scenario configuration,
+environment shaping and invocation recording are handled here. The fixture
+lives inside this skill so the tests run with no cross-skill dependencies.
 """
 
 from __future__ import annotations

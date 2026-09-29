@@ -3,16 +3,14 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from reuse_gate import (
+from pr_gates import (
     REUSE_SELF_CHECK_THRESHOLD,
     count_changed_lines,
     extract_reuse_self_check,
-    format_reuse_self_check,
     missing_reuse_fields,
     reuse_gate_required,
-    reuse_self_check_status,
     validate_reuse_self_check,
 )
 
@@ -26,11 +24,12 @@ def _small_files():
 
 
 def _complete_block():
-    return format_reuse_self_check(
-        "无：未重新发明现有流程",
-        "复用 lerobot.datasets 与 robot_config SSOT",
-        "无（未重新发明现有流程）",
-        "对齐 inference_service 的 bundle + manifest 架构",
+    return (
+        "## Reuse Self-Check\n\n"
+        "**Reinvented workflows:** 无：未重新发明现有流程\n"
+        "**Reused components:** 复用 lerobot.datasets 与 robot_config SSOT\n"
+        "**Reinvention justification:** 无（未重新发明现有流程）\n"
+        "**Architecture conformance:** 对齐 inference_service 的 bundle + manifest 架构\n"
     )
 
 
@@ -83,14 +82,6 @@ def test_extract_rejects_duplicate_headings_and_fields():
             "## Reuse Self-Check\n\n**Reinvented workflows:** a\n**Reinvented workflows:** b\n"
             "**Reused components:** c\n**Reinvention justification:** d\n**Architecture conformance:** e\n"
         )
-
-
-def test_status_classification():
-    assert reuse_self_check_status("") == "absent"
-    assert reuse_self_check_status("## Changes\n\nonly a body\n") == "absent"
-    assert reuse_self_check_status("## Reuse Self-Check\n\n**Reinvented workflows:** only one\n") == "incomplete"
-    assert reuse_self_check_status(_complete_block()) == "complete"
-    assert reuse_self_check_status(_complete_block() + _complete_block()) == "invalid"
 
 
 def test_validate_requires_block_only_for_large_prs():

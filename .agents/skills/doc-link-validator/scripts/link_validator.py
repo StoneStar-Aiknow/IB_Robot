@@ -3,28 +3,32 @@
 Documentation Link Validator
 
 Validates local, external, and AtomGit links in generated docs. AtomGit
-platform lookups go through the official CLI via the shared boundary in
-``.agents/skills/_shared/atomgit_cli.py`` (OpenSpec change
-``migrate-atomgit-skills-to-cli``, task 3.3): every former
+platform lookups go through the official CLI: every former
 ``api.atomgit.com`` REST v5 branch — blob/tree, pull, commit, issues,
-milestones, repo, user/org — is probed read-only through ``gitcode`` with
-``GC_HOST=atomgit.com`` pinned. Authentication belongs to the CLI
-(``gitcode auth login --hostname atomgit.com --with-token``); the retired
-``--config``/``--access-token`` token entries are rejected with an explicit
-deprecation error instead of being read (design.md D2).
+milestones, repo, user/org — is probed read-only through ``gitcode``. The
+CLI access layer is self-contained below (this skill carries no cross-skill
+shared module): an argv-only ``subprocess`` call with a bounded timeout and
+``GC_HOST=atomgit.com`` pinned, plus a one-shot ``gitcode version``
+identity probe so a same-name non-official executable can never have its
+exit codes mistaken for link verdicts. Authentication belongs to the CLI
+(``gitcode auth login --hostname atomgit.com --with-token``); the script
+never reads tokens and accepts no token arguments.
 
-Result semantics are preserved (design.md D1, capability matrix D5): the CLI
-exit code maps to three states — exit 0 → valid, exit 3 (not found) →
-broken, everything else (CLI unavailable, not authenticated, no permission,
-timeout, other failures, unusable output) is explicit inconclusive and is
-never misreported as broken. Third-party HTTP links keep the plain urllib
-probe and are not routed through the AtomGit platform API.
+Result semantics are preserved: the CLI exit code maps to three states —
+exit 0 → valid, exit 3 (not found) → broken, everything else (CLI
+unavailable, not authenticated, no permission, timeout, exec failure,
+other failures, unusable output) is explicit inconclusive and is never
+misreported as broken. Third-party HTTP links keep the plain urllib probe
+and are not routed through the AtomGit platform API.
 """
 
 import argparse
 import base64
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,20 +39,123 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
-
-import atomgit_cli
-
 DOC_EXTENSIONS = {".md", ".rst", ".txt"}
 HTTP_TIMEOUT = 10
 DEFAULT_MAX_WORKERS = 16
 USER_AGENT = "deepwiki-link-validator/1.0"
-ATOMGIT_HOSTS = {"atomgit.com"}
+ATOMGIT_HOSTS = frozenset({"atomgit.com", "gitcode.com"})
 BROKEN_STATUSES = {"broken", "auth_error", "error"}
-RETIRED_TOKEN_FLAGS_MESSAGE = (
-    "--config/--access-token are retired: AtomGit authentication now belongs to the official "
-    f"CLI. Run: {atomgit_cli.AUTH_LOGIN_GUIDANCE}"
-)
+
+# --- minimal read-only AtomGit CLI access (self-contained) ----------------- #
+
+CLI_ENV_VAR = "IBROBOT_ATOMGIT_CLI"
+CLI_ENTRY_NAME = "gitcode"
+CLI_HOST = "atomgit.com"
+AUTH_LOGIN_GUIDANCE = "gitcode auth login --hostname atomgit.com --with-token"
+CLI_EXIT_NOT_FOUND = 3
+CLI_EXIT_AUTH = 4
+IDENTITY_TIMEOUT = 30
+_VERSION_RE = re.compile(r"gitcode version (\d+)\.(\d+)\.(\d+)")
+
+
+@dataclass
+class CliOutcome:
+    """Outcome of one CLI invocation; ``run_cli`` never raises.
+
+    ``returncode`` is None when the process never produced an exit code
+    (timeout or exec failure); ``run_error`` then carries the reason.
+    """
+
+    returncode: int | None = None
+    stdout: str = ""
+    data: object = None
+    json_error: str | None = None
+    run_error: str | None = None
+
+
+def run_cli(args: list[str], cli: str, timeout: float) -> CliOutcome:
+    """Execute the CLI once read-only: argv list, no shell, no retry.
+
+    stdin is /dev/null so prompts cannot hang, ``GC_HOST`` is pinned to the
+    platform host, and stdout is decoded as JSON when possible.
+    """
+    env = dict(os.environ)
+    env["GC_HOST"] = CLI_HOST
+    try:
+        completed = subprocess.run(
+            [cli, *args, "--no-interactive"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return CliOutcome(run_error=f"request timed out after {timeout}s")
+    except OSError as exc:
+        # ENOEXEC ("Exec format error") and friends: the CLI never ran, so
+        # the platform was never asked — inconclusive, never a verdict.
+        return CliOutcome(run_error=f"executable could not be run: {exc.strerror or exc}")
+    outcome = CliOutcome(returncode=completed.returncode, stdout=completed.stdout)
+    stripped = completed.stdout.strip()
+    if stripped:
+        try:
+            outcome.data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            outcome.json_error = f"invalid JSON: {exc}"
+    else:
+        outcome.json_error = "empty stdout"
+    return outcome
+
+
+def resolve_cli_access() -> tuple[str | None, str | None]:
+    """Resolve the official CLI and verify its identity once.
+
+    Returns ``(cli, unavailable_reason)`` with exactly one side None. An
+    explicit ``IBROBOT_ATOMGIT_CLI`` absolute path wins over ``gitcode`` on
+    PATH; ``gc`` (Graphviz) is never considered. The one-shot identity
+    probe runs ``gitcode version`` and requires the official output shape,
+    so a same-name non-official executable is rejected before its exit
+    codes can be mistaken for link verdicts; any release number passes.
+    When the CLI is unavailable, every AtomGit link is reported
+    inconclusive with the reason while local and external links keep being
+    checked. Authentication is diagnosed per probe instead: exit 4 is
+    inconclusive with login guidance, never broken.
+    """
+    explicit = os.environ.get(CLI_ENV_VAR, "").strip()
+    if explicit:
+        path = Path(explicit)
+        if not path.is_absolute():
+            return None, f"{CLI_ENV_VAR} must be an absolute executable path, got: {explicit!r}"
+        if not path.is_file():
+            return None, (
+                f"{CLI_ENV_VAR} points to a missing file: {explicit}; "
+                "fix the variable or unset it to use 'gitcode' from PATH"
+            )
+        if not os.access(path, os.X_OK):
+            return None, f"{CLI_ENV_VAR} points to a non-executable file: {explicit}"
+    else:
+        found = shutil.which(CLI_ENTRY_NAME)
+        if not found:
+            return None, (
+                f"official AtomGit CLI '{CLI_ENTRY_NAME}' was not found on PATH and "
+                f"{CLI_ENV_VAR} is not set; install the official CLI or set {CLI_ENV_VAR} "
+                "to its absolute path (do not use Graphviz 'gc')"
+            )
+        path = Path(found)
+    outcome = run_cli(["version"], str(path), IDENTITY_TIMEOUT)
+    if outcome.run_error is not None:
+        return None, f"AtomGit CLI at {path} {outcome.run_error}"
+    if outcome.returncode != 0 or not _VERSION_RE.search(outcome.stdout):
+        return None, (
+            f"executable at {path} did not report 'gitcode version X.Y.Z' and is not the "
+            f"official AtomGit CLI (same-name tools such as Graphviz 'gc' are rejected on "
+            f"purpose); install the official CLI or set {CLI_ENV_VAR}"
+        )
+    return str(path), None
 
 
 @dataclass
@@ -298,33 +405,6 @@ def atomgit_offline_result(link: LinkOccurrence) -> ValidationResult | None:
     return None
 
 
-def resolve_cli_access() -> tuple[str | None, str | None]:
-    """Resolve the official CLI and its authentication once (task 3.3).
-
-    Returns ``(cli, unavailable_reason)`` with exactly one side None. When
-    the CLI is missing, fails its identity probe, or is not authenticated
-    for the pinned host, every AtomGit link is reported inconclusive with
-    the reason — mirroring the legacy "no token" behaviour — while local
-    and external links keep being checked. Legacy ``--config``/token
-    reading is retired (design.md D2): this is the only auth entry.
-    """
-    try:
-        cli = atomgit_cli.resolve_cli()
-        atomgit_cli.check_cli_identity(cli)
-    except atomgit_cli.CLIError as exc:
-        return None, str(exc)
-    try:
-        auth = atomgit_cli.check_auth_status(cli)
-    except atomgit_cli.CLIError as exc:
-        return None, str(exc)
-    if not auth.logged_in:
-        return (
-            None,
-            f"AtomGit CLI is not authenticated for {atomgit_cli.DEFAULT_WEB_HOST}; run: {atomgit_cli.AUTH_LOGIN_GUIDANCE}",
-        )
-    return cli, None
-
-
 def cli_probe(
     link: LinkOccurrence,
     args: list[str],
@@ -339,24 +419,20 @@ def cli_probe(
     Exit 0 → valid (JSON is additionally required only when the caller
     consumes the response body); exit 3 → broken; everything else — CLI
     unavailable, not authenticated or lacking permission (exit 4), timeout,
-    other nonzero exits and unusable output — is explicit inconclusive,
-    never misreported as broken (design.md D1, capability matrix D5).
+    exec failure, other nonzero exits and unusable output — is explicit
+    inconclusive, never misreported as broken.
     """
-    try:
-        result = atomgit_cli.run_json(args, cli=cli, timeout=timeout)
-    except atomgit_cli.CLITimeoutError:
-        # ``run`` raises before a CLIResult exists; map it here instead of
-        # letting it escape the worker thread and crash the whole run.
-        return make_result(link, "inconclusive", f"AtomGit CLI request timed out after {timeout}s"), None
-    if result.ok and (not require_json or result.data is not None):
-        return make_result(link, "valid", valid_detail), result.data
-    failure = result.failure()
-    if isinstance(failure, atomgit_cli.CLINotFoundError):
+    outcome = run_cli(args, cli, timeout)
+    if outcome.run_error is not None:
+        return make_result(link, "inconclusive", f"AtomGit CLI {outcome.run_error}"), None
+    if outcome.returncode == 0 and (not require_json or outcome.data is not None):
+        return make_result(link, "valid", valid_detail), outcome.data
+    if outcome.returncode == CLI_EXIT_NOT_FOUND:
         return make_result(link, "broken", "AtomGit target was not found"), None
-    if isinstance(failure, atomgit_cli.CLIAuthError):
-        detail = "AtomGit CLI is not authenticated or lacks permission for this target"
-    elif failure is not None:
-        detail = f"AtomGit CLI failed with exit code {result.returncode}"
+    if outcome.returncode == CLI_EXIT_AUTH:
+        detail = f"AtomGit CLI is not authenticated or lacks permission for this target; run: {AUTH_LOGIN_GUIDANCE}"
+    elif outcome.returncode != 0:
+        detail = f"AtomGit CLI failed with exit code {outcome.returncode}"
     else:
         detail = "AtomGit CLI produced no usable JSON output"
     return make_result(link, "inconclusive", detail), None
@@ -434,7 +510,7 @@ def validate_atomgit_link(link: LinkOccurrence, cli: str, timeout: int) -> Valid
     route = segments[2] if len(segments) >= 3 else ""
     if route in {"blob", "tree"}:
         return validate_atomgit_blob_tree(link, parsed, segments, cli, timeout)
-    if route in {"pull", "commit", "issues", "milestones"}:
+    if route in {"pull", "pulls", "merge_requests", "commit", "issues", "milestones"}:
         return validate_atomgit_issue_like(link, segments, cli, timeout)
     if len(segments) == 2:
         return validate_atomgit_repo(link, segments, cli, timeout)
@@ -504,9 +580,11 @@ def validate_atomgit_line_fragment(link: LinkOccurrence, parsed, body: object | 
 
 def validate_atomgit_issue_like(link: LinkOccurrence, segments: list[str], cli: str, timeout: int) -> ValidationResult:
     namespace, repo, route = segments[:3]
-    if route == "pull":
+    if route in {"pull", "pulls", "merge_requests"}:
         if len(segments) < 4:
             return make_result(link, "broken", "pull URL is missing pull request number")
+        if not segments[3].isdigit():
+            return validate_external_link(link, timeout)
         result, _ = cli_probe(
             link,
             ["pr", "view", segments[3], "-R", f"{namespace}/{repo}", "--json"],
@@ -684,22 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fail-on-inconclusive", action="store_true", help="Return non-zero when inconclusive links are found"
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="RETIRED: the token config is no longer read; authenticate via the CLI "
-        f"({atomgit_cli.AUTH_LOGIN_GUIDANCE})",
-    )
-    parser.add_argument(
-        "--access-token",
-        default=None,
-        help=f"RETIRED: authenticate via the CLI ({atomgit_cli.AUTH_LOGIN_GUIDANCE})",
-    )
     args = parser.parse_args(argv)
-
-    if args.config is not None or args.access_token is not None:
-        print(RETIRED_TOKEN_FLAGS_MESSAGE, file=sys.stderr)
-        return 2
 
     cli, cli_unavailable = resolve_cli_access()
 
