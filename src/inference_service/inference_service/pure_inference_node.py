@@ -9,7 +9,7 @@ import traceback
 from dataclasses import dataclass
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -199,7 +199,12 @@ class PureInferenceNode(Node):
             status_qos,
             callback_group=ReentrantCallbackGroup(),
         )
-        self._status_timer = self.create_timer(0.5, self._publish_status)
+        # The heartbeat gets its own group. In the node's default exclusive group it
+        # waits behind the video status and diagnostics timers, and a publish that
+        # blocks inside DDS there delays it past the edge's 2.0 s expiry.
+        self._status_timer = self.create_timer(
+            0.5, self._publish_status, callback_group=MutuallyExclusiveCallbackGroup()
+        )
         self._video_status_timer = self.create_timer(_VIDEO_STATUS_PERIOD_S, self._publish_video_status)
         self._video_diagnostics_timer = self.create_timer(
             _VIDEO_DIAGNOSTICS_PERIOD_S, self._log_video_runtime_diagnostics

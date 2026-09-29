@@ -51,9 +51,25 @@ def test_check_heartbeat_explains_missing_cloud_heartbeat(monkeypatch):
     PipelinePolicyNode._check_heartbeat(node)
 
     assert len(logger.warning_messages) == 1
-    assert "no cloud heartbeat has been received" in logger.warning_messages[0]
+    assert "has not been heard from" in logger.warning_messages[0]
     assert "pure_inference_node" in logger.warning_messages[0]
     assert "/inference/policy/heartbeat" in logger.warning_messages[0]
+    # The edge half being up while the cloud half is silent must not read as a
+    # silent downgrade to single-machine inference.
+    assert "not a fallback to local inference" in logger.warning_messages[0]
+
+
+def test_check_heartbeat_warning_covers_the_startup_window_only(monkeypatch):
+    logger = _Logger()
+    session = _Session(ready=False)
+    # Same moment as the test above, well past the warning delay: the only
+    # difference is that a cloud status has been received.
+    node = _node(session, logger, started_at=10.0, received_at=12.0)
+    monkeypatch.setattr(pipeline_policy_module.time, "monotonic", lambda: 16.0)
+
+    PipelinePolicyNode._check_heartbeat(node)
+
+    assert logger.warning_messages == []
 
 
 def test_cloud_status_logging_distinguishes_not_ready_and_handshake(monkeypatch):

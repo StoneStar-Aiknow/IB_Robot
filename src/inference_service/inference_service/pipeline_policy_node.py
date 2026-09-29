@@ -2937,13 +2937,18 @@ class PipelinePolicyNode(Node):
 
     def _check_heartbeat(self) -> None:
         session = self._require_edge_session()
+        # Startup only: _last_cloud_status_received_monotonic is set on the first
+        # cloud status and never cleared, so a cloud lost mid-run is reported by
+        # the "Cloud heartbeat expired" path instead.
         if not session.ready and self._last_cloud_status_received_monotonic is None:
             elapsed = time.monotonic() - self._distributed_started_monotonic
             if elapsed >= _CLOUD_HANDSHAKE_WARNING_DELAY_S:
                 self.get_logger().warning(
-                    "Distributed pipeline is running locally but no cloud heartbeat has been received "
-                    f"for {elapsed:.1f}s; start pure_inference_node and verify the heartbeat topic "
-                    f"{self._config.heartbeat_topic!r} and ROS 2 discovery settings",
+                    "The cloud side of this distributed pipeline has not been heard from: no cloud "
+                    f"status has arrived in the {elapsed:.1f}s since startup. This is not a fallback "
+                    "to local inference -- the edge side is running, but inference requests stay "
+                    "unanswered until the handshake completes. Start pure_inference_node and verify "
+                    f"the heartbeat topic {self._config.heartbeat_topic!r} and ROS 2 discovery settings",
                     throttle_duration_sec=_CLOUD_HANDSHAKE_WARNING_THROTTLE_S,
                 )
         update = session.expire_heartbeat()
