@@ -41,13 +41,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
 
 import atomgit_cli
+import review_helpers
 from ai_compliance import (
     add_ai_disclosure,
     reject_handwritten_disclosure,
     validate_agent_tool,
     validate_commit_ai_model,
 )
-from pr_management import fetch_pr_record, pr_url
 from reuse_gate import REUSE_SELF_CHECK_THRESHOLD, count_changed_lines, reuse_gate_required, validate_reuse_self_check
 from verification_gate import (
     compute_legacy_verification_inputs,
@@ -400,7 +400,13 @@ def main():
             explicit_config=args.config is not None,
             remotes=atomgit_cli.read_git_remotes(),
         )
-        source = atomgit_cli.resolve_source(args.fork_owner, target)
+        if args.fork_owner == target.owner:
+            # Same-repository PR (branch → base inside one repository, e.g. a
+            # fork-internal test PR): the platform creates it without ``--fork``.
+            # The cross-fork path (distinct source/target owners) is unchanged.
+            source = target
+        else:
+            source = atomgit_cli.resolve_source(args.fork_owner, target)
     except (atomgit_cli.CLIError, atomgit_cli.TargetResolutionError) as e:
         print(f"\n❌ 初始化失败: {e}")
         sys.exit(1)
@@ -559,13 +565,16 @@ def main():
         print(">>> 创建 PR...")
         # SDK 语义 head=f"{fork_owner}:{branch}" 映射为 CLI 跨仓形式：
         # --fork fork_owner/repo --head branch（服务端解析为 head "fork_owner/repo:branch"）。
+        # 同仓 PR（source == target）不传 --fork，head 仓库即目标仓库本身。
         create_argv = [
             "pr",
             "create",
             "-R",
             target.slug,
-            "--fork",
-            source.slug,
+        ]
+        if source.slug != target.slug:
+            create_argv += ["--fork", source.slug]
+        create_argv += [
             "--head",
             branch,
             "--base",
@@ -585,7 +594,7 @@ def main():
         # 只读对账后再决定 (design.md D5)。
         if gate_triggered:
             try:
-                created_pr = fetch_pr_record(cli, target, pr_number)
+                created_pr = review_helpers.fetch_pr_record(cli, target, pr_number)
                 created_head = (created_pr.get("head", {}).get("sha") or "").lower()
                 if created_head != remote_head:
                     raise ValueError(f"PR head changed during creation: expected {remote_head}, got {created_head}")
@@ -594,14 +603,14 @@ def main():
                 )
             except Exception as e:
                 print(f"\n⚠️  PR #{pr_number} 已创建，但写后校验未完成: {e}")
-                print(f"🔗 链接: {pr_url(target, pr_number)}")
+                print(f"🔗 链接: {review_helpers.pr_url(target, pr_number)}")
                 print("   请先只读对账 PR 当前状态（head SHA 与验证元数据），不要重复创建或盲目更新。")
                 sys.exit(1)
 
         print()
         print("✅ PR 创建成功!")
         print(f"PR 编号: #{pr_number}")
-        print(f"PR 链接: {pr_url(target, pr_number)}")
+        print(f"PR 链接: {review_helpers.pr_url(target, pr_number)}")
 
     else:
         print(">>> 已取消创建 PR")

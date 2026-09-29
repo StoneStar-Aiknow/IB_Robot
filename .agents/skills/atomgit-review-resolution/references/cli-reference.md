@@ -27,7 +27,7 @@
 | `--resume` | 从原子 JSON 状态恢复待推送或待回复事务 | — |
 | `--base-branch` | 旧命令兼容参数，已忽略；实际基线固定为 PR `base.sha` | 无 |
 
-CLI 不提供 `--auto`：当前受支持的 `atomgit-sdk` 没有修复生成 API。Agent 应先抓取评论、分析并向用户展示 JSON 修复方案，再使用 `--apply-fixes`。
+CLI 不提供 `--auto`：官方 AtomGit CLI（已验证 v0.14.1）没有修复生成 API。Agent 应先抓取评论、分析并向用户展示 JSON 修复方案，再使用 `--apply-fixes`。
 
 代码修复命令不带 `--push` 时，本地 autosquash 成功后写入 `./tmp/{repo}_pr_{number}_review_resolution_{transaction_id}.json`，返回 `pending_push` / 退出码 2，并且不会发送“已修复”回复。push 或回复部分失败时保留同一状态文件；使用：
 
@@ -63,10 +63,16 @@ python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/rep
 
 只有在显式指定 `--reply-mode visible` 时，才会：
 
-- 对 PR 总评 / 普通评论，发送 **页面可见的 PR 顶层评论**
-- 对 DiffNote / 行内评论，发送 **页面可见的 inline comment**
+- 对 PR 总评 / 普通评论（原评论完全没有文件/行定位信息），发送 **页面可见的 PR 顶层评论**
+- 对 DiffNote / 行内评论，发送 **页面可见的 inline comment**；定位必须在 **当前 PR head diff 的 new 侧可见行** 上重新校验通过（`--position` 语义是 new 侧行号）。原评论只有 old 侧行、已 outdated 且缺少 new 侧行、文件已不在当前 diff 中或行号不再可见时，脚本显式报 unsupported 并 **零平台写入**——不会静默降级为 PR 顶层评论（需要的话请人工另发）
 
 `visible` 适合需要额外补一条页面可见评论的场景；常规 review 跟进默认应使用 threaded。
+
+**已知限制（2026-09-29 认证实测）**：threaded 回复写入成功且 UI 可见，但 CLI/API 读回
+（`pr comments`、`pulls/{n}/comments`、单条 GET 405、replies/discussions 404）均不可见
+——threaded 模式无法做 marker 对账，uncertain 条目需人工 UI 核对；需要自动恢复对账时用
+`visible`（PR 级评论 marker 原文读回完整）。真实行内评论读回无文件路径（锚定在
+`diff_position` dict），对其做 visible 定位回复会零写入拒绝（unsupported）。
 
 ## 审查者复查闭环（开发者已修复 review 意见后）
 
@@ -77,7 +83,7 @@ python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/rep
 3. 对每条已确认修复的意见：
    - 先用 `--reply-comment <id> --reply-file <回复文件> --reply-mode threaded` 在原线程下回复确认（正文明确写出「已修复并复查确认通过，标记为已解决」）。
    - 若该条是 `diff_comment`（行内评论），再追加 `--resolve-comment <id> --resolved true` 标记已解决。
-   - 若该条是 `pr_comment`（PR 级评论），**跳过 resolve**（会 400 失败，见下一节限制说明），回复确认即视为闭环。
+   - 若该条是 `pr_comment`（PR 级评论），**跳过 resolve**（脚本只支持行内 discussion 的 resolve，见下一节限制说明），回复确认即视为闭环。
 4. 若存在顶层摘要评论，可单独回复一条「本次 review 的 N 条意见均已修复确认、全部闭环」作为整体收尾。
 
 ## 修改某条 review discussion 的解决状态
@@ -90,18 +96,19 @@ python3 review_resolution.py --pr 123 --resolve-comment 456 --resolved true --ai
 python3 review_resolution.py --pr 123 --resolve-discussion abcdef --resolved false --ai-model gpt-5.5
 ```
 
-脚本使用官方文档中的 `PUT /api/v5/repos/:owner/:repo/pulls/:number/comments/:discussion_id` 接口修改解决状态。
+脚本通过官方 CLI 的 `pr comment resolve|unresolve <pr> <discussion-id> -R <owner>/<repo>` 修改解决状态。
 
 ### ⚠️ resolve 仅对 inline diff comment 有效
 
-该接口**只能切换绑定到具体代码行的行内评论（`diff_comment` / DiffNote）的 resolved 状态**。对以下类型调用 `--resolve-comment` / `--resolve-discussion` 会返回 **HTTP 400**，无法标记：
+平台只能切换绑定到具体代码行的行内评论（`diff_comment` / DiffNote）的 resolved 状态。写入前，脚本会先从 **PR 作用域全量评论列表** 重新验证该 discussion 确实属于目标 PR 且是行内 discussion——以下情况会在本地直接拒绝并 **零平台写入**：
 
+- discussion id 未知、或其评论实际属于其他 PR（`--resolve-discussion` 归属校验）；
 - PR 级 review 评论（`comment_type == "pr_comment"`），例如 `atomgit-pr-architecture-review` 提交的架构审查评论，或 `atomgit-pr-review` 提交的顶层摘要评论；
-- 普通 PR 顶层评论。
+- 普通 PR 顶层评论（没有文件/行定位信息的线程）。
 
 闭环时的判断规则（基于 `unresolved_comments.json` 的 `comment_type` 字段）：
 
 - `diff_comment` → 回复确认后，用 `--resolve-comment --resolved true` 标记已解决。
-- `pr_comment` → **只能**通过 `--reply-comment` 回复确认修复来实现实质闭环，**不要**对其调用 `--resolve-comment`。
+- `pr_comment` → **只能**通过 `--reply-comment` 回复确认修复来实现实质闭环，**不要**对其调用 `--resolve-comment`（脚本会在本地拒绝并说明限制，不会改动无关 discussion）。
 
 只要回复正文明确写出「已修复并复查确认通过」，即使平台未切换 resolved 标记，对作者而言该意见也已闭环。

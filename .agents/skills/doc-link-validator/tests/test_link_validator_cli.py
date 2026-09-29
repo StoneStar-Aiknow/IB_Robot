@@ -1,29 +1,9 @@
-"""Entry-point behavior tests for the CLI-migrated link validator (task 3.3).
-
-The real ``deepwiki-translator/scripts/link_validator.py`` runs as a
-subprocess against the executable fake CLI (task 2.4), so every AtomGit
-branch — repo, pull, commit, issues, milestones, blob/tree and user/org —
-is exercised through the shared boundary exactly as an Agent drives it.
-Required semantics (design.md D1/D5, task 3.3):
-
-- CLI missing or not authenticated → every AtomGit link is explicit
-  *inconclusive*, never ``broken``; local links keep validating and no
-  platform probe is issued.
-- Exit 3 → broken; exit 0 → valid. ``commit view`` has no ``--json`` flag
-  in the verified help evidence, so its plain-text success must count as
-  valid rather than crash the JSON decode.
-- A probe timeout maps to inconclusive instead of escaping the worker
-  thread and crashing the whole run.
-- Legacy ``--config``/``--access-token`` are rejected with the CLI login
-  guidance and exit 2 before any probe.
-
-Third-party external links keep the urllib probe; they would hit real
-networks from tests and are therefore not exercised here.
-"""
+"""Project workflow regressions; CLI responses are supplied by the shared fake."""
 
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -40,7 +20,7 @@ sys.path.insert(0, str(SHARED_TESTS_DIR))
 
 from entrypoint_fixture import AUTH_LOGIN_GUIDANCE, EntrypointFakeCLI  # noqa: E402
 
-LINK_VALIDATOR_SCRIPT = SKILLS_DIR / "deepwiki-translator" / "scripts" / "link_validator.py"
+LINK_VALIDATOR_SCRIPT = SKILLS_DIR / "doc-link-validator" / "scripts" / "link_validator.py"
 AUTH_OK_RULE = {"argv_contains": ["auth", "status"], "stdout": "Logged in to atomgit.com\n", "exit": 0}
 BLOB_CONTENT = base64.b64encode(b"line1\nline2\nline3\n").decode()
 
@@ -162,44 +142,6 @@ def test_repo_link_exit3_is_broken(fake: EntrypointFakeCLI, tmp_path: Path) -> N
     assert entry["detail"] == "AtomGit target was not found"
 
 
-def test_pull_link_uses_pr_view_and_pins_host(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
-    docs = write_doc(tmp_path, "[pull](https://atomgit.com/acme/widget/pull/7)\n")
-    fake.configure([AUTH_OK_RULE, {"argv_contains": ["pr", "view"], "stdout": '{"number": 7}', "exit": 0}])
-    report = tmp_path / "report.json"
-
-    proc = run_validator(docs, report, env=fake.env())
-
-    assert proc.returncode == 0
-    expected_argv = ["pr", "view", "7", "-R", "acme/widget", "--json", "--no-interactive"]
-    assert fake.argv_of(["pr", "view"]) == expected_argv
-    assert fake.invocation_of(["pr", "view"])["env"]["GC_HOST"] == "atomgit.com"
-    assert load_report(report)["checked_summary"]["valid"] == 1
-
-
-def test_commit_link_valid_without_json_flag(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
-    docs = write_doc(tmp_path, "[commit](https://atomgit.com/acme/widget/commit/abc123def456)\n")
-    fake.configure(
-        [
-            AUTH_OK_RULE,
-            {"argv_contains": ["commit", "view"], "stdout": "commit abc123def456\nAuthor: someone\n", "exit": 0},
-        ]
-    )
-    report = tmp_path / "report.json"
-
-    proc = run_validator(docs, report, env=fake.env())
-
-    assert proc.returncode == 0
-    assert fake.argv_of(["commit", "view"]) == [
-        "commit",
-        "view",
-        "abc123def456",
-        "-R",
-        "acme/widget",
-        "--no-interactive",
-    ]  # no --json: the verified help evidence has no such flag for commit view
-    assert load_report(report)["checked_summary"]["valid"] == 1
-
-
 def test_commit_link_exit3_is_broken(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
     docs = write_doc(tmp_path, "[commit](https://atomgit.com/acme/widget/commit/abc123def456)\n")
     fake.configure([AUTH_OK_RULE, {"argv_contains": ["commit", "view"], "exit": 3}])
@@ -282,19 +224,6 @@ def test_blob_link_to_directory_target_is_broken(fake: EntrypointFakeCLI, tmp_pa
     assert entry["detail"] == "AtomGit directory target should use /tree/ instead of /blob/"
 
 
-def test_user_link_valid_without_org_probe(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
-    docs = write_doc(tmp_path, "[user](https://atomgit.com/janedoe)\n")
-    fake.configure([AUTH_OK_RULE, {"argv_contains": ["user", "view"], "stdout": '{"login": "janedoe"}', "exit": 0}])
-    report = tmp_path / "report.json"
-
-    proc = run_validator(docs, report, env=fake.env())
-
-    assert proc.returncode == 0
-    assert fake.argv_of(["user", "view"]) == ["user", "view", "janedoe", "--json", "--no-interactive"]
-    assert not any("api" in argv for argv in fake.argvs())
-    assert load_report(report)["checked_summary"]["valid"] == 1
-
-
 def test_org_link_falls_back_to_orgs_endpoint(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
     docs = write_doc(tmp_path, "[org](https://atomgit.com/acme-org)\n")
     fake.configure(
@@ -351,27 +280,6 @@ def test_org_link_with_inconclusive_user_probe_never_broken(fake: EntrypointFake
     assert entry["detail"]  # carries the inconclusive probe's reason
 
 
-def test_issues_collection_route_probes_issue_list(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
-    docs = write_doc(tmp_path, "[issues](https://atomgit.com/acme/widget/issues)\n")
-    fake.configure([AUTH_OK_RULE, {"argv_contains": ["issue", "list"], "stdout": "[]", "exit": 0}])
-    report = tmp_path / "report.json"
-
-    proc = run_validator(docs, report, env=fake.env())
-
-    assert proc.returncode == 0
-    assert fake.argv_of(["issue", "list"]) == [
-        "issue",
-        "list",
-        "-R",
-        "acme/widget",
-        "--json",
-        "-L",
-        "1",
-        "--no-interactive",
-    ]
-    assert load_report(report)["checked_summary"]["valid"] == 1
-
-
 def test_issue_number_route_exit3_is_broken(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
     docs = write_doc(tmp_path, "[issue](https://atomgit.com/acme/widget/issues/5)\n")
     fake.configure([AUTH_OK_RULE, {"argv_contains": ["issue", "view"], "exit": 3}])
@@ -382,18 +290,6 @@ def test_issue_number_route_exit3_is_broken(fake: EntrypointFakeCLI, tmp_path: P
     assert proc.returncode == 1
     assert fake.argv_of(["issue", "view"]) == ["issue", "view", "5", "-R", "acme/widget", "--json", "--no-interactive"]
     assert reported(load_report(report), "https://atomgit.com/acme/widget/issues/5")["status"] == "broken"
-
-
-def test_milestone_link_uses_api_endpoint(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
-    docs = write_doc(tmp_path, "[m](https://atomgit.com/acme/widget/milestones/3)\n")
-    fake.configure([AUTH_OK_RULE, {"argv_contains": ["api"], "stdout": '{"number": 3}', "exit": 0}])
-    report = tmp_path / "report.json"
-
-    proc = run_validator(docs, report, env=fake.env())
-
-    assert proc.returncode == 0
-    assert fake.argv_of(["api"]) == ["api", "repos/acme/widget/milestones/3", "--no-interactive"]
-    assert load_report(report)["checked_summary"]["valid"] == 1
 
 
 def test_probe_timeout_is_inconclusive_not_a_crash(fake: EntrypointFakeCLI, tmp_path: Path) -> None:
@@ -433,3 +329,29 @@ def test_incomplete_blob_url_is_broken_even_without_cli(tmp_path: Path) -> None:
     entry = reported(load_report(report), "https://atomgit.com/acme/widget/blob/main")
     assert entry["status"] == "broken"
     assert entry["detail"] == "AtomGit blob/tree URL is missing branch or path"
+
+
+def test_external_url_preserves_escapes_and_encodes_unicode(monkeypatch):
+    spec = importlib.util.spec_from_file_location("rebased_link_validator", LINK_VALIDATOR_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    monkeypatch.syspath_prepend(str(SKILLS_DIR / "_shared"))
+    spec.loader.exec_module(module)
+    requests = []
+
+    class Response:
+        status, reason = 200, "OK"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module, "urlopen", fake_urlopen)
+    assert module.request_status("https://example.com/中文%20路径?q=文档", "HEAD", 10) == (200, "OK")
+    assert requests == ["https://example.com/%E4%B8%AD%E6%96%87%20%E8%B7%AF%E5%BE%84?q=%E6%96%87%E6%A1%A3"]

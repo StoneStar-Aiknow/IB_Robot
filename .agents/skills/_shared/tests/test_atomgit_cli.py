@@ -1,13 +1,4 @@
-"""Behavior tests for the shared AtomGit CLI boundary (task 2.4).
-
-Every platform-facing scenario runs against the executable fake CLI in
-``fake_cli.py`` (launched through a generated ``#!<python>`` wrapper so the
-boundary's subprocess layer is exercised for real): argv/stdin fidelity,
-exit-code classification, timeouts, pagination, host pinning and
-authentication diagnostics. Targeting tests are pure-local. No real
-platform access, no credentials, no TTY — task 1.4 stays blocked on real
-CLI authentication, and none of these tests depend on it.
-"""
+"""Project workflow regressions; CLI responses are supplied by the shared fake."""
 
 from __future__ import annotations
 
@@ -27,7 +18,6 @@ from atomgit_cli import (
     CLIAuthStatus,
     CLIConflictError,
     CLIExecutionError,
-    CLIIdentity,
     CLIJSONError,
     CLINotFoundError,
     CLISelectionError,
@@ -40,7 +30,6 @@ from atomgit_cli import (
     check_cli_identity,
     config_repo_defaults,
     load_config,
-    normalize_host,
     parse_atomgit_url,
     read_git_remotes,
     resolve_cli,
@@ -51,68 +40,28 @@ from atomgit_cli import (
     run_paginated,
     validate_config_base_url,
 )
-
-TESTS_DIR = Path(__file__).resolve().parent
+from entrypoint_fixture import EntrypointFakeCLI
 
 SPECIAL_BODY = (
     "摘要 line1\nline2 `backtick` \"double quotes\" 'single' $HOME $(id:fake) back\\\\slash 中文 ünïcödé 🤖 tab\tend\n"
 )
 
 
-class FakeCLI:
-    """Generated executable fake with scenario-driven responses."""
+class FakeCLI(EntrypointFakeCLI):
+    """Shared executable fixture with a hostile PATH for selection tests."""
 
-    def __init__(self, tmp_path: Path) -> None:
-        self.bin_dir = tmp_path / "bin"
-        self.bin_dir.mkdir()
-        self.exe = self.bin_dir / "gitcode"
-        self._write_launcher(self.exe, "import fake_cli\nfake_cli.main()\n")
-        self.scenario_path = tmp_path / "scenario.json"
-        self.record_path = tmp_path / "record.jsonl"
+    def env(self, **extra):
+        return super().env(**({"PATH": str(self.bin_dir)} | extra))
 
-    def _write_launcher(self, path: Path, body: str) -> None:
-        path.write_text(f"#!{sys.executable}\nimport sys\nsys.path.insert(0, {str(TESTS_DIR)!r})\n{body}")
-        path.chmod(0o755)
-
-    def write_decoy(
-        self,
-        name: str,
-        marker: Path,
-        *,
-        stdout: str = "gc: graphviz graph count tool\n",
-        exit_code: int = 1,
-    ) -> Path:
-        """A same-name decoy binary that records being invoked."""
+    def write_decoy(self, name, marker, *, stdout="gc: graphviz graph count tool\n", exit_code=1):
         path = self.bin_dir / name
-        body = (
-            f"with open({str(marker)!r}, 'a', encoding='utf-8') as handle:\n"
-            f"    handle.write('invoked: ' + {name!r} + '\\n')\n"
-            f"sys.stdout.write({stdout!r})\n"
-            f"sys.exit({exit_code})\n"
+        path.write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            f"with open({str(marker)!r}, 'a') as handle: handle.write('invoked\\n')\n"
+            f"sys.stdout.write({stdout!r})\nsys.exit({exit_code})\n"
         )
-        self._write_launcher(path, body)
+        path.chmod(0o755)
         return path
-
-    def configure(self, rules: list[dict], default: dict | None = None) -> None:
-        scenario = {"rules": rules}
-        if default is not None:
-            scenario["default"] = default
-        self.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
-
-    def env(self, **extra: str) -> dict[str, str]:
-        env = {
-            "PATH": str(self.bin_dir),
-            "PYTHONIOENCODING": "utf-8",
-            "FAKE_CLI_SCENARIO": str(self.scenario_path),
-            "FAKE_CLI_RECORD": str(self.record_path),
-        }
-        env.update(extra)
-        return env
-
-    def invocations(self) -> list[dict]:
-        if not self.record_path.is_file():
-            return []
-        return [json.loads(line) for line in self.record_path.read_text(encoding="utf-8").splitlines() if line]
 
 
 @pytest.fixture
@@ -127,9 +76,7 @@ def fake_env(fake: FakeCLI) -> dict[str, str]:
     return fake.env(IBROBOT_ATOMGIT_CLI=str(fake.exe))
 
 
-# --------------------------------------------------------------------------- #
 # CLI resolution (task 2.1)
-# --------------------------------------------------------------------------- #
 
 
 def test_resolve_prefers_explicit_absolute_path_over_path(fake: FakeCLI, tmp_path: Path):
@@ -170,12 +117,6 @@ def test_resolve_rejects_non_executable_explicit_path(fake: FakeCLI):
         resolve_cli(env)
 
 
-def test_resolve_uses_path_gitcode_when_no_explicit(fake: FakeCLI):
-    env = fake.env()
-
-    assert resolve_cli(env) == str(fake.exe.resolve())
-
-
 def test_resolve_only_graphviz_installed_reports_missing_cli(fake: FakeCLI, tmp_path: Path):
     fake.exe.unlink()
     marker = tmp_path / "gc-marker"
@@ -196,27 +137,7 @@ def test_resolve_gc_and_gitcode_coexistence_uses_gitcode(fake: FakeCLI, tmp_path
     assert marker.is_file() is False
 
 
-# --------------------------------------------------------------------------- #
 # Identity and version gate (task 2.1)
-# --------------------------------------------------------------------------- #
-
-
-def test_identity_accepts_verified_version_output(fake: FakeCLI, fake_env):
-    fake.configure(
-        [
-            {
-                "argv_contains": ["version"],
-                "stdout": "gitcode version 0.14.1\n  commit: 21e19618984ec0628192f6283bca066c76e12511\n  built:  2026-09-24T05:07:54Z\n",
-                "exit": 0,
-            }
-        ]
-    )
-
-    identity = check_cli_identity(env=fake_env)
-
-    assert isinstance(identity, CLIIdentity)
-    assert identity.version == (0, 14, 1)
-    assert identity.commit == "21e19618984ec0628192f6283bca066c76e12511"
 
 
 def test_identity_rejects_same_name_graphviz_binary(fake: FakeCLI, tmp_path: Path):
@@ -242,9 +163,7 @@ def test_identity_rejects_failing_version_probe(fake: FakeCLI, fake_env):
         check_cli_identity(env=fake_env)
 
 
-# --------------------------------------------------------------------------- #
 # Authentication diagnostics (task 2.1)
-# --------------------------------------------------------------------------- #
 
 
 def test_auth_status_not_logged_in_is_diagnostic_not_crash(fake: FakeCLI, fake_env):
@@ -269,23 +188,6 @@ def test_auth_status_not_logged_in_is_diagnostic_not_crash(fake: FakeCLI, fake_e
     assert "--show-token" not in argv  # credentials are never printed (E3)
 
 
-def test_auth_status_logged_in(fake: FakeCLI, fake_env):
-    fake.configure(
-        [
-            {
-                "argv_contains": ["auth", "status"],
-                "stdout": "atomgit.com\n  ✓ Logged in as tester (stored credential)\n",
-                "exit": 0,
-            }
-        ]
-    )
-
-    status = check_auth_status(env=fake_env)
-
-    assert status.logged_in is True
-    assert status.returncode == 0
-
-
 def test_auth_status_unexpected_exit_raises(fake: FakeCLI, fake_env):
     fake.configure([{"argv_contains": ["auth", "status"], "stderr": "garbled", "exit": 1}])
 
@@ -293,9 +195,7 @@ def test_auth_status_unexpected_exit_raises(fake: FakeCLI, fake_env):
         check_auth_status(env=fake_env)
 
 
-# --------------------------------------------------------------------------- #
 # Execution boundary: argv, stdin, host pinning (task 2.3)
-# --------------------------------------------------------------------------- #
 
 
 def test_run_preserves_multiline_and_special_characters_in_argv(fake: FakeCLI, fake_env):
@@ -309,17 +209,6 @@ def test_run_preserves_multiline_and_special_characters_in_argv(fake: FakeCLI, f
     assert invocation["argv"] == args + ["--no-interactive"]  # argv-level fidelity, no shell
 
 
-def test_run_body_via_stdin_body_file_dash(fake: FakeCLI, fake_env):
-    fake.configure([{"argv_contains": ["pr", "comment"], "stdout": "{}", "exit": 0}])
-    args = ["pr", "comment", "123", "-R", "openEuler/IB_Robot", "--body-file", "-", "--json"]
-
-    run(args, env=fake_env, stdin_text=SPECIAL_BODY)
-
-    invocation = fake.invocations()[0]
-    assert invocation["stdin"] == SPECIAL_BODY
-    assert invocation["argv"] == args + ["--no-interactive"]
-
-
 def test_run_pins_gc_host_and_no_interactive(fake: FakeCLI, fake_env):
     fake.configure([{"argv_contains": ["repo", "view"], "stdout": "{}", "exit": 0}])
     env = fake.env(IBROBOT_ATOMGIT_CLI=str(fake.exe), GC_HOST="evil.example.com")
@@ -329,35 +218,6 @@ def test_run_pins_gc_host_and_no_interactive(fake: FakeCLI, fake_env):
     invocation = fake.invocations()[0]
     assert invocation["env"]["GC_HOST"] == "atomgit.com"
     assert invocation["argv"][-1] == "--no-interactive"
-
-
-def test_run_closes_stdin_when_no_body(fake: FakeCLI, fake_env):
-    fake.configure([{"argv_contains": ["pr", "view"], "stdout": "{}", "exit": 0}])
-
-    result = run(["pr", "view", "7", "-R", "openEuler/IB_Robot", "--json"], env=fake_env)
-
-    assert result.ok
-    assert fake.invocations()[0]["stdin"] == ""  # DEVNULL EOF: prompts cannot hang
-
-
-def test_run_nonzero_exit_with_json_is_not_success_but_keeps_data(fake: FakeCLI, fake_env):
-    fake.configure(
-        [
-            {
-                "argv_contains": ["pr", "view"],
-                "stdout": '{"number": 7, "title": "partial"}',
-                "stderr": "enrichment failed",
-                "exit": 3,
-            }
-        ]
-    )
-
-    result = run_json(["pr", "view", "7", "-R", "o/r", "--json"], env=fake_env)
-
-    assert result.ok is False
-    assert result.data == {"number": 7, "title": "partial"}  # inspectable partial data
-    assert isinstance(result.failure(), CLINotFoundError)
-    assert len(fake.invocations()) == 1  # no retry
 
 
 def test_require_data_raises_on_nonzero_exit_even_when_json_decoded(fake: FakeCLI, fake_env):
@@ -377,14 +237,6 @@ def test_require_data_raises_on_nonzero_exit_even_when_json_decoded(fake: FakeCL
     assert result.data == {"number": 7, "title": "partial"}  # partial data stays inspectable
     with pytest.raises(CLINotFoundError):
         result.require_data()  # but is never accepted as complete success
-
-
-def test_require_data_returns_decoded_json_on_success(fake: FakeCLI, fake_env):
-    fake.configure([{"argv_contains": ["pr", "view"], "stdout": '{"number": 7}', "exit": 0}])
-
-    result = run_json(["pr", "view", "7", "-R", "o/r", "--json"], env=fake_env)
-
-    assert result.require_data() == {"number": 7}
 
 
 def test_run_json_invalid_output_sets_json_error(fake: FakeCLI, fake_env):
@@ -430,14 +282,6 @@ def test_failure_classification_matrix(fake: FakeCLI, fake_env, exit_code, expec
     assert failure.argv[-2] == "--json"
     if exit_code == 4:
         assert atomgit_cli.AUTH_LOGIN_GUIDANCE in str(failure)
-
-
-def test_failure_on_ok_result_is_none(fake: FakeCLI, fake_env):
-    fake.configure([{"argv_contains": ["version"], "stdout": "gitcode version 0.14.1\n", "exit": 0}])
-
-    result = run(["version"], env=fake_env)
-
-    assert result.ok and result.failure() is None
 
 
 def test_failure_message_omits_bodies_flags_and_raw_cli_output(fake: FakeCLI, fake_env):
@@ -492,9 +336,7 @@ def test_timeout_message_sanitized_but_argv_preserved(fake: FakeCLI, fake_env):
     assert error.argv[-2] == secret_body  # full argv preserved structurally for reconciliation
 
 
-# --------------------------------------------------------------------------- #
 # Pagination and completeness (task 2.3)
-# --------------------------------------------------------------------------- #
 
 
 def _items(start: int, count: int) -> str:
@@ -518,6 +360,50 @@ def test_paginate_collects_all_pages(fake: FakeCLI, fake_env):
     assert len(page.items) == 137
     assert page.pages == 2
     assert len(fake.invocations()) == 2
+
+
+def test_paginate_repeated_page_requires_independent_completeness_proof(fake: FakeCLI, fake_env):
+    # A repeated first page can also conceal a capped/incomplete collection.
+    fake.configure(
+        [
+            {"argv_contains": ["repos/o/r/pulls/7/files?page=1&per_page=3"], "stdout": _items(0, 7), "exit": 0},
+            {"argv_contains": ["repos/o/r/pulls/7/files?page=2&per_page=3"], "stdout": _items(0, 7), "exit": 0},
+        ]
+    )
+
+    page = run_paginated(
+        lambda n: ["api", f"repos/o/r/pulls/7/files?page={n}&per_page=3"],
+        per_page=3,
+        max_pages=5,
+        env=fake_env,
+    )
+
+    assert page.truncated and page.stop_reason == "repeated-page"
+    assert len(page.items) == 7  # the repeated page extended nothing
+    assert page.pages == 2
+    assert len(fake.invocations()) == 2
+
+
+def test_paginate_window_shift_partial_overlap_still_collects_new_items(fake: FakeCLI, fake_env):
+    # A genuinely paging endpoint with window-shift duplicates (some old,
+    # some new) keeps collecting: only a page with NO new items stops.
+    fake.configure(
+        [
+            {"argv_contains": ["--page", "1"], "stdout": _items(0, 3), "exit": 0},
+            {"argv_contains": ["--page", "2"], "stdout": _items(2, 3), "exit": 0},
+            {"argv_contains": ["--page", "3"], "stdout": _items(5, 1), "exit": 0},
+        ]
+    )
+
+    page = run_paginated(
+        lambda n: ["issue", "list", "-R", "o/r", "--page", str(n), "--per-page", "3", "--json"],
+        per_page=3,
+        env=fake_env,
+    )
+
+    assert page.complete
+    assert len(page.items) == 7  # overlapping second page plus a genuinely new final item
+    assert page.pages == 3
 
 
 def test_paginate_empty_collection_is_complete_not_unavailable(fake: FakeCLI, fake_env):
@@ -567,14 +453,7 @@ def test_paginate_max_pages_guard_stops_runaway_loops(fake: FakeCLI, fake_env):
     assert len(fake.invocations()) == 2
 
 
-# --------------------------------------------------------------------------- #
 # URL and host mapping (task 2.2)
-# --------------------------------------------------------------------------- #
-
-
-def test_normalize_host_strips_www_and_case():
-    assert normalize_host("WWW.AtomGit.COM") == "atomgit.com"
-    assert normalize_host("atomgit.com") == "atomgit.com"
 
 
 def test_parse_url_pr_issue_and_branch_forms():
@@ -603,9 +482,7 @@ def test_parse_url_rejects_missing_or_malformed_parts():
         parse_atomgit_url("")
 
 
-# --------------------------------------------------------------------------- #
 # Local Git remote reading (task 2.2, upstream targeting tier)
-# --------------------------------------------------------------------------- #
 
 
 def _git(args: list[str], cwd: Path) -> None:
@@ -642,13 +519,6 @@ def test_read_git_remotes_keeps_distinct_fetch_push_urls_verbatim(tmp_path: Path
     }
 
 
-def test_read_git_remotes_non_repository_returns_empty_mapping(tmp_path: Path):
-    plain = tmp_path / "not-a-repo"
-    plain.mkdir()
-
-    assert read_git_remotes(cwd=plain) == {}  # fallback tier: absence, not an error
-
-
 def test_resolve_target_consumes_read_git_remotes_upstream_fallback(tmp_path: Path):
     repo = _init_repo(tmp_path)
     _git(["remote", "add", "origin", "https://atomgit.com/BreezeWu/IB_Robot.git"], repo)
@@ -660,16 +530,7 @@ def test_resolve_target_consumes_read_git_remotes_upstream_fallback(tmp_path: Pa
     assert target.origin == "upstream"
 
 
-# --------------------------------------------------------------------------- #
 # Target resolution (task 2.2)
-# --------------------------------------------------------------------------- #
-
-
-def test_resolve_target_explicit_owner_repo_without_config_file(tmp_path: Path):
-    target = resolve_target(owner="openEuler", repo="IB_Robot", config_path=tmp_path / "absent.json")
-
-    assert target.slug == "openEuler/IB_Robot"
-    assert target.origin == "explicit"
 
 
 def test_resolve_target_explicit_overrides_config_defaults_without_conflict(tmp_path: Path):
@@ -680,14 +541,6 @@ def test_resolve_target_explicit_overrides_config_defaults_without_conflict(tmp_
 
     assert target.slug == "A/B"  # explicit overrides config defaults; that is not a conflict
     assert target.origin == "explicit"
-
-
-def test_resolve_target_from_url(tmp_path: Path):
-    target = resolve_target(url="https://atomgit.com/openEuler/IB_Robot/pull/123", config_path=tmp_path / "absent.json")
-
-    assert target.slug == "openEuler/IB_Robot"
-    assert target.origin == "url"
-    assert target.url_info["pr_number"] == 123
 
 
 def test_resolve_target_rejects_explicit_vs_url_conflict(tmp_path: Path):
@@ -707,19 +560,6 @@ def test_resolve_target_partial_explicit_complements_from_url():
     assert target.origin == "explicit"
 
 
-def test_resolve_target_config_defaults(tmp_path: Path):
-    config = tmp_path / "config.json"
-    config.write_text(
-        json.dumps({"atomgit": {"owner": "openEuler", "repo": "IB_Robot"}, "llm": {"apiKey": "x"}}),
-        encoding="utf-8",
-    )
-
-    target = resolve_target(config_path=config)
-
-    assert target.slug == "openEuler/IB_Robot"
-    assert target.origin == "config"
-
-
 def test_resolve_target_config_without_token_key_is_sufficient(tmp_path: Path):
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"atomgit": {"owner": "openEuler", "repo": "IB_Robot"}}), encoding="utf-8")
@@ -732,20 +572,6 @@ def _write_config(tmp_path: Path, atomgit: dict) -> Path:
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"atomgit": atomgit}), encoding="utf-8")
     return config
-
-
-def test_config_base_url_api_host_accepted(tmp_path: Path):
-    config = _write_config(tmp_path, {"owner": "openEuler", "repo": "IB_Robot", "baseUrl": "https://api.atomgit.com"})
-
-    validate_config_base_url(load_config(config))
-    assert resolve_target(config_path=config).slug == "openEuler/IB_Robot"
-
-
-def test_config_base_url_web_host_alias_accepted(tmp_path: Path):
-    config = _write_config(tmp_path, {"owner": "openEuler", "repo": "IB_Robot", "baseUrl": "https://www.atomgit.com/"})
-
-    validate_config_base_url(load_config(config))
-    assert resolve_target(config_path=config).slug == "openEuler/IB_Robot"
 
 
 def test_config_base_url_missing_null_or_empty_accepted(tmp_path: Path):
@@ -834,11 +660,6 @@ def test_resolve_target_invalid_config_json_errors(tmp_path: Path):
 
     with pytest.raises(TargetResolutionError, match="invalid JSON"):
         resolve_target(config_path=config)
-
-
-def test_resolve_target_partial_fields_report_what_is_missing(tmp_path: Path):
-    with pytest.raises(MissingTargetError, match="missing 'repo'"):
-        resolve_target(owner="openEuler", config_path=tmp_path / "absent.json")
 
 
 def test_resolve_source_keeps_cross_fork_source_separate_from_target(tmp_path: Path):

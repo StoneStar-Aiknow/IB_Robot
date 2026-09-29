@@ -48,19 +48,36 @@ class ArchitectureReviewer:
                 candidates.append(candidate)
         return candidates
 
-    def get_readme_context(self, file_path: str, ref: str) -> dict:
-        """Fetch nearest package README context for a changed file."""
+    def get_readme_context(
+        self,
+        file_path: str,
+        head_source: review_helpers.HeadSource | None,
+        head_incomplete_reason: str | None = None,
+    ) -> dict:
+        """Fetch nearest package README context for a changed file.
+
+        Failures are recorded structurally (``content`` empty + ``errors``
+        list); they never become fake README text that could be reviewed as
+        documentation. Unprovable head sources make no platform call at all.
+        """
         candidates = self._candidate_readme_paths(file_path)
+        if head_source is None:
+            return {
+                "path": None,
+                "content": "",
+                "candidates": candidates,
+                "errors": [head_incomplete_reason or "PR head content source is unprovable"],
+            }
         errors = []
         for candidate in candidates:
             try:
-                content = review_helpers.fetch_file_content(self.cli, self.target, candidate, ref)
+                content = review_helpers.fetch_file_content(self.cli, head_source.target, candidate, head_source.sha)
                 return {
                     "path": candidate,
                     "content": review_helpers.add_line_numbers(content),
                     "candidates": candidates,
                 }
-            except Exception as e:
+            except atomgit_cli.CLIError as e:
                 errors.append(f"{candidate}: {e}")
 
         return {
@@ -74,7 +91,11 @@ class ArchitectureReviewer:
         """提取 PR 信息"""
         pr = review_helpers.fetch_pr_record(self.cli, self.target, pr_number)
         files = review_helpers.fetch_pr_files(self.cli, self.target, pr_number)
-        head_sha = pr.get("head", {}).get("sha", "HEAD")
+        # PR head content lives in the head repo at the complete head SHA
+        # (cross-fork gap fix); unprovable metadata marks content unavailable
+        # instead of silently reading the base repo at an ambiguous ref.
+        head_source, head_incomplete_reason = review_helpers.resolve_head_source(pr)
+        head_sha = pr.get("head", {}).get("sha") if isinstance(pr.get("head"), dict) else None
 
         changed_files = []
         for f in files:
@@ -89,17 +110,34 @@ class ArchitectureReviewer:
                     "patch": f.get("patch"),
                 }
 
-                # 获取文件内容（使用 PR 的 head SHA）
-                try:
-                    content = review_helpers.fetch_file_content(self.cli, self.target, filename, head_sha)
-                    file_data["content"] = review_helpers.add_line_numbers(content)
-                except Exception as e:
-                    file_data["content"] = f"# Error fetching content: {e}"
+                # Content unavailability is recorded structurally (content:
+                # None + content_error); errors are never stringified into a
+                # fake file body that could be reviewed as code.
+                if head_source is None:
+                    file_data["content"] = None
+                    file_data["content_error"] = head_incomplete_reason
+                else:
+                    try:
+                        content = review_helpers.fetch_file_content(
+                            self.cli, head_source.target, filename, head_source.sha
+                        )
+                        file_data["content"] = review_helpers.add_line_numbers(content)
+                    except atomgit_cli.CLIError as e:
+                        file_data["content"] = None
+                        file_data["content_error"] = str(e)
 
-                file_data["readme_context"] = self.get_readme_context(filename, head_sha)
+                file_data["readme_context"] = self.get_readme_context(filename, head_source, head_incomplete_reason)
                 changed_files.append(file_data)
 
         return {
+            # Explicit target identity so a submit can prove the context was
+            # extracted for exactly this owner/repo/PR (same-named forks at
+            # the same head SHA are not interchangeable).
+            "target": {
+                "owner": self.target.owner,
+                "repo": self.target.repo,
+                "pr_number": pr_number,
+            },
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
@@ -107,28 +145,54 @@ class ArchitectureReviewer:
                 "author": pr.get("user", {}).get("login"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
+                "head_source": {
+                    "repo": head_source.repo_slug if head_source else None,
+                    "sha": head_source.sha if head_source else None,
+                    "incomplete_reason": head_incomplete_reason,
+                },
                 "changed_files": changed_files,
-            }
+            },
         }
 
     def load_issues_from_json(self, json_path: str) -> list[ArchitectureIssue]:
-        """从 JSON 文件加载问题"""
+        """从 JSON 文件加载问题（整批先验校验，review 回补 4）。
+
+        任何一个 finding 无效都在返回前拒绝整批并列出所有坏条目；
+        调用方拿不到部分构造的列表，因此任何平台写入之前整批已校验。
+        """
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
+        if not isinstance(data, list):
+            raise ValueError(f"arch-issues file must contain a JSON array, got {type(data).__name__}")
+
         issues = []
-        for item in data:
-            issue = ArchitectureIssue(
-                file=item.get("file", ""),
-                line=item.get("line", 0),
-                title=item.get("title", ""),
-                description=item.get("description", ""),
-                severity=item.get("severity", "warning"),
-                pillar=item.get("pillar", "python"),
-                fix=item.get("fix"),
-                context_code=item.get("context_code"),
-            )
+        errors = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                errors.append(f"item {index}: not a JSON object")
+                continue
+            try:
+                issue = ArchitectureIssue(
+                    file=item.get("file", ""),
+                    line=item.get("line", 0),
+                    title=item.get("title", ""),
+                    description=item.get("description", ""),
+                    severity=item.get("severity", "warning"),
+                    pillar=item.get("pillar", "python"),
+                    fix=item.get("fix"),
+                    context_code=item.get("context_code"),
+                )
+            except (ValueError, TypeError) as error:
+                errors.append(f"item {index}: {error}")
+                continue
             issues.append(issue)
+
+        if errors:
+            raise ValueError(
+                f"arch-issues file rejected before any platform write ({len(errors)} invalid of {len(data)}): "
+                + "; ".join(errors)
+            )
 
         return issues
 
@@ -180,6 +244,29 @@ class ArchitectureReviewer:
                 print(f"✅ 提交 {len(pr_level_issues)} 条 PR 评论到 PR #{pr_number}（非变更文件，降级为 PR 级评论）")
             except Exception as e:
                 print(f"  ❌ PR 评论提交失败: {e}")
+
+
+def arch_context_path(output_dir: str | Path, repo: str, pr_number: int) -> Path:
+    """Path of the extract-info architecture context for one PR (contracts.md §5.6)."""
+    return Path(output_dir) / f"{repo.lower().replace('-', '_')}_pr_{pr_number}_arch_info.json"
+
+
+def validate_arch_context_for_submit(reviewer: "ArchitectureReviewer", pr_number: int, output_dir: str | Path) -> dict:
+    """Bind a manual submit to a complete extract-info context and revision.
+
+    Delegates to the shared :func:`review_helpers.validate_extract_context_file`:
+    target identity (owner/repo/pr_number), a structurally complete head source
+    object with a full 40/64-hex SHA consistent with the recorded head SHA,
+    complete per-file head content, and a head SHA matching the live PR head.
+    Any mismatch refuses the submission before a single platform write.
+    """
+    return review_helpers.validate_extract_context_file(
+        arch_context_path(output_dir, reviewer.target.repo, pr_number),
+        cli=reviewer.cli,
+        target=reviewer.target,
+        pr_number=pr_number,
+        what="architecture review",
+    )
 
 
 def mode_extract_info(args, reviewer: ArchitectureReviewer):
@@ -237,6 +324,14 @@ def mode_submit_review(args, reviewer: ArchitectureReviewer):
         print("")
         return
 
+    # The submit must be bound to a complete reviewed context and the current
+    # revision: findings JSON alone never reaches the platform (task 4 gap fix).
+    try:
+        validate_arch_context_for_submit(reviewer, args.pr, args.output_dir)
+    except (ValueError, atomgit_cli.CLIError) as error:
+        print(f"\n❌ 拒绝提交审查结果: {error}")
+        sys.exit(1)
+
     reviewer.submit_review(args.pr, issues)
 
     print("\n" + "=" * 60)
@@ -247,8 +342,15 @@ def mode_submit_review(args, reviewer: ArchitectureReviewer):
     print(f"\n🔗 PR 链接: {review_helpers.pr_url(reviewer.target, args.pr)}\n")
 
 
-def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: ArchitectureReviewer, config: dict):
-    """模式3: 自动审查（CI 使用，需要 LLM 配置）"""
+def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: ArchitectureReviewer, config: dict) -> bool:
+    """模式3: 自动审查（CI 使用，需要 LLM 配置）.
+
+    Returns ``True`` only when the review ran over a complete context and its
+    result was published (or previewed, for dry-run). Any head/file read
+    failure is accumulated and blocks every automatic publication — including
+    the architecture pass summary — because a partial review must never be
+    presented as review coverage.
+    """
     print("\n" + "=" * 60)
     print("🤖 模式: 自动审查（LLM驱动）")
     print("=" * 60)
@@ -264,7 +366,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
         print("   }")
         print("\n或者使用手动模式（AI Agent 调用）:")
         print(f"   python3 architecture_review.py --pr {args.pr} --extract-info")
-        return
+        return False
 
     # 创建 LLM 审查器
     llm_reviewer = LLMArchitectureReviewer(
@@ -274,14 +376,15 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
         llm_model=args.llm_model,
     )
 
-    # 获取 PR 信息以获取 head_sha
+    # 获取 PR 信息以证明 head 内容来源（跨 fork 修复：head.repo + 完整 head SHA）
     pr_info = review_helpers.fetch_pr_record(cli, target, args.pr)
-    head_sha = pr_info.get("head", {}).get("sha", "HEAD")
+    head_source, head_incomplete_reason = review_helpers.resolve_head_source(pr_info)
 
     print("\n📝 获取 PR 文件变更...")
     files = review_helpers.fetch_pr_files(cli, target, args.pr)
 
     all_issues = []
+    incomplete_reasons: list[str] = []
 
     for i, file_info in enumerate(files, 1):
         file_path = file_info["filename"]
@@ -303,11 +406,20 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
 
         print(f"\n[{i}/{len(files)}] 审查 {file_path}")
 
+        if head_source is None:
+            # 没有可证明的 head 内容来源时该文件无法审查（不用 base 仓库的
+            # 猜测 ref 冒充 PR head 内容，跨 fork 修复）；累计不完整原因，
+            # 任何自动发布前都会被阻止。
+            reason = f"{file_path}: PR head 内容来源无法证明 ({head_incomplete_reason})"
+            incomplete_reasons.append(reason)
+            print(f"  ⚠️  跳过：{reason}")
+            continue
+
         try:
-            # 获取文件内容（使用 head_sha）
-            content = review_helpers.fetch_file_content(cli, target, file_path, head_sha)
+            # 获取文件内容（head.repo @ 完整 head SHA）
+            content = review_helpers.fetch_file_content(cli, head_source.target, file_path, head_source.sha)
             diff = file_info.get("patch", "")
-            readme_context = reviewer.get_readme_context(file_path, head_sha)
+            readme_context = reviewer.get_readme_context(file_path, head_source, head_incomplete_reason)
 
             # 调用 LLM 审查
             print("  ⏳ 调用 LLM 进行架构审查...")
@@ -325,7 +437,21 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
                 print("  ✓ 未发现架构问题")
 
         except Exception as e:
-            print(f"  ✗ 审查失败: {e}")
+            reason = f"{file_path}: 架构审查失败: {e}"
+            incomplete_reasons.append(reason)
+            print(f"  ✗ {reason}")
+
+    if incomplete_reasons:
+        print("\n" + "=" * 60)
+        print(f"❌ 自动架构审查上下文不完整（{len(incomplete_reasons)} 项），已阻止任何发布（含通过摘要）:")
+        for reason in incomplete_reasons:
+            print(f"   - {reason}")
+        print("=" * 60)
+        if args.dry_run:
+            print(f"\n（Dry Run）已发现的 {len(all_issues)} 个架构问题不发布:")
+            for issue in all_issues:
+                print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
+        return False
 
     if args.dry_run:
         print("\n" + "=" * 60)
@@ -334,7 +460,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
         print(f"\n发现 {len(all_issues)} 个架构问题：")
         for issue in all_issues:
             print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
-        return
+        return True
 
     # 提交审查结果
     if all_issues:
@@ -359,6 +485,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: Architec
         print("=" * 60)
 
     print(f"\n🔗 PR 链接: {review_helpers.pr_url(target, args.pr)}\n")
+    return True
 
 
 def main():
@@ -484,8 +611,8 @@ def main():
         mode_extract_info(args, reviewer)
     elif args.submit_review:
         mode_submit_review(args, reviewer)
-    elif args.auto:
-        mode_auto(args, cli, target, reviewer, config)
+    elif args.auto and not mode_auto(args, cli, target, reviewer, config):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

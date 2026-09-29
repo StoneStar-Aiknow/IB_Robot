@@ -5,7 +5,7 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
 
 # 链接校验器
 
-对文档树做只读链接体检：本地相对链接查目标文件与锚点存在性，外部 URL 发真实 HTTP 请求，AtomGit 链接走 `api.atomgit.com` 逐类验证存在性。唯一入口 `scripts/link_validator.py`，单脚本零内部依赖，可直接整体拷贝到其他仓库使用。
+对文档树做只读链接体检：本地相对链接查目标文件与锚点存在性，外部 URL 发真实 HTTP 请求，AtomGit 链接通过官方 CLI 逐类验证存在性。入口为 `scripts/link_validator.py`，复用相邻的 `_shared/atomgit_cli.py`；迁移到其他仓库时需一并提供共享边界与官方 CLI。
 
 ## 何时调用
 
@@ -21,8 +21,6 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
 | `paths` | 是（位置参数，可多个） | 待扫描的文件或目录（目录递归） | — |
 | `--root` | 否 | 本地链接解析根；越出此根的相对链接判 broken | `.` |
 | `--report` | 否 | JSON 报告路径 | `<首个扫描目录的父目录>/reports/link_validation.json` |
-| `--config` | 否 | 含 `atomgit.token` 的 JSON 配置路径，支持 `$ATOMGIT_TOKEN` 占位符展开 | `config.json` |
-| `--access-token` | 否 | AtomGit 访问令牌，优先级最高 | — |
 | `--timeout` | 否 | 单请求超时（秒） | `10` |
 | `--max-workers` | 否 | 远程链接并发数 | `16` |
 | `--fail-on-inconclusive` | 否 | 存在 inconclusive 时也返回非零退出码 | 关闭 |
@@ -35,8 +33,7 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
     ```bash
     python -X utf8 <skill_dir>/scripts/link_validator.py <paths...> \
         --root <root> \
-        --report <report.json> \
-        --config config.json
+        --report <report.json>
     ```
 
 3. 命令产出：控制台只打印非 valid 项（格式 `STATUS 文件:行号 URL (detail)`）；JSON 报告含 `checked_summary`（全量各状态计数）、`reported_summary`（非 valid 计数）与非 valid 明细。命令输出与退出码可直接驱动后续动作；报告文件用于长输出兜底、修复前后对比与流程集成。
@@ -47,19 +44,23 @@ description: "校验 Markdown/RST 文档树中本地相对链接（文件与锚�
 |---|---|---|
 | `valid` | 目标存在且可访问 | 无需处理 |
 | `broken` | 目标不存在或不可达：本地文件缺失、链接越出 `--root`、空链接目标、外部 404/5xx、AtomGit 仓库/PR/commit/issue 不存在、`/blob/` 与 `/tree/` 路由词与目标类型不匹配、`#L10-L20` 行号超出文件实际行数、`/bolb/` 拼写错误 | 必须修复源文件 |
-| `auth_error` | 外部或 AtomGit 返回 401/403 | 确认访问权限或 token 是否有效 |
+| `auth_error` | 外部 HTTP 链接返回 401/403（AtomGit CLI 认证失败归 inconclusive） | 确认访问权限 |
 | `error` | 网络层失败或超时 | 排查网络后重跑，不计为文档缺陷 |
-| `inconclusive` | 无法确认：无 token 的 AtomGit 链接、fragment 近似算法未命中 | 按发布要求决定是否人工复核；需严格阻断时加 `--fail-on-inconclusive` |
+| `inconclusive` | 无法确认：CLI 不可用或未认证的 AtomGit 链接、fragment 近似算法未命中 | 按发布要求决定是否人工复核；需严格阻断时加 `--fail-on-inconclusive` |
 
-退出码：`0` 通过（允许存在 inconclusive）；`1` 存在 `broken` / `auth_error` / `error`（或开启 `--fail-on-inconclusive` 时的 inconclusive）；`2` token 配置错误。
+退出码：`0` 通过（允许存在 inconclusive）；`1` 存在 `broken` / `auth_error` / `error`（或开启 `--fail-on-inconclusive` 时的 inconclusive）；`2` 参数错误（包括已退役的 `--config` / `--access-token`）。
 
 **`broken` 与 `inconclusive` 必须区分对待**：前者是确定缺陷，后者是"没法确认"——把 inconclusive 当 broken 修或直接忽略，都是本技能最常见的误用方式。
 
-## Token 配置（AtomGit）
+## CLI 认证（AtomGit）
 
-解析优先级：`--access-token` > `--config` 指定 JSON 的 `atomgit.token` 字段（值支持 `$VAR` / `${VAR}` 环境变量展开）> 环境变量 `$ATOMGIT_TOKEN`。
+安装官方 CLI（已验证 v0.14.1），确保 `gitcode` 在 PATH，或使用 `IBROBOT_ATOMGIT_CLI`
+指定绝对路径。运行 `gitcode auth login --hostname atomgit.com` 完成认证；凭证由 CLI 管理，
+脚本不读取 token。旧 `--config` / `--access-token` 参数已退役，传入即退出 2。
 
-无 token 时 AtomGit 链接一律报 `inconclusive` 而非 `broken`，不会误报。受限仓库需要真实校验时，确保 `config.json` 中 `atomgit.token` 可通过 `$ATOMGIT_TOKEN` 展开，或显式传入 `--access-token`。
+AtomGit 平台不存在（CLI exit 3）才判为 broken；CLI 缺失、未认证、权限不足或网络失败均明确
+报告 inconclusive，不误报断链；本地和第三方外部链接仍照常校验。结果不确定时可以通过
+`--fail-on-inconclusive` 阻止交付。正式安装说明见 `docs/atomgit_cli_migration.md`。
 
 ## 行为边界
 

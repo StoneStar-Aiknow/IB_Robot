@@ -248,6 +248,11 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 
 ### AtomGit 协作
 
+所有 AtomGit 平台访问（PR/Issue/评审评论/链接校验）通过官方 AtomGit CLI 完成（已验证
+v0.14.1，`gitcode` 入口，经 `.agents/skills/_shared/atomgit_cli.py` 共享边界调用）。
+运行协作脚本前需 `gitcode auth login --hostname atomgit.com --with-token` 完成认证；
+项目不再安装或导入 `atomgit-sdk`，`config.json` 仅提供 `atomgit.owner/repo` 默认值。
+
 | 技能 | 触发场景 |
 |------|---------|
 | [atomgit-collaboration](.agents/skills/atomgit-collaboration) | 泛化协作请求路由（先识别再分流） |

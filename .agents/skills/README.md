@@ -77,28 +77,29 @@
 
 - **配置生成 ([deepwiki-config](./deepwiki-config))**: 从 DeepWiki 目录结构生成或增量更新 `doc_config.json`，保持 `deepwiki_processor.py` 可识别的层级与标签。
 - **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 配置优先流程：本地化配置标题后逐页翻译，再构建目录与索引并校验链接锚点，全程保持 H1、文件名与处理器规则一致。
-- **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；单脚本零内部依赖，可整体拷贝到其他 docs 仓库复用。
+- **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；AtomGit 访问复用 `_shared/atomgit_cli.py` 与官方 CLI，其他 docs 仓库复用时需同时携带共享边界。
 - **Mermaid 语法验证 ([mermaid-syntax-validation](./mermaid-syntax-validation))**: 对 Markdown/Sphinx 文档中的 Mermaid 图执行语法风险扫描、最小修复、Sphinx 构建和浏览器端渲染验证。
 
 ### 🌐 AtomGit 自动化工具
-这些技能通过集成 AtomGit API，实现了 PR / Issue 生命周期和代码审查的自动化。
+这些技能通过官方 AtomGit CLI 完成平台访问，实现了 PR / Issue 生命周期和代码审查的自动化。
 
-> **⚠️ 前置条件：配置 AtomGit Token**
+> **⚠️ 前置条件：安装并认证官方 AtomGit CLI（已验证 v0.14.1，`gitcode` 入口）**
 > 
-> 使用 AtomGit 相关技能前，必须先配置 Personal Access Token：
+> 使用 AtomGit 相关技能前，必须先完成 CLI 认证：
 > 
-> 1. 访问 https://atomgit.com 并登录
-> 2. 点击右上角头像 → 个人设置
-> 3. 找到「访问令牌」选项
-> 4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
-> 5. **立即复制保存** Token（只显示一次）
+> 1. 安装官方 AtomGit CLI（项目内隔离安装在 `tmp/tools/atomgit-cli/`，暴露 `gitcode`
+>    入口；不要覆盖系统 Graphviz 的 `gc`）
+> 2. 访问 https://atomgit.com → 右上角头像 → 个人设置 → 「访问令牌」→ 新建访问令牌
+>    （勾选 `repo` 和 `pull_request` 权限），**立即复制保存**（只显示一次）
+> 3. 认证（token 经 stdin 传入，不落盘）：
 > 
-> 设置环境变量：
 > ```bash
-> export ATOMGIT_TOKEN="your_token_here"
+> gitcode auth login --hostname atomgit.com --with-token
+> gitcode auth status
 > ```
 > 
-> Token 配置存储在项目根目录的 `config.json` 中，通过环境变量 `$ATOMGIT_TOKEN` 引用。
+> 认证与平台访问全部由 CLI 管理；脚本不读取 `config.json` 中的 token，也不使用
+> `ATOMGIT_TOKEN` 环境变量（旧 `token` 字段被忽略，请自行清理）。
 
 - **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、WIP/正式检视阶段选择、读取管理上下文和更新描述；coding agent 先执行实际工具版本命令，再将结果传给 `--agent-tool`；如果目标是通用 review，应改用 `atomgit-pr-review`。
 - **Issue 工作流 ([atomgit-issue](./atomgit-issue))**: 面向 Issue 资源本身，覆盖创建、读取、更新与状态流转，支持 `--owner` / `--repo` / `--url` 进行跨仓库调用。

@@ -507,8 +507,8 @@ setup_python_venv() {
             if [[ "${full_profile}" == true ]]; then
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
             else
-                # Inference profile: only the ONNX toolchain; skip mujoco (sim)
-                # and atomgit_sdk (collaboration CLI).
+                # Inference profile: only the ONNX toolchain; skip mujoco (sim).
+                # AtomGit collaboration now uses the official CLI (no pip package).
                 log_info "Installing inference ONNX tooling (inference profile)..."
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/inference.txt" --quiet
             fi

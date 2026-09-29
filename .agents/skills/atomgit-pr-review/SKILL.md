@@ -106,6 +106,9 @@ source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/pr_review
 **重要**: 
 - 提交前必须将具体审查结果展示给人类并获得确认；“review 这个 PR”不等于确认发布结果
 - **提交必须指定 `--ai-model` 参数**，使用你的真实模型名称
+- 提交前脚本会做上下文绑定校验：本 PR 的 `--extract-info` 上下文必须存在且 `target`
+  身份、head_source、逐文件内容完整，head SHA 仍与当前 PR head 一致；不满足即零平台
+  写入拒绝并要求重新提取（PR 更新后需重新走提取与审查）
 - 文件名格式：`./tmp/{repo}_pr_{number}_issues.json`（例如：`./tmp/ib_robot_pr_123_issues.json`）
 - 进行 IB_Robot PR review 时，必须在第 3 步开始时处理 `.pr.mandatory_review_checks`，重点检查
   `libs/lerobot` gitlink；此外还要检查 README / 文档是否应随变更同步，以及 PR 描述中的

@@ -429,14 +429,13 @@ IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCo
 controller 命令。自然语言 Workflow 必须先展示并 flush，随后立即进入 Gateway 校验和执行；运行中的 Agent
 不得开启 `authorize_motion`。
 
-### config.json 配置文件
+### config.json 配置文件与 AtomGit 认证
 
-`config.json` 用于存储 AI Agent 所需的配置信息，目前主要用于 AtomGit API 集成：
+`config.json` 用于存储 AI Agent 所需的配置信息，目前仅提供 AtomGit 目标仓库默认值：
 
 ```json
 {
   "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
     "owner": "openEuler",
     "repo": "IB_Robot",
     "baseUrl": "https://api.atomgit.com"
@@ -444,49 +443,25 @@ controller 命令。自然语言 Workflow 必须先展示并 flush，随后立�
 }
 ```
 
-**获取 AtomGit Personal Access Token**：
+AtomGit 平台访问（PR/Issue/评审评论等协作操作）全部通过官方 AtomGit CLI 完成，认证也由
+CLI 自己管理；脚本不再读取 `config.json` 中的 token，也不再使用 `ATOMGIT_TOKEN` 环境
+变量。若旧配置中仍残留 `token` 字段，它会被忽略，请自行清理。
 
-1. 访问 <https://atomgit.com> 并登录
-2. 点击右上角头像 → 个人设置
-3. 找到「访问令牌」选项
-4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
-5. **立即复制保存** Token（只显示一次）
+**安装与认证**：
 
-### 非交互式 shell 的环境配置
-
-把 Token 保存在仓库外的个人环境文件 `~/.config/ibrobot/env.sh` 中（先创建父目录），文件内容为：
-
-```bash
-export ATOMGIT_TOKEN="your_token_here"
-```
-
-限制文件权限：
+1. 安装官方 AtomGit CLI（项目内隔离安装在 `tmp/tools/atomgit-cli/`，`gitcode` 入口，
+   已验证版本 v0.14.1；不要覆盖系统的 Graphviz `gc` 命令）。
+2. 访问 <https://atomgit.com> → 右上角头像 → 个人设置 → 「访问令牌」→ 新建访问令牌
+   （勾选 `repo` 和 `pull_request` 权限），**立即复制保存**（只显示一次）。
+3. 完成认证（token 经 stdin 传入，不落盘）：
 
 ```bash
-chmod 600 ~/.config/ibrobot/env.sh
+gitcode auth login --hostname atomgit.com --with-token
+gitcode auth status   # 验证认证状态
 ```
 
-**Zsh**：在 `~/.zshenv` 中加载该文件；如果设置了 `ZDOTDIR`，使用 `$ZDOTDIR/.zshenv`。常规交互式和非交互式 Zsh 都会读取它（`zsh -f` 除外）：
-
-```bash
-[ ! -r "$HOME/.config/ibrobot/env.sh" ] || . "$HOME/.config/ibrobot/env.sh"
-```
-
-**Bash**：非交互式 Bash 通过环境变量 `BASH_ENV` 指定启动文件，不会自动读取 `.bashrc`。在实际使用的登录环境文件（通常为 `~/.bash_profile`）中设置：
-
-```bash
-export BASH_ENV="$HOME/.config/ibrobot/env.sh"
-[ ! -r "$BASH_ENV" ] || . "$BASH_ENV"
-```
-
-从该登录会话启动 Agent，子进程即可继承 Token 和 `BASH_ENV`。若从 IDE、服务或其他未继承登录环境的进程启动，应在它的启动环境中显式设置 `BASH_ENV`，或在启动 Agent 前加载上述环境文件。只修改 `.zshrc`／`.bashrc` 无法保证自动化进程取得 Token；已运行的 Agent 需要重新启动。
-
-可以检查变量是否存在，不输出 Token 内容：
-
-```bash
-zsh -c 'test -n "$ATOMGIT_TOKEN" && echo "ATOMGIT_TOKEN is set"'
-BASH_ENV="$HOME/.config/ibrobot/env.sh" bash -c 'test -n "$ATOMGIT_TOKEN" && echo "ATOMGIT_TOKEN is set"'
-```
+CLI 缺失或未认证时，协作脚本会以非零退出码报错并给出上述指引；`intro` 等非阻塞检查
+则把平台部分标记为不可用，不影响本地功能。
 
 ### 支持的 Agent
 

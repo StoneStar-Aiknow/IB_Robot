@@ -11,7 +11,10 @@ class CodeIssue:
     """代码审查 finding（本地数据类，替代已退役的 atomgit_sdk.CodeIssue）。
 
     字段与 SDK pydantic 模型保持一致；confidence 的 0-100 范围校验
-    （SDK ``ge=0 le=100``）以 ``__post_init__`` 保留。
+    （SDK ``ge=0 le=100``）以 ``__post_init__`` 保留。除 confidence 外，
+    file/line/title/description/type/severity 也在构造期整体校验
+    （review 回补 4）：整批 finding 在任何平台写入前先验校验，坏输入
+    立即失败而不是静默降级成残缺评论。
     """
 
     file: str
@@ -26,6 +29,22 @@ class CodeIssue:
     fix_explanation: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.file, str) or not self.file.strip():
+            raise ValueError("CodeIssue.file must be a non-empty string")
+        if not isinstance(self.line, int) or isinstance(self.line, bool) or self.line < 1:
+            raise ValueError(f"CodeIssue.line must be a positive integer, got {self.line!r}")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("CodeIssue.title must be a non-empty string")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("CodeIssue.description must be a non-empty string")
+        if self.type not in VALID_ISSUE_TYPES:
+            raise ValueError(f"unknown CodeIssue.type {self.type!r}; expected one of {sorted(VALID_ISSUE_TYPES)}")
+        if self.severity not in VALID_SEVERITIES:
+            raise ValueError(
+                f"unknown CodeIssue.severity {self.severity!r}; expected one of {sorted(VALID_SEVERITIES)}"
+            )
+        if not isinstance(self.confidence, int) or isinstance(self.confidence, bool):
+            raise ValueError(f"CodeIssue.confidence must be an integer, got {self.confidence!r}")
         if not 0 <= self.confidence <= 100:
             raise ValueError(f"confidence must be within 0-100, got {self.confidence}")
 
@@ -73,6 +92,15 @@ OFFICIAL_REFERENCES = {
         },
     ],
 }
+
+
+# Known finding vocabularies (review 回补 4): the reference table's own types
+# plus "maintainability" (pr_review.py mandatory lerobot-gitlink check). A
+# typo'd type/severity fails validation loudly instead of silently rendering a
+# degraded comment (unknown types would otherwise echo through get_type_name
+# and silently drop their reference block).
+VALID_ISSUE_TYPES = frozenset(OFFICIAL_REFERENCES) | {"maintainability"}
+VALID_SEVERITIES = frozenset({"critical", "error", "warning", "suggestion", "info"})
 
 
 class CommentFormatter:

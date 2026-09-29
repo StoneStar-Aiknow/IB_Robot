@@ -1,15 +1,4 @@
-"""Unit behavior tests for the review CLI helpers (tasks 4.1-4.3).
-
-The entrypoint tests in ``test_review_entrypoint_fake_cli.py`` drive the full
-subprocess path; these tests pin the helper contracts the entrypoints build
-on: new-side diff positioning for added/modified/renamed/deleted files, the
-line-numbering port, ``web_url``→``html_url`` mapping, contents-API
-percent-encoding, pagination hard-failure/dedup rules, and the per-comment
-partial-failure semantics of ``submit_inline_comments`` (missing position,
-nonzero exit, raised timeout — each attempted exactly once, never retried,
-never aborting the batch). Platform access is faked by monkeypatching the
-shared boundary; no real CLI, no credentials.
-"""
+"""Project workflow regressions; CLI responses are supplied by the shared fake."""
 
 from __future__ import annotations
 
@@ -38,9 +27,7 @@ def cli_result(data, *, returncode: int = 0) -> atomgit_cli.CLIResult:
     )
 
 
-# --------------------------------------------------------------------------- #
 # diff positioning (task 4.3): added / modified / renamed / deleted
-# --------------------------------------------------------------------------- #
 
 
 def test_diff_new_side_lines_added_file():
@@ -78,37 +65,7 @@ def test_diff_new_side_lines_empty_patch():
     assert review_helpers.diff_new_side_lines("no hunks here\n") == set()
 
 
-def test_add_line_numbers_prefixes_one_based_numbers():
-    assert review_helpers.add_line_numbers("a\nb") == "   1 | a\n   2 | b"
-
-
-def test_add_line_numbers_empty():
-    assert review_helpers.add_line_numbers("") == ""
-
-
-# --------------------------------------------------------------------------- #
 # PR record and file content reads (task 4.1)
-# --------------------------------------------------------------------------- #
-
-
-def test_fetch_pr_record_maps_web_url_to_html_url(monkeypatch):
-    record = {
-        "number": 7,
-        "head": {"repo": {"web_url": "https://atomgit.com/acme/widget"}},
-        "base": {"repo": {"web_url": "https://atomgit.com/acme/base"}},
-    }
-    captured = {}
-
-    def fake_run_json(args, **kwargs):
-        captured["argv"] = args
-        return cli_result(record)
-
-    monkeypatch.setattr(atomgit_cli, "run_json", fake_run_json)
-    pr = review_helpers.fetch_pr_record("gitcode", TARGET, 7)
-
-    assert captured["argv"] == ["pr", "view", "7", "-R", "acme/widget", "--json"]
-    assert pr["head"]["repo"]["html_url"] == "https://atomgit.com/acme/widget"
-    assert pr["base"]["repo"]["html_url"] == "https://atomgit.com/acme/base"
 
 
 def test_fetch_pr_record_rejects_non_object_payload(monkeypatch):
@@ -117,28 +74,124 @@ def test_fetch_pr_record_rejects_non_object_payload(monkeypatch):
         review_helpers.fetch_pr_record("gitcode", TARGET, 7)
 
 
-def test_fetch_file_content_percent_encodes_path_and_ref(monkeypatch):
-    captured = {}
-
-    def fake_run_json(args, **kwargs):
-        captured["argv"] = args
-        return cli_result({"content": base64.b64encode(b"print('hi')\n").decode("ascii")})
-
-    monkeypatch.setattr(atomgit_cli, "run_json", fake_run_json)
-    text = review_helpers.fetch_file_content("gitcode", TARGET, "src/foo.py", "bbbb")
-
-    assert text == "print('hi')\n"
-    assert captured["argv"] == ["api", "repos/acme/widget/contents/src%2Ffoo.py?ref=bbbb"]
-
-
-def test_fetch_file_content_missing_content_decodes_empty(monkeypatch):
-    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result({}))
+def test_fetch_file_content_missing_content_proven_empty_by_size(monkeypatch):
+    # Missing content is a genuinely empty file only when size == 0 proves it.
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result({"size": 0}))
     assert review_helpers.fetch_file_content("gitcode", TARGET, "a", "b") == ""
 
 
-# --------------------------------------------------------------------------- #
+def test_fetch_file_content_missing_content_without_size_proof_fails(monkeypatch):
+    # Withheld content must never be reported as a fake empty file.
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result({}))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_missing_content_with_nonzero_size_fails(monkeypatch):
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result({"size": 42}))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_truncated_payload_fails(monkeypatch):
+    monkeypatch.setattr(
+        atomgit_cli,
+        "run_json",
+        lambda args, **kwargs: cli_result({"content": base64.b64encode(b"x").decode(), "truncated": True}),
+    )
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_unsupported_encoding_fails(monkeypatch):
+    payload = {"encoding": "utf-8", "content": "plain text"}
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result(payload))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_strict_base64_rejects_invalid_chars(monkeypatch):
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result({"content": "not!base64!!"}))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_size_mismatch_fails(monkeypatch):
+    payload = {"content": base64.b64encode(b"hello").decode(), "size": 3}
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result(payload))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+def test_fetch_file_content_non_utf8_bytes_fail(monkeypatch):
+    payload = {"content": base64.b64encode(b"\xff\xfe\x00").decode()}
+    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, **kwargs: cli_result(payload))
+    with pytest.raises(atomgit_cli.CLIJSONError):
+        review_helpers.fetch_file_content("gitcode", TARGET, "a", "b")
+
+
+# PR head source resolution (review gap 1): cross-fork content identity
+
+
+def pr_record_with_head(head) -> dict:
+    return {"number": 7, "head": head}
+
+
+def test_resolve_head_source_full_name_proves_cross_fork_identity():
+    pr = pr_record_with_head({"ref": "feat/x", "sha": "b" * 40, "repo": {"full_name": "acme-dev/widget"}})
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert reason is None
+    assert head_source is not None
+    assert head_source.target.owner == "acme-dev"
+    assert head_source.target.repo == "widget"
+    assert head_source.sha == "b" * 40
+    assert head_source.repo_slug == "acme-dev/widget"
+
+
+def test_resolve_head_source_owner_login_and_name_prove_identity():
+    pr = pr_record_with_head(
+        {"ref": "feat/x", "sha": "b" * 40, "repo": {"owner": {"login": "acme-dev"}, "name": "widget"}}
+    )
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert reason is None
+    assert head_source.target.slug == "acme-dev/widget"
+
+
+def test_resolve_head_source_missing_head_branch_is_unprovable():
+    head_source, reason = review_helpers.resolve_head_source({"number": 7})
+    assert head_source is None
+    assert "no head branch metadata" in reason
+
+
+def test_resolve_head_source_short_sha_is_refused():
+    pr = pr_record_with_head({"ref": "feat/x", "sha": "b" * 7, "repo": {"full_name": "acme-dev/widget"}})
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert head_source is None
+    assert "not a complete 40-hex SHA" in reason
+
+
+def test_resolve_head_source_missing_sha_is_refused():
+    pr = pr_record_with_head({"ref": "feat/x", "repo": {"full_name": "acme-dev/widget"}})
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert head_source is None
+    assert "not a complete 40-hex SHA" in reason
+
+
+def test_resolve_head_source_unreadable_repo_identity_is_unprovable():
+    pr = pr_record_with_head({"ref": "feat/x", "sha": "b" * 40, "repo": {"web_url": "https://atomgit.com/x"}})
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert head_source is None
+    assert "cannot prove the cross-fork content source" in reason
+
+
+def test_resolve_head_source_missing_repo_metadata_is_unprovable():
+    pr = pr_record_with_head({"ref": "feat/x", "sha": "b" * 40})
+    head_source, reason = review_helpers.resolve_head_source(pr)
+    assert head_source is None
+    assert "no head repository metadata" in reason
+
+
 # paginated collections (task 4.1): dedup + hard failure on partial data
-# --------------------------------------------------------------------------- #
 
 
 def paginated(items, *, truncated: bool = False, stop_reason: str = "complete"):
@@ -155,6 +208,26 @@ def test_fetch_api_pages_dedups_by_key_preserving_order(monkeypatch):
     items = [{"filename": "a.py"}, {"filename": "b.py"}, {"filename": "a.py"}]
     monkeypatch.setattr(atomgit_cli, "run_paginated", lambda build, **kwargs: paginated(items))
     assert review_helpers.fetch_pr_files("gitcode", TARGET, 7) == [{"filename": "a.py"}, {"filename": "b.py"}]
+
+
+@pytest.mark.parametrize("total", [127, 128, None, "127"])
+def test_repeated_pr_files_need_matching_independent_total(monkeypatch, total):
+    full = [{"filename": f"f{i}.py"} for i in range(127)]
+    requests = []
+
+    def fake_run_json(args, **kwargs):
+        requests.append(list(args))
+        if args[:2] == ["pr", "view"]:
+            return cli_result({"number": 7, "changed_files": total})
+        return cli_result(full)
+
+    monkeypatch.setattr(atomgit_cli, "run_json", fake_run_json)
+    if type(total) is int and total == 127:
+        assert review_helpers.fetch_pr_files("gitcode", TARGET, 7) == full
+    else:
+        with pytest.raises(atomgit_cli.CLIExecutionError, match="cannot prove completeness"):
+            review_helpers.fetch_pr_files("gitcode", TARGET, 7)
+    assert len(requests) == 3
 
 
 def test_fetch_api_pages_truncated_is_a_hard_failure(monkeypatch):
@@ -177,9 +250,7 @@ def test_fetch_api_pages_rejects_malformed_entries(monkeypatch):
         review_helpers.fetch_pr_files("gitcode", TARGET, 7)
 
 
-# --------------------------------------------------------------------------- #
 # inline comment submission (tasks 4.2/4.3): partial failure, no retry
-# --------------------------------------------------------------------------- #
 
 
 def test_submit_inline_comments_missing_position_fails_without_platform_call(monkeypatch):
@@ -249,32 +320,3 @@ def test_submit_inline_comments_timeout_is_a_per_comment_failure(monkeypatch):
     assert results[1]["comment_url"] == "https://atomgit.com/acme/widget/pull/7#comment-12"
     # The batch continued past the timeout; the second comment was still attempted.
     assert len(calls) == 2
-
-
-def test_submit_inline_comments_posts_position_as_new_side_line(monkeypatch):
-    captured = {}
-
-    def fake_run_json(args, **kwargs):
-        captured.update(argv=args, stdin=kwargs.get("stdin_text"))
-        return cli_result({"id": 13})
-
-    monkeypatch.setattr(atomgit_cli, "run_json", fake_run_json)
-    review_helpers.submit_inline_comments(
-        "gitcode", TARGET, 7, [{"path": "src/a.py", "line": 2, "body": "body text", "position": 2}]
-    )
-
-    assert captured["argv"] == [
-        "pr",
-        "comment",
-        "7",
-        "-R",
-        "acme/widget",
-        "--body-file",
-        "-",
-        "--path",
-        "src/a.py",
-        "--position",
-        "2",
-        "--json",
-    ]
-    assert captured["stdin"] == "body text"

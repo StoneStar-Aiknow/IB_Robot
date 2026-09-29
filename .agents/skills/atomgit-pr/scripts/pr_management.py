@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[2] / "_shared"))
 
 import atomgit_cli
+import review_helpers
 from ai_compliance import (
     add_ai_disclosure,
     reject_handwritten_disclosure,
@@ -51,11 +52,6 @@ from verification_gate import (
 )
 
 
-def pr_url(target: atomgit_cli.RepoTarget, pr_number: int) -> str:
-    """Construct the web URL locally (registered web host only; no platform call)."""
-    return f"https://{atomgit_cli.DEFAULT_WEB_HOST}/{target.owner}/{target.repo}/pull/{pr_number}"
-
-
 def run_or_raise(argv: list[str], cli: str, *, stdin_text: str | None = None) -> atomgit_cli.CLIResult:
     """Run one CLI invocation; a nonzero exit raises its classified failure."""
     result = atomgit_cli.run(argv, cli=cli, stdin_text=stdin_text)
@@ -65,117 +61,11 @@ def run_or_raise(argv: list[str], cli: str, *, stdin_text: str | None = None) ->
     return result
 
 
-def fetch_pr_record(cli: str, target: atomgit_cli.RepoTarget, pr_number: int) -> dict:
-    """Read one PR via ``pr view --json`` into the project-shaped record.
-
-    CLI Repository objects expose the web URL under ``web_url`` (Go json tag,
-    evidence gc_queries_repo.go); the project structure keeps ``html_url``
-    (consumed by :func:`verification_gate.resolve_pr_head_tree`), so the CLI
-    field is mapped here instead of widening the shared gate (design.md D3).
-    """
-    result = atomgit_cli.run_json(
-        ["pr", "view", str(pr_number), "-R", target.slug, "--json"],
-        cli=cli,
-    )
-    pr = result.require_data()
-    if not isinstance(pr, dict):
-        raise atomgit_cli.CLIJSONError(
-            f"pr view returned {type(pr).__name__} instead of a JSON object",
-            argv=result.argv,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-    for branch_key in ("head", "base"):
-        branch = pr.get(branch_key)
-        if not isinstance(branch, dict):
-            continue
-        repo = branch.get("repo")
-        if isinstance(repo, dict) and not repo.get("html_url") and repo.get("web_url"):
-            repo["html_url"] = repo["web_url"]
-    return pr
-
-
-def fetch_pr_comments(cli: str, target: atomgit_cli.RepoTarget, pr_number: int) -> list[dict]:
-    """All PR comments via ``pr comments --limit 0`` (help: 0 = all)."""
-    result = atomgit_cli.run_json(
-        ["pr", "comments", str(pr_number), "-R", target.slug, "--json", "--limit", "0"],
-        cli=cli,
-    )
-    comments = result.require_data()
-    if not isinstance(comments, list):
-        raise atomgit_cli.CLIJSONError(
-            f"pr comments returned {type(comments).__name__} instead of a JSON array",
-            argv=result.argv,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-    non_object_entries = [comment for comment in comments if not isinstance(comment, dict)]
-    if non_object_entries:
-        raise atomgit_cli.CLIJSONError(
-            f"pr comments array contains {len(non_object_entries)} non-object entries; "
-            "refusing to write a partial PR context",
-            argv=result.argv,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-    return comments
-
-
-def fetch_api_pages(cli: str, endpoint: str, *, what: str, key: str) -> list[dict]:
-    """Traverse every page of a v5 GET endpoint through ``gitcode api``.
-
-    The ``api`` command has no ``--paginate`` flag (capability matrix, api
-    help evidence), so the shared boundary's page loop is used. Window-shift
-    duplicates (the quirk the SDK's comment pagination deduped defensively)
-    are dropped by ``key`` while preserving first-seen order. A failed page or
-    the page cap marks the collection incomplete, and callers must not run
-    fingerprint or compliance logic on partial data, so incompleteness is a
-    hard failure here (design.md D3: no partial "no dependency change").
-    """
-
-    def build_page_args(page: int) -> list[str]:
-        separator = "&" if "?" in endpoint else "?"
-        return ["api", f"{endpoint}{separator}page={page}&per_page=100"]
-
-    result = atomgit_cli.run_paginated(build_page_args, cli=cli)
-    if result.truncated:
-        last = result.last_result
-        raise atomgit_cli.CLIExecutionError(
-            f"could not read the complete {what} collection (stop reason: {result.stop_reason}); "
-            "refusing to proceed on partial data",
-            argv=last.argv if last else None,
-            returncode=last.returncode if last else None,
-            stdout=last.stdout if last else "",
-            stderr=last.stderr if last else "",
-        )
-    items: list[dict] = []
-    seen: set = set()
-    for entry in result.items:
-        if not isinstance(entry, dict):
-            raise atomgit_cli.CLIJSONError(
-                f"{what} page contained a non-object entry; refusing to proceed on partial data",
-                argv=last.argv if (last := result.last_result) else None,
-                returncode=last.returncode if last else None,
-                stdout=last.stdout if last else "",
-                stderr=last.stderr if last else "",
-            )
-        identity = entry.get(key)
-        if not identity:
-            raise atomgit_cli.CLIJSONError(
-                f"{what} page contained an entry without a {key!r} field; refusing to proceed on partial data",
-                argv=result.last_result.argv if result.last_result else None,
-                returncode=result.last_result.returncode if result.last_result else None,
-                stdout=result.last_result.stdout if result.last_result else "",
-                stderr=result.last_result.stderr if result.last_result else "",
-            )
-        if identity in seen:
-            continue
-        seen.add(identity)
-        items.append(entry)
-    return items
+# PR reads share the single review boundary (review 回补 5):
+# ``review_helpers.fetch_pr_record`` / ``fetch_pr_comments`` /
+# ``fetch_pr_commits`` / ``fetch_pr_files`` / ``pr_url``. The former local
+# duplicates implemented byte-identical argv building and integrity rules;
+# semantic parity is covered by the shared boundary's behavior tests.
 
 
 def mode_fetch_info(args, cli: str, target: atomgit_cli.RepoTarget):
@@ -192,20 +82,10 @@ def mode_fetch_info(args, cli: str, target: atomgit_cli.RepoTarget):
     print(f"\n📝 正在从 #{args.pr} 抓取元数据...")
 
     try:
-        pr = fetch_pr_record(cli, target, args.pr)
-        commits = fetch_api_pages(
-            cli,
-            f"repos/{target.owner}/{target.repo}/pulls/{args.pr}/commits",
-            what="PR commits",
-            key="sha",
-        )
-        files = fetch_api_pages(
-            cli,
-            f"repos/{target.owner}/{target.repo}/pulls/{args.pr}/files",
-            what="PR files",
-            key="filename",
-        )
-        comments = [] if args.no_comments else fetch_pr_comments(cli, target, args.pr)
+        pr = review_helpers.fetch_pr_record(cli, target, args.pr)
+        commits = review_helpers.fetch_pr_commits(cli, target, args.pr)
+        files = review_helpers.fetch_pr_files(cli, target, args.pr)
+        comments = [] if args.no_comments else review_helpers.fetch_pr_comments(cli, target, args.pr)
         verification_inputs = compute_verification_inputs(files)
         legacy_inputs = compute_legacy_verification_inputs(files)
         # task 3.2 review: 显式标记输入不完整（缺 patch 或截断），供 Agent/评审
@@ -326,19 +206,9 @@ def mode_update_pr(args, cli: str, target: atomgit_cli.RepoTarget):
             print("❌ 错误: JSON 中未找到 'description' 字段")
             return
 
-        commits = fetch_api_pages(
-            cli,
-            f"repos/{target.owner}/{target.repo}/pulls/{args.pr}/commits",
-            what="PR commits",
-            key="sha",
-        )
-        pr = fetch_pr_record(cli, target, args.pr)
-        files = fetch_api_pages(
-            cli,
-            f"repos/{target.owner}/{target.repo}/pulls/{args.pr}/files",
-            what="PR files",
-            key="filename",
-        )
+        commits = review_helpers.fetch_pr_commits(cli, target, args.pr)
+        pr = review_helpers.fetch_pr_record(cli, target, args.pr)
+        files = review_helpers.fetch_pr_files(cli, target, args.pr)
         title = title or pr.get("title") or ""
         validate_commit_ai_model(commits, args.ai_model)
         agent_tool = validate_agent_tool(args.agent_tool)
@@ -424,7 +294,7 @@ def mode_update_pr(args, cli: str, target: atomgit_cli.RepoTarget):
         # (spec: post-write verification preserves known mutation outcome)。
         if gate_triggered:
             try:
-                updated_pr = fetch_pr_record(cli, target, args.pr)
+                updated_pr = review_helpers.fetch_pr_record(cli, target, args.pr)
                 validate_verification_metadata(
                     description,
                     verification_inputs,
@@ -434,12 +304,12 @@ def mode_update_pr(args, cli: str, target: atomgit_cli.RepoTarget):
                 )
             except Exception as e:
                 print(f"\n⚠️  PR #{args.pr} 描述已写入，但写后校验未完成: {e}")
-                print(f"🔗 链接: {pr_url(target, args.pr)}")
+                print(f"🔗 链接: {review_helpers.pr_url(target, args.pr)}")
                 print("   请先对账 PR 当前状态（不要盲目重复写入），校验完成后重新运行 --update-pr。")
                 sys.exit(1)
 
         print(f"\n✅ PR #{args.pr} 描述已更新")
-        print(f"🔗 链接: {pr_url(target, args.pr)}")
+        print(f"🔗 链接: {review_helpers.pr_url(target, args.pr)}")
 
     except Exception as e:
         print(f"\n❌ 更新失败: {e}")

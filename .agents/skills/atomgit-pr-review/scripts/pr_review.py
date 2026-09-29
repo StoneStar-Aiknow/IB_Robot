@@ -334,7 +334,11 @@ class CodeReviewer:
         files = review_helpers.fetch_pr_files(self.cli, self.target, pr_number)
         commits = review_helpers.fetch_pr_commits(self.cli, self.target, pr_number)
         comments = [] if not include_comments else review_helpers.fetch_pr_comments(self.cli, self.target, pr_number)
-        head_sha = pr.get("head", {}).get("sha", "HEAD")
+        # PR head content lives in the head repo at the complete head SHA
+        # (cross-fork gap fix); unprovable metadata marks content unavailable
+        # instead of silently reading the base repo at an ambiguous ref.
+        head_source, head_incomplete_reason = review_helpers.resolve_head_source(pr)
+        head_sha = pr.get("head", {}).get("sha") if isinstance(pr.get("head"), dict) else None
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
         mandatory_review_checks = self._build_mandatory_review_checks(files)
@@ -358,19 +362,47 @@ class CodeReviewer:
                     "patch": f.get("patch"),
                 }
 
-                try:
-                    content = review_helpers.fetch_file_content(self.cli, self.target, f.get("filename"), head_sha)
-                    file_data["content"] = review_helpers.add_line_numbers(content)
-                except Exception as e:
-                    file_data["content"] = f"# Error fetching content: {e}"
+                # Content unavailability is recorded structurally (content:
+                # None + content_error). Errors are never stringified into a
+                # fake file body that could be reviewed as code.
+                if head_source is None:
+                    file_data["content"] = None
+                    file_data["content_error"] = head_incomplete_reason
+                else:
+                    try:
+                        content = review_helpers.fetch_file_content(
+                            self.cli, head_source.target, f.get("filename"), head_source.sha
+                        )
+                        file_data["content"] = review_helpers.add_line_numbers(content)
+                    except atomgit_cli.CLIError as error:
+                        file_data["content"] = None
+                        file_data["content_error"] = str(error)
 
                 changed_files.append(file_data)
 
         inline_comment_count = sum(1 for comment in comments if comment.get("path") or comment.get("diff_file"))
-        unresolved_comment_count = sum(1 for comment in comments if not comment.get("resolved_at"))
+        # ``resolved_at`` unreadable (key absent) is not evidence of an
+        # unresolved thread: only explicit null/negative states count, and the
+        # aggregate is marked unknown so consumers can withhold conclusions
+        # (matrix B2: resolved-state readability is pending verification).
+        unresolved_comment_count = 0
+        unresolved_comments_unknown = False
+        for comment in comments:
+            if "resolved_at" not in comment:
+                unresolved_comments_unknown = True
+            elif not comment.get("resolved_at"):
+                unresolved_comment_count += 1
 
         return {
             "fetch_time": datetime.now().isoformat(),
+            # Explicit target identity so a submit can prove the context was
+            # extracted for exactly this owner/repo/PR (same-named forks at
+            # the same head SHA are not interchangeable).
+            "target": {
+                "owner": self.target.owner,
+                "repo": self.target.repo,
+                "pr_number": pr_number,
+            },
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
@@ -379,6 +411,11 @@ class CodeReviewer:
                 "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
+                "head_source": {
+                    "repo": head_source.repo_slug if head_source else None,
+                    "sha": head_source.sha if head_source else None,
+                    "incomplete_reason": head_incomplete_reason,
+                },
                 "head_tree": head_tree,
                 "wip": is_wip_title(pr.get("title") or ""),
                 "mandatory_review_checks": mandatory_review_checks,
@@ -393,6 +430,9 @@ class CodeReviewer:
                     "comments": len(comments),
                     "inline_comments": inline_comment_count,
                     "unresolved_comments": unresolved_comment_count,
+                    "unresolved_comments_state": "unknown"
+                    if unresolved_comments_unknown
+                    else "resolved_state_readable",
                     "additions": additions,
                     "deletions": deletions,
                 },
@@ -410,27 +450,50 @@ class CodeReviewer:
         }
 
     def load_issues_from_json(self, json_path: str) -> list[CodeIssue]:
-        """从 JSON 文件加载问题"""
+        """从 JSON 文件加载问题（整批先验校验，review 回补 4）。
+
+        任何一个 finding 无效都在返回前拒绝整批并列出所有坏条目；
+        调用方拿不到部分构造的列表，因此任何平台写入之前整批已校验。
+        """
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
+        if not isinstance(data, list):
+            raise ValueError(f"issues file must contain a JSON array, got {type(data).__name__}")
+
         issues = []
-        for item in data:
-            issue = CodeIssue(
-                file=item.get("file", ""),
-                line=item.get("line", 0),
-                type=item.get("type", "bug"),
-                severity=item.get("severity", "warning"),
-                confidence=item.get("confidence", 80),
-                title=item.get("title", ""),
-                description=item.get("description", ""),
-                context_code=item.get("contextCode") or item.get("context_code"),
-                fix_code=item.get("fix", {}).get("code") if isinstance(item.get("fix"), dict) else item.get("fix_code"),
-                fix_explanation=item.get("fix", {}).get("explanation")
-                if isinstance(item.get("fix"), dict)
-                else item.get("fix_explanation"),
-            )
+        errors = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                errors.append(f"item {index}: not a JSON object")
+                continue
+            try:
+                issue = CodeIssue(
+                    file=item.get("file", ""),
+                    line=item.get("line", 0),
+                    type=item.get("type", "bug"),
+                    severity=item.get("severity", "warning"),
+                    confidence=item.get("confidence", 80),
+                    title=item.get("title", ""),
+                    description=item.get("description", ""),
+                    context_code=item.get("contextCode") or item.get("context_code"),
+                    fix_code=item.get("fix", {}).get("code")
+                    if isinstance(item.get("fix"), dict)
+                    else item.get("fix_code"),
+                    fix_explanation=item.get("fix", {}).get("explanation")
+                    if isinstance(item.get("fix"), dict)
+                    else item.get("fix_explanation"),
+                )
+            except (ValueError, TypeError) as error:
+                errors.append(f"item {index}: {error}")
+                continue
             issues.append(issue)
+
+        if errors:
+            raise ValueError(
+                f"issues file rejected before any platform write ({len(errors)} invalid of {len(data)}): "
+                + "; ".join(errors)
+            )
 
         return issues
 
@@ -484,6 +547,29 @@ class CodeReviewer:
         }
 
 
+def review_context_path(output_dir: str | Path, repo: str, pr_number: int) -> Path:
+    """Path of the extract-info review context for one PR (contracts.md §5.5)."""
+    return Path(output_dir) / f"{repo.lower().replace('-', '_')}_pr_{pr_number}_info.json"
+
+
+def validate_review_context_for_submit(reviewer: "CodeReviewer", pr_number: int, output_dir: str | Path) -> dict:
+    """Bind a manual submit to a complete extract-info context and revision.
+
+    Delegates to the shared :func:`review_helpers.validate_extract_context_file`:
+    target identity (owner/repo/pr_number), a structurally complete head source
+    object with a full 40/64-hex SHA consistent with the recorded head SHA,
+    complete per-file head content, and a head SHA matching the live PR head.
+    Any mismatch refuses the submission before a single platform write.
+    """
+    return review_helpers.validate_extract_context_file(
+        review_context_path(output_dir, reviewer.target.repo, pr_number),
+        cli=reviewer.cli,
+        target=reviewer.target,
+        pr_number=pr_number,
+        what="review",
+    )
+
+
 def mode_extract_info(args, reviewer: CodeReviewer):
     """模式1: 提取 PR 信息（AI Agent 使用）"""
     print("\n" + "=" * 60)
@@ -510,6 +596,8 @@ def mode_extract_info(args, reviewer: CodeReviewer):
     print(f"   评论: {pr_info['pr']['stats']['comments']} 条")
     if not args.no_comments:
         print(f"   未解决评论: {pr_info['pr']['stats']['unresolved_comments']} 条")
+        if pr_info["pr"]["stats"]["unresolved_comments_state"] == "unknown":
+            print("   （resolved_at 字段不可读，未解决数按 unknown 处理，不含状态未知评论）")
 
     mandatory_checks = pr_info["pr"].get("mandatory_review_checks", [])
     if mandatory_checks:
@@ -543,6 +631,14 @@ def mode_submit_review(args, reviewer: CodeReviewer):
         print("")
         return
 
+    # The submit must be bound to a complete reviewed context and the current
+    # revision: findings JSON alone never reaches the platform (task 4 gap fix).
+    try:
+        validate_review_context_for_submit(reviewer, args.pr, args.output_dir)
+    except (ValueError, atomgit_cli.CLIError) as error:
+        print(f"\n❌ 拒绝提交审查结果: {error}")
+        sys.exit(1)
+
     result = reviewer.submit_issues(args.pr, issues)
 
     print("\n" + "=" * 60)
@@ -554,8 +650,15 @@ def mode_submit_review(args, reviewer: CodeReviewer):
     print(f"\n🔗 PR 链接: {review_helpers.pr_url(reviewer.target, args.pr)}\n")
 
 
-def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeReviewer, config: dict):
-    """模式3: 自动审查（CI 使用，需要 LLM 配置）"""
+def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeReviewer, config: dict) -> bool:
+    """模式3: 自动审查（CI 使用，需要 LLM 配置）.
+
+    Returns ``True`` only when the review ran over a complete context and its
+    result was published (or previewed, for dry-run). Any head/file read
+    failure is accumulated and blocks every automatic publication — including
+    the "no issues found" pass summary — because a partial review must never
+    be presented as review coverage.
+    """
     print("\n" + "=" * 60)
     print("🤖 模式: 自动审查（LLM驱动）")
     print("=" * 60)
@@ -570,10 +673,10 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
         print("   }")
         print("\n或者使用手动模式（AI Agent 调用）:")
         print(f"   python3 pr_review.py --pr {args.pr} --extract-info")
-        return
+        return False
 
     pr_info = review_helpers.fetch_pr_record(cli, target, args.pr)
-    head_sha = pr_info.get("head", {}).get("sha", "HEAD")
+    head_source, head_incomplete_reason = review_helpers.resolve_head_source(pr_info)
 
     llm_reviewer = LLMCodeReviewer(
         api_key=config["anthropic"]["apiKey"],
@@ -610,6 +713,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
         if check["id"] == "lerobot_gitlink_changed"
     ]
 
+    incomplete_reasons: list[str] = []
     for i, file_info in enumerate(files, 1):
         file_path = file_info["filename"]
 
@@ -621,8 +725,17 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
 
         print(f"\n[{i}/{len(files)}] 审查 {file_path}")
 
+        if head_source is None:
+            # 没有可证明的 head 内容来源时该文件无法审查（不用 base 仓库的
+            # 猜测 ref 冒充 PR head 内容，跨 fork 修复）；累计不完整原因，
+            # 任何自动发布前都会被阻止。
+            reason = f"{file_path}: PR head 内容来源无法证明 ({head_incomplete_reason})"
+            incomplete_reasons.append(reason)
+            print(f"  ⚠️  跳过：{reason}")
+            continue
+
         try:
-            content = review_helpers.fetch_file_content(cli, target, file_path, head_sha)
+            content = review_helpers.fetch_file_content(cli, head_source.target, file_path, head_source.sha)
             diff = file_info.get("patch", "")
 
             print("  ⏳ 调用 LLM 进行审查...")
@@ -635,7 +748,21 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
                 print("  ✓ 未发现问题")
 
         except Exception as e:
-            print(f"  ✗ 审查失败: {e}")
+            reason = f"{file_path}: 审查失败: {e}"
+            incomplete_reasons.append(reason)
+            print(f"  ✗ {reason}")
+
+    if incomplete_reasons:
+        print("\n" + "=" * 60)
+        print(f"❌ 自动审查上下文不完整（{len(incomplete_reasons)} 项），已阻止任何发布（含通过摘要）:")
+        for reason in incomplete_reasons:
+            print(f"   - {reason}")
+        print("=" * 60)
+        if args.dry_run:
+            print(f"\n（Dry Run）已发现的 {len(all_issues)} 个问题不发布:")
+            for issue in all_issues:
+                print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
+        return False
 
     if args.dry_run:
         print("\n" + "=" * 60)
@@ -644,7 +771,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
         print(f"\n发现 {len(all_issues)} 个问题：")
         for issue in all_issues:
             print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
-        return
+        return True
 
     if all_issues:
         print(f"\n📦 提交 {len(all_issues)} 个审查结果...")
@@ -667,6 +794,7 @@ def mode_auto(args, cli: str, target: atomgit_cli.RepoTarget, reviewer: CodeRevi
         print("=" * 60)
 
     print(f"\n🔗 PR 链接: {review_helpers.pr_url(target, args.pr)}\n")
+    return True
 
 
 def main():
@@ -803,8 +931,8 @@ def main():
         mode_extract_info(args, reviewer)
     elif args.submit_review:
         mode_submit_review(args, reviewer)
-    elif args.auto:
-        mode_auto(args, cli, target, reviewer, config)
+    elif args.auto and not mode_auto(args, cli, target, reviewer, config):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

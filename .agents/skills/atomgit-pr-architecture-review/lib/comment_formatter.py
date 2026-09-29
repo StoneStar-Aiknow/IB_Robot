@@ -10,7 +10,9 @@ from dataclasses import dataclass
 class ArchitectureIssue:
     """架构审查 finding（本地数据类，替代已退役的 atomgit_sdk.ArchitectureIssue）。
 
-    字段与 SDK pydantic 模型保持一致。
+    字段与 SDK pydantic 模型保持一致；review 回补 4 为 file/line/title/
+    description/severity/pillar 增加构造期校验：整批 finding 在任何
+    平台写入前先验校验，坏输入立即失败而不是静默降级成残缺评论。
     """
 
     file: str
@@ -21,6 +23,24 @@ class ArchitectureIssue:
     pillar: str = "python"
     fix: str | None = None
     context_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.file, str) or not self.file.strip():
+            raise ValueError("ArchitectureIssue.file must be a non-empty string")
+        if not isinstance(self.line, int) or isinstance(self.line, bool) or self.line < 1:
+            raise ValueError(f"ArchitectureIssue.line must be a positive integer, got {self.line!r}")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("ArchitectureIssue.title must be a non-empty string")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("ArchitectureIssue.description must be a non-empty string")
+        if self.severity not in VALID_SEVERITIES:
+            raise ValueError(
+                f"unknown ArchitectureIssue.severity {self.severity!r}; expected one of {sorted(VALID_SEVERITIES)}"
+            )
+        if self.pillar not in VALID_PILLARS:
+            raise ValueError(
+                f"unknown ArchitectureIssue.pillar {self.pillar!r}; expected one of {sorted(VALID_PILLARS)}"
+            )
 
 
 # IB-Robot 架构参考资料
@@ -92,6 +112,15 @@ ARCHITECTURE_REFERENCES = {
         }
     ],
 }
+
+
+# Known finding vocabularies (review 回补 4): the severity icon table's own
+# keys and the architecture reference table's own pillars. A typo'd
+# severity/pillar fails validation loudly instead of silently rendering a
+# degraded comment (unknown pillars would otherwise echo through
+# get_pillar_name and silently drop their reference block).
+VALID_SEVERITIES = frozenset({"critical", "error", "warning", "suggestion", "info"})
+VALID_PILLARS = frozenset(ARCHITECTURE_REFERENCES)
 
 
 class CommentFormatter:

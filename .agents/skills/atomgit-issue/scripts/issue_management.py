@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--title", help="Issue title")
     parser.add_argument("--body", help="Issue body")
     parser.add_argument("--issue", type=int, help="Issue number for update or fetch")
-    parser.add_argument("--state", choices=["open", "closed"], help="Issue state for update")
+    parser.add_argument("--state", choices=["open", "closed", "reopen"], help="Issue state for update")
     parser.add_argument("--fetch-info", action="store_true", help="Fetch issue info to JSON")
     parser.add_argument(
         "--comment",

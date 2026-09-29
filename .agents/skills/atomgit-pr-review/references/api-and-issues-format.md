@@ -71,6 +71,11 @@ python3 pr_review.py --pr 123
 
 ```json
 {
+  "target": {
+    "owner": "openEuler",
+    "repo": "IB_Robot",
+    "pr_number": 123
+  },
   "pr": {
     "number": 123,
     "title": "...",
@@ -96,6 +101,8 @@ python3 pr_review.py --pr 123
   "comments": [...]
 }
 ```
+
+`target` 记录本次提取的目标身份（owner/repo/PR），供 `--submit-review` 绑定校验使用。
 
 **⚠️ 重要**：提取的 JSON 文件已经包含了所有 diff（`patch`）、文件内容（`content`）以及已有 PR 评论。
 - **不需要** `git fetch` 或 `git diff`
@@ -123,6 +130,13 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 - `--dry-run`: 仅显示计划
 
 **⚠️ 重要**：`--ai-model` 参数**必须指定你的真实模型名称**，以便在评论中准确标识来源。
+
+**提交绑定校验**：`--submit-review` 发布前要求本 PR 存在完整的 extract-info 上下文
+（`./tmp/{repo}_pr_{n}_info.json`），且其 `target` 身份与当前提交目标一致、`head_source`
+完整（head 仓库 + 完整 SHA）、无不可读文件内容、head SHA 仍与当前 PR head 一致。任一
+不满足（含同 repo 名不同 owner 的 fork、PR 更新后上下文过期）都会零平台写入拒绝并
+提示重新 `--extract-info`——只凭 issues JSON 不能发布。`--dry-run` 不做该校验（无平台
+调用）。
 
 **常见模型名称**：
 - `glm-5.2`
@@ -178,10 +192,13 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 ```json
 {
   "atomgit": {
-    "token": "your_personal_access_token",
     "owner": "openEuler",
     "repo": "IB_Robot",
     "baseUrl": "https://api.atomgit.com"
   }
 }
 ```
+
+认证由官方 AtomGit CLI 管理（`gitcode auth login --hostname atomgit.com --with-token`）；
+脚本不读取 token，`config.json` 仅提供 `owner/repo` 目标默认值与 `--auto` 模式的 LLM
+配置。若配置中仍残留旧 `token` 字段，它会被忽略，请自行清理。

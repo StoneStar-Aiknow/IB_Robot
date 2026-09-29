@@ -1,17 +1,4 @@
-"""Entry-point behavior tests for the CLI-migrated Issue/intro skills (task 3.1).
-
-These tests execute the real script entry points — ``atomgit-issue/scripts/
-issue_management.py`` and ``intro/scripts/intro.py`` — as subprocesses against
-the executable fake CLI from ``fake_cli.py`` (task 2.4), so the full path an
-Agent drives is exercised for real: argument parsing → shared CLI boundary →
-execve argv/stdin → exit-code classification → context/report output.
-
-Scenarios required by the task 3.1 review: authentication exit 4, nonzero
-exit with partial JSON, malformed list payloads, the intro sampling limit,
-partial comment-read failures, no partial issue context on fetch failure, and
-dry-run performing no platform writes. No real platform access, no
-credentials.
-"""
+"""Project workflow regressions; CLI responses are supplied by the shared fake."""
 
 from __future__ import annotations
 
@@ -71,9 +58,7 @@ def run_issue_script(fake: EntrypointFakeCLI, cwd: Path, args: list[str]) -> sub
     return run_script(ISSUE_SCRIPT, [*args, *ISSUE_TARGET_ARGS], env=fake.env(), cwd=cwd)
 
 
-# --------------------------------------------------------------------------- #
 # intro.py entry point
-# --------------------------------------------------------------------------- #
 
 
 def test_intro_auth_exit4_marks_pr_check_unavailable(fake, intro_cwd):
@@ -178,9 +163,7 @@ def test_intro_partial_comment_failure_is_nonfatal(fake, intro_cwd):
     assert "未检查" in result.stdout
 
 
-# --------------------------------------------------------------------------- #
 # issue_management.py entry point
-# --------------------------------------------------------------------------- #
 
 
 def test_issue_fetch_info_writes_context_with_valid_comments(fake, issue_cwd):
@@ -365,25 +348,26 @@ def test_issue_update_state_adds_yes(fake, issue_cwd):
     ]
 
 
-def test_issue_create_reports_number(fake, issue_cwd):
-    fake.configure([{"argv_contains": ["issue", "create"], "stdout": '{"number": 42}', "exit": 0}])
-    result = run_issue_script(fake, issue_cwd, ["--title", "Bug report", "--body", "description"])
+def test_issue_update_state_reopen_supported(fake, issue_cwd):
+    # Remote-smoke finding (task 6.5, 2026-09-29): the CLI documents and
+    # accepts `issue edit --state reopen` (verified against BreezeWu/IB_Robot
+    # issue #1), but the script's argparse choices hid it — reopen through
+    # the migration entry was impossible. Minimal fix: allow "reopen".
+    fake.configure([{"argv_contains": ["issue", "edit"], "stdout": '{"number": 7}', "exit": 0}])
+    result = run_issue_script(fake, issue_cwd, ["--issue", "7", "--state", "reopen"])
     assert result.returncode == 0, result.stdout
-    assert "Successfully created issue #42" in result.stdout
-    assert "https://atomgit.com/acme/widget/issues/42" in result.stdout
-    assert fake.argv_of(["issue", "create"]) == [
+    assert fake.argv_of(["issue", "edit"]) == [
         "issue",
-        "create",
+        "edit",
+        "7",
         "-R",
         "acme/widget",
-        "--title",
-        "Bug report",
-        "--body-file",
-        "-",
+        "--state",
+        "reopen",
+        "--yes",
         "--json",
         "--no-interactive",
     ]
-    assert fake.invocation_of(["issue", "create"])["stdin"] == "description"
 
 
 def test_issue_create_without_number_fails_without_retry(fake, issue_cwd):

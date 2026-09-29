@@ -477,14 +477,13 @@ Gateway/readiness/safety rejection, `4` unavailable runtime, `124` timeout, `130
 The `robot_mcp` compatibility layer has been removed. Use `robot-skill` through the ROS Capability Gateway
 for all robot capability discovery and execution.
 
-### config.json Configuration
+### config.json Configuration and AtomGit Authentication
 
-`config.json` stores configuration for AI Agents, currently used for AtomGit API integration:
+`config.json` stores configuration for AI Agents, currently only the default AtomGit target repository:
 
 ```json
 {
   "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
     "owner": "openEuler",
     "repo": "IB_Robot",
     "baseUrl": "https://api.atomgit.com"
@@ -492,19 +491,27 @@ for all robot capability discovery and execution.
 }
 ```
 
-**Getting an AtomGit Personal Access Token**:
+All AtomGit platform access (PR/Issue/review-comment collaboration) goes through the official
+AtomGit CLI, which also owns authentication. Scripts no longer read a token from `config.json`
+and no longer use the `ATOMGIT_TOKEN` environment variable; if your old config still has a
+`token` field it is ignored — clean it up at your convenience.
 
-1. Visit <https://atomgit.com> and log in
-2. Click your avatar (top-right) → Settings
-3. Find "Access Tokens"
-4. Click "New Token", grant `repo` and `pull_request` permissions
-5. **Copy and save** the token immediately (shown only once)
+**Install and authenticate**:
 
-Set the environment variable by adding the following to your `~/.zshrc` or `~/.bashrc`:
+1. Install the official AtomGit CLI (kept isolated under `tmp/tools/atomgit-cli/` exposing the
+   `gitcode` entry point; verified version v0.14.1; do not shadow the system Graphviz `gc`).
+2. Visit <https://atomgit.com> → avatar (top-right) → Settings → "Access Tokens" → create a new
+   token with `repo` and `pull_request` permissions and **copy it immediately** (shown only once).
+3. Authenticate (the token is passed via stdin, never written to disk):
 
 ```bash
-export ATOMGIT_TOKEN="your_token_here"
+gitcode auth login --hostname atomgit.com --with-token
+gitcode auth status   # verify the authentication state
 ```
+
+When the CLI is missing or unauthenticated, collaboration scripts fail with a nonzero exit code
+and print the guidance above; non-blocking checks such as `intro` mark the platform part
+unavailable without affecting local features.
 
 ### Supported Agents
 

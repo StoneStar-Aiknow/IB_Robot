@@ -63,7 +63,7 @@ IB_Robot 沿用 [openEuler 社区标签约定](https://atomgit.com/openeuler/com
 
 ### ⚠️ 应用方式
 
-这些标签在 IB_Robot 仓库**默认不存在**，且当前 `ATOMGIT_TOKEN` 没有直接写标签的权限（`create-repo-labels` 返回 `403`）。因此 `issue_management.py` **不提供任何打标签的参数**（AtomGit 对 `kind/*` / `priority/*` 直传必然校验失败），标签一律通过 slash 命令添加：
+这些标签在 IB_Robot 仓库**默认不存在**，且当前 AtomGit 平台对协作 token/CLI 没有开放直接写标签的权限（`create-repo-labels` 返回 `403`）。因此 `issue_management.py` **不提供任何打标签的参数**（AtomGit 对 `kind/*` / `priority/*` 直传必然校验失败），标签一律通过 slash 命令添加：
 
 - **正确做法**：先创建 Issue，再用 **slash command 评论**让 openEuler 社区机器人打标签：
 

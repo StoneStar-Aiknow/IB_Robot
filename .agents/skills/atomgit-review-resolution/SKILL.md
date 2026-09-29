@@ -17,9 +17,16 @@ license: MIT
 
 ## ⚠️ 依赖准备
 
-本 skill 依赖 PyPI 包 `atomgit-sdk`，其 Python 导入模块名为 `atomgit_sdk`。
-仓库默认通过 `requirements/*.txt` 安装；如果当前环境未安装，请先运行
-`./scripts/setup.sh`，或在当前 Python 环境中安装 `atomgit-sdk`。
+本 skill 的平台访问全部通过官方 AtomGit CLI（已验证 v0.14.1，`gitcode` 入口，经
+`.agents/skills/_shared/atomgit_cli.py` 共享边界调用），**不再依赖** PyPI 包
+`atomgit-sdk`。认证由 CLI 自己管理：
+
+```bash
+gitcode auth login --hostname atomgit.com --with-token
+```
+
+CLI 缺失或未认证时脚本以退出码 1 报错并给出安装/认证指引；`config.json` 仅提供
+`atomgit.owner/repo` 目标默认值，token 字段被忽略。
 
 ## ⚠️ 文件读取说明
 
@@ -89,7 +96,11 @@ python3 review_resolution.py --resume ./tmp/ib_robot_pr_123_review_resolution_<t
 9. 只接受一个 remote 上唯一、精确匹配 PR source repository 的 push URL；remote 有多个 pushurl，或多个 remote/URL 都匹配时拒绝。push 和 `ls-remote` 均使用这一 URL，并绑定 `--force-with-lease=<ref>:<old-head-sha>`。
 10. autosquash 后立即原子写入恢复状态，记录 old/new HEAD、精确 URL/ref、回复正文/哈希/marker/discussion/status；远端 ref 验证为新 OID 后才发送修复完成回复。
 
-**回复评论时序**：代码修复批次只有在 source branch 推送并验证成功后才发送“已修复”回复；本地成功但未推送时返回 `pending_push`，不伪装闭环。每条远端回复后都会原子 checkpoint；恢复时先按隐藏事务 marker/正文哈希对账，只发送 `pending` 项。纯 `reply_only` 批次也使用同一持久化回复账本。
+**平台已知限制（2026-09-29 认证实测，evidence/remote-smoke）**：threaded 回复（`pr reply`）写入成功且 Web UI 可见，但对 CLI/API 一切读回通道不可见 → **threaded 模式的 marker 对账不可用**：uncertain 条目永不自动重发，需人工在 PR 页面核对；需要自动恢复对账时使用 `--reply-mode visible`（PR 级评论的 marker 原文读回已证实完整保留）。行内评论（diff_comment）读回不带文件路径（`diff_file` 恒为空、锚定信息在 `diff_position` dict）→ 对行内评论的 visible 定位回复为 unsupported 零写入，不猜文件。
+
+**回复评论时序**：代码修复批次只有在 source branch 推送并验证成功后才发送“已修复”回复；本地成功但未推送时返回 `pending_push`，不伪装闭环。每条回复发送前会先写入“结果未知”预检点（`uncertain_outcome: true`），成功或证实未送达后再清除；恢复时先按隐藏事务 marker/正文哈希对账，只发送 `pending` 且非 uncertain 的项。**已尝试但结果未知的回复绝不因一次列表读取看不到 marker 就自动重发**——marker 可能被平台剥离、分页缺失或延迟可见；此类条目保持 unknown outcome，需人工在 PR 页面核对后才能处理（确认未发布后可把状态文件中该项 `uncertain_outcome` 改为 `false` 再恢复）。认证失败（CLI exit 4）可证明未发生写入，修复认证后允许重试。纯 `reply_only` 批次也使用同一持久化回复账本。
+
+**状态文件 schema 政策**：状态文件为 `schema_version: 2`，并携带 `state_provenance.producer = atomgit-cli-review-resolution` 来源标记。恢复仅接受带该来源标记的 v2（含 pending_push、pending_replies 与无 git 段的 reply_only 三种形态），不做自动迁移——版本缺失、变体、未知、旧 v1（SDK 时代及未验证等价的中间 CLI 版本产生）或来源标记不符一律在最前置校验拒绝，且拒绝发生在任何平台调用、Git 写入或状态文件改写之前，无副作用；旧状态文件原样保留，需人工在 PR 页面对账。CLI 回复语义（threaded 无 reply_id、marker 对账）与旧 SDK v1 的等价性未经真实平台验证，因此不提供 v1 恢复。
 
 **本地事务语义**：任一修复项处理失败（字段缺失、路径非法、行号越界、原文不唯一等）时，脚本恢复全部文件到本次运行前状态，不提交代码、不发送任何回复。push/reply 属于不可回滚远端副作用，因此通过状态文件逐阶段 checkpoint 和幂等恢复，而不是伪装成可回滚的“全有或全无”。每个修复项必须携带属于目标 PR 的 `comment_id`。
 

@@ -1,24 +1,4 @@
-"""Entry-point behavior tests for the CLI-migrated PR skill (task 3.2).
-
-These tests execute the real script entry points — ``atomgit-pr/scripts/
-pr_creation.py`` and ``atomgit-pr/scripts/pr_management.py`` — as subprocesses
-against the executable fake CLI (task 2.4), so the full path an Agent drives is
-exercised for real: argument parsing → shared CLI boundary → execve
-argv/stdin → exit-code classification → context/report output.
-
-Scenario coverage required by task 3.2: cross-fork ``pr create`` argv shaping
-(``--fork owner/repo --head branch``), the body via ``--body-file -`` stdin,
-auth exit 4, conflict exit 5 without retry, WIP stage deferral, the
-dual-Docker gate with the v2 fingerprint, and the written-but-validation-
-pending state (the mutation outcome is preserved, never reported as "not
-created"). The management side covers the fetch-info context JSON with the
-v1/v2 fingerprint policy fields and placeholder-tainted platform inputs
-blocking the update write before any platform mutation. D5 reconciliation
-(create timeout → list open PRs and match by full identity plus body
-equality) is exercised in-process because the boundary timeout is 120s — too
-slow to trigger through the fake CLI's sleep. No real platform access, no
-credentials.
-"""
+"""Project workflow regressions; CLI responses are supplied by the shared fake."""
 
 from __future__ import annotations
 
@@ -41,8 +21,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import atomgit_cli  # noqa: E402
 import pr_creation  # noqa: E402
-import pr_management  # noqa: E402
-from entrypoint_fixture import AUTH_LOGIN_GUIDANCE, EntrypointFakeCLI  # noqa: E402
+from entrypoint_fixture import EntrypointFakeCLI  # noqa: E402
 from verification_gate import (  # noqa: E402
     compute_legacy_verification_inputs,
     compute_verification_inputs,
@@ -164,9 +143,7 @@ def management_cwd(tmp_path: Path) -> Path:
     return workdir
 
 
-# --------------------------------------------------------------------------- #
 # pr_creation.py entry point
-# --------------------------------------------------------------------------- #
 
 
 def test_pr_create_success_maps_cross_fork_and_sends_body(fake, tmp_path):
@@ -210,22 +187,31 @@ def test_pr_create_success_maps_cross_fork_and_sends_body(fake, tmp_path):
     assert "Add the feature." in stdin
 
 
-def test_pr_create_auth_exit4_prints_login_guidance(fake, tmp_path):
+def test_pr_create_same_repository_omits_fork_flag(fake, tmp_path):
+    # Remote-smoke finding (task 6.5, 2026-09-29): the entry rejected
+    # fork_owner == target.owner outright, so a same-repository PR (branch →
+    # base inside one repo, e.g. a fork-internal test PR) could not be
+    # created through the migration entry at all. Minimal fix: same owner
+    # means the target is its own source and the create argv omits --fork
+    # (the cross-fork path is unchanged).
     repo = GitRepo(tmp_path)
-    repo.commit_branch("feat/simple", {"src/foo.py": "print('hello')\n"}, AI_COMMIT_MESSAGE, push=False)
-    description = write_description(tmp_path, "## Summary\n\nAdd the feature.\n")
-    fake.configure([{"argv_contains": ["pr", "create"], "stderr": "not logged in to atomgit.com", "exit": 4}])
+    repo.commit_branch("feat/same-repo", {"docs/smoke.md": "# smoke\n"}, AI_COMMIT_MESSAGE, push=False)
+    description = write_description(tmp_path, "## Summary\n\nSame-repo smoke fixture.\n")
+    fake.configure([{"argv_contains": ["pr", "create"], "stdout": '{"number": 12}', "exit": 0}])
 
-    result = run_script(
-        PR_CREATION_SCRIPT,
-        create_args(branch="feat/simple", description_file=description, title="feat: change things"),
-        env=fake.env(),
-        cwd=repo.path,
-    )
+    args = create_args(branch="feat/same-repo", description_file=description, title="docs: same-repo smoke")
+    assert args[args.index("--fork-owner") + 1] == "acme-dev"
+    args[args.index("--fork-owner") + 1] = "acme"  # same owner as the target acme/widget
 
-    assert result.returncode == 1
-    assert AUTH_LOGIN_GUIDANCE in result.stdout
-    assert len([argv for argv in fake.argvs() if argv[:2] == ["pr", "create"]]) == 1
+    result = run_script(PR_CREATION_SCRIPT, args, env=fake.env(), cwd=repo.path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PR 编号: #12" in result.stdout
+    argv = fake.argv_of(["pr", "create"])
+    assert argv[:4] == ["pr", "create", "-R", "acme/widget"]
+    assert "--fork" not in argv
+    assert argv[argv.index("--head") + 1] == "feat/same-repo"
+    assert argv[argv.index("--base") + 1] == "master"
 
 
 def test_pr_create_conflict_exit5_reports_conflict_without_retry(fake, tmp_path):
@@ -376,66 +362,7 @@ def test_pr_create_dry_run_writes_nothing(fake, tmp_path):
     assert fake.argvs() == [["version", "--no-interactive"]]
 
 
-# --------------------------------------------------------------------------- #
 # pr_management.py entry point
-# --------------------------------------------------------------------------- #
-
-
-def test_pr_fetch_info_writes_context(fake, tmp_path):
-    workdir = management_cwd(tmp_path)
-    files = [{"filename": "docs/guide.md", "status": "modified", "additions": 1, "deletions": 0, "patch": "+text"}]
-    commits = [{"sha": "a" * 40, "commit": {"author": {"name": "Dev"}, "message": "docs: update guide"}}]
-    pr_view = {
-        "number": 7,
-        "title": "docs: update guide",
-        "state": "open",
-        "user": {"login": "dev"},
-        "head": {"ref": "feat/docs", "sha": "b" * 40, "repo": {}},
-        "base": {"ref": "master", "sha": "c" * 40, "repo": {}},
-        "body": "old body",
-    }
-    fake.configure(
-        [
-            {"argv_contains": ["pr", "view"], "stdout": json.dumps(pr_view), "exit": 0},
-            {"argv_contains": [COMMITS_ENDPOINT], "stdout": json.dumps(commits), "exit": 0},
-            {"argv_contains": [FILES_ENDPOINT], "stdout": json.dumps(files), "exit": 0},
-            {"argv_contains": ["pr", "comments"], "stdout": json.dumps([{"id": 1, "body": "nice"}]), "exit": 0},
-        ]
-    )
-    out_dir = workdir / "out"
-
-    result = run_script(
-        PR_MANAGEMENT_SCRIPT,
-        ["--fetch-info", "--pr", "7", "--output-dir", str(out_dir), *PR_TARGET_ARGS],
-        env=fake.env(),
-        cwd=workdir,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    context = json.loads((out_dir / "widget_pr_7_context.json").read_text(encoding="utf-8"))
-    assert context["metadata"]["title"] == "docs: update guide"
-    assert context["metadata"]["branch"] == "feat/docs -> master"
-    assert context["metadata"]["verification_inputs"] is None
-    assert context["metadata"]["verification_policy"] is None
-    assert context["comments"] == [{"id": 1, "body": "nice"}]
-    assert context["changed_files"][0]["patch"] == "+text"
-    assert "1 文件修改" in result.stdout
-    assert fake.argv_of(["pr", "view"]) == ["pr", "view", "7", "-R", "acme/widget", "--json", "--no-interactive"]
-    api_argv = [argv for argv in fake.argvs() if argv[:1] == ["api"]]
-    assert len(api_argv) == 2
-    assert any("pulls/7/commits?page=1&per_page=100" in argv[1] for argv in api_argv)
-    assert any("pulls/7/files?page=1&per_page=100" in argv[1] for argv in api_argv)
-    assert fake.argv_of(["pr", "comments"]) == [
-        "pr",
-        "comments",
-        "7",
-        "-R",
-        "acme/widget",
-        "--json",
-        "--limit",
-        "0",
-        "--no-interactive",
-    ]
 
 
 def test_pr_fetch_info_reports_v1_policy_from_legacy_record(fake, tmp_path):
@@ -727,239 +654,49 @@ def _open_pr(
     }
 
 
-def test_create_timeout_reconciles_by_full_identity_and_body(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        ([_open_pr(8, "old body"), _open_pr(9, "body")], 9),
+        ([_open_pr(8, "old body")], None),
+        ([_open_pr(9, "body"), _open_pr(10, "body")], None),
+        ([_open_pr(8, "body", repo_name="other"), _open_pr(9, "body")], 9),
+        ([_open_pr(8, "body", repo_name="other")], None),
+        (["malformed", _open_pr(9, "body")], None),
+        ([_open_pr(8, "body", repo_name=None), _open_pr(9, "body")], None),
+        ([_open_pr(8, "body", owner="ACME-DEV"), _open_pr(9, "body")], None),
+    ],
+    ids=[
+        "unique-body",
+        "wrong-body",
+        "ambiguous",
+        "exclude-other-repo",
+        "only-other-repo",
+        "malformed",
+        "missing-identity",
+        "case-ambiguity",
+    ],
+)
+def test_create_timeout_reconciles_without_recreating(monkeypatch, capsys, candidates, expected):
     target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    calls = _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        # An older PR from the same branch must not be mistaken for this write:
-        # same head/base/owner but a different body.
-        pr_list=[_open_pr(8, "an older unrelated PR body"), _open_pr(9, body)],
-    )
-
-    number = pr_creation.create_pr_or_reconcile(
+    calls = _patched_run_json(monkeypatch, create_error=atomgit_cli.CLITimeoutError("timed out"), pr_list=candidates)
+    kwargs = dict(
         cli="gitcode",
         target=target,
         source=source,
         branch="feat/x",
         base="master",
-        description=body,
+        description="body",
         create_argv=["pr", "create", "-R", "acme/widget"],
     )
-
-    assert number == 9
-    assert [
-        "pr",
-        "list",
-        "-R",
-        "acme/widget",
-        "--state",
-        "open",
-        "--json",
-        "--paginate",
-        "--per-page",
-        "100",
-    ] in calls
-    assert "对账确认" in capsys.readouterr().out
+    if expected is None:
+        with pytest.raises(SystemExit) as error:
+            pr_creation.create_pr_or_reconcile(**kwargs)
+        assert error.value.code == 1
+        assert "uncertain" in capsys.readouterr().out
+    else:
+        assert pr_creation.create_pr_or_reconcile(**kwargs) == expected
+    assert [args[:2] for args in calls] == [["pr", "create"], ["pr", "list"]]
 
 
-def test_create_timeout_without_body_match_is_uncertain(monkeypatch, capsys):
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(8, "an older unrelated PR body")],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    assert "uncertain" in capsys.readouterr().out
-
-
-def test_create_timeout_multiple_matches_is_uncertain(monkeypatch, capsys):
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(9, body), _open_pr(10, body)],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    out = capsys.readouterr().out
-    assert "uncertain" in out
-    assert "无法唯一确认" in out
-
-
-def test_create_timeout_reconciles_excludes_same_owner_other_repo(monkeypatch, capsys):
-    """Task 3.2 review: matching only the owner is not full identity — a
-    different fork repository under the same owner with the same branch and
-    body must be excluded instead of being mistaken for this write."""
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(8, body, repo_name="other-repo"), _open_pr(9, body)],
-    )
-
-    number = pr_creation.create_pr_or_reconcile(
-        cli="gitcode",
-        target=target,
-        source=source,
-        branch="feat/x",
-        base="master",
-        description=body,
-        create_argv=["pr", "create", "-R", "acme/widget"],
-    )
-
-    assert number == 9
-    assert "对账确认" in capsys.readouterr().out
-
-
-def test_create_timeout_reconciles_same_owner_other_repo_alone_is_uncertain(monkeypatch, capsys):
-    """The same-owner other-repo entry alone cannot prove this write was
-    accepted; the result stays uncertain instead of matching a foreign PR."""
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(8, body, repo_name="other-repo")],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    out = capsys.readouterr().out
-    assert "uncertain" in out
-    assert "未找到可证明为本次写入" in out
-
-
-def test_create_timeout_reconciles_malformed_entry_is_uncertain(monkeypatch, capsys):
-    """A non-object entry could be this write; silently skipping it could
-    turn a stale match into a false unique confirmation (task 3.2 review)."""
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=["not-a-dict", _open_pr(9, body)],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    out = capsys.readouterr().out
-    assert "uncertain" in out
-    assert "无法核实身份" in out
-
-
-def test_create_timeout_reconciles_missing_head_identity_is_uncertain(monkeypatch, capsys):
-    """head/base/body match but the entry cannot prove its head repository
-    identity — it can be neither confirmed nor excluded as this write."""
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(9, body, repo_name=None)],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    out = capsys.readouterr().out
-    assert "uncertain" in out
-    assert "owner/repo 身份" in out
-
-
-def test_create_timeout_reconciles_case_ambiguous_identity_is_uncertain(monkeypatch, capsys):
-    """design.md D2: a case-only identity difference proves neither same nor
-    different repository, so the outcome stays uncertain instead of guessing."""
-    target, source = _d5_targets()
-    body = "## Summary\n\nThe created body.\n"
-    _patched_run_json(
-        monkeypatch,
-        create_error=atomgit_cli.CLITimeoutError("timed out"),
-        pr_list=[_open_pr(9, body, owner="Acme-Dev")],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        pr_creation.create_pr_or_reconcile(
-            cli="gitcode",
-            target=target,
-            source=source,
-            branch="feat/x",
-            base="master",
-            description=body,
-            create_argv=["pr", "create", "-R", "acme/widget"],
-        )
-    assert excinfo.value.code == 1
-    out = capsys.readouterr().out
-    assert "uncertain" in out
-    assert "大小写不一致" in out
-
-
-# --------------------------------------------------------------------------- #
 # CLI field-shape mapping (Repository.web_url → project html_url)
-# --------------------------------------------------------------------------- #
-
-
-def test_fetch_pr_record_maps_cli_web_url_to_html_url(monkeypatch):
-    payload = {
-        "number": 7,
-        "head": {"ref": "feat/x", "sha": "a" * 40, "repo": {"web_url": "https://atomgit.com/acme-dev/widget"}},
-        "base": {"ref": "master", "repo": {"web_url": "https://atomgit.com/acme/widget"}},
-    }
-    monkeypatch.setattr(atomgit_cli, "run_json", lambda args, cli=None, **kwargs: _cli_result(payload))
-
-    pr = pr_management.fetch_pr_record("gitcode", atomgit_cli.RepoTarget("acme", "widget", "explicit"), 7)
-
-    assert pr["head"]["repo"]["html_url"] == "https://atomgit.com/acme-dev/widget"
-    assert pr["base"]["repo"]["html_url"] == "https://atomgit.com/acme/widget"

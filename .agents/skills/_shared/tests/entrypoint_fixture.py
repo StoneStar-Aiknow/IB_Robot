@@ -45,7 +45,7 @@ class EntrypointFakeCLI:
         self.record_path = tmp_path / "record.jsonl"
 
     def configure(self, rules: list[dict], default: dict | None = None) -> None:
-        scenario = {"rules": [{"argv_contains": ["version"], "stdout": VERSION_STDOUT, "exit": 0}, *rules]}
+        scenario = {"rules": [*rules, {"argv_contains": ["version"], "stdout": VERSION_STDOUT, "exit": 0}]}
         if default is not None:
             scenario["default"] = default
         self.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")

@@ -503,7 +503,7 @@ class PaginatedResult:
     items: list[Any] = field(default_factory=list)
     pages: int = 0
     truncated: bool = False
-    stop_reason: str = "complete"  # complete | max-pages | failed-page
+    stop_reason: str = "complete"  # complete | max-pages | failed-page | repeated-page
     last_result: CLIResult | None = None
 
     @property
@@ -522,12 +522,11 @@ def run_paginated(
 ) -> PaginatedResult:
     """Loop CLI pages for commands without native ``--paginate`` (task 2.3).
 
-    ``build_page_args(page)`` returns the argv for one page (the caller adds
-    ``--page``/``--per-page`` or query parameters). The loop stops on a short
-    page (complete), on ``max_pages`` (truncated, guards runaway loops the
-    SDK also capped), or on a failed page (truncated, items collected so far
-    preserved so callers can mark the collection incomplete and stop before
-    dependent side effects instead of reporting a false "no comments").
+    ``build_page_args(page)`` returns the argv for one page. Short pages
+    complete the traversal. Failed pages, exhausted bounds and repeated pages
+    are incomplete: repetition can be a cached/capped first page, not proof
+    that all server records were read. Endpoint consumers may establish
+    completeness separately using an independent authoritative total.
     """
     items: list[Any] = []
     result: CLIResult | None = None
@@ -536,6 +535,8 @@ def run_paginated(
         if not result.ok or result.data is None:
             return PaginatedResult(items, page, truncated=True, stop_reason="failed-page", last_result=result)
         batch = result.data if isinstance(result.data, list) else [result.data]
+        if page > 1 and batch and all(item in items for item in batch):
+            return PaginatedResult(items, page, truncated=True, stop_reason="repeated-page", last_result=result)
         items.extend(batch)
         if len(batch) < per_page:
             return PaginatedResult(items, page, truncated=False, stop_reason="complete", last_result=result)

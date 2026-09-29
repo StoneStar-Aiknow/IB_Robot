@@ -148,6 +148,10 @@ python3 architecture_review.py --pr 123
 python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model glm-5.2
 ```
 
+提交前脚本会做上下文绑定校验：本 PR 的 `--extract-info` 上下文必须存在且 `target`
+身份、head_source、逐文件内容完整，head SHA 仍与当前 PR head 一致；不满足即零平台
+写入拒绝并要求重新提取。
+
 ## ⚠️ JSON 格式规范
 
 `arch_issues.json` 必须是数组格式（非对象），每项含 `file` / `line` / `title` / `description` / `severity` / `pillar` 必填字段。完整字段说明、JSON 示例和验证命令见 `references/json-format.md`。

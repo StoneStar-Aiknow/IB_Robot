@@ -1,11 +1,11 @@
-# JSON Format, API Behavior & SDK Design
+# JSON Format, API Behavior & CLI Design
 
 ## When to Read
 
 - 需要编写 `fix_results.json` 修复方案文件
 - 想了解四种修复类型（代码修复 / 回复说明 / 回退文件 / 删除行）的语义
 - 需要查询「获取未解决评论」「应用修复方案」两个 API 的输出与默认行为
-- 想理解 SDK / API 抽象层（`atomgit-sdk` / `atomgit_sdk`）的设计决策
+- 想理解平台访问层（官方 AtomGit CLI + `_shared/atomgit_cli.py` 共享边界）的设计决策
 
 ## 修复类型
 
@@ -37,7 +37,7 @@
 字段约束：
 
 - 所有项必须有 `comment_id`。
-- 脚本在任何文件写入或历史重写前，通过 `RepairService.get_pr_comments(pr_number)` 的 PR 作用域全量分页结果验证每个 `comment_id`；其他 PR、已删除或拼错的 ID 会整批拒绝。状态文件会保留 `discussion_id`、评论类型、路径等可用元数据。
+- 脚本在任何文件写入或历史重写前，通过 `pr comments --json --limit 0`（0 = 全部分页）的 PR 作用域结果验证每个 `comment_id`；其他 PR、已删除或拼错的 ID 会整批拒绝。状态文件会保留 `discussion_id`、评论类型、路径等可用元数据。
 - `code_fix`、`delete_lines`、`revert_file` 必须有 `file_path` 和 `fixup_target`。`fixup_target` 必须解析到 PR metadata `base.sha..HEAD` 范围内的 commit。
 - `code_fix.original_code` 必须非空，并且在目标文件中恰好出现一次；0 次或多次匹配都会拒绝。
 - 只有确认整个批次都应折回同一 commit 时，才可省略逐项字段并在 CLI 显式传 `--fixup-target <SHA|ref>`；该参数没有隐式 `HEAD` 默认值。
@@ -60,6 +60,7 @@ python3 review_resolution.py --pr 123
 - 脚本会自动抓取 **所有分页评论**，不再受默认 20 条限制
 - 输出按 `discussion_id` 聚合线程，`comments[].thread_comments` 中可看到嵌套回复
 - 默认会过滤当前登录用户自己的评论和 bot 评论；可通过 `--include-self-comments` / `--include-bot-comments` 打开
+- 当前登录用户读取失败时**不会静默声称已完成 self 过滤**：`metadata.self_filter` 会标记 `unavailable` 并附原因，stdout 同步告警
 - AtomGit / GitCode 当前读取接口**不会稳定返回 resolved 状态**，因此输出文件会在 `metadata.resolved_state_note` 中说明这一点
 
 ### 应用修复方案
@@ -74,12 +75,12 @@ source repository 必须对应一个 remote 上的唯一精确 push URL：匹配
 
 不带 `--push` 时返回 `pending_push`（退出码 2），不回复评论，并保存可恢复状态。状态包含 PR/repository、old/new HEAD、精确 URL/ref、回复正文/哈希/marker、discussion 元数据、attempts/reply_id/status。回复部分失败返回 `pending_replies`（退出码 2）；`--resume <state.json>` 只重试未完成项。
 
-## SDK / API 设计决策
+## 平台访问层设计决策（官方 CLI + 共享边界）
 
-保留 PyPI 包 `atomgit-sdk` 提供的 `atomgit_sdk` 导入模块作为唯一 AtomGit API 抽象层；skill 脚本只做工作流编排，不直接散落 HTTP 请求。原因：
+所有 AtomGit 平台读写都通过官方 AtomGit CLI（已验证 v0.14.1，`gitcode` 入口）完成；`_shared/atomgit_cli.py` 提供薄共享边界（工具身份/版本门禁、目标仓库解析、参数数组执行、JSON/分页/错误分类），本脚本内的 `RepairCli` 网关承载 review 语义（评论归属证明、线程回复、resolve、marker 对账）。原因：
 
-1. 单条 review 回复、解决状态、评论编辑/删除等能力会被多个 skill 复用，放在 SDK 中更稳定。
-2. 官方 API 文档目前主要提供 endpoint 标题、HTTP 方法和路径；SDK 已沉淀为 `APICatalog`，常用协作 API 提供 typed wrapper，长尾 API 可通过 `client.call_api(...)` 或 `APICatalog.from_docs()` 使用。
-3. 这样比每个 skill 脚本各自拼 curl 更简洁，也能统一认证、错误处理、重试和 URL 解析。
+1. 认证、平台接口与官方工具统一：开发者与 Agent 使用同一 CLI 登录（`gitcode auth login --hostname atomgit.com --with-token`），项目不再安装或导入 `atomgit-sdk`。
+2. 薄边界不重建 SDK：单条 review 回复、解决状态等能力由 CLI 命令直接承载（`pr reply` / `pr comment [--path --position]` / `pr comment resolve|unresolve`），长尾 API 经登记的 `gitcode api` 通用入口分页读取。
+3. 项目脚本专注工作流与门禁：评论归属校验、行内定位 new 侧语义、状态账本（marker/正文哈希、uncertain outcome）与 Git 事务留在本地，写入前零副作用可测。
 
-当前 SDK 提供 `get_pr_comments`、`get_review_threads`、`get_pr_comment`、`reply_to_comment` 等 review API，但不提供 `generate_fix`。因此本 skill 不暴露自动 LLM 修复入口；LLM 分析由 Agent 完成，脚本只消费经确认的 JSON 计划。
+CLI 提供 review 评论读写与 resolve，但不提供 `generate_fix`。因此本 skill 不暴露自动 LLM 修复入口；LLM 分析由 Agent 完成，脚本只消费经确认的 JSON 计划。
