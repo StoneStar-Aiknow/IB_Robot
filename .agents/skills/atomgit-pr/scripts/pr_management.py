@@ -265,7 +265,10 @@ def main():
         action="store_true",
         help="在 --fetch-info 模式下跳过抓取 PR 评论",
     )
-    parser.add_argument("--agent-tool", help="Coding agent 执行 <tool> --version 后传入实际工具名和版本")
+    parser.add_argument(
+        "--agent-tool",
+        help="Coding agent 执行 <tool> --version 确认版本后传入产品全称和版本（不用 CLI 命令名）",
+    )
     parser.add_argument("--ai-model", help="PR 使用的 AI 模型名称及版本；多个模型用逗号分隔，不含 provider 前缀")
     parser.add_argument("--prompt-summary", help="核心提示词或核心意图摘要（更新 PR 时必填）")
     parser.add_argument("--third-party-materials", help="第三方材料、来源及许可证（更新 PR 时必填）")

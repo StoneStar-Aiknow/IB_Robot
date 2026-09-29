@@ -22,7 +22,7 @@ def test_validate_agent_tool_accepts_arbitrary_tool_report():
 
 def test_validate_agent_tool_rejects_unversioned_or_injection_text():
     for value in ("Acme Coding Agent latest", "Acme Agent 1.2.3; rm -rf /"):
-        with pytest.raises(ValueError, match="actual tool name and version"):
+        with pytest.raises(ValueError, match="product name and version"):
             validate_agent_tool(value)
 
 
@@ -163,7 +163,7 @@ def test_ai_model_rejects_provider_prefix():
 
 
 def test_add_ai_disclosure_rejects_unversioned_agent_tool():
-    with pytest.raises(ValueError, match="actual tool name and version"):
+    with pytest.raises(ValueError, match="product name and version"):
         add_ai_disclosure(
             "Description",
             agent_tool="OpenCode latest",

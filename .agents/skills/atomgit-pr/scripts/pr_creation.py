@@ -195,7 +195,7 @@ def main():
     parser.add_argument(
         "--agent-tool",
         required=True,
-        help="Coding agent 执行 <tool> --version 后传入实际工具名和版本",
+        help="Coding agent 执行 <tool> --version 确认版本后传入产品全称和版本（不用 CLI 命令名）",
     )
     parser.add_argument(
         "--ai-model",
