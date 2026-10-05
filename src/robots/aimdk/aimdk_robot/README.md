@@ -621,3 +621,15 @@ The profile's `runtime.stop` bounds (`cancel_bound_s`, `idle_bound_s`,
 `torque_off_bound_s`) are placeholders until measured on the robot; replace
 them with the latencies observed in step 4, with margin, and tick the
 section-9 items in the OpenSpec tasks.
+
+## Parameterized speech and named-motion example
+
+Select `robot_config:=aimdk_x2_interaction_demo` through the existing unified
+`robot.launch.py` entry. The YAML names only the logical `speech.speak` service
+and `motion.named` action. Live runtime interface binding resolves their actual
+endpoints before starting the independent `robot_interaction_demo` node.
+The business package depends only on neutral `ibrobot_msgs` protocol types and
+receives text, language, motion name and target per request; it does not depend
+on robot_config, robot_runtime or the vendor SDK. Bring-up never speaks or moves.
+See [the walkthrough](../../../../docs/aimdk_interaction_demo.md) for commands,
+result semantics and pending hardware acceptance.

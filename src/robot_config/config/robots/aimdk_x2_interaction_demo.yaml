@@ -1,0 +1,22 @@
+# Unified deployment entry for the interaction API example.
+# Business request values (speech text/language and motion name/target) are supplied per call.
+robot:
+  base_config: aimdk_x2.yaml
+  name: aimdk_x2_interaction_demo
+  interaction_demo:
+    enabled: true
+    service_name: /interaction_demo/execute
+    timeout_sec: 40.0
+    interfaces:
+      speech:
+        interface: speech.speak
+        kind: service
+        type: ibrobot_msgs/srv/SpeakText
+        requires:
+          capability: interaction.tts
+      named_motion:
+        interface: motion.named
+        kind: action
+        type: ibrobot_msgs/action/ExecuteNamedMotion
+        requires:
+          capability: motion.named

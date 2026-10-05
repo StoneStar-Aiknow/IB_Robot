@@ -3,15 +3,14 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
-
 
 DOC_EXTENSIONS = {".md", ".rst", ".txt"}
 HTTP_TIMEOUT = 10
@@ -72,9 +71,12 @@ def strip_code_and_mermaid_blocks(text: str) -> str:
             continue
 
         if in_mermaid:
-            if mermaid_indent is None:
-                in_mermaid = False
-            elif stripped.strip() and indent <= mermaid_indent and not stripped.startswith((":", "#")):
+            if (
+                mermaid_indent is None
+                or stripped.strip()
+                and indent <= mermaid_indent
+                and not stripped.startswith((":", "#"))
+            ):
                 in_mermaid = False
             else:
                 output.append("\n")
@@ -127,7 +129,7 @@ def extract_links(file_path: Path, root: Path) -> list[LinkOccurrence]:
 
     patterns = [
         re.compile(r"!?\[[^\]\n]*\]\(([^)\s]*)(?:\s+\"[^\"]*\")?\)"),
-        re.compile(r"(?<![\w])(https?://[^\s<>)\]]+)")
+        re.compile(r"(?<![\w])(https?://[^\s<>)\]]+)"),
     ]
 
     for pattern in patterns:
@@ -167,7 +169,9 @@ def classify_kind(url: str) -> str:
     return "local"
 
 
-def validate_links(paths: Iterable[Path], root: Path, access_token: str | None, timeout: int, max_workers: int) -> list[ValidationResult]:
+def validate_links(
+    paths: Iterable[Path], root: Path, access_token: str | None, timeout: int, max_workers: int
+) -> list[ValidationResult]:
     occurrences = []
     for file_path in iter_doc_files(paths):
         occurrences.extend(extract_links(file_path, root))
@@ -189,12 +193,22 @@ def validate_links(paths: Iterable[Path], root: Path, access_token: str | None, 
             result = validate_local_link(occurrence, root)
         else:
             cached = cache[cache_key]
-            result = ValidationResult(occurrence.file, occurrence.line, occurrence.url, occurrence.kind, cached.status, cached.detail, cached.http_status)
+            result = ValidationResult(
+                occurrence.file,
+                occurrence.line,
+                occurrence.url,
+                occurrence.kind,
+                cached.status,
+                cached.detail,
+                cached.http_status,
+            )
         results.append(result)
     return results
 
 
-def validate_remote_links(remote_occurrences: dict[tuple[str, str], LinkOccurrence], access_token: str | None, timeout: int, max_workers: int) -> dict[tuple[str, str], ValidationResult]:
+def validate_remote_links(
+    remote_occurrences: dict[tuple[str, str], LinkOccurrence], access_token: str | None, timeout: int, max_workers: int
+) -> dict[tuple[str, str], ValidationResult]:
     if not remote_occurrences:
         return {}
 
@@ -344,14 +358,25 @@ def validate_atomgit_link(link: LinkOccurrence, access_token: str | None, timeou
     return validate_external_link(link, timeout)
 
 
-def validate_atomgit_blob_tree(link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int) -> ValidationResult:
+def validate_atomgit_blob_tree(
+    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
+) -> ValidationResult:
     if len(segments) < 5:
         return make_result(link, "broken", "AtomGit blob/tree URL is missing branch or path")
     if not access_token:
-        return make_result(link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config")
+        return make_result(
+            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
+        )
     namespace, repo, route, branch = segments[:4]
     file_path = "/".join(segments[4:])
-    status, detail, body = request_json(atomgit_api_url(parsed, f"repos/{namespace}/{repo}/contents/{quote(file_path, safe='/')}", {"ref": branch, "access_token": access_token}), timeout)
+    status, detail, body = request_json(
+        atomgit_api_url(
+            parsed,
+            f"repos/{namespace}/{repo}/contents/{quote(file_path, safe='/')}",
+            {"ref": branch, "access_token": access_token},
+        ),
+        timeout,
+    )
     if status != 200:
         return status_to_result(link, status, detail)
     target_type = atomgit_content_type(body)
@@ -360,7 +385,9 @@ def validate_atomgit_blob_tree(link: LinkOccurrence, parsed, segments: list[str]
     if target_type == "directory" and route == "blob":
         return make_result(link, "broken", "AtomGit directory target should use /tree/ instead of /blob/", status)
     if target_type == "unknown":
-        return make_result(link, "inconclusive", "AtomGit API response did not identify file or directory target", status)
+        return make_result(
+            link, "inconclusive", "AtomGit API response did not identify file or directory target", status
+        )
     if parsed.fragment:
         if target_type != "file":
             return make_result(link, "broken", f"line fragment #{parsed.fragment} can only target a file", status)
@@ -381,7 +408,9 @@ def atomgit_content_type(body: object | None) -> str:
     return "unknown"
 
 
-def validate_atomgit_line_fragment(link: LinkOccurrence, parsed, body: object | None, status: int) -> ValidationResult | None:
+def validate_atomgit_line_fragment(
+    link: LinkOccurrence, parsed, body: object | None, status: int
+) -> ValidationResult | None:
     line_match = re.fullmatch(r"L(\d+)(?:-L?(\d+))?", parsed.fragment)
     if not line_match:
         return None
@@ -390,19 +419,26 @@ def validate_atomgit_line_fragment(link: LinkOccurrence, parsed, body: object | 
     if not content:
         return make_result(link, "inconclusive", "AtomGit API did not return file content for line check", status)
     import base64
+
     try:
         decoded = base64.b64decode("".join(content.split())).decode("utf-8", errors="replace")
     except ValueError:
         return make_result(link, "inconclusive", "AtomGit API content could not be decoded", status)
     line_count = len(decoded.splitlines())
     if end_line <= line_count:
-        return make_result(link, "valid", f"AtomGit target exists and line fragment is within {line_count} lines", status)
+        return make_result(
+            link, "valid", f"AtomGit target exists and line fragment is within {line_count} lines", status
+        )
     return make_result(link, "broken", f"line fragment #{parsed.fragment} exceeds file length {line_count}", status)
 
 
-def validate_atomgit_issue_like(link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int) -> ValidationResult:
+def validate_atomgit_issue_like(
+    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
+) -> ValidationResult:
     if not access_token:
-        return make_result(link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config")
+        return make_result(
+            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
+        )
     namespace, repo, route = segments[:3]
     if route == "pull":
         if len(segments) < 4:
@@ -417,33 +453,49 @@ def validate_atomgit_issue_like(link: LinkOccurrence, parsed, segments: list[str
             return make_result(link, "broken", "milestones URL is missing milestone number")
         endpoint = f"repos/{namespace}/{repo}/milestones/{segments[3]}"
     else:
-        endpoint = f"repos/{namespace}/{repo}/issues" if len(segments) == 3 else f"repos/{namespace}/{repo}/issues/{segments[3]}"
+        endpoint = (
+            f"repos/{namespace}/{repo}/issues"
+            if len(segments) == 3
+            else f"repos/{namespace}/{repo}/issues/{segments[3]}"
+        )
     status, detail, _ = request_json(atomgit_api_url(parsed, endpoint, {"access_token": access_token}), timeout)
     return status_to_result(link, status, detail, valid_detail=f"AtomGit {route} target exists")
 
 
 def validate_atomgit_user_or_org(link: LinkOccurrence, access_token: str | None, timeout: int) -> ValidationResult:
     if not access_token:
-        return make_result(link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config")
+        return make_result(
+            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
+        )
     parsed = urlparse(link.url)
     segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
     if not segments:
         return make_result(link, "valid", "AtomGit host root")
     namespace = segments[0]
-    user_status, user_detail, _ = request_json(atomgit_api_url(parsed, f"users/{namespace}", {"access_token": access_token}), timeout)
+    user_status, user_detail, _ = request_json(
+        atomgit_api_url(parsed, f"users/{namespace}", {"access_token": access_token}), timeout
+    )
     if user_status == 200:
         return make_result(link, "valid", "AtomGit user exists", user_status)
-    org_status, org_detail, _ = request_json(atomgit_api_url(parsed, f"orgs/{namespace}", {"access_token": access_token}), timeout)
+    org_status, org_detail, _ = request_json(
+        atomgit_api_url(parsed, f"orgs/{namespace}", {"access_token": access_token}), timeout
+    )
     if org_status == 200:
         return make_result(link, "valid", "AtomGit org exists", org_status)
     return status_to_result(link, org_status or user_status, org_detail or user_detail)
 
 
-def validate_atomgit_repo(link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int) -> ValidationResult:
+def validate_atomgit_repo(
+    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
+) -> ValidationResult:
     if not access_token:
-        return make_result(link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config")
+        return make_result(
+            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
+        )
     namespace, repo = segments[:2]
-    status, detail, _ = request_json(atomgit_api_url(parsed, f"repos/{namespace}/{repo}", {"access_token": access_token}), timeout)
+    status, detail, _ = request_json(
+        atomgit_api_url(parsed, f"repos/{namespace}/{repo}", {"access_token": access_token}), timeout
+    )
     return status_to_result(link, status, detail, valid_detail="AtomGit repository exists")
 
 
@@ -452,8 +504,17 @@ def atomgit_api_url(parsed, endpoint: str, params: dict[str, str]) -> str:
     return urlunparse((parsed.scheme, "api.atomgit.com", f"/api/v5/{endpoint}", "", query, ""))
 
 
+def encode_url(url: str) -> str:
+    """Percent-encode non-ASCII characters so http.client can send the request line.
+
+    Raw non-ASCII characters (e.g. Chinese paths) crash http.client with UnicodeEncodeError;
+    existing percent-escapes are preserved verbatim.
+    """
+    return quote(url, safe=":/?#[]@!$&'()*+,;=%")
+
+
 def request_status(url: str, method: str, timeout: int) -> tuple[int | None, str]:
-    request = Request(url, method=method, headers={"User-Agent": USER_AGENT})
+    request = Request(encode_url(url), method=method, headers={"User-Agent": USER_AGENT})
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.status, response.reason
@@ -482,7 +543,9 @@ def request_json(url: str, timeout: int) -> tuple[int | None, str, object | None
         return None, "timeout", None
 
 
-def status_to_result(link: LinkOccurrence, status: int | None, detail: str, valid_detail: str = "URL is reachable") -> ValidationResult:
+def status_to_result(
+    link: LinkOccurrence, status: int | None, detail: str, valid_detail: str = "URL is reachable"
+) -> ValidationResult:
     if status is None:
         return make_result(link, "error", detail)
     if 200 <= status < 400:
@@ -541,13 +604,27 @@ def default_report_path(paths: list[Path]) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate local, external, and AtomGit links in generated docs")
     parser.add_argument("paths", nargs="+", help="Files or directories to scan")
-    parser.add_argument("--root", default=".", help="Root directory for resolving local links and relative report paths")
-    parser.add_argument("--report", default=None, help="JSON report path (default: <first scanned directory parent>/reports/link_validation.json)")
-    parser.add_argument("--config", default="config.json", help="Optional config.json containing atomgit.token; supports $ATOMGIT_TOKEN placeholders")
+    parser.add_argument(
+        "--root", default=".", help="Root directory for resolving local links and relative report paths"
+    )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="JSON report path (default: <first scanned directory parent>/reports/link_validation.json)",
+    )
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="Optional config.json containing atomgit.token; supports $ATOMGIT_TOKEN placeholders",
+    )
     parser.add_argument("--access-token", default=None, help="AtomGit access token for API validation")
     parser.add_argument("--timeout", type=int, default=HTTP_TIMEOUT, help="HTTP timeout in seconds")
-    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum concurrent remote URL checks")
-    parser.add_argument("--fail-on-inconclusive", action="store_true", help="Return non-zero when inconclusive links are found")
+    parser.add_argument(
+        "--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum concurrent remote URL checks"
+    )
+    parser.add_argument(
+        "--fail-on-inconclusive", action="store_true", help="Return non-zero when inconclusive links are found"
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()

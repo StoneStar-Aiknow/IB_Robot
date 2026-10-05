@@ -256,6 +256,7 @@ def generate_embodied_nodes(
         "imitate_human_motion_action_name": hri_runtime.get("action_name", "/hri/imitate_human_motion"),
         "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
         "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
+        "sound_following_service": "/sound_orientation_node/set_following",
     }
     if runtime_motion:
         common_params.update(
@@ -416,6 +417,9 @@ def generate_embodied_nodes(
     sound_orientation = idle_behaviors.get("sound_orientation", {}) if isinstance(idle_behaviors, dict) else {}
     if not isinstance(sound_orientation, dict):
         sound_orientation = {}
+    common_params["sound_following_enabled"] = bool(
+        sound_orientation.get("enabled", False) and sound_orientation.get("mode", "keyword") == "periodic"
+    )
 
     nodes = [
         Node(
@@ -447,6 +451,7 @@ def generate_embodied_nodes(
                     "finalize_workflow_service": common_params["finalize_workflow_service"],
                     "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                     "plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                    "prepare_plan_service": embodied_config.get("prepare_plan_service", "/embodied/prepare_agent_plan"),
                     "validate_plan_service": embodied_config.get(
                         "validate_plan_service", "/embodied/validate_agent_plan"
                     ),
@@ -482,6 +487,7 @@ def generate_embodied_nodes(
                         "max_session_turns": agent_config.get("max_session_turns", 12),
                         "clarification_ttl_sec": agent_config.get("clarification_ttl_sec", 300.0),
                         "event_queue_size": agent_config.get("event_queue_size", 128),
+                        "presentation_timeout_sec": float(agent_config.get("presentation_timeout_sec", 30.0)),
                         "allowed_skills_json": json.dumps(list(agent_config.get("test_allowlist", []))),
                         "simulation_mode": bool(use_sim),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
@@ -491,6 +497,9 @@ def generate_embodied_nodes(
                         "gateway_validate_skill_service": common_params["validate_skill_service"],
                         "gateway_skill_action": common_params["skill_action_name"],
                         "gateway_plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                        "gateway_prepare_plan_service": embodied_config.get(
+                            "prepare_plan_service", "/embodied/prepare_agent_plan"
+                        ),
                         "gateway_validate_plan_service": embodied_config.get(
                             "validate_plan_service", "/embodied/validate_agent_plan"
                         ),
@@ -517,6 +526,16 @@ def generate_embodied_nodes(
                         "primitive_action_name": common_params["primitive_action_name"],
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                         "startup_warmup": hri_runtime.get("startup_warmup", True),
+                        "rgb_topic": hri_runtime.get(
+                            "rgb_topic",
+                            perception_scene_sources.get("wrist_camera_topic", "/camera/wrist/image_raw"),
+                        ),
+                        "yolox_detect_service": hri_runtime.get("yolox_detect_service", "/perception/hri/yolox_detect"),
+                        "pear_parameters_service": hri_runtime.get(
+                            "pear_parameters_service", "/perception/hri/pear_parameters"
+                        ),
+                        "yolox_refresh_interval_sec": hri_runtime.get("yolox_refresh_interval_sec", 0.25),
+                        "person_confidence_threshold": hri_runtime.get("person_confidence_threshold", 0.30),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "reset_positions_json": json.dumps(home_positions),
                         "joint_limits_json": json.dumps(joint_limits),
@@ -541,6 +560,7 @@ def generate_embodied_nodes(
                 "gateway_status_service": common_params["skill_gateway_status_service"],
                 "skill_action_name": common_params["skill_action_name"],
                 "debug_tracing": common_params["debug_tracing"],
+                "default_active": bool(sound_orientation.get("default_active", False)),
             }
         )
         nodes.append(

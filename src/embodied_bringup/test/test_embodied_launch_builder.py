@@ -260,6 +260,11 @@ def test_sound_orientation_node_is_projected_from_robot_config():
     assert params["deadband_deg"] == 20.0
     assert _decode_launch_string(params["skill_name"]) == "nav_turn"
     assert _decode_launch_string(params["skill_action_name"]) == "/embodied/execute_skill"
+    assert _skill_executor_params(nodes)["sound_following_enabled"] is False
+
+    robot_config["embodied"]["idle_behaviors"]["sound_orientation"]["mode"] = "periodic"
+    periodic_nodes = generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+    assert _skill_executor_params(periodic_nodes)["sound_following_enabled"] is True
 
 
 # Drives a robot config whose perception services reference a gitignored model
@@ -280,6 +285,38 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
     assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/get_objects"
     assert params["semantic_map_stand_off_distance_m"] == 0.3
+
+
+def test_hybrid_profile_projects_hri_person_confidence_threshold():
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    config = load_robot_config_dict(config_path)
+
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    hri_node = next(
+        node for node in nodes if vars(node).get("_Node__node_name") == "imitate_human_motion_executor_node"
+    )
+    params = _normalize_launch_param_mapping(hri_node._Node__parameters[0])
+
+    assert params["person_confidence_threshold"] == pytest.approx(0.30)
+    assert params["yolox_refresh_interval_sec"] == pytest.approx(0.25)
+
+
+def test_hri_projection_defaults_person_confidence_threshold_when_omitted():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "imitate_human_motion": {"enabled": True},
+        }
+    }
+
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    hri_node = next(
+        node for node in nodes if vars(node).get("_Node__node_name") == "imitate_human_motion_executor_node"
+    )
+    params = _normalize_launch_param_mapping(hri_node._Node__parameters[0])
+
+    assert params["person_confidence_threshold"] == pytest.approx(0.30)
+    assert params["yolox_refresh_interval_sec"] == pytest.approx(0.25)
 
 
 def test_navigation_endpoint_missing_action_name_raises():
@@ -464,6 +501,7 @@ def test_agent_entry_mode_adds_only_agent_entry_node():
     assert params["execution_enabled"] is False
     assert _decode_launch_json_string(_decode_launch_string(params["allowed_skills_json"])) == ["wave_hello"]
     assert params["simulation_mode"] is False
+    assert params["presentation_timeout_sec"] == 30.0
 
 
 def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
@@ -475,6 +513,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
         "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
         "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
         "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+        "presentation_timeout_sec": 12.0,
     }
 
     nodes = generate_embodied_nodes(
@@ -489,6 +528,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
     nodes_by_name = {vars(node)["_Node__node_name"]: node for node in nodes}
     params = _normalize_launch_param_mapping(vars(nodes_by_name["ibrobot_agent_node"])["_Node__parameters"][0])
     assert params["simulation_mode"] is True
+    assert params["presentation_timeout_sec"] == 12.0
 
 
 def test_non_moveit_game_launches_only_gateway_and_perception():

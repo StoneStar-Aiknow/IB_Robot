@@ -12,9 +12,17 @@ ros2_control 和外设的统一机器人配置系统。
 
 目标是建立机器人硬件配置的单一数据源，消除不同配置系统之间的重复。
 
-固定触发词声源转向由 `robot.embodied.idle_behaviors.sound_orientation` 管理。配置默认关闭，仅支持移动底盘的 `nav_turn`，并要求 Voice ASR、speech direction、`base_navigation` 与导航 command server 同时可用。该配置只决定是否启动 `embodied_agent/sound_orientation_node`；运动授权仍只能由 `authorize_motion` launch 参数提供。
+声源转向由 `robot.embodied.idle_behaviors.sound_orientation` 管理，schema 默认关闭，仅支持移动底盘的
+`nav_turn`。`mode: keyword` 使用配置中的完整 ASR 短语触发一次转向；`mode: periodic` 忽略 ASR 文本，
+由 `sound_following` Skill 在 `inactive` / `active` 会话之间切换，并按 `periodic_interval_sec` 消费新的
+`SpeechDirection.segment_id`。`enabled` 只决定是否启动节点，`default_active` 才决定 periodic 会话初始状态；
+运动授权仍只能由 `authorize_motion` launch 参数提供。`lekiwi_nav_grasp` 的 hybrid stage 默认启用
+periodic（会话仍为 inactive，需显式激活）；其他 stage 与其余机器人 profile 保持关闭，可经
+`lekiwi_nav_grasp_sound_real` overlay 显式开启。periodic 模式只消费 `SpeechDirection`，校验上不要求
+`voice_asr.enabled`；keyword 模式仍要求 ASR 与 speech direction 同时可用。
 
-当前 `VoiceASRNode` 和 `speech_direction_node` 各自拥有音频采集，不共享设备流。生产配置不得在未验证同一麦克风并发读取前默认开启此行为。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
+`VoiceASRNode` 和 `speech_direction_node` 都订阅 `audio_io` 发布的共享音频话题，不直接竞争打开 ReSpeaker
+设备。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
 
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
 override 注入序列号，避免把某一台实物设备绑定到所有同型号 profile。
@@ -1189,6 +1197,7 @@ robot:
       max_session_turns: 12       # 会话记忆滚动窗口
       clarification_ttl_sec: 300.0  # 一次性澄清上下文有效期
       event_queue_size: 128
+      presentation_timeout_sec: 30.0  # exact plan 展示完成回执等待上限
       planner:
         mode: vlm                 # rule（仅仿真执行）| vlm
         provider: kimicode        # kimicode | openai_compatible
@@ -1214,6 +1223,7 @@ robot:
 | `agent.ledger_path` / `conversation_path` / `deployment_lock_path` | 非空路径 |
 | `agent.max_session_turns` / `event_queue_size` | 正整数 |
 | `agent.clarification_ttl_sec` | 正数 |
+| `agent.presentation_timeout_sec` | 有限正数，默认 30 秒；未收到 exact plan 展示完成回执时禁止 confirm/execute |
 | `agent.planner.mode` | `rule` 或 `vlm` |
 | `agent.planner.provider` | vlm 模式下 `kimicode` 或 `openai_compatible` |
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
@@ -1715,3 +1725,13 @@ ros2 launch robot_config robot.launch.py \
 ## 许可证
 
 Apache-2.0
+
+## 交互 demo：逻辑接口绑定与统一入口
+
+选择 `robot_config:=aimdk_x2_interaction_demo` 可从原有 `robot.launch.py` 启动 X2 runtime
+和独立 demo 节点。派生 YAML 只声明启用、超时和逻辑接口 `speech.speak` / `motion.named`；
+运行时接口描述负责解析实际 endpoint，绑定成功后 launch 才注入并启动业务节点。
+
+文本、语言、优先级、动作名和目标侧由每次 `runtime-demo speak` / `runtime-demo motion`
+请求传入，不在机器人 YAML 中固化。业务包只依赖中立 `ibrobot_msgs`，不依赖 robot_config、
+robot_runtime 或厂商 SDK。详细命令见 [交互示范指南](../../docs/aimdk_interaction_demo.md)。

@@ -4,9 +4,14 @@
 `embodied.entry_mode` 入口。它消费 `robot_config` SSOT YAML，启动 Agent plan、安全校验、
 Skill Gateway 以及可选感知和抓取执行服务。
 
-可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。它订阅最终 ASR 文本和 `SpeechDirection`，只通过 `/embodied/execute_skill` 调用 `nav_turn`；默认关闭，不进入视觉游戏的 controller-independent closure。正常自动启动 controller 时，它与 Gateway 节点共享 readiness barrier。
+可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。keyword 模式订阅
+最终 ASR 文本和 `SpeechDirection`；periodic 模式忽略 ASR 文本，通过 catalog 中的 `sound_following` delegated
+executor 调用 `~/set_following` 管理会话。两种模式都只通过 `/embodied/execute_skill` 调用 `nav_turn`；schema
+默认关闭，正常自动启动 controller 时与 Gateway 节点共享 readiness barrier。
 
-启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和包含 `nav_turn` 的 catalog profile。当前 Voice ASR 与 speech direction 是两个独立采集进程，部署侧未验证同一 ReSpeaker 可并发读取时必须保持该行为关闭。
+启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和
+包含 `nav_turn` 的 catalog profile；periodic 模式还要求 profile 暴露 `sound_following`。Voice ASR 与 speech
+direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备。
 
 ## 职责边界
 
@@ -143,5 +148,8 @@ Agent 孵化 profile（`so101_agent_manual`、`so101_single_arm_agent_gazebo` �
 - `lekiwi_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
 - `lekiwi_nav_grasp` hybrid stage 启用 `embodied.imitate_human_motion` 时，bringup 会把 arm 关节顺序、
   reset positions 和 joint limits 从同一份 `robot_config` 注入 HRI runtime，并在启动时默认尝试一次 warmup。
+  同时注入 `rgb_topic` 与两个 HRI 模型服务端点（`yolox_detect_service` / `pear_parameters_service`）；
+  `rgb_topic` 未显式配置时回退到 `embodied.perception.scene_sources.wrist_camera_topic`，即 remap
+  之后的腕部相机名，而不是 RealSense 驱动自己的 topic。
 - 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

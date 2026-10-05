@@ -4,6 +4,8 @@
         "2": "getting_started",
         "2.1": "environment_setup",
         "2.2": "building_the_project",
+        "2.3": "multi_platform_support",
+        "2.4": "third_party_dependencies_lerobot_patch_stack",
         "3": "core_concepts",
         "3.1": "single_source_of_truth_pattern",
         "3.2": "contract_system",
@@ -23,6 +25,8 @@
         "7.4": "policy_nodes",
         "7.5": "model_export_validation",
         "7.6": "attention_visualization",
+        "7.7": "inference_backends_model_sessions",
+        "7.8": "inference_manifest_policy_bundles",
         "8": "action_dispatch",
         "8.1": "action_dispatcher_node",
         "8.2": "temporal_smoothing",
@@ -45,23 +49,44 @@
         "11.3": "simulation_backends",
         "11.4": "lekiwi_mobile_manipulator",
         "11.5": "navigation_stack",
+        "11.6": "robot_calibration",
         "12": "extended_capabilities",
         "12.1": "voice_asr_service",
         "12.2": "social_control_ai_agent_integration",
         "12.3": "performance_tracing",
+        "12.4": "voice_tts_service",
+        "12.5": "speech_direction_enhancement",
         "13": "package_reference",
         "14": "development",
         "14.1": "vs_code_configuration",
         "14.2": "build_system_and_mixins",
         "14.3": "debugging_and_testing",
         "14.4": "atomgit_sdk_ci_automation",
-        "15": "glossary"
+        "15": "embodied_intelligence_stack",
+        "15.1": "interface_definitions",
+        "15.2": "skill_catalog_skill_library",
+        "15.3": "capability_gateway_safety_guard",
+        "15.4": "robot_skill_cli_hermes_agent_integration",
+        "15.5": "embodied_agent_pipeline_bringup",
+        "16": "perception_manipulation_services",
+        "16.1": "perception_service",
+        "16.2": "grasp_planning",
+        "16.3": "pick_place_execution",
+        "16.4": "semantic_mapping_object_tracking",
+        "17": "model_export_toolchains",
+        "17.1": "pi0_5_split_export_pipeline",
+        "17.2": "quantization_ascend_om_conversion",
+        "17.3": "rknn_hisilicon_houmo_hmm_export",
+        "17.4": "accuracy_comparison_observation_batches",
+        "18": "glossary"
     },
     "title_to_label": {
         "IB-Robot Overview": "overview",
         "Getting Started": "getting_started",
         "Environment Setup": "environment_setup",
         "Building the Project": "building_the_project",
+        "Multi-Platform Support (Ubuntu, openEuler, OpenHarmony)": "multi_platform_support",
+        "Third-Party Dependencies and LeRobot Patch Stack": "third_party_dependencies_lerobot_patch_stack",
         "Core Concepts": "core_concepts",
         "Single Source of Truth Pattern": "single_source_of_truth_pattern",
         "Contract System": "contract_system",
@@ -81,6 +106,8 @@
         "Policy Nodes": "policy_nodes",
         "Model Export and Validation (model_utils)": "model_export_validation",
         "Attention Visualization (attention_viz)": "attention_visualization",
+        "Inference Backends and Model Sessions": "inference_backends_model_sessions",
+        "Inference Manifest and Policy Bundles": "inference_manifest_policy_bundles",
         "Action Dispatch": "action_dispatch",
         "Action Dispatcher Node": "action_dispatcher_node",
         "Temporal Smoothing": "temporal_smoothing",
@@ -103,16 +130,35 @@
         "Simulation Backends": "simulation_backends",
         "LeKiwi Mobile Manipulator": "lekiwi_mobile_manipulator",
         "Navigation Stack (robot_navigation)": "navigation_stack",
+        "Robot Calibration (robot_calibration)": "robot_calibration",
         "Extended Capabilities": "extended_capabilities",
         "Voice ASR Service": "voice_asr_service",
         "Social Control and AI Agent Integration": "social_control_ai_agent_integration",
         "Performance Tracing": "performance_tracing",
+        "Voice TTS Service": "voice_tts_service",
+        "Speech Direction and Enhancement": "speech_direction_enhancement",
         "Package Reference": "package_reference",
         "Development Guide": "development",
         "VS Code Configuration": "vs_code_configuration",
         "Build System and Mixins": "build_system_and_mixins",
         "Debugging and Testing": "debugging_and_testing",
         "AtomGit SDK and CI Automation": "atomgit_sdk_ci_automation",
+        "Embodied Intelligence Stack": "embodied_intelligence_stack",
+        "Interface Definitions (ibrobot_msgs)": "interface_definitions",
+        "Skill Catalog and Skill Library": "skill_catalog_skill_library",
+        "Capability Gateway and Safety Guard": "capability_gateway_safety_guard",
+        "robot-skill CLI and Hermes Agent Integration": "robot_skill_cli_hermes_agent_integration",
+        "Embodied Agent and Pipeline Bringup": "embodied_agent_pipeline_bringup",
+        "Perception and Manipulation Services": "perception_manipulation_services",
+        "Perception Service": "perception_service",
+        "Grasp Planning (manipulation_service)": "grasp_planning",
+        "Pick and Place Execution (manipulation_execution)": "pick_place_execution",
+        "Semantic Mapping and Object Tracking": "semantic_mapping_object_tracking",
+        "Model Export Toolchains": "model_export_toolchains",
+        "PI0.5 Split Export Pipeline": "pi0_5_split_export_pipeline",
+        "Quantization and Ascend OM Conversion": "quantization_ascend_om_conversion",
+        "RKNN, Hisilicon and Houmo HMM Export": "rknn_hisilicon_houmo_hmm_export",
+        "Accuracy Comparison and Observation Batches": "accuracy_comparison_observation_batches",
         "Glossary": "glossary"
     },
     "hierarchy": {
@@ -123,7 +169,9 @@
             "title": "Getting Started",
             "subs": {
                 "environment_setup.md": "Environment Setup",
-                "building_the_project.md": "Building the Project"
+                "building_the_project.md": "Building the Project",
+                "multi_platform_support.md": "Multi-Platform Support (Ubuntu, openEuler, OpenHarmony)",
+                "third_party_dependencies_lerobot_patch_stack.md": "Third-Party Dependencies and LeRobot Patch Stack"
             }
         },
         "core_concepts": {
@@ -158,7 +206,9 @@
                 "distributed_execution_mode.md": "Distributed Execution Mode",
                 "policy_nodes.md": "Policy Nodes",
                 "model_export_validation.md": "Model Export and Validation (model_utils)",
-                "attention_visualization.md": "Attention Visualization (attention_viz)"
+                "attention_visualization.md": "Attention Visualization (attention_viz)",
+                "inference_backends_model_sessions.md": "Inference Backends and Model Sessions",
+                "inference_manifest_policy_bundles.md": "Inference Manifest and Policy Bundles"
             }
         },
         "action_dispatch": {
@@ -196,7 +246,8 @@
                 "hardware_plugins.md": "Hardware Plugins",
                 "simulation_backends.md": "Simulation Backends",
                 "lekiwi_mobile_manipulator.md": "LeKiwi Mobile Manipulator",
-                "navigation_stack.md": "Navigation Stack (robot_navigation)"
+                "navigation_stack.md": "Navigation Stack (robot_navigation)",
+                "robot_calibration.md": "Robot Calibration (robot_calibration)"
             }
         },
         "extended_capabilities": {
@@ -204,7 +255,9 @@
             "subs": {
                 "voice_asr_service.md": "Voice ASR Service",
                 "social_control_ai_agent_integration.md": "Social Control and AI Agent Integration",
-                "performance_tracing.md": "Performance Tracing"
+                "performance_tracing.md": "Performance Tracing",
+                "voice_tts_service.md": "Voice TTS Service",
+                "speech_direction_enhancement.md": "Speech Direction and Enhancement"
             }
         },
         "package_reference.md": {
@@ -217,6 +270,34 @@
                 "build_system_and_mixins.md": "Build System and Mixins",
                 "debugging_and_testing.md": "Debugging and Testing",
                 "atomgit_sdk_ci_automation.md": "AtomGit SDK and CI Automation"
+            }
+        },
+        "embodied_intelligence_stack": {
+            "title": "Embodied Intelligence Stack",
+            "subs": {
+                "interface_definitions.md": "Interface Definitions (ibrobot_msgs)",
+                "skill_catalog_skill_library.md": "Skill Catalog and Skill Library",
+                "capability_gateway_safety_guard.md": "Capability Gateway and Safety Guard",
+                "robot_skill_cli_hermes_agent_integration.md": "robot-skill CLI and Hermes Agent Integration",
+                "embodied_agent_pipeline_bringup.md": "Embodied Agent and Pipeline Bringup"
+            }
+        },
+        "perception_manipulation_services": {
+            "title": "Perception and Manipulation Services",
+            "subs": {
+                "perception_service.md": "Perception Service",
+                "grasp_planning.md": "Grasp Planning (manipulation_service)",
+                "pick_place_execution.md": "Pick and Place Execution (manipulation_execution)",
+                "semantic_mapping_object_tracking.md": "Semantic Mapping and Object Tracking"
+            }
+        },
+        "model_export_toolchains": {
+            "title": "Model Export Toolchains",
+            "subs": {
+                "pi0_5_split_export_pipeline.md": "PI0.5 Split Export Pipeline",
+                "quantization_ascend_om_conversion.md": "Quantization and Ascend OM Conversion",
+                "rknn_hisilicon_houmo_hmm_export.md": "RKNN, Hisilicon and Houmo HMM Export",
+                "accuracy_comparison_observation_batches.md": "Accuracy Comparison and Observation Batches"
             }
         },
         "glossary.md": {

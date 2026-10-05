@@ -16,7 +16,7 @@ import yaml
 from inference_service.runtime_composition import (
     require_runtime_dependencies,
 )
-from inference_service.unified_runtime import ModelResult, RegistrySet, RuntimeLatency, RuntimeProviders
+from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 
 try:
     import torch
@@ -40,12 +40,16 @@ _RANSAC_CONFIDENCE = 0.999
 _VALID_INFERENCE_BACKENDS = {"local_cuda", "ascend_local"}
 
 
-def _backend_latency_ms(result: ModelResult) -> float:
+def _backend_latency_ms(result: object) -> float:
     """Return backend latency for either unified-runtime latency representation."""
-    latency = result.latency
-    if isinstance(latency, RuntimeLatency) and latency.backend_ms is not None:
-        return latency.backend_ms
-    return result.latency_ms
+    latency = getattr(result, "latency", None)
+    backend_ms = getattr(latency, "backend_ms", None)
+    if backend_ms is not None:
+        return float(backend_ms)
+    latency_ms = getattr(result, "latency_ms", None)
+    if latency_ms is None:
+        raise TypeError("GraspGen runtime result does not expose latency_ms")
+    return float(latency_ms)
 
 
 def _load_grasp_metadata(config_path: Path) -> tuple[str, int]:

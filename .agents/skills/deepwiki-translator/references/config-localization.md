@@ -2,12 +2,12 @@
 
 ## When to Read
 
-- 执行第 1 步（本地化 doc_config.json）时
-- 执行第 2 步（校验本地化配置）时
-- 执行第 3 步（构建文件名到 H1 的映射）时
-- 需要了解目录 overview 标题后缀规则
+- 执行第 2 步「本地化配置与构建映射」时（开始本地化前必须完整阅读）
+- 校验本地化配置时
+- 构建文件名到 H1 的映射时
+- 需要目录 overview「概述」后缀规则的完整 JSON 示例时
 
-## 第 1 步：本地化 doc_config.json
+## 本地化 doc_config.json
 
 读取 `source_config`，生成同 schema 的 `target_config`。
 
@@ -82,9 +82,9 @@
 }
 ```
 
-## 第 2 步：校验本地化配置
+## 校验本地化配置
 
-翻译页面前必须校验：
+新建或重新本地化 `target_config` 后必须校验：
 
 1. `id_to_label` 中的 label 集合未变化。
 2. `title_to_label` 中的 label 集合与 `id_to_label` 中的 label 集合一致。
@@ -95,7 +95,7 @@
 
 任一校验失败时停止，并报告具体不一致项。不要基于错误配置翻译页面。
 
-## 第 3 步：构建文件名到 H1 的映射
+## 构建文件名到 H1 的映射
 
 使用 `target_config.hierarchy` 构建每个译文 Markdown 文件的标准 H1：
 

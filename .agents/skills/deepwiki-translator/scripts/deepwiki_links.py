@@ -1,12 +1,7 @@
+import json
 import os
 import re
-import zipfile
 from pathlib import Path
-from typing import TypeAlias
-from xml.sax.saxutils import escape
-
-
-XlsxCell: TypeAlias = int | str
 
 
 FILE_LIKE_NAMES = {
@@ -23,21 +18,44 @@ FILE_LIKE_NAMES = {
 }
 
 
-def get_url_from_text(text, base_url, repo_root=None):
-    clean_text = text.split('(')[0].strip().strip('[]`')
+def parse_source_ref(text):
+    """Parse a source reference into (path, start, end).
+
+    Supports single refs like 'path.py:12' or 'path.py:12-34', and multi-range
+    refs like 'path.py:54-56, 136-187'. Multiple ranges are merged into one
+    big span (min start, max end), e.g. '54-56, 136-187' -> (54, 187).
+    Returns None when the text is not a source reference.
+    """
+    clean_text = text.strip().strip('[]`')
+    match = re.match(r'^(?P<path>.+?):(?P<ranges>\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)+)$', clean_text)
+    if match:
+        starts = []
+        ends = []
+        for part in re.split(r'\s*,\s*', match.group('ranges')):
+            numbers = part.split('-')
+            starts.append(int(numbers[0]))
+            ends.append(int(numbers[-1]))
+        return match.group('path'), min(starts), max(ends)
     match = re.match(r'^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?$', clean_text)
     if match:
-        path = match.group('path')
-        start = match.group('start')
-        end = match.group('end')
-        lines = f"#L{start}-L{end}" if end else f"#L{start}"
+        start = int(match.group('start'))
+        end = int(match.group('end') or match.group('start'))
+        return match.group('path'), start, end
+    return None
+
+
+def get_url_from_text(text, base_url, repo_root=None):
+    clean_text = text.split('(')[0].strip().strip('[]`')
+    parsed = parse_source_ref(clean_text)
+    if parsed:
+        path, start, end = parsed
+        lines = f"#L{start}-L{end}" if end > start else f"#L{start}"
         return f"{repo_url(path, base_url, repo_root, force_route='blob')}{lines}"
     return repo_url(clean_text, base_url, repo_root)
 
 
 def looks_like_source_ref(text):
-    clean_text = text.strip().strip('[]`')
-    return bool(re.match(r'^.+?:\d+(?:-\d+)?$', clean_text))
+    return parse_source_ref(text) is not None
 
 
 def looks_like_repo_path(text):
@@ -57,6 +75,52 @@ def looks_like_repo_path(text):
 
 def is_line_noise_link(text):
     return bool(re.fullmatch(r'line\s+\d+', text.strip(), flags=re.IGNORECASE))
+
+
+def strip_inline_markdown(text):
+    """Remove inline code spans, links, and emphasis markers from heading text."""
+    code_spans = []
+
+    def stash(m):
+        code_spans.append(m.group(1))
+        return f"\x00{len(code_spans) - 1}\x00"
+
+    text = re.sub(r'`([^`]*)`', stash, text)
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    text = re.sub(r'[*_~]+', '', text)
+    return re.sub(r'\x00(\d+)\x00', lambda m: code_spans[int(m.group(1))], text)
+
+
+def github_slug(heading):
+    """Generate a GitHub-style anchor slug for a heading text.
+
+    Mirrors GitHub's algorithm: lowercase, drop punctuation (keeping word
+    characters, including CJK, spaces, and hyphens), join words with hyphens.
+    """
+    slug = strip_inline_markdown(heading).strip().lower()
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    return re.sub(r'\s+', '-', slug)
+
+
+def extract_heading_slugs(content):
+    """Collect GitHub-style anchor slugs for every heading in markdown content.
+
+    Duplicate headings get GitHub's dedup suffixes: the second occurrence of
+    "foo" yields "foo-1", the third "foo-2", and so on.
+    """
+    slugs = set()
+    counts = {}
+    for line in content.splitlines():
+        match = re.match(r'^(#{1,6})\s+(.*?)\s*#*\s*$', line)
+        if not match:
+            continue
+        base = github_slug(match.group(2))
+        if not base:
+            continue
+        seen = counts.get(base, 0)
+        counts[base] = seen + 1
+        slugs.add(base if seen == 0 else f"{base}-{seen}")
+    return slugs
 
 
 def strip_page_marker(text):
@@ -259,82 +323,21 @@ def report_link_conversions(link_conversions, output_dir):
         print("\nNo link conversions recorded.")
         return
 
-    entries = link_conversions
     output_dir = Path(output_dir)
     report_dir = output_dir.parent / "reports"
-    report_path = report_dir / "link_conversions.xlsx"
+    report_path = report_dir / "link_conversions.json"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import pandas as pd
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(link_conversions, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
-        df = pd.DataFrame(entries)
-        df.index = df.index + 1
-        df.index.name = "#"
-        df.columns = ["File", "Original", "Converted"]
-
-        with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Link Conversions")
-            ws = writer.sheets["Link Conversions"]
-            ws.column_dimensions["B"].width = 30
-            ws.column_dimensions["C"].width = 50
-            ws.column_dimensions["D"].width = 50
-    except ModuleNotFoundError:
-        write_link_conversions_xlsx(entries, report_path)
-
-    print(f"\nLink Conversions ({len(entries)} total) written to {report_path}")
-
-
-def write_link_conversions_xlsx(entries, report_path):
-    rows: list[list[XlsxCell]] = [["#", "File", "Original", "Converted"]]
-    rows.extend([[index, entry["file"], entry["original"], entry["converted"]] for index, entry in enumerate(entries, start=1)])
-
-    def cell_ref(row_index, col_index):
-        col_name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[col_index]
-        return f"{col_name}{row_index}"
-
-    row_xml = []
-    for row_index, row in enumerate(rows, start=1):
-        cells = []
-        for col_index, value in enumerate(row):
-            ref = cell_ref(row_index, col_index)
-            if isinstance(value, int):
-                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
-            else:
-                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>')
-        row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
-
-    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<cols><col min="2" max="2" width="30" customWidth="1"/><col min="3" max="4" width="50" customWidth="1"/></cols>
-<sheetData>{"".join(row_xml)}</sheetData>
-</worksheet>'''
-
-    with zipfile.ZipFile(report_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>''')
-        archive.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>''')
-        archive.writestr("xl/workbook.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<sheets><sheet name="Link Conversions" sheetId="1" r:id="rId1"/></sheets>
-</workbook>''')
-        archive.writestr("xl/_rels/workbook.xml.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>''')
-        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    print(f"\nLink Conversions ({len(link_conversions)} total) written to {report_path}")
 
 
 def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, label_to_filepath, link_conversions, warn, repo_root=None, label_to_title=None):
     content, placeholders = protect_blocks(content)
+    heading_slugs = extract_heading_slugs(content)
 
     def replace_backtick_wrapped_link(m):
         text = m.group(1).strip()
@@ -353,12 +356,18 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
 
     def replace_bare_code_source(m):
         text = m.group(1).strip()
-        if not looks_like_source_ref(text):
-            return m.group(0)
-        original = m.group(0)
-        converted = f"[{text}]({get_url_from_text(text, base_url, repo_root)})"
-        record_conversion(link_conversions, current_filepath, original, converted)
-        return converted
+        if looks_like_source_ref(text):
+            original = m.group(0)
+            converted = f"[{text}]({get_url_from_text(text, base_url, repo_root)})"
+            record_conversion(link_conversions, current_filepath, original, converted)
+            return converted
+        if looks_like_repo_path(text):
+            original = m.group(0)
+            converted = f"[{text}]({repo_url(text, base_url, repo_root)})"
+            record_conversion(link_conversions, current_filepath, original, converted)
+            return converted
+        warn(f"Unresolved backtick-wrapped empty link in {current_filepath}: `{text}`()")
+        return m.group(0)
 
     content = re.sub(r'`([^`\n]+?)`\(\)', replace_bare_code_source, content)
 
@@ -386,6 +395,10 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
             return m.group(0)
 
         if url.startswith('#') and not re.fullmatch(r'#\d+(?:\.\d+)*', url):
+            anchor = url[1:]
+            if anchor not in heading_slugs:
+                warn(f"Dangling anchor '#{anchor}' in {current_filepath}: [{text}]({url}) (no matching heading in this page)")
+                record_conversion(link_conversions, current_filepath, m.group(0), "(dangling anchor)")
             return m.group(0)
 
         page_link = resolve_page_link(text, url, current_filepath, id_to_label, title_to_label, label_to_filepath, warn, label_to_title)

@@ -1,0 +1,22 @@
+# Operator-facing parameterized demo endpoint, not an Agent/skill execution contract.
+uint8 SPEAK=1
+uint8 NAMED_MOTION=2
+uint8 operation
+
+# SPEAK request fields. language="" selects the runtime default.
+string text
+string language
+uint8 priority
+
+# NAMED_MOTION request fields.
+string motion_name
+string target
+
+# Shared command behavior. Motion additionally requires allow_motion=true.
+bool interrupt
+bool allow_motion
+---
+bool success
+# JSON evidence from the downstream public service/action.
+# Speech acceptance is not playback completion. A timed-out call may still execute.
+string result_json

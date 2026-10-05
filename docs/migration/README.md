@@ -1,14 +1,15 @@
 # IB-Robot DeepWiki 文档迁移与转换指南
 
-本目录用于承接 DeepWiki 输出的 IB-Robot 文档，并通过 Agent 技能完成拆分、配置、翻译、生成与校验。用户直接依次使用 `deepwiki-config`、`deepwiki-translator` 和 `mermaid-syntax-validation` 这 3 个技能，即可完成文档迁移与转换。
+本目录用于承接 DeepWiki 输出的 IB-Robot 文档，并通过 Agent 技能完成拆分、配置、翻译、生成与校验。用户直接依次使用 `deepwiki-config`、`deepwiki-translator`、`doc-link-validator` 和 `mermaid-syntax-validation` 这 4 个技能，即可完成文档迁移与转换。
 
 ## 最新流程概览
 
 推荐按以下顺序执行：
 
 1. `deepwiki-config`: 基于 DeepWiki 目录结构生成或更新 `doc_config.json`。
-2. `deepwiki-translator`: 拆分 DeepWiki Markdown、执行 config-first 翻译、运行 `deepwiki_processor.py` 生成文档，并执行链接检查。
-3. `mermaid-syntax-validation`: 对生成后的文档执行 Mermaid 语法检查、最小修复和渲染验证。
+2. `deepwiki-translator`: 拆分 DeepWiki Markdown、执行 config-first 翻译、运行 `deepwiki_processor.py` 生成文档，并执行锚点校验。
+3. `doc-link-validator`: 对生成后的文档执行链接体检（本地、外部与 AtomGit 链接）。
+4. `mermaid-syntax-validation`: 对生成后的文档执行 Mermaid 语法检查、最小修复和渲染验证。
 
 下文保留每个阶段涉及的输入、产出和脚本命令，便于人工复核或排查问题。
 
@@ -95,26 +96,28 @@ python .agents/skills/deepwiki-translator/scripts/deepwiki_processor.py \
     --input-dir docs/migration/raw_md_zh \
     --output-dir docs/migration/ib_robot_zh \
     --config-file docs/migration/doc_config_zh.json \
-    --source-config-file docs/migration/doc_config.json \
     --branch master
 ```
 
+源配置 `docs/migration/doc_config.json` 与目标配置同目录，满足自动发现条件，无需显式传 `--source-config-file`；若布局不满足该条件，需显式传入。
+
 - **产出**:
   - 层级化 Markdown 文档目录。
-  - `link_conversions.xlsx` 链接转换报告。
+  - `link_conversions.json` 链接转换报告。
   - 生成阶段的 warning 汇总。
 
 不要手工修改生成目录；如需修复内容，应修改 `doc_config_zh.json` 或 `raw_md_zh/*.md` 后重新生成。
 
 ## 链接检查
 
-生成完成后，使用 `deepwiki-translator` 技能脚本中的 `link_validator.py` 检查本地链接、外部链接和 AtomGit 链接。
+生成完成后，使用 `doc-link-validator` 技能检查本地链接、外部链接和 AtomGit 链接。
 
-- **脚本**: `.agents/skills/deepwiki-translator/scripts/link_validator.py`
+- **技能**: `doc-link-validator`
+- **脚本**: `.agents/skills/doc-link-validator/scripts/link_validator.py`
 - **命令**:
 
 ```bash
-python .agents/skills/deepwiki-translator/scripts/link_validator.py \
+python .agents/skills/doc-link-validator/scripts/link_validator.py \
     docs/migration/ib_robot_zh \
     --root docs/migration/ib_robot_zh \
     --report docs/migration/reports/link_validation.json \
@@ -153,5 +156,5 @@ python .agents/skills/deepwiki-translator/scripts/link_validator.py \
 3. 重新运行 `split_md.py` 生成新的 `raw_md/`。
 4. 用 `deepwiki-translator` 的 incremental 模式只翻译新增或明确变更的页面。
 5. 重新运行 `deepwiki_processor.py`。
-6. 运行 `link_validator.py`。
+6. 运行 `doc-link-validator` 技能（`link_validator.py`）。
 7. 运行 `mermaid-syntax-validation`。

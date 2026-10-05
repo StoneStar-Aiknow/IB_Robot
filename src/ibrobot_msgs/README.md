@@ -30,6 +30,12 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 
 ## 1. 消息定义（msg/）
 
+### `SpeechDirection.msg`
+
+声源方向事件使用 REP-103 的 `azimuth_rad`，并以 `segment_id` 关联同一语音段的 `voice_begin`、
+`mid_long_seg` 和 `seg_end` 输出；`seq_id` 仍是逐事件递增的去重序号。新增字段会改变 ROS type hash，
+升级时必须原子重建并部署 `voice_asr_service`、`embodied_agent` 和所有订阅者，不得混跑旧二进制。
+
 ### `MHandProFrame.msg` / `HumanHandState.msg`
 
 `MHandProFrame` 是可选的 mHandPro 厂商原始数据边界，保存左右侧、帧序号、设备电量、
@@ -134,9 +140,24 @@ plan/validate/confirm/execute 端点可达；且系统未处于初始编译、re
 `MOTION_NOT_AUTHORIZED`。状态服务永远不会暴露任一 nonce。
 
 Agent plan 的 `execution_mode` 是显式控制模式契约：`interactive_confirmation` 为旧分阶段入口默认值，
-`immediate_after_presentation` 仅由 `robot-skill run-workflow` 使用。模式在计划创建时捕获，写入
+`immediate_after_presentation` 由 `robot-skill run-workflow` 和 `ibrobot_agent` 孵化入口使用。模式在计划创建时捕获，写入
 `AgentPlan`，并由 `ConfirmAgentPlan` 精确匹配；它不授予或修改 `authorize_motion`。立即模式仍必须完成
 exact catalog、validation、计划展示并 flush、技术绑定、action admission、停止收敛和权威终态校验。
+
+CLI 在同步展示回调返回前完成 flush；孵化 Agent 则发布完整计划并等待客户端的 exact-plan 展示回执，
+收到有效回执后才调用 `ConfirmAgentPlan`。回执是展示传输屏障，不是运动授权或用户二次批准。
+没有客户端、展示失败或超时时不得自动跳过屏障。孵化 JSON 回执协议见 `ibrobot_agent/README.md`。
+
+### Agent plan 复合预检与 trace ID
+
+`PrepareAgentPlan.srv` 请求包含 schema_version=1、request_id、raw_command、typed workflow_steps、
+execution_mode 和 trace_id。响应包含 success、allowed、AgentPlan、error_code、message 和 diagnostics；
+只捕获 exact catalog plan 并做逐步只读 validation，不包含展示、确认、授权或执行。
+`PlanAgentCommand` / `ValidateAgentPlan` 仍保留用于分阶段诊断与兼容调用。
+
+`DispatchBinding.trace_id` 与 `ExecuteAgentPlan.Goal.trace_id` 为链路关联字段，不参与运动权限判断；
+空值按调用路径回退到 request/task ID。日志使用清洗后的副本，不改变业务幂等身份。
+新增同名 ROS 消息/action 字段改变 wire layout，生产者、消费者及生成接口须一致重建和部署。
 
 Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `ValidateSkill.srv`。状态服务不携带
 执行器依赖、ROS transport 名称、配置路径、primitive sequence、坐标或底层控制器状态；这些都不是
@@ -222,6 +243,35 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
 `RecognizeTags` 在 masks 为空时维持整图识别语义，即使 `include_image=false`，以兼容原有整图调用方；
 有 masks 时调用方可关闭整图识别，仅请求局部候选。
+
+### HRI 人体感知服务
+
+`YoloXDetect` 和 `PearParameterPredict` 是 HRI 人体链的两个强类型服务，同样只接受显式图像输入，不订阅
+相机 topic。两者都复用 `DetectionArray` / `Detection2D`，不另立一套检测消息。
+
+**`YoloXDetect`**（`/perception/hri/yolox_detect`）
+
+| 方向 | 字段 | 说明 |
+| --- | --- | --- |
+| 请求 | `image` | 源帧整图；letterbox 与通道顺序由 adapter 负责，调用方不做预处理 |
+| 请求 | `confidence_threshold` / `nms_threshold` | 解码后过滤参数，上游 YOLOX 默认为 `0.01` / `0.65` |
+| 响应 | `detections` | 已解码、已 NMS、已映射回**源图坐标**的框；HRI 调用方按 `label == "person"` 过滤 |
+| 响应 | `model` / `inference_time_ms` / `success` / `message` | 与其余模型服务一致的 runtime 投影与失败语义 |
+
+**`PearParameterPredict`**（`/perception/hri/pear_parameters`）
+
+| 方向 | 字段 | 说明 |
+| --- | --- | --- |
+| 请求 | `image` | 与 `YoloXDetect` 同一张源帧整图，**不是**已裁剪的人体 patch |
+| 请求 | `detections` | 人体框，源图坐标；编译部署为 batch 1，一次只接受一个框 |
+| 响应 | `smplx_pose_raw` [312] | `0:6` global_orient、`6:132` body_pose(21x6D)、`132:222` 左手、`222:312` 右手；6D 值不是欧拉角 |
+| 响应 | `smplx_scale` [6] / `smplx_shape` [200] / `smplx_expression` [50] | SMPL-X 尺度与形状参数 |
+| 响应 | `flame_pose` [14] / `flame_shape` [300] / `flame_expression` [50] | FLAME 头部参数 |
+| 响应 | `camera_raw` [3] | 相对/模型坐标，不是绝对相机 XYZ |
+| 响应 | `model` / `inference_time_ms` / `success` / `message` | 同上 |
+
+姿态输出是 SMPL-X 局部关节旋转，不是机器人电机角；裁剪几何与通道契约见 `perception_service`
+README §11。
 
 ### `GraspCandidate.msg`
 
@@ -588,7 +638,7 @@ HRI 的内部 delegated action，由 `manipulation_execution/imitate_human_motio
 提供，默认路径为 `/hri/imitate_human_motion`。它不是 Agent 或 CLI 的公共入口；公共调用必须先进入
 `SkillCommand`，再由 `skill_library` 通过现有 delegated Gateway 转发。goal 携带完整
 `DispatchBinding`、`expected_executor`、`arm_side`、`imitation_duration_sec` 和独立的 `timeout_sec`。
-内部 runtime 按 `prepare -> start -> mock_playback -> reset` 编排，并通过 `PrimitiveCommand` 执行动作和
+内部 runtime 按 `prepare -> start -> playback -> reset` 编排，并通过 `PrimitiveCommand` 执行动作和
 `move_to_named_pose(home)` 恢复；请求时长超过 20 秒时只执行 20 秒，不循环。
 
 | 字段 | 说明 |
@@ -656,6 +706,13 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 ---
 
 ## 3. 服务定义（srv/）
+
+### `SetSoundFollowing.srv`
+
+`sound_orientation_node` 的会话开关。`enable=true` 清除激活前缓存并进入 `active`；`enable=false` 停止新
+派发，若已有 `nav_turn` 则先进入 `shutting_down`，终态回调后返回 `inactive`；若终态未知，动作层仍保持
+`FAULT_UNKNOWN`，不能重新激活。用户入口必须经过
+catalog 中的 `sound_following` Skill，不能把该内部 service 作为运动授权旁路。
 
 ### `GetSemanticObjects.srv`
 

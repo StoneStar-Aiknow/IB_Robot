@@ -27,8 +27,9 @@ def validate_agent_tool(value: str) -> str:
     value = _require_value("Agent platform", value)
     if _AGENT_TOOL_RE.fullmatch(value) is None:
         raise ValueError(
-            "Agent platform must contain the actual tool name and version reported by the coding agent "
-            "(for example, 'OpenCode 1.17.20'); run '<tool> --version' instead of inventing a value"
+            "Agent platform must contain the product name and version (for example, 'OpenCode 1.17.20'); "
+            "take the version from '<tool> --version' and the product name from the tool's own name, not "
+            "the CLI command name (for example 'DeepSeek Harness 0.1.7-rc.2', not 'dsh 0.1.7-rc.2')"
         )
     return value
 
