@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+import os
 import threading
 import time
 import traceback
@@ -1003,6 +1004,9 @@ class SkillExecutorNode(Node):
     def _execute_program(self, goal_handle):
         goal = goal_handle.request
         result = ExecuteProgram.Result()
+        record = None
+        program_admission = None
+        program_owner = None
         try:
             program = canonicalize_program(
                 schema_version=goal.schema_version,
@@ -1070,6 +1074,7 @@ class SkillExecutorNode(Node):
             }
             self._active_runtime_bundle = bundle
             self._active_runtime_generation_retained = False
+            self._execution_store.mark_active(record.execution_id)
             completed = 0
             for index, step in enumerate(program.steps):
                 # A cancel arriving between children must not start the next
@@ -1173,6 +1178,17 @@ class SkillExecutorNode(Node):
             result.state = "FAILED"
             result.error_code = type(exc).__name__.upper()
             result.message = str(exc)
+            if record is not None and not record.terminal:
+                with suppress(Exception):
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="FAILED",
+                        completed_step_count=record.completed_step_count,
+                        error_code=result.error_code,
+                        message=result.message,
+                    )
+            if program_admission is not None and program_owner is not None:
+                self._finalize_program_admission(program_admission, program_owner, record.completed_step_count)
             goal_handle.abort()
         return result
 
@@ -1206,7 +1222,13 @@ class SkillExecutorNode(Node):
 
     def _execution_auth_ok(self, request) -> bool:
         scopes = set(getattr(self, "_execution_caller_scopes", ()))
-        return request.caller_scope in scopes
+        if request.caller_scope not in scopes:
+            return False
+        configured_token = os.environ.get(
+            "IBROBOT_EXECUTION_TOKEN_" + str(request.caller_scope).upper().replace(":", "_"), ""
+        )
+        request_token = getattr(request, "caller_token", "")
+        return not configured_token or request_token == configured_token
 
     def _get_execution(self, request, response):
         if not self._execution_auth_ok(request):

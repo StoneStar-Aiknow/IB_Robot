@@ -38,9 +38,10 @@ goal 提交前收到展示 tuple（task/plan ID、plan digest、registry identit
 `SUBMISSION_PERSISTENCE_FAILED` 终态阻断 goal 提交。`run(..., expected_registry_identity=...)` 会在 planning
 前校验 live catalog 身份，与快照不一致时按 `SKILL_SNAPSHOT_DIGEST_MISMATCH` fail closed，不发送 goal。
 
-当前 `ibrobot_agent` 生产路径直接通过 `RosBridge` 使用 `/embodied/prepare_agent_plan`，不再
-持有第二套 `InteractiveController` 状态机。CLI 仍保留 `InteractiveController`，并在 runtime
-提供复合接口时使用 prepare+validate；旧 runtime 或测试 bridge 继续使用分阶段兼容路径。
+当前 `ibrobot_agent` 生产路径直接通过 `RosBridge` 使用 `/embodied/execute_program`，由
+Program Gateway 负责一次性 admission、ExecutionStore 幂等账本和 child Skill 派发。
+CLI 仍保留 `InteractiveController`，用于展示、停止、Program 终态收敛以及旧 runtime/test
+bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链。
 
 `ib_trace` 的阶段字段与 `[bind]` 标识符经过有界清洗；日志用的清洗不会改写请求幂等键或
 提交给 Gateway 的 plan/task identity。
@@ -64,8 +65,8 @@ goal 提交前收到展示 tuple（task/plan ID、plan digest、registry identit
 | `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
-| `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
-| `run-workflow [--request-id ID] --text TEXT --workflow-json JSON` | 是 | 展示后按显式 immediate admission policy 自动执行 |
+| `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 旧协议诊断入口：提交 typed AgentPlan |
+| `run-workflow [--request-id ID] --text TEXT --workflow-json JSON` | 是 | 展示后通过 ExecuteProgram 自动执行 |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
 | `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |

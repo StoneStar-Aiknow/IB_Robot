@@ -18,18 +18,33 @@
 | --- | --- | --- |
 | 技能级控制 | `/embodied/execute_skill` | 明确指定技能名，做稳定、可控的动作编排 |
 | primitive 级控制 | `/embodied/execute_primitive` | 直接控制命名位姿、相对位移、关节轨迹、夹爪开合 |
+| Program 控制 | `/embodied/execute_program` | Agent/CLI 一次提交有序 workflow，由 Gateway 维护 root execution |
 
 整体链路如下：
 
 ```text
-Hermes / robot-skill
-  -> agent_plan_node
+Hermes / robot-skill / ibrobot_agent
+  -> /embodied/execute_program
+  -> ExecutionStore（幂等、事件、终态、取消）
   -> /embodied/execute_skill
   -> skill_executor_node
   -> /embodied/execute_primitive
   -> pose/rotation/gripper: /task_executor/execute_task_plan
   -> joint trajectory: /arm_trajectory_controller/follow_joint_trajectory
 ```
+
+Program root execution 的查询和取消入口为：
+
+```text
+/embodied/get_execution
+/embodied/get_execution_events
+/embodied/cancel_execution
+```
+
+`ExecuteProgram` 绑定当前 registry snapshot 的 epoch/generation/digest；child Skill
+复用本节点既有的 safety、control-mode、primitive 和 controller 执行路径。Program
+的唯一权威 root 状态由 ExecutionStore 保存，失败、取消、重启恢复必须收敛为终态或
+明确的 `UNKNOWN`，不能只更新内存中的 legacy workflow 状态。
 
 ## 2. 技能来源：versioned skill catalog snapshot
 

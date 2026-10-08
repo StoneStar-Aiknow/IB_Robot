@@ -1,12 +1,12 @@
 # ibrobot_agent 架构契约
 
 `ibrobot_agent` 是 IB-Robot 自然语言 Agent 的孵化运行时包。它把用户的自然语言请求转成
-严格校验的 typed workflow，并把全部机器人执行委托给既有 Capability Gateway 链路
-（Agent ExecutionPort → `agent_plan_node` → Safety Guard → Skill Executor）。
+严格校验的 canonical Program，并把全部机器人执行委托给既有 Capability Gateway 链路
+（Agent ExecutionPort → `ExecuteProgram` → ExecutionStore → Safety Guard → Skill Executor）。
 本包不拥有 Skill catalog、运动授权或物理执行权，也不实现感知。
 
-本包与 `embodied_agent` 互补而非重复：`embodied_agent` 负责 Agent plan 的
-plan/validate/confirm/execute 生命周期编排；`ibrobot_agent` 在其上层负责自然语言理解、
+本包与 `embodied_agent` 互补而非重复：`embodied_agent` 提供既有 Agent Plan 兼容入口；
+生产 Agent 路径通过 `ExecuteProgram` 一次提交完整 workflow，`ibrobot_agent` 负责自然语言理解、
 Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内的库适配器
 （rule / vlm 两种模式），不是独立 ROS 节点，也不恢复历史上已删除的
 `vlm_task_planner` 包路线。
@@ -26,9 +26,9 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
   -> ibrobot_agent_node
      -> Planner（rule / vlm，严格 JSON 契约）
      -> Agent ExecutionPort 复用 robot_skill_cli.RosBridge
-        -> /embodied/prepare_agent_plan（capture + read-only validate）
-        -> /embodied/confirm_agent_plan -> /embodied/execute_agent_plan
-        -> embodied_agent.agent_plan_node -> Safety Guard -> Skill Executor
+         -> /embodied/execute_program
+         -> ExecutionStore（幂等、事件、终态、取消）
+         -> Safety Guard -> Skill Executor
   <- /agent/response（同步应答） /agent/event（有序事件）
    -> /agent/control（request 粒度 stop / exact plan 展示完成回执）
 ```
@@ -57,6 +57,11 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 当作稳定 API。Gateway 服务侧调用保持既有类型化契约不变。
 
 节点另提供 `~/health` 与 `~/ready`（`std_srvs/Trigger`）。
+
+生产 Program 路径使用 `registry_epoch`、`registry_generation` 和
+`registry_digest` 绑定一次精确 Skill catalog snapshot；ExecutionStore 负责 root
+execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为兼容/诊断入口，不能作为
+新的 Agent 调用路径。
 
 `/agent/request` 的 JSON 在解析前限制为 64 KiB UTF-8 字节；`AgentRequest.text` 去除首尾空白后最多
 4096 个字符（中文字符按一个字符计数）。超限返回 `REQUEST_SCHEMA_INVALID`，不会截断指令或进入规划队列。
