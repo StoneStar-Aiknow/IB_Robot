@@ -45,6 +45,13 @@ class RosBridge:
         execute_plan_action: str = "/embodied/execute_agent_plan",
         start_visual_game_service: str = "/embodied/start_visual_game",
         get_visual_game_result_service: str = "/embodied/get_visual_game_result",
+        execute_program_action: str = "/embodied/execute_program",
+        get_execution_service: str = "/embodied/get_execution",
+        get_execution_events_service: str = "/embodied/get_execution_events",
+        cancel_execution_service: str = "/embodied/cancel_execution",
+        caller_scope: str = "robot_skill_cli",
+        robot_id: str = "",
+        caller_token: str = "",
     ) -> None:
         self._status_service = status_service
         self._snapshot_service = snapshot_service
@@ -60,6 +67,13 @@ class RosBridge:
         self._execute_plan_action = execute_plan_action.rstrip("/")
         self._start_visual_game_service = start_visual_game_service
         self._get_visual_game_result_service = get_visual_game_result_service
+        self._execute_program_action = execute_program_action.rstrip("/")
+        self._get_execution_service = get_execution_service
+        self._get_execution_events_service = get_execution_events_service
+        self._cancel_execution_service = cancel_execution_service
+        self._caller_scope = caller_scope
+        self._robot_id = robot_id
+        self._caller_token = caller_token
         self._node = None
         self._executor = None
         self._spin_thread = None
@@ -81,6 +95,10 @@ class RosBridge:
         self._plan_result_client = None
         self._start_visual_game_client = None
         self._get_visual_game_result_client = None
+        self._program_client = None
+        self._get_execution_client = None
+        self._get_execution_events_client = None
+        self._cancel_execution_client = None
         self._GetSkillGatewayStatus = None
         self._GetSkillSnapshot = None
         self._ReloadSkillCatalog = None
@@ -95,6 +113,10 @@ class RosBridge:
         self._WorkflowStep = None
         self._StartVisualGame = None
         self._GetVisualGameResult = None
+        self._ExecuteProgram = None
+        self._GetExecution = None
+        self._GetExecutionEvents = None
+        self._CancelExecution = None
         self.start_error = ""
 
     def start(self) -> bool:
@@ -107,10 +129,13 @@ class RosBridge:
             from rclpy.executors import MultiThreadedExecutor
 
             from embodied_common.wire_contracts import validate_public_request_wire_contracts
-            from ibrobot_msgs.action import ExecuteAgentPlan, PrimitiveCommand, SkillCommand
+            from ibrobot_msgs.action import ExecuteAgentPlan, ExecuteProgram, PrimitiveCommand, SkillCommand
             from ibrobot_msgs.msg import WorkflowStep
             from ibrobot_msgs.srv import (
+                CancelExecution,
                 ConfirmAgentPlan,
+                GetExecution,
+                GetExecutionEvents,
                 GetSkillGatewayStatus,
                 GetSkillSnapshot,
                 GetVisualGameResult,
@@ -214,6 +239,18 @@ class RosBridge:
                 self._get_visual_game_result_service,
                 callback_group=callback_group,
             )
+            self._program_client = ActionClient(
+                self._node, ExecuteProgram, self._execute_program_action, callback_group=callback_group
+            )
+            self._get_execution_client = self._node.create_client(
+                GetExecution, self._get_execution_service, callback_group=callback_group
+            )
+            self._get_execution_events_client = self._node.create_client(
+                GetExecutionEvents, self._get_execution_events_service, callback_group=callback_group
+            )
+            self._cancel_execution_client = self._node.create_client(
+                CancelExecution, self._cancel_execution_service, callback_group=callback_group
+            )
             self._GetSkillGatewayStatus = GetSkillGatewayStatus
             self._GetSkillSnapshot = GetSkillSnapshot
             self._ReloadSkillCatalog = ReloadSkillCatalog
@@ -228,6 +265,10 @@ class RosBridge:
             self._WorkflowStep = WorkflowStep
             self._StartVisualGame = StartVisualGame
             self._GetVisualGameResult = GetVisualGameResult
+            self._ExecuteProgram = ExecuteProgram
+            self._GetExecution = GetExecution
+            self._GetExecutionEvents = GetExecutionEvents
+            self._CancelExecution = CancelExecution
             self._executor = MultiThreadedExecutor(num_threads=2, context=self._context)
             self._executor.add_node(self._node)
             self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -714,6 +755,120 @@ class RosBridge:
         if self._execute_plan_client is None:
             return False
         return self._execute_plan_client.wait_for_server(timeout_sec=timeout_sec)
+
+    def wait_for_program_server(self, *, timeout_sec: float) -> bool:
+        return self._program_client is not None and self._program_client.wait_for_server(timeout_sec=timeout_sec)
+
+    def send_program_goal(
+        self,
+        *,
+        request_id: str,
+        workflow_steps: list[dict[str, Any]],
+        registry: dict[str, Any],
+        task_budget_sec: float,
+        feedback_callback=None,
+    ):
+        if self._ExecuteProgram is None or self._program_client is None:
+            raise BridgeError("ROS_UNAVAILABLE", "program action client is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        goal = self._ExecuteProgram.Goal()
+        goal.schema_version = 1
+        goal.request_id = request_id
+        goal.caller_scope = self._caller_scope
+        goal.robot_id = self._robot_id
+        goal.expected_registry_epoch = str(registry["registry_epoch"])
+        goal.expected_registry_generation = int(registry["registry_generation"])
+        goal.expected_registry_digest = str(registry["registry_digest"])
+        goal.raw_command = ""
+        goal.trace_id = request_id
+        goal.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
+        goal.task_budget_sec = float(task_budget_sec)
+        if hasattr(goal, "caller_token"):
+            goal.caller_token = self._caller_token
+        try:
+            return self._program_client.send_goal_async(goal, feedback_callback=feedback_callback)
+        except Exception as exc:
+            raise BridgeError("ROS_UNAVAILABLE", str(exc), exit_code=EXIT_ROS_UNAVAILABLE) from exc
+
+    def get_execution(self, *, request_id: str, execution_id: str, timeout_sec: float) -> dict[str, Any]:
+        if self._GetExecution is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "execution query client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        request = self._GetExecution.Request()
+        request.schema_version = 1
+        request.caller_scope = self._caller_scope
+        request.robot_id = self._robot_id
+        request.request_id = request_id
+        request.execution_id = execution_id
+        if hasattr(request, "caller_token"):
+            request.caller_token = self._caller_token
+        response = self._call_service(
+            self._get_execution_client, request, service_name=self._get_execution_service, timeout_sec=timeout_sec
+        )
+        return {
+            "found": bool(response.found),
+            "execution_id": str(response.execution_id),
+            "state": str(response.state),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+        }
+
+    def get_execution_events(
+        self, *, request_id: str, execution_id: str, after_sequence: int = 0, limit: int = 100, timeout_sec: float
+    ) -> dict[str, Any]:
+        if self._GetExecutionEvents is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "execution event client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        request = self._GetExecutionEvents.Request()
+        request.schema_version = 1
+        request.caller_scope = self._caller_scope
+        request.robot_id = self._robot_id
+        request.request_id = request_id
+        request.execution_id = execution_id
+        if hasattr(request, "caller_token"):
+            request.caller_token = self._caller_token
+        request.after_sequence = int(after_sequence)
+        request.limit = int(limit)
+        response = self._call_service(
+            self._get_execution_events_client,
+            request,
+            service_name=self._get_execution_events_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "found": bool(response.found),
+            "execution_id": str(response.execution_id),
+            "events": list(response.events),
+            "last_event_sequence": int(response.last_event_sequence),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+        }
+
+    def cancel_execution(self, *, request_id: str, execution_id: str, timeout_sec: float) -> dict[str, Any]:
+        if self._CancelExecution is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "execution cancel client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        request = self._CancelExecution.Request()
+        request.schema_version = 1
+        request.caller_scope = self._caller_scope
+        request.robot_id = self._robot_id
+        request.request_id = request_id
+        request.execution_id = execution_id
+        if hasattr(request, "caller_token"):
+            request.caller_token = self._caller_token
+        response = self._call_service(
+            self._cancel_execution_client, request, service_name=self._cancel_execution_service, timeout_sec=timeout_sec
+        )
+        return {
+            "accepted": bool(response.accepted),
+            "execution_id": str(response.execution_id),
+            "state": str(response.state),
+            "stop_generation": int(response.stop_generation),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+        }
 
     def wait_for_agent_plan_interfaces(self, *, timeout_sec: float, include_prepare: bool = False) -> bool:
         """Return whether every Hermes-facing plan service/action is discoverable."""

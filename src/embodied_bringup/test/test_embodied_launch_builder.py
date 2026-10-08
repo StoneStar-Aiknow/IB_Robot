@@ -287,6 +287,7 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
+@pytest.mark.model_bundle("yolox_x_640", "pear_parameter_network")
 def test_hybrid_profile_projects_hri_person_confidence_threshold():
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)

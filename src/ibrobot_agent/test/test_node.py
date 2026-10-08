@@ -145,6 +145,23 @@ class _DirectExecutionBridge:
         return _ReadyFuture(_ResultGoalHandle(result))
 
 
+class _ProgramExecutionBridge(_DirectExecutionBridge):
+    def send_program_goal(self, **kwargs):
+        self.calls.append("program_submit")
+        result = type(
+            "Result",
+            (),
+            {
+                "success": True,
+                "error_code": "",
+                "message": "skill completed",
+                "execution_id": "execution-1",
+                "state": "SUCCEEDED",
+            },
+        )()
+        return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": result})()))
+
+
 def _proposal():
     request = AgentRequest(
         schema_version=1,
@@ -189,6 +206,23 @@ def test_direct_execution_adapter_keeps_natural_language_skill_order():
     assert submissions[0][0].task_id
     assert bridge.goal_trace_id == "request-wave"
     assert bridge.calls == ["prepare", "presentation", "status", "confirm", "wait_server", "submit"]
+
+
+def test_program_execution_adapter_freezes_non_empty_digest_and_submits_once():
+    bridge = _ProgramExecutionBridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    proposal = _proposal()
+    presentations = []
+    result = adapter.execute(
+        proposal,
+        expected_registry_identity=proposal.catalog_identity,
+        presentation_callback=presentations.append,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "succeeded"
+    assert presentations[0].task_ref.plan_digest
+    assert bridge.calls == ["program_submit"]
 
 
 @pytest.mark.parametrize("stop_stage", ["get_status", "wait_for_execute_plan_server", "submission_callback"])

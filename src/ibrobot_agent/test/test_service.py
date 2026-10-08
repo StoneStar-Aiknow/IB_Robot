@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.contracts import AgentRequest, ExecutionResult, PlannerIdentity, PlannerOutcome
+from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.planner import RulePlanner
 from ibrobot_agent.presentation import PresentationGate
 from ibrobot_agent.request_store import SQLiteRequestStore
@@ -434,6 +436,39 @@ def test_execution_persists_presentation_submission_and_terminal(tmp_path):
         assert record.may_have_submitted
         assert record.task_ref is not None
         assert execution.calls == 1
+    finally:
+        service.close()
+
+
+def test_empty_execution_message_still_delivers_terminal_event(tmp_path):
+    class EmptyMessageExecution(FakeExecution):
+        def execute(self, *args, **kwargs):
+            return replace(super().execute(*args, **kwargs), message="")
+
+    events = RenderedEvents()
+    conversation = SQLiteConversationStore(tmp_path / "conversation.sqlite3")
+    service = AgentService(
+        planner=RulePlanner(),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "requests.sqlite3"),
+        conversation=conversation,
+        execution=EmptyMessageExecution(),
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    try:
+        request = _request(text="请挥手")
+        assert service.send_message(request).accepted
+        deadline = time.monotonic() + 3.0
+        while not any(event.event_type == "terminal" for event in events.items) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        terminal = [event for event in events.items if event.event_type == "terminal"]
+        assert len(terminal) == 1
+        assert terminal[0].state == "SUCCEEDED"
+        assert service.get_request(request.to_key()).state == "SUCCEEDED"
+        assert conversation.context(request)[-1]["content"] == "Execution succeeded"
     finally:
         service.close()
 

@@ -12,6 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
+from types import SimpleNamespace
 
 import rclpy
 from builtin_interfaces.msg import Duration as DurationMsg
@@ -40,6 +41,7 @@ from embodied_common.dispatch_binding import (
     load_delegated_model_identity,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
+from embodied_common.program_contracts import canonicalize_program
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
@@ -52,6 +54,7 @@ from embodied_common.workflow_contracts import (
 from ibrobot_msgs.action import (
     ExecuteNamedMotion,
     ExecuteNavigation,
+    ExecuteProgram,
     ExecuteTaskPlan,
     ImitateHumanMotion,
     PickObject,
@@ -59,10 +62,20 @@ from ibrobot_msgs.action import (
     PrimitiveCommand,
     SkillCommand,
 )
-from ibrobot_msgs.msg import RuntimeStatus, SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
+from ibrobot_msgs.msg import (
+    ExecutionEvent,
+    RuntimeStatus,
+    SkillCapabilityStatus,
+    SkillDiagnostic,
+    SkillRegistryEvent,
+    TaskStep,
+)
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
+    CancelExecution,
     FinalizeWorkflowExecution,
+    GetExecution,
+    GetExecutionEvents,
     GetSemanticObjects,
     GetSkillGatewayStatus,
     GetSkillSnapshot,
@@ -80,6 +93,7 @@ from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
+from skill_library.execution_store import SQLiteExecutionStore
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -164,6 +178,71 @@ class _EePoseSnapshot:
 
 class _EePoseSnapshotExpired(Exception):
     pass
+
+
+class _ProgramGoalHandle:
+    """Adapter that gives the existing Skill Gateway a typed Program child."""
+
+    def __init__(self, request, root_handle) -> None:
+        self.request = request
+        self._root_handle = root_handle
+
+    @property
+    def is_cancel_requested(self):
+        return bool(getattr(self._root_handle, "is_cancel_requested", False))
+
+    def publish_feedback(self, message) -> None:
+        return None
+
+    def succeed(self) -> None:
+        return None
+
+    def abort(self) -> None:
+        return None
+
+    def canceled(self) -> None:
+        return None
+
+    def _make_dispatch_binding(self):
+        return self.request.dispatch_binding
+
+    @property
+    def late_cleanup_confirmation(self):
+        return None
+
+
+class _ProgramAdmission:
+    def __init__(self, decision, owner) -> None:
+        self.decision = decision
+        self.owner = owner
+
+    @property
+    def admitted(self):
+        return self.decision.admitted
+
+    @property
+    def error_code(self):
+        return self.decision.error_code
+
+    @property
+    def prepared_request(self):
+        return self.decision.prepared_request
+
+    @property
+    def lease_token(self):
+        return self.decision.lease_token
+
+
+class _ProgramChildAdmission:
+    """Allow the existing primitive path to borrow a Program root lease."""
+
+    def __init__(self, program_admission, owner) -> None:
+        self.program_admission = program_admission
+        self.owner = owner
+
+    @property
+    def lease_token(self):
+        return self.program_admission.lease_token
 
 
 @dataclass
@@ -441,6 +520,15 @@ class SkillExecutorNode(Node):
         self.declare_parameter("model_idle_timeout_sec", 120.0, descriptor=startup_descriptor)
         self.declare_parameter("config_digest", "", descriptor=startup_descriptor)
         self.declare_parameter("ledger_terminal_capacity", 100, descriptor=startup_descriptor)
+        self.declare_parameter("execute_program_action", "/embodied/execute_program")
+        self.declare_parameter("get_execution_service", "/embodied/get_execution")
+        self.declare_parameter("get_execution_events_service", "/embodied/get_execution_events")
+        self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
+        self.declare_parameter("execution_store_path", "/tmp/ibrobot-executions.sqlite3")
+        self.declare_parameter("execution_caller_scopes", ["robot_skill_cli"])
+        self._execution_caller_scopes = tuple(
+            str(scope).strip() for scope in self.get_parameter("execution_caller_scopes").value if str(scope).strip()
+        )
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -691,7 +779,7 @@ class SkillExecutorNode(Node):
         self._skill_parameter_schemas = startup_parameter_schemas
         self._skill_control_modes = startup_control_modes
         self._skill_templates = self._mutable_templates(startup_bundle.snapshot.templates)
-        self._active_runtime_bundle = None
+        self._active_runtime_bundle = startup_bundle
         self._latest_ee_pose = None
         self._latest_ee_pose_monotonic = None
         self._latest_joint_state = None
@@ -770,6 +858,44 @@ class SkillExecutorNode(Node):
             self._move_configuration_service,
             callback_group=callback_group,
         )
+        self._execution_store = SQLiteExecutionStore(
+            str(self.get_parameter("execution_store_path").value)
+            if self.has_parameter("execution_store_path")
+            else "/tmp/ibrobot-executions.sqlite3"
+        )
+        self._program_server = ActionServer(
+            self,
+            ExecuteProgram,
+            str(self.get_parameter("execute_program_action").value)
+            if self.has_parameter("execute_program_action")
+            else "/embodied/execute_program",
+            execute_callback=self._execute_program,
+            callback_group=callback_group,
+        )
+        self._get_execution_server = self.create_service(
+            GetExecution,
+            str(self.get_parameter("get_execution_service").value)
+            if self.has_parameter("get_execution_service")
+            else "/embodied/get_execution",
+            self._get_execution,
+            callback_group=callback_group,
+        )
+        self._get_execution_events_server = self.create_service(
+            GetExecutionEvents,
+            str(self.get_parameter("get_execution_events_service").value)
+            if self.has_parameter("get_execution_events_service")
+            else "/embodied/get_execution_events",
+            self._get_execution_events,
+            callback_group=callback_group,
+        )
+        self._cancel_execution_server = self.create_service(
+            CancelExecution,
+            str(self.get_parameter("cancel_execution_service").value)
+            if self.has_parameter("cancel_execution_service")
+            else "/embodied/cancel_execution",
+            self._cancel_execution,
+            callback_group=callback_group,
+        )
         self._gateway_status_server = self.create_service(
             GetSkillGatewayStatus,
             self._skill_gateway_status_service,
@@ -838,6 +964,340 @@ class SkillExecutorNode(Node):
             f"direction_mapping={self._relative_motion_direction_mapping or 'default'}, "
             f"ee_pose_topic={self._ee_pose_topic}, joint_state_topic={self._joint_state_topic}"
         )
+
+    def destroy_node(self):
+        store = getattr(self, "_execution_store", None)
+        if store is not None:
+            store.close()
+            self._execution_store = None
+        return super().destroy_node()
+
+    def _program_identity_matches(self, program) -> bool:
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is None:
+            coordinator = getattr(self, "_runtime_coordinator", None)
+            bundle = coordinator.current if coordinator is not None else None
+        if bundle is None:
+            return False
+        return (
+            program.identity.registry_epoch == bundle.registry_epoch
+            and program.identity.registry_generation == bundle.generation
+            and program.identity.registry_digest == bundle.snapshot.registry_digest
+        )
+
+    def _program_admission_snapshot(self, program):
+        """Reuse the already active registry snapshot for one Program request."""
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is None:
+            coordinator = getattr(self, "_runtime_coordinator", None)
+            bundle = coordinator.current if coordinator is not None else None
+        if bundle is None:
+            return None, "skill registry is not ready"
+        if not self._program_identity_matches(program):
+            return None, "program registry identity does not match the active Gateway registry"
+        snapshot = self._runtime_snapshot()
+        if not snapshot.motion_authorized:
+            return None, "operator authorization is disabled"
+        return bundle, ""
+
+    def _execute_program(self, goal_handle):
+        goal = goal_handle.request
+        result = ExecuteProgram.Result()
+        try:
+            program = canonicalize_program(
+                schema_version=goal.schema_version,
+                request_id=goal.request_id,
+                caller_scope=goal.caller_scope,
+                robot_id=goal.robot_id,
+                expected_registry_epoch=goal.expected_registry_epoch,
+                expected_registry_generation=goal.expected_registry_generation,
+                expected_registry_digest=goal.expected_registry_digest,
+                workflow_steps=goal.workflow_steps,
+                task_budget_sec=goal.task_budget_sec,
+            )
+            if not self._program_identity_matches(program):
+                raise ValueError("PROGRAM_REGISTRY_MISMATCH")
+            bundle, admission_error = self._program_admission_snapshot(program)
+            if bundle is None:
+                raise ValueError(admission_error)
+            record, _created = self._execution_store.begin(program)
+            result.execution_id = record.execution_id
+            result.request_id = record.request_id
+            result.program_digest = record.program_digest
+            result.state = record.state
+            result.completed_step_count = record.completed_step_count
+            if record.terminal:
+                result.success = record.state == "SUCCEEDED"
+                result.error_code = record.error_code
+                result.message = record.message
+                goal_handle.succeed() if result.success else goal_handle.abort()
+                return result
+            self._execution_store.mark_committing(record.execution_id)
+            program_owner = ExecutionOwner.workflow(program.root_task_id)
+            workflow_error, lease_token = self._gateway_policy.admit_workflow(
+                program_owner, self._runtime_snapshot(), timeout_sec=program.task_budget_sec
+            )
+            program_admission = _ProgramAdmission(
+                SimpleNamespace(
+                    admitted=not workflow_error and lease_token is not None,
+                    error_code=workflow_error or "",
+                    message=workflow_error or "",
+                    prepared_request=None,
+                    lease_token=lease_token,
+                ),
+                program_owner,
+            )
+            if not program_admission.admitted:
+                self._execution_store.finish(
+                    record.execution_id,
+                    state="FAILED",
+                    completed_step_count=0,
+                    error_code=program_admission.error_code,
+                    message=program_admission.message,
+                )
+                result.error_code = program_admission.error_code
+                result.message = program_admission.message
+                result.state = "FAILED"
+                goal_handle.abort()
+                return result
+            program_child_admission = _ProgramChildAdmission(program_admission, program_owner)
+            self._active_skill_admission = program_child_admission
+            self._active_skill_owner = program_owner
+            self._active_audit_context = {
+                "task_id": program.root_task_id,
+                "payload_hash": program.program_digest,
+                "skill": program.steps[0].skill_name,
+            }
+            self._active_runtime_bundle = bundle
+            self._active_runtime_generation_retained = False
+            completed = 0
+            for index, step in enumerate(program.steps):
+                # A cancel arriving between children must not start the next
+                # child: converge immediately with the completed-step bound.
+                if goal_handle.is_cancel_requested:
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="CANCELED",
+                        completed_step_count=completed,
+                        error_code="SKILL_CANCELLED",
+                        message="program canceled between steps",
+                        actual_registry_epoch=bundle.registry_epoch,
+                        actual_registry_generation=bundle.generation,
+                        actual_registry_digest=bundle.snapshot.registry_digest,
+                    )
+                    result.state = "CANCELED"
+                    result.error_code = "SKILL_CANCELLED"
+                    result.message = "program canceled between steps"
+                    result.completed_step_count = completed
+                    goal_handle.canceled()
+                    self._finalize_active_admission(
+                        program_admission, error_code="SKILL_CANCELLED", duration_sec=0.0, step_count=completed
+                    )
+                    return result
+                skill_goal = SkillCommand.Goal()
+                skill_goal.schema_version = step.schema_version
+                skill_goal.dispatch_binding.schema_version = 1
+                skill_goal.dispatch_binding.task_id = derive_skill_task_id(program.root_task_id, index)
+                skill_goal.dispatch_binding.root_task_id = program.root_task_id
+                skill_goal.dispatch_binding.expected_registry_epoch = program.identity.registry_epoch
+                skill_goal.dispatch_binding.expected_registry_generation = program.identity.registry_generation
+                skill_goal.dispatch_binding.expected_registry_digest = program.identity.registry_digest
+                skill_goal.dispatch_binding.trace_id = program.request_id
+                self._set_task_budget(skill_goal.dispatch_binding, program.task_budget_sec)
+                skill_goal.dispatch_binding.workflow_digest = ""
+                skill_goal.dispatch_binding.root_lease_nonce = ""
+                skill_goal.dispatch_binding.dispatch_nonce = ""
+                # The existing Skill Gateway treats a program's child skills as
+                # internal work under the root lease.  Keep the root identity on
+                # the binding for lease ownership, while retaining the derived
+                # child identity and actual step index for audit/replay and
+                # per-step dispatch bookkeeping.
+                skill_goal.dispatch_binding.workflow_step_index = index
+                skill_goal.skill_name = step.skill_name
+                skill_goal.target_name = step.target_name
+                skill_goal.container_name = step.container_name
+                skill_goal.place_name = step.place_name
+                skill_goal.motion_direction = step.motion_direction
+                skill_goal.motion_distance = step.motion_distance
+                skill_goal.arm_side = step.arm_side
+                skill_goal.imitation_duration_sec = step.imitation_duration_sec
+                skill_goal.timeout_sec = step.timeout_sec or self._gateway_timeout_policy["default_skill_timeout_sec"]
+                skill_goal.direction = step.direction
+                skill_goal.distance = step.distance
+                skill_goal.degree = step.degree
+                skill_goal.has_x = step.x is not None
+                skill_goal.x = step.x or 0.0
+                skill_goal.has_y = step.y is not None
+                skill_goal.y = step.y or 0.0
+                skill_goal.has_yaw = step.yaw is not None
+                skill_goal.yaw = step.yaw or 0.0
+                child_result = self._execute_program_child(skill_goal, goal_handle)
+                if not child_result.success:
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED",
+                        completed_step_count=completed,
+                        error_code=child_result.error_code,
+                        message=child_result.message,
+                        actual_registry_epoch=bundle.registry_epoch,
+                        actual_registry_generation=bundle.generation,
+                        actual_registry_digest=bundle.snapshot.registry_digest,
+                    )
+                    result.error_code = child_result.error_code
+                    result.message = child_result.message
+                    result.state = "CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED"
+                    goal_handle.canceled() if result.state == "CANCELED" else goal_handle.abort()
+                    self._finalize_active_admission(
+                        program_admission, error_code=result.error_code, duration_sec=0.0, step_count=completed
+                    )
+                    return result
+                completed += 1
+            self._execution_store.finish(
+                record.execution_id,
+                state="SUCCEEDED",
+                completed_step_count=completed,
+                actual_registry_epoch=bundle.registry_epoch,
+                actual_registry_generation=bundle.generation,
+                actual_registry_digest=bundle.snapshot.registry_digest,
+            )
+            result.success = True
+            result.state = "SUCCEEDED"
+            result.completed_step_count = completed
+            result.actual_registry_epoch = bundle.registry_epoch
+            result.actual_registry_generation = bundle.generation
+            result.actual_registry_digest = bundle.snapshot.registry_digest
+            goal_handle.succeed()
+            self._finalize_program_admission(program_admission, program_owner, completed)
+        except Exception as exc:
+            result.success = False
+            result.state = "FAILED"
+            result.error_code = type(exc).__name__.upper()
+            result.message = str(exc)
+            goal_handle.abort()
+        return result
+
+    def _execute_program_child(self, goal, root_goal_handle):
+        """Execute one canonical child through the existing Gateway path."""
+        child_handle = _ProgramGoalHandle(goal, root_goal_handle)
+        requested_timeout = float(goal.timeout_sec)
+        goal.timeout_sec = 0.0
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        schema_error = self._validate_skill_goal_schema(goal, bundle)
+        if schema_error:
+            result = SkillCommand.Result()
+            return self._abort_skill(result, child_handle, [], schema_error, "program child schema is invalid")
+        result = self._execute_skill_child(
+            child_handle,
+            validation_done=True,
+            effective_timeout_sec=requested_timeout or self._default_skill_timeout_sec,
+            canonical_task_id=goal.dispatch_binding.task_id,
+        )
+        return result
+
+    def _finalize_program_admission(self, admission, owner, completed_count: int) -> None:
+        with self._state_guard():
+            if self._active_skill_admission is not None:
+                self._active_skill_admission = None
+            self._active_skill_owner = None
+            self._active_audit_context = None
+            self._active_runtime_bundle = None
+        with suppress(Exception):
+            self._gateway_policy.release_workflow(owner, admission.lease_token)
+
+    def _execution_auth_ok(self, request) -> bool:
+        scopes = set(getattr(self, "_execution_caller_scopes", ()))
+        return request.caller_scope in scopes
+
+    def _get_execution(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        response.found = record is not None
+        if record is None:
+            response.error_code = "EXECUTION_NOT_FOUND"
+            response.message = "execution not found"
+            return response
+        response.execution_id = record.execution_id
+        response.request_id = record.request_id
+        response.caller_scope = record.caller_scope
+        response.robot_id = record.robot_id
+        response.state = record.state
+        response.program_digest = record.program_digest
+        response.completed_step_count = record.completed_step_count
+        response.stop_requested = record.stop_requested
+        response.last_event_sequence = record.last_event_sequence
+        response.error_code = record.error_code
+        response.message = record.message
+        return response
+
+    def _get_execution_events(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        if record is None:
+            response.error_code = "EXECUTION_NOT_FOUND"
+            response.message = "execution not found"
+            return response
+        response.found = True
+        response.execution_id = record.execution_id
+        events = self._execution_store.events_after(
+            record.execution_id, sequence=int(request.after_sequence), limit=max(1, min(int(request.limit or 100), 100))
+        )
+        response.events = [
+            ExecutionEvent(
+                schema_version=1,
+                execution_id=record.execution_id,
+                request_id=record.request_id,
+                caller_scope=record.caller_scope,
+                robot_id=record.robot_id,
+                sequence=event.sequence,
+                state=event.state,
+                program_digest=record.program_digest,
+                completed_step_count=event.completed_step_count,
+                error_code=event.error_code,
+                message=event.message,
+            )
+            for event in events
+        ]
+        response.last_event_sequence = record.last_event_sequence
+        response.has_more = len(events) >= max(1, min(int(request.limit or 100), 100))
+        return response
+
+    def _cancel_execution(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        if record is None:
+            response.error_code = "EXECUTION_NOT_FOUND"
+            response.message = "execution not found"
+            return response
+        record = self._execution_store.request_stop(record.execution_id)
+        response.accepted = True
+        response.execution_id = record.execution_id
+        response.state = record.state
+        response.stop_generation = record.stop_generation
+        return response
 
     def _compile_runtime_snapshot(self):
         from skill_catalog.models import SkillRobotContext
@@ -3107,13 +3567,33 @@ class SkillExecutorNode(Node):
                 remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
-            if goal.timeout_sec > remaining_budget:
+            if goal.timeout_sec > remaining_budget and not isinstance(internal_admission, _ProgramChildAdmission):
                 return TIMEOUT_EXCEEDS_POLICY, None, None, False
             if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
             borrow = workflow.policy.borrow_workflow_internal(
                 workflow.owner,
                 workflow.lease_token,
+                _binding_task_id(goal),
+                str(goal.primitive_name),
+            )
+            return (
+                ("", None, internal_admission, delegated_primitive)
+                if borrow is not None
+                else (SKILL_BUSY, None, None, False)
+            )
+        if isinstance(internal_admission, _ProgramChildAdmission):
+            try:
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return "SKILL_SCHEMA_INVALID", None, None, False
+            if goal.timeout_sec > remaining_budget:
+                goal.timeout_sec = remaining_budget
+            if goal.timeout_sec <= 0.0:
+                goal.timeout_sec = remaining_budget
+            borrow = self._gateway_policy.borrow_workflow_internal(
+                internal_admission.owner,
+                internal_admission.lease_token,
                 _binding_task_id(goal),
                 str(goal.primitive_name),
             )
@@ -3206,7 +3686,13 @@ class SkillExecutorNode(Node):
             result = PrimitiveCommand.Result()
             result.success = False
             result.error_code = schema_error
-            result.message = "primitive schema_version does not match its selected descriptor"
+            descriptor = self._primitive_descriptor(goal_handle.request.primitive_name)
+            result.message = (
+                "primitive schema_version does not match its selected descriptor: "
+                f"name={goal_handle.request.primitive_name!r}, "
+                f"submitted={getattr(goal_handle.request, 'schema_version', None)!r}, "
+                f"expected={getattr(descriptor, 'schema_version', None)!r}"
+            )
             result.pose_name = goal_handle.request.pose_name
             self._set_primitive_replay_identity(result, _binding_task_id(goal_handle.request))
             goal_handle.abort()

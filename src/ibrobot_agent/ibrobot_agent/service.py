@@ -419,8 +419,13 @@ class AgentService:
                 self._finish_unknown(key, current, execution_result.message or execution_result.error_code)
             else:
                 self._store.finish(key, expected_generation=record.planning_generation, result=execution_result)
-                self._conversation.append_assistant(request, execution_result.message)
-                self._emit(key, "terminal", self._request_state_for_result(execution_result), execution_result.message)
+                terminal_message = execution_result.message.strip() or f"Execution {execution_result.status}"
+                try:
+                    self._conversation.append_assistant(request, terminal_message)
+                finally:
+                    # A conversation-memory failure must not hide an already
+                    # persisted execution result from the waiting client.
+                    self._emit(key, "terminal", self._request_state_for_result(execution_result), terminal_message)
         except Exception as exc:
             try:
                 record = self._store.get_request(key)

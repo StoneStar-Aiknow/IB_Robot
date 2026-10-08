@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import threading
 import time
 import uuid
@@ -143,6 +144,79 @@ class _RosExecutionAdapter:
             expected_registry_identity.generation,
             expected_registry_identity.digest,
         )
+        if hasattr(self._bridge, "send_program_goal"):
+            steps = [step.to_dict() for step in proposal.outcome.steps]
+            from embodied_common.program_contracts import canonicalize_program
+
+            program = canonicalize_program(
+                schema_version=1,
+                request_id=proposal.request.request_id,
+                caller_scope="agent_incubation:local_operator",
+                robot_id=proposal.request.robot_scope,
+                expected_registry_epoch=expected_identity[0],
+                expected_registry_generation=expected_identity[1],
+                expected_registry_digest=expected_identity[2],
+                workflow_steps=steps,
+                task_budget_sec=self._task_budget_sec,
+            )
+            presentation = _presentation_from_mapping(
+                {
+                    "task_id": task_id,
+                    "plan_id": task_id,
+                    "plan_digest": program.program_digest,
+                    "plan_kind": 1 if len(steps) == 1 else 2,
+                    "steps": steps,
+                    "execution_mode": "immediate_after_presentation",
+                    "proposed_task_budget_sec": self._task_budget_sec,
+                    "summary": proposal.outcome.summary,
+                },
+                proposal,
+            )
+            presentation_callback(presentation)
+            if stop_event.is_set():
+                return ExecutionResult(
+                    "cancelled", presentation.task_ref, "SKILL_CANCELLED", "stopped after presentation", {}
+                )
+            submission_callback(
+                presentation.task_ref,
+                {
+                    "confirmed": True,
+                    "task_id": task_id,
+                    "expected_step_count": len(steps),
+                    "registry_epoch": expected_identity[0],
+                    "registry_generation": expected_identity[1],
+                    "registry_digest": expected_identity[2],
+                },
+            )
+            try:
+                goal_future = self._bridge.send_program_goal(
+                    request_id=proposal.request.request_id,
+                    workflow_steps=steps,
+                    registry={
+                        "registry_epoch": expected_identity[0],
+                        "registry_generation": expected_identity[1],
+                        "registry_digest": expected_identity[2],
+                    },
+                    task_budget_sec=self._task_budget_sec,
+                )
+                if not self._wait_future(goal_future, self._rpc_timeout_sec, stop_event):
+                    return self._unknown_result("program acceptance unavailable", presentation)
+                goal_handle = goal_future.result()
+                if goal_handle is None or not goal_handle.accepted:
+                    return self._failed_result("GOAL_REJECTED", "program goal was rejected", presentation)
+                result_future = goal_handle.get_result_async()
+                if not self._wait_future(result_future, self._task_budget_sec + self._rpc_timeout_sec, stop_event):
+                    return self._unknown_result("program result timed out", presentation)
+                result = result_future.result().result
+                return ExecutionResult(
+                    "succeeded" if result.success else "failed",
+                    presentation.task_ref,
+                    str(result.error_code),
+                    str(result.message),
+                    {"submitted": True, "execution_id": str(result.execution_id), "state": str(result.state)},
+                )
+            except Exception as exc:
+                return self._failed_result("CAPABILITY_NOT_READY", f"program execution failed: {exc}", presentation)
         if stop_event.is_set():
             return ExecutionResult(
                 "cancelled", None, "SKILL_CANCELLED", "stopped before planning", {"submitted": False}
@@ -473,6 +547,10 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_validate_plan_service", "/embodied/validate_agent_plan")
         self.declare_parameter("gateway_confirm_plan_service", "/embodied/confirm_agent_plan")
         self.declare_parameter("gateway_execute_plan_action", "/embodied/execute_agent_plan")
+        self.declare_parameter("gateway_execute_program_action", "/embodied/execute_program")
+        self.declare_parameter("gateway_get_execution_service", "/embodied/get_execution")
+        self.declare_parameter("gateway_get_execution_events_service", "/embodied/get_execution_events")
+        self.declare_parameter("gateway_cancel_execution_service", "/embodied/cancel_execution")
         ledger_path = str(self.get_parameter("ledger_path").value).strip()
         if not ledger_path:
             ledger_path = str(Path.home() / ".ros" / "ibrobot_agent" / "requests.sqlite3")
@@ -512,6 +590,13 @@ class IncubationAgentNode(Node):
                     validate_plan_service=str(self.get_parameter("gateway_validate_plan_service").value),
                     confirm_plan_service=str(self.get_parameter("gateway_confirm_plan_service").value),
                     execute_plan_action=str(self.get_parameter("gateway_execute_plan_action").value),
+                    execute_program_action=str(self.get_parameter("gateway_execute_program_action").value),
+                    get_execution_service=str(self.get_parameter("gateway_get_execution_service").value),
+                    get_execution_events_service=str(self.get_parameter("gateway_get_execution_events_service").value),
+                    cancel_execution_service=str(self.get_parameter("gateway_cancel_execution_service").value),
+                    caller_scope="agent_incubation:local_operator",
+                    robot_id=str(self.get_parameter("robot_scope").value),
+                    caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR", ""),
                 )
                 if self._bridge.start():
                     rpc_timeout_sec = float(self.get_parameter("rpc_timeout_sec").value)
@@ -688,7 +773,7 @@ class IncubationAgentNode(Node):
             self._gateway_ready = False
             return
         try:
-            if not self._bridge.wait_for_agent_plan_interfaces(timeout_sec=0.1, include_prepare=True):
+            if not self._bridge.wait_for_program_server(timeout_sec=0.1):
                 self._gateway_ready = False
                 return
             status = self._bridge.get_status(task_id="", payload_hash="", timeout_sec=0.2)

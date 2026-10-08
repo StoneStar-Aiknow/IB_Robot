@@ -213,6 +213,13 @@ def _create_bridge(transport):
         validate_plan_service=transport.validate_plan_service,
         confirm_plan_service=transport.confirm_plan_service,
         execute_plan_action=transport.execute_plan_action,
+        execute_program_action=transport.execute_program_action,
+        get_execution_service=transport.get_execution_service,
+        get_execution_events_service=transport.get_execution_events_service,
+        cancel_execution_service=transport.cancel_execution_service,
+        caller_scope=transport.caller_scope,
+        robot_id=transport.robot_id,
+        caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", ""),
         start_visual_game_service=transport.start_visual_game_service,
         get_visual_game_result_service=transport.get_visual_game_result_service,
     )
