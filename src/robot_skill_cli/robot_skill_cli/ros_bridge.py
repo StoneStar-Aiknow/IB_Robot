@@ -774,6 +774,7 @@ class RosBridge:
         goal.schema_version = 1
         goal.request_id = request_id
         goal.caller_scope = self._caller_scope
+        goal.caller_token = self._caller_token
         goal.robot_id = self._robot_id
         goal.expected_registry_epoch = str(registry["registry_epoch"])
         goal.expected_registry_generation = int(registry["registry_generation"])
@@ -797,6 +798,7 @@ class RosBridge:
         request = self._GetExecution.Request()
         request.schema_version = 1
         request.caller_scope = self._caller_scope
+        request.caller_token = self._caller_token
         request.robot_id = self._robot_id
         request.request_id = request_id
         request.execution_id = execution_id
@@ -823,6 +825,7 @@ class RosBridge:
         request = self._GetExecutionEvents.Request()
         request.schema_version = 1
         request.caller_scope = self._caller_scope
+        request.caller_token = self._caller_token
         request.robot_id = self._robot_id
         request.request_id = request_id
         request.execution_id = execution_id
@@ -853,6 +856,7 @@ class RosBridge:
         request = self._CancelExecution.Request()
         request.schema_version = 1
         request.caller_scope = self._caller_scope
+        request.caller_token = self._caller_token
         request.robot_id = self._robot_id
         request.request_id = request_id
         request.execution_id = execution_id

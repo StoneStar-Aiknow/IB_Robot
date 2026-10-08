@@ -551,6 +551,8 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_get_execution_service", "/embodied/get_execution")
         self.declare_parameter("gateway_get_execution_events_service", "/embodied/get_execution_events")
         self.declare_parameter("gateway_cancel_execution_service", "/embodied/cancel_execution")
+        self.declare_parameter("gateway_caller_scope", "agent_incubation:local_operator")
+        self.declare_parameter("gateway_caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR")
         ledger_path = str(self.get_parameter("ledger_path").value).strip()
         if not ledger_path:
             ledger_path = str(Path.home() / ".ros" / "ibrobot_agent" / "requests.sqlite3")
@@ -594,9 +596,9 @@ class IncubationAgentNode(Node):
                     get_execution_service=str(self.get_parameter("gateway_get_execution_service").value),
                     get_execution_events_service=str(self.get_parameter("gateway_get_execution_events_service").value),
                     cancel_execution_service=str(self.get_parameter("gateway_cancel_execution_service").value),
-                    caller_scope="agent_incubation:local_operator",
+                    caller_scope=str(self.get_parameter("gateway_caller_scope").value),
                     robot_id=str(self.get_parameter("robot_scope").value),
-                    caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR", ""),
+                    caller_token=os.environ.get(str(self.get_parameter("gateway_caller_token_env").value), ""),
                 )
                 if self._bridge.start():
                     rpc_timeout_sec = float(self.get_parameter("rpc_timeout_sec").value)

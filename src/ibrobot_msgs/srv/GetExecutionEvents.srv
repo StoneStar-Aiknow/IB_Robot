@@ -4,6 +4,7 @@
 
 uint32 schema_version
 string caller_scope
+string caller_token
 string robot_id
 string request_id
 string execution_id

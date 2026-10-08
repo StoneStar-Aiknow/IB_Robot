@@ -3,7 +3,6 @@
 import copy
 import json
 import math
-import os
 import threading
 import time
 import traceback
@@ -33,6 +32,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
+from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
     copy_binding,
@@ -526,10 +526,11 @@ class SkillExecutorNode(Node):
         self.declare_parameter("get_execution_events_service", "/embodied/get_execution_events")
         self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
         self.declare_parameter("execution_store_path", "/tmp/ibrobot-executions.sqlite3")
-        self.declare_parameter("execution_caller_scopes", ["robot_skill_cli"])
-        self._execution_caller_scopes = tuple(
-            str(scope).strip() for scope in self.get_parameter("execution_caller_scopes").value if str(scope).strip()
-        )
+        self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
+        raw_scopes = self.get_parameter("execution_caller_scopes_json").value
+        if isinstance(raw_scopes, str):
+            raw_scopes = json.loads(raw_scopes)
+        self._execution_caller_scopes = tuple(str(scope).strip() for scope in raw_scopes if str(scope).strip())
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -1008,6 +1009,12 @@ class SkillExecutorNode(Node):
         program_admission = None
         program_owner = None
         try:
+            if not self._execution_auth_ok(goal):
+                result.state = "FAILED"
+                result.error_code = "EXECUTION_SCOPE_DENIED"
+                result.message = "caller scope or token is not authorized"
+                goal_handle.abort()
+                return result
             program = canonicalize_program(
                 schema_version=goal.schema_version,
                 request_id=goal.request_id,
@@ -1221,14 +1228,11 @@ class SkillExecutorNode(Node):
             self._gateway_policy.release_workflow(owner, admission.lease_token)
 
     def _execution_auth_ok(self, request) -> bool:
-        scopes = set(getattr(self, "_execution_caller_scopes", ()))
-        if request.caller_scope not in scopes:
-            return False
-        configured_token = os.environ.get(
-            "IBROBOT_EXECUTION_TOKEN_" + str(request.caller_scope).upper().replace(":", "_"), ""
+        return is_caller_authorized(
+            request.caller_scope,
+            getattr(request, "caller_token", ""),
+            tuple(getattr(self, "_execution_caller_scopes", ())),
         )
-        request_token = getattr(request, "caller_token", "")
-        return not configured_token or request_token == configured_token
 
     def _get_execution(self, request, response):
         if not self._execution_auth_ok(request):

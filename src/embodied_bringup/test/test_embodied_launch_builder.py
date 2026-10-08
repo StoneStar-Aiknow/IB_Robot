@@ -503,6 +503,10 @@ def test_agent_entry_mode_adds_only_agent_entry_node():
     assert _decode_launch_json_string(_decode_launch_string(params["allowed_skills_json"])) == ["wave_hello"]
     assert params["simulation_mode"] is False
     assert params["presentation_timeout_sec"] == 30.0
+    skill_params = _skill_executor_params(nodes)
+    scopes = _decode_launch_json_string(_decode_launch_string(skill_params["execution_caller_scopes_json"]))
+    assert "agent_incubation:local_operator" in scopes
+    assert _decode_launch_string(params["gateway_caller_scope"]) == "agent_incubation:local_operator"
 
 
 def test_agent_entry_mode_receives_use_sim_as_simulation_mode():

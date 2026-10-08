@@ -12,6 +12,7 @@
 uint32 schema_version
 string request_id
 string caller_scope
+string caller_token
 string robot_id
 string raw_command
 string expected_registry_epoch

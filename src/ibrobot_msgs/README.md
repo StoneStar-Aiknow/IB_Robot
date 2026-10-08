@@ -155,6 +155,11 @@ execution_mode 和 trace_id。响应包含 success、allowed、AgentPlan、error
 只捕获 exact catalog plan 并做逐步只读 validation，不包含展示、确认、授权或执行。
 `PlanAgentCommand` / `ValidateAgentPlan` / `ConfirmAgentPlan` / `ExecuteAgentPlan` 仍保留用于分阶段诊断与兼容调用；新的 Agent 生产主路径使用 typed Program contracts。
 
+`ExecuteProgram` 及其查询、事件、取消服务共享 `caller_scope`、`caller_token` 认证契约。
+Gateway 从 `robot_config` 注入允许的 caller scope；若配置了对应的
+`IBROBOT_EXECUTION_TOKEN_<SCOPE>` 环境变量，则所有入口必须携带匹配 token。token 只用于
+传输认证，不参与 canonical Program digest 或 ExecutionStore payload 身份。
+
 `DispatchBinding.trace_id` 与 `ExecuteAgentPlan.Goal.trace_id` 为链路关联字段，不参与运动权限判断；
 空值按调用路径回退到 request/task ID。日志使用清洗后的副本，不改变业务幂等身份。
 新增同名 ROS 消息/action 字段改变 wire layout，生产者、消费者及生成接口须一致重建和部署。

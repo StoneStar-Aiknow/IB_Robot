@@ -105,6 +105,23 @@ def generate_embodied_nodes(
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
     if entry_mode not in {"hermes", "agent"}:
         raise ValueError("embodied.entry_mode must be hermes or agent")
+    agent_config = embodied_config.get("agent", {})
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    configured_execution_scopes = list(
+        embodied_config.get(
+            "execution_caller_scopes",
+            ["robot_skill_cli"]
+            + (
+                [str(agent_config.get("caller_scope", "agent_incubation:local_operator"))]
+                if entry_mode == "agent"
+                else []
+            ),
+        )
+    )
+    agent_caller_scope = str(agent_config.get("caller_scope", "agent_incubation:local_operator"))
+    if entry_mode == "agent" and agent_caller_scope not in configured_execution_scopes:
+        raise ValueError("embodied.agent.caller_scope must be included in embodied.execution_caller_scopes")
     launch_errors = validate_agent_entry_config(embodied_config)
     if launch_errors:
         raise ValueError("; ".join(launch_errors))
@@ -265,6 +282,7 @@ def generate_embodied_nodes(
         "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
         "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
         "sound_following_service": "/sound_orientation_node/set_following",
+        "execution_caller_scopes_json": json.dumps(configured_execution_scopes),
     }
     if runtime_motion:
         common_params.update(
@@ -528,6 +546,22 @@ def generate_embodied_nodes(
                         ),
                         "gateway_execute_plan_action": embodied_config.get(
                             "execute_plan_action", "/embodied/execute_agent_plan"
+                        ),
+                        "gateway_execute_program_action": embodied_config.get(
+                            "execute_program_action", "/embodied/execute_program"
+                        ),
+                        "gateway_get_execution_service": embodied_config.get(
+                            "get_execution_service", "/embodied/get_execution"
+                        ),
+                        "gateway_get_execution_events_service": embodied_config.get(
+                            "get_execution_events_service", "/embodied/get_execution_events"
+                        ),
+                        "gateway_cancel_execution_service": embodied_config.get(
+                            "cancel_execution_service", "/embodied/cancel_execution"
+                        ),
+                        "gateway_caller_scope": agent_config.get("caller_scope", "agent_incubation:local_operator"),
+                        "gateway_caller_token_env": agent_config.get(
+                            "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
                     }
                 ],

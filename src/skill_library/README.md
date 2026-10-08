@@ -46,6 +46,14 @@ Program root execution 的查询和取消入口为：
 的唯一权威 root 状态由 ExecutionStore 保存，失败、取消、重启恢复必须收敛为终态或
 明确的 `UNKNOWN`，不能只更新内存中的 legacy workflow 状态。
 
+Program execution, query, event, and cancel requests share the same caller
+authentication contract. `execution_caller_scopes` is injected by the
+`embodied` launch builder from `robot_config`; agent mode includes
+`agent_incubation:local_operator` by default. A configured
+`IBROBOT_EXECUTION_TOKEN_<SCOPE>` environment variable is required for that
+scope. The token authenticates transport requests and is not included in the
+canonical Program digest or durable execution payload.
+
 ## 2. 技能来源：versioned skill catalog snapshot
 
 技能不再由 `robot_config` 的 `skill_templates` 内联注入。`skill_executor_node` 现在是
