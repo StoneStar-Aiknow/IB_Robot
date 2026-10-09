@@ -184,13 +184,20 @@ class _EePoseSnapshotExpired(Exception):
 class _ProgramGoalHandle:
     """Adapter that gives the existing Skill Gateway a typed Program child."""
 
-    def __init__(self, request, root_handle) -> None:
+    def __init__(self, request, root_handle, execution_store=None, execution_id="") -> None:
         self.request = request
         self._root_handle = root_handle
+        self._execution_store = execution_store
+        self._program_execution_id = execution_id
 
     @property
     def is_cancel_requested(self):
-        return bool(getattr(self._root_handle, "is_cancel_requested", False))
+        if bool(getattr(self._root_handle, "is_cancel_requested", False)):
+            return True
+        if self._execution_store is None or not self._program_execution_id:
+            return False
+        record = self._execution_store.get(execution_id=self._program_execution_id)
+        return bool(record is not None and record.stop_requested)
 
     def publish_feedback(self, message) -> None:
         return None
@@ -224,6 +231,10 @@ class _ProgramAdmission:
     @property
     def error_code(self):
         return self.decision.error_code
+
+    @property
+    def message(self):
+        return getattr(self.decision, "message", self.decision.error_code)
 
     @property
     def prepared_request(self):
@@ -872,6 +883,7 @@ class SkillExecutorNode(Node):
             if self.has_parameter("execute_program_action")
             else "/embodied/execute_program",
             execute_callback=self._execute_program,
+            cancel_callback=self._handle_cancel,
             callback_group=callback_group,
         )
         self._get_execution_server = self.create_service(
@@ -1002,12 +1014,34 @@ class SkillExecutorNode(Node):
             return None, "operator authorization is disabled"
         return bundle, ""
 
+    def _finish_program(self, record, result, *, state, error_code="", message="", completed=0, bundle=None):
+        actual = {}
+        if bundle is not None:
+            actual = {
+                "actual_registry_epoch": bundle.registry_epoch,
+                "actual_registry_generation": bundle.generation,
+                "actual_registry_digest": bundle.snapshot.registry_digest,
+            }
+        self._execution_store.finish(
+            record.execution_id,
+            state=state,
+            completed_step_count=completed,
+            error_code=error_code,
+            message=message,
+            **actual,
+        )
+        result.state = state
+        result.error_code = error_code
+        result.message = message
+        result.completed_step_count = completed
+
     def _execute_program(self, goal_handle):
         goal = goal_handle.request
         result = ExecuteProgram.Result()
         record = None
         program_admission = None
         program_owner = None
+        program_child_admission = None
         try:
             if not self._execution_auth_ok(goal):
                 result.state = "FAILED"
@@ -1031,7 +1065,7 @@ class SkillExecutorNode(Node):
             bundle, admission_error = self._program_admission_snapshot(program)
             if bundle is None:
                 raise ValueError(admission_error)
-            record, _created = self._execution_store.begin(program)
+            record, created = self._execution_store.begin(program)
             result.execution_id = record.execution_id
             result.request_id = record.request_id
             result.program_digest = record.program_digest
@@ -1042,6 +1076,13 @@ class SkillExecutorNode(Node):
                 result.error_code = record.error_code
                 result.message = record.message
                 goal_handle.succeed() if result.success else goal_handle.abort()
+                return result
+            if not created:
+                result.success = False
+                result.state = record.state
+                result.error_code = "EXECUTION_IN_PROGRESS"
+                result.message = "execution is already in progress"
+                goal_handle.abort()
                 return result
             self._execution_store.mark_committing(record.execution_id)
             program_owner = ExecutionOwner.workflow(program.root_task_id)
@@ -1082,11 +1123,15 @@ class SkillExecutorNode(Node):
             self._active_runtime_bundle = bundle
             self._active_runtime_generation_retained = False
             self._execution_store.mark_active(record.execution_id)
+            goal_handle._execution_store = self._execution_store
+            goal_handle._program_execution_id = record.execution_id
             completed = 0
+            budget_binding = SkillCommand.Goal().dispatch_binding
+            self._set_task_budget(budget_binding, program.task_budget_sec)
             for index, step in enumerate(program.steps):
                 # A cancel arriving between children must not start the next
                 # child: converge immediately with the completed-step bound.
-                if goal_handle.is_cancel_requested:
+                if self._program_cancel_requested(goal_handle, record.execution_id):
                     self._execution_store.finish(
                         record.execution_id,
                         state="CANCELED",
@@ -1102,9 +1147,20 @@ class SkillExecutorNode(Node):
                     result.message = "program canceled between steps"
                     result.completed_step_count = completed
                     goal_handle.canceled()
-                    self._finalize_active_admission(
-                        program_admission, error_code="SKILL_CANCELLED", duration_sec=0.0, step_count=completed
+                    self._finalize_program_admission(program_child_admission, program_owner)
+                    return result
+                if self._remaining_task_budget_sec(budget_binding) <= 0.0:
+                    self._finish_program(
+                        record,
+                        result,
+                        state="FAILED",
+                        error_code="TASK_TIMEOUT",
+                        message="program task budget expired",
+                        completed=completed,
+                        bundle=bundle,
                     )
+                    goal_handle.abort()
+                    self._finalize_program_admission(program_child_admission, program_owner)
                     return result
                 skill_goal = SkillCommand.Goal()
                 skill_goal.schema_version = step.schema_version
@@ -1115,7 +1171,13 @@ class SkillExecutorNode(Node):
                 skill_goal.dispatch_binding.expected_registry_generation = program.identity.registry_generation
                 skill_goal.dispatch_binding.expected_registry_digest = program.identity.registry_digest
                 skill_goal.dispatch_binding.trace_id = program.request_id
-                self._set_task_budget(skill_goal.dispatch_binding, program.task_budget_sec)
+                skill_goal.dispatch_binding.task_budget.schema_version = budget_binding.task_budget.schema_version
+                skill_goal.dispatch_binding.task_budget.started_at.sec = budget_binding.task_budget.started_at.sec
+                skill_goal.dispatch_binding.task_budget.started_at.nanosec = (
+                    budget_binding.task_budget.started_at.nanosec
+                )
+                skill_goal.dispatch_binding.task_budget.deadline.sec = budget_binding.task_budget.deadline.sec
+                skill_goal.dispatch_binding.task_budget.deadline.nanosec = budget_binding.task_budget.deadline.nanosec
                 skill_goal.dispatch_binding.workflow_digest = ""
                 skill_goal.dispatch_binding.root_lease_nonce = ""
                 skill_goal.dispatch_binding.dispatch_nonce = ""
@@ -1143,7 +1205,7 @@ class SkillExecutorNode(Node):
                 skill_goal.y = step.y or 0.0
                 skill_goal.has_yaw = step.yaw is not None
                 skill_goal.yaw = step.yaw or 0.0
-                child_result = self._execute_program_child(skill_goal, goal_handle)
+                child_result = self._execute_program_child(skill_goal, goal_handle, record.execution_id)
                 if not child_result.success:
                     self._execution_store.finish(
                         record.execution_id,
@@ -1159,9 +1221,7 @@ class SkillExecutorNode(Node):
                     result.message = child_result.message
                     result.state = "CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED"
                     goal_handle.canceled() if result.state == "CANCELED" else goal_handle.abort()
-                    self._finalize_active_admission(
-                        program_admission, error_code=result.error_code, duration_sec=0.0, step_count=completed
-                    )
+                    self._finalize_program_admission(program_child_admission, program_owner)
                     return result
                 completed += 1
             self._execution_store.finish(
@@ -1179,7 +1239,7 @@ class SkillExecutorNode(Node):
             result.actual_registry_generation = bundle.generation
             result.actual_registry_digest = bundle.snapshot.registry_digest
             goal_handle.succeed()
-            self._finalize_program_admission(program_admission, program_owner, completed)
+            self._finalize_program_admission(program_child_admission, program_owner)
         except Exception as exc:
             result.success = False
             result.state = "FAILED"
@@ -1194,14 +1254,14 @@ class SkillExecutorNode(Node):
                         error_code=result.error_code,
                         message=result.message,
                     )
-            if program_admission is not None and program_owner is not None:
-                self._finalize_program_admission(program_admission, program_owner, record.completed_step_count)
+            if program_child_admission is not None and program_owner is not None:
+                self._finalize_program_admission(program_child_admission, program_owner)
             goal_handle.abort()
         return result
 
-    def _execute_program_child(self, goal, root_goal_handle):
+    def _execute_program_child(self, goal, root_goal_handle, execution_id):
         """Execute one canonical child through the existing Gateway path."""
-        child_handle = _ProgramGoalHandle(goal, root_goal_handle)
+        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id)
         requested_timeout = float(goal.timeout_sec)
         goal.timeout_sec = 0.0
         bundle = getattr(self, "_active_runtime_bundle", None)
@@ -1211,13 +1271,19 @@ class SkillExecutorNode(Node):
             return self._abort_skill(result, child_handle, [], schema_error, "program child schema is invalid")
         result = self._execute_skill_child(
             child_handle,
-            validation_done=True,
+            validation_done=False,
             effective_timeout_sec=requested_timeout or self._default_skill_timeout_sec,
             canonical_task_id=goal.dispatch_binding.task_id,
         )
         return result
 
-    def _finalize_program_admission(self, admission, owner, completed_count: int) -> None:
+    def _program_cancel_requested(self, root_goal_handle, execution_id: str) -> bool:
+        if bool(getattr(root_goal_handle, "is_cancel_requested", False)):
+            return True
+        record = self._execution_store.get(execution_id=execution_id)
+        return bool(record is not None and record.stop_requested)
+
+    def _finalize_program_admission(self, admission, owner) -> None:
         with self._state_guard():
             if self._active_skill_admission is not None:
                 self._active_skill_admission = None

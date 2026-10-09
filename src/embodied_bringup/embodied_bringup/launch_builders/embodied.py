@@ -283,6 +283,13 @@ def generate_embodied_nodes(
         "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
         "sound_following_service": "/sound_orientation_node/set_following",
         "execution_caller_scopes_json": json.dumps(configured_execution_scopes),
+        "execute_program_action": embodied_config.get("execute_program_action", "/embodied/execute_program"),
+        "get_execution_service": embodied_config.get("get_execution_service", "/embodied/get_execution"),
+        "get_execution_events_service": embodied_config.get(
+            "get_execution_events_service", "/embodied/get_execution_events"
+        ),
+        "cancel_execution_service": embodied_config.get("cancel_execution_service", "/embodied/cancel_execution"),
+        "execution_store_path": embodied_config.get("execution_store_path", "/tmp/ibrobot-executions.sqlite3"),
     }
     if runtime_motion:
         common_params.update(

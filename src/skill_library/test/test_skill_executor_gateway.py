@@ -609,10 +609,10 @@ def test_program_gateway_preserves_distinct_child_step_identity(gateway_rig, mon
     captured = []
     original_child_executor = gateway_rig.executor_node._execute_program_child
 
-    def capture_child(goal, root_goal_handle):
+    def capture_child(goal, root_goal_handle, execution_id):
         binding = goal.dispatch_binding
         captured.append((binding.task_id, binding.root_task_id, binding.workflow_step_index))
-        return original_child_executor(goal, root_goal_handle)
+        return original_child_executor(goal, root_goal_handle, execution_id)
 
     monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", capture_child)
     result = _send_program(
@@ -684,6 +684,58 @@ def test_minimal_program_gateway_replay_and_payload_conflict(gateway_rig):
     conflict_result = _send_program(gateway_rig, conflict)
     assert conflict_result.success is False
     assert conflict_result.error_code == "EXECUTIONCONFLICTERROR"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_child_uses_skill_validation_and_shared_budget(gateway_rig, monkeypatch):
+    validated = []
+    original_validate = gateway_rig.executor_node._validate_skill
+    original_child = gateway_rig.executor_node._execute_program_child
+
+    def validate(*args, **kwargs):
+        validated.append(args[0])
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", validate)
+    result = _send_program(
+        gateway_rig,
+        _program_goal(
+            gateway_rig,
+            request_id="program-validation-budget",
+            task_budget_sec=5.0,
+            steps=[
+                workflow_step(skill_name="move", timeout_sec=1.0),
+                workflow_step(skill_name="move", timeout_sec=1.0),
+            ],
+        ),
+    )
+    assert result.success is True
+    assert validated == ["move", "move"]
+
+    # The child executor receives one absolute deadline for every step.
+    captured = []
+
+    def capture(goal, root_handle, execution_id):
+        captured.append(
+            (goal.dispatch_binding.task_budget.started_at.sec, goal.dispatch_binding.task_budget.deadline.sec)
+        )
+        return original_child(goal, root_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", capture)
+    result = _send_program(
+        gateway_rig,
+        _program_goal(
+            gateway_rig,
+            request_id="program-shared-budget",
+            task_budget_sec=5.0,
+            steps=[
+                workflow_step(skill_name="move", timeout_sec=1.0),
+                workflow_step(skill_name="move", timeout_sec=1.0),
+            ],
+        ),
+    )
+    assert result.success is True
+    assert len(set(captured)) == 1
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
