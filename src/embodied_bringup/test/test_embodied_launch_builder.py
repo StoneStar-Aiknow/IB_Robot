@@ -197,6 +197,45 @@ def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
     assert params["gripper_settle_sec"] == 0.8
 
 
+def test_agent_launch_shares_caller_scope_and_token_configuration():
+    config = {
+        "name": "agent_robot",
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "execution_caller_scopes": ["robot_skill_cli", "agent_scope"],
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "ledger_path": "/tmp/test-agent-requests.sqlite3",
+                "conversation_path": "/tmp/test-agent-conversation.sqlite3",
+                "deployment_lock_path": "/tmp/test-agent.lock",
+                "caller_scope": "agent_scope",
+                "caller_token_env": "TEST_AGENT_TOKEN",
+                "caller_token": "configured-token",
+            },
+        },
+    }
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+    assert _decode_launch_json_string(params["execution_caller_scopes_json"]) == [
+        "robot_skill_cli",
+        "agent_scope",
+    ]
+    assert _decode_launch_json_string(params["execution_caller_tokens_json"]) == {"agent_scope": "configured-token"}
+    agent_node = next(
+        node
+        for node in generate_embodied_nodes(config, active_control_mode="moveit_planning")
+        if (
+            vars(node).get("_Node__package") == "ibrobot_agent"
+            and vars(node).get("_Node__node_name") == "ibrobot_agent_node"
+        )
+    )
+    agent_params = _normalize_launch_param_mapping(agent_node._Node__parameters[0])
+    assert _decode_launch_string(agent_params["gateway_caller_scope"]) == "agent_scope"
+    assert _decode_launch_string(agent_params["gateway_caller_token_env"]) == "TEST_AGENT_TOKEN"
+    assert _decode_launch_string(agent_params["gateway_caller_token"]) == "configured-token"
+
+
 def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
     robot_config = {
         "name": "lekiwi_lidar",

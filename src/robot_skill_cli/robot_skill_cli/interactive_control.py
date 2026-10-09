@@ -730,12 +730,16 @@ class InteractiveController:
 
     def _execute_program(self, *, stop_event, feedback_callback=None) -> dict[str, Any]:
         with self._state_lock:
-            if self._pending is None:
+            if self._pending is None or self._state not in {CONFIRMED, STOPPING}:
                 raise IllegalStateError("ILLEGAL_STATE", "no pending workflow to execute")
             task_id = self._pending["task_id"]
+            request_id = self._pending["trace_id"]
             self._active_task_id = task_id
             self._state = EXECUTING
+            self._stop_event = stop_event or self._stop_event
             self._submission_started = True
+            if self._stop_requested_now():
+                return self._record_local_stop(task_id, "stopped before goal admission")
             steps = list(self._pending["steps"])
             registry = {
                 "registry_epoch": self._pending["registry_epoch"],
@@ -756,23 +760,53 @@ class InteractiveController:
             )
             if not self._wait_future_interruptibly(future, self._rpc()):
                 if self._stop_requested_now():
-                    return self._record_local_stop(task_id, "stopped before goal admission")
+                    return self._cancel_program_and_converge(
+                        None,
+                        None,
+                        task_id,
+                        request_id=request_id,
+                        execution_id="",
+                    )
                 return self._record_unknown(task_id, failure_detail="program goal response timed out")
             handle = future.result()
             if handle is None or not getattr(handle, "accepted", False):
                 return self._record_terminal(task_id, FAILED, "GOAL_REJECTED", "program goal was rejected")
             result_future = handle.get_result_async()
+            with self._state_lock:
+                self._goal_handle = handle
+                self._result_future = result_future
+            execution_id = ""
+            with contextlib.suppress(Exception):
+                execution = self._bridge.get_execution(
+                    request_id=request_id,
+                    execution_id="",
+                    timeout_sec=self._rpc(),
+                )
+                if execution.get("found"):
+                    execution_id = str(execution.get("execution_id", ""))
             budget_sec = float(
                 self._confirmed["task_budget_sec"] if self._confirmed else self._fresh_status["task_budget_sec"]
             )
             if not self._wait_future_interruptibly(result_future, budget_sec):
                 if self._stop_requested_now():
-                    return self._cancel_program_and_converge(handle, result_future, task_id)
+                    return self._cancel_program_and_converge(
+                        handle, result_future, task_id, request_id=request_id, execution_id=execution_id
+                    )
                 return self._record_unknown(task_id, failure_detail="program result timed out")
             result = result_future.result().result
+            result_state = str(result.state)
+            terminal_state = (
+                SUCCEEDED
+                if result.success
+                else STOPPED
+                if result_state == "CANCELED"
+                else UNKNOWN
+                if result_state == "UNKNOWN"
+                else FAILED
+            )
             return self._record_terminal(
                 task_id,
-                SUCCEEDED if result.success else FAILED,
+                terminal_state,
                 str(result.error_code),
                 str(result.message),
                 result={
@@ -784,7 +818,9 @@ class InteractiveController:
         except Exception as exc:
             return self._record_terminal(task_id, FAILED, "PROGRAM_EXECUTION_FAILED", str(exc))
 
-    def _cancel_program_and_converge(self, handle, result_future, task_id: str) -> dict[str, Any]:
+    def _cancel_program_and_converge(
+        self, handle, result_future, task_id: str, *, request_id: str, execution_id: str
+    ) -> dict[str, Any]:
         """Cancel the live ExecuteProgram goal once and converge on its terminal result.
 
         An accepted CancelGoal is not a physical stop: only the server's
@@ -792,19 +828,47 @@ class InteractiveController:
         motion stopped. An unconverged cancel stays unknown.
         """
         with contextlib.suppress(Exception):
-            handle.cancel_goal_async()
+            self._bridge.cancel_execution(
+                request_id=request_id,
+                execution_id=execution_id,
+                timeout_sec=self._rpc(),
+            )
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.cancel_goal_async()
         deadline = self._monotonic() + self._rpc_timeout_sec
-        while not result_future.done() and self._monotonic() < deadline:
+        while (result_future is None or not result_future.done()) and self._monotonic() < deadline:
+            with contextlib.suppress(Exception):
+                execution = self._bridge.get_execution(
+                    request_id=request_id,
+                    execution_id=execution_id,
+                    timeout_sec=self._rpc(),
+                )
+                if str(execution.get("state", "")) in {"CANCELED", "FAILED", "UNKNOWN"}:
+                    state = (
+                        STOPPED
+                        if execution["state"] == "CANCELED"
+                        else (FAILED if execution["state"] == "FAILED" else UNKNOWN)
+                    )
+                    return self._record_terminal(
+                        task_id,
+                        state,
+                        str(execution.get("error_code", "")),
+                        str(execution.get("message", "")),
+                        result=execution,
+                    )
             self._sleep(_CANCEL_POLL_INTERVAL_SEC)
-        if not result_future.done():
+        if result_future is None or not result_future.done():
             return self._record_unknown(
                 task_id, deadline_expired=True, failure_detail="program cancel did not converge to a terminal result"
             )
         result = result_future.result().result
         error_code = str(result.error_code) or "SKILL_CANCELLED"
+        state = str(result.state)
+        terminal_state = STOPPED if state == "CANCELED" else (UNKNOWN if state == "UNKNOWN" else FAILED)
         return self._record_terminal(
             task_id,
-            SUCCEEDED if result.success else FAILED,
+            SUCCEEDED if result.success else terminal_state,
             error_code,
             str(result.message),
             result={
@@ -813,6 +877,14 @@ class InteractiveController:
                 "state": str(result.state),
             },
         )
+
+    def _request_program_stop(self, request_id: str, execution_id: str = "") -> None:
+        with contextlib.suppress(Exception):
+            self._bridge.cancel_execution(
+                request_id=request_id,
+                execution_id=execution_id,
+                timeout_sec=self._rpc(),
+            )
 
     def request_stop(self) -> None:
         """Feature 4: thread-safe stop trigger from outside the execute loop."""

@@ -146,17 +146,24 @@ class _DirectExecutionBridge:
 
 
 class _ProgramExecutionBridge(_DirectExecutionBridge):
+    def __init__(self, *, state="SUCCEEDED", success=True):
+        super().__init__()
+        self.program_kwargs = None
+        self.program_state = state
+        self.program_success = success
+
     def send_program_goal(self, **kwargs):
         self.calls.append("program_submit")
+        self.program_kwargs = kwargs
         result = type(
             "Result",
             (),
             {
-                "success": True,
+                "success": self.program_success,
                 "error_code": "",
                 "message": "skill completed",
                 "execution_id": "execution-1",
-                "state": "SUCCEEDED",
+                "state": self.program_state,
             },
         )()
         return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": result})()))
@@ -210,7 +217,11 @@ def test_direct_execution_adapter_keeps_natural_language_skill_order():
 
 def test_program_execution_adapter_freezes_non_empty_digest_and_submits_once():
     bridge = _ProgramExecutionBridge()
-    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    adapter = _RosExecutionAdapter(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0},
+        caller_scope="custom-agent-scope",
+    )
     proposal = _proposal()
     presentations = []
     result = adapter.execute(
@@ -223,6 +234,27 @@ def test_program_execution_adapter_freezes_non_empty_digest_and_submits_once():
     assert result.status == "succeeded"
     assert presentations[0].task_ref.plan_digest
     assert bridge.calls == ["program_submit"]
+    assert bridge.program_kwargs["request_id"] == "request-wave"
+    assert adapter._caller_scope == "custom-agent-scope"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [("CANCELED", "cancelled"), ("UNKNOWN", "unknown"), ("FAILED", "failed")],
+)
+def test_program_result_preserves_gateway_terminal_state(state, expected_status):
+    bridge = _ProgramExecutionBridge(state=state, success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+
+    assert result.status == expected_status
 
 
 @pytest.mark.parametrize("stop_stage", ["get_status", "wait_for_execute_plan_server", "submission_callback"])

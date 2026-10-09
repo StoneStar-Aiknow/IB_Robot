@@ -49,6 +49,9 @@ class FakeGoalHandle:
     def get_result_async(self) -> FakeFuture:
         return self._result_future
 
+    def cancel_goal_async(self) -> FakeFuture:
+        return FakeFuture(None)
+
 
 def _capability_view() -> dict[str, Any]:
     def skill(name: str, *, visible: bool, level: str = "skill") -> dict[str, Any]:
@@ -240,6 +243,38 @@ class FakeBridge:
         return {"status": self.plan_result_status, "result": dict(self.plan_result)}
 
 
+class ProgramBridge(FakeBridge):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.program_result_future = FakeFuture(None, done=False)
+        self.execution_state = "ACTIVE"
+
+    def send_program_goal(self, **kwargs):
+        self._record("send_program_goal", dict(kwargs))
+        return FakeFuture(FakeGoalHandle(result_future=self.program_result_future), done=True)
+
+    def get_execution(self, *, request_id, execution_id, timeout_sec):
+        self._record(
+            "get_execution",
+            {"request_id": request_id, "execution_id": execution_id},
+        )
+        return {
+            "found": True,
+            "execution_id": "execution-1",
+            "state": self.execution_state,
+            "error_code": "",
+            "message": "",
+        }
+
+    def cancel_execution(self, *, request_id, execution_id, timeout_sec):
+        self._record(
+            "cancel_execution",
+            {"request_id": request_id, "execution_id": execution_id},
+        )
+        self.execution_state = "CANCELED"
+        return {"accepted": True, "execution_id": "execution-1", "state": "STOPPING"}
+
+
 @pytest.fixture
 def rig(monkeypatch):
     clock = FakeClock()
@@ -365,6 +400,38 @@ def test_execute_success_reaches_succeeded_terminal(rig):
     assert result["state"] == ic.SUCCEEDED
     assert result["error_code"] == ""
     assert "send_agent_plan_goal" in [m for m, _ in bridge.calls]
+
+
+def test_program_stop_persists_cancel_and_converges_from_execution_store():
+    clock = FakeClock()
+    bridge = ProgramBridge(clock)
+    controller = ic.InteractiveController(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 30.0},
+        id_factory=iter(["task-1", "request-1"]).__next__,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        view_resolver=lambda snapshot, status: _capability_view(),
+    )
+    controller.discover()
+    controller.prepare_workflow("点个头", [_step("nod_yes")], request_id="request-1")
+    controller.confirm("确认")
+    stopped = False
+
+    def stop_on_wait():
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            controller.request_stop()
+
+    bridge.wait_future_hook = stop_on_wait
+
+    result = controller.execute()
+
+    assert result["state"] == ic.STOPPED
+    assert [method for method, _ in bridge.calls].count("cancel_execution") == 1
+    cancel_call = next(kwargs for method, kwargs in bridge.calls if method == "cancel_execution")
+    assert cancel_call == {"request_id": "request-1", "execution_id": "execution-1"}
 
 
 def test_confirm_plan_runs_without_grammar_gate(rig):

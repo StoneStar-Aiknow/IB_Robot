@@ -119,6 +119,7 @@ def generate_embodied_nodes(
             ),
         )
     )
+    configured_execution_scopes = [scope.strip() for scope in configured_execution_scopes if str(scope).strip()]
     agent_caller_scope = str(agent_config.get("caller_scope", "agent_incubation:local_operator"))
     if entry_mode == "agent" and agent_caller_scope not in configured_execution_scopes:
         raise ValueError("embodied.agent.caller_scope must be included in embodied.execution_caller_scopes")
@@ -283,6 +284,11 @@ def generate_embodied_nodes(
         "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
         "sound_following_service": "/sound_orientation_node/set_following",
         "execution_caller_scopes_json": json.dumps(configured_execution_scopes),
+        "execution_caller_tokens_json": json.dumps(
+            {agent_caller_scope: str(agent_config.get("caller_token", ""))}
+            if str(agent_config.get("caller_token", ""))
+            else {}
+        ),
         "execute_program_action": embodied_config.get("execute_program_action", "/embodied/execute_program"),
         "get_execution_service": embodied_config.get("get_execution_service", "/embodied/get_execution"),
         "get_execution_events_service": embodied_config.get(
@@ -570,6 +576,7 @@ def generate_embodied_nodes(
                         "gateway_caller_token_env": agent_config.get(
                             "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
+                        "gateway_caller_token": agent_config.get("caller_token", ""),
                     }
                 ],
             )

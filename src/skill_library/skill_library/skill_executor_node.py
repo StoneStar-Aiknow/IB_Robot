@@ -538,10 +538,17 @@ class SkillExecutorNode(Node):
         self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
         self.declare_parameter("execution_store_path", "/tmp/ibrobot-executions.sqlite3")
         self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
+        self.declare_parameter("execution_caller_tokens_json", "{}")
         raw_scopes = self.get_parameter("execution_caller_scopes_json").value
         if isinstance(raw_scopes, str):
             raw_scopes = json.loads(raw_scopes)
         self._execution_caller_scopes = tuple(str(scope).strip() for scope in raw_scopes if str(scope).strip())
+        raw_tokens = self.get_parameter("execution_caller_tokens_json").value
+        if isinstance(raw_tokens, str):
+            raw_tokens = json.loads(raw_tokens)
+        self._execution_caller_tokens = {
+            str(scope).strip(): str(token) for scope, token in raw_tokens.items() if str(scope).strip() and str(token)
+        }
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -1113,6 +1120,24 @@ class SkillExecutorNode(Node):
                 goal_handle.abort()
                 return result
             program_child_admission = _ProgramChildAdmission(program_admission, program_owner)
+            retained_bundle = self._runtime_coordinator.retain(bundle.generation)
+            budget_binding = SkillCommand.Goal().dispatch_binding
+            self._set_task_budget(budget_binding, program.task_budget_sec)
+            program_workflow = _WorkflowExecution(
+                root_task_id=program.root_task_id,
+                workflow_digest=program.program_digest,
+                root_lease_nonce=uuid.uuid4().hex,
+                lease_token=program_admission.lease_token,
+                owner=program_owner,
+                policy=self._gateway_policy,
+                bundle=retained_bundle,
+                workflow_steps=program.steps,
+                task_budget_key=self._task_budget_key(budget_binding),
+                deadline_unix_sec=budget_binding.task_budget.deadline.sec
+                + budget_binding.task_budget.deadline.nanosec / 1_000_000_000,
+                step_terminal_states=[WORKFLOW_STEP_PENDING] * len(program.steps),
+            )
+            self._active_workflow = program_workflow
             self._active_skill_admission = program_child_admission
             self._active_skill_owner = program_owner
             self._active_audit_context = {
@@ -1120,14 +1145,12 @@ class SkillExecutorNode(Node):
                 "payload_hash": program.program_digest,
                 "skill": program.steps[0].skill_name,
             }
-            self._active_runtime_bundle = bundle
+            self._active_runtime_bundle = retained_bundle
             self._active_runtime_generation_retained = False
             self._execution_store.mark_active(record.execution_id)
             goal_handle._execution_store = self._execution_store
             goal_handle._program_execution_id = record.execution_id
             completed = 0
-            budget_binding = SkillCommand.Goal().dispatch_binding
-            self._set_task_budget(budget_binding, program.task_budget_sec)
             for index, step in enumerate(program.steps):
                 # A cancel arriving between children must not start the next
                 # child: converge immediately with the completed-step bound.
@@ -1179,7 +1202,8 @@ class SkillExecutorNode(Node):
                 skill_goal.dispatch_binding.task_budget.deadline.sec = budget_binding.task_budget.deadline.sec
                 skill_goal.dispatch_binding.task_budget.deadline.nanosec = budget_binding.task_budget.deadline.nanosec
                 skill_goal.dispatch_binding.workflow_digest = ""
-                skill_goal.dispatch_binding.root_lease_nonce = ""
+                skill_goal.dispatch_binding.workflow_digest = program_workflow.workflow_digest
+                skill_goal.dispatch_binding.root_lease_nonce = program_workflow.root_lease_nonce
                 skill_goal.dispatch_binding.dispatch_nonce = ""
                 # The existing Skill Gateway treats a program's child skills as
                 # internal work under the root lease.  Keep the root identity on
@@ -1207,9 +1231,15 @@ class SkillExecutorNode(Node):
                 skill_goal.yaw = step.yaw or 0.0
                 child_result = self._execute_program_child(skill_goal, goal_handle, record.execution_id)
                 if not child_result.success:
+                    cleanup_pending = child_result.error_code in {
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        SKILL_CANCEL_TIMEOUT,
+                    }
                     self._execution_store.finish(
                         record.execution_id,
-                        state="CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED",
+                        state="UNKNOWN"
+                        if cleanup_pending
+                        else ("CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED"),
                         completed_step_count=completed,
                         error_code=child_result.error_code,
                         message=child_result.message,
@@ -1219,9 +1249,14 @@ class SkillExecutorNode(Node):
                     )
                     result.error_code = child_result.error_code
                     result.message = child_result.message
-                    result.state = "CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED"
-                    goal_handle.canceled() if result.state == "CANCELED" else goal_handle.abort()
-                    self._finalize_program_admission(program_child_admission, program_owner)
+                    result.state = (
+                        "UNKNOWN"
+                        if cleanup_pending
+                        else ("CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED")
+                    )
+                    goal_handle.abort()
+                    if not cleanup_pending:
+                        self._finalize_program_admission(program_child_admission, program_owner)
                     return result
                 completed += 1
             self._execution_store.finish(
@@ -1260,22 +1295,9 @@ class SkillExecutorNode(Node):
         return result
 
     def _execute_program_child(self, goal, root_goal_handle, execution_id):
-        """Execute one canonical child through the existing Gateway path."""
+        """Execute one canonical child through the existing workflow lifecycle."""
         child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id)
-        requested_timeout = float(goal.timeout_sec)
-        goal.timeout_sec = 0.0
-        bundle = getattr(self, "_active_runtime_bundle", None)
-        schema_error = self._validate_skill_goal_schema(goal, bundle)
-        if schema_error:
-            result = SkillCommand.Result()
-            return self._abort_skill(result, child_handle, [], schema_error, "program child schema is invalid")
-        result = self._execute_skill_child(
-            child_handle,
-            validation_done=False,
-            effective_timeout_sec=requested_timeout or self._default_skill_timeout_sec,
-            canonical_task_id=goal.dispatch_binding.task_id,
-        )
-        return result
+        return self._execute_workflow_skill_gateway(child_handle)
 
     def _program_cancel_requested(self, root_goal_handle, execution_id: str) -> bool:
         if bool(getattr(root_goal_handle, "is_cancel_requested", False)):
@@ -1284,12 +1306,19 @@ class SkillExecutorNode(Node):
         return bool(record is not None and record.stop_requested)
 
     def _finalize_program_admission(self, admission, owner) -> None:
+        workflow = None
         with self._state_guard():
             if self._active_skill_admission is not None:
                 self._active_skill_admission = None
             self._active_skill_owner = None
             self._active_audit_context = None
             self._active_runtime_bundle = None
+            workflow = self._active_workflow
+            self._active_workflow = None
+        if workflow is not None and not workflow.runtime_generation_released:
+            with suppress(Exception):
+                self._runtime_coordinator.release(workflow.bundle.generation)
+            workflow.runtime_generation_released = True
         with suppress(Exception):
             self._gateway_policy.release_workflow(owner, admission.lease_token)
 
@@ -1298,6 +1327,7 @@ class SkillExecutorNode(Node):
             request.caller_scope,
             getattr(request, "caller_token", ""),
             tuple(getattr(self, "_execution_caller_scopes", ())),
+            dict(getattr(self, "_execution_caller_tokens", {})),
         )
 
     def _get_execution(self, request, response):
@@ -1381,8 +1411,18 @@ class SkillExecutorNode(Node):
             request_id=request.request_id,
         )
         if record is None:
-            response.error_code = "EXECUTION_NOT_FOUND"
-            response.message = "execution not found"
+            if request.execution_id or not request.request_id:
+                response.error_code = "EXECUTION_NOT_FOUND"
+                response.message = "execution not found"
+                return response
+            self._execution_store.request_stop_by_key(
+                request.caller_scope,
+                request.robot_id,
+                request.request_id,
+            )
+            response.accepted = True
+            response.state = "STOPPING"
+            response.message = "stop intent recorded before execution admission"
             return response
         record = self._execution_store.request_stop(record.execution_id)
         response.accepted = True
@@ -3659,7 +3699,11 @@ class SkillExecutorNode(Node):
                 remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
-            if goal.timeout_sec > remaining_budget and not isinstance(internal_admission, _ProgramChildAdmission):
+            workflow_owned = (
+                isinstance(internal_admission, _WorkflowChildAdmission)
+                and internal_admission.workflow.owner.kind == "workflow"
+            )
+            if goal.timeout_sec > remaining_budget and not workflow_owned:
                 return TIMEOUT_EXCEEDS_POLICY, None, None, False
             if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
@@ -5433,30 +5477,6 @@ class SkillExecutorNode(Node):
             except ValueError:
                 result = SkillCommand.Result()
                 return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", "task budget is invalid")
-            total_budget = (
-                self._task_budget_duration_sec(goal.dispatch_binding)
-                if coordinator is not None
-                else getattr(self._gateway_policy, "_task_budget_sec", 1.0)
-            )
-            if goal.timeout_sec > 0.0 and goal.timeout_sec > total_budget:
-                result = SkillCommand.Result()
-                return self._abort_skill(
-                    result,
-                    goal_handle,
-                    [],
-                    "TIMEOUT_EXCEEDS_POLICY",
-                    "skill timeout exceeds root task budget",
-                )
-            effective_timeout = goal.timeout_sec if goal.timeout_sec > 0.0 else self._default_skill_timeout_sec
-            if effective_timeout > total_budget:
-                result = SkillCommand.Result()
-                return self._abort_skill(
-                    result,
-                    goal_handle,
-                    [],
-                    "TIMEOUT_EXCEEDS_POLICY",
-                    "default skill timeout exceeds root task budget",
-                )
             admission = self._gateway_policy.admit(request, self._runtime_snapshot(), owner)
             prepared = admission.prepared_request
             audit_context = {
@@ -5800,14 +5820,6 @@ class SkillExecutorNode(Node):
                         [],
                         "SKILL_TASK_DEADLINE_EXPIRED",
                         "workflow task budget expired",
-                    )
-                elif goal_handle.request.timeout_sec > 0.0 and goal_handle.request.timeout_sec > remaining_budget:
-                    result = self._abort_skill(
-                        result,
-                        deferred_goal_handle,
-                        [],
-                        "SKILL_TASK_BUDGET_MISMATCH",
-                        "workflow step timeout exceeds remaining task budget",
                     )
                 else:
                     result = self._execute_skill_child(

@@ -52,6 +52,7 @@ class RosBridge:
         caller_scope: str = "robot_skill_cli",
         robot_id: str = "",
         caller_token: str = "",
+        caller_token_env: str = "",
     ) -> None:
         self._status_service = status_service
         self._snapshot_service = snapshot_service
@@ -73,7 +74,7 @@ class RosBridge:
         self._cancel_execution_service = cancel_execution_service
         self._caller_scope = caller_scope
         self._robot_id = robot_id
-        self._caller_token = caller_token
+        self._caller_token = caller_token or os.environ.get(caller_token_env, "")
         self._node = None
         self._executor = None
         self._spin_thread = None
