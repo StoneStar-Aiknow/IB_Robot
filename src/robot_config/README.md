@@ -4,6 +4,11 @@ ros2_control 和外设的统一机器人配置系统。
 
 ## 概述
 
+`robot.launch.py` 与 `teleop_operator.launch.py` 在 provider/输入设备前调用共享的
+`dds_environment` 本机检查；robot 的延迟消费者构建前再次检查。它只读实际启动环境与
+DDS 应用记录，明确错误时停止并给建议；不设置 DDS、不检查远端或业务 QoS。
+没有受管记录时保留原行为。范围和错误处理见 [DDS 配置工具](../../scripts/dds/README.md)。
+
 本软件包为机器人硬件提供统一的配置系统，桥接以下组件：
 
 - **ros2_control**：用于关节/电机控制接口

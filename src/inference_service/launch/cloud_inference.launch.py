@@ -1,9 +1,11 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+from robot_config.dds_environment import guard_launch_dds
 
 
 def generate_launch_description():
@@ -84,4 +86,4 @@ def generate_launch_description():
             }
         ],
     )
-    return LaunchDescription([*arguments, cloud_node, recording_node])
+    return LaunchDescription([*arguments, OpaqueFunction(function=guard_launch_dds), cloud_node, recording_node])

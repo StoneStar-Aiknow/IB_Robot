@@ -15,6 +15,11 @@ direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备
 
 ## 职责边界
 
+`embodied_pipeline.launch.py` 在旧 UDPv4 action 和应用配置构建前执行共享 DDS 本机检查。
+未受管环境保留原 UDPv4 设置；已知 Fast generated 配置使用自身 custom UDPv4，Cyclone
+不设置 Fast 专用变量。受管错误明确阻止启动，不覆盖用户配置；file 来源尚未开放。
+检查不代表对端通信通过，详见 [DDS 配置工具](../../scripts/dds/README.md)。
+
 本包负责：
 
 - 提供 `embodied_pipeline.launch.py` 公开入口。

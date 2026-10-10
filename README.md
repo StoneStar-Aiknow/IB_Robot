@@ -98,6 +98,12 @@ export ROS_DOMAIN_ID=42
 | 策略推理、遥操作、数据录制 | `robot_config robot.launch.py` | 加载应用 YAML、接入 Robot Runtime 并启动对应业务模块；不直接启动具身 Agent 技能节点 |
 | 边端协同的算力侧 | `inference_service cloud_inference.launch.py` | 加载命名 deployment，并与机器人侧 pipeline 通信 |
 
+源码工作区可通过 `dds-config set`（或 `set --tmp`）配置 Fast DDS / CycloneDDS；
+`dds-config unset` 可恢复当前终端的原始环境。`robot.launch.py`、`embodied_pipeline.launch.py`、
+`teleop_operator.launch.py` 和 `cloud_inference.launch.py` 会在启动节点前检查本机已受管的
+DDS 环境。此检查不证明跨机通信或 QoS 匹配。用法与适用范围见
+[DDS 配置工具](scripts/dds/README.md)。
+
 SO-101 默认配置使用 Robot Runtime，应用入口的 `use_sim:=true` 对应 SDK 模拟传输。独立运行时使用 `simulated:=true`；两者都不提供 Gazebo 物理场景。Ubuntu／openEuler 源码工作区使用以下入口；OpenHarmony 的构建、部署和启动方式见 [板端指南](README.OpenHarmony.md)。
 
 更详细的子模块说明可参考下表：

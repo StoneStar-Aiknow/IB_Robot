@@ -97,6 +97,7 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
+from robot_config.dds_environment import check_launch_dds
 from robot_config.inference_config import (
     InferenceConfigError,
     parse_inference_config,
@@ -410,6 +411,7 @@ def launch_setup(context, *args, loaded_config=None, extra_consumers=None, **kwa
     Returns:
         List of launch actions
     """
+    check_launch_dds(context)
     # ========== 1. Get and normalize launch parameters ==========
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
@@ -607,6 +609,7 @@ def launch_setup(context, *args, loaded_config=None, extra_consumers=None, **kwa
         robot_config.setdefault("runtime", {})["target"] = runtime_target.value
 
         def construct_consumers(effective):
+            check_launch_dds(context)
             actions = _construct_robot_nodes(context, effective, provider_started=True, **node_options)
             if extra_consumers is not None:
                 actions.extend(extra_consumers(effective))

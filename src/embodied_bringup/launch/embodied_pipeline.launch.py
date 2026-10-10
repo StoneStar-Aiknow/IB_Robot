@@ -15,9 +15,11 @@ from launch.actions import (
     SetEnvironmentVariable,
     SetLaunchConfiguration,
 )
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import (
@@ -25,6 +27,7 @@ from embodied_bringup.launch_builders.embodied import (
     generate_embodied_nodes,
     generate_resident_cli_bridge_action,
 )
+from robot_config.dds_environment import assess_dds_environment, check_launch_dds
 from robot_config.interface_binding import required_interface_ids
 from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
 from robot_config.logger_utils import get_colored_logger
@@ -113,6 +116,7 @@ def _load_config(robot_config_name: str, config_path_override: str, nav_stage: s
 
 
 def launch_setup(context, *_args, **_kwargs):
+    check_launch_dds(context)
     robot_config_name = context.launch_configurations.get("robot_config", "so101_single_arm")
     config_path_override = context.launch_configurations.get("config_path", "")
     control_mode_override = context.launch_configurations.get("control_mode", "")
@@ -325,6 +329,15 @@ def _construct_embodied_actions(config, active_control_mode, *, motion_authorize
     return actions
 
 
+def _dds_preflight(context):
+    # Strict admission before creating this launch's explicit Fast override.
+    # Later included robot actions use check_launch_dds with the scoped marker.
+    backend = assess_dds_environment(context.environment)
+    # This application explicitly used the Fast DDS UDPv4 workaround before
+    # dds-config. Preserve that launch-specific choice for Fast DDS only.
+    return [SetLaunchConfiguration("_ibrobot_embodied_fast_udp", "false" if backend == "cyclonedds" else "true")]
+
+
 def generate_launch_description():
     return LaunchDescription(
         [
@@ -334,7 +347,14 @@ def generate_launch_description():
             # endpoints are not discoverable.  Keep the launch deterministic by
             # using UDPv4 for the whole graph; all nodes inherit the same
             # transport and action services remain discoverable after restart.
-            SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+            OpaqueFunction(function=_dds_preflight),
+            # Standalone robot launch follows the DDS defaults. This embodied
+            # entry keeps its existing Fast DDS-only UDPv4 service workaround.
+            SetEnvironmentVariable(
+                "FASTDDS_BUILTIN_TRANSPORTS",
+                "UDPv4",
+                condition=IfCondition(LaunchConfiguration("_ibrobot_embodied_fast_udp")),
+            ),
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
             DeclareLaunchArgument("config_path", default_value=""),
             DeclareLaunchArgument("use_sim", default_value="false"),

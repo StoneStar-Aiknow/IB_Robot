@@ -33,6 +33,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 
+from robot_config.dds_environment import check_launch_dds
 from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
@@ -51,6 +52,7 @@ def _resolve_config_path(robot_config_name: str, config_path_override: str) -> P
 
 
 def launch_setup(context, *args, **kwargs):
+    check_launch_dds(context)
     robot_config_name = context.launch_configurations.get("robot_config", "")
     config_path_override = context.launch_configurations.get("config_path", "")
     config_path = _resolve_config_path(robot_config_name, config_path_override)
