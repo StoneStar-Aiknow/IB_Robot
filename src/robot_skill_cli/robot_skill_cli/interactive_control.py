@@ -748,6 +748,10 @@ class InteractiveController:
             }
         if self._submission_callback is not None:
             self._submission_callback({"task_id": task_id, "expected_step_count": len(steps), **registry})
+        handle = None
+        result_future = None
+        submitted = False
+        execution_id = ""
         try:
             future = self._bridge.send_program_goal(
                 request_id=self._pending.get("trace_id", task_id),
@@ -771,11 +775,11 @@ class InteractiveController:
             handle = future.result()
             if handle is None or not getattr(handle, "accepted", False):
                 return self._record_terminal(task_id, FAILED, "GOAL_REJECTED", "program goal was rejected")
+            submitted = True
             result_future = handle.get_result_async()
             with self._state_lock:
                 self._goal_handle = handle
                 self._result_future = result_future
-            execution_id = ""
             with contextlib.suppress(Exception):
                 execution = self._bridge.get_execution(
                     request_id=request_id,
@@ -816,6 +820,16 @@ class InteractiveController:
                 },
             )
         except Exception as exc:
+            if submitted:
+                return self._cancel_program_and_converge(
+                    handle,
+                    result_future,
+                    task_id,
+                    request_id=request_id,
+                    execution_id=execution_id,
+                )
+            if handle is not None:
+                return self._record_unknown(task_id, failure_detail=f"program state unavailable: {exc}")
             return self._record_terminal(task_id, FAILED, "PROGRAM_EXECUTION_FAILED", str(exc))
 
     def _cancel_program_and_converge(

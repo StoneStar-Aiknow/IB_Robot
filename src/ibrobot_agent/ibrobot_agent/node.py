@@ -184,6 +184,8 @@ class _RosExecutionAdapter:
                 return ExecutionResult(
                     "cancelled", presentation.task_ref, "SKILL_CANCELLED", "stopped after presentation", {}
                 )
+            goal_handle = None
+            result_future = None
             submission_callback(
                 presentation.task_ref,
                 {
@@ -246,8 +248,13 @@ class _RosExecutionAdapter:
                     str(result.message),
                     {"submitted": True, "execution_id": str(result.execution_id), "state": str(result.state)},
                 )
-            except Exception as exc:
-                return self._failed_result("CAPABILITY_NOT_READY", f"program execution failed: {exc}", presentation)
+            except Exception:
+                return self._cancel_program_and_converge(
+                    proposal.request.request_id,
+                    goal_handle,
+                    result_future,
+                    presentation,
+                )
         if stop_event.is_set():
             return ExecutionResult(
                 "cancelled", None, "SKILL_CANCELLED", "stopped before planning", {"submitted": False}
@@ -464,7 +471,12 @@ class _RosExecutionAdapter:
                         {"submitted": True, **execution},
                     )
             if result_future is not None and result_future.done():
-                result = result_future.result().result
+                try:
+                    result = result_future.result().result
+                except Exception:
+                    return self._unknown_result(
+                        "program result transport failed during cancel convergence", presentation
+                    )
                 status = "succeeded" if result.success else "failed"
                 if str(result.state) == "CANCELED":
                     status = "cancelled"

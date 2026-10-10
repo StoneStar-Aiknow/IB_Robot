@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import sqlite3
@@ -90,6 +91,10 @@ class SQLiteExecutionStore:
             raise RuntimeError("execution store already has an active writer") from None
         self._lock = threading.RLock()
         self._unknown_pending = True
+        # Event listener notification happens strictly after commit and outside
+        # the store lock, so a slow subscriber can never stall ledger writes.
+        self._event_listener = None
+        self._pending_event_ids: list[str] = []
         try:
             self._connection = sqlite3.connect(self._path, check_same_thread=False, timeout=5.0)
             self._connection.row_factory = sqlite3.Row
@@ -104,6 +109,18 @@ class SQLiteExecutionStore:
                 self._connection.close()
             self._writer_lock.close()
             raise
+
+    def set_event_listener(self, listener) -> None:
+        """Register ``listener(execution_ids)`` invoked after each committed event append."""
+        with self._lock:
+            self._event_listener = listener
+
+    def _take_committed_event_ids(self) -> tuple[list[str], object]:
+        ids, self._pending_event_ids = self._pending_event_ids, []
+        return list(dict.fromkeys(ids)), self._event_listener
+
+    def _discard_pending_event_ids(self) -> None:
+        self._pending_event_ids = []
 
     def close(self) -> None:
         with self._lock:
@@ -589,6 +606,7 @@ class SQLiteExecutionStore:
             "UPDATE executions SET last_event_sequence=?, updated_at=? WHERE execution_id=?",
             (sequence, created_at, execution_id),
         )
+        self._pending_event_ids.append(execution_id)
 
     def _get_in_transaction(self, connection: sqlite3.Connection, execution_id: str) -> ExecutionRecord:
         row = connection.execute("SELECT * FROM executions WHERE execution_id=?", (execution_id,)).fetchone()
@@ -621,13 +639,14 @@ class SQLiteExecutionStore:
         )
 
     def _transaction(self):
-        return _Transaction(self._connection, self._lock)
+        return _Transaction(self)
 
 
 class _Transaction:
-    def __init__(self, connection: sqlite3.Connection, lock: threading.RLock) -> None:
-        self._connection = connection
-        self._lock = lock
+    def __init__(self, store: SQLiteExecutionStore) -> None:
+        self._store = store
+        self._connection = store._connection
+        self._lock = store._lock
 
     def __enter__(self) -> sqlite3.Connection:
         self._lock.acquire()
@@ -635,13 +654,22 @@ class _Transaction:
         return self._connection
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        committed_ids: list[str] = []
+        listener = None
         try:
             if exc_type is None:
                 self._connection.commit()
+                committed_ids, listener = self._store._take_committed_event_ids()
             else:
                 self._connection.rollback()
+                self._store._discard_pending_event_ids()
         finally:
             self._lock.release()
+        if listener is not None and committed_ids:
+            # Delivery is best effort: the ledger stays authoritative and
+            # GetExecutionEvents replays anything a subscriber missed.
+            with contextlib.suppress(Exception):
+                listener(committed_ids)
 
 
 def _utc_now() -> str:

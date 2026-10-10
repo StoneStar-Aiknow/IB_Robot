@@ -169,6 +169,24 @@ class _ProgramExecutionBridge(_DirectExecutionBridge):
         return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": result})()))
 
 
+class _ProgramTransportFailureBridge(_ProgramExecutionBridge):
+    def __init__(self):
+        super().__init__()
+        self.cancel_calls = 0
+
+    def send_program_goal(self, **kwargs):
+        self.calls.append("program_submit")
+        return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": object()})()))
+
+    def get_execution(self, **kwargs):
+        self.calls.append("get_execution")
+        return {"state": "UNKNOWN", "error_code": "EXECUTION_RECOVERY_UNKNOWN", "message": "reconcile"}
+
+    def cancel_execution(self, **kwargs):
+        self.cancel_calls += 1
+        return {"accepted": True, "state": "STOPPING"}
+
+
 def _proposal():
     request = AgentRequest(
         schema_version=1,
@@ -255,6 +273,21 @@ def test_program_result_preserves_gateway_terminal_state(state, expected_status)
     )
 
     assert result.status == expected_status
+
+
+def test_program_transport_failure_after_submission_is_unknown_and_attempts_convergence():
+    bridge = _ProgramTransportFailureBridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "unknown"
+    assert bridge.cancel_calls == 1
+    assert "get_execution" in bridge.calls
 
 
 @pytest.mark.parametrize("stop_stage", ["get_status", "wait_for_execute_plan_server", "submission_callback"])

@@ -166,3 +166,42 @@ def test_second_writer_cannot_recover_a_live_gateway(tmp_path):
     recovered = SQLiteExecutionStore(path)
     assert recovered.get(execution_id=record.execution_id).state == "UNKNOWN"
     recovered.close()
+
+
+def test_event_listener_fires_after_commit_and_never_for_rolled_back_events(tmp_path):
+    store = SQLiteExecutionStore(tmp_path / "executions.sqlite3")
+    notified = []
+
+    def listener(execution_ids):
+        # Called outside the store lock: re-entrant reads must not deadlock.
+        for execution_id in execution_ids:
+            notified.append((execution_id, store.get(execution_id=execution_id).last_event_sequence))
+
+    store.set_event_listener(listener)
+    record, _ = store.begin(_program())
+    assert notified == [(record.execution_id, 1)]
+
+    store.mark_committing(record.execution_id)
+    store.finish(record.execution_id, state="SUCCEEDED", completed_step_count=1)
+    assert [sequence for _, sequence in notified] == [1, 2, 3]
+
+    # An event appended inside a transaction that rolls back must neither be
+    # persisted nor leak into the next committed notification.
+    notified.clear()
+    with pytest.raises(RuntimeError, match="abort"), store._transaction() as connection:
+        store._append_event_in_transaction(connection, record.execution_id, "ACTIVE", 1, "", "")
+        raise RuntimeError("abort")
+    assert notified == []
+    assert store.get(execution_id=record.execution_id).last_event_sequence == 3
+
+    second, _ = store.begin(_program(request_id="request-2"))
+    assert notified == [(second.execution_id, 1)]
+
+
+def test_failing_event_listener_cannot_break_the_ledger(tmp_path):
+    store = SQLiteExecutionStore(tmp_path / "executions.sqlite3")
+    store.set_event_listener(lambda _ids: (_ for _ in ()).throw(RuntimeError("publisher down")))
+    record, _ = store.begin(_program())
+    store.mark_committing(record.execution_id)
+    finished = store.finish(record.execution_id, state="SUCCEEDED", completed_step_count=1)
+    assert finished.state == "SUCCEEDED"

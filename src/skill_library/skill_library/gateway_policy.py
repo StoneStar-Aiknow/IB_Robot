@@ -17,6 +17,7 @@ from embodied_common.primitive_contracts import PRIMITIVE_DESCRIPTORS
 MOTION_NOT_AUTHORIZED = "MOTION_NOT_AUTHORIZED"
 CONTROL_MODE_MISMATCH = "CONTROL_MODE_MISMATCH"
 SKILL_BUSY = "SKILL_BUSY"
+EXECUTION_QUARANTINED = "EXECUTION_QUARANTINED"
 TIMEOUT_EXCEEDS_POLICY = "TIMEOUT_EXCEEDS_POLICY"
 CAPABILITY_NOT_READY = "CAPABILITY_NOT_READY"
 DUPLICATE_TASK_ID = "DUPLICATE_TASK_ID"
@@ -120,6 +121,7 @@ class RuntimeSnapshot:
     active_control_mode: str
     required_control_mode: str
     busy: bool = False
+    unresolved_unknown: bool = False
     active_task_id: str = ""
     validate_ready: bool = False
     task_executor_ready: bool = False
@@ -686,6 +688,13 @@ class GatewayPolicy:
                 message="operator authorization is disabled",
                 **decision_args,
             )
+        if snapshot.unresolved_unknown:
+            return GatewayDecision(
+                admitted=False,
+                error_code=EXECUTION_QUARANTINED,
+                message="an earlier execution has unresolved physical effects",
+                **decision_args,
+            )
         if (
             not snapshot.control_mode_switching_enabled
             and snapshot.active_control_mode != snapshot.required_control_mode
@@ -827,6 +836,8 @@ class GatewayPolicy:
         with self._transition_lock:
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
+            if snapshot.unresolved_unknown:
+                return EXECUTION_QUARANTINED, None
             if (
                 not snapshot.control_mode_switching_enabled
                 and snapshot.active_control_mode != snapshot.required_control_mode
@@ -878,6 +889,8 @@ class GatewayPolicy:
                 return SKILL_REJECTED, None
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
+            if snapshot.unresolved_unknown:
+                return EXECUTION_QUARANTINED, None
             if (
                 not snapshot.control_mode_switching_enabled
                 and snapshot.active_control_mode != snapshot.required_control_mode

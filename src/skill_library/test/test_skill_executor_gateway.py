@@ -20,6 +20,7 @@ from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, PRIMITIVE
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
 from ibrobot_msgs.action import ExecuteNavigation, ExecuteProgram, ExecuteTaskPlan, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.msg import ExecutionEvent
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
     CancelExecution,
@@ -716,6 +717,125 @@ def test_program_cancel_execution_between_steps_uses_durable_terminal(gateway_ri
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_second_step_failure_projects_first_step_completion(gateway_rig, monkeypatch):
+    original_child = gateway_rig.executor_node._execute_program_child
+    calls = 0
+
+    def child(goal, root_handle, execution_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            failed = SkillCommand.Result()
+            failed.success = False
+            failed.error_code = "SKILL_REJECTED"
+            failed.message = "second step rejected"
+            return failed
+        return original_child(goal, root_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    goal = _program_goal(
+        gateway_rig,
+        request_id="second-step-failure-projection",
+        task_budget_sec=5.0,
+        steps=[workflow_step(skill_name="move", timeout_sec=1.0), workflow_step(skill_name="move", timeout_sec=1.0)],
+    )
+    result = _send_program(gateway_rig, goal)
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert result.completed_step_count == 1
+    assert result.actual_registry_generation > 0
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = goal.caller_scope
+    query.robot_id = goal.robot_id
+    query.request_id = goal.request_id
+    query.execution_id = result.execution_id
+    response = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert response.completed_step_count == result.completed_step_count
+    assert response.actual_registry_generation == result.actual_registry_generation
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_unresolved_unknown_quarantines_every_root_entry_until_reconciled(gateway_rig):
+    from embodied_common.program_contracts import canonicalize_program
+
+    store = gateway_rig.executor_node._execution_store
+    status = _get_status(gateway_rig)
+    unknown_program = canonicalize_program(
+        schema_version=1,
+        request_id="earlier-unknown",
+        caller_scope="robot_skill_cli",
+        robot_id=gateway_rig.overrides["robot_name"],
+        expected_registry_epoch=status.registry_epoch,
+        expected_registry_generation=status.registry_generation,
+        expected_registry_digest=status.registry_digest,
+        workflow_steps=[workflow_step(skill_name="move", timeout_sec=1.0)],
+        task_budget_sec=2.0,
+    )
+    record, _ = store.begin(unknown_program)
+    store.mark_committing(record.execution_id)
+    store.finish(
+        record.execution_id,
+        state="UNKNOWN",
+        completed_step_count=0,
+        error_code="SKILL_CANCEL_TIMEOUT",
+        message="downstream cleanup was not confirmed",
+    )
+    downstream_before = len(gateway_rig.downstream_goals)
+
+    # Legacy Agent Plan workflow root.
+    began = _begin_single_step_workflow(gateway_rig, "quarantined-workflow", expect_success=False)
+    assert began.success is False
+    assert began.error_code == "EXECUTION_QUARANTINED"
+    # Direct SkillCommand root.
+    assert _send_skill(gateway_rig, task_id="quarantined-skill").error_code == "EXECUTION_QUARANTINED"
+    # External PrimitiveCommand root.
+    primitive_handle = _future_result(
+        gateway_rig.primitive_client.send_goal_async(_primitive_goal("quarantined-primitive", gateway_rig))
+    )
+    primitive_result = _future_result(primitive_handle.get_result_async()).result
+    assert primitive_result.error_code == "EXECUTION_QUARANTINED"
+    # New Program root.
+    program_result = _send_program(gateway_rig, _program_goal(gateway_rig, request_id="quarantined-program"))
+    assert program_result.success is False
+    assert program_result.error_code == "EXECUTION_QUARANTINED"
+    # No quarantined request may reach the downstream controller.
+    assert len(gateway_rig.downstream_goals) == downstream_before
+
+    # Offline reconciliation is the only release path.
+    store.resolve_unknown(record.execution_id, operator_scope="operator", evidence="arm verified at home")
+    assert _send_skill(gateway_rig, task_id="after-reconciliation").success is True
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_ledger_events_are_published_in_sequence(gateway_rig):
+    received = []
+    subscription = gateway_rig.client_node.create_subscription(
+        ExecutionEvent, gateway_rig.names["events"], received.append, 100
+    )
+    try:
+        _wait_for(lambda: gateway_rig.executor_node._execution_event_publisher.get_subscription_count() > 0)
+        goal = _program_goal(gateway_rig, request_id="event-stream")
+        result = _send_program(gateway_rig, goal)
+        assert result.success is True
+        record = gateway_rig.executor_node._execution_store.get(execution_id=result.execution_id)
+        _wait_for(
+            lambda: any(
+                event.execution_id == result.execution_id and event.sequence == record.last_event_sequence
+                for event in received
+            )
+        )
+        sequences = [event.sequence for event in received if event.execution_id == result.execution_id]
+        assert sequences == list(range(1, record.last_event_sequence + 1))
+        terminal = [event for event in received if event.execution_id == result.execution_id][-1]
+        assert terminal.state == "SUCCEEDED"
+        assert terminal.request_id == goal.request_id
+        assert terminal.canonical_steps[0].skill_name == "move"
+    finally:
+        gateway_rig.client_node.destroy_subscription(subscription)
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
 def test_program_gateway_preserves_distinct_child_step_identity(gateway_rig, monkeypatch):
     captured = []
     original_child_executor = gateway_rig.executor_node._execute_program_child
@@ -1119,7 +1239,7 @@ def test_direct_navigation_rejects_hidden_coordinate_value(gateway_rig):
     assert gateway_rig.navigation_goals == []
 
 
-def _begin_single_step_workflow(rig, root_task_id: str):
+def _begin_single_step_workflow(rig, root_task_id: str, *, expect_success: bool = True):
     status = _get_status(rig)
     binding = new_binding(task_id=root_task_id)
     binding.expected_registry_epoch = status.registry_epoch
@@ -1145,6 +1265,8 @@ def _begin_single_step_workflow(rig, root_task_id: str):
     request.dispatch_binding = binding
     request.workflow_steps = steps
     began = _future_result(rig.begin_workflow_client.call_async(request))
+    if not expect_success:
+        return began
     assert began.success is True
     return binding, began
 

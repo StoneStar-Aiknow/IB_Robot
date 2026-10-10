@@ -104,6 +104,7 @@ from skill_library.execution_store import (
     SQLiteExecutionStore,
 )
 from skill_library.gateway_policy import (
+    EXECUTION_QUARANTINED,
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
     TIMEOUT_EXCEEDS_POLICY,
@@ -582,6 +583,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("get_execution_service", "/embodied/get_execution")
         self.declare_parameter("get_execution_events_service", "/embodied/get_execution_events")
         self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
+        self.declare_parameter("execution_event_topic", "/embodied/execution_events")
         self.declare_parameter("execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3"))
         self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
         self.declare_parameter("execution_caller_tokens_json", "{}")
@@ -931,6 +933,21 @@ class SkillExecutorNode(Node):
             if self.has_parameter("execution_store_path")
             else str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
         )
+        self._execution_event_publisher = self.create_publisher(
+            ExecutionEvent,
+            str(self.get_parameter("execution_event_topic").value)
+            if self.has_parameter("execution_event_topic")
+            else "/embodied/execution_events",
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=100,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            ),
+        )
+        self._event_publish_lock = threading.Lock()
+        self._published_event_sequence: dict[str, int] = {}
+        self._execution_store.set_event_listener(self._publish_execution_events)
         self._program_server = ActionServer(
             self,
             ExecuteProgram,
@@ -1349,6 +1366,11 @@ class SkillExecutorNode(Node):
                         if cleanup_pending
                         else ("CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED")
                     )
+                    result.completed_step_count = completed
+                    result.actual_registry_epoch = bundle.registry_epoch
+                    result.actual_registry_generation = bundle.generation
+                    result.actual_registry_digest = bundle.snapshot.registry_digest
+                    result.workflow_digest = record.workflow_digest or program.program_digest
                     goal_handle.abort()
                     if not cleanup_pending:
                         self._finalize_program_admission(program_child_admission, program_owner)
@@ -1379,7 +1401,7 @@ class SkillExecutorNode(Node):
             elif isinstance(exc, ExecutionBusyError):
                 result.error_code = SKILL_BUSY
             elif isinstance(exc, ExecutionQuarantinedError):
-                result.error_code = "EXECUTION_QUARANTINED"
+                result.error_code = EXECUTION_QUARANTINED
             elif isinstance(exc, ValueError):
                 result.error_code = "SKILL_SCHEMA_INVALID"
             else:
@@ -1492,27 +1514,53 @@ class SkillExecutorNode(Node):
             record.execution_id, sequence=int(request.after_sequence), limit=max(1, min(int(request.limit or 100), 100))
         )
         canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
-        response.events = [
-            ExecutionEvent(
-                schema_version=1,
-                execution_id=record.execution_id,
-                request_id=record.request_id,
-                caller_scope=record.caller_scope,
-                robot_id=record.robot_id,
-                sequence=event.sequence,
-                state=event.state,
-                program_digest=record.program_digest,
-                canonical_steps=canonical_steps,
-                completed_step_count=event.completed_step_count,
-                error_code=event.error_code,
-                message=event.message,
-                created_at=_time_message(event.created_at),
-            )
-            for event in events
-        ]
+        response.events = [self._execution_event_message(record, event, canonical_steps) for event in events]
         response.last_event_sequence = record.last_event_sequence
         response.has_more = len(events) >= max(1, min(int(request.limit or 100), 100))
         return response
+
+    @staticmethod
+    def _execution_event_message(record, event, canonical_steps):
+        return ExecutionEvent(
+            schema_version=1,
+            execution_id=record.execution_id,
+            request_id=record.request_id,
+            caller_scope=record.caller_scope,
+            robot_id=record.robot_id,
+            sequence=event.sequence,
+            state=event.state,
+            program_digest=record.program_digest,
+            canonical_steps=canonical_steps,
+            completed_step_count=event.completed_step_count,
+            error_code=event.error_code,
+            message=event.message,
+            created_at=_time_message(event.created_at),
+        )
+
+    def _publish_execution_events(self, execution_ids) -> None:
+        """Publish committed ledger events in sequence order, exactly once per process."""
+        publisher = getattr(self, "_execution_event_publisher", None)
+        store = getattr(self, "_execution_store", None)
+        if publisher is None or store is None:
+            return
+        with self._event_publish_lock:
+            for execution_id in execution_ids:
+                record = store.get(execution_id=execution_id)
+                if record is None:
+                    continue
+                canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
+                published = self._published_event_sequence.get(execution_id, 0)
+                while True:
+                    events = store.events_after(execution_id, sequence=published, limit=100)
+                    for event in events:
+                        publisher.publish(self._execution_event_message(record, event, canonical_steps))
+                        published = event.sequence
+                    if len(events) < 100:
+                        break
+                self._published_event_sequence.pop(execution_id, None)
+                self._published_event_sequence[execution_id] = published
+                while len(self._published_event_sequence) > 1024:
+                    self._published_event_sequence.pop(next(iter(self._published_event_sequence)))
 
     def _cancel_execution(self, request, response):
         if not self._execution_auth_ok(request):
@@ -2300,6 +2348,9 @@ class SkillExecutorNode(Node):
                     and bool(getattr(self, "_supported_control_modes", ()))
                     and bool(getattr(self, "_motion_mode_service", ""))
                 )
+            ),
+            unresolved_unknown=bool(
+                getattr(getattr(self, "_execution_store", None), "has_unresolved_unknown", lambda: False)()
             ),
         )
 

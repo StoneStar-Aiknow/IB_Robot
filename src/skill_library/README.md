@@ -46,6 +46,16 @@ Program root execution 的查询和取消入口为：
 的唯一权威 root 状态由 ExecutionStore 保存，失败、取消、重启恢复必须收敛为终态或
 明确的 `UNKNOWN`，不能只更新内存中的 legacy workflow 状态。
 
+每次账本事件提交后，Gateway 按 sequence 顺序在 `/embodied/execution_events`
+（`embodied.execution_event_topic`，RELIABLE / VOLATILE，depth 100）发布
+`ExecutionEvent`。topic 只是低延迟投影，投递失败不影响账本；订阅方应按
+`(execution_id, sequence)` 去重，并在启动或发现序号空洞时用
+`/embodied/get_execution_events` 从最后序号补齐。
+
+未对账的 `UNKNOWN` 执行会隔离所有新的 root 准入：`ExecuteProgram`、legacy
+`BeginWorkflowExecution`、直接 `SkillCommand` 与外部 `PrimitiveCommand` 均返回
+`EXECUTION_QUARANTINED`，直到运维在停机状态下用 `execution_maintenance` 记录对账证据。
+
 Program execution, query, event, and cancel requests share the same caller
 authentication contract. `execution_caller_scopes` is injected by the
 `embodied` launch builder from `robot_config`; agent mode includes
