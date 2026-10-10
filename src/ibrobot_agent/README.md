@@ -30,7 +30,7 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
          -> ExecutionStore（幂等、事件、终态、取消）
          -> Safety Guard -> Skill Executor
   <- /agent/response（同步应答） /agent/event（有序事件）
-   -> /agent/control（request 粒度 stop / exact plan 展示完成回执）
+   -> /agent/control（request 粒度 stop / 旧 Agent Plan 的 exact plan 展示完成回执）
 ```
 
 ## 请求状态机
@@ -107,7 +107,27 @@ ibrobot_agent
 `so101_agent_manual`（真机手动无运动）、`so101_single_arm_agent_test`（rule Planner 测试）、
 `so101_single_arm_agent_gazebo`（Gazebo 执行）、`so101_single_arm_agent_hardware*`（真机执行/停止）。
 
-## 展示完成协议
+## 展示协议
+
+### typed Program：直接执行、异步展示（生产默认）
+
+Agent 通过 `/embodied/execute_program` 提交的 typed Program 使用
+`execution_mode=direct_execute_async_presentation`：**机器人可能先运动，界面随后显示**。
+无客户端、展示输出失败、事件发布慢或展示事件被丢弃，均不阻止合法 Program 提交，也不改变 Gateway 终态。
+
+- 发送前仍同步持久化：先 `bind_task`（task/proposal 关联），再写入 submission intent（`may_have_submitted`），
+  发送前再检查 stop。关键持久化失败时零下发；可能已提交时按 ledger 保守进入 UNKNOWN。
+- `presentation` 事件 `detail` 带 `async_display: true` 与空 `receipt_token`，不再产生 `presentation_rendered`。
+  TUI 校验身份与 digest 后只显示，不发送回执；带空 token 的回执为 no-op，既不解锁也不停止执行。
+- `/agent/event` 由有界后台线程发布。队列满时优先淘汰展示等普通事件；terminal、stop、quarantine 等关键通知
+  只在超过硬上限时丢弃。所有事件先写入 Agent ledger，物理执行事实以 Gateway 账本为准。
+- TUI 渲染异步展示失败只告警，不会被当作 stop；人工 `/stop`、停止词与 Ctrl-C 语义不变。
+- 迟到或重复事件不会让已终态请求重新显示为活动状态。
+
+由于不再等待展示，“先看计划再动”的保证随之取消。真机需要预先审批时，应在发请求前通过 dry-run
+（`execution_enabled=false`）或人工核对完成，不能依赖执行中的展示拦截错误计划。
+
+### 旧 Agent Plan：展示完成回执（兼容）
 
 `immediate_after_presentation` 仍要求完整 exact plan 展示并 flush 后才 technical confirm。
 `presentation` 事件的 `detail` 包含完整 `presentation`（task/plan/registry tuple、有序步骤、预算和摘要）、
@@ -119,8 +139,9 @@ canonical `presentation_digest` 与一次性 `receipt_token`。TUI 在自己的�
 ```
 
 服务端仅接受当前待展示计划的精确身份、摘要、token 和有效期；回执不代表用户二次批准，不授予运动权限。
-`embodied.agent.presentation_timeout_sec` 默认 30 秒，必须为有限正数；无客户端、输出失败、事件传输失败、
-超时、错误回执或停止请求均不能进入 confirm/goal 发送。旧的只订阅事件而不返回展示回执的客户端必须升级。
+`embodied.agent.presentation_timeout_sec` 默认 30 秒，必须为有限正数，仅作用于该兼容路径；无客户端、输出失败、
+事件传输失败、超时、错误回执或停止请求均不能进入 confirm/goal 发送。除 typed Program 模式外的任何
+`execution_mode` 都按此路径 fail closed。
 `/agent/control` 是受信本地客户端边界，回执是协议证据而非对任意恶意 ROS peer 的认证。
 
 ## 已知限制

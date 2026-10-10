@@ -47,6 +47,8 @@ class ChatState:
     known_request_ids: set[str] = field(default_factory=set)
     connected: bool = False
     identity_warned: bool = False
+    request_sequences: dict[str, set[int]] = field(default_factory=dict)
+    terminal_requests: set[str] = field(default_factory=set)
 
     def register(self, request_id: str) -> None:
         self.last_request_id = request_id
@@ -55,6 +57,24 @@ class ChatState:
 
     def finish(self, request_id: str) -> None:
         self.active_request_ids.discard(request_id)
+        self.terminal_requests.add(request_id)
+
+    def accept_event(self, request_id: str, sequence: object, state: object) -> bool:
+        """Drop duplicate or late events so a terminal request never looks active again.
+
+        Async display allows a presentation (or other non-terminal event) to
+        arrive after the terminal event of the same request.  Only exact
+        sequence repeats are dropped: an out-of-order terminal event must still
+        finish the request even if a higher non-terminal sequence arrived first.
+        """
+        if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
+            seen = self.request_sequences.setdefault(request_id, set())
+            if sequence in seen:
+                return False
+            seen.add(sequence)
+        if state in TERMINAL_STATES:
+            return True
+        return request_id not in self.terminal_requests
 
     def stop_target(self) -> str:
         if self.last_request_id in self.active_request_ids:
@@ -203,6 +223,8 @@ class AgentChatNode(Node):
                 )
             return
         request_id = str(key.get("request_id", ""))
+        if not self.state.accept_event(request_id, payload.get("sequence"), payload.get("state")):
+            return
         if payload.get("state") in TERMINAL_STATES:
             self.state.finish(request_id)
         self._output.put(("event", payload))
@@ -229,9 +251,30 @@ def _render_output_item(node: AgentChatNode, kind: str, payload: dict[str, Any],
     if kind == "event" and not _event_matches_session(payload, node.state):
         return
     _print_output(kind, payload, writer=writer)
-    if kind == "event" and payload.get("event_type") == "presentation":
-        # The writer must return only after the complete plan has been flushed.
+    if kind == "event" and payload.get("event_type") == "presentation" and not _is_async_presentation(payload):
+        # Legacy receipt gate: acknowledge only after the full plan was flushed.
+        # Async display needs no receipt; the robot may already be executing.
         node.acknowledge_presentation(payload)
+
+
+def _is_async_presentation(payload: dict[str, Any]) -> bool:
+    detail = payload.get("detail")
+    return isinstance(detail, dict) and detail.get("async_display") is True
+
+
+def _handle_render_failure(node: AgentChatNode, kind: str, payload: dict[str, Any]) -> bool:
+    """Decide whether a local rendering failure must stop the request.
+
+    Only a legacy receipt-gated presentation stops: execution has not started
+    and the exact plan was not shown.  An async presentation or ordinary
+    output failure is a display fault only; the robot may already be moving,
+    so it must not be turned into an implicit stop.  Explicit /stop is
+    unaffected.
+    """
+    if kind == "event" and payload.get("event_type") == "presentation" and not _is_async_presentation(payload):
+        node.stop()
+        return True
+    return False
 
 
 def _write_terminal_line(line: str) -> None:
@@ -353,9 +396,10 @@ def run_chat(
                         async with in_terminal():
                             _render_output_item(node, kind, payload, writer=write_and_flush)
                     except Exception as exc:
-                        node.stop()
+                        stopped = _handle_render_failure(node, kind, payload)
                         async with in_terminal():
-                            write_and_flush(f"presentation/output failed: {type(exc).__name__}")
+                            suffix = "; stop requested" if stopped else "; execution unaffected"
+                            write_and_flush(f"presentation/output failed: {type(exc).__name__}{suffix}")
 
             renderer = asyncio.create_task(render_output())
             try:

@@ -19,6 +19,12 @@ from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_
 MAX_REQUEST_TEXT_LENGTH = 4096
 MAX_REQUEST_JSON_BYTES = 64 * 1024
 
+# Presentation.execution_mode set by the trusted execution adapter for typed
+# Programs: the robot may execute before any client renders the plan.
+ASYNC_PRESENTATION_MODE = "direct_execute_async_presentation"
+# Legacy Agent Plan mode: execution waits for an exact-plan display receipt.
+GATED_PRESENTATION_MODE = "immediate_after_presentation"
+
 QueryKind = Literal["status", "list_skills", "describe_skill", "list_poses"]
 PlanKind = Literal[1, 2]
 PlannerOutcomeKind = Literal["conversation", "read_only", "needs_clarification", "rejected", "workflow"]
@@ -767,6 +773,8 @@ def request_hash_text(request: AgentRequest) -> str:
 
 
 __all__ = [
+    "ASYNC_PRESENTATION_MODE",
+    "GATED_PRESENTATION_MODE",
     "AdmissionResult",
     "AgentEvent",
     "AgentRequest",

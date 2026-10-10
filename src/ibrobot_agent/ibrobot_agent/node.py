@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,8 +28,12 @@ from embodied_common.agent_terminal_contract import classify_agent_terminal, sta
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
 from ibrobot_agent.contracts import (
+    ASYNC_PRESENTATION_MODE,
+    GATED_PRESENTATION_MODE,
     MAX_REQUEST_JSON_BYTES,
+    TERMINAL_REQUEST_STATES,
     AgentRequest,
     EventSink,
     ExecutionResult,
@@ -47,15 +52,82 @@ _trace = create_trace_logger("ib_trace.agent")
 
 
 class _RosEventSink(EventSink):
-    def __init__(self, publisher) -> None:
+    """Publish Agent events on a bounded background worker.
+
+    ``publish`` never waits for the ROS publisher, so a slow subscriber or a
+    blocked transport cannot stall execution, terminal persistence, or the
+    next request.  The ledger already holds every event before it reaches this
+    sink.  On overflow, ordinary events (presentation, progress) are evicted
+    first; terminal, stop and quarantine notifications are only dropped beyond
+    a hard ceiling and remain queryable from the ledger and Gateway.
+    """
+
+    _CRITICAL_EVENT_TYPES = frozenset({"terminal", "stop_requested", "quarantined", "cancelled", "failed"})
+
+    def __init__(self, publisher, *, capacity: int = 128, drain_timeout_sec: float = 1.0) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("event sink capacity must be a positive integer")
         self._publisher = publisher
-        self._lock = threading.Lock()
+        self._capacity = capacity
+        self._hard_capacity = capacity * 2
+        self._drain_timeout_sec = drain_timeout_sec
+        self._queue: deque = deque()
+        self._condition = threading.Condition()
+        self._closed = False
+        self.dropped = 0
+        self._worker = threading.Thread(target=self._run, name="agent-events", daemon=True)
+        self._worker.start()
+
+    @classmethod
+    def _is_critical(cls, event) -> bool:
+        return getattr(event, "event_type", "") in cls._CRITICAL_EVENT_TYPES or (
+            getattr(event, "state", "") in TERMINAL_REQUEST_STATES
+        )
 
     def publish(self, event) -> None:
-        message = String()
-        message.data = json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True)
-        with self._lock:
-            self._publisher.publish(message)
+        with self._condition:
+            if self._closed:
+                self.dropped += 1
+                return
+            if len(self._queue) >= self._capacity:
+                evicted = next((item for item in self._queue if not self._is_critical(item)), None)
+                if evicted is not None:
+                    self._queue.remove(evicted)
+                    self.dropped += 1
+                elif not self._is_critical(event) or len(self._queue) >= self._hard_capacity:
+                    self.dropped += 1
+                    _trace.warning("agent event queue full; dropping %s", getattr(event, "event_type", "event"))
+                    return
+            self._queue.append(event)
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._queue and not self._closed:
+                    self._condition.wait()
+                if not self._queue:
+                    return
+                event = self._queue.popleft()
+            try:
+                message = String()
+                message.data = json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True)
+                self._publisher.publish(message)
+            except Exception:
+                # The ledger and Gateway retain the truth for replay.
+                self.dropped += 1
+
+    def close(self) -> None:
+        """Stop accepting events, drain within a bound, and stop the worker."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._worker.join(timeout=self._drain_timeout_sec)
+        if self._worker.is_alive():
+            with self._condition:
+                self.dropped += len(self._queue)
+                self._queue.clear()
+            self._worker.join(timeout=self._drain_timeout_sec)
 
 
 class _UnavailableCatalog:
@@ -173,7 +245,9 @@ class _RosExecutionAdapter:
                     "plan_digest": program.program_digest,
                     "plan_kind": 1 if len(steps) == 1 else 2,
                     "steps": steps,
-                    "execution_mode": "immediate_after_presentation",
+                    # Typed Programs execute directly; display is async and
+                    # never a precondition for the Gateway submission.
+                    "execution_mode": ASYNC_PRESENTATION_MODE,
                     "proposed_task_budget_sec": self._task_budget_sec,
                     "summary": proposal.outcome.summary,
                 },
@@ -189,7 +263,7 @@ class _RosExecutionAdapter:
             submission_callback(
                 presentation.task_ref,
                 {
-                    "confirmed": True,
+                    "submission_mode": ASYNC_PRESENTATION_MODE,
                     "task_id": task_id,
                     "expected_step_count": len(steps),
                     "registry_epoch": expected_identity[0],
@@ -197,6 +271,15 @@ class _RosExecutionAdapter:
                     "registry_digest": expected_identity[2],
                 },
             )
+            if stop_event.is_set():
+                # The submission intent is durable, but no goal was sent.
+                return ExecutionResult(
+                    "cancelled",
+                    presentation.task_ref,
+                    "SKILL_CANCELLED",
+                    "stopped before goal submission",
+                    {"submitted": False},
+                )
             try:
                 goal_future = self._bridge.send_program_goal(
                     request_id=proposal.request.request_id,
@@ -269,7 +352,7 @@ class _RosExecutionAdapter:
                 raw_command=proposal.request.text,
                 workflow_steps=[step.to_dict() for step in proposal.outcome.steps],
                 timeout_sec=self._rpc_timeout_sec,
-                execution_mode="immediate_after_presentation",
+                execution_mode=GATED_PRESENTATION_MODE,
                 trace_id=proposal.request.request_id,
             )
         except Exception as exc:
@@ -302,7 +385,7 @@ class _RosExecutionAdapter:
                 "plan_digest": plan["plan_digest"],
                 "plan_kind": int(plan.get("plan_kind", 0)),
                 "steps": [step.to_dict() for step in planned_steps],
-                "execution_mode": "immediate_after_presentation",
+                "execution_mode": GATED_PRESENTATION_MODE,
                 "proposed_task_budget_sec": self._task_budget_sec,
                 "summary": proposal.outcome.summary,
             },
@@ -335,7 +418,7 @@ class _RosExecutionAdapter:
                 status=status,
                 task_budget_sec=task_budget_sec,
                 timeout_sec=self._rpc_timeout_sec,
-                execution_mode="immediate_after_presentation",
+                execution_mode=GATED_PRESENTATION_MODE,
             )
         except Exception:
             return self._unknown_result("confirmation response was unavailable", presentation)
@@ -573,7 +656,7 @@ def _presentation_from_mapping(value: dict, proposal) -> Presentation:
         task_ref=task_ref,
         plan_kind=int(value["plan_kind"]),
         steps=steps,
-        execution_mode=str(value.get("execution_mode", "immediate_after_presentation")),
+        execution_mode=str(value.get("execution_mode", GATED_PRESENTATION_MODE)),
         proposed_task_budget_sec=float(value["proposed_task_budget_sec"]),
         summary=str(value.get("summary") or "；".join(step.skill_name for step in steps)),
     )
@@ -660,6 +743,12 @@ class IncubationAgentNode(Node):
         )
         self._store = SQLiteRequestStore(ledger_path)
         self._presentation_gate = PresentationGate(float(self.get_parameter("presentation_timeout_sec").value))
+        # Typed Programs display asynchronously; legacy Agent Plans keep the gate.
+        self._presentation_port = ModeRoutingPresentationPort(
+            async_port=AsyncPresentationPort(),
+            legacy_port=self._presentation_gate,
+        )
+        self._event_sink = _RosEventSink(event_publisher, capacity=event_queue_size)
         self._bridge = None
         catalog = catalog_port or _UnavailableCatalog()
         execution = execution_port
@@ -730,8 +819,8 @@ class IncubationAgentNode(Node):
             catalog=catalog,
             store=self._store,
             execution=execution,
-            presentation=self._presentation_gate,
-            event_sink=_RosEventSink(event_publisher),
+            presentation=self._presentation_port,
+            event_sink=self._event_sink,
             execution_enabled=bool(self.get_parameter("execution_enabled").value),
             allowed_skills=allowed_skills,
             conversation=SQLiteConversationStore(
@@ -815,6 +904,13 @@ class IncubationAgentNode(Node):
             if payload["operation"] == "presentation_rendered":
                 if payload.get("request_key") != key.to_dict():
                     raise ValueError("presentation receipt identity does not match this Agent")
+                if payload.get("receipt_token", "") == "":
+                    # Async display issues no token: a receipt neither unlocks
+                    # nor cancels execution and does not prove rendering.
+                    self._publish_response(
+                        {"request_id": key.request_id, "presentation_received": False, "async_display": True}
+                    )
+                    return
                 accepted = self._presentation_gate.acknowledge(
                     key,
                     digest=payload["presentation_digest"],
@@ -884,9 +980,16 @@ class IncubationAgentNode(Node):
             self._gateway_ready = False
 
     def close(self) -> None:
+        # Stop producers first, then drain the event worker while the ROS
+        # publisher still exists.  The sink only holds prebuilt events, so it
+        # never touches the request store after the service has closed it.
         try:
             try:
-                self._service.close()
+                try:
+                    self._service.close()
+                finally:
+                    self._presentation_port.close()
+                    self._event_sink.close()
             finally:
                 if self._bridge is not None:
                     self._bridge.close()

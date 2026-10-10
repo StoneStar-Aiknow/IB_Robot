@@ -8,7 +8,14 @@ from datetime import datetime, timezone
 import pytest
 
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
-from ibrobot_agent.contracts import AgentRequest, ExecutionResult, PlannerIdentity, PlannerOutcome
+from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
+from ibrobot_agent.contracts import (
+    ASYNC_PRESENTATION_MODE,
+    AgentRequest,
+    ExecutionResult,
+    PlannerIdentity,
+    PlannerOutcome,
+)
 from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.planner import RulePlanner
 from ibrobot_agent.presentation import PresentationGate
@@ -103,8 +110,9 @@ class FailingFinishStore(SQLiteRequestStore):
 
 
 class FakeExecution:
-    def __init__(self, *, status="succeeded"):
+    def __init__(self, *, status="succeeded", execution_mode="immediate_after_presentation"):
         self.status = status
+        self.execution_mode = execution_mode
         self.calls = 0
         self.stop_calls = 0
         self.submitted = 0
@@ -127,7 +135,7 @@ class FakeExecution:
                 task_ref=task_ref,
                 plan_kind=1,
                 steps=proposal.outcome.steps,
-                execution_mode="immediate_after_presentation",
+                execution_mode=self.execution_mode,
                 proposed_task_budget_sec=90.0,
                 summary=proposal.outcome.summary,
             )
@@ -672,6 +680,117 @@ def test_no_display_receipt_or_failed_transport_prevents_submission(tmp_path, br
         while time.monotonic() < deadline and service.get_request(req.to_key()).state != "FAILED":
             time.sleep(0.01)
         record = service.get_request(req.to_key())
+        assert record.state == "FAILED"
+        assert not record.may_have_submitted
+        assert execution.submitted == 0
+    finally:
+        service.close()
+
+
+def _async_service(tmp_path, events, *, store=None, execution=None):
+    execution = execution or FakeExecution(execution_mode=ASYNC_PRESENTATION_MODE)
+    service = AgentService(
+        planner=RulePlanner(),
+        catalog=FakeCatalog(),
+        store=store or SQLiteRequestStore(tmp_path / "requests.sqlite3"),
+        execution=execution,
+        presentation=ModeRoutingPresentationPort(
+            async_port=AsyncPresentationPort(), legacy_port=PresentationGate(0.05)
+        ),
+        event_sink=events,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    return service, execution
+
+
+def _wait_state(service, key, states, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and service.get_request(key).state not in states:
+        time.sleep(0.01)
+    return service.get_request(key)
+
+
+@pytest.mark.parametrize("broken_transport", [False, True])
+def test_async_program_executes_without_receipt_or_working_display(tmp_path, broken_transport):
+    events = FailingEvents() if broken_transport else Events()
+    service, execution = _async_service(tmp_path, events)
+    req = _request(text="请挥手")
+    try:
+        assert service.send_message(req).accepted
+        record = _wait_state(service, req.to_key(), {"SUCCEEDED", "FAILED", "UNKNOWN"})
+        assert record.state == "SUCCEEDED"
+        assert execution.submitted == 1
+        if not broken_transport:
+            types = [event.event_type for event in events.items]
+            assert "presentation" in types
+            assert "presentation_rendered" not in types
+            presentation = next(event for event in events.items if event.event_type == "presentation")
+            assert presentation.detail["async_display"] is True
+    finally:
+        service.close()
+
+
+def test_async_presentation_is_published_only_after_the_task_binding_is_durable(tmp_path):
+    store = SQLiteRequestStore(tmp_path / "requests.sqlite3")
+    observed = []
+
+    class BindingProbe(Events):
+        def publish(self, event):
+            if event.event_type == "presentation":
+                record = store.get_request(event.request_key)
+                observed.append((record.state, record.task_ref is not None, record.may_have_submitted))
+            super().publish(event)
+
+    service, execution = _async_service(tmp_path, BindingProbe(), store=store)
+    req = _request(text="请挥手")
+    try:
+        assert service.send_message(req).accepted
+        assert _wait_state(service, req.to_key(), {"SUCCEEDED"}).state == "SUCCEEDED"
+        assert observed == [("MAY_EXECUTE", True, False)]
+    finally:
+        service.close()
+
+
+def test_concurrent_emits_publish_in_sequence_order(tmp_path):
+    recorded = threading.Event()
+
+    class SlowRecordStore(SQLiteRequestStore):
+        def record_event(self, *args, **kwargs):
+            sequence = super().record_event(*args, **kwargs)
+            if not recorded.is_set():
+                recorded.set()
+                time.sleep(0.2)  # widen the window between sequence allocation and publish
+            return sequence
+
+    store = SlowRecordStore(tmp_path / "request.sqlite3")
+    key = _request().to_key()
+    store.admit(key, input_hash="hash", session_id="session-1")
+    events = Events()
+    service = AgentService(planner=FakePlanner(None), catalog=FakeCatalog(), store=store, event_sink=events)
+    try:
+        terminal = threading.Thread(target=service._emit, args=(key, "terminal", "CANCELLED", "done"))
+        terminal.start()
+        assert recorded.wait(2)
+        service._emit(key, "stop_requested", "STOPPING", "stop requested")
+        terminal.join(2)
+        assert [event.event_type for event in events.items] == ["terminal", "stop_requested"]
+        sequences = [event.sequence for event in events.items]
+        assert sequences == sorted(sequences)
+    finally:
+        service.close()
+
+
+def test_async_task_binding_failure_never_submits(tmp_path):
+    class FailingBindStore(SQLiteRequestStore):
+        def bind_task(self, *args, **kwargs):
+            raise RuntimeError("ledger unavailable")
+
+    service, execution = _async_service(tmp_path, Events(), store=FailingBindStore(tmp_path / "requests.sqlite3"))
+    req = _request(text="请挥手")
+    try:
+        assert service.send_message(req).accepted
+        record = _wait_state(service, req.to_key(), {"FAILED", "UNKNOWN"})
         assert record.state == "FAILED"
         assert not record.may_have_submitted
         assert execution.submitted == 0

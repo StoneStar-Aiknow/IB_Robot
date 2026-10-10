@@ -14,6 +14,7 @@ from typing import Any
 
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from ibrobot_agent.contracts import (
+    ASYNC_PRESENTATION_MODE,
     AgentEvent,
     AgentRequest,
     CatalogPort,
@@ -165,6 +166,10 @@ class AgentService:
         self._stop = False
         self._active: dict[RequestKey, threading.Event] = {}
         self._active_lock = threading.RLock()
+        # Sequence allocation and enqueue must be one step: stop_request emits from
+        # the ROS control thread while the worker emits terminal, and subscribers
+        # rely on publish order matching ledger sequence order.
+        self._emit_lock = threading.Lock()
         self._worker.start()
 
     @property
@@ -570,6 +575,11 @@ class AgentService:
             )
             if self._presentation is None or self._events is None:
                 raise RuntimeError("presentation transport is unavailable")
+            # The task binding above is the durable pre-submission barrier.
+            # Typed Programs then display asynchronously: publishing is
+            # best-effort and must not gate, fail, or stop execution.  Legacy
+            # Agent Plans keep the receipt gate and its required events.
+            async_display = presentation.execution_mode == ASYNC_PRESENTATION_MODE
             self._presentation.present(
                 key,
                 presentation,
@@ -580,10 +590,11 @@ class AgentService:
                     "MAY_EXECUTE",
                     presentation.summary,
                     detail=detail,
-                    required=True,
+                    required=not async_display,
                 ),
             )
-            self._emit(key, "presentation_rendered", "MAY_EXECUTE", "exact plan presentation completed")
+            if not async_display:
+                self._emit(key, "presentation_rendered", "MAY_EXECUTE", "exact plan presentation completed")
 
     def _mark_may_submit(
         self,
@@ -653,28 +664,29 @@ class AgentService:
                 raise RuntimeError("required event transport is unavailable")
             return
         detail = dict(detail or {})
-        sequence = self._store.record_event(
-            key,
-            event_type=event_type,
-            state=state,
-            detail_json=json.dumps({"message": message, "detail": detail}, ensure_ascii=False, sort_keys=True),
-        )
-        try:
-            self._events.publish(
-                AgentEvent(
-                    schema_version=1,
-                    request_key=key,
-                    sequence=sequence,
-                    event_type=event_type,
-                    state=state,
-                    user_message=message,
-                    detail=detail,
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                )
+        with self._emit_lock:
+            sequence = self._store.record_event(
+                key,
+                event_type=event_type,
+                state=state,
+                detail_json=json.dumps({"message": message, "detail": detail}, ensure_ascii=False, sort_keys=True),
             )
-        except Exception:
-            if required:
-                raise
-            # The ledger is authoritative; a broken transport must not reopen
-            # the request through the outer failure handler.
-            _LOGGER.exception("Could not publish Agent event for %s", key.request_id)
+            try:
+                self._events.publish(
+                    AgentEvent(
+                        schema_version=1,
+                        request_key=key,
+                        sequence=sequence,
+                        event_type=event_type,
+                        state=state,
+                        user_message=message,
+                        detail=detail,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+            except Exception:
+                if required:
+                    raise
+                # The ledger is authoritative; a broken transport must not reopen
+                # the request through the outer failure handler.
+                _LOGGER.exception("Could not publish Agent event for %s", key.request_id)

@@ -351,3 +351,100 @@ def test_async_chat_renderer_flushes_before_receipt(monkeypatch):
     monkeypatch.setattr(chat_tui, "AgentChatNode", LocalChat)
     chat_tui.run_chat(session_id="render-test")
     assert calls == ["plan_written", "flushed", "receipt"]
+
+
+def _presentation_payload(state, *, async_display):
+    from ibrobot_agent.presentation import presentation_digest
+
+    plan = {"steps": [{"schema_version": 1, "skill_name": "nod_yes"}], "task_ref": {"task_id": "task"}}
+    detail = {"presentation": plan, "presentation_digest": presentation_digest(plan), "receipt_token": ""}
+    if async_display:
+        detail["async_display"] = True
+    else:
+        detail["receipt_token"] = "token"
+    return {
+        "request_key": {
+            "request_id": "request",
+            "channel_id": state.channel_id,
+            "principal_id": state.principal_id,
+            "robot_scope": state.robot_scope,
+        },
+        "sequence": 3,
+        "event_type": "presentation",
+        "state": "MAY_EXECUTE",
+        "detail": detail,
+    }
+
+
+def test_async_presentation_is_displayed_without_sending_a_receipt():
+    from types import SimpleNamespace
+
+    from ibrobot_agent.chat_tui import _render_output_item
+
+    state = ChatState("session")
+    state.register("request")
+    calls, lines = [], []
+    node = SimpleNamespace(state=state, acknowledge_presentation=lambda _: calls.append("receipt"))
+    _render_output_item(node, "event", _presentation_payload(state, async_display=True), writer=lines.append)
+    assert lines and "nod_yes" in lines[0]
+    assert calls == []
+
+
+def test_async_presentation_still_rejects_a_tampered_plan():
+    from types import SimpleNamespace
+
+    from ibrobot_agent.chat_tui import _render_output_item
+
+    state = ChatState("session")
+    state.register("request")
+    payload = _presentation_payload(state, async_display=True)
+    payload["detail"]["presentation"]["steps"][0]["skill_name"] = "wave_hello"
+    node = SimpleNamespace(state=state, acknowledge_presentation=lambda _: None)
+    with pytest.raises(ValueError):
+        _render_output_item(node, "event", payload, writer=lambda _: None)
+
+
+@pytest.mark.parametrize(
+    ("kind", "async_display", "event_type", "expect_stop"),
+    [
+        ("event", False, "presentation", True),
+        ("event", True, "presentation", False),
+        ("event", False, "terminal", False),
+        ("response", False, "", False),
+    ],
+)
+def test_only_legacy_presentation_render_failure_stops_the_request(kind, async_display, event_type, expect_stop):
+    from types import SimpleNamespace
+
+    from ibrobot_agent.chat_tui import _handle_render_failure
+
+    state = ChatState("session")
+    state.register("request")
+    stops = []
+    node = SimpleNamespace(state=state, stop=lambda: stops.append("stop") or True)
+    payload = _presentation_payload(state, async_display=async_display)
+    payload["event_type"] = event_type
+    assert _handle_render_failure(node, kind, payload) is expect_stop
+    assert stops == (["stop"] if expect_stop else [])
+
+
+def test_late_or_duplicate_events_never_reactivate_a_terminal_request():
+    state = ChatState("session")
+    state.register("request")
+    assert state.accept_event("request", 2, "MAY_EXECUTE")
+    assert state.accept_event("request", 5, "SUCCEEDED")
+    state.finish("request")
+    assert not state.accept_event("request", 5, "SUCCEEDED")  # duplicate
+    assert not state.accept_event("request", 3, "MAY_EXECUTE")  # late presentation
+    assert not state.accept_event("request", None, "RUNNING")  # unsequenced non-terminal after terminal
+    assert state.stop_target() == ""
+
+
+def test_out_of_order_terminal_event_still_finishes_the_request():
+    state = ChatState("session")
+    state.register("request")
+    assert state.accept_event("request", 6, "STOPPING")  # stop_requested overtook terminal
+    assert state.accept_event("request", 5, "CANCELLED")
+    state.finish("request")
+    assert not state.accept_event("request", 5, "CANCELLED")  # exact duplicate
+    assert state.stop_target() == ""

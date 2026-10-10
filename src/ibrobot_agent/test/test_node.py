@@ -15,8 +15,10 @@ from std_srvs.srv import Trigger
 
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.contracts import (
+    ASYNC_PRESENTATION_MODE,
     MAX_REQUEST_JSON_BYTES,
     MAX_REQUEST_TEXT_LENGTH,
+    AgentEvent,
     AgentRequest,
     PlannerIdentity,
     PlannerOutcome,
@@ -24,7 +26,7 @@ from ibrobot_agent.contracts import (
     RegistryIdentity,
     RequestKey,
 )
-from ibrobot_agent.node import IncubationAgentNode, _RosExecutionAdapter
+from ibrobot_agent.node import IncubationAgentNode, _RosEventSink, _RosExecutionAdapter
 
 
 class FakeCatalog:
@@ -436,6 +438,192 @@ def test_ros_presentation_receipt_unblocks_only_the_displayed_plan(tmp_path):
         wait(lambda: any(e.get("state") == "SUCCEEDED" for e in events))
         assert bridge.calls.count("confirm") == 1
         assert bridge.calls.count("submit") == 1
+    finally:
+        node.close()
+        executor.shutdown()
+        node.destroy_node()
+        client.destroy_node()
+        del subscriptions
+        rclpy.shutdown(context=context)
+
+
+def test_program_presentation_is_async_and_submission_does_not_claim_display_confirmation():
+    bridge = _ProgramExecutionBridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    presentations, submissions = [], []
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=presentations.append,
+        submission_callback=lambda task_ref, detail: submissions.append(detail),
+        stop_event=threading.Event(),
+    )
+    assert result.status == "succeeded"
+    assert presentations[0].execution_mode == ASYNC_PRESENTATION_MODE
+    assert submissions[0]["submission_mode"] == ASYNC_PRESENTATION_MODE
+    assert "confirmed" not in submissions[0]
+
+
+def test_program_stop_after_submission_intent_never_sends_goal():
+    bridge = _ProgramExecutionBridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    stop_event = threading.Event()
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: stop_event.set(),
+        stop_event=stop_event,
+    )
+    assert result.status == "cancelled"
+    assert result.detail["submitted"] is False
+    assert "program_submit" not in bridge.calls
+
+
+class _BlockingPublisher:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.messages = []
+
+    def publish(self, message):
+        self.entered.set()
+        self.release.wait(5.0)
+        self.messages.append(json.loads(message.data))
+
+
+def _event(event_type, state="RUNNING", sequence=1):
+    return AgentEvent(1, RequestKey("so101_single_arm", "c", "p", "r1"), sequence, event_type, state, "m")
+
+
+def test_ros_event_sink_never_blocks_the_caller_on_a_stuck_publisher():
+    publisher = _BlockingPublisher()
+    sink = _RosEventSink(publisher, capacity=4, drain_timeout_sec=0.2)
+    try:
+        sink.publish(_event("presentation"))
+        assert publisher.entered.wait(1.0)
+        started = time.monotonic()
+        for sequence in range(2, 200):
+            sink.publish(_event("presentation", sequence=sequence))
+        assert time.monotonic() - started < 0.5
+    finally:
+        publisher.release.set()
+        sink.close()
+
+
+def test_ros_event_sink_evicts_display_events_before_terminal_notifications():
+    publisher = _BlockingPublisher()
+    sink = _RosEventSink(publisher, capacity=3, drain_timeout_sec=1.0)
+    sink.publish(_event("proposal_ready"))
+    assert publisher.entered.wait(1.0)  # worker is now stuck on the first event
+    for sequence in range(2, 5):
+        sink.publish(_event("presentation", "MAY_EXECUTE", sequence))  # queue is now full
+    critical = [_event("stop_requested", "STOPPING", 5)] + [
+        _event("terminal", "SUCCEEDED", sequence) for sequence in range(6, 10)
+    ]
+    for event in critical:
+        sink.publish(event)
+    sink.publish(_event("presentation", "MAY_EXECUTE", 10))
+    publisher.release.set()
+    sink.close()
+    delivered = [(message["event_type"], message["sequence"]) for message in publisher.messages]
+    # Every critical notification survives; queued display events were evicted first.
+    assert [item for item in delivered if item[0] != "presentation" and item[1] > 1] == [
+        (event.event_type, event.sequence) for event in critical
+    ]
+    assert not any(event_type == "presentation" for event_type, _ in delivered)
+    assert sink.dropped == 4
+
+
+def test_ros_event_sink_close_is_bounded_with_a_stuck_publisher():
+    publisher = _BlockingPublisher()
+    sink = _RosEventSink(publisher, capacity=4, drain_timeout_sec=0.1)
+    sink.publish(_event("presentation"))
+    assert publisher.entered.wait(1.0)
+    sink.publish(_event("terminal", "SUCCEEDED", 2))
+    started = time.monotonic()
+    sink.close()
+    assert time.monotonic() - started < 1.0
+    sink.publish(_event("terminal", "SUCCEEDED", 3))  # closed sinks drop instead of queueing
+    publisher.release.set()
+
+
+def test_ros_program_executes_without_any_presentation_receipt(tmp_path):
+    from rclpy.executors import SingleThreadedExecutor
+
+    from ibrobot_agent.planner import RulePlanner
+
+    class Catalog(FakeCatalog):
+        def get_catalog(self, status):
+            return {"skills": [{"name": "wave_hello", "planner_visible": True, "semantic_level": "skill"}]}
+
+    context = Context()
+    rclpy.init(context=context)
+    bridge = _ProgramExecutionBridge()
+    node = IncubationAgentNode(
+        context=context,
+        planner=RulePlanner(),
+        catalog_port=Catalog(),
+        execution_port=_RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0}),
+        parameter_overrides=[
+            Parameter("ledger_path", value=str(tmp_path / "requests.sqlite3")),
+            Parameter("conversation_path", value=str(tmp_path / "conversation.sqlite3")),
+            Parameter("deployment_lock_path", value=str(tmp_path / "agent.lock")),
+            Parameter("execution_enabled", value=True),
+            Parameter("allowed_skills_json", value='["wave_hello"]'),
+        ],
+    )
+    client = rclpy.create_node("async_presentation_test_client", context=context)
+    events, responses = [], []
+    subscriptions = [
+        client.create_subscription(String, "/agent/event", lambda m: events.append(json.loads(m.data)), 10),
+        client.create_subscription(String, "/agent/response", lambda m: responses.append(json.loads(m.data)), 10),
+    ]
+    control = client.create_publisher(String, "/agent/control", 10)
+    requests = client.create_publisher(String, "/agent/request", 10)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    executor.add_node(client)
+
+    def wait(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.01)
+        assert predicate()
+
+    try:
+        wait(lambda: requests.get_subscription_count() > 0 and control.get_subscription_count() > 0)
+        requests.publish(
+            String(
+                data=json.dumps({"schema_version": 1, "request_id": "wire-async", "session_id": "s", "text": "请挥手"})
+            )
+        )
+        # No client acknowledges anything; the Program still runs to completion.
+        wait(lambda: any(e.get("event_type") == "terminal" and e.get("state") == "SUCCEEDED" for e in events))
+        assert bridge.calls.count("program_submit") == 1
+        presentation = next(e for e in events if e["event_type"] == "presentation")
+        assert presentation["detail"]["async_display"] is True
+        assert presentation["detail"]["receipt_token"] == ""
+        assert not any(e["event_type"] == "presentation_rendered" for e in events)
+
+        # A stale-style empty receipt is a no-op: it neither unlocks nor stops anything.
+        control.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "operation": "presentation_rendered",
+                        "request_id": "wire-async",
+                        "request_key": presentation["request_key"],
+                        "presentation_digest": presentation["detail"]["presentation_digest"],
+                        "receipt_token": "",
+                    }
+                )
+            )
+        )
+        wait(lambda: any(r.get("async_display") is True for r in responses))
+        receipt = next(r for r in responses if r.get("async_display") is True)
+        assert receipt["presentation_received"] is False
+        assert bridge.calls.count("program_submit") == 1
     finally:
         node.close()
         executor.shutdown()
