@@ -425,4 +425,80 @@ TEST(LeKiwiHardwareAdapter, SimulatedBaseOnlyLifecycle)
   EXPECT_EQ(hw.on_shutdown(unused), hardware_interface::CallbackReturn::SUCCESS);
 }
 
+// Each failure is on the last motor of a group, after healthy motors have
+// changed position. Neither the arm nor the wheels may be partially published.
+TEST(LeKiwiHardwareAdapter, ProtectionRejectsWholeCycleWithoutPublishingPartialState)
+{
+  TempCalibFile calib;
+  const rclcpp_lifecycle::State unused;
+  for (bool with_arm : {true, false}) {
+    for (int id : {6, 9}) {
+      if (!with_arm && id == 6) {continue;}
+      for (int bits : {1, 2, 4, 8, 16, 32, 34}) {
+        SCOPED_TRACE(
+          ::testing::Message() << "arm=" << with_arm << " id=" << id << " bits=" << bits);
+        lekiwi_hardware::LeKiwiSystemHardware hw;
+        ASSERT_EQ(
+          hw.on_init(make_info({{"simulated", "true"}, {"calib_file", calib.path()}}, with_arm)),
+          hardware_interface::CallbackReturn::SUCCESS);
+        ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+        ASSERT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::SUCCESS);
+        auto & sim = lekiwi_hardware::LeKiwiHardwareTestAccess::bus(hw).sim();
+        sim.set_converge_step_ticks(0);
+        ASSERT_EQ(
+          hw.read(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+        const auto interfaces = hw.export_state_interfaces();
+        std::vector<double> before;
+        for (const auto & item : interfaces) {before.push_back(item.get_value());}
+        if (with_arm) {sim.set_position_ticks(1, 2700);}
+        sim.set_position_ticks(7, 900);
+        sim.set_position_ticks(id, 3000);
+        sim.set_response_status(id, static_cast<std::uint8_t>(bits));
+        EXPECT_EQ(
+          hw.read(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::ERROR);
+        for (size_t i = 0; i < interfaces.size(); ++i) {
+          EXPECT_DOUBLE_EQ(interfaces[i].get_value(), before[i]);
+        }
+        sim.set_response_status(id, 0);
+        EXPECT_EQ(
+          hw.read(rclcpp::Time(0), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+        bool changed = false;
+        for (size_t i = 0; i < interfaces.size(); ++i) {
+          changed = changed || interfaces[i].get_value() != before[i];
+        }
+        EXPECT_TRUE(changed);
+        EXPECT_EQ(hw.on_shutdown(unused), hardware_interface::CallbackReturn::SUCCESS);
+      }
+    }
+  }
+}
+
+TEST(LeKiwiHardwareAdapter, ActivationRejectsProtectedFeedbackAndReleasesAllMotors)
+{
+  TempCalibFile calib;
+  const rclcpp_lifecycle::State unused;
+  for (bool with_arm : {true, false}) {
+    for (int id : {6, 9}) {
+      if (!with_arm && id == 6) {continue;}
+      for (int bits : {2, 32}) {
+        lekiwi_hardware::LeKiwiSystemHardware hw;
+        ASSERT_EQ(
+          hw.on_init(make_info({{"simulated", "true"}, {"calib_file", calib.path()}}, with_arm)),
+          hardware_interface::CallbackReturn::SUCCESS);
+        ASSERT_EQ(hw.on_configure(unused), hardware_interface::CallbackReturn::SUCCESS);
+        auto & bus = lekiwi_hardware::LeKiwiHardwareTestAccess::bus(hw);
+        bus.sim().set_response_status(id, static_cast<std::uint8_t>(bits));
+        EXPECT_EQ(hw.on_activate(unused), hardware_interface::CallbackReturn::ERROR);
+        for (const auto motor : lekiwi_hardware::LeKiwiHardwareTestAccess::arm_ids(hw)) {
+          EXPECT_FALSE(bus.sim().torque_enabled(motor));
+        }
+        for (const auto motor : lekiwi_hardware::LeKiwiHardwareTestAccess::wheel_ids(hw)) {
+          EXPECT_FALSE(bus.sim().torque_enabled(motor));
+        }
+        EXPECT_EQ(hw.on_shutdown(unused), hardware_interface::CallbackReturn::SUCCESS);
+      }
+    }
+  }
+}
+
 }  // namespace

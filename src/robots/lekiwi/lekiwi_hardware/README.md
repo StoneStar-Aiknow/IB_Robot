@@ -307,3 +307,17 @@ URDF 中的 ros2_control 配置必须恰好包含 9 个 joint（6 手臂 + 3 底
 ## 许可证
 
 Apache-2.0
+
+## 电机保护反馈
+
+共享 Feetech 总线的读取成功仅表示通信与解码成功。LeKiwi 保持原有故障策略：机械臂或车轮
+任意保护位非零（包括 OVERLOAD、ANGLE）、反馈无效或缺失时，read() 返回 ERROR；
+整批检查通过后才更新状态，避免部分更新。它不使用 SO-101 插件的夹爪位置保持/张开恢复策略。
+
+read() 返回 ERROR 只表示拒绝本轮反馈，不等价于电机已停止或扭矩已释放。LeKiwi 尚未覆写
+on_error，运行期错误后的设备级停车与扭矩释放由
+[Issue #147](https://atomgit.com/openEuler/IB_Robot/issues/147) 跟踪。已知限制：夹爪夹持实际触发固件
+OVERLOAD 时同样会使整个组件（含底盘）报错，lekiwi_nav_grasp 等抓取场景受影响。
+
+激活时也执行整批反馈检查，失败时释放机械臂和车轮扭矩。`scan_motors` 将在线但报保护的
+电机显示为 `[FAULT]` 并输出状态及反馈有效性，不再将其误标为正常或不响应。

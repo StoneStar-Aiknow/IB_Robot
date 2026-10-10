@@ -24,5 +24,13 @@ pure kinematics functions above for Python runtime nodes and tools.
 ## Testing
 
 gtest cases (`test_omni_base`, `test_mobile_manipulator`) cover velocity round-trip, odometry across the encoder wrap,
-overspeed scaling, subsystem independence and base-only mode. Odometry tests drive the simulated bus with a manual
-clock (`bus.sim().use_manual_clock()` / `advance_clock()`), so motion depends on simulated time, not on the read rate.
+overspeed scaling, subsystem independence, base-only mode and protected-feedback rejection. Odometry tests drive the
+simulated bus with a manual clock (`bus.sim().use_manual_clock()` / `advance_clock()`), so motion depends on simulated
+time, not on the read rate.
+
+## Protection feedback
+
+Transport success does not imply healthy motor feedback. OmniBase::read_wheels rejects
+invalid, missing or protected wheel samples before updating either output array.
+update_odometry returns false without changing pose or odometry history on those failures.
+The caller must handle the failure: returning false does not itself stop wheel motors.

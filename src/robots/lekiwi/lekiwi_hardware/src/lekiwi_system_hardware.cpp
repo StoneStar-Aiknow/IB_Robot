@@ -14,6 +14,7 @@
 
 #include "lekiwi_hardware/lekiwi_system_hardware.hpp"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -244,38 +245,31 @@ LeKiwiSystemHardware::on_activate(const rclcpp_lifecycle::State &)
   bus_->sync_write_velocities(stop_targets);
 
   // Seed the ros2_control command buffer from the SDK's hold targets before
-  // the first write(). Arm::activate() leaves the arm holding its measured
+  // the first write(): Arm::activate() leaves the arm holding its measured
   // pose, but hw_commands_ still holds zeros from on_init (or the previous
-  // activation's values on an inactive -> active re-entry). Without this the
-  // very first write() commands those stale values, driving a non-zero arm
-  // toward zero while the runtime is still idle. Wheels are seeded to zero to
-  // match the stop written above.
+  // activation's values on an inactive -> active re-entry), and commanding
+  // those stale values would drive a non-zero arm toward zero while the
+  // runtime is still idle. The seed comes from one whole-frame read that
+  // applies the same protection policy as the runtime path, base-only robots
+  // included; never from a second, unchecked arm read. Wheels are seeded to
+  // zero to match the stop written above.
+  if (read(rclcpp::Time(0), rclcpp::Duration(0, 0)) != hardware_interface::return_type::OK) {
+    bus_->emergency_release(wheel_ids_);
+    if (arm_) {arm_->stop(so101::StopPolicy::TorqueOff);}
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   if (arm_) {
-    so101::ArmState state;
-    if (!arm_->read(state)) {
-      RCLCPP_ERROR(
-        rclcpp::get_logger("LeKiwiSystemHardware"),
-        "Arm read failed while seeding hold targets: %s", arm_->health().detail.c_str());
-      bus_->emergency_release(wheel_ids_);
-      arm_->stop(so101::StopPolicy::TorqueOff);
-      return hardware_interface::CallbackReturn::ERROR;
-    }
     const auto & targets = arm_->command_targets();
     for (size_t i = 0; i < num_arm_joints_; i++) {
-      const std::string & name = info_.joints[i].name;
-      const auto reading = state.joints.find(name);
-      const auto target = targets.find(name);
-      if (reading == state.joints.end() || target == targets.end()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger("LeKiwiSystemHardware"),
-          "Arm joint %s missing while seeding hold targets", name.c_str());
+      if (targets.find(info_.joints[i].name) == targets.end()) {
         bus_->emergency_release(wheel_ids_);
         arm_->stop(so101::StopPolicy::TorqueOff);
         return hardware_interface::CallbackReturn::ERROR;
       }
-      hw_positions_[i] = reading->second.position;
-      hw_velocities_[i] = reading->second.velocity;
-      hw_commands_[i] = target->second;
+    }
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      const auto & name = info_.joints[i].name;
+      hw_commands_[i] = targets.at(name);
       arm_command_map_[name] = hw_commands_[i];
     }
   }
@@ -391,9 +385,11 @@ LeKiwiSystemHardware::read(const rclcpp::Time &, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
-  // Arm: scoped read (wheel failures do not affect the arm subsystem).
+  // Validate both scoped reads before publishing any part of this cycle.
+  // The bus reports transport success even when a motor reports protection;
+  // LeKiwi retains its original policy of rejecting every protection state.
+  so101::ArmState state;
   if (arm_) {
-    so101::ArmState state;
     if (!arm_->read(state)) {
       RCLCPP_ERROR_THROTTLE(
         rclcpp::get_logger("LeKiwiSystemHardware"),
@@ -401,28 +397,55 @@ LeKiwiSystemHardware::read(const rclcpp::Time &, const rclcpp::Duration &)
       return hardware_interface::return_type::ERROR;
     }
     for (size_t i = 0; i < num_arm_joints_; i++) {
-      const auto it = state.joints.find(info_.joints[i].name);
+      const auto & name = info_.joints[i].name;
+      const auto it = state.joints.find(name);
       if (it == state.joints.end()) {
+        RCLCPP_ERROR(rclcpp::get_logger("LeKiwiSystemHardware"),
+          "Missing arm feedback: %s", name.c_str());
         return hardware_interface::return_type::ERROR;
       }
-      hw_positions_[i] = it->second.position;
-      hw_velocities_[i] = it->second.velocity;
+      const auto & reading = it->second;
+      if (reading.protection != 0 || !std::isfinite(reading.position) ||
+        !std::isfinite(reading.velocity))
+      {
+        RCLCPP_ERROR_THROTTLE(
+          rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+          "Arm joint %s feedback rejected: %s", name.c_str(),
+          feetech::decode_protection_bits(reading.protection).c_str());
+        return hardware_interface::return_type::ERROR;
+      }
     }
   }
 
-  // Wheels: scoped read.
   std::vector<feetech::MotorSample> wheel_samples;
   const auto wheel_result = bus_->sync_read(wheel_samples, wheel_ids_);
-  if (!wheel_result.ok) {
+  if (!wheel_result.ok || wheel_samples.size() != wheel_ids_.size()) {
     RCLCPP_ERROR_THROTTLE(
       rclcpp::get_logger("LeKiwiSystemHardware"),
-      steady_clock, 500, "Wheel read failed: %s", wheel_result.detail.c_str());
+      steady_clock, 500, "Wheel read failed or incomplete: %s", wheel_result.detail.c_str());
     return hardware_interface::return_type::ERROR;
   }
   for (size_t i = 0; i < wheel_ids_.size(); i++) {
-    const size_t idx = num_arm_joints_ + i;
-    hw_positions_[idx] = wheel_samples[i].position;
-    hw_velocities_[idx] = wheel_samples[i].velocity;
+    const auto & sample = wheel_samples[i];
+    if (sample.id != wheel_ids_[i] || !sample.valid || sample.protection != 0 ||
+      !std::isfinite(sample.position) || !std::isfinite(sample.velocity))
+    {
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+        "Wheel motor %u feedback rejected: valid=%d, status=%s",
+        static_cast<unsigned>(wheel_ids_[i]), sample.valid,
+        feetech::decode_protection_bits(sample.protection).c_str());
+      return hardware_interface::return_type::ERROR;
+    }
+  }
+  for (size_t i = 0; i < num_arm_joints_; i++) {
+    const auto & reading = state.joints.at(info_.joints[i].name);
+    hw_positions_[i] = reading.position;
+    hw_velocities_[i] = reading.velocity;
+  }
+  for (size_t i = 0; i < wheel_ids_.size(); i++) {
+    hw_positions_[num_arm_joints_ + i] = wheel_samples[i].position;
+    hw_velocities_[num_arm_joints_ + i] = wheel_samples[i].velocity;
   }
 
   return hardware_interface::return_type::OK;

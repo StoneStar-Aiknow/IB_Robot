@@ -314,6 +314,43 @@ TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
   EXPECT_DOUBLE_EQ(pose.theta, before.theta);
 }
 
+TEST(OmniBase, ProtectionPreservesOutputsAndOdometryHistory)
+{
+  for (int bits : {1, 2, 4, 8, 16, 32, 34}) {
+    SCOPED_TRACE(bits);
+    feetech::Bus bus(wheel_bus_options());
+    ASSERT_TRUE(bus.open());
+    ASSERT_TRUE(bus.apply_all_configs().ok);
+    lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
+    bus.sim().set_converge_step_ticks(0);
+    lekiwi::BasePose pose;
+    ASSERT_TRUE(base.update_odometry(pose));
+    const auto original_pose = pose;
+    std::array<double, 3> positions{11.0, 12.0, 13.0};
+    std::array<double, 3> velocities{21.0, 22.0, 23.0};
+    const auto original_positions = positions;
+    const auto original_velocities = velocities;
+    bus.sim().set_position_ticks(7, 900);
+    bus.sim().set_position_ticks(9, 3000);
+    bus.sim().set_response_status(9, static_cast<std::uint8_t>(bits));
+    EXPECT_FALSE(base.read_wheels(positions, velocities));
+    EXPECT_EQ(positions, original_positions);
+    EXPECT_EQ(velocities, original_velocities);
+    EXPECT_FALSE(base.update_odometry(pose));
+    EXPECT_DOUBLE_EQ(pose.x, original_pose.x);
+    EXPECT_DOUBLE_EQ(pose.y, original_pose.y);
+    EXPECT_DOUBLE_EQ(pose.theta, original_pose.theta);
+    // Return to the seed pose: rejected data must not replace last_positions_.
+    bus.sim().set_position_ticks(7, 2048);
+    bus.sim().set_position_ticks(9, 2048);
+    bus.sim().set_response_status(9, 0);
+    ASSERT_TRUE(base.update_odometry(pose));
+    EXPECT_NEAR(pose.x, original_pose.x, 1e-9);
+    EXPECT_NEAR(pose.y, original_pose.y, 1e-9);
+    EXPECT_NEAR(pose.theta, original_pose.theta, 1e-9);
+  }
+}
+
 }  // namespace
 
 TEST(OmniBaseKinematics, WheelPositionDeltasTakeTheShortPathAcrossTheWrap)

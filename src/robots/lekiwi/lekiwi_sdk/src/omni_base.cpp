@@ -157,20 +157,28 @@ bool OmniBase::read_wheels(
   // Scope the read to the wheel motors. The bus is shared with the arm on a
   // full LeKiwi, and an unresponsive arm motor must not take the base's
   // odometry down with it.
-  if (!bus_.sync_read(samples, wheel_ids_).ok) {
+  if (wheel_ids_.size() != positions.size() ||
+    !bus_.sync_read(samples, wheel_ids_).ok || samples.size() != wheel_ids_.size())
+  {
     return false;
   }
+  // Validate into temporary outputs: no partial update on a later wheel fault.
+  std::array<double, 3> next_positions{}, next_velocities{};
   // Map samples by motor id (registry order may differ from mount order).
   for (std::size_t i = 0; i < wheel_ids_.size(); ++i) {
     const std::uint8_t id = wheel_ids_[i];
     const auto sample = std::find_if(samples.begin(), samples.end(),
       [id](const feetech::MotorSample & s) { return s.id == id; });
-    if (sample == samples.end()) {
+    if (sample == samples.end() || !sample->valid || sample->protection != 0 ||
+      !std::isfinite(sample->position) || !std::isfinite(sample->velocity))
+    {
       return false;
     }
-    positions[i] = sample->position;
-    velocities[i] = sample->velocity;
+    next_positions[i] = sample->position;
+    next_velocities[i] = sample->velocity;
   }
+  positions = next_positions;
+  velocities = next_velocities;
   return true;
 }
 

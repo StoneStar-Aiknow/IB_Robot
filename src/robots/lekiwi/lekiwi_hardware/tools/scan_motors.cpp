@@ -95,13 +95,20 @@ int main(int argc, char ** argv)
 
     for (int retry = 0; retry < kRetries && !found; ++retry) {
       const feetech::MotorOpResult result = bus.sync_read(samples, ids);
-      found = result.ok && !samples.empty() && samples.front().valid;
+      found = result.ok && samples.size() == 1 && samples.front().id == id;
     }
 
     const std::uint8_t motor_id = static_cast<std::uint8_t>(id);
     if (found) {
       ++found_count;
-      std::cout << "[OK ] Motor ID " << id << describe(motor_id) << std::endl;
+      const auto & sample = samples.front();
+      if (sample.protection != 0 || !sample.valid) {
+        std::cout << "[FAULT] Motor ID " << id << describe(motor_id)
+                  << " - responding, status=" << feetech::decode_protection_bits(sample.protection)
+                  << ", feedback_valid=" << sample.valid << std::endl;
+      } else {
+        std::cout << "[OK ] Motor ID " << id << describe(motor_id) << std::endl;
+      }
     } else {
       std::cout << "[ X ] Motor ID " << id << " - NOT RESPONDING" << describe(motor_id) <<
         std::endl;
