@@ -295,7 +295,9 @@ def generate_embodied_nodes(
             "get_execution_events_service", "/embodied/get_execution_events"
         ),
         "cancel_execution_service": embodied_config.get("cancel_execution_service", "/embodied/cancel_execution"),
-        "execution_store_path": embodied_config.get("execution_store_path", "/tmp/ibrobot-executions.sqlite3"),
+        "execution_store_path": embodied_config.get(
+            "execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
+        ),
     }
     if runtime_motion:
         common_params.update(

@@ -605,6 +605,117 @@ def test_minimal_program_gateway_single_step_round_trip(gateway_rig):
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_result_and_query_project_durable_contract(gateway_rig):
+    goal = _program_goal(gateway_rig, request_id="contract-projection")
+    result = _send_program(gateway_rig, goal)
+    assert result.workflow_digest == result.program_digest
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = goal.caller_scope
+    query.robot_id = goal.robot_id
+    query.request_id = goal.request_id
+    query.execution_id = result.execution_id
+    response = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert response.canonical_steps[0].skill_name == "move"
+    assert response.actual_registry_generation > 0
+    assert response.reconciled is False
+    events = GetExecutionEvents.Request()
+    events.schema_version = 1
+    events.caller_scope = goal.caller_scope
+    events.robot_id = goal.robot_id
+    events.request_id = goal.request_id
+    events.execution_id = result.execution_id
+    events.limit = 100
+    event_response = _future_result(gateway_rig.get_execution_events_client.call_async(events))
+    assert event_response.events
+    assert event_response.events[-1].canonical_steps[0].skill_name == "move"
+    assert event_response.events[-1].created_at.sec > 0
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_terminal_replay_survives_catalog_reload(gateway_rig):
+    goal = _program_goal(gateway_rig, request_id="program-replay-after-reload")
+    first = _send_program(gateway_rig, goal)
+    assert first.success
+
+    implementation_path = (
+        Path(gateway_rig.overrides["skill_catalog_source_root"])
+        / "config"
+        / "skills"
+        / "move"
+        / "implementations"
+        / f"{gateway_rig.overrides['skill_catalog_profile']}.yaml"
+    )
+    changed_implementation = _skill_implementation(
+        gateway_rig.overrides["skill_catalog_profile"],
+        [{"primitive_name": "move_to_named_pose", "pose_name": "home"}],
+    )
+    changed_implementation["initial_gripper_state"] = "open"
+    _write_yaml(implementation_path, changed_implementation)
+    reload = ReloadSkillCatalog.Request()
+    reload.schema_version = 1
+    reload.request_id = f"reload-before-program-replay-{uuid.uuid4().hex}"
+    reload.force = True
+    assert _future_result(gateway_rig.reload_client.call_async(reload)).success
+
+    # Replay resolves from the durable request key before active-registry
+    # admission, so the original terminal result remains idempotent.
+    replay = _send_program(gateway_rig, goal)
+    assert replay.success
+    assert replay.execution_id == first.execution_id
+
+    # A new request carrying the old catalog identity is rejected explicitly.
+    new_goal = _program_goal(gateway_rig, request_id="program-old-registry-after-reload")
+    new_goal.expected_registry_generation = goal.expected_registry_generation
+    new_goal.expected_registry_digest = goal.expected_registry_digest
+    mismatch = _send_program(gateway_rig, new_goal)
+    assert mismatch.success is False
+    assert mismatch.error_code == "SKILL_REGISTRY_VERSION_MISMATCH"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_cancel_execution_between_steps_uses_durable_terminal(gateway_rig, monkeypatch):
+    first_child_finished = threading.Event()
+    release_second = threading.Event()
+    original_child = gateway_rig.executor_node._execute_program_child
+    calls = 0
+
+    def child(goal, root_handle, execution_id):
+        nonlocal calls
+        calls += 1
+        result = original_child(goal, root_handle, execution_id)
+        if calls == 1:
+            first_child_finished.set()
+            release_second.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    goal = _program_goal(
+        gateway_rig,
+        request_id="cancel-between-steps",
+        task_budget_sec=5.0,
+        steps=[workflow_step(skill_name="move", timeout_sec=1.0), workflow_step(skill_name="move", timeout_sec=1.0)],
+    )
+    future = gateway_rig.program_client.send_goal_async(goal)
+    handle = _future_result(future)
+    assert handle.accepted
+    assert first_child_finished.wait(timeout=2.0)
+    cancel = CancelExecution.Request()
+    cancel.schema_version = 1
+    cancel.caller_scope = goal.caller_scope
+    cancel.robot_id = goal.robot_id
+    cancel.request_id = goal.request_id
+    cancel.execution_id = ""
+    cancel_result = _future_result(gateway_rig.cancel_execution_client.call_async(cancel))
+    assert cancel_result.accepted is True
+    release_second.set()
+    result = _future_result(handle.get_result_async()).result
+    assert result.state == "CANCELED"
+    assert result.error_code == "SKILL_CANCELLED"
+    assert calls == 1
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
 def test_program_gateway_preserves_distinct_child_step_identity(gateway_rig, monkeypatch):
     captured = []
     original_child_executor = gateway_rig.executor_node._execute_program_child
@@ -683,7 +794,7 @@ def test_minimal_program_gateway_replay_and_payload_conflict(gateway_rig):
     conflict = _program_goal(gateway_rig, request_id="replay-1", task_budget_sec=3.0)
     conflict_result = _send_program(gateway_rig, conflict)
     assert conflict_result.success is False
-    assert conflict_result.error_code == "EXECUTIONCONFLICTERROR"
+    assert conflict_result.error_code == "SKILL_REQUEST_ID_CONFLICT"
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)

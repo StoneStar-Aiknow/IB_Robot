@@ -54,6 +54,13 @@ authentication contract. `execution_caller_scopes` is injected by the
 scope. The token authenticates transport requests and is not included in the
 canonical Program digest or durable execution payload.
 
+The execution ledger defaults to the persistent user state path
+`~/.ros/ibrobot/executions.sqlite3`; deployments may override it with the
+`embodied.execution_store_path` configuration key. The override must point to
+a persistent, writable directory on the target robot. Do not use `/tmp` for a
+production deployment because restart recovery and UNKNOWN quarantine depend
+on this ledger surviving reboot.
+
 ## 2. 技能来源：versioned skill catalog snapshot
 
 技能不再由 `robot_config` 的 `skill_templates` 内联注入。`skill_executor_node` 现在是

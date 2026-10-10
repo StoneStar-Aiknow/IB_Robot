@@ -10,12 +10,14 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
 
 import rclpy
 from builtin_interfaces.msg import Duration as DurationMsg
+from builtin_interfaces.msg import Time as TimeMsg
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
@@ -70,6 +72,7 @@ from ibrobot_msgs.msg import (
     SkillDiagnostic,
     SkillRegistryEvent,
     TaskStep,
+    WorkflowStep,
 )
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
@@ -94,7 +97,12 @@ from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
-from skill_library.execution_store import SQLiteExecutionStore
+from skill_library.execution_store import (
+    ExecutionBusyError,
+    ExecutionConflictError,
+    ExecutionQuarantinedError,
+    SQLiteExecutionStore,
+)
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -119,6 +127,43 @@ WORKFLOW_STEP_ACTIVE = "active"
 WORKFLOW_STEP_SUCCEEDED = "succeeded"
 WORKFLOW_STEP_FAILED = "failed"
 WORKFLOW_STEP_CANCELED = "canceled"
+
+
+def _workflow_step_message(values: dict):
+    step = WorkflowStep()
+    step.schema_version = int(values.get("schema_version", 1))
+    step.skill_name = str(values.get("skill_name", ""))
+    step.target_name = str(values.get("target_name", ""))
+    step.container_name = str(values.get("container_name", ""))
+    step.place_name = str(values.get("place_name", ""))
+    step.motion_direction = str(values.get("motion_direction", ""))
+    step.motion_distance = float(values.get("motion_distance", 0.0))
+    step.arm_side = str(values.get("arm_side", ""))
+    step.imitation_duration_sec = float(values.get("imitation_duration_sec", 0.0))
+    step.timeout_sec = float(values.get("timeout_sec", 0.0))
+    step.direction = str(values.get("direction", ""))
+    step.distance = float(values.get("distance", 0.0))
+    step.degree = float(values.get("degree", 0.0))
+    step.has_x = values.get("x") is not None
+    step.x = float(values.get("x") or 0.0)
+    step.has_y = values.get("y") is not None
+    step.y = float(values.get("y") or 0.0)
+    step.has_yaw = values.get("yaw") is not None
+    step.yaw = float(values.get("yaw") or 0.0)
+    return step
+
+
+def _time_message(value: str):
+    stamp = TimeMsg()
+    try:
+        parsed = datetime.fromisoformat(value)
+        timestamp = parsed.timestamp()
+        stamp.sec = int(timestamp)
+        stamp.nanosec = int((timestamp - stamp.sec) * 1_000_000_000)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return stamp
+
 
 _NAVIGATION_ERROR_CODES = {
     ExecuteNavigation.Result.INVALID_GOAL: "NAVIGATION_INVALID_GOAL",
@@ -275,6 +320,7 @@ class _WorkflowExecution:
     lease_released: bool = False
     runtime_generation_released: bool = False
     child_results: dict[int, object] = field(default_factory=dict)
+    late_cleanup_callback: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -536,7 +582,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("get_execution_service", "/embodied/get_execution")
         self.declare_parameter("get_execution_events_service", "/embodied/get_execution_events")
         self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
-        self.declare_parameter("execution_store_path", "/tmp/ibrobot-executions.sqlite3")
+        self.declare_parameter("execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3"))
         self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
         self.declare_parameter("execution_caller_tokens_json", "{}")
         raw_scopes = self.get_parameter("execution_caller_scopes_json").value
@@ -799,7 +845,9 @@ class SkillExecutorNode(Node):
         self._skill_parameter_schemas = startup_parameter_schemas
         self._skill_control_modes = startup_control_modes
         self._skill_templates = self._mutable_templates(startup_bundle.snapshot.templates)
-        self._active_runtime_bundle = startup_bundle
+        # Idle reads use coordinator.current. Keeping a startup bundle here
+        # would pin all Program requests to a stale generation after reload.
+        self._active_runtime_bundle = None
         self._latest_ee_pose = None
         self._latest_ee_pose_monotonic = None
         self._latest_joint_state = None
@@ -881,7 +929,7 @@ class SkillExecutorNode(Node):
         self._execution_store = SQLiteExecutionStore(
             str(self.get_parameter("execution_store_path").value)
             if self.has_parameter("execution_store_path")
-            else "/tmp/ibrobot-executions.sqlite3"
+            else str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
         )
         self._program_server = ActionServer(
             self,
@@ -1067,15 +1115,14 @@ class SkillExecutorNode(Node):
                 workflow_steps=goal.workflow_steps,
                 task_budget_sec=goal.task_budget_sec,
             )
-            if not self._program_identity_matches(program):
-                raise ValueError("PROGRAM_REGISTRY_MISMATCH")
-            bundle, admission_error = self._program_admission_snapshot(program)
-            if bundle is None:
-                raise ValueError(admission_error)
             record, created = self._execution_store.begin(program)
             result.execution_id = record.execution_id
             result.request_id = record.request_id
             result.program_digest = record.program_digest
+            result.workflow_digest = record.workflow_digest
+            result.actual_registry_epoch = record.actual_registry_epoch
+            result.actual_registry_generation = record.actual_registry_generation
+            result.actual_registry_digest = record.actual_registry_digest
             result.state = record.state
             result.completed_step_count = record.completed_step_count
             if record.terminal:
@@ -1089,6 +1136,37 @@ class SkillExecutorNode(Node):
                 result.state = record.state
                 result.error_code = "EXECUTION_IN_PROGRESS"
                 result.message = "execution is already in progress"
+                goal_handle.abort()
+                return result
+            record = self._execution_store.bind_workflow_digest(record.execution_id, program.program_digest)
+            result.workflow_digest = record.workflow_digest
+            if not self._program_identity_matches(program):
+                self._finish_program(
+                    record,
+                    result,
+                    state="FAILED",
+                    error_code="SKILL_REGISTRY_VERSION_MISMATCH",
+                    message="program registry identity does not match the active Gateway registry",
+                )
+                goal_handle.abort()
+                return result
+            bundle, admission_error = self._program_admission_snapshot(program)
+            if bundle is None:
+                self._finish_program(
+                    record,
+                    result,
+                    state="FAILED",
+                    error_code=(
+                        "MOTION_NOT_AUTHORIZED"
+                        if "authorization" in admission_error
+                        else (
+                            "SKILL_REGISTRY_VERSION_MISMATCH"
+                            if "registry" in admission_error
+                            else "CAPABILITY_NOT_READY"
+                        )
+                    ),
+                    message=admission_error,
+                )
                 goal_handle.abort()
                 return result
             self._execution_store.mark_committing(record.execution_id)
@@ -1137,6 +1215,9 @@ class SkillExecutorNode(Node):
                 + budget_binding.task_budget.deadline.nanosec / 1_000_000_000,
                 step_terminal_states=[WORKFLOW_STEP_PENDING] * len(program.steps),
             )
+            program_workflow.late_cleanup_callback = lambda: self._finalize_program_admission(
+                program_child_admission, program_owner
+            )
             self._active_workflow = program_workflow
             self._active_skill_admission = program_child_admission
             self._active_skill_owner = program_owner
@@ -1169,7 +1250,10 @@ class SkillExecutorNode(Node):
                     result.error_code = "SKILL_CANCELLED"
                     result.message = "program canceled between steps"
                     result.completed_step_count = completed
-                    goal_handle.canceled()
+                    if bool(getattr(goal_handle, "is_cancel_requested", False)):
+                        goal_handle.canceled()
+                    else:
+                        goal_handle.abort()
                     self._finalize_program_admission(program_child_admission, program_owner)
                     return result
                 if self._remaining_task_budget_sec(budget_binding) <= 0.0:
@@ -1193,7 +1277,7 @@ class SkillExecutorNode(Node):
                 skill_goal.dispatch_binding.expected_registry_epoch = program.identity.registry_epoch
                 skill_goal.dispatch_binding.expected_registry_generation = program.identity.registry_generation
                 skill_goal.dispatch_binding.expected_registry_digest = program.identity.registry_digest
-                skill_goal.dispatch_binding.trace_id = program.request_id
+                skill_goal.dispatch_binding.trace_id = goal.trace_id or program.request_id
                 skill_goal.dispatch_binding.task_budget.schema_version = budget_binding.task_budget.schema_version
                 skill_goal.dispatch_binding.task_budget.started_at.sec = budget_binding.task_budget.started_at.sec
                 skill_goal.dispatch_binding.task_budget.started_at.nanosec = (
@@ -1201,7 +1285,6 @@ class SkillExecutorNode(Node):
                 )
                 skill_goal.dispatch_binding.task_budget.deadline.sec = budget_binding.task_budget.deadline.sec
                 skill_goal.dispatch_binding.task_budget.deadline.nanosec = budget_binding.task_budget.deadline.nanosec
-                skill_goal.dispatch_binding.workflow_digest = ""
                 skill_goal.dispatch_binding.workflow_digest = program_workflow.workflow_digest
                 skill_goal.dispatch_binding.root_lease_nonce = program_workflow.root_lease_nonce
                 skill_goal.dispatch_binding.dispatch_nonce = ""
@@ -1219,7 +1302,10 @@ class SkillExecutorNode(Node):
                 skill_goal.motion_distance = step.motion_distance
                 skill_goal.arm_side = step.arm_side
                 skill_goal.imitation_duration_sec = step.imitation_duration_sec
-                skill_goal.timeout_sec = step.timeout_sec or self._gateway_timeout_policy["default_skill_timeout_sec"]
+                # Preserve the canonical request timeout for workflow identity;
+                # GatewayPolicy applies the catalog cap and the child executor
+                # clamps the accepted timeout to the shared root deadline.
+                skill_goal.timeout_sec = step.timeout_sec
                 skill_goal.direction = step.direction
                 skill_goal.distance = step.distance
                 skill_goal.degree = step.degree
@@ -1229,6 +1315,15 @@ class SkillExecutorNode(Node):
                 skill_goal.y = step.y or 0.0
                 skill_goal.has_yaw = step.yaw is not None
                 skill_goal.yaw = step.yaw or 0.0
+                feedback = ExecuteProgram.Feedback()
+                feedback.execution_id = record.execution_id
+                feedback.sequence = record.last_event_sequence
+                feedback.state = "ACTIVE"
+                feedback.workflow_step_index = index
+                feedback.current_skill = step.skill_name
+                feedback.detail = f"executing step {index + 1} of {len(program.steps)}"
+                feedback.program_digest = program.program_digest
+                goal_handle.publish_feedback(feedback)
                 child_result = self._execute_program_child(skill_goal, goal_handle, record.execution_id)
                 if not child_result.success:
                     cleanup_pending = child_result.error_code in {
@@ -1273,12 +1368,22 @@ class SkillExecutorNode(Node):
             result.actual_registry_epoch = bundle.registry_epoch
             result.actual_registry_generation = bundle.generation
             result.actual_registry_digest = bundle.snapshot.registry_digest
+            result.workflow_digest = record.workflow_digest or program.program_digest
             goal_handle.succeed()
             self._finalize_program_admission(program_child_admission, program_owner)
         except Exception as exc:
             result.success = False
             result.state = "FAILED"
-            result.error_code = type(exc).__name__.upper()
+            if isinstance(exc, ExecutionConflictError):
+                result.error_code = "SKILL_REQUEST_ID_CONFLICT"
+            elif isinstance(exc, ExecutionBusyError):
+                result.error_code = SKILL_BUSY
+            elif isinstance(exc, ExecutionQuarantinedError):
+                result.error_code = "EXECUTION_QUARANTINED"
+            elif isinstance(exc, ValueError):
+                result.error_code = "SKILL_SCHEMA_INVALID"
+            else:
+                result.error_code = "EXECUTION_INTERNAL_ERROR"
             result.message = str(exc)
             if record is not None and not record.terminal:
                 with suppress(Exception):
@@ -1352,11 +1457,18 @@ class SkillExecutorNode(Node):
         response.robot_id = record.robot_id
         response.state = record.state
         response.program_digest = record.program_digest
+        response.canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
         response.completed_step_count = record.completed_step_count
         response.stop_requested = record.stop_requested
         response.last_event_sequence = record.last_event_sequence
         response.error_code = record.error_code
         response.message = record.message
+        response.actual_registry_epoch = record.actual_registry_epoch
+        response.actual_registry_generation = record.actual_registry_generation
+        response.actual_registry_digest = record.actual_registry_digest
+        reconciliation = self._execution_store.reconciliation(record.execution_id)
+        response.reconciled = reconciliation is not None
+        response.reconciliation_evidence = reconciliation["evidence"] if reconciliation else ""
         return response
 
     def _get_execution_events(self, request, response):
@@ -1379,6 +1491,7 @@ class SkillExecutorNode(Node):
         events = self._execution_store.events_after(
             record.execution_id, sequence=int(request.after_sequence), limit=max(1, min(int(request.limit or 100), 100))
         )
+        canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
         response.events = [
             ExecutionEvent(
                 schema_version=1,
@@ -1389,9 +1502,11 @@ class SkillExecutorNode(Node):
                 sequence=event.sequence,
                 state=event.state,
                 program_digest=record.program_digest,
+                canonical_steps=canonical_steps,
                 completed_step_count=event.completed_step_count,
                 error_code=event.error_code,
                 message=event.message,
+                created_at=_time_message(event.created_at),
             )
             for event in events
         ]
@@ -3603,6 +3718,7 @@ class SkillExecutorNode(Node):
         self._converge_retained_admission(admission)
 
     def _converge_retained_admission(self, admission) -> None:
+        late_cleanup_callback = None
         with self._state_guard():
             cleanup = self._retained_admission_cleanup.get(id(admission))
             if (
@@ -3617,32 +3733,35 @@ class SkillExecutorNode(Node):
             ):
                 return
             if isinstance(admission, _WorkflowChildAdmission):
+                late_cleanup_callback = getattr(admission.workflow, "late_cleanup_callback", None)
                 self._active_skill_admission = None
                 self._active_skill_owner = None
                 self._active_audit_context = None
                 self._active_runtime_bundle = None
                 del self._retained_admission_cleanup[id(admission)]
-                return
-            cleanup.finalizing = True
-            try:
-                self._gateway_policy.finalize(
-                    admission,
-                    error_code=SKILL_CANCEL_TIMEOUT,
-                    terminal_metadata={"duration_sec": cleanup.duration_sec, "step_count": cleanup.step_count},
-                )
-            except Exception:
-                cleanup.finalizing = False
-                return
-            self._active_skill_admission = None
-            self._active_skill_owner = None
-            self._active_audit_context = None
-            active_bundle = getattr(self, "_active_runtime_bundle", None)
-            if getattr(self, "_active_runtime_generation_retained", False) and active_bundle is not None:
-                with suppress(Exception):
-                    self._runtime_coordinator.release(active_bundle.generation)
-            self._active_runtime_generation_retained = False
-            self._active_runtime_bundle = None
-            del self._retained_admission_cleanup[id(admission)]
+            else:
+                cleanup.finalizing = True
+                try:
+                    self._gateway_policy.finalize(
+                        admission,
+                        error_code=SKILL_CANCEL_TIMEOUT,
+                        terminal_metadata={"duration_sec": cleanup.duration_sec, "step_count": cleanup.step_count},
+                    )
+                except Exception:
+                    cleanup.finalizing = False
+                    return
+                self._active_skill_admission = None
+                self._active_skill_owner = None
+                self._active_audit_context = None
+                active_bundle = getattr(self, "_active_runtime_bundle", None)
+                if getattr(self, "_active_runtime_generation_retained", False) and active_bundle is not None:
+                    with suppress(Exception):
+                        self._runtime_coordinator.release(active_bundle.generation)
+                self._active_runtime_generation_retained = False
+                self._active_runtime_bundle = None
+                del self._retained_admission_cleanup[id(admission)]
+        if late_cleanup_callback is not None:
+            late_cleanup_callback()
 
     def _release_late_external_primitive(self, token) -> None:
         """Converge terminal ledger and retained generation before reopening the root lease."""
@@ -3699,12 +3818,8 @@ class SkillExecutorNode(Node):
                 remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
-            workflow_owned = (
-                isinstance(internal_admission, _WorkflowChildAdmission)
-                and internal_admission.workflow.owner.kind == "workflow"
-            )
-            if goal.timeout_sec > remaining_budget and not workflow_owned:
-                return TIMEOUT_EXCEEDS_POLICY, None, None, False
+            if goal.timeout_sec > remaining_budget:
+                goal.timeout_sec = remaining_budget
             if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
             borrow = workflow.policy.borrow_workflow_internal(

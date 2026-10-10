@@ -704,10 +704,7 @@ class GatewayPolicy:
                 **decision_args,
             )
         timeout_cap = self._skill_timeout_caps.get(str(prepared.payload["skill_name"]), self._task_budget_sec)
-        workflow_owner = owner is not None and (owner.kind == "workflow" or owner.root_kind == "workflow")
-        if (
-            prepared.effective_timeout_sec > timeout_cap and not workflow_owner
-        ) or prepared.effective_timeout_sec > self._task_budget_sec:
+        if prepared.effective_timeout_sec > timeout_cap or prepared.effective_timeout_sec > self._task_budget_sec:
             return GatewayDecision(admitted=False, error_code=TIMEOUT_EXCEEDS_POLICY, **decision_args)
         if not readiness.ready:
             return GatewayDecision(
