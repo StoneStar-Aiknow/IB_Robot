@@ -7,13 +7,6 @@ from robot_config.config import (
     RobotConfig,
     Ros2ControlConfig,
 )
-from robot_config.inference_config import (
-    ControlModeInferenceConfig,
-    InferenceConfigError,
-    InferencePipelineConfig,
-    InferenceTransportConfig,
-    parse_inference_config,
-)
 from robot_config.observation_transport import (
     H264Spec,
     ObservationTransportSpec,
@@ -22,14 +15,20 @@ from robot_config.observation_transport import (
     VideoMediaSpec,
     VideoReadinessSpec,
 )
-from robot_config.perception_runtime_config import (
-    PerceptionModelServiceConfig,
-    PerceptionRuntimeConfig,
-    PerceptionRuntimeConfigError,
-    parse_perception_runtime_config,
-)
 
 _LAZY_EXPORTS = {
+    # Inference / perception parsing pulls in inference_manifest (pydantic,
+    # jsonschema); keep them lazy so lightweight consumers such as robot-skill
+    # do not pay for it on every invocation.
+    "ControlModeInferenceConfig": ("robot_config.inference_config", "ControlModeInferenceConfig"),
+    "InferenceConfigError": ("robot_config.inference_config", "InferenceConfigError"),
+    "InferencePipelineConfig": ("robot_config.inference_config", "InferencePipelineConfig"),
+    "InferenceTransportConfig": ("robot_config.inference_config", "InferenceTransportConfig"),
+    "parse_inference_config": ("robot_config.inference_config", "parse_inference_config"),
+    "PerceptionModelServiceConfig": ("robot_config.perception_runtime_config", "PerceptionModelServiceConfig"),
+    "PerceptionRuntimeConfig": ("robot_config.perception_runtime_config", "PerceptionRuntimeConfig"),
+    "PerceptionRuntimeConfigError": ("robot_config.perception_runtime_config", "PerceptionRuntimeConfigError"),
+    "parse_perception_runtime_config": ("robot_config.perception_runtime_config", "parse_perception_runtime_config"),
     "bind_robot_interfaces": ("robot_config.interface_binding", "bind_robot_interfaces"),
     "build_contract_from_robot_config_dict": (
         "robot_config.loader",

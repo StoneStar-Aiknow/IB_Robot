@@ -63,6 +63,9 @@ def _load_robot_yaml(config_path: str) -> dict:
     return robot_config
 
 
+# Poll interval for goal/result futures (see skill_executor_node._WAIT_POLL_SEC).
+_WAIT_POLL_SEC = 0.005
+
 # Every gripper command used to take this fixed time, including a full open or
 # close; durations now scale with distance but never exceed this speed.
 _GRIPPER_FULL_STROKE_SEC = 1.0
@@ -436,7 +439,7 @@ class TaskExecutorNode(Node):
         while not future.done():
             if self._cancel_requested:
                 return False, "Cancelled while sending gripper goal"
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -449,7 +452,7 @@ class TaskExecutorNode(Node):
             if self._cancel_requested:
                 goal_handle.cancel_goal_async()
                 return False, "Cancelled during gripper motion"
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         result = result_future.result()
         if result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:

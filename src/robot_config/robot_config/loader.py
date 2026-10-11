@@ -1301,7 +1301,8 @@ def _load_robot_section_with_sources(
         raise FileNotFoundError(f"Robot configuration not found: {resolved_config_path}")
 
     with resolved_config_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        # libyaml parser with the same safe constructor as yaml.safe_load.
+        data = yaml.load(f, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)) or {}  # noqa: S506
 
     if not isinstance(data, dict):
         raise ValueError(f"Invalid robot config: expected mapping in {resolved_config_path}")

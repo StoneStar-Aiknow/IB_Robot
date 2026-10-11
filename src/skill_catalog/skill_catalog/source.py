@@ -158,6 +158,12 @@ class SkillSource(Protocol):
 # --------------------------------------------------------------------------- #
 
 
+# Same safe constructor and resolver as ``yaml.safe_load``; the libyaml parser
+# only makes the 70+ catalog files several times faster to read for every
+# ``robot-skill`` invocation.  Fall back when PyYAML was built without it.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def load_yaml_mapping(path: Path) -> Mapping[str, Any]:
     if not path.is_file():
         raise SkillCatalogError(
@@ -167,7 +173,7 @@ def load_yaml_mapping(path: Path) -> Mapping[str, Any]:
         )
     try:
         with open(path, encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle)
+            loaded = yaml.load(handle, Loader=_SAFE_LOADER)  # noqa: S506 - safe loader
     except yaml.YAMLError as exc:
         raise SkillCatalogError(
             "invalid YAML",

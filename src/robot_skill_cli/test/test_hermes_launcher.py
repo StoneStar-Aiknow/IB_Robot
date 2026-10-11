@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from robot_skill_cli import hermes_launcher
 from robot_skill_cli.ros_bridge import BridgeError
@@ -424,6 +425,46 @@ def test_hermes_skills_directory_uses_reported_active_profile(tmp_path, monkeypa
     )
 
     assert hermes_launcher._hermes_skills_directory("/bin/hermes") == config_path.parent / "skills"
+
+
+def test_launcher_rejects_transport_that_differs_from_the_configured_binding(tmp_path, monkeypatch) -> None:
+    # hermes-robot-configure stores the RMW it saw; the motion plugin then runs
+    # robot-skill with that value even when this shell switched to another RMW.
+    skills_directory = tmp_path / "skills"
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.delenv("CYCLONEDDS_URI", raising=False)
+    monkeypatch.delenv("ROS_LOCALHOST_ONLY", raising=False)
+
+    # No profile config, or a profile without the managed motion plugin: nothing is bound.
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+    hermes_launcher._check_bound_robot_transport(skills_directory)
+    config_path.write_text("plugins:\n  entries: {}\n", encoding="utf-8")
+    hermes_launcher._check_bound_robot_transport(skills_directory)
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "entries": {
+                        "ibrobot-motion": {"settings": {"environment": {"RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp"}}}
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    hermes_launcher._check_bound_robot_transport(skills_directory)
+
+    for current in ("rmw_fastrtps_cpp", None):
+        if current is None:
+            monkeypatch.delenv("RMW_IMPLEMENTATION")
+        else:
+            monkeypatch.setenv("RMW_IMPLEMENTATION", current)
+        with pytest.raises(hermes_launcher.LauncherError) as error:
+            hermes_launcher._check_bound_robot_transport(skills_directory)
+        assert error.value.code == "ROBOT_TRANSPORT_MISMATCH"
+        assert "re-run hermes-robot-configure" in str(error.value)
 
 
 def test_hermes_skill_discovery_requires_enabled_skill(monkeypatch) -> None:

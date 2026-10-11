@@ -191,6 +191,31 @@ def _check_hermes_skill_discovery(hermes_path: str) -> None:
         raise LauncherError("AGENT_SKILL_UNAVAILABLE", "Hermes cannot discover the installed ibrobot-control skill")
 
 
+def _check_bound_robot_transport(skills_directory: Path) -> None:
+    """Refuse to launch when hermes-robot-configure bound a different ROS transport.
+
+    The motion plugin runs ``robot-skill`` with the transport variables that
+    ``hermes-robot-configure`` stored in the profile, which override this
+    shell's values.  If the RMW was changed afterwards, every managed motion
+    would silently fail to discover the Gateway that the preflight just
+    reached, so report the stale binding instead.
+    """
+    try:
+        config = yaml.safe_load((skills_directory.parent / "config.yaml").read_text(encoding="utf-8"))
+        bound = config["plugins"]["entries"]["ibrobot-motion"]["settings"]["environment"]
+    except (OSError, yaml.YAMLError, KeyError, TypeError):
+        return
+    if not isinstance(bound, dict):
+        return
+    for name in ("RMW_IMPLEMENTATION", "CYCLONEDDS_URI", "ROS_LOCALHOST_ONLY"):
+        if name in bound and str(bound[name]) != os.environ.get(name):
+            raise LauncherError(
+                "ROBOT_TRANSPORT_MISMATCH",
+                f"hermes-robot-configure bound {name}={bound[name]} but this shell uses "
+                f"{os.environ.get(name, '<unset>')}; re-run hermes-robot-configure from this shell",
+            )
+
+
 def _shell_environment_assignment(name: str, value: str | None) -> str:
     if value is None:
         return f"unset {name}"
@@ -332,6 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _trace_stage("resolving Hermes profile")
         workspace = _prepare_hermes_workspace()
         skills_directory = _hermes_skills_directory(hermes_path)
+        _check_bound_robot_transport(skills_directory)
         _trace_stage("registering IB-Robot skill")
         register_hermes_skill(_installed_skill_path(), skills_directory)
         _trace_stage("checking Hermes skill discovery")

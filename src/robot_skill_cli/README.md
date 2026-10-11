@@ -378,6 +378,10 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
   `embodied_agent` 视觉游戏播报节点的内部 RPC 超时，三者语义不同，互不替代。
 - 验证当前 `ROS_DOMAIN_ID`（0-232）和 workspace `.shrc_local`（ROS+venv+install overlay 的
   SSOT 入口，见 `AGENTS.md`）。
+- 启用 `ibrobot-motion` 时，把当前 shell 已设置的 `RMW_IMPLEMENTATION`、`CYCLONEDDS_URI`、
+  `ROS_LOCALHOST_ONLY` 写入 profile，受管运动始终使用这组值。之后如果更换 RMW（例如在 Fast DDS 与
+  CycloneDDS 之间切换），必须在新的 shell 环境中重新执行 `hermes-robot-configure`；`hermes-robot`
+  启动时会比较 profile 中的绑定值与当前 shell，不一致时以 `ROBOT_TRANSPORT_MISMATCH` 退出。
 - 把 `resource/hermes/SOUL.md`（`--soul-mode replace`）或 `POLICY.md` 托管区块（`--soul-mode merge`）
   写入 profile/SOUL.md，`skip` 不修改 SOUL；`replace` 会先备份。
 - 把 `ibrobot-control` Skill 幂等注册到 `profile/skills/`，仅替换带 `robot_skill_cli` 所有权标记
@@ -421,3 +425,18 @@ runtime adapter 默认不安装。需要受管运动与优先停止时，显式�
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。
+
+## 排障：DDS 发现时延与 RMW 选择
+
+ROS 2 中间件沿用发行版默认的 Fast DDS，`.shrc_local` 不修改 `RMW_IMPLEMENTATION`，正常使用不需要切换。
+
+- **现象**：Fast DDS 下每个新进程（每次 `robot-skill` 调用都是新进程）需要先与已运行的 Gateway 完成 DDS 发现，
+  才能发出第一个请求。在 SO-101 单机上实测约 1 s，偶发 2–3 s；耗时随网络、节点数量和发现配置变化。
+- **可选：改用 CycloneDDS**：安装 `ros-humble-rmw-cyclonedds-cpp`，并在 `source .shrc_local` 之前执行
+  `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`。目前只在未接相机的 SO-101 单机上验证过（敲命令到机械臂开始
+  运动约 0.8 s）；相机图像传输、LeKiwi、openEuler 与跨机器部署尚未验证。
+- **影响整个 ROS 图**：同一 ROS 图内所有进程必须使用同一 RMW。切换后要重启所有已在运行的节点（包括 launch），
+  并执行 `ros2 daemon stop`，只改 `robot-skill` 所在 shell 不会生效。
+- **Hermes**：受管运动使用 `hermes-robot-configure` 时绑定的 RMW，切换后必须在新的 shell 中重新执行
+  `hermes-robot-configure`，否则 `hermes-robot` 以 `ROBOT_TRANSPORT_MISMATCH` 拒绝启动（见
+  [Hermes 集成同步](#hermes-集成同步)）。

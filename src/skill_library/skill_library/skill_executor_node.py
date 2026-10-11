@@ -500,6 +500,12 @@ def _load_json_list(raw_value: str) -> list[str]:
     return [str(item) for item in parsed]
 
 
+# Poll interval for goal/result futures.  A skill crosses three action hops
+# (skill -> primitive -> task_executor -> controller), each with an accept and
+# a result wait, so a 50 ms poll added ~0.3 s before the arm started moving.
+_WAIT_POLL_SEC = 0.005
+
+
 class SkillExecutorNode(Node):
     """Expose skill and primitive actions with explicit safety validation."""
 
@@ -1901,7 +1907,7 @@ class SkillExecutorNode(Node):
                         PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                         f"named motion {motion} still running at the skill deadline; admission held until it ends",
                     )
-                time.sleep(0.05)
+                time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
                 late_cleanup.watch_result_future(result_future)
                 return self._abort_skill(
@@ -3087,7 +3093,7 @@ class SkillExecutorNode(Node):
                 if cancel_callback is not None:
                     cancel_callback()
                 return False
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
         return future.done()
 
     def _required_control_mode_for_skill(self, skill_name: str) -> str:
@@ -4416,7 +4422,7 @@ class SkillExecutorNode(Node):
                         "cancel cleanup timed out while sending navigation goal",
                     )
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
         if not send_future.done():
             self._cancel_goal_future(send_future, late_cleanup_confirmation)
             return False, "NAVIGATION_INTERNAL_ERROR", "navigation goal send interrupted"
@@ -4469,7 +4475,7 @@ class SkillExecutorNode(Node):
                         "cancel cleanup timed out during navigation execution",
                     )
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
         if not result_future.done():
             cleaned = self._cancel_goal(navigation_handle, result_future, late_cleanup_confirmation)
             return (
@@ -4583,7 +4589,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out while sending arm goal",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         gh = send_future.result()
         if not gh.accepted:
@@ -4605,7 +4611,7 @@ class SkillExecutorNode(Node):
                     False,
                     "timeout waiting for arm motion" if cleaned else "cancel cleanup timed out during arm motion",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         result = result_future.result().result
         if not result.success:
@@ -4637,7 +4643,7 @@ class SkillExecutorNode(Node):
             if time.monotonic() >= deadline:
                 future.cancel()
                 return False, "timeout waiting for MoveIt configuration motion"
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         response = future.result()
         if response is None:
@@ -4693,7 +4699,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out while sending arm trajectory goal",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         gh = send_future.result()
         if not gh.accepted:
@@ -4722,7 +4728,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out during arm joint trajectory execution",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         result = result_future.result()
         if result is None or result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
@@ -4774,7 +4780,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out while sending arm trajectory goal",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         gh = send_future.result()
         if not gh.accepted:
@@ -4803,7 +4809,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out during arm joint waypoint trajectory execution",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         result = result_future.result()
         if result is None or result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
@@ -4858,7 +4864,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out while sending gripper goal",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         gh = send_future.result()
         if not gh.accepted:
@@ -4887,7 +4893,7 @@ class SkillExecutorNode(Node):
                     if cleaned
                     else "cancel cleanup timed out during gripper execution",
                 )
-            time.sleep(0.05)
+            time.sleep(_WAIT_POLL_SEC)
 
         result = result_future.result().result
         if not result.success:
@@ -5064,7 +5070,7 @@ class SkillExecutorNode(Node):
                         "SKILL_TIMEOUT",
                         "pick skill deadline exceeded",
                     )
-                time.sleep(0.05)
+                time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
                 return self._abort_skill(
                     result,
@@ -5263,7 +5269,7 @@ class SkillExecutorNode(Node):
                         "SKILL_TIMEOUT",
                         "imitate human motion skill deadline exceeded",
                     )
-                time.sleep(0.05)
+                time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
                 return self._abort_skill(
                     result,
@@ -5470,7 +5476,7 @@ class SkillExecutorNode(Node):
                         )
                     delegated_terminal = True
                     break
-                time.sleep(0.05)
+                time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
                 return self._abort_skill(
                     result,
