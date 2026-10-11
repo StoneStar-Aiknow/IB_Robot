@@ -73,6 +73,13 @@ VoxPoser planner ─────┘                               │
 `gripper_position_tolerance` 和 `joint_state_max_age_s`。启用后，仅当最近收到的关节反馈足够新、包含夹爪关节，
 且当前位置已在打开目标容差内时，执行器才跳过打开轨迹；关闭命令以及陈旧或缺失反馈仍按原路径执行。
 
+除上述 `skip_redundant_gripper_open` 跳过的打开命令外，夹爪命令都会发送，轨迹时长按行程计算：launch 参数
+`gripper_full_stroke`（由 `robot_config` 的 task executor launch builder 解析 `gripper_open_position` 与
+`gripper_closed_position`，执行器块优先，否则取 `embodied.execution`）视为一次完整开合（原先固定 1 秒），按同样的速度
+折算当前位置到目标的距离，下限 0.1 秒、上限 1 秒。因此完整开合仍是 1 秒，任何命令都不会比原先的开合更快；夹爪已在
+目标位置时仍会下发同一目标，只是轨迹缩短到 0.1 秒，后续动作不必空等 1 秒。开合位置未配置齐全（`gripper_full_stroke`
+为 0）或关节反馈陈旧、缺失时，沿用固定 1 秒。
+
 ### 消息定义
 
 **TaskStep.msg** — 任务步骤：

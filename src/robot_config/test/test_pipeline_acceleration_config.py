@@ -63,6 +63,7 @@ def test_310p_profile_does_not_skip_the_initial_gripper_open() -> None:
 
     assert _launch_parameter_value(node, "skip_redundant_gripper_open") is False
     assert _launch_parameter_value(node, "gripper_open_position") == 1.0
+    assert _launch_parameter_value(node, "gripper_full_stroke") == 1.0
     assert _launch_parameter_value(node, "gripper_position_tolerance") == 0.05
     assert _launch_parameter_value(node, "joint_state_max_age_s") == 0.25
 
@@ -118,3 +119,28 @@ def test_moveit_task_executor_fails_before_launch_when_package_is_missing(monkey
 
     with pytest.raises(RuntimeError, match="task_dispatch.*not present"):
         generate_task_executor_node(config, "moveit_planning")
+
+
+def test_task_executor_gripper_stroke_has_one_owner_and_is_unknown_without_both_positions() -> None:
+    base = {
+        "_config_path": "/tmp/robot.yaml",
+        "control_modes": {"moveit_planning": {"executor": {}}},
+    }
+
+    def stroke(executor: dict, execution: dict | None) -> tuple[float, float]:
+        config = {**base, "control_modes": {"moveit_planning": {"executor": executor}}}
+        if execution is not None:
+            config["embodied"] = {"execution": execution}
+        node = generate_task_executor_node(config, "moveit_planning")
+        return (
+            _launch_parameter_value(node, "gripper_full_stroke"),
+            _launch_parameter_value(node, "gripper_open_position"),
+        )
+
+    so101 = {"gripper_open_position": 1.0, "gripper_closed_position": 0.15}
+    assert stroke({}, so101) == pytest.approx((0.85, 1.0))
+    # The executor block overrides the embodied defaults position by position.
+    assert stroke({"gripper_open_position": 0.9}, so101) == pytest.approx((0.75, 0.9))
+    # Missing either position: unknown, the executor keeps its fixed 1 s.
+    assert stroke({}, {"gripper_open_position": 1.0}) == pytest.approx((0.0, 1.0))
+    assert stroke({}, None) == pytest.approx((0.0, 1.0))

@@ -63,6 +63,37 @@ def _load_robot_yaml(config_path: str) -> dict:
     return robot_config
 
 
+# Every gripper command used to take this fixed time, including a full open or
+# close; durations now scale with distance but never exceed this speed.
+_GRIPPER_FULL_STROKE_SEC = 1.0
+# Lower bound so a command to the current position still forms a valid,
+# monotonic trajectory the controller can execute and report.
+_GRIPPER_MIN_TRAJECTORY_SEC = 0.1
+
+
+def gripper_trajectory_duration(
+    target: float,
+    current: float | None,
+    stroke: float,
+    *,
+    full_stroke_sec: float = _GRIPPER_FULL_STROKE_SEC,
+    min_sec: float = _GRIPPER_MIN_TRAJECTORY_SEC,
+) -> float:
+    """Return the trajectory time for one gripper command.
+
+    The command is always sent; only its duration follows the distance to
+    travel.  ``stroke`` is the configured open-to-closed distance, which every
+    open or close command used to cover in ``full_stroke_sec``, so no command
+    moves faster than an open or close always has.  Without fresh feedback or
+    a configured stroke the previous fixed duration is used, never a guess.
+    """
+    if current is None or not math.isfinite(current) or not math.isfinite(target):
+        return full_stroke_sec
+    if not math.isfinite(stroke) or stroke <= 0.0:
+        return full_stroke_sec
+    return min(full_stroke_sec, max(min_sec, full_stroke_sec * abs(target - current) / stroke))
+
+
 class TaskExecutorNode(Node):
     """Delegate through public runtime interfaces, retaining provider-less legacy routing."""
 
@@ -92,6 +123,10 @@ class TaskExecutorNode(Node):
         self._gripper_open_position = float(self.get_parameter("gripper_open_position").value)
         self._gripper_position_tolerance = max(float(self.get_parameter("gripper_position_tolerance").value), 0.0)
         self._joint_state_max_age_s = max(float(self.get_parameter("joint_state_max_age_s").value), 0.0)
+        # Configured open-to-closed distance, resolved by the robot_config launch
+        # builder; 0.0 (unknown) keeps the fixed full-stroke duration.
+        self.declare_parameter("gripper_full_stroke", 0.0)
+        self._gripper_stroke = max(float(self.get_parameter("gripper_full_stroke").value), 0.0)
 
         # Resolve every binding before creating any motion-capable ROS client.
         self._configure_interfaces()
@@ -389,7 +424,11 @@ class TaskExecutorNode(Node):
         goal_msg.trajectory.joint_names = [self._gripper_joint]
         point = JointTrajectoryPoint()
         point.positions = [target_position]
-        point.time_from_start = Duration(sec=1, nanosec=0)
+        duration = gripper_trajectory_duration(
+            target_position, self._fresh_gripper_position(), getattr(self, "_gripper_stroke", 0.0)
+        )
+        seconds, nanoseconds = divmod(int(round(duration * 1e9)), 1_000_000_000)
+        point.time_from_start = Duration(sec=seconds, nanosec=nanoseconds)
         goal_msg.trajectory.points = [point]
 
         future = self._gripper_action_client.send_goal_async(goal_msg, feedback_callback=self._gripper_feedback_cb)
@@ -404,7 +443,7 @@ class TaskExecutorNode(Node):
             return False, "Gripper trajectory goal rejected"
 
         result_future = goal_handle.get_result_async()
-        self.get_logger().info(f"    Gripper → {target_position:.2f}")
+        self.get_logger().info(f"    Gripper → {target_position:.2f} in {duration:.2f}s")
 
         while not result_future.done():
             if self._cancel_requested:
@@ -444,6 +483,22 @@ class TaskExecutorNode(Node):
             self._latest_joint_state = msg
             self._latest_joint_state_received_at = time.monotonic()
 
+    def _fresh_gripper_position(self, *, now: float | None = None) -> float | None:
+        """Return the gripper position from fresh joint feedback, or ``None``."""
+        checked_at = time.monotonic() if now is None else float(now)
+        with self._joint_state_lock:
+            joint_state = self._latest_joint_state
+            received_at = self._latest_joint_state_received_at
+        if joint_state is None or received_at is None or checked_at - received_at > self._joint_state_max_age_s:
+            return None
+        if self._gripper_joint not in joint_state.name:
+            return None
+        index = joint_state.name.index(self._gripper_joint)
+        if index >= len(joint_state.position):
+            return None
+        current_position = float(joint_state.position[index])
+        return current_position if math.isfinite(current_position) else None
+
     def _is_redundant_gripper_open(self, target: float, *, now: float | None = None) -> bool:
         """Return true only when fresh feedback confirms an open-target no-op."""
         if not self._skip_redundant_gripper_open or not math.isfinite(float(target)):
@@ -452,19 +507,8 @@ class TaskExecutorNode(Node):
         if abs(float(target) - self._gripper_open_position) > tolerance:
             return False
 
-        checked_at = time.monotonic() if now is None else float(now)
-        with self._joint_state_lock:
-            joint_state = self._latest_joint_state
-            received_at = self._latest_joint_state_received_at
-        if joint_state is None or received_at is None or checked_at - received_at > self._joint_state_max_age_s:
-            return False
-        if self._gripper_joint not in joint_state.name:
-            return False
-        index = joint_state.name.index(self._gripper_joint)
-        if index >= len(joint_state.position):
-            return False
-        current_position = float(joint_state.position[index])
-        return math.isfinite(current_position) and abs(current_position - float(target)) <= tolerance
+        current_position = self._fresh_gripper_position(now=now)
+        return current_position is not None and abs(current_position - float(target)) <= tolerance
 
     def _wait_for_gripper(self, target: float, timeout_s: float = 3.0, tolerance: float = 0.05):
         """Wait until gripper joint reaches target position (best-effort)."""
