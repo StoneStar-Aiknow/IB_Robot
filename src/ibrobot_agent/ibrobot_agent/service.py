@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import threading
@@ -383,6 +384,7 @@ class AgentService:
             if status.get("control_plane_ready", True) is False:
                 raise RuntimeError("Gateway control plane is not ready")
             self._validate_workflow(outcome, catalog)
+            outcome = self._bind_step_schema_versions(outcome, catalog)
             identity = RegistryIdentity(
                 epoch=str(status["registry_epoch"]),
                 generation=int(status["registry_generation"]),
@@ -550,6 +552,37 @@ class AgentService:
                 raise RuntimeError(f"skill is not executable: {step.skill_name}")
             if self._allowed_skills and step.skill_name not in self._allowed_skills:
                 raise RuntimeError(f"skill is outside the incubation allowlist: {step.skill_name}")
+
+    @staticmethod
+    def _bind_step_schema_versions(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:
+        """Take each step's ``schema_version`` from the Gateway catalog, not from the model.
+
+        The contract version is a property of the selected skill (the Gateway
+        rejects any other value), so a planner that picked the wrong one is
+        corrected before the proposal, digest and presentation are built.  A
+        step that carries navigation parameters for a version-1 skill cannot
+        be expressed in that contract and is rejected instead of rewritten.
+        """
+        versions = {
+            item.get("name"): item.get("schema_version", 1)
+            for item in catalog.get("skills", [])
+            if isinstance(item, Mapping)
+        }
+        steps = []
+        for step in outcome.steps:
+            expected = versions[step.skill_name]
+            if isinstance(expected, bool) or not isinstance(expected, int):
+                raise RuntimeError(f"catalog schema_version of {step.skill_name} is not an integer: {expected!r}")
+            if step.schema_version != expected:
+                try:
+                    step = dataclasses.replace(step, schema_version=expected)
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"step cannot be bound to the {step.skill_name} contract (schema_version {expected}): {exc}"
+                    ) from exc
+                _LOGGER.info("bound %s to catalog schema_version %d", step.skill_name, expected)
+            steps.append(step)
+        return dataclasses.replace(outcome, steps=tuple(steps))
 
     def _present(
         self,

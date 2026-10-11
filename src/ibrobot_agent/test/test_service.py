@@ -857,3 +857,26 @@ def test_clarification_reply_is_bound_and_consumed(tmp_path):
         assert service.get_request(duplicate.to_key()).terminal.error_code == "CLARIFICATION_EXPIRED"
     finally:
         service.close()
+
+
+def test_step_schema_version_comes_from_the_catalog_contract():
+    # Observed on hardware: the model emitted schema_version 2 for an arm skill
+    # and the Gateway rejected the Program with SKILL_SCHEMA_INVALID.
+    from ibrobot_agent.contracts import PlannerOutcome
+
+    catalog = {"skills": [{"name": "wave_hello"}, {"name": "nav_turn", "schema_version": 2}]}
+
+    def bind(*steps):
+        outcome = PlannerOutcome(kind="workflow", user_message="执行", summary="执行", steps=steps)
+        return AgentService._bind_step_schema_versions(outcome, catalog).steps
+
+    bound = bind(CanonicalWorkflowStep(2, "wave_hello"), CanonicalWorkflowStep(1, "nav_turn"))
+    assert [(step.skill_name, step.schema_version) for step in bound] == [("wave_hello", 1), ("nav_turn", 2)]
+    with pytest.raises(RuntimeError, match="cannot be bound"):
+        bind(CanonicalWorkflowStep(2, "wave_hello", degree=30.0))
+
+    # A malformed or unsupported catalog version is a planner failure, not a crash.
+    for bad in (None, "1", True, 3):
+        catalog = {"skills": [{"name": "wave_hello", "schema_version": bad}]}
+        with pytest.raises(RuntimeError):
+            bind(CanonicalWorkflowStep(1 if bad != 1 else 2, "wave_hello"))

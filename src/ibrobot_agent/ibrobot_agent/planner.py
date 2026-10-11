@@ -133,8 +133,9 @@ def build_planner_messages(
         "The only permitted top-level fields are kind, user_message, query_kind, skill_name, missing_fields, "
         "reason_code, summary, and steps. Never return a field named text. Keep user_message <= 150 characters "
         "and summary <= 300 characters. For conversation/read_only/rejected, omit fields that do not belong "
-        "to that kind (especially summary and steps). For every workflow step, schema_version must be the JSON "
-        "integer 1 or 2, never a string, float, or omitted. Example conversation: "
+        "to that kind (especially summary and steps). For every workflow step, schema_version is a JSON "
+        "integer, never a string, float, or omitted: copy the schema_version of that skill's CATALOG entry, and "
+        "use 1 when the entry has none. Example conversation: "
         '{"kind":"conversation","user_message":"简短回答"}. Example workflow: '
         '{"kind":"workflow","user_message":"准备执行：nod_yes。","summary":"nod_yes",'
         '"steps":[{"schema_version":1,"skill_name":"nod_yes"}]}.'
