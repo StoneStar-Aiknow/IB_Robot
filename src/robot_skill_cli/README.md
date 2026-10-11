@@ -51,6 +51,23 @@ bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链
 显式 path、显式 name、`ROBOT_CONFIG`、`ROBOT_NAME`、默认 `so101_single_arm`。按名称先查安装目录，再查
 源码 `config/robots/`；显式 path 必须存在。
 
+### 常驻 ROS bridge
+
+每次调用 `robot-skill` 都是新进程。原先每个进程都要新建 ROS 节点，并等待已运行的 Gateway 发现它（Fast DDS 下
+约 1 s，偶发 2–3 s），然后才能发出第一个请求。现在需要访问 Gateway 的命令会把 ROS 传输交给一个按需启动的
+常驻进程 `robot-skill-daemon`，后续调用复用它已建立的连接，不再等待发现：
+
+- 第一次调用自动在后台启动 daemon；连续空闲 15 分钟（`IBROBOT_ROBOT_SKILL_DAEMON_IDLE_SEC`）后自动退出。
+- 只有 ROS 传输在 daemon 中执行；参数解析、catalog 加载、展示、停止状态和 stdout 输出仍在 CLI 进程内，
+  命令行为与输出契约不变。CLI 进程退出不会取消已提交的 goal，与原先一致。
+- daemon 按用户隔离：socket 位于权限 `0700` 的 `$XDG_RUNTIME_DIR/ibrobot/`（无该变量时为
+  `/tmp/ibrobot-<uid>/`），并校验对端 uid。socket 名由 `ROS_DOMAIN_ID`、`RMW_IMPLEMENTATION`、
+  `ROS_LOCALHOST_ONLY`、`CYCLONEDDS_URI` 等传输变量以及已安装代码共同决定，因此不同 domain、不同 RMW 或重新
+  构建后会自动使用新的 daemon，不会连到旧图或旧代码。
+- daemon 无法启动或连接时自动回退到进程内 bridge，行为与原先相同，只是没有时延收益。
+- `IBROBOT_ROBOT_SKILL_DAEMON=0` 关闭 daemon；`robot-skill-daemon --stop` 停止当前环境对应的 daemon；
+  daemon 日志写在 socket 同目录的 `.log` 文件。pytest 下默认关闭（根目录 `conftest.py`）。
+
 ## 命令
 
 | 命令 | ROS | 用途 |

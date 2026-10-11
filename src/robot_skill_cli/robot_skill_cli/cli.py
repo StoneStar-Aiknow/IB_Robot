@@ -199,9 +199,12 @@ def _run_catalog_command(args: argparse.Namespace, context) -> dict:
 
 
 def _create_bridge(transport):
-    from robot_skill_cli.ros_bridge import RosBridge
+    # The resident bridge keeps one ROS participant alive across invocations so
+    # a command does not wait for DDS discovery; it falls back to an
+    # in-process RosBridge whenever the daemon cannot be used.
+    from robot_skill_cli.bridge_daemon import ResidentBridge
 
-    return RosBridge(
+    return ResidentBridge(
         status_service=transport.status_service,
         snapshot_service=transport.snapshot_service,
         reload_service=transport.reload_service,
