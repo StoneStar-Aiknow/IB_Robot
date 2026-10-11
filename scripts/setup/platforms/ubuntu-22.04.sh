@@ -15,6 +15,15 @@ platform_install_colcon() {
     run_sudo apt-get install -y python3-colcon-common-extensions
 }
 
+# Training profile only: extra host prerequisites for the LeRobot training
+# path. ffmpeg backs torchcodec / dataset video decoding; python3-venv and
+# python3-pip come from platform_install_python_bootstrap. install_system_deps
+# skips this hook entirely when platform_training_system_deps_satisfied()
+# already holds (pure install-time shortcut: nothing to add, nothing to run).
+platform_install_training_system_deps() {
+    run_sudo apt-get install -y --no-install-recommends ffmpeg -qq
+}
+
 platform_install_python_bootstrap() {
     run_sudo apt-get update -qq
     run_sudo apt-get install -y python3-venv python3-pip -qq

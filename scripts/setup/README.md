@@ -18,6 +18,7 @@
 | `tests/test_lerobot_filter.sh` | 锁定 3 平台基准矩阵 + tag 绑定用例的回归 fixture。 |
 | `tests/test_cann_torch_versions.sh` | 无需安装 CANN，验证 CANN 版本探测与 openEuler Torch ABI 选择。 |
 | `tests/test_openeuler_cv_bridge_abi.sh` | 验证 openEuler 安装匹配 OpenCV 4.13 的 `cv_bridge` RPM。 |
+| `tests/test_setup_profile_training.sh` | 验证 `--profile training` 不触发 ROS 2 / rosdep / colcon，且 `full` / `inference` 行为不变。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
@@ -29,6 +30,7 @@
 | --- | --- |
 | `full`（默认） | 完整开发工作区：硬件、遥操作、感知、抓取、语音、仿真与开发工具全量安装。 |
 | `inference` | 仅运行策略推理的最小运行时，面向端边协同推理验证主机。 |
+| `training` | LeRobot 训练主机：只建 venv、应用 LeRobot 补丁栈并安装 LeRobot + 训练依赖，不装 ROS 2 / rosdep / colcon。 |
 
 `inference` profile 相对 `full` 的差异：
 
@@ -45,11 +47,28 @@
 ./scripts/build.sh --packages-up-to inference_service
 ```
 
+`training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的训练机）：
+
+- **ROS 2**：完全不安装。跳过 `scripts/install_ros.sh`、rosdep、colcon 与 ROS 第三方 patch 栈，也不要求 `install/` overlay。
+- **submodules**：只初始化 `libs/lerobot`。
+- **系统依赖**：只需要 Python bootstrap（`python3-venv` / `python3-pip`）与 `ffmpeg`（torchcodec 视频解码）。三者已存在时**完全不调用系统包管理器**，纯粹省掉一次不必要的安装。
+- **Python venv**：保留 `--system-site-packages`（与 `full` / `inference` 布局一致）；只安装 `base.txt`、`requirements/training.txt`（TensorBoard）与 LeRobot editable（extras：`smolvla,pi,diffusion,dataset,deepdiff-dep`）。跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception、FullSubNet、GraspGen、colcon、`empy` / `rosdep`、pre-commit / gitlint 钩子以及仅服务遥操作的 `kinematics` extra。
+- **NumPy / OpenCV**：**不做** ROS 2 ABI 钉版（`numpy==1.26.4` / `opencv<4.12`），沿用 LeRobot 解析出的版本；CANN 侧的依赖落位改由**加速器轴**决定（见上文「加速器轴依赖落位」）。
+- **验证**：跳过 ROS 2 / rosdep / colcon / cv_bridge / pygraphviz / tracing 校验，只校验 venv + `import lerobot` + `lerobot.policies.act` API + `lerobot-train` 可执行文件。
+- **`.shrc_local`**：读取 `venv/.ibrobot_setup_profile`；`training` 时欢迎信息标注 `(profile: training)`，把 ROS 2 / `install/` / CANN 的缺失显示为「按预期缺失」，并不再提示 `cb` / `cbp` / `src` 等 colcon 别名。
+- **GPU / CUDA 驱动**：不钉 Torch 版本，PyPI 的 Linux wheel 可能面向比本机驱动更新的 CUDA runtime（例如 `cu130` wheel 需要驱动 ≥ 580）。校验随后会打印 `CUDA_MISMATCH`（有 `nvidia-smi` 但 `torch.cuda.is_available()` 为假）并给出换装命令，例如 `venv/bin/python3 -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126`；设 `IBR_TRAINING_REQUIRE_CUDA=1` 可让该情况直接失败而不是静默退回 CPU 训练。
+
+> 命名提醒：此处的 `training` 是**安装范围** profile；它与 LeRobot 补丁过滤的 `training` profile（`IBR_LEROBOT_PROFILES` / `--lerobot-profiles`）属于不同命名空间。`--profile training` 不会改动补丁过滤集合，训练相关补丁照常应用。
+
+```bash
+# 纯训练机（无 ROS 2）：
+./scripts/setup.sh --yes --profile training
+source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
+```
+
 ## 加速器轴依赖落位
 
-`SETUP_ACCEL_ID`（`cuda` / `cann` / `cpu`）由 `detect.sh::detect_accel_id` 探测**设备**得出
-（`nvidia-smi -L` / `/dev/davinci[0-9]*`，不看工具包），实现在 `scripts/setup/accels/<id>.sh`。
-下表是各加速器**当前实际**的依赖来源，不是理想形态：
+`SETUP_ACCEL_ID`（`cuda` / `cann` / `cpu`）由设备探测决定，与安装范围 profile 独立。
 
 | | `cuda` | `cann` | `cpu` |
 | --- | --- | --- | --- |

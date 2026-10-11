@@ -13,6 +13,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `tests/test_lerobot_filter.sh` | Regression fixtures pinned to the canonical 3-platform matrix + tag-binding cases. |
 | `tests/test_cann_torch_versions.sh` | Tests CANN detection and openEuler Torch ABI selection without a CANN installation. |
 | `tests/test_openeuler_cv_bridge_abi.sh` | Tests installation of the OpenCV 4.13-compatible openEuler `cv_bridge` RPM. |
+| `tests/test_setup_profile_training.sh` | Asserts `--profile training` never triggers ROS 2 / rosdep / colcon while `full` / `inference` keep their behaviour. |
 
 ## Setup profiles (dependency-scope parameterization)
 
@@ -23,6 +24,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | --- | --- |
 | `full` (default) | Complete development workspace: hardware, teleop, perception, grasp, voice, sim, and dev tooling. |
 | `inference` | Minimal policy-inference runtime for edge-cloud collaborative inference verification hosts. |
+| `training` | LeRobot training host: creates the venv, applies the LeRobot patch stack, and installs LeRobot plus the training dependencies only. No ROS 2 / rosdep / colcon. |
 
 Differences of `inference` vs. `full`:
 
@@ -37,6 +39,25 @@ Differences of `inference` vs. `full`:
 # Edge-cloud collaborative inference verification host:
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
+```
+
+Differences of `training` vs. `full` (for hosts that only run LeRobot training):
+
+- **ROS 2**: never installed. `scripts/install_ros.sh`, rosdep, colcon, and the ROS third-party patch stacks are all skipped, and no `install/` overlay is required.
+- **Submodules**: only `libs/lerobot` is initialized.
+- **System packages**: only the Python bootstrap (`python3-venv` / `python3-pip`) and `ffmpeg` (torchcodec video decoding) are required. When all three are already present the system package manager is skipped, purely to avoid an unnecessary install.
+- **Python venv**: keeps `--system-site-packages` (same layout as `full` / `inference`) and installs only `base.txt`, `requirements/training.txt` (TensorBoard), and the LeRobot editable install (extras: `smolvla,pi,diffusion,dataset,deepdiff-dep`). It skips `hardware.txt`, WebPhone, `dev-tools.txt`, voice-tts, perception, FullSubNet, GraspGen, colcon, the `empy` / `rosdep` pins, the pre-commit / gitlint hooks, and the teleop-only `kinematics` extra.
+- **NumPy / OpenCV**: the ROS 2 ABI pins (`numpy==1.26.4` / `opencv<4.12`) are deliberately **not** applied; LeRobot's own resolution is kept. CANN hosts now take that layer from the **accelerator axis** (see the accelerator-axis section above).
+- **Verification**: ROS 2 / rosdep / colcon / cv_bridge / pygraphviz / tracing checks are skipped; only the venv, `import lerobot`, the `lerobot.policies.act` API, and the `lerobot-train` executable are verified.
+- **`.shrc_local`**: reads `venv/.ibrobot_setup_profile`; with `training` it labels the banner `(profile: training)`, reports the missing ROS 2 / `install/` / CANN entries as expected, and stops advertising the `cb` / `cbp` / `src` colcon aliases.
+- **GPU / CUDA driver**: no Torch version is pinned, and PyPI's Linux wheel may target a newer CUDA runtime than the installed driver (a `cu130` wheel needs driver >= 580). Verification then prints `CUDA_MISMATCH` (`nvidia-smi` present but `torch.cuda.is_available()` false) together with the reinstall command, e.g. `venv/bin/python3 -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126`; set `IBR_TRAINING_REQUIRE_CUDA=1` to make that a hard failure instead of a silent CPU-training fallback.
+
+> Naming note: this `training` value is the **install-scope** profile. It is a different namespace from the LeRobot patch-filter `training` profile (`IBR_LEROBOT_PROFILES` / `--lerobot-profiles`); `--profile training` leaves the patch filter set untouched, so the training-relevant patches are still applied.
+
+```bash
+# Pure training host (no ROS 2, possibly no sudo):
+./scripts/setup.sh --yes --profile training
+source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
 ```
 
 ## CANN dependency layers

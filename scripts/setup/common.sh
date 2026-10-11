@@ -107,3 +107,28 @@ ui_render_block() {
     echo "${content}"
     echo ""
 }
+
+# ---------------------------------------------------------------------------
+# Setup dependency-scope profiles (SETUP_PROFILE)
+#
+#   full      complete development workspace (default)
+#   inference minimal policy-inference runtime; still installs ROS 2
+#   training  LeRobot training host: venv + LeRobot only, no ROS 2 runtime
+#
+# These predicates are the single definition point shared by setup.sh and the
+# modules it sources. Keep them in sync with validate_setup_profile() in
+# setup.sh.
+# ---------------------------------------------------------------------------
+setup_profile_is_training() {
+    [[ "${SETUP_PROFILE:-full}" == "training" ]]
+}
+
+# Profiles that only need the libs/lerobot submodule: no bringup / LiDAR /
+# teleop submodules and no ROS third-party patch stacks.
+setup_profile_limits_submodules() {
+    [[ "${SETUP_PROFILE:-full}" == "inference" || "${SETUP_PROFILE:-full}" == "training" ]]
+}
+
+setup_profile_skips_ros_third_party() {
+    setup_profile_limits_submodules
+}

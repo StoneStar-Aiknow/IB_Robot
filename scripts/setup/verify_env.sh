@@ -13,8 +13,11 @@
 #   SETUP_ROS_SETUP_PATH — path to ROS 2 setup script (e.g. /opt/ros/humble/setup.bash)
 #
 # Optional variables (default to the full-workspace behavior when unset):
-#   SETUP_PROFILE       — "full" (default) or "inference"; gates checks whose
-#                         dependencies are outside the inference profile scope
+#   SETUP_PROFILE       — "full" (default), "inference", or "training"; gates
+#                         checks whose dependencies are outside the active
+#                         profile scope. On "training" the ROS 2 / rosdep /
+#                         colcon checks are replaced by the venv + LeRobot
+#                         verification in verify_training_env.
 #
 # Colors (imported from setup.sh context):
 #   RED, GREEN, YELLOW, NC, log_info, log_warn, log_error, log_done
@@ -24,9 +27,13 @@
 : "${WORKSPACE:?Variable WORKSPACE is not set}"
 : "${VENV_PYTHON:?Variable VENV_PYTHON is not set}"
 : "${SETUP_PLATFORM_ID:?Variable SETUP_PLATFORM_ID is not set}"
-: "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
 : "${USE_SUDO:?Variable USE_SUDO is not set}"
-: "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+# The training profile installs neither rosdep nor a ROS 2 runtime, so these
+# two are optional there; every other profile keeps the fail-closed contract.
+if [[ "${SETUP_PROFILE:-full}" != "training" ]]; then
+    : "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
+    : "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+fi
 
 verify_ros() {
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -475,7 +482,83 @@ PYBENCH
     return 0
 }
 
+# Training profile entry point: the workspace venv plus the LeRobot training
+# stack only. ROS 2, rosdep, colcon, cv_bridge, pygraphviz, and tracing are all
+# intentionally out of scope, and NumPy/OpenCV are deliberately not pinned to
+# the ROS 2 ABI.
+verify_training_env() {
+    local venv_python="${VENV_PYTHON}"
+    local verify_log="${WORKSPACE}/venv/.ibrobot_training_verify.log"
+
+    log_info "Verifying training profile environment (venv + LeRobot)..."
+
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" >"${verify_log}" 2>&1 <<'PY'
+import os
+import shutil
+import sys
+
+import numpy
+import torch
+
+import lerobot
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies.act import ACTConfig, ACTPolicy
+
+if not issubclass(ACTConfig, PreTrainedConfig):
+    raise SystemExit("LeRobot ACTConfig is not a PreTrainedConfig")
+if ACTPolicy.config_class is not ACTConfig:
+    raise SystemExit("LeRobot ACTPolicy is not bound to ACTConfig")
+if not callable(getattr(ACTPolicy, "reset", None)):
+    raise SystemExit("LeRobot ACTPolicy.reset API is unavailable")
+
+print("lerobot={} ({})".format(getattr(lerobot, "__version__", "unknown"), getattr(lerobot, "__file__", "<unknown>")))
+print("torch={} numpy={}".format(torch.__version__, numpy.__version__))
+if torch.cuda.is_available():
+    print("cuda={} gpu={}".format(torch.version.cuda, torch.cuda.get_device_name(0)))
+elif shutil.which("nvidia-smi") is not None:
+    # An NVIDIA host whose driver cannot load this Torch build would silently
+    # train on CPU; mark it so the shell wrapper can surface it.
+    print("CUDA_MISMATCH torch_cuda={} nvidia_smi=present".format(torch.version.cuda))
+else:
+    print("cuda=unavailable (no NVIDIA GPU detected)")
+
+train_cli = os.path.join(os.path.dirname(sys.executable), "lerobot-train")
+if not os.path.isfile(train_cli):
+    raise SystemExit("lerobot-train CLI is missing from the venv: {}".format(train_cli))
+print("lerobot-train CLI available: {}".format(train_cli))
+PY
+    then
+        cat "${verify_log}" >&2
+        log_error "Verification failed: the training profile environment is incomplete."
+        log_error "Re-run ./scripts/setup.sh --yes --profile training and inspect the log above."
+        return 1
+    fi
+    cat "${verify_log}"
+
+    # A GPU host whose Torch build targets a newer CUDA runtime than the
+    # installed driver would silently fall back to CPU training.
+    if grep -q "CUDA_MISMATCH" "${verify_log}"; then
+        log_warn "An NVIDIA GPU is present but torch.cuda.is_available() is False: the installed Torch build targets a CUDA runtime the host driver does not support."
+        log_warn "Install a driver-compatible build before training, for example:"
+        log_warn "  ${venv_python} -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126"
+        log_warn "Set IBR_TRAINING_REQUIRE_CUDA=1 to turn this into a hard failure."
+        if [[ "${IBR_TRAINING_REQUIRE_CUDA:-0}" == "1" ]]; then
+            log_error "IBR_TRAINING_REQUIRE_CUDA=1 but CUDA is unavailable."
+            return 1
+        fi
+    fi
+
+    log_done "Verified training environment (venv + LeRobot + torch)"
+    return 0
+}
+
 verify_env() {
+    if [[ "${SETUP_PROFILE:-full}" == "training" ]]; then
+        # Training hosts install no ROS 2 runtime, rosdep, or colcon.
+        verify_training_env || return 1
+        return 0
+    fi
+
     if ! platform_supports_local_workspace_build 2>/dev/null; then
         log_info "Verifying OpenHarmony ROS runtime..."
         if verify_runtime_ros_python_bridge >/dev/null 2>&1; then

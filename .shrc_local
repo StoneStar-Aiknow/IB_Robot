@@ -142,6 +142,12 @@ if [ -f "${WORKSPACE_DIR}/scripts/dds/source_hook.sh" ]; then
         printf '%s\n' 'DDS 初始化失败；继续加载其他项目环境，受管 DDS 启动仍需先修复配置。' >&2
 fi
 
+# 7.3 读取 setup.sh 记录的依赖安装范围 profile (full / inference / training)
+_IB_SETUP_PROFILE="$(cat "${WORKSPACE_DIR}/venv/.ibrobot_setup_profile" 2>/dev/null || true)"
+if [ -n "${_IB_SETUP_PROFILE}" ]; then
+    _IB_STEPS+=("setup profile: ${_IB_SETUP_PROFILE}")
+fi
+
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'
@@ -149,10 +155,30 @@ alias src='source install/setup.sh'
 
 # 9. 欢迎信息 + 步骤摘要 (仅在交互式 Shell 中输出)
 if [[ $- == *i* ]]; then
-    echo -e "${GREEN}[ibrobot_ws]${NC} 环境已就绪！"
+    if [ "${_IB_SETUP_PROFILE}" = "training" ]; then
+        echo -e "${GREEN}[ibrobot_ws]${NC} 环境已就绪！${YELLOW}(profile: training)${NC}"
+    else
+        echo -e "${GREEN}[ibrobot_ws]${NC} 环境已就绪！"
+    fi
     for _s in "${_IB_STEPS[@]}";   do echo -e "  ${GREEN}✔${NC} ${_s}"; done
-    for _s in "${_IB_SKIPPED[@]}"; do echo -e "  ${GRAY}✘ ${_s}${NC}"; done
-    echo -e "常用指令: ${YELLOW}cb${NC} (编译全部), ${YELLOW}cbp${NC} (编译指定包), ${YELLOW}src${NC} (刷新环境)"
+    for _s in "${_IB_SKIPPED[@]}"; do
+        # training profile 本来就不安装 ROS 2 / install overlay / CANN，这些缺失是
+        # 预期状态而不是环境故障。
+        case "${_s}" in
+            "ROS 2 Humble"*|"workspace install/"*|"CANN"*)
+                if [ "${_IB_SETUP_PROFILE}" = "training" ]; then
+                    echo -e "  ${GRAY}– ${_s} (training profile 下按预期缺失)${NC}"
+                    continue
+                fi
+                ;;
+        esac
+        echo -e "  ${GRAY}✘ ${_s}${NC}"
+    done
+    if [ "${_IB_SETUP_PROFILE}" = "training" ]; then
+        echo -e "常用指令: ${YELLOW}lerobot-train${NC} (训练); 本 profile 未安装 ROS 2 / colcon，cb / cbp / src 别名需要 ROS 2 工作区"
+    else
+        echo -e "常用指令: ${YELLOW}cb${NC} (编译全部), ${YELLOW}cbp${NC} (编译指定包), ${YELLOW}src${NC} (刷新环境)"
+    fi
     unset _s
 fi
-unset _IB_STEPS _IB_SKIPPED
+unset _IB_STEPS _IB_SKIPPED _IB_SETUP_PROFILE

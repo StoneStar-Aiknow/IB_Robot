@@ -9,9 +9,10 @@
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
 #   ./scripts/setup.sh --only-patch                  # Only apply LeRobot patches
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
-#   ./scripts/setup.sh --profile <name>              # Dependency scope: full (default) or
+#   ./scripts/setup.sh --profile <name>              # Dependency scope: full (default),
 #                                                    # inference (edge-cloud inference
-#                                                    # verification runtime only)
+#                                                    # verification runtime), or
+#                                                    # training (LeRobot-only training host)
 #   ./scripts/setup.sh --help                        # Show help
 #
 # Auto-yes defaults:
@@ -62,9 +63,17 @@ SETUP_ACCEL_ID="unknown"
 # variable, so clearing it unconditionally would make that advice a dead end.
 ACCEL_OVERRIDE="${ACCEL_OVERRIDE:-}"
 # Dependency-scope profile: "full" (default, complete development workspace) or
+# Dependency-scope profile: "full" (default, complete development workspace),
 # "inference" (minimal runtime to run policy inference only, used for
-# edge-cloud collaborative inference verification hosts). Resolution order:
+# edge-cloud collaborative inference verification hosts), or "training"
+# (LeRobot training host: venv + LeRobot patch stack only, without ROS 2,
+# rosdep, colcon, or the ROS third-party patch stacks). Resolution order:
 # --profile CLI argument > IBR_SETUP_PROFILE env > "full".
+#
+# NOTE: this "training" value selects the install scope. It is unrelated to the
+# lerobot patch-series profile of the same name (IBR_LEROBOT_PROFILES /
+# --lerobot-profiles), which keeps its platform default so that the
+# training-relevant LeRobot patches are still applied.
 SETUP_PROFILE="${IBR_SETUP_PROFILE:-full}"
 
 SKIP_VERIFY=false
@@ -238,6 +247,13 @@ Options:
                                       perception, grasp, voice, sim, and
                                       dev tooling; narrows rosdep and
                                       submodules to the inference packages
+                           training  LeRobot training host: creates the venv,
+                                      applies the LeRobot patch stack, and
+                                      installs LeRobot plus the training Python
+                                      dependencies only. Installs no ROS 2 (no
+                                      install_ros.sh), no rosdep, no colcon, and
+                                      no ROS third-party patch stacks; the
+                                      submodule scope is libs/lerobot only.
       --platform ID      Override platform (OS) detection
       --accel ID         Override accelerator detection (env: ACCEL_OVERRIDE).
                          Required when a host carries both an NVIDIA GPU and
@@ -279,7 +295,7 @@ parse_args() {
             --profile)
                 shift
                 if [[ $# -eq 0 ]]; then
-                    log_error "--profile requires a profile name (full|inference)."
+                    log_error "--profile requires a profile name (full|inference|training)."
                     exit 1
                 fi
                 SETUP_PROFILE="$1"
@@ -326,9 +342,9 @@ parse_args() {
 
 validate_setup_profile() {
     case "${SETUP_PROFILE}" in
-        full|inference) ;;
+        full|inference|training) ;;
         *)
-            log_error "Unknown setup profile: '${SETUP_PROFILE}' (expected 'full' or 'inference')."
+            log_error "Unknown setup profile: '${SETUP_PROFILE}' (expected 'full', 'inference', or 'training')."
             exit 1
             ;;
     esac
@@ -346,6 +362,8 @@ validate_setup_profile() {
 # YAML), but its package.xml exec_depends describe full-robot bringup, not the
 # inference runtime; its Python-level needs are covered by the venv install.
 setup_profile_rosdep_paths() {
+    # Only reachable for profiles that install rosdep; the training profile
+    # skips rosdep entirely (see install_system_deps).
     if [[ "${SETUP_PROFILE}" == "inference" ]]; then
         echo "src/ibrobot_msgs src/tensormsg src/inference_manifest src/torch_models src/inference_service src/model_utils src/dataset_tools"
     else
@@ -372,6 +390,10 @@ system_package_installed() {
 preview_system_packages() {
     case "${SETUP_PLATFORM_ID}" in
         ubuntu-22.04)
+            if setup_profile_is_training; then
+                echo "python3-venv python3-pip ffmpeg"
+                return 0
+            fi
             local pkgs="python3-colcon-common-extensions python3-venv python3-pip"
             if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
                 pkgs="${pkgs} libosmesa6-dev ffmpeg"
@@ -480,6 +502,28 @@ platform_install_python_bootstrap() {
     exit 1
 }
 platform_install_benchmark_system_deps() { return 0; }
+
+# --- Training-profile host prerequisites ---
+# The training profile installs no ROS 2 runtime; its only system-level needs
+# are the Python bootstrap (python3-venv / python3-pip) and ffmpeg, which
+# backs torchcodec / dataset video decoding. Platforms override
+# platform_install_training_system_deps() when they need more.
+platform_training_system_deps_satisfied() {
+    # Pure install-time shortcut: this only decides whether apt-get would add
+    # anything, so every probe must test the capability the install path is
+    # about to rely on.
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    if [[ ! -d "${WORKSPACE}/venv" ]]; then
+        # Creating the venv goes through ensurepip, which Debian/Ubuntu ship in
+        # python3-venv. The venv module itself lives in libpython3-stdlib, so its
+        # --help output succeeds on hosts where creation would fail.
+        python3 -c 'import ensurepip' >/dev/null 2>&1 || return 1
+    fi
+    # A missing system python3-pip is not a reason to run apt here: the venv's
+    # pip comes from ensurepip's bundled wheel.
+    return 0
+}
+platform_install_training_system_deps() { return 0; }
 
 # --- Template Method Hooks for platform_install_rosdeps ---
 platform_skip_rosdep_install() { return 1; }  # Return 0 to skip rosdep install
@@ -611,8 +655,12 @@ ensure_colcon() {
 }
 
 install_system_deps() {
-    # Check for ROS 2 installation first
-    check_ros_installation
+    if setup_profile_is_training; then
+        log_info "Training profile: skipping ROS 2, rosdep, and colcon installation."
+    else
+        # Check for ROS 2 installation first
+        check_ros_installation
+    fi
 
     platform_prepare_host
 
@@ -621,6 +669,27 @@ install_system_deps() {
         log_info "This platform consumes a prebuilt ROS runtime and host cross-built deployables."
         SYSTEM_DEPS_STATUS="skipped"
         log_skipped "Local workspace build prerequisites"
+        return 0
+    fi
+
+    if setup_profile_is_training; then
+        # A ROS-less host only needs the Python bootstrap and ffmpeg, and the
+        # system package manager is touched only when one of them is actually
+        # missing. The preflight exists purely to skip an unnecessary install.
+        if platform_training_system_deps_satisfied; then
+            log_info "Python bootstrap tooling and ffmpeg are already present; skipping system package installation."
+            log_skipped "System package installation (training prerequisites already present)"
+        else
+            ensure_sudo_session
+            platform_install_python_bootstrap
+            platform_install_training_system_deps
+        fi
+        # Create the workspace venv early so VENV_PYTHON and the pip mirror are
+        # configured before setup_python_venv runs. rosdep is deliberately not
+        # installed (ensure_rosdep is never called on this path).
+        ensure_workspace_venv
+        SYSTEM_DEPS_STATUS="done"
+        log_skipped "ROS 2 / rosdep / colcon (training profile)"
         return 0
     fi
 
@@ -677,11 +746,11 @@ main() {
     # Update submodules
     set_stage "syncing submodules"
     update_submodules
-    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+    if setup_profile_skips_ros_third_party; then
         # LiDAR/ROS third-party patch stacks operate on submodules that stay
-        # uninitialized in the inference profile (see submodules.sh).
-        log_info "Skipping ROS third-party patch stacks (inference profile)."
-        log_skipped "ROS third-party patch stacks (inference profile)"
+        # uninitialized in the inference/training profiles (see submodules.sh).
+        log_info "Skipping ROS third-party patch stacks (${SETUP_PROFILE} profile)."
+        log_skipped "ROS third-party patch stacks (${SETUP_PROFILE} profile)"
     else
         ensure_ros_third_party_patch_stacks
     fi
@@ -691,7 +760,11 @@ main() {
         set_stage "installing system dependencies"
         install_system_deps
         if [[ "${SYSTEM_DEPS_STATUS}" == "done" ]]; then
-            log_done "System ROS dependencies installed"
+            if setup_profile_is_training; then
+                log_done "Training host dependencies installed (venv bootstrap + ffmpeg)"
+            else
+                log_done "System ROS dependencies installed"
+            fi
         elif [[ "${SYSTEM_DEPS_STATUS}" == "rosdep-errors" ]]; then
             log_error "System dependency installation had errors — see messages above."
             log_error "Fix the reported issues and re-run ./scripts/setup.sh."
@@ -737,7 +810,9 @@ main() {
     done
     echo ""
     local completion_message="Setup complete! Run ./scripts/build.sh to build the workspace."
-    if [[ "${SETUP_PROFILE}" == "inference" ]]; then
+    if setup_profile_is_training; then
+        completion_message="Setup complete (training profile)! Start training with: source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act"
+    elif [[ "${SETUP_PROFILE}" == "inference" ]]; then
         completion_message="Setup complete (inference profile)! Build the inference subset with: ./scripts/build.sh --packages-up-to inference_service"
     fi
     if [[ "${ONLY_PATCH}" == true ]]; then
