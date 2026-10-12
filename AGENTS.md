@@ -35,7 +35,6 @@ IB_Robot/
 ├── third_party/patches/    # lerobot patch 栈
 ├── models/                 # 模型文件
 ├── .agents/skills/         # Agent 技能库
-├── config.json             # AtomGit API 配置
 └── pyproject.toml          # Ruff / 项目配置
 ```
 
@@ -247,6 +246,14 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [mermaid-syntax-validation](.agents/skills/mermaid-syntax-validation) | Mermaid 图语法检查、修复与渲染验证 |
 
 ### AtomGit 协作
+
+日常 PR/Issue/评审操作由 Agent 按对应 skill **直接调用官方 `gitcode` CLI**（历史验证
+v0.14.1，不作为版本约束），参数按需查询 `--help`；使用 `GC_HOST=atomgit.com` 并显式指定
+目标仓库。项目发布规则由本地检查工具处理；批量链接校验保留专用脚本，脚本内自含最小只读
+CLI 调用（argv/超时/`GC_HOST`/身份探测），不依赖跨技能共享包装；intro 为纯本地状态检查，
+不再远端抽查 PR。认证由 `gitcode auth login --hostname atomgit.com --with-token` 完成，
+项目不再安装或导入 `atomgit-sdk`。仓库级 `config.json` 已删除；目标显式指定。
+CLI 自己的登录配置、模型配置和 DeepWiki `doc_config.json` 不受影响。
 
 | 技能 | 触发场景 |
 |------|---------|

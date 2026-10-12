@@ -28,6 +28,7 @@ from embodied_common.agent_execution_contract import (
 from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from embodied_common.tracing import create_trace_logger, sanitize_trace_id, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+from robot_skill_cli.stop_contract import STOP_PHRASES
 
 _trace = create_trace_logger("ib_trace.agent_control")
 
@@ -46,7 +47,6 @@ _CONFIRM_PHRASES = (
     "是的",
     "confirm",
 )
-_STOP_PHRASES = ("别动了", "别动", "停止", "停下", "停", "stop", "halt")
 _CONTINUE_PHRASES = ("继续吧", "继续", "接着来", "go on", "continue")
 
 INTENT_CONFIRM = "confirm"
@@ -119,7 +119,7 @@ def classify(text: str) -> str:
     normalized = _normalize_text(text)
     if not normalized:
         return INTENT_UNKNOWN
-    if normalized in _STOP_PHRASES:
+    if normalized in STOP_PHRASES:
         return INTENT_STOP
     if normalized in _CONTINUE_PHRASES:
         return INTENT_CONTINUE
@@ -519,6 +519,7 @@ class InteractiveController:
         authorization_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+        submission_guard=None,
     ) -> dict[str, Any]:
         """No-gate one-shot flow: discover → prepare → auto confirm_plan → execute.
 
@@ -591,15 +592,20 @@ class InteractiveController:
         with self._state_lock:
             if self._stop_requested_now() and not self._submission_started:
                 return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
-        return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
+        return self.execute(
+            stop_event=stop_event, feedback_callback=feedback_callback, submission_guard=submission_guard
+        )
 
     def execute(
         self,
         *,
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+        submission_guard=None,
     ) -> dict[str, Any]:
         """Feature 4: execute the confirmed plan; interruptible via ``stop_event``."""
+        if hasattr(self._bridge, "send_program_goal"):
+            return self._execute_program(stop_event=stop_event, feedback_callback=feedback_callback)
         with self._state_lock:
             if self._state == STOPPING and not self._submission_started and self._pending is not None:
                 return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
@@ -665,14 +671,21 @@ class InteractiveController:
                     "goal submission was blocked because durable state could not be recorded",
                 )
         try:
-            goal_future = self._bridge.send_agent_plan_goal(
-                plan_token=plan_token,
-                confirmation_token=confirmation_token,
-                task_id=task_id,
-                timeout_sec=timeout_sec,
-                trace_id=self._pending["trace_id"],
-                feedback_callback=guarded_feedback,
-            )
+            with submission_guard() if submission_guard is not None else contextlib.nullcontext():
+                with self._state_lock:
+                    if self._state not in {EXECUTING, STOPPING} or self._active_task_id != task_id:
+                        raise IllegalStateError("ILLEGAL_STATE", "execution ownership was lost")
+                    if self._stop_requested_now():
+                        return self._record_local_stop(task_id, "stopped before goal admission")
+                    self._submission_started = True
+                goal_future = self._bridge.send_agent_plan_goal(
+                    plan_token=plan_token,
+                    confirmation_token=confirmation_token,
+                    task_id=task_id,
+                    timeout_sec=timeout_sec,
+                    trace_id=self._pending["trace_id"],
+                    feedback_callback=guarded_feedback,
+                )
         except Exception as exc:
             submit_error = exc
             goal_future = None
@@ -714,6 +727,178 @@ class InteractiveController:
                 return self._stop_and_converge(task_id, deadline_expired=True)
             self._sleep(_EXECUTE_POLL_INTERVAL_SEC)
         return self._read_terminal(task_id, cancel_on_nonterminal=True)
+
+    def _execute_program(self, *, stop_event, feedback_callback=None) -> dict[str, Any]:
+        with self._state_lock:
+            if self._pending is None or self._state not in {CONFIRMED, STOPPING}:
+                raise IllegalStateError("ILLEGAL_STATE", "no pending workflow to execute")
+            task_id = self._pending["task_id"]
+            request_id = self._pending["trace_id"]
+            self._active_task_id = task_id
+            self._state = EXECUTING
+            self._stop_event = stop_event or self._stop_event
+            self._submission_started = True
+            if self._stop_requested_now():
+                return self._record_local_stop(task_id, "stopped before goal admission")
+            steps = list(self._pending["steps"])
+            registry = {
+                "registry_epoch": self._pending["registry_epoch"],
+                "registry_generation": self._pending["registry_generation"],
+                "registry_digest": self._pending["registry_digest"],
+            }
+        if self._submission_callback is not None:
+            self._submission_callback({"task_id": task_id, "expected_step_count": len(steps), **registry})
+        handle = None
+        result_future = None
+        submitted = False
+        execution_id = ""
+        try:
+            future = self._bridge.send_program_goal(
+                request_id=self._pending.get("trace_id", task_id),
+                workflow_steps=steps,
+                registry=registry,
+                task_budget_sec=float(
+                    self._confirmed["task_budget_sec"] if self._confirmed else self._fresh_status["task_budget_sec"]
+                ),
+                feedback_callback=feedback_callback,
+            )
+            if not self._wait_future_interruptibly(future, self._rpc()):
+                if self._stop_requested_now():
+                    return self._cancel_program_and_converge(
+                        None,
+                        None,
+                        task_id,
+                        request_id=request_id,
+                        execution_id="",
+                    )
+                return self._record_unknown(task_id, failure_detail="program goal response timed out")
+            handle = future.result()
+            if handle is None or not getattr(handle, "accepted", False):
+                return self._record_terminal(task_id, FAILED, "GOAL_REJECTED", "program goal was rejected")
+            submitted = True
+            result_future = handle.get_result_async()
+            with self._state_lock:
+                self._goal_handle = handle
+                self._result_future = result_future
+            with contextlib.suppress(Exception):
+                execution = self._bridge.get_execution(
+                    request_id=request_id,
+                    execution_id="",
+                    timeout_sec=self._rpc(),
+                )
+                if execution.get("found"):
+                    execution_id = str(execution.get("execution_id", ""))
+            budget_sec = float(
+                self._confirmed["task_budget_sec"] if self._confirmed else self._fresh_status["task_budget_sec"]
+            )
+            if not self._wait_future_interruptibly(result_future, budget_sec):
+                if self._stop_requested_now():
+                    return self._cancel_program_and_converge(
+                        handle, result_future, task_id, request_id=request_id, execution_id=execution_id
+                    )
+                return self._record_unknown(task_id, failure_detail="program result timed out")
+            result = result_future.result().result
+            result_state = str(result.state)
+            terminal_state = (
+                SUCCEEDED
+                if result.success
+                else STOPPED
+                if result_state == "CANCELED"
+                else UNKNOWN
+                if result_state == "UNKNOWN"
+                else FAILED
+            )
+            return self._record_terminal(
+                task_id,
+                terminal_state,
+                str(result.error_code),
+                str(result.message),
+                result={
+                    "success": bool(result.success),
+                    "execution_id": str(result.execution_id),
+                    "state": str(result.state),
+                },
+            )
+        except Exception as exc:
+            if submitted:
+                return self._cancel_program_and_converge(
+                    handle,
+                    result_future,
+                    task_id,
+                    request_id=request_id,
+                    execution_id=execution_id,
+                )
+            if handle is not None:
+                return self._record_unknown(task_id, failure_detail=f"program state unavailable: {exc}")
+            return self._record_terminal(task_id, FAILED, "PROGRAM_EXECUTION_FAILED", str(exc))
+
+    def _cancel_program_and_converge(
+        self, handle, result_future, task_id: str, *, request_id: str, execution_id: str
+    ) -> dict[str, Any]:
+        """Cancel the live ExecuteProgram goal once and converge on its terminal result.
+
+        An accepted CancelGoal is not a physical stop: only the server's
+        terminal result (state CANCELED with SKILL_CANCELLED) proves the
+        motion stopped. An unconverged cancel stays unknown.
+        """
+        with contextlib.suppress(Exception):
+            self._bridge.cancel_execution(
+                request_id=request_id,
+                execution_id=execution_id,
+                timeout_sec=self._rpc(),
+            )
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.cancel_goal_async()
+        deadline = self._monotonic() + self._rpc_timeout_sec
+        while (result_future is None or not result_future.done()) and self._monotonic() < deadline:
+            with contextlib.suppress(Exception):
+                execution = self._bridge.get_execution(
+                    request_id=request_id,
+                    execution_id=execution_id,
+                    timeout_sec=self._rpc(),
+                )
+                if str(execution.get("state", "")) in {"CANCELED", "FAILED", "UNKNOWN"}:
+                    state = (
+                        STOPPED
+                        if execution["state"] == "CANCELED"
+                        else (FAILED if execution["state"] == "FAILED" else UNKNOWN)
+                    )
+                    return self._record_terminal(
+                        task_id,
+                        state,
+                        str(execution.get("error_code", "")),
+                        str(execution.get("message", "")),
+                        result=execution,
+                    )
+            self._sleep(_CANCEL_POLL_INTERVAL_SEC)
+        if result_future is None or not result_future.done():
+            return self._record_unknown(
+                task_id, deadline_expired=True, failure_detail="program cancel did not converge to a terminal result"
+            )
+        result = result_future.result().result
+        error_code = str(result.error_code) or "SKILL_CANCELLED"
+        state = str(result.state)
+        terminal_state = STOPPED if state == "CANCELED" else (UNKNOWN if state == "UNKNOWN" else FAILED)
+        return self._record_terminal(
+            task_id,
+            SUCCEEDED if result.success else terminal_state,
+            error_code,
+            str(result.message),
+            result={
+                "success": bool(result.success),
+                "execution_id": str(result.execution_id),
+                "state": str(result.state),
+            },
+        )
+
+    def _request_program_stop(self, request_id: str, execution_id: str = "") -> None:
+        with contextlib.suppress(Exception):
+            self._bridge.cancel_execution(
+                request_id=request_id,
+                execution_id=execution_id,
+                timeout_sec=self._rpc(),
+            )
 
     def request_stop(self) -> None:
         """Feature 4: thread-safe stop trigger from outside the execute loop."""

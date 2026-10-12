@@ -1,7 +1,7 @@
 # Hermes 集成发布源
 
 此目录是 IB-Robot Hermes 集成的唯一发布源，包含推荐 `SOUL.md`、强制策略 (`POLICY.md`)、
-`pre_tool_call` / `post_llm_call` hook 与手动同步入口。同步会安装当前 `ibrobot-control` Skill，
+`RESPONSE_PROTOCOL.md` 回复契约、结构化输出插件和手动同步入口。同步会安装当前 `ibrobot-control` Skill，
 绑定当前 workspace、robot config 和 ROS Domain，并清理已退役的 `ibrobot-robot-control` Plugin
 遗留副本（即时执行改由 `robot-skill run-workflow` 的显式 `immediate_after_presentation` 模式承担）。
 
@@ -10,11 +10,12 @@
 | 文件 | 说明 |
 |---|---|
 | `SOUL.md` | Hermes persona 与完整具身任务工作流（含 `ibrobot-perceive` 使用指引） |
-| `POLICY.md` | 强制策略：运动只能走 `robot-skill` + Gateway；感知读取只能走 `ibrobot-perceive`；裸 `ros2` 子命令被禁止；TTS 由 `post_llm_call` hook 自动完成 |
+| `POLICY.md` | 强制控制与感知策略；引用系统注入的结构化回复协议 |
+| `RESPONSE_PROTOCOL.md` | v1 最终回复与 v2 中间回复契约；v2 增加 `completion` 收尾策略 |
 | `hooks/ibrobot-block-raw-ros` | Hermes `pre_tool_call` hook，用 `shlex` 分词拦截裸 `ros2`/`rclpy`/`roslaunch` 调用 |
-| `hooks/ibrobot-speak` | Hermes `post_llm_call` speech hook wrapper，source `.shrc_local` 后 `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT |
-| `hooks/ibrobot-lifecycle-speech` | Hermes `pre_tool_call` / `post_tool_call` hook；只投递状态检查、规划和计划授权事件，文案生成、TTS 合成和播放均在后台执行 |
-| `hooks/ibrobot-interim-speech` | Hermes `on_interim_message` hook；加载 workspace `.shrc_local` 后按 turn 有界异步转交当前 profile 的 TTS hook |
+| `hooks/ibrobot-speak` | 结构化语音事件的 ROS 投递端，source `.shrc_local` 后运行 `hermes_tts_hook`；不再直接挂载到 `post_llm_call` |
+| `hooks/ibrobot-lifecycle-speech` | 旧生命周期兼容入口；同步后不再挂载，避免重复提示与额外文案模型调用 |
+| `hooks/ibrobot-interim-speech` | 旧安装兼容入口，只接受结构化回复；新安装由原生插件监听 interim，不重复挂载 |
 | `sync_hermes.sh` | 手动同步入口（等价于 `hermes-robot-configure`） |
 
 ## `ibrobot-perceive`（感知读取唯一入口）
@@ -64,6 +65,7 @@ hermes-robot-configure \
   --config-name so101_single_arm \
   --soul-mode replace \
   --accept-hooks \
+  --install-runtime-adapter \
   --restart-gateway
 ```
 
@@ -77,6 +79,7 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
   --config-name so101_single_arm \
   --soul-mode replace \
   --accept-hooks \
+  --install-runtime-adapter \
   --restart-gateway
 ```
 
@@ -100,56 +103,77 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
 - `ibrobot/ibrobot-env.sh`：写入 `terminal.shell_init_files` 的环境文件，并把
   `auto_source_bashrc` 置 `false`，使受管环境优先于用户 bashrc；它同时把 `ibrobot/bin`
   加入 `PATH`。排查「Hermes 不再 source 我的 bashrc」时先看此文件与该开关。
-- `hooks/ibrobot-speak`：`post_llm_call` speech hook wrapper，source `.shrc_local` 后
-  `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT。
-- `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，使用当前 IB-Robot
-  workspace 中的 `robot_skill_cli` 和 `embodied_agent` 异步生成文案，并投递状态检查、规划和计划授权成功三类语音事件。
-- `hooks/ibrobot-interim-speech`：由配置器绑定当前 workspace 和 `ibrobot-speak` 绝对路径，使用完整
-  `.shrc_local` 环境启动；每个 `(session_id, turn_id)` 最多投递一次，失败不阻塞 Hermes。
+- `plugins/ibrobot-response/`：原生输出适配器、纯 Python 回复解析器和协议文档。Hermes 使用自己的
+  Python 加载这些文件，不需要导入 ROS 包。由 `hermes-robot-configure` 管理，遇到同名用户插件会报冲突。
+- `hooks/ibrobot-speak`：结构化语音事件投递端，source `.shrc_local` 后
+  `exec python3 -m robot_skill_cli.hermes_tts_hook`；服务名与超时来自 `robot_config` SSOT。
+- `hooks/ibrobot-lifecycle-speech`：保留兼容文件，同步时移除其受管 hook 注册；`robot-skill`
+  wrapper 关闭旧的 `plan_confirmed` 固定播报。过程文案由主模型的同一次工具响应生成。
+- `hooks/ibrobot-interim-speech`：兼容入口，新安装不挂载此 shell hook，避免重复播报。
+- `display.streaming=false` 和 `streaming.enabled=false`：先校验完整 JSON 再显示渲染结果，避免
+  原始协议碎片泄露到 CLI/消息平台。普通 interim 展示关闭，完整的结构化 interim 仍可由插件播报。
 
-`--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
-`hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经
-`hermes hooks list` 确认未注册后跳过，不会阻断审批。
+受管语音使用原生插件回调，不再需要 shell observer 授权。`--accept-hooks` 保留为兼容参数，
+已有启动命令仍可使用且不会执行授权操作；用户自管 hook 保留原有配置与授权方式。
+runtime adapter 需要显式传入 `--install-runtime-adapter`；不传时 profile/语音同步仍可完成，
+但 `ibrobot-motion` 和优先停止不会启用。
 
 ## 前置条件
 
-- 已安装 Hermes Agent 0.16.0 或更新版本。
+- Hermes 必须提供原生 `register_system_prompt_section`、`pre_llm_call`、`transform_llm_output`、
+  `post_llm_call` 和 `on_interim_message` 接口；当前验证版本为 0.20.2。
 - 已构建 `robot_skill_cli`、`robot_config`、`ibrobot_msgs` 和 TTS 相关包。
 - 当前终端已 source 目标 IB-Robot workspace（`source .shrc_local`）。
 - 启用语音时，目标 robot config 的 `voice_tts.enabled` 必须为 `true`。
 - 真机运动仍必须由操作员在启动 pipeline 时显式设置 `authorize_motion:=true`。
 
-### 生命周期文案模型环境
+## 执行期间输入“别动”
 
-生命周期 Hook 使用 IB-Robot 已提供的 `robot_skill_cli`、`embodied_agent`、`embodied_common` 和
-`rclpy`，不会从 Hermes 或其他目录加载 Python 包。Hook 只需要访问文案模型的 API key。
+使用 `--install-runtime-adapter` 时，同步器安装 `ibrobot-motion` 插件和 Hermes 原生控制 hook 适配器。
+当前适配的 Hermes commit 为
+`cf64ca20c5ab99ebf7e8ca272c69edc7ea0636ed`（0.20.2）；同步前校验版本、源码锚点和已安装文件哈希，
+未知版本或被修改的受管文件会报错。Hermes runtime 修改前生成 `.ibrobot-backup-*` 文件；
+`.ibrobot-control-adapter.json` 记录版本和文件哈希。更新 Hermes 后须重新验证适配器，不能只比较版本字符串。
 
-Hook 固定使用 `gpt-5.6-sol` 路由，该路由在 `embodied_common/config/vlm_models.yaml` 中声明：
+- 在经典 Hermes CLI（`hermes --cli`）输入 `别动`、`别动了`、`停止`、`停下`、`停`、`stop` 或 `halt`，
+  立即锁存当前会话的停止要求；Gateway 文本消息在权限校验后走同一入口。大小写和首尾空白被规范化。
+- `run-workflow` 由受管理的执行器启动；停止通过 profile 的 `ibrobot/control-state/` 传给所属 CLI，
+  不等待模型、普通消息队列或会话租约。该目录只对 profile 所属用户开放，不从记录中的 PID 发信号。
+- CLI 继续取消根 Agent Plan，并等待完整终态。停止与新目标提交在同一状态锁下排序；展示失败或展示期间
+  收到停止时不会提交目标。机器人 CLI 的正常 SIGINT/SIGTERM 处理仍可用于直接命令诊断。
+- 受管理的机器人任务不经过 Hermes 通用终端的 1 秒 SIGKILL。退出等待预算从机器人 RPC 配置推导；
+  超过预算、客户端异常退出或终态身份不一致时报告状态未知并阻止后续运动。
+- owner 仍存活时只由其 CLI 取消；owner 和 CLI 都退出后，停止入口才可用保留的完整身份发 `cancel-plan`。
+  不能手工删除状态目录来解除未知状态，也不能用 `cancel` 代替根计划取消。
+- 停止后本回合不能自动提交另一动作；终态确定后，由用户输入新的独立请求开始下一回合。
 
-```yaml
-api_key_env: XUNXING_API_KEY
+同步后需要退出并重新启动已有 Hermes CLI；`--restart-gateway` 只重启消息 Gateway。
+当前适配覆盖经典 CLI 和 Gateway 文本入口，未实现 TypeScript TUI、ACP 或流式语音的输入回调。
+成功验收应同时看到取消终态和当前子动作停止；单独出现“正在停止”、工具退出或 `Redirected` 不能确认停稳。
+
+### 中间回复与本地收尾
+
+主模型在同一次响应中输出完整 v2 JSON 正文和正常的工具调用：
+
+```json
+{"schema_version":2,"speech":"好的，我来关闭夹爪。","details":"","completion":"after_workflow"}
 ```
 
-推荐在启动 Hermes 的环境中直接设置：
+`on_interim_message` 在该响应完成、工具执行前异步投递正文，TTS 与工具准备并行。
+它不是 token 流式播报，也不保证短动作开始前已经发声；原始 JSON 的流式显示仍关闭。
 
-```bash
-export XUNXING_API_KEY='你的实际密钥'
-```
+`completion=after_workflow` 只适用于用户要求一个简单动作的回合。当前支持单步骤的
+`open_gripper_skill`、`close_gripper_skill`、`recover_safe_pose`、`nod_yes`、`shake_no`、`wave_hello`。
+受管执行器校验完整计划身份、结果状态与步数，工具循环核对本批次的 tool call ID 和最终记录的
+工具结果，再生成本地 v1 回复，经原有 SessionDB、显示与语音 finalizer 结束回合，省去收尾模型请求。
 
-如果现有 Hermes 已经把密钥保存在自己的 `.env` 中，可以指定该文件：
+`completion=continue`、v1 回复、无正文、多工具、多步骤、未支持技能、结果未知、用户新指令、
+中断或被更改的工具结果继续走正常 Hermes 对话。需要分析、解释或后续动作时必须使用 `continue`。
+不解析任意终端输出作为完成证明，也不使用模型预先写好的成功声明。
 
-```bash
-export HERMES_ENV_FILE=/path/to/hermes/data/.env
-```
-
-文件中可以直接配置 `XUNXING_API_KEY`；对于当前 Hermes 的自定义 provider，也支持：
-
-```dotenv
-HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY=你的实际密钥
-```
-
-Hook 会在没有 `XUNXING_API_KEY` 时将该变量映射为 `XUNXING_API_KEY`。310P 的现有路径是
-`/root/claw/hermes/data/.env`，其他机器应改成自己的 Hermes `.env` 路径。真实 API key 不得提交到仓库。
+安装器为受支持的 Hermes revision 更新可逆的通用 `finalize_tool_batch` hook，业务规则在
+`ibrobot-motion` 插件内；适配器 manifest 必须是当前版本，文件哈希不匹配时拒绝覆盖用户修改。
+独立进程的测试见 `test/test_hermes_runtime_e2e.py` 文件说明，需在隔离 Hermes checkout 中运行。
 
 ## 生效与验证
 
@@ -171,13 +195,34 @@ hermes hooks doctor
 动作请求的预期流程为：展示并 flush 冻结计划，内部调用 `confirm-plan` 绑定 exact tuple，然后立即
 `execute-plan`，不等待用户再次回复“确认”。这不会绕过 `authorize_motion`、Gateway 校验或停止能力。
 
-最终自然语言回复通过 `post_llm_call` 自动调用 `/voice_tts/synthesize` 和 `/voice_tts/play`，本地扬声器
-播放结果。诊断日志位于 `/tmp/hermes-speak.log`。
+最终回复必须是 `{"schema_version":1,"speech":"自然语言","details":"技术详情"}`。
+原生插件在 `transform_llm_output` 中校验并渲染正文与详情，在 `post_llm_call` 中只投递已解析的
+`speech`。数据按当前线程的 session/turn 绑定，并核对渲染结果，不能从显示文本重新猜测语音字段。
+协议在新会话的系统提示中注入，`pre_llm_call` 同时向旧会话补充相同协议。
+显示层使用 HTML details/pre 保留完整技术证据；CLI 会将标签显示为文本，是否支持折叠由消息客户端决定。
 
-生命周期语音不会阻塞 `robot-skill`：`pre_llm_call` 只暂存用户原话，确认该回合调用 `status` 后才在
-后台启动文案模型，普通对话不会产生额外调用。每个机器人任务最多调用一次 `LLMClientService` 生成三条文案，
-TTS 合成在后台执行，音频播放通过单设备锁串行化，避免多个进程争用同一声卡；TTS 或文案模型失败
-只使用 fallback 或记录日志，不改变规划、执行和安全门禁。
+最终回复兼容 v1 语音事件：
+
+```json
+{"schema_version":1,"session_id":"session","turn_id":"turn","phase":"final","response":{"schema_version":1,"speech":"夹爪已打开。","details":"goal_status=4"}}
+```
+
+interim 使用 v2 事件，增加整数 `sequence`（来自 Hermes iteration），按 session/turn/phase/sequence
+原子去重。同回合不同中间段可各播一次，重放同一事件不会重复。失败或未知播放结果不自动重播。
+仅 `speech` 进入 `/voice_tts/synthesize` 和 `/voice_tts/play`；格式错误、缺字段、重复字段或截断 JSON
+记录错误并跳过播报，原始文本可在显示详情中查看，绝不退回整段朗读。文本语义仍需依据工具结果评估，
+结构校验不会证明机器人成功或停止。技术详情只供查看，不能影响控制流程。
+
+TTS 不再维护路径、错误码或特定场景措辞替换。只进行 Unicode 规范化和前端兼容检查；当前 ZipVoice
+不支持 ASCII 英文字母，遇到该情况报错并跳过语音，不删除英文字母改变含义。日志位于
+`/tmp/hermes-speak.log`，记录实际 speech 与事件标识；去重记录位于 `/tmp/ibrobot-speech-events/`。
+
+收到当前会话的停止词、最终回复生成或回合结束时写入语音终态标记；尚未处理、等待服务、合成中或等待播放锁的旧 interim
+会在投递前被淘汰。已送入播放设备的音频不撤回。标记与去重文件使用同一
+`IBROBOT_SPEECH_STATE` 目录，因此原生插件与 speaker 必须继承相同配置。
+
+内存中的活动回合身份在 `post_llm_call` 后回收；中断、失败或空回复由 Hermes 标准的
+`on_session_end` 回调清理，不依赖可选 runtime adapter。停止回调只处理尚未结束的活动回合。
 
 ## 升级
 

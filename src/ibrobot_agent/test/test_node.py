@@ -145,6 +145,48 @@ class _DirectExecutionBridge:
         return _ReadyFuture(_ResultGoalHandle(result))
 
 
+class _ProgramExecutionBridge(_DirectExecutionBridge):
+    def __init__(self, *, state="SUCCEEDED", success=True):
+        super().__init__()
+        self.program_kwargs = None
+        self.program_state = state
+        self.program_success = success
+
+    def send_program_goal(self, **kwargs):
+        self.calls.append("program_submit")
+        self.program_kwargs = kwargs
+        result = type(
+            "Result",
+            (),
+            {
+                "success": self.program_success,
+                "error_code": "",
+                "message": "skill completed",
+                "execution_id": "execution-1",
+                "state": self.program_state,
+            },
+        )()
+        return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": result})()))
+
+
+class _ProgramTransportFailureBridge(_ProgramExecutionBridge):
+    def __init__(self):
+        super().__init__()
+        self.cancel_calls = 0
+
+    def send_program_goal(self, **kwargs):
+        self.calls.append("program_submit")
+        return _ReadyFuture(_ResultGoalHandle(type("Wrapped", (), {"result": object()})()))
+
+    def get_execution(self, **kwargs):
+        self.calls.append("get_execution")
+        return {"state": "UNKNOWN", "error_code": "EXECUTION_RECOVERY_UNKNOWN", "message": "reconcile"}
+
+    def cancel_execution(self, **kwargs):
+        self.cancel_calls += 1
+        return {"accepted": True, "state": "STOPPING"}
+
+
 def _proposal():
     request = AgentRequest(
         schema_version=1,
@@ -189,6 +231,63 @@ def test_direct_execution_adapter_keeps_natural_language_skill_order():
     assert submissions[0][0].task_id
     assert bridge.goal_trace_id == "request-wave"
     assert bridge.calls == ["prepare", "presentation", "status", "confirm", "wait_server", "submit"]
+
+
+def test_program_execution_adapter_freezes_non_empty_digest_and_submits_once():
+    bridge = _ProgramExecutionBridge()
+    adapter = _RosExecutionAdapter(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0},
+        caller_scope="custom-agent-scope",
+    )
+    proposal = _proposal()
+    presentations = []
+    result = adapter.execute(
+        proposal,
+        expected_registry_identity=proposal.catalog_identity,
+        presentation_callback=presentations.append,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "succeeded"
+    assert presentations[0].task_ref.plan_digest
+    assert bridge.calls == ["program_submit"]
+    assert bridge.program_kwargs["request_id"] == "request-wave"
+    assert adapter._caller_scope == "custom-agent-scope"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [("CANCELED", "cancelled"), ("UNKNOWN", "unknown"), ("FAILED", "failed")],
+)
+def test_program_result_preserves_gateway_terminal_state(state, expected_status):
+    bridge = _ProgramExecutionBridge(state=state, success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+
+    assert result.status == expected_status
+
+
+def test_program_transport_failure_after_submission_is_unknown_and_attempts_convergence():
+    bridge = _ProgramTransportFailureBridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "unknown"
+    assert bridge.cancel_calls == 1
+    assert "get_execution" in bridge.calls
 
 
 @pytest.mark.parametrize("stop_stage", ["get_status", "wait_for_execute_plan_server", "submission_callback"])

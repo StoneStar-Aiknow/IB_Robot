@@ -67,7 +67,6 @@ IB_Robot/                           # Main Workspace
 ├── README.md                       # Main documentation (Chinese)
 ├── README.en.md                    # Main documentation (English)
 ├── LICENSE                         # Apache 2.0 License
-├── config.json                     # AI Agent configuration (AtomGit API tokens, etc.)
 │
 ├── .agents/                        # AI Agent configuration directory
 │   └── skills/                     # AI Agent skills (see .agents/skills/README.md)
@@ -477,34 +476,35 @@ Gateway/readiness/safety rejection, `4` unavailable runtime, `124` timeout, `130
 The `robot_mcp` compatibility layer has been removed. Use `robot-skill` through the ROS Capability Gateway
 for all robot capability discovery and execution.
 
-### config.json Configuration
+### AtomGit Authentication
 
-`config.json` stores configuration for AI Agents, currently used for AtomGit API integration:
+Agents use the official `gitcode` CLI directly for PR, Issue and review operations.
+The repository-level `config.json` and its token/owner/repo/baseUrl settings have been removed.
+Authentication stays in the CLI's own configuration; this change does not delete that configuration.
+Choose the target explicitly (`-R owner/repo`); do not infer the target from the personal fork's
+`origin`. Model configs and DeepWiki `doc_config.json` are unrelated.
 
-```json
-{
-  "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
-    "owner": "openEuler",
-    "repo": "IB_Robot",
-    "baseUrl": "https://api.atomgit.com"
-  }
-}
-```
+**Install and authenticate**:
 
-**Getting an AtomGit Personal Access Token**:
-
-1. Visit <https://atomgit.com> and log in
-2. Click your avatar (top-right) → Settings
-3. Find "Access Tokens"
-4. Click "New Token", grant `repo` and `pull_request` permissions
-5. **Copy and save** the token immediately (shown only once)
-
-Set the environment variable by adding the following to your `~/.zshrc` or `~/.bashrc`:
+1. Install the official AtomGit CLI at `/usr/local/bin/gitcode` and ensure that directory is on PATH.
+   Upgrade by replacing the same executable, preserving Graphviz at `/usr/bin/gc`. See the
+   [installation instructions](docs/atomgit_cli_migration.md#正式安装linux).
+2. Visit <https://atomgit.com> → avatar (top-right) → Settings → "Access Tokens" → create a new
+   token with `repo` and `pull_request` permissions and **copy it immediately** (shown only once).
+3. Authenticate in a private terminal. The CLI manages credential storage; stdin input does not imply that credentials are never persisted:
 
 ```bash
-export ATOMGIT_TOKEN="your_token_here"
+gitcode auth login --hostname atomgit.com --with-token
+GC_HOST=atomgit.com gitcode auth status   # verify AtomGit authentication
 ```
+
+When the CLI is missing, unofficial, or unauthenticated, the link validator reports the affected
+AtomGit links as inconclusive — never as broken links; inconclusive results alone do not fail the
+run by default, and `--fail-on-inconclusive` turns them into failures (see
+[doc-link-validator](.agents/skills/doc-link-validator/SKILL.md)). Genuine broken links in the same
+run — including offline-decidable errors such as the `/bolb/` route typo — still fail the check
+and are never masked by CLI unavailability. `intro` is a purely local check: it never accesses the
+platform and does not depend on CLI authentication.
 
 ### Supported Agents
 

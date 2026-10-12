@@ -1,7 +1,34 @@
+#!/usr/bin/env python3
+"""
+Documentation Link Validator
+
+Validates local, external, and AtomGit links in generated docs. AtomGit
+platform lookups go through the official CLI: every former
+``api.atomgit.com`` REST v5 branch — blob/tree, pull, commit, issues,
+milestones, repo, user/org — is probed read-only through ``gitcode``. The
+CLI access layer is self-contained below (this skill carries no cross-skill
+shared module): an argv-only ``subprocess`` call with a bounded timeout and
+``GC_HOST=atomgit.com`` pinned, plus a one-shot ``gitcode version``
+identity probe so a same-name non-official executable can never have its
+exit codes mistaken for link verdicts. Authentication belongs to the CLI
+(``gitcode auth login --hostname atomgit.com --with-token``); the script
+never reads tokens and accepts no token arguments.
+
+Result semantics are preserved: the CLI exit code maps to three states —
+exit 0 → valid, exit 3 (not found) → broken, everything else (CLI
+unavailable, not authenticated, no permission, timeout, exec failure,
+other failures, unusable output) is explicit inconclusive and is never
+misreported as broken. Third-party HTTP links keep the plain urllib probe
+and are not routed through the AtomGit platform API.
+"""
+
 import argparse
+import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,16 +36,126 @@ from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 DOC_EXTENSIONS = {".md", ".rst", ".txt"}
 HTTP_TIMEOUT = 10
 DEFAULT_MAX_WORKERS = 16
 USER_AGENT = "deepwiki-link-validator/1.0"
-ATOMGIT_HOSTS = {"atomgit.com"}
+ATOMGIT_HOSTS = frozenset({"atomgit.com", "gitcode.com"})
 BROKEN_STATUSES = {"broken", "auth_error", "error"}
-TOKEN_ENV_VARS = ("ATOMGIT_TOKEN",)
+
+# --- minimal read-only AtomGit CLI access (self-contained) ----------------- #
+
+CLI_ENV_VAR = "IBROBOT_ATOMGIT_CLI"
+CLI_ENTRY_NAME = "gitcode"
+CLI_HOST = "atomgit.com"
+AUTH_LOGIN_GUIDANCE = "gitcode auth login --hostname atomgit.com --with-token"
+CLI_EXIT_NOT_FOUND = 3
+CLI_EXIT_AUTH = 4
+IDENTITY_TIMEOUT = 30
+_VERSION_RE = re.compile(r"gitcode version (\d+)\.(\d+)\.(\d+)")
+
+
+@dataclass
+class CliOutcome:
+    """Outcome of one CLI invocation; ``run_cli`` never raises.
+
+    ``returncode`` is None when the process never produced an exit code
+    (timeout or exec failure); ``run_error`` then carries the reason.
+    """
+
+    returncode: int | None = None
+    stdout: str = ""
+    data: object = None
+    json_error: str | None = None
+    run_error: str | None = None
+
+
+def run_cli(args: list[str], cli: str, timeout: float) -> CliOutcome:
+    """Execute the CLI once read-only: argv list, no shell, no retry.
+
+    stdin is /dev/null so prompts cannot hang, ``GC_HOST`` is pinned to the
+    platform host, and stdout is decoded as JSON when possible.
+    """
+    env = dict(os.environ)
+    env["GC_HOST"] = CLI_HOST
+    try:
+        completed = subprocess.run(
+            [cli, *args, "--no-interactive"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return CliOutcome(run_error=f"request timed out after {timeout}s")
+    except OSError as exc:
+        # ENOEXEC ("Exec format error") and friends: the CLI never ran, so
+        # the platform was never asked — inconclusive, never a verdict.
+        return CliOutcome(run_error=f"executable could not be run: {exc.strerror or exc}")
+    outcome = CliOutcome(returncode=completed.returncode, stdout=completed.stdout)
+    stripped = completed.stdout.strip()
+    if stripped:
+        try:
+            outcome.data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            outcome.json_error = f"invalid JSON: {exc}"
+    else:
+        outcome.json_error = "empty stdout"
+    return outcome
+
+
+def resolve_cli_access() -> tuple[str | None, str | None]:
+    """Resolve the official CLI and verify its identity once.
+
+    Returns ``(cli, unavailable_reason)`` with exactly one side None. An
+    explicit ``IBROBOT_ATOMGIT_CLI`` absolute path wins over ``gitcode`` on
+    PATH; ``gc`` (Graphviz) is never considered. The one-shot identity
+    probe runs ``gitcode version`` and requires the official output shape,
+    so a same-name non-official executable is rejected before its exit
+    codes can be mistaken for link verdicts; any release number passes.
+    When the CLI is unavailable, every AtomGit link is reported
+    inconclusive with the reason while local and external links keep being
+    checked. Authentication is diagnosed per probe instead: exit 4 is
+    inconclusive with login guidance, never broken.
+    """
+    explicit = os.environ.get(CLI_ENV_VAR, "").strip()
+    if explicit:
+        path = Path(explicit)
+        if not path.is_absolute():
+            return None, f"{CLI_ENV_VAR} must be an absolute executable path, got: {explicit!r}"
+        if not path.is_file():
+            return None, (
+                f"{CLI_ENV_VAR} points to a missing file: {explicit}; "
+                "fix the variable or unset it to use 'gitcode' from PATH"
+            )
+        if not os.access(path, os.X_OK):
+            return None, f"{CLI_ENV_VAR} points to a non-executable file: {explicit}"
+    else:
+        found = shutil.which(CLI_ENTRY_NAME)
+        if not found:
+            return None, (
+                f"official AtomGit CLI '{CLI_ENTRY_NAME}' was not found on PATH and "
+                f"{CLI_ENV_VAR} is not set; install the official CLI or set {CLI_ENV_VAR} "
+                "to its absolute path (do not use Graphviz 'gc')"
+            )
+        path = Path(found)
+    outcome = run_cli(["version"], str(path), IDENTITY_TIMEOUT)
+    if outcome.run_error is not None:
+        return None, f"AtomGit CLI at {path} {outcome.run_error}"
+    if outcome.returncode != 0 or not _VERSION_RE.search(outcome.stdout):
+        return None, (
+            f"executable at {path} did not report 'gitcode version X.Y.Z' and is not the "
+            f"official AtomGit CLI (same-name tools such as Graphviz 'gc' are rejected on "
+            f"purpose); install the official CLI or set {CLI_ENV_VAR}"
+        )
+    return str(path), None
 
 
 @dataclass
@@ -170,7 +307,12 @@ def classify_kind(url: str) -> str:
 
 
 def validate_links(
-    paths: Iterable[Path], root: Path, access_token: str | None, timeout: int, max_workers: int
+    paths: Iterable[Path],
+    root: Path,
+    cli: str | None,
+    cli_unavailable: str | None,
+    timeout: int,
+    max_workers: int,
 ) -> list[ValidationResult]:
     occurrences = []
     for file_path in iter_doc_files(paths):
@@ -183,7 +325,7 @@ def validate_links(
         cache_key = (occurrence.kind, occurrence.url)
         remote_occurrences.setdefault(cache_key, occurrence)
 
-    cache = validate_remote_links(remote_occurrences, access_token, timeout, max_workers)
+    cache = validate_remote_links(remote_occurrences, cli, cli_unavailable, timeout, max_workers)
     results = []
     for occurrence in occurrences:
         cache_key = (occurrence.kind, occurrence.url)
@@ -207,7 +349,11 @@ def validate_links(
 
 
 def validate_remote_links(
-    remote_occurrences: dict[tuple[str, str], LinkOccurrence], access_token: str | None, timeout: int, max_workers: int
+    remote_occurrences: dict[tuple[str, str], LinkOccurrence],
+    cli: str | None,
+    cli_unavailable: str | None,
+    timeout: int,
+    max_workers: int,
 ) -> dict[tuple[str, str], ValidationResult]:
     if not remote_occurrences:
         return {}
@@ -216,7 +362,7 @@ def validate_remote_links(
     cache = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(validate_remote_link, occurrence, access_token, timeout): cache_key
+            executor.submit(validate_remote_link, occurrence, cli, cli_unavailable, timeout): cache_key
             for cache_key, occurrence in remote_occurrences.items()
         }
         for future in as_completed(futures):
@@ -224,55 +370,72 @@ def validate_remote_links(
     return cache
 
 
-def validate_remote_link(occurrence: LinkOccurrence, access_token: str | None, timeout: int) -> ValidationResult:
+def validate_remote_link(
+    occurrence: LinkOccurrence,
+    cli: str | None,
+    cli_unavailable: str | None,
+    timeout: int,
+) -> ValidationResult:
     if occurrence.kind == "atomgit":
-        return validate_atomgit_link(occurrence, access_token, timeout)
+        offline = atomgit_offline_result(occurrence)
+        if offline is not None:
+            return offline
+        if cli is None:
+            # CLI missing, failing identity, or not authenticated: explicit
+            # inconclusive for every remaining AtomGit link (never broken,
+            # D1/D5). Offline-decidable classifications were already
+            # returned above, mirroring the legacy pre-token-gate order.
+            return make_result(occurrence, "inconclusive", cli_unavailable or "AtomGit CLI is unavailable")
+        return validate_atomgit_link(occurrence, cli, timeout)
     return validate_external_link(occurrence, timeout)
 
 
-def resolve_access_token(cli_token: str | None, config_path: str | None) -> str | None:
-    if cli_token:
-        return expand_env_var(cli_token)
+def atomgit_offline_result(link: LinkOccurrence) -> ValidationResult | None:
+    """Offline-decidable AtomGit classification, or None when a probe is needed.
 
-    if config_path:
-        config_token = read_config_token(Path(config_path))
-        if config_token:
-            return config_token
-
-    for env_var in TOKEN_ENV_VARS:
-        token = os.environ.get(env_var)
-        if token:
-            return token
+    Route typos and structurally incomplete blob/tree URLs were reported
+    broken *before* the token gate in the pre-migration code; they stay
+    broken with the CLI missing instead of degrading to inconclusive.
+    """
+    segments = [unquote(segment) for segment in urlparse(link.url).path.split("/") if segment]
+    if any(segment == "bolb" for segment in segments):
+        return make_result(link, "broken", "AtomGit route typo: /bolb/ should be /blob/")
+    if len(segments) >= 3 and segments[2] in {"blob", "tree"} and len(segments) < 5:
+        return make_result(link, "broken", "AtomGit blob/tree URL is missing branch or path")
     return None
 
 
-def read_config_token(config_path: Path) -> str | None:
-    if not config_path.exists():
-        return None
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"failed to read config file {config_path}: {exc}") from exc
+def cli_probe(
+    link: LinkOccurrence,
+    args: list[str],
+    cli: str,
+    timeout: int,
+    valid_detail: str,
+    *,
+    require_json: bool = False,
+) -> tuple[ValidationResult, object | None]:
+    """One read-only CLI probe mapped to the three-state semantics.
 
-    atomgit = config.get("atomgit", {})
-    if not isinstance(atomgit, dict):
-        return None
-    token = atomgit.get("token")
-    if not isinstance(token, str) or not token.strip():
-        return None
-    return expand_env_var(token.strip())
-
-
-def expand_env_var(value: str) -> str:
-    pattern = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
-    match = pattern.match(value)
-    if not match:
-        return value
-    env_var = match.group(1)
-    token = os.environ.get(env_var)
-    if not token:
-        raise ValueError(f"environment variable '{env_var}' referenced by token is not set")
-    return token
+    Exit 0 → valid (JSON is additionally required only when the caller
+    consumes the response body); exit 3 → broken; everything else — CLI
+    unavailable, not authenticated or lacking permission (exit 4), timeout,
+    exec failure, other nonzero exits and unusable output — is explicit
+    inconclusive, never misreported as broken.
+    """
+    outcome = run_cli(args, cli, timeout)
+    if outcome.run_error is not None:
+        return make_result(link, "inconclusive", f"AtomGit CLI {outcome.run_error}"), None
+    if outcome.returncode == 0 and (not require_json or outcome.data is not None):
+        return make_result(link, "valid", valid_detail), outcome.data
+    if outcome.returncode == CLI_EXIT_NOT_FOUND:
+        return make_result(link, "broken", "AtomGit target was not found"), None
+    if outcome.returncode == CLI_EXIT_AUTH:
+        detail = f"AtomGit CLI is not authenticated or lacks permission for this target; run: {AUTH_LOGIN_GUIDANCE}"
+    elif outcome.returncode != 0:
+        detail = f"AtomGit CLI failed with exit code {outcome.returncode}"
+    else:
+        detail = "AtomGit CLI produced no usable JSON output"
+    return make_result(link, "inconclusive", detail), None
 
 
 def validate_local_link(link: LinkOccurrence, root: Path) -> ValidationResult:
@@ -338,63 +501,52 @@ def validate_external_link(link: LinkOccurrence, timeout: int) -> ValidationResu
     return status_to_result(link, status, detail)
 
 
-def validate_atomgit_link(link: LinkOccurrence, access_token: str | None, timeout: int) -> ValidationResult:
+def validate_atomgit_link(link: LinkOccurrence, cli: str, timeout: int) -> ValidationResult:
     parsed = urlparse(link.url)
     segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
-    if any(segment == "bolb" for segment in segments):
-        return make_result(link, "broken", "AtomGit route typo: /bolb/ should be /blob/")
     if len(segments) < 2:
-        return validate_atomgit_user_or_org(link, access_token, timeout)
+        return validate_atomgit_user_or_org(link, cli, timeout)
 
     route = segments[2] if len(segments) >= 3 else ""
     if route in {"blob", "tree"}:
-        return validate_atomgit_blob_tree(link, parsed, segments, access_token, timeout)
-    if route in {"pull", "commit", "issues", "milestones"}:
-        return validate_atomgit_issue_like(link, parsed, segments, access_token, timeout)
-    if len(segments) == 1 and segments[0] != "mindspore":
-        return validate_atomgit_user_or_org(link, access_token, timeout)
+        return validate_atomgit_blob_tree(link, parsed, segments, cli, timeout)
+    if route in {"pull", "pulls", "merge_requests", "commit", "issues", "milestones"}:
+        return validate_atomgit_issue_like(link, segments, cli, timeout)
     if len(segments) == 2:
-        return validate_atomgit_repo(link, parsed, segments, access_token, timeout)
+        return validate_atomgit_repo(link, segments, cli, timeout)
     return validate_external_link(link, timeout)
 
 
 def validate_atomgit_blob_tree(
-    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
+    link: LinkOccurrence,
+    parsed,
+    segments: list[str],
+    cli: str,
+    timeout: int,
 ) -> ValidationResult:
-    if len(segments) < 5:
-        return make_result(link, "broken", "AtomGit blob/tree URL is missing branch or path")
-    if not access_token:
-        return make_result(
-            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
-        )
     namespace, repo, route, branch = segments[:4]
     file_path = "/".join(segments[4:])
-    status, detail, body = request_json(
-        atomgit_api_url(
-            parsed,
-            f"repos/{namespace}/{repo}/contents/{quote(file_path, safe='/')}",
-            {"ref": branch, "access_token": access_token},
-        ),
-        timeout,
-    )
-    if status != 200:
-        return status_to_result(link, status, detail)
+    # The contents endpoint is only reachable through the registered generic
+    # API entry (no dedicated CLI command); query parameters ride the endpoint
+    # string, auto-prefixed with /api/v5 by the CLI.
+    endpoint = f"repos/{namespace}/{repo}/contents/{quote(file_path, safe='/')}?ref={branch}"
+    result, body = cli_probe(link, ["api", endpoint], cli, timeout, f"AtomGit {route} target exists", require_json=True)
+    if result.status != "valid":
+        return result
     target_type = atomgit_content_type(body)
     if target_type == "file" and route == "tree":
-        return make_result(link, "broken", "AtomGit file target should use /blob/ instead of /tree/", status)
+        return make_result(link, "broken", "AtomGit file target should use /blob/ instead of /tree/")
     if target_type == "directory" and route == "blob":
-        return make_result(link, "broken", "AtomGit directory target should use /tree/ instead of /blob/", status)
+        return make_result(link, "broken", "AtomGit directory target should use /tree/ instead of /blob/")
     if target_type == "unknown":
-        return make_result(
-            link, "inconclusive", "AtomGit API response did not identify file or directory target", status
-        )
+        return make_result(link, "inconclusive", "AtomGit API response did not identify file or directory target")
     if parsed.fragment:
         if target_type != "file":
-            return make_result(link, "broken", f"line fragment #{parsed.fragment} can only target a file", status)
-        line_result = validate_atomgit_line_fragment(link, parsed, body, status)
+            return make_result(link, "broken", f"line fragment #{parsed.fragment} can only target a file")
+        line_result = validate_atomgit_line_fragment(link, parsed, body)
         if line_result:
             return line_result
-    return make_result(link, "valid", f"AtomGit {route} target exists", status)
+    return result
 
 
 def atomgit_content_type(body: object | None) -> str:
@@ -408,100 +560,108 @@ def atomgit_content_type(body: object | None) -> str:
     return "unknown"
 
 
-def validate_atomgit_line_fragment(
-    link: LinkOccurrence, parsed, body: object | None, status: int
-) -> ValidationResult | None:
+def validate_atomgit_line_fragment(link: LinkOccurrence, parsed, body: object | None) -> ValidationResult | None:
     line_match = re.fullmatch(r"L(\d+)(?:-L?(\d+))?", parsed.fragment)
     if not line_match:
         return None
     end_line = int(line_match.group(2) or line_match.group(1))
     content = body.get("content") if isinstance(body, dict) else None
     if not content:
-        return make_result(link, "inconclusive", "AtomGit API did not return file content for line check", status)
-    import base64
-
+        return make_result(link, "inconclusive", "AtomGit API did not return file content for line check")
     try:
         decoded = base64.b64decode("".join(content.split())).decode("utf-8", errors="replace")
     except ValueError:
-        return make_result(link, "inconclusive", "AtomGit API content could not be decoded", status)
+        return make_result(link, "inconclusive", "AtomGit API content could not be decoded")
     line_count = len(decoded.splitlines())
     if end_line <= line_count:
-        return make_result(
-            link, "valid", f"AtomGit target exists and line fragment is within {line_count} lines", status
-        )
-    return make_result(link, "broken", f"line fragment #{parsed.fragment} exceeds file length {line_count}", status)
+        return make_result(link, "valid", f"AtomGit target exists and line fragment is within {line_count} lines")
+    return make_result(link, "broken", f"line fragment #{parsed.fragment} exceeds file length {line_count}")
 
 
-def validate_atomgit_issue_like(
-    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
-) -> ValidationResult:
-    if not access_token:
-        return make_result(
-            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
-        )
+def validate_atomgit_issue_like(link: LinkOccurrence, segments: list[str], cli: str, timeout: int) -> ValidationResult:
     namespace, repo, route = segments[:3]
-    if route == "pull":
+    if route in {"pull", "pulls", "merge_requests"}:
         if len(segments) < 4:
             return make_result(link, "broken", "pull URL is missing pull request number")
-        endpoint = f"repos/{namespace}/{repo}/pulls/{segments[3]}"
-    elif route == "commit":
+        if not segments[3].isdigit():
+            return validate_external_link(link, timeout)
+        result, _ = cli_probe(
+            link,
+            ["pr", "view", segments[3], "-R", f"{namespace}/{repo}", "--json"],
+            cli,
+            timeout,
+            "AtomGit pull target exists",
+        )
+        return result
+    if route == "commit":
         if len(segments) < 4:
             return make_result(link, "broken", "commit URL is missing commit id")
-        endpoint = f"repos/{namespace}/{repo}/commits/{segments[3]}"
-    elif route == "milestones":
+        result, _ = cli_probe(
+            link,
+            ["commit", "view", segments[3], "-R", f"{namespace}/{repo}"],
+            cli,
+            timeout,
+            "AtomGit commit target exists",
+        )
+        return result
+    if route == "milestones":
         if len(segments) < 4:
             return make_result(link, "broken", "milestones URL is missing milestone number")
-        endpoint = f"repos/{namespace}/{repo}/milestones/{segments[3]}"
-    else:
-        endpoint = (
-            f"repos/{namespace}/{repo}/issues"
-            if len(segments) == 3
-            else f"repos/{namespace}/{repo}/issues/{segments[3]}"
+        # ``milestone view`` repository targeting is not documented in the
+        # verified help evidence (its examples carry no -R), so the original
+        # REST endpoint stays on the registered generic API entry.
+        result, _ = cli_probe(
+            link,
+            ["api", f"repos/{namespace}/{repo}/milestones/{segments[3]}"],
+            cli,
+            timeout,
+            "AtomGit milestone target exists",
         )
-    status, detail, _ = request_json(atomgit_api_url(parsed, endpoint, {"access_token": access_token}), timeout)
-    return status_to_result(link, status, detail, valid_detail=f"AtomGit {route} target exists")
+        return result
+    if len(segments) == 3:
+        result, _ = cli_probe(
+            link,
+            ["issue", "list", "-R", f"{namespace}/{repo}", "--json", "-L", "1"],
+            cli,
+            timeout,
+            "AtomGit issues collection is readable",
+        )
+        return result
+    result, _ = cli_probe(
+        link,
+        ["issue", "view", segments[3], "-R", f"{namespace}/{repo}", "--json"],
+        cli,
+        timeout,
+        "AtomGit issue target exists",
+    )
+    return result
 
 
-def validate_atomgit_user_or_org(link: LinkOccurrence, access_token: str | None, timeout: int) -> ValidationResult:
-    if not access_token:
-        return make_result(
-            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
-        )
+def validate_atomgit_user_or_org(link: LinkOccurrence, cli: str, timeout: int) -> ValidationResult:
     parsed = urlparse(link.url)
     segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
     if not segments:
         return make_result(link, "valid", "AtomGit host root")
     namespace = segments[0]
-    user_status, user_detail, _ = request_json(
-        atomgit_api_url(parsed, f"users/{namespace}", {"access_token": access_token}), timeout
-    )
-    if user_status == 200:
-        return make_result(link, "valid", "AtomGit user exists", user_status)
-    org_status, org_detail, _ = request_json(
-        atomgit_api_url(parsed, f"orgs/{namespace}", {"access_token": access_token}), timeout
-    )
-    if org_status == 200:
-        return make_result(link, "valid", "AtomGit org exists", org_status)
-    return status_to_result(link, org_status or user_status, org_detail or user_detail)
+    user_result, _ = cli_probe(link, ["user", "view", namespace, "--json"], cli, timeout, "AtomGit user exists")
+    if user_result.status == "valid":
+        return user_result
+    org_result, _ = cli_probe(link, ["api", f"orgs/{namespace}"], cli, timeout, "AtomGit org exists")
+    if org_result.status == "valid":
+        return org_result
+    if user_result.status == "broken" and org_result.status == "broken":
+        return make_result(link, "broken", "AtomGit user or org target was not found")
+    # At least one probe was inconclusive: never misreport broken (D1/D5).
+    detail = org_result.detail if org_result.status != "broken" else user_result.detail
+    return make_result(link, "inconclusive", detail)
 
 
-def validate_atomgit_repo(
-    link: LinkOccurrence, parsed, segments: list[str], access_token: str | None, timeout: int
-) -> ValidationResult:
-    if not access_token:
-        return make_result(
-            link, "inconclusive", "AtomGit API validation requires --access-token or atomgit.token in --config"
-        )
+def validate_atomgit_repo(link: LinkOccurrence, segments: list[str], cli: str, timeout: int) -> ValidationResult:
     namespace, repo = segments[:2]
-    status, detail, _ = request_json(
-        atomgit_api_url(parsed, f"repos/{namespace}/{repo}", {"access_token": access_token}), timeout
+    result, _ = cli_probe(
+        link, ["repo", "view", f"{namespace}/{repo}", "--json"], cli, timeout, "AtomGit repository exists"
     )
-    return status_to_result(link, status, detail, valid_detail="AtomGit repository exists")
-
-
-def atomgit_api_url(parsed, endpoint: str, params: dict[str, str]) -> str:
-    query = urlencode(params)
-    return urlunparse((parsed.scheme, "api.atomgit.com", f"/api/v5/{endpoint}", "", query, ""))
+    return result
 
 
 def encode_url(url: str) -> str:
@@ -524,23 +684,6 @@ def request_status(url: str, method: str, timeout: int) -> tuple[int | None, str
         return None, str(error.reason)
     except TimeoutError:
         return None, "timeout"
-
-
-def request_json(url: str, timeout: int) -> tuple[int | None, str, object | None]:
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            try:
-                return response.status, response.reason, json.loads(raw) if raw else None
-            except json.JSONDecodeError:
-                return response.status, "non-JSON API response", None
-    except HTTPError as error:
-        return error.code, error.reason, None
-    except URLError as error:
-        return None, str(error.reason), None
-    except TimeoutError:
-        return None, "timeout", None
 
 
 def status_to_result(
@@ -612,13 +755,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="JSON report path (default: <first scanned directory parent>/reports/link_validation.json)",
     )
-    parser.add_argument(
-        "--config",
-        default="config.json",
-        help="Optional config.json containing atomgit.token; supports $ATOMGIT_TOKEN placeholders",
-    )
-    parser.add_argument("--access-token", default=None, help="AtomGit access token for API validation")
-    parser.add_argument("--timeout", type=int, default=HTTP_TIMEOUT, help="HTTP timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=HTTP_TIMEOUT, help="HTTP and CLI timeout in seconds")
     parser.add_argument(
         "--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum concurrent remote URL checks"
     )
@@ -627,14 +764,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    cli, cli_unavailable = resolve_cli_access()
+
     root = Path(args.root).resolve()
     paths = [Path(path).resolve() for path in args.paths]
-    try:
-        access_token = resolve_access_token(args.access_token, args.config)
-    except ValueError as exc:
-        print(f"Token configuration error: {exc}", file=sys.stderr)
-        return 2
-    results = validate_links(paths, root, access_token, args.timeout, args.max_workers)
+    results = validate_links(paths, root, cli, cli_unavailable, args.timeout, args.max_workers)
     report_path = Path(args.report) if args.report else default_report_path(paths)
     write_report(results, report_path)
     print_summary(results, report_path)

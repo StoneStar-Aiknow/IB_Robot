@@ -41,6 +41,8 @@ ibrobot_msgs / rclpy
 当前稳定 API：
 
 - `embodied_common.base_node.BaseTaskNode`
+- `embodied_common.caller_auth.caller_token_env_name`
+- `embodied_common.caller_auth.is_caller_authorized`
 - `embodied_common.json_utils.extract_json_blob`
 - `embodied_common.json_utils.load_json_mapping`
 - `embodied_common.json_utils.load_json_list`

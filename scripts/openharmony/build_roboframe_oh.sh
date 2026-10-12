@@ -58,6 +58,8 @@ declare -a PACKAGES=(
     "ibrobot_tracing"
     "robot_config"
     "robot_runtime"
+    "observation_transport"
+    "torch_models"
     "inference_service"
     "hardware_mock"
     "action_dispatch"
@@ -310,7 +312,9 @@ prepare_openharmony_lerobot_runtime_src() {
 
     log_info "Preparing OpenHarmony-patched LeRobot runtime staging tree..." >&2
     if [[ -d "${lerobot_repo_source}" ]]; then
-        git clone --local --no-checkout "${lerobot_repo_source}" "${repo_dir}" >/dev/null
+        # --no-hardlinks: the staging root may live on a different filesystem
+        # than the source checkout, where link(2)-based object sharing fails.
+        git clone --local --no-hardlinks --no-checkout "${lerobot_repo_source}" "${repo_dir}" >/dev/null
     else
         git clone --no-checkout "${lerobot_repo_source}" "${repo_dir}" >/dev/null
     fi
@@ -433,7 +437,7 @@ mkdir -p "\${ROS_HOME_ROOT}" "\${ROS_LOG_ROOT}" >/dev/null 2>&1 || true
 
 export HOME="\${ROS_HOME_ROOT}"
 export ROS_LOG_DIR="\${ROS_LOG_ROOT}"
-export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_manifest/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_tracing/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_manifest/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_runtime/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/observation_transport/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/torch_models/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_tracing/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
 export LD_LIBRARY_PATH="${OH_CUSTOM_PREFIX}/dataset_tools/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/sys_prod/robot/out/lib:/sys_prod/robot/install/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_PRELOAD="/sys_prod/robot/out/lib/libpython3.12.so.1.0\${LD_PRELOAD:+:\$LD_PRELOAD}"
 

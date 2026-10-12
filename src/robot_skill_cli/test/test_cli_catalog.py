@@ -112,6 +112,12 @@ def test_non_navigation_profile_keeps_v1_robot_context():
 
 
 @pytest.mark.parametrize("stage", ["navigation", "hybrid"])
+@pytest.mark.model_bundle(
+    "yolox_x_640",
+    "pear_parameter_network",
+    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounded_sam2_swint_ogc_ascend",
+)
 def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
     from robot_config.loader import load_voice_asr_config
@@ -153,6 +159,12 @@ def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     )
 
 
+@pytest.mark.model_bundle(
+    "yolox_x_640",
+    "pear_parameter_network",
+    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounded_sam2_swint_ogc_ascend",
+)
 def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tmp_path):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
     from robot_skill_cli.catalog import compile_local_snapshot

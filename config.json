@@ -1,8 +1,0 @@
-{
-  "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
-    "owner": "openEuler",
-    "repo": "IB_Robot",
-    "baseUrl": "https://api.atomgit.com"
-  }
-}

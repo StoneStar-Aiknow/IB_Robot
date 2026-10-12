@@ -141,11 +141,11 @@ plan/validate/confirm/execute 端点可达；且系统未处于初始编译、re
 
 Agent plan 的 `execution_mode` 是显式控制模式契约：`interactive_confirmation` 为旧分阶段入口默认值，
 `immediate_after_presentation` 由 `robot-skill run-workflow` 和 `ibrobot_agent` 孵化入口使用。模式在计划创建时捕获，写入
-`AgentPlan`，并由 `ConfirmAgentPlan` 精确匹配；它不授予或修改 `authorize_motion`。立即模式仍必须完成
+旧 `AgentPlan` 兼容入口曾由 `ConfirmAgentPlan` 精确匹配；它不授予或修改 `authorize_motion`。当前生产 Program 模式仍必须完成
 exact catalog、validation、计划展示并 flush、技术绑定、action admission、停止收敛和权威终态校验。
 
 CLI 在同步展示回调返回前完成 flush；孵化 Agent 则发布完整计划并等待客户端的 exact-plan 展示回执，
-收到有效回执后才调用 `ConfirmAgentPlan`。回执是展示传输屏障，不是运动授权或用户二次批准。
+收到有效回执后才提交 `ExecuteProgram`。回执是展示传输屏障，不是运动授权或用户二次批准。
 没有客户端、展示失败或超时时不得自动跳过屏障。孵化 JSON 回执协议见 `ibrobot_agent/README.md`。
 
 ### Agent plan 复合预检与 trace ID
@@ -153,7 +153,12 @@ CLI 在同步展示回调返回前完成 flush；孵化 Agent 则发布完整计
 `PrepareAgentPlan.srv` 请求包含 schema_version=1、request_id、raw_command、typed workflow_steps、
 execution_mode 和 trace_id。响应包含 success、allowed、AgentPlan、error_code、message 和 diagnostics；
 只捕获 exact catalog plan 并做逐步只读 validation，不包含展示、确认、授权或执行。
-`PlanAgentCommand` / `ValidateAgentPlan` 仍保留用于分阶段诊断与兼容调用。
+`PlanAgentCommand` / `ValidateAgentPlan` / `ConfirmAgentPlan` / `ExecuteAgentPlan` 仍保留用于分阶段诊断与兼容调用；新的 Agent 生产主路径使用 typed Program contracts。
+
+`ExecuteProgram` 及其查询、事件、取消服务共享 `caller_scope`、`caller_token` 认证契约。
+Gateway 从 `robot_config` 注入允许的 caller scope；若配置了对应的
+`IBROBOT_EXECUTION_TOKEN_<SCOPE>` 环境变量，则所有入口必须携带匹配 token。token 只用于
+传输认证，不参与 canonical Program digest 或 ExecutionStore payload 身份。
 
 `DispatchBinding.trace_id` 与 `ExecuteAgentPlan.Goal.trace_id` 为链路关联字段，不参与运动权限判断；
 空值按调用路径回退到 request/task ID。日志使用清洗后的副本，不改变业务幂等身份。

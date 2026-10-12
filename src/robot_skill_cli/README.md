@@ -38,9 +38,10 @@ goal 提交前收到展示 tuple（task/plan ID、plan digest、registry identit
 `SUBMISSION_PERSISTENCE_FAILED` 终态阻断 goal 提交。`run(..., expected_registry_identity=...)` 会在 planning
 前校验 live catalog 身份，与快照不一致时按 `SKILL_SNAPSHOT_DIGEST_MISMATCH` fail closed，不发送 goal。
 
-当前 `ibrobot_agent` 生产路径直接通过 `RosBridge` 使用 `/embodied/prepare_agent_plan`，不再
-持有第二套 `InteractiveController` 状态机。CLI 仍保留 `InteractiveController`，并在 runtime
-提供复合接口时使用 prepare+validate；旧 runtime 或测试 bridge 继续使用分阶段兼容路径。
+当前 `ibrobot_agent` 生产路径直接通过 `RosBridge` 使用 `/embodied/execute_program`，由
+Program Gateway 负责一次性 admission、ExecutionStore 幂等账本和 child Skill 派发。
+CLI 仍保留 `InteractiveController`，用于展示、停止、Program 终态收敛以及旧 runtime/test
+bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链。
 
 `ib_trace` 的阶段字段与 `[bind]` 标识符经过有界清洗；日志用的清洗不会改写请求幂等键或
 提交给 Gateway 的 plan/task identity。
@@ -64,8 +65,8 @@ goal 提交前收到展示 tuple（task/plan ID、plan digest、registry identit
 | `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
-| `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
-| `run-workflow [--request-id ID] --text TEXT --workflow-json JSON` | 是 | 展示后按显式 immediate admission policy 自动执行 |
+| `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 旧协议诊断入口：提交 typed AgentPlan |
+| `run-workflow [--request-id ID] --text TEXT --workflow-json JSON` | 是 | 展示后通过 ExecuteProgram 自动执行 |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
 | `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |
@@ -356,6 +357,7 @@ hermes-robot-configure \
   --config-name so101_single_arm \
   --soul-mode replace \
   --accept-hooks \
+  --install-runtime-adapter \
   --restart-gateway
 ```
 
@@ -384,22 +386,35 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
   `robot-skill`、最终回复 speech 和 interim wrapper source workspace `.shrc_local`；lifecycle wrapper
   依赖 Hermes 已初始化的 workspace 环境，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
   interim wrapper 还绑定当前 Hermes profile 的 `ibrobot-speak` 路径。
-- 安装 `post_llm_call`、生命周期和 `on_interim_message` speech hook，移除对应的旧 managed 副本；
+- 清理旧的 `post_llm_call`、生命周期和 `on_interim_message` speech hook managed 副本；
   `--disable-speech` 移除全部受管 speech hook。
+- 原生 Hermes response/motion plugin 是最终回复、中间回复和停止控制的唯一事件生产者；保留的
+  `ibrobot-speak` wrapper 只负责在 ROS 环境中投递结构化语音事件，不再作为独立的 `post_llm_call`
+  或生命周期文案生产者。同步完成后必须重启已有 Hermes CLI。
 - 移除已退役的 `ibrobot-robot-control` Plugin 副本（即时执行改由 `robot-skill run-workflow` 的
   显式 `immediate_after_presentation` 模式承担），并清理 `external_dirs` 缓存目录下同名的 stale skill 副本。
   Plugin 目录只在带 `hermes-robot-configure` managed 标记时才会被 quarantine（重命名），
   不删除无标记或用户自管内容。
-- `--accept-hooks` 先调用 `hermes hooks revoke` 清理旧 mtime（首次安装无既有审批时经
-  `hermes hooks list` 确认未注册则跳过该失败），再用 `hermes --accept-hooks hooks doctor`
-  重新批准 hook；`--restart-gateway` 调用 `hermes gateway restart`。
+- `--accept-hooks` 是兼容参数，不会更改 Hermes hook 授权；受管语音使用原生插件回调。
+  runtime adapter 默认不安装。只有显式传入 `--install-runtime-adapter` 时，才会校验并修改受支持的
+  Hermes checkout，同时启用 `ibrobot-motion`；未安装时受管运动和优先停止保持禁用。
+  `--restart-gateway` 调用 `hermes gateway restart`。
 
-`hermes-robot-speak` 是 `post_llm_call` hook 的 Python 入口（由 `ibrobot-speak` shell wrapper 调用），
+`hermes-robot-speak` 是由原生 Hermes response plugin 调用的 ROS 语音投递 Python 入口（由 `ibrobot-speak`
+shell wrapper 调用），
 从 stdin 读取 Hermes hook payload，提取最终 assistant 回复，经 `sanitize_for_tts` 移除 ASCII
 字母 run 和连续 7 位以上数字（避免播报技术标识符；ZipVoice 中文前端不发音英文），调用
 `ibrobot_msgs.srv.SynthesizeSpeech` 合成 WAV
 并通过 `PlayAudioFile` 服务播放。TTS 是系统自动功能，不是机器人 Skill，不进入 `workflow_json`。
 诊断日志位于 `/tmp/hermes-speak.log`（受 `IBROBOT_HERMES_TTS_LOG` 覆盖）。
+
+### Hermes runtime adapter 生命周期
+
+runtime adapter 默认不安装。需要受管运动与优先停止时，显式使用 `--install-runtime-adapter`；此操作仅支持
+指定 Hermes Git revision，文件哈希和适配器版本记录在 checkout 的 `.ibrobot-control-adapter.json`。
+未知 revision、文件漂移或不支持的既有 manifest 会 fail closed，不会部分改写外部运行时。同步前会生成
+`.ibrobot-backup-*` 备份。普通 profile 同步（包括 `--disable-speech`）不检查或修改 Hermes 安装目录。
+长期应优先迁移到 Hermes 正式 plugin lifecycle API，避免依赖源码锚点。
 
 详细同步步骤、前置条件和升级流程见
 [`resource/hermes/README.md`](resource/hermes/README.md)。

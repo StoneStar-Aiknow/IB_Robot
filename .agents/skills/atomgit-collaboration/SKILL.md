@@ -74,4 +74,4 @@ license: MIT
 1. 明确识别这是 **AtomGit 协作请求**，而不是 GitHub 默认请求。
 2. 判断资源类型（PR / Issue）与动作类型（create / fetch / update / review / architecture / reply）。
 3. 读取对应目标 skill 的 `SKILL.md`。
-4. 按目标 skill 的约束与脚本执行，不要停留在路由层。
+4. 按目标 skill 的约束直接调用官方 CLI；只有批处理与项目检查使用专用脚本，不要停留在路由层。

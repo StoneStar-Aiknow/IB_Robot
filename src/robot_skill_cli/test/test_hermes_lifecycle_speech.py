@@ -69,6 +69,7 @@ def test_handle_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("IBROBOT_LIFECYCLE_SPEECH_STATE", str(tmp_path))
     spawned = []
     monkeypatch.setattr(speech, "_spawn_play", lambda *args: spawned.append(args))
+    monkeypatch.setattr(speech, "_spawn_model", lambda *args: None)
     payload = _payload("pre_tool_call", "robot-skill status")
     speech.handle(payload)
     speech.handle(payload)
@@ -129,8 +130,8 @@ def test_generate_uses_hermes_model_route(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_hook_entrypoint_accepts_payload(tmp_path: Path) -> None:
-    env = {**os.environ, "IBROBOT_LIFECYCLE_SPEECH_STATE": str(tmp_path), "PYTHONPATH": "src/robot_skill_cli"}
-    payload = _payload("pre_tool_call", "robot-skill status")
+    env = {**os.environ, "IBROBOT_LIFECYCLE_SPEECH_STATE": str(tmp_path)}
+    payload = _payload("pre_tool_call", "unrelated-read")
     result = subprocess.run(
         [sys.executable, "-m", "robot_skill_cli.hermes_lifecycle_speech"],
         input=json.dumps(payload),
@@ -139,3 +140,17 @@ def test_hook_entrypoint_accepts_payload(tmp_path: Path) -> None:
         env=env,
     )
     assert result.returncode == 0
+
+
+def test_lifecycle_play_uses_structured_event(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(speech, "_LOG_PATH", tmp_path / "lifecycle.log")
+    monkeypatch.setenv("IBROBOT_HERMES_TTS_HOOK", "/profile/speak")
+    monkeypatch.setattr(
+        speech.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append(json.loads(kwargs["input"])) or types.SimpleNamespace(returncode=0),
+    )
+    speech._play("turn", "planning_started", "正在准备动作。")
+    assert calls[0]["phase"] == "planning_started"
+    assert calls[0]["response"] == {"schema_version": 1, "speech": "正在准备动作。", "details": ""}

@@ -19,10 +19,14 @@ from embodied_common.dispatch_binding import copy_binding, new_binding, workflow
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, PRIMITIVE_CONTRACT_V2
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
-from ibrobot_msgs.action import ExecuteNavigation, ExecuteTaskPlan, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.action import ExecuteNavigation, ExecuteProgram, ExecuteTaskPlan, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.msg import ExecutionEvent
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
+    CancelExecution,
     FinalizeWorkflowExecution,
+    GetExecution,
+    GetExecutionEvents,
     GetSkillGatewayStatus,
     GetSkillSnapshot,
     ReloadSkillCatalog,
@@ -311,7 +315,11 @@ def gateway_rig(request, tmp_path):
         "begin_workflow": f"/{suffix}/begin_workflow",
         "cmd_pose": f"/{suffix}/cmd_pose",
         "ee_pose": f"/{suffix}/ee_pose",
+        "events": f"/{suffix}/execution_events",
+        "execute_program": f"/{suffix}/execute_program",
         "finalize_workflow": f"/{suffix}/finalize_workflow",
+        "get_execution": f"/{suffix}/get_execution",
+        "get_execution_events": f"/{suffix}/get_execution_events",
         "joint_state": f"/{suffix}/joint_state",
         "navigation": f"/{suffix}/navigation",
         "primitive": f"/{suffix}/primitive",
@@ -320,6 +328,7 @@ def gateway_rig(request, tmp_path):
         "snapshot": f"/{suffix}/snapshot",
         "status": f"/{suffix}/status",
         "task_executor": f"/{suffix}/task_executor",
+        "cancel_execution": f"/{suffix}/cancel_execution",
         "validate_primitive": f"/{suffix}/validate_primitive",
         "validate_skill": f"/{suffix}/validate_skill",
     }
@@ -371,6 +380,13 @@ def gateway_rig(request, tmp_path):
         "context_schema_version": 2 if serve_navigation else 1,
         "default_skill_timeout_sec": 2.5,
         "ee_pose_topic": names["ee_pose"],
+        "execute_program_action": names["execute_program"],
+        "execution_event_topic": names["events"],
+        "execution_store_path": str(tmp_path / "executions.sqlite3"),
+        "execution_caller_scopes_json": '["robot_skill_cli"]',
+        "get_execution_service": names["get_execution"],
+        "get_execution_events_service": names["get_execution_events"],
+        "cancel_execution_service": names["cancel_execution"],
         "finalize_workflow_service": names["finalize_workflow"],
         "joint_state_topic": names["joint_state"],
         "ledger_terminal_capacity": 8,
@@ -415,6 +431,10 @@ def gateway_rig(request, tmp_path):
     reload_client = client_node.create_client(ReloadSkillCatalog, names["reload"])
     begin_workflow_client = client_node.create_client(BeginWorkflowExecution, names["begin_workflow"])
     finalize_workflow_client = client_node.create_client(FinalizeWorkflowExecution, names["finalize_workflow"])
+    program_client = ActionClient(client_node, ExecuteProgram, names["execute_program"])
+    get_execution_client = client_node.create_client(GetExecution, names["get_execution"])
+    get_execution_events_client = client_node.create_client(GetExecutionEvents, names["get_execution_events"])
+    cancel_execution_client = client_node.create_client(CancelExecution, names["cancel_execution"])
     _wait_for(skill_client.server_is_ready)
     _wait_for(primitive_client.server_is_ready)
     _wait_for(status_client.service_is_ready)
@@ -422,6 +442,10 @@ def gateway_rig(request, tmp_path):
     _wait_for(reload_client.service_is_ready)
     _wait_for(begin_workflow_client.service_is_ready)
     _wait_for(finalize_workflow_client.service_is_ready)
+    _wait_for(program_client.server_is_ready)
+    _wait_for(get_execution_client.service_is_ready)
+    _wait_for(get_execution_events_client.service_is_ready)
+    _wait_for(cancel_execution_client.service_is_ready)
 
     task_started = threading.Event()
     task_release = threading.Event()
@@ -475,6 +499,10 @@ def gateway_rig(request, tmp_path):
         navigation_server=navigation_server,
         overrides=overrides,
         primitive_client=primitive_client,
+        program_client=program_client,
+        get_execution_client=get_execution_client,
+        get_execution_events_client=get_execution_events_client,
+        cancel_execution_client=cancel_execution_client,
         reload_client=reload_client,
         skill_client=skill_client,
         snapshot_client=snapshot_client,
@@ -545,6 +573,436 @@ def test_snapshot_service_response_matches_generated_contract(gateway_rig):
     assert response.success is True
     assert response.generation > 0
     assert response.snapshot_json
+
+
+def _program_goal(gateway_rig, *, request_id="program-1", task_budget_sec=2.5, steps=None):
+    status = _get_status(gateway_rig)
+    goal = ExecuteProgram.Goal()
+    goal.schema_version = 1
+    goal.request_id = request_id
+    goal.caller_scope = "robot_skill_cli"
+    goal.robot_id = gateway_rig.overrides["robot_name"]
+    goal.expected_registry_epoch = status.registry_epoch
+    goal.expected_registry_generation = status.registry_generation
+    goal.expected_registry_digest = status.registry_digest
+    goal.workflow_steps = steps or [workflow_step(skill_name="move", timeout_sec=task_budget_sec)]
+    goal.task_budget_sec = task_budget_sec
+    return goal
+
+
+def _send_program(gateway_rig, goal):
+    handle = _future_result(gateway_rig.program_client.send_goal_async(goal))
+    assert handle.accepted
+    return _future_result(handle.get_result_async()).result
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_minimal_program_gateway_single_step_round_trip(gateway_rig):
+    result = _send_program(gateway_rig, _program_goal(gateway_rig))
+    assert result.success is True
+    assert result.state == "SUCCEEDED"
+    assert result.completed_step_count == 1
+    assert result.execution_id
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_result_and_query_project_durable_contract(gateway_rig):
+    goal = _program_goal(gateway_rig, request_id="contract-projection")
+    result = _send_program(gateway_rig, goal)
+    assert result.workflow_digest == result.program_digest
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = goal.caller_scope
+    query.robot_id = goal.robot_id
+    query.request_id = goal.request_id
+    query.execution_id = result.execution_id
+    response = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert response.canonical_steps[0].skill_name == "move"
+    assert response.actual_registry_generation > 0
+    assert response.reconciled is False
+    events = GetExecutionEvents.Request()
+    events.schema_version = 1
+    events.caller_scope = goal.caller_scope
+    events.robot_id = goal.robot_id
+    events.request_id = goal.request_id
+    events.execution_id = result.execution_id
+    events.limit = 100
+    event_response = _future_result(gateway_rig.get_execution_events_client.call_async(events))
+    assert event_response.events
+    assert event_response.events[-1].canonical_steps[0].skill_name == "move"
+    assert event_response.events[-1].created_at.sec > 0
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_terminal_replay_survives_catalog_reload(gateway_rig):
+    goal = _program_goal(gateway_rig, request_id="program-replay-after-reload")
+    first = _send_program(gateway_rig, goal)
+    assert first.success
+
+    implementation_path = (
+        Path(gateway_rig.overrides["skill_catalog_source_root"])
+        / "config"
+        / "skills"
+        / "move"
+        / "implementations"
+        / f"{gateway_rig.overrides['skill_catalog_profile']}.yaml"
+    )
+    changed_implementation = _skill_implementation(
+        gateway_rig.overrides["skill_catalog_profile"],
+        [{"primitive_name": "move_to_named_pose", "pose_name": "home"}],
+    )
+    changed_implementation["initial_gripper_state"] = "open"
+    _write_yaml(implementation_path, changed_implementation)
+    reload = ReloadSkillCatalog.Request()
+    reload.schema_version = 1
+    reload.request_id = f"reload-before-program-replay-{uuid.uuid4().hex}"
+    reload.force = True
+    assert _future_result(gateway_rig.reload_client.call_async(reload)).success
+
+    # Replay resolves from the durable request key before active-registry
+    # admission, so the original terminal result remains idempotent.
+    replay = _send_program(gateway_rig, goal)
+    assert replay.success
+    assert replay.execution_id == first.execution_id
+
+    # A new request carrying the old catalog identity is rejected explicitly.
+    new_goal = _program_goal(gateway_rig, request_id="program-old-registry-after-reload")
+    new_goal.expected_registry_generation = goal.expected_registry_generation
+    new_goal.expected_registry_digest = goal.expected_registry_digest
+    mismatch = _send_program(gateway_rig, new_goal)
+    assert mismatch.success is False
+    assert mismatch.error_code == "SKILL_REGISTRY_VERSION_MISMATCH"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_cancel_execution_between_steps_uses_durable_terminal(gateway_rig, monkeypatch):
+    first_child_finished = threading.Event()
+    release_second = threading.Event()
+    original_child = gateway_rig.executor_node._execute_program_child
+    calls = 0
+
+    def child(goal, root_handle, execution_id):
+        nonlocal calls
+        calls += 1
+        result = original_child(goal, root_handle, execution_id)
+        if calls == 1:
+            first_child_finished.set()
+            release_second.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    goal = _program_goal(
+        gateway_rig,
+        request_id="cancel-between-steps",
+        task_budget_sec=5.0,
+        steps=[workflow_step(skill_name="move", timeout_sec=1.0), workflow_step(skill_name="move", timeout_sec=1.0)],
+    )
+    future = gateway_rig.program_client.send_goal_async(goal)
+    handle = _future_result(future)
+    assert handle.accepted
+    assert first_child_finished.wait(timeout=2.0)
+    cancel = CancelExecution.Request()
+    cancel.schema_version = 1
+    cancel.caller_scope = goal.caller_scope
+    cancel.robot_id = goal.robot_id
+    cancel.request_id = goal.request_id
+    cancel.execution_id = ""
+    cancel_result = _future_result(gateway_rig.cancel_execution_client.call_async(cancel))
+    assert cancel_result.accepted is True
+    release_second.set()
+    result = _future_result(handle.get_result_async()).result
+    assert result.state == "CANCELED"
+    assert result.error_code == "SKILL_CANCELLED"
+    assert calls == 1
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_second_step_failure_projects_first_step_completion(gateway_rig, monkeypatch):
+    original_child = gateway_rig.executor_node._execute_program_child
+    calls = 0
+
+    def child(goal, root_handle, execution_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            failed = SkillCommand.Result()
+            failed.success = False
+            failed.error_code = "SKILL_REJECTED"
+            failed.message = "second step rejected"
+            return failed
+        return original_child(goal, root_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    goal = _program_goal(
+        gateway_rig,
+        request_id="second-step-failure-projection",
+        task_budget_sec=5.0,
+        steps=[workflow_step(skill_name="move", timeout_sec=1.0), workflow_step(skill_name="move", timeout_sec=1.0)],
+    )
+    result = _send_program(gateway_rig, goal)
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert result.completed_step_count == 1
+    assert result.actual_registry_generation > 0
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = goal.caller_scope
+    query.robot_id = goal.robot_id
+    query.request_id = goal.request_id
+    query.execution_id = result.execution_id
+    response = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert response.completed_step_count == result.completed_step_count
+    assert response.actual_registry_generation == result.actual_registry_generation
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_unresolved_unknown_quarantines_every_root_entry_until_reconciled(gateway_rig):
+    from embodied_common.program_contracts import canonicalize_program
+
+    store = gateway_rig.executor_node._execution_store
+    status = _get_status(gateway_rig)
+    unknown_program = canonicalize_program(
+        schema_version=1,
+        request_id="earlier-unknown",
+        caller_scope="robot_skill_cli",
+        robot_id=gateway_rig.overrides["robot_name"],
+        expected_registry_epoch=status.registry_epoch,
+        expected_registry_generation=status.registry_generation,
+        expected_registry_digest=status.registry_digest,
+        workflow_steps=[workflow_step(skill_name="move", timeout_sec=1.0)],
+        task_budget_sec=2.0,
+    )
+    record, _ = store.begin(unknown_program)
+    store.mark_committing(record.execution_id)
+    store.finish(
+        record.execution_id,
+        state="UNKNOWN",
+        completed_step_count=0,
+        error_code="SKILL_CANCEL_TIMEOUT",
+        message="downstream cleanup was not confirmed",
+    )
+    downstream_before = len(gateway_rig.downstream_goals)
+
+    # Legacy Agent Plan workflow root.
+    began = _begin_single_step_workflow(gateway_rig, "quarantined-workflow", expect_success=False)
+    assert began.success is False
+    assert began.error_code == "EXECUTION_QUARANTINED"
+    # Direct SkillCommand root.
+    assert _send_skill(gateway_rig, task_id="quarantined-skill").error_code == "EXECUTION_QUARANTINED"
+    # External PrimitiveCommand root.
+    primitive_handle = _future_result(
+        gateway_rig.primitive_client.send_goal_async(_primitive_goal("quarantined-primitive", gateway_rig))
+    )
+    primitive_result = _future_result(primitive_handle.get_result_async()).result
+    assert primitive_result.error_code == "EXECUTION_QUARANTINED"
+    # New Program root.
+    program_result = _send_program(gateway_rig, _program_goal(gateway_rig, request_id="quarantined-program"))
+    assert program_result.success is False
+    assert program_result.error_code == "EXECUTION_QUARANTINED"
+    # No quarantined request may reach the downstream controller.
+    assert len(gateway_rig.downstream_goals) == downstream_before
+
+    # Offline reconciliation is the only release path.
+    store.resolve_unknown(record.execution_id, operator_scope="operator", evidence="arm verified at home")
+    assert _send_skill(gateway_rig, task_id="after-reconciliation").success is True
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_ledger_events_are_published_in_sequence(gateway_rig):
+    received = []
+    subscription = gateway_rig.client_node.create_subscription(
+        ExecutionEvent, gateway_rig.names["events"], received.append, 100
+    )
+    try:
+        _wait_for(lambda: gateway_rig.executor_node._execution_event_publisher.get_subscription_count() > 0)
+        goal = _program_goal(gateway_rig, request_id="event-stream")
+        result = _send_program(gateway_rig, goal)
+        assert result.success is True
+        record = gateway_rig.executor_node._execution_store.get(execution_id=result.execution_id)
+        _wait_for(
+            lambda: any(
+                event.execution_id == result.execution_id and event.sequence == record.last_event_sequence
+                for event in received
+            )
+        )
+        sequences = [event.sequence for event in received if event.execution_id == result.execution_id]
+        assert sequences == list(range(1, record.last_event_sequence + 1))
+        terminal = [event for event in received if event.execution_id == result.execution_id][-1]
+        assert terminal.state == "SUCCEEDED"
+        assert terminal.request_id == goal.request_id
+        assert terminal.canonical_steps[0].skill_name == "move"
+    finally:
+        gateway_rig.client_node.destroy_subscription(subscription)
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_gateway_preserves_distinct_child_step_identity(gateway_rig, monkeypatch):
+    captured = []
+    original_child_executor = gateway_rig.executor_node._execute_program_child
+
+    def capture_child(goal, root_goal_handle, execution_id):
+        binding = goal.dispatch_binding
+        captured.append((binding.task_id, binding.root_task_id, binding.workflow_step_index))
+        return original_child_executor(goal, root_goal_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", capture_child)
+    result = _send_program(
+        gateway_rig,
+        _program_goal(
+            gateway_rig,
+            request_id="program-child-identities",
+            task_budget_sec=5.0,
+            steps=[
+                workflow_step(skill_name="move", timeout_sec=2.0),
+                workflow_step(skill_name="move", timeout_sec=2.0),
+            ],
+        ),
+    )
+    assert result.success is True
+    assert result.completed_step_count == 2
+    assert len(captured) == 2
+    assert captured[0][0] == derive_skill_task_id(captured[0][1], 0)
+    assert captured[1][0] == derive_skill_task_id(captured[1][1], 1)
+    assert captured[0][1] == captured[1][1]
+    assert [item[2] for item in captured] == [0, 1]
+    assert captured[0][0] != captured[1][0]
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_minimal_program_gateway_hot_dispatch_latency(gateway_rig, capsys):
+    # Warm-up round: catalog, registry and DDS discovery are already hot from
+    # the rig fixture; this first round still pays one-off allocator costs.
+    warmup = _send_program(gateway_rig, _program_goal(gateway_rig, request_id="latency-warmup"))
+    assert warmup.success is True
+
+    samples_ms = []
+    for index in range(10):
+        goal = _program_goal(gateway_rig, request_id=f"latency-{index}")
+        started = time.perf_counter()
+        result = _send_program(gateway_rig, goal)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        assert result.success is True
+        assert result.state == "SUCCEEDED"
+        samples_ms.append(elapsed_ms)
+
+    ordered = sorted(samples_ms)
+    mean_ms = sum(ordered) / len(ordered)
+    p95_ms = ordered[max(0, int(len(ordered) * 0.95) - 1)]
+    max_ms = ordered[-1]
+    # Record the measured distribution for the migration report; colcon
+    # captures this line in the pytest output.
+    print(
+        "PROGRAM_GATEWAY_HOT_DISPATCH_MS "
+        f"mean={mean_ms:.1f} p95={p95_ms:.1f} max={max_ms:.1f} "
+        f"samples={[round(value, 1) for value in ordered]}"
+    )
+    # Regression ceiling for the local DDS/mock path: ExecuteProgram ->
+    # Gateway admission -> child skill -> primitive executor -> terminal
+    # result, including the durable ExecutionStore ledger commit.  Hardware
+    # acceptance records the real robot value separately.
+    assert max_ms < 1000.0
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_minimal_program_gateway_replay_and_payload_conflict(gateway_rig):
+    first = _program_goal(gateway_rig, request_id="replay-1")
+    result = _send_program(gateway_rig, first)
+    replay = _send_program(gateway_rig, first)
+    assert replay.success is True
+    assert replay.execution_id == result.execution_id
+
+    conflict = _program_goal(gateway_rig, request_id="replay-1", task_budget_sec=3.0)
+    conflict_result = _send_program(gateway_rig, conflict)
+    assert conflict_result.success is False
+    assert conflict_result.error_code == "SKILL_REQUEST_ID_CONFLICT"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_program_child_uses_skill_validation_and_shared_budget(gateway_rig, monkeypatch):
+    validated = []
+    original_validate = gateway_rig.executor_node._validate_skill
+    original_child = gateway_rig.executor_node._execute_program_child
+
+    def validate(*args, **kwargs):
+        validated.append(args[0])
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", validate)
+    result = _send_program(
+        gateway_rig,
+        _program_goal(
+            gateway_rig,
+            request_id="program-validation-budget",
+            task_budget_sec=5.0,
+            steps=[
+                workflow_step(skill_name="move", timeout_sec=1.0),
+                workflow_step(skill_name="move", timeout_sec=1.0),
+            ],
+        ),
+    )
+    assert result.success is True
+    assert validated == ["move", "move"]
+
+    # The child executor receives one absolute deadline for every step.
+    captured = []
+
+    def capture(goal, root_handle, execution_id):
+        captured.append(
+            (goal.dispatch_binding.task_budget.started_at.sec, goal.dispatch_binding.task_budget.deadline.sec)
+        )
+        return original_child(goal, root_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", capture)
+    result = _send_program(
+        gateway_rig,
+        _program_goal(
+            gateway_rig,
+            request_id="program-shared-budget",
+            task_budget_sec=5.0,
+            steps=[
+                workflow_step(skill_name="move", timeout_sec=1.0),
+                workflow_step(skill_name="move", timeout_sec=1.0),
+            ],
+        ),
+    )
+    assert result.success is True
+    assert len(set(captured)) == 1
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_minimal_program_gateway_query_events_and_cancel(gateway_rig):
+    goal = _program_goal(gateway_rig, request_id="query-1")
+    result = _send_program(gateway_rig, goal)
+
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = goal.caller_scope
+    query.robot_id = goal.robot_id
+    query.request_id = goal.request_id
+    query.execution_id = result.execution_id
+    queried = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert queried.found is True
+    assert queried.state == "SUCCEEDED"
+
+    events = GetExecutionEvents.Request()
+    events.schema_version = 1
+    events.caller_scope = goal.caller_scope
+    events.robot_id = goal.robot_id
+    events.request_id = goal.request_id
+    events.execution_id = result.execution_id
+    events.limit = 100
+    event_result = _future_result(gateway_rig.get_execution_events_client.call_async(events))
+    assert event_result.found is True
+    assert [event.sequence for event in event_result.events] == list(range(1, len(event_result.events) + 1))
+
+    cancel = CancelExecution.Request()
+    cancel.schema_version = 1
+    cancel.caller_scope = goal.caller_scope
+    cancel.robot_id = goal.robot_id
+    cancel.request_id = goal.request_id
+    cancel.execution_id = result.execution_id
+    cancel_result = _future_result(gateway_rig.cancel_execution_client.call_async(cancel))
+    assert cancel_result.accepted is True
 
 
 def test_reload_service_response_matches_generated_contract_and_keeps_gateway_alive(gateway_rig):
@@ -781,7 +1239,7 @@ def test_direct_navigation_rejects_hidden_coordinate_value(gateway_rig):
     assert gateway_rig.navigation_goals == []
 
 
-def _begin_single_step_workflow(rig, root_task_id: str):
+def _begin_single_step_workflow(rig, root_task_id: str, *, expect_success: bool = True):
     status = _get_status(rig)
     binding = new_binding(task_id=root_task_id)
     binding.expected_registry_epoch = status.registry_epoch
@@ -807,6 +1265,8 @@ def _begin_single_step_workflow(rig, root_task_id: str):
     request.dispatch_binding = binding
     request.workflow_steps = steps
     began = _future_result(rig.begin_workflow_client.call_async(request))
+    if not expect_success:
+        return began
     assert began.success is True
     return binding, began
 

@@ -6,7 +6,6 @@ av>=15,<16
 onnx
 onnxruntime
 pygraphviz
-atomgit_sdk
 # Required by the CANN 8.1 TBE Python adapter; torch_npu 2.5.1 does not
 # declare it even though graph compilation imports it in a child interpreter.
 decorator

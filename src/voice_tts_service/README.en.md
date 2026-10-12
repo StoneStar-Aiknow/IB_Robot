@@ -130,8 +130,12 @@ voice cloning. It returns `UNSUPPORTED_PROMPT` when prompt fields are supplied.
 | Type | `ibrobot_msgs/srv/PlayAudioFile` |
 | Input | Absolute WAV path on the machine hosting the playback service |
 
-The call blocks until playback completes and then returns `success=true`. A missing path, invalid WAV, unavailable
-playback node, or timeout returns `success=false` with a stable `error_code` and message.
+The call blocks until the complete audio stream has been published and the playback budget has elapsed, then returns
+`success=true`. The shared `audio_common` path waits for the playback subscriber, publishes 50 ms PCM chunks on an
+absolute sample clock, and does not wait for a DDS acknowledgement between chunks. After all chunks are published it
+performs one reliable-delivery acknowledgement wait, still bounded by `playback_timeout_sec`. This acknowledgement is
+not a hardware speaker-completion event. A missing path, invalid WAV, unavailable playback node, or timeout returns
+`success=false` with a stable `error_code` and message.
 The service does not fetch files over SSH or interpret a path from the caller's machine.
 
 ```bash

@@ -197,6 +197,45 @@ def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
     assert params["gripper_settle_sec"] == 0.8
 
 
+def test_agent_launch_shares_caller_scope_and_token_configuration():
+    config = {
+        "name": "agent_robot",
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "execution_caller_scopes": ["robot_skill_cli", "agent_scope"],
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "ledger_path": "/tmp/test-agent-requests.sqlite3",
+                "conversation_path": "/tmp/test-agent-conversation.sqlite3",
+                "deployment_lock_path": "/tmp/test-agent.lock",
+                "caller_scope": "agent_scope",
+                "caller_token_env": "TEST_AGENT_TOKEN",
+                "caller_token": "configured-token",
+            },
+        },
+    }
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+    assert _decode_launch_json_string(params["execution_caller_scopes_json"]) == [
+        "robot_skill_cli",
+        "agent_scope",
+    ]
+    assert _decode_launch_json_string(params["execution_caller_tokens_json"]) == {"agent_scope": "configured-token"}
+    agent_node = next(
+        node
+        for node in generate_embodied_nodes(config, active_control_mode="moveit_planning")
+        if (
+            vars(node).get("_Node__package") == "ibrobot_agent"
+            and vars(node).get("_Node__node_name") == "ibrobot_agent_node"
+        )
+    )
+    agent_params = _normalize_launch_param_mapping(agent_node._Node__parameters[0])
+    assert _decode_launch_string(agent_params["gateway_caller_scope"]) == "agent_scope"
+    assert _decode_launch_string(agent_params["gateway_caller_token_env"]) == "TEST_AGENT_TOKEN"
+    assert _decode_launch_string(agent_params["gateway_caller_token"]) == "configured-token"
+
+
 def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
     robot_config = {
         "name": "lekiwi_lidar",
@@ -287,6 +326,7 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
+@pytest.mark.model_bundle("yolox_x_640", "pear_parameter_network")
 def test_hybrid_profile_projects_hri_person_confidence_threshold():
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)
@@ -502,6 +542,10 @@ def test_agent_entry_mode_adds_only_agent_entry_node():
     assert _decode_launch_json_string(_decode_launch_string(params["allowed_skills_json"])) == ["wave_hello"]
     assert params["simulation_mode"] is False
     assert params["presentation_timeout_sec"] == 30.0
+    skill_params = _skill_executor_params(nodes)
+    scopes = _decode_launch_json_string(_decode_launch_string(skill_params["execution_caller_scopes_json"]))
+    assert "agent_incubation:local_operator" in scopes
+    assert _decode_launch_string(params["gateway_caller_scope"]) == "agent_incubation:local_operator"
 
 
 def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
@@ -1182,3 +1226,119 @@ def test_embodied_runtime_readiness_handler_starts_only_after_success():
     failure_actions = handler(type("Event", (), {"returncode": 1})(), None)
     assert len(failure_actions) == 1
     assert isinstance(failure_actions[0], EmitEvent)
+
+
+def _motion_owning_runtime_config(public_description, *, arm_surface):
+    """A runtime robot without arm motion: no model, ee pose, trajectory or move-to-joint."""
+    from robot_runtime.interface_description import description_digest, validate_description
+
+    description = json.loads(json.dumps(public_description))
+    description.pop("model")
+    for interface_id in ("motion.move_to_joint", "motion.ee_pose", "joint.arm_trajectory"):
+        description["interfaces"].pop(interface_id)
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    validate_description(description)
+    embodied = {"enabled": True, "entry_mode": "hermes"}
+    if arm_surface is not None:
+        embodied["arm_surface"] = arm_surface
+    return {
+        "name": "motion_owning_robot",
+        "runtime": {"provider": "so101_robot", "interface_description": description},
+        "control_modes": {"named_motion": {"runtime_mode": "idle"}},
+        "skill_required_control_mode": "named_motion",
+        "embodied": embodied,
+    }
+
+
+def test_runtime_without_arm_surface_binds_only_runtime_admission(public_description):
+    config = _motion_owning_runtime_config(public_description, arm_surface=False)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion", motion_authorized=True))
+
+    assert params["runtime_enabled"] is True
+    assert _decode_launch_string(params["runtime_status_topic"]) == "/test/runtime_status"
+    assert _decode_launch_string(params["runtime_mode_service"]) == "/test/runtime/set_mode"
+    assert _decode_launch_json_string(params["runtime_mode_map_json"]) == {"named_motion": "idle"}
+    assert "arm_trajectory_action_name" not in params
+    assert "ee_pose_topic" not in params
+    assert "joint_state_topic" not in params
+    assert _decode_launch_string(params["move_configuration_service"]) == RUNTIME.MOVE_TO_JOINT_SERVICE
+
+
+@pytest.mark.parametrize("arm_surface", [None, True])
+def test_runtime_without_arm_interfaces_still_fails_closed_unless_opted_out(public_description, arm_surface):
+    config = _motion_owning_runtime_config(public_description, arm_surface=arm_surface)
+
+    with pytest.raises(ValueError, match="robot_model"):
+        generate_embodied_nodes(config, "named_motion")
+
+
+def test_arm_runtime_still_requires_its_trajectory_action(public_description):
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    from robot_runtime.interface_description import description_digest
+
+    description = json.loads(json.dumps(public_description))
+    description["interfaces"].pop("joint.arm_trajectory")
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    config = bind_robot_interfaces(
+        load_robot_config_dict(config_path, defer_interface_binding=True), public_description
+    )
+    config["runtime"]["interface_description"] = description
+    config["embodied"]["enabled"] = True
+
+    with pytest.raises(ValueError, match="arm trajectory action"):
+        generate_embodied_nodes(config, "moveit_planning")
+
+
+_NAMED_MOTION_BINDING = {
+    "enabled": True,
+    "interface": "motion.named",
+    "kind": "action",
+    "type": "ibrobot_msgs/action/ExecuteNamedMotion",
+}
+
+
+def _with_named_motion_interface(config):
+    from robot_runtime.interface_description import description_digest, validate_description
+
+    description = config["runtime"]["interface_description"]
+    description["interfaces"]["motion.named"] = {
+        "capability": "motion.named",
+        "kind": "action",
+        "direction": "serve",
+        "endpoint": "/test/motion/execute_named",
+        "message_type": "ibrobot_msgs/action/ExecuteNamedMotion",
+    }
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    validate_description(description)
+    return config
+
+
+def test_runtime_named_motion_endpoint_comes_from_the_public_description(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    config["embodied"]["runtime_named_motion"] = dict(_NAMED_MOTION_BINDING)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert params["runtime_named_motion_enabled"] is True
+    assert _decode_launch_string(params["runtime_named_motion_action"]) == "/test/motion/execute_named"
+
+
+def test_runtime_named_motion_requires_the_public_action(public_description):
+    config = _motion_owning_runtime_config(public_description, arm_surface=False)
+    config["embodied"]["runtime_named_motion"] = dict(_NAMED_MOTION_BINDING)
+
+    with pytest.raises(ValueError, match="motion.named"):
+        generate_embodied_nodes(config, "named_motion")
+
+
+def test_runtime_named_motion_stays_off_unless_enabled(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert "runtime_named_motion_enabled" not in params
+    assert "runtime_named_motion_action" not in params

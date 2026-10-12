@@ -147,7 +147,9 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 | 输入 | 播放服务所在机器上的 WAV 文件绝对路径 |
 
 服务同步等待整段音频发布/播放完成，再返回 `success=true`。`audio_common` 链路会先等待播放节点
-连接，按实时速率发布并等待可靠发布确认；等待连接、发布和播放等待均受 `playback_timeout_sec` 限制。
+连接，按音频的绝对 sample clock 以 50 ms 分包发布；分包之间不等待 DDS ACK，避免 ACK 延迟逐包累积
+造成音频间隙。所有 PCM 分包发布后统一等待一次可靠投递确认；等待连接、发布、确认和播放等待均受
+`playback_timeout_sec` 限制。该确认表示数据已可靠交给播放链路，不是声卡硬件播放完成事件。
 由于 `audio_common` 的 `AudioData` 接口没有硬件播放完成回调，共享模式的成功语义是数据已可靠送达并
 完成对应时长的等待，不代表声卡提供了独立的硬件完成事件。路径不存在、WAV 无效、播放节点未就绪、
 播放超时或播放节点不可用时返回 `success=false`，并填写稳定的 `error_code` 和

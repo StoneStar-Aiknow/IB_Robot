@@ -1,0 +1,20 @@
+# Resume authoritative Gateway execution events after a consumer reconnects.
+# The lookup is scoped exactly like GetExecution. after_sequence is exclusive;
+# limit is bounded by the server and must be positive.
+
+uint32 schema_version
+string caller_scope
+string caller_token
+string robot_id
+string request_id
+string execution_id
+uint64 after_sequence
+uint32 limit
+---
+bool found
+string execution_id
+ExecutionEvent[] events
+uint64 last_event_sequence
+bool has_more
+string error_code
+string message

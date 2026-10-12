@@ -10,11 +10,14 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
+from types import SimpleNamespace
 
 import rclpy
 from builtin_interfaces.msg import Duration as DurationMsg
+from builtin_interfaces.msg import Time as TimeMsg
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
@@ -31,6 +34,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
+from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
     copy_binding,
@@ -40,6 +44,7 @@ from embodied_common.dispatch_binding import (
     load_delegated_model_identity,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
+from embodied_common.program_contracts import canonicalize_program
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
@@ -50,7 +55,9 @@ from embodied_common.workflow_contracts import (
     validate_workflow_steps,
 )
 from ibrobot_msgs.action import (
+    ExecuteNamedMotion,
     ExecuteNavigation,
+    ExecuteProgram,
     ExecuteTaskPlan,
     ImitateHumanMotion,
     PickObject,
@@ -58,10 +65,21 @@ from ibrobot_msgs.action import (
     PrimitiveCommand,
     SkillCommand,
 )
-from ibrobot_msgs.msg import RuntimeStatus, SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
+from ibrobot_msgs.msg import (
+    ExecutionEvent,
+    RuntimeStatus,
+    SkillCapabilityStatus,
+    SkillDiagnostic,
+    SkillRegistryEvent,
+    TaskStep,
+    WorkflowStep,
+)
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
+    CancelExecution,
     FinalizeWorkflowExecution,
+    GetExecution,
+    GetExecutionEvents,
     GetSemanticObjects,
     GetSkillGatewayStatus,
     GetSkillSnapshot,
@@ -78,7 +96,15 @@ from robot_runtime import contract as RUNTIME
 from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
+from skill_library import runtime_named_motion as named_motion
+from skill_library.execution_store import (
+    ExecutionBusyError,
+    ExecutionConflictError,
+    ExecutionQuarantinedError,
+    SQLiteExecutionStore,
+)
 from skill_library.gateway_policy import (
+    EXECUTION_QUARANTINED,
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
     TIMEOUT_EXCEEDS_POLICY,
@@ -102,6 +128,43 @@ WORKFLOW_STEP_ACTIVE = "active"
 WORKFLOW_STEP_SUCCEEDED = "succeeded"
 WORKFLOW_STEP_FAILED = "failed"
 WORKFLOW_STEP_CANCELED = "canceled"
+
+
+def _workflow_step_message(values: dict):
+    step = WorkflowStep()
+    step.schema_version = int(values.get("schema_version", 1))
+    step.skill_name = str(values.get("skill_name", ""))
+    step.target_name = str(values.get("target_name", ""))
+    step.container_name = str(values.get("container_name", ""))
+    step.place_name = str(values.get("place_name", ""))
+    step.motion_direction = str(values.get("motion_direction", ""))
+    step.motion_distance = float(values.get("motion_distance", 0.0))
+    step.arm_side = str(values.get("arm_side", ""))
+    step.imitation_duration_sec = float(values.get("imitation_duration_sec", 0.0))
+    step.timeout_sec = float(values.get("timeout_sec", 0.0))
+    step.direction = str(values.get("direction", ""))
+    step.distance = float(values.get("distance", 0.0))
+    step.degree = float(values.get("degree", 0.0))
+    step.has_x = values.get("x") is not None
+    step.x = float(values.get("x") or 0.0)
+    step.has_y = values.get("y") is not None
+    step.y = float(values.get("y") or 0.0)
+    step.has_yaw = values.get("yaw") is not None
+    step.yaw = float(values.get("yaw") or 0.0)
+    return step
+
+
+def _time_message(value: str):
+    stamp = TimeMsg()
+    try:
+        parsed = datetime.fromisoformat(value)
+        timestamp = parsed.timestamp()
+        stamp.sec = int(timestamp)
+        stamp.nanosec = int((timestamp - stamp.sec) * 1_000_000_000)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return stamp
+
 
 _NAVIGATION_ERROR_CODES = {
     ExecuteNavigation.Result.INVALID_GOAL: "NAVIGATION_INVALID_GOAL",
@@ -164,6 +227,82 @@ class _EePoseSnapshotExpired(Exception):
     pass
 
 
+class _ProgramGoalHandle:
+    """Adapter that gives the existing Skill Gateway a typed Program child."""
+
+    def __init__(self, request, root_handle, execution_store=None, execution_id="") -> None:
+        self.request = request
+        self._root_handle = root_handle
+        self._execution_store = execution_store
+        self._program_execution_id = execution_id
+
+    @property
+    def is_cancel_requested(self):
+        if bool(getattr(self._root_handle, "is_cancel_requested", False)):
+            return True
+        if self._execution_store is None or not self._program_execution_id:
+            return False
+        record = self._execution_store.get(execution_id=self._program_execution_id)
+        return bool(record is not None and record.stop_requested)
+
+    def publish_feedback(self, message) -> None:
+        return None
+
+    def succeed(self) -> None:
+        return None
+
+    def abort(self) -> None:
+        return None
+
+    def canceled(self) -> None:
+        return None
+
+    def _make_dispatch_binding(self):
+        return self.request.dispatch_binding
+
+    @property
+    def late_cleanup_confirmation(self):
+        return None
+
+
+class _ProgramAdmission:
+    def __init__(self, decision, owner) -> None:
+        self.decision = decision
+        self.owner = owner
+
+    @property
+    def admitted(self):
+        return self.decision.admitted
+
+    @property
+    def error_code(self):
+        return self.decision.error_code
+
+    @property
+    def message(self):
+        return getattr(self.decision, "message", self.decision.error_code)
+
+    @property
+    def prepared_request(self):
+        return self.decision.prepared_request
+
+    @property
+    def lease_token(self):
+        return self.decision.lease_token
+
+
+class _ProgramChildAdmission:
+    """Allow the existing primitive path to borrow a Program root lease."""
+
+    def __init__(self, program_admission, owner) -> None:
+        self.program_admission = program_admission
+        self.owner = owner
+
+    @property
+    def lease_token(self):
+        return self.program_admission.lease_token
+
+
 @dataclass
 class _WorkflowExecution:
     root_task_id: str
@@ -182,6 +321,7 @@ class _WorkflowExecution:
     lease_released: bool = False
     runtime_generation_released: bool = False
     child_results: dict[int, object] = field(default_factory=dict)
+    late_cleanup_callback: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -395,6 +535,9 @@ class SkillExecutorNode(Node):
         self.declare_parameter("imitate_human_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("sound_following_service", "/sound_orientation_node/set_following")
         self.declare_parameter("sound_following_enabled", False, descriptor=startup_descriptor)
+        # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
+        self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
+        self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -436,6 +579,24 @@ class SkillExecutorNode(Node):
         self.declare_parameter("model_idle_timeout_sec", 120.0, descriptor=startup_descriptor)
         self.declare_parameter("config_digest", "", descriptor=startup_descriptor)
         self.declare_parameter("ledger_terminal_capacity", 100, descriptor=startup_descriptor)
+        self.declare_parameter("execute_program_action", "/embodied/execute_program")
+        self.declare_parameter("get_execution_service", "/embodied/get_execution")
+        self.declare_parameter("get_execution_events_service", "/embodied/get_execution_events")
+        self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
+        self.declare_parameter("execution_event_topic", "/embodied/execution_events")
+        self.declare_parameter("execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3"))
+        self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
+        self.declare_parameter("execution_caller_tokens_json", "{}")
+        raw_scopes = self.get_parameter("execution_caller_scopes_json").value
+        if isinstance(raw_scopes, str):
+            raw_scopes = json.loads(raw_scopes)
+        self._execution_caller_scopes = tuple(str(scope).strip() for scope in raw_scopes if str(scope).strip())
+        raw_tokens = self.get_parameter("execution_caller_tokens_json").value
+        if isinstance(raw_tokens, str):
+            raw_tokens = json.loads(raw_tokens)
+        self._execution_caller_tokens = {
+            str(scope).strip(): str(token) for scope, token in raw_tokens.items() if str(scope).strip() and str(token)
+        }
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -480,6 +641,15 @@ class SkillExecutorNode(Node):
         self._imitate_human_motion_enabled = self.get_parameter("imitate_human_motion_enabled").value
         self._sound_following_enabled = self.get_parameter("sound_following_enabled").value
         self._sound_following_service = self.get_parameter("sound_following_service").get_parameter_value().string_value
+        self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
+        self._runtime_named_motion_action = (
+            self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
+        )
+        if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
+            raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
+        if self._runtime_named_motion_enabled and not self._runtime_enabled:
+            # Admission (mode, capabilities, stop latch) comes from the runtime status.
+            raise ValueError("runtime_named_motion requires runtime admission (runtime_enabled)")
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
         self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
         self._semantic_map_target_service = self.get_parameter("semantic_map_target_service").value
@@ -677,6 +847,8 @@ class SkillExecutorNode(Node):
         self._skill_parameter_schemas = startup_parameter_schemas
         self._skill_control_modes = startup_control_modes
         self._skill_templates = self._mutable_templates(startup_bundle.snapshot.templates)
+        # Idle reads use coordinator.current. Keeping a startup bundle here
+        # would pin all Program requests to a stale generation after reload.
         self._active_runtime_bundle = None
         self._latest_ee_pose = None
         self._latest_ee_pose_monotonic = None
@@ -745,9 +917,69 @@ class SkillExecutorNode(Node):
         self._sound_following_client = self.create_client(
             SetSoundFollowing, self._sound_following_service, callback_group=callback_group
         )
+        # Only a deployment that enabled the executor gets the client.
+        self._runtime_named_motion_client = (
+            ActionClient(self, ExecuteNamedMotion, self._runtime_named_motion_action, callback_group=callback_group)
+            if self._runtime_named_motion_enabled
+            else None
+        )
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
+            callback_group=callback_group,
+        )
+        self._execution_store = SQLiteExecutionStore(
+            str(self.get_parameter("execution_store_path").value)
+            if self.has_parameter("execution_store_path")
+            else str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
+        )
+        self._execution_event_publisher = self.create_publisher(
+            ExecutionEvent,
+            str(self.get_parameter("execution_event_topic").value)
+            if self.has_parameter("execution_event_topic")
+            else "/embodied/execution_events",
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=100,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            ),
+        )
+        self._event_publish_lock = threading.Lock()
+        self._published_event_sequence: dict[str, int] = {}
+        self._execution_store.set_event_listener(self._publish_execution_events)
+        self._program_server = ActionServer(
+            self,
+            ExecuteProgram,
+            str(self.get_parameter("execute_program_action").value)
+            if self.has_parameter("execute_program_action")
+            else "/embodied/execute_program",
+            execute_callback=self._execute_program,
+            cancel_callback=self._handle_cancel,
+            callback_group=callback_group,
+        )
+        self._get_execution_server = self.create_service(
+            GetExecution,
+            str(self.get_parameter("get_execution_service").value)
+            if self.has_parameter("get_execution_service")
+            else "/embodied/get_execution",
+            self._get_execution,
+            callback_group=callback_group,
+        )
+        self._get_execution_events_server = self.create_service(
+            GetExecutionEvents,
+            str(self.get_parameter("get_execution_events_service").value)
+            if self.has_parameter("get_execution_events_service")
+            else "/embodied/get_execution_events",
+            self._get_execution_events,
+            callback_group=callback_group,
+        )
+        self._cancel_execution_server = self.create_service(
+            CancelExecution,
+            str(self.get_parameter("cancel_execution_service").value)
+            if self.has_parameter("cancel_execution_service")
+            else "/embodied/cancel_execution",
+            self._cancel_execution,
             callback_group=callback_group,
         )
         self._gateway_status_server = self.create_service(
@@ -818,6 +1050,549 @@ class SkillExecutorNode(Node):
             f"direction_mapping={self._relative_motion_direction_mapping or 'default'}, "
             f"ee_pose_topic={self._ee_pose_topic}, joint_state_topic={self._joint_state_topic}"
         )
+
+    def destroy_node(self):
+        store = getattr(self, "_execution_store", None)
+        if store is not None:
+            store.close()
+            self._execution_store = None
+        return super().destroy_node()
+
+    def _program_identity_matches(self, program) -> bool:
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is None:
+            coordinator = getattr(self, "_runtime_coordinator", None)
+            bundle = coordinator.current if coordinator is not None else None
+        if bundle is None:
+            return False
+        return (
+            program.identity.registry_epoch == bundle.registry_epoch
+            and program.identity.registry_generation == bundle.generation
+            and program.identity.registry_digest == bundle.snapshot.registry_digest
+        )
+
+    def _program_admission_snapshot(self, program):
+        """Reuse the already active registry snapshot for one Program request."""
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is None:
+            coordinator = getattr(self, "_runtime_coordinator", None)
+            bundle = coordinator.current if coordinator is not None else None
+        if bundle is None:
+            return None, "skill registry is not ready"
+        if not self._program_identity_matches(program):
+            return None, "program registry identity does not match the active Gateway registry"
+        snapshot = self._runtime_snapshot()
+        if not snapshot.motion_authorized:
+            return None, "operator authorization is disabled"
+        return bundle, ""
+
+    def _finish_program(self, record, result, *, state, error_code="", message="", completed=0, bundle=None):
+        actual = {}
+        if bundle is not None:
+            actual = {
+                "actual_registry_epoch": bundle.registry_epoch,
+                "actual_registry_generation": bundle.generation,
+                "actual_registry_digest": bundle.snapshot.registry_digest,
+            }
+        self._execution_store.finish(
+            record.execution_id,
+            state=state,
+            completed_step_count=completed,
+            error_code=error_code,
+            message=message,
+            **actual,
+        )
+        result.state = state
+        result.error_code = error_code
+        result.message = message
+        result.completed_step_count = completed
+
+    def _execute_program(self, goal_handle):
+        goal = goal_handle.request
+        result = ExecuteProgram.Result()
+        record = None
+        program_admission = None
+        program_owner = None
+        program_child_admission = None
+        try:
+            if not self._execution_auth_ok(goal):
+                result.state = "FAILED"
+                result.error_code = "EXECUTION_SCOPE_DENIED"
+                result.message = "caller scope or token is not authorized"
+                goal_handle.abort()
+                return result
+            program = canonicalize_program(
+                schema_version=goal.schema_version,
+                request_id=goal.request_id,
+                caller_scope=goal.caller_scope,
+                robot_id=goal.robot_id,
+                expected_registry_epoch=goal.expected_registry_epoch,
+                expected_registry_generation=goal.expected_registry_generation,
+                expected_registry_digest=goal.expected_registry_digest,
+                workflow_steps=goal.workflow_steps,
+                task_budget_sec=goal.task_budget_sec,
+            )
+            record, created = self._execution_store.begin(program)
+            result.execution_id = record.execution_id
+            result.request_id = record.request_id
+            result.program_digest = record.program_digest
+            result.workflow_digest = record.workflow_digest
+            result.actual_registry_epoch = record.actual_registry_epoch
+            result.actual_registry_generation = record.actual_registry_generation
+            result.actual_registry_digest = record.actual_registry_digest
+            result.state = record.state
+            result.completed_step_count = record.completed_step_count
+            if record.terminal:
+                result.success = record.state == "SUCCEEDED"
+                result.error_code = record.error_code
+                result.message = record.message
+                goal_handle.succeed() if result.success else goal_handle.abort()
+                return result
+            if not created:
+                result.success = False
+                result.state = record.state
+                result.error_code = "EXECUTION_IN_PROGRESS"
+                result.message = "execution is already in progress"
+                goal_handle.abort()
+                return result
+            record = self._execution_store.bind_workflow_digest(record.execution_id, program.program_digest)
+            result.workflow_digest = record.workflow_digest
+            if not self._program_identity_matches(program):
+                self._finish_program(
+                    record,
+                    result,
+                    state="FAILED",
+                    error_code="SKILL_REGISTRY_VERSION_MISMATCH",
+                    message="program registry identity does not match the active Gateway registry",
+                )
+                goal_handle.abort()
+                return result
+            bundle, admission_error = self._program_admission_snapshot(program)
+            if bundle is None:
+                self._finish_program(
+                    record,
+                    result,
+                    state="FAILED",
+                    error_code=(
+                        "MOTION_NOT_AUTHORIZED"
+                        if "authorization" in admission_error
+                        else (
+                            "SKILL_REGISTRY_VERSION_MISMATCH"
+                            if "registry" in admission_error
+                            else "CAPABILITY_NOT_READY"
+                        )
+                    ),
+                    message=admission_error,
+                )
+                goal_handle.abort()
+                return result
+            self._execution_store.mark_committing(record.execution_id)
+            program_owner = ExecutionOwner.workflow(program.root_task_id)
+            workflow_error, lease_token = self._gateway_policy.admit_workflow(
+                program_owner, self._runtime_snapshot(), timeout_sec=program.task_budget_sec
+            )
+            program_admission = _ProgramAdmission(
+                SimpleNamespace(
+                    admitted=not workflow_error and lease_token is not None,
+                    error_code=workflow_error or "",
+                    message=workflow_error or "",
+                    prepared_request=None,
+                    lease_token=lease_token,
+                ),
+                program_owner,
+            )
+            if not program_admission.admitted:
+                self._execution_store.finish(
+                    record.execution_id,
+                    state="FAILED",
+                    completed_step_count=0,
+                    error_code=program_admission.error_code,
+                    message=program_admission.message,
+                )
+                result.error_code = program_admission.error_code
+                result.message = program_admission.message
+                result.state = "FAILED"
+                goal_handle.abort()
+                return result
+            program_child_admission = _ProgramChildAdmission(program_admission, program_owner)
+            retained_bundle = self._runtime_coordinator.retain(bundle.generation)
+            budget_binding = SkillCommand.Goal().dispatch_binding
+            self._set_task_budget(budget_binding, program.task_budget_sec)
+            program_workflow = _WorkflowExecution(
+                root_task_id=program.root_task_id,
+                workflow_digest=program.program_digest,
+                root_lease_nonce=uuid.uuid4().hex,
+                lease_token=program_admission.lease_token,
+                owner=program_owner,
+                policy=self._gateway_policy,
+                bundle=retained_bundle,
+                workflow_steps=program.steps,
+                task_budget_key=self._task_budget_key(budget_binding),
+                deadline_unix_sec=budget_binding.task_budget.deadline.sec
+                + budget_binding.task_budget.deadline.nanosec / 1_000_000_000,
+                step_terminal_states=[WORKFLOW_STEP_PENDING] * len(program.steps),
+            )
+            program_workflow.late_cleanup_callback = lambda: self._finalize_program_admission(
+                program_child_admission, program_owner
+            )
+            self._active_workflow = program_workflow
+            self._active_skill_admission = program_child_admission
+            self._active_skill_owner = program_owner
+            self._active_audit_context = {
+                "task_id": program.root_task_id,
+                "payload_hash": program.program_digest,
+                "skill": program.steps[0].skill_name,
+            }
+            self._active_runtime_bundle = retained_bundle
+            self._active_runtime_generation_retained = False
+            self._execution_store.mark_active(record.execution_id)
+            goal_handle._execution_store = self._execution_store
+            goal_handle._program_execution_id = record.execution_id
+            completed = 0
+            for index, step in enumerate(program.steps):
+                # A cancel arriving between children must not start the next
+                # child: converge immediately with the completed-step bound.
+                if self._program_cancel_requested(goal_handle, record.execution_id):
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="CANCELED",
+                        completed_step_count=completed,
+                        error_code="SKILL_CANCELLED",
+                        message="program canceled between steps",
+                        actual_registry_epoch=bundle.registry_epoch,
+                        actual_registry_generation=bundle.generation,
+                        actual_registry_digest=bundle.snapshot.registry_digest,
+                    )
+                    result.state = "CANCELED"
+                    result.error_code = "SKILL_CANCELLED"
+                    result.message = "program canceled between steps"
+                    result.completed_step_count = completed
+                    if bool(getattr(goal_handle, "is_cancel_requested", False)):
+                        goal_handle.canceled()
+                    else:
+                        goal_handle.abort()
+                    self._finalize_program_admission(program_child_admission, program_owner)
+                    return result
+                if self._remaining_task_budget_sec(budget_binding) <= 0.0:
+                    self._finish_program(
+                        record,
+                        result,
+                        state="FAILED",
+                        error_code="TASK_TIMEOUT",
+                        message="program task budget expired",
+                        completed=completed,
+                        bundle=bundle,
+                    )
+                    goal_handle.abort()
+                    self._finalize_program_admission(program_child_admission, program_owner)
+                    return result
+                skill_goal = SkillCommand.Goal()
+                skill_goal.schema_version = step.schema_version
+                skill_goal.dispatch_binding.schema_version = 1
+                skill_goal.dispatch_binding.task_id = derive_skill_task_id(program.root_task_id, index)
+                skill_goal.dispatch_binding.root_task_id = program.root_task_id
+                skill_goal.dispatch_binding.expected_registry_epoch = program.identity.registry_epoch
+                skill_goal.dispatch_binding.expected_registry_generation = program.identity.registry_generation
+                skill_goal.dispatch_binding.expected_registry_digest = program.identity.registry_digest
+                skill_goal.dispatch_binding.trace_id = goal.trace_id or program.request_id
+                skill_goal.dispatch_binding.task_budget.schema_version = budget_binding.task_budget.schema_version
+                skill_goal.dispatch_binding.task_budget.started_at.sec = budget_binding.task_budget.started_at.sec
+                skill_goal.dispatch_binding.task_budget.started_at.nanosec = (
+                    budget_binding.task_budget.started_at.nanosec
+                )
+                skill_goal.dispatch_binding.task_budget.deadline.sec = budget_binding.task_budget.deadline.sec
+                skill_goal.dispatch_binding.task_budget.deadline.nanosec = budget_binding.task_budget.deadline.nanosec
+                skill_goal.dispatch_binding.workflow_digest = program_workflow.workflow_digest
+                skill_goal.dispatch_binding.root_lease_nonce = program_workflow.root_lease_nonce
+                skill_goal.dispatch_binding.dispatch_nonce = ""
+                # The existing Skill Gateway treats a program's child skills as
+                # internal work under the root lease.  Keep the root identity on
+                # the binding for lease ownership, while retaining the derived
+                # child identity and actual step index for audit/replay and
+                # per-step dispatch bookkeeping.
+                skill_goal.dispatch_binding.workflow_step_index = index
+                skill_goal.skill_name = step.skill_name
+                skill_goal.target_name = step.target_name
+                skill_goal.container_name = step.container_name
+                skill_goal.place_name = step.place_name
+                skill_goal.motion_direction = step.motion_direction
+                skill_goal.motion_distance = step.motion_distance
+                skill_goal.arm_side = step.arm_side
+                skill_goal.imitation_duration_sec = step.imitation_duration_sec
+                # Preserve the canonical request timeout for workflow identity;
+                # GatewayPolicy applies the catalog cap and the child executor
+                # clamps the accepted timeout to the shared root deadline.
+                skill_goal.timeout_sec = step.timeout_sec
+                skill_goal.direction = step.direction
+                skill_goal.distance = step.distance
+                skill_goal.degree = step.degree
+                skill_goal.has_x = step.x is not None
+                skill_goal.x = step.x or 0.0
+                skill_goal.has_y = step.y is not None
+                skill_goal.y = step.y or 0.0
+                skill_goal.has_yaw = step.yaw is not None
+                skill_goal.yaw = step.yaw or 0.0
+                feedback = ExecuteProgram.Feedback()
+                feedback.execution_id = record.execution_id
+                feedback.sequence = record.last_event_sequence
+                feedback.state = "ACTIVE"
+                feedback.workflow_step_index = index
+                feedback.current_skill = step.skill_name
+                feedback.detail = f"executing step {index + 1} of {len(program.steps)}"
+                feedback.program_digest = program.program_digest
+                goal_handle.publish_feedback(feedback)
+                child_result = self._execute_program_child(skill_goal, goal_handle, record.execution_id)
+                if not child_result.success:
+                    cleanup_pending = child_result.error_code in {
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        SKILL_CANCEL_TIMEOUT,
+                    }
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="UNKNOWN"
+                        if cleanup_pending
+                        else ("CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED"),
+                        completed_step_count=completed,
+                        error_code=child_result.error_code,
+                        message=child_result.message,
+                        actual_registry_epoch=bundle.registry_epoch,
+                        actual_registry_generation=bundle.generation,
+                        actual_registry_digest=bundle.snapshot.registry_digest,
+                    )
+                    result.error_code = child_result.error_code
+                    result.message = child_result.message
+                    result.state = (
+                        "UNKNOWN"
+                        if cleanup_pending
+                        else ("CANCELED" if child_result.error_code == "SKILL_CANCELLED" else "FAILED")
+                    )
+                    result.completed_step_count = completed
+                    result.actual_registry_epoch = bundle.registry_epoch
+                    result.actual_registry_generation = bundle.generation
+                    result.actual_registry_digest = bundle.snapshot.registry_digest
+                    result.workflow_digest = record.workflow_digest or program.program_digest
+                    goal_handle.abort()
+                    if not cleanup_pending:
+                        self._finalize_program_admission(program_child_admission, program_owner)
+                    return result
+                completed += 1
+            self._execution_store.finish(
+                record.execution_id,
+                state="SUCCEEDED",
+                completed_step_count=completed,
+                actual_registry_epoch=bundle.registry_epoch,
+                actual_registry_generation=bundle.generation,
+                actual_registry_digest=bundle.snapshot.registry_digest,
+            )
+            result.success = True
+            result.state = "SUCCEEDED"
+            result.completed_step_count = completed
+            result.actual_registry_epoch = bundle.registry_epoch
+            result.actual_registry_generation = bundle.generation
+            result.actual_registry_digest = bundle.snapshot.registry_digest
+            result.workflow_digest = record.workflow_digest or program.program_digest
+            goal_handle.succeed()
+            self._finalize_program_admission(program_child_admission, program_owner)
+        except Exception as exc:
+            result.success = False
+            result.state = "FAILED"
+            if isinstance(exc, ExecutionConflictError):
+                result.error_code = "SKILL_REQUEST_ID_CONFLICT"
+            elif isinstance(exc, ExecutionBusyError):
+                result.error_code = SKILL_BUSY
+            elif isinstance(exc, ExecutionQuarantinedError):
+                result.error_code = EXECUTION_QUARANTINED
+            elif isinstance(exc, ValueError):
+                result.error_code = "SKILL_SCHEMA_INVALID"
+            else:
+                result.error_code = "EXECUTION_INTERNAL_ERROR"
+            result.message = str(exc)
+            if record is not None and not record.terminal:
+                with suppress(Exception):
+                    self._execution_store.finish(
+                        record.execution_id,
+                        state="FAILED",
+                        completed_step_count=record.completed_step_count,
+                        error_code=result.error_code,
+                        message=result.message,
+                    )
+            if program_child_admission is not None and program_owner is not None:
+                self._finalize_program_admission(program_child_admission, program_owner)
+            goal_handle.abort()
+        return result
+
+    def _execute_program_child(self, goal, root_goal_handle, execution_id):
+        """Execute one canonical child through the existing workflow lifecycle."""
+        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id)
+        return self._execute_workflow_skill_gateway(child_handle)
+
+    def _program_cancel_requested(self, root_goal_handle, execution_id: str) -> bool:
+        if bool(getattr(root_goal_handle, "is_cancel_requested", False)):
+            return True
+        record = self._execution_store.get(execution_id=execution_id)
+        return bool(record is not None and record.stop_requested)
+
+    def _finalize_program_admission(self, admission, owner) -> None:
+        workflow = None
+        with self._state_guard():
+            if self._active_skill_admission is not None:
+                self._active_skill_admission = None
+            self._active_skill_owner = None
+            self._active_audit_context = None
+            self._active_runtime_bundle = None
+            workflow = self._active_workflow
+            self._active_workflow = None
+        if workflow is not None and not workflow.runtime_generation_released:
+            with suppress(Exception):
+                self._runtime_coordinator.release(workflow.bundle.generation)
+            workflow.runtime_generation_released = True
+        with suppress(Exception):
+            self._gateway_policy.release_workflow(owner, admission.lease_token)
+
+    def _execution_auth_ok(self, request) -> bool:
+        return is_caller_authorized(
+            request.caller_scope,
+            getattr(request, "caller_token", ""),
+            tuple(getattr(self, "_execution_caller_scopes", ())),
+            dict(getattr(self, "_execution_caller_tokens", {})),
+        )
+
+    def _get_execution(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        response.found = record is not None
+        if record is None:
+            response.error_code = "EXECUTION_NOT_FOUND"
+            response.message = "execution not found"
+            return response
+        response.execution_id = record.execution_id
+        response.request_id = record.request_id
+        response.caller_scope = record.caller_scope
+        response.robot_id = record.robot_id
+        response.state = record.state
+        response.program_digest = record.program_digest
+        response.canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
+        response.completed_step_count = record.completed_step_count
+        response.stop_requested = record.stop_requested
+        response.last_event_sequence = record.last_event_sequence
+        response.error_code = record.error_code
+        response.message = record.message
+        response.actual_registry_epoch = record.actual_registry_epoch
+        response.actual_registry_generation = record.actual_registry_generation
+        response.actual_registry_digest = record.actual_registry_digest
+        reconciliation = self._execution_store.reconciliation(record.execution_id)
+        response.reconciled = reconciliation is not None
+        response.reconciliation_evidence = reconciliation["evidence"] if reconciliation else ""
+        return response
+
+    def _get_execution_events(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        if record is None:
+            response.error_code = "EXECUTION_NOT_FOUND"
+            response.message = "execution not found"
+            return response
+        response.found = True
+        response.execution_id = record.execution_id
+        events = self._execution_store.events_after(
+            record.execution_id, sequence=int(request.after_sequence), limit=max(1, min(int(request.limit or 100), 100))
+        )
+        canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
+        response.events = [self._execution_event_message(record, event, canonical_steps) for event in events]
+        response.last_event_sequence = record.last_event_sequence
+        response.has_more = len(events) >= max(1, min(int(request.limit or 100), 100))
+        return response
+
+    @staticmethod
+    def _execution_event_message(record, event, canonical_steps):
+        return ExecutionEvent(
+            schema_version=1,
+            execution_id=record.execution_id,
+            request_id=record.request_id,
+            caller_scope=record.caller_scope,
+            robot_id=record.robot_id,
+            sequence=event.sequence,
+            state=event.state,
+            program_digest=record.program_digest,
+            canonical_steps=canonical_steps,
+            completed_step_count=event.completed_step_count,
+            error_code=event.error_code,
+            message=event.message,
+            created_at=_time_message(event.created_at),
+        )
+
+    def _publish_execution_events(self, execution_ids) -> None:
+        """Publish committed ledger events in sequence order, exactly once per process."""
+        publisher = getattr(self, "_execution_event_publisher", None)
+        store = getattr(self, "_execution_store", None)
+        if publisher is None or store is None:
+            return
+        with self._event_publish_lock:
+            for execution_id in execution_ids:
+                record = store.get(execution_id=execution_id)
+                if record is None:
+                    continue
+                canonical_steps = [_workflow_step_message(step) for step in record.program["workflow_steps"]]
+                published = self._published_event_sequence.get(execution_id, 0)
+                while True:
+                    events = store.events_after(execution_id, sequence=published, limit=100)
+                    for event in events:
+                        publisher.publish(self._execution_event_message(record, event, canonical_steps))
+                        published = event.sequence
+                    if len(events) < 100:
+                        break
+                self._published_event_sequence.pop(execution_id, None)
+                self._published_event_sequence[execution_id] = published
+                while len(self._published_event_sequence) > 1024:
+                    self._published_event_sequence.pop(next(iter(self._published_event_sequence)))
+
+    def _cancel_execution(self, request, response):
+        if not self._execution_auth_ok(request):
+            response.error_code = "EXECUTION_SCOPE_DENIED"
+            response.message = "caller scope is not configured"
+            return response
+        record = self._execution_store.get(
+            execution_id=request.execution_id,
+            caller_scope=request.caller_scope,
+            robot_id=request.robot_id,
+            request_id=request.request_id,
+        )
+        if record is None:
+            if request.execution_id or not request.request_id:
+                response.error_code = "EXECUTION_NOT_FOUND"
+                response.message = "execution not found"
+                return response
+            self._execution_store.request_stop_by_key(
+                request.caller_scope,
+                request.robot_id,
+                request.request_id,
+            )
+            response.accepted = True
+            response.state = "STOPPING"
+            response.message = "stop intent recorded before execution admission"
+            return response
+        record = self._execution_store.request_stop(record.execution_id)
+        response.accepted = True
+        response.execution_id = record.execution_id
+        response.state = record.state
+        response.stop_generation = record.stop_generation
+        return response
 
     def _compile_runtime_snapshot(self):
         from skill_catalog.models import SkillRobotContext
@@ -891,6 +1666,17 @@ class SkillExecutorNode(Node):
                 "imitate_human_motion configuration mismatch: "
                 f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
             )
+        named_runtime_enabled = bool(getattr(self, "_runtime_named_motion_enabled", False))
+        named_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if named_runtime_enabled != named_catalog_enabled:
+            raise ValueError(
+                "runtime_named_motion configuration mismatch: "
+                f"runtime enabled={named_runtime_enabled}, catalog enabled={named_catalog_enabled}"
+            )
         sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
         sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
         if sound_runtime_enabled != sound_catalog_enabled:
@@ -922,11 +1708,28 @@ class SkillExecutorNode(Node):
             configured_executors.add("imitate_human_motion")
         if getattr(self, "_sound_following_enabled", False):
             configured_executors.add("sound_following")
+        if getattr(self, "_runtime_named_motion_enabled", False):
+            configured_executors.add(named_motion.EXECUTOR_NAME)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
             configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == named_motion.EXECUTOR_NAME:
+                endpoint_name = getattr(self, "_runtime_named_motion_action", "")
+                if not getattr(self, "_runtime_named_motion_enabled", False) or not endpoint_name:
+                    continue
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_action",
+                        # The serving runtime is part of the identity the catalog binds.
+                        configuration={"runtime_name": getattr(self, "_runtime_name", "")},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             if name == "sound_following":
                 endpoint_name = self._sound_following_service
                 descriptor = DelegatedExecutorDescriptor(
@@ -974,6 +1777,185 @@ class SkillExecutorNode(Node):
             )
             descriptors[descriptor.name] = descriptor
         return descriptors
+
+    def _execute_runtime_named_motion_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+    ) -> SkillCommand.Result:
+        """Run the named motion the catalog binds through the runtime's neutral action.
+
+        The runtime refuses cancellation of named motions, so a cancel request is
+        recorded but never forwarded and the motion is reported as it ends. If
+        the skill deadline passes first, the admission is retained until the
+        runtime reports a terminal state; the runtime bounds every motion itself.
+        """
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        client = getattr(self, "_runtime_named_motion_client", None)
+        if client is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.RUNTIME_UNAVAILABLE,
+                "runtime named motion executor is not enabled for this deployment",
+            )
+        motion = named_motion.bound_motion_name(template)
+        if not motion:
+            return self._abort_skill(
+                result, goal_handle, [], named_motion.INVALID_BINDING, "skill template binds no motion"
+            )
+        status, reason = self._runtime_status_for_admission()
+        if status is None:
+            return self._abort_skill(result, goal_handle, [], named_motion.PLATFORM_NOT_READY, reason)
+        names, error_code, reason = named_motion.advertised_motion_names(
+            status.capabilities_json, self._required_capabilities_for_skill(goal.skill_name)
+        )
+        if names is None:
+            return self._abort_skill(result, goal_handle, [], error_code, reason)
+        if motion not in names:
+            # Checked here because the runtime rejects an unknown name at goal
+            # acceptance, which carries no reason.
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.UNKNOWN,
+                f"runtime does not advertise named motion {motion!r}",
+            )
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+        if not client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.RUNTIME_UNAVAILABLE,
+                f"named motion action unavailable: {self._runtime_named_motion_action}",
+            )
+
+        executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
+        motion_goal = ExecuteNamedMotion.Goal()
+        motion_goal.name = motion
+        # The runtime applies the side its profile declares for this name.
+        motion_goal.target = ""
+        # Never pre-empt a motion that is already playing.
+        motion_goal.interrupt = False
+
+        def feedback_cb(feedback_msg) -> None:
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = f"{named_motion.EXECUTOR_NAME}:{motion}:{feedback_msg.feedback.state}"
+            goal_handle.publish_feedback(feedback)
+
+        def keep_running(_motion_handle) -> None:
+            """A late-accepted motion is not cancelled; only its terminal state is awaited."""
+
+        admission = self._active_skill_admission
+        nonce = uuid.uuid4().hex
+        cleanup_key = self._register_delegated_dispatch(nonce, admission, goal.dispatch_binding)
+        terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
+        send_future = None
+        result_future = None
+        try:
+            send_future = client.send_goal_async(motion_goal, feedback_callback=feedback_cb)
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, keep_running)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"named motion {motion} goal response timed out: runtime motion state is unknown",
+                )
+            motion_handle = send_future.result()
+            if motion_handle is None or not motion_handle.accepted:
+                terminal = True
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    named_motion.REJECTED,
+                    f"runtime refused named motion {motion} (another motion is playing or the name is unknown)",
+                )
+            result_future = motion_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            cancel_recorded = False
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested and not cancel_recorded:
+                    cancel_recorded = True
+                    self._audit("cancel_not_supported", **self._public_audit_context_copy())
+                    self.get_logger().warning(
+                        f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
+                    )
+                if time.monotonic() >= deadline:
+                    late_cleanup.watch_result_future(result_future)
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        f"named motion {motion} still running at the skill deadline; admission held until it ends",
+                    )
+                time.sleep(0.05)
+            if not result_future.done():
+                late_cleanup.watch_result_future(result_future)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"named motion {motion} execution state is unknown",
+                )
+            terminal = True
+            wrapped = result_future.result()
+        except Exception:
+            self.get_logger().error(f"runtime named motion execution failed:\n{traceback.format_exc()}")
+            if result_future is not None:
+                late_cleanup.watch_result_future(result_future)
+            elif send_future is not None:
+                late_cleanup.watch_goal_future(send_future, keep_running)
+            else:
+                terminal = True
+            return self._abort_skill(
+                result,
+                goal_handle,
+                executed if send_future is not None else [],
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT if send_future is not None else named_motion.FAILED,
+                f"runtime named motion {motion} execution state is unknown",
+            )
+        finally:
+            if terminal:
+                late_cleanup.confirm()
+
+        motion_result = getattr(wrapped, "result", None) if wrapped is not None else None
+        if motion_result is None:
+            return self._abort_skill(
+                result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} returned no result"
+            )
+        message = str(motion_result.message).strip()
+        if not motion_result.success:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                executed,
+                named_motion.public_error_code(motion_result.error_code),
+                message or f"named motion {motion} failed",
+            )
+        if goal_handle.is_cancel_requested:
+            message = f"cancel not supported; {message or f'named motion {motion} completed'}"
+        result.success = True
+        result.error_code = ""
+        result.message = message or f"named motion {motion} completed"
+        result.executed_primitives = executed
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
 
     def _execute_sound_following_skill(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()
@@ -1366,6 +2348,9 @@ class SkillExecutorNode(Node):
                     and bool(getattr(self, "_supported_control_modes", ()))
                     and bool(getattr(self, "_motion_mode_service", ""))
                 )
+            ),
+            unresolved_unknown=bool(
+                getattr(getattr(self, "_execution_store", None), "has_unresolved_unknown", lambda: False)()
             ),
         )
 
@@ -2784,6 +3769,7 @@ class SkillExecutorNode(Node):
         self._converge_retained_admission(admission)
 
     def _converge_retained_admission(self, admission) -> None:
+        late_cleanup_callback = None
         with self._state_guard():
             cleanup = self._retained_admission_cleanup.get(id(admission))
             if (
@@ -2798,32 +3784,35 @@ class SkillExecutorNode(Node):
             ):
                 return
             if isinstance(admission, _WorkflowChildAdmission):
+                late_cleanup_callback = getattr(admission.workflow, "late_cleanup_callback", None)
                 self._active_skill_admission = None
                 self._active_skill_owner = None
                 self._active_audit_context = None
                 self._active_runtime_bundle = None
                 del self._retained_admission_cleanup[id(admission)]
-                return
-            cleanup.finalizing = True
-            try:
-                self._gateway_policy.finalize(
-                    admission,
-                    error_code=SKILL_CANCEL_TIMEOUT,
-                    terminal_metadata={"duration_sec": cleanup.duration_sec, "step_count": cleanup.step_count},
-                )
-            except Exception:
-                cleanup.finalizing = False
-                return
-            self._active_skill_admission = None
-            self._active_skill_owner = None
-            self._active_audit_context = None
-            active_bundle = getattr(self, "_active_runtime_bundle", None)
-            if getattr(self, "_active_runtime_generation_retained", False) and active_bundle is not None:
-                with suppress(Exception):
-                    self._runtime_coordinator.release(active_bundle.generation)
-            self._active_runtime_generation_retained = False
-            self._active_runtime_bundle = None
-            del self._retained_admission_cleanup[id(admission)]
+            else:
+                cleanup.finalizing = True
+                try:
+                    self._gateway_policy.finalize(
+                        admission,
+                        error_code=SKILL_CANCEL_TIMEOUT,
+                        terminal_metadata={"duration_sec": cleanup.duration_sec, "step_count": cleanup.step_count},
+                    )
+                except Exception:
+                    cleanup.finalizing = False
+                    return
+                self._active_skill_admission = None
+                self._active_skill_owner = None
+                self._active_audit_context = None
+                active_bundle = getattr(self, "_active_runtime_bundle", None)
+                if getattr(self, "_active_runtime_generation_retained", False) and active_bundle is not None:
+                    with suppress(Exception):
+                        self._runtime_coordinator.release(active_bundle.generation)
+                self._active_runtime_generation_retained = False
+                self._active_runtime_bundle = None
+                del self._retained_admission_cleanup[id(admission)]
+        if late_cleanup_callback is not None:
+            late_cleanup_callback()
 
     def _release_late_external_primitive(self, token) -> None:
         """Converge terminal ledger and retained generation before reopening the root lease."""
@@ -2881,12 +3870,32 @@ class SkillExecutorNode(Node):
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
             if goal.timeout_sec > remaining_budget:
-                return TIMEOUT_EXCEEDS_POLICY, None, None, False
+                goal.timeout_sec = remaining_budget
             if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
             borrow = workflow.policy.borrow_workflow_internal(
                 workflow.owner,
                 workflow.lease_token,
+                _binding_task_id(goal),
+                str(goal.primitive_name),
+            )
+            return (
+                ("", None, internal_admission, delegated_primitive)
+                if borrow is not None
+                else (SKILL_BUSY, None, None, False)
+            )
+        if isinstance(internal_admission, _ProgramChildAdmission):
+            try:
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return "SKILL_SCHEMA_INVALID", None, None, False
+            if goal.timeout_sec > remaining_budget:
+                goal.timeout_sec = remaining_budget
+            if goal.timeout_sec <= 0.0:
+                goal.timeout_sec = remaining_budget
+            borrow = self._gateway_policy.borrow_workflow_internal(
+                internal_admission.owner,
+                internal_admission.lease_token,
                 _binding_task_id(goal),
                 str(goal.primitive_name),
             )
@@ -2979,7 +3988,13 @@ class SkillExecutorNode(Node):
             result = PrimitiveCommand.Result()
             result.success = False
             result.error_code = schema_error
-            result.message = "primitive schema_version does not match its selected descriptor"
+            descriptor = self._primitive_descriptor(goal_handle.request.primitive_name)
+            result.message = (
+                "primitive schema_version does not match its selected descriptor: "
+                f"name={goal_handle.request.primitive_name!r}, "
+                f"submitted={getattr(goal_handle.request, 'schema_version', None)!r}, "
+                f"expected={getattr(descriptor, 'schema_version', None)!r}"
+            )
             result.pose_name = goal_handle.request.pose_name
             self._set_primitive_replay_identity(result, _binding_task_id(goal_handle.request))
             goal_handle.abort()
@@ -4628,30 +5643,6 @@ class SkillExecutorNode(Node):
             except ValueError:
                 result = SkillCommand.Result()
                 return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", "task budget is invalid")
-            total_budget = (
-                self._task_budget_duration_sec(goal.dispatch_binding)
-                if coordinator is not None
-                else getattr(self._gateway_policy, "_task_budget_sec", 1.0)
-            )
-            if goal.timeout_sec > 0.0 and goal.timeout_sec > total_budget:
-                result = SkillCommand.Result()
-                return self._abort_skill(
-                    result,
-                    goal_handle,
-                    [],
-                    "TIMEOUT_EXCEEDS_POLICY",
-                    "skill timeout exceeds root task budget",
-                )
-            effective_timeout = goal.timeout_sec if goal.timeout_sec > 0.0 else self._default_skill_timeout_sec
-            if effective_timeout > total_budget:
-                result = SkillCommand.Result()
-                return self._abort_skill(
-                    result,
-                    goal_handle,
-                    [],
-                    "TIMEOUT_EXCEEDS_POLICY",
-                    "default skill timeout exceeds root task budget",
-                )
             admission = self._gateway_policy.admit(request, self._runtime_snapshot(), owner)
             prepared = admission.prepared_request
             audit_context = {
@@ -4996,14 +5987,6 @@ class SkillExecutorNode(Node):
                         "SKILL_TASK_DEADLINE_EXPIRED",
                         "workflow task budget expired",
                     )
-                elif goal_handle.request.timeout_sec > 0.0 and goal_handle.request.timeout_sec > remaining_budget:
-                    result = self._abort_skill(
-                        result,
-                        deferred_goal_handle,
-                        [],
-                        "SKILL_TASK_BUDGET_MISMATCH",
-                        "workflow step timeout exceeds remaining task budget",
-                    )
                 else:
                     result = self._execute_skill_child(
                         deferred_goal_handle,
@@ -5124,6 +6107,12 @@ class SkillExecutorNode(Node):
             )
         if str(template.get("executor", "")).strip() == "imitate_human_motion":
             return self._execute_imitate_human_motion_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME:
+            return self._execute_runtime_named_motion_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,

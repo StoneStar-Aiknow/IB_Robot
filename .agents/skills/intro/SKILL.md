@@ -152,10 +152,13 @@ source .shrc_local && python3 .agents/skills/intro/scripts/intro.py
 | :--- | :--- |
 | 有未提交的代码改动 (`git status`) | `ibrobot-git-flow` 或 `atomgit-pr` |
 | 编译产物缺失（`install/` 目录为空或不存在） | `ibrobot-build` |
-| 存在 open 状态的 PR 且有未回复评论 | `atomgit-review-resolution` |
 | 无特殊状态 | 展示「今日推荐」skill |
 
 Agent 应将脚本输出的推荐内容展示给用户，帮助用户快速进入正确的工作流。
+
+intro 为**纯本地检查**（git 状态、编译产物、分支与未推送 commit），不访问平台、
+不再主动抽查远端 PR 评论，也不会提示「PR #N 有待处理评论」。需要平台状态时，
+Agent 直接调用官方 CLI（`atomgit-pr-review`、`atomgit-review-resolution` 工作流已覆盖）。
 
 ## 🌐 AtomGit 路由优先级
 
@@ -170,5 +173,5 @@ Agent 应将脚本输出的推荐内容展示给用户，帮助用户快速进�
 ## 🔧 技术细节
 
 - **环境依赖**: 执行推荐检测脚本前需先 `source .shrc_local` 加载环境
-- **配置文件**: AtomGit 相关功能依赖 `config.json` 中的 Token 配置
+- **纯本地检测**: 脚本只读本地 git 状态与编译产物，不访问平台；仓库级 `config.json` 已删除，远端状态由 Agent 按需直接调用官方 CLI 获取。
 - **脚本位置**: `.agents/skills/intro/scripts/intro.py`

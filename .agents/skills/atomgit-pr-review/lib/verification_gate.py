@@ -1,1 +1,0 @@
-../../atomgit-pr/scripts/verification_gate.py

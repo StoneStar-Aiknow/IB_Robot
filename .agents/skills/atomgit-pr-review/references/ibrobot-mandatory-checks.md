@@ -3,11 +3,11 @@
 ## When to Read
 
 - 在 IB_Robot 仓库做 PR review 时
-- 提取 PR 上下文后，看到 `.pr.mandatory_review_checks` 含 `lerobot_gitlink_changed` 时
+- 提取 PR 上下文后，看到 `checks` 含 `lerobot_gitlink_changed` 时
 - 判断 PR 是否触发双平台 Docker Verification 门禁时
 - PR 或 commit 表明存在 AI 辅助贡献时
-- PR 变更超过 2000 行（`.pr.reuse_self_check.required` 为 true）或
-  `.pr.mandatory_review_checks` 含 `large_pr_reuse_self_check_*` 时
+- PR 变更超过 2000 行（`reuse_self_check.required` 为 true）或
+  `checks` 含 `large_pr_reuse_self_check_*` 时
 
 ## 1. `libs/lerobot` gitlink 强制检查（阻塞性）
 
@@ -44,10 +44,10 @@
 
 ### 审查输出要求
 
-- 完成三步法的前两步并展示产出后，在第 3 步先查看 `.pr.mandatory_review_checks`。出现
+- 完成三步法的前两步并展示产出后，在第 3 步先查看 `checks`。出现
   `lerobot_gitlink_changed` 时必须完成人工判定，不能直接给出"无问题"。
 - 对违规指针变更，issue 应定位到 `libs/lerobot`，标题明确说明"禁止直接提交 LeRobot
-  submodule 指针"，并在 `fix_code` / 修复方案中给出恢复 gitlink 和导出 patch 的步骤。
+  submodule 指针"，并在修复方案中给出恢复 gitlink 和导出 patch 的步骤。
 - 即使 PR 同时增加了 `third_party/patches/lerobot/*.patch`，也不能自动认为 gitlink 变化
   合法；普通 patch 增量通常不应改变根仓库记录的 submodule 指针。
 
@@ -74,7 +74,7 @@
   - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
   - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
 - PR 描述必须且只能包含一个结构化 `## Docker Verification` 块，含 `Docker verification mode`、`Verified inputs`、`Tested source tree`、`Docker environment` 四个字段。
-- 必须将该字段与 PR 最新 head commit 的 tree SHA 比对。`pr_review.py` 会自动生成：
+- 必须将该字段与 PR 最新 head commit 的 tree SHA 比对。`review_gates.py`（离线审计入口）会自动生成：
   - `docker_verification_missing`：块缺失或字段不完整。
   - `docker_verification_mismatch`：inputs 指纹不匹配当前输入，或 full 模式下 tested tree 不匹配当前 head tree。
 - 两种情况都是阻塞性问题。作者 push 后只有源码 tree 改变才要求重跑 Ubuntu 与 openEuler；只改 commit message、作者或 trailer 而 tree 不变时，已有验证仍有效。
@@ -96,7 +96,8 @@
   阻塞性元数据问题。
 - 据观察（依据 #441 / #443 / #458 的标签变化，不是门禁规则原文）：平台字段只写 CLI 命令名或缩写
   （如 `dsh 0.1.7-rc.2`）会被社区门禁判为 `ai-compliance-failed`。遇到这种写法应按元数据问题提出，
-  并提示作者用 `--update-pr` 把描述改成产品全称，然后复查标签是否转为 `ai-compliance-successful`。
+  并提示作者用 `pr_body_gate.py` 重新生成披露（`--agent-tool` 写产品全称）再经 `gitcode pr edit`
+  刷新描述，然后复查标签是否转为 `ai-compliance-successful`。
 - 检查贡献者是否声明已进行人工审查，并关注无法解释或维护的输出、许可证不兼容材料、商业秘密、
   个人信息、敏感数据、私有代码、内部文档和未公开漏洞信息。
 - 元数据完整不代表代码自动合规；仍需按风险检查正确性、安全性、许可证和必要 Verification。
@@ -106,7 +107,7 @@
 
 ## 5. 禁止本地重复执行 pre-commit 已覆盖的检查
 
-- IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；开发者 `git commit` 时必然已通过 ruff 校验，**PR 上线代码不会再有 `ruff check` / `ruff format` 报错**。
+- IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；审查时结合作者的 hook/CI 证据与实际 diff 判断，不因 hook 配置存在就声称代码必然通过。
 - 因此 review 时**禁止**在本地做以下动作（属于重复劳动，浪费上下文且无新增信息）：
   - `git apply` / `git checkout` / `git diff` 拼接 PR diff 后跑 `ruff check` / `ruff format --check` / `pyright` / `mypy` / `py_compile` 等 lint / format / typecheck 命令
   - 切到 PR 分支跑 `colcon build` 来"验证"代码能否编译——这属于开发者侧 Verification 范畴，由 §3 门禁管理
@@ -120,14 +121,14 @@
 
 ### 触发条件与脚本信号
 
-- **阈值**：PR 变更行数（additions + deletions，由 `pr_review.py` 按 PR 文件统计求和，统计缺失时按 patch 的 +/- 行计数兜底）**超过 2000 行**即触发。
+- **阈值**：PR 变更行数（additions + deletions，按 PR 文件统计求和，统计缺失时按 patch 的 +/- 行计数兜底；`review_gates.py` 摘要中的 `reuse_self_check.changed_lines` 即该值）**超过 2000 行**即触发。
 - `[WIP]` **不豁免**本门禁：与双平台 Docker 门禁不同，复用自查是纯文档要求，且复用/重复造轮子问题在 WIP 阶段暴露价值最大——作者还没在错误方向上投入太多。
-- `pr_review.py --extract-info` 会自动生成 `.pr.mandatory_review_checks`：
+- `review_gates.py` 会自动生成 `checks`（`--output` JSON）或 stdout 中的同名数组：
   - `large_pr_reuse_self_check_missing`：描述中没有 `## Reuse Self-Check` 章节。
   - `large_pr_reuse_self_check_incomplete`：章节存在，但四个字段有缺失或空值。
   - `large_pr_reuse_self_check_invalid`：章节格式歧义（多个同名标题或重复字段）。
-  - 三者均为 severity=error 的阻塞性检查，`.pr.reuse_self_check` 额外给出
-    `changed_lines` / `required` / `status`。
+  - 三者均为 severity=error 的阻塞性检查，摘要中 `reuse_self_check` 额外给出
+    `changed_lines` / `required`。
 
 ### 必需的块格式
 
@@ -145,7 +146,7 @@
 ### Reviewer 审计协议（块完整时仍必须执行）
 
 脚本只能校验"块存在且字段非空"，**无法判断声明是否属实**。看到大型 PR 时，即使
-`status == complete`，也必须对照 diff 审计四项声明：
+复用自查未报缺失或格式问题，也必须对照 diff 审计四项声明：
 
 1. **验证"没有重新发明"的声明**：
    - 新增的 setup / 数据集 / 评测 benchmark / 推理 / 部署管线，先查 `libs/lerobot`

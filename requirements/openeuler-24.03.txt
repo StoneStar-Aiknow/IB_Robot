@@ -2,7 +2,6 @@ aiortc
 onnx
 onnxruntime
 pygraphviz
-atomgit_sdk
 # Ascend NPU backend; pinned to 2.10.0.post4 to match the torch version
 # locked by the lerobot editable install (torch==2.10.0, see
 # libs/lerobot/requirements-ubuntu.txt). Without this pin pip backtracks

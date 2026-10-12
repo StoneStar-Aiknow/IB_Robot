@@ -77,34 +77,38 @@
 
 - **配置生成 ([deepwiki-config](./deepwiki-config))**: 从 DeepWiki 目录结构生成或增量更新 `doc_config.json`，保持 `deepwiki_processor.py` 可识别的层级与标签。
 - **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 配置优先流程：本地化配置标题后逐页翻译，再构建目录与索引并校验链接锚点，全程保持 H1、文件名与处理器规则一致。
-- **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；单脚本零内部依赖，可整体拷贝到其他 docs 仓库复用。
+- **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；AtomGit 访问由脚本内自含的最小只读 CLI 调用完成（argv/超时/`GC_HOST`/身份探测），技能目录可独立携带到其他 docs 仓库。
 - **Mermaid 语法验证 ([mermaid-syntax-validation](./mermaid-syntax-validation))**: 对 Markdown/Sphinx 文档中的 Mermaid 图执行语法风险扫描、最小修复、Sphinx 构建和浏览器端渲染验证。
 
 ### 🌐 AtomGit 自动化工具
-这些技能通过集成 AtomGit API，实现了 PR / Issue 生命周期和代码审查的自动化。
+日常 PR / Issue 与评审操作由 Agent 直接调用官方 `gitcode` CLI，参数按需查询 `--help`。
+项目检查工具只承担披露、复用自查和验证规则；批量链接检查保留专用脚本（自含最小只读
+CLI 调用），intro 为纯本地状态检查，不再远端抽查 PR。
 
-> **⚠️ 前置条件：配置 AtomGit Token**
+> **⚠️ 前置条件：安装并认证官方 AtomGit CLI（`gitcode` 入口）**
 > 
-> 使用 AtomGit 相关技能前，必须先配置 Personal Access Token：
+> 使用 AtomGit 相关技能前，必须先完成 CLI 认证：
 > 
-> 1. 访问 https://atomgit.com 并登录
-> 2. 点击右上角头像 → 个人设置
-> 3. 找到「访问令牌」选项
-> 4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
-> 5. **立即复制保存** Token（只显示一次）
+> 1. 将官方 CLI 安装到 `/usr/local/bin/gitcode`，升级时更新同一文件；
+>    保留系统 Graphviz 的 `/usr/bin/gc`。
+>    参见[正式安装说明](../../docs/atomgit_cli_migration.md#正式安装linux)，不要依赖工作树 `tmp/`。
+> 2. 访问 https://atomgit.com → 右上角头像 → 个人设置 → 「访问令牌」→ 新建访问令牌
+>    （勾选 `repo` 和 `pull_request` 权限），**立即复制保存**（只显示一次）
+> 3. 在私密终端认证（凭证存储由 CLI 管理；stdin 输入不代表不会持久保存）：
 > 
-> 设置环境变量：
 > ```bash
-> export ATOMGIT_TOKEN="your_token_here"
+> gitcode auth login --hostname atomgit.com --with-token
+> GC_HOST=atomgit.com gitcode auth status
 > ```
 > 
-> Token 配置存储在项目根目录的 `config.json` 中，通过环境变量 `$ATOMGIT_TOKEN` 引用。
+> 认证与平台访问全部由 CLI 管理；仓库级 `config.json` 及其旧 token 已删除；
+> intro 为纯本地检查，不访问平台；CLI 登录配置不受影响。
 
-- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、WIP/正式检视阶段选择、读取管理上下文和更新描述；coding agent 先执行实际工具版本命令，再将结果传给 `--agent-tool`；如果目标是通用 review，应改用 `atomgit-pr-review`。
-- **Issue 工作流 ([atomgit-issue](./atomgit-issue))**: 面向 Issue 资源本身，覆盖创建、读取、更新与状态流转，支持 `--owner` / `--repo` / `--url` 进行跨仓库调用。
-- **通用评审 ([atomgit-pr-review](./atomgit-pr-review))**: 利用 LLM 充当第一道代码防线，默认提取变更、提交和已有评论，支持直接从 PR 链接解析目标仓库与编号。
+- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，通过 CLI 创建、读取和更新；发布前用本地工具检查披露、复用自查及 WIP/正式检视规则，`--agent-tool` 使用实际版本命令的输出；如果目标是通用 review，应改用 `atomgit-pr-review`。
+- **Issue 工作流 ([atomgit-issue](./atomgit-issue))**: 面向 Issue 资源本身，直接使用 CLI 创建、读取、更新和流转状态，以 `-R owner/repo` 明确目标仓库。
+- **通用评审 ([atomgit-pr-review](./atomgit-pr-review))**: Agent 直接读取 PR、diff 和评论，按三步评审流程分析；发布前确认具体发现并复核源仓库和 head SHA。
 - **架构扫描 ([atomgit-pr-architecture-review](./atomgit-pr-architecture-review))**: 专门检查是否违背了 SSOT 等核心架构原则。
-- **意见处理 ([atomgit-review-resolution](./atomgit-review-resolution))**: 实现从“发现问题”到“修复代码/回复评论”的自动化闭环，支持直接从 PR 链接解析目标仓库与编号。
+- **意见处理 ([atomgit-review-resolution](./atomgit-review-resolution))**: Agent 修复代码并按 Git 工作流提交推送，再直接用 CLI 回复和解决线程；不提供自动恢复执行器。
 - **协作路由 ([atomgit-collaboration](./atomgit-collaboration))**: 面向“看看这个 PR / 帮我跟进这个评论”这类泛化协作请求，先识别意图，再分流到具体 AtomGit skill。
 
 > **边界说明**: `atomgit-pr-architecture-review` 仍然是 **IB_Robot 专用** 能力；本次跨仓库能力只开放给通用 PR / Issue / review / review-resolution 流程。

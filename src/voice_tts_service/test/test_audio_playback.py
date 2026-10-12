@@ -105,6 +105,7 @@ def test_shared_playback_waits_for_subscriber_and_publishes_all_chunks(monkeypat
     assert node._publish_audio(str(audio_path)) == str(audio_path)
     assert len(publisher.messages) == 2
     assert all(len(message.data) == 2400 for message in publisher.messages)
+    assert len(publisher.ack_timeouts) == 1
     assert all(timeout.nanoseconds > 0 for timeout in publisher.ack_timeouts)
 
 
@@ -132,3 +133,92 @@ def test_shared_playback_reports_ack_timeout(monkeypatch, tmp_path):
     with pytest.raises(AudioPlaybackError) as error:
         node._publish_audio(str(audio_path))
     assert error.value.code == "PLAYBACK_TIMEOUT"
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        assert seconds >= 0.0
+        self.now += seconds
+
+
+def test_sample_clock_does_not_accumulate_ack_or_publish_latency(monkeypatch, tmp_path):
+    """20 ms of work + 50 ms ACK latency must not turn each 50 ms chunk into 120 ms."""
+    audio_path = tmp_path / "speech.wav"
+    _write_wav(audio_path, sample_rate=24000, frames=24000)
+    clock = _Clock()
+    published_at = []
+    acknowledged_at = []
+
+    class SlowPublisher(_FakeAudioPublisher):
+        def publish(self, message):
+            published_at.append(clock.now)
+            clock.sleep(0.02)
+            super().publish(message)
+
+        def wait_for_all_acked(self, timeout=None):
+            acknowledged_at.append(clock.now)
+            clock.sleep(0.05)
+            return super().wait_for_all_acked(timeout)
+
+    publisher = SlowPublisher()
+    node = _make_playback_node(publisher, timeout_sec=3.0)
+    _install_fake_audio_common_msgs(monkeypatch)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    node._publish_audio(str(audio_path))
+
+    assert published_at == pytest.approx([index * 0.05 for index in range(20)])
+    assert acknowledged_at == pytest.approx([1.0])
+    assert clock.now == pytest.approx(1.05)
+    assert len(publisher.messages) == 20
+
+
+def test_sample_clock_preserves_partial_chunk_and_pcm_bytes(monkeypatch, tmp_path):
+    audio_path = tmp_path / "partial.wav"
+    pcm = bytes(range(256)) * 10
+    with wave.open(str(audio_path), "wb") as stream:
+        stream.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+        stream.writeframes(pcm)
+    clock = _Clock()
+    publisher = _FakeAudioPublisher()
+    node = _make_playback_node(publisher)
+    _install_fake_audio_common_msgs(monkeypatch)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    node._publish_audio(str(audio_path))
+
+    assert b"".join(bytes(message.data) for message in publisher.messages) == pcm
+    assert [len(message.data) for message in publisher.messages] == [2400, 160]
+    assert clock.now == pytest.approx(len(pcm) / 48000)
+    assert len(publisher.ack_timeouts) == 1
+
+
+def test_publish_stall_cannot_run_past_playback_budget(monkeypatch, tmp_path):
+    audio_path = tmp_path / "stall.wav"
+    _write_wav(audio_path, sample_rate=24000, frames=2400)
+    clock = _Clock()
+
+    class StalledPublisher(_FakeAudioPublisher):
+        def publish(self, message):
+            clock.sleep(2.0)
+            super().publish(message)
+
+    publisher = StalledPublisher()
+    node = _make_playback_node(publisher, timeout_sec=1.0)
+    _install_fake_audio_common_msgs(monkeypatch)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    with pytest.raises(AudioPlaybackError) as error:
+        node._publish_audio(str(audio_path))
+
+    assert error.value.code == "PLAYBACK_TIMEOUT"
+    assert len(publisher.messages) == 1

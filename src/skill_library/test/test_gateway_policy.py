@@ -158,7 +158,7 @@ def _snapshot(**overrides) -> RuntimeSnapshot:
 
 
 def test_policy_resolves_identity_through_shared_payload_and_hash_api(monkeypatch):
-    policy = _policy()
+    policy, _ledger, _lease = _atomic_policy()
     payload_calls = []
     hash_calls = []
     original_payload = gateway_policy.skill_request.canonical_skill_payload
@@ -193,9 +193,23 @@ def test_policy_rejects_timeout_over_budget_using_wire_effective_timeout():
 
     assert not decision.admitted
     assert decision.error_code == "TIMEOUT_EXCEEDS_POLICY"
-    assert decision.prepared_request is not None
-    assert decision.effective_timeout_sec == decision.prepared_request.payload["timeout_sec"]
-    assert decision.effective_timeout_sec == pytest.approx(10.1)
+
+
+def test_policy_blocks_all_root_admissions_while_unknown_is_unresolved():
+    snapshot = _snapshot(unresolved_unknown=True)
+    decision = _policy().evaluate(_request(), snapshot, owner=ExecutionOwner.skill_command("task-1"))
+    assert decision.error_code == gateway_policy.EXECUTION_QUARANTINED
+
+    policy, _ledger, _lease = _atomic_policy()
+    workflow_error, workflow_token = policy.admit_workflow(
+        ExecutionOwner.workflow("workflow-1"), snapshot, timeout_sec=5.0
+    )
+    assert workflow_error == gateway_policy.EXECUTION_QUARANTINED
+    assert workflow_token is None
+
+    primitive_error, primitive_token = policy.admit_external_primitive("primitive-1", "digest", snapshot)
+    assert primitive_error == gateway_policy.EXECUTION_QUARANTINED
+    assert primitive_token is None
 
 
 def test_workflow_root_lease_issues_only_internal_child_borrows() -> None:

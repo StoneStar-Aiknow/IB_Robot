@@ -82,6 +82,12 @@ class GatewayTransport:
     execute_plan_action: str = "/embodied/execute_agent_plan"
     start_visual_game_service: str = "/embodied/start_visual_game"
     get_visual_game_result_service: str = "/embodied/get_visual_game_result"
+    execute_program_action: str = "/embodied/execute_program"
+    get_execution_service: str = "/embodied/get_execution"
+    get_execution_events_service: str = "/embodied/get_execution_events"
+    cancel_execution_service: str = "/embodied/cancel_execution"
+    robot_id: str = ""
+    caller_scope: str = "robot_skill_cli"
 
 
 def _game_view(robot_config: dict[str, Any], timeout_policy: dict[str, float]) -> dict[str, Any]:
@@ -120,7 +126,12 @@ def load_runtime_context(
     config_name: str | None = None,
     config_path: str | Path | None = None,
 ) -> tuple[CatalogContext, GatewayTransport]:
-    """Load both catalog view and ROS transport for runtime Gateway commands."""
+    """Load both catalog view and ROS transport for runtime Gateway commands.
+
+    Provider-bound robot configs require the live interface description; pass
+    the launch-generated consumer snapshot (``/tmp/ibrobot_interfaces_*/robot.yaml``)
+    as ``config_path`` when driving a running pipeline.
+    """
     resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
     robot_config = load_robot_config_dict(resolved_path)
     embodied = robot_config.get("embodied", {})
@@ -130,7 +141,7 @@ def load_runtime_context(
             view=_snapshot_capability_view(compile_local_snapshot(robot_config, resolved_path)),
             game_view=_game_view(robot_config, timeout_policy),
         ),
-        _gateway_transport(embodied),
+        _gateway_transport(embodied, robot_id=str(robot_config.get("name", ""))),
     )
 
 
@@ -154,7 +165,7 @@ def load_visual_game_runtime_context(
     resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
     robot_config = load_robot_config_dict(resolved_path)
     embodied = robot_config.get("embodied", {})
-    return _visual_game_context(robot_config), _gateway_transport(embodied)
+    return _visual_game_context(robot_config), _gateway_transport(embodied, robot_id=str(robot_config.get("name", "")))
 
 
 def _visual_game_context(robot_config: dict[str, Any]) -> CatalogContext:
@@ -166,7 +177,7 @@ def _visual_game_context(robot_config: dict[str, Any]) -> CatalogContext:
     )
 
 
-def _gateway_transport(embodied: dict[str, Any]) -> GatewayTransport:
+def _gateway_transport(embodied: dict[str, Any], *, robot_id: str = "") -> GatewayTransport:
     return GatewayTransport(
         status_service=embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
         snapshot_service=embodied.get("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"),
@@ -183,6 +194,12 @@ def _gateway_transport(embodied: dict[str, Any]) -> GatewayTransport:
         get_visual_game_result_service=embodied.get(
             "get_visual_game_result_service", "/embodied/get_visual_game_result"
         ),
+        execute_program_action=embodied.get("execute_program_action", "/embodied/execute_program"),
+        get_execution_service=embodied.get("get_execution_service", "/embodied/get_execution"),
+        get_execution_events_service=embodied.get("get_execution_events_service", "/embodied/get_execution_events"),
+        cancel_execution_service=embodied.get("cancel_execution_service", "/embodied/cancel_execution"),
+        robot_id=robot_id,
+        caller_scope="robot_skill_cli",
     )
 
 
@@ -254,6 +271,25 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
                 endpoint_name="/sound_orientation_node/set_following",
                 endpoint_kind="ros_service",
                 configuration={},
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
+    named_motion = embodied.get("runtime_named_motion", {})
+    if isinstance(named_motion, dict) and named_motion.get("enabled") is True:
+        # Mirror SkillExecutorNode: the endpoint and runtime identity come from
+        # the bound public description when this config snapshot carries one.
+        runtime = robot_config.get("runtime", {}) if isinstance(robot_config.get("runtime"), dict) else {}
+        description = runtime.get("interface_description") or {}
+        interface = (description.get("interfaces") or {}).get(named_motion.get("interface", "")) or {}
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="runtime_named_motion",
+                endpoint_name=interface.get("endpoint", "/motion/execute_named"),
+                endpoint_kind="ros_action",
+                configuration={
+                    "runtime_name": (description.get("robot") or {}).get("runtime_name", runtime.get("provider", ""))
+                },
             )
         )
         delegated[descriptor.name] = descriptor

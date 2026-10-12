@@ -10,9 +10,11 @@ from launch_ros.actions import Node
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
+    RUNTIME_NAMED_MOTION_ACTION_TYPE,
     navigation_endpoint_projection,
     robot_config_digest,
     robot_context_schema_version,
+    robot_requires_arm_surface,
     robot_supported_control_modes,
     validate_agent_entry_config,
     validate_navigation_endpoint_contract,
@@ -103,6 +105,24 @@ def generate_embodied_nodes(
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
     if entry_mode not in {"hermes", "agent"}:
         raise ValueError("embodied.entry_mode must be hermes or agent")
+    agent_config = embodied_config.get("agent", {})
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    configured_execution_scopes = list(
+        embodied_config.get(
+            "execution_caller_scopes",
+            ["robot_skill_cli"]
+            + (
+                [str(agent_config.get("caller_scope", "agent_incubation:local_operator"))]
+                if entry_mode == "agent"
+                else []
+            ),
+        )
+    )
+    configured_execution_scopes = [scope.strip() for scope in configured_execution_scopes if str(scope).strip()]
+    agent_caller_scope = str(agent_config.get("caller_scope", "agent_incubation:local_operator"))
+    if entry_mode == "agent" and agent_caller_scope not in configured_execution_scopes:
+        raise ValueError("embodied.agent.caller_scope must be included in embodied.execution_caller_scopes")
     launch_errors = validate_agent_entry_config(embodied_config)
     if launch_errors:
         raise ValueError("; ".join(launch_errors))
@@ -116,7 +136,12 @@ def generate_embodied_nodes(
     teleoperation = robot_config.get("teleoperation", {})
     runtime = robot_config.get("runtime", {})
     runtime_enabled = bool(runtime.get("provider"))
+    # Runtime admission (status, mode service, mode map) applies to every
+    # runtime robot running skills. The arm surface (public model, joint
+    # limits, ee pose, joint trajectory, move-to-configuration) is bound only
+    # when the robot has one; a robot opts out explicitly, never by omission.
     runtime_motion = runtime_enabled and include_motion and motion_mode_compatible
+    arm_surface = runtime_motion and robot_requires_arm_surface(robot_config)
     description = runtime.get("interface_description", {}) if runtime_enabled else {}
     joint_limits = teleoperation.get("safety", {}).get("joint_limits", {})
     home_positions = robot_config.get("ros2_control", {}).get("reset_positions", {})
@@ -124,6 +149,7 @@ def generate_embodied_nodes(
         from robot_runtime.interface_description import validate_description
 
         validate_description(description)
+    if arm_surface:
         model = robot_config.get("robot_model")
         if model != description.get("model") or not model:
             raise ValueError("embodied motion requires bound robot_model from the public description")
@@ -257,6 +283,22 @@ def generate_embodied_nodes(
         "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
         "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
         "sound_following_service": "/sound_orientation_node/set_following",
+        "execution_caller_scopes_json": json.dumps(configured_execution_scopes),
+        "execution_caller_tokens_json": json.dumps(
+            {agent_caller_scope: str(agent_config.get("caller_token", ""))}
+            if str(agent_config.get("caller_token", ""))
+            else {}
+        ),
+        "execute_program_action": embodied_config.get("execute_program_action", "/embodied/execute_program"),
+        "get_execution_service": embodied_config.get("get_execution_service", "/embodied/get_execution"),
+        "get_execution_events_service": embodied_config.get(
+            "get_execution_events_service", "/embodied/get_execution_events"
+        ),
+        "cancel_execution_service": embodied_config.get("cancel_execution_service", "/embodied/cancel_execution"),
+        "execution_event_topic": embodied_config.get("execution_event_topic", "/embodied/execution_events"),
+        "execution_store_path": embodied_config.get(
+            "execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
+        ),
     }
     if runtime_motion:
         common_params.update(
@@ -272,6 +314,18 @@ def generate_embodied_nodes(
                     if isinstance(mode, dict) and mode.get("runtime_mode")
                 }
             ),
+        )
+    named_motion_config = embodied_config.get("runtime_named_motion", {})
+    if runtime_motion and isinstance(named_motion_config, dict) and named_motion_config.get("enabled") is True:
+        # Runtime-owned named motions; the endpoint comes only from the bound public description.
+        common_params.update(
+            runtime_named_motion_enabled=True,
+            runtime_named_motion_action=public_endpoint(
+                named_motion_config.get("interface", ""), "action", RUNTIME_NAMED_MOTION_ACTION_TYPE
+            ),
+        )
+    if arm_surface:
+        common_params.update(
             move_configuration_service=public_endpoint(
                 "motion.move_to_joint", "service", "ibrobot_msgs/srv/MoveToConfiguration"
             ),
@@ -509,6 +563,23 @@ def generate_embodied_nodes(
                         "gateway_execute_plan_action": embodied_config.get(
                             "execute_plan_action", "/embodied/execute_agent_plan"
                         ),
+                        "gateway_execute_program_action": embodied_config.get(
+                            "execute_program_action", "/embodied/execute_program"
+                        ),
+                        "gateway_get_execution_service": embodied_config.get(
+                            "get_execution_service", "/embodied/get_execution"
+                        ),
+                        "gateway_get_execution_events_service": embodied_config.get(
+                            "get_execution_events_service", "/embodied/get_execution_events"
+                        ),
+                        "gateway_cancel_execution_service": embodied_config.get(
+                            "cancel_execution_service", "/embodied/cancel_execution"
+                        ),
+                        "gateway_caller_scope": agent_config.get("caller_scope", "agent_incubation:local_operator"),
+                        "gateway_caller_token_env": agent_config.get(
+                            "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
+                        ),
+                        "gateway_caller_token": agent_config.get("caller_token", ""),
                     }
                 ],
             )

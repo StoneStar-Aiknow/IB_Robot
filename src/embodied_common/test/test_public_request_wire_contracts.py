@@ -112,13 +112,17 @@ class _GeneratedRequest:
     action_package.joinpath("__init__.py").write_text(
         generated_fixture
         + "\nclass SkillCommand:\n    Goal = _GeneratedRequest\n"
-        + "\nclass PrimitiveCommand:\n    Goal = _GeneratedRequest\n",
+        + "\nclass PrimitiveCommand:\n    Goal = _GeneratedRequest\n"
+        + "\nclass ExecuteProgram:\n    Goal = _GeneratedRequest\n",
         encoding="utf-8",
     )
     service_package.joinpath("__init__.py").write_text(
         generated_fixture
         + "\nclass ValidateSkill:\n    Request = _GeneratedRequest\n"
-        + "\nclass ValidatePrimitive:\n    Request = _GeneratedRequest\n",
+        + "\nclass ValidatePrimitive:\n    Request = _GeneratedRequest\n"
+        + "\nclass GetExecution:\n    Request = _GeneratedRequest\n"
+        + "\nclass GetExecutionEvents:\n    Request = _GeneratedRequest\n"
+        + "\nclass CancelExecution:\n    Request = _GeneratedRequest\n",
         encoding="utf-8",
     )
 

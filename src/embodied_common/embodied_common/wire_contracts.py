@@ -5,14 +5,18 @@ from __future__ import annotations
 
 def validate_public_request_wire_contracts() -> None:
     """Reject stale generated interfaces that do not expose the version prefix."""
-    from ibrobot_msgs.action import PrimitiveCommand, SkillCommand
-    from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
+    from ibrobot_msgs.action import ExecuteProgram, PrimitiveCommand, SkillCommand
+    from ibrobot_msgs.srv import CancelExecution, GetExecution, GetExecutionEvents, ValidatePrimitive, ValidateSkill
 
     request_types = (
         ("SkillCommand.Goal", SkillCommand.Goal),
         ("PrimitiveCommand.Goal", PrimitiveCommand.Goal),
         ("ValidateSkill.Request", ValidateSkill.Request),
         ("ValidatePrimitive.Request", ValidatePrimitive.Request),
+        ("ExecuteProgram.Goal", ExecuteProgram.Goal),
+        ("GetExecution.Request", GetExecution.Request),
+        ("GetExecutionEvents.Request", GetExecutionEvents.Request),
+        ("CancelExecution.Request", CancelExecution.Request),
     )
     expected_prefix = ("schema_version", "uint32")
     for type_name, request_type in request_types:
@@ -32,6 +36,18 @@ def validate_public_request_wire_contracts() -> None:
                 raise RuntimeError(
                     f"public request wire contract mismatch for {type_name}: schema_version contract must include "
                     "string arm_side and float32 imitation_duration_sec"
+                )
+        if type_name == "ExecuteProgram.Goal":
+            field_types = dict(fields)
+            required = {
+                "request_id": "string",
+                "caller_scope": "string",
+                "robot_id": "string",
+                "workflow_steps": "sequence<ibrobot_msgs/WorkflowStep>",
+            }
+            if any(field_types.get(name) != field_type for name, field_type in required.items()):
+                raise RuntimeError(
+                    "public request wire contract mismatch for ExecuteProgram.Goal: missing typed Program identity"
                 )
 
     try:

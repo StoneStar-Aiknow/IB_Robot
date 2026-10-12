@@ -19,10 +19,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from robot_skill_cli.hermes_response import HermesResponse, SpeechEvent
+
 FALLBACK_COPY = {
-    "status_check_started": "任务已收到，小鸭子正在观察环境嘎嘎。",
-    "planning_started": "看清楚了，让小鸭子先想想怎么执行。",
-    "plan_confirmed": "计划已绑定，正在等待执行检查嘎嘎。",
+    "status_check_started": "任务已收到，正在检查能否执行。",
+    "planning_started": "正在准备动作计划。",
+    "plan_confirmed": "动作计划已准备好，正在检查执行条件。",
 }
 EVENTS = frozenset(FALLBACK_COPY)
 _LOG_PATH = Path(os.environ.get("IBROBOT_LIFECYCLE_SPEECH_LOG", "/tmp/hermes-lifecycle-speech.log"))
@@ -257,20 +259,20 @@ def _spawn_play(root: Path, turn: str, event: str, text: str) -> None:
 
 def _play(turn: str, event: str, text: str) -> None:
     _log(f"PLAY_START turn={turn} event={event} chars={len(text)}")
-    payload = json.dumps({"session_id": turn, "assistant_response": text}, ensure_ascii=False)
+    payload = json.dumps(SpeechEvent(turn, turn, event, HermesResponse(text)).to_dict(), ensure_ascii=False)
     hook = os.environ.get("IBROBOT_HERMES_TTS_HOOK", "")
     timeout = float(os.environ.get("IBROBOT_LIFECYCLE_TTS_TIMEOUT_SEC", "360"))
     if hook:
-        subprocess.run([hook], input=payload, text=True, timeout=timeout, check=False)
+        result = subprocess.run([hook], input=payload, text=True, timeout=timeout, check=False)
     else:
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, "-m", "robot_skill_cli.hermes_tts_hook"],
             input=payload,
             text=True,
             timeout=timeout,
             check=False,
         )
-    _log(f"PLAY_DONE turn={turn} event={event}")
+    _log(f"{'PLAY_DONE' if result.returncode == 0 else 'PLAY_ERROR'} turn={turn} event={event}")
 
 
 def handle(payload: dict[str, Any]) -> None:

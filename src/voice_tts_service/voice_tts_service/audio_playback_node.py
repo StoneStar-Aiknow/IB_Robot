@@ -92,13 +92,15 @@ class AudioPlaybackNode(Node):
             from audio_common_msgs.msg import AudioData
 
             chunk_frames = max(1, rate // 20)
+            playback_start = time.monotonic()
+            published_frames = 0
             while True:
                 data = wav.readframes(chunk_frames)
                 if not data:
                     break
-                duration = len(data) / (rate * channels * 2)
-                remaining = deadline - time.monotonic()
-                if remaining < duration:
+                published_frames += len(data) // (channels * 2)
+                chunk_end = playback_start + published_frames / rate
+                if chunk_end > deadline or time.monotonic() >= deadline:
                     raise AudioPlaybackError(
                         "PLAYBACK_TIMEOUT",
                         f"audio playback exceeded {timeout_sec:g} seconds",
@@ -106,15 +108,25 @@ class AudioPlaybackNode(Node):
                 message = AudioData()
                 message.data = list(data)
                 self._audio_pub.publish(message)
-                wait_for_all_acked = getattr(self._audio_pub, "wait_for_all_acked", None)
-                if wait_for_all_acked is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not wait_for_all_acked(Duration(seconds=remaining)):
-                        raise AudioPlaybackError(
-                            "PLAYBACK_TIMEOUT",
-                            f"audio playback acknowledgement exceeded {timeout_sec:g} seconds",
-                        )
-                time.sleep(duration)
+                # DDS acknowledgement can take an entire PCM chunk period.
+                # Waiting here would starve audio_play between every chunk.
+                # Absolute sample-clock deadlines also avoid accumulating
+                # serialization and publish overhead into the sound duration.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AudioPlaybackError("PLAYBACK_TIMEOUT", f"audio playback exceeded {timeout_sec:g} seconds")
+                delay = chunk_end - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+        # Retain reliable-delivery confirmation without putting ACK latency
+        # between PCM chunks. This is not a hardware playback-complete event.
+        wait_for_all_acked = getattr(self._audio_pub, "wait_for_all_acked", None)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (wait_for_all_acked is not None and not wait_for_all_acked(Duration(seconds=remaining))):
+            raise AudioPlaybackError(
+                "PLAYBACK_TIMEOUT",
+                f"audio playback acknowledgement exceeded {timeout_sec:g} seconds",
+            )
         return str(path)
 
 

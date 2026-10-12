@@ -90,7 +90,7 @@ requirements_packages() {
     done < "$1"
 }
 assert_eq "CANN 8.1 requirements pin the complete Torch ABI" \
-    "aiortc,av>=15,<16,onnx,onnxruntime,pygraphviz,atomgit_sdk,decorator,torch==2.5.1,torch_npu==2.5.1,torchvision==0.20.1" \
+    "aiortc,av>=15,<16,onnx,onnxruntime,pygraphviz,decorator,torch==2.5.1,torch_npu==2.5.1,torchvision==0.20.1" \
     "$(requirements_packages "${REPO_ROOT}/requirements/openeuler-24.03-cann-8.1.txt" | paste -sd, -)"
 assert_eq "CANN 8.1 LeRobot runtime pins the PI05-compatible Transformers version" \
     "transformers==5.3.0" \

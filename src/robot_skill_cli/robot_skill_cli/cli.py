@@ -213,6 +213,13 @@ def _create_bridge(transport):
         validate_plan_service=transport.validate_plan_service,
         confirm_plan_service=transport.confirm_plan_service,
         execute_plan_action=transport.execute_plan_action,
+        execute_program_action=transport.execute_program_action,
+        get_execution_service=transport.get_execution_service,
+        get_execution_events_service=transport.get_execution_events_service,
+        cancel_execution_service=transport.cancel_execution_service,
+        caller_scope=transport.caller_scope,
+        robot_id=transport.robot_id,
+        caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", ""),
         start_visual_game_service=transport.start_visual_game_service,
         get_visual_game_result_service=transport.get_visual_game_result_service,
     )
@@ -1152,8 +1159,11 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, _handle_signal)
-        run_kwargs = {
-            "presentation_callback": lambda presentation: print(
+        from robot_skill_cli.hermes_workflow_stop import managed_stop, record_workflow_event, wait_for_presentation
+
+        def present(presentation):
+            record_workflow_event("workflow_presentation", presentation)
+            print(
                 json_dumps(
                     {
                         "schema_version": 1,
@@ -1164,14 +1174,22 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
                     }
                 ),
                 flush=True,
-            ),
+            )
+            wait_for_presentation()
+
+        run_kwargs = {
+            "presentation_callback": present,
             "authorization_callback": _notify_authorized,
             "stop_event": interrupt_event,
         }
         request_id = getattr(args, "request_id", None)
         if request_id is not None:
             run_kwargs["request_id"] = request_id
-        terminal = controller.run(args.raw_command, workflow_steps, **run_kwargs)
+        with managed_stop(interrupt_event, fresh_request=request_id is None) as submission_guard:
+            if os.environ.get("IBROBOT_STOP_ROOT"):
+                run_kwargs["submission_guard"] = submission_guard
+            terminal = controller.run(args.raw_command, workflow_steps, **run_kwargs)
+        record_workflow_event("workflow_terminal", terminal)
         print(
             json_dumps(
                 {
@@ -1187,6 +1205,7 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
     except InteractiveControlError as exc:
         terminal = controller.terminal
         if terminal is not None:
+            record_workflow_event("workflow_terminal", terminal)
             print(
                 json_dumps(
                     {
@@ -1349,11 +1368,18 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from robot_skill_cli.hermes_workflow_stop import record_admission_error
+
     parser = _build_parser()
     command = "unknown"
     try:
         args = parser.parse_args(argv)
         command = args.command
+        if os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1" and command in {
+            "execute-plan",
+            "confirm-plan",
+        }:
+            raise _CliArgumentError("Hermes motion requires the managed run-workflow entry")
         from robot_skill_cli.catalog import (
             load_catalog_context,
             load_runtime_context,
@@ -1375,17 +1401,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             data = _run_catalog_command(args, context)
         else:
             context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
+            if command == "execute" and os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1":
+                capability = next((item for item in context.view["skills"] if item["name"] == args.skill), {})
+                if capability.get("moves_robot", True):
+                    raise _CliArgumentError("Hermes motion requires the managed run-workflow entry")
             data = _run_runtime_command(args, context, transport)
     except _CommandError as exc:
+        record_admission_error(exc.code, str(exc))
         print(json_dumps(error_envelope(command, exc.code, str(exc))))
         return exc.exit_code
     except (_CliArgumentError, FileNotFoundError, ValueError) as exc:
+        record_admission_error(getattr(exc, "code", "INVALID_ARGUMENT"), str(exc))
         print(json_dumps(error_envelope(command, getattr(exc, "code", "INVALID_ARGUMENT"), str(exc))))
         return EXIT_INVALID_INPUT
     except Exception as exc:
         from robot_skill_cli.ros_bridge import BridgeError
 
         if isinstance(exc, BridgeError):
+            record_admission_error(exc.code, str(exc))
             print(json_dumps(error_envelope(command, exc.code, str(exc))))
             return exc.exit_code
         raise
