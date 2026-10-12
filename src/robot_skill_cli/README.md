@@ -3,7 +3,7 @@
 `robot_skill_cli` 提供约束 LLM/Agent 对 ROS 访问面的命令行工具集，包含三条受控入口：
 
 ```text
-运动控制:   Hermes -> ibrobot-control Skill -> robot-skill            -> ROS Capability Gateway
+运动控制:   Hermes -> ibrobot-control Skill -> robot-skill [-> robot-skill-daemon] -> ROS Capability Gateway
 感知读取:   Hermes -> ibrobot-perceive (硬编码 allowlist)              -> ros2 topic echo --once
 裸 ROS 拦截: Hermes pre_tool_call -> ibrobot-block-raw-ros hook        -> block ros2/rclpy/roslaunch
 ```
@@ -54,19 +54,44 @@ bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链
 ### 常驻 ROS bridge
 
 每次调用 `robot-skill` 都是新进程。原先每个进程都要新建 ROS 节点，并等待已运行的 Gateway 发现它（Fast DDS 下
-约 1 s，偶发 2–3 s），然后才能发出第一个请求。现在需要访问 Gateway 的命令会把 ROS 传输交给一个按需启动的
-常驻进程 `robot-skill-daemon`，后续调用复用它已建立的连接，不再等待发现：
+约 1 s，偶发 2–3 s），然后才能发出第一个请求。现在需要访问 Gateway 的命令会把 ROS 传输交给常驻进程
+`robot-skill-daemon`，复用它已建立并完成发现的连接。daemon 的生命周期由 embodied pipeline launch 管理，
+`robot-skill` 默认只连接、不自行拉起后台进程：
 
-- 第一次调用自动在后台启动 daemon；连续空闲 15 分钟（`IBROBOT_ROBOT_SKILL_DAEMON_IDLE_SEC`）后自动退出。
+- **随机器人启动**：`embodied_pipeline.launch.py` 在启动 Skill Gateway 的同时启动
+  `robot-skill-daemon --config-path <本次启动的配置快照> --replace --idle-timeout 0`。它按与 `robot-skill`
+  相同的方式解析该配置的 Gateway 接口，提前建立连接，并发送只读 status 探测直到 Gateway 应答，因此启动后的第一次
+  调用也无需等待发现。它随 launch 退出；启动时若已有按需启动的旧 daemon 占用同一 socket，会先让其退出再接管。
+  `embodied.resident_cli_bridge: false` 可关闭这一启动项。
+- **默认只连接**：没有正在运行的 daemon 时（例如未用 embodied pipeline、关闭了启动项、在另一台机器上执行 CLI），
+  `robot-skill` 直接使用进程内 bridge，行为与原先相同，不会在后台留下任何进程。
+- **按需启动（显式开启）**：设置 `IBROBOT_ROBOT_SKILL_DAEMON=spawn` 后，没有 daemon 时第一次调用会在后台启动
+  daemon，连续空闲 15 分钟（`IBROBOT_ROBOT_SKILL_DAEMON_IDLE_SEC`）后自动退出；适合不经 embodied pipeline、又需要
+  连续调用的会话。
 - 只有 ROS 传输在 daemon 中执行；参数解析、catalog 加载、展示、停止状态和 stdout 输出仍在 CLI 进程内，
   命令行为与输出契约不变。CLI 进程退出不会取消已提交的 goal，与原先一致。
-- daemon 按用户隔离：socket 位于权限 `0700` 的 `$XDG_RUNTIME_DIR/ibrobot/`（无该变量时为
-  `/tmp/ibrobot-<uid>/`），并校验对端 uid。socket 名由 `ROS_DOMAIN_ID`、`RMW_IMPLEMENTATION`、
-  `ROS_LOCALHOST_ONLY`、`CYCLONEDDS_URI` 等传输变量以及已安装代码共同决定，因此不同 domain、不同 RMW 或重新
-  构建后会自动使用新的 daemon，不会连到旧图或旧代码。
+- 每个 Gateway 传输配置共享一个 DDS participant；调用方 token（`IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI`）按每个
+  客户端会话传入，只用于该会话的请求。daemon 启动时清除继承来的 token 等私有环境变量（包括 launch 环境）。
+- 停止（`--stop`）或被新 daemon 接管（`--replace`）时，daemon 立即释放 socket、不再接受新连接，但继续服务已连接的
+  命令直到它们结束（最长 10 分钟），正在执行的命令仍能观察并取消自己的动作。launch 退出（SIGINT/SIGTERM）时
+  Gateway 也随之退出，daemon 最多再等 3 秒。
+- 如果 daemon 仍意外退出，CLI 中未完成的 goal 立即以 `ROS_UNAVAILABLE` 失败，命令走原有的传输失败路径：按任务 id
+  的状态查询、取消和执行记录查询会改由进程内新建的 bridge 发出，因此仍能取消并确认动作终态；新的 goal 不会改走
+  进程内 bridge。
+- 每个客户端有独立的发送队列，不读输出的客户端不会阻塞其他客户端的回调；Gateway 未应答时，建立连接最多等 5 秒
+  预热，不会卡住其他配置或后续命令。
+- daemon 按用户隔离：socket 位于权限 `0700` 的 `/run/user/<uid>/ibrobot/`（该目录不存在时为
+  `/tmp/ibrobot-<uid>/`，可用 `IBROBOT_ROBOT_SKILL_DAEMON_DIR` 覆盖），不依赖 `XDG_RUNTIME_DIR`，并校验对端 uid。
+  socket 名由决定 ROS 图与安全身份的变量（`ROS_DOMAIN_ID`、`RMW_IMPLEMENTATION`、`ROS_LOCALHOST_ONLY`、发现范围
+  与 discovery server、`CYCLONEDDS_URI`、Fast DDS profile 文件、`ROS_SECURITY_*`）以及已安装代码共同决定：不同 domain、不同 RMW
+  或重新构建后会使用新的 daemon。只影响本进程传输细节的变量（如 launch 统一设置的 `FASTDDS_BUILTIN_TRANSPORTS`）
+  和 `PYTHONPATH` 的写法不参与，因此 launch 启动的 daemon 与用户 shell、Hermes 包装脚本中的 CLI 使用同一个 socket。
 - daemon 无法启动或连接时自动回退到进程内 bridge，行为与原先相同，只是没有时延收益。
-- `IBROBOT_ROBOT_SKILL_DAEMON=0` 关闭 daemon；`robot-skill-daemon --stop` 停止当前环境对应的 daemon；
-  daemon 日志写在 socket 同目录的 `.log` 文件。pytest 下默认关闭（根目录 `conftest.py`）。
+- `IBROBOT_ROBOT_SKILL_DAEMON` 取值：未设置或 `1` 只连接已运行的 daemon；`spawn` 允许按需启动；`0` 完全关闭
+  （launch 启动项也会直接退出）。`robot-skill-daemon --stop` 停止
+  当前环境对应的 daemon；按需启动的 daemon 日志写在 socket 同目录的 `.log` 文件（超过 1 MiB 时轮转为 `.log.1`），launch 启动的 daemon 输出在
+  launch 日志中。pytest 下默认关闭（根目录 `conftest.py`）。
+- `ibrobot_agent` 的自然语言 Agent 路径不经过 `robot-skill`，它在节点内一直持有自己的 `RosBridge`，不受影响。
 
 ## 命令
 
@@ -320,6 +345,16 @@ reason（没有冒号时两者都是该 code）。因此调用方应按 `error.c
 pipeline、开启授权、修改 ROS 参数，或从 YAML 推导授权。只有操作员完成现场安全检查后，才能在启动
 pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和不执行动作的本地检查；Gateway 会拒绝运动。
 
+常驻 bridge `robot-skill-daemon` 是 `robot-skill` 的 ROS 传输进程，不是新的授权入口：
+
+- 它只向 Capability Gateway 发出与 `robot-skill` 相同的 typed 请求，Gateway 仍逐请求校验 `caller_scope`、
+  调用方 token 和 `authorize_motion`；daemon 不持有授权，也不绕过 Gateway。
+- 它的 Unix socket 位于权限 `0700` 的用户目录，只接受同一 uid 的对端（无法确认对端 uid 时拒绝）。能连上 socket
+  的进程本来就能以同一用户直接运行 `robot-skill` 或 rclpy，因此不扩大访问面；但 CLI 侧的展示、停止状态和
+  `ibrobot-block-raw-ros` hook 只约束经过 `robot-skill` 的调用，不约束直接连接 socket 的进程。
+- daemon 只接受已知的 Gateway 接口参数（不接受 `caller_token_env` 等身份字段）、只允许调用固定的 Gateway 方法，
+  并在启动时清除继承来的 `IBROBOT_EXECUTION_TOKEN_*` 等调用方私有环境变量。
+
 `robot_mcp` 兼容层已移除。Hermes 推荐配置和示例统一通过 `robot-skill` 访问 Capability Gateway。
 
 ## Hermes 启动器
@@ -449,6 +484,9 @@ ROS 2 中间件沿用发行版默认的 Fast DDS，`.shrc_local` 不修改 `RMW_
 
 - **现象**：Fast DDS 下每个新进程（每次 `robot-skill` 调用都是新进程）需要先与已运行的 Gateway 完成 DDS 发现，
   才能发出第一个请求。在 SO-101 单机上实测约 1 s，偶发 2–3 s；耗时随网络、节点数量和发现配置变化。
+  通过 `embodied_pipeline.launch.py` 启动时，[常驻 ROS bridge](#常驻-ros-bridge) 已提前完成发现，`robot-skill`
+  调用不再承担这段时延；只有 daemon 未运行（未用 pipeline、`embodied.resident_cli_bridge: false` 或
+  `IBROBOT_ROBOT_SKILL_DAEMON=0`）时才会出现。
 - **可选：改用 CycloneDDS**：安装 `ros-humble-rmw-cyclonedds-cpp`，并在 `source .shrc_local` 之前执行
   `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`。目前只在未接相机的 SO-101 单机上验证过（敲命令到机械臂开始
   运动约 0.8 s）；相机图像传输、LeKiwi、openEuler 与跨机器部署尚未验证。

@@ -20,7 +20,11 @@ from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
-from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
+from embodied_bringup.launch_builders.embodied import (
+    _resolve_development_source_root,
+    generate_embodied_nodes,
+    generate_resident_cli_bridge_action,
+)
 from robot_config.interface_binding import required_interface_ids
 from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
 from robot_config.logger_utils import get_colored_logger
@@ -294,6 +298,11 @@ def _construct_embodied_actions(config, active_control_mode, *, motion_authorize
                 use_sim=use_sim,
             )
         )
+        resident_bridge = generate_resident_cli_bridge_action(config)
+        if resident_bridge is not None:
+            # Started with the Gateway so the first robot-skill call finds a
+            # discovered, warmed bridge (robot_skill_cli README).
+            runtime_actions.append(resident_bridge)
         ready_waiter = _controller_ready_waiter(config, active_control_mode, use_sim, auto_start)
         if ready_waiter is None:
             actions.extend(runtime_actions)

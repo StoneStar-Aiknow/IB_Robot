@@ -1342,3 +1342,60 @@ def test_runtime_named_motion_stays_off_unless_enabled(public_description):
 
     assert "runtime_named_motion_enabled" not in params
     assert "runtime_named_motion_action" not in params
+
+
+def test_resident_cli_bridge_starts_with_the_gateway_for_the_launch_config(monkeypatch):
+    from embodied_bringup.launch_builders import embodied as builder
+
+    monkeypatch.setattr(builder, "_resident_cli_bridge_executable", lambda: "/ws/install/bin/robot-skill-daemon")
+    config = {"_config_path": "/tmp/ibrobot_interfaces_x/robot.yaml", "embodied": {"enabled": True}}
+
+    action = builder.generate_resident_cli_bridge_action(config)
+
+    command = ["".join(getattr(item, "text", str(item)) for item in part) for part in action.cmd]
+    assert command == [
+        "/ws/install/bin/robot-skill-daemon",
+        "--config-path",
+        "/tmp/ibrobot_interfaces_x/robot.yaml",
+        "--replace",
+        "--idle-timeout",
+        "0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "embodied",
+    [{"enabled": False}, {"enabled": True, "resident_cli_bridge": False}],
+)
+def test_resident_cli_bridge_is_skipped_when_embodied_or_the_switch_is_off(monkeypatch, embodied):
+    from embodied_bringup.launch_builders import embodied as builder
+
+    monkeypatch.setattr(builder, "_resident_cli_bridge_executable", lambda: "/ws/install/bin/robot-skill-daemon")
+    assert builder.generate_resident_cli_bridge_action({"_config_path": "/c.yaml", "embodied": embodied}) is None
+
+
+def test_resident_cli_bridge_falls_back_to_on_demand_without_executable_or_config_path(monkeypatch):
+    from embodied_bringup.launch_builders import embodied as builder
+
+    monkeypatch.setattr(builder, "_resident_cli_bridge_executable", lambda: None)
+    config = {"_config_path": "/c.yaml", "embodied": {"enabled": True}}
+    assert builder.generate_resident_cli_bridge_action(config) is None
+    monkeypatch.setattr(builder, "_resident_cli_bridge_executable", lambda: "/ws/install/bin/robot-skill-daemon")
+    assert builder.generate_resident_cli_bridge_action({"embodied": {"enabled": True}}) is None
+
+
+def test_resident_cli_bridge_executable_comes_from_the_robot_skill_cli_prefix(monkeypatch, tmp_path):
+    from embodied_bringup.launch_builders import embodied as builder
+
+    (tmp_path / "bin").mkdir()
+    daemon = tmp_path / "bin" / "robot-skill-daemon"
+    monkeypatch.setattr(builder, "get_package_prefix", lambda package: str(tmp_path))
+    assert builder._resident_cli_bridge_executable() is None
+    daemon.write_text("#!/bin/sh\n")
+    assert builder._resident_cli_bridge_executable() == str(daemon)
+
+    def missing(_package):
+        raise builder.PackageNotFoundError("robot_skill_cli")
+
+    monkeypatch.setattr(builder, "get_package_prefix", missing)
+    assert builder._resident_cli_bridge_executable() is None

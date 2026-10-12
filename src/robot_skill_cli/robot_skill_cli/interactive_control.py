@@ -88,6 +88,17 @@ def _default_view_resolver(snapshot: dict[str, Any], status: dict[str, Any]) -> 
     return capability_view_from_snapshot(snapshot, status)
 
 
+def _has_result(future: Any) -> bool:
+    """Return whether ``future`` completed with a result rather than a transport error."""
+    if future is None or not future.done():
+        return False
+    try:
+        future.result()
+    except Exception:
+        return False
+    return True
+
+
 class InteractiveControlError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
@@ -851,18 +862,22 @@ class InteractiveController:
             with contextlib.suppress(Exception):
                 handle.cancel_goal_async()
         deadline = self._monotonic() + self._rpc_timeout_sec
-        while (result_future is None or not result_future.done()) and self._monotonic() < deadline:
+        while not _has_result(result_future) and self._monotonic() < deadline:
             with contextlib.suppress(Exception):
                 execution = self._bridge.get_execution(
                     request_id=request_id,
                     execution_id=execution_id,
                     timeout_sec=self._rpc(),
                 )
-                if str(execution.get("state", "")) in {"CANCELED", "FAILED", "UNKNOWN"}:
-                    state = (
-                        STOPPED
-                        if execution["state"] == "CANCELED"
-                        else (FAILED if execution["state"] == "FAILED" else UNKNOWN)
+                terminal = {"CANCELED", "FAILED", "UNKNOWN"}
+                if result_future is not None and result_future.done():
+                    # The result future failed with the transport (for example
+                    # the resident bridge went away), so it will never carry
+                    # the outcome; the execution ledger is the only source.
+                    terminal.add("SUCCEEDED")
+                if str(execution.get("state", "")) in terminal:
+                    state = {"CANCELED": STOPPED, "FAILED": FAILED, "SUCCEEDED": SUCCEEDED}.get(
+                        execution["state"], UNKNOWN
                     )
                     return self._record_terminal(
                         task_id,
@@ -872,7 +887,7 @@ class InteractiveController:
                         result=execution,
                     )
             self._sleep(_CANCEL_POLL_INTERVAL_SEC)
-        if result_future is None or not result_future.done():
+        if not _has_result(result_future):
             return self._record_unknown(
                 task_id, deadline_expired=True, failure_detail="program cancel did not converge to a terminal result"
             )

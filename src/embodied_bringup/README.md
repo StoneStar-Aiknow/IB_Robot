@@ -20,6 +20,10 @@ direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备
 - 提供 `embodied_pipeline.launch.py` 公开入口。
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
+- 与 Skill Gateway 一同启动 `robot-skill-daemon`（`robot_skill_cli` 的常驻 ROS bridge），按本次启动的配置
+  快照预先建立并预热到 Gateway 的连接，使启动后的第一次 `robot-skill` 调用不必等待 DDS 发现；
+  `embodied.resident_cli_bridge: false` 关闭，找不到该可执行文件时跳过。daemon 的生命周期由本 launch 管理：它未运行时
+  `robot-skill` 使用进程内 bridge，默认不会自行拉起后台进程。
 - 当 `embodied.entry_mode: agent` 时，额外启动 `ibrobot_agent_node`（自然语言 Agent
   孵化入口），其全部参数来自 `embodied.agent` 配置块；运动仍经同一条 Gateway 链路授权。
 - 按配置启动低优先级 `sound_orientation_node`，但不为其提供运动旁路、排队或自动重试。

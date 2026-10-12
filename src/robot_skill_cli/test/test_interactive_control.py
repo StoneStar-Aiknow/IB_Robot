@@ -1120,3 +1120,42 @@ def test_continue_resume_unknown_refused(rig):
     with pytest.raises(ic.UnknownStopError) as exc_info:
         controller.continue_workflow("继续", resume=True)
     assert exc_info.value.code == "SKILL_CANCEL_TIMEOUT"
+
+
+class _TransportFailedFuture:
+    """A result future that completed with a transport error (lost resident bridge)."""
+
+    def done(self) -> bool:
+        return True
+
+    def result(self):
+        raise RuntimeError("resident ROS bridge disconnected")
+
+
+@pytest.mark.parametrize(("ledger_state", "expected"), [("CANCELED", ic.STOPPED), ("SUCCEEDED", ic.SUCCEEDED)])
+def test_program_stop_converges_through_the_ledger_when_the_result_future_failed(ledger_state, expected):
+    clock = FakeClock()
+    bridge = ProgramBridge(clock)
+    controller = ic.InteractiveController(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 30.0},
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        view_resolver=lambda snapshot, status: _capability_view(),
+    )
+    original_cancel = bridge.cancel_execution
+
+    def cancel(**kwargs):
+        response = original_cancel(**kwargs)
+        bridge.execution_state = ledger_state
+        return response
+
+    bridge.cancel_execution = cancel
+    controller._active_task_id = "task-1"
+
+    outcome = controller._cancel_program_and_converge(
+        None, _TransportFailedFuture(), "task-1", request_id="request-1", execution_id="execution-1"
+    )
+
+    assert outcome["state"] == expected
+    assert [call[0] for call in bridge.calls][:2] == ["cancel_execution", "get_execution"]

@@ -165,6 +165,9 @@ class EmbodiedConfig:
     arm_surface: bool = True
     entry_mode: str = "hermes"
     agent: dict[str, Any] = field(default_factory=dict)
+    # Start robot-skill's resident ROS bridge together with the Skill Gateway
+    # (embodied_bringup); it never affects execution identity or the digest.
+    resident_cli_bridge: bool = True
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"

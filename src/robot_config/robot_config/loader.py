@@ -1594,6 +1594,8 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append("embodied.skill_catalog_source_root is required in development and production modes")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
+        if not isinstance(embodied.get("resident_cli_bridge", True), bool):
+            errors.append("embodied.resident_cli_bridge must be a boolean")
         errors.extend(_validate_visual_game_services(embodied))
         errors.extend(_validate_sound_orientation_config(robot_config))
         try:
@@ -2208,6 +2210,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         arm_surface=data.get("arm_surface", True) is not False,
         entry_mode=data.get("entry_mode", "hermes"),
         agent=dict(data.get("agent", {})),
+        resident_cli_bridge=data.get("resident_cli_bridge", True) is not False,
         debug_tracing=data.get("debug_tracing", True),
         task_input_topic=data.get("task_input_topic", "/voice_command"),
         task_command_topic=data.get("task_command_topic", "/embodied/task_command"),

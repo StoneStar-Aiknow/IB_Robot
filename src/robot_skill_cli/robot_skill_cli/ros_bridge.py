@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import threading
 import time
@@ -1136,7 +1137,21 @@ class RosBridge:
             return False
         return self._wait_future(result_future, timeout_sec)
 
+    def for_caller(self, caller_token: str) -> RosBridge:
+        """Return a view that shares this bridge's ROS node but sends ``caller_token``.
+
+        The caller token is a per-request field, not part of the DDS
+        participant, so callers with different tokens can share one started
+        bridge.  Closing a view does not stop the shared node.
+        """
+        view = copy.copy(self)
+        view._caller_token = caller_token
+        view._shared_from = self
+        return view
+
     def close(self) -> None:
+        if getattr(self, "_shared_from", None) is not None:
+            return
         with contextlib.suppress(Exception):
             if self._executor is not None:
                 self._executor.shutdown()

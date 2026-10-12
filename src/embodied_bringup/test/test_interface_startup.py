@@ -17,6 +17,12 @@ from robot_config.launch_builders import control, execution, perception, recordi
 from robot_config.loader import load_robot_config_dict
 from robot_runtime.interface_description import description_digest, validate_description
 
+DAEMON = "/ws/install/bin/robot-skill-daemon"
+
+
+def _daemon_command(action) -> list[str]:
+    return ["".join(getattr(item, "text", str(item)) for item in part) for part in action.cmd]
+
 
 @pytest.fixture
 def startup(monkeypatch, tmp_path, public_description):
@@ -27,6 +33,9 @@ def startup(monkeypatch, tmp_path, public_description):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "get_package_share_directory", lambda package: str(source / package))
+    from embodied_bringup.launch_builders import embodied as embodied_builder
+
+    monkeypatch.setattr(embodied_builder, "_resident_cli_bridge_executable", lambda: DAEMON)
     profile = {"width": 640, "height": 480, "fps": 30.0, "encoding": "bgr8"}
     descriptor = {
         "schema_version": 1,
@@ -232,7 +241,17 @@ def test_consumers_share_one_live_snapshot(startup, use_sim, authorize_motion):
     assert startup.seen[3][2]["include_visual_games"] is False
     assert startup.seen[3][2]["include_perception"] is False
     assert len(startup.providers) == 1
-    assert all(isinstance(action, Node) for action in returned)
+    # The robot-skill resident bridge is warmed for the same live snapshot.
+    (daemon,) = [action for action in returned if not isinstance(action, Node)]
+    assert _daemon_command(daemon) == [
+        DAEMON,
+        "--config-path",
+        effective["_config_path"],
+        "--replace",
+        "--idle-timeout",
+        "0",
+    ]
+    returned = [action for action in returned if isinstance(action, Node)]
     executables = [action.node_executable for action in returned]
     assert "wait_for_controllers" not in executables and "wait_for_runtime" not in executables
     assert executables.count("perception_service_node") == 1
@@ -347,4 +366,6 @@ def test_legacy_config_keeps_visual_startup_and_controller_barrier(startup, monk
     assert arguments["with_embodied"] == "false" and arguments["with_perception"] == "false"
     assert visual in actions and motion not in actions
     assert actions[-1].node_executable == "wait_for_controllers"
-    assert startup.finish(actions) == [motion]
+    started = startup.finish(actions)
+    assert started[0] is motion and len(started) == 2
+    assert _daemon_command(started[1])[:3] == [DAEMON, "--config-path", str(startup.path)]

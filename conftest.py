@@ -62,11 +62,13 @@ def pytest_configure(config):
         "markers",
         "repo_asset(path): skip unless the workspace-relative path exists",
     )
-    # robot-skill normally hands its ROS transport to a resident per-user
-    # daemon that outlives the command. Under test that daemon would outlive the
+    # robot-skill hands its ROS transport to a running resident per-user daemon
+    # (and starts one when IBROBOT_ROBOT_SKILL_DAEMON=spawn), which outlives the
+    # command. Under test that daemon would outlive the
     # pytest process and the reserved domain, so tests that run the real CLI use
     # the in-process bridge; the daemon is covered by its own unit tests.
-    os.environ.setdefault("IBROBOT_ROBOT_SKILL_DAEMON", "0")
+    # Forced, not defaulted: a developer's exported value must not leak a daemon.
+    os.environ["IBROBOT_ROBOT_SKILL_DAEMON"] = "0"
 
     if "DISABLE_ROS_ISOLATION" in os.environ:
         return

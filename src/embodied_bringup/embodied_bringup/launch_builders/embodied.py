@@ -5,6 +5,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from ament_index_python.packages import PackageNotFoundError, get_package_prefix
+from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
@@ -760,3 +762,44 @@ def generate_embodied_nodes(
             )
         )
     return nodes
+
+
+def _resident_cli_bridge_executable() -> str | None:
+    """Return robot-skill-daemon from the robot_skill_cli install (never another overlay on PATH)."""
+    try:
+        prefix = Path(get_package_prefix("robot_skill_cli"))
+    except PackageNotFoundError:
+        return None
+    executable = prefix / "bin" / "robot-skill-daemon"
+    return str(executable) if executable.is_file() else None
+
+
+def generate_resident_cli_bridge_action(robot_config: dict[str, Any]) -> ExecuteProcess | None:
+    """Start the robot-skill resident ROS bridge together with the Skill Gateway.
+
+    The daemon pre-opens the Gateway bridge for this robot's config (the live
+    interface snapshot when a runtime provider is bound) and keeps the DDS
+    participant discovered, so even the first ``robot-skill`` call after
+    bring-up skips discovery.  This launch is the daemon's owner: when it is
+    disabled or not running, ``robot-skill`` uses an in-process bridge (it
+    starts a daemon itself only with ``IBROBOT_ROBOT_SKILL_DAEMON=spawn``).
+    """
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict) or not embodied.get("enabled", False):
+        return None
+    if embodied.get("resident_cli_bridge", True) is not True:
+        logger.info("robot-skill resident bridge disabled by embodied.resident_cli_bridge")
+        return None
+    config_path = str(robot_config.get("_config_path", "") or "")
+    if not config_path:
+        logger.warning("robot config path unknown; robot-skill will use an in-process bridge")
+        return None
+    executable = _resident_cli_bridge_executable()
+    if executable is None:
+        logger.warning("robot_skill_cli is not installed; robot-skill will use an in-process bridge")
+        return None
+    return ExecuteProcess(
+        cmd=[executable, "--config-path", config_path, "--replace", "--idle-timeout", "0"],
+        name="robot_skill_daemon",
+        output="screen",
+    )

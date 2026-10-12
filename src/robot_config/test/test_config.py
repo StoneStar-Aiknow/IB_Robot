@@ -1668,3 +1668,12 @@ def test_resolve_joint_names_keeps_bare_selector_names():
     }
 
     assert resolve_joint_names_from_config(robot_config) == ["left_arm", "right_arm"]
+
+
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("false", False), (1, False)])
+def test_resident_cli_bridge_switch_must_be_a_boolean(value, valid):
+    from robot_config.loader import _validate_skill_gateway_config
+
+    errors = _validate_skill_gateway_config({"embodied": {"resident_cli_bridge": value}})
+
+    assert ("embodied.resident_cli_bridge must be a boolean" not in errors) is valid

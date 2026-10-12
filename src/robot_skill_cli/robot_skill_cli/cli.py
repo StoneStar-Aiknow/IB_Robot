@@ -198,6 +198,35 @@ def _run_catalog_command(args: argparse.Namespace, context) -> dict:
     raise _CliArgumentError(f"unsupported command: {args.command}")
 
 
+def bridge_kwargs(transport) -> dict[str, Any]:
+    """Return the RosBridge parameters for one Gateway transport, without caller identity.
+
+    ``robot-skill-daemon --config-path`` uses the same function to pre-open the
+    bridge a later ``robot-skill`` call will ask for.
+    """
+    return {
+        "status_service": transport.status_service,
+        "snapshot_service": transport.snapshot_service,
+        "reload_service": transport.reload_service,
+        "validate_skill_service": transport.validate_skill_service,
+        "skill_action": transport.skill_action_name,
+        "primitive_action": transport.primitive_action_name,
+        "validate_primitive_service": transport.validate_primitive_service,
+        "plan_service": transport.plan_service,
+        "validate_plan_service": transport.validate_plan_service,
+        "confirm_plan_service": transport.confirm_plan_service,
+        "execute_plan_action": transport.execute_plan_action,
+        "execute_program_action": transport.execute_program_action,
+        "get_execution_service": transport.get_execution_service,
+        "get_execution_events_service": transport.get_execution_events_service,
+        "cancel_execution_service": transport.cancel_execution_service,
+        "caller_scope": transport.caller_scope,
+        "robot_id": transport.robot_id,
+        "start_visual_game_service": transport.start_visual_game_service,
+        "get_visual_game_result_service": transport.get_visual_game_result_service,
+    }
+
+
 def _create_bridge(transport):
     # The resident bridge keeps one ROS participant alive across invocations so
     # a command does not wait for DDS discovery; it falls back to an
@@ -205,26 +234,8 @@ def _create_bridge(transport):
     from robot_skill_cli.bridge_daemon import ResidentBridge
 
     return ResidentBridge(
-        status_service=transport.status_service,
-        snapshot_service=transport.snapshot_service,
-        reload_service=transport.reload_service,
-        validate_skill_service=transport.validate_skill_service,
-        skill_action=transport.skill_action_name,
-        primitive_action=transport.primitive_action_name,
-        validate_primitive_service=transport.validate_primitive_service,
-        plan_service=transport.plan_service,
-        validate_plan_service=transport.validate_plan_service,
-        confirm_plan_service=transport.confirm_plan_service,
-        execute_plan_action=transport.execute_plan_action,
-        execute_program_action=transport.execute_program_action,
-        get_execution_service=transport.get_execution_service,
-        get_execution_events_service=transport.get_execution_events_service,
-        cancel_execution_service=transport.cancel_execution_service,
-        caller_scope=transport.caller_scope,
-        robot_id=transport.robot_id,
+        **bridge_kwargs(transport),
         caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", ""),
-        start_visual_game_service=transport.start_visual_game_service,
-        get_visual_game_result_service=transport.get_visual_game_result_service,
     )
 
 

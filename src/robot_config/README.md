@@ -1210,6 +1210,9 @@ robot:
     skill_catalog_source_mode: development          # installed | development | production
     skill_catalog_source_root: src/skill_catalog   # required in development/production
     skill_catalog_profile: so101_single_arm         # required when embodied.enabled is true
+    # 随 Skill Gateway 启动 robot-skill 常驻 ROS bridge（robot-skill-daemon），使启动后的
+    # 第一次 robot-skill 调用无需等待 DDS 发现；只接受布尔值，不参与执行身份 digest。
+    resident_cli_bridge: true                       # 默认 true；false 时 robot-skill 使用进程内 bridge
 
     named_targets:
       demo_object:
@@ -1288,6 +1291,8 @@ Gateway 接线一致性校验，不重复 manifest/capability 校验。配置 `e
 时 `skill_required_control_mode` 必须是 `control_modes` 的非空成员；`embodied.enabled: true`
 时 `embodied.skill_catalog_profile` 必须非空。`skill_catalog_source_mode` 只接受
 `installed`、`development`、`production`；后两者要求 `skill_catalog_source_root` 指向有效目录。
+`embodied.resident_cli_bridge` 可选，必须是布尔值（默认 `true`），由 `embodied_bringup` 用于决定是否随
+Skill Gateway 启动 `robot-skill-daemon`，详见 `robot_skill_cli` README「常驻 ROS bridge」。
 
 `robot_config.loader.robot_config_digest` 是传入 `skill_catalog` 编译器的 canonical execution-context
 digest；它刻意排除 `skill_catalog_source_mode` / `skill_catalog_source_root` / `skill_catalog_profile`、
