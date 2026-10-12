@@ -36,9 +36,16 @@ _ib_dds_error() {
 }
 
 _ib_dds_activate() {
-    local mode=$1 name attrs directory action result=0 present value argument json_output=0
+    local mode=$1 name attrs directory action result=0 present value argument json_output=0 repairing_source=0
     shift
     for argument in "$@"; do [[ $argument != --json ]] || json_output=1; done
+    # A saved default can fail on source because its DDS packages are missing.
+    # Permit explicit set to repair that known status-only failure without
+    # treating the tool's own degraded marker as an inherited user record.
+    if [[ $mode == set && ${_ib_dds_owned:-0} != 1 && ${_ib_dds_failed_source:-0} == 1 &&
+          ${IBROBOT_DDS_STATUS-} == degraded && ! -v IBROBOT_DDS_STATE ]]; then
+        repairing_source=1
+    fi
     if [[ $mode == source && ${_ib_dds_owned:-0} != 1 && ! -v IBROBOT_DDS_STATE && ! -v IBROBOT_DDS_STATUS &&
           ! -e $HOME/.config/ibrobot/dds/config.yaml && ! -L $HOME/.config/ibrobot/dds/config.yaml ]]; then
         return 0
@@ -65,7 +72,9 @@ _ib_dds_activate() {
         fi
     done
     if [[ $mode == unset && ${_ib_dds_owned:-0} != 1 &&
-          ( -v IBROBOT_DDS_STATE || -v IBROBOT_DDS_STATUS ) ]]; then
+          ( -v IBROBOT_DDS_STATE || -v IBROBOT_DDS_STATUS ) &&
+          ! ( ${_ib_dds_failed_source:-0} == 1 && ${IBROBOT_DDS_STATUS-} == degraded &&
+             ! -v IBROBOT_DDS_STATE ) ]]; then
         _ib_dds_error "本终端仅继承了 DDS 配置，缺少接管前的环境" "请在原设置终端执行 unset。"
         return 4
     fi
@@ -76,7 +85,14 @@ _ib_dds_activate() {
         return 4
     fi
     directory=$(mktemp -d "${TMPDIR:-/tmp}/ibrobot-dds-shell.XXXXXXXX") || return 6
-    if [[ $mode == unset && ${_ib_dds_owned:-0} == 1 ]]; then
+    if [[ $repairing_source == 1 ]]; then
+        # The degraded marker was written by our failed source, not by the
+        # caller. Do not inherit it as a baseline on a successful repair.
+        unset IBROBOT_DDS_STATUS
+        before_attrs[IBROBOT_DDS_STATUS]=absent
+        before_values[IBROBOT_DDS_STATUS]=''
+    fi
+    if [[ $mode == unset && ( ${_ib_dds_owned:-0} == 1 || ${_ib_dds_failed_source:-0} == 1 ) ]]; then
         : > "$directory/restore-owned"
     fi
     # Capture shell values without exporting/changing them in the parent.
@@ -102,10 +118,14 @@ _ib_dds_activate() {
                 done
             fi
             export IBROBOT_DDS_STATUS=degraded
+            _ib_dds_failed_source=1
             result=0
-        else return "$result"; fi
+        else
+            if [[ $repairing_source == 1 ]]; then export IBROBOT_DDS_STATUS=degraded; fi
+            return "$result"
+        fi
     elif [[ $action == unset ]]; then
-        if [[ ${_ib_dds_owned:-0} == 1 ]]; then
+        if [[ ${_ib_dds_owned:-0} == 1 || ${_ib_dds_failed_source:-0} == 1 ]]; then
             _ib_dds_restore_map _ib_dds_base_values _ib_dds_base_attrs || result=$?
         fi
         if (( result == 0 )); then
@@ -119,7 +139,7 @@ _ib_dds_activate() {
             fi
             return "$result"
         fi
-        unset _ib_dds_owned _ib_dds_home _ib_dds_base_values _ib_dds_base_attrs _ib_dds_last_values _ib_dds_last_attrs
+        unset _ib_dds_owned _ib_dds_failed_source _ib_dds_home _ib_dds_base_values _ib_dds_base_attrs _ib_dds_last_values _ib_dds_last_attrs
         return 0
     elif [[ $action == restore ]]; then
         rm -rf -- "$directory"
@@ -141,6 +161,7 @@ _ib_dds_activate() {
         rm -rf -- "$directory"
         if (( result != 0 )); then
             _ib_dds_restore_map before_values before_attrs || return 4
+            if [[ $repairing_source == 1 ]]; then export IBROBOT_DDS_STATUS=degraded; fi
             return "$result"
         fi
         if [[ ${_ib_dds_owned:-0} != 1 ]]; then
@@ -151,6 +172,7 @@ _ib_dds_activate() {
             done
         fi
     else rm -rf -- "$directory"; return 6; fi
+    unset _ib_dds_failed_source
     _ib_dds_owned=1
     _ib_dds_home=$HOME
     declare -gA _ib_dds_last_values=() _ib_dds_last_attrs=()

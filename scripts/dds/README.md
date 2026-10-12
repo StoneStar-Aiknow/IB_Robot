@@ -23,7 +23,7 @@ dds-config set
 | `dds-config unset --tmp` | 恢复接管前环境 | 保留 |
 | `dds-config show` | 查看当前配置及用户默认配置 | 只读 |
 
-默认配置位于 `$HOME/.config/ibrobot/dds/config.yaml`，同一用户的不同工作区共用。`set` 会在应用前检查 YAML、本机网卡和路由、依赖及生成的配置；输入无效时不会修改当前 DDS 环境。本版没有独立的校验命令。不带 `--config` 的 `set` 打开问答界面；默认配置损坏时，可通过 `--config` 指定有效文件重新设置，或用 `unset` 移除。
+默认配置位于 `$HOME/.config/ibrobot/dds/config.yaml`，同一用户的不同工作区共用。`set` 会在应用前检查 YAML、本机网卡和路由、依赖及生成的配置。若所选后端缺少 DDS/RMW 系统包，同一次 `set` 会先展示缺少的包及模拟安装计划，再询问是否安装（默认是；普通用户可能需要输入 sudo 密码）。已装齐时不调用包管理器。无效输入不会修改当前 DDS 环境或保存的默认配置。本版没有独立的校验命令。不带 `--config` 的 `set` 打开问答界面；默认配置损坏时，可通过 `--config` 指定有效文件重新设置，或用 `unset` 移除。
 
 `set` 和 `unset` 必须通过当前终端注册的 Bash 函数运行；管道、命令替换或子 shell 无法修改父 shell。更新工具后重新 `source .shrc_local` 加载函数，同时会应用已保存的默认配置。
 
@@ -31,14 +31,16 @@ dds-config set
 
 ## 配置格式与适用运行库
 
-本版在 Ubuntu/openEuler 的 `/opt/ros/humble` 下检查以下系统包版本：
+本版在 Ubuntu/openEuler 的 `/opt/ros/humble` 下检查以下包；括号中的版本是开发时的测试样本，不是 `set` 必须使用的固定版本：
 
-| 后端 | DDS 版本 | RMW 包及版本 |
+| 后端 | DDS 包（测试版本） | RMW 包（测试版本） |
 |---|---|---|
-| Fast DDS | 2.6.11 | rmw_fastrtps_cpp 6.2.10 |
-| CycloneDDS | 0.10.5 | rmw_cyclonedds_cpp 1.3.4 |
+| Fast DDS | `ros-humble-fastrtps`（2.6.11） | `ros-humble-rmw-fastrtps-cpp`（6.2.10） |
+| CycloneDDS | `ros-humble-cyclonedds`（0.10.5） | `ros-humble-rmw-cyclonedds-cpp`（1.3.4） |
 
-缺少依赖或版本不在支持范围时会报错；本提交尚不自动安装或升级依赖。不支持任意厂商 XML、自定义运行库 overlay、调优参数或 Zsh 激活。
+缺包时，`set` 让系统 apt/dnf 仓库选择默认版本，只接受新增包的安装计划；若计划要求升级、降级、替换或卸载已装包，则停止，不会为匹配某个样本版本悄悄改动现有 ROS 栈。仓库没有可用包、安装计划不安全或无交互终端时，也会报错。切换 DDS 或执行 `unset` 不会卸载包；再次 `set` 会复用已装包。若包安装成功后其他校验失败，系统包会保留，但新的当前终端 DDS 配置及用户默认不会应用。
+
+就绪检查会核对已装包、RMW 元数据、库来源和本机配置一致性，但不能证明仓库中每个版本都能正确解析生成的 XML 或与远端通信。本版仍不支持任意厂商 XML、自定义运行库 overlay、调优参数或 Zsh 激活。
 
 仅本机发现的最小 YAML 示例：
 
@@ -102,6 +104,14 @@ network:
 如果生成的 XML 或目录损坏，仅重复 `set` 不能修复不可变目录。报错会指出目标目录并给出安全、不覆盖已有文件的移动命令。先停止引用该配置的节点，将目录移到提示的备份位置（若已存在则另取备份名），再重新 `set`。工具不会自动删除或覆盖仍可能被使用的文件；备份保留供检查。单纯缺失或过期的生成目录可直接通过 `set` 准备。
 
 生成目录只包含 `profile.xml` 和完整性清单。更新工具或本机事实改变后，重新 `source .shrc_local` 会在保存的默认配置仍有效且本机检查通过时生成新产物；临时配置可重新 `set --tmp`。不会在 `source` 时安装包、覆盖旧产物或改变已运行进程；本机事实无效时仍会报错并标为未就绪。
+
+### 自备厂商 XML 的临时方式
+
+`dds-config set` 目前不能叠加任意调优参数或用户 XML。不要直接修改生成的 `profile.xml`：文件内容受清单校验，且可能正被已运行进程引用。临时定制时，可以先将它复制为单独的用户文件，再修改副本，并在未受管的终端启动新进程。
+
+如果当前终端已由本工具接管，先运行 `dds-config unset --tmp` 恢复接管前环境，同时保留保存的默认配置；随后按厂商原生方式设置 `RMW_IMPLEMENTATION`，并指定 Fast DDS 的 `FASTRTPS_DEFAULT_PROFILES_FILE` 或 CycloneDDS 的 `CYCLONEDDS_URI`，同时检查其他厂商变量与 XML 是否一致。这是原有 ROS/DDS 的手动配置方式，不是在受管 `set` 基础上叠加参数：`show` 不会把自备 XML 认证为 ready，launch 检查也不校验它。再次 `source .shrc_local` 会应用保存的默认配置。
+
+embodied 入口保留原 Fast DDS UDPv4 覆盖；某些自备 transport XML 可能与它冲突，需要针对具体配置验证。未来若支持参数叠加，必须明确配置优先级，并一起更新校验、生成、状态和 launch 检查，不能仅放开当前的空 `parameters` 字段。
 
 `--json` 返回机器可读结果。`set` / `unset` 的运行错误在 stderr 输出包含 `error`、`code`、`advice` 的 JSON；无效参数沿用命令行标准帮助提示。终端标题遵循 `NO_COLOR` 与 `TERM=dumb`。
 

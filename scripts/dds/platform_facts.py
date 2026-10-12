@@ -14,6 +14,51 @@ class FactsError(ValueError):
     """Dependency, version or interface facts cannot be established."""
 
 
+BACKEND_PACKAGES = {
+    "fastdds": ("fastrtps", "rmw_fastrtps_cpp"),
+    "cyclonedds": ("cyclonedds", "rmw_cyclonedds_cpp"),
+}
+
+
+def package_status(backend):
+    """Return missing selected-backend packages; never change installed versions."""
+    packages, missing = {}, []
+    if backend not in BACKEND_PACKAGES:
+        raise FactsError(f"Unknown backend: {backend}")
+    for name in BACKEND_PACKAGES[backend]:
+        package = "ros-humble-" + name.replace("_", "-")
+        if shutil.which("dpkg-query"):
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f=${db:Status-Status}|${Version}", package],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode and "no packages found matching" not in result.stderr:
+                raise FactsError(f"Cannot inspect {package}: {result.stderr.strip()}")
+            status, _, installed = result.stdout.partition("|")
+            if status != "installed":
+                installed = ""
+        elif shutil.which("rpm"):
+            result = subprocess.run(
+                ["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", package],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode and "is not installed" not in result.stdout + result.stderr:
+                raise FactsError(f"Cannot inspect {package}: {result.stderr.strip()}")
+            installed = result.stdout if result.returncode == 0 else ""
+        else:
+            raise FactsError("Unsupported system package database")
+        installed = installed.strip()
+        if not installed:
+            missing.append(package)
+        else:
+            packages[name] = {"version": installed.split("-", 1)[0].split(":")[-1], "package_version": installed}
+    return packages, missing
+
+
 def resolve_binding(network, interfaces):
     local = network["discovery"] == "local_only"
     candidates = []
@@ -82,35 +127,20 @@ def _hash_stream(stream):
 def runtime_facts(backend):
     """Inspect selected package prefixes and loader files, not actual dlopen.
 
-    Only the current system Humble combinations are admitted. Unknown overlays
-    are diagnostic failures. Native acceptance remains an explicit probe step.
+    Inspect the selected system Humble packages regardless of repository
+    version. Unknown overlays are diagnostic failures; native acceptance
+    remains an explicit probe step.
     """
-    dds, version, rmw, rmw_version, library = (
-        ("fastrtps", "2.6.11", "rmw_fastrtps_cpp", "6.2.10", "libfastrtps.so")
-        if backend == "fastdds"
-        else ("cyclonedds", "0.10.5", "rmw_cyclonedds_cpp", "1.3.4", "libddsc.so")
-    )
+    dds, rmw = BACKEND_PACKAGES[backend]
+    library = "libfastrtps.so" if backend == "fastdds" else "libddsc.so"
     prefixes = [Path(p) for p in os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep) if p]
     if not prefixes or any(not p.is_absolute() for p in prefixes):
         raise FactsError("Load the project .shrc_local before inspecting DDS packages")
-    packages = {}
+    packages, missing = package_status(backend)
+    if missing:
+        raise FactsError("Package is not installed: " + ", ".join(missing))
     system = Path("/opt/ros/humble")
-    for name, expected in ((dds, version), (rmw, rmw_version)):
-        package_name = "ros-humble-" + name.replace("_", "-")
-        if shutil.which("dpkg-query"):
-            command = ["dpkg-query", "-W", "-f=${db:Status-Status}|${Version}", package_name]
-            output = subprocess.run(command, capture_output=True, text=True, check=True, timeout=5).stdout
-            status, _, installed_version = output.partition("|")
-            if status != "installed":
-                raise FactsError(f"Package is not installed: {package_name}")
-        elif shutil.which("rpm"):
-            command = ["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", package_name]
-            installed_version = subprocess.run(command, capture_output=True, text=True, check=True, timeout=5).stdout
-        else:
-            raise FactsError("Unsupported system package database")
-        if not installed_version.startswith(expected + "-"):
-            raise FactsError(f"Unsupported {package_name} version {installed_version}; expected {expected}")
-        packages[name] = {"version": expected, "package_version": installed_version}
+    for name in BACKEND_PACKAGES[backend]:
         # DDS vendor libraries are plain CMake packages on these systems and
         # need not ship package.xml or ament markers. RMW packages do.
         if name == rmw:
@@ -120,7 +150,7 @@ def runtime_facts(backend):
             if selected is None or selected.resolve() != system.resolve():
                 raise FactsError(f"Missing or unsupported RMW overlay: {name}")
             metadata = selected / "share" / name / "package.xml"
-            if ET.parse(metadata).getroot().findtext("version") != expected:
+            if ET.parse(metadata).getroot().findtext("version") != packages[name]["version"]:
                 raise FactsError(f"RMW metadata and installed package version disagree: {name}")
             packages[name]["metadata"] = file_fingerprint(metadata)
     loader_dirs = [Path(p) for p in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
@@ -138,7 +168,7 @@ def runtime_facts(backend):
             raise FactsError(f"Missing or shadowed runtime library: {name}")
         libraries[name] = file_fingerprint(selected)
     return {
-        "backend_version": version,
+        "backend_version": packages[dds]["version"],
         "packages": packages,
         "libraries": libraries,
         "loader_search": [str(p) for p in loader_dirs],

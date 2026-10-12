@@ -7,7 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import configuration, core, dds_config, environment_plan, wizard
+from . import configuration, core, dds_config, dependencies, environment_plan, wizard
+from .platform_facts import FactsError
 
 KEYS = sorted(environment_plan.MANAGED) + ["IBROBOT_DDS_STATE", "IBROBOT_DDS_STATUS"]
 
@@ -109,7 +110,22 @@ def prepare(directory, mode, arguments, values):
             raise configuration.ConfigurationError("无交互终端；请使用 set --config 文件 [--tmp]。", 2) from exc
         source = directory / "input.yaml"
         source.write_bytes(core.json_bytes(selected))
-    plan = configuration.plan(source)
+    if mode == "set":
+        _, selected = configuration.read_configuration(source)
+        try:
+            installed = dependencies.install_if_missing(selected["backend"])
+        except FactsError as exc:
+            raise configuration.ConfigurationError(str(exc), 3) from exc
+    else:
+        installed = False
+    try:
+        plan = configuration.plan(source)
+    except configuration.ConfigurationError as exc:
+        if installed:
+            raise configuration.ConfigurationError(
+                f"{exc}; 系统包已安装但 DDS 配置未应用，请修复后重试 set。", exc.code
+            ) from exc
+        raise
     if mode == "set":
         configuration.prepare(home, plan)
     status = configuration.generation_status(home, plan)
@@ -194,7 +210,7 @@ def main():
     def error(message, code):
         advice = {
             2: "检查配置文件路径和字段；默认配置损坏时可用 set --config 指定有效文件。",
-            3: "检查提示中的运行库或版本要求；缺依赖请使用项目 setup 流程。",
+            3: "检查提示中的系统包、运行库及安装计划；所选 DDS 缺包时 set 会询问是否安装。",
             4: "用 dds-config show 查看冲突；配置状态损坏或 HOME 改变时请在新终端初始化。",
             5: "重新执行 dds-config set 准备配置，临时配置加 --tmp。",
             6: "检查文件权限或并发配置操作，处理后重试。",
