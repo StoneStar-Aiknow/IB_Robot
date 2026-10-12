@@ -277,6 +277,38 @@ def test_program_result_preserves_gateway_terminal_state(state, expected_status)
     assert result.status == expected_status
 
 
+def test_program_terminal_records_gateway_progress_and_exposes_the_ledger():
+    class _ProgressBridge(_ProgramExecutionBridge):
+        def send_program_goal(self, **kwargs):
+            future = super().send_program_goal(**kwargs)
+            future.result().get_result_async().result().result.completed_step_count = 2
+            return future
+
+        def get_execution(self, **kwargs):
+            self.calls.append(("get_execution", kwargs["request_id"]))
+            return {"found": True, "state": "CANCELED", "completed_step_count": 2}
+
+    bridge = _ProgressBridge(state="CANCELED", success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+
+    assert result.detail == {
+        "submitted": True,
+        "execution_id": "execution-1",
+        "state": "CANCELED",
+        "completed_step_count": 2,
+    }
+    assert adapter.lookup_execution("request-wave")["completed_step_count"] == 2
+    assert ("get_execution", "request-wave") in bridge.calls
+
+
 def test_program_transport_failure_after_submission_is_unknown_and_attempts_convergence():
     bridge = _ProgramTransportFailureBridge()
     adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})

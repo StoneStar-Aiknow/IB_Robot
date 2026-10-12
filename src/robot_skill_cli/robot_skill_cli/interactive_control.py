@@ -47,7 +47,7 @@ _CONFIRM_PHRASES = (
     "是的",
     "confirm",
 )
-_CONTINUE_PHRASES = ("继续吧", "继续", "接着来", "go on", "continue")
+CONTINUE_PHRASES = ("继续吧", "继续", "接着来", "go on", "continue")
 
 INTENT_CONFIRM = "confirm"
 INTENT_STOP = "stop"
@@ -132,7 +132,7 @@ def classify(text: str) -> str:
         return INTENT_UNKNOWN
     if normalized in STOP_PHRASES:
         return INTENT_STOP
-    if normalized in _CONTINUE_PHRASES:
+    if normalized in CONTINUE_PHRASES:
         return INTENT_CONTINUE
     if normalized in _CONFIRM_PHRASES:
         return INTENT_CONFIRM

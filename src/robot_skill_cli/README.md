@@ -281,6 +281,12 @@ server-owned continuation admission；客户端不得切片旧步骤并用新 ta
 `CANCELED + SKILL_CANCELLED` 终态后，用户可以提出一个独立的新 continuation 请求；成功、失败和未知状态
 都不授权自动继续。
 
+以上约束的对象是本包的闭环客户端。孵化期 Agent（`ibrobot_agent`）对「继续」的处理是已确认的语义，不属于
+被禁止的切片续跑：Agent 在自己的账本和 Gateway 账本（`GetExecution`）都确认上一条请求为确定的 `CANCELED`
+之后，把原始指令和已完整完成的步数交给规划器，只规划未完成部分，再以新的 request ID 提交一个全新 Program，
+照常经过 presentation 与 Gateway 校验；旧 plan/task 不复用，Gateway 内部不做续跑。详见
+[`ibrobot_agent` README](../ibrobot_agent/README.md)「继续」一节。
+
 `confirm-plan` 与 `execute-plan` 共享可选的 `--timeout-sec`：省略时两端都默认使用 Gateway 当前
 `task_budget_sec`；显式给出时必须为有限正数且不超过 Gateway task budget。`confirm-plan` 把该值以 float32
 冻结进计划，`execute-plan` 必须传入**同一**值（float32 严格相等），否则协调器以 `SKILL_REQUEST_ID_CONFLICT`

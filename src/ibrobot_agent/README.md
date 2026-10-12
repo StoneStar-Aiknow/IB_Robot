@@ -173,6 +173,7 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
   这次停止，不会再作为新指令发给 Agent（否则会占住通道，紧随其后的「继续」被当作忙碌丢弃）。
 - 请求超过 `request_timeout_sec`（默认 180 秒）仍无终态事件时，桥接先发送 stop 再释放通道并播报
   “任务超时，已停止”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
+- 「继续」由 Agent 处理（见下节），桥接只把它当普通话语发送，并播报 Agent 的 `continuation` 事件。
 - `confirm_mode: auto`（默认，仿真与真机相同）：说完自然语言、Agent 规划完成后直接执行，无需人工二次确认。
   exact plan 渲染（TTS 播放完成；未启用 TTS 时写日志）后即回执；TTS 失败不回执，Agent 按
   `presentation_timeout_sec` 失败关闭。执行中说停止词随时中断。
@@ -180,6 +181,29 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
   超时发送 stop。
 - 澄清回答（`needs_clarification`）后的下一句自动携带 `reply_to_request_id`；`session_idle_sec` 后开启新会话。
 - 启用 TTS 时，播报期间向 `/voice_control` 发送 stop/start 暂停 ASR，避免机器人识别自己的声音。
+
+### 「继续」：按账本恢复被中断的任务
+
+Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robot_skill_cli` 的 closed grammar 同一词表，
+仅对整句生效，“继续挥手”是普通指令），然后查两本账：
+
+1. Agent 账本：同一 `session_id`（及 channel/principal/robot_scope）下最近一个非问答、非准入拒绝的请求，
+   从其绑定的 proposal 取原始指令文本。
+2. Gateway 账本：对 `CANCELLED` 的请求按同一 `request_id` 调 `GetExecution`，要求 `CANCELED`、execution_id
+   与 Agent 记录一致，并取 `completed_step_count` 与 `canonical_steps`。
+
+只有确认安全取消（或尚未提交就停止）才继续：Agent 用原始文本和“已完整完成 N/M 步、第 N+1 步需重做”的提示
+**重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划，Gateway 照常
+校验。播报“上次任务完整完成了 N/M 步后停止，现在继续剩余部分”。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
+规划阶段取消、Gateway 查询失败或两本账不一致一律拒绝（`CONTINUE_REFUSED`），不产生任何运动。
+
+这是已确认的语义。`robot_skill_cli` README 与 `ibrobot-control` skill 中“不得切片旧步骤、拒绝 `--resume`”约束的是
+闭环客户端；Agent 侧的「继续」提交的是经过完整校验的新 Program，不在其禁止范围内（两处文档已注明）。
+
+限制：`completed_step_count` 是下界——Gateway 不记录步内进度，被打断的那一步会从头重做，非幂等技能（如
+已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
+`session_idle_sec`（默认 120 秒）无活动后换新会话即无可继续的任务。连续“停—继续—停—继续”时，
+已完成步骤跨请求累计。
 
 仿真端到端验证（ASR 独立运行，经 `/voice_file_input` 注入录音；真机换用 `so101_agent_voice_hardware`）：
 

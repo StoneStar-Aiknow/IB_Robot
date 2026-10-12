@@ -76,8 +76,22 @@ server-owned continuation admission。客户端直接执行
 - 新 Workflow 重新 discover、重新校验 catalog，并使用新 request/task/plan token；
 - `SUCCEEDED`、`FAILED` 和 `UNKNOWN` 均不授权 continuation。
 
-未来只有在 ROS 层提供 continuation planning/admission 和可验证停止证明后，才可实现“跳过完成步骤、
+未来只有在 ROS 层提供 continuation planning/admission 和可验证停止证明后，才可在本客户端实现“跳过完成步骤、
 中断步骤从头执行”的断点语义。
+
+### 5.1 与 Agent 侧「继续」的关系
+
+本节约束的是 Hermes / `robot_skill_cli` 闭环客户端。孵化期 Agent（`ibrobot_agent`，语音与 chat 通道）的「继续」
+是另一条已确认的路径，与本节不冲突：
+
+- 停止证明来自两本服务端账本——Agent 请求账本的终态，以及 Gateway `GetExecution` 返回的 `CANCELED`、一致的
+  execution ID 和 `completed_step_count`；任一不确定即拒绝（`CONTINUE_REFUSED`），不产生运动；
+- 不切片旧 plan：Agent 把原始指令与进度交给规划器重新规划未完成部分，被打断的那一步从头重做；
+- 结果是使用新 request ID 的全新 Program，照常经过 presentation、白名单、Gateway 与 `safety_guard`；
+- Gateway 契约（`ExecuteProgram` / `GetExecution`）不变，Gateway 内部不做续跑。
+
+检视或后续修改时不要把这条路径当作“用新 task ID 绕过 Gateway 的断点续跑”处理。实现与限制见
+[`ibrobot_agent` README](../src/ibrobot_agent/README.md)「继续」一节。
 
 ## 6. CLI 信号与输出
 

@@ -138,7 +138,10 @@ def build_planner_messages(
         "use 1 when the entry has none. Example conversation: "
         '{"kind":"conversation","user_message":"简短回答"}. Example workflow: '
         '{"kind":"workflow","user_message":"准备执行：nod_yes。","summary":"nod_yes",'
-        '"steps":[{"schema_version":1,"skill_name":"nod_yes"}]}.'
+        '"steps":[{"schema_version":1,"skill_name":"nod_yes"}]}. '
+        "If conversation.continuation is present, request.text is an interrupted task the user asked to continue: "
+        "plan only its unfinished part, never repeating conversation.continuation.completed_steps and planning "
+        "conversation.continuation.interrupted_step again, because it may have stopped half way."
     )
     payload = {
         "request": {"text": request.text, "reply_to_request_id": request.reply_to_request_id},
@@ -254,6 +257,12 @@ class RulePlanner:
             )
         if cancel_token.is_set():
             raise PlannerParseError("planning cancelled")
+        continuation = context.get("continuation") if isinstance(context, Mapping) else None
+        if isinstance(continuation, Mapping):
+            # Same contract as the model prompt: drop fully completed steps, redo the interrupted one.
+            steps = steps[int(continuation.get("completed_step_count", 0)) :]
+            if not steps:
+                return PlannerOutcome(kind="conversation", user_message="上一个任务的步骤已经全部完成。")
         summary = "、".join(step.skill_name for step in steps)
         return PlannerOutcome(
             kind="workflow", user_message=f"准备执行：{summary}。", summary=summary, steps=tuple(steps)

@@ -14,6 +14,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
+from ibrobot_agent.continuation import (
+    CONTINUE_REFUSED,
+    ContinuationDecision,
+    decide_continuation,
+    is_continue_request,
+    needs_gateway,
+    select_anchor,
+)
 from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
     AgentEvent,
@@ -348,17 +356,40 @@ class AgentService:
                     event_type="needs_clarification",
                 )
                 return
-            query = read_only_outcome(request.text)
+            # "继续" keeps its own request id and ledger row; only the text the planner sees
+            # becomes the interrupted request's original text, plus how far it got.
+            planned_request = request
+            planner_context: dict[str, Any] = {
+                "messages": self._conversation.context(request),
+                "clarification": clarification,
+            }
+            if request.reply_to_request_id is None and is_continue_request(request.text):
+                decision = self._resolve_continuation(request)
+                if decision.text is None:
+                    self._conversation.append_assistant(request, decision.message)
+                    self._finish_answered(
+                        key,
+                        record.planning_generation,
+                        decision.message,
+                        error_code=decision.error_code,
+                        event_type="continuation_refused" if decision.error_code else "answered",
+                    )
+                    return
+                self._store.record_event(
+                    key,
+                    event_type="continuation_resolved",
+                    state="PLANNING",
+                    detail_json=json.dumps(dict(decision.hint), ensure_ascii=False, sort_keys=True),
+                )
+                self._emit(key, "continuation", "PLANNING", decision.message, detail={"continuation": decision.hint})
+                planned_request = dataclasses.replace(request, text=decision.text)
+                planner_context["continuation"] = dict(decision.hint)
+            query = read_only_outcome(planned_request.text)
             if query is not None:
                 outcome = query
             else:
                 with trace_stage(_trace, "agent.planner", request_id=request.request_id):
-                    outcome = self._planner.plan(
-                        request,
-                        {"messages": self._conversation.context(request), "clarification": clarification},
-                        catalog,
-                        cancel_token,
-                    )
+                    outcome = self._planner.plan(planned_request, planner_context, catalog, cancel_token)
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
@@ -391,7 +422,7 @@ class AgentService:
                 digest=str(status["registry_digest"]),
             )
             proposal = PlanProposal(
-                request=request,
+                request=planned_request,
                 planning_generation=record.planning_generation,
                 catalog_identity=identity,
                 outcome=outcome,
@@ -452,6 +483,32 @@ class AgentService:
                 self._active.pop(key, None)
             with self._queue_condition:
                 self._queued_or_active.discard(key)
+
+    def _resolve_continuation(self, request: AgentRequest) -> ContinuationDecision:
+        """Read both ledgers for "继续"; any read failure refuses instead of guessing."""
+        key = request.to_key()
+        try:
+            anchor = select_anchor(self._store.recent_session_requests(key, session_id=request.session_id))
+            previous_hint = (
+                None if anchor is None else self._store.latest_event_detail(anchor.key, "continuation_resolved")
+            )
+        except Exception:
+            _LOGGER.exception("Could not read the Agent ledger for continuation %s", request.request_id)
+            return ContinuationDecision("无法读取任务账本，不能继续，请重新下达指令。", error_code=CONTINUE_REFUSED)
+        gateway = None
+        gateway_error = ""
+        if needs_gateway(anchor):
+            lookup = getattr(self._execution, "lookup_execution", None)
+            if lookup is None:
+                gateway_error = "Gateway execution ledger is not available"
+            else:
+                try:
+                    gateway = lookup(anchor.key.request_id)
+                except Exception as exc:
+                    gateway_error = _safe_error_message(exc)
+            if gateway_error:
+                _LOGGER.warning("Continuation %s cannot read the Gateway ledger: %s", request.request_id, gateway_error)
+        return decide_continuation(anchor, gateway=gateway, gateway_error=gateway_error, previous_hint=previous_hint)
 
     def _finish_cancel_before_execution(self, key: RequestKey, generation: int) -> None:
         self._store.finish(

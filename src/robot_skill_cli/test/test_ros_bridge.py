@@ -575,3 +575,31 @@ def test_send_skill_goal_exception_maps_to_ros_unavailable(bridge_rig):
         bridge.send_skill_goal(payload, task_id="task-send-error")
 
     assert exc_info.value.code == "ROS_UNAVAILABLE"
+
+
+def test_get_execution_reports_gateway_ledger_progress():
+    from ibrobot_msgs.msg import WorkflowStep
+    from ibrobot_msgs.srv import GetExecution
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._GetExecution = GetExecution
+    bridge._WorkflowStep = WorkflowStep
+    response = GetExecution.Response()
+    response.found = True
+    response.execution_id = "exec-1"
+    response.state = "CANCELED"
+    response.completed_step_count = 1
+    response.stop_requested = True
+    response.canonical_steps = [
+        bridge._workflow_step_message({"schema_version": 1, "skill_name": name}) for name in ("wave_hello", "nod_yes")
+    ]
+    sent = []
+    bridge._call_service = lambda _client, request, **_kwargs: sent.append(request) or response
+
+    execution = bridge.get_execution(request_id="voice-1", execution_id="", timeout_sec=1.0)
+
+    assert sent[0].request_id == "voice-1"
+    assert execution["state"] == "CANCELED"
+    assert execution["completed_step_count"] == 1
+    assert execution["stop_requested"] is True and execution["reconciled"] is False
+    assert [step["skill_name"] for step in execution["canonical_steps"]] == ["wave_hello", "nod_yes"]

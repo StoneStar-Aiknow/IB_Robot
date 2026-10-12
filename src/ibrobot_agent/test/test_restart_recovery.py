@@ -132,3 +132,36 @@ def test_recovery_is_atomic_and_startup_fails_closed_on_write_error(tmp_path, mo
         assert store.get_request(second.to_key()).state == "RUNNING"
     finally:
         store.close()
+
+
+def test_session_history_is_newest_first_and_survives_a_pre_index_ledger(tmp_path):
+    import sqlite3
+
+    from ibrobot_agent.contracts import RequestKey
+
+    path = tmp_path / "requests.sqlite3"
+    store = SQLiteRequestStore(path)
+    for request_id, session_id in (("a", "s1"), ("b", "s2"), ("c", "s1"), ("d", "s1")):
+        store.admit(
+            RequestKey("so101_single_arm", "voice_asr", "local_operator", request_id),
+            input_hash=f"hash-{request_id}",
+            session_id=session_id,
+        )
+    store.close()
+    # A ledger written before the session index existed (same user_version).
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX requests_session_idx")
+
+    reopened = SQLiteRequestStore(path)
+    try:
+        current = RequestKey("so101_single_arm", "voice_asr", "local_operator", "d")
+        history = reopened.recent_session_requests(current, session_id="s1")
+        assert [record.key.request_id for record in history] == ["c", "a"]
+        assert reopened.latest_event_detail(history[0].key, "admit") == {"input_hash": "hash-c"}
+        assert reopened.latest_event_detail(history[0].key, "continuation_resolved") is None
+        with sqlite3.connect(path) as connection:
+            indexes = {row[1] for row in connection.execute("PRAGMA index_list(requests)")}
+            assert "requests_session_idx" in indexes
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        reopened.close()

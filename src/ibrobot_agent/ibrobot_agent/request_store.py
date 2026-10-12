@@ -165,6 +165,39 @@ class SQLiteRequestStore(RequestStore):
                 raise RequestStoreError("REQUEST_NOT_FOUND", "request is not known")
             return self._row_to_record(row)
 
+    def recent_session_requests(self, key: RequestKey, *, session_id: str, limit: int = 8) -> tuple[RequestRecord, ...]:
+        """Newest-first requests of ``key``'s channel identity and session, excluding ``key`` itself."""
+        with self._transaction(read_only=True):
+            rows = self._connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE robot_scope = ? AND channel_id = ? AND principal_id = ? AND session_id = ?
+                  AND request_id <> ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (key.robot_scope, key.channel_id, key.principal_id, session_id, key.request_id, int(limit)),
+            ).fetchall()
+            return tuple(self._row_to_record(row) for row in rows)
+
+    def latest_event_detail(self, key: RequestKey, event_type: str) -> Mapping[str, Any] | None:
+        """Return the decoded ``detail_json`` of the newest ``event_type`` event of ``key``."""
+        with self._transaction(read_only=True):
+            row = self._connection.execute(
+                """
+                SELECT detail_json FROM request_events
+                WHERE robot_scope = ? AND channel_id = ? AND principal_id = ? AND request_id = ?
+                  AND event_type = ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (*_request_key_tuple(key), event_type),
+            ).fetchone()
+        if row is None:
+            return None
+        detail = json.loads(row["detail_json"])
+        return detail if isinstance(detail, Mapping) else None
+
     def is_robot_quarantined(self, robot_scope: str) -> bool:
         with self._transaction(read_only=True):
             row = self._connection.execute(
@@ -528,6 +561,9 @@ class SQLiteRequestStore(RequestStore):
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (robot_scope, channel_id, principal_id, request_id, sequence)
                 );
+                -- Additive and optional: older binaries still open a database that has it.
+                CREATE INDEX IF NOT EXISTS requests_session_idx
+                    ON requests (robot_scope, channel_id, principal_id, session_id);
                 """
             )
             if user_version == 0:

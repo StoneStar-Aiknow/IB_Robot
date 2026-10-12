@@ -815,6 +815,11 @@ class RosBridge:
             "state": str(response.state),
             "error_code": str(response.error_code),
             "message": str(response.message),
+            # Progress as the Gateway ledger recorded it; callers deciding a continuation need it.
+            "completed_step_count": int(response.completed_step_count),
+            "stop_requested": bool(response.stop_requested),
+            "reconciled": bool(response.reconciled),
+            "canonical_steps": [self._workflow_step_dict(step) for step in response.canonical_steps],
         }
 
     def get_execution_events(

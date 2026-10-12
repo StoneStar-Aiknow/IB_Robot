@@ -166,6 +166,15 @@ class _RosBridgeCatalog:
         return view
 
 
+def _program_terminal_detail(result) -> dict:
+    return {
+        "submitted": True,
+        "execution_id": str(result.execution_id),
+        "state": str(result.state),
+        "completed_step_count": int(getattr(result, "completed_step_count", 0)),
+    }
+
+
 class _RosExecutionAdapter:
     """Execute typed Agent plans without duplicating the CLI controller state machine."""
 
@@ -207,6 +216,12 @@ class _RosExecutionAdapter:
         with self._active_lock:
             if self._active_stop_event is not None:
                 self._active_stop_event.set()
+
+    def lookup_execution(self, request_id: str) -> dict:
+        """Gateway ledger view of the Program a past request submitted (same request_id)."""
+        if not hasattr(self._bridge, "get_execution"):
+            raise RuntimeError("Gateway execution ledger is not available")
+        return self._bridge.get_execution(request_id=request_id, execution_id="", timeout_sec=self._rpc_timeout_sec)
 
     def _execute_direct(
         self,
@@ -256,7 +271,11 @@ class _RosExecutionAdapter:
             presentation_callback(presentation)
             if stop_event.is_set():
                 return ExecutionResult(
-                    "cancelled", presentation.task_ref, "SKILL_CANCELLED", "stopped after presentation", {}
+                    "cancelled",
+                    presentation.task_ref,
+                    "SKILL_CANCELLED",
+                    "stopped after presentation",
+                    {"submitted": False},
                 )
             goal_handle = None
             result_future = None
@@ -329,7 +348,7 @@ class _RosExecutionAdapter:
                     presentation.task_ref,
                     str(result.error_code),
                     str(result.message),
-                    {"submitted": True, "execution_id": str(result.execution_id), "state": str(result.state)},
+                    _program_terminal_detail(result),
                 )
             except Exception:
                 return self._cancel_program_and_converge(
@@ -551,7 +570,11 @@ class _RosExecutionAdapter:
                         presentation.task_ref,
                         str(execution.get("error_code", "")),
                         str(execution.get("message", "")),
-                        {"submitted": True, **execution},
+                        {
+                            "submitted": True,
+                            # The step list is already in the proposal; keep the terminal small.
+                            **{name: value for name, value in execution.items() if name != "canonical_steps"},
+                        },
                     )
             if result_future is not None and result_future.done():
                 try:
@@ -570,7 +593,7 @@ class _RosExecutionAdapter:
                     presentation.task_ref,
                     str(result.error_code),
                     str(result.message),
-                    {"submitted": True, "execution_id": str(result.execution_id), "state": str(result.state)},
+                    _program_terminal_detail(result),
                 )
             time.sleep(0.02)
         return self._unknown_result("program cancel did not converge to a terminal state", presentation)
