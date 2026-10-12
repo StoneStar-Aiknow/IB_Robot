@@ -214,13 +214,14 @@ class VoiceASRConfig:
     enabled: bool = False
     active_mode: str = "continuous"
     language: str = "zh"
-    bundle_path: str = "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    bundle_path: str = "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
     deployment: str = "torch_cpu"
     max_recording_duration: float = 10.0
     vad_sensitivity: float = 0.6
     vad_bundle_path: str = "models/silero-vad"
     vad_deployment: str = "torch_cpu"
     realtime_pre_roll_seconds: float = 0.5
+    final_tail_padding_seconds: float = 1.5
     publish_partial: bool = True
     output_topic: str = "/voice_command"
     sample_rate: int = 16000

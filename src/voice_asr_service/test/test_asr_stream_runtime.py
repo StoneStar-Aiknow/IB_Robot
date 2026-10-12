@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from inference_service.unified_runtime import (
     ExecutionContext,
@@ -11,7 +12,7 @@ from inference_service.unified_runtime import (
     ModelRuntimeHandle,
     RuntimeAssembly,
 )
-from voice_asr_service.asr_inference_module import _SherpaStreamingRuntime
+from voice_asr_service.asr_inference_module import _SherpaStreamingRuntime, normalize_transcript
 
 
 class _Result:
@@ -88,3 +89,37 @@ def test_sherpa_stream_is_owned_by_model_runtime_handle() -> None:
     handle.close_stream(stream, context)
     assert handle.open_stream_count == 0
     handle.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("请 打 开 夹 爪", "请打开夹爪"),
+        ("  机 械 臂 回 到 零 位 ", "机械臂回到零位"),
+        ("打 开 open gripper 好 吗", "打开open gripper好吗"),
+        ("open   the gripper", "open the gripper"),
+        ("确认，执 行", "确认，执行"),
+        ("", ""),
+    ],
+)
+def test_normalize_transcript_drops_separators_between_cjk_only(raw, expected):
+    assert normalize_transcript(raw) == expected
+
+
+def test_final_step_flushes_trailing_speech_with_padding_silence() -> None:
+    recognizer = _Recognizer()
+    runtime = _SherpaStreamingRuntime(recognizer, 16000, final_tail_padding_seconds=1.5)
+    stream = runtime.open_stream(ExecutionContext.create("asr-padding"))
+    context = ExecutionContext.create("asr-padding")
+
+    runtime.step(stream, ModelRequest(inputs={"audio": np.ones(512, dtype=np.float32)}), context)
+    assert [len(chunk) for chunk in stream.stream.audio] == [512]
+
+    runtime.step(
+        stream, ModelRequest(inputs={"audio": np.ones(256, dtype=np.float32)}, metadata={"final": True}), context
+    )
+
+    # Padding is appended once, after the last speech and before input_finished.
+    assert [len(chunk) for chunk in stream.stream.audio] == [512, 256, 24000]
+    assert not stream.stream.audio[-1].any()
+    assert stream.stream.finished

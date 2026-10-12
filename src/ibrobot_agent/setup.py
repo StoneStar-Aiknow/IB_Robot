@@ -21,6 +21,7 @@ setup(
         "console_scripts": [
             "ibrobot_agent_node = ibrobot_agent.node:main",
             "ibrobot_agent_chat = ibrobot_agent.chat_tui:main",
+            "ibrobot_agent_voice_bridge = ibrobot_agent.voice_bridge:main",
         ],
     },
 )

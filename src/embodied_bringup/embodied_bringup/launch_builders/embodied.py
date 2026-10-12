@@ -586,6 +586,9 @@ def generate_embodied_nodes(
                 ],
             )
         )
+        voice_bridge = agent_config.get("voice_bridge", {})
+        if isinstance(voice_bridge, dict) and voice_bridge.get("enabled", False):
+            nodes.append(_agent_voice_bridge_node(robot_config, agent_config, voice_bridge))
     if hri_runtime.get("enabled", False):
         nodes.append(
             Node(
@@ -802,4 +805,58 @@ def generate_resident_cli_bridge_action(robot_config: dict[str, Any]) -> Execute
         cmd=[executable, "--config-path", config_path, "--replace", "--idle-timeout", "0"],
         name="robot_skill_daemon",
         output="screen",
+    )
+
+
+def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridge: dict) -> Node:
+    """Voice client of the Agent channel: ASR final text in, Agent request/control out."""
+    voice_asr = robot_config.get("voice_asr", {})
+    voice_tts = robot_config.get("voice_tts", {})
+    voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
+    voice_tts = voice_tts if isinstance(voice_tts, dict) else {}
+    # Only forward what the robot YAML actually sets: every default lives once, in
+    # ibrobot_agent.voice_bridge.VoiceBridgeConfig / the node's declare_parameter calls.
+    params: dict[str, object] = {
+        # The bridge listens wherever the ASR node publishes; one source of truth.
+        "input_topic": voice_bridge.get("input_topic", voice_asr.get("output_topic", "/voice_command")),
+        "request_topic": agent_config.get("request_topic", "/agent/request"),
+        "response_topic": agent_config.get("response_topic", "/agent/response"),
+        "event_topic": agent_config.get("event_topic", "/agent/event"),
+        "control_topic": agent_config.get("control_topic", "/agent/control"),
+        "channel_id": agent_config.get("channel_id", "agent_incubation"),
+        "principal_id": agent_config.get("principal_id", "local_operator"),
+        "robot_scope": str(robot_config.get("name", "unknown")),
+        # voice_tts owns its service names; the bridge only needs to know whether to speak.
+        "tts_enabled": bool(voice_bridge.get("tts_enabled", voice_tts.get("enabled", False))),
+        "tts_synthesis_service": voice_tts.get("service_name", "/voice_tts/synthesize"),
+        "tts_playback_service": voice_tts.get("playback_service_name", "/voice_tts/play"),
+    }
+    for field_name in ("asr_status_topic", "asr_control_topic", "partial_topic", "confirm_mode", "busy_message"):
+        if field_name in voice_bridge:
+            params[field_name] = str(voice_bridge[field_name])
+    for field_name in (
+        "confirm_timeout_sec",
+        "session_idle_sec",
+        "request_timeout_sec",
+        "tts_timeout_sec",
+        "resume_settle_sec",
+    ):
+        if field_name in voice_bridge:
+            params[field_name] = float(voice_bridge[field_name])
+    if "min_text_chars" in voice_bridge:
+        params["min_text_chars"] = int(voice_bridge["min_text_chars"])
+    for field_name in ("speak_replies", "mute_asr_during_tts"):
+        if field_name in voice_bridge:
+            params[field_name] = bool(voice_bridge[field_name])
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+        if field_name in voice_bridge:
+            params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)
+    if "text_corrections" in voice_bridge:
+        params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
+    return Node(
+        package="ibrobot_agent",
+        executable="ibrobot_agent_voice_bridge",
+        name="agent_voice_bridge",
+        output="screen",
+        parameters=[params],
     )

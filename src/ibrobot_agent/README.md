@@ -16,6 +16,7 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
 | 节点 / 入口 | 主要职责 |
 | --- | --- |
 | `ibrobot_agent_node` | Agent 组合根：transport 与生命周期；ROS-free 的 `AgentService` 通过注入的 port 工作 |
+| `agent_voice_bridge`（`ibrobot_agent_voice_bridge`） | 语音通道客户端：`/voice_command` 最终文本 → `/agent/request`；停止词 → `/agent/control stop`；展示 exact plan 后回执；可选 TTS 播报回复 |
 | `chat_tui.py`（`ros2 run ibrobot_agent ibrobot_agent_chat` / `scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路；`--channel-id`/`--principal-id`/`--robot-scope` 覆盖会话身份以匹配 profile 的 `embodied.agent` 配置 |
 
 ## 调用链
@@ -144,9 +145,60 @@ canonical `presentation_digest` 与一次性 `receipt_token`。TUI 在自己的�
 `execution_mode` 都按此路径 fail closed。
 `/agent/control` 是受信本地客户端边界，回执是协议证据而非对任意恶意 ROS peer 的认证。
 
+## 语音入口（voice bridge）
+
+`embodied.agent.voice_bridge.enabled: true` 时，`embodied_bringup` 在 Agent 节点旁启动
+`agent_voice_bridge`。它与 `chat_tui` 一样只是 `/agent/*` 契约的客户端，不绕过 Agent 的规划、白名单
+与 Gateway；事件身份按 profile 的 `channel_id`/`principal_id`/`robot_scope` 过滤，语音 profile 应使用
+独立的 `channel_id`（如 `voice_asr`）。
+
+```text
+voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(JSON)--> ibrobot_agent_node
+               --/voice_partial(String)-->    |  停止关键词 ----------/agent/control stop
+                                              |  presentation --(播报/日志)--> /agent/control presentation_rendered
+                                              '<-- /agent/event: 终态与回答 --(TTS 可选)--> 用户
+```
+
+- `text_corrections` 先把 ASR 偏好的同音写法纠正为领域词（如“家长”→“夹爪”），再做停止词/确认词匹配与请求封装；
+  纠正前后的文本都会写入日志。替换是**整句范围的字面替换**：配置的误识写法若在日常对话中也会出现
+  （例如真的谈到“家长”），该句同样会被改写。只配置在本机器人语境下不会歧义的写法。
+- 启用 TTS 时，播报期间（以及恢复后 `resume_settle_sec`，默认 1 秒内）收到的识别结果会被丢弃，
+  避免 ASR 把机器人自己的声音或被打断的半句话当成新指令、进而反复触发播报。
+- 同一通道同时只跟踪一个请求：执行中的新话语被丢弃并提示“请稍等”，停止词始终生效。
+- 停止词是**关键词匹配**：句中出现 `stop_phrases` 任一词（默认 停止/别动/停/stop/halt）即中断，例如
+  “帮我停一下”“别动了谢谢”。代价是“不停地挥手”这类句子在执行中也会触发停止；没有可中断的请求时，
+  只含关键词的普通句子仍作为指令发送。
+- 实时中断：桥接同时订阅 ASR 的 `/voice_partial`（`partial_topic`，置空关闭），部分识别结果一出现停止
+  关键词就发送 stop，不必等 VAD 静音与尾部补零；同一句话只由 partial 发送一次 stop，这句话的最终文本归入
+  这次停止，不会再作为新指令发给 Agent（否则会占住通道，紧随其后的「继续」被当作忙碌丢弃）。
+- 请求超过 `request_timeout_sec`（默认 180 秒）仍无终态事件时，桥接先发送 stop 再释放通道并播报
+  “任务超时，已停止”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
+- `confirm_mode: auto`（默认，仿真与真机相同）：说完自然语言、Agent 规划完成后直接执行，无需人工二次确认。
+  exact plan 渲染（TTS 播放完成；未启用 TTS 时写日志）后即回执；TTS 失败不回执，Agent 按
+  `presentation_timeout_sec` 失败关闭。执行中说停止词随时中断。
+- `confirm_mode: voice_confirm`（可选）：播报计划后等待确认词才回执；取消词、停止词或 `confirm_timeout_sec`
+  超时发送 stop。
+- 澄清回答（`needs_clarification`）后的下一句自动携带 `reply_to_request_id`；`session_idle_sec` 后开启新会话。
+- 启用 TTS 时，播报期间向 `/voice_control` 发送 stop/start 暂停 ASR，避免机器人识别自己的声音。
+
+仿真端到端验证（ASR 独立运行，经 `/voice_file_input` 注入录音；真机换用 `so101_agent_voice_hardware`）：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=87 && \
+ros2 launch embodied_bringup embodied_pipeline.launch.py robot_config:=so101_single_arm_agent_voice_gazebo \
+  use_sim:=true control_mode:=moveit_planning entry_mode:=agent authorize_motion:=true
+# 另一个终端：使用默认 ASR 模型（X-ASR），手动模式只处理注入的文件
+ros2 run voice_asr_service voice_asr_node --ros-args -p active_mode:=manual
+ros2 topic echo /agent/event &
+ros2 topic pub --once /voice_file_input std_msgs/String "{data: /abs/path/nod.wav}"
+```
+
+`/agent/event` 依次出现 `proposal_ready` → `presentation` → `presentation_rendered` → `terminal`（`SUCCEEDED`）即链路打通。
+
 ## 已知限制
 
 - 孵化期包（`incubation: true` 强制标记），String JSON topic 契约尚未类型化。
 - 会话记忆为有界滚动窗口，不做长期记忆检索。
-- `chat_tui` 为单操作员本地终端，不提供多通道并发接入。
+- `chat_tui` 为单操作员本地终端，不提供多通道并发接入；Agent 节点一次只绑定一个 `channel_id`，
+  语音与终端不能同时作为同一 Agent 的入口。
 - UNKNOWN 恢复采用保守隔离，不自动重放或推断旧任务终态；需操作员依据保留的 TaskRef 完成核实。

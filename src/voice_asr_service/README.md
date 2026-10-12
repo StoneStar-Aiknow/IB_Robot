@@ -242,7 +242,7 @@ Speech Direction 固定订阅 `/audio/capture_stamped`，不直接打开 ALSA，
 ```bash
 cd /path/to/IB_Robot
 source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run voice_asr_service voice_asr_node --ros-args \
-  -p bundle_path:=models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23 \
+  -p bundle_path:=models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05 \
   -p deployment:=torch_cpu
 ```
 
@@ -341,12 +341,83 @@ ASR bundle 通过打包器显式生成，产物是 schema-v3 manifest + 声明�
 ```bash
 # 流式 transducer（默认）
 python3 -m voice_asr_service.package_sherpa_asr_bundle \
-  --bundle-root models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23 \
+  --bundle-root models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05 \
   --tokens <tokens.txt> --encoder <encoder.onnx> --decoder <decoder.onnx> --joiner <joiner.onnx>
 
 # 流式 Paraformer：把 --joiner 换成 --paraformer
 # 离线：--offline --model <model.onnx>
 ```
+
+默认 ASR 模型是 sherpa-onnx `asr-models` 发布页的
+`sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05`（X-ASR，Apache-2.0，
+480 ms 分块，169 MB）。在 43 条句子（动作指令 / 日常对话 / 中英混合）× 8 种发音（含方言口音与快语速）、
+干净与 10 dB 噪声各 342 条的流式评测中，各候选的 CER / 整句正确率如下：
+
+| 模型 | 干净 | 噪声 | 中英混合（干净） | CPU RTF |
+| --- | --- | --- | --- | --- |
+| x-asr-480ms int8（默认） | 6.8% / 80% | 8.3% / 79% | 7.7% / 76% | 0.048 |
+| streaming-zipformer-zh-14M（原默认） | 21.9% / 51% | 27.5% / 39% | 45.4% / 29% | 0.013 |
+| streaming-zipformer-multi-zh-hans int8 | 16.7% / 61% | 17.6% / 61% | 41.8% / 24% | 0.041 |
+
+原 14M 模型（25 MB、RTF 约为 X-ASR 的 1/4）仍可通过 `voice_asr.bundle_path` 显式选用，适合算力受限的板端。
+X-ASR 可直接运行在现有 sherpa-onnx 1.10.x 上；`sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30`
+等 2025 版模型需要更新的 sherpa-onnx（1.10.46 上 CER 约 70%）。打包示例：
+
+```bash
+N=sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$N.tar.bz2
+mkdir -p models/_work/asr && tar xjf $N.tar.bz2 -C models/_work/asr
+python3 -m voice_asr_service.package_sherpa_asr_bundle --bundle-root models/voice_asr/$N \
+  --tokens models/_work/asr/$N/tokens.txt --encoder models/_work/asr/$N/encoder.int8.onnx \
+  --decoder models/_work/asr/$N/decoder.onnx --joiner models/_work/asr/$N/joiner.int8.onnx
+```
+
+该模型以 480 ms 为块解码，需保持 `final_tail_padding_seconds >= 1.5`，否则“确认”“招呼”等句尾字会丢失；
+它输出的汉字间分隔空格由节点统一去除。同音的少见领域词（如“夹爪”常被识别为“家找/家长”）无法靠热词纠正，
+由语音入口的 `embodied.agent.voice_bridge.text_corrections` 显式映射。
+
+### Ascend 310P NPU deployment（`ascend_310p`）
+
+sherpa-onnx 没有流式 transducer 的 Ascend 后端，因此 `ascend_310p` deployment 是**组合部署**：
+encoder 编译为 OM 跑在 310P NPU 上，decoder/joiner（约 21 MB）与 greedy search、fbank 留在 Host CPU。
+`transducer_ascend.py` 复现 sherpa 的流水线（相同 fbank 契约、`decode_chunk_len` 推进、贪心搜索），
+encoder 的 cached state 用 `AclModel.prepare_dataset_banks` 双 bank 常驻 Device，与 `SileroVadAclRunner`
+的 state 常驻方式一致，每步只回传 `encoder_out`。节点的 CANN 环境由 `robot_config` 的 voice_asr launch
+builder 按 deployment 自动注入，不依赖调用者是否 source `set_env.sh`。
+
+ATC 不支持 sherpa int8 图里的 `MatMulInteger`，也要求静态 shape，故需先导出静态 float encoder：
+
+```bash
+# 1. 主机侧：int8 -> float MatMul + 静态化（权重反量化，激活仍为 float，精度不低于 int8 图）
+N=sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+python3 -m voice_asr_service.export_sherpa_transducer_ascend \
+  --encoder models/_work/asr/$N/encoder.int8.onnx \
+  --output models/_work/$N/ascend/encoder.static.onnx
+
+# 2. 板端（CANN 已安装）：编译 OM，fp16 精度模式
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+atc --framework=5 --model=encoder.static.onnx --output=encoder_fp16 \
+    --soc_version=Ascend310P1 --precision_mode_v2=fp16
+
+# 3. 打包：在 CPU/CUDA deployment 之外追加 ascend_310p
+python3 -m voice_asr_service.package_sherpa_asr_bundle --bundle-root models/voice_asr/$N \
+  --tokens ... --encoder ... --decoder ... --joiner ... \
+  --ascend-encoder-om <encoder_fp16_linux_aarch64.om> \
+  --ascend-encoder-onnx models/_work/$N/ascend/encoder.static.onnx
+```
+
+`--precision_mode_v2=origin` 在 310P 上会因 `Conv2D` 不支持 FP32 输入而编译失败，必须用 `fp16`。
+中间产物（静态 ONNX、OM）属于转换工作目录，放在 `models/_work/<bundle>/ascend/`，不进入发布 bundle；
+bundle 内只保留 manifest 引用的 `artifacts/encoder_ascend/<om>`。
+310P 实测（43 句 × 8 发音 × 干净/噪声，共 684 条，模块级 `recognize_file`）：
+
+| deployment | 干净 CER | 噪声 CER | RTF |
+| --- | --- | --- | --- |
+| `ascend_310p`（encoder OM 在 NPU） | 6.92% | 8.24% | 0.098 |
+| `torch_cpu`（同一 bundle 的 int8 ONNX） | 6.8% | 8.4% | 0.408 |
+
+NPU 与 CPU 精度等价（差异在 ±0.2 个百分点内），RTF 由 0.41 降到 0.10，把 16 核 aarch64 CPU
+从 ASR 解码中解放出来供导航/感知使用。
 
 打包器会同时生成 `torch_cpu` 与 `torch_cuda` 两个 deployment（`--skip-cuda` 可只保留 CPU），
 并对每个 deployment 执行 `load_inference_manifest()` 自校验。
@@ -460,7 +531,7 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | --- | --- | --- |
 | `~/start_recognition` | `std_srvs/srv/Empty` | 开始一次实时监听 |
 | `~/stop_recognition` | `std_srvs/srv/Empty` | 停止当前实时监听 |
-| `~/set_hotwords` | `ibrobot_msgs/srv/SetHotwords` | 更新热词增强配置 |
+| `~/set_hotwords` | `ibrobot_msgs/srv/SetHotwords` | 更新热词增强配置（当前 sherpa-onnx 流式识别器无运行时热词接口，调用不改变识别结果） |
 | `~/recognize_file` | `ibrobot_msgs/srv/RecognizeFile` | 识别一个音频文件 |
 
 ### `ibrobot_msgs/srv/SetHotwords`
@@ -502,6 +573,7 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | --- | --- | --- |
 | `vad_sensitivity` | `0.6` | VAD 灵敏度 |
 | `realtime_pre_roll_seconds` | `0.5` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
+| `final_tail_padding_seconds` | `1.5` | 最终解码前补入的静音时长，冲刷分块编码器尚未输出的末尾语音，避免句尾丢字（480 ms 分块模型需 ≥ 1.5 s） |
 | `sample_rate` | `16000` | 当前完整 Voice ASR 链路仅支持 16000 Hz；其他值属于无效配置，节点会拒绝初始化 |
 | `chunk_size` | `512` | 当前完整 Voice ASR 链路仅支持 512 样本帧；其他值属于无效配置，节点会拒绝初始化 |
 | `buffer_seconds` | `5.0` | 音频环形缓冲区时长 |
@@ -565,7 +637,7 @@ robot:
     enabled: false
     active_mode: continuous
     language: zh
-    bundle_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
+    bundle_path: models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
     deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6

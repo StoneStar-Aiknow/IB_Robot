@@ -175,6 +175,7 @@ class VoiceASRNode(Node):
         self.declare_parameter("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"])
         self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
         self.declare_parameter("realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"])
+        self.declare_parameter("final_tail_padding_seconds", VOICE_ASR_DEFAULTS["final_tail_padding_seconds"])
         self.declare_parameter("audio_topic", "/audio/capture_stamped")
         self.declare_parameter("audio_channels", 6)
         self.declare_parameter("audio_input_channel", VOICE_ASR_DEFAULTS["audio_input_channel"])
@@ -195,6 +196,7 @@ class VoiceASRNode(Node):
         self._chunk_size = self.get_parameter("chunk_size").value
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
         self._realtime_pre_roll_seconds = max(0.0, float(self.get_parameter("realtime_pre_roll_seconds").value))
+        self._final_tail_padding_seconds = max(0.0, float(self.get_parameter("final_tail_padding_seconds").value))
         self._audio_topic = str(self.get_parameter("audio_topic").value)
         self._audio_channels = int(self.get_parameter("audio_channels").value)
         self._audio_input_channel = int(self.get_parameter("audio_input_channel").value)
@@ -244,6 +246,7 @@ class VoiceASRNode(Node):
                 bundle_path=self._bundle_path,
                 deployment=self._deployment,
                 language=self._language,
+                final_tail_padding_seconds=self._final_tail_padding_seconds,
             )
             # ASR 模型采样率只有初始化 recognizer 后才能确定；必须与音频输入一致。
             self._validate_asr_audio_sample_rate()

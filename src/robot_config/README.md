@@ -1271,12 +1271,23 @@ robot:
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
 | `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
 | `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+| `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
+| `agent.voice_bridge.confirm_mode` | `auto`（默认：规划完成即执行，无需二次确认）或 `voice_confirm`（可选：需说确认词才执行） |
+| `agent.voice_bridge.input_topic` / `asr_status_topic` / `asr_control_topic` | 绝对 topic；`input_topic` 默认跟随 `voice_asr.output_topic` |
+| `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空 |
+| `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
+| `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
+| `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |
+| `agent.voice_bridge.resume_settle_sec` | 正数，默认 1 秒；TTS 播报结束恢复 ASR 后的静默窗口，期间丢弃识别结果 |
+| `agent.voice_bridge.tts_enabled` / `speak_replies` / `mute_asr_during_tts` | 布尔；`tts_enabled` 默认跟随 `voice_tts.enabled` |
 
 仓库自带 SO-101 孵化 profile：`so101_agent_manual`（真机手动无运动）、
 `so101_agent_manual_hardware`（真机手动执行）、`so101_single_arm_agent_test`
 （rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
 `so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
-（真机停止验证）。运行时行为与安全边界见 `ibrobot_agent` README。
+（真机停止验证）、`so101_single_arm_agent_voice_gazebo`（仿真语音入口：ASR → voice bridge → Agent）、
+`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）。
+运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约
 

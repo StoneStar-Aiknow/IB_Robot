@@ -104,7 +104,7 @@ robot:
     enabled: false
     active_mode: continuous
     language: zh
-    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    bundle_path: "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
     deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6

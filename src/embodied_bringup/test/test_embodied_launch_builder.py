@@ -575,6 +575,45 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
     assert params["presentation_timeout_sec"] == 12.0
 
 
+def _voice_bridge_nodes(enabled: bool, **voice_bridge):
+    agent = {
+        "enabled": True,
+        "incubation": True,
+        "execution_enabled": True,
+        "channel_id": "voice_asr",
+        "test_allowlist": ["nod_yes"],
+        "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+        "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+        "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+        "voice_bridge": {"enabled": enabled, **voice_bridge},
+    }
+    robot = {
+        "name": "so101_single_arm",
+        "voice_asr": {"enabled": True, "output_topic": "/asr/final_text"},
+        "embodied": {"enabled": True, "entry_mode": "agent", "agent": agent},
+    }
+    nodes = generate_embodied_nodes(robot, active_control_mode="moveit_planning", use_sim=False)
+    return {vars(node)["_Node__node_name"]: node for node in nodes}
+
+
+def test_agent_voice_bridge_follows_agent_channel_and_executes_without_second_confirmation():
+    assert "agent_voice_bridge" not in _voice_bridge_nodes(enabled=False)
+
+    bridge = _voice_bridge_nodes(enabled=True)["agent_voice_bridge"]
+    params = _normalize_launch_param_mapping(vars(bridge)["_Node__parameters"][0])
+    assert _decode_launch_string(params["input_topic"]) == "/asr/final_text"
+    assert _decode_launch_string(params["channel_id"]) == "voice_asr"
+    assert _decode_launch_string(params["request_topic"]) == "/agent/request"
+    # Behaviour defaults live once, in the node; launch only forwards what the YAML sets.
+    assert "confirm_mode" not in params and "stop_phrases_json" not in params
+
+    opted_in = _voice_bridge_nodes(enabled=True, confirm_mode="voice_confirm", stop_phrases=["停"])
+    params = _normalize_launch_param_mapping(vars(opted_in["agent_voice_bridge"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["confirm_mode"]) == "voice_confirm"
+    # Launch serializes a non-ASCII JSON parameter as an escaped JSON string, hence the double decode.
+    assert json.loads(json.loads(params["stop_phrases_json"].strip())) == ["停"]
+
+
 def test_non_moveit_game_launches_only_gateway_and_perception():
     robot_config = {
         "name": "test_robot",

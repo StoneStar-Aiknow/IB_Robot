@@ -198,6 +198,7 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
             "vad_bundle_path": "models/silero-vad",
             "vad_deployment": "torch_cpu",
             "realtime_pre_roll_seconds": 0.5,
+            "final_tail_padding_seconds": 1.5,
             "publish_partial": True,
             "output_topic": "/voice_command",
             "sample_rate": 16000,

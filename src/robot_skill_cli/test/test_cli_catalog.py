@@ -128,7 +128,7 @@ def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     config = load_robot_config_dict(path, nav_stage=stage)
     voice = load_voice_asr_config(config["voice_asr"])
     assert voice.enabled
-    assert voice.bundle_path.endswith("sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
+    assert voice.bundle_path.endswith("sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05")
     assert voice.deployment == "torch_cpu"
     assert voice.vad_input_channel == 1
 

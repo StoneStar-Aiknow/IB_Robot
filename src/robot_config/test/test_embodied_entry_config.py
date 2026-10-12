@@ -28,6 +28,42 @@ def test_agent_presentation_timeout_is_bounded(timeout):
     assert any("presentation_timeout_sec" in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    ("voice_bridge", "fragment"),
+    [
+        ({"confirm_mode": "maybe"}, "confirm_mode"),
+        ({"input_topic": "voice_command"}, "input_topic"),
+        ({"stop_phrases": []}, "stop_phrases must not be empty"),
+        ({"text_corrections": {"夹爪": []}}, "text_corrections"),
+        ({"resume_settle_sec": 0}, "resume_settle_sec"),
+    ],
+)
+def test_agent_voice_bridge_config_is_validated(voice_bridge, fragment):
+    errors = validate_agent_entry_config({"entry_mode": "agent", "agent": {"voice_bridge": voice_bridge}})
+    assert any(fragment in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("voice_profile", "text_profile"),
+    [
+        ("so101_single_arm_agent_voice_gazebo", "so101_single_arm_agent_gazebo"),
+        ("so101_agent_voice_hardware", "so101_agent_manual_hardware"),
+    ],
+)
+def test_agent_voice_profiles_only_add_a_voice_channel_to_their_text_profile(voice_profile, text_profile):
+    robots = Path(__file__).parent.parent / "config" / "robots"
+    agent = load_robot_config_dict(robots / f"{voice_profile}.yaml", defer_interface_binding=True)["embodied"]
+    text = load_robot_config_dict(robots / f"{text_profile}.yaml", defer_interface_binding=True)["embodied"]
+
+    assert validate_agent_entry_config(agent) == []
+    assert agent["agent"]["channel_id"] == "voice_asr"
+    assert agent["agent"]["voice_bridge"]["enabled"] is True
+    # Spoken natural language executes as soon as the Agent has planned it.
+    assert agent["agent"]["voice_bridge"].get("confirm_mode", "auto") == "auto"
+    assert agent["agent"]["test_allowlist"] == text["agent"]["test_allowlist"]
+    assert agent["agent"]["planner"] == text["agent"]["planner"]
+
+
 def _snapshot(config_path: Path):
     return compile_local_snapshot(load_robot_config_dict(config_path), config_path)
 
@@ -67,6 +103,8 @@ def test_default_loader_uses_robot_config_environment_path(monkeypatch):
         "so101_agent_manual_hardware",
         "so101_single_arm_agent_test",
         "so101_single_arm_agent_gazebo",
+        "so101_single_arm_agent_voice_gazebo",
+        "so101_agent_voice_hardware",
         "so101_single_arm_agent_hardware",
         "so101_single_arm_agent_hardware_stop",
     ],

@@ -558,7 +558,10 @@ def test_load_single_arm_config():
     assert len(config.peripherals) == 3
     assert config.voice_asr.enabled is False
     assert config.voice_asr.output_topic == "/voice_command"
-    assert config.voice_asr.bundle_path == "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    assert (
+        config.voice_asr.bundle_path
+        == "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
+    )
     assert config.voice_asr.realtime_pre_roll_seconds == 0.5
     assert not Path(config.voice_asr.bundle_path).is_absolute()
     assert config.voice_asr.exit_on_init_failure is True
@@ -1174,6 +1177,7 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.vad_bundle_path == VOICE_ASR_DEFAULTS["vad_bundle_path"]
     assert config_defaults.vad_deployment == VOICE_ASR_DEFAULTS["vad_deployment"]
     assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+    assert config_defaults.final_tail_padding_seconds == VOICE_ASR_DEFAULTS["final_tail_padding_seconds"]
     assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
     assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
     assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]

@@ -1,0 +1,27 @@
+# SO-101 voice-driven Agent on real hardware. ASR final text is bridged into
+# the Agent request contract by agent_voice_bridge; the Kimi Planner, Gateway,
+# safety guard and skill executor are unchanged from so101_agent_manual_hardware.
+#
+# A spoken natural-language request executes as soon as the Agent has planned
+# it (confirm_mode: auto); stop phrases always interrupt. Set confirm_mode:
+# voice_confirm to require an extra spoken confirmation. The skill allowlist is
+# inherited unchanged from so101_agent_manual_hardware, so the voice channel can
+# run exactly what the text channel can. audio_io/voice_asr stay off here; run voice_asr_node beside
+# the pipeline (microphone via robot.launch, or /voice_file_input for tests).
+robot:
+  name: so101_single_arm
+  base_config: so101_agent_manual_hardware.yaml
+  embodied:
+    agent:
+      channel_id: voice_asr
+      ledger_path: /tmp/ibrobot-agent-so101-voice-hardware/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-voice-hardware/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-voice-hardware/agent.lock
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_enabled: false
+        # Homophones the ASR model prefers over the rare domain terms.
+        text_corrections:
+          夹爪: [家长, 家找, 驾照, 家爪, 夹找]
+          零位: [灵位, 临位]

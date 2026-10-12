@@ -1,5 +1,6 @@
 """Voice ASR launch builder for robot_config."""
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,37 @@ def validate_voice_asr_model_config(
     return errors
 
 
+def _ascend_node_environment(bundle_path: str, deployment: str) -> dict[str, str]:
+    """CANN runtime paths for deployments with an Ascend role (same contract as speech_direction).
+
+    The node must not depend on whether the caller sourced set_env.sh; non-Ascend deployments get
+    no extra environment.
+    """
+    from inference_manifest import load_inference_manifest
+
+    try:
+        validated = load_inference_manifest(bundle_path, deployment)
+    except Exception:  # validate_voice_asr_model_config already reports an unusable bundle
+        return {}
+    profiles = validated.deployment.role_runtime_profiles or {}
+    if not any(profile.backend == "ascend" for profile in profiles.values()):
+        return {}
+    cann_root = Path(os.environ.get("ASCEND_TOOLKIT_HOME", "/usr/local/Ascend/ascend-toolkit/latest"))
+
+    def prepend(name: str, entries: tuple[Path, ...]) -> str:
+        values = [str(path) for path in entries if path.exists()]
+        if os.environ.get(name):
+            values.append(os.environ[name])
+        return os.pathsep.join(values)
+
+    return {
+        "ASCEND_HOME_PATH": str(cann_root),
+        "PYTHONPATH": prepend("PYTHONPATH", (cann_root / "python" / "site-packages",)),
+        "LD_LIBRARY_PATH": prepend("LD_LIBRARY_PATH", (cann_root / "lib64", cann_root / "runtime" / "lib64")),
+        "PATH": prepend("PATH", (cann_root / "bin",)),
+    }
+
+
 def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
     """Generate voice ASR nodes from robot_config YAML."""
     voice_asr_config = robot_config.get("voice_asr", {})
@@ -153,6 +185,9 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "realtime_pre_roll_seconds": voice_asr_config.get(
             "realtime_pre_roll_seconds", voice_asr_defaults["realtime_pre_roll_seconds"]
         ),
+        "final_tail_padding_seconds": voice_asr_config.get(
+            "final_tail_padding_seconds", voice_asr_defaults["final_tail_padding_seconds"]
+        ),
         "publish_partial": voice_asr_config.get("publish_partial", voice_asr_defaults["publish_partial"]),
         "output_topic": voice_asr_config.get("output_topic", voice_asr_defaults["output_topic"]),
         "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
@@ -187,5 +222,6 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
             name=node_name,
             output="screen",
             parameters=[node_params],
+            additional_env=_ascend_node_environment(bundle_path, deployment),
         )
     ]

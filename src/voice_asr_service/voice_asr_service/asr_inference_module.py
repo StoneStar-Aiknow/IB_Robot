@@ -9,9 +9,11 @@ ASRInferenceModule - ASR推理模块
 支持自动检测模型类型
 """
 
+import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -28,6 +30,19 @@ from inference_service.unified_runtime import (
 _MAX_FINAL_DECODE_STEPS = 200
 
 
+_CJK = r"\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef"
+_SPACE_NEXT_TO_CJK = re.compile(rf"(?<=[{_CJK}])\s+|\s+(?=[{_CJK}])")
+
+
+def normalize_transcript(text: str) -> str:
+    """Drop the token separators some sherpa models emit between CJK characters.
+
+    Character/BPE hybrid models (e.g. zh-en zipformers) return ``"请 打 开"``;
+    spaces between Latin words are meaningful and are kept (collapsed to one).
+    """
+    return _SPACE_NEXT_TO_CJK.sub("", " ".join(text.split()))
+
+
 class _SherpaStream:
     def __init__(self, recognizer: Any, sample_rate: int) -> None:
         self.recognizer = recognizer
@@ -38,9 +53,10 @@ class _SherpaStream:
 class _SherpaStreamingRuntime:
     """Adapt one sherpa recognizer to the unified stream lifecycle."""
 
-    def __init__(self, recognizer: Any, sample_rate: int) -> None:
+    def __init__(self, recognizer: Any, sample_rate: int, final_tail_padding_seconds: float = 0.0) -> None:
         self._recognizer = recognizer
         self._sample_rate = sample_rate
+        self._final_tail_padding = np.zeros(int(max(0.0, final_tail_padding_seconds) * sample_rate), dtype=np.float32)
 
     def load(self, _context=None) -> None:
         return None
@@ -57,6 +73,10 @@ class _SherpaStreamingRuntime:
         if request.metadata.get("final", False):
             # Final decode must drain the recognizer completely: silent
             # truncation would drop undecoded audio while reporting success.
+            # Chunked encoders only emit a chunk once its right context has
+            # arrived, so flush the trailing speech with padding silence.
+            if self._final_tail_padding.size:
+                stream.stream.accept_waveform(stream.sample_rate, self._final_tail_padding)
             stream.stream.input_finished()
             while self._recognizer.is_ready(stream.stream):
                 self._recognizer.decode_stream(stream.stream)
@@ -66,7 +86,10 @@ class _SherpaStreamingRuntime:
             self._recognizer.decode_stream(stream.stream)
         result = self._recognizer.get_result(stream.stream)
         text = result if isinstance(result, str) else getattr(result, "text", "")
-        return {"text": text if isinstance(text, str) else "", "is_final": bool(request.metadata.get("final", False))}
+        return {
+            "text": normalize_transcript(text) if isinstance(text, str) else "",
+            "is_final": bool(request.metadata.get("final", False)),
+        }
 
     def reset_stream(self, stream: _SherpaStream, _context: ExecutionContext) -> None:
         stream.stream = self._recognizer.create_stream()
@@ -140,6 +163,7 @@ class ASRInferenceModule:
         bundle_path: str,
         deployment: str,
         language: str = "zh",
+        final_tail_padding_seconds: float = 0.0,
     ) -> bool:
         """
         初始化 ASR 模型
@@ -179,6 +203,11 @@ class ASRInferenceModule:
             tokens_path = role_paths.get("tokens")
             if tokens_path is None:
                 raise ValueError("ASR deployment must declare a tokens artifact")
+            encoder_profile = (validated.deployment.role_runtime_profiles or {}).get("encoder")
+            if encoder_profile is not None and encoder_profile.backend == "ascend":
+                self._initialize_ascend_transducer(validated, role_paths, encoder_profile, final_tail_padding_seconds)
+                self.state = ASRState.READY
+                return True
             if {"encoder", "decoder", "joiner"}.issubset(role_paths):
                 self._model_type = ModelType.STREAMING
                 recognizer = self._create_streaming_recognizer(
@@ -211,26 +240,9 @@ class ASRInferenceModule:
             self._recognizer = recognizer
             self._sample_rate = int(sample_rate)
             if self._model_type == ModelType.STREAMING:
-                streaming_runtime = _SherpaStreamingRuntime(self._recognizer, self._sample_rate)
-                self._runtime_handle = ModelRuntimeHandle(
-                    RuntimeAssembly(
-                        runtime_executor=streaming_runtime,
-                        streaming_runtime=streaming_runtime,
-                        session=streaming_runtime,
-                        execution_contract=ExecutionContract(
-                            state_scope="stream",
-                            state_bank_mode="per_stream",
-                            max_open_streams=1,
-                        ),
-                        stateful=True,
-                        resettable=True,
-                        state_scope="stream",
-                        state_bank_mode="per_stream",
-                        max_open_streams=1,
-                    )
+                self._install_streaming_runtime(
+                    _SherpaStreamingRuntime(self._recognizer, self._sample_rate, final_tail_padding_seconds)
                 )
-                self._runtime_context = ExecutionContext.create("voice-asr")
-                self._runtime_handle.load()
             self.state = ASRState.READY
             return True
 
@@ -245,6 +257,65 @@ class ASRInferenceModule:
             self._last_error = str(e)
             self.state = ASRState.ERROR
             raise RuntimeError(f"Failed to initialize ASR: {e}") from e
+
+    def _install_streaming_runtime(self, streaming_runtime: Any, *, state_bank_mode: str = "per_stream") -> None:
+        """Wrap a streaming runtime in the unified handle.
+
+        sherpa keeps per-stream recognizer state; the Ascend runtime owns one set of
+        device-resident encoder banks, so it declares runtime_exclusive instead.
+        """
+        self._runtime_handle = ModelRuntimeHandle(
+            RuntimeAssembly(
+                runtime_executor=streaming_runtime,
+                streaming_runtime=streaming_runtime,
+                session=streaming_runtime,
+                execution_contract=ExecutionContract(
+                    state_scope="stream",
+                    state_bank_mode=state_bank_mode,
+                    max_open_streams=1,
+                ),
+                stateful=True,
+                resettable=True,
+                state_scope="stream",
+                state_bank_mode=state_bank_mode,
+                max_open_streams=1,
+            )
+        )
+        self._runtime_context = ExecutionContext.create("voice-asr")
+        self._runtime_handle.load()
+
+    def _initialize_ascend_transducer(
+        self, validated: Any, role_paths: dict[str, str], encoder_profile: Any, final_tail_padding_seconds: float
+    ) -> None:
+        """Encoder OM on the NPU, decoder/joiner and greedy search on the host (no sherpa recognizer)."""
+        from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
+        from voice_asr_service.transducer_ascend import (
+            FBANK_SAMPLE_RATE,
+            AscendTransducerRuntime,
+            ZipformerEncoderAclRunner,
+        )
+
+        encoder = ZipformerEncoderAclRunner(
+            Path(role_paths["encoder"]),
+            validated.deployment.bindings["encoder"],
+            device_id=int(getattr(encoder_profile.profile, "device_id", 0) or 0),
+            runtime_manager=AclRuntimeManager(),
+        )
+        try:
+            runtime = AscendTransducerRuntime(
+                encoder,
+                role_paths["decoder"],
+                role_paths["joiner"],
+                role_paths["tokens"],
+                decode_chunk_len=int(validated.deployment.metadata["decode_chunk_len"]),
+                final_tail_padding_seconds=final_tail_padding_seconds,
+            )
+        except Exception:
+            encoder.close()
+            raise
+        self._model_type = ModelType.STREAMING
+        self._sample_rate = FBANK_SAMPLE_RATE
+        self._install_streaming_runtime(runtime, state_bank_mode="runtime_exclusive")
 
     def _create_streaming_recognizer(
         self, encoder: str, decoder: str, joiner: str, tokens_path: str, provider: str
@@ -298,9 +369,14 @@ class ASRInferenceModule:
             raise RuntimeError("streaming ASR runtime not initialized")
         return self._runtime_handle.open_stream(self._runtime_context)
 
+    @property
+    def _is_initialized(self) -> bool:
+        """True once a decoding backend exists: a sherpa recognizer or the Ascend streaming runtime."""
+        return self._recognizer is not None or self._runtime_handle is not None
+
     def _require_recognizer(self, operation: str) -> None:
-        """Ensure the underlying recognizer exists before using it."""
-        if self._recognizer is not None:
+        """Ensure the underlying recognizer (or the Ascend streaming runtime) exists before using it."""
+        if self._is_initialized:
             return
 
         detail = f": {self._last_error}" if self._last_error else ""
@@ -319,9 +395,9 @@ class ASRInferenceModule:
         """
         result = self._recognizer.get_result(stream)
         if isinstance(result, str):
-            return result
+            return normalize_transcript(result)
         text = getattr(result, "text", None)
-        return text if isinstance(text, str) else ""
+        return normalize_transcript(text) if isinstance(text, str) else ""
 
     def _extract_offline_text(self, stream: Any) -> str:
         """Extract text from sherpa-onnx OfflineRecognizer result in a version-tolerant way.
@@ -332,9 +408,9 @@ class ASRInferenceModule:
         """
         result = stream.result
         if isinstance(result, str):
-            return result
+            return normalize_transcript(result)
         text = getattr(result, "text", None)
-        return text if isinstance(text, str) else ""
+        return normalize_transcript(text) if isinstance(text, str) else ""
 
     def _decode_online_stream_until_idle(self, stream: Any, max_steps: int | None = None) -> bool:
         steps = 0
@@ -581,7 +657,7 @@ class ASRInferenceModule:
             self._active_stream = None
             self._pending_stream = None
             self._last_stream_text = ""
-            if self._recognizer is not None:
+            if self._is_initialized:
                 self.state = ASRState.READY
             elif self._last_error:
                 self.state = ASRState.ERROR

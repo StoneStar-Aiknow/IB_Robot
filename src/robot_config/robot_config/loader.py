@@ -2077,6 +2077,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         vad_bundle_path=resolve_ros_path(data.get("vad_bundle_path", defaults.vad_bundle_path)),
         vad_deployment=data.get("vad_deployment", defaults.vad_deployment),
         realtime_pre_roll_seconds=data.get("realtime_pre_roll_seconds", defaults.realtime_pre_roll_seconds),
+        final_tail_padding_seconds=data.get("final_tail_padding_seconds", defaults.final_tail_padding_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
         output_topic=data.get("output_topic", defaults.output_topic),
         sample_rate=data.get("sample_rate", defaults.sample_rate),
@@ -2526,6 +2527,57 @@ def validate_agent_entry_config(embodied: dict[str, Any]) -> list[str]:
             and planner.get("temperature", 1.0) != 1.0
         ):
             errors.append("embodied.agent.planner.temperature must be 1 for kimi-for-coding")
+    errors.extend(_validate_agent_voice_bridge(agent.get("voice_bridge")))
+    return errors
+
+
+def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
+    if voice_bridge is None:
+        return []
+    prefix = "embodied.agent.voice_bridge"
+    if not isinstance(voice_bridge, dict):
+        return [f"{prefix} must be a mapping"]
+    errors: list[str] = []
+    if not isinstance(voice_bridge.get("enabled", False), bool):
+        errors.append(f"{prefix}.enabled must be a boolean")
+    if voice_bridge.get("confirm_mode", "auto") not in {"auto", "voice_confirm"}:
+        errors.append(f"{prefix}.confirm_mode must be auto or voice_confirm")
+    for field_name in ("input_topic", "asr_status_topic", "asr_control_topic"):
+        value = voice_bridge.get(field_name, "/")
+        if not isinstance(value, str) or not value.startswith("/"):
+            errors.append(f"{prefix}.{field_name} must be an absolute ROS topic name")
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+        value = voice_bridge.get(field_name, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
+    if "stop_phrases" in voice_bridge and not voice_bridge["stop_phrases"]:
+        errors.append(f"{prefix}.stop_phrases must not be empty")
+    for field_name in (
+        "confirm_timeout_sec",
+        "session_idle_sec",
+        "request_timeout_sec",
+        "tts_timeout_sec",
+        "resume_settle_sec",
+    ):
+        value = voice_bridge.get(field_name, 1.0)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            errors.append(f"{prefix}.{field_name} must be finite and positive")
+    corrections = voice_bridge.get("text_corrections", {})
+    if not isinstance(corrections, dict) or any(
+        not isinstance(term, str)
+        or not term.strip()
+        or not isinstance(variants, list)
+        or not variants
+        or any(not isinstance(item, str) or not item.strip() for item in variants)
+        for term, variants in corrections.items()
+    ):
+        errors.append(f"{prefix}.text_corrections must map each term to a non-empty list of misrecognized strings")
+    min_text_chars = voice_bridge.get("min_text_chars", 2)
+    if isinstance(min_text_chars, bool) or not isinstance(min_text_chars, int) or min_text_chars < 1:
+        errors.append(f"{prefix}.min_text_chars must be a positive integer")
+    for field_name in ("speak_replies", "tts_enabled", "mute_asr_during_tts"):
+        if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
+            errors.append(f"{prefix}.{field_name} must be a boolean")
     return errors
 
 

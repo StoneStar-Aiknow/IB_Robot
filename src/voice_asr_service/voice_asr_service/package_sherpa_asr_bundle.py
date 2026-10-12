@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from inference_manifest import (
     ArtifactBindings,
+    AscendRuntimeProfile,
     AudioContract,
     BundleFile,
     CompiledDeployment,
@@ -21,6 +22,7 @@ from inference_manifest import (
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    ModelIdentity,
     ONNXRuntimeProfile,
     RoleRuntimeProfile,
     SemanticIdentity,
@@ -107,6 +109,117 @@ def _deployment(artifacts: dict[str, DeploymentArtifact], *, streaming: bool, de
     )
 
 
+def _encoder_om_bindings(encoder_onnx: Path) -> tuple[ArtifactBindings, int]:
+    """Bind every static encoder input/output by index; states pair by name via semantics.
+
+    onnxsim leaves output shapes undeclared, so one zero-input ONNX Runtime pass records the
+    concrete output shapes the OM exposes (ATC keeps the ONNX input/output order).
+    """
+    import numpy as np
+    import onnx
+    import onnxruntime as ort
+
+    from voice_asr_service.transducer_ascend import (
+        ENCODER_FEATURES_SEMANTIC,
+        ENCODER_OUT_SEMANTIC,
+        ENCODER_STATE_IN_PREFIX,
+        ENCODER_STATE_OUT_PREFIX,
+    )
+
+    session = ort.InferenceSession(str(encoder_onnx), providers=["CPUExecutionProvider"])
+    feeds = {}
+    for value in session.get_inputs():
+        if not value.shape or any(not isinstance(dim, int) or dim <= 0 for dim in value.shape):
+            raise ValueError(f"encoder input {value.name!r} must have a static shape, got {value.shape}")
+        feeds[value.name] = np.zeros(value.shape, dtype=np.int64 if "int64" in value.type else np.float32)
+    names = [value.name for value in session.get_outputs()]
+    results = session.run(names, feeds)
+    dtypes = {np.dtype(np.float32): "float32", np.dtype(np.int64): "int64"}
+
+    inputs = tuple(
+        TensorBinding(
+            semantic=ENCODER_FEATURES_SEMANTIC if index == 0 else ENCODER_STATE_IN_PREFIX + name,
+            index=index,
+            dtype=dtypes[array.dtype],
+            shape=array.shape,
+        )
+        for index, (name, array) in enumerate(feeds.items())
+    )
+    outputs = tuple(
+        TensorBinding(
+            semantic=ENCODER_OUT_SEMANTIC if index == 0 else ENCODER_STATE_OUT_PREFIX + name.removeprefix("new_"),
+            index=index,
+            dtype=dtypes[array.dtype],
+            shape=array.shape,
+        )
+        for index, (name, array) in enumerate(zip(names, results, strict=True))
+    )
+    metadata = {prop.key: prop.value for prop in onnx.load(str(encoder_onnx), load_external_data=False).metadata_props}
+    return ArtifactBindings(inputs=inputs, outputs=outputs), int(metadata["decode_chunk_len"])
+
+
+def _ascend_deployment(
+    artifacts: dict[str, DeploymentArtifact],
+    encoder_bindings: ArtifactBindings,
+    decode_chunk_len: int,
+    *,
+    soc: str,
+    runtime_abi: str,
+) -> CompiledDeployment:
+    """Encoder OM on Ascend, the small decoder/joiner on ONNX Runtime CPU, greedy search on host."""
+    cpu = RoleRuntimeProfile(
+        backend="onnx", target=DeploymentTarget(runtime="onnx"), profile=ONNXRuntimeProfile(device="cpu")
+    )
+    base = _deployment(
+        {role: artifacts[role] for role in ("tokens", "encoder", "decoder", "joiner")}, streaming=True, device="cpu"
+    )
+    # Unlike the sherpa deployments, the recurrent state lives in the encoder OM: the runner keeps the
+    # cached tensors device-resident in ping-pong banks it owns exclusively (as SileroVadAclRunner does),
+    # so declare the encoder role and runtime_exclusive banks instead of the sherpa decoder state link.
+    encoder_state_contract = ExecutionContract(
+        state_scope="stream",
+        execution_structure="iterative",
+        cancellation_granularity="checkpoint",
+        stateful=True,
+        orchestration_visibility="session",
+        state_bank_mode="runtime_exclusive",
+        max_open_streams=1,
+        state_links=(
+            StateLink(
+                role="encoder",
+                state_name="cached",
+                owner="session",
+                source="state.encoder_in",
+                target="state.encoder_out",
+                scope="runtime",
+                state_bank="asr.encoder.bank",
+            ),
+        ),
+    )
+    return base.model_copy(
+        update={
+            "execution_contract": encoder_state_contract,
+            "runtime_profile": None,
+            "role_identities": {
+                "encoder": ModelIdentity(interface="tensor_model", model_type="zipformer2_encoder", operation="encode"),
+                "decoder": ModelIdentity(interface="tensor_model", model_type="transducer_decoder", operation="decode"),
+                "joiner": ModelIdentity(interface="tensor_model", model_type="transducer_joiner", operation="join"),
+            },
+            "role_runtime_profiles": {
+                "encoder": RoleRuntimeProfile(
+                    backend="ascend",
+                    target=DeploymentTarget(runtime="acl", runtime_abi=runtime_abi, soc=soc),
+                    profile=AscendRuntimeProfile(device_id=0),
+                ),
+                "decoder": cpu,
+                "joiner": cpu,
+            },
+            "bindings": {**base.bindings, "encoder": encoder_bindings},
+            "metadata": {"decode_chunk_len": decode_chunk_len},
+        }
+    )
+
+
 def package_sherpa_asr_bundle(
     bundle_root: Path,
     *,
@@ -114,6 +227,10 @@ def package_sherpa_asr_bundle(
     streaming: bool,
     streaming_kind: str = "transducer",
     include_cuda: bool = True,
+    ascend_encoder_om: Path | None = None,
+    ascend_encoder_onnx: Path | None = None,
+    ascend_soc: str = "Ascend310P1",
+    ascend_runtime_abi: str = "cann-8.3.RC1",
 ) -> Path:
     """Copy explicitly named artifacts and write/validate the manifest."""
     if streaming and streaming_kind not in {"transducer", "paraformer"}:
@@ -149,6 +266,22 @@ def package_sherpa_asr_bundle(
     deployments_raw = {"torch_cpu": _deployment(deployed, streaming=streaming, device="cpu")}
     if include_cuda:
         deployments_raw["torch_cuda"] = _deployment(deployed, streaming=streaming, device="cuda")
+    if ascend_encoder_om is not None:
+        if not streaming or streaming_kind != "transducer" or ascend_encoder_onnx is None:
+            raise ValueError("the ascend deployment needs a streaming transducer plus the static encoder ONNX")
+        source = ascend_encoder_om.resolve()
+        relative = f"artifacts/encoder_ascend/{source.name}"
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        encoder_bindings, decode_chunk_len = _encoder_om_bindings(ascend_encoder_onnx)
+        ascend_artifacts = {
+            **deployed,
+            "encoder": DeploymentArtifact(path=relative, format="om", sha256=_sha256(destination)),
+        }
+        deployments_raw["ascend_310p"] = _ascend_deployment(
+            ascend_artifacts, encoder_bindings, decode_chunk_len, soc=ascend_soc, runtime_abi=ascend_runtime_abi
+        )
 
     # Repackaging keeps a stable bundle identity, mirroring the silero/fullsubnet
     # packagers: reuse the existing uuid and only bump the revision when the
@@ -255,6 +388,10 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--paraformer", action="store_true", help="Package streaming Paraformer roles")
     parser.add_argument("--skip-cuda", action="store_true")
+    parser.add_argument("--ascend-encoder-om", type=Path, help="Encoder OM for the ascend_310p deployment")
+    parser.add_argument("--ascend-encoder-onnx", type=Path, help="Static ONNX the encoder OM was compiled from")
+    parser.add_argument("--ascend-soc", default="Ascend310P1")
+    parser.add_argument("--ascend-runtime-abi", default="cann-8.3.RC1")
     args = parser.parse_args()
     artifacts = {"tokens": args.tokens}
     if args.offline:
@@ -276,6 +413,10 @@ def main() -> int:
             streaming=not args.offline,
             streaming_kind="paraformer" if args.paraformer else "transducer",
             include_cuda=not args.skip_cuda,
+            ascend_encoder_om=args.ascend_encoder_om,
+            ascend_encoder_onnx=args.ascend_encoder_onnx,
+            ascend_soc=args.ascend_soc,
+            ascend_runtime_abi=args.ascend_runtime_abi,
         )
     )
     return 0
