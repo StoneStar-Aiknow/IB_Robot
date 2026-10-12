@@ -86,7 +86,9 @@ server-owned continuation admission。客户端直接执行
 
 - 停止证明来自两本服务端账本——Agent 请求账本的终态，以及 Gateway `GetExecution` 返回的 `CANCELED`、一致的
   execution ID 和 `completed_step_count`；任一不确定即拒绝（`CONTINUE_REFUSED`），不产生运动；
-- 不切片旧 plan：Agent 把原始指令与进度交给规划器重新规划未完成部分，被打断的那一步从头重做；
+- 不切片旧 plan：Agent 把原始指令与进度交给规划器重新规划未完成部分，被打断的那一步从头重做；VLM Planner
+  依据进度提示自行规划，离线 RulePlanner（仅仿真/测试）对原文重新规划后按累计 `completed_step_count` 去掉
+  已完整完成的前 N 步——截取的是新规划结果，不是旧 plan；
 - 结果是使用新 request ID 的全新 Program，照常经过 presentation、白名单、Gateway 与 `safety_guard`；
 - Gateway 契约（`ExecuteProgram` / `GetExecution`）不变，Gateway 内部不做续跑。
 

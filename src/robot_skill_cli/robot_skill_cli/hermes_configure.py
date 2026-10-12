@@ -260,8 +260,11 @@ def _response_plugin_files(resource: Path) -> dict[str, str]:
         ),
         "RESPONSE_PROTOCOL.md": (resource / "RESPONSE_PROTOCOL.md").read_text(encoding="utf-8"),
     }
+    from embodied_common import control_phrases
+
     for name in ("hermes_response.py", "hermes_response_plugin.py", "hermes_speech_delivery.py", "stop_contract.py"):
         files[name] = Path(__file__).with_name(name).read_text(encoding="utf-8")
+    files["control_phrases.py"] = Path(control_phrases.__file__).read_text(encoding="utf-8")
     return files
 
 
@@ -281,7 +284,7 @@ def _sync_response_plugin(profile: Path, resource: Path, *, dry_run: bool) -> bo
 
 
 def _sync_motion_plugin(profile: Path, *, dry_run: bool) -> bool:
-    from embodied_common import agent_terminal_contract
+    from embodied_common import agent_terminal_contract, control_phrases
 
     target = profile / "plugins" / _MOTION_PLUGIN
     if target.exists() and not _is_managed_plugin(target):
@@ -294,6 +297,7 @@ def _sync_motion_plugin(profile: Path, *, dry_run: bool) -> bool:
             "provides_hooks: [on_control_input, on_control_turn_start, on_control_turn_end, execute_managed_tool, finalize_tool_batch, is_priority_control_text]\n"
         ),
         "agent_terminal_contract.py": Path(agent_terminal_contract.__file__).read_text(),
+        "control_phrases.py": Path(control_phrases.__file__).read_text(),
     }
     for name in (
         "stop_contract.py",

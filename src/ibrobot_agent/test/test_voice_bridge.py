@@ -10,7 +10,9 @@ SCOPE = {"channel_id": "voice_asr", "principal_id": "local_operator", "robot_sco
 
 def _core(**overrides) -> VoiceBridgeCore:
     ids = iter(f"voice-{index}" for index in range(100))
-    return VoiceBridgeCore(VoiceBridgeConfig(**{**SCOPE, **overrides}), id_factory=lambda: next(ids))
+    # The launch profiles run with TTS and therefore resolve to auto; voice_confirm is opted into per test.
+    config = VoiceBridgeConfig(**{"confirm_mode": "auto", **SCOPE, **overrides})
+    return VoiceBridgeCore(config, id_factory=lambda: next(ids))
 
 
 def _of(actions, kind):
@@ -63,6 +65,30 @@ def test_auto_mode_executes_without_second_confirmation_once_plan_is_rendered():
     assert ack.payload["receipt_token"] == "token-1"
 
 
+@pytest.mark.parametrize("confirm_mode", ["auto", "voice_confirm"])
+def test_async_presentation_is_announced_without_a_receipt_or_a_confirmation_prompt(confirm_mode):
+    # Seen on the real SO-101: typed Programs move the robot before any client renders the plan,
+    # so "请说确认或取消" would ask for a confirmation that holds nothing back.
+    core = _core(confirm_mode=confirm_mode)
+    core.on_transcript("点头", now=0.0)
+    presentation = {"summary": "nod_yes", "execution_mode": "direct_execute_async_presentation"}
+    detail = {"presentation": presentation, "presentation_digest": presentation_digest(presentation)}
+    event = _event(
+        "voice-0", "presentation", "MAY_EXECUTE", detail={**detail, "receipt_token": "", "async_display": True}
+    )
+
+    actions = core.on_event(event, now=1.0)
+
+    assert _of(actions, PublishControl) == []
+    (speak,) = _of(actions, Speak)
+    assert speak.text == "正在执行：nod_yes。" and speak.then == ()
+    assert not core.awaiting_confirmation
+    assert any("cannot gate" in log.message for log in _of(actions, Log)) == (confirm_mode == "voice_confirm")
+    # The robot is moving: a stop word still reaches the request.
+    (stop,) = _of(core.on_transcript("停", now=2.0), PublishControl)
+    assert stop.payload == {"operation": "stop", "request_id": "voice-0"}
+
+
 def test_tampered_presentation_is_never_acknowledged():
     core = _core()
     core.on_transcript("点头", now=0.0)
@@ -88,6 +114,80 @@ def test_opt_in_voice_confirm_waits_for_confirmation_and_times_out():
     core.on_event(_presentation_event("voice-1"), now=7.0)
     (stop,) = _of(core.tick(12.0), PublishControl)
     assert stop.payload == {"operation": "stop", "request_id": "voice-1"}
+
+
+@pytest.mark.parametrize("refusal", ["不执行", "我不确定", "别执行了", "先别确认"])
+def test_negated_answer_never_acknowledges_the_plan(refusal):
+    # Each refusal contains a confirm word (执行/确定/确认) and no cancel word.
+    core = _core(confirm_mode="voice_confirm")
+    core.on_transcript("点头", now=0.0)
+    core.on_event(_presentation_event("voice-0"), now=1.0)
+
+    actions = core.on_transcript(refusal, now=2.0)
+
+    assert _of(actions, PublishControl) == []
+    assert [action.text for action in _of(actions, Speak)] == ["请说确认或取消。"]
+    assert core.awaiting_confirmation
+    # A plain confirmation afterwards still releases the plan.
+    (ack,) = _of(core.on_transcript("确认", now=3.0), PublishControl)
+    assert ack.payload["operation"] == "presentation_rendered"
+
+
+def test_cancel_phrase_wins_over_a_confirm_word():
+    core = _core(confirm_mode="voice_confirm")
+    core.on_transcript("点头", now=0.0)
+    core.on_event(_presentation_event("voice-0"), now=1.0)
+
+    (stop,) = _of(core.on_transcript("不要执行", now=2.0), PublishControl)
+
+    assert stop.payload == {"operation": "stop", "request_id": "voice-0"}
+    assert not core.awaiting_confirmation
+
+
+def test_robot_scope_is_required_and_the_unset_confirm_mode_is_the_safe_one():
+    with pytest.raises(ValueError, match="robot_scope"):
+        VoiceBridgeConfig()
+    assert VoiceBridgeConfig(**SCOPE).confirm_mode == "voice_confirm"
+
+
+def test_busy_message_must_not_stop_the_request_it_is_spoken_during():
+    with pytest.raises(ValueError, match="busy_message"):
+        VoiceBridgeConfig(**SCOPE, busy_message="正在执行，要中断请说停止。")
+    with pytest.raises(ValueError, match="busy_message"):
+        VoiceBridgeConfig(**SCOPE, busy_message="请稍等", stop_phrases=("稍等",))
+
+
+def test_replies_spoken_while_interruptible_carry_no_stop_word():
+    """The microphone stays open while a request can be stopped; the bridge must not stop itself."""
+    core = _core(request_timeout_sec=10.0)
+    assert not core.interruptible
+    core.on_transcript("挥挥手", now=0.0)
+    assert core.interruptible
+
+    busy = core.on_transcript("点头", now=1.0)
+    timed_out = core.tick(11.0)
+
+    assert core.interruptible  # timed out, still the stop target until its terminal event
+    spoken = [action.text for action in _of(busy + timed_out, Speak)]
+    assert spoken and not any(core.is_stop_text(text) for text in spoken)
+    assert core.is_stop_text("帮我停一下") and not core.is_stop_text("准备执行：点头。")
+
+
+def test_node_parameter_defaults_come_from_the_config_dataclass():
+    import json
+
+    from ibrobot_agent.voice_bridge import node_parameter_defaults
+
+    defaults = node_parameter_defaults()
+    config = VoiceBridgeConfig(**SCOPE)
+
+    assert defaults["robot_scope"] == ""  # required from launch, never a robot-specific default
+    assert defaults["confirm_mode"] == ""  # derived from tts_enabled
+    assert defaults["request_timeout_sec"] == config.request_timeout_sec
+    assert defaults["busy_message"] == config.busy_message
+    assert tuple(json.loads(defaults["stop_phrases_json"])) == config.stop_phrases
+    assert tuple(json.loads(defaults["confirm_phrases_json"])) == config.confirm_phrases
+    assert json.loads(defaults["text_corrections_json"]) == {}
 
 
 @pytest.mark.parametrize(
@@ -117,7 +217,7 @@ def test_domain_corrections_rewrite_homophones_before_the_agent():
 
     assert request.payload["text"] == "请打开夹爪"
     with pytest.raises(ValueError, match="text_corrections"):
-        VoiceBridgeConfig(text_corrections=(("夹爪", ()),))
+        VoiceBridgeConfig(**SCOPE, text_corrections=(("夹爪", ()),))
 
 
 def test_bounded_id_sets_forget_oldest_without_losing_the_active_request():
@@ -180,9 +280,13 @@ def test_speech_thread_survives_a_tts_error_and_still_acknowledges_later_plans()
 
     node = node_class.__new__(node_class)
     node.get_logger = lambda: logging.getLogger("voice-bridge-test")
+    # Nothing to interrupt: speaking mutes ASR.
+    node._core = _core()
+    node._core_lock = threading.Lock()
     node._mute_asr = True
     node._asr_state = "listening"
     node._deaf_until = 0.0
+    node._echo_until = 0.0
     node._resume_settle_sec = 0.0
     node._speaker = _Speaker()
     node._control_publisher = _Publisher(acknowledged)
@@ -305,10 +409,10 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
     core.on_transcript("继续", now=0.0)
 
     actions = core.on_event(
-        _event("voice-0", "continuation", "PLANNING", "上次完整完成 1/3 步后停止，现在继续剩余部分"), now=1.0
+        _event("voice-0", "continuation", "PLANNING", "上次任务已完整完成 1/3 步，现在继续剩余部分"), now=1.0
     )
 
-    assert [action.text for action in _of(actions, Speak)] == ["上次完整完成 1/3 步后停止，现在继续剩余部分"]
+    assert [action.text for action in _of(actions, Speak)] == ["上次任务已完整完成 1/3 步，现在继续剩余部分"]
     assert core.active_request_id == "voice-0"
 
 
@@ -337,3 +441,96 @@ def test_rejected_admission_is_spoken_in_chinese(response, spoken):
     actions = core.on_response({"request_id": "voice-0", **response}, now=1.0)
 
     assert [action.text for action in _of(actions, Speak)] == [spoken]
+
+
+@pytest.mark.parametrize(
+    ("configured", "tts_enabled", "resolved"),
+    [
+        ("", True, "auto"),
+        # Without TTS the plan is only logged: an unset mode must not acknowledge it on its own.
+        ("", False, "voice_confirm"),
+        # auto without TTS stays possible, but only as an explicit choice.
+        ("auto", False, "auto"),
+        ("voice_confirm", True, "voice_confirm"),
+    ],
+)
+def test_unset_confirm_mode_requires_a_spoken_confirmation_without_tts(configured, tts_enabled, resolved):
+    from ibrobot_agent.voice_bridge import resolve_confirm_mode
+
+    assert resolve_confirm_mode(configured, tts_enabled=tts_enabled) == resolved
+
+
+def test_default_stop_words_are_the_shared_control_vocabulary():
+    from embodied_common.control_phrases import STOP_PHRASES
+
+    assert VoiceBridgeConfig(**SCOPE).stop_phrases == STOP_PHRASES
+
+
+def _speaking_node(core, heard_during_playback):
+    """A bridge node whose speaker feeds ``heard_during_playback`` back as ASR finals while it speaks."""
+    import logging
+    import threading
+
+    from ibrobot_agent.voice_bridge import _build_node_class
+
+    node_class = _build_node_class()
+
+    class _Publisher:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def publish(self, message) -> None:
+            self.messages.append(message.data)
+
+    class _Message:
+        def __init__(self, data: str) -> None:
+            self.data = data
+
+    class _Speaker:
+        def speak(self, text: str) -> bool:
+            for heard in heard_during_playback:
+                node._on_transcript(_Message(heard))
+            return True
+
+    node = node_class.__new__(node_class)
+    node.get_logger = lambda: logging.getLogger("voice-bridge-test")
+    node._core = core
+    node._core_lock = threading.Lock()
+    node._mute_asr = True
+    node._asr_state = "listening"
+    node._deaf_until = 0.0
+    node._echo_until = 0.0
+    node._resume_settle_sec = 30.0
+    node._speaker = _Speaker()
+    node._request_publisher = _Publisher()
+    node._control_publisher = _Publisher()
+    node._asr_control_publisher = _Publisher()
+    return node
+
+
+def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
+    import json
+
+    core = _core()
+    core.on_transcript("挥挥手", now=0.0)
+    # The robot hears its own busy reply and then the user's stop word.
+    node = _speaking_node(core, [VoiceBridgeConfig.busy_message, "停"])
+
+    node._render_speech(Speak(VoiceBridgeConfig.busy_message))
+
+    assert node._asr_control_publisher.messages == []  # ASR was never muted
+    assert [json.loads(data) for data in node._control_publisher.messages] == [
+        {"operation": "stop", "request_id": "voice-0"}
+    ]
+    assert node._request_publisher.messages == []  # the echo was not routed as a command
+
+
+def test_reply_with_a_stop_word_still_mutes_asr():
+    core = _core()
+    core.on_transcript("挥挥手", now=0.0)
+    node = _speaking_node(core, ["已停止"])
+
+    node._render_speech(Speak("已停止。"))
+
+    assert node._asr_control_publisher.messages == ["stop", "start"]
+    assert node._control_publisher.messages == []

@@ -16,7 +16,7 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
 | 节点 / 入口 | 主要职责 |
 | --- | --- |
 | `ibrobot_agent_node` | Agent 组合根：transport 与生命周期；ROS-free 的 `AgentService` 通过注入的 port 工作 |
-| `agent_voice_bridge`（`ibrobot_agent_voice_bridge`） | 语音通道客户端：`/voice_command` 最终文本 → `/agent/request`；停止词 → `/agent/control stop`；展示 exact plan 后回执；可选 TTS 播报回复 |
+| `agent_voice_bridge`（`ibrobot_agent_voice_bridge`） | 语音通道客户端：`/voice_command` 最终文本 → `/agent/request`；停止词 → `/agent/control stop`；播报 exact plan（仅旧 Agent Plan 路径回执）；可选 TTS 播报回复 |
 | `chat_tui.py`（`ros2 run ibrobot_agent ibrobot_agent_chat` / `scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路；`--channel-id`/`--principal-id`/`--robot-scope` 覆盖会话身份以匹配 profile 的 `embodied.agent` 配置 |
 
 ## 调用链
@@ -155,32 +155,49 @@ canonical `presentation_digest` 与一次性 `receipt_token`。TUI 在自己的�
 ```text
 voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(JSON)--> ibrobot_agent_node
                --/voice_partial(String)-->    |  停止关键词 ----------/agent/control stop
-                                              |  presentation --(播报/日志)--> /agent/control presentation_rendered
+                                              |  presentation --(播报/日志)--> [仅旧 Agent Plan] /agent/control presentation_rendered
                                               '<-- /agent/event: 终态与回答 --(TTS 可选)--> 用户
 ```
 
 - `text_corrections` 先把 ASR 偏好的同音写法纠正为领域词（如“家长”→“夹爪”），再做停止词/确认词匹配与请求封装；
   纠正前后的文本都会写入日志。替换是**整句范围的字面替换**：配置的误识写法若在日常对话中也会出现
   （例如真的谈到“家长”），该句同样会被改写。只配置在本机器人语境下不会歧义的写法。
-- 启用 TTS 时，播报期间（以及恢复后 `resume_settle_sec`，默认 1 秒内）收到的识别结果会被丢弃，
-  避免 ASR 把机器人自己的声音或被打断的半句话当成新指令、进而反复触发播报。
-- 同一通道同时只跟踪一个请求：执行中的新话语被丢弃并提示“请稍等”，停止词始终生效。
+- 启用 TTS 且没有可中断的请求时，播报期间向 `/voice_control` 发送 stop/start 暂停 ASR，播报期间（以及恢复后
+  `resume_settle_sec`，默认 1 秒内）收到的识别结果会被丢弃，避免 ASR 把机器人自己的声音或被打断的半句话当成
+  新指令、进而反复触发播报。
+- 有可中断的请求时（执行中、等待确认、超时后等待终态）播报**不暂停 ASR**：播报期间及其后
+  `resume_settle_sec` 内只放行含停止关键词的识别结果（partial 实时中断照常），其余当作回声丢弃。因此桥接在
+  这段时间说的话（忙碌提示、超时提示、「继续」播报）都不含停止词，`busy_message` 含停止词会被配置校验拒绝；
+  万一某句播报含停止词，该句仍按旧方式暂停 ASR 并打 warning，以免机器人听到自己说“停”而中断请求。
+- 同一通道同时只跟踪一个请求：执行中的新话语被丢弃并提示“我正在执行上一个任务，请稍等。”。
 - 停止词是**关键词匹配**：句中出现 `stop_phrases` 任一词（默认 停止/别动/停/stop/halt）即中断，例如
   “帮我停一下”“别动了谢谢”。代价是“不停地挥手”这类句子在执行中也会触发停止；没有可中断的请求时，
   只含关键词的普通句子仍作为指令发送。
-- 实时中断：桥接同时订阅 ASR 的 `/voice_partial`（`partial_topic`，置空关闭），部分识别结果一出现停止
+- 实时中断：桥接同时订阅 ASR 的 `/voice_partial`，部分识别结果一出现停止
   关键词就发送 stop，不必等 VAD 静音与尾部补零；同一句话只由 partial 发送一次 stop，这句话的最终文本归入
   这次停止，不会再作为新指令发给 Agent（否则会占住通道，紧随其后的「继续」被当作忙碌丢弃）。
+  `/voice_partial`、`/voice_status`、`/voice_control` 由 `voice_asr_node` 固定，不在 YAML 中配置
+  （`partial_topic` 只作为 ROS 参数保留，置空可关闭实时中断）。
 - 请求超过 `request_timeout_sec`（默认 180 秒）仍无终态事件时，桥接先发送 stop 再释放通道并播报
-  “任务超时，已停止”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
+  “任务超时，正在中止。”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
 - 「继续」由 Agent 处理（见下节），桥接只把它当普通话语发送，并播报 Agent 的 `continuation` 事件。
-- `confirm_mode: auto`（默认，仿真与真机相同）：说完自然语言、Agent 规划完成后直接执行，无需人工二次确认。
-  exact plan 渲染（TTS 播放完成；未启用 TTS 时写日志）后即回执；TTS 失败不回执，Agent 按
-  `presentation_timeout_sec` 失败关闭。执行中说停止词随时中断。
-- `confirm_mode: voice_confirm`（可选）：播报计划后等待确认词才回执；取消词、停止词或 `confirm_timeout_sec`
-  超时发送 stop。
+- **typed Program（真机与仿真经 Gateway 的默认路径）不等待任何回执**（见上文「typed Program：异步展示」）：
+  `presentation` 事件带 `async_display: true` 时，桥接只播报（无 TTS 时写日志）“正在执行：…”，不回执、
+  不询问确认——机器人此时可能已经在动，再问“请说确认或取消”只会误导用户。语音通道对运动的控制手段是
+  **停止词**；需要预先审批的真机场景按上文用 dry-run 或人工核对，不能依赖语音确认拦截计划。
+- `confirm_mode` 只对旧 Agent Plan 的 `immediate_after_presentation` 回执路径生效；typed Program 下配置
+  `voice_confirm` 时，桥接在每个计划处记录“voice_confirm cannot gate …”日志。未配置时随 TTS 取默认值：
+  启用 TTS 为 `auto`，未启用 TTS 为 `voice_confirm`。
+- `confirm_mode: auto`（旧路径）：exact plan 渲染完成（TTS 播放完成）后即回执；TTS 失败不回执，Agent 按
+  `presentation_timeout_sec` 失败关闭。**未启用 TTS 时唯一的“渲染”是写日志**，节点启动时会打印 warning。
+- `confirm_mode: voice_confirm`（旧路径）：播报（无 TTS 时写日志）计划后等待确认词才回执；取消词、停止词或
+  `confirm_timeout_sec` 超时发送 stop。含否定词（不/别）的回答（如“不执行”“我不确定”“别执行了”）即使包含
+  确认词也**不回执**，而是再次询问；取消词优先于确认词（“不要执行”即取消）。
+- 仓库自带的两个语音 profile（`so101_agent_voice_hardware`、`so101_single_arm_agent_voice_gazebo`）走
+  typed Program 路径且未启用 TTS：计划只写入桥接日志，机器人规划完即执行，用于操作员盯着终端日志的联调场景。
+- 停止词、「继续」词表与文本闭环客户端、Hermes 共用 `embodied_common.control_phrases`，各通道只决定匹配
+  方式（本桥接为关键词，文本闭环为整句）。
 - 澄清回答（`needs_clarification`）后的下一句自动携带 `reply_to_request_id`；`session_idle_sec` 后开启新会话。
-- 启用 TTS 时，播报期间向 `/voice_control` 发送 stop/start 暂停 ASR，避免机器人识别自己的声音。
 
 ### 「继续」：按账本恢复被中断的任务
 
@@ -194,11 +211,15 @@ Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robo
 
 只有确认安全取消（或尚未提交就停止）才继续：Agent 用原始文本和“已完整完成 N/M 步、第 N+1 步需重做”的提示
 **重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划，Gateway 照常
-校验。播报“上次任务完整完成了 N/M 步后停止，现在继续剩余部分”。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
+校验。播报“上次任务已完整完成 N/M 步，现在继续剩余部分。”（播报时请求可被中断，故不含停止词）。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
 规划阶段取消、Gateway 查询失败或两本账不一致一律拒绝（`CONTINUE_REFUSED`），不产生任何运动。
 
 这是已确认的语义。`robot_skill_cli` README 与 `ibrobot-control` skill 中“不得切片旧步骤、拒绝 `--resume`”约束的是
 闭环客户端；Agent 侧的「继续」提交的是经过完整校验的新 Program，不在其禁止范围内（两处文档已注明）。
+
+两种规划器的做法不同：VLM Planner 依据 continuation hint 自行规划剩余部分；离线 RulePlanner（仅仿真/测试用）
+对原文重新规划后，按累计 `completed_step_count` 去掉已完整完成的前 N 步（`steps[N:]`）。后者是对**新规划结果**
+按计数截取，不复用旧 plan，生成的 Program 同样经过 presentation、白名单与 Gateway 校验。
 
 限制：`completed_step_count` 是下界——Gateway 不记录步内进度，被打断的那一步会从头重做，非幂等技能（如
 已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
@@ -217,7 +238,8 @@ ros2 topic echo /agent/event &
 ros2 topic pub --once /voice_file_input std_msgs/String "{data: /abs/path/nod.wav}"
 ```
 
-`/agent/event` 依次出现 `proposal_ready` → `presentation` → `presentation_rendered` → `terminal`（`SUCCEEDED`）即链路打通。
+`/agent/event` 依次出现 `proposal_ready` → `presentation`（`async_display: true`）→ `terminal`（`SUCCEEDED`）即链路打通；
+typed Program 路径不产生 `presentation_rendered`。
 
 ## 已知限制
 

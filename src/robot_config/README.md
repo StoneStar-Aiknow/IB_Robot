@@ -1272,9 +1272,11 @@ robot:
 | `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
 | `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
 | `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
-| `agent.voice_bridge.confirm_mode` | `auto`（默认：规划完成即执行，无需二次确认）或 `voice_confirm`（可选：需说确认词才执行） |
-| `agent.voice_bridge.input_topic` / `asr_status_topic` / `asr_control_topic` | 绝对 topic；`input_topic` 默认跟随 `voice_asr.output_topic` |
-| `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空 |
+| `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
+| `agent.voice_bridge.input_topic` | 绝对 topic；默认跟随 `voice_asr.output_topic` |
+| `agent.voice_bridge.partial_topic` / `asr_status_topic` / `asr_control_topic` | **不可配置**：`voice_asr_node` 固定使用 `/voice_partial`、`/voice_status`、`/voice_control`，出现即报错 |
+| `agent.voice_bridge.busy_message` | 非空字符串；执行中提示语。播报时 ASR 仍在监听停止词，**不得包含停止词**（否则机器人会被自己的提示中断），违反即报错 |
+| `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空，未配置时取 `embodied_common.control_phrases.STOP_PHRASES` |
 | `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
 | `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
 | `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |

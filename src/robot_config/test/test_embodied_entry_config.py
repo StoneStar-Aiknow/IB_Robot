@@ -36,6 +36,14 @@ def test_agent_presentation_timeout_is_bounded(timeout):
         ({"stop_phrases": []}, "stop_phrases must not be empty"),
         ({"text_corrections": {"夹爪": []}}, "text_corrections"),
         ({"resume_settle_sec": 0}, "resume_settle_sec"),
+        # voice_asr_node owns these names; overriding them would silently break realtime stop.
+        ({"partial_topic": "/voice_partial"}, "partial_topic is fixed"),
+        ({"asr_status_topic": "/asr/status"}, "asr_status_topic is fixed"),
+        ({"asr_control_topic": "/asr/control"}, "asr_control_topic is fixed"),
+        # Spoken with the microphone open: hearing its own stop word would stop the robot.
+        ({"busy_message": "正在执行，可以说停止。"}, "busy_message must not contain a stop phrase"),
+        ({"busy_message": "请稍候", "stop_phrases": ["稍候"]}, "busy_message must not contain a stop phrase"),
+        ({"busy_message": ""}, "busy_message must be a non-empty string"),
     ],
 )
 def test_agent_voice_bridge_config_is_validated(voice_bridge, fragment):

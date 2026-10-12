@@ -6,6 +6,10 @@
 # Gazebo has no microphone, so this profile keeps audio_io/voice_asr off and
 # expects the ASR node to run beside it (e.g. standalone voice_asr_node fed by
 # /voice_file_input or ~/recognize_file).
+#
+# Typed Programs execute once planned without waiting for any presentation
+# receipt; with TTS off the exact plan is only logged. confirm_mode: auto keeps
+# the legacy receipt path explicit (unset without TTS it would be voice_confirm).
 robot:
   name: so101_single_arm
   base_config: so101_single_arm_agent_gazebo.yaml

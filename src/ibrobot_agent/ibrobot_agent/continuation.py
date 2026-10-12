@@ -23,8 +23,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from embodied_common.control_phrases import CONTINUE_PHRASES
 from embodied_common.text_normalization import normalize_trigger_text
-from robot_skill_cli.interactive_control import CONTINUE_PHRASES
 
 CONTINUE_REFUSED = "CONTINUE_REFUSED"
 _CONTINUE_WORDS = frozenset(normalize_trigger_text(phrase) for phrase in CONTINUE_PHRASES)
@@ -138,8 +138,9 @@ def decide_continuation(
             "remaining part of original_text from the current robot state."
         ),
     }
+    # Spoken while this request can still be interrupted by voice: no stop word in it.
     if completed_total:
-        message = f"上次任务完整完成了 {len(completed_total)}/{total} 步后停止，现在继续剩余部分。"
+        message = f"上次任务已完整完成 {len(completed_total)}/{total} 步，现在继续剩余部分。"
     else:
         message = "上次任务还没有完成任何步骤，现在重新执行。"
     return ContinuationDecision(message, text=original_text, hint=hint)

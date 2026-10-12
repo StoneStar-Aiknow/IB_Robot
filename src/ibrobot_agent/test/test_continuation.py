@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from embodied_common.control_phrases import STOP_PHRASES
 from ibrobot_agent.continuation import (
     CONTINUE_REFUSED,
     decide_continuation,
@@ -102,6 +103,9 @@ def test_confirmed_cancellation_continues_with_completed_progress():
     assert decision.text == THREE_STEPS
     assert decision.error_code == ""
     assert "1/3" in decision.message
+    # Spoken by the voice bridge while the continued request is interruptible: hearing a stop
+    # word in its own reply would stop the robot.
+    assert not any(phrase in decision.message for phrase in STOP_PHRASES)
     assert decision.hint["completed_step_count"] == 1
     assert decision.hint["completed_steps"] == [{"skill_name": "wave_hello"}]
     assert decision.hint["interrupted_step"] == {"skill_name": "nod_yes"}

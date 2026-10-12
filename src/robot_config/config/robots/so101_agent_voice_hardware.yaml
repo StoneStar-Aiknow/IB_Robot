@@ -3,8 +3,11 @@
 # safety guard and skill executor are unchanged from so101_agent_manual_hardware.
 #
 # A spoken natural-language request executes as soon as the Agent has planned
-# it (confirm_mode: auto); stop phrases always interrupt. Set confirm_mode:
-# voice_confirm to require an extra spoken confirmation. The skill allowlist is
+# it: typed Programs never wait for a presentation receipt, so no confirm_mode
+# can hold them back and stop phrases are the voice control over motion. TTS is
+# off, so the exact plan is only written to the bridge log: an informed choice
+# for bring-up with an operator watching the terminal (confirm_mode: auto keeps
+# the legacy receipt path explicit as well). The skill allowlist is
 # inherited unchanged from so101_agent_manual_hardware, so the voice channel can
 # run exactly what the text channel can. audio_io/voice_asr stay off here; run voice_asr_node beside
 # the pipeline (microphone via robot.launch, or /voice_file_input for tests).

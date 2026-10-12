@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import yaml
 
+from embodied_common.control_phrases import STOP_PHRASES
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
@@ -2542,16 +2543,33 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         errors.append(f"{prefix}.enabled must be a boolean")
     if voice_bridge.get("confirm_mode", "auto") not in {"auto", "voice_confirm"}:
         errors.append(f"{prefix}.confirm_mode must be auto or voice_confirm")
-    for field_name in ("input_topic", "asr_status_topic", "asr_control_topic"):
-        value = voice_bridge.get(field_name, "/")
-        if not isinstance(value, str) or not value.startswith("/"):
-            errors.append(f"{prefix}.{field_name} must be an absolute ROS topic name")
+    input_topic = voice_bridge.get("input_topic", "/")
+    if not isinstance(input_topic, str) or not input_topic.startswith("/"):
+        errors.append(f"{prefix}.input_topic must be an absolute ROS topic name")
+    for field_name in ("partial_topic", "asr_status_topic", "asr_control_topic"):
+        # voice_asr_node publishes and listens on fixed topics; a different name here would only
+        # silently disable realtime stop or muting ASR during TTS.
+        if field_name in voice_bridge:
+            errors.append(f"{prefix}.{field_name} is fixed by voice_asr_node and must not be configured")
     for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
         value = voice_bridge.get(field_name, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
             errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
     if "stop_phrases" in voice_bridge and not voice_bridge["stop_phrases"]:
         errors.append(f"{prefix}.stop_phrases must not be empty")
+    if "busy_message" in voice_bridge:
+        busy_message = voice_bridge["busy_message"]
+        stop_phrases = voice_bridge.get("stop_phrases") or STOP_PHRASES
+        if not isinstance(busy_message, str) or not busy_message.strip():
+            errors.append(f"{prefix}.busy_message must be a non-empty string")
+        elif isinstance(stop_phrases, list | tuple) and any(
+            isinstance(phrase, str)
+            and normalize_trigger_text(phrase)
+            and normalize_trigger_text(phrase) in normalize_trigger_text(busy_message)
+            for phrase in stop_phrases
+        ):
+            # Spoken while the microphone stays open for stop words: the bridge would stop itself.
+            errors.append(f"{prefix}.busy_message must not contain a stop phrase")
     for field_name in (
         "confirm_timeout_sec",
         "session_idle_sec",

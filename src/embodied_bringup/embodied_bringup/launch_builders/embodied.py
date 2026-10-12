@@ -831,7 +831,9 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "tts_synthesis_service": voice_tts.get("service_name", "/voice_tts/synthesize"),
         "tts_playback_service": voice_tts.get("playback_service_name", "/voice_tts/play"),
     }
-    for field_name in ("asr_status_topic", "asr_control_topic", "partial_topic", "confirm_mode", "busy_message"):
+    # /voice_partial, /voice_status and /voice_control are fixed by voice_asr_node; the bridge keeps
+    # its own defaults for them and the loader rejects YAML overrides that could only break them.
+    for field_name in ("confirm_mode", "busy_message"):
         if field_name in voice_bridge:
             params[field_name] = str(voice_bridge[field_name])
     for field_name in (

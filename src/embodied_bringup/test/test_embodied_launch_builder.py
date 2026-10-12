@@ -606,6 +606,10 @@ def test_agent_voice_bridge_follows_agent_channel_and_executes_without_second_co
     assert _decode_launch_string(params["request_topic"]) == "/agent/request"
     # Behaviour defaults live once, in the node; launch only forwards what the YAML sets.
     assert "confirm_mode" not in params and "stop_phrases_json" not in params
+    # The bridge is the Agent's client for exactly this robot.
+    assert _decode_launch_string(params["robot_scope"]) == "so101_single_arm"
+    # voice_asr_node fixes its partial/status/control topics; launch never re-points the bridge.
+    assert not {"partial_topic", "asr_status_topic", "asr_control_topic"} & set(params)
 
     opted_in = _voice_bridge_nodes(enabled=True, confirm_mode="voice_confirm", stop_phrases=["停"])
     params = _normalize_launch_param_mapping(vars(opted_in["agent_voice_bridge"])["_Node__parameters"][0])

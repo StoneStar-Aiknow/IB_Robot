@@ -112,6 +112,36 @@ def test_response_plugin_sync_is_idempotent_and_contains_no_ros_dependencies(tmp
     assert "rclpy" not in (target / "hermes_response_plugin.py").read_text()
 
 
+@pytest.mark.parametrize("plugin", ["ibrobot-response", "ibrobot-motion"])
+def test_synced_stop_contract_imports_its_copied_vocabulary_without_embodied_common(tmp_path, plugin):
+    import subprocess
+    import sys
+
+    from embodied_common.control_phrases import STOP_PHRASES
+
+    resource = tmp_path / "resource"
+    resource.mkdir()
+    (resource / "RESPONSE_PROTOCOL.md").write_text("protocol")
+    hermes_configure._sync_response_plugin(tmp_path, resource, dry_run=False)
+    hermes_configure._sync_motion_plugin(tmp_path, dry_run=False)
+    target = tmp_path / "plugins" / plugin
+    # Hermes' interpreter has no IB-Robot packages: -I drops PYTHONPATH and the workspace overlay.
+    script = (
+        "import importlib, sys, types\n"
+        "package = types.ModuleType('plugin_under_test')\n"
+        "package.__path__ = [sys.argv[1]]\n"
+        "sys.modules['plugin_under_test'] = package\n"
+        "contract = importlib.import_module('plugin_under_test.stop_contract')\n"
+        "assert 'embodied_common' not in sys.modules\n"
+        "print('|'.join(sorted(contract.STOP_PHRASES)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(target)], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.strip().split("|") == sorted(STOP_PHRASES)
+
+
 def test_response_plugin_sync_preserves_user_owned_plugin(tmp_path):
     target = tmp_path / "plugins" / "ibrobot-response"
     target.mkdir(parents=True)

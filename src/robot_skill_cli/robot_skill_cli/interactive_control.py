@@ -26,6 +26,7 @@ from embodied_common.agent_execution_contract import (
     validate_agent_execution_mode,
 )
 from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
+from embodied_common.control_phrases import CONTINUE_PHRASES
 from embodied_common.tracing import create_trace_logger, sanitize_trace_id, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
 from robot_skill_cli.stop_contract import STOP_PHRASES
@@ -47,7 +48,6 @@ _CONFIRM_PHRASES = (
     "是的",
     "confirm",
 )
-CONTINUE_PHRASES = ("继续吧", "继续", "接着来", "go on", "continue")
 
 INTENT_CONFIRM = "confirm"
 INTENT_STOP = "stop"

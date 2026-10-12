@@ -1,6 +1,11 @@
 """ROS-free stop vocabulary shared with the installed Hermes adapter."""
 
-STOP_PHRASES = frozenset({"别动了", "别动", "停止", "停下", "停", "stop", "halt"})
+try:
+    from .control_phrases import STOP_PHRASES as _STOP_PHRASES
+except ImportError:
+    from embodied_common.control_phrases import STOP_PHRASES as _STOP_PHRASES
+
+STOP_PHRASES = frozenset(_STOP_PHRASES)
 
 
 def is_stop(text: str) -> bool:

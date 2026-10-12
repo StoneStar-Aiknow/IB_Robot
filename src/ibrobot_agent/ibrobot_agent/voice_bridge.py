@@ -6,7 +6,9 @@ a client acknowledges the exact-plan ``presentation`` event.  This module is the
 voice client of that contract: it wraps utterances into requests, routes stop
 keywords to ``/agent/control`` (already from partial transcripts, so motion stops
 before the utterance ends), renders presentations (log, optional TTS) before
-acknowledging them, and speaks Agent replies.
+acknowledging them, and speaks Agent replies.  While a request can still be
+interrupted, speaking never mutes ASR: the stop keyword stays live and the
+bridge's own replies (which therefore carry no stop word) are filtered out.
 
 ``VoiceBridgeCore`` is ROS-free and returns transport actions so the protocol
 logic is unit-testable; ``VoiceBridgeNode`` only executes those actions.
@@ -14,6 +16,7 @@ logic is unit-testable; ``VoiceBridgeNode`` only executes those actions.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -25,22 +28,29 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from embodied_common.control_phrases import STOP_PHRASES
 from embodied_common.text_normalization import normalize_trigger_text
-from ibrobot_agent.contracts import TERMINAL_REQUEST_STATES
+from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_STATES
 from ibrobot_agent.presentation import presentation_digest
 
 CONFIRM_MODES = ("auto", "voice_confirm")
 _ACTIVE_ASR_STATES = {"listening", "recognizing"}
+#: A refusal can contain a confirm word ("不执行" has 执行, "我不确定" has 确定); it must never
+#: acknowledge a plan. "没" is left out on purpose: "没问题" is consent.
+_NEGATION_MARKERS = ("不", "别")
+_PHRASE_FIELDS = ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases")
 
 
 @dataclass(frozen=True)
 class VoiceBridgeConfig:
     channel_id: str = "voice_asr"
     principal_id: str = "local_operator"
-    robot_scope: str = "so101_single_arm"
-    stop_phrases: tuple[str, ...] = ("停止", "别动", "停", "stop", "halt")
+    # Robot-specific and part of the Agent request key: always given by the launch builder.
+    robot_scope: str = ""
+    stop_phrases: tuple[str, ...] = STOP_PHRASES
     bypass_phrases: tuple[str, ...] = ()
-    confirm_mode: str = "auto"
+    # Without knowing about TTS, the safe default is a spoken confirmation (see resolve_confirm_mode).
+    confirm_mode: str = "voice_confirm"
     confirm_phrases: tuple[str, ...] = ("确认", "确定", "好的", "执行")
     cancel_phrases: tuple[str, ...] = ("取消", "算了", "不要")
     confirm_timeout_sec: float = 20.0
@@ -48,11 +58,15 @@ class VoiceBridgeConfig:
     min_text_chars: int = 2
     request_timeout_sec: float = 180.0
     speak_replies: bool = True
-    busy_message: str = "我正在执行上一个任务，请稍等，或者说停止。"
+    # Spoken while a request runs and the microphone stays open for stop words, so it must not
+    # contain one (the bridge would hear itself and stop the robot).
+    busy_message: str = "我正在执行上一个任务，请稍等。"
     # Domain term -> homophones the ASR model prefers (e.g. 夹爪 jiā zhǎo is heard as 家找/家长).
     text_corrections: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
+        if not str(self.robot_scope).strip():
+            raise ValueError("robot_scope must be the Agent's robot scope")
         if self.confirm_mode not in CONFIRM_MODES:
             raise ValueError(f"confirm_mode must be one of {CONFIRM_MODES}")
         for name in ("confirm_timeout_sec", "session_idle_sec", "request_timeout_sec"):
@@ -60,10 +74,12 @@ class VoiceBridgeConfig:
                 raise ValueError(f"{name} must be positive")
         if self.min_text_chars < 1:
             raise ValueError("min_text_chars must be at least 1")
-        for name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+        for name in _PHRASE_FIELDS:
             object.__setattr__(self, name, tuple(_normalize(item) for item in getattr(self, name) if _normalize(item)))
         if not self.stop_phrases:
             raise ValueError("stop_phrases must not be empty")
+        if any(phrase in _normalize(self.busy_message) for phrase in self.stop_phrases):
+            raise ValueError("busy_message must not contain a stop phrase: the bridge would stop its own request")
         corrections = []
         for term, variants in self.text_corrections:
             term = str(term).strip()
@@ -190,6 +206,15 @@ class VoiceBridgeCore:
     def awaiting_confirmation(self) -> bool:
         return self._state.pending is not None
 
+    @property
+    def interruptible(self) -> bool:
+        """True while a stop keyword still has a target, so the microphone must stay open."""
+        return bool(self._stop_target())
+
+    def is_stop_text(self, text: str) -> bool:
+        """True when ``text`` contains a stop keyword (after the domain corrections)."""
+        return self._contains_stop(_normalize(self.config.correct(str(text).strip())))
+
     def on_transcript(self, text: str, now: float) -> list[Action]:
         stopped_by_partial, self._state.utterance_stopped = self._state.utterance_stopped, False
         heard = str(text).strip()
@@ -211,8 +236,7 @@ class VoiceBridgeCore:
         Final transcripts only arrive after VAD silence plus tail padding, which is
         seconds of extra motion when the user says "停".
         """
-        normalized = _normalize(self.config.correct(str(text).strip()))
-        if not normalized or not self._contains_stop(normalized):
+        if not self.is_stop_text(text):
             return []
         if self._state.utterance_stopped or not self._stop_target():
             return []
@@ -316,7 +340,8 @@ class VoiceBridgeCore:
             actions += [
                 Log(f"request {request_id} produced no terminal event; stopping and releasing channel"),
                 PublishControl({"operation": "stop", "request_id": request_id}),
-                *self._say("任务超时，已停止。"),
+                # Still a stop target while this plays: the reply must not contain a stop word.
+                *self._say("任务超时，正在中止。"),
             ]
         return actions
 
@@ -339,6 +364,17 @@ class VoiceBridgeCore:
         presentation = detail.get("presentation")
         if not isinstance(presentation, dict) or presentation_digest(presentation) != detail.get("presentation_digest"):
             return [Log(f"presentation digest mismatch for {request_id}; not acknowledging")]
+        summary = _presentation_summary(presentation, payload.get("user_message", ""))
+        plan_log = Log("exact plan " + json.dumps(presentation, ensure_ascii=False, sort_keys=True))
+        if detail.get("async_display") is True or presentation.get("execution_mode") == ASYNC_PRESENTATION_MODE:
+            # Typed Programs execute without waiting for any client: there is no receipt to give, and
+            # asking for a confirmation that cannot hold the robot back would mislead the user.
+            gate = (
+                [Log(f"voice_confirm cannot gate {request_id}: the Agent executes typed Programs without a receipt")]
+                if self.config.confirm_mode == "voice_confirm"
+                else []
+            )
+            return [plan_log, *gate, *self._say(f"正在执行：{summary}。")]
         acknowledgement = PublishControl(
             {
                 "operation": "presentation_rendered",
@@ -348,8 +384,6 @@ class VoiceBridgeCore:
                 "receipt_token": detail.get("receipt_token", ""),
             }
         )
-        summary = _presentation_summary(presentation, payload.get("user_message", ""))
-        plan_log = Log("exact plan " + json.dumps(presentation, ensure_ascii=False, sort_keys=True))
         if self.config.confirm_mode == "auto":
             return [plan_log, Speak(f"准备执行：{summary}。", then=(acknowledgement,))]
         self._state.pending = _PendingConfirmation(
@@ -364,6 +398,9 @@ class VoiceBridgeCore:
         assert pending is not None
         if any(phrase in normalized for phrase in self.config.cancel_phrases):
             return self._stop(now, reason=f"cancel phrase {raw!r}")
+        if any(marker in normalized for marker in _NEGATION_MARKERS):
+            # Keyword matching would read "不执行" as consent; a negated answer asks again instead.
+            return [Log(f"negated answer {raw!r} is not a confirmation"), *self._say("请说确认或取消。")]
         if any(phrase in normalized for phrase in self.config.confirm_phrases):
             self._state.pending = None
             return [Log(f"confirmed {pending.request_id} by {raw!r}"), pending.acknowledgement]
@@ -433,6 +470,52 @@ def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def resolve_confirm_mode(configured: str, *, tts_enabled: bool) -> str:
+    """Pick the confirmation mode, defaulting to an explicit spoken confirmation without TTS.
+
+    Only the legacy Agent Plan path waits for the receipt this decides; typed Programs execute
+    without one. ``auto`` acknowledges the presentation once the exact plan has been rendered.
+    Without TTS the only rendering is the log line, so an unset mode falls back to ``voice_confirm``
+    and a human act gates that path; ``auto`` without TTS must be chosen explicitly (see the README).
+    """
+    if configured:
+        return configured
+    return "auto" if tts_enabled else "voice_confirm"
+
+
+def node_parameter_defaults() -> dict[str, Any]:
+    """ROS parameter defaults: transport names plus every ``VoiceBridgeConfig`` default, declared once."""
+    defaults: dict[str, Any] = {
+        "input_topic": "/voice_command",
+        # voice_asr_node publishes/listens on these fixed names; an empty partial_topic disables
+        # the realtime (partial-transcript) stop.
+        "partial_topic": "/voice_partial",
+        "asr_status_topic": "/voice_status",
+        "asr_control_topic": "/voice_control",
+        "request_topic": "/agent/request",
+        "response_topic": "/agent/response",
+        "event_topic": "/agent/event",
+        "control_topic": "/agent/control",
+        "tts_enabled": False,
+        "tts_synthesis_service": "/voice_tts/synthesize",
+        "tts_playback_service": "/voice_tts/play",
+        "tts_timeout_sec": 60.0,
+        "mute_asr_during_tts": True,
+        "resume_settle_sec": 1.0,
+    }
+    for item in dataclasses.fields(VoiceBridgeConfig):
+        if item.name in _PHRASE_FIELDS:
+            defaults[f"{item.name}_json"] = json.dumps(list(item.default), ensure_ascii=False)
+        elif item.name == "text_corrections":
+            defaults["text_corrections_json"] = json.dumps(dict(item.default), ensure_ascii=False)
+        elif item.name == "confirm_mode":
+            # Empty: resolve_confirm_mode derives it from tts_enabled.
+            defaults["confirm_mode"] = ""
+        else:
+            defaults[item.name] = item.default
+    return defaults
+
+
 def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
     return VoiceBridgeConfig(
         channel_id=str(values["channel_id"]),
@@ -440,7 +523,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         robot_scope=str(values["robot_scope"]),
         stop_phrases=_string_tuple(values["stop_phrases_json"], "stop_phrases"),
         bypass_phrases=_string_tuple(values["bypass_phrases_json"], "bypass_phrases"),
-        confirm_mode=str(values["confirm_mode"]),
+        confirm_mode=resolve_confirm_mode(str(values["confirm_mode"]), tts_enabled=bool(values["tts_enabled"])),
         confirm_phrases=_string_tuple(values["confirm_phrases_json"], "confirm_phrases"),
         cancel_phrases=_string_tuple(values["cancel_phrases_json"], "cancel_phrases"),
         confirm_timeout_sec=float(values["confirm_timeout_sec"]),
@@ -521,38 +604,7 @@ def _build_node_class():
 
         def __init__(self) -> None:
             super().__init__("agent_voice_bridge")
-            defaults = {
-                "input_topic": "/voice_command",
-                # Empty disables realtime (partial-transcript) stop.
-                "partial_topic": "/voice_partial",
-                "asr_status_topic": "/voice_status",
-                "asr_control_topic": "/voice_control",
-                "request_topic": "/agent/request",
-                "response_topic": "/agent/response",
-                "event_topic": "/agent/event",
-                "control_topic": "/agent/control",
-                "channel_id": "voice_asr",
-                "principal_id": "local_operator",
-                "robot_scope": "so101_single_arm",
-                "stop_phrases_json": json.dumps(list(VoiceBridgeConfig.stop_phrases), ensure_ascii=False),
-                "bypass_phrases_json": "[]",
-                "confirm_mode": "auto",
-                "confirm_phrases_json": json.dumps(list(VoiceBridgeConfig.confirm_phrases), ensure_ascii=False),
-                "cancel_phrases_json": json.dumps(list(VoiceBridgeConfig.cancel_phrases), ensure_ascii=False),
-                "confirm_timeout_sec": 20.0,
-                "session_idle_sec": 120.0,
-                "min_text_chars": 2,
-                "request_timeout_sec": 180.0,
-                "speak_replies": True,
-                "busy_message": VoiceBridgeConfig.busy_message,
-                "text_corrections_json": "{}",
-                "tts_enabled": False,
-                "tts_synthesis_service": "/voice_tts/synthesize",
-                "tts_playback_service": "/voice_tts/play",
-                "tts_timeout_sec": 60.0,
-                "mute_asr_during_tts": True,
-                "resume_settle_sec": 1.0,
-            }
+            defaults = node_parameter_defaults()
             for name, value in defaults.items():
                 self.declare_parameter(name, value)
             values = {name: self.get_parameter(name).value for name in defaults}
@@ -576,6 +628,9 @@ def _build_node_class():
             # would be routed as a new command (possibly re-triggering this very reply). Ignore
             # transcripts until the ASR resume has settled.
             self._deaf_until = 0.0
+            # While a request can be interrupted ASR is not muted; until then only stop words pass,
+            # so the robot's own reply is not routed as a command.
+            self._echo_until = 0.0
             self._resume_settle_sec = float(values["resume_settle_sec"])
 
             inbound = MutuallyExclusiveCallbackGroup()
@@ -599,14 +654,20 @@ def _build_node_class():
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
             self._speech_thread = threading.Thread(target=self._speech_loop, daemon=True)
             self._speech_thread.start()
+            confirm_mode = self._core.config.confirm_mode
             self.get_logger().info(
                 f"voice bridge ready: {values['input_topic']} -> {values['request_topic']} "
-                f"(channel={values['channel_id']}, confirm_mode={values['confirm_mode']}, "
+                f"(channel={values['channel_id']}, confirm_mode={confirm_mode}, "
                 f"tts={'on' if self._speaker else 'off'})"
             )
+            if self._speaker is None:
+                self.get_logger().warning(
+                    "TTS is off: each exact plan is rendered only to this log; nobody hears it before the robot moves"
+                )
 
         def _on_transcript(self, message: String) -> None:
-            if time.monotonic() < self._deaf_until:
+            now = time.monotonic()
+            if now < self._deaf_until or (now < self._echo_until and not self._core.is_stop_text(message.data)):
                 self.get_logger().info(f"ignored transcript heard during playback: {message.data!r}")
                 return
             self._run(lambda now: self._core.on_transcript(message.data, now))
@@ -678,17 +739,31 @@ def _build_node_class():
                     self.get_logger().error(f"speech rendering failed: {error!r}{dropped}")
 
         def _render_speech(self, action: Speak) -> None:
-            muted = self._mute_asr and self._asr_state in _ACTIVE_ASR_STATES
+            with self._core_lock:
+                interruptible = self._core.interruptible
+            # Muting ASR would also drop the stop keyword, so it is only done while nothing can move.
+            # A reply that itself contains a stop word would stop the request it talks about, so it
+            # still mutes (and says so).
+            keep_listening = interruptible and not self._core.is_stop_text(action.text)
+            if interruptible and not keep_listening:
+                self.get_logger().warning(f"reply contains a stop word; ASR is muted while it plays: {action.text!r}")
+            muted = self._mute_asr and not keep_listening and self._asr_state in _ACTIVE_ASR_STATES
+            filter_echo = self._mute_asr and keep_listening
             if muted:
                 self._asr_control_publisher.publish(String(data="stop"))
                 self._deaf_until = float("inf")
+            elif filter_echo:
+                self._echo_until = float("inf")
             try:
                 self.get_logger().info(f"[say] {action.text}")
                 spoken = self._speaker.speak(action.text)
             finally:
+                settled = time.monotonic() + self._resume_settle_sec
                 if muted:
                     self._asr_control_publisher.publish(String(data="start"))
-                    self._deaf_until = time.monotonic() + self._resume_settle_sec
+                    self._deaf_until = settled
+                elif filter_echo:
+                    self._echo_until = settled
             if spoken:
                 self._execute(action.then)
             elif action.then:
