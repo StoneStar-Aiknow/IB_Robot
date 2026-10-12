@@ -398,3 +398,34 @@ def test_vad_audio_contract_mismatch_fails_closed():
     node = make_node(vad_runtime=FakeVADRuntime(frame_size=256))
     with pytest.raises(ValueError, match="frame_size=256"):
         node._validate_vad_audio_contract(node._vad_runtime)
+
+
+def test_failed_final_decode_drops_the_utterance_and_keeps_listening():
+    node = make_node(vad_state=VADState.SILENCE, node_state=NodeState.RECOGNIZING)
+    node._audio_capture.chunks.append(np.zeros(512, dtype=np.float32))
+
+    def raise_final():
+        raise RuntimeError("encoder execute failed")
+
+    node._asr.end_streaming = raise_final
+
+    node._process_audio()
+
+    assert node.commands == []
+    assert node._state_machine.state is NodeState.LISTENING
+    assert node._asr.reset_calls == 1
+
+
+def test_stop_recognition_returns_to_idle_when_final_decode_fails():
+    node = make_node(node_state=NodeState.RECOGNIZING)
+
+    def raise_final():
+        raise RuntimeError("encoder execute failed")
+
+    node._asr.end_streaming = raise_final
+
+    node._on_stop_recognition(SimpleNamespace(), SimpleNamespace())
+
+    assert node.commands == []
+    assert node._state_machine.state is NodeState.IDLE
+    assert not node._audio_capture.started

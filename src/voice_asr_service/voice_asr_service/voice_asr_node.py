@@ -19,7 +19,7 @@ from std_srvs.srv import Empty
 
 from ibrobot_msgs.srv import RecognizeFile, SetHotwords
 
-from .asr_inference_module import ASRInferenceModule
+from .asr_inference_module import ASRInferenceModule, ASRResult
 from .audio_capture_module import AudioCaptureModule, AudioConfig
 from .defaults import VOICE_ASR_DEFAULTS
 from .file_input_module import FileInputModule
@@ -303,6 +303,16 @@ class VoiceASRNode(Node):
         vad.initialize()
         return vad
 
+    def _end_streaming(self, trigger: str) -> ASRResult:
+        """End the active recognition; a failed final decode drops the utterance, not the node."""
+        try:
+            return self._asr.end_streaming()
+        except Exception as e:
+            # Every caller runs inside an executor callback, so a propagated
+            # error would end spin() and take the whole ASR node down.
+            self.get_logger().error(f"Final ASR decode failed ({trigger}); utterance dropped: {e}")
+            return ASRResult(text="", is_final=True)
+
     def _reset_recognition_runtime(self, clear_audio: bool = False):
         self._recording_start_time = None
         self._last_partial_text = ""
@@ -433,7 +443,7 @@ class VoiceASRNode(Node):
 
         elif vad_result.state == VADState.SILENCE:
             if self._state_machine.is_recognizing():
-                final_result = self._asr.end_streaming()
+                final_result = self._end_streaming("vad_silence_detected")
 
                 if final_result.text:
                     self._publish_command(final_result.text, final_result.confidence)
@@ -454,7 +464,7 @@ class VoiceASRNode(Node):
             self.get_logger().warn("Recognition timeout, forcing final result")
 
             latency = time.time() - self._recording_start_time
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("timeout")
 
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
@@ -483,7 +493,7 @@ class VoiceASRNode(Node):
         )
 
         if self._state_machine.is_recognizing():
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("audio_capture_stalled")
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
             else:
@@ -541,7 +551,7 @@ class VoiceASRNode(Node):
     def _on_stop_recognition(self, request, response):
         """停止识别服务回调"""
         if self._state_machine.is_recognizing():
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("service_request")
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
 
@@ -631,7 +641,7 @@ class VoiceASRNode(Node):
             self._state_machine.is_listening() or self._state_machine.is_recognizing()
         ):
             if self._state_machine.is_recognizing():
-                final_result = self._asr.end_streaming()
+                final_result = self._end_streaming("topic_command")
                 if final_result.text:
                     self._publish_command(final_result.text, final_result.confidence)
             self._audio_capture.stop_capture()

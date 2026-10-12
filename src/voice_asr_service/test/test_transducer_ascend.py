@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 
 from voice_asr_service.transducer_ascend import OnlineFbank
@@ -25,7 +27,8 @@ def test_reset_keeps_a_runtime_only_module_ready():
     from voice_asr_service.asr_inference_module import ASRInferenceModule, ASRState
 
     module = ASRInferenceModule()
-    module._runtime_handle = object()
+    # A healthy handle: reset() only asks whether the runtime needs recovery.
+    module._runtime_handle = SimpleNamespace(reset_required=False)
     module.state = ASRState.READY
 
     module.reset()

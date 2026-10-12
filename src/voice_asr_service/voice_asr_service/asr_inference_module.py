@@ -479,21 +479,25 @@ class ASRInferenceModule:
             if self._active_stream is None:
                 return ASRResult(text="", is_final=True)
 
-            result = self._runtime_handle.step(
-                self._active_stream,
-                ModelRequest(inputs={"audio": np.zeros(0, dtype=np.float32)}, metadata={"final": True}),
-                self._runtime_context,
-            )
-            text = str(result.outputs.get("text", ""))
-
-            result = ASRResult(text=text, is_final=True, confidence=1.0)
-
-            self._runtime_handle.close_stream(self._active_stream, self._runtime_context)
+            # The recognition ends here whether or not the final decode succeeds:
+            # a failed step must not keep the single open-stream slot or leave the
+            # facade in RECOGNIZING, where start_streaming() is refused forever.
+            stream = self._active_stream
             self._active_stream = None
             self._last_stream_text = ""
             self.state = ASRState.READY
+            try:
+                result = self._runtime_handle.step(
+                    stream,
+                    ModelRequest(inputs={"audio": np.zeros(0, dtype=np.float32)}, metadata={"final": True}),
+                    self._runtime_context,
+                )
+                text = str(result.outputs.get("text", ""))
+            finally:
+                self._runtime_handle.close_stream(stream, self._runtime_context)
+                self._recover_runtime_locked()
 
-            return result
+            return ASRResult(text=text, is_final=True, confidence=1.0)
 
     def end_streaming(self) -> ASRResult:
         """结束流式识别并返回最终结果"""
@@ -646,6 +650,25 @@ class ASRInferenceModule:
         if self._recognizer and hasattr(self._recognizer, "set_hotwords"):
             self._recognizer.set_hotwords({})
 
+    def _recover_runtime_locked(self) -> bool:
+        """Clear a runtime-scope recovery requirement left by a failed step.
+
+        A runtime_exclusive state bank (Ascend) turns an unknown step outcome
+        into RESET_REQUIRED with admission closed; closing the stream does not
+        reopen it, so every later open_stream() would raise recovery_required.
+        A failed reset leaves the facade in ERROR so start_streaming() refuses
+        explicitly instead of failing on each utterance.
+        """
+        if self._runtime_handle is None or not self._runtime_handle.reset_required:
+            return True
+        try:
+            self._runtime_handle.reset(self._runtime_context)
+        except Exception as e:
+            self._last_error = f"ASR runtime recovery failed: {e}"
+            self.state = ASRState.ERROR
+            return False
+        return True
+
     def reset(self):
         """重置识别状态"""
         with self._lock:
@@ -657,6 +680,8 @@ class ASRInferenceModule:
             self._active_stream = None
             self._pending_stream = None
             self._last_stream_text = ""
+            if not self._recover_runtime_locked():
+                return
             if self._is_initialized:
                 self.state = ASRState.READY
             elif self._last_error:
