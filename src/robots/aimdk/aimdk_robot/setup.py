@@ -15,6 +15,7 @@ setup(
         ("share/" + package_name + "/profiles", glob("profiles/*.yaml")),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",

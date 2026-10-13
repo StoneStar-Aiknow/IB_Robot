@@ -1549,14 +1549,14 @@ class AimdkRuntimeNode(Node):
             prefix="aimdk/alert",
         )
 
-    def _publish_diagnostics(self, entries: list[tuple[str, str, int]], *, prefix: str) -> None:
+    def _publish_diagnostics(self, entries: list[tuple[str, str, int | bytes]], *, prefix: str) -> None:
         array = DiagnosticArray()
         array.header.stamp = self.get_clock().now().to_msg()
         for detail, code, level in entries:
             status = DiagnosticStatus()
             status.name = f"{prefix}/{code}"
             status.hardware_id = self._state.name
-            status.level = bytes([level])
+            status.level = level if isinstance(level, bytes) else bytes([level])
             status.message = detail
             status.values = [KeyValue(key="code", value=code)]
             array.status.append(status)
