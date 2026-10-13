@@ -1,0 +1,128 @@
+# Unitree G1 (29 DoF + Dex3) application configuration.
+#
+# Runtime ownership: every vendor fact — DDS topics, RPC api ids, FSM ids,
+# joint order, arm_sdk gains, QoS, peripherals — lives in the unitree_g1_robot
+# runtime profile (unitree_g1_robot/profiles/g1_29dof_dex3.yaml). This file
+# selects that runtime and states what the application requires of it.
+#
+# Deployment note: the G1 vendor DDS tier speaks CycloneDDS, so the whole
+# deployment — the runtime and every application node that calls its services
+# — must run rmw_cyclonedds_cpp; export RMW_IMPLEMENTATION before launching
+# (the runtime launch verifies this in real transport and fails closed).
+# The launch argument network_interface:=<nic> additionally binds CycloneDDS
+# to the NIC the robot is wired to (see
+# src/robots/unitree/unitree_g1_robot/README.md). The MID-360 and D435
+# instance values (IPs, serials) arrive via the launch argument's peripherals
+# fragment, never hand-edited per unit here.
+
+robot:
+  name: unitree_g1
+  # Must match the selected runtime profile's public robot identity. Vendor
+  # family metadata remains robot_type=unitree_g1 below.
+  type: g1_29dof_dex3
+  robot_type: unitree_g1  # For LeRobot dataset metadata
+
+  simulation:
+    # The in-repo vendor mock stands in for the robot's DDS tier; there is no
+    # physics simulation.
+    platform: sdk
+
+  runtime:
+    provider: unitree_g1_robot
+    profile: g1_29dof_dex3
+    # No public model is published for the G1 in this stage (design D6): the
+    # launch starts robot_state_publisher from the vendored URDF for TF only
+    # and never passes it to build_description, so consumers must not require
+    # one. Policy inference and dataset recording that need normalization
+    # metadata go through refactor-embodiment-control-bindings instead.
+    require_model: false
+
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      # Dex3 is a 7-joint-per-hand dexterous hand: hand.multi_joint, NOT
+      # gripper.1d (design D3) — a Dex3 finger is not a scalar aperture.
+      - hand.multi_joint
+      - base.cmd_vel
+      - motion.named
+      - motion.posture
+      - interaction.tts
+      - interaction.led
+      # Composed shared-driver peripherals (design D8), not vendor SDK
+      # endpoints: the declared topics are the ones the composed drivers
+      # actually serve.
+      - perception.camera
+      - perception.lidar
+      - perception.imu
+      # power.state is not required: which vendor topic publishes the G1's
+      # pack state is unverified (gate 6.1), so the runtime declares none.
+      # interaction.audio_playback likewise returns with its vendor source
+      # confirmed on hardware (gate 6.1).
+      - runtime.stop
+
+  # Control mode management. The runtime owns what each mode means on the
+  # platform (stream = the arm_sdk handover, locomotion = SetFsmId(start));
+  # the application only selects it.
+  default_control_mode: "teleop"
+  controller_startup_timeout:
+    sim: 120.0
+    hardware: 60.0
+
+  control_modes:
+    teleop:
+      description: "Operator-streamed upper body control"
+      description_cn: "遥操作上半身流式控制"
+      runtime_mode: stream
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+    base_navigation:
+      description: "Velocity control of the legged base"
+      description_cn: "足式底盘速度控制"
+      runtime_mode: locomotion
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: base_navigation
+        queue_size: 50
+        control_frequency: 50.0
+
+  # The G1 runtime serves no audio contract: the vendor voice service plays
+  # named streams (StartPlay/StopPlay), and no PCM capture or playback topic
+  # is verified on the unit (gate 6.1). The shared ALSA nodes would publish
+  # and subscribe against endpoints nothing serves, so they stay off.
+  audio_io:
+    enabled: false
+
+  # The vendor voice RPC carries an ASR api id, but no ASR surface is bridged
+  # or verified; enabling the ASR stack needs a runtime-provided capture
+  # source that does not exist yet (gate 6.1).
+  voice_asr:
+    enabled: false
+
+  # The platform's own speech output is exposed as interaction.tts on
+  # /speech/speak; the ZipVoice synthesis service is not launched.
+  voice_tts:
+    enabled: false
+
+  # No continuous odometry or localization pose is served yet: the fast-lio
+  # lidar odometry chain stays disabled until the MID-360 network facts are
+  # confirmed on hardware (gate 6.1), so there is no map input either.
+  semantic_mapping:
+    enabled: false
+
+  # The embodied skill stack is not enabled for the G1 yet: its primitive
+  # vocabulary has no entry for the platform's named arm actions or FSM
+  # postures. Those primitives are the separate coordination change against
+  # the shared embodied stack (see the unitree-g1-runtime-migration OpenSpec,
+  # section 5); the optional unitree_g1_skills.yaml deployment that would
+  # reuse runtime_named_motion is deliberately not shipped in this stage.
+  embodied:
+    enabled: false
