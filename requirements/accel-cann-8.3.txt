@@ -1,0 +1,39 @@
+# Ascend CANN 8.3 accelerator dependencies. Selected by
+# scripts/setup/accels/cann.sh and installed on every OS when the accelerator
+# axis resolves to cann: an Ascend NPU needs this Torch ABI whether the host
+# runs openEuler Embedded or Ubuntu.
+#
+# Pins the ABI set Ascend documents for CANN 8.3.RC1 (torch_npu 2.8.0 requires
+# exactly torch 2.8.0; torchvision 0.23.0 matches) instead of whatever the
+# lerobot editable install resolves. torch 2.8.0 sits inside LeRobot's declared
+# torch>=2.7,<2.12, so unlike CANN 8.1 no metadata exception applies — only the
+# override ordering. The triple is taken from the official compatibility table
+# with aarch64 wheel availability verified (cp310/cp311); it has not run on
+# hardware yet, unlike the 8.1 set. The constraint file is also exported as
+# PIP_CONSTRAINT for every transaction; keeping it here as well means a direct
+# install of this file cannot drift either.
+-c constraints-cann-8.3.txt
+# Install, not merely constrain, every version constraints-cann-8.3.txt pins.
+# The constraint is activated only after LeRobot resolves, so a package LeRobot
+# already installed at another version would otherwise keep it: a constraint
+# does not retroactively downgrade. Keep this list in step with the constraint
+# file; test_cann_torch_versions.sh asserts that.
+torch==2.8.0
+torch_npu==2.8.0
+torchvision==0.23.0
+# Non-Torch halves pinned for the same reasons as CANN 8.1: the measured PI0.5
+# behaviour and the ROS ABI.
+transformers==5.3.0
+tokenizers==0.22.2
+safetensors==0.8.0
+pillow==10.3.0
+opencv-python-headless==4.11.0.86
+# Required by the CANN TBE Python adapter; torch_npu does not declare it even
+# though graph compilation imports it in a child interpreter.
+decorator
+# LeRobot's own resolution installs torchcodec on aarch64, and that wheel's
+# extension is ABI-bound to a newer Torch while declaring no torch requirement
+# at all, so pip leaves it in place after this file pins Torch.
+# accels/cann.sh::accel_post_requirements uninstalls it so LeRobot falls back
+# to the PyAV decoder installed here.
+av>=15,<16

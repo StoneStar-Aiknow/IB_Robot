@@ -354,9 +354,15 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 
 ## Phase 5 — Run setup.sh
 
+`--accel cann` is required: the accelerator axis probes `/dev/davinci*`,
+which the qemu chroot does not expose, so detection would resolve to `cpu` and
+skip `torch_npu` and the CANN Torch ABI entirely. The override states which
+runtime to install rather than which hardware is present. Drop it only to
+verify the CPU-only profile on purpose.
+
 ```bash
 docker exec -d verify-oee bash -c \
-  'chroot /root/openeuler_rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --no-sudo > /tmp/setup.log 2>&1"'
+  'chroot /root/openeuler_rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --no-sudo --accel cann > /tmp/setup.log 2>&1"'
 ```
 
 Monitor progress (qemu-user 模拟下 pip 安装很慢，全流程约 20-40 min):

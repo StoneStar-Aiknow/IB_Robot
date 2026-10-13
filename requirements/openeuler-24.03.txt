@@ -1,12 +1,9 @@
+# openEuler Embedded OS dependencies. This file is the OS axis only: the Torch
+# ABI and torch_npu belong to the accelerator axis and are selected by
+# scripts/setup/accels/cann.sh from requirements/accel-cann-*.txt, so they
+# install on any OS carrying an Ascend NPU rather than on this OS alone.
 aiortc
 onnx
 onnxruntime
 pygraphviz
 atomgit_sdk
-# Ascend NPU backend; pinned to 2.10.0.post4 to match the torch version
-# locked by the lerobot editable install (torch==2.10.0, see
-# libs/lerobot/requirements-ubuntu.txt). Without this pin pip backtracks
-# through torch_npu 2.12.0/2.11.0 (which require torch>=2.11, outside the
-# lerobot range) and wastes minutes resolving on aarch64 OEE Docker.
-# CANN 8.1 setup selects openeuler-24.03-cann-8.1.txt instead.
-torch_npu==2.10.0.post4

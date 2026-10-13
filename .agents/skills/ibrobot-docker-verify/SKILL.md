@@ -82,11 +82,22 @@ must describe one exact committed tree:
   inaccessible even when the directory exists.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
-- **NVIDIA GPU + CUDA toolkit on the host (optional)**: GraspGen's
-  `pointnet2_ops` CUDA extension is installed by default when a CUDA toolkit
-  (`nvcc`) is available. If the host has no CUDA toolkit, `setup.sh` will
-  warn and skip GraspGen install gracefully; the verification continues
-  without the grasp smoke test.
+- **NVIDIA GPU + CUDA toolkit on the host (do NOT mount a mismatched one)**:
+  `pointnet2_ops` is installed from the audited wheel **only when no `nvcc` is
+  visible**. Any visible `nvcc` makes `install_graspgen_pip` prefer a source
+  build and suppresses the Torch ABI pin, and the build then aborts unless the
+  toolkit's CUDA version equals `torch.version.cuda`. Measured here: a mounted
+  CUDA 12.4 toolkit against LeRobot's resolved `torch 2.11.0+cu130` fails with
+  `The detected CUDA version (12.4) mismatches the version that was used to
+  compile PyTorch (13.0)`, `pointnet2_ops` is never installed, and setup exits
+  1. The audited wheel cannot rescue it either, because that wheel requires
+  `torch==2.7.1+cu126` and the pin that would supply it is gated off by the
+  same `nvcc` check. **Leave the toolkit unmounted unless its version matches
+  Torch's**; with it absent the same tree and the same `--accel cuda` complete
+  setup and build 58/58 packages.
+  The `--accel cuda` flag itself is still required: accelerator detection reads
+  `nvidia-smi`, which a container without `--gpus` does not have, and would
+  otherwise resolve to `cpu` and skip the CUDA dependency set entirely.
   - Host CUDA toolkit with `nvcc` on PATH or at `/usr/local/cuda/bin/nvcc`.
     The toolkit directory is mounted read-only into the container at the same
     path, and `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` are set accordingly.
@@ -139,7 +150,7 @@ corresponding phase section.
 | **2** | Create container, configure mirrors, create `testuser`, verify cache write | `CONTAINER_SECONDS` |
 | **3** | Prepare source workspace — **choose one mode** | `SOURCE_MODE`, `SOURCE_DETAILS` |
 | **3.5** | ROS source-switch pre-clean (conditional) — remove all `ros-*` packages when the change switches the ROS source | No ROS packages left |
-| **4** | Run `setup.sh --yes`, capture log and timing | `/tmp/setup.log`, `SETUP_ELAPSED_SECONDS` |
+| **4** | Run `setup.sh --yes --accel cuda`, capture log and timing | `/tmp/setup.log`, `SETUP_ELAPSED_SECONDS` |
 | **5** | Run `build.sh`, capture log and timing | `/tmp/build.log`, `BUILD_ELAPSED_SECONDS` |
 | **6** | Collect ERROR lines, report timing, clean up container | Final report |
 

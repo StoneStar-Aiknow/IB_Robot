@@ -31,6 +31,10 @@ VERBOSE=${VERBOSE:-false}
 DRY_RUN=${DRY_RUN:-false}
 USE_SUDO=true
 SUMMARY=()
+# Set by install_accel_requirements when the cann axis installs no NPU backend
+# (no CANN toolkit detected, or a release without a validated Torch ABI here).
+# The hook itself runs in a subshell and cannot set it; read by the summary.
+ACCEL_NPU_PENDING_MANUAL_CONFIG=false
 SETUP_PLATFORM_ID="unknown"
 SETUP_OS_ID="unknown"
 SETUP_OS_VERSION="unknown"
@@ -51,6 +55,12 @@ SETUP_DISK_FREE_SUMMARY="unknown"
 SETUP_ROS_SUMMARY="unknown"
 SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
+# Accelerator axis, independent of the OS axis: Ascend ships on both openEuler
+# and Ubuntu, so the Torch build to install cannot be derived from the OS.
+SETUP_ACCEL_ID="unknown"
+# Honor an inherited value: the ambiguous-host error tells the user to set this
+# variable, so clearing it unconditionally would make that advice a dead end.
+ACCEL_OVERRIDE="${ACCEL_OVERRIDE:-}"
 # Dependency-scope profile: "full" (default, complete development workspace) or
 # "inference" (minimal runtime to run policy inference only, used for
 # edge-cloud collaborative inference verification hosts). Resolution order:
@@ -228,7 +238,11 @@ Options:
                                       perception, grasp, voice, sim, and
                                       dev tooling; narrows rosdep and
                                       submodules to the inference packages
-      --platform ID      Override platform detection
+      --platform ID      Override platform (OS) detection
+      --accel ID         Override accelerator detection (env: ACCEL_OVERRIDE).
+                         Required when a host carries both an NVIDIA GPU and
+                         an Ascend NPU, since the two need different Torch
+                         builds and setup refuses to guess.
       --lerobot-profiles CSV
                          Override lerobot patch profile selection
                          (e.g. core,ros,hardware,ascend). Highest
@@ -239,6 +253,15 @@ Known platform IDs:
   ubuntu-22.04
   openeuler-embedded-24.03
   openharmony-5.1.0-musl
+
+Known accelerator IDs:
+  cuda   NVIDIA GPU (detected via nvidia-smi -L)
+  cann   Ascend NPU (detected via the /dev/davinci* devices)
+  cpu    no accelerator; the workspace still builds and CPU tests still run
+
+Detection reads devices, not toolkits: a CUDA or CANN toolkit installed only to
+cross-compile or convert models does not select that accelerator. Use --accel to
+install a runtime on a host whose device is absent or not passed through.
 EOF
 }
 
@@ -268,6 +291,14 @@ parse_args() {
                     exit 1
                 fi
                 PLATFORM_OVERRIDE="$1"
+                ;;
+            --accel)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "--accel requires an accelerator ID."
+                    exit 1
+                fi
+                ACCEL_OVERRIDE="$1"
                 ;;
             --lerobot-profiles)
                 shift
@@ -698,6 +729,9 @@ main() {
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "${YELLOW} Setup Summary${NC}"
     echo -e "${YELLOW}============================================================${NC}"
+    if [[ "${ACCEL_NPU_PENDING_MANUAL_CONFIG:-false}" == true ]]; then
+        SUMMARY+=("${YELLOW}!${NC} Ascend NPU backend not installed: NPU runtime pending manual configuration")
+    fi
     for entry in "${SUMMARY[@]}"; do
         echo -e "  ${entry}"
     done
@@ -713,6 +747,22 @@ main() {
         completion_message="Setup complete! OpenHarmony runtime verified; cross-build deployables on the host."
     fi
     echo -e "\033[1;32m[INFO] ${completion_message}${NC}"
+
+    # A cann host whose NPU backend was not installed must not read "Setup
+    # complete!" as "everything works": NPU inference is unavailable until the
+    # runtime is configured by hand. The state is recorded by the caller of
+    # accel_requirements (the hook runs in a subshell); see python_venv.sh.
+    if [[ "${ACCEL_NPU_PENDING_MANUAL_CONFIG:-false}" == true ]]; then
+        echo ""
+        echo -e "${YELLOW}------------------------------------------------------------${NC}"
+        echo -e "${YELLOW} Ascend NPU runtime is NOT configured${NC}"
+        echo -e "${YELLOW} -${NC} No torch_npu is installed; NPU inference is unavailable until it is."
+        echo -e "${YELLOW} -${NC} Check the CANN/Torch/torch_npu/torchvision pairing for your CANN release:"
+        echo -e "${YELLOW}   https://www.hiascend.com/developer/download/compatibility${NC}"
+        echo -e "${YELLOW} -${NC} Then install the matched versions with the workspace venv, not the system pip:"
+        echo -e "${YELLOW}   venv/bin/python -m pip install torch==<v> torch_npu==<v> torchvision==<v>${NC}"
+        echo -e "${YELLOW}------------------------------------------------------------${NC}"
+    fi
 }
 
 # Run if executed directly (not sourced)
