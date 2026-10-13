@@ -47,6 +47,8 @@ DISCLOSURE_END = "<!-- openEuler-ai-disclosure:end -->"
 PLACEHOLDERS = {"ai", "agent", "model", "unknown", "n/a", "none"}
 HUMAN_COAUTHOR_RE = re.compile(r"<[^<>]+>\s*$")
 AGENT_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._/@:+~\- ]*\s+v?\d+(?:\.\d+){1,5}(?:[-+][0-9A-Za-z.-]+)?$")
+REVIEW_STATUS_PENDING_TEXT = "待开发者完成逐项实质审查；发布授权不等同于审查完成"
+REVIEW_STATUS_COMPLETED_TEXT = "开发者已明确确认完成逐项实质审查"
 
 
 def _require_value(name: str, value: str) -> str:
@@ -96,6 +98,40 @@ _DISCLOSURE_BLOCK_RE = re.compile(
 _HANDWRITTEN_DISCLOSURE_RE = re.compile(r"当前PR是否有AI参与|希望检视人员了解|Agent平台信息（Tool）")
 
 
+def extract_disclosure_review_status(body: str) -> str | None:
+    """Read the disclosed human-review status from a managed disclosure block."""
+    match = _DISCLOSURE_BLOCK_RE.search(body or "")
+    if match is None:
+        return None
+    block = match.group(0)
+    if REVIEW_STATUS_COMPLETED_TEXT in block:
+        return "completed"
+    if REVIEW_STATUS_PENDING_TEXT in block:
+        return "pending"
+    return None
+
+
+def validate_review_status_transition(previous_body: str, human_review_status: str, *, reset: bool = False) -> None:
+    """Reject a silent downgrade of an already-disclosed completed human review.
+
+    The disclosure block is regenerated from CLI metadata on every gate run,
+    so an update that re-runs with the default ``--human-review-status pending``
+    would quietly rewrite a previously published "completed" review record.
+    Both update doors are guarded here: the previous PR body passed via
+    ``--previous-body-file`` and a draft that still carries the old managed
+    block. A real downgrade must re-ask the developer and pass an explicit
+    reset flag.
+    """
+    if reset:
+        return
+    if extract_disclosure_review_status(previous_body) == "completed" and human_review_status != "completed":
+        raise ValueError(
+            "the existing PR disclosure already records completed human review; regenerating with a lower "
+            "--human-review-status would silently downgrade it — keep completed, or re-ask the developer and "
+            "pass --review-status-reset to downgrade explicitly"
+        )
+
+
 def _ensure_disclosure_separator(description: str) -> str:
     """Keep exactly one horizontal rule between the disclosure block and the body."""
     head, marker, tail = description.partition(DISCLOSURE_END)
@@ -133,6 +169,7 @@ def add_ai_disclosure(
     prompt_summary: str,
     third_party_materials: str,
     human_review_status: str = "pending",
+    review_status_reset: bool = False,
 ) -> str:
     """Add or replace the machine-identifiable openEuler AI disclosure block."""
     agent_tool = _require_value("Agent platform", agent_tool)
@@ -142,22 +179,25 @@ def add_ai_disclosure(
     third_party_materials = _require_value("Third-party materials", third_party_materials)
 
     review_states = {
-        "pending": "待开发者完成逐项实质审查；发布授权不等同于审查完成",
-        "completed": "开发者已明确确认完成逐项实质审查",
+        "pending": REVIEW_STATUS_PENDING_TEXT,
+        "completed": REVIEW_STATUS_COMPLETED_TEXT,
     }
     if human_review_status not in review_states:
         raise ValueError("human review status must be pending or completed")
+    # A draft pasted from the current PR body still carries the old managed
+    # block; replacing it with a lower status must not downgrade the record.
+    validate_review_status_transition(description, human_review_status, reset=review_status_reset)
 
     disclosure = f"""{DISCLOSURE_START}
 ### 当前PR是否有AI参与:
 - [ ] 否
 - [x] 是
 
-1. Agent平台信息（Tool）: {agent_tool}
-2. 模型信息 (Model): {", ".join(ai_models)}
-3. Prompt摘要 (Prompt Summary): {prompt_summary}
-4. 人工审查情况: {review_states[human_review_status]}
-5. 第三方材料及许可证: {third_party_materials}
+1. **Agent平台信息（Tool）**: {agent_tool}
+2. **模型信息 (Model)**: {", ".join(ai_models)}
+3. **Prompt摘要 (Prompt Summary)**: {prompt_summary}
+4. **人工审查情况**: {review_states[human_review_status]}
+5. **第三方材料及许可证**: {third_party_materials}
 
 ### 希望检视人员了解:
 代码或文档由 AI 辅助开发者完成，最终正确性、安全性、合规性和维护责任由人类贡献者承担。

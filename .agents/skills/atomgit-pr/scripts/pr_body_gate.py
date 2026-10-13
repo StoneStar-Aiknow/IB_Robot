@@ -78,6 +78,7 @@ from pr_gates import (
     validate_agent_tool,
     validate_commit_ai_model,
     validate_reuse_self_check,
+    validate_review_status_transition,
     validate_verification_metadata,
     verification_inputs_placeholder_tainted,
 )
@@ -232,6 +233,11 @@ def main() -> int:
         default="pending",
         help="Actual human review status; completed requires explicit confirmation",
     )
+    parser.add_argument(
+        "--review-status-reset",
+        action="store_true",
+        help="Explicitly downgrade a previously disclosed completed human review after re-asking the developer",
+    )
     args = parser.parse_args()
 
     if not args.publication_authorized:
@@ -260,6 +266,12 @@ def main() -> int:
         with open(args.description_file, encoding="utf-8") as f:
             description = f.read()
 
+        previous_body = None
+        if args.previous_body_file:
+            with open(args.previous_body_file, encoding="utf-8") as f:
+                previous_body = f.read()
+            validate_review_status_transition(previous_body, args.human_review_status, reset=args.review_status_reset)
+
         agent_tool = validate_agent_tool(args.agent_tool)
         reject_handwritten_disclosure(description)
         description = add_ai_disclosure(
@@ -269,6 +281,7 @@ def main() -> int:
             prompt_summary=args.prompt_summary,
             third_party_materials=args.third_party_materials,
             human_review_status=args.human_review_status,
+            review_status_reset=args.review_status_reset,
         )
 
         title = args.title or commits[0]["subject"]
@@ -293,9 +306,7 @@ def main() -> int:
                 )
             require_pushed_tracking_head(git, branch)
             head_tree = git(["rev-parse", f"{branch}^{{tree}}"]).strip().lower()
-            if args.previous_body_file:
-                with open(args.previous_body_file, encoding="utf-8") as f:
-                    previous_body = f.read()
+            if previous_body is not None:
                 description, _metadata = prepare_update_verification(
                     description,
                     previous_body,

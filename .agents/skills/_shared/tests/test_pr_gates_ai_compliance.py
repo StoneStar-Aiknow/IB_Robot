@@ -9,9 +9,11 @@ from pr_gates import (
     DISCLOSURE_END,
     DISCLOSURE_START,
     add_ai_disclosure,
+    extract_disclosure_review_status,
     reject_handwritten_disclosure,
     validate_agent_tool,
     validate_commit_ai_model,
+    validate_review_status_transition,
 )
 
 
@@ -36,9 +38,9 @@ def test_add_ai_disclosure_records_required_metadata():
     )
 
     assert body.count(DISCLOSURE_START) == 1
-    assert "Agent平台信息（Tool）: OpenCode 1.17.20" in body
-    assert "模型信息 (Model): gpt-5.6-sol" in body
-    assert "人工审查情况" in body
+    assert "**Agent平台信息（Tool）**: OpenCode 1.17.20" in body
+    assert "**模型信息 (Model)**: gpt-5.6-sol" in body
+    assert "**人工审查情况**: 待开发者完成逐项实质审查；发布授权不等同于审查完成" in body
     assert f"{DISCLOSURE_END}\n\n---\n\n## Changes" in body
     assert body.endswith("## Changes\n\nFocused update.")
 
@@ -74,8 +76,8 @@ def test_add_ai_disclosure_replaces_existing_block():
 
     assert updated.count(DISCLOSURE_START) == 1
     assert "OpenCode 1.17.20" not in updated
-    assert "模型信息 (Model): model-v2" in updated
-    assert "Agent平台信息（Tool）: Claude Code 2.1.223" in updated
+    assert "**模型信息 (Model)**: model-v2" in updated
+    assert "**Agent平台信息（Tool）**: Claude Code 2.1.223" in updated
     assert f"{DISCLOSURE_END}\n\n---\n\nDescription" in updated
 
 
@@ -137,7 +139,77 @@ def test_add_ai_disclosure_deduplicates_multiple_models():
         third_party_materials="无",
     )
 
-    assert "模型信息 (Model): gpt-5.6-sol, DeepSeek-V3" in body
+    assert "**模型信息 (Model)**: gpt-5.6-sol, DeepSeek-V3" in body
+
+
+def test_extract_disclosure_review_status_reads_managed_block():
+    kwargs = dict(
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the policy",
+        third_party_materials="无",
+    )
+    pending = add_ai_disclosure("Body", **kwargs)
+    completed = add_ai_disclosure("Body", human_review_status="completed", **kwargs)
+
+    assert extract_disclosure_review_status(pending) == "pending"
+    assert extract_disclosure_review_status(completed) == "completed"
+    assert extract_disclosure_review_status("no disclosure block here") is None
+    # An empty marker block without a recognizable status is unknown, not pending.
+    assert extract_disclosure_review_status(f"{DISCLOSURE_START}\n{DISCLOSURE_END}") is None
+
+
+def test_validate_review_status_transition_rejects_silent_downgrade():
+    completed = add_ai_disclosure(
+        "Body",
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the policy",
+        third_party_materials="无",
+        human_review_status="completed",
+    )
+
+    with pytest.raises(ValueError, match="silently downgrade"):
+        validate_review_status_transition(completed, "pending")
+
+    # Explicit reset, carry-over, upgrade and missing block are all allowed.
+    validate_review_status_transition(completed, "pending", reset=True)
+    validate_review_status_transition(completed, "completed")
+    validate_review_status_transition("body without a completed disclosure", "completed")
+    validate_review_status_transition("", "pending")
+
+
+def test_add_ai_disclosure_rejects_downgrade_via_pasted_completed_block():
+    completed_body = add_ai_disclosure(
+        "Body",
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the policy",
+        third_party_materials="无",
+        human_review_status="completed",
+    )
+
+    with pytest.raises(ValueError, match="silently downgrade"):
+        add_ai_disclosure(
+            completed_body,
+            agent_tool="OpenCode 1.17.20",
+            ai_model="gpt-5.6-sol",
+            prompt_summary="Apply the policy",
+            third_party_materials="无",
+            human_review_status="pending",
+        )
+
+    downgraded = add_ai_disclosure(
+        completed_body,
+        agent_tool="OpenCode 1.17.20",
+        ai_model="gpt-5.6-sol",
+        prompt_summary="Apply the policy",
+        third_party_materials="无",
+        human_review_status="pending",
+        review_status_reset=True,
+    )
+    assert downgraded.count(DISCLOSURE_START) == 1
+    assert "待开发者完成逐项实质审查；发布授权不等同于审查完成" in downgraded
 
 
 def test_validate_commit_ai_model_rejects_missing_disclosed_model():

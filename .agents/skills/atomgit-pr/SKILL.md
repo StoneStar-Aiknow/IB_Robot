@@ -41,7 +41,12 @@ files 的完整 patch 在 `patch.diff`；`pr diff --json` 是统计摘要。按�
    `ai-compliance-failed`（先例：#441 / #458）。收集 **PR 全部提交** 的 AI 模型集合，
    去掉 provider 前缀。记录 Prompt 摘要及第三方材料/许可证。披露块由工具生成，勿手写重复块。
 4. 用户已明确要求提交/更新时沿用授权，不重复确认。人工实质审查责任仍由贡献者承担。披露默认标记待审查；只有开发者明确确认已完成
-   逐项审查，才传 `--human-review-status completed`，不能以发布授权代替完成确认。
+   逐项审查，才传 `--human-review-status completed`，不能以发布授权代替完成确认。PR 以正式检视发布（首次以非 `[WIP]`、非 draft
+   创建，或 WIP 转正式）时，Agent 必须先通过 ask-user 工具询问开发者是否已完成逐项人工审查，确认才传 completed，否则保持
+   pending；WIP/draft 阶段不询问。命中双平台 Docker 门禁的正式发布把该问题合并进已有的阶段询问，一次交互完成。更新已有 PR
+   时先抓取当前正文传 `--previous-body-file`：上次披露为 completed 且没有新增 AI-assisted 提交则继续传 completed，有新 AI
+   提交或状态不明则重新询问。completed 披露不允许静默降级：草稿中粘贴的旧披露块或 `--previous-body-file` 里的 completed
+   遇到更低的 `--human-review-status` 会被工具拒绝；确需降级必须先重新询问开发者并显式传 `--review-status-reset`。
 5. 命中双平台 Docker 条件时，尚未选择阶段才询问 WIP 或正式检视；已有选择继续生效。
    WIP 暂缓 Docker，保持 `[WIP]` 标题和 draft；正式检视补齐当前代码的两平台证据。
 
@@ -57,8 +62,8 @@ source .shrc_local && python3 .agents/skills/atomgit-pr/scripts/pr_body_gate.py 
 
 工具从本地 Git 读取 commit/diff，而非未提交工作区。正式阶段检查本地源 head 与
 `origin/<branch>` tracking ref 一致，并从真实 Git 对象推导 tree；运行前先 fetch。
-更新已有 PR 时可传 `--previous-body-file tmp/current-pr-body.md`，按相同输入规则复用
-既有证据，不手改指纹。缺失/截断 patch 不支持证据复用。
+更新已有 PR 时先抓取当前正文传 `--previous-body-file tmp/current-pr-body.md`，按相同输入规则复用
+既有证据，不手改指纹；该文件同时驱动人工审查状态防降级校验（见第 4 条）。缺失/截断 patch 不支持证据复用。
 
 项目描述规则：
 
