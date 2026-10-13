@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>unitree_g1_description</name>
+  <version>0.0.0</version>
+  <description>Unitree G1 humanoid description (vendored): the 29-DoF + Dex3-hand
+    rev_1_0 URDF and exactly the meshes it references. Robot-specific; consumed by
+    the unitree_g1 runtime for TF via robot_state_publisher. See PROVENANCE.md.</description>
+  <maintainer email="unitree@unitree.com">Unitree</maintainer>
+  <license>BSD 3-Clause License</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>robot_state_publisher</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
