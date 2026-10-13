@@ -652,18 +652,20 @@ EOF
         log_warn "FullSubNet wheel not found at ${fullsubnet_wheel_root}; skipping (speech_direction Torch backend unavailable)."
     fi
 
-    # GraspGen runtime dependencies are part of the default install contract:
-    # manipulation_service is part of the default workspace build. The stack is
-    # gated on the accelerator, not the OS: pointnet2_ops is a CUDA extension,
-    # and the Ascend grasp path is the OM runtime instead. install_graspgen_pip
-    # installs the audited grasp_gen and pointnet2_ops wheels and validates the
-    # latter's Torch/Python ABI contract.
+    # GraspGen and GraspGenX runtime dependencies are part of the default
+    # install contract: manipulation_service is part of the default workspace
+    # build. The stack is gated on the accelerator, not the OS: pointnet2_ops is
+    # a CUDA extension, and the Ascend grasp path is the OM runtime instead.
+    # install_graspgen_pip installs the audited grasp_gen and pointnet2_ops
+    # wheels and validates the latter's Torch/Python ABI contract.
     # Record whether grasp was actually installed and let the smoke test below
     # key off that fact rather than re-deriving the condition. Re-deriving is
     # how the smoke test kept an OS test after the install moved to the
     # accelerator axis, which made a full setup on Ubuntu + Ascend or Ubuntu +
     # CPU skip the install and then fail importing grasp_gen.
     local grasp_installed=false
+    local graspgenx_wheel_root="${WORKSPACE}/third_party/wheels/graspgenx/b942909"
+    local graspgenx_wheel="${graspgenx_wheel_root}/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl"
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping grasp dependencies (inference profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
@@ -690,6 +692,20 @@ EOF
             log_info "Installing grasp dependencies (GraspGen)..."
             export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
             install_graspgen_pip "${VENV_PYTHON}" -m pip install
+            # GraspGenX ships as an audited pure-Python wheel built from its pinned
+            # upstream commit (scripts/build_graspgenx_wheel.sh). --no-deps: upstream
+            # pins torch<2.7, diffusers==0.11.1 and huggingface-hub==0.25.2 only for
+            # its authors' driver; it reuses GraspGen's pointnet2_ops and runtime
+            # requirements plus requirements/graspgenx.txt, so it is installed, or
+            # skipped, together with GraspGen.
+            log_info "Installing grasp dependencies (GraspGenX)..."
+            run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+                -r "${WORKSPACE}/requirements/graspgenx.txt" --quiet
+            if ! (cd "${graspgenx_wheel_root}" && sha256sum --check SHA256SUMS); then
+                log_error "GraspGenX wheel checksum verification failed."
+                return 1
+            fi
+            run_cmd "${pip_install[@]}" --no-deps "${graspgenx_wheel}" --quiet
             grasp_installed=true
         fi
     fi

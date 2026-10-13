@@ -1,0 +1,284 @@
+"""Write the schema-v3 bundle used by the CUDA GraspGenX executor.
+
+A GraspGenX bundle pairs the gripper-independent checkpoints with exactly one gripper
+description, because the deployed service answers for one physical end effector. The
+gripper is copied into the bundle so the runtime never resolves it from the network or
+from the official package's own ``ext/`` directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+from pathlib import Path
+from uuid import uuid4
+
+from inference_manifest import (
+    BundleFile,
+    DeploymentTarget,
+    Digest,
+    ExecutionContract,
+    InferenceManifest,
+    ManifestBundle,
+    ModelDescriptor,
+    RoleRuntimeProfile,
+    SemanticIdentity,
+    SemanticTensor,
+    TorchDeployment,
+    TorchRuntimeProfile,
+    canonical_bundle_digest,
+    load_inference_manifest,
+    load_inference_manifest_metadata,
+    write_inference_manifest,
+)
+from model_utils.graspgen_contract import (
+    GRASPGEN_CONFIDENCE_SEMANTIC,
+    GRASPGEN_POINT_CLOUD_SEMANTIC,
+    GRASPGEN_POSE_SEMANTIC,
+)
+
+from .graspgenx_adapter import (
+    GRASPGENX_POSTPROCESSING,
+    GRASPGENX_PREPROCESSING,
+    GRASPGENX_SAMPLE_COUNT_SEMANTIC,
+    GraspGenXConfig,
+)
+
+# Bumped whenever the bundle layout or the service semantics change incompatibly.
+GRASPGENX_CONTRACT_VERSION = 1
+
+_ADAPTER_ASSET = "assets/adapter.json"
+_CHECKPOINTS = "assets/graspgenx"
+_GRIPPERS = "assets"
+_GENERATOR = f"{_CHECKPOINTS}/gen/generator.pth"
+_DISCRIMINATOR = f"{_CHECKPOINTS}/dis/discriminator.pth"
+_EPOCH = re.compile(r"epoch_(\d+)\.pth$")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _latest_checkpoint(directory: Path) -> Path:
+    """The official release ships one ``epoch_<n>.pth`` per network; take the newest."""
+    candidates = sorted(
+        (int(match.group(1)), path)
+        for path in directory.glob("*.pth")
+        if (match := _EPOCH.search(path.name)) is not None
+    )
+    if not candidates:
+        raise FileNotFoundError(f"no epoch_<n>.pth checkpoint in {directory}")
+    return candidates[-1][1]
+
+
+def _copy_if_changed(source: Path, target: Path) -> None:
+    """Copy unless ``target`` already holds exactly this content.
+
+    Size and mtime are not enough to decide: two checkpoints of the same model
+    have the same size by construction, so mtime alone separates them, and any
+    copy that preserves it (``cp -p``, ``rsync -t``, an unpacked archive) can
+    present new content under the old timestamp. The skip would then be silent
+    and the manifest digests, computed later from the destination, would record
+    and attest the stale checkpoint. Size is still checked first because it
+    rules out most pairs without reading anything; only a size match pays for
+    hashing, and only the no-op case hashes twice.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and source.stat().st_size == target.stat().st_size and _sha256(source) == _sha256(target):
+        return
+    shutil.copy2(source, target)
+
+
+def _materialize(bundle_root: Path, checkpoint_root: Path, gripper_dir: Path, gripper_name: str) -> None:
+    for network, checkpoint in (("gen", _GENERATOR), ("dis", _DISCRIMINATOR)):
+        source = checkpoint_root / network
+        if not (source / "config.yaml").is_file():
+            raise FileNotFoundError(f"GraspGenX {network} config is missing: {source / 'config.yaml'}")
+        _copy_if_changed(source / "config.yaml", bundle_root / _CHECKPOINTS / network / "config.yaml")
+        _copy_if_changed(_latest_checkpoint(source), bundle_root / checkpoint)
+    if not (gripper_dir / "config.json").is_file():
+        raise FileNotFoundError(f"GraspGenX gripper description has no config.json: {gripper_dir}")
+    # A bundle binds exactly one gripper: drop every other description, including
+    # one left by an earlier package run under a different gripper name.
+    grippers = bundle_root / _GRIPPERS / "x_grippers"
+    if grippers.exists():
+        shutil.rmtree(grippers)
+    shutil.copytree(gripper_dir, grippers / gripper_name, copy_function=shutil.copy2)
+
+
+def _model_descriptor() -> ModelDescriptor:
+    return ModelDescriptor(
+        interface="tensor_model",
+        model_type="graspgenx",
+        operation="generate_grasps",
+        inputs=(
+            SemanticTensor(semantic=GRASPGEN_POINT_CLOUD_SEMANTIC, dtype="float32", shape=(-1, 3)),
+            SemanticTensor(semantic=GRASPGENX_SAMPLE_COUNT_SEMANTIC, dtype="int64", shape=(1,)),
+        ),
+        outputs=(
+            SemanticTensor(semantic=GRASPGEN_POSE_SEMANTIC, dtype="float32", shape=(-1, 4, 4)),
+            SemanticTensor(semantic=GRASPGEN_CONFIDENCE_SEMANTIC, dtype="float32", shape=(-1,)),
+        ),
+        semantic_identity=SemanticIdentity(
+            logical_model_revision=f"graspgenx@v{GRASPGENX_CONTRACT_VERSION}",
+            preprocessing_contract=GRASPGENX_PREPROCESSING,
+            output_semantics=GRASPGENX_POSTPROCESSING,
+        ),
+    )
+
+
+def _bundle_files(bundle_root: Path) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            path.relative_to(bundle_root).as_posix()
+            for path in (bundle_root / "assets").rglob("*")
+            if path.is_file() and path.relative_to(bundle_root).as_posix() != _ADAPTER_ASSET
+        )
+    )
+
+
+def package_graspgenx_torch_bundle(
+    bundle_root: Path,
+    *,
+    checkpoint_root: Path | None = None,
+    gripper_dir: Path | None = None,
+    gripper_name: str = "omnihand_left_x2",
+    num_grasps: int = 400,
+    topk: int = 400,
+    deployment_name: str = "torch_cuda",
+) -> Path:
+    """Create or update a bundle; sources are optional when the bundle already holds them."""
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    if (checkpoint_root is None) != (gripper_dir is None):
+        raise ValueError("pass both --checkpoint-root and --gripper-dir, or neither to repackage in place")
+    if checkpoint_root is not None and gripper_dir is not None:
+        _materialize(bundle_root, checkpoint_root, gripper_dir, gripper_name)
+    required = (
+        f"{_CHECKPOINTS}/gen/config.yaml",
+        _GENERATOR,
+        f"{_CHECKPOINTS}/dis/config.yaml",
+        _DISCRIMINATOR,
+        f"{_GRIPPERS}/x_grippers/{gripper_name}/config.json",
+    )
+    missing = [relative for relative in required if not (bundle_root / relative).is_file()]
+    if missing:
+        raise FileNotFoundError(f"GraspGenX bundle is missing {missing}; provide --checkpoint-root and --gripper-dir")
+
+    adapter = {
+        "interface": "tensor_model",
+        "model_type": "graspgenx",
+        "operation": "generate_grasps",
+        "preprocessing": GRASPGENX_PREPROCESSING,
+        "postprocessing": GRASPGENX_POSTPROCESSING,
+        "torch_module_loader": "perception_service.torch_model_loaders:load_graspgenx",
+        "gripper_name": gripper_name,
+        "num_grasps": num_grasps,
+        "topk": topk,
+        "checkpoints_dir": _CHECKPOINTS,
+        "gripper_assets_dir": _GRIPPERS,
+        "generator_checkpoint": _GENERATOR,
+        "discriminator_checkpoint": _DISCRIMINATOR,
+        # Every bundle file, so a changed gripper mesh changes adapter.json and with
+        # it the bundle revision; bundle.files and the structure digest hold paths only.
+        "source_sha256": {relative: _sha256(bundle_root / relative) for relative in _bundle_files(bundle_root)},
+    }
+    GraspGenXConfig.from_assets(adapter)
+    adapter_document = json.dumps(adapter, indent=2, sort_keys=True) + "\n"
+    adapter_path = bundle_root / _ADAPTER_ASSET
+    previous_adapter = adapter_path.read_text(encoding="utf-8") if adapter_path.is_file() else ""
+    adapter_path.write_text(adapter_document, encoding="utf-8")
+    files = tuple(BundleFile(path=relative) for relative in (*_bundle_files(bundle_root), _ADAPTER_ASSET))
+
+    manifest_path = bundle_root / "inference_manifest.json"
+    existing = None
+    if manifest_path.is_file():
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # Metadata only: the previous file list may name assets this run replaced.
+        existing = load_inference_manifest_metadata(bundle_root, next(iter(raw["deployments"]))).manifest
+    model = _model_descriptor()
+    if existing is None:
+        bundle_uuid, revision = str(uuid4()), 1
+    else:
+        changed = existing.bundle.files != files or existing.model != model or previous_adapter != adapter_document
+        bundle_uuid, revision = existing.bundle.uuid, existing.bundle.revision + int(changed)
+    deployment = TorchDeployment(
+        execution_contract=ExecutionContract(
+            state_scope="request",
+            execution_structure="direct",
+            cancellation_granularity="request_boundary",
+        ),
+        runtime_profile=RoleRuntimeProfile(
+            backend="torch",
+            target=DeploymentTarget(runtime="torch"),
+            profile=TorchRuntimeProfile(device="cuda"),
+        ),
+    )
+    previous_deployment = existing.deployments.get(deployment_name) if existing is not None else None
+    if isinstance(previous_deployment, TorchDeployment):
+        deployment = deployment.model_copy(
+            update={"uuid": previous_deployment.uuid, "revision": previous_deployment.revision}
+        )
+    manifest = InferenceManifest(
+        schema_version=3,
+        bundle=ManifestBundle(
+            uuid=bundle_uuid,
+            revision=revision,
+            name=bundle_root.name,
+            files=files,
+            digest=Digest(
+                algorithm="sha256",
+                scope="structure",
+                value=canonical_bundle_digest(bundle_uuid, revision, bundle_root.name, files),
+            ),
+        ),
+        model=model,
+        deployments={**(existing.deployments if existing is not None else {}), deployment_name: deployment},
+    )
+    write_inference_manifest(manifest_path, manifest)
+    load_inference_manifest(bundle_root, deployment_name)
+    return manifest_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=None,
+        help="GraspGenX release directory containing gen/ and dis/ (config.yaml + epoch_<n>.pth each).",
+    )
+    parser.add_argument(
+        "--gripper-dir",
+        type=Path,
+        default=None,
+        help="One gripper description directory (config.json, gripper.urdf, meshes) to bind into the bundle.",
+    )
+    parser.add_argument("--gripper-name", default="omnihand_left_x2")
+    parser.add_argument("--num-grasps", type=int, default=400)
+    parser.add_argument("--topk", type=int, default=400)
+    parser.add_argument("--deployment", default="torch_cuda")
+    args = parser.parse_args()
+    print(
+        package_graspgenx_torch_bundle(
+            args.bundle_root,
+            checkpoint_root=args.checkpoint_root,
+            gripper_dir=args.gripper_dir,
+            gripper_name=args.gripper_name,
+            num_grasps=args.num_grasps,
+            topk=args.topk,
+            deployment_name=args.deployment,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

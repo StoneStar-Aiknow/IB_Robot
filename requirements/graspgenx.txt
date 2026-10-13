@@ -1,0 +1,15 @@
+# Runtime dependencies for the GraspGenX perception plugin
+# (perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin).
+# Installed by ./scripts/setup.sh right after GraspGen, behind the same
+# accelerator gate (accel_supports_torch_grasp, i.e. the cuda accelerator):
+# GraspGenX reuses GraspGen's pointnet2_ops extension and the rest of
+# requirements/manipulation.txt, and its adapter only serves the torch_cuda
+# deployment.
+#
+# GraspGenX itself is installed from the audited wheel in
+# third_party/wheels/graspgenx/ with --no-deps; its upstream pins (torch<2.7,
+# diffusers==0.11.1, huggingface-hub==0.25.2) only reflect its authors' driver.
+# The sampler is verified on torch 2.7.1+cu126 and the diffusers range LeRobot
+# already uses.
+
+diffusers>=0.27.2,<0.36

@@ -1,0 +1,4 @@
+0001-pin-audited-wheel-version.patch
+0002-accept-an-explicit-initial-noise.patch
+0003-allow-a-generator-class-and-a-request-scope.patch
+0004-place-per-request-tensors-on-the-model-device.patch

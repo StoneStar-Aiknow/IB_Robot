@@ -35,10 +35,14 @@ third_party/
     ├── groundingdino/<commit>/
     │   ├── ibrobot_groundingdino-*.whl
     │   └── SHA256SUMS
-    └── graspgen/<commit>/
-        ├── grasp_gen-*.whl
+    ├── graspgen/<commit>/
+    │   ├── grasp_gen-*.whl
+    │   ├── LICENSE
+    │   ├── LICENSE_ASSETS.md
+    │   └── SHA256SUMS
+    └── graspgenx/<commit>/
+        ├── graspgenx-*.whl
         ├── LICENSE
-        ├── LICENSE_ASSETS.md
         └── SHA256SUMS
 └── vendor/
     └── mhandpro/<version>/
@@ -55,6 +59,7 @@ CUDA 用户如需最优性能可单独构建 `_C` 扩展）。GraspGen wheel 通
 `pointnet2_ops` wheel 只含 `sm_86` cubin 且不带 PTX（`cuobjdump --list-elf` 仅 `sm_86.cubin`，`--list-ptx` 为空），因此只能在 sm_86/87/89 上运行——cubin 向同 major 的更高 minor 兼容，但 sm_80（A100）与 sm_90（H100）都不行，且没有 PTX 可供驱动 JIT。setup 会在修改 Torch 前通过 `nvidia-smi` 读取所有可见 GPU 的算力：兼容主机安装审计 wheel；不兼容主机在存在 CUDA 12.x `nvcc` 时为完整架构集合编译本地非审计 wheel，否则跳过 GraspGen 而不中止 setup；Blackwell、非 x86_64 和非 Python 3.10 环境也会在保留原 Torch runtime 的前提下跳过。手工构建可使用 `TORCH_CUDA_ARCH_LIST='8.0;9.0' POINTNET2OPS_WHEEL_OUT_DIR=<dir> scripts/build_pointnet2ops_wheel.sh`，它只写入指定目录，不会覆盖审计产物。setup 使用 `--force-reinstall --no-deps` 安装 `pointnet2_ops`，确保架构变化后相同版本号的 wheel 仍会被替换；Python runtime 依赖仍由
 `requirements/manipulation.txt` 统一解析，避免第三方元数据覆盖
 IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
+GraspGenX wheel 通过 `scripts/build_graspgenx_wheel.sh` 从固定 upstream commit 重建（只打包 `graspgenx` 包本身，构建时不拉取上游的 Git LFS 资产；字节级可复现）。它复用 GraspGen 的 `pointnet2_ops`，因此 setup 在同一判定下与 GraspGen 一起安装或跳过，用 `--no-deps` 安装，运行时依赖由 `requirements/graspgenx.txt` 声明。
 
 `vendor/` 中的 manifest 记录厂商制品的技术身份、授权状态和预期外部路径，不自动授予
 许可证。未获公开再分发授权的二进制不得进入提交或发布包；用户必须从合法来源取得外部

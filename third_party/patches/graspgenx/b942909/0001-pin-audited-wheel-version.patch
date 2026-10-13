@@ -1,0 +1,13 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 5399cac..d131217 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "graspgenx"
+-version = "1.0.0"
++version = "1.0.0+ibrobot.2"
+ description = "GraspGenX: Cross-Embodiment Diffusion-based 6-DOF Grasp Generation"
+ authors = [
+     {name = "Adithya Murali", email = "admurali@nvidia.com"},

@@ -253,4 +253,53 @@ def load_graspgen(context):
     return _GraspGenModule(GraspGenSampler(config), GraspGenConfig.from_assets(assets), __import__("torch"))
 
 
-__all__ = ["load_graspgen", "load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]
+class _GraspGenXModule:
+    def __init__(self, sampler, torch_module) -> None:
+        self.sampler = sampler
+        self.torch = torch_module
+
+    def __call__(self, inputs):
+        # The adapter has already removed outliers on the host, and the sampler centres
+        # the cloud and restores the source frame itself.
+        sample_count = int(_numpy(inputs["observation.grasp_sample_count"]).reshape(-1)[0])
+        grasps, confidence, _ = self.sampler.sample(
+            inputs["observation.object_points"],
+            threshold=-1.0,
+            num_grasps=sample_count,
+            remove_outliers=False,
+        )
+        if len(grasps) == 0:
+            grasps = self.torch.empty((0, 4, 4), dtype=self.torch.float32)
+            confidence = self.torch.empty((0,), dtype=self.torch.float32)
+        return {
+            "grasp.poses": grasps.to(self.torch.float32),
+            "grasp.confidence": confidence.reshape(-1).to(self.torch.float32),
+        }
+
+
+def load_graspgenx(context):
+    import os
+
+    root, assets = _configuration(context)
+    checkpoints = root / assets["checkpoints_dir"]
+    grippers = root / assets["gripper_assets_dir"]
+    # ``import graspgenx`` runs a setup hook that clones gripper descriptions and
+    # checkpoints from Hugging Face into site-packages unless both variables name
+    # existing directories. Point them into this bundle before the first import so a
+    # model service never reaches the network or reads anything outside its bundle.
+    os.environ["GRASPGENX_GRIPPER_CFG_DIR"] = str(grippers)
+    os.environ["GRASPGENX_CHECKPOINT_DIR"] = str(checkpoints)
+    from graspgenx.grasp_server import GraspGenXSampler
+    from graspgenx.utils.checkpoint_io import load_model_cfg
+
+    config = load_model_cfg(
+        str(checkpoints / "gen"),
+        str(checkpoints / "dis"),
+        gen_pth=str(root / assets["generator_checkpoint"]),
+        dis_pth=str(root / assets["discriminator_checkpoint"]),
+    )
+    sampler = GraspGenXSampler(config, assets["gripper_name"], assets_dir=str(grippers))
+    return _GraspGenXModule(sampler, __import__("torch"))
+
+
+__all__ = ["load_graspgen", "load_graspgenx", "load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]

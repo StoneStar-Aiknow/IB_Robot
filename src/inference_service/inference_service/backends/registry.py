@@ -43,6 +43,7 @@ MODEL_TYPE_OPERATIONS: Mapping[str, frozenset[str]] = MappingProxyType(
         "siglip2": frozenset({"encode"}),
         "grounding_dino": frozenset({"detect"}),
         "graspgen": frozenset({"generate_grasps"}),
+        "graspgenx": frozenset({"generate_grasps"}),
         "dummy_echo": frozenset({"echo"}),
         "zipvoice": frozenset({"synthesize"}),
         "fullsubnet": frozenset({"enhance"}),
@@ -520,6 +521,7 @@ _TENSOR_TORCH = (
     ("tensor_model", "grounding_dino", "detect"),
     ("tensor_model", "siglip2", "encode"),
     ("tensor_model", "graspgen", "generate_grasps"),
+    ("tensor_model", "graspgenx", "generate_grasps"),
     ("tensor_model", "dummy_echo", "echo"),
     ("tensor_model", "zipvoice", "synthesize"),
 )
@@ -643,7 +645,9 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
 
 # Adapter code still uses this name to describe its supported service families;
 # it is metadata only and is not a registry dispatch dimension.
-PERCEPTION_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"})
+PERCEPTION_FAMILIES = frozenset(
+    {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "graspgenx", "dummy_echo"}
+)
 
 
 __all__ = [

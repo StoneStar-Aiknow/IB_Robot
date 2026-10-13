@@ -23,6 +23,7 @@ from inference_service.unified_runtime import (
 )
 
 from .graspgen_adapter import GraspGenAdapter
+from .graspgenx_adapter import GraspGenXAdapter
 from .model_contracts import (
     point_cloud_xyz,
     rank_detections,
@@ -534,8 +535,49 @@ class GraspGenGenerateGraspsPlugin(_SessionPlugin):
         return f"generated {len(candidates)} grasps"
 
 
+class GraspGenXGenerateGraspsPlugin(_SessionPlugin):
+    """Serve ``GenerateGrasps`` from a GraspGenX bundle bound to one described gripper."""
+
+    service_type = "ibrobot_msgs/srv/GenerateGrasps"
+    model_type = "graspgenx"
+    operation = "generate_grasps"
+    adapter_class = GraspGenXAdapter
+
+    def handle(self, request, response) -> str:
+        from ibrobot_msgs.msg import GraspCandidate, GraspCandidateArray
+
+        header = request.object_points.header
+        if not header.frame_id:
+            # The poses are returned in the cloud's own frame; without a name for that
+            # frame the executor cannot transform them and would act on a guess.
+            raise ValueError("object_points.header.frame_id is required for source-frame grasps")
+        inputs = self.adapter.prepare(point_cloud_xyz(request.object_points), max_grasps=int(request.max_grasps))
+        candidates = []
+        if inputs is not None:
+            candidates = self.adapter.postprocess(
+                self._infer(inputs),
+                max_grasps=int(request.max_grasps),
+                min_confidence=float(request.min_confidence),
+            )
+        # As with GraspGen, width and collision fields stay at their defaults: the model
+        # scores a pose; manipulation_execution measures apertures and clears the scene.
+        response.grasps = GraspCandidateArray(
+            header=header,
+            grasps=[
+                GraspCandidate(
+                    header=header,
+                    pose_matrix=candidate.pose_matrix.reshape(16).astype(float).tolist(),
+                    confidence=candidate.confidence,
+                )
+                for candidate in candidates
+            ],
+        )
+        return f"generated {len(candidates)} grasps"
+
+
 __all__ = [
     "GraspGenGenerateGraspsPlugin",
+    "GraspGenXGenerateGraspsPlugin",
     "GroundingDetectPlugin",
     "GroundingDINORawDetectPlugin",
     "RAMPlusRecognizeTagsPlugin",
