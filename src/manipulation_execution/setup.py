@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "manipulation_execution"
@@ -9,6 +11,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        (
+            "share/" + package_name + "/data/x2_mock_imitation",
+            glob("data/x2_mock_imitation/*"),
+        ),
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},
@@ -23,6 +29,8 @@ setup(
             "pick_executor_node = manipulation_execution.pick_executor_node:main",
             "place_executor_node = manipulation_execution.placement_executor_node:main",
             "imitate_human_motion_executor_node = manipulation_execution.imitate_human_motion_executor_node:main",
+            "motion_imitation_stream_node = manipulation_execution.motion_imitation_stream_node:main",
+            "motion_imitation_mock_node = manipulation_execution.motion_imitation_mock_node:main",
             "placement_replay = manipulation_execution.placement_replay:main",
         ],
     },

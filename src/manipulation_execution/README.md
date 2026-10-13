@@ -57,7 +57,7 @@ result 的 `actual_duration_sec` 报的是**回放**时长，不是采集时长�
 使用最新整帧；YOLOX 成功但没有合格 person 时，executor 构造图像中心方框，
 边长为 `min(width, height) / 1.25`，再用恰好一个框调用 PEAR。任务首次完成 YOLOX 成功响应前不调用
 PEAR；之后的 YOLOX 刷新失败继续使用任务内最近一次成功结果。服务不可用、RPC 超时、模型失败和无效图像
-不会创建初始 fallback。像素处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。
+不会创建初始 fallback。模型语义预处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。该节点订阅的是已解码的 `sensor_msgs/Image`；本包唯一的像素代码是 `compressed_image_decode.py` 的传输层解码（JPEG/PNG → `bgr8`），因为模型服务只收原始 `Image`，编码流必须有人在调用侧解。
 
 任务 deadline 是相机计数和视觉推理的硬边界：边界后的帧不计数、不入队，worker 不提交过期
 请求，边界后返回的响应也不计入任务。每次调用分别跟踪 RPC deadline 和任务 deadline；只有

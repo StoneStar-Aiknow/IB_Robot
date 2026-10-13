@@ -493,7 +493,12 @@ manifest 的 named deployment 进入 shared `AscendOmModelSession`。两条都�
 **调用方传原始图像和框，不碰像素。** `YoloXDetect` 收整帧 `sensor_msgs/Image`，
 `PearParameterPredict` 收同一张整帧加一个 `DetectionArray`；letterbox、通道顺序、裁剪、缩放、
 归一化全部在 adapter 内。这与 §8 的分工一致（adapter 拥有模型语义预处理和后处理），也意味着
-执行侧节点里不出现 `cv2`。
+执行侧节点里不出现**模型语义预处理**，因此通常也不出现 `cv2`。
+
+唯一的例外是传输层解码：服务只接受原始 `sensor_msgs/Image`（`model_contracts.validate_image_message`
+只认 `bgr8`/`rgb8`），所以面对平台的编码相机流时，调用侧**必须**先解码。该解码不属于模型语义预处理，
+归属调用方，且应集中在单独一个模块里（先例：`manipulation_execution/compressed_image_decode.py`），
+不要散入执行逻辑。
 
 `YoloXAdapter`：
 
