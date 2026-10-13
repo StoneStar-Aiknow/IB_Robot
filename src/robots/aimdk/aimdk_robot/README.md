@@ -222,7 +222,7 @@ slower or weaker source:
 
 | Field | What it gives the bridge |
 |---|---|
-| `fsm_state` | The balance controller's own state. Wired into the fault registry as `balance`: the platform entering SAFE degrades the runtime instead of leaving it ACTIVE while mode switches are being refused. |
+| `fsm_state` | The balance controller's raw state value, republished as a diagnostic observation only. It does not gate lifecycle or command output because the SDK message and generated documentation disagree on numeric meanings, and the vendor examples do not use it as an admission check. |
 | `input_source` | The arbitration holder, ten times a second. A preemption is seen at once rather than up to a poll period later — and every command published in that window would have been discarded. |
 | `speed_status` | The speed envelope the platform is enforcing *now*, which it narrows with battery, load and terrain. `/cmd_vel` is checked against it; the profile stays the ceiling, so the platform may narrow it and never widen it. |
 | `motion_status` | Upper-body player state — a faster second source behind the preset-motion poll. |

@@ -1448,7 +1448,10 @@ class AimdkRuntimeNode(Node):
                 # rather than on its own (see projection.clock_skew_estimate).
                 self._clock_samples.append((time.monotonic(), skew_s))
         self._note_arbitration_holder(holder, holder_priority)
-        self._set_fault("balance", projection.fsm_fault(fsm_state))
+        self._publish_diagnostics(
+            [(projection.fsm_diagnostic(fsm_state), str(fsm_state), DiagnosticStatus.OK)],
+            prefix="aimdk/fsm_state",
+        )
 
     def _note_arbitration_holder(self, holder: str, holder_priority: int) -> None:
         """Apply the holder the platform reports with every state message.
