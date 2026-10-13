@@ -1,0 +1,585 @@
+# Unitree G1 (29 DoF + Dex3) runtime profile.
+#
+# The single source of runtime parameters for the G1 runtime bridge and the
+# conformance suite. Vendor facts are cited to the material vendored in this
+# repository: unitree_sdk2 headers (joint indices, arm_sdk weight slot, RPC
+# service names and API ids, FSM ids, Dex3 mode byte) and the vendored
+# unitree_ros2 messages (unitree_hg / unitree_api IDL), plus the vendored
+# g1_29dof_with_hand_rev_1_0 URDF (joint names and limits). See
+# openspec/changes/unitree-g1-runtime-migration/design.md (D1-D12).
+#
+# UNVERIFIED marking: every value that cannot be established from the vendored
+# material carries an `unverified` note naming the hardware gate that will
+# confirm it (tasks 6.1-6.4). Nothing unverified is silently presented as fact.
+#
+# Scope notes (design D1/D6/D11): this runtime bridges the vendor DDS tier. It
+# launches no controller manager and no ros2_control hardware component, so
+# `controller_manager`, `ros2_control` and `hardware_components` are
+# deliberately absent and every mode's controller set is empty. No public model
+# is published in this change: launch starts robot_state_publisher from the
+# vendored URDF for TF only, and the URDF is NOT passed to build_description;
+# consumers needing normalization metadata fail closed on the G1 until the
+# embodiment-binding change lands.
+
+runtime:
+  name: unitree_g1_robot
+  version: 0.1.0
+  type: g1_29dof_dex3
+
+# true: the bridge talks to the in-repo vendor mock instead of a robot
+# (unitree_vendor_mock, phase 2). There is no vendor-provided physics
+# simulation here.
+simulated: false
+
+joint_state_topic: /joint_states
+
+# All 43 observable joints (design D3), URDF names, in URDF declaration order:
+# 12 legs, 3 waist, 14 arms, 14 fingers. The vendor's LowState motor index
+# order (legs first, then waist, then arms) is remapped by the projection; it
+# never leaks to consumers. Dex3 finger state comes from rt/dex3/*/state, not
+# from LowState.
+joints:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  - left_hand_thumb_0_joint
+  - left_hand_thumb_1_joint
+  - left_hand_thumb_2_joint
+  - left_hand_middle_0_joint
+  - left_hand_middle_1_joint
+  - left_hand_index_0_joint
+  - left_hand_index_1_joint
+  - right_hand_thumb_0_joint
+  - right_hand_thumb_1_joint
+  - right_hand_thumb_2_joint
+  - right_hand_middle_0_joint
+  - right_hand_middle_1_joint
+  - right_hand_index_0_joint
+  - right_hand_index_1_joint
+
+# v1 joint groups (design D3): arm = the 14 arm joints; the waist stays OUT of
+# the arm group (user decision U4); the Dex3 fingers are NOT placed in the
+# gripper group (the interim choice was withdrawn with U5: multi-action-space
+# models go through refactor-embodiment-control-bindings, and a Dex3 finger is
+# not a 0..100 gripper). gripper and base stay empty.
+arm_joints:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+gripper_joints: []
+
+# Mode = named runtime state with a vendor-side meaning (design D5):
+#   idle        internal control, arm_sdk weight = 0
+#   stream      arm_sdk weight ramps to 1; arm/waist/Dex3 channels admitted
+#   locomotion  SetFsmId(start), confirmed via GetFsmId, then SetVelocity
+#               admitted; arms stay under internal control
+# Controller sets are empty: the bridge performs the vendor-side switch, not a
+# controller activation.
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: [stream, locomotion]
+  stream:
+    controllers: []
+    allows_stream: true
+    transitions: [idle, locomotion]
+  # Entering locomotion performs SetFsmId(start) and commits only once
+  # GetFsmId reports it; leaving it zeroes the base velocity first, because
+  # the last SetVelocity alone keeps its effect for its duration. unverified:
+  # whether the sport service accepts SetFsmId(start) as the locomotion entry
+  # from every posture (gate 6.3).
+  locomotion:
+    controllers: []
+    allows_base: true
+    transitions: [idle, stream]
+
+# Streaming command topics observed for rejected-command counting; the bridge
+# is their only subscriber and translates them to vendor messages. Channel
+# joint lists are the contract-side order of the Float64MultiArray payload;
+# the projection maps them into the vendor's own index order.
+command_channels:
+  - channel: arm_stream
+    topic: /unitree_g1/arm/commands
+    joints:
+      - left_shoulder_pitch_joint
+      - left_shoulder_roll_joint
+      - left_shoulder_yaw_joint
+      - left_elbow_joint
+      - left_wrist_roll_joint
+      - left_wrist_pitch_joint
+      - left_wrist_yaw_joint
+      - right_shoulder_pitch_joint
+      - right_shoulder_roll_joint
+      - right_shoulder_yaw_joint
+      - right_elbow_joint
+      - right_wrist_roll_joint
+      - right_wrist_pitch_joint
+      - right_wrist_yaw_joint
+    modes: [stream]
+  - channel: waist_stream
+    topic: /unitree_g1/waist/commands
+    joints: [waist_yaw_joint, waist_roll_joint, waist_pitch_joint]
+    modes: [stream]
+  # Dex3 motor order per hand (SDK dex3 example limits arrays): thumb 0-2,
+  # index 3-4, middle 5-6. unverified: index vs middle motor positions cannot
+  # be distinguished from the example's limits alone (identical ranges);
+  # confirm on hardware before relying on the split (gate 6.3).
+  - channel: hand_left_stream
+    topic: /unitree_g1/hand_left/commands
+    joints:
+      - left_hand_thumb_0_joint
+      - left_hand_thumb_1_joint
+      - left_hand_thumb_2_joint
+      - left_hand_index_0_joint
+      - left_hand_index_1_joint
+      - left_hand_middle_0_joint
+      - left_hand_middle_1_joint
+    modes: [stream]
+  - channel: hand_right_stream
+    topic: /unitree_g1/hand_right/commands
+    joints:
+      - right_hand_thumb_0_joint
+      - right_hand_thumb_1_joint
+      - right_hand_thumb_2_joint
+      - right_hand_index_0_joint
+      - right_hand_index_1_joint
+      - right_hand_middle_0_joint
+      - right_hand_middle_1_joint
+    modes: [stream]
+  - channel: base_velocity
+    topic: /cmd_vel
+    type: twist
+    modes: [locomotion]
+
+# No joint-trajectory endpoint exists at the vendor tier this change bridges.
+trajectory_actions: []
+
+capabilities:
+  joint.state: {joint_count: 43, rate_hz: 50.0}
+  joint.position_stream: {joint_count: 31, rate_hz: 50.0}
+  # Dex3 is a 7-joint-per-hand dexterous hand: hand.multi_joint, NOT gripper.1d
+  # (design D3; a Dex3 finger is not a scalar aperture and no openness value is
+  # synthesised from the 7 measured positions).
+  hand.multi_joint: {count: 2, joints_per_hand: 7}
+  # unverified: velocity envelope and staleness; measured on hardware (gate 6.3).
+  base.cmd_vel: {max_vx: 1.0, max_vy: 0.4, max_wz: 1.0, staleness_s: 0.5}
+  # Preset upper-body actions dispatched through the `arm` RPC service; the
+  # action table below is checked against GetActionList at startup (D7).
+  motion.named:
+    names: [blow_kiss, clap, hands_up, heart, high_five, hug, release_arm, shake_hand, wave]
+  # Whole-body postures dispatched through SetFsmId (design D5).
+  motion.posture:
+    postures: [sit, squat, stand_up]
+  interaction.tts: {endpoints: [/speech/speak]}
+  # interaction.audio_playback is NOT declared: the voice service plays named
+  # streams (StartPlay/StopPlay), not a documented PCM topic, so no vendor
+  # source for an /audio/play subscription is verified. It returns with the
+  # stream semantics confirmed on hardware (gate 6.1).
+  # SetRgbLed has no priority parameter; no priority_levels are declared (a
+  # deviation from design D7's X2-style list, noted in the phase-1 report).
+  interaction.led: {endpoints: [/led/set_pattern]}
+  # power.state is NOT declared: which vendor topic publishes the G1's pack
+  # state is unverified (LowState carries no battery fields, and HandState's
+  # power rail is the hand board's, not the pack's). It returns with the
+  # source confirmed on hardware (gate 6.1).
+  perception.imu: {topics: [/imu/data]}
+  # Camera/lidar endpoints generated from the peripherals defaults below (D8);
+  # the runtime composes shared drivers, it does not re-drive vendor sensors.
+  perception.camera:
+    topics: [/camera/head_front/image_raw, /camera/head_front/depth/image_rect_raw]
+  perception.lidar:
+    topics: [/livox/lidar, /livox/imu]
+  runtime.status: {}
+  # Stop latency bounds, sized to the implementation they bound: idle covers
+  # the weight ramp-down from 1.0 at stop.weight_ramp_down_rate plus the
+  # bounded-wait margin (1/0.2 + 1 = 6 s); torque_off adds one vendor RPC
+  # round trip (rpc.timeout_s, 5 s) for the damping switch (6 + 5 = 11 s).
+  # The bounds must stay >= those recomputed values whenever the rates change.
+  # unverified: the rates and the RPC latency are placeholders until measured
+  # on hardware (gate 6.4).
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 6.0, torque_off_bound_s: 11.0}
+
+stop_default_policy: HOLD
+
+# Teleoperation is not advertised: the public projection binds exactly one arm
+# group and one gripper, and this change publishes no public model (D6).
+teleoperation:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Vendor-specific facts (read only by the G1 bridge; never by generic layers).
+# ---------------------------------------------------------------------------
+vendor:
+  sdk_version: "unitree_sdk2 + unitree_ros2 vendored at upstream 668d1ec5 (BSD-3)"
+  description_version: "unitree_ros g1_29dof_with_hand_rev_1_0 (vendored subset)"
+  # Design D10: the bridge reads LowState.mode_machine at startup and faults on
+  # mismatch; it also requires both Dex3 state topics to be publishing.
+  # unverified: 5 is the value the rev_1_0 URDF corresponds to (4010 wrist
+  # motors); if the unit is mode 15/16/18 (5010) there is no matching
+  # 29dof+Dex3 URDF in the vendored tree and this profile must not be declared
+  # for that unit until one is merged (user gate, tasks.md 0.4).
+  mode_machine: 5
+  # unverified: examples initialise LowCmd.mode_pr from their Mode::PR default;
+  # the numeric value is confirmed on hardware (gate 6.1) before lowcmd-shaped
+  # publishes (arm_sdk) rely on it.
+  mode_pr: 1
+  topics:
+    low_state: rt/lowstate
+    arm_sdk: rt/arm_sdk
+    dex3_left_cmd: rt/dex3/left/cmd
+    dex3_right_cmd: rt/dex3/right/cmd
+    # unverified: the SDK dex3 example subscribes rt/lf/dex3/<side>/state — an
+    # "lf" segment the cmd topic does not carry (suspected a low-frequency
+    # state stream); confirm with `ros2 topic list` on hardware (gate 6.1).
+    dex3_left_state: rt/lf/dex3/left/state
+    dex3_right_state: rt/lf/dex3/right/state
+    # JSON state {holding, id, name} of the arm action service (SDK header).
+    arm_action_state: rt/arm/action/state
+    # unverified: which topic publishes unitree_hg/BmsState on the G1 (LowState
+    # carries no battery fields, and HandState.power_* is the hand board's
+    # rail, not the pack); resolved on hardware (gate 6.1) before power.state
+    # can be served from a vendor source.
+    bms_state: rt/bmsstate
+  # RPC surface (design D2). Requests correlate on Request.header.identity.id
+  # (monotonic), answered with the same id and api_id; a timed-out call is a
+  # failure and is NOT resent when the call would change robot motion.
+  # unverified: topic names follow the rt/api/<service>/{request,response}
+  # convention; confirm with `ros2 topic list` on hardware (gate 6.1).
+  rpc:
+    timeout_s: 5.0
+    request_topics:
+      loco: rt/api/sport/request
+      arm: rt/api/arm/request
+      audio: rt/api/voice/request
+    response_topics:
+      loco: rt/api/sport/response
+      arm: rt/api/arm/response
+      audio: rt/api/voice/response
+  # API ids from the vendored SDK headers (g1_loco_api.hpp, g1_arm_action_api.hpp,
+  # g1_audio_api.hpp).
+  api_ids:
+    loco:
+      get_fsm_id: 7001
+      get_fsm_mode: 7002
+      get_balance_mode: 7003
+      get_swing_height: 7004
+      get_stand_height: 7005
+      fsm_api: 7100
+      set_fsm_id: 7101
+      set_balance_mode: 7102
+      set_swing_height: 7103
+      set_stand_height: 7104
+      set_velocity: 7105
+      set_speed_mode: 7107
+      switch_to_user_ctrl: 7110
+      switch_to_internal_ctrl: 7111
+    arm:
+      execute_action: 7106
+      get_action_list: 7107
+      execute_custom_action: 7108
+      stop_custom_action: 7113
+    audio:
+      tts: 1001
+      asr: 1002
+      start_play: 1003
+      stop_play: 1004
+      get_volume: 1005
+      set_volume: 1006
+      set_rgb_led: 1010
+  # FSM ids from the SDK's own high-level LocoClient methods (SetFsmId
+  # argument). Their acceptance latencies and posture preconditions are a
+  # hardware gate (6.2/6.4); the ids themselves are SDK facts.
+  fsm_ids:
+    zero_torque: 0
+    damping: 1
+    squat: 2
+    sit: 3
+    stand_up: 4
+    start: 500
+    internal_ctrl: {last: 0, passive: 1, walkrun: 2}
+  # motion.posture names -> SetFsmId ids.
+  postures:
+    sit: {fsm_id: 3}
+    squat: {fsm_id: 2}
+    stand_up: {fsm_id: 4}
+  # motion.named names -> `arm` service actions (SDK action_map). The vendor
+  # table also carries two-hand kiss 11 / left kiss 12 / right kiss 12 (note the
+  # vendor's own duplicate id 12), face wave 25, right heart 21, reject 22,
+  # right hand up 23, x-ray 24; the subset below has unique ids. GetActionList
+  # is queried at startup and compared against this table (D7, phase 2). An
+  # action's completion is its ExecuteAction RPC answer; unverified: whether
+  # rt/arm/action/state reports progress the bridge must wait for instead
+  # (gate 6.3).
+  arm_actions:
+    release_arm: {action_id: 99, action_name: "release arm"}
+    blow_kiss: {action_id: 11, action_name: "two-hand kiss"}
+    hands_up: {action_id: 15, action_name: "hands up"}
+    clap: {action_id: 17, action_name: "clap"}
+    high_five: {action_id: 18, action_name: "high five"}
+    hug: {action_id: 19, action_name: "hug"}
+    heart: {action_id: 20, action_name: "heart"}
+    wave: {action_id: 26, action_name: "high wave"}
+    shake_hand: {action_id: 27, action_name: "shake hand"}
+  # arm_sdk (shared-weight 17-joint frame, design D4). The weight is the q
+  # field of motor_cmd[29] (the first slot after JointIndex 0-28); it is shared
+  # by 14 arm + 3 waist joints, so all 17 must carry targets whenever any
+  # channel streams.
+  arm_sdk:
+    rate_hz: 50.0
+    weight_index: 29
+    # unverified: example ramp rate 0.2/s; tuned on a gantry (gate 6.2).
+    weight_ramp_rate: 0.2
+    # unverified: example gains; the handover period superposes the vendor's
+    # balance controller on user targets, so these stay conservative until 6.2.
+    default_kp: 60.0
+    default_kd: 1.5
+    # A channel older than this is stale; a stale channel keeps its LAST
+    # COMMANDED value in the latch — not the entry hold, not a zero fill, and
+    # never a per-tick measured refill (the waist would sink under gravity).
+    # The bridge does not enforce this window at runtime: a channel that goes
+    # quiet simply stops updating the latch, which already holds its last
+    # commanded value, so expiry holds by construction. The value documents
+    # the policy for consumers.
+    stream_staleness_s: 0.5
+    # Entering stream mode latches the 17 fresh measured positions as hold
+    # targets; feedback older than this refuses entry outright (D4).
+    feedback_staleness_s: 0.5
+  dex3:
+    joints_per_hand: 7
+    press_sensors_per_hand: 9
+    # unverified: the example writes HandCmd every 100 us; 100 Hz is a
+    # conservative bridge default until the real requirement is measured.
+    rate_hz: 100.0
+    # unverified: example grip gains (kp 1.5, kd 0.1).
+    default_kp: 1.5
+    default_kd: 0.1
+  locomotion:
+    # SetVelocity(vx, vy, omega, duration); the bridge re-issues at
+    # command_duration_s while a fresh Twist keeps arriving. SDK Move() uses
+    # 864000 s for continuous motion.
+    command_duration_s: 1.0
+    continuous_duration_s: 864000.0
+    deadband: 0.005
+    # unverified: measured on hardware (gate 6.3); a biped's lateral envelope
+    # is deliberately conservative.
+    max_linear_mps: 1.0
+    max_lateral_mps: 0.4
+    max_angular_radps: 1.0
+  stop:
+    # HOLD (design D5): latch admission, zero the velocity command
+    # (SetVelocity(0,0,0)), freeze streaming targets, ramp the weight back to
+    # 0. TORQUE_OFF maps to the damping FSM and is refused while the platform
+    # is standing: only the postures listed as safe are released. The posture
+    # test uses the reported fsm_id, since LowState carries no body-pose field.
+    # unverified: the safe set and the standing/locomotion FSM id population
+    # are confirmed on hardware (gate 6.4); until then TORQUE_OFF is
+    # fail-closed to sit/squat.
+    torque_off_fsm_id: 1
+    torque_off_safe_fsm_ids: [2, 3]
+    zero_velocity_first: true
+    # The ramp-down rate for every handover of the 17-joint frame back to
+    # internal control: the stop sequence and stream exit both use it. It
+    # bounds the declared idle/torque_off stop latencies.
+    # unverified: tuned on a gantry (gate 6.2/6.4).
+    weight_ramp_down_rate: 0.2
+  tts:
+    api_id: 1001
+    # unverified: TtsMakerParameter defaults (index 0, speaker_id 0).
+    speaker_id: 0
+    index: 0
+  led:
+    api_id: 1010
+  audio:
+    start_play_api_id: 1003
+    stop_play_api_id: 1004
+  # Per-endpoint QoS (design D9). unverified in full: assumed from DDS
+  # high-rate-stream conventions; measured with `ros2 topic info -v` on
+  # hardware (gate 6.1) and written back before conformance.
+  qos:
+    low_state: {reliability: best_effort, durability: volatile, depth: 10}
+    arm_sdk: {reliability: best_effort, durability: volatile, depth: 10}
+    dex3_cmd: {reliability: best_effort, durability: volatile, depth: 10}
+    dex3_state: {reliability: best_effort, durability: volatile, depth: 10}
+    rpc_request: {reliability: reliable, durability: volatile, depth: 10}
+    rpc_response: {reliability: reliable, durability: volatile, depth: 10}
+  # URDF joint limits (g1_29dof_with_hand_rev_1_0), SI radians. Used by the
+  # projection to refuse out-of-range targets; nothing is clamped, a clamp
+  # would execute a motion the caller did not ask for.
+  joint_limits:
+    left_hip_pitch_joint: {lower: -2.530700, upper: 2.879800, effort: 88.0, velocity: 32.0}
+    left_hip_roll_joint: {lower: -0.523600, upper: 2.967100, effort: 139.0, velocity: 20.0}
+    left_hip_yaw_joint: {lower: -2.757600, upper: 2.757600, effort: 88.0, velocity: 32.0}
+    left_knee_joint: {lower: -0.087267, upper: 2.879800, effort: 139.0, velocity: 20.0}
+    left_ankle_pitch_joint: {lower: -0.872670, upper: 0.523600, effort: 35.0, velocity: 30.0}
+    left_ankle_roll_joint: {lower: -0.261800, upper: 0.261800, effort: 35.0, velocity: 30.0}
+    right_hip_pitch_joint: {lower: -2.530700, upper: 2.879800, effort: 88.0, velocity: 32.0}
+    right_hip_roll_joint: {lower: -2.967100, upper: 0.523600, effort: 139.0, velocity: 20.0}
+    right_hip_yaw_joint: {lower: -2.757600, upper: 2.757600, effort: 88.0, velocity: 32.0}
+    right_knee_joint: {lower: -0.087267, upper: 2.879800, effort: 139.0, velocity: 20.0}
+    right_ankle_pitch_joint: {lower: -0.872670, upper: 0.523600, effort: 35.0, velocity: 30.0}
+    right_ankle_roll_joint: {lower: -0.261800, upper: 0.261800, effort: 35.0, velocity: 30.0}
+    waist_yaw_joint: {lower: -2.618000, upper: 2.618000, effort: 88.0, velocity: 32.0}
+    waist_roll_joint: {lower: -0.520000, upper: 0.520000, effort: 35.0, velocity: 30.0}
+    waist_pitch_joint: {lower: -0.520000, upper: 0.520000, effort: 35.0, velocity: 30.0}
+    left_shoulder_pitch_joint: {lower: -3.089200, upper: 2.670400, effort: 25.0, velocity: 37.0}
+    left_shoulder_roll_joint: {lower: -1.588200, upper: 2.251500, effort: 25.0, velocity: 37.0}
+    left_shoulder_yaw_joint: {lower: -2.618000, upper: 2.618000, effort: 25.0, velocity: 37.0}
+    left_elbow_joint: {lower: -1.047200, upper: 2.094400, effort: 25.0, velocity: 37.0}
+    left_wrist_roll_joint: {lower: -1.972222, upper: 1.972222, effort: 25.0, velocity: 37.0}
+    left_wrist_pitch_joint: {lower: -1.614430, upper: 1.614430, effort: 5.0, velocity: 22.0}
+    left_wrist_yaw_joint: {lower: -1.614430, upper: 1.614430, effort: 5.0, velocity: 22.0}
+    right_shoulder_pitch_joint: {lower: -3.089200, upper: 2.670400, effort: 25.0, velocity: 37.0}
+    right_shoulder_roll_joint: {lower: -2.251500, upper: 1.588200, effort: 25.0, velocity: 37.0}
+    right_shoulder_yaw_joint: {lower: -2.618000, upper: 2.618000, effort: 25.0, velocity: 37.0}
+    right_elbow_joint: {lower: -1.047200, upper: 2.094400, effort: 25.0, velocity: 37.0}
+    right_wrist_roll_joint: {lower: -1.972222, upper: 1.972222, effort: 25.0, velocity: 37.0}
+    right_wrist_pitch_joint: {lower: -1.614430, upper: 1.614430, effort: 5.0, velocity: 22.0}
+    right_wrist_yaw_joint: {lower: -1.614430, upper: 1.614430, effort: 5.0, velocity: 22.0}
+    left_hand_thumb_0_joint: {lower: -1.047198, upper: 1.047198, effort: 2.45, velocity: 3.14}
+    left_hand_thumb_1_joint: {lower: -0.610865, upper: 1.047198, effort: 1.4, velocity: 12.0}
+    left_hand_thumb_2_joint: {lower: 0.0, upper: 1.745329, effort: 1.4, velocity: 12.0}
+    left_hand_index_0_joint: {lower: -1.570796, upper: 0.0, effort: 1.4, velocity: 12.0}
+    left_hand_index_1_joint: {lower: -1.745329, upper: 0.0, effort: 1.4, velocity: 12.0}
+    left_hand_middle_0_joint: {lower: -1.570796, upper: 0.0, effort: 1.4, velocity: 12.0}
+    left_hand_middle_1_joint: {lower: -1.745329, upper: 0.0, effort: 1.4, velocity: 12.0}
+    right_hand_thumb_0_joint: {lower: -1.047198, upper: 1.047198, effort: 2.45, velocity: 3.14}
+    right_hand_thumb_1_joint: {lower: -1.047198, upper: 0.610865, effort: 1.4, velocity: 12.0}
+    right_hand_thumb_2_joint: {lower: -1.745329, upper: 0.0, effort: 1.4, velocity: 12.0}
+    right_hand_index_0_joint: {lower: 0.0, upper: 1.570796, effort: 1.4, velocity: 12.0}
+    right_hand_index_1_joint: {lower: 0.0, upper: 1.745329, effort: 1.4, velocity: 12.0}
+    right_hand_middle_0_joint: {lower: 0.0, upper: 1.570796, effort: 1.4, velocity: 12.0}
+    right_hand_middle_1_joint: {lower: 0.0, upper: 1.745329, effort: 1.4, velocity: 12.0}
+  # Low-level expert tier, default OFF (design D11): rt/lowcmd publishing and
+  # the CRC32 requirement are not implemented in this change; gains are data
+  # only while the tier is disabled.
+  expert_joint_tier:
+    enabled: false
+    command_topic: rt/lowcmd
+    gains:
+      arm: {kp: 60.0, kd: 1.5}
+      waist: {kp: 60.0, kd: 1.5}
+
+# ---------------------------------------------------------------------------
+# Peripherals composed by the runtime from shared drivers (design D8): the
+# D435 camera and the MID-360 lidar are NOT published by the vendor SDK.
+# Instance values (IPs, serials) arrive via deployment peripherals fragments;
+# the defaults here carry only what the URDF fixes plus conservative
+# placeholders. The declared endpoints are the ones peripheral_nodes actually
+# serves when enabled.
+# ---------------------------------------------------------------------------
+peripherals:
+  - type: camera
+    name: head_front
+    driver: realsense
+    frame_id: d435_link
+    # unverified: optical frame naming, confirmed on the unit (gate 6.1).
+    optical_frame_id: d435_link
+    width: 640
+    height: 480
+    fps: 30
+    enable_depth: true
+    align_depth: true
+  - type: lidar
+    name: chest_front
+    driver: livox_mid360
+    frame_id: mid360_link
+    xfer_format: 0
+    publish_freq: 10.0
+    pointcloud_topic: /livox/lidar
+    imu_topic: /livox/imu
+    # unverified: MID-360 lidar_ip / host network on the G1 compute board;
+    # overridden by deployment fragments, never hand-edited per unit.
+    lidar_ip: 192.168.1.100
+    host_ip: 192.168.1.10
+
+# Lidar-inertial odometry off by default: enabling it requires the MID-360
+# network facts to be confirmed first (gate 6.1). fast_lio_nodes composes from
+# the lidar peripheral; the output feeds base.odom-style localization only when
+# enabled.
+fast_lio:
+  enabled: false
+  odom_frame: odom
+  source_body_frame: body
+  output_topic: /odometry/filtered
+
+# ---------------------------------------------------------------------------
+# Public interfaces merged verbatim into the exported description.
+#
+# The bridge republishes vendor-sensed state (IMU from LowState.imu_state)
+# onto neutral endpoints, and serves vendor request/response surfaces with
+# ibrobot_msgs types so no generic consumer links unitree_hg or unitree_api.
+# Vendor capabilities that need a request/response surface are served here;
+# nothing vendor-private is exported.
+#
+# Two entries are deliberately absent: power.state (which vendor topic
+# publishes the pack state is unverified, gate 6.1) and audio.play (the voice
+# service plays named streams, not a documented PCM topic, gate 6.1). They
+# return with their sources confirmed on hardware.
+# ---------------------------------------------------------------------------
+interfaces:
+  imu.body:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /imu/data
+    message_type: sensor_msgs/msg/Imu
+    # unverified: which URDF IMU frame (imu_in_torso vs imu_in_pelvis)
+    # LowState.imu_state reports; frame_id stays unset until confirmed.
+    rate_hz: 500.0
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+  motion.named:
+    capability: motion.named
+    kind: action
+    direction: serve
+    endpoint: /motion/execute_named
+    message_type: ibrobot_msgs/action/ExecuteNamedMotion
+  speech.speak:
+    capability: interaction.tts
+    kind: service
+    direction: serve
+    endpoint: /speech/speak
+    message_type: ibrobot_msgs/srv/SpeakText
+  led.set_pattern:
+    capability: interaction.led
+    kind: service
+    direction: serve
+    endpoint: /led/set_pattern
+    message_type: ibrobot_msgs/srv/SetLedPattern

@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>unitree_g1_robot</name>
+  <version>0.1.0</version>
+  <description>
+    Unitree G1 (29 DoF + Dex3) robot runtime: the independently deployable
+    unit through which the G1 joins IB-Robot. The vendor owns balance,
+    whole-body control and sensing; this package serves the public runtime
+    contract by bridging to the vendor DDS tier (rt/lowstate, rt/arm_sdk,
+    rt/dex3 and the rt/api RPC services) through pure ROS 2 messages only.
+    It launches no controller manager, no ros2_control hardware component
+    and no sensor driver, and the low-level rt/lowcmd expert tier stays
+    disabled by default.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- runtime contract layer (the only IB-Robot packages a runtime may depend on) -->
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+
+  <!-- vendored Unitree interface definitions (BSD-3-Clause, see each
+       package's PROVENANCE.md for the upstream commit) -->
+  <exec_depend>unitree_hg</exec_depend>
+  <exec_depend>unitree_api</exec_depend>
+
+  <!-- message packages the bridge publishes on the neutral surface -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>audio_common_msgs</exec_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
