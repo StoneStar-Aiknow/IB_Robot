@@ -598,6 +598,51 @@ robot:
   robot-skill CLI 请用 launch 日志里 `consumer snapshot:` 给出的绑定后配置（`--config-path`）。
 - `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。
 
+## X2 照镜子（motion_imitation_stream / mirror_session）
+
+`config/robots/aimdk_x2_magicmirror.yaml` 在 `aimdk_x2_skills.yaml` 之上配置 X2 照镜子：选用 OmniHand
+profile（`joint.hand_stream`，20 路），技能栈只保留 `mirror_start` / `mirror_stop`，控制模式
+`model_inference` 映射到运行时 `policy_stream`。节点职责见 `manipulation_execution` README 的
+“X2 照镜子”一节。三个配置块：
+
+```yaml
+robot:
+  perception_services:            # YOLOX 与 PEAR 两个通用模型服务（Ascend 310P bundle）
+    services: [...]
+  motion_imitation_stream:
+    enabled: true
+    frame_source:
+      interface: camera.stereo_head_front_left.color_compressed   # 逻辑 ID，端点取自实时接口描述
+      decoder: mock_cpu
+    mock_playback:
+      enabled: true
+      preview_topic: /motion_imitation_mock/arm_command_preview
+      arm_limits: {...}             # 按关节名，必须恰好覆盖 joint.arm_stream 的关节
+      arm_velocity_limits: {...}
+  mirror_session:
+    enabled: true
+    publish_enabled: false        # 默认只发 preview 话题，不发运行时通道
+    control_mode: model_inference
+    stop_timeout_sec: 5.0         # 必须等于 skill_catalog 中 mirror_stop 的 timeout_sec
+    interfaces:                   # 逻辑接口绑定：launch 等待并从实时接口描述绑定端点
+      get_status: {interface: runtime.get_status, kind: service, type: ibrobot_msgs/srv/GetRuntimeStatus}
+      set_mode: {interface: runtime.set_mode, kind: service, type: ibrobot_msgs/srv/SetRuntimeMode}
+```
+
+- `launch_builders/motion_imitation_stream.py` 启动 `motion_imitation_stream_node`，`mock_playback.enabled`
+  时再启动 `motion_imitation_mock_node`。相机端点和手臂通道的关节顺序都按逻辑 ID 从已绑定的运行时接口
+  描述中取得，配置未绑定时启动失败，不回退到猜测的话题名。`frame_source.topic` 可直接指定描述中没有的
+  话题，与 `frame_source.interface` 二选一。
+- `launch_builders/mirror_session.py` 启动 `mirror_session_node`，并检查：`control_mode` 是
+  `control_modes` 的成员，其 `runtime_mode` 显式且不是 idle；映射到同一运行时模式的控制模式都显式关闭
+  `inference` 和 `executor`（会话是该模式唯一的指令源）。会话进程退出且 launch 仍在运行时，launch 运行
+  `mirror_session_release` 把运行时从 `policy_stream` 释放回 idle；它只调用 `set_mode`，从不发送手臂或
+  手指指令。
+- `mirror_session.enabled` 为 `true` 时，`embodied_bringup` 为 Gateway 打开 `mirror_session` 执行器并传入
+  会话的 `~/set_session` 服务名；catalog 是否包含该执行器的技能必须与此一致，否则 Gateway 拒绝启动。
+- 两个模型 bundle 按 `WORKSPACE` 相对路径解析，`$WORKSPACE/models/` 下缺少 bundle 时配置解析失败，整个
+  launch 中止。
+
 ## 控制模式配置
 
 robot_config 包支持双控制模式，以满足不同 AI 模型的需求：

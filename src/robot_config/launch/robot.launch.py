@@ -1115,8 +1115,12 @@ def _construct_robot_nodes(
 
     # Business code lives in its own package; start after runtime readiness.
     from robot_config.launch_builders.interaction_demo import generate_interaction_demo_nodes
+    from robot_config.launch_builders.motion_imitation_stream import generate_motion_imitation_stream_nodes
+    from robot_config.launch_builders.mirror_session import generate_mirror_session_nodes
 
     controller_dependent_actions.extend(generate_interaction_demo_nodes(robot_config))
+    controller_dependent_actions.extend(generate_motion_imitation_stream_nodes(robot_config))
+    controller_dependent_actions.extend(generate_mirror_session_nodes(robot_config))
 
     enable_tracing = parse_bool(context.launch_configurations.get("enable_tracing", "false"), default=False)
     if controller_dependent_actions:
