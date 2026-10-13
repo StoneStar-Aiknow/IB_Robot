@@ -529,6 +529,10 @@ peripherals:
     # overridden by deployment fragments, never hand-edited per unit.
     lidar_ip: 192.168.1.100
     host_ip: 192.168.1.10
+    # Stock driver config template the launch rewrites with the IPs above
+    # (same default as the LeKiwi profiles); the path substitution resolves
+    # inside the vendored livox_ros_driver2 share directory.
+    user_config_path: $(find livox_ros_driver2)/config/MID360_config.json
 
 # Lidar-inertial odometry off by default: enabling it requires the MID-360
 # network facts to be confirmed first (gate 6.1). fast_lio_nodes composes from

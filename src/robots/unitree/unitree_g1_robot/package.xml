@@ -9,9 +9,10 @@
     whole-body control and sensing; this package serves the public runtime
     contract by bridging to the vendor DDS tier (rt/lowstate, rt/arm_sdk,
     rt/dex3 and the rt/api RPC services) through pure ROS 2 messages only.
-    It launches no controller manager, no ros2_control hardware component
-    and no sensor driver, and the low-level rt/lowcmd expert tier stays
-    disabled by default.
+    It launches no controller manager and no ros2_control hardware
+    component, the low-level rt/lowcmd expert tier stays disabled by
+    default, and the D435/MID-360 peripherals the vendor SDK does not
+    publish are composed from shared drivers (design D8).
   </description>
   <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
   <license>Apache-2.0</license>
@@ -26,6 +27,18 @@
        package's PROVENANCE.md for the upstream commit) -->
   <exec_depend>unitree_hg</exec_depend>
   <exec_depend>unitree_api</exec_depend>
+  <!-- vendored robot description: the URDF robot_state_publisher renders for
+       TF only (design D6); it never reaches build_description -->
+  <exec_depend>unitree_g1_description</exec_depend>
+
+  <!-- launch composition: the pinned vendor DDS implementation (design D2)
+       and the shared sensor drivers the runtime composes in real transport
+       (design D8) -->
+  <exec_depend>rmw_cyclonedds_cpp</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
 
   <!-- message packages the bridge publishes on the neutral surface -->
   <exec_depend>ament_index_python</exec_depend>
