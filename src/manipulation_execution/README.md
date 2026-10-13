@@ -99,6 +99,51 @@ binding 或 executor identity。
 goal 发送和反馈收敛，抓取行为仍只在正式 phases 中实现；`test_pick_single_source.py` 会确保旧脚本不被
 重新引入，且客户端保持为唯一的 supervised-direct 入口。
 
+## X2 照镜子：常驻感知流与镜像会话
+
+`robot_config` 的 `aimdk_x2_magicmirror` 配置启动以下三个节点（launch 接线与配置项见 `robot_config`
+README 的“X2 照镜子”一节）：
+
+```text
+头部压缩相机流 -> motion_imitation_stream_node --PearFrame--> motion_imitation_mock_node
+                                                              --arm_command_preview--> mirror_session_node
+mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ joint.hand_stream（20 路）
+```
+
+| 节点 | 职责 | 主要接口 |
+| --- | --- | --- |
+| `motion_imitation_stream_node` | 常驻流水线：解码压缩图像，低频刷新 YOLOX 人框，对最新帧调用 PEAR 并逐帧发布 | 发布 `ibrobot_msgs/PearFrame`、`ibrobot_msgs/ActorState` 和 JSON 状态；不发布任何运动指令 |
+| `motion_imitation_mock_node` | 模拟重定向（播放随包动画 `data/x2_mock_imitation/`）与模拟安全（关节限位钳制、限速） | 订阅 `PearFrame`（只作存活判据），发布 `/motion_imitation_mock/arm_command_preview`；`~/play`（`std_srvs/SetBool`） |
+| `mirror_session_node` | WAIT / STANDBY / MIRRORING 状态机、运行时模式的接管与释放；手臂与手指通道的唯一发布者 | `~/set_session`（`std_srvs/SetBool`，只由 Gateway 的 `mirror_session` 执行器调用）、`~/status`（JSON）、`~/arm_command_preview` / `~/hand_command_preview` |
+
+解码器按名字选择（`frame_decoder.py`），当前只注册了 `mock_cpu`（OpenCV 软件解码）；选人逻辑在
+`actor_selector.py`，当前取置信度最高的人且不跨帧保持身份。两者与模拟节点的 `_retarget` /
+`_apply_safety` 都可以单独替换，替换时保持各自的输出契约。
+
+会话与运行时的约定（`mirror_session/core.py`、`mirror_session/runtime.py`）：
+
+- 节点启动后处于 WAIT。`mirror_start` 由 Gateway 先把运行时切到控制模式 `model_inference` 对应的
+  `policy_stream`，会话再接管该模式；会话从不自行从 idle 申请 `policy_stream`。
+- 失去模式（运行时切到其他模式、stop 锁存、故障、状态超过 2 s 未更新）时立即关闭输出闸门并进入 WAIT，
+  不请求 idle，也不自动恢复，需要重新 `mirror_start`。
+- 所有回到 idle 的路径都经过 `release_to_idle`：只有观察到运行时处于 `policy_stream` 且没有 stop 锁存时
+  才请求 idle（请求 idle 会清除 stop 锁存）。`mirror_stop` 在观察到运行时回到 idle 后才报成功；收尾
+  预算为 `stop_timeout_sec` 减去 2 s 的释放预留。
+- `publish_enabled`（默认 `false`）为 `false` 时，闸门输出只发到会话的 preview 话题，不发到运行时通道；
+  接管与释放照常执行。
+- `mirror_session/hooks.py` 的 `SessionHooks` 是镜像行为的扩展点（起止判据、窗口流水线、收尾），默认值
+  均取最保守的行为。启用 `mock_playback` 时窗口流水线为 `MockPlaybackHooks`：每轮通过 `~/play` 从第 0 帧
+  播放模拟动画，手指 20 路恒为 0。
+
+已知限制：
+
+- 模拟安全的限速不覆盖每轮的第一条命令。`~/play` 开始播放、或 PEAR 流中断超过 `input_staleness_sec`
+  后恢复时，动画从第 0 帧重新开始，第一条命令只做限位钳制，可能从当前保持的位姿直接跳到第 0 帧；随包动画
+  中任一帧与第 0 帧的单关节差最大约 1.41 rad。
+- 限速使用配置的关节额定速度（取自厂商 URDF），步长按实际经过的时间计算，定时器延迟时单步允许的变化相应变大。
+- 回到 idle 需要运行时仍能应答。整个 launch 被中断时运行时可能先退出，会话无法请求 idle；launch 自身关闭
+  期间也不会运行 `mirror_session_release`。停止 launch 前应先执行 `mirror_stop`。
+
 ## 架构位置
 
 ```text
