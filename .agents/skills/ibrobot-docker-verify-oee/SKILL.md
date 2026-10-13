@@ -173,7 +173,7 @@ corresponding phase section.
 | **3.5** | Verify & repair base image integrity (RPM DB vs on-disk binary mismatch) — see [Base Image Integrity Pre-flight](#base-image-integrity-pre-flight) | Base packages consistent |
 | **4** | Prepare workspace — **choose one mode** (docker cp or git clone) | `SOURCE_MODE` |
 | **4.5** | ROS source-switch pre-clean (conditional) — remove all `ros-humble-*` in chroot when the change switches the ROS source | No ROS packages left |
-| **5** | Run `setup.sh --yes --no-sudo`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
+| **5** | Run `setup.sh --yes --no-sudo --accel cann`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
 | **5.5** | Post-setup integrity gate (MUST run before build): re-probe fragile pairs, repair via `dnf reinstall` | Gate OK before build |
 | **6** | Run `build.sh`, capture log | `/tmp/build.log` |
 | **7** | Collect ERROR lines, clean up container | Final report |

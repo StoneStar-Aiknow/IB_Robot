@@ -94,11 +94,15 @@ runs normally reuse the local image layers.
 
 ```bash
 # 2.1 Remove a stale verification container, then start the ROS-ready image.
-# CUDA toolkit (if available on the host) is mounted read-only so GraspGen's
-# pointnet2_ops can be compiled. --gpus is NOT required: the CUDA arch is
-# fixed via TORCH_CUDA_ARCH_LIST and the smoke test only does find_spec.
-# If no host CUDA toolkit is available, setup.sh will skip grasp install
-# gracefully and the verification continues without the grasp smoke test.
+# --gpus is NOT required: the CUDA arch is fixed via TORCH_CUDA_ARCH_LIST and
+# the smoke test only does find_spec.
+# Do NOT mount a host CUDA toolkit whose CUDA version differs from
+# torch.version.cuda. Any visible nvcc makes install_graspgen_pip prefer a
+# source build of pointnet2_ops and suppresses the Torch ABI pin, and the build
+# then fails on the version mismatch (measured: toolkit 12.4 vs torch
+# 2.11.0+cu130 -> setup exits 1, pointnet2_ops not installed). With no toolkit
+# mounted the ABI pin runs and the audited wheel installs, which is the
+# configuration this gate should use.
 CONTAINER_START=$(date +%s)
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
@@ -196,8 +200,8 @@ docker exec \
   '
 
 # 2.5 Verify the mounted CUDA toolkit is accessible from the container (only
-# when a host CUDA toolkit was detected in Phase 0). If skipped, setup.sh will
-# warn and skip GraspGen install — the verification continues.
+# when Phase 0 detected one AND its CUDA version matches torch.version.cuda).
+# Mounting a mismatched toolkit breaks the grasp install outright; see 2.1.
 if [ -n "${HOST_CUDA_HOME}" ]; then
     docker exec \
       -u testuser \
@@ -209,7 +213,7 @@ if [ -n "${HOST_CUDA_HOME}" ]; then
         printf "CUDA_HOME=%s\n" "${CUDA_HOME}"
       '
 else
-    echo "No host CUDA toolkit; grasp deps will be skipped in this verification run."
+    echo "No host CUDA toolkit; this is the preferred state - the Torch ABI pin runs and pointnet2_ops installs from the audited wheel."
 fi
 
 CONTAINER_SECONDS=$(( $(date +%s) - CONTAINER_START ))
@@ -393,6 +397,14 @@ required in addition.
 
 ## Phase 4 — Run setup.sh
 
+`--accel cuda` is required: the accelerator axis is probed from `nvidia-smi`,
+which a container started without `--gpus` does not have, so detection would
+resolve to `cpu` and skip the whole CUDA dependency set. The override states
+which runtime to install rather than which hardware is present, so this keeps
+the gate covering the GraspGen and `pointnet2_ops` wheel install path without
+needing GPU passthrough. Drop the flag only to verify the CPU-only profile on
+purpose.
+
 ```bash
 docker exec \
   -u testuser \
@@ -404,7 +416,7 @@ docker exec \
   "${CONTAINER}" \
   bash -c '
     SECONDS=0
-    bash scripts/setup.sh --yes > /tmp/setup.log 2>&1
+    bash scripts/setup.sh --yes --accel cuda > /tmp/setup.log 2>&1
     status=$?
     printf "%s\n" "${status}" > /tmp/setup.status
     printf "SETUP_ELAPSED_SECONDS=%s\n" "${SECONDS}" > /tmp/setup.time

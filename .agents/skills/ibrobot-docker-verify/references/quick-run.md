@@ -26,6 +26,6 @@ docker exec -u testuser -e HOME=/home/testuser \
   -w /home/testuser/IB_Robot \
   verify-ubuntu2204 \
   bash -c 'DEBIAN_FRONTEND=noninteractive \
-    bash scripts/setup.sh --yes \
+    bash scripts/setup.sh --yes --accel cuda \
     > /tmp/setup.log 2>&1'
 ```
