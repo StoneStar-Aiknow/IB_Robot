@@ -12,6 +12,10 @@ TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 WORKSPACE="${REPO_ROOT}"
 
+# python_venv.sh resolves its dependency groups through the profile table and
+# helpers in common.sh; setup.sh always sources common.sh first.
+# shellcheck disable=SC1090
+source "${REPO_ROOT}/scripts/setup/common.sh"
 # shellcheck disable=SC1090
 source "${DETECT_LIB}"
 # shellcheck disable=SC1090
@@ -379,5 +383,26 @@ else
 fi
 
 echo
+# A training environment deliberately keeps NumPy 2.x. Only ROS profiles
+# require the restored NumPy 1.26 ABI; CANN package constraints still apply.
+if SETUP_PROFILE=training TEST_NUMPY_VERSION=2.3.0 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null; then
+    assert_eq "training CANN accepts NumPy without the ROS ABI pin" "0" "0"
+else
+    assert_eq "training CANN accepts NumPy without the ROS ABI pin" "0" "1"
+fi
+if SETUP_PROFILE=inference TEST_NUMPY_VERSION=2.3.0 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null 2>&1; then
+    assert_eq "inference CANN still rejects a broken ROS NumPy ABI" "1" "0"
+else
+    assert_eq "inference CANN still rejects a broken ROS NumPy ABI" "1" "1"
+fi
+if SETUP_PROFILE=training TEST_TRANSFORMERS_VERSION=5.5.4 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null 2>&1; then
+    assert_eq "training CANN still enforces non-ROS runtime constraints" "1" "0"
+else
+    assert_eq "training CANN still enforces non-ROS runtime constraints" "1" "1"
+fi
+
 echo "== summary: ${PASS} passed, ${FAIL} failed =="
 [[ ${FAIL} -eq 0 ]]

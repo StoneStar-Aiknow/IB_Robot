@@ -43,7 +43,7 @@ update_submodules() {
         [[ -n "${sm_path}" ]] && submodules+=("${sm_path}")
     done <<< "$(git config --file .gitmodules --get-regexp path | awk '{ print $2 }')"
 
-    if setup_profile_limits_submodules; then
+    if [[ "$(setup_profile_get submodules)" == "lerobot" ]]; then
         # Inference-only hosts (edge-cloud collaborative inference
         # verification) and LeRobot training hosts need just the lerobot policy
         # sources; bringup, teleop, and LiDAR submodules stay uninitialized to

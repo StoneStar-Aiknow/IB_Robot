@@ -163,7 +163,11 @@ verify_cann_runtime_versions() {
         *) return 0 ;;
     esac
     verify_cann_torch_abi "${python_path}" || return 1
-    "${python_path}" - "${release}" "${WORKSPACE}/requirements/constraints-cann-${release}.txt" <<'PY'
+    local require_ros_numpy=0
+    if setup_profile_enables ros_abi; then
+        require_ros_numpy=1
+    fi
+    "${python_path}" - "${release}" "${WORKSPACE}/requirements/constraints-cann-${release}.txt" "${require_ros_numpy}" <<'PY'
 import importlib.metadata
 import sys
 from pathlib import Path
@@ -187,7 +191,7 @@ for raw in constraints_path.read_text(encoding="utf-8").splitlines():
         raise SystemExit(f"CANN {release} requires {requirement}, got {installed}")
     print(f"CANN {release} runtime verified: {requirement.name}=={installed}")
 numpy_version = importlib.metadata.version("numpy")
-if numpy_version != "1.26.4":
+if sys.argv[3] == "1" and numpy_version != "1.26.4":
     raise SystemExit(f"CANN {release} final ROS ABI requires numpy==1.26.4, got {numpy_version}")
 PY
 }
@@ -202,8 +206,9 @@ install_lerobot_editable() {
         exit 1
     fi
 
-    # The ROS 2 ABI Python-version warning is meaningless on a training host.
-    if [[ "${SETUP_PROFILE:-full}" != "training" ]]; then
+    # The ROS 2 ABI Python-version warning only applies to profiles that must
+    # honour that ABI.
+    if setup_profile_enables ros_abi; then
         check_lerobot_ros_numpy_compat
     fi
 
@@ -221,8 +226,9 @@ install_lerobot_editable() {
     # distribution before installing hf-libero so the two providers never
     # coexist under the same top-level Python package.
     local lerobot_extras=(smolvla pi diffusion dataset deepdiff-dep)
-    # kinematics pulls placo for SO-101 Cartesian teleop: full workspaces only.
-    if [[ "${SETUP_PROFILE:-full}" == "full" ]]; then
+    # kinematics pulls placo for SO-101 Cartesian teleop: development
+    # workspaces only.
+    if setup_profile_enables kinematics; then
         lerobot_extras+=(kinematics)
     fi
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID:-unknown}" == "ubuntu-22.04" ]]; then
@@ -252,7 +258,7 @@ GRASPGEN_TORCHCODEC_VERSION="0.5"
 
 install_graspgen_torch_abi() {
     # Lean profiles must not inherit the manipulation-stack Torch ABI pin.
-    if [[ "${SETUP_PROFILE:-full}" != "full" ]]; then
+    if ! setup_profile_enables graspgen_abi_pin; then
         return 0
     fi
     # Both wheel paths use this exact ABI. A skip plan must leave the runtime
@@ -316,20 +322,9 @@ setup_python_venv() {
     local venv_path="${WORKSPACE}/venv"
     local lerobot_dir="${WORKSPACE}/libs/lerobot"
 
-    # Convenience flags for profile gating below: the inference profile skips
-    # every dependency group that is not required to load policy bundles and
-    # serve inference requests; the training profile keeps the LeRobot path and
-    # its training dependencies but installs neither ROS 2 runtime glue nor the
-    # manipulation / teleop / perception stacks.
-    local full_profile=true
-    local training_profile=false
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        full_profile=false
-    fi
-    if [[ "${SETUP_PROFILE:-full}" == "training" ]]; then
-        full_profile=false
-        training_profile=true
-    fi
+    # Every dependency group below is gated by the feature list of the active
+    # profile (_SETUP_PROFILE_TABLE in common.sh); there is no per-profile
+    # branching here.
 
     # 0. Python interpreter preflight
     local host_python_path host_python_version host_py_major host_py_minor
@@ -424,8 +419,10 @@ setup_python_venv() {
     # until the patch stack lowers it. Running patches first ensures
     # the compat gate reads the patched pyproject.toml.
     # ------------------------------------------------------------------
-    log_info "Installing PyYAML for the lerobot patch dispatcher..."
-    run_cmd "${VENV_PYTHON}" -m pip install pyyaml --quiet
+    # Both checks run before LeRobot installs its declared dependencies.
+    # A fresh Ubuntu venv has neither PyYAML nor packaging by default.
+    log_info "Installing LeRobot bootstrap dependencies (PyYAML and packaging)..."
+    run_cmd "${VENV_PYTHON}" -m pip install pyyaml "packaging>=24.2,<26" --quiet
     if [[ -d "${lerobot_dir}" ]]; then
         ensure_lerobot_patch_stack_applied
     fi
@@ -434,7 +431,7 @@ setup_python_venv() {
     # The same plan drives the later wheel install so a skipped stack never
     # downgrades the runtime merely for an extension that will not be installed.
     local pointnet2ops_plan="skip:GraspGen is disabled for this setup profile"
-    if [[ "${full_profile}" == true && "${INSTALL_BENCHMARK_DEPS:-false}" != true ]] &&
+    if setup_profile_enables grasp && [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true ]] &&
         accel_supports_torch_grasp; then
         # shellcheck disable=SC1091
         source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
@@ -488,7 +485,7 @@ setup_python_venv() {
     run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/base.txt" --quiet
 
     # Install hardware dependencies
-    if [[ "${full_profile}" == true ]]; then
+    if setup_profile_enables hardware; then
         log_info "Installing hardware dependencies..."
         run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/hardware.txt" --quiet
     else
@@ -496,7 +493,7 @@ setup_python_venv() {
     fi
 
     # Install the optional built-in WebPhone dependency
-    if [[ "${full_profile}" != true ]]; then
+    if ! setup_profile_enables webphone; then
         log_info "Skipping WebPhone teleoperation dependency (${SETUP_PROFILE} profile)."
     elif [[ "${AUTO_YES}" == true ]]; then
         log_info "Auto-yes mode: installing WebPhone dependency (websockets)..."
@@ -532,10 +529,10 @@ setup_python_venv() {
     #   training  -> requirements/training.txt only (installed after the
     #                platform dependency block below)
     #   inference -> neither
-    if [[ "${full_profile}" == true ]]; then
+    if setup_profile_enables dev_tools; then
         log_info "Installing dev-tools (tensorboard, rerun, gitlint, ruff, pre-commit)..."
         run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/dev-tools.txt" --quiet
-    elif [[ "${training_profile}" == true ]]; then
+    elif setup_profile_enables training_requirements; then
         log_info "Skipping dev-tools; installing training dependencies instead."
     else
         log_info "Skipping dev-tools (${SETUP_PROFILE} profile)."
@@ -544,19 +541,17 @@ setup_python_venv() {
     # Install OS-axis dependencies (ONNX tooling, etc.)
     case "${SETUP_PLATFORM_ID}" in
         ubuntu-22.04)
-            if [[ "${training_profile}" == true ]]; then
-                # Training profile: no ONNX toolchain (inference) and no
-                # mujoco (sim) / atomgit_sdk (collaboration CLI) from the full
-                # file; requirements/training.txt is installed below for every
-                # platform.
-                log_info "Skipping Ubuntu full/inference Python dependencies (training profile)."
-            elif [[ "${full_profile}" == true ]]; then
+            if setup_profile_enables ubuntu_full_deps; then
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
-            else
+            elif setup_profile_enables onnx_tooling; then
                 # Inference profile: only the ONNX toolchain; skip mujoco (sim).
                 # AtomGit collaboration now uses the official CLI (no pip package).
                 log_info "Installing inference ONNX tooling (${SETUP_PROFILE} profile)..."
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/inference.txt" --quiet
+            else
+                # No Ubuntu-specific file applies; a profile-owned requirements
+                # file (requirements/training.txt) is installed below.
+                log_info "Skipping Ubuntu full/inference Python dependencies (${SETUP_PROFILE} profile)."
             fi
             ;;
         openeuler-embedded-24.03)
@@ -567,12 +562,12 @@ setup_python_venv() {
             ;;
     esac
 
-    if [[ "${training_profile}" == true ]]; then
+    if setup_profile_enables training_requirements; then
         log_info "Installing LeRobot training dependencies (TensorBoard)..."
         run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/training.txt" --quiet
     fi
 
-    if [[ "${full_profile}" == true ]] && [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
+    if setup_profile_enables precommit_hook && [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
         "${VENV_PYTHON}" -m pre_commit install
     fi
 
@@ -580,9 +575,7 @@ setup_python_venv() {
     # Environment Patches & Overrides
     # ------------------------------------------------------------------
     
-    if [[ "${training_profile}" == true ]]; then
-        log_info "Skipping colcon installation (training profile)."
-    else
+    if setup_profile_enables colcon; then
         log_info "Installing colcon-common-extensions + colcon-mixin into the workspace venv..."
         run_cmd "${pip_install[@]}" --ignore-installed --upgrade colcon-common-extensions colcon-mixin --quiet
 
@@ -598,11 +591,11 @@ PY
             log_warn "colcon symlink installation will fail because setuptools>=71 removed setup.py develop."
             log_warn "Please ensure setuptools is downgraded or wait for colcon-core updates."
         fi
+    else
+        log_info "Skipping colcon installation (${SETUP_PROFILE} profile)."
     fi
 
-    if [[ "${training_profile}" == true ]]; then
-        log_info "Skipping Empy/rosdep ROS 2 compatibility pins (training profile)."
-    else
+    if setup_profile_enables ros_compat_pins; then
         log_info "Pinning Empy 3.3.4 for ROS 2 Humble rosidl compatibility..."
         run_cmd "${pip_install[@]}" --force-reinstall "empy==3.3.4" --quiet
 
@@ -612,6 +605,8 @@ PY
         # in case the venv was recreated between the two steps.
         log_info "Ensuring rosdep is present in the workspace venv..."
         run_cmd "${pip_install[@]}" rosdep --quiet
+    else
+        log_info "Skipping Empy/rosdep ROS 2 compatibility pins (${SETUP_PROFILE} profile)."
     fi
 
     # Force NumPy/OpenCV back to ROS 2 Humble ABI-compatible versions.
@@ -623,10 +618,7 @@ PY
     # The training profile has no ROS 2 runtime to protect, so it keeps the
     # NumPy/OpenCV versions LeRobot resolved. The constraints file stays
     # present but empty so downstream consumers keep working unchanged.
-    if [[ "${training_profile}" == true ]]; then
-        log_info "Skipping the ROS 2 NumPy/OpenCV ABI pin (training profile)."
-        : > "${ros_abi_constraints}"
-    else
+    if setup_profile_enables ros_abi; then
         log_info "Pinning NumPy/OpenCV to the ROS 2 Humble ABI-compatible versions..."
         run_cmd "${pip_install[@]}" --force-reinstall "${ros_abi_pin_packages[@]}" --quiet
         benchmark_install_runtime_abi "${VENV_PYTHON}" -m pip install
@@ -639,12 +631,15 @@ EOF
         if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
             cat "${BENCHMARK_PIP_CONSTRAINTS}" >> "${ros_abi_constraints}"
         fi
+    else
+        log_info "Skipping the ROS 2 NumPy/OpenCV ABI pin (${SETUP_PROFILE} profile)."
+        : > "${ros_abi_constraints}"
     fi
 
     # Install the ZipVoice frontend after creating the ROS ABI constraints.
     # Vocos itself is maintained in voice_tts_service.vocos_backend because
     # the PyPI package can replace the workspace Torch/torchaudio ABI.
-    if [[ "${full_profile}" == true ]]; then
+    if setup_profile_enables voice_tts; then
         log_info "Installing voice TTS frontend dependencies..."
         run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
             -r "${WORKSPACE}/requirements/voice-tts.txt" --quiet
@@ -658,13 +653,13 @@ EOF
     # RAM++ / GroundingDINO wheels ship in third_party/. Install them on every
     # platform that runs the local workspace build, including openEuler Embedded
     # (the Ascend OM path does not replace the Torch perception runtime).
-    # The inference profile skips them: edge-cloud inference verification uses
+    # The leaner profiles skip them: edge-cloud inference verification uses
     # the perception ROS mock instead of the real perception stack.
     local ram_wheel_root="${WORKSPACE}/third_party/wheels/recognize-anything/7cb804a"
     local ram_wheel="${ram_wheel_root}/ibrobot_ram-0.0.1+ibrobot.1-py3-none-any.whl"
     local gdino_wheel_root="${WORKSPACE}/third_party/wheels/groundingdino/313392a"
     local gdino_wheel="${gdino_wheel_root}/ibrobot_groundingdino-0.1.0+ibrobot.1-py3-none-any.whl"
-    if [[ "${full_profile}" != true ]]; then
+    if ! setup_profile_enables perception; then
         log_info "Skipping perception dependencies (${SETUP_PROFILE} profile)."
     else
         log_info "Installing perception dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2)..."
@@ -688,7 +683,7 @@ EOF
     # package instead of cloning the upstream source tree into models/.
     local fullsubnet_wheel_root="${WORKSPACE}/third_party/wheels/fullsubnet/e97448375"
     local fullsubnet_wheel="${fullsubnet_wheel_root}/ibrobot_fullsubnet-0.0.1+ibrobot.1-py3-none-any.whl"
-    if [[ "${full_profile}" != true ]]; then
+    if ! setup_profile_enables fullsubnet; then
         log_info "Skipping FullSubNet wheel (${SETUP_PROFILE} profile)."
     elif [[ -f "${fullsubnet_wheel_root}/SHA256SUMS" ]]; then
         if ! (cd "${fullsubnet_wheel_root}" && sha256sum --check SHA256SUMS); then
@@ -714,7 +709,7 @@ EOF
     local grasp_installed=false
     local graspgenx_wheel_root="${WORKSPACE}/third_party/wheels/graspgenx/b942909"
     local graspgenx_wheel="${graspgenx_wheel_root}/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl"
-    if [[ "${full_profile}" != true ]]; then
+    if ! setup_profile_enables grasp; then
         log_info "Skipping grasp dependencies (${SETUP_PROFILE} profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
         log_info "Skipping GraspGen/manipulation dependencies for Benchmark-only setup."
@@ -753,7 +748,7 @@ EOF
     # while the versions this workspace needs are in
     # requirements/graspgenx.txt and the accelerator's constraints.
     local graspgenx_installed=false
-    if [[ "${full_profile}" != true ]]; then
+    if ! setup_profile_enables grasp; then
         log_info "Skipping GraspGenX (inference profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
         log_info "Skipping GraspGenX for Benchmark-only setup."
@@ -815,8 +810,8 @@ EOF
 
     # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
-    if [[ "${training_profile}" == true ]]; then
-        log_info "Checking NumPy/OpenCV availability (training profile, unpinned)..."
+    if ! setup_profile_enables ros_abi; then
+        log_info "Checking NumPy/OpenCV availability (${SETUP_PROFILE} profile, unpinned)..."
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import cv2
 import numpy
@@ -909,8 +904,8 @@ with tempfile.TemporaryDirectory() as root:
 print(f"GraspGenX smoke test passed: graspgenx=={version}; patch seams present")
 PY
     fi
-    # gitlint ships in dev-tools.txt, which the inference profile skips.
-    if [[ "${full_profile}" != true ]]; then
+    # gitlint ships in dev-tools.txt, which the leaner profiles skip.
+    if ! setup_profile_enables gitlint_hook; then
         log_info "Skipping gitlint commit-msg hook (${SETUP_PROFILE} profile)."
     else
         local commit_msg_hook
@@ -951,10 +946,12 @@ PY
 
     local numpy_version_note="Target: 1.26.x for ROS 2 ABI"
     local colcon_summary="${venv_colcon_path}"
-    if [[ "${training_profile}" == true ]]; then
-        # No ROS 2 ABI to protect and no colcon installed on this profile.
-        numpy_version_note="training profile: unpinned (no ROS 2 ABI requirement)"
-        colcon_summary="not installed (training profile)"
+    if ! setup_profile_enables ros_abi; then
+        # No ROS 2 ABI to protect on this profile.
+        numpy_version_note="${SETUP_PROFILE} profile: unpinned (no ROS 2 ABI requirement)"
+    fi
+    if ! setup_profile_enables colcon; then
+        colcon_summary="not installed (${SETUP_PROFILE} profile)"
     fi
 
     echo -e "\n${YELLOW}Python Environment Summary:${NC}"

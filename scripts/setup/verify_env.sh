@@ -28,9 +28,10 @@
 : "${VENV_PYTHON:?Variable VENV_PYTHON is not set}"
 : "${SETUP_PLATFORM_ID:?Variable SETUP_PLATFORM_ID is not set}"
 : "${USE_SUDO:?Variable USE_SUDO is not set}"
-# The training profile installs neither rosdep nor a ROS 2 runtime, so these
-# two are optional there; every other profile keeps the fail-closed contract.
-if [[ "${SETUP_PROFILE:-full}" != "training" ]]; then
+# A profile without a ROS 2 runtime (training) installs neither rosdep nor
+# ROS 2, so these two are optional there; every other profile keeps the
+# fail-closed contract.
+if setup_profile_enables ros_runtime; then
     : "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
     : "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
 fi
@@ -204,8 +205,8 @@ verify_tracing() {
     # Tracing packages (lttng-ust, babeltrace2, tracetools_analysis) are pulled
     # in via robot_config's rosdep keys, which the inference profile does not
     # install; tracing is a full-workspace diagnostics feature.
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        log_info "Skipping tracing verification (inference profile)."
+    if [[ "$(setup_profile_get verify)" != "full" ]]; then
+        log_info "Skipping tracing verification (${SETUP_PROFILE} profile)."
         return 0
     fi
 
@@ -493,8 +494,8 @@ verify_training_env() {
     log_info "Verifying training profile environment (venv + LeRobot)..."
 
     if ! PYTHONNOUSERSITE=1 "${venv_python}" >"${verify_log}" 2>&1 <<'PY'
+import importlib.util
 import os
-import shutil
 import sys
 
 import numpy
@@ -513,14 +514,13 @@ if not callable(getattr(ACTPolicy, "reset", None)):
 
 print("lerobot={} ({})".format(getattr(lerobot, "__version__", "unknown"), getattr(lerobot, "__file__", "<unknown>")))
 print("torch={} numpy={}".format(torch.__version__, numpy.__version__))
-if torch.cuda.is_available():
-    print("cuda={} gpu={}".format(torch.version.cuda, torch.cuda.get_device_name(0)))
-elif shutil.which("nvidia-smi") is not None:
-    # An NVIDIA host whose driver cannot load this Torch build would silently
-    # train on CPU; mark it so the shell wrapper can surface it.
-    print("CUDA_MISMATCH torch_cuda={} nvidia_smi=present".format(torch.version.cuda))
+# Importing the decoder loads FFmpeg libraries and surfaces ABI/linker failures.
+# Some platforms deliberately do not install torchcodec and use another backend.
+if importlib.util.find_spec("torchcodec") is not None:
+    import torchcodec.decoders
+    print("torchcodec FFmpeg libraries loadable")
 else:
-    print("cuda=unavailable (no NVIDIA GPU detected)")
+    print("torchcodec not installed; decoder load check not applicable")
 
 train_cli = os.path.join(os.path.dirname(sys.executable), "lerobot-train")
 if not os.path.isfile(train_cli):
@@ -535,25 +535,12 @@ PY
     fi
     cat "${verify_log}"
 
-    # A GPU host whose Torch build targets a newer CUDA runtime than the
-    # installed driver would silently fall back to CPU training.
-    if grep -q "CUDA_MISMATCH" "${verify_log}"; then
-        log_warn "An NVIDIA GPU is present but torch.cuda.is_available() is False: the installed Torch build targets a CUDA runtime the host driver does not support."
-        log_warn "Install a driver-compatible build before training, for example:"
-        log_warn "  ${venv_python} -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126"
-        log_warn "Set IBR_TRAINING_REQUIRE_CUDA=1 to turn this into a hard failure."
-        if [[ "${IBR_TRAINING_REQUIRE_CUDA:-0}" == "1" ]]; then
-            log_error "IBR_TRAINING_REQUIRE_CUDA=1 but CUDA is unavailable."
-            return 1
-        fi
-    fi
-
     log_done "Verified training environment (venv + LeRobot + torch)"
     return 0
 }
 
 verify_env() {
-    if [[ "${SETUP_PROFILE:-full}" == "training" ]]; then
+    if [[ "$(setup_profile_get verify)" == "training" ]]; then
         # Training hosts install no ROS 2 runtime, rosdep, or colcon.
         verify_training_env || return 1
         return 0

@@ -17,6 +17,10 @@ trap 'rm -rf "${TMP_ROOT}"' EXIT
 WORKSPACE="${TMP_ROOT}/ws"
 mkdir -p "${WORKSPACE}"
 
+# Profile predicates are production dependencies of the ABI helper.
+source "${REPO_ROOT}/scripts/setup/common.sh"
+SETUP_PROFILE=full
+
 log_info() { echo "[INFO] $*"; }
 log_warn() { echo "[WARN] $*" >&2; }
 log_error() { echo "[ERROR] $*" >&2; }
@@ -343,6 +347,30 @@ assert_eq "the local wheel is installed instead of the audited one" \
 assert_eq "the local wheel replacement is forced" \
     "1" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c -- '--force-reinstall' || true)"
 unset GRASPGEN_POINTNET2OPS_WHEEL
+
+# Run the actual pre-resolution plan block with strict unset-variable checking.
+# This catches newly merged upstream uses of removed profile booleans.
+echo "== the early GraspGen plan respects the capability table =="
+plan_block="$(awk '/^    local pointnet2ops_plan=/{capture=1} capture && /^    if \[\[ .*INSTALL_BENCHMARK_DEPS.*SETUP_PLATFORM_ID/{exit} capture{print}' "${SETUP_LIB}")"
+for p in full inference training; do
+    plan_output="$(
+        set -eu
+        unset full_profile training_profile
+        SETUP_PROFILE=$p
+        INSTALL_BENCHMARK_DEPS=false
+        # Disable the hardware branch so this tests admission, not a GPU.
+        accel_supports_torch_grasp() { echo ACCEL_CHECK; return 1; }
+        run_plan_block() {
+            eval "${plan_block}"
+            echo "PLAN=${pointnet2ops_plan}"
+        }
+        run_plan_block
+    )"
+    expected=0
+    [[ "$p" == full ]] && expected=1
+    assert_eq "$p early plan consults accelerator only when grasp is enabled" \
+        "$expected" "$(printf '%s' "${plan_output}" | grep -c ACCEL_CHECK || true)"
+done
 
 echo "== the grasp section follows the plan instead of aborting setup =="
 

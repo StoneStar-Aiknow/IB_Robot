@@ -54,6 +54,12 @@ repos:
             scripts/setup/platforms/[^/]+\.sh |
             scripts/setup/tests/test_setup_profile_training\.sh
           )$
+      - id: training-runtime-fixtures
+        name: training video verification fixtures
+        entry: bash scripts/setup/tests/test_training_runtime.sh
+        language: system
+        pass_filenames: false
+        files: ^scripts/setup/(verify_env|tests/test_training_runtime)\.sh$
       - id: openeuler-cv-bridge-abi-fixtures
         name: openEuler cv_bridge ABI selection fixtures
         entry: bash scripts/setup/tests/test_openeuler_cv_bridge_abi.sh
