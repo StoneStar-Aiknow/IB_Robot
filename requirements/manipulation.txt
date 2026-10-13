@@ -1,12 +1,12 @@
 # Default runtime dependencies for src/manipulation_service.
-# Installed unconditionally by ./scripts/setup.sh on platforms that build the
-# local workspace (Ubuntu). Skipped on openEuler Embedded because GraspGen's
-# pointnet2_ops CUDA extension is not supported there.
+# Installed by ./scripts/setup.sh wherever the Torch grasp stack is installed,
+# which the accelerator axis decides: pointnet2_ops is a CUDA extension, so the
+# cuda accelerator carries it and cann/cpu do not.
 #
-# GraspGen itself is installed by scripts/setup/python_venv.sh from a pinned
-# editable VCS source using --no-deps so it does not overwrite the workspace's
-# Torch/NumPy versions. Keep this file to runtime dependencies that are not
-# already managed by the base IB-Robot environment.
+# GraspGen itself is installed by scripts/setup/python_venv.sh from the audited
+# wheel in third_party/wheels/graspgen using --no-deps so it does not overwrite
+# the workspace's Torch/NumPy versions. Keep this file to runtime dependencies
+# that are not already managed by the base IB-Robot environment.
 
 h5py
 hydra-core

@@ -10,11 +10,9 @@ IMAGE=ubuntu:22.04
 ```
 
 - Keep the selected Phase 3 source mode and host pip cache mount.
-- **Leave the host CUDA toolkit unmounted**, as in Phase 2, unless its CUDA
-  version matches `torch.version.cuda`. A visible `nvcc` makes setup prefer a
-  source build of `pointnet2_ops` and suppresses the Torch ABI pin, so a
-  mismatched toolkit aborts setup; with none mounted the pin runs and the
-  audited wheel installs. `--gpus` is not required either way.
+- The host CUDA toolkit mount from Phase 2 is optional: without GPU
+  passthrough, GraspGen and `pointnet2_ops` install from audited wheels, and
+  `--gpus` is not required for setup+build verification.
 - Let `setup.sh --yes --accel cuda` install ROS without manual intervention.
   Keep `--accel cuda` for the same reason as Phase 4: detection reads
   `nvidia-smi`, absent in a container without `--gpus`.

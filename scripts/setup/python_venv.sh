@@ -238,30 +238,60 @@ install_lerobot_editable() {
         "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
 }
 
+# TorchCodec release matching the pinned Torch 2.7.1 ABI. Upstream's
+# compatibility table pairs 0.4/0.5 with torch 2.7 and 0.6/0.7 with torch 2.8;
+# 0.5 is also the version the benchmark profile validates for the same Torch
+# build (BENCHMARK_TORCHCODEC_VERSION in benchmark_profile.sh). Keep both on
+# the same version for as long as they ride the same Torch.
+GRASPGEN_TORCHCODEC_VERSION="0.5"
+
 install_graspgen_torch_abi() {
-    # The checked-in pointnet2_ops wheel is built against this exact Torch ABI.
-    # Keep CUDA hosts on their existing Torch installation so the source-build
-    # path remains available, but make the no-nvcc path self-contained.
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        # The GraspGen pointnet2_ops ABI pin is a manipulation-stack concern;
-        # the inference profile keeps the Torch build selected by lerobot.
-        return 0
-    fi
-    # This pin exists only to serve the CUDA pointnet2_ops extension, so it is
-    # gated on the accelerator, not the OS. Pinning a CUDA Torch build on an
-    # Ascend host would replace the Torch that torch_npu is built against.
-    if ! accel_supports_torch_grasp; then
-        return 0
-    fi
-    if command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
-        return 0
+    # Both wheel paths use this exact ABI. A skip plan must leave the runtime
+    # alone, especially on GPUs that the pinned Torch itself cannot run on.
+    case "${1:-skip:no GraspGen install plan}" in
+        ok:*|build:*) ;;
+        *) return 0 ;;
+    esac
+
+    local torch_version torchvision_version torchcodec_version
+    torch_version="$("${VENV_PYTHON}" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+    torchvision_version="$("${VENV_PYTHON}" -c 'import torchvision; print(torchvision.__version__)' 2>/dev/null || true)"
+    if [[ "${torch_version}" != "2.7.1+cu126" || "${torchvision_version}" != "0.22.1+cu126" ]]; then
+        log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
+        run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
+            "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
+            --index-url "https://download.pytorch.org/whl/cu126" \
+            --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
     fi
 
-    log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
-    run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
-        "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
-        --index-url "https://download.pytorch.org/whl/cu126" \
-        --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
+    # torchcodec is ABI-bound to a Torch minor but declares no torch
+    # requirement, so pip cannot see the conflict: LeRobot's [dataset] extra
+    # allows >=0.3.0,<0.12.0 and the resolver takes the newest, which links
+    # against a newer Torch (0.11.x wants libnvrtc.so.13, i.e. the CUDA 13
+    # runtime shipped with Torch 2.11). Install the matching version so
+    # LeRobot's own resolution finds the requirement already satisfied and
+    # leaves it alone. This check deliberately runs on its own instead of
+    # behind the Torch pin above: environments set up before it existed
+    # (master's no-nvcc pin path) already carry 2.7.1+cu126 with a
+    # resolver-picked torchcodec, and a re-run must heal them rather than
+    # short-circuit past them.
+    torchcodec_version="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("torchcodec"))' 2>/dev/null || true)"
+    if [[ "${torchcodec_version}" != "${GRASPGEN_TORCHCODEC_VERSION}" ]]; then
+        log_info "Pinning torchcodec ${GRASPGEN_TORCHCODEC_VERSION} for the Torch 2.7.1 ABI..."
+        # --no-deps, like the benchmark runtime ABI install: re-resolving here
+        # could replace either side of the ABI contract with an incompatible
+        # release.
+        run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall --no-deps \
+            "torchcodec==${GRASPGEN_TORCHCODEC_VERSION}" --index-url "${SETUP_PIP_INDEX_URL}" --quiet
+    fi
+    # The ABI cannot be expressed as a constraint for pip to enforce, so verify
+    # unconditionally — also on hosts where both versions already match — that
+    # the extension loads and exposes its public decoder API.
+    if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c 'import torchcodec._core; from torchcodec.decoders import VideoDecoder' >/dev/null 2>&1; then
+        log_error "torchcodec ${GRASPGEN_TORCHCODEC_VERSION} does not load against the pinned Torch 2.7.1+cu126."
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c 'import torchcodec._core; from torchcodec.decoders import VideoDecoder' || true
+        return 1
+    fi
 }
 
 setup_python_venv() {
@@ -347,13 +377,11 @@ setup_python_venv() {
     fi
 
     # A function-local exported constraint applies to all pip invocations and
-    # build subprocesses, and is restored on return. It is activated after
-    # LeRobot installs, not here: an accelerator whose Torch sits below
-    # LeRobot's declared floor (CANN 8.1 needs 2.5.1, LeRobot declares >=2.7)
-    # would make LeRobot's own resolution fail outright. CANN 8.3's 2.8.0 is
-    # inside the range, but the ordering stays uniform. LeRobot resolves first,
-    # install_accel_requirements then overrides Torch, and the constraint
-    # protects that override for every later pip step.
+    # build subprocesses, and is restored on return. CUDA activates its GraspGen
+    # ABI constraint before LeRobot resolves only when the preflight confirms
+    # that pointnet2_ops will be installed. Other accelerators resolve LeRobot
+    # first, install their runtime override, and activate their constraint after
+    # that override; this preserves the CANN 8.1 metadata exception.
     local -x PIP_CONSTRAINT="${PIP_CONSTRAINT:-}"
     local pip_install=("${VENV_PYTHON}" -m pip install)
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
@@ -387,13 +415,31 @@ setup_python_venv() {
         ensure_lerobot_patch_stack_applied
     fi
 
+    # Preflight before any GraspGen Torch pin or LeRobot dependency resolution.
+    # The same plan drives the later wheel install so a skipped stack never
+    # downgrades the runtime merely for an extension that will not be installed.
+    local pointnet2ops_plan="skip:GraspGen is disabled for this setup profile"
+    if [[ "${full_profile}" == true && "${INSTALL_BENCHMARK_DEPS:-false}" != true ]] &&
+        accel_supports_torch_grasp; then
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
+        unset GRASPGEN_POINTNET2OPS_WHEEL
+        pointnet2ops_plan="$(graspgen_pointnet2ops_plan)"
+    fi
+
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
         benchmark_prepare_torch_profile "${VENV_PYTHON}" "${venv_path}/benchmark_torch_constraints.txt"
         # Protect the validated Torch/TorchVision/TorchCodec ABI during every
         # subsequent dependency install, not only the LeRobot editable step.
         pip_install+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
     else
-        install_graspgen_torch_abi
+        install_graspgen_torch_abi "${pointnet2ops_plan}"
+        if [[ "${pointnet2ops_plan%%:*}" != "skip" ]]; then
+            local grasp_torch_constraints="${venv_path}/graspgen_torch_constraints.txt"
+            printf '%s\n' 'torch==2.7.1+cu126' 'torchvision==0.22.1+cu126' \
+                "torchcodec==${GRASPGEN_TORCHCODEC_VERSION}" > "${grasp_torch_constraints}"
+            PIP_CONSTRAINT="${grasp_torch_constraints}${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+        fi
     fi
 
     # Install LeRobot in editable mode
@@ -609,9 +655,9 @@ EOF
     # GraspGen runtime dependencies are part of the default install contract:
     # manipulation_service is part of the default workspace build. The stack is
     # gated on the accelerator, not the OS: pointnet2_ops is a CUDA extension,
-    # and the Ascend grasp path is the OM runtime instead. On CUDA hosts without
-    # nvcc, install_graspgen_pip falls back to the audited pointnet2_ops wheel
-    # and validates its Torch/Python ABI contract.
+    # and the Ascend grasp path is the OM runtime instead. install_graspgen_pip
+    # installs the audited grasp_gen and pointnet2_ops wheels and validates the
+    # latter's Torch/Python ABI contract.
     # Record whether grasp was actually installed and let the smoke test below
     # key off that fact rather than re-deriving the condition. Re-deriving is
     # how the smoke test kept an OS test after the install moved to the
@@ -626,12 +672,26 @@ EOF
         log_warn "Skipping grasp dependencies on accelerator ${SETUP_ACCEL_ID}; Torch GraspGen needs CUDA."
         log_warn "Re-run with --accel cuda to install them regardless, e.g. on a host with a CUDA toolkit but no visible GPU."
     else
-        log_info "Installing grasp dependencies (GraspGen)..."
-        # shellcheck disable=SC1091
-        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
-        export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
-        install_graspgen_pip "${VENV_PYTHON}" -m pip install
-        grasp_installed=true
+        local pointnet2ops_action pointnet2ops_arg
+        pointnet2ops_action="${pointnet2ops_plan%%:*}"
+        pointnet2ops_arg="${pointnet2ops_plan#*:}"
+        local install_grasp=true
+        if [[ "${pointnet2ops_action}" == "skip" ]]; then
+            log_warn "Skipping grasp dependencies: ${pointnet2ops_arg}"
+            install_grasp=false
+        elif [[ "${pointnet2ops_action}" == "build" ]] && ! graspgen_pointnet2ops_build "${pointnet2ops_arg}"; then
+            # The build is best-effort: it needs GitHub and a working CUDA
+            # toolchain, and its failure must degrade to a skipped grasp
+            # instead of aborting the whole setup.
+            log_warn "Skipping grasp dependencies: the local pointnet2_ops wheel build failed; resolve the error above and re-run setup."
+            install_grasp=false
+        fi
+        if [[ "${install_grasp}" == true ]]; then
+            log_info "Installing grasp dependencies (GraspGen)..."
+            export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
+            install_graspgen_pip "${VENV_PYTHON}" -m pip install
+            grasp_installed=true
+        fi
     fi
 
     # Optional speech_direction report dependencies (Plotly/Matplotlib). Pure-Python.
@@ -699,6 +759,10 @@ try:
     importlib.import_module("grasp_gen")
 except Exception as exc:
     raise SystemExit(f"Missing grasp_gen after default grasp install: {exc}")
+try:
+    importlib.import_module("pointnet2_ops")
+except Exception as exc:
+    raise SystemExit(f"Missing pointnet2_ops after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
 PY
     fi

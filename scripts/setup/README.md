@@ -53,7 +53,7 @@
 
 | | `cuda` | `cann` | `cpu` |
 | --- | --- | --- | --- |
-| `accel_requirements` | 无（Torch 由 LeRobot 解析，再由 `install_graspgen_torch_abi` 固定到 `2.7.1+cu126` 以匹配预编译 `pointnet2_ops` wheel） | `accel-cann-8.1.txt` / `accel-cann-8.3.txt`（按检测到的版本）；其他已探到的版本**不安装**、setup 继续，报官方配套版本并在结束摘要提示手工配置；未探到 toolkit 则同样不装 | 无 |
+| `accel_requirements` | 无（PointNet2 预检确认可安装审计 wheel 或编译本地 wheel 时，`install_graspgen_torch_abi` 才把 Torch 固定到 `2.7.1+cu126`；预检跳过时保留 LeRobot 解析的 Torch） | `accel-cann-8.1.txt` / `accel-cann-8.3.txt`（按检测到的版本）；其他已探到的版本**不安装**、setup 继续，报官方配套版本并在结束摘要提示手工配置；未探到 toolkit 则同样不装 | 无 |
 | `accel_pip_constraints` | 无 | `constraints-cann-8.1.txt` / `constraints-cann-8.3.txt`（按版本） | 无 |
 | `accel_post_requirements` | 无 | 8.1 / 8.3 卸载 `torchcodec`（aarch64 wheel 的 ABI 绑定在更新的 Torch 上，但其元数据不声明 torch 依赖，pip 察觉不到） | 无 |
 | `accel_supports_torch_grasp` | 是 | 否（`pointnet2_ops` 无昇腾构建） | 否 |
@@ -61,8 +61,10 @@
 
 已知的不对称，列在这里以免被误读成违规：
 
-- **CUDA 侧没有自己的 requirements 文件**。CUDA Torch 来自 LeRobot 的依赖解析，再被
-  `install_graspgen_torch_abi` 固定；该固定只为服务仓库内预编译的 `pointnet2_ops` wheel。
+- **CUDA 侧没有自己的 requirements 文件**。PointNet2 预检会先检查 Python、架构和所有可见
+  GPU；只有确认将安装审计 wheel 或编译本地 wheel 时，才由 `install_graspgen_torch_abi`
+  提前固定 Torch/TorchVision/TorchCodec 并生成局部约束。Blackwell、非 x86_64、非 Python 3.10
+  或缺少本地构建条件时跳过 GraspGen，并保留 LeRobot 解析的 Torch。
 - **`requirements/manipulation.txt` 仍含 `spconv-cu120`、`torch-scatter` 等 CUDA 包**。该文件
   只由 `install_graspgen_pip` 安装，而那一步受 `accel_supports_torch_grasp` 把关，因此实际
   只在 `cuda` 上执行；但它位于 OS 无关的文件里，尚未迁入 `accel-cuda*.txt`。
@@ -74,10 +76,11 @@
   手工配置"，指向[昇腾版本配套查询助手](https://www.hiascend.com/developer/download/compatibility)
   核对 CANN / Torch / torch_npu / torchvision 配套版本，再用工作区 `venv/bin/python -m pip`
   安装（不要用系统 pip）。新增自动安装的版本需补齐三元组、约束文件和末尾校验。
-- **约束的启用时机在 LeRobot 之后**。CANN 8.1 的 Torch 2.5.1 低于 LeRobot 声明的 `>=2.7`，
+- **CANN 约束的启用时机在 LeRobot 之后**。CANN 8.1 的 Torch 2.5.1 低于 LeRobot 声明的 `>=2.7`，
   提前启用会让 LeRobot 自身解析直接失败；因此顺序是"LeRobot 正常解析 → 覆盖 Torch →
   启用约束保护其后所有步骤"。8.3 的 2.8.0 在声明区间内，无需例外，但沿用同一顺序。
-  8.1 的覆盖是一个**已验证的兼容例外**，包元数据检查会报冲突。
+  8.1 的覆盖是一个**已验证的兼容例外**，包元数据检查会报冲突。CUDA GraspGen 的约束不同：
+  预检允许安装时在 LeRobot 前启用，以防后续解析替换 PointNet2 所需 ABI。
 
 ## CANN 依赖文件分工
 

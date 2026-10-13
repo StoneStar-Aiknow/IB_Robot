@@ -14,8 +14,8 @@ accel_supports_torch_grasp() {
 # during every dependency install, or no output when none is needed.
 accel_pip_constraints() {
     # CUDA hosts follow the Torch build selected by lerobot, narrowed to the
-    # pointnet2_ops wheel ABI by install_graspgen_torch_abi when grasp is
-    # installed. No global constraint is required.
+    # pointnet2_ops wheel ABI when grasp is enabled. setup_python_venv protects
+    # that pin with its scoped constraint; no accelerator-wide pin is required.
     :
 }
 

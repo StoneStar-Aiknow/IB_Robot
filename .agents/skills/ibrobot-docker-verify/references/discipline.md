@@ -18,11 +18,13 @@
 - **挂载宿主机 pip cache**：只复用下载缓存，禁止挂载宿主机 `venv`、
   `build`、`install` 或整个源码工作区。默认流程使用 `docker cp` 复制源码，
   不是 bind mount，并在容器内删除宿主机构建产物。
-- **挂载宿主机 CUDA toolkit（可选）**：GraspGen 的 `pointnet2_ops` CUDA 扩展
-  需要 `nvcc` 编译，CUDA toolkit 目录以只读方式挂载到容器中同一路径（不是
-  源码工作区的一部分，属于构建工具），并设置 `CUDA_HOME` / `PATH` /
-  `LD_LIBRARY_PATH` 环境变量。系统目录（`/`、`/usr`、`/usr/local`）被拒绝挂载。
-  无 CUDA toolkit 时 setup.sh 优雅跳过 grasp 安装，验证继续。
+- **挂载宿主机 CUDA toolkit（可选）**：默认验证不透传 GPU，GraspGen 与其
+  `pointnet2_ops` CUDA 扩展从 `third_party/wheels/` 的审计 wheel 安装，不需要
+  `nvcc`。仅当另行透传了不兼容 SM86 wheel 的 GPU 时，CUDA 12.x `nvcc` 才触发
+  本地非审计 wheel 构建。如需挂载，
+  CUDA toolkit 目录以只读方式挂载到容器中同一路径（不是源码工作区的一部分，
+  属于构建工具），并设置 `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` 环境变量。
+  系统目录（`/`、`/usr`、`/usr/local`）被拒绝挂载。
 - **缓存权限必须以目标用户验证**：root 身份执行 `test -w` 没有意义。必须以
   `testuser` 实际在 `PIP_CACHE_DIR` 创建并删除探针文件，失败时立即终止验证。
 

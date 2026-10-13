@@ -82,19 +82,11 @@ must describe one exact committed tree:
   inaccessible even when the directory exists.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
-- **NVIDIA GPU + CUDA toolkit on the host (do NOT mount a mismatched one)**:
-  `pointnet2_ops` is installed from the audited wheel **only when no `nvcc` is
-  visible**. Any visible `nvcc` makes `install_graspgen_pip` prefer a source
-  build and suppresses the Torch ABI pin, and the build then aborts unless the
-  toolkit's CUDA version equals `torch.version.cuda`. Measured here: a mounted
-  CUDA 12.4 toolkit against LeRobot's resolved `torch 2.11.0+cu130` fails with
-  `The detected CUDA version (12.4) mismatches the version that was used to
-  compile PyTorch (13.0)`, `pointnet2_ops` is never installed, and setup exits
-  1. The audited wheel cannot rescue it either, because that wheel requires
-  `torch==2.7.1+cu126` and the pin that would supply it is gated off by the
-  same `nvcc` check. **Leave the toolkit unmounted unless its version matches
-  Torch's**; with it absent the same tree and the same `--accel cuda` complete
-  setup and build 58/58 packages.
+- **NVIDIA GPU + CUDA toolkit on the host (not required)**: the default
+  verification container has no GPU passthrough, so GraspGen and
+  `pointnet2_ops` install from audited wheels in `third_party/wheels/` without
+  `nvcc` or GitHub. A CUDA 12.x toolkit matters only when a visible GPU cannot
+  run the audited SM86 wheel; that is outside this default GPU-less gate.
   The `--accel cuda` flag itself is still required: accelerator detection reads
   `nvidia-smi`, which a container without `--gpus` does not have, and would
   otherwise resolve to `cpu` and skip the CUDA dependency set entirely.
@@ -104,8 +96,8 @@ must describe one exact committed tree:
     System directories (`/`, `/usr`, `/usr/local`) are rejected to prevent
     accidental bind-mount of the entire system.
   - `--gpus` passthrough is NOT required for setup+build verification:
-    `pointnet2_ops` compilation uses `TORCH_CUDA_ARCH_LIST` (fixed, not
-    GPU-detected) and the smoke test only does `importlib.util.find_spec`.
+    `pointnet2_ops` installs as a prebuilt wheel and the smoke test imports it
+    without launching a CUDA kernel.
 
 ## Core Principle
 

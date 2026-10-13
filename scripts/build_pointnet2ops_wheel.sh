@@ -16,9 +16,22 @@ export PATH="${CUDA_HOME}/bin:${PATH}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.6}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1739846159}"
 
-if [[ "${TORCH_CUDA_ARCH_LIST}" != "8.6" ]]; then
-    echo "This audited wheel is fixed to TORCH_CUDA_ARCH_LIST=8.6, got ${TORCH_CUDA_ARCH_LIST}" >&2
+# The committed wheel is the audited artifact: byte-reproducible from the pinned
+# commit at TORCH_CUDA_ARCH_LIST=8.6. Another architecture produces a different
+# binary under the SAME filename, so it must never land on top of the audited
+# one or its SHA256SUMS. Building for a different GPU is therefore allowed only
+# into an explicit output directory. Setup uses a separate venv cache for its
+# local architecture builds and installs that wheel when the preflight selects it.
+if [[ "${TORCH_CUDA_ARCH_LIST}" != "8.6" && -z "${POINTNET2OPS_WHEEL_OUT_DIR:-}" ]]; then
+    echo "The audited wheel is fixed to TORCH_CUDA_ARCH_LIST=8.6, got ${TORCH_CUDA_ARCH_LIST}." >&2
+    echo "To build for another GPU, send it to its own directory:" >&2
+    echo "  TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} POINTNET2OPS_WHEEL_OUT_DIR=<dir> $0" >&2
     exit 1
+fi
+if [[ -n "${POINTNET2OPS_WHEEL_OUT_DIR:-}" ]]; then
+    WHEEL_ROOT="$(mkdir -p "${POINTNET2OPS_WHEEL_OUT_DIR}" && cd "${POINTNET2OPS_WHEEL_OUT_DIR}" && pwd)"
+    echo "Building pointnet2_ops for TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} into ${WHEEL_ROOT}" >&2
+    echo "This is a local build, not the audited artifact." >&2
 fi
 
 if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then

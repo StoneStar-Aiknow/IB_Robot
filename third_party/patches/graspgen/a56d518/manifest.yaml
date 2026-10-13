@@ -1,0 +1,27 @@
+upstream:
+  repository: https://github.com/NVlabs/GraspGen.git
+  commit: a56d518f3b76ea2a432b5b838b3c68027d29be49
+distribution:
+  name: grasp_gen
+  version: 1.0.0+ibrobot.1
+  import_package: grasp_gen
+  wheel: ../../../wheels/graspgen/a56d518/grasp_gen-1.0.0+ibrobot.1-py3-none-any.whl
+  license: NVIDIA License
+  license_file: LICENSE
+  asset_license_file: LICENSE_ASSETS.md
+build:
+  python: ">=3.10"
+  source_date_epoch: 1739846159
+  command: scripts/build_graspgen_wheel.sh
+runtime:
+  notes: >
+    Pure-Python wheel of the grasp_gen package with its gripper definitions
+    (config/grippers) and the robotiq, panda_gripper and suction gripper meshes
+    packaged inside it, so it works without a source checkout. The CUDA
+    pointnet2_ops extension is a separate audited wheel. The code is restricted
+    by the NVIDIA License to non-commercial research or evaluation use and must
+    be redistributed with the complete LICENSE file; the gripper meshes carry
+    their own Apache-2.0 / BSD-3-Clause terms listed in LICENSE_ASSETS.md.
+patches:
+  - file: 0001-package-gripper-assets-inside-grasp-gen.patch
+    purpose: Move config/grippers and the gripper meshes into the grasp_gen package, resolve them relative to it, ship the licenses, and stamp the audited +ibrobot.1 version.

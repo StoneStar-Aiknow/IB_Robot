@@ -57,14 +57,14 @@ CUDA 路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Pyth
 `grasp_gen`。Ascend 本地路径通过统一 `inference_manifest.json` 加载 GraspGen OM 子图。
 两个后端都把 `num_grasps` 按每批最多 1000 拆分，并在所有批次合并后执行一次全局
 `topk_num_grasps`；该值小于等于 0 时保留全部达到阈值的候选。Ascend 各批次连续消耗同一个随机流，
-避免重复候选。GraspGen 不再放在
-`libs/` 下；安装脚本会把固定上游源码作为 editable pip 依赖放到 workspace venv 的 `src/` 缓存中。
+避免重复候选。GraspGen 不再放在 `libs/` 下；安装脚本从仓库内审计 wheel 安装
+`grasp_gen`，无需保留上游源码树。
 
 运行前需要满足：
 
 - 使用 `local_cuda` 时当前环境需有可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
 - 使用 `ascend_local` 时需有可加载的 Ascend GraspGen manifest/OM bundle 和 ACL 运行环境。
-- 已通过 `./scripts/setup.sh` 默认安装 `grasp_gen` 和 `pointnet2_ops`（Ubuntu 默认安装；有 CUDA toolkit 时从源码编译，无 `nvcc` 时安装仓库内、绑定 Python 3.10 + Torch 2.7.1/cu126 + SM86 的 wheel；openEuler Embedded 因 CUDA 扩展限制跳过）。该 wheel 受 NVIDIA License 非商业研究/评估用途限制。
+- 已通过 `./scripts/setup.sh` 安装 `grasp_gen` 和 `pointnet2_ops`（是否安装由加速器轴和 PointNet2 预检决定，不由 OS 决定）。`grasp_gen` 是仓库内纯 Python 审计 wheel，夹爪定义与网格已打包；`pointnet2_ops` 审计 wheel 绑定 Python 3.10、Torch 2.7.1/cu126、x86_64 和 SM86。SM86/87/89 或无 GPU 透传的验证容器直接安装审计 wheel；其他受 Torch 2.7 支持的 NVIDIA GPU 在存在 CUDA 12.x `nvcc` 时会从固定源码为全部可见架构编译本地非审计 wheel，此路径需要访问 GitHub；缺少匹配 toolkit、Blackwell、非 x86_64 或非 Python 3.10 时跳过 Torch GraspGen 并保留原 Torch runtime。昇腾（`cann`）与纯 CPU 主机也跳过，昇腾抓取走 OM 运行时。两者受 NVIDIA License 非商业研究/评估用途限制。
 - GraspGen 运行 bundle 位于 `models/graspgen/`；其中
   `assets/adapter.json` 声明 bundle-relative 配置和权重路径。旧的
   `models/grasp/checkpoints/` 布局和 `GRASPGEN_MODEL_DIR` 仍作为兼容回退。
