@@ -445,8 +445,12 @@ class PlacoServoBackend(CartesianBackend):
             return
         self._home_pending = False
         self._home_result = bool(result.success)
-        log = self._node.get_logger().info if result.success else self._node.get_logger().error
-        log(result.message or result.error_code or "ArmReturnHome completed")
+        # rclpy pins the severity of each call site; keep one call per level.
+        message = result.message or result.error_code or "ArmReturnHome completed"
+        if result.success:
+            self._node.get_logger().info(message)
+        else:
+            self._node.get_logger().error(message)
 
     def consume_home_result(self) -> bool | None:
         result = self._home_result

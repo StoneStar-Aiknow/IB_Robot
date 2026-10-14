@@ -227,9 +227,7 @@ class MirrorSessionNode(Node):
         self._arm_joints = arm.joint_names
         self._arm_publisher = self._hand_publisher = None
         if self._publish_enabled:
-            self._arm_publisher = self.create_publisher(
-                Float64MultiArray, arm.endpoint, qos_profile_from_dict(arm.qos)
-            )
+            self._arm_publisher = self.create_publisher(Float64MultiArray, arm.endpoint, qos_profile_from_dict(arm.qos))
             self._hand_publisher = self.create_publisher(
                 Float64MultiArray, hand.endpoint, qos_profile_from_dict(hand.qos)
             )
@@ -361,8 +359,11 @@ class MirrorSessionNode(Node):
         self._tick_timer.cancel()
         self._port.spin_once = spin_once
         outcome = self.session.shutdown()
-        log = self.get_logger().info if outcome.idle else self.get_logger().warning
-        log(f"exit release: {outcome.message}")
+        # rclpy pins the severity of each call site; keep one call per level.
+        if outcome.idle:
+            self.get_logger().info(f"exit release: {outcome.message}")
+        else:
+            self.get_logger().warning(f"exit release: {outcome.message}")
 
 
 def _interrupt(_signum, _frame):
@@ -404,8 +405,10 @@ def release_main(args=None) -> int:
         port = RosRuntimePort(node, endpoints)
         port.spin_once = executor.spin_once
         outcome = release_to_idle(port, policy_mode, stop_timeout)
-        log = node.get_logger().info if outcome.idle else node.get_logger().error
-        log(f"mirror session exit release: {outcome.message}")
+        if outcome.idle:
+            node.get_logger().info(f"mirror session exit release: {outcome.message}")
+        else:
+            node.get_logger().error(f"mirror session exit release: {outcome.message}")
         return 0 if outcome.idle else 1
     finally:
         executor.shutdown()

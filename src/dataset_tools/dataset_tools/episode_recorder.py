@@ -961,8 +961,12 @@ class EpisodeRecorderServer(Node):
         self._write_dataset_metadata()
 
         for topic, seen, written, drop_ratio in _topic_counter_diagnostics(self._ws.counts):
-            level = self.get_logger().warning if drop_ratio > 0.2 else self.get_logger().info
-            level(f"Recorder topic stats: {topic} seen={seen} written={written} drop_ratio={drop_ratio:.1%}")
+            # rclpy pins the severity of each call site; keep one call per level.
+            stats = f"Recorder topic stats: {topic} seen={seen} written={written} drop_ratio={drop_ratio:.1%}"
+            if drop_ratio > 0.2:
+                self.get_logger().warning(stats)
+            else:
+                self.get_logger().info(stats)
 
         # Cancel timers (do NOT destroy — the executor may still reference the
         # handles; destroying from within a callback causes InvalidHandle).

@@ -470,10 +470,14 @@ class SoundOrientationNode(Node):
             }
             response.current_state = self._policy.session_state.value
             response.message = decision.reason
-            level = self.get_logger().info if response.success else self.get_logger().warning
-            level(
+            # rclpy pins the severity of each call site; keep one call per level.
+            message = (
                 f"sound following set enable={request.enable}: state={response.current_state} reason={decision.reason}"
             )
+            if response.success:
+                self.get_logger().info(message)
+            else:
+                self.get_logger().warning(message)
             return response
 
     def _finish_known_action(self, reason: str) -> None:

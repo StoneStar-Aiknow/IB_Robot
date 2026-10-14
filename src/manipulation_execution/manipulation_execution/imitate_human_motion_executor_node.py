@@ -868,8 +868,12 @@ class ImitateHumanMotionExecutorNode(Node):
             joint_limits=self._joint_limits,
             prepare_positions={name: _PREPARE_JOINT_POSITIONS.get(name, 0.0) for name in self._joint_names},
         )
-        log = self.get_logger().warning if result.fell_back else self.get_logger().info
-        log(f"imitate_human_motion retargeting {result.message}")
+        # rclpy pins the severity of each call site; keep one call per level.
+        message = f"imitate_human_motion retargeting {result.message}"
+        if result.fell_back:
+            self.get_logger().warning(message)
+        else:
+            self.get_logger().info(message)
         return result.plan, result.message
 
     def _run_startup_warmup(self) -> bool:

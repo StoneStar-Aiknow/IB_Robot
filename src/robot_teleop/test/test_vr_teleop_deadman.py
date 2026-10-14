@@ -29,6 +29,10 @@ import types
 
 import pytest
 
+# The real rclpy logger, imported before the stubs below so it stays usable when this
+# file runs alone; it enforces one severity per logging call site.
+from rclpy.impl.rcutils_logger import RcutilsLogger
+
 # Package source dir resolved relative to THIS file, so the test works both from
 # the source tree (bare pytest at workspace root) and under ``colcon test``
 # (CWD is the build tree). ``<pkg>/test/..``/robot_teleop is the package dir.
@@ -406,6 +410,23 @@ def test_home_refused_while_stop_pending():
     node._so101_stop_pending = True
     assert node._go_home_so101() is False
     assert node._so101_home_cli.futures == []
+
+
+def _home_result_future(success):
+    result = types.SimpleNamespace(success=success, error_code="", message=f"home success={success}")
+    return types.SimpleNamespace(result=lambda: types.SimpleNamespace(result=result))
+
+
+def test_home_results_with_different_outcomes_keep_node_alive():
+    # rclpy pins the severity of each logging call site; an aborted home followed by a
+    # reached home used to raise ValueError and kill vr_teleop.
+    node = _make_node()
+    node._logger = RcutilsLogger(name="test_vr_teleop_home_result_severity")
+    for success in (False, True, False):
+        node._so101_home_inflight = True
+        node._on_so101_home_result(_home_result_future(success))
+        assert node._so101_home_inflight is False
+        assert node._home_terminal is True
 
 
 def test_ensure_started_blocked_while_pending():

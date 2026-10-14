@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 from rclpy.action import GoalResponse
+from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.time import Time
 
 from dataset_tools import episode_recorder
@@ -252,3 +253,28 @@ def test_queued_old_timeout_cannot_stop_next_episode(recorder):
     node._flags.is_recording = True
     callbacks[0]()
     assert not node._flags.stop_requested
+
+
+def test_finalize_logs_mixed_topic_drop_ratios_with_real_logger():
+    # rclpy pins the severity of each logging call site; one healthy and one lossy topic
+    # in the same episode used to switch severity inside the stats loop and raise.
+    node = object.__new__(EpisodeRecorderServer)
+    node._flags = Flags()
+    node._ws = WriterState(
+        counts={
+            "/camera/front/image_raw": _TopicCounter(seen=10, written=10),
+            "/camera/wrist/image_raw": _TopicCounter(seen=10, written=5),
+        }
+    )
+    node._episode_done_evt = threading.Event()
+    node._feedback_timer = None
+    node._timeout_timer = None
+    node._write_episode_metadata = Mock()
+    node._write_dataset_metadata = Mock()
+    logger = RcutilsLogger(name="test_episode_recorder_finalize_severity")
+    node.get_logger = lambda: logger
+
+    node._finalize_episode(Path("episode_000002"), "prompt", 2)
+
+    assert node._ws.writer is None
+    node._write_episode_metadata.assert_called_once_with(Path("episode_000002"), "prompt", 2)
