@@ -34,6 +34,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
+from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
@@ -122,6 +123,19 @@ from skill_library.runtime_coordinator import SkillRegistryOwner
 EE_POSITION_TOLERANCE_M = 0.02
 SKILL_CANCEL_TIMEOUT = "SKILL_CANCEL_TIMEOUT"
 PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
+# The X2 mirror session's switch. Its skills take no arguments: the catalog
+# implementation binds the command, sent as the session's SetBool.
+MIRROR_SESSION_EXECUTOR = "mirror_session"
+MIRROR_SESSION_COMMANDS = {"start": True, "stop": False}
+
+
+def mirror_session_command(template) -> str:
+    """The session command a mirror_session template binds, or "" if malformed."""
+    binding = template.get("binding") if isinstance(template, Mapping) else None
+    command = binding.get("command") if isinstance(binding, Mapping) else None
+    return command if isinstance(command, str) and command in MIRROR_SESSION_COMMANDS else ""
+
+
 _trace = create_trace_logger("ib_trace.skill")
 WORKFLOW_STEP_PENDING = "pending"
 WORKFLOW_STEP_ACTIVE = "active"
@@ -541,6 +555,13 @@ class SkillExecutorNode(Node):
         self.declare_parameter("imitate_human_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("sound_following_service", "/sound_orientation_node/set_following")
         self.declare_parameter("sound_following_enabled", False, descriptor=startup_descriptor)
+        # The X2 mirror session's start/stop switch (std_srvs/SetBool).
+        self.declare_parameter("mirror_session_service", "", descriptor=startup_descriptor)
+        self.declare_parameter("mirror_session_enabled", False, descriptor=startup_descriptor)
+        # How long the session may take to answer stop; mirror_stop's timeout must exceed it.
+        self.declare_parameter(
+            "mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC, descriptor=startup_descriptor
+        )
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
@@ -647,6 +668,15 @@ class SkillExecutorNode(Node):
         self._imitate_human_motion_enabled = self.get_parameter("imitate_human_motion_enabled").value
         self._sound_following_enabled = self.get_parameter("sound_following_enabled").value
         self._sound_following_service = self.get_parameter("sound_following_service").get_parameter_value().string_value
+        self._mirror_session_enabled = self.get_parameter("mirror_session_enabled").value is True
+        self._mirror_session_service = (
+            self.get_parameter("mirror_session_service").get_parameter_value().string_value.strip()
+        )
+        if self._mirror_session_enabled and not self._mirror_session_service:
+            raise ValueError("mirror_session_service must be set when mirror_session_enabled is true")
+        self._mirror_session_stop_timeout_sec = float(self.get_parameter("mirror_session_stop_timeout_sec").value)
+        if not math.isfinite(self._mirror_session_stop_timeout_sec) or self._mirror_session_stop_timeout_sec <= 0.0:
+            raise ValueError("mirror_session_stop_timeout_sec must be finite and positive")
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
             self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
@@ -927,6 +957,11 @@ class SkillExecutorNode(Node):
         self._runtime_named_motion_client = (
             ActionClient(self, ExecuteNamedMotion, self._runtime_named_motion_action, callback_group=callback_group)
             if self._runtime_named_motion_enabled
+            else None
+        )
+        self._mirror_session_client = (
+            self.create_client(SetBool, self._mirror_session_service, callback_group=callback_group)
+            if self._mirror_session_enabled
             else None
         )
         self._move_configuration_client = self.create_client(
@@ -1690,6 +1725,35 @@ class SkillExecutorNode(Node):
                 "sound_following configuration mismatch: "
                 f"runtime enabled={sound_runtime_enabled}, catalog enabled={sound_catalog_enabled}"
             )
+        mirror_runtime_enabled = bool(getattr(self, "_mirror_session_enabled", False))
+        mirror_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == MIRROR_SESSION_EXECUTOR
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if mirror_runtime_enabled != mirror_catalog_enabled:
+            raise ValueError(
+                "mirror_session configuration mismatch: "
+                f"runtime enabled={mirror_runtime_enabled}, catalog enabled={mirror_catalog_enabled}"
+            )
+        # The session answers stop within its own stop timeout; the skill must wait longer.
+        required_stop_timeout = (
+            getattr(self, "_mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC)
+            + MIRROR_SESSION.STOP_TIMEOUT_MARGIN_SEC
+        )
+        for name, template in (getattr(snapshot, "templates", None) or {}).items():
+            if (
+                not isinstance(template, Mapping)
+                or str(template.get("executor", "")).strip() != MIRROR_SESSION_EXECUTOR
+                or mirror_session_command(template) != "stop"
+            ):
+                continue
+            timeout = template.get("timeout_sec")
+            if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout < required_stop_timeout:
+                raise ValueError(
+                    f"{name} timeout_sec must be >= mirror_session stop timeout + "
+                    f"{MIRROR_SESSION.STOP_TIMEOUT_MARGIN_SEC:g} s ({required_stop_timeout:g} s), got {timeout!r}"
+                )
 
     def _delegated_executor_descriptors(self):
         descriptors = {}
@@ -1716,6 +1780,8 @@ class SkillExecutorNode(Node):
             configured_executors.add("sound_following")
         if getattr(self, "_runtime_named_motion_enabled", False):
             configured_executors.add(named_motion.EXECUTOR_NAME)
+        if getattr(self, "_mirror_session_enabled", False):
+            configured_executors.add(MIRROR_SESSION_EXECUTOR)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
@@ -1738,6 +1804,20 @@ class SkillExecutorNode(Node):
                 continue
             if name == "sound_following":
                 endpoint_name = self._sound_following_service
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_service",
+                        configuration={},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
+            if name == MIRROR_SESSION_EXECUTOR:
+                endpoint_name = getattr(self, "_mirror_session_service", "")
+                if not getattr(self, "_mirror_session_enabled", False) or not endpoint_name:
+                    continue
                 descriptor = DelegatedExecutorDescriptor(
                     **delegated_executor_identity(
                         name=name,
@@ -2028,6 +2108,135 @@ class SkillExecutorNode(Node):
         result.diagnostics = []
         goal_handle.succeed()
         return result
+
+    def _execute_mirror_session_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+        left_idle: bool = False,
+    ):
+        """Start or stop the mirror session; the Gateway does not track it past the reply.
+
+        The session answers start once it holds the runtime mode, and stop once
+        it has observed the runtime back in idle. ``left_idle`` says admission
+        switched the runtime out of idle for this start: if the start then
+        fails, that mode is the Gateway's to give back. So is the mode when no
+        session is there to answer, for start and stop alike.
+        """
+        result = SkillCommand.Result()
+        request = goal_handle.request
+        skill_name = str(request.skill_name or "").strip()
+        command = mirror_session_command(template)
+        if not command:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "MIRROR_SESSION_INVALID_SKILL",
+                f"{skill_name!r} binds no session command; binding.command must be one of: "
+                f"{', '.join(MIRROR_SESSION_COMMANDS)}",
+            )
+        start = command == "start"
+        client = getattr(self, "_mirror_session_client", None)
+        timeout_sec = float(effective_timeout_sec or request.timeout_sec or self._rpc_timeout)
+        if client is None or not client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_SERVICE_UNAVAILABLE",
+                f"mirror session service unavailable: {getattr(self, '_mirror_session_service', '')}",
+                give_back=True,
+            )
+
+        future = client.call_async(SetBool.Request(data=MIRROR_SESSION_COMMANDS[command]))
+        if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_TIMEOUT",
+                f"{skill_name} timed out",
+                give_back=start and left_idle,
+                canceled=goal_handle.is_cancel_requested,
+            )
+        try:
+            response = future.result()
+        except Exception as exc:
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_FAILED",
+                f"{skill_name} failed: {exc}",
+                give_back=start and left_idle,
+            )
+        if response is None or not response.success:
+            message = str(getattr(response, "message", "")).strip()
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_FAILED",
+                message or f"{skill_name} failed",
+                give_back=start and left_idle,
+            )
+        return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _succeed_mirror_session(self, result, goal_handle, skill_name: str, message: str, *, called: bool = True):
+        result.success = True
+        result.error_code = ""
+        result.message = f"{skill_name}: {message}"
+        result.executed_primitives = [f"mirror_session:{skill_name}"] if called else []
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
+
+    def _fail_mirror_session(
+        self, result, goal_handle, code: str, message: str, *, give_back: bool, canceled: bool = False
+    ):
+        """Report a failed mirror_session skill, first giving the runtime mode back if it is ours."""
+        skill_name = goal_handle.request.skill_name
+        note = self._give_back_mirror_mode(skill_name) if give_back else ""
+        if canceled:
+            result = self._cancel_skill(result, goal_handle, [], skill_name)
+            if note:
+                result.message = f"{result.message}; {note}"
+            return result
+        return self._abort_skill(result, goal_handle, [], code, f"{message}; {note}" if note else message)
+
+    def _give_back_mirror_mode(self, skill_name: str) -> str:
+        """Switch the runtime from the skill's mode back to idle; says what happened.
+
+        Only from the skill's own runtime mode, and only on fresh admission
+        evidence: a latched stop is refused there, because requesting idle
+        clears it. A session that did take over sees the mode change and
+        revokes on its own; it is not asked to stop.
+        """
+        required_mode = self._required_control_mode_for_skill(skill_name) or str(
+            getattr(self, "_skill_required_control_mode", "")
+        ).strip()
+        runtime_mode = self._runtime_mode_for(required_mode)
+        with self._motion_mode_switch_lock:
+            status, reason = self._runtime_status_for_admission()
+            if status is None:
+                return f"runtime not returned to idle: {reason}"
+            if status.active_mode != runtime_mode:
+                return f"runtime not returned to idle: active mode is {status.active_mode!r}"
+            ok, reason = self._request_runtime_mode("idle")
+        return "runtime returned to idle" if ok else f"runtime not returned to idle: {reason}"
+
+    def _runtime_idle_for_admission(self) -> bool:
+        status, _ = self._runtime_status_for_admission()
+        return status is not None and status.active_mode == "idle"
+
+    def _active_mirror_session_command(self, skill_name: str) -> str:
+        """The session command the active catalog binds to *skill_name*; "" for other skills."""
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        templates = bundle.snapshot.templates if bundle is not None else getattr(self, "_skill_templates", {})
+        template = templates.get(skill_name) if isinstance(templates, Mapping) else None
+        if not isinstance(template, Mapping) or str(template.get("executor", "")).strip() != MIRROR_SESSION_EXECUTOR:
+            return ""
+        return mirror_session_command(template)
 
     def _execute_semantic_map_query(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()
@@ -6084,6 +6293,18 @@ class SkillExecutorNode(Node):
             if not allowed:
                 return self._abort_skill(result, goal_handle, [], "SKILL_REJECTED", reason)
 
+        # X2 mirror session: with the runtime already idle a mirror_stop has
+        # nothing to stop, and admission would switch to policy_stream only for
+        # the session to switch back. A mirror_start notes whether admission is
+        # what takes the runtime out of idle, so a failed start knows the mode
+        # is the Gateway's to give back.
+        mirror_command = self._active_mirror_session_command(goal.skill_name)
+        if mirror_command == "stop" and self._runtime_idle_for_admission():
+            return self._succeed_mirror_session(
+                result, goal_handle, goal.skill_name, "runtime already idle", called=False
+            )
+        mirror_left_idle = mirror_command == "start" and self._runtime_idle_for_admission()
+
         control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
         if not control_mode_ready:
             return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", control_mode_reason)
@@ -6127,6 +6348,13 @@ class SkillExecutorNode(Node):
             return self._execute_sound_following_skill(
                 goal_handle,
                 effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == MIRROR_SESSION_EXECUTOR:
+            return self._execute_mirror_session_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+                left_idle=mirror_left_idle,
             )
         if str(template.get("executor", "")).strip() == "semantic_map_query":
             return self._execute_semantic_map_query(

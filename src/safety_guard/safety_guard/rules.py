@@ -207,6 +207,23 @@ def validate_skill_request(
             ]
             if supplied:
                 return False, f"{', '.join(supplied)} not accepted by {skill_name}"
+        if executor_name == "mirror_session":
+            # The catalog binds the session command; the skill accepts no argument.
+            supplied = [
+                name
+                for name, value in (
+                    ("target_name", str(target_name).strip()),
+                    ("direction", str(direction).strip()),
+                    ("distance", distance),
+                    ("degree", degree),
+                    ("x", x),
+                    ("y", y),
+                    ("yaw", yaw),
+                )
+                if value not in ("", 0.0, None)
+            ]
+            if supplied:
+                return False, f"{', '.join(supplied)} not accepted by {skill_name}"
         if motion_direction or motion_distance:
             return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""

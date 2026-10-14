@@ -621,6 +621,33 @@ admission，直到运行时报告终态（运行时自己对每个动作有超�
 `runtime_named_motion_enabled` / `runtime_named_motion_action`。`runtime_named_motion_enabled` 必须与当前
 catalog 是否包含该执行器的技能一致，否则节点拒绝启动。
 
+### 8.8 X2 照镜子会话执行器
+
+`mirror_session` delegated executor 只服务 `mirror_start` / `mirror_stop` 两个技能，调用方不传参数：命令由
+catalog implementation 的 `binding: {command: start|stop}` 声明（编译期校验），执行器向会话的
+`~/set_session`（`std_srvs/SetBool`）发送 `true`（start）或 `false`（stop）。
+
+1. Gateway 常规准入。两个技能的控制模式都是 `model_inference`，映射到运行时 `policy_stream`；Gateway
+   在调用执行器之前把运行时切到该模式，会话只接管已切好的模式。例外：运行时已经是 idle 时，`mirror_stop`
+   在准入之前直接报成功（“runtime already idle”），不切模式、不调用会话。
+2. 执行器在技能超时内等待会话应答。会话在接管模式后应答 start，在观察到运行时回到 idle 后应答 stop。
+   Gateway 在应答之后不再跟踪会话。
+3. 归还模式：`mirror_start` 失败（会话拒绝、超时、调用异常、等待期间被取消）且这次准入正是把运行时从
+   idle 切出来的那一次，或者会话服务不可达（start 和 stop 都算，没有会话来释放），Gateway 在报失败之前把
+   运行时从技能的模式请求回 idle，结果附在 message 里。只在新鲜的准入状态显示运行时正处于技能的模式、且
+   没有 stop 锁存时才请求（请求 idle 会清除锁存）。会话若已经接管，会看到模式变化自行撤销，不会收到 stop。
+   代价：会话接管了但应答晚于超时时，这次归还会跳过收尾直接撤销。
+4. 错误码：`MIRROR_SESSION_INVALID_SKILL`（模板没有合法的 `binding.command`）、
+   `MIRROR_SESSION_SERVICE_UNAVAILABLE`（执行器未启用或服务不可达）、`MIRROR_SESSION_TIMEOUT`（超时未应答）、
+   `MIRROR_SESSION_FAILED`（调用异常或会话拒绝，会话的 message 原样透传）。等待期间收到取消请求时按取消结束
+   技能，不撤销已发出的请求。
+
+部署接线：`robot_config` 的 `mirror_session.enabled` 为 `true` 时，`embodied_bringup` 注入
+`mirror_session_enabled` / `mirror_session_service` / `mirror_session_stop_timeout_sec`。
+`mirror_session_enabled` 必须与当前 catalog 是否包含该执行器的技能一致；绑定 `command: stop` 的技能，
+`timeout_sec` 必须不小于 `mirror_session_stop_timeout_sec` + 0.5 s（`embodied_common.mirror_session_contract`
+的 `STOP_TIMEOUT_MARGIN_SEC`）。两条不满足时节点拒绝启动。
+
 ## 9. 主要参数
 
 | 参数 | 默认值 | 说明 |

@@ -128,7 +128,9 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
   不请求 idle，也不自动恢复，需要重新 `mirror_start`。
 - 所有回到 idle 的路径都经过 `release_to_idle`：只有观察到运行时处于 `policy_stream` 且没有 stop 锁存时
   才请求 idle（请求 idle 会清除 stop 锁存）。`mirror_stop` 在观察到运行时回到 idle 后才报成功；收尾
-  预算为 `stop_timeout_sec` 减去 2 s 的释放预留。
+  预算为 `stop_timeout_sec`（默认 4.5 s）减去 2 s 的释放预留。Gateway 启动时检查 `mirror_stop` 的技能
+  超时至少比它多 0.5 s，保证会话的应答赶在 Gateway 超时之前。常量的唯一来源是
+  `embodied_common/mirror_session_contract.py`。
 - `publish_enabled`（默认 `false`）为 `false` 时，闸门输出只发到会话的 preview 话题，不发到运行时通道；
   接管与释放照常执行。
 - `mirror_session/hooks.py` 的 `SessionHooks` 是镜像行为的扩展点（起止判据、窗口流水线、收尾），默认值
@@ -143,6 +145,13 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
 - 限速使用配置的关节额定速度（取自厂商 URDF），步长按实际经过的时间计算，定时器延迟时单步允许的变化相应变大。
 - 回到 idle 需要运行时仍能应答。整个 launch 被中断时运行时可能先退出，会话无法请求 idle；launch 自身关闭
   期间也不会运行 `mirror_session_release`。停止 launch 前应先执行 `mirror_stop`。
+- 这一版模仿状态内不支持中断。`mirror_start` 应答后 Gateway 和 Agent 都没有活动任务，「停」「停下」
+  「stop」等通用停止词和 Agent 取消都找不到作用对象，镜子继续运行；结束只能靠 `mirror_stop`，要明确说出，
+  例如「停止照镜子」。状态内中断作为后续需求单独跟踪。
+- 急停用 `/runtime/stop`：运行时锁存，会话关闭输出闸门进入 WAIT，机器人停住。锁存期间 Gateway 拒绝所有
+  技能，包括 `mirror_stop`。复位要在 `/runtime/set_mode` 上请求 idle，这会清除锁存：
+  `ros2 service call /runtime/set_mode ibrobot_msgs/srv/SetRuntimeMode "{mode: idle}"`。之后会话停在 WAIT，
+  直到下一次 `mirror_start`。
 
 ## 架构位置
 

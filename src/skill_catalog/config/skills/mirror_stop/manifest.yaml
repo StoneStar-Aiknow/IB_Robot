@@ -1,0 +1,46 @@
+schema_version: 1
+name: mirror_stop
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Stop mirroring and hand the robot back to idle.
+  category: social_interaction
+  when_to_use:
+  - end the mirror game
+  - stop copying the person
+  - stop mirroring
+  do_not_use:
+  - condition: start mirroring
+    instead_use: mirror_start
+  # Explicit phrases only: a bare stop word is caught by the voice bridge and
+  # Hermes before planning, and negated phrases may not be planned at all.
+  aliases_zh:
+  - 停止照镜子
+  - 结束照镜子
+  - 不玩照镜子了
+  aliases_en:
+  - stop mirroring
+  - stop copying me
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: subtle
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Stop mirroring and hand the robot back to idle.
+  domain: social
+  moves_robot: true
+  required_control_mode: model_inference
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # The session reports why it could not stop; /runtime/stop is the operator interrupt.
+  recovery_policy: never_retry
+  required_capabilities:
+  - joint.position_stream
+  - hand.multi_joint
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

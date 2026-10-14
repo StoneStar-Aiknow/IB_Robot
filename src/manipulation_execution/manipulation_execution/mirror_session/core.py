@@ -30,9 +30,11 @@ Runtime ownership (``runtime`` module):
   gate is closed: ``stop``, the cover path, startup and shutdown here, and the
   launch exit script in the node module.
 * ``stop`` reports success only when the runtime was observed back in idle.
-  Wrap-up plus release fit in ``stop_timeout_s``, the same value the Gateway's
-  ``mirror_stop`` template waits for: the wrap-up is cut at
-  ``stop_timeout_s - RELEASE_RESERVE_S``.
+  Wrap-up plus release fit in ``stop_timeout_s``; the wrap-up is cut at
+  ``stop_timeout_s - RELEASE_RESERVE_S``. The Gateway checks at startup that
+  its ``mirror_stop`` timeout exceeds ``stop_timeout_s`` by
+  ``mirror_session_contract.STOP_TIMEOUT_MARGIN_SEC``, so the answer arrives
+  before the Gateway gives up.
 """
 
 from __future__ import annotations
@@ -44,6 +46,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from embodied_common.mirror_session_contract import COMMANDS
+from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC as DEFAULT_STOP_TIMEOUT_S
+from embodied_common.mirror_session_contract import RELEASE_RESERVE_SEC as RELEASE_RESERVE_S
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, HAND_JOINT_COUNT
 from manipulation_execution.mirror_session.hooks import (
     CoverDetector,
@@ -66,10 +71,7 @@ from manipulation_execution.mirror_session.runtime import (
     takeover_refusal,
 )
 
-DEFAULT_STOP_TIMEOUT_S = 5.0
-RELEASE_RESERVE_S = 2.0
 TAKEOVER_RPC_TIMEOUT_S = 2.0
-COMMANDS = ("start", "stop")
 
 
 class SessionState(str, Enum):

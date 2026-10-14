@@ -9,6 +9,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from embodied_common.mirror_session_contract import COMMANDS as MIRROR_SESSION_COMMANDS
 from skill_catalog.models import (
     DELEGATED_ENDPOINT_KINDS,
     DISPATCH_KIND_CAPABILITY_BY_CONTEXT_VERSION,
@@ -34,6 +35,9 @@ CONTROL_MODES_BY_SCHEMA_VERSION = {
 # Delegated executor whose implementation binds the runtime motion it runs;
 # the caller supplies no argument (see validate_implementation).
 RUNTIME_NAMED_MOTION_EXECUTOR = "runtime_named_motion"
+# Delegated executor whose implementation binds the command it sends (the X2
+# mirror session's start/stop); the caller supplies no argument either.
+MIRROR_SESSION_EXECUTOR = "mirror_session"
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
@@ -484,6 +488,9 @@ def validate_implementation(
         if runtime_named:
             # The bound motion is implementation data, never a caller argument.
             allowed.add("binding")
+        if executor_name == MIRROR_SESSION_EXECUTOR:
+            # So is the bound session command.
+            allowed.add("binding")
         _exact_fields(implementation, allowed, diagnostics, source_relative_path=source_relative_path)
         if implementation.get("schema_version") != source_version:
             _error(
@@ -519,6 +526,13 @@ def validate_implementation(
                 implementation,
                 capability_parameters,
                 manifest.get("capability", {}).get("required_capabilities", []),
+                diagnostics,
+                source_relative_path=source_relative_path,
+            )
+        elif executor_name == MIRROR_SESSION_EXECUTOR:
+            _validate_mirror_session(
+                implementation,
+                capability_parameters,
                 diagnostics,
                 source_relative_path=source_relative_path,
             )
@@ -618,6 +632,45 @@ def _validate_runtime_named_motion(
             diagnostics,
             "SKILL_SCHEMA_INVALID",
             "binding must be exactly {motion: <runtime motion name>}",
+            source_relative_path=source_relative_path,
+            field_path="binding",
+        )
+
+
+def _validate_mirror_session(
+    implementation: Mapping[str, Any],
+    capability_parameters: Any,
+    diagnostics: list[SkillDiagnostic],
+    *,
+    source_relative_path: str,
+) -> None:
+    """A mirror session skill binds exactly one session command and takes no arguments."""
+    if implementation.get("required_args") != []:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "mirror_session takes no caller arguments; required_args must be []",
+            source_relative_path=source_relative_path,
+            field_path="required_args",
+        )
+    if capability_parameters:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "mirror_session skills must declare no capability parameters",
+            source_relative_path=source_relative_path,
+            field_path="capability.parameters",
+        )
+    binding = implementation.get("binding")
+    if (
+        not isinstance(binding, Mapping)
+        or set(binding) != {"command"}
+        or binding.get("command") not in MIRROR_SESSION_COMMANDS
+    ):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            f"binding must be exactly {{command: {'|'.join(MIRROR_SESSION_COMMANDS)}}}",
             source_relative_path=source_relative_path,
             field_path="binding",
         )

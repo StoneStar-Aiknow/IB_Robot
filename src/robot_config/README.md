@@ -623,7 +623,7 @@ robot:
     enabled: true
     publish_enabled: false        # 默认只发 preview 话题，不发运行时通道
     control_mode: model_inference
-    stop_timeout_sec: 5.0         # 必须等于 skill_catalog 中 mirror_stop 的 timeout_sec
+    stop_timeout_sec: 4.5         # 会话应答 stop 的时限；mirror_stop 的技能超时须至少再多 0.5 s
     interfaces:                   # 逻辑接口绑定：launch 等待并从实时接口描述绑定端点
       get_status: {interface: runtime.get_status, kind: service, type: ibrobot_msgs/srv/GetRuntimeStatus}
       set_mode: {interface: runtime.set_mode, kind: service, type: ibrobot_msgs/srv/SetRuntimeMode}
@@ -633,13 +633,16 @@ robot:
   时再启动 `motion_imitation_mock_node`。相机端点和手臂通道的关节顺序都按逻辑 ID 从已绑定的运行时接口
   描述中取得，配置未绑定时启动失败，不回退到猜测的话题名。`frame_source.topic` 可直接指定描述中没有的
   话题，与 `frame_source.interface` 二选一。
-- `launch_builders/mirror_session.py` 启动 `mirror_session_node`，并检查：`control_mode` 是
+- `launch_builders/mirror_session.py` 启动 `mirror_session_node`，并检查：`control_mode` 等于
+  `skill_required_control_mode`（不写时取它；Gateway 切到技能的模式，会话接管的必须正是这个模式），是
   `control_modes` 的成员，其 `runtime_mode` 显式且不是 idle；映射到同一运行时模式的控制模式都显式关闭
   `inference` 和 `executor`（会话是该模式唯一的指令源）。会话进程退出且 launch 仍在运行时，launch 运行
   `mirror_session_release` 把运行时从 `policy_stream` 释放回 idle；它只调用 `set_mode`，从不发送手臂或
   手指指令。
 - `mirror_session.enabled` 为 `true` 时，`embodied_bringup` 为 Gateway 打开 `mirror_session` 执行器并传入
-  会话的 `~/set_session` 服务名；catalog 是否包含该执行器的技能必须与此一致，否则 Gateway 拒绝启动。
+  会话的 `~/set_session` 服务名和 `stop_timeout_sec`；catalog 是否包含该执行器的技能必须与此一致，
+  `mirror_stop` 的技能超时必须不小于 `stop_timeout_sec` + 0.5 s，否则 Gateway 拒绝启动。节点名、服务名、
+  释放预留和这 0.5 s 余量只在 `embodied_common/mirror_session_contract.py` 定义一次。
 - 两个模型 bundle 按 `WORKSPACE` 相对路径解析，`$WORKSPACE/models/` 下缺少 bundle 时配置解析失败，整个
   launch 中止。
 

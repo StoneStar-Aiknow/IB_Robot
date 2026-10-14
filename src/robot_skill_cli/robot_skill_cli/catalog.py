@@ -11,6 +11,7 @@ from typing import Any
 
 from embodied_common.capability_view import project_capability_timeout_policy
 from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
+from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
 from embodied_common.primitive_contracts import primitive_contract_for_version
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
 from robot_config.config_path import resolve_robot_config_path
@@ -290,6 +291,18 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
                 configuration={
                     "runtime_name": (description.get("robot") or {}).get("runtime_name", runtime.get("provider", ""))
                 },
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
+    mirror_session = robot_config.get("mirror_session", {})
+    if isinstance(mirror_session, dict) and mirror_session.get("enabled") is True:
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="mirror_session",
+                endpoint_name=MIRROR_SESSION_SERVICE,
+                endpoint_kind="ros_service",
+                configuration={},
             )
         )
         delegated[descriptor.name] = descriptor

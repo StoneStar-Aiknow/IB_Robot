@@ -1,0 +1,10 @@
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: mirror_session
+binding:
+  # The session command sent through ~/set_session (start = true, stop = false).
+  command: start
+required_args: []
+# The Gateway switches the runtime mode before calling; the session only takes it over.
+timeout_sec: 5.0

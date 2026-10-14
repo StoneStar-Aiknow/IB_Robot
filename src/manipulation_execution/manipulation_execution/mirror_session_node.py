@@ -8,8 +8,9 @@ Parameters (one parameter file serves the node and the release script):
 
 ``runtime_description_json``  the bound ``runtime.interface_description``
 ``policy_mode``               ``control_modes.model_inference.runtime_mode``
-``stop_timeout_sec``          the ``mirror_stop`` skill timeout (default 5 s);
-                              the wrap-up budget is derived from it
+``stop_timeout_sec``          how long a stop may take (default 4.5 s): the
+                              wrap-up gets it minus the 2 s release reserve;
+                              the ``mirror_stop`` skill timeout must exceed it
 ``publish_rate_hz``           output tick (default 50 Hz)
 ``status_period_sec``         ``~/status`` period (default 1 s)
 ``publish_enabled``           false (default): the gate's output goes to the

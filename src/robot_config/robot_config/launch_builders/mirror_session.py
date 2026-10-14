@@ -5,7 +5,9 @@ mirror's runtime mode, so this builder checks what the node cannot see from
 inside one process:
 
 * the runtime mode it takes over is ``control_modes.<control_mode>.runtime_mode``,
-  explicit and not idle;
+  explicit and not idle, and ``control_mode`` is ``skill_required_control_mode``:
+  the Gateway switches to the skills' mode and the session takes over exactly
+  that mode;
 * nothing else produces that mode: no control mode mapped to it launches an
   inference pipeline or an action dispatcher;
 * the bound runtime description is passed whole, so the node resolves every
@@ -37,6 +39,7 @@ from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
+from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC, NODE_NAME, RELEASE_RESERVE_SEC
 from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_builders.motion_imitation_stream import (
     mock_playback_endpoints,
@@ -54,14 +57,7 @@ _KEYS = frozenset(
         "interfaces",
     }
 )
-_DEFAULT_CONTROL_MODE = "model_inference"
-# Must match manipulation_execution.mirror_session.core.RELEASE_RESERVE_S.
-_RELEASE_RESERVE_SEC = 2.0
 _IDLE = "idle"
-# The session node's name and its start/stop service (std_srvs/SetBool), which
-# the Gateway's mirror_session executor calls for mirror_start / mirror_stop.
-NODE_NAME = "mirror_session"
-SESSION_SERVICE = f"/{NODE_NAME}/set_session"
 
 
 def _bool(config: Mapping, key: str, default: bool) -> bool:
@@ -132,14 +128,22 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     unknown = sorted(set(config) - _KEYS)
     if unknown:
         raise ValueError(f"mirror_session has unknown keys {unknown}")
-    control_mode = config.get("control_mode", _DEFAULT_CONTROL_MODE)
+    skill_mode = robot_config.get("skill_required_control_mode")
+    if not isinstance(skill_mode, str) or not skill_mode.strip():
+        raise ValueError("mirror_session needs skill_required_control_mode: its skills run through the Gateway")
+    control_mode = config.get("control_mode", skill_mode)
     if not isinstance(control_mode, str) or not control_mode.strip():
         raise ValueError("mirror_session.control_mode must be a non-empty string")
+    if control_mode.strip() != skill_mode.strip():
+        raise ValueError(
+            f"mirror_session.control_mode {control_mode!r} must equal skill_required_control_mode "
+            f"{skill_mode!r}: the Gateway switches to the skills' mode and the session takes over exactly that mode"
+        )
 
     release_parameters = {
         "runtime_description_json": _runtime_description(robot_config),
         "policy_mode": _policy_mode(robot_config, control_mode.strip()),
-        "stop_timeout_sec": _number(config, "stop_timeout_sec", 5.0, _RELEASE_RESERVE_SEC),
+        "stop_timeout_sec": _number(config, "stop_timeout_sec", DEFAULT_STOP_TIMEOUT_SEC, RELEASE_RESERVE_SEC),
     }
     stream = motion_imitation_stream_parameters(robot_config) or {}
     mock = mock_playback_endpoints(robot_config) or ("", "")
@@ -171,4 +175,4 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     return [session, RegisterEventHandler(OnProcessExit(target_action=session, on_exit=[release]))]
 
 
-__all__ = ["NODE_NAME", "SESSION_SERVICE", "generate_mirror_session_nodes"]
+__all__ = ["generate_mirror_session_nodes"]

@@ -9,6 +9,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
+from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
@@ -324,6 +325,17 @@ def generate_embodied_nodes(
             runtime_named_motion_enabled=True,
             runtime_named_motion_action=public_endpoint(
                 named_motion_config.get("interface", ""), "action", RUNTIME_NAMED_MOTION_ACTION_TYPE
+            ),
+        )
+    mirror_session = robot_config.get("mirror_session", {})
+    if isinstance(mirror_session, dict) and mirror_session.get("enabled") is True:
+        # The X2 mirror session's start/stop switch; robot_config launches the session node.
+        # The Gateway checks its mirror_stop timeout against the session's stop timeout.
+        common_params.update(
+            mirror_session_enabled=True,
+            mirror_session_service=MIRROR_SESSION.SESSION_SERVICE,
+            mirror_session_stop_timeout_sec=float(
+                mirror_session.get("stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC)
             ),
         )
     if arm_surface:

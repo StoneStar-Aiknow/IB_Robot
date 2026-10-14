@@ -89,6 +89,9 @@ ibrobot_msgs / rclpy
   边界：结构化 `IBTRACE1` 插桩与分析链路属于 `ibrobot_tracing` 包；本模块只产生 `[hop]` 阶段记录，
   其进程内 ContextVar 为 `embodied_stage_trace_id`，与 `ibrobot_tracing` 的 `ibrobot_trace_id`
   互不共享；跨子系统关联统一走 `DispatchBinding.trace_id` 消息字段。
+- `embodied_common.mirror_session_contract`：X2 照镜子会话的共享常量（节点名、`~/set_session` 服务名、
+  技能绑定的命令 `start` / `stop`、停止超时默认值、释放预留与 Gateway 超时余量）。会话节点、launch
+  builder、Gateway、skill catalog 和 `robot_skill_cli` 都从这里取，不各自保留副本；模块不依赖任何包。
 
 Agent execution mode is captured when an Agent plan is created and must match
 at confirmation. `immediate_after_presentation` only removes the second user

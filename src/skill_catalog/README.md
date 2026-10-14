@@ -85,6 +85,42 @@ Named motions cannot be cancelled once started (the runtime refuses it); see the
 `skill_library` README for the executor's cancel and deadline semantics. Postures
 and stairs are deliberately not exposed by `aimdk_x2_skills`.
 
+## Mirror session skills
+
+`mirror_start` and `mirror_stop` (profile `aimdk_x2_magicmirror`) are
+`delegated_executor` implementations with `executor: mirror_session`. Each binds
+the session command it sends, `binding: {command: start}` or
+`binding: {command: stop}`; the skill executor sends it to the X2 mirror
+session's `~/set_session` (`std_srvs/SetBool`: start sends true, stop sends
+false).
+
+- `binding` must be exactly `{command: start|stop}`, `required_args` must be
+  `[]` and the capability must declare no parameters; the validator enforces
+  all three at compile time.
+- Both declare `required_control_mode: model_inference`, which the robot maps to
+  the runtime's `policy_stream`. The Gateway switches the runtime to that mode
+  before calling; the session only takes it over.
+- `mirror_stop`'s `timeout_sec` must be at least `mirror_session.stop_timeout_sec`
+  in the robot configuration plus 0.5 s, so the session's answer arrives before
+  the Gateway gives up. The Gateway checks this at startup.
+- Mirroring is a resident state, not a running task: generic stop phrases and
+  Agent cancel do not end it in this version; only `mirror_stop` does. See the
+  skills' `SKILL.md` for the emergency stop.
+
+```yaml
+# config/skills/mirror_stop/implementations/x2_runtime_v1.yaml
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: mirror_session
+binding:
+  command: stop
+required_args: []
+timeout_sec: 5.0     # >= mirror_session.stop_timeout_sec (4.5) + 0.5
+```
+
+See the `skill_library` README for the executor's error codes.
+
 ## Source Modes
 
 Robot YAML selects the source through `embodied.skill_catalog_source_mode`
