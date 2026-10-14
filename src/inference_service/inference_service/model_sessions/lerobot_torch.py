@@ -6,6 +6,7 @@ import gc
 import importlib
 import inspect
 import math
+import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
 from typing import Any
@@ -68,7 +69,8 @@ class LeRobotTorchModelSession(ModelSession):
         self._preprocessor: Any | None = None
         self._postprocessor: Any | None = None
         self._model_dtype = "native"
-        self._last_metadata: dict[str, object] = {}
+        # SequentialModelExecutor collects metadata on the executing thread.
+        self._execution_local = threading.local()
         self._attention_collector = None
 
     @property
@@ -94,9 +96,10 @@ class LeRobotTorchModelSession(ModelSession):
         return self._postprocessor(action)
 
     def execution_metadata(self, request_id: str) -> Mapping[str, object]:
-        if self._last_metadata.get("request_id") != request_id:
+        metadata = getattr(self._execution_local, "metadata", {})
+        if metadata.get("request_id") != request_id:
             return {}
-        return dict(self._last_metadata)
+        return dict(metadata)
 
     def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         profile = context.backend_profile
@@ -279,6 +282,7 @@ class LeRobotTorchModelSession(ModelSession):
         )
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        self._execution_local.metadata = {}
         context.check("backend")
         policy = self._policy
         torch_module = self._torch
@@ -329,7 +333,7 @@ class LeRobotTorchModelSession(ModelSession):
             if provider is not None and provider.execution_metadata is not None
             else {}
         )
-        self._last_metadata = {
+        self._execution_local.metadata = {
             "request_id": context.request_id,
             "policy_type": self._require_context().model_type,
             "device": self._configured_device_name,
@@ -370,7 +374,7 @@ class LeRobotTorchModelSession(ModelSession):
         self._device = None
         self._torch = None
         self._attention_collector = None
-        self._last_metadata = {}
+        self._execution_local = threading.local()
         gc.collect()
         cache_owner = getattr(torch_module, device_name, None) if torch_module is not None else None
         empty_cache = getattr(cache_owner, "empty_cache", None)

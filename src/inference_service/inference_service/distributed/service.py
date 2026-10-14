@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 
 from inference_service.distributed.runtime import CloudBackendRuntime
@@ -104,6 +105,8 @@ class DistributedCloudService:
         stream_manager: _StreamManager | None = None,
         runtime_interface: str = "policy",
         runtime_model_type: str = "",
+        owns_runtime: bool = True,
+        inference_admission=None,
         require_target_observation: bool = False,
     ) -> None:
         if runtime_interface != "policy":
@@ -122,6 +125,9 @@ class DistributedCloudService:
         self.identity = identity
         self._lifecycle_lock = threading.RLock()
         self.runtime = runtime
+        self._owns_runtime = owns_runtime
+        self._inference_admission = inference_admission
+        # Frontend startup failure blocks serving even when a borrowed runtime is healthy.
         self.startup_error = startup_error
         if stream_manager is not None and stream_negotiator is not None:
             raise ValueError("provide stream_manager or stream_negotiator, not both")
@@ -137,7 +143,7 @@ class DistributedCloudService:
 
     def observe_edge(self, status: PipelineStatus) -> PipelineStatus:
         with self._lifecycle_lock:
-            if self.runtime is None:
+            if self.startup_error is not None or self.runtime is None:
                 self.session.observe_edge(status, backend_ready=False)
                 return self.status()
             _, backend_available, _ = self._runtime_status()
@@ -152,7 +158,7 @@ class DistributedCloudService:
 
     def status(self) -> PipelineStatus:
         with self._lifecycle_lock:
-            if self.runtime is None:
+            if self.startup_error is not None or self.runtime is None:
                 status = self.session.status(
                     backend_ready=False,
                     backend_state="failed",
@@ -176,7 +182,7 @@ class DistributedCloudService:
         inference_start_monotonic_ns = 0
         inference_end_monotonic_ns = 0
         transport_streams: tuple[dict[str, object], ...] = ()
-        if self.runtime is None:
+        if self.startup_error is not None or self.runtime is None:
             result_monotonic_ns = time.monotonic_ns()
             return DistributedResult(
                 operation=request.operation,
@@ -226,12 +232,17 @@ class DistributedCloudService:
                             self.stream_manager.record_state_alignment(alignment_delta_ns)
                     stream_assembly_end_monotonic_ns = time.monotonic_ns()
                     inference_start_monotonic_ns = time.monotonic_ns()
-                    pipeline_result = self.runtime.infer(
-                        request.request_id,
-                        inputs,
-                        prompt=request.prompt,
-                        deadline=request.deadline,
-                    )
+                    with (
+                        self._inference_admission(request.deadline, lambda: False)
+                        if self._inference_admission is not None
+                        else nullcontext()
+                    ):
+                        pipeline_result = self.runtime.infer(
+                            request.request_id,
+                            inputs,
+                            prompt=request.prompt,
+                            deadline=request.deadline,
+                        )
                     action = pipeline_result.action
                     chunk_size = pipeline_result.actual_chunk_size
                     metadata = getattr(pipeline_result, "metadata", {})
@@ -256,6 +267,14 @@ class DistributedCloudService:
                     execution_horizon = 0
                     latency_ms = 0.0
                 elif request.operation is Operation.CANCEL:
+                    if not self.runtime.capabilities.supports_cancellation:
+                        raise DistributedProtocolError(
+                            StructuredError(
+                                code="unsupported_capability",
+                                message="cloud backend does not support cancellation",
+                                stage="cancel",
+                            )
+                        )
                     self.runtime.cancel(request.target_request_id, deadline=request.deadline)
                     action = None
                     chunk_size = 0
@@ -380,7 +399,7 @@ class DistributedCloudService:
                 self.stream_manager.close()
             except Exception as exc:
                 error = exc
-        if self.runtime is not None:
+        if self.runtime is not None and self._owns_runtime:
             try:
                 self.runtime.close()
             except Exception as exc:

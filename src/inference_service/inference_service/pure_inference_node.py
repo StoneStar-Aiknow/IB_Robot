@@ -80,8 +80,11 @@ class PureInferenceNode(Node):
         node_name: str,
         registry_set: RegistrySet | None = None,
         providers: RuntimeProviders | None = None,
+        runtime: CloudBackendRuntime | None = None,
+        inference_admission=None,
+        use_global_arguments: bool = True,
     ) -> None:
-        super().__init__(node_name)
+        super().__init__(node_name, use_global_arguments=use_global_arguments)
         registry_set, providers = require_runtime_dependencies(
             registry_set,
             providers,
@@ -102,6 +105,7 @@ class PureInferenceNode(Node):
 
         startup_error = None
         stream_manager = None
+        owns_runtime = runtime is None
         require_target_observation = False
         try:
             if config.robot_config_path:
@@ -128,7 +132,7 @@ class PureInferenceNode(Node):
                     require_target_observation=require_target_observation,
                 )
             validated = load_inference_manifest(config.model_path, config.deployment)
-            runtime = CloudBackendRuntime(
+            runtime = runtime or CloudBackendRuntime(
                 config.pipeline_id,
                 validated,
                 request_timeout=config.request_timeout,
@@ -137,7 +141,8 @@ class PureInferenceNode(Node):
                 providers=self._providers,
             )
         except Exception as exc:
-            runtime = None
+            if owns_runtime:
+                runtime = None
             startup_error = structured_error_from_exception(exc, "startup")
             self.get_logger().error(f"distributed cloud backend failed to start: {exc}")
         self._config = config
@@ -147,6 +152,8 @@ class PureInferenceNode(Node):
             runtime,
             startup_error=startup_error,
             stream_manager=stream_manager,
+            owns_runtime=owns_runtime,
+            inference_admission=inference_admission,
             require_target_observation=require_target_observation,
         )
         self._fingerprint = metadata.fingerprint
@@ -199,12 +206,56 @@ class PureInferenceNode(Node):
             status_qos,
             callback_group=ReentrantCallbackGroup(),
         )
-        # The heartbeat gets its own group. In the node's default exclusive group it
-        # waits behind the video status and diagnostics timers, and a publish that
-        # blocks inside DDS there delays it past the edge's 2.0 s expiry.
+        # The heartbeat timer gets its own callback group. Timers created without one
+        # land in the node's default MutuallyExclusiveCallbackGroup, so this 0.5s timer
+        # would share a group with the video status timer below -- and a
+        # MultiThreadedExecutor cannot run two callbacks from one exclusive group at
+        # once, no matter how many threads it has.
+        #
+        # This mattered because the video status timer used to run at 0.02s (see the
+        # comment on that timer): with two rtp cameras it published 100 messages a
+        # second and was ready on nearly every executor pass, which starved the
+        # heartbeat. Measured on the two-machine rtp setup (2026-09-21): same process,
+        # same moment, the 0.02s timer delivered a steady 100.0 Hz while this one fell
+        # from 2 Hz to ~1.3 Hz with gaps up to 2.0s on loopback and 3.0s across the
+        # network. The edge side declares the session dead after 2.0s of silence
+        # (distributed/session.py heartbeat_timeout), so every distributed rtp run lost
+        # its session seconds after the handshake and the benchmark aborted before
+        # sending a single frame. The dds path never showed this because
+        # _publish_video_status returns immediately when there is no stream manager and
+        # publishes nothing.
+        #
+        # The publish rate is fixed below, so the two timers no longer compete for
+        # executor passes. Keep the separate group anyway: it is what makes the
+        # heartbeat independent of whatever else lands in the default group, and it is
+        # cheap.
+        #
+        # _publish_status only calls DistributedCloudService.status(), which already
+        # runs under the service's own _lifecycle_lock and is already reached
+        # concurrently from the reentrant subscription callbacks above, so moving it out
+        # of the default group adds no new shared state.
         self._status_timer = self.create_timer(
             0.5, self._publish_status, callback_group=MutuallyExclusiveCallbackGroup()
         )
+        # 0.25s, matching recording_node._publish_video_status -- the other cloud-side
+        # node that receives rtp and republishes receiver status on this same topic.
+        #
+        # This was 0.25s until 41f57a5e ("benchmark: integrate native observation
+        # streaming") changed it to 0.02s; that commit message gives no reason, and
+        # nothing subscribing to this topic needs a faster rate. The edge publishes its
+        # own sender-origin status every 0.25s (pipeline_policy_node), and the only
+        # readers are recording_node, the two ci_smoke clients, and this node's own
+        # subscription above (which the edge's sender status is what actually matters
+        # for -- compute_video_streams.observe_status ignores receiver-origin messages).
+        #
+        # At 0.02s with two streams this publisher put 100 RELIABLE messages a second on
+        # the wire and publish() itself blocked. py-spy on the cloud host (220 samples):
+        # worker threads sat inside rclpy publish() in 76 samples, each call blocking
+        # 1.6-2.2s, and the heartbeat blocked in its own publish() for 4.5s
+        # straight. That is inside DDS, below the executor, so the callback group fix
+        # alone could not reach it. Single-variable check the same day: with this
+        # publisher idle the heartbeat held 2.000 Hz / max gap 0.500s; with it running at
+        # 100 msg/s the heartbeat fell to 1.0-1.3 Hz / max gap 2.0-3.0s.
         self._video_status_timer = self.create_timer(_VIDEO_STATUS_PERIOD_S, self._publish_video_status)
         self._video_diagnostics_timer = self.create_timer(
             _VIDEO_DIAGNOSTICS_PERIOD_S, self._log_video_runtime_diagnostics
@@ -295,23 +346,43 @@ class PureInferenceNode(Node):
     def _log_video_runtime_diagnostics(self) -> None:
         if self._stream_manager is None:
             return
-        for observation_key, metrics in self._stream_manager.decoder_diagnostics():
-            self.get_logger().info(
-                f"Decoder runtime: observation={observation_key}, "
-                f"input_frames={metrics.input_frames}, output_frames={metrics.output_frames}, "
-                f"input_fps={metrics.input_frame_rate_hz:.2f}, output_fps={metrics.output_frame_rate_hz:.2f}, "
-                f"backlog={metrics.decoder_backlog_depth}, output_age_ms={metrics.decoder_output_age_ns / 1e6:.1f}, "
-                f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}"
-            )
+        # All streams go into one log line per diagnostic. rclpy keys its throttle
+        # context on the call site -- CallerId is (function_name, file_path,
+        # line_number, last_index), with no message content in it (rcutils_logger.py:54).
+        # A throttled log inside a for loop therefore shares one context across every
+        # stream: the first stream logs, resets the 2s timer, and the rest of the
+        # streams are dropped. The video status timer fires faster than the 2s throttle
+        # window (see _video_status_timer), so with two cameras the second camera's
+        # line never appears at all. The sending end of this same link already logs one
+        # aggregated line (pipeline_policy_node.py _publish_video_stream_control);
+        # this matches it.
+        decoder_lines = [
+            f"observation={observation_key}, "
+            f"input_frames={metrics.input_frames}, output_frames={metrics.output_frames}, "
+            f"input_fps={metrics.input_frame_rate_hz:.2f}, output_fps={metrics.output_frame_rate_hz:.2f}, "
+            f"backlog={metrics.decoder_backlog_depth}, output_age_ms={metrics.decoder_output_age_ns / 1e6:.1f}, "
+            f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}"
+            for observation_key, metrics in self._stream_manager.decoder_diagnostics()
+        ]
+        if decoder_lines:
+            self.get_logger().info("Decoder runtime: " + " | ".join(decoder_lines), throttle_duration_sec=2.0)
+        # Left outside the aggregation above on purpose: this log has a single
+        # call site and is not inside a loop, so its throttle context is not
+        # shared with anything.
         alignment_delta_ns = self._stream_manager.state_alignment_delta_ns()
         if alignment_delta_ns is not None:
-            self.get_logger().info(f"State alignment: delta_ms={alignment_delta_ns / 1e6:.1f}")
-        for observation_key, capture_ns, capture_age_ms, live_age_ms in self._stream_manager.selection_diagnostics():
             self.get_logger().info(
-                f"Video selection: observation={observation_key}, "
-                f"capture_age_ms={capture_age_ms:.1f}, live_age_ms={live_age_ms:.1f}, "
-                f"selected_capture_ns={capture_ns}"
+                f"State alignment: delta_ms={alignment_delta_ns / 1e6:.1f}",
+                throttle_duration_sec=2.0,
             )
+        selection_lines = [
+            f"observation={observation_key}, "
+            f"capture_age_ms={capture_age_ms:.1f}, live_age_ms={live_age_ms:.1f}, "
+            f"selected_capture_ns={capture_ns}"
+            for observation_key, capture_ns, capture_age_ms, live_age_ms in self._stream_manager.selection_diagnostics()
+        ]
+        if selection_lines:
+            self.get_logger().info("Video selection: " + " | ".join(selection_lines), throttle_duration_sec=2.0)
 
     def _request_callback(self, message: DistributedInferenceRequest) -> None:
         request = None

@@ -293,6 +293,7 @@ def create_inference_pipeline(
     registry_set: RegistrySet | None = None,
     providers: RuntimeProviders | None = None,
     model_session_factory=None,
+    max_active_executions: int = 1,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
     instrument_processors: bool = True,
@@ -311,6 +312,8 @@ def create_inference_pipeline(
     ``model_session_factory`` optionally overrides session construction for tests.
     """
 
+    if type(max_active_executions) is not int or max_active_executions < 1:
+        raise ValueError("max_active_executions must be a positive integer")
     selected_registry, session_registry, assembler_registry, selected_providers = _resolve_pipeline_dependencies(
         registry_set=registry_set,
         providers=providers,
@@ -347,6 +350,7 @@ def create_inference_pipeline(
             )
         preprocessor = handle.preprocessor or preprocessor
         postprocessor = handle.postprocessor or postprocessor
+        assembly.max_active_executions = max_active_executions
         return InferencePipeline(
             pipeline_id,
             context,
@@ -385,6 +389,7 @@ def create_pipeline_manager(
     registry_set: RegistrySet | None = None,
     providers: RuntimeProviders | None = None,
     model_session_factory=None,
+    max_active_executions: int = 1,
     pi05_diagnostic_schedule: PI05DenoisingSchedule | None = None,
     pi05_diagnostic_schedule_source: str | None = None,
     instrument_processors: bool = True,
@@ -405,6 +410,7 @@ def create_pipeline_manager(
         registry_set=registry_set,
         providers=providers,
         model_session_factory=model_session_factory,
+        max_active_executions=max_active_executions,
         pi05_diagnostic_schedule=pi05_diagnostic_schedule,
         pi05_diagnostic_schedule_source=pi05_diagnostic_schedule_source,
         instrument_processors=instrument_processors,

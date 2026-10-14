@@ -96,6 +96,8 @@ class CloudBackendRuntime:
         registry: BackendRegistry | None = None,
         registry_set: RegistrySet | None = None,
         providers: RuntimeProviders | None = None,
+        model_session_factory=None,
+        max_active_executions: int = 1,
     ) -> None:
         interface = getattr(getattr(validated_manifest.manifest, "model", None), "interface", None)
         if interface is not None and interface != "policy":
@@ -117,6 +119,8 @@ class CloudBackendRuntime:
             registry=registry,
             registry_set=registry_set,
             providers=providers,
+            model_session_factory=model_session_factory,
+            max_active_executions=max_active_executions,
             instrument_processors=True,
             model_component_id="cloud_inference",
         )

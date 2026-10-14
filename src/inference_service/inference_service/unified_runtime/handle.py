@@ -610,6 +610,10 @@ class ModelRuntimeHandle:
         return self.state is LifecycleState.CLOSED
 
     @property
+    def max_active_executions(self) -> int:
+        return self._max_active_executions
+
+    @property
     def active_executions(self) -> int:
         with self._condition:
             return self._active_executions

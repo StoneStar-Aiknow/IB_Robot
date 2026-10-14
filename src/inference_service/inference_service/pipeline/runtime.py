@@ -876,6 +876,16 @@ class InferencePipeline:
     def load(self) -> None:
         try:
             self._unified_handle.load(self._context)
+            # Partially-constructed pipelines (bypassed __init__ in drain tests)
+            # carry no session handle; the concurrency bound is enforced for
+            # every normally constructed pipeline.
+            session_handle = getattr(self, "_session_handle", None)
+            if (
+                session_handle is not None
+                and self._unified_handle.max_active_executions > session_handle.capabilities.max_in_flight_per_instance
+            ):
+                self._unified_handle.close()
+                raise ValueError("runtime concurrency exceeds loaded model session capacity")
         except ExecutionFailure as exc:
             self._raise_execution_failure(exc)
 

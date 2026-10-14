@@ -9,8 +9,9 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,7 +72,6 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
     video_descriptor_to_message,
-    video_status_from_message,
     video_status_to_message,
 )
 from inference_service.pipeline import (
@@ -151,7 +151,6 @@ class PipelineNodeConfig:
     heartbeat_topic: str
     video_descriptor_topic: str = ""
     video_status_topic: str = ""
-    external_video_producer: bool = False
     # Empty when scheduler is disabled.
     scheduled_open_session: str = ""
     scheduled_dispatch: str = ""
@@ -275,115 +274,6 @@ class DistributedSessionNotReadyError(RuntimeError):
         super().__init__(f"distributed pipeline is not ready ({state})")
 
 
-class _ExternalVideoProducerView:
-    """Request-side session view for an out-of-process frame producer.
-
-    This object never owns a sender, descriptor publisher, or stream-status
-    publisher. It only keeps request stream references aligned with the active
-    distributed inference session.
-    """
-
-    def __init__(
-        self,
-        observation_specs: list[SpecView],
-        *,
-        pipeline_id: str,
-        contract_fingerprint: str,
-        deployment_fingerprint: str,
-    ) -> None:
-        from robot_config.observation_transport import effective_observation_transport
-
-        self._references = tuple(
-            StreamReference(spec.key, transport.stream_id or "")
-            for spec in observation_specs
-            if (transport := effective_observation_transport(spec.transport)).mode == "rtp"
-        )
-        self._session = StreamSessionView.inactive(
-            pipeline_id=pipeline_id,
-            contract_fingerprint=contract_fingerprint,
-            deployment_fingerprint=deployment_fingerprint,
-        )
-        self._latest_sent_capture_ns: dict[str, int] = {}
-        self._status_lock = threading.Lock()
-
-    @property
-    def observation_keys(self) -> frozenset[str]:
-        return frozenset(reference.observation_key for reference in self._references)
-
-    @property
-    def stream_references(self) -> tuple[StreamReference, ...]:
-        return self._references
-
-    @property
-    def session(self) -> StreamSessionView:
-        return self._session
-
-    def bind_session(self, session: StreamSessionView) -> bool:
-        changed = self._session != session
-        self._session = session
-        if changed:
-            with self._status_lock:
-                self._latest_sent_capture_ns.clear()
-        return changed
-
-    def clear_session(self) -> None:
-        self._session = StreamSessionView.inactive(
-            pipeline_id=self._session.pipeline_id,
-            contract_fingerprint=self._session.contract_fingerprint,
-            deployment_fingerprint=self._session.deployment_fingerprint,
-        )
-        with self._status_lock:
-            self._latest_sent_capture_ns.clear()
-
-    def latest_sent_capture_ns(self, observation_key: str) -> int:
-        with self._status_lock:
-            return self._latest_sent_capture_ns.get(observation_key, 0)
-
-    def observe_sender_status(self, status: object) -> bool:
-        """Record the sender's post-send capture mapping for external RTP input."""
-        if (
-            getattr(status, "status_origin", "") != "sender"
-            or getattr(status, "pipeline_id", "") != self._session.pipeline_id
-            or not self._session.active
-            or getattr(status, "session_id", "") != self._session.session_id
-            or int(getattr(status, "session_generation", 0)) != self._session.generation
-            or getattr(status, "observation_key", "") not in self.observation_keys
-            or not bool(getattr(status, "timestamp_mapping_valid", False))
-            or int(getattr(status, "encoded_frames", 0)) <= 0
-            or int(getattr(status, "sent_packets", 0)) <= 0
-        ):
-            return False
-        capture_ns = int(getattr(status, "mapping_capture_timestamp_ns", 0))
-        if capture_ns <= 0:
-            return False
-        key = status.observation_key
-        with self._status_lock:
-            if capture_ns < self._latest_sent_capture_ns.get(key, 0):
-                return False
-            self._latest_sent_capture_ns[key] = capture_ns
-        return True
-
-    def reset(self) -> None:
-        with self._status_lock:
-            self._latest_sent_capture_ns.clear()
-
-    def close(self) -> None:
-        self.clear_session()
-
-    def descriptors(self) -> tuple[()]:
-        return ()
-
-    def statuses(self) -> tuple[()]:
-        return ()
-
-    def diagnostic_snapshots(self) -> tuple[()]:
-        return ()
-
-    def sender_diagnostics(self) -> tuple[()]:
-        """External producers own sender diagnostics and publish their own status."""
-        return ()
-
-
 def _execution_horizon_from_metadata(metadata: object, chunk_size: int) -> int:
     """Validate the optional policy-selected prefix before publishing a result."""
     value = metadata.get("execution_horizon", 0) if isinstance(metadata, Mapping) else 0
@@ -402,8 +292,11 @@ class PipelinePolicyNode(Node):
         node_name: str,
         registry_set: RegistrySet | None = None,
         providers: RuntimeProviders | None = None,
+        shared_manager: InferencePipelineManager | None = None,
+        inference_admission: Callable[[datetime, Callable[[], bool]], AbstractContextManager] | None = None,
+        use_global_arguments: bool = True,
     ) -> None:
-        super().__init__(node_name)
+        super().__init__(node_name, use_global_arguments=use_global_arguments)
         registry_set, providers = require_runtime_dependencies(
             registry_set,
             providers,
@@ -415,8 +308,12 @@ class PipelinePolicyNode(Node):
             raise RuntimeError(f"unsupported pipeline execution mode {config.execution_mode!r}")
         if config.scheduler_enabled and config.execution_mode != "monolithic":
             raise RuntimeError("scheduled inference supports only monolithic pipelines")
+        if shared_manager is not None and (config.execution_mode != "monolithic" or config.scheduler_enabled):
+            raise RuntimeError("shared frontends require legacy monolithic execution")
 
         self._config = config
+        self._owns_manager = shared_manager is None
+        self._inference_admission = inference_admission
         self._manager: InferencePipelineManager | None = None
         self._edge_runtime: EdgeProcessorRuntime | None = None
         self._edge_session: EdgeSession | None = None
@@ -491,7 +388,7 @@ class PipelinePolicyNode(Node):
             stage_scheduling = scheduling.get("stages", {}) if isinstance(scheduling, dict) else {}
             if config.scheduler_enabled and config.pipeline_stage_policy == "independent":
                 self._frame_trigger_priority = int(scheduling.get("frame_base_priority", 0))
-            self._manager = create_pipeline_manager(
+            self._manager = shared_manager or create_pipeline_manager(
                 config.pipeline_id,
                 self._manifest,
                 request_timeout=config.request_timeout,
@@ -516,26 +413,18 @@ class PipelinePolicyNode(Node):
             self._edge_runtime.load()
             self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
             self._edge_session.start()
-            if config.external_video_producer:
-                self._video_stream_manager = _ExternalVideoProducerView(
-                    self._obs_specs,
+            from robot_config.observation_transport import effective_observation_transport
+
+            if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
+                self._video_stream_manager = DeviceVideoStreamManager(
                     pipeline_id=config.pipeline_id,
                     contract_fingerprint=contract_fingerprint(self._contract),
                     deployment_fingerprint=self._manifest.fingerprint,
+                    observation_specs=self._obs_specs,
                 )
-            else:
-                from robot_config.observation_transport import effective_observation_transport
-
-                if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
-                    self._video_stream_manager = DeviceVideoStreamManager(
-                        pipeline_id=config.pipeline_id,
-                        contract_fingerprint=contract_fingerprint(self._contract),
-                        deployment_fingerprint=self._manifest.fingerprint,
-                        observation_specs=self._obs_specs,
-                    )
-                # Pipelines whose observations all ride the request (pure DDS
-                # transport) have no video streams to manage; the frame ingress
-                # rejects an empty stream set, so the manager stays unset.
+            # Pipelines whose observations all ride the request (pure DDS
+            # transport) have no video streams to manage; the frame ingress
+            # rejects an empty stream set, so the manager stays unset.
 
         self._action_pub = None
         if not config.scheduler_enabled:
@@ -562,23 +451,11 @@ class PipelinePolicyNode(Node):
                 callback_group=ReentrantCallbackGroup(),
             )
             self._status_pub = self.create_publisher(InferencePipelineStatus, config.heartbeat_topic, status_qos)
-            self._video_descriptor_pub = None
-            self._video_status_pub = None
-            self._video_status_timer = None
-            if config.external_video_producer:
-                self.create_subscription(
-                    VideoStreamStatus,
-                    config.video_status_topic,
-                    self._external_video_status_callback,
-                    10,
-                    callback_group=ReentrantCallbackGroup(),
-                )
-            else:
-                self._video_descriptor_pub = self.create_publisher(
-                    VideoStreamDescriptor, config.video_descriptor_topic, descriptor_qos
-                )
-                self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
-                self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
+            self._video_descriptor_pub = self.create_publisher(
+                VideoStreamDescriptor, config.video_descriptor_topic, descriptor_qos
+            )
+            self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
+            self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
             self.create_subscription(
                 InferencePipelineStatus,
                 config.heartbeat_topic,
@@ -601,7 +478,7 @@ class PipelinePolicyNode(Node):
                 cancel_callback=self._cancel_callback,
                 callback_group=(
                     MutuallyExclusiveCallbackGroup()
-                    if config.execution_mode == "monolithic"
+                    if config.execution_mode == "monolithic" and shared_manager is None
                     else ReentrantCallbackGroup()
                 ),
             )
@@ -1694,16 +1571,23 @@ class PipelinePolicyNode(Node):
             if self._config.execution_mode == "monolithic":
                 observations = self._to_policy_inputs(observations)
                 inference_start_monotonic_ns = time.monotonic_ns()
-                result = self._require_manager().infer(
-                    self._config.pipeline_id,
-                    InferenceRequest(
-                        request_id=request_id,
-                        inputs=observations,
-                        prompt=request.prompt if request.prompt else None,
-                        deadline=deadline,
-                        priority=0,
-                    ),
-                )
+                admission = getattr(self, "_inference_admission", None)
+                with (
+                    admission(deadline, lambda: self._goal_cancel_requested(goal_handle))
+                    if admission is not None
+                    else contextlib.nullcontext()
+                ):
+                    admitted_monotonic_ns = time.monotonic_ns()
+                    result = self._require_manager().infer(
+                        self._config.pipeline_id,
+                        InferenceRequest(
+                            request_id=request_id,
+                            inputs=observations,
+                            prompt=request.prompt if request.prompt else None,
+                            deadline=deadline,
+                            priority=0,
+                        ),
+                    )
                 raw_action = result.action
                 chunk_size = result.actual_chunk_size
                 inference_end_monotonic_ns = time.monotonic_ns()
@@ -1718,6 +1602,12 @@ class PipelinePolicyNode(Node):
                     "inference_end_monotonic_ns": inference_end_monotonic_ns,
                     "transport": {"mode": "dds", "streams": []},
                 }
+                if admission is not None:
+                    total_latency_ms = (time.perf_counter() - total_start) * 1000.0
+                    service_performance["shared_admission_wait_ms"] = (
+                        admitted_monotonic_ns - inference_start_monotonic_ns
+                    ) / 1_000_000
+                    service_performance["inference_start_monotonic_ns"] = admitted_monotonic_ns
             else:
                 edge_runtime = self._require_edge_runtime()
                 try:
@@ -1947,7 +1837,6 @@ class PipelinePolicyNode(Node):
                     "state": session.state.value,
                     "backend_state": self._remote_state,
                     "remote_state": self._remote_state,
-                    "external_video_producer": bool(getattr(self._config, "external_video_producer", False)),
                     "session_id": session_id,
                     "session_generation": generation,
                 }
@@ -1961,6 +1850,7 @@ class PipelinePolicyNode(Node):
                         )
             values.update(
                 {
+                    "pipeline_id": self._config.pipeline_id,
                     "inference_count": self._inference_count,
                     "last_inference_time": self._last_inference_time or "",
                 }
@@ -2874,16 +2764,6 @@ class PipelinePolicyNode(Node):
                 f"diagnostic={self._format_video_stream_diagnostic(snapshot)}"
             )
 
-    def _external_video_status_callback(self, message: VideoStreamStatus) -> None:
-        manager = self._video_stream_manager
-        if manager is None or not isinstance(manager, _ExternalVideoProducerView):
-            return
-        try:
-            manager.observe_sender_status(video_status_from_message(message))
-        except Exception as exc:
-            self._last_error = f"invalid external video status: {exc}"
-            self.get_logger().error(self._last_error)
-
     def _cloud_status_callback(self, message: InferencePipelineStatus) -> None:
         if message.role != InferencePipelineStatus.ROLE_CLOUD:
             return
@@ -2937,9 +2817,11 @@ class PipelinePolicyNode(Node):
 
     def _check_heartbeat(self) -> None:
         session = self._require_edge_session()
-        # Startup only: _last_cloud_status_received_monotonic is set on the first
-        # cloud status and never cleared, so a cloud lost mid-run is reported by
-        # the "Cloud heartbeat expired" path instead.
+        # This warning covers one case only: no cloud status has arrived since this
+        # node started. _last_cloud_status_received_monotonic is set once, on the
+        # first cloud status (see _cloud_status_callback), and is never set back to
+        # None, so the warning does not return if the cloud is lost later in a run.
+        # That case is reported by the "Cloud heartbeat expired" warning below.
         if not session.ready and self._last_cloud_status_received_monotonic is None:
             elapsed = time.monotonic() - self._distributed_started_monotonic
             if elapsed >= _CLOUD_HANDSHAKE_WARNING_DELAY_S:
@@ -3177,7 +3059,9 @@ class PipelinePolicyNode(Node):
         return rclpy.action.CancelResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle: object):
-        if self._config.execution_mode == "distributed" and self._require_edge_session().cancellation_supported:
+        if getattr(self, "_inference_admission", None) is not None or (
+            self._config.execution_mode == "distributed" and self._require_edge_session().cancellation_supported
+        ):
             with self._goal_state_lock:
                 if id(goal_handle) in self._completed_goals:
                     return rclpy.action.CancelResponse.REJECT
@@ -3261,7 +3145,7 @@ class PipelinePolicyNode(Node):
                 self.get_logger().error(f"video stream shutdown failed: {exc}")
         manager = self._manager
         self._manager = None
-        if manager is not None:
+        if manager is not None and self._owns_manager:
             try:
                 manager.close()
             except Exception as exc:
@@ -3316,7 +3200,6 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
         "terminal_session_retention_ns": 1,
         "video_descriptor_topic": "/inference/policy/video/descriptors",
         "video_status_topic": "/inference/policy/video/status",
-        "external_video_producer": False,
     }
     # Preserve the existing reader's parameter declarations and event order.
     # Only the newly introduced staged options are conditional.
