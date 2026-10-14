@@ -63,6 +63,7 @@ from ibrobot_tracing import get_trace_emitter
 from robot_config.dispatch_strategies import (
     DispatchStrategyError,
     resolve_dispatch_strategies,
+    validate_n_action_steps,
 )
 
 trace = get_trace_emitter("ib_trace.dispatch", component_id="action_dispatcher")
@@ -135,7 +136,7 @@ class ScheduledActionDispatcherNode(Node):
         # strategies can hold cross-request state; per-tick code selects
         # instances, never types. The internal smoothing flag is derived from
         # the authoritative blending strategy.
-        self._chunk_planner = create_chunk_planner(self._chunking_strategy)
+        self._chunk_planner = create_chunk_planner(self._chunking_strategy, n_action_steps=self._n_action_steps)
         # Scheduled toggles retain the queue but discard the disabled smoother.
         # Each retained store therefore owns its own source and watermark.
         self._queue_plan = ActivePlan(capacity=self._queue_size, watermark=self._watermark, overflow="fail_closed")
@@ -234,6 +235,13 @@ class ScheduledActionDispatcherNode(Node):
             ("blending_strategy", "none"),
             ("executor_type", "topic"),
             ("scheduler_mode", "continuous"),
+            # Static execution-prefix length N for ``n_action_steps``
+            # chunking. Startup read-only (runtime writes are rejected by
+            # the parameter callback); the launch builder validates N
+            # against the policy metadata nominal_chunk_size — the node
+            # has no manifest access — and against queue_size, which is
+            # re-checked defensively in _load_parameters.
+            ("n_action_steps", 0),
         ):
             self.declare_parameter(name, default)
         for name in (
@@ -278,8 +286,26 @@ class ScheduledActionDispatcherNode(Node):
         self._default_request_timeout_ns = int(self.get_parameter("default_request_timeout_ns").value)
         if self._queue_size <= 0 or self._chunk_size <= 0:
             raise ValueError("queue_size and chunk_size must be positive")
-        if self._chunk_size > self._queue_size:
-            raise ValueError("chunk_size must not exceed queue_size")
+        _n_action_steps_raw = self.get_parameter("n_action_steps").value
+        if self._chunking_strategy == "n_action_steps":
+            if _n_action_steps_raw is None or _n_action_steps_raw == 0:
+                raise ValueError("chunking strategy 'n_action_steps' requires the n_action_steps parameter")
+            # Canonical shape validation (positive int, bool rejected).
+            self._n_action_steps = int(validate_n_action_steps(_n_action_steps_raw))
+            if self._n_action_steps > self._queue_size:
+                # Fail-closed queue admission would reject every N-step plan
+                # at runtime; fail fast at init instead. The launch builder
+                # already rejected this combination at launch-plan time.
+                raise ValueError(f"n_action_steps {self._n_action_steps} exceeds queue_size {self._queue_size}")
+            # chunk_size is not the queue admission size for this strategy
+            # (the N-step prefix is), so chunk_size > queue_size is legal;
+            # N=50, queue_size=50, chunk_size=100 must not fail here.
+        else:
+            if self._chunk_size > self._queue_size:
+                raise ValueError("chunk_size must not exceed queue_size")
+            # Other strategies ignore a stray N (full_chunk compatibility
+            # first); only the n_action_steps strategy consumes it.
+            self._n_action_steps = None
 
     def _load_contract_and_plan(self) -> None:
         from robot_config import load_robot_config
@@ -575,6 +601,11 @@ class ScheduledActionDispatcherNode(Node):
                     return SetParametersResult(successful=False, reason="Use ~/toggle_smoothing at runtime")
                 # Single-use object identity, not a flag that concurrent writes can inherit.
                 self._blending_update = None
+            if parameter.name == "n_action_steps":
+                # Startup read-only: the chunk planner snapshot is fixed at
+                # init, so a runtime write would leave ros2 param showing a
+                # new value the planner never consumes.
+                return SetParametersResult(successful=False, reason="n_action_steps is startup read-only")
         return SetParametersResult(successful=True)
 
     def _toggle_smoothing_cb(self, _request, response: Empty.Response) -> Empty.Response:

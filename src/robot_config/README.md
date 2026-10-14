@@ -733,7 +733,7 @@ robot:
         control_frequency: 20.0
       dispatch:
         scheduler: continuous   # continuous | wait_for_feedback，与 executor.type 存在配对约束
-        chunking: full_chunk    # 缺省 full_chunk
+        chunking: full_chunk    # full_chunk（缺省）| auto_horizon | n_action_steps
         blending: none          # none | temporal_ensemble，缺省 none；唯一融合开关
 ```
 
@@ -748,7 +748,8 @@ robot:
 |----------------------------|--------|-----------------|
 | `executor.type` | `topic` | `executor_type`，输出通道 |
 | `dispatch.scheduler` | `continuous` | `scheduler_mode`，逐 tick 调度；另支持 `wait_for_feedback` |
-| `dispatch.chunking` | `full_chunk` | `chunking_strategy`，支持 `full_chunk` / `auto_horizon` |
+| `dispatch.chunking` | `full_chunk` | `chunking_strategy`，支持 `full_chunk` / `auto_horizon` / `n_action_steps` |
+| `dispatch.n_action_steps` | 无 | 仅 `chunking: n_action_steps` 时必填；静态执行前缀长度 N（正整数，bool 拒绝） |
 | `dispatch.blending` | `none` | `blending_strategy`，另支持 `temporal_ensemble` |
 | `executor.watermark_threshold` | `20` | 剩余动作数的补货阈值，0 表示耗尽后补货；不改变 blending 选择 |
 | `executor.queue_size` | `100` | queue 容量，不限制 smoother 存储 |
@@ -761,9 +762,9 @@ robot:
 
 | 入口 | executor.type / dispatch.scheduler | dispatch.chunking | dispatch.blending / 存储 |
 |------|------------------------------------|-------------------|-------------------------|
-| legacy continuous | `topic` / `continuous` | `full_chunk` 或 `auto_horizon` | `none` queue 或已有 manager 透传；`temporal_ensemble` smoother |
-| legacy benchmark | `benchmark` / `wait_for_feedback` | 仅 `full_chunk`（`auto_horizon` 组合报错） | 同上，消费等待匹配反馈提交 |
-| scheduled | 仅 `topic` / `continuous` | `full_chunk` 或 `auto_horizon` | `none` queue；`temporal_ensemble` 独立 smoother |
+| legacy continuous | `topic` / `continuous` | `full_chunk`、`auto_horizon` 或 `n_action_steps` | `none` queue 或已有 manager 透传；`temporal_ensemble` smoother |
+| legacy benchmark | `benchmark` / `wait_for_feedback` | 仅 `full_chunk`（`auto_horizon`/`n_action_steps` 组合报错） | 同上，消费等待匹配反馈提交 |
+| scheduled | 仅 `topic` / `continuous` | `full_chunk`、`auto_horizon` 或 `n_action_steps` | `none` queue；`temporal_ensemble` 独立 smoother |
 
 - 策略字段缺失、null 或空字符串采用默认：executor 为 `topic`，scheduler 为
   `continuous`，chunking 为 `full_chunk`，blending 为 `none`。
@@ -788,6 +789,15 @@ robot:
   （见其 README）。RTC 配置名尚未开放，远端缓存确认和相对动作重锚定也未实现。
   runtime options 会参与 profile 兼容性指纹，开关变化需要重新标定。ensemble 没有精确
   单源坐标，本地 revision/接纳身份不能作为 RTC 远端确认。
+- `dispatch.chunking: n_action_steps` 是静态执行前缀截断：`dispatch.n_action_steps`
+  必填且只在该策略下消费（其他策略忽略残留值，不透传节点参数）。launch 期 fail-fast
+  校验 `N <= executor.queue_size`（有界队列会丢弃最老前缀，超限意味着执行的是最后
+  `queue_size` 步而不是前 N 步）以及 `N <=` 每个可路由 pipeline 的策略元数据
+  `nominal_chunk_size`（缺失即拒绝，不静默回退完整 chunk；scheduled 路径在 priority=0
+  时对主 pipeline 加 fallback 链整体校验）。运行时 chunk 短于 N 时截断为整个 chunk；
+  结果级 `execution_horizon` 被忽略，静态 N 是唯一 horizon 来源。节点参数
+  `n_action_steps` 为启动只读，运行时写入被参数回调拒绝。该策略下
+  `chunk_size > queue_size` 合法（N 步前缀才是队列准入大小）。
 
 耗尽后补货与异步提前补货的完整解释统一放在
 [推理补货与融合配置示例](../action_dispatch/README.md#推理补货与融合配置示例)

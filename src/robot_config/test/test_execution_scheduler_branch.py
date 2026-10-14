@@ -662,3 +662,189 @@ def test_launch_accepts_auto_horizon_for_topic_executor(tmp_path):
     nodes = _nodes(generate_execution_nodes(config, "model_inference"))
     dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
     assert _node_parameters(dispatcher)["chunking_strategy"] == "auto_horizon"
+
+
+# ---------------------------------------------------------------------------
+# n_action_steps launch-time resolution and fail-fast bounds.
+# ---------------------------------------------------------------------------
+
+
+def _bundle_with_chunk_size(root: Path, chunk_size: int) -> Path:
+    """ACT bundle whose config.json declares chunk_size (nominal_chunk_size)."""
+    bundle = _create_bundle(root)
+    config_path = bundle / "config.json"
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    value["chunk_size"] = chunk_size
+    config_path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+    return bundle
+
+
+def test_launch_rejects_benchmark_n_action_steps_combination(strategy_launch_config):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["executor"]["type"] = "benchmark"
+    mode["dispatch"] = {"scheduler": "wait_for_feedback", "chunking": "n_action_steps"}
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+def test_launch_requires_n_action_steps_value_when_chunking_selected(tmp_path):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {"chunking": "n_action_steps"}
+    with pytest.raises(InferenceConfigError, match="requires dispatch.n_action_steps"):
+        generate_execution_nodes(config, "model_inference")
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -2, 1.5, "3", [], {}])
+def test_launch_rejects_non_positive_int_n_action_steps(tmp_path, value):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": value,
+    }
+    with pytest.raises(InferenceConfigError, match="n_action_steps"):
+        generate_execution_nodes(config, "model_inference")
+
+
+def test_launch_rejects_n_above_nominal_chunk_size(tmp_path):
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=10)
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": 11,
+    }
+    with pytest.raises(InferenceConfigError, match="exceeds nominal chunk size 10"):
+        generate_execution_nodes(config, "model_inference")
+
+
+def test_launch_rejects_n_when_nominal_chunk_size_missing(tmp_path):
+    """ACT bundle without chunk_size: refuse to silently fall back to full-chunk."""
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": 5,
+    }
+    with pytest.raises(InferenceConfigError, match="nominal"):
+        generate_execution_nodes(config, "model_inference")
+
+
+def test_launch_rejects_n_above_queue_size(tmp_path):
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=100)
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": 51,
+    }
+    config["control_modes"]["model_inference"]["executor"]["queue_size"] = 50
+    with pytest.raises(InferenceConfigError, match="exceeds executor.queue_size 50"):
+        generate_execution_nodes(config, "model_inference")
+
+
+def test_launch_accepts_n_action_steps_and_passes_parameter(tmp_path):
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=100)
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": 50,
+    }
+    config["control_modes"]["model_inference"]["executor"]["queue_size"] = 50
+    config["control_modes"]["model_inference"]["executor"]["chunk_size"] = 100
+
+    nodes = _nodes(generate_execution_nodes(config, "model_inference"))
+    dispatcher = next(node for node in nodes if node.node_executable == "action_dispatcher_node")
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "n_action_steps"
+    assert params["n_action_steps"] == 50
+
+
+def test_launch_omits_n_action_steps_parameter_for_other_strategies(strategy_launch_config):
+    """A stray N under full_chunk is ignored, and the parameter stays absent."""
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["dispatch"] = {"chunking": "full_chunk", "n_action_steps": 7}
+    nodes = _nodes(generate_execution_nodes(strategy_launch_config, "model_inference"))
+    dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "full_chunk"
+    assert "n_action_steps" not in params
+
+
+def test_scheduled_launch_validates_n_against_fallback_chain(tmp_path):
+    """priority=0 fallback routing must never land on a smaller-chunk policy."""
+    bundle_primary = _bundle_with_chunk_size(tmp_path / "primary", chunk_size=100)
+    bundle_backup = _bundle_with_chunk_size(tmp_path / "backup", chunk_size=10)
+    profile = _profile_file(tmp_path)
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle_primary, profile)
+    mode = config["control_modes"]["model_inference"]
+    # priority=0 + fallback requires edf (or FIFO deadline admission).
+    mode["inference"]["scheduler"]["global_policy"] = "edf"
+    backup = {
+        **mode["inference"]["pipelines"]["policy"],
+        "model_path": str(bundle_backup),
+        "transport": {
+            key: value.replace("policy", "backup")
+            for key, value in mode["inference"]["pipelines"]["policy"]["transport"].items()
+        },
+    }
+    mode["inference"]["pipelines"]["backup"] = backup
+    mode["executor"]["inference_fallback_chain"] = ["backup"]
+    mode["executor"]["inference_priority"] = 0
+    mode["dispatch"] = {"chunking": "n_action_steps", "n_action_steps": 50}
+    mode["executor"]["queue_size"] = 100
+
+    with pytest.raises(InferenceConfigError, match="exceeds nominal chunk size 10 of pipeline 'backup'"):
+        generate_execution_nodes(config, "model_inference")
+
+
+def test_scheduled_launch_priority_nonzero_skips_fallback_validation(tmp_path):
+    """Non-zero priority dispatches the target pipeline directly; fallback is
+    not routable, so only the primary's nominal chunk size bounds N."""
+    bundle_primary = _bundle_with_chunk_size(tmp_path / "primary", chunk_size=100)
+    bundle_backup = _bundle_with_chunk_size(tmp_path / "backup", chunk_size=10)
+    profile = _profile_file(tmp_path)
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle_primary, profile)
+    mode = config["control_modes"]["model_inference"]
+    backup = {
+        **mode["inference"]["pipelines"]["policy"],
+        "model_path": str(bundle_backup),
+        "transport": {
+            key: value.replace("policy", "backup")
+            for key, value in mode["inference"]["pipelines"]["policy"]["transport"].items()
+        },
+    }
+    mode["inference"]["pipelines"]["backup"] = backup
+    mode["executor"]["inference_fallback_chain"] = ["backup"]
+    mode["executor"]["inference_priority"] = 3
+    mode["dispatch"] = {"chunking": "n_action_steps", "n_action_steps": 50}
+    mode["executor"]["queue_size"] = 100
+
+    nodes = _nodes(generate_execution_nodes(config, "model_inference"))
+    dispatcher = next(node for node in nodes if node.node_executable == "scheduled_action_dispatcher_node")
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "n_action_steps"
+    assert params["n_action_steps"] == 50
+
+
+def test_scheduled_launch_passes_n_action_steps_parameter(tmp_path):
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=100)
+    profile = _profile_file(tmp_path)
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, profile)
+    mode = config["control_modes"]["model_inference"]
+    mode["dispatch"] = {"chunking": "n_action_steps", "n_action_steps": 20}
+    mode["executor"]["queue_size"] = 100
+
+    nodes = _nodes(generate_execution_nodes(config, "model_inference"))
+    dispatcher = next(node for node in nodes if node.node_executable == "scheduled_action_dispatcher_node")
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "n_action_steps"
+    assert params["n_action_steps"] == 20
+
+
+def test_scheduled_launch_without_n_action_steps_omits_parameter(tmp_path):
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=100)
+    profile = _profile_file(tmp_path)
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, profile)
+    nodes = _nodes(generate_execution_nodes(config, "model_inference"))
+    dispatcher = next(node for node in nodes if node.node_executable == "scheduled_action_dispatcher_node")
+    assert "n_action_steps" not in _node_parameters(dispatcher)

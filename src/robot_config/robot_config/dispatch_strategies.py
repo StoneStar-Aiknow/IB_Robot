@@ -12,8 +12,9 @@ Strategy layers (see the action_dispatch package documentation):
 - ``scheduler`` — when inference may be requested and actions submitted
   (``continuous`` / ``wait_for_feedback``).
 - ``chunking``  — how an inference chunk enters the executable plan
-  (``full_chunk`` / ``auto_horizon``; ``auto_horizon`` requires the
-  ``topic`` executor and is rejected for benchmark episodes).
+  (``full_chunk`` / ``auto_horizon`` / ``n_action_steps``); the
+  prefix-truncation strategies (``auto_horizon``, ``n_action_steps``)
+  require the ``topic`` executor and are rejected for benchmark episodes.
 - ``blending``  — how candidates become one action per tick
   (``none`` / ``temporal_ensemble``).
 
@@ -26,11 +27,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 SUPPORTED_SCHEDULERS = ("continuous", "wait_for_feedback")
-SUPPORTED_CHUNKING_STRATEGIES = ("full_chunk", "auto_horizon")
+SUPPORTED_CHUNKING_STRATEGIES = ("full_chunk", "auto_horizon", "n_action_steps")
 SUPPORTED_BLENDING_STRATEGIES = ("none", "temporal_ensemble")
 
 DEFAULT_SCHEDULER = "continuous"
 DEFAULT_CHUNKING = "full_chunk"
+
+# Chunking strategies that truncate the executable plan to a prefix and
+# switch to consume-then-replan replenishment. They share the same
+# combination rules: topic executor only (benchmark episodes must execute
+# full chunks) and no result-level horizon interplay beyond their own
+# horizon source.
+_PREFIX_TRUNCATION_CHUNKING_STRATEGIES = ("auto_horizon", "n_action_steps")
 
 
 class DispatchStrategyError(ValueError):
@@ -85,14 +93,14 @@ def resolve_dispatch_strategies(
         )
     validate_executor_scheduler_pairing(executor, scheduler)
     chunking = _resolve_name(chunking, DEFAULT_CHUNKING, SUPPORTED_CHUNKING_STRATEGIES, "chunking strategy")
-    if chunking == "auto_horizon" and executor != "topic":
+    if chunking in _PREFIX_TRUNCATION_CHUNKING_STRATEGIES and executor != "topic":
         # Benchmark episodes measure full-chunk policies against recorded
         # action sequences; consuming a result-level prefix there would
         # silently change the evaluated trajectories. Reject the
         # combination in the shared SSOT instead of ignoring the field
         # per path.
         raise DispatchStrategyError(
-            f"chunking strategy 'auto_horizon' requires executor type 'topic' "
+            f"chunking strategy {chunking!r} requires executor type 'topic' "
             f"(benchmark executes full chunks); got executor_type={executor!r}"
         )
     blending = _resolve_name(blending, "none", SUPPORTED_BLENDING_STRATEGIES, "blending strategy")
@@ -143,6 +151,21 @@ def validate_chunking_strategy(chunking: str) -> None:
         )
 
 
+def validate_n_action_steps(value: object, *, label: str = "n_action_steps") -> int:
+    """Validate a static execution-prefix length N for ``n_action_steps`` chunking.
+
+    N is an exact positive int (bool rejected). The upper bound against the
+    policy's ``nominal_chunk_size`` and the executor queue capacity is
+    context-dependent (launch builder / node init), so callers validate it
+    separately; this helper only owns the value shape.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DispatchStrategyError(f"{label} must be an int (bool rejected); got {type(value).__name__}")
+    if value < 1:
+        raise DispatchStrategyError(f"{label} must be a positive int; got {value}")
+    return value
+
+
 def validate_blending_strategy(blending: str) -> None:
     """Exact-match validation of a blending strategy name (no aliases)."""
     if blending not in SUPPORTED_BLENDING_STRATEGIES:
@@ -181,4 +204,5 @@ __all__ = [
     "validate_chunking_strategy",
     "validate_dispatch_strategies",
     "validate_executor_scheduler_pairing",
+    "validate_n_action_steps",
 ]

@@ -114,6 +114,31 @@ def test_selected_interval_and_zero_watermark_drive_actual_ticks(monkeypatch, sm
     assert node._active_plan.snapshot() == before
 
 
+@pytest.mark.parametrize("smoothing", [False, True])
+def test_n_action_steps_prefix_consumption_then_rerequest(monkeypatch, smoothing):
+    """Legacy path with the static N=2 prefix: no prefetch, re-request on exhaust.
+
+    Only the first N actions of the chunk are planned; the control loop
+    consumes the prefix and re-requests inference once it is exhausted.
+    """
+    from action_dispatch.chunk_planning import create_chunk_planner
+
+    node = make_node(smoothing=smoothing)
+    node._chunk_planner = create_chunk_planner("n_action_steps", n_action_steps=2)
+    deliver(node, monkeypatch, {"action": np.arange(8).reshape(4, 2)})
+    snapshot = node._active_plan.snapshot()
+    assert (snapshot.remaining, snapshot.watermark) == (2, 0)
+    # Consume both prefix actions: no re-request while the prefix remains.
+    node._control_loop()
+    node._control_loop()
+    node._request_inference.assert_not_called()
+    np.testing.assert_array_equal([call.args[0] for call in node._executor.execute.call_args_list], [[0, 1], [2, 3]])
+    # The chunk had 4 actions; only the N=2 prefix was ever enqueued.
+    node._control_loop()
+    node._request_inference.assert_called_once()
+    assert node._active_plan.snapshot().remaining == 0
+
+
 def test_capacity_pause_resume_retains_position_and_watermark(monkeypatch):
     node = make_node()
     node._plan_length_at_inference_start = 5

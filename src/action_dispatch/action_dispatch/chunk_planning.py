@@ -19,6 +19,9 @@ import numpy as np
 from robot_config.dispatch_strategies import (
     SUPPORTED_CHUNKING_STRATEGIES as SUPPORTED_CHUNKING,
 )
+from robot_config.dispatch_strategies import (
+    validate_n_action_steps,
+)
 
 from .action_chunk import validate_execution_horizon
 
@@ -145,6 +148,32 @@ class FullChunkPlanner(ChunkPlanner):
         return "full_chunk"
 
 
+def _plan_prefix_truncation(
+    actions: np.ndarray,
+    *,
+    actions_executed: int,
+    horizon: int,
+) -> ChunkPlan:
+    """Shared prefix-truncation skeleton for both truncation strategies.
+
+    Truncates the executable plan to ``[skip, horizon)``, clamps the skip
+    to the horizon, and forces the plan-level replenishment watermark to 0
+    (consume-then-replan instead of watermark prefetching). The horizon
+    *source* is the strategy's own concern.
+    """
+    if actions.ndim != 2:
+        raise ValueError(f"actions must have rank 2, got shape {actions.shape}")
+    skipped = max(0, min(int(actions_executed), actions.shape[0]))
+    return validate_chunk_plan(
+        ChunkPlan(
+            actions=actions,
+            executed_during_inference=min(skipped, horizon),
+            execution_horizon=horizon,
+            replenishment_watermark=0,
+        )
+    )
+
+
 class AutoHorizonPlanner(ChunkPlanner):
     """Adaptive execution-horizon planning (AutoHorizon).
 
@@ -172,18 +201,11 @@ class AutoHorizonPlanner(ChunkPlanner):
     ) -> ChunkPlan:
         if actions.ndim != 2:
             raise ValueError(f"actions must have rank 2, got shape {actions.shape}")
-        skipped = max(0, min(int(actions_executed), actions.shape[0]))
         horizon = validate_execution_horizon(execution_horizon, actions.shape[0])
         if horizon is None:
+            skipped = max(0, min(int(actions_executed), actions.shape[0]))
             return validate_chunk_plan(ChunkPlan(actions=actions, executed_during_inference=skipped))
-        return validate_chunk_plan(
-            ChunkPlan(
-                actions=actions,
-                executed_during_inference=min(skipped, horizon),
-                execution_horizon=horizon,
-                replenishment_watermark=0,
-            )
-        )
+        return _plan_prefix_truncation(actions, actions_executed=actions_executed, horizon=horizon)
 
     def reset(self) -> None:
         return
@@ -193,12 +215,65 @@ class AutoHorizonPlanner(ChunkPlanner):
         return "auto_horizon"
 
 
-def create_chunk_planner(chunking: str) -> ChunkPlanner:
-    """Exact-name factory for chunk-planning strategies (no aliases)."""
+class NActionStepsPlanner(ChunkPlanner):
+    """Static execution-prefix truncation (``n_action_steps`` chunking).
+
+    Same prefix-truncation skeleton as :class:`AutoHorizonPlanner`
+    (:func:`_plan_prefix_truncation`); the horizon is a static positive
+    ``N`` from the robot YAML instead of the result-level
+    ``execution_horizon``, which is deliberately ignored. ``N`` bounds are
+    validated fail-fast at launch (nominal_chunk_size, queue_size); a
+    runtime chunk shorter than N is clamped to the whole chunk.
+    """
+
+    def __init__(self, n_action_steps: int):
+        # Canonical shape validation (positive int, bool rejected) is shared
+        # with the launch builders through the robot_config SSOT.
+        self._n_action_steps = validate_n_action_steps(n_action_steps)
+
+    @property
+    def n_action_steps(self) -> int:
+        return self._n_action_steps
+
+    def plan(
+        self,
+        actions: np.ndarray,
+        *,
+        actions_executed: int,
+        execution_horizon: int | None = None,
+    ) -> ChunkPlan:
+        # execution_horizon is intentionally ignored: the static N is the sole horizon source.
+        if actions.ndim != 2:
+            raise ValueError(f"actions must have rank 2, got shape {actions.shape}")
+        return _plan_prefix_truncation(
+            actions,
+            actions_executed=actions_executed,
+            horizon=min(self._n_action_steps, actions.shape[0]),
+        )
+
+    def reset(self) -> None:
+        return
+
+    @property
+    def chunking_strategy(self) -> str:
+        return "n_action_steps"
+
+
+def create_chunk_planner(chunking: str, *, n_action_steps: int | None = None) -> ChunkPlanner:
+    """Exact-name factory for chunk-planning strategies (no aliases).
+
+    ``n_action_steps`` is only meaningful for the ``n_action_steps``
+    strategy; other strategies ignore it so a stray value never changes
+    their behavior (full_chunk compatibility first).
+    """
     if chunking == "full_chunk":
         return FullChunkPlanner()
     if chunking == "auto_horizon":
         return AutoHorizonPlanner()
+    if chunking == "n_action_steps":
+        if n_action_steps is None:
+            raise ValueError("chunking strategy 'n_action_steps' requires the n_action_steps value")
+        return NActionStepsPlanner(n_action_steps)
     raise ValueError(f"unknown chunking strategy {chunking!r}; expected one of {SUPPORTED_CHUNKING}")
 
 
@@ -207,6 +282,7 @@ __all__ = [
     "ChunkPlan",
     "ChunkPlanner",
     "FullChunkPlanner",
+    "NActionStepsPlanner",
     "SUPPORTED_CHUNKING",
     "create_chunk_planner",
     "validate_chunk_plan",

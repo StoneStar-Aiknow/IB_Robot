@@ -154,9 +154,9 @@ feedback commits once. It does not use continuous direct consumption.
 | Legacy benchmark | `benchmark` / `wait_for_feedback` | same queue/manager choices | same queue clipping; revision-bound reservation and feedback commit |
 | Scheduled | `topic` / `continuous` only | queue with `none`; separate smoother with `temporal_ensemble` | queue overflow rejects, safe-stops and closes; direct logical consumption |
 
-The `auto_horizon` chunking strategy is available only with the `topic` executor;
-`benchmark` + `auto_horizon` is rejected by the SSOT (benchmark episodes execute
-full chunks).
+The `auto_horizon` / `n_action_steps` chunking strategies are available only with the
+`topic` executor; benchmark combinations with either are rejected by the SSOT
+(benchmark episodes execute full chunks).
 
 Smoother storage does not inherit deque capacity limits. Legacy toggles retain an
 existing manager and its plan; a node without a manager cannot enable one via the
@@ -174,7 +174,7 @@ scheduled stop/safe-stop/close/restart clear both stores, including inactive met
 | queue clipping, accepted source interval, revision and watermark | active-plan owner (path-selected overflow policy) |
 | capacity overflow as failure (`ValueError` -> safe-stop + session close), `(session_id, generation, request_id)` result dedup | scheduled path |
 | session state machine (WAITING_READY/.../FAILED) and retries | scheduled path (not moved into `DispatchScheduler`) |
-| watermark replenishment rule | shared (`schedulers.continuous.should_replenish_plan`; the configured watermark by default, or the plan-level threshold carried by an auto_horizon plan) |
+| watermark replenishment rule | shared (`schedulers.continuous.should_replenish_plan`; the configured watermark by default, or the plan-level threshold carried by an auto_horizon/n_action_steps plan) |
 
 ### Extension points
 
@@ -186,6 +186,11 @@ scheduled stop/safe-stop/close/restart clear both stores, including inactive met
   configured default; zero means replenish when empty. Both stores apply the interval once.
   Runtime options participate in the profile-compatibility identity (see the inference_service
   README). The benchmark combination is rejected by the SSOT.
+- **n_action_steps (supported)**: static execution-prefix truncation reuses the same
+  prefix-truncation skeleton as auto_horizon (`_plan_prefix_truncation`: truncate to
+  `[skip, N)` and force the plan-level replenishment watermark to 0); the horizon source
+  becomes the static `dispatch.n_action_steps` from robot YAML. The result-level
+  `execution_horizon` is deliberately ignored. See "n_action_steps static prefix" below.
 - **RTC (planned extension, strategy name not yet open)**: `PlanSource` records request and applicable generation/session IDs.
   Direct single-source `PlanSnapshot.next_position` includes skipped/clipped prefixes.
   Revision only invalidates local reservations. Ensemble has no exact single-source coordinate;
@@ -232,7 +237,7 @@ control_modes:
       type: topic                 # topic | benchmark
     dispatch:
       scheduler: continuous       # continuous | wait_for_feedback
-      chunking: full_chunk        # full_chunk (default) | auto_horizon
+      chunking: full_chunk        # full_chunk (default) | auto_horizon | n_action_steps
       blending: none              # none | temporal_ensemble
 ```
 
@@ -240,10 +245,16 @@ control_modes:
   Scheduled accepts only `topic`+`continuous`; explicit unsupported selections
   are rejected, not discarded. The historical executor `action` alias is mapped
   to `topic` only at the robot_config launch boundary, not direct node startup.
-- `dispatch.chunking: auto_horizon` requires the `topic` executor; the
-  `benchmark`+`auto_horizon` combination is rejected by the shared SSOT
+- `dispatch.chunking: auto_horizon` / `n_action_steps` requires the `topic`
+  executor; benchmark combinations with either are rejected by the shared SSOT
   (benchmark episodes execute full chunks), both at launch time and at node
   init.
+- `dispatch.chunking: n_action_steps` additionally requires a positive-int
+  `dispatch.n_action_steps` in the same block (bools rejected); the value is
+  consumed only by the `n_action_steps` strategy — other strategies ignore a
+  stray N and never forward the node parameter. Launch-time fail-fast bounds:
+  `N <= executor.queue_size` and `N <=` the `nominal_chunk_size` of every
+  routable pipeline (see "n_action_steps static prefix" below).
 - **Breaking interface change:** `temporal_smoothing_enabled` is removed, with
   no alias or compatibility path. Old robot YAML and direct ROS overrides
   (constructor, CLI or parameter file) are rejected even when consistent.
@@ -344,6 +355,68 @@ instance) still fall back to `execution_horizon=0`, i.e. the full chunk. Option 
 identity coupling and the distributed cloud-side configuration location are documented
 in the [inference_service README](../inference_service/README.md).
 
+### n_action_steps static prefix (`chunking: n_action_steps`)
+
+`NActionStepsPlanner` shares the prefix-truncation skeleton with `AutoHorizonPlanner`:
+the executable plan is truncated to `[skip, N)` and the plan-level replenishment
+watermark is forced to 0 (re-request inference once the prefix is consumed, no
+watermark prefetching). The only difference is the horizon source: auto_horizon
+consumes the result-level `execution_horizon`, while n_action_steps uses the static
+`dispatch.n_action_steps` from robot YAML; the result-level horizon is deliberately
+ignored.
+
+Enabling example (merge into an existing robot YAML's `control_modes.model_inference`):
+
+```yaml
+executor:
+  type: topic
+  inference_pipeline: policy
+  queue_size: 50            # N <= queue_size, enforced at launch time
+  chunk_size: 100           # smoother weight-table size; may exceed queue_size under this strategy
+dispatch:
+  scheduler: continuous
+  chunking: n_action_steps
+  n_action_steps: 50        # static execution prefix N, consumed only by this strategy
+  blending: none
+```
+
+Naming isolation: the model bundle `config.json`'s **`n_action_steps`** is still only
+used for the LeRobot `select_action` queue semantics and has **no interop or copying**
+with the robot YAML `dispatch.n_action_steps`; the two same-named fields belong to
+their own SSOTs.
+
+- Value shape and bounds: `dispatch.n_action_steps` must be a positive int (bools
+  rejected); `0`, negative numbers, floats, strings and lists raise
+  `InferenceConfigError` at launch time. Selecting the strategy without the value is
+  an error, not a fallback to another strategy.
+- Launch-time fail-fast upper bounds:
+  - `N <= executor.queue_size`: the legacy bounded queue drops the *oldest* prefix on
+    overflow, so an oversized N would execute the last `queue_size` steps instead of
+    the first N; the scheduled fail-closed queue would reject every N-step plan at
+    runtime. Both are rejected at launch-plan time.
+  - `N <=` the policy metadata `nominal_chunk_size` of every routable pipeline
+    (missing metadata is rejected instead of silently falling back to full-chunk
+    execution). Legacy validates its single selected pipeline; scheduled validates
+    the primary plus, at priority 0, the whole fallback chain (routing must never
+    land on a smaller-chunk policy); non-zero priority validates the primary only.
+- The node parameter `n_action_steps` is startup read-only: the planner snapshot is
+  fixed at init, and runtime writes are rejected by the parameter callback
+  (`ros2 param set` fails), preventing the parameter from showing a value the
+  planner never consumes.
+- Replenishment is driven purely by prefix consumption: `executor.watermark_threshold`
+  is ignored (the plan-level threshold is forced to 0); no watermark prefetching.
+- A runtime chunk shorter than N is clamped to the whole chunk; steps consumed during
+  inference are skipped from the prefix start as usual, and a fully expired prefix
+  reuses the same empty-interval normalization as auto_horizon: `[H, H)` where
+  `H = min(N, len(chunk))` (not a constant `[N, N)`; H shrinks with short chunks).
+- Under this strategy `chunk_size > queue_size` is legal: the N-step prefix, not
+  chunk_size, is the queue admission size (`N=50, queue_size=50, chunk_size=100` is
+  valid; chunk_size is only the smoother weight-table size). The scheduled node's
+  init still rejects `chunk_size > queue_size` under the other strategies; the
+  legacy node has no such check (chunk_size is only the weight-table size).
+- Other strategies ignore a stray `dispatch.n_action_steps` (full_chunk compatibility
+  first), and the launch builder never forwards the node parameter for them.
+
 ### Parameters
 
 These are standalone node defaults. robot_config launch overrides runtime parameters from
@@ -354,7 +427,8 @@ apply to scheduled; see the [scheduler control plane](../robot_config/README.md#
 |-----------|------|---------|-------------|
 | `executor_type` | string | `topic` | Output channel; pairing constraints above |
 | `scheduler_mode` | string | `continuous` | Per-tick scheduling, not the inference product-entrypoint switch |
-| `chunking_strategy` | string | `''` | Empty resolves to `full_chunk` |
+| `chunking_strategy` | string | `''` | Empty resolves to `full_chunk`; also `auto_horizon`, `n_action_steps` |
+| `n_action_steps` | int | 0 | Required only by `chunking: n_action_steps`; static prefix N, startup read-only |
 | `blending_strategy` | string | `none` | `none` or `temporal_ensemble` |
 | `queue_size` | int | 100 | Maximum queue length; does not limit smoother storage |
 | `watermark_threshold` | int | 20 | Replenish when remaining is at or below this value; not a fixed execution interval |

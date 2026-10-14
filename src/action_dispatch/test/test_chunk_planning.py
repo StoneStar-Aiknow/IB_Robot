@@ -9,9 +9,11 @@ from action_dispatch.chunk_planning import (
     AutoHorizonPlanner,
     ChunkPlan,
     FullChunkPlanner,
+    NActionStepsPlanner,
     create_chunk_planner,
     validate_chunk_plan,
 )
+from robot_config.dispatch_strategies import DispatchStrategyError
 
 
 def _chunk(steps: int):
@@ -202,3 +204,100 @@ def test_fail_closed_owner_counts_horizon_prefix_against_capacity():
 
     assert snapshot.remaining == 3
     assert np.array_equal(np.asarray(owner._queue), _chunk(6)[:3])
+
+
+# ---------------------------------------------------------------------------
+# n_action_steps: static execution-prefix truncation.
+# ---------------------------------------------------------------------------
+
+
+def test_n_action_steps_planner_truncates_to_static_prefix():
+    plan = NActionStepsPlanner(3).plan(_chunk(10), actions_executed=0)
+
+    assert plan.execution_horizon == 3
+    assert np.array_equal(plan.executable_actions, _chunk(10)[:3])
+    # Consume-then-replan: watermark forced to 0 regardless of configuration.
+    assert plan.replenishment_watermark == 0
+
+
+def test_n_action_steps_planner_clamps_short_chunk_to_whole_chunk():
+    plan = NActionStepsPlanner(8).plan(_chunk(3), actions_executed=0)
+
+    assert plan.execution_horizon == 3
+    assert np.array_equal(plan.executable_actions, _chunk(3))
+    assert plan.replenishment_watermark == 0
+
+
+def test_n_action_steps_planner_skips_prefix_executed_during_inference():
+    plan = NActionStepsPlanner(5).plan(_chunk(10), actions_executed=2)
+
+    assert plan.executed_during_inference == 2
+    assert np.array_equal(plan.executable_actions, _chunk(10)[2:5])
+
+
+def test_n_action_steps_planner_expired_prefix_normalizes_to_empty_plan():
+    """S >= N after prefetch is the same legal [N, N) normalization as auto_horizon."""
+    plan = NActionStepsPlanner(3).plan(_chunk(5), actions_executed=5)
+
+    assert plan.start == plan.stop == 3
+    assert plan.executable_actions.shape[0] == 0
+    assert plan.replenishment_watermark == 0
+
+
+def test_n_action_steps_planner_ignores_result_level_execution_horizon():
+    plan = NActionStepsPlanner(2).plan(_chunk(6), actions_executed=0, execution_horizon=4)
+
+    # The static N is the sole horizon source; a reported horizon is legal but ignored.
+    assert plan.execution_horizon == 2
+    assert np.array_equal(plan.executable_actions, _chunk(6)[:2])
+
+
+def test_n_action_steps_planner_rejects_wrong_rank_before_shape_access():
+    with pytest.raises(ValueError, match="rank 2"):
+        NActionStepsPlanner(3).plan(np.zeros(6, dtype=np.float32), actions_executed=0)
+
+
+def test_n_action_steps_planner_reports_strategy_name():
+    assert NActionStepsPlanner(1).chunking_strategy == "n_action_steps"
+    assert NActionStepsPlanner(7).n_action_steps == 7
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.0, "3", None])
+def test_n_action_steps_planner_rejects_non_positive_int_shapes(value):
+    with pytest.raises(DispatchStrategyError):
+        NActionStepsPlanner(value)
+
+
+def test_create_chunk_planner_builds_n_action_steps_with_value():
+    planner = create_chunk_planner("n_action_steps", n_action_steps=4)
+    assert isinstance(planner, NActionStepsPlanner)
+    assert planner.n_action_steps == 4
+
+
+def test_create_chunk_planner_requires_value_for_n_action_steps():
+    with pytest.raises(ValueError, match="requires the n_action_steps value"):
+        create_chunk_planner("n_action_steps")
+
+
+@pytest.mark.parametrize("strategy", ["full_chunk", "auto_horizon"])
+def test_create_chunk_planner_ignores_stray_n_for_other_strategies(strategy):
+    """full_chunk compatibility first: a stray N never changes other strategies."""
+    planner = create_chunk_planner(strategy, n_action_steps=3)
+    assert planner.chunking_strategy == strategy
+    plan = planner.plan(_chunk(6), actions_executed=0, execution_horizon=2)
+    if strategy == "full_chunk":
+        assert plan.execution_horizon is None
+    else:
+        assert plan.execution_horizon == 2
+
+
+def test_n_action_steps_prefix_counts_against_fail_closed_capacity():
+    from action_dispatch.active_plan import ActivePlan, PlanSource
+
+    plan = NActionStepsPlanner(3).plan(_chunk(10), actions_executed=0)
+    owner = ActivePlan(capacity=4, watermark=2, overflow="fail_closed")
+    snapshot = owner.accept(plan, PlanSource("request"))
+
+    # Only the N-step prefix enters the queue, so N <= queue_size is the bound.
+    assert snapshot.remaining == 3
+    assert np.array_equal(np.asarray(owner._queue), _chunk(10)[:3])

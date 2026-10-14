@@ -34,7 +34,7 @@ from ibrobot_msgs.action import DispatchInfer, RunPolicy
 from ibrobot_msgs.srv import PreparePolicyEpisode
 from ibrobot_tracing import get_trace_emitter
 from robot_config.contract_utils import iter_specs
-from robot_config.dispatch_strategies import resolve_dispatch_strategies
+from robot_config.dispatch_strategies import resolve_dispatch_strategies, validate_n_action_steps
 from tensormsg.converter import TensorMsgConverter
 
 from .action_chunk import normalize_action_chunk, validate_execution_horizon
@@ -188,6 +188,12 @@ class ActionDispatcherNode(Node):
         # launch builders. Standalone fusion defaults to none.
         self.declare_parameter("chunking_strategy", "")
         self.declare_parameter("blending_strategy", "none")
+        # Static execution-prefix length N for ``n_action_steps`` chunking.
+        # Startup read-only (runtime writes are rejected by the parameter
+        # callback); the launch builder validates N against the policy
+        # metadata nominal_chunk_size — the node has no manifest access —
+        # and against queue_size, which is re-checked defensively here.
+        self.declare_parameter("n_action_steps", 0)
         self._blending_update = None
         self.add_on_set_parameters_callback(self._validate_blending_update)
         # Execution timeout for ``wait_for_feedback`` mode only. Monotonic
@@ -299,7 +305,24 @@ class ActionDispatcherNode(Node):
         # scheduler/executor registry wiring) so stateful follow-up
         # strategies can hold cross-request state; per-tick code selects
         # instances, never types.
-        self._chunk_planner = create_chunk_planner(self._chunking_strategy)
+        _n_action_steps_raw = self.get_parameter("n_action_steps").value
+        if self._chunking_strategy == "n_action_steps":
+            if _n_action_steps_raw is None or _n_action_steps_raw == 0:
+                raise ValueError("chunking strategy 'n_action_steps' requires the n_action_steps parameter")
+            # Canonical shape validation (positive int, bool rejected).
+            self._n_action_steps = int(validate_n_action_steps(_n_action_steps_raw))
+            if self._n_action_steps > self._queue_limit:
+                # The bounded queue drops the oldest prefix steps when a plan
+                # exceeds capacity, so an oversized N would execute the last
+                # queue_size steps instead of the first N. Fail fast here;
+                # the launch builder already rejected this combination.
+                raise ValueError(f"n_action_steps {self._n_action_steps} exceeds queue_size {self._queue_limit}")
+            self._chunk_planner = create_chunk_planner(self._chunking_strategy, n_action_steps=self._n_action_steps)
+        else:
+            # Other strategies ignore a stray N (full_chunk compatibility
+            # first); only the n_action_steps strategy consumes it.
+            self._n_action_steps = None
+            self._chunk_planner = create_chunk_planner(self._chunking_strategy)
         self._active_plan = ActivePlan(capacity=self._queue_limit, watermark=self._watermark, smoother=self._smoother)
         # create_executor raises ExecutorNotFoundError for unknown types; letting
         # it propagate fail-fasts the node at init without falling back.
@@ -1393,6 +1416,11 @@ class ActionDispatcherNode(Node):
                     return SetParametersResult(successful=False, reason="Use ~/toggle_smoothing at runtime")
                 # Single-use object identity, not a flag that concurrent writes can inherit.
                 self._blending_update = None
+            if parameter.name == "n_action_steps":
+                # Startup read-only: the chunk planner snapshot is fixed at
+                # init, so a runtime write would leave ros2 param showing a
+                # new value the planner never consumes.
+                return SetParametersResult(successful=False, reason="n_action_steps is startup read-only")
         return SetParametersResult(successful=True)
 
     @_dispatch_locked

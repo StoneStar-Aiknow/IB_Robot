@@ -12,9 +12,11 @@ from robot_config.benchmark_endpoints import (
     resolve_benchmark_parallel,
 )
 from robot_config.dispatch_strategies import (
+    DispatchStrategyError,
     reject_legacy_smoothing_config,
     resolve_dispatch_strategies,
     validate_executor_scheduler_pairing,
+    validate_n_action_steps,
 )
 from robot_config.inference_config import (
     ControlModeInferenceConfig,
@@ -394,6 +396,96 @@ def _resolve_dispatch_strategies(
     return selection.chunking, selection.blending
 
 
+def _resolve_n_action_steps(mode_config: dict, chunking: str) -> int | None:
+    """Resolve ``dispatch.n_action_steps`` for the resolved chunking strategy.
+
+    The value is only consumed by the ``n_action_steps`` strategy. For every
+    other strategy an explicitly configured value is ignored on purpose:
+    ``full_chunk``/``auto_horizon`` compatibility comes first, and the
+    queue-capacity guard below must not silently reinterpret a stray N.
+    """
+    if chunking != "n_action_steps":
+        return None
+    dispatch = mode_config.get("dispatch", {}) or {}
+    raw = dispatch.get("n_action_steps")
+    if raw is None or (isinstance(raw, str) and not raw):
+        raise InferenceConfigError(
+            "dispatch.chunking 'n_action_steps' requires dispatch.n_action_steps to be set to a positive int"
+        )
+    try:
+        return validate_n_action_steps(raw, label="dispatch.n_action_steps")
+    except DispatchStrategyError as exc:
+        raise InferenceConfigError(str(exc)) from exc
+
+
+def _validate_n_action_steps_bounds(
+    n_action_steps: int,
+    *,
+    queue_size: int,
+    candidate_pipelines: list[str],
+    inference: ControlModeInferenceConfig,
+) -> None:
+    """Fail-fast bound checks for the static execution prefix N.
+
+    Upper bounds:
+
+    - ``N <= executor.queue_size``: the legacy bounded queue drops the
+      *oldest* prefix when a plan exceeds capacity, so an oversized N would
+      execute the last ``queue_size`` steps instead of the first N — the
+      scheduled fail-closed path would only explode at runtime. Reject at
+      launch-plan time instead.
+    - ``N <= nominal_chunk_size`` of every routable policy pipeline: the
+      prefix is executed from the policy's own predicted chunk, so a
+      larger N is a configuration error. The launch-time manifest
+      metadata is the only existing chain that carries
+      ``nominal_chunk_size`` (the global Open response selects no
+      pipeline); candidate pipelines are validated for the whole routable
+      set (primary + fallback chain) so runtime routing can never land on
+      a smaller-chunk policy.
+    """
+    if queue_size < 1:
+        raise InferenceConfigError(f"executor.queue_size must be positive; got {queue_size}")
+    if n_action_steps > queue_size:
+        raise InferenceConfigError(
+            f"dispatch.n_action_steps {n_action_steps} exceeds executor.queue_size {queue_size}: "
+            "the bounded dispatcher queue would drop the oldest prefix steps instead of "
+            "executing the first N steps"
+        )
+    for pipeline_id in candidate_pipelines:
+        pipeline = inference.pipelines[pipeline_id]
+        policy = pipeline.validated_manifest.policy
+        nominal = getattr(policy, "nominal_chunk_size", None)
+        if nominal is None:
+            raise InferenceConfigError(
+                f"dispatch.n_action_steps requires pipeline {pipeline_id!r} to declare a nominal "
+                "chunk size (policy metadata nominal_chunk_size is missing); refusing to "
+                "silently fall back to full-chunk execution"
+            )
+        if n_action_steps > nominal:
+            raise InferenceConfigError(
+                f"dispatch.n_action_steps {n_action_steps} exceeds nominal chunk size {nominal} "
+                f"of pipeline {pipeline_id!r}"
+            )
+
+
+def _routable_pipeline_candidates(inference: ControlModeInferenceConfig) -> list[str]:
+    """Pipelines the scheduled dispatcher can route a request to.
+
+    The scheduled dispatcher has no per-request override entry: every
+    request carries the startup ``inference_pipeline`` target, and the
+    fallback chain is attached only for priority 0 (non-zero priority
+    dispatches the target pipeline directly), so the launch-time candidate
+    set is the primary plus — for priority 0 — the fallback chain. The
+    legacy path routes to its single selected pipeline only.
+    """
+    primary = inference.inference_pipeline
+    if primary is None:
+        return []
+    if inference.inference_priority == 0:
+        return [primary, *list(inference.inference_fallback_chain)]
+    return [primary]
+
+
 def _resolve_benchmark_step_service(robot_config: dict) -> str:
     """Resolve the benchmark step service endpoint through the benchmark endpoint resolver.
 
@@ -575,6 +667,18 @@ def generate_action_dispatcher_node(
     executor_type, scheduler_mode = selection.executor_type, selection.scheduler_mode
     _validate_executor_no_routing_keys(executor_config)
     chunking, blending = selection.chunking, selection.blending
+    # Static execution-prefix truncation: resolve N from the same dispatch
+    # section and fail fast on queue-capacity / nominal-chunk-size bounds
+    # before the dispatcher node is spawned. Non-n_action_steps strategies
+    # ignore a stray N (full_chunk compatibility first).
+    n_action_steps = _resolve_n_action_steps(mode_config, chunking)
+    if n_action_steps is not None:
+        _validate_n_action_steps_bounds(
+            n_action_steps,
+            queue_size=int(executor_config.get("queue_size", 100)),
+            candidate_pipelines=[pipeline.pipeline_id],
+            inference=inference,
+        )
 
     # production benchmark wiring: only benchmark executor resolves a step service endpoint. For
     # all other executors the parameter must be empty string. The customer
@@ -639,6 +743,11 @@ def generate_action_dispatcher_node(
         # StepBenchmark, while the native path publishes action topics.
         "executor_mode": executor_config.get("mode", control_mode),
     }
+    if n_action_steps is not None:
+        # Startup read-only parameter: the planner snapshot is fixed at init;
+        # an undeclared parameter would let ros2 param show a new value the
+        # planner never consumes.
+        dispatcher_parameters["n_action_steps"] = n_action_steps
     if executor_type == "benchmark":
         # Benchmark actions leave through StepBenchmark; native action-topic
         # parameters are intentionally not supplied in this mode.
@@ -1043,6 +1152,18 @@ def generate_scheduled_action_dispatcher_node(
         entrypoint="scheduled",
     )
     chunking, blending = selection.chunking, selection.blending
+    # Static execution-prefix truncation: the scheduled dispatcher routes
+    # every request to the startup primary/fallback candidates, so validate
+    # N against the whole routable set (primary + fallback chain) as well
+    # as the queue capacity, fail-fast at launch-plan time.
+    n_action_steps = _resolve_n_action_steps(mode_config, chunking)
+    if n_action_steps is not None:
+        _validate_n_action_steps_bounds(
+            n_action_steps,
+            queue_size=int(executor_config.get("queue_size", 100)),
+            candidate_pipelines=_routable_pipeline_candidates(inference),
+            inference=inference,
+        )
     return Node(
         package="action_dispatch",
         executable="scheduled_action_dispatcher_node",
@@ -1077,6 +1198,9 @@ def generate_scheduled_action_dispatcher_node(
                 # navigation_mode=false opens on READY; true waits in STOPPED.
                 "navigation_mode": executor_config.get("navigation_mode", False),
                 "use_sim_time": use_sim_time,
+                # Startup read-only parameter: the planner snapshot is fixed
+                # at init (see the legacy dispatcher note).
+                **({"n_action_steps": n_action_steps} if n_action_steps is not None else {}),
             }
         ],
         output="screen",

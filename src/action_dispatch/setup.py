@@ -22,4 +22,5 @@ setup(
             "scheduled_action_dispatcher_node = action_dispatch.scheduled_action_dispatcher_node:main",
         ],
     },
+    extras_require={"test": ["pytest"]},
 )

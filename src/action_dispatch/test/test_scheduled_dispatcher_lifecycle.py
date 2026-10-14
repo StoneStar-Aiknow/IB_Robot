@@ -294,6 +294,54 @@ def test_enqueue_chunk_full_chunk_strategy_ignores_execution_horizon():
     )
 
 
+@pytest.mark.parametrize("smoothing", [False, True])
+def test_n_action_steps_strategy_consumes_prefix_then_rerequests(monkeypatch, smoothing):
+    """N-step prefix: static truncation, consume-then-replan, no prefetch.
+
+    The result-level execution_horizon must not leak into the plan; the
+    static N is the sole horizon source. While the N-step prefix remains,
+    the control loop neither prefetches (watermark forced to 0) nor runs
+    past N; after exhausting the prefix the next tick re-requests.
+    """
+    node = _plan_node(smoothing=smoothing)
+    node._chunk_planner = create_chunk_planner("n_action_steps", n_action_steps=2)
+    node._plan_length_at_inference_start = 0
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+
+    result = _result(node, np.arange(8).reshape(4, 2))
+    result.execution_horizon = 3  # ignored: static N=2 is the sole horizon source
+
+    node._on_dispatch_result(result)
+
+    snapshot = node._active_plan.snapshot()
+    assert (snapshot.remaining, snapshot.watermark) == (2, 0)
+    node._request_dispatch = Mock()
+    # Consume the two prefix actions: no re-request until the prefix empties.
+    node._control_loop()
+    node._control_loop()
+    node._request_dispatch.assert_not_called()
+    assert [call.args[0].tolist() for call in node._executor.execute.call_args_list] == [[0, 1], [2, 3]]
+    # The chunk had 4 actions but only the N=2 prefix was ever enqueued.
+    node._control_loop()
+    node._request_dispatch.assert_called_once()
+    assert node._active_plan.snapshot().remaining == 0
+
+
+def test_n_action_steps_strategy_skips_actions_executed_during_inference():
+    """A replacement prefix starts after the steps consumed while inferring."""
+    node = _plan_node()
+    node._chunk_planner = create_chunk_planner("n_action_steps", n_action_steps=3)
+    node._plan_length_at_inference_start = 2
+
+    node._on_dispatch_result(_result(node, np.arange(12).reshape(6, 2)))
+
+    snapshot = node._active_plan.snapshot()
+    assert (snapshot.remaining, snapshot.watermark) == (1, 0)
+    assert snapshot.next_position == 2
+    assert [node._active_plan.take_action().action.tolist() for _ in range(1)] == [[4, 5]]
+
+
 def test_enqueue_chunk_accepts_expired_horizon_as_empty_plan():
     """A fully expired prefix (S > H) is accepted, not treated as invalid.
 

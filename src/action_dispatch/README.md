@@ -144,8 +144,8 @@ action_dispatch 的职责划分为六个边界，legacy
 | Legacy benchmark | `benchmark` / `wait_for_feedback` | 同上 | 同样的 queue 裁剪；带 revision 的 reservation 和反馈提交 |
 | Scheduled | 仅 `topic` / `continuous` | `none` 使用 queue；`temporal_ensemble` 使用独立 smoother | queue 超容拒绝并 safe-stop/close；逻辑直接消费 |
 
-`auto_horizon` chunking 仅在 `topic` executor 下可用；`benchmark + auto_horizon` 由 SSOT
-拒绝（benchmark episode 执行完整 chunk）。
+`auto_horizon` / `n_action_steps` chunking 仅在 `topic` executor 下可用；benchmark 与
+两者的组合由 SSOT 拒绝（benchmark episode 执行完整 chunk）。
 
 smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及计划；没有 manager
 的节点不能通过 toggle 创建它。scheduled toggle 保留非活动 queue 及其元数据，关闭
@@ -161,7 +161,7 @@ smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及�
 | queue 裁剪、已接纳来源区间、revision 和水位线 | active-plan owner（由产品选择超容策略） |
 | 超容即失败（`ValueError` → safe-stop + session close）、`(session_id, generation, request_id)` 结果去重 | scheduled 路径 |
 | session 状态机（WAITING_READY/…/FAILED）与重试 | scheduled 路径（不迁入 `DispatchScheduler`） |
-| 水位线补货规则 | 共享（`schedulers.continuous.should_replenish_plan`；默认用配置水位线，auto_horizon 计划携带自己的补货阈值） |
+| 水位线补货规则 | 共享（`schedulers.continuous.should_replenish_plan`；默认用配置水位线，auto_horizon/n_action_steps 计划携带自己的补货阈值） |
 
 ### 扩展点
 
@@ -172,6 +172,10 @@ smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及�
   `replenishment_watermark=None` 使用配置默认，0 表示耗尽才补货；两种存储只应用一次区间。
   runtime options 参与 profile 兼容性身份（见 inference_service README）。`benchmark`
   组合由 SSOT 拒绝。
+- **n_action_steps（已支持）**：静态执行前缀截断复用与 auto_horizon 相同的
+  prefix-truncation 骨架（`_plan_prefix_truncation`：截断为 `[skip, N)`、计划级补货阈值
+  强制 0），horizon 来源换成 robot YAML 的静态 `dispatch.n_action_steps`。结果级
+  `execution_horizon` 被有意忽略。详见「n_action_steps 静态前缀」。
 - **RTC（规划中的扩展点，配置名未开放）**：`PlanSource` 记录 request 及适用的 generation/session 身份；直接单源计划的
   `PlanSnapshot.next_position` 包括 skip 和容量丢弃前缀。revision 只用于本地 reservation 失效。
   ensemble 没有精确单源坐标，最近来源仅用于诊断；本地接纳/topic 进度不是物理完成或远端缓存确认。
@@ -214,15 +218,20 @@ control_modes:
       type: topic                 # topic | benchmark
     dispatch:
       scheduler: continuous       # continuous | wait_for_feedback
-      chunking: full_chunk        # full_chunk（默认）| auto_horizon
+      chunking: full_chunk        # full_chunk（默认）| auto_horizon | n_action_steps
       blending: none              # none | temporal_ensemble
 ```
 
 - legacy 合法配对：`topic`+`continuous`、`benchmark`+`wait_for_feedback`。
   scheduled 仅支持 `topic`+`continuous`，显式不支持的选择报错而非丢弃。
   历史 executor `action` 仅在 robot_config launch 边界映射为 `topic`，直接节点入口不接受该别名。
-- `dispatch.chunking: auto_horizon` 要求 executor 为 `topic`；`benchmark`+`auto_horizon`
-  在共享 SSOT 报错（benchmark episode 执行完整 chunk），launch 期与节点 init 期都会拒绝。
+- `dispatch.chunking: auto_horizon` / `n_action_steps` 要求 executor 为 `topic`；
+  benchmark 与两者的组合在共享 SSOT 报错（benchmark episode 执行完整 chunk），launch 期与
+  节点 init 期都会拒绝。
+- `dispatch.chunking: n_action_steps` 还要求同节的 `dispatch.n_action_steps` 为正整数
+  （bool 拒绝）；该值只在 `n_action_steps` 策略下消费，其他策略忽略残留值且不透传节点参数。
+  launch 期 fail-fast 校验 `N <= executor.queue_size` 与 `N <=` 可路由 pipeline 的
+  `nominal_chunk_size`（详见下文「n_action_steps 静态前缀」）。
 - **破坏性接口变更**：删除 `temporal_smoothing_enabled`，不提供别名或兼容路径。
   旧机器人 YAML 和直接 ROS override（构造参数、CLI、参数文件）即使值一致也会报错。
   原 false 迁移为 `dispatch.blending: none`，原 true 迁移为 `temporal_ensemble`；
@@ -301,6 +310,58 @@ runtime_options:
 范围、加载时机、profile 标定身份联动以及分布式 cloud 侧的配置位置见
 [inference_service README](../inference_service/README.md)。
 
+### n_action_steps 静态前缀（`chunking: n_action_steps`）
+
+`NActionStepsPlanner` 与 `AutoHorizonPlanner` 共用同一 prefix-truncation 骨架：把可执行
+计划截断为 `[skip, N)`，计划级补货阈值强制 0（消费完前缀后立即重新请求推理，不做
+watermark 预取）。区别只在 horizon 来源：auto_horizon 消费结果级 `execution_horizon`，
+n_action_steps 使用 robot YAML 的静态 `dispatch.n_action_steps`，结果级 horizon 被有意
+忽略。
+
+启用示例（合并到已有机器人 YAML 的 `control_modes.model_inference`）：
+
+```yaml
+executor:
+  type: topic
+  inference_pipeline: policy
+  queue_size: 50            # N <= queue_size，launch 期强制
+  chunk_size: 100           # smoother 权重表大小；本策略下可大于 queue_size
+dispatch:
+  scheduler: continuous
+  chunking: n_action_steps
+  n_action_steps: 50        # 静态执行前缀 N，仅本策略消费
+  blending: none
+```
+
+命名隔离：模型 bundle `config.json` 的 **`n_action_steps`** 仍仅用于 LeRobot
+`select_action` 的队列语义，与 robot YAML 的 `dispatch.n_action_steps` **没有互通或
+复制**，两个同名字段各归各的 SSOT。
+
+- 值解析与边界：`dispatch.n_action_steps` 必须是正整数（bool 拒绝）；`0`、负数、浮点、
+  字符串、列表等在 launch 期报 `InferenceConfigError`。缺省该值时选择此策略直接报错，
+  不回退到其他策略。
+- launch 期 fail-fast 上界：
+  - `N <= executor.queue_size`：legacy 有界队列超容时丢弃**最老**前缀，超限的 N 实际
+    执行的是最后 `queue_size` 步而不是前 N 步；scheduled fail-closed 队列会在运行期拒绝
+    每个 N 步计划。两侧都在 launch 计划期拒绝。
+  - `N <=` 每个可路由 pipeline 的策略元数据 `nominal_chunk_size`（缺失即拒绝，不静默
+    回退完整 chunk）。legacy 只校验其选中的单个 pipeline；scheduled 在 priority=0 时对
+    主 pipeline 加 fallback 链整体校验（路由不允许落到更小 chunk 的策略上），非零
+    priority 只校验主 pipeline。
+- 节点参数 `n_action_steps` 为启动只读：planner 快照在 init 固定，运行时写入被参数回调
+  拒绝（`ros2 param set` 报错），避免参数显示一个 planner 永不消费的新值。
+- 补货只由前缀消耗驱动：`executor.watermark_threshold` 被忽略（计划级阈值强制 0），
+  不做 watermark 预取。
+- 运行时 chunk 短于 N 时截断为整个 chunk（clamp）；推理期间已消费步数照常从前缀起点
+  跳过，全部过期的前缀复用与 auto_horizon 相同的空区间归一化：`[H, H)`，其中
+  `H = min(N, len(chunk))`（不是恒 `[N, N)`，短 chunk 时 H 随之收缩）。
+- 该策略下 `chunk_size > queue_size` 合法：N 步前缀（而非 chunk_size）才是队列准入
+  大小，`N=50, queue_size=50, chunk_size=100` 是合法组合（chunk_size 只是 smoother
+  权重表大小）。scheduled 节点 init 在其他策略下仍拒绝 `chunk_size > queue_size`；
+  legacy 节点没有该校验（chunk_size 只是权重表大小）。
+- 其他策略忽略残留的 `dispatch.n_action_steps`（full_chunk 兼容优先），且 launch 不
+  透传该节点参数。
+
 ### 参数配置
 
 下表为独立节点默认值；robot_config launch 可用 `executor` 中的同名字段覆盖运行参数，
@@ -311,7 +372,8 @@ runtime_options:
 |--------|------|--------|------|
 | `executor_type` | string | `topic` | 输出通道，配对约束见上方 |
 | `scheduler_mode` | string | `continuous` | 每 tick 调度，不是推理服务的产品入口开关 |
-| `chunking_strategy` | string | `''` | 空值解析为 `full_chunk` |
+| `chunking_strategy` | string | `''` | 空值解析为 `full_chunk`；另支持 `auto_horizon`、`n_action_steps` |
+| `n_action_steps` | int | 0 | 仅 `chunking: n_action_steps` 时必填；静态执行前缀 N，启动只读 |
 | `blending_strategy` | string | `none` | `none` 或 `temporal_ensemble` |
 | `queue_size` | int | 100 | queue 最大长度；不限制 smoother |
 | `watermark_threshold` | int | 20 | 剩余量小于等于此值时可补货；不是固定执行间隔 |

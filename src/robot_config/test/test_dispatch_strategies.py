@@ -6,12 +6,14 @@ import pytest
 
 from robot_config.dispatch_strategies import (
     DEFAULT_CHUNKING,
+    SUPPORTED_CHUNKING_STRATEGIES,
     DispatchStrategyError,
     resolve_dispatch_strategies,
     validate_blending_strategy,
     validate_chunking_strategy,
     validate_dispatch_strategies,
     validate_executor_scheduler_pairing,
+    validate_n_action_steps,
 )
 
 
@@ -71,6 +73,53 @@ def test_auto_horizon_requires_topic_executor():
             scheduler_mode="wait_for_feedback",
             chunking="auto_horizon",
         )
+
+
+# ---------------------------------------------------------------------------
+# n_action_steps chunking: SSOT membership, combination and value shape.
+# ---------------------------------------------------------------------------
+
+
+def test_n_action_steps_is_a_supported_chunking_strategy():
+    assert "n_action_steps" in SUPPORTED_CHUNKING_STRATEGIES
+    validate_chunking_strategy("n_action_steps")
+
+
+def test_n_action_steps_resolves_for_topic_executor():
+    selection = resolve_dispatch_strategies(
+        executor_type="topic",
+        scheduler_mode="continuous",
+        chunking="n_action_steps",
+    )
+    assert selection.chunking == "n_action_steps"
+
+
+@pytest.mark.parametrize("entrypoint", ["legacy", "scheduled"])
+def test_n_action_steps_rejected_for_benchmark_executor(entrypoint):
+    """Benchmark episodes execute full chunks; the SSOT rejects the pairing."""
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        resolve_dispatch_strategies(
+            executor_type="benchmark",
+            scheduler_mode="wait_for_feedback",
+            chunking="n_action_steps",
+            entrypoint=entrypoint,
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -3, 1.5, "4", None, [], {}])
+def test_validate_n_action_steps_rejects_non_positive_int_shapes(value):
+    with pytest.raises(DispatchStrategyError, match="n_action_steps must be"):
+        validate_n_action_steps(value)
+
+
+@pytest.mark.parametrize("value", [1, 7, 100])
+def test_validate_n_action_steps_accepts_positive_ints(value):
+    assert validate_n_action_steps(value) == value
+
+
+def test_validate_n_action_steps_rejects_bool_explicitly():
+    with pytest.raises(DispatchStrategyError, match="bool rejected"):
+        validate_n_action_steps(True)
 
 
 def test_blending_strategy_exact_match():

@@ -104,6 +104,85 @@ def test_removed_override_rejected_before_declaration(node_type, source, enabled
         rclpy.shutdown()
 
 
+@pytest.mark.parametrize("atomic", [False, True])
+def test_n_action_steps_dump_restart_roundtrip(node_type, atomic, tmp_path):
+    """N exports with the parameter set, survives restart, and stays read-only.
+
+    N=50 with queue_size=50 and chunk_size=100 pins the legal combination
+    where chunk_size exceeds queue_size: the N-step prefix, not chunk_size,
+    is the queue admission size for this strategy.
+    """
+    rclpy.init(args=[])
+    node = node_type(
+        parameter_overrides=[
+            Parameter("chunking_strategy", value="n_action_steps"),
+            Parameter("n_action_steps", value=50),
+            Parameter("queue_size", value=50),
+            Parameter("chunk_size", value=100),
+        ]
+    )
+    try:
+        assert node._chunking_strategy == "n_action_steps"
+        assert node._n_action_steps == 50
+        planner = node._chunk_planner
+        # Runtime writes are rejected: the planner snapshot is fixed at init,
+        # so ros2 param must never show a value the planner never consumes.
+        attempted = [Parameter("n_action_steps", value=7)]
+        result = node.set_parameters_atomically(attempted) if atomic else node.set_parameters(attempted)[0]
+        assert not result.successful
+        assert "startup read-only" in result.reason
+        assert node.get_parameter("n_action_steps").value == 50
+        assert node._chunk_planner is planner
+        parameters = node.get_parameters_by_prefix("")
+        exported = {name: parameter.value for name, parameter in parameters.items()}
+        assert exported["chunking_strategy"] == "n_action_steps"
+        assert exported["n_action_steps"] == 50
+        path = tmp_path / "parameters.yaml"
+        path.write_text(yaml.safe_dump({node.get_fully_qualified_name(): {"ros__parameters": exported}}))
+    finally:
+        Node.destroy_node(node)
+        rclpy.shutdown()
+    rclpy.init(args=["--ros-args", "--params-file", str(path)])
+    restarted = node_type()
+    try:
+        assert restarted.get_parameter("chunking_strategy").value == "n_action_steps"
+        assert restarted.get_parameter("n_action_steps").value == 50
+        assert restarted.get_parameter("queue_size").value == 50
+        assert restarted.get_parameter("chunk_size").value == 100
+        assert restarted._chunking_strategy == "n_action_steps"
+        assert restarted._n_action_steps == 50
+        assert restarted._chunk_planner.n_action_steps == 50
+    finally:
+        Node.destroy_node(restarted)
+        rclpy.shutdown()
+
+
+def test_n_action_steps_startup_requires_value(node_type):
+    rclpy.init(args=["--ros-args", "-p", "chunking_strategy:=n_action_steps"])
+    try:
+        with pytest.raises(ValueError, match="requires the n_action_steps parameter"):
+            node_type()
+    finally:
+        rclpy.shutdown()
+
+
+def test_n_action_steps_startup_rejects_oversized_queue_bound(node_type):
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            "chunking_strategy:=n_action_steps",
+            "-p",
+            "n_action_steps:=101",
+        ]
+    )
+    try:
+        with pytest.raises(ValueError, match="exceeds queue_size"):
+            node_type()
+    finally:
+        rclpy.shutdown()
+
+
 @pytest.mark.parametrize("veto_first", [False, True])
 def test_rejected_parameter_update_preserves_toggle_state(node_type, veto_first):
     rclpy.init(args=[])

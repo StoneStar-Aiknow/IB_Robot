@@ -17,7 +17,11 @@ def test_every_chunking_name_has_a_factory_implementation():
     from action_dispatch.chunk_planning import create_chunk_planner
 
     for name in SUPPORTED_CHUNKING:
-        planner = create_chunk_planner(name)
+        # n_action_steps additionally requires its static prefix value; the
+        # others are value-less strategies the factory builds bare.
+        planner = (
+            create_chunk_planner(name, n_action_steps=1) if name == "n_action_steps" else create_chunk_planner(name)
+        )
         assert planner.chunking_strategy == name
 
 
