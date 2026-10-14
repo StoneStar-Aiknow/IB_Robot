@@ -34,7 +34,8 @@ class FinalizationLedger:
         self._run_id = run_id
         self._on_task_committed = on_task_committed
         self._task_position = 0
-        self._episode_index = 0
+        self._task_ids = plan.assigned_task_ids
+        self._episode_position = 0
         self._pending_episode_id: int | None = None
         self._reset_authorized = False
         self._task_committed: set[int] = set()
@@ -47,9 +48,16 @@ class FinalizationLedger:
 
     @property
     def current_task_id(self) -> int | None:
-        if self._task_position >= len(self._plan.selected_task_ids):
+        if self._task_position >= len(self._task_ids):
             return None
-        return self._plan.selected_task_ids[self._task_position]
+        return self._task_ids[self._task_position]
+
+    @property
+    def episode_index(self) -> int:
+        indices = self._plan.episode_indices(self.current_task_id) if self.current_task_id is not None else ()
+        return (
+            indices[self._episode_position] if self._episode_position < len(indices) else self._plan.episodes_per_task
+        )
 
     def authorize_reset(self, suite: str, task_id: int, episode_index: int) -> None:
         if self._run_committed:
@@ -62,15 +70,15 @@ class FinalizationLedger:
         if suite != self._plan.suite:
             raise FinalizationLedgerError(f"suite mismatch: got {suite!r}, expected {self._plan.suite!r}")
         if task_id != expected_task:
-            relation = (
-                "future task" if task_id in self._plan.selected_task_ids[self._task_position + 1 :] else "stale task"
-            )
+            relation = "future task" if task_id in self._task_ids[self._task_position + 1 :] else "stale task"
             raise FinalizationLedgerError(f"{relation}: got task {task_id}, expected task {expected_task}")
-        if episode_index != self._episode_index:
-            relation = "future" if episode_index > self._episode_index else "stale"
+        if episode_index != self.episode_index:
+            relation = "future" if episode_index > self.episode_index else "stale"
             raise FinalizationLedgerError(
-                f"{relation} episode index: got {episode_index}, expected {self._episode_index}"
+                f"{relation} episode index: got {episode_index}, expected {self.episode_index}"
             )
+        if self._episode_position >= len(self._plan.episode_indices(expected_task)):
+            raise FinalizationLedgerError("all assigned episodes are committed; finalize task first")
         self._reset_authorized = True
 
     def record_reset(self, episode_id: int) -> None:
@@ -139,22 +147,18 @@ class FinalizationLedger:
         expected_task = self.current_task_id
         identity = payload.identity
         if expected_task is None or identity.task_id != expected_task:
-            relation = (
-                "future task"
-                if identity.task_id in self._plan.selected_task_ids[self._task_position + 1 :]
-                else "stale task"
-            )
+            relation = "future task" if identity.task_id in self._task_ids[self._task_position + 1 :] else "stale task"
             raise FinalizationLedgerError(f"{relation}: got task {identity.task_id}, expected task {expected_task}")
         if identity.suite != self._plan.suite:
             raise FinalizationLedgerError("suite mismatch")
-        if identity.episode_index != self._episode_index:
+        if identity.episode_index != self.episode_index:
             relation = (
                 "future"
-                if identity.episode_index is not None and identity.episode_index > self._episode_index
+                if identity.episode_index is not None and identity.episode_index > self.episode_index
                 else "stale"
             )
             raise FinalizationLedgerError(
-                f"{relation} episode index: got {identity.episode_index}, expected {self._episode_index}"
+                f"{relation} episode index: got {identity.episode_index}, expected {self.episode_index}"
             )
         if self._pending_episode_id is None:
             raise FinalizationLedgerError("episode finalization has no successful reset identity")
@@ -164,7 +168,7 @@ class FinalizationLedger:
             )
         self._commits[key] = fingerprint
         self._pending_episode_id = None
-        self._episode_index += 1
+        self._episode_position += 1
 
     def _commit_task(self, payload: FinalizationPayload, key: tuple[object, ...], fingerprint: tuple[str, ...]) -> None:
         expected_task = self.current_task_id
@@ -175,20 +179,20 @@ class FinalizationLedger:
             raise FinalizationLedgerError("suite mismatch")
         if self._pending_episode_id is not None or self._reset_authorized:
             raise FinalizationLedgerError("task cannot finalize while an episode is uncommitted")
-        if self._episode_index < self._plan.episodes_per_task and not payload.partial:
-            raise FinalizationLedgerError(f"episode {self._episode_index} is not committed for task {expected_task}")
+        if self._episode_position < len(self._plan.episode_indices(expected_task)) and not payload.partial:
+            raise FinalizationLedgerError(f"episode {self.episode_index} is not committed for task {expected_task}")
         prior_task_position = self._task_position
-        prior_episode_index = self._episode_index
+        prior_episode_position = self._episode_position
         self._commits[key] = fingerprint
         self._task_committed.add(expected_task)
         self._task_position += 1
-        self._episode_index = 0
+        self._episode_position = 0
         if self._on_task_committed is not None:
             try:
                 self._on_task_committed(self._plan.suite, expected_task)
             except Exception:
                 self._task_position = prior_task_position
-                self._episode_index = prior_episode_index
+                self._episode_position = prior_episode_position
                 self._task_committed.remove(expected_task)
                 del self._commits[key]
                 raise
@@ -196,7 +200,7 @@ class FinalizationLedger:
     def _commit_run(self, payload: FinalizationPayload, key: tuple[object, ...], fingerprint: tuple[str, ...]) -> None:
         if self._pending_episode_id is not None or self._reset_authorized:
             raise FinalizationLedgerError("run cannot finalize while an episode is uncommitted")
-        expected_tasks = set(self._plan.selected_task_ids)
+        expected_tasks = set(self._task_ids)
         missing = sorted(expected_tasks - self._task_committed)
         if missing:
             raise FinalizationLedgerError(f"task {missing[0]} is not committed")

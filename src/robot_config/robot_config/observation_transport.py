@@ -397,6 +397,32 @@ def robot_config_has_distributed_pipeline(robot_config: Mapping[str, Any]) -> bo
     return False
 
 
+def robot_config_declares_rtp_observation(robot_config: Mapping[str, Any]) -> bool:
+    """Return whether any contract observation asks for RTP video transport.
+
+    ``execution_mode: distributed`` says where inference runs; this says whether
+    video leaves the box over RTP.  They are independent: most shipped
+    distributed profiles send every observation over DDS.  A profile that does
+    declare RTP names a remote ``endpoint.host``, which is what makes it a
+    two-command deployment -- the second command belongs on whichever machine
+    owns that address.
+
+    Reads the raw configuration rather than a built contract because the launch
+    description is assembled before any node starts.  "dds" is the *absence* of a
+    ``transport:`` block, so an observation without one answers no.
+    """
+    contract = robot_config.get("contract", {})
+    if not isinstance(contract, Mapping):
+        return False
+    for item in contract.get("observations", []) or []:
+        if not isinstance(item, Mapping):
+            continue
+        transport = parse_observation_transport(item.get("transport"))
+        if transport is not None and transport.mode == "rtp":
+            return True
+    return False
+
+
 def validate_robot_config_observation_transports(robot_config: Mapping[str, Any]) -> list[str]:
     """Validate transport declarations directly from a raw robot configuration."""
     cameras = {

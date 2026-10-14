@@ -47,7 +47,7 @@ from benchmark_runtime.io_descriptor import (
     descriptor_from_robot_model,
     validate_io_compatibility,
 )
-from benchmark_runtime.plan import BenchmarkPlanJSONError, benchmark_plan_from_json
+from benchmark_runtime.plan import BenchmarkPlanJSONError, benchmark_plan_from_json, benchmark_plan_to_json
 
 READY_TAG = "[IBROBOT_BENCHMARK][EVALUATOR_NODE_READY]"
 PRODUCTION_READY_TAG = "[IBROBOT_BENCHMARK][EVALUATOR_PRODUCTION_READY]"
@@ -203,6 +203,20 @@ def _runtime_manifest_identity(robot_config_path: str) -> dict[str, Any]:
     benchmark = robot.get("benchmark", {})
     evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
     observation_transport = evaluation.get("observation_transport", {}) if isinstance(evaluation, dict) else {}
+    # Profiles no longer declare a top-level transport selection; derive the
+    # effective delivery mode from the contract entries so reports stay
+    # meaningful under the explicit per-camera transport model.
+    transport_mode = observation_transport.get("mode") if isinstance(observation_transport, dict) else None
+    contract_entries = robot.get("contract", {}).get("observations", [])
+    if transport_mode is None and isinstance(contract_entries, list):
+        transport_mode = (
+            "rtp"
+            if any(
+                isinstance(entry, dict) and (entry.get("transport") or {}).get("mode") == "rtp"
+                for entry in contract_entries
+            )
+            else "dds"
+        )
     provider_packages = benchmark.get("identity_packages", []) if isinstance(benchmark, dict) else []
     if not isinstance(provider_packages, list) or any(
         not isinstance(name, str) or not name for name in provider_packages
@@ -228,7 +242,7 @@ def _runtime_manifest_identity(robot_config_path: str) -> dict[str, Any]:
         },
         "environment_contract": robot.get("contract", {}),
         "observation_transport": {
-            "mode": observation_transport.get("mode") if isinstance(observation_transport, dict) else None,
+            "mode": transport_mode,
             "effective_fingerprint": (
                 observation_transport.get("effective_fingerprint") if isinstance(observation_transport, dict) else None
             ),
@@ -284,6 +298,7 @@ class BenchmarkEvaluatorNode(Node):
         self.declare_parameter("run_policy_action_server", "")
         self.declare_parameter("inference_health_topic", "")
         self.declare_parameter("run_id", "")
+        self.declare_parameter("lane_id", "")
 
         self._plan_client: Any = None
         self._reset_client: Any = None
@@ -334,6 +349,7 @@ class BenchmarkEvaluatorNode(Node):
             "run_policy_action_server",
             "inference_health_topic",
             "run_id",
+            "lane_id",
         )
         return {name: self.get_parameter(name).value for name in names}
 
@@ -415,7 +431,9 @@ class BenchmarkEvaluatorNode(Node):
         output = evaluation.get("output", {})
         if not isinstance(output, dict):
             raise EvaluatorStartupError("benchmark.evaluation.output must be a mapping")
-        configured = evaluation.get("run_id") or parameter_run_id or output.get("run_name")
+        configured = parameter_run_id or evaluation.get("run_id") or output.get("run_name")
+        if plan.lane_count > 1 and not (parameter_run_id or evaluation.get("run_id")):
+            raise EvaluatorStartupError("parallel evaluation requires a shared explicit run_id from launch")
         if not isinstance(configured, str) or not configured.strip():
             configured = f"{plan.suite}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
         configured = configured.strip()
@@ -453,6 +471,7 @@ class BenchmarkEvaluatorNode(Node):
             plan,
             artifact_config,
             image_size,
+            lane_count=plan.lane_count,
             max_steps=plan.max_steps,
         )
         checked = check_disk_preflight(output_root, estimate)
@@ -461,6 +480,8 @@ class BenchmarkEvaluatorNode(Node):
                 f"insufficient disk space at {output_root}: free={checked.free_bytes} required={checked.required_bytes}"
             )
         run_root = output_root / self._run_id
+        if plan.lane_count > 1:
+            run_root /= f"lanes/lane_{plan.lane_index:03d}"
         manifest = {
             "schema_version": 1,
             "artifact_layout_version": 1,
@@ -474,6 +495,9 @@ class BenchmarkEvaluatorNode(Node):
             "run_root": str(run_root),
             "robot_config_path": str(Path(self._robot_config_path).resolve()),
             "runtime_identity": _runtime_manifest_identity(self._robot_config_path),
+            "resolved_plan": json.loads(benchmark_plan_to_json(plan)),
+            "lane_index": plan.lane_index,
+            "lane_count": plan.lane_count,
             "plan": {
                 "requested_task_order_index": plan.requested_task_order_index,
                 "effective_task_order_index": plan.effective_task_order_index,
@@ -525,9 +549,12 @@ class BenchmarkEvaluatorNode(Node):
     def _planned_tasks(self) -> dict[int, dict[str, Any]]:
         assert self._supervisor is not None
         return {
-            task.task_id: {"planned_episodes": self._supervisor.plan.episodes_per_task, "task_name": task.name}
+            task.task_id: {
+                "planned_episodes": len(self._supervisor.plan.episode_indices(task.task_id)),
+                "task_name": task.name,
+            }
             for task in self._supervisor.plan.tasks
-            if task.task_id in self._supervisor.plan.selected_task_ids
+            if task.task_id in self._supervisor.plan.assigned_task_ids
         }
 
     def _canonical_artifacts(self, response: Any, scope: str) -> tuple[ArtifactStatus, ...]:
@@ -700,6 +727,10 @@ class BenchmarkEvaluatorNode(Node):
             infrastructure_error=payload.error_category or None,
             artifacts=self._record_canonical_scope_artifacts(response, "episode"),
             metadata={
+                "lane_index": self._supervisor.plan.lane_index,
+                "global_work_index": self._supervisor.plan.episode_work.index(
+                    (task.task_id, payload.identity.episode_index)
+                ),
                 "prompt": task.prompt,
                 "reset_observation_delivery": metadata.get("observation_delivery"),
                 "reward": result.get("reward") if result.get("has_reward") else None,
@@ -743,8 +774,8 @@ class BenchmarkEvaluatorNode(Node):
             return False
         expected = {
             (task_id, episode_index)
-            for task_id in self._supervisor.plan.selected_task_ids
-            for episode_index in range(self._supervisor.plan.episodes_per_task)
+            for task_id in self._supervisor.plan.assigned_task_ids
+            for episode_index in self._supervisor.plan.episode_indices(task_id)
         }
         actual = {(record.task_id, record.episode_index) for record in writer.records}
         return actual == expected

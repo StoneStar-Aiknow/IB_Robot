@@ -76,6 +76,7 @@ def estimate_disk_usage(
     artifact_config: Any = None,
     image_size: Sequence[int] | None = None,
     *,
+    lane_count: int = 1,
     max_steps: int | None = None,
     state_bytes_per_sample: int = STATE_BYTES_PER_SAMPLE,
     report_overhead_bytes: int = REPORT_OVERHEAD_BYTES,
@@ -88,9 +89,12 @@ def estimate_disk_usage(
     with ``tasks``/``selected_tasks`` and ``episodes_per_task``.  The artifact
     config accepts either ``video``/``save_sim_states`` or the corresponding
     flat keys.  Video bytes are intentionally raw RGB bytes, not a prediction
-    of compressed MP4 size.
+    of compressed MP4 size. Each lane runs a complete copy of ``plan``;
+    episode costs and report overhead are per lane, but the free-space reserve
+    is shared once across the output filesystem.
     """
-    planned = _planned_episodes(plan)
+    lane_count = _positive_int(lane_count, "lane_count")
+    planned = _planned_episodes(plan) * lane_count
     steps = max_steps if max_steps is not None else _read(plan, "max_steps", "max_actions", default=None)
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
         raise ValueError("max_steps must be a non-negative int")
@@ -125,6 +129,7 @@ def estimate_disk_usage(
     max_frames = planned * (steps + TERMINAL_RESET_FRAME_ALLOWANCE)
     video_bytes = width * height * 3 * max_frames if video_enabled else 0
     state_bytes = state_bytes_per_sample * planned * (steps + 1) if save_states else 0
+    report_overhead_bytes *= lane_count
     estimated = video_bytes + state_bytes + report_overhead_bytes
     required = ceil(estimated * float(safety_factor)) + reserve_bytes
     return DiskEstimate(

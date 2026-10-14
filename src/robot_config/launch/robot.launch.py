@@ -747,7 +747,7 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 6.5 Benchmark nodes (benchmark target only) ==========
     if is_benchmark:
-        benchmark_nodes = generate_benchmark_nodes(robot_config)
+        benchmark_nodes = generate_benchmark_nodes(robot_config, use_sim=use_sim)
         actions.extend(benchmark_nodes)
         logger.info(f"Added {len(benchmark_nodes)} benchmark nodes")
 

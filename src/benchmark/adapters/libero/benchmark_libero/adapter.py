@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -107,6 +108,7 @@ class LiberoAdapter(BenchmarkAdapter):
             if self._configured:
                 raise LiberoAdapterError("LiberoAdapter already configured")
             options = config.options
+            capabilities = replace(self._capabilities, max_lane_count=options.get("max_lane_count", 1))
             camera_names = tuple(options.get("camera_names", _FROZEN_OBSERVATION_KEYS))
             if camera_names != _FROZEN_OBSERVATION_KEYS:
                 raise LiberoAdapterError(
@@ -149,6 +151,7 @@ class LiberoAdapter(BenchmarkAdapter):
                 self._use_init_state_id = bool(options.get("use_init_state_id", True))
                 self._init_state_id = self._require_non_negative_int(options.get("init_state_id", 0), "init_state_id")
                 self._task_id = self._require_non_negative_int(options.get("task_id", 0), "task_id")
+            self._capabilities = capabilities
             self._configured = True
 
     @staticmethod

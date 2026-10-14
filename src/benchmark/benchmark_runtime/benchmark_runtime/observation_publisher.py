@@ -24,6 +24,7 @@ an absolute path (leading ``/``) fail fast.
 
 from __future__ import annotations
 
+import array
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -78,7 +79,6 @@ class ObservationPublisherSpec:
     image_width: int  # 0 for non-image
     state_dim: int  # 0 when not a vector observation or names not declared
     optional: bool = False
-    transport_mode: str = "dds"
 
 
 def _require_non_empty_str(value: Any, label: str) -> str:
@@ -216,14 +216,16 @@ def resolve_publisher_specs(contract_observations: Any) -> list[ObservationPubli
             raise ObservationContractError(f"duplicate observation key '{key}'")
         if topic in seen_topics:
             raise ObservationContractError(f"duplicate observation topic '{topic}'")
+        # ``transport:`` is read here only to reject a malformed block early.
+        # Whether an observation travels over DDS or RTP is not this layer's
+        # business: the benchmark publishes every observation on its contract
+        # topic, exactly as a camera driver does, and the edge pipeline node
+        # decides what to do with it.  The rules about transport (RTP requires
+        # ``sensor_msgs/msg/Image``, which modes exist) live in
+        # ``robot_config.observation_transport`` and run on every profile load.
         transport = entry.get("transport") or {}
         if not isinstance(transport, Mapping):
             raise ObservationContractError(f"transport for key '{key}' must be a mapping when present")
-        transport_mode = str(transport.get("mode", "dds")).lower()
-        if transport_mode not in {"dds", "rtp"}:
-            raise ObservationContractError(f"unsupported transport mode '{transport_mode}' for key '{key}'")
-        if transport_mode == "rtp" and ros_type != "sensor_msgs/msg/Image":
-            raise ObservationContractError(f"RTP observation '{key}' must be sensor_msgs/msg/Image")
         seen_keys.add(key)
         seen_topics.add(topic)
         specs.append(
@@ -237,7 +239,6 @@ def resolve_publisher_specs(contract_observations: Any) -> list[ObservationPubli
                 image_width=width,
                 state_dim=state_dim,
                 optional=bool(entry.get("optional", False)),
-                transport_mode=transport_mode,
             )
         )
     return specs
@@ -279,7 +280,16 @@ def _build_image_message(
     msg.width = w
     msg.encoding = spec.image_encoding
     msg.step = w * 3
-    msg.data = payload.tobytes()
+    # Not `msg.data = payload.tobytes()`. Assigning `bytes` to a `uint8[]` field
+    # sends rclpy through a per-element Python check that every item is an int in
+    # 0..255; for a 256x256x3 frame that is ~196k iterations of interpreted code.
+    # Measured on this workspace: 7.57 ms versus 0.0032 ms for the line below,
+    # per image, on every frame. `array.array('B', ...)` already carries the
+    # right item type, so the check is a buffer check instead of a loop.
+    # Byte-for-byte identical on the wire -- verified by a round-trip through a
+    # real publisher/subscriber pair, including a one-byte tamper control that
+    # the comparison caught.
+    msg.data = array.array("B", payload.tobytes())
     return msg
 
 
@@ -367,8 +377,6 @@ def build_dds_sinks(
     """Build DDS sinks in canonical Contract order."""
     routes: list[DDSObservationSink] = []
     for spec in specs:
-        if spec.transport_mode != "dds":
-            continue
         publisher = publishers.get(spec.key)
         if publisher is None:
             raise ObservationContractError(f"no publisher registered for key '{spec.key}'")
@@ -402,12 +410,6 @@ def build_and_validate_messages(
     messages via :func:`publish_prepared_messages`.
     """
     sec, nanosec = stamp_to_builtin_time(stamp)
-    non_dds = [spec.key for spec in specs if spec.transport_mode != "dds"]
-    if non_dds:
-        raise ObservationContractError(
-            "legacy DDS observation publishing cannot route non-DDS observations; "
-            f"use ObservationRouter with ObservationSink values for {non_dds}"
-        )
     prepared: list[tuple[Any, Any]] = []
     for spec in specs:
         if spec.key not in observations:
@@ -470,8 +472,6 @@ def build_publishers(
     """Create one ROS publisher per spec on ``node`` and return a key->pub map."""
     publishers: dict[str, Any] = {}
     for spec in specs:
-        if spec.transport_mode != "dds":
-            continue
         if spec.ros_type == "sensor_msgs/msg/Image":
             publishers[spec.key] = node.create_publisher(
                 ImageMsg,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -155,6 +155,7 @@ class BenchmarkPlan:
     artifacts: BenchmarkArtifactFlags
     warnings: tuple[str, ...] = ()
     lane_count: int = 1
+    lane_index: int | None = None
 
     def __post_init__(self) -> None:
         _non_empty_string(self.benchmark_type, "benchmark_type")
@@ -185,14 +186,16 @@ class BenchmarkPlan:
             raise ValueError(f"selected task IDs out of range for {len(self.tasks)} tasks: {invalid}")
         _positive_int(self.episodes_per_task, "episodes_per_task")
         _positive_int(self.planned_episodes, "planned_episodes")
-        expected_episodes = len(self.selected_task_ids) * self.episodes_per_task
+        _positive_int(self.lane_count, "lane_count")
+        if self.lane_index is not None:
+            _non_negative_int(self.lane_index, "lane_index")
+            if self.lane_index >= self.lane_count:
+                raise ValueError("lane_index must be less than lane_count")
+        expected_episodes = sum(len(self.episode_indices(task_id)) for task_id in self.selected_task_ids)
         if self.planned_episodes != expected_episodes:
-            raise ValueError(
-                f"planned_episodes must equal selected task count * episodes_per_task ({expected_episodes})"
-            )
+            raise ValueError(f"planned_episodes must equal assigned episode count ({expected_episodes})")
         _non_negative_int(self.seed, "seed")
         _positive_int(self.max_steps, "max_steps")
-        _positive_int(self.lane_count, "lane_count")
         if not isinstance(self.init_state_policy, InitStatePolicy):
             raise ValueError("init_state_policy must be an InitStatePolicy")
         if self.init_state_policy.use_init_state_id:
@@ -205,6 +208,40 @@ class BenchmarkPlan:
             raise ValueError("artifacts must be BenchmarkArtifactFlags")
         for warning in self.warnings:
             _non_empty_string(warning, "warnings entry")
+
+    @property
+    def global_planned_episodes(self) -> int:
+        return len(self.selected_task_ids) * self.episodes_per_task
+
+    def episode_indices(self, task_id: int) -> tuple[int, ...]:
+        """Return the complete configured episode set for this lane."""
+        if task_id not in self.selected_task_ids:
+            raise ValueError(f"task {task_id} is not selected")
+        return tuple(range(self.episodes_per_task))
+
+    @property
+    def assigned_task_ids(self) -> tuple[int, ...]:
+        return tuple(task_id for task_id in self.selected_task_ids if self.episode_indices(task_id))
+
+    @property
+    def episode_work(self) -> tuple[tuple[int, int], ...]:
+        return tuple((task_id, index) for task_id in self.assigned_task_ids for index in self.episode_indices(task_id))
+
+
+def partition_plan(plan: BenchmarkPlan, lane_index: int = 0, lane_count: int = 1) -> BenchmarkPlan:
+    """Assign the complete resolved plan to one independent execution lane."""
+    _positive_int(lane_count, "lane_count")
+    _non_negative_int(lane_index, "lane_index")
+    if plan.lane_index is not None:
+        raise ValueError("cannot partition an already partitioned plan")
+    if lane_index >= lane_count:
+        raise ValueError("lane_index must be less than lane_count")
+    return replace(
+        plan,
+        lane_index=lane_index,
+        lane_count=lane_count,
+        planned_episodes=plan.global_planned_episodes,
+    )
 
 
 def _task_to_dict(task: BenchmarkPlanTask) -> dict[str, Any]:
@@ -246,6 +283,7 @@ def _plan_to_dict(plan: BenchmarkPlan) -> dict[str, Any]:
         },
         "warnings": list(plan.warnings),
         "lane_count": plan.lane_count,
+        "lane_index": plan.lane_index,
     }
 
 
@@ -290,6 +328,8 @@ def benchmark_plan_from_json(payload: str) -> BenchmarkPlan:
     """Parse the plan schema and accept legacy flattened provider metadata."""
     try:
         root = require_json_object(loads_strict(payload), "benchmark plan")
+        # Persisted single-lane snapshots predate static partitioning.
+        root.setdefault("lane_index", None)
         require_exact_keys(
             root,
             {
@@ -309,6 +349,7 @@ def benchmark_plan_from_json(payload: str) -> BenchmarkPlan:
                 "artifacts",
                 "warnings",
                 "lane_count",
+                "lane_index",
             },
             "benchmark plan",
         )
@@ -343,6 +384,7 @@ def benchmark_plan_from_json(payload: str) -> BenchmarkPlan:
             artifacts=BenchmarkArtifactFlags(**artifacts),
             warnings=tuple(warnings),
             lane_count=root["lane_count"],
+            lane_index=root["lane_index"],
         )
     except (StrictJSONError, TypeError, ValueError) as exc:
         raise BenchmarkPlanJSONError(str(exc)) from exc

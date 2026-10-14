@@ -18,6 +18,13 @@ def resolve_plan_request(options: Mapping[str, Any]) -> LiberoPlanRequest | None
     if not bool(evaluation.get("enabled", False)):
         return None
 
+    parallel = evaluation.get("parallel", {})
+    if not isinstance(parallel, Mapping) or parallel.get("scheduling", "static") != "static":
+        raise ValueError("LIBERO evaluation supports static scheduling only; dynamic is unsupported")
+    if parallel.get("enabled", False) and parallel.get("fail_fast", True) is not True:
+        raise ValueError("LIBERO static parallel MVP requires fail_fast=true")
+    lane_count = parallel.get("lane_count", 1) if parallel.get("enabled", False) else 1
+
     tasks_raw = evaluation.get("tasks")
     tasks = None if tasks_raw is None else tuple(tasks_raw)
     video = evaluation.get("video", {})
@@ -43,5 +50,5 @@ def resolve_plan_request(options: Mapping[str, Any]) -> LiberoPlanRequest | None
         video_enabled=video.get("enabled", True),
         write_native=output.get("write_native", True),
         write_canonical=output.get("write_canonical", True),
-        lane_count=evaluation.get("lane_count", 1),
+        lane_count=lane_count,
     )

@@ -28,7 +28,6 @@ from benchmark_runtime.capability_negotiation import (
     CapabilityNegotiationError,
     negotiate_provider_capabilities,
 )
-from benchmark_runtime.direct_frame_transport import FrameIngressObservationSink
 from benchmark_runtime.disk_preflight import DiskPreflightError, ensure_disk_preflight, estimate_disk_usage
 from benchmark_runtime.finalization import FinalizationJSONError, finalization_payload_from_wire
 from benchmark_runtime.finalization_ledger import FinalizationLedger, FinalizationLedgerError
@@ -58,13 +57,12 @@ from benchmark_runtime.observation_router import (
     ObservationRouter,
     ObservationRouterError,
 )
-from benchmark_runtime.plan import BenchmarkPlan, benchmark_plan_to_json
+from benchmark_runtime.plan import BenchmarkPlan, benchmark_plan_to_json, partition_plan
 from benchmark_runtime.registry import (
     BenchmarkPlugin,
     BenchmarkRegistryError,
     load_plugin,
 )
-from observation_transport import create_managed_frame_ingress
 
 READY_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_READY]"
 PRODUCTION_READY_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_PRODUCTION_READY]"
@@ -199,9 +197,10 @@ class BenchmarkEnvironmentNode(Node):
         self.declare_parameter("step_service", "")
         self.declare_parameter("plan_service", "")
         self.declare_parameter("finalize_service", "")
-        self.declare_parameter("frame_ingress_enabled", False)
-        self.declare_parameter("frame_ingress_contract_json", "{}")
-        self.declare_parameter("frame_ingress_startup_timeout_sec", 120.0)
+        self.declare_parameter("lane_id", "")
+        self.declare_parameter("lane_index", 0)
+        self.declare_parameter("lane_count", 1)
+        self.declare_parameter("run_id", "")
 
         # Production runtime state. Allocated eagerly so failure paths can
         # call close() without checking for None. Note: attribute names must
@@ -230,7 +229,6 @@ class BenchmarkEnvironmentNode(Node):
         self._obs_publishers: dict[str, Any] = {}
         self._obs_publisher_specs: list = []
         self._observation_router: ObservationRouter | None = None
-        self._frame_ingress: Any = None
         self._io_descriptor: BenchmarkIODescriptor | None = None
         self._capability_agreement: BenchmarkCapabilityAgreement | None = None
         self._observation_transaction_id: str | None = None
@@ -248,9 +246,8 @@ class BenchmarkEnvironmentNode(Node):
             "step_service": self.get_parameter("step_service").value,
             "plan_service": self.get_parameter("plan_service").value,
             "finalize_service": self.get_parameter("finalize_service").value,
-            "frame_ingress_enabled": self.get_parameter("frame_ingress_enabled").value,
-            "frame_ingress_contract_json": self.get_parameter("frame_ingress_contract_json").value,
-            "frame_ingress_startup_timeout_sec": self.get_parameter("frame_ingress_startup_timeout_sec").value,
+            "lane_index": self.get_parameter("lane_index").value,
+            "lane_count": self.get_parameter("lane_count").value,
         }
 
     def announce_ready(self) -> dict[str, Any]:
@@ -397,7 +394,13 @@ class BenchmarkEnvironmentNode(Node):
             output_root = workspace_root / output_root
         output_root = output_root.resolve()
         self._native_run_id = self._evaluation_run_id(benchmark_section)
+        parameter_run_id = str(self.get_parameter("run_id").value or "")
+        if parameter_run_id:
+            self._native_run_id = self._evaluation_run_id({"evaluation": {"run_id": parameter_run_id}})
+        lane_index = int(self.get_parameter("lane_index").value)
         self._native_run_root = output_root / self._native_run_id
+        if self._plan.lane_count > 1:
+            self._native_run_root /= f"lanes/lane_{lane_index:03d}"
         try:
             output_root.mkdir(parents=True, exist_ok=True)
             image_specs = [spec for spec in self._obs_publisher_specs if spec.image_width > 0]
@@ -414,9 +417,10 @@ class BenchmarkEnvironmentNode(Node):
                 self._plan,
                 config,
                 image_size=image_size,
+                lane_count=self._plan.lane_count,
             )
-            ensure_disk_preflight(output_root, estimate)
-            self._native_run_root.mkdir(exist_ok=False)
+            checked = ensure_disk_preflight(output_root, estimate)
+            self._native_run_root.mkdir(parents=True, exist_ok=False)
         except (DiskPreflightError, ValueError, OSError) as exc:
             raise EnvironmentStartupError(f"native disk preflight failed: {exc}") from exc
         try:
@@ -430,7 +434,7 @@ class BenchmarkEnvironmentNode(Node):
                     "suite": self._plan.suite,
                     "plan": json.loads(self._plan_json),
                     "native_reporter": config,
-                    "disk_preflight": estimate.to_dict(),
+                    "disk_preflight": checked.to_dict(),
                 },
             )
             self._native_reporter.on_run_started(manifest)
@@ -451,7 +455,7 @@ class BenchmarkEnvironmentNode(Node):
                 task_id=task.task_id,
                 task_name=task.name,
                 prompt=task.prompt,
-                planned_episodes=self._plan.episodes_per_task,
+                planned_episodes=len(self._plan.episode_indices(task_id)),
                 video_enabled=config["video"]["enabled"],
                 fps=config["video"]["fps"],
                 camera_name=config["video"]["camera_name"],
@@ -531,6 +535,16 @@ class BenchmarkEnvironmentNode(Node):
         if not isinstance(evaluation, dict):
             raise EnvironmentStartupError("benchmark.evaluation must be a mapping when present")
         evaluation_enabled = bool(evaluation.get("enabled", False))
+        parallel = evaluation.get("parallel", {})
+        if not isinstance(parallel, dict) or parallel.get("scheduling", "static") != "static":
+            raise EnvironmentStartupError("only static benchmark scheduling is supported; dynamic is unsupported")
+        if parallel.get("enabled", False) and parallel.get("fail_fast", True) is not True:
+            raise EnvironmentStartupError("static parallel MVP requires fail_fast=true")
+        configured_lanes = parallel.get("lane_count", 1) if parallel.get("enabled", False) else 1
+        if configured_lanes != params["lane_count"]:
+            raise EnvironmentStartupError("environment lane_count must match active evaluation.parallel.lane_count")
+        if configured_lanes > 1 and not (self.get_parameter("run_id").value or evaluation.get("run_id")):
+            raise EnvironmentStartupError("parallel evaluation requires a shared explicit run_id from launch")
         reset_service, step_service, plan_service, finalize_service = _require_endpoints_from_params(
             params, require_plan=evaluation_enabled
         )
@@ -546,25 +560,15 @@ class BenchmarkEnvironmentNode(Node):
         contract_observations = contract_section.get("observations", [])
         self._obs_publisher_specs = resolve_publisher_specs(contract_observations)
         self._obs_publishers = build_publishers(self, self._obs_publisher_specs)
+        # Every observation leaves this node the same way: a plain ROS message on
+        # the topic the contract names.  Whether a camera's frames additionally go
+        # out over RTP is decided downstream by ``pipeline_policy_node`` --
+        # exactly as it is on the real robot, where this node does not exist and
+        # nobody encodes anything before the policy node sees it.  This node used
+        # to branch on the transport mode and hand RTP observations to a second,
+        # benchmark-only sender; that branch is what made the benchmark's video
+        # path diverge from the real robot's.
         sinks_by_key = {sink.key: sink for sink in build_dds_routes(self._obs_publishers, self._obs_publisher_specs)}
-        rtp_specs = [spec for spec in self._obs_publisher_specs if spec.transport_mode == "rtp"]
-        if rtp_specs:
-            if not bool(params["frame_ingress_enabled"]):
-                raise EnvironmentStartupError("RTP observation routes require the IB-Robot frame ingress")
-            self._frame_ingress = create_managed_frame_ingress(
-                self,
-                str(params["frame_ingress_contract_json"]),
-                startup_timeout_s=float(params["frame_ingress_startup_timeout_sec"]),
-            )
-            for spec in rtp_specs:
-                sinks_by_key[spec.key] = FrameIngressObservationSink(
-                    self._frame_ingress,
-                    spec.key,
-                    optional=spec.optional,
-                    logger=self.get_logger(),
-                )
-        elif bool(params["frame_ingress_enabled"]):
-            raise EnvironmentStartupError("frame ingress was enabled but robot.contract has no RTP routes")
         self._observation_router = ObservationRouter(
             tuple(sinks_by_key[spec.key] for spec in self._obs_publisher_specs)
         )
@@ -594,11 +598,14 @@ class BenchmarkEnvironmentNode(Node):
                 )
             self._io_descriptor = adapter_descriptor
             if evaluation_enabled:
-                self._plan = self._adapter.get_plan()
+                global_plan = self._adapter.get_plan()
+                self._plan = partition_plan(global_plan, params["lane_index"], params["lane_count"])
+                if self._plan.lane_count > 1 and not self._plan.artifacts.write_canonical:
+                    raise EnvironmentStartupError("parallel evaluation requires output.write_canonical=true")
                 try:
                     self._capability_agreement = negotiate_provider_capabilities(
                         self._adapter.capabilities,
-                        self._plan,
+                        global_plan,
                     )
                 except CapabilityNegotiationError as exc:
                     raise EnvironmentStartupError(str(exc)) from exc
@@ -1371,12 +1378,6 @@ class BenchmarkEnvironmentNode(Node):
             if self._observation_router is not None:
                 self._observation_router.close()
                 self._observation_router = None
-            if self._frame_ingress is not None:
-                try:
-                    self._frame_ingress.close()
-                except Exception as exc:
-                    self.get_logger().error(f"{CLOSE_TAG} frame ingress close raised: {exc}")
-                self._frame_ingress = None
             for pub in list(self._obs_publishers.values()):
                 with contextlib.suppress(Exception):
                     self.destroy_publisher(pub)
@@ -1435,7 +1436,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # Benchmark providers such as LIBERO own native simulator state and are
     # intentionally single-lane.  Keep ROS service/control callbacks on that
-    # same lane; RTP encode/send remains asynchronous in FrameIngress workers.
+    # same lane.  Publishing an observation is now just a ROS publish, the same
+    # cost the real robot's camera driver pays; nothing encodes video here.
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:

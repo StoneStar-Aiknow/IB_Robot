@@ -102,8 +102,14 @@ def atomic_write_json(
         raise CanonicalReportError(f"atomic write failed for {destination}: {exc}") from exc
 
 
-def _episode_identity(record: CanonicalEpisodeRecord) -> tuple[str, str, int, int]:
-    return record.run_id, record.suite, record.task_id, record.episode_index
+def _episode_identity(record: CanonicalEpisodeRecord) -> tuple[str, str, int, int, Any]:
+    return (
+        record.run_id,
+        record.suite,
+        record.task_id,
+        record.episode_index,
+        record.metadata.get("lane_index"),
+    )
 
 
 def _coerce_episode(record: CanonicalEpisodeRecord | Mapping[str, Any]) -> CanonicalEpisodeRecord:
@@ -172,7 +178,7 @@ def reduce_episode_records(
 ) -> CanonicalRunSummary:
     """Reduce ordered episode facts without changing native success semantics."""
     materialized = [_coerce_episode(record) for record in records]
-    seen: set[tuple[str, str, int, int]] = set()
+    seen: set[tuple[str, str, int, int, Any]] = set()
     for record in materialized:
         identity = _episode_identity(record)
         if identity in seen:
@@ -266,13 +272,13 @@ class CanonicalReportWriter:
         self.episodes_path = self.run_root / "episodes.jsonl"
         self.summary_path = self.run_root / "summary.json"
         self._started = False
-        self._seen: set[tuple[str, str, int, int]] = set()
+        self._seen: set[tuple[str, str, int, int, Any]] = set()
 
     @property
     def records(self) -> tuple[CanonicalEpisodeRecord, ...]:
         return tuple(_read_jsonl(self.episodes_path))
 
-    def start_run(self, manifest: Mapping[str, Any]) -> None:
+    def start_run(self, manifest: Mapping[str, Any], *, allow_lanes: bool = False) -> None:
         """Create the run root and initial running manifest before reset."""
         if self._started:
             raise CanonicalReportError("run has already started")
@@ -281,10 +287,15 @@ class CanonicalReportWriter:
             raise CanonicalReportError("initial manifest status must not be terminal")
         if self.run_root.exists():
             existing = list(self.run_root.iterdir())
-            unexpected = [item for item in existing if item.name != "native" or not item.is_dir()]
+            allowed = {"native", "lanes"} if allow_lanes else {"native"}
+            unexpected = [item for item in existing if item.name not in allowed or not item.is_dir()]
             if unexpected:
                 raise CanonicalReportError(f"run root contains unexpected entries: {unexpected}")
         self.run_root.mkdir(parents=True, exist_ok=True)
+        if allow_lanes:
+            # An exclusive claim also prevents two coordinators racing start_run.
+            with (self.run_root / ".aggregation_claim").open("x", encoding="utf-8"):
+                pass
         atomic_write_json(self.manifest_path, payload)
         with self.episodes_path.open("a", encoding="utf-8"):
             pass

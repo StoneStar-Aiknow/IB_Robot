@@ -67,7 +67,9 @@ class SerialSupervisor:
         self.run_id = run_id
         self._phase = Phase.RESET if ready else Phase.WAITING_READY
         self._task_position = 0
-        self._episode_index = 0
+        self._task_ids = plan.assigned_task_ids
+        self._episode_position = 0
+        self._episode_index = plan.episode_indices(self._task_ids[0])[0] if self._task_ids else 0
         self._episode_id = 0
         self._timestamp_ns = 0
         self._prompt = ""
@@ -81,9 +83,9 @@ class SerialSupervisor:
 
     @property
     def current_task_id(self) -> int | None:
-        if self._task_position >= len(self.plan.selected_task_ids):
+        if self._task_position >= len(self._task_ids):
             return None
-        return self.plan.selected_task_ids[self._task_position]
+        return self._task_ids[self._task_position]
 
     @property
     def episode_index(self) -> int:
@@ -101,11 +103,7 @@ class SerialSupervisor:
     def next_command(self, remaining_startup_sec: float) -> Any | None:
         if self._phase == Phase.WAITING_READY or self._phase == Phase.COMPLETED:
             return None
-        task_id = (
-            self.plan.selected_task_ids[self._task_position]
-            if self._task_position < len(self.plan.selected_task_ids)
-            else None
-        )
+        task_id = self._task_ids[self._task_position] if self._task_position < len(self._task_ids) else None
         if self._phase == Phase.RESET:
             if task_id is None:
                 raise SupervisorError("reset requested after all tasks were accounted for")
@@ -199,7 +197,7 @@ class SerialSupervisor:
             self._fatal = True
             self._phase = Phase.FINALIZE_TASK
             return
-        task = self.plan.tasks[self.plan.selected_task_ids[self._task_position]]
+        task = self.plan.tasks[self._task_ids[self._task_position]]
         if episode_id <= 0 or step_id != 0 or timestamp_ns <= 0 or prompt != task.prompt:
             raise SupervisorError("reset identity/timestamp/prompt mismatch")
         self._episode_id = episode_id
@@ -263,20 +261,20 @@ class SerialSupervisor:
             if self._fatal:
                 self._phase = Phase.FINALIZE_TASK
             else:
-                self._episode_index += 1
-                self._phase = Phase.RESET if self._episode_index < self.plan.episodes_per_task else Phase.FINALIZE_TASK
+                self._episode_position += 1
+                indices = self.plan.episode_indices(self.current_task_id)
+                self._phase = Phase.FINALIZE_TASK
+                if self._episode_position < len(indices):
+                    self._episode_index = indices[self._episode_position]
+                    self._phase = Phase.RESET
         elif scope == "task":
             self._task_position += 1
-            self._episode_index = 0
+            self._episode_position = 0
+            if self.current_task_id is not None:
+                self._episode_index = self.plan.episode_indices(self.current_task_id)[0]
             if self._fatal:
-                self._phase = (
-                    Phase.FINALIZE_TASK
-                    if self._task_position < len(self.plan.selected_task_ids)
-                    else Phase.FINALIZE_RUN
-                )
+                self._phase = Phase.FINALIZE_TASK if self._task_position < len(self._task_ids) else Phase.FINALIZE_RUN
             else:
-                self._phase = (
-                    Phase.RESET if self._task_position < len(self.plan.selected_task_ids) else Phase.FINALIZE_RUN
-                )
+                self._phase = Phase.RESET if self._task_position < len(self._task_ids) else Phase.FINALIZE_RUN
         else:
             self._phase = Phase.COMPLETED

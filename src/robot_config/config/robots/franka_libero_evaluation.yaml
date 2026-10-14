@@ -18,6 +18,10 @@ robot:
     adapter: libero
     instance_id: libero
     identity_packages: [robosuite, mujoco, hf-libero]
+    # Adapter lane limit (positive integer; omitted defaults to 1).
+    # Actual lane count is evaluation.parallel.lane_count below.
+    # The launch topology independently supports at most 20 lanes.
+    max_lane_count: 20
 
     # Simulator interface settings. Most users should leave these unchanged;
     # they define the camera inputs, image size, and relative action format.
@@ -49,28 +53,35 @@ robot:
       episodes_per_task: 2
       max_steps: 600
 
-      # Observation transport selection. This is the only field ordinary
-      # users change to switch between the compatible ROS/DDS path and the
-      # low-latency direct-frame H.264/RTP path. Both modes keep the same
-      # distributed loopback inference topology, so this switch changes only
-      # observation delivery. RTP stream defaults are materialized deterministically.
-      observation_transport:
-        mode: dds  # dds | rtp
-        # Advanced RTP overrides are optional. Example:
-        # rtp:
-        #   base_port: 55000
-        #   encoder_backend: software
-        #   decoder_backend: software
-        #   streams:
-        #     observation.images.image:
-        #       endpoint: {host: 127.0.0.1, port: 55000}
+      # Observation transport. This profile delivers observations over the
+      # compatible ROS/DDS path, which is expressed by the absence of a
+      # ``transport`` block on the image observations below -- the same way
+      # every non-RTP robot configuration expresses it.
+      #
+      # For the low-latency H.264/RTP path use the companion configuration,
+      # which declares an explicit transport block per camera exactly the way
+      # the real-robot configurations do (see so101_rtp_distributed.yaml):
+      #
+      #   ros2 launch robot_config robot.launch.py \
+      #     robot_config:=franka_libero_evaluation_rtp
+      #
+      # Both configurations keep the same distributed inference topology and
+      # the same parallel lane layout, so the only difference between them is
+      # observation delivery.
 
       # Controls reproducible initial-state selection. Usually leave unchanged.
       seed: 10000
 
-      # Episodes run serially; parallel evaluation is not supported.
-      use_mp: false
-      num_procs: 1
+      parallel:
+        enabled: true
+        lane_count: 5
+        scheduling: static
+        fail_fast: true
+      inference:
+        # Shared PI05 passed CUDA isolation and two five-lane RTP runs at 5.
+        # This is bounded benchmark validation, not a throughput guarantee.
+        max_in_flight: 5
+        queue_size: 64
 
       # Save the initial simulator state and one state after every action.
       # State files and videos can use substantial disk space; available space
@@ -100,6 +111,11 @@ robot:
         write_canonical: true
 
       timeouts:
+        # Whole-run wall-clock limit from coordinator startup, including model
+        # startup, all episodes and artifact finalization. Consumed only when
+        # parallel is enabled with more than one lane; must be finite and > 0.
+        # Increase for larger suites / more episodes (e.g. 14400.0 for 4 hours).
+        run_timeout_sec: 3600.0
         # Maximum time to wait for required ROS nodes and model inference to
         # become ready. This is a startup limit, not a limit for the whole run.
         startup_timeout_sec: 120.0
@@ -200,7 +216,9 @@ robot:
             model_path: "<MODEL_BUNDLE_DIRECTORY>"
             deployment: torch-cuda
             # Fixed for this Benchmark profile so DDS/RTP compare the same
-            # inference topology. Users only switch observation_transport.mode.
+            # inference topology. The RTP variant of this profile lives in
+            # franka_libero_evaluation_rtp.yaml and declares the same value.
+            # Parallel multi-lane evaluation also requires distributed.
             execution_mode: distributed
             request_timeout: 60.0
             default_task: ""

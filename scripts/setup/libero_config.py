@@ -12,8 +12,11 @@ to a user-home cache. Setup makes this deterministic and non-interactive by:
 4. linking the provider's package-local ``assets`` path to that cache; and
 5. atomically writing ``${WORKSPACE}/venv/ibrobot_libero/config.yaml``.
 
-This script never imports ``libero`` before the config exists and never reads
-or modifies the legacy ``libs/libero`` checkout.
+Set ``IBROBOT_LIBERO_ASSETS_DIR`` to reuse an explicitly selected local asset
+tree instead of downloading when no installed assets or workspace cache exist.
+The same pinned hash validation applies to local and downloaded assets.
+This script never imports ``libero`` before the config exists and never probes
+legacy workspaces automatically.
 """
 
 from __future__ import annotations
@@ -109,32 +112,69 @@ def _validate_assets(assets_dir: Path) -> tuple[int, str]:
 def _prepare_assets(config_dir: Path, provider_root: Path) -> tuple[Path, int, str]:
     """Download/reuse assets and make hf-libero's package lookup deterministic."""
     package_assets = provider_root / "assets"
-    if package_assets.exists() and not package_assets.is_symlink():
-        count, tree_sha256 = _validate_assets(package_assets)
-        return package_assets.resolve(), count, tree_sha256
-
     assets_dir = config_dir / "assets"
-    try:
-        count, tree_sha256 = _validate_assets(assets_dir)
-    except RuntimeError:
+    source_value = os.environ.get("IBROBOT_LIBERO_ASSETS_DIR")
+    can_resume = source_value is None and assets_dir.is_dir() and not assets_dir.is_symlink()
+    if package_assets.exists() or package_assets.is_symlink():
         try:
-            from huggingface_hub import snapshot_download
-        except ImportError as exc:
-            raise RuntimeError("huggingface_hub is required to download LIBERO assets") from exc
-        snapshot_download(
-            repo_id=HF_ASSETS_REPO_ID,
-            repo_type="dataset",
-            revision=HF_ASSETS_REVISION,
-            local_dir=str(assets_dir),
-        )
-        count, tree_sha256 = _validate_assets(assets_dir)
+            count, tree_sha256 = _validate_assets(package_assets)
+        except RuntimeError as exc:
+            if not (can_resume and package_assets.is_symlink() and package_assets.resolve() == assets_dir.resolve()):
+                raise RuntimeError(
+                    f"Invalid existing LIBERO assets at {package_assets}: {exc}. "
+                    "Move this path aside or repair it before retrying; no files were removed."
+                ) from exc
+        else:
+            return package_assets.resolve(), count, tree_sha256
 
-    if package_assets.is_symlink():
-        if package_assets.resolve() != assets_dir.resolve():
-            package_assets.unlink()
-            package_assets.symlink_to(assets_dir, target_is_directory=True)
-    elif package_assets.exists():
-        raise RuntimeError(f"refusing to replace unexpected hf-libero assets path: {package_assets}")
+    assets_valid = False
+    if assets_dir.exists() or assets_dir.is_symlink():
+        try:
+            count, tree_sha256 = _validate_assets(assets_dir)
+        except RuntimeError as exc:
+            if not can_resume:
+                raise RuntimeError(
+                    f"Invalid existing LIBERO assets at {assets_dir}: {exc}. "
+                    "Move this path aside or repair it before retrying; no files were removed."
+                ) from exc
+        else:
+            assets_valid = True
+    if not assets_valid:
+        if source_value is not None:
+            if not source_value.strip():
+                raise RuntimeError("IBROBOT_LIBERO_ASSETS_DIR must name a non-empty assets directory")
+            local_source = Path(source_value).expanduser().resolve()
+            try:
+                count, tree_sha256 = _validate_assets(local_source)
+            except RuntimeError as exc:
+                raise RuntimeError(f"Invalid IBROBOT_LIBERO_ASSETS_DIR={local_source}: {exc}") from exc
+            assets_dir.symlink_to(local_source, target_is_directory=True)
+        else:
+            if can_resume:
+                # Downloads write metadata too; no descendant link is safe to follow.
+                for root, dirs, files in os.walk(assets_dir, followlinks=False):
+                    for name in dirs + files:
+                        path = Path(root) / name
+                        if path.is_symlink():
+                            raise RuntimeError(
+                                f"Cannot resume LIBERO assets download through symlink: {path}. "
+                                "Move this path aside or repair it before retrying; no files were removed."
+                            )
+            try:
+                from huggingface_hub import snapshot_download
+            except ImportError as exc:
+                raise RuntimeError("huggingface_hub is required to download LIBERO assets") from exc
+            snapshot_download(
+                repo_id=HF_ASSETS_REPO_ID,
+                repo_type="dataset",
+                revision=HF_ASSETS_REVISION,
+                local_dir=str(assets_dir),
+            )
+            count, tree_sha256 = _validate_assets(assets_dir)
+
+    if package_assets.exists() or package_assets.is_symlink():
+        if not (package_assets.is_symlink() and package_assets.resolve() == assets_dir.resolve()):
+            raise RuntimeError(f"refusing to replace unexpected hf-libero assets path: {package_assets}")
     else:
         package_assets.symlink_to(assets_dir, target_is_directory=True)
 

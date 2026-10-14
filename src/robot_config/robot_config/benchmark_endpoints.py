@@ -19,10 +19,13 @@ Packages.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+MAX_BENCHMARK_LANES = 20
 
 
 class BenchmarkEndpointError(ValueError):
@@ -45,11 +48,111 @@ class BenchmarkEndpoints:
     namespace: str
     reset_service: str
     step_service: str
+    lane_id: str = ""
+
+    def scope_endpoint(self, endpoint: str | None) -> str:
+        """Scope a transport/observation endpoint to this lane, preserving serial names."""
+        if not endpoint or not self.lane_id:
+            return endpoint or ""
+        if endpoint == self.namespace or endpoint.startswith(f"{self.namespace}/"):
+            return endpoint
+        base = f"/benchmark/{self.instance_id}/"
+        suffix = endpoint[len(base) :] if endpoint.startswith(base) else endpoint.lstrip("/")
+        return f"{self.namespace}/{suffix}"
 
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _FULL_PATH_OVERRIDE_KEYS = frozenset(("namespace", "reset_service", "step_service", "status_topic"))
+
+
+def resolve_benchmark_cloud_deployment(evaluation: Mapping[str, Any]) -> str:
+    """Resolve where the parallel shared cloud owner runs (SSOT switch).
+
+    ``colocated`` (default) co-launches the shared cloud owner in the benchmark
+    launch and pins every lane RTP endpoint to loopback. ``external`` omits the
+    co-launched owner, keeps the profile-declared endpoint hosts, and exports
+    the cloud configs so a ``benchmark_shared_cloud.launch.py`` on another host
+    can own the single shared runtime. Effective only with parallel enabled.
+    """
+    if not isinstance(evaluation, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation must be a mapping")
+    parallel = evaluation.get("parallel", {})
+    if not isinstance(parallel, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel must be a mapping")
+    deployment = parallel.get("cloud_deployment", "colocated")
+    if deployment not in ("colocated", "external"):
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel.cloud_deployment must be 'colocated' or 'external'")
+    return deployment
+
+
+def resolve_benchmark_parallel(evaluation: Mapping[str, Any]) -> tuple[bool, int]:
+    """Resolve the explicit shared-policy opt-in and active static lane count."""
+    if not isinstance(evaluation, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation must be a mapping")
+    enabled = evaluation.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise BenchmarkEndpointError("benchmark.evaluation.enabled must be a boolean")
+    if "lane_count" in evaluation:
+        raise BenchmarkEndpointError("use benchmark.evaluation.parallel.lane_count, not evaluation.lane_count")
+    parallel = evaluation.get("parallel", {})
+    if not isinstance(parallel, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel must be a mapping")
+    parallel_enabled = parallel.get("enabled", False)
+    if not isinstance(parallel_enabled, bool):
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel.enabled must be a boolean")
+    count = parallel.get("lane_count", 1)
+    if type(count) is not int or count < 1:
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel.lane_count must be a positive int (bool rejected)")
+    if count > MAX_BENCHMARK_LANES:
+        raise BenchmarkEndpointError(
+            f"benchmark.evaluation.parallel.lane_count must be <= {MAX_BENCHMARK_LANES}; got {count}"
+        )
+    if parallel.get("scheduling", "static") != "static":
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel.scheduling must be static")
+    if not isinstance(parallel.get("fail_fast", True), bool):
+        raise BenchmarkEndpointError("benchmark.evaluation.parallel.fail_fast must be a boolean")
+    if parallel_enabled:
+        if not enabled:
+            raise BenchmarkEndpointError("benchmark.evaluation.parallel.enabled requires evaluation.enabled=true")
+        if parallel.get("fail_fast", True) is not True:
+            raise BenchmarkEndpointError("parallel benchmark requires fail_fast=true")
+        if count > 1 and evaluation.get("output", {}).get("write_canonical", True) is not True:
+            raise BenchmarkEndpointError("parallel benchmark requires output.write_canonical=true")
+    return parallel_enabled, count if parallel_enabled else 1
+
+
+def resolve_benchmark_inference(evaluation: Mapping[str, Any]) -> dict[str, int]:
+    """Validate shared admission settings, effective only with parallel.enabled=true.
+
+    Serial evaluation does not consume these settings, but malformed settings
+    are rejected in every mode. A single lane with parallel enabled still uses
+    shared inference and consumes both limits. The concurrency level itself is
+    model-neutral here; the shared owner enforces what it can actually host.
+    """
+    inference = evaluation.get("inference", {})
+    if not isinstance(inference, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation.inference must be a mapping")
+    limits = {}
+    for key, default in (("max_in_flight", 1), ("queue_size", 64)):
+        value = inference.get(key, default)
+        if type(value) is not int or value < 1:
+            raise BenchmarkEndpointError(f"benchmark.evaluation.inference.{key} must be a positive int (bool rejected)")
+        limits[key] = value
+    if limits["queue_size"] < limits["max_in_flight"]:
+        raise BenchmarkEndpointError("benchmark.evaluation.inference.queue_size must be >= max_in_flight")
+    return limits
+
+
+def resolve_benchmark_run_timeout(evaluation: Mapping[str, Any]) -> float:
+    """Resolve the multi-lane coordinator's whole-run wall-clock limit."""
+    timeouts = evaluation.get("timeouts", {})
+    if not isinstance(timeouts, Mapping):
+        raise BenchmarkEndpointError("benchmark.evaluation.timeouts must be a mapping")
+    value = timeouts.get("run_timeout_sec", 3600.0)
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise BenchmarkEndpointError("benchmark.evaluation.timeouts.run_timeout_sec must be finite and positive")
+    return float(value)
 
 
 def _is_non_empty_exact_string(value: Any) -> bool:
@@ -132,6 +235,8 @@ def _reject_full_path_overrides(benchmark: Mapping[str, Any]) -> None:
 
 def resolve_benchmark_endpoints(
     robot_config: Mapping[str, Any],
+    *,
+    lane_id: str | None = None,
 ) -> BenchmarkEndpoints:
     """Resolve the deterministic benchmark ROS endpoint identity.
 
@@ -160,7 +265,12 @@ def resolve_benchmark_endpoints(
     adapter_name = _require_adapter(benchmark)
     instance_id = _resolve_instance_id(benchmark, benchmark_type)
 
-    namespace = f"/benchmark/{instance_id}"
+    if lane_id is not None:
+        if not isinstance(lane_id, str) or not re.fullmatch(r"lane_[0-9]{3,}", lane_id):
+            raise BenchmarkEndpointError("lane_id must use the canonical lane_NNN format when provided")
+        namespace = f"/benchmark/{instance_id}/{lane_id}"
+    else:
+        namespace = f"/benchmark/{instance_id}"
     return BenchmarkEndpoints(
         benchmark_type=benchmark_type,
         adapter_name=adapter_name,
@@ -168,4 +278,5 @@ def resolve_benchmark_endpoints(
         namespace=namespace,
         reset_service=f"{namespace}/reset",
         step_service=f"{namespace}/step",
+        lane_id=lane_id or "",
     )

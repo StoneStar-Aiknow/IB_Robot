@@ -1493,6 +1493,19 @@ ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy mode
 ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_single_arm_distributed.yaml control_mode:=model_inference use_sim:=true
 # 算力机器（需设置相同 ROS_DOMAIN_ID）：
 # ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy model_path:=/absolute/path/to/policy_bundle deployment:=cuda
+
+# Benchmark 评测 — 与上面的真机分布式是同一套用法，不是另一条路径。
+# 用几个终端由配置文件决定，不由命令行开关决定：档里声明了 rtp transport 就是两个终端
+# （云端单独起），没声明就是 DDS、一个终端（云端随 Edge 一起起）。
+#
+# DDS（一个终端）：
+ros2 launch robot_config robot.launch.py robot_config:=franka_libero_evaluation
+#
+# RTP（两个终端、两台机器；云端先起，两台机器 ROS_DOMAIN_ID 要相同）：
+# 算力机器：
+ros2 launch inference_service cloud_inference.launch.py model_path:=/absolute/path/to/policy_bundle deployment:=torch-cuda robot_config_path:=/absolute/path/to/franka_libero_evaluation_rtp.yaml
+# 端侧（跑 LIBERO 仿真）：
+ros2 launch robot_config robot.launch.py robot_config:=franka_libero_evaluation_rtp
 ```
 
 相对 `model_path` 只相对于绝对路径环境变量 `WORKSPACE` 解析。Pipeline ID 决定默认 Action、

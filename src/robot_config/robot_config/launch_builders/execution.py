@@ -6,7 +6,11 @@ import json
 
 from launch_ros.actions import Node
 
-from robot_config.benchmark_endpoints import resolve_benchmark_endpoints
+from robot_config.benchmark_endpoints import (
+    resolve_benchmark_endpoints,
+    resolve_benchmark_inference,
+    resolve_benchmark_parallel,
+)
 from robot_config.dispatch_strategies import (
     reject_legacy_smoothing_config,
     resolve_dispatch_strategies,
@@ -17,8 +21,11 @@ from robot_config.inference_config import (
     InferenceConfigError,
     InferencePipelineConfig,
     parse_inference_config,
+    scheduler_enabled_from_raw_config,
 )
+from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
+from robot_config.observation_transport import robot_config_declares_rtp_observation
 from robot_config.runtime_target import RuntimeTarget
 from robot_config.utils import parse_bool, prepare_lerobot_env
 
@@ -55,17 +62,36 @@ def _resolve_executor_type(executor_type: object) -> tuple[object, bool]:
     return canonical_type, True
 
 
-def _benchmark_external_video_producer(
+def _colocated_cloud_inference(
     runtime_target: RuntimeTarget,
     pipeline: InferencePipelineConfig,
+    robot_config: dict,
 ) -> bool:
-    # Benchmark distributed pipelines use the same loopback cloud role in both
-    # DDS and RTP modes.  Keeping the inference topology stable makes the
-    # user-facing observation_transport.mode switch change only observation
-    # delivery instead of also adding/removing an inference process.
+    """Whether this launch also starts the cloud half of a distributed pipeline.
+
+    A distributed deployment is two processes.  The real-robot route has always
+    left the second one to the operator -- it runs on the compute machine,
+    started by its own command -- and that is not changed here: this returns
+    False for every non-benchmark target, so the real-robot launch graph is
+    exactly what it was.
+
+    The benchmark route co-launched the cloud process unconditionally, which is
+    convenient on one host and impossible across two: the co-launched node binds
+    ``endpoint.host``, and a host that belongs to the *other* machine cannot be
+    bound here (observed: ``bind(('192.0.2.1', 55000))`` ->
+    ``OSError: [Errno 99] Cannot assign requested address``).
+
+    So the benchmark asks the configuration instead.  A profile that declares
+    RTP names a remote endpoint, and is therefore two commands -- the same shape
+    as the real robot, whether the second command runs in another terminal or on
+    another machine.  A profile with no RTP observation keeps everything on this
+    host and stays a single command.
+    """
     if pipeline.execution_mode != "distributed":
         return False
-    return runtime_target is RuntimeTarget.BENCHMARK
+    if runtime_target is not RuntimeTarget.BENCHMARK:
+        return False
+    return not robot_config_declares_rtp_observation(robot_config)
 
 
 def _attention_viz_request(inference_config: dict) -> tuple[bool, str, dict]:
@@ -226,9 +252,11 @@ def _validate_benchmark_evaluation(evaluation: object) -> None:
         raise BenchmarkEvaluationError(
             "benchmark.evaluation.num_procs must be exactly 1 (bool rejected); parallel execution is not supported"
         )
-    lane_count = evaluation.get("lane_count", 1)
-    if type(lane_count) is bool or type(lane_count) is not int or lane_count < 1:
-        raise BenchmarkEvaluationError("benchmark.evaluation.lane_count must be a positive int (bool rejected)")
+    try:
+        resolve_benchmark_parallel(evaluation)
+        resolve_benchmark_inference(evaluation)
+    except ValueError as exc:
+        raise BenchmarkEvaluationError(str(exc)) from exc
 
     # 6. max_steps: default 600; must be positive int.
     max_steps = evaluation.get("max_steps", 600)
@@ -383,6 +411,7 @@ def generate_inference_node(
     use_sim: object = False,
     use_sim_time: object | None = None,
     runtime_target: RuntimeTarget = RuntimeTarget.HARDWARE,
+    include_cloud: bool = True,
 ) -> list[Node]:
     """Create one unified local or distributed-edge process per pipeline."""
 
@@ -421,8 +450,6 @@ def generate_inference_node(
             "video_descriptor_topic": transport.video_descriptor_topic or "",
             "video_status_topic": transport.video_status_topic or "",
         }
-        if runtime_target is RuntimeTarget.BENCHMARK:
-            parameters["external_video_producer"] = _benchmark_external_video_producer(runtime_target, pipeline)
         # Scheduled-path endpoints are passed to the pipeline node only
         # when the scheduler is enabled; the node registers the scheduled
         # action servers + serving status iff scheduler_enabled=true.
@@ -481,7 +508,7 @@ def generate_inference_node(
                 output="screen",
             )
         )
-        if _benchmark_external_video_producer(runtime_target, pipeline):
+        if include_cloud and _colocated_cloud_inference(runtime_target, pipeline, robot_config):
             nodes.append(
                 Node(
                     package="inference_service",
@@ -516,7 +543,14 @@ def generate_inference_node(
     return nodes
 
 
-def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_sim: object = False) -> Node:
+def generate_action_dispatcher_node(
+    robot_config: dict,
+    control_mode: str,
+    use_sim: object = False,
+    *,
+    benchmark_step_service: str | None = None,
+    namespace: str = "",
+) -> Node:
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
@@ -547,11 +581,16 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     # never fills a full service path; only benchmark.type/instance_id drive
     # the resolver (benchmark endpoint resolver). When executor.type=benchmark, also validate the
     # checkpoint-centric evaluation selection (suite/tasks/episodes/single-lane).
-    benchmark_step_service = ""
+    resolved_benchmark_step_service = ""
     if executor_type == "benchmark":
-        benchmark_step_service = _resolve_benchmark_step_service(robot_config)
+        resolved_benchmark_step_service = benchmark_step_service or _resolve_benchmark_step_service(robot_config)
         benchmark_section = robot_config.get("benchmark", {}) or {}
         _validate_benchmark_evaluation(benchmark_section.get("evaluation", {}))
+
+    def lane_endpoint(endpoint: str) -> str:
+        if not namespace:
+            return endpoint
+        return resolve_benchmark_endpoints(robot_config, lane_id=namespace.rsplit("/", 1)[-1]).scope_endpoint(endpoint)
 
     # benchmark setup: resolve joint_names. When joints.all is an explicit empty list
     # (benchmark YAMLs with no joint consumer), omit the parameter entirely
@@ -588,8 +627,8 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         "exhaustion_timeout": 2.0,
         "joint_state_topic": "/joint_states",
         "robot_config_path": str(robot_config_path),
-        "inference_action_server": pipeline.transport.action_server,
-        "inference_reset_service": pipeline.transport.reset_service,
+        "inference_action_server": lane_endpoint(pipeline.transport.action_server),
+        "inference_reset_service": lane_endpoint(pipeline.transport.reset_service),
         "inference_timeout_sec": pipeline.request_timeout,
         "policy_reset_timeout_sec": executor_config.get("policy_reset_timeout_sec", 2.0),
         "inference_prompt": executor_config.get("inference_prompt", ""),
@@ -609,7 +648,7 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
                 "executor_type": executor_type,
                 "scheduler_mode": scheduler_mode,
                 "execution_timeout_sec": execution_timeout_sec,
-                "benchmark_step_service": benchmark_step_service,
+                "benchmark_step_service": resolved_benchmark_step_service,
             }
         )
     else:
@@ -628,6 +667,7 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         package="action_dispatch",
         executable="action_dispatcher_node",
         name="action_dispatcher",
+        namespace=namespace,
         parameters=[dispatcher_parameters],
         output="screen",
     )
@@ -684,6 +724,18 @@ def _benchmark_evaluation_enabled(robot_config: dict) -> bool:
     return isinstance(evaluation, dict) and bool(evaluation.get("enabled", False))
 
 
+def _benchmark_lane_count(robot_config: dict) -> int:
+    """Resolve and validate the static benchmark lane count from the SSOT."""
+    benchmark = robot_config.get("benchmark", {})
+    evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
+    if not isinstance(evaluation, dict):
+        return 1
+    try:
+        return resolve_benchmark_parallel(evaluation)[1]
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _benchmark_process_exit_shutdown_factory(node: object):
     """Build a Benchmark-only handler for the legacy execution topology."""
     from launch.actions import EmitEvent
@@ -721,6 +773,13 @@ def generate_execution_nodes(
 
     if not control_mode or control_mode == "default":
         control_mode = robot_config.get("default_control_mode", "model_inference")
+
+    if (
+        runtime_target is RuntimeTarget.BENCHMARK
+        and _benchmark_evaluation_enabled(robot_config)
+        and scheduler_enabled_from_raw_config(robot_config, control_mode)
+    ):
+        raise BenchmarkEvaluationError("benchmark evaluation does not support inference.scheduler.enable=true")
 
     inference = _validated_inference(robot_config, control_mode)
     scheduler = inference.scheduler if inference.scheduler is not None else None
@@ -777,20 +836,82 @@ def generate_execution_nodes(
         ]
         return [*inference_nodes, scheduler_node, scheduled_dispatcher, *exit_handlers]
 
-    # False or absent selects the unchanged legacy behavior.
-    inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
-    if not _executor_enabled(robot_config, control_mode):
-        # A recording-only deployment streams video but has no inference backend
-        # to answer a request. Dispatching one anyway lets it time out, and the
-        # timeout invalidates the distributed session, which stops the RTP
-        # sender for good. The pipeline node stays because it owns that sender.
-        return list(inference_nodes)
-    dispatcher = generate_action_dispatcher_node(
-        robot_config,
-        control_mode,
-        _resolve_use_sim_time(use_sim, use_sim_time),
+    # False or absent selects the unchanged legacy behavior. Benchmark lanes
+    # intentionally share the inference nodes but own one dispatcher each.
+    parallel_enabled = False
+    if runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config):
+        benchmark = robot_config.get("benchmark", {})
+        evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
+        parallel_enabled = resolve_benchmark_parallel(evaluation)[0]
+    if parallel_enabled and not _executor_enabled(robot_config, control_mode):
+        raise BenchmarkEvaluationError(
+            f"control mode {control_mode!r} disables the executor while benchmark parallel "
+            "evaluation is enabled; every lane requires an action dispatcher"
+        )
+    # Lanes need their own edge process exactly when the selected pipeline is
+    # distributed (DDS or RTP delivery); the shared cloud owner for those lanes
+    # is generated by the benchmark builder. A monolithic parallel profile has
+    # no edges at all and shares policy frontends instead.
+    distributed_parallel = False
+    lane_robot_configs = []
+    if parallel_enabled:
+        distributed_parallel = _selected_executor_pipeline(robot_config, control_mode).execution_mode == "distributed"
+        lane_config_paths = robot_config.get("_benchmark_lane_configs", [])
+        if not isinstance(lane_config_paths, list) or len(lane_config_paths) != _benchmark_lane_count(robot_config):
+            raise BenchmarkEvaluationError(
+                "parallel benchmark requires materialized lane configs from benchmark builder"
+            )
+        lane_robot_configs = [
+            load_robot_config_dict(path, materialize_benchmark_transport=True) for path in lane_config_paths
+        ]
+    if not parallel_enabled:
+        inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
+        if not _executor_enabled(robot_config, control_mode):
+            # A recording-only deployment streams video but has no inference backend
+            # to answer a request. Dispatching one anyway lets it time out, and the
+            # timeout invalidates the distributed session, which stops the RTP
+            # sender for good. The pipeline node stays because it owns that sender.
+            return list(inference_nodes)
+    elif distributed_parallel:
+        inference_nodes = []
+        for lane_robot_config in lane_robot_configs:
+            inference_nodes.extend(
+                generate_inference_node(
+                    lane_robot_config,
+                    control_mode,
+                    use_sim,
+                    use_sim_time,
+                    runtime_target,
+                    include_cloud=False,
+                )
+            )
+    else:
+        inference_nodes = []
+    benchmark_lanes = (
+        _benchmark_lane_count(robot_config)
+        if runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config)
+        else 1
     )
-    nodes = [*inference_nodes, dispatcher]
+    dispatchers: list[Node] = []
+    for index in range(benchmark_lanes):
+        lane_id = f"lane_{index:03d}" if parallel_enabled else ""
+        lane_robot_config = lane_robot_configs[index] if lane_id else robot_config
+        step_service = None
+        namespace = ""
+        if lane_id:
+            endpoints = resolve_benchmark_endpoints(robot_config, lane_id=lane_id)
+            step_service = endpoints.step_service
+            namespace = endpoints.namespace
+        dispatchers.append(
+            generate_action_dispatcher_node(
+                lane_robot_config,
+                control_mode,
+                _resolve_use_sim_time(use_sim, use_sim_time),
+                benchmark_step_service=step_service,
+                namespace=namespace,
+            )
+        )
+    nodes = [*inference_nodes, *dispatchers]
     if runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config):
         # The benchmark configuration uses the legacy dispatcher topology
         # (dispatch.scheduler is a benchmark contract, not inference.scheduler).
@@ -901,6 +1022,8 @@ def generate_scheduled_action_dispatcher_node(
     control_mode: str,
     scheduler: object,
     use_sim_time: bool,
+    *,
+    namespace: str = "",
 ) -> Node:
     """ScheduledActionDispatcher executable. Shares node name
     `/action_dispatcher` with the legacy dispatcher; the two never coexist."""
@@ -924,6 +1047,7 @@ def generate_scheduled_action_dispatcher_node(
         package="action_dispatch",
         executable="scheduled_action_dispatcher_node",
         name="action_dispatcher",
+        namespace=namespace,
         parameters=[
             {
                 "queue_size": executor_config.get("queue_size", 100),

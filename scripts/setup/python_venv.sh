@@ -192,6 +192,45 @@ if numpy_version != "1.26.4":
 PY
 }
 
+resolve_egl_probe_cmake() {
+    # ``egl_probe`` and ``hf-egl-probe`` are pulled in by the LeRobot ``libero``
+    # extra (through robomimic), and both shell out to ``cmake`` from inside
+    # pip's build isolation. On a workspace this script has already set up, two
+    # things conspire to make that fail:
+    #
+    #   * LeRobot depends on the ``cmake`` PyPI package, so ``<venv>/bin/cmake``
+    #     is a Python console script that imports its own ``cmake`` module. Under
+    #     build isolation that import fails, the script exits 1, and egl_probe
+    #     concludes cmake is absent.
+    #   * That package currently resolves to CMake 4.x, which removed support for
+    #     ``cmake_minimum_required`` below 3.5 outright -- and egl_probe's
+    #     CMakeLists declares exactly that. So even the package's real binary,
+    #     reached directly, cannot configure the project.
+    #
+    # The build therefore needs a real cmake executable older than 4. Print the
+    # first one on PATH; the caller puts that single file, via a shim directory,
+    # ahead of PATH for the install. Prepending the directory that holds it (in
+    # practice /usr/bin) would also shadow ``pip`` itself and silently redirect
+    # the whole install to the user site directory.
+    local candidate magic version
+    while IFS= read -r candidate; do
+        [[ -x "${candidate}" ]] || continue
+        # The PyPI console script is text opening with a shebang; a distribution
+        # package ships an ELF binary. Only the binary survives build isolation.
+        magic="$(head -c 2 "${candidate}" 2>/dev/null || true)"
+        if [[ "${magic}" == '#!' ]]; then
+            continue
+        fi
+        version="$("${candidate}" --version 2>/dev/null | head -1 | awk '{print $3}')"
+        [[ -n "${version}" ]] || continue
+        if (( ${version%%.*} < 4 )); then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done < <(type -a -p cmake 2>/dev/null)
+    return 1
+}
+
 install_lerobot_editable() {
     local pip_runner=("$@")
 
@@ -218,6 +257,7 @@ install_lerobot_editable() {
     # distribution before installing hf-libero so the two providers never
     # coexist under the same top-level Python package.
     local lerobot_extras=(smolvla pi diffusion dataset deepdiff-dep)
+    local libero_extra_enabled=false
     if [[ "${SETUP_PROFILE:-full}" != "inference" ]]; then
         lerobot_extras+=(kinematics)
     fi
@@ -225,6 +265,7 @@ install_lerobot_editable() {
         log_info "Removing the legacy libs/libero editable provider, if installed..."
         "${pip_runner[@]}" uninstall -y libero >/dev/null 2>&1 || true
         lerobot_extras+=(libero)
+        libero_extra_enabled=true
         log_info "Enabling the local LeRobot libero extra for Ubuntu benchmark setup."
     fi
 
@@ -234,8 +275,41 @@ install_lerobot_editable() {
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && -n "${BENCHMARK_PIP_CONSTRAINTS:-}" ]]; then
         constraint_args+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
     fi
-    run_cmd "${pip_runner[@]}" install "${constraint_args[@]}" -e \
-        "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
+
+    # Only the libero extra drags in the egl_probe C build; every other extra is
+    # pure Python or ships wheels, so the rest of the matrix keeps the plain PATH.
+    local install_path="${PATH}"
+    local cmake_shim_dir=""
+    if [[ "${libero_extra_enabled}" == true ]]; then
+        local egl_probe_cmake
+        if ! egl_probe_cmake="$(resolve_egl_probe_cmake)"; then
+            log_error "The LeRobot libero extra needs a real cmake executable older than 4 to build egl_probe."
+            log_error "None was found on PATH. Install the distribution package (apt-get install cmake) and re-run setup."
+            exit 1
+        fi
+        cmake_shim_dir="$(mktemp -d)"
+        ln -s "${egl_probe_cmake}" "${cmake_shim_dir}/cmake"
+        install_path="${cmake_shim_dir}:${PATH}"
+        log_info "Building egl_probe with ${egl_probe_cmake} ($("${egl_probe_cmake}" --version | head -1))."
+    fi
+
+    local install_status=0
+    # The subshell is what keeps the shim out of the rest of setup: ``run_cmd``
+    # is a shell function, and in bash a variable assignment prefixed to a
+    # function call outlives the call, so ``PATH=... run_cmd ...`` would leave
+    # the shim directory on PATH for every later step. Scoping PATH inside a
+    # subshell keeps run_cmd's DRY_RUN/VERBOSE handling and the temporary PATH.
+    (
+        PATH="${install_path}"
+        run_cmd "${pip_runner[@]}" install "${constraint_args[@]}" -e \
+            "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
+    ) || install_status=$?
+    # An ``A && B`` list whose condition is false exits 1, which ``set -e`` in
+    # scripts/setup.sh would treat as a failed install. Keep it an if block.
+    if [[ -n "${cmake_shim_dir}" ]]; then
+        rm -rf "${cmake_shim_dir}"
+    fi
+    return "${install_status}"
 }
 
 install_graspgen_torch_abi() {

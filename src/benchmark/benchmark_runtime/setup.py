@@ -20,6 +20,7 @@ setup(
         "console_scripts": [
             "benchmark_environment_node = benchmark_runtime.environment_node:main",
             "benchmark_evaluator_node = benchmark_runtime.evaluator_node:main",
+            "benchmark_coordinator_node = benchmark_runtime.coordinator_node:main",
         ],
         # Concrete adapters register in their own packages; the generic
         # runtime remains provider-agnostic.
