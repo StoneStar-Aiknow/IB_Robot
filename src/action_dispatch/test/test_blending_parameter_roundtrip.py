@@ -266,7 +266,8 @@ def test_non_integer_override_rejected_at_declaration(node_type, value):
 
 
 def test_n_action_steps_descriptor_metadata_is_read_only(node_type):
-    """The parameter descriptor itself reports read_only, not just the callback."""
+    """The parameter descriptor itself reports read_only; it is the single
+    mechanism rejecting runtime writes (no per-name callback branch)."""
     rclpy.init(args=[])
     node = node_type()
     try:

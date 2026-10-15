@@ -605,11 +605,6 @@ class ScheduledActionDispatcherNode(Node):
                     return SetParametersResult(successful=False, reason="Use ~/toggle_smoothing at runtime")
                 # Single-use object identity, not a flag that concurrent writes can inherit.
                 self._blending_update = None
-            if parameter.name == "n_action_steps":
-                # Startup read-only: the chunk planner snapshot is fixed at
-                # init, so a runtime write would leave ros2 param showing a
-                # new value the planner never consumes.
-                return SetParametersResult(successful=False, reason="n_action_steps is startup read-only")
         return SetParametersResult(successful=True)
 
     def _toggle_smoothing_cb(self, _request, response: Empty.Response) -> Empty.Response:

@@ -175,7 +175,8 @@ smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及�
 - **n_action_steps（已支持）**：静态执行前缀截断复用与 auto_horizon 相同的
   prefix-truncation 骨架（`_plan_prefix_truncation`：截断为 `[skip, N)`、计划级补货阈值
   强制 0），horizon 来源换成 robot YAML 的静态 `dispatch.n_action_steps`。结果级
-  `execution_horizon` 被有意忽略。详见「n_action_steps 静态前缀」。
+  `execution_horizon` 不参与本策略的 horizon 选择（静态 N 是唯一来源），公共 horizon
+  合法性校验照常执行。详见「n_action_steps 静态前缀」。
 - **RTC（规划中的扩展点，配置名未开放）**：`PlanSource` 记录 request 及适用的 generation/session 身份；直接单源计划的
   `PlanSnapshot.next_position` 包括 skip 和容量丢弃前缀。revision 只用于本地 reservation 失效。
   ensemble 没有精确单源坐标，最近来源仅用于诊断；本地接纳/topic 进度不是物理完成或远端缓存确认。

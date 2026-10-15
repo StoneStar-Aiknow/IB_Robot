@@ -190,7 +190,9 @@ scheduled stop/safe-stop/close/restart clear both stores, including inactive met
   prefix-truncation skeleton as auto_horizon (`_plan_prefix_truncation`: truncate to
   `[skip, N)` and force the plan-level replenishment watermark to 0); the horizon source
   becomes the static `dispatch.n_action_steps` from robot YAML. The result-level
-  `execution_horizon` is deliberately ignored. See "n_action_steps static prefix" below.
+  `execution_horizon` does not participate in this strategy's horizon selection (the
+  static N is the sole horizon source); the shared horizon legality check still runs.
+  See "n_action_steps static prefix" below.
 - **RTC (planned extension, strategy name not yet open)**: `PlanSource` records request and applicable generation/session IDs.
   Direct single-source `PlanSnapshot.next_position` includes skipped/clipped prefixes.
   Revision only invalidates local reservations. Ensemble has no exact single-source coordinate;
