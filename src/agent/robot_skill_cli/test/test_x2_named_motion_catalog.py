@@ -5,11 +5,13 @@ from pathlib import Path
 import yaml
 
 from embodied_common.dispatch_binding import delegated_executor_identity
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 
-SRC = Path(__file__).resolve().parents[2]
-CONFIG_PATH = SRC / "robot_config" / "config" / "robots" / "aimdk_x2_skills.yaml"
-RUNTIME_PROFILE = SRC / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
+CONFIG_PATH = resolve_robot_config_path(config_name="aimdk_x2_skills")
+# The X2 runtime is built only with --aimdk; read its profile from the checkout.
+REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
+RUNTIME_PROFILE = REPOSITORY_ROOT / "src" / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
 
 
 def _snapshot():

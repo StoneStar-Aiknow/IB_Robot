@@ -151,7 +151,6 @@ robot:
     enabled: false
     entry_mode: hermes
     skill_catalog_source_mode: development
-    skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: so101_single_arm
     debug_tracing: true
     task_input_topic: /voice_command

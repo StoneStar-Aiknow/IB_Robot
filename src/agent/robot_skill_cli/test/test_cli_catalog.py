@@ -14,6 +14,7 @@ import yaml
 
 from embodied_common.skill_request import canonical_skill_payload, skill_payload_hash
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
@@ -21,7 +22,9 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 # before its logical interfaces can resolve; offline catalog tests use the
 # self-contained legacy variant, which compiles the same so101_arm_v1
 # capability surface (see test_so101_v1_catalog_identity.py for the digest).
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
+CONFIG_PATH = resolve_robot_config_path(config_name="so101_single_arm_legacy")
+# Repository-level fixtures (other robot packages, model bundles) live outside this package.
+_REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
 
 
 def _enabled_game_view() -> dict:
@@ -46,9 +49,8 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
     from robot_config import loader
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    root = Path(__file__).resolve().parents[3]
-    config_path = root / "src/robot_config/config/robots/lekiwi_lidar.yaml"
-    mount_path = root / "src/robots/lekiwi/lekiwi_description/config/lekiwi_mid360_mount.yaml"
+    config_path = resolve_robot_config_path(config_name="lekiwi_lidar")
+    mount_path = _REPOSITORY_ROOT / "src/robots/lekiwi/lekiwi_description/config/lekiwi_mid360_mount.yaml"
     original_resolver = loader.resolve_ros_path
 
     def resolve_path(value):
@@ -77,8 +79,7 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
 def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    root = Path(__file__).resolve().parents[3]
-    config_path = root / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
+    config_path = resolve_robot_config_path(config_name="lekiwi_nav_grasp")
     config = load_robot_config_dict(config_path)
 
     snapshot = compile_local_snapshot(config, config_path)
@@ -171,12 +172,10 @@ def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tm
     from skill_library.skill_executor_node import SkillExecutorNode
 
     # Hermetic copy: the checkout shares the model bundles but has no approved
-    # camera calibration (clearing the artifact keeps the inline transform),
-    # and the catalog source root must stay absolute for a tmp path.
+    # camera calibration (clearing the artifact keeps the inline transform).
     copied = yaml.safe_load((CONFIG_PATH.parent / "lekiwi_nav_grasp.yaml").read_text(encoding="utf-8"))
     robot = copied["robot"]
     robot["sensor_calibration"]["artifacts"]["base_to_front_camera"] = ""
-    robot["embodied"]["skill_catalog_source_root"] = str(Path(__file__).resolve().parents[2] / "skill_catalog")
     config_path = tmp_path / "robot.yaml"
     config_path.write_text(yaml.safe_dump(copied), encoding="utf-8")
 
@@ -347,8 +346,8 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
 def test_pc_grasp_catalog_registers_enabled_delegated_executors(monkeypatch):
     from robot_skill_cli.catalog import load_capability_catalog
 
-    pc_config = CONFIG_PATH.parents[2] / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
-    monkeypatch.setenv("WORKSPACE", str(pc_config.parents[4]))
+    pc_config = CONFIG_PATH.parent / "lekiwi_handeye_realsense_grasp_pc.yaml"
+    monkeypatch.setenv("WORKSPACE", str(_REPOSITORY_ROOT))
 
     view = load_capability_catalog(config_path=pc_config)
 

@@ -32,7 +32,12 @@ from skill_catalog.digest import (
     to_canonical_json,
 )
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
+from skill_catalog.source import (
+    AmentShareSkillSource,
+    DevelopmentStagingSkillSource,
+    DirectoryReleaseSkillSource,
+    resolve_development_source_root,
+)
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -209,20 +214,15 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
     embodied = robot_config["embodied"]
     execution = embodied.get("execution", {})
     source_mode = embodied.get("skill_catalog_source_mode", "installed")
-    source_root = Path(embodied.get("skill_catalog_source_root", ""))
+    source_root = embodied.get("skill_catalog_source_root", "")
     if source_mode == "development":
-        if not source_root.is_absolute():
-            repository_root = next((parent for parent in config_path.parents if parent.name == "src"), None)
-            if repository_root is None:
-                source_mode = "installed"
-            else:
-                source_root = repository_root.parent / source_root
-        if source_mode == "installed":
+        development_root = resolve_development_source_root(source_root, config_path)
+        if development_root is None:
             source = AmentShareSkillSource()
         else:
-            source = DevelopmentStagingSkillSource(source_root)
+            source = DevelopmentStagingSkillSource(development_root)
     elif source_mode == "production":
-        source = DirectoryReleaseSkillSource(source_root)
+        source = DirectoryReleaseSkillSource(Path(source_root))
     else:
         source = AmentShareSkillSource()
     # Keep the ROS-independent CLI catalog context aligned with the runtime

@@ -26,31 +26,9 @@ from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
 from robot_runtime import contract as RUNTIME
+from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup")
-
-
-def _resolve_development_source_root(config_path: Path, configured_root: str) -> Path | None:
-    module_path = Path(__file__).resolve()
-    anchors = [config_path]
-    repository_root = next((parent.parent for parent in module_path.parents if parent.name == "src"), None)
-    if repository_root is not None:
-        install_root = repository_root / "install"
-        try:
-            config_path.absolute().relative_to(install_root)
-        except ValueError:
-            pass
-        else:
-            anchors.append(module_path)
-    for anchor in anchors:
-        try:
-            repository_root = next(parent for parent in anchor.parents if parent.name == "src").parent
-        except StopIteration:
-            continue
-        candidate = (repository_root / configured_root).resolve()
-        if candidate.is_dir():
-            return candidate
-    return None
 
 
 def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
@@ -198,10 +176,16 @@ def generate_embodied_nodes(
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
     skill_catalog_source_mode = embodied_config.get("skill_catalog_source_mode", "installed")
     skill_catalog_source_root = embodied_config.get("skill_catalog_source_root", "")
-    if skill_catalog_source_root and not Path(skill_catalog_source_root).is_absolute():
-        config_path = Path(robot_config.get("_config_path", ""))
-        resolved_source_root = _resolve_development_source_root(config_path, skill_catalog_source_root)
+    if skill_catalog_source_mode == "development":
+        config_path = robot_config.get("_config_path", "")
+        resolved_source_root = resolve_development_source_root(
+            skill_catalog_source_root, Path(config_path) if config_path else None
+        )
         if resolved_source_root is None:
+            logger.warning(
+                "skill_catalog has no source tree (not a --symlink-install build); "
+                "development mode falls back to the installed catalog"
+            )
             skill_catalog_source_mode = "installed"
             skill_catalog_source_root = ""
         else:

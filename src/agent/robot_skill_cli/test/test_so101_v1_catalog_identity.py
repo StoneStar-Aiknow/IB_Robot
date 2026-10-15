@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot
 
-SRC_ROOT = Path(__file__).resolve().parents[2]
-ROBOT_CONFIG_DIR = SRC_ROOT / "robot_config" / "config" / "robots"
+REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
 
 # Rebased onto upstream master 830a9d2fd: the robot-context contract moved to
 # schema v3 (supported_control_modes, versioned execution endpoints, new
@@ -30,8 +30,8 @@ SO101_V1_CAPABILITY_DIGEST = "9899815166f5684ba69b8401c94e623a90c41460be308e7250
 
 
 def test_so101_v1_registry_and_capability_digests_match_base_identity(monkeypatch) -> None:
-    monkeypatch.setenv("WORKSPACE", str(SRC_ROOT.parent))
-    config_path = ROBOT_CONFIG_DIR / "so101_single_arm.yaml"
+    monkeypatch.setenv("WORKSPACE", str(REPOSITORY_ROOT))
+    config_path = resolve_robot_config_path(config_name="so101_single_arm")
     # The compiler test reads declarations only; the public model binder
     # supplies the live arm context that is deferred here.
     config = load_robot_config_dict(config_path, defer_interface_binding=True)

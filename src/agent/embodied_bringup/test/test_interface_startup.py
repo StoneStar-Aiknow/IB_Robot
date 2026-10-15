@@ -26,13 +26,11 @@ def _daemon_command(action) -> list[str]:
 
 @pytest.fixture
 def startup(monkeypatch, tmp_path, public_description):
-    source = Path(__file__).parents[2]
     spec = importlib.util.spec_from_file_location(
-        "embodied_interface_launch_test", source / "embodied_bringup/launch/embodied_pipeline.launch.py"
+        "embodied_interface_launch_test", Path(__file__).parents[1] / "launch" / "embodied_pipeline.launch.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "get_package_share_directory", lambda package: str(source / package))
     from embodied_bringup.launch_builders import embodied as embodied_builder
 
     monkeypatch.setattr(embodied_builder, "_resident_cli_bridge_executable", lambda: DAEMON)

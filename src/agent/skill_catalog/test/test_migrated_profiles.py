@@ -6,17 +6,17 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
+from robot_config.config_path import resolve_robot_config_path
+from robot_config.loader import load_robot_config_dict, robot_config_digest
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
 
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
-from robot_config.loader import load_robot_config_dict, robot_config_digest
-from robot_config.timeout_policy import resolve_embodied_timeout_policy
-
-ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
 CATALOG_ROOT = Path(__file__).resolve().parents[1]
-ROBOT_CONFIG_DIR = ROOT / "robot_config" / "config" / "robots"
 PROFILES = (
     "so101_single_arm",
     "lekiwi_handeye_realsense_grasp",
@@ -118,10 +118,10 @@ def _context(config: dict, capability_digest: str) -> SkillCompileContext:
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 @pytest.mark.parametrize("profile", PROFILES)
 def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility(profile: str, monkeypatch) -> None:
-    monkeypatch.setenv("WORKSPACE", str(ROOT.parent))
+    monkeypatch.setenv("WORKSPACE", str(REPOSITORY_ROOT))
     # This compiler test reads declarations only; live interface binding is tested
     # by embodied_bringup before constructing execution consumers.
-    config = load_robot_config_dict(ROBOT_CONFIG_DIR / f"{profile}.yaml", defer_interface_binding=True)
+    config = load_robot_config_dict(resolve_robot_config_path(config_name=profile), defer_interface_binding=True)
     if config.get("runtime", {}).get("provider"):
         # Supply the explicit arm context that the public model binder provides.
         config["joints"] = {"arm": ["1", "2", "3", "4", "5"]}
@@ -199,3 +199,17 @@ def test_equivalent_so101_profiles_select_shared_stable_implementation_variant()
         )
         assert all(entry["implementation"] == "so101_arm_v1" for entry in profile_config["enabled_skills"])
 
+
+def test_x2_voice_overlay_keeps_the_catalog_profile_robot_name() -> None:
+    # The catalog validator rejects a launch whose robot context name differs
+    # from the profile's robot_name (SKILL_LIMIT_VIOLATION), which is how a
+    # renaming overlay died on the real robot (2026-10-15): both skill_executor
+    # and robot_skill_daemon refused to start.
+    config = load_robot_config_dict(
+        resolve_robot_config_path(config_name="aimdk_x2_voice"), defer_interface_binding=True
+    )
+    profile_name = config["embodied"]["skill_catalog_profile"]
+    profile = yaml.safe_load(
+        (CATALOG_ROOT / "config" / "profiles" / f"{profile_name}.yaml").read_text(encoding="utf-8")
+    )
+    assert config["name"] == profile["robot_name"]

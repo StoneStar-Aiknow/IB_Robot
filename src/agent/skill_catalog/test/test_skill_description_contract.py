@@ -9,9 +9,9 @@ import yaml
 
 from robot_config.loader import _validate_skill_description
 
-SO101 = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
-SKILLS = SO101.parents[3] / "skill_catalog" / "config" / "skills"
-PROFILE = SO101.parents[3] / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
+CATALOG_CONFIG = Path(__file__).resolve().parents[1] / "config"
+SKILLS = CATALOG_CONFIG / "skills"
+PROFILE = CATALOG_CONFIG / "profiles" / "so101_single_arm.yaml"
 
 _REQUIRED_FIELDS = ("summary", "category", "when_to_use", "motion_scope", "intensity")
 

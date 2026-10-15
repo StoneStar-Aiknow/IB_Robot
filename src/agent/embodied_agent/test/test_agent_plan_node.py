@@ -31,6 +31,10 @@ from ibrobot_msgs.srv import (
     ValidateAgentPlan,
     ValidateSkill,
 )
+from robot_config.config_path import resolve_robot_config_path
+
+# Replay evidence lives in the gitignored ``outputs/`` directory of the checkout.
+_REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
 
 
 def _future_result(future, timeout_sec: float = 3.0):
@@ -184,7 +188,7 @@ def plan_rig(request):
     # Offline-complete variant of the provider-bound so101_single_arm config:
     # catalog compilation needs real joint groups without a live description.
     config_name = getattr(request, "param", "so101_single_arm_legacy")
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
+    config_path = resolve_robot_config_path(config_name=config_name)
     snapshot = compile_local_snapshot(load_robot_config_dict(config_path), config_path)
     registry = ("epoch-test", 7, snapshot.registry_digest)
 
@@ -502,9 +506,8 @@ def test_validate_plan_unexpected_error_returns_stable_failure_and_service_survi
 @pytest.mark.model_bundle("grounded_sam2_swint_ogc")
 def test_marker_outputs_replay_uses_hermes_pick_contract_without_hardware(plan_rig):
     """Replay the saved marker planning evidence through the Agent plan boundary only."""
-    repository_root = Path(__file__).parents[3]
     evidence_path = (
-        repository_root / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
+        _REPOSITORY_ROOT / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
     )
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["fixture"].endswith("20260717_103241_marker_1784255561600731369")
@@ -576,12 +579,9 @@ def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware
     if not rclpy.ok():
         rclpy.init()
 
-    repository_root = Path(__file__).parents[3]
-    config_path = (
-        repository_root / "src" / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
-    )
+    config_path = resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp_pc")
     evidence_path = (
-        repository_root / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
+        _REPOSITORY_ROOT / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
     )
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     candidate_id = int(evidence["pr259"]["final_candidate_id"])
@@ -591,13 +591,14 @@ def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware
     from ibrobot_msgs.action import PickObject
     from robot_config.loader import load_robot_config_dict, robot_config_digest
     from robot_config.timeout_policy import resolve_embodied_timeout_policy
+    from skill_catalog.source import resolve_development_source_root
     from skill_library.skill_executor_node import SkillExecutorNode
 
     config = load_robot_config_dict(config_path)
     embodied = config["embodied"]
     execution = embodied["execution"]
     timeouts = resolve_embodied_timeout_policy(embodied)
-    catalog_root = repository_root / embodied["skill_catalog_source_root"]
+    catalog_root = resolve_development_source_root(embodied.get("skill_catalog_source_root", ""), config_path)
     mock_node = rclpy.create_node(f"hermes_marker_replay_{uuid.uuid4().hex}")
     pick_goals = []
 
@@ -667,8 +668,8 @@ def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware
         "rpc_timeout_sec": 1.0,
         "scene_freshness_sec": timeouts["scene_freshness_sec"],
         "skill_catalog_profile": embodied["skill_catalog_profile"],
-        "skill_catalog_source_mode": "development",
-        "skill_catalog_source_root": str(catalog_root),
+        "skill_catalog_source_mode": "development" if catalog_root else "installed",
+        "skill_catalog_source_root": str(catalog_root or ""),
         "skill_required_control_mode": config["skill_required_control_mode"],
         "task_budget_sec": timeouts["task_budget_sec"],
         "workspace_json": json.dumps(embodied["safety"]["workspace"]),

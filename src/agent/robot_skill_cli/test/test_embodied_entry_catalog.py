@@ -7,8 +7,9 @@ cannot declare a test dependency on it without creating a dependency cycle
 (robot_skill_cli already depends on robot_config), and colcon refuses to order a
 workspace that contains one.
 
-Config paths are resolved relative to the workspace root rather than to this
-package, because the inputs are owned by robot_config and skill_catalog.
+The inputs are owned by robot_config and skill_catalog, so they are resolved
+through those packages (robot config lookup and the ament share) rather than
+through this package's location.
 """
 
 from __future__ import annotations
@@ -17,19 +18,19 @@ from pathlib import Path
 
 import pytest
 import yaml
+from ament_index_python.packages import get_package_share_directory
 
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot
 
 GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
 
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
-_ROBOT_CONFIG_ROBOTS = _WORKSPACE_ROOT / "src" / "robot_config" / "config" / "robots"
-_SKILL_CATALOG_CONFIG = _WORKSPACE_ROOT / "src" / "skill_catalog" / "config"
+_SKILL_CATALOG_CONFIG = Path(get_package_share_directory("skill_catalog")) / "config"
 
 
 def _robot_config_path(config_name: str) -> Path:
-    return _ROBOT_CONFIG_ROBOTS / f"{config_name}.yaml"
+    return resolve_robot_config_path(config_name=config_name)
 
 
 def _snapshot(config_path: Path):

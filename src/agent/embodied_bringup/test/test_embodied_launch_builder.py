@@ -5,11 +5,13 @@ import pytest
 from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVariable
 from launch_ros.actions import Node
 
-from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
+from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.interface_binding import bind_robot_interfaces
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict, robot_execution_endpoints
 from robot_runtime import contract as RUNTIME
+from skill_catalog import source as SKILL_SOURCE
 
 
 def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
@@ -131,7 +133,7 @@ def test_providerless_motion_defaults_match_digest_endpoints(service):
 
 @pytest.mark.parametrize("config_name", ["so101_single_arm"])
 def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name, public_description):
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
+    config_path = resolve_robot_config_path(config_name=config_name)
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -311,7 +313,7 @@ def test_sound_orientation_node_is_projected_from_robot_config():
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    config_path = resolve_robot_config_path(config_name="lekiwi_nav_grasp")
     config = load_robot_config_dict(config_path)
 
     params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
@@ -328,7 +330,7 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
 
 @pytest.mark.model_bundle("yolox_x_640", "pear_parameter_network")
 def test_hybrid_profile_projects_hri_person_confidence_threshold():
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    config_path = resolve_robot_config_path(config_name="lekiwi_nav_grasp")
     config = load_robot_config_dict(config_path)
 
     nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
@@ -434,7 +436,8 @@ def test_disabled_command_server_uses_v1_context_without_navigation_endpoint():
     assert "navigation_action_name" not in params
 
 
-def test_installed_profile_falls_back_to_ament_skill_catalog_source():
+def test_installed_profile_falls_back_to_ament_skill_catalog_source(monkeypatch):
+    monkeypatch.setattr(SKILL_SOURCE, "package_source_root", lambda: None)
     robot_config = {
         "_config_path": "/opt/ibrobot/install/robot_config/share/robot_config/config/robots/robot.yaml",
         "embodied": {
@@ -444,7 +447,8 @@ def test_installed_profile_falls_back_to_ament_skill_catalog_source():
         },
     }
 
-    params = _skill_executor_params(generate_embodied_nodes(robot_config, "moveit_planning"))
+    with pytest.warns(FutureWarning, match="src/skill_catalog"):
+        params = _skill_executor_params(generate_embodied_nodes(robot_config, "moveit_planning"))
 
     assert _decode_launch_string(params["skill_catalog_source_mode"]) == "installed"
     assert _decode_launch_string(params["skill_catalog_source_root"]) == ""
@@ -495,12 +499,17 @@ def test_hermes_entry_mode_omits_voice_pipeline_nodes():
     assert {"task_entry_node", "task_executor_node"}.isdisjoint(node_names)
 
 
-def test_development_catalog_resolves_from_source_module_when_config_is_installed():
-    installed_config = Path(__file__).parents[3] / "install/share/robot_config/config/robots/robot.yaml"
+def test_development_catalog_without_root_uses_the_skill_catalog_package_source(monkeypatch, tmp_path):
+    monkeypatch.setattr(SKILL_SOURCE, "package_source_root", lambda: tmp_path)
+    robot_config = {
+        "_config_path": "/opt/ibrobot/install/robot_config/share/robot_config/config/robots/robot.yaml",
+        "embodied": {"enabled": True, "skill_catalog_source_mode": "development"},
+    }
 
-    resolved = _resolve_development_source_root(installed_config, "src/skill_catalog")
+    params = _skill_executor_params(generate_embodied_nodes(robot_config, "moveit_planning"))
 
-    assert resolved == (Path(__file__).parents[3] / "src/skill_catalog").resolve()
+    assert _decode_launch_string(params["skill_catalog_source_mode"]) == "development"
+    assert _decode_launch_string(params["skill_catalog_source_root"]) == str(tmp_path)
 
 
 def test_unknown_entry_mode_is_rejected():
@@ -1042,9 +1051,7 @@ def test_moveit_visual_closure_starts_perception_before_controller_readiness(mon
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_handeye_grasp_config_launches_pick_and_place_pipelines():
-    config_path = (
-        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
-    )
+    config_path = resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp")
     config = load_robot_config_dict(config_path)
     assert config["grasp_execution"]["planner_node"]["enable_source_gripper_tabletop_sweep"] is False
     assert config["grasp_execution"]["ik"]["worker_count"] == 4
@@ -1150,9 +1157,7 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
-    config_path = (
-        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
-    )
+    config_path = resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp_pc")
     config = load_robot_config_dict(config_path)
     config["embodied"]["enabled"] = True
 
@@ -1222,7 +1227,9 @@ def test_providerless_ik_workers_require_an_explicit_suite_launch(tmp_path):
 
 
 def test_source_workspace_profile_uses_absolute_development_catalog_root(public_description):
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    if SKILL_SOURCE.package_source_root() is None:
+        pytest.skip("skill_catalog is not installed from a source checkout")
+    config_path = resolve_robot_config_path(config_name="so101_single_arm")
     config = bind_robot_interfaces(
         load_robot_config_dict(config_path, defer_interface_binding=True), public_description
     )
@@ -1233,7 +1240,7 @@ def test_source_workspace_profile_uses_absolute_development_catalog_root(public_
     assert _decode_launch_string(params["skill_catalog_source_mode"]) == "development"
     source_root = Path(_decode_launch_string(params["skill_catalog_source_root"]))
     assert source_root.is_absolute()
-    assert source_root == Path(__file__).parents[3] / "src" / "skill_catalog"
+    assert source_root == SKILL_SOURCE.package_source_root()
     assert _decode_launch_string(params["skill_catalog_profile"]) == "so101_single_arm"
 
 
@@ -1318,7 +1325,7 @@ def test_runtime_without_arm_interfaces_still_fails_closed_unless_opted_out(publ
 
 
 def test_arm_runtime_still_requires_its_trajectory_action(public_description):
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = resolve_robot_config_path(config_name="so101_single_arm")
     from robot_runtime.interface_description import description_digest
 
     description = json.loads(json.dumps(public_description))

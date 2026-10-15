@@ -23,7 +23,6 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import (
-    _resolve_development_source_root,
     generate_embodied_nodes,
     generate_resident_cli_bridge_action,
 )
@@ -32,6 +31,7 @@ from robot_config.interface_binding import required_interface_ids
 from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
+from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup.launch")
 
@@ -100,15 +100,10 @@ def _start_runtime_after_controller_readiness(runtime_actions):
 
 
 def _load_config(robot_config_name: str, config_path_override: str, nav_stage: str = "") -> dict:
-    try:
-        robot_config_share = get_package_share_directory("robot_config")
-    except Exception:
-        robot_config_share = str(Path(__file__).parents[2] / "robot_config")
-
     config_path = (
         Path(config_path_override)
         if config_path_override
-        else Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml"
+        else Path(get_package_share_directory("robot_config")) / "config" / "robots" / f"{robot_config_name}.yaml"
     )
     config = load_robot_config_dict(config_path, nav_stage=nav_stage, defer_interface_binding=True)
     config["_config_path"] = str(config_path)
@@ -183,9 +178,10 @@ def launch_setup(context, *_args, **_kwargs):
         del base_launch_arguments["with_embodied"]
         del base_launch_arguments["with_perception"]
         base_launch_arguments["config_path"] = config["_config_path"]
-        catalog_root = embodied_config.get("skill_catalog_source_root", "")
-        if catalog_root and not Path(catalog_root).is_absolute():
-            resolved_root = _resolve_development_source_root(Path(config["_config_path"]), catalog_root)
+        if embodied_config.get("skill_catalog_source_mode", "installed") == "development":
+            resolved_root = resolve_development_source_root(
+                embodied_config.get("skill_catalog_source_root", ""), Path(config["_config_path"])
+            )
             if resolved_root is not None:
                 embodied_config["skill_catalog_source_root"] = str(resolved_root)
         spec = importlib.util.spec_from_file_location("embodied_base_robot_launch", base_launch_path)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -328,6 +329,51 @@ class DevelopmentStagingSkillSource:
                 code="SKILL_SOURCE_CHANGED_DURING_COMPILE",
                 source_relative_path=str(release.root),
             )
+
+
+def package_source_root() -> Path | None:
+    """Return the source tree of this package when it runs from a development checkout.
+
+    ``colcon build --symlink-install`` links the installed module back to the
+    source tree, so the package root (``package.xml`` + ``config/``) is the
+    parent of the resolved module directory. A regular install resolves into
+    site-packages and returns ``None``.
+    """
+
+    package_root = Path(__file__).resolve().parent.parent
+    if (package_root / "package.xml").is_file() and (package_root / "config").is_dir():
+        return package_root
+    return None
+
+
+def resolve_development_source_root(configured_root: str = "", config_path: Path | None = None) -> Path | None:
+    """Resolve ``skill_catalog_source_root`` for ``development`` mode.
+
+    An absolute root is used as-is. An empty root selects the source tree of
+    the installed ``skill_catalog`` package. A relative root is resolved against
+    the repository that holds ``config_path``; when it does not exist there, it
+    falls back to the package source tree with a ``FutureWarning``. ``None``
+    means no source tree is available and the caller uses the installed catalog.
+    """
+
+    configured_root = str(configured_root or "").strip()
+    if configured_root and Path(configured_root).is_absolute():
+        return Path(configured_root)
+    if configured_root:
+        if config_path is not None and str(config_path):
+            anchor = Path(config_path).resolve()
+            repository_root = next((parent.parent for parent in anchor.parents if parent.name == "src"), None)
+            if repository_root is not None:
+                candidate = (repository_root / configured_root).resolve()
+                if candidate.is_dir():
+                    return candidate
+        warnings.warn(
+            f"skill_catalog_source_root {configured_root!r} does not exist; falling back to the skill_catalog "
+            "package source tree. Drop the setting: development mode now defaults to that tree.",
+            FutureWarning,
+            stacklevel=2,
+        )
+    return package_source_root()
 
 
 class AmentShareSkillSource:

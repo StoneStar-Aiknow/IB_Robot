@@ -1,18 +1,18 @@
 import json
 import signal
 from collections import deque
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot, load_capability_catalog
 from skill_catalog.models import SkillSnapshot
 
 # Offline-complete variant of the provider-bound so101_single_arm config; the
 # catalog compiler needs real joint groups without a live runtime description.
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
+CONFIG_PATH = resolve_robot_config_path(config_name="so101_single_arm_legacy")
 
 
 class _CancelBridge:

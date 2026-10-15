@@ -18,7 +18,6 @@ ROBOTS = Path(__file__).resolve().parents[1] / "config" / "robots"
 CONFIG = ROBOTS / "aimdk_x2_skills.yaml"
 # src/robot_config/test/ -> src/
 PROFILE = Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
-SKILL_CATALOG_PROFILES = Path(__file__).resolve().parents[2] / "skill_catalog" / "config" / "profiles"
 
 
 @pytest.fixture(scope="module")
@@ -202,15 +201,11 @@ def test_voice_profile_layers_on_the_gesture_profile(voice_config):
     assert "bundle_path" not in voice_config["voice_asr"]
 
 
-def test_voice_profile_robot_name_matches_the_skill_catalog_profile(voice_config):
-    # The catalog validator rejects a launch whose robot context name differs
-    # from the catalog profile's robot_name (SKILL_LIMIT_VIOLATION), which is
-    # how a renaming overlay died on the real robot (2026-10-15): both
-    # skill_executor and robot_skill_daemon refused to start. Pin the contract
-    # between the overlay and the catalog profile here.
-    profile_name = voice_config["embodied"]["skill_catalog_profile"]
-    profile = yaml.safe_load((SKILL_CATALOG_PROFILES / f"{profile_name}.yaml").read_text())
-    assert voice_config["name"] == profile["robot_name"]
+def test_voice_profile_keeps_the_gesture_profile_identity(voice_config):
+    # The overlay must not rename the robot; the contract against the catalog
+    # profile's robot_name is pinned in skill_catalog, which owns the profiles.
+    assert voice_config["name"] == "aimdk_x2_skills"
+    assert voice_config["embodied"]["skill_catalog_profile"] == "aimdk_x2_skills"
     assert "deployment" not in voice_config["voice_asr"]
 
 

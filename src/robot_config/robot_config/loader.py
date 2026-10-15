@@ -1589,10 +1589,10 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         profile_name = embodied.get("skill_catalog_profile", "")
         if source_mode not in {"installed", "development", "production"}:
             errors.append("embodied.skill_catalog_source_mode must be installed, development, or production")
-        elif source_mode in {"development", "production"} and (
-            not isinstance(source_root, str) or not source_root.strip()
-        ):
-            errors.append("embodied.skill_catalog_source_root is required in development and production modes")
+        elif source_mode == "production" and (not isinstance(source_root, str) or not source_root.strip()):
+            errors.append("embodied.skill_catalog_source_root is required in production mode")
+        elif source_mode == "development" and not isinstance(source_root, str):
+            errors.append("embodied.skill_catalog_source_root must be a string")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
         if not isinstance(embodied.get("resident_cli_bridge", True), bool):

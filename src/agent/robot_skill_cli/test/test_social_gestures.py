@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 import yaml
+from ament_index_python.packages import get_package_share_directory
 
 from embodied_common.skill_templates import get_skill_templates
 from embodied_common.trajectory_templates import _pose_within_workspace, expand_trajectory_template
+from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -33,11 +35,10 @@ GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 
 @pytest.fixture(scope="module")
 def robot_config() -> dict:
-    repo_root = Path(__file__).resolve().parents[3]
     # Offline-complete variant of the provider-bound so101_single_arm config:
     # gesture templates need real joint groups, and the provider config gets
     # them only from a live runtime description.
-    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = resolve_robot_config_path(config_name="so101_single_arm_legacy")
     return load_robot_config_dict(config_path)
 
 
@@ -48,15 +49,15 @@ def embodied_config(robot_config: dict) -> dict:
 
 @pytest.fixture(scope="module")
 def skill_templates(robot_config: dict) -> dict:
-    repo_root = Path(__file__).resolve().parents[3]
-    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = resolve_robot_config_path(config_name="so101_single_arm_legacy")
     snapshot = compile_local_snapshot(robot_config, config_path)
-    profile_path = repo_root / "src" / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
+    catalog_config = Path(get_package_share_directory("skill_catalog")) / "config"
+    profile_path = catalog_config / "profiles" / "so101_single_arm.yaml"
     profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
     implementation_names = {item["name"]: item["implementation"] for item in profile["enabled_skills"]}
     templates = {}
     for name, _frozen in snapshot.templates.items():
-        manifest_path = repo_root / "src" / "skill_catalog" / "config" / "skills" / name / "manifest.yaml"
+        manifest_path = catalog_config / "skills" / name / "manifest.yaml"
         manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
         implementation_name = implementation_names[name]
         implementation_path = manifest_path.parent / manifest["implementations"][implementation_name]

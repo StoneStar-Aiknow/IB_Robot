@@ -36,7 +36,6 @@ robot:
     arm_surface: false
     skill_catalog_profile: aimdk_x2_skills
     skill_catalog_source_mode: development
-    skill_catalog_source_root: src/skill_catalog
     runtime_named_motion:
       enabled: true
       # Logical binding: launch waits for this runtime interface and binds its

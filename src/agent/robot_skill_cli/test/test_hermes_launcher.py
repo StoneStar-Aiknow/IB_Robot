@@ -17,7 +17,9 @@ def test_hermes_local_command_timeout_allows_slow_embedded_targets() -> None:
 
 
 def test_packaged_control_skill_matches_workspace_canonical_copy() -> None:
-    repository_root = Path(__file__).resolve().parents[3]
+    repository_root = next(
+        parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file()
+    )
     canonical = repository_root / ".agents" / "skills" / "ibrobot-control" / "SKILL.md"
     packaged = Path(__file__).resolve().parents[1] / "resource" / "ibrobot-control" / "SKILL.md"
 
