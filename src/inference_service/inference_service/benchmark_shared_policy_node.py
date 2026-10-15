@@ -65,6 +65,28 @@ def validate_shared_manifest(manifest):
             "shared benchmark cannot host RTC or relative-action processors: their preprocess/postprocess "
             "pairs retain per-request state outside the serialized window, so interleaved lanes would mix them"
         )
+    # The config flag is not the only place relative actions can hide: the
+    # trained processor chain may carry the relative/absolute pair directly.
+    # A fully disabled pair is inert (pass-through on both sides), but an
+    # enabled one retains cross-request state and must fail closed here.
+    pre_steps = json.loads((manifest.bundle_root / "policy_preprocessor.json").read_text())["steps"]
+    post_steps = json.loads((manifest.bundle_root / "policy_postprocessor.json").read_text())["steps"]
+    for step in pre_steps:
+        if step.get("registry_name") == "relative_actions_processor" and bool(
+            (step.get("config") or {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "shared benchmark cannot host an enabled relative_actions_processor in the preprocessor chain: "
+                "its paired postprocessing state would mix interleaved lanes"
+            )
+    for step in post_steps:
+        if step.get("registry_name") == "absolute_actions_processor" and bool(
+            (step.get("config") or {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "shared benchmark cannot host an enabled absolute_actions_processor in the postprocessor chain: "
+                "its paired preprocessing state would mix interleaved lanes"
+            )
 
 
 class SharedPolicySession(LeRobotTorchModelSession):
