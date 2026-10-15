@@ -86,7 +86,7 @@ from manipulation_execution.mirror_session.runtime import (
 )
 
 TAKEOVER_RPC_TIMEOUT_S = 2.0
-SHORT_ROUND_S = 10.0  # rounds shorter than this count towards short_rounds
+SHORT_ROUND_S = 10.0  # rounds shorter than this count towards short_rounds; WAIT clears it
 TRANSITION_BUFFER = 64  # transitions kept until drained; the oldest are dropped beyond it
 
 
@@ -623,6 +623,7 @@ class MirrorSession:
         error, self._round_error = self._round_error, ""
         self.wait_reason, self.detail = reason, f"{detail}; {error}" if error else detail
         self._wrap_purpose, self._stop_reason = None, None
+        self._short_rounds = 0  # every WAIT is a fresh start
         if transition is None:
             transition = _WAIT_TRANSITION_REASONS.get(reason, reason.value)
         self._transition_locked(SessionState.WAIT, Phase.NONE, transition)
