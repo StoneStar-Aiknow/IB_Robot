@@ -1,0 +1,39 @@
+# AgiBot X2 deployment that adds the voice chain to the preset social gestures.
+#
+# The vendor enhanced stream (AEC + beamforming + denoise, wake-word gated) is
+# bridged inside aimdk_runtime into atomic SpeechAudioChunk messages; voice ASR
+# consumes them and publishes recognized text on /voice_command.
+#
+# This is a separate profile rather than a flag on aimdk_x2_skills because the
+# voice chain carries two dependencies the gesture-only deployment must not
+# inherit: the out-of-repo X-ASR bundle, and the runtime audio.speech interface
+# whose readiness participates in launch admission. A deployment that cannot
+# provision the bundle keeps working with aimdk_x2_skills alone.
+robot:
+  # The skill catalog validates the robot context name against the catalog
+  # profile's robot_name, so an overlay that renames the robot fails catalog
+  # compilation at launch (SKILL_LIMIT_VIOLATION) before any node serves a
+  # request. This overlay is the same robot plus the voice chain, so it keeps
+  # the gesture profile's robot identity.
+  name: aimdk_x2_skills
+  base_config: aimdk_x2_skills.yaml
+
+  audio_io:
+    # Capture-side topics come from aimdk_runtime (raw stream and enhanced
+    # speech chunks), so no ALSA capture node is launched.
+    enabled: true
+    source: runtime
+
+  voice_asr:
+    enabled: true
+    input_mode: external_vad
+    active_mode: continuous
+    # bundle_path and deployment intentionally follow VOICE_ASR_DEFAULTS: pinning
+    # them here would freeze X2 on today's model when the mainline default moves.
+    # The bundle is externally provisioned; see voice_asr_service/README.md for
+    # the packaging steps. Later optimization: switch deployment to ascend_310p
+    # once the encoder OM is exported.
+    audio_input:
+      interface: audio.speech
+      type: ibrobot_msgs/msg/SpeechAudioChunk
+    output_topic: /voice_command

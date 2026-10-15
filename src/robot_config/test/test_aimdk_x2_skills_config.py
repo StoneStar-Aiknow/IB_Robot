@@ -18,6 +18,7 @@ ROBOTS = Path(__file__).resolve().parents[1] / "config" / "robots"
 CONFIG = ROBOTS / "aimdk_x2_skills.yaml"
 # src/robot_config/test/ -> src/
 PROFILE = Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
+SKILL_CATALOG_PROFILES = Path(__file__).resolve().parents[2] / "skill_catalog" / "config" / "profiles"
 
 
 @pytest.fixture(scope="module")
@@ -28,6 +29,10 @@ def config():
 
 def test_configuration_is_valid(config):
     validate_robot_config_dict(config, deferred_interfaces=True)
+    # The gesture profile stays voice-free: the voice chain lives in the
+    # aimdk_x2_voice overlay so this deployment never needs the ASR bundle.
+    assert config["audio_io"]["enabled"] is False
+    assert config["voice_asr"]["enabled"] is False
 
 
 def test_it_extends_the_x2_runtime_without_an_arm_surface(config):
@@ -121,15 +126,41 @@ def test_runtime_named_motion_switch_rejects_inconsistent_configuration(override
     assert any(item.startswith(error) for item in errors)
 
 
-def _description(interfaces):
+SPEECH_INTERFACE = {
+    "capability": "interaction.audio_capture",
+    "kind": "topic",
+    "direction": "publish",
+    "endpoint": "/audio/speech_chunk",
+    "message_type": "ibrobot_msgs/msg/SpeechAudioChunk",
+    "qos": {"reliability": "reliable", "durability": "volatile", "history": "keep_last", "depth": 50},
+}
+
+
+def _description(interfaces, *, ready=()):
+    """A runtime description for binder unit tests.
+
+    ``ready`` names interfaces to report as ready. This is fixture input for the
+    binder only: it does not stand in for a real runtime, which proves readiness
+    by observing its own endpoint (covered by
+    ``aimdk_robot/test/test_runtime_speech_readiness.py``).
+    """
     from robot_runtime.interface_description import description_digest
 
     description = {
         "schema_version": 1,
         "robot": {"id": "aimdk_robot", "type": "x2_ultra", "runtime_name": "aimdk_robot", "runtime_version": "0"},
         "execution": "simulated",
-        "interfaces": interfaces,
-        "states": {},
+        "interfaces": dict(interfaces),
+        "states": {
+            name: {
+                "state": "ready",
+                "observed_profile": None,
+                "observed_frame_id": "test",
+                "last_seen": 1.0,
+                "detail": "fixture-injected state",
+            }
+            for name in ready
+        },
     }
     description["digest"] = description_digest(description)
     return description
@@ -148,6 +179,63 @@ def test_enabled_named_motion_is_a_live_logical_binding(config):
     assert "motion.named" in required_interface_ids(config)
     with pytest.raises(InterfaceBindingError, match="description_required"):
         load_robot_config_dict(CONFIG)
+
+
+VOICE_CONFIG = ROBOTS / "aimdk_x2_voice.yaml"
+
+
+@pytest.fixture(scope="module")
+def voice_config():
+    return load_robot_config_dict(VOICE_CONFIG, defer_interface_binding=True)
+
+
+def test_voice_profile_layers_on_the_gesture_profile(voice_config):
+    # The overlay keeps the gesture profile's robot identity: the skill
+    # catalog validates the robot context name against the catalog profile.
+    assert voice_config["name"] == "aimdk_x2_skills"
+    assert voice_config["_config_sources"][-2].endswith("aimdk_x2_skills.yaml")
+    assert voice_config["audio_io"] == {"enabled": True, "source": "runtime"}
+    assert voice_config["voice_asr"]["input_mode"] == "external_vad"
+    assert voice_config["voice_asr"]["audio_input"]["interface"] == "audio.speech"
+    # bundle_path/deployment are deliberately absent so a mainline model upgrade
+    # is not silently pinned to today's bundle.
+    assert "bundle_path" not in voice_config["voice_asr"]
+
+
+def test_voice_profile_robot_name_matches_the_skill_catalog_profile(voice_config):
+    # The catalog validator rejects a launch whose robot context name differs
+    # from the catalog profile's robot_name (SKILL_LIMIT_VIOLATION), which is
+    # how a renaming overlay died on the real robot (2026-10-15): both
+    # skill_executor and robot_skill_daemon refused to start. Pin the contract
+    # between the overlay and the catalog profile here.
+    profile_name = voice_config["embodied"]["skill_catalog_profile"]
+    profile = yaml.safe_load((SKILL_CATALOG_PROFILES / f"{profile_name}.yaml").read_text())
+    assert voice_config["name"] == profile["robot_name"]
+    assert "deployment" not in voice_config["voice_asr"]
+
+
+def test_voice_profile_requires_speech_and_named_motion(voice_config):
+    assert set(required_interface_ids(voice_config)) == {"motion.named", "audio.speech"}
+    with pytest.raises(InterfaceBindingError, match="description_required"):
+        load_robot_config_dict(VOICE_CONFIG)
+
+
+def test_audio_binding_uses_runtime_endpoint(voice_config):
+    interfaces = {"motion.named": dict(NAMED_MOTION_INTERFACE), "audio.speech": dict(SPEECH_INTERFACE)}
+    interfaces["audio.speech"]["endpoint"] = "/instance_x/speech"
+    description = _description(interfaces, ready=("audio.speech",))
+
+    bound = bind_robot_interfaces(voice_config, description, require_ready=True)
+    assert bound["voice_asr"]["audio_input"]["topic"] == "/instance_x/speech"
+    assert "audio.speech" in required_interface_ids(voice_config)
+
+
+def test_speech_binding_fails_closed_when_the_runtime_omits_it(voice_config):
+    # The gesture profile must keep working against a runtime without speech,
+    # but the voice profile must refuse to launch against it.
+    description = _description({"motion.named": dict(NAMED_MOTION_INTERFACE)})
+    with pytest.raises(InterfaceBindingError, match="does not publish it"):
+        bind_robot_interfaces(voice_config, description, require_ready=True)
 
 
 def test_binding_resolves_the_action_and_carries_the_live_description(config):

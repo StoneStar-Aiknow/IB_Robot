@@ -2087,6 +2087,11 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         audio_input_channel=data.get("audio_input_channel", defaults.audio_input_channel),
         vad_input_channel=data.get("vad_input_channel", defaults.vad_input_channel),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+        input_mode=data.get("input_mode", defaults.input_mode),
+        chunk_topic=data.get("chunk_topic", defaults.chunk_topic),
+        audio_input=data.get("audio_input", defaults.audio_input),
+        external_min_samples=data.get("external_min_samples", defaults.external_min_samples),
+        external_idle_timeout=data.get("external_idle_timeout", defaults.external_idle_timeout),
     )
 
 
@@ -2124,6 +2129,7 @@ def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
     return AudioIOConfig(
         enabled=data.get("enabled", defaults.enabled),
         microphone=data.get("microphone", defaults.microphone),
+        source=data.get("source", defaults.source),
         capture_topic=data.get("capture_topic", defaults.capture_topic),
         capture_stamped_topic=data.get("capture_stamped_topic", defaults.capture_stamped_topic),
         audio_info_topic=data.get("audio_info_topic", defaults.audio_info_topic),
@@ -2641,6 +2647,27 @@ def validate_config(config: RobotConfig) -> list[str]:
     playback_required = config.voice_tts.enabled
     if (capture_required or playback_required) and not is_audio_io_enabled(config.audio_io):
         errors.append("audio_io.enabled must be true when voice ASR, speech direction, or voice TTS is enabled")
+    if config.voice_asr.enabled:
+        if config.voice_asr.input_mode not in ("shared_audio", "external_vad"):
+            errors.append(
+                f"voice_asr.input_mode must be 'shared_audio' or 'external_vad': {config.voice_asr.input_mode!r}"
+            )
+        if (
+            config.voice_asr.input_mode == "external_vad"
+            and config.audio_io.source == "alsa"
+            and is_audio_io_enabled(config.audio_io)
+        ):
+            errors.append(
+                "voice_asr.input_mode=external_vad requires audio_io.source=runtime "
+                "(the segmented audio stream is provided by the robot runtime)"
+            )
+        if config.voice_asr.input_mode == "external_vad":
+            for name in ("chunk_topic",):
+                value = getattr(config.voice_asr, name)
+                if value and not value.startswith("/"):
+                    errors.append(f"voice_asr.{name} must be an absolute ROS topic name")
+    if config.audio_io.source not in ("alsa", "runtime"):
+        errors.append(f"audio_io.source must be 'alsa' or 'runtime', got {config.audio_io.source!r}")
     if config.audio_io.enabled:
         for name in (
             "capture_topic",
@@ -2650,7 +2677,11 @@ def validate_config(config: RobotConfig) -> list[str]:
         ):
             if not getattr(config.audio_io, name).startswith("/"):
                 errors.append(f"audio_io.{name} must be an absolute ROS topic name")
-        if capture_required and not config.audio_io.microphone:
+        if config.audio_io.source == "runtime":
+            # 采集侧 topic 由机器人 runtime 提供（如 aimdk 增强流桥），
+            # 不启动 ALSA 采集节点，也没有可校验的麦克风外设。
+            pass
+        elif capture_required and not config.audio_io.microphone:
             errors.append("audio_io.microphone is required when shared audio capture is enabled")
         elif capture_required:
             microphone_matches = [

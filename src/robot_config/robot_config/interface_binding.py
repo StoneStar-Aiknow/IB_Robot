@@ -20,6 +20,18 @@ class InterfaceBindingError(ValueError):
 
 
 def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    voice = config.get("voice_asr") or {}
+    if isinstance(voice, Mapping) and voice.get("enabled") and voice.get("input_mode") == "external_vad":
+        item = voice.get("audio_input")
+        if item is not None:
+            if not isinstance(item, dict):
+                raise InterfaceBindingError("invalid_binding", "voice_asr.audio_input", "must be a mapping")
+            interface_id = item.get("interface")
+            if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+                raise InterfaceBindingError("invalid_interface", "voice_asr.audio_input", "logical ID required")
+            if item.get("type") != "ibrobot_msgs/msg/SpeechAudioChunk":
+                raise InterfaceBindingError("type_mismatch", "voice_asr.audio_input", "SpeechAudioChunk required")
+            yield item, "voice_asr.audio_input", "publish"
     contract = config.get("contract") or {}
     if not isinstance(contract, Mapping):
         return
@@ -188,7 +200,12 @@ def bind_robot_interfaces(
         interface_id = item["interface"]
         interface = descriptor["interfaces"].get(interface_id)
         if interface is None:
-            raise InterfaceBindingError("unknown_interface", path, "ID is not in the runtime description")
+            raise InterfaceBindingError(
+                "unknown_interface",
+                path,
+                "ID is not in the runtime description; this runtime does not publish it, "
+                "so the consumer must not be launched against it",
+            )
         if interface["kind"] != "topic":
             raise InterfaceBindingError("kind_mismatch", path, f"expected topic, described {interface['kind']!r}")
         if interface["direction"] != direction:
@@ -312,7 +329,12 @@ def bind_robot_interfaces(
         interface_id = item["interface"]
         interface = descriptor["interfaces"].get(interface_id)
         if interface is None:
-            raise InterfaceBindingError("unknown_interface", path, "ID is not in the runtime description")
+            raise InterfaceBindingError(
+                "unknown_interface",
+                path,
+                "ID is not in the runtime description; this runtime does not serve it, "
+                "so the consumer must not be launched against it",
+            )
         expected_kind = item.get("kind")
         if expected_kind not in {"service", "action"}:
             raise InterfaceBindingError("invalid_binding", path, "kind must be service or action")

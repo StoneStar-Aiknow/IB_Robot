@@ -230,6 +230,13 @@ class VoiceASRConfig:
     audio_input_channel: int = 1
     vad_input_channel: int | None = None
     exit_on_init_failure: bool = True
+    #: shared_audio = 本地 Silero VAD + 共享音频流；external_vad = 音源自带分段事件。
+    input_mode: str = "shared_audio"
+    #: external_vad 通过 audio.speech 逻辑接口消费 SpeechAudioChunk；chunk_topic 是独立节点 fallback。
+    chunk_topic: str = "/audio/speech_chunk"
+    audio_input: dict[str, Any] | None = None
+    external_min_samples: int = 3200
+    external_idle_timeout: float = 2.0
 
 
 @dataclass
@@ -238,6 +245,9 @@ class AudioIOConfig:
 
     enabled: bool = False
     microphone: str = ""
+    #: alsa = 启动共享 audio_capture_node（需要麦克风外设）；
+    #: runtime = 采集侧 topic 由机器人 runtime 提供，不启动 ALSA 节点。
+    source: str = "alsa"
     capture_topic: str = "/audio/capture"
     capture_stamped_topic: str = "/audio/capture_stamped"
     audio_info_topic: str = "/audio/info"

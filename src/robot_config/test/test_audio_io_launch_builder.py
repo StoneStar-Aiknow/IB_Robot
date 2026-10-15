@@ -205,6 +205,8 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
             "chunk_size": 512,
             "buffer_seconds": 5.0,
             "exit_on_init_failure": False,
+            "input_mode": "shared_audio",
+            "external_min_samples": 3200,
         },
     )
     monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])

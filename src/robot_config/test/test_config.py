@@ -1184,6 +1184,8 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
     assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
+    assert config_defaults.input_mode == VOICE_ASR_DEFAULTS["input_mode"]
+    assert config_defaults.external_min_samples == VOICE_ASR_DEFAULTS["external_min_samples"]
 
 
 def test_voice_tts_loader_and_runtime_defaults_match():

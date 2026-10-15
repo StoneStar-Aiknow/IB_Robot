@@ -46,3 +46,8 @@ robot:
       type: ibrobot_msgs/action/ExecuteNamedMotion
       requires:
         capability: motion.named
+
+# The voice chain lives in aimdk_x2_voice.yaml, which layers on this profile.
+# It is not enabled here on purpose: it needs the out-of-repo X-ASR bundle and
+# the runtime audio.speech interface, so a deployment that only wants the
+# preset gestures must not inherit either dependency.

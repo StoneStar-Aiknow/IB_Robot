@@ -151,16 +151,25 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
     voice_asr_defaults = _load_voice_asr_service()
 
     active_mode = voice_asr_config.get("active_mode", "manual")
+    input_mode = str(voice_asr_config.get("input_mode", voice_asr_defaults["input_mode"]))
+    if input_mode not in ("shared_audio", "external_vad"):
+        raise ValueError(f"voice_asr.input_mode must be 'shared_audio' or 'external_vad', got {input_mode!r}")
+    external_mode = input_mode == "external_vad"
     bundle_path = resolve_voice_asr_path(voice_asr_config.get("bundle_path", voice_asr_defaults["bundle_path"]))
     deployment = str(voice_asr_config.get("deployment", voice_asr_defaults["deployment"]))
-    vad_bundle_path = resolve_voice_asr_path(
-        voice_asr_config.get("vad_bundle_path", voice_asr_defaults["vad_bundle_path"])
-    )
-    vad_deployment = str(voice_asr_config.get("vad_deployment", voice_asr_defaults["vad_deployment"]))
+    if external_mode:
+        # 外部分段输入：VAD 由音源负责，节点不装配本地 Silero，无需 VAD bundle。
+        vad_bundle_path = ""
+        vad_deployment = ""
+    else:
+        vad_bundle_path = resolve_voice_asr_path(
+            voice_asr_config.get("vad_bundle_path", voice_asr_defaults["vad_bundle_path"])
+        )
+        vad_deployment = str(voice_asr_config.get("vad_deployment", voice_asr_defaults["vad_deployment"]))
     validation_errors = validate_voice_asr_model_config(
         bundle_path=bundle_path,
         deployment=deployment,
-        require_streaming=voice_asr_mode_requires_streaming(active_mode),
+        require_streaming=voice_asr_mode_requires_streaming(active_mode) or external_mode,
         sample_rate=int(voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"])),
         chunk_size=int(voice_asr_config.get("chunk_size", voice_asr_defaults["chunk_size"])),
         vad_bundle_path=vad_bundle_path,
@@ -171,19 +180,15 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
 
     node_params = {
         "active_mode": active_mode,
+        "input_mode": input_mode,
         "language": voice_asr_config.get("language", voice_asr_defaults["language"]),
         "bundle_path": bundle_path,
         "deployment": deployment,
         "max_recording_duration": voice_asr_config.get(
             "max_recording_duration", voice_asr_defaults["max_recording_duration"]
         ),
-        "vad_sensitivity": voice_asr_config.get("vad_sensitivity", voice_asr_defaults["vad_sensitivity"]),
-        "vad_bundle_path": resolve_voice_asr_path(
-            voice_asr_config.get("vad_bundle_path", voice_asr_defaults["vad_bundle_path"])
-        ),
-        "vad_deployment": voice_asr_config.get("vad_deployment", voice_asr_defaults["vad_deployment"]),
-        "realtime_pre_roll_seconds": voice_asr_config.get(
-            "realtime_pre_roll_seconds", voice_asr_defaults["realtime_pre_roll_seconds"]
+        "exit_on_init_failure": voice_asr_config.get(
+            "exit_on_init_failure", voice_asr_defaults["exit_on_init_failure"]
         ),
         "final_tail_padding_seconds": voice_asr_config.get(
             "final_tail_padding_seconds", voice_asr_defaults["final_tail_padding_seconds"]
@@ -191,29 +196,64 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "publish_partial": voice_asr_config.get("publish_partial", voice_asr_defaults["publish_partial"]),
         "output_topic": voice_asr_config.get("output_topic", voice_asr_defaults["output_topic"]),
         "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
-        "chunk_size": voice_asr_config.get("chunk_size", voice_asr_defaults["chunk_size"]),
-        "buffer_seconds": voice_asr_config.get("buffer_seconds", voice_asr_defaults["buffer_seconds"]),
-        "exit_on_init_failure": voice_asr_config.get(
-            "exit_on_init_failure", voice_asr_defaults["exit_on_init_failure"]
-        ),
     }
     audio_io = robot_config.get("audio_io", {})
     if not is_audio_io_enabled(audio_io):
         raise ValueError("voice_asr.enabled=true requires audio_io.enabled=true")
-    microphone_name = str(audio_io.get("microphone", ""))
-    microphone_params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
-    node_params["audio_topic"] = str(audio_io.get("capture_stamped_topic", "/audio/capture_stamped"))
-    node_params["audio_channels"] = int(microphone_params.get("channels", 1))
-    node_params["audio_input_channel"] = int(
-        voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))
-    )
-    # VAD 独立输入通道（如 ReSpeaker ch0 板载处理通道）；未配置时与 ASR 通道一致。
-    vad_input_channel = voice_asr_config.get("vad_input_channel")
-    node_params["vad_input_channel"] = -1 if vad_input_channel is None else int(vad_input_channel)
+
+    if external_mode:
+        # SpeechAudioChunk carries the mono S16LE PCM and its boundary in one
+        # message, so the external path has exactly one input topic. A
+        # runtime-managed deployment must bind it before constructing the
+        # consumer; there is no audio_topic in this mode to fall back to.
+        audio_input = voice_asr_config.get("audio_input")
+        if audio_input is not None:
+            if not isinstance(audio_input, dict) or not audio_input.get("_interface_source"):
+                raise ValueError("voice_asr.audio_input must be bound to a runtime description before launch")
+            if audio_input.get("type") != "ibrobot_msgs/msg/SpeechAudioChunk":
+                raise ValueError("voice_asr.audio_input requires SpeechAudioChunk")
+            explicit = voice_asr_config.get("chunk_topic")
+            if explicit and explicit != audio_input["topic"]:
+                raise ValueError("voice_asr.chunk_topic conflicts with the bound runtime endpoint")
+            node_params["chunk_topic"] = audio_input["topic"]
+        else:
+            node_params["chunk_topic"] = str(voice_asr_config.get("chunk_topic", voice_asr_defaults["chunk_topic"]))
+        node_params["external_min_samples"] = int(
+            voice_asr_config.get("external_min_samples", voice_asr_defaults["external_min_samples"])
+        )
+        node_params["external_idle_timeout"] = float(
+            voice_asr_config.get("external_idle_timeout", voice_asr_defaults["external_idle_timeout"])
+        )
+    else:
+        node_params.update(
+            {
+                "vad_sensitivity": voice_asr_config.get("vad_sensitivity", voice_asr_defaults["vad_sensitivity"]),
+                "vad_bundle_path": resolve_voice_asr_path(
+                    voice_asr_config.get("vad_bundle_path", voice_asr_defaults["vad_bundle_path"])
+                ),
+                "vad_deployment": voice_asr_config.get("vad_deployment", voice_asr_defaults["vad_deployment"]),
+                "realtime_pre_roll_seconds": voice_asr_config.get(
+                    "realtime_pre_roll_seconds", voice_asr_defaults["realtime_pre_roll_seconds"]
+                ),
+                "chunk_size": voice_asr_config.get("chunk_size", voice_asr_defaults["chunk_size"]),
+                "buffer_seconds": voice_asr_config.get("buffer_seconds", voice_asr_defaults["buffer_seconds"]),
+            }
+        )
+        microphone_name = str(audio_io.get("microphone", ""))
+        microphone_params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
+        node_params["audio_topic"] = str(audio_io.get("capture_stamped_topic", "/audio/capture_stamped"))
+        node_params["audio_channels"] = int(microphone_params.get("channels", 1))
+        node_params["audio_input_channel"] = int(
+            voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))
+        )
+        # VAD 独立输入通道（如 ReSpeaker ch0 板载处理通道）；未配置时与 ASR 通道一致。
+        vad_input_channel = voice_asr_config.get("vad_input_channel")
+        node_params["vad_input_channel"] = -1 if vad_input_channel is None else int(vad_input_channel)
 
     node_name = voice_asr_config.get("node_name", "voice_asr_node")
-    logger.info(f"Voice ASR enabled, launching node '{node_name}'")
+    logger.info(f"Voice ASR enabled, launching node '{node_name}' (input_mode={input_mode})")
     logger.info(f"  output_topic: {node_params['output_topic']}")
+    logger.info(f"  input: {node_params['chunk_topic'] if external_mode else node_params['audio_topic']}")
 
     return [
         Node(

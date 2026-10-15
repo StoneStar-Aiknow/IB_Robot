@@ -21,8 +21,17 @@ periodic（会话仍为 inactive，需显式激活）；其他 stage 与其余�
 `lekiwi_nav_grasp_sound_real` overlay 显式开启。periodic 模式只消费 `SpeechDirection`，校验上不要求
 `voice_asr.enabled`；keyword 模式仍要求 ASR 与 speech direction 同时可用。
 
-`VoiceASRNode` 和 `speech_direction_node` 都订阅 `audio_io` 发布的共享音频话题，不直接竞争打开 ReSpeaker
-设备。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
+`VoiceASRNode` 的 shared_audio 模式和 `speech_direction_node` 订阅共享音频，不直接竞争打开 ReSpeaker。
+external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消费 runtime 绑定的 `audio.speech` 原子消息块。
+
+X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
+profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
+在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
+`audio_io.source=runtime` 时不启动 ALSA capture；runtime 提供音频。X2 的 external_vad 模式通过
+`voice_asr.audio_input: {interface: audio.speech, type: ibrobot_msgs/msg/SpeechAudioChunk}` 绑定原子音频块，
+端点由 runtime profile 声明。离线需提供 description，live launch 延迟绑定后才构造 ASR；类型或显式 topic
+冲突会拒绝启动。独立输入可显式设 `chunk_topic`。`manual` 与 `continuous` 激活策略不受音源模式覆盖。
+完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
 
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
 override 注入序列号，避免把某一台实物设备绑定到所有同型号 profile。
