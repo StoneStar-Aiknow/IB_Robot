@@ -69,6 +69,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
   "msg/SpeechDirection.msg"
+  "msg/SpeechAudioChunk.msg"
   "msg/MHandProFrame.msg"
   "msg/HumanHandState.msg"
   "msg/StampedFloat32MultiArray.msg"
