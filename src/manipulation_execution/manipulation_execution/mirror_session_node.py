@@ -24,12 +24,38 @@ Parameters (one parameter file serves the node and the release script):
 ``mock_play_service``         ``mirror_session.mock_playback`` (the mock node's
                               animation through the gate); both empty: the
                               ``SessionHooks`` defaults
+``business_hooks``            ``""``: the window pipeline above; ``demo``: the
+                              demo start/cancel rules around it;
+                              ``pkg.mod:Class``: a business hooks class, not
+                              with the mock (``mirror_session.business``)
+``business_config``           absolute path of the business config file
+                              (session / timing / cover_judge / operator);
+                              empty: every section empty
 
-Interfaces: ``~/set_session`` (``std_srvs/SetBool``: true = start, false =
-stop; only the Gateway's ``mirror_session`` executor calls it), ``~/status``
-(``std_msgs/String``, JSON snapshot), and ``~/arm_command_preview`` /
-``~/hand_command_preview`` (``Float64MultiArray``, every command the gate sends,
-whether or not ``publish_enabled`` is set).
+Interfaces:
+
+* ``~/set_session`` (``std_srvs/SetBool``: true = start, false = stop): called
+  by the Gateway's ``mirror_session`` executor and by the operator node (false
+  only);
+* ``~/operator_touch`` (``std_srvs/Trigger``): STANDBY cooldown/ready ->
+  MIRRORING, MIRRORING running -> cancel, nothing elsewhere; ``success`` says
+  whether it did something. Serialised with ``~/set_session``;
+* ``/mirror_session/state`` (``std_msgs/String``, JSON; reliable +
+  transient_local, depth 1): one message per transition and a heartbeat every
+  second (``StateReporter``);
+* ``~/status`` (``std_msgs/String``, JSON snapshot, every
+  ``status_period_sec``), with ``latency_s`` (node clock minus the commands'
+  ``source_stamp_s``) and ``business_hooks``;
+* ``~/arm_command_preview`` / ``~/hand_command_preview``
+  (``Float64MultiArray``, every command the gate sends, whether or not
+  ``publish_enabled`` is set).
+
+In both the state and the status, ``cancel_reason`` is the reason of the most
+recent cancel: a later stop or round does not clear it. ``short_rounds`` is
+cleared on entering WAIT, so the transition into WAIT already reports 0.
+
+A business hooks class is constructed in ``__init__``: a slow constructor
+delays the startup.
 
 Exits back to idle, all through ``runtime.release_to_idle``:
 
@@ -49,7 +75,9 @@ interrupting the launch.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
 import signal
 import threading
 import time
@@ -58,16 +86,19 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float64MultiArray, String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 
+from embodied_common.mirror_session_contract import NODE_NAME, STATE_PERIOD_SEC, STATE_TOPIC
 from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode
+from manipulation_execution.mirror_session.business import build_hooks, load_business_config
 from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
 from manipulation_execution.mirror_session.endpoints import RELEASE_INTERFACES, resolve_endpoints
+from manipulation_execution.mirror_session.hooks import HookContext
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
 from manipulation_execution.mirror_session.runtime import RuntimeObservation, release_to_idle
@@ -170,6 +201,8 @@ SESSION_PARAMETERS = {
     "camera_topic": "",
     "mock_preview_topic": "",
     "mock_play_service": "",
+    "business_hooks": "",
+    "business_config": "",
 }
 
 
@@ -193,9 +226,91 @@ def _optional_topic(node: Node, name: str) -> str:
     return value
 
 
+def _string(node: Node, name: str) -> str:
+    value = node.get_parameter(name).value
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+TRANSITION_FIELDS = ("from", "to", "reason", "t")
+
+
+class StateReporter:
+    """What goes on the state topic after a tick. No ROS.
+
+    One message per transition, built from the transition record; with no
+    transition, a heartbeat from the snapshot once ``period`` has passed since
+    the last message (and at the first call). ``seq`` counts every message.
+    """
+
+    def __init__(self, period: float = STATE_PERIOD_SEC):
+        self._period = period
+        self._seq = 0
+        self._last_at: float | None = None
+
+    def messages(self, transitions: list[dict], snapshot: dict, now: float) -> list[dict]:
+        if transitions:
+            sources = transitions
+        elif self._last_at is None or now - self._last_at >= self._period:
+            sources = [None]
+        else:
+            return []
+        messages = []
+        for record in sources:
+            current = snapshot if record is None else record
+            last = snapshot.get("last_transition") if record is None else record
+            self._seq += 1
+            messages.append(
+                {
+                    "seq": self._seq,
+                    "stamp": now,
+                    "state": current["state"],
+                    "phase": current["phase"],
+                    "wrap_purpose": current["wrap_purpose"],
+                    "wait_reason": current["wait_reason"],
+                    "holding": current["holding"],
+                    "releasing": snapshot["releasing"],
+                    "cancel_reason": current["cancel_reason"],
+                    "short_rounds": current["short_rounds"],
+                    "last_transition": None if last is None else {key: last[key] for key in TRANSITION_FIELDS},
+                }
+            )
+        self._last_at = now
+        return messages
+
+
+class LatencyMeter:
+    """``latency_s``: send time minus ``source_stamp_s``, counting each stamp once.
+
+    The gate resends the last command when the pipeline has nothing new; a
+    resend carries the same stamp and is not counted again. Commands without
+    a stamp are not counted.
+    """
+
+    def __init__(self):
+        self._stamp: float | None = None
+        self.last: float | None = None
+        self.max: float | None = None
+        self.n = 0
+        self._sum = 0.0
+
+    def observe(self, stamp: float | None, now: float) -> None:
+        if stamp is None or not math.isfinite(stamp) or stamp == self._stamp:
+            return
+        self._stamp = stamp
+        self.last = now - stamp
+        self.max = self.last if self.max is None else max(self.max, self.last)
+        self.n += 1
+        self._sum += self.last
+
+    def snapshot(self) -> dict:
+        return {"last": self.last, "mean": self._sum / self.n if self.n else None, "max": self.max, "n": self.n}
+
+
 class MirrorSessionNode(Node):
     def __init__(self, hooks=None, cover=None):
-        super().__init__("mirror_session")
+        super().__init__(NODE_NAME)
         description, policy_mode, stop_timeout = _parameters(self, SESSION_PARAMETERS)
         rate = float(self.get_parameter("publish_rate_hz").value)
         status_period = float(self.get_parameter("status_period_sec").value)
@@ -213,11 +328,22 @@ class MirrorSessionNode(Node):
             raise ValueError("mock_preview_topic and mock_play_service are set together or not at all")
         if mock_preview and hooks is not None:
             raise ValueError("mock_preview_topic selects the mock window pipeline; do not pass hooks as well")
+        self._business_hooks = _string(self, "business_hooks")
+        business_config = _string(self, "business_config")
         self._mock = MockPlaybackHooks(self._request_play) if mock_preview else None
-        if self._mock is not None:
-            hooks = self._mock
         endpoints = resolve_endpoints(description, policy_mode=policy_mode)
-        config = SessionConfig(policy_mode, endpoints.identity, stop_timeout_s=stop_timeout)
+        business = load_business_config(business_config)
+        config = SessionConfig(policy_mode, endpoints.identity, stop_timeout_s=stop_timeout, **business.timing)
+        if hooks is None:
+            context = HookContext(
+                arm_joint_names=endpoints["joint.arm_stream"].joint_names,
+                hand_joint_names=endpoints["joint.hand_stream"].joint_names,
+                tick_hz=rate,
+                wrap_up_budget_s=config.wrap_up_budget_s,
+                publish_enabled=self._publish_enabled,
+                logger=self.get_logger(),
+            )
+            hooks = build_hooks(self._business_hooks, business, context, self._mock)
 
         from robot_config.contract_utils import qos_profile_from_dict
 
@@ -233,7 +359,8 @@ class MirrorSessionNode(Node):
             )
         self._arm_preview = self.create_publisher(Float64MultiArray, "~/arm_command_preview", 10)
         self._hand_preview = self.create_publisher(Float64MultiArray, "~/hand_command_preview", 10)
-        self.session = MirrorSession(config, self._port, self._publish, hooks=hooks, cover=cover)
+        self._latency = LatencyMeter()
+        self.session = MirrorSession(config, self._port, self._send, hooks=hooks, cover=cover)
 
         self._inputs = InputCollector()
         inputs_group = MutuallyExclusiveCallbackGroup()
@@ -272,15 +399,25 @@ class MirrorSessionNode(Node):
             callback_group=runtime_group,
         )
         self._status_publisher = self.create_publisher(String, "~/status", 10)
-        self.create_service(
-            SetBool, "~/set_session", self._on_set_session, callback_group=MutuallyExclusiveCallbackGroup()
+        self._state_reporter = StateReporter()
+        self._state_publisher = self.create_publisher(
+            String,
+            STATE_TOPIC,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
+        # One group: a touch and a start/stop are handled one after the other.
+        self._requests_group = MutuallyExclusiveCallbackGroup()
+        self.create_service(SetBool, "~/set_session", self._on_set_session, callback_group=self._requests_group)
+        self.create_service(Trigger, "~/operator_touch", self._on_operator_touch, callback_group=self._requests_group)
         self._tick_timer = self.create_timer(1.0 / rate, self._tick, callback_group=MutuallyExclusiveCallbackGroup())
         self.create_timer(status_period, self._publish_status, callback_group=MutuallyExclusiveCallbackGroup())
         self._startup_timer = self.create_timer(0.1, self._startup, callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(
             f"mirror session in WAIT; mode {policy_mode!r}, stop timeout {stop_timeout:.1f} s; "
-            f"window pipeline: {'mock playback of ' + mock_preview if self._mock else 'hook defaults'}"
+            f"window pipeline: {'mock playback of ' + mock_preview if self._mock else 'hook defaults'}; "
+            f"business hooks {self._business_hooks!r} ({type(hooks).__name__}), "
+            f"config {business_config or '(none)'}, start/cancel confirm "
+            f"{config.start_confirm_s:.1f}/{config.cancel_confirm_s:.1f} s"
         )
         if self._publish_enabled:
             self.get_logger().warning(
@@ -300,6 +437,11 @@ class MirrorSessionNode(Node):
             self._hand_publisher.publish(hand)
         self._arm_preview.publish(arm)
         self._hand_preview.publish(hand)
+
+    def _send(self, command) -> None:
+        # The gate is the only caller, under the session lock.
+        self._publish(command)
+        self._latency.observe(command.source_stamp_s, self.get_clock().now().nanoseconds / 1e9)
 
     def _request_play(self, playing: bool, round_id: int) -> None:
         # Called under the session lock: never wait here.
@@ -336,7 +478,16 @@ class MirrorSessionNode(Node):
             self.session.observe_arm_position([positions[name] for name in self._arm_joints])
 
     def _tick(self) -> None:
-        self.session.tick(self._inputs.take())
+        self.session.tick(dataclasses.replace(self._inputs.take(), publish_enabled=self._publish_enabled))
+        transitions = self.session.drain_transitions()
+        for record in transitions:
+            self.get_logger().info(
+                f"{record['from']} -> {record['to']} ({record['reason']}); cancel_reason={record['cancel_reason']!r} "
+                f"short_rounds={record['short_rounds']}"
+            )
+        now = self.get_clock().now().nanoseconds / 1e9
+        for message in self._state_reporter.messages(transitions, self.session.snapshot(), now):
+            self._state_publisher.publish(String(data=json.dumps(message, sort_keys=True)))
 
     def _on_set_session(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
         command = "start" if request.data else "stop"
@@ -346,10 +497,19 @@ class MirrorSessionNode(Node):
         self.get_logger().info(f"set_session {command}: success={success} {response.message}")
         return response
 
+    def _on_operator_touch(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        success, message = self.session.operator_touch()
+        response.success = bool(success)
+        response.message = f"{message} [state={self.session.state.value}]"
+        self.get_logger().info(f"operator_touch: success={success} {response.message}")
+        return response
+
     def _publish_status(self) -> None:
         status = self.session.snapshot()
         status["publish_enabled"] = self._publish_enabled
         status["inputs"] = self._inputs.snapshot()
+        status["latency_s"] = self._latency.snapshot()
+        status["business_hooks"] = self._business_hooks
         if self._mock is not None:
             status["mock_playback"] = self._mock.snapshot()
         self._status_publisher.publish(String(data=json.dumps(status, sort_keys=True)))

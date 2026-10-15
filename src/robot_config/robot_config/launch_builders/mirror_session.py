@@ -157,6 +157,8 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         "camera_topic": stream.get("rgb_compressed_topic", ""),
         "mock_preview_topic": mock[0],
         "mock_play_service": mock[1],
+        "business_hooks": "",
+        "business_config": "",
     }
     session = Node(
         package="manipulation_execution",

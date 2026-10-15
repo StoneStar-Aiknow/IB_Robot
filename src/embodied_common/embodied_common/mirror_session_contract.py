@@ -11,6 +11,16 @@ importing it must not pull in any launch builder or ROS package.
 NODE_NAME = "mirror_session"
 SESSION_SERVICE = f"/{NODE_NAME}/set_session"
 
+# The session state topic (std_msgs/String, JSON; reliable + transient_local,
+# depth 1): one message per state transition, and a heartbeat at this period.
+STATE_TOPIC = f"/{NODE_NAME}/state"
+STATE_PERIOD_SEC = 1.0
+# The operator touch (std_srvs/Trigger): STANDBY cooldown/ready -> MIRRORING,
+# MIRRORING running -> cancel; nothing elsewhere.
+OPERATOR_TOUCH_SERVICE = f"/{NODE_NAME}/operator_touch"
+# The operator node (gestures, touch, lights); its status is /mirror_operator/status.
+OPERATOR_NODE_NAME = "mirror_operator"
+
 # The commands a mirror_session skill binds in its catalog implementation
 # (``binding: {command: start|stop}``).
 COMMANDS = ("start", "stop")
