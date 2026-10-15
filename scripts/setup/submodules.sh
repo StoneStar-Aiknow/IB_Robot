@@ -82,9 +82,17 @@ update_submodules() {
 
     if [[ ${#to_update[@]} -gt 0 ]]; then
         log_info "Updating submodules..."
+        # Shallow-clone submodules by default (depth=1) to avoid full
+        # upstream downloads. Override with IBR_SUBMODULE_DEPTH=<n> for a
+        # deeper history, or set it empty to disable shallow clones entirely.
+        local sm_depth="${IBR_SUBMODULE_DEPTH-1}"
+        local depth_args=()
+        if [[ -n "${sm_depth}" ]]; then
+            depth_args=(--depth "${sm_depth}")
+        fi
         for sm in "${to_update[@]}"; do
             log_info "  -> ${sm}"
-            run_cmd git submodule update --init --recursive "${sm}"
+            run_cmd git submodule update --init --recursive "${depth_args[@]}" "${sm}"
         done
         log_done "Submodules updated"
     else
