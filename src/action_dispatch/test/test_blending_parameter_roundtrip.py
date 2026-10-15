@@ -8,6 +8,7 @@ import pytest
 import rclpy
 import yaml
 from rcl_interfaces.msg import SetParametersResult
+from rclpy.exceptions import InvalidParameterTypeException
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
@@ -125,12 +126,13 @@ def test_n_action_steps_dump_restart_roundtrip(node_type, atomic, tmp_path):
         assert node._chunking_strategy == "n_action_steps"
         assert node._n_action_steps == 50
         planner = node._chunk_planner
-        # Runtime writes are rejected: the planner snapshot is fixed at init,
-        # so ros2 param must never show a value the planner never consumes.
+        # Runtime writes are rejected: the read_only descriptor fails the
+        # set before any user callback, so ros2 param must never show a
+        # value the planner never consumes.
         attempted = [Parameter("n_action_steps", value=7)]
         result = node.set_parameters_atomically(attempted) if atomic else node.set_parameters(attempted)[0]
         assert not result.successful
-        assert "startup read-only" in result.reason
+        assert "read-only" in result.reason
         assert node.get_parameter("n_action_steps").value == 50
         assert node._chunk_planner is planner
         parameters = node.get_parameters_by_prefix("")
@@ -178,6 +180,117 @@ def test_n_action_steps_startup_rejects_oversized_queue_bound(node_type):
     )
     try:
         with pytest.raises(ValueError, match="exceeds queue_size"):
+            node_type()
+    finally:
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("strategy", ["full_chunk", "auto_horizon"])
+def test_other_strategies_dump_restart_carries_zero_sentinel(node_type, strategy, tmp_path):
+    """The integer 0 sentinel exports and reloads legally under other strategies.
+
+    A direct ROS dump/restart of full_chunk/auto_horizon parameters carries
+    n_action_steps: 0; restarting must not mistake it for residue. A nonzero
+    N under these strategies is rejected instead of silently ignored.
+    """
+    rclpy.init(args=[])
+    node = node_type(
+        parameter_overrides=[
+            Parameter("chunking_strategy", value=strategy),
+            Parameter("n_action_steps", value=0),
+        ]
+    )
+    try:
+        assert node._chunking_strategy == strategy
+        assert node._n_action_steps is None
+        parameters = node.get_parameters_by_prefix("")
+        exported = {name: parameter.value for name, parameter in parameters.items()}
+        assert exported["chunking_strategy"] == strategy
+        assert exported["n_action_steps"] == 0
+        path = tmp_path / "parameters.yaml"
+        path.write_text(yaml.safe_dump({node.get_fully_qualified_name(): {"ros__parameters": exported}}))
+    finally:
+        Node.destroy_node(node)
+        rclpy.shutdown()
+    rclpy.init(args=["--ros-args", "--params-file", str(path)])
+    restarted = node_type()
+    try:
+        assert restarted.get_parameter("chunking_strategy").value == strategy
+        assert restarted.get_parameter("n_action_steps").value == 0
+        assert restarted._chunking_strategy == strategy
+        assert restarted._n_action_steps is None
+    finally:
+        Node.destroy_node(restarted)
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("strategy", ["full_chunk", "auto_horizon"])
+def test_other_strategies_reject_nondefault_n(node_type, strategy):
+    """A nonzero N under a non-n_action_steps strategy is not silently ignored."""
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            f"chunking_strategy:={strategy}",
+            "-p",
+            "n_action_steps:=7",
+        ]
+    )
+    try:
+        with pytest.raises(ValueError, match="only consumed by chunking strategy 'n_action_steps'"):
+            node_type()
+    finally:
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "n_action_steps:=true",
+        "n_action_steps:=false",
+        "n_action_steps:=1.5",
+        "n_action_steps:=50.0",
+        "n_action_steps:='4'",
+        "n_action_steps:=''",
+    ],
+)
+def test_non_integer_override_rejected_at_declaration(node_type, value):
+    """bool/float/str overrides never read as the 0 sentinel: static INTEGER
+    typing rejects them at declaration, before the node body runs."""
+    rclpy.init(args=["--ros-args", "-p", value])
+    try:
+        with pytest.raises(InvalidParameterTypeException, match="expecting type 'INTEGER'"):
+            node_type()
+    finally:
+        rclpy.shutdown()
+
+
+def test_n_action_steps_descriptor_metadata_is_read_only(node_type):
+    """The parameter descriptor itself reports read_only, not just the callback."""
+    rclpy.init(args=[])
+    node = node_type()
+    try:
+        descriptor = node.describe_parameter("n_action_steps")
+        assert descriptor.read_only
+        assert descriptor.type == Parameter.Type.INTEGER.value
+    finally:
+        Node.destroy_node(node)
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("value", [-3, 0])
+def test_n_action_steps_startup_rejects_non_positive_ints(node_type, value):
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            "chunking_strategy:=n_action_steps",
+            "-p",
+            f"n_action_steps:={value}",
+        ]
+    )
+    try:
+        with pytest.raises(ValueError, match="positive int"):
             node_type()
     finally:
         rclpy.shutdown()

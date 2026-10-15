@@ -15,8 +15,8 @@ from robot_config.dispatch_strategies import (
     DispatchStrategyError,
     reject_legacy_smoothing_config,
     resolve_dispatch_strategies,
+    resolve_n_action_steps_config,
     validate_executor_scheduler_pairing,
-    validate_n_action_steps,
 )
 from robot_config.inference_config import (
     ControlModeInferenceConfig,
@@ -399,21 +399,17 @@ def _resolve_dispatch_strategies(
 def _resolve_n_action_steps(mode_config: dict, chunking: str) -> int | None:
     """Resolve ``dispatch.n_action_steps`` for the resolved chunking strategy.
 
-    The value is only consumed by the ``n_action_steps`` strategy. For every
-    other strategy an explicitly configured value is ignored on purpose:
-    ``full_chunk``/``auto_horizon`` compatibility comes first, and the
-    queue-capacity guard below must not silently reinterpret a stray N.
+    Shared SSOT rule (``resolve_n_action_steps_config``): the key is
+    consumed only by the ``n_action_steps`` strategy, and residue is
+    rejected by key existence — including ``null`` / empty string / ``0`` /
+    bool values — under every other strategy. Silently ignoring a stray N
+    would reproduce the "configured but not effective" failure mode the
+    strategy exists to prevent; clearing the value requires removing the
+    key.
     """
-    if chunking != "n_action_steps":
-        return None
     dispatch = mode_config.get("dispatch", {}) or {}
-    raw = dispatch.get("n_action_steps")
-    if raw is None or (isinstance(raw, str) and not raw):
-        raise InferenceConfigError(
-            "dispatch.chunking 'n_action_steps' requires dispatch.n_action_steps to be set to a positive int"
-        )
     try:
-        return validate_n_action_steps(raw, label="dispatch.n_action_steps")
+        return resolve_n_action_steps_config(dispatch, chunking)
     except DispatchStrategyError as exc:
         raise InferenceConfigError(str(exc)) from exc
 
@@ -445,6 +441,14 @@ def _validate_n_action_steps_bounds(
     """
     if queue_size < 1:
         raise InferenceConfigError(f"executor.queue_size must be positive; got {queue_size}")
+    if not candidate_pipelines:
+        # Fail closed: an empty routable set means no pipeline's nominal
+        # chunk size was checked, so the N <= nominal bound silently
+        # disappears. Upstream config validation already requires a
+        # primary pipeline; reaching here is an internal wiring error.
+        raise InferenceConfigError(
+            "dispatch.n_action_steps found no routable policy pipeline to validate the nominal chunk size bound against"
+        )
     if n_action_steps > queue_size:
         raise InferenceConfigError(
             f"dispatch.n_action_steps {n_action_steps} exceeds executor.queue_size {queue_size}: "
@@ -670,7 +674,7 @@ def generate_action_dispatcher_node(
     # Static execution-prefix truncation: resolve N from the same dispatch
     # section and fail fast on queue-capacity / nominal-chunk-size bounds
     # before the dispatcher node is spawned. Non-n_action_steps strategies
-    # ignore a stray N (full_chunk compatibility first).
+    # reject a stray N by key existence (shared SSOT).
     n_action_steps = _resolve_n_action_steps(mode_config, chunking)
     if n_action_steps is not None:
         _validate_n_action_steps_bounds(

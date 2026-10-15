@@ -9,6 +9,8 @@ from robot_config.dispatch_strategies import (
     SUPPORTED_CHUNKING_STRATEGIES,
     DispatchStrategyError,
     resolve_dispatch_strategies,
+    resolve_n_action_steps_config,
+    resolve_n_action_steps_param,
     validate_blending_strategy,
     validate_chunking_strategy,
     validate_dispatch_strategies,
@@ -120,6 +122,84 @@ def test_validate_n_action_steps_accepts_positive_ints(value):
 def test_validate_n_action_steps_rejects_bool_explicitly():
     with pytest.raises(DispatchStrategyError, match="bool rejected"):
         validate_n_action_steps(True)
+
+
+# ---------------------------------------------------------------------------
+# n_action_steps YAML key resolution: residue rejected by key existence.
+# ---------------------------------------------------------------------------
+
+
+def test_config_resolver_accepts_valid_n_under_matching_strategy():
+    assert resolve_n_action_steps_config({"n_action_steps": 50}, "n_action_steps") == 50
+    assert resolve_n_action_steps_config({"n_action_steps": 1}, "n_action_steps") == 1
+
+
+def test_config_resolver_requires_key_under_matching_strategy():
+    with pytest.raises(DispatchStrategyError, match="requires dispatch.n_action_steps"):
+        resolve_n_action_steps_config({}, "n_action_steps")
+    with pytest.raises(DispatchStrategyError, match="requires dispatch.n_action_steps"):
+        resolve_n_action_steps_config(None, "n_action_steps")
+
+
+@pytest.mark.parametrize("value", [None, "", 0, -2, 1.5, "3", True, False, [], {}])
+def test_config_resolver_rejects_invalid_shapes_under_matching_strategy(value):
+    with pytest.raises(DispatchStrategyError, match="n_action_steps"):
+        resolve_n_action_steps_config({"n_action_steps": value}, "n_action_steps")
+
+
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+def test_config_resolver_returns_none_when_key_absent(chunking):
+    assert resolve_n_action_steps_config({}, chunking) is None
+    assert resolve_n_action_steps_config(None, chunking) is None
+    assert resolve_n_action_steps_config({"blending": "none"}, chunking) is None
+
+
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+@pytest.mark.parametrize("value", [50, 0, -2, 1.5, "3", True, False, None, "", [], {}])
+def test_config_resolver_rejects_any_key_presence_under_other_strategies(chunking, value):
+    """Residue is rejected by key existence, not by truthiness: null, empty
+    string, 0 and bool values are errors too — clearing N requires removing
+    the key (unlike the strategy-name fields, where null/empty mean default)."""
+    with pytest.raises(DispatchStrategyError, match="only consumed by chunking strategy 'n_action_steps'"):
+        resolve_n_action_steps_config({"n_action_steps": value}, chunking)
+
+
+# ---------------------------------------------------------------------------
+# n_action_steps ROS parameter resolution: integer 0 sentinel.
+# ---------------------------------------------------------------------------
+
+
+def test_param_resolver_accepts_valid_n_under_matching_strategy():
+    assert resolve_n_action_steps_param(50, chunking="n_action_steps") == 50
+    assert resolve_n_action_steps_param(1, chunking="n_action_steps") == 1
+
+
+@pytest.mark.parametrize("value", [None, 0])
+def test_param_resolver_requires_value_under_matching_strategy(value):
+    with pytest.raises(DispatchStrategyError, match="requires the n_action_steps parameter"):
+        resolve_n_action_steps_param(value, chunking="n_action_steps")
+
+
+@pytest.mark.parametrize("value", [-3, 1.5, "3", True, False, [], {}])
+def test_param_resolver_rejects_invalid_shapes_under_matching_strategy(value):
+    with pytest.raises(DispatchStrategyError, match="n_action_steps must be"):
+        resolve_n_action_steps_param(value, chunking="n_action_steps")
+
+
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+def test_param_resolver_accepts_zero_sentinel_under_other_strategies(chunking):
+    """The strict-ROS integer 0 sentinel: a direct parameter dump/restart of
+    full_chunk/auto_horizon restarts with n_action_steps: 0."""
+    assert resolve_n_action_steps_param(0, chunking=chunking) is None
+
+
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+@pytest.mark.parametrize("value", [50, -2, 1.5, "3", True, False, None, [], {}])
+def test_param_resolver_rejects_nondefault_values_under_other_strategies(chunking, value):
+    """bool/float/str never read as the 0 sentinel; a non-default N under a
+    non-n_action_steps strategy is rejected instead of silently ignored."""
+    with pytest.raises(DispatchStrategyError, match="only consumed by chunking strategy 'n_action_steps'"):
+        resolve_n_action_steps_param(value, chunking=chunking)
 
 
 def test_blending_strategy_exact_match():

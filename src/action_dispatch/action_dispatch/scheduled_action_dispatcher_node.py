@@ -30,7 +30,7 @@ from enum import Enum
 import numpy as np
 import rclpy
 import rclpy.action
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.clock import Clock, ClockType
 from rclpy.executors import MultiThreadedExecutor
@@ -63,7 +63,7 @@ from ibrobot_tracing import get_trace_emitter
 from robot_config.dispatch_strategies import (
     DispatchStrategyError,
     resolve_dispatch_strategies,
-    validate_n_action_steps,
+    resolve_n_action_steps_param,
 )
 
 trace = get_trace_emitter("ib_trace.dispatch", component_id="action_dispatcher")
@@ -236,14 +236,19 @@ class ScheduledActionDispatcherNode(Node):
             ("executor_type", "topic"),
             ("scheduler_mode", "continuous"),
             # Static execution-prefix length N for ``n_action_steps``
-            # chunking. Startup read-only (runtime writes are rejected by
-            # the parameter callback); the launch builder validates N
-            # against the policy metadata nominal_chunk_size — the node
-            # has no manifest access — and against queue_size, which is
-            # re-checked defensively in _load_parameters.
-            ("n_action_steps", 0),
+            # chunking. Declared read_only so the parameter metadata
+            # itself marks it as startup-fixed; the launch builder
+            # validates N against the policy metadata nominal_chunk_size —
+            # the node has no manifest access — and against queue_size,
+            # which is re-checked defensively in _load_parameters.
+            # Integer 0 is the strict-ROS "not enabled" sentinel: a direct
+            # ROS parameter dump under the other strategies legitimately
+            # restarts with 0. bool/float/str values never read as the
+            # sentinel (the static INTEGER typing rejects them at
+            # declaration).
         ):
             self.declare_parameter(name, default)
+        self.declare_parameter("n_action_steps", 0, ParameterDescriptor(name="n_action_steps", read_only=True))
         for name in (
             "startup_readiness_timeout_ns",
             "default_open_timeout_ns",
@@ -287,11 +292,13 @@ class ScheduledActionDispatcherNode(Node):
         if self._queue_size <= 0 or self._chunk_size <= 0:
             raise ValueError("queue_size and chunk_size must be positive")
         _n_action_steps_raw = self.get_parameter("n_action_steps").value
+        # Shared SSOT rule (resolve_n_action_steps_param): the integer 0
+        # sentinel is only legal under the other strategies (direct ROS
+        # dump/restart carries it); a non-default N under them — or a
+        # missing/invalid N under this strategy — is rejected fail-fast
+        # instead of silently ignored.
+        self._n_action_steps = resolve_n_action_steps_param(_n_action_steps_raw, chunking=self._chunking_strategy)
         if self._chunking_strategy == "n_action_steps":
-            if _n_action_steps_raw is None or _n_action_steps_raw == 0:
-                raise ValueError("chunking strategy 'n_action_steps' requires the n_action_steps parameter")
-            # Canonical shape validation (positive int, bool rejected).
-            self._n_action_steps = int(validate_n_action_steps(_n_action_steps_raw))
             if self._n_action_steps > self._queue_size:
                 # Fail-closed queue admission would reject every N-step plan
                 # at runtime; fail fast at init instead. The launch builder
@@ -303,9 +310,6 @@ class ScheduledActionDispatcherNode(Node):
         else:
             if self._chunk_size > self._queue_size:
                 raise ValueError("chunk_size must not exceed queue_size")
-            # Other strategies ignore a stray N (full_chunk compatibility
-            # first); only the n_action_steps strategy consumes it.
-            self._n_action_steps = None
 
     def _load_contract_and_plan(self) -> None:
         from robot_config import load_robot_config
@@ -1020,7 +1024,10 @@ class ScheduledActionDispatcherNode(Node):
             # auto_horizon strategy truncates the executable plan and switches
             # to consume-then-replan replenishment (ActivePlan applies the
             # candidate's start/stop/watermark transactionally); full_chunk
-            # ignores it.
+            # ignores it, and n_action_steps ignores the horizon *selection*
+            # (the static N is the sole horizon source) while the shared
+            # validate_execution_horizon legality check above still applies
+            # to every strategy.
             chunk_plan = self._chunk_planner.plan(
                 action_np,
                 actions_executed=actions_executed,

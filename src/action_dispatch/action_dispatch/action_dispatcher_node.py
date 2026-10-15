@@ -21,7 +21,7 @@ import rclpy
 import rclpy.action
 import rclpy.time
 import torch
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
@@ -34,7 +34,7 @@ from ibrobot_msgs.action import DispatchInfer, RunPolicy
 from ibrobot_msgs.srv import PreparePolicyEpisode
 from ibrobot_tracing import get_trace_emitter
 from robot_config.contract_utils import iter_specs
-from robot_config.dispatch_strategies import resolve_dispatch_strategies, validate_n_action_steps
+from robot_config.dispatch_strategies import resolve_dispatch_strategies, resolve_n_action_steps_param
 from tensormsg.converter import TensorMsgConverter
 
 from .action_chunk import normalize_action_chunk, validate_execution_horizon
@@ -189,11 +189,15 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("chunking_strategy", "")
         self.declare_parameter("blending_strategy", "none")
         # Static execution-prefix length N for ``n_action_steps`` chunking.
-        # Startup read-only (runtime writes are rejected by the parameter
-        # callback); the launch builder validates N against the policy
+        # Declared read_only so the parameter metadata itself marks it as
+        # startup-fixed; the launch builder validates N against the policy
         # metadata nominal_chunk_size — the node has no manifest access —
         # and against queue_size, which is re-checked defensively here.
-        self.declare_parameter("n_action_steps", 0)
+        # Integer 0 is the strict-ROS "not enabled" sentinel: a direct ROS
+        # parameter dump under the other strategies legitimately restarts
+        # with 0. bool/float/str values never read as the sentinel (the
+        # static INTEGER typing rejects them at declaration).
+        self.declare_parameter("n_action_steps", 0, ParameterDescriptor(name="n_action_steps", read_only=True))
         self._blending_update = None
         self.add_on_set_parameters_callback(self._validate_blending_update)
         # Execution timeout for ``wait_for_feedback`` mode only. Monotonic
@@ -306,11 +310,13 @@ class ActionDispatcherNode(Node):
         # strategies can hold cross-request state; per-tick code selects
         # instances, never types.
         _n_action_steps_raw = self.get_parameter("n_action_steps").value
+        # Shared SSOT rule (resolve_n_action_steps_param): the integer 0
+        # sentinel is only legal under the other strategies (direct ROS
+        # dump/restart carries it); a non-default N under them — or a
+        # missing/invalid N under this strategy — is rejected fail-fast
+        # instead of silently ignored.
+        self._n_action_steps = resolve_n_action_steps_param(_n_action_steps_raw, chunking=self._chunking_strategy)
         if self._chunking_strategy == "n_action_steps":
-            if _n_action_steps_raw is None or _n_action_steps_raw == 0:
-                raise ValueError("chunking strategy 'n_action_steps' requires the n_action_steps parameter")
-            # Canonical shape validation (positive int, bool rejected).
-            self._n_action_steps = int(validate_n_action_steps(_n_action_steps_raw))
             if self._n_action_steps > self._queue_limit:
                 # The bounded queue drops the oldest prefix steps when a plan
                 # exceeds capacity, so an oversized N would execute the last
@@ -319,9 +325,6 @@ class ActionDispatcherNode(Node):
                 raise ValueError(f"n_action_steps {self._n_action_steps} exceeds queue_size {self._queue_limit}")
             self._chunk_planner = create_chunk_planner(self._chunking_strategy, n_action_steps=self._n_action_steps)
         else:
-            # Other strategies ignore a stray N (full_chunk compatibility
-            # first); only the n_action_steps strategy consumes it.
-            self._n_action_steps = None
             self._chunk_planner = create_chunk_planner(self._chunking_strategy)
         self._active_plan = ActivePlan(capacity=self._queue_limit, watermark=self._watermark, smoother=self._smoother)
         # create_executor raises ExecutorNotFoundError for unknown types; letting
@@ -1208,7 +1211,10 @@ class ActionDispatcherNode(Node):
             # the auto_horizon strategy truncates the executable plan and
             # switches to consume-then-replan replenishment (ActivePlan
             # applies the candidate's start/stop/watermark transactionally);
-            # full_chunk ignores it.
+            # full_chunk ignores it, and n_action_steps ignores the horizon
+            # *selection* (the static N is the sole horizon source) while
+            # the shared validate_execution_horizon legality check above
+            # still applies to every strategy.
             candidate = self._chunk_planner.plan(
                 actions,
                 actions_executed=executed,

@@ -749,7 +749,7 @@ robot:
 | `executor.type` | `topic` | `executor_type`，输出通道 |
 | `dispatch.scheduler` | `continuous` | `scheduler_mode`，逐 tick 调度；另支持 `wait_for_feedback` |
 | `dispatch.chunking` | `full_chunk` | `chunking_strategy`，支持 `full_chunk` / `auto_horizon` / `n_action_steps` |
-| `dispatch.n_action_steps` | 无 | 仅 `chunking: n_action_steps` 时必填；静态执行前缀长度 N（正整数，bool 拒绝） |
+| `dispatch.n_action_steps` | 无 | 仅 `chunking: n_action_steps` 时必填；静态执行前缀长度 N（正整数，bool 拒绝）。其他策略下按键存在性拒绝残留（null/空串/`0`/bool 均算残留，清除必须删键） |
 | `dispatch.blending` | `none` | `blending_strategy`，另支持 `temporal_ensemble` |
 | `executor.watermark_threshold` | `20` | 剩余动作数的补货阈值，0 表示耗尽后补货；不改变 blending 选择 |
 | `executor.queue_size` | `100` | queue 容量，不限制 smoother 存储 |
@@ -790,13 +790,16 @@ robot:
   runtime options 会参与 profile 兼容性指纹，开关变化需要重新标定。ensemble 没有精确
   单源坐标，本地 revision/接纳身份不能作为 RTC 远端确认。
 - `dispatch.chunking: n_action_steps` 是静态执行前缀截断：`dispatch.n_action_steps`
-  必填且只在该策略下消费（其他策略忽略残留值，不透传节点参数）。launch 期 fail-fast
+  必填且只在该策略下消费，其他策略下按键存在性拒绝残留（null/空串/`0`/bool 均算残留，
+  清除必须删键，不透传节点参数；直接 ROS 参数入口保留严格整数 `0` 未启用哨兵，参数
+  dump 重启可合法携带 `0`，bool/float/str 不会被当作哨兵）。launch 期 fail-fast
   校验 `N <= executor.queue_size`（有界队列会丢弃最老前缀，超限意味着执行的是最后
   `queue_size` 步而不是前 N 步）以及 `N <=` 每个可路由 pipeline 的策略元数据
-  `nominal_chunk_size`（缺失即拒绝，不静默回退完整 chunk；scheduled 路径在 priority=0
-  时对主 pipeline 加 fallback 链整体校验）。运行时 chunk 短于 N 时截断为整个 chunk；
-  结果级 `execution_horizon` 被忽略，静态 N 是唯一 horizon 来源。节点参数
-  `n_action_steps` 为启动只读，运行时写入被参数回调拒绝。该策略下
+  `nominal_chunk_size`（缺失即拒绝，不静默回退完整 chunk；可路由集合为空时同样
+  fail-closed；scheduled 路径在 priority=0 时对主 pipeline 加 fallback 链整体校验）。
+  运行时 chunk 短于 N 时截断为整个 chunk；结果级 `execution_horizon` 不参与本策略的
+  horizon 选择（静态 N 是唯一来源，公共 horizon 合法性校验仍照常执行）。节点参数
+  `n_action_steps` 声明带 `read_only` 描述符，启动只读，运行时写入被拒绝。该策略下
   `chunk_size > queue_size` 合法（N 步前缀才是队列准入大小）。
 
 耗尽后补货与异步提前补货的完整解释统一放在

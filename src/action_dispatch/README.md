@@ -229,7 +229,8 @@ control_modes:
   benchmark 与两者的组合在共享 SSOT 报错（benchmark episode 执行完整 chunk），launch 期与
   节点 init 期都会拒绝。
 - `dispatch.chunking: n_action_steps` 还要求同节的 `dispatch.n_action_steps` 为正整数
-  （bool 拒绝）；该值只在 `n_action_steps` 策略下消费，其他策略忽略残留值且不透传节点参数。
+  （bool 拒绝）；该键只在 `n_action_steps` 策略下消费，其他策略下按键存在性直接拒绝
+  （null/空串/`0`/bool 均算残留），且不透传节点参数。
   launch 期 fail-fast 校验 `N <= executor.queue_size` 与 `N <=` 可路由 pipeline 的
   `nominal_chunk_size`（详见下文「n_action_steps 静态前缀」）。
 - **破坏性接口变更**：删除 `temporal_smoothing_enabled`，不提供别名或兼容路径。
@@ -315,8 +316,8 @@ runtime_options:
 `NActionStepsPlanner` 与 `AutoHorizonPlanner` 共用同一 prefix-truncation 骨架：把可执行
 计划截断为 `[skip, N)`，计划级补货阈值强制 0（消费完前缀后立即重新请求推理，不做
 watermark 预取）。区别只在 horizon 来源：auto_horizon 消费结果级 `execution_horizon`，
-n_action_steps 使用 robot YAML 的静态 `dispatch.n_action_steps`，结果级 horizon 被有意
-忽略。
+n_action_steps 使用 robot YAML 的静态 `dispatch.n_action_steps`，结果级 horizon 不参与
+本策略的 horizon 选择（公共 horizon 合法性校验仍照常执行）。
 
 启用示例（合并到已有机器人 YAML 的 `control_modes.model_inference`）：
 
@@ -335,7 +336,10 @@ dispatch:
 
 命名隔离：模型 bundle `config.json` 的 **`n_action_steps`** 仍仅用于 LeRobot
 `select_action` 的队列语义，与 robot YAML 的 `dispatch.n_action_steps` **没有互通或
-复制**，两个同名字段各归各的 SSOT。
+复制**，两个同名字段各归各的 SSOT。对 diffusion bundle，`config.json` 的
+`n_action_steps` 经 `inference_manifest` 元数据解析（`metadata.py`）成为
+`nominal_chunk_size` 的取值来源，只作为 launch 期 `N <= nominal_chunk_size` 上界
+校验的输入；它本身不会被复制或覆盖 robot YAML 里的 `dispatch.n_action_steps`。
 
 - 值解析与边界：`dispatch.n_action_steps` 必须是正整数（bool 拒绝）；`0`、负数、浮点、
   字符串、列表等在 launch 期报 `InferenceConfigError`。缺省该值时选择此策略直接报错，
@@ -348,8 +352,11 @@ dispatch:
     回退完整 chunk）。legacy 只校验其选中的单个 pipeline；scheduled 在 priority=0 时对
     主 pipeline 加 fallback 链整体校验（路由不允许落到更小 chunk 的策略上），非零
     priority 只校验主 pipeline。
-- 节点参数 `n_action_steps` 为启动只读：planner 快照在 init 固定，运行时写入被参数回调
-  拒绝（`ros2 param set` 报错），避免参数显示一个 planner 永不消费的新值。
+  - 可路由 pipeline 集合为空时 fail-closed 报错（正常配置必含主 pipeline，走到空集合
+    属于内部接线错误），nominal 上界不会因此静默消失。
+- 节点参数 `n_action_steps` 为启动只读：声明带 `read_only` 描述符，参数元数据本身标记
+  只读，planner 快照在 init 固定，运行时写入被拒绝（`ros2 param set` 报错），避免参数
+  显示一个 planner 永不消费的新值。
 - 补货只由前缀消耗驱动：`executor.watermark_threshold` 被忽略（计划级阈值强制 0），
   不做 watermark 预取。
 - 运行时 chunk 短于 N 时截断为整个 chunk（clamp）；推理期间已消费步数照常从前缀起点
@@ -359,8 +366,13 @@ dispatch:
   大小，`N=50, queue_size=50, chunk_size=100` 是合法组合（chunk_size 只是 smoother
   权重表大小）。scheduled 节点 init 在其他策略下仍拒绝 `chunk_size > queue_size`；
   legacy 节点没有该校验（chunk_size 只是权重表大小）。
-- 其他策略忽略残留的 `dispatch.n_action_steps`（full_chunk 兼容优先），且 launch 不
-  透传该节点参数。
+- 结果级 `execution_horizon` 在本策略下不参与 horizon 选择（静态 N 是唯一来源），但
+  公共的 horizon 合法性校验对所有策略照常执行。
+- 其他策略**按键存在性拒绝**残留的 `dispatch.n_action_steps`：null、空串、`0`、bool
+  等任何形式的键存在都是配置错误（清除 N 必须删除该键），且 launch 不透传该节点参数。
+  直接 ROS 参数入口保留严格整数 `0` 作为未启用哨兵：`full_chunk`/`auto_horizon` 的
+  参数 dump 重启合法携带 `0`；非零 N 在这些策略下被节点 init 拒绝，bool/float/str
+  不会被当作哨兵（静态 INTEGER 参数类型在声明期即拒绝）。
 
 ### 参数配置
 

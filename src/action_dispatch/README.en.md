@@ -250,11 +250,13 @@ control_modes:
   (benchmark episodes execute full chunks), both at launch time and at node
   init.
 - `dispatch.chunking: n_action_steps` additionally requires a positive-int
-  `dispatch.n_action_steps` in the same block (bools rejected); the value is
-  consumed only by the `n_action_steps` strategy — other strategies ignore a
-  stray N and never forward the node parameter. Launch-time fail-fast bounds:
-  `N <= executor.queue_size` and `N <=` the `nominal_chunk_size` of every
-  routable pipeline (see "n_action_steps static prefix" below).
+  `dispatch.n_action_steps` in the same block (bools rejected); the key is
+  consumed only by the `n_action_steps` strategy — under every other strategy
+  residue is rejected by key existence (null / empty string / `0` / bool all
+  count as residue) and the node parameter is never forwarded. Launch-time
+  fail-fast bounds: `N <= executor.queue_size` and `N <=` the
+  `nominal_chunk_size` of every routable pipeline (see "n_action_steps static
+  prefix" below).
 - **Breaking interface change:** `temporal_smoothing_enabled` is removed, with
   no alias or compatibility path. Old robot YAML and direct ROS overrides
   (constructor, CLI or parameter file) are rejected even when consistent.
@@ -362,8 +364,9 @@ the executable plan is truncated to `[skip, N)` and the plan-level replenishment
 watermark is forced to 0 (re-request inference once the prefix is consumed, no
 watermark prefetching). The only difference is the horizon source: auto_horizon
 consumes the result-level `execution_horizon`, while n_action_steps uses the static
-`dispatch.n_action_steps` from robot YAML; the result-level horizon is deliberately
-ignored.
+`dispatch.n_action_steps` from robot YAML; the result-level horizon does not
+participate in this strategy's horizon selection (the shared horizon legality
+check still runs for every strategy).
 
 Enabling example (merge into an existing robot YAML's `control_modes.model_inference`):
 
@@ -383,7 +386,11 @@ dispatch:
 Naming isolation: the model bundle `config.json`'s **`n_action_steps`** is still only
 used for the LeRobot `select_action` queue semantics and has **no interop or copying**
 with the robot YAML `dispatch.n_action_steps`; the two same-named fields belong to
-their own SSOTs.
+their own SSOTs. For diffusion bundles, the `config.json` `n_action_steps` flows
+through the `inference_manifest` metadata parsing (`metadata.py`) into
+`nominal_chunk_size`; it only feeds the launch-time `N <= nominal_chunk_size` upper
+bound check and is never copied onto or overrides the robot YAML
+`dispatch.n_action_steps`.
 
 - Value shape and bounds: `dispatch.n_action_steps` must be a positive int (bools
   rejected); `0`, negative numbers, floats, strings and lists raise
@@ -399,10 +406,17 @@ their own SSOTs.
     execution). Legacy validates its single selected pipeline; scheduled validates
     the primary plus, at priority 0, the whole fallback chain (routing must never
     land on a smaller-chunk policy); non-zero priority validates the primary only.
-- The node parameter `n_action_steps` is startup read-only: the planner snapshot is
-  fixed at init, and runtime writes are rejected by the parameter callback
+    An empty routable set fails closed (a healthy config always has a primary
+    pipeline, so reaching an empty set is an internal wiring error) instead of
+    letting the nominal bound silently disappear.
+- The node parameter `n_action_steps` is startup read-only: it is declared with a
+  `read_only` descriptor so the parameter metadata itself marks it read-only; the
+  planner snapshot is fixed at init, and runtime writes are rejected
   (`ros2 param set` fails), preventing the parameter from showing a value the
   planner never consumes.
+- The result-level `execution_horizon` does not participate in this strategy's
+  horizon selection (the static N is the sole horizon source); the shared horizon
+  legality check still runs for every strategy.
 - Replenishment is driven purely by prefix consumption: `executor.watermark_threshold`
   is ignored (the plan-level threshold is forced to 0); no watermark prefetching.
 - A runtime chunk shorter than N is clamped to the whole chunk; steps consumed during
@@ -414,8 +428,15 @@ their own SSOTs.
   valid; chunk_size is only the smoother weight-table size). The scheduled node's
   init still rejects `chunk_size > queue_size` under the other strategies; the
   legacy node has no such check (chunk_size is only the weight-table size).
-- Other strategies ignore a stray `dispatch.n_action_steps` (full_chunk compatibility
-  first), and the launch builder never forwards the node parameter for them.
+- Other strategies reject a stray `dispatch.n_action_steps` **by key existence**:
+  null, empty string, `0` and bool values all count as residue (clearing N
+  requires removing the key), and the launch builder never forwards the node
+  parameter for them. The direct ROS parameter entrypoint keeps the strict
+  integer `0` as the not-enabled sentinel: a parameter dump/restart of
+  `full_chunk`/`auto_horizon` legitimately carries `0`; a non-default N under
+  those strategies is rejected at node init, and bool/float/str values are
+  never interpreted as the sentinel (the static INTEGER parameter typing
+  rejects them at declaration).
 
 ### Parameters
 

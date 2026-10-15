@@ -759,10 +759,25 @@ def test_launch_accepts_n_action_steps_and_passes_parameter(tmp_path):
     assert params["n_action_steps"] == 50
 
 
-def test_launch_omits_n_action_steps_parameter_for_other_strategies(strategy_launch_config):
-    """A stray N under full_chunk is ignored, and the parameter stays absent."""
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+@pytest.mark.parametrize("value", [7, 0, None, "", True, False, 1.5, "3", [], {}])
+def test_launch_rejects_stray_n_action_steps_key(strategy_launch_config, chunking, value):
+    """YAML residue is rejected by key existence under other strategies.
+
+    null / empty string / 0 / bool do not get the missing-key default
+    treatment the strategy-name fields get; clearing N requires removing
+    the key. The parameter stays absent for clean configs.
+    """
     mode = strategy_launch_config["control_modes"]["model_inference"]
-    mode["dispatch"] = {"chunking": "full_chunk", "n_action_steps": 7}
+    mode["dispatch"] = {"chunking": chunking, "n_action_steps": value}
+    with pytest.raises(InferenceConfigError, match="only consumed by chunking strategy 'n_action_steps'"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+def test_launch_omits_n_action_steps_parameter_without_key(strategy_launch_config):
+    """No dispatch.n_action_steps key: the parameter stays absent."""
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["dispatch"] = {"chunking": "full_chunk"}
     nodes = _nodes(generate_execution_nodes(strategy_launch_config, "model_inference"))
     dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
     params = _node_parameters(dispatcher)
@@ -848,3 +863,26 @@ def test_scheduled_launch_without_n_action_steps_omits_parameter(tmp_path):
     nodes = _nodes(generate_execution_nodes(config, "model_inference"))
     dispatcher = next(node for node in nodes if node.node_executable == "scheduled_action_dispatcher_node")
     assert "n_action_steps" not in _node_parameters(dispatcher)
+
+
+def test_bounds_validation_fails_closed_on_empty_candidate_pipelines(tmp_path, monkeypatch):
+    """An empty routable set must not let the nominal-chunk-size bound vanish.
+
+    Reaching _validate_n_action_steps_bounds with no candidates is an
+    internal wiring error (upstream config validation requires a primary
+    pipeline); the scheduled launch builder resolves candidates through
+    _routable_pipeline_candidates, so an empty set must fail closed
+    instead of silently skipping the bound check.
+    """
+    bundle = _bundle_with_chunk_size(tmp_path / "bundle", chunk_size=100)
+    profile = _profile_file(tmp_path)
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, profile)
+    config["control_modes"]["model_inference"]["dispatch"] = {
+        "chunking": "n_action_steps",
+        "n_action_steps": 50,
+    }
+    from robot_config.launch_builders import execution
+
+    monkeypatch.setattr(execution, "_routable_pipeline_candidates", lambda inference: [])
+    with pytest.raises(InferenceConfigError, match="no routable policy pipeline"):
+        execution.generate_execution_nodes(config, "model_inference")

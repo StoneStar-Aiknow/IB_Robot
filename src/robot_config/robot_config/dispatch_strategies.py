@@ -24,6 +24,7 @@ without ROS or numpy dependencies.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 SUPPORTED_SCHEDULERS = ("continuous", "wait_for_feedback")
@@ -166,6 +167,65 @@ def validate_n_action_steps(value: object, *, label: str = "n_action_steps") -> 
     return value
 
 
+def resolve_n_action_steps_config(
+    dispatch_config: Mapping[str, object] | None,
+    chunking: str,
+    *,
+    label: str = "dispatch.n_action_steps",
+) -> int | None:
+    """Resolve the robot-YAML ``dispatch.n_action_steps`` key against ``chunking``.
+
+    YAML residue is rejected by key existence: under any chunking strategy
+    other than ``n_action_steps`` the key being present at all is an error —
+    including ``null`` / empty-string / ``0`` / bool values, which do not get
+    the missing-key default treatment the strategy-name fields get (clearing
+    N requires removing the key). Under ``n_action_steps`` the value must be
+    a positive int (bool rejected); a missing key is an error, not a fallback
+    to another strategy.
+    """
+    dispatch = dispatch_config or {}
+    if "n_action_steps" not in dispatch:
+        if chunking == "n_action_steps":
+            raise DispatchStrategyError(
+                f"chunking strategy 'n_action_steps' requires {label} to be set to a positive int"
+            )
+        return None
+    raw = dispatch["n_action_steps"]
+    if chunking != "n_action_steps":
+        raise DispatchStrategyError(
+            f"{label} is only consumed by chunking strategy 'n_action_steps'; chunking is "
+            f"{chunking!r} — remove the key or set chunking to 'n_action_steps'"
+        )
+    return validate_n_action_steps(raw, label=label)
+
+
+def resolve_n_action_steps_param(value: object, *, chunking: str, label: str = "n_action_steps") -> int | None:
+    """Resolve the ROS node parameter ``n_action_steps`` against ``chunking``.
+
+    The parameter is declared as a strict int with default ``0``, the
+    "not enabled" sentinel: a direct-ROS dump/restart under
+    ``full_chunk``/``auto_horizon`` legitimately carries ``0``. ``bool``,
+    ``float`` and ``str`` values are never interpreted as the sentinel (the
+    static INTEGER parameter typing rejects them at declaration; this helper
+    keeps the rule explicit in the SSOT). Under any chunking strategy other
+    than ``n_action_steps`` a non-default (nonzero) N is rejected instead of
+    silently ignored; under ``n_action_steps`` the value must be a positive
+    int.
+    """
+    if chunking == "n_action_steps":
+        if value is None or (isinstance(value, int) and not isinstance(value, bool) and value == 0):
+            raise DispatchStrategyError(
+                f"chunking strategy 'n_action_steps' requires the {label} parameter to be set to a positive int"
+            )
+        return validate_n_action_steps(value, label=label)
+    if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+        raise DispatchStrategyError(
+            f"{label} is only consumed by chunking strategy 'n_action_steps'; chunking is "
+            f"{chunking!r} — unset the parameter or set chunking to 'n_action_steps'"
+        )
+    return None
+
+
 def validate_blending_strategy(blending: str) -> None:
     """Exact-match validation of a blending strategy name (no aliases)."""
     if blending not in SUPPORTED_BLENDING_STRATEGIES:
@@ -200,6 +260,8 @@ __all__ = [
     "SUPPORTED_CHUNKING_STRATEGIES",
     "SUPPORTED_SCHEDULERS",
     "resolve_dispatch_strategies",
+    "resolve_n_action_steps_config",
+    "resolve_n_action_steps_param",
     "validate_blending_strategy",
     "validate_chunking_strategy",
     "validate_dispatch_strategies",
