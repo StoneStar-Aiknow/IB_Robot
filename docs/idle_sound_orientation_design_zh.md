@@ -101,7 +101,7 @@ nav_turn catalog contract
 | `~/set_following` | `src/ibrobot_msgs/srv/SetSoundFollowing.srv` | periodic 会话进入/退出 |
 | `/embodied/get_skill_gateway_status` | `src/ibrobot_msgs/srv/GetSkillGatewayStatus.srv` | Gateway 状态和 registry identity |
 | `/embodied/execute_skill` | `src/ibrobot_msgs/action/SkillCommand.action` | 受保护的单 Skill 执行入口 |
-| `nav_turn` | `src/skill_catalog/config/skills/nav_turn/manifest.yaml` | 底盘原地转向 Skill |
+| `nav_turn` | `src/agent/skill_catalog/config/skills/nav_turn/manifest.yaml` | 底盘原地转向 Skill |
 
 ## 4. 触发和方向关联
 
@@ -373,17 +373,17 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 | 文件 | 变更内容 |
 | --- | --- |
-| `src/embodied_agent/embodied_agent/sound_orientation_policy.py` | 无 ROS 依赖的状态机、输入校验、方向转换和决策 |
-| `src/embodied_agent/embodied_agent/sound_orientation_node.py` | ROS topic/service/action 适配，不复制业务规则 |
-| `src/embodied_agent/setup.py` | 注册 `sound_orientation_node` console script |
-| `src/embodied_agent/package.xml` | 确认 `rclpy`、`ibrobot_msgs` 等依赖 |
-| `src/embodied_bringup/embodied_bringup/launch_builders/embodied.py` | 按配置启动节点并复用 controller readiness barrier |
+| `src/agent/embodied_agent/embodied_agent/sound_orientation_policy.py` | 无 ROS 依赖的状态机、输入校验、方向转换和决策 |
+| `src/agent/embodied_agent/embodied_agent/sound_orientation_node.py` | ROS topic/service/action 适配，不复制业务规则 |
+| `src/agent/embodied_agent/setup.py` | 注册 `sound_orientation_node` console script |
+| `src/agent/embodied_agent/package.xml` | 确认 `rclpy`、`ibrobot_msgs` 等依赖 |
+| `src/agent/embodied_bringup/embodied_bringup/launch_builders/embodied.py` | 按配置启动节点并复用 controller readiness barrier |
 | `src/robot_config/robot_config/config.py` | 增加归一化配置结构 |
 | `src/robot_config/robot_config/loader.py` | 增加配置和 catalog 关联校验 |
 | `src/robot_config/config/robots/<robot>.yaml` | 仅在目标机器人启用该行为 |
-| `src/embodied_agent/test/test_sound_orientation_policy.py` | 本文定义的纯策略契约测试 |
-| `src/embodied_agent/test/test_sound_orientation_node.py` | ROS 适配和 Action 生命周期测试 |
-| `src/embodied_bringup/test/test_embodied_launch_builder.py` | launch 节点和参数投影测试 |
+| `src/agent/embodied_agent/test/test_sound_orientation_policy.py` | 本文定义的纯策略契约测试 |
+| `src/agent/embodied_agent/test/test_sound_orientation_node.py` | ROS 适配和 Action 生命周期测试 |
+| `src/agent/embodied_bringup/test/test_embodied_launch_builder.py` | launch 节点和参数投影测试 |
 
 不要把 `nav_turn` 的 primitive sequence 复制到 `embodied_agent`，不要修改 `skill_executor_node` 以增加本功能专用旁路。
 
@@ -410,7 +410,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 ## 13. 给后续代码 Agent 的执行说明
 
-实现前先阅读本文件、`src/ibrobot_msgs/msg/SpeechDirection.msg`、`src/ibrobot_msgs/srv/GetSkillGatewayStatus.srv`、`src/ibrobot_msgs/action/SkillCommand.action` 和 `src/skill_catalog/config/skills/nav_turn/manifest.yaml`。
+实现前先阅读本文件、`src/ibrobot_msgs/msg/SpeechDirection.msg`、`src/ibrobot_msgs/srv/GetSkillGatewayStatus.srv`、`src/ibrobot_msgs/action/SkillCommand.action` 和 `src/agent/skill_catalog/config/skills/nav_turn/manifest.yaml`。
 
 实现顺序：
 

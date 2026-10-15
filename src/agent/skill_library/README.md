@@ -663,7 +663,7 @@ catalog implementation 的 `binding: {command: start|stop}` 声明（编译期�
 | `finalize_workflow_service` | `/embodied/finalize_workflow_execution` | 内部 Workflow Finalize 服务名 |
 | `skill_registry_event_topic` | `/embodied/skill_registry_events` | registry 事件 topic（RELIABLE/TRANSIENT_LOCAL/KEEP_LAST depth 1） |
 | `skill_catalog_source_mode` | `installed` | catalog source 模式：`installed`/`development`/`production` |
-| `skill_catalog_source_root` | 空字符串 | `development`/`production` 模式下的 source root |
+| `skill_catalog_source_root` | 空字符串 | `development`/`production` 模式下的 source root（`embodied_bringup` 传入绝对路径） |
 | `skill_catalog_profile` | 空字符串 | catalog profile 名 |
 | `robot_name` | `unknown` | 启动时固定；capability view 中的机器人名称 |
 | `motion_authorized` | `false` | 启动时固定；唯一运动授权值，默认拒绝运动 |

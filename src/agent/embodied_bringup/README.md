@@ -18,7 +18,7 @@ direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备
 `embodied_pipeline.launch.py` 在旧 UDPv4 action 和应用配置构建前执行共享 DDS 本机检查。
 未受管环境保留原 UDPv4 设置；已知 Fast generated 配置使用自身 custom UDPv4，Cyclone
 不设置 Fast 专用变量。受管错误明确阻止启动，不覆盖用户配置；file 来源尚未开放。
-检查不代表对端通信通过，详见 [DDS 配置工具](../../scripts/dds/README.md)。
+检查不代表对端通信通过，详见 [DDS 配置工具](../../../scripts/dds/README.md)。
 
 本包负责：
 
@@ -86,7 +86,7 @@ Agent、CLI、YAML 和动态参数都不能代替操作员授权。
 
 SO-101 真机手动验证必须使用 `ROS_DOMAIN_ID=52`、显式设置 `moveit_display:=true`，并通过 Hermes 完成
 plan/validate/confirm/execute。完整启动、回原位和关停流程见
-[`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。
+[`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../../docs/hermes_so101_real_robot_manual_validation_zh.md)。
 
 `with_perception` 只控制独立感知服务，不恢复已删除的 voice/VLM Planner 流水线。
 

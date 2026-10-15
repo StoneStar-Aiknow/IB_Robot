@@ -75,7 +75,7 @@ hermes-robot-configure \
 也可以使用此目录中的 shell 入口：
 
 ```bash
-bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
+bash src/agent/robot_skill_cli/resource/hermes/sync_hermes.sh \
   --config-name so101_single_arm \
   --soul-mode replace \
   --accept-hooks \

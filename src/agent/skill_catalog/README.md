@@ -130,7 +130,11 @@ longer a valid execution SSOT; `robot_config.loader` rejects it with a single
 error pointing at `embodied.skill_catalog_profile`.
 
 - `development`: validates a mutable staging tree before and after compilation. Source-workspace robot configs use this
-  mode with an absolute path resolved by `embodied_bringup`.
+  mode without a root: `skill_catalog.source.resolve_development_source_root()` selects the source tree of the
+  installed `skill_catalog` package (`--symlink-install` links it back to the checkout), so the catalog location does
+  not depend on where the package sits under `src/`. An absolute root is used as-is; a relative root is resolved
+  against the checkout of the robot config and falls back to the package source tree with a `FutureWarning` when
+  missing. Without a source tree (regular install) the launch and `robot-skill` use the `installed` source.
 - `installed`: resolves `skill_catalog` through the ament package index. It rejects symlinked implementation files, so
   it is intended for non-`--symlink-install` release builds.
 - `production`: requires a release directory selected through `current` and verified by release manifest/digest.

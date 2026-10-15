@@ -93,7 +93,7 @@ server-owned continuation admission。客户端直接执行
 - Gateway 契约（`ExecuteProgram` / `GetExecution`）不变，Gateway 内部不做续跑。
 
 检视或后续修改时不要把这条路径当作“用新 task ID 绕过 Gateway 的断点续跑”处理。实现与限制见
-[`ibrobot_agent` README](../src/ibrobot_agent/README.md)「继续」一节。
+[`ibrobot_agent` README](../src/agent/ibrobot_agent/README.md)「继续」一节。
 
 ## 6. CLI 信号与输出
 

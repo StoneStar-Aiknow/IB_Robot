@@ -63,9 +63,9 @@ env -i HOME="$HOME" USER=xqw TERM=xterm \
 | `ROS_DOMAIN_ID=219 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/action_dispatch/test -q --tb=short` | 449 passed |
 | `ROS_DOMAIN_ID=220 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -o pythonpath="src/task_dispatch" src/task_dispatch/test -q --tb=short` | 23 passed |
 | `ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/manipulation_execution/test -q --tb=short` | 216 passed |
-| `ROS_DOMAIN_ID=217 IBROBOT_TEST_ROS_DOMAIN_ID=217 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/skill_library/test -q --tb=short` | 269 passed |
-| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/skill_catalog/test -q --tb=short` | 78 passed |
-| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/embodied_bringup/test -q --tb=short` | 59 passed, one upstream xacro deprecation warning |
+| `ROS_DOMAIN_ID=217 IBROBOT_TEST_ROS_DOMAIN_ID=217 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/agent/skill_library/test -q --tb=short` | 269 passed |
+| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/agent/skill_catalog/test -q --tb=short` | 78 passed |
+| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/agent/embodied_bringup/test -q --tb=short` | 59 passed, one upstream xacro deprecation warning |
 
 Total: 1094 passing tests. Ruff check and formatting were limited to modified
 and new Python files in the six owned packages; check passed. Scoped
@@ -93,13 +93,13 @@ src/action_dispatch/test/test_policy_admission.py
 src/action_dispatch/test/test_scheduled_dispatcher_lifecycle.py
 src/action_dispatch/test/test_topic_executor.py
 src/action_dispatch/test/test_topic_executor_bindings.py
-src/embodied_bringup/SO101_CONSUMER_MIGRATION.md
-src/embodied_bringup/embodied_bringup/launch_builders/embodied.py
-src/embodied_bringup/launch/embodied_pipeline.launch.py
-src/embodied_bringup/package.xml
-src/embodied_bringup/test/conftest.py
-src/embodied_bringup/test/test_embodied_launch_builder.py
-src/embodied_bringup/test/test_interface_startup.py
+src/agent/embodied_bringup/SO101_CONSUMER_MIGRATION.md
+src/agent/embodied_bringup/embodied_bringup/launch_builders/embodied.py
+src/agent/embodied_bringup/launch/embodied_pipeline.launch.py
+src/agent/embodied_bringup/package.xml
+src/agent/embodied_bringup/test/conftest.py
+src/agent/embodied_bringup/test/test_embodied_launch_builder.py
+src/agent/embodied_bringup/test/test_interface_startup.py
 src/manipulation_execution/manipulation_execution/geometry.py
 src/manipulation_execution/manipulation_execution/providers.py
 src/manipulation_execution/manipulation_execution/phases/execution.py
@@ -115,16 +115,16 @@ src/manipulation_execution/test/test_geometry.py
 src/manipulation_execution/test/test_pick_executor_orientation_guard.py
 src/manipulation_execution/test/test_pick_kinematics_boundary.py
 src/manipulation_execution/test/test_providers.py
-src/skill_catalog/skill_catalog/compiler.py
-src/skill_catalog/skill_catalog/validator.py
-src/skill_catalog/test/test_compiler.py
-src/skill_catalog/test/test_migrated_profiles.py
-src/skill_catalog/test/test_navigation_catalog.py
-src/skill_library/README.md
-src/skill_library/package.xml
-src/skill_library/skill_library/skill_executor_node.py
-src/skill_library/test/test_capability_admission.py
-src/skill_library/test/test_skill_executor_node.py
+src/agent/skill_catalog/skill_catalog/compiler.py
+src/agent/skill_catalog/skill_catalog/validator.py
+src/agent/skill_catalog/test/test_compiler.py
+src/agent/skill_catalog/test/test_migrated_profiles.py
+src/agent/skill_catalog/test/test_navigation_catalog.py
+src/agent/skill_library/README.md
+src/agent/skill_library/package.xml
+src/agent/skill_library/skill_library/skill_executor_node.py
+src/agent/skill_library/test/test_capability_admission.py
+src/agent/skill_library/test/test_skill_executor_node.py
 src/task_dispatch/package.xml
 src/task_dispatch/task_dispatch/task_executor_node.py
 src/task_dispatch/test/test_task_executor_bindings.py

@@ -19,7 +19,8 @@ IB_Robot/
 │   ├── robots/aimdk/       # 灵犀 X2（AimDK）：桥接厂商 MC 层的运行时
 │   ├── lekiwi_hardware/    # LeKiwi 硬件接口
 │   ├── ibrobot_msgs/       # 自定义消息/服务定义
-│   ├── ibrobot_agent/      # 自然语言 Agent 孵化运行时（entry_mode=agent）
+│   ├── agent/              # Agent 栈（技能目录/Gateway/安全/规划/CLI/自然语言 Agent/总装 launch）
+│   ├── embodied_common/    # 具身公共契约层（agent 与非 agent 包共用）
 │   ├── sim_models/         # 仿真模型
 │   ├── model_utils/        # 模型工具
 │   ├── dataset_tools/      # 数据集工具

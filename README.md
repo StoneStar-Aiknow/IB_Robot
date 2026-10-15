@@ -4,7 +4,7 @@
 
 IB-Robot 把遥操作、数据采集、模型训练、边端协同推理、具身技能与机器人控制连接起来。上层应用通过统一的观测／动作契约和机器人能力接口工作，底层按机器人运行时接入机械臂、移动底盘或厂商控制系统。
 
-**[用户指导文档](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)** · **[机器人配置](src/robot_config/README.md)** · **[推理运行时](src/inference_service/README.md)** · **[Agent 技能入口](src/robot_skill_cli/README.md)** · **[开发与测试](docs/testing.md)**
+**[用户指导文档](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)** · **[机器人配置](src/robot_config/README.md)** · **[推理运行时](src/inference_service/README.md)** · **[Agent 技能入口](src/agent/robot_skill_cli/README.md)** · **[开发与测试](docs/testing.md)**
 
 ## 项目能力
 
@@ -164,7 +164,7 @@ ros2 launch robot_config robot.launch.py \
     moveit_display:=true
 ```
 
-运动服务与接口说明见 [SO-101 运动服务](src/robots/so101/so101_motion/README.md)。Agent 的能力发现与受控执行通过 [robot-skill](src/robot_skill_cli/README.md) 进行。
+运动服务与接口说明见 [SO-101 运动服务](src/robots/so101/so101_motion/README.md)。Agent 的能力发现与受控执行通过 [robot-skill](src/agent/robot_skill_cli/README.md) 进行。
 
 ### 二、真机场景
 
@@ -208,7 +208,7 @@ robot-skill --config-name so101_single_arm status
 
 后续通过 Hermes／`robot-skill` 的计划、校验、确认和执行流程控制机器人。只运行 `robot_config robot.launch.py control_mode:=moveit_planning` 不会启动这套技能链路；真机策略推理和遥操作采集则仍使用下文的 `robot_config` 入口。
 
-完整流程见 [具身启动说明](src/embodied_bringup/README.md)、[robot-skill CLI](src/robot_skill_cli/README.md) 和 [真机验证指南](docs/hermes_so101_real_robot_manual_validation_zh.md)。
+完整流程见 [具身启动说明](src/agent/embodied_bringup/README.md)、[robot-skill CLI](src/agent/robot_skill_cli/README.md) 和 [真机验证指南](docs/hermes_so101_real_robot_manual_validation_zh.md)。
 
 ### 三、分布式推理部署场景
 
@@ -378,14 +378,15 @@ IB_Robot/
 │   ├── model_utils/             # 模型导出与转换工具
 │   ├── dataset_tools/           # 数据采集、转换、评估与可视化
 │   ├── benchmark/               # Benchmark 运行时与 LIBERO 适配
-│   ├── ibrobot_agent/           # 自然语言 Agent（孵化）
-│   ├── robot_skill_cli/         # Agent 受控 CLI 与集成接口
-│   ├── embodied_agent/          # Agent plan 生命周期
-│   ├── embodied_bringup/        # 具身节点组合与启动
+│   ├── agent/                   # Agent 栈（技能目录、Gateway、规划、CLI、自然语言 Agent）
+│   │   ├── ibrobot_agent/       # 自然语言 Agent（孵化）
+│   │   ├── robot_skill_cli/     # Agent 受控 CLI 与集成接口
+│   │   ├── embodied_agent/      # Agent plan 生命周期
+│   │   ├── embodied_bringup/    # 具身节点组合与启动
+│   │   ├── skill_catalog/       # 技能目录编译与快照
+│   │   ├── skill_library/       # 技能执行网关与 primitives
+│   │   └── safety_guard/        # 只读安全预检
 │   ├── embodied_common/         # 共享契约与工具
-│   ├── skill_catalog/           # 技能目录编译与快照
-│   ├── skill_library/           # 技能执行网关与 primitives
-│   ├── safety_guard/            # 只读安全预检
 │   ├── action_dispatch/         # 策略动作调度与流式执行
 │   ├── task_dispatch/           # 任务序列执行
 │   ├── manipulation_service/    # 抓取规划与验证

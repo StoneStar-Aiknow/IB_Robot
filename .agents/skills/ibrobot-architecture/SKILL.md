@@ -128,13 +128,15 @@ src/
 ├── model_utils/             # ONNX/OM/RKNN/HMM export and bundle packaging CLIs
 ├── action_dispatch/         # Pull-based action dispatch: schedulers, executors, smoothing
 ├── task_dispatch/           # Task plan execution (waypoints + gripper + waits)
-├── skill_catalog/           # Skill manifest compiler + immutable catalog registry
-├── skill_library/           # Capability gateway (skill_executor_node)
-├── robot_skill_cli/         # Controlled CLI surface for LLM/Agent access
-├── embodied_agent/          # Task entry, planning, visual game nodes
-├── embodied_bringup/        # Embodied pipeline launch orchestration
+├── agent/                   # Agent stack (catalog, Gateway, planning, CLI, Agent)
+│   ├── skill_catalog/       # Skill manifest compiler + immutable catalog registry
+│   ├── skill_library/       # Capability gateway (skill_executor_node)
+│   ├── robot_skill_cli/     # Controlled CLI surface for LLM/Agent access
+│   ├── embodied_agent/      # Task entry, planning, visual game nodes
+│   ├── embodied_bringup/    # Embodied pipeline launch orchestration
+│   ├── ibrobot_agent/       # Natural-language Agent node and chat TUI
+│   └── safety_guard/        # Read-only skill/primitive validation preflight
 ├── embodied_common/         # Neutral shared helpers (contracts, base node)
-├── safety_guard/            # Read-only skill/primitive validation preflight
 ├── manipulation_service/    # GraspGen grasp planning/verification services
 ├── manipulation_execution/  # Closed-loop pick/place/imitate executors
 ├── dataset_tools/           # Episode recording, bag_to_lerobot, policy_eval, rerun_viewer

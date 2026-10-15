@@ -423,7 +423,7 @@ hermes-robot-configure \
 `hermes-robot-configure`），适合源码场景或无 `install/setup.bash` 时使用：
 
 ```bash
-bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
+bash src/agent/robot_skill_cli/resource/hermes/sync_hermes.sh \
   --config-name so101_single_arm --dry-run
 ```
 
@@ -482,7 +482,7 @@ runtime adapter 默认不安装。需要受管运动与优先停止时，显式�
 [`resource/hermes/README.md`](resource/hermes/README.md)。
 
 SO-101 真机的完整手动验证步骤见
-[`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。
+[`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../../docs/hermes_so101_real_robot_manual_validation_zh.md)。
 
 ## 排障：DDS 发现时延与 RMW 选择
 

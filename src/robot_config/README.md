@@ -1270,7 +1270,7 @@ robot:
     # + implementations/<implementation>.yaml). Robot YAML only selects the
     # source, profile, and runtime Gateway wiring:
     skill_catalog_source_mode: development          # installed | development | production
-    skill_catalog_source_root: src/skill_catalog   # required in development/production
+    # skill_catalog_source_root: 省略时 development 使用已安装 skill_catalog 包的源码树；production 必填
     skill_catalog_profile: so101_single_arm         # required when embodied.enabled is true
     # 随 Skill Gateway 启动 robot-skill 常驻 ROS bridge（robot-skill-daemon），使启动后的
     # 第一次 robot-skill 调用无需等待 DDS 发现；只接受布尔值，不参与执行身份 digest。
@@ -1365,7 +1365,10 @@ robot:
 Gateway 接线一致性校验，不重复 manifest/capability 校验。配置 `embodied.skill_catalog_profile`
 时 `skill_required_control_mode` 必须是 `control_modes` 的非空成员；`embodied.enabled: true`
 时 `embodied.skill_catalog_profile` 必须非空。`skill_catalog_source_mode` 只接受
-`installed`、`development`、`production`；后两者要求 `skill_catalog_source_root` 指向有效目录。
+`installed`、`development`、`production`；`production` 要求 `skill_catalog_source_root` 指向 release 根目录。
+`development` 可省略 root：launch 与 `robot-skill` 使用 `--symlink-install` 安装的 `skill_catalog` 包所在源码树，
+与该包在 `src/` 下的目录位置无关；非 symlink 安装时回退到 ament `installed` source。显式 root 为绝对路径时原样使用，
+为相对路径时按配置文件所在 checkout 解析，不存在则带 `FutureWarning` 回退到包源码树。
 `embodied.resident_cli_bridge` 可选，必须是布尔值（默认 `true`），由 `embodied_bringup` 用于决定是否随
 Skill Gateway 启动 `robot-skill-daemon`，详见 `robot_skill_cli` README「常驻 ROS bridge」。
 
@@ -1413,10 +1416,10 @@ registry 都在相关节点启动时冻结。修改机器人 YAML 后需重启 p
 重启。`robot-skill reload-catalog` 不会影响视觉游戏。
 
 更多具身节点说明，详见各子包 README：
-- [`embodied_agent`](../embodied_agent/README.md)
+- [`embodied_agent`](../agent/embodied_agent/README.md)
 - [`perception_service`](../perception_service/README.md)
-- [`skill_library`](../skill_library/README.md)
-- [`safety_guard`](../safety_guard/README.md)
+- [`skill_library`](../agent/skill_library/README.md)
+- [`safety_guard`](../agent/safety_guard/README.md)
 
 #### 2. moveit_planning 模式（轨迹规划控制）
 
