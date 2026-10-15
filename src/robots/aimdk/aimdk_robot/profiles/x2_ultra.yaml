@@ -259,6 +259,7 @@ vendor:
     alert_codes: /aima/hds/alert_code_list
     diag_codes: /aima/hds/diag_code_list
     power_state: /aima/hal/pmu/state
+    processed_audio: /agent/process_audio_output
     audio_capture: /aima/hal/audio/capture
     audio_playback: /aima/hal/audio/playback
     audio_focus_response: /aima/hal/audio/focus_response
@@ -277,6 +278,7 @@ vendor:
   # offers, which is how the platform's state topics deliver their current value
   # immediately on subscribe.
   qos:
+    processed_audio: {reliability: best_effort, durability: volatile}
     upper_body_command: {reliability: best_effort, durability: volatile}
     locomotion_command: {reliability: best_effort, durability: volatile}
     mc_state: {reliability: best_effort, durability: transient_local}
@@ -504,6 +506,20 @@ vendor:
 # read them from CameraInfo.
 # ---------------------------------------------------------------------------
 interfaces:
+  audio.speech:
+    capability: interaction.audio_capture
+    kind: topic
+    direction: publish
+    endpoint: /audio/speech_chunk
+    message_type: ibrobot_msgs/msg/SpeechAudioChunk
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 50}
+  audio.enhanced_capture:
+    capability: interaction.audio_capture
+    kind: topic
+    direction: publish
+    endpoint: /audio/enhanced_capture_stamped
+    message_type: audio_common_msgs/msg/AudioDataStamped
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
   joint.body_state:
     capability: joint.state
     kind: topic

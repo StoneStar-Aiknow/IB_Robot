@@ -63,6 +63,9 @@ def _launch_setup(context, *_args, **_kwargs):
         )
 
     if not simulated:
+        # The runtime itself bridges the vendor's processed speech stream, next
+        # to the raw capture and playback paths it already owns; declaring the
+        # endpoint in the profile is all a deployment has to do.
         return [runtime_node()]
 
     # In simulated transport the platform's sensor streams have no publisher, so
