@@ -208,6 +208,25 @@ def test_ai_commit_without_trailer_when_declared_is_blocking(tmp_path):
     assert "ai_commit_metadata_missing" in ids_of(result)
 
 
+@pytest.mark.parametrize("bold", [True, False])
+@pytest.mark.parametrize("parentheses", ["ascii", "fullwidth"])
+def test_generated_ai_labels_are_recognized(tmp_path, bold, parentheses):
+    body = DISCLOSED_BODY
+    if not bold:
+        body = body.replace("**", "")
+    if parentheses == "fullwidth":
+        body = body.replace("(Model)", "（Model）").replace("（Tool）", "(Tool)")
+    result = run_gates(tmp_path, make_pr(title="[WIP] feature", body=body), plain_files(), ai_commits())
+    assert result.returncode == 0
+    assert not {issue for issue in ids_of(result) if issue.startswith("ai_")}
+
+
+def test_bold_tool_label_does_not_hide_an_invalid_agent_version(tmp_path):
+    body = DISCLOSED_BODY.replace("OpenCode 1.17.20", "OpenCode")
+    result = run_gates(tmp_path, make_pr(title="[WIP] feature", body=body), plain_files(), ai_commits())
+    assert "ai_tool_version_invalid" in ids_of(result)
+
+
 def test_ai_provider_prefix_is_blocking(tmp_path):
     result = run_gates(
         tmp_path,

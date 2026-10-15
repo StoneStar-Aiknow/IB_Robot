@@ -42,7 +42,7 @@ from robot_config.launch_registry.registry import BuilderSpec, BuildResult, Laun
 _COMPRESSED_TYPE = "sensor_msgs/msg/CompressedImage"
 # The runtime publishes the camera; the stream subscribes it.
 _CAMERA_SHAPE = ("topic", "publish", _COMPRESSED_TYPE)
-_FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "decoder", "decoder_params"})
+_FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "decoder", "decoder_params", "require_unique_publisher"})
 # Superseded by frame_source; refused rather than silently ignored.
 _LEGACY_STREAM_KEYS = ("rgb_compressed_topic", "rgb_compressed_type")
 _DEFAULT_DECODER = "mock_cpu"
@@ -181,6 +181,9 @@ def _stream_parameters(config: Mapping, robot_config: Mapping) -> dict:
         "status_period_sec": _positive(config, "status_period_sec", 5.0),
         "actor_stale_sec": _positive(config, "actor_stale_sec", 3.0),
     }
+    source_config = config["frame_source"]
+    if "require_unique_publisher" in source_config:
+        parameters["require_unique_publisher"] = _required_bool(source_config, "require_unique_publisher")
     outputs = [parameters[key] for key in ("frame_topic", "status_topic", "actor_state_topic")]
     if len(set(outputs)) != len(outputs):
         raise ValueError("motion_imitation_stream.frame_topic, status_topic and actor_state_topic must differ")
@@ -229,8 +232,8 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
         raise ValueError(f"motion_imitation_stream.frame_source has unknown keys {unknown}")
     if ("interface" in source) == ("topic" in source):
         raise ValueError("motion_imitation_stream.frame_source needs exactly one of interface or topic")
-    interfaces = _described_interfaces(robot_config, "motion_imitation_stream.frame_source subscribes a camera")
     if "interface" in source:
+        interfaces = _described_interfaces(robot_config, "motion_imitation_stream.frame_source subscribes a camera")
         interface_id = source["interface"]
         if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
             raise InterfaceBindingError(
@@ -254,6 +257,11 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
         topic = source["topic"]
         if not isinstance(topic, str) or not topic.startswith("/") or topic.strip() != topic:
             raise ValueError("motion_imitation_stream.frame_source.topic must be an absolute ROS name")
+        runtime = robot_config.get("runtime") or {}
+        description = runtime.get("interface_description") if isinstance(runtime, Mapping) else None
+        interfaces = description.get("interfaces", {}) if isinstance(description, Mapping) else {}
+        if not isinstance(interfaces, Mapping):
+            interfaces = {}
         described = sorted(
             name for name, item in interfaces.items() if isinstance(item, Mapping) and item.get("endpoint") == topic
         )

@@ -92,25 +92,17 @@ robot:
   # two services above. The node is perception only: it publishes parameter
   # frames and commands no motion, so starting it cannot move the robot.
   #
-  # The camera is the left head-front stereo camera, by its compressed
-  # interface ID; the endpoint comes from the live description. This compute
-  # unit must not subscribe raw images across units, so only the compressed
-  # stream is used. With the whole launch running, this stream (2064x1552 JPEG)
-  # reached the node, while the front-centre camera (2688x1944) delivered
-  # almost no frames and the rgbd_head_front camera had no publisher. With no
-  # publisher the node idles and reports it once per status period rather
-  # than failing.
-  #
-  # frame_source.topic selects a stream the description does not carry, for
-  # example a resized stream from another compute unit; topic and interface
-  # are never both set. The decoder is chosen by name; mock_cpu is the
-  # in-process OpenCV decode (JPEG/PNG -> bgr8).
+  # The robot already publishes the front-centre camera's half-resolution
+  # compressed stream. Subscribe to that existing topic directly; do not
+  # derive or launch another relay in this application. The decoder is chosen
+  # by name and auto prefers 310P DVPP for JPEG.
   motion_imitation_stream:
     enabled: true
     frame_source:
-      interface: camera.stereo_head_front_left.color_compressed
-      decoder: mock_cpu
-      decoder_params: {}
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+      require_unique_publisher: true
+      decoder: auto
+      decoder_params: {device_id: 0}
     frame_topic: /motion_imitation_stream/pear_frame
     status_topic: /motion_imitation_stream/status
     # ibrobot_msgs/ActorState, one per frame PEAR takes up. The actor

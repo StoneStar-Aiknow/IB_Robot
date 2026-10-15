@@ -33,6 +33,8 @@
        channel order, crop, resize, normalise) stays in the perception
        adapters; this is only JPEG/PNG -> raw Image. -->
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>inference_service</exec_depend>
+  <exec_depend>observation_transport</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
@@ -41,6 +43,13 @@
   <!-- The migrated mirror-session builder tests import robot_config's
        launch preparation pipeline (design decision 4). -->
   <test_depend>robot_config</test_depend>
+  <!-- test_compressed_image_decode.py validates decoded frames against
+       perception_service.model_contracts. -->
+  <test_depend>perception_service</test_depend>
+  <!-- test_motion_imitation_stream_builder.py cross-checks the stream's
+       service parameters against inference_service's perception model
+       endpoints. -->
+  <test_depend>inference_service</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

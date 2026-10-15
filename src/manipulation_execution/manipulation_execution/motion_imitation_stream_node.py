@@ -24,9 +24,9 @@ The perception semantics -- person selection, the centred-crop fallback, the
 call-start-to-call-start YOLOX rate limit, the response validation -- are the
 windowed executor's, and the shared pieces live in
 ``manipulation_execution.hri_vision`` so the two stay identical.
-What is deliberately absent here is that node's task machinery: there is no
-capture window, no epoch, no task deadline and no frame buffer, because a
-resident stream has nothing to scope them to.
+There is no task capture window or deadline. A source generation invalidates
+queued frames and in-flight results across source faults, restarts and geometry
+changes; it does not scope the resident stream to an imitation task.
 """
 
 from __future__ import annotations
@@ -37,12 +37,13 @@ import math
 import queue
 import threading
 import time
+from dataclasses import dataclass
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 
@@ -86,6 +87,12 @@ _QUEUE_POLL_SEC = 0.1
 _FUTURE_POLL_SEC = 0.01
 
 
+@dataclass(frozen=True)
+class _QueuedFrame:
+    generation: int
+    message: CompressedImage | Image
+
+
 def _validated_positive(value: object, name: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number <= 0.0:
@@ -109,6 +116,7 @@ class MotionImitationStreamNode(Node):
         super().__init__("motion_imitation_stream", parameter_overrides=parameter_overrides)
         self.declare_parameter("rgb_compressed_topic", "")
         self.declare_parameter("frame_source_interface", "")
+        self.declare_parameter("require_unique_publisher", False)
         self.declare_parameter("decoder", "mock_cpu")
         self.declare_parameter("decoder_params_json", "{}")
         self.declare_parameter("actor_state_topic", "/motion_imitation_stream/actor_state")
@@ -127,6 +135,9 @@ class MotionImitationStreamNode(Node):
         self._rgb_topic = _validated_topic(self.get_parameter("rgb_compressed_topic").value, "rgb_compressed_topic")
         # Empty when launch used an explicit frame_source.topic override.
         self._frame_source_interface = str(self.get_parameter("frame_source_interface").value).strip()
+        self._require_unique_publisher = self.get_parameter("require_unique_publisher").value
+        if type(self._require_unique_publisher) is not bool:
+            raise ValueError("require_unique_publisher must be a boolean")
         try:
             decoder_params = json.loads(str(self.get_parameter("decoder_params_json").value))
         except json.JSONDecodeError as exc:
@@ -160,11 +171,16 @@ class MotionImitationStreamNode(Node):
             self._person_confidence_threshold, self.get_parameter("actor_stale_sec").value
         )
 
-        # Guards the counters, the bbox cache and the last sample only. It is
-        # never held across a service call, unlike the executor's capture lock,
-        # which also covers the task window.
-        self._stats_lock = threading.Lock()
+        self._stats_lock = threading.RLock()
+        self._source_generation = 0
+        self._source_healthy = None
         self._received = 0
+        self._compressed_dropped = 0
+        self._out_of_order = 0
+        self._source_rejected = 0
+        self._last_capture_stamp = None
+        self._last_encoded_at = 0.0
+        self._source_geometry = None
         self._frames = 0
         self._frames_dropped = 0
         self._decode_failed = 0
@@ -201,12 +217,14 @@ class MotionImitationStreamNode(Node):
         self._started_at = time.monotonic()
         self._window_started_at = self._started_at
         self._window_received = 0
+        self._window_decode_calls = 0
         self._window_frames = 0
         self._window_published = 0
         self._window_decode_sec = 0.0
         self._window_decode_max_sec = 0.0
 
         self._stop = threading.Event()
+        self._decode_queue: queue.Queue = queue.Queue(maxsize=1)
         self._pear_queue: queue.Queue = queue.Queue(maxsize=1)
         self._yolox_queue: queue.Queue = queue.Queue(maxsize=1)
         self._next_pear_at = 0.0
@@ -224,15 +242,21 @@ class MotionImitationStreamNode(Node):
 
         self._pear_worker = threading.Thread(target=self._pear_loop, name="mi-stream-pear", daemon=True)
         self._yolox_worker = threading.Thread(target=self._yolox_loop, name="mi-stream-yolox", daemon=True)
+        self._decode_worker = threading.Thread(target=self._decode_loop, name="mi-stream-decode", daemon=True)
         self._pear_worker.start()
         self._yolox_worker.start()
+        self._decode_worker.start()
         self._rgb_subscription = self.create_subscription(
             CompressedImage,
             self._rgb_topic,
             self._on_compressed_frame,
-            qos_profile_sensor_data,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
         )
         self._status_timer = self.create_timer(self._status_period_sec, self._publish_status)
+        # count_publishers queries the rclpy graph; doing it per frame while
+        # holding the stats lock contends with the decode and vision workers.
+        # A slow timer owns the probe; frame paths read the cached boolean.
+        self._source_health_timer = self.create_timer(0.2, self._refresh_source_health)
         self.get_logger().info(
             f"motion imitation stream ready: in={self._rgb_topic} "
             f"interface={self._frame_source_interface or '(explicit topic)'} decoder={self._decoder_name} "
@@ -243,8 +267,89 @@ class MotionImitationStreamNode(Node):
             f"yolox_refresh={self._yolox_refresh_interval_sec:.2f}s rpc_timeout={self._rpc_timeout:.2f}s"
         )
 
+    def _refresh_source_health(self) -> None:
+        """Probe source availability at a slow rate; frame paths read the cache."""
+        if not self._require_unique_publisher:
+            return
+        available = self.count_publishers(self._rgb_topic) == 1
+        with self._stats_lock:
+            if not available and self._source_healthy is not False:
+                self._invalidate_source_locked()
+            self._source_healthy = available
+
+    def _source_available(self) -> bool:
+        if not self._require_unique_publisher:
+            return True
+        if self._source_healthy is None:
+            # Before the health timer's first tick the cache is empty; probe
+            # once here so early frames are not rejected. Callers already hold
+            # the stats lock, which is reentrant for this thread.
+            self._refresh_source_health()
+        return self._source_healthy is True
+
+    def _invalidate_source_locked(self) -> None:
+        """Retire cache, queue entries and RPCs together while holding the state lock."""
+        self._source_generation += 1
+        self._yolox_detections = None
+        self._yolox_result_ready = False
+        self._source_geometry = None
+        self._last_capture_stamp = None
+        self._last_encoded_at = 0.0
+        self._next_pear_at = 0.0
+        for slot in (self._decode_queue, self._pear_queue, self._yolox_queue):
+            with contextlib.suppress(queue.Empty):
+                slot.get_nowait()
+
+    def _frame_current_locked(self, message: Image, generation: int) -> bool:
+        return generation == self._source_generation and (
+            self._source_geometry is None or self._source_geometry == (message.width, message.height)
+        )
+
     def _on_compressed_frame(self, message: CompressedImage) -> None:
+        """Keep the newest compressed frame without decoding on the ROS callback."""
+        stamp = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
+        with self._stats_lock:
+            if not self._source_available():
+                self._source_rejected += 1
+                self._yolox_detections = None
+                self._yolox_result_ready = False
+                return
+            self._received += 1
+            self._window_received += 1
+            now = time.monotonic()
+            if self._last_encoded_at and now - self._last_encoded_at > max(2.0, self._rpc_timeout):
+                self._invalidate_source_locked()
+            if stamp != (0, 0):
+                if self._last_capture_stamp is not None and stamp <= self._last_capture_stamp:
+                    self._out_of_order += 1
+                    return
+                self._last_capture_stamp = stamp
+            self._last_encoded_at = now
+            if put_latest(self._decode_queue, _QueuedFrame(self._source_generation, message)):
+                self._compressed_dropped += 1
+
+    def _decode_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                queued = self._decode_queue.get(timeout=_QUEUE_POLL_SEC)
+            except queue.Empty:
+                continue
+            try:
+                self._decode_frame(queued.message, queued.generation)
+            except Exception as exc:
+                with self._stats_lock:
+                    self._decode_failed += 1
+                self._record_vision_failure(f"decode: {type(exc).__name__}: {exc}")
+
+    def _decode_frame(self, message: CompressedImage, generation: int | None = None) -> None:
         """Decode once, then hand the same frame to both workers."""
+        if not self._source_available():
+            return
+        with self._stats_lock:
+            if generation is None:
+                generation = self._source_generation
+            if generation != self._source_generation:
+                return
         started = time.perf_counter()
         error = ""
         try:
@@ -257,8 +362,7 @@ class MotionImitationStreamNode(Node):
             error = f" ({type(exc).__name__}: {exc})"
         decode_sec = time.perf_counter() - started
         with self._stats_lock:
-            self._received += 1
-            self._window_received += 1
+            self._window_decode_calls += 1
             self._window_decode_sec += decode_sec
             self._window_decode_max_sec = max(self._window_decode_max_sec, decode_sec)
         if image is None:
@@ -272,14 +376,24 @@ class MotionImitationStreamNode(Node):
             # zero frames has to say what it was handed.
             if count == 1:
                 self.get_logger().warning(
-                    f"compressed frame rejected by decoder {self._decoder_name}, "
-                    f"format={str(message.format)!r}{error}"
+                    f"compressed frame rejected by decoder {self._decoder_name}, format={str(message.format)!r}{error}"
                 )
+            return
+        if not self._source_available():
             return
         stamp = image.header.stamp
         stamp_text = f"{int(stamp.sec)}.{int(stamp.nanosec):09d}"
         now = time.monotonic()
         with self._stats_lock:
+            if generation != self._source_generation:
+                return
+            geometry = (image.width, image.height)
+            if self._source_geometry is not None and self._source_geometry != geometry:
+                last_capture, last_encoded = self._last_capture_stamp, self._last_encoded_at
+                self._invalidate_source_locked()
+                self._last_capture_stamp, self._last_encoded_at = last_capture, last_encoded
+                generation = self._source_generation
+            self._source_geometry = geometry
             self._frames += 1
             self._window_frames += 1
             if not self._first_stamp:
@@ -290,16 +404,16 @@ class MotionImitationStreamNode(Node):
             first_frame = self._first_frame_after_sec is None
             if first_frame:
                 self._first_frame_after_sec = now - self._started_at
+            queued = _QueuedFrame(generation, image)
+            dropped = put_latest(self._pear_queue, queued)
+            dropped = put_latest(self._yolox_queue, queued) or dropped
+            if dropped:
+                self._frames_dropped += 1
         if first_frame:
             self.get_logger().info(
                 f"motion imitation stream first camera frame after {now - self._started_at:.2f}s: "
                 f"{image.width}x{image.height} decoder={self._decoder_name} decode={decode_sec * 1000.0:.1f}ms"
             )
-        dropped = put_latest(self._pear_queue, image)
-        dropped = put_latest(self._yolox_queue, image) or dropped
-        if dropped:
-            with self._stats_lock:
-                self._frames_dropped += 1
 
     def _yolox_loop(self) -> None:
         next_refresh = 0.0
@@ -321,7 +435,7 @@ class MotionImitationStreamNode(Node):
             pending_frame = None
             refresh_started = time.monotonic()
             try:
-                self._process_yolox_frame(message)
+                self._process_yolox_frame(message.message, message.generation)
             except Exception as exc:
                 self._record_vision_failure(f"{type(exc).__name__}: {exc}")
             # Measured call-start to call-start so a slow refresh does not
@@ -331,23 +445,32 @@ class MotionImitationStreamNode(Node):
     def _pear_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                message = self._pear_queue.get(timeout=_QUEUE_POLL_SEC)
+                queued = self._pear_queue.get(timeout=_QUEUE_POLL_SEC)
             except queue.Empty:
                 continue
-            if self._min_pear_period_sec > 0.0:
-                now = time.monotonic()
-                if now < self._next_pear_at:
-                    with self._stats_lock:
-                        self._throttled += 1
+            with self._stats_lock:
+                if not self._frame_current_locked(queued.message, queued.generation):
                     continue
-                self._next_pear_at = now + self._min_pear_period_sec
+                if self._min_pear_period_sec > 0.0:
+                    now = time.monotonic()
+                    if now < self._next_pear_at:
+                        self._throttled += 1
+                        continue
+                    self._next_pear_at = now + self._min_pear_period_sec
             try:
-                self._process_pear_frame(message)
+                self._process_pear_frame(queued.message, queued.generation)
             except Exception as exc:
                 self._record_vision_failure(f"{type(exc).__name__}: {exc}")
 
-    def _process_yolox_frame(self, message: Image) -> bool:
+    def _process_yolox_frame(self, message: Image, generation: int | None = None) -> bool:
         """Refresh the person-box cache. Model preprocessing lives in the adapter."""
+        if not self._source_available():
+            return False
+        with self._stats_lock:
+            if generation is None:
+                generation = self._source_generation
+            if not self._frame_current_locked(message, generation):
+                return False
         try:
             center_fallback_detection(message)
         except ValueError as exc:
@@ -358,7 +481,7 @@ class MotionImitationStreamNode(Node):
         request.confidence_threshold = self._person_confidence_threshold
         request.nms_threshold = _NMS_THRESHOLD
         response = self._call_vision(self._yolox_client, request, metric="yolox")
-        if response is None:
+        if response is None or not self._source_available():
             return False
         if not response.success:
             self._record_vision_failure(f"yolox: {response.message}")
@@ -377,22 +500,30 @@ class MotionImitationStreamNode(Node):
         # with no qualifying person is the deliberate switch to the
         # centred-crop fallback.
         with self._stats_lock:
+            if not self._frame_current_locked(message, generation):
+                return False
             self._yolox_detections = cached
             self._yolox_result_ready = True
         return True
 
-    def _process_pear_frame(self, message: Image) -> None:
+    def _process_pear_frame(self, message: Image, generation: int | None = None) -> None:
         """Decide the actor for the newest frame, run PEAR on its box, then publish."""
+        if not self._source_available():
+            return
         try:
             fallback_detection = center_fallback_detection(message)
         except ValueError as exc:
             self._record_vision_failure(str(exc))
             return
         with self._stats_lock:
+            if generation is None:
+                generation = self._source_generation
+            if not self._frame_current_locked(message, generation):
+                return
             ready = self._yolox_result_ready
             detections = self._yolox_detections
-        decision = self._actor_selector.update(message, detections)
-        self._record_actor(message, decision)
+            decision = self._actor_selector.update(message, detections)
+            self._record_actor(message, decision)
         if not ready:
             return
         # Unknown is never present, so a stale result falls back like an
@@ -442,7 +573,11 @@ class MotionImitationStreamNode(Node):
             [round(value, 4) for value in values["smplx_scale"][:3]],
             float(result.inference_time_ms),
         )
+        if not self._source_available():
+            return
         with self._stats_lock:
+            if not self._frame_current_locked(message, generation):
+                return
             self._vision_ok += 1
             if source == "yolox":
                 self._vision_detected += 1
@@ -458,26 +593,21 @@ class MotionImitationStreamNode(Node):
                 self._published += 1
                 self._window_published += 1
                 sequence = self._sequence
+            if sequence is not None:
+                frame = PearFrame()
+                frame.header = message.header
+                frame.schema = SCHEMA
+                frame.sequence = sequence
+                frame.source = source
+                frame.actor_id = decision.actor_id
+                frame.bbox = [float(value) for value in detection.bbox]
+                frame.confidence = float(detection.confidence)
+                frame.inference_time_ms = float(result.inference_time_ms)
+                for name in PEAR_OUTPUT_FIELDS:
+                    setattr(frame, name, values[name])
+                self._frame_publisher.publish(frame)
         if announce:
-            # Logged once to confirm the chain is producing frames. Later
-            # frames are reported through the periodic status: a per-frame log
-            # at stream rate would flood the log.
             self.get_logger().info(f"motion imitation stream first frame {sample}")
-        if sequence is None:
-            return
-
-        frame = PearFrame()
-        frame.header = message.header
-        frame.schema = SCHEMA
-        frame.sequence = sequence
-        frame.source = source
-        frame.actor_id = decision.actor_id
-        frame.bbox = [float(value) for value in detection.bbox]
-        frame.confidence = float(detection.confidence)
-        frame.inference_time_ms = float(result.inference_time_ms)
-        for name in PEAR_OUTPUT_FIELDS:
-            setattr(frame, name, values[name])
-        self._frame_publisher.publish(frame)
 
     def _record_actor(self, message: Image, decision: ActorDecision) -> None:
         """Count and publish the actor decision for one frame, before PEAR runs."""
@@ -552,7 +682,16 @@ class MotionImitationStreamNode(Node):
                 "interface": self._frame_source_interface,
                 "decoder": self._decoder_name,
                 "publishers": self.count_publishers(self._rgb_topic),
+                "require_unique_publisher": self._require_unique_publisher,
+                "source_available": self._source_available(),
+                "source_generation": self._source_generation,
+                "source_rejected": self._source_rejected,
                 "received": self._received,
+                "compressed_dropped": self._compressed_dropped,
+                "out_of_order": self._out_of_order,
+                "cpu_frames": getattr(self._decoder, "cpu_frames", self._frames),
+                "dvpp_frames": getattr(self._decoder, "dvpp_frames", 0),
+                "decoder_error": getattr(self._decoder, "last_error", ""),
                 "frames": self._frames,
                 "frames_dropped": self._frames_dropped,
                 "decode_failed": self._decode_failed,
@@ -575,10 +714,10 @@ class MotionImitationStreamNode(Node):
                 "input_hz": round(self._window_received / elapsed, 2),
                 "decode_hz": round(self._window_frames / elapsed, 2),
                 "output_hz": round(self._window_published / elapsed, 2),
-                "decode_ms": round(1000.0 * self._window_decode_sec / self._window_received, 2)
-                if self._window_received
+                "decode_ms": round(1000.0 * self._window_decode_sec / self._window_decode_calls, 2)
+                if self._window_decode_calls
                 else None,
-                "decode_ms_max": round(1000.0 * self._window_decode_max_sec, 2) if self._window_received else None,
+                "decode_ms_max": round(1000.0 * self._window_decode_max_sec, 2) if self._window_decode_calls else None,
                 "first_frame_after_sec": round(self._first_frame_after_sec, 2)
                 if self._first_frame_after_sec is not None
                 else None,
@@ -590,6 +729,7 @@ class MotionImitationStreamNode(Node):
             }
             self._window_started_at = now
             self._window_received = 0
+            self._window_decode_calls = 0
             self._window_frames = 0
             self._window_published = 0
             self._window_decode_sec = 0.0
@@ -597,22 +737,50 @@ class MotionImitationStreamNode(Node):
         message = String()
         message.data = json.dumps(status, ensure_ascii=False)
         self._status_publisher.publish(message)
-        if status["frames"] == 0:
-            # Distinguish nobody publishing from publishing-but-undecodable:
-            # the two look identical from the frame count alone.
-            self.get_logger().info(
-                f"motion imitation stream idle: no frames from {self._rgb_topic} "
+        if status["publishers"] == 0:
+            reason = "source has no publisher"
+        elif not status["source_available"]:
+            reason = "source has conflicting publishers"
+        elif status["frames"] == 0:
+            reason = "source produced no decodable frames"
+        elif self._last_frame_at and now - self._last_frame_at >= self._status_period_sec:
+            reason = "source timed out: no recent decodable frame"
+        elif (
+            status["decoder_error"]
+            and status["cpu_frames"] > 0
+            and status["dvpp_frames"] == 0
+            and self._decoder_name in ("auto", "dvpp")
+        ):
+            # auto falls back to CPU decode when hardware is unavailable; the
+            # 30 FPS target only holds with DVPP, so surface the degradation.
+            reason = "hardware decoder unavailable: decoding on CPU"
+        else:
+            reason = ""
+        if reason:
+            self.get_logger().warning(
+                f"motion imitation stream warning: {reason} on {self._rgb_topic} "
                 f"(publishers={status['publishers']}, received={status['received']}, "
-                f"decode_failed={status['decode_failed']})"
+                f"decode_failed={status['decode_failed']}, last_age_sec={status['last_age_sec']})"
             )
         else:
             self.get_logger().info(f"motion imitation stream status {message.data}")
 
     def destroy_node(self) -> bool:
         self._stop.set()
-        for worker in (self._pear_worker, self._yolox_worker):
+        stuck = False
+        for worker in (self._decode_worker, self._pear_worker, self._yolox_worker):
             if worker.is_alive():
-                worker.join(timeout=1.0)
+                worker.join(timeout=max(5.0, self._rpc_timeout + 1.0))
+            if worker.is_alive():
+                stuck = True
+                self.get_logger().error(
+                    f"worker {worker.name} did not stop; its decoder resources stay owned"
+                    " and the shared decoder will not be closed"
+                )
+        if not stuck:
+            self._decoder.close()
+        # Finish teardown even when a worker is stuck: skipping super() would
+        # leak every subscription, timer, client and publisher.
         return super().destroy_node()
 
 

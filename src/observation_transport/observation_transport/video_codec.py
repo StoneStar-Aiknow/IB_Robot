@@ -227,9 +227,12 @@ class VideoCodecRegistry:
             decoder_factory,
         )
 
-    def resolve(self, policy: str, kind: CodecKind) -> ResolvedCodecBackend:
+    def resolve(self, policy: str, kind: CodecKind, *, codec: str = "h264") -> ResolvedCodecBackend:
         if kind not in {"encoder", "decoder"}:
             raise ValueError(f"unsupported codec kind {kind!r}")
+        if not isinstance(codec, str) or not codec.strip():
+            raise ValueError("codec must be a non-empty string")
+        codec = codec.strip().lower()
         normalized = policy.strip().lower()
         if normalized != "auto":
             registration = self._backends.get(normalized)
@@ -239,7 +242,7 @@ class VideoCodecRegistry:
                     f"video codec backend {normalized!r} is not registered",
                     backend=normalized,
                 )
-            result = self._probe(registration, kind)
+            result = self._probe(registration, kind, codec)
             if not result.available:
                 raise VideoCodecError(
                     "backend_unavailable",
@@ -252,7 +255,7 @@ class VideoCodecRegistry:
         probes: list[BackendProbeResult] = []
         registrations = sorted(self._backends.values(), key=lambda item: (-item.priority, item.name))
         for registration in registrations:
-            result = self._probe(registration, kind)
+            result = self._probe(registration, kind, codec)
             probes.append(result)
             if result.available:
                 return self._resolved(registration, kind, result, tuple(probes))
@@ -264,7 +267,7 @@ class VideoCodecRegistry:
         )
 
     @staticmethod
-    def _probe(registration: _BackendRegistration, kind: CodecKind) -> BackendProbeResult:
+    def _probe(registration: _BackendRegistration, kind: CodecKind, codec: str = "h264") -> BackendProbeResult:
         factory = registration.encoder_factory if kind == "encoder" else registration.decoder_factory
         if factory is None:
             return BackendProbeResult(registration.name, kind, False, reason=f"{kind} is not implemented")
@@ -279,6 +282,10 @@ class VideoCodecRegistry:
             )
         if capabilities is None:
             return BackendProbeResult(registration.name, kind, False, reason="probe reported unavailable")
+        if codec not in capabilities.codecs:
+            return BackendProbeResult(
+                registration.name, kind, False, capabilities=capabilities, reason=f"codec {codec!r} is not supported"
+            )
         return BackendProbeResult(registration.name, kind, True, capabilities=capabilities)
 
     @staticmethod
