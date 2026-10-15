@@ -1,0 +1,14 @@
+# Business config of the mirror session's demo rules (business hooks / cover judge "demo").
+# A stand-in so the main line runs, not the mirror behaviour; replace it with the business config.
+#
+# session:     given to the business hooks class as is (DemoHooks, manipulation_execution.mirror_session.demo).
+#              min_box_height_px 0 turns the distance rule off.
+# timing:      read by the session: start_criteria / cancel_criteria must hold this long (s).
+#              YOLOX refreshes about once a second: start needs two detections in a row,
+#              cancel two misses plus 0.5 s.
+# cover_judge: given to the cover judge class as is (placeholder brightness limits).
+# operator:    read by the operator node; empty = its defaults.
+session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
+timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
+cover_judge: {mean_max: 20, max_max: 60}
+operator:    {}
