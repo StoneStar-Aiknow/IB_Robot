@@ -52,6 +52,18 @@ update_submodules() {
         submodules=("libs/lerobot")
     fi
 
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true ]]; then
+        # RoboTwin is opt-in benchmark tooling, gated by --with-benchmark like
+        # its runtime wheels: its 4.6 GB clone and its nested GitHub-hosted
+        # XPolicyLab submodule must not gate the default setup path.
+        local default_path_submodules=()
+        for sm in "${submodules[@]}"; do
+            [[ "${sm}" == "libs/robotwin" ]] && continue
+            default_path_submodules+=("${sm}")
+        done
+        submodules=("${default_path_submodules[@]}")
+    fi
+
     local to_update=()
     local skipped=()
 
@@ -84,7 +96,14 @@ update_submodules() {
         log_info "Updating submodules..."
         for sm in "${to_update[@]}"; do
             log_info "  -> ${sm}"
-            run_cmd git submodule update --init --recursive "${sm}"
+            if [[ "${sm}" == "libs/robotwin" ]]; then
+                # XPolicyLab is RoboTwin's optional policy-serving stack on
+                # GitHub; the benchmark adapter drives Base_Task directly and
+                # never imports it, so the opt-in sync stays non-recursive.
+                run_cmd git submodule update --init "${sm}"
+            else
+                run_cmd git submodule update --init --recursive "${sm}"
+            fi
         done
         log_done "Submodules updated"
     else

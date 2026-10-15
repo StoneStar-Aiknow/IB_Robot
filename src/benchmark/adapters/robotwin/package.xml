@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>benchmark_robotwin</name>
+  <version>0.0.1</version>
+  <description>RoboTwin benchmark adapter plugin for IB-Robot benchmark runtime.</description>
+  <maintainer email="ib-robot@example.com">ib-robot</maintainer>
+  <license>Apache-2.0</license>
+
+  <build_depend>benchmark_runtime</build_depend>
+  <exec_depend>benchmark_runtime</exec_depend>
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <test_depend>benchmark_runtime</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

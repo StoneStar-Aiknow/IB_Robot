@@ -219,7 +219,11 @@ Options:
       --with-diagnostics Install optional Plotly/Matplotlib dependencies for
                           the speech_direction_report offline CLI only;
                           the speech_direction_node runtime does not need them.
-      --with-benchmark   Install the Ubuntu 22.04 x86_64 GPU LIBERO profile.
+      --with-benchmark   Install the Ubuntu 22.04 x86_64 GPU benchmark profile:
+                          the LIBERO provider (lerobot[libero]) plus the
+                          RoboTwin runtime wheels (requirements/robotwin.txt:
+                          sapien/mplib/open3d/warp-lang/imageio; nvidia-curobo
+                          stays a manual source build, see that file's header).
                           Pins the validated PyTorch/TorchCodec CUDA ABI, needs
                           NVIDIA driver >=560.28.03, does not need local nvcc,
                           and skips unrelated GraspGen dependencies.

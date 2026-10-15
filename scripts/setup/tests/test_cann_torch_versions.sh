@@ -293,8 +293,12 @@ fi
 
 check_lerobot_python_compat() { return 0; }
 check_lerobot_ros_numpy_compat() { return 0; }
-CAPTURED_COMMANDS=""
-run_cmd() { CAPTURED_COMMANDS+="$(printf '%q ' "$@")"$'\n'; }
+# install_lerobot_editable scopes the cmake shim PATH inside a subshell, so a
+# shell variable cannot carry the capture back to this assertion context.
+# Capture run_cmd through a file instead.
+CAPTURE_FILE="${TMP_ROOT}/lerobot-install-captured.txt"
+: > "${CAPTURE_FILE}"
+run_cmd() { printf '%q ' "$@" >> "${CAPTURE_FILE}"; printf '\n' >> "${CAPTURE_FILE}"; }
 # LeRobot now resolves its own dependencies on every accelerator, including
 # CANN 8.1: accel_requirements overrides Torch afterwards and
 # accel_pip_constraints protects it. Hand-maintained substitute lists and
@@ -302,34 +306,34 @@ run_cmd() { CAPTURED_COMMANDS+="$(printf '%q ' "$@")"$'\n'; }
 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" SETUP_PROFILE=full \
     install_lerobot_editable fake-python -m pip
 assert_eq "CANN 8.1 installs LeRobot with its own extras, not --no-deps" \
-    "0" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c -- '--no-deps')"
+    "0" "$(grep -c -- '--no-deps' "${CAPTURE_FILE}")"
 assert_eq "CANN 8.1 keeps the kinematics extra in the full profile" \
-    "1" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c 'lerobot.*kinematics')"
+    "1" "$(grep -c 'lerobot.*kinematics' "${CAPTURE_FILE}")"
 
 # torchcodec is in LeRobot's aarch64 base deps but declares no torch
 # requirement, so after a supported override its extension is ABI-broken while
 # pip stays quiet. accel_post_requirements must remove it — on both releases.
-CAPTURED_COMMANDS=""
+: > "${CAPTURE_FILE}"
 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" accel_post_requirements fake-python -m pip install
 assert_eq "CANN 8.1 removes the ABI-incompatible torchcodec" \
-    "1" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c 'uninstall -y torchcodec')"
-CAPTURED_COMMANDS=""
+    "1" "$(grep -c 'uninstall -y torchcodec' "${CAPTURE_FILE}")"
+: > "${CAPTURE_FILE}"
 IBR_CANN_TOOLKIT_ROOT="$(fake_cann_root 8.3.RC1)" accel_post_requirements fake-python -m pip install
 assert_eq "CANN 8.3 removes the ABI-incompatible torchcodec" \
-    "1" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c 'uninstall -y torchcodec')"
-CAPTURED_COMMANDS=""
+    "1" "$(grep -c 'uninstall -y torchcodec' "${CAPTURE_FILE}")"
+: > "${CAPTURE_FILE}"
 IBR_CANN_TOOLKIT_ROOT="${EMPTY_ROOT}" accel_post_requirements fake-python -m pip install
-assert_eq "an unsupported CANN release removes nothing" "" "${CAPTURED_COMMANDS}"
+assert_eq "an unsupported CANN release removes nothing" "" "$(cat "${CAPTURE_FILE}")"
 
 # Only the trailing `install` verb may be swapped. "${arr[@]/install/uninstall}"
 # rewrites the first `install` substring of every element, so an interpreter
 # path containing "install" — a colcon install tree, /opt/install/... — would
 # be mangled into a nonexistent binary.
-CAPTURED_COMMANDS=""
+: > "${CAPTURE_FILE}"
 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" \
     accel_post_requirements /opt/install/ws/venv/bin/python3 -m pip install
 assert_eq "the interpreter path survives the install-to-uninstall swap" \
-    "1" "$(printf '%s' "${CAPTURED_COMMANDS}" | grep -c '^/opt/install/ws/venv/bin/python3 -m pip uninstall ')"
+    "1" "$(grep -c '^/opt/install/ws/venv/bin/python3 -m pip uninstall ' "${CAPTURE_FILE}")"
 
 # A runner that does not end in `install` is a contract violation, not something
 # to silently rewrite.

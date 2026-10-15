@@ -213,6 +213,8 @@ resolve_egl_probe_cmake() {
     # practice /usr/bin) would also shadow ``pip`` itself and silently redirect
     # the whole install to the user site directory.
     local candidate magic version
+    local cmake_candidates
+    cmake_candidates="$(type -a -p cmake 2>/dev/null)"
     while IFS= read -r candidate; do
         [[ -x "${candidate}" ]] || continue
         # The PyPI console script is text opening with a shebang; a distribution
@@ -227,7 +229,7 @@ resolve_egl_probe_cmake() {
             printf '%s' "${candidate}"
             return 0
         fi
-    done < <(type -a -p cmake 2>/dev/null)
+    done <<< "${cmake_candidates}"
     return 1
 }
 
@@ -747,6 +749,18 @@ EOF
             fi
             export LIBERO_CONFIG_PATH="${libero_config_dir}"
             log_info "hf-libero config/assets ready at ${libero_config_dir}"
+
+            # RoboTwin benchmark runtime: pinned SAPIEN/mplib wheels. curobo
+            # is deliberately NOT auto-installed (PyPI ships a stub package;
+            # the real v1 build needs the host CUDA toolkit) — see the header
+            # of requirements/robotwin.txt for the manual recipe.
+            log_info "Installing optional benchmark (RoboTwin) runtime wheels..."
+            run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/robotwin.txt" --quiet
+            if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c "import curobo" >/dev/null 2>&1; then
+                log_warn "nvidia-curobo is not importable; RoboTwin evaluation needs the manual v0.7.8 source build:"
+                log_warn "  pip install --no-build-isolation \"git+https://github.com/NVlabs/curobo.git@v0.7.8\""
+                log_warn "See requirements/robotwin.txt for the full recipe (CUDA toolkit + ASSETS_PATH placeholder sed)."
+            fi
         fi
     fi
 

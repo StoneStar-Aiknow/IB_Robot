@@ -1,0 +1,199 @@
+robot:
+  name: piper_robotwin_evaluation
+  type: piper
+  robot_type: piper
+
+  runtime:
+    target: benchmark
+
+  default_control_mode: model_inference
+
+  joints:
+    all: []
+
+  benchmark:
+    type: robotwin
+    adapter: robotwin
+    instance_id: robotwin
+    # Static parallel lanes: every lane is an isolated SAPIEN instance running
+    # the complete plan. 5 is a conservative declared bound, not certified
+    # capacity; measure before raising.
+    max_lane_count: 5
+
+    headless: true
+    camera_names:
+      - head_camera
+      - left_camera
+      - right_camera
+    image_size: [480, 640]
+    control_mode: qpos
+
+    task_name: beat_block_hammer
+    task_config: demo_clean
+    embodiment: piper
+    env_cfg_type: piper
+    action_type: qpos
+    arm_dim: 6
+
+    evaluation:
+      enabled: true
+      suite: robotwin
+      tasks: [0]
+      episodes_per_task: 2
+      max_steps: 400
+      seed: 10000
+
+      parallel:
+        enabled: true
+        lane_count: 2
+        scheduling: static
+        fail_fast: true
+      inference:
+        max_in_flight: 2
+        queue_size: 64
+
+      save_sim_states: false
+      video:
+        enabled: true
+        camera_name: head_camera
+        fps: 10
+        single_video: false
+
+      output:
+        root: ~/ibrobot_robotwin_outputs
+        run_name: piper_robotwin_evaluation
+        write_native: true
+        write_canonical: true
+
+      timeouts:
+        run_timeout_sec: 3600.0
+        startup_timeout_sec: 300.0
+        max_duration_sec: 600.0
+
+      failure_policy:
+        continue_recoverable_episode_errors: true
+        continue_video_errors: true
+
+  contract:
+    observations:
+      - key: observation.images.cam_high
+        topic: /benchmark/robotwin/observation/images/cam_high
+        type: sensor_msgs/msg/Image
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        image:
+          encoding: rgb8
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+      - key: observation.images.cam_left_wrist
+        topic: /benchmark/robotwin/observation/images/cam_left_wrist
+        type: sensor_msgs/msg/Image
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        image:
+          encoding: rgb8
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+      - key: observation.images.cam_right_wrist
+        topic: /benchmark/robotwin/observation/images/cam_right_wrist
+        type: sensor_msgs/msg/Image
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        image:
+          encoding: rgb8
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+      - key: observation.state
+        topic: /benchmark/robotwin/observation/state
+        type: ibrobot_msgs/msg/StampedFloat32MultiArray
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        selector:
+          names:
+            - left_arm_j0
+            - left_arm_j1
+            - left_arm_j2
+            - left_arm_j3
+            - left_arm_j4
+            - left_arm_j5
+            - left_gripper
+            - right_arm_j0
+            - right_arm_j1
+            - right_arm_j2
+            - right_arm_j3
+            - right_arm_j4
+            - right_arm_j5
+            - right_gripper
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+    actions:
+      - key: action
+        publish:
+          topic: /benchmark/robotwin/action
+          type: std_msgs/msg/Float32MultiArray
+        selector:
+          names:
+            - left_arm_j0
+            - left_arm_j1
+            - left_arm_j2
+            - left_arm_j3
+            - left_arm_j4
+            - left_arm_j5
+            - left_gripper
+            - right_arm_j0
+            - right_arm_j1
+            - right_arm_j2
+            - right_arm_j3
+            - right_arm_j4
+            - right_arm_j5
+            - right_gripper
+
+  control_modes:
+    model_inference:
+      inference:
+        enabled: true
+        pipelines:
+          policy:
+            model_path: "<MODEL_BUNDLE_DIRECTORY>"
+            deployment: torch-cuda
+            execution_mode: monolithic
+            request_timeout: 60.0
+            default_task: ""
+      executor:
+        type: benchmark
+        mode: benchmark
+        inference_pipeline: policy
+        queue_size: 100
+        chunk_size: 100
+        control_frequency: 10.0
+      dispatch:
+        scheduler: wait_for_feedback
+        execution_timeout_sec: 60.0
+
+  voice_asr:
+    enabled: false
+
+  navigation:
+    enabled: false
+
+  embodied:
+    enabled: false

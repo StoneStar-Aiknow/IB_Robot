@@ -64,9 +64,9 @@ benchmark_preflight_host() {
     fi
 
     local gpu_name driver_version driver_cuda
-    IFS=',' read -r gpu_name driver_version < <(
-        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader,nounits 2>/dev/null | head -n1
-    )
+    local gpu_info_line
+    gpu_info_line="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader,nounits 2>/dev/null | head -n1)"
+    IFS=',' read -r gpu_name driver_version <<< "${gpu_info_line}"
     gpu_name="${gpu_name# }"
     driver_version="${driver_version// /}"
     driver_cuda="$(benchmark_detect_driver_cuda)"
