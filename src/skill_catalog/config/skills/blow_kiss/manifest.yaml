@@ -25,7 +25,7 @@ description:
   anchor_pose: none
   intensity: moderate
   # Placeholder until measured on the robot; the runtime bounds the motion itself.
-  duration_sec_estimate: 10.0
+  duration_sec_estimate: 6.1
   requires_motion_params: false
 capability:
   schema_version: 1
