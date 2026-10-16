@@ -2,3 +2,5 @@
 bool success
 string message
 string plan_json
+# Adapter-verified startup snapshot: a JSON object, or null when unavailable.
+string provider_identity_json

@@ -51,4 +51,5 @@ def resolve_plan_request(options: Mapping[str, Any]) -> LiberoPlanRequest | None
         write_native=output.get("write_native", True),
         write_canonical=output.get("write_canonical", True),
         lane_count=lane_count,
+        provider=str(options.get("libero_provider", "hf-libero")),
     )

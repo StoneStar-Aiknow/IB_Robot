@@ -13,11 +13,16 @@ from typing import Any
 import numpy as np
 
 from benchmark_libero.evaluation import resolve_plan_request
-from benchmark_libero.init_state_loader import InitStateLoadError, load_trusted_init_states, resolve_init_states_path
+from benchmark_libero.init_state_loader import InitStateLoadError, load_task_init_states, resolve_init_states_path
 from benchmark_libero.observation_codec import convert_observation
 from benchmark_libero.plan_provider import NativeLiberoPlanProvider
 from benchmark_libero.plan_resolver import LiberoPlanResolver
-from benchmark_libero.version_probe import probe_libero_provider
+from benchmark_libero.version_probe import (
+    ProviderIdentity,
+    prepare_libero_plus_import,
+    probe_libero_plus_provider,
+    probe_libero_provider,
+)
 from benchmark_runtime.adapter import BenchmarkAdapter
 from benchmark_runtime.io_descriptor import (
     BenchmarkIODescriptor,
@@ -72,6 +77,8 @@ class LiberoAdapter(BenchmarkAdapter):
         self._task_environment_generation = 0
         self._task_environment_close_count = 0
         self._plan: BenchmarkPlan | None = None
+        self._provider_identity: ProviderIdentity | None = None
+        self._libero_provider = "hf-libero"
         self._suite = _FROZEN_SUITE
         self._seed = 0
         self._use_init_state_id = True
@@ -130,11 +137,24 @@ class LiberoAdapter(BenchmarkAdapter):
                     f"MUJOCO_GL='{mujoco_gl}' is not a recognized headless backend; use 'egl' or unset it"
                 )
 
-            probe_libero_provider()
+            provider = str(options.get("libero_provider", "hf-libero"))
+            self._libero_provider = provider
+            if provider == "libero-plus":
+                # Both providers share the ``libero`` package name; the import
+                # binding must happen before the first libero import in this
+                # process (config path + sys.path precedence).
+                prepare_libero_plus_import()
+                self._provider_identity = probe_libero_plus_provider()
+            elif provider == "hf-libero":
+                self._provider_identity = probe_libero_provider()
+            else:
+                raise LiberoAdapterError(f"unknown libero_provider {provider!r}; expected 'hf-libero' or 'libero-plus'")
             plan_request = resolve_plan_request(options)
             if plan_request is not None:
                 try:
-                    self._plan = LiberoPlanResolver(NativeLiberoPlanProvider()).resolve(plan_request)
+                    self._plan = LiberoPlanResolver(NativeLiberoPlanProvider(provider=self._libero_provider)).resolve(
+                        plan_request
+                    )
                 except Exception as exc:
                     raise LiberoAdapterError(f"failed to resolve LIBERO evaluation plan: {exc}") from exc
                 self._validate_plan_metadata(self._plan)
@@ -165,6 +185,21 @@ class LiberoAdapter(BenchmarkAdapter):
             if self._plan is None:
                 raise NotImplementedError("LIBERO evaluation is disabled; no resolved plan is available")
             return self._plan
+
+    def provider_identity(self) -> dict[str, Any] | None:
+        """Serialize the actual configure-time probe, without probing again."""
+        with self._lock:
+            identity = self._provider_identity
+            if not self._configured or identity is None:
+                return None
+            return {
+                "name": identity.distribution_name,
+                "version": identity.distribution_version,
+                "module_path": identity.module_path,
+                "provider_root": identity.provider_root,
+                "assets_path": identity.assets_path,
+                "apis_present": list(identity.apis_present),
+            }
 
     def list_tasks(self) -> list[BenchmarkTask]:
         with self._lock:
@@ -245,7 +280,9 @@ class LiberoAdapter(BenchmarkAdapter):
                     "image_size": list(_FROZEN_IMAGE_SIZE),
                     "control_mode": _FROZEN_CONTROL_MODE,
                     "camera_names": list(_FROZEN_CAMERA_NAMES),
-                    "init_states_path": resolve_init_states_path(self._task, self._get_libero_path()),
+                    "init_states_path": resolve_init_states_path(
+                        self._task, self._get_libero_path(), provider=self._libero_provider
+                    ),
                 },
             )
 
@@ -358,9 +395,9 @@ class LiberoAdapter(BenchmarkAdapter):
             if self._plan is not None
             else (None, self._native_task_for_legacy(request.task_id))
         )
-        init_path = resolve_init_states_path(task, self._get_libero_path())
+        init_path = resolve_init_states_path(task, self._get_libero_path(), provider=self._libero_provider)
         try:
-            init_states = load_trusted_init_states(init_path)
+            init_states = load_task_init_states(task, self._get_libero_path(), provider=self._libero_provider)
         except InitStateLoadError as exc:
             raise LiberoAdapterError(f"failed to load trusted LIBERO init-state asset at '{init_path}': {exc}") from exc
         if init_states is None or len(init_states) == 0:

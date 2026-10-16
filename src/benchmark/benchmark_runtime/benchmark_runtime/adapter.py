@@ -86,6 +86,15 @@ class BenchmarkAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support resolved benchmark plans")
 
+    def provider_identity(self) -> dict[str, Any] | None:
+        """Return the configured provider's verified JSON identity, if available.
+
+        The environment snapshots this once at startup and transports it to the
+        evaluator separately from the persisted plan. Adapters own all provider
+        probing; the generic runtime must not infer identity from configuration.
+        """
+        return None
+
     def on_task_finalized(self, suite: str, task_id: int) -> None:
         """Release task-scoped native resources after a committed task.
 

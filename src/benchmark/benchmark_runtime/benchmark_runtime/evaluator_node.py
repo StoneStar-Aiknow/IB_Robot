@@ -169,7 +169,9 @@ def _git_identity(workspace_root: Path) -> dict[str, Any]:
     return result
 
 
-def _runtime_manifest_identity(robot_config_path: str) -> dict[str, Any]:
+def _runtime_manifest_identity(
+    robot_config_path: str, *, provider_identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
     robot = _load_robot_mapping(robot_config_path)
     config_path = Path(robot_config_path).resolve()
     workspace_root = next((parent for parent in config_path.parents if (parent / ".git").exists()), config_path.parent)
@@ -232,6 +234,7 @@ def _runtime_manifest_identity(robot_config_path: str) -> dict[str, Any]:
     return {
         "python": {"version": platform.python_version(), "executable": sys.executable},
         "packages": packages,
+        "provider": provider_identity,
         "git": _git_identity(workspace_root),
         "inference": {
             "pipeline_id": pipeline_id,
@@ -312,6 +315,7 @@ class BenchmarkEvaluatorNode(Node):
         self._readiness: ReadinessBarrier | None = None
         self._supervisor: SerialSupervisor | None = None
         self._plan_future: Any = None
+        self._provider_identity: dict[str, Any] | None = None
         self._pending_future: Any = None
         self._pending_kind = ""
         self._goal_handle: Any = None
@@ -494,7 +498,9 @@ class BenchmarkEvaluatorNode(Node):
             "output_root": str(output_root),
             "run_root": str(run_root),
             "robot_config_path": str(Path(self._robot_config_path).resolve()),
-            "runtime_identity": _runtime_manifest_identity(self._robot_config_path),
+            "runtime_identity": _runtime_manifest_identity(
+                self._robot_config_path, provider_identity=self._provider_identity
+            ),
             "resolved_plan": json.loads(benchmark_plan_to_json(plan)),
             "lane_index": plan.lane_index,
             "lane_count": plan.lane_count,
@@ -880,6 +886,13 @@ class BenchmarkEvaluatorNode(Node):
                 plan = benchmark_plan_from_json(response.plan_json)
             except BenchmarkPlanJSONError as exc:
                 raise EvaluatorStartupError(f"malformed benchmark plan: {exc}") from exc
+            try:
+                provider_identity = loads_strict(response.provider_identity_json)
+                if provider_identity is not None:
+                    require_json_object(provider_identity, "provider identity")
+            except StrictJSONError as exc:
+                raise EvaluatorStartupError(f"malformed provider identity: {exc}") from exc
+            self._provider_identity = provider_identity
             self._set_readiness_plan(plan)
             self._resolve_canonical_identity(plan, self._run_id)
             self._supervisor = SerialSupervisor(plan, run_id=self._run_id, ready=False)

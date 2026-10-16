@@ -71,6 +71,7 @@ class LiberoPlanRequest:
     write_native: bool
     write_canonical: bool
     lane_count: int = 1
+    provider: str = "hf-libero"
 
     def __post_init__(self) -> None:
         if self.suite not in _VALID_SUITES:
@@ -131,7 +132,21 @@ class LiberoPlanResolver:
                 )
 
         expected_count = 90 if request.suite == "libero_90" else 100 if request.suite == "libero_100" else 10
-        if len(provider_tasks) != expected_count:
+        if request.provider == "libero-plus":
+            # LIBERO-plus expands the original suites from 10 to 2500+ tasks
+            # per suite; only the lower bound is enforced, with a warning.
+            if len(provider_tasks) < expected_count:
+                raise ValueError(
+                    f"suite {request.suite!r} resolved {len(provider_tasks)} tasks; expected at least {expected_count}"
+                )
+            if len(provider_tasks) > expected_count:
+                warnings = warnings + (
+                    f"suite {request.suite!r} resolved {len(provider_tasks)} tasks "
+                    f"(LIBERO-plus expansion; original LIBERO has {expected_count})",
+                )
+        elif len(provider_tasks) != expected_count:
+            # hf-libero stays fail-closed: a mismatched task table means the
+            # wrong provider or version is loaded; do not continue silently.
             raise ValueError(f"suite {request.suite!r} resolved {len(provider_tasks)} tasks; expected {expected_count}")
         names = [task.name for task in provider_tasks]
         if len(set(names)) != len(names):

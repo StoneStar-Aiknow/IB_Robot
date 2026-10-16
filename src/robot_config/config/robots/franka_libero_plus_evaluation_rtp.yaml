@@ -1,0 +1,13 @@
+robot:
+  base_config: franka_libero_evaluation_rtp.yaml
+  name: franka_libero_plus_evaluation_rtp
+
+  # Inherit evaluation, RTP transport and inference settings from the baseline.
+  # One provider per process; hf-libero remains installed for sibling profiles.
+  benchmark:
+    instance_id: libero_plus
+    libero_provider: libero-plus
+    identity_packages: [robosuite, mujoco]
+    evaluation:
+      output:
+        run_name: franka_libero_plus_evaluation_rtp

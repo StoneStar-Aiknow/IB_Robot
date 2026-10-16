@@ -36,3 +36,7 @@
 	path = libs/robotwin
 	url = https://github.com/RoboTwin-Platform/RoboTwin.git
 	ignore = dirty
+[submodule "libs/libero_plus"]
+	path = libs/libero_plus
+	url = https://github.com/sylvestf/LIBERO-plus.git
+	ignore = dirty

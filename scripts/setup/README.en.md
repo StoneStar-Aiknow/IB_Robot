@@ -6,6 +6,8 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | --- | --- |
 | `detect.sh` | OS / arch / Python detection; resolves `IBR_HOST_*` and `IBR_LEROBOT_PROFILES`. |
 | `benchmark_profile.sh` | Ubuntu GPU preflight, validated PyTorch/TorchVision/TorchCodec CUDA profile, and provider ABI boundary for `--with-benchmark`; NVIDIA driver >=560.28.03 is required, local nvcc is not required and GraspGen is excluded. |
+| `libero_config.py` / `libero_plus_config.py` | Prepare separate workspace-owned provider configs and validate manually supplied assets; never download assets. |
+| `verify_env.sh` | Environment verification, including isolated hf-libero and LIBERO-plus Python children under `--with-benchmark`. |
 | `platforms/<id>.sh` | Per-platform package managers, ROS source, and `platform_lerobot_profiles()` defaults. |
 | `lerobot_patches.sh` | Drives `git am` of the curated lerobot patch stack into `libs/lerobot`. |
 | `lerobot_resolve_active.py` | Resolves the active lerobot tag from `INDEX.yaml`; cross-checks the per-tag `manifest.yaml`. |
@@ -38,6 +40,92 @@ Differences of `inference` vs. `full`:
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
 ```
+
+## LIBERO Providers And Manual Assets
+
+Benchmark dependency installation is opt-in and supported on **Ubuntu 22.04
+only**. `--with-benchmark` installs the hf-libero provider through local
+`lerobot[libero]`, initializes the pinned `libs/libero_plus` checkout, and installs
+the extra runtime wheels from `requirements/libero_plus.txt` (including `wand`,
+`usd-core`, `scikit-image` and `gym`). The Ubuntu system hook supplies ImageMagick's
+`libMagickWand`; a pip wheel alone is insufficient. Resolve package-manager
+conflicts explicitly; setup does not remove GraphicsMagick to work around them.
+The CUDA benchmark profile requires an NVIDIA GPU and driver >=560.28.03; a
+local CUDA toolkit is not required. This is separate from `--profile full` or
+`inference`, which controls dependency scope, not provider selection.
+
+```bash
+source .shrc_local && ./scripts/setup.sh --yes --with-benchmark
+```
+
+Both providers remain available, but **only one provider may be imported per
+Python process**. Do not pip-install LIBERO-plus or globally prepend its checkout
+to `PYTHONPATH`; the adapter selects its workspace-owned shim before importing
+`libero`. The default per-provider locations are:
+
+| Provider | Generated config | User-managed assets |
+| --- | --- | --- |
+| hf-libero | `venv/ibrobot_libero/config.yaml` | `venv/ibrobot_libero/assets/` (extracted tree) |
+| LIBERO-plus | `venv/ibrobot_libero_plus/config.yaml` | `venv/ibrobot_libero_plus/assets.zip` (archive), extracted into `venv/ibrobot_libero_plus/assets/` |
+
+All paths above are relative to the workspace. Setup **never downloads assets**,
+including on evaluation startup. The hf-libero dataset is
+`lerobot/libero-assets`; the larger LIBERO-plus archive is `assets.zip` from
+`Sylvest/LIBERO-plus`. They are different trees and are not interchangeable.
+
+1. Run setup once. If assets are absent, it creates workspace-owned configs and
+   empty linked asset directories, reports `assets_status=missing`, and prints
+   `HINT:` commands. Keep these hints: their `--revision` comes from each
+   script's `HF_ASSETS_REVISION`, not a moving branch selected by the operator.
+2. Manually execute the printed hf-libero download command with its destination
+   `venv/ibrobot_libero/assets`. Execute the printed LIBERO-plus command with
+   `--include assets.zip` and destination `venv/ibrobot_libero_plus`, **not** its
+   `assets/` subdirectory. Alternatively place a manually obtained `assets.zip`
+   at exactly `venv/ibrobot_libero_plus/assets.zip`. An optional
+   `HF_ENDPOINT=https://hf-mirror.com` prefix selects the mirror, without changing
+   the pinned revision. Follow the scripts' current printed hints rather than
+   substituting `main` or copying an unverified revision from another source.
+3. Re-run the same `source .shrc_local && ./scripts/setup.sh --yes --with-benchmark`
+   command. Setup extracts the local plus archive and validates required
+   directories, business-file count and tree SHA-256 for both providers. It
+   preserves user data rather than silently replacing an unexpected asset path.
+4. Only after the relevant tree validates, configure a packaged model bundle and
+   launch the selected robot profile. Missing assets permit dependency setup to
+   finish but **never** permit evaluation. A supplied partial/corrupt tree,
+   invalid archive or invalid explicit override fails setup; it is not a missing
+   asset warning. Repair it or deliberately move it aside, then rerun setup.
+
+To reuse existing extracted trees, set `IBROBOT_LIBERO_ASSETS_DIR` and/or
+`IBROBOT_LIBERO_PLUS_ASSETS_DIR` to their absolute roots on the setup invocation.
+For example, after `source .shrc_local`:
+
+```bash
+IBROBOT_LIBERO_ASSETS_DIR=/data/libero-assets \
+IBROBOT_LIBERO_PLUS_ASSETS_DIR=/data/libero-plus-assets \
+  ./scripts/setup.sh --yes --with-benchmark
+```
+
+The override must contain the actual validated tree, not its parent or a ZIP.
+`IBROBOT_LIBERO_PLUS_ROOT` selects an external pinned plus checkout;
+`IBROBOT_LIBERO_PLUS_CONFIG_DIR` selects its generated config/shim directory.
+Use matching overrides consistently for preparation and launch; generated paths
+must still refer to the chosen provider. Do not use a global `LIBERO_CONFIG_PATH`
+to switch providers: the plus import preparation sets its own path. Ordinary
+workspace setup needs none of these overrides.
+
+Verification uses **separate Python children** for hf-libero and LIBERO-plus.
+The plus child calls `prepare_libero_plus_import()` before importing
+`libero.libero.benchmark` and `libero.libero.envs`, then checks provider identity
+with `allow_missing_assets=True`. It does not construct an environment or require
+scene assets. Python/native import errors (including missing `libMagickWand`)
+fail setup even when assets are pending. hf-libero's existing off-screen smoke
+test runs only when its assets are ready. A successful import gate is not a
+LIBERO-plus rollout or rendering certification.
+
+Select `franka_libero_evaluation` / `franka_libero_evaluation_rtp` for hf-libero,
+or `franka_libero_plus_evaluation` / `franka_libero_plus_evaluation_rtp` for
+LIBERO-plus. See [static lane profiles](../../src/benchmark/STATIC_LANES.md#provider-profiles)
+for inherited settings and launch examples.
 
 ## CANN dependency layers
 

@@ -318,7 +318,10 @@ if probe_spec is None or probe_spec.loader is None:
 probe_module = importlib.util.module_from_spec(probe_spec)
 sys.modules[probe_spec.name] = probe_module
 probe_spec.loader.exec_module(probe_module)
-identity = probe_module.probe_libero_provider()
+# Setup completes while the user-downloaded asset tree is pending
+# (assets_status=missing): probe the provider boundary without requiring
+# assets. The evaluation-time probe keeps the default fail-closed behavior.
+identity = probe_module.probe_libero_provider(allow_missing_assets=True)
 if identity.distribution_name != "hf-libero":
     raise RuntimeError(f"unexpected provider distribution: {identity.distribution_name!r}")
 if Version(identity.distribution_version) not in SpecifierSet(">=0.1.4,<0.2.0"):
@@ -421,27 +424,38 @@ if init_states is None or len(init_states) == 0:
     raise RuntimeError("task 0 has no trusted init states")
 
 # Exercise the real off-screen provider path once, without testing evaluator
-# or video writing in Setup.
-env = OffScreenRenderEnv(
-    bddl_file_name=str(bddl_path),
-    camera_names=["agentview", "robot0_eye_in_hand"],
-    camera_heights=256,
-    camera_widths=256,
-)
-try:
-    reset_obs = env.reset()
-    if not isinstance(reset_obs, dict):
-        raise RuntimeError(f"reset returned {type(reset_obs).__name__}, expected dict")
-    init_obs = env.set_init_state(init_states[0])
-    if not isinstance(init_obs, dict):
-        raise RuntimeError(f"set_init_state returned {type(init_obs).__name__}, expected dict")
-    for key in ("agentview_image", "robot0_eye_in_hand_image"):
-        image = np.asarray(init_obs.get(key))
-        if image.shape != (256, 256, 3):
-            raise RuntimeError(f"{key} shape is {image.shape}, expected (256, 256, 3)")
-        print(f"{key} shape={image.shape}")
-finally:
-    env.close()
+# or video writing in Setup. The smoke test loads MuJoCo scene XMLs from the
+# user-downloaded asset tree; while assets are pending (setup never downloads
+# them), skip it with a warning instead of failing the whole verification.
+assets_root = Path(identity.assets_path)
+missing_assets = [d for d in probe_module.EXPECTED_ASSET_DIRS if not (assets_root / d).is_dir()]
+if missing_assets:
+    print(
+        f"WARNING: hf-libero assets pending at {assets_root} (missing {missing_assets}); "
+        "skipping the off-screen render smoke test. "
+        "Setup never downloads assets; run scripts/setup/libero_config.py for the pinned manual download command."
+    )
+else:
+    env = OffScreenRenderEnv(
+        bddl_file_name=str(bddl_path),
+        camera_names=["agentview", "robot0_eye_in_hand"],
+        camera_heights=256,
+        camera_widths=256,
+    )
+    try:
+        reset_obs = env.reset()
+        if not isinstance(reset_obs, dict):
+            raise RuntimeError(f"reset returned {type(reset_obs).__name__}, expected dict")
+        init_obs = env.set_init_state(init_states[0])
+        if not isinstance(init_obs, dict):
+            raise RuntimeError(f"set_init_state returned {type(init_obs).__name__}, expected dict")
+        for key in ("agentview_image", "robot0_eye_in_hand_image"):
+            image = np.asarray(init_obs.get(key))
+            if image.shape != (256, 256, 3):
+                raise RuntimeError(f"{key} shape is {image.shape}, expected (256, 256, 3)")
+            print(f"{key} shape={image.shape}")
+    finally:
+        env.close()
 
 # Confirm the final ABI state produced by Setup, including both OpenCV wheels.
 if np.__version__ != "1.26.4":
@@ -471,8 +485,47 @@ print("LeRobot PreTrainedConfig/ACTConfig/ACTPolicy API verified")
 print("MINIMAL_BENCHMARK_VERIFY_OK")
 PYBENCH
 
-    log_done "Minimal benchmark (LIBERO) environment verified"
+    # hf-libero above and LIBERO-plus below must never share a Python process.
+    verify_benchmark_libero_plus || return 1
+
+    log_done "Minimal benchmark (LIBERO and LIBERO-plus) environments verified"
     return 0
+}
+
+verify_benchmark_libero_plus() {
+    log_info "Verifying LIBERO-plus provider imports (independent Python process)..."
+
+    PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PYPLUS' || return 1
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+workspace = Path(os.environ["WORKSPACE"]).resolve()
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+probe_path = workspace / "src/benchmark/adapters/libero/benchmark_libero/version_probe.py"
+spec = importlib.util.spec_from_file_location("benchmark_libero_plus_version_probe", probe_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"cannot load production provider probe: {probe_path}")
+probe_module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = probe_module
+spec.loader.exec_module(probe_module)
+
+# Bind before any libero import, even if the parent selected hf-libero's config.
+probe_module.prepare_libero_plus_import()
+from libero.libero import benchmark
+from libero.libero.envs import OffScreenRenderEnv
+
+# Missing user-managed assets are allowed only during setup. Broken imports,
+# native libraries, config and any present-but-invalid assets still fail closed.
+identity = probe_module.probe_libero_plus_provider(allow_missing_assets=True)
+if identity.distribution_name != "libero-plus":
+    raise RuntimeError(f"unexpected provider distribution: {identity.distribution_name!r}")
+if not callable(benchmark.get_benchmark_dict) or not isinstance(OffScreenRenderEnv, type):
+    raise RuntimeError("LIBERO-plus benchmark/envs API is unavailable")
+print(f"libero-plus ({identity.module_path})")
+print("LIBERO_PLUS_IMPORT_VERIFY_OK")
+PYPLUS
 }
 
 verify_env() {

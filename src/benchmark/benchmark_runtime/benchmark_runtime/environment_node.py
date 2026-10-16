@@ -21,6 +21,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
+from benchmark_runtime._strict_json import dumps_strict, require_json_object
 from benchmark_runtime.action_codec import ActionDecodeError, decode_step_action_generic
 from benchmark_runtime.adapter import BenchmarkAdapter, PreNativeValidationError
 from benchmark_runtime.capability_negotiation import (
@@ -216,6 +217,7 @@ class BenchmarkEnvironmentNode(Node):
         self._finalize_srv_handle: Any = None
         self._plan: BenchmarkPlan | None = None
         self._plan_json = ""
+        self._provider_identity_json = "null"
         self._ledger: FinalizationLedger | None = None
         self._native_reporter: Any = None
         self._native_artifacts_enabled = False
@@ -580,6 +582,10 @@ class BenchmarkEnvironmentNode(Node):
         try:
             self._adapter = self._plugin.create_adapter()
             self._adapter.configure(env_config)
+            provider_identity = self._adapter.provider_identity()
+            if provider_identity is not None:
+                require_json_object(provider_identity, "provider identity")
+            self._provider_identity_json = dumps_strict(provider_identity)
             try:
                 adapter_descriptor = self._adapter.get_io_descriptor()
             except NotImplementedError:
@@ -653,6 +659,7 @@ class BenchmarkEnvironmentNode(Node):
 
     def _handle_get_plan(self, request, response) -> Any:
         del request
+        response.provider_identity_json = "null"
         if self._plan is None or not self._plan_json:
             response.success = False
             response.message = "resolved benchmark plan is unavailable"
@@ -661,6 +668,7 @@ class BenchmarkEnvironmentNode(Node):
         response.success = True
         response.message = "ok"
         response.plan_json = self._plan_json
+        response.provider_identity_json = self._provider_identity_json
         return response
 
     @staticmethod

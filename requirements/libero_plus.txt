@@ -1,0 +1,30 @@
+# LIBERO-plus benchmark runtime dependencies.
+#
+# LIBERO-plus (https://github.com/sylvestf/LIBERO-plus) is the pinned
+# libs/libero_plus submodule and is NEVER pip-installed: it shares the
+# top-level ``libero`` package name with the pip-installed hf-libero
+# distribution, and the benchmark adapter binds to it per process via
+# sys.path precedence plus a dedicated LIBERO_CONFIG_PATH. Only the wheels
+# its perturbation assets need are installed here.
+#
+# The upstream requirements.txt pins the original LIBERO training stack
+# (robosuite==1.4.0, robomimic==0.2.0, transformers==4.21.1, ...) which
+# conflicts with the workspace venv; evaluation reuses the workspace's
+# existing robosuite/mujoco (same LIBERO code lineage).
+#
+# SYSTEM PREREQUISITE (not pip-installable): wand needs the ImageMagick
+# shared library (libMagickWand). The upstream envs module imports it at
+# the top level, so without the system library the LIBERO-plus provider
+# cannot be imported at evaluation time. Ubuntu benchmark setup installs
+# libmagickwand-6.q16-6 through platform_install_benchmark_system_deps and
+# requires a successful `import wand.image` after installing these wheels.
+# Package-manager conflicts must be resolved explicitly by the operator;
+# setup does not remove GraphicsMagick or other installed packages.
+#
+# usd-core: the new_objects asset tree is USD
+# wand/scikit-image: texture and image perturbation processing
+# gym: the upstream envs module imports gym at the top level
+usd-core>=25.5
+wand
+scikit-image
+gym==0.25.2

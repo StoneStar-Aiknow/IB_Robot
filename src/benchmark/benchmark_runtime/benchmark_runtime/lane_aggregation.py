@@ -203,6 +203,19 @@ def write_global_report(
     """Write canonical fan-in once; never overwrite an earlier global run."""
     root = Path(run_root)
     summary, records = _aggregate_lanes(root, run_id=run_id, plan=plan, lane_count=lane_count)
+    identities = {}
+    for index in range(lane_count):
+        lane_name = f"lane_{index:03d}"
+        try:
+            identity = read_object(root / "lanes" / lane_name / "run_manifest.json").get("runtime_identity")
+        except (OSError, ValueError):
+            continue
+        if isinstance(identity, dict):
+            identities[lane_name] = identity
+    identity_fields = {"lane_runtime_identities": identities}
+    # Only claim one shared identity when every lane actually recorded it.
+    if len(identities) == lane_count and all(value == identities["lane_000"] for value in identities.values()):
+        identity_fields["runtime_identity"] = identities["lane_000"]
     writer = CanonicalReportWriter(root)
     # start_run permits only a native directory; fan-in additionally owns lanes.
     writer.start_run({"run_id": run_id, "status": "running"}, allow_lanes=True)
@@ -215,6 +228,7 @@ def write_global_report(
             "status": summary.run_status,
             "lane_count": lane_count,
             "resolved_plan": loads_strict(benchmark_plan_to_json(plan)),
+            **identity_fields,
         },
     )
     return summary

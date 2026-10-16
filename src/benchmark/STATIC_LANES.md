@@ -50,6 +50,75 @@ enforces the contracts it can host (policy interface, Torch backend,
 request-scoped state, direct execution). These fields are validated in serial mode
 too, but only consumed when `parallel.enabled=true` (even with lane_count=1).
 
+## Provider Profiles
+
+Dependency setup and manual assets are described in the
+[setup workflow](../../scripts/setup/README.en.md#libero-providers-and-manual-assets)
+([中文](../../scripts/setup/README.md#libero-provider-与手动资产准备)). Benchmark
+dependencies are opt-in (`--with-benchmark`) and supported on Ubuntu 22.04 only.
+Setup never downloads assets. Missing assets may leave setup pending, but
+evaluation fails closed until its provider's tree validates; supplied invalid
+assets and Python/native import failures are setup errors, not pending states.
+
+| Profile | Provider | Observation transport |
+| --- | --- | --- |
+| `franka_libero_evaluation` | hf-libero | DDS |
+| `franka_libero_evaluation_rtp` | hf-libero | H.264/RTP |
+| `franka_libero_plus_evaluation` | pinned `libs/libero_plus` | inherited DDS |
+| `franka_libero_plus_evaluation_rtp` | pinned `libs/libero_plus` | inherited H.264/RTP |
+
+The plus profiles are thin `base_config` overlays of their matching hf-libero
+baselines. Exactly five fields differ: `name`, `benchmark.instance_id`,
+`benchmark.libero_provider`, `benchmark.identity_packages` (replaces the list,
+removing hf-libero), and `benchmark.evaluation.output.run_name`. The suite, tasks,
+episodes, seed, five-lane/static/fail-fast settings, timeouts, output root,
+contract, distributed model pipeline and RTP codec/endpoints are inherited
+unchanged. Select one provider for the entire run; providers share the `libero`
+package name and must never be imported in the same process. Neither the
+coordinator nor a cloud-only model process needs to import both providers.
+
+Set the model bundle path in a local sibling overlay (so `base_config` resolves
+in the same directory). For example, create `franka_libero_plus_local.yaml`
+alongside the shipped profiles under `src/robot_config/config/robots/`:
+
+```yaml
+robot:
+  base_config: franka_libero_plus_evaluation.yaml
+  control_modes:
+    model_inference:
+      inference:
+        pipelines:
+          policy:
+            model_path: /absolute/path/to/packaged/model
+  benchmark:
+    evaluation:
+      suite: libero_object
+      tasks: [0]
+      episodes_per_task: 2
+```
+
+Use the canonical loader (`load_robot_config_dict`) for inherited configs, not
+`yaml.safe_load(...)["robot"]`, which sees only the overlay. Lists such as tasks,
+identity packages and contract observations **replace** inherited lists unless
+the explicit `__append__` syntax is used. For a single-lane RTP endpoint override,
+provide the full observation list including both camera contracts and state;
+an endpoint-only partial list would discard inherited observation fields.
+The default five-lane topology materializes disjoint loopback RTP ports and
+co-locates the shared model owner; it does not require a second cloud launch.
+
+After preparing assets and building the workspace, launch the local DDS overlay:
+
+```bash
+source .shrc_local && ros2 launch robot_config robot.launch.py \
+  config_path:="$PWD/src/robot_config/config/robots/franka_libero_plus_local.yaml"
+```
+
+For RTP, use `base_config: franka_libero_plus_evaluation_rtp.yaml` in that local
+overlay and the same launch command. For a single-lane two-machine RTP route,
+configure the real cloud host address instead of the inherited documentation
+placeholder and follow the baseline RTP deployment instructions. Provider
+selection does not change topology or certify new lane capacities.
+
 ## Work Identity
 
 The adapter first resolves the entire suite and selected task order. Every

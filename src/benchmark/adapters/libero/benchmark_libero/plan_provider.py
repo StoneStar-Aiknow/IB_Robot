@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from benchmark_libero.init_state_loader import load_trusted_init_states, resolve_init_states_path
+from benchmark_libero.init_state_loader import load_task_init_states
 from benchmark_libero.plan_resolver import ProviderTask
 
 
 class NativeLiberoPlanProvider:
     """Read task snapshots from the pinned provider without creating an environment."""
+
+    def __init__(self, *, provider: str = "hf-libero"):
+        self._provider = provider
 
     def resolve_suite(self, suite: str, task_order_index: int) -> tuple[ProviderTask, ...]:
         if suite not in {"libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"}:
@@ -19,13 +22,12 @@ class NativeLiberoPlanProvider:
         try:
             suite_factory = libero_benchmark.get_benchmark_dict()[suite]
         except KeyError as exc:
-            raise ValueError(f"verified hf-libero provider does not expose suite {suite!r}") from exc
+            raise ValueError(f"verified provider does not expose suite {suite!r}") from exc
         native_suite = suite_factory(task_order_index=task_order_index)
         tasks: list[ProviderTask] = []
         for index in range(native_suite.get_num_tasks()):
             native_task = native_suite.get_task(index)
-            init_states_path = resolve_init_states_path(native_task, get_libero_path)
-            init_states = load_trusted_init_states(init_states_path)
+            init_states = load_task_init_states(native_task, get_libero_path, provider=self._provider)
             init_state_count = int(len(init_states)) if init_states is not None else 0
             if init_state_count <= 0:
                 raise ValueError(f"suite {suite!r} task {index} has no native init states")

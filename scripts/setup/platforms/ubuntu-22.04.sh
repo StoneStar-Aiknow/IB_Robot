@@ -25,8 +25,8 @@ platform_install_benchmark_system_deps() {
         return 0
     fi
 
-    log_info "Installing benchmark headless rendering dependency..."
-    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev ffmpeg -qq
+    log_info "Installing benchmark headless rendering and ImageMagick dependencies..."
+    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev ffmpeg libmagickwand-6.q16-6 -qq
 }
 
 platform_pre_install_rosdeps() {

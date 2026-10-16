@@ -735,20 +735,28 @@ EOF
             log_info "Configuring optional benchmark (LIBERO) runtime..."
             export WORKSPACE="${WORKSPACE}"
 
-            # Generate workspace-owned config and fetch/reuse official assets
-            # before importing hf-libero. This prevents the provider's legacy
-            # first-import prompt and makes get_assets_path() deterministic.
+            # Generate the workspace-owned config before importing hf-libero.
+            # Assets are user-downloaded (setup never fetches them); the config
+            # script links the package-local assets path either way so
+            # get_assets_path() stays deterministic and never falls back to
+            # the provider's hidden user-home download.
             local libero_config_script="${SCRIPT_DIR}/setup/libero_config.py"
             local libero_config_dir="${venv_path}/ibrobot_libero"
-            log_info "Preparing workspace-owned hf-libero config and assets..."
+            local libero_config_output="${venv_path}/benchmark_libero_config_output.txt"
+            log_info "Preparing workspace-owned hf-libero config..."
             if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_config_script}" \
-                > "${venv_path}/benchmark_libero_config_output.txt" 2>&1; then
+                > "${libero_config_output}" 2>&1; then
                 log_error "Failed to prepare workspace-owned hf-libero config/assets."
-                cat "${venv_path}/benchmark_libero_config_output.txt" 2>/dev/null || true
+                cat "${libero_config_output}" 2>/dev/null || true
                 exit 1
             fi
             export LIBERO_CONFIG_PATH="${libero_config_dir}"
-            log_info "hf-libero config/assets ready at ${libero_config_dir}"
+            if grep -qx 'assets_status=missing' "${libero_config_output}"; then
+                log_warn "hf-libero assets are missing; setup never downloads them."
+                grep '^HINT: ' "${libero_config_output}" || true
+            else
+                log_info "hf-libero config/assets ready at ${libero_config_dir}"
+            fi
 
             # RoboTwin benchmark runtime: pinned SAPIEN/mplib wheels. curobo
             # is deliberately NOT auto-installed (PyPI ships a stub package;
@@ -760,6 +768,36 @@ EOF
                 log_warn "nvidia-curobo is not importable; RoboTwin evaluation needs the manual v0.7.8 source build:"
                 log_warn "  pip install --no-build-isolation \"git+https://github.com/NVlabs/curobo.git@v0.7.8\""
                 log_warn "See requirements/robotwin.txt for the full recipe (CUDA toolkit + ASSETS_PATH placeholder sed)."
+            fi
+
+            # LIBERO-plus benchmark runtime: extra wheels for the perturbation
+            # assets (USD objects, texture processing). The provider itself is
+            # the pinned libs/libero_plus submodule and is never pip-installed
+            # (it shares the ``libero`` package name with hf-libero and binds
+            # per process through sys.path precedence in the adapter).
+            log_info "Installing optional benchmark (LIBERO-plus) runtime wheels..."
+            run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/libero_plus.txt" --quiet
+            # Wheels do not supply libMagickWand; the platform hook installs it.
+            if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c "import wand.image" >/dev/null 2>&1; then
+                log_error "LIBERO-plus requires importable wand.image and the ImageMagick system library."
+                log_error "Check the benchmark system dependencies and rerun setup."
+                exit 1
+            fi
+
+            local libero_plus_config_script="${SCRIPT_DIR}/setup/libero_plus_config.py"
+            local libero_plus_config_output="${venv_path}/benchmark_libero_plus_config_output.txt"
+            log_info "Preparing workspace-owned LIBERO-plus config (assets are user-downloaded)..."
+            if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_plus_config_script}" \
+                > "${libero_plus_config_output}" 2>&1; then
+                log_error "Failed to prepare workspace-owned LIBERO-plus config/assets."
+                cat "${libero_plus_config_output}" 2>/dev/null || true
+                exit 1
+            fi
+            if grep -qx 'assets_status=missing' "${libero_plus_config_output}"; then
+                log_warn "LIBERO-plus assets are missing; setup never downloads them."
+                grep '^HINT: ' "${libero_plus_config_output}" || true
+            else
+                log_info "LIBERO-plus config/assets ready at ${venv_path}/ibrobot_libero_plus"
             fi
         fi
     fi

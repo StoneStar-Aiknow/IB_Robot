@@ -11,6 +11,7 @@
 | `common.sh` | 通用工具函数，例如日志格式、`run_cmd` 与 `ask_yn`、`sudo` 会话等基础设施提取。 |
 | `detect.sh` | OS / 架构 / Python 探测；解析 `IBR_HOST_*` 与 `IBR_LEROBOT_PROFILES`。 |
 | `verify_env.sh` | 独立环境验证库；暴露 `verify_ros` / `verify_colcon` / `verify_numpy_compat` / `verify_lerobot` / `verify_tracing` 及入口 `verify_env`。 |
+| `libero_config.py` / `libero_plus_config.py` | 分别生成工作区 provider 配置，校验用户手动提供的资产，不自动下载。 |
 | `platforms/<id>.sh` | 各平台的包管理器、ROS 源、`platform_lerobot_profiles()` 默认值。 |
 | `lerobot_patches.sh` | 驱动 `git am` 将精选的 lerobot 补丁栈应用到 `libs/lerobot`。 |
 | `lerobot_resolve_active.py` | 从 `INDEX.yaml` 解析当前生效的 lerobot tag；并交叉校验对应 `manifest.yaml`。 |
@@ -44,6 +45,77 @@
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
 ```
+
+## LIBERO Provider 与手动资产准备
+
+Benchmark 依赖需要显式启用，当前**仅支持 Ubuntu 22.04**：
+
+```bash
+source .shrc_local && ./scripts/setup.sh --yes --with-benchmark
+```
+
+`--with-benchmark` 通过本地 `lerobot[libero]` 安装 hf-libero，初始化固定版本的
+`libs/libero_plus` 子模块，并安装 `requirements/libero_plus.txt` 中的附加运行时依赖
+（包括 `wand`、`usd-core`、`scikit-image`、`gym`）。Ubuntu 系统依赖钩子安装
+ImageMagick 的 `libMagickWand`，单装 pip wheel 不够；包管理器冲突需操作者明确处理，
+setup 不会通过卸载 GraphicsMagick 来绕过冲突。CUDA benchmark profile 要求 NVIDIA
+GPU 和 >=560.28.03 的驱动，不要求本机 CUDA toolkit。`--profile full` / `inference`
+只决定依赖范围，不用于选择 provider。
+
+两套 provider 可以同时存在，但**每个 Python 进程只能导入其中一个**。不要 pip 安装
+LIBERO-plus，也不要把其源码全局加入 `PYTHONPATH`；adapter 在首次导入 `libero` 前选择
+工作区生成的 shim。默认路径均相对于工作区根目录：
+
+| Provider | 生成配置 | 用户手动准备的资产 |
+| --- | --- | --- |
+| hf-libero | `venv/ibrobot_libero/config.yaml` | `venv/ibrobot_libero/assets/`（解压后的目录树） |
+| LIBERO-plus | `venv/ibrobot_libero_plus/config.yaml` | `venv/ibrobot_libero_plus/assets.zip`，本地解压到 `venv/ibrobot_libero_plus/assets/` |
+
+Setup **不自动下载资产**，评估启动也不能偷偷下载。hf-libero 使用
+`lerobot/libero-assets` 数据集；LIBERO-plus 使用 `Sylvest/LIBERO-plus` 数据集的
+`assets.zip`，两者不是同一棵资产树，不能互相替代。
+
+1. 先执行上述 setup。未准备资产时会创建工作区配置、空资产目录及受管理链接，输出
+   `assets_status=missing` 和手动操作的 `HINT:` 命令。下载命令中的 `--revision` 由各
+   配置脚本的 `HF_ASSETS_REVISION` 决定，不要自行换成浮动分支。
+2. 手动执行打印的 hf-libero 命令，将目录树放到 `venv/ibrobot_libero/assets`。
+   手动执行 LIBERO-plus 命令，保留 `--include assets.zip`，目标目录应为
+   `venv/ibrobot_libero_plus`，**不是**其 `assets/` 子目录。也可自行取得压缩包后放到
+   精确路径 `venv/ibrobot_libero_plus/assets.zip`。需要镜像时给命令加上
+   `HF_ENDPOINT=https://hf-mirror.com`，但不改变固定 revision。以脚本当前打印的
+   HINT 为准，不从文档猜测 revision，也不手动替换为 `main`。
+3. 重新执行 `source .shrc_local && ./scripts/setup.sh --yes --with-benchmark`。
+   Setup 本地解压 plus 压缩包，检查两套资产的必需目录、业务文件数和目录树 SHA-256；
+   不会静默覆盖非预期的用户资产路径。
+4. 相应资产验证通过后，再配置打包模型目录并启动选定的 robot profile。真正缺失的资产
+   只允许依赖 setup 完成，**不允许评估运行**。已提供但不完整、损坏的目录树、无效 ZIP
+   或无效显式覆盖必须使 setup 失败，不能降级成 missing 警告；修复或主动移走后重跑。
+
+复用已解压资产时，在 setup 调用上设置 `IBROBOT_LIBERO_ASSETS_DIR` 和/或
+`IBROBOT_LIBERO_PLUS_ASSETS_DIR` 为各自资产树的绝对路径。例如先加载
+`source .shrc_local`，再执行：
+
+```bash
+IBROBOT_LIBERO_ASSETS_DIR=/data/libero-assets \
+IBROBOT_LIBERO_PLUS_ASSETS_DIR=/data/libero-plus-assets \
+  ./scripts/setup.sh --yes --with-benchmark
+```
+
+覆盖路径必须指向实际资产树，不能指向父目录或 ZIP。`IBROBOT_LIBERO_PLUS_ROOT` 可选择
+外部固定版本的 plus checkout，`IBROBOT_LIBERO_PLUS_CONFIG_DIR` 可选择生成配置和 shim
+的目录；准备与启动时要保持这些覆盖一致，配置路径必须匹配所选 provider。不要用全局
+`LIBERO_CONFIG_PATH` 切换 provider，plus 的导入准备会自行设置它。普通工作区不需要覆盖。
+
+环境验证在**两个独立 Python 子进程**中检查 hf-libero 与 LIBERO-plus。Plus 子进程先调用
+`prepare_libero_plus_import()`，再导入 `libero.libero.benchmark` 和
+`libero.libero.envs`，并以 `allow_missing_assets=True` 检查 provider 身份；不会构造环境
+或加载场景资产。即使资产 pending，Python 导入失败或缺少 `libMagickWand` 等本地库也必须
+使 setup 失败。hf-libero 既有的离屏渲染 smoke test 仅在其资产就绪后运行；plus import
+gate 成功不代表已经完成 plus rollout 或渲染验证。
+
+hf-libero 对应 `franka_libero_evaluation` / `franka_libero_evaluation_rtp`；LIBERO-plus
+对应 `franka_libero_plus_evaluation` / `franka_libero_plus_evaluation_rtp`。继承配置和
+启动示例见 [static lane profiles](../../src/benchmark/STATIC_LANES.md#provider-profiles)。
 
 ## 加速器轴依赖落位
 
