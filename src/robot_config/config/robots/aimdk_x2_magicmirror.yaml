@@ -206,7 +206,8 @@ robot:
         enabled: false
 
   # The session node: WAIT / STANDBY / MIRRORING, the only publisher of the arm
-  # and hand channels. Its hooks keep their conservative defaults; with
+  # and hand channels. mirror_start only reaches STANDBY/ready; the business
+  # hooks decide when a round starts and ends. With
   # motion_imitation_stream.mock_playback enabled the window pipeline plays
   # the mock animation.
   #
@@ -237,3 +238,18 @@ robot:
         interface: runtime.set_mode
         kind: service
         type: ibrobot_msgs/srv/SetRuntimeMode
+    # The demo rules by default: with the mock on, the default hooks' start
+    # criteria are always false, so mirror_start would stop at STANDBY/ready
+    # for good. demo starts a round when a person is in view and close enough
+    # (rules and timing in demo.yaml); a business class replaces it here.
+    business:
+      hooks: demo
+      cover_judge: demo
+      config: $(find robot_config)/config/mirror_session/demo.yaml
+    # The operator node: double cover asks for mirror_start, long cover stops
+    # the session, a head touch starts or cancels a round, the LED follows the
+    # session. With send_enabled false it only records what it would send; see
+    # /mirror_operator/status.
+    operator:
+      enabled: true
+      send_enabled: false
