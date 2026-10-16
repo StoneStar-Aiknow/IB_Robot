@@ -51,9 +51,7 @@
 
 `training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的 Ubuntu 22.04 训练机）：
 
-`training` 仅支持 `ubuntu-22.04`。平台识别后，其他平台会在依赖预览、子模块同步和系统安装前报错退出；`--only-patch` / `--skip-verify` 不绕过此限制。`full` / `inference` 的平台支持范围不变。
-
-`training` 与 `--with-benchmark` 不兼容，benchmark 环境请使用 `full`。
+`training` 仅支持 `ubuntu-22.04`。平台识别后，其他平台会在依赖预览、子模块同步和系统安装前报错退出；`--only-patch` / `--skip-verify` 不绕过此限制。`full` / `inference` 的平台支持范围不变。`training` 与 `--with-benchmark` 不兼容，benchmark 环境请使用 `full`。
 
 - **ROS 2**：完全不安装。跳过 `scripts/install_ros.sh`、rosdep、colcon 与 ROS 第三方 patch 栈，也不要求 `install/` overlay。
 - **submodules**：只初始化 `libs/lerobot`。

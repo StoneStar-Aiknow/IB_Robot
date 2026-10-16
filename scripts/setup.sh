@@ -351,20 +351,15 @@ validate_setup_profile() {
     export SETUP_PROFILE
 }
 
-# Benchmark setup needs the ROS ABI and rendering contract skipped by training.
-validate_setup_profile_options() {
-    if [[ "${SETUP_PROFILE:-full}" == "training" && "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
-        log_error "The training profile cannot be combined with --with-benchmark; use --profile full for benchmark setup."
-        return 1
-    fi
-    return 0
-}
-
 # Validate only after initialize_platform has resolved the OS. Reject an
 # unsupported install scope before any host preparation or workspace mutation.
 validate_setup_profile_platform() {
     if [[ "${SETUP_PROFILE:-full}" == "training" && "${SETUP_PLATFORM_ID:-unknown}" != "ubuntu-22.04" ]]; then
         log_error "The training profile is only supported on ubuntu-22.04 (detected: ${SETUP_PLATFORM_ID:-unknown})."
+        return 1
+    fi
+    if [[ "${SETUP_PROFILE:-full}" == "training" && "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_error "The training profile cannot be combined with --with-benchmark; use --profile full for benchmark setup."
         return 1
     fi
     return 0
@@ -395,9 +390,9 @@ preview_system_packages() {
                 echo "python3-venv python3-pip ffmpeg"
                 return 0
             fi
-            local pkgs="python3-colcon-common-extensions python3-venv python3-pip"
+            local pkgs="python3-colcon-common-extensions python3-venv python3-pip ffmpeg"
             if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
-                pkgs="${pkgs} libosmesa6-dev ffmpeg"
+                pkgs="${pkgs} libosmesa6-dev"
             fi
             echo "${pkgs}"
             ;;
@@ -503,28 +498,6 @@ platform_install_python_bootstrap() {
     exit 1
 }
 platform_install_benchmark_system_deps() { return 0; }
-
-# --- Training-profile host prerequisites ---
-# The training profile installs no ROS 2 runtime; its only system-level needs
-# are the Python bootstrap (python3-venv / python3-pip) and ffmpeg, which
-# backs torchcodec / dataset video decoding. Platforms override
-# platform_install_training_system_deps() when they need more.
-platform_training_system_deps_satisfied() {
-    # Pure install-time shortcut: this only decides whether apt-get would add
-    # anything, so every probe must test the capability the install path is
-    # about to rely on.
-    command -v ffmpeg >/dev/null 2>&1 || return 1
-    if [[ ! -d "${WORKSPACE}/venv" ]]; then
-        # Creating the venv goes through ensurepip, which Debian/Ubuntu ship in
-        # python3-venv. The venv module itself lives in libpython3-stdlib, so its
-        # --help output succeeds on hosts where creation would fail.
-        python3 -c 'import ensurepip' >/dev/null 2>&1 || return 1
-    fi
-    # A missing system python3-pip is not a reason to run apt here: the venv's
-    # pip comes from ensurepip's bundled wheel.
-    return 0
-}
-platform_install_training_system_deps() { return 0; }
 
 # --- Template Method Hooks for platform_install_rosdeps ---
 platform_skip_rosdep_install() { return 1; }  # Return 0 to skip rosdep install
@@ -693,17 +666,9 @@ install_system_deps() {
     fi
 
     if ! setup_profile_enables ros_runtime; then
-        # A ROS-less host only needs the Python bootstrap and ffmpeg, and the
-        # system package manager is touched only when one of them is actually
-        # missing. The preflight exists purely to skip an unnecessary install.
-        if platform_training_system_deps_satisfied; then
-            log_info "Python bootstrap tooling and ffmpeg are already present; skipping system package installation."
-            log_skipped "System package installation (training prerequisites already present)"
-        else
-            ensure_sudo_session
-            platform_install_python_bootstrap
-            platform_install_training_system_deps
-        fi
+        # Use the same idempotent OS dependency installation as the ROS profiles.
+        ensure_sudo_session
+        platform_install_python_bootstrap
         # Create the workspace venv early so VENV_PYTHON and the pip mirror are
         # configured before setup_python_venv runs. rosdep is deliberately not
         # installed (ensure_rosdep is never called on this path).
@@ -752,7 +717,6 @@ main() {
     trap 'on_setup_interrupt' INT
     parse_args "$@"
     validate_setup_profile
-    validate_setup_profile_options || exit 1
     check_foreign_env
 
     cd "${WORKSPACE}"

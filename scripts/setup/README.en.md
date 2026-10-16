@@ -45,9 +45,7 @@ Differences of `inference` vs. `full`:
 
 Differences of `training` vs. `full` (for Ubuntu 22.04 hosts that only run LeRobot training):
 
-`training` supports only `ubuntu-22.04`. Other platforms are rejected after platform detection, before dependency previews, submodule synchronization or system installation. Neither `--only-patch` nor `--skip-verify` bypasses this restriction. The platform support of `full` / `inference` is unchanged.
-
-`training` cannot be combined with `--with-benchmark`; use `full` for benchmark setup.
+`training` supports only `ubuntu-22.04`. Other platforms are rejected after platform detection, before dependency previews, submodule synchronization or system installation. Neither `--only-patch` nor `--skip-verify` bypasses this restriction. The platform support of `full` / `inference` is unchanged. `training` cannot be combined with `--with-benchmark`; use `full` for benchmark setup.
 
 - **ROS 2**: never installed. `scripts/install_ros.sh`, rosdep, colcon, and the ROS third-party patch stacks are all skipped, and no `install/` overlay is required.
 - **Submodules**: only `libs/lerobot` is initialized.
