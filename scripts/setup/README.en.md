@@ -24,7 +24,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | --- | --- |
 | `full` (default) | Complete development workspace: hardware, teleop, perception, grasp, voice, sim, and dev tooling. |
 | `inference` | Minimal policy-inference runtime for edge-cloud collaborative inference verification hosts. |
-| `training` | LeRobot training host: creates the venv, applies the LeRobot patch stack, and installs LeRobot plus the training dependencies only. No ROS 2 / rosdep / colcon. |
+| `training` | **Ubuntu 22.04 only.** LeRobot training host: creates the venv, applies the LeRobot patch stack, and installs LeRobot plus the training dependencies only. No ROS 2 / rosdep / colcon. |
 
 The single source of truth for the capability matrix is `_SETUP_PROFILE_TABLE` in [`common.sh`](./common.sh): one row per profile, cells separated by `|` (columns are the `rosdep` cell, the `submodules` scope, the `verify` strictness, and the comma-separated `features`), and any cell may be wrapped onto indented continuation lines — the physical lines are glued together before the cells are split and cell whitespace is normalised. The `rosdep` cell reads `<scope>:<paths>` (for example `full:src`, `narrow:src/a,src/b`, `skip:-`), so a profile cannot claim `skip` while still resolving a path set. `setup_profile_enables <feature>` answers "what is installed" and `setup_profile_get rosdep|rosdep_paths|submodules|verify` answers scope, paths, and verification strictness, so **adding a profile means adding one row**.
 
@@ -43,7 +43,9 @@ Differences of `inference` vs. `full`:
 ./scripts/build.sh --packages-up-to inference_service
 ```
 
-Differences of `training` vs. `full` (for hosts that only run LeRobot training):
+Differences of `training` vs. `full` (for Ubuntu 22.04 hosts that only run LeRobot training):
+
+`training` supports only `ubuntu-22.04`. Other platforms are rejected after platform detection, before dependency previews, submodule synchronization or system installation. Neither `--only-patch` nor `--skip-verify` bypasses this restriction. The platform support of `full` / `inference` is unchanged.
 
 `training` cannot be combined with `--with-benchmark`; use `full` for benchmark setup.
 

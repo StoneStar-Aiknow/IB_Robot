@@ -254,6 +254,7 @@ Options:
                                       install_ros.sh), no rosdep, no colcon, and
                                       no ROS third-party patch stacks; the
                                       submodule scope is libs/lerobot only.
+                                      Supported only on Ubuntu 22.04.
       --platform ID      Override platform (OS) detection
       --accel ID         Override accelerator detection (env: ACCEL_OVERRIDE).
                          Required when a host carries both an NVIDIA GPU and
@@ -354,6 +355,16 @@ validate_setup_profile() {
 validate_setup_profile_options() {
     if [[ "${SETUP_PROFILE:-full}" == "training" && "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
         log_error "The training profile cannot be combined with --with-benchmark; use --profile full for benchmark setup."
+        return 1
+    fi
+    return 0
+}
+
+# Validate only after initialize_platform has resolved the OS. Reject an
+# unsupported install scope before any host preparation or workspace mutation.
+validate_setup_profile_platform() {
+    if [[ "${SETUP_PROFILE:-full}" == "training" && "${SETUP_PLATFORM_ID:-unknown}" != "ubuntu-22.04" ]]; then
+        log_error "The training profile is only supported on ubuntu-22.04 (detected: ${SETUP_PLATFORM_ID:-unknown})."
         return 1
     fi
     return 0
@@ -662,6 +673,8 @@ ensure_colcon() {
 }
 
 install_system_deps() {
+    # Also protect direct callers that do not enter through main().
+    validate_setup_profile_platform || return 1
     if setup_profile_enables ros_runtime; then
         # Check for ROS 2 installation first
         check_ros_installation
@@ -746,6 +759,7 @@ main() {
     print_banner
     set_stage "detecting system"
     initialize_platform
+    validate_setup_profile_platform || exit 1
     print_platform_summary
     if [[ "${INSTALL_BENCHMARK_DEPS}" == true ]]; then
         benchmark_preflight_host || exit 1

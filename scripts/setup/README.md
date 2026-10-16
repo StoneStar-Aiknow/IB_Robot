@@ -30,7 +30,7 @@
 | --- | --- |
 | `full`（默认） | 完整开发工作区：硬件、遥操作、感知、抓取、语音、仿真与开发工具全量安装。 |
 | `inference` | 仅运行策略推理的最小运行时，面向端边协同推理验证主机。 |
-| `training` | LeRobot 训练主机：只建 venv、应用 LeRobot 补丁栈并安装 LeRobot + 训练依赖，不装 ROS 2 / rosdep / colcon。 |
+| `training` | **仅支持 Ubuntu 22.04** 的 LeRobot 训练主机：只建 venv、应用 LeRobot 补丁栈并安装 LeRobot + 训练依赖，不装 ROS 2 / rosdep / colcon。 |
 
 能力矩阵的**单一事实源**是 [`common.sh`](./common.sh) 里的 `_SETUP_PROFILE_TABLE`：一行一个 profile，单元格以 `|` 分隔（列 = `rosdep` 单元格 / `submodules` 范围 / `verify` 校验档 / `features` 能力清单），长单元格可用缩进续行 —— 物理行先粘合再切格、格内空白归一化，所以任一单元格都能在逗号后折行。`rosdep` 单元格写作 `<scope>:<paths>`（如 `full:src`、`narrow:src/a,src/b`、`skip:-`），scope 与 `--from-paths` 同格声明，因此不会出现“skip 却仍在解析某个路径集”的非法组合。`setup_profile_enables <feature>` 查“装什么”，`setup_profile_get rosdep|rosdep_paths|submodules|verify` 查范围、路径与校验档；**新增一个 profile = 新增一行**。
 
@@ -49,7 +49,9 @@
 ./scripts/build.sh --packages-up-to inference_service
 ```
 
-`training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的训练机）：
+`training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的 Ubuntu 22.04 训练机）：
+
+`training` 仅支持 `ubuntu-22.04`。平台识别后，其他平台会在依赖预览、子模块同步和系统安装前报错退出；`--only-patch` / `--skip-verify` 不绕过此限制。`full` / `inference` 的平台支持范围不变。
 
 `training` 与 `--with-benchmark` 不兼容，benchmark 环境请使用 `full`。
 

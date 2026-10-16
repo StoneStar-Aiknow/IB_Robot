@@ -75,6 +75,118 @@ BAD_OUT="$("${REPO_ROOT}/scripts/setup.sh" --profile bogus 2>&1)"
 assert_contains "unknown profile is rejected" "Unknown setup profile: 'bogus'" "${BAD_OUT}"
 assert_contains "rejection lists the configured profiles" "supported: full inference training" "${BAD_OUT}"
 
+# Platform scope is independent of profile-name validation: the OS is not
+# resolved when validate_setup_profile runs. Exercise both the matrix and
+# the real entry-point ordering without allowing installation side effects.
+assert_contains "help documents the training platform restriction" \
+    "Supported only on Ubuntu 22.04." "${HELP_OUT}"
+PROBE_PROFILE_PLATFORMS="$(probe '
+set +u
+source scripts/setup.sh
+for p in training full inference; do
+  SETUP_PROFILE=$p
+  for os in ubuntu-22.04 openeuler-embedded-24.03 openharmony-5.1.0-musl ubuntu-24.04 unknown; do
+    SETUP_PLATFORM_ID=$os
+    if validate_setup_profile_platform >/dev/null 2>&1; then rc=0; else rc=$?; fi
+    echo "PLATFORM $p $os rc=$rc"
+  done
+done
+')"
+for p in training full inference; do
+    for os in ubuntu-22.04 openeuler-embedded-24.03 openharmony-5.1.0-musl ubuntu-24.04 unknown; do
+        expected_rc=0
+        if [[ "$p" == training && "$os" != ubuntu-22.04 ]]; then expected_rc=1; fi
+        assert_eq "platform policy: $p on $os" \
+            "PLATFORM $p $os rc=$expected_rc" "$(line_for "PLATFORM $p $os " "${PROBE_PROFILE_PLATFORMS}")"
+    done
+done
+
+PROBE_PROFILE_ENTRY="$(probe '
+set +u
+source scripts/setup.sh
+check_foreign_env() { :; }
+print_banner() { :; }
+set_stage() { :; }
+initialize_platform() { SETUP_PLATFORM_ID=$PLATFORM_OVERRIDE; echo "PLATFORM_RESOLVED"; }
+print_platform_summary() { echo "SUMMARY_TRIPWIRE"; }
+print_dependency_preview() { echo "PREVIEW_REACHED"; exit 0; }
+update_submodules() { echo "SUBMODULE_TRIPWIRE"; exit 91; }
+platform_prepare_host() { echo "HOST_PREPARE_TRIPWIRE"; exit 92; }
+ensure_sudo_session() { echo "SUDO_TRIPWIRE"; exit 93; }
+for os in openeuler-embedded-24.03 openharmony-5.1.0-musl ubuntu-24.04 unknown; do
+  if output=$(main --profile training --platform "$os" --yes --only-patch --skip-verify 2>&1); then rc=0; else rc=$?; fi
+  echo "$output"
+  echo "ENTRY training $os rc=$rc"
+done
+# Also cover a profile selected through the environment-default value.
+SETUP_PROFILE=training
+if output=$(main --platform openeuler-embedded-24.03 --yes 2>&1); then rc=0; else rc=$?; fi
+echo "$output"
+echo "ENTRY inherited-training rc=$rc"
+')"
+for os in openeuler-embedded-24.03 openharmony-5.1.0-musl ubuntu-24.04 unknown; do
+    assert_contains "main rejects training on $os even with bypass flags" \
+        "ENTRY training $os rc=1" "${PROBE_PROFILE_ENTRY}"
+    assert_contains "error identifies unsupported platform $os" \
+        "only supported on ubuntu-22.04 (detected: $os)" "${PROBE_PROFILE_ENTRY}"
+done
+assert_contains "main validates after platform initialization" "PLATFORM_RESOLVED" "${PROBE_PROFILE_ENTRY}"
+assert_contains "inherited training scope cannot bypass the platform gate" \
+    "ENTRY inherited-training rc=1" "${PROBE_PROFILE_ENTRY}"
+for marker in SUMMARY_TRIPWIRE PREVIEW_REACHED SUBMODULE_TRIPWIRE HOST_PREPARE_TRIPWIRE SUDO_TRIPWIRE; do
+    assert_not_contains "unsupported training stops before $marker" "$marker" "${PROBE_PROFILE_ENTRY}"
+done
+
+PROBE_PROFILE_ALLOWED="$(probe '
+set +u
+source scripts/setup.sh
+check_foreign_env() { :; }
+print_banner() { :; }
+set_stage() { :; }
+initialize_platform() { SETUP_PLATFORM_ID=$PLATFORM_OVERRIDE; }
+print_platform_summary() { :; }
+print_dependency_preview() { echo "ALLOWED $SETUP_PROFILE $SETUP_PLATFORM_ID"; exit 0; }
+for p in full inference training; do
+  for os in ubuntu-22.04 openeuler-embedded-24.03 openharmony-5.1.0-musl; do
+    [[ "$p" == training && "$os" != ubuntu-22.04 ]] && continue
+    if output=$(main --profile "$p" --platform "$os" --yes 2>&1); then rc=0; else rc=$?; fi
+    echo "$output"
+    echo "ALLOWED_RC $p $os rc=$rc"
+  done
+done
+')"
+for p in full inference training; do
+    for os in ubuntu-22.04 openeuler-embedded-24.03 openharmony-5.1.0-musl; do
+        [[ "$p" == training && "$os" != ubuntu-22.04 ]] && continue
+        assert_contains "main allows $p on $os to reach dependency preview" \
+            "ALLOWED $p $os" "${PROBE_PROFILE_ALLOWED}"
+        assert_contains "allowed entry $p on $os returns success" \
+            "ALLOWED_RC $p $os rc=0" "${PROBE_PROFILE_ALLOWED}"
+    done
+done
+
+PROBE_PROFILE_DIRECT="$(probe '
+set +u
+source scripts/setup.sh
+SETUP_PROFILE=training
+platform_prepare_host() { echo "HOST_PREPARE_TRIPWIRE"; }
+platform_supports_local_workspace_build() { echo "BUILD_SUPPORT_TRIPWIRE"; return 0; }
+ensure_sudo_session() { echo "SUDO_TRIPWIRE"; }
+platform_install_python_bootstrap() { echo "PACKAGE_TRIPWIRE"; }
+ensure_workspace_venv() { echo "VENV_TRIPWIRE"; }
+for os in openeuler-embedded-24.03 openharmony-5.1.0-musl unknown; do
+  SETUP_PLATFORM_ID=$os
+  if install_system_deps; then rc=0; else rc=$?; fi
+  echo "DIRECT $os rc=$rc"
+done
+')"
+for os in openeuler-embedded-24.03 openharmony-5.1.0-musl unknown; do
+    assert_contains "direct dependency installation rejects training on $os" \
+        "DIRECT $os rc=1" "${PROBE_PROFILE_DIRECT}"
+done
+assert_not_contains "direct rejection causes no preparation or install side effects" \
+    "TRIPWIRE" "${PROBE_PROFILE_DIRECT}"
+
 # The benchmark contract includes ROS ABI/rendering checks that training skips.
 PROBE_TRAINING_BENCHMARK="$(probe '
 set +u
@@ -283,9 +395,8 @@ ensure_colcon() { CALLS+="ensure_colcon "; }
 ensure_rosdep() { CALLS+="ensure_rosdep "; }
 platform_install_rosdeps() { CALLS+="rosdeps "; }
 platform_prepare_host() { CALLS+="prepare_host "; }
+ensure_sudo_session() { CALLS+="sudo_session "; }
 platform_install_python_bootstrap() { CALLS+="python_bootstrap "; }
-platform_install_training_system_deps() { CALLS+="training_deps "; }
-platform_training_system_deps_satisfied() { return 0; }
 platform_install_benchmark_system_deps() { CALLS+="benchmark_deps "; }
 platform_supports_local_workspace_build() { return 0; }
 ensure_workspace_venv() { CALLS+="workspace_venv "; }
@@ -301,20 +412,20 @@ TRAINING_SYSDEPS="$(line_for "SYSDEPS training" "${PROBE_SYSDEPS}")"
 FULL_SYSDEPS="$(line_for "SYSDEPS full" "${PROBE_SYSDEPS}")"
 INFERENCE_SYSDEPS="$(line_for "SYSDEPS inference" "${PROBE_SYSDEPS}")"
 
-assert_eq "training only prepares the host and the workspace venv" \
-    "SYSDEPS training calls=[prepare_host workspace_venv ] status=done" "${TRAINING_SYSDEPS}"
+assert_eq "training installs shared host dependencies and creates the workspace venv" \
+    "SYSDEPS training calls=[prepare_host sudo_session python_bootstrap workspace_venv ] status=done" "${TRAINING_SYSDEPS}"
 assert_not_contains "training never runs check_ros_installation" "check_ros" "${TRAINING_SYSDEPS}"
 assert_not_contains "training never runs ensure_colcon" "ensure_colcon" "${TRAINING_SYSDEPS}"
 assert_not_contains "training never runs ensure_rosdep" "ensure_rosdep" "${TRAINING_SYSDEPS}"
 assert_not_contains "training never runs platform_install_rosdeps" "rosdeps" "${TRAINING_SYSDEPS}"
 assert_not_contains "training never installs benchmark system deps" "benchmark_deps" "${TRAINING_SYSDEPS}"
 assert_eq "full keeps the ROS 2 + rosdep + colcon path" \
-    "SYSDEPS full calls=[check_ros prepare_host python_bootstrap benchmark_deps ensure_colcon ensure_rosdep rosdeps ] status=done" "${FULL_SYSDEPS}"
+    "SYSDEPS full calls=[check_ros prepare_host sudo_session python_bootstrap benchmark_deps ensure_colcon ensure_rosdep rosdeps ] status=done" "${FULL_SYSDEPS}"
 assert_eq "inference keeps the ROS 2 + rosdep + colcon path" \
-    "SYSDEPS inference calls=[check_ros prepare_host python_bootstrap benchmark_deps ensure_colcon ensure_rosdep rosdeps ] status=done" "${INFERENCE_SYSDEPS}"
+    "SYSDEPS inference calls=[check_ros prepare_host sudo_session python_bootstrap benchmark_deps ensure_colcon ensure_rosdep rosdeps ] status=done" "${INFERENCE_SYSDEPS}"
 
-# The other side of the same gate: a training host that is MISSING the Python
-# bootstrap tooling and ffmpeg must install them (and still never touch ROS).
+# The real Ubuntu shared hook declares FFmpeg for all profiles. Training
+# invokes it directly and must still never touch ROS.
 PROBE_SYSDEPS_APT="$(probe '
 set +u
 source scripts/setup/common.sh
@@ -333,7 +444,6 @@ ensure_workspace_venv() { echo "[ensure_workspace_venv]"; }
 platform_prepare_host() { :; }
 platform_install_benchmark_system_deps() { :; }
 platform_supports_local_workspace_build() { return 0; }
-platform_training_system_deps_satisfied() { return 1; }
 check_ros_installation() { echo "ROS_TRIPWIRE"; }
 ensure_colcon() { echo "COLCON_TRIPWIRE"; }
 ensure_rosdep() { echo "ROSDEP_TRIPWIRE"; }
@@ -344,7 +454,7 @@ echo "status=${SYSTEM_DEPS_STATUS}"
 assert_contains "missing tooling installs the python bootstrap" \
     "apt-get install -y python3-venv python3-pip" "${PROBE_SYSDEPS_APT}"
 assert_contains "missing tooling installs ffmpeg" \
-    "apt-get install -y --no-install-recommends ffmpeg" "${PROBE_SYSDEPS_APT}"
+    "apt-get install -y python3-venv python3-pip ffmpeg" "${PROBE_SYSDEPS_APT}"
 assert_contains "the workspace venv is still created on that path" \
     "ensure_workspace_venv" "${PROBE_SYSDEPS_APT}"
 assert_contains "the system dependency stage completes" "status=done" "${PROBE_SYSDEPS_APT}"
@@ -352,55 +462,6 @@ assert_not_contains "no ROS 2 detection on that path" "ROS_TRIPWIRE" "${PROBE_SY
 assert_not_contains "no colcon on that path" "COLCON_TRIPWIRE" "${PROBE_SYSDEPS_APT}"
 assert_not_contains "no rosdep on that path" "ROSDEP_TRIPWIRE" "${PROBE_SYSDEPS_APT}"
 assert_not_contains "no rosdep path resolution on that path" "ROSDEP_PATHS_TRIPWIRE" "${PROBE_SYSDEPS_APT}"
-
-# The preflight is exercised for real here (the probes above stub it): it must
-# test the capability the install path relies on, so "skip apt" can never be a
-# false positive. Regression: `python3 -m venv --help` succeeds on Debian and
-# Ubuntu even when python3-venv -- and therefore ensurepip -- is missing.
-PF_ROOT="${TMP_ROOT}/preflight"
-mkdir -p "${PF_ROOT}/bin-ok" "${PF_ROOT}/bin-noensurepip" "${PF_ROOT}/bin-nopip"
-mkdir -p "${PF_ROOT}/ws-empty" "${PF_ROOT}/ws-with-venv/venv"
-for d in bin-ok bin-noensurepip bin-nopip; do
-    printf '#!/bin/sh\nexit 0\n' >"${PF_ROOT}/${d}/ffmpeg"
-    chmod +x "${PF_ROOT}/${d}/ffmpeg"
-done
-cat >"${PF_ROOT}/bin-noensurepip/python3" <<'STUB'
-#!/bin/sh
-case "$*" in
-    *ensurepip*) exit 1 ;;
-    *) exit 0 ;;
-esac
-STUB
-cat >"${PF_ROOT}/bin-nopip/python3" <<'STUB'
-#!/bin/sh
-case "$*" in
-    "-m pip"*) exit 1 ;;   # no system pip (must not match the ensurepip probe)
-    *) exit 0 ;;
-esac
-STUB
-chmod +x "${PF_ROOT}/bin-noensurepip/python3" "${PF_ROOT}/bin-nopip/python3"
-
-preflight_probe() {  # $1 = stub bin dir, $2 = workspace
-    PATH="$1:${PATH}" probe '
-set +u
-source scripts/setup.sh
-WORKSPACE="'"$2"'"
-if python3 -m venv --help >/dev/null 2>&1; then echo "OLD_PROBE=passes"; else echo "OLD_PROBE=fails"; fi
-if python3 -m pip --version >/dev/null 2>&1; then echo "OLD_PIP_PROBE=passes"; else echo "OLD_PIP_PROBE=fails"; fi
-platform_training_system_deps_satisfied && echo "PREDICATE=skip-apt" || echo "PREDICATE=run-apt"
-'
-}
-PF_OK="$(preflight_probe "${PF_ROOT}/bin-ok" "${PF_ROOT}/ws-empty")"
-assert_contains "a ready host skips the install" "PREDICATE=skip-apt" "${PF_OK}"
-PF_NOENSUREPIP="$(preflight_probe "${PF_ROOT}/bin-noensurepip" "${PF_ROOT}/ws-empty")"
-assert_contains "host without ensurepip runs the install" "PREDICATE=run-apt" "${PF_NOENSUREPIP}"
-assert_contains "the old venv --help probe would have passed (regression)" \
-    "OLD_PROBE=passes" "${PF_NOENSUREPIP}"
-PF_EXISTING="$(preflight_probe "${PF_ROOT}/bin-noensurepip" "${PF_ROOT}/ws-with-venv")"
-assert_contains "an existing venv needs no installer" "PREDICATE=skip-apt" "${PF_EXISTING}"
-PF_NOPIP="$(preflight_probe "${PF_ROOT}/bin-nopip" "${PF_ROOT}/ws-empty")"
-assert_contains "a missing system pip does not force an install" "PREDICATE=skip-apt" "${PF_NOPIP}"
-assert_contains "the preflight no longer probes system pip" "OLD_PIP_PROBE=fails" "${PF_NOPIP}"
 
 # ---------------------------------------------------------------------------
 # 4. dependency preview
@@ -420,6 +481,33 @@ assert_eq "training preview lists only venv/pip/ffmpeg" \
     "PREVIEW training [python3-venv python3-pip ffmpeg]" "${TRAINING_PREVIEW}"
 assert_not_contains "training preview omits colcon" "colcon" "${TRAINING_PREVIEW}"
 assert_contains "full preview still lists colcon" "python3-colcon-common-extensions" "${FULL_PREVIEW}"
+
+# FFmpeg is explicitly installed and previewed for every Ubuntu profile.
+PROBE_FFMPEG="$(probe '
+set +u
+source scripts/setup.sh
+source scripts/setup/platforms/ubuntu-22.04.sh
+SETUP_PLATFORM_ID=ubuntu-22.04
+run_sudo() { printf "APT"; printf " %s" "$@"; printf "\n"; }
+for p in full inference training; do
+  SETUP_PROFILE=$p
+  INSTALL_BENCHMARK_DEPS=false
+  echo "FFMPEG_PREVIEW $p [$(preview_system_packages)]"
+  platform_install_python_bootstrap
+  INSTALL_BENCHMARK_DEPS=true
+  echo "BENCH_PREVIEW $p [$(preview_system_packages)]"
+done
+platform_install_benchmark_system_deps
+')"
+for p in full inference training; do
+    assert_contains "$p previews FFmpeg explicitly" "ffmpeg" "$(line_for "FFMPEG_PREVIEW $p " "${PROBE_FFMPEG}")"
+    count="$(line_for "BENCH_PREVIEW $p " "${PROBE_FFMPEG}" | grep -o ffmpeg | wc -l)"
+    assert_eq "$p benchmark preview has one FFmpeg entry" "1" "$count"
+done
+assert_contains "shared bootstrap installs FFmpeg explicitly" \
+    "APT apt-get install -y python3-venv python3-pip ffmpeg -qq" "${PROBE_FFMPEG}"
+assert_contains "benchmark hook only adds its rendering dependency" \
+    "APT apt-get install -y --no-install-recommends libosmesa6-dev -qq" "${PROBE_FFMPEG}"
 
 # ---------------------------------------------------------------------------
 # 5. LeRobot extras: training keeps dataset/policy deps, drops teleop kinematics
