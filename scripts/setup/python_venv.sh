@@ -692,22 +692,35 @@ EOF
             log_info "Installing grasp dependencies (GraspGen)..."
             export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
             install_graspgen_pip "${VENV_PYTHON}" -m pip install
-            # GraspGenX ships as an audited pure-Python wheel built from its pinned
-            # upstream commit (scripts/build_graspgenx_wheel.sh). --no-deps: upstream
-            # pins torch<2.7, diffusers==0.11.1 and huggingface-hub==0.25.2 only for
-            # its authors' driver; it reuses GraspGen's pointnet2_ops and runtime
-            # requirements plus requirements/graspgenx.txt, so it is installed, or
-            # skipped, together with GraspGen.
-            log_info "Installing grasp dependencies (GraspGenX)..."
-            run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
-                -r "${WORKSPACE}/requirements/graspgenx.txt" --quiet
-            if ! (cd "${graspgenx_wheel_root}" && sha256sum --check SHA256SUMS); then
-                log_error "GraspGenX wheel checksum verification failed."
-                return 1
-            fi
-            run_cmd "${pip_install[@]}" --no-deps "${graspgenx_wheel}" --quiet
             grasp_installed=true
         fi
+    fi
+
+    # GraspGenX is installed on its own predicate, not with GraspGen. It ships
+    # as an audited pure-Python wheel built from its pinned upstream commit
+    # (scripts/build_graspgenx_wheel.sh) and its encoder is PTV3, so it needs
+    # neither pointnet2_ops nor a CUDA toolchain -- which is what lets an
+    # Ascend host serve it. --no-deps: upstream pins torch<2.7,
+    # diffusers==0.11.1 and huggingface-hub==0.25.2 for its authors' driver,
+    # while the versions this workspace needs are in
+    # requirements/graspgenx.txt and the accelerator's constraints.
+    local graspgenx_installed=false
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping GraspGenX (inference profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping GraspGenX for Benchmark-only setup."
+    elif ! accel_supports_torch_graspgenx; then
+        log_warn "Skipping GraspGenX on accelerator ${SETUP_ACCEL_ID}: it has no cuda or npu backend."
+    else
+        log_info "Installing GraspGenX..."
+        run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/graspgenx.txt" --quiet
+        if ! (cd "${graspgenx_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "GraspGenX wheel checksum verification failed."
+            return 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${graspgenx_wheel}" --quiet
+        graspgenx_installed=true
     fi
 
     # Optional speech_direction report dependencies (Plotly/Matplotlib). Pure-Python.
@@ -780,6 +793,62 @@ try:
 except Exception as exc:
     raise SystemExit(f"Missing pointnet2_ops after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
+PY
+    fi
+    # Only assert the import when this run actually installed GraspGenX.
+    if [[ "${graspgenx_installed}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib
+import importlib.metadata
+import os
+import tempfile
+
+# The distribution version, not graspgenx.__version__: the package hardcodes
+# "0.1.0" regardless of the build, so only the metadata distinguishes the
+# audited wheel from one built locally off a different patch stack.
+version = importlib.metadata.version("graspgenx")
+if version != "1.0.0+ibrobot.2":
+    raise SystemExit(f"Expected the audited GraspGenX 1.0.0+ibrobot.2, got {version}")
+
+# Importing graspgenx runs a hook that clones gripper descriptions and
+# checkpoints from Hugging Face unless both roots already exist, which would
+# make setup hang on a host without that network. Point them at empty
+# directories: the import only has to prove the wheel is loadable here, and
+# the runtime loader passes the bundle's own paths.
+with tempfile.TemporaryDirectory() as root:
+    for variable in ("GRASPGENX_GRIPPER_CFG_DIR", "GRASPGENX_CHECKPOINT_DIR"):
+        os.environ[variable] = root
+    try:
+        importlib.import_module("graspgenx.grasp_server")
+    except Exception as exc:
+        raise SystemExit(f"Missing graspgenx.grasp_server after GraspGenX install: {exc}")
+
+    # The seams patches 0002-0004 open, asserted as behaviour. The device
+    # property is checked for being a property: inserting it next to a
+    # decorated method is how a patch silently moves that decorator onto the
+    # property instead, which leaves load_gripper_input ungated and is
+    # invisible in the patch's own diff.
+    import inspect
+
+    from graspgenx.grasp_server import GraspGenXSampler, load_grasp_gen_model
+    from graspgenx.models.generator import GraspGenGenerator
+    from graspgenx.models.grasp_gen import GraspGen
+
+    for owner, name, parameter in (
+        (GraspGen, "from_config", "generator_class"),
+        (load_grasp_gen_model, None, "device"),
+    ):
+        function = owner if name is None else getattr(owner, name)
+        if parameter not in inspect.signature(function).parameters:
+            raise SystemExit(f"GraspGenX patch missing: {function.__qualname__} has no {parameter}")
+    if not isinstance(inspect.getattr_static(GraspGenXSampler, "device"), property):
+        raise SystemExit(
+            "GraspGenX patch 0004 is misapplied: GraspGenXSampler.device is not a property, "
+            "which means a decorator was captured by it"
+        )
+    if "initial_noise" not in inspect.getsource(GraspGenGenerator.forward_inference):
+        raise SystemExit("GraspGenX patch 0002 missing: the generator ignores initial_noise")
+print(f"GraspGenX smoke test passed: graspgenx=={version}; patch seams present")
 PY
     fi
     # gitlint ships in dev-tools.txt, which the inference profile skips.

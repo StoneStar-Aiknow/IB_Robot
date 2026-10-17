@@ -81,6 +81,15 @@ grasp_support_for() {
     )
 }
 
+graspgenx_support_for() {
+    local accel_id="$1"
+    (
+        SETUP_ACCEL_ID="${accel_id}"
+        load_accel_impl
+        if accel_supports_torch_graspgenx; then echo "yes"; else echo "no"; fi
+    )
+}
+
 constraints_for() {
     local accel_id="$1" cann_root="${2:-${NO_CANN}}"
     (
@@ -138,6 +147,7 @@ echo "== every accelerator profile implements the whole hook contract =="
 # aborting a real `--accel cuda` setup run at exit 127.
 ACCEL_HOOKS=(
     accel_supports_torch_grasp
+    accel_supports_torch_graspgenx
     accel_pip_constraints
     accel_requirements
     accel_verify_runtime
@@ -161,6 +171,17 @@ echo "== Torch grasp stack is gated on the accelerator, not the OS =="
 assert_eq "cuda installs the Torch grasp stack" "yes" "$(grasp_support_for cuda)"
 assert_eq "cann skips the Torch grasp stack" "no" "$(grasp_support_for cann)"
 assert_eq "cpu skips the Torch grasp stack" "no" "$(grasp_support_for cpu)"
+
+# GraspGenX answers its own question: a pure-Python wheel whose encoder is
+# PTV3 never touches pointnet2_ops, and its 310P deployment runs on torch_npu.
+# Answering with accel_supports_torch_grasp kept it off npu for a reason that
+# does not apply to it, so the two hooks must not agree on cann.
+echo "== GraspGenX is gated separately from GraspGen =="
+assert_eq "cuda installs GraspGenX" "yes" "$(graspgenx_support_for cuda)"
+assert_eq "cann installs GraspGenX" "yes" "$(graspgenx_support_for cann)"
+assert_eq "cpu skips GraspGenX" "no" "$(graspgenx_support_for cpu)"
+assert_eq "cann separates GraspGenX from GraspGen" \
+    "no:yes" "$(grasp_support_for cann):$(graspgenx_support_for cann)"
 
 echo "== Torch ABI constraints =="
 assert_eq "cuda needs no global constraint" \

@@ -1,15 +1,46 @@
 # Runtime dependencies for the GraspGenX perception plugin
 # (perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin).
-# Installed by ./scripts/setup.sh right after GraspGen, behind the same
-# accelerator gate (accel_supports_torch_grasp, i.e. the cuda accelerator):
-# GraspGenX reuses GraspGen's pointnet2_ops extension and the rest of
-# requirements/manipulation.txt, and its adapter only serves the torch_cuda
-# deployment.
+# Installed by ./scripts/setup.sh behind accel_supports_torch_graspgenx: the
+# cuda and cann accelerators, skipped on cpu, which has no backend to serve it.
 #
-# GraspGenX itself is installed from the audited wheel in
-# third_party/wheels/graspgenx/ with --no-deps; its upstream pins (torch<2.7,
-# diffusers==0.11.1, huggingface-hub==0.25.2) only reflect its authors' driver.
-# The sampler is verified on torch 2.7.1+cu126 and the diffusers range LeRobot
-# already uses.
+# This file has to be self-sufficient on every accelerator that hook answers
+# for. The audited wheel is installed with --no-deps, and the cann accelerator
+# never runs install_graspgen_pip, so requirements/manipulation.txt is not
+# there to supply what graspgenx.grasp_server imports at module scope:
+#
+#   grasp_server -> omegaconf, diffusers
+#                -> dataset.dataset        -> h5py, trimesh, sklearn
+#                -> dataset.webdataset_utils -> webdataset
+#                -> models.grasp_gen       -> omegaconf
+#                   -> discriminator       -> sklearn
+#                -> x_grippers             -> yourdfpy, imageio
+#
+# numpy, tqdm, PyYAML and scipy are left out on purpose: scipy is in
+# requirements/base.txt, and the other three are core dependencies of LeRobot
+# and the colcon toolchain, which every profile installs. imageio reaches a
+# cuda host through pyrender/viser in manipulation.txt and is named here
+# because nothing on a cann host pulls it.
+#
+# addict and timm are also left out: the PTV3 backbone needs them, but the
+# import is inside generator.py's backbone branch rather than at module scope,
+# so it is not part of the closure the regression test walks. They come from
+# requirements/perception.txt, which is gated on the profile and not on the
+# accelerator -- the full profile installs it on every platform.
+#
+# The versions match requirements/manipulation.txt so the cuda accelerator
+# resolves the same set the sampler is verified on. omegaconf is named
+# directly rather than through manipulation.txt's hydra-core: the package
+# imports omegaconf and never hydra itself.
+#
+# GraspGenX's own upstream pins (torch<2.7, diffusers==0.11.1,
+# huggingface-hub==0.25.2) only reflect its authors' driver; the sampler is
+# verified on torch 2.7.1+cu126 and the diffusers range LeRobot already uses.
 
 diffusers>=0.27.2,<0.36
+h5py
+imageio
+omegaconf
+scikit-learn
+trimesh==4.5.3
+webdataset
+yourdfpy==0.0.56
