@@ -69,9 +69,28 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 |---|---|---|
 | DemoTorchModel | `torch_models/demo_torch_model` | CPU smoke example |
 | [PI0.5 Ascend310P](torch_models/pi05_ascend_310p/README.md) | `torch_models/pi05_ascend_310p` | `model_type=pi05` + `backend=torch` + `device=npu` |
+| [GraspGenX Ascend310P](torch_models/graspgenx_ascend_310p/README.md) | `torch_models/graspgenx_ascend_310p` | `model_type=graspgenx` + `backend=torch` + `device=npu` |
 
 每个模型目录负责自己的配置校验、运行时准备和平台约束。统一推理服务只按稳定的
 `model_type/backend/device` 组合解析 provider，不在通用 manifest exporter 中维护模型特判。
+
+## 自定义 Ascend 算子
+
+需要自定义算子的模型，把算子源码放进**自己的模型目录**，而不是包的顶层——它们服务单个
+模型，不是本包的共享设施。目前只有 `graspgenx_ascend_310p`：源码在
+`torch_models/graspgenx_ascend_310p/custom_ops/kernels/`，与调用它的 Python 绑定
+（同目录的 `custom_ops/`）收在一处；算子清单、CANN 绑定与输出布局见该目录的
+[`manifest.yaml`](torch_models/graspgenx_ascend_310p/custom_ops/kernels/manifest.yaml)。
+
+这些源码**不由 colcon 构建**：`scripts/build.sh` 只构建 `src/` 下带 `package.xml` 的包，
+而算子要用 CANN 的 msopgen + CMake 在运行它们的主机上现场编译
+（`scripts/setup/install_graspgenx_ascend_ops.sh`）。`setup.py` 的 `find_packages` 不收
+没有 `__init__.py` 的 `kernels/`，所以源码随包进仓库但不进 install space。
+
+**构建产物不在仓库里**，默认落 `~/.cache/ibrobot/graspgenx_ascend_ops`：vendor 包按单一
+CANN release 与 `ascend310p` 计算单元编译，Torch bridge 按本机 venv 的
+libtorch/libtorch_npu ABI 链接，换任何一样都要重编。位置由
+`IBROBOT_GRASPGENX_ASCEND_OPS` 覆盖，该变量是这个路径**唯一**被写下的地方。
 
 ## Provider 扩展
 
