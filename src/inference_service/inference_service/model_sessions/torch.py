@@ -56,10 +56,10 @@ class TorchModelSession(ModelSession):
             context.backend != "torch"
             or context.interface != "tensor_model"
             or not isinstance(profile, TorchRuntimeProfile)
-            or profile.device not in {"cpu", "cuda"}
+            or profile.device not in {"cpu", "cuda", "npu"}
         ):
             raise BackendLoadError(
-                "TorchModelSession requires a tensor_model deployment with a typed cpu/cuda Torch profile",
+                "TorchModelSession requires a tensor_model deployment with a typed cpu/cuda/npu Torch profile",
                 code="invalid_deployment",
             )
         unknown_options = sorted(context.runtime_options)
@@ -70,10 +70,22 @@ class TorchModelSession(ModelSession):
 
         torch_module = self._torch_loader()
         device_name = profile.device
-        if device_name == "cuda":
-            is_available = getattr(getattr(torch_module, "cuda", None), "is_available", None)
+        if device_name == "npu":
+            # Importing torch_npu is what registers the device, so it has to
+            # happen before `is_available` can answer; the accelerator is
+            # otherwise reported as absent.
+            try:
+                importlib.import_module("torch_npu")
+            except ImportError as exc:
+                raise BackendLoadError(
+                    f"torch_npu is required for a Torch npu deployment: {exc}",
+                    code="missing_dependency",
+                ) from exc
+        if device_name in {"cuda", "npu"}:
+            accelerator = getattr(torch_module, device_name, None)
+            is_available = getattr(accelerator, "is_available", None)
             if not callable(is_available) or not is_available():
-                raise BackendLoadError("Torch CUDA device is unavailable", code="device_unavailable")
+                raise BackendLoadError(f"Torch {device_name} device is unavailable", code="device_unavailable")
         try:
             device = torch_module.device(device_name)
             module = self._module_loader(context)
@@ -133,8 +145,10 @@ class TorchModelSession(ModelSession):
         self._device_name = None
         self._torch = None
         gc.collect()
-        if torch_module is not None and device_name == "cuda":
-            empty_cache = getattr(getattr(torch_module, "cuda", None), "empty_cache", None)
+        # Resolve the cache owner from the device name rather than branching per
+        # accelerator, as LeRobotTorchModelSession._close does.
+        if torch_module is not None and device_name in {"cuda", "npu"}:
+            empty_cache = getattr(getattr(torch_module, device_name, None), "empty_cache", None)
             if callable(empty_cache):
                 with suppress(Exception):
                     empty_cache()

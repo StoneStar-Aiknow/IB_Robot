@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from inference_manifest import (
     BundleFile,
+    DeploymentArtifact,
     DeploymentTarget,
     Digest,
     ExecutionContract,
@@ -39,6 +40,7 @@ from model_utils.graspgen_contract import (
     GRASPGEN_POINT_CLOUD_SEMANTIC,
     GRASPGEN_POSE_SEMANTIC,
 )
+from model_utils.graspgenx_export.binding import generator_binding, validate_binding
 
 from .graspgenx_adapter import (
     GRASPGENX_POSTPROCESSING,
@@ -55,6 +57,13 @@ _CHECKPOINTS = "assets/graspgenx"
 _GRIPPERS = "assets"
 _GENERATOR = f"{_CHECKPOINTS}/gen/generator.pth"
 _DISCRIMINATOR = f"{_CHECKPOINTS}/dis/discriminator.pth"
+# The offline diffusion loop lives outside assets/ on purpose: _bundle_files
+# walks assets/, and a path may be in bundle.files or in a deployment's
+# artifacts but never both. Only the artifacts map carries a sha256, so this is
+# also the side that gets its content verified rather than only its name.
+_DIFFUSION_LOOP_DIR = "artifacts/ascend_310p"
+_DIFFUSION_LOOP = f"{_DIFFUSION_LOOP_DIR}/diffusion_loop.om"
+_DIFFUSION_LOOP_METADATA = f"{_DIFFUSION_LOOP_DIR}/diffusion_loop.json"
 _EPOCH = re.compile(r"epoch_(\d+)\.pth$")
 
 
@@ -134,6 +143,31 @@ def _model_descriptor() -> ModelDescriptor:
     )
 
 
+def _validate_diffusion_loop(source: Path, num_grasps: int, binding: dict) -> None:
+    """Copy the offline diffusion loop in, refusing one the bundle cannot use.
+
+    The graph is compiled for one grasp count and one step count. A mismatch is
+    not an error at run time -- the generator declines the offline loop and
+    falls back to the eager one -- so it would show up only as the deployment
+    being inexplicably slow. Catching it here is the difference between a
+    packaging failure and a silent performance cliff.
+    """
+    metadata_source = source.with_suffix(".json")
+    if not source.is_file():
+        raise FileNotFoundError(f"offline diffusion loop not found: {source}")
+    if not metadata_source.is_file():
+        raise FileNotFoundError(f"the offline loop's metadata must sit beside it as {metadata_source.name}")
+    metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
+    validate_binding(metadata, binding, num_grasps)
+
+
+def _materialize_diffusion_loop(bundle_root: Path, source: Path) -> None:
+    destination = bundle_root / _DIFFUSION_LOOP
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _copy_if_changed(source, destination)
+    _copy_if_changed(source.with_suffix(".json"), bundle_root / _DIFFUSION_LOOP_METADATA)
+
+
 def _bundle_files(bundle_root: Path) -> tuple[str, ...]:
     return tuple(
         sorted(
@@ -153,11 +187,39 @@ def package_graspgenx_torch_bundle(
     num_grasps: int = 400,
     topk: int = 400,
     deployment_name: str = "torch_cuda",
+    device: str = "cuda",
+    diffusion_loop: Path | None = None,
 ) -> Path:
     """Create or update a bundle; sources are optional when the bundle already holds them."""
     bundle_root.mkdir(parents=True, exist_ok=True)
+    if device not in {"cuda", "npu"}:
+        raise ValueError(f"GraspGenX serves cuda and npu deployments, not {device!r}")
+    if (device == "npu") != (diffusion_loop is not None):
+        raise ValueError("an npu deployment needs --diffusion-loop, and no other deployment takes one")
     if (checkpoint_root is None) != (gripper_dir is None):
         raise ValueError("pass both --checkpoint-root and --gripper-dir, or neither to repackage in place")
+    # Preflight every retained NPU deployment against the prospective sources,
+    # before copying any checkpoints or rewriting adapter/manifest digests.
+    # Updating only CUDA still changes the assets shared with an existing OM.
+    loops = [diffusion_loop] if diffusion_loop is not None else []
+    manifest_path = bundle_root / "inference_manifest.json"
+    if manifest_path.is_file():
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for name, deployment in raw["deployments"].items():
+            artifact = deployment.get("artifacts", {}).get("diffusion_loop")
+            if artifact and name != deployment_name:
+                path = bundle_root / artifact["path"]
+                loops.append(
+                    diffusion_loop if diffusion_loop is not None and path == bundle_root / _DIFFUSION_LOOP else path
+                )
+    if loops:
+        checkpoint = _latest_checkpoint(checkpoint_root / "gen") if checkpoint_root else bundle_root / _GENERATOR
+        config = (
+            checkpoint_root / "gen/config.yaml" if checkpoint_root else bundle_root / _CHECKPOINTS / "gen/config.yaml"
+        )
+        binding = generator_binding(checkpoint, config)
+        for loop in loops:
+            _validate_diffusion_loop(loop, num_grasps, binding)
     if checkpoint_root is not None and gripper_dir is not None:
         _materialize(bundle_root, checkpoint_root, gripper_dir, gripper_name)
     required = (
@@ -170,6 +232,9 @@ def package_graspgenx_torch_bundle(
     missing = [relative for relative in required if not (bundle_root / relative).is_file()]
     if missing:
         raise FileNotFoundError(f"GraspGenX bundle is missing {missing}; provide --checkpoint-root and --gripper-dir")
+
+    if diffusion_loop is not None:
+        _materialize_diffusion_loop(bundle_root, diffusion_loop)
 
     adapter = {
         "interface": "tensor_model",
@@ -208,6 +273,24 @@ def package_graspgenx_torch_bundle(
     else:
         changed = existing.bundle.files != files or existing.model != model or previous_adapter != adapter_document
         bundle_uuid, revision = existing.bundle.uuid, existing.bundle.revision + int(changed)
+    # The offline loop is declared as a verified artifact but left out of
+    # `execution`: this backend is torch, and the graph is driven by the model
+    # the torch_module_loader builds, not by an ACL session. An empty execution
+    # list is what lets a torch deployment carry it at all.
+    artifacts = {}
+    if device == "npu":
+        artifacts = {
+            "diffusion_loop": DeploymentArtifact(
+                path=_DIFFUSION_LOOP,
+                format="om",
+                sha256=_sha256(bundle_root / _DIFFUSION_LOOP),
+            ),
+            "diffusion_loop_metadata": DeploymentArtifact(
+                path=_DIFFUSION_LOOP_METADATA,
+                format="json",
+                sha256=_sha256(bundle_root / _DIFFUSION_LOOP_METADATA),
+            ),
+        }
     deployment = TorchDeployment(
         execution_contract=ExecutionContract(
             state_scope="request",
@@ -217,8 +300,9 @@ def package_graspgenx_torch_bundle(
         runtime_profile=RoleRuntimeProfile(
             backend="torch",
             target=DeploymentTarget(runtime="torch"),
-            profile=TorchRuntimeProfile(device="cuda"),
+            profile=TorchRuntimeProfile(device=device),
         ),
+        artifacts=artifacts,
     )
     previous_deployment = existing.deployments.get(deployment_name) if existing is not None else None
     if isinstance(previous_deployment, TorchDeployment):
@@ -265,6 +349,22 @@ def main() -> int:
     parser.add_argument("--num-grasps", type=int, default=400)
     parser.add_argument("--topk", type=int, default=400)
     parser.add_argument("--deployment", default="torch_cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=("cuda", "npu"),
+        help="Torch device this deployment targets. An npu deployment also needs --diffusion-loop.",
+    )
+    parser.add_argument(
+        "--diffusion-loop",
+        type=Path,
+        default=None,
+        help=(
+            "Offline diffusion-loop model (.om) for an npu deployment, with its metadata "
+            "JSON beside it. It is declared as a sha256-verified artifact, and its grasp "
+            "count must match --num-grasps."
+        ),
+    )
     args = parser.parse_args()
     print(
         package_graspgenx_torch_bundle(
@@ -275,6 +375,8 @@ def main() -> int:
             num_grasps=args.num_grasps,
             topk=args.topk,
             deployment_name=args.deployment,
+            device=args.device,
+            diffusion_loop=args.diffusion_loop,
         )
     )
     return 0

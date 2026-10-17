@@ -86,16 +86,19 @@ class GraspGenXAdapter(PerceptionAdapter):
         model_type="graspgenx",
         preprocessing=GRASPGENX_PREPROCESSING,
         postprocessing=GRASPGENX_POSTPROCESSING,
-        supported_deployments=frozenset({"torch_cuda"}),
+        supported_deployments=frozenset({"torch_cuda", "torch_npu"}),
         operation="generate_grasps",
     )
 
-    def __init__(self, config: GraspGenXConfig) -> None:
+    def __init__(self, config: GraspGenXConfig, *, compiled_sample_count: int | None = None) -> None:
         self.config = config
+        # Set when the deployment ships an offline diffusion loop: that graph is
+        # compiled for one row count, so the draw cannot follow a request.
+        self.compiled_sample_count = compiled_sample_count
 
     @classmethod
     def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> GraspGenXAdapter:
-        del model, deployment
+        del model
         assets = json.loads((Path(bundle_root) / "assets" / "adapter.json").read_text(encoding="utf-8"))
         expected = {
             "interface": "tensor_model",
@@ -107,7 +110,11 @@ class GraspGenXAdapter(PerceptionAdapter):
         mismatched = {name: assets.get(name) for name, value in expected.items() if assets.get(name) != value}
         if mismatched:
             raise ValueError(f"GraspGenX adapter identity mismatch: expected {expected}, got {mismatched}")
-        return cls(GraspGenXConfig.from_assets(assets))
+        config = GraspGenXConfig.from_assets(assets)
+        # A deployment that carries a compiled diffusion loop can only run the
+        # row count the graph was built for; see the draw cap in prepare.
+        artifacts = getattr(deployment, "artifacts", None) or {}
+        return cls(config, compiled_sample_count=config.num_grasps if "diffusion_loop" in artifacts else None)
 
     def preprocess(self, points_xyz: np.ndarray) -> dict[str, np.ndarray]:
         prepared = self.prepare(points_xyz)
@@ -139,6 +146,16 @@ class GraspGenXAdapter(PerceptionAdapter):
         if max_grasps > GRASPGENX_MAX_SAMPLE_COUNT:
             raise ValueError(f"GraspGenX max_grasps {max_grasps} exceeds {GRASPGENX_MAX_SAMPLE_COUNT}")
         sample_count = max(self.config.num_grasps, int(max_grasps))
+        if self.compiled_sample_count is not None:
+            # The offline diffusion loop is compiled for one row count, and the
+            # generator declines a graph that does not match it -- silently, by
+            # running the eager loop: ~320 ms against ~196 ms on Ascend310P1
+            # (torch_models/graspgenx_ascend_310p/README.md). Nothing is given
+            # up by pinning the draw, because the eager loop's cost barely
+            # depends on the count, so a larger draw buys slower and not more.
+            # max_grasps still bounds what is returned, which is what it means
+            # on every other deployment anyway.
+            sample_count = self.compiled_sample_count
         return {
             GRASPGEN_POINT_CLOUD_SEMANTIC: np.ascontiguousarray(kept, dtype=np.float32),
             GRASPGENX_SAMPLE_COUNT_SEMANTIC: np.asarray([sample_count], dtype=np.int64),

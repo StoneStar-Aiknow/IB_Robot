@@ -193,3 +193,54 @@ def test_a_reflection_is_rejected_although_it_passes_the_orthonormality_check():
 
     assert np.abs(poses[1, :3, :3].T @ poses[1, :3, :3] - np.eye(3)).max() == 0.0
     assert [c.confidence for c in kept] == [pytest.approx(0.5)]
+
+
+def test_a_compiled_diffusion_loop_pins_the_draw_to_the_graph():
+    """A request may not push the draw off the compiled row count.
+
+    The offline loop is built for one count and the generator declines any
+    other -- silently, by running the eager loop at ~320 ms against ~196 ms.
+    Pinning gives nothing up: the eager loop's cost barely depends on the
+    count, so the larger draw would be slower rather than richer. max_grasps
+    still bounds what is returned, which is all it means on a deployment
+    without a compiled loop too.
+    """
+    points = np.zeros((32, 3), dtype=np.float32)
+    # What the 310P README has an npu bundle declare, to match its graph.
+    adapter = GraspGenXAdapter(
+        GraspGenXConfig(gripper_name="omnihand_left_x2", num_grasps=400, topk=400),
+        compiled_sample_count=400,
+    )
+
+    def drawn(max_grasps):
+        return int(adapter.prepare(points, max_grasps=max_grasps)[GRASPGENX_SAMPLE_COUNT_SEMANTIC][0])
+
+    assert drawn(0) == 400
+    assert drawn(100) == 400
+    # Without the pin these would draw 500 and 1000 and leave the graph behind.
+    assert drawn(500) == 400
+    assert drawn(1000) == 400
+    # The contract bound still applies: it is the service's limit, not the graph's.
+    with pytest.raises(ValueError, match="exceeds 1000"):
+        drawn(1001)
+
+
+def test_only_a_deployment_carrying_the_loop_pins_the_draw(tmp_path):
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "adapter.json").write_text(json.dumps(_identity()), encoding="utf-8")
+
+    without = GraspGenXAdapter.from_bundle(tmp_path, deployment=SimpleNamespace(artifacts={}))
+    with_loop = GraspGenXAdapter.from_bundle(
+        tmp_path, deployment=SimpleNamespace(artifacts={"diffusion_loop": object()})
+    )
+
+    assert without.compiled_sample_count is None
+    assert with_loop.compiled_sample_count == without.config.num_grasps
+
+
+def test_a_bundle_read_without_a_deployment_does_not_pin_the_draw(tmp_path):
+    """from_bundle is also called without a deployment, e.g. by packaging tools."""
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "adapter.json").write_text(json.dumps(_identity()), encoding="utf-8")
+
+    assert GraspGenXAdapter.from_bundle(tmp_path).compiled_sample_count is None

@@ -15,6 +15,7 @@ import json
 import pytest
 
 from inference_manifest import load_inference_manifest
+from model_utils.graspgenx_export.binding import generator_binding
 from perception_service.graspgenx_adapter import GRASPGENX_SAMPLE_COUNT_SEMANTIC, GraspGenXAdapter
 from perception_service.package_graspgenx_torch_bundle import package_graspgenx_torch_bundle
 
@@ -23,7 +24,10 @@ def _sources(tmp_path):
     release = tmp_path / "release"
     for network, epochs in (("gen", (90, 736)), ("dis", (1056,))):
         (release / network).mkdir(parents=True)
-        (release / network / "config.yaml").write_text(f"network: {network}\n", encoding="utf-8")
+        (release / network / "config.yaml").write_text(
+            f"network: {network}\ndiffusion:\n  num_diffusion_iters: 20\n  num_diffusion_iters_eval: 20\n",
+            encoding="utf-8",
+        )
         for epoch in epochs:
             (release / network / f"epoch_{epoch}.pth").write_bytes(f"{network}-{epoch}".encode())
     gripper = tmp_path / "omnihand_left_x2"
@@ -104,3 +108,117 @@ def test_repackaging_under_another_gripper_name_keeps_one_gripper(tmp_path):
     files = {item.path for item in load_inference_manifest(root, "torch_cuda").manifest.bundle.files}
     assert not [path for path in files if "omnihand_left_x2" in path]
     assert "assets/x_grippers/omnihand_right_x2/config.json" in files
+
+
+def _loop(tmp_path, release, **overrides):
+    path = tmp_path / "loop.om"
+    path.write_bytes(b"compiled loop")
+    metadata = {
+        "grasps": 400,
+        "steps": 20,
+        "generator_binding": generator_binding(
+            release / "gen/epoch_736.pth",
+            release / "gen/config.yaml",
+        ),
+        **overrides,
+    }
+    path.with_suffix(".json").write_text(json.dumps(metadata), encoding="utf-8")
+    return path
+
+
+def test_matching_loop_is_packaged_and_repackaged_without_changing_revision(tmp_path):
+    release, gripper = _sources(tmp_path)
+    root = tmp_path / "bundle"
+    loop = _loop(tmp_path, release)
+    package_graspgenx_torch_bundle(
+        root,
+        checkpoint_root=release,
+        gripper_dir=gripper,
+        deployment_name="torch_npu",
+        device="npu",
+        diffusion_loop=loop,
+    )
+    first = load_inference_manifest(root, "torch_npu").manifest
+    package_graspgenx_torch_bundle(
+        root, deployment_name="torch_npu", device="npu", diffusion_loop=root / "artifacts/ascend_310p/diffusion_loop.om"
+    )
+    assert load_inference_manifest(root, "torch_npu").manifest.bundle.revision == first.bundle.revision
+
+
+@pytest.mark.parametrize("change", ["checkpoint", "config", "steps", "grasps", "missing_binding"])
+def test_incompatible_incoming_loop_is_rejected_before_materializing_assets(tmp_path, change):
+    release, gripper = _sources(tmp_path)
+    overrides = {"steps": 10} if change == "steps" else {"grasps": 200} if change == "grasps" else {}
+    loop = _loop(tmp_path, release, **overrides)
+    if change in {"checkpoint", "config"}:
+        path = release / "gen" / ("epoch_736.pth" if change == "checkpoint" else "config.yaml")
+        path.write_bytes(path.read_bytes() + b"\n# changed\n")
+    if change == "missing_binding":
+        loop.with_suffix(".json").write_text('{"grasps":400,"steps":20}', encoding="utf-8")
+    root = tmp_path / "bundle"
+    with pytest.raises(ValueError, match="binding|must cover"):
+        package_graspgenx_torch_bundle(
+            root,
+            checkpoint_root=release,
+            gripper_dir=gripper,
+            deployment_name="torch_npu",
+            device="npu",
+            diffusion_loop=loop,
+        )
+    assert not (root / "assets").exists()
+
+
+@pytest.mark.parametrize("changed_file", ["epoch_736.pth", "config.yaml"])
+def test_cuda_update_cannot_preserve_a_loop_from_an_old_generator(tmp_path, changed_file):
+    release, gripper = _sources(tmp_path)
+    root = tmp_path / "bundle"
+    loop = _loop(tmp_path, release)
+    package_graspgenx_torch_bundle(
+        root,
+        checkpoint_root=release,
+        gripper_dir=gripper,
+        deployment_name="torch_npu",
+        device="npu",
+        diffusion_loop=loop,
+    )
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    path = release / "gen" / changed_file
+    path.write_bytes(path.read_bytes() + b"\n# changed\n")
+    with pytest.raises(ValueError, match="generator binding"):
+        package_graspgenx_torch_bundle(root, checkpoint_root=release, gripper_dir=gripper)
+    assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+    load_inference_manifest(root, "torch_npu")
+
+
+def test_runtime_rejects_unbound_loop_before_assembly_or_acl(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch_models.graspgenx_ascend_310p as ascend
+    from perception_service.torch_model_loaders import _graspgenx_ascend_model
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("incompatible metadata reached NPU assembly or ACL")
+
+    monkeypatch.setitem(ascend.__dict__, "assemble", unexpected)
+    monkeypatch.setitem(ascend.__dict__, "DiffusionLoopOM", unexpected)
+    release, _ = _sources(tmp_path)
+    metadata = tmp_path / "loop.json"
+    metadata.write_text('{"grasps":400,"steps":20}', encoding="utf-8")
+    context = SimpleNamespace(
+        validated_manifest=SimpleNamespace(
+            resolved_artifacts={
+                "diffusion_loop": tmp_path / "loop.om",
+                "diffusion_loop_metadata": metadata,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="generator binding"):
+        _graspgenx_ascend_model(
+            context,
+            release,
+            {
+                "generator_checkpoint": "gen/epoch_736.pth",
+                "checkpoints_dir": ".",
+                "num_grasps": 400,
+            },
+        )

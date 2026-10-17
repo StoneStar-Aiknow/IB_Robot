@@ -226,8 +226,13 @@ def test_the_session_factory_requires_a_cuda_torch_deployment_without_options(bu
         build_graspgenx_session(RuntimeContext(validated, runtime_options={"device_id": 0}), adapter=adapter)
 
 
-def test_the_backend_registry_admits_graspgenx_on_torch_cuda_only(bundle):
-    """GraspGenX is a canonical model type: Torch hosts it, no other backend claims it."""
+def test_only_the_torch_backend_claims_the_graspgenx_identity(bundle):
+    """GraspGenX is a canonical model type: Torch hosts it, no other backend claims it.
+
+    Both its devices live under that one backend, so this says nothing about
+    cuda versus npu -- the registry separates those through the evidence's
+    device set, which test_graspgenx_npu_launch_environment covers.
+    """
     from inference_manifest import CANONICAL_MODEL_MAPPING
 
     registry = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)

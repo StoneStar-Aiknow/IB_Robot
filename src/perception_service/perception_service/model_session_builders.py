@@ -108,12 +108,33 @@ def build_graspgenx_session(
     adapter,
     providers: RuntimeProviders | None = None,
 ):
-    """Build the Torch CUDA GraspGenX session; the official sampler has no other target."""
+    """Build the GraspGenX session: the official sampler on CUDA, ours on a 310P.
+
+    The npu deployment is a separate branch rather than a looser check in
+    `_cuda_torch_session`, which GraspGen shares: widening that would hand the
+    npu device to a model with no evidence for it.
+    """
 
     del adapter, providers
     if context.backend != "torch":
-        raise RuntimeError(f"{context.model_type} requires a Torch CUDA deployment")
+        raise RuntimeError(f"{context.model_type} requires a Torch deployment")
+    profile = context.backend_profile
+    if isinstance(profile, TorchRuntimeProfile) and profile.device == "npu":
+        return _npu_torch_session(context, "GraspGenX")
     return _cuda_torch_session(context, "GraspGenX")
+
+
+def _npu_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:
+    """A Torch session on an Ascend device, taking no runtime options.
+
+    The device id is not a runtime option here as it is for the ACL backend:
+    Torch-NPU owns the device, and the offline model this session drives runs
+    on Torch's own stream rather than a context of its own.
+    """
+    if context.runtime_options:
+        raise ValueError(f"{label} Torch deployment does not accept runtime options: {sorted(context.runtime_options)}")
+    model_type = context.model_type
+    return TorchModelSession(lambda runtime_context: _load_torch_module(model_type, runtime_context))
 
 
 def _cuda_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:
