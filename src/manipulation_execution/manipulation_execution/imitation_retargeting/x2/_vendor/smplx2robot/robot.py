@@ -27,11 +27,14 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import mujoco
 import numpy as np
 
-from .paths import model_path
+# IB-Robot patch: numpy forward kinematics instead of mujoco, and the model
+# shipped with the package instead of a search for the vendor drop.
+from ...kinematics import MjcfKinematics
 from .source import unit
+
+DEFAULT_MODEL_FILE = Path(__file__).resolve().parents[2] / "model" / "x2_ultra.xml"
 
 SIDES: tuple[str, ...] = ("left", "right")
 
@@ -158,30 +161,25 @@ class X2Kinematics:
     """Pose the arms, read anchors and axes. No renderer, no GL, no dynamics."""
 
     def __init__(self, model_file: Path | str | None = None) -> None:
-        path = Path(model_file) if model_file is not None else model_path()
+        path = Path(model_file) if model_file is not None else DEFAULT_MODEL_FILE
         if not Path(path).is_file():
             raise FileNotFoundError(f"robot model not found: {path}")
         self.model_file = Path(path).resolve()
-        self.model = mujoco.MjModel.from_xml_path(str(self.model_file))
-        self.data = mujoco.MjData(self.model)
-        self._joint_ids = {name: self._joint_id(name) for name in ARM_JOINT_NAMES}
-        self._arm_adr = np.array(
-            [self.model.jnt_qposadr[self._joint_ids[name]] for name in ARM_JOINT_NAMES],
-            dtype=np.int32,
-        )
+        self.model = MjcfKinematics(self.model_file, BASE_QPOS)
+        for name in ARM_JOINT_NAMES:
+            self._joint_id(name)
         limits = np.array(
-            [self.model.jnt_range[self._joint_ids[name]] for name in ARM_JOINT_NAMES],
+            [self.model.joint_range(name) for name in ARM_JOINT_NAMES],
             dtype=np.float64,
         )
         limits.setflags(write=False)
         self.limits_rad = limits
         self.set_arm(np.zeros(ARM_DOF))
 
-    def _joint_id(self, name: str) -> int:
-        joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if joint_id < 0:
+    def _joint_id(self, name: str) -> str:
+        if not self.model.has_joint(name):
             raise KeyError(f"joint {name!r} is not present in {self.model_file.name}")
-        return joint_id
+        return name
 
     @property
     def limits_deg(self) -> np.ndarray:
@@ -194,19 +192,15 @@ class X2Kinematics:
             raise ValueError(f"expected a [{ARM_DOF}] pose, got {frame.shape}")
         if not np.isfinite(frame).all():
             raise ValueError("pose contains non-finite values")
-        self.data.qpos[:] = 0.0
-        self.data.qpos[:7] = BASE_QPOS
-        self.data.qpos[self._arm_adr] = frame
-        self.data.qvel[:] = 0.0
-        mujoco.mj_forward(self.model, self.data)
+        self.model.forward(dict(zip(ARM_JOINT_NAMES, frame)))
 
     def anchor(self, joint_name: str) -> np.ndarray:
         """World position of a joint's rotation centre at the current pose."""
-        return self.data.xanchor[self._joint_id(joint_name)].copy()
+        return self.model.anchor(self._joint_id(joint_name))
 
     def axis(self, joint_name: str) -> np.ndarray:
         """World direction of a joint's axis at the current pose."""
-        return self.data.xaxis[self._joint_id(joint_name)].copy()
+        return self.model.axis(self._joint_id(joint_name))
 
     def body_pose(self, body_name: str) -> tuple[np.ndarray, np.ndarray]:
         """World (position, 3x3 rotation) of a link at the current pose.
@@ -215,11 +209,9 @@ class X2Kinematics:
         this is only ever used for points that are rigidly attached to the link
         and want the link's ORIENTATION -- never as a support point.
         """
-        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-        if body_id < 0:
+        if not self.model.has_body(body_name):
             raise KeyError(f"body {body_name!r} is not present in {self.model_file.name}")
-        return (self.data.xpos[body_id].copy(),
-                self.data.xmat[body_id].reshape(3, 3).copy())
+        return self.model.body_pose(body_name)
 
     # ---- geometry the readouts need -------------------------------------
 

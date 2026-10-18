@@ -29,8 +29,6 @@ M1 的五条验收全部跑在这个文件上（见 tools/followme_replay.py）�
 
 from __future__ import annotations
 
-import os
-import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,28 +38,19 @@ import numpy as np
 ARM_DOF = 14
 
 
-def _vendor_src() -> Path:
-    """vendor/smplx2robot/src，从 SMPLX2ROBOT_DIR 来。env.sh 声明了它。"""
-    root = os.environ.get("SMPLX2ROBOT_DIR")
-    if root:
-        return Path(root) / "src"
-    return Path(__file__).resolve().parents[4] / "vendor" / "smplx2robot" / "src"
-
-
 def _import_vendor():
     """只读 import vendor 的算术。一个字节都不重写。
 
     `retarget` / `smooth` / `despike` / `quintic_blend` / `clip_to_limits`
     全部原样调用，followme 只负责**喂什么、什么时候喂**。
+
+    IB-Robot patch: the vendored copy beside this file, not sys.path.
     """
-    src = _vendor_src()
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
-    from smplx2robot import postprocess, readouts  # noqa: F401
-    from smplx2robot.ledger import Ledger
-    from smplx2robot.retarget import READOUT_B, retarget
-    from smplx2robot.robot import ARM_JOINT_NAMES, X2Kinematics
-    from smplx2robot.source import SourceAnimation
+    from .smplx2robot import postprocess, readouts  # noqa: F401
+    from .smplx2robot.ledger import Ledger
+    from .smplx2robot.retarget import READOUT_B, retarget
+    from .smplx2robot.robot import ARM_JOINT_NAMES, X2Kinematics
+    from .smplx2robot.source import SourceAnimation
     return dict(postprocess=postprocess, Ledger=Ledger, retarget=retarget,
                 READOUT_B=READOUT_B, X2Kinematics=X2Kinematics,
                 ARM_JOINT_NAMES=ARM_JOINT_NAMES, SourceAnimation=SourceAnimation)
@@ -230,7 +219,11 @@ class StreamRetargeter:
             # 2.3 ms/帧 —— 9% 的开销，买的是"符号错了会抛异常"。符号错一个，
             # 机器人那条关节就是满速反向，这不是能靠事后看日志兜住的事。
             # 超过 MIRROR_CHECK_LIMIT_MM 它自己 raise，我们不接。
-            trajectory = trajectory.mirrored(self.ledger, kinematics=self.kinematics)
+            # IB-Robot patch: the per-frame FK self-check is off (no `kinematics=`);
+            # x2.followme.create runs it once at startup instead. The signs are
+            # constants, so a frame can only fail it if the table is wrong, and a
+            # 20 mm trip on one live frame would drop that frame for nothing.
+            trajectory = trajectory.mirrored(self.ledger)
         return trajectory.arm_pos[-1].copy()
 
 
