@@ -32,7 +32,9 @@ Patches:
   `StreamRetargeter` numbers frames absolutely across the trimmed history. Upstream
   numbered them by list position, so after `max_anchor_frames` pushes (about a
   minute of tracking) the branch guard never widened its window again and a wrist
-  crossing ±π stepped by 2π (`test_x2_followme.py` pins this).
+  crossing ±π stepped by 2π (`test_x2_followme.py` pins this). When the window
+  hits `max_anchor_frames` it also drops the frames before it, which no later
+  window reaches; upstream kept every frame while the guard stayed tripped.
 
 Not copied: the rest of `smplx2robot` (cli, export, delivery, safety, preview,
 compare, verify), which the streaming path does not import.

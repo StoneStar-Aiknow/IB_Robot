@@ -209,6 +209,12 @@ class StreamRetargeter:
                 self.notes.append(
                     f"帧 {index}: unwrap 分支跨度 {span} 帧超过上限 "
                     f"{self.max_anchor_frames}，窗口被截断，腕部可能出现 360° 台阶")
+                # IB-Robot patch: no later window starts before this anchor (the
+                # clamp only moves forward and a newly tripped channel anchors
+                # later), so drop those frames; upstream kept every frame for as
+                # long as the guard stayed tripped.
+                del self._frames[:anchor - self._trimmed]
+                self._trimmed = anchor
             window = self._frames[anchor - self._trimmed:]
         else:
             window = self._frames[-1:]

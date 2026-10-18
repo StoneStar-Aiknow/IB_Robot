@@ -26,6 +26,13 @@ from ._vendor import followme_core as core
 from ._vendor.neutral_fk import NeutralFK
 
 POSE_DIM = 52 * 6
+# The branch guard's longest window, in frames. Push cost grows with the window
+# (about 0.2 ms per frame of it on the dev machine) and the runtime's 1200 would
+# take 230 ms a frame against a 50 ms frame budget. 200 is 10 s of a wrist held
+# past the Euler cut; beyond that the vendor truncates and notes it.
+MAX_ANCHOR_FRAMES = 200
+# Notes kept across retargeter rebuilds and per-frame truncation notes.
+NOTES_KEPT = 10
 
 
 def _session() -> core.Session:
@@ -46,8 +53,12 @@ class X2FollowMe:
         self._stream = core.FollowMeStream(
             vendor=self._vendor, session=_session(), latency_s=latency_s, lookahead_s=lookahead_s,
             base_pose=base, limit_rate=False, mirror=mirror)
+        self._stream.retargeter = self._new_retargeter(self._stream.retargeter)
         self.retarget_count = 0
         self.input_resets = 0
+        # Guard counts of the retargeters that reset_input replaced.
+        self._guard_trips = 0
+        self._guard_worst = 0
         self._dry_run()
 
     def _dry_run(self) -> None:
@@ -90,7 +101,9 @@ class X2FollowMe:
                                 body_pose=rotations[1:22], global_orient=rotations[0])
 
     def retarget(self, t_camera: float, frame_id: int, smplx_pose_raw) -> np.ndarray:
-        pose = self._stream.retargeter.push(self._frame(t_camera, frame_id, smplx_pose_raw))
+        retargeter = self._stream.retargeter
+        pose = retargeter.push(self._frame(t_camera, frame_id, smplx_pose_raw))
+        del retargeter.notes[:-NOTES_KEPT]
         self.retarget_count += 1
         return pose
 
@@ -101,10 +114,17 @@ class X2FollowMe:
         # The branch guard follows one person's wrist unwrap; across a gap there is
         # no continuity to keep. The despiker's velocity statistics are the arm's,
         # not the person's, and the runtime keeps them across rounds too.
+        # Its counts and notes carry over: the status reports the whole session.
         old = self._stream.retargeter
-        self._stream.retargeter = core.StreamRetargeter(
-            self._vendor, old.kinematics, old.ledger, max_anchor_frames=old.max_anchor_frames, mirror=old.mirror)
+        self._guard_trips += old.guard.trips
+        self._guard_worst = max(self._guard_worst, old.guard.worst_branch)
+        self._stream.retargeter = self._new_retargeter(old)
+        self._stream.retargeter.notes.extend(old.notes[-NOTES_KEPT:])
         self.input_resets += 1
+
+    def _new_retargeter(self, old: core.StreamRetargeter) -> core.StreamRetargeter:
+        return core.StreamRetargeter(self._vendor, old.kinematics, old.ledger,
+                                     max_anchor_frames=MAX_ANCHOR_FRAMES, mirror=old.mirror)
 
     def start_round(self) -> None:
         self._stream.reset(_session())
@@ -122,8 +142,8 @@ class X2FollowMe:
             "stretched_frames": stream.stretched_frames,
             "offset_samples": stream.offset_samples,
             "despike_flagged": int(stream.despiker.flagged.sum()),
-            "branch_guard_trips": guard.trips,
-            "branch_guard_worst": guard.worst_branch,
+            "branch_guard_trips": self._guard_trips + guard.trips,
+            "branch_guard_worst": max(self._guard_worst, guard.worst_branch),
             "retargeted": self.retarget_count,
             "input_resets": self.input_resets,
             "notes": (stream.notes + stream.retargeter.notes)[-3:],

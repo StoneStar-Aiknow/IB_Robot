@@ -3,6 +3,7 @@ from scipy.spatial.transform import Rotation
 
 from manipulation_execution.imitation_retargeting.rotations import encode_rotation_6d
 from manipulation_execution.imitation_retargeting.streaming import create_stream
+from manipulation_execution.imitation_retargeting.x2 import followme
 from manipulation_execution.imitation_retargeting.x2._vendor import followme_core as core
 
 NEUTRAL = [0.4, 0.0, 0.0, -1.2, 0.0, 0.0, 0.0] * 2
@@ -50,3 +51,39 @@ def test_branch_guard_survives_trimmed_history():
     assert len(retargeter._frames) < len(frames) and retargeter.guard.trips > 0
     assert not retargeter.notes  # the cap itself never bit
     np.testing.assert_array_equal(trimmed, full)
+
+
+def _held_trip(stream, frames_past_the_cut):
+    # One wrist channel turns through +pi and stays past it, so the guard stays tripped.
+    body_index, axis = stream._stream.retargeter.guard.channels[0]
+    angles = [*np.linspace(2.5, 3.0, 6), *[3.3] * frames_past_the_cut]
+    for i, angle in enumerate(angles):
+        stream.retarget(i * 0.05, i, _raw(body_index, axis, angle))
+
+
+def test_a_held_trip_keeps_the_window_and_history_bounded(monkeypatch):
+    monkeypatch.setattr(followme, "MAX_ANCHOR_FRAMES", 10)
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=False)
+    retargeter = stream._stream.retargeter
+    windows = []
+    animation = retargeter._animation
+    monkeypatch.setattr(retargeter, "_animation",
+                        lambda frames: windows.append([f.frame_id for f in frames]) or animation(frames))
+    _held_trip(stream, 40)
+    assert retargeter.guard.trips > 0 and retargeter.notes
+    assert max(len(w) for w in windows) == 10 and len(retargeter._frames) <= 10
+    assert all(w == list(range(w[-1] - len(w) + 1, w[-1] + 1)) for w in windows)
+    assert len(retargeter.notes) <= followme.NOTES_KEPT
+
+
+def test_reset_input_keeps_the_sessions_guard_counts_and_notes(monkeypatch):
+    monkeypatch.setattr(followme, "MAX_ANCHOR_FRAMES", 10)
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=False)
+    _held_trip(stream, 20)
+    before = stream.status()
+    assert before["branch_guard_trips"] > 0 and before["notes"]
+    stream.reset_input()
+    after = stream.status()
+    assert stream._stream.retargeter.max_anchor_frames == 10
+    for key in ("branch_guard_trips", "branch_guard_worst", "notes"):
+        assert after[key] == before[key], key
