@@ -361,36 +361,65 @@ def _mock_config(config: Mapping) -> Mapping | None:
     return mock
 
 
+def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
+    """Parameters only the live retarget node takes; ``reset_pose`` is required for it."""
+    retarget = mock.get("retarget", {})
+    if not isinstance(retarget, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.retarget must be a mapping")
+    reset_pose = mock_reset_pose(robot_config)
+    if reset_pose is None:
+        raise ValueError("motion_imitation_stream.mock_playback.reset_pose is required when player is retarget")
+    retargeter = retarget.get("retargeter", "x2_followme")
+    if not isinstance(retargeter, str) or not retargeter.strip():
+        raise ValueError("motion_imitation_stream.mock_playback.retarget.retargeter must be a non-empty string")
+    return {
+        "reset_pose_json": json.dumps(reset_pose),
+        "retargeter": retargeter.strip(),
+        "vel_scale": _positive(retarget, "vel_scale", 1.0),
+        "latency_s": _non_negative(retarget, "latency_s", 0.4),
+        "lookahead_s": _non_negative(retarget, "lookahead_s", 0.25),
+        "mirror": _required_bool(retarget, "mirror") if "mirror" in retarget else True,
+    }
+
+
 def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mapping) -> list[Node]:
     mock = _mock_config(config)
     if mock is None:
         return []
     _, joint_names = _arm_stream(robot_config)
     limits, velocity = _arm_limits(mock, joint_names)
-    manifest = str(mock.get("animation_manifest", "")).strip()
-    if not manifest:
-        manifest = str(Path(get_package_share_directory("manipulation_execution")) / _DEFAULT_ANIMATION)
+    # Either node takes the preview contract below; mirror_session cannot tell them apart.
+    player = mock.get("player", "animation")
+    parameters = {
+        "pear_frame_topic": frame_topic,
+        "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
+        "status_topic": _required_topic(mock, "status_topic", "/motion_imitation_mock/status"),
+        "publish_rate_hz": _positive(mock, "publish_rate_hz", 50.0),
+        "input_staleness_sec": _positive(mock, "input_staleness_sec", 0.5),
+        "status_period_sec": _positive(mock, "status_period_sec", 5.0),
+        "joint_names_json": json.dumps(joint_names),
+        "joint_limits_json": json.dumps({name: list(limits[name]) for name in joint_names}),
+        "velocity_limits_json": json.dumps({name: float(velocity[name]) for name in joint_names}),
+    }
+    if player == "animation":
+        executable = "motion_imitation_mock_node"
+        manifest = str(mock.get("animation_manifest", "")).strip()
+        if not manifest:
+            manifest = str(Path(get_package_share_directory("manipulation_execution")) / _DEFAULT_ANIMATION)
+        parameters["animation_manifest"] = manifest
+        parameters["loop"] = _required_bool(mock, "loop") if "loop" in mock else True
+    elif player == "retarget":
+        executable = "motion_imitation_retarget_node"
+        parameters.update(_retarget_parameters(mock, robot_config))
+    else:
+        raise ValueError("motion_imitation_stream.mock_playback.player must be 'animation' or 'retarget'")
     return [
         Node(
             package="manipulation_execution",
-            executable="motion_imitation_mock_node",
+            executable=executable,
             name=MOCK_NODE_NAME,
             output="screen",
-            parameters=[
-                {
-                    "animation_manifest": manifest,
-                    "pear_frame_topic": frame_topic,
-                    "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
-                    "status_topic": _required_topic(mock, "status_topic", "/motion_imitation_mock/status"),
-                    "publish_rate_hz": _positive(mock, "publish_rate_hz", 50.0),
-                    "input_staleness_sec": _positive(mock, "input_staleness_sec", 0.5),
-                    "status_period_sec": _positive(mock, "status_period_sec", 5.0),
-                    "loop": _required_bool(mock, "loop") if "loop" in mock else True,
-                    "joint_names_json": json.dumps(joint_names),
-                    "joint_limits_json": json.dumps({name: list(limits[name]) for name in joint_names}),
-                    "velocity_limits_json": json.dumps({name: float(velocity[name]) for name in joint_names}),
-                }
-            ],
+            parameters=[parameters],
         )
     ]
 

@@ -137,20 +137,35 @@ robot:
     # its gate; whether that reaches the robot is mirror_session.publish_enabled.
     mock_playback:
       enabled: true
-      animation_manifest: ""  # empty: use the clip shipped with manipulation_execution
+      # Which node fills the preview: retarget follows the person live
+      # (motion_imitation_retarget_node); animation plays the clip below
+      # (motion_imitation_mock_node). Both take the same topics and ~/play.
+      player: retarget
+      animation_manifest: ""  # animation only; empty: use the clip shipped with manipulation_execution
       preview_topic: /motion_imitation_mock/arm_command_preview
       status_topic: /motion_imitation_mock/status
       publish_rate_hz: 50.0
       input_staleness_sec: 0.5
-      loop: true
+      loop: true  # animation only
       status_period_sec: 5.0
+      # retarget only. The runtime's follow-me settings (video2x2_runtime 0717710):
+      # buffer latency and lookahead in seconds, her right arm drives the robot's
+      # left, and vel_scale scales arm_velocity_limits below for the rate cap.
+      retarget:
+        retargeter: x2_followme
+        latency_s: 0.4
+        lookahead_s: 0.25
+        mirror: true
+        vel_scale: 1.0
 
       # The neutral pose, in radians, keyed by joint name like arm_limits below.
       # The session walks the arm here when it takes over (approach) and when a
       # round ends (cancel / stop), and holds it while ready and cooling down.
       # The runtime's BASE_POSE_RAD (upper_body_animation, video2x2_runtime
-      # 0717710); the vendor idle pose is the same. Remove it to keep the
-      # framework defaults (hold the pose measured at takeover).
+      # 0717710); the vendor idle pose is the same. The retarget player also
+      # parks and fades in from it, so it is required there; with the animation
+      # player, remove it to keep the framework defaults (hold the pose measured
+      # at takeover).
       reset_pose:
         left_shoulder_pitch_joint: 0.4
         left_shoulder_roll_joint: 0.0
