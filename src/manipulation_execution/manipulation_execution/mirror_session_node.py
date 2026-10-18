@@ -24,6 +24,10 @@ Parameters (one parameter file serves the node and the release script):
 ``mock_play_service``         ``mirror_session.mock_playback`` (the mock node's
                               animation through the gate); both empty: the
                               ``SessionHooks`` defaults
+``mock_reset_pose_json``      JSON list of the 14 arm values (arm_stream
+                              order) the mock window pipeline resets to,
+                              approach and wrap-up included; empty: the
+                              ``SessionHooks`` defaults
 ``business_hooks``            ``""``: the window pipeline above; ``demo``: the
                               demo start/cancel rules around it;
                               ``pkg.mod:Class``: a business hooks class, not
@@ -201,6 +205,7 @@ SESSION_PARAMETERS = {
     "camera_topic": "",
     "mock_preview_topic": "",
     "mock_play_service": "",
+    "mock_reset_pose_json": "",
     "business_hooks": "",
     "business_config": "",
 }
@@ -330,7 +335,11 @@ class MirrorSessionNode(Node):
             raise ValueError("mock_preview_topic selects the mock window pipeline; do not pass hooks as well")
         self._business_hooks = _string(self, "business_hooks")
         business_config = _string(self, "business_config")
-        self._mock = MockPlaybackHooks(self._request_play) if mock_preview else None
+        reset_pose_json = _string(self, "mock_reset_pose_json")
+        if reset_pose_json and not mock_preview:
+            raise ValueError("mock_reset_pose_json belongs to the mock window pipeline (mock_preview_topic)")
+        reset_pose = json.loads(reset_pose_json) if reset_pose_json else None
+        self._mock = MockPlaybackHooks(self._request_play, reset_pose) if mock_preview else None
         endpoints = resolve_endpoints(description, policy_mode=policy_mode)
         business = load_business_config(business_config)
         config = SessionConfig(policy_mode, endpoints.identity, stop_timeout_s=stop_timeout, **business.timing)

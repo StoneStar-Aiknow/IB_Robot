@@ -122,6 +122,30 @@ def mock_playback_endpoints(robot_config: Mapping) -> tuple[str, str] | None:
     return _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW), MOCK_PLAY_SERVICE
 
 
+def mock_reset_pose(robot_config: Mapping) -> list[float] | None:
+    """The mock pipeline's reset pose in the arm channel's order, or None if unset.
+
+    ``mock_playback.reset_pose`` is keyed by joint name like ``arm_limits`` and
+    must name exactly the ``joint.arm_stream`` joints. The session walks the arm
+    to it when it takes over and when a round ends.
+    """
+    config = _stream_config(robot_config)
+    mock = None if config is None else _mock_config(config)
+    if mock is None or mock.get("reset_pose") is None:
+        return None
+    pose = mock["reset_pose"]
+    _, joint_names = _arm_stream(robot_config)
+    if not isinstance(pose, Mapping) or set(pose) != set(joint_names):
+        raise ValueError(f"motion_imitation_stream.mock_playback.reset_pose must name exactly the {_ARM_STREAM} joints")
+    values = []
+    for name in joint_names:
+        value = pose[name]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            raise ValueError(f"motion_imitation_stream.mock_playback.reset_pose.{name} must be a finite number")
+        values.append(float(value))
+    return values
+
+
 def generate_motion_imitation_stream_nodes(robot_config: dict) -> list[Node]:
     """Launch the head-camera -> YOLOX -> PEAR frame stream, if the robot enables it."""
     config = _stream_config(robot_config)
@@ -376,5 +400,6 @@ __all__ = [
     "MOCK_PLAY_SERVICE",
     "generate_motion_imitation_stream_nodes",
     "mock_playback_endpoints",
+    "mock_reset_pose",
     "motion_imitation_stream_parameters",
 ]

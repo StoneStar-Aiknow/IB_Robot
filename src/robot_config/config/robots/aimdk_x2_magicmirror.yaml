@@ -145,6 +145,28 @@ robot:
       loop: true
       status_period_sec: 5.0
 
+      # The neutral pose, in radians, keyed by joint name like arm_limits below.
+      # The session walks the arm here when it takes over (approach) and when a
+      # round ends (cancel / stop), and holds it while ready and cooling down.
+      # The runtime's BASE_POSE_RAD (upper_body_animation, video2x2_runtime
+      # 0717710); the vendor idle pose is the same. Remove it to keep the
+      # framework defaults (hold the pose measured at takeover).
+      reset_pose:
+        left_shoulder_pitch_joint: 0.4
+        left_shoulder_roll_joint: 0.0
+        left_shoulder_yaw_joint: 0.0
+        left_elbow_joint: -1.2
+        left_wrist_yaw_joint: 0.0
+        left_wrist_pitch_joint: 0.0
+        left_wrist_roll_joint: 0.0
+        right_shoulder_pitch_joint: 0.4
+        right_shoulder_roll_joint: 0.0
+        right_shoulder_yaw_joint: 0.0
+        right_elbow_joint: -1.2
+        right_wrist_yaw_joint: 0.0
+        right_wrist_pitch_joint: 0.0
+        right_wrist_roll_joint: 0.0
+
       # Arm travel the mock safety clamps against, in radians and rad/s.
       # Application configuration, deliberately not in the runtime profile. Keyed
       # by joint name and must name exactly the joints of joint.arm_stream; the
