@@ -1,8 +1,8 @@
 # Vendored from video2x2_runtime
 
 Upstream: video2x2_runtime, commit 0717710. Copied byte for byte; the two
-files marked PATCHED were then edited in the commit after the copy, and each
-edit carries an "IB-Robot patch" comment.
+files marked PATCHED were then edited in later commits, and each edit carries
+an "IB-Robot patch" comment.
 
 | here | upstream | sha256 of the upstream file |
 | --- | --- | --- |
@@ -28,7 +28,11 @@ Patches:
   results are unchanged (`test_x2_kinematics.py` pins the FK to mujoco).
 * `followme_core.py`: `_import_vendor` imports the copy beside it instead of
   inserting `SMPLX2ROBOT_DIR` into `sys.path`; the per-frame mirror FK
-  self-check is dropped (`x2.followme` runs it once at startup).
+  self-check is dropped (`x2.followme` runs it once at startup); and
+  `StreamRetargeter` numbers frames absolutely across the trimmed history. Upstream
+  numbered them by list position, so after `max_anchor_frames` pushes (about a
+  minute of tracking) the branch guard never widened its window again and a wrist
+  crossing ±π stepped by 2π (`test_x2_followme.py` pins this).
 
 Not copied: the rest of `smplx2robot` (cli, export, delivery, safety, preview,
 compare, verify), which the streaming path does not import.

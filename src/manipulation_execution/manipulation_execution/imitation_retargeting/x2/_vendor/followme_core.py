@@ -176,6 +176,11 @@ class StreamRetargeter:
         self.guard = BranchGuard(sorted(euler))
 
         self._frames: list[SourceFrame] = []      # 只在哨兵触发时才会用到多于 1 帧
+        # IB-Robot patch: the guard keeps absolute frame numbers, so frames trimmed
+        # off the front must be counted; upstream used list positions, and after the
+        # first trim (max_anchor_frames pushes) every anchor equalled the current
+        # frame and the guard never widened the window again.
+        self._trimmed = 0
         self.limits_rad = np.array(self.kinematics.limits_rad, dtype=np.float64)
         self.notes: list[str] = []
 
@@ -193,7 +198,7 @@ class StreamRetargeter:
     def push(self, frame: SourceFrame) -> np.ndarray:
         """吃一帧，出 [14] 弧度（已按关节限位夹紧，与 retarget 的 arm_pos 同义）。"""
         self._frames.append(frame)
-        index = len(self._frames) - 1
+        index = self._trimmed + len(self._frames) - 1
         anchor = self.guard.observe(index, frame.body_pose)
 
         if anchor < index:
@@ -204,11 +209,12 @@ class StreamRetargeter:
                 self.notes.append(
                     f"帧 {index}: unwrap 分支跨度 {span} 帧超过上限 "
                     f"{self.max_anchor_frames}，窗口被截断，腕部可能出现 360° 台阶")
-            window = self._frames[anchor:index + 1]
+            window = self._frames[anchor - self._trimmed:]
         else:
-            window = self._frames[index:index + 1]
+            window = self._frames[-1:]
             # 单帧窗口够用时不留历史，内存恒定
             if len(self._frames) > self.max_anchor_frames:
+                self._trimmed += len(self._frames) - self.max_anchor_frames
                 del self._frames[:-self.max_anchor_frames]
 
         trajectory = self._v["retarget"](
