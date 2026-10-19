@@ -27,8 +27,6 @@ from robot_config.launch_registry.registry import (
 )
 from robot_config.logger_utils import get_colored_logger
 
-from .sim_backend import get_sim_backend
-
 logger = get_colored_logger("robot_config.launch_builders.simulation")
 
 
@@ -45,7 +43,9 @@ def generate_gazebo_nodes(robot_config: dict) -> list:
     Returns:
         List of launch actions for Gazebo simulation.
     """
-    adapter = get_sim_backend("gazebo")
+    from robot_config.launch_builders import sim_backend as sim_backend_module
+
+    adapter = sim_backend_module.get_sim_backend("gazebo")
     actions, _ = adapter.start_backend(robot_config)
     actions += adapter.spawn_peripheral_bridges(robot_config.get("peripherals", []))
     return actions
@@ -76,6 +76,12 @@ def build_simulation(context: LaunchBuildContext) -> BuildResult:
     into it for the create-entity arguments; those local writes never
     leak back to the shared context or later entries.
     """
+    if context.simulation_startup is not None:
+        # Pre-seeded by the orchestrator's pre-binding world bootstrap
+        # (runtime-simulation-transport D3b): the world is already starting
+        # ahead of the provider readiness wait, so this second plan pass
+        # contributes no actions and re-uses the resolved startup verbatim.
+        return BuildResult(simulation_startup=context.simulation_startup)
     if not context.use_sim:
         # Hardware launch: no simulation backend processes (legacy section 5
         # ran only for use_sim and not benchmark and not provider).
@@ -88,6 +94,22 @@ def build_simulation(context: LaunchBuildContext) -> BuildResult:
         logger.info("benchmark target: skipping simulation backend (SimBackendAdapter)")
         return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
     if runtime_provider_name(context):
+        if context.sim_platform == "gazebo":
+            # D4: generic launch owns the world only; the provider owns the
+            # embodiment (description, entity, controllers, sensors, facade).
+            # get_sim_backend resolves at call time (monkeypatch seam).
+            from robot_config.launch_builders import sim_backend as sim_backend_module
+
+            robot_config = context.robot_config
+            private_config = isolated_config(robot_config)
+            logger.info("========== Generating Gazebo World (provider hand-off) ==========")
+            sim_adapter = sim_backend_module.get_sim_backend("gazebo")
+            actions, world_name, spawn_pose = sim_adapter.start_world_only(private_config)
+            logger.info(f"World-only Gazebo: world={world_name!r}, spawn_pose={spawn_pose}")
+            return BuildResult(
+                actions=actions,
+                simulation_startup=SimulationStartup(entity_action=None, world_name=world_name, spawn_pose=spawn_pose),
+            )
         logger.info("runtime.provider active: simulation transport owned by the robot runtime")
         return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
 
@@ -100,9 +122,11 @@ def build_simulation(context: LaunchBuildContext) -> BuildResult:
     logger.info("========== Generating Simulation Nodes ==========")
     logger.info(f"Sim platform: {sim_platform}")
     try:
-        from robot_config.launch_builders.sim_backend import get_sim_backend
+        # Call-time resolution keeps the monkeypatch seam (tests patch
+        # robot_config.launch_builders.sim_backend.get_sim_backend).
+        from robot_config.launch_builders import sim_backend as sim_backend_module
 
-        sim_adapter = get_sim_backend(sim_platform)
+        sim_adapter = sim_backend_module.get_sim_backend(sim_platform)
         sim_nodes, create_entity = sim_adapter.start_backend(private_config)
         sim_nodes += sim_adapter.spawn_peripheral_bridges(private_config.get("peripherals", []))
         actions.extend(sim_nodes)

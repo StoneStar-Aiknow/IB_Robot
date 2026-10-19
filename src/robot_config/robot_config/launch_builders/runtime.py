@@ -119,11 +119,20 @@ def generate_runtime_provider_actions(
     robot_config: dict[str, Any],
     *,
     use_sim: bool,
+    sim_platform: str = "sdk",
+    simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
     description_output: str | None = None,
 ) -> tuple[list, Node]:
-    """Return (provider launch include, wait_for_runtime readiness/reconciliation node)."""
+    """Return (provider launch include, wait_for_runtime readiness/reconciliation node).
+
+    Generic launch emits exactly one consistent transport selection
+    (runtime-simulation-transport D1/D3): ``transport:=gazebo`` (with the
+    resolved world name and the full spawn pose from ``simulation_startup``,
+    never the boolean alias) for the Gazebo platform, and the legacy
+    ``simulated:=true|false`` unchanged for sdk/hardware.
+    """
     provider = runtime_provider(robot_config)
     if not provider:
         raise RuntimeError("robot.runtime.provider is required for runtime-provider bring-up")
@@ -142,26 +151,50 @@ def generate_runtime_provider_actions(
     mode_config = (robot_config.get("control_modes") or {}).get(mode_name) or {}
     runtime_mode = str(mode_config.get("runtime_mode", "") or "").strip()
     initial_mode = "trajectory" if runtime_mode == "trajectory" else ""
-    logger.info(
-        f"runtime.provider={provider}: including {launch_path} "
-        f"(profile={profile}, simulated={use_sim}, initial_mode={initial_mode or 'profile default'}, "
-        f"peripherals={peripherals_file or 'profile defaults'})"
-    )
+    include_arguments: dict[str, str] = {
+        "profile": profile,
+        "display": "true" if display else "false",
+        "peripherals": peripherals_file,
+        **({"initial_mode": initial_mode} if initial_mode else {}),
+        **(
+            {"instance_id": str(robot_config["runtime"]["instance_id"])}
+            if (robot_config.get("runtime") or {}).get("instance_id")
+            else {}
+        ),
+    }
+    if use_sim and str(sim_platform).lower() == "gazebo":
+        # D3: the world owner hands the provider the resolved world name and
+        # spawn pose (x, y, z, yaw) — nothing is recomputed here. An empty
+        # world name means the provider starts its own minimal empty world.
+        startup = simulation_startup
+        world_name = str(getattr(startup, "world_name", "") or "")
+        spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
+        include_arguments.update(
+            {
+                "transport": "gazebo",
+                "gazebo_world": world_name,
+                "spawn_x": str(spawn_pose[0]),
+                "spawn_y": str(spawn_pose[1]),
+                "spawn_z": str(spawn_pose[2]),
+                "spawn_yaw": str(spawn_pose[3]),
+            }
+        )
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, transport=gazebo, world={world_name!r}, spawn={spawn_pose}, "
+            f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
+        )
+    else:
+        include_arguments["simulated"] = "true" if use_sim else "false"
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, simulated={use_sim}, initial_mode={initial_mode or 'profile default'}, "
+            f"peripherals={peripherals_file or 'profile defaults'})"
+        )
 
     include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(launch_path),
-        launch_arguments={
-            "profile": profile,
-            "simulated": "true" if use_sim else "false",
-            "display": "true" if display else "false",
-            "peripherals": peripherals_file,
-            **({"initial_mode": initial_mode} if initial_mode else {}),
-            **(
-                {"instance_id": str(robot_config["runtime"]["instance_id"])}
-                if (robot_config.get("runtime") or {}).get("instance_id")
-                else {}
-            ),
-        }.items(),
+        launch_arguments=include_arguments.items(),
     )
     required = required_capabilities(robot_config)
     interface_ids = required_interface_ids(robot_config) if description_output else []
@@ -218,10 +251,18 @@ def generate_bound_runtime_actions(
     construct_consumers,
     *,
     use_sim: bool,
+    sim_platform: str = "sdk",
+    simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
 ) -> list:
-    """Start the provider once; only construct consumers after the live description is bound."""
+    """Start the provider once; only construct consumers after the live description is bound.
+
+    ``simulation_startup`` carries the world hand-off for a physics transport
+    (runtime-simulation-transport D3): the world generic launch started ahead
+    of this call is passed to the provider as ``gazebo_world`` plus the full
+    spawn pose instead of being recomputed or re-launched.
+    """
     directory = Path(tempfile.mkdtemp(prefix="ibrobot_interfaces_"))
     description_path = directory / "description.yaml"
     effective_path = directory / "robot.yaml"
@@ -229,6 +270,8 @@ def generate_bound_runtime_actions(
         providers, waiter = generate_runtime_provider_actions(
             robot_config,
             use_sim=use_sim,
+            sim_platform=sim_platform,
+            simulation_startup=simulation_startup,
             display=display,
             readiness_timeout_s=readiness_timeout_s,
             description_output=str(description_path),

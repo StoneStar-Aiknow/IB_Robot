@@ -1,0 +1,20 @@
+# SO-101 single-arm application configuration for the pick_banana scene.
+#
+# Overlay of so101_single_arm: identical application contract, but simulation
+# runs on the Gazebo transport with the sim_models pick_banana scene (table,
+# banana, plate). Generic launch owns the world (scene + robot spawn pose) and
+# hands both to the SO-101 runtime provider; scene choice is configuration,
+# not a CLI argument (runtime-simulation-transport D8).
+
+robot:
+  name: so101_single_arm
+  base_config: so101_single_arm.yaml
+
+  simulation:
+    platform: gazebo
+    scene: pick_banana
+    robot_spawn:
+      x: 0.0
+      y: 0.30
+      z: -0.03
+    sim_models_pkg: sim_models

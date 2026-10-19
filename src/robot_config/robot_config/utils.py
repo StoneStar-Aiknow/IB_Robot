@@ -122,6 +122,29 @@ def prepare_writable_file_path(path):
     return resolved_path
 
 
+#: Simulation platforms the runtime-provider path supports
+#: (runtime-simulation-transport D4): ``sdk`` delegates the whole transport
+#: to the provider as before; ``gazebo`` starts the world only.
+PROVIDER_SIM_PLATFORMS = ("sdk", "gazebo")
+
+
+def provider_sim_platform_error(sim_platform: str, provider: str) -> str:
+    """Shared provider/simulation-platform predicate (D4).
+
+    Returns '' when the combination is supported, else an error naming the
+    platform and the provider. Loader validation and launch preparation both
+    call this one predicate so the two gates cannot drift.
+    """
+    platform = str(sim_platform or "").strip().lower()
+    if platform in PROVIDER_SIM_PLATFORMS:
+        return ""
+    return (
+        f"runtime.provider={provider} supports simulation.platform in {list(PROVIDER_SIM_PLATFORMS)} only "
+        f"(got {platform!r}): sdk delegates the transport to the provider, gazebo starts the world only; "
+        "MuJoCo and the legacy mock backend are not interchangeable with a provider transport"
+    )
+
+
 def parse_bool(value, default=False):
     """Parse various value types to boolean with robust handling.
 

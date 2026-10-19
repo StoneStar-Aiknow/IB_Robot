@@ -119,11 +119,32 @@ def test_default_loader_uses_robot_config_environment_path(monkeypatch):
 )
 def test_agent_profiles_drop_disabled_peripherals_from_all_contract_views(config_name):
     config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
-    # Agent profiles overlay the provider-bound so101_single_arm; offline
-    # loading defers the live interface binding but still filters peripherals.
+    # Agent profiles overlay the provider-bound so101_single_arm. Since the
+    # deployment-toggle change (runtime-simulation-transport D8) the loader
+    # KEEPS the toggle-only entries so the runtime fragment carries the
+    # enable/disable selections; every contract view the runtime builds drops
+    # the disabled cameras through the shared peripheral merge.
     config = load_robot_config_dict(config_path, defer_interface_binding=True)
 
-    assert all(not item.get("disabled", False) for item in config.get("peripherals", []))
+    from robot_runtime.interface_description import merge_peripherals
+
+    peripherals = config.get("peripherals", [])
+    # toggle-only overrides: no driver or device settings may ride along
+    assert all(set(item) <= {"type", "name", "enabled", "disabled"} for item in peripherals)
+    # and the effective inventory the runtime and its description build from
+    # is exactly the runtime-declared cameras minus the disabled ones
+    declared = {"top", "wrist", "front"}
+    effective = merge_peripherals(
+        [
+            {"type": "camera", "name": name, "driver": "opencv" if name != "front" else "realsense"}
+            for name in sorted(declared)
+        ],
+        peripherals,
+    )
+    disabled_names = {
+        item["name"] for item in peripherals if item.get("disabled", False) or not item.get("enabled", True)
+    }
+    assert {item["name"] for item in effective} == declared - disabled_names
     assert config.get("contract", {}).get("observations", []) == []
 
 

@@ -200,6 +200,23 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
     """Design phase 0: runtime target, provider, sim platform, backend caps."""
     use_sim_str = arguments["use_sim"]
     requested_use_sim = None if use_sim_str == "" else parse_bool(use_sim_str, default=False)
+    sim_platform_override = arguments["sim_platform"].strip()
+    if sim_platform_override and requested_use_sim is False:
+        # Same rule as the runtime entries (runtime-simulation-platform spec,
+        # "Generic launch applies the same selection rules"): physical
+        # execution cannot carry a platform, and the conflict must fail
+        # before any process starts.
+        raise PreparationError(
+            f"physical execution (use_sim:=false) cannot select sim_platform:={sim_platform_override!r}; "
+            "pass at most one"
+        )
+    if sim_platform_override and requested_use_sim is None:
+        # A command-line platform alone selects simulation — before the
+        # runtime target is decided, so the include keeps the platform
+        # instead of silently taking the hardware path. A platform that only
+        # comes from the configuration's simulation.platform does NOT select
+        # simulation (that stays resolved exactly as before).
+        requested_use_sim = True
     runtime_target = resolve_runtime_target(robot_config, arguments["runtime_target"], requested_use_sim)
     use_sim = runtime_target is not RuntimeTarget.HARDWARE
     is_benchmark = runtime_target is RuntimeTarget.BENCHMARK
@@ -213,22 +230,27 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
 
     from robot_config.launch_builders.runtime import runtime_provider
     from robot_config.launch_builders.sim_backend import get_backend_caps
+    from robot_config.utils import provider_sim_platform_error
 
     runtime_provider_name = runtime_provider(robot_config)
     sim_platform = str(
         robot_config.get("simulation", {}).get("platform", "sdk" if runtime_provider_name else "gazebo")
     ).lower()
-    sim_platform_override = arguments["sim_platform"]
     if sim_platform_override:
         logger.info(f"CLI override: simulation.platform={sim_platform_override} (was {sim_platform})")
         sim_platform = sim_platform_override
         robot_config.setdefault("simulation", {})["platform"] = sim_platform
     if runtime_provider_name and not is_benchmark:
-        if sim_platform != "sdk":
-            raise PreparationError(
-                "runtime.provider requires sim_platform:=sdk; physics and legacy mock are unsupported"
-            )
-        backend_caps = {"provides_clock": False, "needs_ros2_control": False}
+        platform_error = provider_sim_platform_error(sim_platform, runtime_provider_name)
+        if platform_error:
+            raise PreparationError(platform_error)
+        if sim_platform == "gazebo":
+            # D4: generic launch owns the world only; the provider owns the
+            # embodiment. The world provides the clock, but ros2_control and
+            # the entity are the provider's, so generic never spawns them.
+            backend_caps = {"provides_clock": True, "needs_ros2_control": False}
+        else:
+            backend_caps = {"provides_clock": False, "needs_ros2_control": False}
     elif is_benchmark:
         backend_caps = {"provides_clock": False, "needs_ros2_control": False}
     else:
@@ -630,8 +652,13 @@ def prepare_launch(
             raise PreparationError(
                 "Live logical interface binding requires runtime.provider and a non-benchmark target"
             )
-        # Provider simulation is an SDK transport, not a Gazebo /clock owner.
-        node_use_sim_time = False
+        # Bound consumers follow the transport clock (D7): the SDK transport
+        # provides no /clock, so they run on wall time; a physics transport
+        # owns a /clock and the prepared node_use_sim_time (True for gazebo)
+        # stands. Hardware launches never reach the live-binding branch with
+        # use_sim.
+        if target_state["sim_platform"] == "sdk":
+            node_use_sim_time = False
         robot_config.setdefault("runtime", {})["target"] = target_state["runtime_target"].value
 
     context = LaunchBuildContext(

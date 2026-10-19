@@ -361,15 +361,37 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     if provider:
         if not profile:
             errors.append(f"runtime.profile is required when runtime.provider={provider!r}")
+        from robot_config.utils import provider_sim_platform_error
+
         sim_platform = str((robot_config.get("simulation") or {}).get("platform", "sdk")).lower()
-        if sim_platform != "sdk":
-            errors.append(
-                "runtime.provider supports simulation.platform=sdk only; "
-                "Gazebo, MuJoCo and legacy mock backends are not interchangeable with SDK simulated transport"
-            )
+        platform_error = provider_sim_platform_error(sim_platform, provider)
+        if platform_error:
+            errors.append(platform_error)
         if runtime.get("require_model"):
-            if robot_config.get("ros2_control") or robot_config.get("peripherals"):
+            if robot_config.get("ros2_control"):
                 errors.append("public runtime consumers must place hardware and peripherals in runtime.profile")
+            peripherals = robot_config.get("peripherals")
+            if peripherals:
+                # Deployment peripheral overrides on the provider path are
+                # toggle-only (runtime-simulation-transport D8): enabling or
+                # disabling a runtime-declared peripheral by (type, name).
+                # Anything that changes a driver or device settings belongs in
+                # the runtime profile; unknown names are rejected by the
+                # runtime's peripheral merge.
+                if not isinstance(peripherals, list):
+                    errors.append("peripherals must be a list")
+                else:
+                    for entry in peripherals:
+                        if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+                            errors.append("peripherals entries require type and name")
+                            continue
+                        extra_keys = sorted(set(entry) - {"type", "name", "enabled", "disabled"})
+                        if extra_keys:
+                            errors.append(
+                                f"peripheral ({entry.get('type')}, {entry.get('name')!r}) on a provider path "
+                                f"may only toggle enabled/disabled (unexpected keys: {extra_keys}); "
+                                "driver and device settings belong in the runtime profile"
+                            )
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
@@ -1916,9 +1938,16 @@ def load_robot_config_dict(
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
     peripherals = robot_config.get("peripherals", [])
     if isinstance(peripherals, list):
-        robot_config["peripherals"] = [
-            item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
-        ]
+        runtime = robot_config.get("runtime") or {}
+        provider_owns_peripherals = bool(runtime.get("provider") and runtime.get("require_model"))
+        if not provider_owns_peripherals:
+            robot_config["peripherals"] = [
+                item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
+            ]
+        # Provider configs keep their toggle-only peripheral entries so the
+        # deployment fragment handed to the runtime carries the enable/disable
+        # selections (runtime-simulation-transport D8); the runtime's merge
+        # applies the toggles to its declared peripherals.
     robot_config["_config_path"] = str(resolved_config_path)
     robot_config["_config_sources"] = [str(path) for path in config_sources]
     robot_config = resolve_robot_interfaces(robot_config, defer=defer_interface_binding)

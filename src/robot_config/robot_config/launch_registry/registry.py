@@ -295,10 +295,20 @@ class SimulationStartup:
     """Typed simulation output; owned by the single simulation entry.
 
     ``entity_action`` is the Gazebo ``ros_gz_sim create`` node consumed by
-    the controller-startup entry for the entity -> controller chain.
+    the controller-startup entry for the entity -> controller chain
+    (provider-less launches).
+
+    ``world_name`` and ``spawn_pose`` carry the world hand-off to a runtime
+    provider on a physics transport (runtime-simulation-transport D3):
+    generic launch owns the world and resolves the scene, so the provider
+    receives the resolved world name and the full robot spawn pose
+    (x, y, z, yaw) instead of recomputing them. Both stay empty/None when
+    generic launch owns no world (provider-less or sdk transports).
     """
 
     entity_action: Any = None
+    world_name: str = ""
+    spawn_pose: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True)

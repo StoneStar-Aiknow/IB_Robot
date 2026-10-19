@@ -658,8 +658,12 @@ def build_control(context: LaunchBuildContext) -> BuildResult:
         provider_actions, runtime_ready_waiter = generate_runtime_provider_actions(
             robot_config,
             use_sim=use_sim,
+            sim_platform=context.sim_platform,
+            simulation_startup=context.simulation_startup,
             display=resolve_display(context),
-            readiness_timeout_s=readiness_attribute("resolve_controller_startup_timeout")(robot_config, use_sim),
+            readiness_timeout_s=readiness_attribute("resolve_controller_startup_timeout")(
+                robot_config, use_sim, context.sim_platform
+            ),
         )
         actions.extend(provider_actions)
         logger.info(f"Added runtime provider include for {provider_name}")
@@ -705,6 +709,12 @@ CONTROL_BUILDER = BuilderSpec(
     id="control",
     factory=f"{__name__}:build_control",
     provides=("control_startup",),
+    # The provider include may need the world the simulation entry starts
+    # (runtime-simulation-transport D3b: on the non-binding branch the world
+    # must be running before the provider waits for its clock), so control
+    # builds after simulation; controller_startup already declares
+    # after=("control", "simulation") and stays after both.
+    after=("simulation",),
 )
 
 AUXILIARY_ACTUATORS_BUILDER = BuilderSpec(

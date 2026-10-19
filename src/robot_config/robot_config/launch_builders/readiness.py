@@ -72,8 +72,13 @@ def controller_readiness_barrier(deferred_spawners, readiness_waiter):
     return deferred_spawners[0] if deferred_spawners else readiness_waiter
 
 
-def resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> float:
-    """Resolve controller startup timeout from robot YAML."""
+def resolve_controller_startup_timeout(robot_config: dict, use_sim: bool, sim_platform: str = "") -> float:
+    """Resolve controller startup timeout from robot YAML.
+
+    The mapping may define a ``gazebo`` tier for physics transports
+    (runtime-simulation-transport D7: world boot + entity spawn + controllers
+    need more headroom than the SDK transport); it falls back to ``sim``.
+    """
     configured_timeout = robot_config.get("controller_startup_timeout")
     if configured_timeout is None:
         return 120.0 if use_sim else 30.0
@@ -81,7 +86,12 @@ def resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> flo
     timeout_value = configured_timeout
     if isinstance(configured_timeout, dict):
         profile_key = "sim" if use_sim else "hardware"
-        timeout_value = configured_timeout.get(profile_key)
+        if use_sim and str(sim_platform).lower() == "gazebo":
+            timeout_value = configured_timeout.get("gazebo")
+            if timeout_value is None:
+                timeout_value = configured_timeout.get("sim")
+        else:
+            timeout_value = configured_timeout.get(profile_key)
         if timeout_value is None:
             timeout_value = configured_timeout.get("default")
 

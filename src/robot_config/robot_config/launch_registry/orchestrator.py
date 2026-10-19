@@ -163,8 +163,31 @@ def build_prepared_launch(
     # callback only builds the already-frozen plan against the bound
     # effective config and never re-filters registry entries.
     import robot_config.launch_builders.runtime as runtime_module
+    from robot_config.launch_registry.registry import resolve_builder_factory
 
     robot_config = context.robot_config
+
+    # Pre-binding world bootstrap (runtime-simulation-transport D3b): on the
+    # gazebo transport the world must exist BEFORE the provider readiness
+    # wait — the provider cannot become ready without it, and the plan (which
+    # owns the simulation entry) only runs inside construct_consumers after
+    # readiness. Execute the simulation builder once here, ahead of the
+    # provider include, and pre-seed its SimulationStartup into the context so
+    # the second plan pass reuses the resolved world without re-launching it.
+    world_prelude: list[Any] = []
+    simulation_startup = None
+    if prepared.use_sim and prepared.sim_platform == "gazebo":
+        sim_spec = next((spec for spec in plan.specs if spec.id == "simulation"), None)
+        if sim_spec is not None:
+            world_result = resolve_builder_factory(sim_spec.factory)(context)
+            world_prelude = list(world_result.actions)
+            simulation_startup = world_result.simulation_startup
+            if simulation_startup is not None:
+                context.simulation_startup = simulation_startup
+            logger.info(
+                "Pre-binding world bootstrap: "
+                f"{len(world_prelude)} world action(s) ahead of the provider readiness wait"
+            )
 
     def construct_consumers(effective):
         # Deferred-consumer DDS re-check (upstream robot.launch.py semantics):
@@ -182,10 +205,15 @@ def build_prepared_launch(
 
     # The controller startup timeout resolves only on this real
     # provider/binding consumption path (never for benchmark/mock skips).
-    return runtime_module.generate_bound_runtime_actions(
+    bound_actions = runtime_module.generate_bound_runtime_actions(
         robot_config,
         construct_consumers,
         use_sim=prepared.use_sim,
+        sim_platform=prepared.sim_platform,
+        simulation_startup=simulation_startup,
         display=parse_bool(prepared.arguments.get("moveit_display", "false"), default=False),
-        readiness_timeout_s=_readiness_attribute("resolve_controller_startup_timeout")(robot_config, prepared.use_sim),
+        readiness_timeout_s=_readiness_attribute("resolve_controller_startup_timeout")(
+            robot_config, prepared.use_sim, prepared.sim_platform
+        ),
     )
+    return [*world_prelude, *bound_actions]

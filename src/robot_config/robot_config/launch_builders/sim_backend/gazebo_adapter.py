@@ -63,6 +63,52 @@ def _start_actions_on_success(start_actions, success_message: str, failure_reaso
     return _handler
 
 
+def _gazebo_gui_env_actions(robot_config: dict) -> list:
+    """Optional GUI / EGL workaround env actions (shared by both Gazebo modes)."""
+    actions = []
+    gz_gui = robot_config.get("gazebo_gui") or {}
+    qt_platform = gz_gui.get("qt_platform") or robot_config.get("gazebo_qt_platform")
+    if qt_platform:
+        actions.append(SetEnvironmentVariable("QT_QPA_PLATFORM", str(qt_platform)))
+        logger.info(f"Gazebo GUI: QT_QPA_PLATFORM={qt_platform}")
+    libgl_sw = gz_gui.get("libgl_always_software", robot_config.get("gazebo_libgl_always_software"))
+    if parse_bool(libgl_sw, default=False):
+        actions.append(SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "1"))
+        logger.info(
+            "Gazebo GUI: LIBGL_ALWAYS_SOFTWARE=1 "
+            "(software GL; set gazebo_gui.libgl_always_software: false if GPU view works)"
+        )
+    return actions
+
+
+def _gz_server_include(gz_args: str):
+    """The ros_gz_sim server launch with the given gz_args."""
+    return IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution(
+                [
+                    FindPackageShare("ros_gz_sim"),
+                    "launch",
+                    "gz_sim.launch.py",
+                ]
+            )
+        ),
+        launch_arguments={"gz_args": gz_args}.items(),
+    )
+
+
+def _headless_prefix() -> str:
+    """IBROBOT_GAZEBO_HEADLESS=1 switches to server-only headless mode (no GUI,
+    no rendering window). Used by sim_camera_adjuster when the primary
+    simulator is MuJoCo and a parallel Gazebo stack is spawned purely for
+    camera pose calibration. Default (env unset) preserves the normal Gazebo
+    UX exactly."""
+    if os.environ.get("IBROBOT_GAZEBO_HEADLESS", "0") == "1":
+        logger.info("IBROBOT_GAZEBO_HEADLESS=1 -> Gazebo server-only headless mode")
+        return "-s --headless-rendering "
+    return ""
+
+
 class GazeboAdapter(SimBackendAdapter):
     """Gazebo Ignition simulation backend.
 
@@ -77,6 +123,91 @@ class GazeboAdapter(SimBackendAdapter):
 
     provides_clock = True
     needs_ros2_control = True
+
+    def _resolve_world_and_spawn(self, robot_config: dict) -> tuple[str, dict]:
+        """Resolve the world file and the robot spawn pose (shared by both modes).
+
+        Scene override: if simulation.scene is set, replace the default world
+        with the sim_models template (resolves mesh paths to absolute URIs).
+        The spawn pose comes from ``simulation.robot_spawn`` with the scene
+        layout as fallback (the legacy precedence); x/y/z are written back as
+        ``initial_pose_{x,y,z}`` for the provider-less create arguments. The
+        pose may additionally carry ``yaw`` (consumed by the world-only mode's
+        provider hand-off; the provider-less create keeps x/y/z only).
+        """
+        world_file = robot_config.get("world_file", "")
+        if not world_file:
+            world_file = "$(find robot_config)/config/worlds/simulation.world"
+        elif not world_file.startswith("$("):
+            world_file = f"$(find robot_config)/config/worlds/{world_file}"
+
+        world_path = resolve_ros_path(world_file)
+        spawn: dict = {}
+        _scene_name = robot_config.get("simulation", {}).get("scene")
+        if _scene_name:
+            try:
+                from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
+
+                world_path = str(get_gazebo_world_path(_scene_name))
+                logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
+                layout = get_scene_layout(_scene_name)
+                spawn = copy.deepcopy(
+                    robot_config.get("simulation", {}).get("robot_spawn", {}) or layout.get("robot_spawn", {})
+                )
+                for axis in ("x", "y", "z"):
+                    key = f"initial_pose_{axis}"
+                    if axis in spawn:
+                        robot_config[key] = spawn[axis]
+                        logger.info(f"scene robot_spawn.{axis} = {spawn[axis]}")
+            except ImportError:
+                logger.warning("sim_models not installed; ignoring simulation.scene")
+            except Exception as e:
+                logger.warning(f"scene '{_scene_name}' load failed: {e}; falling back to default world")
+
+        if not Path(world_path).exists():
+            logger.info(f"WARNING: World file not found at {world_path}")
+        return world_path, spawn
+
+    def start_world_only(self, robot_config: dict) -> tuple[list, str, tuple[float, float, float, float]]:
+        """World-only mode (runtime-simulation-transport D4): generic launch
+        owns the world for a runtime provider on the Gazebo transport.
+
+        Emits the GUI env workarounds, the scene-resolved Gazebo server and
+        the ``/clock`` bridge, and returns ``(actions, world_name,
+        spawn_pose)`` with the spawn pose (x, y, z, yaw) resolved with the
+        scene/``robot_spawn`` precedence. No ``create`` (the provider spawns
+        its own embodiment), no joint-state bridge and no camera bridges:
+        those are embodiment, owned by the provider. Scene assets resolve to
+        absolute mesh URIs inside the generated world, so no
+        description-derived resource paths are set (D7b: the provider's
+        description carries absolute ``file://`` mesh URIs itself).
+        """
+        actions: list = []
+        actions.extend(_gazebo_gui_env_actions(robot_config))
+        world_path, spawn = self._resolve_world_and_spawn(robot_config)
+
+        gazebo_world_name = robot_config.get("gazebo_world_name", "demo")
+        logger.info(f"Gazebo world name (world-only hand-off): {gazebo_world_name}")
+
+        headless_prefix = _headless_prefix()
+        gz_args = f"{headless_prefix}-r {world_path}"
+        actions.append(_gz_server_include(gz_args))
+        actions.append(
+            Node(
+                package="ros_gz_bridge",
+                executable="parameter_bridge",
+                arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
+                output="screen",
+            )
+        )
+        spawn_pose = (
+            float(spawn.get("x", 0.0)),
+            float(spawn.get("y", 0.0)),
+            float(spawn.get("z", 0.0)),
+            float(spawn.get("yaw", 0.0)),
+        )
+        self._gazebo_world_name = gazebo_world_name
+        return actions, gazebo_world_name, spawn_pose
 
     def start_backend(self, robot_config: dict) -> tuple:
         """Launch Gazebo and core infrastructure.
@@ -127,58 +258,10 @@ class GazeboAdapter(SimBackendAdapter):
             actions.append(SetEnvironmentVariable("GZ_SIM_MODEL_PATH", combined_model))
 
         # ---- Optional GUI / EGL workarounds ----
-        # Symptom: gray/empty 3D view while physics and ROS topics work; log may show
-        #   libEGL warning: egl: failed to create dri2 screen
-        # Enable via robot YAML ``gazebo_gui`` (see so101_single_arm.yaml).
-        gz_gui = robot_config.get("gazebo_gui") or {}
-        qt_platform = gz_gui.get("qt_platform") or robot_config.get("gazebo_qt_platform")
-        if qt_platform:
-            actions.append(SetEnvironmentVariable("QT_QPA_PLATFORM", str(qt_platform)))
-            logger.info(f"Gazebo GUI: QT_QPA_PLATFORM={qt_platform}")
-        libgl_sw = gz_gui.get("libgl_always_software", robot_config.get("gazebo_libgl_always_software"))
-        if parse_bool(libgl_sw, default=False):
-            actions.append(SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "1"))
-            logger.info(
-                "Gazebo GUI: LIBGL_ALWAYS_SOFTWARE=1 "
-                "(software GL; set gazebo_gui.libgl_always_software: false if GPU view works)"
-            )
+        actions.extend(_gazebo_gui_env_actions(robot_config))
 
-        # ---- World file resolution ----
-        world_file = robot_config.get("world_file", "")
-        if not world_file:
-            world_file = "$(find robot_config)/config/worlds/simulation.world"
-        elif not world_file.startswith("$("):
-            world_file = f"$(find robot_config)/config/worlds/{world_file}"
-
-        world_path = resolve_ros_path(world_file)
-
-        # Scene override: if simulation.scene is set, replace the default world
-        # with the sim_models template (resolves mesh paths to absolute URIs).
-        # Also applies robot_spawn from robot_config YAML (falling back to the
-        # scene layout for legacy scenes) to override initial_pose_{x,y,z}.
-        _scene_name = robot_config.get("simulation", {}).get("scene")
-        if _scene_name:
-            try:
-                from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
-
-                world_path = str(get_gazebo_world_path(_scene_name))
-                logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
-                layout = get_scene_layout(_scene_name)
-                spawn = copy.deepcopy(
-                    robot_config.get("simulation", {}).get("robot_spawn", {}) or layout.get("robot_spawn", {})
-                )
-                for axis in ("x", "y", "z"):
-                    key = f"initial_pose_{axis}"
-                    if axis in spawn:
-                        robot_config[key] = spawn[axis]
-                        logger.info(f"scene robot_spawn.{axis} = {spawn[axis]}")
-            except ImportError:
-                logger.warning("sim_models not installed; ignoring simulation.scene")
-            except Exception as e:
-                logger.warning(f"scene '{_scene_name}' load failed: {e}; falling back to default world")
-
-        if not Path(world_path).exists():
-            logger.info(f"WARNING: World file not found at {world_path}")
+        # ---- World file resolution (scene override + robot spawn) ----
+        world_path, _spawn = self._resolve_world_and_spawn(robot_config)
 
         # Must match <world name="..."> inside the loaded .world/.sdf (simulation.world uses "demo").
         # ros_gz_sim create: if -world is omitted, it picks worlds_msg.data(0) from /gazebo/worlds
@@ -231,36 +314,11 @@ class GazeboAdapter(SimBackendAdapter):
         )
 
         # ---- Gazebo server + GUI (must be listed before spawn; see below) ----
-        # IBROBOT_GAZEBO_HEADLESS=1 switches to server-only headless mode (no GUI,
-        # no rendering window).  Used by sim_camera_adjuster when the primary
-        # simulator is MuJoCo and a parallel Gazebo stack is spawned purely for
-        # camera pose calibration.  Default (env unset) preserves the normal
-        # Gazebo UX exactly.
-        headless_prefix = ""
-        if os.environ.get("IBROBOT_GAZEBO_HEADLESS", "0") == "1":
-            headless_prefix = "-s --headless-rendering "
-            logger.info("IBROBOT_GAZEBO_HEADLESS=1 -> Gazebo server-only headless mode")
-
-        gz_args = ""
         if Path(world_path).exists():
-            gz_args = f"{headless_prefix}-r {world_path}"
+            gz_args = f"{_headless_prefix()}-r {world_path}"
         else:
             logger.info("Using empty Gazebo world (world file not found)")
-            if headless_prefix:
-                gz_args = headless_prefix.strip()
-
-        gazebo_launch = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution(
-                    [
-                        FindPackageShare("ros_gz_sim"),
-                        "launch",
-                        "gz_sim.launch.py",
-                    ]
-                )
-            ),
-            launch_arguments={"gz_args": gz_args}.items(),
-        )
+            gz_args = _headless_prefix().strip()
 
         clock_ready_waiter = Node(
             package="robot_config",
@@ -279,7 +337,7 @@ class GazeboAdapter(SimBackendAdapter):
 
         actions.extend(
             [
-                gazebo_launch,
+                _gz_server_include(gz_args),
                 clock_bridge,
                 joint_state_bridge,
                 clock_ready_waiter,

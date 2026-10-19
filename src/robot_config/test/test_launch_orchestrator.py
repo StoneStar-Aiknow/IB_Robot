@@ -30,6 +30,7 @@ def _prepared(monkeypatch, entries, *, barrier=None, binding=False, arguments=No
         arguments=arguments or {},
         live_binding_required=binding,
         use_sim=True,
+        sim_platform="sdk",
         # The live-binding branch re-runs check_launch_dds against the
         # original launch context; give the fake prepared state a real one.
         launch_context=LaunchContext(),
@@ -184,3 +185,144 @@ def test_builder_exception_preserves_cause(monkeypatch):
     with pytest.raises(RuntimeError, match="'consumer'") as caught:
         build_prepared_launch(prepared)
     assert caught.value.__cause__ is error
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-binding world bootstrap (runtime-simulation-transport D3b, task 3.2b)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _gazebo_provider_prepared(monkeypatch, tmp_path, *, binding=True):
+    """A real prepared launch for a provider on the gazebo transport.
+
+    Drives the real launch entry preparation over the builtin registry with
+    the real simulation/control entries; only the provider launch file (and,
+    for the consumer pass, the live-description binding) is stubbed.
+    """
+    from robot_config.launch_registry.builtin_registry import build_launch_registry
+    from robot_config.launch_registry.preparation import prepare_launch
+
+    provider_launch = tmp_path / "runtime.launch.py"
+    provider_launch.write_text("# provider is not executed by this construction test\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "resolve_runtime_launch", lambda _provider: str(provider_launch))
+
+    loaded = {
+        "name": "consumer",
+        "runtime": {"provider": "test_robot", "profile": "so101_single_arm", "require_model": binding},
+        "simulation": {"platform": "gazebo", "scene": "pick_banana", "robot_spawn": {"x": 0.1, "y": 0.2, "z": -0.03}},
+    }
+    context = LaunchContext()
+    context.launch_configurations.update({"use_sim": "true", "sim_platform": ""})
+    return prepare_launch(context, build_launch_registry(entry_points=[]), loaded_config=loaded)
+
+
+def _sub_text(value):
+    if isinstance(value, tuple | list):
+        return "".join(_sub_text(item) for item in value)
+    return str(getattr(value, "text", value))
+
+
+def _include_summary(actions):
+    """(index, source_name, arguments) for each include; the gz server include
+    is identified by its ``gz_args`` argument (its launch source is a
+    PathJoinSubstitution whose str() carries no readable name)."""
+    from launch.actions import IncludeLaunchDescription
+
+    summaries = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, IncludeLaunchDescription):
+            continue
+        arguments = {_sub_text(key): _sub_text(value) for key, value in action.launch_arguments}
+        if "gz_args" in arguments:
+            name = "gz_sim.launch.py"
+        elif "profile" in arguments:
+            name = "provider runtime.launch.py"
+        else:
+            name = ""
+        summaries.append((index, name, arguments))
+    return summaries
+
+
+def _gz_server_count(actions):
+    return sum(1 for _index, name, args in _include_summary(actions) if "gz_sim.launch.py" in name)
+
+
+def test_binding_branch_starts_the_world_once_before_the_provider(monkeypatch, tmp_path):
+    """The real binding branch (D3b): exactly one gz server action, ordered
+    before the provider include, with the resolved world handed over."""
+    prepared = _gazebo_provider_prepared(monkeypatch, tmp_path, binding=True)
+    assert prepared.live_binding_required is True
+
+    actions = build_prepared_launch(prepared)
+    includes = _include_summary(actions)
+    gz_includes = [(index, args) for index, name, args in includes if "gz_sim.launch.py" in name]
+    assert len(gz_includes) == 1, f"expected exactly one gz server action, got {len(gz_includes)}"
+    provider_includes = [(index, args) for index, name, args in includes if "provider runtime.launch.py" in name]
+    assert len(provider_includes) == 1
+    world_index, _ = gz_includes[0]
+    provider_index, provider_args = provider_includes[0]
+    assert world_index < provider_index, "the world must start before the provider readiness wait"
+    assert provider_args["transport"] == "gazebo"
+    assert "simulated" not in provider_args
+    assert provider_args["gazebo_world"] == "demo"
+    assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.1", "0.2", "-0.03")
+
+
+def test_binding_branch_consumer_pass_does_not_relaunch_the_world(monkeypatch, tmp_path):
+    """Driving the real on_ready consumer callback: the second plan pass
+    reuses the pre-seeded SimulationStartup and emits no second world."""
+    import robot_config.launch_builders.runtime as runtime_module
+    import robot_runtime.interface_description as interface_description_module
+
+    prepared = _gazebo_provider_prepared(monkeypatch, tmp_path, binding=True)
+    actions = build_prepared_launch(prepared)
+
+    description = {
+        "schema_version": 1,
+        "robot": {"id": "test_robot", "type": "test", "runtime_name": "test_robot", "runtime_version": "0.1.0"},
+        "execution": "simulated",
+        "transport": "gazebo",
+        "interfaces": {},
+        "states": {},
+    }
+    from robot_runtime.interface_description import description_digest
+
+    description["digest"] = description_digest(description)
+    monkeypatch.setattr(interface_description_module, "load_description", lambda _path: description)
+    monkeypatch.setattr(runtime_module, "materialize_interface_config", lambda effective, _d, _p: effective)
+
+    from launch.event_handlers import OnProcessExit
+
+    handlers = [
+        action
+        for action in actions
+        if isinstance(action, RegisterEventHandler) and isinstance(action.event_handler, OnProcessExit)
+    ]
+    assert len(handlers) == 1, "the bound stream registers exactly one OnProcessExit handler (readiness)"
+    on_ready = handlers[0].event_handler._OnActionEventBase__on_event
+    consumer_actions = on_ready(_exit(None, 0), SimpleNamespace(is_shutdown=False))
+    assert _gz_server_count(actions) + _gz_server_count(consumer_actions or []) == 1, (
+        "the consumer pass must reuse the pre-seeded world, not relaunch it"
+    )
+
+
+def test_control_builds_after_simulation_in_the_frozen_plan(monkeypatch, tmp_path):
+    """D3b non-binding branch: the provider-including control entry builds
+    after the simulation entry (the world must run before the provider waits
+    for its clock); controller_startup stays after both."""
+    prepared = _gazebo_provider_prepared(monkeypatch, tmp_path, binding=False)
+    assert prepared.live_binding_required is False
+    order = [spec.id for spec in prepared.plan.specs]
+    assert "simulation" in order and "control" in order
+    assert order.index("simulation") < order.index("control")
+    assert "controller_startup" in order
+    assert order.index("control") < order.index("controller_startup")
+    assert order.index("simulation") < order.index("controller_startup")
+
+    # The non-binding stream keeps the same property: the world include is
+    # emitted before the provider include.
+    actions = build_prepared_launch(prepared)
+    includes = _include_summary(actions)
+    world = [index for index, name, _args in includes if "gz_sim.launch.py" in name]
+    provider = [index for index, name, _args in includes if "provider runtime.launch.py" in name]
+    assert len(world) == 1 and len(provider) == 1 and world[0] < provider[0]

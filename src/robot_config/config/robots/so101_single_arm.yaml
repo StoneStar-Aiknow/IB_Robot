@@ -13,8 +13,10 @@ robot:
   robot_type: so_101  # For LeRobot dataset metadata
 
   # Robot runtime provider (robot-runtime-packaging). simulation.platform=sdk
-  # selects the SDK simulated transport; Gazebo/MuJoCo/mock are not supported
-  # on the provider path.
+  # selects the SDK simulated transport; platform=gazebo (or
+  # sim_platform:=gazebo) starts the scene world through generic launch and
+  # runs the SO-101 runtime provider on the Gazebo transport (physics ×
+  # MoveIt planning). MuJoCo/mock are not supported on the provider path.
   simulation:
     platform: sdk
 
