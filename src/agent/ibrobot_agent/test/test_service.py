@@ -11,6 +11,7 @@ from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
 from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
+    CATALOG_SKILL_NAMES_ZH,
     AgentRequest,
     ExecutionResult,
     PlannerIdentity,
@@ -880,3 +881,95 @@ def test_step_schema_version_comes_from_the_catalog_contract():
         catalog = {"skills": [{"name": "wave_hello", "schema_version": bad}]}
         with pytest.raises(RuntimeError):
             bind(CanonicalWorkflowStep(1 if bad != 1 else 2, "wave_hello"))
+
+
+class NamedCatalog(FakeCatalog):
+    """A Gateway catalog carrying Chinese skill names, as the node's catalog adapter adds them."""
+
+    def get_catalog(self, status):
+        return {
+            "robot_name": "aimdk_x2",
+            "skills": [
+                {"name": "wave_hand", "planner_visible": True, "semantic_level": "skill"},
+                {"name": "handshake", "planner_visible": True, "semantic_level": "skill"},
+            ],
+            CATALOG_SKILL_NAMES_ZH: {"wave_hand": "挥手", "handshake": "握手"},
+        }
+
+
+class CatalogRecordingPlanner(FakePlanner):
+    def plan(self, request, context, catalog, cancel_token):
+        self.catalog = catalog
+        return super().plan(request, context, catalog, cancel_token)
+
+
+def test_plan_is_presented_with_the_chinese_catalog_names_of_its_steps(tmp_path):
+    # Observed on X2: the model summarized the plan as "wave_hand", the voice channel spoke
+    # that summary, and the Chinese TTS frontend rejected it, so the gesture reply was silent.
+    events = Events()
+    planner = CatalogRecordingPlanner(
+        PlannerOutcome(
+            kind="workflow",
+            user_message="准备执行：wave_hand、handshake。",
+            summary="wave_hand、handshake",
+            steps=(CanonicalWorkflowStep(1, "wave_hand"), CanonicalWorkflowStep(1, "handshake")),
+        )
+    )
+    service = AgentService(
+        planner=planner,
+        catalog=NamedCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        execution=FakeExecution(execution_mode=ASYNC_PRESENTATION_MODE),
+        presentation=ModeRoutingPresentationPort(
+            async_port=AsyncPresentationPort(), legacy_port=PresentationGate(0.05)
+        ),
+        event_sink=events,
+        execution_enabled=True,
+        allowed_skills={"wave_hand", "handshake"},
+    )
+    try:
+        request = _request(text="挥手然后握手")
+        assert service.send_message(request).accepted
+        assert _wait_state(service, request.to_key(), {"SUCCEEDED"}).state == "SUCCEEDED"
+        presentation = next(event for event in events.items if event.event_type == "presentation")
+        assert presentation.detail["presentation"]["summary"] == "挥手、握手"
+        # The names only word replies: what the planner is given is unchanged.
+        assert CATALOG_SKILL_NAMES_ZH not in planner.catalog
+    finally:
+        service.close()
+
+
+def test_plan_summary_is_kept_when_a_step_has_no_chinese_catalog_name():
+    """A partly named plan is never partly rewritten; a renderer that cannot use it fails visibly."""
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="执行",
+        summary="wave_hand、nav_turn",
+        steps=(CanonicalWorkflowStep(1, "wave_hand"), CanonicalWorkflowStep(1, "nav_turn")),
+    )
+
+    for catalog in ({CATALOG_SKILL_NAMES_ZH: {"wave_hand": "挥手"}}, {}):
+        assert AgentService._bind_summary_to_catalog_names(outcome, catalog).summary == "wave_hand、nav_turn"
+
+
+def test_skill_list_names_skills_the_way_plans_do(tmp_path):
+    class PartlyNamedCatalog(NamedCatalog):
+        def get_catalog(self, status):
+            catalog = super().get_catalog(status)
+            catalog["skills"].append({"name": "nav_turn", "planner_visible": True, "semantic_level": "skill"})
+            return catalog
+
+    service = AgentService(
+        planner=FakePlanner(PlannerOutcome(kind="conversation", user_message="unused")),
+        catalog=PartlyNamedCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+    )
+    try:
+        request = _request(text="当前有哪些技能")
+        assert service.send_message(request).accepted
+        record = _wait_state(service, request.to_key(), {"ANSWERED"})
+        # A skill without a Chinese name keeps its own name instead of being left out.
+        assert record.terminal.message == "当前可规划技能：握手、nav_turn、挥手。"
+    finally:
+        service.close()

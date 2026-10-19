@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -31,6 +32,7 @@ from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
 from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
+    CATALOG_SKILL_NAMES_ZH,
     GATED_PRESENTATION_MODE,
     MAX_REQUEST_JSON_BYTES,
     TERMINAL_REQUEST_STATES,
@@ -163,7 +165,33 @@ class _RosBridgeCatalog:
         view["registry_epoch"] = str(status.get("registry_epoch", ""))
         view["registry_generation"] = int(status.get("registry_generation", 0))
         view["registry_digest"] = str(status.get("registry_digest", ""))
+        view[CATALOG_SKILL_NAMES_ZH] = _chinese_skill_names(snapshot, status)
         return view
+
+
+def _chinese_skill_names(snapshot, status) -> dict[str, str]:
+    """Name each skill by its first Chinese alias (the first ``aliases_zh`` entry of its manifest).
+
+    Aliases are not part of the public capability view, so they are read through the catalog's
+    own verified consumer. They only word user-facing text: a snapshot they cannot be read from
+    leaves that text as the planner wrote it, and planning and execution never depend on them.
+    """
+    from skill_catalog.consumer import CatalogIdentity, verify_snapshot_response
+
+    identity = CatalogIdentity(
+        str(status["registry_epoch"]), int(status["registry_generation"]), str(status["registry_digest"])
+    )
+    try:
+        aliases = verify_snapshot_response(SimpleNamespace(**snapshot), identity).aliases
+    except (AttributeError, TypeError, ValueError) as exc:
+        _trace.warning("skill aliases are unavailable; replies keep skill names: %s", exc)
+        return {}
+    names = {}
+    for skill_name, values in aliases.items():
+        chinese = next((alias for alias in values if any(0x4E00 <= ord(char) <= 0x9FFF for char in alias)), None)
+        if chinese:
+            names[str(skill_name)] = chinese
+    return names
 
 
 def _program_terminal_detail(result) -> dict:

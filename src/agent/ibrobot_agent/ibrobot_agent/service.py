@@ -24,6 +24,7 @@ from ibrobot_agent.continuation import (
 )
 from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
+    CATALOG_SKILL_NAMES_ZH,
     AgentEvent,
     AgentRequest,
     CatalogPort,
@@ -46,6 +47,18 @@ from ibrobot_agent.planner import RulePlanner, read_only_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _trace = create_trace_logger("ib_trace.agent")
+
+
+def _chinese_skill_name(catalog: Mapping[str, Any], skill_name: str) -> str | None:
+    """The skill's Chinese catalog name, or None when the catalog does not give one."""
+    names = catalog.get(CATALOG_SKILL_NAMES_ZH)
+    name = names.get(skill_name) if isinstance(names, Mapping) else None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _planner_catalog(catalog: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The catalog as the planner sees it: Chinese skill names word replies, never plans."""
+    return {key: value for key, value in catalog.items() if key != CATALOG_SKILL_NAMES_ZH}
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -389,7 +402,9 @@ class AgentService:
                 outcome = query
             else:
                 with trace_stage(_trace, "agent.planner", request_id=request.request_id):
-                    outcome = self._planner.plan(planned_request, planner_context, catalog, cancel_token)
+                    outcome = self._planner.plan(
+                        planned_request, planner_context, _planner_catalog(catalog), cancel_token
+                    )
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
@@ -416,6 +431,7 @@ class AgentService:
                 raise RuntimeError("Gateway control plane is not ready")
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)
+            outcome = self._bind_summary_to_catalog_names(outcome, catalog)
             identity = RegistryIdentity(
                 epoch=str(status["registry_epoch"]),
                 generation=int(status["registry_generation"]),
@@ -562,7 +578,10 @@ class AgentService:
                 for item in catalog.get("skills", [])
                 if isinstance(item, Mapping) and item.get("planner_visible") is True and item.get("name")
             )
-            return AgentService._bounded_list_message("当前可规划技能", names)
+            # Spoken like plan summaries: the Chinese catalog name when there is one, else the skill name.
+            return AgentService._bounded_list_message(
+                "当前可规划技能", [_chinese_skill_name(catalog, name) or name for name in names]
+            )
         if outcome.query_kind == "list_poses":
             poses = [str(name) for name in catalog.get("pose_names", [])]
             return AgentService._bounded_list_message("当前命名姿态", sorted(poses))
@@ -640,6 +659,28 @@ class AgentService:
                 _LOGGER.info("bound %s to catalog schema_version %d", step.skill_name, expected)
             steps.append(step)
         return dataclasses.replace(outcome, steps=tuple(steps))
+
+    @staticmethod
+    def _bind_summary_to_catalog_names(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:
+        """Name the workflow by its steps' Chinese catalog names, not by the model's text.
+
+        The summary is what clients render before the robot moves (the voice channel speaks
+        it), so like the step schema versions it is taken from the catalog for exactly the
+        validated steps.  When a step has no Chinese name the planner's summary is kept as
+        is: it is never partly rewritten, and a renderer that cannot use it fails visibly.
+        """
+        names = [_chinese_skill_name(catalog, step.skill_name) for step in outcome.steps]
+        if not names or None in names:
+            return outcome
+        summary = "、".join(names)
+        try:
+            bound = dataclasses.replace(outcome, summary=summary)
+        except ValueError:
+            # Longer than the summary contract allows.
+            return outcome
+        if summary != outcome.summary:
+            _LOGGER.info("bound workflow summary %r to catalog names %r", outcome.summary, summary)
+        return bound
 
     def _present(
         self,

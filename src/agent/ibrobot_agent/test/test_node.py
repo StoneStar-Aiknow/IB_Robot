@@ -745,3 +745,40 @@ def test_node_binds_runtime_identity_and_answers_read_only(tmp_path):
         node.close()
         node.destroy_node()
         rclpy.shutdown(context=context)
+
+
+def test_gateway_catalog_names_every_x2_skill_by_its_chinese_alias():
+    """The X2 voice loop speaks plans and skill lists with these names, read from the manifests."""
+    from ibrobot_agent.contracts import CATALOG_SKILL_NAMES_ZH
+    from ibrobot_agent.node import _RosBridgeCatalog
+    from robot_config.config_path import resolve_robot_config_path
+    from robot_config.loader import load_robot_config_dict
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    config_path = resolve_robot_config_path(config_name="aimdk_x2_voice_agent")
+    snapshot = compile_local_snapshot(load_robot_config_dict(config_path, defer_interface_binding=True), config_path)
+
+    class _SnapshotBridge:
+        def get_skill_snapshot(self, **kwargs):
+            # The shape RosBridge.get_skill_snapshot returns for the Gateway's GetSkillSnapshot.
+            return {
+                "success": True,
+                "registry_epoch": "epoch",
+                "generation": 1,
+                "registry_digest": snapshot.registry_digest,
+                "capability_digest": snapshot.capability_digest,
+                "source_release_digest": "",
+                "provenance_digest": snapshot.provenance_digest,
+                "profile_name": snapshot.profile_name,
+                "snapshot_json": snapshot.snapshot_json,
+                "error_code": "",
+                "message": "",
+            }
+
+    status = {"registry_epoch": "epoch", "registry_generation": 1, "registry_digest": snapshot.registry_digest}
+    catalog = _RosBridgeCatalog(_SnapshotBridge(), rpc_timeout_sec=1.0).get_catalog(status)
+
+    names = catalog[CATALOG_SKILL_NAMES_ZH]
+    # Every gesture the X2 planner can pick has one, so no X2 plan summary falls back to a skill id.
+    assert {skill["name"] for skill in catalog["skills"] if skill["planner_visible"]} <= set(names)
+    assert names["wave_hand"] == "挥手"

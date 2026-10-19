@@ -24,6 +24,9 @@ MAX_REQUEST_JSON_BYTES = 64 * 1024
 ASYNC_PRESENTATION_MODE = "direct_execute_async_presentation"
 # Legacy Agent Plan mode: execution waits for an exact-plan display receipt.
 GATED_PRESENTATION_MODE = "immediate_after_presentation"
+# Catalog key holding each skill's Chinese name (the first ``aliases_zh`` entry of its
+# manifest). It only words user-facing text; the planner never sees it.
+CATALOG_SKILL_NAMES_ZH = "skill_names_zh"
 
 QueryKind = Literal["status", "list_skills", "describe_skill", "list_poses"]
 PlanKind = Literal[1, 2]
@@ -784,6 +787,7 @@ def request_hash_text(request: AgentRequest) -> str:
 
 __all__ = [
     "ASYNC_PRESENTATION_MODE",
+    "CATALOG_SKILL_NAMES_ZH",
     "GATED_PRESENTATION_MODE",
     "AdmissionResult",
     "AgentEvent",
