@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -140,8 +141,22 @@ class Caller(Node):
 
 @pytest.fixture(scope="module")
 def stack(tmp_path_factory):
-    os.environ.setdefault("ROS_DOMAIN_ID", "48")
-    os.environ.setdefault("ROS_LOCALHOST_ONLY", "1")
+    # Own DDS domain: colcon runs this package's whole suite in one process
+    # (the pytest extra is declared in setup.py), and torn-down runtimes from
+    # the other suites leave ghost endpoints on the shared per-process domain
+    # that flip this suite's "unreachable cancel service" expectations into
+    # 5-second call timeouts. Reserve a fresh domain through the same
+    # coordinator the root conftest uses instead of a fixed ID, so concurrent
+    # workspaces never collide; restore the per-process domain afterwards.
+    previous_domain = os.environ.get("ROS_DOMAIN_ID")
+    reservation = contextlib.ExitStack()
+    try:
+        from domain_coordinator import domain_id as reserve_domain_id
+    except ImportError:
+        pass
+    else:
+        os.environ["ROS_DOMAIN_ID"] = str(reservation.enter_context(reserve_domain_id()))
+    os.environ["ROS_LOCALHOST_ONLY"] = "1"
     profile_path = tmp_path_factory.mktemp("profile") / "runtime.yaml"
     profile_path.write_text(yaml.safe_dump(PROFILE), encoding="utf-8")
     rclpy.init()
@@ -165,6 +180,11 @@ def stack(tmp_path_factory):
     executor.shutdown(timeout_sec=2.0)
     caller.destroy_node()
     rclpy.shutdown()
+    reservation.close()
+    if previous_domain is None:
+        os.environ.pop("ROS_DOMAIN_ID", None)
+    else:
+        os.environ["ROS_DOMAIN_ID"] = previous_domain
 
 
 def test_set_mode_maps_to_strict_switch(stack):

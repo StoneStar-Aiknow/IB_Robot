@@ -15,6 +15,8 @@ setup(
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools", "pyyaml", "jsonschema>=4,<5"],
+    # colcon test falls back to unittest (0 tests, false green) without this.
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",
