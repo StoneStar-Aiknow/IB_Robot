@@ -1384,6 +1384,18 @@ def test_platform_state_is_read_off_the_feedback_torrents_callback_group(harness
     assert joint_publish is not harness.runtime.default_callback_group
 
 
+def test_command_streams_are_not_taken_up_behind_the_feedback_torrent(harness):
+    """On the robot the arm stream in the default group was read ~2 times a second."""
+    harness.wait_active()
+    runtime = harness.runtime
+    arm = [s for s in runtime.subscriptions if s.topic_name == "/aimdk/arm/commands"]
+    joints = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/arm/state"]
+    assert len(arm) == 1 and len(joints) == 1
+    assert arm[0].callback_group is runtime._command_cb
+    assert arm[0].callback_group is not joints[0].callback_group
+    assert arm[0].callback_group is not runtime.default_callback_group
+
+
 # --- named motion dispatch --------------------------------------------------
 
 

@@ -250,6 +250,11 @@ class AimdkRuntimeNode(Node):
         # Telemetry that must be timely gets its own group.
         self._telemetry_cb = MutuallyExclusiveCallbackGroup()
         self._joint_pub_cb = MutuallyExclusiveCallbackGroup()
+        # The command streams get their own group for the same reason: behind
+        # the joint torrent the arm stream was taken up about twice a second on
+        # the robot, so the platform got a stale pose, then nothing once it
+        # aged past stream_staleness_s, then a jump.
+        self._command_cb = MutuallyExclusiveCallbackGroup()
         # Stop and status must never queue behind a mode switch that is
         # waiting for the platform's confirmation: they run in their own
         # reentrant group, and the stop path serialises itself.
@@ -492,7 +497,11 @@ class AimdkRuntimeNode(Node):
             topic = str(channel["topic"])
             if str(channel.get("type", "float64_array")).lower() == "twist":
                 self.create_subscription(
-                    Twist, topic, lambda message, name=name: self._on_twist(name, message), _SENSOR_QOS
+                    Twist,
+                    topic,
+                    lambda message, name=name: self._on_twist(name, message),
+                    _SENSOR_QOS,
+                    callback_group=self._command_cb,
                 )
                 continue
             self.create_subscription(
@@ -500,6 +509,7 @@ class AimdkRuntimeNode(Node):
                 topic,
                 lambda message, channel=channel: self._on_stream(channel, message),
                 _SENSOR_QOS,
+                callback_group=self._command_cb,
             )
 
         if self._state.has_capability("interaction.tts"):
