@@ -40,50 +40,19 @@ Why parent_frame, not frame_id:
 import yaml
 from launch_ros.actions import Node
 
-from robot_config.peripherals.camera import camera_dict_requests_depth
-
 
 def _build_camera_bridge_entries(periph: dict, model_name: str, world_name: str) -> list:
     """Return bridge config dicts for one camera peripheral.
 
-    Uses parent_frame as the Gazebo link name because Ignition Gazebo 6 merges
-    fixed-joint child links (frame_id) into the parent link.
+    Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
+    the robot-agnostic builder lives in ``robot_runtime.gazebo``; this call
+    site keeps the generic provider-less behaviour (color, color info and the
+    legacy aligned-depth entry; the runtime providers pass ``full_streams`` to
+    bridge every advertised stream).
     """
-    name = periph["name"]
-    sensor_name = f"{name}_camera"
+    from robot_runtime.gazebo import camera_bridge_entries
 
-    gz_base = f"/{sensor_name}"
-
-    entries = [
-        {
-            "ros_topic_name": f"/camera/{name}/image_raw",
-            "gz_topic_name": f"{gz_base}/image",
-            "ros_type_name": "sensor_msgs/msg/Image",
-            "gz_type_name": "gz.msgs.Image",
-            "direction": "GZ_TO_ROS",
-            "lazy": False,
-        },
-        {
-            "ros_topic_name": f"/camera/{name}/camera_info",
-            "gz_topic_name": f"{gz_base}/camera_info",
-            "ros_type_name": "sensor_msgs/msg/CameraInfo",
-            "gz_type_name": "gz.msgs.CameraInfo",
-            "direction": "GZ_TO_ROS",
-            "lazy": False,
-        },
-    ]
-    if camera_dict_requests_depth(periph):
-        entries.append(
-            {
-                "ros_topic_name": f"/camera/{name}/aligned_depth_to_color/image_raw",
-                "gz_topic_name": f"{gz_base}/depth_image",
-                "ros_type_name": "sensor_msgs/msg/Image",
-                "gz_type_name": "gz.msgs.Image",
-                "direction": "GZ_TO_ROS",
-                "lazy": False,
-            }
-        )
-    return entries
+    return camera_bridge_entries(periph)
 
 
 def _build_lidar_bridge_entries(

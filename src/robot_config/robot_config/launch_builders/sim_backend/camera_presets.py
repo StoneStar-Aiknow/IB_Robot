@@ -10,6 +10,12 @@ Two mount categories:
   "base"  — generic workspace camera fixed on the robot base body.
              Used by any camera without a dedicated preset (front, etc.).
 
+The Gazebo column was removed (openspec ``so101-gazebo-runtime-transport``
+D6.2): those values were SO-101 defaults and are now runtime-owned, declared
+per-camera as ``simulation.gazebo.transform`` (+ ``fovy``) in the SO-101
+runtime profile. Generic provider-less Gazebo users declare their poses
+explicitly; only the MuJoCo column remains.
+
 Convention:
   Values are stored in each platform's native coordinate convention:
     - Gazebo (gz-sim): camera forward = +X, up = +Z
@@ -19,38 +25,6 @@ Convention:
 """
 
 PRESETS = {
-    "gazebo": {
-        "wrist": {
-            "parent_frame": "gripper",
-            "x": 0.002265,
-            "y": 0.073023,
-            "z": -0.016289,
-            "roll": -1.512475,
-            "pitch": 1.079239,
-            "yaw": -1.541112,
-            "fovy": 46,
-        },
-        "top": {
-            "parent_frame": "world",
-            "x": 0.0419,
-            "y": 0.1123,
-            "z": 0.6136,
-            "roll": 0.057596,
-            "pitch": 1.518436,
-            "yaw": -1.518436,
-            "fovy": 47,
-        },
-        "base": {
-            "parent_frame": "base",
-            "x": 0.0,
-            "y": -0.28,
-            "z": 0.5,
-            "roll": 0.0,
-            "pitch": 1.5708,
-            "yaw": -1.5708,
-            "fovy": 70,
-        },
-    },
     "mujoco": {
         "wrist": {
             "parent_frame": "gripper",

@@ -17,6 +17,11 @@
     <!-- sim_plugin: hardware plugin for simulation. Default = Gazebo.
          MuJoCo: description.py passes "mujoco_ros2_control/MujocoSystemInterface" when platform=mujoco. -->
     <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
+    <!-- gazebo_effort_state: expose the effort state interface so the runtime's
+         simulated joint-current publisher can derive joint.current from the
+         simulated effort (runtime-simulation-transport D6b). Gazebo transport
+         only; the hardware/SDK plugins do not export effort. -->
+    <xacro:arg name="gazebo_effort_state" default="false"/>
     <xacro:arg name="mujoco_model" default=""/>
     <xacro:arg name="camera_publish_rate" default=""/>
 
@@ -52,6 +57,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">1</param>
         </joint>
 
@@ -63,6 +71,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">2</param>
         </joint>
 
@@ -74,6 +85,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">3</param>
         </joint>
 
@@ -85,6 +99,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">4</param>
         </joint>
         <joint name="5">
@@ -95,6 +112,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">5</param>
         </joint>
 
@@ -112,6 +132,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg gazebo_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">6</param>
         </joint>
     </ros2_control>

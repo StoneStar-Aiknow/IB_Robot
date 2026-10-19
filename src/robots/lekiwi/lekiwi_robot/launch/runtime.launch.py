@@ -71,7 +71,7 @@ def _launch_setup(context, *_args, **_kwargs):
                     os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
                 ),
                 launch_arguments={
-                    **motion_launch_arguments(profile, profile_path, simulated, display),
+                    **motion_launch_arguments(profile, profile_path, transport, display),
                     "robot_description": arm_motion_model(profile, profile_path, simulated),
                 }.items(),
             )

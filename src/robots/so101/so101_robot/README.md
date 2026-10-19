@@ -23,6 +23,7 @@ Plus stock ros2_control controllers. No generic IB-Robot package is in the closu
 ```bash
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm            # hardware
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true   # SDK simulated transport
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm transport:=gazebo # Gazebo physics
 ```
 
 `profile` is a path or the name of a file in `profiles/`. The profile is the
@@ -33,6 +34,23 @@ bounds), command channels, trajectory endpoints, motion frames.
 The runtime reaches `ACTIVE` when the initial mode's controllers are active
 and publishes `/runtime_status`; `/runtime/set_mode`, `/runtime/stop`,
 `/runtime/get_status` and `/motion/*` are then available.
+
+### Transports
+
+The profile declares which transports it supports (`transports: [hardware,
+sdk, gazebo]`); `transport:=` selects one, the legacy `simulated:=` boolean
+remains an alias for `sdk`/`hardware`, and a conflicting pair fails fast.
+`transport:=gazebo` runs the same controllers, motion services, modes and
+stop behaviour against the simulator's ros2_control interface: the runtime
+starts a minimal empty world on its own (bring `IBROBOT_GAZEBO_HEADLESS=1`
+for server-only rendering), spawns the SO-101 into it and republishes the
+simulated joint effort as `joint.current`. When generic launch owns the
+world it passes `gazebo_world` and the spawn pose (`spawn_x/y/z/yaw`) and
+the runtime attaches to that world instead of starting one. Every node the
+runtime starts on this transport runs on simulation time. The Gazebo camera
+poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
+the profile); user-saved overrides under
+`~/.ros/ibrobot/sim_camera_overrides/` take precedence.
 
 ## Conformance
 

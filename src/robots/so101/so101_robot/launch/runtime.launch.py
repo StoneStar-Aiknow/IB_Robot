@@ -28,6 +28,7 @@ from robot_runtime.interface_description import build_description
 from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
+    render_gazebo_description,
     render_robot_description,
     resolve_profile_argument,
     resolve_transport,
@@ -59,7 +60,12 @@ def _launch_setup(context, *_args, **_kwargs):
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
-    robot_description = render_robot_description(profile, profile_path, simulated)
+    gazebo_world = LaunchConfiguration("gazebo_world").perform(context).strip()
+    spawn_pose = tuple(float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw"))
+    if transport == "gazebo":
+        robot_description = render_gazebo_description(profile, profile_path, spawn_pose=spawn_pose)
+    else:
+        robot_description = render_robot_description(profile, profile_path, simulated)
     description = build_description(profile, robot_description=robot_description, transport=transport)
 
     motion = IncludeLaunchDescription(
@@ -67,7 +73,7 @@ def _launch_setup(context, *_args, **_kwargs):
             os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
         ),
         launch_arguments={
-            **motion_launch_arguments(profile, profile_path, simulated, display),
+            **motion_launch_arguments(profile, profile_path, transport, display),
             "robot_description": robot_description,
         }.items(),
     )
@@ -83,9 +89,11 @@ def _launch_setup(context, *_args, **_kwargs):
             robot_description=robot_description,
             interface_description=description,
             transport=transport,
+            gazebo_world=gazebo_world,
+            spawn_pose=spawn_pose,
         ),
         motion,
-        *peripheral_stack_actions(profile, "", simulated, description=description),
+        *peripheral_stack_actions(profile, "", simulated, description=description, transport=transport),
         *generate_teleoperation_nodes(profile, description, {"robot_description": robot_description}),
     ]
 
@@ -104,6 +112,17 @@ def generate_launch_description():
                 default_value="",
                 description="Execution transport: hardware | sdk | gazebo (overrides the profile default; "
                 "conflicts with simulated:=)",
+            ),
+            DeclareLaunchArgument(
+                "gazebo_world",
+                default_value="",
+                description="Gazebo world name to spawn into (empty: the runtime starts a minimal empty world)",
+            ),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo transport)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo transport)"),
+            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo transport)"),
+            DeclareLaunchArgument(
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo transport)"
             ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),

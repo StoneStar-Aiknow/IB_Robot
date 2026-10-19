@@ -92,6 +92,9 @@ def generate_launch_description():
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
             moveit_config.joint_limits,
+            # Every provider node runs on the transport's clock (D7); RViz
+            # replays the same bag/joint states the motion stack sees.
+            {"use_sim_time": use_sim_time},
         ],
         remappings=[("joint_states", joint_state_topic)],
         condition=IfCondition(LaunchConfiguration("display")),

@@ -9,12 +9,10 @@ Public API:
 """
 
 import json
-import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from robot_config.logger_utils import get_colored_logger
-from robot_config.peripherals.camera import camera_dict_requests_depth
 from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.description")
@@ -64,6 +62,13 @@ def _build_cameras_urdf_from_yaml(
 ) -> str:
     """从 YAML peripherals 动态生成相机 link/joint/gazebo XML。
 
+    Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
+    the robot-agnostic builder lives in ``robot_runtime.gazebo`` and is shared
+    with the runtime providers; generic provider-less Gazebo callers keep the
+    same behaviour through this call site (preset defaults via
+    ``use_default_transform``, spawn-offset compensation for world-parented
+    cameras; the yaw component is 0 on this path).
+
     命名约定（与 sim_peripheral_bridge.py 的 bridge 路径对齐）：
     - URDF link 名     = YAML frame_id（如 camera_top_frame）
       → robot_state_publisher TF 帧名与图像消息 header.frame_id 一致
@@ -78,7 +83,8 @@ def _build_cameras_urdf_from_yaml(
     生成逻辑完全相同，区别仅在于 parent link 的值。
     MuJoCo 使用的 <gazebo reference> 块会被忽略（不影响 MJCF 解析）。
 
-    当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿。
+    当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿
+    （用户保存的 override 优先）。
 
     ``parent_frame="world"`` 特殊处理：URDF 的 ``world`` link 虽然名字叫 world
     但实际是模型根，在 Gazebo 里会随机器人 spawn 位置移动。因此对此类
@@ -93,90 +99,15 @@ def _build_cameras_urdf_from_yaml(
         model_spawn_offset: 机器人模型在 Gazebo 世界坐标的 spawn 位置
             (x, y, z) —— 用于修正 ``parent_frame="world"`` 的相机位姿。
     """
-    from robot_config.launch_builders.sim_backend.camera_overrides import load_with_override
+    from robot_config.launch_builders.sim_backend.camera_presets import get_preset
+    from robot_runtime.gazebo import camera_sensor_urdf
 
-    parts = []
-    for periph in peripherals:
-        if periph.get("type") != "camera":
-            continue
-        if periph.get("disabled", False):
-            continue
-        if (periph.get("simulation") or {}).get("embedded_sensor", False):
-            continue
-        if periph.get("skip_urdf_without_transform", False) and not periph.get("transform"):
-            continue
-        name = periph["name"]
-        frame_id = periph.get("frame_id", f"camera_{name}_frame")
-
-        # --- preset 查找 (优先读 override YAML，fallback 到硬编码默认值) ---
-        t = periph.get("transform", {})
-        cam_fovy = periph.get("fovy", 60)
-        if periph.get("use_default_transform", False):
-            preset = load_with_override(platform, name)
-            if preset:
-                t = preset
-                cam_fovy = preset.get("fovy", cam_fovy)
-
-        parent = t.get("parent_frame", "world")
-        x = t.get("x", 0.0)
-        y = t.get("y", 0.0)
-        z = t.get("z", 0.0)
-        roll = t.get("roll", 0.0)
-        pitch = t.get("pitch", 0.0)
-        yaw = t.get("yaw", 0.0)
-
-        # The URDF "world" link is actually model-local (sits at model spawn
-        # position in Gazebo).  Convert user-saved world-absolute coords into
-        # offsets from that model-local "world" link by subtracting spawn.
-        if parent == "world":
-            x -= model_spawn_offset[0]
-            y -= model_spawn_offset[1]
-            z -= model_spawn_offset[2]
-
-        width = periph.get("width", 640)
-        height = periph.get("height", 480)
-        fps = periph.get("fps", 30)
-        sensor_name = f"{name}_camera"
-        has_depth = camera_dict_requests_depth(periph)
-        sensor_type = "rgbd_camera" if has_depth else "camera"
-        topic_name = sensor_name if has_depth else f"{sensor_name}/image"
-
-        # fovy (vertical, degrees) → horizontal_fov (radians)
-        fovy_rad = math.radians(cam_fovy)
-        hfov_rad = 2.0 * math.atan(math.tan(fovy_rad / 2.0) * width / height)
-
-        parts.append(f"""
-    <!-- {name} camera (generated from YAML peripherals) -->
-    <link name="{frame_id}">
-        <inertial>
-            <origin xyz="0 0 0" rpy="0 0 0"/>
-            <mass value="0.01"/>
-            <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
-        </inertial>
-    </link>
-    <joint name="{name}_camera_joint" type="fixed">
-        <parent link="{parent}"/>
-        <child  link="{frame_id}"/>
-        <origin xyz="{x} {y} {z}" rpy="{roll} {pitch} {yaw}"/>
-    </joint>
-    <gazebo reference="{frame_id}">
-        <sensor type="{sensor_type}" name="{sensor_name}">
-            <update_rate>{fps}</update_rate>
-            <camera>
-                <horizontal_fov>{hfov_rad:.4f}</horizontal_fov>
-                <image>
-                    <width>{width}</width>
-                    <height>{height}</height>
-                    <format>R8G8B8</format>
-                </image>
-                <clip><near>0.01</near><far>100</far></clip>
-            </camera>
-            <always_on>true</always_on>
-            <visualize>true</visualize>
-            <topic>{topic_name}</topic>
-        </sensor>
-    </gazebo>""")
-    return "\n".join(parts)
+    return camera_sensor_urdf(
+        peripherals,
+        platform=platform,
+        spawn_pose=(*model_spawn_offset, 0.0),
+        default_pose_loader=get_preset,
+    )
 
 
 def _inject_mujoco_camera_sensors(full_urdf: str, peripherals: list) -> str:

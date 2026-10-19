@@ -186,7 +186,13 @@ def write_description(description: dict, path: str | Path) -> None:
 
 
 def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dict]:
-    """Resolve partial instance overrides without mutating either configuration."""
+    """Resolve partial instance overrides without mutating either configuration.
+
+    ``disabled: true`` is normalized to ``enabled: false`` at merge time (both
+    spellings stay valid). A toggle-only override entry (type, name and
+    enabled/disabled at most) must name a peripheral the defaults declare: a
+    toggle cannot disable something the runtime never provided (D8).
+    """
 
     def merge(base, override):
         result = deepcopy(base)
@@ -197,6 +203,12 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
                 else deepcopy(value)
             )
         return result
+
+    def normalize(entry):
+        normalized = deepcopy(entry)
+        if normalized.get("disabled", False):
+            normalized["enabled"] = False
+        return normalized
 
     result = []
     index = {}
@@ -215,14 +227,19 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
                 pos = index[key]
                 # A changed driver must not inherit vendor-specific settings.
                 result[pos] = (
-                    deepcopy(entry)
+                    normalize(entry)
                     if entry.get("driver", result[pos].get("driver")) != result[pos].get("driver")
                     else merge(result[pos], entry)
                 )
             else:
+                if override and set(entry) <= {"type", "name", "enabled", "disabled"}:
+                    raise InterfaceDescriptionError(
+                        f"peripheral {key} is not declared by the runtime: a toggle-only entry "
+                        "cannot enable or disable an undeclared peripheral"
+                    )
                 index[key] = len(result)
-                result.append(deepcopy(entry))
-    return [entry for entry in result if entry.get("enabled", True)]
+                result.append(normalize(entry))
+    return [entry for entry in (normalize(entry) for entry in result) if entry.get("enabled", True)]
 
 
 def camera_streams(camera: dict) -> list[str]:
@@ -260,7 +277,7 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
     }
 
 
-def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
+def peripheral_interfaces(peripherals: list[dict] | None, *, transport: str | None = None) -> dict[str, dict]:
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = merge_peripherals(peripherals, [])
@@ -313,6 +330,12 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
             if driver not in ("opencv", "camera_ros", "realsense"):
                 raise InterfaceDescriptionError(f"camera {name}: unsupported driver {driver!r}")
             streams = camera_streams(periph)
+            if transport == "gazebo":
+                # Streams the gz simulator cannot produce are not advertised on
+                # this transport (runtime-simulation-transport D6): the
+                # rgbd_camera publishes no depth camera_info (its depth image
+                # shares the color intrinsics) and no color-aligned pointcloud.
+                streams = [stream for stream in streams if stream != "pointcloud"]
             prefix = f"/camera/{name}"
             capability = "perception.camera"
             image_frame = periph.get("frame_id", f"camera_{name}_frame")
@@ -361,6 +384,12 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
                 endpoint = f"{prefix}{suffix}/{'image_raw' if is_color or aligned else 'image_rect_raw'}"
                 info_topic = f"{prefix}{suffix}/camera_info"
+                if transport == "gazebo" and not is_color:
+                    # gz rgbd_camera has no depth camera_info topic; the depth
+                    # image shares the color intrinsics, so the color info
+                    # interface carries them (D6: unproducible streams are not
+                    # advertised).
+                    info_topic = f"{prefix}/camera_info"
                 stream_frame, stream_info_frame = image_frame, info_frame
                 if driver == "realsense":
                     native_prefix = periph.get(
@@ -394,6 +423,11 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
+                if transport == "gazebo" and not is_color:
+                    # the shared color info interface above already carries the
+                    # depth intrinsics; a dedicated depth info topic has no
+                    # producer on this transport
+                    continue
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
                 )
@@ -602,7 +636,22 @@ def build_description(
     """
     runtime = profile["runtime"]
     caps = profile["capabilities"]
-    interfaces = peripheral_interfaces(profile.get("peripherals") if peripherals is None else peripherals)
+    if transport is None:
+        if simulated is None:
+            transport = str(profile.get("transport") or ("sdk" if profile.get("simulated", False) else "hardware"))
+        else:
+            transport = "sdk" if simulated else "hardware"
+    else:
+        transport = str(transport).strip()
+        if transport not in TRANSPORTS:
+            raise InterfaceDescriptionError(f"unknown transport {transport!r}: expected one of {list(TRANSPORTS)}")
+        if simulated is not None and (transport != "hardware") != bool(simulated):
+            raise InterfaceDescriptionError(
+                f"conflicting execution selection: simulated={simulated} with transport={transport!r}"
+            )
+    interfaces = peripheral_interfaces(
+        profile.get("peripherals") if peripherals is None else peripherals, transport=transport
+    )
     # Audio peripherals derive the interaction.audio_* capability entries. A
     # profile that additionally declares them explicitly must agree with the
     # devices it also lists, or the RuntimeStatus surface would contradict the
@@ -741,19 +790,6 @@ def build_description(
             frame_id=lidar_odom.get("source_body_frame", "body"),
         )
         interfaces["localization.cloud"]["qos"]["reliability"] = "reliable"
-    if transport is None:
-        if simulated is None:
-            transport = str(profile.get("transport") or ("sdk" if profile.get("simulated", False) else "hardware"))
-        else:
-            transport = "sdk" if simulated else "hardware"
-    else:
-        transport = str(transport).strip()
-        if transport not in TRANSPORTS:
-            raise InterfaceDescriptionError(f"unknown transport {transport!r}: expected one of {list(TRANSPORTS)}")
-        if simulated is not None and (transport != "hardware") != bool(simulated):
-            raise InterfaceDescriptionError(
-                f"conflicting execution selection: simulated={simulated} with transport={transport!r}"
-            )
     effective_simulated = transport != "hardware"
     description = {
         "schema_version": 1,
