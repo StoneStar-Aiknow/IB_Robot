@@ -81,6 +81,9 @@ class X2FollowMe:
         # Guard counts of the retargeters that reset_input replaced.
         self._guard_trips = 0
         self._guard_worst = 0
+        # Starved/stretched counts of the earlier legs of a round that re-entries restarted.
+        self._starved_before = 0
+        self._stretched_before = 0
         self._dry_run()
         self._child = None
         if separate_process:
@@ -162,6 +165,12 @@ class X2FollowMe:
         start = self._base if from_pose is None else np.asarray(from_pose, dtype=np.float64)
         if start.shape != self._base.shape or not np.isfinite(start).all():
             raise ValueError(f"from_pose must be {self._base.shape[0]} finite radians")
+        if from_pose is None:
+            self._starved_before = self._stretched_before = 0
+        else:
+            # A re-entry continues the round: its status keeps counting from here.
+            self._starved_before += self._stream.starved_frames
+            self._stretched_before += self._stream.stretched_frames
         self._stream.base = start.copy()
         self._stream.reset(_session())
 
@@ -179,8 +188,8 @@ class X2FollowMe:
         status = {
             "phase": stream.session.phase(stream._k)[0] if stream._t0 is not None else "filling",
             "buffered": len(stream._buf),
-            "starved_frames": stream.starved_frames,
-            "stretched_frames": stream.stretched_frames,
+            "starved_frames": self._starved_before + stream.starved_frames,
+            "stretched_frames": self._stretched_before + stream.stretched_frames,
             "offset_samples": stream.offset_samples,
             "despike_flagged": int(stream.despiker.flagged.sum()),
             "branch_guard_trips": self._guard_trips + guard.trips,

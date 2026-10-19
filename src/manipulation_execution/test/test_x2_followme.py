@@ -49,8 +49,12 @@ def test_a_round_from_a_pose_parks_on_it_then_blends_into_the_person():
     np.testing.assert_allclose(last, person, atol=1e-9)
     steps = np.abs(np.diff(np.array(samples), axis=0)).max()
     assert steps < 0.02, steps          # 0.5 rad over a 2 s quintic blend, no jump
+    stream._stream.starved_frames = 7
+    stream.start_round(from_pose=person)
+    assert stream.status()["starved_frames"] == 7      # a re-entry keeps the round's counts
     stream.start_round()
     assert np.array_equal(stream._stream.base, NEUTRAL)
+    assert stream.status()["starved_frames"] == 0      # a new round does not
 
 
 def test_branch_guard_survives_trimmed_history():
