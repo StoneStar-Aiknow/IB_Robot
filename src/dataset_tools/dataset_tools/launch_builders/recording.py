@@ -30,9 +30,9 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
-from robot_config.launch_builders.builder_support import rerun_visualizer_requested
-from robot_config.launch_builders.launch_options import ArgumentSpec
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.builder_support import rerun_visualizer_requested
+from robot_config.launch_registry.launch_options import ArgumentSpec
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     parse_bool,

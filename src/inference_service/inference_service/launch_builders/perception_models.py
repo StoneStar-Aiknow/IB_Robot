@@ -16,7 +16,7 @@ from typing import Any
 
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.perception_runtime_config import parse_perception_runtime_config
 
 # The operator location is owned by torch_models.graspgenx_ascend_310p

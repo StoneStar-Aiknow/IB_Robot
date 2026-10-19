@@ -1,5 +1,8 @@
 """Launch argument declaration model with dual entry points.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Implements the argument-spec half of openspec change
 ``refactor-launch-builder-registry`` (design decision 4):
 

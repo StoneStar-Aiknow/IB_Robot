@@ -1,5 +1,8 @@
 """Shared launch-builder helpers used by enable predicates and build functions.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Moved here from the retired ``adapters.py`` / ``builtin_registry.py`` (openspec
 change ``decentralize-launch-builder-registration``, design decision 1): the
 runtime-provider / display / with_navigation / with_moveit / rerun resolvers
@@ -12,7 +15,7 @@ dependencies through this module.
 
 from __future__ import annotations
 
-from robot_config.launch_builders.registry import LaunchBuildContext
+from robot_config.launch_registry.registry import LaunchBuildContext
 from robot_config.utils import parse_bool
 
 

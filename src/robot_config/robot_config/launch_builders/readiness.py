@@ -16,8 +16,8 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builder_support import readiness_attribute, runtime_provider_name
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.builder_support import readiness_attribute, runtime_provider_name
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 

@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builtin_registry import (
+from robot_config.launch_registry.builtin_registry import (
     LAUNCH_BUILDER_ENTRY_POINT_GROUP,
     build_builtin_registry,
     build_launch_registry,
@@ -129,7 +129,7 @@ def test_magicmirror_plan_reaches_mirror_session_through_the_entry_point():
     assert extension_ids == sorted(extension_ids)
     assert "mirror_session" in extension_ids
 
-    from robot_config.launch_builders.preparation import prepare_launch
+    from robot_config.launch_registry.preparation import prepare_launch
 
     context = SimpleNamespace(
         launch_configurations={"robot_config": "aimdk_x2_magicmirror", "use_sim": "true"},
@@ -150,8 +150,8 @@ def test_magicmirror_actions_match_the_baseline_wrapper_structure():
     the f0aded6e baseline: the plan rides behind the aimdk runtime
     provider's readiness handler, with no extra or missing top-level
     actions caused by the registration move."""
-    from robot_config.launch_builders.orchestrator import build_prepared_launch
-    from robot_config.launch_builders.preparation import prepare_launch
+    from robot_config.launch_registry.orchestrator import build_prepared_launch
+    from robot_config.launch_registry.preparation import prepare_launch
 
     context = SimpleNamespace(
         launch_configurations={"robot_config": "aimdk_x2_magicmirror", "use_sim": "true"},

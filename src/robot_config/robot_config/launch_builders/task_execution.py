@@ -8,9 +8,9 @@ the runtime provider requirement. The ``task_executor`` entry (the
 and registers through the entry point group ``ibrobot.launch_builders``.
 """
 
-from robot_config.launch_builders.builder_support import resolve_with_moveit, runtime_provider_name
-from robot_config.launch_builders.launch_options import ArgumentSpec
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.builder_support import resolve_with_moveit, runtime_provider_name
+from robot_config.launch_registry.launch_options import ArgumentSpec
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 
 logger = get_colored_logger("robot_config.task_execution")

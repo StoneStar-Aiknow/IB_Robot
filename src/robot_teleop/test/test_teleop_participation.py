@@ -9,8 +9,8 @@ stays hermetic.
 
 from importlib.metadata import EntryPoint
 
-from robot_config.launch_builders.builtin_registry import build_launch_registry
-from robot_config.launch_builders.registry import LaunchBuildContext
+from robot_config.launch_registry.builtin_registry import build_launch_registry
+from robot_config.launch_registry.registry import LaunchBuildContext
 from robot_config.runtime_target import RuntimeTarget
 
 

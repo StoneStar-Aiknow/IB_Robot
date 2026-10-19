@@ -35,13 +35,13 @@ from importlib.metadata import EntryPoint
 
 import pytest
 
-from robot_config.launch_builders.builtin_registry import (
+from robot_config.launch_registry.builtin_registry import (
     LAUNCH_BUILDER_ENTRY_POINT_GROUP,
     build_builtin_registry,
     build_launch_registry,
 )
-from robot_config.launch_builders.launch_options import ArgumentSpec, compose_argument_specs
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.launch_options import ArgumentSpec, compose_argument_specs
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     HookSpec,

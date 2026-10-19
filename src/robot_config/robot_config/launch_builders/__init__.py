@@ -1,17 +1,21 @@
 """Launch builder modules for robot_config.
 
-This package contains modules for building ROS2 launch components:
+This package contains robot_config's own launch entries and the
+infrastructure helper modules they share:
 - description.py: URDF building (xacro processing + camera injection)
 - control.py: ros2_control nodes, controller spawners
 - perception.py: Camera drivers, TF publishers
 - simulation.py: Gazebo and simulation nodes
 - execution.py: Action dispatcher and inference nodes
 
+The registration framework itself (BuilderSpec, registry, preparation,
+orchestrator, launch_options, builtin_registry, builder_support,
+import_budget) lives in ``robot_config.launch_registry``.
+
 Compatibility lazy facade (openspec ``refactor-launch-builder-registry``,
 design decision 6): every legacy public symbol resolves through a lookup
 table on first access. Importing this package imports NO builder
-submodule, so ``import robot_config.launch_builders.registry`` (or
-``launch_options``) does not pull benchmark/tensormsg or any other
+submodule, so no launch entry pulls benchmark/tensormsg or any other
 business dependency. Each access re-resolves the attribute on the source
 module (no cached callable), preserving source-module monkeypatch seams;
 ``from robot_config.launch_builders import <submodule>`` keeps working

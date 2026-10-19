@@ -28,7 +28,7 @@ from manipulation_execution.launch_builders.mirror_session import (
     build_mirror_session,
     generate_mirror_session_nodes,
 )
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.registry import (
     BuildResult,
     LaunchBuildContext,
     resolve_builder_factory,
@@ -272,7 +272,7 @@ class TestGenerateNodesValidation:
 
 class TestRegistryIntegration:
     def test_builder_spec_is_addable_to_a_fresh_registry(self):
-        from robot_config.launch_builders.registry import LaunchBuilderRegistry
+        from robot_config.launch_registry.registry import LaunchBuilderRegistry
 
         registry = LaunchBuilderRegistry()
         registry.add(MIRROR_SESSION_BUILDER)

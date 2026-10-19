@@ -1,8 +1,11 @@
 """Generic launch orchestrator over the prepared launch and frozen plan.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Implements design decisions 3/6 of openspec change
 ``refactor-launch-builder-registry``. The orchestrator accepts a
-:class:`~robot_config.launch_builders.preparation.PreparedLaunch` (the
+:class:`~robot_config.launch_registry.preparation.PreparedLaunch` (the
 preparation pipeline output: prepared context + frozen plan) and executes
 the planned builders through ``execute_plan``, then assembles the final
 action stream:
@@ -43,11 +46,11 @@ from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 
 from robot_config.dds_environment import check_launch_dds
-from robot_config.launch_builders.registry import LaunchBuildContext, execute_plan
+from robot_config.launch_registry.registry import LaunchBuildContext, execute_plan
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 
-logger = get_colored_logger("robot_config.launch_builders.orchestrator")
+logger = get_colored_logger("robot_config.launch_registry.orchestrator")
 
 
 def _tracing_attribute(name: str):

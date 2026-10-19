@@ -21,8 +21,8 @@ motion to moveit_gateway and gripper control to ros2_control.
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builder_support import resolve_with_moveit
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.builder_support import resolve_with_moveit
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 

@@ -15,7 +15,7 @@ from launch.actions import EmitEvent
 from launch.events import Shutdown
 
 import dataset_tools.launch_builders.recording as recording_module
-from robot_config.launch_builders.registry import LaunchBuildContext
+from robot_config.launch_registry.registry import LaunchBuildContext
 from robot_config.runtime_target import RuntimeTarget
 
 

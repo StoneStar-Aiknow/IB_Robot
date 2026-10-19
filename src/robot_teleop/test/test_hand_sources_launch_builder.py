@@ -17,8 +17,8 @@ import pytest
 import yaml
 
 from robot_config.launch_builders import control
-from robot_config.launch_builders.builtin_registry import build_launch_registry
-from robot_config.launch_builders.preparation import prepare_launch
+from robot_config.launch_registry.builtin_registry import build_launch_registry
+from robot_config.launch_registry.preparation import prepare_launch
 from robot_teleop.launch_builders.hand_sources import (
     apply_hand_profile,
     confirm_interactive_startup_p_pose,
@@ -530,7 +530,7 @@ def test_hand_profile_argument_is_contributed_with_empty_fallback():
     """The hand_profile launch argument moved with the entry: it is declared
     by the injected extension with the same spec as the former builtin row
     (robot_config's composed-table assertions moved here)."""
-    from robot_config.launch_builders.launch_options import compose_argument_specs
+    from robot_config.launch_registry.launch_options import compose_argument_specs
 
     specs = {spec.name: spec for spec in compose_argument_specs(_hand_sources_registry().contributed_arguments())}
     assert "hand_profile" in specs
@@ -543,9 +543,9 @@ def test_hand_sources_joins_the_plan_only_through_its_entry_point():
     """Spec scenarios: with the entry point installed the entry participates
     in the plan; without it the builtin-only registry carries no hand_sources
     entry (and no hand_profile argument is declared)."""
-    from robot_config.launch_builders.builtin_registry import build_builtin_registry
-    from robot_config.launch_builders.launch_options import compose_argument_specs
-    from robot_config.launch_builders.registry import LaunchBuildContext
+    from robot_config.launch_registry.builtin_registry import build_builtin_registry
+    from robot_config.launch_registry.launch_options import compose_argument_specs
+    from robot_config.launch_registry.registry import LaunchBuildContext
     from robot_config.runtime_target import RuntimeTarget
 
     context = LaunchBuildContext(

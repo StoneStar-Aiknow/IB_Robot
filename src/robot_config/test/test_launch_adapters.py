@@ -31,7 +31,7 @@ from __future__ import annotations
 import robot_config.launch_builders.benchmark as benchmark_module
 import robot_config.launch_builders.sim_backend as sim_backend_module
 import robot_config.launch_builders.simulation as simulation_module
-from robot_config.launch_builders.registry import LaunchBuildContext
+from robot_config.launch_registry.registry import LaunchBuildContext
 from robot_config.runtime_target import RuntimeTarget
 
 

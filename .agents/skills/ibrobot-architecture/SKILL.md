@@ -183,7 +183,7 @@ Read only the references needed for the current scenario:
 | Purpose | Reference |
 |---------|-----------|
 | Observation/Action flows with key code paths, Inference Execution Modes (monolithic / distributed / scheduled), Unified Runtime layering + backend table, Model Service typed services, Temporal Smoothing | `references/data-flow.md` |
-| Launch System (30 launch builders, sim backend adapters, all 25 launch arguments), Common Patterns (Launching, Adding New Robot, Debugging Contracts), Troubleshooting | `references/launch-and-troubleshooting.md` |
+| Launch System (launch builder registry: builtin entries + entry point extensions by owning package, runtime-owned audio, all 25 launch arguments with owners), Common Patterns (Launching, Adding New Robot, Debugging Contracts), Troubleshooting (incl. missing extension builders and registry errors) | `references/launch-and-troubleshooting.md` |
 | Package Responsibilities by layer, README as Local Architecture Contract, Key Files Reference table | `references/key-files.md` |
 
 Do not expose these references as separate skills.

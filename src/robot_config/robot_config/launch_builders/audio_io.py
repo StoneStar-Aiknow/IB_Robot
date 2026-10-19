@@ -13,7 +13,7 @@ from typing import Any
 from launch_ros.actions import Node
 
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 
 logger = get_colored_logger("robot_config.audio_io")

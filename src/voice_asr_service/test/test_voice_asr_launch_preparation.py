@@ -19,8 +19,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from robot_config.launch_builders.preparation import prepare_launch
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.preparation import prepare_launch
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     HookSpec,

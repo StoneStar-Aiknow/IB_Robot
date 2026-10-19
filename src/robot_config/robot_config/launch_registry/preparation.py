@@ -1,5 +1,8 @@
 """Configuration preparation pipeline for the registry-based launch entry.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Implements design decision 4 of openspec change
 ``refactor-launch-builder-registry``: the legacy ``launch_setup``
 configuration half is split into a fixed, named phase pipeline that ends
@@ -61,12 +64,12 @@ from typing import Any
 
 from robot_config.interface_binding import required_interface_ids
 from robot_config.launch_builders import readiness
-from robot_config.launch_builders.launch_options import (
+from robot_config.launch_registry.launch_options import (
     ArgumentSpec,
     compose_argument_specs,
     read_launch_arguments,
 )
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.registry import (
     HookSpec,
     HookTargetState,
     LaunchBuildContext,
@@ -79,7 +82,7 @@ from robot_config.logger_utils import get_colored_logger
 from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
 from robot_config.utils import parse_bool
 
-logger = get_colored_logger("robot_config.launch_builders.preparation")
+logger = get_colored_logger("robot_config.launch_registry.preparation")
 
 
 class PreparationError(ValueError):

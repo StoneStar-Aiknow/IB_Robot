@@ -13,7 +13,7 @@ from robot_config.dispatch_strategies import (
     resolve_dispatch_strategies,
     validate_executor_scheduler_pairing,
 )
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.runtime_target import RuntimeTarget
 from robot_config.utils import parse_bool, prepare_lerobot_env

@@ -37,7 +37,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
 
 from robot_config.interface_binding import InterfaceBindingError
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 
 _COMPRESSED_TYPE = "sensor_msgs/msg/CompressedImage"
 # The runtime publishes the camera; the stream subscribes it.

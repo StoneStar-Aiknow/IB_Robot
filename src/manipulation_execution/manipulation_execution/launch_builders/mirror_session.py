@@ -60,7 +60,7 @@ from manipulation_execution.launch_builders.motion_imitation_stream import (
     motion_imitation_stream_parameters,
 )
 from robot_config.interface_binding import InterfaceBindingError
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 
 _KEYS = frozenset(
     {

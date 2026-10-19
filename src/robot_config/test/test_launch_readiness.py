@@ -313,8 +313,8 @@ def test_controller_readiness_handler_is_registered_before_barrier_can_start():
     from launch.actions import EmitEvent, LogInfo
     from launch.events.process import ProcessExited
 
-    from robot_config.launch_builders.orchestrator import _assemble_actions
-    from robot_config.launch_builders.registry import LaunchBuildContext, PlanOutputs, PlanSegment
+    from robot_config.launch_registry.orchestrator import _assemble_actions
+    from robot_config.launch_registry.registry import LaunchBuildContext, PlanOutputs, PlanSegment
 
     barrier = ExecuteProcess(cmd=["never-executed"])
     consumer = LogInfo(msg="deferred")
@@ -775,7 +775,7 @@ def test_launch_setup_enables_navigation_when_requested(monkeypatch):
     from importlib.metadata import EntryPoint
     from types import ModuleType
 
-    from robot_config.launch_builders.registry import BuilderSpec, BuildResult
+    from robot_config.launch_registry.registry import BuilderSpec, BuildResult
 
     module = ModuleType("launch_readiness_synthetic_navigation")
     module.build_navigation = lambda _context: BuildResult(
@@ -835,9 +835,9 @@ def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
     from launch.event_handlers import OnProcessExit
     from launch.events.process import ProcessExited
 
-    from robot_config.launch_builders import builtin_registry as builtin_registry_module
-    from robot_config.launch_builders.launch_options import ArgumentSpec
-    from robot_config.launch_builders.registry import BuilderSpec, BuildResult, HookSpec
+    from robot_config.launch_registry import builtin_registry as builtin_registry_module
+    from robot_config.launch_registry.launch_options import ArgumentSpec
+    from robot_config.launch_registry.registry import BuilderSpec, BuildResult, HookSpec
 
     factory_calls = []
     built_actions = []

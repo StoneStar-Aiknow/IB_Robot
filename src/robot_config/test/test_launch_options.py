@@ -15,8 +15,8 @@ from __future__ import annotations
 import pytest
 from launch import LaunchContext
 
-from robot_config.launch_builders.builtin_registry import build_builtin_registry
-from robot_config.launch_builders.launch_options import (
+from robot_config.launch_registry.builtin_registry import build_builtin_registry
+from robot_config.launch_registry.launch_options import (
     CORE_ARGUMENT_SPECS,
     ArgumentSpec,
     ArgumentSpecError,

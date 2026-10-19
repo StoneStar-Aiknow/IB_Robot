@@ -16,8 +16,8 @@ from typing import Any
 
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builder_support import runtime_provider_name
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.builder_support import runtime_provider_name
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
 

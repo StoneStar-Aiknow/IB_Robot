@@ -21,9 +21,9 @@ from __future__ import annotations
 from importlib.metadata import EntryPoint
 
 from dataset_tools.launch_builders.recording import RECORDING_BUILDER, RERUN_VISUALIZER_BUILDER
-from robot_config.launch_builders.builtin_registry import build_launch_registry
-from robot_config.launch_builders.launch_options import compose_argument_specs
-from robot_config.launch_builders.registry import LaunchBuildContext, execute_plan
+from robot_config.launch_registry.builtin_registry import build_launch_registry
+from robot_config.launch_registry.launch_options import compose_argument_specs
+from robot_config.launch_registry.registry import LaunchBuildContext, execute_plan
 from robot_config.runtime_target import RuntimeTarget
 
 _RECORDING_ENTRY_POINT = EntryPoint(

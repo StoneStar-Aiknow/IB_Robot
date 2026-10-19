@@ -9,14 +9,14 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from robot_config.launch_builders import control, readiness
-from robot_config.launch_builders.launch_options import ArgumentSpec, ArgumentSpecError
-from robot_config.launch_builders.preparation import (
+from robot_config.launch_registry.launch_options import ArgumentSpec, ArgumentSpecError
+from robot_config.launch_registry.preparation import (
     PreparationError,
     _run_phase_hooks,
     compose_registry_arguments,
     prepare_launch,
 )
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     HookSpec,
@@ -72,7 +72,7 @@ def business(monkeypatch):
     monkeypatch.setitem(sys.modules, probe.__name__, probe)
 
     def probe_registry():
-        from robot_config.launch_builders.builtin_registry import build_builtin_registry
+        from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
         registry = build_builtin_registry()
         registry.add(probe.PROBE_BUILDER)
@@ -137,7 +137,7 @@ def test_direct_call_fallbacks(business):
     """Direct launch_setup callers observe the same absent fallbacks as
     before the business-parameter migration — through the builtin
     registry that contributes them."""
-    from robot_config.launch_builders.builtin_registry import build_builtin_registry
+    from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
     prepared = prepare_launch(_context(), build_builtin_registry())
     assert prepared.arguments["robot_config"] == "test_cam"
@@ -338,8 +338,8 @@ def test_business_argument_collision_with_builtin_contribution_rejected(monkeypa
     add time against the builtin contributions. (The record arguments moved
     to dataset_tools with the recording entry; their collision behavior is
     pinned there against the injected extension.)"""
-    from robot_config.launch_builders.builtin_registry import build_builtin_registry
-    from robot_config.launch_builders.registry import RegistryError
+    from robot_config.launch_registry.builtin_registry import build_builtin_registry
+    from robot_config.launch_registry.registry import RegistryError
 
     module = ModuleType("test_preparation_with_moveit_collision")
     module.build = lambda context: BuildResult()
@@ -449,7 +449,7 @@ def test_use_sim_runtime_target_mismatch_rejected_in_both_directions(business, t
 
 
 def _builtin_registry():
-    from robot_config.launch_builders.builtin_registry import build_builtin_registry
+    from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
     return build_builtin_registry()
 
@@ -482,7 +482,7 @@ def test_builtin_hook_owned_keys_stay_exclusive(monkeypatch):
     exclusivity moved with that entry's hook to voice_asr_service's suite;
     the hand-profile keys moved with the hand_sources entry to robot_teleop's
     suite.)"""
-    from robot_config.launch_builders.registry import RegistryError
+    from robot_config.launch_registry.registry import RegistryError
 
     for key in ("embodied",):
         registry = _builtin_registry()

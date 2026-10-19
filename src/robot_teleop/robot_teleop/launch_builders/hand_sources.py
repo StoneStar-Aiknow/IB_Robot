@@ -16,8 +16,8 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.control import runtime_component_enabled
-from robot_config.launch_builders.launch_options import ArgumentSpec
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.launch_options import ArgumentSpec
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     HookSpec,

@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
-from robot_config.launch_builders.builtin_registry import build_launch_registry
-from robot_config.launch_builders.registry import LaunchBuildContext
+from robot_config.launch_registry.builtin_registry import build_launch_registry
+from robot_config.launch_registry.registry import LaunchBuildContext
 from robot_config.loader import load_robot_config_dict
 from robot_config.runtime_target import RuntimeTarget
 from task_dispatch.launch_builders.task_execution import generate_task_executor_node

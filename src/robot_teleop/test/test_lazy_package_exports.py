@@ -7,7 +7,7 @@ point resolution imports ``robot_teleop`` on every launch description
 generation. The PEP 562 lazy facade keeps ``__all__``, attribute access and
 ``from robot_teleop import X`` behavior while making the bare package
 import light; the subprocess probing and the core-budget computation are
-shared through ``robot_config.launch_builders.import_budget``.
+shared through ``robot_config.launch_registry.import_budget``.
 """
 
 from __future__ import annotations

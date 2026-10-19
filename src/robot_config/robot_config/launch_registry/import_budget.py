@@ -1,5 +1,8 @@
 """Shared import-budget helpers for launch-builder registry tests.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Openspec change ``migrate-business-launch-builders``, design decision 6:
 the subprocess probing and core-budget computation used by robot_config's
 import-budget test are reusable so every package that contributes launch
@@ -64,5 +67,5 @@ def core_import_budget() -> set[str]:
     means a domain module regressed to a top-level cross-package import.
     """
     return imported_top_level_packages(
-        "import launch\nimport launch_ros\nimport robot_config.launch_builders.registry\n"
+        "import launch\nimport launch_ros\nimport robot_config.launch_registry.registry\n"
     )

@@ -19,13 +19,13 @@ from launch.actions import EmitEvent
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builder_support import (
+from robot_config.launch_builders.description import generate_robot_description
+from robot_config.launch_registry.builder_support import (
     readiness_attribute,
     resolve_display,
     runtime_provider_name,
 )
-from robot_config.launch_builders.description import generate_robot_description
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     ControlStartup,

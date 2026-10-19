@@ -12,8 +12,8 @@ from launch.events import Shutdown
 from launch.events.process import ProcessExited
 
 from robot_config.launch_builders import runtime, tracing
-from robot_config.launch_builders.orchestrator import build_prepared_launch
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext, LaunchBuilderRegistry
+from robot_config.launch_registry.orchestrator import build_prepared_launch
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext, LaunchBuilderRegistry
 
 
 def _prepared(monkeypatch, entries, *, barrier=None, binding=False, arguments=None, enabled=None):

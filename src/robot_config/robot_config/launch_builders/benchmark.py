@@ -31,7 +31,7 @@ from robot_config.benchmark_endpoints import (
     resolve_benchmark_endpoints,
 )
 from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.observation_transport import (
     effective_observation_transport,
@@ -554,7 +554,7 @@ def build_benchmark(context: LaunchBuildContext) -> BuildResult:
 
 
 def _benchmark_startup(snapshot: dict[str, Any], run_id: str):
-    from robot_config.launch_builders.registry import BenchmarkStartup
+    from robot_config.launch_registry.registry import BenchmarkStartup
 
     return BenchmarkStartup(
         effective_config=snapshot,

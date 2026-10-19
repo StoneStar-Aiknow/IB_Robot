@@ -1,5 +1,8 @@
 """Explicit ordered launch-builder registry contracts.
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Implements the registry core for openspec change
 ``refactor-launch-builder-registry``:
 
@@ -59,11 +62,11 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_registry.launch_options import ArgumentSpec
 from robot_config.logger_utils import get_colored_logger
 from robot_config.runtime_target import RuntimeTarget
 
-logger = get_colored_logger("robot_config.launch_builders.registry")
+logger = get_colored_logger("robot_config.launch_registry.registry")
 
 VALID_TIMINGS = ("immediate", "runtime_ready")
 TYPED_OUTPUT_OWNERS = {

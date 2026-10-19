@@ -93,22 +93,38 @@ robot_config YAML（单一数据源）
 
 ### Launch builder 注册表（registry orchestration）
 
+注册框架与启动条目分属两个子包（openspec change `split-launch-registry-package`）：
+
+- **`robot_config.launch_registry`** —— 注册框架本体：`BuilderSpec` 等注册契约（`registry.py`）、
+  准备流水线（`preparation.py`）、通用编排器（`orchestrator.py`）、参数表 SSOT
+  （`launch_options.py`）、内建表与 entry point 发现（`builtin_registry.py`）、扩展可用的公共
+  helper（`builder_support.py`）、导入预算检查（`import_budget.py`）。**业务包从这里导入框架
+  API**（`BuilderSpec`、`ArgumentSpec`、`HookSpec` 等）。
+- **`robot_config.launch_builders`** —— robot_config 自己贡献的启动条目（`control`、
+  `simulation`、`perception` 等）与基础设施辅助模块（`description`、`runtime`、
+  `hardware_mock`、`tracing`、`sim_backend` 等），与业务包中同名目录的含义一致。
+
 `robot.launch.py` 主入口只保留三项职责：声明 launch 参数（SSOT 在
-`launch_builders/launch_options.py`）、执行准备流水线（`preparation.py`）、把冻结的
-participation plan 交给通用编排器（`orchestrator.py`）。每个内建条目的 `BuilderSpec` 常量与
+`launch_registry/launch_options.py`）、执行准备流水线（`launch_registry/preparation.py`）、把冻结的
+participation plan 交给通用编排器（`launch_registry/orchestrator.py`）。每个内建条目的 `BuilderSpec` 常量与
 `build_<id>(context) -> BuildResult` 构建函数住在它自己的领域模块里；
 `builtin_registry.py` 只保留一张有序的 `"module:<ID>_BUILDER"` 引用表（`BUILTIN_BUILDERS`），
 表顺序即拓扑排序的稳定决胜序；已安装业务包还可通过 entry point 组 `ibrobot.launch_builders`
 追加扩展条目（见下文「跨包扩展」）。构建注册表不得引入超出注册表核心、`launch`、`launch_ros` 与
 `ament_index_python` 之外的依赖：领域模块的跨包运行依赖一律函数内 import（共享的启用判定
-helper 在 `launch_builders/builder_support.py`），由导入预算测试固化。
+helper 在 `launch_registry/builder_support.py`），由导入预算测试固化。
+
+**旧路径已删除**：`robot_config.launch_builders.<框架模块>`（`registry` / `preparation` /
+`orchestrator` / `launch_options` / `builtin_registry` / `builder_support` / `import_budget`）
+这些路径只在本仓库自己的历史中存在过，未随任何版本发布，已随本次拆分直接删除；仓库内代码一律
+使用 `robot_config.launch_registry`（有守护测试防止旧路径回潮，并断言旧路径不可导入）。
 
 新增一个 launch 条目 = 在领域模块定义 `build_<id>` 与 `<ID>_BUILDER`，再在
 `BUILTIN_BUILDERS` 表加一行，主入口与旧 facade 不需要任何修改。例如：
 
 ```python
-from robot_config.launch_builders.launch_options import ArgumentSpec
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult, HookSpec
+from robot_config.launch_registry.launch_options import ArgumentSpec
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, HookSpec
 
 # 1) 领域模块 my_feature.py：构建函数（业务依赖函数内 import）+ 注册常量
 def build_my_feature(context) -> BuildResult:
@@ -159,7 +175,7 @@ entry_points={
 }
 
 # <your_package>/your_package/launch_builder.py —— 领域模块自带 BuilderSpec（同内建模式）
-from robot_config.launch_builders.registry import BuilderSpec, BuildResult
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult
 
 def build_my_feature(context) -> BuildResult: ...
 
@@ -181,9 +197,9 @@ MY_FEATURE_BUILDER = BuilderSpec(id="my_feature", factory=f"{__name__}:build_my_
   条目不会解析 factory，其运行依赖不会被导入。
 
 条目启动的节点属于哪个包，构建代码就放在哪个包（openspec change
-`migrate-business-launch-builders`）；robot_config 只保留注册框架、类型化输出的所有者
-（`control` / `simulation` / `benchmark`）、通用校验条目（`motion_planning`）与启动第三方节点
-或尚无单一归属包的条目。已迁移条目与归属：
+`migrate-business-launch-builders`）；robot_config 只保留注册框架（`launch_registry/`，见上文
+分工）、类型化输出的所有者（`control` / `simulation` / `benchmark`）、通用校验条目
+（`motion_planning`）与启动第三方节点或尚无单一归属包的条目。已迁移条目与归属：
 
 | 条目 | 归属包 |
 |---|---|
@@ -198,11 +214,12 @@ MY_FEATURE_BUILDER = BuilderSpec(id="my_feature", factory=f"{__name__}:build_my_
 | `interaction_demo` | `robot_interaction_demo` |
 | `navigation`（含 `nav2` / `localization` / `navigation_command` / `voice_nav` 子模块） | `robot_navigation` |
 
-留在 robot_config 的内建条目：`control`、`auxiliary_actuators`、`simulation`、`controller_startup`、
-`perception`、`benchmark`、`audio_io`（无 provider 旧路径；provider 部署让位于
-runtime 外设）、`execution`、`motion_planning`、`embodied`，以及辅助模块 `cmd_vel`、`fast_lio`、
-`static_tf`、`description`、`hardware_mock`、`runtime`、`tracing`、`sim_backend`、
-`sim_peripheral_bridge`、`builder_support`。`hand_sources` 条目（含 `hand_profile` 参数与 P 位姿确认 hook）随遥操作输入源
+留在 robot_config 的内建条目（`launch_builders/`）：`control`、`auxiliary_actuators`、`simulation`、
+`controller_startup`、`perception`、`benchmark`、`audio_io`（无 provider 旧路径；provider 部署让位于
+runtime 外设）、`execution`、`motion_planning`、`embodied`，以及基础设施辅助模块 `cmd_vel`、
+`fast_lio`、`static_tf`、`description`、`hardware_mock`、`runtime`、`tracing`、`sim_backend`、
+`sim_peripheral_bridge`（框架自身的 7 个模块在 `launch_registry/`，见上文分工）。
+`hand_sources` 条目（含 `hand_profile` 参数与 P 位姿确认 hook）随遥操作输入源
 迁至 `robot_teleop/launch_builders/hand_sources.py`，经 entry point 注册。
 
 **未安装即不参与**：目标包未安装时其条目与 CLI 参数都不出现（`ros2 launch` 对未声明参数不报错），
@@ -210,7 +227,7 @@ runtime 外设）、`execution`、`motion_planning`、`embodied`，以及辅助�
 不再隐式参与；需要哪个业务，把它的归属包加进构建清单即可。**残留 egg-info**：迁移后旧 install
 目录可能同时存在新旧 entry point 导致 id 冲突（错误消息会指出两个值），重新构建相关包即可清除。
 
-**扩展可用的公开 helper**（`robot_config.launch_builders.builder_support`，扩展模块可直接导入）：
+**扩展可用的公开 helper**（`robot_config.launch_registry.builder_support`，扩展模块可直接导入）：
 `resolve_with_navigation`、`resolve_with_moveit`、`rerun_visualizer_requested`、
 `runtime_provider_name`、`resolve_display`、`readiness_attribute`。
 

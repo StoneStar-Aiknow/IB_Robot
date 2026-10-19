@@ -635,7 +635,7 @@ def _synthetic_recording_registry(monkeypatch, module, seen, preflight_calls, in
 
     from launch_ros.actions import Node
 
-    from robot_config.launch_builders.registry import BuilderSpec, BuildResult, HookSpec
+    from robot_config.launch_registry.registry import BuilderSpec, BuildResult, HookSpec
 
     synthetic = ModuleType("snapshot_gate_synthetic_recording")
 

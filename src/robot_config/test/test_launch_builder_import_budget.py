@@ -11,7 +11,7 @@ pulls in, plus ``ament_index_python`` and robot_config's hard dependency
 ``robot_runtime``.
 
 The subprocess probing and the core-budget computation live in
-``robot_config.launch_builders.import_budget`` (openspec change
+``robot_config.launch_registry.import_budget`` (openspec change
 ``migrate-business-launch-builders``, design decision 6) so every package
 contributing launch builders can pin the same rule; this test keeps its
 original assertions unchanged.
@@ -19,10 +19,30 @@ original assertions unchanged.
 
 from __future__ import annotations
 
-from robot_config.launch_builders.import_budget import (
+import json
+import subprocess
+import sys
+
+from robot_config.launch_registry.import_budget import (
     HARD_DEPENDENCY_ALLOWANCE,
     core_import_budget,
     imported_top_level_packages,
+)
+
+# The builtin entry modules that ``robot_config.launch_builders`` keeps
+# owning after the framework split (openspec change
+# ``split-launch-registry-package``): importing the registration framework
+# must never load any of them.
+BUILTIN_ENTRY_MODULES = (
+    "robot_config.launch_builders.control",
+    "robot_config.launch_builders.simulation",
+    "robot_config.launch_builders.readiness",
+    "robot_config.launch_builders.perception",
+    "robot_config.launch_builders.benchmark",
+    "robot_config.launch_builders.audio_io",
+    "robot_config.launch_builders.execution",
+    "robot_config.launch_builders.task_execution",
+    "robot_config.launch_builders.embodied",
 )
 
 
@@ -43,7 +63,7 @@ def test_builtin_registry_stays_within_the_core_import_budget():
     """
     core = core_import_budget()
     registry = imported_top_level_packages(
-        "from robot_config.launch_builders.builtin_registry import build_builtin_registry\n"
+        "from robot_config.launch_registry.builtin_registry import build_builtin_registry\n"
         "registry = build_builtin_registry()\n"
     )
     overflow = sorted(registry - core - HARD_DEPENDENCY_ALLOWANCE)
@@ -65,7 +85,7 @@ def test_launch_registry_with_extensions_stays_within_the_core_import_budget():
     """
     core = core_import_budget()
     registry = imported_top_level_packages(
-        "from robot_config.launch_builders.builtin_registry import build_launch_registry\n"
+        "from robot_config.launch_registry.builtin_registry import build_launch_registry\n"
         "registry = build_launch_registry(entry_points=[])\n"
     )
     overflow = sorted(registry - core - HARD_DEPENDENCY_ALLOWANCE)
@@ -93,12 +113,54 @@ def test_builtin_registry_does_not_import_known_business_packages():
         "robot_navigation",  # navigation.py sub-builders
     }
     loaded = imported_top_level_packages(
-        "from robot_config.launch_builders.builtin_registry import build_builtin_registry\nbuild_builtin_registry()\n"
+        "from robot_config.launch_registry.builtin_registry import build_builtin_registry\nbuild_builtin_registry()\n"
     )
     assert not (loaded & forbidden), (
         f"building the builtin registry imported business packages {sorted(loaded & forbidden)}; "
         "their imports must stay inside the build functions"
     )
+
+
+def test_registry_core_import_loads_no_builtin_entry_modules():
+    """Importing the framework core stays framework-only (design decision 3).
+
+    ``robot_config.launch_registry.registry`` is the import-light entry of
+    the split registration framework (openspec change
+    ``split-launch-registry-package``): a fresh interpreter importing it may
+    load framework modules and the infrastructure helpers they legitimately
+    need (``launch_builders.tracing`` through launch_options), but never a
+    builtin entry module (control, perception, execution, ...) — those load
+    only when the builtin table or an extension factory is resolved.
+    """
+    code = (
+        "import json\n"
+        "import sys\n"
+        "import robot_config.launch_registry.registry\n"
+        "loaded = sorted(n for n in sys.modules if n.startswith('robot_config.'))\n"
+        "print(json.dumps(loaded))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    loaded = json.loads(result.stdout)
+    forbidden = [name for name in BUILTIN_ENTRY_MODULES if name in loaded]
+    assert forbidden == [], (
+        f"importing robot_config.launch_registry.registry loaded builtin entry modules {forbidden}; "
+        "the framework core must stay import-light (design decision 3)"
+    )
+    allowed = {
+        "robot_config",
+        "robot_config.config",
+        "robot_config.observation_transport",
+        "robot_config.launch_registry",
+        "robot_config.launch_registry.registry",
+        "robot_config.launch_registry.launch_options",
+        "robot_config.launch_builders",
+        "robot_config.launch_builders.tracing",
+        "robot_config.logger_utils",
+        "robot_config.runtime_target",
+    }
+    unexpected = [name for name in loaded if name not in allowed]
+    assert unexpected == [], f"registry core imported unexpected robot_config modules: {unexpected}"
 
 
 def test_real_discovery_stays_within_the_core_budget_plus_discovered_packages():
@@ -112,7 +174,7 @@ def test_real_discovery_stays_within_the_core_budget_plus_discovered_packages():
     description generation."""
     from importlib.metadata import entry_points
 
-    from robot_config.launch_builders.builtin_registry import LAUNCH_BUILDER_ENTRY_POINT_GROUP
+    from robot_config.launch_registry.builtin_registry import LAUNCH_BUILDER_ENTRY_POINT_GROUP
 
     discovered = list(entry_points(group=LAUNCH_BUILDER_ENTRY_POINT_GROUP))
     owning_packages = {str(entry.value).partition(":")[0].partition(".")[0] for entry in discovered}
@@ -120,7 +182,7 @@ def test_real_discovery_stays_within_the_core_budget_plus_discovered_packages():
 
     core = core_import_budget()
     registry = imported_top_level_packages(
-        "from robot_config.launch_builders.builtin_registry import build_launch_registry\nbuild_launch_registry()\n"
+        "from robot_config.launch_registry.builtin_registry import build_launch_registry\nbuild_launch_registry()\n"
     )
     overflow = sorted(registry - core - HARD_DEPENDENCY_ALLOWANCE - owning_packages)
     assert overflow == [], (

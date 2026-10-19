@@ -17,8 +17,8 @@ from typing import Any
 
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.builder_support import runtime_provider_name
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.builder_support import runtime_provider_name
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     LaunchBuildContext,

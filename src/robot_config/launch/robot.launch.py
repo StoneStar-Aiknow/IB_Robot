@@ -5,7 +5,7 @@ This entry owns three responsibilities only (openspec change
 
 1. declare the launch arguments contributed by the builtin registry
    (core table + business contributions; the SSOT lives in
-   ``launch_builders/launch_options.py``);
+   ``launch_registry/launch_options.py``);
 2. run the preparation pipeline (``prepare_launch``): config load,
    CLI overrides, safety checks, live-binding target write-back and the
    frozen participation plan;
@@ -49,11 +49,11 @@ from robot_config.dds_environment import check_launch_dds
 # the production registry entry: builtin table + ibrobot.launch_builders entry
 # point extensions (see builtin_registry and the README's extension section).
 from robot_config.launch_builders import readiness as _readiness
-from robot_config.launch_builders.builtin_registry import build_launch_registry
-from robot_config.launch_builders.launch_options import declare_launch_arguments
-from robot_config.launch_builders.orchestrator import build_prepared_launch
-from robot_config.launch_builders.preparation import compose_registry_arguments, prepare_launch
 from robot_config.launch_builders.tracing import DEFAULT_TRACE_SESSION_NAME  # noqa: F401 (baseline tests read it here)
+from robot_config.launch_registry.builtin_registry import build_launch_registry
+from robot_config.launch_registry.launch_options import declare_launch_arguments
+from robot_config.launch_registry.orchestrator import build_prepared_launch
+from robot_config.launch_registry.preparation import compose_registry_arguments, prepare_launch
 
 
 def _controller_readiness_barrier(deferred_spawners, readiness_waiter):
@@ -94,7 +94,7 @@ def _apply_inference_cli_overrides(context, robot_config: dict, control_mode: st
     Compatibility wrapper over the preparation pipeline step; reads the two
     launch configurations exactly like the legacy entry did.
     """
-    from robot_config.launch_builders.preparation import _apply_inference_overrides
+    from robot_config.launch_registry.preparation import _apply_inference_overrides
 
     _apply_inference_overrides(
         {

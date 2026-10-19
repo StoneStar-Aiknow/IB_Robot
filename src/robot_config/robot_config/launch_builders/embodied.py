@@ -8,8 +8,8 @@ bodies are verbatim migrations. A lightweight module: no business run
 dependencies, so hooks run even when the entry never participates.
 """
 
-from robot_config.launch_builders.launch_options import ArgumentSpec
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.launch_options import ArgumentSpec
+from robot_config.launch_registry.registry import (
     BuilderSpec,
     BuildResult,
     HookSpec,

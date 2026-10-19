@@ -1,12 +1,12 @@
 """Behavioral tests for the launch_builders compatibility lazy facade.
 
 The facade must keep every legacy public symbol importable while
-importing NO builder submodule on package import: ``import
-robot_config.launch_builders.registry`` must not pull benchmark (and
-through it tensormsg) or any other business dependency. The
-no-submodule-import assertion runs in a fresh subprocess so it cannot be
-polluted by this pytest process importing business modules for other
-test files.
+importing NO builder submodule on package import: importing the
+registration framework (``robot_config.launch_registry.registry``) must
+not pull benchmark (and through it tensormsg) or any other business
+dependency. The no-submodule-import assertion runs in a fresh subprocess
+so it cannot be polluted by this pytest process importing business
+modules for other test files.
 """
 
 from __future__ import annotations
@@ -22,26 +22,26 @@ import robot_config.launch_builders as launch_builders_pkg
 
 def test_package_import_loads_no_builder_submodules():
     """A fresh interpreter must be able to import the package (and the
-    registry/launch_options infrastructure modules) without pulling any
+    framework registry/launch_options modules) without pulling any
     business builder submodule — benchmark (and through it tensormsg),
     control, perception, execution and friends must stay unloaded.
 
     The empty-submodule assertion applies to the bare package import;
-    importing registry/launch_options legitimately loads those two
-    modules plus tracing (launch_options reads the default trace session
-    name), so afterwards we assert the loaded set contains ONLY that
-    allowed infrastructure, never a business builder.
+    importing the framework registry/launch_options legitimately loads
+    those two modules plus tracing (launch_options reads the default
+    trace session name), so afterwards we assert the loaded set contains
+    ONLY that allowed infrastructure, never a business builder.
     """
     code = (
         "import sys\n"
         "import robot_config.launch_builders\n"
         "bare = [n for n in sys.modules if n.startswith('robot_config.launch_builders.')]\n"
         "assert bare == [], f'bare package import loaded submodules: {bare}'\n"
-        "import robot_config.launch_builders.registry\n"
-        "import robot_config.launch_builders.launch_options\n"
+        "import robot_config.launch_registry.registry\n"
+        "import robot_config.launch_registry.launch_options\n"
         "ALLOWED = {\n"
-        "    'robot_config.launch_builders.registry',\n"
-        "    'robot_config.launch_builders.launch_options',\n"
+        "    'robot_config.launch_registry.registry',\n"
+        "    'robot_config.launch_registry.launch_options',\n"
         "    'robot_config.launch_builders.tracing',\n"
         "}\n"
         "loaded = {n for n in sys.modules if n.startswith('robot_config.launch_builders.')}\n"

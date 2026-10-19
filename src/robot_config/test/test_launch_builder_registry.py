@@ -28,8 +28,8 @@ from types import SimpleNamespace
 import pytest
 from launch.actions import LogInfo
 
-from robot_config.launch_builders.launch_options import ArgumentSpec, compose_argument_specs
-from robot_config.launch_builders.registry import (
+from robot_config.launch_registry.launch_options import ArgumentSpec, compose_argument_specs
+from robot_config.launch_registry.registry import (
     BenchmarkStartup,
     BuilderSpec,
     BuildResult,
@@ -297,7 +297,7 @@ class TestBuiltinParticipation:
 
     @staticmethod
     def _plan_ids(**overrides) -> list[str]:
-        from robot_config.launch_builders.builtin_registry import build_builtin_registry
+        from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
         defaults = {
             "robot_config": {"name": "test_robot"},
@@ -366,8 +366,8 @@ class TestSkipLogging:
     owning filter (mock skip key or enabled predicate) — design decision 2."""
 
     def _plan_with_log_spy(self, monkeypatch, context):
-        from robot_config.launch_builders import registry as registry_module
-        from robot_config.launch_builders.builtin_registry import build_builtin_registry
+        from robot_config.launch_registry import registry as registry_module
+        from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
         messages = []
         monkeypatch.setattr(
@@ -639,7 +639,7 @@ class TestContextPropagation:
         injected extensions) is pinned by dataset_tools' suite."""
         from robot_config.launch_builders import benchmark as benchmark_module
         from robot_config.launch_builders import execution as execution_module
-        from robot_config.launch_builders.builtin_registry import build_builtin_registry
+        from robot_config.launch_registry.builtin_registry import build_builtin_registry
 
         # Builtin declaration check: the retained consumer declares after="benchmark".
         builtin_specs = {spec.id: spec for spec in build_builtin_registry().snapshot()}

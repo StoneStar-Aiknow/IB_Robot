@@ -1,5 +1,8 @@
 """Explicit builtin launch-builder registration table (ordered references).
 
+The registration framework lives in ``robot_config.launch_registry``
+(openspec change ``split-launch-registry-package``).
+
 Implements design decision 1 of openspec change
 ``decentralize-launch-builder-registration``: every builtin entry's
 ``BuilderSpec`` constant and ``build_<id>`` function live in its domain
@@ -34,8 +37,8 @@ line here; no other module changes.
 
 Import budget (design decision 2): building the registry imports every
 builtin domain module, so those modules keep their cross-package run
-dependencies function-local (see ``builder_support.py`` for the shared
-enable-predicate helpers); the import-budget test pins the allowed
+dependencies function-local (see ``launch_registry/builder_support.py`` for the
+shared enable-predicate helpers); the import-budget test pins the allowed
 non-stdlib top-level package set to the registry core + ``launch`` +
 ``launch_ros`` + ``ament_index_python``.
 
@@ -51,7 +54,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from robot_config.launch_builders.registry import LaunchBuilderRegistry
+from robot_config.launch_registry.registry import LaunchBuilderRegistry
 
 # Ordered builtin builder references ("module:<ID>_BUILDER"). The order is
 # the registration order and the stable tie-breaker for topological sorting;
@@ -132,7 +135,7 @@ def _extension_entries(entry_points):
     rejected as :class:`RegistryError` naming the offending entry point.
     Entries are ordered by (name, value) for deterministic composition.
     """
-    from robot_config.launch_builders.registry import BuilderSpec, RegistryError
+    from robot_config.launch_registry.registry import BuilderSpec, RegistryError
 
     if entry_points is None:
         from importlib.metadata import entry_points as discover_entry_points
@@ -214,7 +217,7 @@ def build_launch_registry(*, entry_points=None) -> LaunchBuilderRegistry:
     points); ``None`` discovers the ``ibrobot.launch_builders`` group through
     :func:`importlib.metadata.entry_points`.
     """
-    from robot_config.launch_builders.registry import RegistryError
+    from robot_config.launch_registry.registry import RegistryError
 
     registry = build_builtin_registry()
     for name, value, specs in _extension_entries(entry_points):

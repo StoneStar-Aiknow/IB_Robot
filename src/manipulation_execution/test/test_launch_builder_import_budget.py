@@ -6,12 +6,12 @@ importing this package's ``launch_builders`` modules (which the
 description generation) must not pull in non-stdlib top-level packages
 beyond the registry core budget and this package itself. The subprocess
 probing and the core-budget computation are shared through
-``robot_config.launch_builders.import_budget``.
+``robot_config.launch_registry.import_budget``.
 """
 
 from __future__ import annotations
 
-from robot_config.launch_builders.import_budget import (
+from robot_config.launch_registry.import_budget import (
     HARD_DEPENDENCY_ALLOWANCE,
     core_import_budget,
     imported_top_level_packages,
