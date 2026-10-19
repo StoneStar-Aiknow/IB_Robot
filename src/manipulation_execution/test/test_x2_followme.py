@@ -87,3 +87,16 @@ def test_reset_input_keeps_the_sessions_guard_counts_and_notes(monkeypatch):
     assert stream._stream.retargeter.max_anchor_frames == 10
     for key in ("branch_guard_trips", "branch_guard_worst", "notes"):
         assert after[key] == before[key], key
+
+
+def test_jittery_ticks_still_get_one_sample_each():
+    # Ticks a millisecond either side of the 50 Hz grid, as a ROS timer delivers them.
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    stream.start_round()
+    for i in range(12):
+        stream.push_pose(i * 0.05, stream.retarget(i * 0.05, i, _raw()))
+    now = 0.6
+    while not stream.poll(now):
+        now += 0.02
+    counts = [len(stream.poll(now + k * 0.02 + (0.001 if k % 2 else -0.001))) for k in range(1, 40)]
+    assert counts == [1] * len(counts)

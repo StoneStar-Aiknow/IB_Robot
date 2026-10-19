@@ -130,7 +130,12 @@ class X2FollowMe:
         self._stream.reset(_session())
 
     def poll(self, now: float) -> list[np.ndarray]:
-        return [sample.pose for sample in self._stream.poll(float(now))]
+        # The output clock starts on the poll that opens the gate, so later samples fall
+        # due exactly on the caller's tick phase: a tick that runs a little early finds
+        # none and the next finds two. Once started, read half a step ahead so jitter
+        # under half a period still yields one sample per tick.
+        lead = 0.5 * self._stream.session.dt if self._stream._t0 is not None else 0.0
+        return [sample.pose for sample in self._stream.poll(float(now) + lead)]
 
     def status(self) -> dict:
         stream = self._stream
