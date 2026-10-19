@@ -191,13 +191,16 @@ def test_vendor_endpoint_qos_matches_the_documented_profiles(profile):
     """QoS is part of the endpoint contract; a mismatch drops messages silently.
 
     The platform subscribes RELIABLE on audio playback, so publishing
-    BEST_EFFORT there delivers nothing (observed on the robot). Its state topics
-    publish TRANSIENT_LOCAL, so subscribing TRANSIENT_LOCAL picks up the current
-    value on subscribe instead of waiting for the next sample.
+    BEST_EFFORT there delivers nothing (observed on the robot). Audio capture
+    runs the other way: the platform publishes it RELIABLE with a 1000-deep
+    history, and a RELIABLE reader lets it retransmit from that history on
+    every lost fragment, so it is read BEST_EFFORT as the SDK examples do. Its
+    state topics publish TRANSIENT_LOCAL, so subscribing TRANSIENT_LOCAL picks
+    up the current value on subscribe instead of waiting for the next sample.
     """
     qos = profile["vendor"]["qos"]
     assert qos["audio_playback"]["reliability"] == "reliable"
-    assert qos["audio_capture"]["reliability"] == "reliable"
+    assert qos["audio_capture"]["reliability"] == "best_effort"
     for key in ("mc_state", "system_state", "joint_state", "hand_state", "power_state"):
         assert qos[key]["durability"] == "transient_local", key
     # The vendor's own command topics are BEST_EFFORT + VOLATILE.

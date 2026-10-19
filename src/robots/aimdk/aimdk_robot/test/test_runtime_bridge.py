@@ -921,6 +921,23 @@ def test_vendor_audio_playback_is_published_reliable(harness):
     assert harness.runtime._locomotion_pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
 
 
+def test_vendor_audio_capture_is_read_best_effort(harness):
+    """The platform publishes capture RELIABLE from a 1000-deep history.
+
+    A RELIABLE reader lets it retransmit that history whenever a fragment is
+    lost; capture traffic to RELIABLE readers filled the SoC's egress on the
+    robot (2026-10-16). The SDK's own raw-audio examples read it BEST_EFFORT
+    with a 500-deep queue.
+    """
+    from rclpy.qos import ReliabilityPolicy
+
+    harness.wait_active()
+    capture = [s for s in harness.runtime.subscriptions if s.topic_name == "/aima/hal/audio/capture"]
+    assert len(capture) == 1
+    assert capture[0].qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert capture[0].qos_profile.depth == 500
+
+
 def test_audio_play_reaches_the_platform(harness):
     """End to end over the QoS the platform really uses.
 

@@ -426,11 +426,14 @@ class AimdkRuntimeNode(Node):
         self._audio_info_pub = self.create_publisher(AudioInfo, str(audio.get("info_topic", "/audio/info")), 1)
         self._audio_stamped_type = AudioDataStamped
         self._audio_info_type = AudioInfo
+        # BEST_EFFORT by default, as the SDK's raw-audio examples subscribe; the
+        # profile's vendor.qos explains why (a RELIABLE reader lets the platform
+        # retransmit from its 1000-deep capture history).
         self.create_subscription(
             audio_capture_type,
             str(topics["audio_capture"]),
             self._on_audio_capture,
-            self._vendor_qos("audio_capture", reliability="reliable"),
+            self._vendor_qos("audio_capture", reliability="best_effort", depth=500),
         )
         if topics.get("audio_playback"):
             from aimdk_msgs.msg import AudioPlayback, FocusResponse  # noqa: PLC0415
