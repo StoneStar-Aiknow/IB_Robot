@@ -64,6 +64,7 @@ from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_builders.motion_imitation_stream import (
     mock_playback_endpoints,
     mock_reset_pose,
+    mock_velocity_limits,
     motion_imitation_stream_parameters,
 )
 from robot_config.utils import resolve_ros_path
@@ -255,6 +256,7 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     stream = motion_imitation_stream_parameters(robot_config) or {}
     mock = mock_playback_endpoints(robot_config) or ("", "")
     reset_pose = mock_reset_pose(robot_config)
+    velocity = mock_velocity_limits(robot_config)
     business = _business(config, mock=bool(mock[1]))
     parameters = {
         **release_parameters,
@@ -267,6 +269,7 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         "mock_preview_topic": mock[0],
         "mock_play_service": mock[1],
         "mock_reset_pose_json": json.dumps(reset_pose) if reset_pose else "",
+        "mock_velocity_limits_json": json.dumps(velocity) if velocity else "",
         "business_hooks": business["hooks"],
         "business_config": business["config"],
     }

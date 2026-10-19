@@ -146,6 +146,29 @@ def mock_reset_pose(robot_config: Mapping) -> list[float] | None:
     return values
 
 
+def mock_velocity_limits(robot_config: Mapping) -> list[float] | None:
+    """The mock pipeline's ``arm_velocity_limits`` in the arm channel's order (rad/s), or None if disabled.
+
+    The session limits each tick of the window pipeline to them, as the player
+    node limits its own output.
+    """
+    config = _stream_config(robot_config)
+    mock = None if config is None else _mock_config(config)
+    if mock is None:
+        return None
+    _, joint_names = _arm_stream(robot_config)
+    _, velocity = _arm_limits(mock, joint_names)
+    values = []
+    for name in joint_names:
+        value = velocity[name]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"motion_imitation_stream.mock_playback.arm_velocity_limits.{name} must be a positive number"
+            )
+        values.append(float(value))
+    return values
+
+
 def generate_motion_imitation_stream_nodes(robot_config: dict) -> list[Node]:
     """Launch the head-camera -> YOLOX -> PEAR frame stream, if the robot enables it."""
     config = _stream_config(robot_config)
@@ -430,5 +453,6 @@ __all__ = [
     "generate_motion_imitation_stream_nodes",
     "mock_playback_endpoints",
     "mock_reset_pose",
+    "mock_velocity_limits",
     "motion_imitation_stream_parameters",
 ]

@@ -28,6 +28,11 @@ Parameters (one parameter file serves the node and the release script):
                               order) the mock window pipeline resets to,
                               approach and wrap-up included; empty: the
                               ``SessionHooks`` defaults
+``mock_velocity_limits_json`` JSON list of the 14 arm speeds (rad/s,
+                              arm_stream order); each joint of the mock window
+                              pipeline's command moves at most this times one
+                              tick (1 / ``publish_rate_hz``) from the last one
+                              sent; empty: passed through
 ``business_hooks``            ``""``: the window pipeline above; ``demo``: the
                               demo start/cancel rules around it;
                               ``pkg.mod:Class``: a business hooks class, not
@@ -101,7 +106,7 @@ from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode
 from manipulation_execution.mirror_session.business import build_hooks, load_business_config
 from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
-from manipulation_execution.mirror_session.endpoints import RELEASE_INTERFACES, resolve_endpoints
+from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, RELEASE_INTERFACES, resolve_endpoints
 from manipulation_execution.mirror_session.hooks import HookContext
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
@@ -206,6 +211,7 @@ SESSION_PARAMETERS = {
     "mock_preview_topic": "",
     "mock_play_service": "",
     "mock_reset_pose_json": "",
+    "mock_velocity_limits_json": "",
     "business_hooks": "",
     "business_config": "",
 }
@@ -236,6 +242,17 @@ def _string(node: Node, name: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     return value
+
+
+def _max_step(velocity: object, rate_hz: float) -> list[float]:
+    """Per-tick steps from ``mock_velocity_limits_json``: 14 positive finite rad/s."""
+    if (
+        not isinstance(velocity, list)
+        or len(velocity) != ARM_JOINT_COUNT
+        or not all(type(v) in (int, float) and math.isfinite(v) and v > 0.0 for v in velocity)
+    ):
+        raise ValueError(f"mock_velocity_limits_json must list {ARM_JOINT_COUNT} positive finite rad/s")
+    return [float(v) / rate_hz for v in velocity]
 
 
 TRANSITION_FIELDS = ("from", "to", "reason", "t")
@@ -339,7 +356,11 @@ class MirrorSessionNode(Node):
         if reset_pose_json and not mock_preview:
             raise ValueError("mock_reset_pose_json belongs to the mock window pipeline (mock_preview_topic)")
         reset_pose = json.loads(reset_pose_json) if reset_pose_json else None
-        self._mock = MockPlaybackHooks(self._request_play, reset_pose) if mock_preview else None
+        velocity_json = _string(self, "mock_velocity_limits_json")
+        if velocity_json and not mock_preview:
+            raise ValueError("mock_velocity_limits_json belongs to the mock window pipeline (mock_preview_topic)")
+        max_step = _max_step(json.loads(velocity_json), rate) if velocity_json else None
+        self._mock = MockPlaybackHooks(self._request_play, reset_pose, max_step) if mock_preview else None
         endpoints = resolve_endpoints(description, policy_mode=policy_mode)
         business = load_business_config(business_config)
         config = SessionConfig(policy_mode, endpoints.identity, stop_timeout_s=stop_timeout, **business.timing)

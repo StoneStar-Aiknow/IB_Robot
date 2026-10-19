@@ -13,6 +13,13 @@ the arm and hand channels. Per round:
 * ``retarget`` hands each preview to the gate once, hands at 20 zeros
   (the left hand's sign convention is not established); with no new
   preview it passes nothing and the gate holds;
+* ``post_process`` with a ``max_step`` (14 arm values, radians per tick)
+  moves each joint at most that far from the gate's last command. The mock
+  node limits its own steps, but the session ticks on its own timer: a tick
+  that finds no new preview holds, and the next takes the newest, two of the
+  mock's steps at once. A limited command is handed over again on the
+  next tick with no new preview, so the arm still arrives where the mock
+  stopped. Without a ``max_step`` it passes the command through;
 * ``end_round`` pauses the mock (``~/play`` false).
 
 The paused mock publishes nothing, so between rounds no preview is in flight.
@@ -34,6 +41,7 @@ rated speeds. Everything else keeps the ``SessionHooks`` default.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
 from collections.abc import Callable, Sequence
@@ -60,12 +68,23 @@ RETURN_DURATION_S = 2.0  # cancel / stop, as the runtime's blend-out
 class MockPlaybackHooks(SessionHooks):
     """``SessionHooks`` defaults, except a window pipeline fed by the mock's preview."""
 
-    def __init__(self, request_play: PlayRequest, reset_pose: Sequence[float] | None = None):
+    def __init__(
+        self,
+        request_play: PlayRequest,
+        reset_pose: Sequence[float] | None = None,
+        max_step: Sequence[float] | None = None,
+    ):
         if reset_pose is not None:
             reset_pose = tuple(float(v) for v in reset_pose)
             if len(reset_pose) != ARM_JOINT_COUNT or not all(map(math.isfinite, reset_pose)):
                 raise ValueError(f"reset_pose needs {ARM_JOINT_COUNT} finite values, got {reset_pose!r}")
+        if max_step is not None:
+            max_step = tuple(float(v) for v in max_step)
+            if len(max_step) != ARM_JOINT_COUNT or not all(math.isfinite(v) and v > 0.0 for v in max_step):
+                raise ValueError(f"max_step needs {ARM_JOINT_COUNT} finite positive values, got {max_step!r}")
         self._reset_arm = reset_pose
+        self._max_step = max_step
+        self._last_sent: tuple[float, ...] | None = None
         self._return_from: tuple[float, ...] | None = None
         self._approach_elapsed: float | None = None
         self._request_play = request_play
@@ -73,8 +92,10 @@ class MockPlaybackHooks(SessionHooks):
         self._round = 0
         self._accepting = False
         self._pending: tuple[float, ...] | None = None
+        self._unreached: UpperBodyCommand | None = None  # the last command post_process limited
         self.taken = 0
         self.dropped = 0
+        self.limited = 0
 
     def begin_round(self) -> None:
         self._request_play(True, self._next_round())
@@ -88,6 +109,7 @@ class MockPlaybackHooks(SessionHooks):
             self._round += 1
             self._accepting = False
             self._pending = None
+            self._unreached = None
             return self._round
 
     def acknowledge(self, round_id: int, playing: bool, success: bool) -> None:
@@ -106,23 +128,42 @@ class MockPlaybackHooks(SessionHooks):
             self._pending = values
 
     def retarget(self, inputs: SessionInputs) -> UpperBodyCommand | None:
-        """The newest preview, once. The PEAR content is ignored, as in the mock node."""
+        """The newest preview, once, else a command ``post_process`` has not reached yet.
+
+        The PEAR content is ignored, as in the mock node.
+        """
+        last = inputs.last_sent
+        self._last_sent = None if last is None else tuple(last.arm)
         with self._lock:
             arm, self._pending = self._pending, None
             if arm is not None:
                 self.taken += 1
+            unreached, self._unreached = self._unreached, None
         if arm is None:
-            return None
+            return unreached
         return UpperBodyCommand(arm, (0.0,) * HAND_JOINT_COUNT)
 
     def post_process(self, command: UpperBodyCommand) -> UpperBodyCommand | None:
-        """Pass through: no limit is applied here.
+        """At most ``max_step`` per joint from the gate's last command, as ``retarget`` saw it.
 
-        The mock node clamps every command to the joint limits. Its rate limit
-        does not cover the first command after a (re)start, so that command
-        can step from the held pose to frame 0 of the clip.
+        The joint limits are the mock node's: it clamps every command to them.
+        Without a ``max_step``, or before the gate sent anything, the command
+        passes through.
         """
-        return command
+        last = self._last_sent
+        if self._max_step is None or last is None or len(last) != ARM_JOINT_COUNT:
+            return command
+        if all(abs(goal - now) <= step for goal, now, step in zip(command.arm, last, self._max_step)):
+            return command
+        arm = tuple(
+            goal if abs(goal - now) <= step else now + math.copysign(step, goal - now)
+            for goal, now, step in zip(command.arm, last, self._max_step)
+        )
+        with self._lock:
+            self.limited += 1
+            if self._accepting:
+                self._unreached = command
+        return dataclasses.replace(command, arm=arm)
 
     def reset_pose(self, arm_at_takeover: Sequence[float] | None) -> UpperBodyCommand | None:
         if self._reset_arm is None:
@@ -180,4 +221,10 @@ class MockPlaybackHooks(SessionHooks):
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {"round": self._round, "accepting": self._accepting, "taken": self.taken, "dropped": self.dropped}
+            return {
+                "round": self._round,
+                "accepting": self._accepting,
+                "taken": self.taken,
+                "dropped": self.dropped,
+                "limited": self.limited,
+            }
