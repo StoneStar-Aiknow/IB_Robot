@@ -12,12 +12,22 @@ its inputs and its round:
 * mirroring is on by default (her right arm drives the robot's left), as in the
   runtime's follow-me;
 * the runtime's own rate limiter only counts here (``limit_rate=False``); the
-  live node caps the published command against the robot's measured bands.
+  live node caps the published command against the robot's measured bands;
+* with ``separate_process=True`` the mapping (``retarget``/``reset_input``) runs
+  in a child process. On duck one frame costs ~36 ms of the GIL, and a worker
+  thread holding it starved the 50 Hz timer down to ~17 Hz.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
 from collections.abc import Sequence
+from multiprocessing.connection import Connection
 
 import numpy as np
 
@@ -33,6 +43,9 @@ POSE_DIM = 52 * 6
 MAX_ANCHOR_FRAMES = 200
 # Notes kept across retargeter rebuilds and per-frame truncation notes.
 NOTES_KEPT = 10
+# Status keys that describe the mapping; with a child process they come from there.
+_MAPPING_KEYS = ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets")
+_CHILD_START_TIMEOUT_S = 120.0
 
 
 def _session() -> core.Session:
@@ -43,7 +56,8 @@ class X2FollowMe:
     """``RetargetStream`` for the X2 arms, in ``ARM_JOINT_NAMES`` (arm_pos) order."""
 
     def __init__(self, *, base_pose: Sequence[float], latency_s: float = core.DEFAULT_LATENCY_S,
-                 lookahead_s: float = core.DEFAULT_LOOKAHEAD_S, mirror: bool = True):
+                 lookahead_s: float = core.DEFAULT_LOOKAHEAD_S, mirror: bool = True,
+                 separate_process: bool = False):
         self._vendor = core._import_vendor()
         self.joint_names = tuple(self._vendor["ARM_JOINT_NAMES"])
         base = np.asarray(base_pose, dtype=np.float64)
@@ -60,6 +74,10 @@ class X2FollowMe:
         self._guard_trips = 0
         self._guard_worst = 0
         self._dry_run()
+        self._child = None
+        if separate_process:
+            self._child = _MappingProcess(dict(base_pose=base.tolist(), latency_s=latency_s,
+                                               lookahead_s=lookahead_s, mirror=mirror))
 
     def _dry_run(self) -> None:
         """Pay the first-call costs now and run the mirror's FK self-check once.
@@ -101,6 +119,8 @@ class X2FollowMe:
                                 body_pose=rotations[1:22], global_orient=rotations[0])
 
     def retarget(self, t_camera: float, frame_id: int, smplx_pose_raw) -> np.ndarray:
+        if self._child is not None:
+            return self._child.retarget(t_camera, frame_id, smplx_pose_raw)
         retargeter = self._stream.retargeter
         pose = retargeter.push(self._frame(t_camera, frame_id, smplx_pose_raw))
         del retargeter.notes[:-NOTES_KEPT]
@@ -111,6 +131,9 @@ class X2FollowMe:
         self._stream.push_pose(float(t_camera), pose)
 
     def reset_input(self) -> None:
+        if self._child is not None:
+            self._child.reset_input()
+            return
         # The branch guard follows one person's wrist unwrap; across a gap there is
         # no continuity to keep. The despiker's velocity statistics are the arm's,
         # not the person's, and the runtime keeps them across rounds too.
@@ -140,7 +163,7 @@ class X2FollowMe:
     def status(self) -> dict:
         stream = self._stream
         guard = stream.retargeter.guard
-        return {
+        status = {
             "phase": stream.session.phase(stream._k)[0] if stream._t0 is not None else "filling",
             "buffered": len(stream._buf),
             "starved_frames": stream.starved_frames,
@@ -153,6 +176,105 @@ class X2FollowMe:
             "input_resets": self.input_resets,
             "notes": (stream.notes + stream.retargeter.notes)[-3:],
         }
+        if self._child is not None:
+            mapping = self._child.mapping_status
+            status.update({key: mapping[key] for key in _MAPPING_KEYS})
+            status["notes"] = (stream.notes + mapping["notes"])[-3:]
+        return status
+
+    def close(self) -> None:
+        if self._child is not None:
+            self._child.close()
+
+
+class _MappingProcess:
+    """An in-process ``X2FollowMe`` in a child interpreter, driven over a socket pair.
+
+    Only ``retarget`` waits for an answer (on the worker thread, without the GIL);
+    ``reset_input`` is fire-and-forget, and the socket keeps it ahead of the next frame.
+    The child is a fresh ``python3 -c``, not multiprocessing's spawn, which would
+    re-run the parent's main script.
+    """
+
+    def __init__(self, params: dict):
+        ours, theirs = socket.socketpair()
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+        code = f"from {__name__} import _serve_mapping; _serve_mapping({theirs.fileno()}, {json.dumps(params)!r})"
+        self._process = subprocess.Popen([sys.executable, "-c", code], pass_fds=(theirs.fileno(),), env=env)
+        theirs.close()
+        self._conn = Connection(ours.detach())
+        if not self._conn.poll(_CHILD_START_TIMEOUT_S):
+            self.close()
+            raise RuntimeError("the mapping process did not start")
+        kind, payload = self._conn.recv()
+        if kind != "ready":
+            self.close()
+            raise RuntimeError(f"the mapping process failed to start: {payload}")
+        self.mapping_status = payload
+
+    def retarget(self, t_camera, frame_id, smplx_pose_raw) -> np.ndarray:
+        raw = np.asarray(smplx_pose_raw, dtype=np.float64)
+        try:
+            self._conn.send(("frame", float(t_camera), int(frame_id), raw))
+            kind, payload, mapping = self._conn.recv()
+        except (EOFError, OSError) as exc:
+            raise RuntimeError(f"the mapping process is gone (exit code {self._process.poll()})") from exc
+        self.mapping_status = mapping
+        if kind == "error":
+            raise ValueError(payload)
+        return payload
+
+    def reset_input(self) -> None:
+        try:
+            self._conn.send(("reset",))
+        except OSError:
+            pass  # the next retarget reports the dead child
+
+    def close(self) -> None:
+        try:
+            self._conn.send(("close",))
+        except OSError:
+            pass
+        try:
+            self._process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+        self._conn.close()
+
+
+def _mapping_status(stream: X2FollowMe) -> dict:
+    status = stream.status()
+    return {**{key: status[key] for key in _MAPPING_KEYS}, "notes": stream._stream.retargeter.notes[-3:]}
+
+
+def _serve_mapping(fd: int, params_json: str) -> None:
+    # The parent decides when to stop: Ctrl-C reaches the whole process group.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    conn = Connection(fd)
+    params = json.loads(params_json)
+    try:
+        stream = X2FollowMe(**params)
+    except Exception as exc:  # noqa: BLE001 - reported to the parent, which raises it
+        conn.send(("failed", repr(exc)))
+        return
+    conn.send(("ready", _mapping_status(stream)))
+    while True:
+        try:
+            message = conn.recv()
+        except (EOFError, OSError):
+            return
+        if message[0] == "close":
+            return
+        if message[0] == "reset":
+            stream.reset_input()
+            continue
+        _, t_camera, frame_id, raw = message
+        try:
+            reply = ("pose", stream.retarget(t_camera, frame_id, raw))
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not end the child
+            reply = ("error", repr(exc)[:200])
+        conn.send((*reply, _mapping_status(stream)))
 
 
 def create(*, base_pose: Sequence[float], **params) -> X2FollowMe:

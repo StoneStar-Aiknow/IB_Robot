@@ -116,6 +116,9 @@ class LivePlayer:
             # Frames never processed count as dropped, so input always balances.
             self._dropped += len(self._queue)
             self._queue.clear()
+        close = getattr(self._stream, "close", None)
+        if close is not None:
+            close()
 
     # -- output (service and timers) -----------------------------------------------
     def play(self, on: bool) -> None:

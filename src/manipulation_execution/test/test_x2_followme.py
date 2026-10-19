@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from manipulation_execution.imitation_retargeting.rotations import encode_rotation_6d
@@ -100,3 +101,26 @@ def test_jittery_ticks_still_get_one_sample_each():
         now += 0.02
     counts = [len(stream.poll(now + k * 0.02 + (0.001 if k % 2 else -0.001))) for k in range(1, 40)]
     assert counts == [1] * len(counts)
+
+
+def test_a_mapping_process_gives_the_in_process_poses_and_counts():
+    body_index, axis = create_stream("x2_followme", base_pose=NEUTRAL)._stream.retargeter.guard.channels[0]
+    raws = [_raw(body_index, axis, a) for a in np.linspace(2.6, 3.6, 30)]
+    local = create_stream("x2_followme", base_pose=NEUTRAL)
+    remote = create_stream("x2_followme", base_pose=NEUTRAL, separate_process=True)
+    try:
+        for stream in (local, remote):
+            stream.reset_input()
+        poses = [(local.retarget(i * 0.05, i, r), remote.retarget(i * 0.05, i, r)) for i, r in enumerate(raws)]
+        for mine, theirs in poses:
+            np.testing.assert_array_equal(mine, theirs)
+        local_status, remote_status = local.status(), remote.status()
+        assert remote_status["branch_guard_trips"] > 0
+        for key in ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "notes"):
+            assert remote_status[key] == local_status[key], key
+        with pytest.raises(ValueError, match="smplx_pose_raw"):
+            remote.retarget(2.0, 99, np.zeros(5))
+        np.testing.assert_array_equal(remote.retarget(2.05, 100, raws[-1]), local.retarget(2.05, 100, raws[-1]))
+    finally:
+        remote.close()
+    assert remote._child._process.poll() == 0

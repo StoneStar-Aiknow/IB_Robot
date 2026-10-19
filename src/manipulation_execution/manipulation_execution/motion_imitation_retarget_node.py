@@ -111,8 +111,10 @@ class MotionImitationRetargetNode(Node):
         rated = self._velocity_array(json.loads(str(self.get_parameter("velocity_limits_json").value)))
         reset_pose = self._reset_pose(json.loads(str(self.get_parameter("reset_pose_json").value)))
 
+        # The mapping runs in its own process: in a thread it holds the GIL long enough
+        # to starve the 50 Hz timer (17 Hz on duck).
         stream = create_stream(retargeter, base_pose=reset_pose, latency_s=latency_s, lookahead_s=lookahead_s,
-                               mirror=mirror)
+                               mirror=mirror, separate_process=True)
         if self._joint_names != tuple(stream.joint_names):
             raise ValueError(
                 f"joint_names_json {list(self._joint_names)} does not match the {retargeter} stream's joint "
