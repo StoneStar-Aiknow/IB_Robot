@@ -59,14 +59,24 @@ def _launch_setup(context, *_args, **_kwargs):
         profile["runtime"]["instance_id"] = instance_id
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
-    profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
+    # Description rendering needs the deployment-final peripheral set: a
+    # disabled camera must be absent from the URDF and the description. The
+    # stack helpers and the facade below each apply the fragment exactly once
+    # against the raw profile, so they keep the untouched profile and the
+    # fragment path - folding the merge into the profile they receive would
+    # apply a disable toggle twice, and the second pass would reject it as a
+    # toggle for an undeclared peripheral (the disabled entry is gone).
+    effective_profile = {
+        **profile,
+        "peripherals": merge_peripherals(profile.get("peripherals"), fragment.get("peripherals")),
+    }
     gazebo_world = LaunchConfiguration("gazebo_world").perform(context).strip()
     spawn_pose = tuple(float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw"))
     if transport == "gazebo":
-        robot_description = render_gazebo_description(profile, profile_path, spawn_pose=spawn_pose)
+        robot_description = render_gazebo_description(effective_profile, profile_path, spawn_pose=spawn_pose)
     else:
-        robot_description = render_robot_description(profile, profile_path, simulated)
-    description = build_description(profile, robot_description=robot_description, transport=transport)
+        robot_description = render_robot_description(effective_profile, profile_path, simulated)
+    description = build_description(effective_profile, robot_description=robot_description, transport=transport)
 
     motion = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -93,7 +103,7 @@ def _launch_setup(context, *_args, **_kwargs):
             spawn_pose=spawn_pose,
         ),
         motion,
-        *peripheral_stack_actions(profile, "", simulated, description=description, transport=transport),
+        *peripheral_stack_actions(profile, peripherals_file, simulated, description=description, transport=transport),
         *generate_teleoperation_nodes(profile, description, {"robot_description": robot_description}),
     ]
 

@@ -532,19 +532,19 @@ def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
 
 
 def test_shared_loader_preserves_source_path_metadata():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_arm_aero_hand.yaml"
     robot_config = load_robot_config_dict(config_path)
 
-    assert robot_config["name"] == "so101_single_arm"
+    assert robot_config["name"] == "so101_arm_aero_hand"
     assert robot_config["_config_path"] == str(config_path.resolve())
     assert robot_config["_config_sources"] == [str(config_path.resolve())]
 
 
 def test_launch_loader_uses_shared_dict_loader():
-    robot_config = robot_launch.load_robot_config("so101_single_arm_legacy")
+    robot_config = robot_launch.load_robot_config("so101_arm_aero_hand")
 
-    assert robot_config["name"] == "so101_single_arm"
-    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm_legacy.yaml")
+    assert robot_config["name"] == "so101_arm_aero_hand"
+    assert robot_config["_config_path"].endswith("config/robots/so101_arm_aero_hand.yaml")
 
 
 def test_default_trace_session_auto_suffixes_on_collision(monkeypatch, tmp_path):
@@ -997,7 +997,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
     monkeypatch.setattr(tracing_builder, "_resolve_trace_session", lambda name, _root: (name, tmp_path / name))
     monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda _command, _reason: None)
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_arm_aero_hand.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
     bundle = _create_inference_bundle(tmp_path / "model")
@@ -1007,7 +1007,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
 
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "so101_single_arm_legacy"
+    context.launch_configurations["robot_config"] = "so101_arm_aero_hand"
     context.launch_configurations["config_path"] = str(config_path)
     context.launch_configurations["use_sim"] = "true"
     context.launch_configurations["sim_platform"] = "mock"

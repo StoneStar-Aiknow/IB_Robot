@@ -70,10 +70,20 @@ def _context(config_path, robot_config="lekiwi_rtp_distributed"):
 
 
 def _profile_copy(tmp_path, name="lekiwi_rtp_distributed"):
-    """Copy a shipped profile so tests can tweak it without touching the repo."""
+    """Copy a shipped profile so tests can tweak it without touching the repo.
+
+    Overlay profiles (base_config) bring their base along: the loader resolves
+    the base relative to the overlay file's directory.
+    """
     profile = yaml.safe_load((_PROFILE_DIR / f"{name}.yaml").read_text(encoding="utf-8"))
     target = tmp_path / f"{name}.yaml"
     target.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    base_name = str(profile.get("robot", {}).get("base_config", "") or "").removesuffix(".yaml")
+    if base_name and (_PROFILE_DIR / f"{base_name}.yaml").is_file():
+        base = yaml.safe_load((_PROFILE_DIR / f"{base_name}.yaml").read_text(encoding="utf-8"))
+        (tmp_path / f"{base_name}.yaml").write_text(
+            yaml.safe_dump(base, sort_keys=False, allow_unicode=True), encoding="utf-8"
+        )
     return profile, target
 
 
@@ -142,11 +152,24 @@ def test_launch_setup_rejects_a_profile_without_teleop_devices(tmp_path):
 
 
 def test_launch_setup_accepts_any_profile_not_just_lekiwi(tmp_path, monkeypatch):
-    """The entry is generic; the profile is an argument, not a hard-coded name."""
-    monkeypatch.setenv("HOME", str(_calibrated_home(tmp_path, "so101_leader_calibrate", "so101_follower_calibrate")))
-    _, config_path = _profile_copy(tmp_path, name="so101_rtp_distributed")
+    """The entry is generic; the profile is an argument, not a hard-coded name.
 
-    actions = teleop_operator_launch.launch_setup(_context(config_path, robot_config="so101_rtp_distributed"))
+    Uses so101_arm_aero_hand (a non-LeKiWi, provider-less profile with a full
+    teleoperation device set): the entry must load whatever profile it is
+    given. Provider profiles (so101_single_arm and its overlays such as
+    so101_rtp_distributed) bind their interfaces live in the main launch and
+    are composed there, not through this offline standalone host."""
+    monkeypatch.setenv(
+        "HOME",
+        str(
+            _calibrated_home(
+                tmp_path, "so101_leader_calibrate", "so101_follower_calibrate", "aero_hand_right_calibrate"
+            )
+        ),
+    )
+    _, config_path = _profile_copy(tmp_path, name="so101_arm_aero_hand")
+
+    actions = teleop_operator_launch.launch_setup(_context(config_path, robot_config="so101_arm_aero_hand"))
 
     assert [action for action in actions if isinstance(action, Node)]
 

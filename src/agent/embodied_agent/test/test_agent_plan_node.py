@@ -185,10 +185,15 @@ def plan_rig(request):
     from robot_config.loader import load_robot_config_dict
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    # Offline-complete variant of the provider-bound so101_single_arm config:
-    # catalog compilation needs real joint groups without a live description.
-    config_name = getattr(request, "param", "so101_single_arm_legacy")
-    config_path = resolve_robot_config_path(config_name=config_name)
+    # Offline-complete SO-101 fixture (shared with robot_skill_cli): catalog
+    # compilation needs real joint groups, which the provider-bound
+    # so101_single_arm config gets only from a live runtime description.
+    repository_root = next(
+        parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file()
+    )
+    config_path = (
+        repository_root / "src" / "agent" / "robot_skill_cli" / "test" / "fixtures" / "so101_single_arm_offline.yaml"
+    )
     snapshot = compile_local_snapshot(load_robot_config_dict(config_path), config_path)
     registry = ("epoch-test", 7, snapshot.registry_digest)
 

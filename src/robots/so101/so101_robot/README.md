@@ -132,7 +132,8 @@ images and joint feedback were saved.
 
 `robot_config/config/robots/so101_single_arm.yaml` selects this runtime
 (`runtime.provider: so101_robot`, `simulation.platform: sdk`) and binds its
-contract to the public interfaces above. The retained
-`so101_single_arm_legacy.yaml` is the provider-less in-config bring-up used
-by unmigrated overlays (e.g. `so101_arm_aero_hand.yaml`) until their own
-migration; it is not the new-path configuration.
+contract to the public interfaces above. Overlays such as
+`so101_rtp_distributed.yaml` layer application deltas on it, and
+`so101_arm_aero_hand.yaml` is the retained provider-less profile for setups
+whose extra hardware (the Aero Hand) is not part of this runtime; the old
+provider-less single-arm bring-up configuration has been removed.

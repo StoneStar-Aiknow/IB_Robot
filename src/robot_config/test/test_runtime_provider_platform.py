@@ -218,6 +218,61 @@ def test_undeclared_toggle_is_rejected_by_the_runtime_merge():
         )
 
 
+def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch, tmp_path):
+    """Task 4.2: the migrated so101_rtp_distributed overlay composes the
+    provider on the Gazebo transport in the pick_banana world, with its
+    application deltas intact (name, skill profile, distributed inference)."""
+    from launch import LaunchContext
+
+    import robot_config.launch_builders.runtime as runtime_module
+    from robot_config.launch_builders.readiness import load_launch_robot_config
+    from robot_config.launch_registry.builtin_registry import build_launch_registry
+    from robot_config.launch_registry.orchestrator import build_prepared_launch
+    from robot_config.launch_registry.preparation import prepare_launch
+
+    provider_launch = tmp_path / "runtime.launch.py"
+    provider_launch.write_text("# provider is not executed by this construction test\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "resolve_runtime_launch", lambda _provider: str(provider_launch))
+
+    loaded = load_launch_robot_config("so101_rtp_distributed", None, defer_interface_binding=True)
+    assert loaded["name"] == "so101_rtp_distributed"
+    assert loaded["embodied"]["skill_catalog_profile"] == "so101_rtp_distributed"
+    policy = loaded["control_modes"]["model_inference"]["inference"]["pipelines"]["policy"]
+    assert (policy["deployment"], policy["execution_mode"]) == ("ascend_310b1", "distributed")
+
+    context = LaunchContext()
+    context.launch_configurations.update({"use_sim": "true", "sim_platform": ""})
+    prepared = prepare_launch(context, build_launch_registry(entry_points=[]), loaded_config=loaded)
+    assert prepared.sim_platform == "gazebo"
+    actions = build_prepared_launch(prepared)
+
+    from launch.actions import IncludeLaunchDescription
+
+    includes = [a for a in actions if isinstance(a, IncludeLaunchDescription)]
+
+    def arguments(include):
+        def text(value):
+            if isinstance(value, list | tuple):
+                return "".join(text(item) for item in value)
+            return str(getattr(value, "text", value))
+
+        return {text(k): text(v) for k, v in include.launch_arguments}
+
+    world = next(i for i in includes if "gz_args" in arguments(i))
+    provider = next(i for i in includes if "profile" in arguments(i))
+    assert "sim_models_pick_banana.world" in arguments(world)["gz_args"]
+    provider_args = arguments(provider)
+    assert provider_args["transport"] == "gazebo"
+    assert "simulated" not in provider_args
+    assert provider_args["gazebo_world"] == "demo"
+    assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.0", "0.3", "-0.03")
+    # the deployment peripheral toggle reaches the provider fragment
+    import yaml as _yaml
+
+    fragment = _yaml.safe_load(Path(provider_args["peripherals"]).read_text(encoding="utf-8"))
+    assert fragment == {"peripherals": [{"name": "front", "type": "camera", "disabled": True}]}
+
+
 # ---------------------------------------------------------------------------
 # 3.3: exactly one transport selection, world name and full spawn pose
 # ---------------------------------------------------------------------------

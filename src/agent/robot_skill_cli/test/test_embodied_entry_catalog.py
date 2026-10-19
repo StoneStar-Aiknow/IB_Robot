@@ -20,7 +20,6 @@ import pytest
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
-from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -29,20 +28,18 @@ GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
 _SKILL_CATALOG_CONFIG = Path(get_package_share_directory("skill_catalog")) / "config"
 
 
-def _robot_config_path(config_name: str) -> Path:
-    return resolve_robot_config_path(config_name=config_name)
+# Offline-complete SO-101 fixture (see fixtures/so101_single_arm_offline.yaml):
+# the compiler needs real joint groups, which the provider-bound shipped config
+# gets only from a live runtime description.
+_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "so101_single_arm_offline.yaml"
 
 
 def _snapshot(config_path: Path):
     return compile_local_snapshot(load_robot_config_dict(config_path), config_path)
 
 
-@pytest.mark.parametrize(
-    "config_name",
-    ["so101_single_arm_legacy"],
-)
-def test_compiled_profile_includes_dance_basic(config_name):
-    config_path = _robot_config_path(config_name)
+def test_compiled_profile_includes_dance_basic():
+    config_path = _FIXTURE
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -59,7 +56,7 @@ def test_compiled_profile_includes_dance_basic(config_name):
 
 
 def test_compiled_skills_match_profile_enabled_set():
-    config_path = _robot_config_path("so101_single_arm_legacy")
+    config_path = _FIXTURE
     profile_path = _SKILL_CATALOG_CONFIG / "profiles" / "so101_single_arm.yaml"
     expected = {entry["name"] for entry in yaml.safe_load(profile_path.read_text(encoding="utf-8"))["enabled_skills"]}
 
@@ -67,7 +64,7 @@ def test_compiled_skills_match_profile_enabled_set():
 
 
 def test_embodied_config_keeps_only_supported_direct_skills():
-    config_path = _robot_config_path("so101_single_arm_legacy")
+    config_path = _FIXTURE
     skill_templates = _snapshot(config_path).templates
 
     assert "dance_basic" in skill_templates
@@ -85,7 +82,7 @@ def test_embodied_config_keeps_only_supported_direct_skills():
     ],
 )
 def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_name):
-    config_path = _robot_config_path("so101_single_arm_legacy")
+    config_path = _FIXTURE
     config = load_robot_config_dict(config_path)
     skill_templates = _snapshot(config_path).templates
 
@@ -99,7 +96,7 @@ def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_nam
     ["wave_hello", "nod_yes", "shake_no", "act_cute", "happy_spin_upright"],
 )
 def test_social_gesture_duration_estimate_covers_configured_motion(skill_name):
-    config_path = _robot_config_path("so101_single_arm_legacy")
+    config_path = _FIXTURE
     skill = _snapshot(config_path).templates[skill_name]
     manifest_path = _SKILL_CATALOG_CONFIG / "skills" / skill_name / "manifest.yaml"
     description = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))["description"]

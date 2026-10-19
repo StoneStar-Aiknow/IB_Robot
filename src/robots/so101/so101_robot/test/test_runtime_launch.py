@@ -131,6 +131,33 @@ def test_unknown_transport_fails_fast_before_any_action():
         _render({"transport": "mujoco"})
 
 
+def test_gazebo_transport_applies_a_peripheral_toggle_exactly_once(tmp_path):
+    """A deployment disable toggle survives the whole launch construction.
+
+    The description is rendered from the merged peripheral set while the stack
+    helpers and the facade each apply the fragment themselves; folding the
+    merge into the profile they receive applied the toggle twice, and the
+    second pass rejected it as a toggle for an undeclared peripheral (the
+    disabled entry was already filtered out) - the so101_rtp_distributed
+    front-camera disable hit exactly that.
+    """
+    fragment = tmp_path / "peripherals.yaml"
+    fragment.write_text("peripherals:\n- type: camera\n  name: front\n  disabled: true\n", encoding="utf-8")
+
+    actions = _render({"transport": "gazebo", "peripherals": str(fragment)})
+
+    nodes = [action for action in actions if isinstance(action, Node)]
+    facade = next(node for node in nodes if node._Node__node_executable == "runtime_facade")
+    # The facade owns the live perception surface: it keeps the fragment path
+    # and applies it against the raw profile itself.
+    assert _params(facade)["peripherals"] == str(fragment)
+    bridge = next(node for node in nodes if node._Node__node_executable == "bridge_node")
+    config = Path(_params(bridge)["config_file"]).read_text(encoding="utf-8")
+    assert "camera/front" not in config
+    assert "camera/top" in config
+    assert "camera/wrist" in config
+
+
 def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):
     from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.profile import load_profile

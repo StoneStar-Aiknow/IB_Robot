@@ -96,7 +96,7 @@ def _voice_tts(**overrides) -> dict:
 
 
 def test_default_loader_uses_robot_config_environment_path(monkeypatch):
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     monkeypatch.setenv("ROBOT_CONFIG", str(config_path))
 
     config = load_robot_config_dict()
@@ -169,7 +169,7 @@ def test_loader_rejects_invalid_global_skill_required_control_mode(tmp_path, req
 
 
 def test_so101_skill_gateway_control_mode_is_global_and_safety_has_no_motion_authorization():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
     raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
     embodied = raw_config["embodied"]
 
@@ -178,7 +178,10 @@ def test_so101_skill_gateway_control_mode_is_global_and_safety_has_no_motion_aut
     assert "motion_authorized" not in embodied["safety"]
     assert "skill_templates" not in embodied
 
-    typed_config = load_robot_config(config_path)
+    # The typed schema check runs on the retained provider-less profile; the
+    # provider config itself cannot produce a typed object without a live
+    # runtime description.
+    typed_config = load_robot_config(Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml")
     assert not hasattr(typed_config.embodied, "motion_authorized")
 
 
@@ -294,14 +297,14 @@ def test_sound_orientation_rejects_invalid_behavior_config(value, field):
 
 
 def test_production_robot_yaml_has_no_inline_skill_catalog():
-    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
     embodied = yaml.safe_load(source_path.read_text(encoding="utf-8"))["robot"]["embodied"]
     assert "skill_templates" not in embodied
     assert embodied["skill_catalog_profile"] == "so101_single_arm"
 
 
 def test_embodied_visual_games_are_typed_without_asr_routing_config():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
 
     games = config.embodied.visual_games
@@ -317,7 +320,7 @@ def test_embodied_visual_games_are_typed_without_asr_routing_config():
 
 def test_enabled_game_requires_perception_enabled():
     """An enabled visual game with perception disabled must fail validation."""
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
 
     config.embodied.enabled = True
@@ -330,7 +333,7 @@ def test_enabled_game_requires_perception_enabled():
 
 def test_disabled_games_do_not_require_perception():
     """All games disabled: perception may stay off without a validation error."""
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
 
     config.embodied.enabled = True
@@ -355,7 +358,7 @@ def test_launch_dict_enabled_game_without_perception_is_rejected():
 
 
 def test_raw_loader_rejects_enabled_game_without_perception(tmp_path):
-    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
     copied_config["robot"]["embodied"]["enabled"] = True
     copied_config["robot"]["embodied"]["perception"]["enabled"] = False
@@ -403,7 +406,7 @@ def test_launch_dict_accepts_incubating_agent_entry():
 
 
 def test_validate_config_rejects_unknown_typed_entry_mode():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
 
     config.embodied.enabled = True
@@ -550,7 +553,7 @@ def test_launch_dict_enabled_game_does_not_require_tts_runtime():
 
 
 def test_typed_enabled_game_does_not_require_complete_tts_config():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
     config.embodied.enabled = True
     config.embodied.perception = {**config.embodied.perception, "enabled": True}
@@ -598,7 +601,7 @@ def test_launch_dict_unknown_visual_game_handler_is_rejected():
 
 
 def test_raw_loader_rejects_unknown_visual_game_handler_when_embodied_disabled(tmp_path):
-    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
     copied_config["robot"]["embodied"]["enabled"] = False
     copied_config["robot"]["embodied"]["visual_games"]["sorting_hat"]["handler"] = "missing_v1"
@@ -610,7 +613,7 @@ def test_raw_loader_rejects_unknown_visual_game_handler_when_embodied_disabled(t
 
 
 def test_raw_loader_rejects_removed_entry_scoped_visual_games(tmp_path):
-    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
     embodied = copied_config["robot"]["embodied"]
     embodied["entry"] = {"visual_games": {"sorting_hat": {"enabled": False, "trigger_aliases": ["分院帽"]}}}
@@ -622,7 +625,7 @@ def test_raw_loader_rejects_removed_entry_scoped_visual_games(tmp_path):
 
 
 def test_visual_game_service_names_must_be_distinct():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
     config.embodied.get_visual_game_result_service = config.embodied.start_visual_game_service
 
@@ -630,7 +633,7 @@ def test_visual_game_service_names_must_be_distinct():
 
 
 def test_raw_loader_rejects_duplicate_visual_game_service_names(tmp_path):
-    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
     embodied = copied_config["robot"]["embodied"]
     embodied["get_visual_game_result_service"] = embodied["start_visual_game_service"]
@@ -643,7 +646,7 @@ def test_raw_loader_rejects_duplicate_visual_game_service_names(tmp_path):
 
 def test_enabled_embodied_config_uses_configured_default_place_pose(monkeypatch, tmp_path):
     # validate_config requires ros2_control.calib_file to exist on disk, and the
-    # legacy profile points it at $(env HOME)/.calibrate/, a calibration-run
+    # retained provider-less profile points it at $(env HOME)/.calibrate/, a calibration-run
     # artifact that no clean machine has. Point HOME at a tmp dir with the file
     # present so validation stays hermetic; the calib content is never read.
     calibrate_dir = tmp_path / ".calibrate"
@@ -651,7 +654,7 @@ def test_enabled_embodied_config_uses_configured_default_place_pose(monkeypatch,
     (calibrate_dir / "so101_follower_calibrate.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
     config = load_robot_config(config_path)
 
     config.embodied.enabled = True

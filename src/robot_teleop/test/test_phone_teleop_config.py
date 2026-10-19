@@ -627,7 +627,7 @@ def test_lekiwi_rtp_distributed_profile_resolves_follower_calib(tmp_path, monkey
     [
         "lekiwi_realsense_navigation",
         "so101_rtp_distributed",
-        "so101_single_arm_legacy",
+        "so101_arm_aero_hand",
         "so101_single_arm_rgbd",
         "so101_dual_arm",
     ],

@@ -19,10 +19,17 @@ from robot_config.loader import load_robot_config_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 # The provider-bound so101_single_arm.yaml needs a live runtime description
-# before its logical interfaces can resolve; offline catalog tests use the
-# self-contained legacy variant, which compiles the same so101_arm_v1
-# capability surface (see test_so101_v1_catalog_identity.py for the digest).
-CONFIG_PATH = resolve_robot_config_path(config_name="so101_single_arm_legacy")
+# before its logical interfaces can resolve, and offline catalog compilation
+# needs real joint groups; both come from the checked-in offline fixture,
+# which compiles the same so101_arm_v1 capability surface (see
+# test_so101_v1_catalog_identity.py for the digest).
+CONFIG_PATH = Path(__file__).resolve().parent / "fixtures" / "so101_single_arm_offline.yaml"
+
+
+def _shipped(config_name: str) -> Path:
+    return resolve_robot_config_path(config_name=config_name)
+
+
 # Repository-level fixtures (other robot packages, model bundles) live outside this package.
 _REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
 
@@ -125,7 +132,7 @@ def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     from robot_skill_cli.catalog import compile_local_snapshot
     from skill_library.skill_executor_node import SkillExecutorNode
 
-    path = CONFIG_PATH.parent / "lekiwi_nav_grasp_sound_real.yaml"
+    path = _shipped("lekiwi_nav_grasp_sound_real")
     config = load_robot_config_dict(path, nav_stage=stage)
     voice = load_voice_asr_config(config["voice_asr"])
     assert voice.enabled
@@ -173,7 +180,7 @@ def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tm
 
     # Hermetic copy: the checkout shares the model bundles but has no approved
     # camera calibration (clearing the artifact keeps the inline transform).
-    copied = yaml.safe_load((CONFIG_PATH.parent / "lekiwi_nav_grasp.yaml").read_text(encoding="utf-8"))
+    copied = yaml.safe_load((_shipped("lekiwi_nav_grasp")).read_text(encoding="utf-8"))
     robot = copied["robot"]
     robot["sensor_calibration"]["artifacts"]["base_to_front_camera"] = ""
     config_path = tmp_path / "robot.yaml"
@@ -222,7 +229,7 @@ def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tm
 def test_hybrid_switch_test_overlay_disables_inherited_sound_following():
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    path = CONFIG_PATH.parent / "lekiwi_hybrid_switch_test.yaml"
+    path = _shipped("lekiwi_hybrid_switch_test")
     config = load_robot_config_dict(path, nav_stage="hybrid")
 
     assert config["embodied"]["idle_behaviors"]["sound_orientation"]["enabled"] is False
@@ -346,7 +353,7 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
 def test_pc_grasp_catalog_registers_enabled_delegated_executors(monkeypatch):
     from robot_skill_cli.catalog import load_capability_catalog
 
-    pc_config = CONFIG_PATH.parent / "lekiwi_handeye_realsense_grasp_pc.yaml"
+    pc_config = _shipped("lekiwi_handeye_realsense_grasp_pc")
     monkeypatch.setenv("WORKSPACE", str(_REPOSITORY_ROOT))
 
     view = load_capability_catalog(config_path=pc_config)

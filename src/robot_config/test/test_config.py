@@ -537,14 +537,14 @@ def test_robot_state_freshness_defaults_independently_from_perception_scene_fres
 def test_load_single_arm_config():
     """Test loading SO-101 single arm configuration."""
     # This test assumes the example config exists
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
     config = load_robot_config(config_path)
 
-    assert config.name == "so101_single_arm"
+    assert config.name == "so101_arm_aero_hand"
     assert config.robot_type == "so_101"
     assert config.ros2_control.hardware_plugin == "so101_hardware/SO101SystemHardware"
     assert len(config.peripherals) == 3
@@ -587,14 +587,14 @@ def test_load_single_arm_config():
 
 
 def test_load_single_arm_config_dict_preserves_launch_schema():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
     config = load_robot_config_dict(config_path)
 
-    assert config["name"] == "so101_single_arm"
+    assert config["name"] == "so101_arm_aero_hand"
     assert "control_modes" in config
     assert "policy" in config["control_modes"]["model_inference"]["inference"]["pipelines"]
     assert "joints" in config
@@ -605,17 +605,19 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
 
 
 def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
 
-    config = load_robot_config_dict(config_path)
+    # provider profile: interfaces bind live, so load the structural view
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
 
     assert resolve_lerobot_norm_mode(config) == "degrees"
 
 
 def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
 
-    config = load_robot_config_dict(config_path)
+    # provider profile: interfaces bind live, so load the structural view
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
     policy_keys = {"observation.state", "observation.images.top", "observation.images.wrist"}
     policy_observations = [
         observation for observation in config["contract"]["observations"] if observation["key"] in policy_keys
@@ -626,7 +628,7 @@ def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
 
 
 def test_dict_contract_builder_matches_typed_contract_shape():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -712,7 +714,7 @@ def test_align_rejects_negative_max_age():
 
 
 def test_so101_single_arm_contract_includes_motor_current_observation():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
