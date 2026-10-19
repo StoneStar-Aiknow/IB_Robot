@@ -33,6 +33,26 @@ def test_round_parks_on_the_neutral_pose_then_follows():
     assert stream.status()["phase"] in ("park", "blend_in", "live")
 
 
+def test_a_round_from_a_pose_parks_on_it_then_blends_into_the_person():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    inside = np.array([1, 0, 1, 1, 1, 0, 0] * 2)  # joints with room either way of neutral
+    held = np.array(NEUTRAL) + 0.3 * inside
+    person = np.array(NEUTRAL) - 0.2 * inside
+    stream.start_round(from_pose=held)
+    samples = []
+    for i in range(80):
+        t = i * 0.05
+        stream.push_pose(t, person)
+        samples += stream.poll(t + 0.2)
+    first, last = np.array(samples[0]), np.array(samples[-1])
+    np.testing.assert_array_equal(first, held)
+    np.testing.assert_allclose(last, person, atol=1e-9)
+    steps = np.abs(np.diff(np.array(samples), axis=0)).max()
+    assert steps < 0.02, steps          # 0.5 rad over a 2 s quintic blend, no jump
+    stream.start_round()
+    assert np.array_equal(stream._stream.base, NEUTRAL)
+
+
 def test_branch_guard_survives_trimmed_history():
     # A wrist channel turns through +pi after more single-frame pushes than the
     # history keeps; the guard must still widen the window and unwrap it.

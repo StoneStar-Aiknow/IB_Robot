@@ -71,6 +71,7 @@ class X2FollowMe:
         if base.shape != (len(self.joint_names),) or not np.isfinite(base).all():
             raise ValueError(f"base_pose must be {len(self.joint_names)} finite radians")
         self._fk = NeutralFK()
+        self._base = base
         self._stream = core.FollowMeStream(
             vendor=self._vendor, session=_session(), latency_s=latency_s, lookahead_s=lookahead_s,
             base_pose=base, limit_rate=False, mirror=mirror)
@@ -156,7 +157,12 @@ class X2FollowMe:
         return core.StreamRetargeter(self._vendor, old.kinematics, old.ledger,
                                      max_anchor_frames=MAX_ANCHOR_FRAMES, mirror=old.mirror)
 
-    def start_round(self) -> None:
+    def start_round(self, from_pose: Sequence[float] | None = None) -> None:
+        # The core parks on, and blends out of, its base; the neutral pose stays the default.
+        start = self._base if from_pose is None else np.asarray(from_pose, dtype=np.float64)
+        if start.shape != self._base.shape or not np.isfinite(start).all():
+            raise ValueError(f"from_pose must be {self._base.shape[0]} finite radians")
+        self._stream.base = start.copy()
         self._stream.reset(_session())
 
     def poll(self, now: float) -> list[np.ndarray]:

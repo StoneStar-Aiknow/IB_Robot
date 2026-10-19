@@ -14,7 +14,8 @@ plan. A streaming retargeter instead follows a live person, and the live node
 
 A round is open-ended: ``start_round`` holds the neutral pose briefly, then
 cross-fades from it to the person, then follows until the next
-``start_round``. Ending a round is not the stream's business: the session stops
+``start_round``. When the person comes back after a gap, the node starts a new
+round from the last command instead, so the arm does not chase them at full speed. Ending a round is not the stream's business: the session stops
 taking the preview and walks the arm back itself.
 
 Robots register a factory in ``_KINDS``; the factory is imported on first use
@@ -42,8 +43,8 @@ class RetargetStream(Protocol):
     def reset_input(self) -> None:
         """The input broke off; forget the per-person continuity (worker thread)."""
 
-    def start_round(self) -> None:
-        """Start a round from the neutral pose."""
+    def start_round(self, from_pose: Sequence[float] | None = None) -> None:
+        """Start a round from the neutral pose, or from ``from_pose``."""
 
     def poll(self, now: float) -> list[np.ndarray]:
         """The poses due by ``now``, oldest first, one per 50 Hz tick; ``[]`` while filling.

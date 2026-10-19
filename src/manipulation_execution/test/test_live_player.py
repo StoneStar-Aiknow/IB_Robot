@@ -33,8 +33,8 @@ class FakeStream:
     def reset_input(self):
         self.calls.append(("reset_input",))
 
-    def start_round(self):
-        self.calls.append(("start_round",))
+    def start_round(self, from_pose=None):
+        self.calls.append(("start_round",) if from_pose is None else ("start_round", list(from_pose)))
 
     def poll(self, now):
         self.calls.append(("poll", now))
@@ -91,6 +91,25 @@ def test_reset_input_precedes_first_frame_after_gap():
     names = [c for c in stream.calls if c[0] in ("reset_input", "retarget")]
     assert names == [("reset_input",), ("retarget", 0), ("retarget", 1), ("retarget", 2),
                      ("reset_input",), ("retarget", 3), ("retarget", 4)]
+
+
+def test_back_after_a_gap_restarts_the_round_from_the_last_command():
+    stream = FakeStream()
+    player = _player(stream)
+    _frame(player, 1.0, 0)
+    player.play(True)
+    player.process_one(timeout=0)       # first frame of the round: nothing sent yet
+    stream.polled = [np.full(14, 0.01)]
+    sent = player.tick(1.02)
+    _frame(player, 2.0, 1)              # back after 1 s
+    player.process_one(timeout=0)
+    restarts = [c for c in stream.calls if c[0] == "start_round"]
+    assert restarts == [("start_round",), ("start_round", sent)]
+    assert player.status(2.0)["reentries"] == 1
+    player.play(False)
+    _frame(player, 3.0, 2)              # a gap while paused: the next play starts the round
+    player.process_one(timeout=0)
+    assert [c for c in stream.calls if c[0] == "start_round"] == restarts
 
 
 def test_retarget_error_is_counted_and_not_pushed():

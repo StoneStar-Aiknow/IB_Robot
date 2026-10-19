@@ -50,6 +50,8 @@ class LivePlayer:
         self._last_error: str | None = None
         self._retarget_ms = collections.deque(maxlen=_LATENCY_WINDOW)
         self._published = 0
+        self._published_this_round = False
+        self._reentries = 0
         self._held_stale = 0
         self._last_command: list[float] | None = None
 
@@ -85,6 +87,11 @@ class LivePlayer:
             if reset_first:
                 with self._lock:
                     self._stream.reset_input()
+                    if self._playing and self._published_this_round:
+                        # The person is back after a gap: hold the last command, then
+                        # blend into them as a round does, instead of a full-speed chase.
+                        self._stream.start_round(from_pose=self._last_command)
+                        self._reentries += 1
             started = time.perf_counter()
             pose = self._stream.retarget(t_camera, frame_id, raw)
             elapsed_ms = (time.perf_counter() - started) * 1e3
@@ -126,6 +133,7 @@ class LivePlayer:
             if on:
                 self._stream.start_round()
                 self._limiter.reset(self._base_pose)
+                self._published_this_round = False
                 self._playing = True
                 self._play_requests += 1
             else:
@@ -148,6 +156,7 @@ class LivePlayer:
             out = self._limiter.step(poses[-1])
             command = out.tolist()
             self._published += 1
+            self._published_this_round = True
             self._last_command = command
             return command
 
@@ -169,6 +178,7 @@ class LivePlayer:
                 "retarget_ms_max": round(latencies[-1], 1) if latencies else None,
                 "published": self._published,
                 "held_stale": self._held_stale,
+                "reentries": self._reentries,
                 "cap_trips": int(self._limiter.cap_trips.sum()),
                 "limit_trips": int(self._limiter.limit_trips.sum()),
                 "limits_deg": [[round(math.degrees(lo), 1), round(math.degrees(hi), 1)]
