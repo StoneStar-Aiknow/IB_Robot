@@ -5,8 +5,8 @@ import pytest
 import yaml
 
 from robot_config.launch_builders.perception import generate_camera_nodes
-from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict, robot_context_schema_version, validate_motion_mode_config
+from robot_config.perception_runtime_config import parse_perception_runtime_config
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
@@ -222,7 +222,12 @@ def test_hybrid_keeps_static_semantic_query_and_disables_online_services():
     # Endpoints stay disjoint from the grasp services in the same stage.
     endpoints = [service["endpoint"] for service in services.values()]
     assert len(endpoints) == len(set(endpoints))
-    assert {vars(node)["_Node__node_name"] for node in generate_perception_model_nodes(hybrid)} == {
+    # The query-only stage excludes the semantic-role services from the
+    # enabled set, so only the grasp pair survives to node selection (the
+    # node generator itself lives in inference_service now — task A.5 — and
+    # the enabled-service names are this package's SSOT fact).
+    runtime = parse_perception_runtime_config(hybrid)
+    assert {service.node_name for service in runtime.enabled_services} == {
         "grasp_grounding_detect",
         "grasp_segment_detections",
     }

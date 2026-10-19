@@ -87,7 +87,7 @@ robot:
 
   # Resident head-camera -> YOLOX -> PEAR frame stream.
   #
-  # Consumed by robot_config/launch_builders/motion_imitation_stream.py, which
+  # Consumed by manipulation_execution/launch_builders/motion_imitation_stream.py, which
   # launches manipulation_execution/motion_imitation_stream_node alongside the
   # two services above. The node is perception only: it publishes parameter
   # frames and commands no motion, so starting it cannot move the robot.

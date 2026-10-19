@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from robot_config.launch_builders import control, hand_sources, readiness
+from robot_config.launch_builders import control, readiness
 from robot_config.launch_builders.launch_options import ArgumentSpec, ArgumentSpecError
 from robot_config.launch_builders.preparation import (
     PreparationError,
@@ -33,19 +33,58 @@ def _context(**arguments):
 
 @pytest.fixture()
 def business(monkeypatch):
+    """Hermetic loader + resource-check observer.
+
+    The config_overrides/preflight hook observations that used hand_sources as
+    their sample entry moved to a synthetic probe entry (the hand_sources entry
+    itself moved to robot_teleop, which robot_config tests must not import);
+    the framework properties under test are unchanged.
+    """
     calls = []
-    monkeypatch.setattr(hand_sources, "apply_hand_profile", lambda config, profile: calls.append(("hand", profile)))
     monkeypatch.setattr(
         control, "validate_runtime_resources", lambda config, **kwargs: calls.append(("resources", config))
     )
-    monkeypatch.setattr(
-        hand_sources,
-        "confirm_interactive_startup_p_pose",
-        lambda config, **kwargs: calls.append(("confirm", config, kwargs)),
-    )
     monkeypatch.setattr(readiness, "resolve_config_path", lambda *args: "/tmp/preparation-test.yaml")
     monkeypatch.setattr(readiness, "load_launch_robot_config", lambda *args, **kwargs: {"name": "test_robot"})
+    probe = ModuleType("preparation_probe_hand")
+
+    def probe_override_hook(config, arguments):
+        calls.append(("hand", arguments["probe_profile"]))
+
+    def probe_preflight_hook(config, arguments, target_state):
+        calls.append(("confirm", config, {"use_sim": target_state.use_sim, "control_mode": target_state.control_mode}))
+
+    probe.probe_override_hook = probe_override_hook
+    probe.probe_preflight_hook = probe_preflight_hook
+    probe.PROBE_BUILDER = BuilderSpec(
+        id="probe_hand",
+        factory=f"{probe.__name__}:probe_override_hook",
+        arguments=(
+            ArgumentSpec(
+                name="probe_profile", declared_default="", absent_fallback="", description="Probe profile selection"
+            ),
+        ),
+        hooks=(
+            HookSpec(phase="config_overrides", factory=f"{probe.__name__}:probe_override_hook", config_keys=("probe",)),
+            HookSpec(phase="preflight", factory=f"{probe.__name__}:probe_preflight_hook", config_keys=("probe",)),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+
+    def probe_registry():
+        from robot_config.launch_builders.builtin_registry import build_builtin_registry
+
+        registry = build_builtin_registry()
+        registry.add(probe.PROBE_BUILDER)
+        return registry
+
+    monkeypatch.setattr(sys.modules[__name__], "_probe_hand_registry", probe_registry, raising=False)
     return calls
+
+
+def _probe_hand_registry():
+    """Set by the business fixture (see above); keeps test bodies terse."""
+    raise AssertionError("the business fixture installs the probe registry")
 
 
 def _registry(monkeypatch, hook, *, phase="control_mode", keys=("feature",), arguments=(), enabled=None):
@@ -67,18 +106,16 @@ def _registry(monkeypatch, hook, *, phase="control_mode", keys=("feature",), arg
 
 
 def test_normalization_copy_and_prepared_fields(business):
-    """Through the REAL builtin registry: the caller's loaded config is
-    never mutated, core arguments are normalized, and the hand_sources
-    config_overrides hook applies the strip().lower() normalization the
-    preparation core used to perform (design decision 4: verbatim
-    migration)."""
-    from robot_config.launch_builders.builtin_registry import build_builtin_registry
-
+    """Through the builtin registry plus one synthetic hook-bearing entry
+    (the former hand_sources sample moved to robot_teleop): the caller's
+    loaded config is never mutated, core arguments are normalized, and the
+    config_overrides hook -> resource check -> preflight hook ordering with
+    an isolated preflight snapshot holds for ANY contributing entry."""
     loaded = {"name": "test_robot"}
     before = copy.deepcopy(loaded)
     prepared = prepare_launch(
-        _context(use_sim="true", sim_platform=" Mock ", hand_profile=" RIGHT ", nav_stage=" grasp "),
-        build_builtin_registry(),
+        _context(use_sim="true", sim_platform=" Mock ", probe_profile="right", nav_stage=" grasp "),
+        _probe_hand_registry(),
         loaded_config=loaded,
     )
     assert loaded == before
@@ -87,12 +124,10 @@ def test_normalization_copy_and_prepared_fields(business):
     assert prepared.robot_config["simulation"]["platform"] == "mock"
     assert prepared.context.auto_start_controllers == "false"
     assert prepared.context.sim_backend_needs_ros2_control is False
-    # hand hook -> resource check -> preflight P-pose hook, exactly once each.
+    # overrides hook -> resource check -> preflight hook, exactly once each.
     assert [item[0] for item in business] == ["hand", "resources", "confirm"]
-    # The hook normalized the raw CLI value before applying the profile.
-    assert business[0] == ("hand", "right")
-    # The preflight P-pose hook receives the prepared target state and an
-    # isolated copy of the real snapshot (never the shared object).
+    # The preflight hook receives the prepared target state and an isolated
+    # copy of the real snapshot (never the shared object).
     assert business[-1][2] == {"use_sim": True, "control_mode": "model_inference"}
     assert business[-1][1] is not prepared.robot_config
     assert business[-1][1] == prepared.robot_config
@@ -107,7 +142,9 @@ def test_direct_call_fallbacks(business):
     prepared = prepare_launch(_context(), build_builtin_registry())
     assert prepared.arguments["robot_config"] == "test_cam"
     assert prepared.arguments["moveit_display"] == "false"
-    assert prepared.arguments["voice_asr_auto_start"] == ""
+    # The hand_profile fallback example moved with the hand_sources entry to
+    # robot_teleop's suite (voice_asr's example moved earlier the same way).
+    assert "hand_profile" not in prepared.arguments
 
 
 def test_contributed_cli_hook_enables_builder_before_plan(monkeypatch, business):
@@ -200,11 +237,13 @@ def _provider_loaded_config():
 
 
 def test_invalid_registry_rejected_before_provider_factory(monkeypatch, tmp_path):
-    """Task 4.5: patching the REAL launch entry's build_builtin_registry to
-    an invalid builtin registry (all control/provider entries kept, one
-    rogue spec with an unknown dependency) must fail synchronously inside
-    launch_setup with RegistryError and ZERO calls to BOTH provider seams —
-    generate_runtime_provider_actions and generate_bound_runtime_actions."""
+    """Task 4.5: patching the REAL launch entry's build_launch_registry to
+    an invalid registry (all control/provider entries kept, one rogue spec
+    with an unknown dependency) must fail synchronously inside launch_setup
+    with RegistryError and ZERO calls to BOTH provider seams —
+    generate_runtime_provider_actions and generate_bound_runtime_actions.
+    (The seam migrated from build_builtin_registry to build_launch_registry
+    when the entry switched to entry-point composition.)"""
     import robot_config.launch_builders.runtime as runtime_module
 
     provider_calls = []
@@ -223,14 +262,14 @@ def test_invalid_registry_rejected_before_provider_factory(monkeypatch, tmp_path
     )
 
     module = _launch_entry_module()
-    original_build = module.build_builtin_registry
+    original_build = module.build_launch_registry
 
-    def build_invalid_builtin_registry():
-        registry = original_build()
+    def build_invalid_registry():
+        registry = original_build(entry_points=[])
         registry.add(BuilderSpec(id="rogue_extension", factory="does_not_exist:build", after=("missing",)))
         return registry
 
-    monkeypatch.setattr(module, "build_builtin_registry", build_invalid_builtin_registry)
+    monkeypatch.setattr(module, "build_launch_registry", build_invalid_registry)
 
     from launch import LaunchContext
 
@@ -294,25 +333,29 @@ def test_core_argument_collision_rejected(monkeypatch):
 
 
 def test_business_argument_collision_with_builtin_contribution_rejected(monkeypatch):
-    """A contributed argument reusing a builtin business name (record is
-    owned by the recording entry now, not the core table) is rejected at
-    add time against the builtin contributions."""
+    """A contributed argument reusing a builtin business name (with_moveit is
+    owned by the motion_planning entry, not the core table) is rejected at
+    add time against the builtin contributions. (The record arguments moved
+    to dataset_tools with the recording entry; their collision behavior is
+    pinned there against the injected extension.)"""
     from robot_config.launch_builders.builtin_registry import build_builtin_registry
     from robot_config.launch_builders.registry import RegistryError
 
-    module = ModuleType("test_preparation_record_collision")
+    module = ModuleType("test_preparation_with_moveit_collision")
     module.build = lambda context: BuildResult()
     monkeypatch.setitem(sys.modules, module.__name__, module)
     registry = build_builtin_registry()
     with pytest.raises(
-        RegistryError, match="cannot contribute launch argument 'record'; already contributed by 'recording'"
+        RegistryError, match="cannot contribute launch argument 'with_moveit'; already contributed by 'motion_planning'"
     ):
         registry.add(
             BuilderSpec(
                 id="rogue",
                 factory=f"{module.__name__}:build",
                 arguments=(
-                    ArgumentSpec(name="record", declared_default="x", absent_fallback="x", description="collision"),
+                    ArgumentSpec(
+                        name="with_moveit", declared_default="x", absent_fallback="x", description="collision"
+                    ),
                 ),
             )
         )
@@ -411,155 +454,37 @@ def _builtin_registry():
     return build_builtin_registry()
 
 
-def _hand_profile_loaded_config() -> dict:
-    """A hand-profile selection config mirroring aero_hand_teleop.yaml."""
-    return {
-        "name": "hand_profile_robot",
-        "hand_profiles": {
-            "default_profile": "right",
-            "profiles": {
-                "right": {
-                    "sides": ["right"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aux_right"],
-                    "active_devices": ["glove_right"],
-                },
-                "dual": {
-                    "sides": ["left", "right"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aux_left", "aux_right"],
-                    "active_devices": ["glove_left", "glove_right"],
-                },
-            },
-        },
-        "hand_sources": {"mhandpro": {"type": "mhandpro", "enabled": True, "mock": True, "sides": ["right"]}},
-        "auxiliary_actuators": {
-            "aux_left": {"profile_managed": True, "enabled": False, "joint_names": ["left_j1"]},
-            "aux_right": {"profile_managed": True, "enabled": False, "joint_names": ["right_j1"]},
-        },
-        "teleoperation": {
-            "enabled": True,
-            "active_devices": ["glove_right"],
-            "devices": [{"name": "glove_left"}, {"name": "glove_right"}],
-        },
-        "joints": {"arm": [], "hand": []},
-    }
-
-
-def test_hand_profile_hook_result_matches_legacy_preparation(monkeypatch):
-    """Task 3.5 equivalence anchor: through the REAL builtin registry the
-    hand_sources config_overrides hook produces exactly the config the
-    legacy core step produced (design decision 4)."""
-    resource_configs = []
-    monkeypatch.setattr(control, "validate_runtime_resources", lambda config, **kwargs: resource_configs.append(config))
-    loaded = _hand_profile_loaded_config()
-    before = copy.deepcopy(loaded)
-    prepared = prepare_launch(_context(hand_profile=" DUAL "), _builtin_registry(), loaded_config=loaded)
-    # The caller's loaded config is never mutated.
-    assert loaded == before
-    # Verbatim hand-profile semantics: normalized selection, sides,
-    # profile-managed actuator enables, active teleop devices, hand joints.
-    assert prepared.robot_config["active_hand_profile"] == "dual"
-    assert prepared.robot_config["hand_sources"]["mhandpro"]["sides"] == ["left", "right"]
-    assert prepared.robot_config["auxiliary_actuators"]["aux_left"]["enabled"] is True
-    assert prepared.robot_config["auxiliary_actuators"]["aux_right"]["enabled"] is True
-    assert prepared.robot_config["teleoperation"]["active_devices"] == ["glove_left", "glove_right"]
-    assert prepared.robot_config["joints"]["hand"] == ["left_j1", "right_j1"]
-    # resource_check runs AFTER the hook and observes the applied profile.
-    assert len(resource_configs) == 1
-    assert resource_configs[0]["active_hand_profile"] == "dual"
-    # The hand_profiles INPUT section is consumed, never rewritten.
-    assert prepared.robot_config["hand_profiles"] == before["hand_profiles"]
-
-
-def test_default_hand_profile_applies_without_cli_argument(monkeypatch):
-    monkeypatch.setattr(control, "validate_runtime_resources", lambda config, **kwargs: None)
-    prepared = prepare_launch(_context(), _builtin_registry(), loaded_config=_hand_profile_loaded_config())
-    assert prepared.robot_config["active_hand_profile"] == "right"
-    assert prepared.robot_config["auxiliary_actuators"]["aux_left"]["enabled"] is False
-    assert prepared.robot_config["auxiliary_actuators"]["aux_right"]["enabled"] is True
-
-
-def test_voice_and_embodied_overrides_match_legacy_preparation():
-    """Task 3.5 equivalence anchor: the voice ASR and embodied
-    config_overrides hooks reproduce the legacy override semantics."""
+def test_embodied_overrides_match_legacy_preparation():
+    """Task 3.5 equivalence anchor: the embodied config_overrides hook
+    reproduces the legacy override semantics. (The voice ASR half of the
+    anchor moved with the voice_asr entry to voice_asr_service's suite.)"""
     loaded = {
         "name": "r",
-        "voice_asr": {"enabled": False, "active_mode": "manual", "realtime_pre_roll_seconds": 0.5},
         "embodied": {"enabled": False, "perception": {"enabled": False}},
         "teleoperation": {"enabled": False},
     }
     prepared = prepare_launch(
         _context(
-            voice_asr_auto_start="true",
-            voice_asr_realtime_pre_roll_seconds="0.8",
             with_embodied="true",
             with_perception="true",
         ),
         _builtin_registry(),
         loaded_config=loaded,
     )
-    # Legacy voice_start: auto-start forces enabled + continuous.
-    assert prepared.robot_config["voice_asr"]["enabled"] is True
-    assert prepared.robot_config["voice_asr"]["active_mode"] == "continuous"
-    # Legacy voice_override: the explicit pre-roll override applies.
-    assert prepared.robot_config["voice_asr"]["realtime_pre_roll_seconds"] == 0.8
     # Legacy embodied overrides.
     assert prepared.robot_config["embodied"]["enabled"] is True
     assert prepared.robot_config["embodied"]["perception"]["enabled"] is True
 
 
-def test_voice_asr_explicit_false_override_disables_yaml_enabled():
-    loaded = {
-        "name": "r",
-        "voice_asr": {"enabled": True, "active_mode": "continuous", "realtime_pre_roll_seconds": 0.5},
-        "teleoperation": {"enabled": False},
-    }
-    prepared = prepare_launch(_context(voice_asr_auto_start="false"), _builtin_registry(), loaded_config=loaded)
-    assert prepared.robot_config["voice_asr"]["enabled"] is False
-
-
-def test_voice_asr_hook_runs_when_entry_is_mock_skipped_without_optional_imports(monkeypatch):
-    """The config_overrides hook runs for every registered entry whether or
-    not it participates: a mock-skipped voice_asr still observes the CLI
-    override, and the hook never imports the optional voice_asr_service
-    package (design decision 4)."""
-    sys.modules.pop("voice_asr_service", None)
-    loaded = {
-        "name": "r",
-        "voice_asr": {"enabled": False, "realtime_pre_roll_seconds": 0.5},
-        "teleoperation": {"enabled": False},
-    }
-    prepared = prepare_launch(
-        _context(
-            use_sim="true",
-            sim_platform="mock",
-            control_mode="model_inference",
-            voice_asr_realtime_pre_roll_seconds="0.8",
-        ),
-        _builtin_registry(),
-        loaded_config=loaded,
-    )
-    plan_ids = [spec.id for spec in prepared.plan.specs]
-    assert "voice_asr" not in plan_ids  # mock skip filtered the entry...
-    assert prepared.robot_config["voice_asr"]["realtime_pre_roll_seconds"] == 0.8  # ...hook still ran
-    assert "voice_asr_service" not in sys.modules
-
-
 def test_builtin_hook_owned_keys_stay_exclusive(monkeypatch):
-    """Spec delta: another registered entry declaring voice_asr, embodied
-    or a hand-profile key is rejected at add time, before any hook runs."""
+    """Spec delta: another registered entry declaring an owned key is
+    rejected at add time, before any hook runs. (The voice_asr key's
+    exclusivity moved with that entry's hook to voice_asr_service's suite;
+    the hand-profile keys moved with the hand_sources entry to robot_teleop's
+    suite.)"""
     from robot_config.launch_builders.registry import RegistryError
 
-    for key in (
-        "voice_asr",
-        "embodied",
-        "hand_sources",
-        "auxiliary_actuators",
-        "teleoperation",
-        "joints",
-        "active_hand_profile",
-    ):
+    for key in ("embodied",):
         registry = _builtin_registry()
         module = ModuleType("test_preparation_key_collision")
         module.build = lambda context: BuildResult()
@@ -574,33 +499,51 @@ def test_builtin_hook_owned_keys_stay_exclusive(monkeypatch):
             )
 
 
-def test_preflight_p_pose_confirmation_runs_exactly_once(monkeypatch):
-    """Spec delta: the P-pose confirmation runs exactly once per launch
-    through the hand_sources preflight hook, before any provider startup."""
-    confirmations = []
-    monkeypatch.setattr(
-        hand_sources,
-        "confirm_interactive_startup_p_pose",
-        lambda config, **kwargs: confirmations.append((config["active_hand_profile"], kwargs)),
+def _preflight_probe_registry(monkeypatch, preflight_hook):
+    """Builtin table plus one synthetic preflight-only entry (the former
+    hand_sources preflight sample moved to robot_teleop with its entry)."""
+    module = ModuleType("preparation_preflight_probe")
+    module.preflight_hook = preflight_hook
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    registry = _builtin_registry()
+    registry.add(
+        BuilderSpec(
+            id="probe_hand",
+            factory=f"{module.__name__}:preflight_hook",
+            hooks=(HookSpec(phase="preflight", factory=f"{module.__name__}:preflight_hook", config_keys=("probe",)),),
+        )
     )
-    prepared = prepare_launch(_context(), _builtin_registry(), loaded_config=_hand_profile_loaded_config())
+    return registry
+
+
+def test_preflight_hook_confirmation_runs_exactly_once(monkeypatch):
+    """Spec delta: a preflight hook runs exactly once per launch, before any
+    provider startup, and must not rewrite the prepared configuration."""
+    confirmations = []
+
+    def observing(config, arguments, target_state):
+        confirmations.append(
+            (dict(config), {"use_sim": target_state.use_sim, "control_mode": target_state.control_mode})
+        )
+
+    prepared = prepare_launch(
+        _context(), _preflight_probe_registry(monkeypatch, observing), loaded_config={"name": "test_robot"}
+    )
     assert len(confirmations) == 1
-    assert confirmations[0][0] == "right"
     assert confirmations[0][1] == {"use_sim": False, "control_mode": "model_inference"}
-    # The preflight hook must not rewrite the prepared configuration.
-    assert prepared.robot_config["active_hand_profile"] == "right"
+    assert confirmations[0][0] == dict(prepared.robot_config)
 
 
-def test_preflight_p_pose_failure_fails_the_launch(monkeypatch):
-    """Cancel/EOF during the interactive confirmation fails the launch
-    synchronously, before any provider factory runs."""
+def test_preflight_hook_failure_fails_the_launch(monkeypatch):
+    """A failing preflight hook fails the launch synchronously, before any
+    provider factory runs."""
 
     def refusing(config, **kwargs):
         raise RuntimeError("Interactive startup P-pose requires a terminal.")
 
-    monkeypatch.setattr(hand_sources, "confirm_interactive_startup_p_pose", refusing)
-    with pytest.raises(RuntimeError, match=r"preparation hook 'hand_sources' \(preflight\) failed"):
-        prepare_launch(_context(), _builtin_registry(), loaded_config=_hand_profile_loaded_config())
+    registry = _preflight_probe_registry(monkeypatch, refusing)
+    with pytest.raises(RuntimeError, match=r"preparation hook 'probe_hand' \(preflight\) failed"):
+        prepare_launch(_context(), registry, loaded_config={"name": "test_robot"})
 
 
 def test_legacy_two_parameter_hook_convention_stays_compatible(monkeypatch):

@@ -19,6 +19,13 @@
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
   <depend>skill_catalog</depend>
+  <!-- Launch-builder registration (openspec change
+       ``decentralize-launch-builder-registration``): launch_builder.py
+       contributes the mirror-session BuilderSpec to robot_config's launch
+       registry through the ``ibrobot.launch_builders`` entry point group, so
+       this package imports robot_config at runtime. The dependency is one
+       way: robot_config does not depend on manipulation_execution. -->
+  <depend>robot_config</depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <!-- Transport decode of the platform's encoded camera stream, in
@@ -31,6 +38,9 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated mirror-session builder tests import robot_config's
+       launch preparation pipeline (design decision 4). -->
+  <test_depend>robot_config</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

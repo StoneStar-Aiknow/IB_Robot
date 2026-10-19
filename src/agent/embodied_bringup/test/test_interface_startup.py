@@ -13,7 +13,8 @@ from launch.event_handlers import OnProcessExit
 from launch.events.process import ProcessExited
 from launch_ros.actions import Node
 
-from robot_config.launch_builders import control, execution, perception, readiness, recording, runtime, sim_backend
+from dataset_tools.launch_builders import recording
+from robot_config.launch_builders import control, execution, perception, readiness, runtime, sim_backend
 from robot_config.loader import load_robot_config_dict
 from robot_runtime.interface_description import description_digest, validate_description
 

@@ -35,5 +35,19 @@ setup(
             "mirror_session_release = manipulation_execution.mirror_session_node:release_main",
             "placement_replay = manipulation_execution.placement_replay:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``decentralize-launch-builder-registration``, design decision 4):
+        # robot_config discovers this group when building the launch registry,
+        # so the mirror session's launch wiring registers from its owning
+        # package without any robot_config change. Installing this package
+        # does not enable the session; participation still comes from the
+        # robot YAML (``mirror_session.enabled``). Openspec change
+        # ``migrate-business-launch-builders`` additionally moved the module
+        # to the unified ``launch_builders/`` layout and added the
+        # motion-imitation stream entry.
+        "ibrobot.launch_builders": [
+            "mirror_session = manipulation_execution.launch_builders.mirror_session:MIRROR_SESSION_BUILDER",
+            "motion_imitation_stream = manipulation_execution.launch_builders.motion_imitation_stream:MOTION_IMITATION_STREAM_BUILDER",
+        ],
     },
 )

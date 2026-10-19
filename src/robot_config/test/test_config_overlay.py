@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from robot_config.launch_builders.teleop import validate_teleop_config
 from robot_config.loader import _load_robot_section, load_robot_config_dict
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "robots"
@@ -88,18 +87,6 @@ def test_overlay_rejects_cross_directory_base_config(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must reference a sibling robot YAML"):
         _load_robot_section(overlay_dir / "overlay.yaml")
-
-
-def test_legacy_mhandpro_glove_is_rejected_as_active_runtime_path() -> None:
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_device": "legacy_glove",
-            "devices": [{"name": "legacy_glove", "type": "mhandpro_glove"}],
-        }
-    )
-
-    assert any("has been removed" in error for error in errors)
 
 
 def test_overlay_cycle_is_rejected(tmp_path: Path) -> None:

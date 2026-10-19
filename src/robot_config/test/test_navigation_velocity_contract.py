@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,17 +19,6 @@ def test_lidar_stages_declare_their_bridge_input_topics():
     assert mapping["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel"
     assert navigation["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
     assert navigation["command_server"]["stop_velocity_topic"] == "/cmd_vel_safe"
-
-
-def test_dynamic_navigation_rejects_a_bridge_topic_that_bypasses_collision_monitor():
-    from robot_config.launch_builders.navigation import _validate_navigation_velocity_contract
-
-    config = _lidar_config()
-    navigation = config["nav_stages"]["navigation"]["navigation"]
-    navigation["cmd_vel_bridge"]["cmd_vel_topic"] = "/cmd_vel"
-
-    with pytest.raises(ValueError, match="cmd_vel_safe"):
-        _validate_navigation_velocity_contract(config, navigation)
 
 
 def test_cmd_vel_builder_preserves_a_custom_non_dynamic_topic(monkeypatch):

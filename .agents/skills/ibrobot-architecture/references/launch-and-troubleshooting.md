@@ -15,7 +15,7 @@
 
 | Group | Builders |
 |-------|----------|
-| Control & description | `control.py` (ros2_control nodes, controller spawners), `description.py` (URDF xacro + camera injection), `hand_sources.py` (hand data sources + profiles) |
+| Control & description | `control.py` (ros2_control nodes, controller spawners), `description.py` (URDF xacro + camera injection) |
 | Perception | `perception.py` (camera/lidar drivers, virtual relays), `perception_models.py` (typed model-service plugins from `perception_services.services`), `camera_isp_overrides.py` (ISP calibration) |
 | Simulation | `simulation.py` (dispatch), `sim_backend/` (gazebo/mujoco/mock adapters), `sim_peripheral_bridge.py` (ros_gz bridge), `hardware_mock.py` (contract-driven mock) |
 | Inference & execution | `execution.py` (named inference pipelines + dispatch routing), `task_execution.py` (`task_executor_node`) |

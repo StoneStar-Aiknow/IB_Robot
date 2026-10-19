@@ -26,30 +26,23 @@
   <exec_depend>rosbag2_storage_mcap</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
-  <exec_depend>robot_interaction_demo</exec_depend>
-
-  <!-- Teleoperation and auxiliary hand nodes launched by this package -->
-  <exec_depend>robot_teleop</exec_depend>
+  <!-- Auxiliary hand actuator nodes launched by this package; the teleop
+       wiring and the hand_sources entry moved to robot_teleop (openspec
+       changes ``migrate-business-launch-builders`` and
+       ``migrate-hand-sources-to-robot-teleop``), which now depends on
+       robot_config. -->
   <exec_depend>aero_hand_hardware</exec_depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>camera_ros</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
-  <exec_depend>rtabmap_launch</exec_depend>
-  <exec_depend>depthimage_to_laserscan</exec_depend>
   <exec_depend>ldlidar_ros2</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>
-  <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>livox_ros_driver2</exec_depend>
   <exec_depend>fast_lio</exec_depend>
-  <exec_depend>rviz2</exec_depend>
-  <exec_depend>joy</exec_depend>
-  <exec_depend>joy_teleop</exec_depend>
-  <exec_depend>robot_localization</exec_depend>
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <depend>voice_asr_service</depend>
   <exec_depend>audio_capture</exec_depend>
   <exec_depend>audio_play</exec_depend>
 
@@ -69,9 +62,6 @@
   <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>
 
-  <!-- Navigation bringup -->
-  <exec_depend>nav2_bringup</exec_depend>
-  <exec_depend>robot_navigation</exec_depend>
 
   <!-- Benchmark runtime launched when runtime.target=benchmark -->
   <exec_depend>benchmark_runtime</exec_depend>

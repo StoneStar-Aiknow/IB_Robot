@@ -14,14 +14,12 @@ detection):
   the shared context config);
 - benchmark: the materialized snapshot (``_config_path`` + ``run_id``)
   is returned as ``benchmark_startup``; the shared context config is NOT
-  replaced here (``execute_plan`` owns that);
-- recording tolerance: semantic dataset + episodic mode + record:=false
-  emits Shutdown inside a BuildResult and never calls the node generator
-  (resolve_recording_launch rejects episodic first); semantic +
-  continuous forces recording on even with record:=false; ordinary
-  failures log and continue;
-- rerun visualizer: the value is lower()ed first; unknown values really
-  warn (logger calls asserted) and generate nothing; none is a no-op.
+  replaced here (``execute_plan`` owns that).
+
+The recording / rerun visualizer tolerance boundaries moved to
+dataset_tools with the recording module (openspec change
+``migrate-business-launch-builders``; same assertions, import paths
+updated).
 
 The controller-startup event chain (real ExecuteProcess targets) is
 covered separately by the readiness/orchestrator suites; it is
@@ -30,13 +28,7 @@ deliberately not tested here with fake actions.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-from launch.actions import EmitEvent
-from launch.events import Shutdown
-
 import robot_config.launch_builders.benchmark as benchmark_module
-import robot_config.launch_builders.recording as recording_module
 import robot_config.launch_builders.sim_backend as sim_backend_module
 import robot_config.launch_builders.simulation as simulation_module
 from robot_config.launch_builders.registry import LaunchBuildContext
@@ -144,104 +136,6 @@ class TestBenchmarkEntry:
         # The shared context config is NOT replaced by the build function itself;
         # execute_plan owns the cross-entry propagation.
         assert "benchmark" not in context.robot_config
-
-
-class TestRecordingEntry:
-    def _semantic_context(self, record_mode: str) -> LaunchBuildContext:
-        return _sim_context(
-            robot_config={"name": "test_robot", "recording": {"semantic_dataset": True}},
-            arguments={"record": "false", "record_mode": record_mode},
-        )
-
-    def test_semantic_dataset_with_episodic_mode_emits_shutdown_without_generating(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(recording_module, "generate_recording_nodes", lambda *a, **k: calls.append(a) or [])
-        result = recording_module.build_recording(self._semantic_context("episodic"))
-
-        shutdowns = [a for a in result.actions if isinstance(a, EmitEvent) and isinstance(a.event, Shutdown)]
-        assert len(shutdowns) == 1
-        assert calls == []
-
-    def test_semantic_dataset_with_continuous_mode_forces_recording_on(self, monkeypatch):
-        calls: list = []
-
-        def fake_generate(robot_config, control_mode, mode, scheduler_enabled=False):
-            calls.append((mode, scheduler_enabled))
-            return [_FakeNode("recorder")]
-
-        monkeypatch.setattr(recording_module, "generate_recording_nodes", fake_generate)
-        result = recording_module.build_recording(self._semantic_context("continuous"))
-
-        # record:=false is overridden to enabled by the semantic dataset policy.
-        assert calls == [("continuous", False)]
-        assert [a.name for a in result.actions] == ["recorder"]
-
-    def test_ordinary_recording_failure_logs_and_continues(self, monkeypatch):
-        def failing(*a, **k):
-            raise RuntimeError("plain recording failure")
-
-        monkeypatch.setattr(recording_module, "generate_recording_nodes", failing)
-        context = _sim_context(arguments={"record": "true", "record_mode": "continuous"})
-        result = recording_module.build_recording(context)
-
-        assert result.actions == []
-
-
-class TestRerunVisualizerEntry:
-    def _logger_spy(self, monkeypatch) -> list[str]:
-        warnings: list[str] = []
-
-        def record_warning(msg):
-            warnings.append(msg)
-
-        monkeypatch.setattr(
-            recording_module,
-            "logger",
-            SimpleNamespace(warning=record_warning, info=lambda msg: None, error=lambda msg: None),
-        )
-        return warnings
-
-    def test_value_is_lowered_before_matching(self, monkeypatch):
-        calls: list = []
-
-        def fake_generate(robot_config):
-            calls.append(robot_config)
-            return [_FakeNode("viewer")]
-
-        monkeypatch.setattr(recording_module, "generate_rerun_viewer_node", fake_generate)
-        self._logger_spy(monkeypatch)
-        context = _sim_context(arguments={"record_visualizer": "RERUN"})
-
-        result = recording_module.build_rerun_visualizer(context)
-
-        assert len(calls) == 1
-        assert [a.name for a in result.actions] == ["viewer"]
-
-    def test_unknown_value_really_warns_and_generates_nothing(self, monkeypatch):
-        def unexpected(*a, **k):
-            raise AssertionError("unknown visualizer values must not generate nodes")
-
-        monkeypatch.setattr(recording_module, "generate_rerun_viewer_node", unexpected)
-        warnings = self._logger_spy(monkeypatch)
-        context = _sim_context(arguments={"record_visualizer": "matplotlib"})
-
-        result = recording_module.build_rerun_visualizer(context)
-
-        assert result.actions == []
-        assert any("Unknown record_visualizer value" in msg for msg in warnings)
-
-    def test_none_is_a_noop_without_warning(self, monkeypatch):
-        def unexpected(*a, **k):
-            raise AssertionError("none must not generate nodes")
-
-        monkeypatch.setattr(recording_module, "generate_rerun_viewer_node", unexpected)
-        warnings = self._logger_spy(monkeypatch)
-        context = _sim_context(arguments={"record_visualizer": "none"})
-
-        result = recording_module.build_rerun_visualizer(context)
-
-        assert result.actions == []
-        assert warnings == []
 
 
 def test_disabled_benchmark_evaluation_propagates_transport_without_run_identity(monkeypatch):

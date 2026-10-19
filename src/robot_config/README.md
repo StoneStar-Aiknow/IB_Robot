@@ -4,7 +4,7 @@ ros2_control 和外设的统一机器人配置系统。
 
 ## 概述
 
-`robot.launch.py` 与 `teleop_operator.launch.py` 在 provider/输入设备前调用共享的
+`robot.launch.py` 与（robot_teleop 侧的）`teleop_operator.launch.py` 在 provider/输入设备前调用共享的
 `dds_environment` 本机检查；robot 的延迟消费者构建前再次检查。它只读实际启动环境与
 DDS 应用记录，明确错误时停止并给建议；不设置 DDS、不检查远端或业务 QoS。
 没有受管记录时保留原行为。范围和错误处理见 [DDS 配置工具](../../scripts/dds/README.md)。
@@ -93,7 +93,8 @@ robot_config YAML（单一数据源）
 participation plan 交给通用编排器（`orchestrator.py`）。每个内建条目的 `BuilderSpec` 常量与
 `build_<id>(context) -> BuildResult` 构建函数住在它自己的领域模块里；
 `builtin_registry.py` 只保留一张有序的 `"module:<ID>_BUILDER"` 引用表（`BUILTIN_BUILDERS`），
-表顺序即拓扑排序的稳定决胜序。构建注册表不得引入超出注册表核心、`launch`、`launch_ros` 与
+表顺序即拓扑排序的稳定决胜序；已安装业务包还可通过 entry point 组 `ibrobot.launch_builders`
+追加扩展条目（见下文「跨包扩展」）。构建注册表不得引入超出注册表核心、`launch`、`launch_ros` 与
 `ament_index_python` 之外的依赖：领域模块的跨包运行依赖一律函数内 import（共享的启用判定
 helper 在 `launch_builders/builder_support.py`），由导入预算测试固化。
 
@@ -135,6 +136,78 @@ MY_FEATURE_BUILDER = BuilderSpec(
 （`control_startup` / `simulation_startup` / `benchmark_startup`）单所有者声明（`provides`），
 benchmark 是唯一的 run-config 物化所有者，后续条目读取其物化快照而不重复物化。
 
+#### 跨包扩展：entry point 注册
+
+robot_config 之外的业务包通过 entry point 组 `ibrobot.launch_builders` 贡献条目：主入口
+`robot.launch.py` 用 `build_launch_registry()`（内建表 + 已安装扩展）构建注册表，参数枚举与
+plan 生成对扩展完全透明。`build_builtin_registry()` 保留为"仅内建"（测试 seam）。扩展条目的
+`BuilderSpec` 与内建使用同一份契约：可贡献参数与 hook（`arguments` / `hooks`）、可声明
+`after` / `requires` 引用内建或其他扩展，factory 与 hook factory 同样是 `module:attr` 字符串
+懒解析。业务包声明示例：
+
+```python
+# <your_package>/setup.py
+entry_points={
+    "ibrobot.launch_builders": [
+        "my_feature = your_package.launch_builder:MY_FEATURE_BUILDER",
+    ],
+}
+
+# <your_package>/your_package/launch_builder.py —— 领域模块自带 BuilderSpec（同内建模式）
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult
+
+def build_my_feature(context) -> BuildResult: ...
+
+MY_FEATURE_BUILDER = BuilderSpec(id="my_feature", factory=f"{__name__}:build_my_feature", ...)
+```
+
+规则（全部在任何 build 工厂或 hook 执行前校验，出错即整次 launch 失败，不静默跳过）：
+
+- **顺序**：内建条目在前且顺序不变；扩展按 entry point 名称排序后追加（名称相同按值排序；
+  同名 entry point 本身是错误，会指出两个值——常见于环境中残留旧 egg-info）。扩展引用内建
+  或其他扩展的 `after` / `requires` 走同一套拓扑规则。
+- **校验**：entry point 值必须是 `module:ATTR`，解析结果是单个 `BuilderSpec` 或其序列；导入失败、
+  属性不存在、类型不符均为 `RegistryError`，消息带 entry point 名与值。扩展 id 与内建或其他扩展
+  冲突、参数名冲突、hook config key 冲突沿用注册时的同一检查，错误消息会定位到 entry point。
+- **类型化输出**：扩展禁止声明 `provides`（`control_startup` / `simulation_startup` /
+  `benchmark_startup` 只属于固定内建 owner）。
+- **安装不等于启用**：安装扩展包只是让它**可被发现**；是否参与 launch 仍由该条目的
+  `enabled` / `mock_skip_key`（以及业务配置，如 `mirror_session.enabled`）决定。未参与的扩展
+  条目不会解析 factory，其运行依赖不会被导入。
+
+条目启动的节点属于哪个包，构建代码就放在哪个包（openspec change
+`migrate-business-launch-builders`）；robot_config 只保留注册框架、类型化输出的所有者
+（`control` / `simulation` / `benchmark`）、通用校验条目（`motion_planning`）与启动第三方节点
+或尚无单一归属包的条目。已迁移条目与归属：
+
+| 条目 | 归属包 |
+|---|---|
+| `mirror_session`、`motion_imitation_stream` | `manipulation_execution` |
+| `perception_models` | `inference_service` |
+| `semantic_mapping` | `semantic_mapping` |
+| `task_executor` | `task_dispatch` |
+| `recording`、`rerun_visualizer` | `dataset_tools` |
+| `teleop` | `robot_teleop` |
+| `voice_asr`、`speech_direction` | `voice_asr_service` |
+| `voice_tts` | `voice_tts_service` |
+| `interaction_demo` | `robot_interaction_demo` |
+| `navigation`（含 `nav2` / `localization` / `navigation_command` / `voice_nav` 子模块） | `robot_navigation` |
+
+留在 robot_config 的内建条目：`control`、`auxiliary_actuators`、`simulation`、`controller_startup`、
+`perception`、`benchmark`、`audio_io`、`execution`、`motion_planning`、
+`embodied`，以及辅助模块 `cmd_vel`、`fast_lio`、`static_tf`、`description`、`hardware_mock`、
+`runtime`、`tracing`、`sim_backend`、`sim_peripheral_bridge`、`builder_support`。`hand_sources` 条目（含 `hand_profile` 参数与 P 位姿确认 hook）随遥操作输入源
+迁至 `robot_teleop/launch_builders/hand_sources.py`，经 entry point 注册。
+
+**未安装即不参与**：目标包未安装时其条目与 CLI 参数都不出现（`ros2 launch` 对未声明参数不报错），
+其余条目不受影响。只构建 robot_config（`colcon build --packages-select robot_config`）时上述业务
+不再隐式参与；需要哪个业务，把它的归属包加进构建清单即可。**残留 egg-info**：迁移后旧 install
+目录可能同时存在新旧 entry point 导致 id 冲突（错误消息会指出两个值），重新构建相关包即可清除。
+
+**扩展可用的公开 helper**（`robot_config.launch_builders.builder_support`，扩展模块可直接导入）：
+`resolve_with_navigation`、`resolve_with_moveit`、`rerun_visualizer_requested`、
+`runtime_provider_name`、`resolve_display`、`readiness_attribute`。
+
 准备流水线按固定命名 anchor 执行（`load_target → control_mode → config_overrides →
 inference_override → mock_check → inference_derived → scheduler_check → benchmark_check →
 resource_check → preflight`），注册 hook 在对应 anchor 的核心步骤**之前**执行，签名统一为
@@ -142,7 +215,8 @@ resource_check → preflight`），注册 hook 在对应 anchor 的核心步骤*
 收到只读的 prepared target 状态 `hook_factory(robot_config, arguments, target_state)`
 （`HookTargetState(use_sim, control_mode)`，供 preflight hook 使用，不需要自行推导）。
 `config_overrides` 没有核心步骤，只按注册顺序运行业务 override hook（内建：hand profile →
-voice ASR → embodied）。`preflight` hook 在隔离深拷贝上运行，任何配置改写都会被拒绝。
+embodied；随后是扩展 hook，按 entry point 名称排序——voice ASR 的 hook 随条目迁入
+voice_asr_service 后在此列。各 hook 的 `config_keys` 互斥，顺序不影响结果）。`preflight` hook 在隔离深拷贝上运行，任何配置改写都会被拒绝。
 hook 声明的 `config_keys` 不能与准备核心拥有的键（`runtime`、`simulation`、`control_modes`
 等）或其父子路径冲突；跨条目的 key 冲突在注册时拒绝。非 preflight hook 同样先在副本上执行，
 只允许修改其声明的路径（含子路径）；越权写入会拒绝整次 hook 结果，不污染共享配置。
@@ -185,7 +259,7 @@ bringup）时缺失键回落到 `absent_fallback`。两者刻意不同（`robot_
 
 | 参数 | 所属条目 | declared 默认 | 直调回落 | 说明 |
 |---|---|---|---|---|
-| `hand_profile` | hand_sources | 空 | 空 | 选择手部 profile（right/left/dual） |
+| `hand_profile` | hand_sources（robot_teleop 贡献） | 空 | 空 | 选择手部 profile（right/left/dual） |
 | `voice_asr_auto_start` | voice_asr | `false` | 空 | true 时启用 ASR 并强制 continuous |
 | `voice_asr_realtime_pre_roll_seconds` | voice_asr | 空 | 空 | 覆盖 ASR 预滚时长 |
 | `with_navigation` | navigation | 空 | 空 | 启用导航；空则按 `navigation.enabled` |
@@ -759,16 +833,21 @@ robot:
       set_mode: {interface: runtime.set_mode, kind: service, type: ibrobot_msgs/srv/SetRuntimeMode}
 ```
 
-- `launch_builders/motion_imitation_stream.py` 启动 `motion_imitation_stream_node`，`mock_playback.enabled`
+- `motion_imitation_stream_node` 的启动 wiring 在 `manipulation_execution/launch_builders/
+  motion_imitation_stream.py`（该节点的所属包，openspec change `migrate-business-launch-builders` 前位于
+  本包 `launch_builders/motion_imitation_stream.py`），`mock_playback.enabled`
   时再启动 `motion_imitation_mock_node`。相机端点和手臂通道的关节顺序都按逻辑 ID 从已绑定的运行时接口
   描述中取得，配置未绑定时启动失败，不回退到猜测的话题名。`frame_source.topic` 可直接指定描述中没有的
   话题，与 `frame_source.interface` 二选一。
-- `launch_builders/mirror_session.py` 启动 `mirror_session_node`，并检查：`control_mode` 等于
-  `skill_required_control_mode`（不写时取它；Gateway 切到技能的模式，会话接管的必须正是这个模式），是
-  `control_modes` 的成员，其 `runtime_mode` 显式且不是 idle；映射到同一运行时模式的控制模式都显式关闭
-  `inference` 和 `executor`（会话是该模式唯一的指令源）。会话进程退出且 launch 仍在运行时，launch 运行
-  `mirror_session_release` 把运行时从 `policy_stream` 释放回 idle；它只调用 `set_mode`，从不发送手臂或
-  手指指令。
+- `mirror_session_node` 的启动 wiring 在 `manipulation_execution/launch_builders/mirror_session.py`（该节点的
+  所属包，与 motion_imitation_stream 同布局），经
+  entry point 组 `ibrobot.launch_builders` 注册（见上文「跨包扩展」）；只有安装了 manipulation_execution，
+  mirror_session 才会出现在 plan 中——未安装时它不参与（旧行为是参与后在运行期找不到可执行文件而失败）。
+  该构建器检查：`control_mode` 等于 `skill_required_control_mode`（不写时取它；Gateway 切到技能的模式，
+  会话接管的必须正是这个模式），是 `control_modes` 的成员，其 `runtime_mode` 显式且不是 idle；映射到同一
+  运行时模式的控制模式都显式关闭 `inference` 和 `executor`（会话是该模式唯一的指令源）。会话进程退出且
+  launch 仍在运行时，launch 运行 `mirror_session_release` 把运行时从 `policy_stream` 释放回 idle；它只调用
+  `set_mode`，从不发送手臂或手指指令。
 - `mirror_session.enabled` 为 `true` 时，`embodied_bringup` 为 Gateway 打开 `mirror_session` 执行器并传入
   会话的 `~/set_session` 服务名和 `stop_timeout_sec`；catalog 是否包含该执行器的技能必须与此一致，
   `mirror_stop` 的技能超时必须不小于 `stop_timeout_sec` + 0.5 s，否则 Gateway 拒绝启动。节点名、服务名、
@@ -1233,7 +1312,7 @@ started nodes 清单；不应用 launch CLI 覆盖（除显式 `--control-mode`�
 ### Voice ASR（语音识别）
 
 `robot_config` 通过 `robot.voice_asr` 作为语音识别节点的机器人级单一配置来源，并由
-`robot_config/launch_builders/voice_asr.py` 注入到 `voice_asr_service` 节点。
+`voice_asr_service/launch_builders/voice_asr.py`（openspec change `migrate-business-launch-builders` 前位于本包 `launch_builders/voice_asr.py`）注入到 `voice_asr_service` 节点。
 
 常用启动覆盖参数：
 

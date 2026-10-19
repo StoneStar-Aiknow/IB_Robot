@@ -81,8 +81,8 @@ TYPED_OUTPUT_NAMES = tuple(TYPED_OUTPUT_OWNERS)
 # ``config_overrides`` anchor (openspec change
 # ``migrate-builtin-builder-metadata``, design decision 4): it has no
 # core step and runs the registered business override hooks in
-# registration order (builtin: hand_sources -> voice_asr -> embodied,
-# matching the legacy hand -> voice_start -> embodied order).
+# registration order (builtin embodied first, then extensions sorted
+# by entry point name; hand_sources now registers from robot_teleop).
 PREPARATION_PHASES = (
     "load_target",  # 0: nav_stage participates; runtime target/backend caps
     "control_mode",  # 1: control_mode override

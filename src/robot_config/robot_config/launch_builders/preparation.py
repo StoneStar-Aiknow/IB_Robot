@@ -272,8 +272,8 @@ def _apply_control_mode_override(arguments: Mapping[str, str], robot_config: dic
 # (hand profile, voice ASR, embodied) moved to their owning BuilderSpec
 # hooks (openspec change ``migrate-builtin-builder-metadata``, design
 # decision 4). The anchor has no core step; hooks run in registration
-# order (builtin: hand_sources -> voice_asr -> embodied), matching the
-# legacy hand -> voice_start -> embodied order. The former voice_override
+# order (builtin embodied first, then extensions sorted by entry point
+# name: hand_sources, ..., voice_asr, voice_tts). The former voice_override
 # step moved ahead of inference_override/mock_check: those steps only
 # read control mode and control_modes, never voice_asr, so the final
 # configuration is unchanged.

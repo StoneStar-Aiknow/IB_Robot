@@ -33,5 +33,16 @@ setup(
             "speech_direction_node = voice_asr_service.speech_direction.node:main",
             "speech_direction_report = voice_asr_service.speech_direction.report_cli:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the voice ASR and
+        # speech-direction launch wiring registers from its owning package
+        # without any robot_config change. Installing this package does not
+        # enable the entries; participation still comes from the robot YAML
+        # (``voice_asr.enabled`` / ``speech_direction.enabled``).
+        "ibrobot.launch_builders": [
+            "voice_asr = voice_asr_service.launch_builders.voice_asr:VOICE_ASR_BUILDER",
+            "speech_direction = voice_asr_service.launch_builders.speech_direction:SPEECH_DIRECTION_BUILDER",
+        ],
     },
 )

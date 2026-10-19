@@ -75,21 +75,30 @@ CORE_ARGUMENT_NAMES = (
 )
 
 # Business parameters and their owning builder entries (design decision 3),
-# in builtin registration order (hand_sources -> voice_asr -> navigation ->
-# motion_planning -> embodied -> recording -> rerun_visualizer).
+# in builtin registration order (motion_planning -> embodied). The record /
+# record_mode / record_visualizer arguments moved to dataset_tools with the
+# recording entry, the voice_asr and navigation arguments to their owning
+# packages (openspec change ``migrate-business-launch-builders``), and
+# hand_profile to robot_teleop with the hand_sources entry (openspec change
+# ``migrate-hand-sources-to-robot-teleop``); MIGRATED_BUSINESS_ARGUMENTS
+# below marks what the builtin composed table no longer contributes, with
+# ownership and defaults pinned by the owning packages' suites.
 BUSINESS_ARGUMENT_OWNERS = {
-    "hand_profile": "hand_sources",
-    "voice_asr_auto_start": "voice_asr",
-    "voice_asr_realtime_pre_roll_seconds": "voice_asr",
-    "with_navigation": "navigation",
-    "navigation_mode": "navigation",
     "with_moveit": "motion_planning",
     "with_embodied": "embodied",
     "with_perception": "embodied",
-    "record": "recording",
-    "record_mode": "recording",
-    "record_visualizer": "rerun_visualizer",
 }
+
+MIGRATED_BUSINESS_ARGUMENTS = (
+    "record",
+    "record_mode",
+    "record_visualizer",
+    "hand_profile",
+    "voice_asr_auto_start",
+    "voice_asr_realtime_pre_roll_seconds",
+    "with_navigation",
+    "navigation_mode",
+)
 
 
 def _text(substitutions):
@@ -114,16 +123,17 @@ class TestCoreTableMatchesLegacyDeclarations:
 
     def test_composed_argument_set_matches_legacy_exactly(self):
         """Core + builtin business contributions must equal the legacy
-        table: same name set, same declared_default, same absent_fallback
-        (the declaration ORDER differs — core first, then business in
-        registration order — and is the only allowed difference)."""
+        table minus the arguments that moved to owning packages: same name
+        set, same declared_default, same absent_fallback (the declaration
+        ORDER differs — core first, then business in registration order —
+        and is the only allowed difference). The full legacy set — including
+        the migrated business arguments — is pinned end to end by the
+        baseline argument-table equivalence of this openspec change."""
+        expected = set(LEGACY_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
         table = _composed_table()
-        assert set(table) == set(LEGACY_DECLARED_DEFAULTS), (
-            f"missing={sorted(set(LEGACY_DECLARED_DEFAULTS) - set(table))} "
-            f"extra={sorted(set(table) - set(LEGACY_DECLARED_DEFAULTS))}"
-        )
-        for name, expected_default in LEGACY_DECLARED_DEFAULTS.items():
-            assert table[name].declared_default == expected_default, name
+        assert set(table) == expected, f"missing={sorted(expected - set(table))} extra={sorted(set(table) - expected)}"
+        for name in expected:
+            assert table[name].declared_default == LEGACY_DECLARED_DEFAULTS[name], name
 
     @pytest.mark.parametrize(
         "name,expected_default",
@@ -181,31 +191,28 @@ class TestAbsentFallbacks:
         # call site (both provider display and controller paths).
         assert _spec_table()["moveit_display"].absent_fallback == "false"
 
-    def test_voice_asr_auto_start_absent_falls_back_to_empty(self):
-        # launch_setup: .get("voice_asr_auto_start", "") — an absent key
-        # must NOT enable/disable the section; the empty-string rule keeps
-        # YAML voice_asr.enabled for the direct embodied call path.
-        assert _composed_table()["voice_asr_auto_start"].absent_fallback == ""
+    def test_with_moveit_absent_falls_back_to_empty(self):
+        # launch_setup: an absent with_moveit key must NOT enable motion
+        # planning; the empty-string rule keeps YAML/defaults active.
+        # (hand_profile had the same rule and moved with the hand_sources
+        # entry to robot_teleop, pinned by its suite; voice_asr_auto_start
+        # moved earlier the same way.)
+        assert _composed_table()["with_moveit"].absent_fallback == ""
 
     @pytest.mark.parametrize(
         "name",
         [
             "auto_start_controllers",
-            "record",
-            "record_mode",
-            "record_visualizer",
             "enable_tracing",
         ],
     )
     def test_hardcoded_read_defaults_are_absent_fallbacks(self, name):
         # launch_setup reads these with hardcoded defaults ("true",
-        # "false", "continuous", "none", "false").
+        # "false"). The record / record_mode / record_visualizer hardcoded
+        # defaults moved to dataset_tools with the recording entry.
         table = _composed_table()
         expected = {
             "auto_start_controllers": "true",
-            "record": "false",
-            "record_mode": "continuous",
-            "record_visualizer": "none",
             "enable_tracing": "false",
         }[name]
         assert table[name].absent_fallback == expected
@@ -218,14 +225,10 @@ class TestAbsentFallbacks:
             "sim_platform",
             "control_mode",
             "nav_stage",
-            "hand_profile",
-            "voice_asr_realtime_pre_roll_seconds",
             "with_inference",
             "inference_pipeline",
             "inference_execution_mode",
             "with_moveit",
-            "with_navigation",
-            "navigation_mode",
             "with_embodied",
             "with_perception",
             "runtime_target",
@@ -241,8 +244,8 @@ class TestReadSemantics:
         assert read_launch_argument({}, spec) == "test_cam"
 
     def test_present_empty_string_is_returned_verbatim(self):
-        spec = _composed_table()["voice_asr_auto_start"]
-        assert read_launch_argument({"voice_asr_auto_start": ""}, spec) == ""
+        spec = _composed_table()["with_moveit"]
+        assert read_launch_argument({"with_moveit": ""}, spec) == ""
 
     def test_present_value_wins_over_both_defaults(self):
         spec = _spec_table()["robot_config"]
@@ -258,15 +261,15 @@ class TestReadSemantics:
         assert values["config_path"] == ""
 
     def test_read_launch_arguments_covers_composed_table(self):
-        """Reading with the builtin composed specs yields every legacy
-        argument, business ones included, with the same fallback rules."""
+        """Reading with the builtin composed specs yields every retained
+        legacy argument, business ones included, with the same fallback
+        rules (the record arguments are dataset_tools contributions now)."""
         registry = build_builtin_registry()
         specs = compose_argument_specs(registry.contributed_arguments())
         values = read_launch_arguments({}, specs)
-        assert set(values) == set(LEGACY_DECLARED_DEFAULTS)
-        assert values["hand_profile"] == ""
-        assert values["record"] == "false"
-        assert values["record_visualizer"] == "none"
+        assert set(values) == set(LEGACY_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
+        assert values["with_moveit"] == ""
+        assert values["with_embodied"] == ""
 
 
 class TestComposition:

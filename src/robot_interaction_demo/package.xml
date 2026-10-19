@@ -10,7 +10,16 @@
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>ibrobot_msgs</exec_depend>
+  <!-- Launch-builder registration (openspec change
+       ``migrate-business-launch-builders``):
+       launch_builders/interaction_demo.py contributes the interaction_demo
+       entry to robot_config's launch registry through the
+       ibrobot.launch_builders entry point group, importing robot_config at
+       registration time. The dependency is one way: robot_config does not
+       depend on this package. -->
+  <depend>robot_config</depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>robot_config</test_depend>
   <test_depend>ibrobot_msgs</test_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

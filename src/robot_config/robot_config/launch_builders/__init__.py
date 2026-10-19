@@ -32,21 +32,15 @@ _EXPORTS = {
     "validate_joint_config": ("control", "validate_joint_config"),
     "validate_runtime_resources": ("control", "validate_runtime_resources"),
     "generate_robot_description": ("description", "generate_robot_description"),
-    "generate_hand_source_nodes": ("hand_sources", "generate_hand_source_nodes"),
     "generate_hardware_mock_nodes": ("hardware_mock", "generate_hardware_mock_nodes"),
     "mock_mode_skips_subsystem": ("hardware_mock", "mock_mode_skips_subsystem"),
-    "generate_navigation_nodes": ("navigation", "generate_navigation_nodes"),
     "generate_camera_nodes": ("perception", "generate_camera_nodes"),
     "generate_lidar_nodes": ("perception", "generate_lidar_nodes"),
     "generate_tf_nodes": ("perception", "generate_tf_nodes"),
     "generate_virtual_camera_relays": ("perception", "generate_virtual_camera_relays"),
-    "generate_perception_model_nodes": ("perception_models", "generate_perception_model_nodes"),
     "generate_runtime_provider_actions": ("runtime", "generate_runtime_provider_actions"),
     "runtime_provider": ("runtime", "runtime_provider"),
     "generate_gazebo_nodes": ("simulation", "generate_gazebo_nodes"),
-    "generate_voice_asr_nodes": ("voice_asr", "generate_voice_asr_nodes"),
-    "generate_voice_tts_nodes": ("voice_tts", "generate_voice_tts_nodes"),
-    "generate_speech_direction_actions": ("speech_direction", "generate_speech_direction_actions"),
 }
 
 
@@ -72,7 +66,6 @@ __all__ = [
     # Control
     "generate_ros2_control_nodes",
     "generate_controller_spawners",
-    "generate_hand_source_nodes",
     "validate_runtime_resources",
     "validate_joint_config",
     # Perception
@@ -80,19 +73,14 @@ __all__ = [
     "generate_lidar_nodes",
     "generate_tf_nodes",
     "generate_virtual_camera_relays",
-    "generate_perception_model_nodes",
     # Simulation
     "generate_gazebo_nodes",
     # MoveIt
     "generate_runtime_provider_actions",
     "runtime_provider",
-    # Voice ASR
-    "generate_voice_asr_nodes",
+    # Audio I/O (the ASR/TTS/direction wirings moved to their owning
+    # packages with the launch-builder migration)
     "generate_audio_io_actions",
-    "generate_voice_tts_nodes",
-    "generate_speech_direction_actions",
-    # Navigation
-    "generate_navigation_nodes",
     # Hardware mock
     "generate_hardware_mock_nodes",
     "mock_mode_skips_subsystem",

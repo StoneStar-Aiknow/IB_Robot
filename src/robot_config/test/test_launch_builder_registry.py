@@ -318,13 +318,18 @@ class TestBuiltinParticipation:
             sim_platform="mock",
             runtime_target=RuntimeTarget.SIMULATION,
         )
-        # Mock skip keys (perception/voice_asr/speech_direction/navigation)
-        # drop the entries from the frozen plan; the adapters are never
-        # called, so their bodies no longer repeat the mock check.
-        for skipped in ("perception", "voice_asr", "speech_direction", "navigation"):
+        # Mock skip keys drop the entries from the frozen plan; the adapters
+        # are never called, so their bodies no longer repeat the mock check.
+        # voice_asr / speech_direction / navigation moved to their owning
+        # packages (their mock-skip participation is pinned there through
+        # injected entry points); perception is the retained mock-skipped
+        # builtin.
+        for skipped in ("perception",):
             assert skipped not in plan_ids
-        # Non-skipped entries still participate.
-        for present in ("control", "simulation", "voice_tts", "execution", "recording"):
+        # Non-skipped entries still participate (recording moved to
+        # dataset_tools, voice_tts to voice_tts_service; embodied is the
+        # retained always-participating sample here).
+        for present in ("control", "simulation", "audio_io", "execution", "embodied"):
             assert present in plan_ids
 
     def test_mock_backend_skips_subsystems_via_shared_helper(self):
@@ -334,37 +339,6 @@ class TestBuiltinParticipation:
 
         assert mock_mode_skips_subsystem(True, "navigation") is True
         assert mock_mode_skips_subsystem(False, "navigation") is False
-
-    def test_teleop_only_participates_in_teleop_mode(self):
-        assert "teleop" not in self._plan_ids(control_mode="model_inference")
-        assert "teleop" in self._plan_ids(control_mode="teleop")
-
-    def test_navigation_follows_cli_switch_and_yaml_fallback(self):
-        # CLI false beats YAML enabled=true.
-        assert "navigation" not in self._plan_ids(
-            arguments={"with_navigation": "false"},
-            robot_config={"name": "r", "navigation": {"enabled": True}},
-        )
-        # CLI true beats YAML enabled=false.
-        assert "navigation" in self._plan_ids(arguments={"with_navigation": "true"})
-        # Empty CLI falls back to the prepared YAML flag.
-        assert "navigation" not in self._plan_ids(robot_config={"name": "r", "navigation": {"enabled": False}})
-        assert "navigation" in self._plan_ids(robot_config={"name": "r", "navigation": {"enabled": True}})
-
-    def test_task_executor_follows_shared_with_moveit_resolution(self):
-        # CLI false beats a moveit control mode.
-        assert "task_executor" not in self._plan_ids(control_mode="moveit_planning", arguments={"with_moveit": "false"})
-        # Empty CLI falls back to the control mode containing moveit.
-        assert "task_executor" in self._plan_ids(control_mode="moveit_planning")
-        assert "task_executor" not in self._plan_ids(control_mode="model_inference")
-
-    def test_rerun_visualizer_participates_for_any_value_but_none(self):
-        assert "rerun_visualizer" not in self._plan_ids(arguments={"record_visualizer": "none"})
-        assert "rerun_visualizer" not in self._plan_ids(arguments={})  # absent -> "none"
-        assert "rerun_visualizer" in self._plan_ids(arguments={"record_visualizer": "RERUN"})
-        # Unknown values still participate: the adapter owns the
-        # unknown-value warning dispatch (build-time policy).
-        assert "rerun_visualizer" in self._plan_ids(arguments={"record_visualizer": "matplotlib"})
 
     def test_benchmark_and_perception_follow_the_runtime_target(self):
         plan_ids = self._plan_ids(runtime_target=RuntimeTarget.BENCHMARK, use_sim=True)
@@ -383,7 +357,7 @@ class TestBuiltinParticipation:
         or mock skip key: their adapters own the internal no-op branches."""
         for runtime_target in (RuntimeTarget.HARDWARE, RuntimeTarget.SIMULATION, RuntimeTarget.BENCHMARK):
             plan_ids = self._plan_ids(runtime_target=runtime_target, use_sim=True, with_inference=True)
-            for infrastructure in ("control", "simulation", "controller_startup", "recording", "motion_planning"):
+            for infrastructure in ("control", "simulation", "controller_startup", "embodied", "motion_planning"):
                 assert infrastructure in plan_ids, (runtime_target, infrastructure)
 
 
@@ -415,18 +389,14 @@ class TestSkipLogging:
         )
         plan, messages = self._plan_with_log_spy(monkeypatch, context)
         plan_ids = [spec.id for spec in plan.specs]
-        assert "teleop" not in plan_ids
-        assert "task_executor" not in plan_ids
-        assert "rerun_visualizer" not in plan_ids
-        assert "navigation" not in plan_ids
-        teleop_logs = [message for message in messages if "launch builder 'teleop' skipped" in message]
-        assert teleop_logs == ["launch builder 'teleop' skipped: enabled predicate"]
-        assert "launch builder 'task_executor' skipped: enabled predicate" in messages
-        assert "launch builder 'rerun_visualizer' skipped: enabled predicate" in messages
-        assert "launch builder 'navigation' skipped: enabled predicate" in messages
+        assert "benchmark" not in plan_ids
         assert "launch builder 'benchmark' skipped: enabled predicate" in messages  # hardware target
-        # Each skipped entry is reported exactly once.
-        assert len([message for message in messages if "skipped" in message]) == 5
+        # Each skipped entry is reported exactly once (teleop, navigation,
+        # task_executor and rerun_visualizer moved out of the builtin table;
+        # their skip behavior is pinned by their owning packages through
+        # injected entry points; benchmark is the retained enabled-predicate
+        # skip under this context).
+        assert len([message for message in messages if "skipped" in message]) == 1
 
     def test_mock_skip_skips_are_logged_with_the_key(self, monkeypatch):
         context = LaunchBuildContext(
@@ -440,11 +410,10 @@ class TestSkipLogging:
         )
         plan, messages = self._plan_with_log_spy(monkeypatch, context)
         plan_ids = [spec.id for spec in plan.specs]
-        assert "voice_asr" not in plan_ids
-        assert "launch builder 'voice_asr' skipped: mock skip key 'voice_asr'" in messages
-        assert "launch builder 'navigation' skipped: mock skip key 'navigation'" in messages
+        assert "perception" not in plan_ids
         assert "launch builder 'perception' skipped: mock skip key 'perception'" in messages
-        assert "launch builder 'speech_direction' skipped: mock skip key 'speech_direction'" in messages
+        # voice_asr / speech_direction / navigation moved to voice_asr_service
+        # and robot_navigation; their mock-skip logging is pinned there.
 
     def test_participating_entries_are_not_logged(self, monkeypatch):
         context = LaunchBuildContext(
@@ -457,7 +426,7 @@ class TestSkipLogging:
         )
         _plan, messages = self._plan_with_log_spy(monkeypatch, context)
         assert not any("'control' skipped" in message for message in messages)
-        assert not any("'recording' skipped" in message for message in messages)
+        assert not any("'embodied' skipped" in message for message in messages)
 
 
 class TestTypedOutputOwnership:
@@ -661,25 +630,27 @@ class TestContextPropagation:
     def test_builtin_registry_real_adapters_share_one_materialized_identity(self, monkeypatch):
         """Task 5.7 through the REAL builtin registry and REAL adapters (no
         hand-written specs): the SOURCE benchmark generator materializes the
-        run config exactly once; the builtin execution / recording /
-        rerun_visualizer entries — the three after=benchmark consumers — each
-        receive that SAME materialized snapshot (new path + run_id), while the
-        original loaded config is never rewritten and nothing re-materializes."""
+        run config exactly once and the builtin execution entry — the
+        after=benchmark consumer that stays in robot_config — receives that
+        SAME materialized snapshot (new path + run_id), while the original
+        loaded config is never rewritten and nothing re-materializes. The
+        recording / rerun_visualizer consumers moved to dataset_tools with
+        the recording entry; the full three-consumer composition (builtin +
+        injected extensions) is pinned by dataset_tools' suite."""
         from robot_config.launch_builders import benchmark as benchmark_module
         from robot_config.launch_builders import execution as execution_module
-        from robot_config.launch_builders import recording as recording_module
         from robot_config.launch_builders.builtin_registry import build_builtin_registry
 
-        # Builtin declaration check: the three consumers declare after="benchmark".
+        # Builtin declaration check: the retained consumer declares after="benchmark".
         builtin_specs = {spec.id: spec for spec in build_builtin_registry().snapshot()}
-        assert {"execution", "recording", "rerun_visualizer"} <= set(builtin_specs)
-        for entry_id in ("execution", "recording", "rerun_visualizer"):
-            assert "benchmark" in builtin_specs[entry_id].after
+        assert "execution" in builtin_specs
+        assert "benchmark" in builtin_specs["execution"].after
+        # The migrated consumers are extension contributions now, not builtin rows.
+        assert "recording" not in builtin_specs
+        assert "rerun_visualizer" not in builtin_specs
 
         benchmark_calls = []
         execution_configs = []
-        recording_configs = []
-        rerun_configs = []
 
         def materializing_generate(snapshot):
             # SOURCE seam: one materialization owner — new path + run_id are
@@ -692,12 +663,6 @@ class TestContextPropagation:
         monkeypatch.setattr(benchmark_module, "generate_benchmark_nodes", materializing_generate)
         monkeypatch.setattr(
             execution_module, "generate_execution_nodes", lambda config, *a, **k: execution_configs.append(config) or []
-        )
-        monkeypatch.setattr(
-            recording_module, "generate_recording_nodes", lambda config, *a, **k: recording_configs.append(config) or []
-        )
-        monkeypatch.setattr(
-            recording_module, "generate_rerun_viewer_node", lambda config, *a, **k: rerun_configs.append(config) or []
         )
 
         loaded_config = {
@@ -712,7 +677,7 @@ class TestContextPropagation:
             use_sim=True,
             control_mode="benchmark",
             with_inference=True,
-            arguments={"record": "true", "record_mode": "episodic", "record_visualizer": "rerun"},
+            arguments={},
         )
         registry = build_builtin_registry()
         outputs = execute_plan(registry.plan(context), context)
@@ -720,16 +685,13 @@ class TestContextPropagation:
         # The SOURCE benchmark generator ran exactly once (no re-materialization).
         assert len(benchmark_calls) == 1
         materialized = benchmark_calls[0]
-        # Each builtin consumer generator ran exactly once...
+        # The builtin consumer generator ran exactly once and received the
+        # SAME materialized snapshot object, carrying the SAME new path and
+        # run identity.
         assert len(execution_configs) == 1
-        assert len(recording_configs) == 1
-        assert len(rerun_configs) == 1
-        # ...and all three received the SAME materialized snapshot object,
-        # carrying the SAME new path and run identity.
-        for received in (execution_configs[0], recording_configs[0], rerun_configs[0]):
-            assert received is materialized
-            assert received["_config_path"] == "/materialized/run-5.7.yaml"
-            assert received["benchmark"]["evaluation"]["run_id"] == "run-5.7"
+        assert execution_configs[0] is materialized
+        assert execution_configs[0]["_config_path"] == "/materialized/run-5.7.yaml"
+        assert execution_configs[0]["benchmark"]["evaluation"]["run_id"] == "run-5.7"
         # execute_plan replaced the shared context config with the materialized
         # snapshot exactly once, and the typed output owns the same identity.
         assert context.robot_config is materialized

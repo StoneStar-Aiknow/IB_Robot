@@ -6,9 +6,9 @@ from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVaria
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+from inference_service.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.config_path import resolve_robot_config_path
 from robot_config.interface_binding import bind_robot_interfaces
-from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict, robot_execution_endpoints
 from robot_runtime import contract as RUNTIME
 from robot_runtime.interface_description import description_digest, validate_description

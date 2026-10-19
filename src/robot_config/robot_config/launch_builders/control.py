@@ -411,18 +411,29 @@ def generate_controller_spawners(
     ]
 
 
-def _calibration_tool_command(robot_config: dict, arm: str, port: str) -> str:
+def calibration_tool_command(robot_config: dict, arm: str, port: str) -> str:
     """Build the calibration tool command from the robot configuration.
 
     The command is derived from ``robot.calibration.tool_command`` (a format
     string with ``{arm}`` and ``{port}`` placeholders) instead of hardcoding
     a specific robot package. When the key is absent, the proven default
     tool is used.
+
+    Openspec change ``migrate-business-launch-builders`` (design decision 4)
+    made this name public: the migrated teleop builder (now in
+    robot_teleop) consumes it across the package boundary, and cross-package
+    consumers must not reach for the underscore-prefixed spelling.
     """
     template = (robot_config.get("calibration") or {}).get(
         "tool_command"
     ) or "ros2 run so101_hardware calibrate_arm --arm {arm} --port {port}"
     return template.format(arm=arm, port=port)
+
+
+# Backwards-compatible alias for robot_config's internal call sites and any
+# in-tree tests that still patch or import the private spelling: the public
+# name above is the same function object, never a wrapper.
+_calibration_tool_command = calibration_tool_command
 
 
 def generate_ros2_control_nodes(

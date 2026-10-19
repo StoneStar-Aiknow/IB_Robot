@@ -1,10 +1,8 @@
-from pathlib import Path
-
 import pytest
 
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
 from robot_config.config import PeripheralConfig, RobotConfig, Ros2ControlConfig
-from robot_config.launch_builders import audio_io, speech_direction, voice_asr
+from robot_config.launch_builders import audio_io
 from robot_config.loader import load_audio_io_config, validate_config
 
 
@@ -163,72 +161,3 @@ def test_audio_io_builder_routes_independent_capture_and_playback_formats():
     assert ("audio", "/shared/capture") in remappings(capture)
     assert ("audio_stamped", "/shared/capture_stamped") in remappings(capture)
     assert ("audio", "/shared/play") in remappings(playback)
-
-
-def test_speech_direction_uses_shared_stamped_topic(monkeypatch, tmp_path):
-    launch_file = tmp_path / "launch" / "speech_direction.launch.py"
-    launch_file.parent.mkdir()
-    launch_file.touch()
-    monkeypatch.setattr(speech_direction, "_voice_asr_service_share", lambda: Path(tmp_path))
-    config = _audio_config()
-    config["speech_direction"] = {
-        "enabled": True,
-        "profile": "ubuntu",
-        "microphone": "respeaker",
-        "parameters": {},
-    }
-
-    actions = speech_direction.generate_speech_direction_actions(config)
-
-    arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
-    assert arguments["speech_direction_audio_topic"] == "/shared/capture_stamped"
-    assert arguments["microphone_channels"] == "6"
-
-
-def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        voice_asr,
-        "_load_voice_asr_service",
-        lambda: {
-            "bundle_path": "models/voice_asr/demo",
-            "deployment": "torch_cpu",
-            "language": "zh",
-            "max_recording_duration": 10.0,
-            "vad_sensitivity": 0.6,
-            "vad_bundle_path": "models/silero-vad",
-            "vad_deployment": "torch_cpu",
-            "realtime_pre_roll_seconds": 0.5,
-            "final_tail_padding_seconds": 1.5,
-            "publish_partial": True,
-            "output_topic": "/voice_command",
-            "sample_rate": 16000,
-            "chunk_size": 512,
-            "buffer_seconds": 5.0,
-            "exit_on_init_failure": False,
-            "input_mode": "shared_audio",
-            "external_min_samples": 3200,
-        },
-    )
-    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
-    config = _audio_config()
-    config["voice_asr"] = {
-        "enabled": True,
-        "bundle_path": str(tmp_path),
-        "deployment": "torch_cpu",
-        "active_mode": "manual",
-        "vad_input_channel": 0,
-    }
-
-    node = voice_asr.generate_voice_asr_nodes(config)[0]
-    parameters = {}
-    for raw_key, raw_value in node._Node__parameters[0].items():
-        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
-        if isinstance(raw_value, tuple):
-            raw_value = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
-            if raw_value.endswith("\n..."):
-                raw_value = raw_value[:-4].rstrip()
-        parameters[key] = raw_value
-
-    assert parameters["audio_topic"] == "/shared/capture_stamped"
-    assert parameters["audio_channels"] == 6
-    assert parameters["vad_input_channel"] == 0

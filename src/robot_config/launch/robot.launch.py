@@ -45,9 +45,11 @@ from robot_config.dds_environment import check_launch_dds
 # Thin aliases over the shared readiness helpers: the implementations have a
 # single owner in robot_config.launch_builders.readiness (resolved at call
 # time by the orchestrator); these module-level names exist only because
-# existing tests call them directly on this module.
+# existing tests call them directly on this module. build_launch_registry is
+# the production registry entry: builtin table + ibrobot.launch_builders entry
+# point extensions (see builtin_registry and the README's extension section).
 from robot_config.launch_builders import readiness as _readiness
-from robot_config.launch_builders.builtin_registry import build_builtin_registry
+from robot_config.launch_builders.builtin_registry import build_launch_registry
 from robot_config.launch_builders.launch_options import declare_launch_arguments
 from robot_config.launch_builders.orchestrator import build_prepared_launch
 from robot_config.launch_builders.preparation import compose_registry_arguments, prepare_launch
@@ -116,14 +118,14 @@ def launch_setup(context, *args, loaded_config=None, extra_consumers=None, **kwa
     # runs before any config load or provider startup; the live-binding
     # branch re-checks inside the orchestrator's construct_consumers.
     check_launch_dds(context)
-    registry = build_builtin_registry()
+    registry = build_launch_registry()
     prepared = prepare_launch(context, registry, loaded_config=loaded_config)
     return build_prepared_launch(prepared, extra_consumers=extra_consumers)
 
 
 def generate_launch_description():
     """Generate launch description for robot system."""
-    registry = build_builtin_registry()
+    registry = build_launch_registry()
     argument_specs = compose_registry_arguments(registry)
     return LaunchDescription(
         [
