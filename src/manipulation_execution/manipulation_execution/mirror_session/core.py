@@ -205,12 +205,14 @@ class MirrorSession:
         hooks: SessionHooks | None = None,
         cover: CoverDetector | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self._config = config
         self._port = port
         self._hooks = hooks if hooks is not None else SessionHooks()
         self._cover = cover if cover is not None else CoverDetector()
         self._clock = clock
+        self._sleep = sleep
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._release_lock = threading.Lock()
@@ -220,6 +222,9 @@ class MirrorSession:
         self.wait_reason: WaitReason | None = WaitReason.BOOT
         self.detail = "startup check pending"
         self.last_release: ReleaseOutcome | None = None
+        # How far the last command a stop left was from the reset pose, in degrees
+        # (largest joint): 0 once the stop's motion was sent to the end.
+        self.stop_final_gap_deg: float | None = None
         self._started = False
         self._holding = False
         self._releasing = False
@@ -353,6 +358,7 @@ class MirrorSession:
             elif self.state == SessionState.STANDBY:
                 # cooldown / ready: the arm is at the reset pose already.
                 self._enter_wait_locked(WaitReason.STOPPED, "mirror_stop")
+            self.stop_final_gap_deg = self._final_gap_deg_locked()
         # WAIT included: the Gateway switched to policy_stream before this call.
         outcome = self._release()
         return outcome.idle, outcome.message
@@ -413,7 +419,14 @@ class MirrorSession:
                 self._releasing = True
             outcome = None
             try:
-                outcome = release_to_idle(self._port, self._config.policy_mode, RELEASE_RESERVE_S, self._clock)
+                outcome = release_to_idle(
+                    self._port,
+                    self._config.policy_mode,
+                    RELEASE_RESERVE_S,
+                    self._clock,
+                    self._sleep,
+                    held=lambda: self._holding,
+                )
             finally:
                 with self._lock:
                     self._releasing = False
@@ -553,6 +566,17 @@ class MirrorSession:
             raise _HookError(f"wrap_up returned {type(step).__name__}, not WrapUpStep")
         return step
 
+    def _final_gap_deg_locked(self) -> float | None:
+        """Largest joint gap between the gate's last command and the reset pose; None if either is missing."""
+        last = self._gate.last
+        try:
+            target = self._reset_target()
+        except _HookError:
+            return None
+        if last is None or target is None or len(last.arm) != len(target.arm):
+            return None
+        return math.degrees(max(abs(a - b) for a, b in zip(last.arm, target.arm)))
+
     def _wrap_tick_locked(self, now: float, target) -> str | None:
         """One wrap-up step; ``wrap_up_done`` / ``wrap_up_overrun`` once it ends, else None."""
         elapsed = now - self._phase_started
@@ -682,6 +706,7 @@ class MirrorSession:
                 "commands_sent": self._gate.sent,
                 "commands_malformed": self._gate.malformed,
                 "last_release": None if self.last_release is None else self.last_release.message,
+                "stop_final_gap_deg": self.stop_final_gap_deg,
                 "cancel_reason": self._cancel_reason,
                 "short_rounds": self._short_rounds,
                 "last_transition": None if self._last_transition is None else dict(self._last_transition),

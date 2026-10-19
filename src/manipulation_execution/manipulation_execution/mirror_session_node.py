@@ -524,7 +524,15 @@ class MirrorSessionNode(Node):
         success, message = self.session.request(command)
         response.success = bool(success)
         response.message = f"{message} [state={self.session.state.value}]"
-        self.get_logger().info(f"set_session {command}: success={success} {response.message}")
+        if request.data:
+            self.get_logger().info(f"set_session {command}: success={success} {response.message}")
+        else:
+            gap = self.session.stop_final_gap_deg
+            gap_text = "n/a" if gap is None else f"{gap:.2f} deg"
+            self.get_logger().info(
+                f"set_session {command}: success={success} {response.message}; "
+                f"last command before the release was {gap_text} from the reset pose"
+            )
         return response
 
     def _on_operator_touch(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:

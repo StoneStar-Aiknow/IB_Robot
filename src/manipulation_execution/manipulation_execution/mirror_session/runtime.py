@@ -120,36 +120,81 @@ class ReleaseOutcome:
     message: str
 
 
+# Before the idle request the output has to run out. The gate is closed when a
+# release starts, but the runtime repeats the last arm command for its
+# ``stream_staleness_s`` (0.5 s in the aimdk profiles) and the arm needs a moment
+# to settle on it. R1 (10-19) asked 60 ms after the gate closed, with that
+# stream still live; the platform answered MOTION_BUSY and stayed in
+# UPPERBODY_REMOTE_SPLIT until a reboot.
+RELEASE_DRAIN_S = 0.8
+# A refused idle request is asked again after this long, within the budget.
+RELEASE_RETRY_S = 0.3
+# Also bounds the retries when the clock does not move (tests).
+RELEASE_MAX_ATTEMPTS = 4
+
+
 def release_to_idle(
-    port: RuntimePort, policy_mode: str, budget_s: float, clock: Callable[[], float] = time.monotonic
+    port: RuntimePort,
+    policy_mode: str,
+    budget_s: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    held: Callable[[], bool] = lambda: False,
 ) -> ReleaseOutcome:
     """Return ``policy_mode`` to idle, never over a stop latch. Shared by every exit path.
 
     Sends ``SetRuntimeMode(idle)`` only when the status read here shows
     ``active_mode == policy_mode`` and no stop latch. In every other case it
-    sends nothing and reports what it saw.
+    sends nothing and reports what it saw. The request waits
+    ``RELEASE_DRAIN_S`` for the output to run out, and a refusal is retried
+    while the budget lasts; the status is read again before every request, and
+    ``held()`` true (a later start took the mode over meanwhile) ends it
+    without one. The message lists every request with its time from the call.
     """
-    deadline = clock() + budget_s
+    started = clock()
+    deadline = started + budget_s
+    attempts: list[str] = []
 
     def remaining() -> float:
         return max(0.0, deadline - clock())
 
-    status = port.get_status(remaining())
-    if status is None:
-        return ReleaseOutcome(False, False, "runtime status unavailable; idle not requested")
-    if status.active_mode == IDLE:
-        return ReleaseOutcome(True, False, "runtime already idle")
-    if status.stop_latched:
-        return ReleaseOutcome(False, False, "runtime stop is latched; idle is never requested over a latch")
-    if status.active_mode != policy_mode:
-        return ReleaseOutcome(
-            False, False, f"runtime mode {status.active_mode!r} is not {policy_mode!r}; not ours to release"
-        )
-    success, message = port.set_mode(IDLE, remaining())
-    if not success:
-        return ReleaseOutcome(False, True, f"idle request refused: {message}")
+    def history() -> str:
+        return f" [{'; '.join(attempts)}]" if attempts else ""
+
+    def unreleasable(status: RuntimeObservation | None) -> ReleaseOutcome | None:
+        sent = bool(attempts)
+        if status is None:
+            return ReleaseOutcome(False, sent, "runtime status unavailable; idle not requested" + history())
+        if status.active_mode == IDLE:
+            return ReleaseOutcome(True, sent, "runtime already idle" + history())
+        if status.stop_latched:
+            return ReleaseOutcome(
+                False, sent, "runtime stop is latched; idle is never requested over a latch" + history()
+            )
+        if status.active_mode != policy_mode:
+            message = f"runtime mode {status.active_mode!r} is not {policy_mode!r}; not ours to release"
+            return ReleaseOutcome(False, sent, message + history())
+        if held():
+            return ReleaseOutcome(False, sent, "a later start holds the mode; idle not requested" + history())
+        return None
+
+    outcome = unreleasable(port.get_status(remaining()))
+    if outcome is not None:
+        return outcome
+    sleep(min(RELEASE_DRAIN_S, remaining()))
+    while True:
+        outcome = unreleasable(port.get_status(remaining()))
+        if outcome is not None:
+            return outcome
+        success, message = port.set_mode(IDLE, remaining())
+        attempts.append(f"{clock() - started:.2f} s {'accepted' if success else 'refused'}: {message}")
+        if success:
+            break
+        if len(attempts) >= RELEASE_MAX_ATTEMPTS or remaining() < RELEASE_RETRY_S:
+            return ReleaseOutcome(False, True, f"idle request refused {len(attempts)} times: {message}" + history())
+        sleep(RELEASE_RETRY_S)
     after = port.get_status(remaining())
     if after is None or after.active_mode != IDLE:
         mode = None if after is None else after.active_mode
-        return ReleaseOutcome(False, True, f"idle requested but runtime reports {mode!r}")
-    return ReleaseOutcome(True, True, "runtime returned to idle")
+        return ReleaseOutcome(False, True, f"idle requested but runtime reports {mode!r}" + history())
+    return ReleaseOutcome(True, True, "runtime returned to idle" + history())
