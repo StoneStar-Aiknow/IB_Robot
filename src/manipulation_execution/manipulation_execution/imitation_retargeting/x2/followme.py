@@ -30,6 +30,13 @@ from collections.abc import Sequence
 from multiprocessing.connection import Connection
 
 import numpy as np
+# The vendored code imports these lazily, the first output sample's included: on duck
+# that first import stalled the 50 Hz tick ~2.3 s and the subscription lost ~40 frames.
+import scipy.interpolate  # noqa: F401
+import scipy.optimize  # noqa: F401
+import scipy.signal  # noqa: F401
+import scipy.sparse  # noqa: F401
+import scipy.spatial.transform  # noqa: F401
 
 from ..rotations import decode_rotation_6d, encode_rotation_6d
 from ._vendor import followme_core as core
