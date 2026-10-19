@@ -24,6 +24,75 @@ def test_minimal_profile_validates_and_fills_defaults():
     assert data["stop_default_policy"] == "HOLD"
 
 
+def test_transport_defaults_match_legacy_simulated():
+    data = _minimal()
+    validate_profile(data, "unit")
+    assert data["transports"] == ["hardware", "sdk"]
+    assert data["transport"] == "hardware"
+    simulated = _minimal()
+    simulated["simulated"] = True
+    validate_profile(simulated, "unit")
+    assert simulated["transport"] == "sdk"
+    assert simulated["transports"] == ["hardware", "sdk"]
+
+
+def test_profile_declares_supported_transports_and_default():
+    data = _minimal()
+    data["transports"] = ["hardware", "sdk", "gazebo"]
+    data["transport"] = "gazebo"
+    validate_profile(data, "unit")
+    assert data["transport"] == "gazebo"
+    # the legacy boolean is normalized from the effective transport
+    assert data["simulated"] is True
+
+
+def test_gazebo_default_conflicting_with_simulated_alias_fails():
+    data = _minimal()
+    data["transports"] = ["hardware", "sdk", "gazebo"]
+    data["transport"] = "gazebo"
+    data["simulated"] = True  # simulated:true selects sdk, not gazebo
+    with pytest.raises(ProfileError, match=r"transport 'gazebo'.*'simulated: True' implies 'sdk'"):
+        validate_profile(data, "unit")
+
+
+@pytest.mark.parametrize("transports", [[], "gazebo", ["hardware", "hardware"], ["teleport"]])
+def test_invalid_transports_list_rejected(transports):
+    data = _minimal()
+    data["transports"] = transports
+    with pytest.raises(ProfileError, match="'transports'"):
+        validate_profile(data, "unit")
+
+
+def test_unknown_transport_value_rejected():
+    data = _minimal()
+    data["transport"] = "teleport"
+    with pytest.raises(ProfileError, match="'transport' must be one of"):
+        validate_profile(data, "unit")
+
+
+def test_transport_conflicting_with_simulated_alias_fails_naming_both():
+    data = _minimal()
+    data["simulated"] = False
+    data["transport"] = "sdk"
+    with pytest.raises(ProfileError, match=r"transport 'sdk'.*'simulated: False' implies 'hardware'"):
+        validate_profile(data, "unit")
+
+
+def test_transport_outside_declared_set_names_transport_set_and_source():
+    data = _minimal()
+    data["transports"] = ["hardware"]
+    data["simulated"] = True  # default transport sdk, which the set does not declare
+    with pytest.raises(ProfileError, match=r"transport 'sdk' is not in the supported transports \['hardware'\].*unit"):
+        validate_profile(data, "unit")
+
+
+def test_simulated_must_be_a_boolean():
+    data = _minimal()
+    data["simulated"] = "false"
+    with pytest.raises(ProfileError, match="'simulated' must be a boolean"):
+        validate_profile(data, "unit")
+
+
 @pytest.mark.parametrize("missing", ["runtime", "modes", "capabilities", "joints"])
 def test_missing_required_key_names_key_and_source(missing):
     data = _minimal()

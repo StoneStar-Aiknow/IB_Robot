@@ -372,7 +372,7 @@ def _lekiwi_public_description(public_description):
         )
         + "</robot>"
     )
-    description["model"] = build_model_metadata(profile, simulated=True, robot_description=urdf)
+    description["model"] = build_model_metadata(profile, transport="sdk", robot_description=urdf)
     # runtime-owned-audio-io: the hybrid profile binds audio.capture (speech
     # direction / voice_asr) and audio.play (voice_tts) on the lekiwi runtime.
     description["interfaces"]["audio.capture"] = {

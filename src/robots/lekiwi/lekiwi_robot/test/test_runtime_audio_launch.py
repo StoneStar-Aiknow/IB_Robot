@@ -67,6 +67,7 @@ def _render(simulated: str, peripherals_file: str, profile: Path = _PROFILE):
         {
             "profile": str(profile),
             "simulated": simulated,
+            "transport": "",
             "display": "false",
             "instance_id": "",
             "peripherals": peripherals_file,

@@ -26,7 +26,7 @@ from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
     resolve_profile_argument,
-    resolve_simulated,
+    resolve_transport,
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file
@@ -36,7 +36,13 @@ from robot_runtime.profile import load_profile
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("lekiwi_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
+    transport = resolve_transport(
+        profile,
+        LaunchConfiguration("transport").perform(context),
+        LaunchConfiguration("simulated").perform(context),
+        source=str(profile_path),
+    )
+    simulated = transport != "hardware"
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
 
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
@@ -81,6 +87,7 @@ def _launch_setup(context, *_args, **_kwargs):
             simulated,
             peripherals_file,
             LaunchConfiguration("instance_id").perform(context).strip(),
+            transport=transport,
         ),
         base_node,
         *motion_actions,
@@ -93,6 +100,12 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("profile", description="Runtime profile path or shipped profile name (required)"),
             DeclareLaunchArgument("simulated", default_value="", description="Override profile.simulated"),
+            DeclareLaunchArgument(
+                "transport",
+                default_value="",
+                description="Execution transport: hardware | sdk | gazebo (overrides the profile default; "
+                "conflicts with simulated:=)",
+            ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument(

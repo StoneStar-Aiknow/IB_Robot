@@ -30,7 +30,7 @@ from robot_runtime.launch_support import (
     peripheral_stack_actions,
     render_robot_description,
     resolve_profile_argument,
-    resolve_simulated,
+    resolve_transport,
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
@@ -40,7 +40,13 @@ from robot_runtime.profile import load_profile
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("so101_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
+    transport = resolve_transport(
+        profile,
+        LaunchConfiguration("transport").perform(context),
+        LaunchConfiguration("simulated").perform(context),
+        source=str(profile_path),
+    )
+    simulated = transport != "hardware"
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
     if initial_mode:
@@ -54,7 +60,7 @@ def _launch_setup(context, *_args, **_kwargs):
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
     robot_description = render_robot_description(profile, profile_path, simulated)
-    description = build_description(profile, simulated=simulated, robot_description=robot_description)
+    description = build_description(profile, robot_description=robot_description, transport=transport)
 
     motion = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -76,6 +82,7 @@ def _launch_setup(context, *_args, **_kwargs):
             instance_id,
             robot_description=robot_description,
             interface_description=description,
+            transport=transport,
         ),
         motion,
         *peripheral_stack_actions(profile, "", simulated, description=description),
@@ -91,6 +98,12 @@ def generate_launch_description():
                 "simulated",
                 default_value="",
                 description="Override profile.simulated: run so101_hardware on the SDK simulated transport",
+            ),
+            DeclareLaunchArgument(
+                "transport",
+                default_value="",
+                description="Execution transport: hardware | sdk | gazebo (overrides the profile default; "
+                "conflicts with simulated:=)",
             ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),

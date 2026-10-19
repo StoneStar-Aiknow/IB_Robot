@@ -10,7 +10,9 @@ Facade-relevant shape::
     runtime:
       name: so101_robot
       version: 0.1.0
-    simulated: false
+    transports: [hardware, sdk, gazebo]   # supported execution transports
+    transport: hardware                   # default transport (D1); a legacy
+    simulated: false                      # `simulated` bool is an sdk/hardware alias
     controller_manager: controller_manager
     modes:                                  # see robot_runtime.modes.ModeModelConfig
       initial: idle
@@ -39,6 +41,9 @@ import yaml
 from robot_runtime.capabilities import validate_capability_set
 from robot_runtime.contract import IDLE_MODE, STOP_POLICIES
 
+#: Execution transports a runtime profile may declare (runtime-simulation-transport D1).
+TRANSPORTS = ("hardware", "sdk", "gazebo")
+
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")
 _REQUIRED_STOP_BOUNDS = ("cancel_bound_s", "idle_bound_s", "torque_off_bound_s")
@@ -46,6 +51,52 @@ _REQUIRED_STOP_BOUNDS = ("cancel_bound_s", "idle_bound_s", "torque_off_bound_s")
 
 class ProfileError(ValueError):
     """Raised when a runtime profile is missing or invalid."""
+
+
+def _validate_transport_selection(data: dict[str, Any], source: str | Path) -> None:
+    """Normalize and validate ``transports``/``transport`` (runtime-simulation-transport D1).
+
+    A profile declares the transports it supports and a default. The legacy
+    boolean ``simulated`` stays an alias: ``true``/``false`` select ``sdk``/
+    ``hardware`` when no explicit ``transport`` is present, and an explicit
+    ``transport`` that disagrees with it fails naming both values. A profile
+    without ``transports`` supports ``[hardware, sdk]`` (today's behaviour).
+    """
+    transports = data.get("transports")
+    if transports is None:
+        transports = ["hardware", "sdk"]
+    elif not isinstance(transports, list) or not transports:
+        raise ProfileError(f"runtime profile 'transports' must be a non-empty list from {list(TRANSPORTS)}: {source}")
+    else:
+        transports = [str(entry).strip() for entry in transports]
+        if any(entry not in TRANSPORTS for entry in transports) or len(set(transports)) != len(transports):
+            raise ProfileError(f"runtime profile 'transports' must be unique values from {list(TRANSPORTS)}: {source}")
+    data["transports"] = transports
+
+    has_simulated = "simulated" in data
+    if has_simulated and not isinstance(data["simulated"], bool):
+        raise ProfileError(f"runtime profile 'simulated' must be a boolean: {source}")
+    has_transport = "transport" in data
+    transport = str(data.get("transport", "")).strip() if has_transport else ""
+    if has_transport and transport not in TRANSPORTS:
+        raise ProfileError(f"runtime profile 'transport' must be one of {list(TRANSPORTS)}: {source}")
+    if has_simulated and has_transport:
+        implied = "sdk" if data["simulated"] else "hardware"
+        if transport != implied:
+            raise ProfileError(
+                f"runtime profile selects transport {transport!r} but 'simulated: {data['simulated']}' implies "
+                f"{implied!r}; pass at most one selection: {source}"
+            )
+    if not has_transport:
+        transport = "sdk" if data.get("simulated", False) else "hardware"
+    if transport not in transports:
+        raise ProfileError(
+            f"runtime profile transport {transport!r} is not in the supported transports {transports}: {source}"
+        )
+    data["transport"] = transport
+    # The legacy boolean stays consistent with the effective transport so
+    # consumers reading ``profile['simulated']`` cannot disagree with it.
+    data["simulated"] = transport != "hardware"
 
 
 def load_profile(path: str | Path) -> dict[str, Any]:
@@ -103,6 +154,8 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
     joints = data["joints"]
     if not isinstance(joints, list) or not joints or not all(str(j).strip() for j in joints):
         raise ProfileError(f"runtime profile 'joints' must be a non-empty list of names: {source}")
+
+    _validate_transport_selection(data, source)
 
     ros2_control = data.get("ros2_control") or {}
     for key, default in (

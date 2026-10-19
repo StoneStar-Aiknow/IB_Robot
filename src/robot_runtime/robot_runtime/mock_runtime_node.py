@@ -178,7 +178,7 @@ class MockRuntime(Node):
         capabilities.update(perception_capabilities(peripherals))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
-        description = build_description(self._profile, peripherals, simulated=True)
+        description = build_description(self._profile, peripherals, transport="sdk")
         self._interface_monitor = InterfaceMonitor(self, description)
         self._synthetic_streams = SyntheticStreams(self, description)
         self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))

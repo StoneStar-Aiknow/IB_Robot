@@ -30,6 +30,7 @@ from robot_runtime.peripherals import (
     peripheral_nodes,
     synthetic_perception_nodes,
 )
+from robot_runtime.profile import TRANSPORTS
 
 
 def render_xacro(xacro_path: str, args: dict[str, Any]) -> str:
@@ -155,11 +156,41 @@ def resolve_profile_argument(package: str, raw: str) -> Path:
     )
 
 
-def resolve_simulated(profile: dict[str, Any], override: str) -> bool:
-    override = (override or "").strip().lower()
-    if override == "":
-        return bool(profile.get("simulated", False))
-    return override in ("1", "true", "yes")
+def resolve_transport(profile: dict[str, Any], transport_arg: str, simulated_arg: str, *, source: str = "") -> str:
+    """Resolve the effective execution transport (runtime-simulation-transport D1).
+
+    ``transport_arg`` (``transport:=``) selects a transport explicitly;
+    ``simulated_arg`` (``simulated:=``) stays the legacy boolean alias mapping
+    to ``sdk``/``hardware``. An empty selection falls back to the profile's
+    declared default. Disagreeing selections, unknown values and transports
+    the profile does not declare fail fast, naming the values involved.
+    """
+    transport_override = (transport_arg or "").strip().lower()
+    simulated_override = (simulated_arg or "").strip().lower()
+    if transport_override and transport_override not in TRANSPORTS:
+        raise RuntimeProfileError(f"unknown transport {transport_override!r}: expected one of {list(TRANSPORTS)}")
+    simulated_explicit = ""
+    if simulated_override:
+        if simulated_override in ("1", "true", "yes"):
+            simulated_explicit = "sdk"
+        elif simulated_override in ("0", "false", "no"):
+            simulated_explicit = "hardware"
+        else:
+            raise RuntimeProfileError(f"cannot parse simulated:={simulated_override!r} as a boolean")
+    if transport_override and simulated_explicit and transport_override != simulated_explicit:
+        raise RuntimeProfileError(
+            f"conflicting transport selection: transport:={transport_override!r} and simulated:="
+            f"{simulated_override!r} (-> {simulated_explicit!r}); pass at most one"
+        )
+    default_transport = str(profile.get("transport") or ("sdk" if profile.get("simulated") else "hardware"))
+    selection = transport_override or simulated_explicit or default_transport
+    supported = [str(entry) for entry in (profile.get("transports") or ["hardware", "sdk"])]
+    if selection not in supported:
+        raise RuntimeProfileError(
+            f"transport {selection!r} is not supported by this runtime profile (supported: {supported}, "
+            f"default: {default_transport!r}{f'; profile: {source}' if source else ''})"
+        )
+    return selection
 
 
 def render_robot_description(profile: dict[str, Any], profile_path: Path, simulated: bool) -> str:
@@ -197,13 +228,17 @@ def runtime_stack_actions(
     *,
     robot_description: str | None = None,
     interface_description: dict | None = None,
+    transport: str = "",
 ) -> list:
     """robot_state_publisher + ros2_control_node + controller spawners + runtime facade.
 
     ``peripherals_file`` (deployment overrides; profile ``peripherals:`` are
     the robot's defaults) additionally composes the sensor driver nodes, or
     synthetic perception publishers in simulated transport (D12), and feeds
-    the facade so RuntimeStatus declares the perception surface.
+    the facade so RuntimeStatus declares the perception surface. ``transport``
+    (runtime-simulation-transport D1/D7) is forwarded to the facade so its
+    public description carries the selected transport; empty keeps the
+    facade's legacy ``simulated``-parameter resolution.
     """
     if robot_description is None:
         robot_description = render_robot_description(profile, profile_path, simulated)
@@ -241,6 +276,7 @@ def runtime_stack_actions(
                     "peripherals": peripherals_file,
                     "simulated": simulated,
                     "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
+                    **({"transport": transport} if transport else {}),
                     **(
                         {"interface_description_json": json.dumps(interface_description)}
                         if interface_description is not None

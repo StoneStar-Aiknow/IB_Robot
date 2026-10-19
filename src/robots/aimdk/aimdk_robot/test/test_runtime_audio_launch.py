@@ -29,7 +29,7 @@ def _runtime_launch_module():
 def _render(simulated: str):
     context = launch.LaunchContext()
     context.launch_configurations.update(
-        {"profile": str(_PROFILE), "simulated": simulated, "instance_id": "", "initial_mode": ""}
+        {"profile": str(_PROFILE), "simulated": simulated, "transport": "", "instance_id": "", "initial_mode": ""}
     )
     return _runtime_launch_module()._launch_setup(context)
 

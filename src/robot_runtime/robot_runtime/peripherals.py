@@ -103,7 +103,7 @@ def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, descrip
                 "capabilities": {},
                 "peripherals": peripherals,
             },
-            simulated=True,
+            transport="sdk",
         )
     if not _has_synthetic_streams(description):
         # e.g. audio-only peripherals: the real ALSA owners serve them in both

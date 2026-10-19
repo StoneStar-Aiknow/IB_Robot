@@ -30,6 +30,7 @@ from robot_runtime.joint_conversion import (
     joint_limits_from_urdf,
     normalize_lerobot_norm_mode,
 )
+from robot_runtime.profile import TRANSPORTS
 
 _MODES = (NORM_MODE_DEGREES, NORM_MODE_RANGE, NORM_MODE_NONE)
 _ENTRY_FIELDS = ("min", "max", "span", "offset")
@@ -253,12 +254,19 @@ def validate_public_conversion_metadata(metadata: dict) -> None:
             raise ValueError(f"public conversion metadata {key} mismatch")
 
 
-def build_model_metadata(profile: dict, *, simulated: bool, robot_description: str | None) -> dict:
+def build_model_metadata(profile: dict, *, transport: str, robot_description: str | None) -> dict:
     """Project calibrated ranges, grouping, rest pose and public motion frame names.
 
-    Conversion ranges preserve calibration semantics; admissible command limits
-    intersect those ranges with the effective URDF. Simulation never reads calibration.
+    ``transport`` (runtime-simulation-transport D7) selects the conversion
+    authority: every non-hardware transport (``sdk``, ``gazebo``) reads the
+    URDF convention, physical hardware reads calibration. Conversion ranges
+    preserve calibration semantics; admissible command limits intersect those
+    ranges with the effective URDF. Simulation never reads calibration.
     """
+    transport = str(transport)
+    if transport not in TRANSPORTS:
+        raise ValueError(f"model metadata transport must be one of {list(TRANSPORTS)}, got {transport!r}")
+    simulated = transport != "hardware"
     names = [str(name) for name in profile.get("joints", [])]
     base = profile.get("base") or {}
     wheels = [str(name) for name in base.get("wheel_joints", [])]

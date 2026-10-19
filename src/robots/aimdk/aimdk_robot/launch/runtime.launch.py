@@ -23,7 +23,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import resolve_profile_argument, resolve_simulated
+from robot_runtime.launch_support import resolve_profile_argument, resolve_transport
 from robot_runtime.peripherals import synthetic_perception_nodes
 from robot_runtime.profile import load_profile
 
@@ -41,7 +41,13 @@ NODE_STAGGER_S = 0.6
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("aimdk_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
+    transport = resolve_transport(
+        profile,
+        LaunchConfiguration("transport").perform(context),
+        LaunchConfiguration("simulated").perform(context),
+        source=str(profile_path),
+    )
+    simulated = transport != "hardware"
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
 
@@ -71,7 +77,7 @@ def _launch_setup(context, *_args, **_kwargs):
     # In simulated transport the platform's sensor streams have no publisher, so
     # the contract layer's synthetic publishers stand in for them on exactly the
     # declared endpoints.
-    description = build_description(profile, simulated=True)
+    description = build_description(profile, transport=transport)
     for spec in description["interfaces"].values():
         if spec["message_type"] == "sensor_msgs/msg/Image" and spec.get("configured_profile") is None:
             spec["configured_profile"] = dict(SIMULATED_IMAGE_PROFILE)
@@ -107,6 +113,12 @@ def generate_launch_description() -> LaunchDescription:
                 "simulated",
                 default_value="",
                 description="Override profile.simulated: run against the in-repo vendor mock",
+            ),
+            DeclareLaunchArgument(
+                "transport",
+                default_value="",
+                description="Execution transport: hardware | sdk | gazebo (overrides the profile default; "
+                "conflicts with simulated:=)",
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),

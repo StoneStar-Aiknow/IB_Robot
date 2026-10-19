@@ -49,7 +49,11 @@ from robot_runtime.contract import (
     STOP_SERVICE,
     STOP_TORQUE_OFF,
 )
-from robot_runtime.interface_description import build_description, validate_description
+from robot_runtime.interface_description import (
+    build_description,
+    description_transport,
+    validate_description,
+)
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.peripherals import (
@@ -58,11 +62,45 @@ from robot_runtime.peripherals import (
     merge_peripherals,
     perception_capabilities,
 )
-from robot_runtime.profile import load_profile, stop_bounds
+from robot_runtime.profile import TRANSPORTS, load_profile, stop_bounds
 from robot_runtime.state import RuntimeState
 
 _SERVICE_TIMEOUT_S = 5.0
 _SWITCH_TIMEOUT_S = 3.0
+
+
+def resolve_facade_transport(profile: dict[str, Any], transport_param: str, simulated_param: bool) -> str:
+    """Facade-side transport resolution (runtime-simulation-transport D7).
+
+    The explicit ``transport`` parameter wins when given; otherwise the legacy
+    ``simulated`` boolean maps to ``sdk``/``hardware`` (the facade itself never
+    picks a physics simulator). A ``simulated`` parameter that moved away from
+    the profile default counts as an explicit selection: one that disagrees
+    with ``transport`` fails naming both.
+    """
+    explicit = str(transport_param or "").strip()
+    simulated = bool(simulated_param)
+    if not explicit:
+        return "sdk" if simulated else "hardware"
+    if explicit not in TRANSPORTS:
+        raise ValueError(f"runtime_facade: unknown transport {explicit!r}: expected one of {list(TRANSPORTS)}")
+    # ROS parameters cannot distinguish "unset" from "set to the default", so
+    # only a value that left the profile default is treated as a selection.
+    if simulated != bool(profile.get("simulated", False)) and (explicit != "hardware") != simulated:
+        raise ValueError(f"runtime_facade: conflicting selection transport:={explicit!r} with simulated:={simulated}")
+    return explicit
+
+
+def check_description_identity(profile: dict[str, Any], description: dict, transport: str) -> None:
+    """The effective public description must match the runtime profile's identity."""
+    identity = description["robot"]
+    if (
+        identity["runtime_name"] != profile["runtime"]["name"]
+        or identity["runtime_version"] != str(profile["runtime"]["version"])
+        or description["execution"] != ("simulated" if transport != "hardware" else "physical")
+        or description_transport(description) != transport
+    ):
+        raise ValueError("effective public description does not match the runtime profile")
 
 
 class RuntimeFacade(Node):
@@ -75,6 +113,7 @@ class RuntimeFacade(Node):
             raise ValueError("runtime_facade requires the 'profile' parameter (path to the runtime profile YAML)")
         self._profile: dict[str, Any] = load_profile(path)
         self.declare_parameter("simulated", bool(self._profile.get("simulated", False)))
+        self.declare_parameter("transport", "")
         self.declare_parameter("instance_id", str(self._profile["runtime"].get("instance_id", "")))
         self.declare_parameter("initial_mode", str(self._profile["modes"].get("initial", IDLE_MODE)))
         self._profile["modes"]["initial"] = str(self.get_parameter("initial_mode").value)
@@ -90,19 +129,18 @@ class RuntimeFacade(Node):
         self._profile["fast_lio"] = {**(self._profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
         self.declare_parameter("interface_description_json", "")
         encoded_description = str(self.get_parameter("interface_description_json").value)
+        self._transport = resolve_facade_transport(
+            self._profile,
+            str(self.get_parameter("transport").value),
+            bool(self.get_parameter("simulated").value),
+        )
         description = (
             json.loads(encoded_description)
             if encoded_description
-            else build_description(self._profile, peripherals, simulated=bool(self.get_parameter("simulated").value))
+            else build_description(self._profile, peripherals, transport=self._transport)
         )
         validate_description(description)
-        identity = description["robot"]
-        if (
-            identity["runtime_name"] != self._profile["runtime"]["name"]
-            or identity["runtime_version"] != str(self._profile["runtime"]["version"])
-            or description["execution"] != ("simulated" if self.get_parameter("simulated").value else "physical")
-        ):
-            raise ValueError("effective public description does not match the runtime profile")
+        check_description_identity(self._profile, description, self._transport)
         self._interface_monitor = InterfaceMonitor(self, description)
         self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))
         self._state = RuntimeState(

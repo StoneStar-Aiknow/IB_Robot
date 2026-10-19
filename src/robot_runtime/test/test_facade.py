@@ -349,3 +349,40 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert not cm.active
     assert any("stop engaged during the controller switch" in fault for fault in status.faults)
     assert caller.set_mode("idle").success
+
+
+def test_facade_transport_resolution_follows_parameters():
+    from robot_runtime.facade_node import resolve_facade_transport
+
+    profile = {"runtime": {"name": "t", "version": "0"}, "simulated": False}
+    assert resolve_facade_transport(profile, "", False) == "hardware"
+    assert resolve_facade_transport(profile, "", True) == "sdk"
+    # an explicit transport wins; the simulated parameter left at its profile
+    # default is not treated as a conflicting selection
+    assert resolve_facade_transport(profile, "sdk", False) == "sdk"
+    assert resolve_facade_transport(profile, "hardware", False) == "hardware"
+    assert resolve_facade_transport(profile, "gazebo", True) == "gazebo"
+    with pytest.raises(ValueError, match="unknown transport"):
+        resolve_facade_transport(profile, "teleport", False)
+    with pytest.raises(ValueError, match="conflicting selection"):
+        resolve_facade_transport(profile, "hardware", True)
+    # a simulated parameter moved away from a simulated profile conflicts too
+    with pytest.raises(ValueError, match="conflicting selection"):
+        resolve_facade_transport({"runtime": {"name": "t"}, "simulated": True}, "sdk", False)
+
+
+def test_facade_identity_check_covers_transport():
+    from robot_runtime.facade_node import check_description_identity
+    from robot_runtime.interface_description import build_description, description_digest
+
+    description = build_description(PROFILE, transport="sdk")
+    check_description_identity(PROFILE, description, "sdk")
+    gazebo = build_description(PROFILE, transport="gazebo")
+    check_description_identity(PROFILE, gazebo, "gazebo")
+    with pytest.raises(ValueError, match="does not match"):
+        check_description_identity(PROFILE, gazebo, "sdk")
+    # pre-transport snapshots default from execution and still match the sdk facade
+    legacy = build_description(PROFILE, transport="sdk")
+    del legacy["transport"]
+    legacy["digest"] = description_digest(legacy)
+    check_description_identity(PROFILE, legacy, "sdk")

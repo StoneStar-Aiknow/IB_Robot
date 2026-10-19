@@ -141,7 +141,7 @@ def model_descriptor(descriptor, description_api):
             "gripper_joints": [],
             "motion": {"base_link": "base", "ee_link": "tool", "shoulder_link": "shoulder"},
         },
-        simulated=True,
+        transport="sdk",
         robot_description='<robot name="test"><link name="base"/><link name="tool"/><link name="shoulder"/>'
         '<joint name="one" type="revolute">'
         '<limit lower="-1" upper="1" effort="10" velocity="10"/></joint></robot>',

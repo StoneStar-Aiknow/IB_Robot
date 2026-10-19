@@ -16,6 +16,7 @@ from robot_runtime.interface_description import (
     _teleoperation_interfaces,
     build_description,
     description_digest,
+    description_transport,
     load_description,
     merge_peripherals,
     validate_description,
@@ -136,6 +137,71 @@ def test_digest_and_unknown_states(profile):
     doc["interfaces"]["camera.front.color"]["configured_profile"]["width"] = 32
     with pytest.raises(ValueError, match="digest"):
         validate_description(doc)
+
+
+@pytest.mark.parametrize(
+    ("transport", "execution"),
+    [("hardware", "physical"), ("sdk", "simulated"), ("gazebo", "simulated")],
+)
+def test_description_records_transport_and_execution(profile, transport, execution):
+    doc = build_description(profile, transport=transport)
+    assert doc["transport"] == transport
+    assert doc["execution"] == execution
+    validate_description(doc)  # build already validated; the schema accepts the field
+
+
+def test_simulated_argument_stays_a_transport_alias(profile):
+    assert build_description(profile, simulated=True)["transport"] == "sdk"
+    assert build_description(profile, simulated=False)["transport"] == "hardware"
+    profile_with_sim = {**profile, "simulated": True}
+    assert build_description(profile_with_sim)["transport"] == "sdk"
+
+
+def test_conflicting_simulated_and_transport_selection_rejected(profile):
+    with pytest.raises(InterfaceDescriptionError, match="conflicting execution selection"):
+        build_description(profile, simulated=False, transport="sdk")
+    with pytest.raises(InterfaceDescriptionError, match="conflicting execution selection"):
+        build_description(profile, simulated=True, transport="hardware")
+
+
+def test_unknown_transport_rejected(profile):
+    with pytest.raises(InterfaceDescriptionError, match="unknown transport 'teleport'"):
+        build_description(profile, transport="teleport")
+
+
+def test_digest_covers_transport(profile):
+    doc = build_description(profile, transport="sdk")
+    doc["transport"] = "gazebo"
+    with pytest.raises(ValueError, match="digest"):
+        validate_description(doc)
+
+
+def test_pre_transport_description_stays_valid_and_defaults_from_execution(profile):
+    # A snapshot exported before the transport field existed keeps its digest
+    # and validates unchanged; readers default it from execution without
+    # mutating the document (runtime-simulation-transport D7).
+    doc = build_description(profile, transport="sdk")
+    del doc["transport"]
+    doc["digest"] = description_digest(doc)
+    validate_description(doc)
+    assert description_transport(doc) == "sdk"
+    assert "transport" not in doc  # the reader must not insert the default
+    physical = build_description(profile, transport="hardware")
+    del physical["transport"]
+    physical["digest"] = description_digest(physical)
+    validate_description(physical)
+    assert description_transport(physical) == "hardware"
+    assert "transport" not in physical
+
+
+def test_description_transport_rejects_unknown_value(profile):
+    doc = build_description(profile, transport="sdk")
+    doc["transport"] = "teleport"
+    doc["digest"] = description_digest(doc)
+    with pytest.raises(ValueError, match="transport"):
+        validate_description(doc)  # the schema enum rejects the unknown value
+    with pytest.raises(InterfaceDescriptionError, match="unknown value 'teleport'"):
+        description_transport(doc)
 
 
 def test_supported_modes_not_inferred(profile):

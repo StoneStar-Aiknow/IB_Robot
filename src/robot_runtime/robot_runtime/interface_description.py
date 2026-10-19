@@ -21,10 +21,28 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
+from robot_runtime.profile import TRANSPORTS
 
 
 class InterfaceDescriptionError(ValueError):
     """A public description violates its schema or semantic contract."""
+
+
+def description_transport(description: dict) -> str:
+    """Effective transport of a description, without mutating the document.
+
+    The ``transport`` field is optional (schema_version stays 1), so snapshots
+    exported before it existed remain valid: they are read as ``sdk`` when
+    execution is simulated and ``hardware`` otherwise. An explicitly present
+    but unknown value fails closed instead of silently defaulting.
+    """
+    transport = description.get("transport")
+    if transport is None:
+        return "sdk" if description.get("execution") == "simulated" else "hardware"
+    transport = str(transport)
+    if transport not in TRANSPORTS:
+        raise InterfaceDescriptionError(f"interface description transport: unknown value {transport!r}")
+    return transport
 
 
 def validate_interface_requirements(requirements) -> dict:
@@ -572,8 +590,16 @@ def build_description(
     *,
     simulated: bool | None = None,
     robot_description: str | None = None,
+    transport: str | None = None,
 ) -> dict:
-    """Project only public ROS interfaces; do not serialize private configuration."""
+    """Project only public ROS interfaces; do not serialize private configuration.
+
+    ``transport`` (runtime-simulation-transport D1/D7) selects the execution
+    transport recorded in the description; the legacy ``simulated`` boolean
+    stays an alias for ``sdk``/``hardware``, and with neither given the
+    profile's declared transport applies. Disagreeing selections fail naming
+    both values.
+    """
     runtime = profile["runtime"]
     caps = profile["capabilities"]
     interfaces = peripheral_interfaces(profile.get("peripherals") if peripherals is None else peripherals)
@@ -715,7 +741,20 @@ def build_description(
             frame_id=lidar_odom.get("source_body_frame", "body"),
         )
         interfaces["localization.cloud"]["qos"]["reliability"] = "reliable"
-    effective_simulated = profile.get("simulated", False) if simulated is None else simulated
+    if transport is None:
+        if simulated is None:
+            transport = str(profile.get("transport") or ("sdk" if profile.get("simulated", False) else "hardware"))
+        else:
+            transport = "sdk" if simulated else "hardware"
+    else:
+        transport = str(transport).strip()
+        if transport not in TRANSPORTS:
+            raise InterfaceDescriptionError(f"unknown transport {transport!r}: expected one of {list(TRANSPORTS)}")
+        if simulated is not None and (transport != "hardware") != bool(simulated):
+            raise InterfaceDescriptionError(
+                f"conflicting execution selection: simulated={simulated} with transport={transport!r}"
+            )
+    effective_simulated = transport != "hardware"
     description = {
         "schema_version": 1,
         "robot": {
@@ -725,6 +764,7 @@ def build_description(
             "runtime_version": str(runtime["version"]),
         },
         "execution": "simulated" if effective_simulated else "physical",
+        "transport": transport,
         "interfaces": interfaces,
         "states": {},
     }
@@ -733,9 +773,7 @@ def build_description(
     if robot_description is not None:
         from robot_runtime.model_metadata import build_model_metadata
 
-        description["model"] = build_model_metadata(
-            profile, simulated=bool(effective_simulated), robot_description=robot_description
-        )
+        description["model"] = build_model_metadata(profile, transport=transport, robot_description=robot_description)
         for name, interface in _teleoperation_interfaces(profile, description["model"]).items():
             if name in interfaces:
                 raise InterfaceDescriptionError(f"duplicate logical command interface {name}")
@@ -753,6 +791,7 @@ def main(argv=None):
     source.add_argument("--validate")
     parser.add_argument("--peripherals", default="")
     parser.add_argument("--simulated", choices=("true", "false"))
+    parser.add_argument("--transport", choices=TRANSPORTS)
     parser.add_argument("--output")
     parser.add_argument("--instance-id")
     args = parser.parse_args(argv)
@@ -770,7 +809,9 @@ def main(argv=None):
                 profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
                 profile["fast_lio"] = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
             description = build_description(
-                profile, simulated=None if args.simulated is None else args.simulated == "true"
+                profile,
+                simulated=None if args.simulated is None else args.simulated == "true",
+                transport=args.transport,
             )
         if args.output:
             write_description(description, args.output)
