@@ -7,6 +7,7 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.perception_runtime_config import parse_perception_runtime_config
 
 # The operator location is owned by torch_models.graspgenx_ascend_310p
@@ -91,3 +92,23 @@ def generate_perception_model_nodes(
 
 
 __all__ = ["generate_perception_model_nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_perception_models(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.perception_models import generate_perception_model_nodes
+
+    return BuildResult(actions=list(generate_perception_model_nodes(context.robot_config)))
+
+
+PERCEPTION_MODELS_BUILDER = BuilderSpec(
+    id="perception_models",
+    factory=f"{__name__}:build_perception_models",
+    timing="runtime_ready",
+)

@@ -9,6 +9,7 @@ from launch_ros.actions import Node
 from launch_ros.utilities import evaluate_parameters
 
 from robot_config.interface_binding import InterfaceBindingError, bind_robot_interfaces, required_interface_ids
+from robot_config.launch_builders import runtime
 from robot_config.launch_builders.interaction_demo import generate_interaction_demo_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_runtime.interface_description import build_description
@@ -104,7 +105,7 @@ def test_unified_launch_constructs_demo_from_live_bound_config(monkeypatch):
         captured["consumers"] = construct(bind_robot_interfaces(config, descriptor(), require_ready=True))
         return [marker]
 
-    monkeypatch.setattr(robot_launch, "generate_bound_runtime_actions", fake_bound_actions)
+    monkeypatch.setattr(runtime, "generate_bound_runtime_actions", fake_bound_actions)
     context = LaunchContext()
     context.launch_configurations.update(config_path=str(CONFIG), use_sim="true", record="false")
     assert robot_launch.launch_setup(context) == [marker]

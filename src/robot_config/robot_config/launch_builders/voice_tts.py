@@ -8,6 +8,7 @@ from typing import Any
 from launch_ros.actions import Node
 
 from robot_config.audio_contract import is_audio_io_enabled
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
@@ -121,3 +122,25 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             ],
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_voice_tts(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.voice_tts import generate_voice_tts_nodes
+
+    nodes = generate_voice_tts_nodes(context.robot_config)
+    if nodes:
+        logger.info(f"Added {len(nodes)} voice TTS node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+VOICE_TTS_BUILDER = BuilderSpec(
+    id="voice_tts",
+    factory=f"{__name__}:build_voice_tts",
+)

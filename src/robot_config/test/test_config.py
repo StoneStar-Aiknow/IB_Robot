@@ -15,7 +15,6 @@ from robot_config.config import (
     Ros2ControlConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
-    VoiceTTSConfig,
 )
 from robot_config.contract_utils import contract_fingerprint, iter_specs
 from robot_config.launch_builders.recording import get_recording_topics
@@ -35,7 +34,6 @@ from robot_config.loader import (
 from robot_config.timeout_policy import DEFAULT_EMBODIED_TIMEOUT_POLICY, resolve_embodied_timeout_policy
 from robot_config.utils import resolve_lerobot_norm_mode
 from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
-from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 
 HUMBLE_FLOAT32_MAX = 3.402823466e38
 IEEE_FLOAT32_MAX = 3.4028234663852886e38
@@ -1188,7 +1186,7 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.external_min_samples == VOICE_ASR_DEFAULTS["external_min_samples"]
 
 
-def test_voice_tts_loader_and_runtime_defaults_match():
+def test_voice_tts_loader_applies_explicit_overrides():
     config = load_voice_tts_config(
         {
             "enabled": True,
@@ -1197,19 +1195,17 @@ def test_voice_tts_loader_and_runtime_defaults_match():
             "max_request_chars": 1000,
         }
     )
-    defaults = VoiceTTSConfig()
 
     assert config.enabled is True
     assert config.bundle_path == "models/voice_tts/custom"
     assert config.deployment == "torch_cpu"
     assert config.max_request_chars == 1000
-    assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
-    assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
-    assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
-    assert defaults.playback_service_name == VOICE_TTS_DEFAULTS["playback_service_name"]
-    assert defaults.playback_timeout_sec == VOICE_TTS_DEFAULTS["playback_timeout_sec"]
-    assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
-    assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
+
+
+# The contract that VoiceTTSConfig() defaults stay in sync with the shared
+# VOICE_TTS_DEFAULTS dict moved to voice_tts_service (the defaults owner);
+# robot_config deliberately treats voice_tts_service as an undeclared runtime
+# plugin (see launch_builders/voice_tts.py), so its tests must not import it.
 
 
 def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():

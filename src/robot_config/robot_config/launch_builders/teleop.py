@@ -15,13 +15,13 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.control import _calibration_tool_command
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     prepare_lerobot_env,
     resolve_calibration_source_specs_from_config,
     resolve_ros_path,
 )
-from robot_teleop.teleop_groups import resolve_target_publish_groups
 
 logger = get_colored_logger("robot_config.teleop")
 
@@ -224,6 +224,10 @@ def _resolve_follower_calib_file(robot_config: dict, device_config: dict, device
 
 
 def _generate_device_nodes(robot_config: dict, device_config: dict, robot_description_dict: dict = None) -> list[Node]:
+    # Function-local import: keep registry construction free of the
+    # robot_teleop dependency chain.
+    from robot_teleop.teleop_groups import resolve_target_publish_groups
+
     nodes = []
     teleop_config = robot_config.get("teleoperation", {})
     device_type = device_config.get("type", "")
@@ -1098,6 +1102,10 @@ def validate_teleop_config(
         ...     for error in errors:
         ...         print(f"Error: {error}")
     """
+    # Function-local import: keep registry construction free of the
+    # robot_teleop dependency chain.
+    from robot_teleop.teleop_groups import resolve_target_publish_groups
+
     errors = []
 
     if not teleop_config.get("enabled", False):
@@ -1383,3 +1391,43 @@ def get_recording_topics(robot_config: dict) -> list[str]:
             topics.append(f"/camera/{name}/camera_info")
 
     return topics
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_teleop(context: LaunchBuildContext) -> BuildResult:
+    """Teleop mode entry; runtime_ready timing.
+
+    The registry enable predicate owns overall participation (teleop
+    control mode only); the fine-grained ``teleoperation.enabled`` YAML
+    check stays here as a domain condition.
+    """
+    logger.info(f"TELEOP MODE DETECTED ({context.control_mode})")
+    teleop_config = context.robot_config.get("teleoperation", {})
+    if not teleop_config.get("enabled", False):
+        logger.info("WARNING: Teleop mode requested but teleoperation config not found")
+        return BuildResult()
+
+    from robot_config.launch_builders.teleop import generate_teleop_nodes
+
+    control = context.control_startup
+    robot_description = dict(control.robot_description) if control is not None else {}
+    nodes = generate_teleop_nodes(context.robot_config, robot_description)
+    logger.info(f"Prepared {len(nodes)} teleop nodes")
+    return BuildResult(actions=list(nodes))
+
+
+TELEOP_BUILDER = BuilderSpec(
+    id="teleop",
+    factory=f"{__name__}:build_teleop",
+    after=("control",),
+    timing="runtime_ready",
+    # CLI-owned overall participation; the fine-grained
+    # teleoperation.enabled YAML check stays in the build function.
+    enabled=lambda context: context.control_mode == "teleop",
+)

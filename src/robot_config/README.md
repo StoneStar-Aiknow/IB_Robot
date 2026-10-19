@@ -86,6 +86,122 @@ robot_config YAML（单一数据源）
                 └───► PolicyBridge / EpisodeRecorder
 ```
 
+### Launch builder 注册表（registry orchestration）
+
+`robot.launch.py` 主入口只保留三项职责：声明 launch 参数（SSOT 在
+`launch_builders/launch_options.py`）、执行准备流水线（`preparation.py`）、把冻结的
+participation plan 交给通用编排器（`orchestrator.py`）。每个内建条目的 `BuilderSpec` 常量与
+`build_<id>(context) -> BuildResult` 构建函数住在它自己的领域模块里；
+`builtin_registry.py` 只保留一张有序的 `"module:<ID>_BUILDER"` 引用表（`BUILTIN_BUILDERS`），
+表顺序即拓扑排序的稳定决胜序。构建注册表不得引入超出注册表核心、`launch`、`launch_ros` 与
+`ament_index_python` 之外的依赖：领域模块的跨包运行依赖一律函数内 import（共享的启用判定
+helper 在 `launch_builders/builder_support.py`），由导入预算测试固化。
+
+新增一个 launch 条目 = 在领域模块定义 `build_<id>` 与 `<ID>_BUILDER`，再在
+`BUILTIN_BUILDERS` 表加一行，主入口与旧 facade 不需要任何修改。例如：
+
+```python
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, HookSpec
+
+# 1) 领域模块 my_feature.py：构建函数（业务依赖函数内 import）+ 注册常量
+def build_my_feature(context) -> BuildResult:
+    from robot_config.launch_builders.my_feature import generate_my_feature_nodes
+
+    return BuildResult(actions=list(generate_my_feature_nodes(context.robot_config)))
+
+
+MY_FEATURE_BUILDER = BuilderSpec(
+    id="my_feature",
+    factory=f"{__name__}:build_my_feature",
+    timing="runtime_ready",  # 控制器就绪屏障之后才启动
+    # 可选：贡献 CLI 参数与准备阶段 hook（一处声明即可）
+    arguments=(ArgumentSpec(name="my_feature_scale", declared_default="1.0",
+                            absent_fallback="1.0", description="Feature scale"),),
+    hooks=(HookSpec(phase="preflight",
+                    factory=f"{__name__}:preflight_hook",
+                    config_keys=("my_feature",)),),
+)
+
+# 2) builtin_registry.BUILTIN_BUILDERS 表中追加一行：
+#    "robot_config.launch_builders.my_feature:MY_FEATURE_BUILDER",
+#    （或测试直接用独立 registry 实例 registry.add(MY_FEATURE_BUILDER)）
+```
+
+`after` 只影响构建顺序（目标不参与时边被移除）；`requires` 是硬参与依赖（目标被过滤掉即报错），
+不贡献顺序边；环在组合 `after`+`requires` 图上拒绝，且都发生在任何 factory 解析之前。
+`timing="runtime_ready"` 的条目在存在控制器就绪屏障时被拆分到屏障之后（单个 `OnProcessExit`
+成功门控 handler，非零退出触发 `Shutdown`）；无屏障时按 plan 原序直通。类型化基础设施输出
+（`control_startup` / `simulation_startup` / `benchmark_startup`）单所有者声明（`provides`），
+benchmark 是唯一的 run-config 物化所有者，后续条目读取其物化快照而不重复物化。
+
+准备流水线按固定命名 anchor 执行（`load_target → control_mode → config_overrides →
+inference_override → mock_check → inference_derived → scheduler_check → benchmark_check →
+resource_check → preflight`），注册 hook 在对应 anchor 的核心步骤**之前**执行，签名统一为
+`hook_factory(robot_config, arguments)`（arguments 为只读表）；额外声明了第三个位置参数的 hook
+收到只读的 prepared target 状态 `hook_factory(robot_config, arguments, target_state)`
+（`HookTargetState(use_sim, control_mode)`，供 preflight hook 使用，不需要自行推导）。
+`config_overrides` 没有核心步骤，只按注册顺序运行业务 override hook（内建：hand profile →
+voice ASR → embodied）。`preflight` hook 在隔离深拷贝上运行，任何配置改写都会被拒绝。
+hook 声明的 `config_keys` 不能与准备核心拥有的键（`runtime`、`simulation`、`control_modes`
+等）或其父子路径冲突；跨条目的 key 冲突在注册时拒绝。非 preflight hook 同样先在副本上执行，
+只允许修改其声明的路径（含子路径）；越权写入会拒绝整次 hook 结果，不污染共享配置。
+hook 对所有已注册条目运行（与该条目是否参与 plan 无关），因此 hook 工厂必须保持轻量导入。
+未参与 plan 的条目由 registry 统一输出一次跳过日志（`launch builder '<id>' skipped:
+mock skip key '<key>'` 或 `enabled predicate`），adapter 内不再打印各自的跳过日志。
+类型化 startup 输出仅能由固定的 `control`、`simulation`、`benchmark` 条目声明，并检查返回值类型。
+
+内建条目的整体参与条件只声明一次：mock/benchmark/with_inference 过滤与 CLI 开关门控
+（teleop 控制模式、`with_navigation`/`with_moveit` 解析、`record_visualizer != none`）都在
+`BuilderSpec.enabled` / `mock_skip_key` 中；adapter 与领域函数不重复这些判断。依赖
+live-binding 后配置、benchmark 物化快照或承载失败容忍策略的条件（recording 语义数据集、
+motion_planning 无 provider 报错、rerun 未知值告警）保持在构建期。
+
+#### Launch 参数表（核心 14 项 + 业务贡献）
+
+`declare_launch_arguments` 按 `declared_default` 声明；直接调用 `launch_setup`（如 embodied
+bringup）时缺失键回落到 `absent_fallback`。两者刻意不同（`robot_config`、`voice_asr_auto_start`、
+`moveit_display`），不要合并。核心表只保留被准备核心或基础设施条目消费的参数：
+
+| 参数 | declared 默认 | 直调回落 | 说明 |
+|---|---|---|---|
+| `robot_config` | `so101_single_arm` | `test_cam` | 机器人配置名（不带 `.yaml`） |
+| `config_path` | 空 | 空 | 完整配置文件路径（覆盖 `robot_config`） |
+| `use_sim` | 空 | 空 | 覆盖虚拟具身；空则按 `runtime.target` 推断 |
+| `sim_platform` | 空 | 空 | 覆盖 `simulation.platform`（gazebo/mujoco/mock/sdk） |
+| `auto_start_controllers` | `true` | `true` | 自动 spawn controller（调试可关） |
+| `control_mode` | 空 | 空 | 覆盖 YAML 的 `default_control_mode` |
+| `nav_stage` | 空 | 空 | 选择工作流 stage（mapping/navigation/grasp/hybrid） |
+| `with_inference` | 空 | 空 | 启用完整执行链；空则按控制模式配置推断 |
+| `inference_pipeline` | 空 | 空 | 推理覆盖目标 pipeline ID |
+| `inference_execution_mode` | 空 | 空 | `monolithic` / `distributed` |
+| `moveit_display` | `true` | `false` | MoveIt RViz（仅 MoveIt 启用时） |
+| `runtime_target` | 空 | 空 | 覆盖目标（hardware/simulation/benchmark） |
+| `enable_tracing` | `false` | `false` | 启用 ros2_tracing / LTTng |
+| `trace_session_name` | `ib_robot_trace` | `ib_robot_trace` | LTTng 会话名 |
+
+业务参数由所属条目的 `BuilderSpec(arguments=...)` 声明（`declared_default` / `absent_fallback` /
+描述逐字保留，与迁移前的核心表一致）：
+
+| 参数 | 所属条目 | declared 默认 | 直调回落 | 说明 |
+|---|---|---|---|---|
+| `hand_profile` | hand_sources | 空 | 空 | 选择手部 profile（right/left/dual） |
+| `voice_asr_auto_start` | voice_asr | `false` | 空 | true 时启用 ASR 并强制 continuous |
+| `voice_asr_realtime_pre_roll_seconds` | voice_asr | 空 | 空 | 覆盖 ASR 预滚时长 |
+| `with_navigation` | navigation | 空 | 空 | 启用导航；空则按 `navigation.enabled` |
+| `navigation_mode` | navigation | 空 | 空 | 覆盖 `navigation.default_mode` |
+| `with_moveit` | motion_planning | 空 | 空 | 启用 MoveIt；空则按控制模式推断 |
+| `with_embodied` | embodied | 空 | 空 | 覆盖 `embodied.enabled` |
+| `with_perception` | embodied | 空 | 空 | 覆盖 `embodied.perception.enabled` |
+| `record` | recording | `false` | `false` | 自动 rosbag 录制 |
+| `record_mode` | recording | `continuous` | `continuous` | `continuous` / `episodic` |
+| `record_visualizer` | rerun_visualizer | `none` | `none` | `rerun` / `none` |
+
+组合后的参数名集合、默认值与迁移前完全一致；声明顺序变为"核心表顺序 + 业务贡献按注册顺序"，
+这是唯一允许的可观察差异。条目可读取任意已组合参数（task_executor 读取 motion_planning 声明的
+`with_moveit`），所有权只决定由谁声明。与核心表或其他业务贡献重名在 `compose_argument_specs`
+聚合时拒绝，发生在任何副作用阶段之前。
+
 ### 通用模型服务 SSOT
 
 模型服务使用顶层 `perception_services`，不属于具体消费者。每个 enabled entry 必须显式选择 manifest 中的命名

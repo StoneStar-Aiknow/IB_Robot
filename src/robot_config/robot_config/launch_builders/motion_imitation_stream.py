@@ -29,6 +29,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
 
 from robot_config.interface_binding import InterfaceBindingError
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 
 _COMPRESSED_TYPE = "sensor_msgs/msg/CompressedImage"
 # The runtime publishes the camera; the stream subscribes it.
@@ -234,7 +235,9 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
             raise InterfaceBindingError("unknown_interface", interface_id, "ID is not in the runtime description")
         if (item.get("kind"), item.get("direction"), item.get("message_type")) != _CAMERA_SHAPE:
             kind, direction, message_type = _CAMERA_SHAPE
-            raise InterfaceBindingError("invalid_interface", interface_id, f"requires {kind} {message_type} {direction}")
+            raise InterfaceBindingError(
+                "invalid_interface", interface_id, f"requires {kind} {message_type} {direction}"
+            )
         topic = item.get("endpoint")
         if not isinstance(topic, str) or not topic.startswith("/"):
             raise InterfaceBindingError("invalid_interface", interface_id, "endpoint must be an absolute ROS name")
@@ -248,8 +251,7 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
         )
         if described:
             raise ValueError(
-                f"motion_imitation_stream.frame_source.topic is described as {described[0]}; "
-                "use frame_source.interface"
+                f"motion_imitation_stream.frame_source.topic is described as {described[0]}; use frame_source.interface"
             )
     decoder = source.get("decoder", _DEFAULT_DECODER)
     if not isinstance(decoder, str) or not decoder:
@@ -369,3 +371,23 @@ __all__ = [
     "mock_playback_endpoints",
     "motion_imitation_stream_parameters",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_motion_imitation_stream(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.motion_imitation_stream import generate_motion_imitation_stream_nodes
+
+    return BuildResult(actions=list(generate_motion_imitation_stream_nodes(context.robot_config)))
+
+
+MOTION_IMITATION_STREAM_BUILDER = BuilderSpec(
+    id="motion_imitation_stream",
+    factory=f"{__name__}:build_motion_imitation_stream",
+    timing="runtime_ready",
+)

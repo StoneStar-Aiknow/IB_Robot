@@ -5,6 +5,7 @@ from typing import Any
 from launch_ros.actions import Node
 
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 
 logger = get_colored_logger("robot_config.audio_io")
@@ -92,3 +93,22 @@ def generate_audio_io_actions(robot_config: dict[str, Any]) -> list[Node]:
             )
         )
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_audio_io(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.audio_io import generate_audio_io_actions
+
+    return BuildResult(actions=list(generate_audio_io_actions(context.robot_config)))
+
+
+AUDIO_IO_BUILDER = BuilderSpec(
+    id="audio_io",
+    factory=f"{__name__}:build_audio_io",
+)

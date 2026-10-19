@@ -13,7 +13,23 @@ debugging and unit testing; it always uses the Gazebo backend
 regardless of YAML platform.
 """
 
+from typing import Any
+
+from launch_ros.actions import Node
+
+from robot_config.launch_builders.builder_support import runtime_provider_name
+from robot_config.launch_builders.registry import (
+    BuilderSpec,
+    BuildResult,
+    LaunchBuildContext,
+    SimulationStartup,
+    isolated_config,
+)
+from robot_config.logger_utils import get_colored_logger
+
 from .sim_backend import get_sim_backend
+
+logger = get_colored_logger("robot_config.launch_builders.simulation")
 
 
 def generate_gazebo_nodes(robot_config: dict) -> list:
@@ -33,3 +49,100 @@ def generate_gazebo_nodes(robot_config: dict) -> list:
     actions, _ = adapter.start_backend(robot_config)
     actions += adapter.spawn_peripheral_bridges(robot_config.get("peripherals", []))
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_simulation(context: LaunchBuildContext) -> BuildResult:
+    """Design §2 simulation entry: sim backend + peripheral bridges + scene task.
+
+    Always participates (infrastructure entries are never enable-gated
+    at the registry level); the build body decides whether backend
+    processes are actually created. Hardware launches and benchmark
+    targets never enter the sim backend registry — benchmark even though
+    its effective use_sim is true ([IBROBOT_BENCHMARK][SKIP]
+    simulation_backend) — and a runtime provider owns its own transport;
+    all three yield the explicit empty :class:`SimulationStartup`. Mock is
+    NOT skipped: the mock contract backend starts through this section
+    (legacy behavior).
+
+    Uses a private deep copy of the context config: the Gazebo adapter
+    may write ``initial_pose_x/y/z`` from the scene layout / robot_spawn
+    into it for the create-entity arguments; those local writes never
+    leak back to the shared context or later entries.
+    """
+    if not context.use_sim:
+        # Hardware launch: no simulation backend processes (legacy section 5
+        # ran only for use_sim and not benchmark and not provider).
+        return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
+    if context.is_benchmark:
+        # simulation_backend skipped by benchmark target; the
+        # [IBROBOT_BENCHMARK][SKIP] simulation_backend marker is already
+        # printed at runtime target resolution. Benchmark must never enter
+        # the SimBackendAdapter registry even though use_sim=true.
+        logger.info("benchmark target: skipping simulation backend (SimBackendAdapter)")
+        return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
+    if runtime_provider_name(context):
+        logger.info("runtime.provider active: simulation transport owned by the robot runtime")
+        return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
+
+    robot_config = context.robot_config
+    sim_platform = context.sim_platform
+    private_config = isolated_config(robot_config)
+    actions: list[Any] = []
+    create_entity = None
+
+    logger.info("========== Generating Simulation Nodes ==========")
+    logger.info(f"Sim platform: {sim_platform}")
+    try:
+        from robot_config.launch_builders.sim_backend import get_sim_backend
+
+        sim_adapter = get_sim_backend(sim_platform)
+        sim_nodes, create_entity = sim_adapter.start_backend(private_config)
+        sim_nodes += sim_adapter.spawn_peripheral_bridges(private_config.get("peripherals", []))
+        actions.extend(sim_nodes)
+        logger.info(f"Added {len(sim_nodes)} simulation nodes ({sim_platform})")
+
+        # Scene task node for randomisation and AutoTest evaluation
+        scene_name = private_config.get("simulation", {}).get("scene", "")
+        if sim_platform == "mujoco" and scene_name == "pick_banana":
+            actions.append(
+                Node(
+                    package="sim_models",
+                    executable="pick_banana_task_node",
+                    name="pick_banana_task_node",
+                    parameters=[{"use_sim_time": True}],
+                    output="screen",
+                )
+            )
+            logger.info("Added pick_banana_task_node")
+    except NotImplementedError:
+        logger.warning(
+            f"sim platform '{sim_platform}' not implemented yet, "
+            f"skipping simulation nodes (set simulation.platform: gazebo to use Gazebo)"
+        )
+    except Exception as e:
+        logger.error(f"generating simulation nodes: {e}")
+        raise
+
+    return BuildResult(
+        actions=actions,
+        simulation_startup=SimulationStartup(entity_action=create_entity),
+    )
+
+
+SIMULATION_BUILDER = BuilderSpec(
+    id="simulation",
+    factory=f"{__name__}:build_simulation",
+    provides=("simulation_startup",),
+    # Infrastructure entries always participate (design §2):
+    # the build body decides whether backend processes are
+    # actually created and returns an explicit empty
+    # SimulationStartup otherwise, so controller_startup can
+    # always rely on the typed output.
+)

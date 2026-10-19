@@ -121,7 +121,14 @@ def test_moveit_task_executor_fails_before_launch_when_package_is_missing(monkey
         generate_task_executor_node(config, "moveit_planning")
 
 
-def test_task_executor_gripper_stroke_has_one_owner_and_is_unknown_without_both_positions() -> None:
+def test_task_executor_gripper_stroke_has_one_owner_and_is_unknown_without_both_positions(monkeypatch) -> None:
+    # generate_task_executor_node's get_package_prefix("task_dispatch") is only an
+    # install-presence check (the prefix value is unused); task_dispatch
+    # exec_depends on robot_config, so this test must not require its install.
+    monkeypatch.setattr(
+        task_execution_builder, "get_package_prefix", lambda _package_name: "/opt/ros/humble/share/task_dispatch"
+    )
+
     base = {
         "_config_path": "/tmp/robot.yaml",
         "control_modes": {"moveit_planning": {"executor": {}}},

@@ -11,7 +11,13 @@ motion to moveit_gateway and gripper control to ros2_control.
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.builder_support import resolve_with_moveit, runtime_provider_name
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
+
+logger = get_colored_logger("robot_config.task_execution")
 
 
 def generate_task_executor_node(robot_config, control_mode, use_sim=False):
@@ -115,3 +121,87 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
 
     print("[robot_config] ✓ Task executor node configured")
     return node
+
+
+# ---------------------------------------------------------------------------
+# Registry entries (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constants and build functions moved here from the retired
+# ``adapters.py``; the bodies are verbatim migrations (only the shared with_moveit
+# resolution now imports from ``builder_support`` instead of the former
+# ``builtin_registry`` helper).
+# ---------------------------------------------------------------------------
+
+# Business launch arguments owned by the motion_planning entry (migrated
+# verbatim from the former builtin_registry table; task_executor only reads).
+_MOTION_PLANNING_ARGUMENTS = (
+    ArgumentSpec(
+        name="with_moveit",
+        declared_default="",
+        absent_fallback="",
+        description="Enable MoveIt motion planning. If empty, auto-detects from control mode config",
+    ),
+)
+
+
+def build_motion_planning(context: LaunchBuildContext) -> BuildResult:
+    """with_moveit validation: generic launch ships no planner.
+
+    Always participates: the no-provider hard error is build-time policy
+    (failure tolerance), not a participation condition. The with_moveit
+    resolution is shared with the task_executor enable predicate.
+    """
+    with_moveit = resolve_with_moveit(context)
+    logger.info(f"with_moveit={with_moveit}")
+
+    provider_name = runtime_provider_name(context)
+    if with_moveit and not provider_name:
+        raise RuntimeError(
+            "motion planning was requested (with_moveit / a moveit control mode) but robot.runtime.provider "
+            "is not set: motion services come from the robot runtime, generic launch ships no planner"
+        )
+    if with_moveit:
+        logger.info(f"Motion services provided by runtime.provider={provider_name}")
+    else:
+        logger.info("Motion planning not requested")
+    return BuildResult()
+
+
+MOTION_PLANNING_BUILDER = BuilderSpec(
+    id="motion_planning",
+    factory=f"{__name__}:build_motion_planning",
+    arguments=_MOTION_PLANNING_ARGUMENTS,
+)
+
+
+def build_task_executor(context: LaunchBuildContext) -> BuildResult:
+    """Task executor entry; runtime_ready timing.
+
+    The registry enable predicate owns the shared with_moveit resolution;
+    a false resolution never reaches this build function. The generation
+    failure policy (refusing an incomplete motion stack) stays here.
+    """
+    from robot_config.launch_builders.task_execution import generate_task_executor_node
+
+    try:
+        task_node = generate_task_executor_node(context.robot_config, context.control_mode, context.node_use_sim_time)
+        if task_node is not None:
+            print("[robot_config] Task executor node added")
+            return BuildResult(actions=[task_node])
+        return BuildResult()
+    except Exception as e:
+        logger.error(f"generating required task executor: {e}")
+        raise RuntimeError("MoveIt task executor setup failed; refusing to start an incomplete motion stack") from e
+
+
+TASK_EXECUTOR_BUILDER = BuilderSpec(
+    id="task_executor",
+    factory=f"{__name__}:build_task_executor",
+    after=("benchmark",),
+    timing="runtime_ready",
+    # with_moveit is declared by motion_planning; task_executor
+    # only reads it (ownership decides declaration, not reads).
+    # Shared with_moveit resolution (CLI switch with the
+    # control-mode fallback); build-time node generation and
+    # its failure policy stay in the build function.
+    enabled=resolve_with_moveit,
+)

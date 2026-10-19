@@ -16,6 +16,11 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.logger_utils import get_colored_logger
+
+logger = get_colored_logger("robot_config.semantic_mapping")
+
 
 def generate_semantic_mapping_nodes(robot_config: dict[str, Any]) -> list[Node]:
     """Generate the online semantic mapping node when it is enabled.
@@ -45,3 +50,26 @@ def generate_semantic_mapping_nodes(robot_config: dict[str, Any]) -> list[Node]:
 
 
 __all__ = ["generate_semantic_mapping_nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_semantic_mapping(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.semantic_mapping import generate_semantic_mapping_nodes
+
+    nodes = generate_semantic_mapping_nodes(context.robot_config)
+    if nodes:
+        logger.info(f"Added {len(nodes)} semantic mapping node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+SEMANTIC_MAPPING_BUILDER = BuilderSpec(
+    id="semantic_mapping",
+    factory=f"{__name__}:build_semantic_mapping",
+    timing="runtime_ready",
+)

@@ -8,6 +8,7 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
@@ -83,3 +84,28 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
             launch_arguments=launch_arguments.items(),
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_speech_direction(context: LaunchBuildContext) -> BuildResult:
+    """Speech direction entry; the mock backend never reaches this build function."""
+
+    from robot_config.launch_builders.speech_direction import generate_speech_direction_actions
+
+    actions = generate_speech_direction_actions(context.robot_config)
+    if actions:
+        logger.info("Added speech direction launch")
+    return BuildResult(actions=list(actions))
+
+
+SPEECH_DIRECTION_BUILDER = BuilderSpec(
+    id="speech_direction",
+    factory=f"{__name__}:build_speech_direction",
+    mock_skip_key="speech_direction",
+)

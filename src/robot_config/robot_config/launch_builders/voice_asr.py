@@ -7,13 +7,60 @@ from typing import Any
 from launch_ros.actions import Node
 
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import (
+    BuilderSpec,
+    BuildResult,
+    HookSpec,
+    LaunchBuildContext,
+)
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import resolve_ros_path
+from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.voice_asr")
 _VOICE_ASR_REPO_ROOT = Path(__file__).resolve().parents[4]
 _VOICE_ASR_REALTIME_MODES = {"continuous", "wake_word"}
 _VOICE_ASR_MISSING_ERROR = "voice_asr.enabled=true requires the voice_asr_service package to be installed"
+
+
+def apply_voice_asr_config_hook(robot_config: dict, arguments) -> None:
+    """config_overrides hook: voice ASR CLI overrides (auto-start + pre-roll).
+
+    Migrated verbatim from the preparation core's ``_apply_voice_start``
+    and ``_apply_voice_asr_overrides`` steps (openspec change
+    ``migrate-builtin-builder-metadata``, design decision 4): first the
+    ``voice_asr_auto_start`` enable/continuous override, then the
+    non-empty ``enabled`` / ``realtime_pre_roll_seconds`` overrides with
+    the unconditional ``voice_asr`` write-back and log. Ownership:
+    ``voice_asr``. Runs whether or not the voice_asr entry participates
+    in the plan (mock-skipped launches still observe the override state)
+    and never imports the optional voice_asr_service package.
+    """
+    if parse_bool(arguments["voice_asr_auto_start"], default=False):
+        voice_asr_cfg = robot_config.setdefault("voice_asr", {})
+        voice_asr_cfg["enabled"] = True
+        voice_asr_cfg["active_mode"] = "continuous"
+        logger.info(
+            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous; "
+            "bundle_path and deployment must be configured explicitly"
+        )
+
+    voice_asr_config = dict(robot_config.get("voice_asr", {}))
+
+    enabled_override = arguments["voice_asr_auto_start"]
+    if enabled_override != "":
+        voice_asr_config["enabled"] = parse_bool(enabled_override, default=False)
+
+    pre_roll_override = arguments["voice_asr_realtime_pre_roll_seconds"]
+    if pre_roll_override != "":
+        voice_asr_config["realtime_pre_roll_seconds"] = float(pre_roll_override)
+
+    robot_config["voice_asr"] = voice_asr_config
+    logger.info(
+        "Voice ASR override state: "
+        f"enabled={voice_asr_config.get('enabled', False)}, "
+        f"realtime_pre_roll_seconds={voice_asr_config.get('realtime_pre_roll_seconds', 0.5)}"
+    )
 
 
 def _load_voice_asr_service():
@@ -265,3 +312,58 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
             additional_env=_ascend_node_environment(bundle_path, deployment),
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+# Business launch arguments owned by this entry (migrated verbatim from the
+# former builtin_registry table; ownership decides who declares an argument).
+_VOICE_ASR_ARGUMENTS = (
+    ArgumentSpec(
+        name="voice_asr_auto_start",
+        declared_default="false",
+        absent_fallback="",
+        description="When true, enable Voice ASR and override robot.voice_asr.active_mode=continuous",
+    ),
+    ArgumentSpec(
+        name="voice_asr_realtime_pre_roll_seconds",
+        declared_default="",
+        absent_fallback="",
+        description="Optional override for robot.voice_asr.realtime_pre_roll_seconds.",
+    ),
+)
+
+
+def build_voice_asr(context: LaunchBuildContext) -> BuildResult:
+    """Voice ASR entry; the mock backend never reaches this build function."""
+
+    from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
+    nodes = generate_voice_asr_nodes(context.robot_config)
+    if nodes:
+        logger.info(f"Added {len(nodes)} voice ASR node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+VOICE_ASR_BUILDER = BuilderSpec(
+    id="voice_asr",
+    factory=f"{__name__}:build_voice_asr",
+    mock_skip_key="voice_asr",
+    arguments=_VOICE_ASR_ARGUMENTS,
+    hooks=(
+        # config_overrides: voice_asr_auto_start enable/continuous
+        # override, then the non-empty enabled / realtime pre-roll
+        # overrides (the two legacy voice phases, one owner).
+        # Runs whether or not the entry participates: mock-skipped
+        # launches still observe the CLI override state.
+        HookSpec(
+            phase="config_overrides",
+            factory=f"{__name__}:apply_voice_asr_config_hook",
+            config_keys=("voice_asr",),
+        ),
+    ),
+)

@@ -19,6 +19,9 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.builder_support import resolve_with_navigation
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
 
@@ -291,3 +294,60 @@ def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> 
     )
     logger.info(f"Added rviz2 (config: {rviz_config_file})")
     return [node]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+# Business launch arguments owned by this entry (migrated verbatim from the
+# former builtin_registry table; ownership decides who declares an argument).
+_NAVIGATION_ARGUMENTS = (
+    ArgumentSpec(
+        name="with_navigation",
+        declared_default="",
+        absent_fallback="",
+        description="Enable navigation nodes. If empty, auto-detects from robot.navigation.enabled",
+    ),
+    ArgumentSpec(
+        name="navigation_mode",
+        declared_default="",
+        absent_fallback="",
+        description="Override robot.navigation.default_mode (for example: full, odom_only, imu_only)",
+    ),
+)
+
+
+def build_navigation(context: LaunchBuildContext) -> BuildResult:
+    """Navigation entry; runtime_ready timing.
+
+    The mock backend and a false ``with_navigation`` resolution never
+    reach this build function (registry-level filtering). ``force_enable=True``
+    keeps the legacy generate semantics: the overall enablement decision
+    was already made by the registry predicate.
+    """
+    from robot_config.launch_builders.navigation import generate_navigation_nodes
+
+    nodes = generate_navigation_nodes(
+        context.robot_config,
+        use_sim=context.node_use_sim_time,
+        navigation_mode=context.arguments.get("navigation_mode", ""),
+        force_enable=True,
+    )
+    logger.info(f"Prepared {len(nodes)} navigation node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+NAVIGATION_BUILDER = BuilderSpec(
+    id="navigation",
+    factory=f"{__name__}:build_navigation",
+    timing="runtime_ready",
+    mock_skip_key="navigation",
+    arguments=_NAVIGATION_ARGUMENTS,
+    # CLI switch (with its navigation.enabled YAML fallback)
+    # owns overall participation; the build function no longer repeats
+    # the resolution.
+    enabled=resolve_with_navigation,
+)

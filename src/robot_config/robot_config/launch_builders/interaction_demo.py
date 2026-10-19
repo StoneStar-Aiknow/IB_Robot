@@ -5,6 +5,8 @@ from collections.abc import Mapping
 
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
+
 _SPEECH_TYPE = "ibrobot_msgs/srv/SpeakText"
 _MOTION_TYPE = "ibrobot_msgs/action/ExecuteNamedMotion"
 
@@ -57,3 +59,23 @@ def generate_interaction_demo_nodes(robot_config: dict) -> list[Node]:
             ],
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_interaction_demo(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.interaction_demo import generate_interaction_demo_nodes
+
+    return BuildResult(actions=list(generate_interaction_demo_nodes(context.robot_config)))
+
+
+INTERACTION_DEMO_BUILDER = BuilderSpec(
+    id="interaction_demo",
+    factory=f"{__name__}:build_interaction_demo",
+    timing="runtime_ready",
+)

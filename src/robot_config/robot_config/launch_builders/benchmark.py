@@ -31,12 +31,7 @@ from robot_config.benchmark_endpoints import (
     resolve_benchmark_endpoints,
 )
 from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
-from robot_config.contract_utils import contract_fingerprint, iter_specs
-from robot_config.inference_config import (
-    InferenceConfigError,
-    parse_inference_config,
-)
-from robot_config.loader import build_contract_from_robot_config_dict
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.observation_transport import (
     effective_observation_transport,
@@ -270,6 +265,10 @@ def _resolve_evaluator_endpoints(robot_config: dict) -> dict[str, str]:
     run_policy_action = f"/{action_dispatcher_name}/run_policy"
 
     # inference_health_topic — the only endpoint from the inference_service.
+    # Function-local imports: keep registry construction free of the
+    # inference_manifest dependency chain.
+    from robot_config.inference_config import InferenceConfigError, parse_inference_config
+
     control_mode = str(robot_config.get("default_control_mode", "model_inference"))
     try:
         inference = parse_inference_config(robot_config, control_mode)
@@ -290,6 +289,10 @@ def _resolve_evaluator_endpoints(robot_config: dict) -> dict[str, str]:
 
 
 def _selected_benchmark_pipeline(robot_config: dict):
+    # Function-local import: keep registry construction free of the
+    # inference_manifest dependency chain.
+    from robot_config.inference_config import parse_inference_config
+
     control_mode = str(robot_config.get("default_control_mode", "model_inference"))
     inference = parse_inference_config(robot_config, control_mode)
     if not inference.enabled or not inference.pipelines:
@@ -309,6 +312,12 @@ def _selected_benchmark_pipeline(robot_config: dict):
 
 
 def _frame_ingress_parameters(robot_config: dict, benchmark: dict) -> dict[str, Any]:
+    # Function-local imports: keep registry construction free of the
+    # tensormsg/torch (contract_utils) and embodied_common (loader)
+    # dependency chains.
+    from robot_config.contract_utils import contract_fingerprint, iter_specs
+    from robot_config.loader import build_contract_from_robot_config_dict
+
     contract = build_contract_from_robot_config_dict(robot_config)
     streams = []
     for spec in iter_specs(contract):
@@ -507,3 +516,56 @@ def generate_benchmark_nodes(robot_config: dict) -> list:
         *_with_benchmark_lifecycle(environment_node, "environment"),
         *_with_benchmark_lifecycle(evaluator_node, "evaluator"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_benchmark(context: LaunchBuildContext) -> BuildResult:
+    """Design §5 benchmark entry: the sole run-config materialization owner.
+
+    Deep-copies the effective config, calls the legacy
+    ``generate_benchmark_nodes`` (which materializes transports, allocates
+    the run identity and writes the run config), and returns the complete
+    materialized snapshot with its new ``_config_path`` and ``run_id`` in
+    :class:`BenchmarkStartup`. The orchestrator replaces the shared
+    context config with this snapshot for every later entry
+    (execution/recording/rerun must not re-materialize or re-assign
+    identity).
+    """
+    import copy
+
+    from robot_config.launch_builders.benchmark import generate_benchmark_nodes
+
+    snapshot = copy.deepcopy(dict(context.robot_config))
+    nodes = generate_benchmark_nodes(snapshot)
+    logger.info(f"Added {len(nodes)} benchmark nodes")
+    benchmark = snapshot.get("benchmark", {}) if isinstance(snapshot.get("benchmark", {}), dict) else {}
+    evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark.get("evaluation", {}), dict) else {}
+    run_id = str(evaluation.get("run_id", "") or "") if evaluation.get("enabled", False) else ""
+    return BuildResult(
+        actions=list(nodes),
+        benchmark_startup=_benchmark_startup(snapshot, run_id),
+    )
+
+
+def _benchmark_startup(snapshot: dict[str, Any], run_id: str):
+    from robot_config.launch_builders.registry import BenchmarkStartup
+
+    return BenchmarkStartup(
+        effective_config=snapshot,
+        config_path=str(snapshot.get("_config_path", "")),
+        run_id=run_id,
+    )
+
+
+BENCHMARK_BUILDER = BuilderSpec(
+    id="benchmark",
+    factory=f"{__name__}:build_benchmark",
+    provides=("benchmark_startup",),
+    enabled=lambda context: context.is_benchmark,
+)

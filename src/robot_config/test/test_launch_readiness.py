@@ -16,6 +16,7 @@ from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.inference_config import InferenceConfigError
+from robot_config.launch_builders import control as control_builder
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
     generate_auxiliary_actuator_nodes,
@@ -326,11 +327,36 @@ def test_group_spawner_is_the_controller_readiness_barrier():
 
 
 def test_controller_readiness_handler_is_registered_before_barrier_can_start():
-    source = _LAUNCH_PATH.read_text(encoding="utf-8")
-    block = source[source.index("if controller_dependent_actions:") : source.index("# ========== N. Tracing")]
+    from launch.actions import EmitEvent, LogInfo
+    from launch.events.process import ProcessExited
 
-    assert "actions.insert(" in block
-    assert "target_action=controller_ready_barrier" in block
+    from robot_config.launch_builders.orchestrator import _assemble_actions
+    from robot_config.launch_builders.registry import LaunchBuildContext, PlanOutputs, PlanSegment
+
+    barrier = ExecuteProcess(cmd=["never-executed"])
+    consumer = LogInfo(msg="deferred")
+    outputs = PlanOutputs(
+        actions=[barrier, consumer],
+        runtime_ready_actions=[consumer],
+        segments=[
+            PlanSegment("startup", "immediate", (barrier,)),
+            PlanSegment("consumer", "runtime_ready", (consumer,)),
+        ],
+    )
+    context = LaunchBuildContext(robot_config={}, controller_readiness_barrier=barrier)
+    actions = _assemble_actions(SimpleNamespace(arguments={}), context, outputs, enable_tracing=False)
+    assert isinstance(actions[0], RegisterEventHandler)
+    assert actions[1:] == [barrier]
+    for code in (0, 1):
+        event = ProcessExited(action=barrier, name="barrier", cmd=[], cwd=None, env=None, pid=1, returncode=code)
+        handler = actions[0].event_handler
+        assert handler.matches(event)
+        released = list(handler.handle(event, LaunchContext()))
+        if code == 0:
+            assert released == [consumer]
+        else:
+            assert len(released) == 1 and isinstance(released[0], EmitEvent)
+            assert isinstance(released[0].event, Shutdown)
 
 
 def _relay_targets(nodes):
@@ -820,6 +846,148 @@ def test_launch_setup_enables_navigation_when_requested():
     assert len(nav_nodes) == 1
 
 
+def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
+    """Task 6.2: adding ONE registration (a minimal module + a single
+    BuilderSpec with its own CLI argument, prepare hook, enable switch and
+    a runtime-ready action) must extend the REAL production entry end to
+    end — the new CLI argument is enumerated by generate_launch_description,
+    the hook runs inside the real preparation pipeline under its own config
+    key, the enable switch controls participation, and the runtime-ready
+    action is gated behind the REAL controller-readiness barrier (invisible
+    in the immediate stream until the barrier exits; success releases it,
+    failure shuts down without release) — with NO extra modification to the
+    main launch file or the facade (design decision 4 / spec 6.2)."""
+    import sys
+    from types import ModuleType
+
+    from launch.actions import EmitEvent, LogInfo
+    from launch.event_handlers import OnProcessExit
+    from launch.events.process import ProcessExited
+
+    from robot_config.launch_builders import builtin_registry as builtin_registry_module
+    from robot_config.launch_builders.launch_options import ArgumentSpec
+    from robot_config.launch_builders.registry import BuilderSpec, BuildResult, HookSpec
+
+    factory_calls = []
+    built_actions = []
+
+    def extension_hook(config, arguments):
+        config["extension_probe"] = {"executed": True, "mode": arguments["extension_mode"]}
+
+    def extension_build(context):
+        # The hook's write under its own config key must be visible to the
+        # factory through the real preparation -> plan data flow.
+        factory_calls.append(
+            (context.arguments["extension_mode"], dict(context.robot_config.get("extension_probe", {})))
+        )
+        action = LogInfo(msg="extension runtime-ready action")
+        built_actions.append(action)
+        return BuildResult(actions=[action])
+
+    # One registration: the extension spec (CLI argument + prepare hook
+    # with its own config key + enable switch + runtime-ready action) joins
+    # the builtin table through the same build_builtin_registry seam the
+    # production entry uses.
+    original_build = builtin_registry_module.build_builtin_registry
+
+    def build_with_extension():
+        registry = original_build()
+        registry.add(
+            BuilderSpec(
+                id="extension_probe",
+                factory="test_launch_readiness_extension_probe:extension_build",
+                timing="runtime_ready",
+                enabled=lambda context: context.arguments.get("extension_mode") == "true",
+                arguments=(
+                    ArgumentSpec(
+                        name="extension_mode",
+                        declared_default="false",
+                        absent_fallback="false",
+                        description="Extension probe switch",
+                    ),
+                ),
+                hooks=(
+                    HookSpec(
+                        phase="config_overrides",
+                        factory="test_launch_readiness_extension_probe:extension_hook",
+                        config_keys=("extension_probe",),
+                    ),
+                ),
+            )
+        )
+        return registry
+
+    monkeypatch.setattr(robot_launch, "build_builtin_registry", build_with_extension)
+
+    probe_module = ModuleType("test_launch_readiness_extension_probe")
+    probe_module.extension_build = extension_build
+    probe_module.extension_hook = extension_hook
+    monkeypatch.setitem(sys.modules, probe_module.__name__, probe_module)
+
+    # 1. Declaration stage: the contributed CLI argument is enumerated by
+    # the real generate_launch_description without touching the entry file.
+    description = robot_launch.generate_launch_description()
+    declared_names = {getattr(entity, "name", None) for entity in description.entities}
+    assert "extension_mode" in declared_names  # the new argument IS declared
+    assert "robot_config" in declared_names  # core table still declared
+
+    def _launch(extension_mode):
+        context = LaunchContext()
+        context.launch_configurations["robot_config"] = "lekiwi"
+        context.launch_configurations["use_sim"] = "false"
+        # auto_start_controllers=true arms the REAL controller readiness
+        # barrier (the controller group spawner) of this hardware launch.
+        context.launch_configurations["auto_start_controllers"] = "true"
+        context.launch_configurations["control_mode"] = "teleop"
+        context.launch_configurations["extension_mode"] = extension_mode
+        return robot_launch.launch_setup(context)
+
+    # 2. Enabled branch: the hook ran inside the real preparation pipeline
+    # (its own config key is visible to the factory), the factory ran once
+    # with the CLI value, and the runtime-ready action is deferred behind
+    # the real barrier — invisible in the immediate stream.
+    actions = _launch("true")
+    assert factory_calls == [("true", {"executed": True, "mode": "true"})]
+    extension_action = built_actions[0]
+    assert extension_action not in actions  # gated: invisible before the barrier exits
+
+    barrier = next(
+        action
+        for action in actions
+        if isinstance(action, Node) and action.node_executable in {"controller_spawner", "wait_for_controllers"}
+    )
+    assert isinstance(barrier, ExecuteProcess)  # the real readiness barrier process
+    exit_handlers = [
+        action.event_handler
+        for action in actions
+        if isinstance(action, RegisterEventHandler) and isinstance(action.event_handler, OnProcessExit)
+    ]
+    assert exit_handlers  # the success-gated consumer handler is registered before the barrier
+
+    event_context = LaunchContext()
+    for returncode in (0, 1):
+        event = ProcessExited(action=barrier, name="barrier", cmd=[], cwd=None, env=None, pid=1, returncode=returncode)
+        handler = next(handler for handler in exit_handlers if handler.matches(event))
+        released = list(handler.handle(event, event_context))
+        if returncode == 0:
+            # Success releases the deferred set: the extension action rides
+            # the same readiness gating as the builtin runtime-ready entries.
+            assert extension_action in released
+            assert any(isinstance(action, Node) for action in released)
+        else:
+            # Failure shuts down without releasing the deferred set.
+            assert len(released) == 1 and isinstance(released[0], EmitEvent)
+            assert isinstance(released[0].event, Shutdown)
+            assert extension_action not in released
+
+    # 3. Disabled branch: the same registration with the switch off never
+    # resolves the factory (zero calls, zero actions created).
+    disabled_actions = _launch("false")
+    assert len(factory_calls) == 1
+    assert len(built_actions) == 1
+    assert extension_action not in disabled_actions
+
+
 def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
     # The migrated provider config binds logical interfaces against the live
@@ -843,7 +1011,7 @@ def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monk
     def unexpected_control_generation(*args, **kwargs):
         pytest.fail("control generation must not run for unsupported scheduled simulation")
 
-    monkeypatch.setattr(robot_launch, "generate_ros2_control_nodes", unexpected_control_generation)
+    monkeypatch.setattr(control_builder, "generate_ros2_control_nodes", unexpected_control_generation)
     with pytest.raises(ValueError, match="simulation does not support"):
         robot_launch.launch_setup(context)
 
@@ -1823,7 +1991,18 @@ def test_phone_placo_uses_explicit_arm_group_topic():
             "moveit": {
                 "base_link": "base",
                 "ee_link": "gripper",
-                "so101_placo_servo_config_path": "$(find so101_motion)/config/so101_placo_servo.yaml",
+                # Source-tree path (same precedent as test_phone_teleop_config.py
+                # and test_teleop_home_action.py): $(find so101_motion) would
+                # make this test require so101_motion's install for a YAML that
+                # is part of the same source checkout.
+                "so101_placo_servo_config_path": str(
+                    Path(__file__).resolve().parents[2]
+                    / "robots"
+                    / "so101"
+                    / "so101_motion"
+                    / "config"
+                    / "so101_placo_servo.yaml"
+                ),
             },
             "ros2_control": {"reset_positions": {"1": 0.0, "2": 0.0}},
             "teleoperation": {

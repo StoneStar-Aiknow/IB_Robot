@@ -15,6 +15,9 @@ from robot_config.interface_binding import (
     required_interface_ids,
     resolve_robot_interfaces,
 )
+from robot_config.launch_builders import control, hand_sources, runtime, sim_backend
+from robot_config.launch_builders import execution as execution_builder
+from robot_config.launch_builders import recording as recording_builder
 
 
 @pytest.fixture
@@ -255,6 +258,29 @@ def test_robot_type_and_execution_must_match(config, descriptor):
         bind_robot_interfaces(config, descriptor)
 
 
+@pytest.mark.parametrize(
+    "config_target,descriptor_execution",
+    [
+        # Forward: config hardware vs descriptor simulated (already covered
+        # above); Reverse: config simulation vs descriptor physical.
+        ("hardware", "simulated"),
+        ("simulation", "physical"),
+    ],
+)
+def test_execution_mismatch_rejected_in_both_directions(
+    config, descriptor, description_api, config_target, descriptor_execution
+):
+    """Task 4.3: runtime.target vs descriptor.execution mismatch must be
+    rejected symmetrically, not only when the config says hardware."""
+    config["runtime"]["target"] = config_target
+    descriptor["execution"] = descriptor_execution
+    descriptor["digest"] = description_api.description_digest(descriptor)
+    with pytest.raises(InterfaceBindingError, match="identity_mismatch: runtime.target") as error:
+        bind_robot_interfaces(config, descriptor)
+    assert f"expected {'physical' if config_target == 'hardware' else 'simulated'!r}" in str(error.value)
+    assert f"described {descriptor_execution!r}" in str(error.value)
+
+
 def test_unsupported_schema_and_missing_type(config, descriptor):
     descriptor["schema_version"] = 900
     with pytest.raises(InterfaceBindingError, match="invalid_descriptor"):
@@ -488,9 +514,9 @@ def test_legacy_launch_still_constructs_consumers_directly(monkeypatch, tmp_path
     context = LaunchContext()
     context.launch_configurations.update({"config_path": str(path), "record": "true", "record_mode": "episodic"})
     monkeypatch.setattr(
-        module, "generate_bound_runtime_actions", lambda *_a, **_k: pytest.fail("legacy binding opt-in")
+        runtime, "generate_bound_runtime_actions", lambda *_a, **_k: pytest.fail("legacy binding opt-in")
     )
-    monkeypatch.setattr(module, "generate_ros2_control_nodes", lambda *_a, **_k: ([], [], [], {}))
+    monkeypatch.setattr(control, "generate_ros2_control_nodes", lambda *_a, **_k: ([], [], [], {}))
     nodes = module.launch_setup(context)
     recorder = next(node for node in nodes if isinstance(node, Node) and node.node_package == "dataset_tools")
     params = {
@@ -648,18 +674,23 @@ def test_robot_launch_snapshot_gate(config, descriptor, description_api, monkeyp
     provider_path.write_text("# provider is not executed by this construction test\n", encoding="utf-8")
     monkeypatch.setattr(builder, "resolve_runtime_launch", lambda _provider: str(provider_path))
     monkeypatch.setattr(builder.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setattr(module, "get_sim_backend", lambda *_: pytest.fail("provider simulation must not start twice"))
     monkeypatch.setattr(
-        module, "generate_ros2_control_nodes", lambda *_a, **_k: pytest.fail("duplicate hardware start")
+        sim_backend, "get_sim_backend", lambda *_: pytest.fail("provider simulation must not start twice")
     )
     monkeypatch.setattr(
-        module,
+        control, "generate_ros2_control_nodes", lambda *_a, **_k: pytest.fail("duplicate hardware start")
+    )
+    preflight_calls = []
+    monkeypatch.setattr(
+        hand_sources,
         "confirm_interactive_startup_p_pose",
-        lambda cfg, **_kwargs: cfg.setdefault("recording", {}).update(default_task="preflight completed"),
+        lambda cfg, **_kwargs: preflight_calls.append(
+            dict(cfg.get("recording", {}), control_mode=cfg.get("default_control_mode"))
+        ),
     )
     seen = []
     execution_paths = []
-    real_recording = module.generate_recording_nodes
+    real_recording = recording_builder.generate_recording_nodes
 
     def execution(effective, *_args, **kwargs):
         assert kwargs["use_sim_time"] is False
@@ -673,12 +704,18 @@ def test_robot_launch_snapshot_gate(config, descriptor, description_api, monkeyp
         assert snapshot != path and snapshot.is_file()
         assert yaml.safe_load(snapshot.read_text())["robot"]["contract"] == effective["contract"]
         assert yaml.safe_load(snapshot.read_text())["robot"]["default_control_mode"] == "teleop"
-        assert yaml.safe_load(snapshot.read_text())["robot"]["recording"]["default_task"] == "preflight completed"
+        # The preflight P-pose confirmation ran exactly once and observed the
+        # prepared snapshot (control_mode applied) BEFORE this consumer
+        # construction; hooks no longer write configuration
+        # (migrate-builtin-builder-metadata spec).
+        assert len(preflight_calls) == 1
+        assert preflight_calls[0]["control_mode"] == "teleop"
+        assert "default_task" not in preflight_calls[0]
         seen.append(effective)
         return real_recording(effective, *args, **kwargs)
 
-    monkeypatch.setattr(module, "generate_recording_nodes", recording)
-    monkeypatch.setattr(module, "generate_execution_nodes", execution)
+    monkeypatch.setattr(recording_builder, "generate_recording_nodes", recording)
+    monkeypatch.setattr(execution_builder, "generate_execution_nodes", execution)
     actions = module.launch_setup(context)
     assert not seen and not execution_paths
     assert sum(isinstance(action, IncludeLaunchDescription) for action in actions) == 1
@@ -745,6 +782,135 @@ def test_robot_launch_snapshot_gate(config, descriptor, description_api, monkeyp
         from robot_config.loader import load_robot_config_dict
 
         assert load_robot_config_dict(seen[0]["_config_path"])["contract"] == seen[0]["contract"]
+
+
+@pytest.mark.parametrize(
+    ("use_sim", "descriptor_execution", "expected_target", "expected_binding_side"),
+    [
+        # YAML has no runtime.target; use_sim resolves the target, the
+        # write-back feeds the live binding, and a descriptor describing the
+        # opposite execution side must be rejected (task 4.3, launch level).
+        ("false", "simulated", "hardware", "physical"),
+        ("true", "physical", "simulation", "simulated"),
+    ],
+)
+def test_robot_launch_live_binding_rejects_use_sim_descriptor_execution_mismatch(
+    config,
+    descriptor,
+    description_api,
+    monkeypatch,
+    tmp_path,
+    use_sim,
+    descriptor_execution,
+    expected_target,
+    expected_binding_side,
+):
+    """Task 4.3 launch-level rejection: the YAML carries no runtime.target, the
+    use_sim argument resolves it and the write-back reaches the live binding,
+    which must reject a descriptor whose execution contradicts it — after a
+    successful provider waiter exit, with zero consumer construction."""
+    from launch import LaunchContext
+    from launch.actions import EmitEvent, IncludeLaunchDescription, RegisterEventHandler
+    from launch.events import Shutdown
+    from launch.events.process import ProcessExited
+    from launch_ros.actions import Node
+
+    from robot_config.launch_builders import runtime as builder
+
+    module = _launch_module()
+    del config["runtime"]["target"]
+    config["default_control_mode"] = "unused"
+    path = tmp_path / "input.yaml"
+    path.write_text(yaml.safe_dump({"robot": config}), encoding="utf-8")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "config_path": str(path),
+            "use_sim": use_sim,
+            "record": "true",
+            "record_mode": "episodic",
+            "control_mode": "teleop",
+            "with_inference": "true",
+        }
+    )
+    provider_path = tmp_path / "runtime.launch.py"
+    provider_path.write_text("# provider is not executed by this construction test\n", encoding="utf-8")
+    monkeypatch.setattr(builder, "resolve_runtime_launch", lambda _provider: str(provider_path))
+    monkeypatch.setattr(builder.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        sim_backend, "get_sim_backend", lambda *_: pytest.fail("provider simulation must not start twice")
+    )
+    monkeypatch.setattr(
+        control, "generate_ros2_control_nodes", lambda *_a, **_k: pytest.fail("duplicate hardware start")
+    )
+    monkeypatch.setattr(
+        hand_sources,
+        "confirm_interactive_startup_p_pose",
+        lambda cfg, **_kwargs: None,
+    )
+    consumer_calls = []
+
+    def execution(*_args, **_kwargs):
+        consumer_calls.append("execution")
+
+    def recording(*_args, **_kwargs):
+        consumer_calls.append("recording")
+
+    def extra_consumer(_effective):
+        consumer_calls.append("extra")
+
+    monkeypatch.setattr(execution_builder, "generate_execution_nodes", execution)
+    monkeypatch.setattr(recording_builder, "generate_recording_nodes", recording)
+
+    # Pass-through spy on the orchestrator seam: the real pipeline still runs;
+    # capture the prepared launch to observe the phase-13a write-back and the
+    # SDK use_sim_time fix.
+    prepared_state = {}
+    real_build = module.build_prepared_launch
+
+    def build_spy(prepared, **kwargs):
+        prepared_state["live_binding"] = prepared.live_binding_required
+        prepared_state["target"] = prepared.robot_config["runtime"].get("target")
+        prepared_state["node_use_sim_time"] = prepared.node_use_sim_time
+        prepared_state["use_sim"] = prepared.use_sim
+        return real_build(prepared, **kwargs)
+
+    monkeypatch.setattr(module, "build_prepared_launch", build_spy)
+
+    actions = module.launch_setup(context, extra_consumers=extra_consumer)
+    # The YAML had no runtime.target; the use_sim-resolved target was written
+    # back into the launch snapshot, live binding is active and the SDK
+    # transport provides no /clock (node_use_sim_time fixed to False).
+    assert prepared_state["live_binding"] is True
+    assert prepared_state["target"] == expected_target
+    assert prepared_state["node_use_sim_time"] is False
+    assert prepared_state["use_sim"] == (use_sim == "true")
+    assert not consumer_calls
+    assert sum(isinstance(action, IncludeLaunchDescription) for action in actions) == 1
+    waiter = next(action for action in actions if isinstance(action, Node))
+    arguments = waiter._Node__arguments
+    description_path = Path(arguments[arguments.index("--description-output") + 1])
+    # The provider waiter succeeds, but the descriptor it produced describes
+    # the OPPOSITE execution side of the resolved target.
+    descriptor["execution"] = descriptor_execution
+    descriptor["digest"] = description_api.description_digest(descriptor)
+    description_path.write_text(yaml.safe_dump(descriptor), encoding="utf-8")
+    event = ProcessExited(action=waiter, name="waiter", cmd=[], cwd=None, env=None, pid=1, returncode=0)
+    returned = list(_exit_callback(actions, event).handle(event, context))
+    # Binding failed after reading the descriptor: Shutdown is requested and
+    # no consumer (execution/recording/extra) was ever constructed.
+    assert not consumer_calls
+    assert len(returned) == 1 and isinstance(returned[0], EmitEvent)
+    shutdown = returned[0].event
+    assert isinstance(shutdown, Shutdown)
+    assert "Runtime interface binding failed" in shutdown.reason
+    assert "identity_mismatch: runtime.target" in shutdown.reason
+    assert f"expected {expected_binding_side!r}" in shutdown.reason
+    assert f"described {descriptor_execution!r}" in shutdown.reason
+    assert not (description_path.parent / "robot.yaml").exists()
+    for action in actions:
+        if isinstance(action, RegisterEventHandler) and action.event_handler.matches(Shutdown()):
+            list(action.event_handler.handle(Shutdown(), context) or [])
 
 
 def test_recording_uses_public_topics(config, descriptor):

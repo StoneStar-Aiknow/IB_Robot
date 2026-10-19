@@ -22,8 +22,12 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
+from robot_config.launch_builders.builder_support import rerun_visualizer_requested
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
+    parse_bool,
     resolve_gripper_joints_from_config,
     resolve_joint_names_from_config,
     resolve_lerobot_norm_mode,
@@ -557,3 +561,130 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         _append(extra_topic)
 
     return topics
+
+
+# ---------------------------------------------------------------------------
+# Registry entries (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constants and build functions moved here from the retired
+# ``adapters.py``; the bodies are verbatim migrations.
+# ---------------------------------------------------------------------------
+
+# Business launch arguments owned by these entries (migrated verbatim from the
+# former builtin_registry table; ownership decides who declares an argument).
+_RECORDING_ARGUMENTS = (
+    ArgumentSpec(
+        name="record",
+        declared_default="false",
+        absent_fallback="false",
+        description="Enable automatic rosbag recording (auto-discovers topics from config)",
+    ),
+    ArgumentSpec(
+        name="record_mode",
+        declared_default="continuous",
+        absent_fallback="continuous",
+        description=(
+            "Recording mode: 'continuous' (all-in-one bag) or 'episodic' "
+            "(triggered episode-by-episode via episode_recorder)"
+        ),
+    ),
+)
+_RERUN_VISUALIZER_ARGUMENTS = (
+    ArgumentSpec(
+        name="record_visualizer",
+        declared_default="none",
+        absent_fallback="none",
+        description=(
+            "Recording visualizer: 'rerun' (launch Rerun sidecar for live cameras/joints/actions) "
+            "or 'none' (no visualizer)"
+        ),
+    ),
+)
+
+
+def build_recording(context: LaunchBuildContext) -> BuildResult:
+    """Design §5 recording entry: registry always participates.
+
+    Resolution and node generation live in the build function, keeping the
+    legacy tolerance policy: semantic dataset setup failures emit Shutdown
+    (still inside a BuildResult, never a synchronous plan error), ordinary
+    recording failures log and continue.
+    """
+    robot_config = context.robot_config
+    try:
+        from robot_config.launch_builders.recording import (
+            generate_recording_nodes,
+            resolve_recording_launch,
+        )
+
+        record_str = context.arguments.get("record", "false")
+        record_mode = context.arguments.get("record_mode", "continuous")
+        record_enabled, record_mode = resolve_recording_launch(
+            robot_config,
+            requested=parse_bool(record_str, default=False),
+            mode=record_mode,
+        )
+
+        if record_enabled:
+            logger.info(f"========== Setting up Recording (mode: {record_mode}) ==========")
+            recording_nodes = generate_recording_nodes(
+                robot_config,
+                context.control_mode,
+                record_mode,
+                scheduler_enabled=context.scheduler_enabled,
+            )
+            logger.info(f"Added {len(recording_nodes)} recording node(s)")
+            return BuildResult(actions=list(recording_nodes))
+        logger.info(f"Recording disabled (record:={record_str})")
+        return BuildResult()
+    except Exception as e:
+        logger.error(f"setting up recording: {e}")
+        if robot_config.get("recording", {}).get("semantic_dataset", False):
+            return BuildResult(
+                actions=[EmitEvent(event=Shutdown(reason=f"semantic dataset recording setup failed: {e}"))]
+            )
+        logger.info("Continuing without recording...")
+        return BuildResult()
+
+
+def build_rerun_visualizer(context: LaunchBuildContext) -> BuildResult:
+    """Design §5 rerun entry: registry always participates.
+
+    Mirrors the legacy build-time policy: lower() the value first, rerun
+    loads the viewer, none is a no-op, unknown values warn; generation
+    failures log and continue.
+    """
+    try:
+        record_viz = context.arguments.get("record_visualizer", "none").lower()
+        if record_viz == "rerun":
+            logger.info("========== Setting up Rerun Visualizer ==========")
+            from robot_config.launch_builders.recording import generate_rerun_viewer_node
+
+            rerun_nodes = generate_rerun_viewer_node(context.robot_config)
+            logger.info(f"Added {len(rerun_nodes)} rerun viewer node(s)")
+            return BuildResult(actions=list(rerun_nodes))
+        if record_viz != "none":
+            logger.warning(f"Unknown record_visualizer value: '{record_viz}' (expected 'rerun' or 'none')")
+        return BuildResult()
+    except Exception as e:
+        logger.error(f"setting up rerun visualizer: {e}")
+        logger.info("Continuing without recording visualizer...")
+        return BuildResult()
+
+
+RECORDING_BUILDER = BuilderSpec(
+    id="recording",
+    factory=f"{__name__}:build_recording",
+    after=("benchmark",),
+    arguments=_RECORDING_ARGUMENTS,
+)
+
+RERUN_VISUALIZER_BUILDER = BuilderSpec(
+    id="rerun_visualizer",
+    factory=f"{__name__}:build_rerun_visualizer",
+    after=("benchmark",),
+    arguments=_RERUN_VISUALIZER_ARGUMENTS,
+    # Any record_visualizer value but "none" participates; the
+    # rerun-vs-unknown dispatch and its failure tolerance stay
+    # in the build function.
+    enabled=rerun_visualizer_requested,
+)

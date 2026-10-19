@@ -7,10 +7,50 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.control import runtime_component_enabled
+from robot_config.launch_builders.launch_options import ArgumentSpec
+from robot_config.launch_builders.registry import (
+    BuilderSpec,
+    BuildResult,
+    HookSpec,
+    LaunchBuildContext,
+)
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_mhandpro_sdk_path
+
+logger = get_colored_logger("robot_config.launch_builders.hand_sources")
 
 FAILURE_POLICIES = {"require_all", "allow_available"}
 STARTUP_P_POSE_MODES = {"manual", "interactive"}
+
+
+def apply_hand_profile_hook(robot_config: dict, arguments) -> None:
+    """config_overrides hook: apply the hand_profile CLI selection.
+
+    Migrated verbatim from the preparation core's ``_apply_hand_profile``
+    step (openspec change ``migrate-builtin-builder-metadata``, design
+    decision 4), including the ``strip().lower()`` normalization of the
+    ``hand_profile`` argument that the core used to perform upfront.
+    Ownership: ``hand_sources`` / ``auxiliary_actuators`` /
+    ``teleoperation`` / ``joints`` / ``active_hand_profile``.
+    """
+    active_hand_profile = apply_hand_profile(robot_config, arguments["hand_profile"].strip().lower())
+    if active_hand_profile is not None:
+        logger.info(f"Active hand profile: {active_hand_profile}")
+
+
+def confirm_startup_p_pose_hook(robot_config: dict, arguments, target_state) -> None:
+    """preflight hook: interactive P-pose confirmation, exactly once.
+
+    Migrated from the preparation core's ``_preflight`` step. Receives the
+    read-only prepared target state (``use_sim`` / ``control_mode``), so
+    the resolution is not re-derived here; runs before any provider
+    startup and never modifies configuration.
+    """
+    confirm_interactive_startup_p_pose(
+        robot_config,
+        use_sim=target_state.use_sim,
+        control_mode=target_state.control_mode,
+    )
 
 
 def apply_hand_profile(robot_config: dict, requested_profile: str = "") -> str | None:
@@ -247,3 +287,70 @@ def _named_configs(raw_configs, label: str) -> list[dict]:
             raise ValueError(f"{label} list entries must be objects")
         return raw_configs
     raise ValueError(f"{label} must be an object or list")
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+# Top-level config keys apply_hand_profile writes (the P-pose preflight hook
+# reuses the same ownership set: it must declare a non-empty key set but never
+# writes anything).
+_HAND_PROFILE_CONFIG_KEYS = (
+    "hand_sources",
+    "auxiliary_actuators",
+    "teleoperation",
+    "joints",
+    "active_hand_profile",
+)
+
+# Business launch arguments owned by this entry (migrated verbatim from the
+# former builtin_registry table; ownership decides who declares an argument).
+_HAND_SOURCES_ARGUMENTS = (
+    ArgumentSpec(
+        name="hand_profile",
+        declared_default="",
+        absent_fallback="",
+        description="Select a hand profile declared by the robot YAML (for example right, left, or dual).",
+    ),
+)
+
+
+def build_hand_sources(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.hand_sources import generate_hand_source_nodes
+
+    nodes = generate_hand_source_nodes(
+        context.robot_config,
+        use_sim=context.use_sim,
+        control_mode=context.control_mode,
+    )
+    if nodes:
+        logger.info(f"Added {len(nodes)} shared hand source node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+HAND_SOURCES_BUILDER = BuilderSpec(
+    id="hand_sources",
+    factory=f"{__name__}:build_hand_sources",
+    after=("control",),
+    arguments=_HAND_SOURCES_ARGUMENTS,
+    hooks=(
+        # config_overrides: apply the hand_profile CLI selection
+        # (auxiliary actuators and the resource manifest become
+        # effective here, before resource_check).
+        HookSpec(
+            phase="config_overrides",
+            factory=f"{__name__}:apply_hand_profile_hook",
+            config_keys=_HAND_PROFILE_CONFIG_KEYS,
+        ),
+        # preflight: interactive P-pose confirmation, exactly
+        # once, before any provider startup; never rewrites.
+        HookSpec(
+            phase="preflight",
+            factory=f"{__name__}:confirm_startup_p_pose_hook",
+            config_keys=_HAND_PROFILE_CONFIG_KEYS,
+        ),
+    ),
+)

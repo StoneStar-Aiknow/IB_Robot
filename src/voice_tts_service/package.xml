@@ -16,6 +16,11 @@
   <exec_depend>inference_service</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
 
+  <!-- test/test_robot_config_defaults_contract.py imports robot_config to
+       assert the typed VoiceTTSConfig defaults track VOICE_TTS_DEFAULTS.
+       robot_config has no dependency edge back to this package, so this
+       test_depend cannot form a cycle. -->
+  <test_depend>robot_config</test_depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

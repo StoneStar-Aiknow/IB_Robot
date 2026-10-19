@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 from launch_ros.actions import Node
 
@@ -12,15 +13,17 @@ from robot_config.dispatch_strategies import (
     resolve_dispatch_strategies,
     validate_executor_scheduler_pairing,
 )
-from robot_config.inference_config import (
-    ControlModeInferenceConfig,
-    InferenceConfigError,
-    InferencePipelineConfig,
-    parse_inference_config,
-)
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.runtime_target import RuntimeTarget
 from robot_config.utils import parse_bool, prepare_lerobot_env
+
+if TYPE_CHECKING:
+    # Annotation-only names; importing robot_config.inference_config at module
+    # level would pull the inference_manifest dependency chain into registry
+    # construction (openspec change ``decentralize-launch-builder-registration``,
+    # design decision 2). The runtime imports stay function-local.
+    from robot_config.inference_config import ControlModeInferenceConfig, InferencePipelineConfig
 
 logger = get_colored_logger("robot_config.execution")
 
@@ -76,6 +79,10 @@ def _attention_viz_request(inference_config: dict) -> tuple[bool, str, dict]:
 
 
 def _validated_inference(robot_config: dict, control_mode: str) -> ControlModeInferenceConfig:
+    # Function-local import: keep registry construction free of the
+    # inference_manifest dependency chain.
+    from robot_config.inference_config import parse_inference_config
+
     return parse_inference_config(robot_config, control_mode)
 
 
@@ -84,6 +91,10 @@ def _selected_executor_pipeline(
     control_mode: str,
     inference: ControlModeInferenceConfig | None = None,
 ) -> InferencePipelineConfig:
+    # Function-local import: keep registry construction free of the
+    # inference_manifest dependency chain.
+    from robot_config.inference_config import InferenceConfigError
+
     validated = inference or _validated_inference(robot_config, control_mode)
     if not validated.enabled or not validated.pipelines:
         raise InferenceConfigError(f"control mode {control_mode!r} has no enabled inference pipeline")
@@ -728,6 +739,10 @@ def generate_execution_nodes(
     from launch.actions import RegisterEventHandler
     from launch.event_handlers import OnProcessExit
 
+    # Function-local import: keep registry construction free of the
+    # inference_manifest dependency chain.
+    from robot_config.inference_config import InferenceConfigError
+
     if not control_mode or control_mode == "default":
         control_mode = robot_config.get("default_control_mode", "model_inference")
 
@@ -966,3 +981,35 @@ def generate_scheduled_action_dispatcher_node(
         ],
         output="screen",
     )
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_execution(context: LaunchBuildContext) -> BuildResult:
+    """Execution entry; a false with_inference never reaches this build function."""
+
+    from robot_config.launch_builders.execution import generate_execution_nodes
+
+    nodes = generate_execution_nodes(
+        context.robot_config,
+        context.control_mode,
+        context.use_sim,
+        use_sim_time=context.node_use_sim_time,
+        runtime_target=context.runtime_target,
+    )
+    logger.info(f"Prepared {len(nodes)} execution nodes")
+    return BuildResult(actions=list(nodes))
+
+
+EXECUTION_BUILDER = BuilderSpec(
+    id="execution",
+    factory=f"{__name__}:build_execution",
+    after=("benchmark",),
+    timing="runtime_ready",
+    enabled=lambda context: context.with_inference,
+)

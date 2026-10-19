@@ -13,8 +13,6 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import xacro as _xacro_lib
-
 from robot_config.logger_utils import get_colored_logger
 from robot_config.peripherals.camera import camera_dict_requests_depth
 from robot_config.utils import parse_bool, resolve_ros_path
@@ -307,6 +305,10 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
                 xacro_mappings["gz_ros2_control_parameters_file"] = str(Path(controllers_config).resolve())
 
     try:
+        # Function-local import: keep registry construction free of the
+        # xacro dependency chain.
+        import xacro as _xacro_lib
+
         doc = _xacro_lib.process_file(urdf_path, mappings=xacro_mappings)
         base_urdf = doc.toxml()
     except Exception as e:

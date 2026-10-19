@@ -11,6 +11,8 @@ from robot_config.interface_binding import bind_robot_interfaces
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict, robot_execution_endpoints
 from robot_runtime import contract as RUNTIME
+from robot_runtime.interface_description import description_digest, validate_description
+from robot_runtime.model_metadata import build_model_metadata
 from skill_catalog import source as SKILL_SOURCE
 
 
@@ -308,13 +310,85 @@ def test_sound_orientation_node_is_projected_from_robot_config():
     assert _skill_executor_params(periodic_nodes)["sound_following_enabled"] is True
 
 
-# Drives a robot config whose perception services reference a gitignored model
-# bundle; without scripts/download_models.py the config cannot load. A missing
-# download is not a defect, so skip rather than fail. See root conftest.py.
-@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
-def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
-    config_path = resolve_robot_config_path(config_name="lekiwi_nav_grasp")
-    config = load_robot_config_dict(config_path)
+# The hybrid LeKiwi profile below references model bundles that live outside
+# the repository; the config cannot load until every one of them has been
+# provisioned on this machine. The allowlisted names come from
+# scripts/download_models.py; the *_ascend deployment names must be supplied
+# by whatever route ends up owning them (still unresolved, and kept failing by
+# the model bundle availability contract test). A missing provision is not a
+# defect of these projection tests, so they skip rather than fail (root
+# conftest.py). The marker lists every enabled model-service bundle the loader
+# resolves for this yaml, so the skip tracks the profile's real load-time
+# dependencies.
+_LEKIWI_MODEL_BUNDLES = (
+    "yolox_x_640",
+    "pear_parameter_network",
+    "grounding_dino_swint_seq8_1280x720_ascend",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384_ascend",
+)
+
+
+def _lekiwi_public_description(public_description):
+    """A synthetic simulated snapshot for the lekiwi_nav_grasp hybrid profile.
+
+    Live launch binds the description only after the runtime provider starts,
+    so the yaml itself carries none. This helper rebuilds the fixture snapshot
+    around what the config declares: the runtime.provider/type identity, the
+    nine-joint arm/gripper/base grouping, the MoveIt frames and the
+    ros2_control reset positions as the home pose. It is a simulated test
+    snapshot, not the physical robot's calibrated description; the fixture
+    URDF publishes ranges wide enough that the application limits in
+    teleoperation.safety.joint_limits stay a narrowing of the public model.
+    The bound config sets runtime.target below so the real binding still
+    verifies the execution identity instead of skipping it.
+    """
+    description = json.loads(json.dumps(public_description))
+    description["robot"] = {
+        "id": "lekiwi_robot",
+        "type": "lekiwi",
+        "runtime_name": "lekiwi_robot",
+        "runtime_version": "0.1.0",
+    }
+    description["execution"] = "simulated"
+    arm = ["1", "2", "3", "4", "5"]
+    profile = {
+        "joints": arm + ["6", "7", "8", "9"],
+        "arm_joints": arm,
+        "gripper_joints": ["6"],
+        "base": {"wheel_joints": ["7", "8", "9"], "max_wheel_radps": 10.0},
+        "home_positions": {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0},
+        "motion": {"base_link": "base", "ee_link": "gripper", "shoulder_link": "shoulder"},
+    }
+    urdf = (
+        '<robot name="lekiwi-fixture"><link name="base"/><link name="gripper"/><link name="shoulder"/>'
+        + "".join(
+            f'<joint name="{name}" type="revolute"><limit lower="0.0" upper="1.0"/></joint>'
+            if name == "6"
+            else f'<joint name="{name}" type="revolute"><limit lower="-3.14" upper="3.14"/></joint>'
+            for name in profile["joints"]
+        )
+        + "</robot>"
+    )
+    description["model"] = build_model_metadata(profile, simulated=True, robot_description=urdf)
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    validate_description(description)
+    return description
+
+
+def _bound_lekiwi_hybrid_config(public_description):
+    """The hybrid LeKiwi profile after the live runtime binding it depends on."""
+    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_nav_grasp"))
+    config["runtime"]["target"] = "simulation"  # match the simulated snapshot so binding verifies execution
+    return bind_robot_interfaces(config, _lekiwi_public_description(public_description))
+
+
+@pytest.mark.model_bundle(*_LEKIWI_MODEL_BUNDLES)
+def test_hybrid_profile_projects_runtime_control_mode_switching_parameters(public_description):
+    config = _bound_lekiwi_hybrid_config(public_description)
 
     params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
 
@@ -328,10 +402,20 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
-@pytest.mark.model_bundle("yolox_x_640", "pear_parameter_network")
-def test_hybrid_profile_projects_hri_person_confidence_threshold():
-    config_path = resolve_robot_config_path(config_name="lekiwi_nav_grasp")
-    config = load_robot_config_dict(config_path)
+@pytest.mark.model_bundle(*_LEKIWI_MODEL_BUNDLES)
+def test_lekiwi_hybrid_profile_fails_closed_until_the_runtime_binds_its_description():
+    # Without the live binding the yaml alone must not build embodied nodes:
+    # the provider is declared but no public description exists yet, so the
+    # builder has to refuse instead of guessing interfaces.
+    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_nav_grasp"))
+
+    with pytest.raises(ValueError, match="'schema_version' is a required property"):
+        generate_embodied_nodes(config, active_control_mode="moveit_planning")
+
+
+@pytest.mark.model_bundle(*_LEKIWI_MODEL_BUNDLES)
+def test_hybrid_profile_projects_hri_person_confidence_threshold(public_description):
+    config = _bound_lekiwi_hybrid_config(public_description)
 
     nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
     hri_node = next(

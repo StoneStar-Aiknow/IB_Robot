@@ -39,12 +39,12 @@ from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
-from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC, NODE_NAME, RELEASE_RESERVE_SEC
 from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_builders.motion_imitation_stream import (
     mock_playback_endpoints,
     motion_imitation_stream_parameters,
 )
+from robot_config.launch_builders.registry import BuilderSpec, BuildResult, LaunchBuildContext
 
 _KEYS = frozenset(
     {
@@ -120,6 +120,10 @@ def _runtime_description(robot_config: Mapping) -> str:
 
 def generate_mirror_session_nodes(robot_config: dict) -> list:
     """The session node and its process-exit release, if the robot enables the session."""
+    # Function-local import: keep registry construction free of the
+    # embodied_common dependency chain.
+    from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC, NODE_NAME, RELEASE_RESERVE_SEC
+
     config = robot_config.get("mirror_session", {})
     if not isinstance(config, Mapping):
         raise ValueError("mirror_session must be a mapping")
@@ -176,3 +180,23 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
 
 
 __all__ = ["generate_mirror_session_nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_mirror_session(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.mirror_session import generate_mirror_session_nodes
+
+    return BuildResult(actions=list(generate_mirror_session_nodes(context.robot_config)))
+
+
+MIRROR_SESSION_BUILDER = BuilderSpec(
+    id="mirror_session",
+    factory=f"{__name__}:build_mirror_session",
+    timing="runtime_ready",
+)
