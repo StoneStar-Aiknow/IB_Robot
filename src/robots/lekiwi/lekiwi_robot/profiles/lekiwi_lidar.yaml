@@ -65,7 +65,10 @@ base:
 
 capabilities:
   joint.state: {joint_count: 3, rate_hz: 100.0}
-  base.cmd_vel: {max_vx: 0.5, max_vy: 0.5, max_wz: 1.5, staleness_s: 0.5}
+  # Linear limits are what the wheels can realize: max_wheel_radps x
+  # wheel_radius over each axis' largest wheel projection (0.2657 / 0.2301 m/s,
+  # checked at launch by lekiwi_robot.base_profile).
+  base.cmd_vel: {max_vx: 0.26, max_vy: 0.23, max_wz: 1.5, staleness_s: 0.5}
   base.odom: {}
   base.navigation_gate: {}
   runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}

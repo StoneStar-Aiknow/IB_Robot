@@ -127,7 +127,7 @@ robot:
     # 默认使用 continuous 监听模式；可通过 launch 参数临时覆盖是否启用。
     active_mode: continuous
     language: zh
-    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    bundle_path: "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
     deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
@@ -151,7 +151,6 @@ robot:
     enabled: false
     entry_mode: hermes
     skill_catalog_source_mode: development
-    skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: so101_rtp_distributed
     debug_tracing: true
     task_input_topic: /voice_command

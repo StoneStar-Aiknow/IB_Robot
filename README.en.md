@@ -99,10 +99,11 @@ IB_Robot/                           # Main Workspace
 │   ├── voice_asr_service/          # Voice recognition service
 │   ├── workflows/                  # CI/CD configuration
 │   │
-│   ├── embodied_agent/             # Hermes Agent plan lifecycle and execution orchestration
-│   ├── perception_service/         # Continuous scene understanding service (RGB-D / multi-view)
-│   ├── skill_library/              # Skill execution layer (skill → primitive → MoveIt)
-│   └── safety_guard/               # Explicit safety validation layer (allowlist + workspace bounds)
+│   ├── agent/                      # Agent stack (skill catalog, Gateway, planning, CLI, Agent)
+│   │   ├── embodied_agent/         # Hermes Agent plan lifecycle and execution orchestration
+│   │   ├── skill_library/          # Skill execution layer (skill → primitive → MoveIt)
+│   │   └── safety_guard/           # Explicit safety validation layer (allowlist + workspace bounds)
+│   └── perception_service/         # Continuous scene understanding service (RGB-D / multi-view)
 │
 ├── docs/                           # Detailed architecture docs and dev guides
 │   ├── pictures/                   # Architecture diagrams and demo GIFs
@@ -471,7 +472,7 @@ Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
 `cancel` require the Gateway. Non-execution commands emit one JSON envelope; `execute` emits JSONL with zero or more
 `feedback` records followed by exactly one `result`. Exit codes are `0` success, `2` argument/config/schema error, `3`
 Gateway/readiness/safety rejection, `4` unavailable runtime, `124` timeout, `130` converged SIGINT cancellation, and
-`143` converged SIGTERM cancellation. See [robot_skill_cli](src/robot_skill_cli/README.md) for commands and contracts.
+`143` converged SIGTERM cancellation. See [robot_skill_cli](src/agent/robot_skill_cli/README.md) for commands and contracts.
 
 The `robot_mcp` compatibility layer has been removed. Use `robot-skill` through the ROS Capability Gateway
 for all robot capability discovery and execution.
@@ -603,10 +604,10 @@ robot-skill --config-name so101_single_arm plan-workflow \
 ```
 
 For further details, see:
-- [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — task entry & orchestration
+- [`src/agent/embodied_agent/README.md`](src/agent/embodied_agent/README.md) — task entry & orchestration
 - [`src/perception_service/README.md`](src/perception_service/README.md) — scene perception service
-- [`src/skill_library/README.md`](src/skill_library/README.md) — skill execution layer
-- [`src/safety_guard/README.md`](src/safety_guard/README.md) — safety validation layer
+- [`src/agent/skill_library/README.md`](src/agent/skill_library/README.md) — skill execution layer
+- [`src/agent/safety_guard/README.md`](src/agent/safety_guard/README.md) — safety validation layer
 
 ---
 

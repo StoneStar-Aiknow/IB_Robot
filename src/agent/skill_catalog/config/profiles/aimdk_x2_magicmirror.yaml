@@ -1,0 +1,10 @@
+schema_version: 1
+name: aimdk_x2_magicmirror
+robot_name: aimdk_x2_magicmirror
+enabled_skills:
+- name: mirror_start
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: mirror_stop
+  implementation: x2_runtime_v1
+  planner_visible: true

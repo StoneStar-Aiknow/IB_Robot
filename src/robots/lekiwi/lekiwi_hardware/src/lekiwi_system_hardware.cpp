@@ -14,6 +14,7 @@
 
 #include "lekiwi_hardware/lekiwi_system_hardware.hpp"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,17 @@ hardware_interface::CallbackReturn
 LeKiwiSystemHardware::on_configure(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configuring...");
+
+  // Re-configuration (e.g. after an I/O error sent the component back to
+  // unconfigured) must release and close the previous bus first. Replacing
+  // bus_ while arm_ still points at it made ~Arm() release torque through a
+  // freed bus -- a use-after-free that killed the controller manager.
+  if (bus_ && !teardown_bus()) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Releasing the previous bus before re-configuration failed");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
 
   // Load arm calibration (LeKiwi "id"-field format is accepted by the SDK's
   // Calibration::load alongside the SO-101 keyed format).
@@ -233,38 +245,31 @@ LeKiwiSystemHardware::on_activate(const rclcpp_lifecycle::State &)
   bus_->sync_write_velocities(stop_targets);
 
   // Seed the ros2_control command buffer from the SDK's hold targets before
-  // the first write(). Arm::activate() leaves the arm holding its measured
+  // the first write(): Arm::activate() leaves the arm holding its measured
   // pose, but hw_commands_ still holds zeros from on_init (or the previous
-  // activation's values on an inactive -> active re-entry). Without this the
-  // very first write() commands those stale values, driving a non-zero arm
-  // toward zero while the runtime is still idle. Wheels are seeded to zero to
-  // match the stop written above.
+  // activation's values on an inactive -> active re-entry), and commanding
+  // those stale values would drive a non-zero arm toward zero while the
+  // runtime is still idle. The seed comes from one whole-frame read that
+  // applies the same protection policy as the runtime path, base-only robots
+  // included; never from a second, unchecked arm read. Wheels are seeded to
+  // zero to match the stop written above.
+  if (read(rclcpp::Time(0), rclcpp::Duration(0, 0)) != hardware_interface::return_type::OK) {
+    bus_->emergency_release(wheel_ids_);
+    if (arm_) {arm_->stop(so101::StopPolicy::TorqueOff);}
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   if (arm_) {
-    so101::ArmState state;
-    if (!arm_->read(state)) {
-      RCLCPP_ERROR(
-        rclcpp::get_logger("LeKiwiSystemHardware"),
-        "Arm read failed while seeding hold targets: %s", arm_->health().detail.c_str());
-      bus_->emergency_release(wheel_ids_);
-      arm_->stop(so101::StopPolicy::TorqueOff);
-      return hardware_interface::CallbackReturn::ERROR;
-    }
     const auto & targets = arm_->command_targets();
     for (size_t i = 0; i < num_arm_joints_; i++) {
-      const std::string & name = info_.joints[i].name;
-      const auto reading = state.joints.find(name);
-      const auto target = targets.find(name);
-      if (reading == state.joints.end() || target == targets.end()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger("LeKiwiSystemHardware"),
-          "Arm joint %s missing while seeding hold targets", name.c_str());
+      if (targets.find(info_.joints[i].name) == targets.end()) {
         bus_->emergency_release(wheel_ids_);
         arm_->stop(so101::StopPolicy::TorqueOff);
         return hardware_interface::CallbackReturn::ERROR;
       }
-      hw_positions_[i] = reading->second.position;
-      hw_velocities_[i] = reading->second.velocity;
-      hw_commands_[i] = target->second;
+    }
+    for (size_t i = 0; i < num_arm_joints_; i++) {
+      const auto & name = info_.joints[i].name;
+      hw_commands_[i] = targets.at(name);
       arm_command_map_[name] = hw_commands_[i];
     }
   }
@@ -272,6 +277,7 @@ LeKiwiSystemHardware::on_activate(const rclcpp_lifecycle::State &)
     hw_commands_[num_arm_joints_ + i] = 0.0;
   }
 
+  active_ = true;
   RCLCPP_INFO(
     rclcpp::get_logger("LeKiwiSystemHardware"),
     "Activated! %zu arm + %zu base motors running.",
@@ -285,6 +291,7 @@ LeKiwiSystemHardware::on_deactivate(const rclcpp_lifecycle::State &)
   // inactive -> active re-enters on_activate() without on_configure(), so the
   // shared bus must stay open: stop wheels and release torque only.
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Deactivating (torque off, bus kept)...");
+  active_ = false;
   if (!bus_) {
     return hardware_interface::CallbackReturn::SUCCESS;
   }
@@ -333,29 +340,44 @@ hardware_interface::CallbackReturn
 LeKiwiSystemHardware::on_cleanup(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Cleaning up (closing bus)...");
-  teardown_bus();
-  return hardware_interface::CallbackReturn::SUCCESS;
+  return teardown_bus() ? hardware_interface::CallbackReturn::SUCCESS :
+         hardware_interface::CallbackReturn::ERROR;
 }
 
 hardware_interface::CallbackReturn
 LeKiwiSystemHardware::on_shutdown(const rclcpp_lifecycle::State &)
 {
-  teardown_bus();
-  return hardware_interface::CallbackReturn::SUCCESS;
+  return teardown_bus() ? hardware_interface::CallbackReturn::SUCCESS :
+         hardware_interface::CallbackReturn::ERROR;
 }
 
-void LeKiwiSystemHardware::teardown_bus()
+bool LeKiwiSystemHardware::teardown_bus()
 {
+  active_ = false;
   if (!bus_) {
-    return;
+    return true;
   }
-  bus_->emergency_release(wheel_ids_);
-  if (arm_) {
-    arm_->deactivate();  // scoped release (shared bus: close is a no-op here)
+  // Same rule as on_deactivate(): attempt both releases, then report either
+  // failure. Cleanup and shutdown are the last chance to de-energize a motor,
+  // so a refused release must not be reported as a clean teardown.
+  const auto wheel_release = bus_->emergency_release(wheel_ids_);
+  if (!wheel_release.ok) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Wheel torque release during teardown failed: %s", wheel_release.detail.c_str());
   }
+  bool arm_released = true;
+  if (arm_ && !arm_->deactivate()) {  // scoped release (shared bus: close is a no-op here)
+    arm_released = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Arm torque release during teardown failed: %s", arm_->health().detail.c_str());
+  }
+  // Reverse-dependency order: the arm holds a non-owning pointer to the bus.
+  arm_.reset();
   bus_->close();
   bus_.reset();
-  arm_.reset();
+  return wheel_release.ok && arm_released;
 }
 
 hardware_interface::return_type
@@ -363,9 +385,11 @@ LeKiwiSystemHardware::read(const rclcpp::Time &, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
-  // Arm: scoped read (wheel failures do not affect the arm subsystem).
+  // Validate both scoped reads before publishing any part of this cycle.
+  // The bus reports transport success even when a motor reports protection;
+  // LeKiwi retains its original policy of rejecting every protection state.
+  so101::ArmState state;
   if (arm_) {
-    so101::ArmState state;
     if (!arm_->read(state)) {
       RCLCPP_ERROR_THROTTLE(
         rclcpp::get_logger("LeKiwiSystemHardware"),
@@ -373,28 +397,55 @@ LeKiwiSystemHardware::read(const rclcpp::Time &, const rclcpp::Duration &)
       return hardware_interface::return_type::ERROR;
     }
     for (size_t i = 0; i < num_arm_joints_; i++) {
-      const auto it = state.joints.find(info_.joints[i].name);
+      const auto & name = info_.joints[i].name;
+      const auto it = state.joints.find(name);
       if (it == state.joints.end()) {
+        RCLCPP_ERROR(rclcpp::get_logger("LeKiwiSystemHardware"),
+          "Missing arm feedback: %s", name.c_str());
         return hardware_interface::return_type::ERROR;
       }
-      hw_positions_[i] = it->second.position;
-      hw_velocities_[i] = it->second.velocity;
+      const auto & reading = it->second;
+      if (reading.protection != 0 || !std::isfinite(reading.position) ||
+        !std::isfinite(reading.velocity))
+      {
+        RCLCPP_ERROR_THROTTLE(
+          rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+          "Arm joint %s feedback rejected: %s", name.c_str(),
+          feetech::decode_protection_bits(reading.protection).c_str());
+        return hardware_interface::return_type::ERROR;
+      }
     }
   }
 
-  // Wheels: scoped read.
   std::vector<feetech::MotorSample> wheel_samples;
   const auto wheel_result = bus_->sync_read(wheel_samples, wheel_ids_);
-  if (!wheel_result.ok) {
+  if (!wheel_result.ok || wheel_samples.size() != wheel_ids_.size()) {
     RCLCPP_ERROR_THROTTLE(
       rclcpp::get_logger("LeKiwiSystemHardware"),
-      steady_clock, 500, "Wheel read failed: %s", wheel_result.detail.c_str());
+      steady_clock, 500, "Wheel read failed or incomplete: %s", wheel_result.detail.c_str());
     return hardware_interface::return_type::ERROR;
   }
   for (size_t i = 0; i < wheel_ids_.size(); i++) {
-    const size_t idx = num_arm_joints_ + i;
-    hw_positions_[idx] = wheel_samples[i].position;
-    hw_velocities_[idx] = wheel_samples[i].velocity;
+    const auto & sample = wheel_samples[i];
+    if (sample.id != wheel_ids_[i] || !sample.valid || sample.protection != 0 ||
+      !std::isfinite(sample.position) || !std::isfinite(sample.velocity))
+    {
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+        "Wheel motor %u feedback rejected: valid=%d, status=%s",
+        static_cast<unsigned>(wheel_ids_[i]), sample.valid,
+        feetech::decode_protection_bits(sample.protection).c_str());
+      return hardware_interface::return_type::ERROR;
+    }
+  }
+  for (size_t i = 0; i < num_arm_joints_; i++) {
+    const auto & reading = state.joints.at(info_.joints[i].name);
+    hw_positions_[i] = reading.position;
+    hw_velocities_[i] = reading.velocity;
+  }
+  for (size_t i = 0; i < wheel_ids_.size(); i++) {
+    hw_positions_[num_arm_joints_ + i] = wheel_samples[i].position;
+    hw_velocities_[num_arm_joints_ + i] = wheel_samples[i].velocity;
   }
 
   return hardware_interface::return_type::OK;
@@ -404,6 +455,13 @@ hardware_interface::return_type
 LeKiwiSystemHardware::write(const rclcpp::Time &, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+
+  // Inactive hardware was released on purpose (runtime TORQUE_OFF rides on
+  // deactivation). Sending targets would fail against the stopped arm and turn
+  // that intentional stop into an I/O error; activation re-seeds the buffers.
+  if (!active_) {
+    return hardware_interface::return_type::OK;
+  }
 
   if (arm_) {
     for (size_t i = 0; i < num_arm_joints_; i++) {

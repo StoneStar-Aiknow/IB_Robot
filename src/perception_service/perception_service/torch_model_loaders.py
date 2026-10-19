@@ -253,4 +253,109 @@ def load_graspgen(context):
     return _GraspGenModule(GraspGenSampler(config), GraspGenConfig.from_assets(assets), __import__("torch"))
 
 
-__all__ = ["load_graspgen", "load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]
+class _GraspGenXModule:
+    def __init__(self, sampler, torch_module) -> None:
+        self.sampler = sampler
+        self.torch = torch_module
+
+    def __call__(self, inputs):
+        # The adapter has already removed outliers on the host, and the sampler centres
+        # the cloud and restores the source frame itself.
+        sample_count = int(_numpy(inputs["observation.grasp_sample_count"]).reshape(-1)[0])
+        grasps, confidence, _ = self.sampler.sample(
+            inputs["observation.object_points"],
+            threshold=-1.0,
+            num_grasps=sample_count,
+            remove_outliers=False,
+        )
+        if len(grasps) == 0:
+            grasps = self.torch.empty((0, 4, 4), dtype=self.torch.float32)
+            confidence = self.torch.empty((0,), dtype=self.torch.float32)
+        return {
+            "grasp.poses": grasps.to(self.torch.float32),
+            "grasp.confidence": confidence.reshape(-1).to(self.torch.float32),
+        }
+
+
+def _graspgenx_ascend_model(context, root: Path, assets: dict):
+    """Assemble the 310P model and attach its offline diffusion loop.
+
+    The upstream model is CUDA-shaped: its PTV3 encoders and its diffusion loop
+    both assume that device. `torch_models.graspgenx_ascend_310p` replaces the
+    encoders with Ascend ones and runs the loop as a compiled graph, which the
+    bundle declares as a verified artifact. The graph is driven from inside this
+    Torch process rather than through an ACL session, because it reads and
+    writes Torch's own device memory.
+    """
+    import torch
+
+    from model_utils.graspgenx_export.binding import generator_binding, validate_binding
+    from torch_models.graspgenx_ascend_310p import DiffusionLoopOM, assemble
+
+    loop_path = (context.validated_manifest.resolved_artifacts or {}).get("diffusion_loop")
+    if loop_path is None:
+        raise RuntimeError(
+            "the torch_npu deployment must declare a 'diffusion_loop' artifact; "
+            "without it the request would silently run the eager loop"
+        )
+    metadata_path = (context.validated_manifest.resolved_artifacts or {}).get("diffusion_loop_metadata")
+    if metadata_path is None:
+        raise RuntimeError("the torch_npu deployment must declare a verified 'diffusion_loop_metadata' artifact")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    binding = generator_binding(
+        root / assets["generator_checkpoint"], root / assets["checkpoints_dir"] / "gen/config.yaml"
+    )
+    validate_binding(metadata, binding, int(assets["num_grasps"]))
+    model = assemble(
+        root,
+        assets,
+        device_name=torch.npu.get_device_name(0),
+        num_grasps=int(assets["num_grasps"]),
+    )
+    loop = DiffusionLoopOM(str(loop_path), metadata_path=metadata_path)
+    if not loop.matches(int(assets["num_grasps"]), int(model.grasp_generator.num_diffusion_iters_eval)):
+        loop.close()
+        raise RuntimeError(
+            f"{loop_path.name} does not cover {assets['num_grasps']} grasps at "
+            f"{model.grasp_generator.num_diffusion_iters_eval} steps; its metadata says "
+            f"{loop.metadata}"
+        )
+    model.grasp_generator.om_loop = loop
+    return model
+
+
+def load_graspgenx(context):
+    """Build the sampler this deployment's device calls for.
+
+    Both deployments share this entry point because `adapter.json` names one
+    loader for the bundle; the device decides which model goes into the
+    sampler, and the sampler itself is the same upstream class either way.
+    """
+    import os
+
+    root, assets = _configuration(context)
+    checkpoints = root / assets["checkpoints_dir"]
+    grippers = root / assets["gripper_assets_dir"]
+    # ``import graspgenx`` runs a setup hook that clones gripper descriptions and
+    # checkpoints from Hugging Face into site-packages unless both variables name
+    # existing directories. Point them into this bundle before the first import so a
+    # model service never reaches the network or reads anything outside its bundle.
+    os.environ["GRASPGENX_GRIPPER_CFG_DIR"] = str(grippers)
+    os.environ["GRASPGENX_CHECKPOINT_DIR"] = str(checkpoints)
+    from graspgenx.grasp_server import GraspGenXSampler
+    from graspgenx.utils.checkpoint_io import load_model_cfg
+
+    config = load_model_cfg(
+        str(checkpoints / "gen"),
+        str(checkpoints / "dis"),
+        gen_pth=str(root / assets["generator_checkpoint"]),
+        dis_pth=str(root / assets["discriminator_checkpoint"]),
+    )
+    # An already-placed model is passed through untouched, so the sampler never
+    # calls .cuda() on it; the per-request tensors follow the weights.
+    model = _graspgenx_ascend_model(context, root, assets) if context.deployment.device == "npu" else None
+    sampler = GraspGenXSampler(config, assets["gripper_name"], assets_dir=str(grippers), model=model)
+    return _GraspGenXModule(sampler, __import__("torch"))
+
+
+__all__ = ["load_graspgen", "load_graspgenx", "load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]

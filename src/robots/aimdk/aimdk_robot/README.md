@@ -211,8 +211,45 @@ enough to do it.
 `/audio/capture_stamped` republishes the platform's raw capture unchanged:
 4 microphones + 2 echo-reference channels, interleaved per int16 sample. The
 channel count is declared in the profile and published on `/audio/info`; a
-consumer that assumes mono reads it as noise. The platform's *processed* VAD
-stream is the mono 16 kHz one, and it is not bridged (task 7.2).
+consumer that assumes mono reads it as noise. The platform's processed VAD
+stream is mono 16 kHz S16LE, and this node — not a second process — republishes
+it as `ibrobot_msgs/msg/SpeechAudioChunk`: PCM and BEGIN/PROCESSING/END travel in
+one message, with a producer identity and a project sequence. ASR consumes the
+profile's `audio.speech` interface (default `/audio/speech_chunk`). The separate
+`/audio/enhanced_capture_stamped` topic is diagnostic only and nothing
+synchronizes on it; like every other public endpoint it is declared as the
+`audio.enhanced_capture` interface, so the runtime description advertises it and
+it carries its own QoS rather than borrowing the chunk stream's.
+
+The vendor topic and subscription QoS come from `vendor.topics.processed_audio`
+and `vendor.qos.processed_audio`; the public chunk endpoint and its QoS come from
+`interfaces.audio.speech`. Wiring is capability-gated exactly like the raw
+capture path, and a profile that declares the vendor topic without the project
+interface fails at startup instead of falling back to a literal topic. The
+default VOLATILE subscription deliberately does not request historical speech
+from the vendor's TRANSIENT_LOCAL publisher, so speech latched before this
+runtime started cannot be recognized as new.
+
+`MessageHeader.sequence` is documented as the vendor's consecutively increasing
+ID, but the X2 firmware currently sends a constant (observed on hardware,
+2026-10-15), so an upstream BEST_EFFORT loss is **not** observable on X2. Only a
+strict forward skip counts as evidence of one, and it leaves one project sequence
+number unused so the consumer drops the affected segment; constant, repeated and
+reset values are not gaps. An earlier "anything but last + 1" test flagged every
+message against that constant field and dropped all speech. `stream_id` names the
+vendor stream, and a change of it resets that baseline; the forward-skip check
+stays for firmware that implements the IDL, and on X2 the segment deadlines are
+the only protection. Empty state-zero heartbeats indicate that this path is
+running, not that someone is speaking; they never produce recognition text or
+keep a stalled utterance alive.
+
+Readiness is reported through `robot_runtime.InterfaceMonitor`, the same
+component the facade and mock runtimes use, so `audio.speech` is `ready` before
+the wake word and `wait_for_runtime` can admit ASR. The monitor is given only
+`OBSERVED_INTERFACES = ("audio.speech",)`: handing it the whole description would
+re-subscribe the camera and lidar streams inside this process on a board that is
+already the bottleneck. Its subscription runs in the speech callback group so the
+~500 Hz joint feedback cannot delay it past the staleness window.
 
 ### The platform's state message is read whole
 
@@ -222,7 +259,7 @@ slower or weaker source:
 
 | Field | What it gives the bridge |
 |---|---|
-| `fsm_state` | The balance controller's own state. Wired into the fault registry as `balance`: the platform entering SAFE degrades the runtime instead of leaving it ACTIVE while mode switches are being refused. |
+| `fsm_state` | The balance controller's raw state value, republished as a diagnostic observation only. It does not gate lifecycle or command output because the SDK message and generated documentation disagree on numeric meanings, and the vendor examples do not use it as an admission check. |
 | `input_source` | The arbitration holder, ten times a second. A preemption is seen at once rather than up to a poll period later — and every command published in that window would have been discarded. |
 | `speed_status` | The speed envelope the platform is enforcing *now*, which it narrows with battery, load and terrain. `/cmd_vel` is checked against it; the profile stays the ceiling, so the platform may narrow it and never widen it. |
 | `motion_status` | Upper-body player state — a faster second source behind the preset-motion poll. |

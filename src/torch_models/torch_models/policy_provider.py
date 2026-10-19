@@ -17,6 +17,9 @@ class PolicyProvider:
     prepare: Callable[..., object]
     load_options: Mapping[str, object]
     execution_metadata: Callable[[object], Mapping[str, object]] | None = None
+    preprocess_inputs: Callable[..., Mapping[str, object]] | None = None
+    configure_processors: Callable[..., None] | None = None
+    resolve_load_options: Callable[..., Mapping[str, object]] | None = None
 
 
 _PROVIDERS = {

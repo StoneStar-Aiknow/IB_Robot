@@ -59,6 +59,158 @@ detect_gpu_summary() {
     echo "not detected"
 }
 
+_cann_version_from_file() {
+    local version_file="$1"
+    local line version
+
+    [[ -r "${version_file}" ]] || return 1
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            version=*)
+                version="${line#version=}"
+                ;;
+            version_dir=*)
+                version="${line#version_dir=}"
+                ;;
+            *_running_version=\[*:*\])
+                version="${line#*:}"
+                version="${version%%]*}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        version="${version%$'\r'}"
+        if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
+            printf '%s\n' "${version}"
+            return 0
+        fi
+    done < "${version_file}"
+    return 1
+}
+
+detect_cann_version() {
+    # CANN's "latest" path can be a merged directory of component symlinks,
+    # not a symlink to the release directory. Prefer its public version.cfg,
+    # then cover versioned toolkit roots and component metadata.
+    local toolkit_root="${IBR_CANN_TOOLKIT_ROOT:-${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
+    local version_file version resolved_root
+    local version_files=(
+        "${toolkit_root}/version.cfg"
+        "${toolkit_root}/ascend_toolkit_install.info"
+        "${toolkit_root}/aarch64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/arm64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/x86_64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/runtime/version.info"
+        "${toolkit_root}/toolkit/version.info"
+    )
+
+    for version_file in "${version_files[@]}"; do
+        if version="$(_cann_version_from_file "${version_file}")"; then
+            printf '%s\n' "${version}"
+            return 0
+        fi
+    done
+
+    resolved_root="$(readlink -f "${toolkit_root}" 2>/dev/null || true)"
+    version="${resolved_root##*/}"
+    if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
+        printf '%s\n' "${version}"
+        return 0
+    fi
+    return 1
+}
+
+# The two accelerator probes are separate functions so tests can stub them as
+# shell functions. A fake nvidia-smi on PATH is not an option: the board
+# targets mount /tmp noexec, so an executable fixture there cannot run.
+_accel_has_nvidia_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+_accel_has_ascend_npu() {
+    # A CANN toolkit alone is NOT an Ascend NPU: hosts that only convert OM
+    # model bundles install the toolkit as a cross-compilation toolchain, and
+    # treating that as an NPU made such a host look like it had two
+    # accelerators. Probe the device instead, mirroring the nvidia-smi -L
+    # device check. The davinci device nodes are the driver's own view of the
+    # NPUs and are present even where npu-smi is not on PATH, which is the case
+    # on the Ascend 310P openEuler board.
+    local device_glob="${IBR_ASCEND_DEVICE_GLOB:-/dev/davinci[0-9]*}"
+
+    if compgen -G "${device_glob}" >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v npu-smi >/dev/null 2>&1 && npu-smi info >/dev/null 2>&1
+}
+
+# The accelerator axis is independent of the OS axis: Ascend is deployed on
+# both openEuler and Ubuntu, and an Ubuntu host may carry either an NVIDIA GPU
+# or an Ascend NPU. Probe the toolkits and drivers on disk, never an installed
+# Torch: which Torch build to install is exactly what this axis decides.
+detect_accel_id() {
+    if [[ -n "${ACCEL_OVERRIDE:-}" ]]; then
+        echo "${ACCEL_OVERRIDE}"
+        return 0
+    fi
+
+    local has_cuda=false has_cann=false
+    if _accel_has_nvidia_gpu; then
+        has_cuda=true
+    fi
+    if _accel_has_ascend_npu; then
+        has_cann=true
+    fi
+
+    if [[ "${has_cuda}" == true && "${has_cann}" == true ]]; then
+        # Guessing here silently installs one vendor's Torch over the other's.
+        log_error "Detected both an NVIDIA GPU and an Ascend NPU device on this host."
+        log_error "Set ACCEL_OVERRIDE=cuda or ACCEL_OVERRIDE=cann to select the runtime to install."
+        return 1
+    fi
+    if [[ "${has_cuda}" == true ]]; then
+        echo "cuda"
+        return 0
+    fi
+    if [[ "${has_cann}" == true ]]; then
+        echo "cann"
+        return 0
+    fi
+    # No accelerator is a supported configuration: the workspace still builds
+    # and its CPU-only tests still run.
+    echo "cpu"
+}
+
+detect_accel_summary() {
+    local detail=""
+
+    if [[ "${SETUP_ACCEL_ID}" == "cann" ]]; then
+        local cann_version
+        cann_version="$(detect_cann_version 2>/dev/null || true)"
+        if [[ -n "${cann_version}" ]]; then
+            detail=" (CANN ${cann_version})"
+        fi
+    fi
+    if [[ -n "${ACCEL_OVERRIDE:-}" ]]; then
+        detail="${detail} (ACCEL_OVERRIDE)"
+    fi
+    printf '%s%s\n' "${SETUP_ACCEL_ID}" "${detail}"
+}
+
+load_accel_impl() {
+    case "${SETUP_ACCEL_ID}" in
+        cuda | cann | cpu)
+            # shellcheck disable=SC1090
+            source "${SCRIPT_DIR}/setup/accels/${SETUP_ACCEL_ID}.sh"
+            ;;
+        *)
+            log_error "Unsupported accelerator '${SETUP_ACCEL_ID}'."
+            log_error "Expected one of: cuda, cann, cpu (set via ACCEL_OVERRIDE)."
+            exit 1
+            ;;
+    esac
+}
+
 detect_ram_summary() {
     if [[ -e /proc/meminfo ]]; then
         local total_kib
@@ -200,6 +352,10 @@ initialize_platform() {
     detect_host_metadata
     SETUP_PLATFORM_ID="$(detect_platform_id)"
     load_platform_impl
+    if ! SETUP_ACCEL_ID="$(detect_accel_id)"; then
+        exit 1
+    fi
+    load_accel_impl
     detect_python_runtimes
     export_lerobot_host_facts
 }
@@ -252,10 +408,11 @@ print_platform_summary() {
         python_summary="${SETUP_BOOTSTRAP_PYTHON_VERSION} (shell: ${SETUP_SHELL_PYTHON_VERSION})"
     fi
 
-    summary_block="$(printf "OS:       %s\nPython:   %s\nGPU:      %s\nROS:      %s\nRAM:      %s\nDisk:     %s" \
+    summary_block="$(printf "OS:       %s\nPython:   %s\nGPU:      %s\nAccel:    %s\nROS:      %s\nRAM:      %s\nDisk:     %s" \
         "${SETUP_OS_PRETTY_NAME} (${SETUP_ARCH})" \
         "${python_summary}" \
         "${SETUP_GPU_SUMMARY}" \
+        "$(detect_accel_summary)" \
         "${SETUP_ROS_SUMMARY}" \
         "${SETUP_RAM_SUMMARY}" \
         "${SETUP_DISK_FREE_SUMMARY}")"

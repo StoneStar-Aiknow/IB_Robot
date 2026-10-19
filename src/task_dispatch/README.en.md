@@ -74,6 +74,15 @@ VoxPoser planner ─────┘                               │
 fresh joint feedback contains the gripper joint and is already within tolerance. Close commands and stale or missing
 feedback always use the normal trajectory path.
 
+Apart from open commands skipped by `skip_redundant_gripper_open` above, every gripper command is sent and its
+trajectory time follows the travel distance. The launch parameter `gripper_full_stroke` (resolved by the robot_config
+task executor launch builder from `gripper_open_position` and `gripper_closed_position`, the executor block first,
+then `embodied.execution`) counts as one full open or close, which used to take a fixed 1 s; the distance from the
+current position to the target is converted at that same speed and bounded to 0.1–1 s. A full open or close therefore
+still takes 1 s and no command moves faster than before. A command to the position the gripper already holds is still
+issued, only with a 0.1 s trajectory, so the next motion does not wait a full second. Without both positions
+configured (`gripper_full_stroke` is 0) or with stale or missing joint feedback, the fixed 1 s duration is kept.
+
 ### Message Definitions
 
 **TaskStep.msg** — Task step:

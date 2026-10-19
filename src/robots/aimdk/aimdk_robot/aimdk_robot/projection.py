@@ -193,9 +193,9 @@ TASK_STATES_IN_PROGRESS: frozenset[int] = frozenset(
     {TASK_STATE_NOT_READY, TASK_STATE_PENDING, TASK_STATE_CREATED, TASK_STATE_RUNNING}
 )
 
-# Balance finite-state machine (``McFsmState``). This is the only view of
-# whether the platform's own balance controller is still operating normally;
-# an action read-back and fresh timestamps do not show it entering SAFE.
+# Balance finite-state machine (``McFsmState``). Keep the raw value for
+# diagnostics only: the SDK message and generated documentation disagree on
+# the numeric meanings, and the vendor examples do not gate commands on it.
 FSM_STATE_UNKNOWN = 0
 FSM_STATE_STARTING = 1
 FSM_STATE_STABLE = 2
@@ -203,40 +203,11 @@ FSM_STATE_MOVING = 3
 FSM_STATE_SAFE = 4
 FSM_STATE_SPECIAL = 5
 FSM_STATE_TEST = 6
-FSM_STATE_NAMES: dict[int, str] = {
-    FSM_STATE_UNKNOWN: "unknown",
-    FSM_STATE_STARTING: "starting",
-    FSM_STATE_STABLE: "stable",
-    FSM_STATE_MOVING: "moving",
-    FSM_STATE_SAFE: "safe",
-    FSM_STATE_SPECIAL: "special",
-    FSM_STATE_TEST: "test",
-}
-#: States in which the platform is operating its balance controller normally.
-FSM_STATES_OPERATIONAL: frozenset[int] = frozenset({FSM_STATE_STABLE, FSM_STATE_MOVING})
 
 
-def fsm_fault(state: int) -> str | None:
-    """Describe a balance state that means commands will not be executed normally.
-
-    ``SAFE`` is the platform protecting itself — the condition the safety
-    section describes, in which mode switches are refused and only damping or
-    zero torque are permitted. A runtime that keeps reporting ACTIVE through it
-    tells its callers the robot is available when it is not. ``UNKNOWN`` is not
-    treated as a fault: a firmware that does not populate the field would
-    otherwise degrade the runtime permanently.
-    """
-    value = int(state)
-    if value in FSM_STATES_OPERATIONAL or value == FSM_STATE_UNKNOWN:
-        return None
-    if value == FSM_STATE_STARTING:
-        return "platform balance controller is still starting; commands are not executed yet"
-    if value == FSM_STATE_SAFE:
-        return (
-            "platform balance controller entered SAFE (its own protection); mode switches are "
-            "refused and only damping or zero torque are permitted until it recovers"
-        )
-    return f"platform balance controller is in {FSM_STATE_NAMES.get(value, value)}, not a normal operating state"
+def fsm_diagnostic(state: int) -> str:
+    """Format the vendor FSM value without assigning it control semantics."""
+    return f"platform balance controller reported fsm_state={int(state)}"
 
 
 # Upper-body motion player (``McPlayerState``), pushed with every state

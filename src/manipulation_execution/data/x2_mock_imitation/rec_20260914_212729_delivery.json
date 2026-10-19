@@ -1,0 +1,15 @@
+{
+  "format": "aimdk-upper-body-animation",
+  "version": 1,
+  "representation": "sampled",
+  "rate_hz": 50.0,
+  "source": "smplx2robot rec_20260914_212729_smoothed.npz (arms only; head and hand are constant placeholders)",
+  "hand_sub_mode": 1,
+  "data_file": "rec_20260914_212729_delivery.npz",
+  "arrays": {
+    "timestamp_s": "timestamp_s",
+    "arm_pos": "arm_pos",
+    "head_pos": "head_pos",
+    "hand_pos": "hand_pos"
+  }
+}

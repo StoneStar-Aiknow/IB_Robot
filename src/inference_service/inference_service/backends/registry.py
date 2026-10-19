@@ -43,6 +43,7 @@ MODEL_TYPE_OPERATIONS: Mapping[str, frozenset[str]] = MappingProxyType(
         "siglip2": frozenset({"encode"}),
         "grounding_dino": frozenset({"detect"}),
         "graspgen": frozenset({"generate_grasps"}),
+        "graspgenx": frozenset({"generate_grasps"}),
         "dummy_echo": frozenset({"echo"}),
         "zipvoice": frozenset({"synthesize"}),
         "fullsubnet": frozenset({"enhance"}),
@@ -523,6 +524,15 @@ _TENSOR_TORCH = (
     ("tensor_model", "dummy_echo", "echo"),
     ("tensor_model", "zipvoice", "synthesize"),
 )
+# Tensor models on Ascend are otherwise expected to be compiled and served
+# through the ACL backend, so the evidence above stays narrow. GraspGen-X is
+# listed separately because its 310P deployment has been measured on the
+# device -- encoder parity against the CUDA baseline, a step-by-step check of
+# the compiled diffusion loop, and a paired latency comparison -- and because
+# its PTV3 encoder has no compiled form yet, so Torch is the only host for it.
+# Keep this tuple to models with that evidence; do not fold it back into
+# _TENSOR_TORCH, which would hand `npu` to every model in it.
+_TENSOR_TORCH_NPU = (("tensor_model", "graspgenx", "generate_grasps"),)
 _POLICY_ASCEND = (("policy", "act", "predict"), ("policy", "pi05", "predict"))
 _TENSOR_ASCEND = (
     ("tensor_model", "ram_plus", "recognize_tags"),
@@ -548,7 +558,7 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
     {
         "torch": BackendDescriptor(
             name="torch",
-            supported_identities=_identities(*_POLICY_TORCH, *_TENSOR_TORCH),
+            supported_identities=_identities(*_POLICY_TORCH, *_TENSOR_TORCH, *_TENSOR_TORCH_NPU),
             profile_types=frozenset({TorchRuntimeProfile}),
             conformance_evidence=_evidence(
                 *_POLICY_TORCH,
@@ -561,6 +571,12 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
                 session_type="TorchModelSession",
                 profile_type=TorchRuntimeProfile,
                 devices=frozenset({"cpu", "cuda"}),
+            )
+            | _evidence(
+                *_TENSOR_TORCH_NPU,
+                session_type="TorchModelSession",
+                profile_type=TorchRuntimeProfile,
+                devices=frozenset({"cpu", "cuda", "npu"}),
             ),
             target_validator=_validate_torch,
         ),
@@ -643,7 +659,9 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
 
 # Adapter code still uses this name to describe its supported service families;
 # it is metadata only and is not a registry dispatch dimension.
-PERCEPTION_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"})
+PERCEPTION_FAMILIES = frozenset(
+    {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "graspgenx", "dummy_echo"}
+)
 
 
 __all__ = [

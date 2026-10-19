@@ -2,12 +2,13 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from voice_asr_service.audio_capture_module import AudioCaptureModule, AudioConfig
+from voice_asr_service.audio_capture_module import AudioCaptureModule, AudioConfig, CaptureState
 from voice_asr_service.voice_asr_node import VoiceASRNode
 
 
 def test_shared_audio_accumulates_short_multichannel_blocks_into_exact_frames():
     capture = AudioCaptureModule(AudioConfig(channels=6, input_channel=1, chunk_size=4, buffer_seconds=1.0))
+    assert capture.start_capture() is True
     first = np.array([[0, 100, 200, 300, 400, 500], [0, 200, 0, 0, 0, 0]], dtype=np.int16)
     second = np.array([[0, 300, 0, 0, 0, 0], [0, 400, 0, 0, 0, 0], [0, 500, 0, 0, 0, 0]], dtype=np.int16)
 
@@ -42,6 +43,7 @@ def test_dual_channel_capture_emits_paired_vad_asr_chunks():
         dtype=np.int16,
     )
 
+    assert capture.start_capture() is True
     assert capture.feed_audio(block.tobytes(), channels=6) is True
 
     chunk = capture.get_audio_chunk(timeout=0.0)
@@ -56,6 +58,26 @@ def test_dual_channel_capture_emits_paired_vad_asr_chunks():
     capture.feed_audio(block.tobytes(), channels=6)
     pre_roll = capture.get_pre_roll_audio(seconds=1.0)
     assert pre_roll.ndim == 1
+
+
+def test_idle_capture_drops_shared_audio_without_overflowing_into_error():
+    capture = AudioCaptureModule(AudioConfig(channels=1, input_channel=0, chunk_size=4, buffer_seconds=1.0))
+    errors = []
+    capture.set_error_callback(errors.append)
+    block = np.arange(8, dtype=np.int16)
+
+    # Far more frames than the 100-slot queue: idle capture must not enqueue them.
+    for _ in range(300):
+        assert capture.feed_audio(block.tobytes(), channels=1) is False
+    assert errors == []
+    assert capture.get_audio_chunk(timeout=0.0) is None
+
+    assert capture.start_capture() is True
+    assert capture.feed_audio(block.tobytes(), channels=1) is True
+    capture.stop_capture()
+    assert capture.state == CaptureState.CLOSED
+    assert capture.feed_audio(block.tobytes(), channels=1) is False
+    assert errors == []
 
 
 def test_voice_asr_callback_consumes_audio_data_stamped_payload():

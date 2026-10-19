@@ -26,10 +26,24 @@ start 使用调用方 request ID 和独立 game config digest；在 advertised r
 observe-only 三种模式，并通过隔离的并行 IK/FK worker 准备候选；所有实际运动仍逐步回到
 `skill_library` 的 `PrimitiveCommand` 安全边界。
 
-## 已移除路径
+## 已移除路径与语音入口
 
-`/voice_command` 不再是机器人运动入口。`perception_service` 仍可作为独立场景感知
-服务启动，但不再由 task entry 自动路由。
+`/voice_command` 不再**直接**驱动机器人运动：旧的 `task_entry_node` → `/embodied/task_command`
+路由已移除，`perception_service` 仍可作为独立场景感知服务启动，但不再由 task entry 自动路由。
+
+语音只能作为 Agent 的一个输入通道接入。`entry_mode: agent` 且启用
+`embodied.agent.voice_bridge` 时，`ibrobot_agent` 包内的 `agent_voice_bridge` 把 ASR 最终文本
+封装为 `/agent/request`，与 `chat_tui` 一样只是 Agent 孵化契约的客户端：
+
+```text
+voice_asr_node --/voice_command--> agent_voice_bridge --/agent/request--> ibrobot_agent_node
+    --> Planner + 白名单校验 --> /embodied/execute_program --> skill_executor / safety_guard
+```
+
+因此语音指令与文字指令走同一条受控链路：必须经 Agent 规划、`test_allowlist`、Gateway
+readiness 与 `authorize_motion`，停止词经 `/agent/control` 中断。其他 `/voice_command`
+消费者（`sound_orientation_node` 的触发短语、导航关键词）不经过 Agent，同一 profile
+同时启用时需用 `voice_bridge.bypass_phrases` 避免同一句话被重复处理。
 
 ## 视觉游戏控制平面
 

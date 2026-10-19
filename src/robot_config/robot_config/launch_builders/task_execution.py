@@ -76,6 +76,25 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
     print("[robot_config] ========== Generating Task Executor ==========")
     print(f"[robot_config] Control mode: {control_mode}")
 
+    # One owner for the gripper's open/closed positions: the mode executor
+    # block, falling back to the embodied execution block the skill layer
+    # commands.  The executor only receives the resolved values.
+    embodied = robot_config.get("embodied")
+    embodied_execution = embodied.get("execution", {}) if isinstance(embodied, dict) else {}
+    if not isinstance(embodied_execution, dict):
+        embodied_execution = {}
+
+    def _gripper_position(key: str):
+        value = executor_config.get(key, embodied_execution.get(key))
+        return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+    gripper_open = _gripper_position("gripper_open_position")
+    gripper_closed = _gripper_position("gripper_closed_position")
+    # 0.0 means "unknown": the executor then keeps the fixed full-stroke time.
+    gripper_full_stroke = (
+        abs(gripper_open - gripper_closed) if gripper_open is not None and gripper_closed is not None else 0.0
+    )
+
     node = Node(
         package="task_dispatch",
         executable="task_executor_node",
@@ -85,7 +104,8 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
                 "robot_config_path": str(robot_config_path),
                 "use_sim_time": is_sim,
                 "skip_redundant_gripper_open": bool(executor_config.get("skip_redundant_gripper_open", False)),
-                "gripper_open_position": float(executor_config.get("gripper_open_position", 1.0)),
+                "gripper_open_position": 1.0 if gripper_open is None else gripper_open,
+                "gripper_full_stroke": gripper_full_stroke,
                 "gripper_position_tolerance": max(float(executor_config.get("gripper_position_tolerance", 0.05)), 0.0),
                 "joint_state_max_age_s": max(float(executor_config.get("joint_state_max_age_s", 0.25)), 0.0),
             }

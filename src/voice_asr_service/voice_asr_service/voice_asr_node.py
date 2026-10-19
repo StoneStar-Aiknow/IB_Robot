@@ -19,7 +19,7 @@ from std_srvs.srv import Empty
 
 from ibrobot_msgs.srv import RecognizeFile, SetHotwords
 
-from .asr_inference_module import ASRInferenceModule
+from .asr_inference_module import ASRInferenceModule, ASRResult
 from .audio_capture_module import AudioCaptureModule, AudioConfig
 from .defaults import VOICE_ASR_DEFAULTS
 from .file_input_module import FileInputModule
@@ -111,6 +111,10 @@ class VoiceASRNode(Node):
                 "Current Voice ASR pipeline supports only "
                 f"sample_rate={_VOICE_ASR_SUPPORTED_SAMPLE_RATE}, got {self._sample_rate}"
             )
+        if self._external_mode:
+            # 外部分段输入是事件驱动流，音频块大小由音源决定，512 帧契约仅约束
+            # shared_audio 链路的本地 VAD/采集组装。
+            return
         if self._chunk_size != _VOICE_ASR_SUPPORTED_CHUNK_SIZE:
             raise ValueError(
                 "Current Voice ASR pipeline supports only "
@@ -175,11 +179,16 @@ class VoiceASRNode(Node):
         self.declare_parameter("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"])
         self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
         self.declare_parameter("realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"])
+        self.declare_parameter("final_tail_padding_seconds", VOICE_ASR_DEFAULTS["final_tail_padding_seconds"])
         self.declare_parameter("audio_topic", "/audio/capture_stamped")
         self.declare_parameter("audio_channels", 6)
         self.declare_parameter("audio_input_channel", VOICE_ASR_DEFAULTS["audio_input_channel"])
         self.declare_parameter("vad_input_channel", -1)
         self.declare_parameter("exit_on_init_failure", VOICE_ASR_DEFAULTS["exit_on_init_failure"])
+        self.declare_parameter("input_mode", VOICE_ASR_DEFAULTS["input_mode"])
+        self.declare_parameter("chunk_topic", VOICE_ASR_DEFAULTS["chunk_topic"])
+        self.declare_parameter("external_min_samples", VOICE_ASR_DEFAULTS["external_min_samples"])
+        self.declare_parameter("external_idle_timeout", VOICE_ASR_DEFAULTS["external_idle_timeout"])
 
         self._active_mode = self.get_parameter("active_mode").value
         self._language = self.get_parameter("language").value
@@ -195,6 +204,7 @@ class VoiceASRNode(Node):
         self._chunk_size = self.get_parameter("chunk_size").value
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
         self._realtime_pre_roll_seconds = max(0.0, float(self.get_parameter("realtime_pre_roll_seconds").value))
+        self._final_tail_padding_seconds = max(0.0, float(self.get_parameter("final_tail_padding_seconds").value))
         self._audio_topic = str(self.get_parameter("audio_topic").value)
         self._audio_channels = int(self.get_parameter("audio_channels").value)
         self._audio_input_channel = int(self.get_parameter("audio_input_channel").value)
@@ -202,35 +212,53 @@ class VoiceASRNode(Node):
         # -1 表示未配置，VAD 与 ASR 共用输入通道。
         self._vad_input_channel = None if vad_input_channel_raw < 0 else vad_input_channel_raw
         self._exit_on_init_failure = self.get_parameter("exit_on_init_failure").value
+        self._input_mode = str(self.get_parameter("input_mode").value)
+        if self._input_mode not in ("shared_audio", "external_vad"):
+            raise ValueError(f"input_mode must be 'shared_audio' or 'external_vad', got {self._input_mode!r}")
+        self._external_mode = self._input_mode == "external_vad"
+        self._chunk_topic = str(self.get_parameter("chunk_topic").value)
+        self._external_idle_timeout = float(self.get_parameter("external_idle_timeout").value)
+        if self._external_mode and self._active_mode not in ("manual", "continuous"):
+            raise ValueError("external_vad supports active_mode manual or continuous")
+        self._external_min_samples = int(self.get_parameter("external_min_samples").value)
 
     def _init_modules(self):
         """初始化各模块"""
         self._state_machine = StateMachine()
         self._state_machine.set_mode_str(self._active_mode)
 
-        audio_config = AudioConfig(
-            sample_rate=self._sample_rate,
-            chunk_size=self._chunk_size,
-            buffer_seconds=self._buffer_seconds,
-            input_channel=self._audio_input_channel,
-            vad_input_channel=self._vad_input_channel,
-        )
-        self._audio_capture = AudioCaptureModule(audio_config)
-        self._audio_capture.set_error_callback(self._on_audio_error)
+        if self._external_mode:
+            # 外部分段输入：PCM 与 BEGIN/END 边界由音源（aimdk_runtime）在一条
+            # SpeechAudioChunk 中提供；本节点不装配采集缓冲与本地 Silero VAD，
+            # 避免二次 VAD 截句首。
+            self._audio_capture = None
+            self._vad = None
+            self._vad_runtime = None
+            self.get_logger().info(f"Voice ASR external-VAD input: chunks={self._chunk_topic!r}")
+        else:
+            audio_config = AudioConfig(
+                sample_rate=self._sample_rate,
+                chunk_size=self._chunk_size,
+                buffer_seconds=self._buffer_seconds,
+                input_channel=self._audio_input_channel,
+                vad_input_channel=self._vad_input_channel,
+            )
+            self._audio_capture = AudioCaptureModule(audio_config)
+            self._audio_capture.set_error_callback(self._on_audio_error)
 
-        vad_channel_desc = str(self._vad_input_channel) if self._vad_input_channel is not None else "same as ASR"
-        self.get_logger().info(
-            f"Voice ASR using shared audio_common topic {self._audio_topic!r} "
-            f"(asr_ch={self._audio_input_channel}, vad_ch={vad_channel_desc})"
-        )
+            vad_channel_desc = str(self._vad_input_channel) if self._vad_input_channel is not None else "same as ASR"
+            self.get_logger().info(
+                f"Voice ASR using shared audio_common topic {self._audio_topic!r} "
+                f"(asr_ch={self._audio_input_channel}, vad_ch={vad_channel_desc})"
+            )
+
+            vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
+            self._vad = VADModule(vad_config)
+            self._vad.set_sensitivity(self._vad_sensitivity)
+            self._vad_runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
 
         self._file_input = FileInputModule()
         self._file_input.set_progress_callback(self._on_file_progress)
-
-        vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
-        self._vad = VADModule(vad_config)
-        self._vad.set_sensitivity(self._vad_sensitivity)
-        self._vad_runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
 
         self._asr = ASRInferenceModule()
         self._asr_init_error: str | None = None
@@ -244,13 +272,15 @@ class VoiceASRNode(Node):
                 bundle_path=self._bundle_path,
                 deployment=self._deployment,
                 language=self._language,
+                final_tail_padding_seconds=self._final_tail_padding_seconds,
             )
             # ASR 模型采样率只有初始化 recognizer 后才能确定；必须与音频输入一致。
             self._validate_asr_audio_sample_rate()
-            self._vad_runtime.initialize()
-            self._validate_vad_audio_contract(self._vad_runtime)
-            self._vad.set_runtime(self._vad_runtime)
-            self._vad.initialize()
+            if not self._external_mode:
+                self._vad_runtime.initialize()
+                self._validate_vad_audio_contract(self._vad_runtime)
+                self._vad.set_runtime(self._vad_runtime)
+                self._vad.initialize()
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
             self.get_logger().info(
                 f"ASR deployment loaded: {self._bundle_path}#{self._deployment} (type: {model_type_str})"
@@ -300,12 +330,23 @@ class VoiceASRNode(Node):
         vad.initialize()
         return vad
 
+    def _end_streaming(self, trigger: str) -> ASRResult:
+        """End the active recognition; a failed final decode drops the utterance, not the node."""
+        try:
+            return self._asr.end_streaming()
+        except Exception as e:
+            # Every caller runs inside an executor callback, so a propagated
+            # error would end spin() and take the whole ASR node down.
+            self.get_logger().error(f"Final ASR decode failed ({trigger}); utterance dropped: {e}")
+            return ASRResult(text="", is_final=True)
+
     def _reset_recognition_runtime(self, clear_audio: bool = False):
         self._recording_start_time = None
         self._last_partial_text = ""
-        self._vad.reset()
+        if self._vad is not None:
+            self._vad.reset()
         self._asr.reset()
-        if clear_audio:
+        if clear_audio and self._audio_capture is not None:
             self._audio_capture.clear_buffer()
 
     def _init_ros_interface(self):
@@ -318,9 +359,29 @@ class VoiceASRNode(Node):
 
         self._sub_control = self.create_subscription(String, "/voice_control", self._on_voice_control, 10)
         self._sub_file_input = self.create_subscription(String, "/voice_file_input", self._on_file_input, 10)
-        from audio_common_msgs.msg import AudioDataStamped
 
-        self._sub_audio = self.create_subscription(AudioDataStamped, self._audio_topic, self._on_audio_message, 50)
+        self._external_input = None
+        self._sub_audio = None
+        if self._external_mode:
+            from .external_vad_input import ExternalVadInput
+
+            self._external_input = ExternalVadInput(
+                node=self,
+                asr=self._asr,
+                chunk_topic=self._chunk_topic,
+                sample_rate=self._sample_rate,
+                min_samples=self._external_min_samples,
+                max_duration=float(self._max_recording_duration),
+                idle_timeout=self._external_idle_timeout,
+                publish_partial=self._publish_partial,
+                on_final=self._publish_command,
+                on_partial=self._publish_partial_result,
+                on_state=self._on_external_state_change,
+            )
+        else:
+            from audio_common_msgs.msg import AudioDataStamped
+
+            self._sub_audio = self.create_subscription(AudioDataStamped, self._audio_topic, self._on_audio_message, 50)
 
         self._cb_group = MutuallyExclusiveCallbackGroup()
         self._srv_start = self.create_service(
@@ -349,10 +410,34 @@ class VoiceASRNode(Node):
 
     def _init_control_loop(self):
         """初始化控制循环"""
+        if self._external_mode:
+            self._control_timer = self.create_timer(1.0, self._external_control_loop, callback_group=self._cb_group)
+            if self._state_machine.mode == ActiveMode.CONTINUOUS and self._ensure_realtime_asr_supported(
+                operation="external_continuous_listening"
+            ):
+                self._external_input.enabled = True
+                self._transition_state(NodeState.LISTENING, "external_vad_continuous_ready")
+            return
+
         self._control_timer = self.create_timer(0.01, self._control_loop, callback_group=self._cb_group)
 
         if self._state_machine.mode == ActiveMode.CONTINUOUS:
             self._start_continuous_listening()
+
+    def _on_external_state_change(self, state: str) -> None:
+        """Map external segment events onto the public node state machine."""
+        if state == "recognizing":
+            self._transition_state(NodeState.RECOGNIZING, "external_vad_begin")
+            self._recording_start_time = time.time()
+        elif state == "listening":
+            self._recording_start_time = None
+            if self._state_machine.is_recognizing():
+                self._transition_state(NodeState.LISTENING, "external_vad_end")
+
+    def _external_control_loop(self):
+        self._publish_status_heartbeat()
+        if self._external_input is not None and self._external_input.check_timeout():
+            self._recording_start_time = None
 
     def _control_loop(self):
         """主控制循环"""
@@ -430,7 +515,7 @@ class VoiceASRNode(Node):
 
         elif vad_result.state == VADState.SILENCE:
             if self._state_machine.is_recognizing():
-                final_result = self._asr.end_streaming()
+                final_result = self._end_streaming("vad_silence_detected")
 
                 if final_result.text:
                     self._publish_command(final_result.text, final_result.confidence)
@@ -451,7 +536,7 @@ class VoiceASRNode(Node):
             self.get_logger().warn("Recognition timeout, forcing final result")
 
             latency = time.time() - self._recording_start_time
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("timeout")
 
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
@@ -480,7 +565,7 @@ class VoiceASRNode(Node):
         )
 
         if self._state_machine.is_recognizing():
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("audio_capture_stalled")
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
             else:
@@ -521,6 +606,14 @@ class VoiceASRNode(Node):
             self.get_logger().warn("Recognition already in progress")
             return response
 
+        if self._external_mode:
+            if self._external_input is None:
+                self._state_machine.set_error("External VAD input is not initialized")
+                return response
+            self._external_input.enabled = True
+            self._transition_state(NodeState.LISTENING, "service_request")
+            return response
+
         if not self._audio_capture.initialize():
             self._state_machine.set_error("Failed to initialize audio capture")
             return response
@@ -537,8 +630,14 @@ class VoiceASRNode(Node):
 
     def _on_stop_recognition(self, request, response):
         """停止识别服务回调"""
+        if self._external_mode:
+            if self._external_input is not None:
+                self._external_input.enabled = False
+            self._transition_state(NodeState.IDLE, "service_request")
+            return response
+
         if self._state_machine.is_recognizing():
-            final_result = self._asr.end_streaming()
+            final_result = self._end_streaming("service_request")
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
 
@@ -617,6 +716,11 @@ class VoiceASRNode(Node):
             if self._state_machine.is_idle():
                 if not self._ensure_realtime_asr_supported(operation="voice_control.start"):
                     return
+                if self._external_mode:
+                    if self._external_input is not None:
+                        self._external_input.enabled = True
+                    self._transition_state(NodeState.LISTENING, "topic_command")
+                    return
                 if not self._audio_capture.initialize():
                     return
                 if self._audio_capture.start_capture():
@@ -627,8 +731,13 @@ class VoiceASRNode(Node):
         elif command in ["stop", "停止", "停止监听"] and (
             self._state_machine.is_listening() or self._state_machine.is_recognizing()
         ):
+            if self._external_mode:
+                if self._external_input is not None:
+                    self._external_input.enabled = False
+                self._transition_state(NodeState.IDLE, "topic_command")
+                return
             if self._state_machine.is_recognizing():
-                final_result = self._asr.end_streaming()
+                final_result = self._end_streaming("topic_command")
                 if final_result.text:
                     self._publish_command(final_result.text, final_result.confidence)
             self._audio_capture.stop_capture()
@@ -720,9 +829,12 @@ class VoiceASRNode(Node):
         """销毁节点"""
         if hasattr(self, "_control_timer"):
             self._control_timer.cancel()
-        self._audio_capture.cleanup()
+        if self._external_input is not None:
+            self._external_input.enabled = False
+        if self._audio_capture is not None:
+            self._audio_capture.cleanup()
         self._asr.cleanup()
-        if hasattr(self, "_vad"):
+        if self._vad is not None:
             self._vad.close()
         super().destroy_node()
 

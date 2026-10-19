@@ -1508,16 +1508,18 @@ def test_only_documented_control_areas_are_offered_as_targets():
 # --- platform state fields (already subscribed, previously discarded) -------
 
 
-def test_balance_safe_state_degrades_the_runtime():
-    """The platform entering its own SAFE state must not read as ACTIVE."""
+def test_balance_fsm_state_is_diagnostic_only():
+    """An unverified vendor FSM value must not block the runtime."""
     harness = Harness(fsm_state=projection.FSM_STATE_SAFE)
     try:
-        status = harness.wait_for(
-            lambda: harness.status() if harness.status().lifecycle == "DEGRADED" else None,
-            "the runtime to degrade on the platform's balance state",
-        )
-        assert any("SAFE" in fault for fault in status.faults)
-        assert not harness.runtime.output_admitted()
+        harness.wait_active()
+        assert harness.runtime.output_admitted()
+        assert harness.set_mode("stream").success
+        message = Float64MultiArray()
+        message.data = [0.01] * 14
+        harness.publish("/aimdk/arm/commands", message)
+        received = harness.wait_for(lambda: harness.mock.last_upper_body, "an upper body command")
+        assert list(received.arm_pos) == pytest.approx(message.data)
     finally:
         harness.shutdown()
 

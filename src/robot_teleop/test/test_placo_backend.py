@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+from rclpy.impl.rcutils_logger import RcutilsLogger
+
 from robot_teleop.cartesian_backend.placo_servo import PlacoServoBackend
 
 
@@ -102,6 +104,21 @@ def test_home_action_abort_is_reported():
     backend._on_home_result(SimpleNamespace(result=lambda: SimpleNamespace(result=result)), generation=3)
 
     assert backend.consume_home_result() is False
+
+
+def test_home_results_with_different_outcomes_use_real_logger():
+    # rclpy pins the severity of each logging call site; mixed outcomes used to raise.
+    backend = _pending_home_backend()
+    logger = RcutilsLogger(name="test_placo_backend_home_result_severity")
+    backend._node = SimpleNamespace(get_logger=lambda: logger)
+
+    for success in (False, True, False):
+        backend._home_pending = True
+        result = SimpleNamespace(success=success, error_code="", message=f"home success={success}")
+        backend._on_home_result(
+            SimpleNamespace(result=lambda result=result: SimpleNamespace(result=result)), generation=3
+        )
+        assert backend.consume_home_result() is success
 
 
 def test_late_home_goal_is_canceled_after_disable_generation():

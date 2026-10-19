@@ -38,11 +38,11 @@ def test_fast_lio_native_tf_topics_are_isolated_from_navigation_tf():
 
 def test_navigation_stage_exposes_navigation_skills_but_mapping_stage_does_not(monkeypatch):
     config_path = ROOT / "src/robot_config/config/robots/lekiwi_lidar.yaml"
-    mount_path = ROOT / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
+    mount_path = ROOT / "src/robots/lekiwi/lekiwi_description/config/lekiwi_mid360_mount.yaml"
     original_resolver = loader.resolve_ros_path
 
     def resolve_path(value):
-        if value == "$(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml":
+        if value == "$(find lekiwi_description)/config/lekiwi_mid360_mount.yaml":
             return str(mount_path)
         return original_resolver(value)
 

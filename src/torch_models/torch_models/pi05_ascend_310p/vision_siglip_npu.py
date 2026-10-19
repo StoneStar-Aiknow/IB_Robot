@@ -188,8 +188,48 @@ class PI05SiglipMLP(nn.Module):
         self.activation_fn = ACT2FN[config.hidden_act]
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.register_parameter("ffn_weight1", None)
+        self.register_parameter("ffn_weight2", None)
+
+    @torch.no_grad()
+    def prepare_npu_ffn(self) -> None:
+        """Pack the inference-only FFN weights after strict checkpoint loading."""
+
+        if self.ffn_weight1 is not None:
+            return
+        if self.config.hidden_act != "gelu_pytorch_tanh":
+            raise ValueError("PI05 vision FFN requires gelu_pytorch_tanh activation")
+        if self.fc1.weight.device.type != "npu" or self.fc1.weight.dtype != torch.float16:
+            raise ValueError("PI05 vision FFN requires FP16 NPU weights")
+        import torch_npu
+
+        # Atlas310P FFN uses [K, N] weights in FRACTAL_NZ. Prepare them once,
+        # outside the graph: npu_format_cast has no Torch-NPU 2.5.1 fake kernel.
+        self.ffn_weight1 = nn.Parameter(
+            torch_npu.npu_format_cast(self.fc1.weight.detach().t().contiguous(), 29), requires_grad=False
+        )
+        self.ffn_weight2 = nn.Parameter(
+            torch_npu.npu_format_cast(self.fc2.weight.detach().t().contiguous(), 29), requires_grad=False
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.ffn_weight1 is not None and not self.training and torch.compiler.is_compiling():
+            import torch_npu
+
+            shape = hidden_states.shape
+            # Let GE select the activation layout. The eager FFN API is not
+            # numerically equivalent on this stack, so keep eager on the
+            # original MLP below even when packed weights are available.
+            output = torch_npu.npu_ffn(
+                hidden_states.reshape(-1, shape[-1]),
+                self.ffn_weight1,
+                self.ffn_weight2,
+                "gelu",
+                bias1=self.fc1.bias,
+                bias2=self.fc2.bias,
+                inner_precise=1,
+            )
+            return output.reshape(shape)
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
@@ -311,6 +351,11 @@ class PI05SiglipVisionModel(nn.Module):
     def fuse_qkv_weights(self) -> None:
         for layer in self.vision_model.encoder.layers:
             layer.self_attn.fuse_qkv_weights()
+
+    def prepare_npu_ffn(self) -> int:
+        for layer in self.vision_model.encoder.layers:
+            layer.mlp.prepare_npu_ffn()
+        return len(self.vision_model.encoder.layers)
 
     def forward(
         self,

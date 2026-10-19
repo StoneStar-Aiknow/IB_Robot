@@ -5,8 +5,8 @@ robot:
     enabled: true
     active_mode: continuous
     language: zh
-    bundle_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
-    deployment: torch_cpu
+    bundle_path: models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+    deployment: ascend_310p
     publish_partial: true
     output_topic: /voice_command
     sample_rate: 16000
@@ -32,7 +32,6 @@ robot:
       embodied:
         enabled: true
         skill_catalog_source_mode: development
-        skill_catalog_source_root: src/skill_catalog
         skill_catalog_profile: lekiwi_lidar_sound_following
         imitate_human_motion:
           enabled: false
@@ -74,7 +73,6 @@ robot:
       embodied:
         enabled: true
         skill_catalog_source_mode: development
-        skill_catalog_source_root: src/skill_catalog
         skill_catalog_profile: lekiwi_lidar_sound_following
         imitate_human_motion:
           enabled: false

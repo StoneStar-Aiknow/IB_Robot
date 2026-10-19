@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import yaml
 
+from embodied_common.control_phrases import STOP_PHRASES
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
@@ -1301,7 +1302,8 @@ def _load_robot_section_with_sources(
         raise FileNotFoundError(f"Robot configuration not found: {resolved_config_path}")
 
     with resolved_config_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        # libyaml parser with the same safe constructor as yaml.safe_load.
+        data = yaml.load(f, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)) or {}  # noqa: S506
 
     if not isinstance(data, dict):
         raise ValueError(f"Invalid robot config: expected mapping in {resolved_config_path}")
@@ -1587,12 +1589,14 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         profile_name = embodied.get("skill_catalog_profile", "")
         if source_mode not in {"installed", "development", "production"}:
             errors.append("embodied.skill_catalog_source_mode must be installed, development, or production")
-        elif source_mode in {"development", "production"} and (
-            not isinstance(source_root, str) or not source_root.strip()
-        ):
-            errors.append("embodied.skill_catalog_source_root is required in development and production modes")
+        elif source_mode == "production" and (not isinstance(source_root, str) or not source_root.strip()):
+            errors.append("embodied.skill_catalog_source_root is required in production mode")
+        elif source_mode == "development" and not isinstance(source_root, str):
+            errors.append("embodied.skill_catalog_source_root must be a string")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
+        if not isinstance(embodied.get("resident_cli_bridge", True), bool):
+            errors.append("embodied.resident_cli_bridge must be a boolean")
         errors.extend(_validate_visual_game_services(embodied))
         errors.extend(_validate_sound_orientation_config(robot_config))
         try:
@@ -2074,6 +2078,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         vad_bundle_path=resolve_ros_path(data.get("vad_bundle_path", defaults.vad_bundle_path)),
         vad_deployment=data.get("vad_deployment", defaults.vad_deployment),
         realtime_pre_roll_seconds=data.get("realtime_pre_roll_seconds", defaults.realtime_pre_roll_seconds),
+        final_tail_padding_seconds=data.get("final_tail_padding_seconds", defaults.final_tail_padding_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
         output_topic=data.get("output_topic", defaults.output_topic),
         sample_rate=data.get("sample_rate", defaults.sample_rate),
@@ -2082,6 +2087,11 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         audio_input_channel=data.get("audio_input_channel", defaults.audio_input_channel),
         vad_input_channel=data.get("vad_input_channel", defaults.vad_input_channel),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+        input_mode=data.get("input_mode", defaults.input_mode),
+        chunk_topic=data.get("chunk_topic", defaults.chunk_topic),
+        audio_input=data.get("audio_input", defaults.audio_input),
+        external_min_samples=data.get("external_min_samples", defaults.external_min_samples),
+        external_idle_timeout=data.get("external_idle_timeout", defaults.external_idle_timeout),
     )
 
 
@@ -2119,6 +2129,7 @@ def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
     return AudioIOConfig(
         enabled=data.get("enabled", defaults.enabled),
         microphone=data.get("microphone", defaults.microphone),
+        source=data.get("source", defaults.source),
         capture_topic=data.get("capture_topic", defaults.capture_topic),
         capture_stamped_topic=data.get("capture_stamped_topic", defaults.capture_stamped_topic),
         audio_info_topic=data.get("audio_info_topic", defaults.audio_info_topic),
@@ -2207,6 +2218,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         arm_surface=data.get("arm_surface", True) is not False,
         entry_mode=data.get("entry_mode", "hermes"),
         agent=dict(data.get("agent", {})),
+        resident_cli_bridge=data.get("resident_cli_bridge", True) is not False,
         debug_tracing=data.get("debug_tracing", True),
         task_input_topic=data.get("task_input_topic", "/voice_command"),
         task_command_topic=data.get("task_command_topic", "/embodied/task_command"),
@@ -2522,6 +2534,74 @@ def validate_agent_entry_config(embodied: dict[str, Any]) -> list[str]:
             and planner.get("temperature", 1.0) != 1.0
         ):
             errors.append("embodied.agent.planner.temperature must be 1 for kimi-for-coding")
+    errors.extend(_validate_agent_voice_bridge(agent.get("voice_bridge")))
+    return errors
+
+
+def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
+    if voice_bridge is None:
+        return []
+    prefix = "embodied.agent.voice_bridge"
+    if not isinstance(voice_bridge, dict):
+        return [f"{prefix} must be a mapping"]
+    errors: list[str] = []
+    if not isinstance(voice_bridge.get("enabled", False), bool):
+        errors.append(f"{prefix}.enabled must be a boolean")
+    if voice_bridge.get("confirm_mode", "auto") not in {"auto", "voice_confirm"}:
+        errors.append(f"{prefix}.confirm_mode must be auto or voice_confirm")
+    input_topic = voice_bridge.get("input_topic", "/")
+    if not isinstance(input_topic, str) or not input_topic.startswith("/"):
+        errors.append(f"{prefix}.input_topic must be an absolute ROS topic name")
+    for field_name in ("partial_topic", "asr_status_topic", "asr_control_topic"):
+        # voice_asr_node publishes and listens on fixed topics; a different name here would only
+        # silently disable realtime stop or muting ASR during TTS.
+        if field_name in voice_bridge:
+            errors.append(f"{prefix}.{field_name} is fixed by voice_asr_node and must not be configured")
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+        value = voice_bridge.get(field_name, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
+    if "stop_phrases" in voice_bridge and not voice_bridge["stop_phrases"]:
+        errors.append(f"{prefix}.stop_phrases must not be empty")
+    if "busy_message" in voice_bridge:
+        busy_message = voice_bridge["busy_message"]
+        stop_phrases = voice_bridge.get("stop_phrases") or STOP_PHRASES
+        if not isinstance(busy_message, str) or not busy_message.strip():
+            errors.append(f"{prefix}.busy_message must be a non-empty string")
+        elif isinstance(stop_phrases, list | tuple) and any(
+            isinstance(phrase, str)
+            and normalize_trigger_text(phrase)
+            and normalize_trigger_text(phrase) in normalize_trigger_text(busy_message)
+            for phrase in stop_phrases
+        ):
+            # Spoken while the microphone stays open for stop words: the bridge would stop itself.
+            errors.append(f"{prefix}.busy_message must not contain a stop phrase")
+    for field_name in (
+        "confirm_timeout_sec",
+        "session_idle_sec",
+        "request_timeout_sec",
+        "tts_timeout_sec",
+        "resume_settle_sec",
+    ):
+        value = voice_bridge.get(field_name, 1.0)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            errors.append(f"{prefix}.{field_name} must be finite and positive")
+    corrections = voice_bridge.get("text_corrections", {})
+    if not isinstance(corrections, dict) or any(
+        not isinstance(term, str)
+        or not term.strip()
+        or not isinstance(variants, list)
+        or not variants
+        or any(not isinstance(item, str) or not item.strip() for item in variants)
+        for term, variants in corrections.items()
+    ):
+        errors.append(f"{prefix}.text_corrections must map each term to a non-empty list of misrecognized strings")
+    min_text_chars = voice_bridge.get("min_text_chars", 2)
+    if isinstance(min_text_chars, bool) or not isinstance(min_text_chars, int) or min_text_chars < 1:
+        errors.append(f"{prefix}.min_text_chars must be a positive integer")
+    for field_name in ("speak_replies", "tts_enabled", "mute_asr_during_tts"):
+        if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
+            errors.append(f"{prefix}.{field_name} must be a boolean")
     return errors
 
 
@@ -2567,6 +2647,27 @@ def validate_config(config: RobotConfig) -> list[str]:
     playback_required = config.voice_tts.enabled
     if (capture_required or playback_required) and not is_audio_io_enabled(config.audio_io):
         errors.append("audio_io.enabled must be true when voice ASR, speech direction, or voice TTS is enabled")
+    if config.voice_asr.enabled:
+        if config.voice_asr.input_mode not in ("shared_audio", "external_vad"):
+            errors.append(
+                f"voice_asr.input_mode must be 'shared_audio' or 'external_vad': {config.voice_asr.input_mode!r}"
+            )
+        if (
+            config.voice_asr.input_mode == "external_vad"
+            and config.audio_io.source == "alsa"
+            and is_audio_io_enabled(config.audio_io)
+        ):
+            errors.append(
+                "voice_asr.input_mode=external_vad requires audio_io.source=runtime "
+                "(the segmented audio stream is provided by the robot runtime)"
+            )
+        if config.voice_asr.input_mode == "external_vad":
+            for name in ("chunk_topic",):
+                value = getattr(config.voice_asr, name)
+                if value and not value.startswith("/"):
+                    errors.append(f"voice_asr.{name} must be an absolute ROS topic name")
+    if config.audio_io.source not in ("alsa", "runtime"):
+        errors.append(f"audio_io.source must be 'alsa' or 'runtime', got {config.audio_io.source!r}")
     if config.audio_io.enabled:
         for name in (
             "capture_topic",
@@ -2576,7 +2677,11 @@ def validate_config(config: RobotConfig) -> list[str]:
         ):
             if not getattr(config.audio_io, name).startswith("/"):
                 errors.append(f"audio_io.{name} must be an absolute ROS topic name")
-        if capture_required and not config.audio_io.microphone:
+        if config.audio_io.source == "runtime":
+            # 采集侧 topic 由机器人 runtime 提供（如 aimdk 增强流桥），
+            # 不启动 ALSA 采集节点，也没有可校验的麦克风外设。
+            pass
+        elif capture_required and not config.audio_io.microphone:
             errors.append("audio_io.microphone is required when shared audio capture is enabled")
         elif capture_required:
             microphone_matches = [

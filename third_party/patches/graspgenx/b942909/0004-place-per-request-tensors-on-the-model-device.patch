@@ -1,0 +1,118 @@
+diff --git a/graspgenx/grasp_server.py b/graspgenx/grasp_server.py
+index b86237f..b874e87 100644
+--- a/graspgenx/grasp_server.py
++++ b/graspgenx/grasp_server.py
+@@ -32,7 +32,7 @@ SWEEP_VOLUME_ONLY_BACKBONES = {
+ }
+ 
+ 
+-def load_grasp_gen_model(cfg: omegaconf.DictConfig):
++def load_grasp_gen_model(cfg: omegaconf.DictConfig, device: str = "cuda"):
+     """Load the (gripper-independent) GraspGen model from cfg checkpoints.
+ 
+     The returned model can back any number of samplers — the gripper
+@@ -45,7 +45,7 @@ def load_grasp_gen_model(cfg: omegaconf.DictConfig):
+         raise FileNotFoundError(f"Checkpoint {cfg.eval.dis_checkpoint} does not exist")
+     model.load_state_dict(cfg.eval.gen_checkpoint, cfg.eval.dis_checkpoint)
+     model.eval()
+-    return model.cuda().eval()
++    return model.to(device).eval()
+ 
+ 
+ class GraspGenXSampler:
+@@ -194,7 +194,7 @@ class GraspGenXSampler:
+             grasp_conf: Confidence scores for the grasps
+         """
+         if type(object_pc) == np.ndarray:
+-            object_pc = torch.from_numpy(object_pc).cuda().float()
++            object_pc = torch.from_numpy(object_pc).to(self.device).float()
+ 
+         if grasp_threshold == -1.0 and topk_num_grasps == -1:
+             topk_num_grasps = 100
+@@ -446,22 +446,48 @@ class GraspGenXSampler:
+         grasps[:, :3, 3] += obj_pcd_center
+         return grasps, grasp_conf, None
+ 
++    @property
++    def device(self):
++        """The device this model computes on.
++
++        Not simply the first parameter's: a deployment may keep part of the
++        model on the host on purpose -- an encoder whose irregular work is
++        faster there -- and the first parameter in registration order can
++        then be a CPU one while the rest of the network is on an
++        accelerator. The per-request tensors have to join the accelerator,
++        so that is what this reports, and two accelerators at once are
++        rejected rather than guessed between.
++        """
++        cached = self.__dict__.get('_compute_device')
++        if cached is not None:
++            return cached
++        devices = {parameter.device for parameter in self.model.parameters()}
++        accelerators = sorted({d for d in devices if d.type != 'cpu'}, key=str)
++        if len(accelerators) > 1:
++            raise RuntimeError(
++                f"the model spans several accelerators {accelerators}; "
++                "GraspGenX cannot choose where a request's tensors belong"
++            )
++        device = accelerators[0] if accelerators else torch.device('cpu')
++        self.__dict__['_compute_device'] = device
++        return device
++
+     @torch.inference_mode()
+     def load_gripper_input(self, outputs):
+ 
+         outputs["z_offset"] = torch.tensor(
+             (self.gripper.depth,), dtype=torch.float32
+-        ).cuda()
++        ).to(self.device)
+         outputs["sweep_volume"] = torch.from_numpy(
+             self.gripper.sweep_volume.astype(np.float32)
+-        ).cuda()
++        ).to(self.device)
+         outputs["gripper_type"] = self.gripper.gripper_type
+ 
+         sweep_volume_open = self.gripper.sweep_volume.astype(np.float32)
+         sweep_volume_mid = self.gripper.sweep_volume_mid.astype(np.float32)
+         outputs["sweep_volume_open_and_mid"] = torch.from_numpy(
+             np.concatenate([sweep_volume_open, sweep_volume_mid], axis=0)
+-        ).cuda()
++        ).to(self.device)
+ 
+         gripper_open_ptc = self.gripper.open_pointcloud.copy()
+         gripper_close_ptc = self.gripper.close_pointcloud.copy()
+@@ -471,14 +497,14 @@ class GraspGenXSampler:
+         )
+         gripper_open_ptc = torch.from_numpy(
+             gripper_close_ptc[mask].astype(np.float32)
+-        ).cuda()
++        ).to(self.device)
+ 
+         mask = np.random.randint(
+             0, gripper_close_ptc.shape[0], (self.cfg.data.num_points,)
+         )
+         gripper_close_ptc = torch.from_numpy(
+             gripper_close_ptc[mask].astype(np.float32)
+-        ).cuda()
++        ).to(self.device)
+ 
+         outputs["gripper_open_ptc"] = gripper_open_ptc
+         outputs["gripper_close_ptc"] = gripper_close_ptc
+@@ -489,7 +515,7 @@ class GraspGenXSampler:
+         )
+         outputs["gripper_vol_tsdf"] = torch.from_numpy(
+             vol_tsdf.astype(np.float32)
+-        ).cuda()
++        ).to(self.device)
+ 
+         outputs["gripper_pointnet_repr"] = torch.from_numpy(
+             np.concatenate(
+@@ -500,7 +526,7 @@ class GraspGenXSampler:
+                 ],
+                 axis=0,
+             ).astype(np.float32)
+-        ).cuda()
++        ).to(self.device)
+ 
+         return outputs
+ 

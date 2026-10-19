@@ -140,6 +140,18 @@ from the source `config/robots/` directory; an explicit path must exist. The pub
 fields, named-pose names, timeout policy, and a digest. Primitive sequences, joint/cartesian coordinates, target
 bindings, and ROS service/action/topic names remain private implementation data.
 
+Optional `embodied.resident_cli_bridge` (boolean, default `true`; any other type fails validation) tells
+`embodied_bringup` to start `robot-skill-daemon`, the resident ROS bridge of `robot_skill_cli`, together with the Skill
+Gateway, so even the first `robot-skill` call after bring-up skips DDS discovery. With `false`, `robot-skill` uses an
+in-process bridge. The field is deployment wiring only and is not part of the execution-context digest; see
+"Resident ROS bridge" in the `robot_skill_cli` README.
+
+```yaml
+robot:
+  embodied:
+    resident_cli_bridge: true   # default; false keeps robot-skill on its in-process bridge
+```
+
 ## Observation Video Transport
 
 Observation transport is part of the contract. Omitting `transport` preserves the existing DDS image path. Explicit

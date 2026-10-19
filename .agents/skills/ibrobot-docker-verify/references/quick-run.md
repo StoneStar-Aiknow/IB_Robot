@@ -2,9 +2,10 @@
 
 > **Prerequisite**: The container must have been created via the full Phase 2
 > `docker run`. If a host CUDA toolkit was detected in Phase 0, it is mounted
-> read-only and `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` are set so GraspGen
-> `pointnet2_ops` can be compiled. If no CUDA toolkit is available, setup.sh
-> will skip grasp install gracefully and the verification continues.
+> read-only and `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` are set. Setup does
+> not need it: without GPU passthrough, GraspGen and `pointnet2_ops` install
+> from audited wheels either way. A visible incompatible GPU would instead use
+> a matching CUDA 12.x toolkit for a local, unaudited PointNet2 build.
 
 When iterating locally, repeat the matching Phase 3 source preparation rather
 than changing source modes implicitly:
@@ -26,6 +27,6 @@ docker exec -u testuser -e HOME=/home/testuser \
   -w /home/testuser/IB_Robot \
   verify-ubuntu2204 \
   bash -c 'DEBIAN_FRONTEND=noninteractive \
-    bash scripts/setup.sh --yes \
+    bash scripts/setup.sh --yes --accel cuda \
     > /tmp/setup.log 2>&1'
 ```

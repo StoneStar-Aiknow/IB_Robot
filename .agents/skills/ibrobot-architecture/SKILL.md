@@ -128,13 +128,15 @@ src/
 ├── model_utils/             # ONNX/OM/RKNN/HMM export and bundle packaging CLIs
 ├── action_dispatch/         # Pull-based action dispatch: schedulers, executors, smoothing
 ├── task_dispatch/           # Task plan execution (waypoints + gripper + waits)
-├── skill_catalog/           # Skill manifest compiler + immutable catalog registry
-├── skill_library/           # Capability gateway (skill_executor_node)
-├── robot_skill_cli/         # Controlled CLI surface for LLM/Agent access
-├── embodied_agent/          # Task entry, planning, visual game nodes
-├── embodied_bringup/        # Embodied pipeline launch orchestration
+├── agent/                   # Agent stack (catalog, Gateway, planning, CLI, Agent)
+│   ├── skill_catalog/       # Skill manifest compiler + immutable catalog registry
+│   ├── skill_library/       # Capability gateway (skill_executor_node)
+│   ├── robot_skill_cli/     # Controlled CLI surface for LLM/Agent access
+│   ├── embodied_agent/      # Task entry, planning, visual game nodes
+│   ├── embodied_bringup/    # Embodied pipeline launch orchestration
+│   ├── ibrobot_agent/       # Natural-language Agent node and chat TUI
+│   └── safety_guard/        # Read-only skill/primitive validation preflight
 ├── embodied_common/         # Neutral shared helpers (contracts, base node)
-├── safety_guard/            # Read-only skill/primitive validation preflight
 ├── manipulation_service/    # GraspGen grasp planning/verification services
 ├── manipulation_execution/  # Closed-loop pick/place/imitate executors
 ├── dataset_tools/           # Episode recording, bag_to_lerobot, policy_eval, rerun_viewer
@@ -148,12 +150,10 @@ src/
 ├── voice_tts_service/       # Manifest-backed ZipVoice TTS typed service
 ├── robots/so101/            # SO-101 runtime suite: so101_sdk, so101_hardware, so101_description, so101_motion, so101_suite, so101_robot
 ├── robots/feetech/          # feetech_sdk (pinned Feetech servo SDK)
-├── lekiwi_hardware/         # ros2_control hardware plugin (LeKiwi base + arm)
+├── robots/lekiwi/           # LeKiwi runtime suite: lekiwi_sdk, lekiwi_hardware, lekiwi_description, lekiwi_calibration, lekiwi_robot
 ├── aero_hand_hardware/      # Aero Hand command/state bridge
 ├── hardware_mock/           # Contract-driven mock backend (no real hardware)
-├── lekiwi_description/      # LeKiwi URDF/meshes
 ├── sim_models/              # Scene assets + scene compiler (Gazebo/MuJoCo)
-├── robot_calibration/       # Sensor calibration capture/validate/activate workflows
 ├── attention_viz/           # ACT attention weight visualization
 ├── fast_lio/ fast_calib/ livox_ros_driver2/ omni_wheel_controller/  # (git submodules)
 ├── pymoveit2/ rosclaw/      # (git submodules, vendored)

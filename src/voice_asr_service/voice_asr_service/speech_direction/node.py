@@ -356,6 +356,16 @@ class SpeechDirectionNode(Node):
         # 方向 topic 用 KEEP_LAST(1),只保留最新方向
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self._direction_pub = self.create_publisher(SpeechDirection, "/voice/speech_direction", qos)
+        self.declare_parameter("enhanced_audio_topic", "")
+        self._enhanced_audio_topic = self.get_parameter("enhanced_audio_topic").value.strip()
+        self._enhanced_audio_pub = None
+        self._audio_origin_ns = None
+        if self._enhanced_audio_topic:
+            if self._enhanced_audio_topic == cfg.audio_topic:
+                raise ValueError("enhanced_audio_topic must differ from the input audio_topic")
+            from audio_common_msgs.msg import AudioDataStamped
+
+            self._enhanced_audio_pub = self.create_publisher(AudioDataStamped, self._enhanced_audio_topic, 10)
         self._audio_subscription = None
         # 在线状态(诊断)
         self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -595,7 +605,7 @@ class SpeechDirectionNode(Node):
                 model_batch_samples=cfg.pipeline.model_batch_samples,
                 srp_update_interval_hops=cfg.pipeline.srp_update_interval_hops,
                 early_direction_min_scores=cfg.pipeline.early_direction_min_scores,
-                raw_activity_gate_enabled=cfg.pipeline.raw_activity_gate_enabled,
+                raw_activity_gate_enabled=cfg.pipeline.raw_activity_gate_enabled and not self._enhanced_audio_topic,
                 raw_activity_start_rms=cfg.pipeline.raw_activity_start_rms,
                 raw_activity_stop_rms=cfg.pipeline.raw_activity_stop_rms,
                 raw_activity_tail_samples=round(cfg.pipeline.raw_activity_tail_sec * cfg.pipeline.sample_rate),
@@ -688,7 +698,11 @@ class SpeechDirectionNode(Node):
 
         self._pending_backend_resources = tuple(backend_resources)
 
-        streaming_runtime = SpeechDirectionStreamingRuntime(pipeline, close_backends=False)
+        streaming_runtime = SpeechDirectionStreamingRuntime(
+            pipeline,
+            close_backends=False,
+            on_enhanced_audio=self._publish_enhanced_audio if self._enhanced_audio_pub is not None else None,
+        )
         owned_components: list[OwnedComponent] = []
         if self._session_resources is not None:
             for role, (session, context) in session_entries.items():
@@ -786,7 +800,27 @@ class SpeechDirectionNode(Node):
         """Feed interleaved shared PCM into the existing multi-channel ring."""
         if self._runtime is None:
             return
+        if self._audio_origin_ns is None:
+            stamp = message.header.stamp
+            self._audio_origin_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+            if not self._audio_origin_ns:
+                self._audio_origin_ns = self.get_clock().now().nanoseconds
         self._runtime.feed_audio(bytes(message.audio.data))
+
+    def _publish_enhanced_audio(self, samples: np.ndarray, start_sample: int) -> None:
+        """Publish interleaved four-channel PCM; channel zero is input channel_indices[0]."""
+        if self._enhanced_audio_pub is None or self._audio_origin_ns is None:
+            return
+        from audio_common_msgs.msg import AudioDataStamped
+
+        from .audio_output import encode_enhanced_pcm
+
+        msg = AudioDataStamped()
+        stamp_ns = max(0, self._audio_origin_ns + round(start_sample * 1_000_000_000 / self._config.audio.sample_rate))
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
+        msg.header.frame_id = "enhanced_audio"
+        msg.audio.data = list(encode_enhanced_pcm(samples))
+        self._enhanced_audio_pub.publish(msg)
 
     # ------------------------------------------------------------------ 轮询发布
     def _poll_and_publish(self) -> None:

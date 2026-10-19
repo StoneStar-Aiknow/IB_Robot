@@ -34,8 +34,8 @@
 
 - **submodules**：只初始化 `libs/lerobot`（跳过 LiDAR / bringup 子模块与 ROS 第三方 patch 栈）。
 - **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`torch_models`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
-- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的平台依赖与 CANN 匹配的 `torch_npu`；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
-- **CANN 8.1 ABI**：`full` 和 `inference` 共用 `lerobot-v0.6-cann-8.1-compat.txt`，包含已验证的 Transformers 5.3.0。`full` 仅追加 `lerobot-v0.6-cann-8.1-extras.txt` 的 dataset/kinematics 功能依赖，不切换推理版本。LeRobot 以 `--no-deps` 安装；`openeuler-24.03-cann-8.1.txt` 负责平台包和 Torch ABI。
+- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、GraspGenX、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的 OS 依赖，与 CANN 匹配的 `torch_npu` 由加速器轴安装；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
+- **CANN Torch ABI**：LeRobot 按自身声明正常安装（含所选 extras），随后由 `accel-cann-8.1.txt`（已真机验证的 2.5.1 三元组）或 `accel-cann-8.3.txt`（官方配套的 2.8.0 三元组）按检测到的 CANN 版本覆盖，再由对应 `constraints-cann-<release>.txt` 经 `PIP_CONSTRAINT` 保护其后每一步 pip。`openeuler-24.03.txt` 只负责 OS 包。
 - **OpenCV / cv_bridge ABI**：openEuler aarch64 同时安装 `opencv>=4.13.0` 与 `ros-humble-cv-bridge>=3.2.1-2.oe2403`；后者是针对 OpenCV 4.13 重新构建的 RPM。环境校验在工作区 Python 中执行 BGR/RGB 转换、非连续数组及 mono8/mono16/32FC1 往返，不要求将 NumPy 1.x 兼容的 `cv2` wheel 升到 4.13，也不拒绝后续兼容的 RPM 修订。
 - **验证**：跳过 tracing 校验（lttng / tracetools 属于全工作区诊断能力），并跳过 Ubuntu 平台的 tracing 工具安装钩子（`platform_post_install_rosdeps`）。
 
@@ -45,20 +45,65 @@
 ./scripts/build.sh --packages-up-to inference_service
 ```
 
-## CANN 8.1 依赖文件分工
+## 加速器轴依赖落位
+
+`SETUP_ACCEL_ID`（`cuda` / `cann` / `cpu`）由 `detect.sh::detect_accel_id` 探测**设备**得出
+（`nvidia-smi -L` / `/dev/davinci[0-9]*`，不看工具包），实现在 `scripts/setup/accels/<id>.sh`。
+下表是各加速器**当前实际**的依赖来源，不是理想形态：
+
+| | `cuda` | `cann` | `cpu` |
+| --- | --- | --- | --- |
+| `accel_requirements` | 无（PointNet2 预检确认可安装审计 wheel 或编译本地 wheel 时，`install_graspgen_torch_abi` 才把 Torch 固定到 `2.7.1+cu126`；预检跳过时保留 LeRobot 解析的 Torch） | `accel-cann-8.1.txt` / `accel-cann-8.3.txt`（按检测到的版本）；其他已探到的版本**不安装**、setup 继续，报官方配套版本并在结束摘要提示手工配置；未探到 toolkit 则同样不装 | 无 |
+| `accel_pip_constraints` | 无 | `constraints-cann-8.1.txt` / `constraints-cann-8.3.txt`（按版本） | 无 |
+| `accel_post_requirements` | 无 | 8.1 / 8.3 卸载 `torchcodec`（aarch64 wheel 的 ABI 绑定在更新的 Torch 上，但其元数据不声明 torch 依赖，pip 察觉不到） | 无 |
+| `accel_supports_torch_grasp` | 是 | 否（`pointnet2_ops` 无昇腾构建） | 否 |
+| `accel_supports_torch_graspgenx` | 是 | 是（纯 Python wheel，编码器为 PTV3，不碰 `pointnet2_ops`；310P 部署跑在 `torch_npu` 上，扩散循环为离线 OM 图） | 否（无后端可服务） |
+| `accel_verify_runtime` | 无 | `verify_cann_runtime_versions`（8.1 / 8.3，按版本） | 无 |
+
+已知的不对称，列在这里以免被误读成违规：
+
+- **CUDA 侧没有自己的 requirements 文件**。PointNet2 预检会先检查 Python、架构和所有可见
+  GPU；只有确认将安装审计 wheel 或编译本地 wheel 时，才由 `install_graspgen_torch_abi`
+  提前固定 Torch/TorchVision/TorchCodec 并生成局部约束。Blackwell、非 x86_64、非 Python 3.10
+  或缺少本地构建条件时跳过 GraspGen，并保留 LeRobot 解析的 Torch。
+- **`requirements/manipulation.txt` 仍含 `spconv-cu120`、`torch-scatter` 等 CUDA 包**。该文件
+  只由 `install_graspgen_pip` 安装，而那一步受 `accel_supports_torch_grasp` 把关，因此实际
+  只在 `cuda` 上执行；但它位于 OS 无关的文件里，尚未迁入 `accel-cuda*.txt`。
+- **`requirements/graspgenx.txt` 与 `manipulation.txt` 重复声明 `h5py`、`trimesh`、`scikit-learn`
+  等**。这不是冗余：GraspGenX 的 wheel 以 `--no-deps` 安装，而 `manipulation.txt` 只由
+  `install_graspgen_pip` 在 `cuda` 上安装，所以 `cann` 上没有任何东西提供
+  `graspgenx.grasp_server` 在模块级 import 的那些包。该文件因此必须对
+  `accel_supports_torch_graspgenx` 答"是"的每个加速器自足，由
+  `scripts/setup/tests/test_graspgenx_requirements.sh` 比对 wheel 的模块级 import 闭包守住。
+- **CANN 8.1 与 8.3 自动安装，其余版本留给操作者**。8.1 的三元组经 Ascend310P 真机验证；
+  8.3 的三元组取自昇腾官方配套表（`torch_npu` 2.8.0 恒要求 torch 2.8.0）并核实了 cp310/cp311
+  的 aarch64 wheel 可用性，但尚未上真机。其他 CANN 版本一律不装 NPU 后端且 setup 继续
+  （保留 LeRobot 已装的普通 Torch，不中止半装的工作区）：一个 pin 不可能通吃多个版本
+  （树内曾用的 2.10.0.post4 其实是 9.1.0 的配套）。此时 setup 结束摘要会提示"NPU 运行期待
+  手工配置"，指向[昇腾版本配套查询助手](https://www.hiascend.com/developer/download/compatibility)
+  核对 CANN / Torch / torch_npu / torchvision 配套版本，再用工作区 `venv/bin/python -m pip`
+  安装（不要用系统 pip）。新增自动安装的版本需补齐三元组、约束文件和末尾校验。
+- **CANN 约束的启用时机在 LeRobot 之后**。CANN 8.1 的 Torch 2.5.1 低于 LeRobot 声明的 `>=2.7`，
+  提前启用会让 LeRobot 自身解析直接失败；因此顺序是"LeRobot 正常解析 → 覆盖 Torch →
+  启用约束保护其后所有步骤"。8.3 的 2.8.0 在声明区间内，无需例外，但沿用同一顺序。
+  8.1 的覆盖是一个**已验证的兼容例外**，包元数据检查会报冲突。CUDA GraspGen 的约束不同：
+  预检允许安装时在 LeRobot 前启用，以防后续解析替换 PointNet2 所需 ABI。
+
+## CANN 依赖文件分工
 
 | 文件（`requirements/` 下） | 使用方式 |
 | --- | --- |
-| `lerobot-v0.6-cann-8.1-compat.txt` | 两种 profile 都安装，公共 LeRobot/PI05 兼容运行时。 |
-| `lerobot-v0.6-cann-8.1-extras.txt` | full 在 compat 之上追加数据集和运动学依赖。 |
-| `openeuler-24.03-cann-8.1.txt` | openEuler+CANN 8.1 的平台包及 Torch 2.5.1/Torch-NPU 2.5.1/TorchVision 0.20.1。 |
+| `accel-cann-8.1.txt` | 加速器轴：CANN 8.1 的 Torch 2.5.1/Torch-NPU 2.5.1/TorchVision 0.20.1（真机验证），任何 OS 上检测到昇腾即安装。 |
 | `constraints-cann-8.1.txt` | 版本约束，不是功能安装清单；通过函数局部的 `PIP_CONSTRAINT` 保护每次 pip 安装及子进程，安装结束后核验全部受保护版本。 |
+| `accel-cann-8.3.txt` | 加速器轴：CANN 8.3 的 Torch 2.8.0/Torch-NPU 2.8.0/TorchVision 0.23.0（官方配套 + aarch64 wheel 核实，未上真机），任何 OS 上检测到昇腾即安装。 |
+| `constraints-cann-8.3.txt` | 同 8.1 约束文件的职责，按 8.3 的三元组。 |
 
-`full = compat + extras + 平台依赖`，`inference = compat + 平台依赖`。
-Torch ABI、Transformers、tokenizers、safetensors、Pillow 和 OpenCV wheel 的版本约束与 profile 无关。
-外部已有的 pip constraints 会保留并共同生效；这些运行库的冲突明确报错，不先升级后降级。
-NumPy 沿用仓库既有的最终 ROS ABI 恢复步骤，安装结束后固定并核验为 1.26.4；full 的 Rerun 元数据要求 NumPy 2，因此不将 NumPy 加入全过程约束。
-Transformers 5.3.0 是当前冻结精度的兼容选择，本轮不解决其已知安全公告；模型升级和其他模型兼容性验证另行安排。
+两个 profile 都先正常安装 LeRobot（含所选 extras），再由 `accel-cann-<release>.txt` 覆盖为
+该 CANN 版本的配套版本，随后约束才生效并保护其后每一次 pip 安装。Torch ABI、Transformers、
+tokenizers、safetensors、Pillow 和 OpenCV wheel 的版本约束与 profile 无关。NumPy 沿用仓库
+既有的最终 ROS ABI 恢复步骤，安装结束后固定并核验为 1.26.4；full 的 Rerun 元数据要求
+NumPy 2，因此不将 NumPy 加入全过程约束。Transformers 5.3.0 是当前冻结精度的兼容选择，
+本轮不解决其已知安全公告；模型升级和其他模型兼容性验证另行安排。
 
 ## LeRobot 补丁分发
 

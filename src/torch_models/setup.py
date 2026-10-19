@@ -6,12 +6,16 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(include=[package_name, f"{package_name}.*"]),
-    package_data={f"{package_name}.pi05_ascend_310p": ["README.md"]},
+    package_data={
+        f"{package_name}.pi05_ascend_310p": ["README.md"],
+        f"{package_name}.graspgenx_ascend_310p": ["README.md"],
+    },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml", "README.md", "LICENSE", "NOTICE"]),
     ],
     install_requires=["setuptools", "torch", "typing_extensions"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="yidahao",
     maintainer_email="haoyida@huawei.com",

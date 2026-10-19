@@ -38,5 +38,4 @@ robot:
           sound_orientation:
             enabled: false
         skill_catalog_source_mode: development
-        skill_catalog_source_root: src/skill_catalog
         skill_catalog_profile: lekiwi_hybrid_switch_test

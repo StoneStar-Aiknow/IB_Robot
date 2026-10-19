@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -215,27 +216,39 @@ TEST(OmniBase, BodyVelocityUsesConfiguredGeometry)
   }
 }
 
+// Drive `base` at a fixed body velocity for `seconds` of simulated time,
+// integrating odometry every `period`. Returns the x after every step.
+std::vector<double> drive(
+  feetech::Bus & bus, lekiwi::OmniBase & base, lekiwi::BasePose & pose,
+  double vx, double vy, double vtheta, double seconds, std::chrono::milliseconds period)
+{
+  bus.sim().use_manual_clock();
+  EXPECT_TRUE(base.set_body_velocity(vx, vy, vtheta));
+  EXPECT_TRUE(base.update_odometry(pose));  // seed read, time origin
+  std::vector<double> xs;
+  const int steps = static_cast<int>(std::lround(seconds * 1000.0 / period.count()));
+  for (int i = 0; i < steps; ++i) {
+    bus.sim().advance_clock(period);
+    EXPECT_TRUE(base.update_odometry(pose));
+    xs.push_back(pose.x);
+  }
+  return xs;
+}
+
 TEST(OmniBase, OdometryAdvancesConsistentlyWithWheelFeedback)
 {
   feetech::Bus bus(wheel_bus_options());
   ASSERT_TRUE(bus.open());
   ASSERT_TRUE(bus.apply_all_configs().ok);
-  const lekiwi::BaseGeometry geometry = test_geometry();
-  lekiwi::OmniBase base(bus, {7, 8, 9}, geometry);
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
 
-  // Pure forward drive: pose must advance along +x after odometry seeding.
-  // The pseudo-inverse recovers the commanded body velocity per read step
-  // (each simulated read advances the wheels by one step of the commanded
-  // speed), so one integrated step equals vx.
-  ASSERT_TRUE(base.set_body_velocity(0.2, 0.0, 0.0));
+  // A quarter second of pure forward drive at the runtime's 100 Hz read rate:
+  // the pose advances by vx * t, bounded by the one-step-per-second command
+  // quantisation of each wheel. (Short enough that no wheel crosses the
+  // encoder wrap; OdometryIsContinuousAcrossEncoderWrap covers that.)
   lekiwi::BasePose pose;
-  ASSERT_TRUE(base.update_odometry(pose));  // seed read
-  ASSERT_TRUE(base.update_odometry(pose));  // first integrated step
-
-  // One integrated step recovers the commanded body velocity, bounded by the
-  // one-tick command quantisation (~1.5e-3 rad/s per wheel).
-  EXPECT_GT(pose.x, 0.0);
-  EXPECT_NEAR(pose.x, 0.2, 1e-3);
+  drive(bus, base, pose, 0.2, 0.0, 0.0, 0.25, std::chrono::milliseconds(10));
+  EXPECT_NEAR(pose.x, 0.05, 1e-3);
   EXPECT_NEAR(pose.y, 0.0, 1e-3);
   EXPECT_NEAR(pose.theta, 0.0, 1e-3);
 }
@@ -245,16 +258,37 @@ TEST(OmniBase, OdometryPureSpinAdvancesThetaOnly)
   feetech::Bus bus(wheel_bus_options());
   ASSERT_TRUE(bus.open());
   ASSERT_TRUE(bus.apply_all_configs().ok);
-  const lekiwi::BaseGeometry geometry = test_geometry();
-  lekiwi::OmniBase base(bus, {7, 8, 9}, geometry);
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
 
-  ASSERT_TRUE(base.set_body_velocity(0.0, 0.0, 0.5));
   lekiwi::BasePose pose;
-  ASSERT_TRUE(base.update_odometry(pose));  // seed
-  ASSERT_TRUE(base.update_odometry(pose));  // step
+  drive(bus, base, pose, 0.0, 0.0, 0.5, 0.25, std::chrono::milliseconds(10));
   EXPECT_NEAR(pose.x, 0.0, 1e-3);
   EXPECT_NEAR(pose.y, 0.0, 1e-3);
-  EXPECT_NEAR(pose.theta, 0.5, 1e-3);
+  EXPECT_NEAR(pose.theta, 0.125, 1e-3);
+}
+
+// Regression: odometry differenced raw encoder angles, so every wheel
+// revolution injected a spurious full turn and the pose jumped. Five seconds
+// at 0.2 m/s turns the wheels through several revolutions, from a start tick
+// close to the wrap point so the first crossing comes early.
+TEST(OmniBase, OdometryIsContinuousAcrossEncoderWrap)
+{
+  feetech::Bus bus(wheel_bus_options());
+  ASSERT_TRUE(bus.open());
+  ASSERT_TRUE(bus.apply_all_configs().ok);
+  for (const std::uint8_t id : {7, 8, 9}) {
+    bus.sim().set_position_ticks(id, 4000);
+  }
+  lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
+
+  lekiwi::BasePose pose;
+  const auto xs = drive(bus, base, pose, 0.2, 0.0, 0.0, 5.0, std::chrono::milliseconds(20));
+  for (std::size_t i = 1; i < xs.size(); ++i) {
+    ASSERT_GT(xs[i], xs[i - 1]) << "odometry went backwards at step " << i;
+    ASSERT_LT(xs[i] - xs[i - 1], 0.01) << "odometry jumped at step " << i;
+  }
+  EXPECT_NEAR(pose.x, 1.0, 1e-2);
+  EXPECT_NEAR(pose.y, 0.0, 1e-2);
 }
 
 TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
@@ -280,7 +314,59 @@ TEST(OmniBase, ReadFailureIsExplicitAndPoseNotAdvanced)
   EXPECT_DOUBLE_EQ(pose.theta, before.theta);
 }
 
+TEST(OmniBase, ProtectionPreservesOutputsAndOdometryHistory)
+{
+  for (int bits : {1, 2, 4, 8, 16, 32, 34}) {
+    SCOPED_TRACE(bits);
+    feetech::Bus bus(wheel_bus_options());
+    ASSERT_TRUE(bus.open());
+    ASSERT_TRUE(bus.apply_all_configs().ok);
+    lekiwi::OmniBase base(bus, {7, 8, 9}, test_geometry());
+    bus.sim().set_converge_step_ticks(0);
+    lekiwi::BasePose pose;
+    ASSERT_TRUE(base.update_odometry(pose));
+    const auto original_pose = pose;
+    std::array<double, 3> positions{11.0, 12.0, 13.0};
+    std::array<double, 3> velocities{21.0, 22.0, 23.0};
+    const auto original_positions = positions;
+    const auto original_velocities = velocities;
+    bus.sim().set_position_ticks(7, 900);
+    bus.sim().set_position_ticks(9, 3000);
+    bus.sim().set_response_status(9, static_cast<std::uint8_t>(bits));
+    EXPECT_FALSE(base.read_wheels(positions, velocities));
+    EXPECT_EQ(positions, original_positions);
+    EXPECT_EQ(velocities, original_velocities);
+    EXPECT_FALSE(base.update_odometry(pose));
+    EXPECT_DOUBLE_EQ(pose.x, original_pose.x);
+    EXPECT_DOUBLE_EQ(pose.y, original_pose.y);
+    EXPECT_DOUBLE_EQ(pose.theta, original_pose.theta);
+    // Return to the seed pose: rejected data must not replace last_positions_.
+    bus.sim().set_position_ticks(7, 2048);
+    bus.sim().set_position_ticks(9, 2048);
+    bus.sim().set_response_status(9, 0);
+    ASSERT_TRUE(base.update_odometry(pose));
+    EXPECT_NEAR(pose.x, original_pose.x, 1e-9);
+    EXPECT_NEAR(pose.y, original_pose.y, 1e-9);
+    EXPECT_NEAR(pose.theta, original_pose.theta, 1e-9);
+  }
+}
+
 }  // namespace
+
+TEST(OmniBaseKinematics, WheelPositionDeltasTakeTheShortPathAcrossTheWrap)
+{
+  const double turn = 2.0 * M_PI;
+  const double near_top = turn - 0.05;
+  // Forward across the wrap: top of the range -> just past zero.
+  const auto forward = lekiwi::wheel_position_deltas({0.03, 1.0, 0.0}, {near_top, 0.9, 0.0});
+  EXPECT_NEAR(forward[0], 0.08, 1e-9);
+  EXPECT_NEAR(forward[1], 0.1, 1e-9);
+  EXPECT_NEAR(forward[2], 0.0, 1e-9);
+  // Backward across the wrap: just past zero -> top of the range.
+  const auto backward = lekiwi::wheel_position_deltas({near_top, 0.9, 0.0}, {0.03, 1.0, 0.0});
+  EXPECT_NEAR(backward[0], -0.08, 1e-9);
+  EXPECT_NEAR(backward[1], -0.1, 1e-9);
+}
 
 TEST(OmniBaseKinematics, PureFunctionsRoundTripWithoutBus)
 {

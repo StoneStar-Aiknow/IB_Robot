@@ -19,6 +19,7 @@ import json
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from typing import Any
 
@@ -60,6 +61,7 @@ from robot_runtime.contract import (
     STOP_SERVICE,
 )
 from robot_runtime.interface_description import build_description, validate_description
+from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.profile import load_profile
 from robot_runtime.state import RuntimeState
@@ -98,6 +100,20 @@ _RELIABLE_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
 )
+
+#: Public streams this runtime proves ready by observing them on the ROS graph.
+#: Vendor-native sensors (cameras, lidar, IMUs) are deliberately excluded:
+#: subscribing to them inside this process would compete with motion control on
+#: a board that is already the bottleneck.
+OBSERVED_INTERFACES = ("audio.speech",)
+
+#: Frame id carried by project speech chunks; consumers must not depend on it.
+_SPEECH_FRAME_ID = "enhanced_audio"
+
+
+#: Upper bound for one forwarded vendor chunk. The vendor streams ~100 ms
+#: blocks; this only stops a malformed message from becoming an unbounded publish.
+_SPEECH_MAX_CHUNK_BYTES = 16000
 
 #: How long to wait before asking for audio focus again after a refusal. A
 #: refusal means another source holds the speaker, so retrying every tick would
@@ -188,6 +204,18 @@ class AimdkRuntimeNode(Node):
             validate_description(description)
         else:
             description = build_description(self._profile, simulated=self._simulated)
+        self._speech_cb = MutuallyExclusiveCallbackGroup()
+        self._speech_description = description
+        self._speech_enabled = False
+        # Readiness is reported the same way the facade and mock runtimes report
+        # it: by observing the declared endpoint, not by trusting that we
+        # published to it. Only the interfaces this runtime can afford to
+        # observe are handed to the monitor.
+        self._interface_monitor = InterfaceMonitor(
+            self,
+            {"interfaces": {k: v for k, v in description["interfaces"].items() if k in OBSERVED_INTERFACES}},
+            callback_group=self._speech_cb,
+        )
         modes = ModeModel(ModeModelConfig.from_profile(self._profile))
         self._state = RuntimeState(
             name=str(self._profile["runtime"]["name"]),
@@ -196,6 +224,7 @@ class AimdkRuntimeNode(Node):
             modes=modes,
             on_change=self._publish_status,
             interface_description=description,
+            interface_states=self._interface_monitor.states,
         )
         self._modes = modes
 
@@ -403,6 +432,7 @@ class AimdkRuntimeNode(Node):
                 )
         if self._state.has_capability("interaction.audio_capture") and topics.get("audio_capture"):
             self._setup_audio(AudioCapture, topics, caller, RequestAudioFocus, AbandonAudioFocus)
+        self._setup_processed_audio_if_declared(topics)
         if self._state.has_capability("localization.pose") and topics.get("localization_pose"):
             self._setup_localization(topics)
 
@@ -465,6 +495,165 @@ class AimdkRuntimeNode(Node):
                 AudioDataStamped, str(audio.get("play_topic", "/audio/play")), self._on_audio_play, _SENSOR_QOS
             )
             self._focus_timer = self.create_timer(0.1, self._audio_focus_tick, callback_group=self._client_cb)
+
+    def _public_qos(self, spec: dict[str, Any]) -> QoSProfile:
+        """QoS for one project-facing endpoint, taken from its own declaration."""
+        qos = spec.get("qos") or {}
+        return QoSProfile(
+            reliability=(
+                ReliabilityPolicy.RELIABLE if qos.get("reliability") == "reliable" else ReliabilityPolicy.BEST_EFFORT
+            ),
+            durability=(
+                DurabilityPolicy.TRANSIENT_LOCAL
+                if qos.get("durability") == "transient_local"
+                else DurabilityPolicy.VOLATILE
+            ),
+            history=HistoryPolicy.KEEP_LAST,
+            depth=int(qos.get("depth", 10)),
+        )
+
+    def _wants_processed_audio(self, topics: dict[str, Any]) -> bool:
+        """Whether this profile asks for the vendor's enhanced speech stream.
+
+        The same gate the raw capture path uses: the capability must be
+        declared, and the profile must name the vendor topic.
+        """
+        return bool(self._state.has_capability("interaction.audio_capture") and topics.get("processed_audio"))
+
+    def _setup_processed_audio_if_declared(self, topics: dict[str, Any]) -> bool:
+        """Wire the enhanced speech path only when the profile asked for it."""
+        if not self._wants_processed_audio(topics):
+            return False
+        self._setup_processed_audio(topics)
+        return True
+
+    def _setup_processed_audio(self, topics: dict[str, Any]) -> None:
+        """Republish the vendor's processed (AEC) speech stream as project chunks.
+
+        The vendor message type stays behind this node, exactly like the raw
+        capture and playback paths. PCM and the VAD boundary travel in one
+        project message so no consumer has to reconstruct an ordering that DDS
+        does not promise across two topics.
+        """
+        from aimdk_msgs.msg import ProcessedAudioOutput  # noqa: PLC0415 - vendor import stays local
+        from audio_common_msgs.msg import AudioDataStamped  # noqa: PLC0415
+
+        from ibrobot_msgs.msg import SpeechAudioChunk  # noqa: PLC0415
+
+        interfaces = self._speech_description.get("interfaces") or {}
+        speech = interfaces.get("audio.speech")
+        if speech is None:
+            raise RuntimeError(
+                "vendor.topics.processed_audio is declared but the profile publishes no "
+                "audio.speech interface; declare the project endpoint or remove the topic"
+            )
+        # The declared capability is a promise about what consumers can rely on.
+        if speech.get("message_type") != "ibrobot_msgs/msg/SpeechAudioChunk":
+            raise RuntimeError(
+                f"audio.speech must be ibrobot_msgs/msg/SpeechAudioChunk, got {speech.get('message_type')!r}"
+            )
+
+        self._speech_chunk_type = SpeechAudioChunk
+        self._speech_source_id = uuid.uuid4().hex
+        self._speech_sequence = 0
+        self._speech_vendor_sequence: int | None = None
+        self._speech_vendor_stream_id: int | None = None
+        self._speech_enabled = True
+        self._speech_pub = self.create_publisher(
+            SpeechAudioChunk, str(speech["endpoint"]), self._public_qos(speech), callback_group=self._speech_cb
+        )
+        # The diagnostic republish is a project-facing endpoint, so it is
+        # declared like any other public interface instead of being smuggled
+        # through the vendor section: that keeps it visible to the runtime
+        # description and lets it carry its own QoS. Not declared means not
+        # published.
+        capture = interfaces.get("audio.enhanced_capture")
+        if capture is None:
+            self._speech_capture_pub = None
+        else:
+            if capture.get("message_type") != "audio_common_msgs/msg/AudioDataStamped":
+                raise RuntimeError(
+                    "audio.enhanced_capture must be audio_common_msgs/msg/AudioDataStamped, "
+                    f"got {capture.get('message_type')!r}"
+                )
+            self._speech_capture_pub = self.create_publisher(
+                AudioDataStamped, str(capture["endpoint"]), self._public_qos(capture)
+            )
+        self.create_subscription(
+            ProcessedAudioOutput,
+            str(topics["processed_audio"]),
+            self._on_processed_audio,
+            # BEST_EFFORT + VOLATILE can consume a TRANSIENT_LOCAL publisher and
+            # deliberately does not ask for history: a latched utterance from
+            # before this runtime started must not be recognized as new speech.
+            self._vendor_qos("processed_audio", reliability="best_effort", durability="volatile"),
+            callback_group=self._speech_cb,
+        )
+        # Availability heartbeat, not speech: it lets the runtime description
+        # report the interface before the wake word, and carries no PCM.
+        self.create_timer(0.5, self._publish_speech_heartbeat, callback_group=self._speech_cb)
+
+    def _next_speech_sequence(self) -> int:
+        """Allocate the project sequence, surfacing vendor-side loss when visible."""
+        self._speech_sequence += 1
+        return self._speech_sequence
+
+    def _publish_speech_heartbeat(self) -> None:
+        if not self._speech_enabled:
+            return
+        chunk = self._speech_chunk_type()
+        chunk.header.stamp = self.get_clock().now().to_msg()
+        chunk.header.frame_id = _SPEECH_FRAME_ID
+        chunk.source_id = self._speech_source_id
+        chunk.sequence = self._next_speech_sequence()
+        chunk.state = 0
+        self._speech_pub.publish(chunk)
+
+    def _on_processed_audio(self, message: Any) -> None:
+        """Map one vendor processed-audio message onto one project speech chunk."""
+        data = bytes(message.audio_data)
+        chunk = self._speech_chunk_type()
+        chunk.header.stamp = message.header.stamp
+        chunk.header.frame_id = _SPEECH_FRAME_ID
+        chunk.source_id = self._speech_source_id
+        # The vendor IDL documents MessageHeader.sequence as a consecutively
+        # increasing ID, but the X2 firmware currently sends a constant
+        # (observed on hardware, 2026-10-15), so an upstream BEST_EFFORT loss is
+        # NOT observable on X2. Only a strict forward skip is treated as evidence
+        # of one, because an earlier "anything but last + 1" test flagged every
+        # message against that constant field and dropped all speech; constant,
+        # repeated and reset values are not gaps. stream_id names the vendor
+        # stream, and a change of it invalidates the previous continuation. On a
+        # detected skip one project sequence number is left unused so the
+        # consumer drops the affected segment instead of joining audio across
+        # the hole.
+        stream_id = int(getattr(message, "stream_id", 0) or 0)
+        vendor_sequence = int(message.header.sequence)
+        if stream_id != self._speech_vendor_stream_id:
+            self._speech_vendor_stream_id = stream_id
+            self._speech_vendor_sequence = None
+        elif self._speech_vendor_sequence is not None and vendor_sequence > self._speech_vendor_sequence + 1:
+            self._speech_sequence += 1
+            self.get_logger().warning(
+                f"vendor speech sequence jumped {self._speech_vendor_sequence} -> {vendor_sequence}; "
+                "marking the project stream so the consumer drops the affected segment"
+            )
+        self._speech_vendor_sequence = vendor_sequence
+        chunk.sequence = self._next_speech_sequence()
+        chunk.state = int(message.audio_vad_state.value)
+        # Malformed PCM is forwarded, not dropped here: the consumer aborts the
+        # affected segment instead of joining audio across a gap. It is still
+        # bounded so a bad vendor message cannot become an unbounded publish.
+        chunk.audio_data = list(data[:_SPEECH_MAX_CHUNK_BYTES])
+        self._speech_pub.publish(chunk)
+        if self._speech_capture_pub is not None and data:
+            from audio_common_msgs.msg import AudioDataStamped  # noqa: PLC0415
+
+            stamped = AudioDataStamped()
+            stamped.header.stamp = message.header.stamp
+            stamped.header.frame_id = _SPEECH_FRAME_ID
+            stamped.audio.data = list(data[:_SPEECH_MAX_CHUNK_BYTES])
+            self._speech_capture_pub.publish(stamped)
 
     def _setup_localization(self, topics: dict[str, Any]) -> None:
         from nav_msgs.msg import Odometry  # noqa: PLC0415
@@ -1448,7 +1637,10 @@ class AimdkRuntimeNode(Node):
                 # rather than on its own (see projection.clock_skew_estimate).
                 self._clock_samples.append((time.monotonic(), skew_s))
         self._note_arbitration_holder(holder, holder_priority)
-        self._set_fault("balance", projection.fsm_fault(fsm_state))
+        self._publish_diagnostics(
+            [(projection.fsm_diagnostic(fsm_state), str(fsm_state), DiagnosticStatus.OK)],
+            prefix="aimdk/fsm_state",
+        )
 
     def _note_arbitration_holder(self, holder: str, holder_priority: int) -> None:
         """Apply the holder the platform reports with every state message.
@@ -1546,14 +1738,14 @@ class AimdkRuntimeNode(Node):
             prefix="aimdk/alert",
         )
 
-    def _publish_diagnostics(self, entries: list[tuple[str, str, int]], *, prefix: str) -> None:
+    def _publish_diagnostics(self, entries: list[tuple[str, str, int | bytes]], *, prefix: str) -> None:
         array = DiagnosticArray()
         array.header.stamp = self.get_clock().now().to_msg()
         for detail, code, level in entries:
             status = DiagnosticStatus()
             status.name = f"{prefix}/{code}"
             status.hardware_id = self._state.name
-            status.level = bytes([level])
+            status.level = level if isinstance(level, bytes) else bytes([level])
             status.message = detail
             status.values = [KeyValue(key="code", value=code)]
             array.status.append(status)

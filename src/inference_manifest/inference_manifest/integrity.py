@@ -292,6 +292,9 @@ def _deployment_payload(
         "artifacts": _artifact_identity(deployment),
         "bindings": _binding_identity(deployment),
         "device_links": [_model_value(link) for link in deployment.device_links],
+        # Preserve legacy identities when the optional parameters are absent.
+        # This is cache identity, not a user-supplied file checksum.
+        **({"extra_parameters": _model_value(deployment.extra_parameters)} if deployment.extra_parameters else {}),
     }
 
 
@@ -371,6 +374,7 @@ def _runtime_profile_payload(
         "bundle_digest": bundle_digest,
         "deployment_name": deployment_name,
         "profiles": values,
+        **({"extra_parameters": _model_value(deployment.extra_parameters)} if deployment.extra_parameters else {}),
     }
 
 

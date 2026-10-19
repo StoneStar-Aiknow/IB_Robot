@@ -57,7 +57,7 @@ result 的 `actual_duration_sec` 报的是**回放**时长，不是采集时长�
 使用最新整帧；YOLOX 成功但没有合格 person 时，executor 构造图像中心方框，
 边长为 `min(width, height) / 1.25`，再用恰好一个框调用 PEAR。任务首次完成 YOLOX 成功响应前不调用
 PEAR；之后的 YOLOX 刷新失败继续使用任务内最近一次成功结果。服务不可用、RPC 超时、模型失败和无效图像
-不会创建初始 fallback。像素处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。
+不会创建初始 fallback。模型语义预处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。该节点订阅的是已解码的 `sensor_msgs/Image`；本包唯一的像素代码是 `compressed_image_decode.py` 的传输层解码（JPEG/PNG → `bgr8`），因为模型服务只收原始 `Image`，编码流必须有人在调用侧解。
 
 任务 deadline 是相机计数和视觉推理的硬边界：边界后的帧不计数、不入队，worker 不提交过期
 请求，边界后返回的响应也不计入任务。每次调用分别跟踪 RPC deadline 和任务 deadline；只有
@@ -98,6 +98,60 @@ binding 或 executor identity。
 旧的长脚本实现及 legacy-only replay benchmark 已删除。当前监督式客户端只负责 live registry preflight、
 goal 发送和反馈收敛，抓取行为仍只在正式 phases 中实现；`test_pick_single_source.py` 会确保旧脚本不被
 重新引入，且客户端保持为唯一的 supervised-direct 入口。
+
+## X2 照镜子：常驻感知流与镜像会话
+
+`robot_config` 的 `aimdk_x2_magicmirror` 配置启动以下三个节点（launch 接线与配置项见 `robot_config`
+README 的“X2 照镜子”一节）：
+
+```text
+头部压缩相机流 -> motion_imitation_stream_node --PearFrame--> motion_imitation_mock_node
+                                                              --arm_command_preview--> mirror_session_node
+mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ joint.hand_stream（20 路）
+```
+
+| 节点 | 职责 | 主要接口 |
+| --- | --- | --- |
+| `motion_imitation_stream_node` | 常驻流水线：解码压缩图像，低频刷新 YOLOX 人框，对最新帧调用 PEAR 并逐帧发布 | 发布 `ibrobot_msgs/PearFrame`、`ibrobot_msgs/ActorState` 和 JSON 状态；不发布任何运动指令 |
+| `motion_imitation_mock_node` | 模拟重定向（播放随包动画 `data/x2_mock_imitation/`）与模拟安全（关节限位钳制、限速） | 订阅 `PearFrame`（只作存活判据），发布 `/motion_imitation_mock/arm_command_preview`；`~/play`（`std_srvs/SetBool`） |
+| `mirror_session_node` | WAIT / STANDBY / MIRRORING 状态机、运行时模式的接管与释放；手臂与手指通道的唯一发布者 | `~/set_session`（`std_srvs/SetBool`，只由 Gateway 的 `mirror_session` 执行器调用）、`~/status`（JSON）、`~/arm_command_preview` / `~/hand_command_preview` |
+
+解码器按名字选择（`frame_decoder.py`），当前只注册了 `mock_cpu`（OpenCV 软件解码）；选人逻辑在
+`actor_selector.py`，当前取置信度最高的人且不跨帧保持身份。两者与模拟节点的 `_retarget` /
+`_apply_safety` 都可以单独替换，替换时保持各自的输出契约。
+
+会话与运行时的约定（`mirror_session/core.py`、`mirror_session/runtime.py`）：
+
+- 节点启动后处于 WAIT。`mirror_start` 由 Gateway 先把运行时切到控制模式 `model_inference` 对应的
+  `policy_stream`，会话再接管该模式；会话从不自行从 idle 申请 `policy_stream`。
+- 失去模式（运行时切到其他模式、stop 锁存、故障、状态超过 2 s 未更新）时立即关闭输出闸门并进入 WAIT，
+  不请求 idle，也不自动恢复，需要重新 `mirror_start`。
+- 所有回到 idle 的路径都经过 `release_to_idle`：只有观察到运行时处于 `policy_stream` 且没有 stop 锁存时
+  才请求 idle（请求 idle 会清除 stop 锁存）。`mirror_stop` 在观察到运行时回到 idle 后才报成功；收尾
+  预算为 `stop_timeout_sec`（默认 4.5 s）减去 2 s 的释放预留。Gateway 启动时检查 `mirror_stop` 的技能
+  超时至少比它多 0.5 s，保证会话的应答赶在 Gateway 超时之前。常量的唯一来源是
+  `embodied_common/mirror_session_contract.py`。
+- `publish_enabled`（默认 `false`）为 `false` 时，闸门输出只发到会话的 preview 话题，不发到运行时通道；
+  接管与释放照常执行。
+- `mirror_session/hooks.py` 的 `SessionHooks` 是镜像行为的扩展点（起止判据、窗口流水线、收尾），默认值
+  均取最保守的行为。启用 `mock_playback` 时窗口流水线为 `MockPlaybackHooks`：每轮通过 `~/play` 从第 0 帧
+  播放模拟动画，手指 20 路恒为 0。
+
+已知限制：
+
+- 模拟安全的限速不覆盖每轮的第一条命令。`~/play` 开始播放、或 PEAR 流中断超过 `input_staleness_sec`
+  后恢复时，动画从第 0 帧重新开始，第一条命令只做限位钳制，可能从当前保持的位姿直接跳到第 0 帧；随包动画
+  中任一帧与第 0 帧的单关节差最大约 1.41 rad。
+- 限速使用配置的关节额定速度（取自厂商 URDF），步长按实际经过的时间计算，定时器延迟时单步允许的变化相应变大。
+- 回到 idle 需要运行时仍能应答。整个 launch 被中断时运行时可能先退出，会话无法请求 idle；launch 自身关闭
+  期间也不会运行 `mirror_session_release`。停止 launch 前应先执行 `mirror_stop`。
+- 这一版模仿状态内不支持中断。`mirror_start` 应答后 Gateway 和 Agent 都没有活动任务，「停」「停下」
+  「stop」等通用停止词和 Agent 取消都找不到作用对象，镜子继续运行；结束只能靠 `mirror_stop`，要明确说出，
+  例如「停止照镜子」。状态内中断作为后续需求单独跟踪。
+- 急停用 `/runtime/stop`：运行时锁存，会话关闭输出闸门进入 WAIT，机器人停住。锁存期间 Gateway 拒绝所有
+  技能，包括 `mirror_stop`。复位要在 `/runtime/set_mode` 上请求 idle，这会清除锁存：
+  `ros2 service call /runtime/set_mode ibrobot_msgs/srv/SetRuntimeMode "{mode: idle}"`。之后会话停在 WAIT，
+  直到下一次 `mirror_start`。
 
 ## 架构位置
 

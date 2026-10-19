@@ -165,6 +165,9 @@ class EmbodiedConfig:
     arm_surface: bool = True
     entry_mode: str = "hermes"
     agent: dict[str, Any] = field(default_factory=dict)
+    # Start robot-skill's resident ROS bridge together with the Skill Gateway
+    # (embodied_bringup); it never affects execution identity or the digest.
+    resident_cli_bridge: bool = True
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"
@@ -211,13 +214,14 @@ class VoiceASRConfig:
     enabled: bool = False
     active_mode: str = "continuous"
     language: str = "zh"
-    bundle_path: str = "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    bundle_path: str = "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
     deployment: str = "torch_cpu"
     max_recording_duration: float = 10.0
     vad_sensitivity: float = 0.6
     vad_bundle_path: str = "models/silero-vad"
     vad_deployment: str = "torch_cpu"
     realtime_pre_roll_seconds: float = 0.5
+    final_tail_padding_seconds: float = 1.5
     publish_partial: bool = True
     output_topic: str = "/voice_command"
     sample_rate: int = 16000
@@ -226,6 +230,13 @@ class VoiceASRConfig:
     audio_input_channel: int = 1
     vad_input_channel: int | None = None
     exit_on_init_failure: bool = True
+    #: shared_audio = 本地 Silero VAD + 共享音频流；external_vad = 音源自带分段事件。
+    input_mode: str = "shared_audio"
+    #: external_vad 通过 audio.speech 逻辑接口消费 SpeechAudioChunk；chunk_topic 是独立节点 fallback。
+    chunk_topic: str = "/audio/speech_chunk"
+    audio_input: dict[str, Any] | None = None
+    external_min_samples: int = 3200
+    external_idle_timeout: float = 2.0
 
 
 @dataclass
@@ -234,6 +245,9 @@ class AudioIOConfig:
 
     enabled: bool = False
     microphone: str = ""
+    #: alsa = 启动共享 audio_capture_node（需要麦克风外设）；
+    #: runtime = 采集侧 topic 由机器人 runtime 提供，不启动 ALSA 节点。
+    source: str = "alsa"
     capture_topic: str = "/audio/capture"
     capture_stamped_topic: str = "/audio/capture_stamped"
     audio_info_topic: str = "/audio/info"

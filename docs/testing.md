@@ -64,6 +64,10 @@ source .shrc_local && pytest tests scripts .agents
 - 需要 ROS 图的测试应断言 `IBROBOT_TEST_ROS_DOMAIN_ID` 已设置，而不是直接读 `ROS_DOMAIN_ID`，这样"为本进程分配过域"和"开发者碰巧 export 了 `ROS_DOMAIN_ID`"可以区分开。
 - 调试时用 `DISABLE_ROS_ISOLATION=1` 关闭分配；此时依赖隔离的测试会失败退出，而不是静默共享域 0。
 
+根 `conftest.py` 还会强制设置 `IBROBOT_ROBOT_SKILL_DAEMON=0`：`robot-skill` 会把 ROS 传输交给已运行的按用户常驻
+`robot-skill-daemon`，开发者若 export 了 `spawn` 还会自行拉起它，而它会比 pytest 进程和已分配的域活得更久。测试中运行
+真实 CLI 时一律使用进程内 bridge；daemon 本身由 `robot_skill_cli/test/test_bridge_daemon.py` 用临时 socket 覆盖。
+
 ## 4. ROS 测试必须能退出
 
 测试"全部通过"和进程"能退出"是两件事。rclpy 把 action 的 `execute_callback` 放在 `ThreadPoolExecutor` 的 worker 线程上，而 `concurrent.futures` 注册的 atexit 钩子会**无超时地** join 这些 worker。只要有一个回调还在跑，pytest 打印完 `50 passed` 之后解释器就永远退不出去，`colcon test` 会一直等这个包，最后整条流水线超时被杀——而测试报告上一条失败都没有。

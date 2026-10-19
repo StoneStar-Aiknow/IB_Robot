@@ -1,5 +1,9 @@
 # inference_service
 
+`cloud_inference.launch.py` 在 inference/recording 两个分支的节点执行前检查本机受管 DDS
+环境。错误按原因、实际状态与建议报告，环境不会被自动改写。这不是跨机通信认证，其他
+独立推理入口未自动获得此检查。详见 [DDS 配置工具](../../scripts/dds/README.md)。
+
 `inference_service` 是 IB-Robot 的统一推理运行时。它以一个模型 bundle 和一个命名
 deployment 为输入，统一承载 Torch、Ascend、Hisilicon、RKNN 与 HMM 后端。策略模型额外使用稳定的
 pipeline ID，并支持单体和边云分布式执行。
@@ -622,6 +626,14 @@ Canonical backend 只有以下五个：
 稳定的 `(model_type, backend, device)` provider；例如 PI0.5 Ascend310P 使用
 `(pi05, torch, npu)`。通用 runtime 不按模型名称维护平台分支，provider 自己负责模型
 配置、平台校验和运行时准备。
+Provider 可选的 `preprocess_inputs(inputs, config=...)` 在 LeRobot processor 之前执行
+模型自己的 CPU 输入优化，仍计入 pipeline 的 preprocess 耗时；通用 session 不包含模型图像规则。
+可选的 `configure_processors(preprocessor=..., postprocessor=..., config=...)` 在加载阶段
+配置模型特定的 LeRobot steps，例如在上传之前检查语言容量、在 CPU 上处理小动作张量。
+Deployment 的 `extra_parameters` 是模型拥有的通用 JSON 参数。原生 Torch session 将其副本
+传给可选 `resolve_load_options(config=..., extra_parameters=...)`，返回值用于本次模型构造。
+Session 不解释模型字段；没有对应 provider consumer 时拒绝非空参数，且不允许返回值覆盖
+严格权重加载/本地加载约束。参数参与部署与性能配置身份，不要求额外参数文件或内容校验值。
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
 Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间

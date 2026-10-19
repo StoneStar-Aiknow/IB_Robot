@@ -1,0 +1,38 @@
+# Ascend CANN 8.1 accelerator dependencies. Selected by
+# scripts/setup/accels/cann.sh and installed on every OS when the accelerator
+# axis resolves to cann: an Ascend NPU needs this Torch ABI whether the host
+# runs openEuler Embedded or Ubuntu.
+#
+# Pins the ABI set supported by CANN 8.1 on Ascend310P instead of the Torch
+# 2.10 set the lerobot editable install would otherwise resolve. The constraint
+# file is also exported as PIP_CONSTRAINT for every transaction; keeping it here
+# as well means a direct install of this file cannot drift either.
+-c constraints-cann-8.1.txt
+# Install, not merely constrain, every version constraints-cann-8.1.txt pins.
+# The constraint is activated only after LeRobot resolves, so a package LeRobot
+# already installed at another version would otherwise keep it: a constraint
+# does not retroactively downgrade. Measured on an Ascend 310P — transformers
+# stayed at LeRobot's 5.5.4 and verify_cann_runtime_versions failed, while
+# tokenizers, safetensors and pillow happened to land correctly only because
+# later steps reinstalled them under the active constraint. Keep this list in
+# step with the constraint file; test_cann_torch_versions.sh asserts that.
+torch==2.5.1
+torch_npu==2.5.1
+torchvision==0.20.1
+# Non-Torch halves of the validated CANN 8.1 runtime. transformers is pinned to
+# preserve the measured PI0.5 behaviour; upgrading it is separate
+# model-compatibility work, not a side effect of dependency resolution.
+transformers==5.3.0
+tokenizers==0.22.2
+safetensors==0.8.0
+pillow==10.3.0
+opencv-python-headless==4.11.0.86
+# Required by the CANN 8.1 TBE Python adapter; torch_npu 2.5.1 does not
+# declare it even though graph compilation imports it in a child interpreter.
+decorator
+# LeRobot's own resolution installs torchcodec on aarch64 (its base deps ask
+# for >=0.11.0), and that wheel's extension is ABI-bound to a newer Torch while
+# declaring no torch requirement at all, so pip leaves it in place after this
+# file downgrades Torch. accels/cann.sh::accel_post_requirements uninstalls it
+# so LeRobot falls back to the PyAV decoder installed here.
+av>=15,<16

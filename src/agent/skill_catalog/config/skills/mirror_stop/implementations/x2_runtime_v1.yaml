@@ -1,0 +1,11 @@
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: mirror_session
+binding:
+  # The session command sent through ~/set_session (start = true, stop = false).
+  command: stop
+required_args: []
+# The Gateway refuses to start unless this is at least mirror_session.stop_timeout_sec
+# (aimdk_x2_magicmirror.yaml, 4.5 s) plus 0.5 s, so the session's answer arrives in time.
+timeout_sec: 5.0

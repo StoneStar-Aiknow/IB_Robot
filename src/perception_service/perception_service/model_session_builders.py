@@ -85,14 +85,7 @@ def build_graspgen_session(
     model_type = context.model_type
     options = context.runtime_options
     if context.backend == "torch":
-        if options:
-            raise ValueError(f"GraspGen Torch deployment does not accept runtime options: {sorted(options)}")
-        profile = context.backend_profile
-        if not isinstance(profile, TorchRuntimeProfile) or profile.device != "cuda":
-            raise RuntimeError("GraspGen Torch requires a typed cuda profile")
-        return TorchModelSession(
-            lambda runtime_context: _load_torch_module(model_type, runtime_context),
-        )
+        return _cuda_torch_session(context, "GraspGen")
     if context.backend != "ascend":
         raise RuntimeError(f"{model_type} requires a Torch CUDA or ACL deployment")
     device_id = _ascend_device_id(
@@ -107,6 +100,52 @@ def build_graspgen_session(
         config=adapter.config,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
     )
+
+
+def build_graspgenx_session(
+    context: RuntimeContext,
+    *,
+    adapter,
+    providers: RuntimeProviders | None = None,
+):
+    """Build the GraspGenX session: the official sampler on CUDA, ours on a 310P.
+
+    The npu deployment is a separate branch rather than a looser check in
+    `_cuda_torch_session`, which GraspGen shares: widening that would hand the
+    npu device to a model with no evidence for it.
+    """
+
+    del adapter, providers
+    if context.backend != "torch":
+        raise RuntimeError(f"{context.model_type} requires a Torch deployment")
+    profile = context.backend_profile
+    if isinstance(profile, TorchRuntimeProfile) and profile.device == "npu":
+        return _npu_torch_session(context, "GraspGenX")
+    return _cuda_torch_session(context, "GraspGenX")
+
+
+def _npu_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:
+    """A Torch session on an Ascend device, taking no runtime options.
+
+    The device id is not a runtime option here as it is for the ACL backend:
+    Torch-NPU owns the device, and the offline model this session drives runs
+    on Torch's own stream rather than a context of its own.
+    """
+    if context.runtime_options:
+        raise ValueError(f"{label} Torch deployment does not accept runtime options: {sorted(context.runtime_options)}")
+    model_type = context.model_type
+    return TorchModelSession(lambda runtime_context: _load_torch_module(model_type, runtime_context))
+
+
+def _cuda_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:
+    """A Torch session for a model that runs only on CUDA and takes no runtime options."""
+    if context.runtime_options:
+        raise ValueError(f"{label} Torch deployment does not accept runtime options: {sorted(context.runtime_options)}")
+    profile = context.backend_profile
+    if not isinstance(profile, TorchRuntimeProfile) or profile.device != "cuda":
+        raise RuntimeError(f"{label} Torch requires a typed cuda profile")
+    model_type = context.model_type
+    return TorchModelSession(lambda runtime_context: _load_torch_module(model_type, runtime_context))
 
 
 def register_perception_session_builders(registry: SessionBuilderRegistry | None = None) -> None:
@@ -146,5 +185,14 @@ def register_perception_session_builders(registry: SessionBuilderRegistry | None
                 build_graspgen_session,
             )
 
+    key = ("tensor_model", "graspgenx", "generate_grasps", "torch")
+    if registry.get(*key) is None:
+        registry.register(*key, build_graspgenx_session)
 
-__all__ = ["build_graspgen_session", "build_perception_session", "register_perception_session_builders"]
+
+__all__ = [
+    "build_graspgen_session",
+    "build_graspgenx_session",
+    "build_perception_session",
+    "register_perception_session_builders",
+]

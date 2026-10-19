@@ -465,16 +465,9 @@ def test_led_priority_stays_in_a_band_that_leaves_headroom():
 # --- platform state fields --------------------------------------------------
 
 
-def test_balance_fsm_safe_state_is_a_fault_and_normal_states_are_not():
-    """SAFE is the platform protecting itself; ACTIVE through it is a lie."""
-    assert projection.fsm_fault(projection.FSM_STATE_STABLE) is None
-    assert projection.fsm_fault(projection.FSM_STATE_MOVING) is None
-    # A firmware that does not populate the field must not degrade the runtime.
-    assert projection.fsm_fault(projection.FSM_STATE_UNKNOWN) is None
-    safe = projection.fsm_fault(projection.FSM_STATE_SAFE)
-    assert safe is not None and "SAFE" in safe
-    assert projection.fsm_fault(projection.FSM_STATE_STARTING) is not None
-    assert projection.fsm_fault(projection.FSM_STATE_TEST) is not None
+def test_fsm_diagnostic_preserves_the_raw_vendor_value():
+    """FSM values are observations, not lifecycle or command-admission rules."""
+    assert projection.fsm_diagnostic(4) == "platform balance controller reported fsm_state=4"
 
 
 def test_platform_speed_envelope_only_tightens_the_profile_ceiling():

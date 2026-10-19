@@ -26,6 +26,22 @@ from embodied_common.dispatch_binding import (
 from ibrobot_msgs.action import ImitateHumanMotion, PrimitiveCommand
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from ibrobot_msgs.srv import PearParameterPredict, YoloXDetect
+from manipulation_execution.hri_vision import (
+    PEAR_OUTPUT_FIELDS,
+    put_latest,
+)
+from manipulation_execution.hri_vision import (
+    center_fallback_detection as _center_fallback_detection,
+)
+from manipulation_execution.hri_vision import (
+    select_person_detection as _select_person_detection,
+)
+from manipulation_execution.hri_vision import (
+    validated_person_confidence_threshold as _validated_person_confidence_threshold,
+)
+from manipulation_execution.hri_vision import (
+    validated_yolox_refresh_interval as _validated_yolox_refresh_interval,
+)
 from manipulation_execution.imitate_human_motion_executor import (
     CANCEL_CLEANUP_TIMEOUT,
     AnimationPlan,
@@ -37,7 +53,6 @@ from manipulation_execution.imitate_human_motion_executor import (
 from manipulation_execution.imitation_retargeting import retarget_capture
 
 _PREPARE_DURATION_SEC = 2.5
-_PEAR_CROP_EXPANSION = 1.25
 
 # Hard ceiling on the recorded PEAR window, in frames. The capture window is
 # already bounded -- 20 s at most, and the camera tops out around 30 fps -- so a
@@ -66,52 +81,6 @@ _PREPARE_JOINT_POSITIONS = {
     "4": 0.0,
     "5": -1.5708,  # -90 deg
 }
-
-
-def _validated_person_confidence_threshold(value: object) -> float:
-    threshold = float(value)
-    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
-        raise ValueError("person_confidence_threshold must be finite and within [0, 1]")
-    return threshold
-
-
-def _validated_yolox_refresh_interval(value: object) -> float:
-    interval = float(value)
-    if not math.isfinite(interval) or interval <= 0.0:
-        raise ValueError("yolox_refresh_interval_sec must be finite and greater than zero")
-    return interval
-
-
-def _select_person_detection(detections: list[Detection2D], threshold: float) -> Detection2D | None:
-    persons = [
-        detection
-        for detection in detections
-        if detection.label == "person"
-        and math.isfinite(float(detection.confidence))
-        and float(detection.confidence) >= threshold
-    ]
-    return max(persons, key=lambda detection: float(detection.confidence), default=None)
-
-
-def _center_fallback_detection(image: Image) -> Detection2D:
-    width = int(image.width)
-    height = int(image.height)
-    if width <= 0 or height <= 0:
-        raise ValueError("image dimensions must be positive")
-    center_x = width / 2.0
-    center_y = height / 2.0
-    half_side = min(width, height) / _PEAR_CROP_EXPANSION / 2.0
-    detection = Detection2D()
-    detection.header = image.header
-    detection.label = "person"
-    detection.confidence = 0.0
-    detection.bbox = [
-        center_x - half_side,
-        center_y - half_side,
-        center_x + half_side,
-        center_y + half_side,
-    ]
-    return detection
 
 
 class _CaptureRecorder:
@@ -538,26 +507,13 @@ class ImitateHumanMotionExecutorNode(Node):
 
     @staticmethod
     def _put_latest(frame_queue, frame) -> None:
-        while True:
-            try:
-                frame_queue.put_nowait(frame)
-                return
-            except queue.Full:
-                try:
-                    frame_queue.get_nowait()
-                except queue.Empty:
-                    continue
+        # The shared helper reports whether it evicted a frame; a bounded
+        # capture window has no use for that, so it is discarded here.
+        put_latest(frame_queue, frame)
 
-    _PEAR_OUTPUT_FIELDS = (
-        "smplx_pose_raw",
-        "smplx_scale",
-        "smplx_shape",
-        "smplx_expression",
-        "flame_pose",
-        "flame_shape",
-        "flame_expression",
-        "camera_raw",
-    )
+    # Sourced from manipulation_execution.hri_vision so the streaming node and
+    # this executor cannot drift apart on what a PEAR response carries.
+    _PEAR_OUTPUT_FIELDS = PEAR_OUTPUT_FIELDS
 
     def _vision_loop(self) -> None:
         while not self._vision_stop.is_set():
@@ -912,8 +868,12 @@ class ImitateHumanMotionExecutorNode(Node):
             joint_limits=self._joint_limits,
             prepare_positions={name: _PREPARE_JOINT_POSITIONS.get(name, 0.0) for name in self._joint_names},
         )
-        log = self.get_logger().warning if result.fell_back else self.get_logger().info
-        log(f"imitate_human_motion retargeting {result.message}")
+        # rclpy pins the severity of each call site; keep one call per level.
+        message = f"imitate_human_motion retargeting {result.message}"
+        if result.fell_back:
+            self.get_logger().warning(message)
+        else:
+            self.get_logger().info(message)
         return result.plan, result.message
 
     def _run_startup_warmup(self) -> bool:

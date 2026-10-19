@@ -1,0 +1,49 @@
+upstream:
+  repository: https://github.com/NVlabs/GraspGenX.git
+  commit: b9429097728cb1c430dd78b92edf17ba318aad03
+distribution:
+  name: graspgenx
+  version: 1.0.0+ibrobot.2
+  import_package: graspgenx
+  wheel: ../../../wheels/graspgenx/b942909/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl
+  license: Apache-2.0
+  license_file: LICENSE
+build:
+  python: ">=3.10"
+  source_date_epoch: 1739846159
+  command: scripts/build_graspgenx_wheel.sh
+runtime:
+  torch: "2.7.1+cu126 (verified), 2.5.1 + torch_npu 2.5.1 on CANN 8.1 (verified)"
+  diffusers: ">=0.27.2,<0.36 (requirements/graspgenx.txt)"
+  notes: >
+    Pure-Python wheel of the graspgenx package only (no tests, demos or LFS
+    assets). setup installs it with --no-deps: upstream's torch<2.7,
+    diffusers==0.11.1 and huggingface-hub==0.25.2 pins reflect its authors'
+    CUDA driver, and the sampler is verified on this workspace's torch
+    2.7.1+cu126. Gripper descriptions and checkpoints are supplied by the
+    model bundle, never downloaded by the package.
+patches:
+  - file: 0001-pin-audited-wheel-version.patch
+    purpose: Stamp the audited local version label so setup can recognise an installed audited build.
+  # 0002-0004 open seams for the Ascend 310P deployment. None changes what the
+  # CUDA path computes: each either adds an optional input or replaces a
+  # hardcoded device with the one the weights are already on.
+  - file: 0002-accept-an-explicit-initial-noise.patch
+    purpose: >
+      Let a caller supply the generator's initial noise. On a 310P
+      torch.randn(device="npu") segfaults the process, so the noise has to be
+      drawn on the host and handed in; it also makes a run reproducible for a
+      parity check against the CUDA baseline.
+  - file: 0003-allow-a-generator-class-and-a-request-scope.patch
+    purpose: >
+      Accept an explicit generator class, so a deployment can serve its own
+      implementation, and add a per-request scope defaulting to
+      contextlib.nullcontext. The Ascend encoders use the scope to compute the
+      point cloud's coordinate-derived work once for the generator and the
+      discriminator instead of twice.
+  - file: 0004-place-per-request-tensors-on-the-model-device.patch
+    purpose: >
+      Place the gripper inputs and the object cloud on the device the model's
+      weights are on, as run_inference_batch already did, instead of calling
+      .cuda() on each. Nine call sites; without them the sampler raises on any
+      host whose model is not on CUDA.

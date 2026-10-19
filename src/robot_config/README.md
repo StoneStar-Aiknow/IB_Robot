@@ -4,6 +4,11 @@ ros2_control 和外设的统一机器人配置系统。
 
 ## 概述
 
+`robot.launch.py` 与 `teleop_operator.launch.py` 在 provider/输入设备前调用共享的
+`dds_environment` 本机检查；robot 的延迟消费者构建前再次检查。它只读实际启动环境与
+DDS 应用记录，明确错误时停止并给建议；不设置 DDS、不检查远端或业务 QoS。
+没有受管记录时保留原行为。范围和错误处理见 [DDS 配置工具](../../scripts/dds/README.md)。
+
 本软件包为机器人硬件提供统一的配置系统，桥接以下组件：
 
 - **ros2_control**：用于关节/电机控制接口
@@ -21,8 +26,17 @@ periodic（会话仍为 inactive，需显式激活）；其他 stage 与其余�
 `lekiwi_nav_grasp_sound_real` overlay 显式开启。periodic 模式只消费 `SpeechDirection`，校验上不要求
 `voice_asr.enabled`；keyword 模式仍要求 ASR 与 speech direction 同时可用。
 
-`VoiceASRNode` 和 `speech_direction_node` 都订阅 `audio_io` 发布的共享音频话题，不直接竞争打开 ReSpeaker
-设备。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
+`VoiceASRNode` 的 shared_audio 模式和 `speech_direction_node` 订阅共享音频，不直接竞争打开 ReSpeaker。
+external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消费 runtime 绑定的 `audio.speech` 原子消息块。
+
+X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
+profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
+在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
+`audio_io.source=runtime` 时不启动 ALSA capture；runtime 提供音频。X2 的 external_vad 模式通过
+`voice_asr.audio_input: {interface: audio.speech, type: ibrobot_msgs/msg/SpeechAudioChunk}` 绑定原子音频块，
+端点由 runtime profile 声明。离线需提供 description，live launch 延迟绑定后才构造 ASR；类型或显式 topic
+冲突会拒绝启动。独立输入可显式设 `chunk_topic`。`manual` 与 `continuous` 激活策略不受音源模式覆盖。
+完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
 
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
 override 注入序列号，避免把某一台实物设备绑定到所有同型号 profile。
@@ -597,6 +611,54 @@ robot:
   `motion.posture`。因为是实时绑定，离线 `load_robot_config_dict()` 需要 `defer_interface_binding=True`；
   robot-skill CLI 请用 launch 日志里 `consumer snapshot:` 给出的绑定后配置（`--config-path`）。
 - `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。
+
+## X2 照镜子（motion_imitation_stream / mirror_session）
+
+`config/robots/aimdk_x2_magicmirror.yaml` 在 `aimdk_x2_skills.yaml` 之上配置 X2 照镜子：选用 OmniHand
+profile（`joint.hand_stream`，20 路），技能栈只保留 `mirror_start` / `mirror_stop`，控制模式
+`model_inference` 映射到运行时 `policy_stream`。节点职责见 `manipulation_execution` README 的
+“X2 照镜子”一节。三个配置块：
+
+```yaml
+robot:
+  perception_services:            # YOLOX 与 PEAR 两个通用模型服务（Ascend 310P bundle）
+    services: [...]
+  motion_imitation_stream:
+    enabled: true
+    frame_source:
+      interface: camera.stereo_head_front_left.color_compressed   # 逻辑 ID，端点取自实时接口描述
+      decoder: mock_cpu
+    mock_playback:
+      enabled: true
+      preview_topic: /motion_imitation_mock/arm_command_preview
+      arm_limits: {...}             # 按关节名，必须恰好覆盖 joint.arm_stream 的关节
+      arm_velocity_limits: {...}
+  mirror_session:
+    enabled: true
+    publish_enabled: false        # 默认只发 preview 话题，不发运行时通道
+    control_mode: model_inference
+    stop_timeout_sec: 4.5         # 会话应答 stop 的时限；mirror_stop 的技能超时须至少再多 0.5 s
+    interfaces:                   # 逻辑接口绑定：launch 等待并从实时接口描述绑定端点
+      get_status: {interface: runtime.get_status, kind: service, type: ibrobot_msgs/srv/GetRuntimeStatus}
+      set_mode: {interface: runtime.set_mode, kind: service, type: ibrobot_msgs/srv/SetRuntimeMode}
+```
+
+- `launch_builders/motion_imitation_stream.py` 启动 `motion_imitation_stream_node`，`mock_playback.enabled`
+  时再启动 `motion_imitation_mock_node`。相机端点和手臂通道的关节顺序都按逻辑 ID 从已绑定的运行时接口
+  描述中取得，配置未绑定时启动失败，不回退到猜测的话题名。`frame_source.topic` 可直接指定描述中没有的
+  话题，与 `frame_source.interface` 二选一。
+- `launch_builders/mirror_session.py` 启动 `mirror_session_node`，并检查：`control_mode` 等于
+  `skill_required_control_mode`（不写时取它；Gateway 切到技能的模式，会话接管的必须正是这个模式），是
+  `control_modes` 的成员，其 `runtime_mode` 显式且不是 idle；映射到同一运行时模式的控制模式都显式关闭
+  `inference` 和 `executor`（会话是该模式唯一的指令源）。会话进程退出且 launch 仍在运行时，launch 运行
+  `mirror_session_release` 把运行时从 `policy_stream` 释放回 idle；它只调用 `set_mode`，从不发送手臂或
+  手指指令。
+- `mirror_session.enabled` 为 `true` 时，`embodied_bringup` 为 Gateway 打开 `mirror_session` 执行器并传入
+  会话的 `~/set_session` 服务名和 `stop_timeout_sec`；catalog 是否包含该执行器的技能必须与此一致，
+  `mirror_stop` 的技能超时必须不小于 `stop_timeout_sec` + 0.5 s，否则 Gateway 拒绝启动。节点名、服务名、
+  释放预留和这 0.5 s 余量只在 `embodied_common/mirror_session_contract.py` 定义一次。
+- 两个模型 bundle 按 `WORKSPACE` 相对路径解析，`$WORKSPACE/models/` 下缺少 bundle 时配置解析失败，整个
+  launch 中止。
 
 ## 控制模式配置
 
@@ -1208,8 +1270,11 @@ robot:
     # + implementations/<implementation>.yaml). Robot YAML only selects the
     # source, profile, and runtime Gateway wiring:
     skill_catalog_source_mode: development          # installed | development | production
-    skill_catalog_source_root: src/skill_catalog   # required in development/production
+    # skill_catalog_source_root: 省略时 development 使用已安装 skill_catalog 包的源码树；production 必填
     skill_catalog_profile: so101_single_arm         # required when embodied.enabled is true
+    # 随 Skill Gateway 启动 robot-skill 常驻 ROS bridge（robot-skill-daemon），使启动后的
+    # 第一次 robot-skill 调用无需等待 DDS 发现；只接受布尔值，不参与执行身份 digest。
+    resident_cli_bridge: true                       # 默认 true；false 时 robot-skill 使用进程内 bridge
 
     named_targets:
       demo_object:
@@ -1268,12 +1333,25 @@ robot:
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
 | `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
 | `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+| `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
+| `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
+| `agent.voice_bridge.input_topic` | 绝对 topic；默认跟随 `voice_asr.output_topic` |
+| `agent.voice_bridge.partial_topic` / `asr_status_topic` / `asr_control_topic` | **不可配置**：`voice_asr_node` 固定使用 `/voice_partial`、`/voice_status`、`/voice_control`，出现即报错 |
+| `agent.voice_bridge.busy_message` | 非空字符串；执行中提示语。播报时 ASR 仍在监听停止词，**不得包含停止词**（否则机器人会被自己的提示中断），违反即报错 |
+| `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空，未配置时取 `embodied_common.control_phrases.STOP_PHRASES` |
+| `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
+| `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
+| `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |
+| `agent.voice_bridge.resume_settle_sec` | 正数，默认 1 秒；TTS 播报结束恢复 ASR 后的静默窗口，期间丢弃识别结果 |
+| `agent.voice_bridge.tts_enabled` / `speak_replies` / `mute_asr_during_tts` | 布尔；`tts_enabled` 默认跟随 `voice_tts.enabled` |
 
 仓库自带 SO-101 孵化 profile：`so101_agent_manual`（真机手动无运动）、
 `so101_agent_manual_hardware`（真机手动执行）、`so101_single_arm_agent_test`
 （rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
 `so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
-（真机停止验证）。运行时行为与安全边界见 `ibrobot_agent` README。
+（真机停止验证）、`so101_single_arm_agent_voice_gazebo`（仿真语音入口：ASR → voice bridge → Agent）、
+`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）。
+运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约
 
@@ -1287,7 +1365,12 @@ robot:
 Gateway 接线一致性校验，不重复 manifest/capability 校验。配置 `embodied.skill_catalog_profile`
 时 `skill_required_control_mode` 必须是 `control_modes` 的非空成员；`embodied.enabled: true`
 时 `embodied.skill_catalog_profile` 必须非空。`skill_catalog_source_mode` 只接受
-`installed`、`development`、`production`；后两者要求 `skill_catalog_source_root` 指向有效目录。
+`installed`、`development`、`production`；`production` 要求 `skill_catalog_source_root` 指向 release 根目录。
+`development` 可省略 root：launch 与 `robot-skill` 使用 `--symlink-install` 安装的 `skill_catalog` 包所在源码树，
+与该包在 `src/` 下的目录位置无关；非 symlink 安装时回退到 ament `installed` source。显式 root 为绝对路径时原样使用，
+为相对路径时按配置文件所在 checkout 解析，不存在则带 `FutureWarning` 回退到包源码树。
+`embodied.resident_cli_bridge` 可选，必须是布尔值（默认 `true`），由 `embodied_bringup` 用于决定是否随
+Skill Gateway 启动 `robot-skill-daemon`，详见 `robot_skill_cli` README「常驻 ROS bridge」。
 
 `robot_config.loader.robot_config_digest` 是传入 `skill_catalog` 编译器的 canonical execution-context
 digest；它刻意排除 `skill_catalog_source_mode` / `skill_catalog_source_root` / `skill_catalog_profile`、
@@ -1333,10 +1416,10 @@ registry 都在相关节点启动时冻结。修改机器人 YAML 后需重启 p
 重启。`robot-skill reload-catalog` 不会影响视觉游戏。
 
 更多具身节点说明，详见各子包 README：
-- [`embodied_agent`](../embodied_agent/README.md)
+- [`embodied_agent`](../agent/embodied_agent/README.md)
 - [`perception_service`](../perception_service/README.md)
-- [`skill_library`](../skill_library/README.md)
-- [`safety_guard`](../safety_guard/README.md)
+- [`skill_library`](../agent/skill_library/README.md)
+- [`safety_guard`](../agent/safety_guard/README.md)
 
 #### 2. moveit_planning 模式（轨迹规划控制）
 
@@ -1517,8 +1600,9 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:
 # 契约级 mock 仿真
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
 
-# Ascend310P PI0.5 native Torch end-to-end validation with hardware_mock
-ros2 launch robot_config robot.launch.py robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
+# PI0.5 hardware_mock: first package both modes with package-pi05-ascend-deployments.
+# The YAML defaults to fast; switch the adjacent commented deployment line for fidelity.
+TASK_QUEUE_ENABLE=0 ros2 launch robot_config robot.launch.py robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
 
 # MoveIt 规划模式（带 RViz）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true

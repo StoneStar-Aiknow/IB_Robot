@@ -53,6 +53,8 @@ SUPPORTED_SKILL_EXECUTORS = {
     # A named motion the robot runtime owns and executes itself (for example a
     # vendor preset gesture), bound per skill by the catalog implementation.
     "runtime_named_motion",
+    # The X2 mirror session's start/stop switch; the catalog binds the command.
+    "mirror_session",
 }
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 

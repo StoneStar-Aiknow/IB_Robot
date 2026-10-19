@@ -311,9 +311,12 @@ class VADModule:
             if result.state in (VADState.STARTING, VADState.SPEAKING, VADState.ENDING):
                 if current_start is None:
                     current_start = start
-                    pre_roll = self.get_pre_roll_audio()
+                    # process() already pushed this frame into the pre-roll; drop it so
+                    # the onset frame is not decoded twice (garbles short commands).
+                    pre_roll = self.get_pre_roll_audio()[: -len(frame)]
                     if len(pre_roll) > 0:
                         current_audio.append(pre_roll)
+                        current_start = max(0, start - len(pre_roll))
                 current_audio.append(frame)
 
             elif result.state == VADState.SILENCE and current_start is not None:

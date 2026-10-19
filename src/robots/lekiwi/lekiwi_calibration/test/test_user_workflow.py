@@ -167,10 +167,16 @@ def test_default_fast_calib_workspace_is_repository_relative(monkeypatch):
     assert workflow._default_workspace() == workflow._repo_root()
 
 
-def test_default_mount_is_the_active_robot_profile_source():
-    assert workflow._default_mount() == (
-        workflow._repo_root() / "src/robot_config/config/hardware/lekiwi_mid360_mount.yaml"
-    )
+def test_default_mount_is_shipped_by_the_lekiwi_description(monkeypatch, tmp_path):
+    # Resolved through the ament index, not the source checkout, so an
+    # install-only deployment finds it.
+    import ament_index_python.packages as packages
+
+    shares = {"lekiwi_description": str(tmp_path / "share/lekiwi_description")}
+    monkeypatch.setattr(packages, "get_package_share_directory", lambda name: shares[name])
+    monkeypatch.setattr(workflow, "_repo_root", lambda: tmp_path / "no-source-tree")
+
+    assert workflow._default_mount() == tmp_path / "share/lekiwi_description/config/lekiwi_mid360_mount.yaml"
 
 
 def test_solve_archive_contains_three_candidate_artifacts_from_mount_and_camera_info(tmp_path, monkeypatch):

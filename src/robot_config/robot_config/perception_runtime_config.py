@@ -10,15 +10,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from inference_manifest import (
-    MANIFEST_FILENAME,
-    ManifestError,
-    ValidatedManifest,
-    load_inference_manifest,
-    semantic_identity_fingerprint,
-)
+if TYPE_CHECKING:
+    from inference_manifest import ValidatedManifest
+
+# inference_manifest (pydantic + jsonschema, ~110 ms) is imported where a
+# bundle is actually validated: robot_config.loader imports this module on
+# every robot-skill invocation, including robots without perception services.
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _NODE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -70,6 +69,8 @@ class PerceptionRuntimeConfig:
 
     def configuration_generation(self, role_bindings: Mapping[str, str]) -> int:
         """Return a stable positive generation for the effective role-bound services."""
+        from inference_manifest import semantic_identity_fingerprint
+
         by_id = {service.instance_id: service for service in self.enabled_services}
         records = []
         for role, instance_id in sorted(role_bindings.items()):
@@ -216,6 +217,8 @@ def _resolve_bundle_path(value: str, service_path: str) -> Path:
 
 
 def _validate_bundle(path: Path, deployment: str, service_path: str) -> ValidatedManifest:
+    from inference_manifest import MANIFEST_FILENAME, ManifestError, load_inference_manifest
+
     manifest_path = path / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise PerceptionRuntimeConfigError(f"{service_path} bundle is missing {MANIFEST_FILENAME}: {manifest_path}")

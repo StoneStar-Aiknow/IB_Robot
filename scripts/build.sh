@@ -269,7 +269,7 @@ require_setup_environment
 # ============================================================================
 declare -A GROUP_PATHS=(
     [base]="ibrobot_msgs robot_config robot_runtime robot_teleop tensormsg model_utils hardware_mock observation_transport perception_service manipulation_service action_dispatch task_dispatch inference_service inference_manifest torch_models ibrobot_tracing voice_asr_service voice_tts_service manipulation_execution semantic_mapping object_tracker sim_models dataset_tools benchmark aero_hand_hardware attention_viz pymoveit2"
-    [agent]="embodied_agent embodied_bringup embodied_common skill_library skill_catalog robot_skill_cli safety_guard workflows ibrobot_agent"
+    [agent]="agent embodied_common"
     [so101]="robots/so101 robots/feetech"
     [lekiwi]="robots/lekiwi robots/feetech omni_wheel_controller robot_navigation fast_calib fast_lio livox_ros_driver2"
     # The X2 runtime additionally needs the vendor AimDK overlay on the ROS 2

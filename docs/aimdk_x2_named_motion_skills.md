@@ -33,8 +33,8 @@ Hermes / planner / robot-skill
 - 端点只来自运行时公开接口描述：`embodied.runtime_named_motion` 是逻辑接口绑定，统一 launch 在运行时就绪后
   解析并注入。
 
-配置细节见 `src/robot_config/README.md`「运行时自持运动的机器人」；目录规则见 `src/skill_catalog/README.md`
-「Runtime named-motion skills」；执行器语义见 `src/skill_library/README.md` §8.7。
+配置细节见 `src/robot_config/README.md`「运行时自持运动的机器人」；目录规则见 `src/agent/skill_catalog/README.md`
+「Runtime named-motion skills」；执行器语义见 `src/agent/skill_library/README.md` §8.7。
 
 ## 安全须知（先读）
 

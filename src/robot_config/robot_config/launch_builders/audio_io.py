@@ -20,6 +20,14 @@ def generate_audio_io_actions(robot_config: dict[str, Any]) -> list[Node]:
     playback_enabled = bool(robot_config.get("voice_tts", {}).get("enabled", False))
     if not capture_enabled and not playback_enabled:
         return []
+    source = str(config.get("source", "alsa")).strip() or "alsa"
+    if capture_enabled and source == "runtime":
+        # 采集侧 topic（原始流/增强流）由机器人 runtime 提供（如 aimdk_runtime），
+        # 不启动 ALSA 采集。
+        logger.info("audio_io.source=runtime: capture topics are runtime-provided, skipping audio_capture_node")
+        capture_enabled = False
+    if not capture_enabled and not playback_enabled:
+        return []
     microphone_name = str(config.get("microphone", "")).strip()
     params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
     capture_topic = str(config.get("capture_topic", "/audio/capture"))

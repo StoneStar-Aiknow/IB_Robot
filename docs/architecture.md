@@ -44,7 +44,7 @@ IB-Robot 将 LeRobot 模型与数据流程接入 ROS 2 机器人系统，通过�
 | 机器人 runtime profile | 本体身份、硬件端口、标定、传感器、模式、控制器或厂商 MC 适配参数 | [robot_runtime](../src/robot_runtime/README.md)、各机器人运行时 |
 | 运行时接口描述 | 实际公开的端点、消息类型、QoS、坐标系、模型与能力信息 | [公开接口 schema](robot_interface_schema.md) |
 | 模型 manifest | 模型语义、产物、命名 deployment、后端 runtime profile 与 tensor 绑定 | [inference_manifest](../src/inference_manifest/README.md) |
-| 技能目录快照 | 技能定义、参数、primitive 契约、机器人上下文及目录身份 | [skill_catalog](../src/skill_catalog/README.md)、[skill_library](../src/skill_library/README.md) |
+| 技能目录快照 | 技能定义、参数、primitive 契约、机器人上下文及目录身份 | [skill_catalog](../src/agent/skill_catalog/README.md)、[skill_library](../src/agent/skill_library/README.md) |
 
 `robot_config` 支持 `base_config` 继承与启动前校验。采用 `runtime.provider` 的配置把本体参数交给机器人 profile，应用只选择运行时并声明绑定关系；旧式无 provider 配置仍有自身的启动路径，不能把其硬件字段直接套用到新运行时。
 
@@ -104,7 +104,7 @@ Hermes / 外部 Agent → robot-skill ──────────┐
 
 技能可调用操作、导航和本体能力；策略动作流则由推理与动作调度链路处理。两者共享机器人公开接口，但不等于所有模型输出都要经过 Agent 计划。
 
-详见 [具身启动](../src/embodied_bringup/README.md)、[robot-skill](../src/robot_skill_cli/README.md) 与 [自然语言 Agent](../src/ibrobot_agent/README.md)。
+详见 [具身启动](../src/agent/embodied_bringup/README.md)、[robot-skill](../src/agent/robot_skill_cli/README.md) 与 [自然语言 Agent](../src/agent/ibrobot_agent/README.md)。
 
 ## 具身模型统一执行框架
 

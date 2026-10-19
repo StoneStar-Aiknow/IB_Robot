@@ -558,7 +558,10 @@ def test_load_single_arm_config():
     assert len(config.peripherals) == 3
     assert config.voice_asr.enabled is False
     assert config.voice_asr.output_topic == "/voice_command"
-    assert config.voice_asr.bundle_path == "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    assert (
+        config.voice_asr.bundle_path
+        == "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
+    )
     assert config.voice_asr.realtime_pre_roll_seconds == 0.5
     assert not Path(config.voice_asr.bundle_path).is_absolute()
     assert config.voice_asr.exit_on_init_failure is True
@@ -1174,12 +1177,15 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.vad_bundle_path == VOICE_ASR_DEFAULTS["vad_bundle_path"]
     assert config_defaults.vad_deployment == VOICE_ASR_DEFAULTS["vad_deployment"]
     assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+    assert config_defaults.final_tail_padding_seconds == VOICE_ASR_DEFAULTS["final_tail_padding_seconds"]
     assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
     assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
     assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]
     assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
     assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
+    assert config_defaults.input_mode == VOICE_ASR_DEFAULTS["input_mode"]
+    assert config_defaults.external_min_samples == VOICE_ASR_DEFAULTS["external_min_samples"]
 
 
 def test_voice_tts_loader_and_runtime_defaults_match():
@@ -1668,3 +1674,12 @@ def test_resolve_joint_names_keeps_bare_selector_names():
     }
 
     assert resolve_joint_names_from_config(robot_config) == ["left_arm", "right_arm"]
+
+
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("false", False), (1, False)])
+def test_resident_cli_bridge_switch_must_be_a_boolean(value, valid):
+    from robot_config.loader import _validate_skill_gateway_config
+
+    errors = _validate_skill_gateway_config({"embodied": {"resident_cli_bridge": value}})
+
+    assert ("embodied.resident_cli_bridge must be a boolean" not in errors) is valid

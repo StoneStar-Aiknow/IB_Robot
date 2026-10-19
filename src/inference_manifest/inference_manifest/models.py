@@ -22,6 +22,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
@@ -383,6 +384,7 @@ CANONICAL_MODEL_MAPPING: dict[str, dict[str, Any]] = {
     "yolox_person": {"interface": "tensor_model", "operations": ("detect",)},
     "pear_parameter_network": {"interface": "tensor_model", "operations": ("predict_parameters",)},
     "graspgen": {"interface": "tensor_model", "operations": ("generate_grasps",)},
+    "graspgenx": {"interface": "tensor_model", "operations": ("generate_grasps",)},
     "dummy_echo": {"interface": "tensor_model", "operations": ("echo",)},
     "zipvoice": {"interface": "tensor_model", "operations": ("synthesize",)},
     "fullsubnet": {"interface": "tensor_model", "operations": ("enhance",)},
@@ -915,7 +917,15 @@ class Deployment(StrictFrozenModel):
     bindings: dict[ExecutionRole, ArtifactBindings] = Field(default_factory=dict)
     device_links: tuple[DeviceLink, ...] = ()
     audio_contract: AudioContract | None = None
+    extra_parameters: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("extra_parameters", mode="before")
+    @classmethod
+    def validate_extra_parameters(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("deployment.extra_parameters must be a JSON object")
+        return _json_safe(value, "deployment.extra_parameters")
 
     @property
     def is_composite(self) -> bool:

@@ -132,6 +132,16 @@ if [ -f "${_IB_LIBERO_CONFIG_PATH}/config.yaml" ]; then
 fi
 unset _IB_LIBERO_CONFIG_PATH
 
+# Register this checkout's CLI after venv/overlay setup has finished editing PATH.
+# This hook only registers the command; it does not activate any DDS profile.
+if [ -f "${WORKSPACE_DIR}/scripts/dds/command_path.sh" ]; then
+    source "${WORKSPACE_DIR}/scripts/dds/command_path.sh"
+fi
+if [ -f "${WORKSPACE_DIR}/scripts/dds/source_hook.sh" ]; then
+    source "${WORKSPACE_DIR}/scripts/dds/source_hook.sh" ||
+        printf '%s\n' 'DDS 初始化失败；继续加载其他项目环境，受管 DDS 启动仍需先修复配置。' >&2
+fi
+
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'

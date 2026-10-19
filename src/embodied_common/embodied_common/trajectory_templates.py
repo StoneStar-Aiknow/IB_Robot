@@ -88,7 +88,22 @@ def _parse_xyz(value: str | None, field_name: str) -> tuple[float, float, float]
 
 
 def _matmul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
-    return [[sum(a[row][k] * b[k][col] for k in range(4)) for col in range(4)] for row in range(4)]
+    # Unrolled form of ``sum(a[row][k] * b[k][col] for k in range(4))``:
+    # compiling the social-skill catalog evaluates this ~10k times per
+    # robot-skill invocation.  The leading ``0.0 +`` mirrors the start value of
+    # ``sum`` and keeps the sign of a zero result unchanged, so the result is
+    # bit-identical to the generic form wherever ``sum`` adds floats left to
+    # right (CPython before 3.12; the project targets 3.10).
+    b0, b1, b2, b3 = b
+    return [
+        [
+            0.0 + r[0] * b0[0] + r[1] * b1[0] + r[2] * b2[0] + r[3] * b3[0],
+            0.0 + r[0] * b0[1] + r[1] * b1[1] + r[2] * b2[1] + r[3] * b3[1],
+            0.0 + r[0] * b0[2] + r[1] * b1[2] + r[2] * b2[2] + r[3] * b3[2],
+            0.0 + r[0] * b0[3] + r[1] * b1[3] + r[2] * b2[3] + r[3] * b3[3],
+        ]
+        for r in a
+    ]
 
 
 def _identity() -> list[list[float]]:

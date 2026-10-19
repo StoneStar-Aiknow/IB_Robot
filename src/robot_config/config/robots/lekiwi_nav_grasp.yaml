@@ -36,7 +36,7 @@ robot:
   # controllers own joints 1-6, while base_velocity_controller owns joints 7-9.
   # The legacy grasp/mapping/navigation stages remain available for migration.
   default_nav_stage: hybrid
-  mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+  mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
 
   sensor_calibration:
     artifacts:
@@ -937,7 +937,7 @@ robot:
     hybrid:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
-      mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+      mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
       peripheral_names: [respeaker, wrist, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
@@ -1054,8 +1054,8 @@ robot:
     enabled: false
     active_mode: continuous
     language: zh
-    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
-    deployment: torch_cpu
+    bundle_path: "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
+    deployment: ascend_310p  # X-ASR encoder OM on the 310P NPU; decoder/joiner on CPU
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
     realtime_pre_roll_seconds: 0.5
@@ -1097,7 +1097,6 @@ robot:
     enabled: false
     entry_mode: hermes
     skill_catalog_source_mode: development
-    skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
     debug_tracing: true
     idle_behaviors:

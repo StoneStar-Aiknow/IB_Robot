@@ -69,9 +69,28 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 |---|---|---|
 | DemoTorchModel | `torch_models/demo_torch_model` | CPU smoke example |
 | [PI0.5 Ascend310P](torch_models/pi05_ascend_310p/README.md) | `torch_models/pi05_ascend_310p` | `model_type=pi05` + `backend=torch` + `device=npu` |
+| [GraspGenX Ascend310P](torch_models/graspgenx_ascend_310p/README.md) | `torch_models/graspgenx_ascend_310p` | `model_type=graspgenx` + `backend=torch` + `device=npu` |
 
 每个模型目录负责自己的配置校验、运行时准备和平台约束。统一推理服务只按稳定的
 `model_type/backend/device` 组合解析 provider，不在通用 manifest exporter 中维护模型特判。
+
+## 自定义 Ascend 算子
+
+需要自定义算子的模型，把算子源码放进**自己的模型目录**，而不是包的顶层——它们服务单个
+模型，不是本包的共享设施。目前只有 `graspgenx_ascend_310p`：源码在
+`torch_models/graspgenx_ascend_310p/custom_ops/kernels/`，与调用它的 Python 绑定
+（同目录的 `custom_ops/`）收在一处；算子清单、CANN 绑定与输出布局见该目录的
+[`manifest.yaml`](torch_models/graspgenx_ascend_310p/custom_ops/kernels/manifest.yaml)。
+
+这些源码**不由 colcon 构建**：`scripts/build.sh` 只构建 `src/` 下带 `package.xml` 的包，
+而算子要用 CANN 的 msopgen + CMake 在运行它们的主机上现场编译
+（`scripts/setup/install_graspgenx_ascend_ops.sh`）。`setup.py` 的 `find_packages` 不收
+没有 `__init__.py` 的 `kernels/`，所以源码随包进仓库但不进 install space。
+
+**构建产物不在仓库里**，默认落 `~/.cache/ibrobot/graspgenx_ascend_ops`：vendor 包按单一
+CANN release 与 `ascend310p` 计算单元编译，Torch bridge 按本机 venv 的
+libtorch/libtorch_npu ABI 链接，换任何一样都要重编。位置由
+`IBROBOT_GRASPGENX_ASCEND_OPS` 覆盖，该变量是这个路径**唯一**被写下的地方。
 
 ## Provider 扩展
 
@@ -87,12 +106,20 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 | `configure_config(config, model_dtype=...)` | 加载权重前配置模型并检查固定契约 |
 | `validate(config=..., bundle_root=..., tokenizer_path=..., device_name=...)` | 模型内部的平台与依赖兼容检查 |
 | `load_options` | 该模型特有的 `from_pretrained` 参数 |
+| `resolve_load_options(config=..., extra_parameters=...)` | 可选；解释本次 deployment 的通用 JSON 参数，返回模型自己的 `from_pretrained` 参数。不得覆盖 config、strict 或本地加载约束 |
 | `prepare(policy=..., deployment_fingerprint=..., torch_module=..., torch_npu_module=..., device_name=...)` | 模型放置设备并转换 dtype 后准备推理优化 |
 | `execution_metadata(policy)` | 可选的模型诊断 metadata，默认无 |
+| `preprocess_inputs(inputs, config=...)` | 可选的 CPU 输入优化；在 LeRobot processor 之前执行，耗时计入 pipeline preprocess，默认不改变输入 |
+| `configure_processors(preprocessor=..., postprocessor=..., config=...)` | 可选；加载阶段为该模型组装 LeRobot processor steps，默认不修改 processor |
 
 `ModelSession` 继续管理权重加载、设备放置、processor、取消和资源释放。Provider 不依赖
 ROS，也不导入 `inference_service`。模型源码、兼容矩阵和使用说明归属模型目录。
 新增模型时应覆盖 lazy 解析、未匹配路由、加载失败和模型特有约束，并在相应设备上验证。
+
+`extra_parameters` 是 deployment 级通用容器，通用 manifest/session 不定义其中字段。
+Session 传递独立的参数副本；provider 可为本次新建的配置对象绑定不可变推理设置，并将同一设置
+作为构造参数返回。配置不得保存到共享 provider 单例或进程全局变量。PI05 实现使用
+`PI05AscendInferenceConfig`，两档命名部署共享权重，分别选择 Euler10 与 AB2 三次求值。
 
 ## 轻量验证
 

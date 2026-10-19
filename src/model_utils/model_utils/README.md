@@ -82,6 +82,34 @@ ros2 run model_utils package-torch-deployment \
 上述命令生成 `native-cpu`。`--devices` 也支持 `cuda`、`mps` 和 `npu`；生成 manifest
 不要求当前主机具备对应设备，实际加载 deployment 时 runtime 才检查设备可用性。
 
+单设备可用 `--deployment-name` 指定精确名字，以 `--extra-parameters-json` 传入模型自己的参数。
+打包器只验证它是合法 JSON 对象，运行时的对应 provider 负责模型字段校验；不生成外置参数文件，
+不要求用户填写 SHA-256。参数变更由现有 upsert 流程更新部署 revision/fingerprint。
+
+```bash
+source .shrc_local && ros2 run model_utils package-torch-deployment \
+  --bundle-root /path/to/pi05_bundle --devices npu \
+  --deployment-name custom-pi05 \
+  --extra-parameters-json '{"denoising":{"solver":"ab2","schedule":"uniform","steps":3},"language_capacity":48}'
+```
+
+PI05 Ascend310P 的两档完整预设由模型自己的配置模块定义，使用专用入口生成：
+
+```bash
+source .shrc_local && ros2 run model_utils package-pi05-ascend-deployments \
+  --bundle-root /path/to/pi05_bundle
+```
+
+生成 `torch-npu-fidelity`（Euler10，容量200）和 `torch-npu-fast`（AB2三次求值，容量48），
+均启用vision FFN、按布局CPU resize与CPU动作输出。`--modes fidelity`或`--modes fast`可只生成一档。
+预设容量规则为：fast使用48，其他受支持模式使用200。更新预设后需重新打包已有bundle；
+fidelity参数变更会更新其revision/fingerprint并使用独立图缓存，fast参数保持不变。
+机器人示例统一使用`so101_pi05_ascend_310p_mock.yaml`，默认`deployment: torch-npu-fast`；
+切换时注释该行并取消相邻`deployment: torch-npu-fidelity`的注释，保持只有一行生效。
+共享checkpoint和processor文件，保留已有部署，不修改训练`config.json`。在robot YAML的
+`deployment`中选择，`runtime_options.model_dtype`设为`fp16`。发布工具本身不代表完成了板端验证；
+两档需要分别记录frozen精度与hardware_mock的稳态mean/P95及冷启动时间。
+
 Repository-owned native Torch policies are selected by the stable combination
 of manifest `model_type`, runtime backend, and runtime device. For PI0.5 on
 Ascend310P, use the normal native Torch deployment:

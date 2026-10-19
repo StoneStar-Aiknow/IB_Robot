@@ -922,8 +922,12 @@ class VRTeleopNode(Node):
             self._release_home_gate_if_ready()
             return
 
-        log = self.get_logger().info if result.success else self.get_logger().error
-        log(result.message or result.error_code or "SO101 ArmReturnHome completed")
+        # rclpy pins the severity of each call site; keep one call per level.
+        message = result.message or result.error_code or "SO101 ArmReturnHome completed"
+        if result.success:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
         self._release_home_gate_if_ready()
         if self._so101_stop_pending and not self._so101_stop_inflight:
             self._stop_so101_servo("ArmReturnHome completed while stop pending")

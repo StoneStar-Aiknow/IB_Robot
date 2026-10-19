@@ -130,8 +130,8 @@ def test_plain_pr_passes_and_injects_disclosure(repo, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     body = (tmp_path / "pr_body.md").read_text(encoding="utf-8")
     assert body.startswith("<!-- openEuler-ai-disclosure:start -->")
-    assert "Agent平台信息（Tool）: OpenCode 1.17.20" in body
-    assert "模型信息 (Model): glm-5.3" in body
+    assert "**Agent平台信息（Tool）**: OpenCode 1.17.20" in body
+    assert "**模型信息 (Model)**: glm-5.3" in body
     assert "待开发者完成逐项实质审查" in body
     assert "已逐项审查" not in body
     assert "## 方案" in body
@@ -162,6 +162,51 @@ def test_model_coverage_enforced_over_all_commits(repo, tmp_path):
     assert result.returncode == 1
     assert "gpt-9.1" in result.stdout
     assert "does not include commit models" in result.stdout
+
+
+def test_completed_review_status_recorded(repo, tmp_path):
+    result = run_gate(repo, "## 方案\n\n新增 feature 模块。", "--human-review-status", "completed", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = (tmp_path / "pr_body.md").read_text(encoding="utf-8")
+    assert "开发者已明确确认完成逐项实质审查" in body
+    assert "待开发者完成逐项实质审查" not in body
+
+
+def test_update_refuses_silent_downgrade_of_completed_review(repo, tmp_path):
+    result = run_gate(repo, "## 方案\n\n新增 feature 模块。", "--human-review-status", "completed", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    previous_file = tmp_path / "previous.md"
+    previous_file.write_text((tmp_path / "pr_body.md").read_text(encoding="utf-8"), encoding="utf-8")
+
+    downgraded = run_gate(repo, "## 方案\n\n更新正文。", "--previous-body-file", str(previous_file), tmp_path=tmp_path)
+    assert downgraded.returncode == 1
+    assert "silently downgrade" in downgraded.stdout
+    assert "--review-status-reset" in downgraded.stdout
+
+    reset = run_gate(
+        repo,
+        "## 方案\n\n更新正文。",
+        "--previous-body-file",
+        str(previous_file),
+        "--review-status-reset",
+        tmp_path=tmp_path,
+    )
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    body = (tmp_path / "pr_body.md").read_text(encoding="utf-8")
+    assert "待开发者完成逐项实质审查" in body
+
+
+def test_pasted_completed_block_in_draft_refuses_downgrade(repo, tmp_path):
+    result = run_gate(repo, "## 方案\n\n新增 feature 模块。", "--human-review-status", "completed", tmp_path=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    draft_with_old_block = (tmp_path / "pr_body.md").read_text(encoding="utf-8")
+
+    downgraded = run_gate(repo, draft_with_old_block, tmp_path=tmp_path)
+    assert downgraded.returncode == 1
+    assert "silently downgrade" in downgraded.stdout
+
+    reset = run_gate(repo, draft_with_old_block, "--review-status-reset", tmp_path=tmp_path)
+    assert reset.returncode == 0, reset.stdout + reset.stderr
 
 
 def test_wip_stage_defers_docker_gate(repo, tmp_path):

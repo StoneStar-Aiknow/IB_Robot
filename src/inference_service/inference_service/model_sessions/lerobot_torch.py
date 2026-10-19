@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
 from typing import Any
 
+import numpy as np
+
 from inference_manifest import TorchRuntimeProfile
 from inference_service.auto_horizon_runtime import build_action_attention_collector
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
@@ -86,7 +88,21 @@ class LeRobotTorchModelSession(ModelSession):
     def preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         if self._preprocessor is None:
             raise BackendInferenceError("LeRobot preprocessor is not loaded", code="runtime_not_loaded")
-        return self._preprocessor(dict(inputs))
+        prepared = dict(inputs)
+        transform = getattr(self._policy_provider, "preprocess_inputs", None)
+        if transform is not None:
+            prepared = dict(transform(prepared, config=self._policy_config))
+        if self._configured_device_name == "npu":
+            # HWC->CHW views are cheap on the host but costly for a strided NPU
+            # upload. Pack before LeRobot's device processor; include this copy
+            # in normal preprocessing timing and leave device tensors alone.
+            is_tensor = getattr(self._torch, "is_tensor", lambda value: False)
+            for name, value in prepared.items():
+                if isinstance(value, np.ndarray):
+                    prepared[name] = np.ascontiguousarray(value) if value.ndim else value
+                elif is_tensor(value) and value.device.type == "cpu":
+                    prepared[name] = value.contiguous()
+        return self._preprocessor(prepared)
 
     def postprocess(self, action: object) -> object:
         if self._postprocessor is None:
@@ -153,12 +169,19 @@ class LeRobotTorchModelSession(ModelSession):
             ) from exc
         if provider is not None:
             try:
+                provider_options = self._provider_load_options(
+                    provider, policy_config, context.validated_manifest.deployment.extra_parameters
+                )
                 policy_config = provider.configure_config(policy_config, model_dtype=model_dtype)
             except (AttributeError, TypeError, ValueError) as exc:
                 raise BackendLoadError(
                     f"unable to configure repository-owned Torch policy: {exc}",
                     code="incompatible_policy_config",
                 ) from exc
+        else:
+            provider_options = self._provider_load_options(
+                None, policy_config, context.validated_manifest.deployment.extra_parameters
+            )
         try:
             policy_config.device = profile.device
         except (AttributeError, TypeError) as exc:
@@ -206,6 +229,7 @@ class LeRobotTorchModelSession(ModelSession):
         }
         if provider is not None:
             policy_load_options.update(provider.load_options)
+            policy_load_options.update(provider_options)
         policy = policy_class.from_pretrained(
             bundle_path,
             **policy_load_options,
@@ -256,6 +280,11 @@ class LeRobotTorchModelSession(ModelSession):
             preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": {"device": str(device)}},
         )
+        configure_processors = getattr(provider, "configure_processors", None)
+        if configure_processors is not None:
+            configure_processors(
+                preprocessor=self._preprocessor, postprocessor=self._postprocessor, config=policy_config
+            )
         self._model_dtype = model_dtype
         resettable = callable(getattr(policy, "reset", None))
         self._update_loaded_capabilities(
@@ -397,6 +426,24 @@ class LeRobotTorchModelSession(ModelSession):
         if parameter is not None:
             return move(device=getattr(parameter, "device", self._device), dtype=getattr(parameter, "dtype", None))
         return move(self._device)
+
+    @staticmethod
+    def _provider_load_options(provider, config, extra_parameters: Mapping[str, object]) -> dict[str, object]:
+        from copy import deepcopy
+
+        resolve = getattr(provider, "resolve_load_options", None)
+        if resolve is None:
+            if extra_parameters:
+                raise BackendLoadError(
+                    "this Torch policy does not support deployment.extra_parameters",
+                    code="invalid_deployment",
+                )
+            return {}
+        options = dict(resolve(config=config, extra_parameters=deepcopy(dict(extra_parameters))))
+        reserved = {"config", "pretrained_path", "pretrained_name_or_path", "strict", "local_files_only"}
+        if reserved.intersection(options):
+            raise ValueError(f"provider load options cannot replace {sorted(reserved.intersection(options))}")
+        return options
 
     @staticmethod
     def validate_runtime_options(options: Mapping[str, object]) -> str:

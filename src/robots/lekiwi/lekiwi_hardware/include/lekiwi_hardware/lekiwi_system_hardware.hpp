@@ -73,7 +73,13 @@ private:
   std::string port_;
   std::string calib_file_;
   bool simulated_ = false;
-  void teardown_bus();
+  /// True between a successful on_activate() and the next on_deactivate().
+  /// Humble keeps calling read()/write() on inactive hardware; write() must
+  /// then send nothing, because the motors were released on purpose.
+  bool active_ = false;
+  /// Release every motor and close the bus. Returns false when any release
+  /// failed; the bus is closed either way.
+  bool teardown_bus();
   bool base_only_mode_ = false;
   size_t num_arm_joints_ = 0;
   size_t num_base_joints_ = 0;

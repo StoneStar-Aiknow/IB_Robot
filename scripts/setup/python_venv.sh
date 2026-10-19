@@ -73,135 +73,105 @@ if version not in spec:
     return 0
 }
 
-_cann_version_from_file() {
-    local version_file="$1"
-    local line version
-
-    [[ -r "${version_file}" ]] || return 1
-    while IFS= read -r line || [[ -n "${line}" ]]; do
-        case "${line}" in
-            version=*)
-                version="${line#version=}"
-                ;;
-            version_dir=*)
-                version="${line#version_dir=}"
-                ;;
-            *_running_version=\[*:*\])
-                version="${line#*:}"
-                version="${version%%]*}"
-                ;;
-            *)
-                continue
-                ;;
-        esac
-        version="${version%$'\r'}"
-        if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
-            printf '%s\n' "${version}"
-            return 0
-        fi
-    done < "${version_file}"
-    return 1
-}
-
-detect_cann_version() {
-    # CANN's "latest" path can be a merged directory of component symlinks,
-    # not a symlink to the release directory. Prefer its public version.cfg,
-    # then cover versioned toolkit roots and component metadata.
-    local toolkit_root="${IBR_CANN_TOOLKIT_ROOT:-${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
-    local version_file version resolved_root
-    local version_files=(
-        "${toolkit_root}/version.cfg"
-        "${toolkit_root}/ascend_toolkit_install.info"
-        "${toolkit_root}/aarch64-linux/ascend_toolkit_install.info"
-        "${toolkit_root}/arm64-linux/ascend_toolkit_install.info"
-        "${toolkit_root}/x86_64-linux/ascend_toolkit_install.info"
-        "${toolkit_root}/runtime/version.info"
-        "${toolkit_root}/toolkit/version.info"
-    )
-
-    for version_file in "${version_files[@]}"; do
-        if version="$(_cann_version_from_file "${version_file}")"; then
-            printf '%s\n' "${version}"
-            return 0
-        fi
-    done
-
-    resolved_root="$(readlink -f "${toolkit_root}" 2>/dev/null || true)"
-    version="${resolved_root##*/}"
-    if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
-        printf '%s\n' "${version}"
-        return 0
-    fi
-    return 1
-}
-
-openeuler_requirements_for_cann() {
-    local cann_version="${1:-}"
-
-    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
-        printf '%s\n' "openeuler-24.03-cann-8.1.txt"
-    else
-        printf '%s\n' "openeuler-24.03.txt"
-    fi
-}
-
+# detect_cann_version lives in setup/detect.sh: it feeds the accelerator axis
+# (SETUP_ACCEL_ID), which has to be resolved before any Torch build is chosen.
+# The Torch ABI that CANN dictates is no longer selected here: it belongs to the
+# accelerator axis, so accels/cann.sh picks it from requirements/accel-cann-*.txt
+# and install_accel_requirements installs it on whichever OS carries the NPU.
 install_openeuler_python_dependencies() {
     local pip_runner=("$@")
-    local cann_version=""
-    local requirements_file
 
-    if cann_version="$(detect_cann_version)"; then
-        log_info "Detected CANN ${cann_version}."
-    else
-        log_info "No active CANN installation detected."
-    fi
-    requirements_file="$(openeuler_requirements_for_cann "${cann_version}")"
-
-    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
-        log_info "Using the CANN 8.1 Torch ABI requirements."
-    else
-        log_info "Using the default openEuler requirements."
-    fi
-    run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/${requirements_file}" --quiet
+    run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/openeuler-24.03.txt" --quiet
 }
 
+# Accelerator-axis Python dependencies, installed on every OS. The OS axis
+# installs its own list separately; neither may carry the other's packages.
+install_accel_requirements() {
+    local pip_runner=("$@")
+    local requirements_file rc=0
+
+    # Capture the status explicitly: a failing command substitution inside a
+    # bare assignment does not trip errexit, and the hook contract still
+    # allows an accelerator to refuse outright (a broken runtime, not merely
+    # an unvalidated release).
+    requirements_file="$(accel_requirements)" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        log_error "Accelerator ${SETUP_ACCEL_ID} cannot select its Python dependencies; see above."
+        return 1
+    fi
+    if [[ -z "${requirements_file}" ]]; then
+        # An empty result means "no accelerator packages to install". For cann
+        # that is a deferral, not a no-op: either no CANN toolkit was detected
+        # or the detected release has no validated Torch ABI here, so no
+        # torch_npu landed in the venv. The hook ran inside the $( ) subshell
+        # above and cannot set variables here, so the CALLER records the
+        # pending state from the empty result; setup.sh's end summary reads it
+        # and prints the manual-configuration guidance.
+        if [[ "${SETUP_ACCEL_ID}" == "cann" ]]; then
+            ACCEL_NPU_PENDING_MANUAL_CONFIG=true
+            log_warn "No NPU backend installed for cann; NPU inference stays unavailable until it is configured manually."
+        else
+            log_info "No accelerator-specific Python dependencies for ${SETUP_ACCEL_ID}."
+        fi
+        return 0
+    fi
+    log_info "Installing ${SETUP_ACCEL_ID} accelerator dependencies..."
+    run_cmd "${pip_runner[@]}" -r "${requirements_file}" --quiet
+}
+
+# The CANN release selects the exact Torch triple it requires. 8.1 is
+# hardware-validated on Ascend310P1; 8.3 follows Ascend's compatibility table
+# (torch_npu 2.8.0 pairs with CANN 8.3.RC1 and requires exactly torch 2.8.0,
+# torchvision 0.23.0 matches).
 verify_cann_torch_abi() {
     local python_path="$1"
-    local cann_version=""
+    local cann_version="" release torch_pin torch_npu_pin torchvision_pin
 
     cann_version="$(detect_cann_version 2>/dev/null || true)"
-    [[ "${cann_version}" =~ ^8[.]1([.]|$) ]] || return 0
-    "${python_path}" - <<'PY'
+    case "${cann_version}" in
+        8.1*) release="8.1"; torch_pin="2.5.1"; torch_npu_pin="2.5.1"; torchvision_pin="0.20.1" ;;
+        8.3*) release="8.3"; torch_pin="2.8.0"; torch_npu_pin="2.8.0"; torchvision_pin="0.23.0" ;;
+        *) return 0 ;;
+    esac
+    "${python_path}" - "${release}" "${torch_pin}" "${torch_npu_pin}" "${torchvision_pin}" <<'PY'
+import sys
+
+release, torch_pin, torch_npu_pin, torchvision_pin = sys.argv[1:5]
 import torch
 import torch_npu
 import torchvision
 
-expected = {"torch": "2.5.1", "torch_npu": "2.5.1", "torchvision": "0.20.1"}
+expected = {"torch": torch_pin, "torch_npu": torch_npu_pin, "torchvision": torchvision_pin}
 actual = {
     "torch": torch.__version__.split("+", maxsplit=1)[0],
     "torch_npu": torch_npu.__version__.split("+", maxsplit=1)[0],
     "torchvision": torchvision.__version__.split("+", maxsplit=1)[0],
 }
 if actual != expected:
-    raise SystemExit(f"CANN 8.1 requires the exact Torch ABI {expected}, got {actual}")
-print(f"CANN 8.1 Torch ABI verified: {actual}")
+    raise SystemExit(f"CANN {release} requires the exact Torch ABI {expected}, got {actual}")
+print(f"CANN {release} Torch ABI verified: {actual}")
 PY
 }
 
 verify_cann_runtime_versions() {
     local python_path="$1"
-    local cann_version=""
+    local cann_version="" release
     cann_version="$(detect_cann_version 2>/dev/null || true)"
-    [[ "${cann_version}" =~ ^8[.]1([.]|$) ]] || return 0
+    case "${cann_version}" in
+        8.1*) release="8.1" ;;
+        8.3*) release="8.3" ;;
+        *) return 0 ;;
+    esac
     verify_cann_torch_abi "${python_path}" || return 1
-    "${python_path}" - "${WORKSPACE}/requirements/constraints-cann-8.1.txt" <<'PY'
+    "${python_path}" - "${release}" "${WORKSPACE}/requirements/constraints-cann-${release}.txt" <<'PY'
 import importlib.metadata
 import sys
 from pathlib import Path
 
 from packaging.requirements import Requirement
 
-for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+release, constraints_path = sys.argv[1], Path(sys.argv[2])
+for raw in constraints_path.read_text(encoding="utf-8").splitlines():
     line = raw.strip()
     if not line or line.startswith("#"):
         continue
@@ -214,17 +184,16 @@ for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
             continue
         raise
     if installed not in requirement.specifier:
-        raise SystemExit(f"CANN 8.1 requires {requirement}, got {installed}")
-    print(f"CANN 8.1 runtime verified: {requirement.name}=={installed}")
+        raise SystemExit(f"CANN {release} requires {requirement}, got {installed}")
+    print(f"CANN {release} runtime verified: {requirement.name}=={installed}")
 numpy_version = importlib.metadata.version("numpy")
 if numpy_version != "1.26.4":
-    raise SystemExit(f"CANN 8.1 final ROS ABI requires numpy==1.26.4, got {numpy_version}")
+    raise SystemExit(f"CANN {release} final ROS ABI requires numpy==1.26.4, got {numpy_version}")
 PY
 }
 
 install_lerobot_editable() {
     local pip_runner=("$@")
-    local cann_version=""
 
     if ! check_lerobot_python_compat; then
         log_error "Cannot install lerobot: Python version is incompatible."
@@ -234,21 +203,6 @@ install_lerobot_editable() {
     fi
 
     check_lerobot_ros_numpy_compat
-
-    cann_version="$(detect_cann_version 2>/dev/null || true)"
-    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
-        log_info "Installing the shared CANN 8.1-compatible LeRobot v0.6 runtime..."
-        run_cmd "${pip_runner[@]}" install \
-            -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-compat.txt" --quiet
-        if [[ "${SETUP_PROFILE:-full}" == "full" ]]; then
-            log_info "Installing the CANN 8.1-compatible full-workspace LeRobot dependencies..."
-            run_cmd "${pip_runner[@]}" install \
-                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-extras.txt" --quiet
-        fi
-        log_info "Installing LeRobot editable without its incompatible upstream Torch constraints..."
-        run_cmd "${pip_runner[@]}" install --no-deps -e "${WORKSPACE}/libs/lerobot"
-        return 0
-    fi
 
     # [smolvla,pi] extras pull in policy-specific deps; kinematics pulls in
     # placo for SO-101 Placo Cartesian teleop; diffusion pulls in diffusers
@@ -284,27 +238,60 @@ install_lerobot_editable() {
         "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
 }
 
+# TorchCodec release matching the pinned Torch 2.7.1 ABI. Upstream's
+# compatibility table pairs 0.4/0.5 with torch 2.7 and 0.6/0.7 with torch 2.8;
+# 0.5 is also the version the benchmark profile validates for the same Torch
+# build (BENCHMARK_TORCHCODEC_VERSION in benchmark_profile.sh). Keep both on
+# the same version for as long as they ride the same Torch.
+GRASPGEN_TORCHCODEC_VERSION="0.5"
+
 install_graspgen_torch_abi() {
-    # The checked-in pointnet2_ops wheel is built against this exact Torch ABI.
-    # Keep CUDA hosts on their existing Torch installation so the source-build
-    # path remains available, but make the no-nvcc path self-contained.
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        # The GraspGen pointnet2_ops ABI pin is a manipulation-stack concern;
-        # the inference profile keeps the Torch build selected by lerobot.
-        return 0
-    fi
-    if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
-        return 0
-    fi
-    if command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
-        return 0
+    # Both wheel paths use this exact ABI. A skip plan must leave the runtime
+    # alone, especially on GPUs that the pinned Torch itself cannot run on.
+    case "${1:-skip:no GraspGen install plan}" in
+        ok:*|build:*) ;;
+        *) return 0 ;;
+    esac
+
+    local torch_version torchvision_version torchcodec_version
+    torch_version="$("${VENV_PYTHON}" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+    torchvision_version="$("${VENV_PYTHON}" -c 'import torchvision; print(torchvision.__version__)' 2>/dev/null || true)"
+    if [[ "${torch_version}" != "2.7.1+cu126" || "${torchvision_version}" != "0.22.1+cu126" ]]; then
+        log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
+        run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
+            "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
+            --index-url "https://download.pytorch.org/whl/cu126" \
+            --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
     fi
 
-    log_info "Pinning Torch 2.7.1+cu126 for the precompiled pointnet2_ops ABI..."
-    run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall \
-        "torch==2.7.1+cu126" "torchvision==0.22.1+cu126" \
-        --index-url "https://download.pytorch.org/whl/cu126" \
-        --extra-index-url "${SETUP_PIP_INDEX_URL}" --quiet
+    # torchcodec is ABI-bound to a Torch minor but declares no torch
+    # requirement, so pip cannot see the conflict: LeRobot's [dataset] extra
+    # allows >=0.3.0,<0.12.0 and the resolver takes the newest, which links
+    # against a newer Torch (0.11.x wants libnvrtc.so.13, i.e. the CUDA 13
+    # runtime shipped with Torch 2.11). Install the matching version so
+    # LeRobot's own resolution finds the requirement already satisfied and
+    # leaves it alone. This check deliberately runs on its own instead of
+    # behind the Torch pin above: environments set up before it existed
+    # (master's no-nvcc pin path) already carry 2.7.1+cu126 with a
+    # resolver-picked torchcodec, and a re-run must heal them rather than
+    # short-circuit past them.
+    torchcodec_version="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("torchcodec"))' 2>/dev/null || true)"
+    if [[ "${torchcodec_version}" != "${GRASPGEN_TORCHCODEC_VERSION}" ]]; then
+        log_info "Pinning torchcodec ${GRASPGEN_TORCHCODEC_VERSION} for the Torch 2.7.1 ABI..."
+        # --no-deps, like the benchmark runtime ABI install: re-resolving here
+        # could replace either side of the ABI contract with an incompatible
+        # release.
+        run_cmd "${VENV_PYTHON}" -m pip install --force-reinstall --no-deps \
+            "torchcodec==${GRASPGEN_TORCHCODEC_VERSION}" --index-url "${SETUP_PIP_INDEX_URL}" --quiet
+    fi
+    # The ABI cannot be expressed as a constraint for pip to enforce, so verify
+    # unconditionally — also on hosts where both versions already match — that
+    # the extension loads and exposes its public decoder API.
+    if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c 'import torchcodec._core; from torchcodec.decoders import VideoDecoder' >/dev/null 2>&1; then
+        log_error "torchcodec ${GRASPGEN_TORCHCODEC_VERSION} does not load against the pinned Torch 2.7.1+cu126."
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" -c 'import torchcodec._core; from torchcodec.decoders import VideoDecoder' || true
+        return 1
+    fi
 }
 
 setup_python_venv() {
@@ -390,15 +377,12 @@ setup_python_venv() {
     fi
 
     # A function-local exported constraint applies to all pip invocations and
-    # build subprocesses, and is restored on return. Do not wait until the
-    # platform requirements step: extras can otherwise pull a newer Torch first.
-    local cann_version=""
+    # build subprocesses, and is restored on return. CUDA activates its GraspGen
+    # ABI constraint before LeRobot resolves only when the preflight confirms
+    # that pointnet2_ops will be installed. Other accelerators resolve LeRobot
+    # first, install their runtime override, and activate their constraint after
+    # that override; this preserves the CANN 8.1 metadata exception.
     local -x PIP_CONSTRAINT="${PIP_CONSTRAINT:-}"
-    cann_version="$(detect_cann_version 2>/dev/null || true)"
-    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
-        PIP_CONSTRAINT="${WORKSPACE}/requirements/constraints-cann-8.1.txt${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
-        log_info "Protecting the validated CANN 8.1 runtime during every dependency install."
-    fi
     local pip_install=("${VENV_PYTHON}" -m pip install)
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
     local ros_abi_pin_packages=("numpy==1.26.4" "opencv-python-headless<4.12")
@@ -431,13 +415,31 @@ setup_python_venv() {
         ensure_lerobot_patch_stack_applied
     fi
 
+    # Preflight before any GraspGen Torch pin or LeRobot dependency resolution.
+    # The same plan drives the later wheel install so a skipped stack never
+    # downgrades the runtime merely for an extension that will not be installed.
+    local pointnet2ops_plan="skip:GraspGen is disabled for this setup profile"
+    if [[ "${full_profile}" == true && "${INSTALL_BENCHMARK_DEPS:-false}" != true ]] &&
+        accel_supports_torch_grasp; then
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
+        unset GRASPGEN_POINTNET2OPS_WHEEL
+        pointnet2ops_plan="$(graspgen_pointnet2ops_plan)"
+    fi
+
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
         benchmark_prepare_torch_profile "${VENV_PYTHON}" "${venv_path}/benchmark_torch_constraints.txt"
         # Protect the validated Torch/TorchVision/TorchCodec ABI during every
         # subsequent dependency install, not only the LeRobot editable step.
         pip_install+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
     else
-        install_graspgen_torch_abi
+        install_graspgen_torch_abi "${pointnet2ops_plan}"
+        if [[ "${pointnet2ops_plan%%:*}" != "skip" ]]; then
+            local grasp_torch_constraints="${venv_path}/graspgen_torch_constraints.txt"
+            printf '%s\n' 'torch==2.7.1+cu126' 'torchvision==0.22.1+cu126' \
+                "torchcodec==${GRASPGEN_TORCHCODEC_VERSION}" > "${grasp_torch_constraints}"
+            PIP_CONSTRAINT="${grasp_torch_constraints}${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+        fi
     fi
 
     # Install LeRobot in editable mode
@@ -447,6 +449,23 @@ setup_python_venv() {
     if [[ -d "${lerobot_dir}" ]]; then
         log_info "Installing LeRobot in editable mode with kinematics extra..."
         install_lerobot_editable "${VENV_PYTHON}" -m pip
+    fi
+
+    # Accelerator-axis dependencies, on every OS. torch_npu used to live in the
+    # openEuler list, which is why an Ubuntu host with an Ascend NPU could never
+    # get it; the axis decides this now, not the OS.
+    #
+    # This runs immediately after LeRobot so the override lands on top of
+    # LeRobot's resolution, and the constraint is activated right after it so no
+    # later step can replace the selected ABI.
+    install_accel_requirements "${pip_install[@]}"
+    accel_post_requirements "${pip_install[@]}"
+
+    local accel_constraints
+    accel_constraints="$(accel_pip_constraints)"
+    if [[ -n "${accel_constraints}" ]]; then
+        PIP_CONSTRAINT="${accel_constraints}${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+        log_info "Protecting the validated ${SETUP_ACCEL_ID} Torch runtime for every later dependency install."
     fi
 
     # Install base Python dependencies
@@ -501,7 +520,7 @@ setup_python_venv() {
         log_info "Skipping dev-tools (inference profile)."
     fi
 
-    # Install platform-specific dependencies (ONNX tooling, etc.)
+    # Install OS-axis dependencies (ONNX tooling, etc.)
     case "${SETUP_PLATFORM_ID}" in
         ubuntu-22.04)
             if [[ "${full_profile}" == true ]]; then
@@ -515,8 +534,8 @@ setup_python_venv() {
             ;;
         openeuler-embedded-24.03)
             # Installed whole in both profiles: onnx/onnxruntime (ONNX policy
-            # path), torch_npu (Ascend NPU inference), and pygraphviz (required
-            # by verify_env on this platform) are all inference-relevant.
+            # path) and pygraphviz (required by verify_env on this platform)
+            # are both inference-relevant.
             install_openeuler_python_dependencies "${pip_install[@]}"
             ;;
     esac
@@ -633,24 +652,75 @@ EOF
         log_warn "FullSubNet wheel not found at ${fullsubnet_wheel_root}; skipping (speech_direction Torch backend unavailable)."
     fi
 
-    # GraspGen runtime dependencies are part of the default install contract:
-    # manipulation_service is part of the default workspace build. Skip on
-    # openEuler Embedded because GraspGen's pointnet2_ops CUDA extension is
-    # validated on Ubuntu only; the Ascend OM path does not cover Torch grasp.
-    # On Ubuntu hosts without nvcc, install_graspgen_pip falls back to the
-    # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
+    # GraspGen and GraspGenX runtime dependencies are part of the default
+    # install contract: manipulation_service is part of the default workspace
+    # build. The stack is gated on the accelerator, not the OS: pointnet2_ops is
+    # a CUDA extension, and the Ascend grasp path is the OM runtime instead.
+    # install_graspgen_pip installs the audited grasp_gen and pointnet2_ops
+    # wheels and validates the latter's Torch/Python ABI contract.
+    # Record whether grasp was actually installed and let the smoke test below
+    # key off that fact rather than re-deriving the condition. Re-deriving is
+    # how the smoke test kept an OS test after the install moved to the
+    # accelerator axis, which made a full setup on Ubuntu + Ascend or Ubuntu +
+    # CPU skip the install and then fail importing grasp_gen.
+    local grasp_installed=false
+    local graspgenx_wheel_root="${WORKSPACE}/third_party/wheels/graspgenx/b942909"
+    local graspgenx_wheel="${graspgenx_wheel_root}/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl"
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping grasp dependencies (inference profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
         log_info "Skipping GraspGen/manipulation dependencies for Benchmark-only setup."
-    elif [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
+    elif ! accel_supports_torch_grasp; then
+        log_warn "Skipping grasp dependencies on accelerator ${SETUP_ACCEL_ID}; Torch GraspGen needs CUDA."
+        log_warn "Re-run with --accel cuda to install them regardless, e.g. on a host with a CUDA toolkit but no visible GPU."
     else
-        log_info "Installing grasp dependencies (GraspGen)..."
-        # shellcheck disable=SC1091
-        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
-        export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
-        install_graspgen_pip "${VENV_PYTHON}" -m pip install
+        local pointnet2ops_action pointnet2ops_arg
+        pointnet2ops_action="${pointnet2ops_plan%%:*}"
+        pointnet2ops_arg="${pointnet2ops_plan#*:}"
+        local install_grasp=true
+        if [[ "${pointnet2ops_action}" == "skip" ]]; then
+            log_warn "Skipping grasp dependencies: ${pointnet2ops_arg}"
+            install_grasp=false
+        elif [[ "${pointnet2ops_action}" == "build" ]] && ! graspgen_pointnet2ops_build "${pointnet2ops_arg}"; then
+            # The build is best-effort: it needs GitHub and a working CUDA
+            # toolchain, and its failure must degrade to a skipped grasp
+            # instead of aborting the whole setup.
+            log_warn "Skipping grasp dependencies: the local pointnet2_ops wheel build failed; resolve the error above and re-run setup."
+            install_grasp=false
+        fi
+        if [[ "${install_grasp}" == true ]]; then
+            log_info "Installing grasp dependencies (GraspGen)..."
+            export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
+            install_graspgen_pip "${VENV_PYTHON}" -m pip install
+            grasp_installed=true
+        fi
+    fi
+
+    # GraspGenX is installed on its own predicate, not with GraspGen. It ships
+    # as an audited pure-Python wheel built from its pinned upstream commit
+    # (scripts/build_graspgenx_wheel.sh) and its encoder is PTV3, so it needs
+    # neither pointnet2_ops nor a CUDA toolchain -- which is what lets an
+    # Ascend host serve it. --no-deps: upstream pins torch<2.7,
+    # diffusers==0.11.1 and huggingface-hub==0.25.2 for its authors' driver,
+    # while the versions this workspace needs are in
+    # requirements/graspgenx.txt and the accelerator's constraints.
+    local graspgenx_installed=false
+    if [[ "${full_profile}" != true ]]; then
+        log_info "Skipping GraspGenX (inference profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping GraspGenX for Benchmark-only setup."
+    elif ! accel_supports_torch_graspgenx; then
+        log_warn "Skipping GraspGenX on accelerator ${SETUP_ACCEL_ID}: it has no cuda or npu backend."
+    else
+        log_info "Installing GraspGenX..."
+        run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/graspgenx.txt" --quiet
+        if ! (cd "${graspgenx_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "GraspGenX wheel checksum verification failed."
+            return 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${graspgenx_wheel}" --quiet
+        graspgenx_installed=true
     fi
 
     # Optional speech_direction report dependencies (Plotly/Matplotlib). Pure-Python.
@@ -709,7 +779,8 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true && "${full_profile}" == true && "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
+    # Only assert the import when this run actually installed GraspGen.
+    if [[ "${grasp_installed}" == true ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 
@@ -717,7 +788,67 @@ try:
     importlib.import_module("grasp_gen")
 except Exception as exc:
     raise SystemExit(f"Missing grasp_gen after default grasp install: {exc}")
+try:
+    importlib.import_module("pointnet2_ops")
+except Exception as exc:
+    raise SystemExit(f"Missing pointnet2_ops after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
+PY
+    fi
+    # Only assert the import when this run actually installed GraspGenX.
+    if [[ "${graspgenx_installed}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib
+import importlib.metadata
+import os
+import tempfile
+
+# The distribution version, not graspgenx.__version__: the package hardcodes
+# "0.1.0" regardless of the build, so only the metadata distinguishes the
+# audited wheel from one built locally off a different patch stack.
+version = importlib.metadata.version("graspgenx")
+if version != "1.0.0+ibrobot.2":
+    raise SystemExit(f"Expected the audited GraspGenX 1.0.0+ibrobot.2, got {version}")
+
+# Importing graspgenx runs a hook that clones gripper descriptions and
+# checkpoints from Hugging Face unless both roots already exist, which would
+# make setup hang on a host without that network. Point them at empty
+# directories: the import only has to prove the wheel is loadable here, and
+# the runtime loader passes the bundle's own paths.
+with tempfile.TemporaryDirectory() as root:
+    for variable in ("GRASPGENX_GRIPPER_CFG_DIR", "GRASPGENX_CHECKPOINT_DIR"):
+        os.environ[variable] = root
+    try:
+        importlib.import_module("graspgenx.grasp_server")
+    except Exception as exc:
+        raise SystemExit(f"Missing graspgenx.grasp_server after GraspGenX install: {exc}")
+
+    # The seams patches 0002-0004 open, asserted as behaviour. The device
+    # property is checked for being a property: inserting it next to a
+    # decorated method is how a patch silently moves that decorator onto the
+    # property instead, which leaves load_gripper_input ungated and is
+    # invisible in the patch's own diff.
+    import inspect
+
+    from graspgenx.grasp_server import GraspGenXSampler, load_grasp_gen_model
+    from graspgenx.models.generator import GraspGenGenerator
+    from graspgenx.models.grasp_gen import GraspGen
+
+    for owner, name, parameter in (
+        (GraspGen, "from_config", "generator_class"),
+        (load_grasp_gen_model, None, "device"),
+    ):
+        function = owner if name is None else getattr(owner, name)
+        if parameter not in inspect.signature(function).parameters:
+            raise SystemExit(f"GraspGenX patch missing: {function.__qualname__} has no {parameter}")
+    if not isinstance(inspect.getattr_static(GraspGenXSampler, "device"), property):
+        raise SystemExit(
+            "GraspGenX patch 0004 is misapplied: GraspGenXSampler.device is not a property, "
+            "which means a decorator was captured by it"
+        )
+    if "initial_noise" not in inspect.getsource(GraspGenGenerator.forward_inference):
+        raise SystemExit("GraspGenX patch 0002 missing: the generator ignores initial_noise")
+print(f"GraspGenX smoke test passed: graspgenx=={version}; patch seams present")
 PY
     fi
     # gitlint ships in dev-tools.txt, which the inference profile skips.
@@ -774,9 +905,9 @@ PY
 
     # Optional full-profile installs run after the platform dependencies.
     # Validate at the very end so no later pip transaction can invalidate it.
-    if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        verify_cann_runtime_versions "${VENV_PYTHON}" || return 1
-    fi
+    # Gated on the accelerator, not the OS: an Ascend NPU needs the same ABI
+    # check on Ubuntu as it does on openEuler.
+    accel_verify_runtime "${VENV_PYTHON}" || return 1
     PYTHON_ENV_STATUS="done"
 
 }

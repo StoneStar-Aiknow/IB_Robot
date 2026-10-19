@@ -15,6 +15,7 @@
 #include "sim_sms_sts.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace feetech
@@ -95,23 +96,54 @@ void SimSmsSts::queue_ack(std::uint8_t id)
   queue_bytes({0xFF, 0xFF, id, 2, status, checksum});
 }
 
+void SimSmsSts::use_manual_clock()
+{
+  manual_clock_ = true;
+  last_advance_.reset();
+}
+
+void SimSmsSts::advance_clock(std::chrono::nanoseconds elapsed)
+{
+  manual_now_ += elapsed;
+}
+
+std::chrono::steady_clock::time_point SimSmsSts::now() const
+{
+  return manual_clock_ ? manual_now_ : std::chrono::steady_clock::now();
+}
+
 void SimSmsSts::advance_time()
 {
-  // Called once per read round: position-mode motors step toward their goal,
-  // wheel-mode motors accumulate rotation at the commanded speed.
+  // Called once per read round. Position-mode motors step toward their goal by
+  // a fixed amount per read. Wheel-mode motors rotate at the commanded speed
+  // (steps per second) for the time elapsed since the previous read round, so
+  // the read rate does not scale the simulated motion; the sub-tick remainder
+  // is carried so slow wheels do not stall on truncation.
+  const auto t = now();
+  const double dt_s =
+    last_advance_ ? std::chrono::duration<double>(t - *last_advance_).count() : 0.0;
+  last_advance_ = t;
   for (auto & [id, m] : motors_) {
     if (!m.present || !m.torque_on) {
       m.last_move_ticks = 0;
+      m.present_speed = 0;
+      m.wheel_residual_ticks = 0.0;
       continue;
     }
     if (m.wheel_mode) {
-      m.pos_ticks += m.wheel_speed_steps;
-      m.last_move_ticks = m.wheel_speed_steps;
+      const double travel = static_cast<double>(m.wheel_speed_steps) * dt_s + m.wheel_residual_ticks;
+      const auto whole = static_cast<std::int32_t>(std::trunc(travel));
+      m.wheel_residual_ticks = travel - static_cast<double>(whole);
+      m.pos_ticks += whole;
+      m.last_move_ticks = whole;
+      // Like the real servo, a wheel reports its speed in steps per second.
+      m.present_speed = m.wheel_speed_steps;
     } else {
       const std::int32_t delta = m.goal_ticks - m.pos_ticks;
       const std::int32_t step = std::clamp(delta, -converge_step_ticks, converge_step_ticks);
       m.pos_ticks += step;
       m.last_move_ticks = step;
+      m.present_speed = step;
     }
     // Wrap into the 12-bit encoder range like the real servo.
     m.pos_ticks = ((m.pos_ticks % 4096) + 4096) % 4096;
@@ -137,12 +169,12 @@ std::vector<std::uint8_t> SimSmsSts::register_block(
       case 56: value = static_cast<std::uint8_t>(m.pos_ticks & 0xFF); break;
       case 57: value = static_cast<std::uint8_t>((m.pos_ticks >> 8) & 0xFF); break;
       case 58: {
-        const std::uint16_t speed = encode_word(m.last_move_ticks);
+        const std::uint16_t speed = encode_word(m.present_speed);
         value = static_cast<std::uint8_t>(speed & 0xFF);
         break;
       }
       case 59: {
-        const std::uint16_t speed = encode_word(m.last_move_ticks);
+        const std::uint16_t speed = encode_word(m.present_speed);
         value = static_cast<std::uint8_t>((speed >> 8) & 0xFF);
         break;
       }

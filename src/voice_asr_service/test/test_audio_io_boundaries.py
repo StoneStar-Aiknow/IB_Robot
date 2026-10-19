@@ -94,6 +94,7 @@ def test_missing_file_and_unsupported_format_fail_with_contract_errors(tmp_path:
 
 def test_capture_contract_emits_float32_frames_within_unit_range():
     capture = AudioCaptureModule(AudioConfig(channels=1, chunk_size=512, buffer_seconds=1.0))
+    assert capture.start_capture() is True
 
     pcm = np.array([32767, -32768, 0, 16384] * 512, dtype=np.int16)
     assert capture.feed_audio(pcm.tobytes(), channels=1) is True
@@ -109,6 +110,7 @@ def test_capture_contract_emits_float32_frames_within_unit_range():
 
 def test_capture_preroll_retains_recent_frames_for_streaming_warmup():
     capture = AudioCaptureModule(AudioConfig(channels=1, chunk_size=512, buffer_seconds=1.0))
+    assert capture.start_capture() is True
     capture.feed_audio((np.ones(512 * 3, dtype=np.int16) * 1000).tobytes(), channels=1)
 
     pre_roll = capture.get_pre_roll_audio(seconds=0.05)

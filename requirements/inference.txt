@@ -6,8 +6,8 @@
 # simplification (onnx, onnxsim) and CPU ONNX Runtime execution checks.
 # Torch and LeRobot policy dependencies come from the lerobot editable
 # install; ROS message/runtime dependencies come from rosdep and the
-# system site-packages; Ascend NPU support on openEuler is covered by
-# requirements/openeuler-24.03.txt (torch_npu).
+# system site-packages; Ascend NPU support is covered by the accelerator axis
+# (requirements/accel-cann-*.txt, torch_npu) on whichever OS carries the NPU.
 onnx
 onnxsim
 onnxruntime

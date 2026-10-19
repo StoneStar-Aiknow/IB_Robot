@@ -1,0 +1,47 @@
+schema_version: 1
+name: mirror_start
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Start mirroring the person in front of the robot with the upper body.
+  category: social_interaction
+  when_to_use:
+  - play the mirror game
+  - copy what the person in front of the robot does
+  - start mirroring
+  do_not_use:
+  - condition: stop mirroring
+    instead_use: mirror_stop
+  aliases_zh:
+  - 照镜子
+  - 开始照镜子
+  - 学我动作
+  - 模仿我
+  aliases_en:
+  - mirror me
+  - start mirroring
+  - copy my moves
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Start mirroring the person in front of the robot with the upper body.
+  domain: social
+  moves_robot: true
+  required_control_mode: model_inference
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # The session reports why it could not start; starting again is the caller's call.
+  recovery_policy: never_retry
+  # The mirror session is the only publisher of the arm and hand channels.
+  required_capabilities:
+  - joint.position_stream
+  - hand.multi_joint
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

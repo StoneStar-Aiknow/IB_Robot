@@ -19,7 +19,8 @@ IB_Robot/
 │   ├── robots/aimdk/       # 灵犀 X2（AimDK）：桥接厂商 MC 层的运行时
 │   ├── lekiwi_hardware/    # LeKiwi 硬件接口
 │   ├── ibrobot_msgs/       # 自定义消息/服务定义
-│   ├── ibrobot_agent/      # 自然语言 Agent 孵化运行时（entry_mode=agent）
+│   ├── agent/              # Agent 栈（技能目录/Gateway/安全/规划/CLI/自然语言 Agent/总装 launch）
+│   ├── embodied_common/    # 具身公共契约层（agent 与非 agent 包共用）
 │   ├── sim_models/         # 仿真模型
 │   ├── model_utils/        # 模型工具
 │   ├── dataset_tools/      # 数据集工具
@@ -157,6 +158,37 @@ source .shrc_local && <your_command>
 `libs/lerobot` 是 git submodule，通过 `third_party/patches/lerobot/` 的 patch 栈管理。
 **禁止在普通 commit 中直接提交 `libs/lerobot` 的修改**。如需提交 lerobot 改动，
 必须通过 `ibrobot-lerobot-patch` skill 导出为 patch 文件。
+
+### OS 轴与加速器轴解耦（硬性规则）
+
+setup 有两条**互相独立**的轴，不要把它们混成一个判断：
+
+- **OS 轴** `SETUP_PLATFORM_ID`（`ubuntu-22.04` / `openeuler-embedded-24.03` /
+  `openharmony-5.1.0-musl`），实现在 `scripts/setup/platforms/<id>.sh`，管系统包管理器、
+  ROS 仓库、OS 特有依赖。
+- **加速器轴** `SETUP_ACCEL_ID`（`cuda` / `cann` / `cpu`），实现在
+  `scripts/setup/accels/<id>.sh`，管 Torch 构建、Torch ABI 约束、CUDA/NPU 扩展装不装。
+
+**不变量**：加速器相关的依赖与 Torch ABI **不得仅凭 OS 选择**。OS 文件（如
+`requirements/openeuler-24.03.txt`、`ubuntu-22.04.txt`）不放 Torch 或 `torch_npu`。
+
+昇腾同时部署在 openEuler 和 Ubuntu 上，所以**装哪套 Torch 不能由 OS 推导**。
+禁止新增**仅凭** `if [[ "${SETUP_PLATFORM_ID}" == ... ]]` 来决定 Torch 版本、CUDA/NPU 扩展或
+加速器相关依赖的判断——加速器维度必须经 `accel_*` 钩子；同时考虑 OS 与加速器兼容性
+（例如某 wheel 只有 x86_64 manylinux 构建）是允许的。各加速器当前如何落位（哪些依赖进
+`requirements/accel-*.txt`、哪些仍由 LeRobot 解析或由 `install_graspgen_torch_abi` 固定）
+见 [`scripts/setup/README.md`](scripts/setup/README.md)，不在本文件重复。反例见本规则引入前的
+`install_graspgen_torch_abi`：它只判断"是不是 Ubuntu"，于是在 Ubuntu + 昇腾主机上
+把 `torch==2.7.1+cu126` 强装到 `torch_npu` 需要的 Torch 之上。
+
+两条轴各有一个覆盖开关（`--platform` / `--accel`，后者也可用 `ACCEL_OVERRIDE`）。
+`--accel` 表达的是"要装哪套运行时"，不是"硬件在不在"：无 GPU 透传的容器里做 CUDA
+依赖验证就要显式传 `--accel cuda`。同时探测到 NVIDIA 和昇腾时 setup 拒绝猜测、直接报错。
+
+加速器探测只能看**设备**（`nvidia-smi -L`、`/dev/davinci*`），不能看工具包——只为交叉
+编译或模型转换装的 CUDA/CANN toolkit 不代表有卡；也**禁止靠 `import torch` 判断**——装哪个 Torch 正是这条轴要决定的东西。回归测试见
+`scripts/setup/tests/test_accel_axis.sh`（轴本身）和
+`scripts/setup/tests/test_cann_torch_versions.sh`（CANN 版本族与清单切分）。
 
 ### 模型转换中间产物
 

@@ -82,19 +82,22 @@ must describe one exact committed tree:
   inaccessible even when the directory exists.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
-- **NVIDIA GPU + CUDA toolkit on the host (optional)**: GraspGen's
-  `pointnet2_ops` CUDA extension is installed by default when a CUDA toolkit
-  (`nvcc`) is available. If the host has no CUDA toolkit, `setup.sh` will
-  warn and skip GraspGen install gracefully; the verification continues
-  without the grasp smoke test.
+- **NVIDIA GPU + CUDA toolkit on the host (not required)**: the default
+  verification container has no GPU passthrough, so GraspGen and
+  `pointnet2_ops` install from audited wheels in `third_party/wheels/` without
+  `nvcc` or GitHub. A CUDA 12.x toolkit matters only when a visible GPU cannot
+  run the audited SM86 wheel; that is outside this default GPU-less gate.
+  The `--accel cuda` flag itself is still required: accelerator detection reads
+  `nvidia-smi`, which a container without `--gpus` does not have, and would
+  otherwise resolve to `cpu` and skip the CUDA dependency set entirely.
   - Host CUDA toolkit with `nvcc` on PATH or at `/usr/local/cuda/bin/nvcc`.
     The toolkit directory is mounted read-only into the container at the same
     path, and `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` are set accordingly.
     System directories (`/`, `/usr`, `/usr/local`) are rejected to prevent
     accidental bind-mount of the entire system.
   - `--gpus` passthrough is NOT required for setup+build verification:
-    `pointnet2_ops` compilation uses `TORCH_CUDA_ARCH_LIST` (fixed, not
-    GPU-detected) and the smoke test only does `importlib.util.find_spec`.
+    `pointnet2_ops` installs as a prebuilt wheel and the smoke test imports it
+    without launching a CUDA kernel.
 
 ## Core Principle
 
@@ -139,7 +142,7 @@ corresponding phase section.
 | **2** | Create container, configure mirrors, create `testuser`, verify cache write | `CONTAINER_SECONDS` |
 | **3** | Prepare source workspace — **choose one mode** | `SOURCE_MODE`, `SOURCE_DETAILS` |
 | **3.5** | ROS source-switch pre-clean (conditional) — remove all `ros-*` packages when the change switches the ROS source | No ROS packages left |
-| **4** | Run `setup.sh --yes`, capture log and timing | `/tmp/setup.log`, `SETUP_ELAPSED_SECONDS` |
+| **4** | Run `setup.sh --yes --accel cuda`, capture log and timing | `/tmp/setup.log`, `SETUP_ELAPSED_SECONDS` |
 | **5** | Run `build.sh`, capture log and timing | `/tmp/build.log`, `BUILD_ELAPSED_SECONDS` |
 | **6** | Collect ERROR lines, report timing, clean up container | Final report |
 

@@ -1,0 +1,247 @@
+# AgiBot X2 "magic mirror" application configuration.
+#
+# It brings up the two HRI perception model services, the resident head-camera
+# PEAR stream, the mock playback stage and the mirror session. It starts no
+# camera driver. Commands reach the robot only through mirror_session, and only
+# with mirror_session.publish_enabled true.
+#
+# Everything else — arbitration, command topics, interaction surfaces — comes
+# from aimdk_x2_skills.yaml (and through it aimdk_x2.yaml) and the aimdk_robot
+# runtime profile. The interaction demo is deliberately not inherited.
+#
+# The skill stack carries only mirror_start / mirror_stop: a schema v1 robot
+# context compiles only skills of skill_required_control_mode, and the mirror
+# runs in model_inference. So the inherited preset named motions are switched
+# off here, binding included. mirror_session.interfaces is what makes launch
+# wait for the runtime and bind the live interface description.
+#
+# Deployment note: both bundles are Ascend 310P OM artifacts and are resolved
+# relative to WORKSPACE, so `source .shrc_local` must have run and
+# `$WORKSPACE/models/` must hold them. A missing bundle fails config parsing,
+# which aborts the whole launch rather than just the perception part.
+
+robot:
+  base_config: aimdk_x2_skills.yaml
+  name: aimdk_x2_magicmirror
+
+  default_control_mode: "model_inference"
+  skill_required_control_mode: "model_inference"
+
+  # This X2 carries OmniHand dexterous hands, so this entry selects the
+  # OmniHand profile: joint.hand_stream (20 radians, left 10 then right 10)
+  # instead of the 1-D gripper. type must match the profile's public identity.
+  # aimdk_x2.yaml and the profiles are used unchanged.
+  type: x2_ultra_omnihand
+  runtime:
+    profile: x2_ultra_omnihand
+
+  # Lists replace rather than merge, so this is the whole list: the base list
+  # with gripper.1d (not declared by the OmniHand profile; launch would wait
+  # for it forever) swapped for hand.multi_joint.
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      - hand.multi_joint
+      - base.cmd_vel
+      - base.navigation_gate
+      - motion.named
+      - motion.posture
+      - perception.camera
+      - perception.imu
+      - power.state
+      - diagnostics.codes
+      - interaction.tts
+      - interaction.expression
+      - interaction.led
+      - runtime.stop
+
+  # Only the two motion-imitation models. Each entry becomes one generic
+  # inference_service/model_service_node; nothing here is X2-specific, and the
+  # launch path that reads this block is gated on neither embodied nor the
+  # robot family.
+  perception_services:
+    services:
+      - id: hri_yolox_person
+        enabled: true
+        required: true
+        bundle_path: models/yolox_x_640
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:YoloXPersonDetectPlugin
+        service_type: ibrobot_msgs/srv/YoloXDetect
+        endpoint: /perception/hri/yolox_detect
+        node_name: hri_yolox_detect
+        runtime_options:
+          device_id: 0
+      - id: hri_pear_parameters
+        enabled: true
+        required: true
+        bundle_path: models/pear_parameter_network
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:PearParameterPredictPlugin
+        service_type: ibrobot_msgs/srv/PearParameterPredict
+        endpoint: /perception/hri/pear_parameters
+        node_name: hri_pear_parameters
+        runtime_options:
+          device_id: 0
+
+  # Resident head-camera -> YOLOX -> PEAR frame stream.
+  #
+  # Consumed by robot_config/launch_builders/motion_imitation_stream.py, which
+  # launches manipulation_execution/motion_imitation_stream_node alongside the
+  # two services above. The node is perception only: it publishes parameter
+  # frames and commands no motion, so starting it cannot move the robot.
+  #
+  # The camera is the left head-front stereo camera, by its compressed
+  # interface ID; the endpoint comes from the live description. This compute
+  # unit must not subscribe raw images across units, so only the compressed
+  # stream is used. With the whole launch running, this stream (2064x1552 JPEG)
+  # reached the node, while the front-centre camera (2688x1944) delivered
+  # almost no frames and the rgbd_head_front camera had no publisher. With no
+  # publisher the node idles and reports it once per status period rather
+  # than failing.
+  #
+  # frame_source.topic selects a stream the description does not carry, for
+  # example a resized stream from another compute unit; topic and interface
+  # are never both set. The decoder is chosen by name; mock_cpu is the
+  # in-process OpenCV decode (JPEG/PNG -> bgr8).
+  motion_imitation_stream:
+    enabled: true
+    frame_source:
+      interface: camera.stereo_head_front_left.color_compressed
+      decoder: mock_cpu
+      decoder_params: {}
+    frame_topic: /motion_imitation_stream/pear_frame
+    status_topic: /motion_imitation_stream/status
+    # ibrobot_msgs/ActorState, one per frame PEAR takes up. The actor
+    # selector follows the highest-confidence person.
+    actor_state_topic: /motion_imitation_stream/actor_state
+    # Detections older than this make the actor unknown, which never counts
+    # as present. Must exceed yolox_refresh_interval_sec.
+    actor_stale_sec: 3.0
+    yolox_detect_service: /perception/hri/yolox_detect
+    pear_parameters_service: /perception/hri/pear_parameters
+    person_confidence_threshold: 0.30
+    # Both models share one Ascend device. YOLOX is the expensive half and a
+    # standing person's box does not move much in a second, so the resident
+    # refresh is far lazier than the 0.25 s a bounded skill window uses.
+    yolox_refresh_interval_sec: 1.0
+    # A resident stream sheds rather than queues: at 30 Hz input a longer stall
+    # would sit behind dozens of skipped frames.
+    rpc_timeout_sec: 2.0
+    # 0 disables throttling; raise if the two bundles contend on device 0.
+    max_pear_hz: 0.0
+    publish_fallback_frames: true
+    status_period_sec: 5.0
+
+    # Mock retargeting + mock safety: it plays a recorded animation instead of
+    # retargeting the PEAR stream, so the whole chain can run while each stage
+    # is replaced independently. The PEAR stream is a liveness gate, not a data
+    # source -- losing the camera stops the motion. The first command of each
+    # round is clamped but not rate-limited (see motion_imitation_mock_node).
+    #
+    # It publishes on preview_topic only and plays only when mirror_session
+    # asks (~/play, once per round). mirror_session takes the preview through
+    # its gate; whether that reaches the robot is mirror_session.publish_enabled.
+    mock_playback:
+      enabled: true
+      animation_manifest: ""  # empty: use the clip shipped with manipulation_execution
+      preview_topic: /motion_imitation_mock/arm_command_preview
+      status_topic: /motion_imitation_mock/status
+      publish_rate_hz: 50.0
+      input_staleness_sec: 0.5
+      loop: true
+      status_period_sec: 5.0
+
+      # Arm travel the mock safety clamps against, in radians and rad/s.
+      # Application configuration, deliberately not in the runtime profile. Keyed
+      # by joint name and must name exactly the joints of joint.arm_stream; the
+      # published order comes from that channel in the runtime description,
+      # which also supplies the command endpoint. Values cited from the
+      # vendor URDF X2_URDF-v1.3.0 (x2_ultra.urdf, each joint's
+      # <limit lower/upper/velocity>). Left and right are mirrored, NOT
+      # identical: shoulder_roll and wrist_roll have opposite bands.
+      arm_limits:
+        left_shoulder_pitch_joint: [-3.0800, 2.0400]
+        left_shoulder_roll_joint: [-0.0610, 2.9930]
+        left_shoulder_yaw_joint: [-2.5560, 2.5560]
+        left_elbow_joint: [-2.3556, 0.0000]
+        left_wrist_yaw_joint: [-2.5560, 2.5560]
+        left_wrist_pitch_joint: [-0.5580, 0.5580]
+        left_wrist_roll_joint: [-1.5710, 0.7240]
+        right_shoulder_pitch_joint: [-3.0800, 2.0400]
+        right_shoulder_roll_joint: [-2.9930, 0.0610]
+        right_shoulder_yaw_joint: [-2.5560, 2.5560]
+        right_elbow_joint: [-2.3556, 0.0000]
+        right_wrist_yaw_joint: [-2.5560, 2.5560]
+        right_wrist_pitch_joint: [-0.5580, 0.5580]
+        right_wrist_roll_joint: [-0.7240, 1.5710]
+      arm_velocity_limits:
+        left_shoulder_pitch_joint: 13.088
+        left_shoulder_roll_joint: 13.088
+        left_shoulder_yaw_joint: 15.077
+        left_elbow_joint: 15.077
+        left_wrist_yaw_joint: 15.077
+        left_wrist_pitch_joint: 4.188
+        left_wrist_roll_joint: 4.188
+        right_shoulder_pitch_joint: 13.088
+        right_shoulder_roll_joint: 13.088
+        right_shoulder_yaw_joint: 15.077
+        right_elbow_joint: 15.077
+        right_wrist_yaw_joint: 15.077
+        right_wrist_pitch_joint: 4.188
+        right_wrist_roll_joint: 4.188
+
+  # Only the mirror's two skills (see the header). The session node is
+  # launched by robot_config; the Gateway calls its ~/set_session.
+  embodied:
+    skill_catalog_profile: aimdk_x2_magicmirror
+    runtime_named_motion:
+      enabled: false
+
+  # The mirror's control mode: the Gateway switches the runtime to its
+  # runtime_mode before mirror_start, and mirror_session takes that mode over.
+  # mirror_session is its only producer, so neither an inference pipeline nor
+  # an action dispatcher is launched for it.
+  control_modes:
+    model_inference:
+      description: "Upper body mirrors the person in front of the camera"
+      description_cn: "照镜子：上半身跟随镜头前的人"
+      runtime_mode: policy_stream
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  # The session node: WAIT / STANDBY / MIRRORING, the only publisher of the arm
+  # and hand channels. Its hooks keep their conservative defaults; with
+  # motion_imitation_stream.mock_playback enabled the window pipeline plays
+  # the mock animation.
+  #
+  # publish_enabled defaults to false so that bringing this up never moves the
+  # robot. With it false the session still takes over and
+  # releases policy_stream, and every command it would send is on
+  # /mirror_session/arm_command_preview and /mirror_session/hand_command_preview.
+  mirror_session:
+    enabled: true
+    publish_enabled: false
+    control_mode: model_inference
+    # How long the session may take to answer mirror_stop; the wrap-up gets
+    # this minus the 2 s release reserve. The Gateway refuses to start unless
+    # the mirror_stop skill timeout (skill_catalog, 5.0 s) is at least this
+    # plus 0.5 s, so the session's answer arrives before the Gateway gives up.
+    stop_timeout_sec: 4.5
+    publish_rate_hz: 50.0
+    status_period_sec: 1.0
+    # The runtime services the session and its release call. Logical
+    # bindings: launch waits for them and binds their endpoints from the live
+    # description (never a hard-coded name).
+    interfaces:
+      get_status:
+        interface: runtime.get_status
+        kind: service
+        type: ibrobot_msgs/srv/GetRuntimeStatus
+      set_mode:
+        interface: runtime.set_mode
+        kind: service
+        type: ibrobot_msgs/srv/SetRuntimeMode

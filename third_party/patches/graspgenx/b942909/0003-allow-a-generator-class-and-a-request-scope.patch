@@ -1,0 +1,83 @@
+diff --git a/graspgenx/models/grasp_gen.py b/graspgenx/models/grasp_gen.py
+index 14b8a5e..105bf13 100644
+--- a/graspgenx/models/grasp_gen.py
++++ b/graspgenx/models/grasp_gen.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import contextlib
+ import os
+ import glob
+ import torch
+@@ -42,17 +43,25 @@ class GraspGen(nn.Module):
+     Args:
+         grasp_generator_cfg (DictConfig): Configuration for the grasp generator
+         grasp_discriminator_cfg (DictConfig): Configuration for the grasp discriminator
++        generator_class: Generator type; defaults to the reference implementation.
+     """
+ 
+     def __init__(
+-        self, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig
++        self, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig,
++        generator_class=GraspGenGenerator,
+     ):
+         super(GraspGen, self).__init__()
+-        self.grasp_generator = GraspGenGenerator.from_config(grasp_generator_cfg)
++        self.grasp_generator = generator_class.from_config(grasp_generator_cfg)
+         self.grasp_discriminator = GraspGenDiscriminator.from_config(
+             grasp_discriminator_cfg
+         )
+ 
++    # Model assembly may install a per-request context manager. The Ascend
++    # encoders use it to compute coordinate-derived work once for the generator
++    # and the discriminator, which encode the same point cloud. The default
++    # scope does nothing, so other deployments are unaffected.
++    request_scope = contextlib.nullcontext
++
+     def forward(self, data):
+         """Forward pass combining generation and discrimination.
+ 
+@@ -62,12 +71,13 @@ class GraspGen(nn.Module):
+         Returns:
+             tuple: (outputs, losses, stats) containing generated and scored grasps
+         """
+-        outputs, _, stats = self.grasp_generator.infer(data, return_metrics=True)
+-        data.update(outputs)
+-        data["grasp_key"] = (
+-            "grasps_pred"  # Override to run discriminator inference on grasps predicted from previous step.
+-        )
+-        outputs, _, _ = self.grasp_discriminator.infer(data)
++        with self.request_scope():
++            outputs, _, stats = self.grasp_generator.infer(data, return_metrics=True)
++            data.update(outputs)
++            data["grasp_key"] = (
++                "grasps_pred"  # Override to run discriminator inference on grasps predicted from previous step.
++            )
++            outputs, _, _ = self.grasp_discriminator.infer(data)
+         return outputs, {}, stats
+ 
+     def infer(self, data, return_metrics=False):
+@@ -84,18 +94,20 @@ class GraspGen(nn.Module):
+ 
+     @classmethod
+     def from_config(
+-        cls, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig
++        cls, grasp_generator_cfg: DictConfig, grasp_discriminator_cfg: DictConfig,
++        generator_class=GraspGenGenerator,
+     ):
+         """Creates a GraspGen instance from configuration objects.
+ 
+         Args:
+             grasp_generator_cfg (DictConfig): Configuration for the grasp generator
+             grasp_discriminator_cfg (DictConfig): Configuration for the grasp discriminator
++            generator_class: Explicit generator type for experimental inference.
+ 
+         Returns:
+             GraspGen: Instantiated model
+         """
+-        return GraspGen(grasp_generator_cfg, grasp_discriminator_cfg)
++        return cls(grasp_generator_cfg, grasp_discriminator_cfg, generator_class=generator_class)
+ 
+     def load_state_dict(
+         self, grasp_generator_ckpt_filepath: str, grasp_discriminator_ckpt_filepath: str

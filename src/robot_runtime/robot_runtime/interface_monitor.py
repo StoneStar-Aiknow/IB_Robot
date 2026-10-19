@@ -12,7 +12,14 @@ from rosidl_runtime_py.utilities import get_message
 
 
 class InterfaceMonitor:
-    def __init__(self, node, description: dict):
+    def __init__(self, node, description: dict, *, callback_group=None):
+        """Observe published interfaces; ``callback_group`` keeps them off the default group.
+
+        A runtime whose default callback group also carries high-rate telemetry
+        (this platform feeds joint feedback at ~500 Hz) can starve a low-rate
+        readiness subscription long enough to be reported stale. Callers that
+        need timely observation pass their own group.
+        """
         self._lock = threading.Lock()
         self._states = {}
         self._times = {}
@@ -53,12 +60,17 @@ class InterfaceMonitor:
                 reliability=reliability,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL if latched else DurabilityPolicy.VOLATILE,
             )
+            # Only name the group when one was given: rclpy's own default is
+            # None, so omitting it is identical, and simple node doubles that
+            # mirror create_subscription positionally keep working.
+            extra = {} if callback_group is None else {"callback_group": callback_group}
             self._subscriptions.append(
                 node.create_subscription(
                     msg_type,
                     interface["endpoint"],
                     lambda msg, key=name, spec=interface: self.observe(key, spec, msg),
                     qos,
+                    **extra,
                 )
             )
 

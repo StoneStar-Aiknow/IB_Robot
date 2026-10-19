@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "feetech/conversion.hpp"
+
 namespace lekiwi
 {
 
@@ -78,6 +80,19 @@ bool wheel_deltas_to_body(
   dtheta = (j11 * (j22 * b3 - b2 * j23) - j12 * (j12 * b3 - b1 * j23) +
             b1 * (j12 * j23 - j22 * j13)) / det;
   return true;
+}
+
+std::array<double, 3> wheel_position_deltas(
+  const std::array<double, 3> & current, const std::array<double, 3> & previous)
+{
+  // One encoder revolution in the radians the bus reports.
+  constexpr double kRevolution = feetech::kTicksPerRevolution / feetech::kTicksPerRad;
+  std::array<double, 3> deltas{};
+  for (std::size_t i = 0; i < 3; ++i) {
+    // remainder() maps the raw difference into [-half turn, +half turn].
+    deltas[i] = std::remainder(current[i] - previous[i], kRevolution);
+  }
+  return deltas;
 }
 
 void integrate_pose(BasePose & pose, double dx, double dy, double dtheta)
@@ -142,20 +157,28 @@ bool OmniBase::read_wheels(
   // Scope the read to the wheel motors. The bus is shared with the arm on a
   // full LeKiwi, and an unresponsive arm motor must not take the base's
   // odometry down with it.
-  if (!bus_.sync_read(samples, wheel_ids_).ok) {
+  if (wheel_ids_.size() != positions.size() ||
+    !bus_.sync_read(samples, wheel_ids_).ok || samples.size() != wheel_ids_.size())
+  {
     return false;
   }
+  // Validate into temporary outputs: no partial update on a later wheel fault.
+  std::array<double, 3> next_positions{}, next_velocities{};
   // Map samples by motor id (registry order may differ from mount order).
   for (std::size_t i = 0; i < wheel_ids_.size(); ++i) {
     const std::uint8_t id = wheel_ids_[i];
     const auto sample = std::find_if(samples.begin(), samples.end(),
       [id](const feetech::MotorSample & s) { return s.id == id; });
-    if (sample == samples.end()) {
+    if (sample == samples.end() || !sample->valid || sample->protection != 0 ||
+      !std::isfinite(sample->position) || !std::isfinite(sample->velocity))
+    {
       return false;
     }
-    positions[i] = sample->position;
-    velocities[i] = sample->velocity;
+    next_positions[i] = sample->position;
+    next_velocities[i] = sample->velocity;
   }
+  positions = next_positions;
+  velocities = next_velocities;
   return true;
 }
 
@@ -172,10 +195,7 @@ bool OmniBase::update_odometry(BasePose & pose)
     return true;
   }
 
-  std::array<double, 3> deltas{};
-  for (std::size_t i = 0; i < 3; ++i) {
-    deltas[i] = positions[i] - last_positions_[i];
-  }
+  const auto deltas = wheel_position_deltas(positions, last_positions_);
   last_positions_ = positions;
 
   double dx = 0.0, dy = 0.0, dtheta = 0.0;

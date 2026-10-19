@@ -28,12 +28,34 @@ ros2 run ibrobot_agent ibrobot_agent_chat \
   --robot-scope so101_single_arm
 ```
 
-保持客户端在线直到最终事件；展示回执仍是当前 Agent 运行链路的一部分。
+客户端可随时连接；typed Program 采用直接执行、异步展示，不再需要展示回执，
+机器人可能先于界面显示开始运动（见 `src/agent/ibrobot_agent/README.md`「展示协议」）。
 不要通过立即 EOF 或紧接 `/quit` 的管道模拟交互客户端。
 直接使用 `robot-skill` 时，provider 配置需要本次 launch 生成的
 `/tmp/ibrobot_interfaces_*/robot.yaml` 绑定快照。
 
-## 2026-10-08 实测
+## 2026-10-10 实测：异步展示
+
+同一入口与 provider（`kimicode` / `kimi-for-coding`），探针不发送任何展示回执：
+
+```bash
+cd src/agent/ibrobot_agent/test
+python3 agent_node_kimi_hardware_probe.py --steps nod_yes
+python3 agent_node_kimi_hardware_probe.py \
+  --text "先点头一次，然后回到安全位置，只执行这两个动作。" --steps nod_yes recover_safe_pose
+```
+
+| 请求 | 规划步骤 | 终态 | presentation 到达 | terminal 到达 |
+|---|---|---|---|---|
+| 只执行一次点头动作，不要执行其他动作 | `nod_yes` | `SUCCEEDED` | 2924 ms | 10243 ms |
+| 先点头一次，然后回到安全位置，只执行这两个动作 | `nod_yes` → `recover_safe_pose` | `SUCCEEDED` | 5039 ms | 14340 ms |
+
+两次事件序列均为 `proposal_ready` → `presentation`（`async_display: true`）→ `terminal`，
+没有 `presentation_rendered`；控制器日志共 9 次 `Goal reached, success!`。
+时间从发布请求起算，包含 Kimi 规划与物理运动；与下方旧样本的任务相同但未做受控对比，
+不能据此计算展示门控节省的时间。
+
+## 2026-10-08 实测（旧展示回执流程）
 
 真实 provider 为 `kimicode`，模型为 `kimi-for-coding`。
 持续在线客户端通过 `/agent/request` 提交自然语言，核对并展示 Kimi 生成的

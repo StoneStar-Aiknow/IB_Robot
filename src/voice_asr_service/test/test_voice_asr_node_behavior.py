@@ -168,6 +168,8 @@ def make_node(
     node._asr = asr or FakeASR()
     node._pipeline_init_error = None
     node._asr_init_error = None
+    node._external_mode = False
+    node._external_input = None
     node._state_machine = StateMachine()
     node._state_machine.set_mode(mode)
     node._state_machine._state = node_state
@@ -398,3 +400,108 @@ def test_vad_audio_contract_mismatch_fails_closed():
     node = make_node(vad_runtime=FakeVADRuntime(frame_size=256))
     with pytest.raises(ValueError, match="frame_size=256"):
         node._validate_vad_audio_contract(node._vad_runtime)
+
+
+def test_failed_final_decode_drops_the_utterance_and_keeps_listening():
+    node = make_node(vad_state=VADState.SILENCE, node_state=NodeState.RECOGNIZING)
+    node._audio_capture.chunks.append(np.zeros(512, dtype=np.float32))
+
+    def raise_final():
+        raise RuntimeError("encoder execute failed")
+
+    node._asr.end_streaming = raise_final
+
+    node._process_audio()
+
+    assert node.commands == []
+    assert node._state_machine.state is NodeState.LISTENING
+    assert node._asr.reset_calls == 1
+
+
+def _external_node(mode=ActiveMode.MANUAL, ready=True):
+    from voice_asr_service.external_vad_input import ExternalVadInput
+
+    node = make_node(mode=mode, node_state=NodeState.IDLE, asr=FakeASR(ready=ready))
+    node._external_mode = True
+    node._pipeline_init_error = None if ready else "model init failed"
+    node._cb_group = None
+    node.create_subscription = lambda *_args, **_kwargs: None
+    node.create_timer = lambda *_args, **_kwargs: SimpleNamespace(cancel=lambda: None)
+    node._asr.get_final_result = node._asr.end_streaming
+    node._external_input = ExternalVadInput(
+        node=node,
+        asr=node._asr,
+        chunk_topic="/test/speech",
+        min_samples=1,
+        on_final=node._publish_command,
+        on_state=node._on_external_state_change,
+    )
+    return node
+
+
+def _external_chunk(sequence, state):
+    from ibrobot_msgs.msg import SpeechAudioChunk
+
+    message = SpeechAudioChunk()
+    message.source_id = "test"
+    message.sequence = sequence
+    message.state = state
+    message.audio_data = [1, 0]
+    return message
+
+
+@pytest.mark.parametrize(
+    "mode,ready,enabled",
+    [
+        (ActiveMode.MANUAL, True, False),
+        (ActiveMode.CONTINUOUS, True, True),
+        (ActiveMode.CONTINUOUS, False, False),
+    ],
+)
+def test_external_node_activation(mode, ready, enabled):
+    node = _external_node(mode, ready)
+    node._init_control_loop()
+    assert node._external_input.enabled is enabled
+    assert node._state_machine.state is (NodeState.LISTENING if enabled else NodeState.IDLE)
+    node._external_input._on_chunk(_external_chunk(1, 1))
+    assert node._asr.started is enabled
+
+
+@pytest.mark.parametrize("via_topic", [False, True])
+def test_external_node_stop_and_restart(via_topic):
+    node = _external_node()
+    node._init_control_loop()
+
+    def control(value):
+        if via_topic:
+            node._on_voice_control(SimpleNamespace(data=value))
+        else:
+            callback = node._on_start_recognition if value == "start" else node._on_stop_recognition
+            callback(SimpleNamespace(), SimpleNamespace())
+
+    control("start")
+    node._external_input._on_chunk(_external_chunk(1, 1))
+    assert node._state_machine.is_recognizing()
+    control("stop")
+    assert node._state_machine.is_idle() and node._asr.reset_calls == 1
+    control("start")
+    node._external_input._on_chunk(_external_chunk(2, 3))
+    assert node.commands == []
+    node._external_input._on_chunk(_external_chunk(3, 1))
+    node._external_input._on_chunk(_external_chunk(4, 3))
+    assert len(node.commands) == 1 and node._state_machine.is_listening()
+
+
+def test_stop_recognition_returns_to_idle_when_final_decode_fails():
+    node = make_node(node_state=NodeState.RECOGNIZING)
+
+    def raise_final():
+        raise RuntimeError("encoder execute failed")
+
+    node._asr.end_streaming = raise_final
+
+    node._on_stop_recognition(SimpleNamespace(), SimpleNamespace())
+
+    assert node.commands == []
+    assert node._state_machine.state is NodeState.IDLE
+    assert not node._audio_capture.started

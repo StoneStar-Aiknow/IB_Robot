@@ -159,8 +159,14 @@ class AudioCaptureModule:
         return self._ring_buffer.read_last(n_samples)
 
     def feed_audio(self, data: bytes | np.ndarray, channels: int = 1) -> bool:
-        """Feed one interleaved audio_common PCM frame into the ASR queue."""
-        if self._pause_event.is_set():
+        """Feed one interleaved audio_common PCM frame into the ASR queue.
+
+        The shared ROS audio stream keeps flowing while the node is idle (manual
+        mode, or ASR muted during TTS playback). Frames are only queued while
+        capturing; otherwise nothing drains the queue and it would overflow into
+        an unrecoverable ERROR state.
+        """
+        if self.state != CaptureState.CAPTURING or self._pause_event.is_set():
             return False
         asr_values, vad_values = self._extract_channels(data, channels)
         if asr_values.size == 0:

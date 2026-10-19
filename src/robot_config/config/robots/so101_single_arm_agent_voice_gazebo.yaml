@@ -1,0 +1,29 @@
+# SO-101 voice-driven Agent overlay for Gazebo. ASR final text on
+# voice_asr.output_topic is bridged into the Agent request contract by
+# agent_voice_bridge; robot motion still flows Agent -> Gateway -> skill
+# executor exactly as for the text channel.
+#
+# Gazebo has no microphone, so this profile keeps audio_io/voice_asr off and
+# expects the ASR node to run beside it (e.g. standalone voice_asr_node fed by
+# /voice_file_input or ~/recognize_file).
+#
+# Typed Programs execute once planned without waiting for any presentation
+# receipt; with TTS off the exact plan is only logged. confirm_mode: auto keeps
+# the legacy receipt path explicit (unset without TTS it would be voice_confirm).
+robot:
+  name: so101_single_arm
+  base_config: so101_single_arm_agent_gazebo.yaml
+  embodied:
+    agent:
+      channel_id: voice_asr
+      ledger_path: /tmp/ibrobot-agent-so101-voice-gazebo/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-voice-gazebo/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-voice-gazebo/agent.lock
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_enabled: false
+        # Homophones the ASR model prefers over the rare domain terms.
+        text_corrections:
+          夹爪: [家长, 家找, 驾照, 家爪, 夹找]
+          零位: [灵位, 临位]

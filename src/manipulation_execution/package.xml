@@ -11,6 +11,8 @@
   <depend>ament_index_python</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
   <depend>moveit_msgs</depend>
   <depend>robot_runtime</depend>
   <depend>tf2_ros</depend>
@@ -19,6 +21,11 @@
   <depend>skill_catalog</depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
+  <!-- Transport decode of the platform's encoded camera stream, in
+       compressed_image_decode.py. Model-semantic preprocessing (letterbox,
+       channel order, crop, resize, normalise) stays in the perception
+       adapters; this is only JPEG/PNG -> raw Image. -->
+  <exec_depend>python3-opencv</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

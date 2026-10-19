@@ -114,6 +114,17 @@ PYBIND11_MODULE(lekiwi_sdk_py, m)
     },
     py::arg("wheel_deltas"), py::arg("geometry"));
   m.def(
+    "wheel_position_deltas",
+    [](const std::vector<double> & current, const std::vector<double> & previous) {
+      if (current.size() != 3 || previous.size() != 3) {
+        throw std::invalid_argument("wheel_position_deltas expects exactly 3 wheel values");
+      }
+      const auto deltas = wheel_position_deltas(
+        {current[0], current[1], current[2]}, {previous[0], previous[1], previous[2]});
+      return std::vector<double>(deltas.begin(), deltas.end());
+    },
+    py::arg("current"), py::arg("previous"));
+  m.def(
     "integrate_pose",
     [](BasePose & pose, double dx, double dy, double dtheta) { integrate_pose(pose, dx, dy, dtheta); },
     py::arg("pose"), py::arg("dx"), py::arg("dy"), py::arg("dtheta"));

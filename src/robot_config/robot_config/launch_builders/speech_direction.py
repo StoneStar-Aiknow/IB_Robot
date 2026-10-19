@@ -70,6 +70,11 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
     launch_arguments["speech_direction_audio_topic"] = str(
         audio_io.get("capture_stamped_topic", "/audio/capture_stamped")
     )
+    # The experimental enhanced-output topic is deliberately not part of the
+    # robot SSOT: x2_enhanced_asr.launch.py passes
+    # speech_direction_enhanced_audio_topic directly, so there is no YAML key
+    # to read here (reading one that no typed field declares would silently
+    # ignore it).
 
     logger.info(f"Speech direction enabled with profile {profile!r}")
     return [
