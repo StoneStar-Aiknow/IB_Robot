@@ -21,6 +21,10 @@ per-person state is reset before the next frame. ``~/play``
 (``std_srvs/SetBool``) true starts a round from the neutral pose
 (``reset_pose_json``); false pauses. To watch it alone:
 ``ros2 service call /motion_imitation_mock/play std_srvs/srv/SetBool "{data: true}"``.
+
+``~/retarget_debug`` carries every mapped frame before the buffer and the smoothing:
+``[t_camera, t_received, t_mapped, 14 joint angles]`` (seconds, radians), for
+measuring where the delay goes.
 """
 
 from __future__ import annotations
@@ -123,10 +127,11 @@ class MotionImitationRetargetNode(Node):
         low_rad, high_rad = effective_limits_rad(lower, upper, LIMIT_MARGIN_DEG)
         self._player = LivePlayer(
             stream, low_rad=low_rad, high_rad=high_rad, rated_rad_s=rated, vel_scale=vel_scale, rate_hz=rate_hz,
-            staleness_s=staleness_sec, base_pose=reset_pose,
+            staleness_s=staleness_sec, base_pose=reset_pose, on_mapped=self._publish_mapped,
         )
 
         self._preview_publisher = self.create_publisher(Float64MultiArray, preview_topic, 10)
+        self._debug_publisher = self.create_publisher(Float64MultiArray, "~/retarget_debug", 50)
         self._status_publisher = self.create_publisher(String, status_topic, 10)
         self.create_subscription(PearFrame, self._pear_topic, self._on_pear_frame, qos_profile_sensor_data)
         self.create_service(SetBool, "~/play", self._on_play)
@@ -200,6 +205,11 @@ class MotionImitationRetargetNode(Node):
         message = Float64MultiArray()
         message.data = command
         self._preview_publisher.publish(message)
+
+    def _publish_mapped(self, t_camera: float, t_received: float, pose) -> None:
+        message = Float64MultiArray()
+        message.data = [float(t_camera), float(t_received), self._now(), *map(float, pose)]
+        self._debug_publisher.publish(message)
 
     def _publish_status(self) -> None:
         status = self._player.status(self._now())

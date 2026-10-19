@@ -33,6 +33,18 @@ def test_round_parks_on_the_neutral_pose_then_follows():
     assert stream.status()["phase"] in ("park", "blend_in", "live")
 
 
+def test_status_reports_how_far_the_output_runs_behind_the_camera():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    assert stream.status()["offset_ms"] is None and stream.status()["age_ms"] is None
+    for i in range(60):
+        t = i * 0.05
+        stream.push_pose(t, np.array(NEUTRAL))
+        stream.poll(t + 0.2)            # every frame 200 ms old when polled
+    status = stream.status()
+    assert status["age_ms"] == 200.0 and status["offset_ms"] == 600.0
+
+
 def test_a_round_from_a_pose_parks_on_it_then_blends_into_the_person():
     stream = create_stream("x2_followme", base_pose=NEUTRAL)
     inside = np.array([1, 0, 1, 1, 1, 0, 0] * 2)  # joints with room either way of neutral

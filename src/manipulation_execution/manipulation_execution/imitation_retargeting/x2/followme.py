@@ -191,6 +191,11 @@ class X2FollowMe:
             "starved_frames": self._starved_before + stream.starved_frames,
             "stretched_frames": self._stretched_before + stream.stretched_frames,
             "offset_samples": stream.offset_samples,
+            # The output runs this far behind the camera stamps, all round: the median
+            # frame age while the buffer filled, plus latency_s. Both in the node's clock
+            # against the camera's, so a clock offset between them lands in age_ms.
+            "offset_ms": round(stream._offset * 1e3, 1) if stream._t0 is not None else None,
+            "age_ms": round((stream._offset - stream.latency_s) * 1e3, 1) if stream._t0 is not None else None,
             "despike_flagged": int(stream.despiker.flagged.sum()),
             "branch_guard_trips": self._guard_trips + guard.trips,
             "branch_guard_worst": max(self._guard_worst, guard.worst_branch),

@@ -25,8 +25,10 @@ class LivePlayer:
     """Drives a RetargetStream for the live node: frame gate, worker queue, play/pause, rate cap."""
 
     def __init__(self, stream, *, low_rad, high_rad, rated_rad_s, vel_scale, rate_hz, staleness_s, base_pose,
-                 queue_size=4):
+                 queue_size=4, on_mapped=None):
         self._stream = stream
+        # Called on the worker with (t_camera, t_received, pose) for every mapped frame, outside the lock.
+        self._on_mapped = on_mapped
         self._low = np.asarray(low_rad, dtype=np.float64)
         self._high = np.asarray(high_rad, dtype=np.float64)
         self._limiter = RateLimiter(self._low, self._high, rated_rad_s, vel_scale, 1.0 / float(rate_hz))
@@ -67,7 +69,7 @@ class LivePlayer:
             self._last_yolox_at = now
             with self._queue_cv:
                 evicted = self._queue[0] if len(self._queue) == self._queue.maxlen else None
-                self._queue.append((reset_first, t_camera, frame_id, smplx_pose_raw))
+                self._queue.append((reset_first, t_camera, frame_id, smplx_pose_raw, now))
                 if evicted is not None:
                     self._dropped += 1
                     if evicted[0]:
@@ -82,7 +84,7 @@ class LivePlayer:
                 self._queue_cv.wait(timeout)
             if not self._queue:
                 return False
-            reset_first, t_camera, frame_id, raw = self._queue.popleft()
+            reset_first, t_camera, frame_id, raw, t_received = self._queue.popleft()
         try:
             if reset_first:
                 with self._lock:
@@ -99,6 +101,8 @@ class LivePlayer:
                 self._stream.push_pose(t_camera, pose)
                 self._retarget_ms.append(elapsed_ms)
                 self._processed += 1
+            if self._on_mapped is not None:
+                self._on_mapped(t_camera, t_received, pose)
         except Exception as exc:  # noqa: BLE001 - a bad frame must never kill the worker
             with self._lock:
                 self._retarget_errors += 1

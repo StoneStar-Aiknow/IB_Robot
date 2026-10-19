@@ -112,6 +112,24 @@ def test_back_after_a_gap_restarts_the_round_from_the_last_command():
     assert [c for c in stream.calls if c[0] == "start_round"] == restarts
 
 
+def test_every_mapped_frame_is_reported_with_its_camera_and_receipt_times():
+    stream = FakeStream()
+    mapped = []
+    player = LivePlayer(stream, low_rad=LOW, high_rad=HIGH, rated_rad_s=RATED, vel_scale=VEL_SCALE,
+                        rate_hz=RATE_HZ, staleness_s=0.5, base_pose=BASE,
+                        on_mapped=lambda *args: mapped.append(args))
+    player.on_frame(1.25, 1.0, 0, "yolox", np.zeros(312))
+    player.on_frame(1.30, 1.1, 1, "center_fallback", np.zeros(312))
+    while player.process_one(timeout=0):
+        pass
+    assert [(t_camera, t_received) for t_camera, t_received, _ in mapped] == [(1.0, 1.25)]
+    np.testing.assert_array_equal(mapped[0][2], np.full(14, 0.01))
+    stream.fail = True
+    player.on_frame(1.35, 1.2, 2, "yolox", np.zeros(312))
+    player.process_one(timeout=0)
+    assert len(mapped) == 1             # a frame that failed to map is not reported
+
+
 def test_retarget_error_is_counted_and_not_pushed():
     stream = FakeStream()
     stream.fail = True
