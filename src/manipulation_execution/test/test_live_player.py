@@ -120,6 +120,16 @@ def test_big_jump_is_rate_capped_and_clamped():
     assert np.allclose(prev, HIGH)
 
 
+def test_a_catch_up_poll_still_moves_one_capped_step():
+    stream = FakeStream()
+    player = _player(stream)
+    player.play(True)
+    stream.polled = [np.full(14, 0.5)] * 5
+    _frame(player, 1.0, 0)
+    out = np.array(player.tick(1.0))
+    assert np.allclose(np.abs(out - BASE), RATED * VEL_SCALE / RATE_HZ)
+
+
 def test_full_queue_drops_oldest():
     stream = FakeStream()
     player = _player(stream, queue_size=4)

@@ -143,8 +143,9 @@ class LivePlayer:
                 # last published pose so the next command is capped against what was sent.
                 self._held_stale += 1
                 return None
-            for pose in poses:
-                out = self._limiter.step(pose)
+            # One capped step per published command: when the poll catches up on several
+            # samples, stepping through each would multiply the speed cap.
+            out = self._limiter.step(poses[-1])
             command = out.tolist()
             self._published += 1
             self._last_command = command
