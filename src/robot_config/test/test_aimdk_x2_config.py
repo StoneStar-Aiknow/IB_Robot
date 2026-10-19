@@ -93,5 +93,10 @@ def test_control_modes_name_runtime_modes_the_profile_declares(raw, profile):
 
 
 def test_audio_capture_is_not_launched_twice(raw):
-    """X2 publishes the audio contract itself; the shared ALSA nodes stay off."""
-    assert raw["audio_io"]["enabled"] is False
+    """X2 publishes the audio contract itself; the shared ALSA nodes stay off.
+
+    runtime-owned-audio-io removed the audio_io section entirely: a provider
+    deployment's audio devices belong to the runtime (X2 bridges its own), and
+    consumers bind the runtime interfaces instead.
+    """
+    assert "audio_io" not in raw

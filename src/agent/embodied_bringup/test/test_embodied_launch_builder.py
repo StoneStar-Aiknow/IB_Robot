@@ -373,6 +373,20 @@ def _lekiwi_public_description(public_description):
         + "</robot>"
     )
     description["model"] = build_model_metadata(profile, simulated=True, robot_description=urdf)
+    # runtime-owned-audio-io: the hybrid profile binds audio.capture (speech
+    # direction / voice_asr) and audio.play (voice_tts) on the lekiwi runtime.
+    description["interfaces"]["audio.capture"] = {
+        "capability": "interaction.audio_capture",
+        "kind": "topic",
+        "direction": "publish",
+        "endpoint": "/audio/capture_stamped",
+        "message_type": "audio_common_msgs/msg/AudioDataStamped",
+        "qos": {"reliability": "reliable", "durability": "volatile", "history": "keep_last", "depth": 10},
+        "sample_rate_hz": 16000,
+        "channels": 6,
+        "sample_format": "S16LE",
+        "channel_indices": [1, 2, 3, 4],
+    }
     description.pop("digest")
     description["digest"] = description_digest(description)
     validate_description(description)
@@ -381,7 +395,9 @@ def _lekiwi_public_description(public_description):
 
 def _bound_lekiwi_hybrid_config(public_description):
     """The hybrid LeKiwi profile after the live runtime binding it depends on."""
-    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_nav_grasp"))
+    config = load_robot_config_dict(
+        resolve_robot_config_path(config_name="lekiwi_nav_grasp"), defer_interface_binding=True
+    )
     config["runtime"]["target"] = "simulation"  # match the simulated snapshot so binding verifies execution
     return bind_robot_interfaces(config, _lekiwi_public_description(public_description))
 
@@ -407,7 +423,9 @@ def test_lekiwi_hybrid_profile_fails_closed_until_the_runtime_binds_its_descript
     # Without the live binding the yaml alone must not build embodied nodes:
     # the provider is declared but no public description exists yet, so the
     # builder has to refuse instead of guessing interfaces.
-    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_nav_grasp"))
+    config = load_robot_config_dict(
+        resolve_robot_config_path(config_name="lekiwi_nav_grasp"), defer_interface_binding=True
+    )
 
     with pytest.raises(ValueError, match="'schema_version' is a required property"):
         generate_embodied_nodes(config, active_control_mode="moveit_planning")

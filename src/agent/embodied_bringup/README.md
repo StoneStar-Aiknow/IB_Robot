@@ -11,7 +11,7 @@ executor 调用 `~/set_following` 管理会话。两种模式都只通过 `/embo
 
 启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和
 包含 `nav_turn` 的 catalog profile；periodic 模式还要求 profile 暴露 `sound_following`。Voice ASR 与 speech
-direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备。
+direction 订阅同一音频采集 topic（provider 部署绑定 runtime `audio.capture`，旧路径共享 `audio_io`），不直接打开麦克风设备。
 
 ## 职责边界
 

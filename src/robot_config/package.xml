@@ -43,6 +43,10 @@
   <exec_depend>fast_lio</exec_depend>
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+  <!-- ALSA audio device owners for the provider-less legacy audio_io entry
+       (runtime-owned-audio-io). Delete both once every deployment sets
+       runtime.provider: provider deployments launch these nodes from the
+       robot runtime's peripheral list and declare the dependency there. -->
   <exec_depend>audio_capture</exec_depend>
   <exec_depend>audio_play</exec_depend>
 

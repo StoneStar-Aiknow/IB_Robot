@@ -18,11 +18,9 @@ robot:
   name: aimdk_x2_skills
   base_config: aimdk_x2_skills.yaml
 
-  audio_io:
-    # Capture-side topics come from aimdk_runtime (raw stream and enhanced
-    # speech chunks), so no ALSA capture node is launched.
-    enabled: true
-    source: runtime
+  # Audio capture is runtime-owned (runtime-owned-audio-io): the vendor
+  # runtime publishes the enhanced speech chunks; voice_asr binds the
+  # audio.speech interface below instead of an audio_io section.
 
   voice_asr:
     enabled: true

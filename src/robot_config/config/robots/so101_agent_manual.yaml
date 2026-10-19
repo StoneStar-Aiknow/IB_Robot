@@ -3,8 +3,6 @@
 robot:
   name: so101_single_arm
   base_config: so101_single_arm.yaml
-  audio_io:
-    enabled: false
   voice_asr:
     enabled: false
   voice_tts:

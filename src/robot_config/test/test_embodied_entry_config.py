@@ -223,7 +223,9 @@ def _hermetic_lekiwi_nav_grasp_copy(tmp_path):
 
 
 def test_lekiwi_hybrid_stage_ships_periodic_sound_following_inactive(tmp_path):
-    config = load_robot_config_dict(_hermetic_lekiwi_nav_grasp_copy(tmp_path), nav_stage="hybrid")
+    config = load_robot_config_dict(
+        _hermetic_lekiwi_nav_grasp_copy(tmp_path), nav_stage="hybrid", defer_interface_binding=True
+    )
     sound_orientation = config["embodied"]["idle_behaviors"]["sound_orientation"]
 
     assert sound_orientation["enabled"] is True
@@ -238,7 +240,7 @@ def test_lekiwi_non_hybrid_stages_keep_sound_orientation_disabled(tmp_path):
     config_path = _hermetic_lekiwi_nav_grasp_copy(tmp_path)
 
     for stage in ("grasp", "mapping", "navigation"):
-        config = load_robot_config_dict(config_path, nav_stage=stage)
+        config = load_robot_config_dict(config_path, nav_stage=stage, defer_interface_binding=True)
         assert config["embodied"]["idle_behaviors"]["sound_orientation"]["enabled"] is False
 
 

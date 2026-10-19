@@ -64,7 +64,7 @@ def _require_calibration(monkeypatch, tmp_path, translation=None):
 
 
 def test_disabled_config_starts_no_mapping_node():
-    config = load_robot_config_dict(CONFIG_PATH, nav_stage="navigation")
+    config = load_robot_config_dict(CONFIG_PATH, nav_stage="navigation", defer_interface_binding=True)
 
     assert generate_semantic_mapping_nodes(config) == []
 

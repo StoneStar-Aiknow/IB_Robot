@@ -254,7 +254,12 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
     }
     audio_io = robot_config.get("audio_io", {})
-    if not is_audio_io_enabled(audio_io):
+    audio_input = voice_asr_config.get("audio_input")
+    if audio_input is not None:
+        if not isinstance(audio_input, dict) or not audio_input.get("_interface_source"):
+            raise ValueError("voice_asr.audio_input must be bound to a runtime description before launch")
+    elif not is_audio_io_enabled(audio_io):
+        # No runtime binding: the legacy provider-less path reads audio_io.
         raise ValueError("voice_asr.enabled=true requires audio_io.enabled=true")
 
     if external_mode:
@@ -262,10 +267,7 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         # message, so the external path has exactly one input topic. A
         # runtime-managed deployment must bind it before constructing the
         # consumer; there is no audio_topic in this mode to fall back to.
-        audio_input = voice_asr_config.get("audio_input")
         if audio_input is not None:
-            if not isinstance(audio_input, dict) or not audio_input.get("_interface_source"):
-                raise ValueError("voice_asr.audio_input must be bound to a runtime description before launch")
             if audio_input.get("type") != "ibrobot_msgs/msg/SpeechAudioChunk":
                 raise ValueError("voice_asr.audio_input requires SpeechAudioChunk")
             explicit = voice_asr_config.get("chunk_topic")
@@ -295,10 +297,46 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
                 "buffer_seconds": voice_asr_config.get("buffer_seconds", voice_asr_defaults["buffer_seconds"]),
             }
         )
-        microphone_name = str(audio_io.get("microphone", ""))
-        microphone_params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
-        node_params["audio_topic"] = str(audio_io.get("capture_stamped_topic", "/audio/capture_stamped"))
-        node_params["audio_channels"] = int(microphone_params.get("channels", 1))
+        if audio_input is not None:
+            # Streaming input bound to the runtime's stamped capture: the
+            # topic and device format come from the binding, never from
+            # audio_io/peripherals.
+            if audio_input.get("type") != "audio_common_msgs/msg/AudioDataStamped":
+                raise ValueError("voice_asr.audio_input requires AudioDataStamped in shared_audio mode")
+            node_params["audio_topic"] = audio_input["topic"]
+            node_params["audio_channels"] = int(audio_input["channels"])
+            bound_rate = audio_input.get("sample_rate_hz")
+            if bound_rate is not None and int(bound_rate) != int(node_params["sample_rate"]):
+                raise ValueError(
+                    f"voice_asr.sample_rate={node_params['sample_rate']} conflicts with the bound "
+                    f"audio interface sample_rate_hz={bound_rate}"
+                )
+            channels = int(audio_input["channels"])
+            for field_name, input_channel in (
+                (
+                    "audio_input_channel",
+                    int(voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))),
+                ),
+                (
+                    "vad_input_channel",
+                    -1
+                    if voice_asr_config.get("vad_input_channel") is None
+                    else int(voice_asr_config["vad_input_channel"]),
+                ),
+            ):
+                if input_channel < 0:
+                    continue
+                if input_channel >= channels:
+                    raise ValueError(
+                        f"voice_asr.{field_name} must reference an available channel of the bound audio "
+                        f"interface ({input_channel} >= {channels})"
+                    )
+        else:
+            microphone_name = str(audio_io.get("microphone", ""))
+            microphone_params = find_microphone_params(robot_config.get("peripherals", []), microphone_name)
+            node_params["audio_topic"] = str(audio_io.get("capture_stamped_topic", "/audio/capture_stamped"))
+            channels = int(microphone_params.get("channels", 1))
+            node_params["audio_channels"] = channels
         node_params["audio_input_channel"] = int(
             voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))
         )

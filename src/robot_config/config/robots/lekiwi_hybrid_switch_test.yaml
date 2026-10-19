@@ -10,11 +10,132 @@ robot:
   voice_tts:
     enabled: false
 
+  # This switch test uses no audio. A base_config overlay REPLACES the whole
+  # peripherals list, so the parent's entries are restated verbatim with the
+  # audio devices off (runtime-owned-audio-io: declared devices -- including
+  # the lekiwi profile's default microphone -- launch unconditionally).
+  peripherals:
+  - type: microphone
+    name: respeaker
+    enabled: false
+    driver: alsa
+    params:
+      device: hw:0,0
+      channels: 6
+      sample_rate: 16000
+      sample_format: S16LE
+      channel_indices:
+      - 1
+      - 2
+      - 3
+      - 4
+  - type: speaker
+    name: speaker
+    enabled: false
+    driver: alsa
+    params:
+      device: ''
+      channels: 1
+      sample_rate: 24000
+      sample_format: S16LE
+  - type: camera
+    name: wrist
+    driver: realsense
+    serial_number: ''
+    initial_reset: false
+    width: 640
+    height: 360
+    fps: 30
+    pixel_format: bgr8
+    align_depth: true
+    enable_sync: false
+    enable_pointcloud: false
+    enable_gyro: false
+    enable_accel: false
+    streams:
+    - color
+    - depth
+    frame_id: camera_wrist_link
+    optical_frame_id: camera_wrist_optical_frame
+    transform:
+      parent_frame: gripper
+      x: -0.029804122099556248
+      y: 0.0735813073058911
+      z: -0.03849247926512127
+      roll: 3.093836835932143
+      pitch: 1.0039505938496505
+      yaw: -1.6776874824436123
+  - type: camera
+    name: front
+    driver: realsense
+    driver_camera_name: front
+    serial_number: ''
+    width: 640
+    height: 480
+    fps: 30
+    color_format: RGB8
+    depth_format: Z16
+    streams:
+    - color
+    - depth
+    align_depth: true
+    enable_sync: true
+    initial_reset: false
+    enable_pointcloud: false
+    frame_id: camera_front_link
+    optical_frame_id: camera_front_optical_frame
+    skip_urdf_without_transform: true
+    transform:
+      parent_frame: base_link
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+  - type: lidar
+    name: mid360
+    driver: livox_mid360
+    frame_id: livox_frame
+    lidar_ip: 192.168.1.139
+    host_ip: 192.168.1.5
+    pointcloud_topic: /livox/lidar
+    imu_topic: /livox/imu
+    user_config_path: $(find livox_ros_driver2)/config/MID360_config.json
+    xfer_format: 1
+    multi_topic: 0
+    data_src: 0
+    publish_freq: 10.0
+    output_data_type: 0
+    cmdline_input_bd_code: livox0000000001
+    respawn: true
+    scan_converter:
+      enabled: true
+      queue_size: 1
+      pointcloud_topic: /cloud_registered_body
+      scan_topic: /scan
+      target_frame: body
+      transform_tolerance: 0.01
+      min_height: -0.05
+      max_height: 0.5
+      angle_min: -3.14159265
+      angle_max: 3.14159265
+      angle_increment: 0.00872665
+      scan_time: 0.1
+      range_min: 0.1
+      range_max: 8.0
+      use_inf: true
+      inf_epsilon: 1.0
+      respawn: true
+
+
   nav_stages:
     hybrid:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
-      peripheral_names: [mid360]
+      # respeaker/speaker are listed so their disabled entries reach the
+      # runtime fragment (the lekiwi profile would otherwise launch them).
+      peripheral_names: [respeaker, speaker, mid360]
       sensor_calibration:
         artifacts:
           base_to_front_camera: ""

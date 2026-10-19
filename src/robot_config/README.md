@@ -32,10 +32,15 @@ external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消
 X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
 profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
 在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
-`audio_io.source=runtime` 时不启动 ALSA capture；runtime 提供音频。X2 的 external_vad 模式通过
+`audio_io.source` 已删除（runtime-owned-audio-io）：设置 `runtime.provider` 的部署音频设备由 runtime
+拥有——`peripherals` 中的 `microphone`/`speaker` 由机器人 runtime 启动同一组 ALSA 节点，并投影为带格式
+元数据的 `audio.capture` / `audio.play` 接口；voice_asr（流式）、speech_direction、voice_tts 通过
+`audio_input` / `audio_output` 绑定读取话题与格式（provider 部署出现 `audio_io` 段、或启用音频使用方却未
+声明绑定，加载期直接报错）。X2 的 external_vad 模式通过
 `voice_asr.audio_input: {interface: audio.speech, type: ibrobot_msgs/msg/SpeechAudioChunk}` 绑定原子音频块，
 端点由 runtime profile 声明。离线需提供 description，live launch 延迟绑定后才构造 ASR；类型或显式 topic
 冲突会拒绝启动。独立输入可显式设 `chunk_topic`。`manual` 与 `continuous` 激活策略不受音源模式覆盖。
+无 provider 的部署仍走 `audio_io` 旧路径（robot_config 启动同一份 ALSA 节点生成实现）。
 完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
 
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
@@ -194,9 +199,10 @@ MY_FEATURE_BUILDER = BuilderSpec(id="my_feature", factory=f"{__name__}:build_my_
 | `navigation`（含 `nav2` / `localization` / `navigation_command` / `voice_nav` 子模块） | `robot_navigation` |
 
 留在 robot_config 的内建条目：`control`、`auxiliary_actuators`、`simulation`、`controller_startup`、
-`perception`、`benchmark`、`audio_io`、`execution`、`motion_planning`、
-`embodied`，以及辅助模块 `cmd_vel`、`fast_lio`、`static_tf`、`description`、`hardware_mock`、
-`runtime`、`tracing`、`sim_backend`、`sim_peripheral_bridge`、`builder_support`。`hand_sources` 条目（含 `hand_profile` 参数与 P 位姿确认 hook）随遥操作输入源
+`perception`、`benchmark`、`audio_io`（无 provider 旧路径；provider 部署让位于
+runtime 外设）、`execution`、`motion_planning`、`embodied`，以及辅助模块 `cmd_vel`、`fast_lio`、
+`static_tf`、`description`、`hardware_mock`、`runtime`、`tracing`、`sim_backend`、
+`sim_peripheral_bridge`、`builder_support`。`hand_sources` 条目（含 `hand_profile` 参数与 P 位姿确认 hook）随遥操作输入源
 迁至 `robot_teleop/launch_builders/hand_sources.py`，经 entry point 注册。
 
 **未安装即不参与**：目标包未安装时其条目与 CLI 参数都不出现（`ros2 launch` 对未声明参数不报错），
@@ -1329,7 +1335,8 @@ ros2 launch robot_config robot.launch.py \
 | `voice_asr_realtime_pre_roll_seconds` | 临时覆盖实时识别 pre-roll 时长 |
 
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
-具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。实时麦克风设备由
+具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。实时麦克风设备：provider
+部署经 runtime `peripherals` 声明并由 `voice_asr.audio_input` 绑定 `audio.capture`；无 provider 部署由
 `robot.audio_io` 及其引用的 microphone peripheral 统一配置。
 
 ### Voice TTS（语音合成）

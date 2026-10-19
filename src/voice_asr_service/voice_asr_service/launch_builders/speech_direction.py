@@ -55,18 +55,40 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
         if value:
             launch_arguments[key] = resolve_ros_path(value)
 
-    microphone_name = str(config.get("microphone", "")).strip()
-    peripherals = robot_config.get("peripherals", [])
-    microphone_params = find_microphone_params(peripherals, microphone_name)
-    launch_argument_names = {
-        "channels": "microphone_channels",
-        "sample_rate": "microphone_sample_rate",
-        "channel_indices": "microphone_channel_indices",
-    }
-    for parameter_name, launch_name in launch_argument_names.items():
-        if parameter_name in microphone_params:
-            value = microphone_params[parameter_name]
-            launch_arguments[launch_name] = str(value) if parameter_name != "channel_indices" else repr(value)
+    audio_input = config.get("audio_input")
+    if audio_input is not None:
+        # Bound to the runtime's audio.capture: the topic and the microphone
+        # array format come from the binding, never from audio_io/peripherals.
+        if not isinstance(audio_input, dict) or not audio_input.get("_interface_source"):
+            raise ValueError("speech_direction.audio_input must be bound to a runtime description before launch")
+        if audio_input.get("type") != "audio_common_msgs/msg/AudioDataStamped":
+            raise ValueError("speech_direction.audio_input requires AudioDataStamped")
+        launch_arguments["speech_direction_audio_topic"] = audio_input["topic"]
+        if "channels" in audio_input:
+            launch_arguments["microphone_channels"] = str(int(audio_input["channels"]))
+        if "sample_rate_hz" in audio_input:
+            launch_arguments["microphone_sample_rate"] = str(int(audio_input["sample_rate_hz"]))
+        if "channel_indices" in audio_input:
+            launch_arguments["microphone_channel_indices"] = repr(audio_input["channel_indices"])
+    else:
+        microphone_name = str(config.get("microphone", "")).strip()
+        peripherals = robot_config.get("peripherals", [])
+        microphone_params = find_microphone_params(peripherals, microphone_name)
+        launch_argument_names = {
+            "channels": "microphone_channels",
+            "sample_rate": "microphone_sample_rate",
+            "channel_indices": "microphone_channel_indices",
+        }
+        for parameter_name, launch_name in launch_argument_names.items():
+            if parameter_name in microphone_params:
+                value = microphone_params[parameter_name]
+                launch_arguments[launch_name] = str(value) if parameter_name != "channel_indices" else repr(value)
+        audio_io = robot_config.get("audio_io", {})
+        if not is_audio_io_enabled(audio_io):
+            raise ValueError("speech_direction.enabled=true requires audio_io.enabled=true")
+        launch_arguments["speech_direction_audio_topic"] = str(
+            audio_io.get("capture_stamped_topic", "/audio/capture_stamped")
+        )
     parameter_launch_names = {
         "mount_yaw_deg": "speech_direction_mount_yaw_deg",
     }
@@ -74,12 +96,6 @@ def generate_speech_direction_actions(robot_config: dict[str, Any]) -> list[Incl
         if parameter_name in config.get("parameters", {}):
             launch_arguments[launch_name] = str(config["parameters"][parameter_name])
 
-    audio_io = robot_config.get("audio_io", {})
-    if not is_audio_io_enabled(audio_io):
-        raise ValueError("speech_direction.enabled=true requires audio_io.enabled=true")
-    launch_arguments["speech_direction_audio_topic"] = str(
-        audio_io.get("capture_stamped_topic", "/audio/capture_stamped")
-    )
     # The experimental enhanced-output topic is deliberately not part of the
     # robot SSOT: x2_enhanced_asr.launch.py passes
     # speech_direction_enhanced_audio_topic directly, so there is no YAML key

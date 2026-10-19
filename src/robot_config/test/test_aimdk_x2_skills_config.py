@@ -30,7 +30,8 @@ def test_configuration_is_valid(config):
     validate_robot_config_dict(config, deferred_interfaces=True)
     # The gesture profile stays voice-free: the voice chain lives in the
     # aimdk_x2_voice overlay so this deployment never needs the ASR bundle.
-    assert config["audio_io"]["enabled"] is False
+    # runtime-owned-audio-io removed the audio_io section from provider configs.
+    assert "audio_io" not in config
     assert config["voice_asr"]["enabled"] is False
 
 
@@ -193,7 +194,7 @@ def test_voice_profile_layers_on_the_gesture_profile(voice_config):
     # catalog validates the robot context name against the catalog profile.
     assert voice_config["name"] == "aimdk_x2_skills"
     assert voice_config["_config_sources"][-2].endswith("aimdk_x2_skills.yaml")
-    assert voice_config["audio_io"] == {"enabled": True, "source": "runtime"}
+    assert "audio_io" not in voice_config
     assert voice_config["voice_asr"]["input_mode"] == "external_vad"
     assert voice_config["voice_asr"]["audio_input"]["interface"] == "audio.speech"
     # bundle_path/deployment are deliberately absent so a mainline model upgrade

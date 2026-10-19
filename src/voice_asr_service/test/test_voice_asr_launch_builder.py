@@ -310,3 +310,133 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
     assert parameters["audio_topic"] == "/shared/capture_stamped"
     assert parameters["audio_channels"] == 6
     assert parameters["vad_input_channel"] == 0
+
+
+# --- runtime-bound streaming input (runtime-owned-audio-io) ----------------------
+
+
+def _bound_streaming_input(**metadata):
+    return {
+        "interface": "audio.capture",
+        "type": "audio_common_msgs/msg/AudioDataStamped",
+        "topic": "/audio/capture_stamped",
+        "_interface_source": {"id": "audio.capture"},
+        **metadata,
+    }
+
+
+def _streaming_config(audio_input, tmp_path):
+    return {
+        "audio_io": {},
+        "voice_asr": {
+            "enabled": True,
+            "input_mode": "shared_audio",
+            "bundle_path": str(tmp_path),
+            "deployment": "torch_cpu",
+            "active_mode": "continuous",
+            "audio_input": audio_input,
+        },
+        "voice_tts": {"enabled": False},
+        "peripherals": [],
+    }
+
+
+def _node_parameters(node):
+    parameters = {}
+    for raw_key, raw_value in node._Node__parameters[0].items():
+        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
+        if isinstance(raw_value, tuple):
+            raw_value = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
+            if raw_value.endswith("\n..."):
+                raw_value = raw_value[:-4].rstrip()
+        parameters[key] = raw_value
+    return parameters
+
+
+def test_streaming_voice_asr_reads_topic_and_channels_from_the_binding(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _streaming_config(
+        _bound_streaming_input(sample_rate_hz=16000, channels=6, sample_format="S16LE", channel_indices=[1, 2]),
+        tmp_path,
+    )
+
+    node = voice_asr.generate_voice_asr_nodes(config)[0]
+
+    parameters = _node_parameters(node)
+    assert parameters["audio_topic"] == "/audio/capture_stamped"
+    assert parameters["audio_channels"] == 6
+
+
+def test_streaming_voice_asr_rejects_an_unbound_audio_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _streaming_config(
+        {"interface": "audio.capture", "type": "audio_common_msgs/msg/AudioDataStamped"}, tmp_path
+    )
+    with pytest.raises(ValueError, match="must be bound to a runtime description"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_streaming_voice_asr_rejects_a_conflicting_sample_rate(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _streaming_config(_bound_streaming_input(sample_rate_hz=8000, channels=6), tmp_path)
+    with pytest.raises(
+        ValueError, match="sample_rate=16000 conflicts with the bound audio interface sample_rate_hz=8000"
+    ):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_streaming_voice_asr_rejects_an_out_of_range_input_channel(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _streaming_config(_bound_streaming_input(channels=2), tmp_path)
+    config["voice_asr"]["audio_input_channel"] = 5
+    with pytest.raises(ValueError, match="audio_input_channel must reference an available channel"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_speech_direction_reads_the_bound_capture_interface(monkeypatch, tmp_path):
+    launch_file = tmp_path / "launch" / "speech_direction.launch.py"
+    launch_file.parent.mkdir()
+    launch_file.touch()
+    monkeypatch.setattr(speech_direction, "_voice_asr_service_share", lambda: Path(tmp_path))
+    config = {
+        "speech_direction": {
+            "enabled": True,
+            "profile": "ascend_310p",
+            "parameters": {"mount_yaw_deg": 90.0},
+            "audio_input": {
+                "interface": "audio.capture",
+                "type": "audio_common_msgs/msg/AudioDataStamped",
+                "topic": "/audio/capture_stamped",
+                "sample_rate_hz": 16000,
+                "channels": 6,
+                "channel_indices": [1, 2, 3, 4],
+                "_interface_source": {"id": "audio.capture"},
+            },
+        },
+        "peripherals": [],
+    }
+
+    actions = speech_direction.generate_speech_direction_actions(config)
+
+    arguments = dict(actions[0]._IncludeLaunchDescription__launch_arguments)
+    assert arguments["speech_direction_audio_topic"] == "/audio/capture_stamped"
+    assert arguments["microphone_channels"] == "6"
+    assert arguments["microphone_sample_rate"] == "16000"
+    assert arguments["microphone_channel_indices"] == "[1, 2, 3, 4]"
+
+
+def test_speech_direction_rejects_an_unbound_audio_input(monkeypatch, tmp_path):
+    launch_file = tmp_path / "launch" / "speech_direction.launch.py"
+    launch_file.parent.mkdir()
+    launch_file.touch()
+    monkeypatch.setattr(speech_direction, "_voice_asr_service_share", lambda: Path(tmp_path))
+    config = {
+        "speech_direction": {
+            "enabled": True,
+            "profile": "ascend_310p",
+            "audio_input": {"interface": "audio.capture", "type": "audio_common_msgs/msg/AudioDataStamped"},
+        },
+        "peripherals": [],
+    }
+    with pytest.raises(ValueError, match="must be bound to a runtime description"):
+        speech_direction.generate_speech_direction_actions(config)

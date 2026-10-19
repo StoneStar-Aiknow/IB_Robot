@@ -52,7 +52,12 @@ from robot_runtime.contract import (
 from robot_runtime.interface_description import build_description, validate_description
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
-from robot_runtime.peripherals import load_peripherals_file, merge_peripherals, perception_capabilities
+from robot_runtime.peripherals import (
+    audio_capabilities,
+    load_peripherals_file,
+    merge_peripherals,
+    perception_capabilities,
+)
 from robot_runtime.profile import load_profile, stop_bounds
 from robot_runtime.state import RuntimeState
 
@@ -80,6 +85,7 @@ class RuntimeFacade(Node):
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
         capabilities = dict(self._profile["capabilities"])
         capabilities.update(perception_capabilities(peripherals))
+        capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         self._profile["fast_lio"] = {**(self._profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
         self.declare_parameter("interface_description_json", "")

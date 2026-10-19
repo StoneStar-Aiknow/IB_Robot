@@ -241,13 +241,10 @@ class VoiceASRConfig:
 
 @dataclass
 class AudioIOConfig:
-    """Cross-platform audio_common device-owner configuration."""
+    """Cross-platform audio_common device-owner configuration (provider-less legacy path)."""
 
     enabled: bool = False
     microphone: str = ""
-    #: alsa = 启动共享 audio_capture_node（需要麦克风外设）；
-    #: runtime = 采集侧 topic 由机器人 runtime 提供，不启动 ALSA 节点。
-    source: str = "alsa"
     capture_topic: str = "/audio/capture"
     capture_stamped_topic: str = "/audio/capture_stamped"
     audio_info_topic: str = "/audio/info"
@@ -265,6 +262,9 @@ class SpeechDirectionConfig:
     enabled: bool = False
     profile: str = "ascend_310p"
     microphone: str = ""
+    #: Bound to the runtime's audio.capture interface (runtime-owned-audio-io);
+    #: the resolved topic and array format are written by bind_robot_interfaces.
+    audio_input: dict[str, Any] | None = None
     config_file: str = ""
     profiles_file: str = ""
     models_root: str = ""
@@ -293,6 +293,9 @@ class VoiceTTSConfig:
     tts_timeout_sec: float = 15.0
     device_id: int = 0
     exit_on_init_failure: bool = True
+    #: Bound to the runtime's audio.play interface (runtime-owned-audio-io);
+    #: the resolved topic and playback format are written by bind_robot_interfaces.
+    audio_output: dict[str, Any] | None = None
 
 
 @dataclass

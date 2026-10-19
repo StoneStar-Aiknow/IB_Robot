@@ -25,8 +25,9 @@ X2 通过 runtime profile 的 `audio.speech` 逻辑接口绑定输入（部署�
 
 `speech_direction_node` 属于 `voice_asr_service`，与上文所述的 `VoiceASRNode` 是两个独立节点。它负责多通道人声音频增强、语音门控和方向估计，不执行 ASR，也不控制底盘。
 
-阵列、模型和运行时效参数由以下包内配置管理；音频设备和 Topic 由
-`robot_config.audio_io` 统一管理：
+阵列、模型和运行时效参数由以下包内配置管理；音频设备与采集 Topic 由机器人 runtime 的
+`peripherals` 声明，使用方经 `speech_direction.audio_input` 绑定 `audio.capture`（无 provider
+部署仍由 `robot_config.audio_io` 统一管理）：
 
 ```text
 src/voice_asr_service/config/speech_direction.yaml
@@ -666,12 +667,12 @@ robot:
     chunk_size: 512
     buffer_seconds: 5.0
     exit_on_init_failure: true
+    # provider 部署绑定 runtime 的采集接口；无 audio_io 段
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
 
-  audio_io:
-    enabled: true
-    microphone: respeaker
-    capture_stamped_topic: /audio/capture_stamped
-
+  # provider 部署（runtime-owned-audio-io）：外设与绑定，无 audio_io 段
   peripherals:
     - type: microphone
       name: respeaker
@@ -694,7 +695,7 @@ robot:
 | 节点能启动，但实时识别始终不可用 | 加载的是离线模型 | 查看日志里是否出现 `Offline ASR model loaded` |
 | `start_recognition` 被拒绝 | ASR 未就绪，或当前模型是离线模型 | 查看 `_asr_init_error` 相关日志和模型类型 |
 | 文件识别立即失败 | 文件路径错误或解码失败 | 确认文件存在且格式受支持 |
-| 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 `audio_io.microphone` 引用的 `device`/`channels` |
+| 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 microphone peripheral（provider 部署在 runtime `peripherals`，旧路径在 `audio_io.microphone`）的 `device`/`channels` |
 | 启动报 bundle/deployment 无效 | bundle 尚未打包或 deployment 名不匹配 | 用 `package_sherpa_asr_bundle` 生成 bundle，并确认 YAML 的 `deployment` 与 manifest 中的名字一致 |
 
 ## 14. 当前已验证行为

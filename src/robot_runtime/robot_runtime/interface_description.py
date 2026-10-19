@@ -244,9 +244,53 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
 
 def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
     interfaces: dict[str, dict] = {}
-    for periph in merge_peripherals(peripherals, []):
+    audio_counts = {"microphone": 0, "speaker": 0}
+    merged = merge_peripherals(peripherals, [])
+    for periph in merged:
         name, kind = periph["name"], periph["type"]
-        if kind == "camera" and periph.get("driver") != "virtual":
+        if kind in ("microphone", "speaker"):
+            # A runtime exposes at most one logical audio input and output:
+            # the fixed interface IDs (audio.capture / audio.play) map to a
+            # single device each, so a second device of the same kind has no
+            # surface to project onto.
+            audio_counts[kind] += 1
+            if audio_counts[kind] > 1:
+                raise InterfaceDescriptionError(
+                    f"{kind} peripheral {name}: at most one {kind} is supported "
+                    f"(found {audio_counts[kind]}; single-value mapping to a fixed logical ID)"
+                )
+            if periph.get("driver") != "alsa":
+                raise InterfaceDescriptionError(
+                    f"{kind} peripheral {name}: unsupported driver {periph.get('driver')!r}"
+                )
+            params = periph.get("params") or {}
+            if kind == "microphone":
+                metadata = {
+                    "sample_rate_hz": params.get("sample_rate", 16000),
+                    "channels": params.get("channels", 6),
+                    "sample_format": params.get("sample_format", "S16LE"),
+                }
+                if params.get("channel_indices") is not None:
+                    # Consumer-facing channel selection only; the device stays
+                    # the interleaved stream the ALSA owner publishes.
+                    metadata["channel_indices"] = params["channel_indices"]
+                interfaces["audio.capture"] = _topic(
+                    "/audio/capture_stamped",
+                    "audio_common_msgs/msg/AudioDataStamped",
+                    "interaction.audio_capture",
+                    **metadata,
+                )
+            else:
+                interfaces["audio.play"] = _topic(
+                    "/audio/play",
+                    "audio_common_msgs/msg/AudioDataStamped",
+                    "interaction.audio_playback",
+                    "subscribe",
+                    sample_rate_hz=params.get("sample_rate", 24000),
+                    channels=params.get("channels", 1),
+                    sample_format=params.get("sample_format", "S16LE"),
+                )
+        elif kind == "camera" and periph.get("driver") != "virtual":
             driver = periph.get("driver", "opencv")
             if driver not in ("opencv", "camera_ros", "realsense"):
                 raise InterfaceDescriptionError(f"camera {name}: unsupported driver {driver!r}")
@@ -390,6 +434,32 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
     return interfaces
 
 
+def audio_capability_entries(interfaces: dict[str, dict]) -> dict[str, dict]:
+    """RuntimeStatus ``interaction.audio_*`` entries for projected audio interfaces.
+
+    Field names follow the capability parameter schema (robot_runtime.capabilities):
+    capture carries ``topics`` plus the capture format, playback ``endpoints`` plus
+    the playback format. Audio interfaces a runtime does not project (e.g. the
+    vendor-bridged X2 declares them in its profile instead) contribute nothing.
+    """
+    entries: dict[str, dict] = {}
+    capture = interfaces.get("audio.capture")
+    if capture is not None:
+        entries["interaction.audio_capture"] = {
+            "topics": [capture["endpoint"]],
+            "sample_rate_hz": capture["sample_rate_hz"],
+            "channels": capture["channels"],
+        }
+    playback = interfaces.get("audio.play")
+    if playback is not None:
+        entries["interaction.audio_playback"] = {
+            "endpoints": [playback["endpoint"]],
+            "sample_rate_hz": playback["sample_rate_hz"],
+            "channels": playback["channels"],
+        }
+    return entries
+
+
 def _add_profile_interfaces(interfaces: dict[str, dict], declared: object) -> None:
     """Merge explicitly public profile interfaces without accepting duplicate IDs."""
     if declared is None:
@@ -507,6 +577,17 @@ def build_description(
     runtime = profile["runtime"]
     caps = profile["capabilities"]
     interfaces = peripheral_interfaces(profile.get("peripherals") if peripherals is None else peripherals)
+    # Audio peripherals derive the interaction.audio_* capability entries. A
+    # profile that additionally declares them explicitly must agree with the
+    # devices it also lists, or the RuntimeStatus surface would contradict the
+    # interface description (openspec change runtime-owned-audio-io, D2).
+    for capability, derived in audio_capability_entries(interfaces).items():
+        declared = caps.get(capability)
+        if declared is not None and declared != derived:
+            raise InterfaceDescriptionError(
+                f"profile capability {capability} {declared!r} contradicts the audio peripherals {derived!r}; "
+                "align the profile entry with the peripheral parameters or drop it"
+            )
     for name, endpoint, service in (
         ("get_status", C.GET_STATUS_SERVICE, "GetRuntimeStatus"),
         ("set_mode", C.SET_MODE_SERVICE, "SetRuntimeMode"),

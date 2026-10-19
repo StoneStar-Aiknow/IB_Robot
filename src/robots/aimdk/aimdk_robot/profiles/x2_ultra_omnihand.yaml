@@ -650,6 +650,10 @@ interfaces:
     endpoint: /audio/capture_stamped
     message_type: audio_common_msgs/msg/AudioDataStamped
     rate_hz: 33.3
+    # Format metadata mirrors the capability entry above so consumers bind the
+    # same fields on vendor-bridged and ALSA-backed runtimes alike.
+    sample_rate_hz: 16000.0
+    channels: 6
     qos:
       reliability: reliable
       durability: volatile
@@ -661,6 +665,8 @@ interfaces:
     direction: subscribe
     endpoint: /audio/play
     message_type: audio_common_msgs/msg/AudioDataStamped
+    sample_rate_hz: 16000.0
+    channels: 1
     qos:
       reliability: best_effort
       durability: volatile

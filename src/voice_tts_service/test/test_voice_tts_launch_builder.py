@@ -6,6 +6,8 @@ follow the module to its owning package; assertions are verbatim, only the
 import path changed.
 """
 
+import pytest
+
 from voice_tts_service.launch_builders import voice_tts
 
 
@@ -113,3 +115,80 @@ def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_pa
     runtime_options = _node_parameters(nodes[0])["runtime_options_json"]
     assert '"max_request_chars": 100' in runtime_options
     assert '"max_prompt_audio_bytes": 1024' in runtime_options
+
+
+# --- runtime-bound playback output (runtime-owned-audio-io) ----------------------
+
+
+def _bound_audio_output(**metadata):
+    return {
+        "interface": "audio.play",
+        "type": "audio_common_msgs/msg/AudioDataStamped",
+        "topic": "/audio/play",
+        "_interface_source": {"id": "audio.play"},
+        **metadata,
+    }
+
+
+def _bound_tts_config(audio_output):
+    return {
+        "voice_tts": {
+            "enabled": True,
+            "bundle_path": "models/zipvoice",
+            "deployment": "ubuntu_onnx",
+            "audio_output": audio_output,
+        },
+    }
+
+
+def _playback_parameters(nodes):
+    player = next(node for node in nodes if node._Node__node_executable == "audio_playback_node")
+    parameters = {}
+    for raw_key, raw_value in player._Node__parameters[0].items():
+        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
+        if isinstance(raw_value, tuple):
+            raw_value = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
+            if raw_value.endswith("\n..."):
+                raw_value = raw_value[:-4].rstrip()
+        parameters[key] = raw_value
+    return parameters
+
+
+def test_voice_tts_reads_topic_and_format_from_the_binding(tmp_path, monkeypatch):
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=24000, channels=1))
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/audio/play"
+    assert parameters["playback_sample_rate"] == 24000
+    assert parameters["playback_channels"] == 1
+
+
+def test_voice_tts_tracks_the_runtime_declared_playback_rate(tmp_path, monkeypatch):
+    """A vendor runtime declaring 16 kHz playback overrides the legacy default."""
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=16000, channels=1))
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["playback_sample_rate"] == 16000
+
+
+def test_voice_tts_rejects_an_unbound_audio_output(tmp_path, monkeypatch):
+    config = _bound_tts_config({"interface": "audio.play", "type": "audio_common_msgs/msg/AudioDataStamped"})
+    with pytest.raises(ValueError, match="must be bound to a runtime description"):
+        voice_tts.generate_voice_tts_nodes(config)
+
+
+def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypatch):
+    config = {
+        "audio_io": {"enabled": True, "playback_topic": "/audio/play", "playback_sample_rate": 24000},
+        "voice_tts": {"enabled": True, "bundle_path": "models/zipvoice", "deployment": "ubuntu_onnx"},
+    }
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/audio/play"
+    assert parameters["playback_sample_rate"] == 24000

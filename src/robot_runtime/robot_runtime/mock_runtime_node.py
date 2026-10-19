@@ -67,7 +67,12 @@ from robot_runtime.contract import (
 from robot_runtime.interface_description import build_description
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
-from robot_runtime.peripherals import load_peripherals_file, merge_peripherals, perception_capabilities
+from robot_runtime.peripherals import (
+    audio_capabilities,
+    load_peripherals_file,
+    merge_peripherals,
+    perception_capabilities,
+)
 from robot_runtime.profile import load_profile, validate_profile
 from robot_runtime.state import RuntimeState
 from robot_runtime.synthetic_perception import SyntheticStreams
@@ -171,6 +176,7 @@ class MockRuntime(Node):
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
         capabilities = dict(self._profile["capabilities"])
         capabilities.update(perception_capabilities(peripherals))
+        capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = build_description(self._profile, peripherals, simulated=True)
         self._interface_monitor = InterfaceMonitor(self, description)

@@ -93,12 +93,24 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "runtime_options_json": json.dumps(runtime_options, sort_keys=True),
     }
     node_name = str(config.get("node_name", "model_service_voice_tts"))
-    audio_io = robot_config.get("audio_io", {})
-    if not is_audio_io_enabled(audio_io):
-        raise ValueError("voice_tts.enabled=true requires audio_io.enabled=true")
-    audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
-    playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
-    playback_channels = int(audio_io.get("playback_channels", 1))
+    audio_output = config.get("audio_output")
+    if audio_output is not None:
+        # Bound to the runtime's audio.play: the topic and the playback format
+        # come from the binding, never from audio_io.
+        if not isinstance(audio_output, dict) or not audio_output.get("_interface_source"):
+            raise ValueError("voice_tts.audio_output must be bound to a runtime description before launch")
+        if audio_output.get("type") != "audio_common_msgs/msg/AudioDataStamped":
+            raise ValueError("voice_tts.audio_output requires AudioDataStamped")
+        audio_topic = audio_output["topic"]
+        playback_sample_rate = int(audio_output.get("sample_rate_hz", 24000))
+        playback_channels = int(audio_output.get("channels", 1))
+    else:
+        audio_io = robot_config.get("audio_io", {})
+        if not is_audio_io_enabled(audio_io):
+            raise ValueError("voice_tts.enabled=true requires audio_io.enabled=true")
+        audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
+        playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
+        playback_channels = int(audio_io.get("playback_channels", 1))
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(

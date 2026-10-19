@@ -24,6 +24,7 @@ from robot_runtime.contract import IDLE_MODE
 from robot_runtime.interface_description import build_description
 from robot_runtime.path_subst import resolve_path
 from robot_runtime.peripherals import (
+    audio_nodes,
     load_peripherals_file,
     merge_peripherals,
     peripheral_nodes,
@@ -253,20 +254,25 @@ def runtime_stack_actions(
 
 
 def peripheral_stack_actions(
-    profile: dict[str, Any], peripherals_file: str, simulated: bool, *, description: dict | None = None
+    profile: dict, peripherals_file: str, simulated: bool, *, description: dict | None = None
 ) -> list:
     """Sensor peripheral composition for a runtime launch (D12).
 
     Physical drivers + static TF on real hardware; synthetic perception
-    publishers on the same topics in simulated transport.
+    publishers on the same topics in simulated transport. Audio devices are
+    host devices, so their ALSA owners run in BOTH modes (the legacy
+    robot_config audio_io entry also launched them under simulation).
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
     if simulated:
         effective = {**profile, "fast_lio": {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}}
-        return synthetic_perception_nodes(
-            peripherals, description or build_description(effective, peripherals, simulated=True)
-        )
+        return [
+            *synthetic_perception_nodes(
+                peripherals, description or build_description(effective, peripherals, simulated=True)
+            ),
+            *audio_nodes(peripherals),
+        ]
     return peripheral_nodes(peripherals, use_sim=False)
 
 

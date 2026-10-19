@@ -57,7 +57,15 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     assert config["motion_mode"]["navigation_controllers"] == ["base_velocity_controller"]
 
     peripherals = {item["name"]: item for item in config["peripherals"]}
-    assert set(peripherals) == {"respeaker", "wrist", "front", "mid360"}
+    # runtime-owned-audio-io: the speaker peripheral replaces the former
+    # audio_io playback keys; the runtime launches it as the ALSA owner.
+    assert set(peripherals) == {"respeaker", "speaker", "wrist", "front", "mid360"}
+    assert peripherals["speaker"] == {
+        "type": "speaker",
+        "name": "speaker",
+        "driver": "alsa",
+        "params": {"device": "", "channels": 1, "sample_rate": 24000, "sample_format": "S16LE"},
+    }
     assert peripherals["respeaker"] == {
         "type": "microphone",
         "name": "respeaker",
