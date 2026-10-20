@@ -37,7 +37,9 @@ import sys
 from pathlib import Path
 
 STOP_WORDS = {"and", "or", "of", "the", "for", "with", "a", "an", "in", "on", "to"}
-SECTION_RE = re.compile(r"^\s*[-*]?\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$")
+# Multi-level ids (e.g. "3.2.1") are accepted; parent is the integer part,
+# so deeper pages flatten into the top section's subs (hierarchy has one sub level).
+SECTION_RE = re.compile(r"^\s*[-*]?\s*(\d+(?:\.\d+)*)\s+(.+?)\s*$")
 
 
 def sort_key(section_id):
@@ -141,7 +143,9 @@ def validate(id_to_label, title_to_label, hierarchy, pages):
         label = id_to_label[page["id"]]
         mapped = title_to_label.get(page["title"])
         if mapped != label:
-            errors.append(f"id_to_label[{page['id']}] label={label!r} 但 title_to_label[{page['title']!r}] label={mapped!r}")
+            errors.append(
+                f"id_to_label[{page['id']}] label={label!r} 但 title_to_label[{page['title']!r}] label={mapped!r}"
+            )
     page_titles = {p["title"] for p in pages}
     for title in sorted(set(title_to_label) - page_titles):
         errors.append(f"title_to_label 存在多余条目（无对应页面）: {title!r}")
@@ -202,7 +206,9 @@ def main():
 
     # Sub pages whose parent section is missing from the input.
     top_ids = {p["id"] for p in pages if p["level"] == 0}
-    for page in sorted((p for p in pages if p["level"] == 1 and p["parent"] not in top_ids), key=lambda p: sort_key(p["id"])):
+    for page in sorted(
+        (p for p in pages if p["level"] == 1 and p["parent"] not in top_ids), key=lambda p: sort_key(p["id"])
+    ):
         print(f"错误: 二级子页面 {page['id']} {page['title']!r} 的父章节 {page['parent']} 不存在", file=sys.stderr)
         return 2
 
@@ -246,7 +252,7 @@ def main():
         f"目录节点: {len(dir_nodes)} 个 — "
         + (", ".join(f"{label} ({count} 个子页面)" for label, _, count in dir_nodes) or "无")
     )
-    print(f"验证: id_to_label / title_to_label / hierarchy 三者一致")
+    print("验证: id_to_label / title_to_label / hierarchy 三者一致")
     if reused:
         print(f"更新场景: 复用已有 label {len(reused)} 个")
     if conflicts:

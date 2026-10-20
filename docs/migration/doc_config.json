@@ -1,303 +1,212 @@
 {
     "id_to_label": {
         "1": "overview",
-        "2": "getting_started",
-        "2.1": "environment_setup",
-        "2.2": "building_the_project",
-        "2.3": "multi_platform_support",
-        "2.4": "third_party_dependencies_lerobot_patch_stack",
-        "3": "core_concepts",
-        "3.1": "single_source_of_truth_pattern",
-        "3.2": "contract_system",
-        "3.3": "control_mode_architecture",
-        "4": "architecture",
-        "5": "configuration",
-        "5.1": "robot_configuration_files",
-        "5.2": "contract_definition",
-        "5.3": "peripheral_configuration",
-        "5.4": "launch_system",
-        "5.5": "configuration_validation",
-        "6": "protocol",
-        "7": "inference",
-        "7.1": "inference_architecture",
-        "7.2": "monolithic_execution_mode",
-        "7.3": "distributed_execution_mode",
-        "7.4": "policy_nodes",
-        "7.5": "model_export_validation",
-        "7.6": "attention_visualization",
-        "7.7": "inference_backends_model_sessions",
-        "7.8": "inference_manifest_policy_bundles",
-        "8": "action_dispatch",
-        "8.1": "action_dispatcher_node",
-        "8.2": "temporal_smoothing",
-        "8.3": "topic_and_action_executors",
-        "9": "data_pipeline",
-        "9.1": "teleoperation_and_data_collection",
-        "9.2": "episode_recording",
-        "9.3": "dataset_conversion_bag_to_lerobot",
-        "9.4": "training_integration",
-        "9.5": "deployment_feedback_loop",
-        "9.6": "camera_tools",
-        "10": "motion_planning",
-        "10.1": "moveitgateway_node",
-        "10.2": "5dof_kinematic_constraints",
-        "10.3": "moveit_launch_configuration",
-        "10.4": "task_dispatch",
-        "11": "hardware",
-        "11.1": "ros2_control_configuration",
-        "11.2": "hardware_plugins",
-        "11.3": "simulation_backends",
-        "11.4": "lekiwi_mobile_manipulator",
-        "11.5": "navigation_stack",
-        "11.6": "robot_calibration",
-        "12": "extended_capabilities",
-        "12.1": "voice_asr_service",
-        "12.2": "social_control_ai_agent_integration",
-        "12.3": "performance_tracing",
-        "12.4": "voice_tts_service",
-        "12.5": "speech_direction_enhancement",
-        "13": "package_reference",
-        "14": "development",
-        "14.1": "vs_code_configuration",
-        "14.2": "build_system_and_mixins",
-        "14.3": "debugging_and_testing",
-        "14.4": "atomgit_sdk_ci_automation",
-        "15": "embodied_intelligence_stack",
-        "15.1": "interface_definitions",
-        "15.2": "skill_catalog_skill_library",
-        "15.3": "capability_gateway_safety_guard",
-        "15.4": "robot_skill_cli_hermes_agent_integration",
-        "15.5": "embodied_agent_pipeline_bringup",
-        "16": "perception_manipulation_services",
-        "16.1": "perception_service",
-        "16.2": "grasp_planning",
-        "16.3": "pick_place_execution",
-        "16.4": "semantic_mapping_object_tracking",
-        "17": "model_export_toolchains",
-        "17.1": "pi0_5_split_export_pipeline",
-        "17.2": "quantization_ascend_om_conversion",
-        "17.3": "rknn_hisilicon_houmo_hmm_export",
-        "17.4": "accuracy_comparison_observation_batches",
-        "18": "glossary"
+        "1.1": "getting_started_environment",
+        "1.2": "system_architecture_data_flow",
+        "1.3": "supported_platforms",
+        "2": "configuration_ssot",
+        "2.1": "config_loader_validation",
+        "2.2": "launch_builders",
+        "2.3": "robot_profiles_control_modes",
+        "3": "inference_service",
+        "3.1": "pipeline_runtime_processors",
+        "3.2": "distributed_edge_cloud_inference",
+        "3.2.1": "observation_video_transport",
+        "3.3": "backends_model_sessions",
+        "3.4": "inference_manifest_schema",
+        "3.5": "scheduling_action_dispatch",
+        "4": "model_export_deployment_toolchain",
+        "4.1": "pi0_5_split_export_pipeline",
+        "4.2": "accuracy_diagnostics_schedules",
+        "4.3": "other_targets_rknn_hmm_910b_torch",
+        "4.4": "model_bundle_distribution",
+        "5": "robot_hardware_control_simulation",
+        "5.1": "hardware_interfaces_descriptions",
+        "5.2": "moveit_kinematics",
+        "5.3": "teleoperation",
+        "5.4": "simulation_mock_hardware",
+        "5.5": "navigation",
+        "6": "perception_manipulation_semantic_mapping",
+        "6.1": "perception_service",
+        "6.2": "grasp_planning_verification",
+        "6.3": "manipulation_execution",
+        "6.4": "human_motion_imitation",
+        "6.5": "semantic_mapping_object_tracking",
+        "7": "embodied_agent_skills",
+        "7.1": "embodied_pipeline_agent_nodes",
+        "7.2": "skill_catalog_skill_library",
+        "7.3": "robot_skill_cli_hermes",
+        "7.4": "safety_guard",
+        "8": "voice_audio",
+        "8.1": "asr_vad",
+        "8.2": "speech_direction_enhancement",
+        "8.3": "text_speech",
+        "9": "data_tools_benchmarks_observability",
+        "9.1": "dataset_recording_conversion",
+        "9.2": "camera_calibration_isp_tuning",
+        "9.3": "policy_evaluation_benchmark_runtime",
+        "9.4": "tracing_web_ui",
+        "10": "interfaces",
+        "10.1": "skill_primitive_contracts",
+        "10.2": "perception_grasp_inference_interfaces",
+        "11": "development_workflow_tooling",
+        "11.1": "dependency_patch_management",
+        "11.2": "ai_agent_skills_framework",
+        "11.3": "pr_review_verification_gates",
+        "12": "glossary"
     },
     "title_to_label": {
-        "IB-Robot Overview": "overview",
-        "Getting Started": "getting_started",
-        "Environment Setup": "environment_setup",
-        "Building the Project": "building_the_project",
-        "Multi-Platform Support (Ubuntu, openEuler, OpenHarmony)": "multi_platform_support",
-        "Third-Party Dependencies and LeRobot Patch Stack": "third_party_dependencies_lerobot_patch_stack",
-        "Core Concepts": "core_concepts",
-        "Single Source of Truth Pattern": "single_source_of_truth_pattern",
-        "Contract System": "contract_system",
-        "Control Mode Architecture": "control_mode_architecture",
-        "System Architecture": "architecture",
-        "Configuration System (robot_config)": "configuration",
-        "Robot Configuration Files": "robot_configuration_files",
-        "Contract Definition": "contract_definition",
-        "Peripheral Configuration": "peripheral_configuration",
-        "Launch System": "launch_system",
-        "Configuration Validation": "configuration_validation",
-        "Protocol Conversion (tensormsg)": "protocol",
-        "Inference Pipeline": "inference",
-        "Inference Architecture": "inference_architecture",
-        "Monolithic Execution Mode": "monolithic_execution_mode",
-        "Distributed Execution Mode": "distributed_execution_mode",
-        "Policy Nodes": "policy_nodes",
-        "Model Export and Validation (model_utils)": "model_export_validation",
-        "Attention Visualization (attention_viz)": "attention_visualization",
-        "Inference Backends and Model Sessions": "inference_backends_model_sessions",
-        "Inference Manifest and Policy Bundles": "inference_manifest_policy_bundles",
-        "Action Dispatch": "action_dispatch",
-        "Action Dispatcher Node": "action_dispatcher_node",
-        "Temporal Smoothing": "temporal_smoothing",
-        "Topic and Action Executors": "topic_and_action_executors",
-        "Data Pipeline": "data_pipeline",
-        "Teleoperation and Data Collection": "teleoperation_and_data_collection",
-        "Episode Recording": "episode_recording",
-        "Dataset Conversion (bag_to_lerobot)": "dataset_conversion_bag_to_lerobot",
-        "Training Integration": "training_integration",
-        "Deployment Feedback Loop": "deployment_feedback_loop",
-        "Camera Tools (Alignment and ISP Calibration)": "camera_tools",
-        "Motion Planning (MoveIt)": "motion_planning",
-        "MoveItGateway Node": "moveitgateway_node",
-        "5DOF Kinematic Constraints": "5dof_kinematic_constraints",
-        "MoveIt Launch Configuration": "moveit_launch_configuration",
-        "Task Dispatch (task_dispatch)": "task_dispatch",
-        "Hardware Integration": "hardware",
-        "ros2_control Configuration": "ros2_control_configuration",
-        "Hardware Plugins": "hardware_plugins",
-        "Simulation Backends": "simulation_backends",
-        "LeKiwi Mobile Manipulator": "lekiwi_mobile_manipulator",
-        "Navigation Stack (robot_navigation)": "navigation_stack",
-        "Robot Calibration (robot_calibration)": "robot_calibration",
-        "Extended Capabilities": "extended_capabilities",
-        "Voice ASR Service": "voice_asr_service",
-        "Social Control and AI Agent Integration": "social_control_ai_agent_integration",
-        "Performance Tracing": "performance_tracing",
-        "Voice TTS Service": "voice_tts_service",
-        "Speech Direction and Enhancement": "speech_direction_enhancement",
-        "Package Reference": "package_reference",
-        "Development Guide": "development",
-        "VS Code Configuration": "vs_code_configuration",
-        "Build System and Mixins": "build_system_and_mixins",
-        "Debugging and Testing": "debugging_and_testing",
-        "AtomGit SDK and CI Automation": "atomgit_sdk_ci_automation",
-        "Embodied Intelligence Stack": "embodied_intelligence_stack",
-        "Interface Definitions (ibrobot_msgs)": "interface_definitions",
-        "Skill Catalog and Skill Library": "skill_catalog_skill_library",
-        "Capability Gateway and Safety Guard": "capability_gateway_safety_guard",
-        "robot-skill CLI and Hermes Agent Integration": "robot_skill_cli_hermes_agent_integration",
-        "Embodied Agent and Pipeline Bringup": "embodied_agent_pipeline_bringup",
-        "Perception and Manipulation Services": "perception_manipulation_services",
-        "Perception Service": "perception_service",
-        "Grasp Planning (manipulation_service)": "grasp_planning",
-        "Pick and Place Execution (manipulation_execution)": "pick_place_execution",
-        "Semantic Mapping and Object Tracking": "semantic_mapping_object_tracking",
-        "Model Export Toolchains": "model_export_toolchains",
+        "Overview": "overview",
+        "Getting Started & Environment": "getting_started_environment",
+        "System Architecture & Data Flow": "system_architecture_data_flow",
+        "Supported Platforms": "supported_platforms",
+        "Configuration SSOT (robot_config)": "configuration_ssot",
+        "Config Loader & Validation": "config_loader_validation",
+        "Launch Builders": "launch_builders",
+        "Robot Profiles & Control Modes": "robot_profiles_control_modes",
+        "Inference Service": "inference_service",
+        "Pipeline Runtime & Processors": "pipeline_runtime_processors",
+        "Distributed Edge/Cloud Inference": "distributed_edge_cloud_inference",
+        "Observation Video Transport (RTP/H.264)": "observation_video_transport",
+        "Backends & Model Sessions": "backends_model_sessions",
+        "Inference Manifest Schema": "inference_manifest_schema",
+        "Scheduling & Action Dispatch": "scheduling_action_dispatch",
+        "Model Export & Deployment Toolchain": "model_export_deployment_toolchain",
         "PI0.5 Split Export Pipeline": "pi0_5_split_export_pipeline",
-        "Quantization and Ascend OM Conversion": "quantization_ascend_om_conversion",
-        "RKNN, Hisilicon and Houmo HMM Export": "rknn_hisilicon_houmo_hmm_export",
-        "Accuracy Comparison and Observation Batches": "accuracy_comparison_observation_batches",
+        "Accuracy Diagnostics & Schedules": "accuracy_diagnostics_schedules",
+        "Other Targets: RKNN, HMM, 910B Torch": "other_targets_rknn_hmm_910b_torch",
+        "Model Bundle Distribution": "model_bundle_distribution",
+        "Robot Hardware, Control & Simulation": "robot_hardware_control_simulation",
+        "Hardware Interfaces & Descriptions": "hardware_interfaces_descriptions",
+        "MoveIt & Kinematics": "moveit_kinematics",
+        "Teleoperation": "teleoperation",
+        "Simulation & Mock Hardware": "simulation_mock_hardware",
+        "Navigation": "navigation",
+        "Perception, Manipulation & Semantic Mapping": "perception_manipulation_semantic_mapping",
+        "Perception Service": "perception_service",
+        "Grasp Planning & Verification": "grasp_planning_verification",
+        "Manipulation Execution": "manipulation_execution",
+        "Human Motion Imitation (HRI)": "human_motion_imitation",
+        "Semantic Mapping & Object Tracking": "semantic_mapping_object_tracking",
+        "Embodied Agent & Skills": "embodied_agent_skills",
+        "Embodied Pipeline & Agent Nodes": "embodied_pipeline_agent_nodes",
+        "Skill Catalog & Skill Library": "skill_catalog_skill_library",
+        "robot-skill CLI & Hermes": "robot_skill_cli_hermes",
+        "Safety Guard": "safety_guard",
+        "Voice & Audio": "voice_audio",
+        "ASR & VAD": "asr_vad",
+        "Speech Direction (DOA) & Enhancement": "speech_direction_enhancement",
+        "Text-to-Speech": "text_speech",
+        "Data Tools, Benchmarks & Observability": "data_tools_benchmarks_observability",
+        "Dataset Recording & Conversion": "dataset_recording_conversion",
+        "Camera Calibration & ISP Tuning": "camera_calibration_isp_tuning",
+        "Policy Evaluation & Benchmark Runtime": "policy_evaluation_benchmark_runtime",
+        "Tracing & Web UI": "tracing_web_ui",
+        "Interfaces (ibrobot_msgs)": "interfaces",
+        "Skill & Primitive Contracts": "skill_primitive_contracts",
+        "Perception, Grasp & Inference Interfaces": "perception_grasp_inference_interfaces",
+        "Development Workflow & Tooling": "development_workflow_tooling",
+        "Dependency & Patch Management": "dependency_patch_management",
+        "AI Agent Skills Framework": "ai_agent_skills_framework",
+        "PR, Review & Verification Gates": "pr_review_verification_gates",
         "Glossary": "glossary"
     },
     "hierarchy": {
-        "overview.md": {
-            "title": "IB-Robot Overview"
-        },
-        "getting_started": {
-            "title": "Getting Started",
+        "overview": {
+            "title": "Overview",
             "subs": {
-                "environment_setup.md": "Environment Setup",
-                "building_the_project.md": "Building the Project",
-                "multi_platform_support.md": "Multi-Platform Support (Ubuntu, openEuler, OpenHarmony)",
-                "third_party_dependencies_lerobot_patch_stack.md": "Third-Party Dependencies and LeRobot Patch Stack"
+                "getting_started_environment.md": "Getting Started & Environment",
+                "system_architecture_data_flow.md": "System Architecture & Data Flow",
+                "supported_platforms.md": "Supported Platforms"
             }
         },
-        "core_concepts": {
-            "title": "Core Concepts",
+        "configuration_ssot": {
+            "title": "Configuration SSOT (robot_config)",
             "subs": {
-                "single_source_of_truth_pattern.md": "Single Source of Truth Pattern",
-                "contract_system.md": "Contract System",
-                "control_mode_architecture.md": "Control Mode Architecture"
+                "config_loader_validation.md": "Config Loader & Validation",
+                "launch_builders.md": "Launch Builders",
+                "robot_profiles_control_modes.md": "Robot Profiles & Control Modes"
             }
         },
-        "architecture.md": {
-            "title": "System Architecture"
-        },
-        "configuration": {
-            "title": "Configuration System (robot_config)",
+        "inference_service": {
+            "title": "Inference Service",
             "subs": {
-                "robot_configuration_files.md": "Robot Configuration Files",
-                "contract_definition.md": "Contract Definition",
-                "peripheral_configuration.md": "Peripheral Configuration",
-                "launch_system.md": "Launch System",
-                "configuration_validation.md": "Configuration Validation"
+                "pipeline_runtime_processors.md": "Pipeline Runtime & Processors",
+                "distributed_edge_cloud_inference.md": "Distributed Edge/Cloud Inference",
+                "observation_video_transport.md": "Observation Video Transport (RTP/H.264)",
+                "backends_model_sessions.md": "Backends & Model Sessions",
+                "inference_manifest_schema.md": "Inference Manifest Schema",
+                "scheduling_action_dispatch.md": "Scheduling & Action Dispatch"
             }
         },
-        "protocol.md": {
-            "title": "Protocol Conversion (tensormsg)"
-        },
-        "inference": {
-            "title": "Inference Pipeline",
-            "subs": {
-                "inference_architecture.md": "Inference Architecture",
-                "monolithic_execution_mode.md": "Monolithic Execution Mode",
-                "distributed_execution_mode.md": "Distributed Execution Mode",
-                "policy_nodes.md": "Policy Nodes",
-                "model_export_validation.md": "Model Export and Validation (model_utils)",
-                "attention_visualization.md": "Attention Visualization (attention_viz)",
-                "inference_backends_model_sessions.md": "Inference Backends and Model Sessions",
-                "inference_manifest_policy_bundles.md": "Inference Manifest and Policy Bundles"
-            }
-        },
-        "action_dispatch": {
-            "title": "Action Dispatch",
-            "subs": {
-                "action_dispatcher_node.md": "Action Dispatcher Node",
-                "temporal_smoothing.md": "Temporal Smoothing",
-                "topic_and_action_executors.md": "Topic and Action Executors"
-            }
-        },
-        "data_pipeline": {
-            "title": "Data Pipeline",
-            "subs": {
-                "teleoperation_and_data_collection.md": "Teleoperation and Data Collection",
-                "episode_recording.md": "Episode Recording",
-                "dataset_conversion_bag_to_lerobot.md": "Dataset Conversion (bag_to_lerobot)",
-                "training_integration.md": "Training Integration",
-                "deployment_feedback_loop.md": "Deployment Feedback Loop",
-                "camera_tools.md": "Camera Tools (Alignment and ISP Calibration)"
-            }
-        },
-        "motion_planning": {
-            "title": "Motion Planning (MoveIt)",
-            "subs": {
-                "moveitgateway_node.md": "MoveItGateway Node",
-                "5dof_kinematic_constraints.md": "5DOF Kinematic Constraints",
-                "moveit_launch_configuration.md": "MoveIt Launch Configuration",
-                "task_dispatch.md": "Task Dispatch (task_dispatch)"
-            }
-        },
-        "hardware": {
-            "title": "Hardware Integration",
-            "subs": {
-                "ros2_control_configuration.md": "ros2_control Configuration",
-                "hardware_plugins.md": "Hardware Plugins",
-                "simulation_backends.md": "Simulation Backends",
-                "lekiwi_mobile_manipulator.md": "LeKiwi Mobile Manipulator",
-                "navigation_stack.md": "Navigation Stack (robot_navigation)",
-                "robot_calibration.md": "Robot Calibration (robot_calibration)"
-            }
-        },
-        "extended_capabilities": {
-            "title": "Extended Capabilities",
-            "subs": {
-                "voice_asr_service.md": "Voice ASR Service",
-                "social_control_ai_agent_integration.md": "Social Control and AI Agent Integration",
-                "performance_tracing.md": "Performance Tracing",
-                "voice_tts_service.md": "Voice TTS Service",
-                "speech_direction_enhancement.md": "Speech Direction and Enhancement"
-            }
-        },
-        "package_reference.md": {
-            "title": "Package Reference"
-        },
-        "development": {
-            "title": "Development Guide",
-            "subs": {
-                "vs_code_configuration.md": "VS Code Configuration",
-                "build_system_and_mixins.md": "Build System and Mixins",
-                "debugging_and_testing.md": "Debugging and Testing",
-                "atomgit_sdk_ci_automation.md": "AtomGit SDK and CI Automation"
-            }
-        },
-        "embodied_intelligence_stack": {
-            "title": "Embodied Intelligence Stack",
-            "subs": {
-                "interface_definitions.md": "Interface Definitions (ibrobot_msgs)",
-                "skill_catalog_skill_library.md": "Skill Catalog and Skill Library",
-                "capability_gateway_safety_guard.md": "Capability Gateway and Safety Guard",
-                "robot_skill_cli_hermes_agent_integration.md": "robot-skill CLI and Hermes Agent Integration",
-                "embodied_agent_pipeline_bringup.md": "Embodied Agent and Pipeline Bringup"
-            }
-        },
-        "perception_manipulation_services": {
-            "title": "Perception and Manipulation Services",
-            "subs": {
-                "perception_service.md": "Perception Service",
-                "grasp_planning.md": "Grasp Planning (manipulation_service)",
-                "pick_place_execution.md": "Pick and Place Execution (manipulation_execution)",
-                "semantic_mapping_object_tracking.md": "Semantic Mapping and Object Tracking"
-            }
-        },
-        "model_export_toolchains": {
-            "title": "Model Export Toolchains",
+        "model_export_deployment_toolchain": {
+            "title": "Model Export & Deployment Toolchain",
             "subs": {
                 "pi0_5_split_export_pipeline.md": "PI0.5 Split Export Pipeline",
-                "quantization_ascend_om_conversion.md": "Quantization and Ascend OM Conversion",
-                "rknn_hisilicon_houmo_hmm_export.md": "RKNN, Hisilicon and Houmo HMM Export",
-                "accuracy_comparison_observation_batches.md": "Accuracy Comparison and Observation Batches"
+                "accuracy_diagnostics_schedules.md": "Accuracy Diagnostics & Schedules",
+                "other_targets_rknn_hmm_910b_torch.md": "Other Targets: RKNN, HMM, 910B Torch",
+                "model_bundle_distribution.md": "Model Bundle Distribution"
+            }
+        },
+        "robot_hardware_control_simulation": {
+            "title": "Robot Hardware, Control & Simulation",
+            "subs": {
+                "hardware_interfaces_descriptions.md": "Hardware Interfaces & Descriptions",
+                "moveit_kinematics.md": "MoveIt & Kinematics",
+                "teleoperation.md": "Teleoperation",
+                "simulation_mock_hardware.md": "Simulation & Mock Hardware",
+                "navigation.md": "Navigation"
+            }
+        },
+        "perception_manipulation_semantic_mapping": {
+            "title": "Perception, Manipulation & Semantic Mapping",
+            "subs": {
+                "perception_service.md": "Perception Service",
+                "grasp_planning_verification.md": "Grasp Planning & Verification",
+                "manipulation_execution.md": "Manipulation Execution",
+                "human_motion_imitation.md": "Human Motion Imitation (HRI)",
+                "semantic_mapping_object_tracking.md": "Semantic Mapping & Object Tracking"
+            }
+        },
+        "embodied_agent_skills": {
+            "title": "Embodied Agent & Skills",
+            "subs": {
+                "embodied_pipeline_agent_nodes.md": "Embodied Pipeline & Agent Nodes",
+                "skill_catalog_skill_library.md": "Skill Catalog & Skill Library",
+                "robot_skill_cli_hermes.md": "robot-skill CLI & Hermes",
+                "safety_guard.md": "Safety Guard"
+            }
+        },
+        "voice_audio": {
+            "title": "Voice & Audio",
+            "subs": {
+                "asr_vad.md": "ASR & VAD",
+                "speech_direction_enhancement.md": "Speech Direction (DOA) & Enhancement",
+                "text_speech.md": "Text-to-Speech"
+            }
+        },
+        "data_tools_benchmarks_observability": {
+            "title": "Data Tools, Benchmarks & Observability",
+            "subs": {
+                "dataset_recording_conversion.md": "Dataset Recording & Conversion",
+                "camera_calibration_isp_tuning.md": "Camera Calibration & ISP Tuning",
+                "policy_evaluation_benchmark_runtime.md": "Policy Evaluation & Benchmark Runtime",
+                "tracing_web_ui.md": "Tracing & Web UI"
+            }
+        },
+        "interfaces": {
+            "title": "Interfaces (ibrobot_msgs)",
+            "subs": {
+                "skill_primitive_contracts.md": "Skill & Primitive Contracts",
+                "perception_grasp_inference_interfaces.md": "Perception, Grasp & Inference Interfaces"
+            }
+        },
+        "development_workflow_tooling": {
+            "title": "Development Workflow & Tooling",
+            "subs": {
+                "dependency_patch_management.md": "Dependency & Patch Management",
+                "ai_agent_skills_framework.md": "AI Agent Skills Framework",
+                "pr_review_verification_gates.md": "PR, Review & Verification Gates"
             }
         },
         "glossary.md": {

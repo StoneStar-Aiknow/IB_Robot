@@ -77,7 +77,7 @@ Do not expose these references as separate skills.
 
 ### 第 2 步 — 本地化配置与构建映射
 
-**执行本步前必须完整阅读 `references/config-localization.md`**。按其要求生成同 schema 的 `target_config` 并完成校验（增量模式下已存在则直接复用，跳过生成与校验）；随后从 `target_config.hierarchy` 构建"文件名 -> 中文 H1"映射。
+**执行本步前必须完整阅读 `references/config-localization.md`**。按其要求生成同 schema 的 `target_config` 并完成校验（增量模式下已存在则直接复用，跳过生成与校验）；随后构建「英文 H1 -> 中文 H1」映射：源文件 H1 经 `source_config.title_to_label` 得到 label，再在 `target_config` 中取同 label 的中文标题。映射与源文件名无关。构建后按 config-localization.md 的「映射校验」检查（全量与增量模式均执行），未通过不得进入第 4 步。
 
 ### 第 3 步 — 确定翻译范围
 
@@ -117,10 +117,10 @@ Do not expose these references as separate skills.
 
 **执行本步前必须完整阅读 `references/content-protection.md`**。对每个待翻译文件：
 
-1. 根据文件名从映射中找到对应中文 H1（缺失时停止并报告，不得编造）。
-2. 使用 **Read** 工具从 `source_dir` 完整读取源 Markdown。
+1. 使用 **Read** 工具从 `source_dir` 完整读取源 Markdown。
+2. 取源文件第一个 H1（英文页面标题），从映射中找到对应中文 H1（缺失时停止并报告，不得编造）。
 3. 按 `references/content-protection.md` 的规则翻译为简洁技术中文，保持 Markdown 结构。
-4. 将第一个 H1 替换为 `# <target_config 中的中文标题>`。
+4. 将第一个 H1 替换为 `# <映射命中的中文标题>`。
 5. 使用 **Write** 工具以相同文件名和 UTF-8 编码写入 `target_dir`。
 
 ### 第 5 步 — 生成中文文档并检查输出
@@ -143,7 +143,7 @@ Do not expose these references as separate skills.
 
 - 使用的翻译模式（全量或增量）与本地化配置路径（新建或复用）。
 - 翻译的配置标题数量、翻译的 Markdown 文件数量（增量模式含跳过的文件数）。
-- 缺少配置映射的源文件、空标题或重复标题情况。
+- 缺少 H1 映射的源文件、H1 重复、空标题情况。
 - `references/output-pipeline.md`「验证清单」检查结果（如有失败项）。
 - `verify_anchors.py` 校验结果（扫描文件数、问题数）。
 - 生成目录和链接转换报告路径。

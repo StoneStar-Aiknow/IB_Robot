@@ -3,7 +3,6 @@ import os
 import re
 from pathlib import Path
 
-
 FILE_LIKE_NAMES = {
     "CMakeLists.txt",
     "LICENSE",
@@ -26,26 +25,26 @@ def parse_source_ref(text):
     big span (min start, max end), e.g. '54-56, 136-187' -> (54, 187).
     Returns None when the text is not a source reference.
     """
-    clean_text = text.strip().strip('[]`')
-    match = re.match(r'^(?P<path>.+?):(?P<ranges>\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)+)$', clean_text)
+    clean_text = text.strip().strip("[]`")
+    match = re.match(r"^(?P<path>.+?):(?P<ranges>\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)+)$", clean_text)
     if match:
         starts = []
         ends = []
-        for part in re.split(r'\s*,\s*', match.group('ranges')):
-            numbers = part.split('-')
+        for part in re.split(r"\s*,\s*", match.group("ranges")):
+            numbers = part.split("-")
             starts.append(int(numbers[0]))
             ends.append(int(numbers[-1]))
-        return match.group('path'), min(starts), max(ends)
-    match = re.match(r'^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?$', clean_text)
+        return match.group("path"), min(starts), max(ends)
+    match = re.match(r"^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?$", clean_text)
     if match:
-        start = int(match.group('start'))
-        end = int(match.group('end') or match.group('start'))
-        return match.group('path'), start, end
+        start = int(match.group("start"))
+        end = int(match.group("end") or match.group("start"))
+        return match.group("path"), start, end
     return None
 
 
 def get_url_from_text(text, base_url, repo_root=None):
-    clean_text = text.split('(')[0].strip().strip('[]`')
+    clean_text = text.split("(")[0].strip().strip("[]`")
     parsed = parse_source_ref(clean_text)
     if parsed:
         path, start, end = parsed
@@ -59,22 +58,22 @@ def looks_like_source_ref(text):
 
 
 def looks_like_repo_path(text):
-    clean_text = text.strip().strip('[]`')
+    clean_text = text.strip().strip("[]`")
     if not clean_text or any(ch.isspace() for ch in clean_text):
         return False
-    if clean_text.startswith(('http://', 'https://', '#', './', '../')):
+    if clean_text.startswith(("http://", "https://", "#", "./", "../")):
         return False
-    if re.fullmatch(r'\d+(?:\.\d+)*', clean_text):
+    if re.fullmatch(r"\d+(?:\.\d+)*", clean_text):
         return False
-    if clean_text.startswith('.'):
+    if clean_text.startswith("."):
         return True
-    if '/' in clean_text:
+    if "/" in clean_text:
         return True
-    return bool(re.search(r'\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$', clean_text))
+    return bool(re.search(r"\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$", clean_text))
 
 
 def is_line_noise_link(text):
-    return bool(re.fullmatch(r'line\s+\d+', text.strip(), flags=re.IGNORECASE))
+    return bool(re.fullmatch(r"line\s+\d+", text.strip(), flags=re.IGNORECASE))
 
 
 def strip_inline_markdown(text):
@@ -85,10 +84,10 @@ def strip_inline_markdown(text):
         code_spans.append(m.group(1))
         return f"\x00{len(code_spans) - 1}\x00"
 
-    text = re.sub(r'`([^`]*)`', stash, text)
-    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
-    text = re.sub(r'[*_~]+', '', text)
-    return re.sub(r'\x00(\d+)\x00', lambda m: code_spans[int(m.group(1))], text)
+    text = re.sub(r"`([^`]*)`", stash, text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[*_~]+", "", text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: code_spans[int(m.group(1))], text)
 
 
 def github_slug(heading):
@@ -98,8 +97,8 @@ def github_slug(heading):
     characters, including CJK, spaces, and hyphens), join words with hyphens.
     """
     slug = strip_inline_markdown(heading).strip().lower()
-    slug = re.sub(r'[^\w\s-]', '', slug)
-    return re.sub(r'\s+', '-', slug)
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    return re.sub(r"\s+", "-", slug)
 
 
 def extract_heading_slugs(content):
@@ -111,7 +110,7 @@ def extract_heading_slugs(content):
     slugs = set()
     counts = {}
     for line in content.splitlines():
-        match = re.match(r'^(#{1,6})\s+(.*?)\s*#*\s*$', line)
+        match = re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", line)
         if not match:
             continue
         base = github_slug(match.group(2))
@@ -125,26 +124,26 @@ def extract_heading_slugs(content):
 
 def strip_page_marker(text):
     clean_text = text.strip()
-    clean_text = re.sub(r'^#?\d+(?:\.\d+)*\s+', '', clean_text).strip()
-    clean_text = re.sub(r'\s*\(\d+(?:\.\d+)*\)\s*$', '', clean_text).strip()
+    clean_text = re.sub(r"^#?\d+(?:\.\d+)*\s+", "", clean_text).strip()
+    clean_text = re.sub(r"\s*\(\d+(?:\.\d+)*\)\s*$", "", clean_text).strip()
     return clean_text
 
 
 def repo_url(path, base_url, repo_root=None, force_route=None):
-    clean_path = path.strip().strip('[]`').lstrip('/')
+    clean_path = path.strip().strip("[]`").lstrip("/")
     route = force_route or atomgit_route_for_path(clean_path, repo_root)
     repo_base, branch = split_atomgit_base_url(base_url)
     return f"{repo_base}/{route}/{branch}/{clean_path}"
 
 
 def split_atomgit_base_url(base_url):
-    clean_base = base_url.rstrip('/')
-    repo_base, branch = clean_base.rsplit('/', 1)
+    clean_base = base_url.rstrip("/")
+    repo_base, branch = clean_base.rsplit("/", 1)
     return repo_base, branch
 
 
 def atomgit_route_for_path(path, repo_root=None):
-    clean_path = path.strip().strip('[]`').lstrip('/')
+    clean_path = path.strip().strip("[]`").lstrip("/")
     if repo_root:
         target = Path(repo_root) / clean_path
         if target.is_dir():
@@ -155,33 +154,35 @@ def atomgit_route_for_path(path, repo_root=None):
 
 
 def looks_like_file_path(path):
-    clean_path = path.strip().rstrip('/')
+    clean_path = path.strip().rstrip("/")
     if not clean_path:
         return False
-    name = clean_path.rsplit('/', 1)[-1]
+    name = clean_path.rsplit("/", 1)[-1]
     if name in FILE_LIKE_NAMES:
         return True
-    return bool(re.search(r'\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$', name))
+    return bool(re.search(r"\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$", name))
 
 
 def extract_page_id(text, url):
     clean_url = url.strip()
-    if re.fullmatch(r'#?\d+(?:\.\d+)*', clean_url):
-        return clean_url.lstrip('#')
+    if re.fullmatch(r"#?\d+(?:\.\d+)*", clean_url):
+        return clean_url.lstrip("#")
 
-    text_match = re.match(r'^#?(\d+(?:\.\d+)*)(?:\s+|$)', text.strip())
+    text_match = re.match(r"^#?(\d+(?:\.\d+)*)(?:\s+|$)", text.strip())
     if text_match:
         return text_match.group(1)
 
-    parenthetical_match = re.search(r'\((\d+(?:\.\d+)*)\)\s*$', text.strip())
+    parenthetical_match = re.search(r"\((\d+(?:\.\d+)*)\)\s*$", text.strip())
     if parenthetical_match:
         return parenthetical_match.group(1)
     return None
 
 
-def resolve_page_link(text, url, current_filepath, id_to_label, title_to_label, label_to_filepath, warn, label_to_title=None):
+def resolve_page_link(
+    text, url, current_filepath, id_to_label, title_to_label, label_to_filepath, warn, label_to_title=None
+):
     clean_url = url.strip()
-    if clean_url and not re.fullmatch(r'#?\d+(?:\.\d+)*', clean_url):
+    if clean_url and not re.fullmatch(r"#?\d+(?:\.\d+)*", clean_url):
         return None
 
     page_id = extract_page_id(text, url)
@@ -236,7 +237,7 @@ def protect_blocks(content):
         placeholders.append(match.group(0))
         return placeholder
 
-    content = re.sub(r'```.*?```', store_block, content, flags=re.DOTALL)
+    content = re.sub(r"```.*?```", store_block, content, flags=re.DOTALL)
     return content, placeholders
 
 
@@ -248,11 +249,11 @@ def restore_blocks(content, placeholders):
 
 def get_relative_path(from_file, to_file):
     from_dir = str(Path(from_file).parent)
-    if from_dir == '.':
+    if from_dir == ".":
         return f"./{to_file}"
     try:
-        rel = os.path.relpath(to_file, from_dir).replace('\\', '/')
-        if not rel.startswith('.'):
+        rel = os.path.relpath(to_file, from_dir).replace("\\", "/")
+        if not rel.startswith("."):
             rel = f"./{rel}"
         return rel
     except ValueError:
@@ -260,11 +261,13 @@ def get_relative_path(from_file, to_file):
 
 
 def record_conversion(link_conversions, filepath, original, converted):
-    link_conversions.append({
-        "file": filepath,
-        "original": original,
-        "converted": converted,
-    })
+    link_conversions.append(
+        {
+            "file": filepath,
+            "original": original,
+            "converted": converted,
+        }
+    )
 
 
 class MarkdownLinkMatch:
@@ -310,8 +313,8 @@ def replace_markdown_links(content, replace_link):
             index += 1
             continue
 
-        original = content[index:url_end + 1]
-        text = content[link_start + 1:text_end]
+        original = content[index : url_end + 1]
+        text = content[link_start + 1 : text_end]
         url = content[url_start:url_end]
         output.append(replace_link(MarkdownLinkMatch(original, prefix, text, url)))
         index = url_end + 1
@@ -335,7 +338,18 @@ def report_link_conversions(link_conversions, output_dir):
     print(f"\nLink Conversions ({len(link_conversions)} total) written to {report_path}")
 
 
-def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, label_to_filepath, link_conversions, warn, repo_root=None, label_to_title=None):
+def fix_links(
+    content,
+    current_filepath,
+    base_url,
+    id_to_label,
+    title_to_label,
+    label_to_filepath,
+    link_conversions,
+    warn,
+    repo_root=None,
+    label_to_title=None,
+):
     content, placeholders = protect_blocks(content)
     heading_slugs = extract_heading_slugs(content)
 
@@ -349,7 +363,7 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
         return converted
 
     content = re.sub(
-        r'`\[([^\]\n]+?)\]\((https?://[^)\n]+)\)`',
+        r"`\[([^\]\n]+?)\]\((https?://[^)\n]+)\)`",
         replace_backtick_wrapped_link,
         content,
     )
@@ -369,10 +383,23 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
         warn(f"Unresolved backtick-wrapped empty link in {current_filepath}: `{text}`()")
         return m.group(0)
 
-    content = re.sub(r'`([^`\n]+?)`\(\)', replace_bare_code_source, content)
+    content = re.sub(r"`([^`\n]+?)`\(\)", replace_bare_code_source, content)
+
+    def replace_code_span_line_ref(m):
+        text = m.group(1).strip()
+        gap = m.group(2)
+        lines = m.group(3)
+        if looks_like_repo_path(text):
+            original = m.group(0)
+            converted = f"`{text}`{gap}[{lines}]({get_url_from_text(f'{text}:{lines}', base_url, repo_root)})"
+            record_conversion(link_conversions, current_filepath, original, converted)
+            return converted
+        return m.group(0)
+
+    content = re.sub(r"`([^`\n]+?)`(\s*)\[(\d+(?:-\d+)?)\]\(\)", replace_code_span_line_ref, content)
 
     def replace_double_source(m):
-        text = m.group(1).strip().replace('`', '')
+        text = m.group(1).strip().replace("`", "")
         if not looks_like_source_ref(text):
             warn(f"Unresolved double-bracket link in {current_filepath}: [[{text}]]()")
             return m.group(0)
@@ -381,27 +408,31 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
         record_conversion(link_conversions, current_filepath, original, converted)
         return converted
 
-    content = re.sub(r'\[\[(.+?)\]\]\(\)', replace_double_source, content)
+    content = re.sub(r"\[\[(.+?)\]\]\(\)", replace_double_source, content)
 
     def replace_link(m):
         prefix = m.group(1)
-        text = m.group(2).strip().replace('`', '')
+        text = m.group(2).strip().replace("`", "")
         url = m.group(3).strip()
 
         if prefix:
             return m.group(0)
 
-        if url.startswith(('http://', 'https://', './', '../')):
+        if url.startswith(("http://", "https://", "./", "../")):
             return m.group(0)
 
-        if url.startswith('#') and not re.fullmatch(r'#\d+(?:\.\d+)*', url):
+        if url.startswith("#") and not re.fullmatch(r"#\d+(?:\.\d+)*", url):
             anchor = url[1:]
             if anchor not in heading_slugs:
-                warn(f"Dangling anchor '#{anchor}' in {current_filepath}: [{text}]({url}) (no matching heading in this page)")
+                warn(
+                    f"Dangling anchor '#{anchor}' in {current_filepath}: [{text}]({url}) (no matching heading in this page)"
+                )
                 record_conversion(link_conversions, current_filepath, m.group(0), "(dangling anchor)")
             return m.group(0)
 
-        page_link = resolve_page_link(text, url, current_filepath, id_to_label, title_to_label, label_to_filepath, warn, label_to_title)
+        page_link = resolve_page_link(
+            text, url, current_filepath, id_to_label, title_to_label, label_to_filepath, warn, label_to_title
+        )
         if page_link:
             original = m.group(0)
             if original != page_link:
@@ -438,7 +469,7 @@ def fix_links(content, current_filepath, base_url, id_to_label, title_to_label, 
 
     content = replace_markdown_links(content, replace_link)
     content = re.sub(
-        r'`\[([^\]\n]+?)\]\((https?://[^)\n]+)\)`',
+        r"`\[([^\]\n]+?)\]\((https?://[^)\n]+)\)`",
         replace_backtick_wrapped_link,
         content,
     )

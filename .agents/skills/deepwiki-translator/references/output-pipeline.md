@@ -36,7 +36,7 @@ python -X utf8 <skill_dir>/scripts/deepwiki_processor.py --input-dir <target_dir
 
 先完整执行上方验证清单，汇总全部失败项，再按下表统一修复源文件；全部修复完成后重新生成并完整重检一次，禁止每修一项就重新生成一次。
 
-- `Configured title missing from input`（译文 H1 与配置标题不一致）：对照第 2 步构建的「文件名 -> 中文 H1」映射判断哪边错——译文 H1 写错则改 `raw_md_zh` 的 H1，配置标题译错则改 `target_config` 的标题。
-- `Input page not used by hierarchy`（存在未被配置使用的译文页面）：核对 `target_config.hierarchy` 与该文件名，三选一——补充 hierarchy 条目 / 删除多余译文文件（须经用户确认）/ 纠正文件名。
+- `Configured title missing from input`（译文 H1 与配置标题不一致）：对照第 2 步构建的「英文 H1 -> 中文 H1」映射判断哪边错——译文 H1 写错则改 `raw_md_zh` 的 H1，配置标题译错则改 `target_config` 的标题。
+- `Input page not used by hierarchy`（存在未被配置使用的译文页面）：核对该译文的 H1 与 `target_config.hierarchy`，三选一——补充 hierarchy 条目 / 删除多余译文文件（须经用户确认）/ 纠正译文 H1。
 - 保真失败（围栏代码块数量不符、路径或 URL 被翻译、链接显示文字的 URL 变了）：修 `raw_md_zh` 对应内容。
 - 已知坑——UTF-8 BOM：带 BOM 的源文件会让首行 H1 解析失败（表现为 `Configured title missing from input`）。读写统一用 `utf-8-sig`（`verify_anchors.py` 已内置；临时排查脚本也须如此）。

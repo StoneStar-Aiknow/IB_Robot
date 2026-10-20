@@ -5,12 +5,32 @@ from pathlib import Path
 
 
 def _slugify(title: str) -> str:
-    return re.sub(r"[^\w\s]", "", title).strip().replace(" ", "_").lower()
+    """Slug aligned with DeepWiki official labels: drop parenthesized segments,
+    treat remaining non-word chars as separators, collapse runs into a single "_"."""
+    without_parens = re.sub(r"[（(][^（）()]*[)）]", " ", title)
+    replaced = re.sub(r"[^\w\s]", " ", without_parens)
+    return re.sub(r"[\s_]+", "_", replaced).strip("_").lower()
+
+
+def _normalize_heading(text: str) -> str:
+    """Strip leading numbering ("1.1. ") and trailing section suffix ("(Section 8.3)" / "（8.3 节）")."""
+    t = re.sub(r"^\d+(?:\.\d+)*\.?\s*", "", text.strip())
+    t = re.sub(r"\s*[（(]\s*(?:Section\s*)?[\d.]+\s*节?\s*[)）]$", "", t)
+    return t.strip()
 
 
 def _page_content(full_title: str, body: str) -> str:
     title_heading = f"# {full_title}"
     body = body.lstrip("\n")
+    lines = body.split("\n")
+    # Drop a leading H1 that is a numbering/suffix variant of the page title,
+    # e.g. "# 1.1. Getting Started & Environment" for "Getting Started & Environment".
+    heading = re.match(r"^#\s+(.+)$", lines[0].strip()) if lines else None
+    if heading and _normalize_heading(heading.group(1)) == full_title.strip():
+        lines = lines[1:]
+        if lines and not lines[0].strip():
+            lines = lines[1:]
+        body = "\n".join(lines).lstrip("\n")
     if body.split("\n", 1)[0].strip() == title_heading:
         return body.rstrip() + "\n"
     return f"{title_heading}\n\n{body}".rstrip() + "\n"

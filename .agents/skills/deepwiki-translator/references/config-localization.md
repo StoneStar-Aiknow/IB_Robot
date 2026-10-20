@@ -4,7 +4,7 @@
 
 - 执行第 2 步「本地化配置与构建映射」时（开始本地化前必须完整阅读）
 - 校验本地化配置时
-- 构建文件名到 H1 的映射时
+- 构建英文 H1 到中文 H1 的映射时
 - 需要目录 overview「概述」后缀规则的完整 JSON 示例时
 
 ## 本地化 doc_config.json
@@ -95,12 +95,26 @@
 
 任一校验失败时停止，并报告具体不一致项。不要基于错误配置翻译页面。
 
-## 构建文件名到 H1 的映射
+## 构建英文 H1 到中文 H1 的映射
 
-使用 `target_config.hierarchy` 构建每个译文 Markdown 文件的标准 H1：
+映射以页面英文 H1 为键，经 label 连接两个配置，与源文件名无关：
 
-- 叶子页面：`"overview.md": {"title": "IB-Robot 概述"}` 映射 `overview.md` -> `IB-Robot 概述`。
-- 目录 overview：`"getting_started": {"title": "入门指南概述"}` 映射源文件 `getting_started.md` -> `入门指南概述`。目录 overview 标题必须带"概述"后缀。
-- 子页面：`"environment_setup.md": "环境配置"` 映射 `environment_setup.md` -> `环境配置`。
+1. 读取源文件的第一个 H1（即英文页面标题）。
+2. 用 `source_config.title_to_label` 将英文标题映射到 label。
+3. 用该 label 在 `target_config.title_to_label` 中反查中文标题。
 
-注意：目录 overview 的源文件仍然是 flat raw markdown 中按 label 命名的文件，例如 `getting_started.md`；后续生成时才会变成 `getting_started/overview.md`。
+示例（label = `getting_started`）：
+
+- 目录 overview：英文 H1 "Getting Started" -> 中文 "入门指南概述"。目录 overview 标题必须带"概述"后缀。
+- 子页面：英文 H1 "Environment Setup" -> "环境配置"。
+- 叶子页面：英文 H1 "IB-Robot Overview" -> "IB-Robot 概述"。
+
+译文文件名保持与源文件一致；第 5 步生成时按 H1 标题匹配页面，文件名不参与匹配。
+
+### 映射校验（全量与增量均执行）
+
+映射构建后、开始第 4 步前必须校验：
+
+1. `source_dir` 中全部文件的 H1 不得重复；重复即停止并报告涉及的文件与标题。
+2. 本轮待翻译文件（增量模式下为第 3 步判定需翻译的文件）的 H1 必须命中映射；未命中即停止并报告，不得编造标题。
+3. 增量模式复用旧 `target_config` 时，新增页面 H1 无法命中说明配置已过时：重新执行本文件的本地化生成与校验，不得跳过。
