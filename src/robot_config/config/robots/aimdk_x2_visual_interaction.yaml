@@ -1,0 +1,154 @@
+# AgiBot X2 proactive visual interaction configuration.
+#
+# It brings up one resident node that watches the visitor in front of the
+# head camera, decides what is worth answering, and publishes the sentence it
+# would say. It starts no camera driver, and it says nothing out loud.
+#
+# This entry point is observation-only, and that is enforced rather than
+# promised:
+#
+#   * the node resolves exactly one interface, a camera, and refuses to
+#     resolve anything from a motion family (visual_interaction.session
+#     .endpoints.assert_observation_only);
+#   * this config launches no inference pipeline and no action dispatcher, and
+#     the launch builder refuses to run if one is enabled in any control mode;
+#   * no control mode here declares a runtime_mode, so nothing takes over a
+#     runtime mode or asks for control authority. There is no release node,
+#     because there is nothing to hand back.
+#
+# Speech is deliberately absent. The session publishes
+# /visual_interaction/utterance with the generated text in it, and
+# /visual_interaction/status with the reason for every quiet round. Saying any
+# of it out loud needs arbitration this repo does not have yet: three sources
+# already call /voice_tts/synthesize and /voice_tts/play unaware of each other,
+# the playback node serialises FIFO with no priority, and PlayAudioFile has no
+# request-level cancel. See the TODO on visual_interaction.session.hooks
+# .SpeechPort.
+#
+# vl.implementation is 'fake' because it is the only port that exists. The
+# board's InternVL loop arrives after phase zero has measured it; until then
+# the whole decision chain runs and reports, and says nothing.
+#
+# Everything else — arbitration, command topics, interaction surfaces — comes
+# from aimdk_x2_skills.yaml (and through it aimdk_x2.yaml) and the aimdk_robot
+# runtime profile.
+
+robot:
+  base_config: aimdk_x2_skills.yaml
+  name: aimdk_x2_visual_interaction
+
+  # No skill reaches this feature, and no skill needs the robot to move for it.
+  # observation stays the default so bringing this up cannot leave the runtime
+  # in a mode that drives anything.
+  default_control_mode: "observation"
+  skill_required_control_mode: "observation"
+
+  # This X2 carries OmniHand dexterous hands; type must match the profile's
+  # public identity. Nothing here commands a hand — the profile is selected so
+  # the camera interface IDs resolve against the right description.
+  type: x2_ultra_omnihand
+  runtime:
+    profile: x2_ultra_omnihand
+
+  # Lists replace rather than merge, so this is the whole list. Only what the
+  # feature actually reads: a camera. No joint or hand capability is required,
+  # which is what keeps launch from waiting for a motion interface this entry
+  # point will never use.
+  capabilities:
+    requires:
+      - perception.camera
+
+  # Named motions are inherited from the skills config; switch them off so no
+  # skill in this deployment can move the robot.
+  embodied:
+    skill_catalog_profile: aimdk_x2_skills
+    runtime_named_motion:
+      enabled: false
+
+  # One mode of this deployment's own, and it produces nothing. runtime_mode is
+  # absent on purpose: a mode with one would be a mode something could take
+  # over.
+  #
+  # teleop and base_navigation are inherited through aimdk_x2_skills.yaml, and
+  # both drive the robot: they declare a runtime_mode (stream, locomotion) and
+  # an executor block with no "enabled" key, which
+  # robot_config.launch_builders.execution._executor_enabled reads as enabled
+  # (``executor.get("enabled", True)``). Leaving them as inherited would put a
+  # motion producer in an entry point described as observation-only, so both are
+  # switched off here and the launch builder refuses to run if either is not.
+  control_modes:
+    observation:
+      description: "Watch the visitor and decide what is worth answering"
+      description_cn: "观察访客，判断什么值得回应"
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+    teleop:
+      executor:
+        enabled: false
+    base_navigation:
+      executor:
+        enabled: false
+
+  visual_interaction:
+    enabled: true
+
+    # Resolved by interface ID from the live runtime description, never as a
+    # topic name. This is the camera the magic-mirror deployment already
+    # watches a visitor with: declared in the X2 profile, forward-facing,
+    # 30 Hz compressed.
+    #
+    # Not the camera the board demo used
+    # (camera.rgb_head_front_center.color_compressed): the vendor withdrew it
+    # from the open interface set in v0.8.1, and the profile contract test
+    # forbids it appearing in any endpoint. Phase zero still has to confirm
+    # this one frames a standing visitor — it is the left eye of a stereo pair,
+    # a different position from the demo's centre camera.
+    frame_source:
+      interface: camera.stereo_head_front_left.color_compressed
+
+    vl:
+      implementation: fake
+
+    # How often a round runs, and what it looks at. Four frames matches the
+    # board demo's vision input, so the window shape does not have to change
+    # when the real model arrives.
+    round_period_sec: 1.0
+    window_sec: 2.0
+    frames_per_window: 4
+    buffer_sec: 6.0
+    # A stream is judged dropped by arrival time, which needs no clock
+    # agreement between the robot and this host.
+    stale_stream_sec: 2.0
+    status_period_sec: 5.0
+
+    # The whole whitelist. A closed set with no fallback member: a generic
+    # "other object" category would hand the "is this sensitive?" judgement
+    # back to the model. Pendants are a real request and stay out until small
+    # object visibility and religious-symbol refusal are accepted separately.
+    categories:
+      - toy
+      - sign
+      - hat
+      - badge
+
+    # Every value below is a proposal, not a measurement. Phase zero measures
+    # the real VL and TTS latency before any of them is frozen.
+    session:
+      # Two different sampling windows must agree before a static subject is
+      # spoken. A small vision-language model will name a shape it cannot
+      # resolve, and a second look is the cheapest check available.
+      confirmation_count: 2
+      # How old the picture behind a reply may be when the words would be
+      # heard. Checked again immediately before delivery, not only when the
+      # model finished.
+      max_evidence_age_sec: 8.0
+      # Quiet time measured from the estimated end of the previous utterance.
+      min_gap_sec: 10.0
+      # A confirmed absence, as the missed-hand-over guard. A camera dropout is
+      # unknown rather than absent and never starts this timer.
+      absent_reset_sec: 30.0
+      # Without this a queue of visitors never resets and every later visitor
+      # inherits the first one's covered topics.
+      max_session_sec: 120.0
