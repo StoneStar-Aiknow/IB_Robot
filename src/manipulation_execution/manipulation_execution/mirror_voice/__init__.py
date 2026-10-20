@@ -5,6 +5,9 @@ Modules:
 ``core``  which session transitions are spoken, each at most once; the queue
           of phrases waiting to be spoken; the phrase chosen for an event;
           when the missing TTS service is reported.
+``speaker``  the order of a phrase: queue, WAV cache or synthesis, playback
+             segment by segment; precaching, call timeouts, failures and
+             ``~/status``.
 
 The ``voice`` section of the config, its defaults and its checks are in
 ``embodied_common.mirror_voice_contract``, which the session's launch builder

@@ -17,7 +17,7 @@ Everything else (``-> STANDBY/cooldown``, ``-> */wrap_up``) is silent. The
 state strings are built from the session's own ``SessionState`` and ``Phase``,
 so renaming a state breaks here at import instead of going quiet.
 
-The WAV cache, synthesis and playback order belong to the node.
+The WAV cache, synthesis and playback order are in ``mirror_voice.speaker``.
 """
 
 from __future__ import annotations

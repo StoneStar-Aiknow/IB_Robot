@@ -40,6 +40,7 @@ setup(
             "mirror_session_node = manipulation_execution.mirror_session_node:main",
             "mirror_session_release = manipulation_execution.mirror_session_node:release_main",
             "mirror_operator_node = manipulation_execution.mirror_operator_node:main",
+            "mirror_voice_node = manipulation_execution.mirror_voice_node:main",
             "placement_replay = manipulation_execution.placement_replay:main",
         ],
     },

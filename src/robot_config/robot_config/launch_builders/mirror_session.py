@@ -43,6 +43,17 @@ node's declaration. Its ``set_session(false)`` wait is the contract's stop
 timeout plus margin, a constant: ``stop_timeout_sec`` can only be at most 4.5
 (the Gateway's ``mirror_stop`` timeout must exceed it by 0.5), so it is not
 passed.
+
+``voice.enabled`` appends the voice node (a short phrase as the session
+changes state, spoken through ``voice_tts``) after everything else. Voice is
+an extra and the mirror must start without it: a wrong ``voice`` section, a
+``voice_tts`` that cannot run, or any other error while working out the voice
+node only logs a WARNING and leaves the node out; it never fails this launch.
+The section is checked by ``embodied_common.mirror_voice_contract``, which the
+node shares; the services and timeouts are ``voice_tts``'s, with
+``VoiceTTSConfig``'s defaults for the keys it leaves out, as loading does not
+fill them in. Its parameter names are held against the node's declaration
+the same way as the operator's.
 """
 
 import json
@@ -60,6 +71,10 @@ from embodied_common.mirror_session_contract import (
     OPERATOR_NODE_NAME,
     RELEASE_RESERVE_SEC,
 )
+from embodied_common.mirror_voice_contract import NODE_NAME as VOICE_NODE_NAME
+from embodied_common.mirror_voice_contract import SECTION_PATH as VOICE_PATH
+from embodied_common.mirror_voice_contract import parse_voice_section, to_json
+from robot_config.config import VoiceTTSConfig
 from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_builders.motion_imitation_stream import (
     mock_playback_endpoints,
@@ -67,6 +82,7 @@ from robot_config.launch_builders.motion_imitation_stream import (
     mock_velocity_limits,
     motion_imitation_stream_parameters,
 )
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
 
 _KEYS = frozenset(
@@ -80,6 +96,7 @@ _KEYS = frozenset(
         "interfaces",
         "business",
         "operator",
+        "voice",
     }
 )
 _BUSINESS_KEYS = frozenset({"hooks", "cover_judge", "config"})
@@ -93,6 +110,9 @@ _GATEWAY_NAMES = (
     ("gateway_skill_action", "skill_action_name", "/embodied/execute_skill"),
 )
 _IDLE = "idle"
+_VOICE_OFF = "no voice node, the mirror starts without voice"
+
+logger = get_colored_logger("robot_config.mirror_session")
 
 
 def _bool(config: Mapping, key: str, default: bool, where: str = "mirror_session") -> bool:
@@ -226,8 +246,67 @@ def _operator_parameters(robot_config: Mapping, config: Mapping, session: Mappin
     }
 
 
+def _voice_tts_unmet(voice_tts: Mapping) -> list[str]:
+    """Why ``voice_tts`` cannot serve the voice node, judged as embodied's ``has_tts_runtime`` does."""
+    unmet = []
+    if voice_tts["enabled"] is not True:
+        unmet.append("voice_tts.enabled is not true")
+    for key in ("bundle_path", "deployment"):
+        if not str(voice_tts[key]).strip():
+            unmet.append(f"voice_tts.{key} is empty")
+    for key in ("service_name", "playback_service_name"):
+        if not str(voice_tts[key]).startswith("/"):
+            unmet.append(f"voice_tts.{key} is not an absolute ROS name")
+    for key in ("tts_timeout_sec", "playback_timeout_sec"):
+        value = voice_tts[key]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            unmet.append(f"voice_tts.{key} is not a positive number")
+    return unmet
+
+
+def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
+    """The voice node's parameters, or None if it is not to start; a WARNING says why when it is wrong."""
+    section = config.get("voice")
+    if section is None:
+        return None
+    try:
+        voice = parse_voice_section(section)
+    except ValueError as exc:
+        logger.warning(f"{exc}; {_VOICE_OFF}")
+        return None
+    if not voice.enabled:
+        return None
+    given = robot_config.get("voice_tts")
+    given = given if isinstance(given, Mapping) else {}
+    defaults = VoiceTTSConfig()
+    voice_tts = {
+        key: given.get(key, getattr(defaults, key))
+        for key in (
+            "enabled",
+            "bundle_path",
+            "deployment",
+            "service_name",
+            "playback_service_name",
+            "tts_timeout_sec",
+            "playback_timeout_sec",
+        )
+    }
+    unmet = _voice_tts_unmet(voice_tts)
+    if unmet:
+        logger.warning(f"{VOICE_PATH}.enabled is true but voice_tts cannot run: {'; '.join(unmet)}; {_VOICE_OFF}")
+        return None
+    return {
+        "voice_json": to_json(voice),
+        "tts_service": str(voice_tts["service_name"]),
+        "playback_service": str(voice_tts["playback_service_name"]),
+        "tts_timeout_sec": float(voice_tts["tts_timeout_sec"]),
+        "playback_timeout_sec": float(voice_tts["playback_timeout_sec"]),
+        "status_period_sec": _number(config, "status_period_sec", 1.0, 0.0),
+    }
+
+
 def generate_mirror_session_nodes(robot_config: dict) -> list:
-    """The session node, its process-exit release and, if enabled, the operator node."""
+    """The session node, its process-exit release and, if enabled, the operator node and the voice node."""
     config = robot_config.get("mirror_session", {})
     if not isinstance(config, Mapping):
         raise ValueError("mirror_session must be a mapping")
@@ -297,6 +376,22 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
                 name=OPERATOR_NODE_NAME,
                 output="screen",
                 parameters=[operator],
+            )
+        )
+    # Voice is an extra; the mirror must start: no voice error may fail this launch.
+    try:
+        voice = _voice_parameters(robot_config, config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"{VOICE_PATH}: {type(exc).__name__}: {exc}; {_VOICE_OFF}")
+        voice = None
+    if voice is not None:
+        actions.append(
+            Node(
+                package="manipulation_execution",
+                executable="mirror_voice_node",
+                name=VOICE_NODE_NAME,
+                output="screen",
+                parameters=[voice],
             )
         )
     return actions

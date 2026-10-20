@@ -19,6 +19,11 @@
 # relative to WORKSPACE, so `source .shrc_local` must have run and
 # `$WORKSPACE/models/` must hold them. A missing bundle fails config parsing,
 # which aborts the whole launch rather than just the perception part.
+#
+# The mirror voice (mirror_session.voice) says a short phrase as the session
+# changes state, through our ZipVoice (models/zipvoice, also on the 310P) and
+# the runtime's speaker. The voice is an extra: when it cannot start, the
+# mirror starts without it.
 
 robot:
   base_config: aimdk_x2_skills.yaml
@@ -55,6 +60,8 @@ robot:
       - interaction.expression
       - interaction.led
       - runtime.stop
+      # The mirror voice plays through the runtime's audio.play.
+      - interaction.audio_playback
 
   # Only the two motion-imitation models. Each entry becomes one generic
   # inference_service/model_service_node; nothing here is X2-specific, and the
@@ -84,6 +91,28 @@ robot:
         node_name: hri_pear_parameters
         runtime_options:
           device_id: 0
+
+  # The voice's speech output; the base turns both off. ZipVoice speaks 24 kHz
+  # and the runtime's audio.play takes 16 kHz mono (/audio/play,
+  # AudioDataStamped), so the playback node resamples. The speaker is the
+  # runtime's: no local ALSA node is launched. ZipVoice failing to start must
+  # not take the mirror down, hence exit_on_init_failure false.
+  audio_io:
+    enabled: true
+    playback_source: runtime
+    playback_sample_rate: 16000
+    playback_channels: 1
+
+  voice_tts:
+    enabled: true
+    bundle_path: models/zipvoice
+    deployment: ascend_310p
+    resample_to_playback_rate: true
+    exit_on_init_failure: false
+    audio_output:
+      interface: audio.play
+      type: audio_common_msgs/msg/AudioDataStamped
+      requires: {capability: interaction.audio_playback}
 
   # Resident head-camera -> YOLOX -> PEAR frame stream.
   #
@@ -290,3 +319,14 @@ robot:
     operator:
       enabled: true
       send_enabled: false
+    # The voice node: a phrase when the session starts, is ready, starts
+    # mirroring and goes back to WAIT, synthesized by voice_tts below. Any
+    # error on this path only warns; the mirror starts without voice.
+    voice:
+      enabled: true
+      queue_max: 8
+      phrases:
+        starting: ["启动中"]
+        ready: ["我准备好咯"]
+        mirroring: ["开始模仿啦"]
+        goodbye: ["下次再见"]
