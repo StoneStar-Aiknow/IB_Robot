@@ -31,7 +31,7 @@ from robot_runtime.launch_support import (
     render_gazebo_description,
     render_robot_description,
     resolve_profile_argument,
-    resolve_transport,
+    resolve_sim_selection,
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
@@ -41,13 +41,14 @@ from robot_runtime.profile import load_profile
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("so101_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    transport = resolve_transport(
+    use_sim, sim_platform = resolve_sim_selection(
         profile,
-        LaunchConfiguration("transport").perform(context),
+        LaunchConfiguration("use_sim").perform(context),
+        LaunchConfiguration("sim_platform").perform(context),
         LaunchConfiguration("simulated").perform(context),
         source=str(profile_path),
     )
-    simulated = transport != "hardware"
+    simulated = use_sim
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
     if initial_mode:
@@ -72,18 +73,20 @@ def _launch_setup(context, *_args, **_kwargs):
     }
     gazebo_world = LaunchConfiguration("gazebo_world").perform(context).strip()
     spawn_pose = tuple(float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw"))
-    if transport == "gazebo":
+    if use_sim and sim_platform == "gazebo":
         robot_description = render_gazebo_description(effective_profile, profile_path, spawn_pose=spawn_pose)
     else:
         robot_description = render_robot_description(effective_profile, profile_path, simulated)
-    description = build_description(effective_profile, robot_description=robot_description, transport=transport)
+    description = build_description(
+        effective_profile, robot_description=robot_description, use_sim=use_sim, sim_platform=sim_platform
+    )
 
     motion = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
         ),
         launch_arguments={
-            **motion_launch_arguments(profile, profile_path, transport, display),
+            **motion_launch_arguments(profile, profile_path, simulated, sim_platform or "", display),
             "robot_description": robot_description,
         }.items(),
     )
@@ -98,13 +101,20 @@ def _launch_setup(context, *_args, **_kwargs):
             instance_id,
             robot_description=robot_description,
             interface_description=description,
-            transport=transport,
+            sim_platform=sim_platform or "",
             gazebo_world=gazebo_world,
             spawn_pose=spawn_pose,
         ),
         motion,
-        *peripheral_stack_actions(profile, peripherals_file, simulated, description=description, transport=transport),
-        *generate_teleoperation_nodes(profile, description, {"robot_description": robot_description}),
+        *peripheral_stack_actions(
+            profile, peripherals_file, simulated, description=description, sim_platform=sim_platform or ""
+        ),
+        *generate_teleoperation_nodes(
+            profile,
+            description,
+            {"robot_description": robot_description},
+            use_sim_time=use_sim and sim_platform == "gazebo",
+        ),
     ]
 
 
@@ -113,26 +123,31 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("profile", description="Runtime profile path or shipped profile name (required)"),
             DeclareLaunchArgument(
-                "simulated",
+                "use_sim",
                 default_value="",
-                description="Override profile.simulated: run so101_hardware on the SDK simulated transport",
+                description="Run simulated (true) or physical (false); default: the profile's selection",
             ),
             DeclareLaunchArgument(
-                "transport",
+                "sim_platform",
                 default_value="",
-                description="Execution transport: hardware | sdk | gazebo (overrides the profile default; "
-                "conflicts with simulated:=)",
+                description="Simulation platform: sdk | gazebo (sdk: the vendor SDK virtual bus, no physics; "
+                "gazebo: physics); implies use_sim:=true when given alone",
+            ),
+            DeclareLaunchArgument(
+                "simulated",
+                default_value="",
+                description="Deprecated alias of use_sim (a warning names use_sim)",
             ),
             DeclareLaunchArgument(
                 "gazebo_world",
                 default_value="",
                 description="Gazebo world name to spawn into (empty: the runtime starts a minimal empty world)",
             ),
-            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo transport)"),
-            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo transport)"),
-            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo transport)"),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo platform)"),
             DeclareLaunchArgument(
-                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo transport)"
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo platform)"
             ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),

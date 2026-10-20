@@ -193,7 +193,7 @@ def test_builder_exception_preserves_cause(monkeypatch):
 
 
 def _gazebo_provider_prepared(monkeypatch, tmp_path, *, binding=True):
-    """A real prepared launch for a provider on the gazebo transport.
+    """A real prepared launch for a provider on the gazebo platform.
 
     Drives the real launch entry preparation over the builtin registry with
     the real simulation/control entries; only the provider launch file (and,
@@ -262,7 +262,8 @@ def test_binding_branch_starts_the_world_once_before_the_provider(monkeypatch, t
     world_index, _ = gz_includes[0]
     provider_index, provider_args = provider_includes[0]
     assert world_index < provider_index, "the world must start before the provider readiness wait"
-    assert provider_args["transport"] == "gazebo"
+    assert provider_args["use_sim"] == "true"
+    assert provider_args["sim_platform"] == "gazebo"
     assert "simulated" not in provider_args
     assert provider_args["gazebo_world"] == "demo"
     assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.1", "0.2", "-0.03")
@@ -281,7 +282,7 @@ def test_binding_branch_consumer_pass_does_not_relaunch_the_world(monkeypatch, t
         "schema_version": 1,
         "robot": {"id": "test_robot", "type": "test", "runtime_name": "test_robot", "runtime_version": "0.1.0"},
         "execution": "simulated",
-        "transport": "gazebo",
+        "sim_platform": "gazebo",
         "interfaces": {},
         "states": {},
     }

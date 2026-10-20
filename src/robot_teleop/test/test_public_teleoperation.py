@@ -549,7 +549,7 @@ def test_real_runtime_projection_composes_executor_and_all_inputs(monkeypatch):
     path = root / "robots/so101/so101_robot/profiles/so101_single_arm.yaml"
     profile = yaml.safe_load(path.read_text())
     xml = render_robot_description(profile, path, True)
-    descriptor = build_description(profile, simulated=True, robot_description=xml)
+    descriptor = build_description(profile, use_sim=True, robot_description=xml)
     item = yaml.safe_load((root / "robot_config/config/robots/so101_single_arm.yaml").read_text())["robot"]
     item["robot_model"] = descriptor["model"]
     item["runtime"]["interface_description"] = descriptor

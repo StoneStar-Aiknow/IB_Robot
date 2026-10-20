@@ -19,7 +19,7 @@ runtime:
 
 # true: the bridge talks to the in-repo vendor mock instead of a robot
 # (aimdk_vendor_mock). There is no vendor-provided physics simulation here.
-simulated: false
+use_sim: false
 
 joint_state_topic: /joint_states
 

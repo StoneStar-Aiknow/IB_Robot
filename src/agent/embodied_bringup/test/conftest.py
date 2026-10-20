@@ -98,7 +98,7 @@ def public_description():
         "execution": "simulated",
         "interfaces": interfaces,
         "states": {},
-        "model": build_model_metadata(profile, transport="sdk", robot_description=urdf),
+        "model": build_model_metadata(profile, use_sim=True, sim_platform="sdk", robot_description=urdf),
     }
     description["digest"] = description_digest(description)
     validate_description(description)

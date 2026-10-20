@@ -1,10 +1,10 @@
-"""Episode metadata keeps the execution transport identity (runtime-simulation-transport D7).
+"""Episode metadata keeps the execution platform identity (runtime-simulation-platform D7).
 
-A Gazebo-transport runtime description forwarded to the episode recorder (the
+A Gazebo-platform runtime description forwarded to the episode recorder (the
 ``interface_description_json`` hand-off in ``launch_builders/recording.py``)
 must survive the dataset metadata round-trip with its ``execution`` and
-``transport`` fields intact, so offline consumers can tell physics simulation
-apart from the SDK virtual transport.
+``sim_platform`` fields intact, so offline consumers can tell physics simulation
+apart from the SDK virtual bus.
 """
 
 from __future__ import annotations
@@ -45,10 +45,10 @@ def _profile():
     }
 
 
-def test_gazebo_transport_description_survives_episode_metadata_roundtrip(tmp_path):
-    description = build_description(_profile(), transport="gazebo", robot_description=URDF)
+def test_gazebo_platform_description_survives_episode_metadata_roundtrip(tmp_path):
+    description = build_description(_profile(), use_sim=True, sim_platform="gazebo", robot_description=URDF)
     assert description["execution"] == "simulated"
-    assert description["transport"] == "gazebo"
+    assert description["sim_platform"] == "gazebo"
 
     # The recorder snapshots the bound description into the portable conversion
     # metadata it persists for every episode dataset.
@@ -67,5 +67,5 @@ def test_gazebo_transport_description_survives_episode_metadata_roundtrip(tmp_pa
     validate_public_conversion_metadata(reloaded)
     roundtrip = reloaded["description"]
     assert roundtrip["execution"] == "simulated"
-    assert roundtrip["transport"] == "gazebo"
+    assert roundtrip["sim_platform"] == "gazebo"
     assert description_digest(roundtrip) == roundtrip["digest"]

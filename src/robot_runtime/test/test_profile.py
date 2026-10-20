@@ -24,65 +24,68 @@ def test_minimal_profile_validates_and_fills_defaults():
     assert data["stop_default_policy"] == "HOLD"
 
 
-def test_transport_defaults_match_legacy_simulated():
+def test_sim_selection_defaults_match_legacy_simulated():
     data = _minimal()
     validate_profile(data, "unit")
-    assert data["transports"] == ["hardware", "sdk"]
-    assert data["transport"] == "hardware"
-    simulated = _minimal()
-    simulated["simulated"] = True
-    validate_profile(simulated, "unit")
-    assert simulated["transport"] == "sdk"
-    assert simulated["transports"] == ["hardware", "sdk"]
+    assert data["sim_platforms"] == ["sdk"]
+    assert data["sim_platform"] == "sdk"
+    assert data["use_sim"] is False
+    legacy = _minimal()
+    legacy["simulated"] = True
+    validate_profile(legacy, "unit")
+    assert legacy["use_sim"] is True
+    assert legacy["sim_platform"] == "sdk"
+    assert legacy["sim_platforms"] == ["sdk"]
 
 
-def test_profile_declares_supported_transports_and_default():
+def test_profile_declares_supported_platforms_and_default():
     data = _minimal()
-    data["transports"] = ["hardware", "sdk", "gazebo"]
-    data["transport"] = "gazebo"
+    data["sim_platforms"] = ["sdk", "gazebo"]
+    data["sim_platform"] = "gazebo"
     validate_profile(data, "unit")
-    assert data["transport"] == "gazebo"
-    # the legacy boolean is normalized from the effective transport
-    assert data["simulated"] is True
+    assert data["sim_platform"] == "gazebo"
+    # declaring a default platform does not by itself select simulation
+    assert data["use_sim"] is False
+    assert data["simulated"] is False
 
 
-def test_gazebo_default_conflicting_with_simulated_alias_fails():
+def test_simulated_alias_disagreeing_with_use_sim_fails_naming_both():
     data = _minimal()
-    data["transports"] = ["hardware", "sdk", "gazebo"]
-    data["transport"] = "gazebo"
-    data["simulated"] = True  # simulated:true selects sdk, not gazebo
-    with pytest.raises(ProfileError, match=r"transport 'gazebo'.*'simulated: True' implies 'sdk'"):
+    data["use_sim"] = False
+    data["simulated"] = True
+    with pytest.raises(ProfileError, match=r"use_sim: False.*'simulated: True' disagrees"):
         validate_profile(data, "unit")
 
 
-@pytest.mark.parametrize("transports", [[], "gazebo", ["hardware", "hardware"], ["teleport"]])
-def test_invalid_transports_list_rejected(transports):
+@pytest.mark.parametrize("sim_platforms", [[], "gazebo", ["sdk", "sdk"], ["teleport"]])
+def test_invalid_sim_platforms_list_rejected(sim_platforms):
     data = _minimal()
-    data["transports"] = transports
-    with pytest.raises(ProfileError, match="'transports'"):
+    data["sim_platforms"] = sim_platforms
+    with pytest.raises(ProfileError, match="'sim_platforms'"):
         validate_profile(data, "unit")
 
 
-def test_unknown_transport_value_rejected():
+def test_unknown_sim_platform_value_rejected():
     data = _minimal()
-    data["transport"] = "teleport"
-    with pytest.raises(ProfileError, match="'transport' must be one of"):
+    data["sim_platform"] = "teleport"
+    with pytest.raises(ProfileError, match="'sim_platform' must be one of"):
         validate_profile(data, "unit")
 
 
-def test_transport_conflicting_with_simulated_alias_fails_naming_both():
+def test_default_platform_outside_declared_set_rejected():
     data = _minimal()
-    data["simulated"] = False
-    data["transport"] = "sdk"
-    with pytest.raises(ProfileError, match=r"transport 'sdk'.*'simulated: False' implies 'hardware'"):
+    data["sim_platforms"] = ["sdk"]
+    data["use_sim"] = True
+    data["sim_platform"] = "gazebo"
+    with pytest.raises(ProfileError, match=r"sim_platform 'gazebo'.*not in the supported platforms \['sdk'\]"):
         validate_profile(data, "unit")
 
 
-def test_transport_outside_declared_set_names_transport_set_and_source():
+def test_default_platform_outside_minimal_set_names_platform_set_and_source():
     data = _minimal()
-    data["transports"] = ["hardware"]
-    data["simulated"] = True  # default transport sdk, which the set does not declare
-    with pytest.raises(ProfileError, match=r"transport 'sdk' is not in the supported transports \['hardware'\].*unit"):
+    data["simulated"] = True  # default platform sdk; declare a set without it
+    data["sim_platforms"] = ["gazebo"]
+    with pytest.raises(ProfileError, match=r"sim_platform 'sdk'.*not in the supported platforms \['gazebo'\].*unit"):
         validate_profile(data, "unit")
 
 

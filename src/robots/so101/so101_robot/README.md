@@ -21,9 +21,9 @@ Plus stock ros2_control controllers. No generic IB-Robot package is in the closu
 ## Running standalone
 
 ```bash
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm            # hardware
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true   # SDK simulated transport
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm transport:=gazebo # Gazebo physics
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm                          # hardware
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true            # sdk platform
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=gazebo     # Gazebo physics
 ```
 
 `profile` is a path or the name of a file in `profiles/`. The profile is the
@@ -35,19 +35,28 @@ The runtime reaches `ACTIVE` when the initial mode's controllers are active
 and publishes `/runtime_status`; `/runtime/set_mode`, `/runtime/stop`,
 `/runtime/get_status` and `/motion/*` are then available.
 
-### Transports
+### Simulation selection
 
-The profile declares which transports it supports (`transports: [hardware,
-sdk, gazebo]`); `transport:=` selects one, the legacy `simulated:=` boolean
-remains an alias for `sdk`/`hardware`, and a conflicting pair fails fast.
-`transport:=gazebo` runs the same controllers, motion services, modes and
+The runtime uses the same vocabulary as generic launch: `use_sim:=` selects
+simulated (`true`) or physical (`false`) execution, `sim_platform:=` selects
+which simulation platform replaces the robot when simulated. `use_sim:=false`
+means physical (no platform applies; passing a platform alongside it fails
+fast). `sdk` is the vendor SDK virtual bus behind the production hardware
+adapter — the full controller stack with no serial port and no physics.
+`gazebo` is the physics simulator. The profile declares the platforms it
+supports (`sim_platforms: [sdk, gazebo]`) and a default (`sim_platform:
+sdk`); `sim_platform:=gazebo` alone implies `use_sim:=true`, and a platform
+the profile does not declare fails before any process starts. The legacy
+`simulated:=` boolean stays a deprecated alias of `use_sim:=` (a warning
+names `use_sim`); a conflicting pair fails fast.
+`sim_platform:=gazebo` runs the same controllers, motion services, modes and
 stop behaviour against the simulator's ros2_control interface: the runtime
 starts a minimal empty world on its own (bring `IBROBOT_GAZEBO_HEADLESS=1`
 for server-only rendering), spawns the SO-101 into it and republishes the
 simulated joint effort as `joint.current`. When generic launch owns the
 world it passes `gazebo_world` and the spawn pose (`spawn_x/y/z/yaw`) and
 the runtime attaches to that world instead of starting one. Every node the
-runtime starts on this transport runs on simulation time. The Gazebo camera
+runtime starts on this platform runs on simulation time. The Gazebo camera
 poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
 the profile); user-saved overrides under
 `~/.ros/ibrobot/sim_camera_overrides/` take precedence.
@@ -55,7 +64,7 @@ the profile); user-saved overrides under
 ## Conformance
 
 ```bash
-CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true" \
+CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true" \
 CONFORMANCE_PROFILE=$(ros2 pkg prefix so101_robot)/share/so101_robot/profiles/so101_single_arm.yaml \
 python3 -m pytest src/robot_runtime/test/test_conformance.py -q
 ```

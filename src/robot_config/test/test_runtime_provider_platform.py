@@ -3,7 +3,7 @@
 Openspec ``so101-gazebo-runtime-transport`` tasks 3.1, 3.1b and 3.3: the
 shared provider/simulation-platform predicate used by loader validation and
 launch preparation, toggle-only deployment peripheral overrides on the
-provider path, and the single transport selection generic launch hands the
+provider path, and the simulation selection generic launch hands the
 provider (with the world name and the full spawn pose).
 """
 
@@ -220,7 +220,7 @@ def test_undeclared_toggle_is_rejected_by_the_runtime_merge():
 
 def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch, tmp_path):
     """Task 4.2: the migrated so101_rtp_distributed overlay composes the
-    provider on the Gazebo transport in the pick_banana world, with its
+    provider on the Gazebo platform in the pick_banana world, with its
     application deltas intact (name, skill profile, distributed inference)."""
     from launch import LaunchContext
 
@@ -262,7 +262,8 @@ def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch
     provider = next(i for i in includes if "profile" in arguments(i))
     assert "sim_models_pick_banana.world" in arguments(world)["gz_args"]
     provider_args = arguments(provider)
-    assert provider_args["transport"] == "gazebo"
+    assert provider_args["use_sim"] == "true"
+    assert provider_args["sim_platform"] == "gazebo"
     assert "simulated" not in provider_args
     assert provider_args["gazebo_world"] == "demo"
     assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.0", "0.3", "-0.03")
@@ -274,7 +275,7 @@ def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# 3.3: exactly one transport selection, world name and full spawn pose
+# 3.3: one selection vocabulary (use_sim + sim_platform), world name and full spawn pose
 # ---------------------------------------------------------------------------
 
 
@@ -292,16 +293,18 @@ def _include_arguments(robot_config, **kwargs):
     return {text(key): text(value) for key, value in include.launch_arguments}
 
 
-def test_hardware_and_sdk_keep_the_legacy_simulated_selection():
+def test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias():
     hardware = _include_arguments(_provider_config(), use_sim=False)
-    assert hardware["simulated"] == "false"
-    assert "transport" not in hardware
+    assert hardware["use_sim"] == "false"
+    assert "sim_platform" not in hardware
+    assert "simulated" not in hardware, "the legacy alias must never be passed"
     sdk = _include_arguments(_provider_config(), use_sim=True, sim_platform="sdk")
-    assert sdk["simulated"] == "true"
-    assert "transport" not in sdk
+    assert sdk["use_sim"] == "true"
+    assert sdk["sim_platform"] == "sdk"
+    assert "simulated" not in sdk
 
 
-def test_gazebo_emits_transport_world_and_full_spawn_pose_only():
+def test_gazebo_emits_platform_world_and_full_spawn_pose_only():
     startup = SimulationStartup(
         entity_action=None,
         world_name="demo",
@@ -310,8 +313,9 @@ def test_gazebo_emits_transport_world_and_full_spawn_pose_only():
     arguments = _include_arguments(
         _provider_config(platform="gazebo"), use_sim=True, sim_platform="gazebo", simulation_startup=startup
     )
-    assert arguments["transport"] == "gazebo"
-    assert "simulated" not in arguments, "the boolean alias must not accompany an explicit transport"
+    assert arguments["use_sim"] == "true"
+    assert arguments["sim_platform"] == "gazebo"
+    assert "simulated" not in arguments, "the legacy alias must never be passed"
     assert arguments["gazebo_world"] == "demo"
     assert (arguments["spawn_x"], arguments["spawn_y"], arguments["spawn_z"]) == ("0.5", "0.3", "-0.03")
     assert arguments["spawn_yaw"] == "1.25"
@@ -321,7 +325,8 @@ def test_gazebo_without_a_started_world_spawns_into_an_empty_world():
     arguments = _include_arguments(
         _provider_config(platform="gazebo"), use_sim=True, sim_platform="gazebo", simulation_startup=None
     )
-    assert arguments["transport"] == "gazebo"
+    assert arguments["use_sim"] == "true"
+    assert arguments["sim_platform"] == "gazebo"
     assert arguments["gazebo_world"] == ""
     assert arguments["spawn_yaw"] == "0.0"
 
@@ -339,7 +344,7 @@ def test_gazebo_readiness_timeout_uses_the_policy_with_a_gazebo_tier():
 
 
 # ---------------------------------------------------------------------------
-# 3.1c: bound consumers follow the transport clock (D7)
+# 3.1c: bound consumers follow the platform clock (D7)
 # ---------------------------------------------------------------------------
 
 
@@ -363,7 +368,7 @@ def _prepared_for_platform(monkeypatch, *, use_sim, sim_platform, platform):
         ("true", "", "gazebo", True),  # gazebo: the world owns /clock
     ],
 )
-def test_bound_consumers_follow_the_transport_clock(monkeypatch, use_sim, sim_platform, platform, expected):
+def test_bound_consumers_follow_the_platform_clock(monkeypatch, use_sim, sim_platform, platform, expected):
     prepared = _prepared_for_platform(monkeypatch, use_sim=use_sim, sim_platform=sim_platform, platform=platform)
     # the final PreparedLaunch carries the resolved clock policy
     assert prepared.node_use_sim_time is expected

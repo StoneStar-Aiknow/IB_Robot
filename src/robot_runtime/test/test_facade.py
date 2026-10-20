@@ -351,38 +351,36 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert caller.set_mode("idle").success
 
 
-def test_facade_transport_resolution_follows_parameters():
-    from robot_runtime.facade_node import resolve_facade_transport
+def test_facade_selection_resolution_follows_parameters():
+    from robot_runtime.facade_node import resolve_facade_selection
 
-    profile = {"runtime": {"name": "t", "version": "0"}, "simulated": False}
-    assert resolve_facade_transport(profile, "", False) == "hardware"
-    assert resolve_facade_transport(profile, "", True) == "sdk"
-    # an explicit transport wins; the simulated parameter left at its profile
-    # default is not treated as a conflicting selection
-    assert resolve_facade_transport(profile, "sdk", False) == "sdk"
-    assert resolve_facade_transport(profile, "hardware", False) == "hardware"
-    assert resolve_facade_transport(profile, "gazebo", True) == "gazebo"
-    with pytest.raises(ValueError, match="unknown transport"):
-        resolve_facade_transport(profile, "teleport", False)
-    with pytest.raises(ValueError, match="conflicting selection"):
-        resolve_facade_transport(profile, "hardware", True)
-    # a simulated parameter moved away from a simulated profile conflicts too
-    with pytest.raises(ValueError, match="conflicting selection"):
-        resolve_facade_transport({"runtime": {"name": "t"}, "simulated": True}, "sdk", False)
+    profile = {"runtime": {"name": "t", "version": "0"}, "use_sim": False, "sim_platforms": ["sdk", "gazebo"]}
+    assert resolve_facade_selection(profile, False, "") == (False, None)
+    assert resolve_facade_selection(profile, True, "") == (True, "sdk")
+    # an explicit platform wins over the profile default
+    assert resolve_facade_selection(profile, True, "gazebo") == (True, "gazebo")
+    with pytest.raises(ValueError, match="unknown sim_platform"):
+        resolve_facade_selection(profile, True, "teleport")
+    # physical execution cannot carry a platform
+    with pytest.raises(ValueError, match="physical execution cannot select"):
+        resolve_facade_selection(profile, False, "sdk")
+    # a platform the profile does not declare fails naming the set
+    with pytest.raises(ValueError, match="not supported by this runtime profile"):
+        resolve_facade_selection({"runtime": {"name": "t"}, "use_sim": True, "sim_platforms": ["sdk"]}, True, "gazebo")
 
 
-def test_facade_identity_check_covers_transport():
+def test_facade_identity_check_covers_sim_platform():
     from robot_runtime.facade_node import check_description_identity
     from robot_runtime.interface_description import build_description, description_digest
 
-    description = build_description(PROFILE, transport="sdk")
-    check_description_identity(PROFILE, description, "sdk")
-    gazebo = build_description(PROFILE, transport="gazebo")
-    check_description_identity(PROFILE, gazebo, "gazebo")
+    description = build_description(PROFILE, use_sim=True, sim_platform="sdk")
+    check_description_identity(PROFILE, description, True, "sdk")
+    gazebo = build_description(PROFILE, use_sim=True, sim_platform="gazebo")
+    check_description_identity(PROFILE, gazebo, True, "gazebo")
     with pytest.raises(ValueError, match="does not match"):
-        check_description_identity(PROFILE, gazebo, "sdk")
-    # pre-transport snapshots default from execution and still match the sdk facade
-    legacy = build_description(PROFILE, transport="sdk")
-    del legacy["transport"]
+        check_description_identity(PROFILE, gazebo, True, "sdk")
+    # pre-platform snapshots default from execution and still match the sdk facade
+    legacy = build_description(PROFILE, use_sim=True, sim_platform="sdk")
+    del legacy["sim_platform"]
     legacy["digest"] = description_digest(legacy)
-    check_description_identity(PROFILE, legacy, "sdk")
+    check_description_identity(PROFILE, legacy, True, "sdk")

@@ -51,7 +51,7 @@ from robot_runtime.contract import (
 )
 from robot_runtime.interface_description import (
     build_description,
-    description_transport,
+    description_sim_platform,
     validate_description,
 )
 from robot_runtime.interface_monitor import InterfaceMonitor
@@ -62,43 +62,51 @@ from robot_runtime.peripherals import (
     merge_peripherals,
     perception_capabilities,
 )
-from robot_runtime.profile import TRANSPORTS, load_profile, stop_bounds
+from robot_runtime.profile import SIM_PLATFORMS, load_profile, stop_bounds
 from robot_runtime.state import RuntimeState
 
 _SERVICE_TIMEOUT_S = 5.0
 _SWITCH_TIMEOUT_S = 3.0
 
 
-def resolve_facade_transport(profile: dict[str, Any], transport_param: str, simulated_param: bool) -> str:
-    """Facade-side transport resolution (runtime-simulation-transport D7).
+def resolve_facade_selection(
+    profile: dict[str, Any], use_sim_param: bool, sim_platform_param: str
+) -> tuple[bool, str | None]:
+    """Facade-side simulation selection (runtime-simulation-platform D7).
 
-    The explicit ``transport`` parameter wins when given; otherwise the legacy
-    ``simulated`` boolean maps to ``sdk``/``hardware`` (the facade itself never
-    picks a physics simulator). A ``simulated`` parameter that moved away from
-    the profile default counts as an explicit selection: one that disagrees
-    with ``transport`` fails naming both.
+    The launch resolves ``use_sim``/``sim_platform`` and passes both here; an
+    empty ``sim_platform`` means the profile's default applies. Physical
+    execution cannot carry a platform; a platform the profile does not declare
+    fails naming the platform, the set and the profile.
     """
-    explicit = str(transport_param or "").strip()
-    simulated = bool(simulated_param)
-    if not explicit:
-        return "sdk" if simulated else "hardware"
-    if explicit not in TRANSPORTS:
-        raise ValueError(f"runtime_facade: unknown transport {explicit!r}: expected one of {list(TRANSPORTS)}")
-    # ROS parameters cannot distinguish "unset" from "set to the default", so
-    # only a value that left the profile default is treated as a selection.
-    if simulated != bool(profile.get("simulated", False)) and (explicit != "hardware") != simulated:
-        raise ValueError(f"runtime_facade: conflicting selection transport:={explicit!r} with simulated:={simulated}")
-    return explicit
+    use_sim = bool(use_sim_param)
+    explicit = str(sim_platform_param or "").strip()
+    if not use_sim:
+        if explicit:
+            raise ValueError(f"runtime_facade: physical execution cannot select sim_platform:={explicit!r}")
+        return False, None
+    platform = explicit or str(profile.get("sim_platform") or "sdk")
+    if platform not in SIM_PLATFORMS:
+        raise ValueError(f"runtime_facade: unknown sim_platform {platform!r}: expected one of {list(SIM_PLATFORMS)}")
+    supported = [str(entry) for entry in (profile.get("sim_platforms") or ["sdk"])]
+    if platform not in supported:
+        raise ValueError(
+            f"runtime_facade: sim_platform {platform!r} is not supported by this runtime profile "
+            f"(supported: {supported})"
+        )
+    return True, platform
 
 
-def check_description_identity(profile: dict[str, Any], description: dict, transport: str) -> None:
+def check_description_identity(
+    profile: dict[str, Any], description: dict, use_sim: bool, sim_platform: str | None
+) -> None:
     """The effective public description must match the runtime profile's identity."""
     identity = description["robot"]
     if (
         identity["runtime_name"] != profile["runtime"]["name"]
         or identity["runtime_version"] != str(profile["runtime"]["version"])
-        or description["execution"] != ("simulated" if transport != "hardware" else "physical")
-        or description_transport(description) != transport
+        or description["execution"] != ("simulated" if use_sim else "physical")
+        or description_sim_platform(description) != sim_platform
     ):
         raise ValueError("effective public description does not match the runtime profile")
 
@@ -112,8 +120,8 @@ class RuntimeFacade(Node):
         if not path:
             raise ValueError("runtime_facade requires the 'profile' parameter (path to the runtime profile YAML)")
         self._profile: dict[str, Any] = load_profile(path)
-        self.declare_parameter("simulated", bool(self._profile.get("simulated", False)))
-        self.declare_parameter("transport", "")
+        self.declare_parameter("use_sim", bool(self._profile.get("use_sim", False)))
+        self.declare_parameter("sim_platform", "")
         self.declare_parameter("instance_id", str(self._profile["runtime"].get("instance_id", "")))
         self.declare_parameter("initial_mode", str(self._profile["modes"].get("initial", IDLE_MODE)))
         self._profile["modes"]["initial"] = str(self.get_parameter("initial_mode").value)
@@ -129,18 +137,18 @@ class RuntimeFacade(Node):
         self._profile["fast_lio"] = {**(self._profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
         self.declare_parameter("interface_description_json", "")
         encoded_description = str(self.get_parameter("interface_description_json").value)
-        self._transport = resolve_facade_transport(
+        self._use_sim, self._sim_platform = resolve_facade_selection(
             self._profile,
-            str(self.get_parameter("transport").value),
-            bool(self.get_parameter("simulated").value),
+            bool(self.get_parameter("use_sim").value),
+            str(self.get_parameter("sim_platform").value),
         )
         description = (
             json.loads(encoded_description)
             if encoded_description
-            else build_description(self._profile, peripherals, transport=self._transport)
+            else build_description(self._profile, peripherals, use_sim=self._use_sim, sim_platform=self._sim_platform)
         )
         validate_description(description)
-        check_description_identity(self._profile, description, self._transport)
+        check_description_identity(self._profile, description, self._use_sim, self._sim_platform)
         self._interface_monitor = InterfaceMonitor(self, description)
         self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))
         self._state = RuntimeState(

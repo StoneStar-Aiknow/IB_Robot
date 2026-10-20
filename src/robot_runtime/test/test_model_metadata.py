@@ -53,7 +53,8 @@ def _write_calibration(tmp_path):
 def test_physical_gripper_limits_come_from_calibration_not_urdf(tmp_path):
     model = build_model_metadata(
         _profile(_write_calibration(tmp_path)),
-        transport="hardware",
+        use_sim=False,
+        sim_platform=None,
         robot_description=URDF,
     )
     # Arm joint: conversion range intersected with the (mechanical) URDF window.
@@ -65,7 +66,7 @@ def test_physical_gripper_limits_come_from_calibration_not_urdf(tmp_path):
 
 
 def test_simulated_gripper_keeps_the_urdf_convention():
-    model = build_model_metadata(_profile(), transport="sdk", robot_description=URDF)
+    model = build_model_metadata(_profile(), use_sim=True, sim_platform="sdk", robot_description=URDF)
     assert model["authority"] == "urdf"
     assert model["joint_limits"]["6"]["min"] == pytest.approx(0.0)
     assert model["joint_limits"]["6"]["max"] == pytest.approx(1.0)
@@ -73,19 +74,19 @@ def test_simulated_gripper_keeps_the_urdf_convention():
     assert model["joint_limits"]["1"]["max"] == pytest.approx(1.0)
 
 
-def test_gazebo_transport_keeps_the_urdf_authority():
-    # A physics simulator is a simulated transport: the URDF convention stays
-    # the authority and calibration is never read (runtime-simulation-transport
+def test_gazebo_platform_keeps_the_urdf_authority():
+    # A physics simulator is a simulated platform: the URDF convention stays
+    # the authority and calibration is never read (runtime-simulation-platform
     # D7).
-    model = build_model_metadata(_profile(), transport="gazebo", robot_description=URDF)
+    model = build_model_metadata(_profile(), use_sim=True, sim_platform="gazebo", robot_description=URDF)
     assert model["authority"] == "urdf"
     assert model["joint_limits"]["6"]["min"] == pytest.approx(0.0)
     assert model["joint_limits"]["6"]["max"] == pytest.approx(1.0)
 
 
-def test_unknown_transport_is_rejected():
-    with pytest.raises(ValueError, match="transport"):
-        build_model_metadata(_profile(), transport="teleop", robot_description=URDF)
+def test_unknown_sim_platform_is_rejected():
+    with pytest.raises(ValueError, match="sim_platform"):
+        build_model_metadata(_profile(), use_sim=True, sim_platform="teleop", robot_description=URDF)
 
 
 def test_physical_gripper_missing_from_urdf_is_rejected(tmp_path):
@@ -95,7 +96,8 @@ def test_physical_gripper_missing_from_urdf_is_rejected(tmp_path):
     with pytest.raises(KeyError, match="missing lower/upper limits"):
         build_model_metadata(
             _profile(_write_calibration(tmp_path)),
-            transport="hardware",
+            use_sim=False,
+            sim_platform=None,
             robot_description=urdf_without_6,
         )
 
@@ -105,6 +107,6 @@ def test_conversion_lookup_error_hints_at_field_selectors():
     # joint names is the recurring confusion; the error must name it.
     from robot_runtime.model_metadata import build_joint_conversion_table_from_model
 
-    model = build_model_metadata(_profile(), transport="sdk", robot_description=URDF)
+    model = build_model_metadata(_profile(), use_sim=True, sim_platform="sdk", robot_description=URDF)
     with pytest.raises(ValueError, match="field selectors"):
         build_joint_conversion_table_from_model(model, ["position.1", "position.6"], "degrees")

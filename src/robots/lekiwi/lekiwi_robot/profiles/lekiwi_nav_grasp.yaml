@@ -4,7 +4,7 @@ runtime:
   name: lekiwi_robot
   version: 0.1.0
 
-simulated: false
+use_sim: false
 controller_manager: controller_manager
 joint_state_topic: /joint_states
 joints: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]

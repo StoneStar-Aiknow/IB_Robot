@@ -5,7 +5,7 @@ profile (which declares the respeaker microphone) plus the deployment speaker
 fragment — the same peripheral data the migrated ``lekiwi_nav_grasp``
 deployment config hands the runtime — and pins the generated ALSA nodes item
 by item to the nodes robot_config's legacy ``audio_io`` entry used to launch
-for the same device parameters, in both physical and simulated transport.
+for the same device parameters, in both physical and simulated execution.
 """
 
 from __future__ import annotations
@@ -67,7 +67,8 @@ def _render(simulated: str, peripherals_file: str, profile: Path = _PROFILE):
         {
             "profile": str(profile),
             "simulated": simulated,
-            "transport": "",
+            "use_sim": "",
+            "sim_platform": "",
             "display": "false",
             "instance_id": "",
             "peripherals": peripherals_file,
@@ -136,6 +137,29 @@ def test_runtime_launch_runs_the_alsa_owners_in_both_modes(tmp_path):
         assert _params(playback) == _EXPECTED_PLAYBACK_PARAMS
         remappings = [(_text(source), _text(target)) for source, target in playback._Node__remappings]
         assert remappings == [("audio", "/audio/play")]
+
+
+def test_physical_selection_passes_no_platform_to_the_facade(tmp_path):
+    """Physical execution must reach the facade with no platform (PR !515 P1).
+
+    The launch used to default the platform to "sdk" on the physical path,
+    which the facade's selection resolver rejects; the regression goes through
+    the real entry: rendered facade parameters must resolve without error.
+    """
+    from robot_runtime.facade_node import resolve_facade_selection
+    from robot_runtime.profile import load_profile
+
+    actions = _render("false", "", _profile_without_lidar(tmp_path))
+    facade = _node(_nodes(actions), "runtime_facade")
+    params = _params(facade)
+    assert params["use_sim"] is False
+    assert "sim_platform" not in params, "physical execution must carry no platform"
+
+    profile = load_profile(_profile_without_lidar(tmp_path))
+    assert resolve_facade_selection(profile, bool(params["use_sim"]), str(params.get("sim_platform", ""))) == (
+        False,
+        None,
+    )
 
 
 def test_runtime_launch_without_a_speaker_launches_only_the_capture_owner(tmp_path):

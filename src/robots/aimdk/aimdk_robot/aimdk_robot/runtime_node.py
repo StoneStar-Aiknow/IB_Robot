@@ -132,7 +132,8 @@ class AimdkRuntimeNode(Node):
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("aimdk_runtime", **node_kwargs)
         self.declare_parameter("profile", "")
-        self.declare_parameter("simulated", False)
+        self.declare_parameter("use_sim", False)
+        self.declare_parameter("sim_platform", "")
         self.declare_parameter("initial_mode", "")
         self.declare_parameter("instance_id", "")
         self.declare_parameter("startup_timeout_s", 20.0)
@@ -145,7 +146,8 @@ class AimdkRuntimeNode(Node):
         if not profile_path:
             raise RuntimeError("aimdk_runtime requires the 'profile' parameter")
         self._profile = load_profile(profile_path)
-        self._simulated = bool(self.get_parameter("simulated").value)
+        self._use_sim = bool(self.get_parameter("use_sim").value)
+        self._sim_platform = str(self.get_parameter("sim_platform").value or "").strip()
         instance_id = str(self.get_parameter("instance_id").value or "")
         if instance_id:
             self._profile["runtime"]["instance_id"] = instance_id
@@ -203,7 +205,9 @@ class AimdkRuntimeNode(Node):
             description = json.loads(supplied)
             validate_description(description)
         else:
-            description = build_description(self._profile, simulated=self._simulated)
+            description = build_description(
+                self._profile, use_sim=self._use_sim, sim_platform=self._sim_platform or None
+            )
         self._speech_cb = MutuallyExclusiveCallbackGroup()
         self._speech_description = description
         self._speech_enabled = False

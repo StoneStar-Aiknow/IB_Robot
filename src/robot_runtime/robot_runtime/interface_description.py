@@ -21,28 +21,29 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
-from robot_runtime.profile import TRANSPORTS
+from robot_runtime.profile import SIM_PLATFORMS
 
 
 class InterfaceDescriptionError(ValueError):
     """A public description violates its schema or semantic contract."""
 
 
-def description_transport(description: dict) -> str:
-    """Effective transport of a description, without mutating the document.
+def description_sim_platform(description: dict) -> str | None:
+    """Effective simulation platform of a description, without mutating the document.
 
-    The ``transport`` field is optional (schema_version stays 1), so snapshots
-    exported before it existed remain valid: they are read as ``sdk`` when
-    execution is simulated and ``hardware`` otherwise. An explicitly present
-    but unknown value fails closed instead of silently defaulting.
+    The ``sim_platform`` field is optional (schema_version stays 1), so
+    snapshots exported before it existed remain valid with their original
+    digest: they are read as ``sdk`` when execution is simulated and as no
+    platform when physical. An explicitly present but unknown value fails
+    closed instead of silently defaulting.
     """
-    transport = description.get("transport")
-    if transport is None:
-        return "sdk" if description.get("execution") == "simulated" else "hardware"
-    transport = str(transport)
-    if transport not in TRANSPORTS:
-        raise InterfaceDescriptionError(f"interface description transport: unknown value {transport!r}")
-    return transport
+    sim_platform = description.get("sim_platform")
+    if sim_platform is None:
+        return "sdk" if description.get("execution") == "simulated" else None
+    sim_platform = str(sim_platform)
+    if sim_platform not in SIM_PLATFORMS:
+        raise InterfaceDescriptionError(f"interface description sim_platform: unknown value {sim_platform!r}")
+    return sim_platform
 
 
 def validate_interface_requirements(requirements) -> dict:
@@ -277,7 +278,7 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
     }
 
 
-def peripheral_interfaces(peripherals: list[dict] | None, *, transport: str | None = None) -> dict[str, dict]:
+def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str | None = None) -> dict[str, dict]:
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = merge_peripherals(peripherals, [])
@@ -330,9 +331,9 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, transport: str | No
             if driver not in ("opencv", "camera_ros", "realsense"):
                 raise InterfaceDescriptionError(f"camera {name}: unsupported driver {driver!r}")
             streams = camera_streams(periph)
-            if transport == "gazebo":
+            if sim_platform == "gazebo":
                 # Streams the gz simulator cannot produce are not advertised on
-                # this transport (runtime-simulation-transport D6): the
+                # this platform (runtime-simulation-platform D6): the
                 # rgbd_camera publishes no depth camera_info (its depth image
                 # shares the color intrinsics) and no color-aligned pointcloud.
                 streams = [stream for stream in streams if stream != "pointcloud"]
@@ -381,10 +382,18 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, transport: str | No
                 }.get(wire_format)
                 if wire_format in ("rgb8", "bgr8", "mono8", "16UC1", "32FC1"):
                     encoding = wire_format
+                if sim_platform == "gazebo" and not is_color:
+                    # gz rgbd depth is float32 and ros_gz_bridge maps
+                    # R_FLOAT32 to 32FC1; advertising the physical device's
+                    # encoding (RealSense Z16 -> 16UC1) would mismatch every
+                    # observed depth message in the interface monitor
+                    # (PR !515 P2). The contract on this platform is what the
+                    # simulator actually publishes.
+                    encoding = "32FC1"
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
                 endpoint = f"{prefix}{suffix}/{'image_raw' if is_color or aligned else 'image_rect_raw'}"
                 info_topic = f"{prefix}{suffix}/camera_info"
-                if transport == "gazebo" and not is_color:
+                if sim_platform == "gazebo" and not is_color:
                     # gz rgbd_camera has no depth camera_info topic; the depth
                     # image shares the color intrinsics, so the color info
                     # interface carries them (D6: unproducible streams are not
@@ -423,10 +432,10 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, transport: str | No
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
-                if transport == "gazebo" and not is_color:
+                if sim_platform == "gazebo" and not is_color:
                     # the shared color info interface above already carries the
                     # depth intrinsics; a dedicated depth info topic has no
-                    # producer on this transport
+                    # producer on this platform
                     continue
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
@@ -622,35 +631,36 @@ def build_description(
     profile: dict,
     peripherals: list[dict] | None = None,
     *,
-    simulated: bool | None = None,
+    use_sim: bool | None = None,
     robot_description: str | None = None,
-    transport: str | None = None,
+    sim_platform: str | None = None,
 ) -> dict:
     """Project only public ROS interfaces; do not serialize private configuration.
 
-    ``transport`` (runtime-simulation-transport D1/D7) selects the execution
-    transport recorded in the description; the legacy ``simulated`` boolean
-    stays an alias for ``sdk``/``hardware``, and with neither given the
-    profile's declared transport applies. Disagreeing selections fail naming
-    both values.
+    ``use_sim``/``sim_platform`` (runtime-simulation-platform D1/D7) select the
+    execution identity recorded in the description: physical execution carries
+    no platform, simulated execution carries the platform it runs on. With
+    neither given the profile's declared selection applies; ``use_sim:=false``
+    together with a platform fails naming both.
     """
     runtime = profile["runtime"]
     caps = profile["capabilities"]
-    if transport is None:
-        if simulated is None:
-            transport = str(profile.get("transport") or ("sdk" if profile.get("simulated", False) else "hardware"))
-        else:
-            transport = "sdk" if simulated else "hardware"
-    else:
-        transport = str(transport).strip()
-        if transport not in TRANSPORTS:
-            raise InterfaceDescriptionError(f"unknown transport {transport!r}: expected one of {list(TRANSPORTS)}")
-        if simulated is not None and (transport != "hardware") != bool(simulated):
+    if use_sim is None:
+        use_sim = bool(profile.get("use_sim", profile.get("simulated", False)))
+    if not use_sim:
+        if sim_platform:
             raise InterfaceDescriptionError(
-                f"conflicting execution selection: simulated={simulated} with transport={transport!r}"
+                f"conflicting execution selection: use_sim=false with sim_platform={sim_platform!r}"
+            )
+        sim_platform = None
+    else:
+        sim_platform = str(sim_platform or profile.get("sim_platform") or "sdk").strip()
+        if sim_platform not in SIM_PLATFORMS:
+            raise InterfaceDescriptionError(
+                f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}"
             )
     interfaces = peripheral_interfaces(
-        profile.get("peripherals") if peripherals is None else peripherals, transport=transport
+        profile.get("peripherals") if peripherals is None else peripherals, sim_platform=sim_platform
     )
     # Audio peripherals derive the interaction.audio_* capability entries. A
     # profile that additionally declares them explicitly must agree with the
@@ -790,7 +800,6 @@ def build_description(
             frame_id=lidar_odom.get("source_body_frame", "body"),
         )
         interfaces["localization.cloud"]["qos"]["reliability"] = "reliable"
-    effective_simulated = transport != "hardware"
     description = {
         "schema_version": 1,
         "robot": {
@@ -799,8 +808,8 @@ def build_description(
             "runtime_name": runtime["name"],
             "runtime_version": str(runtime["version"]),
         },
-        "execution": "simulated" if effective_simulated else "physical",
-        "transport": transport,
+        "execution": "simulated" if use_sim else "physical",
+        **({"sim_platform": sim_platform} if use_sim else {}),
         "interfaces": interfaces,
         "states": {},
     }
@@ -809,7 +818,9 @@ def build_description(
     if robot_description is not None:
         from robot_runtime.model_metadata import build_model_metadata
 
-        description["model"] = build_model_metadata(profile, transport=transport, robot_description=robot_description)
+        description["model"] = build_model_metadata(
+            profile, use_sim=use_sim, sim_platform=sim_platform, robot_description=robot_description
+        )
         for name, interface in _teleoperation_interfaces(profile, description["model"]).items():
             if name in interfaces:
                 raise InterfaceDescriptionError(f"duplicate logical command interface {name}")
@@ -827,7 +838,7 @@ def main(argv=None):
     source.add_argument("--validate")
     parser.add_argument("--peripherals", default="")
     parser.add_argument("--simulated", choices=("true", "false"))
-    parser.add_argument("--transport", choices=TRANSPORTS)
+    parser.add_argument("--sim_platform", choices=SIM_PLATFORMS)
     parser.add_argument("--output")
     parser.add_argument("--instance-id")
     args = parser.parse_args(argv)
@@ -846,8 +857,8 @@ def main(argv=None):
                 profile["fast_lio"] = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
             description = build_description(
                 profile,
-                simulated=None if args.simulated is None else args.simulated == "true",
-                transport=args.transport,
+                use_sim=None if args.simulated is None else args.simulated == "true",
+                sim_platform=args.sim_platform,
             )
         if args.output:
             write_description(description, args.output)

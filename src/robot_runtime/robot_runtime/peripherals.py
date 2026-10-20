@@ -15,9 +15,9 @@ Peripheral sources are merged by ``(type, name)``:
 - the deployment robot YAML's ``peripherals:`` list overrides matching
   entries and may add deployment-specific ones (lidar IPs, camera serials).
 
-In simulated transport the physical drivers are replaced by
+When simulated the physical drivers are replaced by
 ``synthetic_perception`` publishers on the same topics, so the perception
-contract holds in both modes (the same principle the SDK simulated transport
+contract holds in both modes (the same principle the SDK simulation platform
 applies to motors).
 """
 
@@ -91,7 +91,7 @@ def _has_synthetic_streams(description: dict) -> bool:
 
 
 def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, description: dict | None = None) -> list[Node]:
-    """Simulated-transport perception: publish the declared topics with synthetic data."""
+    """Simulated-execution perception: publish the declared topics with synthetic data."""
     if not peripherals and not (
         description and any(key.startswith("localization.") for key in description["interfaces"])
     ):
@@ -103,11 +103,12 @@ def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, descrip
                 "capabilities": {},
                 "peripherals": peripherals,
             },
-            transport="sdk",
+            use_sim=True,
+            sim_platform="sdk",
         )
     if not _has_synthetic_streams(description):
         # e.g. audio-only peripherals: the real ALSA owners serve them in both
-        # transport modes, so there is nothing synthetic to publish.
+        # modes, so there is nothing synthetic to publish.
         return []
     return [
         Node(

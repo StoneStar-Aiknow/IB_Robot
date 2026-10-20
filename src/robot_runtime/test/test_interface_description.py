@@ -16,7 +16,7 @@ from robot_runtime.interface_description import (
     _teleoperation_interfaces,
     build_description,
     description_digest,
-    description_transport,
+    description_sim_platform,
     load_description,
     merge_peripherals,
     validate_description,
@@ -72,7 +72,7 @@ def profile():
 
 def test_public_projection_and_roundtrip(profile, tmp_path):
     original = copy.deepcopy(profile)
-    descriptor = build_description(profile, simulated=True)
+    descriptor = build_description(profile, use_sim=True)
     image = descriptor["interfaces"]["camera.front.color"]
     assert image["configured_profile"] == {"width": 16, "height": 12, "fps": 20, "encoding": "rgb8"}
     assert image["supported_profiles"] is None
@@ -140,68 +140,65 @@ def test_digest_and_unknown_states(profile):
 
 
 @pytest.mark.parametrize(
-    ("transport", "execution"),
-    [("hardware", "physical"), ("sdk", "simulated"), ("gazebo", "simulated")],
+    ("use_sim", "sim_platform", "execution"),
+    [(False, None, "physical"), (True, "sdk", "simulated"), (True, "gazebo", "simulated")],
 )
-def test_description_records_transport_and_execution(profile, transport, execution):
-    doc = build_description(profile, transport=transport)
-    assert doc["transport"] == transport
+def test_description_records_sim_platform_and_execution(profile, use_sim, sim_platform, execution):
+    doc = build_description(profile, use_sim=use_sim, sim_platform=sim_platform)
+    assert doc.get("sim_platform") == sim_platform  # absent when physical
     assert doc["execution"] == execution
     validate_description(doc)  # build already validated; the schema accepts the field
 
 
-def test_simulated_argument_stays_a_transport_alias(profile):
-    assert build_description(profile, simulated=True)["transport"] == "sdk"
-    assert build_description(profile, simulated=False)["transport"] == "hardware"
+def test_simulated_profile_key_stays_a_use_sim_alias(profile):
+    assert build_description(profile, use_sim=True)["sim_platform"] == "sdk"
+    assert "sim_platform" not in build_description(profile, use_sim=False)
     profile_with_sim = {**profile, "simulated": True}
-    assert build_description(profile_with_sim)["transport"] == "sdk"
+    assert build_description(profile_with_sim)["sim_platform"] == "sdk"
 
 
-def test_conflicting_simulated_and_transport_selection_rejected(profile):
+def test_physical_execution_with_platform_rejected(profile):
     with pytest.raises(InterfaceDescriptionError, match="conflicting execution selection"):
-        build_description(profile, simulated=False, transport="sdk")
-    with pytest.raises(InterfaceDescriptionError, match="conflicting execution selection"):
-        build_description(profile, simulated=True, transport="hardware")
+        build_description(profile, use_sim=False, sim_platform="sdk")
 
 
-def test_unknown_transport_rejected(profile):
-    with pytest.raises(InterfaceDescriptionError, match="unknown transport 'teleport'"):
-        build_description(profile, transport="teleport")
+def test_unknown_sim_platform_rejected(profile):
+    with pytest.raises(InterfaceDescriptionError, match="unknown sim_platform 'teleport'"):
+        build_description(profile, use_sim=True, sim_platform="teleport")
 
 
-def test_digest_covers_transport(profile):
-    doc = build_description(profile, transport="sdk")
-    doc["transport"] = "gazebo"
+def test_digest_covers_sim_platform(profile):
+    doc = build_description(profile, use_sim=True, sim_platform="sdk")
+    doc["sim_platform"] = "gazebo"
     with pytest.raises(ValueError, match="digest"):
         validate_description(doc)
 
 
-def test_pre_transport_description_stays_valid_and_defaults_from_execution(profile):
-    # A snapshot exported before the transport field existed keeps its digest
-    # and validates unchanged; readers default it from execution without
-    # mutating the document (runtime-simulation-transport D7).
-    doc = build_description(profile, transport="sdk")
-    del doc["transport"]
+def test_pre_platform_description_stays_valid_and_defaults_from_execution(profile):
+    # A snapshot exported before the sim_platform field existed keeps its
+    # digest and validates unchanged; readers default it from execution
+    # without mutating the document (runtime-simulation-platform D7).
+    doc = build_description(profile, use_sim=True, sim_platform="sdk")
+    del doc["sim_platform"]
     doc["digest"] = description_digest(doc)
     validate_description(doc)
-    assert description_transport(doc) == "sdk"
-    assert "transport" not in doc  # the reader must not insert the default
-    physical = build_description(profile, transport="hardware")
-    del physical["transport"]
+    assert description_sim_platform(doc) == "sdk"
+    assert "sim_platform" not in doc  # the reader must not insert the default
+    physical = build_description(profile, use_sim=False)
     physical["digest"] = description_digest(physical)
     validate_description(physical)
-    assert description_transport(physical) == "hardware"
-    assert "transport" not in physical
+    assert description_sim_platform(physical) is None
+    assert "sim_platform" not in physical
 
 
-def test_description_transport_rejects_unknown_value(profile):
-    doc = build_description(profile, transport="sdk")
-    doc["transport"] = "teleport"
+def test_description_sim_platform_rejects_unknown_value(profile):
+    doc = build_description(profile, use_sim=True, sim_platform="sdk")
+    doc["sim_platform"] = "teleport"
     doc["digest"] = description_digest(doc)
-    with pytest.raises(ValueError, match="transport"):
+    with pytest.raises(ValueError, match="sim_platform"):
         validate_description(doc)  # the schema enum rejects the unknown value
     with pytest.raises(InterfaceDescriptionError, match="unknown value 'teleport'"):
-        description_transport(doc)
+        description_sim_platform(doc)
 
 
 def test_supported_modes_not_inferred(profile):
@@ -265,7 +262,7 @@ class FakeNode:
 
 
 def test_synthetic_streams_match_the_descriptor(profile):
-    doc = build_description(profile, simulated=True)
+    doc = build_description(profile, use_sim=True)
     node = FakeNode()
     SyntheticStreams(node, doc)
     for period, callback in node.timers:
@@ -363,7 +360,7 @@ def test_shipped_runtime_profiles_export_valid_public_descriptions():
     assert paths
     for path in paths:
         profile = load_profile(path)
-        validate_description(build_description(profile, simulated=True))
+        validate_description(build_description(profile, use_sim=True))
 
 
 def test_monitor_subscription_mirrors_declared_qos(profile):
@@ -418,7 +415,7 @@ def test_synthetic_perception_publishes_an_unstamped_message(profile):
         def get_clock(self):
             raise AssertionError("an unstamped message must not reach the clock")
 
-    descriptor = build_description(profile, simulated=True)
+    descriptor = build_description(profile, use_sim=True)
     # Only the headerless interface, so any use of the clock is this one's.
     descriptor["interfaces"] = {
         "touch.hands": {

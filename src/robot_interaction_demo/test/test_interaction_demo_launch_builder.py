@@ -37,7 +37,7 @@ def deferred_config():
 
 
 def descriptor():
-    return build_description(load_profile(PROFILE), simulated=True)
+    return build_description(load_profile(PROFILE), use_sim=True)
 
 
 def test_runtime_description_resolves_endpoints_before_launching_business_node():

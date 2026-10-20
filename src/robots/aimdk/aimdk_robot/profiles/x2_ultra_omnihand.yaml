@@ -24,7 +24,7 @@ runtime:
   name: aimdk_robot
   version: 0.1.0
   type: x2_ultra_omnihand
-simulated: false
+use_sim: false
 joint_state_topic: /joint_states
 joints:
 - left_shoulder_pitch_joint

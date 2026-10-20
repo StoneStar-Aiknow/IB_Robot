@@ -250,7 +250,7 @@ def test_build_description_accepts_matching_declared_audio_capability():
     capabilities = {
         "interaction.audio_capture": {"topics": ["/audio/capture_stamped"], "sample_rate_hz": 16000, "channels": 6}
     }
-    description = build_description(_profile([_RESPEAKER], capabilities), simulated=True)
+    description = build_description(_profile([_RESPEAKER], capabilities), use_sim=True)
     assert description["interfaces"]["audio.capture"]["channels"] == 6
 
 
@@ -259,7 +259,7 @@ def test_build_description_rejects_contradicting_declared_audio_capability():
         "interaction.audio_playback": {"endpoints": ["/audio/play"], "sample_rate_hz": 16000, "channels": 1}
     }
     try:
-        build_description(_profile([_SPEAKER], capabilities), simulated=True)
+        build_description(_profile([_SPEAKER], capabilities), use_sim=True)
     except InterfaceDescriptionError as exc:
         assert "contradicts the audio peripherals" in str(exc)
     else:

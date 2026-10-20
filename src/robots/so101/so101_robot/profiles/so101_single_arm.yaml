@@ -10,13 +10,15 @@ runtime:
   version: 0.1.0
   type: so101
 
-# true: so101_hardware runs on the SDK simulated transport (no serial port, no
-# physics) — the production controller stack, headless. Overridable by the
-# `simulated` launch argument. `transports` declares what this runtime
-# supports; `transport:=gazebo` runs the same controllers against Gazebo
-# physics (runtime-simulation-transport).
-simulated: false
-transports: [hardware, sdk, gazebo]
+# use_sim selects simulated or physical execution (the same vocabulary as
+# generic launch; `simulated:` stays a deprecated alias). true: so101_hardware
+# runs on the `sdk` platform — the vendor SDK virtual bus, no serial port, no
+# physics — the production controller stack, headless. `sim_platforms`
+# declares the supported platforms; `sim_platform:=gazebo` runs the same
+# controllers against Gazebo physics (runtime-simulation-platform).
+use_sim: false
+sim_platforms: [sdk, gazebo]
+sim_platform: sdk
 
 controller_manager: controller_manager
 joint_state_topic: /joint_states

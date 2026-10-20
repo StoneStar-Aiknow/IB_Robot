@@ -7,8 +7,8 @@ launch package: profile path resolution, xacro rendering, the
 controller_manager parameter file, and controller spawners derived from the
 profile's mode table.
 
-The Gazebo transport (openspec ``so101-gazebo-runtime-transport`` D5/D7)
-adds transport-aware description rendering and ``gazebo_embodiment_actions``:
+The Gazebo simulation platform (openspec ``so101-gazebo-runtime-transport``
+D5/D7) adds platform-aware description rendering and ``gazebo_embodiment_actions``:
 the runtime provider owns its embodiment (description, entity creation,
 controllers, sensors and bridges, facade) while the world is owned either by
 generic launch or, standalone, by a minimal empty world started here.
@@ -17,6 +17,7 @@ generic launch or, standalone, by a minimal empty world started here.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -52,7 +53,9 @@ from robot_runtime.peripherals import (
     peripheral_nodes,
     synthetic_perception_nodes,
 )
-from robot_runtime.profile import TRANSPORTS
+from robot_runtime.profile import SIM_PLATFORMS
+
+logger = logging.getLogger(__name__)
 
 #: The provider-alone minimal empty world (physics + user commands + scene
 #: broadcaster + the sensors system so runtime-owned cameras render, a light
@@ -192,41 +195,79 @@ def resolve_profile_argument(package: str, raw: str) -> Path:
     )
 
 
-def resolve_transport(profile: dict[str, Any], transport_arg: str, simulated_arg: str, *, source: str = "") -> str:
-    """Resolve the effective execution transport (runtime-simulation-transport D1).
+def _parse_bool_argument(value: str, name: str) -> bool:
+    text = (value or "").strip().lower()
+    if text in ("1", "true", "yes"):
+        return True
+    if text in ("0", "false", "no"):
+        return False
+    raise RuntimeProfileError(f"cannot parse {name}:={value!r} as a boolean")
 
-    ``transport_arg`` (``transport:=``) selects a transport explicitly;
-    ``simulated_arg`` (``simulated:=``) stays the legacy boolean alias mapping
-    to ``sdk``/``hardware``. An empty selection falls back to the profile's
-    declared default. Disagreeing selections, unknown values and transports
-    the profile does not declare fail fast, naming the values involved.
+
+def resolve_sim_selection(
+    profile: dict[str, Any],
+    use_sim_arg: str,
+    sim_platform_arg: str,
+    simulated_arg: str,
+    *,
+    source: str = "",
+) -> tuple[bool, str | None]:
+    """Resolve the effective simulation selection (runtime-simulation-platform D1).
+
+    Uses generic launch's vocabulary: ``use_sim:=`` selects simulated or
+    physical execution, ``sim_platform:=`` selects the simulation platform.
+    ``sim_platform:=X`` alone implies simulation on X; ``use_sim:=true``
+    alone runs the profile's default platform; ``use_sim:=false`` with a
+    platform fails naming both. ``simulated:=`` stays a deprecated alias of
+    ``use_sim:=`` (a warning names ``use_sim``); disagreeing with ``use_sim:=``
+    fails naming both. A platform the profile does not declare fails naming
+    the platform, the declared set and the profile.
     """
-    transport_override = (transport_arg or "").strip().lower()
+    use_sim_explicit: bool | None = None
     simulated_override = (simulated_arg or "").strip().lower()
-    if transport_override and transport_override not in TRANSPORTS:
-        raise RuntimeProfileError(f"unknown transport {transport_override!r}: expected one of {list(TRANSPORTS)}")
-    simulated_explicit = ""
     if simulated_override:
-        if simulated_override in ("1", "true", "yes"):
-            simulated_explicit = "sdk"
-        elif simulated_override in ("0", "false", "no"):
-            simulated_explicit = "hardware"
-        else:
-            raise RuntimeProfileError(f"cannot parse simulated:={simulated_override!r} as a boolean")
-    if transport_override and simulated_explicit and transport_override != simulated_explicit:
-        raise RuntimeProfileError(
-            f"conflicting transport selection: transport:={transport_override!r} and simulated:="
-            f"{simulated_override!r} (-> {simulated_explicit!r}); pass at most one"
+        use_sim_explicit = _parse_bool_argument(simulated_override, "simulated")
+        logger.warning(
+            "simulated:=%s is deprecated; use use_sim:=%s (same effect)",
+            simulated_override,
+            str(use_sim_explicit).lower(),
         )
-    default_transport = str(profile.get("transport") or ("sdk" if profile.get("simulated") else "hardware"))
-    selection = transport_override or simulated_explicit or default_transport
-    supported = [str(entry) for entry in (profile.get("transports") or ["hardware", "sdk"])]
-    if selection not in supported:
+    use_sim_override = (use_sim_arg or "").strip().lower()
+    if use_sim_override:
+        use_sim_value = _parse_bool_argument(use_sim_override, "use_sim")
+        if use_sim_explicit is not None and use_sim_explicit != use_sim_value:
+            raise RuntimeProfileError(
+                f"conflicting selection: use_sim:={use_sim_value} and simulated:={str(use_sim_explicit).lower()}; "
+                "pass at most one"
+            )
+        use_sim_explicit = use_sim_value
+
+    sim_platform = (sim_platform_arg or "").strip().lower()
+    if sim_platform and sim_platform not in SIM_PLATFORMS:
+        raise RuntimeProfileError(f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}")
+
+    # A platform alone implies simulation; otherwise the profile's selection
+    # applies unless an argument overrode it.
+    if use_sim_explicit is None:
+        # the profile-level `simulated` key stays the legacy alias of `use_sim`
+        use_sim = bool(sim_platform) or bool(profile.get("use_sim", profile.get("simulated", False)))
+    else:
+        use_sim = use_sim_explicit
+    if not use_sim:
+        if sim_platform:
+            raise RuntimeProfileError(
+                f"physical execution (use_sim:=false) cannot select sim_platform:={sim_platform!r}; pass at most one"
+            )
+        return False, None
+
+    platform = sim_platform or str(profile.get("sim_platform") or "sdk")
+    supported = [str(entry) for entry in (profile.get("sim_platforms") or ["sdk"])]
+    if platform not in supported:
         raise RuntimeProfileError(
-            f"transport {selection!r} is not supported by this runtime profile (supported: {supported}, "
-            f"default: {default_transport!r}{f'; profile: {source}' if source else ''})"
+            f"sim_platform {platform!r} is not supported by this runtime profile (supported: {supported}, "
+            f"default: {profile.get('sim_platform', 'sdk')!r}{f'; profile: {source}' if source else ''})"
         )
-    return selection
+    return True, platform
 
 
 def render_robot_description(profile: dict[str, Any], profile_path: Path, simulated: bool) -> str:
@@ -261,7 +302,7 @@ _PACKAGE_URI_PATTERN = None
 def _resolve_package_uris(robot_description: str) -> str:
     """Rewrite ``package://<pkg>/...`` mesh URIs to absolute ``file://`` paths.
 
-    A description spawned on the Gazebo transport must be resolvable by a
+    A description spawned on the Gazebo platform must be resolvable by a
     simulator server the provider did not configure (D7b): no resource-path
     environment hand-off is needed when the URDF carries absolute file URIs.
     """
@@ -290,14 +331,14 @@ def render_gazebo_description(
     *,
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> str:
-    """Render the profile's xacro for the Gazebo transport (D5, D7b).
+    """Render the profile's xacro for the Gazebo platform (D5, D7b).
 
     ``use_sim`` selects the ros2_control simulation plugin (gz
     ``GazeboSimSystem``), the SDK flag stays off, the gz plugin reads the
     profile's controllers parameter file and the effort state interface is
     exposed for the simulated joint-current publisher (D6b). Camera sensors
     are injected for the effective peripherals, meshes resolve to absolute
-    ``file://`` URIs and the SDK/hardware transports are untouched.
+    ``file://`` URIs and the SDK/hardware descriptions are untouched.
     """
     description = profile.get("description") or {}
     if not description.get("xacro"):
@@ -344,7 +385,7 @@ def _on_success(start_actions, success_message: str, failure_reason: str):
 
 
 def simulated_joint_current_actions(profile: dict[str, Any]) -> list:
-    """The effort→JointCurrent republisher for a physics transport (D6b).
+    """The effort→JointCurrent republisher for a physics platform (D6b).
 
     Started only when the profile declares a ``joint.current`` interface whose
     runtime endpoint and joint names parameterize the robot-agnostic node; the
@@ -510,8 +551,8 @@ def gazebo_embodiment_actions(
                     {
                         "profile": str(profile_path),
                         "peripherals": peripherals_file,
-                        "simulated": True,
-                        "transport": "gazebo",
+                        "use_sim": True,
+                        "sim_platform": "gazebo",
                         "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
                         "use_sim_time": True,
                         **(
@@ -548,7 +589,7 @@ def runtime_stack_actions(
     *,
     robot_description: str | None = None,
     interface_description: dict | None = None,
-    transport: str = "",
+    sim_platform: str = "",
     gazebo_world: str = "",
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> list:
@@ -556,17 +597,16 @@ def runtime_stack_actions(
 
     ``peripherals_file`` (deployment overrides; profile ``peripherals:`` are
     the robot's defaults) additionally composes the sensor driver nodes, or
-    synthetic perception publishers in simulated transport (D12), and feeds
-    the facade so RuntimeStatus declares the perception surface. ``transport``
-    (runtime-simulation-transport D1/D7) is forwarded to the facade so its
-    public description carries the selected transport; empty keeps the
-    facade's legacy ``simulated``-parameter resolution. ``gazebo`` dispatches
-    to the embodiment variant (D5): no ``ros2_control_node``, entity creation
-    in the named world (empty ⇒ standalone minimal world), spawners against
-    the in-simulator controller manager and the facade on sim time; hardware
-    and sdk are unchanged.
+    synthetic perception publishers in simulated execution (D12), and feeds
+    the facade so RuntimeStatus declares the perception surface.
+    ``sim_platform`` (runtime-simulation-platform D1/D7) is forwarded to the
+    facade so its public description carries the selected platform; the
+    ``gazebo`` platform dispatches to the embodiment variant (D5): no
+    ``ros2_control_node``, entity creation in the named world (empty ⇒
+    standalone minimal world), spawners against the in-simulator controller
+    manager and the facade on sim time; hardware and sdk are unchanged.
     """
-    if transport == "gazebo":
+    if simulated and sim_platform == "gazebo":
         return gazebo_embodiment_actions(
             profile,
             profile_path,
@@ -611,9 +651,9 @@ def runtime_stack_actions(
                 {
                     "profile": str(profile_path),
                     "peripherals": peripherals_file,
-                    "simulated": simulated,
+                    "use_sim": simulated,
                     "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
-                    **({"transport": transport} if transport else {}),
+                    **({"sim_platform": sim_platform} if sim_platform else {}),
                     **(
                         {"interface_description_json": json.dumps(interface_description)}
                         if interface_description is not None
@@ -627,28 +667,27 @@ def runtime_stack_actions(
 
 
 def peripheral_stack_actions(
-    profile: dict, peripherals_file: str, simulated: bool, *, description: dict | None = None, transport: str = ""
+    profile: dict, peripherals_file: str, simulated: bool, *, description: dict | None = None, sim_platform: str = ""
 ) -> list:
     """Sensor peripheral composition for a runtime launch (D12).
 
     Physical drivers + static TF on real hardware; synthetic perception
-    publishers on the same topics in SDK simulated transport. Under a physics
-    transport the camera streams come from the simulator's sensors and
+    publishers on the same topics on the SDK simulation platform. Under a
+    physics platform the camera streams come from the simulator's sensors and
     bridges (embodiment, D6), so only the host audio devices remain here.
     Audio devices are host devices, so their ALSA owners run in EVERY
-    transport (the legacy robot_config audio_io entry also launched them
+    execution (the legacy robot_config audio_io entry also launched them
     under simulation).
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
-    effective_transport = transport or ("sdk" if simulated else "hardware")
-    if effective_transport == "gazebo":
+    if simulated and sim_platform == "gazebo":
         return audio_nodes(peripherals)
     if simulated:
         effective = {**profile, "fast_lio": {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}}
         return [
             *synthetic_perception_nodes(
-                peripherals, description or build_description(effective, peripherals, transport="sdk")
+                peripherals, description or build_description(effective, peripherals, use_sim=True, sim_platform="sdk")
             ),
             *audio_nodes(peripherals),
         ]
@@ -656,13 +695,13 @@ def peripheral_stack_actions(
 
 
 def motion_launch_arguments(
-    profile: dict[str, Any], profile_path: Path, transport: str, display: bool
+    profile: dict[str, Any], profile_path: Path, simulated: bool, sim_platform: str, display: bool
 ) -> dict[str, str]:
     """Launch arguments for a MoveIt-backed motion package (so101_motion/motion.launch.py).
 
     Every motion node (move_group, motion server, IK workers and the optional
-    RViz) runs on the transport's clock: simulation time on a physics
-    transport, wall time otherwise (D7).
+    RViz) runs on the platform's clock: simulation time on a physics platform,
+    wall time otherwise (D7).
     """
     motion = profile.get("motion") or {}
     missing = [k for k in ("arm_group_name", "base_link", "ee_link", "shoulder_link") if not motion.get(k)]
@@ -675,7 +714,7 @@ def motion_launch_arguments(
     ]
     arm_joints = [str(j) for j in profile.get("arm_joints", profile["joints"])]
     return {
-        "use_sim_time": "true" if transport == "gazebo" else "false",
+        "use_sim_time": "true" if simulated and sim_platform == "gazebo" else "false",
         "display": xacro_value(display),
         "joint_names": " ".join(arm_joints),
         "joint_state_topic": str(motion.get("joint_state_topic", profile["joint_state_topic"])),
@@ -686,9 +725,7 @@ def motion_launch_arguments(
         "motion_feedback_timeout_s": str(motion.get("motion_feedback_timeout_s", 0.3)),
         "motion_feedback_tolerance_rad": str(motion.get("motion_feedback_tolerance_rad", 0.12)),
         "motion_require_tf_sync": xacro_value(bool(motion.get("motion_require_tf_sync", True))),
-        "motion_hardware_feedback_topic": ""
-        if transport != "hardware"
-        else str(motion.get("motion_hardware_feedback_topic", "")),
+        "motion_hardware_feedback_topic": "" if simulated else str(motion.get("motion_hardware_feedback_topic", "")),
         "trajectory_modes": " ".join(trajectory_modes) or "trajectory",
         "ik_worker_count": str(int(motion.get("ik_worker_count", 0))),
     }

@@ -1,8 +1,8 @@
 """so101_robot runtime launch tests (openspec ``so101-gazebo-runtime-transport``).
 
 Renders the shipped ``runtime.launch.py`` against the real
-``so101_single_arm`` profile on the Gazebo transport, pinning the launch
-argument mapping (transport, world name, full spawn pose, sim-time motion
+``so101_single_arm`` profile on the Gazebo platform, pinning the launch
+argument mapping (simulation selection, world name, full spawn pose, sim-time motion
 arguments) and the runtime-owned Gazebo camera poses (task 2.4).
 
 This is also the package's first test directory: ``colcon test`` previously
@@ -37,7 +37,8 @@ def _render(extra):
     configurations = {
         "profile": str(_PROFILE),
         "simulated": "",
-        "transport": "",
+        "use_sim": "",
+        "sim_platform": "",
         "gazebo_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
@@ -75,18 +76,20 @@ def _params(node):
     return params
 
 
-def test_shipped_profile_declares_the_gazebo_transport():
+def test_shipped_profile_declares_the_gazebo_platform():
     from robot_runtime.profile import load_profile
 
     profile = load_profile(_PROFILE)
-    assert profile["transports"] == ["hardware", "sdk", "gazebo"]
-    assert profile["transport"] == "hardware"
+    assert profile["sim_platforms"] == ["sdk", "gazebo"]
+    assert profile["sim_platform"] == "sdk"
+    assert profile["use_sim"] is False
 
 
-def test_gazebo_transport_threads_world_spawn_pose_and_sim_time():
+def test_gazebo_platform_threads_world_spawn_pose_and_sim_time():
     actions = _render(
         {
-            "transport": "gazebo",
+            "use_sim": "true",
+            "sim_platform": "gazebo",
             "gazebo_world": "demo",
             "spawn_x": "0.5",
             "spawn_y": "-0.25",
@@ -96,7 +99,7 @@ def test_gazebo_transport_threads_world_spawn_pose_and_sim_time():
     )
     nodes = [a for a in actions if isinstance(a, Node)]
     facade = next(node for node in nodes if node._Node__node_executable == "runtime_facade")
-    assert _params(facade)["transport"] == "gazebo"
+    assert _params(facade)["sim_platform"] == "gazebo"
     assert _params(facade)["use_sim_time"] is True
 
     # the motion include runs on sim time
@@ -122,16 +125,16 @@ def test_gazebo_transport_threads_world_spawn_pose_and_sim_time():
     assert not any(node._Node__node_executable == "ros2_control_node" for node in nodes)
 
 
-def test_unknown_transport_fails_fast_before_any_action():
+def test_unknown_platform_fails_fast_before_any_action():
     import pytest
 
     from robot_runtime.launch_support import RuntimeProfileError
 
-    with pytest.raises(RuntimeProfileError, match="unknown transport 'mujoco'"):
-        _render({"transport": "mujoco"})
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'mujoco'"):
+        _render({"use_sim": "true", "sim_platform": "mujoco"})
 
 
-def test_gazebo_transport_applies_a_peripheral_toggle_exactly_once(tmp_path):
+def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
     """A deployment disable toggle survives the whole launch construction.
 
     The description is rendered from the merged peripheral set while the stack
@@ -144,7 +147,7 @@ def test_gazebo_transport_applies_a_peripheral_toggle_exactly_once(tmp_path):
     fragment = tmp_path / "peripherals.yaml"
     fragment.write_text("peripherals:\n- type: camera\n  name: front\n  disabled: true\n", encoding="utf-8")
 
-    actions = _render({"transport": "gazebo", "peripherals": str(fragment)})
+    actions = _render({"use_sim": "true", "sim_platform": "gazebo", "peripherals": str(fragment)})
 
     nodes = [action for action in actions if isinstance(action, Node)]
     facade = next(node for node in nodes if node._Node__node_executable == "runtime_facade")
@@ -156,6 +159,51 @@ def test_gazebo_transport_applies_a_peripheral_toggle_exactly_once(tmp_path):
     assert "camera/front" not in config
     assert "camera/top" in config
     assert "camera/wrist" in config
+
+
+def test_teleop_executor_follows_the_platform_clock():
+    """The runtime-owned placo servo runs on sim time only on Gazebo (PR !515 P2).
+
+    Managed mode compares the node clock against JointState stamps; a wall
+    clock under Gazebo drops every sim-stamped feedback sample.
+    """
+    gazebo = _render({"use_sim": "true", "sim_platform": "gazebo"})
+    servo = next(
+        node for node in gazebo if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
+    )
+    assert _params(servo)["use_sim_time"] is True
+
+    physical = _render({"use_sim": "false"})
+    servo = next(
+        node
+        for node in physical
+        if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
+    )
+    assert _params(servo)["use_sim_time"] is False
+
+
+def test_physical_selection_passes_no_platform_to_the_facade():
+    """Physical execution must reach the facade with no platform (PR !515 P1).
+
+    The launch used to default the platform to "sdk" on the physical path,
+    which the facade's selection resolver rejects; the regression goes through
+    the real entry: rendered facade parameters must resolve without error.
+    """
+    from robot_runtime.facade_node import resolve_facade_selection
+    from robot_runtime.profile import load_profile
+
+    actions = _render({"use_sim": "false"})
+    nodes = [action for action in actions if isinstance(action, Node)]
+    facade = next(node for node in nodes if node._Node__node_executable == "runtime_facade")
+    params = _params(facade)
+    assert params["use_sim"] is False
+    assert "sim_platform" not in params, "physical execution must carry no platform"
+
+    profile = load_profile(_PROFILE)
+    assert resolve_facade_selection(profile, bool(params["use_sim"]), str(params.get("sim_platform", ""))) == (
+        False,
+        None,
+    )
 
 
 def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):

@@ -127,11 +127,11 @@ def generate_runtime_provider_actions(
 ) -> tuple[list, Node]:
     """Return (provider launch include, wait_for_runtime readiness/reconciliation node).
 
-    Generic launch emits exactly one consistent transport selection
-    (runtime-simulation-transport D1/D3): ``transport:=gazebo`` (with the
-    resolved world name and the full spawn pose from ``simulation_startup``,
-    never the boolean alias) for the Gazebo platform, and the legacy
-    ``simulated:=true|false`` unchanged for sdk/hardware.
+    Generic launch passes its selection through unchanged
+    (runtime-simulation-platform D1/D3): ``use_sim:=`` always, plus
+    ``sim_platform:=`` when simulated — never the legacy ``simulated`` alias.
+    The Gazebo platform additionally hands the provider the resolved world
+    name and the full spawn pose from ``simulation_startup``.
     """
     provider = runtime_provider(robot_config)
     if not provider:
@@ -162,6 +162,9 @@ def generate_runtime_provider_actions(
             else {}
         ),
     }
+    include_arguments["use_sim"] = "true" if use_sim else "false"
+    if use_sim:
+        include_arguments["sim_platform"] = str(sim_platform).lower()
     if use_sim and str(sim_platform).lower() == "gazebo":
         # D3: the world owner hands the provider the resolved world name and
         # spawn pose (x, y, z, yaw) — nothing is recomputed here. An empty
@@ -171,7 +174,6 @@ def generate_runtime_provider_actions(
         spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
         include_arguments.update(
             {
-                "transport": "gazebo",
                 "gazebo_world": world_name,
                 "spawn_x": str(spawn_pose[0]),
                 "spawn_y": str(spawn_pose[1]),
@@ -181,14 +183,15 @@ def generate_runtime_provider_actions(
         )
         logger.info(
             f"runtime.provider={provider}: including {launch_path} "
-            f"(profile={profile}, transport=gazebo, world={world_name!r}, spawn={spawn_pose}, "
+            f"(profile={profile}, use_sim=true, sim_platform=gazebo, world={world_name!r}, spawn={spawn_pose}, "
             f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
         )
     else:
-        include_arguments["simulated"] = "true" if use_sim else "false"
         logger.info(
             f"runtime.provider={provider}: including {launch_path} "
-            f"(profile={profile}, simulated={use_sim}, initial_mode={initial_mode or 'profile default'}, "
+            f"(profile={profile}, use_sim={use_sim}"
+            + (f", sim_platform={str(sim_platform).lower()}" if use_sim else "")
+            + f", initial_mode={initial_mode or 'profile default'}, "
             f"peripherals={peripherals_file or 'profile defaults'})"
         )
 

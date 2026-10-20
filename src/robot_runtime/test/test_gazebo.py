@@ -1,7 +1,7 @@
-"""Gazebo transport tests: shared camera builders, embodiment actions, sim identity.
+"""Gazebo platform tests: shared camera builders, embodiment actions, sim identity.
 
 Covers openspec ``so101-gazebo-runtime-transport`` tasks 2.1, 2.3b, 2.3c and
-2.3d: the launch-structure contract per transport, the advertised camera
+2.3d: the launch-structure contract per platform, the advertised camera
 contract (frames, streams, spawn compensation), the effective peripheral
 inventory (disabled cameras absent everywhere) and the simulated joint
 current.
@@ -178,8 +178,8 @@ def _profile(tmp_path: Path, peripherals=None, with_joint_current=True):
         "capabilities": {"joint.state": {}, "joint.trajectory": {}, "runtime.stop": {}},
         "joints": ["1"],
         "simulated": False,
-        "transports": ["hardware", "sdk", "gazebo"],
-        "transport": "hardware",
+        "sim_platforms": ["sdk", "gazebo"],
+        "sim_platform": "sdk",
         "controller_manager": "controller_manager",
         "joint_state_topic": "/joint_states",
         "command_channels": [
@@ -294,14 +294,14 @@ def _deferred_actions(actions):
 
 
 # ---------------------------------------------------------------------------
-# 2.1: launch structure per transport
+# 2.1: launch structure per platform
 # ---------------------------------------------------------------------------
 
 
-def test_gazebo_transport_action_set_has_no_ros2_control_node(tmp_path):
+def test_gazebo_platform_action_set_has_no_ros2_control_node(tmp_path):
     profile = _profile(tmp_path)
     actions = runtime_stack_actions(
-        profile, tmp_path / "robot.xacro", simulated=True, transport="gazebo", gazebo_world=""
+        profile, tmp_path / "robot.xacro", simulated=True, sim_platform="gazebo", gazebo_world=""
     )
     nodes = [a for a in actions if isinstance(a, Node)]
     executables = {node._Node__node_executable for node in nodes}
@@ -328,7 +328,7 @@ def test_gazebo_nodes_run_on_sim_time(tmp_path):
     assert _params(rsp)["use_sim_time"] is True
     facade = _node(nodes, "runtime_facade")
     assert _params(facade)["use_sim_time"] is True
-    assert _params(facade)["transport"] == "gazebo"
+    assert _params(facade)["sim_platform"] == "gazebo"
     # spawners sit behind the create-exit handler; they must carry sim time
     spawners = [
         node
@@ -372,35 +372,35 @@ def test_gazebo_description_has_no_package_uris_and_flags(tmp_path):
 
 def test_hardware_and_sdk_action_lists_are_unchanged(tmp_path):
     profile = _profile(tmp_path)
-    for transport, simulated in (("hardware", False), ("sdk", True)):
-        legacy = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, transport="")
-        selected = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, transport=transport)
+    for sim_platform, simulated in (("", False), ("sdk", True)):
+        legacy = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, sim_platform="")
+        selected = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, sim_platform=sim_platform)
         assert [type(a).__name__ for a in legacy] == [type(a).__name__ for a in selected]
         legacy_nodes = [a for a in legacy if isinstance(a, Node)]
         selected_nodes = [a for a in selected if isinstance(a, Node)]
         assert [n._Node__node_name for n in legacy_nodes] == [n._Node__node_name for n in selected_nodes]
         for legacy_node, selected_node in zip(legacy_nodes, selected_nodes, strict=True):
-            # the facade additionally receives the selected transport (D1/D7);
+            # the facade additionally receives the selected platform (D1/D7);
             # everything else is identical
-            legacy_params = {k: v for k, v in _params(legacy_node).items() if k != "transport"}
-            selected_params = {k: v for k, v in _params(selected_node).items() if k != "transport"}
+            legacy_params = {k: v for k, v in _params(legacy_node).items() if k != "sim_platform"}
+            selected_params = {k: v for k, v in _params(selected_node).items() if k != "sim_platform"}
             assert legacy_params == selected_params
         facade = _node(selected_nodes, "runtime_facade")
-        assert _params(facade)["transport"] == transport
+        assert _params(facade).get("sim_platform", "") == sim_platform
         executables = {node._Node__node_executable for node in legacy_nodes}
         assert "ros2_control_node" in executables
-        # wall time: no provider node carries sim time off the gazebo transport
+        # wall time: no provider node carries sim time off the gazebo platform
         assert all("use_sim_time" not in _params(node) for node in legacy_nodes)
 
 
-def test_motion_launch_arguments_follow_the_transport_clock(tmp_path):
+def test_motion_launch_arguments_follow_the_platform_clock(tmp_path):
     profile = _profile(tmp_path)
-    gazebo = motion_launch_arguments(profile, tmp_path / "robot.xacro", "gazebo", False)
+    gazebo = motion_launch_arguments(profile, tmp_path / "robot.xacro", True, "gazebo", False)
     assert gazebo["use_sim_time"] == "true"
     assert gazebo["motion_hardware_feedback_topic"] == ""
-    sdk = motion_launch_arguments(profile, tmp_path / "robot.xacro", "sdk", False)
+    sdk = motion_launch_arguments(profile, tmp_path / "robot.xacro", True, "sdk", False)
     assert sdk["use_sim_time"] == "false"
-    hardware = motion_launch_arguments(profile, tmp_path / "robot.xacro", "hardware", False)
+    hardware = motion_launch_arguments(profile, tmp_path / "robot.xacro", False, "", False)
     assert hardware["use_sim_time"] == "false"
     assert hardware["motion_hardware_feedback_topic"] == "/so101_follower/joint_currents" or isinstance(
         hardware["motion_hardware_feedback_topic"], str
@@ -431,7 +431,8 @@ def test_descriptor_interfaces_match_generated_sensors_and_bridge_entries(tmp_pa
             "joints": ["1"],
             "peripherals": peripherals,
         },
-        transport="gazebo",
+        use_sim=True,
+        sim_platform="gazebo",
     )
     urdf = camera_sensor_urdf(peripherals, platform="gazebo", frame_contract=True)
     for periph in peripherals:
@@ -459,6 +460,37 @@ def test_descriptor_interfaces_match_generated_sensors_and_bridge_entries(tmp_pa
     assert 'sensor type="camera" name="top_camera"' in urdf
 
 
+def test_gazebo_depth_streams_advertise_the_encoding_gz_publishes():
+    """The Gazebo depth contract is what ros_gz_bridge actually publishes (PR !515 P2).
+
+    gz ``rgbd_camera`` depth is float32 and the bridge maps ``R_FLOAT32`` to
+    ``32FC1``; the bridge config carries no conversion, so advertising the
+    physical device's encoding (RealSense Z16 -> ``16UC1``) would make every
+    observed depth message an encoding mismatch in the interface monitor.
+    sdk keeps the device encoding: the synthetic publishers produce exactly
+    what the descriptor advertises.
+    """
+    robot = {
+        "runtime": {"name": "test_robot", "version": "0.1.0"},
+        "capabilities": {},
+        "joints": ["1"],
+        "peripherals": [FRONT],
+    }
+    gazebo = build_description(robot, use_sim=True, sim_platform="gazebo")["interfaces"]
+    assert gazebo["camera.front.depth"]["configured_profile"]["encoding"] == "32FC1"
+    assert gazebo["camera.front.aligned_depth"]["configured_profile"]["encoding"] == "32FC1"
+    # both depth endpoints are bridged from the same gz depth_image stream,
+    # so both observe exactly the encoding asserted above
+    bridged = {
+        entry["ros_topic_name"]: entry["gz_topic_name"] for entry in camera_bridge_entries(FRONT, full_streams=True)
+    }
+    assert bridged["/camera/front/depth/image_rect_raw"] == "/front_camera/depth_image"
+    assert bridged["/camera/front/aligned_depth_to_color/image_raw"] == "/front_camera/depth_image"
+    sdk = build_description(robot, use_sim=True, sim_platform="sdk")["interfaces"]
+    assert sdk["camera.front.depth"]["configured_profile"]["encoding"] == "16UC1"
+    assert sdk["camera.front.aligned_depth"]["configured_profile"]["encoding"] == "16UC1"
+
+
 def test_unproducible_streams_are_not_advertised_on_gazebo(tmp_path):
     pointcloud_camera = {
         **FRONT,
@@ -472,7 +504,8 @@ def test_unproducible_streams_are_not_advertised_on_gazebo(tmp_path):
             "joints": ["1"],
             "peripherals": [pointcloud_camera],
         },
-        transport="gazebo",
+        use_sim=True,
+        sim_platform="gazebo",
     )
     assert not any(key.startswith("camera.front.points") for key in description["interfaces"])
     sdk_description = build_description(
@@ -482,7 +515,8 @@ def test_unproducible_streams_are_not_advertised_on_gazebo(tmp_path):
             "joints": ["1"],
             "peripherals": [pointcloud_camera],
         },
-        transport="sdk",
+        use_sim=True,
+        sim_platform="sdk",
     )
     assert any(key.startswith("camera.front.points") for key in sdk_description["interfaces"])
 
@@ -572,12 +606,13 @@ def test_disabled_camera_is_absent_everywhere(tmp_path):
             "peripherals": [TOP, WRIST, FRONT],
         },
         peripherals=peripherals,
-        transport="gazebo",
+        use_sim=True,
+        sim_platform="gazebo",
     )
     assert not any(key.startswith("camera.front.") for key in description["interfaces"])
     # sdk synthetic publishers
     profile = _profile(tmp_path, peripherals=peripherals)
-    sdk_actions = peripheral_stack_actions(profile, "", simulated=True, transport="sdk")
+    sdk_actions = peripheral_stack_actions(profile, "", simulated=True, sim_platform="sdk")
     synthetic = _node([a for a in sdk_actions if isinstance(a, Node)], "synthetic_perception")
     encoded = _params(synthetic)["description_json"]
     assert "camera.front.color" not in encoded
@@ -591,7 +626,7 @@ def test_disabled_camera_is_absent_everywhere(tmp_path):
     config = Path(_params(bridge)["config_file"]).read_text(encoding="utf-8")
     assert "camera/front" not in config
     # physical drivers
-    hardware_actions = peripheral_stack_actions(profile, "", simulated=False, transport="hardware")
+    hardware_actions = peripheral_stack_actions(profile, "", simulated=False, sim_platform="")
     assert not any(isinstance(a, Node) and a._Node__node_name == "front_camera" for a in hardware_actions)
 
 
@@ -641,8 +676,8 @@ def test_joint_current_node_only_on_gazebo(tmp_path):
     assert params["joint_names"] == ["1"]
     assert params["scale"] == [2.0]
     # the hardware/sdk stack never starts it
-    for transport, simulated in (("hardware", False), ("sdk", True)):
-        actions = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, transport=transport)
+    for sim_platform, simulated in (("", False), ("sdk", True)):
+        actions = runtime_stack_actions(profile, tmp_path / "robot.xacro", simulated, sim_platform=sim_platform)
         assert not any(isinstance(a, Node) and a._Node__node_executable == "joint_current_publisher" for a in actions)
     # a profile without the joint.current interface gets no publisher
     bare = _profile(tmp_path, with_joint_current=False)

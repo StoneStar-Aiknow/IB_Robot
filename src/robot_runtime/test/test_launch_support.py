@@ -1,76 +1,101 @@
-"""Launch-support unit tests: transport selection (runtime-simulation-transport D1)."""
+"""Launch-support unit tests: simulation selection (runtime-simulation-platform D1)."""
+
+import logging
 
 import pytest
 
-from robot_runtime.launch_support import RuntimeProfileError, resolve_transport
+from robot_runtime.launch_support import RuntimeProfileError, resolve_sim_selection
 
 
 def _profile(**extra):
     profile = {
         "runtime": {"name": "test_robot", "version": "0.1.0"},
-        "simulated": False,
-        "transports": ["hardware", "sdk"],
-        "transport": "hardware",
+        "use_sim": False,
+        "sim_platforms": ["sdk"],
+        "sim_platform": "sdk",
     }
     profile.update(extra)
     return profile
 
 
 def test_no_selection_uses_profile_default():
-    assert resolve_transport(_profile(), "", "") == "hardware"
-    assert resolve_transport(_profile(simulated=True, transport="sdk"), "", "") == "sdk"
+    assert resolve_sim_selection(_profile(), "", "", "") == (False, None)
+    assert resolve_sim_selection(_profile(use_sim=True), "", "", "") == (True, "sdk")
 
 
-def test_simulated_alias_maps_to_sdk_and_hardware():
-    profile = _profile()
-    assert resolve_transport(profile, "", "true") == "sdk"
-    assert resolve_transport(profile, "", "false") == "hardware"
-    assert resolve_transport(profile, "", "1") == "sdk"
-    assert resolve_transport(profile, "", "no") == "hardware"
+def test_platform_alone_implies_simulation():
+    assert resolve_sim_selection(_profile(sim_platforms=["sdk", "gazebo"]), "", "gazebo", "") == (True, "gazebo")
+    # ... even when the profile itself defaults to physical execution
+    assert resolve_sim_selection(_profile(), "", "sdk", "") == (True, "sdk")
 
 
-def test_explicit_transport_overrides_profile_default():
-    assert resolve_transport(_profile(), "sdk", "") == "sdk"
-    assert resolve_transport(_profile(simulated=True, transport="sdk"), "hardware", "") == "hardware"
+def test_use_sim_alone_uses_profile_default_platform():
+    assert resolve_sim_selection(_profile(), "true", "", "") == (True, "sdk")
+    assert resolve_sim_selection(_profile(sim_platforms=["sdk", "gazebo"], sim_platform="gazebo"), "true", "", "") == (
+        True,
+        "gazebo",
+    )
 
 
-def test_agreeing_transport_and_simulated_selection_is_accepted():
-    assert resolve_transport(_profile(), "sdk", "true") == "sdk"
-    assert resolve_transport(_profile(), "hardware", "false") == "hardware"
+def test_simulated_alias_maps_to_use_sim_and_warns(caplog):
+    with caplog.at_level(logging.WARNING, logger="robot_runtime.launch_support"):
+        assert resolve_sim_selection(_profile(), "", "", "true") == (True, "sdk")
+        assert resolve_sim_selection(_profile(), "", "", "false") == (False, None)
+        assert resolve_sim_selection(_profile(use_sim=True), "", "", "1") == (True, "sdk")
+        assert resolve_sim_selection(_profile(), "", "", "no") == (False, None)
+    assert any(
+        "simulated:=true is deprecated" in record.message and "use_sim" in record.message for record in caplog.records
+    )
+    assert any(
+        "simulated:=false is deprecated" in record.message and "use_sim" in record.message for record in caplog.records
+    )
 
 
-def test_conflicting_transport_and_simulated_selection_fails_naming_both():
-    with pytest.raises(RuntimeProfileError, match=r"transport:='gazebo'.*simulated:='false'"):
-        resolve_transport(_profile(transports=["hardware", "sdk", "gazebo"]), "gazebo", "false")
+def test_agreeing_use_sim_and_simulated_selection_is_accepted():
+    assert resolve_sim_selection(_profile(), "true", "", "true") == (True, "sdk")
+    assert resolve_sim_selection(_profile(), "false", "", "false") == (False, None)
+
+
+def test_conflicting_use_sim_and_simulated_selection_fails_naming_both():
+    with pytest.raises(RuntimeProfileError, match=r"use_sim:=True.*simulated:=false"):
+        resolve_sim_selection(_profile(), "true", "", "false")
     with pytest.raises(RuntimeProfileError, match="pass at most one"):
-        resolve_transport(_profile(), "hardware", "true")
+        resolve_sim_selection(_profile(), "false", "", "true")
 
 
-def test_unknown_transport_value_fails():
-    with pytest.raises(RuntimeProfileError, match="unknown transport 'teleport'"):
-        resolve_transport(_profile(), "teleport", "")
+def test_physical_execution_with_platform_fails_naming_both():
+    with pytest.raises(RuntimeProfileError, match=r"use_sim:=false.*sim_platform:='gazebo'"):
+        resolve_sim_selection(_profile(sim_platforms=["sdk", "gazebo"]), "false", "gazebo", "")
 
 
-def test_unparseable_simulated_value_fails():
+def test_unknown_platform_value_fails():
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'teleport'"):
+        resolve_sim_selection(_profile(), "true", "teleport", "")
+
+
+def test_unparseable_boolean_values_fail():
+    with pytest.raises(RuntimeProfileError, match="cannot parse use_sim:='banana'"):
+        resolve_sim_selection(_profile(), "banana", "", "")
     with pytest.raises(RuntimeProfileError, match="cannot parse simulated:='banana'"):
-        resolve_transport(_profile(), "", "banana")
+        resolve_sim_selection(_profile(), "", "", "banana")
 
 
-def test_undeclared_transport_fails_naming_transport_set_and_profile():
+def test_undeclared_platform_fails_naming_platform_set_and_profile():
     profile = _profile()
     with pytest.raises(
         RuntimeProfileError,
-        match=r"transport 'gazebo' is not supported.*supported: \['hardware', 'sdk'\].*profile: /tmp/p.yaml",
+        match=r"sim_platform 'gazebo' is not supported.*supported: \['sdk'\].*profile: /tmp/p.yaml",
     ):
-        resolve_transport(profile, "gazebo", "", source="/tmp/p.yaml")
+        resolve_sim_selection(profile, "true", "gazebo", "", source="/tmp/p.yaml")
 
 
-def test_declared_gazebo_transport_resolves():
-    profile = _profile(transports=["hardware", "sdk", "gazebo"])
-    assert resolve_transport(profile, "gazebo", "") == "gazebo"
+def test_declared_gazebo_platform_resolves():
+    profile = _profile(sim_platforms=["sdk", "gazebo"])
+    assert resolve_sim_selection(profile, "true", "gazebo", "") == (True, "gazebo")
+    assert resolve_sim_selection(profile, "", "gazebo", "") == (True, "gazebo")
 
 
-def test_profile_without_transport_keys_keeps_legacy_behaviour():
+def test_profile_without_selection_keys_keeps_legacy_behaviour():
     profile = {"runtime": {"name": "test_robot", "version": "0.1.0"}, "simulated": True}
-    assert resolve_transport(profile, "", "") == "sdk"
-    assert resolve_transport(profile, "", "false") == "hardware"
+    assert resolve_sim_selection(profile, "", "", "") == (True, "sdk")
+    assert resolve_sim_selection(profile, "", "", "false") == (False, None)

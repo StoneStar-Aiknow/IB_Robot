@@ -30,7 +30,7 @@ def deferred_config():
 
 
 def descriptor():
-    return build_description(load_profile(PROFILE), simulated=True)
+    return build_description(load_profile(PROFILE), use_sim=True)
 
 
 def test_demo_yaml_contains_only_deployment_and_logical_interface_binding():

@@ -2,7 +2,7 @@
 
 The vendor runtime bridges its own audio; it declares no audio peripherals, so
 rendering ``runtime.launch.py`` must never produce ``audio_capture`` /
-``audio_play`` nodes, in physical or simulated transport, and the profile's
+``audio_play`` nodes, in physical or simulated execution, and the profile's
 ``audio.capture`` / ``audio.play`` interfaces must carry the format metadata
 consumers bind to (mirroring the capability entries).
 """
@@ -29,7 +29,14 @@ def _runtime_launch_module():
 def _render(simulated: str):
     context = launch.LaunchContext()
     context.launch_configurations.update(
-        {"profile": str(_PROFILE), "simulated": simulated, "transport": "", "instance_id": "", "initial_mode": ""}
+        {
+            "profile": str(_PROFILE),
+            "simulated": simulated,
+            "use_sim": "",
+            "sim_platform": "",
+            "instance_id": "",
+            "initial_mode": "",
+        }
     )
     return _runtime_launch_module()._launch_setup(context)
 
@@ -48,7 +55,7 @@ def _nodes(actions):
     return [action for action in _flatten(actions) if type(action).__name__ == "Node"]
 
 
-def test_physical_transport_renders_the_bridge_only():
+def test_physical_execution_renders_the_bridge_only():
     actions = _render("false")
     assert [type(action).__name__ for action in actions] == ["Node"]
     nodes = _nodes(actions)
@@ -57,7 +64,7 @@ def test_physical_transport_renders_the_bridge_only():
     ]
 
 
-def test_simulated_transport_declares_no_alsa_audio_nodes():
+def test_simulated_execution_declares_no_alsa_audio_nodes():
     actions = _render("true")
     assert [type(action).__name__ for action in actions] == ["Node", "TimerAction", "TimerAction"]
     packages = {node.node_package for node in _nodes(actions)}
@@ -68,7 +75,7 @@ def test_profile_audio_interfaces_carry_format_metadata():
     from robot_runtime.interface_description import build_description
     from robot_runtime.profile import load_profile
 
-    description = build_description(load_profile(_PROFILE), simulated=True)
+    description = build_description(load_profile(_PROFILE), use_sim=True)
     capture = description["interfaces"]["audio.capture"]
     assert capture["endpoint"] == "/audio/capture_stamped"
     assert capture["sample_rate_hz"] == 16000.0
