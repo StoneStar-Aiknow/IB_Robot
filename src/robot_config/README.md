@@ -795,11 +795,14 @@ V3 额外包含 `supported_control_modes`。切换 `context_schema_version` 会�
 robot:
   base_config: aimdk_x2.yaml          # 运行时作者的基础配置保持不变
   name: aimdk_x2_skills
+  type: x2_ultra_omnihand             # 选用 OmniHand profile，它声明了回放用的手势录制轨迹
+  runtime:
+    profile: x2_ultra_omnihand
   default_control_mode: named_motion
   skill_required_control_mode: named_motion
   control_modes:
     named_motion:
-      runtime_mode: idle              # 运行时只在 idle（稳定站立）准入命名动作
+      runtime_mode: stream            # 运行时在 stream（UPPERBODY_REMOTE_SPLIT）回放录制的手势轨迹
       inference: {enabled: false}
       executor: {enabled: false}      # 必须显式关闭：缺省视为启用，会启动 action_dispatcher
   embodied:
@@ -823,7 +826,11 @@ robot:
   配置交给 embodied 节点。要求 `runtime.provider`，且 `capabilities.requires` 含 `motion.named` 或
   `motion.posture`。因为是实时绑定，离线 `load_robot_config_dict()` 需要 `defer_interface_binding=True`；
   robot-skill CLI 请用 launch 日志里 `consumer snapshot:` 给出的绑定后配置（`--config-path`）。
-- `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。
+- `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。它和 `aimdk_x2.yaml` 的
+  `teleop` 共用运行时 `stream`：运行时处于 `idle` 时执行器先切一次 `stream`，之后保持在 `stream`；
+  运行时不让手势抢占正在发手臂流的指令源（返回 `BUSY`）。
+- 适用硬件：`aimdk_x2_skills` 与叠加其上的 `aimdk_x2_voice` 只适用于装 OmniHand 的 X2（一只或两只）。
+  装夹爪的 X2 用 `aimdk_x2.yaml`；选错时运行时启动即报手型不匹配（`hand type mismatch`）并进入 FAULTED。
 
 ## X2 照镜子（motion_imitation_stream / mirror_session）
 

@@ -460,6 +460,32 @@ vendor:
     required_action: STAND_DEFAULT
     preset_timeout_s: 30.0
     poll_s: 0.2
+    # In the upper-body stream mode (UPPERBODY_REMOTE_SPLIT) the platform plays
+    # no preset, so named motions are replayed there from arm trajectories
+    # recorded off the presets (aimdk_record_named_motion), eased in from the
+    # measured pose. Only the arms move; head and hands hold. A name without a
+    # recording is refused in these modes with MODE_NOT_ALLOWED. Declared here
+    # and not in x2_ultra: the hands must hold in every upper-body command,
+    # which is verified for dexterous hands only.
+    trajectory_modes:
+    - stream
+    trajectory_blend_speed_radps: 0.5
+    trajectory_blend_min_s: 0.5
+    # A recording faster than this anywhere is refused at startup. The
+    # platform's own presets peak at 4.7 rad/s (raise_hand, 2026-10-20).
+    trajectory_max_speed_radps: 6.0
+    # A replay fails unless the measured arm moved at least this share of the
+    # commanded motion on its most-moving joint: the platform drops commands it
+    # cannot use without saying so. Replays track at ~0.9 (2026-10-20).
+    trajectory_follow_min_ratio: 0.3
+    # name -> JSON file relative to this profile, recorded off the presets on
+    # firmware release-lx2501_3_t2d5-soc1-v1.1.1 (2026-10-20).
+    trajectories:
+      wave: trajectories/wave.json
+      handshake: trajectories/handshake.json
+      raise_hand: trajectories/raise_hand.json
+      blow_kiss: trajectories/blow_kiss.json
+      clap: trajectories/clap.json
   expressions:
     blink: 1
     calm: 10

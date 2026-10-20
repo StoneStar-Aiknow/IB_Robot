@@ -13,6 +13,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/profiles", glob("profiles/*.yaml")),
+        ("share/" + package_name + "/profiles/trajectories", glob("profiles/trajectories/*.json")),
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},
@@ -25,6 +26,7 @@ setup(
         "console_scripts": [
             "aimdk_runtime = aimdk_robot.runtime_node:main",
             "aimdk_vendor_mock = aimdk_robot.vendor_mock_node:main",
+            "aimdk_record_named_motion = aimdk_robot.record_named_motion:main",
         ],
     },
 )

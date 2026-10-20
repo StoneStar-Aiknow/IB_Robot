@@ -589,9 +589,11 @@ catalog implementation 用 `binding: {motion: <名字>}` 绑定一个运行时�
 执行顺序：
 
 1. Gateway 常规准入：`motion_authorized`、root lease、运行时状态新鲜度、`ACTIVE`、stop 未锁存、
-   控制模式。该部署的技能控制模式是 `named_motion`，映射到运行时 `idle`；执行器从不请求切到 `idle`
-   （那会清除操作员的 stop latch）。运行时处在 `stream` 等其他模式时返回 `CONTROL_MODE_MISMATCH`，
-   不抢占其他指令源。
+   控制模式。该部署的技能控制模式是 `named_motion`，映射到运行时 `stream`（与 `teleop` 共用），运行时在
+   该模式下回放录制的手势轨迹。运行时处在 `idle` 时执行器先切一次 `stream`，之后保持在 `stream`；
+   执行器从不请求切到 `idle`（那会清除操作员的 stop latch）。运行时处在 `policy_stream`、`locomotion`
+   等其他模式时返回 `CONTROL_MODE_MISMATCH`，不抢占其他指令源；`stream` 下若遥操作或抓取正在发手臂流，
+   运行时拒绝手势（`NAMED_MOTION_BUSY`），同样不抢占。
 2. `capability.required_capabilities`（`motion.named` 或 `motion.posture`）必须出现在 `RuntimeStatus`。
 3. **名字预检**：绑定名必须在最新 `RuntimeStatus.capabilities_json` 中对应能力的
    `names` / `postures` 列表里，否则 `NAMED_MOTION_UNKNOWN` 且不发送 goal。运行时对未知名字在

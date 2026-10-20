@@ -246,6 +246,11 @@ class AimdkRuntimeNode(Node):
         self._arm_stamp = 0.0
         self._head_stamp = 0.0
         self._hand_stamp = 0.0
+        #: Token of the named motion replaying a trajectory on the arm channel;
+        #: while set, the public arm stream is refused instead of interleaved.
+        self._arm_owner: int | None = None
+        #: When the public arm stream last set a target; a fresh one is not preempted.
+        self._public_arm_stamp: float | None = None
         self._twist: tuple[float, float, float] | None = None
         self._twist_stamp = 0.0
         self._sequence = 0
@@ -1321,8 +1326,12 @@ class AimdkRuntimeNode(Node):
             if name == "arm_stream":
                 payload = projection.arm_payload(message.data, channel_joints=joints)
                 with self._lock:
+                    if self._arm_owner is not None:
+                        self._modes.note_rejected(f"{name}:NAMED_MOTION_ACTIVE")
+                        return
                     self._arm_cmd = payload
                     self._arm_stamp = time.monotonic()
+                    self._public_arm_stamp = self._arm_stamp
             elif name == "head_stream":
                 payload = projection.head_payload(message.data, channel_joints=joints, limits=self._head_limits)
                 with self._lock:
@@ -2011,6 +2020,47 @@ class AimdkRuntimeNode(Node):
 
     def current_mode(self) -> str:
         return self._modes.mode
+
+    def measured_arm_positions(self) -> list[float] | None:
+        """Fresh measured arm positions in vendor order, or None."""
+        with self._lock:
+            return self._hold_target_locked(projection.VENDOR_ARM_ORDER)
+
+    def claim_arm(self, owner: int) -> bool:
+        """Give the arm channel to a named motion; the public arm stream is refused meanwhile.
+
+        False while the public arm stream (teleop, grasping) is live: taking the
+        arm from it mid-stream would leave its next absolute target to jump the
+        arm back once the motion released it. A motion replacing another one
+        takes the channel over.
+        """
+        with self._lock:
+            if (
+                self._arm_owner is None
+                and self._public_arm_stamp is not None
+                and time.monotonic() - self._public_arm_stamp <= self._stream_staleness_s
+            ):
+                return False
+            self._arm_owner = owner
+            return True
+
+    def release_arm(self, owner: int) -> None:
+        with self._lock:
+            if self._arm_owner == owner:
+                self._arm_owner = None
+
+    def command_arm(self, positions: list[float], *, owner: int, epoch: int) -> bool:
+        """Set the arm target for the fixed-rate publisher, if ``owner`` still may.
+
+        False once the owner lost the channel, a stop engaged since ``epoch``,
+        or output is no longer admitted: the caller must stop, not retry.
+        """
+        with self._lock:
+            if self._arm_owner != owner or self._state.stop_epoch != epoch or not self.output_admitted():
+                return False
+            self._arm_cmd = list(positions)
+            self._arm_stamp = time.monotonic()
+            return True
 
 
 def main(argv=None) -> int:

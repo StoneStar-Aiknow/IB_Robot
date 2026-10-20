@@ -1623,6 +1623,208 @@ def test_a_claw_contributes_no_tactile_frames():
     assert frames["right_palm"] == [5] * 36
 
 
+# --- named motions replayed in the upper-body stream mode --------------------
+
+# Index of right_shoulder_pitch_joint in UpperBodyCommandArray.arm_pos.
+_RIGHT_PITCH = projection.VENDOR_ARM_ORDER.index("right_shoulder_pitch_joint")
+
+
+def _replay_harness(tmp_path: Path, *, duration_s: float, **mock_params) -> Harness:
+    """The OmniHand profile on an X2 with only a left hand, ``wave`` recorded as a right shoulder
+    pitch out-and-back to -0.3 rad."""
+    import json
+
+    import yaml
+
+    rows = [[0.0] * len(projection.VENDOR_ARM_ORDER) for _ in range(3)]
+    rows[1][_RIGHT_PITCH] = -0.3
+    (tmp_path / "wave.json").write_text(
+        json.dumps(
+            {
+                "target": "right",
+                "joints": list(projection.VENDOR_ARM_ORDER),
+                "time_from_start_s": [0.0, duration_s / 2, duration_s],
+                "positions": rows,
+            }
+        )
+    )
+    profile = yaml.safe_load(OMNIHAND_PROFILE.read_text())
+    profile["vendor"]["named_motion"]["trajectories"] = {"wave": "wave.json"}
+    (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
+    harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none", **mock_params)
+    harness.wait_active()
+    assert harness.set_mode("stream").success
+    return harness
+
+
+def _start_wave(harness, target: str = ""):
+    from rclpy.action import ActionClient
+
+    client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+    handle = _send_named(harness, client, "wave", target=target)
+    assert handle.accepted
+    return handle.get_result_async()
+
+
+def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
+    """In the stream mode the gesture streams on the arm channel, no preset is asked for, and the
+    public arm stream is refused rather than interleaved while it runs."""
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        pitches: list[float] = []
+        result_future = _start_wave(harness)
+        intruder = Float64MultiArray()
+        intruder.data = [0.9] * len(projection.VENDOR_ARM_ORDER)
+        publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+        last = None
+        while not result_future.done():
+            publisher.publish(intruder)
+            message = harness.mock.last_upper_body
+            if message is not None and message is not last:
+                pitches.append(message.arm_pos[_RIGHT_PITCH])
+                last = message
+            time.sleep(0.01)
+        result = result_future.result().result
+        assert result.success, result.message
+        assert min(pitches) == pytest.approx(-0.3, abs=0.03)
+        assert 0.9 not in pitches
+        assert harness.mock.last_preset is None
+        # The installed left hand is held, the absent right one gets dummies: the platform
+        # drops an upper-body command whose hand_pos does not fit hand_sub_mode.
+        sent = harness.mock.last_upper_body
+        assert (sent.hand_sub_mode, len(sent.hand_pos), list(sent.hand_pos[10:])) == (2, 20, [0.0] * 10)
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("target", ["left", "both", "sideways"])
+def test_a_replay_refuses_a_side_it_was_not_recorded_for(tmp_path, target):
+    """``wave`` was recorded on the right arm: asked for another side it moves nothing."""
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        sent = harness.mock.upper_body_count
+        result_future = _start_wave(harness, target=target)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.INVALID_TARGET, result.message
+        time.sleep(0.3)
+        assert harness.mock.upper_body_count == sent
+    finally:
+        harness.shutdown()
+
+
+def test_a_replay_asked_for_its_recorded_side_plays(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        result_future = _start_wave(harness, target="right")
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        assert result_future.result().result.success, result_future.result().result.message
+    finally:
+        harness.shutdown()
+
+
+class _GoalHandle:
+    """The part of a server goal handle the named-motion server uses."""
+
+    def __init__(self, name: str, interrupt: bool) -> None:
+        self.request = ExecuteNamedMotion.Goal()
+        self.request.name, self.request.interrupt = name, interrupt
+
+    def publish_feedback(self, _feedback) -> None:
+        pass
+
+    def succeed(self) -> None:
+        pass
+
+    def abort(self) -> None:
+        pass
+
+
+def test_two_goals_that_both_passed_admission_do_not_interrupt_each_other(tmp_path):
+    """Two ``interrupt=false`` goals accepted before either took anything over: the second is
+    refused BUSY instead of taking the arm from the first."""
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    server = harness.runtime._named_motion
+    register = harness.runtime.ensure_input_source
+    callers: list[str] = []
+    second_arrived = threading.Event()
+
+    def ensure_input_source():
+        # Hold the first goal at the dispatch step, before _take_over, until the second one
+        # has had the chance to arrive at the same point.
+        callers.append(threading.current_thread().name)
+        if len(callers) == 1:
+            second_arrived.wait(1.0)
+        else:
+            second_arrived.set()
+        return register()
+
+    harness.runtime.ensure_input_source = ensure_input_source
+    try:
+        results: dict[str, object] = {}
+
+        def run(label: str) -> None:
+            results[label] = server._execute(_GoalHandle("wave", interrupt=False))
+
+        first = threading.Thread(target=run, args=("first",), name="first")
+        first.start()
+        harness.wait_for(lambda: callers, "the first goal to reach the dispatch step")
+        second = threading.Thread(target=run, args=("second",), name="second")
+        second.start()
+        first.join(timeout=TIMEOUT_S)
+        second.join(timeout=TIMEOUT_S)
+        assert results["first"].success, results["first"].message
+        assert results["second"].error_code == ExecuteNamedMotion.Result.BUSY, results["second"].message
+        assert callers == ["first"]
+    finally:
+        harness.shutdown()
+
+
+def test_a_replay_does_not_preempt_a_live_public_arm_stream(tmp_path):
+    """Teleop streaming on the arm channel keeps it: the gesture is refused BUSY, not interleaved."""
+    import threading
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    teleop = Float64MultiArray()
+    teleop.data = [0.2] * len(projection.VENDOR_ARM_ORDER)
+    publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+    done = threading.Event()
+
+    def stream():
+        while not done.wait(0.02):
+            publisher.publish(teleop)
+
+    streamer = threading.Thread(target=stream, daemon=True)
+    streamer.start()
+    try:
+        harness.wait_for(
+            lambda: getattr(harness.mock.last_upper_body, "arm_pos", [0.0] * 14)[_RIGHT_PITCH] == pytest.approx(0.2),
+            "the public arm stream to reach the platform",
+        )
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.BUSY, result.message
+        assert harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(0.2)
+    finally:
+        done.set()
+        streamer.join(timeout=1.0)
+        harness.shutdown()
+
+
+def test_a_replay_the_platform_does_not_follow_fails_instead_of_succeeding(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0, follow_commands=False)
+    try:
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM
+        assert "did not follow" in result.message
+    finally:
+        harness.shutdown()
+
+
 def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
     """A claw profile on an X2 with one dexterous hand: speech and presets stay usable."""
     harness = Harness(hand_type="dexterous", right_hand_type="none")
@@ -1632,5 +1834,23 @@ def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
         assert not response.success
         assert "hand type mismatch" in response.message
         assert harness.status().lifecycle == "ACTIVE"
+    finally:
+        harness.shutdown()
+
+
+def test_stop_ends_a_replay_and_no_further_arm_target_is_sent(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=3.0)
+    try:
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: harness.mock.upper_body_count > 10, "the replay to be streaming")
+        request = StopRuntime.Request()
+        request.policy = "HOLD"
+        assert harness.call(StopRuntime, "/runtime/stop", request).success
+        harness.wait_for(lambda: result_future.done(), "the named motion result", timeout_s=3.0)
+        assert result_future.result().result.error_code == ExecuteNamedMotion.Result.STOP_LATCHED
+        count = harness.mock.upper_body_count
+        time.sleep(0.5)
+        # HOLD may publish one explicit safe command; the replay must not continue.
+        assert harness.mock.upper_body_count - count <= 1
     finally:
         harness.shutdown()

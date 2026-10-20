@@ -11,7 +11,8 @@ from robot_config.loader import load_robot_config_dict
 CONFIG_PATH = resolve_robot_config_path(config_name="aimdk_x2_skills")
 # The X2 runtime is built only with --aimdk; read its profile from the checkout.
 REPOSITORY_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file())
-RUNTIME_PROFILE = REPOSITORY_ROOT / "src" / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
+# The runtime profile aimdk_x2_skills selects.
+RUNTIME_PROFILE = REPOSITORY_ROOT / "src" / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra_omnihand.yaml"
 
 
 def _snapshot():
@@ -36,15 +37,21 @@ def test_x2_profile_exposes_only_named_motion_skills():
         assert snapshot.templates[name]["executor"] == "runtime_named_motion"
 
 
-def test_every_bound_motion_is_advertised_by_the_x2_runtime_profile():
-    """Static guard against catalog/runtime drift; the executor re-checks the live status."""
+def test_every_bound_motion_is_advertised_and_recorded_by_the_x2_runtime_profile():
+    """Static guard against catalog/runtime drift; the executor re-checks the live status.
+
+    The skills run in the stream mode, where the runtime only replays recorded motions: a bound
+    name without a recording passes the executor's name check and is then refused by the runtime.
+    """
     profile = yaml.safe_load(RUNTIME_PROFILE.read_text(encoding="utf-8"))
     advertised = set(profile["capabilities"]["motion.named"]["names"])
+    recorded = set(profile["vendor"]["named_motion"]["trajectories"])
     snapshot = _snapshot()
 
     bound = {snapshot.templates[name]["binding"]["motion"] for name in snapshot.enabled_skill_names}
 
     assert bound <= advertised
+    assert bound <= recorded
     assert bound == {"wave", "handshake", "raise_hand", "blow_kiss", "clap"}
 
 

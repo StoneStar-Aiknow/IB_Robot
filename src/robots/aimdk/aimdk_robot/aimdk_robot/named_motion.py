@@ -1,11 +1,16 @@
 """Named motions and postures exposed as one neutral action server.
 
-Two vendor mechanisms sit behind ``/motion/execute_named``:
+Three mechanisms sit behind ``/motion/execute_named``:
 
 * preset motions (``SetMcPresetMotion``) — wave, handshake, clap, …
 * posture MC actions (``SetMcAction``) — sit, squat, lie down, stand up, stairs
+* recorded arm trajectories — the preset gestures replayed on the upper-body
+  stream, for the modes in which the platform will not play a preset
 
-Both are "run this named thing"; the caller does not need to know which
+Which one runs follows the runtime mode: a trajectory mode replays, every other
+admitted mode uses the vendor mechanisms.
+
+All are "run this named thing"; the caller does not need to know which
 mechanism a given name uses. Names come from the profile, so an unknown name is
 rejected instead of being mapped onto a neighbouring motion.
 
@@ -24,11 +29,13 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from aimdk_robot import projection
+from aimdk_robot import trajectory as traj
 from aimdk_robot import vendor_gateway as vg
 from aimdk_robot.projection import CommandRejected
 from ibrobot_msgs.action import ExecuteNamedMotion
@@ -75,10 +82,30 @@ class NamedMotionServer:
         # gantry may never reach stable stand — so the platform's own report is
         # what is checked.
         self._required_action = str(config.get("required_action", ""))
+        # Modes in which named motions are replayed from recorded trajectories
+        # on the arm channel instead of being handed to the platform. Files are
+        # resolved relative to the profile and validated at startup.
+        self._trajectory_modes = [str(mode) for mode in config.get("trajectory_modes", [])]
+        self._blend_speed = float(config.get("trajectory_blend_speed_radps", 0.5))
+        self._blend_min_s = float(config.get("trajectory_blend_min_s", 0.5))
+        # A replay only succeeds if the measured arm followed it: the platform
+        # drops upper-body commands it cannot use without saying so.
+        self._follow_min_ratio = float(config.get("trajectory_follow_min_ratio", 0.3))
+        self._rate_hz = float((vendor.get("command") or {}).get("rate_hz", 50.0))
+        profile_dir = Path(str(node.get_parameter("profile").value)).parent
+        max_speed = float(config.get("trajectory_max_speed_radps", 3.0))
+        self._trajectories = {
+            str(name): traj.load_trajectory(profile_dir / str(path), max_speed_radps=max_speed)
+            for name, path in (config.get("trajectories") or {}).items()
+        }
         self._lock = threading.Lock()
         # (name, generation) of the goal currently executing; a later goal
         # with interrupt=true replaces it and the earlier wait loop notices.
         self._running: tuple[str, int] | None = None
+        # Goals between entering _execute and returning their result. Unlike
+        # _running it is taken before any vendor call, so it is what an
+        # interrupt=false goal is refused against.
+        self._executing = 0
         self._generation = 0
         self._server = ActionServer(
             node,
@@ -94,21 +121,24 @@ class NamedMotionServer:
 
     def _accept(self, goal) -> GoalResponse:
         name = str(goal.name)
-        if name not in self._presets and name not in self._postures:
+        if name not in self._presets and name not in self._postures and name not in self._trajectories:
             return GoalResponse.REJECT
+        # Early answer only: two goals can both pass here before either has
+        # started executing. _execute makes the check that holds.
         with self._lock:
-            if self._running is not None and not bool(goal.interrupt):
+            if self._executing and not bool(goal.interrupt):
                 return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
     def _refuse_cancel(self, _goal_handle) -> CancelResponse:
-        """The platform offers no way to cancel either mechanism.
+        """Named motions are not cancellable; ``/runtime/stop`` interrupts them.
 
         A posture transition is not interruptible (stopping half-way through
         sitting down is a fall), and the SDK exposes no "stop preset motion"
-        call. Accepting a cancel and then ignoring it would be a lie; the
-        honest answer is to refuse it and point at ``/runtime/stop``, which
-        does interrupt everything through the platform's stop action.
+        call. Accepting a cancel and then ignoring it would be a lie, so it is
+        refused and ``/runtime/stop`` named instead, which does interrupt
+        everything. A replayed trajectory could stop between ticks, but it is
+        the same named motion to the caller and answers cancel the same way.
         """
         self._node.get_logger().warning(
             "named motion cancel refused: the platform cannot cancel a running motion; use /runtime/stop"
@@ -129,14 +159,40 @@ class NamedMotionServer:
                 "runtime does not hold platform command arbitration",
             )
         mode = str(self._node.current_mode())
-        if mode not in self._allowed_modes:
+        if mode not in self._allowed_modes and mode not in self._trajectory_modes:
             return (
                 ExecuteNamedMotion.Result.MODE_NOT_ALLOWED,
-                f"mode {mode!r} does not admit named motions; allowed: {self._allowed_modes}",
+                f"mode {mode!r} does not admit named motions; allowed: {self._allowed_modes + self._trajectory_modes}",
             )
         return None
 
     def _execute(self, goal_handle):
+        """Refuse an interrupt=false goal while another executes, atomically with entering.
+
+        The check is made here and not by reserving in the goal callback:
+        rclpy can accept a goal and never execute it (the client went away
+        before the response), and a reservation taken there would never be
+        released.
+        """
+        request = goal_handle.request
+        with self._lock:
+            busy = self._executing > 0 and not bool(request.interrupt)
+            if not busy:
+                self._executing += 1
+        if busy:
+            return self._fail(
+                goal_handle,
+                ExecuteNamedMotion.Result(),
+                ExecuteNamedMotion.Result.BUSY,
+                "another named motion is executing and interrupt is false",
+            )
+        try:
+            return self._execute_admitted(goal_handle)
+        finally:
+            with self._lock:
+                self._executing -= 1
+
+    def _execute_admitted(self, goal_handle):
         request = goal_handle.request
         result = ExecuteNamedMotion.Result()
         name = str(request.name)
@@ -165,7 +221,10 @@ class NamedMotionServer:
             if failure is not None:
                 return self._fail(goal_handle, result, *failure)
 
-            if name in self._postures:
+            mode = str(self._node.current_mode())
+            if mode in self._trajectory_modes:
+                outcome = self._run_trajectory(name, mode, str(request.target), goal_handle, generation, epoch)
+            elif name in self._postures:
                 outcome = self._run_posture(name, goal_handle, generation, epoch)
             else:
                 outcome = self._run_preset(
@@ -322,6 +381,99 @@ class NamedMotionServer:
             ExecuteNamedMotion.Result.TIMEOUT,
             f"preset motion {name} (task {task_id}) not reported complete within {self._preset_timeout_s:.0f}s",
         )
+
+    def _run_trajectory(
+        self, name: str, mode: str, target: str, goal_handle, generation: int, epoch: int
+    ) -> tuple[bool, int, str]:
+        """Replay a recorded trajectory on the arm channel, easing in from the measured pose."""
+        recorded = self._trajectories.get(name)
+        if recorded is None:
+            return (
+                False,
+                ExecuteNamedMotion.Result.MODE_NOT_ALLOWED,
+                f"mode {mode!r} replays only recorded motions {sorted(self._trajectories)}; {name!r} has none",
+            )
+        # A recording drives exactly the side it was recorded on (the loader
+        # refuses one that does not say which), so a request for any other side
+        # is refused rather than answered with that side's motion.
+        if target and target != recorded.target:
+            raise CommandRejected("INVALID_TARGET", f"{name!r} was recorded for {recorded.target!r}, not {target!r}")
+        # Arm targets only move the robot in the mode's own platform action;
+        # anywhere else they would be accepted and silently dropped.
+        required = str((self._node.vendor_config.get("mc_actions") or {}).get(mode, ""))
+        current = str(self._node.platform_action())
+        if required and current != required:
+            return (
+                False,
+                ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                f"platform is in {current or 'an unreported action'}; replaying {name} requires {required}",
+            )
+        if not self._node.ensure_input_source():
+            return (
+                False,
+                ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                "vendor input source could not be registered; the platform would discard this motion",
+            )
+        start = self._node.measured_arm_positions()
+        if start is None:
+            return (
+                False,
+                ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                "no fresh arm measurement to start the motion from",
+            )
+        first = list(recorded.positions[0])
+        ease = traj.blend_duration(start, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
+        total = ease + recorded.duration
+        period = 1.0 / self._rate_hz
+        self._take_over(name, generation)
+        if not self._node.claim_arm(generation):
+            return (
+                False,
+                ExecuteNamedMotion.Result.BUSY,
+                f"another source is streaming on the arm channel; {name} does not preempt it",
+            )
+        feedback = ExecuteNamedMotion.Feedback()
+        feedback.state = "running"
+        commanded_peak = [0.0] * len(start)
+        measured_peak = [0.0] * len(start)
+        try:
+            started = time.monotonic()
+            tick = 0
+            while True:
+                t = tick * period
+                self._still_current(generation, epoch)
+                if self._node.current_mode() != mode:
+                    raise _Superseded(ExecuteNamedMotion.Result.CANCELLED, f"runtime left {mode!r} during {name}")
+                point = traj.blend(start, first, t / ease) if t < ease else recorded.sample(t - ease)
+                if not self._node.command_arm(point, owner=generation, epoch=epoch):
+                    self._still_current(generation, epoch)
+                    return (
+                        False,
+                        ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                        f"runtime stopped admitting arm commands during {name}",
+                    )
+                measured = self._node.measured_arm_positions() or start
+                for k, (origin, target, actual) in enumerate(zip(start, point, measured, strict=True)):
+                    commanded_peak[k] = max(commanded_peak[k], abs(target - origin))
+                    measured_peak[k] = max(measured_peak[k], abs(actual - origin))
+                if t >= total:
+                    break
+                if tick % int(self._rate_hz) == 0:
+                    feedback.progress = min(t / total, 1.0)
+                    goal_handle.publish_feedback(feedback)
+                tick += 1
+                time.sleep(max(0.0, started + tick * period - time.monotonic()))
+        finally:
+            self._node.release_arm(generation)
+        joint = max(range(len(start)), key=commanded_peak.__getitem__)
+        if measured_peak[joint] < self._follow_min_ratio * commanded_peak[joint]:
+            return (
+                False,
+                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                f"platform did not follow {name}: {projection.VENDOR_ARM_ORDER[joint]} was commanded "
+                f"{commanded_peak[joint]:.2f} rad and moved {measured_peak[joint]:.2f} rad",
+            )
+        return True, ExecuteNamedMotion.Result.NONE, f"replayed {name} in {mode} ({total:.1f}s)"
 
     def _run_posture(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         action = projection.resolve_named(name, self._postures, reason="UNKNOWN_MOTION")

@@ -318,3 +318,23 @@ def test_runtime_node_builds_its_own_description_without_injection():
     finally:
         if owned and rclpy.ok():
             rclpy.shutdown()
+
+
+def test_shipped_trajectories_load_and_replay_advertised_motions():
+    """A recording that fails validation would stop the runtime at startup."""
+    from aimdk_robot.named_motion import CONTROL_AREAS
+    from aimdk_robot.trajectory import load_trajectory
+
+    path = PROFILE_PATH.with_name("x2_ultra_omnihand.yaml")
+    profile = load_profile(path)
+    config = profile["vendor"]["named_motion"]
+    assert {profile["vendor"]["mc_actions"][mode] for mode in config["trajectory_modes"]} == {"UPPERBODY_REMOTE_SPLIT"}
+    assert set(config["trajectories"]) <= set(profile["capabilities"]["motion.named"]["names"])
+    areas = {area: name for name, area in CONTROL_AREAS.items()}
+    for name, path_in_profile in config["trajectories"].items():
+        recorded = load_trajectory(
+            path.parent / path_in_profile, max_speed_radps=float(config["trajectory_max_speed_radps"])
+        )
+        # The recording plays the side the preset it was recorded from plays.
+        preset = profile["vendor"]["preset_motions"][name]
+        assert recorded.target == (areas[preset["area"]] if "area" in preset else preset["target"]), name
