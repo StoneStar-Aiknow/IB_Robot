@@ -255,11 +255,14 @@ class AimdkRuntimeNode(Node):
         self._vendor_action = ""
         self._system_state = ""
         self._hold_target_missing = False
+        self._hand_hold_missing = False
         self._hand_type_verified = False
         self._hand_type_reported: list[str] = []
         #: Hand families as reported by the hand state stream (HandStateArray
         #: carries the same enumeration as GetHandType).
         self._hand_state_types: list[int] = []
+        #: Measured hand joint positions per side (left, right), by joint name.
+        self._hand_measured: list[dict[str, float]] = [{}, {}]
         # Per-source joint feedback with its receipt time: a source that goes
         # quiet must drop out of the aggregate instead of being re-stamped.
         self._joint_groups: dict[str, list[tuple[str, float, float, float]]] = {}
@@ -1043,6 +1046,12 @@ class AimdkRuntimeNode(Node):
             response.success = True
             response.message = "already active"
             return response
+        mismatch = self._hand_mismatch(target)
+        if mismatch:
+            response.success = False
+            response.message = mismatch
+            response.valid_transitions = sorted(self._modes.valid_transitions())
+            return response
         ok, detail = self._request_vendor_mode(target, epoch)
         if not ok:
             response.success = False
@@ -1467,9 +1476,17 @@ class AimdkRuntimeNode(Node):
                     )
                 return
             self._hold_target_missing = False
-            hand_sub_mode, hand_pos = (
-                self._hand_cmd if self._hand_cmd is not None else (self._default_hand_sub_mode, [])
-            )
+            hand = self._hand_cmd if self._hand_cmd is not None else self._hand_hold_locked()
+            if hand is None:
+                if not self._hand_hold_missing:
+                    self._hand_hold_missing = True
+                    self._modes.note_rejected("upper_body:HAND_HOLD_UNAVAILABLE")
+                    self.get_logger().warning(
+                        "upper-body command withheld: the installed hands cannot be held at a measured pose"
+                    )
+                return
+            self._hand_hold_missing = False
+            hand_sub_mode, hand_pos = hand
             self._upper_body_pub.publish(
                 vg.upper_body_command(
                     self,
@@ -1481,6 +1498,55 @@ class AimdkRuntimeNode(Node):
                     hand_pos=hand_pos,
                 )
             )
+
+    def _hand_mismatch(self, mode: str) -> str:
+        """Why ``mode`` cannot carry this robot's hands, or "".
+
+        A profile whose hand family differs from one the platform reports is
+        not a fault of the whole runtime — speech, presets and the other modes
+        do not involve the hands — but every upper-body command in the
+        hands-carrying action would be dropped by the platform, arms included.
+        So only that action is refused, naming the reason.
+        """
+        if str((self._vendor.get("mc_actions") or {}).get(mode, "")) != projection.UPPER_BODY_HANDS_ACTION:
+            return ""
+        declared = "claw" if self._hand_type == "claw" else "dexterous"
+        with self._lock:
+            reported = list(self._hand_state_types)
+        if {vg.hand_type_family(value) for value in reported} - {None, declared}:
+            names = [vg.hand_type_name(value) for value in reported]
+            return (
+                f"hand type mismatch: profile declares {declared!r}, platform reports {names}; "
+                f"its upper-body commands in {mode!r} would be dropped"
+            )
+        return ""
+
+    def _hand_hold_locked(self) -> tuple[int, list[float]] | None:
+        """Hand fields for a tick with no hand command, or None to withhold it. Caller holds _lock.
+
+        In the hands-carrying action a profile that declares dexterous joint
+        control holds the installed hands at their measured pose: the platform
+        drops the whole upper-body command, arms included, when ``hand_pos``
+        does not fit ``hand_sub_mode``. The platform's hand report only says
+        which side has a hand. An installed hand that cannot be held withholds
+        the command rather than sending one that would be dropped. Claw holding
+        is not verified on hardware; it keeps the declared sub-mode with no
+        targets.
+        """
+        action = str((self._vendor.get("mc_actions") or {}).get(self._modes.mode, ""))
+        if (
+            self._default_hand_sub_mode != projection.HAND_SUB_MODE_DEXTEROUS_JOINT
+            or action != projection.UPPER_BODY_HANDS_ACTION
+        ):
+            return self._default_hand_sub_mode, []
+        installed = [vg.hand_type_family(value) is not None for value in self._hand_state_types]
+        if not any(installed):
+            return self._default_hand_sub_mode, []
+        fresh, _stale = projection.partition_fresh(
+            self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
+        )
+        payload = projection.dexterous_hold_payload(installed, self._hand_measured) if "hand" in fresh else None
+        return None if payload is None else (self._default_hand_sub_mode, payload)
 
     def _hold_target_locked(self, order: tuple[str, ...]) -> list[float] | None:
         """Fresh measured positions in vendor order, or None. Caller holds _lock."""
@@ -1512,10 +1578,15 @@ class AimdkRuntimeNode(Node):
         with self._lock:
             self._hand_state_types = [int(message.left_hand_type.value), int(message.right_hand_type.value)]
         entries: list[tuple[str, float, float, float]] = []
+        measured: list[dict[str, float]] = []
         for side, hands in (("left", message.left_hands), ("right", message.right_hands)):
+            measured.append({})
             for hand in hands:
                 name = str(hand.name) or f"{side}_hand"
                 entries.append((name, float(hand.position), float(hand.velocity), float(hand.effort)))
+                measured[-1][name] = float(hand.position)
+        with self._lock:
+            self._hand_measured = measured
         self._record_feedback("hand", entries)
         self._publish_hand_touch(message)
 

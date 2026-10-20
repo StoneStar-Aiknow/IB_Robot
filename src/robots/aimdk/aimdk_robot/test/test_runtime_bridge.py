@@ -1621,3 +1621,16 @@ def test_a_claw_contributes_no_tactile_frames():
     assert frames, "the dexterous hand must contribute its pads"
     assert all(pad.startswith("right_") for pad in frames)
     assert frames["right_palm"] == [5] * 36
+
+
+def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
+    """A claw profile on an X2 with one dexterous hand: speech and presets stay usable."""
+    harness = Harness(hand_type="dexterous", right_hand_type="none")
+    try:
+        harness.wait_active()
+        response = harness.set_mode("stream")
+        assert not response.success
+        assert "hand type mismatch" in response.message
+        assert harness.status().lifecycle == "ACTIVE"
+    finally:
+        harness.shutdown()

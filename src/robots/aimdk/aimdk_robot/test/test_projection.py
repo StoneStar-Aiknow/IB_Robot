@@ -504,3 +504,19 @@ def test_head_targets_outside_the_platform_travel_are_refused_not_clamped():
         projection.head_payload([0.0, -0.4], channel_joints=joints, limits=limits)
     # Without declared limits the behaviour is unchanged.
     assert projection.head_payload([2.0, 2.0], channel_joints=joints) == [2.0, 2.0]
+
+
+# --- holding dexterous hands while the arms stream ---------------------------
+
+
+def test_dexterous_hands_are_held_at_their_measured_pose():
+    """An upper-body command without a fitting hand_pos is dropped whole by the platform, arms included."""
+    left = {f"L_{joint}_joint": float(i) for i, joint in enumerate(projection.DEXTEROUS_JOINT_ORDER)}
+    # An X2 with only a left hand: the right slots exist in the layout but drive nothing.
+    assert projection.dexterous_hold_payload([True, False], [left, {}]) == [float(i) for i in range(10)] + [0.0] * 10
+    # Two hands: each side is held at its own measured pose, left 10 then right 10.
+    right = {f"R_{joint}_joint": 10.0 + i for i, joint in enumerate(projection.DEXTEROUS_JOINT_ORDER)}
+    assert projection.dexterous_hold_payload([True, True], [left, right]) == [float(i) for i in range(20)]
+    left.pop("L_pinky_pip_joint")
+    assert projection.dexterous_hold_payload([True, False], [left, {}]) is None
+    assert projection.dexterous_hold_payload([False, False], [{}, {}]) is None

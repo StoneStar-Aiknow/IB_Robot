@@ -77,6 +77,9 @@ VENDOR_MOTION_MODES: frozenset[str] = frozenset(
         "UPPERBODY_REMOTE_SPLIT",
     }
 )
+# The motion mode whose upper-body commands carry the hands: every command in it
+# needs a hand_pos that fits its hand_sub_mode, or the platform drops it whole.
+UPPER_BODY_HANDS_ACTION = "UPPERBODY_REMOTE_SPLIT"
 
 # Posture skills, dispatched through the same service but absent from the mode
 # table. Their registration has not been confirmed against hardware (the unit
@@ -345,6 +348,34 @@ def dexterous_joint_payload(values: Sequence[float]) -> list[float]:
     if len(numbers) != expected:
         raise CommandRejected("HAND_COMMAND_LENGTH", f"expected {expected} values, got {len(numbers)}")
     return list(numbers)
+
+
+def dexterous_hold_payload(installed: Sequence[bool], measured: Sequence[dict[str, float]]) -> list[float] | None:
+    """Sub-mode 2 ``hand_pos`` that holds the dexterous hands where they are measured.
+
+    In UPPER_BODY_HANDS_ACTION the platform drops a whole upper-body command —
+    arms included — whose ``hand_pos`` does not fit its ``hand_sub_mode``
+    (verified 2026-10-20: an empty ``hand_pos`` left the arm command board
+    untouched, the 20-value layout moved it). ``installed`` and ``measured``
+    are per side, left then right. A side with no hand gets zeros: its slots
+    exist in the fixed layout but drive nothing, which is how an X2 with only
+    a left hand is commanded. None when an installed hand is not fully
+    measured, or no hand is installed at all.
+    """
+    if len(installed) != 2 or not any(installed):
+        return None
+    payload: list[float] = []
+    for present, positions in zip(installed, measured, strict=True):
+        if not present:
+            payload.extend([0.0] * DEXTEROUS_JOINTS_PER_HAND)
+            continue
+        by_joint = {name.lower(): value for name, value in positions.items()}
+        for joint in DEXTEROUS_JOINT_ORDER:
+            match = [value for name, value in by_joint.items() if name.endswith(f"{joint}_joint")]
+            if len(match) != 1:
+                return None
+            payload.append(float(match[0]))
+    return payload
 
 
 def gesture_payload(values: Sequence[float], *, gesture_ids: Sequence[int] | None = None) -> list[float]:
