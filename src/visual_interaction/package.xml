@@ -23,10 +23,25 @@
        not depend on visual_interaction. -->
   <depend>robot_config</depend>
 
+  <!-- The phase-zero measurement tools only (visual_interaction/phase0/), not
+       the session or the node. They are command-line tools run by hand during
+       bring-up, so these stay exec-only: the interaction itself needs none of
+       them, and a deployment that never measures does not need them installed
+       beyond what ROS already brings. -->
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- golden.py compares model output archives; tokenizer.py builds the Qwen2
+       BPE from the tokenizer data files to count prompt tokens. -->
+  <exec_depend>python3-tokenizers</exec_depend>
+  <!-- pcm_intervals.py subscribes to /audio/play, which the playback node
+       publishes as audio_common_msgs/AudioData. -->
+  <exec_depend>audio_common_msgs</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- test_phase0_golden.py compares arrays. -->
+  <test_depend>python3-numpy</test_depend>
   <!-- The launch-builder tests import robot_config's launch preparation
        pipeline, the same way manipulation_execution's migrated builder tests
        do. -->
