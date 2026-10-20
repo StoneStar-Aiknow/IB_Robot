@@ -10,7 +10,12 @@ ones that have nothing to do with ROS.
 
 | module | owns |
 |---|---|
+| ``core`` | one observation round, and the order its checks run in |
+| ``hooks`` | every extension point: the model, the speaker, the change gate |
 | ``semantics`` | reading one model answer, or rejecting it |
+| ``topics`` | what has been said, and what two windows have confirmed |
+| ``validity`` | short-term association, session boundaries, evidence age |
+| ``fake_vl`` | a scripted model, for tests and for the first version |
 
 Design: docs/x2_visual_interaction_design_zh.md
 """
