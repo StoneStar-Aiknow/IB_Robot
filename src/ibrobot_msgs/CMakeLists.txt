@@ -50,6 +50,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SceneAnalysisRequest.msg"
   "msg/SceneAnalysisResult.msg"
   "msg/VisualGameEvent.msg"
+  "msg/VisualInteractionUtterance.msg"
   "msg/SceneObject.msg"
   "msg/SceneObservation.msg"
   "msg/AttentionWeights.msg"

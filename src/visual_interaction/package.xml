@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>visual_interaction</name>
+  <version>0.1.0</version>
+  <description>Proactive visual interaction: watch the visitor, decide what is worth answering, and say it once</description>
+  <maintainer email="roboguru.92@gmail.com">IB-Robot Contributors</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>ibrobot_msgs</depend>
+  <depend>embodied_common</depend>
+  <!-- The actor selector and the shared person-vision helpers live there; this
+       package reuses them instead of keeping a second copy that could drift. -->
+  <depend>manipulation_execution</depend>
+  <!-- Launch-builder registration: launch_builders/visual_interaction.py
+       contributes a BuilderSpec to robot_config's launch registry through the
+       ``ibrobot.launch_builders`` entry point group, so this package imports
+       robot_config at runtime. The dependency is one way: robot_config does
+       not depend on visual_interaction. -->
+  <depend>robot_config</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <!-- The launch-builder tests import robot_config's launch preparation
+       pipeline, the same way manipulation_execution's migrated builder tests
+       do. -->
+  <test_depend>robot_config</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
