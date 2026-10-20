@@ -11,6 +11,7 @@ ones that have nothing to do with ROS.
 | module | owns |
 |---|---|
 | ``core`` | one observation round, and the order its checks run in |
+| ``endpoints`` | resolving the camera by ID, and refusing every motion family |
 | ``hooks`` | every extension point: the model, the speaker, the change gate |
 | ``semantics`` | reading one model answer, or rejecting it |
 | ``topics`` | what has been said, and what two windows have confirmed |

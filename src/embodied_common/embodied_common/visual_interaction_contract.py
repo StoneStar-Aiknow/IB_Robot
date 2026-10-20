@@ -14,6 +14,14 @@ NODE_NAME = "visual_interaction"
 UTTERANCE_TOPIC = f"/{NODE_NAME}/utterance"
 STATUS_TOPIC = f"/{NODE_NAME}/status"
 
+# How the robot is asked to stop talking: ``std_srvs/SetBool``, data false to
+# mute and true to resume. A visitor cannot reach a ROS service, so whatever
+# calls this — an attendant console, a button — is part of the feature rather
+# than an optional extra. Without it there is no way to ask for quiet, and only
+# an explicit resume ever clears a mute.
+SET_ENABLED_SERVICE = "set_enabled"
+SET_ENABLED_FULL_NAME = f"/{NODE_NAME}/{SET_ENABLED_SERVICE}"
+
 # What the model may report about one observation window.
 #
 # ``none`` is "nothing new worth answering" and ``uncertain`` is "cannot see it
