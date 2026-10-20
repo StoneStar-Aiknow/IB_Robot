@@ -437,6 +437,12 @@ Gateway 成为 owner，在 admission 时 stamp canonical `task_budget_sec` 预�
 都不能开启或修改授权。未授权请求返回 `MOTION_NOT_AUTHORIZED`，控制模式不匹配返回
 `CONTROL_MODE_MISMATCH`，两种情况都不会向 primitive 层发送动作。
 
+启用 runtime 时，`active_control_mode` 由 runtime 当前模式经 `runtime_mode_map_json` 反查得到。多个控制
+模式可以映射到同一个 runtime 模式（如 X2 上 `teleop` 与 `named_motion` 都是 `stream`；默认映射和
+SO-101 配置里各控制模式的 runtime 模式互不相同）。这时只要本执行器服务的 `skill_required_control_mode`
+映射到当前 runtime 模式，就报告它——因此该控制模式按"已处于"准入；否则报告第一个匹配项。runtime 只上报
+自己的模式，分辨不出这个模式此刻由哪个控制模式的指令源在使用，同一模式下指令源之间的互斥由 runtime 负责。
+
 ### 8.1 Gateway 准入、readiness 与新鲜度
 
 Gateway 先规范化 task ID 与公开 skill payload，再按固定顺序评估：操作员授权、控制模式、现有 root

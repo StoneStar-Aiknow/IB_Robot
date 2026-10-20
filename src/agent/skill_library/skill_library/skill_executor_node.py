@@ -2212,9 +2212,10 @@ class SkillExecutorNode(Node):
         clears it. A session that did take over sees the mode change and
         revokes on its own; it is not asked to stop.
         """
-        required_mode = self._required_control_mode_for_skill(skill_name) or str(
-            getattr(self, "_skill_required_control_mode", "")
-        ).strip()
+        required_mode = (
+            self._required_control_mode_for_skill(skill_name)
+            or str(getattr(self, "_skill_required_control_mode", "")).strip()
+        )
         runtime_mode = self._runtime_mode_for(required_mode)
         with self._motion_mode_switch_lock:
             status, reason = self._runtime_status_for_admission()
@@ -2527,16 +2528,25 @@ class SkillExecutorNode(Node):
     def _handle_joint_state(self, msg: JointState) -> None:
         self._latest_joint_state = msg
 
+    def _control_mode_for_runtime(self, status) -> str:
+        """The control mode a runtime status shows active, or "" without one.
+
+        Control modes may share a runtime mode (X2 teleop and named motions
+        both run in stream); the one this executor serves is the one reported.
+        """
+        if status is None:
+            return ""
+        if self._runtime_mode_map.get(self._skill_required_control_mode) == status.active_mode:
+            return self._skill_required_control_mode
+        return next((name for name, mode in self._runtime_mode_map.items() if mode == status.active_mode), "")
+
     def _runtime_snapshot(self) -> RuntimeSnapshot:
         owner = self._gateway_lease.owner
         active_workflow = self._active_workflow
         active_control_mode = self._active_control_mode
         if getattr(self, "_runtime_enabled", False):
             status, _ = self._runtime_status_for_admission()
-            active_control_mode = next(
-                (name for name, mode in self._runtime_mode_map.items() if status and mode == status.active_mode),
-                "",
-            )
+            active_control_mode = self._control_mode_for_runtime(status)
         return RuntimeSnapshot(
             motion_authorized=self._motion_authorized,
             active_control_mode=active_control_mode,
