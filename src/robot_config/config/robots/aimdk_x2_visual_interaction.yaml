@@ -95,16 +95,14 @@ robot:
     enabled: true
 
     # Resolved by interface ID from the live runtime description, never as a
-    # topic name. This is the camera the magic-mirror deployment already
-    # watches a visitor with: declared in the X2 profile, forward-facing,
-    # 30 Hz compressed.
+    # topic name. This is the same compressed stream the magic-mirror
+    # deployment already watches a visitor with: declared in the X2 profile,
+    # forward-facing, 30 Hz.
     #
     # Not the camera the board demo used
     # (camera.rgb_head_front_center.color_compressed): the vendor withdrew it
     # from the open interface set in v0.8.1, and the profile contract test
-    # forbids it appearing in any endpoint. Phase zero still has to confirm
-    # this one frames a standing visitor — it is the left eye of a stereo pair,
-    # a different position from the demo's centre camera.
+    # forbids it appearing in any endpoint.
     frame_source:
       interface: camera.stereo_head_front_left.color_compressed
 
