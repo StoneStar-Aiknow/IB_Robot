@@ -5,6 +5,7 @@ import { useProfilerStore } from "../../stores/profiler";
 import { eventComponent, recordToData } from "../../utils/format";
 import AsyncState from "../AsyncState.vue";
 import DataGrid, { type GridColumn } from "../DataGrid.vue";
+import RecordPagination from "../RecordPagination.vue";
 
 const store = useProfilerStore();
 const { events, tabState, tabError, searchQuery } = storeToRefs(store);
@@ -30,7 +31,10 @@ function select(row: Record<string, unknown>): void {
 </script>
 
 <template>
-  <AsyncState :state="tabState.events" :error="tabError.events" :empty="!events.length" empty-title="没有原始事件" empty-message="当前请求和组件范围内没有事件。" @retry="store.fetchTab('events', true)">
-    <div class="table-panel"><div class="table-toolbar"><span>共 {{ rows.length }} 条事件</span><span class="toolbar-help">单页最多读取 1000 条；使用范围栏缩小结果</span></div><DataGrid :rows="rows" :columns="columns" row-key="id" @select="select" /></div>
+  <div class="record-page">
+    <RecordPagination tab="events" :count="events.length" />
+    <AsyncState :state="tabState.events" :error="tabError.events" :empty="!events.length" empty-title="没有匹配的事件" empty-message="可清除名称查询，或调整请求与组件范围。" @retry="store.fetchTab('events', true)">
+      <div class="table-panel"><div class="table-toolbar"><span>本页匹配 {{ rows.length }} / {{ events.length }} 条事件</span></div><DataGrid :rows="rows" :columns="columns" row-key="id" empty-text="本页没有匹配记录；名称查询可搜索当前范围全部事件" @select="select" /></div>
   </AsyncState>
+  </div>
 </template>

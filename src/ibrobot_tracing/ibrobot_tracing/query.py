@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from .model import Component, FlowRecord, SpanRecord, TraceEvent, TracepointDefinition
@@ -163,6 +164,36 @@ def stable_flow_id(flow: FlowRecord) -> str:
     return _digest("flow", (flow.trace_id, flow.edge_id, flow.flow_id))
 
 
+def span_occurrences(spans: list[SpanRecord]) -> list[SpanRecord]:
+    """Assign before filtering/paging; keep IDs on already indexed records."""
+    used = Counter()
+    result = []
+    for span in sorted(spans, key=lambda item: (item.start_ns, stable_span_id(item))):
+        base = stable_span_id(span)
+        used[base] += 1
+        identity = base if used[base] == 1 else f"{base}:{used[base]}"
+        result.append(span if span.occurrence_id else replace(span, occurrence_id=identity))
+    return result
+
+
+def flow_occurrences(flows: list[FlowRecord]) -> list[FlowRecord]:
+    used = Counter()
+    result = []
+    for flow in sorted(
+        flows,
+        key=lambda item: (
+            item.send_ns if item.send_ns is not None else -1,
+            item.receive_ns if item.receive_ns is not None else -1,
+            stable_flow_id(item),
+        ),
+    ):
+        base = stable_flow_id(flow)
+        used[base] += 1
+        identity = base if used[base] == 1 else f"{base}:{used[base]}"
+        result.append(flow if flow.occurrence_id else replace(flow, occurrence_id=identity))
+    return result
+
+
 def stable_request_id(request: str | dict[str, Any]) -> str:
     request_id = request if isinstance(request, str) else str(request.get("request_id", ""))
     return _digest("request", request_id)
@@ -198,9 +229,12 @@ class QueryService:
         return _page(items, query.offset, query.limit)
 
     def spans(self, query: SpanQuery = SpanQuery()) -> QueryPage[SpanRecord]:
+        records = self.result.spans
+        if any(not span.occurrence_id for span in records):
+            records = span_occurrences(records)
         items = [
             span
-            for span in self.result.spans
+            for span in records
             if (not query.request_id or span.trace_id == query.request_id)
             and (not query.component_id or span.component_id == query.component_id)
             and (not query.name or span.name == query.name)
@@ -213,6 +247,9 @@ class QueryService:
         return _page(items, query.offset, query.limit)
 
     def flows(self, query: FlowQuery = FlowQuery()) -> QueryPage[FlowRecord]:
+        records = self.result.flows
+        if any(not flow.occurrence_id for flow in records):
+            records = flow_occurrences(records)
         component_edges = {
             edge.edge_id
             for edge in (self.result.topology.edges if self.result.topology is not None else [])
@@ -236,7 +273,7 @@ class QueryService:
 
         items = [
             flow
-            for flow in self.result.flows
+            for flow in records
             if (not query.request_id or flow.trace_id == query.request_id)
             and (not query.component_id or flow.edge_id in component_edges)
             and (not query.edge_id or flow.edge_id == query.edge_id)

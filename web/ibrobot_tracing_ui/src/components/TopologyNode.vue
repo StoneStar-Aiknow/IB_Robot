@@ -15,6 +15,7 @@ export interface TopologyNodeData {
 defineProps<{ data: TopologyNodeData; selected?: boolean }>();
 
 const KIND_LABELS: Record<string, string> = {
+  observed_component: "观测组件",
   ros_node: "ROS 节点",
   module: "模块",
   operation: "操作",

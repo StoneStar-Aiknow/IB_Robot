@@ -102,7 +102,7 @@ const hoverInfo = computed(() => {
       title: node.name,
       subtitle: node.component_id || "未标记组件",
       lines: [
-        `总墙钟 ${formatNs(numericNs(node.duration_ns))}`,
+        `总墙钟 ${node.duration_ns === null ? "未完成 / 未提供" : formatNs(numericNs(node.duration_ns))}`,
         `自身/未覆盖 ${formatNs(numericNs(node.uncovered_wall_ns))}`,
         `偏移 ${formatNs(numericNs(node.start_offset_ns))} · 深度 ${node.depth} · 全局通道 ${hoverLane.value}`,
         `状态 ${node.status}${node.diagnostics.length ? ` · ${node.diagnostics.join(", ")}` : ""}`,
@@ -154,7 +154,7 @@ function inspectAggregate(node: AggregateSpanProfileNode): void {
 }
 
 function requestNodeLabel(node: RequestSpanProfileNode): string {
-  return `${node.name}，组件 ${node.component_id || "未标记"}，墙钟 ${formatNs(numericNs(node.duration_ns))}，状态 ${node.status}。按 Enter 或空格检查`;
+  return `${node.name}，组件 ${node.component_id || "未标记"}，墙钟 ${node.duration_ns === null ? "未完成 / 未提供" : formatNs(numericNs(node.duration_ns))}，状态 ${node.status}。按 Enter 或空格检查`;
 }
 
 function aggregateNodeLabel(node: AggregateSpanProfileNode): string {
@@ -308,12 +308,11 @@ onBeforeUnmount(() => {
 
     <div class="profile-toolbar">
       <div class="profile-segment" aria-label="Span 分析模式">
-        <button type="button" :class="{ active: spanAnalysisMode === 'call-tree' }" @click="setMode('call-tree')">调用树</button>
-        <button type="button" :class="{ active: spanAnalysisMode === 'request' }" @click="setMode('request')">请求区间</button>
-        <button type="button" :class="{ active: spanAnalysisMode === 'aggregate' }" @click="setMode('aggregate')">聚合冰柱</button>
+        <button type="button" :aria-pressed="spanAnalysisMode === 'call-tree'" :class="{ active: spanAnalysisMode === 'call-tree' }" @click="setMode('call-tree')">调用树</button>
+        <button type="button" :aria-pressed="spanAnalysisMode === 'request'" :class="{ active: spanAnalysisMode === 'request' }" @click="setMode('request')">请求区间</button>
+        <button type="button" :aria-pressed="spanAnalysisMode === 'aggregate'" :class="{ active: spanAnalysisMode === 'aggregate' }" @click="setMode('aggregate')">全部请求聚合</button>
       </div>
       <span class="profile-toolbar-spacer" />
-      <span v-if="spanAnalysisMode !== 'call-tree'" class="profile-legend"><i class="inclusive" />包含权重 <i class="self" />自身/未覆盖 <i class="incomplete" />未完成</span>
       <div v-if="spanAnalysisMode !== 'call-tree'" class="profile-zoom" aria-label="剖析图缩放">
         <button type="button" title="缩小（-）" :disabled="zoom <= 0.75" @click="setZoom(zoom / 1.25)">−</button>
         <code>{{ Math.round(zoom * 100) }}%</code>
@@ -354,10 +353,11 @@ onBeforeUnmount(() => {
     <div v-if="spanAnalysisMode === 'request' && !requestId" class="profile-prompt state-view">
       <AppIcon name="trace" :size="24" />
       <strong>请选择一个请求以生成 Span 剖析</strong>
-      <span>单请求模式只绘制明确的 request_id；当前不会向服务端发出无效请求。可从“请求”标签或上方范围栏选择。</span>
+      <span>从请求列表打开一条记录，或在上方粘贴完整请求 ID。</span>
       <button class="button secondary" type="button" @click="store.activeTab = 'requests'">打开请求列表</button>
     </div>
     <AsyncState
+      context="调用层级"
       v-else
       class="profile-async-state"
       :state="tabState['span-profile']"
@@ -376,20 +376,22 @@ onBeforeUnmount(() => {
         @pointermove="movePan"
         @pointerup="endPan"
         @pointercancel="endPan"
+        @lostpointercapture="endPan"
         @wheel="handleWheel"
       >
+        <div class="profile-legend" role="group" aria-label="调用层级图例"><i class="inclusive" />包含墙钟 <i class="self" />自身/未覆盖 <i class="incomplete" />未完成</div>
         <svg
           v-if="spanProfile"
           class="profile-chart"
           :width="chartWidth"
           :height="svgHeight"
           :viewBox="`0 0 ${chartWidth} ${svgHeight}`"
-          role="img"
+          role="group"
           :aria-label="spanAnalysisMode === 'request' ? '按时间排列的单请求 Span 墙钟冰柱图' : '按包含墙钟权重分区的聚合 Span 冰柱图'"
         >
           <defs>
             <pattern id="profile-incomplete-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-              <line x1="0" y1="0" x2="0" y2="6" stroke="rgba(255,255,255,.75)" stroke-width="2" />
+              <line x1="0" y1="0" x2="0" y2="6" stroke="rgba(var(--inverse-rgb), .75)" stroke-width="2" />
             </pattern>
           </defs>
           <rect class="profile-chart-background" :width="chartWidth" :height="svgHeight" />

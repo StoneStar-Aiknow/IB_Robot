@@ -206,6 +206,171 @@ describe("profiler store", () => {
   beforeEach(() => setActivePinia(createPinia()));
   afterEach(() => vi.restoreAllMocks());
 
+  it("cancels a pending exact lookup when a newer row navigation wins", async () => {
+    const old = deferred<any>();
+    const api = vi.spyOn(tracingApi, "requests").mockReturnValue(old.promise);
+    vi.spyOn(tracingApi, "timeline").mockResolvedValue({ start_ns: null, end_ns: null, duration_ns: 0, lanes: [], items: [] });
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.activeTab = "requests";
+    const pending = store.findRequest("old");
+    await store.navigateToRequest("new", "timeline");
+    expect(api.mock.calls[0][1]?.aborted).toBe(true);
+    old.resolve({ items: [{ request_id: "old" }], total: 1 });
+    await pending;
+    expect(store.requestId).toBe("new");
+    expect(store.activeTab).toBe("timeline");
+  });
+
+  it("cancels a lookup when its input is edited or the task is changed", async () => {
+    const response = deferred<any>();
+    vi.spyOn(tracingApi, "requests").mockReturnValue(response.promise);
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    const pending = store.findRequest("old");
+    store.cancelLookup();
+    response.resolve({ items: [{ request_id: "old" }], total: 1 });
+    await pending;
+    expect(store.requestId).toBe("");
+    expect(store.lookupState).toBe("idle");
+  });
+
+  it("restores request-scoped hierarchy on entering a request and retains list context", async () => {
+    vi.spyOn(tracingApi, "criticalPath").mockResolvedValue(criticalPath("one", "", "detail"));
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.activeTab = "requests";
+    store.spanAnalysisMode = "aggregate";
+    store.requestListFilter = "one";
+    store.requestListScroll = 200;
+    await store.navigateToRequest("one", "critical-path");
+    expect(store.spanAnalysisMode).toBe("request");
+    expect(store.requestListFilter).toBe("one");
+    expect(store.requestListScroll).toBe(200);
+  });
+
+  it("finds an exact request outside the current page and opens its own detail", async () => {
+    const requests = vi.spyOn(tracingApi, "requests").mockResolvedValue({ items: [{ request_id: "outside-page", total_ms: 3 }], total: 1 });
+    vi.spyOn(tracingApi, "criticalPath").mockResolvedValue(criticalPath("outside-page", "", "detail"));
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.requests = [{ request_id: "first-page" }];
+    await store.findRequest(" outside-page ");
+    expect(requests).toHaveBeenCalledWith("analysis", expect.any(AbortSignal), { requestId: "outside-page", limit: 1 });
+    expect(store.requestId).toBe("outside-page");
+    expect(store.selectedRequest?.total_ms).toBe(3);
+    expect(store.activeTab).toBe("critical-path");
+    expect(store.requests).toEqual([{ request_id: "first-page" }]);
+  });
+
+  it("keeps the existing request when an exact lookup has no match", async () => {
+    vi.spyOn(tracingApi, "requests").mockResolvedValue({ items: [], total: 0 });
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.requestId = "existing";
+    await store.findRequest("unknown");
+    expect(store.requestId).toBe("existing");
+    expect(store.lookupState).toBe("error");
+    expect(store.lookupError).toContain("完整 ID");
+  });
+
+  it("does not allow a late lookup to replace a more recent request", async () => {
+    const old = deferred<any>();
+    vi.spyOn(tracingApi, "requests").mockReturnValueOnce(old.promise)
+      .mockResolvedValueOnce({ items: [{ request_id: "new" }], total: 1 });
+    vi.spyOn(tracingApi, "criticalPath").mockResolvedValue(criticalPath("new", "", "detail"));
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    const pending = store.findRequest("old");
+    await store.findRequest("new");
+    old.resolve({ items: [{ request_id: "old" }], total: 1 });
+    await pending;
+    expect(store.requestId).toBe("new");
+  });
+
+  it("uses server sorting and pagination instead of sorting only the first page", async () => {
+    const api = vi.spyOn(tracingApi, "requests").mockResolvedValue({ items: [{ request_id: "last" }], total: 101, offset: 100, next_offset: null });
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.requestsOffset = 100;
+    store.requestSortBy = "inference_ms";
+    store.requestDescending = false;
+    await store.fetchRequests();
+    expect(api).toHaveBeenCalledWith("analysis", expect.any(AbortSignal), { offset: 100, sortBy: "inference_ms", descending: false });
+    expect(store.requestsTotal).toBe(101);
+    expect(store.requestsNextOffset).toBeNull();
+    expect(store.requests[0].request_id).toBe("last");
+  });
+
+  it("retains raw-page totals and resets pagination when request scope changes", async () => {
+    const api = vi.spyOn(tracingApi, "events").mockResolvedValue({ items: [{ id: "one" }] as any, total: 43200, next_offset: 100 });
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.activeTab = "events";
+    await store.refreshScopedData();
+    await store.setRecordPage("events", 100, "span_begin");
+    expect(api.mock.lastCall?.[1]).toMatchObject({ offset: 100, name: "span_begin" });
+    expect(store.recordPages.events.total).toBe(43200);
+    store.requestId = "specific";
+    await store.refreshScopedData();
+    expect(api.mock.lastCall?.[1]).toMatchObject({ offset: 0, requestId: "specific" });
+    expect(store.recordPages.events.name).toBe("");
+  });
+
+  it("never fetches a whole timeline when no request is selected", async () => {
+    const api = vi.spyOn(tracingApi, "timeline");
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    await store.fetchTab("timeline");
+    expect(api).not.toHaveBeenCalled();
+    expect(store.timeline).toBeNull();
+    expect(store.tabState.timeline).toBe("ready");
+  });
+
+  it("shares concurrent requests for the same tab and scope", async () => {
+    const response = deferred<any>();
+    const api = vi.spyOn(tracingApi, "events").mockReturnValue(response.promise);
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    const first = store.fetchTab("events");
+    const second = store.fetchTab("events");
+    expect(api).toHaveBeenCalledTimes(1);
+    response.resolve({ items: [{ id: "one" }], total: 1 });
+    await Promise.all([first, second]);
+    expect(store.events).toEqual([{ id: "one" }]);
+  });
+
+  it("clears the previous graph and reports its own failure without hiding usable analysis", async () => {
+    const api = vi.spyOn(tracingApi, "topology").mockRejectedValueOnce(new Error("unavailable"));
+    const store = useProfilerStore();
+    store.analysisId = "analysis";
+    store.analysisState = "ready";
+    store.topology = topology("previous");
+    store.requestId = "new-request";
+    const pending = store.refreshTopology();
+    expect(store.topology).toBeNull();
+    expect(store.topologyState).toBe("loading");
+    await pending;
+    expect(store.topology).toBeNull();
+    expect(store.topologyState).toBe("error");
+    expect(store.topologyError).toBe("unavailable");
+    expect(store.analysisState).toBe("ready");
+    api.mockResolvedValueOnce(topology("recovered"));
+    await store.refreshTopology();
+    expect(store.topologyState).toBe("ready");
+    expect(store.topologyError).toBe("");
+  });
+
   it("ignores a stale tab response after the scope changes", async () => {
     const first = deferred<any>();
     const second = deferred<any>();

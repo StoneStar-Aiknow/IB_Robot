@@ -1,0 +1,121 @@
+import { createPinia, setActivePinia } from "pinia";
+import { createApp, nextTick, type App } from "vue";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import HelpGuide from "../src/components/HelpGuide.vue";
+import DetailPane from "../src/components/DetailPane.vue";
+import ComparisonPanel from "../src/components/tabs/ComparisonPanel.vue";
+import { tracingApi } from "../src/api/client";
+import { useProfilerStore } from "../src/stores/profiler";
+import { searchHelp } from "../src/utils/help";
+import { explainDiagnostic } from "../src/utils/diagnostics";
+
+let app: App | undefined;
+let host: HTMLDivElement | undefined;
+afterEach(() => { app?.unmount(); host?.remove(); app = undefined; vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+describe("task-oriented usability contracts", () => {
+  it("interprets supported diagnostics while preserving raw evidence and unknown meanings", () => {
+    const raw = "request request-one metric policy_total_reported_ms: error; excluded from request summary";
+    expect(explainDiagnostic(raw)).toMatchObject({ requestId: "request-one", metric: "policy_total_reported_ms", raw });
+    expect(explainDiagnostic(raw).title).toContain("错误记录");
+    expect(explainDiagnostic(raw).explanation).toContain("不等于业务失败");
+    const unknown = "new analyzer message: request maybe-unrelated";
+    expect(explainDiagnostic(unknown)).toMatchObject({ raw: unknown, requestId: "", metric: "" });
+    expect(explainDiagnostic(unknown).explanation).toContain("尚无专用解释");
+  });
+
+  it("requires an intentional deletion and restores focus on cancel or success", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    const remove = vi.spyOn(tracingApi, "deleteComparison").mockResolvedValue();
+    const pinia = createPinia(); setActivePinia(pinia);
+    const store = useProfilerStore();
+    store.analysisId = "analysis"; store.analysisState = "ready";
+    store.sources = [{ id: "baseline", name: "baseline", version: "v1", kind: "log", modified_at: "", size_bytes: 1, file_count: 1 }];
+    store.selectedBaselineSourceId = "baseline";
+    store.comparisonResult = { id: "result", baseline_source_id: "baseline", baseline_source_version: "v1", candidate_analysis_id: "analysis", statistic: "p95", relative_threshold_percent: 10, absolute_threshold_ms: 1, comparable: true, has_regression: false, metrics: [], flame_diff: [], coverage_warnings: [], count_warnings: [], blocking_reasons: [], histogram: { metric: "", buckets: [] } } as any;
+    store.comparisonResultId = "result"; store.comparisonState = "ready"; store.activeTab = "comparison";
+    host = document.createElement("div"); document.body.appendChild(host);
+    app = createApp(ComparisonPanel).use(pinia); app.mount(host);
+    const button = (text: string) => Array.from(host!.querySelectorAll("button")).find((node) => node.textContent?.trim() === text)!;
+    button("删除此结果").click(); await nextTick(); await nextTick();
+    expect(remove).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(button("取消删除"));
+    button("取消删除").click(); await nextTick(); await nextTick();
+    expect(document.activeElement).toBe(button("删除此结果"));
+    expect(store.comparisonResultId).toBe("result");
+    button("删除此结果").click(); await nextTick();
+    button("确认删除结果").click();
+    await vi.waitFor(() => expect(store.comparisonResult).toBeNull());
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain("已删除缓存比较结果 result");
+    expect(document.activeElement).toBe(host.querySelector(".compare-button"));
+  });
+  it("finds task explanations by technical synonyms without changing analysis filters", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const store = useProfilerStore();
+    store.activeTab = "critical-path";
+    store.searchQuery = "model_call";
+    store.requestId = "request-one";
+    host = document.createElement("div"); document.body.appendChild(host);
+    app = createApp(HelpGuide).use(pinia); app.mount(host);
+    const panel = host.querySelector<HTMLDetailsElement>(".help-guide")!;
+    panel.open = true;
+    panel.dispatchEvent(new Event("toggle"));
+    await nextTick();
+    const input = host.querySelector<HTMLInputElement>("#help-search")!;
+    expect(document.activeElement).toBe(input);
+    input.value = "source_id"; input.dispatchEvent(new Event("input"));
+    await nextTick();
+    expect(host.querySelectorAll(".help-topic")).toHaveLength(1);
+    expect(host.textContent).toContain("从归因片段打开原始证据");
+    expect(store.searchQuery).toBe("model_call");
+    expect(store.requestId).toBe("request-one");
+    expect(searchHelp("P95 样本", "summary").some((topic) => topic.id === "statistics")).toBe(true);
+    expect(searchHelp("no-such-topic", "summary")).toEqual([]);
+    host.querySelector<HTMLButtonElement>('[aria-label="关闭帮助"]')!.click();
+    expect(panel.open).toBe(false);
+    expect(document.activeElement).toBe(panel.querySelector("summary"));
+  });
+
+  it("finishes a narrow-screen filter without clearing it or losing the current request", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    const pinia = createPinia(); setActivePinia(pinia);
+    const store = useProfilerStore();
+    store.activeTab = "timeline"; store.requestId = "request-one";
+    host = document.createElement("div"); document.body.appendChild(host);
+    app = createApp(DetailPane).use(pinia); app.mount(host);
+    const toggle = host.querySelector<HTMLButtonElement>("#view-tools-toggle")!;
+    toggle.click();
+    const input = host.querySelector<HTMLInputElement>("#global-trace-search")!;
+    input.value = "model_call"; input.dispatchEvent(new Event("input"));
+    await nextTick();
+    host.querySelector("form.local-filter")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await nextTick(); await nextTick();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.textContent).toContain("model_call");
+    expect(store.searchQuery).toBe("model_call");
+    expect(store.requestId).toBe("request-one");
+    expect(document.activeElement?.id).toBe("workspace-view-heading");
+  });
+
+  it("does not reopen a cancelled analysis when a completed create response arrives late", async () => {
+    let resolve!: (value: any) => void;
+    const pending = new Promise<any>((done) => { resolve = done; });
+    const create = vi.spyOn(tracingApi, "createAnalysis").mockReturnValue(pending);
+    const readSummary = vi.spyOn(tracingApi, "summary");
+    setActivePinia(createPinia());
+    const store = useProfilerStore();
+    store.sources = [{ id: "source", name: "capture", kind: "log", version: "v1", modified_at: "", size_bytes: 1, file_count: 1 }];
+    store.sourceId = "source";
+    const rejected = store.analyzeSelectedSource().catch((error) => error);
+    store.closeAnalysis();
+    resolve({ id: "job", status: "completed", analysis_id: "stale-analysis" });
+    expect((await rejected).name).toBe("AbortError");
+    expect(create.mock.calls[0][1]?.aborted).toBe(true);
+    expect(store.analysisState).toBe("idle");
+    expect(store.analysisId).toBe("");
+    expect(store.loadJob).toBeNull();
+    expect(readSummary).not.toHaveBeenCalled();
+  });
+});

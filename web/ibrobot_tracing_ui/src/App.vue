@@ -1,47 +1,45 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
-import { useRoute, useRouter } from "vue-router";
 import DetailPane from "./components/DetailPane.vue";
 import ProfilerHeader from "./components/ProfilerHeader.vue";
 import ScopeBar from "./components/ScopeBar.vue";
 import TopologyGraph from "./components/TopologyGraph.vue";
+import AsyncState from "./components/AsyncState.vue";
+import WelcomePanel from "./components/WelcomePanel.vue";
 import { useProfilerStore } from "./stores/profiler";
 import { formatInteger, shortId } from "./utils/format";
-import { buildProfilerQuery, DETAIL_TABS, parseProfilerRoute } from "./utils/routeState";
+import { DETAIL_TABS } from "./utils/routeState";
+import { useProfilerNavigation } from "./useProfilerNavigation";
+import { dismissOutsidePopovers, dismissTopPopover, keepOnePopover } from "./utils/popovers";
 
 const store = useProfilerStore();
-const route = useRoute();
-const router = useRouter();
+const { analyze, recover } = useProfilerNavigation(store);
 const {
   activeTab,
   analysisId,
   analysisState,
+  analysisError,
+  analysisMissing,
+  topologyOpen,
   capabilities,
   summary,
-  sourceId,
   requestId,
   componentId,
-  distributionMetric,
-  metric,
-  graphView,
   spanProfile,
   criticalPath,
   spanAnalysisMode,
   searchQuery,
   selection,
-  selectedBaselineSourceId,
-  comparisonStatistic,
-  comparisonRelativeThreshold,
-  comparisonAbsoluteThresholdMs,
-  comparisonMetric,
   comparisonJob,
   comparisonResult,
 } = storeToRefs(store);
-const topPercent = ref(48);
+const topPercent = ref(35);
 const resizing = ref(false);
 const workspace = ref<HTMLElement | null>(null);
-let routeApplying = false;
+const recoverySource = computed(() => store.sources.find((item) => item.id === store.restoreSourceId));
+const canRecover = computed(() => recoverySource.value && (!store.restoreSourceVersion || recoverySource.value.version === store.restoreSourceVersion));
+let inspectorTrigger: HTMLElement | null = null;
 
 const statusText = computed(() => {
   if (analysisState.value === "loading") return "正在解析追踪";
@@ -50,60 +48,13 @@ const statusText = computed(() => {
   return "等待载入追踪";
 });
 
-async function applyRoute(): Promise<void> {
-  routeApplying = true;
-  const state = parseProfilerRoute(route.query);
-  activeTab.value = state.activeTab;
-  requestId.value = state.requestId;
-  componentId.value = state.componentId;
-  distributionMetric.value = state.distributionMetric;
-  metric.value = state.metric;
-  graphView.value = state.graphView;
-  await store.setSpanAnalysisMode(state.spanAnalysisMode);
-  searchQuery.value = state.searchQuery;
-  selectedBaselineSourceId.value = state.selectedBaselineSourceId;
-  comparisonStatistic.value = state.comparisonStatistic;
-  comparisonRelativeThreshold.value = state.comparisonRelativeThreshold;
-  comparisonAbsoluteThresholdMs.value = state.comparisonAbsoluteThresholdMs;
-  comparisonMetric.value = state.comparisonMetric;
-  const routeAnalysisId = Array.isArray(route.params.analysisId)
-    ? String(route.params.analysisId[0] ?? "")
-    : String(route.params.analysisId ?? "");
-  if (routeAnalysisId && routeAnalysisId !== analysisId.value) await store.openAnalysis(routeAnalysisId);
-  if (routeAnalysisId) await store.fetchTab(activeTab.value);
-  await nextTick();
-  routeApplying = false;
-}
-
-async function syncRoute(): Promise<void> {
-  if (routeApplying) return;
-  const query = buildProfilerQuery({
-    activeTab: activeTab.value,
-    requestId: requestId.value,
-    componentId: componentId.value,
-    distributionMetric: distributionMetric.value,
-    metric: metric.value,
-    graphView: graphView.value,
-    spanAnalysisMode: spanAnalysisMode.value,
-    searchQuery: searchQuery.value,
-    selectedBaselineSourceId: selectedBaselineSourceId.value,
-    comparisonStatistic: comparisonStatistic.value,
-    comparisonRelativeThreshold: comparisonRelativeThreshold.value,
-    comparisonAbsoluteThresholdMs: comparisonAbsoluteThresholdMs.value,
-    comparisonMetric: comparisonMetric.value,
-  });
-  const params = analysisId.value ? { analysisId: analysisId.value } : {};
-  await router.replace({ name: "analysis", params, query });
-}
-
-async function analyze(): Promise<void> {
-  try {
-    const id = await store.analyzeSelectedSource();
-    analysisId.value = id;
-    await syncRoute();
-  } catch (error) {
-    if (!(error instanceof DOMException && error.name === "AbortError")) console.error(error);
-  }
+function chooseSource(): void {
+  store.requestId = "";
+  store.componentId = "";
+  store.searchQuery = "";
+  store.activeTab = "summary";
+  store.closeAnalysis();
+  void nextTick(() => document.querySelector<HTMLElement>(".welcome-panel h1")?.focus());
 }
 
 function beginResize(event: PointerEvent): void {
@@ -115,7 +66,7 @@ function beginResize(event: PointerEvent): void {
 function resize(event: PointerEvent): void {
   if (!resizing.value || !workspace.value) return;
   const bounds = workspace.value.getBoundingClientRect();
-  topPercent.value = Math.min(70, Math.max(30, ((event.clientY - bounds.top) / bounds.height) * 100));
+  topPercent.value = Math.min(65, Math.max(25, ((event.clientY - bounds.top) / bounds.height) * 100));
 }
 
 function endResize(): void {
@@ -127,9 +78,19 @@ function handleKeyboard(event: KeyboardEvent): void {
   const editing = target.matches("input, select, textarea, [contenteditable='true']");
   if (event.key === "/" && !editing) {
     event.preventDefault();
-    document.getElementById("global-trace-search")?.focus();
+    const search = document.getElementById("global-trace-search") ?? document.getElementById("request-id-search");
+    if (search && !search.getClientRects().length) {
+      document.getElementById(search.id === "global-trace-search" ? "view-tools-toggle" : "scope-tools-toggle")?.click();
+    }
+    void nextTick(() => search?.focus());
   } else if (event.key === "Escape") {
+    if (dismissTopPopover()) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (selection.value) store.selection = null;
+    else if (activeTab.value === "requests" && store.requestListFilter) store.requestListFilter = "";
     else if (searchQuery.value) searchQuery.value = "";
   } else if (event.altKey && /^[1-9]$/.test(event.key)) {
     event.preventDefault();
@@ -141,53 +102,69 @@ function handleKeyboard(event: KeyboardEvent): void {
   }
 }
 
-watch(() => route.fullPath, applyRoute, { immediate: true });
-watch([
-  activeTab,
-  analysisId,
-  requestId,
-  componentId,
-  distributionMetric,
-  metric,
-  graphView,
-  spanAnalysisMode,
-  searchQuery,
-  selectedBaselineSourceId,
-  comparisonStatistic,
-  comparisonRelativeThreshold,
-  comparisonAbsoluteThresholdMs,
-  comparisonMetric,
-], syncRoute);
 watch(capabilities, (value) => {
   if (value && !value.baseline_compare && activeTab.value === "comparison") activeTab.value = "summary";
 });
-watch(graphView, () => {
-  if (routeApplying) return;
-  componentId.value = "";
-  if (selection.value?.kind === "component" || selection.value?.kind === "edge") selection.value = null;
+watch(selection, async (value, previous) => {
+  if (value && !previous) inspectorTrigger = document.activeElement as HTMLElement;
+  await nextTick();
+  if (value) {
+    document.getElementById("inspector-heading")?.focus({ preventScroll: true });
+  } else if (!value && previous && document.activeElement === document.body) {
+    (inspectorTrigger?.isConnected ? inspectorTrigger : document.getElementById("request-id-search"))?.focus();
+  }
 });
-watch([metric, graphView, requestId], () => store.refreshTopology());
-watch([requestId, componentId], () => {
-  if (!routeApplying) void store.refreshScopedData();
+watch(analysisState, async (value, previous) => {
+  if (value === "ready" && previous !== "ready") {
+    await nextTick();
+    document.getElementById("workspace-view-heading")?.focus({ preventScroll: true });
+  }
 });
-watch(sourceId, (value) => {
-  if (summary.value && value !== summary.value.analysis.source_id) store.clearCriticalPath();
+watch(topologyOpen, (value) => {
+  try { localStorage.setItem("ibrobot.tracing.topology", String(value)); } catch { /* Optional layout preference. */ }
 });
 
 onMounted(() => {
   store.loadSources();
+  try { topologyOpen.value = localStorage.getItem("ibrobot.tracing.topology") === "true"; } catch { /* Default is collapsed. */ }
   window.addEventListener("keydown", handleKeyboard);
+  document.addEventListener("pointerdown", dismissOutsidePopovers, true);
+  document.addEventListener("toggle", keepOnePopover, true);
 });
-onBeforeUnmount(() => window.removeEventListener("keydown", handleKeyboard));
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", handleKeyboard);
+  document.removeEventListener("pointerdown", dismissOutsidePopovers, true);
+  document.removeEventListener("toggle", keepOnePopover, true);
+});
 </script>
 
 <template>
   <div class="profiler-app" :class="{ resizing }">
-    <ProfilerHeader @analyze="analyze" @refresh="store.refreshSources" />
-    <ScopeBar />
-    <main ref="workspace" class="workspace" :style="{ '--top-pane': `${topPercent}%` }">
-      <TopologyGraph />
+    <ProfilerHeader @change-source="chooseSource" />
+    <ScopeBar v-if="analysisState === 'ready'" />
+    <div v-else aria-hidden="true" />
+    <main ref="workspace" class="workspace" :class="{ 'with-topology': topologyOpen && analysisState === 'ready' }" :style="{ '--top-pane': `${topPercent}%` }">
+      <WelcomePanel v-if="analysisState === 'idle'" @analyze="analyze" />
+      <section v-else-if="analysisState === 'loading'" class="analysis-loading">
+        <AsyncState state="loading" loading-message="正在解析 trace 文件并准备分析…" />
+        <button class="button secondary" type="button" @click="chooseSource">停止等待，返回首页</button>
+        <p>仅停止当前页面等待，后台解析可能继续；稍后可重新打开同一 trace 文件。</p>
+      </section>
+      <section v-else-if="analysisState === 'error'" class="state-view recovery-view" role="alert">
+        <h1>{{ analysisMissing ? "分析结果已过期或不存在" : "暂时无法读取分析" }}</h1>
+        <p>{{ analysisMissing ? "原始 trace 文件可能仍在。重新分析后可继续查看原请求和视图。" : analysisError }}</p>
+        <p v-if="analysisMissing && recoverySource && !canRecover">原始 trace 文件已变化，请选择 trace 文件重新开始，避免混用旧请求。</p>
+        <p v-else-if="analysisMissing && !recoverySource">这个链接没有可恢复的原始 trace 文件，请重新选择。</p>
+        <div class="state-actions">
+          <button v-if="analysisMissing && canRecover" class="button primary" type="button" @click="recover">重新分析原 trace 文件</button>
+          <button v-else-if="!analysisMissing" class="button primary" type="button" @click="store.openAnalysis(analysisId)">重试</button>
+          <button class="button secondary" type="button" @click="chooseSource">选择 trace 文件</button>
+        </div>
+      </section>
+      <template v-else>
+      <TopologyGraph v-if="topologyOpen" />
       <div
+        v-if="topologyOpen"
         class="pane-resizer"
         role="separator"
         aria-label="调整拓扑与详情高度"
@@ -198,10 +175,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", handleKeyboard));
         @pointermove="resize"
         @pointerup="endResize"
         @pointercancel="endResize"
+        @lostpointercapture="endResize"
         @keydown.up.prevent="topPercent = Math.max(30, topPercent - 2)"
         @keydown.down.prevent="topPercent = Math.min(70, topPercent + 2)"
       ><i /></div>
       <DetailPane />
+      </template>
     </main>
     <footer class="status-bar">
       <span class="status-state"><i :class="analysisState" />{{ statusText }}</span>
@@ -212,7 +191,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", handleKeyboard));
       <span v-if="activeTab === 'span-profile' && spanProfile">{{ formatInteger(spanProfile.returned_nodes) }}/{{ formatInteger(spanProfile.total_nodes) }} 个节点<span v-if="spanProfile.truncated">（已截断）</span></span>
       <span v-if="activeTab === 'critical-path' && criticalPath">{{ formatInteger(criticalPath.returned_segments) }}/{{ formatInteger(criticalPath.total_segments) }} 个墙钟分段<span v-if="criticalPath.truncated">（返回前缀）</span></span>
       <span v-if="activeTab === 'comparison' && comparisonJob">比较任务 {{ comparisonJob.status }}</span>
-      <span v-if="activeTab === 'comparison' && comparisonResult">{{ comparisonResult.comparable ? "可比较" : "不可比较" }} · {{ comparisonResult.has_regression ? "发现回归" : "未发现回归" }}</span>
+      <span v-if="activeTab === 'comparison' && comparisonResult">{{ comparisonResult.comparable ? "可计算差值" : "数据不足" }} · {{ comparisonResult.has_regression ? "有指标超阈值" : "未超阈值" }}</span>
       <span v-if="capabilities?.authentication === 'none'" class="security-warning">局域网无认证模式</span>
       <span class="status-spacer" />
       <span class="keyboard-hint">/ 过滤 · Esc 关闭检查器 · Alt+1…9 切换视图</span>

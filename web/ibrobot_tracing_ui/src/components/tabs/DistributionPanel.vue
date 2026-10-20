@@ -36,15 +36,25 @@ const stats = computed(() => {
   const response = distribution.value;
   if (!response) return [];
   return [
-    { label: "min", value: formatDuration(response.summary.minimum) },
-    { label: "p50", value: formatDuration(response.summary.p50) },
-    { label: "p95", value: formatDuration(response.summary.p95) },
-    { label: "p99", value: formatDuration(response.summary.p99) },
-    { label: "max", value: formatDuration(response.summary.maximum) },
-    { label: "mean", value: formatDuration(response.summary.mean) },
-    { label: "样本", value: formatInteger(response.sample_count) },
-    { label: "无效", value: formatInteger(response.invalid_count) },
-    { label: "桶", value: formatInteger(response.bin_count) },
+    { label: "有效样本", value: formatInteger(response.sample_count) },
+    { label: "中位 P50", value: formatDuration(response.summary.p50) },
+    { label: "高位 P95", value: formatDuration(response.summary.p95) },
+    { label: "最大耗时", value: formatDuration(response.summary.maximum) },
+  ];
+});
+const extraStats = computed(() => {
+  const response = distribution.value;
+  if (!response) return [];
+  return [
+    { title: "其他耗时统计", items: [
+      { label: "最小耗时", value: formatDuration(response.summary.minimum) },
+      { label: "高位 P99", value: formatDuration(response.summary.p99) },
+      { label: "均值", value: formatDuration(response.summary.mean) },
+    ] },
+    { title: "数据与分桶", items: [
+      { label: "无效样本", value: formatInteger(response.invalid_count) },
+      { label: "分桶数量", value: formatInteger(response.bin_count) },
+    ] },
   ];
 });
 
@@ -128,6 +138,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
     </header>
 
     <AsyncState
+      context="延迟分布"
       class="distribution-async"
       :state="tabState.distribution"
       :error="tabError.distribution"
@@ -138,9 +149,13 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
       @retry="analysisId && store.fetchTab('distribution', true)"
     >
       <div v-if="distribution" class="distribution-scroll">
-        <div class="distribution-stat-strip" aria-label="分布统计">
+        <div class="distribution-stat-strip" role="group" aria-label="分布统计">
           <dl v-for="stat in stats" :key="stat.label"><dt>{{ stat.label }}</dt><dd>{{ stat.value }}</dd></dl>
         </div>
+        <details class="distribution-extra-stats">
+          <summary>其他耗时统计与分桶信息<span v-if="distribution.invalid_count"> · {{ distribution.invalid_count }} 个无效样本</span></summary>
+          <div class="measurement-groups"><section v-for="group in extraStats" :key="group.title"><h2>{{ group.title }}</h2><dl><div v-for="item in group.items" :key="item.label"><dt>{{ item.label }}</dt><dd>{{ item.value }}</dd></div></dl></section></div>
+        </details>
 
         <section class="distribution-chart-section" aria-labelledby="distribution-chart-title">
           <header>
@@ -151,7 +166,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
             <svg
               class="distribution-chart"
               :viewBox="`0 0 ${chartWidth} ${plotHeight + 34}`"
-              role="img"
+              role="group"
               :aria-label="`${stageLabel(distribution.metric || '')}延迟直方图，共${distribution.sample_count}个样本`"
             >
               <line class="distribution-axis" :x1="plotInset" :x2="chartWidth - plotInset" :y1="plotHeight" :y2="plotHeight" />
@@ -225,8 +240,8 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
                     <td><code :title="id">{{ shortId(id, 24) }}</code></td>
                     <td class="request-actions">
                       <button type="button" class="text-button" :aria-label="`在时间线打开请求 ${id}`" @click="openRequest(id, 'timeline')">时间线</button>
-                      <button type="button" class="text-button" :aria-label="`在 Span 分析打开请求 ${id}`" @click="openRequest(id, 'span-profile')">Span 分析</button>
-                      <button type="button" class="text-button" :aria-label="`在关键路径打开请求 ${id}`" @click="openRequest(id, 'critical-path')">关键路径</button>
+                      <button type="button" class="text-button" :aria-label="`在调用层级打开请求 ${id}`" @click="openRequest(id, 'span-profile')">调用层级</button>
+                      <button type="button" class="text-button" :aria-label="`在耗时拆分打开请求 ${id}`" @click="openRequest(id, 'critical-path')">耗时拆分</button>
                     </td>
                   </tr>
                 </tbody>
@@ -248,8 +263,8 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
                     <td><span class="tail-classification" :class="{ tail: outlier.p95_tail }">P{{ outlier.percentile.toFixed(2) }} · {{ outlier.p95_tail ? "P95 尾部" : "非 P95 尾部" }}</span></td>
                     <td class="request-actions">
                       <button type="button" class="text-button" :aria-label="`在时间线打开请求 ${outlier.request_id}`" @click="openRequest(outlier.request_id, 'timeline')">时间线</button>
-                      <button type="button" class="text-button" :aria-label="`在 Span 分析打开请求 ${outlier.request_id}`" @click="openRequest(outlier.request_id, 'span-profile')">Span 分析</button>
-                      <button type="button" class="text-button" :aria-label="`在关键路径打开请求 ${outlier.request_id}`" @click="openRequest(outlier.request_id, 'critical-path')">关键路径</button>
+                      <button type="button" class="text-button" :aria-label="`在调用层级打开请求 ${outlier.request_id}`" @click="openRequest(outlier.request_id, 'span-profile')">调用层级</button>
+                      <button type="button" class="text-button" :aria-label="`在耗时拆分打开请求 ${outlier.request_id}`" @click="openRequest(outlier.request_id, 'critical-path')">耗时拆分</button>
                     </td>
                   </tr>
                 </tbody>

@@ -83,6 +83,23 @@ def test_catalog_rejects_a_symlinked_root(tmp_path):
         SourceCatalog((linked_root,))
 
 
+def test_merged_file_uses_regular_file_snapshot_and_rejects_symlinks(tmp_path):
+    path = tmp_path / "run.ibtrace"
+    path.write_text("original archive\n")
+    (tmp_path / "linked.ibtrace").symlink_to(path)
+    catalog = SourceCatalog((tmp_path,))
+    result = catalog.refresh()
+    assert len(result.sources) == 1
+    source = result.sources[0]
+    assert source.kind == "merged"
+    assert any("Symbolic links" in warning for warning in result.warnings)
+    with catalog.source_snapshot(source) as snapshot:
+        assert snapshot.read_text() == "original archive\n"
+    path.write_text("changed archive\n")
+    with pytest.raises(SourceChangedError):
+        catalog.validate(source)
+
+
 def test_catalog_reports_missing_root_without_exposing_it(tmp_path):
     root = tmp_path / "missing"
     snapshot = SourceCatalog((root,)).refresh()

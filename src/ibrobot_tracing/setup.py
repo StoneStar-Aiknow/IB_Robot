@@ -12,6 +12,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
+        ("share/" + package_name + "/docs", glob("docs/*.md")),
     ],
     install_requires=["setuptools", "PyYAML"],
     extras_require={"test": ["pytest"]},
@@ -24,6 +25,8 @@ setup(
     entry_points={
         "console_scripts": [
             "ibrobot-trace = ibrobot_tracing.cli:main",
+            "ibrobot-clock = ibrobot_tracing.clock_capture:main",
+            "ibrobot-rtp-metrics = ibrobot_tracing.rtp_metrics:main",
         ],
     },
 )

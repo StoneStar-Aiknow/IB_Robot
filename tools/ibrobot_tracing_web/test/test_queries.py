@@ -37,6 +37,23 @@ def _span(
     )
 
 
+def test_occurrence_identity_survives_pagination_filtering_and_critical_path():
+    from ibrobot_tracing.critical_path import CriticalPathQuery, project_critical_path
+
+    spans = [_span("same", "reused-id", 100 + index * 100, 150 + index * 100) for index in range(120)]
+    queries = ResultQueries(AnalysisResult(TraceDataset(), spans=spans))
+    first = queries.query_spans(request_id="request", limit=100)["items"]
+    second = queries.query_spans(request_id="request", offset=100, limit=100)["items"]
+    assert len({item["id"] for item in first + second}) == 120
+    assert len({item["base_id"] for item in first + second}) == 1
+    assert second[0]["id"].endswith(":101")
+    filtered = queries.query_spans(request_id="request", start_ns=10100)["items"]
+    assert filtered[0]["id"] == second[0]["id"]
+    path = project_critical_path(queries.result, CriticalPathQuery("request"))
+    ids = {item["id"] for item in first + second}
+    assert all(segment.source_id in ids for segment in path.segments if segment.kind == "span")
+
+
 def test_current_query_and_projection_apis_are_used_with_js_safe_records():
     result = AnalysisService().analyze_dataset(
         TraceDataset(

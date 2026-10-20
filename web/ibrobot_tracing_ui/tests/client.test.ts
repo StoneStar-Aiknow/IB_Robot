@@ -5,6 +5,14 @@ import type { ComparisonJob, LoadJob } from "../src/api/types";
 afterEach(() => vi.restoreAllMocks());
 
 describe("追踪接口客户端", () => {
+  it("encodes exact request lookup and bounded raw pagination", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ items: [], total: 0 })));
+    vi.stubGlobal("fetch", fetchMock);
+    await tracingApi.requests("analysis/1", undefined, { requestId: "id / x", offset: 100, descending: false, sortBy: "inference_ms" });
+    await tracingApi.events("analysis/1", { offset: 200, name: "event / name", requestId: "id" });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/analyses/analysis%2F1/requests?offset=100&limit=100&sort_by=inference_ms&descending=false&request_id=id+%2F+x");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/analyses/analysis%2F1/events?request_id=id&offset=200&limit=100&event_name=event+%2F+name");
+  });
   it("对服务端错误生成带状态码的异常", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ message: "追踪不存在" }), { status: 404 })));
     await expect(tracingApi.summary("missing")).rejects.toEqual(expect.objectContaining({ status: 404, message: "追踪不存在" }));

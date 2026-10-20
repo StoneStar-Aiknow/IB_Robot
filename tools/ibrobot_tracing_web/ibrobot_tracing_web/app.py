@@ -355,7 +355,7 @@ def create_app(
             tls_enabled=config.tls_enabled,
             cors_enabled=bool(config.cors_origins),
             baseline_compare=True,
-            source_kinds=["ctf", "log"],
+            source_kinds=["ctf", "log", "merged"],
             analysis_views=[
                 "summary",
                 "distribution",

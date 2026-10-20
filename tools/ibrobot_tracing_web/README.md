@@ -52,6 +52,19 @@ mkdir -p ~/.ros/tracing
 scp -r root@<openeuler-board>:/root/.ros/tracing/<session> ~/.ros/tracing/
 ```
 
+### 1.4 查看校准合并后的 Trace
+
+Web 同时支持 CTF 目录、原始 log 和通用 `.ibtrace` 合并文件。先按
+[合并流程](../../src/ibrobot_tracing/docs/trace_merge.md) 使用各主机同期时钟校准合并，再将输出
+放入 Web 配置的 `--trace-root`，扫描并载入分析即可。文件沿用目录扫描、路径/符号链接限制和
+内容快照检查；解析仍由 `ibrobot_tracing` 的通用 merged reader 完成。
+
+Events、Spans、Flows API 保留主机/boot/进程来源、原始单调时间与时钟映射/误差信息，
+大整数沿用既有 JS-safe 序列化。Timeline、Flow 和 critical path 使用原有分析能力。
+本支持不依赖 LIBERO、客户 t1/t2/t3 命名或任何诊断 patch，也不生成派生 trace。
+未能校准的事件保留在原合并文件中，summary 显示 coverage/rejection 信息；详细查看仍可使用
+`ibrobot-trace events run.ibtrace --uncalibrated`。
+
 ## 2. 构建 Web UI
 
 Ubuntu 构建需要 Node.js 18 或更高版本。`setup.sh` 不安装 Node.js；请先确认系统已有

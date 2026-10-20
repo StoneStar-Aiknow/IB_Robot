@@ -78,7 +78,7 @@ describe("non-intrusive analysis panels", () => {
     expect(Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "重试")).toBe(false);
 
     const navigate = vi.spyOn(store, "navigateToRequest").mockResolvedValue();
-    const button = host.querySelector('[id="grid-row-retry"] button[aria-label*="Span 分析"]') as HTMLButtonElement;
+    const button = host.querySelector('[id="grid-row-retry"] button[aria-label*="调用层级"]') as HTMLButtonElement;
     button.click();
     await nextTick();
     expect(navigate).toHaveBeenCalledWith("retry", "span-profile");
@@ -109,7 +109,7 @@ describe("non-intrusive analysis panels", () => {
     expect(host.querySelectorAll("tr[id]")).toHaveLength(50);
     const fetch = vi.spyOn(store, "fetchTab").mockResolvedValue();
     store.componentId = "old-scope";
-    const more = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "更多见Span分析");
+    const more = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "查看全部调用聚合");
     more!.click();
     await vi.waitFor(() => expect(store.activeTab).toBe("span-profile"));
     expect(store.spanAnalysisMode).toBe("aggregate");
@@ -133,7 +133,9 @@ describe("non-intrusive analysis panels", () => {
       blocking_reasons: comparable ? [] : ["required metric preprocess_ms is missing from the candidate"],
     } satisfies ComparisonResult;
     mount(ComparisonPanel);
-    expect(host.textContent).toContain("comparable 仅表示所选指标数据足够进行比较，不等同于业务成功或可用性");
+    expect(host.textContent).toContain("可比较仅表示样本足以计算差值，不代表实验条件一致");
+    expect(host.textContent).toContain("也不据此判断业务成功");
+    expect(host.textContent).not.toContain("发现性能回归");
     expect(host.textContent).toContain(comparable ? "所选指标数据足够比较" : "所选指标数据不足以比较");
     expect(host.textContent).not.toContain("比较被阻止");
     expect(host.textContent).not.toContain("业务不可用");
