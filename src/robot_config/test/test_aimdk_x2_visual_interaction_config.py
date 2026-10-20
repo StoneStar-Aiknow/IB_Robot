@@ -80,30 +80,31 @@ class TestObservationOnly:
         for name in ("teleop", "base_navigation"):
             assert config["control_modes"][name]["executor"]["enabled"] is False, name
 
-    def test_the_launch_builder_accepts_this_config(self, config):
-        """The gate that would refuse a motion producer must pass on the real file."""
+    def test_the_launch_builder_accepts_this_config(self, config, profile):
+        """The gate that would refuse a motion producer must pass on the real file.
+
+        The description is built from the real runtime profile and placed where
+        ``interface_binding`` puts it, ``runtime.interface_description``, so
+        this also covers the camera actually being declared there.
+        """
+        import copy
+
         from visual_interaction.launch_builders.visual_interaction import (
             generate_visual_interaction_nodes,
         )
 
-        # The description is bound at launch; supply the camera the config names.
-        bound = dict(config)
         interface = config["visual_interaction"]["frame_source"]["interface"]
-        bound["runtime_interface_description"] = {
+        bound = copy.deepcopy(config)
+        bound["runtime"]["interface_description"] = {
             "robot": {
                 "id": "x2",
-                "type": "x2_ultra_omnihand",
-                "runtime_name": "aimdk",
-                "runtime_version": "1",
+                "type": profile["runtime"]["type"],
+                "runtime_name": profile["runtime"]["name"],
+                "runtime_version": profile["runtime"]["version"],
             },
-            "interfaces": {
-                interface: {
-                    "kind": "topic",
-                    "direction": "publish",
-                    "message_type": "sensor_msgs/msg/CompressedImage",
-                    "endpoint": "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed",
-                }
-            },
+            # Straight from the profile: an interface the robot does not
+            # publish cannot make this test pass.
+            "interfaces": {interface: profile["interfaces"][interface]},
         }
 
         assert len(generate_visual_interaction_nodes(bound)) == 1

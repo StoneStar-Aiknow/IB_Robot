@@ -36,6 +36,7 @@ from embodied_common.visual_interaction_contract import (
     DEFAULT_MAX_EVIDENCE_AGE_SEC,
     DEFAULT_MAX_SESSION_SEC,
     DEFAULT_MIN_GAP_SEC,
+    KIND_UNCERTAIN,
     PARTIAL_COVERED,
     SPEAKABLE_KINDS,
     SUPPRESS_AMBIGUOUS,
@@ -44,6 +45,7 @@ from embodied_common.visual_interaction_contract import (
     SUPPRESS_MUTED,
     SUPPRESS_NO_NEW_TOPIC,
     SUPPRESS_STALE,
+    SUPPRESS_WAITING_NEXT_VISITOR,
     SUPPRESSED,
 )
 from visual_interaction.session.hooks import RoundInputs, SessionHooks
@@ -55,6 +57,7 @@ from visual_interaction.session.semantics import (
 )
 from visual_interaction.session.topics import TopicKey, TopicLedger
 from visual_interaction.session.validity import (
+    END_ABSENT,
     END_HANDOVER,
     ActorTracker,
     Candidate,
@@ -83,6 +86,13 @@ class RoundResult:
     confirmations: int = 0
     model_called: bool = False
     evidence_stamp: float = 0.0
+    # Counts display episodes of this topic, for tracing and cancellation only;
+    # coverage outranks it. Zero on a round that produced no candidate.
+    episode_seq: int = 0
+    # The latest moment speaking may START, derived from the evidence age and
+    # the configured budget. Not a deadline for finishing playback, and zero
+    # when there is nothing to say.
+    latest_start_at: float = 0.0
 
     @property
     def quiet(self) -> bool:
@@ -130,6 +140,7 @@ class VisualInteractionSession:
     _episode_seq: int = field(default=0, init=False)
     _quiet_until: float = field(default=0.0, init=False)
     _muted: bool = field(default=False, init=False)
+    _awaiting_handover: bool = field(default=False, init=False)
     _last_window_stamp: float | None = field(default=None, init=False)
 
     # -- lifecycle --------------------------------------------------------
@@ -165,6 +176,7 @@ class VisualInteractionSession:
         )
         self._ledger = TopicLedger(confirmation_count=self.config.confirmation_count)
         self._last_window_stamp = None
+        self._awaiting_handover = False
         # The quiet gap and the mute survive: both are about the robot's own
         # behaviour, not about who is standing there.
         return self._window.session_id
@@ -200,10 +212,21 @@ class VisualInteractionSession:
 
         window.observe(present=inputs.actor.present, known=inputs.actor.known, now=inputs.now)
         expiry = window.expired_reason(inputs.now)
-        if expiry:
+        if expiry == END_ABSENT:
+            # Nobody is there to inherit the covered topics, so a new range may
+            # start on its own.
             self.start_session(now=inputs.now, reason=expiry)
             window = self._window
             assert window is not None
+        elif expiry:
+            # The duration limit is a missed-hand-over signal, not a reset:
+            # clearing coverage while the same visitor is still standing there
+            # would say the same things to them again every two minutes.
+            # ``next_visitor`` is how an attendant ends it.
+            self._awaiting_handover = True
+            return self._finish(inputs, SUPPRESS_WAITING_NEXT_VISITOR)
+        if self._awaiting_handover:
+            return self._finish(inputs, SUPPRESS_WAITING_NEXT_VISITOR)
 
         association = self.tracker.update(
             present=inputs.actor.present,
@@ -218,9 +241,9 @@ class VisualInteractionSession:
             self.ledger().break_all_chains()
 
         if association.ambiguous:
-            return self._finish(inputs, SUPPRESS_AMBIGUOUS)
+            return self._break_and_finish(inputs, SUPPRESS_AMBIGUOUS)
         if not association.associated:
-            return self._finish(inputs, SUPPRESS_STALE)
+            return self._break_and_finish(inputs, SUPPRESS_STALE)
 
         if self._muted:
             return self._finish(inputs, SUPPRESS_MUTED)
@@ -232,14 +255,19 @@ class VisualInteractionSession:
 
         raw = self.hooks.vision.observe(inputs)
         if raw is None:
-            return self._finish(inputs, SUPPRESS_MODEL_NOT_READY, model_called=True)
+            return self._break_and_finish(inputs, SUPPRESS_MODEL_NOT_READY, model_called=True)
 
         try:
             observation = parse_observation(raw, categories=self.config.categories)
         except SemanticsError as error:
-            return self._finish(inputs, error.reason, model_called=True)
+            return self._break_and_finish(inputs, error.reason, model_called=True)
 
         if observation.kind not in SPEAKABLE_KINDS:
+            if observation.kind == KIND_UNCERTAIN:
+                # Cannot see it well enough is a break in the evidence, not a
+                # gap to bridge: otherwise an occlusion lets an old look and a
+                # new one add up to a confirmation.
+                self.ledger().break_all_chains()
             return self._finish(inputs, quiet_reason(observation.kind), model_called=True, observation=observation)
 
         key = TopicKey.of(observation.category, observation.region)
@@ -276,15 +304,18 @@ class VisualInteractionSession:
             text=observation.reply,
         )
 
-        # Checked again here, not only when the model finished: the words are
-        # about to be heard, and that is the moment the picture's age matters.
+        # Asked again rather than reusing the round's start: generation takes
+        # time, and the age that decides this is the age when the words would
+        # be heard. A fake model returns instantly, which is precisely why the
+        # clock is a port and not a captured value.
+        now = self.hooks.clock.now(inputs)
         reason = candidate_validity(
             candidate,
             session_id=self.session_id,
             actor_epoch=self.actor_epoch,
             target_present=inputs.actor.present,
             topic_blocked=False,
-            now=inputs.now,
+            now=now,
             max_age_sec=self.config.max_evidence_age_sec,
         )
         if reason:
@@ -299,7 +330,7 @@ class VisualInteractionSession:
 
         ledger = self.ledger()
         ledger.reserve(key)
-        delivery = self.hooks.speech.deliver(observation.reply, event_id=event_id, now=inputs.now)
+        delivery = self.hooks.speech.deliver(observation.reply, event_id=event_id, now=now)
 
         if not delivery.accepted:
             # Nothing could have been heard, so the topic goes back to unspoken
@@ -332,6 +363,8 @@ class VisualInteractionSession:
             confirmations=confirmations,
             model_called=True,
             evidence_stamp=inputs.window.newest_stamp,
+            episode_seq=self._episode_seq,
+            latest_start_at=inputs.window.newest_stamp + self.config.max_evidence_age_sec,
         )
         self._notify(inputs, "")
         return result
@@ -351,6 +384,17 @@ class VisualInteractionSession:
             self.ledger().release(topic, "")
 
     # -- helpers ----------------------------------------------------------
+
+    def _break_and_finish(self, inputs: RoundInputs, reason: str, **kwargs) -> RoundResult:
+        """End the round and drop every confirmation chain.
+
+        For a round that saw nothing it can vouch for: an ambiguous target, a
+        lost one, an unreachable model, an unreadable answer. Keeping the
+        chains would let a look from before the break and one from after add
+        up to "confirmed twice", which is not what two windows agreeing means.
+        """
+        self.ledger().break_all_chains()
+        return self._finish(inputs, reason, **kwargs)
 
     def _finish(
         self,

@@ -272,14 +272,13 @@ class TestReplyContent:
         assert error.value.reason == SUPPRESS_PRIVACY
 
     def test_a_reply_that_drifted_off_the_confirmed_category_is_refused(self):
-        """The positive check: it fails closed on a drift with no matching pattern.
+        """The grounding check: it fails closed on a drift with no pattern.
 
-        Nothing in the sentence is sensitive on its own, and no out-of-range
-        pattern matches it — it simply stopped being about the toy the closed
-        fields settled.
+        Built entirely from allowed words and still not about the toy the
+        closed fields settled, so the vocabulary check cannot catch it.
         """
         with pytest.raises(SemanticsError) as error:
-            parse_observation(answer(category="toy", reply="今天天气真不错呀。"))
+            parse_observation(answer(category="toy", reply="你戴的帽子很特别。"))
 
         assert error.value.reason == SUPPRESS_PRIVACY
         assert "toy" in error.value.detail
@@ -297,11 +296,83 @@ class TestReplyContent:
         assert parse_observation(answer(category=category, reply=reply)).reply == reply
 
     def test_check_reply_skips_grounding_when_no_category_is_given(self):
-        """Callers that have no confirmed subject still get the other checks."""
-        assert check_reply("今天天气真不错呀。") == "今天天气真不错呀。"
+        """Callers with no confirmed subject still get every other check."""
+        assert check_reply("这个玩偶真可爱呀。") == "这个玩偶真可爱呀。"
 
         with pytest.raises(SemanticsError):
             check_reply("你看起来很开心呀。")
+
+
+class TestVocabularyWhitelist:
+    """The load-bearing content check: a reply may only use allowed words.
+
+    Each case below names its category, misses every out-of-range pattern, and
+    publishes something the first version promised never to say. They are why
+    the boundary is a whitelist: a blacklist fixes the three somebody thought
+    of and leaves the fourth.
+    """
+
+    @pytest.mark.parametrize(
+        ("category", "reply", "what"),
+        [
+            ("sign", "你举着的牌子写了电话号码13800138000。", "personal data"),
+            ("toy", "你举起的玩偶旁边有助听器。", "a medical device"),
+            ("badge", "你戴的徽章上有十字架。", "a religious symbol"),
+            ("toy", "你举起的玩偶是进口的吧。", "provenance"),
+            ("hat", "你戴的帽子是名牌货。", "a brand claim"),
+        ],
+    )
+    def test_a_reply_outside_the_vocabulary_is_refused(self, category, reply, what):
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(category=category, reply=reply))
+
+        assert error.value.reason == SUPPRESS_PRIVACY, what
+
+    @pytest.mark.parametrize("reply", ["你举起的玩偶编号是7。", "你举着的牌子上有abc。"])
+    def test_digits_and_latin_letters_are_refused(self, reply):
+        """How a phone number, a plate or a brand reaches a reply."""
+        with pytest.raises(SemanticsError, match="digits or Latin letters"):
+            parse_observation(answer(category="toy", reply=reply))
+
+    @pytest.mark.parametrize(
+        ("category", "reply"),
+        [
+            ("toy", "你举起的玩偶真有意思。"),
+            ("toy", "这个玩偶真可爱呀。"),
+            ("sign", "你举着的牌子我看到了。"),
+            ("hat", "你戴的帽子很特别。"),
+            ("badge", "你别着的徽章真好看。"),
+            ("badge", "你的徽章很漂亮。"),
+        ],
+    )
+    def test_an_ordinary_remark_still_passes(self, category, reply):
+        """The whitelist must leave the sentences this feature exists to say."""
+        assert parse_observation(answer(category=category, reply=reply)).reply == reply
+
+    def test_praise_aimed_at_the_person_is_still_refused(self):
+        """ "你真好看" is out of range; "你的徽章真好看" is the point."""
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(reply="你真好看呀，玩偶也可爱。"))
+
+        assert error.value.reason == SUPPRESS_PRIVACY
+
+    def test_the_refusal_names_the_offending_characters(self):
+        """So a widening decision can be made with the actual word in view."""
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(reply="你举起的玩偶旁边有助听器。"))
+
+        assert "助" in error.value.detail
+
+
+class TestNoQuestions:
+    @pytest.mark.parametrize("reply", ["你举起的玩偶是什么牌子的？", "这个玩偶真可爱吧?"])
+    def test_a_question_is_refused(self, reply):
+        """Asking invites an answer nothing in the first version can hear."""
+        with pytest.raises(SemanticsError, match="asks a question"):
+            parse_observation(answer(reply=reply))
+
+    def test_a_statement_ending_in_ba_is_not_a_question(self):
+        assert parse_observation(answer(reply="这个玩偶真可爱呀。")).reply
 
 
 class TestNormalisation:

@@ -50,6 +50,10 @@ from visual_interaction.session.hooks import ActorSignal, RoundInputs, SessionHo
 # Declared names and their types. Launch may pass no other name and no other
 # type: rclpy drops an override it has no declaration for without a warning,
 # and refuses one of the wrong type at startup.
+# Frames kept at most, whatever the camera stamps say. 300 is ten seconds of
+# a 30 Hz stream, comfortably more than any configured window.
+DEFAULT_MAX_BUFFERED_FRAMES = 300
+
 PARAMETERS: dict[str, object] = {
     "runtime_description_json": "",
     "camera_interface": CAMERA_COMPRESSED,
@@ -60,6 +64,8 @@ PARAMETERS: dict[str, object] = {
     "frames_per_window": 4,
     "buffer_sec": 6.0,
     "stale_stream_sec": 2.0,
+    "stale_actor_sec": 2.0,
+    "max_buffered_frames": 300,
     "confirmation_count": DEFAULT_CONFIRMATION_COUNT,
     "max_evidence_age_sec": DEFAULT_MAX_EVIDENCE_AGE_SEC,
     "min_gap_sec": DEFAULT_MIN_GAP_SEC,
@@ -79,14 +85,23 @@ class FrameBuffer:
     Liveness is judged separately, by arrival, where no agreement is needed.
     """
 
-    def __init__(self, buffer_sec: float) -> None:
+    def __init__(self, buffer_sec: float, max_frames: int = DEFAULT_MAX_BUFFERED_FRAMES) -> None:
         self._buffer_sec = float(buffer_sec)
-        self._items: deque[tuple[float, float, bytes]] = deque()
+        if max_frames < 1:
+            raise ValueError("max_frames must be at least 1")
+        # A hard cap as well as the time window. Eviction by camera stamp alone
+        # evicts nothing when the stamp stops advancing — a frozen or
+        # always-zero clock then grows this without bound in a resident
+        # process. The cap is what makes the memory bounded by the stream rate
+        # rather than by the robot's clock behaving.
+        self._items: deque[tuple[float, float, bytes]] = deque(maxlen=max_frames)
         self._lock = threading.Lock()
         self.total = 0
 
     def put(self, stamp: float, received_at: float, data: bytes) -> None:
         with self._lock:
+            # deque(maxlen=...) drops the oldest once full, so the cap needs no
+            # explicit check here.
             self._items.append((stamp, received_at, data))
             self.total += 1
             while self._items and self._items[0][0] < stamp - self._buffer_sec:
@@ -135,7 +150,8 @@ class VisualInteractionNode(Node):
         self._window_sec = float(self._value("window_sec"))
         self._frames = max(1, int(self._value("frames_per_window")))
         self._stale_stream_sec = float(self._value("stale_stream_sec"))
-        self._buffer = FrameBuffer(float(self._value("buffer_sec")))
+        self._stale_actor_sec = float(self._value("stale_actor_sec"))
+        self._buffer = FrameBuffer(float(self._value("buffer_sec")), int(self._value("max_buffered_frames")))
 
         self._session = VisualInteractionSession(
             hooks=session_hooks,
@@ -150,6 +166,7 @@ class VisualInteractionNode(Node):
         )
 
         self._actor = ActorSignal(present=False, known=False, bbox=None, stamp=0.0)
+        self._actor_received_at: float | None = None
         self._counts: dict[str, int] = {}
         self._rounds = 0
 
@@ -228,7 +245,12 @@ class VisualInteractionNode(Node):
             known=known,
             bbox=bbox,
             stamp=message.header.stamp.sec + message.header.stamp.nanosec * 1e-9,
+            # ActorState describes one actor, so a second box is not available
+            # on this wire. The ambiguity check therefore cannot fire from this
+            # input, and the node says so rather than implying it is covered.
+            others=(),
         )
+        self._actor_received_at = self._now()
 
     def _on_round(self) -> None:
         window = self._buffer.window(self._window_sec, self._frames)
@@ -241,7 +263,15 @@ class VisualInteractionNode(Node):
             self._count(SUPPRESS_MODEL_NOT_READY)
             return
 
-        result = self._session.step(RoundInputs(window=window, actor=self._actor, now=now))
+        # The actor state has its own liveness. Holding the last message
+        # forever would keep answering a visitor who left, because the tracker
+        # only ever sees the same stamp and so never times the gap out. Its age
+        # is measured by arrival, for the same reason the stream's is.
+        actor = self._actor
+        if self._actor_received_at is None or now - self._actor_received_at > self._stale_actor_sec:
+            actor = ActorSignal(present=False, known=False, bbox=None, stamp=now)
+
+        result = self._session.step(RoundInputs(window=window, actor=actor, now=now))
         self._rounds += 1
         self._count(result.reason or "spoken")
         self._publish(result, window)
@@ -250,16 +280,23 @@ class VisualInteractionNode(Node):
 
     def _publish(self, result, window: Window) -> None:
         message = VisualInteractionUtterance()
-        message.header.stamp = self.get_clock().now().to_msg()
+        # The evidence clock, as the message says: the observation time of the
+        # newest frame the decision rests on. Publishing the current time here
+        # would present an old picture as a fresh one to every consumer.
+        message.header.stamp = _as_time(window.newest_stamp)
+        message.evidence_start_stamp = _as_time(window.oldest_stamp)
         message.session_id = result.session_id
         message.actor_epoch = max(0, int(result.actor_epoch))
         message.event_id = result.event_id
+        message.episode_seq = max(0, int(result.episode_seq))
         message.text = result.text
         message.kind = result.observation.kind if result.observation else ""
         message.category = result.observation.category if result.observation else ""
         message.region = result.observation.region if result.observation else ""
         message.suppress_reason = result.reason
-        message.evidence_start_stamp = _as_time(window.oldest_stamp)
+        # Zero when there is nothing to say, which the message defines as "no
+        # deadline" rather than "start immediately".
+        message.latest_start_at = _as_time(result.latest_start_at) if result.spoken else _as_time(0.0)
         self._utterances.publish(message)
 
     def _publish_status(self) -> None:

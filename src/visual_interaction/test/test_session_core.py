@@ -17,6 +17,7 @@ from embodied_common.visual_interaction_contract import (
     SUPPRESS_STALE,
     SUPPRESS_UNCERTAIN,
     SUPPRESS_UNCONFIRMED,
+    SUPPRESS_WAITING_NEXT_VISITOR,
     SUPPRESSED,
 )
 from visual_interaction.session.core import SessionConfig, VisualInteractionSession
@@ -401,14 +402,21 @@ class TestSessionBoundaries:
 
         assert sess.session_id == first
 
-    def test_the_duration_limit_resets_a_busy_stand(self):
+    def test_the_duration_limit_pauses_a_busy_stand(self):
+        """It is a missed-hand-over signal, not a reset.
+
+        An earlier revision asserted the opposite — that the limit started a
+        new session by itself — which repeated every remark to the same
+        visitor on a timer. See TestMaxDurationWaitsForAHandOver.
+        """
         sess = session(vision=ScriptedVision.of(answer("toy")), max_session_sec=60.0)
         sess.step(inputs(now=10.0))
         first = sess.session_id
 
-        sess.step(inputs(now=75.0))
+        result = sess.step(inputs(now=75.0))
 
-        assert sess.session_id != first
+        assert sess.session_id == first
+        assert result.reason == SUPPRESS_WAITING_NEXT_VISITOR
 
     def test_a_mute_survives_a_new_session(self):
         """It is about the robot's behaviour, not about who is standing there."""
@@ -499,3 +507,163 @@ class TestWindow:
         assert window.oldest_stamp == 1.0
         assert window.newest_stamp == 3.0
         assert window.span == 2.0
+
+
+class TestConfirmationChainBreaks:
+    """A round that saw nothing it can vouch for must not bridge two looks.
+
+    Review finding: "seen twice at some point" was passing for "confirmed by
+    two windows", so an occlusion or a model fault let an old look and a new
+    one add up.
+    """
+
+    def test_uncertain_breaks_the_chain(self):
+        vision = ScriptedVision.of(answer("toy"), {"kind": KIND_UNCERTAIN}, answer("toy"))
+        sess = session(vision=vision, min_gap_sec=0.0)
+
+        first = sess.step(inputs(now=10.0))
+        middle = sess.step(inputs(now=11.0))
+        third = sess.step(inputs(now=12.0))
+
+        assert first.confirmations == 1
+        assert middle.reason == SUPPRESS_UNCERTAIN
+        assert not third.spoken
+        assert third.confirmations == 1
+
+    def test_an_unreachable_model_breaks_the_chain(self):
+        vision = ScriptedVision.of(answer("toy"), None, answer("toy"))
+        sess = session(vision=vision, min_gap_sec=0.0)
+
+        sess.step(inputs(now=10.0))
+        sess.step(inputs(now=11.0))
+
+        assert not sess.step(inputs(now=12.0)).spoken
+
+    def test_an_unreadable_answer_breaks_the_chain(self):
+        vision = ScriptedVision.of(answer("toy"), '{"kind": "display"', answer("toy"))
+        sess = session(vision=vision, min_gap_sec=0.0)
+
+        sess.step(inputs(now=10.0))
+        sess.step(inputs(now=11.0))
+
+        assert not sess.step(inputs(now=12.0)).spoken
+
+    def test_a_lost_target_breaks_the_chain(self):
+        sess = session(vision=ScriptedVision.of(answer("toy")), min_gap_sec=0.0)
+
+        sess.step(inputs(now=10.0))
+        sess.step(inputs(now=11.0, present=False, bbox=None))
+
+        assert not sess.step(inputs(now=12.0)).spoken
+
+    def test_an_uninterrupted_pair_still_confirms(self):
+        """The break must not make confirmation impossible."""
+        sess = session(vision=ScriptedVision.of(answer("toy")), min_gap_sec=0.0)
+
+        sess.step(inputs(now=10.0))
+
+        assert sess.step(inputs(now=11.0)).spoken
+
+
+class TestMaxDurationWaitsForAHandOver:
+    """Review finding: the duration limit was resetting coverage by itself.
+
+    With the same visitor still standing there that repeats every remark on a
+    timer, which is the behaviour the session exists to prevent.
+    """
+
+    def test_it_pauses_instead_of_resetting(self):
+        sess = session(
+            vision=ScriptedVision.of(answer("toy")),
+            speech=RecordingSpeech(duration=0.0),
+            max_session_sec=120.0,
+            min_gap_sec=0.0,
+        )
+        speak_once(sess)
+        first = sess.session_id
+
+        later = sess.step(inputs(now=200.0))
+
+        assert sess.session_id == first
+        assert later.reason == SUPPRESS_WAITING_NEXT_VISITOR
+
+    def test_it_keeps_waiting_until_an_attendant_acts(self):
+        sess = session(vision=ScriptedVision.of(answer("toy")), max_session_sec=60.0, min_gap_sec=0.0)
+        sess.step(inputs(now=10.0))
+        sess.step(inputs(now=100.0))
+
+        for now in (110.0, 200.0, 500.0):
+            assert sess.step(inputs(now=now)).reason == SUPPRESS_WAITING_NEXT_VISITOR
+
+    def test_a_hand_over_ends_the_wait_and_clears_coverage(self):
+        sess = session(
+            vision=ScriptedVision.of(answer("toy")),
+            speech=RecordingSpeech(duration=0.0),
+            max_session_sec=120.0,
+            min_gap_sec=0.0,
+        )
+        speak_once(sess)
+        sess.step(inputs(now=200.0))
+
+        sess.next_visitor(now=210.0)
+
+        assert speak_once(sess, start=211.0)[-1].spoken
+
+    def test_a_confirmed_absence_still_resets_on_its_own(self):
+        """Nobody is there to inherit the covered topics."""
+        sess = session(vision=ScriptedVision.of(answer("toy")), absent_reset_sec=30.0, max_session_sec=0.0)
+        sess.step(inputs(now=10.0))
+        first = sess.session_id
+
+        sess.step(inputs(now=15.0, present=False, bbox=None))
+        sess.step(inputs(now=60.0, present=False, bbox=None))
+
+        assert sess.session_id != first
+
+
+class TestValidityUsesTheDeliveryClock:
+    """Review finding: generation time was invisible to the validity check.
+
+    A fake model returns instantly, so only a clock port exposes it.
+    """
+
+    def test_a_slow_generation_makes_the_evidence_stale(self):
+        from visual_interaction.session.hooks import Clock
+
+        class ThirtySecondModel(Clock):
+            def now(self, round_inputs):
+                return round_inputs.now + 30.0
+
+        sess = VisualInteractionSession(
+            hooks=SessionHooks(vision=ScriptedVision.of(answer("toy")), clock=ThirtySecondModel()),
+            config=SessionConfig(max_evidence_age_sec=8.0, min_gap_sec=0.0),
+        )
+
+        sess.step(inputs(now=10.0))
+        result = sess.step(inputs(now=11.0))
+
+        assert not result.spoken
+        assert result.reason == SUPPRESS_STALE
+
+    def test_a_fast_generation_still_speaks(self):
+        sess = session(vision=ScriptedVision.of(answer("toy")), max_evidence_age_sec=8.0)
+
+        assert speak_once(sess)[-1].spoken
+
+
+class TestResultCarriesTheMessageFields:
+    def test_a_spoken_round_reports_its_episode_and_deadline(self):
+        sess = session(vision=ScriptedVision.of(answer("toy")), max_evidence_age_sec=8.0)
+
+        result = speak_once(sess)[-1]
+
+        assert result.episode_seq == 1
+        assert result.latest_start_at == pytest.approx(result.evidence_stamp + 8.0)
+
+    def test_a_quiet_round_carries_neither(self):
+        sess = session(vision=ScriptedVision.of(quiet()))
+
+        result = sess.step(inputs())
+
+        assert result.episode_seq == 0
+        assert result.latest_start_at == 0.0

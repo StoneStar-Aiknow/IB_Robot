@@ -164,6 +164,22 @@ class ChangeGate:
         return True
 
 
+class Clock:
+    """What time it is *now*, asked again after the model has run.
+
+    ``RoundInputs.now`` is the moment the round began. A generation taking
+    several seconds would otherwise be invisible to the validity check, which
+    is exactly the "it commented on a picture from ages ago" behaviour the
+    design set out to avoid — a fake model returns instantly and hides it.
+
+    The default returns the round's own start, so a test that passes explicit
+    times stays reproducible; the ROS adapter overrides it with the node clock.
+    """
+
+    def now(self, inputs: RoundInputs) -> float:
+        return inputs.now
+
+
 class SessionHooks:
     """Everything the session delegates. Each default is the conservative value."""
 
@@ -173,10 +189,12 @@ class SessionHooks:
         vision: VisionLanguagePort | None = None,
         speech: SpeechPort | None = None,
         gate: ChangeGate | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self.vision = vision or VisionLanguagePort()
         self.speech = speech or SpeechPort()
         self.gate = gate or ChangeGate()
+        self.clock = clock or Clock()
 
     def on_round(self, inputs: RoundInputs, outcome: str) -> None:
         """Called once per round with the reason it ended. Default: nothing.
@@ -211,6 +229,7 @@ def as_boxes(values: Sequence[Sequence[float]]) -> tuple[tuple[float, float, flo
 __all__ = [
     "ActorSignal",
     "ChangeGate",
+    "Clock",
     "Delivery",
     "RoundInputs",
     "SessionHooks",

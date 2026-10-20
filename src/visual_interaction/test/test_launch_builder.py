@@ -57,7 +57,13 @@ def node_parameters(node: Node) -> dict:
 
 
 def config(**overrides) -> dict:
-    """A config that launches the feature, so a test can break one thing."""
+    """A config that launches the feature, so a test can break one thing.
+
+    The description sits where ``robot_config.interface_binding`` writes it:
+    ``runtime.interface_description``. An earlier revision of this helper
+    invented a top-level key, so the builder passed here and failed on every
+    real config — a fixture has to mirror the framework, not the reader.
+    """
     section = {
         "enabled": True,
         "frame_source": {"interface": CAMERA_ID},
@@ -70,7 +76,7 @@ def config(**overrides) -> dict:
         "name": "visual_probe",
         "skill_required_control_mode": "observation",
         "control_modes": {"observation": {"inference": {"enabled": False}, "executor": {"enabled": False}}},
-        "runtime_interface_description": _DESCRIPTION,
+        "runtime": {"profile": "x2_ultra_omnihand", "interface_description": _DESCRIPTION},
         "visual_interaction": section,
     }
 
@@ -215,12 +221,37 @@ class TestValidation:
 
     def test_an_unbound_description_is_refused_by_code(self):
         broken = config()
-        del broken["runtime_interface_description"]
+        del broken["runtime"]["interface_description"]
 
         with pytest.raises(InterfaceBindingError) as error:
             generate_visual_interaction_nodes(broken)
 
         assert error.value.code == "description_required"
+
+    def test_a_description_at_the_wrong_key_is_not_accepted(self):
+        """Guards the bug this test file used to hide.
+
+        ``interface_binding`` writes ``runtime.interface_description``; a
+        top-level key is written by nothing, so honouring one would pass here
+        and fail at launch.
+        """
+        misplaced = config()
+        misplaced["runtime_interface_description"] = misplaced["runtime"].pop("interface_description")
+
+        with pytest.raises(InterfaceBindingError) as error:
+            generate_visual_interaction_nodes(misplaced)
+
+        assert error.value.path == "runtime.interface_description"
+
+    def test_the_builder_reads_the_same_key_as_the_mirror_builder(self):
+        """Both resolve endpoints by ID, so both read the one bound location."""
+        import inspect
+
+        from manipulation_execution.launch_builders import mirror_session
+        from visual_interaction.launch_builders import visual_interaction as ours
+
+        assert 'runtime.get("interface_description")' in inspect.getsource(mirror_session._runtime_description)
+        assert 'runtime.get("interface_description")' in inspect.getsource(ours._runtime_description)
 
     def test_an_unwired_model_is_refused(self):
         with pytest.raises(ValueError, match="only 'fake' is wired"):

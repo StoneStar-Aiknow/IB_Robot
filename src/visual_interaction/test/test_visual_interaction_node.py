@@ -258,3 +258,131 @@ class TestQuietRequest:
                 )
         finally:
             rclpy.shutdown()
+
+
+def record_step(node) -> dict:
+    """Capture what the node hands the session, keeping the round working.
+
+    The real step still runs: _on_round reads the result afterwards, so a stub
+    returning something else would fail for the wrong reason.
+    """
+    seen: dict = {}
+    original = node._session.step
+
+    def recording(round_inputs):
+        seen["actor"] = round_inputs.actor
+        seen["window"] = round_inputs.window
+        return original(round_inputs)
+
+    node._session.step = recording
+    return seen
+
+
+class TestActorLiveness:
+    """Review finding: the last actor state was held forever.
+
+    The tracker compares the stamps it is handed, so replaying one message
+    keeps the difference at zero and the gap never times out — the session
+    kept answering a visitor who had left.
+    """
+
+    def test_a_stale_actor_state_is_treated_as_unknown(self, node):
+        from visual_interaction.session.hooks import ActorSignal
+
+        node._actor = ActorSignal(present=True, known=True, bbox=(100.0, 100.0, 200.0, 400.0), stamp=9.9)
+        node._actor_received_at = node._now() - (node._stale_actor_sec + 5.0)
+
+        seen = record_step(node)
+        node._buffer.put(node._now(), node._now(), b"frame")
+        node._on_round()
+
+        assert seen["actor"].known is False
+        assert seen["actor"].present is False
+
+    def test_a_fresh_actor_state_is_passed_through(self, node):
+        from visual_interaction.session.hooks import ActorSignal
+
+        box = (100.0, 100.0, 200.0, 400.0)
+        node._actor = ActorSignal(present=True, known=True, bbox=box, stamp=node._now())
+        node._actor_received_at = node._now()
+
+        seen = record_step(node)
+        node._buffer.put(node._now(), node._now(), b"frame")
+        node._on_round()
+
+        assert seen["actor"].present is True
+        assert seen["actor"].bbox == box
+
+    def test_an_actor_state_that_never_arrived_is_unknown(self, node):
+        seen = record_step(node)
+        node._buffer.put(node._now(), node._now(), b"frame")
+        node._on_round()
+
+        assert seen["actor"].known is False
+
+
+class TestBufferCap:
+    """Review finding: eviction by camera stamp alone evicts nothing.
+
+    A frozen or always-zero stamp then grows a resident process without bound.
+    """
+
+    def test_a_frozen_camera_stamp_cannot_grow_the_buffer(self):
+        buffer = FrameBuffer(6.0, max_frames=300)
+
+        for _ in range(1000):
+            buffer.put(0.0, 0.0, b"x" * 100)
+
+        assert len(buffer._items) == 300
+        assert buffer.total == 1000
+
+    def test_the_cap_keeps_the_newest_frames(self):
+        buffer = FrameBuffer(600.0, max_frames=3)
+
+        for index in range(10):
+            buffer.put(float(index), float(index), f"f{index}".encode())
+
+        assert [item[2] for item in buffer._items] == [b"f7", b"f8", b"f9"]
+
+    def test_a_zero_cap_is_refused(self):
+        with pytest.raises(ValueError, match="at least 1"):
+            FrameBuffer(6.0, max_frames=0)
+
+
+class TestPublishedFields:
+    """Review finding: the message contradicted its own contract."""
+
+    def _publish_and_capture(self, node, result):
+        from visual_interaction.session.hooks import Window
+
+        captured = {}
+        node._utterances.publish = lambda message: captured.setdefault("message", message)
+        node._publish(result, Window(frames=(b"a",), stamps=(10.9,), received_at=11.0))
+        return captured["message"]
+
+    def test_the_header_carries_the_evidence_time_not_the_publish_time(self, node):
+        from visual_interaction.session.core import RoundResult
+
+        message = self._publish_and_capture(node, RoundResult(spoken=False, reason="NO_NEW_TOPIC"))
+
+        stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+        assert stamp == pytest.approx(10.9)
+
+    def test_a_spoken_round_publishes_its_episode_and_deadline(self, node):
+        from visual_interaction.session.core import RoundResult
+
+        result = RoundResult(spoken=True, text="你举起的玩偶真有趣。", episode_seq=3, latest_start_at=18.9)
+        message = self._publish_and_capture(node, result)
+
+        assert message.episode_seq == 3
+        deadline = message.latest_start_at.sec + message.latest_start_at.nanosec * 1e-9
+        assert deadline == pytest.approx(18.9)
+
+    def test_a_quiet_round_publishes_no_deadline(self, node):
+        from visual_interaction.session.core import RoundResult
+
+        message = self._publish_and_capture(node, RoundResult(spoken=False, reason="NO_NEW_TOPIC"))
+
+        assert message.latest_start_at.sec == 0
+        assert message.latest_start_at.nanosec == 0
+        assert message.episode_seq == 0

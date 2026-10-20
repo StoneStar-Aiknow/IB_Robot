@@ -83,6 +83,11 @@ SUPPRESS_IN_FLIGHT = "IN_FLIGHT"
 SUPPRESS_MUTED = "MUTED"
 SUPPRESS_MODEL_NOT_READY = "MODEL_NOT_READY"
 SUPPRESS_SCHEMA_INVALID = "SCHEMA_INVALID"
+# The session hit its maximum duration while somebody was still standing there.
+# It is a missed-hand-over signal, not a reset: clearing coverage under the same
+# visitor would say the same things to them again every couple of minutes. Only
+# an explicit hand-over, or a confirmed absence, ends it.
+SUPPRESS_WAITING_NEXT_VISITOR = "WAITING_NEXT_VISITOR"
 SUPPRESS_REASONS = (
     SUPPRESS_NO_NEW_TOPIC,
     SUPPRESS_UNCERTAIN,
@@ -96,6 +101,7 @@ SUPPRESS_REASONS = (
     SUPPRESS_MUTED,
     SUPPRESS_MODEL_NOT_READY,
     SUPPRESS_SCHEMA_INVALID,
+    SUPPRESS_WAITING_NEXT_VISITOR,
 )
 
 # Timing defaults. Every one of these is a proposal until phase zero measures

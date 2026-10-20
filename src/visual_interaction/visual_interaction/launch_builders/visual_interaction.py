@@ -114,14 +114,22 @@ def _assert_observation_only(robot_config: Mapping[str, object]) -> None:
 
 
 def _runtime_description(robot_config: Mapping[str, object]) -> str:
-    description = robot_config.get("runtime_interface_description")
+    """Read the bound description from where ``interface_binding`` writes it.
+
+    ``robot_config["runtime"]["interface_description"]`` — set by
+    ``robot_config.interface_binding`` and read the same way by the
+    mirror-session builder. Reading a top-level key instead looks plausible and
+    fails on every real config, because nothing ever writes one.
+    """
+    runtime = robot_config.get("runtime")
+    description = runtime.get("interface_description") if isinstance(runtime, Mapping) else None
     if not isinstance(description, Mapping) or not isinstance(description.get("interfaces"), Mapping):
         raise InterfaceBindingError(
             "description_required",
             "runtime.interface_description",
-            "visual_interaction needs the bound runtime description to resolve its camera",
+            "visual_interaction resolves its camera by ID; bind the live description first",
         )
-    return json.dumps(description)
+    return json.dumps(description, sort_keys=True)
 
 
 def _categories(section: Mapping[str, object]) -> list[str]:

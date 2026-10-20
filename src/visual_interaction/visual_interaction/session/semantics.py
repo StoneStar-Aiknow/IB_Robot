@@ -74,10 +74,49 @@ _OUT_OF_RANGE_PATTERNS: tuple[tuple[str, str], ...] = (
     # characters between them.
     (r"开心|高兴|难过|生气|紧张|害羞|心情|情绪|性格|喜欢|讨厌|想要|觉得|累了", "inner_state"),
     # Person attributes: appearance, body, age, gender, health, belief.
-    (r"漂亮|好看|帅|瘦|胖|高个|矮|年轻|年纪|岁|小朋友|女士|先生|信仰|宗教|生病|医生|身材", "person"),
+    # Narrower than it looks: the vocabulary whitelist already refuses every
+    # word for a body, an age or a belief, so this only has to catch praise
+    # aimed at the person rather than the object. "你真好看" is out of range;
+    # "你别着的徽章真好看" is the remark this feature exists to make.
+    (r"你(真|很|好|挺)?(漂亮|好看|帅|可爱)", "person"),
 )
 
 _OUT_OF_RANGE = tuple((re.compile(pattern), label) for pattern, label in _OUT_OF_RANGE_PATTERNS)
+
+# The vocabulary a reply may be built from. This is the load-bearing check, and
+# it is a whitelist on purpose.
+#
+# A blacklist cannot hold this boundary. "你举着的牌子写了电话号码13800138000。",
+# "你举起的玩偶旁边有助听器。" and "你戴的徽章上有十字架。" each name the
+# confirmed category, miss every out-of-range pattern, and each publishes
+# something the first version promised never to say — personal data, a medical
+# device, a religious symbol. Enumerating those three fixes those three.
+#
+# So the rule is inverted: a reply may only use characters from this set, and
+# anything else — an unlisted word, a digit, a Latin letter — refuses it. The
+# cost is that a perfectly good sentence can be refused for using a word nobody
+# listed, which is the right direction to fail in. Widening the set is a review
+# decision with the whole boundary in view, not an edit to a pattern.
+_ALLOWED_REPLY_CHARS = frozenset(
+    # Subjects: the four categories and their ordinary synonyms.
+    "玩偶玩具娃娃公仔牌子标牌纸板帽子徽章胸针别针胸章"
+    # Display relations: holding, wearing, showing, pointing.
+    "举起拿着带来戴着别着挂在手上头上胸前身上拿出展示给看向"
+    # Second person and the robot's own voice.
+    "你我它这那个只件顶枚张"
+    # Plain remarks: noticing, liking, finding it interesting.
+    "真好有意思特别挺不错很可爱看到注意呀啊呢吧哦喔嗯漂亮趣点目醒眼"
+    "是的了着过在和跟与也还就都又再一二两"
+    # Light verbs that keep a sentence grounded in what is visible.
+    "像似乎显得看起来瞧见发现觉"
+    # Punctuation.
+    "。！？，、…—～ "
+)
+
+# Characters that are refused however they are used. Digits and Latin letters
+# are how a phone number, a licence plate or a brand reaches a reply, and no
+# allowed remark needs either.
+_FORBIDDEN_REPLY_PATTERN = re.compile(r"[0-9０-９a-zA-Z]")
 
 # Wording that treats the reply as a command rather than a remark. A sign in
 # frame may read like an instruction, and a model that copied it would produce
@@ -179,18 +218,24 @@ def check_reply(
 ) -> str:
     """Return the reply to speak, or raise :class:`SemanticsError`.
 
-    Three checks, deliberately ordered cheapest-first and all fail-closed:
+    Five checks, all fail-closed, cheapest first:
 
     1. the length band, because a one-word answer carries no observation and a
        long one stops being a short remark;
     2. the instruction shape, because a sign in frame may read like a command
        and a reply is something said to a visitor, never to the system;
-    3. the out-of-range attributes, and then whether the reply still names the
-       confirmed ``category`` at all.
+    3. no question, because the first version has no way to hear an answer;
+    4. the vocabulary whitelist — the load-bearing one. A reply may only use
+       characters from :data:`_ALLOWED_REPLY_CHARS`, so a phone number, a
+       medical device or a religious symbol is refused for not being in the
+       vocabulary rather than for matching a pattern somebody thought of;
+    5. the out-of-range patterns and the category grounding, which catch a
+       sentence built entirely from allowed characters that still over-reaches.
 
-    The last one is the only *positive* check, so it is what catches a drift
-    this module has no pattern for. It is skipped when no category is given,
-    which is why :func:`parse_observation` always passes one.
+    Check 4 is why 1–3 and 5 are a net rather than the boundary: a blacklist
+    cannot enumerate every way to say something out of range, and each of the
+    three real bypasses found in review named its category, missed every
+    pattern, and published something the first version promised never to say.
     """
     text = normalise_text(reply)
     if not text:
@@ -201,6 +246,15 @@ def check_reply(
         raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"reply is longer than {max_chars} characters")
     if _INSTRUCTION_SHAPED.search(text):
         raise SemanticsError(SUPPRESS_PRIVACY, "reply is shaped like an instruction, not a remark")
+    if "?" in text or "？" in text:
+        # Asking invites an answer nothing here can hear, so the first version
+        # states rather than asks.
+        raise SemanticsError(SUPPRESS_PRIVACY, "reply asks a question; the first version only states")
+    if _FORBIDDEN_REPLY_PATTERN.search(text):
+        raise SemanticsError(SUPPRESS_PRIVACY, "reply contains digits or Latin letters, which no allowed remark needs")
+    outside = sorted(set(text) - _ALLOWED_REPLY_CHARS)
+    if outside:
+        raise SemanticsError(SUPPRESS_PRIVACY, f"reply uses words outside the allowed vocabulary: {''.join(outside)}")
     for pattern, label in _OUT_OF_RANGE:
         if pattern.search(text):
             raise SemanticsError(SUPPRESS_PRIVACY, f"reply asserts {label}, which is out of range")
