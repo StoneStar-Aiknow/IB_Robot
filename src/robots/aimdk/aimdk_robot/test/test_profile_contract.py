@@ -318,3 +318,26 @@ def test_runtime_node_builds_its_own_description_without_injection():
     finally:
         if owned and rclpy.ok():
             rclpy.shutdown()
+
+
+@pytest.mark.parametrize("name", ["x2_ultra.yaml", "x2_ultra_omnihand.yaml"])
+def test_every_declared_audio_format_agrees_with_the_stream_the_bridge_moves(name):
+    """The same PCM format is written in up to three places, and they drift independently.
+
+    Consumers size their PCM from the public capability, bindings read the interface metadata,
+    and the bridge stamps the vendor playback format from its private vendor block. Audio sized
+    from one and played under another plays at the wrong pitch and speed, or with the wrong
+    channels, with nothing in the description to catch it.
+    """
+    profile = load_profile(PROFILE_PATH.parent / name)
+    capabilities = profile["capabilities"]
+    interfaces = profile["interfaces"]
+    vendor = profile["vendor"]["audio"]
+
+    playback = capabilities["interaction.audio_playback"]
+    assert playback["sample_rate_hz"] == interfaces["audio.play"]["sample_rate_hz"] == vendor["playback_sample_rate"]
+    assert playback["channels"] == interfaces["audio.play"]["channels"] == vendor["playback_channels"]
+
+    capture = capabilities["interaction.audio_capture"]
+    assert capture["sample_rate_hz"] == interfaces["audio.capture"]["sample_rate_hz"]
+    assert capture["channels"] == interfaces["audio.capture"]["channels"]
