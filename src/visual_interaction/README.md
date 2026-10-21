@@ -163,13 +163,38 @@ source .shrc_local && python3 -m visual_interaction.phase0.token_budget \
 
 **这些工具都不 import 板上 VL demo 的代码。** demo 没有 LICENSE、且自称提示词与逻辑照搬另一个
 本机脚本，来源确认前它的预处理和生成循环不往本仓搬：`vl_segments` 读它自己写的日志，
-`token_budget` 用 tokenizer 的**数据文件**（`vocab.json` / `merges.txt` / `added_tokens.json`）
-重建 Qwen2 BPE——数据不是代码，且已逐项核对与板上 tokenizer 输出一致（中文文本、
-`<img>`/`<IMG_CONTEXT>`/`</img>` 块、`<|im_start|>` 模板标记 id 全等）。
+`token_budget` 只读 tokenizer 的**数据文件**（`vocab.json` / `merges.txt` / `added_tokens.json`）。
+
+`phase0/tokenizer.py` 不是自己实现 BPE，而是用 `tokenizers` 库按 **Qwen2 公开的分词规范**
+加载那三个数据文件：NFC 规范化 → 按 added token 切开 → Qwen2 预切分正则 → byte-level BPE。
+板上 `qwen_tok.py` 自己的注释也写着「对齐 HF 慢速 Qwen2Tokenizer」，两边依据的是同一份规范。
+
+**一个实现细节容易错**：`added_tokens.json` 里带着每个特殊 token 的 id，必须把它们
+**先并进词表再建模型**。用 `add_tokens()` 事后追加会让库重新编号（`<img>` 本该 151665，
+会变成 151672），token 数就全错了。
+
+#### 上板时要做的一次性对照（阶段零 0C 清单项）
+
+本机验证只覆盖了三种输入（中文短句、图像块、对话模板标记），都与板上输出 id 全等。
+但**没有覆盖全部字符组合**——标点、emoji、中英混排的边界都没测过。所以上板后要做一次对照，
+确认本机计数可以继续信任：
+
+```bash
+# 板上，用 demo 自己的分词器对同一段提示词计数
+cd /root/vlx_internvl_310p && python3 -c "
+import sys; sys.path.insert(0, 'scripts')
+from qwen_tok import Tokenizer
+print(len(Tokenizer('tokenizer').encode(open('/tmp/prompt.txt', encoding='utf-8').read())))
+"
+```
+
+把 `token_budget` 用的同一段提示词落到 `/tmp/prompt.txt`，两边数字应当相同。
+对上之后这个工具就可以放心在本机用；对不上就说明有字符走了不同的路径，先定位再继续，
+**不要直接改容差或改数字**。
 
 ### 已测出的结论：提示词预算比设计假设紧得多
 
-用板上真实 tokenizer 对当前 OM 导出（P=1280、L=1344、4 帧 × 256 image token = 1024 个位置）
+按板上 tokenizer 数据、对当前 OM 导出（P=1280、L=1344、4 帧 × 256 image token = 1024 个位置）
 实测，**图像之后只剩 256 个位置留给全部文本**：
 
 | 场景 | prompt token | 余量 |

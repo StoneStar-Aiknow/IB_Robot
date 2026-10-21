@@ -7,11 +7,17 @@ tokens, the Qwen2 pre-tokenize regex, byte-level BPE. This module assembles
 exactly that from ``tokenizers``, so a count runs on any host with no NPU, no
 CANN and nothing imported from the demo directory.
 
-Verified against the board tokenizer's own output: plain Chinese text, the
-``<img>``/``<IMG_CONTEXT>``/``</img>`` block and the ``<|im_start|>`` chat
-markers all give identical ids. ``added_tokens.json`` carries the ids, so the
-added tokens are registered at those ids rather than appended — appending
-would renumber them and silently change every count.
+Verified against the board tokenizer's own output on three inputs: plain
+Chinese text, the ``<img>``/``<IMG_CONTEXT>``/``</img>`` block and the
+``<|im_start|>`` chat markers all give identical ids. That is not full
+coverage — punctuation, emoji and mixed-script boundaries were not exercised —
+so the phase-zero checklist includes one on-board comparison of the real
+prompt before these counts are relied on further. The package README carries
+the command.
+
+``added_tokens.json`` carries the ids, so the added tokens are registered at
+those ids rather than appended — appending renumbers them (``<img>`` became
+151672 instead of 151665) and silently changes every count.
 """
 
 from __future__ import annotations
