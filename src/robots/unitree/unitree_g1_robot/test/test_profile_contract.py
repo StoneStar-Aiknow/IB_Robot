@@ -347,7 +347,7 @@ def test_expert_joint_tier_stays_disabled(profile):
 def test_description_builds_and_publishes_no_model(profile):
     """D6: no URDF is passed to the description; consumers needing
     normalization metadata fail closed on the G1."""
-    description = build_description(profile, simulated=True)
+    description = build_description(profile, use_sim=True)
     validate_description(description)
     assert "model" not in description
     assert "robot.description" not in description["interfaces"]
@@ -356,7 +356,7 @@ def test_description_builds_and_publishes_no_model(profile):
 
 
 def test_command_surface_is_bridge_owned_neutral_topics(profile):
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     assert interfaces["joint.arm_stream"]["endpoint"] == "/unitree_g1/arm/commands"
     assert interfaces["joint.waist_stream"]["endpoint"] == "/unitree_g1/waist/commands"
     assert interfaces["joint.hand_left_stream"]["endpoint"] == "/unitree_g1/hand_left/commands"
@@ -369,7 +369,7 @@ def test_command_surface_is_bridge_owned_neutral_topics(profile):
 
 
 def test_joint_state_exposes_the_full_43_joint_projection(profile):
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     state = interfaces["joint.state"]
     assert state["endpoint"] == "/joint_states"
     assert state["joint_names"] == profile["joints"]
@@ -379,7 +379,7 @@ def test_joint_state_exposes_the_full_43_joint_projection(profile):
 def test_peripheral_drivers_serve_the_declared_capability_topics(profile):
     """D8: the runtime composes shared drivers; the endpoints are the ones
     peripheral_nodes serves, not vendor SDK topics."""
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     endpoints = {spec["endpoint"] for spec in interfaces.values()}
     for topic in profile["capabilities"]["perception.camera"]["topics"]:
         assert topic in endpoints
@@ -390,7 +390,7 @@ def test_peripheral_drivers_serve_the_declared_capability_topics(profile):
 def test_public_interfaces_serve_neutral_message_types(profile):
     """No generic consumer links unitree_hg or unitree_api: every vendor-facing
     surface is re-served with a neutral type."""
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     for name, spec in profile["interfaces"].items():
         assert spec["capability"] in profile["capabilities"], name
         assert name in interfaces
@@ -407,7 +407,7 @@ def test_unsourced_capabilities_stay_undeclared(profile):
     caps = profile["capabilities"]
     assert "interaction.audio_playback" not in caps
     assert "power.state" not in caps
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     assert "audio.play" not in interfaces
     assert "power.state" not in interfaces
 
