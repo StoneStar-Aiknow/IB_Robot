@@ -727,6 +727,15 @@ The verified `ascend_310p` deployment uses the fixed bundle prompt, accepts Chin
 punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently rejected with
 `UNSUPPORTED_PROMPT`; this is a deployment capability rather than an implicit backend choice.
 
+Playback follows the bound speaker: once `voice_tts.audio_output` binds `audio.play`, the playback topic, sample
+rate, and channel count all come from the interface binding. When the synthesis rate differs from the speaker's
+(ZipVoice produces 24 kHz, the X2 speaker takes 16 kHz), set `resample_to_playback_rate: true` explicitly; without
+it a rate mismatch stays an error. Channel count and sample width are never converted. `audio_message_type` selects
+the message type the playback node publishes. Unset, it publishes `audio_common_msgs/msg/AudioData`, as it did
+before the key existed; a deployment whose speaker subscribes to `AudioDataStamped` (such as the X2 runtime's
+`audio.play`) names it explicitly, and it must match `audio_output.type`. The key is interim: once the type the
+ALSA speaker's `audio_play` actually subscribes to is confirmed, the binding alone will decide it.
+
 
 ## Usage
 
