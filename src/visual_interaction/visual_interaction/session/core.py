@@ -77,6 +77,15 @@ class RoundResult:
 
     spoken: bool
     reason: str = ""
+    # Why the reason, when there is more to say than the closed code. Carries
+    # the SemanticsError detail for a refused or malformed answer, which is the
+    # only record of what the model actually produced: diagnostics would
+    # otherwise report SCHEMA_INVALID forty times with no way to tell whether
+    # the model wrote prose, truncated, or answered a field wrong.
+    #
+    # For logs and diagnostics only. Nothing in the decision reads it, and the
+    # published message keeps carrying the closed reason alone.
+    detail: str = ""
     text: str = ""
     observation: Observation | None = None
     topic: TopicKey | None = None
@@ -260,7 +269,7 @@ class VisualInteractionSession:
         try:
             observation = parse_observation(raw, categories=self.config.categories)
         except SemanticsError as error:
-            return self._break_and_finish(inputs, error.reason, model_called=True)
+            return self._break_and_finish(inputs, error.reason, model_called=True, detail=error.detail)
 
         if observation.kind not in SPEAKABLE_KINDS:
             if observation.kind == KIND_UNCERTAIN:
@@ -405,11 +414,13 @@ class VisualInteractionSession:
         observation: Observation | None = None,
         topic: TopicKey | None = None,
         confirmations: int = 0,
+        detail: str = "",
     ) -> RoundResult:
         self._notify(inputs, reason)
         return RoundResult(
             spoken=False,
             reason=reason,
+            detail=detail,
             observation=observation,
             topic=topic,
             session_id=self.session_id,

@@ -400,10 +400,32 @@ def _as_mapping(payload: str | Mapping[str, object]) -> Mapping[str, object]:
     except json.JSONDecodeError as error:
         # Truncated output is the common case; an early stop on ``kind`` leaves
         # the rest of the object unclosed. It is not a candidate either way.
-        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"answer is not valid JSON: {error.msg}") from error
+        #
+        # The offending text comes along, trimmed. "answer is not valid JSON"
+        # alone is unactionable: it reads the same whether the model wrote
+        # prose, stopped mid-object or answered in the wrong shape, and a
+        # bring-up run that reports it forty times leaves nothing to work from.
+        raise SemanticsError(
+            SUPPRESS_SCHEMA_INVALID, f"answer is not valid JSON: {error.msg}: {_trimmed(text)}"
+        ) from error
     if not isinstance(decoded, Mapping):
-        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"answer is a JSON {type(decoded).__name__}, not an object")
+        raise SemanticsError(
+            SUPPRESS_SCHEMA_INVALID,
+            f"answer is a JSON {type(decoded).__name__}, not an object: {_trimmed(text)}",
+        )
     return decoded
+
+
+# How much of a rejected answer a diagnostic carries. Enough to see the shape
+# of what went wrong without putting a whole generation into a log line.
+_DETAIL_CHARS = 160
+
+
+def _trimmed(text: str) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= _DETAIL_CHARS:
+        return repr(collapsed)
+    return repr(collapsed[:_DETAIL_CHARS] + "…")
 
 
 def _as_string(value: object, field: str) -> str:

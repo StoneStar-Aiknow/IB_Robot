@@ -440,6 +440,13 @@ class VisualInteractionNode(Node):
                 self.get_logger().debug(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
             return
         self._last_model_error = None
+        # A refused or malformed answer carries why. Logged at info rather than
+        # debug: unlike COOLDOWN or DUPLICATE, which are the feature working,
+        # these say the model produced something unusable, and during bring-up
+        # that is the single most useful line on the terminal.
+        if result.detail:
+            self.get_logger().info(f"quiet: {result.reason} ({result.detail})")
+            return
         self.get_logger().debug(f"quiet: {result.reason}")
 
     def _publish_status(self) -> None:
