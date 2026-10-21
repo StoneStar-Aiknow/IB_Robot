@@ -212,3 +212,54 @@ def test_voice_tts_resampling_to_the_speaker_rate_is_opt_in(tmp_path, monkeypatc
 
     config["voice_tts"]["resample_to_playback_rate"] = True
     assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is True
+
+
+def _additional_env(node):
+    """Node.additional_env holds (name, value) substitution pairs, not plain strings."""
+
+    def text(value):
+        return "".join(getattr(item, "text", str(item)) for item in value)
+
+    return {text(name): text(value) for name, value in (node.additional_env or ())}
+
+
+def _manifest_with_profiles(monkeypatch, *, role_runtime_profiles=None, runtime_profile=None):
+    import sys
+    import types
+
+    deployment = types.SimpleNamespace(role_runtime_profiles=role_runtime_profiles, runtime_profile=runtime_profile)
+    module = types.ModuleType("inference_manifest")
+    module.load_inference_manifest = lambda *_args, **_kwargs: types.SimpleNamespace(deployment=deployment)
+    monkeypatch.setitem(sys.modules, "inference_manifest", module)
+
+
+def _model_host(nodes):
+    return next(node for node in nodes if node._Node__node_executable == "model_service_node")
+
+
+def test_ascend_deployment_runs_under_the_cann_abi_its_om_declares(monkeypatch, tmp_path):
+    """The OM is built against one CANN ABI; the node must not inherit the caller's toolkit."""
+    from types import SimpleNamespace
+
+    from voice_tts_service import cann_runtime
+
+    toolkit = tmp_path / "cann" / "8.1.RC1"
+    (toolkit / "lib64").mkdir(parents=True)
+    (tmp_path / "cann" / "latest").mkdir()
+    monkeypatch.setattr(cann_runtime, "CANN_INSTALL_ROOT", tmp_path / "cann")
+    ascend = SimpleNamespace(backend="ascend", target=SimpleNamespace(runtime_abi="cann-8.1.RC1"))
+    _manifest_with_profiles(monkeypatch, role_runtime_profiles={"text_encoder": ascend})
+
+    host = _model_host(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+
+    assert _additional_env(host)["ASCEND_TOOLKIT_HOME"] == str(toolkit)
+
+
+def test_non_ascend_deployment_gets_no_cann_environment(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    _manifest_with_profiles(monkeypatch, runtime_profile=SimpleNamespace(backend="onnxruntime", target=None))
+
+    host = _model_host(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+
+    assert _additional_env(host) == {}
