@@ -1454,7 +1454,8 @@ WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。�
 `tts_timeout_sec` 是 `embodied_agent` 视觉游戏播报节点的内部 RPC 超时。三者互不替代。
 
 播放格式跟随绑定的扬声器：`voice_tts.audio_output` 绑定 `audio.play` 后，播放话题、采样率和声道数都来自
-接口绑定。合成采样率与扬声器不同时（ZipVoice 输出 24 kHz，X2 扬声器为 16 kHz），需要显式设置
+接口绑定；扬声器接口若还声明了 `write_chunk_ms` / `prebuffer_ms`（X2 的 hal_audio 需要整块写入、提前排队），
+播放节点就按它分包，并在整段播放中保持这个领先量。合成采样率与扬声器不同时（ZipVoice 输出 24 kHz，X2 扬声器为 16 kHz），需要显式设置
 `resample_to_playback_rate: true`，播放节点才会重采样；不设置时，采样率不符仍报错。声道数和采样位宽从不转换。
 `audio_message_type` 指定播放节点发布的消息类型，不设置时发布 `audio_common_msgs/msg/AudioData`，和引入这个
 字段之前一样；扬声器订阅 `AudioDataStamped` 的部署（如 X2 runtime 的 `audio.play`）需要显式写出，并且必须与

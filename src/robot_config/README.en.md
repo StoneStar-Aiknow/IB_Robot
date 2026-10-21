@@ -738,7 +738,9 @@ punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently r
 `UNSUPPORTED_PROMPT`; this is a deployment capability rather than an implicit backend choice.
 
 Playback follows the bound speaker: once `voice_tts.audio_output` binds `audio.play`, the playback topic, sample
-rate, and channel count all come from the interface binding. When the synthesis rate differs from the speaker's
+rate, and channel count all come from the interface binding. A speaker interface that also declares `write_chunk_ms`
+and `prebuffer_ms` (the X2's hal_audio wants whole chunks queued ahead) has the playback node write in those chunks
+and keep that lead for the whole stream. When the synthesis rate differs from the speaker's
 (ZipVoice produces 24 kHz, the X2 speaker takes 16 kHz), set `resample_to_playback_rate: true` explicitly; without
 it a rate mismatch stays an error. Channel count and sample width are never converted. `audio_message_type` selects
 the message type the playback node publishes. Unset, it publishes `audio_common_msgs/msg/AudioData`, as it did

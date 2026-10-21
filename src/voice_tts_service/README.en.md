@@ -156,8 +156,12 @@ Playback node parameters:
 | `audio_message_type` | `audio_common_msgs/msg/AudioData` | `AudioData` (local `audio_play`) or `AudioDataStamped` (runtime-owned speaker such as aimdk `audio.play`); anything else fails at startup |
 | `playback_sample_rate` / `playback_channels` | `24000` / `1` | Playback PCM contract |
 | `resample_to_playback_rate` | `false` | When `true`, WAVs at any rate are resampled to `playback_sample_rate` |
-| `chunk_ms` | `50` | Duration of each published chunk in milliseconds |
+| `chunk_ms` | `50` | Duration of each published chunk in milliseconds (20-200); taken from the bound speaker interface's `write_chunk_ms` when it declares one |
+| `prebuffer_ms` | `0` | Audio kept written ahead of the sample clock in milliseconds (0-2000), for the whole stream; taken from the bound speaker interface's `prebuffer_ms` when it declares one |
 | `timeout_sec` | `300.0` | Overall budget for one playback |
+
+The playback service returns when the last sample's playback time is reached, not when the last chunk is
+written: callers such as the Agent's voice bridge take the return as the end of the speech and resume listening.
 
 ### 4.3 Model lifecycle
 

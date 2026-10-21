@@ -109,6 +109,7 @@ def _make_playback_node(
     resample=False,
     message_type=AUDIO_DATA_TYPE,
     chunk_ms=50,
+    prebuffer_ms=0,
 ):
     node = AudioPlaybackNode.__new__(AudioPlaybackNode)
     node._player = AudioFilePlayer(AudioPlaybackConfig(timeout_sec=timeout_sec))
@@ -117,6 +118,7 @@ def _make_playback_node(
     node._playback_channels = 1
     node._resample = resample
     node._chunk_ms = chunk_ms
+    node._prebuffer_ms = prebuffer_ms
     node._audio_message_type = message_type
     node._audio_message_class = _FakeAudioDataStamped if message_type == AUDIO_DATA_STAMPED_TYPE else _FakeAudioData
     node.get_clock = _FakeClock
@@ -344,3 +346,46 @@ def test_unknown_audio_message_type_is_rejected(monkeypatch):
     assert _audio_message_class(AUDIO_DATA_STAMPED_TYPE) is _FakeAudioDataStamped
     with pytest.raises(ValueError, match="audio_message_type"):
         _audio_message_class("std_msgs/msg/String")
+
+
+def _paced_playback(monkeypatch, tmp_path, *, seconds, chunk_ms, prebuffer_ms):
+    """Play ``seconds`` of audio on a virtual clock; return each write's (time, audio already written)."""
+    audio_path = tmp_path / "reply.wav"
+    _write_wav(audio_path, sample_rate=16000, frames=int(16000 * seconds))
+    clock = _Clock()
+    writes = []
+
+    class RecordingPublisher(_FakeAudioPublisher):
+        def publish(self, message):
+            writes.append((clock.now, len(self.messages) * chunk_ms / 1000))
+            super().publish(message)
+
+    publisher = RecordingPublisher()
+    node = _make_playback_node(
+        publisher, timeout_sec=60.0, sample_rate=16000, chunk_ms=chunk_ms, prebuffer_ms=prebuffer_ms
+    )
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    node._publish_audio(str(audio_path))
+
+    return writes, clock.now
+
+
+def test_the_lead_is_kept_for_the_whole_reply_not_only_its_start(monkeypatch, tmp_path):
+    """A player waiting on every write reports PLAYING/STOPPED around it; a lead keeps it fed."""
+    writes, returned_at = _paced_playback(monkeypatch, tmp_path, seconds=12.0, chunk_ms=200, prebuffer_ms=1000)
+
+    # Once the first second is queued, every later write finds a full second not yet played.
+    lead_at_each_write = [written - now for now, written in writes if written >= 1.0]
+    assert lead_at_each_write and min(lead_at_each_write) == pytest.approx(1.0)
+    assert returned_at == pytest.approx(12.0)
+
+
+def test_a_reply_shorter_than_the_lead_returns_once_it_has_played(monkeypatch, tmp_path):
+    # The voice bridge resumes listening when this returns; returning on the write would let
+    # the robot hear its own reply.
+    writes, returned_at = _paced_playback(monkeypatch, tmp_path, seconds=0.6, chunk_ms=200, prebuffer_ms=1000)
+
+    assert [now for now, _written in writes] == [0.0, 0.0, 0.0]
+    assert returned_at == pytest.approx(0.6)

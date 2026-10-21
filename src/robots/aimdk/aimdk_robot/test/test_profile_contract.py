@@ -364,3 +364,17 @@ def test_shipped_trajectories_load_and_replay_advertised_motions():
         # The recording plays the side the preset it was recorded from plays.
         preset = profile["vendor"]["preset_motions"][name]
         assert recorded.target == (areas[preset["area"]] if "area" in preset else preset["target"]), name
+
+
+def test_both_x2_profiles_ask_for_the_same_playback_pacing():
+    # Both drive the same hal_audio player: a pacing fix that reaches one profile only leaves
+    # the other stuttering on every write it has to wait for.
+    pacing = [
+        {
+            field: load_profile(PROFILE_PATH.parent / name)["interfaces"]["audio.play"].get(field)
+            for field in ("write_chunk_ms", "prebuffer_ms")
+        }
+        for name in ("x2_ultra.yaml", "x2_ultra_omnihand.yaml")
+    ]
+    assert pacing[0] == pacing[1]
+    assert None not in pacing[0].values()

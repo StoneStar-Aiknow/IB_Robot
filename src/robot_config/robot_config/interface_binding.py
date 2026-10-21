@@ -331,8 +331,16 @@ def bind_robot_interfaces(
                 )
             item[field] = interface[source]
         # Audio format metadata rides with the interface (runtime-owned-audio-io):
-        # absent fields stay absent so consumers can tell "undeclared" apart.
-        for field in ("sample_rate_hz", "channels", "sample_format", "channel_indices"):
+        # absent fields stay absent so consumers can tell "undeclared" apart. A speaker can
+        # also declare how it wants PCM written (write_chunk_ms / prebuffer_ms).
+        for field in (
+            "sample_rate_hz",
+            "channels",
+            "sample_format",
+            "channel_indices",
+            "write_chunk_ms",
+            "prebuffer_ms",
+        ):
             if field in interface:
                 item[field] = copy.deepcopy(interface[field])
 

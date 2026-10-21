@@ -24,6 +24,7 @@ def generate_launch_description():
             DeclareLaunchArgument("chunk_ms", default_value="50"),
             # JSON object of adapter runtime options, e.g. '{"num_steps": 4}'.
             DeclareLaunchArgument("runtime_options_json", default_value="{}"),
+            DeclareLaunchArgument("prebuffer_ms", default_value="0"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -64,6 +65,7 @@ def generate_launch_description():
                         "resample_to_playback_rate": LaunchConfiguration("resample_to_playback_rate"),
                         "audio_message_type": LaunchConfiguration("audio_message_type"),
                         "chunk_ms": LaunchConfiguration("chunk_ms"),
+                        "prebuffer_ms": LaunchConfiguration("prebuffer_ms"),
                     }
                 ],
             ),

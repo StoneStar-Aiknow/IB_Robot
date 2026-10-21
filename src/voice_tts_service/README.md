@@ -175,8 +175,12 @@ ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
 | `audio_message_type` | `audio_common_msgs/msg/AudioData` | `AudioData`（本机 `audio_play`）或 `AudioDataStamped`（runtime 提供的扬声器，如 aimdk `audio.play`）；其他值启动即失败 |
 | `playback_sample_rate` / `playback_channels` | `24000` / `1` | 播放端 PCM 契约 |
 | `resample_to_playback_rate` | `false` | 为 `true` 时把任意采样率的 WAV 重采样到 `playback_sample_rate` |
-| `chunk_ms` | `50` | 每个发布分包的时长（毫秒） |
+| `chunk_ms` | `50` | 每个发布分包的时长（毫秒，20–200）；绑定的扬声器接口声明了 `write_chunk_ms` 时取该值 |
+| `prebuffer_ms` | `0` | 写入始终领先采样时钟的余量（毫秒，0–2000），整段播放都保持；绑定的扬声器接口声明了 `prebuffer_ms` 时取该值 |
 | `timeout_sec` | `300.0` | 单次播放的总时限 |
+
+播放服务在最后一个采样的播放时刻返回，而不是写完最后一个分包时返回：调用方（如 Agent 的 voice_bridge）
+据此认为播报已经结束，再恢复语音识别。
 
 ### 4.3 模型生命周期
 
