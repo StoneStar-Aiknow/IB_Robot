@@ -345,12 +345,36 @@ def parse_observation(
     return Observation(kind=kind, category=category, region=region, reply=reply)
 
 
+def _strip_code_fence(text: str) -> str:
+    """Remove a markdown code fence around a JSON object, if there is one.
+
+    Measured on the board: the model wraps its answer in ```json … ``` on
+    roughly half the rounds, with the same object inside either way. Refusing
+    those would throw away a well-formed answer over presentation, and no
+    prompt wording reliably stops a chat-tuned model from doing it. The fence
+    is formatting, so the host removes it rather than asking the model to be
+    perfect.
+
+    Only an outer fence is stripped. Anything else about the payload is still
+    the schema check's business.
+    """
+    if not text.startswith("```"):
+        return text
+    body = text[3:]
+    # An opening fence may name a language ("```json"); drop that first line.
+    newline = body.find("\n")
+    if newline != -1 and "{" not in body[:newline]:
+        body = body[newline + 1 :]
+    closing = body.rfind("```")
+    return (body[:closing] if closing != -1 else body).strip()
+
+
 def _as_mapping(payload: str | Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(payload, Mapping):
         return payload
     if not isinstance(payload, str):
         raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"answer is {type(payload).__name__}, not JSON")
-    text = payload.strip()
+    text = _strip_code_fence(payload.strip())
     if not text:
         raise SemanticsError(SUPPRESS_SCHEMA_INVALID, "answer is empty")
     try:

@@ -114,6 +114,47 @@ class TestQuietAnswers:
             quiet_reason(kind)
 
 
+class TestCodeFence:
+    """A markdown fence is presentation, so the host removes it.
+
+    Measured on the board: the model wrapped its answer in ```json … ``` on
+    roughly half the rounds, with the same object inside either way. Refusing
+    those discarded well-formed answers over formatting.
+    """
+
+    def test_a_fenced_answer_parses(self):
+        fenced = (
+            '```json\n{"kind": "display", "category": "toy", "region": "hand", "reply": "你举起的玩偶真有趣。"}\n```'
+        )
+
+        assert parse_observation(fenced).category == "toy"
+
+    def test_a_fence_without_a_language_parses(self):
+        assert parse_observation('```\n{"kind": "none"}\n```').kind == KIND_NONE
+
+    def test_a_fence_on_one_line_parses(self):
+        assert parse_observation('```{"kind": "none"}```').kind == KIND_NONE
+
+    def test_an_unfenced_answer_is_unaffected(self):
+        assert parse_observation('{"kind": "none"}').kind == KIND_NONE
+
+    def test_stripping_the_fence_does_not_rescue_a_broken_object(self):
+        """Only the wrapper is forgiven; the schema check still applies."""
+        with pytest.raises(SemanticsError) as error:
+            parse_observation('```json\n{"kind": "display"\n```')
+
+        assert error.value.reason == SUPPRESS_SCHEMA_INVALID
+
+    def test_an_english_reply_is_still_refused_inside_a_fence(self):
+        """The board produced exactly this: fenced JSON with an English reply."""
+        fenced = '```json\n{"kind": "object", "category": "sign", "region": "chest", "reply": "sign with a smiley face"}\n```'
+
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(fenced)
+
+        assert error.value.reason == SUPPRESS_PRIVACY
+
+
 class TestMalformedAnswers:
     @pytest.mark.parametrize(
         "payload",

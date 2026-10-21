@@ -41,31 +41,42 @@ def frame_header(frames: int) -> str:
 
 
 # The schema, in Chinese and in English, so the label language can be priced.
+#
+# The reply field says "Chinese" twice and gives an example. Measured on the
+# board, saying it once in prose produced English replies on half the rounds —
+# a 1B chat model follows a demonstrated shape better than a stated rule.
 _SCHEMA_ZH = (
-    "只输出一个 JSON 对象，字段固定为 kind、category、region、reply。\n"
+    "只输出一个 JSON 对象，不要加 markdown 代码块，字段固定为 kind、category、region、reply。\n"
     f"kind 取值：{'、'.join(KINDS)}。\n"
     f"category 取值：{'、'.join(CATEGORIES)}。\n"
     f"region 取值：{'、'.join(REGIONS)}。\n"
-    f"reply 是对该物品的一句中文短评，不超过 {DEFAULT_MAX_REPLY_CHARS} 字。\n"
+    f"reply 必须是中文，不超过 {DEFAULT_MAX_REPLY_CHARS} 字，不要用英文单词。\n"
+    '例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
 )
 _SCHEMA_EN = (
-    "Output one JSON object with exactly the fields kind, category, region, reply.\n"
+    "Output one JSON object with exactly the fields kind, category, region, reply. No markdown fence.\n"
     f"kind: {', '.join(KINDS)}.\n"
     f"category: {', '.join(CATEGORIES)}.\n"
     f"region: {', '.join(REGIONS)}.\n"
-    f"reply: one short Chinese remark about the item, at most {DEFAULT_MAX_REPLY_CHARS} characters.\n"
+    f"reply: Chinese only, at most {DEFAULT_MAX_REPLY_CHARS} characters, no English words.\n"
+    '例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
 )
 SCHEMA = {"zh": _SCHEMA_ZH, "en": _SCHEMA_EN}
 
 # The minimal ruleset: what the whitelist and the privacy boundary require the
 # model to be told, with nothing optional left in.
+#
+# Rule 1 leads with none because the board run showed the opposite failure to
+# the one expected: given a closed category list the model forced a match,
+# labelling gestures and cloth-folding as "sign" on nearly every round. Staying
+# quiet has to be presented as the normal answer, not as an exception.
 RULES_MINIMAL = (
     "规则：\n"
-    "1. 只描述离镜头最近的那个人正在展示的物品。\n"
-    "2. 物品不在上面的 category 取值里，kind 填 none。\n"
-    "3. 看不清就填 uncertain，不要猜。\n"
+    "1. 看不到上面 category 列出的物品时，kind 填 none，其他字段留空。这是最常见的情况。\n"
+    "2. 只描述离镜头最近的那个人正在展示或穿戴的物品。\n"
+    "3. 不确定是哪一类就填 uncertain，不要硬选一个。\n"
     "4. 不要读出画面里的文字、数字、品牌或标识。\n"
-    "5. 不要评价这个人的外貌、情绪、年龄或身份。\n"
+    "5. 不要评价这个人的外貌、情绪、年龄或身份；可以评价物品本身。\n"
 )
 
 # A fuller ruleset, to price what the extra guidance costs.
