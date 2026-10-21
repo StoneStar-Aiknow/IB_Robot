@@ -129,6 +129,18 @@ peripherals:
     - 2
     - 3
     - 4
+- # The playback device the runtime can launch when a deployment enables it
+  # (runtime-peripheral-overrides: the profile owns the driver and defaults;
+  # a robot configuration opts in with an enabled-true override entry).
+  type: speaker
+  name: speaker
+  driver: alsa
+  enabled: false
+  params:
+    device: ""
+    channels: 1
+    sample_rate: 24000
+    sample_format: S16LE
 - type: camera
   name: wrist
   driver: realsense

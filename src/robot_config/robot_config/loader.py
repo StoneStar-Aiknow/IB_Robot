@@ -297,7 +297,12 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
         microphone = matches[0]
         if microphone.get("type") != "microphone":
             errors.append("speech_direction.microphone must reference a peripheral with type=microphone")
-        if not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip():
+        provider = str((robot_config.get("runtime") or {}).get("provider", "") or "").strip()
+        if not provider and (not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip()):
+            # runtime-peripheral-overrides: on a provider path the entry is an
+            # override of a runtime-declared device and carries no driver; the
+            # driver requirement applies to provider-less configurations,
+            # whose entries are the microphone definitions.
             errors.append("speech direction microphone driver must be a non-empty string")
         microphone_parameters = microphone.get("params", {})
         if not isinstance(microphone_parameters, dict):
@@ -339,6 +344,40 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _provider_peripheral_entry_errors(peripherals: Any) -> list[str]:
+    """Structural and driver checks for one list of provider peripheral entries.
+
+    runtime-peripheral-overrides D1 (revision 2, review M1 + round 2 Minor 1):
+    EVERY provider configuration's peripheral entries are overrides of
+    runtime-declared devices, require_model or not — enabled, disabled or
+    filtered into ``runtime._disabled_peripherals`` alike. An entry names a
+    runtime-declared peripheral by (type, name) and may set its enabled state
+    and device settings; the runtime owns which peripherals exist, their
+    drivers and the validation of any override. Only ``driver`` is rejected
+    here — the runtime merge rejects a name it does not declare (the
+    configuration cannot declare a driver to add one). Non-mapping entries
+    are errors, not silently dropped.
+    """
+    if not peripherals:
+        return []
+    if not isinstance(peripherals, list):
+        return ["peripherals must be a list"]
+    errors: list[str] = []
+    for entry in peripherals:
+        if not isinstance(entry, dict):
+            errors.append("peripherals entries require type and name")
+            continue
+        if not entry.get("type") or not entry.get("name"):
+            errors.append("peripherals entries require type and name")
+            continue
+        if "driver" in entry:
+            errors.append(
+                f"peripheral ({entry.get('type')}, {entry.get('name')!r}) on a provider path "
+                "may not set driver: driver is runtime-owned; change the runtime profile"
+            )
+    return errors
+
+
 def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     """Validate the optional ``runtime.provider`` selection (robot-runtime-packaging).
 
@@ -369,31 +408,14 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
         platform_error = provider_sim_platform_error(sim_platform, provider)
         if platform_error:
             errors.append(platform_error)
+        # runtime-peripheral-overrides: the entry checks cover the public list
+        # AND the loader-recorded disabled entries (round 2 Minor 1: a disabled
+        # entry must not bypass the driver ban).
+        errors.extend(_provider_peripheral_entry_errors(robot_config.get("peripherals")))
+        errors.extend(_provider_peripheral_entry_errors(runtime.get("_disabled_peripherals")))
         if runtime.get("require_model"):
             if robot_config.get("ros2_control"):
                 errors.append("public runtime consumers must place hardware and peripherals in runtime.profile")
-            peripherals = robot_config.get("peripherals")
-            if peripherals:
-                # Deployment peripheral overrides on the provider path are
-                # toggle-only (runtime-simulation-transport D8): enabling or
-                # disabling a runtime-declared peripheral by (type, name).
-                # Anything that changes a driver or device settings belongs in
-                # the runtime profile; unknown names are rejected by the
-                # runtime's peripheral merge.
-                if not isinstance(peripherals, list):
-                    errors.append("peripherals must be a list")
-                else:
-                    for entry in peripherals:
-                        if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
-                            errors.append("peripherals entries require type and name")
-                            continue
-                        extra_keys = sorted(set(entry) - {"type", "name", "enabled", "disabled"})
-                        if extra_keys:
-                            errors.append(
-                                f"peripheral ({entry.get('type')}, {entry.get('name')!r}) on a provider path "
-                                f"may only toggle enabled/disabled (unexpected keys: {extra_keys}); "
-                                "driver and device settings belong in the runtime profile"
-                            )
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
@@ -850,7 +872,12 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         errors.append("semantic_mapping.camera.peripheral must reference a configured camera peripheral")
     else:
         peripheral = matching[0]
-        if peripheral.get("driver") != "realsense":
+        provider = str((robot_config.get("runtime") or {}).get("provider", "") or "").strip()
+        if not provider and peripheral.get("driver") != "realsense":
+            # runtime-peripheral-overrides: on a provider path the entry is an
+            # override of a runtime-declared camera and carries no driver; the
+            # realsense requirement applies to provider-less configurations,
+            # whose entries are the camera definitions.
             errors.append("semantic_mapping.camera.peripheral must use the realsense driver")
         if not peripheral.get("align_depth", False):
             errors.append("semantic_mapping.camera.peripheral must enable aligned depth")
@@ -1837,6 +1864,16 @@ def _normalized_quaternion(quaternion: list[float]) -> list[float]:
 
 
 def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
+    runtime = robot_config.get("runtime") or {}
+    if isinstance(runtime, dict) and runtime.get("provider") and runtime.get("require_model"):
+        # runtime-peripheral-overrides D1 (revision 2): on the require_model
+        # provider path calibration files are runtime-owned
+        # (so101-runtime-integration) and peripheral entries are overrides of
+        # runtime-declared devices, not camera definitions to provision
+        # transforms into. The artifact flow serves provider-less and
+        # non-require_model provider configurations, whose public entries
+        # are the camera definitions.
+        return
     calibration = robot_config.get("sensor_calibration", {})
     artifacts = calibration.get("artifacts", {}) if isinstance(calibration, dict) else {}
     artifact_value = artifacts.get("base_to_front_camera") if isinstance(artifacts, dict) else None
@@ -1945,18 +1982,45 @@ def load_robot_config_dict(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    runtime_section = robot_config.get("runtime") or {}
+    if isinstance(runtime_section, dict) and "_disabled_peripherals" in runtime_section:
+        # runtime-deployment-peripherals D2: the private key is framework
+        # generated (the loader records the entries it filters); it is never
+        # read from user YAML.
+        raise ValueError(
+            "runtime._disabled_peripherals is framework-generated (the loader records the disabled "
+            "peripheral entries it filters for the runtime fragment); remove it from the configuration"
+        )
     peripherals = robot_config.get("peripherals", [])
     if isinstance(peripherals, list):
         runtime = robot_config.get("runtime") or {}
+        if isinstance(runtime, dict) and runtime.get("provider"):
+            # runtime-peripheral-overrides round 2 (Minor 1): validate the RAW
+            # stage-resolved entries BEFORE the D2 filter, so a disabled entry
+            # cannot bypass the driver ban and a non-mapping entry is an error
+            # instead of being silently dropped. The framework-private
+            # recording below still only ever holds entries that passed here.
+            raw_errors = _provider_peripheral_entry_errors(peripherals)
+            if raw_errors:
+                raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(raw_errors))
         provider_owns_peripherals = bool(runtime.get("provider") and runtime.get("require_model"))
         if not provider_owns_peripherals:
+            # runtime-deployment-peripherals D2: record the dropped entries
+            # verbatim, in their original order, so the fragment builder's
+            # application layer carries an application `disabled: true` to the
+            # runtime even on providers without require_model (previously it
+            # was dropped silently and the profile's device stayed enabled).
+            # Mount and approved-calibration transforms never apply to
+            # disabled devices, so the pre-filter entries need no transforms.
+            disabled_entries = [item for item in peripherals if isinstance(item, dict) and item.get("disabled", False)]
             robot_config["peripherals"] = [
                 item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
             ]
-        # Provider configs keep their toggle-only peripheral entries so the
-        # deployment fragment handed to the runtime carries the enable/disable
-        # selections (runtime-simulation-transport D8); the runtime's merge
-        # applies the toggles to its declared peripherals.
+            if disabled_entries and isinstance(runtime, dict) and runtime.get("provider"):
+                runtime["_disabled_peripherals"] = disabled_entries
+        # Provider configs keep their peripheral entries (overrides of
+        # runtime-declared devices) so the fragment handed to the runtime
+        # carries them; the runtime's merge applies them to its profile.
     robot_config["_config_path"] = str(resolved_config_path)
     robot_config["_config_sources"] = [str(path) for path in config_sources]
     robot_config = resolve_robot_interfaces(robot_config, defer=defer_interface_binding)

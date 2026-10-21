@@ -10,6 +10,7 @@ from robot_config.perception_runtime_config import parse_perception_runtime_conf
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
+PROFILE_PATH = ROOT / "src/robots/lekiwi/lekiwi_robot/profiles/lekiwi_nav_grasp.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -59,17 +60,19 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     peripherals = {item["name"]: item for item in config["peripherals"]}
     # runtime-owned-audio-io: the speaker peripheral replaces the former
     # audio_io playback keys; the runtime launches it as the ALSA owner.
+    # runtime-peripheral-overrides: the entry is an override of the
+    # profile-declared speaker (the profile owns the driver and defaults to
+    # disabled); this deployment opts in with its parameters.
     assert set(peripherals) == {"respeaker", "speaker", "wrist", "front", "mid360"}
     assert peripherals["speaker"] == {
         "type": "speaker",
         "name": "speaker",
-        "driver": "alsa",
+        "enabled": True,
         "params": {"device": "", "channels": 1, "sample_rate": 24000, "sample_format": "S16LE"},
     }
     assert peripherals["respeaker"] == {
         "type": "microphone",
         "name": "respeaker",
-        "driver": "alsa",
         "params": {
             "device": "hw:0,0",
             "channels": 6,
@@ -82,7 +85,15 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     assert peripherals["front"]["transform"]["parent_frame"] == "base_link"
     assert peripherals["front"]["driver_camera_name"] == "front"
     assert peripherals["front"]["align_depth"] is True
-    assert peripherals["mid360"]["driver"] == "livox_mid360"
+    # the drivers are the runtime profile's declarations, not config keys
+    from robot_runtime.profile import load_profile
+
+    profile_peripherals = {entry["name"]: entry for entry in load_profile(PROFILE_PATH).get("peripherals") or []}
+    assert profile_peripherals["mid360"]["driver"] == "livox_mid360"
+    assert profile_peripherals["wrist"]["driver"] == "realsense"
+    assert profile_peripherals["front"]["driver"] == "realsense"
+    assert profile_peripherals["speaker"]["driver"] == "alsa"
+    assert profile_peripherals["speaker"]["enabled"] is False, "the profile default is off"
     assert config["semantic_mapping"]["camera"] == {
         "peripheral": "front",
         "mounting": "fixed",
@@ -259,9 +270,22 @@ def test_lean_stages_keep_semantic_mapping_disabled():
 def test_unified_profile_launches_wrist_and_front_realsense_drivers():
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
 
+    # The configuration entries are overrides of runtime-declared cameras (no
+    # driver keys since the all-provider driver ban); the realsense drivers
+    # are the lekiwi_nav_grasp profile's declarations, so the merged set —
+    # what the runtime launches — carries them.
+    from robot_runtime.interface_description import merge_peripherals
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(PROFILE_PATH)
+    merged = merge_peripherals(profile.get("peripherals"), config.get("peripherals"))
+    by_name = {entry["name"]: entry for entry in merged if entry.get("type") == "camera"}
+    assert {name for name, entry in by_name.items() if entry.get("driver") == "realsense"} == {"wrist", "front"}
+    # ... and the driver-composed nodes the runtime generates from the merged
+    # set name exactly those two cameras
     drivers = [
         node
-        for node in generate_camera_nodes(config, use_sim=False)
+        for node in generate_camera_nodes({"peripherals": merged}, use_sim=False)
         if vars(node).get("_Node__package") == "realsense2_camera"
     ]
     assert {vars(node).get("_Node__node_name") for node in drivers} == {"wrist_camera", "front"}

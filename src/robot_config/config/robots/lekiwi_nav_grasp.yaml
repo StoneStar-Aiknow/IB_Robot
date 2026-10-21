@@ -1215,13 +1215,15 @@ robot:
       - gripper_trajectory_controller
       - base_velocity_controller
 
-  # Audio devices are runtime-owned: the respeaker microphone above and this
-  # speaker are launched by the lekiwi_robot runtime as ALSA device owners on
+  # Audio devices are runtime-owned: the respeaker microphone and the speaker
+  # below are launched by the lekiwi_robot runtime as ALSA device owners on
   # the /audio/* topics; voice consumers bind audio.capture / audio.play.
+  # The entries are overrides of the runtime-declared devices (the profile
+  # owns the drivers; the speaker defaults to disabled there and this
+  # deployment enables it).
   peripherals:
     - type: microphone
       name: respeaker
-      driver: alsa
       params:
         device: "hw:0,0"
         channels: 6
@@ -1231,7 +1233,7 @@ robot:
 
     - type: speaker
       name: speaker
-      driver: alsa
+      enabled: true
       params:
         device: ""
         channels: 1
@@ -1240,7 +1242,6 @@ robot:
 
     - type: camera
       name: wrist
-      driver: realsense
       # Device-specific serials belong in a deployment instance override.
       # Leave the generic profile empty so other LeKiwi units can bind safely.
       serial_number: ""
@@ -1282,7 +1283,6 @@ robot:
 
     - type: camera
       name: front
-      driver: realsense
       driver_camera_name: front
       # Device-specific serials belong in a deployment instance override.
       serial_number: ""
@@ -1312,7 +1312,6 @@ robot:
 
     - type: lidar
       name: mid360
-      driver: livox_mid360
       frame_id: livox_frame
       lidar_ip: 192.168.1.139
       host_ip: 192.168.1.5

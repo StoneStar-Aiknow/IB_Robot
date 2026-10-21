@@ -13,12 +13,12 @@ robot:
   # This switch test uses no audio. A base_config overlay REPLACES the whole
   # peripherals list, so the parent's entries are restated verbatim with the
   # audio devices off (runtime-owned-audio-io: declared devices -- including
-  # the lekiwi profile's default microphone -- launch unconditionally).
+  # the lekiwi profile's default microphone and speaker -- launch
+  # unconditionally; the entries are overrides, the profile owns the drivers).
   peripherals:
   - type: microphone
     name: respeaker
     enabled: false
-    driver: alsa
     params:
       device: hw:0,0
       channels: 6
@@ -32,7 +32,6 @@ robot:
   - type: speaker
     name: speaker
     enabled: false
-    driver: alsa
     params:
       device: ''
       channels: 1
@@ -40,7 +39,6 @@ robot:
       sample_format: S16LE
   - type: camera
     name: wrist
-    driver: realsense
     serial_number: ''
     initial_reset: false
     width: 640
@@ -67,7 +65,6 @@ robot:
       yaw: -1.6776874824436123
   - type: camera
     name: front
-    driver: realsense
     driver_camera_name: front
     serial_number: ''
     width: 640
@@ -95,7 +92,6 @@ robot:
       yaw: 0.0
   - type: lidar
     name: mid360
-    driver: livox_mid360
     frame_id: livox_frame
     lidar_ip: 192.168.1.139
     host_ip: 192.168.1.5

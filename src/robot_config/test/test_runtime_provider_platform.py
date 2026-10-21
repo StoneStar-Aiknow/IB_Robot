@@ -229,11 +229,11 @@ def test_preparation_sets_gazebo_world_caps_for_a_provider():
 
 
 # ---------------------------------------------------------------------------
-# 3.1b: toggle-only deployment peripherals on the provider path
+# runtime-peripheral-overrides: configuration overrides on the provider path
 # ---------------------------------------------------------------------------
 
 
-def test_toggle_only_peripherals_are_accepted_for_require_model_providers():
+def test_toggle_entries_are_accepted_for_require_model_providers():
     config = _provider_config()
     config["peripherals"] = [
         {"type": "camera", "name": "front", "disabled": True},
@@ -243,19 +243,35 @@ def test_toggle_only_peripherals_are_accepted_for_require_model_providers():
     assert not errors
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        {"type": "camera", "name": "front", "driver": "opencv"},
-        {"type": "camera", "name": "front", "index": 2},
-        {"type": "camera", "name": "front", "transform": {"parent_frame": "base"}},
-    ],
-)
-def test_non_toggle_peripheral_keys_are_rejected(entry):
+def test_device_fields_are_accepted_for_require_model_providers():
+    # revision 2: an entry may set the enabled state and device settings of a
+    # runtime-declared peripheral; only driver stays runtime-owned.
     config = _provider_config()
-    config["peripherals"] = [entry]
+    config["peripherals"] = [
+        {
+            "type": "camera",
+            "name": "top",
+            "width": 1280,
+            "height": 720,
+            "fps": 15,
+            "pixel_format": "yuyv",
+            "depth_width": 640,
+            "depth_height": 480,
+            "depth_fps": 30,
+        },
+        {"type": "camera", "name": "front", "disabled": True},
+    ]
     errors = validate_runtime_provider_config(config)
-    assert any("may only toggle" in error for error in errors), errors
+    assert not errors, errors
+
+
+def test_driver_is_rejected_for_require_model_providers():
+    config = _provider_config()
+    config["peripherals"] = [{"type": "camera", "name": "front", "driver": "opencv"}]
+    errors = validate_runtime_provider_config(config)
+    assert any(
+        "may not set driver: driver is runtime-owned; change the runtime profile" in error for error in errors
+    ), errors
 
 
 def test_ros2_control_still_rejected_for_provider_configs():

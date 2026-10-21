@@ -1845,6 +1845,62 @@ ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_si
 相对 `model_path` 只相对于绝对路径环境变量 `WORKSPACE` 解析。Pipeline ID 决定默认 Action、
 reset、health 和分布式 topic；多个 pipeline 时 `executor.inference_pipeline` 必须明确选择一个。
 
+### Provider 配置覆盖 runtime 外设（runtime-peripheral-overrides）
+
+runtime.provider 配置（如 `so101_single_arm` 及其全部 overlay）可以在**机器人配置自己的
+`peripherals:` 列表**里覆盖 runtime 已声明外设的设备参数：相机分辨率、帧率、像素格式、
+`depth_*` 等，与同文件里的观测契约 `requires: {width, height, min_fps}` 放在一起。分层为
+**runtime profile < 机器人配置**（overlay 间按 `base_config` 叠加）。每台机器的差异写成
+sibling overlay（同时改相机参数和匹配的 `requires`）：
+
+```yaml
+# config/robots/so101_single_arm_720p.yaml — per-machine overlay
+robot:
+  base_config: so101_single_arm
+  name: so101_single_arm_720p
+
+  peripherals:
+    - type: camera
+      name: top
+      width: 1280
+      height: 720
+      fps: 15
+
+  contract:
+    observations:
+      - key: observation.images.top
+        interface: camera.top.color
+        requires: {width: 1280, height: 720, min_fps: 15}
+        image:
+          resize: [720, 1280]
+```
+
+生效规则（runtime-peripheral-overrides spec）：
+
+- **条目按 `(type, name)` 匹配 runtime 声明的外设**：可设 `enabled`/`disabled` 与设备
+  参数（未知字段在合并阶段保留、不按白名单拒绝；是否生效取决于具体 runtime 驱动适配器的
+  字段映射）。配置层在每个字段上胜出，**包括 enabled 状态**（配置可以
+  重新启用 profile 禁用的相机）。每层内 `disabled: X` 等价于 `enabled: not X`，同一
+  entry 同时写两个且语义矛盾会被拒绝。
+- **runtime 保留的权限**：`driver` 不允许出现在**任何** provider 配置（含
+  `require_model` 与非 `require_model`，如 LeKiwi）的条目里（加载即拒绝，点名条目）；
+  runtime 未声明的外设名也会被 runtime 的完整性规则拒绝（配置不能写 driver，因此无法
+  借此新增设备）。新增设备的正确路径是在 runtime profile 里声明（可默认
+  `enabled: false`，部署配置用覆盖条目开启——如 LeKiwi 的 speaker）。
+  `ros2_control` 与 controller 激活集仍归 require_model 配置的 runtime profile。
+- **观测契约仍然 fail closed**：配置把相机改成 1280x720 而契约 `requires` 仍是 640x480
+  时，绑定按接口点名失败（`requires.width=640, source=1280`），不会有任何 bound
+  consumer 启动——改相机参数时把 `requires` 一起改掉。
+- **值校验**：非法相机值（非正整数 `width/height`、非正有限数 `fps`、
+  `depth_width/depth_height` 必须成对、`depth_fps` 依赖两者）在 provider 启动时点名
+  报错；拼写错误的名字（如 `tpo`）同样在 provider 启动 setup 阶段失败，live-binding
+  配置下不会有任何 consumer 被构造。
+- **AimDK 边界**：`aimdk_robot` 的相机是厂商公共接口，非空 peripherals fragment 会被
+  显式拒绝。
+- **仿真限制**：Gazebo 的 depth/aligned-depth 流按 RGB-D 传感器实际渲染的 colour
+  尺寸/帧率广告（物理 depth_* 覆盖不生效）；MuJoCo 的相机帧率是插件全局速率
+  （`simulation.mujoco.camera_publish_rate`），单相机 `fps` 被其取代。
+
 ### 验证配置
 
 ```bash
@@ -1857,8 +1913,11 @@ python3 src/robot_config/robot_config/scripts/validate_config.py \
 
 `peripherals[]` 条目支持 `disabled: true` 标志：设置后该外设在 `load_robot_config()`
 与 perception launch builder 中被整体跳过（不加载配置、不生成相机节点）。用于
-Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意统一的禁用开关
-是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键不被识别）。
+Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意 provider-less 路径
+统一的禁用开关是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键在
+provider-less 的加载/构建路径不被识别）；**runtime.provider 路径上两种写法等价**
+（runtime merge 会把 `disabled: X` 规范化为 `enabled: not X`，见「Provider 配置覆盖
+runtime 外设」一节）。
 
 ### USB 相机（通过 `usb_cam`）
 

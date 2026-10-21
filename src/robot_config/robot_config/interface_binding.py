@@ -149,6 +149,35 @@ def required_interface_ids(config: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def semantic_mapping_interface_ids(config: Mapping[str, Any]) -> list[str]:
+    """Interface IDs the online semantic-mapping consumer needs from the runtime.
+
+    The node synchronises the configured camera's colour image, aligned-depth
+    image and camera info (``semantic_mapping.camera.peripheral``); a
+    ``query_only`` deployment subscribes to no camera. The IDs follow the
+    interface-description naming convention — the runtime's public description
+    decides them; robot_config never guesses topics. The runtime readiness
+    waiter validates them against the live description, so a runtime that
+    does not publish the aligned-depth stream (or the camera at all) fails
+    with a named error before any ``runtime_ready`` consumer starts
+    (runtime-peripheral-overrides review round 2, Major 1).
+    """
+    section = config.get("semantic_mapping")
+    if not isinstance(section, Mapping) or not section.get("enabled", False):
+        return []
+    if section.get("query_only", False):
+        return []
+    camera = section.get("camera")
+    peripheral = camera.get("peripheral") if isinstance(camera, Mapping) else None
+    if not isinstance(peripheral, str) or not peripheral:
+        return []
+    return [
+        f"camera.{peripheral}.color",
+        f"camera.{peripheral}.aligned_depth",
+        f"camera.{peripheral}.color_info",
+    ]
+
+
 def _requirements(value: Any, path: str) -> Mapping[str, Any]:
     from robot_runtime.interface_description import validate_interface_requirements
 

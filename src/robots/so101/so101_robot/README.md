@@ -118,6 +118,10 @@ description (`RuntimeStatus.interface_description_json`, schema v1,
   published under their declared profiles, pointcloud is opt-in. In simulated
   transport, synthetic publishers serve the same topics with typed payloads
   and the camera monitor measures real readiness from received samples.
+  Per-machine differences (a resolution or frame rate) go into the robot
+  configuration's `peripherals:` list next to the matching `requires` — see
+  *Peripheral overrides from the robot configuration*
+  below.
 - **Model metadata** — the description's `model` projection carries named
   joint groups, admissible physical limits, semantic home positions, motion
   frames and the `joint_conversions` table with its fingerprint. Inference,
@@ -172,3 +176,57 @@ contract to the public interfaces above. Overlays such as
 `so101_arm_aero_hand.yaml` is the retained provider-less profile for setups
 whose extra hardware (the Aero Hand) is not part of this runtime; the old
 provider-less single-arm bring-up configuration has been removed.
+
+## Peripheral overrides from the robot configuration
+
+Camera settings that differ per machine (resolution, frame rate, pixel
+format) are set in the **robot configuration's `peripherals:` list**, next to
+the observation contract (`requires: {width, height, min_fps}`) they must
+satisfy — a resolution change edits the configuration anyway, so the settings
+and the contract live in one place. Per-machine variants are `base_config`
+overlays of `so101_single_arm` that change both together. The runtime owns
+which peripherals exist, their drivers and their defaults; the configuration
+may override the enabled state and device settings of a declared device:
+
+```yaml
+# an overlay of so101_single_arm (peripherals + matching requires)
+robot:
+  base_config: so101_single_arm
+  name: so101_single_arm_720p
+  peripherals:
+    - type: camera
+      name: top
+      width: 1280
+      height: 720
+      fps: 15
+  contract:
+    observations:
+      - key: observation.images.top
+        interface: camera.top.color
+        requires: {width: 1280, height: 720, min_fps: 15}
+```
+
+Effective peripherals are layered by `(type, name)` — **runtime profile <
+robot configuration** — with the configuration winning on every field, the
+enabled state included: it can even re-enable a camera the profile disables.
+In every layer `disabled: X` is the same toggle as `enabled: not X`.
+
+What stays runtime-owned: a configuration entry may not set `driver` (the
+loader rejects it naming the entry) and cannot add a peripheral the runtime
+does not declare (the runtime's merge rejects an undeclared entry, and the
+configuration cannot declare a driver to add one).
+
+Fail-fast guarantees: a misspelled `(type, name)` and invalid camera values
+(non-positive or non-integer `width`/`height`, non-finite `fps`, unpaired
+`depth_width`/`depth_height`, `depth_fps` without the depth dimensions) fail
+the launch naming the device and the field, before any bound consumer
+starts. The observation contract still fails closed at binding: changing the
+camera without changing the matching `requires` fails the binding naming the
+interface and the mismatched width.
+
+Simulator limits: on **Gazebo** the depth/aligned-depth streams advertise
+the colour dimensions and rate the RGB-D sensor actually renders (the
+physical device's `depth_*` overrides do not apply); on **MuJoCo** the
+camera rate is the plugin's single global rate
+(`simulation.mujoco.camera_publish_rate`), which supersedes a per-camera
+`fps`. `fast_lio` stays in the application's `navigation.fast_lio:`.

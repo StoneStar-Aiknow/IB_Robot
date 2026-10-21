@@ -19,14 +19,15 @@ import yaml
 _PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
 _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"
 
-# The speaker the migrated lekiwi_nav_grasp deployment declares (parameters
-# carried over verbatim from its former audio_io.playback_* keys).
+# The speaker the migrated lekiwi_nav_grasp deployment declares: an
+# enabled-true override of the profile-declared (default-disabled) device,
+# parameters carried over verbatim from its former audio_io.playback_* keys.
 _SPEAKER_FRAGMENT = {
     "peripherals": [
         {
             "type": "speaker",
             "name": "speaker",
-            "driver": "alsa",
+            "enabled": True,
             "params": {"device": "", "channels": 1, "sample_rate": 24000, "sample_format": "S16LE"},
         }
     ]
