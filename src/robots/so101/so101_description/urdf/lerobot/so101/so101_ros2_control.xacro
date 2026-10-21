@@ -17,13 +17,19 @@
     <!-- sim_plugin: hardware plugin for simulation. Default = Gazebo.
          MuJoCo: description.py passes "mujoco_ros2_control/MujocoSystemInterface" when platform=mujoco. -->
     <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
-    <!-- gazebo_effort_state: expose the effort state interface so the runtime's
+    <!-- sim_effort_state: expose the effort state interface so the runtime's
          simulated joint-current publisher can derive joint.current from the
-         simulated effort (runtime-simulation-transport D6b). Gazebo transport
-         only; the hardware/SDK plugins do not export effort. -->
-    <xacro:arg name="gazebo_effort_state" default="false"/>
+         simulated effort (runtime-simulation-transport D6b). Physics
+         transports only (Gazebo, MuJoCo); the hardware/SDK plugins do not
+         export effort. -->
+    <xacro:arg name="sim_effort_state" default="false"/>
     <xacro:arg name="mujoco_model" default=""/>
     <xacro:arg name="camera_publish_rate" default=""/>
+    <!-- mujoco_headless: the mujoco_ros2_control 0.0.3 <hardware> "headless"
+         parameter (no Simulate UI window). Camera rendering still opens a
+         hidden GLFW context, so a GL context (desktop display or xvfb-run)
+         remains required. -->
+    <xacro:arg name="mujoco_headless" default="false"/>
 
     <ros2_control name="RobotSystem" type="system">
         <xacro:if value="$(arg use_sim)">
@@ -34,6 +40,9 @@
                 </xacro:if>
                 <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
                     <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
+                </xacro:if>
+                <xacro:if value="$(arg mujoco_headless)">
+                    <param name="headless">true</param>
                 </xacro:if>
             </hardware>
         </xacro:if>
@@ -57,7 +66,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">1</param>
@@ -71,7 +80,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">2</param>
@@ -85,7 +94,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">3</param>
@@ -99,7 +108,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">4</param>
@@ -112,7 +121,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">5</param>
@@ -132,7 +141,7 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
-            <xacro:if value="$(arg gazebo_effort_state)">
+            <xacro:if value="$(arg sim_effort_state)">
                 <state_interface name="effort" />
             </xacro:if>
             <param name="id">6</param>

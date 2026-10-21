@@ -141,7 +141,12 @@ def test_digest_and_unknown_states(profile):
 
 @pytest.mark.parametrize(
     ("use_sim", "sim_platform", "execution"),
-    [(False, None, "physical"), (True, "sdk", "simulated"), (True, "gazebo", "simulated")],
+    [
+        (False, None, "physical"),
+        (True, "sdk", "simulated"),
+        (True, "gazebo", "simulated"),
+        (True, "mujoco", "simulated"),
+    ],
 )
 def test_description_records_sim_platform_and_execution(profile, use_sim, sim_platform, execution):
     doc = build_description(profile, use_sim=use_sim, sim_platform=sim_platform)
@@ -172,6 +177,43 @@ def test_digest_covers_sim_platform(profile):
     doc["sim_platform"] = "gazebo"
     with pytest.raises(ValueError, match="digest"):
         validate_description(doc)
+
+
+def test_mujoco_description_validates_and_keeps_a_stable_digest(profile):
+    # the schema enum and the reader accept mujoco (D1), and re-digesting the
+    # same document reproduces the digest exactly as for the older platforms
+    doc = build_description(profile, use_sim=True, sim_platform="mujoco")
+    assert description_sim_platform(doc) == "mujoco"
+    assert doc["digest"] == description_digest(doc)
+    validate_description(doc)
+    again = build_description(profile, use_sim=True, sim_platform="mujoco")
+    assert again["digest"] == doc["digest"]
+
+
+def test_mujoco_depth_stream_dims_come_from_the_rendered_camera(profile):
+    # The plugin renders one MJCF camera at width x height for every stream
+    # (D5): unequal device depth overrides must not leak into the mujoco
+    # contract (finding 7).
+    peripherals = [
+        {
+            "type": "camera",
+            "name": "front",
+            "driver": "realsense",
+            "width": 16,
+            "height": 12,
+            "depth_width": 8,
+            "depth_height": 6,
+            "align_depth": True,
+            "streams": ["color", "depth"],
+        }
+    ]
+    descriptor = build_description({**profile, "peripherals": peripherals}, use_sim=True, sim_platform="mujoco")
+    for stream in ("camera.front.depth", "camera.front.aligned_depth"):
+        configured = descriptor["interfaces"][stream]["configured_profile"]
+        assert (configured["width"], configured["height"]) == (16, 12), f"{stream} uses the rendered dims"
+    # off mujoco the device-specific depth dims are still honoured
+    gazebo = build_description({**profile, "peripherals": peripherals}, use_sim=True, sim_platform="gazebo")
+    assert gazebo["interfaces"]["camera.front.depth"]["configured_profile"]["width"] == 8
 
 
 def test_pre_platform_description_stays_valid_and_defaults_from_execution(profile):
@@ -431,3 +473,16 @@ def test_synthetic_perception_publishes_an_unstamped_message(profile):
     descriptor["digest"] = description_digest(descriptor)
     SyntheticStreams(_Node(), descriptor)
     assert published and isinstance(published[0], Float64MultiArray)
+
+
+def test_camera_frames_come_from_the_shared_advertised_frames_helper(profile, monkeypatch):
+    """5b.3/D: the description must not re-derive the frame convention."""
+    import robot_runtime.interface_description as description_module
+
+    def sentinel(_periph):
+        return ("SENTINEL_IMAGE_FRAME", "SENTINEL_INFO_FRAME")
+
+    monkeypatch.setattr(description_module, "advertised_camera_frames", sentinel)
+    doc = build_description(profile, use_sim=True)
+    assert doc["interfaces"]["camera.front.color"]["frame_id"] == "SENTINEL_IMAGE_FRAME"
+    assert doc["interfaces"]["camera.front.color_info"]["frame_id"] == "SENTINEL_INFO_FRAME"

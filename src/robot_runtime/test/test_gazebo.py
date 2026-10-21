@@ -45,7 +45,7 @@ XACRO = """<?xml version="1.0"?>
   <xacro:arg name="use_sim" default="true"/>
   <xacro:arg name="simulated" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
-  <xacro:arg name="gazebo_effort_state" default="false"/>
+  <xacro:arg name="sim_effort_state" default="false"/>
   <xacro:arg name="gz_ros2_control_parameters_file" default=""/>
   <link name="base">
     <visual><geometry><mesh><filename>package://robot_runtime/meshes/none.stl</filename></mesh></geometry></visual>
@@ -65,7 +65,7 @@ XACRO = """<?xml version="1.0"?>
         <command_interface name="position"/>
         <state_interface name="position"/>
         <state_interface name="velocity"/>
-        <xacro:if value="$(arg gazebo_effort_state)">
+        <xacro:if value="$(arg sim_effort_state)">
           <state_interface name="effort"/>
         </xacro:if>
       </joint>
@@ -398,6 +398,10 @@ def test_motion_launch_arguments_follow_the_platform_clock(tmp_path):
     gazebo = motion_launch_arguments(profile, tmp_path / "robot.xacro", True, "gazebo", False)
     assert gazebo["use_sim_time"] == "true"
     assert gazebo["motion_hardware_feedback_topic"] == ""
+    # mujoco is a physics platform like gazebo: every motion node runs on sim time
+    mujoco = motion_launch_arguments(profile, tmp_path / "robot.xacro", True, "mujoco", False)
+    assert mujoco["use_sim_time"] == "true"
+    assert mujoco["motion_hardware_feedback_topic"] == ""
     sdk = motion_launch_arguments(profile, tmp_path / "robot.xacro", True, "sdk", False)
     assert sdk["use_sim_time"] == "false"
     hardware = motion_launch_arguments(profile, tmp_path / "robot.xacro", False, "", False)
@@ -630,6 +634,15 @@ def test_disabled_camera_is_absent_everywhere(tmp_path):
     assert not any(isinstance(a, Node) and a._Node__node_name == "front_camera" for a in hardware_actions)
 
 
+def test_peripheral_stack_on_a_physics_platform_is_audio_only(tmp_path):
+    profile = _profile(tmp_path)
+    for platform in ("gazebo", "mujoco"):
+        actions = peripheral_stack_actions(profile, "", simulated=True, sim_platform=platform)
+        executables = {a._Node__node_executable for a in actions if isinstance(a, Node)}
+        assert "synthetic_perception" not in executables, f"{platform}: the simulator serves the camera streams"
+        assert not any("camera" in exe for exe in executables), f"{platform}: no camera driver nodes"
+
+
 def test_enabled_false_and_disabled_true_are_the_same_toggle():
     assert merge_peripherals([TOP], [{"type": "camera", "name": "top", "enabled": False}]) == []
     assert merge_peripherals([TOP], [{"type": "camera", "name": "top", "disabled": True}]) == []
@@ -682,3 +695,56 @@ def test_joint_current_node_only_on_gazebo(tmp_path):
     # a profile without the joint.current interface gets no publisher
     bare = _profile(tmp_path, with_joint_current=False)
     assert simulated_joint_current_actions(bare) == []
+
+
+def test_joint_current_scale_is_looked_up_per_platform(tmp_path):
+    profile = _profile(tmp_path)
+    profile["simulation"] = {
+        "gazebo": {"joint_current": {"scale": [2.0]}},
+        "mujoco": {"joint_current": {"scale": [3.5]}},
+    }
+    gazebo_node = _node(
+        [a for a in simulated_joint_current_actions(profile, sim_platform="gazebo") if isinstance(a, Node)],
+        "simulated_joint_current",
+    )
+    mujoco_node = _node(
+        [a for a in simulated_joint_current_actions(profile, sim_platform="mujoco") if isinstance(a, Node)],
+        "simulated_joint_current",
+    )
+    assert _params(gazebo_node)["scale"] == [2.0]
+    assert _params(mujoco_node)["scale"] == [3.5]
+    # a platform section without the scale falls back to 1 per joint
+    fallback = _node(
+        [a for a in simulated_joint_current_actions(_profile(tmp_path), sim_platform="mujoco") if isinstance(a, Node)],
+        "simulated_joint_current",
+    )
+    assert _params(fallback)["scale"] == [1.0]
+
+
+def test_advertised_camera_frames_is_the_single_source_of_the_convention():
+    """5b.3/D: one helper defines the opencv/realsense/camera_ros frame rules."""
+    from robot_runtime.gazebo import advertised_camera_frame, advertised_camera_frames
+
+    opencv = {"name": "top", "driver": "opencv", "frame_id": "camera_top_frame", "optical_frame_id": "unused"}
+    assert advertised_camera_frames(opencv) == ("camera_top_frame", "camera_top_frame")
+    assert advertised_camera_frame(opencv) == "camera_top_frame"
+
+    realsense = {
+        "name": "front",
+        "driver": "realsense",
+        "frame_id": "camera_front_link",
+        "optical_frame_id": "camera_front_optical_frame",
+    }
+    assert advertised_camera_frames(realsense) == ("camera_front_optical_frame", "camera_front_optical_frame")
+
+    remapped = {**realsense, "direct_topic_remap": True}
+    assert advertised_camera_frames(remapped) == (None, "camera_front_optical_frame")
+    assert advertised_camera_frame(remapped) == "camera_front_optical_frame"
+
+    assert advertised_camera_frames({"name": "cam", "driver": "camera_ros"}) == (None, None)
+
+    # defaults when the YAML omits the explicit frame ids
+    assert advertised_camera_frames({"name": "wrist", "driver": "opencv"}) == (
+        "camera_wrist_frame",
+        "camera_wrist_frame",
+    )

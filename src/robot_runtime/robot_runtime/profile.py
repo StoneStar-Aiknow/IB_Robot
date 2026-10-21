@@ -44,7 +44,14 @@ from robot_runtime.contract import IDLE_MODE, STOP_POLICIES
 #: Simulation platforms a runtime profile may declare (runtime-simulation-platform D1).
 #: ``sdk`` is the vendor SDK virtual bus behind the production hardware adapter
 #: (no physics); physical execution is not a simulation platform.
-SIM_PLATFORMS = ("sdk", "gazebo")
+SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
+
+#: Platforms that replace the robot with a physics simulator
+#: (so101-mujoco-runtime-platform D1). Every ``== "gazebo"`` test that really
+#: means "a physics simulator provides the clock and the world-side rules"
+#: must test membership here instead; tests about Gazebo specifics (entity
+#: creation, gz bridges) keep the literal platform.
+PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
 
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")

@@ -95,6 +95,17 @@ def test_declared_gazebo_platform_resolves():
     assert resolve_sim_selection(profile, "", "gazebo", "") == (True, "gazebo")
 
 
+def test_declared_mujoco_platform_resolves_and_undeclared_fails():
+    profile = _profile(sim_platforms=["sdk", "gazebo", "mujoco"])
+    assert resolve_sim_selection(profile, "true", "mujoco", "") == (True, "mujoco")
+    assert resolve_sim_selection(profile, "", "mujoco", "") == (True, "mujoco")
+    with pytest.raises(
+        RuntimeProfileError,
+        match=r"sim_platform 'mujoco' is not supported.*supported: \['sdk'\].*profile: /tmp/p.yaml",
+    ):
+        resolve_sim_selection(_profile(), "true", "mujoco", "", source="/tmp/p.yaml")
+
+
 def test_profile_without_selection_keys_keeps_legacy_behaviour():
     profile = {"runtime": {"name": "test_robot", "version": "0.1.0"}, "simulated": True}
     assert resolve_sim_selection(profile, "", "", "") == (True, "sdk")

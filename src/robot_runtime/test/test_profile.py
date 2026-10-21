@@ -49,6 +49,18 @@ def test_profile_declares_supported_platforms_and_default():
     assert data["simulated"] is False
 
 
+def test_profile_may_declare_mujoco_and_physics_platforms_vocabulary():
+    from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
+
+    data = _minimal()
+    data["sim_platforms"] = ["sdk", "gazebo", "mujoco"]
+    data["sim_platform"] = "mujoco"
+    validate_profile(data, "unit")
+    assert data["sim_platform"] == "mujoco"
+    # the physics vocabulary is exactly the non-sdk platforms (D1)
+    assert set(PHYSICS_SIM_PLATFORMS) == set(SIM_PLATFORMS) - {"sdk"}
+
+
 def test_simulated_alias_disagreeing_with_use_sim_fails_naming_both():
     data = _minimal()
     data["use_sim"] = False

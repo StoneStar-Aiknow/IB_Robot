@@ -21,6 +21,7 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
+from robot_runtime.gazebo import advertised_camera_frames
 from robot_runtime.profile import SIM_PLATFORMS
 
 
@@ -278,7 +279,9 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
     }
 
 
-def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str | None = None) -> dict[str, dict]:
+def peripheral_interfaces(
+    peripherals: list[dict] | None, *, sim_platform: str | None = None, camera_rate_hz: float | None = None
+) -> dict[str, dict]:
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = merge_peripherals(peripherals, [])
@@ -337,15 +340,16 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str |
                 # rgbd_camera publishes no depth camera_info (its depth image
                 # shares the color intrinsics) and no color-aligned pointcloud.
                 streams = [stream for stream in streams if stream != "pointcloud"]
+            if sim_platform == "mujoco":
+                # The MuJoCo plugin produces no color-aligned pointcloud
+                # (so101-mujoco-runtime-platform D5); depth it does produce
+                # (32FC1, spike T0).
+                streams = [stream for stream in streams if stream != "pointcloud"]
             prefix = f"/camera/{name}"
             capability = "perception.camera"
-            image_frame = periph.get("frame_id", f"camera_{name}_frame")
-            info_frame = image_frame
-            if driver == "realsense":
-                image_frame = periph.get("optical_frame_id") if not periph.get("direct_topic_remap") else None
-                info_frame = periph.get("optical_frame_id")
-            if driver == "camera_ros":
-                image_frame = info_frame = None
+            # the shared advertised-frame convention (5b.3): one helper for
+            # the description, the gz frame_id and the MuJoCo sensor frame_name
+            image_frame, info_frame = advertised_camera_frames(periph)
             for stream in ("color", "depth", "aligned_depth"):
                 aligned = stream == "aligned_depth"
                 if stream == "color" and "color" not in streams:
@@ -365,6 +369,13 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str |
                     if is_color or aligned
                     else periph.get("depth_height", periph.get("height", 480))
                 )
+                if sim_platform == "mujoco" and not (is_color or aligned):
+                    # the plugin renders one MJCF camera (width x height) for
+                    # every stream (D5): the depth stream dims are the rendered
+                    # camera's dims, never the physical device's
+                    # depth_width/depth_height
+                    width = periph.get("width", 640)
+                    height = periph.get("height", 480)
                 fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
                 if driver == "realsense":
                     wire_format = periph.get("color_format", "RGB8") if is_color else periph.get("depth_format", "Z16")
@@ -390,6 +401,15 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str |
                     # (PR !515 P2). The contract on this platform is what the
                     # simulator actually publishes.
                     encoding = "32FC1"
+                if sim_platform == "mujoco":
+                    # the plugin always publishes rgb8 color and 32FC1 metre
+                    # depth (spike T0); the contract on this platform is what
+                    # the simulator actually publishes (D5)
+                    encoding = "rgb8" if is_color else "32FC1"
+                if sim_platform == "mujoco" and camera_rate_hz is not None:
+                    # the plugin has one rate for all cameras (D5): every
+                    # stream advertises the effective rate
+                    fps = float(camera_rate_hz)
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
                 endpoint = f"{prefix}{suffix}/{'image_raw' if is_color or aligned else 'image_rect_raw'}"
                 info_topic = f"{prefix}{suffix}/camera_info"
@@ -432,6 +452,12 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str |
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
+                if sim_platform == "mujoco":
+                    # the plugin's camera publishers are reliable (depth 1):
+                    # large images lose fragments without repair under
+                    # best-effort, so the contract on this platform offers
+                    # reliable delivery (what the simulator actually publishes)
+                    interfaces[key]["qos"]["reliability"] = "reliable"
                 if sim_platform == "gazebo" and not is_color:
                     # the shared color info interface above already carries the
                     # depth intrinsics; a dedicated depth info topic has no
@@ -440,6 +466,8 @@ def peripheral_interfaces(peripherals: list[dict] | None, *, sim_platform: str |
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
                 )
+                if sim_platform == "mujoco":
+                    interfaces[f"{key}_info"]["qos"]["reliability"] = "reliable"
             if "pointcloud" in streams:
                 interfaces[f"camera.{name}.points"] = _topic(
                     f"{prefix}/depth/color/points",
@@ -627,6 +655,14 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
     }
 
 
+def _mujoco_camera_rate(profile: dict) -> float:
+    """The effective MuJoCo camera rate for the description (lazy import: the
+    rate algorithm lives next to the MuJoCo camera generation, D5)."""
+    from robot_runtime.mujoco import mujoco_camera_publish_rate  # noqa: PLC0415
+
+    return mujoco_camera_publish_rate(profile)
+
+
 def build_description(
     profile: dict,
     peripherals: list[dict] | None = None,
@@ -660,7 +696,13 @@ def build_description(
                 f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}"
             )
     interfaces = peripheral_interfaces(
-        profile.get("peripherals") if peripherals is None else peripherals, sim_platform=sim_platform
+        profile.get("peripherals") if peripherals is None else peripherals,
+        sim_platform=sim_platform,
+        camera_rate_hz=(
+            _mujoco_camera_rate({**profile, "peripherals": peripherals or profile.get("peripherals") or []})
+            if sim_platform == "mujoco"
+            else None
+        ),
     )
     # Audio peripherals derive the interaction.audio_* capability entries. A
     # profile that additionally declares them explicitly must agree with the
