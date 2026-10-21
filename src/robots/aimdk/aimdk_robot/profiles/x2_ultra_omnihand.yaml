@@ -917,6 +917,37 @@ interfaces:
       durability: volatile
       history: keep_last
       depth: 5
+  camera.rgb_head_front_center.color_half_compressed:
+    # Half-resolution forward-centre colour, republished by the robot's
+    # hri_halfres_relay node rather than straight off the sensor HAL.
+    #
+    # Measured on the robot (2026-10-21), against the full-resolution stereo
+    # stream below:
+    #
+    #   this stream   30.1 Hz   p50 33 ms   p95 35 ms   ~80 KB JPEG
+    #   stereo left   10.0 Hz   p50 100 ms  p95 107 ms  ~296 KB JPEG (2064x1552)
+    #
+    # Three times the frame rate at a quarter of the bytes, and already close
+    # to the 448x448 a vision-language model takes, so visual interaction reads
+    # this one. Note the QoS is the opposite of the stereo stream's: this relay
+    # publishes BEST_EFFORT/VOLATILE, which is why a subscriber must take the
+    # profile's values rather than assume either.
+    #
+    # The full-resolution rgb_head_front_center/rgb_image/compressed endpoint
+    # stays out of this profile: the vendor withdrew it in v0.8.1 and the
+    # contract test forbids it. This is the relay's own half-resolution topic,
+    # which is what the robot actually publishes for perception consumers.
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+    message_type: sensor_msgs/msg/CompressedImage
+    rate_hz: 30.0
+    qos:
+      reliability: best_effort
+      durability: volatile
+      history: keep_last
+      depth: 5
   camera.stereo_head_front_left.color_compressed:
     capability: perception.camera
     kind: topic

@@ -21,13 +21,29 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-# The one interface the session needs. mirror uses the same camera for the same
-# reason: it is declared in the X2 runtime profile, it faces forward, and it is
-# what the magic-mirror deployment already watches a visitor with.
-CAMERA_COMPRESSED = "camera.stereo_head_front_left.color_compressed"
+# The camera the session reads: the robot's half-resolution forward-centre
+# relay. Measured on the robot (2026-10-21) against the full-resolution stereo
+# stream the magic mirror uses:
+#
+#   half-res centre   30.1 Hz   p50 33 ms   ~80 KB JPEG
+#   stereo left       10.0 Hz   p50 100 ms  ~296 KB JPEG (2064x1552)
+#
+# Three times the rate at a quarter of the bytes, and already near the 448x448
+# a vision-language model takes. The two also publish with opposite QoS — this
+# relay is BEST_EFFORT/VOLATILE, the stereo stream RELIABLE/TRANSIENT_LOCAL —
+# which is why the node builds its subscription from the declared profile
+# instead of assuming either.
+CAMERA_HALF_COMPRESSED = "camera.rgb_head_front_center.color_half_compressed"
+
+# The default: the camera the session reads unless a deployment names another.
+CAMERA_COMPRESSED = CAMERA_HALF_COMPRESSED
+# The full-resolution stereo stream stays resolvable: mirror reads it, and a
+# deployment may still choose it.
+CAMERA_STEREO_LEFT_COMPRESSED = "camera.stereo_head_front_left.color_compressed"
 
 _SHAPES: Mapping[str, tuple[str, str, str]] = {
-    CAMERA_COMPRESSED: ("topic", "publish", "sensor_msgs/msg/CompressedImage"),
+    CAMERA_HALF_COMPRESSED: ("topic", "publish", "sensor_msgs/msg/CompressedImage"),
+    CAMERA_STEREO_LEFT_COMPRESSED: ("topic", "publish", "sensor_msgs/msg/CompressedImage"),
     "camera.stereo_head_front_right.color_compressed": (
         "topic",
         "publish",

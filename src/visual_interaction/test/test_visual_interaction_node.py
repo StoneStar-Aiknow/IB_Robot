@@ -163,7 +163,7 @@ class TestDeclaredParameters:
         assert PARAMETERS["vl_implementation"] == "fake"
 
 
-CAMERA_ENDPOINT = "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed"
+CAMERA_ENDPOINT = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
 
 # rclpy gives every node these, and they cannot be declined.
 RCLPY_SERVICES = frozenset(
@@ -196,7 +196,7 @@ def node():
             "runtime_version": "1",
         },
         "interfaces": {
-            "camera.stereo_head_front_left.color_compressed": {
+            "camera.rgb_head_front_center.color_half_compressed": {
                 "kind": "topic",
                 "direction": "publish",
                 "message_type": "sensor_msgs/msg/CompressedImage",

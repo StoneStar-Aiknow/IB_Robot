@@ -16,8 +16,8 @@ from visual_interaction.launch_builders.visual_interaction import (
     generate_visual_interaction_nodes,
 )
 
-CAMERA_ID = "camera.stereo_head_front_left.color_compressed"
-CAMERA_ENDPOINT = "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed"
+CAMERA_ID = "camera.rgb_head_front_center.color_half_compressed"
+CAMERA_ENDPOINT = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
 
 _DESCRIPTION = {
     "robot": {"id": "x2", "type": "x2_ultra_omnihand", "runtime_name": "aimdk", "runtime_version": "1"},

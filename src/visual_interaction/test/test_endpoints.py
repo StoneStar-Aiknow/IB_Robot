@@ -4,13 +4,14 @@ import pytest
 
 from visual_interaction.session.endpoints import (
     CAMERA_COMPRESSED,
+    CAMERA_STEREO_LEFT_COMPRESSED,
     FORBIDDEN_PREFIXES,
     EndpointBindingError,
     assert_observation_only,
     resolve_camera,
 )
 
-CAMERA_ENDPOINT = "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed"
+CAMERA_ENDPOINT = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
 
 
 def description(**overrides):
@@ -47,8 +48,33 @@ class TestResolveCamera:
         assert endpoint.qos["reliability"] == "reliable"
         assert endpoint.qos["depth"] == 5
 
-    def test_the_default_is_the_camera_the_mirror_already_watches_a_visitor_with(self):
-        assert CAMERA_COMPRESSED == "camera.stereo_head_front_left.color_compressed"
+    def test_the_default_is_the_half_resolution_relay(self):
+        """Measured on the robot: 30.1 Hz at ~80 KB, against 10.0 Hz at ~296 KB.
+
+        The stereo stream the magic mirror watches declares 30 Hz and delivers
+        10, at a quarter of this one's frame rate and four times its bytes,
+        full-resolution 2064x1552 that a vision-language model immediately
+        scales to 448x448 anyway.
+        """
+        assert CAMERA_COMPRESSED == "camera.rgb_head_front_center.color_half_compressed"
+
+    def test_the_stereo_stream_stays_resolvable(self):
+        """A deployment may still choose it, and the mirror reads it."""
+        stereo_endpoint = "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed"
+        bound = {
+            "robot": {"id": "x2", "type": "x2_ultra_omnihand", "runtime_name": "aimdk", "runtime_version": "1"},
+            "interfaces": {
+                CAMERA_STEREO_LEFT_COMPRESSED: {
+                    "kind": "topic",
+                    "direction": "publish",
+                    "message_type": "sensor_msgs/msg/CompressedImage",
+                    "endpoint": stereo_endpoint,
+                    "qos": {"reliability": "reliable", "durability": "transient_local", "depth": 5},
+                }
+            },
+        }
+
+        assert resolve_camera(bound, CAMERA_STEREO_LEFT_COMPRESSED).endpoint == stereo_endpoint
 
     def test_an_unbound_description_is_refused_by_code(self):
         for value in [{}, {"interfaces": None}, "not a mapping", None]:

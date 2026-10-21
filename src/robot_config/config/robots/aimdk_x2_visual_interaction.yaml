@@ -95,16 +95,24 @@ robot:
     enabled: true
 
     # Resolved by interface ID from the live runtime description, never as a
-    # topic name. This is the same compressed stream the magic-mirror
-    # deployment already watches a visitor with: declared in the X2 profile,
-    # forward-facing, 30 Hz.
+    # topic name.
     #
-    # Not the camera the board demo used
-    # (camera.rgb_head_front_center.color_compressed): the vendor withdrew it
-    # from the open interface set in v0.8.1, and the profile contract test
-    # forbids it appearing in any endpoint.
+    # The robot's half-resolution forward-centre relay, measured against the
+    # full-resolution stereo stream the magic mirror uses (2026-10-21):
+    #
+    #   half-res centre   30.1 Hz   p50 33 ms   ~80 KB JPEG
+    #   stereo left       10.0 Hz   p50 100 ms  ~296 KB JPEG (2064x1552)
+    #
+    # Three times the rate at a quarter of the bytes, and already near the
+    # 448x448 a vision-language model takes, so it is the better source for
+    # reading what a visitor is doing. The stereo stream's declared 30 Hz is
+    # not what it delivers.
+    #
+    # This is the relay's own rgb_image_half topic, not the full-resolution
+    # rgb_head_front_center/rgb_image/compressed endpoint the vendor withdrew
+    # in v0.8.1 and the profile contract test still forbids.
     frame_source:
-      interface: camera.stereo_head_front_left.color_compressed
+      interface: camera.rgb_head_front_center.color_half_compressed
 
     vl:
       implementation: fake
