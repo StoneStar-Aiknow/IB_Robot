@@ -195,6 +195,13 @@ class TestParameters:
         assert values["absent_reset_sec"] == 15.0
         assert values["max_session_sec"] == 90.0
 
+    def test_internvl_reaches_the_node_with_its_deployment_path(self):
+        """The deployment is on the board, so its path has to travel with it."""
+        values = self.parameters(vl={"implementation": "internvl", "demo_root": "/root/vlx_internvl_310p"})
+
+        assert values["vl_implementation"] == "internvl"
+        assert values["vl_demo_root"] == "/root/vlx_internvl_310p"
+
     def test_the_category_whitelist_reaches_the_node(self):
         """As JSON: an empty ROS string array has no inferable element type,
         so rclpy declared BYTE_ARRAY and the node refused the builder's
@@ -256,9 +263,23 @@ class TestValidation:
         assert 'runtime.get("interface_description")' in inspect.getsource(mirror_session._runtime_description)
         assert 'runtime.get("interface_description")' in inspect.getsource(ours._runtime_description)
 
-    def test_an_unwired_model_is_refused(self):
-        with pytest.raises(ValueError, match="only 'fake' is wired"):
+    def test_an_unknown_model_is_refused(self):
+        with pytest.raises(ValueError, match="expected 'fake' or 'internvl'"):
+            generate_visual_interaction_nodes(config(vl={"implementation": "llava"}))
+
+    def test_internvl_without_a_deployment_path_is_refused(self):
+        """It lives on the board, not in this repository, so it must be named.
+
+        Refusing here rather than at the first round keeps a launch from coming
+        up as a node that can never answer.
+        """
+        with pytest.raises(ValueError, match="demo_root must be an absolute path"):
             generate_visual_interaction_nodes(config(vl={"implementation": "internvl"}))
+
+    def test_a_deployment_path_without_internvl_is_refused(self):
+        """A stray key usually means the implementation was not switched over."""
+        with pytest.raises(ValueError, match="only applies to implementation"):
+            generate_visual_interaction_nodes(config(vl={"implementation": "fake", "demo_root": "/x"}))
 
     def test_a_relative_actor_topic_is_refused(self):
         with pytest.raises(ValueError, match="absolute ROS name"):

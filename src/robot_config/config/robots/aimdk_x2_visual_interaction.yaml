@@ -114,6 +114,13 @@ robot:
     # nothing and reports nothing, so the QoS is stated rather than assumed.
     frame_source:
       topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+      # Stated, not assumed. Measured from the live publisher
+      # (hri_halfres_relay) on 2026-10-21.
+      qos:
+        reliability: best_effort
+        durability: volatile
+        history: keep_last
+        depth: 5
 
     vl:
       implementation: fake

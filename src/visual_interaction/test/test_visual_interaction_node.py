@@ -294,11 +294,11 @@ class TestQuietRequest:
 
         rclpy.init()
         try:
-            with pytest.raises(ValueError, match="only 'fake' is wired"):
+            with pytest.raises(ValueError, match="expected 'fake' or 'internvl'"):
                 VisualInteractionNode(
                     parameter_overrides=[
                         Parameter("runtime_description_json", value=json.dumps({"interfaces": {}})),
-                        Parameter("vl_implementation", value="internvl"),
+                        Parameter("vl_implementation", value="llava"),
                     ]
                 )
         finally:

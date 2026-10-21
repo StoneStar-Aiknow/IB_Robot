@@ -53,8 +53,9 @@ _KEYS = frozenset(
         "status_period_sec",
     }
 )
-_FRAME_SOURCE_KEYS = frozenset({"interface", "topic"})
-_VL_KEYS = frozenset({"implementation"})
+_FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "qos"})
+_QOS_KEYS = frozenset({"reliability", "durability", "history", "depth"})
+_VL_KEYS = frozenset({"implementation", "demo_root", "max_new_tokens"})
 _SESSION_KEYS = frozenset(
     {
         "confirmation_count",
@@ -190,24 +191,52 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         raise ValueError("visual_interaction.frame_source takes at most one of interface or topic")
     camera_topic = ""
     interface = ""
+    camera_qos_json = ""
     if "topic" in frame_source:
         camera_topic = frame_source["topic"]
         if not isinstance(camera_topic, str) or not camera_topic.startswith("/"):
             raise ValueError("visual_interaction.frame_source.topic must be an absolute ROS name")
+        # A named topic has no description to take QoS from, so the config has
+        # to state it. Without this key the node fell back to a hardcoded
+        # default that happened to match the live relay — frames flowed, and a
+        # publisher with different QoS would have delivered nothing, silently.
+        qos = _mapping(frame_source.get("qos", {}), "visual_interaction.frame_source.qos")
+        _unknown(qos, _QOS_KEYS, "visual_interaction.frame_source.qos")
+        if not qos:
+            raise ValueError(
+                "visual_interaction.frame_source.qos is required with topic: a mismatched "
+                "subscription receives nothing and reports nothing"
+            )
+        camera_qos_json = json.dumps(dict(qos))
     else:
         interface = frame_source.get("interface", CAMERA_COMPRESSED)
         if not isinstance(interface, str) or not interface:
             raise ValueError("visual_interaction.frame_source.interface must be an interface ID")
+        if "qos" in frame_source:
+            raise ValueError(
+                "visual_interaction.frame_source.qos belongs with topic; an interface takes "
+                "its QoS from the bound runtime description"
+            )
 
     vl = _mapping(section.get("vl", {}), "visual_interaction.vl")
     _unknown(vl, _VL_KEYS, "visual_interaction.vl")
     implementation = vl.get("implementation", "fake")
-    if implementation != "fake":
-        # Only the scripted port is wired. Refusing here keeps a deployment
-        # from believing it configured a model that does not exist yet.
+    if implementation not in ("fake", "internvl"):
         raise ValueError(
-            f"visual_interaction.vl.implementation {implementation!r} is not available; only 'fake' is wired"
+            f"visual_interaction.vl.implementation {implementation!r} is not available; expected 'fake' or 'internvl'"
         )
+    demo_root = vl.get("demo_root", "")
+    if implementation == "internvl":
+        # The deployment directory is not in this repository, so it has to be
+        # named. Failing here rather than at the first round keeps a launch
+        # from coming up as a node that can never answer.
+        if not isinstance(demo_root, str) or not demo_root.startswith("/"):
+            raise ValueError("visual_interaction.vl.demo_root must be an absolute path for 'internvl'")
+    elif demo_root:
+        raise ValueError("visual_interaction.vl.demo_root only applies to implementation 'internvl'")
+    max_new_tokens = int(vl.get("max_new_tokens", 110))
+    if max_new_tokens < 1:
+        raise ValueError("visual_interaction.vl.max_new_tokens must be positive")
 
     session = _mapping(section.get("session", {}), "visual_interaction.session")
     _unknown(session, _SESSION_KEYS, "visual_interaction.session")
@@ -222,6 +251,8 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         "camera_topic": camera_topic,
         "actor_state_topic": actor_topic,
         "vl_implementation": implementation,
+        "vl_demo_root": demo_root,
+        "vl_max_new_tokens": max_new_tokens,
         "round_period_sec": float(section.get("round_period_sec", 1.0)),
         "window_sec": float(section.get("window_sec", 2.0)),
         "frames_per_window": int(section.get("frames_per_window", 4)),
@@ -237,6 +268,9 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         "categories_json": json.dumps(_categories(section)),
         "status_period_sec": float(section.get("status_period_sec", 5.0)),
     }
+
+    if camera_qos_json:
+        parameters["camera_topic_qos_json"] = camera_qos_json
 
     return [
         Node(

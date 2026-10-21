@@ -66,6 +66,10 @@ PARAMETERS: dict[str, object] = {
     "camera_topic_qos_json": '{"reliability": "best_effort", "durability": "volatile", "depth": 5}',
     "actor_state_topic": "",
     "vl_implementation": "fake",
+    # Where the board's InternVL deployment lives, for
+    # vl_implementation "internvl". Empty with "fake".
+    "vl_demo_root": "",
+    "vl_max_new_tokens": 110,
     "round_period_sec": 1.0,
     "window_sec": 2.0,
     "frames_per_window": 4,
@@ -303,12 +307,25 @@ class VisualInteractionNode(Node):
 
     def _build_hooks(self) -> SessionHooks:
         implementation = str(self._value("vl_implementation"))
-        if implementation != "fake":
-            # Only the scripted port exists so far. Failing here keeps a
-            # deployment from believing it configured a model that is not
-            # wired yet.
-            raise ValueError(f"vl_implementation {implementation!r} is not available; only 'fake' is wired")
-        return SessionHooks(vision=ScriptedVision.of())
+        if implementation == "fake":
+            return SessionHooks(vision=ScriptedVision.of())
+        if implementation == "internvl":
+            # Imported here, not at module scope: it loads the board's InternVL
+            # deployment and a workstation has neither that directory nor an
+            # NPU, so importing it eagerly would break every other entry point.
+            from visual_interaction.session.internvl_vision import InternVlVision
+
+            demo_root = str(self._value("vl_demo_root")).strip()
+            if not demo_root:
+                raise ValueError("vl_implementation 'internvl' needs vl.demo_root")
+            return SessionHooks(
+                vision=InternVlVision(
+                    demo_root=demo_root,
+                    frames=max(1, int(self._value("frames_per_window"))),
+                    max_new_tokens=int(self._value("vl_max_new_tokens")),
+                )
+            )
+        raise ValueError(f"vl_implementation {implementation!r} is not available; expected 'fake' or 'internvl'")
 
     def _on_set_enabled(self, request, response):
         """``data`` true resumes, false mutes. Only this clears a mute."""
