@@ -146,6 +146,34 @@ def main(argv: list[str] | None = None) -> int:
 
         rclpy.logging.set_logger_level(node.get_name(), rclpy.logging.LoggingSeverity.DEBUG)
 
+        # And print every round through Python as well, because the model's own
+        # loader silences the ROS log. aclruntime writes ~20 debug lines per
+        # inference straight to fd 1, which log_level cannot suppress, so the
+        # demo's quiet_native_output points fd 1 and 2 at /dev/null and rebinds
+        # only Python's sys.stdout object. ROS logging writes to the fd from C,
+        # so it goes to /dev/null with the noise — the first live run produced
+        # 54 rounds and not one visible line.
+        #
+        # Wrapping _publish rather than the on_round hook: the hook is handed
+        # the reason code alone, and what a bring-up run needs is the spoken
+        # text and the rejected answer's detail.
+        published = node._publish
+
+        def echo(result, window):
+            published(result, window)
+            if result.spoken:
+                observation = result.observation
+                subject = f"{observation.category}/{observation.region}" if observation else "?"
+                print(f'  SAY: "{result.text}"  [{subject}]', flush=True)
+            elif result.detail:
+                print(f"  quiet: {result.reason} ({result.detail})", flush=True)
+            else:
+                # MODEL_NOT_READY keeps its cause on the port, not the result.
+                cause = getattr(node._session.hooks.vision, "last_error", "")
+                print(f"  quiet: {result.reason}{f' ({cause})' if cause else ''}", flush=True)
+
+        node._publish = echo
+
         if args.demo_root:
             # Pay the load cost before the first round so the first round costs
             # what every later one does.
