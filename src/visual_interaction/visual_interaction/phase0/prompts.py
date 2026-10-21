@@ -51,7 +51,8 @@ _SCHEMA_ZH = (
     f"category 取值：{'、'.join(CATEGORIES)}。\n"
     f"region 取值：{'、'.join(REGIONS)}。\n"
     f"reply 必须是中文，不超过 {DEFAULT_MAX_REPLY_CHARS} 字，不要用英文单词。\n"
-    '例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
+    '有物品时例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
+    '没有物品时例如：{"kind": "none", "category": "", "region": "", "reply": ""}\n'
 )
 _SCHEMA_EN = (
     "Output one JSON object with exactly the fields kind, category, region, reply. No markdown fence.\n"
@@ -59,7 +60,8 @@ _SCHEMA_EN = (
     f"category: {', '.join(CATEGORIES)}.\n"
     f"region: {', '.join(REGIONS)}.\n"
     f"reply: Chinese only, at most {DEFAULT_MAX_REPLY_CHARS} characters, no English words.\n"
-    '例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
+    '有物品时例如：{"kind": "display", "category": "hat", "region": "head", "reply": "你戴的帽子很有特点。"}\n'
+    '没有物品时例如：{"kind": "none", "category": "", "region": "", "reply": ""}\n'
 )
 SCHEMA = {"zh": _SCHEMA_ZH, "en": _SCHEMA_EN}
 

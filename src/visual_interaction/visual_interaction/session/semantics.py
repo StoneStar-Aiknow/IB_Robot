@@ -153,11 +153,16 @@ _INSTRUCTION_SHAPED = re.compile(
 # word that names the confirmed category is a coarse check, but it is a
 # *positive* one: it fails closed on a reply that drifted onto another subject,
 # including one this module has no pattern for.
+#
+# Each list has to carry the synonyms a model actually reaches for, or the
+# check refuses accurate descriptions. The board run showed this: fourteen of
+# twenty replies said 标志 for a sign, which was absent here, so every one was
+# refused for "not describing the confirmed sign" while in fact describing it.
 _CATEGORY_WORDS: Mapping[str, tuple[str, ...]] = {
-    "toy": ("玩偶", "玩具", "娃娃", "公仔"),
-    "sign": ("牌子", "标牌", "纸板", "举牌"),
+    "toy": ("玩偶", "玩具", "娃娃", "公仔", "毛绒"),
+    "sign": ("牌子", "标牌", "纸板", "举牌", "标志", "牌"),
     "hat": ("帽子", "帽"),
-    "badge": ("徽章", "胸针", "别针", "胸章"),
+    "badge": ("徽章", "胸针", "别针", "胸章", "胸牌"),
 }
 
 # Characters that must never reach a synthesiser: C0/C1 controls, bidi overrides
