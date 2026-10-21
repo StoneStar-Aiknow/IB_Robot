@@ -40,6 +40,7 @@ def _render(extra):
         "use_sim": "",
         "sim_platform": "",
         "gazebo_world": "",
+        "mujoco_scene": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.0",
@@ -80,7 +81,7 @@ def test_shipped_profile_declares_the_gazebo_platform():
     from robot_runtime.profile import load_profile
 
     profile = load_profile(_PROFILE)
-    assert profile["sim_platforms"] == ["sdk", "gazebo"]
+    assert profile["sim_platforms"] == ["sdk", "gazebo", "mujoco"]
     assert profile["sim_platform"] == "sdk"
     assert profile["use_sim"] is False
 
@@ -130,8 +131,9 @@ def test_unknown_platform_fails_fast_before_any_action():
 
     from robot_runtime.launch_support import RuntimeProfileError
 
-    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'mujoco'"):
-        _render({"use_sim": "true", "sim_platform": "mujoco"})
+    # a platform outside the runtime vocabulary fails on the spot
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'webots'"):
+        _render({"use_sim": "true", "sim_platform": "webots"})
 
 
 def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
@@ -257,3 +259,132 @@ def test_saved_camera_override_takes_precedence_on_the_provider_path(tmp_path, m
     assert 'xyz="1.5 -0.2 0.8"' in urdf
     # the untouched cameras keep the runtime-owned poses
     assert 'xyz="0.002265 0.073023 -0.016289"' in urdf
+
+
+# ---------------------------------------------------------------------------
+# so101-mujoco-runtime-platform task 3.4: the MuJoCo platform on this profile
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_profile_declares_mujoco_and_keeps_the_golden_camera_poses():
+    """The MuJoCo defaults are runtime-owned and hold the provider-less
+    path's preset values verbatim (top/wrist) plus the old generic base
+    preset for front."""
+    from robot_runtime.mujoco import resolve_mujoco_camera_pose
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(_PROFILE)
+    assert "mujoco" in profile["sim_platforms"]
+    mujoco_cfg = profile["simulation"]["mujoco"]
+    assert mujoco_cfg["sdf_meshes"] == ["wrist_roll_follower", "moving_jaw"]
+    peripherals = {entry["name"]: entry for entry in profile["peripherals"]}
+
+    top, top_fovy = resolve_mujoco_camera_pose(peripherals["top"])
+    assert (top["parent_frame"], top_fovy) == ("world", 47)
+    assert (top["x"], top["y"], top["z"]) == (0.0419, 0.1123, 0.6136)
+    assert (top["roll"], top["pitch"], top["yaw"]) == (0.052274, 0.003013, 3.136436)
+
+    wrist, wrist_fovy = resolve_mujoco_camera_pose(peripherals["wrist"])
+    assert (wrist["parent_frame"], wrist_fovy) == ("gripper", 46)
+    assert (wrist["x"], wrist["y"], wrist["z"]) == (0.002265, 0.073023, -0.016289)
+    assert (wrist["roll"], wrist["pitch"], wrist["yaw"]) == (0.031197, -0.490648, -1.607245)
+
+    front, front_fovy = resolve_mujoco_camera_pose(peripherals["front"])
+    assert (front["parent_frame"], front_fovy) == ("base", 70)
+    assert (front["x"], front["y"], front["z"]) == (0.0, -0.28, 0.55)
+    assert (front["roll"], front["pitch"], front["yaw"]) == (0.0, 0.0, 3.1415)
+
+
+def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
+    import sim_models.scene_compiler as scene_compiler
+
+    captured = {}
+
+    def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
+        captured["scene"] = scene
+        captured["sdf_meshes"] = list(sdf_mesh_names)
+        return Path("/tmp/ibrobot_fake_composed.mjb")
+
+    monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "mujoco_scene": "pick_banana"})
+    assert captured["scene"] == "pick_banana"
+    assert captured["sdf_meshes"] == ["wrist_roll_follower", "moving_jaw"]
+    mujoco_nodes = [
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "ros2_control_node"
+    ]
+    assert [node._Node__package for node in mujoco_nodes] == ["mujoco_ros2_control"]
+
+
+def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
+    """5b.2 revision: no scene composes the `empty` scene (lit ground), never robot-only."""
+    import sim_models.scene_compiler as scene_compiler
+
+    captured = {}
+
+    def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
+        captured["scene"] = scene
+        return Path("/tmp/ibrobot_fake_composed.mjb")
+
+    monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
+    _render({"use_sim": "true", "sim_platform": "mujoco"})
+    assert captured["scene"] == "empty"
+
+
+# ---------------------------------------------------------------------------
+# 5b.2 / 5b.3: the empty-scene composition and the shared camera frame contract
+# ---------------------------------------------------------------------------
+
+
+def test_provider_alone_empty_scene_composes_ground_and_light(tmp_path):
+    """5b.2: provider-alone with an empty mujoco_scene carries the lit ground."""
+    import mujoco
+
+    from robot_runtime.launch_support import render_mujoco_description
+    from robot_runtime.profile import load_profile
+    from sim_models.scene_compiler import composed_model_path
+
+    profile = load_profile(_PROFILE)
+    description = render_mujoco_description(
+        profile, _PROFILE, profile.get("peripherals"), spawn_pose=(0.0, 0.0, 0.0, 0.0), scene=""
+    )
+    composed = composed_model_path("empty")
+    assert str(composed) in description
+    model = mujoco.MjModel.from_binary_path(str(composed))
+    assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor") >= 0
+    assert model.nlight >= 1
+
+
+def test_advertised_camera_frames_are_identical_on_every_platform():
+    """5b.3: every SO-101 camera advertises the same frame on all four platforms."""
+    import xml.etree.ElementTree as ET
+
+    from robot_runtime.interface_description import build_description
+    from robot_runtime.launch_support import render_mujoco_description
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(_PROFILE)
+    cameras = [str(p["name"]) for p in profile.get("peripherals") or [] if p.get("type") == "camera"]
+    assert set(cameras) == {"top", "wrist", "front"}
+
+    frames = {name: {} for name in cameras}
+    for platform, use_sim in (("hardware", False), ("sdk", True), ("gazebo", True), ("mujoco", True)):
+        doc = build_description(profile, use_sim=use_sim, sim_platform=None if platform == "hardware" else platform)
+        for name in cameras:
+            frames[name][platform] = doc["interfaces"][f"camera.{name}.color"]["frame_id"]
+
+    for name, per_platform in frames.items():
+        assert len(set(per_platform.values())) == 1, f"{name} advertises different frames: {per_platform}"
+    assert frames["top"]["mujoco"] == "camera_top_frame"
+    assert frames["wrist"]["mujoco"] == "camera_wrist_frame"
+    assert frames["front"]["mujoco"] == "camera_front_optical_frame"
+
+    # the MuJoCo sensor blocks stamp exactly the advertised frame
+    description = render_mujoco_description(profile, _PROFILE, profile.get("peripherals"), scene="")
+    root = ET.fromstring(description)
+    sensor_frames = {
+        sensor.get("name").removesuffix("_camera"): param.text
+        for sensor in root.findall(".//ros2_control/sensor")
+        for param in sensor.findall("param")
+        if param.get("name") == "frame_name"
+    }
+    assert sensor_frames == {name: frames[name]["mujoco"] for name in cameras}
