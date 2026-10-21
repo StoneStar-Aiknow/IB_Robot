@@ -44,7 +44,7 @@ from embodied_common.visual_interaction_contract import (
 )
 from ibrobot_msgs.msg import ActorState, VisualInteractionUtterance
 from visual_interaction.session.core import SessionConfig, VisualInteractionSession
-from visual_interaction.session.endpoints import CAMERA_COMPRESSED, resolve_camera
+from visual_interaction.session.endpoints import CAMERA_COMPRESSED, Endpoint, resolve_camera
 from visual_interaction.session.fake_vl import ScriptedVision
 from visual_interaction.session.hooks import ActorSignal, RoundInputs, SessionHooks, Window
 
@@ -58,6 +58,12 @@ DEFAULT_MAX_BUFFERED_FRAMES = 300
 PARAMETERS: dict[str, object] = {
     "runtime_description_json": "",
     "camera_interface": CAMERA_COMPRESSED,
+    # Escape hatch for a stream the runtime description does not carry, such
+    # as the robot's half-resolution relay. Set it and camera_interface is
+    # ignored; the QoS then has to be stated here too, since there is no
+    # description to read it from.
+    "camera_topic": "",
+    "camera_topic_qos_json": '{"reliability": "best_effort", "durability": "volatile", "depth": 5}',
     "actor_state_topic": "",
     "vl_implementation": "fake",
     "round_period_sec": 1.0,
@@ -197,7 +203,7 @@ class VisualInteractionNode(Node):
         # as whatever the runtime description happens to be missing.
         session_hooks = hooks or self._build_hooks()
 
-        camera = resolve_camera(self._description(), str(self._value("camera_interface")))
+        camera = self._camera()
         self._window_sec = float(self._value("window_sec"))
         self._frames = max(1, int(self._value("frames_per_window")))
         self._stale_stream_sec = float(self._value("stale_stream_sec"))
@@ -257,6 +263,31 @@ class VisualInteractionNode(Node):
         except ValueError as error:
             raise ValueError("runtime_description_json must be the bound runtime interface description") from error
         return description
+
+    def _camera(self) -> Endpoint:
+        """Where the frames come from: a described interface, or a named topic.
+
+        ``camera_interface`` is the normal form and resolves by ID, so the
+        endpoint and its QoS come from the bound runtime description. A named
+        ``camera_topic`` is the escape hatch for a stream the description does
+        not carry — the robot's half-resolution relay republishes a resized
+        JPEG outside the HAL interface contract, which is how
+        motion_imitation_stream reads it too. There is then no description to
+        take QoS from, so it is stated alongside the topic.
+        """
+        topic = str(self._value("camera_topic")).strip()
+        if not topic:
+            return resolve_camera(self._description(), str(self._value("camera_interface")))
+        if not topic.startswith("/"):
+            raise ValueError("camera_topic must be an absolute ROS name")
+        raw = str(self._value("camera_topic_qos_json"))
+        try:
+            declared = json.loads(raw)
+        except ValueError as error:
+            raise ValueError("camera_topic_qos_json must be a JSON object of QoS fields") from error
+        if not isinstance(declared, dict):
+            raise ValueError("camera_topic_qos_json must be a JSON object of QoS fields")
+        return Endpoint(endpoint=topic, qos=declared)
 
     def _categories(self) -> dict:
         raw = str(self._value("categories_json"))

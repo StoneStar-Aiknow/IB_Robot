@@ -53,7 +53,7 @@ _KEYS = frozenset(
         "status_period_sec",
     }
 )
-_FRAME_SOURCE_KEYS = frozenset({"interface"})
+_FRAME_SOURCE_KEYS = frozenset({"interface", "topic"})
 _VL_KEYS = frozenset({"implementation"})
 _SESSION_KEYS = frozenset(
     {
@@ -179,9 +179,25 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
 
     frame_source = _mapping(section.get("frame_source", {}), "visual_interaction.frame_source")
     _unknown(frame_source, _FRAME_SOURCE_KEYS, "visual_interaction.frame_source")
-    interface = frame_source.get("interface", CAMERA_COMPRESSED)
-    if not isinstance(interface, str) or not interface:
-        raise ValueError("visual_interaction.frame_source.interface must be an interface ID")
+    # At most one of the two, with the same meaning motion_imitation_stream
+    # gives them: ``interface`` names a camera the runtime description carries
+    # and is the normal form; ``topic`` is the escape hatch for a stream the
+    # description does not carry. The robot's half-resolution relay
+    # (hri_halfres_relay) is one of those — it republishes a resized JPEG and
+    # is not part of the HAL interface contract, so naming it needs the hatch
+    # rather than a new profile entry. Neither set keeps the default camera.
+    if "interface" in frame_source and "topic" in frame_source:
+        raise ValueError("visual_interaction.frame_source takes at most one of interface or topic")
+    camera_topic = ""
+    interface = ""
+    if "topic" in frame_source:
+        camera_topic = frame_source["topic"]
+        if not isinstance(camera_topic, str) or not camera_topic.startswith("/"):
+            raise ValueError("visual_interaction.frame_source.topic must be an absolute ROS name")
+    else:
+        interface = frame_source.get("interface", CAMERA_COMPRESSED)
+        if not isinstance(interface, str) or not interface:
+            raise ValueError("visual_interaction.frame_source.interface must be an interface ID")
 
     vl = _mapping(section.get("vl", {}), "visual_interaction.vl")
     _unknown(vl, _VL_KEYS, "visual_interaction.vl")
@@ -203,6 +219,7 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
     parameters = {
         "runtime_description_json": _runtime_description(robot_config),
         "camera_interface": interface,
+        "camera_topic": camera_topic,
         "actor_state_topic": actor_topic,
         "vl_implementation": implementation,
         "round_period_sec": float(section.get("round_period_sec", 1.0)),

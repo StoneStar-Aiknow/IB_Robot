@@ -84,8 +84,10 @@ class TestObservationOnly:
         """The gate that would refuse a motion producer must pass on the real file.
 
         The description is built from the real runtime profile and placed where
-        ``interface_binding`` puts it, ``runtime.interface_description``, so
-        this also covers the camera actually being declared there.
+        ``interface_binding`` puts it, ``runtime.interface_description``. This
+        config reads the relay by topic, so the description carries no camera
+        for it; what it still proves is that the observation-only gate and the
+        rest of the wiring accept the shipped file.
         """
         import copy
 
@@ -93,7 +95,6 @@ class TestObservationOnly:
             generate_visual_interaction_nodes,
         )
 
-        interface = config["visual_interaction"]["frame_source"]["interface"]
         bound = copy.deepcopy(config)
         bound["runtime"]["interface_description"] = {
             "robot": {
@@ -102,9 +103,7 @@ class TestObservationOnly:
                 "runtime_name": profile["runtime"]["name"],
                 "runtime_version": profile["runtime"]["version"],
             },
-            # Straight from the profile: an interface the robot does not
-            # publish cannot make this test pass.
-            "interfaces": {interface: profile["interfaces"][interface]},
+            "interfaces": {},
         }
 
         assert len(generate_visual_interaction_nodes(bound)) == 1
@@ -123,25 +122,36 @@ class TestObservationOnly:
 
 
 class TestCamera:
-    def test_it_names_the_camera_the_mirror_already_uses(self, config):
-        from visual_interaction.session.endpoints import CAMERA_COMPRESSED
+    def test_it_reads_the_half_resolution_relay_by_topic(self, config):
+        """Measured on the robot: 30.1 Hz at ~80 KB, against 10.0 Hz at ~296 KB.
 
-        assert config["visual_interaction"]["frame_source"]["interface"] == CAMERA_COMPRESSED
+        The relay republishes a resized JPEG and is not part of the HAL
+        interface contract, so it is named as a topic rather than resolved by
+        ID — the same decision aimdk_x2_magicmirror.yaml records for it.
+        """
+        source = config["visual_interaction"]["frame_source"]
 
-    def test_that_camera_is_declared_by_the_runtime_profile(self, config, profile):
-        """Resolved by ID, so a name the profile does not publish fails at launch."""
-        interface = config["visual_interaction"]["frame_source"]["interface"]
-        declared = profile["interfaces"][interface]
+        assert source["topic"] == "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
+        assert "interface" not in source, "topic and interface are never both set"
 
-        assert declared["kind"] == "topic"
-        assert declared["direction"] == "publish"
-        assert declared["message_type"] == "sensor_msgs/msg/CompressedImage"
+    def test_the_relay_topic_is_not_a_described_interface(self, config, profile):
+        """Which is why it needs the topic escape hatch at all.
 
-    def test_the_withdrawn_centre_camera_is_not_named(self, config, profile):
-        """The vendor withdrew it in v0.8.1; the board demo used it anyway."""
-        interface = config["visual_interaction"]["frame_source"]["interface"]
+        Naming a described endpoint this way would bypass the shape check, so
+        the two forms stay mutually exclusive on purpose.
+        """
+        topic = config["visual_interaction"]["frame_source"]["topic"]
+        declared = [spec.get("endpoint") for spec in profile["interfaces"].values()]
 
-        assert "rgb_head_front_center" not in interface
+        assert topic not in declared
+
+    def test_the_withdrawn_centre_camera_is_not_declared(self, profile):
+        """The vendor withdrew the full-resolution centre topic in v0.8.1.
+
+        The relay's half-resolution topic is a different endpoint, published
+        by hri_halfres_relay rather than the sensor HAL, and it is reached
+        through frame_source.topic rather than the profile.
+        """
         assert not [
             spec.get("endpoint")
             for spec in profile["interfaces"].values()

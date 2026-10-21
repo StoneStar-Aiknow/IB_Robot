@@ -183,15 +183,7 @@ def test_only_firmware_verified_sensor_endpoints_are_declared(profile):
     assert "localization.pose" in capabilities
 
     # Withdrawn from the open interface set (v0.8.1) / undocumented type.
-    #
-    # The withdrawal is of the sensor HAL's full-resolution centre colour
-    # topic. The robot separately runs hri_halfres_relay, which republishes a
-    # half-resolution JPEG on rgb_image_half — measured at 30.1 Hz and ~80 KB
-    # per frame against the stereo stream's 10.0 Hz and ~296 KB — and visual
-    # interaction reads that. So the ban is on the withdrawn endpoint itself,
-    # not on the camera's name appearing at all.
-    assert not [e for e in endpoints if e and e.endswith("rgb_head_front_center/rgb_image/compressed")]
-    assert not [e for e in endpoints if e and e.endswith("rgb_head_front_center/rgb_image")]
+    assert not [e for e in endpoints if e and "rgb_head_front_center" in e]
     assert not [e for e in endpoints if e and e.endswith("/h265")]
 
 

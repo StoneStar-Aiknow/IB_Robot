@@ -163,7 +163,7 @@ class TestDeclaredParameters:
         assert PARAMETERS["vl_implementation"] == "fake"
 
 
-CAMERA_ENDPOINT = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
+CAMERA_ENDPOINT = "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed"
 
 # rclpy gives every node these, and they cannot be declined.
 RCLPY_SERVICES = frozenset(
@@ -196,7 +196,7 @@ def node():
             "runtime_version": "1",
         },
         "interfaces": {
-            "camera.rgb_head_front_center.color_half_compressed": {
+            "camera.stereo_head_front_left.color_compressed": {
                 "kind": "topic",
                 "direction": "publish",
                 "message_type": "sensor_msgs/msg/CompressedImage",
@@ -539,4 +539,89 @@ class TestCameraQos:
             finally:
                 node.destroy_node()
         finally:
+            rclpy.shutdown()
+
+
+class TestCameraTopicEscapeHatch:
+    """Reading a stream the runtime description does not carry.
+
+    The robot's hri_halfres_relay republishes a resized JPEG at 30.1 Hz and
+    ~80 KB per frame, against the described stereo stream's 10.0 Hz and
+    ~296 KB. It is not part of the HAL interface contract, so it is named as a
+    topic — the same way motion_imitation_stream reads it — and the QoS comes
+    with it, since there is no description to take one from.
+    """
+
+    HALF_TOPIC = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
+
+    def node(self, **overrides):
+        import json
+
+        import rclpy
+        from rclpy.parameter import Parameter
+
+        from visual_interaction.visual_interaction_node import VisualInteractionNode
+
+        values = {
+            "runtime_description_json": json.dumps({"robot": {}, "interfaces": {}}),
+            "categories_json": '["toy","sign","hat","badge"]',
+            "camera_topic": self.HALF_TOPIC,
+        }
+        values.update(overrides)
+        rclpy.init()
+        try:
+            node = VisualInteractionNode(parameter_overrides=[Parameter(k, value=v) for k, v in values.items()])
+            return node, rclpy
+        except Exception:
+            rclpy.shutdown()
+            raise
+
+    def test_a_named_topic_is_subscribed_without_a_described_camera(self):
+        """The description carries no camera at all here, and that is fine."""
+        node, rclpy = self.node()
+        try:
+            assert any(sub.topic_name == self.HALF_TOPIC for sub in node.subscriptions)
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_the_stated_qos_is_used(self):
+        """The relay publishes BEST_EFFORT/VOLATILE, unlike the stereo stream."""
+        from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+        node, rclpy = self.node()
+        try:
+            sub = next(s for s in node.subscriptions if s.topic_name == self.HALF_TOPIC)
+
+            assert sub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
+            assert sub.qos_profile.durability == DurabilityPolicy.VOLATILE
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_reliable_relay_would_also_be_honoured(self):
+        """Stating the QoS means following it, not assuming best effort."""
+        from rclpy.qos import ReliabilityPolicy
+
+        node, rclpy = self.node(
+            camera_topic_qos_json='{"reliability": "reliable", "durability": "transient_local", "depth": 5}'
+        )
+        try:
+            sub = next(s for s in node.subscriptions if s.topic_name == self.HALF_TOPIC)
+
+            assert sub.qos_profile.reliability == ReliabilityPolicy.RELIABLE
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_relative_topic_is_refused(self):
+        with pytest.raises(ValueError, match="absolute ROS name"):
+            node, rclpy = self.node(camera_topic="rgb_image_half/compressed")
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_malformed_qos_json_is_refused(self):
+        with pytest.raises(ValueError, match="camera_topic_qos_json"):
+            node, rclpy = self.node(camera_topic_qos_json="not json")
+            node.destroy_node()
             rclpy.shutdown()
