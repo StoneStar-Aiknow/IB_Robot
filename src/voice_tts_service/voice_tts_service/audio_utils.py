@@ -8,6 +8,10 @@ import struct
 import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
+from fractions import Fraction
+from functools import lru_cache
+
+import numpy as np
 
 from voice_tts_service.errors import TTSError
 
@@ -95,6 +99,69 @@ def resample_linear(samples: tuple[float, ...], source_rate: int, target_rate: i
         fraction = position - left
         result.append(samples[left] * (1.0 - fraction) + samples[right] * fraction)
     return tuple(result)
+
+
+#: Zero crossings of the windowed-sinc kernel on each side, per unit of max(up, down).
+_RESAMPLE_HALF_WIDTH = 10
+_RESAMPLE_KAISER_BETA = 5.0
+#: Output samples computed per vectorized block, bounding the (outputs x taps) gather.
+_RESAMPLE_BLOCK = 65536
+
+
+@lru_cache(maxsize=8)
+def _polyphase_filter(up: int, down: int) -> np.ndarray:
+    """Kaiser-windowed sinc low-pass at the upsampled rate, with a DC gain of ``up``."""
+
+    max_rate = max(up, down)
+    half_length = _RESAMPLE_HALF_WIDTH * max_rate
+    taps = np.arange(-half_length, half_length + 1, dtype=np.float64)
+    cutoff = 1.0 / max_rate
+    kernel = cutoff * np.sinc(cutoff * taps) * np.kaiser(taps.size, _RESAMPLE_KAISER_BETA)
+    return kernel * (up / kernel.sum())
+
+
+def _resample_channel(samples: np.ndarray, up: int, down: int, kernel: np.ndarray) -> np.ndarray:
+    """Evaluate upsample-filter-downsample only at the output points (polyphase form)."""
+
+    output_count = -(-samples.size * up // down)
+    delay = (kernel.size - 1) // 2
+    taps_per_phase = -(-kernel.size // up)
+    padded_kernel = np.zeros(taps_per_phase * up)
+    padded_kernel[: kernel.size] = kernel
+    margin = taps_per_phase + delay // up + 1
+    padded = np.concatenate((np.zeros(margin), samples, np.zeros(margin)))
+    taps = np.arange(taps_per_phase)
+    output = np.empty(output_count)
+    for start in range(0, output_count, _RESAMPLE_BLOCK):
+        positions = np.arange(start, min(start + _RESAMPLE_BLOCK, output_count)) * down + delay
+        base, phase = np.divmod(positions, up)
+        coefficients = padded_kernel[phase[:, None] + taps * up]
+        output[start : start + positions.size] = np.einsum(
+            "ij,ij->i", coefficients, padded[margin + base[:, None] - taps]
+        )
+    return output
+
+
+def resample_pcm16(data: bytes, *, channels: int, source_rate: int, target_rate: int) -> bytes:
+    """Resample interleaved S16LE PCM by a rational factor with an anti-aliasing filter."""
+
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("sample rates must be positive")
+    if len(data) % (2 * channels):
+        raise ValueError("PCM payload is not a whole number of S16LE frames")
+    if source_rate == target_rate or not data:
+        return data
+    ratio = Fraction(target_rate, source_rate)
+    kernel = _polyphase_filter(ratio.numerator, ratio.denominator)
+    frames = np.frombuffer(data, dtype="<i2").reshape(-1, channels).astype(np.float64) / 32768.0
+    resampled = np.stack(
+        [_resample_channel(frames[:, index], ratio.numerator, ratio.denominator, kernel) for index in range(channels)],
+        axis=1,
+    )
+    pcm = np.clip(np.rint(resampled * 32768.0), -32768, 32767).astype("<i2")
+    return pcm.tobytes()
 
 
 def validate_float_pcm(samples: Iterable[float], sample_rate: int) -> tuple[float, ...]:

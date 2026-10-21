@@ -2536,6 +2536,8 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
         audio_output=data.get("audio_output", defaults.audio_output),
+        resample_to_playback_rate=data.get("resample_to_playback_rate", defaults.resample_to_playback_rate),
+        audio_message_type=data.get("audio_message_type", defaults.audio_message_type),
     )
 
 
@@ -3187,6 +3189,10 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
     return errors
 
 
+#: Message types the TTS playback node can publish (voice_tts.audio_message_type).
+_TTS_PLAYBACK_MESSAGE_TYPES = ("audio_common_msgs/msg/AudioData", "audio_common_msgs/msg/AudioDataStamped")
+
+
 def validate_config(config: RobotConfig) -> list[str]:
     """Validate robot configuration.
 
@@ -3511,6 +3517,17 @@ def validate_config(config: RobotConfig) -> list[str]:
                 errors.append(f"voice_tts.{name} must be positive")
         if config.voice_tts.segment_pause_ms < 0:
             errors.append("voice_tts.segment_pause_ms must be non-negative")
+        if not isinstance(config.voice_tts.resample_to_playback_rate, bool):
+            errors.append("voice_tts.resample_to_playback_rate must be a boolean")
+        message_type = config.voice_tts.audio_message_type
+        if message_type and message_type not in _TTS_PLAYBACK_MESSAGE_TYPES:
+            errors.append(f"voice_tts.audio_message_type must be one of {list(_TTS_PLAYBACK_MESSAGE_TYPES)}")
+        elif message_type and tts_bound and config.voice_tts.audio_output.get("type") != message_type:
+            # The node publishes what the bound speaker subscribes to; another type is never heard.
+            errors.append(
+                f"voice_tts.audio_message_type {message_type!r} must match voice_tts.audio_output.type "
+                f"{config.voice_tts.audio_output.get('type')!r}"
+            )
 
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}

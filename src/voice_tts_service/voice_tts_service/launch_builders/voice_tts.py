@@ -145,6 +145,10 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "audio_topic": audio_topic,
                     "playback_sample_rate": playback_sample_rate,
                     "playback_channels": playback_channels,
+                    "resample_to_playback_rate": bool(config.get("resample_to_playback_rate", False)),
+                    # Empty keeps the node's AudioData default; robot_config checks that an
+                    # explicit type matches the bound speaker.
+                    "audio_message_type": str(config.get("audio_message_type") or "audio_common_msgs/msg/AudioData"),
                 }
             ],
         ),

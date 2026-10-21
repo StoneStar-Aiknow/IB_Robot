@@ -204,6 +204,26 @@ def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypat
     assert parameters["playback_sample_rate"] == 24000
 
 
+def test_voice_tts_publishes_audio_data_unless_the_config_names_the_speaker_type(tmp_path, monkeypatch):
+    # A bound speaker keeps receiving AudioData unless the deployment names another type: the
+    # ALSA speaker is projected as AudioDataStamped while audio_play is documented to take AudioData.
+    config = _bound_tts_config(_bound_audio_output())
+    default = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+    assert default["audio_message_type"] == "audio_common_msgs/msg/AudioData"
+
+    config["voice_tts"]["audio_message_type"] = "audio_common_msgs/msg/AudioDataStamped"
+    stamped = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+    assert stamped["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+
+
+def test_voice_tts_resampling_to_the_speaker_rate_is_opt_in(tmp_path, monkeypatch):
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=16000, channels=1))
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is False
+
+    config["voice_tts"]["resample_to_playback_rate"] = True
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is True
+
+
 def test_voice_tts_builder_passes_num_steps_to_the_session(monkeypatch, tmp_path):
     """The flow step count must be reachable from YAML.
 

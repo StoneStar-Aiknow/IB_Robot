@@ -107,6 +107,10 @@ PlayAudioFile 请求（播放端本机绝对路径）
 `audio_play` 无法从 `AudioData` 消息感知每个文件的格式，因此服务会在发布前校验 WAV；格式不匹配时
 返回 `UNSUPPORTED_AUDIO_FORMAT`，不会静默以错误采样率播放。
 
+播放端设备的采样率与 ZipVoice 不同时（例如 AgiBot X2 runtime 的扬声器为 16 kHz），由机器人配置显式开启
+`resample_to_playback_rate`，播放节点在内存中用带抗混叠滤波的有理数比例重采样（纯 numpy 多相 FIR）转换到
+`playback_sample_rate` 后再分包；声道数与位宽从不转换，不一致仍返回 `UNSUPPORTED_AUDIO_FORMAT`。
+
 ## 4. ROS 接口
 
 ### 4.1 语音合成
@@ -162,6 +166,17 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
   "{file_path: '/tmp/voice_tts/output.wav'}"
 ```
+
+播放节点参数：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `audio_topic` | `/audio/play` | 发布 PCM 的 topic；绑定 runtime 播放接口时由 `robot_config` 注入 |
+| `audio_message_type` | `audio_common_msgs/msg/AudioData` | `AudioData`（本机 `audio_play`）或 `AudioDataStamped`（runtime 提供的扬声器，如 aimdk `audio.play`）；其他值启动即失败 |
+| `playback_sample_rate` / `playback_channels` | `24000` / `1` | 播放端 PCM 契约 |
+| `resample_to_playback_rate` | `false` | 为 `true` 时把任意采样率的 WAV 重采样到 `playback_sample_rate` |
+| `chunk_ms` | `50` | 每个发布分包的时长（毫秒） |
+| `timeout_sec` | `300.0` | 单次播放的总时限 |
 
 ### 4.3 模型生命周期
 
