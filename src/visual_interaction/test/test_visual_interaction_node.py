@@ -11,6 +11,7 @@ import pytest
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("ibrobot_msgs.msg")
 
+from visual_interaction.session.endpoints import CAMERA_COMPRESSED  # noqa: E402
 from visual_interaction.session.hooks import Window  # noqa: E402
 from visual_interaction.visual_interaction_node import PARAMETERS, FrameBuffer  # noqa: E402
 
@@ -430,3 +431,112 @@ class TestPublishedFields:
         assert message.latest_start_at.sec == 0
         assert message.latest_start_at.nanosec == 0
         assert message.episode_seq == 0
+
+
+class TestCameraQos:
+    """The subscription must match what the interface description declares.
+
+    This is the test that was missing. The node hardcoded BEST_EFFORT while the
+    X2 profile declares the camera reliable/transient_local, which is what the
+    robot really publishes. An incompatible subscription in ROS 2 is silent:
+    no error, no warning, just zero frames forever. Measured on the board,
+    BEST_EFFORT/VOLATILE received 0 frames in 7 seconds on a topic that gave
+    10 (1.4 Hz, ~288 KB JPEG) over RELIABLE/TRANSIENT_LOCAL.
+    """
+
+    def test_the_declared_profile_is_honoured(self):
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+
+        from visual_interaction.visual_interaction_node import camera_qos
+
+        qos = camera_qos(
+            {"reliability": "reliable", "durability": "transient_local", "history": "keep_last", "depth": 5}
+        )
+
+        assert qos.reliability == ReliabilityPolicy.RELIABLE
+        assert qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+        assert qos.history == HistoryPolicy.KEEP_LAST
+        assert qos.depth == 5
+
+    def test_the_x2_camera_declaration_does_not_become_best_effort(self):
+        """The exact regression: this camera is reliable, and must stay so."""
+        from rclpy.qos import ReliabilityPolicy
+
+        from visual_interaction.visual_interaction_node import camera_qos
+
+        declared = {"reliability": "reliable", "durability": "transient_local", "history": "keep_last", "depth": 5}
+
+        assert camera_qos(declared).reliability != ReliabilityPolicy.BEST_EFFORT
+
+    def test_a_best_effort_declaration_is_also_honoured(self):
+        """Honouring the description means following it either way."""
+        from rclpy.qos import ReliabilityPolicy
+
+        from visual_interaction.visual_interaction_node import camera_qos
+
+        qos = camera_qos({"reliability": "best_effort", "durability": "volatile"})
+
+        assert qos.reliability == ReliabilityPolicy.BEST_EFFORT
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("reliability", "reliabel"), ("durability", "transient"), ("history", "keep_latest")],
+    )
+    def test_an_unknown_value_fails_rather_than_downgrading(self, field, value):
+        """A profile typo must not quietly produce a subscription that receives nothing."""
+        from visual_interaction.visual_interaction_node import camera_qos
+
+        declared = {"reliability": "reliable", "durability": "transient_local", "history": "keep_last"}
+        declared[field] = value
+
+        with pytest.raises(ValueError, match=field):
+            camera_qos(declared)
+
+    def test_a_nonpositive_depth_is_refused(self):
+        from visual_interaction.visual_interaction_node import camera_qos
+
+        with pytest.raises(ValueError, match="depth"):
+            camera_qos({"reliability": "reliable", "depth": 0})
+
+    def test_the_live_node_subscribes_with_the_declared_profile(self):
+        """End to end: what the description says is what the subscription uses."""
+        import json
+
+        import rclpy
+        from rclpy.parameter import Parameter
+        from rclpy.qos import ReliabilityPolicy
+
+        from visual_interaction.visual_interaction_node import VisualInteractionNode
+
+        description = {
+            "robot": {"id": "x2", "type": "x2_ultra_omnihand", "runtime_name": "aimdk", "runtime_version": "1"},
+            "interfaces": {
+                CAMERA_COMPRESSED: {
+                    "kind": "topic",
+                    "direction": "publish",
+                    "message_type": "sensor_msgs/msg/CompressedImage",
+                    "endpoint": CAMERA_ENDPOINT,
+                    "qos": {
+                        "reliability": "reliable",
+                        "durability": "transient_local",
+                        "history": "keep_last",
+                        "depth": 5,
+                    },
+                }
+            },
+        }
+        rclpy.init()
+        try:
+            node = VisualInteractionNode(
+                parameter_overrides=[
+                    Parameter("runtime_description_json", value=json.dumps(description)),
+                    Parameter("categories_json", value='["toy","sign","hat","badge"]'),
+                ]
+            )
+            try:
+                subscription = next(sub for sub in node.subscriptions if sub.topic_name == CAMERA_ENDPOINT)
+                assert subscription.qos_profile.reliability == ReliabilityPolicy.RELIABLE
+            finally:
+                node.destroy_node()
+        finally:
+            rclpy.shutdown()

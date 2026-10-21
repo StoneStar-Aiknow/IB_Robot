@@ -20,11 +20,12 @@ from __future__ import annotations
 import json
 import threading
 from collections import deque
+from collections.abc import Mapping
 
 import rclpy
 from builtin_interfaces.msg import Time
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
@@ -82,6 +83,48 @@ PARAMETERS: dict[str, object] = {
     "categories_json": "[]",
     "status_period_sec": 5.0,
 }
+
+
+def camera_qos(declared: Mapping[str, object]) -> QoSProfile:
+    """Build the subscription QoS from what the interface description declares.
+
+    Load-bearing, and it was wrong. The node hardcoded BEST_EFFORT while the X2
+    profile declares this camera as reliable/transient_local — and that is what
+    the robot really publishes. Measured on the board: subscribing
+    BEST_EFFORT/VOLATILE received 0 frames in 7 seconds, while
+    RELIABLE/TRANSIENT_LOCAL on the same topic received 10 (1.4 Hz, ~288 KB
+    JPEG). An incompatible subscription is silent — no error, no warning, just
+    a feature that never sees a frame — so the declared values are honoured
+    rather than assumed.
+
+    Unknown values fail closed: a typo in a profile must not quietly downgrade
+    the subscription into one that receives nothing.
+    """
+    reliability = {
+        "reliable": ReliabilityPolicy.RELIABLE,
+        "best_effort": ReliabilityPolicy.BEST_EFFORT,
+    }
+    durability = {
+        "volatile": DurabilityPolicy.VOLATILE,
+        "transient_local": DurabilityPolicy.TRANSIENT_LOCAL,
+    }
+    history = {"keep_last": HistoryPolicy.KEEP_LAST, "keep_all": HistoryPolicy.KEEP_ALL}
+
+    def pick(table: dict, key: str, default: str):
+        raw = str(declared.get(key, default)).strip().lower()
+        if raw not in table:
+            raise ValueError(f"camera qos.{key} {raw!r} is not one of {sorted(table)}")
+        return table[raw]
+
+    depth = int(declared.get("depth", 5))
+    if depth <= 0:
+        raise ValueError("camera qos.depth must be positive")
+    return QoSProfile(
+        reliability=pick(reliability, "reliability", "reliable"),
+        durability=pick(durability, "durability", "volatile"),
+        history=pick(history, "history", "keep_last"),
+        depth=depth,
+    )
 
 
 class FrameBuffer:
@@ -184,7 +227,7 @@ class VisualInteractionNode(Node):
             CompressedImage,
             camera.endpoint,
             self._on_frame,
-            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5),
+            camera_qos(camera.qos),
         )
         actor_topic = str(self._value("actor_state_topic"))
         if actor_topic:
