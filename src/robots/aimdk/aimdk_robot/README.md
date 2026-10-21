@@ -221,6 +221,13 @@ synchronizes on it; like every other public endpoint it is declared as the
 `audio.enhanced_capture` interface, so the runtime description advertises it and
 it carries its own QoS rather than borrowing the chunk stream's.
 
+Each vendor message becomes exactly one chunk, carried whole on both topics, so a
+boundary keeps all of its audio: the VAD opens a segment with a backfill burst of
+the audio before onset (about 650 ms on the X2). A vendor message longer than
+2 s is not one the stream produces; it is dropped rather than truncated, and one
+project sequence number is left unused so the consumer drops that segment instead
+of recognizing it with speech cut out.
+
 The vendor topic and subscription QoS come from `vendor.topics.processed_audio`
 and `vendor.qos.processed_audio`; the public chunk endpoint and its QoS come from
 `interfaces.audio.speech`. Wiring is capability-gated exactly like the raw

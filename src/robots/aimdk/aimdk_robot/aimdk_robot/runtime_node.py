@@ -111,9 +111,13 @@ OBSERVED_INTERFACES = ("audio.speech",)
 _SPEECH_FRAME_ID = "enhanced_audio"
 
 
-#: Upper bound for one forwarded vendor chunk. The vendor streams ~100 ms
-#: blocks; this only stops a malformed message from becoming an unbounded publish.
-_SPEECH_MAX_CHUNK_BYTES = 16000
+#: Longest vendor message forwarded as one speech chunk. The vendor streams ~100 ms blocks, but
+#: its VAD opens a segment with a backfill burst of the audio before onset (~650 ms, 20800 bytes,
+#: observed on hardware 2026-10-20), which a 16000-byte cap cut short. A message past this bound
+#: is not one the vendor stream produces; it is dropped, never truncated.
+_SPEECH_MAX_CHUNK_MS = 2000
+#: SpeechAudioChunk carries mono 16 kHz signed 16-bit PCM (see the message definition).
+_SPEECH_MAX_CHUNK_BYTES = _SPEECH_MAX_CHUNK_MS * 16000 * 2 // 1000
 
 #: How long to wait before asking for audio focus again after a refusal. A
 #: refusal means another source holds the speaker, so retrying every tick would
@@ -643,12 +647,22 @@ class AimdkRuntimeNode(Node):
                 "marking the project stream so the consumer drops the affected segment"
             )
         self._speech_vendor_sequence = vendor_sequence
+        if len(data) > _SPEECH_MAX_CHUNK_BYTES:
+            # One chunk carries one vendor message whole, so a boundary keeps all of its audio.
+            # Truncating would remove speech from inside a segment, which the recognizer then
+            # reports as a different word; leaving a sequence number unused makes the consumer
+            # drop the segment instead.
+            self._speech_sequence += 1
+            self.get_logger().warning(
+                f"vendor speech message of {len(data)} bytes exceeds {_SPEECH_MAX_CHUNK_MS} ms; dropping it "
+                "and marking the project stream so the consumer drops the affected segment"
+            )
+            return
         chunk.sequence = self._next_speech_sequence()
         chunk.state = int(message.audio_vad_state.value)
         # Malformed PCM is forwarded, not dropped here: the consumer aborts the
-        # affected segment instead of joining audio across a gap. It is still
-        # bounded so a bad vendor message cannot become an unbounded publish.
-        chunk.audio_data = list(data[:_SPEECH_MAX_CHUNK_BYTES])
+        # affected segment instead of joining audio across a gap.
+        chunk.audio_data = list(data)
         self._speech_pub.publish(chunk)
         if self._speech_capture_pub is not None and data:
             from audio_common_msgs.msg import AudioDataStamped  # noqa: PLC0415
@@ -656,7 +670,7 @@ class AimdkRuntimeNode(Node):
             stamped = AudioDataStamped()
             stamped.header.stamp = message.header.stamp
             stamped.header.frame_id = _SPEECH_FRAME_ID
-            stamped.audio.data = list(data[:_SPEECH_MAX_CHUNK_BYTES])
+            stamped.audio.data = list(data)
             self._speech_capture_pub.publish(stamped)
 
     def _setup_localization(self, topics: dict[str, Any]) -> None:

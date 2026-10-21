@@ -326,9 +326,30 @@ def test_malformed_pcm_is_forwarded_for_the_consumer_to_abort(vendor_module):
     assert list(pub.messages[0].audio_data) == [0]
 
 
-def test_oversized_vendor_chunk_is_bounded(vendor_module):
+@pytest.mark.parametrize(("pcm_bytes", "state"), [(19200, 1), (20800, 3)])
+def test_a_vendor_backfill_burst_is_forwarded_whole(vendor_module, pcm_bytes, state):
+    # Measured on the X2 (2026-10-20): segments open and close with bursts of up to 20800 bytes,
+    # and a 16000-byte cap cut speech out of the utterance, so the recognizer heard another word.
     node = runtime()
     node._setup_processed_audio({"processed_audio": "/agent/process_audio_output"})
-    node._on_processed_audio(vendor_message(pcm=b"\x00" * 40000, state=2))
-    pub = next(p for p in node._rec_publishers if p.topic == "/audio/speech_chunk")
-    assert len(pub.messages[0].audio_data) == 16000
+    pcm = (bytes(range(256)) * (pcm_bytes // 256 + 1))[:pcm_bytes]
+    node._on_processed_audio(vendor_message(pcm=pcm, state=state))
+    speech = next(p for p in node._rec_publishers if p.topic == "/audio/speech_chunk")
+    diag = next(p for p in node._rec_publishers if p.topic == "/audio/enhanced_capture_stamped")
+    assert [(m.state, bytes(m.audio_data)) for m in speech.messages] == [(state, pcm)]
+    assert [bytes(m.audio.data) for m in diag.messages] == [pcm]
+
+
+def test_a_vendor_message_past_the_bound_is_dropped_and_marks_a_gap(vendor_module):
+    node = runtime()
+    node._setup_processed_audio({"processed_audio": "/agent/process_audio_output"})
+    node._on_processed_audio(vendor_message(sequence=1))
+    node._on_processed_audio(vendor_message(pcm=b"\x00" * (2 * 16000 * 2 + 2), state=2, sequence=2))
+    node._on_processed_audio(vendor_message(sequence=3))
+    speech = next(p for p in node._rec_publishers if p.topic == "/audio/speech_chunk")
+    diag = next(p for p in node._rec_publishers if p.topic == "/audio/enhanced_capture_stamped")
+    # None of it is published, and the gap left behind makes the consumer drop the segment
+    # rather than hear it with speech cut out.
+    assert [m.sequence for m in speech.messages] == [1, 3]
+    assert len(diag.messages) == 2
+    assert any(level == "warning" for level, _ in node.logger.records)
