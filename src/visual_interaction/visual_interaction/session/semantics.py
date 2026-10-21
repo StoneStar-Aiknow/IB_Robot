@@ -47,8 +47,11 @@ from embodied_common.visual_interaction_contract import (
 # silently dropping it would hide that.
 _FIELDS = frozenset({"kind", "category", "region", "reply"})
 
-# Fields that must be absent or empty when the kind carries no subject.
-_SUBJECT_FIELDS = ("category", "region")
+# Values that name no subject, so finding one in a subject field means the model
+# repeated a kind word rather than reporting something. Tolerated on a quiet
+# answer (see parse_observation) and never a valid category in themselves —
+# CATEGORIES excludes all of them.
+_NON_SUBJECT_VALUES = frozenset({"none", "uncertain", "unknown", "null", "n/a", "无", "没有"})
 
 # Specific risks a reply may not express. One family per risk somebody named,
 # not a guess at vocabulary.
@@ -319,11 +322,26 @@ def parse_observation(
         raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"kind {kind!r} is not one of {list(KINDS)}")
 
     if kind not in SPEAKABLE_KINDS:
-        # A quiet answer must stay quiet: carrying a subject or a reply here
-        # would let a "cannot see it" round speak anyway.
-        for field in (*_SUBJECT_FIELDS, "reply"):
-            if normalise_text(_as_string(data.get(field, ""), field)):
-                raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"kind {kind!r} must not carry {field}")
+        # A quiet answer must stay quiet. What makes it quiet is that nothing
+        # speakable survives, so the subject fields are dropped rather than
+        # inspected — except for a real category, which is the one thing that
+        # would mean the model contradicted itself.
+        #
+        # Measured on the board, thirteen of twenty quiet answers arrived as
+        # {"kind": "none", "category": "uncertain", "region": "chest", ...},
+        # some with none and uncertain swapped. The model meant "nothing to
+        # report" and filled the fields with the words listed beside them in
+        # the schema. Refusing those reported SCHEMA_INVALID — which reads as a
+        # broken model — for an answer whose meaning was right.
+        #
+        # A named category still fails: "nothing to report, it is a hat" is a
+        # contradiction, and honouring either half would be guessing which.
+        category = normalise_text(_as_string(data.get("category", ""), "category"))
+        if category and category not in _NON_SUBJECT_VALUES:
+            raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"kind {kind!r} must not carry category")
+        # A region alone names no subject — without a category nothing can be
+        # said about it — and a reply here is a report to the host rather than
+        # a remark to a visitor ("没有看到明显的物品。"). Both are discarded.
         return Observation(kind=kind)
 
     category = _as_string(data.get("category"), "category")

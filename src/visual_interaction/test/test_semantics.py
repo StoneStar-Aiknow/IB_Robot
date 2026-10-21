@@ -92,18 +92,58 @@ class TestQuietAnswers:
         """A working silence must be tellable from a blind one."""
         assert quiet_reason(KIND_NONE) != quiet_reason(KIND_UNCERTAIN)
 
-    @pytest.mark.parametrize("field", ["category", "region", "reply"])
-    def test_a_quiet_kind_may_not_smuggle_a_subject(self, field):
-        """Otherwise a "cannot see it" round could still speak."""
-        payload = {"kind": KIND_UNCERTAIN, field: "toy" if field == "category" else "hand"}
-        if field == "reply":
-            payload[field] = "你举起的玩偶真有趣。"
+    def test_a_quiet_kind_may_not_smuggle_a_subject(self):
+        """Otherwise a "cannot see it" round could still speak.
 
+        A named category contradicts the kind, and honouring either half would
+        be guessing which one the model meant.
+        """
         with pytest.raises(SemanticsError) as error:
-            parse_observation(payload)
+            parse_observation({"kind": KIND_UNCERTAIN, "category": "toy"})
 
         assert error.value.reason == SUPPRESS_SCHEMA_INVALID
-        assert field in error.value.detail
+        assert "category" in error.value.detail
+
+    def test_a_region_alone_names_no_subject(self):
+        """Without a category there is nothing to say about a position."""
+        observation = parse_observation({"kind": KIND_UNCERTAIN, "region": "hand"})
+
+        assert not observation.has_subject
+        assert not observation.reply
+
+    def test_a_quiet_kind_drops_its_reply_rather_than_failing(self):
+        """A quiet answer has nothing to say, so stray text is not an error.
+
+        What matters is that nothing gets spoken, and an Observation with no
+        reply cannot speak. Refusing instead reported SCHEMA_INVALID — which
+        reads as a broken model — for an answer that was merely wordy.
+        """
+        observation = parse_observation({"kind": KIND_NONE, "reply": "没有看到明显的物品。"})
+
+        assert observation.kind == KIND_NONE
+        assert not observation.reply
+        assert not observation.has_subject
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"kind": "none", "category": "uncertain", "region": "chest", "reply": "没有看到明显的物品。"},
+            {"kind": "uncertain", "category": "none", "region": "chest", "reply": "没有看到明显的物品。"},
+            {"kind": "none", "category": "unknown", "region": "unknown", "reply": ""},
+        ],
+        ids=["kind-word-in-category", "swapped", "unknown-in-both"],
+    )
+    def test_a_kind_word_parked_in_a_subject_field_is_tolerated(self, payload):
+        """Thirteen of twenty board answers looked exactly like these.
+
+        The model meant "nothing to report" and filled the subject fields with
+        the words listed beside them in the schema. That is a formatting slip,
+        not a subject, so it is dropped — the round still goes quiet.
+        """
+        observation = parse_observation(payload)
+
+        assert not observation.has_subject
+        assert not observation.reply
 
     def test_an_empty_subject_field_on_a_quiet_kind_is_fine(self):
         assert parse_observation({"kind": KIND_NONE, "category": "", "reply": "  "}).kind == KIND_NONE
