@@ -489,6 +489,10 @@ vendor:
     # internally — so the bridge holds focus itself while it streams.
     focus_priority: 6
     focus_priority_weight: 0
+    # Release the speaker this long after everything handed to hal_audio has
+    # played out: releasing makes it abandon and flush what it still holds,
+    # and holding focus while idle would keep preempting the platform's own
+    # announcements. The grace covers the player's own output latency.
     focus_release_idle_s: 1.0
     focus_buffer_chunks: 50
   # Optional vendor SLAM component ("contact after-sales"). Declaring

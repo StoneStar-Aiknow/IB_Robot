@@ -69,21 +69,27 @@ playback service manages focus internally — so audio published without it is
 accepted on the wire and never reaches the speaker. There is no error anywhere:
 the only symptom is silence.
 
-The bridge therefore takes focus itself, for exactly as long as it is
-streaming: the first chunk on `/audio/play` triggers `RequestAudioFocus` (and
-is buffered, not dropped, so an utterance does not start mid-word), and
-`AbandonAudioFocus` follows once the stream has been quiet for
-`vendor.audio.focus_release_idle_s`. Holding focus while idle would keep
-preempting the platform's own announcements. Three details are contractual:
+The bridge therefore takes focus itself, for exactly as long as there is audio
+to hear: a chunk on `/audio/play` that finds no focus triggers
+`RequestAudioFocus` (and is buffered, not dropped, so an utterance does not start
+mid-word), and `AbandonAudioFocus` follows `vendor.audio.focus_release_idle_s`
+after everything forwarded has played out. The bridge times that from the PCM it
+hands over, not from when chunks arrived: a publisher writing ahead of real time
+finishes its stream long before the speaker does. Holding focus while idle would
+keep preempting the platform's own announcements. Four details are contractual:
 
 - The service status is `SUCCESS` whether or not focus was granted — it reports
   only that the request was processed. `focus_response.focus_gain` is the answer.
 - `AbandonAudioFocus` must repeat `pkg_name`, `priority` and `priority_weight`
   exactly as the matching request carried them, or the holder never matches and
   the focus is never released.
+- Releasing focus makes `hal_audio` abandon and flush whatever it still holds,
+  so a release that lands while the end of a reply is queued cuts it short.
 - Focus loss is announced on `/aima/hal/audio/focus_response`, not polled. A
   higher (or equal) priority source preempts; the bridge stops publishing
-  rather than fighting whatever the platform decided should be heard.
+  rather than fighting whatever the platform decided should be heard. A refused
+  request drops the buffered audio, and focus is asked for again only when new
+  audio arrives.
 
 To test playback on a robot, start with the vendor's own path, which proves the
 speaker and needs no focus handling, then the contract topic:

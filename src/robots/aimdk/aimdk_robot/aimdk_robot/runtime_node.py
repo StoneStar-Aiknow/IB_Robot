@@ -124,6 +124,9 @@ _SPEECH_MAX_CHUNK_BYTES = _SPEECH_MAX_CHUNK_MS * 16000 * 2 // 1000
 #: only add service traffic to a queue that is already occupied.
 _AUDIO_FOCUS_RETRY_S = 1.0
 
+#: Bytes per sample of the PCM formats the platform player declares.
+_PCM_SAMPLE_BYTES = {"S16LE": 2, "S24LE": 3, "S32LE": 4}
+
 #: Window over which clock-offset samples are kept. Long enough that a burst of
 #: callback latency cannot fill it, short enough to notice a clock being
 #: stepped while the runtime is up.
@@ -197,7 +200,8 @@ class AimdkRuntimeNode(Node):
         self._playback_buffer: deque[list[int]] = deque(maxlen=1)
         self._focus_held = False
         self._focus_attempt_s = 0.0
-        self._last_play_s = 0.0
+        # When everything handed to the platform player has been rendered (monotonic seconds).
+        self._render_until = 0.0
         self._focus_priority = 6
         self._focus_weight = 0
         self._focus_release_idle_s = 1.0
@@ -1784,7 +1788,6 @@ class AimdkRuntimeNode(Node):
     def _on_audio_play(self, message: Any) -> None:
         chunk = list(message.audio.data)
         with self._audio_lock:
-            self._last_play_s = time.monotonic()
             if self._focus_held:
                 publish = True
             else:
@@ -1798,34 +1801,46 @@ class AimdkRuntimeNode(Node):
 
     def _publish_playback(self, chunk: list[int]) -> None:
         audio = self._vendor.get("audio") or {}
+        channels = int(audio.get("playback_channels", 1))
+        sample_rate = int(audio.get("playback_sample_rate", 16000))
+        sample_format = str(audio.get("playback_sample_format", "S16LE"))
         playback = self._playback_type()
         playback.stamps = self.get_clock().now().to_msg()
-        playback.info.channels = int(audio.get("playback_channels", 1))
-        playback.info.sample_rate = int(audio.get("playback_sample_rate", 16000))
-        playback.info.sample_format = str(audio.get("playback_sample_format", "S16LE"))
+        playback.info.channels = channels
+        playback.info.sample_rate = sample_rate
+        playback.info.sample_format = sample_format
         playback.info.coding_format = str(audio.get("playback_coding_format", "pcm"))
         playback.data.data = chunk
         # pkg_name identifies the playback source; a change flushes the
         # platform's buffer, so every chunk of one stream carries the same one.
         playback.pkg_name = self._source
         self._playback_pub.publish(playback)
+        # The player renders what it is handed in real time, after whatever it already holds.
+        frame_bytes = channels * _PCM_SAMPLE_BYTES.get(sample_format, 2)
+        with self._audio_lock:
+            self._render_until = max(time.monotonic(), self._render_until) + len(chunk) / (sample_rate * frame_bytes)
 
     def _audio_focus_tick(self) -> None:
-        """Hold audio focus for exactly as long as there is audio to play.
+        """Hold audio focus while forwarded audio is still playing, and ask for it only to play audio.
 
         ``hal_audio`` never requests focus on a publisher's behalf, so nothing
-        published here is guaranteed to be heard until this succeeds. Focus is
-        released once the stream goes quiet: holding it idle would keep
-        preempting whatever else the platform wants to say.
+        published here is guaranteed to be heard until this succeeds. Releasing
+        focus makes it abandon and flush whatever it still holds, so focus is
+        kept until everything forwarded has been rendered, plus
+        ``focus_release_idle_s``; holding it longer would keep preempting
+        whatever else the platform wants to say.
         """
         now = time.monotonic()
         with self._audio_lock:
-            wants_focus = bool(self._playback_buffer) or (now - self._last_play_s) < self._focus_release_idle_s
+            buffered = bool(self._playback_buffer)
+            playing = now < self._render_until + self._focus_release_idle_s
             held = self._focus_held
             retry_due = (now - self._focus_attempt_s) >= _AUDIO_FOCUS_RETRY_S
-        if wants_focus and not held and retry_due:
+        # A refusal drops the buffer: asking again with nothing to play would only take the
+        # speaker for silence once the higher-priority source lets go.
+        if buffered and not held and retry_due:
             self._acquire_audio_focus()
-        elif held and not wants_focus:
+        elif held and not (buffered or playing):
             self.release_audio_focus()
 
     def _acquire_audio_focus(self) -> None:
