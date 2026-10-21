@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timezone
 
 import pytest
 
-from ibrobot_agent.contracts import AgentRequest, PlannerIdentity
+from ibrobot_agent.contracts import AgentRequest, PlannerIdentity, PlannerRepair
 from ibrobot_agent.planner import (
     PlannerAdapter,
     PlannerParseError,
@@ -210,3 +211,105 @@ def test_planner_adapter_rejects_execution_fields_on_conversation():
 
     with pytest.raises(PlannerParseError, match="conversation outcomes cannot carry a summary"):
         planner.plan(_request("这是什么"), {}, {}, threading.Event())
+
+
+def _parse(payload):
+    return parse_planner_outcome(json.dumps(payload, ensure_ascii=False))
+
+
+def test_a_clarification_without_missing_fields_is_still_asked():
+    # Observed on the X2: the model asked a question but left missing_fields out, and the strict
+    # contract turned it into a FAILED terminal the user heard as a failed execution.
+    outcome = _parse({"kind": "needs_clarification", "user_message": "你想让我挥哪只手？"})
+
+    assert outcome.kind == "needs_clarification"
+    assert outcome.missing_fields == ("request",)
+    assert outcome.repairs == (PlannerRepair("missing_fields", "defaulted", None),)
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "expected", "action"),
+    [
+        (" SAFETY_RESTRICTED ", "SAFETY_RESTRICTED", "normalized"),
+        ("out_of_scope", "OUT_OF_SCOPE", "normalized"),
+        ("NOT_A_REASON", "UNSUPPORTED_TASK", "defaulted"),
+        (None, "UNSUPPORTED_TASK", "defaulted"),
+        (["SAFETY_RESTRICTED"], "UNSUPPORTED_TASK", "defaulted"),
+    ],
+)
+def test_a_refusal_keeps_a_reason_the_contract_knows_and_records_the_original(reason_code, expected, action):
+    outcome = _parse({"kind": "rejected", "user_message": "这个我做不到。", "reason_code": reason_code})
+
+    assert outcome.kind == "rejected"
+    assert outcome.reason_code == expected
+    assert outcome.repairs == (PlannerRepair("reason_code", action, reason_code),)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "kind": "needs_clarification",
+            "user_message": "哪只手？",
+            "missing_fields": ["hand"],
+            "reason_code": "",
+            "skill_name": "",
+            "query_kind": None,
+            "steps": [],
+            "summary": "",
+        },
+        {
+            "kind": "rejected",
+            "user_message": "做不到。",
+            "reason_code": "OUT_OF_SCOPE",
+            "skill_name": "",
+            "missing_fields": [],
+        },
+        {"kind": "conversation", "user_message": "你好。", "reason_code": "", "skill_name": None, "summary": ""},
+        {"kind": "read_only", "user_message": "我来查。", "query_kind": "list_skills", "skill_name": ""},
+    ],
+)
+def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
+    # Models fill the fields they do not use with empty values; dropping those loses nothing.
+    outcome = _parse(payload)
+
+    assert outcome.kind == payload["kind"]
+    assert outcome.repairs == ()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # A question that also carries steps or a reason: the model's intent is ambiguous.
+        {
+            "kind": "needs_clarification",
+            "user_message": "哪只手？",
+            "missing_fields": ["hand"],
+            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
+        },
+        {"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["hand"], "reason_code": "X"},
+        {"kind": "rejected", "user_message": "做不到。", "reason_code": "OUT_OF_SCOPE", "summary": "wave_hand"},
+        # Workflow replies are never repaired.
+        {
+            "kind": "workflow",
+            "user_message": "准备执行。",
+            "summary": "挥手",
+            "reason_code": "",
+            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
+        },
+        # A read-only reply without its query has no unambiguous repair.
+        {"kind": "read_only", "user_message": "我来查。"},
+    ],
+)
+def test_a_reply_whose_fields_contradict_its_kind_still_fails_closed(payload):
+    with pytest.raises(PlannerParseError):
+        _parse(payload)
+
+
+def test_repairs_stay_out_of_what_the_robot_is_asked_to_do():
+    repaired = _parse({"kind": "needs_clarification", "user_message": "哪只手？"})
+    strict = _parse({"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["request"]})
+
+    # Digests and stored outcomes are built from to_dict(); a repair is provenance, not content.
+    assert repaired.to_dict() == strict.to_dict()
+    assert repaired == strict

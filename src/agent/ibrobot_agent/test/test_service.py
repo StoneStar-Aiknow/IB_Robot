@@ -16,6 +16,7 @@ from ibrobot_agent.contracts import (
     ExecutionResult,
     PlannerIdentity,
     PlannerOutcome,
+    PlannerRepair,
 )
 from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.planner import RulePlanner
@@ -971,5 +972,27 @@ def test_skill_list_names_skills_the_way_plans_do(tmp_path):
         record = _wait_state(service, request.to_key(), {"ANSWERED"})
         # A skill without a Chinese name keeps its own name instead of being left out.
         assert record.terminal.message == "当前可规划技能：握手、nav_turn、挥手。"
+    finally:
+        service.close()
+
+
+def test_a_repaired_planner_reply_is_answered_and_its_repairs_audited(tmp_path, caplog):
+    outcome = PlannerOutcome(
+        kind="needs_clarification",
+        user_message="你想让我挥哪只手？",
+        missing_fields=("request",),
+        repairs=(PlannerRepair("missing_fields", "defaulted", None),),
+    )
+    service, _planner, _events = _service(tmp_path, outcome)
+    try:
+        request = _request(text="挥手")
+        assert service.send_message(request).accepted
+        record = _wait_state(service, request.to_key(), {"ANSWERED"})
+
+        # The user hears the question rather than a failed execution, and the operator can see why.
+        assert record.terminal.message == "你想让我挥哪只手？"
+        detail = service._store.latest_event_detail(request.to_key(), "planner_outcome")
+        assert detail["planner_repairs"] == [{"field": "missing_fields", "action": "defaulted", "original": None}]
+        assert any("repaired" in entry.getMessage() for entry in caplog.records if entry.levelname == "WARNING")
     finally:
         service.close()

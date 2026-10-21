@@ -1,18 +1,34 @@
 """Strict planner-response parsing for ibrobot_agent.
 
 The planner layer accepts only a single JSON object and turns it into the
-typed ``PlannerOutcome`` contract. Anything else fails closed.
+typed ``PlannerOutcome`` contract. Anything else fails closed, except the
+few unambiguous repairs ``_repair_untrusted_reply`` makes to replies that
+cannot run anything.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
-from ibrobot_agent.contracts import PlannerIdentity, PlannerOutcome, planner_outcome_from_mapping
+from ibrobot_agent.contracts import (
+    REASON_CODE_VALUES,
+    PlannerIdentity,
+    PlannerOutcome,
+    PlannerRepair,
+    planner_outcome_from_mapping,
+)
+
+#: Outcome fields only some kinds may carry; the contract decides which.
+_KIND_SPECIFIC_FIELDS = ("query_kind", "skill_name", "missing_fields", "reason_code", "steps", "summary")
+#: A clarification the model left unqualified asks about the request as a whole.
+_CLARIFICATION_FIELD_FALLBACK = "request"
+#: A refusal whose reason is not one the contract knows is reported as unsupported.
+_REASON_CODE_FALLBACK = "UNSUPPORTED_TASK"
 
 _NEGATION_MARKERS = ("不要", "别", "不想", "do not", "don't")
 _HYPOTHETICAL_MARKERS = ("如果", "假如", "假设")
@@ -73,18 +89,66 @@ def parse_planner_outcome(raw_text: str, *, steps: Sequence[Any] | None = None) 
         raise PlannerParseError("planner response is not valid JSON") from exc
     if not isinstance(payload, Mapping):
         raise PlannerParseError("planner response must be a JSON object")
-    try:
-        return planner_outcome_from_mapping(payload, steps=steps)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PlannerParseError(str(exc)) from exc
+    return planner_outcome_from_payload(payload, steps=steps)
 
 
 def planner_outcome_from_payload(payload: Mapping[str, Any], *, steps: Sequence[Any] | None = None) -> PlannerOutcome:
     """Convert a pre-parsed payload mapping into a validated PlannerOutcome."""
+    data, repairs = _repair_untrusted_reply(payload)
     try:
-        return planner_outcome_from_mapping(payload, steps=steps)
+        outcome = planner_outcome_from_mapping(data, steps=steps)
     except (KeyError, TypeError, ValueError) as exc:
         raise PlannerParseError(str(exc)) from exc
+    return dataclasses.replace(outcome, repairs=repairs) if repairs else outcome
+
+
+def _fields_allowed_for(kind: Any, data: Mapping[str, Any]) -> set[str] | None:
+    """The kind-specific fields a reply of ``kind`` may carry; ``None`` for kinds never repaired."""
+    if kind == "conversation":
+        return set()
+    if kind == "read_only":
+        return {"query_kind", "skill_name"} if data.get("query_kind") == "describe_skill" else {"query_kind"}
+    if kind == "needs_clarification":
+        return {"missing_fields"}
+    if kind == "rejected":
+        return {"reason_code"}
+    return None
+
+
+def _repair_untrusted_reply(payload: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[PlannerRepair, ...]]:
+    """Fit a reply that cannot run anything to its kind's contract where the repair is unambiguous.
+
+    The model is untrusted input while ``PlannerOutcome`` stays strict, so a question or refusal
+    that merely left a field empty or out used to surface as a FAILED terminal: the user heard
+    that execution failed where nothing could have run. Workflow replies are never repaired, and
+    a reply whose fields contradict its kind (a question carrying steps, a chat reply carrying a
+    summary) still fails closed, since its intent is ambiguous.
+    """
+    data = dict(payload)
+    kind = data.get("kind")
+    allowed = _fields_allowed_for(kind, data)
+    if allowed is None:
+        return data, ()
+    for name in _KIND_SPECIFIC_FIELDS:
+        # Models fill fields they do not use with empty values; those carry nothing to lose.
+        if name not in allowed and name in data and data[name] in (None, "", [], {}):
+            del data[name]
+    repairs = []
+    if kind == "needs_clarification" and not data.get("missing_fields"):
+        repairs.append(PlannerRepair("missing_fields", "defaulted", payload.get("missing_fields")))
+        data["missing_fields"] = [_CLARIFICATION_FIELD_FALLBACK]
+    if kind == "rejected":
+        original = data.get("reason_code")
+        # Only text can name a reason; anything else (null, a list) is no reason at all.
+        normalized = original.strip().upper() if isinstance(original, str) else None
+        if normalized in REASON_CODE_VALUES:
+            if normalized != original:
+                repairs.append(PlannerRepair("reason_code", "normalized", original))
+            data["reason_code"] = normalized
+        else:
+            repairs.append(PlannerRepair("reason_code", "defaulted", original))
+            data["reason_code"] = _REASON_CODE_FALLBACK
+    return data, tuple(repairs)
 
 
 class PlannerAdapter:

@@ -76,6 +76,11 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
   操作员 `authorize_motion` launch 参数。
 - 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。
 - Planner 输出只接受单一严格 JSON 对象；未知字段、未知 skill、编造参数一律拒绝。
+- 唯一的例外是不会触发执行的回复（对话、只读查询、澄清、拒绝）在修复不产生歧义时会被修正，而不是变成
+  FAILED 终态：本类型用不到的字段若是空值（`""`、`null`、`[]`）直接去掉；澄清缺 `missing_fields` 时补
+  `["request"]`；拒绝的 `reason_code` 先去空白并转大写，仍不合法则回退为 `UNSUPPORTED_TASK`。修正记录
+  （字段、动作、原值）写入 ledger 的 `planner_outcome` 事件 `planner_repairs` 并记 warning 日志，不进入
+  digest。workflow 回复从不修正；字段与类型矛盾（如澄清带 `steps`、对话带 `summary`）仍然拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
   供人工通过 Gateway 核实；确定未提交的中断请求转为 FAILED 或 CANCELLED_BEFORE_EXECUTION。

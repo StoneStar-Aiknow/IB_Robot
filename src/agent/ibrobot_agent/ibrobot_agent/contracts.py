@@ -299,6 +299,18 @@ class TaskRef:
 
 
 @dataclass(frozen=True)
+class PlannerRepair:
+    """One unambiguous change made to an untrusted planner reply so it fits its kind's contract."""
+
+    field: str
+    action: Literal["defaulted", "normalized"]
+    original: Any = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"field": self.field, "action": self.action, "original": self.original}
+
+
+@dataclass(frozen=True)
 class PlannerOutcome:
     kind: PlannerOutcomeKind
     user_message: str
@@ -308,6 +320,9 @@ class PlannerOutcome:
     reason_code: str | None = None
     steps: tuple[CanonicalWorkflowStep, ...] = ()
     summary: str = ""
+    #: Provenance only: never part of to_dict() or equality, so digests and stored outcomes
+    #: describe what the robot was asked to do, not how the model's reply was fitted to it.
+    repairs: tuple[PlannerRepair, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if self.kind not in {"conversation", "read_only", "needs_clarification", "rejected", "workflow"}:
@@ -805,6 +820,7 @@ __all__ = [
     "PlannerIdentity",
     "PlannerOutcome",
     "PlannerOutcomeKind",
+    "PlannerRepair",
     "QueryKind",
     "RegistryIdentity",
     "RequestKey",

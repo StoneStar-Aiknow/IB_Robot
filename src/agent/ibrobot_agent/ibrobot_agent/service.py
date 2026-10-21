@@ -414,11 +414,17 @@ class AgentService:
                 user_message = self._resolve_non_workflow_message(outcome, status, catalog)
                 if outcome.kind == "needs_clarification":
                     self._conversation.save_clarification(request, outcome.missing_fields)
+                detail = planner_outcome_to_mapping(outcome)
+                if outcome.repairs:
+                    # The audit trail explains why the user got this answer where the strict
+                    # contract would have produced a FAILED terminal.
+                    detail["planner_repairs"] = [repair.to_dict() for repair in outcome.repairs]
+                    _LOGGER.warning("planner reply for %s repaired: %s", request.request_id, detail["planner_repairs"])
                 self._store.record_event(
                     key,
                     event_type="planner_outcome",
                     state="PLANNING",
-                    detail_json=json.dumps(planner_outcome_to_mapping(outcome), ensure_ascii=False, sort_keys=True),
+                    detail_json=json.dumps(detail, ensure_ascii=False, sort_keys=True),
                 )
                 self._conversation.append_assistant(request, user_message)
                 self._finish_answered(key, record.planning_generation, user_message, event_type=outcome.kind)
