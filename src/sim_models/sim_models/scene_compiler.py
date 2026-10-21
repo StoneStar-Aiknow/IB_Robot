@@ -7,8 +7,8 @@ contain two placeholders that are substituted at launch time:
   {{MESHES_DIR}}      — absolute path to the scene's meshes/ directory
   {{ROBOT_XML_PATH}}  — absolute path to the robot MJCF XML (MuJoCo only)
 
-The substituted content is written to /tmp/ so that Gazebo and MuJoCo
-can reference mesh files by their installed absolute paths.
+The substituted content is written to a temporary directory so that Gazebo
+and MuJoCo can reference mesh files by their installed absolute paths.
 
 Public API
 ----------
@@ -16,19 +16,38 @@ Public API
       Return the Path to the raw template file (for inspection or tests).
 
   get_gazebo_world_path(scene_name) -> Path
-      Generate /tmp/sim_models_{scene}.world with {{MESHES_DIR}} resolved.
+      Generate the resolved Gazebo world file.
       Used by GazeboAdapter.start_backend() when simulation.scene is set.
 
-  get_mujoco_scene_path(scene_name, robot_xml_path="") -> Path
-      Generate /tmp/sim_models_{scene}.mjb with both placeholders resolved,
-      SDF non-convex collision enabled for meshes listed in _SDF_MESH_NAMES,
-      and the result saved as a binary .mjb for mujoco_ros2_control.
-      Pass robot_xml_path for a full robot+scene file (T6);
-      omit it for a standalone scene file (MuJoCo Viewer testing).
+  randomization_grid(layout) -> list[(x, y, z, yaw)]
+      The single randomisation generator shared by both physics platforms
+      (so101-mujoco-runtime-platform D9): randomisation index *k* maps to
+      the same banana placement on MuJoCo (keyframe ``random_KKK``) and on
+      Gazebo (``SetEntityPose`` with the same index).
+
+  composed_model_path(scene) -> Path
+      The single composed-model location (D3), keyed by ``ROS_DOMAIN_ID`` so
+      concurrent launches on different domains never overwrite each other's
+      model. Used by the provider (writer) and the scene task (reader).
+
+  compose_mujoco_model(robot_mjcf_path, scene, sdf_mesh_names) -> Path
+      Robot-agnostic composition (D3): substitute the robot MJCF into the
+      named scene (or compile it alone when ``scene`` is None), inject the
+      shared keyframes, apply SDF collision to the given meshes, compile and
+      save the ``.mjb``. Falls back to the ``.xml`` only when the ``mujoco``
+      package is missing; the provider treats that as fatal.
+
+  get_scene_layout(scene_name) -> dict
+      The parsed layout.yaml of a scene (or {}).
+
+  get_scene_task(scene_name) -> dict | None
+      The scene's ``task:`` declaration (executable + platforms), or None.
 """
 
 import logging
 import math
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -43,26 +62,71 @@ _PLATFORM_EXT = {
     "mujoco": ".xml.template",
 }
 
-# Mesh asset names that require SDF-based non-convex collision.
-# MuJoCo normally convex-hulls all mesh geoms; needsdf=True enables the
-# octree SDF so the exact (non-convex) surface is used for contact.
-# The gripper finger meshes are strongly non-convex; without SDF, MuJoCo
-# replaces them with convex hulls that distort fingertip contact.
-_SDF_MESH_NAMES: frozenset[str] = frozenset(
-    {
-        "wrist_roll_follower",  # fixed jaw finger
-        "moving_jaw",  # moving jaw finger
-    }
-)
+
+def randomization_grid(layout: dict) -> list[tuple[float, float, float, float]]:
+    """The single randomisation generator shared by both physics platforms (D9).
+
+    Index *k* of the returned list maps to the same banana placement on every
+    platform: MuJoCo keyframe ``random_{k:03d}`` and the Gazebo backend's
+    ``SetEntityPose`` with the same index. The order is stable: x outer,
+    y middle, yaw inner, exactly as the previous keyframe-only generator
+    produced, so existing randomisation indices keep their meaning.
+    """
+    rand = layout.get("randomization", {})
+    banana_cfg = rand.get("banana", {})
+    if not banana_cfg:
+        return []
+    x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
+    y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
+    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
+    grid_cols = int(banana_cfg.get("grid_cols", 5))
+    grid_rows = int(banana_cfg.get("grid_rows", 7))
+    yaw_steps = int(banana_cfg.get("yaw_steps", 6))
+    xs = np.linspace(x_min, x_max, grid_cols)
+    ys = np.linspace(y_min, y_max, grid_rows)
+    yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
+    return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+
+
+def _quat_from_extrinsic_xyz(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    """Extrinsic XYZ (URDF rpy) rotation as a MuJoCo w-x-y-z quaternion."""
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    # q = qz(yaw) @ qy(pitch) @ qx(roll), scalar first
+    return (
+        cy * cp * cr + sy * sp * sr,
+        cy * cp * sr - sy * sp * cr,
+        cy * sp * cr + sy * cp * sr,
+        sy * cp * cr - cy * sp * sr,
+    )
+
+
+def _layout_dynamic_objects(layout: dict) -> list[tuple[str, list[float], list[float]]]:
+    """The scene's dynamic objects as (name, position, rotation_euler_rad)."""
+    out = []
+    for obj in layout.get("objects", []) or []:
+        if str(obj.get("type", "")).lower() != "dynamic":
+            continue
+        out.append(
+            (
+                str(obj.get("name", "")),
+                [float(v) for v in (obj.get("position") or [0.0, 0.0, 0.0])],
+                [float(v) for v in (obj.get("rotation_euler_rad") or [0.0, 0.0, 0.0])],
+            )
+        )
+    return out
 
 
 def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
-    """Inject pre-generated random banana placement keyframes into MJCF XML.
+    """Inject the shared randomisation keyframes plus a named default (D3/D9).
 
-    Generates a grid_cols × grid_rows × yaw_steps keyframe grid, naming each
-    ``random_KKK``.  Uses the mujoco Python API to resolve qpos addresses by
-    joint name so the arm/banana/plate ordering is inferred from the model, not
-    hardcoded.  If mujoco is unavailable or the model cannot compile, returns
+    ``random_KKK`` keyframes come from ``randomization_grid`` (index k → pose);
+    the ``default`` keyframe holds the layout's default object poses and
+    ``arm_rest_qpos``, so a default reset and the trajectory controller's
+    hold setpoint agree. Uses the mujoco Python API to resolve qpos addresses
+    by joint name so the ordering is inferred from the model, not hardcoded.
+    If mujoco is unavailable or the model cannot compile, returns
     xml_content unchanged.
     """
     try:
@@ -71,19 +135,14 @@ def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
         logging.warning("mujoco not available; skipping keyframe injection")
         return xml_content
 
-    rand = layout.get("randomization", {})
-    banana_cfg = rand.get("banana", {})
-    if not banana_cfg:
+    grid = randomization_grid(layout)
+    if not grid:
         return xml_content
 
-    x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
-    y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
-    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
-    grid_cols = int(banana_cfg.get("grid_cols", 5))
-    grid_rows = int(banana_cfg.get("grid_rows", 7))
-    yaw_steps = int(banana_cfg.get("yaw_steps", 6))
+    rand = layout.get("randomization", {})
     arm_joint_names = rand.get("arm_joint_names", [])
     arm_rest_qpos = rand.get("arm_rest_qpos", [])
+    dynamics = _layout_dynamic_objects(layout)
 
     try:
         spec = mujoco.MjSpec.from_string(xml_content)
@@ -98,38 +157,42 @@ def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
         return int(model.jnt_qposadr[jid]) if jid >= 0 else -1
 
-    banana_adr = _adr("banana_free")
-    if banana_adr < 0:
-        logging.warning("banana_free joint not found in model; skipping keyframe injection")
-        return xml_content
+    def _set_arm(qpos) -> None:
+        for jname, qval in zip(arm_joint_names, arm_rest_qpos, strict=False):
+            adr = _adr(jname)
+            if adr >= 0:
+                qpos[adr] = float(qval)
 
-    xs = np.linspace(x_min, x_max, grid_cols)
-    ys = np.linspace(y_min, y_max, grid_rows)
-    yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
+    def _set_freejoint(qpos, name: str, position: list[float], rpy: list[float]) -> None:
+        adr = _adr(f"{name}_free")
+        if adr < 0:
+            return
+        qw, qx, qy, qz = _quat_from_extrinsic_xyz(rpy[0], rpy[1], rpy[2])
+        qpos[adr : adr + 7] = [position[0], position[1], position[2], qw, qx, qy, qz]
+
+    banana = next((entry for entry in dynamics if entry[0] == "banana"), None)
 
     lines = ["  <keyframe>"]
-    idx = 0
-    for x in xs:
-        for y in ys:
-            for yaw in yaws:
-                qpos = data.qpos.copy()
-                for jname, qval in zip(arm_joint_names, arm_rest_qpos, strict=False):
-                    adr = _adr(jname)
-                    if adr >= 0:
-                        qpos[adr] = float(qval)
-                # banana_free freejoint: [tx, ty, tz, qw, qx, qy, qz]
-                qpos[banana_adr : banana_adr + 7] = [
-                    float(x),
-                    float(y),
-                    z_spawn,
-                    math.cos(yaw / 2),
-                    0.0,
-                    0.0,
-                    math.sin(yaw / 2),
-                ]
-                qstr = " ".join(f"{v:.6f}" for v in qpos)
-                lines.append(f'    <key name="random_{idx:03d}" qpos="{qstr}"/>')
-                idx += 1
+
+    def _emit(name: str, qpos) -> None:
+        qstr = " ".join(f"{v:.6f}" for v in qpos)
+        lines.append(f'    <key name="{name}" qpos="{qstr}"/>')
+
+    # named default: the arm at rest and every dynamic object at its layout pose
+    qpos = data.qpos.copy()
+    _set_arm(qpos)
+    for obj_name, position, rpy in dynamics:
+        _set_freejoint(qpos, obj_name, position, rpy)
+    _emit("default", qpos)
+
+    # randomisation grid: index k → random_KKK (banana at grid[k], arm at rest)
+    for idx, (x, y, z, yaw) in enumerate(grid):
+        qpos = data.qpos.copy()
+        _set_arm(qpos)
+        if banana is not None:
+            # banana_free freejoint: [tx, ty, tz, qw, qx, qy, qz]
+            _set_freejoint(qpos, banana[0], [x, y, z], [0.0, 0.0, yaw])
+        _emit(f"random_{idx:03d}", qpos)
     lines.append("  </keyframe>")
 
     return xml_content.replace("</mujoco>", "\n".join(lines) + "\n</mujoco>")
@@ -183,61 +246,73 @@ def get_gazebo_world_path(scene_name: str) -> Path:
     return out
 
 
-def get_mujoco_scene_path(scene_name: str, robot_xml_path: str = "") -> Path:
-    """Generate a MuJoCo scene binary (.mjb) with resolved paths and SDF collision.
+def composed_model_path(scene: str | None) -> Path:
+    """The single composed-model location (D3), keyed by ``ROS_DOMAIN_ID``.
 
-    Steps:
-    1. Read ``{scene_name}.xml.template``, substitute ``{{MESHES_DIR}}`` and
-       optionally ``{{ROBOT_XML_PATH}}``.
-    2. Write the intermediate XML to ``/tmp/sim_models_{scene_name}.xml``
-       (kept for debugging / MuJoCo Viewer standalone use).
-    3. Load the XML via ``mujoco.MjSpec``, set ``needsdf=True`` on every mesh
-       listed in ``_SDF_MESH_NAMES``, compile, and save as
-       ``/tmp/sim_models_{scene_name}.mjb``.
-    4. Return the ``.mjb`` path so ``mujoco_ros2_control`` loads it with
-       ``mj_loadModel`` (binary path), which preserves the SDF octree data.
+    Resolves to ``<tempdir>/ibrobot_sim_models/<ROS_DOMAIN_ID or 0>/<scene>.mjb``
+    (``robot`` when no scene is composed), so concurrent launches on different
+    domains (separate worktrees, e2e domains) do not overwrite each other's
+    model. The provider (writer) and the scene task (reader) both resolve the
+    composed model through this function.
+    """
+    domain = str(os.environ.get("ROS_DOMAIN_ID", "") or "0")
+    name = scene if scene else "robot"
+    return Path(tempfile.gettempdir()) / "ibrobot_sim_models" / domain / f"{name}.mjb"
 
-    If the ``mujoco`` Python package is not available (e.g. build-time import),
-    the function falls back to returning the plain ``.xml`` path without SDF.
+
+def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names) -> Path:
+    """Robot-agnostic robot+scene composition for the MuJoCo provider (D3).
+
+    Substitutes the robot MJCF into the named scene template (``scene=None``
+    compiles the robot MJCF alone), injects the shared keyframes when the
+    layout has randomisation, enables SDF collision on the given mesh names,
+    compiles and saves the ``.mjb`` at ``composed_model_path(scene)``. The
+    intermediate XML is kept beside it for debugging. Falls back to the
+    ``.xml`` path only when the ``mujoco`` package is missing; the provider
+    treats that as fatal.
 
     Args:
-        scene_name:      Scene name (e.g. ``"pick_banana"``).
-        robot_xml_path:  Absolute path to the robot MJCF (e.g. ``so101.xml``).
-                         Leave empty to generate a standalone scene file.
+        robot_mjcf_path:  Absolute path to the fully substituted robot MJCF.
+        scene:            Scene name (e.g. ``"pick_banana"``, ``"empty"``),
+                          or None for a robot-only model.
+        sdf_mesh_names:   Mesh asset names that need SDF non-convex collision
+                          (robot-specific input, e.g. the gripper fingers).
 
     Returns:
-        :class:`pathlib.Path` to the generated ``.mjb`` file in ``/tmp/``
-        (or ``.xml`` if mujoco is unavailable).
+        :class:`pathlib.Path` to the compiled ``.mjb`` (or the ``.xml``
+        fallback when the ``mujoco`` package is unavailable).
     """
-    tmpl = get_scene_file(scene_name, "mujoco")
-    meshes_dir = tmpl.parent / "meshes"
-    content = tmpl.read_text().replace(_MESHES_PLACEHOLDER, str(meshes_dir))
-    if robot_xml_path:
-        content = content.replace(_ROBOT_XML_PLACEHOLDER, robot_xml_path)
+    robot_path = Path(robot_mjcf_path)
+    if scene:
+        tmpl = get_scene_file(scene, "mujoco")
+        meshes_dir = tmpl.parent / "meshes"
+        content = tmpl.read_text().replace(_MESHES_PLACEHOLDER, str(meshes_dir))
+        content = content.replace(_ROBOT_XML_PLACEHOLDER, str(robot_path))
+        layout = get_scene_layout(scene)
     else:
-        # Remove the robot <include> line so the file is self-contained.
-        content = "\n".join(line for line in content.splitlines() if _ROBOT_XML_PLACEHOLDER not in line)
+        content = robot_path.read_text()
+        layout = {}
+    if layout.get("randomization"):
+        content = _inject_random_keyframes(content, layout)
 
-    # Inject random keyframes from layout.yaml randomization config
-    _layout = get_scene_layout(scene_name)
-    if _layout.get("randomization"):
-        content = _inject_random_keyframes(content, _layout)
-
-    xml_out = Path(f"/tmp/sim_models_{scene_name}.xml")
+    xml_out = composed_model_path(scene).with_suffix(".xml")
+    xml_out.parent.mkdir(parents=True, exist_ok=True)
     xml_out.write_text(content)
 
     try:
         import mujoco  # noqa: PLC0415
     except ImportError:
+        logging.warning("mujoco not available; composed model left as XML at %s", xml_out)
         return xml_out
 
     try:
         spec = mujoco.MjSpec.from_string(content)
+        sdf_names = {str(name) for name in sdf_mesh_names}
         for mesh in spec.meshes:
-            if mesh.name in _SDF_MESH_NAMES:
+            if mesh.name in sdf_names:
                 mesh.needsdf = True
         model = spec.compile()
-        mjb_out = Path(f"/tmp/sim_models_{scene_name}.mjb")
+        mjb_out = composed_model_path(scene)
         mujoco.mj_saveModel(model, str(mjb_out))
         return mjb_out
     except Exception as exc:  # noqa: BLE001
@@ -259,3 +334,17 @@ def get_scene_layout(scene_name: str) -> dict:
     if not layout_path.exists():
         return {}
     return yaml.safe_load(layout_path.read_text()) or {}
+
+
+def get_scene_task(scene_name: str) -> dict | None:
+    """Return the scene's ``task:`` declaration, or None when it declares none.
+
+    A scene task declaration names the executable the world owner starts
+    after runtime readiness and the physics platforms it supports::
+
+        task:
+          executable: pick_banana_task_node
+          platforms: [mujoco, gazebo]
+    """
+    task = get_scene_layout(scene_name).get("task")
+    return task if isinstance(task, dict) else None
