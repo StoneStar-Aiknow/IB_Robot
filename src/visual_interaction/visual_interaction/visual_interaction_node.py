@@ -230,6 +230,9 @@ class VisualInteractionNode(Node):
         self._actor_received_at: float | None = None
         self._counts: dict[str, int] = {}
         self._rounds = 0
+        # The last MODEL_NOT_READY cause logged, so a permanent
+        # fault warns once instead of every round.
+        self._last_model_error: str | None = None
 
         self._utterances = self.create_publisher(VisualInteractionUtterance, UTTERANCE_TOPIC, 10)
         self._status = self.create_publisher(String, STATUS_TOPIC, 10)
@@ -427,8 +430,16 @@ class VisualInteractionNode(Node):
             return
         if result.reason == SUPPRESS_MODEL_NOT_READY:
             detail = getattr(self._session.hooks.vision, "last_error", "")
-            self.get_logger().warning(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
+            # Once per distinct cause. A model that cannot load fails the same
+            # way every round, and sixty identical warnings bury the one line
+            # that says what went wrong; the status topic still counts them all.
+            if detail != self._last_model_error:
+                self._last_model_error = detail
+                self.get_logger().warning(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
+            else:
+                self.get_logger().debug(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
             return
+        self._last_model_error = None
         self.get_logger().debug(f"quiet: {result.reason}")
 
     def _publish_status(self) -> None:

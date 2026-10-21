@@ -116,6 +116,20 @@ class InternVlVision(VisionLanguagePort):
             if path not in sys.path:
                 sys.path.insert(0, path)
 
+        try:
+            import aclruntime  # noqa: F401 - imported for the diagnosis below
+        except ImportError as error:
+            # The CANN runtime is a binary extension installed into the system
+            # site-packages, and a venv does not inherit those. Observed on the
+            # board: every round reported MODEL_NOT_READY with a bare
+            # ModuleNotFoundError, which says nothing about what to do. Name the
+            # fix here, once, where the failure happens.
+            raise ImportError(
+                f"{error}. The CANN runtime lives in the system site-packages, which this "
+                "interpreter does not include. Source the toolkit's set_env.sh and add it, e.g. "
+                "PYTHONPATH=/usr/local/lib64/python3.11/site-packages:$PYTHONPATH"
+            ) from error
+
         import live_chat
         from llm_host import Generator
         from qwen_detok import Detokenizer

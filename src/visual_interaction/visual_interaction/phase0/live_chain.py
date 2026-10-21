@@ -14,8 +14,20 @@ association, epoch bumps, or the ambiguity and hand-over paths. Point
 ``--actor-topic`` at the real stream instead once it is running.
 
 Usage (board, with the environment loaded as ibrobot-worktree-env describes):
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    # aclruntime is a CANN binary extension installed into the SYSTEM
+    # site-packages, which a venv does not inherit. Without this the model
+    # loads nowhere and every round reports MODEL_NOT_READY with
+    # ModuleNotFoundError: No module named 'aclruntime'.
+    export PYTHONPATH=/usr/local/lib64/python3.11/site-packages:$PYTHONPATH
     python3 -m visual_interaction.phase0.live_chain \\
         --demo-root /root/vlx_internvl_310p --synthetic-actor --seconds 120
+
+Note on --seconds: the session's duration limit (session.max_session_sec,
+120 s by default) is a missed-hand-over signal that only an attendant clears,
+and a synthetic actor never leaves. A run longer than that limit therefore
+spends its remainder reporting WAITING_NEXT_VISITOR. Keep a synthetic run
+inside the limit, or drive the real actor stream.
 
 Prints one line per round. A spoken round shows the text; a quiet round shows
 its reason. Nothing is ever spoken aloud — the utterance goes to the topic.
