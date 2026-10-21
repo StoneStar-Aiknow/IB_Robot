@@ -91,6 +91,47 @@ class TestFrameBuffer:
 
 
 class TestDeclaredParameters:
+    def test_a_declared_default_accepts_the_value_launch_overrides_it_with(self):
+        """The test that was missing, and it has to use parameter_overrides.
+
+        ``categories`` was declared from an empty list, so rclpy inferred
+        BYTE_ARRAY, and the first launch carrying real categories died with
+        "expecting type 'BYTE_ARRAY'" before the node existed. No node test
+        caught it because they all pass their own override for that name.
+
+        It also has to go through ``parameter_overrides`` specifically:
+        ``set_parameters`` with the same string array is *accepted* on a
+        BYTE_ARRAY declaration, so a test written that way passes while launch
+        still fails.
+        """
+        import json
+
+        import rclpy
+        from rclpy.parameter import Parameter
+
+        rclpy.init()
+        try:
+            # What the launch builder actually sends for every parameter.
+            overrides = [
+                Parameter("runtime_description_json", value="{}"),
+                Parameter("categories_json", value='["toy","sign","hat","badge"]'),
+                Parameter("vl_implementation", value="fake"),
+            ]
+            node = rclpy.create_node("parameter_override_probe", parameter_overrides=overrides)
+            try:
+                for name, default in PARAMETERS.items():
+                    node.declare_parameter(name, default)
+                assert json.loads(node.get_parameter("categories_json").value) == [
+                    "toy",
+                    "sign",
+                    "hat",
+                    "badge",
+                ]
+            finally:
+                node.destroy_node()
+        finally:
+            rclpy.shutdown()
+
     def test_every_name_the_launch_builder_passes_is_declared(self):
         """rclpy drops an override it has no declaration for without a warning."""
         for name in (
@@ -103,7 +144,7 @@ class TestDeclaredParameters:
             "min_gap_sec",
             "absent_reset_sec",
             "max_session_sec",
-            "categories",
+            "categories_json",
         ):
             assert name in PARAMETERS
 
@@ -111,7 +152,10 @@ class TestDeclaredParameters:
         assert isinstance(PARAMETERS["runtime_description_json"], str)
         assert isinstance(PARAMETERS["frames_per_window"], int)
         assert isinstance(PARAMETERS["window_sec"], float)
-        assert isinstance(PARAMETERS["categories"], list)
+        # JSON rather than a ROS string array: an empty list has no
+        # inferable element type, so rclpy declared BYTE_ARRAY and the
+        # node died at startup on the launch builder's strings.
+        assert isinstance(PARAMETERS["categories_json"], str)
 
     def test_the_default_model_is_the_scripted_one(self):
         """The real loop waits for phase zero, so the skeleton stays launchable."""

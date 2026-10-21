@@ -215,7 +215,9 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         "min_gap_sec": float(session.get("min_gap_sec", DEFAULT_MIN_GAP_SEC)),
         "absent_reset_sec": float(session.get("absent_reset_sec", DEFAULT_ABSENT_RESET_SEC)),
         "max_session_sec": float(session.get("max_session_sec", DEFAULT_MAX_SESSION_SEC)),
-        "categories": _categories(section),
+        # JSON, matching the node's declaration: an empty ROS string array has
+        # no inferable element type, so the node would refuse it at startup.
+        "categories_json": json.dumps(_categories(section)),
         "status_period_sec": float(section.get("status_period_sec", 5.0)),
     }
 

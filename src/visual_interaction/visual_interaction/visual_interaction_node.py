@@ -71,7 +71,15 @@ PARAMETERS: dict[str, object] = {
     "min_gap_sec": DEFAULT_MIN_GAP_SEC,
     "absent_reset_sec": DEFAULT_ABSENT_RESET_SEC,
     "max_session_sec": DEFAULT_MAX_SESSION_SEC,
-    "categories": [],
+    # A JSON array, not a ROS string array. An empty list gives rclpy no
+    # element type to infer, so it declares BYTE_ARRAY and then refuses the
+    # strings the launch builder passes — the node died at startup with
+    # "expecting type 'BYTE_ARRAY'", which no unit test saw because they all
+    # pass a non-empty override. Every other package here carries a list the
+    # same way (``arm_joint_names_json``, ``allowed_skills_json``), and
+    # ``runtime_description_json`` above is already JSON. Empty means the
+    # contract's whole whitelist.
+    "categories_json": "[]",
     "status_period_sec": 5.0,
 }
 
@@ -208,7 +216,15 @@ class VisualInteractionNode(Node):
         return description
 
     def _categories(self) -> dict:
-        values = self._value("categories") or []
+        raw = str(self._value("categories_json"))
+        try:
+            values = json.loads(raw)
+        except ValueError as error:
+            raise ValueError("categories_json must be a JSON array of category names") from error
+        if not isinstance(values, list):
+            raise ValueError("categories_json must be a JSON array of category names")
+        # Empty means the contract's whole whitelist, so the key is omitted and
+        # SessionConfig keeps its default rather than being handed ().
         return {"categories": tuple(str(value) for value in values)} if values else {}
 
     def _build_hooks(self) -> SessionHooks:

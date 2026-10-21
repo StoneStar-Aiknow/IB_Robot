@@ -196,7 +196,10 @@ class TestParameters:
         assert values["max_session_sec"] == 90.0
 
     def test_the_category_whitelist_reaches_the_node(self):
-        assert self.parameters(categories=["toy"])["categories"] == ["toy"]
+        """As JSON: an empty ROS string array has no inferable element type,
+        so rclpy declared BYTE_ARRAY and the node refused the builder's
+        strings at startup."""
+        assert json.loads(self.parameters(categories=["toy"])["categories_json"]) == ["toy"]
 
     def test_an_actor_topic_is_optional(self):
         assert self.parameters()["actor_state_topic"] == ""
