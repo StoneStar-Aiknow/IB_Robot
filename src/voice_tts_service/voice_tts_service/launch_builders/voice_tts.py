@@ -131,6 +131,13 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         audio_topic = audio_output["topic"]
         playback_sample_rate = int(audio_output.get("sample_rate_hz", 24000))
         playback_channels = int(audio_output.get("channels", 1))
+        # How the speaker wants PCM written is a property of the speaker, declared on its
+        # interface; a speaker that declares nothing keeps the node's defaults.
+        speaker_pacing = {
+            parameter: int(audio_output[field])
+            for field, parameter in (("write_chunk_ms", "chunk_ms"), ("prebuffer_ms", "prebuffer_ms"))
+            if field in audio_output
+        }
     else:
         audio_io = robot_config.get("audio_io", {})
         if not is_audio_io_enabled(audio_io):
@@ -138,6 +145,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
         playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
         playback_channels = int(audio_io.get("playback_channels", 1))
+        speaker_pacing = {}
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(
@@ -171,6 +179,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     # Empty keeps the node's AudioData default; robot_config checks that an
                     # explicit type matches the bound speaker.
                     "audio_message_type": str(config.get("audio_message_type") or "audio_common_msgs/msg/AudioData"),
+                    **speaker_pacing,
                 }
             ],
         ),

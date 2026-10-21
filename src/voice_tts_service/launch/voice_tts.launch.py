@@ -21,6 +21,7 @@ def generate_launch_description():
             DeclareLaunchArgument("resample_to_playback_rate", default_value="false"),
             DeclareLaunchArgument("audio_message_type", default_value="audio_common_msgs/msg/AudioData"),
             DeclareLaunchArgument("chunk_ms", default_value="50"),
+            DeclareLaunchArgument("prebuffer_ms", default_value="0"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -59,6 +60,7 @@ def generate_launch_description():
                         "resample_to_playback_rate": LaunchConfiguration("resample_to_playback_rate"),
                         "audio_message_type": LaunchConfiguration("audio_message_type"),
                         "chunk_ms": LaunchConfiguration("chunk_ms"),
+                        "prebuffer_ms": LaunchConfiguration("prebuffer_ms"),
                     }
                 ],
             ),

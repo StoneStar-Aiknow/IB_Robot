@@ -341,3 +341,17 @@ def test_every_declared_audio_format_agrees_with_the_stream_the_bridge_moves(nam
     capture = capabilities["interaction.audio_capture"]
     assert capture["sample_rate_hz"] == interfaces["audio.capture"]["sample_rate_hz"]
     assert capture["channels"] == interfaces["audio.capture"]["channels"]
+
+
+def test_both_x2_profiles_ask_for_the_same_playback_pacing():
+    # Both drive the same hal_audio player: a pacing fix that reaches one profile only leaves
+    # the other stuttering on every write it has to wait for.
+    pacing = [
+        {
+            field: load_profile(PROFILE_PATH.parent / name)["interfaces"]["audio.play"].get(field)
+            for field in ("write_chunk_ms", "prebuffer_ms")
+        }
+        for name in ("x2_ultra.yaml", "x2_ultra_omnihand.yaml")
+    ]
+    assert pacing[0] == pacing[1]
+    assert None not in pacing[0].values()

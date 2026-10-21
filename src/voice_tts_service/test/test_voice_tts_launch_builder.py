@@ -263,3 +263,13 @@ def test_non_ascend_deployment_gets_no_cann_environment(monkeypatch, tmp_path):
     host = _model_host(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
 
     assert _additional_env(host) == {}
+
+
+def test_the_playback_node_writes_pcm_the_way_the_bound_speaker_asks(tmp_path, monkeypatch):
+    paced_output = _bound_audio_output(write_chunk_ms=200, prebuffer_ms=1000)
+    paced = _playback_parameters(voice_tts.generate_voice_tts_nodes(_bound_tts_config(paced_output)))
+    assert (paced["chunk_ms"], paced["prebuffer_ms"]) == (200, 1000)
+
+    # A speaker that declares nothing leaves the node on its own defaults.
+    unpaced = _playback_parameters(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+    assert "chunk_ms" not in unpaced and "prebuffer_ms" not in unpaced

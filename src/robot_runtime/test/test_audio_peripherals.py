@@ -10,6 +10,7 @@ metadata, and derives the ``interaction.audio_*`` capability entries.
 from __future__ import annotations
 
 import launch_ros.actions
+import pytest
 import yaml
 
 from robot_runtime.interface_description import (
@@ -264,3 +265,38 @@ def test_build_description_rejects_contradicting_declared_audio_capability():
         assert "contradicts the audio peripherals" in str(exc)
     else:
         raise AssertionError("a profile capability contradicting the audio peripherals must be rejected")
+
+
+def _speaker_profile(**pacing):
+    """A runtime that owns its speaker itself (like a vendor bridge) and declares audio.play."""
+    profile = _profile(
+        [], {"interaction.audio_playback": {"endpoints": ["/audio/play"], "sample_rate_hz": 16000, "channels": 1}}
+    )
+    profile["interfaces"] = {
+        "audio.play": {
+            "capability": "interaction.audio_playback",
+            "kind": "topic",
+            "direction": "subscribe",
+            "endpoint": "/audio/play",
+            "message_type": "audio_common_msgs/msg/AudioDataStamped",
+            "qos": {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 10},
+            **pacing,
+        }
+    }
+    return profile
+
+
+def test_a_speaker_interface_can_declare_how_it_wants_pcm_written():
+    play = build_description(_speaker_profile(write_chunk_ms=200, prebuffer_ms=1000), use_sim=True)["interfaces"][
+        "audio.play"
+    ]
+
+    assert (play["write_chunk_ms"], play["prebuffer_ms"]) == (200, 1000)
+
+
+@pytest.mark.parametrize(
+    "pacing", [{"write_chunk_ms": 5}, {"write_chunk_ms": 1000}, {"prebuffer_ms": -1}, {"prebuffer_ms": 5000}]
+)
+def test_speaker_pacing_no_publisher_can_honour_is_rejected(pacing):
+    with pytest.raises(InterfaceDescriptionError, match="audio.play"):
+        build_description(_speaker_profile(**pacing), use_sim=True)

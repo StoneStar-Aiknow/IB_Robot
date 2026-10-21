@@ -17,9 +17,12 @@ from .audio_playback import AudioFilePlayer, AudioPlaybackConfig, AudioPlaybackE
 AUDIO_DATA_TYPE = "audio_common_msgs/msg/AudioData"
 AUDIO_DATA_STAMPED_TYPE = "audio_common_msgs/msg/AudioDataStamped"
 SUPPORTED_AUDIO_MESSAGE_TYPES = (AUDIO_DATA_TYPE, AUDIO_DATA_STAMPED_TYPE)
-#: Publication granularity bounds, matching robot_config's voice_tts.chunk_ms validation.
+#: Publication granularity bounds, matching the speaker interface's write_chunk_ms bounds.
 MIN_CHUNK_MS = 20
 MAX_CHUNK_MS = 200
+#: Lead kept ahead of the sample clock, matching the speaker interface's prebuffer_ms bounds.
+MIN_PREBUFFER_MS = 0
+MAX_PREBUFFER_MS = 2000
 
 
 def _audio_message_class(message_type: str):
@@ -48,7 +51,9 @@ class AudioPlaybackNode(Node):
         self.declare_parameter("resample_to_playback_rate", False)
         # AudioDataStamped for runtime-owned speakers (e.g. the aimdk audio.play interface).
         self.declare_parameter("audio_message_type", AUDIO_DATA_TYPE)
+        # How the speaker wants PCM written; robot launches take both from its audio.play interface.
         self.declare_parameter("chunk_ms", 50)
+        self.declare_parameter("prebuffer_ms", 0)
 
         self._player = AudioFilePlayer(
             AudioPlaybackConfig(
@@ -59,11 +64,16 @@ class AudioPlaybackNode(Node):
         self._playback_sample_rate = int(self.get_parameter("playback_sample_rate").value)
         self._playback_channels = int(self.get_parameter("playback_channels").value)
         self._resample = bool(self.get_parameter("resample_to_playback_rate").value)
-        # Bounded here as well as in robot_config: a standalone launch has no loader to
-        # reject a value that would publish a DDS message per millisecond.
+        # Bounded here as well as in the interface schema: a standalone launch has no description
+        # to reject a value that would publish a DDS message per millisecond.
         self._chunk_ms = int(self.get_parameter("chunk_ms").value)
         if not MIN_CHUNK_MS <= self._chunk_ms <= MAX_CHUNK_MS:
             raise ValueError(f"chunk_ms must be between {MIN_CHUNK_MS} and {MAX_CHUNK_MS}, got {self._chunk_ms}")
+        self._prebuffer_ms = int(self.get_parameter("prebuffer_ms").value)
+        if not MIN_PREBUFFER_MS <= self._prebuffer_ms <= MAX_PREBUFFER_MS:
+            raise ValueError(
+                f"prebuffer_ms must be between {MIN_PREBUFFER_MS} and {MAX_PREBUFFER_MS}, got {self._prebuffer_ms}"
+            )
         self._audio_message_type = str(self.get_parameter("audio_message_type").value)
         self._audio_message_class = _audio_message_class(self._audio_message_type)
 
@@ -121,6 +131,7 @@ class AudioPlaybackNode(Node):
         rate = self._playback_sample_rate
         frame_bytes = self._playback_channels * 2
         chunk_bytes = max(1, rate * self._chunk_ms // 1000) * frame_bytes
+        lead_frames = rate * self._prebuffer_ms // 1000
         playback_start = time.monotonic()
         published_frames = 0
         for offset in range(0, len(pcm), chunk_bytes):
@@ -133,16 +144,17 @@ class AudioPlaybackNode(Node):
                     f"audio playback exceeded {timeout_sec:g} seconds",
                 )
             self._audio_pub.publish(self._make_message(data))
-            # DDS acknowledgement can take an entire PCM chunk period.
-            # Waiting here would starve audio_play between every chunk.
-            # Absolute sample-clock deadlines also avoid accumulating
-            # serialization and publish overhead into the sound duration.
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AudioPlaybackError("PLAYBACK_TIMEOUT", f"audio playback exceeded {timeout_sec:g} seconds")
-            delay = chunk_end - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
+            # A player that has to wait for each write can report a PLAYING/STOPPED pair around
+            # it (the X2's hal_audio did, once per chunk, audible as stutter), so the stream keeps
+            # prebuffer_ms ahead of the sample clock for its whole length, not only at the start.
+            # DDS acknowledgement can take an entire PCM chunk period; waiting for it here would
+            # starve the player between chunks. Absolute sample-clock deadlines also avoid
+            # accumulating serialization and publish overhead into the sound duration.
+            self._sleep_until(playback_start + max(0, published_frames - lead_frames) / rate, deadline, timeout_sec)
+        # Return once the last sample's playback time is reached, not when it was written: callers
+        # take the return as "spoken" (the voice bridge resumes listening on it), and with a lead
+        # the last chunk is written up to prebuffer_ms early.
+        self._sleep_until(playback_start + published_frames / rate, deadline, timeout_sec)
         # Retain reliable-delivery confirmation without putting ACK latency
         # between PCM chunks. This is not a hardware playback-complete event.
         wait_for_all_acked = getattr(self._audio_pub, "wait_for_all_acked", None)
@@ -153,6 +165,14 @@ class AudioPlaybackNode(Node):
                 f"audio playback acknowledgement exceeded {timeout_sec:g} seconds",
             )
         return file_path.strip()
+
+    @staticmethod
+    def _sleep_until(when: float, deadline: float, timeout_sec: float) -> None:
+        if deadline - time.monotonic() <= 0:
+            raise AudioPlaybackError("PLAYBACK_TIMEOUT", f"audio playback exceeded {timeout_sec:g} seconds")
+        delay = when - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
 
     def _make_message(self, chunk: bytes):
         message = self._audio_message_class()

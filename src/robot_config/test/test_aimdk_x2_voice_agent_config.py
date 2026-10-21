@@ -67,11 +67,14 @@ def test_playback_binds_the_runtime_speaker_with_its_declared_format(config, des
     bound = bind_robot_interfaces(config, description, require_ready=False)
 
     output = bound["voice_tts"]["audio_output"]
+    speaker = description["interfaces"]["audio.play"]
     assert output["_interface_source"]["id"] == "audio.play"
-    assert output["topic"] == description["interfaces"]["audio.play"]["endpoint"]
+    assert output["topic"] == speaker["endpoint"]
     assert (output["sample_rate_hz"], output["channels"]) == (16000, 1)
     # The X2 runtime subscribes to AudioDataStamped, so that is what the playback node publishes.
     assert output["type"] == bound["voice_tts"]["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+    # hal_audio's write pacing reaches the playback node through the same binding.
+    assert (output["write_chunk_ms"], output["prebuffer_ms"]) == (speaker["write_chunk_ms"], speaker["prebuffer_ms"])
 
 
 def test_playback_binding_fails_closed_without_the_speaker_interface(config, description):

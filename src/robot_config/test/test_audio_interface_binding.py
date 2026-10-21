@@ -134,6 +134,21 @@ def test_absent_format_metadata_stays_absent(description_api):
     assert "sample_rate_hz" not in output and "channels" not in output and "sample_format" not in output
 
 
+def test_a_speaker_declared_write_pacing_rides_with_its_binding(description_api):
+    config = _config(voice_tts={"enabled": True, "audio_output": {"interface": "audio.play", "type": _AUDIOStamped}})
+    paced = _audio_description(description_api)
+    paced["interfaces"]["audio.play"].update(write_chunk_ms=200, prebuffer_ms=1000)
+    paced["digest"] = description_api.description_digest(paced)
+    description_api.validate_description(paced)
+
+    output = bind_robot_interfaces(config, paced)["voice_tts"]["audio_output"]
+    assert (output["write_chunk_ms"], output["prebuffer_ms"]) == (200, 1000)
+
+    # A speaker that declares nothing leaves the publisher on its own defaults.
+    unpaced = bind_robot_interfaces(config, _audio_description(description_api))["voice_tts"]["audio_output"]
+    assert "write_chunk_ms" not in unpaced and "prebuffer_ms" not in unpaced
+
+
 def test_streaming_voice_asr_rejects_the_external_message_type(description_api):
     config = _config(
         voice_asr={
