@@ -61,8 +61,6 @@ _SUBJECT_FIELDS = ("category", "region")
 # over-reach, and _REQUIRED_GROUNDING below refuses anything that stopped
 # describing the confirmed category at all.
 _OUT_OF_RANGE_PATTERNS: tuple[tuple[str, str], ...] = (
-    # Colour.
-    (r"红|橙|黄|绿|青|蓝|紫|粉|灰|棕|褐|黑色|白色|金色|银色", "colour"),
     # Material and make.
     (r"木|金属|塑料|棉|丝|皮革|陶|玻璃|毛绒|手工|材质|做工", "material"),
     # Brand, price and provenance.
@@ -73,12 +71,33 @@ _OUT_OF_RANGE_PATTERNS: tuple[tuple[str, str], ...] = (
     # state word are allowed to be far apart: "你看起来很开心" puts three
     # characters between them.
     (r"开心|高兴|难过|生气|紧张|害羞|心情|情绪|性格|喜欢|讨厌|想要|觉得|累了", "inner_state"),
-    # Person attributes: appearance, body, age, gender, health, belief.
-    # Narrower than it looks: the vocabulary whitelist already refuses every
-    # word for a body, an age or a belief, so this only has to catch praise
-    # aimed at the person rather than the object. "你真好看" is out of range;
-    # "你别着的徽章真好看" is the remark this feature exists to make.
-    (r"你(真|很|好|挺)?(漂亮|好看|帅|可爱)", "person"),
+    # Praise aimed at the person rather than at the thing.
+    #
+    # Praising the object is the point ("你的帽子很好看"), so this cannot refuse
+    # the praise words themselves. It refuses them when the subject is the
+    # visitor, in the shapes that carry that meaning:
+    #
+    #   你 … 好看          second person praised directly, at any distance
+    #   你也好看            "and you too", after a fine object remark
+    #   举着玩偶的你真可爱    a relative clause ending on 你
+    #   你戴着帽子真好看      an adverbial clause: the hat is how, not what
+    #
+    # The first alternative is load-bearing: an adjacency-based pattern missed
+    # "你戴的帽子好看，你也好看。", exactly what the default-off appearance
+    # rule exists to stop. What makes the praise land on the object is a
+    # determiner in front of the subject noun — either possessive 的
+    # ("你戴的帽子") or a demonstrative with a measure word ("你戴这顶帽子").
+    # The lookahead steps over a noun reached either way. With a bare
+    # adverbial noun and no determiner ("你戴着帽子真好看") the praise is about
+    # the visitor, so it stays refused.
+    (
+        r"你(?![^。！？，、]*?(?:的|这|那)[^。！？，、]*?"
+        r"(?:帽子|玩偶|玩具|娃娃|公仔|牌子|标牌|纸板|徽章|胸针|别针|胸章))"
+        r"[^。！？，、]*?(?:漂亮|好看|帅|可爱)"
+        r"|你也(?:很|真|挺)?(?:漂亮|好看|帅|可爱)"
+        r"|的你(?:真|很|好|挺)?(?:漂亮|好看|帅|可爱)",
+        "person",
+    ),
 )
 
 _OUT_OF_RANGE = tuple((re.compile(pattern), label) for pattern, label in _OUT_OF_RANGE_PATTERNS)
@@ -109,6 +128,13 @@ _ALLOWED_REPLY_CHARS = frozenset(
     "是的了着过在和跟与也还就都又再一二两"
     # Light verbs that keep a sentence grounded in what is visible.
     "像似乎显得看起来瞧见发现觉"
+    # Basic colours. A colour is a property of the picture rather than an
+    # inference about it, so it is allowed to be stated: "你的红帽子很显眼。"
+    # Material, make and brand stay refused by pattern — those are claims about
+    # how a thing was produced, which a camera cannot establish.
+    "红橙黄绿青蓝紫粉灰棕褐黑白金银色"
+    # Stative remarks that describe rather than judge.
+    "显眼鲜艳亮醒颜"
     # Punctuation.
     "。！？，、…—～ "
 )

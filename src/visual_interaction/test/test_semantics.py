@@ -207,7 +207,6 @@ class TestReplyContent:
     @pytest.mark.parametrize(
         ("reply", "label"),
         [
-            ("你的红色玩偶真可爱。", "colour"),
             ("这个毛绒玩偶手工很好。", "material"),
             ("这个牌子是限量款吧。", "commerce"),
             ("牌子上写着欢迎光临。", "sign text"),
@@ -221,6 +220,15 @@ class TestReplyContent:
             parse_observation(answer(reply=reply))
 
         assert error.value.reason == SUPPRESS_PRIVACY, label
+
+    def test_a_colour_is_stated_rather_than_inferred_so_it_passes(self):
+        """Colour used to be refused alongside material and brand.
+
+        It does not belong there: a camera sees a colour, while how a thing was
+        made or who made it is a claim about something outside the picture. The
+        scope change allows stating one.
+        """
+        assert parse_observation(answer(reply="你的红色玩偶真可爱。")).reply == "你的红色玩偶真可爱。"
 
     @pytest.mark.parametrize("reply", ["好。", "嗯", "是的"])
     def test_a_reply_below_the_band_carries_no_observation(self, reply):
@@ -355,6 +363,46 @@ class TestVocabularyWhitelist:
             parse_observation(answer(reply="你真好看呀，玩偶也可爱。"))
 
         assert error.value.reason == SUPPRESS_PRIVACY
+
+    @pytest.mark.parametrize(
+        ("reply", "why"),
+        [
+            ("你戴的帽子好看，你也好看。", "praise appended to a valid object remark"),
+            ("你戴着帽子真好看呀。", "adverbial noun: the hat is how, not what"),
+            ("拿着玩偶的你很漂亮。", "relative clause ending on the visitor"),
+            ("你很帅，帽子也好看。", "person first, object second"),
+            ("你真可爱呀我看到了。", "no object mentioned at all"),
+        ],
+    )
+    def test_person_praise_is_refused_however_far_the_words_sit_apart(self, reply, why):
+        """These five passed an adjacency-based pattern.
+
+        It required 你 and the praise to be adjacent, so anything between them
+        bypassed it — including appending "你也好看" to an otherwise fine
+        sentence. Appearance praise is default-off, so distance must not matter.
+        """
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(category="hat", reply=reply))
+
+        assert error.value.reason == SUPPRESS_PRIVACY, why
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "你的帽子很好看。",
+            "你戴的蓝色帽子真不错。",
+            "你戴这顶帽子特别好看。",
+            "你的红帽子很显眼。",
+            "你戴的帽子颜色很鲜艳。",
+        ],
+    )
+    def test_praising_the_worn_item_is_the_remark_this_feature_makes(self, reply):
+        """The other side of the same boundary: the thing may be praised.
+
+        A determiner in front of the noun — possessive 的 or a demonstrative
+        with a measure word — is what puts the praise on the object.
+        """
+        assert parse_observation(answer(category="hat", reply=reply)).reply == reply
 
     def test_the_refusal_names_the_offending_characters(self):
         """So a widening decision can be made with the actual word in view."""
