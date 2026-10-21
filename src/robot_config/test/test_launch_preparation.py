@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -203,7 +205,9 @@ def test_nested_owned_key_can_be_created_without_allowing_siblings(monkeypatch):
     assert config["feature"]["enabled"] is True
 
 
-@pytest.mark.parametrize("key", ["runtime.target", "simulation", "contract.observations", "peripherals"])
+@pytest.mark.parametrize(
+    "key", ["runtime.target", "runtime_scheduler", "simulation", "contract.observations", "peripherals"]
+)
 def test_core_key_declarations_rejected_before_loading(monkeypatch, key):
     registry = _registry(monkeypatch, lambda *args: None, keys=(key,))
     with pytest.raises(PreparationError, match="core"):
@@ -418,6 +422,20 @@ def test_teleop_inference_fallback_and_override(business, override, expected):
     assert prepared.with_inference is expected
 
 
+@pytest.mark.parametrize("override,expected", [("false", False), ("true", True)])
+def test_robot_scheduler_respects_launch_inference_override(business, override, expected):
+    prepared = prepare_launch(
+        _context(with_inference=override),
+        LaunchBuilderRegistry(),
+        loaded_config={
+            "runtime_scheduler": {"enable": True},
+            "control_modes": {"model_inference": {"inference": {"enabled": True}}},
+        },
+    )
+    assert prepared.scheduler_enabled is expected
+    assert prepared.context.scheduler_enabled is expected
+
+
 def test_execution_mode_override_requires_pipeline(business):
     with pytest.raises(PreparationError, match="requires inference_pipeline"):
         prepare_launch(_context(inference_execution_mode="monolithic"), LaunchBuilderRegistry())
@@ -441,6 +459,47 @@ def test_use_sim_runtime_target_mismatch_rejected_in_both_directions(business, t
             _context(runtime_target=target, use_sim=use_sim),
             LaunchBuilderRegistry(),
         )
+
+
+@pytest.mark.parametrize("target,use_sim", [("hardware", True), ("simulation", False), ("benchmark", False)])
+@pytest.mark.parametrize("scheduler_block", [None, {"enable": False}, {"enable": True}])
+def test_declared_target_does_not_consult_yaml_embodiment(business, target, use_sim, scheduler_block):
+    config = {
+        "runtime": {"target": target},
+        "use_sim": use_sim,
+        "benchmark": {"type": "libero", "adapter": "libero"},
+    }
+    if scheduler_block is not None:
+        config["runtime_scheduler"] = scheduler_block
+    prepared = prepare_launch(_context(), LaunchBuilderRegistry(), loaded_config=config)
+    assert prepared.runtime_target.value == target
+    assert prepared.use_sim is (target != "hardware")
+    assert prepared.robot_config["use_sim"] is use_sim
+
+
+_PREPARATION_BASELINE = json.loads(
+    (Path(__file__).parent / "fixtures" / "preparation_direct_baseline.json").read_text()
+)["scenarios"]
+
+
+@pytest.mark.parametrize("scenario", _PREPARATION_BASELINE, ids=lambda scenario: scenario["name"])
+@pytest.mark.parametrize("scheduler_block", [None, {"enable": False}])
+def test_direct_preparation_matches_base_commit(business, scenario, scheduler_block):
+    config = copy.deepcopy(scenario["config"])
+    if scheduler_block is not None:
+        config["runtime_scheduler"] = scheduler_block
+    original = copy.deepcopy(config)
+    if "error" in scenario:
+        with pytest.raises(RuntimeTargetError) as caught:
+            prepare_launch(_context(**scenario["arguments"]), LaunchBuilderRegistry(), loaded_config=config)
+        assert str(caught.value) == scenario["error"]
+    else:
+        prepared = prepare_launch(_context(**scenario["arguments"]), LaunchBuilderRegistry(), loaded_config=config)
+        actual = {key: getattr(prepared, key) for key in scenario["expected"]}
+        actual["robot_config"] = copy.deepcopy(actual["robot_config"])
+        actual["robot_config"].pop("runtime_scheduler", None)
+        assert actual == scenario["expected"]
+    assert config == original
 
 
 # ---------------------------------------------------------------------------

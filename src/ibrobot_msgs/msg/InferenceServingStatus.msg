@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Product-session serving status published by each monolithic scheduled pipeline.
 # Distinct from InferencePipelineStatus, which carries distributed transport handshake only.
 uint8 STARTING=1

@@ -184,14 +184,16 @@ Default endpoints:
 
 ### Scheduled Control Plane
 
-`control_modes.<mode>.inference.scheduler.enable` is the only scheduler switch and defaults to `false`. When enabled,
-the launch graph uses Global Open/Dispatch/Close actions and the scheduled action dispatcher. Only monolithic pipelines
+`robot.runtime_scheduler.enable` is the only scheduler switch and defaults to `false`. When enabled,
+the hardware launch graph uses Global Open/Dispatch/Close actions and the scheduled action dispatcher. Only monolithic pipelines
 are supported; they use the whole-graph sequential executor by default, while a supported functional manifest may opt
 into independent staged execution.
+Simulation and benchmark always run directly. A disabled inference control mode stays disabled.
+The existing policy scheduler, FIFO/EDF, profile schema and public session contracts remain unchanged.
 
 When the switch is `false`, a complete scheduled configuration may remain in the SSOT as dormant configuration; the
 launch graph, node parameters, endpoints, executor sizing, and backend execution still use the legacy path. When the
-entire `scheduler` block is absent, scheduled fields remain unknown so legacy configurations keep strict typo checking.
+entire `runtime_scheduler` block is absent, scheduled fields remain unknown so legacy configurations keep strict typo checking.
 
 A downstream Close with known `NOT_STARTED` preserves its outcome and recoverability. The session stays `CLOSING`
 without quarantining the pipeline solely for that rejection. A retry uses new operation IDs and only visits bindings

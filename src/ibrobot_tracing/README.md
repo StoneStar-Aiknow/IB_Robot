@@ -12,7 +12,13 @@ Dispatch Request -> First Action Execute
 
 该边界同时适用于 scheduler 关闭时的 legacy `DispatchInfer` 路径，以及 scheduler 开启时经过
 `ScheduledActionDispatcher -> Global Scheduler -> Pipeline` 的 scheduled 路径。Topology 会根据
-robot YAML 中的 `scheduler.enable` 记录实际 dispatch path。
+展开后的 robot YAML 声明生成 dispatch path；`ibrobot-trace-topology` 由 robot_config 统一解析
+`robot.runtime_scheduler.enable` 和运行目标，再交给 tracing 构图。
+这是声明拓扑（`provenance=declared`、`runtime_verified=false`），不代表已启动节点清单，
+也不读取启动命令的覆盖参数。分析 simulation/benchmark 等覆盖启动时，应使用对应的有效配置，
+而不是据原始 YAML 推断实际运行路径。
+直接调用 Python `bind_robot_topology()` 时，调用方通过 `scheduler_enabled` 传入已解析的调度结果
+（缺省为直通）；该参数是构图输入，不是额外的 YAML 配置开关。
 多 pipeline scheduler 在图中聚合为 `Policy Pipelines` 逻辑路径，Topology metadata 的 `pipeline_ids`、
 `pipeline_nodes` 与事件字段 `pipeline_id` 用于区分 primary/fallback；transport flow ID 还包含 ROS action
 goal UUID，使同一 request 的幂等重放保持为独立 flow pair。

@@ -63,6 +63,58 @@ def test_declaration_does_not_require_runtime_model_availability(monkeypatch, tm
     assert actual["metadata"]["provenance"] == "declared"
 
 
+@pytest.mark.parametrize("target", ["hardware", "simulation", "benchmark"])
+@pytest.mark.parametrize("scheduler_enabled", [None, False, True])
+@pytest.mark.parametrize("inference_enabled", [False, True])
+def test_declared_dispatch_path_uses_robot_scheduling_rules(
+    tmp_path, capsys, target, scheduler_enabled, inference_enabled
+):
+    """Configuration activation belongs here; tracing only tests rendering the resolved path."""
+    config = {
+        "name": "offline",
+        "runtime": {"target": target},
+        "control_modes": {"policy": {"inference": {"enabled": inference_enabled}}},
+        "default_control_mode": "teleop",
+    }
+    if scheduler_enabled is not None:
+        config["runtime_scheduler"] = {"enable": scheduler_enabled}
+    if target == "benchmark":
+        config["benchmark"] = {"type": "libero", "adapter": "libero"}
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump({"robot": config}))
+
+    assert main([str(config_path), "--control-mode", "policy"]) == 0
+    topology = json.loads(capsys.readouterr().out)
+    scheduled = scheduler_enabled is True and inference_enabled and target == "hardware"
+    components = {component["component_id"]: component for component in topology["components"]}
+    assert ("global_scheduler" in components) is scheduled
+    assert (topology["metadata"].get("dispatch_path") == "scheduled") is scheduled
+    assert components["action_dispatcher"]["executable"] == (
+        "scheduled_action_dispatcher_node" if scheduled else "action_dispatcher_node"
+    )
+    assert topology["metadata"]["runtime_verified"] is False
+
+
+def test_declared_topology_uses_target_without_consulting_yaml_use_sim(tmp_path, capsys):
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {
+                    "name": "offline",
+                    "runtime": {"target": "hardware"},
+                    "use_sim": True,
+                    "runtime_scheduler": {"enable": True},
+                    "control_modes": {"model_inference": {"inference": {"enabled": True}}},
+                }
+            }
+        )
+    )
+    assert main([str(config_path)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["metadata"]["dispatch_path"] == "scheduled"
+
+
 @pytest.mark.parametrize("reference", ["missing", "child", "../outside"])
 def test_invalid_base_fails_without_emitting_manifest(tmp_path, capsys, reference):
     child = tmp_path / "child.yaml"

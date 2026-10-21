@@ -1,0 +1,238 @@
+{
+  "baseline_commit": "c8be174e46156a94219999a8dc216336f1f19af5",
+  "scenarios": [
+    {
+      "name": "default",
+      "config": {},
+      "arguments": {},
+      "expected": {
+        "runtime_target": "hardware",
+        "use_sim": false,
+        "node_use_sim_time": false,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "yaml_use_sim",
+      "config": {
+        "use_sim": true
+      },
+      "arguments": {},
+      "expected": {
+        "runtime_target": "hardware",
+        "use_sim": false,
+        "node_use_sim_time": false,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "use_sim": true,
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "hardware_yaml_use_sim",
+      "config": {
+        "runtime": {
+          "target": "hardware"
+        },
+        "use_sim": true
+      },
+      "arguments": {},
+      "expected": {
+        "runtime_target": "hardware",
+        "use_sim": false,
+        "node_use_sim_time": false,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "runtime": {
+            "target": "hardware"
+          },
+          "use_sim": true,
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "simulation_yaml_use_sim",
+      "config": {
+        "runtime": {
+          "target": "simulation"
+        },
+        "use_sim": false
+      },
+      "arguments": {},
+      "expected": {
+        "runtime_target": "simulation",
+        "use_sim": true,
+        "node_use_sim_time": true,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "runtime": {
+            "target": "simulation"
+          },
+          "use_sim": false,
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "cli_simulation",
+      "config": {},
+      "arguments": {
+        "use_sim": "true"
+      },
+      "expected": {
+        "runtime_target": "simulation",
+        "use_sim": true,
+        "node_use_sim_time": true,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "cli_hardware",
+      "config": {
+        "use_sim": true
+      },
+      "arguments": {
+        "use_sim": "false"
+      },
+      "expected": {
+        "runtime_target": "hardware",
+        "use_sim": false,
+        "node_use_sim_time": false,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "use_sim": true,
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "cli_platform",
+      "config": {
+        "use_sim": false
+      },
+      "arguments": {
+        "sim_platform": "mock"
+      },
+      "expected": {
+        "runtime_target": "simulation",
+        "use_sim": true,
+        "node_use_sim_time": false,
+        "sim_platform": "mock",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "false",
+        "live_binding_required": false,
+        "robot_config": {
+          "use_sim": false,
+          "_config_path": "/tmp/preparation-test.yaml",
+          "simulation": {
+            "platform": "mock"
+          }
+        }
+      }
+    },
+    {
+      "name": "cli_target",
+      "config": {
+        "runtime": {
+          "target": "hardware"
+        }
+      },
+      "arguments": {
+        "runtime_target": "simulation"
+      },
+      "expected": {
+        "runtime_target": "simulation",
+        "use_sim": true,
+        "node_use_sim_time": true,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "runtime": {
+            "target": "hardware"
+          },
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    },
+    {
+      "name": "conflicting_cli",
+      "config": {},
+      "arguments": {
+        "runtime_target": "hardware",
+        "use_sim": "true"
+      },
+      "error": "runtime target 'hardware' requires use_sim=false but use_sim=true"
+    },
+    {
+      "name": "benchmark",
+      "config": {
+        "runtime": {
+          "target": "benchmark"
+        },
+        "benchmark": {
+          "type": "libero",
+          "adapter": "libero"
+        },
+        "use_sim": false
+      },
+      "arguments": {},
+      "expected": {
+        "runtime_target": "benchmark",
+        "use_sim": true,
+        "node_use_sim_time": false,
+        "sim_platform": "gazebo",
+        "with_inference": false,
+        "scheduler_enabled": false,
+        "auto_start_controllers": "true",
+        "live_binding_required": false,
+        "robot_config": {
+          "runtime": {
+            "target": "benchmark"
+          },
+          "benchmark": {
+            "type": "libero",
+            "adapter": "libero"
+          },
+          "use_sim": false,
+          "_config_path": "/tmp/preparation-test.yaml"
+        }
+      }
+    }
+  ]
+}

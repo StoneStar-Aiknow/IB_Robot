@@ -626,13 +626,15 @@ def test_bound_consumers_follow_the_platform_clock(monkeypatch, use_sim, sim_pla
 
     captured = {}
 
-    def spy(robot_config, control_mode, use_sim, use_sim_time=None, runtime_target=None):
+    def spy(robot_config, control_mode, use_sim, use_sim_time=None, runtime_target=None, *, scheduler_enabled=None):
         captured["use_sim_time"] = use_sim_time
+        captured["scheduler_enabled"] = scheduler_enabled
         return []
 
     monkeypatch.setattr(execution_module, "generate_execution_nodes", spy)
     build_execution(prepared.context)
     assert captured["use_sim_time"] is expected
+    assert captured["scheduler_enabled"] is prepared.scheduler_enabled
 
 
 # ---------------------------------------------------------------------------

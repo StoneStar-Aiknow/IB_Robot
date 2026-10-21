@@ -17,7 +17,6 @@ from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.inference_config import InferenceConfigError
-from robot_config.launch_builders import control as control_builder
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
     generate_auxiliary_actuator_nodes,
@@ -26,7 +25,6 @@ from robot_config.launch_builders.control import (
     validate_runtime_resources,
 )
 from robot_config.launch_builders.execution import (
-    _attention_viz_request,
     generate_action_dispatcher_node,
     generate_execution_nodes,
     generate_inference_node,
@@ -960,32 +958,105 @@ def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
     assert extension_action not in disabled_actions
 
 
-def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
-    # The migrated provider config binds logical interfaces against the live
-    # runtime at launch time; offline structural loads defer that binding.
-    robot_config = load_robot_config_dict(src_config_path, defer_interface_binding=True)
-    robot_config.pop("_config_path", None)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
-    config_path = tmp_path / "scheduled_sim.yaml"
-    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
-    context = LaunchContext()
-    context.launch_configurations.update(
-        config_path=str(config_path),
-        use_sim="true",
-        # The migrated provider config supports the SDK simulated transport;
-        # the scheduler/simulation rejection below must fire before any nodes.
-        sim_platform="sdk",
-        control_mode="model_inference",
-        with_inference="true",
+@pytest.mark.parametrize(
+    ("target", "execution_mode", "transport_mode"),
+    [
+        (None, "monolithic", "dds"),  # simulation selected by CLI use_sim alone
+        ("simulation", "monolithic", "dds"),
+        ("benchmark", "monolithic", "dds"),
+        ("benchmark", "distributed", "dds"),
+        ("benchmark", "distributed", "rtp"),
+    ],
+)
+def test_virtual_target_launch_keeps_robot_scheduler_dormant(
+    tmp_path, monkeypatch, target, execution_mode, transport_mode
+):
+    from copy import deepcopy
+
+    from robot_config.launch_builders.benchmark import BENCHMARK_BUILDER
+    from robot_config.launch_builders.execution import EXECUTION_BUILDER
+    from robot_config.launch_registry.registry import LaunchBuilderRegistry
+
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {"policy": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": execution_mode}},
+        selection="policy",
     )
+    config["runtime"] = {"target": "hardware"}
+    if target is None:
+        config.pop("runtime")
+    config["default_control_mode"] = "model_inference"
+    config["runtime_scheduler"] = {"enable": True}  # dormant tuning needs no scheduled endpoints
+    config["contract"] = {
+        "observations": [
+            {
+                "key": "observation.images.image",
+                "topic": "/camera/image",
+                "type": "sensor_msgs/msg/Image",
+                "image": {"encoding": "rgb8", "resize": [32, 32]},
+            }
+        ],
+        "actions": [],
+    }
+    if target == "benchmark":
+        config["benchmark"] = {
+            "type": "libero",
+            "adapter": "libero",
+            "evaluation": {
+                "enabled": True,
+                "suite": "libero_spatial",
+                "observation_transport": {"mode": transport_mode},
+                "output": {"root": str(tmp_path / "output")},
+            },
+        }
+        mode = config["control_modes"]["model_inference"]
+        mode["executor"]["type"] = "benchmark"
+        mode["dispatch"] = {"scheduler": "wait_for_feedback"}
+    original = deepcopy(config)
+    registry = LaunchBuilderRegistry()
+    registry.add(BENCHMARK_BUILDER)
+    registry.add(EXECUTION_BUILDER)
+    # Isolate registration and local DDS admission; the production preparation,
+    # orchestrator, benchmark and execution builders all run without stubs.
+    monkeypatch.setattr(robot_launch, "build_launch_registry", lambda: registry)
+    monkeypatch.setattr(robot_launch, "check_launch_dds", lambda context: None)
+    monkeypatch.delenv("WORKSPACE", raising=False)  # materialize run YAML inside tmp_path
+    context = LaunchContext()
+    context.launch_configurations.update(config_path=str(tmp_path / "robot.yaml"), with_inference="true")
+    if target is not None:
+        context.launch_configurations.update(runtime_target=target, sim_platform="mock")
+    else:
+        context.launch_configurations.update(use_sim="true")
 
-    def unexpected_control_generation(*args, **kwargs):
-        pytest.fail("control generation must not run for unsupported scheduled simulation")
-
-    monkeypatch.setattr(control_builder, "generate_ros2_control_nodes", unexpected_control_generation)
-    with pytest.raises(ValueError, match="simulation does not support"):
-        robot_launch.launch_setup(context)
+    actions = robot_launch.launch_setup(context, loaded_config=config)
+    nodes = {node.node_executable: node for node in actions if isinstance(node, Node)}
+    expected = {"pipeline_policy_node", "action_dispatcher_node"}
+    if target == "benchmark":
+        expected.update({"benchmark_environment_node", "benchmark_evaluator_node"})
+    if execution_mode == "distributed":
+        expected.add("pure_inference_node")
+    assert set(nodes) == expected
+    policy = _node_parameters(nodes["pipeline_policy_node"])
+    assert "runtime_policy_json" not in policy
+    assert config == original
+    if target == "benchmark":
+        evaluator = _node_parameters(nodes["benchmark_evaluator_node"])
+        assert evaluator["inference_health_topic"] == policy["health_topic"] == "/inference/policy/health"
+        assert evaluator["prepare_policy_episode_service"] == "/action_dispatcher/prepare_episode"
+        assert evaluator["run_policy_action_server"] == "/action_dispatcher/run_policy"
+        run_config = yaml.safe_load(Path(evaluator["robot_config_path"]).read_text())["robot"]
+        assert run_config["runtime"] == config["runtime"]
+        assert "use_sim" not in run_config
+        assert run_config["runtime_scheduler"]["enable"] is True
+        assert policy["robot_config_path"] == evaluator["robot_config_path"]
+        environment = _node_parameters(nodes["benchmark_environment_node"])
+        assert environment["frame_ingress_enabled"] is (transport_mode == "rtp")
+        if transport_mode == "rtp":
+            ingress = json.loads(environment["frame_ingress_contract_json"])
+            assert ingress["pipeline_id"] == "policy"
+            assert ingress["heartbeat_topic"] == policy["heartbeat_topic"]
+            assert len(ingress["streams"]) == 1
 
 
 @pytest.mark.parametrize("enable_tracing", [False, True])
@@ -1242,13 +1313,6 @@ def test_launch_generation_rejects_pipeline_endpoint_conflicts(tmp_path):
 
     with pytest.raises(InferenceConfigError, match="endpoint conflict"):
         generate_inference_node(robot_config, "model_inference")
-
-
-def test_attention_viz_request_uses_robot_config_only():
-    enabled, mode, _viz_config = _attention_viz_request({"attention_viz": {"enabled": False, "mode": "file"}})
-
-    assert enabled is False
-    assert mode == "file"
 
 
 def test_generate_auxiliary_aero_hand_node_uses_configured_topics_and_rates():

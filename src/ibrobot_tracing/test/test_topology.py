@@ -1,5 +1,4 @@
 import json
-from copy import deepcopy
 
 import pytest
 
@@ -15,27 +14,23 @@ from ibrobot_tracing.topology import (
 
 
 @pytest.mark.parametrize("execution_mode", ["monolithic", "distributed"])
-def test_scheduler_absent_and_false_keep_legacy_topology(execution_mode):
+def test_direct_dispatch_topology(execution_mode):
     config = {
         "name": "robot",
         "default_control_mode": "model_inference",
         "control_modes": {
             "model_inference": {
                 "inference": {
+                    "enabled": True,
                     "pipelines": {"policy": {"execution_mode": execution_mode}},
                 },
                 "executor": {"inference_pipeline": "policy"},
             }
         },
     }
-    disabled_config = deepcopy(config)
-    disabled_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
-
     absent = bind_robot_topology(config)
-    disabled = bind_robot_topology(disabled_config)
     components = {component.component_id: component for component in absent.components}
 
-    assert disabled.to_dict() == absent.to_dict()
     assert absent.metadata == {"config_path": "", "pipeline_id": "policy"}
     assert components["action_dispatcher"].executable == "action_dispatcher_node"
     assert "global_scheduler" not in components
@@ -58,10 +53,11 @@ def test_scheduler_enabled_adds_scheduled_components_edges_and_metadata():
         {
             "name": "robot",
             "default_control_mode": "model_inference",
+            "runtime_scheduler": {"enable": True},
             "control_modes": {
                 "model_inference": {
                     "inference": {
-                        "scheduler": {"enable": True},
+                        "enabled": True,
                         "pipelines": {
                             "fallback": {"execution_mode": "monolithic"},
                             "selected": {"execution_mode": "monolithic"},
@@ -70,7 +66,8 @@ def test_scheduler_enabled_adds_scheduled_components_edges_and_metadata():
                     "executor": {"inference_pipeline": "selected"},
                 }
             },
-        }
+        },
+        scheduler_enabled=True,
     )
 
     components = {component.component_id: component for component in topology.components}
@@ -117,6 +114,7 @@ def test_distributed_topology_routes_model_flows_through_cloud_component():
         {
             "name": "robot",
             "default_control_mode": "model_inference",
+            "runtime_scheduler": {"enable": True},
             "control_modes": {
                 "model_inference": {
                     "inference": {
@@ -151,6 +149,7 @@ def test_legacy_inference_topology_keeps_execution_mode_compatibility():
         {
             "name": "robot",
             "default_control_mode": "model_inference",
+            "runtime_scheduler": {"enable": True},
             "control_modes": {"model_inference": {"inference": {"execution_mode": "distributed"}}},
         }
     )
@@ -319,3 +318,15 @@ def test_reader_normalizes_legacy_duplicate_data_sink_ids(tmp_path):
 
     graph = project_graph(AnalysisResult(TraceDataset(), topology=topology), GraphQuery(view="components"))
     assert len([node for node in graph.nodes if node.kind == "data_sink"]) == 2
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_topology_uses_callers_scheduling_decision(enabled):
+    config = {
+        "runtime_scheduler": {"enable": not enabled},
+        "control_modes": {"model_inference": {"inference": {"enabled": True}}},
+    }
+    topology = bind_robot_topology(config, scheduler_enabled=enabled)
+    components = {component.component_id for component in topology.components}
+    assert ("global_scheduler" in components) is enabled
+    assert (topology.metadata.get("dispatch_path") == "scheduled") is enabled

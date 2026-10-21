@@ -137,9 +137,8 @@ def _scheduler_block() -> dict[str, Any]:
 
 def _robot_config(pipelines: dict[str, Any], *, scheduler: dict[str, Any] | None) -> dict[str, Any]:
     inference: dict[str, Any] = {"enabled": True, "pipelines": pipelines}
-    if scheduler is not None:
-        inference["scheduler"] = scheduler
     return {
+        **({"runtime_scheduler": scheduler} if scheduler is not None else {}),
         "control_modes": {
             "model_inference": {
                 "inference": inference,
@@ -154,7 +153,7 @@ def _robot_config(pipelines: dict[str, Any], *, scheduler: dict[str, Any] | None
                     },
                 },
             }
-        }
+        },
     }
 
 

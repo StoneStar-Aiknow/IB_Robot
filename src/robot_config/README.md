@@ -1105,7 +1105,7 @@ robot:
   `temporal_ensemble_coeff`、`chunk_size`、`smoothing_device` 等调参字段保持不变。
 - 历史 `executor.type: action` 仅由 launch 边界映射为 `topic`。直接节点参数
   `executor_type` 不接受此别名。ROS 参数类型约束仍适用，YAML null 默认语义不适用于 ROS CLI override。
-- `inference.scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
+- `robot.runtime_scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
   scheduled 显式选择 benchmark 或 wait_for_feedback 会报错，不再静默忽略。
 - 两节点的 `~/toggle_smoothing`（Empty）先校验有效组合，拒绝时保留配置及计划并记日志，
   不伪造响应错误字段；start/stop/get_status 为 Trigger。legacy reset 为 Empty，scheduled
@@ -1129,12 +1129,22 @@ robot:
 
 ### 推理调度控制面
 
-调度只有一个功能开关：`control_modes.<mode>.inference.scheduler.enable`，缺失时按 `false` 处理。
-仿真暂不支持启用该开关：`runtime_target=simulation`（含 Gazebo、MuJoCo、mock）运行推理时必须设置
-`scheduler.enable=false`，否则 launch 在生成控制与仿真节点前报错。仿真场景不管理调度 session/binding。
+调度只有一个功能开关：`robot.runtime_scheduler.enable`，缺失时按 `false` 处理。
+开关位于机器人级，统一控制各控制模式下的 policy 推理调度。
+SIM（含 Gazebo、MuJoCo、mock）和 benchmark 始终直通，即使开关为 true，也不创建调度 session/binding。
+目标按 CLI `runtime_target`、YAML `runtime.target`、CLI `use_sim`、hardware 默认值的顺序解析；
+YAML `use_sim` 不参与目标选择。显式 CLI 目标与具身参数冲突时拒绝启动，单独 CLI `sim_platform` 选择虚拟具身。
+准备阶段将调度决策与有效目标传给 execution；显式 `scheduler_enabled` 仅作一致性校验，
+与机器人开关、当前推理模式或有效目标矛盾时拒绝解析。benchmark 专用配置解析始终采用直通策略。
+只有 live-binding 分支将目标写入绑定配置副本，源 YAML 不变。
+独立 execution builder 可显式接收目标和时钟；未传 `use_sim_time` 时，保留原有规则，跟随调用者的
+`use_sim` 参数（两者均未传时为 `false`），不根据后端另行推断。通用 launch 仍由 preparation
+统一选择后端时钟并显式传入。声明拓扑 CLI 只解释 YAML 中的目标，不读取 launch 覆盖参数。
+本阶段仍使用既有 policy 调度器，不将感知、语音或进程内模型自动纳管。
 `inference.enabled` 仍只表示该控制模式是否启用推理，不是调度模式开关。
 
-当 `scheduler.enable` 缺失或为 `false` 时，launch graph 与原路径相同：
+`robot.runtime_scheduler.enable` 缺失或为 `false` 时，通用 launch 的目标解析和直通执行路径保持不变
+（包括节点参数、名称、环境、remapping、输出设置和 action 顺序）：
 
 ```text
 executor.inference_pipeline
@@ -1144,9 +1154,9 @@ executor.inference_pipeline
 ```
 
 该分支不创建 Global Scheduler、ScheduledActionDispatcher、product session、scheduled endpoint 或 serving
-status。显式保留 `scheduler` 块并设置 `enable: false` 时，完整调度配置可以原样保留为 dormant 配置，
+status。显式保留 `runtime_scheduler` 块并设置 `enable: false` 时，完整调度配置可以原样保留为 dormant 配置，
 不会生成 runtime policy，也不会改变 legacy launch graph、节点参数、接口、线程数或 backend 执行方式，
-因此启停只需修改这一处开关。若整个 `scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留
+因此启停只需修改这一处开关。若整个 `runtime_scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留
 旧配置的严格拼写检查。
 仓库当前发布的机器人 YAML 都未启用该开关，因此默认生产启动仍是这条 legacy 路径；下面的 `true` 片段是配置
 契约示例，不是默认切流。
@@ -1155,17 +1165,18 @@ status。显式保留 `scheduler` 块并设置 `enable: false` 时，完整调�
 `profile_path` 可选；只有实际参与 priority-0 deadline 准入的候选才需要有效的离线 profile：
 
 ```yaml
+# 以下为 robot: 下的配置
+runtime_scheduler:
+  enable: true
+  global_endpoints:
+    readiness: /inference/scheduler/ready
+    open_session: /inference/session/open
+    dispatch: /inference/dispatch
+    close_session: /inference/session/close
 control_modes:
   model_inference:
     inference:
       enabled: true
-      scheduler:
-        enable: true
-        global_endpoints:
-          readiness: /inference/scheduler/ready
-          open_session: /inference/session/open
-          dispatch: /inference/dispatch
-          close_session: /inference/session/close
       pipelines:
         policy:
           model_path: models/policy
@@ -1201,7 +1212,7 @@ Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生�
 `max_snapshot_age_ms: 5000`（默认值，正整数）。producer 是 manifest `execution` 中的第一个角色；
 terminal 或 sequential stage 不允许设置该字段。时效从观测采样开始计算，包含 producer 排队与执行时间，
 阈值进入 runtime policy fingerprint 并经 launch 下发。刷新不能使过期的同一观测重新有效。
-分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
+分布式 pipeline 保持 legacy protocol v2；hardware 目标下不能与 `robot.runtime_scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
 默认 `global_policy: fifo` 且 `priority_zero_deadline_admission.enable: false` 时，priority-0 直接下发 target，
 不建立资源等待队列、不使用 profile，也不接受非空 fallback chain；启用 scheduler 后该无效组合会在配置加载时报错。

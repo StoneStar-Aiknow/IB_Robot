@@ -9,7 +9,9 @@ to robot controllers. Temporal blending can soften changes between overlapping p
 but guarantees neither continuous physical motion nor a gap-free supply of inference results.
 
 Two mutually exclusive executables are selected solely by
-`control_modes.<mode>.inference.scheduler.enable`:
+`robot.runtime_scheduler.enable`:
+
+SIM/benchmark always use the direct dispatcher; this switch selects scheduling only for hardware.
 
 - Absent or `false`: `action_dispatcher_node` uses the named
   `executor.inference_pipeline` through `DispatchInfer /dispatch` and `/reset`.

@@ -93,7 +93,7 @@ PREPARATION_PHASES = (
     "inference_override",  # 3: inference pipeline/execution_mode override
     "mock_check",  # 4: validate_mock_control_mode
     "inference_derived",  # 5: with_inference / teleop fallback derivation
-    "scheduler_check",  # 6: scheduler derivation; reject simulation+scheduler
+    "scheduler_check",  # 6: scheduler derivation; virtual targets stay direct
     "benchmark_check",  # 7: in-memory transport materialization + closure check
     "resource_check",  # 8: validate_runtime_resources (sees applied hand profile)
     "preflight",  # 9: operator confirmations (e.g. P-pose); interactive, exactly-once

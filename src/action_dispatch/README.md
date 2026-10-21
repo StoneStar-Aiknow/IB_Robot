@@ -8,7 +8,9 @@
 跨帧融合可缓和重叠预测之间的变化，但不保证物理运动连续或推理供应无间隙。
 
 本包包含两个互斥 executable，具体选择只来自
-`control_modes.<mode>.inference.scheduler.enable`：
+`robot.runtime_scheduler.enable`：
+
+SIM/benchmark 始终使用直通 dispatcher；此开关仅在 hardware 目标下选择调度路径。
 
 - 缺失或 `false`：启动 `action_dispatcher_node`，沿
   `executor.inference_pipeline -> DispatchInfer /dispatch + /reset` 工作，行为与原路径一致。
