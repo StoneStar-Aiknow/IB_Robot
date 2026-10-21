@@ -50,23 +50,42 @@ _FIELDS = frozenset({"kind", "category", "region", "reply"})
 # Fields that must be absent or empty when the kind carries no subject.
 _SUBJECT_FIELDS = ("category", "region")
 
-# Attributes outside the first version's verifiable range. A reply only ever
-# expresses the category and the display relation, so wording that reaches for
-# one of these is rejected whole: the claim is what is unverifiable, and
-# deleting the word would leave the same sentence asserting it.
+# Specific risks a reply may not express. One family per risk somebody named,
+# not a guess at vocabulary.
 #
-# This list is a net, not a proof. Keyword matching cannot enumerate every way
-# to assert a colour or a mood, which is why it is only the second of three
-# checks: the closed fields above decide the subject, this removes the common
-# over-reach, and _REQUIRED_GROUNDING below refuses anything that stopped
-# describing the confirmed category at all.
+# This replaced a character whitelist, which constrained characters while the
+# risk lives in meaning — a level mismatch that failed in both directions.
+# Measured offline (visual_interaction.phase0.boundary_ablation) over fourteen
+# sentences this feature exists to say and twenty-one that must stay refused:
+#
+#   character whitelist   11/14 said   15/21 refused
+#   these filters         14/14 said   21/21 refused
+#   both together         11/14 said   21/21 refused
+#
+# The whitelist refused "她正在展示一个和平手势" — an accurate description —
+# and passed "你那个玩偶是我的。", built entirely from allowed characters.
+# Keeping it alongside these filters bought nothing and cost three refusals, so
+# expression is open and each risk is named instead.
+#
+# These are a net, not a proof: a risk nobody listed is not refused here. The
+# closed fields still decide what may be discussed, and _CATEGORY_WORDS below
+# refuses a reply that stopped describing the confirmed subject at all.
 _OUT_OF_RANGE_PATTERNS: tuple[tuple[str, str], ...] = (
+    # The visitor talked about rather than to. The board model did this on
+    # every round ("她正在展示一个和平手势"), which reads as surveillance
+    # commentary: the robot is speaking face to face. A second person is NOT
+    # required — "戴着这顶帽子很显眼呀" addresses them by context, and six of
+    # the fourteen desirable sentences carry no 你 at all.
+    (r"她|他(?!们好)|这个人|那个人|那位|这位|此人|女士|先生|对方", "third_person"),
+    # The room rather than the person in it. The closed fields cannot catch
+    # this: they say what was confirmed, not what the sentence is about.
+    (r"房间|地上|墙上|桌上|屋里|室内|背景|旁边有|摆着|放着", "scene_not_visitor"),
     # Material and make.
     (r"木|金属|塑料|棉|丝|皮革|陶|玻璃|毛绒|手工|材质|做工", "material"),
     # Brand, price and provenance.
-    (r"牌子是|品牌|名牌|多少钱|价格|贵|便宜|正品|限量|买的|产地", "commerce"),
+    (r"牌子是|品牌|名牌|多少钱|价格|贵|便宜|正品|限量|买的|产地|进口", "commerce"),
     # Reading any text in frame out loud, however it is introduced.
-    (r"写着|写的是|上面说|标语|字是|念出|读出|内容是|上面的字", "sign_text"),
+    (r"写着|写的是|上面说|标语|字是|念出|读出|内容是|上面的字|电话|号码", "sign_text"),
     # Inferred inner state. The robot sees a picture, not a mood. "你" and the
     # state word are allowed to be far apart: "你看起来很开心" puts three
     # characters between them.
@@ -93,51 +112,26 @@ _OUT_OF_RANGE_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         r"你(?![^。！？，、]*?(?:的|这|那)[^。！？，、]*?"
         r"(?:帽子|玩偶|玩具|娃娃|公仔|牌子|标牌|纸板|徽章|胸针|别针|胸章))"
-        r"[^。！？，、]*?(?:漂亮|好看|帅|可爱)"
+        r"[^。！？，、]*?(?:漂亮|好看|帅|可爱|身材|年纪|岁)"
         r"|你也(?:很|真|挺)?(?:漂亮|好看|帅|可爱)"
-        r"|的你(?:真|很|好|挺)?(?:漂亮|好看|帅|可爱)",
+        r"|的你(?:真|很|好|挺)?(?:漂亮|好看|帅|可爱)"
+        # A simile routes praise back to the person around the determiner:
+        # "你举起的玩偶真像你。" passed every check the whitelist build had.
+        r"|像你",
         "person",
     ),
+    # The robot inventing a history with the visitor, or a claim on what they
+    # are holding. Found by composing whitelisted characters, so it is exactly
+    # the class a vocabulary gate could not see.
+    (r"是我的|我也有|我的东西|归我|送我|给我吧|我见过你|上次", "false_claim"),
+    # Medical devices and religious or political symbols: named in review as
+    # never-say, and the review bypass "你戴的徽章上有十字架。" lives here.
+    (r"助听|轮椅|拐杖|药|病|残|十字架|佛|经文|党徽|国旗", "sensitive_attribute"),
+    # Anyone other than the visitor brought into the remark.
+    (r"和那个|和这个人|旁边的人|其他人|大家|他们", "third_party"),
 )
 
 _OUT_OF_RANGE = tuple((re.compile(pattern), label) for pattern, label in _OUT_OF_RANGE_PATTERNS)
-
-# The vocabulary a reply may be built from. This is the load-bearing check, and
-# it is a whitelist on purpose.
-#
-# A blacklist cannot hold this boundary. "你举着的牌子写了电话号码13800138000。",
-# "你举起的玩偶旁边有助听器。" and "你戴的徽章上有十字架。" each name the
-# confirmed category, miss every out-of-range pattern, and each publishes
-# something the first version promised never to say — personal data, a medical
-# device, a religious symbol. Enumerating those three fixes those three.
-#
-# So the rule is inverted: a reply may only use characters from this set, and
-# anything else — an unlisted word, a digit, a Latin letter — refuses it. The
-# cost is that a perfectly good sentence can be refused for using a word nobody
-# listed, which is the right direction to fail in. Widening the set is a review
-# decision with the whole boundary in view, not an edit to a pattern.
-_ALLOWED_REPLY_CHARS = frozenset(
-    # Subjects: the four categories and their ordinary synonyms.
-    "玩偶玩具娃娃公仔牌子标牌纸板帽子徽章胸针别针胸章"
-    # Display relations: holding, wearing, showing, pointing.
-    "举起拿着带来戴着别着挂在手上头上胸前身上拿出展示给看向"
-    # Second person and the robot's own voice.
-    "你我它这那个只件顶枚张"
-    # Plain remarks: noticing, liking, finding it interesting.
-    "真好有意思特别挺不错很可爱看到注意呀啊呢吧哦喔嗯漂亮趣点目醒眼"
-    "是的了着过在和跟与也还就都又再一二两"
-    # Light verbs that keep a sentence grounded in what is visible.
-    "像似乎显得看起来瞧见发现觉"
-    # Basic colours. A colour is a property of the picture rather than an
-    # inference about it, so it is allowed to be stated: "你的红帽子很显眼。"
-    # Material, make and brand stay refused by pattern — those are claims about
-    # how a thing was produced, which a camera cannot establish.
-    "红橙黄绿青蓝紫粉灰棕褐黑白金银色"
-    # Stative remarks that describe rather than judge.
-    "显眼鲜艳亮醒颜"
-    # Punctuation.
-    "。！？，、…—～ "
-)
 
 # Characters that are refused however they are used. Digits and Latin letters
 # are how a phone number, a licence plate or a brand reaches a reply, and no
@@ -244,24 +238,28 @@ def check_reply(
 ) -> str:
     """Return the reply to speak, or raise :class:`SemanticsError`.
 
-    Five checks, all fail-closed, cheapest first:
+    The boundary has three levels, each holding what it can actually hold:
 
-    1. the length band, because a one-word answer carries no observation and a
-       long one stops being a short remark;
-    2. the instruction shape, because a sign in frame may read like a command
-       and a reply is something said to a visitor, never to the system;
-    3. no question, because the first version has no way to hear an answer;
-    4. the vocabulary whitelist — the load-bearing one. A reply may only use
-       characters from :data:`_ALLOWED_REPLY_CHARS`, so a phone number, a
-       medical device or a religious symbol is refused for not being in the
-       vocabulary rather than for matching a pattern somebody thought of;
-    5. the out-of-range patterns and the category grounding, which catch a
-       sentence built entirely from allowed characters that still over-reaches.
+    * **closed semantic range** — ``kind``, ``category`` and ``region`` decide
+      what may be discussed at all. Done by :func:`parse_observation`.
+    * **open expression** — any wording is allowed. There is no vocabulary
+      gate: constraining characters while the risk lives in meaning refused
+      accurate descriptions and passed inaccurate ones (see
+      :data:`_OUT_OF_RANGE_PATTERNS` for the measurement).
+    * **specific risk filters plus grounding** — this function. Each named
+      risk is refused, and the reply must still describe the confirmed
+      subject.
 
-    Check 4 is why 1–3 and 5 are a net rather than the boundary: a blacklist
-    cannot enumerate every way to say something out of range, and each of the
-    three real bypasses found in review named its category, missed every
-    pattern, and published something the first version promised never to say.
+    Checks run cheapest first: the length band (a one-word answer carries no
+    observation, a long one stops being a short remark), the instruction shape
+    (a sign in frame may read like a command; a reply is said to a visitor,
+    never to the system), no question (nothing here can hear an answer),
+    digits and Latin letters, then each risk family, then grounding.
+
+    These filters are a net, not a proof: a risk nobody listed is not refused.
+    What bounds the damage is the level above — the closed fields — and the
+    grounding check below, which refuses a reply that wandered off the subject
+    those fields settled.
     """
     text = normalise_text(reply)
     if not text:
@@ -278,9 +276,6 @@ def check_reply(
         raise SemanticsError(SUPPRESS_PRIVACY, "reply asks a question; the first version only states")
     if _FORBIDDEN_REPLY_PATTERN.search(text):
         raise SemanticsError(SUPPRESS_PRIVACY, "reply contains digits or Latin letters, which no allowed remark needs")
-    outside = sorted(set(text) - _ALLOWED_REPLY_CHARS)
-    if outside:
-        raise SemanticsError(SUPPRESS_PRIVACY, f"reply uses words outside the allowed vocabulary: {''.join(outside)}")
     for pattern, label in _OUT_OF_RANGE:
         if pattern.search(text):
             raise SemanticsError(SUPPRESS_PRIVACY, f"reply asserts {label}, which is out of range")

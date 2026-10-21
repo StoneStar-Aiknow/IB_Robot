@@ -353,12 +353,13 @@ class TestReplyContent:
 
 
 class TestVocabularyWhitelist:
-    """The load-bearing content check: a reply may only use allowed words.
+    """The risk filters: each named risk is refused, expression stays open.
 
-    Each case below names its category, misses every out-of-range pattern, and
-    publishes something the first version promised never to say. They are why
-    the boundary is a whitelist: a blacklist fixes the three somebody thought
-    of and leaves the fourth.
+    These cases used to be caught by a character whitelist. That gate was
+    removed because it worked at the wrong level — it constrained characters
+    while the risk is in the meaning, so it refused accurate descriptions
+    ("她正在展示一个和平手势") and passed inaccurate ones ("你那个玩偶是我的。").
+    Every sentence below must stay refused by a filter that names its risk.
     """
 
     @pytest.mark.parametrize(
@@ -371,7 +372,7 @@ class TestVocabularyWhitelist:
             ("hat", "你戴的帽子是名牌货。", "a brand claim"),
         ],
     )
-    def test_a_reply_outside_the_vocabulary_is_refused(self, category, reply, what):
+    def test_a_named_risk_is_refused(self, category, reply, what):
         with pytest.raises(SemanticsError) as error:
             parse_observation(answer(category=category, reply=reply))
 
@@ -382,6 +383,30 @@ class TestVocabularyWhitelist:
         """How a phone number, a plate or a brand reaches a reply."""
         with pytest.raises(SemanticsError, match="digits or Latin letters"):
             parse_observation(answer(category="toy", reply=reply))
+
+    @pytest.mark.parametrize(
+        ("reply", "risk"),
+        [
+            ("她正在展示一个玩偶。", "third_person"),
+            ("这个人举起的玩偶真有趣。", "third_person"),
+            ("房间内有玩偶和一些纸箱。", "scene_not_visitor"),
+            ("你那个玩偶是我的。", "false_claim"),
+            ("这个玩偶我也有。", "false_claim"),
+            ("你举起的玩偶真像你。", "person"),
+        ],
+    )
+    def test_the_risks_the_board_run_and_the_whitelist_exposed(self, reply, risk):
+        """Six sentences the previous boundary got wrong, in both directions.
+
+        The first three the model actually produced and the whitelist refused
+        only incidentally, by vocabulary; the last three are built entirely
+        from whitelisted characters and passed every check it had.
+        """
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(category="toy", reply=reply))
+
+        assert error.value.reason == SUPPRESS_PRIVACY
+        assert risk in error.value.detail
 
     @pytest.mark.parametrize(
         ("category", "reply"),
@@ -395,7 +420,25 @@ class TestVocabularyWhitelist:
         ],
     )
     def test_an_ordinary_remark_still_passes(self, category, reply):
-        """The whitelist must leave the sentences this feature exists to say."""
+        """The filters must leave the sentences this feature exists to say."""
+        assert parse_observation(answer(category=category, reply=reply)).reply == reply
+
+    @pytest.mark.parametrize(
+        ("category", "reply"),
+        [
+            ("hat", "戴着这顶帽子很显眼呀。"),
+            ("toy", "举着的那个玩偶真可爱。"),
+            ("sign", "举着的牌子真显眼呀。"),
+            ("badge", "胸前那枚徽章真精致。"),
+        ],
+    )
+    def test_a_remark_without_a_pronoun_passes(self, category, reply):
+        """Addressing the visitor does not require saying 你.
+
+        A remark addresses whoever it is said to by context, so requiring a
+        pronoun would refuse ordinary speech. Six of the fourteen desirable
+        sentences in the offline ablation carry none.
+        """
         assert parse_observation(answer(category=category, reply=reply)).reply == reply
 
     def test_praise_aimed_at_the_person_is_still_refused(self):
@@ -445,12 +488,31 @@ class TestVocabularyWhitelist:
         """
         assert parse_observation(answer(category="hat", reply=reply)).reply == reply
 
-    def test_the_refusal_names_the_offending_characters(self):
-        """So a widening decision can be made with the actual word in view."""
+    def test_the_refusal_names_the_risk_it_matched(self):
+        """So a long silence can be read without guessing which rule fired.
+
+        It used to name the offending characters, which only made sense while
+        the gate was a vocabulary. Naming the risk is what a diagnostics reader
+        and a widening decision both need.
+        """
+        with pytest.raises(SemanticsError) as error:
+            parse_observation(answer(reply="你举起的玩偶上有十字架。"))
+
+        assert "sensitive_attribute" in error.value.detail
+
+    def test_the_first_matching_risk_is_the_one_reported(self):
+        """A sentence can carry two risks; the reason names one deterministically.
+
+        "你举起的玩偶旁边有助听器。" is both a scene description (旁边有) and a
+        medical reference, and the order in the pattern table decides which is
+        reported. Either refusal is correct, so the test pins that it is
+        refused and that the reason is one of the two.
+        """
         with pytest.raises(SemanticsError) as error:
             parse_observation(answer(reply="你举起的玩偶旁边有助听器。"))
 
-        assert "助" in error.value.detail
+        assert error.value.reason == SUPPRESS_PRIVACY
+        assert any(risk in error.value.detail for risk in ("scene_not_visitor", "sensitive_attribute"))
 
 
 class TestNoQuestions:
