@@ -4,147 +4,33 @@ When a camera peripheral in the robot YAML has ``use_default_transform: true``,
 the launch system looks up default transform and fovy values from this module
 instead of using the (zeroed-out) values in the YAML.
 
-Two mount categories:
-  "wrist" — gripper-mounted palm-plate camera, follows the end-effector.
-  "top"   — calibrated workspace overview camera fixed in the world.
-  "base"  — generic workspace camera fixed on the robot base body.
-             Used by any camera without a dedicated preset (front, etc.).
-
 The Gazebo column was removed (openspec ``so101-gazebo-runtime-transport``
 D6.2): those values were SO-101 defaults and are now runtime-owned, declared
 per-camera as ``simulation.gazebo.transform`` (+ ``fovy``) in the SO-101
-runtime profile. Generic provider-less Gazebo users declare their poses
-explicitly; only the MuJoCo column remains.
+runtime profile. The MuJoCo column was removed the same way
+(so101-mujoco-runtime-platform D5): the SO-101 MuJoCo defaults live in the
+runtime profile as ``simulation.mujoco.transform`` (+ ``fovy``), and the
+gazebo→mujoco orientation conversion moved to ``robot_runtime.mujoco``
+(``gazebo_rpy_to_mujoco_rpy``), next to the shared Gazebo camera code.
 
-Convention:
-  Values are stored in each platform's native coordinate convention:
-    - Gazebo (gz-sim): camera forward = +X, up = +Z
-    - MuJoCo:          camera forward = -Z, up = +Y
-  No cross-platform conversion is needed at runtime — each adapter reads its
-  own column directly.
+``get_preset`` stays as the generic default-pose loader hook: provider-less
+generic Gazebo users declare their poses explicitly, so it now returns None
+for every platform (the ``sim_camera_adjuster``'s guarded lookups keep
+working, exactly as they already do for the removed Gazebo column).
 """
-
-PRESETS = {
-    "mujoco": {
-        "wrist": {
-            "parent_frame": "gripper",
-            "x": 0.002265,
-            "y": 0.073023,
-            "z": -0.016289,
-            "roll": 0.031197,
-            "pitch": -0.490648,
-            "yaw": -1.607245,
-            "fovy": 46,
-        },
-        "top": {
-            "parent_frame": "world",
-            "x": 0.0419,
-            "y": 0.1123,
-            "z": 0.6136,
-            "roll": 0.052274,
-            "pitch": 0.003013,
-            "yaw": 3.136436,
-            "fovy": 47,
-        },
-        "base": {
-            "parent_frame": "base",
-            "x": 0.0,
-            "y": -0.28,
-            "z": 0.55,
-            "roll": 0.0,
-            "pitch": 0.0,
-            "yaw": 3.1415,
-            "fovy": 70,
-        },
-    },
-}
 
 
 def get_preset(platform: str, camera_name: str) -> dict | None:
-    """Look up default camera transform for a given platform and camera name.
+    """Look up a default camera transform for a given platform and camera name.
 
     Args:
         platform: "gazebo" or "mujoco".
         camera_name: The ``name`` field from the YAML peripheral entry.
-                     Dedicated entries (e.g. "wrist", "top") are used when
-                     present; otherwise the generic "base" preset is returned.
 
     Returns:
-        A dict with keys (parent_frame, x, y, z, roll, pitch, yaw, fovy),
-        or None if the platform is unknown.
+        None — both preset columns were removed (Gazebo: runtime-owned since
+        ``so101-gazebo-runtime-transport`` D6.2; MuJoCo: runtime-owned since
+        ``so101-mujoco-runtime-platform`` D5). The function remains as the
+        default-pose loader hook ``robot_runtime.gazebo`` callers inject.
     """
-    platform_presets = PRESETS.get(platform)
-    if not platform_presets:
-        return None
-    return platform_presets.get(camera_name) or platform_presets.get("base")
-
-
-# ---------------------------------------------------------------------------
-# Coordinate-system conversion: Gazebo camera frame → MuJoCo camera frame
-# ---------------------------------------------------------------------------
-#
-# Gazebo SDF camera link convention:   optical = +X,  image-up = +Z,  image-right = -Y
-# MuJoCo camera body convention:       optical = -Z,  image-up = +Y,  image-right = +X
-#
-# R_fix maps MuJoCo camera basis into Gazebo camera basis (columns = e_x^M,
-# e_y^M, e_z^M expressed in Gazebo coords).  With R_WG the calibrated Gazebo
-# camera rotation in world, the equivalent MuJoCo camera rotation is
-# R_WM = R_WG @ R_fix.  det(R_fix) = +1 (proper rotation).
-#
-# This conversion relies on the URDF/MJCF body hierarchy being consistent
-# (same parent frame orientation in both backends), which is true for the
-# SO101 model because mujoco_adapter uses URDF-derived body origins with
-# eulerseq="XYZ" (matching URDF rpy extrinsic XYZ).
-#
-# Used by ``mujoco_adapter`` to translate ``sim_camera_adjuster`` output
-# (always saved in Gazebo convention) into MuJoCo ``<camera euler="...">``.
-
-_R_FIX_GZ_TO_MJ = (
-    (0.0, 0.0, -1.0),
-    (-1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-)
-
-
-def gazebo_rpy_to_mujoco_rpy(gz_roll: float, gz_pitch: float, gz_yaw: float) -> tuple[float, float, float]:
-    """Convert (roll, pitch, yaw) from Gazebo camera convention to MuJoCo.
-
-    Input and output are extrinsic XYZ Euler angles in radians, matching both
-    URDF ``rpy`` and MuJoCo ``eulerseq="XYZ"``.
-    """
-    import math
-
-    def rpy_to_R(r, p, y):
-        cr, sr = math.cos(r), math.sin(r)
-        cp, sp = math.cos(p), math.sin(p)
-        cy, sy = math.cos(y), math.sin(y)
-        # R = Rz(y) @ Ry(p) @ Rx(r)
-        return (
-            (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
-            (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
-            (-sp, cp * sr, cp * cr),
-        )
-
-    def mat_mul_3x3(A, B):
-        return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)) for i in range(3))
-
-    def R_to_rpy(R):
-        # Inverse of R = Rz(y) @ Ry(p) @ Rx(r).
-        # R[2][0] = -sin(p);  R[2][1] = cos(p)*sin(r);  R[2][2] = cos(p)*cos(r)
-        # R[1][0] = cos(p)*sin(y);  R[0][0] = cos(p)*cos(y)
-        sp = max(-1.0, min(1.0, -R[2][0]))
-        pitch = math.asin(sp)
-        cp = math.cos(pitch)
-        if abs(cp) > 1e-6:
-            roll = math.atan2(R[2][1], R[2][2])
-            yaw = math.atan2(R[1][0], R[0][0])
-        else:
-            # Gimbal lock (pitch = ±pi/2); roll and yaw are coupled.
-            # Convention: set roll = 0, resolve yaw.
-            roll = 0.0
-            yaw = math.atan2(-R[0][1], R[1][1])
-        return roll, pitch, yaw
-
-    R_WG = rpy_to_R(gz_roll, gz_pitch, gz_yaw)
-    R_WM = mat_mul_3x3(R_WG, _R_FIX_GZ_TO_MJ)
-    return R_to_rpy(R_WM)
+    return None

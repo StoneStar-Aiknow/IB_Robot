@@ -15,8 +15,6 @@ regardless of YAML platform.
 
 from typing import Any
 
-from launch_ros.actions import Node
-
 from robot_config.launch_registry.builder_support import runtime_provider_name
 from robot_config.launch_registry.registry import (
     BuilderSpec,
@@ -110,6 +108,22 @@ def build_simulation(context: LaunchBuildContext) -> BuildResult:
                 actions=actions,
                 simulation_startup=SimulationStartup(entity_action=None, world_name=world_name, spawn_pose=spawn_pose),
             )
+        if context.sim_platform == "mujoco":
+            # so101-mujoco-runtime-platform D7: generic launch resolves the
+            # scene and spawn pose only; the provider starts the single
+            # MuJoCo simulator and composes its robot MJCF with the scene.
+            from robot_config.launch_builders import sim_backend as sim_backend_module
+
+            robot_config = context.robot_config
+            private_config = isolated_config(robot_config)
+            logger.info("========== Resolving MuJoCo Scene (provider hand-off) ==========")
+            sim_adapter = sim_backend_module.get_sim_backend("mujoco")
+            actions, scene_name, spawn_pose = sim_adapter.start_world_only(private_config)
+            logger.info(f"World-only MuJoCo: scene={scene_name!r}, spawn_pose={spawn_pose}")
+            return BuildResult(
+                actions=actions,
+                simulation_startup=SimulationStartup(entity_action=None, scene_name=scene_name, spawn_pose=spawn_pose),
+            )
         logger.info("runtime.provider active: simulation transport owned by the robot runtime")
         return BuildResult(simulation_startup=SimulationStartup(entity_action=None))
 
@@ -131,20 +145,6 @@ def build_simulation(context: LaunchBuildContext) -> BuildResult:
         sim_nodes += sim_adapter.spawn_peripheral_bridges(private_config.get("peripherals", []))
         actions.extend(sim_nodes)
         logger.info(f"Added {len(sim_nodes)} simulation nodes ({sim_platform})")
-
-        # Scene task node for randomisation and AutoTest evaluation
-        scene_name = private_config.get("simulation", {}).get("scene", "")
-        if sim_platform == "mujoco" and scene_name == "pick_banana":
-            actions.append(
-                Node(
-                    package="sim_models",
-                    executable="pick_banana_task_node",
-                    name="pick_banana_task_node",
-                    parameters=[{"use_sim_time": True}],
-                    output="screen",
-                )
-            )
-            logger.info("Added pick_banana_task_node")
     except NotImplementedError:
         logger.warning(
             f"sim platform '{sim_platform}' not implemented yet, "

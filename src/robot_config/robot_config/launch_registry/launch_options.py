@@ -87,7 +87,11 @@ CORE_ARGUMENT_SPECS: tuple[ArgumentSpec, ...] = (
         name="sim_platform",
         declared_default="",
         absent_fallback="",
-        description="Override simulation.platform from YAML (gazebo, mujoco, or mock). Empty uses YAML.",
+        description=(
+            "Override simulation.platform from YAML (gazebo, mujoco, or mock). "
+            "mujoco requires a runtime.provider (there is no provider-less MuJoCo "
+            "bring-up); empty uses YAML."
+        ),
     ),
     ArgumentSpec(
         name="auto_start_controllers",

@@ -347,7 +347,9 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     the runtime facade; robot_config only delegates and reconciles
     ``capabilities.requires`` against ``RuntimeStatus``. A provider is
     mutually exclusive with a legacy simulation platform. Provider-less
-    configurations retain their existing launch path until separately migrated.
+    configurations retain their existing launch path until separately
+    migrated, except ``simulation.platform: mujoco``, which is rejected here
+    and in launch preparation (MuJoCo is served through a runtime provider).
     """
     errors: list[str] = []
     runtime = robot_config.get("runtime") or {}
@@ -395,6 +397,13 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
+    else:
+        from robot_config.utils import providerless_sim_platform_error
+
+        sim_platform = str((robot_config.get("simulation") or {}).get("platform", "sdk")).lower()
+        platform_error = providerless_sim_platform_error(sim_platform)
+        if platform_error:
+            errors.append(platform_error)
 
     required = (robot_config.get("capabilities") or {}).get("requires") or []
     if required:

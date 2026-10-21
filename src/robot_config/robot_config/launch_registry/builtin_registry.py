@@ -66,6 +66,9 @@ BUILTIN_BUILDERS: tuple[str, ...] = (
     # hand_sources moved to robot_teleop and registers through the
     # ibrobot.launch_builders entry point group.
     "robot_config.launch_builders.simulation:SIMULATION_BUILDER",
+    # scene_task (so101-mujoco-runtime-platform D8) reads the simulation
+    # entry's resolved world and runs behind the runtime readiness barrier.
+    "robot_config.launch_builders.scene_task:SCENE_TASK_BUILDER",
     "robot_config.launch_builders.readiness:CONTROLLER_STARTUP_BUILDER",
     # ---- Business ----
     "robot_config.launch_builders.perception:PERCEPTION_BUILDER",

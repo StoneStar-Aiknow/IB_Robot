@@ -302,13 +302,17 @@ class SimulationStartup:
     provider on a physics transport (runtime-simulation-transport D3):
     generic launch owns the world and resolves the scene, so the provider
     receives the resolved world name and the full robot spawn pose
-    (x, y, z, yaw) instead of recomputing them. Both stay empty/None when
-    generic launch owns no world (provider-less or sdk transports).
+    (x, y, z, yaw) instead of recomputing them. ``scene_name`` carries the
+    scene identity on the MuJoCo transport (so101-mujoco-runtime-platform
+    D3/D7): the world owner resolves the scene by name and the provider
+    composes its robot MJCF with it. All stay empty/None when generic launch
+    owns no world (provider-less or sdk transports).
     """
 
     entity_action: Any = None
     world_name: str = ""
     spawn_pose: tuple[float, float, float, float] | None = None
+    scene_name: str = ""
 
 
 @dataclass(frozen=True)

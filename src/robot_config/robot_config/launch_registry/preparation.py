@@ -230,7 +230,7 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
 
     from robot_config.launch_builders.runtime import runtime_provider
     from robot_config.launch_builders.sim_backend import get_backend_caps
-    from robot_config.utils import provider_sim_platform_error
+    from robot_config.utils import provider_sim_platform_error, providerless_sim_platform_error
 
     runtime_provider_name = runtime_provider(robot_config)
     sim_platform = str(
@@ -244,16 +244,21 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
         platform_error = provider_sim_platform_error(sim_platform, runtime_provider_name)
         if platform_error:
             raise PreparationError(platform_error)
-        if sim_platform == "gazebo":
-            # D4: generic launch owns the world only; the provider owns the
-            # embodiment. The world provides the clock, but ros2_control and
-            # the entity are the provider's, so generic never spawns them.
+        if sim_platform in ("gazebo", "mujoco"):
+            # D4 (gazebo) / D1 (mujoco): generic launch owns the world side
+            # only; the provider owns the embodiment. The world provides the
+            # clock, but ros2_control and the entity are the provider's, so
+            # generic never spawns them.
             backend_caps = {"provides_clock": True, "needs_ros2_control": False}
         else:
             backend_caps = {"provides_clock": False, "needs_ros2_control": False}
     elif is_benchmark:
         backend_caps = {"provides_clock": False, "needs_ros2_control": False}
     else:
+        if use_sim:
+            providerless_error = providerless_sim_platform_error(sim_platform)
+            if providerless_error:
+                raise PreparationError(providerless_error)
         backend_caps = (
             get_backend_caps(sim_platform)
             if use_sim

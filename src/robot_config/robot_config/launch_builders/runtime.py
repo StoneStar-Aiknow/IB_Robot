@@ -165,7 +165,8 @@ def generate_runtime_provider_actions(
     include_arguments["use_sim"] = "true" if use_sim else "false"
     if use_sim:
         include_arguments["sim_platform"] = str(sim_platform).lower()
-    if use_sim and str(sim_platform).lower() == "gazebo":
+    platform = str(sim_platform).lower() if use_sim else ""
+    if platform == "gazebo":
         # D3: the world owner hands the provider the resolved world name and
         # spawn pose (x, y, z, yaw) — nothing is recomputed here. An empty
         # world name means the provider starts its own minimal empty world.
@@ -184,6 +185,28 @@ def generate_runtime_provider_actions(
         logger.info(
             f"runtime.provider={provider}: including {launch_path} "
             f"(profile={profile}, use_sim=true, sim_platform=gazebo, world={world_name!r}, spawn={spawn_pose}, "
+            f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
+        )
+    elif platform == "mujoco":
+        # so101-mujoco-runtime-platform D3: the world owner hands the provider
+        # the resolved scene NAME and spawn pose — no file path crosses the
+        # boundary and nothing is recomputed. An empty scene name means the
+        # robot model runs alone (the provider-alone behaviour).
+        startup = simulation_startup
+        scene_name = str(getattr(startup, "scene_name", "") or "")
+        spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
+        include_arguments.update(
+            {
+                "mujoco_scene": scene_name,
+                "spawn_x": str(spawn_pose[0]),
+                "spawn_y": str(spawn_pose[1]),
+                "spawn_z": str(spawn_pose[2]),
+                "spawn_yaw": str(spawn_pose[3]),
+            }
+        )
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, use_sim=true, sim_platform=mujoco, scene={scene_name!r}, spawn={spawn_pose}, "
             f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
         )
     else:
