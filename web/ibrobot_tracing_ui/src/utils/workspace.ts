@@ -14,7 +14,7 @@ export function isRequestView(tab: DetailTab, mode: SpanAnalysisMode): boolean {
 
 export function scopeLabel(tab: DetailTab, requestId: string, componentId: string, mode: SpanAnalysisMode): string {
   if (["summary", "requests", "distribution", "comparison", "warnings"].includes(tab)) {
-    return tab === "comparison" ? "两份 trace 文件 · 不使用请求筛选" : "整份 trace 文件 · 全部请求";
+    return tab === "comparison" ? "两份 trace 文件 · 不使用请求筛选" : "全部请求";
   }
   const request = tab === "span-profile" && mode === "aggregate"
     ? "全部请求聚合"

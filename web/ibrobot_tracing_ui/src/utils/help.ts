@@ -6,9 +6,16 @@ export interface HelpTopic {
   keywords: string;
   views: DetailTab[];
   steps: string[];
+  guide?: "capture" | "instrument";
 }
 
 export const HELP_TOPICS: HelpTopic[] = [
+  { id: "capture", title: "如何抓取 trace", keywords: "抓取 录制 记录 LTTng CTF 开始 停止 trace-root 文件目录 文件上传", views: [], guide: "capture", steps: [
+    "在运行业务的机器上记录，停止后将完整 trace 放入 Web 服务配置的目录，再刷新首页列表。已有埋点无需修改代码。",
+  ] },
+  { id: "instrument", title: "添加自定义埋点", keywords: "Python span event trace_context request_id IB_TRACE_ENABLED 自定义 埋点", views: [], guide: "instrument", steps: [
+    "用 Span 测量一段耗时，用 Event 记录瞬间状态；通过同一个 request_id 将记录关联到业务请求。指南提供可运行示例。",
+  ] },
   { id: "start", title: "找到一个值得调查的请求", keywords: "开始 trace 文件 慢请求 查找 ID 排序 分页", views: ["summary", "requests"], steps: [
     "打开 trace 文件后，选“查看最慢请求”；也可在顶部查找框粘贴完整请求 ID，查找覆盖整份 trace 文件。",
     "请求列表按耗时排序并真实分页。列表里的文字过滤只作用于当前页，不是完整 ID 查找。",

@@ -26,6 +26,7 @@ export function useProfilerNavigation(store: ReturnType<typeof useProfilerStore>
 
   async function applyRoute(): Promise<void> {
     const generation = ++routeGeneration;
+    if (route.name !== "analysis") { applying = false; return; }
     const returningHome = !route.params.analysisId && store.analysisState !== "idle";
     applying = true;
     if (store.sourcesState !== "ready") await store.loadSources();
@@ -54,9 +55,11 @@ export function useProfilerNavigation(store: ReturnType<typeof useProfilerStore>
       page.offset = state.recordOffset ?? 0;
       page.name = state.recordName ?? "";
     }
-    if (state.sourceId) store.restoreSourceId = state.sourceId;
-    if (state.sourceVersion) store.restoreSourceVersion = state.sourceVersion;
     const id = String(route.params.analysisId ?? "");
+    if (id !== store.analysisId || state.sourceId) {
+      store.restoreSourceId = state.sourceId || "";
+      store.restoreSourceVersion = state.sourceId ? state.sourceVersion || "" : "";
+    }
     await nextTick();
     if (generation !== routeGeneration) return;
     if (!id) {
@@ -81,7 +84,7 @@ export function useProfilerNavigation(store: ReturnType<typeof useProfilerStore>
 
   watch(() => route.fullPath, applyRoute, { immediate: true });
   async function syncRoute(state: ReturnType<typeof routeState>): Promise<void> {
-    if (applying) return;
+    if (applying || route.name !== "analysis") return;
     const target = { name: "analysis", params: store.analysisId ? { analysisId: store.analysisId } : {}, query: buildProfilerQuery(state) };
     if (router.resolve(target).fullPath === route.fullPath) return;
     const previous = parseProfilerRoute(route.query);

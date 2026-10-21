@@ -5,7 +5,7 @@ import { MarkerType, Panel, VueFlow, useVueFlow, type Edge, type Node, type Node
 import { Background } from "@vue-flow/background";
 import { MiniMap } from "@vue-flow/minimap";
 import { useProfilerStore } from "../stores/profiler";
-import { formatDuration, metricLabel, recordToData, shortId } from "../utils/format";
+import { formatDuration, recordToData, shortId } from "../utils/format";
 import AppIcon from "./AppIcon.vue";
 import AsyncState from "./AsyncState.vue";
 import TopologyEdge from "./TopologyEdge.vue";
@@ -24,7 +24,6 @@ const fit = () => fitView({ padding: 0.16, minZoom: 0.75, duration: motionDurati
 let elkPromise: ReturnType<typeof createElk> | null = null;
 let layoutGeneration = 0;
 const flowColor = "var(--oe-success)";
-const graphViewLabels = { nodes: "ROS 节点层级", components: "组件层级", tracepoints: "埋点层级" } as const;
 
 async function createElk() {
   const { default: ELK } = await import("elkjs/lib/elk.bundled.js");
@@ -202,10 +201,8 @@ onBeforeUnmount(() => { layoutGeneration += 1; });
     <header class="panel-heading">
       <div>
         <strong>调用拓扑</strong>
-        <span v-if="topology">{{ topology.topology_source === "declared" ? "清单拓扑" : "观测拓扑" }} · {{ graphViewLabels[topology.view] }}</span>
       </div>
       <span v-if="requestId" class="scope-indicator" :title="requestId">请求 {{ shortId(requestId, 20) }} · 实际值</span>
-      <span v-else class="scope-indicator">{{ metricLabel(metric) }} 聚合</span>
       <label>层级<select v-model="graphView" aria-label="拓扑层级"><option value="nodes">ROS 节点</option><option value="components">组件</option><option value="tracepoints">埋点</option></select></label>
       <label v-if="!requestId">统计值<select v-model="metric" aria-label="拓扑统计值"><option value="p50">P50</option><option value="p95">P95</option><option value="p99">P99</option><option value="maximum">最大值</option><option value="mean">均值</option><option value="minimum">最小值</option></select></label>
       <input v-model="graphSearch" type="search" placeholder="查找拓扑节点" aria-label="查找拓扑节点" />

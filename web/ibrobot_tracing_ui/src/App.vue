@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
-import DetailPane from "./components/DetailPane.vue";
+import { RouterView, useRoute, useRouter } from "vue-router";
 import ProfilerHeader from "./components/ProfilerHeader.vue";
 import ScopeBar from "./components/ScopeBar.vue";
-import TopologyGraph from "./components/TopologyGraph.vue";
 import AsyncState from "./components/AsyncState.vue";
 import WelcomePanel from "./components/WelcomePanel.vue";
 import { useProfilerStore } from "./stores/profiler";
@@ -12,8 +11,28 @@ import { formatInteger, shortId } from "./utils/format";
 import { DETAIL_TABS } from "./utils/routeState";
 import { useProfilerNavigation } from "./useProfilerNavigation";
 import { dismissOutsidePopovers, dismissTopPopover, keepOnePopover } from "./utils/popovers";
+import { asyncView } from "./utils/asyncView";
+import { routeLoadError } from "./router";
+
+const DetailPane = asyncView(() => import("./components/DetailPane.vue"), "分析工作区");
+const TopologyGraph = asyncView(() => import("./components/TopologyGraph.vue"), "拓扑视图");
+
+function retryRoute(): void {
+  if (routeLoadError.value) void router.push(routeLoadError.value.target).catch(() => { /* Keep the recovery panel. */ });
+}
+function reloadRoute(): void {
+  if (routeLoadError.value) window.location.assign(router.resolve(routeLoadError.value.target).href);
+}
+
+async function focusWorkspace(): Promise<void> {
+  await nextTick();
+  if (!isGuide.value && store.analysisState === "ready") document.getElementById("workspace-view-heading")?.focus({ preventScroll: true });
+}
 
 const store = useProfilerStore();
+const route = useRoute();
+const router = useRouter();
+const isGuide = computed(() => route.name === "guide");
 const { analyze, recover } = useProfilerNavigation(store);
 const {
   activeTab,
@@ -54,7 +73,7 @@ function chooseSource(): void {
   store.searchQuery = "";
   store.activeTab = "summary";
   store.closeAnalysis();
-  void nextTick(() => document.querySelector<HTMLElement>(".welcome-panel h1")?.focus());
+  void router.push({ name: "analysis" }).then(() => nextTick(() => document.querySelector<HTMLElement>(".welcome-panel h1")?.focus()));
 }
 
 function beginResize(event: PointerEvent): void {
@@ -74,6 +93,10 @@ function endResize(): void {
 }
 
 function handleKeyboard(event: KeyboardEvent): void {
+  if (isGuide.value) {
+    if (event.key === "Escape" && dismissTopPopover()) event.preventDefault();
+    return;
+  }
   const target = event.target as HTMLElement;
   const editing = target.matches("input, select, textarea, [contenteditable='true']");
   if (event.key === "/" && !editing) {
@@ -115,9 +138,15 @@ watch(selection, async (value, previous) => {
   }
 });
 watch(analysisState, async (value, previous) => {
-  if (value === "ready" && previous !== "ready") {
+  if (!isGuide.value && value === "ready" && previous !== "ready") {
     await nextTick();
     document.getElementById("workspace-view-heading")?.focus({ preventScroll: true });
+  }
+});
+watch(isGuide, async (value, previous) => {
+  if (!value && previous) {
+    await nextTick();
+    (document.getElementById("workspace-view-heading") ?? document.querySelector<HTMLElement>(".welcome-panel h1"))?.focus();
   }
 });
 watch(topologyOpen, (value) => {
@@ -141,10 +170,15 @@ onBeforeUnmount(() => {
 <template>
   <div class="profiler-app" :class="{ resizing }">
     <ProfilerHeader @change-source="chooseSource" />
-    <ScopeBar v-if="analysisState === 'ready'" />
+    <section v-if="routeLoadError" class="context-error" role="alert">
+      <strong>目标页面暂时无法载入</strong><p>当前分析仍保留。请检查连接后重试；资源已更新时可刷新打开目标页面。</p>
+      <div class="state-actions"><button class="button secondary" type="button" @click="retryRoute">重试打开页面</button><button class="button secondary" type="button" @click="reloadRoute">刷新打开目标页面</button><button class="text-button" type="button" @click="routeLoadError = null">继续当前分析</button></div>
+    </section>
+    <ScopeBar v-else-if="!isGuide && analysisState === 'ready'" />
     <div v-else aria-hidden="true" />
-    <main ref="workspace" class="workspace" :class="{ 'with-topology': topologyOpen && analysisState === 'ready' }" :style="{ '--top-pane': `${topPercent}%` }">
-      <WelcomePanel v-if="analysisState === 'idle'" @analyze="analyze" />
+    <main ref="workspace" class="workspace" :class="{ 'with-topology': !isGuide && topologyOpen && analysisState === 'ready' }" :style="{ '--top-pane': `${topPercent}%` }">
+      <RouterView v-if="isGuide" />
+      <WelcomePanel v-else-if="analysisState === 'idle'" @analyze="analyze" />
       <section v-else-if="analysisState === 'loading'" class="analysis-loading">
         <AsyncState state="loading" loading-message="正在解析 trace 文件并准备分析…" />
         <button class="button secondary" type="button" @click="chooseSource">停止等待，返回首页</button>
@@ -179,10 +213,12 @@ onBeforeUnmount(() => {
         @keydown.up.prevent="topPercent = Math.max(30, topPercent - 2)"
         @keydown.down.prevent="topPercent = Math.min(70, topPercent + 2)"
       ><i /></div>
-      <DetailPane />
+      <Suspense @resolve="focusWorkspace"><DetailPane /><template #fallback><AsyncState state="loading" loading-message="正在载入分析工作区…" /></template></Suspense>
       </template>
     </main>
     <footer class="status-bar">
+      <template v-if="isGuide"><span>使用指南 · 命令在对应机器的终端执行</span></template>
+      <template v-else>
       <span class="status-state"><i :class="analysisState" />{{ statusText }}</span>
       <span v-if="summary">{{ formatInteger(summary.analysis.request_count) }} 个请求 · {{ formatInteger(summary.analysis.event_count) }} 个事件</span>
       <span v-if="requestId">请求 {{ shortId(requestId) }}</span>
@@ -195,6 +231,7 @@ onBeforeUnmount(() => {
       <span v-if="capabilities?.authentication === 'none'" class="security-warning">局域网无认证模式</span>
       <span class="status-spacer" />
       <span class="keyboard-hint">/ 过滤 · Esc 关闭检查器 · Alt+1…9 切换视图</span>
+      </template>
     </footer>
   </div>
 </template>

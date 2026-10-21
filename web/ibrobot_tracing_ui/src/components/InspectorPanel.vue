@@ -57,6 +57,19 @@ function asFields(value: unknown): Record<string, unknown> {
 const digest = computed<[string, unknown][]>(() => {
   if (!selection.value) return [];
   const data = selection.value.data;
+  if (selection.value.kind === "span-aggregate") {
+    return [
+      ["范围", data.aggregation_scope || "相同调用路径的聚合"],
+      ["包含墙钟权重", formatDuration(Number(data.value_ns) / 1e6, 3)],
+      ["自身 / 未覆盖权重", formatDuration(Number(data.self_value_ns) / 1e6, 3)],
+      ["占聚合根权重", `${Number(data.percentage).toFixed(2)}%`],
+      ["调用次数 / 请求数", `${formatInteger(data.occurrence_count as number)} / ${formatInteger(data.request_count as number)}`],
+      ["错误 / 未完成 / 无效", `${formatInteger(data.error_count as number)} / ${formatInteger(data.incomplete_count as number)} / ${formatInteger(data.invalid_count as number)}`],
+      ["组件", data.component_id || "未标记"],
+      ["调用路径", Array.isArray(data.path) ? data.path.map((item) => `${asFields(item).name} (${asFields(item).component_id})`).join(" → ") : "未提供"],
+      ["计时含义", "跨请求按调用路径汇总的已埋点墙钟权重，不是单个请求耗时、CPU 用时或业务成功率。"],
+    ];
+  }
   if (selection.value.kind === "warning") {
     return [["含义", data.explanation || "请查看原始诊断"], ["关联请求", data.request_id || "未提供"],
       ["涉及指标", data.metric ? stageLabel(String(data.metric)) : "未提供"]];

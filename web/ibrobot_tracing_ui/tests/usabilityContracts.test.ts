@@ -1,5 +1,6 @@
 import { createPinia, setActivePinia } from "pinia";
 import { createApp, nextTick, type App } from "vue";
+import { createMemoryHistory, createRouter } from "vue-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import HelpGuide from "../src/components/HelpGuide.vue";
 import DetailPane from "../src/components/DetailPane.vue";
@@ -14,6 +15,22 @@ let host: HTMLDivElement | undefined;
 afterEach(() => { app?.unmount(); host?.remove(); app = undefined; vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("task-oriented usability contracts", () => {
+  it("distinguishes a comparison catalog failure from a successfully loaded empty catalog", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    const pinia = createPinia(); setActivePinia(pinia);
+    const store = useProfilerStore();
+    store.analysisState = "ready"; store.analysisId = "analysis";
+    store.sourcesState = "error"; store.sourcesError = "HTTP 503";
+    const retry = vi.spyOn(store, "loadSources").mockResolvedValue();
+    host = document.createElement("div"); document.body.appendChild(host);
+    app = createApp(ComparisonPanel).use(pinia); app.mount(host);
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("trace 文件列表暂时无法读取");
+    expect(host.textContent).not.toContain("没有另一份可比较的 trace");
+    host.querySelector<HTMLButtonElement>(".context-error button")!.click();
+    expect(retry).toHaveBeenCalledOnce();
+    store.sourcesState = "ready"; await nextTick();
+    expect(host.textContent).toContain("没有另一份可比较的 trace");
+  });
   it("interprets supported diagnostics while preserving raw evidence and unknown meanings", () => {
     const raw = "request request-one metric policy_total_reported_ms: error; excluded from request summary";
     expect(explainDiagnostic(raw)).toMatchObject({ requestId: "request-one", metric: "policy_total_reported_ms", raw });
@@ -43,10 +60,16 @@ describe("task-oriented usability contracts", () => {
     button("取消删除").click(); await nextTick(); await nextTick();
     expect(document.activeElement).toBe(button("删除此结果"));
     expect(store.comparisonResultId).toBe("result");
+    remove.mockRejectedValueOnce(new Error("HTTP 503"));
     button("删除此结果").click(); await nextTick();
     button("确认删除结果").click();
+    await vi.waitFor(() => expect(host!.textContent).toContain("删除失败，当前结果和链接已保留"));
+    await nextTick();
+    expect(store.comparisonResultId).toBe("result");
+    expect(document.activeElement).toBe(button("取消删除"));
+    button("确认删除结果").click();
     await vi.waitFor(() => expect(store.comparisonResult).toBeNull());
-    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("已删除缓存比较结果 result");
     expect(document.activeElement).toBe(host.querySelector(".compare-button"));
   });
@@ -58,7 +81,12 @@ describe("task-oriented usability contracts", () => {
     store.searchQuery = "model_call";
     store.requestId = "request-one";
     host = document.createElement("div"); document.body.appendChild(host);
-    app = createApp(HelpGuide).use(pinia); app.mount(host);
+    const router = createRouter({ history: createMemoryHistory(), routes: [
+      { path: "/analysis", name: "analysis", component: {} },
+      { path: "/guide/:topic", name: "guide", component: {} },
+    ] });
+    await router.push("/analysis");
+    app = createApp(HelpGuide).use(pinia).use(router); app.mount(host);
     const panel = host.querySelector<HTMLDetailsElement>(".help-guide")!;
     panel.open = true;
     panel.dispatchEvent(new Event("toggle"));

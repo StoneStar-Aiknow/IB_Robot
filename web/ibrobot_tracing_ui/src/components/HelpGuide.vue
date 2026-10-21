@@ -3,6 +3,7 @@ import { computed, nextTick, ref } from "vue";
 import { useProfilerStore } from "../stores/profiler";
 import { searchHelp } from "../utils/help";
 import AppIcon from "./AppIcon.vue";
+import GuideLink from "./GuideLink.vue";
 
 const store = useProfilerStore();
 const query = ref("");
@@ -30,6 +31,7 @@ function close(): void {
       <div v-if="!topics.length" class="help-empty"><p>没有匹配说明。试试更短的关键词，或查看全部说明。</p><button class="button secondary" type="button" @click="query = ''">清除帮助搜索</button></div>
       <details v-for="topic in topics" :key="`${topic.id}:${query.trim()}`" class="help-topic" :open="Boolean(query.trim()) || topic.id === topics[0]?.id">
         <summary>{{ topic.title }}</summary><ol><li v-for="step in topic.steps" :key="step">{{ step }}</li></ol>
+        <GuideLink v-if="topic.guide" :topic="topic.guide" @click="close">{{ topic.title }}：查看完整指南</GuideLink>
       </details>
     </section>
   </details>

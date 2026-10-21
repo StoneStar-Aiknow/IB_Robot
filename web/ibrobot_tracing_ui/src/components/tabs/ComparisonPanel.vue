@@ -33,6 +33,7 @@ const {
   selectedBaselineSourceId,
   selection,
   sourcesState,
+  sourcesError,
   summary,
 } = storeToRefs(store);
 
@@ -59,6 +60,7 @@ const FLAME_ROW_HEIGHT = 27;
 
 const canCompare = computed(() => (
   analysisState.value === "ready"
+  && sourcesState.value !== "error"
   && Boolean(selectedBaselineSource.value)
   && comparisonState.value !== "loading"
   && Number.isFinite(comparisonRelativeThreshold.value)
@@ -212,7 +214,11 @@ async function confirmDelete(): Promise<void> {
     if (analysisId.value === candidate && comparisonResult.value?.id === resultId) {
       deleteError.value = error instanceof Error ? error.message : "删除请求失败";
     }
-  } finally { deleting.value = false; }
+  } finally {
+    deleting.value = false;
+    await nextTick();
+    if (deleteError.value && store.activeTab === "comparison" && analysisId.value === candidate) deleteCancel.value?.focus();
+  }
 }
 
 function bucketLabel(index: number): string {
@@ -307,10 +313,16 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
       <button class="icon-button" type="button" title="刷新追踪目录" :disabled="sourcesState === 'loading'" @click="store.refreshSources"><AppIcon name="refresh" /><span class="sr-only">刷新追踪目录</span></button>
     </header>
 
+    <section v-if="sourcesState === 'error'" class="context-error" role="alert">
+      <strong>trace 文件列表暂时无法读取</strong>
+      <p>这不表示没有可比较的 trace 文件。请检查追踪服务连接，再重试读取；已有选择和比较结果会保留。</p>
+      <button class="button secondary" type="button" @click="store.loadSources">重试读取 trace 文件</button>
+      <details><summary>查看错误详情</summary><pre>{{ sourcesError }}</pre></details>
+    </section>
     <div v-if="sourcesState === 'loading' && !baselineSources.length" class="comparison-catalog-state" aria-live="polite">
       正在读取追踪目录…
     </div>
-    <div v-else-if="!baselineSources.length" class="comparison-empty state-view">
+    <div v-else-if="sourcesState !== 'error' && !baselineSources.length" class="comparison-empty state-view">
       <AppIcon name="trace" :size="24" />
       <strong>没有另一份可比较的 trace</strong>
       <span>追踪目录中至少需要两份 trace：当前分析作为候选，另一份作为基线。</span>
@@ -318,7 +330,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
       <button class="button secondary" type="button" @click="store.refreshSources">刷新追踪目录</button>
     </div>
 
-    <template v-else>
+    <template v-else-if="baselineSources.length || comparisonResult">
       <form class="comparison-controls" @submit.prevent="runComparison">
         <label class="comparison-control baseline-control">
           <span>基线</span>

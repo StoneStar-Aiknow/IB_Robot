@@ -646,7 +646,7 @@ export interface CriticalPathFilters {
   maxSegments?: number;
 }
 
-export type SelectionKind = "request" | "event" | "span" | "span-summary" | "flow" | "critical-path" | "component" | "edge" | "warning" | "comparison";
+export type SelectionKind = "request" | "event" | "span" | "span-summary" | "span-aggregate" | "flow" | "critical-path" | "component" | "edge" | "warning" | "comparison";
 
 export interface InspectorSelection {
   kind: SelectionKind;

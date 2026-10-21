@@ -41,6 +41,24 @@ describe("non-intrusive analysis panels", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps fallback model-call statistics separate from an unavailable end-to-end boundary", async () => {
+    const store = useProfilerStore();
+    store.analysisId = "analysis"; store.tabState.summary = "ready";
+    const data = summary();
+    data.coverage.boundary = "Dispatch Request -> First Action Execute";
+    data.stages = { inference_ms: { count: 8, minimum: 70, maximum: 90, p50: 80, p95: 85, p99: 90, mean: 80 } };
+    store.summary = data;
+    mount(SummaryPanel);
+    const intro = host.querySelector(".overview-intro")!;
+    expect(intro.textContent).toContain("模型调用开始 → 模型调用结束");
+    expect(intro.textContent).toContain("未提供有效端到端耗时样本");
+    expect(intro.textContent).not.toContain("请求分发 → 首次动作执行");
+    expect(intro.querySelector(".button.primary")?.textContent).toBe("查看模型调用最慢请求");
+    data.stages.total_ms = { count: 8, minimum: 100, maximum: 130, p50: 110, p95: 125, p99: 130, mean: 110 };
+    store.summary = { ...data }; await nextTick();
+    expect(intro.textContent).toContain("请求分发 → 首次动作执行");
+  });
+
   it("makes a truncated diagnostic response visible instead of claiming completeness", () => {
     const store = useProfilerStore();
     store.tabState.warnings = "ready";
@@ -96,7 +114,7 @@ describe("non-intrusive analysis panels", () => {
     store.summary.span_summary_total = 250;
     store.summary.span_summary_truncated = true;
     mount(SummaryPanel);
-    expect(host.textContent).toContain("请求链投影");
+    expect(host.textContent).toContain("未计入统计不代表业务执行失败");
     expect(host.textContent).toContain("未形成投影数值");
     expect(host.textContent).toContain("不等于事件未采到");
     expect(host.textContent).toContain("100 / 250 组，上限 100");

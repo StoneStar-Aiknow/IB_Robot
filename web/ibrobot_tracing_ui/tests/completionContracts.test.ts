@@ -18,6 +18,24 @@ let host: HTMLDivElement | undefined;
 afterEach(() => { app?.unmount(); host?.remove(); vi.restoreAllMocks(); });
 
 describe("failure and provenance presentation", () => {
+  it("shows quantitative aggregate meaning instead of a missing single-request identity", async () => {
+    const pinia = createPinia(); setActivePinia(pinia);
+    const store = useProfilerStore();
+    store.selection = { kind: "span-aggregate", title: "model_call", data: {
+      value_ns: "871686000", self_value_ns: "800000000", percentage: 25.23,
+      occurrence_count: 100, request_count: 80, error_count: 2, incomplete_count: 1, invalid_count: 0,
+      component_id: "policy.inference", path: [{ name: "model_call", component_id: "policy.inference" }],
+    } };
+    host = document.createElement("div"); app = createApp(InspectorPanel).use(pinia); app.mount(host);
+    await nextTick();
+    const digest = host.querySelector(".record-digest")!.textContent;
+    expect(digest).toContain("871.686 ms");
+    expect(digest).toContain("25.23%");
+    expect(digest).toContain("100 / 80");
+    expect(digest).toContain("2 / 1 / 0");
+    expect(digest).not.toContain("主机 / 机器标识");
+    expect(digest).not.toContain("请求未提供");
+  });
   it("distinguishes layout failure from absent trace data and offers page recovery", async () => {
     const pinia = createPinia();
     setActivePinia(pinia);

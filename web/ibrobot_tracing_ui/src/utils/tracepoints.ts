@@ -19,7 +19,7 @@ export function resolveTracepointDescription(
   if (selection.kind === "component") return value(selection.data, "description");
 
   const timelineItem = "label" in selection.data;
-  const kind = timelineItem ? value(selection.data, "kind") : selection.kind === "span-summary" ? "span" : selection.kind;
+  const kind = timelineItem ? value(selection.data, "kind") : ["span-summary", "span-aggregate"].includes(selection.kind) ? "span" : selection.kind;
   if (kind !== "event" && kind !== "span") return "";
   const name = value(selection.data, timelineItem ? "label" : "name");
   const componentId = value(selection.data, "component_id");

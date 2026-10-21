@@ -14,6 +14,10 @@ const primary = computed(() => {
   return { name, stats: name ? metrics[name] : null };
 });
 const excluded = computed(() => Math.max(0, (summary.value?.analysis.request_count ?? 0) - (primary.value.stats?.count ?? 0)));
+const primaryBoundary = computed(() => primary.value.name === "inference_ms"
+  ? "模型调用开始 → 模型调用结束 · 主机侧调用区间；未提供有效端到端耗时样本"
+  : primary.value.name === "total_ms" ? `${boundaryLabel(summary.value?.coverage.boundary || '') || '计时边界以具体记录为准'} · 主机侧观测`
+    : "未形成主要耗时指标，计时边界以具体记录为准");
 
 async function openSlowest(): Promise<void> {
   if (!primary.value.name) return;
@@ -24,7 +28,7 @@ async function openSlowest(): Promise<void> {
   await store.fetchRequests();
   if (store.analysisId !== analysis || store.tabState.requests !== "ready") return;
   const first = store.requests.find((request) => typeof request[primary.value.name] === "number");
-  if (first) await store.navigateToRequest(first.request_id, "critical-path");
+  if (first) await store.navigateToRequest(first.request_id, primary.value.name === "inference_ms" ? "timeline" : "critical-path");
 }
 
 const stages = computed(() => {
@@ -85,24 +89,27 @@ async function openSpanAnalysis(): Promise<void> {
     <div v-if="summary" class="tab-scroll summary-view">
       <section class="overview-intro" aria-label="trace 文件概况">
         <h2>{{ primary.name ? stageLabel(primary.name) : '这份 trace 文件的记录' }}</h2>
-        <p>{{ boundaryLabel(summary.coverage.boundary || '') || '计时边界以具体记录为准' }} · 主机侧观测</p>
+        <p>{{ primaryBoundary }}</p>
         <dl v-if="primary.stats" class="overview-metrics">
           <div><dt>典型耗时 · P50</dt><dd>{{ formatDuration(primary.stats.p50) }}</dd></div>
           <div><dt>高位耗时 · P95</dt><dd>{{ formatDuration(primary.stats.p95) }}</dd></div>
           <div><dt>最慢</dt><dd>{{ formatDuration(primary.stats.maximum) }}</dd></div>
         </dl>
-        <p v-if="primary.stats">共 {{ formatInteger(summary.analysis.request_count) }} 个请求，{{ formatInteger(primary.stats.count) }} 个有此指标，{{ formatInteger(excluded) }} 个未纳入该项统计。<button class="text-button" type="button" @click="store.activeTab = 'warnings'">查看数据质量</button></p>
+        <p v-if="primary.stats">共 {{ formatInteger(summary.analysis.request_count) }} 个请求，其中 {{ formatInteger(primary.stats.count) }} 个可计算上述耗时<span v-if="excluded">，另 {{ formatInteger(excluded) }} 个未计入统计</span>。<button class="text-button" type="button" @click="store.activeTab = 'warnings'">查看数据质量</button></p>
         <div class="state-actions">
-          <button class="button primary" type="button" :disabled="!primary.stats || tabState.requests === 'loading'" @click="openSlowest">查看最慢请求</button>
+          <button class="button primary" type="button" :disabled="!primary.stats || tabState.requests === 'loading'" @click="openSlowest">{{ primary.name === 'inference_ms' ? '查看模型调用最慢请求' : '查看最慢请求' }}</button>
           <button class="button secondary" type="button" @click="store.activeTab = 'requests'">浏览请求列表</button>
           <button class="text-button" type="button" @click="store.activeTab = 'distribution'; store.fetchTab('distribution')">查看延迟分布</button>
         </div>
         <p v-if="tabError.requests" role="alert">{{ tabError.requests }} <button class="text-button" type="button" @click="store.fetchRequests(true)">重试请求列表</button></p>
       </section>
-      <header class="profile-semantic-banner">
-        <strong>请求链投影</strong>
-        <span>阶段延迟仅汇总可唯一关联的请求指标，不代表业务成功或可用性。歧义、错误、不完整记录不纳入该投影，不等于未采到，也不表示需要重试。</span>
-      </header>
+      <details class="overview-metadata">
+        <summary>这些耗时是如何统计的？</summary>
+        <p>系统将同一请求的记录关联起来，计算各阶段耗时。缺少必要记录、无法确定唯一对应关系、记录状态异常或时钟不可比较时，相应耗时不会计入统计。</p>
+        <p>未计入统计不代表业务执行失败；相关记录仍保留在原始 trace 文件中，可继续排查原因。</p>
+        <p>同一个请求中，若各阶段首尾相接、没有重叠或遗漏，且完整覆盖总计时区间，各段耗时之和就等于总耗时。</p>
+        <p>下方表格对各阶段分别统计。各阶段的 P95 相加不一定等于总耗时的 P95；均值只有在上述计时条件成立、且使用同一组请求样本时才可相加。</p>
+      </details>
       <section class="summary-strip">
         <dl><dt>请求</dt><dd>{{ formatInteger(summary.analysis.request_count) }}</dd></dl>
         <dl><dt>事件</dt><dd>{{ formatInteger(summary.analysis.event_count) }}</dd></dl>
@@ -116,7 +123,7 @@ async function openSpanAnalysis(): Promise<void> {
       </details>
 
       <section class="matrix-section">
-        <header><strong>各阶段耗时</strong><span>全部请求 · 阶段可能重叠，不直接相加</span></header>
+        <header><strong>各阶段耗时</strong><span>各阶段分别统计，相加不一定等于总耗时</span></header>
         <div class="data-grid-wrap">
           <table class="data-grid summary-matrix">
             <thead><tr><th>阶段</th><th class="align-right">最小</th><th class="align-right">P50 中位</th><th class="align-right">P95 高位</th><th class="align-right">P99 高位</th><th class="align-right">最大</th><th class="align-right">均值</th><th class="align-right">样本</th></tr></thead>

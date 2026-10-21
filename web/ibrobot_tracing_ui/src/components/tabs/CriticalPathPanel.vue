@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import type { CriticalPathBottleneck, CriticalPathSegment, JsSafeInteger } from "../../api/types";
 import { useProfilerStore } from "../../stores/profiler";
@@ -13,6 +13,8 @@ const store = useProfilerStore();
 const { criticalPath, requestId, tabError, tabState } = storeToRefs(store);
 const selectedSegmentId = ref("");
 const chartCursor = ref(0);
+const showAllBottlenecks = ref(false);
+const segmentDetails = ref<HTMLDetailsElement | null>(null);
 const chart = ref<SVGSVGElement | null>(null);
 const restrictedScope = computed(() => Boolean(criticalPath.value?.component_id));
 const gapLabel = computed(() => restrictedScope.value ? "当前范围未归因" : "未归因间隙");
@@ -53,6 +55,13 @@ const geometry = computed(() => buildCriticalPathGeometry(
 ));
 const orderedSegments = computed(() => geometry.value.rects.map((rect) => rect.segment));
 const bottlenecks = computed(() => [...(criticalPath.value?.bottlenecks ?? [])].sort((left, right) => left.rank - right.rank));
+const visibleBottlenecks = computed(() => showAllBottlenecks.value ? bottlenecks.value : bottlenecks.value.slice(0, 3));
+
+async function openSegments(): Promise<void> {
+  if (segmentDetails.value) segmentDetails.value.open = true;
+  await nextTick();
+  segmentDetails.value?.querySelector<HTMLButtonElement>(".segment-inspect")?.focus();
+}
 const diagnostics = computed(() => [...(criticalPath.value?.diagnostics ?? [])].sort((left, right) => right.count - left.count || left.code.localeCompare(right.code)));
 const axisTicks = computed(() => Array.from({ length: 5 }, (_, index) => {
   const ratio = index / 4;
@@ -115,6 +124,7 @@ function segmentFill(segment: CriticalPathSegment): string {
 watch(criticalPath, () => {
   selectedSegmentId.value = "";
   chartCursor.value = 0;
+  showAllBottlenecks.value = false;
 });
 </script>
 
@@ -155,8 +165,8 @@ watch(criticalPath, () => {
           <summary>计时边界：{{ boundaryLabel(criticalPath.boundary_source) || '未提供' }} · 查看归因组成</summary>
           <div class="measurement-groups">
             <section aria-label="计时边界"><h2>计时边界</h2><dl>
-              <div><dt>起点</dt><dd>{{ criticalPath.boundary_start_source || '未提供' }}<code>{{ criticalPath.start_ns ?? '未提供' }} ns</code></dd></div>
-              <div><dt>终点</dt><dd>{{ criticalPath.boundary_end_source || '未提供' }}<code>{{ criticalPath.end_ns ?? '未提供' }} ns</code></dd></div>
+              <div><dt>起点</dt><dd>{{ boundaryLabel(criticalPath.boundary_start_source) || '未提供' }}<code>{{ criticalPath.start_ns ?? '未提供' }} ns</code></dd></div>
+              <div><dt>终点</dt><dd>{{ boundaryLabel(criticalPath.boundary_end_source) || '未提供' }}<code>{{ criticalPath.end_ns ?? '未提供' }} ns</code></dd></div>
               <div><dt>原始边界代码</dt><dd><code>{{ criticalPath.boundary_source || '未提供' }}</code></dd></div>
             </dl></section>
             <section aria-label="归因组成"><h2>归因组成</h2><dl>
@@ -178,7 +188,7 @@ watch(criticalPath, () => {
           <span>已返回 {{ formatInteger(criticalPath.returned_segments) }} 个分段（{{ formatNs(criticalPath.returned_duration_ns) }}）；尾部省略 {{ formatInteger(criticalPath.omitted_segments) }} 个分段，精确时长 {{ formatNs(criticalPath.omitted_duration_ns) }}。原因：<code>{{ criticalPath.truncation_reason }}</code></span>
         </div>
 
-        <div v-if="diagnostics.length" class="critical-path-diagnostic-strip" aria-label="关键路径诊断摘要">
+        <div v-if="diagnostics.length" class="critical-path-diagnostic-strip" role="region" tabindex="0" aria-label="关键路径诊断摘要">
           <strong>诊断</strong>
           <span v-for="item in diagnostics" :key="item.code" :title="item.message"><code>{{ item.code }}</code> {{ formatInteger(item.count) }}</span>
         </div>
@@ -189,7 +199,7 @@ watch(criticalPath, () => {
               <strong id="critical-path-chart-heading">墙钟分区时间线</strong>
             </div>
             <span class="critical-path-legend"><i class="span" />Span 组件 <i class="flow" />Flow <i class="gap" />Gap <template v-if="criticalPath.truncated"><i class="omitted" />省略尾部</template></span>
-            <button class="text-button" type="button" @click="($el as HTMLElement).querySelector<HTMLButtonElement>('.segment-inspect')?.focus()">查看分段列表</button>
+            <button class="text-button" type="button" @click="openSegments">查看分段列表</button>
           </header>
           <div v-if="numericNs(criticalPath.duration_ns) > 0" class="critical-path-chart-wrap">
             <svg
@@ -264,27 +274,27 @@ watch(criticalPath, () => {
 
         <div class="critical-path-detail-grid">
           <section class="critical-path-bottlenecks">
-            <header><div><strong>排序瓶颈</strong><span>按归因墙钟总量</span></div><b>{{ formatInteger(bottlenecks.length) }}</b></header>
+            <header><div><strong>耗时最多的记录</strong><span>按归因墙钟排序 · 默认显示前三项</span></div><b>{{ formatInteger(bottlenecks.length) }} 项</b></header>
             <div class="critical-path-table-wrap">
               <table>
-                <thead><tr><th>排名</th><th>记录</th><th>位置</th><th>时长</th><th>占比</th><th>分段</th></tr></thead>
+                <caption class="sr-only">已归因记录按耗时排序，点击名称查看原始证据入口</caption>
+                <thead><tr><th>排名</th><th>记录 / 组件</th><th>归因时长</th><th>占比</th></tr></thead>
                 <tbody>
-                  <tr v-if="!bottlenecks.length"><td colspan="6" class="empty-cell">没有可排序的已归因瓶颈。</td></tr>
-                  <tr v-for="item in bottlenecks" v-else :key="`${item.rank}:${item.kind}:${item.source_id}`">
+                  <tr v-if="!bottlenecks.length"><td colspan="4" class="empty-cell">没有可排序的已归因瓶颈。</td></tr>
+                  <tr v-for="item in visibleBottlenecks" v-else :key="`${item.rank}:${item.kind}:${item.source_id}`">
                     <td class="numeric">#{{ item.rank }}</td>
-                    <td><button class="text-button evidence-button" type="button" :title="item.label" @click="inspectBottleneck(item)">{{ item.label || "—" }}</button><small>{{ kindLabel(item.kind) }} · {{ recordStatusLabel(item.status) }}</small></td>
-                    <td><code :title="owner(item)">{{ owner(item) }}</code></td>
+                    <td><button class="text-button evidence-button" type="button" :title="item.label" @click="inspectBottleneck(item)">{{ item.label || "—" }}</button><code>{{ owner(item) }}</code><small>{{ kindLabel(item.kind) }} · {{ recordStatusLabel(item.status) }} · {{ formatInteger(item.segment_count) }} 段</small></td>
                     <td class="numeric">{{ formatNs(item.duration_ns) }}</td>
                     <td class="numeric">{{ item.percentage.toFixed(2) }}%</td>
-                    <td class="numeric">{{ formatInteger(item.segment_count) }}</td>
                   </tr>
                 </tbody>
               </table>
             </div>
+            <button v-if="bottlenecks.length > 3" class="text-button ranking-toggle" type="button" :aria-expanded="showAllBottlenecks" @click="showAllBottlenecks = !showAllBottlenecks">{{ showAllBottlenecks ? '收起为前三项' : `查看全部 ${bottlenecks.length} 项` }}</button>
           </section>
 
-          <section class="critical-path-segments-section">
-            <header><div><strong>按时间分段</strong><span>打开归因详情，可继续查看原始记录</span></div><b>{{ formatInteger(orderedSegments.length) }}</b></header>
+          <details ref="segmentDetails" class="critical-path-segments-section">
+            <summary>按时间分段 · {{ formatInteger(orderedSegments.length) }} 段 · 查看完整明细</summary>
             <div class="critical-path-table-wrap segment-table-wrap">
               <table class="critical-path-segment-table">
                 <thead><tr><th>#</th><th>偏移</th><th>记录</th><th>时长</th><th>占比</th><th>类型</th><th>组件 / 边</th><th>状态</th></tr></thead>
@@ -309,7 +319,7 @@ watch(criticalPath, () => {
                 </tbody>
               </table>
             </div>
-          </section>
+          </details>
 
           <section v-if="diagnostics.length" class="critical-path-diagnostics">
             <header><div><strong>诊断详情</strong><span>边界、记录排除与时钟完整性</span></div><b>{{ formatInteger(diagnostics.length) }}</b></header>

@@ -51,13 +51,7 @@ const rows = computed(() => {
   const filtered = query
     ? requests.value.filter((request) => Object.values(request).some((value) => String(value ?? "").toLocaleLowerCase("zh-CN").includes(query)))
     : [...requests.value];
-  return filtered
-    .sort((a, b) => {
-      const left = Number(a[requestSortBy.value] ?? Number.NEGATIVE_INFINITY);
-      const right = Number(b[requestSortBy.value] ?? Number.NEGATIVE_INFINITY);
-      return (left - right) * (requestDescending.value ? -1 : 1);
-    })
-    .map((row) => recordToData(row));
+  return filtered.map((row) => recordToData(row));
 });
 
 function select(row: Record<string, unknown>): void {

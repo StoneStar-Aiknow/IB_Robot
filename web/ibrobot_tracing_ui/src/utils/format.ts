@@ -26,6 +26,10 @@ export function boundaryLabel(value: string): string {
   return ({
     dispatch_request_to_first_action_execute: "请求分发 → 首次动作执行",
     "Dispatch Request -> First Action Execute": "请求分发 → 首次动作执行",
+    partial_boundary_fallback: "部分业务端点缺失，使用观测记录补齐边界",
+    selected_record_bounds_fallback: "业务端点缺失，使用当前观测范围",
+    "fallback:selected_records": "当前选中记录的时间边界",
+    "fallback:preferred_anchor": "可用的业务端点",
   })[value] ?? value;
 }
 

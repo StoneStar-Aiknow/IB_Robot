@@ -107,6 +107,18 @@ npm run build --prefix web/ibrobot_tracing_ui
 `build_tracing_web.sh`；前端依赖变化时先显式重跑 `npm ci`。Node.js 只用于构建，Web server
 运行阶段不需要 Node.js。
 
+### 静态资源交付
+
+服务对可压缩且超过500字节的响应按客户端 `Accept-Encoding` 协商gzip，保留未压缩客户端支持，
+并由中间件设置 `Vary: Accept-Encoding`。API响应的JSON语义不变。
+交付适配层尊重gzip的q值（含q=0），Range请求和206响应保留原始表示，HEAD不压缩。
+gzip响应使用弱ETag，避免与identity字节不同却共用强validator；静态GET/HEAD支持
+If-None-Match和If-Modified-Since的304（ETag条件优先）。本地和已部署Starlette版本本已跳过206，
+适配层用于明确不同受支持版本的共同契约，而非声称此前生产分片已损坏。
+`assets/` 内含构建hash的资源使用 `Cache-Control: public, max-age=31536000, immutable`；
+HTML首页、SPA深链接及非hash文件使用 `no-cache`，以便发布后读取新入口。生产发布先复制全部hash资源，
+再原子替换index，并保留旧hash资源供已有页面继续加载。不要用相同hash文件名发布不同内容。
+
 构建后可从仓库根目录验证（需已有 pytest 和 Web 测试依赖）：
 
 ```bash

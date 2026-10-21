@@ -162,6 +162,11 @@ onBeforeUnmount(() => resizeObserver?.disconnect());
             <div><strong id="distribution-chart-title">请求延迟直方图</strong><span>柱高表示样本数</span></div>
             <span class="tail-legend">P95 尾部区间使用深色柱，并以虚线标出起点</span>
           </header>
+          <label class="chart-picker">选择延迟区间，查看其中的请求
+            <select aria-label="选择延迟区间" :value="selectedBucketIndex" @change="selectBucket(Number(($event.target as HTMLSelectElement).value))">
+              <option v-for="bucket in distribution.buckets" :key="bucket.index" :value="bucket.index">桶 {{ bucket.index + 1 }} · {{ formatDuration(bucket.start) }}–{{ formatDuration(bucket.end) }} · {{ bucket.count }} 个样本</option>
+            </select>
+          </label>
           <div ref="chartHost" class="distribution-chart-host">
             <svg
               class="distribution-chart"

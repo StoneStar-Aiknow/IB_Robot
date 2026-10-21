@@ -43,6 +43,12 @@ const dragging = ref(false);
 const hoverNode = ref<RequestSpanProfileNode | AggregateSpanProfileNode | null>(null);
 const hoverPoint = ref({ x: 0, y: 0 });
 const hoverLane = ref(0);
+const nodeListOpen = ref(false);
+const nodeListOffset = ref(0);
+const NODE_PAGE_SIZE = 20;
+const listedNodes = computed(() => activeLayout.value.rects.map((rect) => rect.node).filter(matches));
+const nodePage = computed(() => listedNodes.value.slice(nodeListOffset.value, nodeListOffset.value + NODE_PAGE_SIZE));
+watch([spanProfile, searchQuery, focusId], () => { nodeListOffset.value = 0; });
 let resizeObserver: ResizeObserver | null = null;
 let panStartX = 0;
 let panStartScroll = 0;
@@ -150,7 +156,12 @@ function inspectRequest(node: RequestSpanProfileNode): void {
 }
 
 function inspectAggregate(node: AggregateSpanProfileNode): void {
-  store.selection = { kind: "span", title: node.name, subtitle: `${node.component_id} · 聚合路径`, data: recordToData(node) };
+  store.selection = { kind: "span-aggregate", title: node.name, subtitle: `${node.component_id} · 聚合路径`, data: { ...recordToData(node), aggregation_scope: `全部请求 · ${store.componentId ? `组件范围 ${store.componentId}` : '全部组件'} · 相同调用路径` } };
+}
+
+function inspectListed(node: RequestSpanProfileNode | AggregateSpanProfileNode): void {
+  if ("occurrence_id" in node) inspectRequest(node);
+  else inspectAggregate(node);
 }
 
 function requestNodeLabel(node: RequestSpanProfileNode): string {
@@ -245,7 +256,7 @@ function movePan(event: PointerEvent): void {
 function endPan(event: PointerEvent): void {
   if (!dragging.value) return;
   dragging.value = false;
-  chartScroller.value?.releasePointerCapture(event.pointerId);
+  if (chartScroller.value?.hasPointerCapture(event.pointerId)) chartScroller.value.releasePointerCapture(event.pointerId);
 }
 
 function handleWheel(event: WheelEvent): void {
@@ -307,13 +318,13 @@ onBeforeUnmount(() => {
     </header>
 
     <div class="profile-toolbar">
-      <div class="profile-segment" aria-label="Span 分析模式">
+      <div class="profile-segment" role="group" aria-label="Span 分析模式">
         <button type="button" :aria-pressed="spanAnalysisMode === 'call-tree'" :class="{ active: spanAnalysisMode === 'call-tree' }" @click="setMode('call-tree')">调用树</button>
         <button type="button" :aria-pressed="spanAnalysisMode === 'request'" :class="{ active: spanAnalysisMode === 'request' }" @click="setMode('request')">请求区间</button>
         <button type="button" :aria-pressed="spanAnalysisMode === 'aggregate'" :class="{ active: spanAnalysisMode === 'aggregate' }" @click="setMode('aggregate')">全部请求聚合</button>
       </div>
       <span class="profile-toolbar-spacer" />
-      <div v-if="spanAnalysisMode !== 'call-tree'" class="profile-zoom" aria-label="剖析图缩放">
+      <div v-if="spanAnalysisMode !== 'call-tree'" class="profile-zoom" role="group" aria-label="剖析图缩放">
         <button type="button" title="缩小（-）" :disabled="zoom <= 0.75" @click="setZoom(zoom / 1.25)">−</button>
         <code>{{ Math.round(zoom * 100) }}%</code>
         <button type="button" title="放大（+）" :disabled="zoom >= 8" @click="setZoom(zoom * 1.25)">+</button>
@@ -330,16 +341,15 @@ onBeforeUnmount(() => {
       <dl><dt>Span 次数</dt><dd>{{ formatInteger(spanProfile.totals.occurrence_count) }}</dd></dl>
       <dl><dt>请求数</dt><dd>{{ formatInteger(spanProfile.totals.request_count) }}</dd></dl>
       <dl><dt>错误 / 未完成</dt><dd>{{ formatInteger(spanProfile.totals.error_count) }} / {{ formatInteger(spanProfile.totals.incomplete_count) }}</dd></dl>
-      <dl><dt>选中墙钟并集</dt><dd>{{ formatNs(numericNs(spanProfile.totals.selected_wall_union_ns)) }}</dd></dl>
-      <dl><dt>并发系数</dt><dd>{{ spanProfile.totals.concurrency_factor.toFixed(2) }}×</dd></dl>
     </div>
+    <details v-if="spanProfile" class="profile-extra-stats"><summary>墙钟并集与并发信息</summary><dl><dt>选中墙钟并集</dt><dd>{{ formatNs(numericNs(spanProfile.totals.selected_wall_union_ns)) }}</dd><dt>并发系数</dt><dd>{{ spanProfile.totals.concurrency_factor.toFixed(2) }}×</dd></dl><p>只描述已埋点区间的覆盖与重叠，不代表 CPU 或设备利用率。</p></details>
 
     <div v-if="spanProfile?.truncated" class="profile-truncation" role="status">
       <AppIcon name="warning" :size="14" />
       <strong>结果已截断</strong>
       <span>服务端因 {{ spanProfile.truncation_reason || "节点上限" }} 仅返回 {{ formatInteger(spanProfile.returned_nodes) }} / {{ formatInteger(spanProfile.total_nodes) }} 个节点，子树可能不完整。</span>
     </div>
-    <div v-if="diagnosticItems.length" class="profile-diagnostics" aria-label="诊断摘要">
+    <div v-if="diagnosticItems.length" class="profile-diagnostics" role="region" tabindex="0" aria-label="诊断摘要">
       <strong>诊断</strong>
       <span v-for="item in diagnosticItems" :key="item.code" :title="item.title"><code>{{ item.code }}</code> {{ formatInteger(item.count) }}</span>
     </div>
@@ -368,6 +378,21 @@ onBeforeUnmount(() => {
       loading-message="正在计算 Span 墙钟剖析…"
       @retry="store.fetchTab('span-profile', true)"
     >
+      <details class="profile-node-picker" @toggle="nodeListOpen = ($event.target as HTMLDetailsElement).open">
+        <summary>用列表选择节点（含小片段）</summary>
+        <div v-if="nodeListOpen">
+          <label class="chart-picker">筛选节点名称或组件<input v-model="searchQuery" type="search" aria-label="筛选图中节点" /></label>
+          <p role="status">{{ listedNodes.length ? `${nodeListOffset + 1}–${Math.min(nodeListOffset + NODE_PAGE_SIZE, listedNodes.length)} / ${listedNodes.length} 个节点` : '没有匹配节点，请调整筛选。' }}</p>
+          <ul class="profile-node-list">
+            <li v-for="node in nodePage" :key="node.id">
+              <button class="text-button" type="button" :aria-label="`检查节点 ${node.name}，${node.component_id}`" @click="inspectListed(node)">{{ node.name }}<small>{{ node.component_id || '未标记组件' }}</small></button>
+              <span>{{ formatNs(numericNs('value_ns' in node ? node.value_ns : node.duration_ns)) }}</span>
+              <button v-if="'value_ns' in node" class="button secondary" type="button" :aria-label="`聚焦子树 ${node.name}`" @click="focusAggregate(node)">聚焦</button>
+            </li>
+          </ul>
+          <div class="node-list-pages"><button class="button secondary" type="button" :disabled="!nodeListOffset" @click="nodeListOffset = Math.max(0, nodeListOffset - NODE_PAGE_SIZE)">上一组节点</button><button class="button secondary" type="button" :disabled="nodeListOffset + NODE_PAGE_SIZE >= listedNodes.length" @click="nodeListOffset += NODE_PAGE_SIZE">下一组节点</button></div>
+        </div>
+      </details>
       <div
         ref="chartScroller"
         class="profile-chart-scroll"

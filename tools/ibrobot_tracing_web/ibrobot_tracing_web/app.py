@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.responses import Response as FastAPIResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -30,6 +31,7 @@ from ibrobot_tracing.projection import (
 
 from .catalog import CatalogSnapshot, SourceCatalog, SourceChangedError, SourceNotFoundError, UnsafeSourceError
 from .config import WebConfig, validate_lan_exposure
+from .delivery import DeliveryMiddleware, static_response
 from .jobs import (
     AnalysisEntry,
     AnalysisManager,
@@ -323,6 +325,7 @@ def create_app(
     app.state.catalog = catalog
     app.state.analysis_manager = manager
     app.state.comparison_manager = comparison_manager
+    app.add_middleware(DeliveryMiddleware)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(config.allowed_hosts))
     if config.cors_origins:
         app.add_middleware(
@@ -820,18 +823,23 @@ def create_app(
         asset_roots = {web_root, index_path.resolve().parent}
 
         @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
-        def web_index() -> FileResponse:
-            return FileResponse(index_path)
+        def web_index(request: Request) -> Response:
+            return static_response(index_path, request, "no-cache")
 
         @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
-        def web_asset_or_route(path: str) -> FileResponse:
+        def web_asset_or_route(path: str, request: Request) -> Response:
             if path == "api" or path.startswith("api/") or path == "healthz" or path.startswith("healthz/"):
                 raise HTTPException(status_code=404, detail="Not Found")
             asset_path = (web_root / path).resolve()
             if any(asset_path.is_relative_to(root) for root in asset_roots) and asset_path.is_file():
-                return FileResponse(asset_path)
+                hashed = path.startswith("assets/") and re.fullmatch(
+                    r".+-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|png|svg)", asset_path.name
+                )
+                return static_response(
+                    asset_path, request, "public, max-age=31536000, immutable" if hashed else "no-cache"
+                )
             if path.startswith("assets/") or Path(path).suffix:
                 raise HTTPException(status_code=404, detail="Not Found")
-            return FileResponse(index_path)
+            return static_response(index_path, request, "no-cache")
 
     return app
