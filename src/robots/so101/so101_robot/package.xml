@@ -44,6 +44,7 @@
   <test_depend>python3-pytest</test_depend>
   <!-- new launch-builder tests compose/inspect sim_models scenes -->
   <test_depend>sim_models</test_depend>
+  <test_depend>robot_runtime</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

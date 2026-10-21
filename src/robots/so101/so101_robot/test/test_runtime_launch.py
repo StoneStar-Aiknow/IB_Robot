@@ -388,3 +388,193 @@ def test_advertised_camera_frames_are_identical_on_every_platform():
         if param.get("name") == "frame_name"
     }
     assert sensor_frames == {name: frames[name]["mujoco"] for name in cameras}
+
+
+# ---------------------------------------------------------------------------
+# runtime-peripheral-overrides: D7 fragment application, D8 effective-value
+# consistency and D9 fail-fast on this provider (the fragment is the
+# serialized robot-configuration layer handed to the runtime)
+# ---------------------------------------------------------------------------
+
+
+def _node_params(node):
+    from launch import LaunchContext
+    from launch_ros.utilities import evaluate_parameters
+
+    params = {}
+    for entry in evaluate_parameters(LaunchContext(), node._Node__parameters):
+        params.update(entry)
+    return params
+
+
+def _fragment(tmp_path, peripherals):
+    path = tmp_path / "peripheral_overrides.yaml"
+    path.write_text(yaml.safe_dump({"peripherals": peripherals}), encoding="utf-8")
+    return str(path)
+
+
+def _facade_description(actions):
+    import json
+
+    facade = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "runtime_facade"
+    )
+    return json.loads(_node_params(facade)["interface_description_json"])
+
+
+def _synthetic_description(actions):
+    import json
+
+    synthetic = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "synthetic_perception"
+    )
+    return json.loads(_node_params(synthetic)["description_json"])
+
+
+def test_fragment_disabling_a_camera_removes_it_from_description_and_actions(tmp_path):
+    """D7: a fragment disabling the declared `front` camera removes it from
+    the live description and from the physical and synthetic actions alike."""
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "front", "disabled": True}])
+
+    # physical: no realsense driver chain for front, description omits it
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    description = _facade_description(actions)
+    assert not any(name.startswith("camera.front.") for name in description["interfaces"])
+    executables = {node._Node__node_executable for node in actions if isinstance(node, Node)}
+    assert "realsense2_camera_node" not in executables
+    assert not any("front" in str(node._Node__node_name) for node in actions if isinstance(node, Node))
+
+    # sdk: the synthetic perception description omits the camera too
+    actions = _render({"use_sim": "true", "peripherals": fragment})
+    synthetic = _synthetic_description(actions)
+    assert not any(name.startswith("camera.front.") for name in synthetic["interfaces"])
+    # and the other cameras stay
+    assert "camera.top.color" in synthetic["interfaces"]
+
+
+def test_override_top_resolution_reaches_every_consumer(tmp_path):
+    """D8: one composed value (top -> 1280x720@15) reaches the live
+    description, the SDK synthetic-perception description, the physical driver
+    parameters and the rendered Gazebo sensor identically."""
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "top", "width": 1280, "height": 720, "fps": 15}])
+
+    # physical: the usb_cam driver parameters carry the value
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    driver = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "usb_cam_node_exe"
+    )
+    params = _node_params(driver)
+    assert (params["image_width"], params["image_height"], params["framerate"]) == (1280, 720, 15.0)
+    description = _facade_description(actions)
+    assert description["interfaces"]["camera.top.color"]["configured_profile"] == {
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "encoding": "rgb8",
+    }
+
+    # sdk: the synthetic publishers serve exactly the same profile
+    actions = _render({"use_sim": "true", "peripherals": fragment})
+    synthetic = _synthetic_description(actions)
+    assert synthetic["interfaces"]["camera.top.color"]["configured_profile"]["width"] == 1280
+    assert synthetic["interfaces"]["camera.top.color"]["configured_profile"]["fps"] == 15
+
+    # gazebo: the rendered URDF sensor carries the dimensions and rate
+    actions = _render({"use_sim": "true", "sim_platform": "gazebo", "peripherals": fragment})
+    publisher = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "robot_state_publisher"
+    )
+    urdf = _node_params(publisher)["robot_description"]
+    sensor = re.search(r'<sensor type="camera" name="top_camera">.*?</sensor>', urdf, re.S).group(0)
+    assert "<width>1280</width>" in sensor and "<height>720</height>" in sensor
+    assert "<update_rate>15</update_rate>" in sensor
+    gazebo_description = _facade_description(actions)
+    assert gazebo_description["interfaces"]["camera.top.color"]["configured_profile"]["width"] == 1280
+
+    # mujoco: the description carries the rendered dimensions; the rate is the
+    # plugin's single camera rate (so101-mujoco D5), not the per-camera fps
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "peripherals": fragment})
+    mujoco_description = _facade_description(actions)
+    configured = mujoco_description["interfaces"]["camera.top.color"]["configured_profile"]
+    assert (configured["width"], configured["height"]) == (1280, 720)
+    from robot_runtime.mujoco import mujoco_camera_publish_rate
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(_PROFILE)
+    merged = merge_peripherals_for_test(profile, fragment)
+    assert configured["fps"] == float(mujoco_camera_publish_rate({**profile, "peripherals": merged}))
+
+
+def merge_peripherals_for_test(profile, fragment_path):
+    from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
+
+    return merge_peripherals(profile.get("peripherals"), load_peripherals_file(fragment_path).get("peripherals"))
+
+
+def test_override_front_depth_settings_reach_driver_and_description(tmp_path):
+    """D8: depth_* values reach the physical RealSense driver and the
+    description identically; on Gazebo the depth streams advertise the colour
+    dimensions the sensor renders."""
+    fragment = _fragment(
+        tmp_path,
+        [
+            {
+                "type": "camera",
+                "name": "front",
+                "width": 1280,
+                "height": 720,
+                "fps": 30,
+                "depth_width": 640,
+                "depth_height": 480,
+                "depth_fps": 30,
+            }
+        ],
+    )
+
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    driver = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "realsense2_camera_node"
+    )
+    params = _node_params(driver)
+    assert params["rgb_camera.color_profile"] == "1280x720x30"
+    assert params["depth_module.depth_profile"] == "640x480x30"
+    description = _facade_description(actions)
+    depth = description["interfaces"]["camera.front.depth"]["configured_profile"]
+    assert (depth["width"], depth["height"], depth["fps"]) == (640, 480, 30)
+
+    # gazebo renders one camera at the colour dims; the depth streams advertise
+    # exactly that (D8), never the physical depth_* overrides
+    actions = _render({"use_sim": "true", "sim_platform": "gazebo", "peripherals": fragment})
+    gazebo_description = _facade_description(actions)
+    depth = gazebo_description["interfaces"]["camera.front.depth"]["configured_profile"]
+    assert (depth["width"], depth["height"], depth["fps"]) == (1280, 720, 30)
+
+
+def test_misspelled_partial_fragment_fails_the_runtime_launch_setup(tmp_path):
+    """D9: a misspelled partial entry raises inside the runtime launch setup
+    (the OpaqueFunction), before any process starts — the same error the
+    runtime merge reports through generic launch."""
+    import pytest
+
+    from robot_runtime.interface_description import InterfaceDescriptionError
+
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "tpo", "width": 1280}])
+    with pytest.raises(InterfaceDescriptionError, match=r"\('camera', 'tpo'\) is not declared"):
+        _render({"use_sim": "true", "peripherals": fragment})
+
+
+def test_launch_declares_the_peripherals_argument():
+    """D7 (m3): the provider's real launch description declares the
+    peripherals argument every provider contract requires."""
+    from launch.actions import DeclareLaunchArgument
+
+    def text(value):
+        return "".join(part.text if hasattr(part, "text") else str(part) for part in value)
+
+    description = _launch_module().generate_launch_description()
+    names = {
+        text(action._DeclareLaunchArgument__name)
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
+    }
+    assert "peripherals" in names

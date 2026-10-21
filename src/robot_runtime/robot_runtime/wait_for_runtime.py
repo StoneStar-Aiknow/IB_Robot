@@ -22,8 +22,19 @@ from robot_runtime.contract import GET_STATUS_SERVICE
 from robot_runtime.interface_description import check_interface_requirements, validate_description, write_description
 
 
-def validate_runtime_snapshot(status, *, runtime_name, required=(), instance_id="", interfaces=(), requirements=None):
-    """Check identity, capabilities and requested public streams before admitting consumers."""
+def validate_runtime_snapshot(
+    status, *, runtime_name, required=(), instance_id="", interfaces=(), requirements=None, declared_interfaces=()
+):
+    """Check identity, capabilities and requested public streams before admitting consumers.
+
+    ``interfaces`` are full readiness requirements (publish topics must be
+    ready with a fresh sample, and the caller may check their ROS graph
+    endpoints). ``declared_interfaces`` only require the runtime's public
+    description to DECLARE the interface (with a sane kind/direction) — a
+    declaration gate for consumers whose own startup does not depend on a
+    live sample, so a slow-to-warm driver or a simulator that publishes a
+    stream late cannot block the shared readiness barrier.
+    """
     if status.runtime_name != runtime_name:
         raise ValueError(f"runtime identity {status.runtime_name!r} != expected {runtime_name!r}")
     if status.lifecycle not in ("ACTIVE", "DEGRADED"):
@@ -41,6 +52,14 @@ def validate_runtime_snapshot(status, *, runtime_name, required=(), instance_id=
         raise ValueError("descriptor identity does not match RuntimeStatus")
     if instance_id and identity["id"] != instance_id:
         raise ValueError(f"robot instance {identity['id']!r} != expected {instance_id!r}")
+    for name in declared_interfaces:
+        spec = description["interfaces"].get(name)
+        if spec is None:
+            raise ValueError(f"runtime does not declare interface {name!r}")
+        if spec["kind"] != "topic" or spec["direction"] != "publish":
+            raise ValueError(
+                f"declared interface {name!r} must be a published topic, got {spec['kind']}/{spec['direction']}"
+            )
     for name in interfaces:
         spec = description["interfaces"].get(name)
         if spec is None:
@@ -109,6 +128,12 @@ def main(args=None):
     )
     parser.add_argument("--require-interfaces", nargs="*", default=[])
     parser.add_argument(
+        "--declared-interfaces",
+        nargs="*",
+        default=[],
+        help="interfaces the runtime's public description must declare (no readiness, freshness or graph check)",
+    )
+    parser.add_argument(
         "--interface-requirements",
         type=json.loads,
         default={},
@@ -156,6 +181,7 @@ def main(args=None):
                         instance_id=ns.instance_id,
                         interfaces=ns.require_interfaces,
                         requirements=ns.interface_requirements,
+                        declared_interfaces=ns.declared_interfaces,
                     )
                     validate_endpoint_graph(node, description, ns.require_interfaces)
                     if ns.description_output:

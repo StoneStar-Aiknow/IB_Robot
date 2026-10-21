@@ -54,14 +54,56 @@ _POINTCLOUD_TYPE = "sensor_msgs/msg/PointCloud2"
 
 
 def load_peripherals_file(path: str) -> dict[str, Any]:
-    """Load a deployment peripherals fragment ``{peripherals: [...], fast_lio: {...}}``."""
+    """Load and structurally validate a peripherals fragment (D6).
+
+    The fragment format is ``{peripherals: [...], fast_lio: {...}}``; an
+    empty path yields ``{}``, and so does an empty document. This is the one
+    structural loader every fragment source uses (runtime launches, the
+    facade/mock nodes, launch_support and the offline CLI): structural errors
+    name the file so every caller reports the same message for the same
+    malformed file. An explicitly null ``peripherals``/``fast_lio`` value is
+    an error, distinct from a missing key.
+    """
     raw = (path or "").strip()
     if not raw:
         return {}
-    with open(resolve_path(raw), encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    resolved = resolve_path(raw)
+    try:
+        with open(resolved, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"peripherals file is not valid YAML: {raw} ({exc})") from exc
+    except OSError as exc:
+        raise ValueError(f"peripherals file is unreadable: {raw} ({exc})") from exc
+    if data is None:
+        data = {}  # an empty document is the empty fragment
     if not isinstance(data, dict):
         raise ValueError(f"peripherals file must be a mapping: {raw}")
+    unknown = sorted(set(data) - {"peripherals", "fast_lio"})
+    if unknown:
+        raise ValueError(
+            f"peripherals file {raw} has unknown top-level keys: {unknown} (expected a subset of peripherals, fast_lio)"
+        )
+    if "peripherals" in data:
+        peripherals = data["peripherals"]
+        if peripherals is None:
+            raise ValueError(f"peripherals file {raw}: peripherals must be a list (explicit null is not a fragment)")
+        if not isinstance(peripherals, list):
+            raise ValueError(f"peripherals file {raw}: peripherals must be a list")
+        seen: set[tuple[Any, Any]] = set()
+        for entry in peripherals:
+            if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+                raise ValueError(f"peripherals file {raw}: every peripherals entry requires type and name")
+            key = (entry["type"], entry["name"])
+            if key in seen:
+                raise ValueError(f"peripherals file {raw}: duplicate peripheral {key}")
+            seen.add(key)
+    if "fast_lio" in data:
+        fast_lio = data["fast_lio"]
+        if fast_lio is None:
+            raise ValueError(f"peripherals file {raw}: fast_lio must be a mapping (explicit null is not a fragment)")
+        if not isinstance(fast_lio, dict):
+            raise ValueError(f"peripherals file {raw}: fast_lio must be a mapping")
     return data
 
 

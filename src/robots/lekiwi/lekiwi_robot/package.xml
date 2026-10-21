@@ -60,6 +60,7 @@
   <exec_depend>audio_play</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
+  <test_depend>robot_runtime</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

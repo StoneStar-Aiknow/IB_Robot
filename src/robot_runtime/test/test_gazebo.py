@@ -646,9 +646,12 @@ def test_peripheral_stack_on_a_physics_platform_is_audio_only(tmp_path):
 def test_enabled_false_and_disabled_true_are_the_same_toggle():
     assert merge_peripherals([TOP], [{"type": "camera", "name": "top", "enabled": False}]) == []
     assert merge_peripherals([TOP], [{"type": "camera", "name": "top", "disabled": True}]) == []
-    # the normalized entry keeps both spellings for generic consumers
-    merged = merge_peripherals([], [{"type": "camera", "name": "top", "disabled": True, "width": 32}])
-    assert merged == [] or merged[0]["enabled"] is False
+    # the canonicaliser turns the disabled spelling into enabled: false and
+    # the enabled spelling is already canonical (runtime-deployment-peripherals D3)
+    disabled_spelling = merge_peripherals([TOP], [{"type": "camera", "name": "top", "disabled": False, "width": 32}])
+    assert disabled_spelling == [dict(TOP, width=32, enabled=True)]
+    enabled_spelling = merge_peripherals([TOP], [{"type": "camera", "name": "top", "enabled": True, "width": 32}])
+    assert enabled_spelling == [dict(TOP, width=32, enabled=True)]
 
 
 def test_toggle_only_entry_for_undeclared_peripheral_is_rejected():

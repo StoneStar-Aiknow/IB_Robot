@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import launch
+import pytest
 
 _PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra.yaml"
 _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"
@@ -36,6 +37,9 @@ def _render(simulated: str):
             "sim_platform": "",
             "instance_id": "",
             "initial_mode": "",
+            # declared by generate_launch_description; a direct _launch_setup
+            # caller must supply it (runtime-deployment-peripherals D7)
+            "peripherals": "",
         }
     )
     return _runtime_launch_module()._launch_setup(context)
@@ -89,3 +93,45 @@ def test_profile_audio_interfaces_carry_format_metadata():
     )
     # The simulated embed stays valid JSON metadata for the runtime node.
     assert json.dumps(description)
+
+
+def test_a_non_empty_deployment_peripherals_fragment_is_rejected(tmp_path):
+    """runtime-deployment-peripherals D7: the X2's cameras are vendor public
+    interfaces; a non-empty fragment fails closed in launch setup with the
+    contract message instead of being silently ignored."""
+    fragment = tmp_path / "deployment_peripherals.yaml"
+    fragment.write_text("peripherals:\n- type: camera\n  name: top\n  width: 1280\n", encoding="utf-8")
+    context = launch.LaunchContext()
+    context.launch_configurations.update(
+        {
+            "profile": str(_PROFILE),
+            "simulated": "false",
+            "use_sim": "",
+            "sim_platform": "",
+            "instance_id": "",
+            "initial_mode": "",
+            "peripherals": str(fragment),
+        }
+    )
+    with pytest.raises(
+        RuntimeError, match="aimdk_robot exposes vendor interfaces and accepts no deployment peripherals"
+    ):
+        _runtime_launch_module()._launch_setup(context)
+
+
+def test_launch_declares_the_peripherals_argument():
+    """D7 (m3): the provider's real launch description declares the
+    peripherals argument every provider contract requires (AimDK rejects a
+    non-empty value, but the shared argument must exist)."""
+    from launch.actions import DeclareLaunchArgument
+
+    def text(value):
+        return "".join(part.text if hasattr(part, "text") else str(part) for part in value)
+
+    description = _runtime_launch_module().generate_launch_description()
+    names = {
+        text(action._DeclareLaunchArgument__name)
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
+    }
+    assert "peripherals" in names

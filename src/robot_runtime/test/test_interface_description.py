@@ -211,9 +211,16 @@ def test_mujoco_depth_stream_dims_come_from_the_rendered_camera(profile):
     for stream in ("camera.front.depth", "camera.front.aligned_depth"):
         configured = descriptor["interfaces"][stream]["configured_profile"]
         assert (configured["width"], configured["height"]) == (16, 12), f"{stream} uses the rendered dims"
-    # off mujoco the device-specific depth dims are still honoured
+    # gazebo renders its rgbd sensor at the colour dims/rate too
+    # (runtime-deployment-peripherals D8): the depth streams advertise what
+    # the sensor actually renders, never the device's depth_* overrides.
     gazebo = build_description({**profile, "peripherals": peripherals}, use_sim=True, sim_platform="gazebo")
-    assert gazebo["interfaces"]["camera.front.depth"]["configured_profile"]["width"] == 8
+    for stream in ("camera.front.depth", "camera.front.aligned_depth"):
+        configured = gazebo["interfaces"][stream]["configured_profile"]
+        assert (configured["width"], configured["height"], configured["fps"]) == (16, 12, 30)
+    # off every simulator the device-specific depth dims are still honoured
+    sdk = build_description({**profile, "peripherals": peripherals}, use_sim=True, sim_platform="sdk")
+    assert sdk["interfaces"]["camera.front.depth"]["configured_profile"]["width"] == 8
 
 
 def test_pre_platform_description_stays_valid_and_defaults_from_execution(profile):
@@ -375,6 +382,33 @@ def test_waiter_validates_identity_and_graph(profile):
         validate_endpoint_graph(SimpleNamespace(get_service_names_and_types=lambda: []), doc, ["runtime.get_status"])
 
 
+def test_waiter_declared_interfaces_check_declaration_only(profile):
+    """--declared-interfaces gates on the runtime's declaration, not on
+    readiness: a missing interface is a named error, an interface that
+    exists but has published no sample yet passes (the shared readiness
+    barrier must not block on a slow driver or a late simulator)."""
+    doc = build_description(profile)
+    status = SimpleNamespace(
+        runtime_name="test_robot",
+        runtime_version="1.0.0",
+        lifecycle="ACTIVE",
+        capabilities=["runtime.status"],
+        interface_description_json=json.dumps(doc),
+    )
+    # every camera interface exists, none has a ready state
+    assert doc["states"] == {}
+    validate_runtime_snapshot(
+        status,
+        runtime_name="test_robot",
+        declared_interfaces=["camera.front.color", "camera.front.color_info"],
+    )
+    with pytest.raises(ValueError, match="runtime does not declare interface 'camera.front.aligned_depth'"):
+        validate_runtime_snapshot(status, runtime_name="test_robot", declared_interfaces=["camera.front.aligned_depth"])
+    # a non-topic or non-publish interface is not a valid declaration gate
+    with pytest.raises(ValueError, match="must be a published topic"):
+        validate_runtime_snapshot(status, runtime_name="test_robot", declared_interfaces=["runtime.get_status"])
+
+
 def test_graph_qos_uses_requested_offered_compatibility(profile):
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
@@ -486,3 +520,173 @@ def test_camera_frames_come_from_the_shared_advertised_frames_helper(profile, mo
     doc = build_description(profile, use_sim=True)
     assert doc["interfaces"]["camera.front.color"]["frame_id"] == "SENTINEL_IMAGE_FRAME"
     assert doc["interfaces"]["camera.front.color_info"]["frame_id"] == "SENTINEL_INFO_FRAME"
+
+
+# ---------------------------------------------------------------------------
+# runtime-deployment-peripherals D3/D5: toggle canonicalisation, the
+# completeness rule, driver changes and enabled-camera value checks
+# ---------------------------------------------------------------------------
+
+_CAMERA = {"type": "camera", "name": "top", "driver": "opencv", "width": 640, "height": 480, "fps": 30}
+
+
+def test_profile_disabled_true_is_overridden_by_enabled_true():
+    # D3: canonicalisation happens in every layer, so a deployment's
+    # enabled: true really overrides a profile's legacy disabled: true.
+    merged = merge_peripherals([dict(_CAMERA, disabled=True)], [{"type": "camera", "name": "top", "enabled": True}])
+    assert [entry["name"] for entry in merged] == ["top"]
+    assert merged[0]["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"type": "camera", "name": "top", "disabled": True, "enabled": True},
+        {"type": "camera", "name": "top", "disabled": False, "enabled": False},
+    ],
+)
+def test_contradictory_toggle_spellings_are_rejected(entry):
+    with pytest.raises(InterfaceDescriptionError, match=r"peripheral \('camera', 'top'\) sets contradictory"):
+        merge_peripherals([_CAMERA], [entry])
+    # the defaults layer is canonicalised with the same rule
+    with pytest.raises(InterfaceDescriptionError, match="sets contradictory"):
+        merge_peripherals([dict(_CAMERA, **entry)], [])
+
+
+def test_agreeing_toggle_spellings_accept_the_enabled_value():
+    # disabled: X == enabled: not X: both spellings of the same toggle agree
+    # and the canonical enabled value wins.
+    merged = merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", "disabled": True, "enabled": False}])
+    assert merged == []
+    kept = merge_peripherals(
+        [_CAMERA], [{"type": "camera", "name": "top", "disabled": False, "enabled": True, "width": 32}]
+    )
+    assert kept[0]["enabled"] is True and kept[0]["width"] == 32
+
+
+def test_driver_change_keeps_the_base_disable():
+    # D3: a changed driver replaces the device settings but inherits the
+    # base enabled state unless the override sets one.
+    merged = merge_peripherals(
+        [dict(_CAMERA, disabled=True)],
+        [{"type": "camera", "name": "top", "driver": "camera_ros", "width": 1280}],
+    )
+    assert merged == []
+    # an explicit enabled on the driver change wins
+    reenabled = merge_peripherals(
+        [dict(_CAMERA, disabled=True)],
+        [{"type": "camera", "name": "top", "driver": "camera_ros", "enabled": True, "width": 1280}],
+    )
+    assert reenabled[0]["driver"] == "camera_ros" and reenabled[0]["enabled"] is True
+    assert reenabled[0].get("index") is None, "the old driver's settings must not leak"
+
+
+def test_misspelled_partial_entry_is_rejected():
+    with pytest.raises(
+        InterfaceDescriptionError,
+        match=r"peripheral \('camera', 'tpo'\) is not declared by the runtime: an override must "
+        "name a declared peripheral, or declare driver to add a new device",
+    ):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "tpo", "width": 1280}])
+
+
+def test_toggle_only_undeclared_entry_is_still_rejected():
+    with pytest.raises(InterfaceDescriptionError, match=r"\('camera', 'ghost'\) is not declared"):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "ghost", "disabled": True}])
+
+
+def test_complete_new_device_with_driver_is_accepted():
+    merged = merge_peripherals(
+        [_CAMERA],
+        [{"type": "camera", "name": "deploy", "driver": "realsense", "serial_number": "X", "width": 848}],
+    )
+    assert [entry["name"] for entry in merged] == ["top", "deploy"]
+    assert merged[1]["driver"] == "realsense"
+
+
+def test_empty_overrides_never_apply_the_completeness_rule():
+    # merge_peripherals(defaults, []) callers (interfaces, nodes, stacks) must
+    # keep accepting profile defaults of any shape.
+    assert merge_peripherals([{"type": "camera", "name": "top", "width": 640}], []) == [
+        {"type": "camera", "name": "top", "width": 640}
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("width", 0),
+        ("width", "1280"),
+        ("width", 1280.5),
+        ("width", True),
+        ("height", 0),
+        ("depth_width", 0),
+        ("depth_height", -1),
+        ("fps", 0),
+        ("fps", "30"),
+        ("fps", True),
+        ("fps", float("nan")),
+        ("fps", float("inf")),
+        ("depth_fps", float("nan")),
+    ],
+)
+def test_invalid_enabled_camera_values_are_rejected(field, value):
+    with pytest.raises(InterfaceDescriptionError, match=rf"camera top: {field} must be"):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", field: value}])
+
+
+def test_unpaired_depth_dimensions_are_rejected():
+    with pytest.raises(InterfaceDescriptionError, match="camera top: depth_width and depth_height must be"):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", "depth_width": 640}])
+    with pytest.raises(InterfaceDescriptionError, match="camera top: depth_width and depth_height must be"):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", "depth_height": 480}])
+
+
+def test_depth_fps_without_depth_dimensions_is_rejected():
+    with pytest.raises(InterfaceDescriptionError, match="camera top: depth_fps requires depth_width/depth_height"):
+        merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", "depth_fps": 30}])
+
+
+def test_disabled_camera_is_not_value_checked():
+    merged = merge_peripherals(
+        [_CAMERA], [{"type": "camera", "name": "top", "disabled": True, "fps": 0, "width": "bad"}]
+    )
+    assert merged == []
+
+
+def test_unknown_keys_pass_through_the_merge():
+    merged = merge_peripherals([_CAMERA], [{"type": "camera", "name": "top", "vendor_knob": 7}])
+    assert merged[0]["vendor_knob"] == 7
+
+
+def test_broken_profile_default_fails_the_same_value_checks():
+    # D5: profile defaults are validated by the same pass.
+    with pytest.raises(InterfaceDescriptionError, match="camera top: fps must be"):
+        merge_peripherals([dict(_CAMERA, fps=0)], [])
+
+
+def test_gazebo_depth_streams_advertise_the_rendered_colour_dims():
+    # D8: the gz rgbd sensor renders one camera at the colour dims/rate; the
+    # depth streams advertise exactly that, never the device's depth_* overrides.
+    camera = {
+        "type": "camera",
+        "name": "front",
+        "driver": "realsense",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "depth_width": 640,
+        "depth_height": 360,
+        "depth_fps": 30,
+        "align_depth": True,
+        "streams": ["color", "depth"],
+    }
+    profile = {"runtime": {"name": "t", "version": "1"}, "capabilities": {}, "peripherals": [camera]}
+    description = build_description(profile, use_sim=True, sim_platform="gazebo")
+    for stream in ("camera.front.depth", "camera.front.aligned_depth"):
+        configured = description["interfaces"][stream]["configured_profile"]
+        assert (configured["width"], configured["height"], configured["fps"]) == (1280, 720, 15)
+    # off the simulator the device-specific depth dims are still honoured
+    sdk = build_description(profile, use_sim=True, sim_platform="sdk")
+    depth = sdk["interfaces"]["camera.front.depth"]["configured_profile"]
+    assert (depth["width"], depth["height"], depth["fps"]) == (640, 360, 30)

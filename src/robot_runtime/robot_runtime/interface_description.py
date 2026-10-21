@@ -187,13 +187,73 @@ def write_description(description: dict, path: str | Path) -> None:
             temp.unlink(missing_ok=True)
 
 
+def canonicalise_peripheral_entry(entry: dict) -> dict:
+    """Canonicalise one peripheral entry's toggle spelling (D3).
+
+    ``disabled: X`` becomes ``enabled: not X`` and the ``disabled`` key is
+    removed; an entry setting both keys with contradictory values is rejected
+    naming the entry. The input is not mutated. This is the one canonicaliser
+    the runtime merge applies to every layer, the runtime profile included.
+    """
+    key = (entry.get("type"), entry.get("name"))
+    canonical = deepcopy(entry)
+    if "disabled" in canonical:
+        disabled = canonical.pop("disabled")
+        if "enabled" in canonical and bool(canonical["enabled"]) != bool(disabled):
+            # Both present and agreeing (``disabled: X`` == ``enabled: not X``):
+            # the canonical ``enabled`` value wins.
+            return canonical
+        if "enabled" in canonical:
+            raise InterfaceDescriptionError(
+                f"peripheral {key} sets contradictory disabled={disabled!r} and "
+                f"enabled={canonical['enabled']!r}; pass at most one"
+            )
+        canonical["enabled"] = not bool(disabled)
+    return canonical
+
+
+def _check_camera_values(camera: dict) -> None:
+    """Value checks on one enabled merged camera entry (D5).
+
+    ``width``/``height``/``depth_width``/``depth_height`` must be positive
+    integers (bool rejected); ``fps``/``depth_fps`` positive finite numbers
+    (bool, NaN and infinity rejected); the depth dimensions are paired and
+    ``depth_fps`` requires them (without them the RealSense driver ignores it
+    while the description would advertise it). Absent fields keep their
+    documented defaults and are not checked; unknown keys are not rejected.
+    """
+    name = camera.get("name")
+    integer_fields = ("width", "height", "depth_width", "depth_height")
+    number_fields = ("fps", "depth_fps")
+    for field in integer_fields:
+        if field not in camera:
+            continue
+        value = camera[field]
+        if type(value) is not int or value <= 0:
+            raise InterfaceDescriptionError(f"camera {name}: {field} must be a positive integer, got {value!r}")
+    for field in number_fields:
+        if field not in camera:
+            continue
+        value = camera[field]
+        if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise InterfaceDescriptionError(f"camera {name}: {field} must be a positive finite number, got {value!r}")
+    if ("depth_width" in camera) != ("depth_height" in camera):
+        raise InterfaceDescriptionError(f"camera {name}: depth_width and depth_height must be given together")
+    if "depth_fps" in camera and "depth_width" not in camera:
+        raise InterfaceDescriptionError(f"camera {name}: depth_fps requires depth_width/depth_height")
+
+
 def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dict]:
     """Resolve partial instance overrides without mutating either configuration.
 
-    ``disabled: true`` is normalized to ``enabled: false`` at merge time (both
-    spellings stay valid). A toggle-only override entry (type, name and
-    enabled/disabled at most) must name a peripheral the defaults declare: a
-    toggle cannot disable something the runtime never provided (D8).
+    Every entry of every layer (defaults included) is canonicalised first
+    (``disabled: X`` == ``enabled: not X``; contradictory spellings in one
+    entry are rejected, D3). An override entry for an ``(type, name)`` the
+    defaults do not declare must declare ``driver`` (D5): a partial entry
+    cannot silently add a default device, which catches misspelled names. A
+    changed driver replaces the base device settings and inherits only the
+    base ``enabled`` state unless the override sets one (toggle state is not
+    vendor-specific, D3). Merged enabled cameras get value checks (D5).
     """
 
     def merge(base, override):
@@ -206,42 +266,45 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
             )
         return result
 
-    def normalize(entry):
-        normalized = deepcopy(entry)
-        if normalized.get("disabled", False):
-            normalized["enabled"] = False
-        return normalized
-
     result = []
     index = {}
     for entries, override in ((defaults or [], False), (overrides or [], True)):
         if not isinstance(entries, list):
             raise InterfaceDescriptionError("peripherals must be a list")
         seen = set()
-        for entry in entries:
-            if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict) or not raw_entry.get("type") or not raw_entry.get("name"):
                 raise InterfaceDescriptionError("peripherals entries require type and name")
-            key = (entry["type"], entry["name"])
+            key = (raw_entry["type"], raw_entry["name"])
             if key in seen:
                 raise InterfaceDescriptionError(f"duplicate peripheral {key}")
             seen.add(key)
+            entry = canonicalise_peripheral_entry(raw_entry)
             if override and key in index:
                 pos = index[key]
-                # A changed driver must not inherit vendor-specific settings.
-                result[pos] = (
-                    normalize(entry)
-                    if entry.get("driver", result[pos].get("driver")) != result[pos].get("driver")
-                    else merge(result[pos], entry)
-                )
+                base = result[pos]
+                if entry.get("driver", base.get("driver")) != base.get("driver"):
+                    # A changed driver must not inherit vendor-specific
+                    # settings (D3); the base's enabled state carries over
+                    # unless the override sets one itself (toggle state is
+                    # not vendor-specific).
+                    if "enabled" not in entry and "enabled" in base:
+                        entry["enabled"] = base["enabled"]
+                    result[pos] = entry
+                else:
+                    result[pos] = merge(base, entry)
             else:
-                if override and set(entry) <= {"type", "name", "enabled", "disabled"}:
+                if override and "driver" not in entry:
                     raise InterfaceDescriptionError(
-                        f"peripheral {key} is not declared by the runtime: a toggle-only entry "
-                        "cannot enable or disable an undeclared peripheral"
+                        f"peripheral {key} is not declared by the runtime: an override must name a "
+                        "declared peripheral, or declare driver to add a new device"
                     )
                 index[key] = len(result)
-                result.append(normalize(entry))
-    return [entry for entry in (normalize(entry) for entry in result) if entry.get("enabled", True)]
+                result.append(entry)
+    for entry in result:
+        if entry.get("type") == "camera" and entry.get("enabled", True):
+            _check_camera_values(entry)
+    return [entry for entry in result if entry.get("enabled", True)]
 
 
 def camera_streams(camera: dict) -> list[str]:
@@ -376,7 +439,17 @@ def peripheral_interfaces(
                     # depth_width/depth_height
                     width = periph.get("width", 640)
                     height = periph.get("height", 480)
-                fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
+                if sim_platform == "gazebo" and not is_color:
+                    # the gz rgbd sensor renders one camera at the colour
+                    # dimensions and rate (D8): the depth/aligned-depth
+                    # streams advertise what the sensor actually renders,
+                    # never the physical device's depth_* overrides (the
+                    # MuJoCo branch above applies the same principle)
+                    width = periph.get("width", 640)
+                    height = periph.get("height", 480)
+                    fps = periph.get("fps", 30)
+                else:
+                    fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
                 if driver == "realsense":
                     wire_format = periph.get("color_format", "RGB8") if is_color else periph.get("depth_format", "Z16")
                 else:
@@ -894,7 +967,12 @@ def main(argv=None):
             if args.instance_id:
                 profile["runtime"]["instance_id"] = args.instance_id
             if args.peripherals:
-                fragment = yaml.safe_load(Path(args.peripherals).read_text())
+                # One structural loader for every fragment (D6): the CLI
+                # rejects the same malformed files as the runtime launches
+                # and the facade/mock nodes, with the same messages.
+                from robot_runtime.peripherals import load_peripherals_file
+
+                fragment = load_peripherals_file(args.peripherals)
                 profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
                 profile["fast_lio"] = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
             description = build_description(

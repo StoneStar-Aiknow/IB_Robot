@@ -48,6 +48,15 @@ def _launch_setup(context, *_args, **_kwargs):
         LaunchConfiguration("simulated").perform(context),
         source=str(profile_path),
     )
+    peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
+    if peripherals_file:
+        # runtime-deployment-peripherals D7: the X2's cameras are vendor
+        # public interfaces declared in profile.interfaces, not
+        # runtime-declared peripherals; a deployment layer for vendor
+        # interfaces is out of scope, so a non-empty fragment fails closed
+        # instead of being silently ignored. An empty value (today's
+        # behaviour for every AimDK configuration) is unchanged.
+        raise RuntimeError("aimdk_robot exposes vendor interfaces and accepts no deployment peripherals")
     simulated = use_sim
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
@@ -130,6 +139,12 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
+            DeclareLaunchArgument(
+                "peripherals",
+                default_value="",
+                description="Rejected: aimdk_robot exposes vendor interfaces and accepts no deployment "
+                "peripherals (kept for the shared provider contract)",
+            ),
             OpaqueFunction(function=_launch_setup),
         ]
     )
