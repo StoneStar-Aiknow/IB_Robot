@@ -405,6 +405,31 @@ class VisualInteractionNode(Node):
         # deadline" rather than "start immediately".
         message.latest_start_at = _as_time(result.latest_start_at) if result.spoken else _as_time(0.0)
         self._utterances.publish(message)
+        self._log_round(result)
+
+    def _log_round(self, result) -> None:
+        """Log what the round decided, so a bring-up run is readable live.
+
+        Without this the only trace of a decision is the utterance topic, which
+        means watching the feature work requires a second terminal echoing a
+        topic. A spoken line is logged at info because it is the event the
+        feature exists to produce; a quiet round is logged at debug, since at
+        one round a second the normal case is quiet and would drown the rest.
+
+        MODEL_NOT_READY is the exception: it is the one quiet reason that means
+        something is wrong rather than that there was nothing to say, so it
+        gets a warning and carries the model's own error when there is one.
+        """
+        if result.spoken:
+            observation = result.observation
+            subject = f"{observation.category}/{observation.region}" if observation else "?"
+            self.get_logger().info(f'say: "{result.text}"  [{subject}] event={result.event_id}')
+            return
+        if result.reason == SUPPRESS_MODEL_NOT_READY:
+            detail = getattr(self._session.hooks.vision, "last_error", "")
+            self.get_logger().warning(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
+            return
+        self.get_logger().debug(f"quiet: {result.reason}")
 
     def _publish_status(self) -> None:
         payload = {
