@@ -1,8 +1,9 @@
 # X2 主动视觉互动方案
 
 - 状态：设计评审稿；阶段零尚未放行。会话骨架与假 VL 已实现（`src/visual_interaction/`，
-  见该包 README），真模型、真实发声和板端验证均未开始。
-- 更新日期：2026-10-21。
+  见该包 README）；发声已接入 magicmirror 合并入口（经 mirror_voice 送达，见 §8/§9），
+  真模型与板端验证均未开始。
+- 更新日期：2026-10-23。
 - 源码参考快照：`46d09cc67b69c71cf6df7fafee24e4a7705d2edd`。
 - 内容分为设计决策、阶段零计划、验收标准、证据附录。
 - 接口和配置名称除注明“已有”外均为拟新增；性能参数为待冻结提案，不是测量结果。
@@ -180,6 +181,12 @@ latest_start_at 是最晚开始发声，不是播放完成期限；action 不原
 取消接受、CANCELING、最终取消与真实静音分别记录；标准 CancelGoal 不承载自定义取消原因，
 领域原因由控制接口和 event_id 关联。底层 PCM 循环、runtime 缓冲及音频焦点也需取消适配。
 
+当前的送达通路（协调器到位前的过渡）：独立入口不发声，`SpeechPort` 只发
+`/visual_interaction/utterance`；magicmirror 入口把 `mirror_session.voice.utterance_topic`
+接到该话题，由 mirror_voice 准入（仅 MIRRORING 且状态新鲜、无 ASCII 字母、未过
+latest_start_at）后按需合成，与镜像状态短语共用同一队列，全部署保持单一 TTS 客户端。
+本段不改变上面的协调器设计：另外三个直接调 TTS 的发声源仍未协调，TODO 保留。
+
 D 为重采样后的音频时长，t_first/t_last 为首/末 PCM 发布时间：
 
 ```text
@@ -207,7 +214,12 @@ delta 取许可的现场校准高分位/保守余量，保留校准版本与误�
 
 未来需要 use_sim_time 时另设一致的测试配置与跳变策略，不与本轮验收结果混算。
 
-拟新增 aimdk_x2_visual_interaction.yaml 和音频/观察专用 launch。
+入口有两个，都是 robot_config 的机器人配置。`aimdk_x2_visual_interaction.yaml` 是观察模式
+开发入口：fake VL、不发声。`aimdk_x2_magicmirror.yaml` 是合并入口：一次 launch 同时拉起镜像
+与互动，启动、退出、重启天然同步；互动轮次仅在镜像处于 MIRRORING 时进行（其余状态整轮挂起、
+报 `MIRROR_INACTIVE`，不调 VL，也不重置确认链之外的会话状态），回传语句经
+`mirror_session.voice.utterance_topic` 交给 mirror_voice 送达（见 §8）；板端真 VL 用
+`aimdk_x2_magicmirror_board.yaml` 叠加，唯一机器相关字面量是 VL demo root。
 入口门禁包括节点/服务/action/厂商调用白名单、假 SDK MC/运动控制权/运动命令零调用，
 以及获授权的现场观测。现有 runtime 含控制面/定时器，不以“没启动 executor”证明无副作用。
 音频焦点不是运动控制权；VL 无任意硬件/ROS 调用权限。
@@ -221,7 +233,8 @@ delta 取许可的现场校准高分位/保守余量，保留校准版本与误�
 但不把敏感词匹配当作隐私保证；未知/高风险候选保持沉默。
 
 `/visual_interaction/status` 区分 none、uncertain、duplicate、privacy、stale、ambiguous、
-cooldown、MODEL_NOT_READY、PCM_UNDERRUN、LEASE_UNKNOWN、WAITING_NEXT_VISITOR。
+cooldown、MODEL_NOT_READY、PCM_UNDERRUN、LEASE_UNKNOWN、WAITING_NEXT_VISITOR；
+合并入口另有 MIRROR_INACTIVE（镜像不在 MIRRORING，整轮挂起、不调 VL）。
 诊断默认只有枚举、耗时、计数和临时 epoch，不含原图/身份/自由回复。
 
 ## 二、阶段零计划
