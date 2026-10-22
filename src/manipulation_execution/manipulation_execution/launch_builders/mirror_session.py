@@ -52,7 +52,9 @@ absolute path, whether the file exists is the nodes' check at startup. Only
 ``""`` and ``demo`` hooks wrap the mock; any other business class and the mock
 are exclusive. ``operator.enabled`` appends the operator node (covered camera,
 head touch, LED) as the last action; without an ``operator`` block it is not
-launched. The operator's parameter names are listed here rather than imported:
+launched. Its camera is ``operator.camera_topic`` (a compressed topic) if
+given, else the stream's camera. The operator's parameter names are listed
+here rather than imported:
 robot_config does not depend on manipulation_execution, so
 manipulation_execution's test_mirror_session_launch holds them against the
 node's declaration. Its ``set_session(false)`` wait is the contract's stop
@@ -109,7 +111,7 @@ _KEYS = frozenset(
     }
 )
 _BUSINESS_KEYS = frozenset({"hooks", "cover_judge", "config"})
-_OPERATOR_KEYS = frozenset({"enabled", "send_enabled"})
+_OPERATOR_KEYS = frozenset({"enabled", "send_enabled", "camera_topic"})
 # The hooks that wrap the mock instead of replacing it.
 _MOCK_HOOKS = ("", "demo")
 # The Gateway's names, read as robot_skill_cli's catalog reads them, with its defaults.
@@ -238,13 +240,20 @@ def _operator_parameters(robot_config: Mapping, config: Mapping, session: Mappin
     block = _block(config, "operator", _OPERATOR_KEYS)
     if block is None or not _bool(block, "enabled", False, "mirror_session.operator"):
         return None
-    if not session["camera_topic"]:
-        raise ValueError(
-            "mirror_session.operator needs the camera: motion_imitation_stream must name its compressed frame source"
-        )
+    if "camera_topic" not in block:
+        camera_topic = session["camera_topic"]
+        if not camera_topic:
+            raise ValueError(
+                "mirror_session.operator needs a camera: set mirror_session.operator.camera_topic or let "
+                "motion_imitation_stream name its compressed frame source"
+            )
+    else:
+        camera_topic = block["camera_topic"]
+        if not isinstance(camera_topic, str) or not camera_topic:
+            raise ValueError("mirror_session.operator.camera_topic must be a non-empty string")
     return {
         "runtime_description_json": session["runtime_description_json"],
-        "camera_topic": session["camera_topic"],
+        "camera_topic": camera_topic,
         # frame_source only takes a compressed camera.
         "camera_kind": "compressed",
         "business_config": business["config"],

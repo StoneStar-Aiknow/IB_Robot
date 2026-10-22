@@ -155,6 +155,13 @@ class TestTheWiring:
         assert qos["reliability"] == "best_effort"
         assert qos["durability"] == "volatile"
 
+    def test_the_operator_reads_the_rear_head_camera(self, config):
+        """Covering the front centre camera trips its auto gain and brightens
+        the frame again, so the gestures read the rear head camera instead."""
+        operator = config["mirror_session"]["operator"]
+
+        assert operator["camera_topic"] == "/aima/hal/sensor/rgb_head_rear/rgb_image/compressed"
+
 
 class TestTheSection:
     def test_the_vl_is_the_scripted_one_here(self, config):

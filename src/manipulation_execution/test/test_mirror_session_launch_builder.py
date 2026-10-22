@@ -213,6 +213,54 @@ class TestGenerateNodes:
         assert _node_parameters(session)["publish_enabled"] is True
 
 
+class TestOperatorNode:
+    """The operator's camera: its own when the entry names one, the imitation
+    camera when it does not. The magicmirror entry names the rear head camera
+    because covering the front centre one trips its auto gain."""
+
+    def config_with_operator(self, **operator):
+        config = _config()
+        config["motion_imitation_stream"] = {
+            "enabled": True,
+            "frame_topic": "/stream/pear",
+            "status_topic": "/stream/status",
+            "actor_state_topic": "/stream/actor",
+            "frame_source": {"interface": "camera.head.color_compressed", "decoder": "mock_cpu"},
+            "yolox_detect_service": "/perception/yolox",
+            "pear_parameters_service": "/perception/pear",
+        }
+        config["mirror_session"]["operator"] = {"enabled": True, "send_enabled": False, **operator}
+        return config
+
+    def operator_parameters(self, config):
+        actions = generate_mirror_session_nodes(config)
+        operator = next(
+            node
+            for node in actions
+            if isinstance(node, Node) and node._Node__node_executable == "mirror_operator_node"
+        )
+        return _node_parameters(operator)
+
+    def test_an_operator_camera_topic_wins_over_the_stream_s(self):
+        rear = "/aima/hal/sensor/rgb_head_rear/rgb_image/compressed"
+
+        parameters = self.operator_parameters(self.config_with_operator(camera_topic=rear))
+
+        assert parameters["camera_topic"] == rear
+
+    def test_without_one_it_takes_the_imitation_camera(self):
+        parameters = self.operator_parameters(self.config_with_operator())
+
+        assert parameters["camera_topic"] == "/camera/head/image_compressed"
+
+    def test_with_neither_it_names_both_ways_out(self):
+        config = self.config_with_operator()
+        del config["motion_imitation_stream"]
+
+        with pytest.raises(ValueError, match="needs a camera"):
+            generate_mirror_session_nodes(config)
+
+
 class TestVoiceNode:
     """The voice node's parameters, including the utterance topic the visual
     interaction feature added to the shared section: it travels inside
