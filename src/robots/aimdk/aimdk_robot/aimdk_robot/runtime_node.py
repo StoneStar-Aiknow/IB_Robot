@@ -102,10 +102,14 @@ _RELIABLE_QOS = QoSProfile(
 )
 
 #: Public streams this runtime proves ready by observing them on the ROS graph.
-#: Vendor-native sensors (cameras, lidar, IMUs) are deliberately excluded:
-#: subscribing to them inside this process would compete with motion control on
-#: a board that is already the bottleneck.
-OBSERVED_INTERFACES = ("audio.speech",)
+#: The two audio bindings are here because a voice deployment may consume either:
+#: the vendor speech chunks (external_vad) or the republished raw capture
+#: (shared_audio). Without the second entry a shared_audio consumer can never be
+#: admitted: its interface would stay 'unknown' and launch would time out.
+#: Vendor-native sensors (cameras, lidar, IMUs) stay excluded: subscribing to
+#: them inside this process would compete with motion control on a board that is
+#: already the bottleneck.
+OBSERVED_INTERFACES = ("audio.speech", "audio.capture")
 
 #: Frame id carried by project speech chunks; consumers must not depend on it.
 _SPEECH_FRAME_ID = "enhanced_audio"

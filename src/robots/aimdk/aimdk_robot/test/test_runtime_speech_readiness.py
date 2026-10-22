@@ -1,4 +1,4 @@
-"""The audio.speech readiness contract the launcher depends on.
+"""The runtime-audio readiness contract the launcher depends on.
 
 ``robot.launch.py`` turns a logical binding into ``--require-interfaces``, and
 ``wait_for_runtime`` only admits a consumer when the runtime's own
@@ -39,6 +39,7 @@ from robot_runtime.wait_for_runtime import validate_runtime_snapshot  # noqa: E4
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra.yaml"
 SPEECH = "audio.speech"
+CAPTURE = "audio.capture"
 
 
 class FakeNode:
@@ -94,16 +95,23 @@ def _heartbeat():
 
 
 def test_observed_interfaces_stay_a_narrow_allowlist():
-    """Observing every declared stream would re-subscribe the sensor streams."""
-    assert OBSERVED_INTERFACES == (SPEECH,)
+    """Observing every declared stream would re-subscribe the sensor streams.
+
+    Both audio bindings the voice chain can declare are observed: the vendor
+    speech chunks (external_vad) and the republished raw capture (shared_audio).
+    Anything wider would put this process on the camera and IMU streams.
+    """
+    assert OBSERVED_INTERFACES == (SPEECH, CAPTURE)
 
 
 def test_unknown_then_ready_through_the_real_runtime_status(profile):
     description, observed = _description_and_observed(profile)
     node = FakeNode()
     monitor = InterfaceMonitor(node, {"interfaces": observed})
-    # The monitor must watch only the speech endpoint, not the whole profile.
-    assert [entry["topic"] for entry in node.subscriptions] == [description["interfaces"][SPEECH]["endpoint"]]
+    # The monitor must watch only the allowlisted audio endpoints, not the whole profile.
+    assert [entry["topic"] for entry in node.subscriptions] == [
+        description["interfaces"][name]["endpoint"] for name in OBSERVED_INTERFACES
+    ]
 
     kwargs = {
         "runtime_name": str(profile["runtime"]["name"]),
