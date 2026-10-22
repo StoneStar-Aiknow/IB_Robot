@@ -36,6 +36,7 @@ its reason. Nothing is ever spoken aloud — the utterance goes to the topic.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -194,6 +195,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("live_chain: stopped")
     finally:
+        # Same lesson pose_recorder learned, applied late: Ctrl-C has already
+        # shut the context down, so rclpy.shutdown() raises "rcl_shutdown
+        # already called" and anything after it is skipped. The summary is the
+        # run's result, so it is gathered first and printed regardless, and
+        # every teardown call is suppressed rather than trusted.
         status = None
         for item in nodes:
             if hasattr(item, "_session"):
@@ -203,11 +209,15 @@ def main(argv: list[str] | None = None) -> int:
                     "outcomes": dict(sorted(item._counts.items())),
                     "spoken_topics": item._session.ledger().spoken_count(),
                 }
-            executor.remove_node(item)
-            item.destroy_node()
-        rclpy.shutdown()
         if status:
-            print(f"live_chain: {json.dumps(status, ensure_ascii=False)}")
+            print(f"live_chain: {json.dumps(status, ensure_ascii=False)}", flush=True)
+        for item in nodes:
+            with contextlib.suppress(Exception):
+                executor.remove_node(item)
+            with contextlib.suppress(Exception):
+                item.destroy_node()
+        with contextlib.suppress(Exception):
+            rclpy.shutdown()
     return 0
 
 
