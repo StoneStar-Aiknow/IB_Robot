@@ -32,6 +32,7 @@ scored only on whether the answer parsed, since nothing says what they are.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import sys
@@ -148,6 +149,14 @@ def _answer(raw: str) -> dict:
 
     A variant that asks for one bare word is not JSON, so a plain
     category word counts as an answer rather than a parse failure.
+
+    Two tolerances, both earned the hard way. A first run scored 45 of 240
+    answers as unparseable and two variants at 0% accuracy, and none of that
+    was the model: it had written Python dict syntax with single quotes, whose
+    content was complete and correct, and it had answered "interaction" where
+    the list says "interacting". Measuring the prompt means not scoring the
+    model down for the harness's literalism — a probe that counts its own
+    strictness as model failure is worse than no probe.
     """
     text = raw.strip()
     if text.startswith("```"):
@@ -158,22 +167,58 @@ def _answer(raw: str) -> dict:
         closing = body.rfind("```")
         text = (body[:closing] if closing != -1 else body).strip()
     if text.startswith("{"):
-        try:
-            decoded = json.loads(text)
-        except ValueError:
+        decoded = _as_mapping(text)
+        if decoded is None:
             return {"parsed": False, "raw": text[:120]}
-        if isinstance(decoded, dict):
-            return {
-                "parsed": True,
-                "kind": str(decoded.get("kind", "")),
-                "category": str(decoded.get("category", "")),
-                "reply": str(decoded.get("reply", "")),
-            }
-        return {"parsed": False, "raw": text[:120]}
-    bare = text.strip().strip('".,。').lower()
+        return {
+            "parsed": True,
+            "kind": str(decoded.get("kind", "")),
+            "category": _canonical(str(decoded.get("category", ""))),
+            "reply": str(decoded.get("reply", "")),
+        }
+    bare = _canonical(text.strip().strip('".,。'))
     if bare in ACTION_CATEGORIES:
         return {"parsed": True, "kind": "action", "category": bare, "reply": ""}
+    # The bare-word variant sometimes echoes the gloss line it was given
+    # ("gesture = 用手做的手势"). That is still an answer; refusing to read it
+    # would again score the harness rather than the model. Only accept it when
+    # exactly one value appears, so an echo of the whole list stays a failure.
+    named = [value for value in ACTION_CATEGORIES if value in text.lower()]
+    if len(named) == 1:
+        return {"parsed": True, "kind": "action", "category": named[0], "reply": "", "echoed": True}
     return {"parsed": False, "raw": text[:120]}
+
+
+def _as_mapping(text: str) -> dict | None:
+    """Read an object the model wrote, in JSON or in Python dict syntax."""
+    try:
+        decoded = json.loads(text)
+    except ValueError:
+        try:
+            # Single-quoted keys and values: syntactically a Python literal,
+            # semantically the answer that was asked for. literal_eval and not
+            # eval — this is model output, so it never gets executed.
+            decoded = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+# Near-misses for each closed value. Scoring "interaction" as wrong would
+# measure spelling, not whether the model told gesture from holding.
+_ALIASES = {
+    "interaction": "interacting",
+    "interact": "interacting",
+    "gestures": "gesture",
+    "gesturing": "gesture",
+    "hold": "holding",
+    "holds": "holding",
+}
+
+
+def _canonical(value: str) -> str:
+    cleaned = value.strip().strip('".,。').lower()
+    return _ALIASES.get(cleaned, cleaned)
 
 
 def main(argv: list[str] | None = None) -> int:
