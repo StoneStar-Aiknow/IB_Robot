@@ -53,6 +53,15 @@ class TestTheOverlay:
             "demo_root": "/root/vlx_internvl_310p",
         }
 
+    def test_the_window_fits_the_om_prefill_budget(self, config):
+        """Four frames overflow the vision deployment's 1280-token prefill.
+
+        Measured on the board with the real tokenizer: 835 prompt tokens at two
+        frames, 1361 at four. The budget check raises inside the model's load,
+        so with four the node re-loads the OMs every round and never speaks.
+        """
+        assert config["visual_interaction"]["frames_per_window"] == 2
+
     def test_everything_else_is_inherited(self, config):
         """The wiring the combined entry exists for survives the overlay."""
         frame_topic = config["motion_imitation_stream"]["frame_source"]["topic"]
