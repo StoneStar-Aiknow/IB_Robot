@@ -222,7 +222,7 @@ def build_ai_metadata_checks(pr: dict, commits: list[dict]) -> list[dict]:
         )
 
     tool_match = re.search(
-        r"(?:Agent平台信息\s*（?Tool）?|Agent\s*(?:platform|tool))\s*[:：]\s*([^\n]+)",
+        r"(?:Agent平台信息\s*(?:[（(]Tool[）)])?|Agent\s*(?:platform|tool))\s*(?:\*\*)?\s*[:：]\s*([^\n]+)",
         body,
         re.IGNORECASE,
     )
@@ -236,7 +236,7 @@ def build_ai_metadata_checks(pr: dict, commits: list[dict]) -> list[dict]:
         )
 
     model_match = re.search(
-        r"(?:模型信息\s*(?:\(Model\))?|\bModel\b)\s*[:：]\s*([^\n]+)",
+        r"(?:模型信息\s*(?:[（(]Model[）)])?|\bModel\b)\s*(?:\*\*)?\s*[:：]\s*([^\n]+)",
         body,
         re.IGNORECASE,
     )

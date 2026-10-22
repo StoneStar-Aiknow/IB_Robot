@@ -18,6 +18,9 @@ def generate_launch_description():
             DeclareLaunchArgument("audio_topic", default_value="/audio/play"),
             DeclareLaunchArgument("playback_sample_rate", default_value="24000"),
             DeclareLaunchArgument("playback_channels", default_value="1"),
+            DeclareLaunchArgument("resample_to_playback_rate", default_value="false"),
+            DeclareLaunchArgument("audio_message_type", default_value="audio_common_msgs/msg/AudioData"),
+            DeclareLaunchArgument("chunk_ms", default_value="50"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -53,6 +56,9 @@ def generate_launch_description():
                         "audio_topic": LaunchConfiguration("audio_topic"),
                         "playback_sample_rate": LaunchConfiguration("playback_sample_rate"),
                         "playback_channels": LaunchConfiguration("playback_channels"),
+                        "resample_to_playback_rate": LaunchConfiguration("resample_to_playback_rate"),
+                        "audio_message_type": LaunchConfiguration("audio_message_type"),
+                        "chunk_ms": LaunchConfiguration("chunk_ms"),
                     }
                 ],
             ),

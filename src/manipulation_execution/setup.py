@@ -8,6 +8,11 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
+    package_data={
+        "manipulation_execution.imitation_retargeting.x2": ["model/*.xml"],
+        "manipulation_execution.imitation_retargeting.x2._vendor": ["data/*.npz"],
+        "manipulation_execution.imitation_retargeting.x2._vendor.smplx2robot": ["data/*.json"],
+    },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
@@ -31,8 +36,11 @@ setup(
             "imitate_human_motion_executor_node = manipulation_execution.imitate_human_motion_executor_node:main",
             "motion_imitation_stream_node = manipulation_execution.motion_imitation_stream_node:main",
             "motion_imitation_mock_node = manipulation_execution.motion_imitation_mock_node:main",
+            "motion_imitation_retarget_node = manipulation_execution.motion_imitation_retarget_node:main",
             "mirror_session_node = manipulation_execution.mirror_session_node:main",
             "mirror_session_release = manipulation_execution.mirror_session_node:release_main",
+            "mirror_operator_node = manipulation_execution.mirror_operator_node:main",
+            "mirror_voice_node = manipulation_execution.mirror_voice_node:main",
             "placement_replay = manipulation_execution.placement_replay:main",
         ],
         # Cross-package launch-builder registration (openspec change

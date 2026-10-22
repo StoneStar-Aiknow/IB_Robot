@@ -32,6 +32,7 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
+from .nv12_image import NV12_FULL_RANGE, Nv12Image
 from .pear_adapter import PearParameterAdapter
 from .ram_plus_adapter import RAMPlusAdapter, masked_image_crop, select_mask_tags
 from .semantic_model_adapters import (
@@ -381,7 +382,7 @@ class YoloXPersonDetectPlugin(_SessionPlugin):
             raise ValueError("confidence_threshold must be finite and within [0, 1]")
         if not np.isfinite(nms_threshold) or not 0.0 <= nms_threshold <= 1.0:
             raise ValueError("nms_threshold must be finite and within [0, 1]")
-        image = self.image_rgb(request.image)
+        image = Nv12Image(request.image) if request.image.encoding == NV12_FULL_RANGE else self.image_rgb(request.image)
         result = self._infer(self.adapter.preprocess(image))
         records = rank_detections(
             [
@@ -403,7 +404,7 @@ class PearParameterPredictPlugin(_SessionPlugin):
     def handle(self, request, response) -> str:
         detections = list(request.detections.detections)
         validate_detection_batch(detections)
-        image = self.image_rgb(request.image)
+        image = Nv12Image(request.image) if request.image.encoding == NV12_FULL_RANGE else self.image_rgb(request.image)
         result = self._infer(self.adapter.preprocess((image, [detection.bbox for detection in detections])))
         values = self.adapter.postprocess(result)
         response.header = request.image.header

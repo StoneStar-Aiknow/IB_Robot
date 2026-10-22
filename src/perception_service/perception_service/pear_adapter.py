@@ -11,6 +11,7 @@ import numpy as np
 from inference_service.unified_runtime import ModelResult
 
 from .adapter_support import output_tensor, read_adapter_identity
+from .nv12_image import Nv12Image
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
 
@@ -63,6 +64,11 @@ class PearParameterAdapter(PerceptionAdapter):
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
         image_rgb, boxes = value
+        if isinstance(image_rgb, Nv12Image):
+            if len(boxes) != 1:
+                raise ValueError("PEAR NV12 input requires exactly one person bbox")
+            image_rgb, local_box = image_rgb.roi_rgb(boxes[0], self._CROP_MARGIN)
+            boxes = [local_box]
         image = np.asarray(image_rgb)
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
             raise ValueError("image must be an RGB uint8 HxWx3 array")

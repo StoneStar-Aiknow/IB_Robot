@@ -6,6 +6,8 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
+from voice_tts_service.audio_utils import resample_pcm16
+
 
 class AudioPlaybackError(RuntimeError):
     """Stable audio playback failure returned by the ROS service."""
@@ -78,6 +80,46 @@ class AudioFilePlayer:
                 f"got {actual[0]} Hz, {actual[1]} channel(s), {actual[2] * 8}-bit, {actual[3]}",
             )
         return path
+
+    @classmethod
+    def load_pcm_for_playback(
+        cls,
+        file_path: str,
+        *,
+        sample_rate: int,
+        channels: int,
+        resample: bool,
+        sample_width: int = 2,
+    ) -> bytes:
+        """Return the WAV's PCM in the playback contract, resampling only when explicitly enabled.
+
+        Channel count and sample width are never converted. A sample-rate mismatch is rejected unless
+        ``resample`` is set, so audio is never silently played at the wrong rate.
+        """
+
+        if not resample:
+            path = cls.validate_pcm_format(
+                file_path, sample_rate=sample_rate, channels=channels, sample_width=sample_width
+            )
+            with wave.open(str(path), "rb") as stream:
+                return stream.readframes(stream.getnframes())
+
+        path = cls.validate_file(file_path)
+        try:
+            with wave.open(str(path), "rb") as stream:
+                actual = (stream.getnchannels(), stream.getsampwidth(), stream.getcomptype())
+                source_rate = stream.getframerate()
+                pcm = stream.readframes(stream.getnframes())
+        except (EOFError, OSError, wave.Error) as exc:
+            raise AudioPlaybackError("INVALID_AUDIO_FILE", f"invalid WAV file: {exc}") from exc
+        if actual != (channels, sample_width, "NONE"):
+            raise AudioPlaybackError(
+                "UNSUPPORTED_AUDIO_FORMAT",
+                "audio_common playback requires "
+                f"{channels} channel(s), {sample_width * 8}-bit PCM (any rate, resampled to {sample_rate} Hz); "
+                f"got {actual[0]} channel(s), {actual[1] * 8}-bit, {actual[2]}",
+            )
+        return resample_pcm16(pcm, channels=channels, source_rate=source_rate, target_rate=sample_rate)
 
 
 __all__ = ["AudioFilePlayer", "AudioPlaybackConfig", "AudioPlaybackError"]

@@ -33,6 +33,10 @@
        channel order, crop, resize, normalise) stays in the perception
        adapters; this is only JPEG/PNG -> raw Image. -->
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>inference_service</exec_depend>
+  <exec_depend>observation_transport</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
@@ -41,6 +45,10 @@
   <!-- The migrated mirror-session builder tests import robot_config's
        launch preparation pipeline (design decision 4). -->
   <test_depend>robot_config</test_depend>
+  <!-- test_compressed_image_decode asserts the transport decode contract
+       against perception_service's model contracts. -->
+  <test_depend>perception_service</test_depend>
+  <test_depend>inference_service</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -8,6 +8,7 @@ import path changed.
 
 import pytest
 
+from robot_config.launch_registry.registry import LaunchBuildContext
 from voice_tts_service.launch_builders import voice_tts
 
 
@@ -76,6 +77,10 @@ def test_voice_tts_builder_routes_shared_playback_format(monkeypatch, tmp_path):
     assert playback["audio_topic"] == "/shared/play"
     assert playback["playback_sample_rate"] == 24000
     assert playback["playback_channels"] == 1
+    # Without a runtime binding the local audio_play contract is unchanged.
+    assert playback["audio_message_type"] == "audio_common_msgs/msg/AudioData"
+    assert playback["resample_to_playback_rate"] is False
+    assert playback["chunk_ms"] == 50
 
 
 def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_path):
@@ -192,3 +197,150 @@ def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypat
     parameters = _playback_parameters(nodes)
     assert parameters["audio_topic"] == "/audio/play"
     assert parameters["playback_sample_rate"] == 24000
+
+
+def test_runtime_bound_playback_forwards_the_resample_settings(tmp_path, monkeypatch):
+    """The bound sink's topic/type/rate plus the opt-in resample knobs reach the playback node."""
+    config = _bound_tts_config(_bound_audio_output(topic="/instance_x/play", sample_rate_hz=16000, channels=1))
+    config["voice_tts"]["resample_to_playback_rate"] = True
+    config["voice_tts"]["chunk_ms"] = 100
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/instance_x/play"
+    assert parameters["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+    assert parameters["playback_sample_rate"] == 16000
+    assert parameters["resample_to_playback_rate"] is True
+    assert parameters["chunk_ms"] == 100
+
+
+# --- CANN environment for Ascend deployments -------------------------------------
+
+
+def _additional_env(node):
+    """Node.additional_env holds (name, value) substitution pairs, not plain strings."""
+
+    def text(value):
+        return "".join(getattr(item, "text", str(item)) for item in value)
+
+    return {text(name): text(value) for name, value in (node.additional_env or ())}
+
+
+_PLAYBACK_DEFAULTS = {
+    "enabled": False,
+    "bundle_path": "models/zipvoice",
+    "deployment": "",
+    "exit_on_init_failure": True,
+}
+
+
+def _runtime_playback_config(tmp_path, **voice_tts_overrides):
+    config = {
+        "enabled": True,
+        "bundle_path": str(tmp_path),
+        "deployment": "ascend_310p",
+        "audio_output": _bound_audio_output(sample_rate_hz=16000, channels=1),
+    }
+    config.update(voice_tts_overrides)
+    return {
+        "voice_tts": config,
+        "audio_io": {"enabled": True, "playback_source": "runtime", "playback_sample_rate": 16000},
+    }
+
+
+def test_ascend_deployment_runs_under_the_cann_abi_its_om_declares(monkeypatch, tmp_path):
+    """The OM is built against one CANN ABI; the node must not inherit the caller's toolkit."""
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: _PLAYBACK_DEFAULTS)
+    toolkit = tmp_path / "cann" / "8.1.RC1"
+    (toolkit / "lib64").mkdir(parents=True)
+    monkeypatch.setattr(voice_tts, "resolve_cann_root", lambda abi: toolkit if abi == "cann-8.1.RC1" else tmp_path)
+
+    class _Target:
+        runtime_abi = "cann-8.1.RC1"
+
+    class _Profile:
+        backend = "ascend"
+        target = _Target()
+
+    class _Deployment:
+        role_runtime_profiles = {"text_encoder": _Profile()}
+        runtime_profile = None
+
+    import sys
+    import types
+
+    module = types.ModuleType("inference_manifest")
+    module.load_inference_manifest = lambda *_a, **_k: types.SimpleNamespace(deployment=_Deployment())
+    monkeypatch.setitem(sys.modules, "inference_manifest", module)
+
+    host, _player = voice_tts.generate_voice_tts_nodes(_runtime_playback_config(tmp_path))
+
+    assert _additional_env(host)["ASCEND_TOOLKIT_HOME"] == str(toolkit)
+
+
+def test_non_ascend_deployment_gets_no_cann_environment(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: _PLAYBACK_DEFAULTS)
+
+    class _Profile:
+        backend = "torch"
+        target = None
+
+    class _Deployment:
+        role_runtime_profiles = None
+        runtime_profile = _Profile()
+
+    import sys
+    import types
+
+    module = types.ModuleType("inference_manifest")
+    module.load_inference_manifest = lambda *_a, **_k: types.SimpleNamespace(deployment=_Deployment())
+    monkeypatch.setitem(sys.modules, "inference_manifest", module)
+
+    host, _player = voice_tts.generate_voice_tts_nodes(_runtime_playback_config(tmp_path))
+
+    assert _additional_env(host) == {}
+
+
+# --- launch failure tolerance (voice_tts.exit_on_init_failure) --------------------
+
+
+def _broken(_config):
+    raise ValueError("WORKSPACE must be an absolute path")
+
+
+def test_build_passes_the_generated_nodes_through(monkeypatch):
+    marker = object()
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", lambda _config: [marker])
+
+    result = voice_tts.build_voice_tts(LaunchBuildContext(robot_config={"voice_tts": {"enabled": True}}))
+
+    assert result.actions == [marker]
+
+
+def test_build_failure_is_skipped_when_exit_on_init_failure_is_false(monkeypatch):
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", _broken)
+
+    config = {"voice_tts": {"enabled": True, "exit_on_init_failure": False}}
+
+    result = voice_tts.build_voice_tts(LaunchBuildContext(robot_config=config))
+
+    assert result.actions == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"voice_tts": {"enabled": True, "exit_on_init_failure": True}},
+        {"voice_tts": {"enabled": True}},
+        {"voice_tts": {"enabled": True, "exit_on_init_failure": "false"}},
+        {"voice_tts": None},
+        {},
+    ],
+    ids=["true", "default", "string", "none", "missing"],
+)
+def test_build_failure_stops_the_launch_otherwise(monkeypatch, config):
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", _broken)
+
+    with pytest.raises(ValueError, match="WORKSPACE"):
+        voice_tts.build_voice_tts(LaunchBuildContext(robot_config=config))

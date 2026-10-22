@@ -245,6 +245,10 @@ class AudioIOConfig:
 
     enabled: bool = False
     microphone: str = ""
+    #: 只决定播放侧，与采集轴互相独立（不得由 source 推导）：
+    #: alsa = 启动本机 audio_play 播放节点；
+    #: runtime = 扬声器由机器人 runtime 提供，必须用 voice_tts.audio_output 绑定其播放接口。
+    playback_source: str = "alsa"
     capture_topic: str = "/audio/capture"
     capture_stamped_topic: str = "/audio/capture_stamped"
     audio_info_topic: str = "/audio/info"
@@ -296,6 +300,10 @@ class VoiceTTSConfig:
     #: Bound to the runtime's audio.play interface (runtime-owned-audio-io);
     #: the resolved topic and playback format are written by bind_robot_interfaces.
     audio_output: dict[str, Any] | None = None
+    #: Opt-in conversion of synthesized audio to the playback sample rate (the
+    #: bound runtime rate, or audio_io.playback_sample_rate for a local sink).
+    resample_to_playback_rate: bool = False
+    chunk_ms: int = 50
 
 
 @dataclass

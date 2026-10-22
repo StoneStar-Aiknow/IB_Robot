@@ -283,6 +283,16 @@ class AimdkRuntimeNode(Node):
         # Telemetry that must be timely gets its own group.
         self._telemetry_cb = MutuallyExclusiveCallbackGroup()
         self._joint_pub_cb = MutuallyExclusiveCallbackGroup()
+        # The command streams get their own group for the same reason: behind
+        # the joint torrent the arm stream was taken up about twice a second on
+        # the robot, so the platform got a stale pose, then nothing once it
+        # aged past stream_staleness_s, then a jump.
+        self._command_cb = MutuallyExclusiveCallbackGroup()
+        # The speaker stream too: behind the joint torrent a 1 s phrase came
+        # out as 3-11 of its 20 chunks spread over up to 5 s, the depth-10
+        # queue having dropped the rest. Mutually exclusive, so chunks of one
+        # phrase are still published in the order they arrive.
+        self._audio_cb = MutuallyExclusiveCallbackGroup()
         # Stop and status must never queue behind a mode switch that is
         # waiting for the platform's confirmation: they run in their own
         # reentrant group, and the stop path serialises itself.
@@ -460,11 +470,14 @@ class AimdkRuntimeNode(Node):
         self._audio_info_pub = self.create_publisher(AudioInfo, str(audio.get("info_topic", "/audio/info")), 1)
         self._audio_stamped_type = AudioDataStamped
         self._audio_info_type = AudioInfo
+        # BEST_EFFORT by default, as the SDK's raw-audio examples subscribe; the
+        # profile's vendor.qos explains why (a RELIABLE reader lets the platform
+        # retransmit from its 1000-deep capture history).
         self.create_subscription(
             audio_capture_type,
             str(topics["audio_capture"]),
             self._on_audio_capture,
-            self._vendor_qos("audio_capture", reliability="reliable"),
+            self._vendor_qos("audio_capture", reliability="best_effort", depth=500),
         )
         if topics.get("audio_playback"):
             from aimdk_msgs.msg import AudioPlayback, FocusResponse  # noqa: PLC0415
@@ -496,7 +509,11 @@ class AimdkRuntimeNode(Node):
                 self._vendor_qos("audio_focus_response", reliability="reliable", durability="transient_local"),
             )
             self.create_subscription(
-                AudioDataStamped, str(audio.get("play_topic", "/audio/play")), self._on_audio_play, _SENSOR_QOS
+                AudioDataStamped,
+                str(audio.get("play_topic", "/audio/play")),
+                self._on_audio_play,
+                _SENSOR_QOS,
+                callback_group=self._audio_cb,
             )
             self._focus_timer = self.create_timer(0.1, self._audio_focus_tick, callback_group=self._client_cb)
 
@@ -682,7 +699,11 @@ class AimdkRuntimeNode(Node):
             topic = str(channel["topic"])
             if str(channel.get("type", "float64_array")).lower() == "twist":
                 self.create_subscription(
-                    Twist, topic, lambda message, name=name: self._on_twist(name, message), _SENSOR_QOS
+                    Twist,
+                    topic,
+                    lambda message, name=name: self._on_twist(name, message),
+                    _SENSOR_QOS,
+                    callback_group=self._command_cb,
                 )
                 continue
             self.create_subscription(
@@ -690,6 +711,7 @@ class AimdkRuntimeNode(Node):
                 topic,
                 lambda message, channel=channel: self._on_stream(channel, message),
                 _SENSOR_QOS,
+                callback_group=self._command_cb,
             )
 
         if self._state.has_capability("interaction.tts"):

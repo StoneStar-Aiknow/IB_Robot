@@ -535,6 +535,8 @@ _TENSOR_TORCH = (
 _TENSOR_TORCH_NPU = (("tensor_model", "graspgenx", "generate_grasps"),)
 _POLICY_ASCEND = (("policy", "act", "predict"), ("policy", "pi05", "predict"))
 _TENSOR_ASCEND = (
+    ("tensor_model", "yolox_person", "detect"),
+    ("tensor_model", "pear_parameter_network", "predict_parameters"),
     ("tensor_model", "ram_plus", "recognize_tags"),
     ("tensor_model", "sam2", "automatic"),
     ("tensor_model", "sam2", "prompt"),

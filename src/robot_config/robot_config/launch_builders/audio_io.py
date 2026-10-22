@@ -33,7 +33,16 @@ def generate_audio_io_actions(robot_config: dict[str, Any]) -> list[Node]:
     capture_enabled = bool(robot_config.get("voice_asr", {}).get("enabled", False)) or bool(
         robot_config.get("speech_direction", {}).get("enabled", False)
     )
-    playback_enabled = bool(robot_config.get("voice_tts", {}).get("enabled", False))
+    voice_tts = robot_config.get("voice_tts", {})
+    playback_enabled = bool(voice_tts.get("enabled", False))
+    playback_source = str(config.get("playback_source", "alsa")).strip() or "alsa"
+    if playback_enabled and playback_source == "runtime":
+        # 播放端由 runtime 驱动（如 aimdk audio.play）：扬声器归 runtime，本机不启动 ALSA
+        # 播放节点，避免本机声卡与 runtime 同时订阅播放 topic。绑定关系由
+        # voice_tts.audio_output 表达，两者一致性由 loader 的
+        # validate_audio_playback_config 在每次加载配置时保证。
+        logger.info("audio_io.playback_source=runtime: speaker is runtime-owned, skipping audio_play_node")
+        playback_enabled = False
     if not capture_enabled and not playback_enabled:
         return []
     from robot_runtime.peripherals import audio_capture_node, audio_play_node

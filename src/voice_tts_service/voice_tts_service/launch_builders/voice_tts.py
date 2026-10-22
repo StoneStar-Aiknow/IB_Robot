@@ -17,6 +17,7 @@ from typing import Any
 from launch_ros.actions import Node
 
 from robot_config.audio_contract import is_audio_io_enabled
+from robot_config.cann_runtime import ascend_node_environment, resolve_cann_root
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
@@ -51,6 +52,32 @@ def resolve_voice_tts_path(path: str) -> str:
     if not workspace.is_absolute():
         raise ValueError("WORKSPACE must be absolute for a relative voice_tts.bundle_path")
     return str((workspace / candidate).resolve())
+
+
+def _ascend_node_environment(bundle_path: str, deployment: str) -> dict[str, str]:
+    """CANN paths for an Ascend deployment, chosen from the ABI its OM files were built against.
+
+    The ZipVoice OM files declare ``cann-8.1.RC1``; loading them under a different CANN runtime
+    crashes inside ACL (observed on the 310P, 2026-10-16), so the node must not inherit whichever
+    toolkit the caller sourced. Non-Ascend deployments get no extra environment.
+    """
+    from inference_manifest import load_inference_manifest
+
+    try:
+        validated = load_inference_manifest(bundle_path, deployment)
+    except Exception:  # The node validates the bundle itself and reports a usable error.
+        return {}
+    profiles = dict(validated.deployment.role_runtime_profiles or {})
+    if not profiles and validated.deployment.runtime_profile is not None:
+        profiles = {"": validated.deployment.runtime_profile}
+    ascend = [profile for profile in profiles.values() if profile.backend == "ascend"]
+    if not ascend:
+        return {}
+    abis = {profile.target.runtime_abi for profile in ascend if profile.target is not None}
+    abis.discard(None)
+    if len(abis) > 1:
+        raise ValueError(f"voice_tts deployment {deployment!r} declares conflicting CANN ABIs: {sorted(abis)}")
+    return ascend_node_environment(resolve_cann_root(next(iter(abis), None)))
 
 
 def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
@@ -102,6 +129,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         if audio_output.get("type") != "audio_common_msgs/msg/AudioDataStamped":
             raise ValueError("voice_tts.audio_output requires AudioDataStamped")
         audio_topic = audio_output["topic"]
+        audio_message_type = "audio_common_msgs/msg/AudioDataStamped"
         playback_sample_rate = int(audio_output.get("sample_rate_hz", 24000))
         playback_channels = int(audio_output.get("channels", 1))
     else:
@@ -109,6 +137,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         if not is_audio_io_enabled(audio_io):
             raise ValueError("voice_tts.enabled=true requires audio_io.enabled=true")
         audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
+        audio_message_type = "audio_common_msgs/msg/AudioData"
         playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
         playback_channels = int(audio_io.get("playback_channels", 1))
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
@@ -119,6 +148,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             name=node_name,
             output="screen",
             parameters=[node_params],
+            additional_env=_ascend_node_environment(bundle_path, deployment),
         ),
         Node(
             package="voice_tts_service",
@@ -139,6 +169,9 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "audio_topic": audio_topic,
                     "playback_sample_rate": playback_sample_rate,
                     "playback_channels": playback_channels,
+                    "audio_message_type": audio_message_type,
+                    "resample_to_playback_rate": bool(config.get("resample_to_playback_rate", False)),
+                    "chunk_ms": int(config.get("chunk_ms", 50)),
                 }
             ],
         ),
@@ -153,9 +186,25 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
 
 
 def build_voice_tts(context: LaunchBuildContext) -> BuildResult:
+    """Voice TTS actions; with ``voice_tts.exit_on_init_failure: false`` a failure only skips them.
+
+    That flag already keeps a ZipVoice that fails to start from stopping the launch; a voice TTS
+    that cannot even be launched (no WORKSPACE, a binding that does not resolve, ...) is treated
+    the same way.
+    """
     from voice_tts_service.launch_builders.voice_tts import generate_voice_tts_nodes
 
-    nodes = generate_voice_tts_nodes(context.robot_config)
+    try:
+        nodes = generate_voice_tts_nodes(context.robot_config)
+    except Exception as exc:
+        voice_tts_config = context.robot_config.get("voice_tts") or {}
+        if not isinstance(voice_tts_config, dict) or voice_tts_config.get("exit_on_init_failure", True) is not False:
+            raise
+        logger.error(
+            f"generating voice TTS nodes: {type(exc).__name__}: {exc}; "
+            "continuing without voice TTS (voice_tts.exit_on_init_failure is false)"
+        )
+        return BuildResult(actions=[])
     if nodes:
         logger.info(f"Added {len(nodes)} voice TTS node(s)")
     return BuildResult(actions=list(nodes))
