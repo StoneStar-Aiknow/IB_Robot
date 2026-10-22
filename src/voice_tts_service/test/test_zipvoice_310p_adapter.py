@@ -8,23 +8,21 @@ import pytest
 from inference_service.backends.errors import BackendInferenceError
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from voice_tts_service.errors import BackendLoadError
-from voice_tts_service.zipvoice_310p_adapter import ZipVoiceAscendSession, _ChineseTokenizer
+from voice_tts_service.zipvoice_310p_adapter import ZipVoiceAscendSession, _EmiliaTokenizer
+from voice_tts_service.zipvoice_shared import TokenGroup, duration_model, plan_chunks
 
 
 class _Tokenizer:
     pad_id = 0
+    tail_sentinel = ()
 
     @staticmethod
-    def text_to_tokens(text):
-        return list(text)
+    def text_to_groups(text):
+        return [TokenGroup((char,), "zh") for char in text]
 
     @staticmethod
     def tokens_to_ids(tokens):
         return [1] * len(tokens)
-
-    @staticmethod
-    def chunk_tokens(tokens, max_tokens):
-        return [tokens[index : index + max_tokens] for index in range(0, len(tokens), max_tokens)]
 
 
 class _Tensor:
@@ -114,8 +112,40 @@ def test_verified_310p_session_runs_four_flow_steps_and_returns_pcm():
 
     outputs = session._execute(_request(), _context())
 
-    assert outputs["tts.audio"].shape == (240,)
+    # 240 vocoded samples plus the default 100 ms of trailing silence at 24 kHz.
+    assert outputs["tts.audio"].shape == (240 + 2400,)
     assert session.roles == [(0, "text_encoder")] + [(1, "flow_decoder_1537")] * 4
+
+
+def test_310p_session_lays_out_planned_frames_after_the_encoder_prompt_layout():
+    session = _session()
+    session._tokenizer.text_to_groups = lambda text: [
+        TokenGroup(("a1",), "zh"),
+        TokenGroup((",",), "punct"),
+        TokenGroup(("b1",), "zh"),
+        TokenGroup((".",), "punct"),
+    ]
+    inputs = {}
+    run_role = session._run_role
+
+    def capture(role_index, role, values):
+        inputs.setdefault(role, dict(values))
+        return run_role(role_index, role, values)
+
+    session._run_role = capture
+    session._execute(_request("a,b."), _context())
+
+    (plan,) = plan_chunks(
+        session._tokenizer.text_to_groups(""),
+        duration_model(session._prompt, session._config),
+        max_tokens=256,
+        max_target_frames=1537 - 302,
+    )
+    flow = inputs["flow_decoder_1537"]
+    # The encoder runs at speed 1 and only supplies embeddings; 29 prompt tokens keep 302 // 29 = 10
+    # frames each, and the target tokens follow with their planned frames.
+    assert float(inputs["text_encoder"]["host.zipvoice.speed"]) == 1.0
+    assert int((~flow["host.zipvoice.flow_padding_mask"]).sum()) == 290 + sum(plan.frames)
 
 
 def test_verified_310p_deployment_explicitly_rejects_request_prompt():
@@ -124,27 +154,55 @@ def test_verified_310p_deployment_explicitly_rejects_request_prompt():
     assert error.value.code == "unsupported_prompt"
 
 
-def test_chinese_frontend_rejects_ascii_before_loading_optional_dependencies(tmp_path, monkeypatch):
-    token_file = tmp_path / "tokens.txt"
-    token_file.write_text("_\t0\n.\t1\n", encoding="utf-8")
+def _install_fake_frontend(monkeypatch, *, english=True):
     fake_cn2an = SimpleNamespace(transform=lambda value, _mode: value)
     fake_jieba = SimpleNamespace(
         default_logger=SimpleNamespace(setLevel=lambda _level: None), initialize=lambda: None, cut=lambda value: [value]
     )
-    fake_pypinyin = SimpleNamespace(Style=SimpleNamespace(TONE3="tone3"), lazy_pinyin=lambda words, **kwargs: words)
-    fake_tone = SimpleNamespace(to_finals_tone3=lambda *args, **kwargs: "", to_initials=lambda *args, **kwargs: "")
+    fake_pypinyin = SimpleNamespace(
+        Style=SimpleNamespace(TONE3="tone3"),
+        lazy_pinyin=lambda words, **kwargs: ["a1" for word in words for _char in word],
+    )
+    fake_tone = SimpleNamespace(
+        to_finals_tone3=lambda syllable, **kwargs: syllable, to_initials=lambda *args, **kwargs: ""
+    )
     modules = {
         "cn2an": fake_cn2an,
         "jieba": fake_jieba,
         "pypinyin": fake_pypinyin,
         "pypinyin.contrib.tone_convert": fake_tone,
+        "piper_phonemize": SimpleNamespace(phonemize_espeak=lambda text, voice: [list(text.lower())])
+        if english
+        else None,
     }
     monkeypatch.setitem(sys.modules, "pypinyin.contrib", SimpleNamespace(tone_convert=fake_tone))
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    tokenizer = _ChineseTokenizer(token_file)
 
-    with pytest.raises(Exception, match="not English words"):
+
+def test_frontend_tokenizes_mixed_chinese_and_english_words(tmp_path, monkeypatch):
+    token_file = tmp_path / "tokens.txt"
+    token_file.write_text("_\t0\n.\t1\n \t2\na1\t3\nr\t4\no\t5\ns\t6\n", encoding="utf-8")
+    _install_fake_frontend(monkeypatch)
+    tokenizer = _EmiliaTokenizer(token_file)
+
+    groups = tokenizer.text_to_groups("打开ROS")
+
+    assert [(group.kind, group.tokens) for group in groups] == [
+        ("zh", ("a1", "a1")),
+        ("en", ("r", "o", "s")),
+        ("punct", (".",)),
+    ]
+
+
+def test_frontend_reports_english_without_the_espeak_dependency(tmp_path, monkeypatch):
+    token_file = tmp_path / "tokens.txt"
+    token_file.write_text("_\t0\n.\t1\na1\t3\n", encoding="utf-8")
+    _install_fake_frontend(monkeypatch, english=False)
+    tokenizer = _EmiliaTokenizer(token_file)
+
+    assert tokenizer.text_to_tokens("打开") == ["a1", "a1", "."]
+    with pytest.raises(Exception, match="requires piper_phonemize"):
         tokenizer.text_to_tokens("hello")
 
 
@@ -154,12 +212,8 @@ def test_frontend_import_failure_is_reported(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "cn2an", None)
 
     with pytest.raises(BackendLoadError, match="dependency is unavailable"):
-        _ChineseTokenizer(token_file)
+        _EmiliaTokenizer(token_file)
 
 
 def test_ellipsis_is_treated_as_sentence_punctuation():
-    assert _ChineseTokenizer._map_punctuation("等等……") == "等等."
-    assert _ChineseTokenizer.chunk_tokens(["deng3", ".", "hao3", "."], 3) == [
-        ["deng3", "."],
-        ["hao3", "."],
-    ]
+    assert _EmiliaTokenizer._map_punctuation("等等……") == "等等."

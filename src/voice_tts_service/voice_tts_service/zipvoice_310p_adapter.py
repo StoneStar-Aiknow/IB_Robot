@@ -15,11 +15,23 @@ from inference_service.backends.errors import BackendInferenceError as SessionIn
 from inference_service.backends.errors import BackendLoadError as SessionLoadError
 from inference_service.model_sessions import AscendOmModelSession
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
-from voice_tts_service.errors import BackendInferenceError, BackendLoadError
-from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
+from voice_tts_service.errors import BackendLoadError
+from voice_tts_service.zipvoice_shared import (
+    DEFAULT_CLAUSE_CHUNK_TOKENS,
+    DEFAULT_TAIL_SILENCE_MS,
+    ChunkPlan,
+    EmiliaTokenizer,
+    PromptProfile,
+    chunk_conditions,
+    content_frame_count,
+    duration_model,
+    join_chunks,
+    plan_chunks,
+    timesteps,
+)
 
 _PromptProfile = PromptProfile
-_ChineseTokenizer = ChineseTokenizer
+_EmiliaTokenizer = EmiliaTokenizer
 
 
 class ZipVoiceAscendSession(AscendOmModelSession):
@@ -114,7 +126,7 @@ class ZipVoiceAscendSession(AscendOmModelSession):
         if features.shape[2] != 100 or not np.isfinite(features).all():
             raise BackendLoadError("ZipVoice prompt profile features are invalid")
         self._prompt = PromptProfile(tokens=tokens, features=features)
-        self._tokenizer = ChineseTokenizer(self._asset("tokens_path"))
+        self._tokenizer = EmiliaTokenizer(self._asset("tokens_path"), lexicon=self._config.get("lexicon"))
         self._load_vocos()
 
     def _load_vocos(self) -> None:
@@ -139,24 +151,6 @@ class ZipVoiceAscendSession(AscendOmModelSession):
     def _timesteps(num_steps: int, t_shift: float) -> np.ndarray:
         return timesteps(num_steps, t_shift)
 
-    @staticmethod
-    def _max_target_tokens(
-        flow_frames: int,
-        prompt_frames: int,
-        prompt_tokens: int,
-        speed: float,
-        text_capacity: int,
-    ) -> int:
-        for target in range(text_capacity, 0, -1):
-            frames = int(np.ceil(prompt_frames / prompt_tokens * (prompt_tokens + target) / speed))
-            if frames <= flow_frames:
-                return target
-        raise BackendInferenceError("flow bucket cannot fit one target token")
-
-    @staticmethod
-    def _cross_fade_concat(waves: list[np.ndarray], sample_rate: int, seconds: float) -> np.ndarray:
-        return cross_fade_concat(waves, sample_rate, seconds)
-
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
         context.check("backend")
         if any(value is None for value in (self._tokenizer, self._prompt, self._torch, self._vocos)):
@@ -176,36 +170,40 @@ class ZipVoiceAscendSession(AscendOmModelSession):
         config = self._config
         text_capacity = int(config.get("text_capacity", 256))
         flow_frames = int(config.get("flow_frames", 1537))
-        speed = float(config.get("speed", 1.0))
         num_steps = int(config.get("num_steps", 4))
         t_shift = float(config.get("t_shift", 0.5))
         sample_rate = int(config.get("sample_rate", 24000))
         prompt = self._prompt
-        token_strings = self._tokenizer.text_to_tokens(text)
-        chunk_capacity = self._max_target_tokens(
-            flow_frames,
-            prompt.frame_count,
-            int(prompt.tokens.shape[1]),
-            speed,
-            text_capacity,
+        durations = duration_model(prompt, config)
+        plans = plan_chunks(
+            self._tokenizer.text_to_groups(text),
+            durations,
+            max_tokens=text_capacity,
+            max_target_frames=flow_frames - prompt.frame_count,
+            sentinel=self._tokenizer.tail_sentinel if config.get("tail_sentinel", True) else (),
+            clause_chunk_tokens=int(config.get("clause_chunk_tokens", DEFAULT_CLAUSE_CHUNK_TOKENS)),
         )
-        chunks = self._tokenizer.chunk_tokens(token_strings, chunk_capacity)
         timesteps = self._timesteps(num_steps, t_shift)
         rng = np.random.default_rng(int(config.get("seed", 42)))
-        waves = [self._synthesize_chunk(chunk, rng, timesteps) for chunk in chunks]
+        waves = [self._synthesize_chunk(plan, rng, timesteps) for plan in plans]
         if not waves:
             raise SessionInferenceError("ZipVoice frontend produced no token chunks")
-        wave = self._cross_fade_concat(waves, sample_rate, float(config.get("cross_fade_sec", 0.1)))
+        wave = join_chunks(
+            waves,
+            [plan.pause_after_ms for plan in plans],
+            sample_rate,
+            tail_silence_ms=int(config.get("tail_silence_ms", DEFAULT_TAIL_SILENCE_MS)),
+        )
         if wave.size == 0 or not np.isfinite(wave).all():
             raise SessionInferenceError("ZipVoice produced invalid audio")
         return {"tts.audio": np.ascontiguousarray(np.clip(wave, -1.0, 1.0), dtype=np.float32)}
 
-    def _synthesize_chunk(self, tokens: list[str], rng, timesteps: np.ndarray) -> np.ndarray:
+    def _synthesize_chunk(self, plan: ChunkPlan, rng, timesteps: np.ndarray) -> np.ndarray:
         config = self._config
         prompt = self._prompt
         text_capacity = int(config.get("text_capacity", 256))
         flow_frames = int(config.get("flow_frames", 1537))
-        ids = self._tokenizer.tokens_to_ids(tokens)
+        ids = self._tokenizer.tokens_to_ids(plan.tokens)
         padded = np.full((1, text_capacity), self._tokenizer.pad_id, dtype=np.int64)
         padded[0, : len(ids)] = ids
         text_inputs = {
@@ -213,27 +211,26 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             "host.zipvoice.tokens_len": np.asarray(len(ids), dtype=np.int64),
             "host.zipvoice.prompt_tokens": prompt.tokens,
             "host.zipvoice.prompt_features_len": np.asarray(prompt.frame_count, dtype=np.int64),
-            "host.zipvoice.speed": np.asarray(float(config.get("speed", 1.0)), dtype=np.float32),
+            # The encoder only supplies token embeddings; durations come from the plan.
+            "host.zipvoice.speed": np.asarray(1.0, dtype=np.float32),
         }
         values: dict[str, object] = dict(text_inputs)
         text_outputs = self._run_role(0, self._text_role, values)
         text_full = np.asarray(text_outputs["host.zipvoice.text_condition"], dtype=np.float32).reshape(1, -1, 100)
-        features_len = int(np.asarray(text_outputs["host.zipvoice.features_len"]).reshape(()))
-        mask_full = np.asarray(text_outputs["host.zipvoice.padding_mask"], dtype=np.bool_).reshape(1, -1)
+        encoder_len = int(np.asarray(text_outputs["host.zipvoice.features_len"]).reshape(()))
+        condition, speech, plan = chunk_conditions(plan, prompt, text_full[0, :encoder_len], encoder_len)
+        features_len = int(condition.shape[0])
         if not prompt.frame_count < features_len <= flow_frames:
             raise SessionInferenceError(
                 f"ZipVoice chunk requires {features_len} frames outside supported range "
                 f"({prompt.frame_count + 1}..{flow_frames})"
             )
         text_condition = np.zeros((1, flow_frames, 100), dtype=np.float32)
+        text_condition[0, :features_len] = condition
         padding_mask = np.ones((1, flow_frames), dtype=np.bool_)
-        copy_frames = min(flow_frames, text_full.shape[1])
-        text_condition[:, :copy_frames] = text_full[:, :copy_frames]
-        padding_mask[:, :copy_frames] = mask_full[:, :copy_frames]
-        text_condition[:, features_len:] = 0.0
-        padding_mask[:, features_len:] = True
+        padding_mask[:, :features_len] = False
         speech_condition = np.zeros((1, flow_frames, 100), dtype=np.float32)
-        speech_condition[:, : prompt.frame_count] = prompt.features
+        speech_condition[0, :features_len] = speech
         x = rng.standard_normal((1, flow_frames, 100), dtype=np.float32)
         for step in range(len(timesteps) - 1):
             values.update(
@@ -253,10 +250,11 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             if not np.isfinite(velocity).all():
                 raise SessionInferenceError("ZipVoice flow decoder produced NaN or Inf")
             x += velocity * np.float32(timesteps[step + 1] - timesteps[step])
-        generated = x[:, prompt.frame_count : features_len, :]
-        features = np.transpose(generated, (0, 2, 1)) / np.float32(config.get("feature_scale", 0.1))
+        generated = x[0, prompt.frame_count : features_len, :]
+        generated = generated[: content_frame_count(plan, generated)]
+        features = np.transpose(generated[None], (0, 2, 1)) / np.float32(config.get("feature_scale", 0.1))
         with self._torch.inference_mode():
-            return self._vocos(self._torch.from_numpy(features)).cpu().numpy()[0]
+            return self._vocos(self._torch.from_numpy(np.ascontiguousarray(features))).cpu().numpy()[0]
 
     def _release_assets(self) -> None:
         self._vocos = None

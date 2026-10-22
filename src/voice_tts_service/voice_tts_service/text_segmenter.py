@@ -7,15 +7,44 @@ import unicodedata
 
 from voice_tts_service.errors import TTSError
 
-_PRIMARY_BOUNDARIES = frozenset("。！？!?；;")
+_PRIMARY_BOUNDARIES = frozenset("。！？!?；;.")
 _SECONDARY_BOUNDARIES = frozenset("，、：:,")
-_SUPPORTED_PUNCTUATION = _PRIMARY_BOUNDARIES | _SECONDARY_BOUNDARIES | frozenset(".…")
+_SUPPORTED_PUNCTUATION = _PRIMARY_BOUNDARIES | _SECONDARY_BOUNDARIES | frozenset("…")
 _FORMAT_MARKS = frozenset("#*_`~'\"‘’“”()（）[]【】{}<>《》")
+# Symbols the frontends read aloud after a number: cn2an and espeak both verbalize them.
+_UNIT_SYMBOLS = frozenset("%‰℃℉°")
+# Separators that are spoken inside numbers or words: dates, ranges, fractions, "state-of-the-art".
+_NUMBER_SEPARATORS = frozenset("-~/:")
+_WORD_SEPARATORS = frozenset("-'/")
+# Inline separators that are not spoken still mark only a short clause pause.
+_INLINE_SEPARATORS = frozenset("-‐‑‒–—―/\\|~")
 
 
 def _canonical_char(char: str) -> str:
     normalized = unicodedata.normalize("NFKC", char)
+    if char in "‘’":
+        return "'"
     return normalized if len(normalized) == 1 else char
+
+
+def _is_ascii_letter(char: str) -> bool:
+    return char.isascii() and char.isalpha()
+
+
+def _is_spoken_symbol(text: str, index: int) -> bool:
+    """Return whether a symbol carries meaning the frontend can verbalize in this context."""
+
+    char = _canonical_char(text[index])
+    before = text[index - 1] if index > 0 else ""
+    after = text[index + 1] if index + 1 < len(text) else ""
+    if char in _UNIT_SYMBOLS:
+        return before.isdigit()
+    if char in _NUMBER_SEPARATORS and before.isdigit() and after.isdigit():
+        return True
+    if char in _WORD_SEPARATORS and _is_ascii_letter(before) and _is_ascii_letter(after):
+        return True
+    # A leading minus sign is read as "负" or "minus"; after a word or digit it is a separator.
+    return char == "-" and after.isdigit() and not (before.isascii() and before.isalnum())
 
 
 def _is_supported_punctuation(char: str) -> bool:
@@ -48,11 +77,11 @@ def _nearest_content_char(text: str, start: int, step: int) -> str:
     return ""
 
 
-def _append_sentence_boundary(result: list[str]) -> None:
+def _append_sentence_boundary(result: list[str], boundary: str = "。") -> None:
     while result and result[-1].isspace():
         result.pop()
     if not result or not _is_supported_punctuation(result[-1]):
-        result.append("。")
+        result.append(boundary)
 
 
 def _sanitize_symbols(text: str) -> str:
@@ -60,6 +89,10 @@ def _sanitize_symbols(text: str) -> str:
     index = 0
     while index < len(text):
         char = text[index]
+        if _is_spoken_symbol(text, index):
+            result.append(_canonical_char(char))
+            index += 1
+            continue
         if _is_format_mark(char) or unicodedata.category(char) == "Cf":
             index += 1
             continue
@@ -83,7 +116,8 @@ def _sanitize_symbols(text: str) -> str:
             before = _nearest_content_char(text, start - 1, -1)
             after = _nearest_content_char(text, index, 1)
             if not _is_supported_punctuation(before) and not _is_supported_punctuation(after):
-                _append_sentence_boundary(result)
+                inline = all(_canonical_char(value) in _INLINE_SEPARATORS for value in text[start:index].strip())
+                _append_sentence_boundary(result, "，" if inline else "。")
             continue
         if unicodedata.category(char).startswith("C"):
             index += 1
@@ -97,12 +131,32 @@ def normalize_text(text: str) -> str:
     """Remove unsupported formatting and retain pauses around unspoken symbols."""
 
     normalized = unicodedata.normalize("NFKC", _sanitize_symbols(text))
+    # NFKC expands the temperature signs into "°C"/"°F"; keep them as one unit symbol.
+    normalized = normalized.replace("°C", "℃").replace("°F", "℉")
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_number_separator(text: str, index: int) -> bool:
+    return 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit()
+
+
+def _is_token_char(text: str, index: int) -> bool:
+    char = text[index]
+    return (char.isascii() and char.isalnum()) or _is_number_separator(text, index)
+
+
+def _avoid_splitting_token(text: str, limit: int) -> int:
+    """Move a forced character-window split to the start of a number or ASCII word when possible."""
+
+    boundary = limit
+    while boundary > 0 and _is_token_char(text, boundary - 1) and _is_token_char(text, boundary):
+        boundary -= 1
+    return boundary or limit
 
 
 def _candidate_boundary(text: str, limit: int, boundaries: frozenset[str]) -> int | None:
     for index in range(min(limit, len(text)) - 1, -1, -1):
-        if text[index] in boundaries:
+        if text[index] in boundaries and not _is_number_separator(text, index):
             return index + 1
     return None
 
@@ -115,7 +169,10 @@ def _split_bounded(text: str, max_chars: int) -> list[str]:
         if boundary is None:
             boundary = _candidate_boundary(remaining, max_chars, _SECONDARY_BOUNDARIES)
         if boundary is None:
-            boundary = max_chars
+            # English text without punctuation still splits between words.
+            boundary = _candidate_boundary(remaining, max_chars, frozenset(" "))
+        if boundary is None:
+            boundary = _avoid_splitting_token(remaining, max_chars)
         result.append(remaining[:boundary])
         remaining = remaining[boundary:]
     if remaining:

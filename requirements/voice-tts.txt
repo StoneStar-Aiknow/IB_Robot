@@ -4,6 +4,13 @@ proces==0.1.7
 jieba==0.42.1
 pypinyin==0.55.0
 
+# ZipVoice English frontend: espeak-ng IPA phonemes, the same frontend upstream
+# ZipVoice uses for its Emilia token table.  The wheel bundles libespeak-ng
+# (GPL-3.0-or-later) and espeak-ng-data.  Linux wheels exist only for
+# CPython 3.9-3.11 (x86_64 and aarch64); on other interpreters Chinese
+# synthesis keeps working and English requests fail with an explicit error.
+piper_phonemize==1.1.0; python_version < "3.12"
+
 # The ZipVoice Vocos checkpoint uses the project-pinned implementation in
 # voice_tts_service.vocos_backend.  Do not install PyPI vocos: its dependency
 # metadata can replace the workspace Torch/torchaudio ABI.

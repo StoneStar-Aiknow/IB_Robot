@@ -283,12 +283,50 @@ The current `ascend_310p` deployment:
 - Runs four host-scheduled Euler flow steps.
 - Runs Vocos with CPU PyTorch.
 - Produces 24 kHz mono WAV PCM16.
-- Supports Chinese, Arabic numbers, and common Chinese/English punctuation.
-- Input normalization removes Markdown formatting and control characters. Emoji and other unspoken symbols are
-  removed when adjacent to punctuation, otherwise replaced with a period to retain a pause. Line breaks also become
-  periods.
-- Rejects ASCII English words explicitly.
+- Supports Chinese, English, mixed Chinese/English text, Arabic numbers, and common Chinese/English punctuation.
+  Chinese uses cn2an + jieba + pypinyin and English uses `piper_phonemize` (espeak-ng `en-us` IPA); both map into
+  the bundle's Emilia token table. Numbers follow the language of the preceding word. `piper_phonemize` only ships
+  Linux wheels for CPython 3.9-3.11; without it Chinese still works and requests containing English fail explicitly.
+  Digits glued to a following letter after Chinese text are model names read digit by digit without tone sandhi
+  (`昇腾310P` reads "三一零P"), and common units after a number in Chinese text are read in Chinese
+  (`35ms` reads "三十五毫秒"). A built-in lexicon reads `openEuler` as "open欧拉"; the `lexicon` field adds entries.
+- Input normalization removes Markdown formatting and control characters. Symbols spoken inside numbers or words
+  are kept (`25℃`, `50%`, `3/4`, `2026-10-21`, `10:30`, `3~5`, `don't`, `state-of-the-art`), and Chinese dates,
+  clock times, thousands separators, and ranges are rewritten before cn2an. Unspoken inline separators (dashes,
+  slashes) become commas; emoji and other unspoken symbols are removed when adjacent to punctuation, otherwise
+  replaced with a period. Line breaks also become periods.
+- Model chunks pack whole clauses: once a chunk holds `clause_chunk_tokens` tokens it ends at the next punctuation
+  mark, very short clauses (such as "来，") merge with the next one, and an oversized clause falls back to word
+  boundaries, never splitting a word. Chunks are joined after trimming edge silence, with an exact pause chosen by the
+  chunk's final punctuation (250 ms for sentence ends, 120 ms for commas) instead of an overlapping cross-fade;
+  `tail_silence_ms` of silence ends the audio.
+- ZipVoice keeps speaking through the last generated frame (upstream k2-fsa/ZipVoice#166 truncates the final
+  syllable). Each chunk appends a pause and the sentinel syllable "嗯。", then crops at the quietest frame between the
+  final punctuation and the sentinel so the real final syllable finishes.
+- Duration control: the exported text encoder repeats every token's embedding for the same number of frames, so the
+  model gets no hint of how long a comma lasts or how fast English is, and scatters surplus time as pauses between
+  words. The runtime recovers one embedding per token and re-lays only the target text: Chinese at
+  `spoken_token_scale` of the prompt rate, English IPA further divided by `english_token_scale`, and 2 (comma) or
+  3 (sentence end) tokens of pause frames inside a chunk. The prompt keeps the exported encoder layout, where the
+  target starts inside the prompt's trailing silence; otherwise the model drops the first syllable of a chunk. Silence
+  is not forced into the speech condition: when the model's alignment drifts it also silences neighbouring syllables.
+  If the encoder output is not the expected per-token repeat layout, its own layout is kept.
 - Uses a fixed bundle prompt and does not support request-scoped voice cloning.
+
+Optional duration and pause fields in the runtime config (`assets/zipvoice_310p.json` / `assets/zipvoice_onnx.json`):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `speed` | `1.0` | Speaking rate; every generated frame is divided by it. The text encoder only supplies token embeddings and always runs at 1.0 |
+| `spoken_token_scale` | `0.95` | Spoken-token duration relative to the prompt's frames-per-token ratio; the default prompt actually speaks at about 0.98 |
+| `english_token_scale` | `1.8` | Extra compression for English IPA tokens; larger is faster. Applied per token, so Chinese in the same chunk keeps its rate |
+| `lexicon` | `{}` | Extra pronunciations: whole English words replaced by the given reading, e.g. `{"openEuler": "open欧拉"}` (built in) |
+| `tail_sentinel` | `true` | Enables sentinel cropping of the final syllable |
+| `clause_chunk_tokens` | `16` | A chunk ends at the next punctuation mark once it holds this many tokens; smaller is more precise and costs more 310P calls |
+| `tail_silence_ms` | `100` | Silence appended after the whole utterance |
+| `max_frames` | `2343` | ONNX only: prompt plus generated frame limit (about 25 s); 310P uses `flow_frames` |
+
+`cross_fade_sec` is no longer used.
 
 `ZipVoiceAscendSession` subclasses the shared `AscendOmModelSession` and is the `ModelSession` resource in the
 plugin's `RuntimeAssembly`. It owns the ACL lease, OM resources, Vocos, tokenizer, and prompt. The plugin calls

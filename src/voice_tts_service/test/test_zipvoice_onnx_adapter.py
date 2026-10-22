@@ -8,22 +8,20 @@ from inference_service.backends.errors import BackendInferenceError
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from voice_tts_service.errors import BackendLoadError
 from voice_tts_service.zipvoice_onnx_adapter import ZipVoiceOnnxSession
+from voice_tts_service.zipvoice_shared import TokenGroup
 
 
 class _Tokenizer:
     pad_id = 0
+    tail_sentinel = ()
 
     @staticmethod
-    def text_to_tokens(text):
-        return list(text)
+    def text_to_groups(text):
+        return [TokenGroup((char,), "zh") for char in text]
 
     @staticmethod
     def tokens_to_ids(tokens):
         return [1] * len(tokens)
-
-    @staticmethod
-    def chunk_tokens(tokens, max_tokens):
-        return [tokens[index : index + max_tokens] for index in range(0, len(tokens), max_tokens)]
 
 
 class _Tensor:
@@ -144,7 +142,8 @@ def test_onnx_session_runs_eight_flow_steps_and_returns_pcm():
 
     outputs = session._execute(_request(), _context())
 
-    assert outputs["tts.audio"].shape == (240,)
+    # 240 vocoded samples plus the default 100 ms of trailing silence at 24 kHz.
+    assert outputs["tts.audio"].shape == (240 + 2400,)
     assert outputs["tts.audio"].dtype == np.float32
 
 

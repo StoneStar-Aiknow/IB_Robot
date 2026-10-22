@@ -318,11 +318,42 @@ voice_tts:
 - Flow Decoder 由主机执行 4-step Euler 调度。
 - Vocos 当前在 CPU PyTorch 上执行。
 - 输出为 24 kHz、单声道 WAV PCM16。
-- 支持中文、阿拉伯数字和常用中英文标点。
-- 输入文本会移除 Markdown 格式符号和控制字符；表情或其他不可朗读符号若紧邻已有标点则直接移除，
-  否则替换为句号，以保留必要停顿；换行同样规范化为句号。
-- ASCII 英文单词会明确失败。
+- 支持中文、英文、中英混合、阿拉伯数字和常用中英文标点。中文走 cn2an + jieba + pypinyin，英文走
+  `piper_phonemize`（espeak-ng `en-us` IPA）；两者都在 bundle 的 Emilia token table 内。数字跟随前一个词的
+  语言（`第3号` 读中文、`I have 3 apples` 读英文）；中文后紧跟字母的数字视为型号逐位读（`昇腾310P` 读
+  "三一零P"，不做"一"的变调）；中文语境下数字后的常见单位读中文（`35ms` 读"三十五毫秒"、`2m` 读"两米"）。内置读音词典把 `openEuler` 读作"open欧拉"，可用配置字段 `lexicon` 追加。`piper_phonemize` 只有 CPython 3.9–3.11 的 Linux wheel，
+  未安装时中文照常合成，含英文的请求明确失败。
+- 输入文本会移除 Markdown 格式符号和控制字符。数字和单词内可朗读的符号会保留（`25℃`、`50%`、`3/4`、
+  `2026-10-21`、`10:30`、`3~5`、`don't`、`state-of-the-art`）；中文日期、时间、千分位和范围在 cn2an 之前改写，
+  避免 `2026-10-21` 被读成负数。不朗读的行内分隔符（破折号、斜杠）替换为逗号；表情等其他符号若紧邻已有标点
+  则直接移除，否则替换为句号；换行同样规范化为句号。
+- 每个模型块按分句装箱：一个块攒够 `clause_chunk_tokens` 个 token 后在下一个标点处结束，过短的分句（如"来，"）
+  与下一分句合并；分句超长时退到词边界，不会切断一个词。块之间先裁掉边缘静音，再按块尾标点插入精确停顿
+  （句号类 250 ms、逗号类 120 ms），不再交叠淡化；整段音频末尾补 `tail_silence_ms` 静音。
+- ZipVoice 会把生成段的最后一帧也当作仍在说话（上游 k2-fsa/ZipVoice#166 的尾字吞音），每块末尾追加一个停顿和
+  哨兵音节"嗯。"，生成后在句末标点与哨兵之间最安静的帧处裁掉，使真正的最后一个字完整收尾。
+- 时长控制：导出的 Text Encoder 把每个 token 的向量重复相同帧数，模型拿不到逗号该停多久、英文该多快的信息，
+  会把多余时间随机变成词间停顿。运行时从 Text Encoder 输出中取回每个 token 的向量，只重排目标文本部分：中文按
+  prompt 语速的 `spoken_token_scale` 倍，英文 IPA 再除以 `english_token_scale`，块内的逗号 2 个、句号 3 个 token
+  的停顿帧；prompt 部分保持导出模型的布局（目标文本从 prompt 尾部静音内开始），否则模型会吞掉块首字。
+  不在 speech condition 中强制写入静音：实测模型对齐有漂移时会把相邻的字一起压成静音。Text Encoder 输出若不是
+  预期的逐 token 重复布局，则保留原布局。
 - 使用 bundle 中的固定默认 prompt，不支持请求级音色克隆。
+
+运行时配置（`assets/zipvoice_310p.json` / `assets/zipvoice_onnx.json`）中与时长和停顿相关的可选字段：
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `speed` | `1.0` | 语速，所有生成帧除以该值；Text Encoder 只用于取 token 向量，固定以 1.0 调用 |
+| `spoken_token_scale` | `0.95` | 发音 token 相对 prompt 帧/token 比例的时长；默认 prompt 的实际语速约为 0.98 |
+| `english_token_scale` | `1.8` | 英文 IPA token 的额外压缩系数，越大英文越快；按 token 生效，不影响同块中文语速 |
+| `lexicon` | `{}` | 追加读音词典，整词匹配的英文单词替换为指定读法，例如 `{"openEuler": "open欧拉"}`（已内置） |
+| `tail_sentinel` | `true` | 是否启用尾字哨兵裁切 |
+| `clause_chunk_tokens` | `16` | 块达到该 token 数后在下一个标点处结束；越小停顿越准确，310P 上推理调用越多 |
+| `tail_silence_ms` | `100` | 整段音频末尾补的静音 |
+| `max_frames` | `2343` | 仅 ONNX：prompt 加生成段的帧数上限（约 25 s）；310P 使用 `flow_frames` |
+
+`cross_fade_sec` 已不再使用。
 
 `ZipVoiceAscendSession` 继承公共 `AscendOmModelSession`，作为 `RuntimeAssembly` 中的 `ModelSession`
 resource 持有 ACL lease、OM、Vocos、tokenizer 和 prompt。Plugin 调用
