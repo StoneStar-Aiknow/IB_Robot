@@ -1,0 +1,25 @@
+# AgiBot X2 "magic mirror" application configuration, board deployment.
+#
+# The magicmirror entry with the real vision-language model: everything is
+# inherited from aimdk_x2_magicmirror.yaml and only visual_interaction.vl is
+# swapped. fake answers nothing; internvl runs the 310P deployment directory
+# named below, the same one visual_interaction.phase0.live_chain uses, so the
+# phase-zero measurements carry over.
+#
+# That directory is the one machine-specific literal in this file: it is
+# created by the board deployment (not in this repository) and must be
+# re-checked before a launch. A missing directory fails at the first round,
+# not at startup, so verify it by hand:
+# ls /root/vlx_internvl_310p
+#
+# Everything else — the mirror stack, the voice, the gating, the utterance
+# wiring — is the base entry's; see its header.
+
+robot:
+  base_config: aimdk_x2_magicmirror.yaml
+  name: aimdk_x2_magicmirror_board
+
+  visual_interaction:
+    vl:
+      implementation: internvl
+      demo_root: /root/vlx_internvl_310p
