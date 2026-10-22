@@ -37,6 +37,15 @@ KINDS = (KIND_NONE, KIND_UNCERTAIN, KIND_OBJECT, KIND_DISPLAY)
 
 # Kinds that carry a candidate to speak. The others never produce an utterance.
 SPEAKABLE_KINDS = (KIND_OBJECT, KIND_DISPLAY)
+# Kinds an utterance may carry on the wire, which the mirror voice admits.
+# The two extra ones come from the chatter mode (visual_interaction.session
+# .chatter): there the model only names what it sees, and the line spoken is
+# chosen from a host-owned phrase bank, so an "action" utterance is our own
+# sentence keyed by a matched gesture, not a model's claim about one. They are
+# not in KINDS: the closed-schema model still cannot report a gesture.
+KIND_ACTION = "action"
+KIND_CHATTER = "chatter"
+UTTERANCE_KINDS = SPEAKABLE_KINDS + (KIND_ACTION, KIND_CHATTER)
 
 # The only subjects the first version may talk about.
 #

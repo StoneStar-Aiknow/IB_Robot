@@ -51,7 +51,7 @@ from std_msgs.msg import String
 
 from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC, STATE_TOPIC
 from embodied_common.mirror_voice_contract import NODE_NAME, VoiceSection, from_json, has_ascii_letters
-from embodied_common.visual_interaction_contract import SPEAKABLE_KINDS
+from embodied_common.visual_interaction_contract import UTTERANCE_KINDS
 from ibrobot_msgs.msg import VisualInteractionUtterance
 from ibrobot_msgs.srv import PlayAudioFile, SynthesizeSpeech
 from manipulation_execution.mirror_voice.speaker import Done, Speaker, SynthesisDone, WavDirectory
@@ -268,7 +268,7 @@ class MirrorVoiceNode(Node):
         queued behind the state phrases, and the speaker asks the gate once
         more when it would actually start synthesizing.
         """
-        if message.kind not in SPEAKABLE_KINDS:
+        if message.kind not in UTTERANCE_KINDS:
             self._refuse("kind")
             return
         if message.suppress_reason:
