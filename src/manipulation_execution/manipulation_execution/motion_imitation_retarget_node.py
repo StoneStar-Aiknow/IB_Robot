@@ -94,6 +94,7 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("lookahead_s", 0.25)
         self.declare_parameter("mirror", True)
         self.declare_parameter("elbow_spin_to_wrist", False)
+        self.declare_parameter("elbow_spin_gain", 0.5)
 
         self._pear_topic = _validated_topic(self.get_parameter("pear_frame_topic").value, "pear_frame_topic")
         preview_topic = _validated_topic(self.get_parameter("preview_topic").value, "preview_topic")
@@ -110,6 +111,9 @@ class MotionImitationRetargetNode(Node):
         if type(self.get_parameter("elbow_spin_to_wrist").value) is not bool:
             raise ValueError("elbow_spin_to_wrist must be a boolean")
         elbow_spin_to_wrist = self.get_parameter("elbow_spin_to_wrist").value
+        elbow_spin_gain = float(self.get_parameter("elbow_spin_gain").value)
+        if not 0.0 <= elbow_spin_gain <= 1.0:
+            raise ValueError("elbow_spin_gain must be within [0, 1]")
         retargeter = str(self.get_parameter("retargeter").value).strip()
 
         self._joint_names = tuple(json.loads(str(self.get_parameter("joint_names_json").value)))
@@ -122,7 +126,8 @@ class MotionImitationRetargetNode(Node):
         # The mapping runs in its own process: in a thread it holds the GIL long enough
         # to starve the 50 Hz timer (17 Hz on duck).
         stream = create_stream(retargeter, base_pose=reset_pose, latency_s=latency_s, lookahead_s=lookahead_s,
-                               mirror=mirror, elbow_spin_to_wrist=elbow_spin_to_wrist, separate_process=True)
+                               mirror=mirror, elbow_spin_to_wrist=elbow_spin_to_wrist,
+                               elbow_spin_gain=elbow_spin_gain, separate_process=True)
         if self._joint_names != tuple(stream.joint_names):
             raise ValueError(
                 f"joint_names_json {list(self._joint_names)} does not match the {retargeter} stream's joint "
@@ -145,8 +150,8 @@ class MotionImitationRetargetNode(Node):
         self._player.start()
         self.get_logger().info(
             f"motion imitation retarget ready: retargeter={retargeter}, {rate_hz:g} Hz, vel_scale={vel_scale:g}, "
-            f"mirror={mirror}, elbow_spin_to_wrist={elbow_spin_to_wrist}; paused until ~/play; "
-            f"computed commands go to {preview_topic} only"
+            f"mirror={mirror}, elbow_spin_to_wrist={elbow_spin_to_wrist}, elbow_spin_gain={elbow_spin_gain:g}; "
+            f"paused until ~/play; computed commands go to {preview_topic} only"
         )
 
     def _limit_arrays(self, limits: object) -> tuple[np.ndarray, np.ndarray]:

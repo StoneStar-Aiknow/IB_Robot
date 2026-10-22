@@ -416,6 +416,7 @@ def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
         "mirror": _required_bool(retarget, "mirror") if "mirror" in retarget else True,
         "elbow_spin_to_wrist": (_required_bool(retarget, "elbow_spin_to_wrist")
                                 if "elbow_spin_to_wrist" in retarget else False),
+        "elbow_spin_gain": _unit_interval(retarget, "elbow_spin_gain", 0.5),
     }
 
 
