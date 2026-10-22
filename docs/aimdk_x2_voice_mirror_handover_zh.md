@@ -239,3 +239,37 @@ source /home/agi/.aima/env/bashrc && aima em restart-app agent
 ros2 service call /aimdk_5Fmsgs/srv/SetAgentPropertiesRequest aimdk_msgs/srv/SetAgentPropertiesRequest \
   "{contents: {properties: [{key: {value: 2}, value: only_voice}]}}"
 ```
+
+## 12. 延迟实测与调优（2026-10-23 晚补充）
+
+### 12.1 "慢"花在哪（说话结束 → 听到回复，合计约 5.5–6 s）
+
+| 环节 | 实测 | 说明 |
+|---|---|---|
+| ASR 收尾 | ~1.5 s | `voice_asr.final_tail_padding_seconds = 1.5`；README 要求 ≥1.5，低于它“确认/招呼”这类句尾字会丢，别随便降 |
+| planner | 1.0–1.2 s | 本机 27B（`10.42.0.177:18094`），含目录 prompt 的 prefill |
+| ZipVoice 合成 | 1.9–2.1 s | **近似固定成本**：`"好的。"` 1.88 s（音频 0.46 s，RTF 4.09）、`"挥挥手，我正在挥手。"` 2.07 s（音频 1.95 s，RTF 1.06）→ 短回复也不便宜 |
+| 播放预缓冲 | 1.0 s | 厂商 speaker 契约 `write_chunk_ms: 200 / prebuffer_ms: 1000`（`profiles/x2_ultra.yaml`），属接口声明，不是本地参数，不建议改 |
+| 起播后分包 | 200 ms/包 | 只影响连续播放的粒度 |
+
+### 12.2 本次已调
+
+- `voice_bridge.resume_settle_sec`：`1.0 → 0.6`（写在 `aimdk_x2_voice_raw.yaml`）。
+  作用：回复播完后 ASR 保持静音的窗口，缩短轮次间隔。代价：尾音回灌风险上升，
+  若出现“它把自己的话当指令”，先调回 0.8–1.0。
+
+### 12.3 想真正“连续对话”，需要改代码（本次没做）
+
+1. **中间结果提前触发**：`/voice_partial` 命中已知技能别名时先规划执行，省掉 1.5 s 收尾。
+2. **按句合成、边合成边播**：现在整段回复一次合成（1.9 s 固定成本），改成第一句先合成先播。
+3. **对比 `external_vad`（厂商分段）**：厂商 VAD 的分段边界可能比 silero+1.5 s tail 更快，值得 A/B。
+4. **固定ack 缓存**：把“好的/收到”这类高频短句预合成成文件直接播，省掉合成那 1.9 s。
+
+### 12.4 复测命令
+
+```bash
+# 合成固定成本（看 inference_time_ms / total_duration_sec）
+ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech "{text: '好的。'}"
+# 轮次间隔（改 resume_settle_sec 后重启生效）
+ros2 param get /agent_voice_bridge resume_settle_sec
+```
