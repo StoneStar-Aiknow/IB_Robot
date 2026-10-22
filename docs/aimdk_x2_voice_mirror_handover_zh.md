@@ -60,6 +60,7 @@ https_proxy=http://127.0.0.1:7897 git push origin 1028_agi_lyx
 | `src/robot_config/config/robots/aimdk_x2_voice_raw.yaml` | 新 profile：语音 + 手势，ASR 走 `shared_audio`/`audio.capture` | 需要先在 `aimdk_x2_voice_agent` 之上确认部署口径；目录名（robot name）必须沿用 `aimdk_x2_skills` |
 | `src/robot_config/config/robots/aimdk_x2_voice_agent.yaml` | `planner.base_url` 改成 `http://10.42.0.177:18094/v1` | 现场地址，不入库 |
 | `libs/lerobot`（子模块） | checkout `a2be6a8a`（`requires-python >=3.11`） | 分支钉的 `30da8e68` 要 Python 3.12，板子是 3.11 |
+| `src/agent/ibrobot_agent/ibrobot_agent/voice_bridge.py` | 自言自语两处补丁：① 订阅厂商 `/aima/hal/audio/play_state`，PLAYING 时 `/voice_control stop`、STOPED 后 `start` + settle；② 丢掉“复述自己刚说的话”的 transcript（20s 窗口、归一化后 60% 重合） | liuweihong 的包；X2 专用（`aimdk_msgs` 不存在时自动跳过），需要与他对齐再上游 |
 
 ## 3. 板端工作区与关键路径
 
@@ -273,3 +274,29 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech "{text
 # 轮次间隔（改 resume_settle_sec 后重启生效）
 ros2 param get /agent_voice_bridge resume_settle_sec
 ```
+
+### 12.5 自言自语（原始流无 AEC）的处置——2026-10-23 夜
+
+原始流没有回声消除，麦克风会把机器人自己的播报再收一遍，于是它“回答自己”。两处板端补丁（都在
+`voice_bridge.py`，未入库）：
+
+1. **按厂商播放状态闭麦**：订阅 `/aima/hal/audio/play_state`（`aimdk_msgs/msg/PlayStateChange`），
+   `state=1(PLAYING)` 时向 `/voice_control` 发 `stop` 并置 `_deaf_until=inf`；`state=0/2` 时发 `start`
+   并留 `resume_settle_sec`。比“按 TTS 服务返回时刻”准，因为播放服务返回只代表队列交给了平台。
+2. **文本级回声过滤**：记下最近一次 `[say]` 的文本，20 秒内若 transcript 归一化后与它相同/包含/60%
+   重合，直接丢弃并打印 `ignored transcript that repeats the reply`。这一层是兜底：即使 ASR 缓冲区
+   里还有回声，也不会变成指令。
+
+代价与边界：**不能打断播报**（播报期间 ASR 是 stop 的）；用户若在机器人刚说完时原样重复它的话，会被当成回声丢掉。
+验证状态：代码已编译、ruff 通过、栈已重启，但在复测时机器人整机离线（见 12.6），**回声抑制尚未完成真机确认**。
+
+### 12.6 2026-10-23 01:54 机器人离线（交接时请先确认）
+
+- 现象：板子 `10.0.1.40/41/42` 全部 ping 不通、ARP `FAILED`/`PROBE`；`10.42.0.1` 也不通；
+  板子自身 `eth0` 地址正常（`10.0.1.15 / 10.42.0.178`），所以是**机器人侧或机器人网段**掉了，
+  不是板子或我们的栈。
+- 连带：`/aima/mc/common/state`、`/aima/sm/system_state`、`/aima/hal/audio/capture` 全部无 publisher，
+  runtime 在 `wait_for_runtime` 处 FAULTED（预期行为），`x2-voice` 起不来。
+- 恢复步骤：机器人上电/网络恢复 → 确认 `ping 10.0.1.42` 通 → `ros2 topic list | grep aima | wc -l`
+  能看到话题 → `systemd-run --unit=x2-voice --collect bash -c '/root/workspace/lyx/run_x2_voice_raw.sh > /tmp/x2_voice_raw.log 2>&1'`
+  → 看 `/runtime_status` 是否 ACTIVE、`/voice_status` 是否 listening。
