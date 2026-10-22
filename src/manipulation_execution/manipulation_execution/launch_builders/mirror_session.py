@@ -45,10 +45,38 @@ the gate's output reaches the robot or only the session's preview topics.
 Installing ``manipulation_execution`` does not enable the session:
 participation is still decided by the config (``mirror_session.enabled``),
 exactly as before the migration.
+
+``business`` names the start/cancel rules (``hooks``), the cover judge and the
+business config file both nodes read; ``config`` is resolved here to an
+absolute path, whether the file exists is the nodes' check at startup. Only
+``""`` and ``demo`` hooks wrap the mock; any other business class and the mock
+are exclusive. ``operator.enabled`` appends the operator node (covered camera,
+head touch, LED) as the last action; without an ``operator`` block it is not
+launched. The operator's parameter names are listed here rather than imported:
+robot_config does not depend on manipulation_execution, so
+manipulation_execution's test_mirror_session_launch holds them against the
+node's declaration. Its ``set_session(false)`` wait is the contract's stop
+timeout plus margin, a constant: ``stop_timeout_sec`` can only be at most 4.5
+(the Gateway's ``mirror_stop`` timeout must exceed it by 0.5), so it is not
+passed.
+
+``voice.enabled`` appends the voice node (a short phrase as the session
+changes state, spoken through ``voice_tts``) after everything else. Voice is
+an extra and the mirror must start without it: a wrong ``voice`` section, a
+``voice_tts`` that cannot run, or any other error while working out the voice
+node only logs a WARNING and leaves the node out; it never fails this launch.
+The section is checked by ``embodied_common.mirror_voice_contract``, which the
+node shares; the services and timeouts are ``voice_tts``'s, with
+``VoiceTTSConfig``'s defaults for the keys it leaves out, as loading does not
+fill them in. Its parameter names are held against the node's declaration
+the same way as the operator's. The ``embodied_common`` contract imports are
+function-local: the module stays within the registry import budget (design
+decision 6 of ``migrate-business-launch-builders``).
 """
 
 import json
 import math
+import os
 from collections.abc import Mapping
 
 from launch.actions import RegisterEventHandler
@@ -57,10 +85,14 @@ from launch_ros.actions import Node
 
 from manipulation_execution.launch_builders.motion_imitation_stream import (
     mock_playback_endpoints,
+    mock_reset_pose,
+    mock_velocity_limits,
     motion_imitation_stream_parameters,
 )
 from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.logger_utils import get_colored_logger
+from robot_config.utils import resolve_ros_path
 
 _KEYS = frozenset(
     {
@@ -71,16 +103,52 @@ _KEYS = frozenset(
         "publish_rate_hz",
         "status_period_sec",
         "interfaces",
+        "business",
+        "operator",
+        "voice",
     }
 )
+_BUSINESS_KEYS = frozenset({"hooks", "cover_judge", "config"})
+_OPERATOR_KEYS = frozenset({"enabled", "send_enabled"})
+# The hooks that wrap the mock instead of replacing it.
+_MOCK_HOOKS = ("", "demo")
+# The Gateway's names, read as robot_skill_cli's catalog reads them, with its defaults.
+_GATEWAY_NAMES = (
+    ("gateway_status_service", "skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+    ("gateway_validate_service", "validate_skill_service", "/embodied/validate_skill"),
+    ("gateway_skill_action", "skill_action_name", "/embodied/execute_skill"),
+)
 _IDLE = "idle"
+_VOICE_OFF = "no voice node, the mirror starts without voice"
+
+logger = get_colored_logger("robot_config.mirror_session")
 
 
-def _bool(config: Mapping, key: str, default: bool) -> bool:
+def _bool(config: Mapping, key: str, default: bool, where: str = "mirror_session") -> bool:
     value = config.get(key, default)
     if type(value) is not bool:
-        raise ValueError(f"mirror_session.{key} must be a boolean")
+        raise ValueError(f"{where}.{key} must be a boolean")
     return value
+
+
+def _string(config: Mapping, key: str, where: str) -> str:
+    value = config.get(key, "")
+    if not isinstance(value, str):
+        raise ValueError(f"{where}.{key} must be a string")
+    return value
+
+
+def _block(config: Mapping, key: str, keys: frozenset) -> Mapping | None:
+    """``mirror_session.<key>``, its keys checked; None if it is absent."""
+    block = config.get(key)
+    if block is None:
+        return None
+    if not isinstance(block, Mapping):
+        raise ValueError(f"mirror_session.{key} must be a mapping")
+    unknown = sorted(set(block) - keys)
+    if unknown:
+        raise ValueError(f"mirror_session.{key} has unknown keys {unknown}")
+    return block
 
 
 def _number(config: Mapping, key: str, default: float, minimum: float) -> float:
@@ -134,11 +202,136 @@ def _runtime_description(robot_config: Mapping) -> str:
     return json.dumps(description, sort_keys=True)
 
 
+def _business(config: Mapping, mock: bool) -> dict:
+    """``hooks``, ``cover_judge`` and the absolute ``config`` path of ``mirror_session.business``."""
+    block = _block(config, "business", _BUSINESS_KEYS) or {}
+    business = {key: _string(block, key, "mirror_session.business") for key in sorted(_BUSINESS_KEYS)}
+    if business["config"]:
+        business["config"] = str(resolve_ros_path(business["config"]))
+        if not os.path.isabs(business["config"]):
+            raise ValueError(
+                f"mirror_session.business.config must resolve to an absolute path, got {business['config']!r}"
+            )
+    if mock and business["hooks"] not in _MOCK_HOOKS:
+        raise ValueError(
+            f"mirror_session.business.hooks {business['hooks']!r} replaces the mock: disable "
+            "motion_imitation_stream.mock_playback or use the demo hooks"
+        )
+    return business
+
+
+def _gateway_names(robot_config: Mapping) -> dict:
+    embodied = robot_config.get("embodied") or {}
+    if not isinstance(embodied, Mapping):
+        raise ValueError("embodied must be a mapping")
+    names = {}
+    for parameter, key, default in _GATEWAY_NAMES:
+        value = embodied.get(key, default)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"embodied.{key} must be a non-empty string")
+        names[parameter] = value
+    return names
+
+
+def _operator_parameters(robot_config: Mapping, config: Mapping, session: Mapping, business: Mapping) -> dict | None:
+    """The operator node's parameters, or None if ``mirror_session.operator`` does not enable it."""
+    block = _block(config, "operator", _OPERATOR_KEYS)
+    if block is None or not _bool(block, "enabled", False, "mirror_session.operator"):
+        return None
+    if not session["camera_topic"]:
+        raise ValueError(
+            "mirror_session.operator needs the camera: motion_imitation_stream must name its compressed frame source"
+        )
+    return {
+        "runtime_description_json": session["runtime_description_json"],
+        "camera_topic": session["camera_topic"],
+        # frame_source only takes a compressed camera.
+        "camera_kind": "compressed",
+        "business_config": business["config"],
+        "cover_judge": business["cover_judge"],
+        "send_enabled": _bool(block, "send_enabled", False, "mirror_session.operator"),
+        **_gateway_names(robot_config),
+        "status_period_sec": session["status_period_sec"],
+    }
+
+
+def _voice_tts_unmet(voice_tts: Mapping) -> list[str]:
+    """Why ``voice_tts`` cannot serve the voice node, judged as embodied's ``has_tts_runtime`` does."""
+    unmet = []
+    if voice_tts["enabled"] is not True:
+        unmet.append("voice_tts.enabled is not true")
+    for key in ("bundle_path", "deployment"):
+        if not str(voice_tts[key]).strip():
+            unmet.append(f"voice_tts.{key} is empty")
+    for key in ("service_name", "playback_service_name"):
+        if not str(voice_tts[key]).startswith("/"):
+            unmet.append(f"voice_tts.{key} is not an absolute ROS name")
+    for key in ("tts_timeout_sec", "playback_timeout_sec"):
+        value = voice_tts[key]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            unmet.append(f"voice_tts.{key} is not a positive number")
+    return unmet
+
+
+def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
+    """The voice node's parameters, or None if it is not to start; a WARNING says why when it is wrong."""
+    # Function-local imports: embodied_common stays out of the registry import
+    # budget, and VoiceTTSConfig is only needed when the voice node is enabled.
+    from embodied_common.mirror_voice_contract import SECTION_PATH as VOICE_PATH
+    from embodied_common.mirror_voice_contract import parse_voice_section, to_json
+    from robot_config.config import VoiceTTSConfig
+
+    section = config.get("voice")
+    if section is None:
+        return None
+    try:
+        voice = parse_voice_section(section)
+    except ValueError as exc:
+        logger.warning(f"{exc}; {_VOICE_OFF}")
+        return None
+    if not voice.enabled:
+        return None
+    given = robot_config.get("voice_tts")
+    given = given if isinstance(given, Mapping) else {}
+    defaults = VoiceTTSConfig()
+    voice_tts = {
+        key: given.get(key, getattr(defaults, key))
+        for key in (
+            "enabled",
+            "bundle_path",
+            "deployment",
+            "service_name",
+            "playback_service_name",
+            "tts_timeout_sec",
+            "playback_timeout_sec",
+        )
+    }
+    unmet = _voice_tts_unmet(voice_tts)
+    if unmet:
+        logger.warning(f"{VOICE_PATH}.enabled is true but voice_tts cannot run: {'; '.join(unmet)}; {_VOICE_OFF}")
+        return None
+    return {
+        "voice_json": to_json(voice),
+        "tts_service": str(voice_tts["service_name"]),
+        "playback_service": str(voice_tts["playback_service_name"]),
+        "tts_timeout_sec": float(voice_tts["tts_timeout_sec"]),
+        "playback_timeout_sec": float(voice_tts["playback_timeout_sec"]),
+        "status_period_sec": _number(config, "status_period_sec", 1.0, 0.0),
+    }
+
+
 def generate_mirror_session_nodes(robot_config: dict) -> list:
-    """The session node and its process-exit release, if the robot enables the session."""
-    # Function-local import: keep registry construction free of the
-    # embodied_common dependency chain.
-    from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC, NODE_NAME, RELEASE_RESERVE_SEC
+    """The session node, its process-exit release and, if enabled, the operator node and the voice node."""
+    # Function-local imports: keep registry construction free of the
+    # embodied_common dependency chain (import budget, design decision 6).
+    from embodied_common.mirror_session_contract import (
+        DEFAULT_STOP_TIMEOUT_SEC,
+        NODE_NAME,
+        OPERATOR_NODE_NAME,
+        RELEASE_RESERVE_SEC,
+    )
+    from embodied_common.mirror_voice_contract import NODE_NAME as VOICE_NODE_NAME
+    from embodied_common.mirror_voice_contract import SECTION_PATH as VOICE_PATH
 
     config = robot_config.get("mirror_session", {})
     if not isinstance(config, Mapping):
@@ -167,6 +360,9 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     }
     stream = motion_imitation_stream_parameters(robot_config) or {}
     mock = mock_playback_endpoints(robot_config) or ("", "")
+    reset_pose = mock_reset_pose(robot_config)
+    velocity = mock_velocity_limits(robot_config)
+    business = _business(config, mock=bool(mock[1]))
     parameters = {
         **release_parameters,
         "publish_enabled": _bool(config, "publish_enabled", False),
@@ -177,7 +373,12 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         "camera_topic": stream.get("rgb_compressed_topic", ""),
         "mock_preview_topic": mock[0],
         "mock_play_service": mock[1],
+        "mock_reset_pose_json": json.dumps(reset_pose) if reset_pose else "",
+        "mock_velocity_limits_json": json.dumps(velocity) if velocity else "",
+        "business_hooks": business["hooks"],
+        "business_config": business["config"],
     }
+    operator = _operator_parameters(robot_config, config, parameters, business)
     session = Node(
         package="manipulation_execution",
         executable="mirror_session_node",
@@ -192,7 +393,34 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         output="screen",
         parameters=[release_parameters],
     )
-    return [session, RegisterEventHandler(OnProcessExit(target_action=session, on_exit=[release]))]
+    actions = [session, RegisterEventHandler(OnProcessExit(target_action=session, on_exit=[release]))]
+    if operator is not None:
+        actions.append(
+            Node(
+                package="manipulation_execution",
+                executable="mirror_operator_node",
+                name=OPERATOR_NODE_NAME,
+                output="screen",
+                parameters=[operator],
+            )
+        )
+    # Voice is an extra; the mirror must start: no voice error may fail this launch.
+    try:
+        voice = _voice_parameters(robot_config, config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"{VOICE_PATH}: {type(exc).__name__}: {exc}; {_VOICE_OFF}")
+        voice = None
+    if voice is not None:
+        actions.append(
+            Node(
+                package="manipulation_execution",
+                executable="mirror_voice_node",
+                name=VOICE_NODE_NAME,
+                output="screen",
+                parameters=[voice],
+            )
+        )
+    return actions
 
 
 __all__ = ["generate_mirror_session_nodes"]

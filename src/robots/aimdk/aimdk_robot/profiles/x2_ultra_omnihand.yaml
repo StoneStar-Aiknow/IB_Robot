@@ -354,8 +354,11 @@ vendor:
       reliability: best_effort
       durability: transient_local
     audio_capture:
-      reliability: reliable
+      # The platform publishes this one; subscribe BEST_EFFORT like the SDK's
+      # raw-audio examples (rationale in x2_ultra.yaml).
+      reliability: best_effort
       durability: volatile
+      depth: 500
     audio_playback:
       reliability: reliable
       durability: volatile

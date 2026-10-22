@@ -19,6 +19,11 @@
 # relative to WORKSPACE, so `source .shrc_local` must have run and
 # `$WORKSPACE/models/` must hold them. A missing bundle fails config parsing,
 # which aborts the whole launch rather than just the perception part.
+#
+# The mirror voice (mirror_session.voice) says a short phrase as the session
+# changes state, through our ZipVoice (models/zipvoice, also on the 310P) and
+# the runtime's speaker. The voice is an extra: when it cannot start, the
+# mirror starts without it.
 
 robot:
   base_config: aimdk_x2_skills.yaml
@@ -55,6 +60,8 @@ robot:
       - interaction.expression
       - interaction.led
       - runtime.stop
+      # The mirror voice plays through the runtime's audio.play.
+      - interaction.audio_playback
 
   # Only the two motion-imitation models. Each entry becomes one generic
   # inference_service/model_service_node; nothing here is X2-specific, and the
@@ -85,6 +92,28 @@ robot:
         runtime_options:
           device_id: 0
 
+  # The voice's speech output; the base turns both off. ZipVoice speaks 24 kHz
+  # and the runtime's audio.play takes 16 kHz mono (/audio/play,
+  # AudioDataStamped), so the playback node resamples. The speaker is the
+  # runtime's: the audio_output binding carries the topic, format and rate
+  # from the live description, no local ALSA node is launched, and a provider
+  # robot declares no audio_io section at all (runtime-owned-audio-io).
+  # ZipVoice failing to start, or voice_tts failing to launch at all, must not
+  # take the mirror down, hence exit_on_init_failure false.
+  voice_tts:
+    enabled: true
+    bundle_path: models/zipvoice
+    deployment: ascend_310p
+    resample_to_playback_rate: true
+    exit_on_init_failure: false
+    audio_output:
+      interface: audio.play
+      type: audio_common_msgs/msg/AudioDataStamped
+      requires: {capability: interaction.audio_playback}
+    # The X2 runtime subscribes to AudioDataStamped on audio.play; without this the
+    # playback node keeps its AudioData default and the speaker never hears it.
+    audio_message_type: audio_common_msgs/msg/AudioDataStamped
+
   # Resident head-camera -> YOLOX -> PEAR frame stream.
   #
   # Consumed by manipulation_execution/launch_builders/motion_imitation_stream.py, which
@@ -92,25 +121,17 @@ robot:
   # two services above. The node is perception only: it publishes parameter
   # frames and commands no motion, so starting it cannot move the robot.
   #
-  # The camera is the left head-front stereo camera, by its compressed
-  # interface ID; the endpoint comes from the live description. This compute
-  # unit must not subscribe raw images across units, so only the compressed
-  # stream is used. With the whole launch running, this stream (2064x1552 JPEG)
-  # reached the node, while the front-centre camera (2688x1944) delivered
-  # almost no frames and the rgbd_head_front camera had no publisher. With no
-  # publisher the node idles and reports it once per status period rather
-  # than failing.
-  #
-  # frame_source.topic selects a stream the description does not carry, for
-  # example a resized stream from another compute unit; topic and interface
-  # are never both set. The decoder is chosen by name; mock_cpu is the
-  # in-process OpenCV decode (JPEG/PNG -> bgr8).
+  # The robot already publishes the front-centre camera's half-resolution
+  # compressed stream. Subscribe to that existing topic directly; do not
+  # derive or launch another relay in this application. The decoder is chosen
+  # by name and auto prefers 310P DVPP for JPEG.
   motion_imitation_stream:
     enabled: true
     frame_source:
-      interface: camera.stereo_head_front_left.color_compressed
-      decoder: mock_cpu
-      decoder_params: {}
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+      require_unique_publisher: true
+      decoder: auto
+      decoder_params: {device_id: 0}
     frame_topic: /motion_imitation_stream/pear_frame
     status_topic: /motion_imitation_stream/status
     # ibrobot_msgs/ActorState, one per frame PEAR takes up. The actor
@@ -145,13 +166,50 @@ robot:
     # its gate; whether that reaches the robot is mirror_session.publish_enabled.
     mock_playback:
       enabled: true
-      animation_manifest: ""  # empty: use the clip shipped with manipulation_execution
+      # Which node fills the preview: retarget follows the person live
+      # (motion_imitation_retarget_node); animation plays the clip below
+      # (motion_imitation_mock_node). Both take the same topics and ~/play.
+      player: retarget
+      animation_manifest: ""  # animation only; empty: use the clip shipped with manipulation_execution
       preview_topic: /motion_imitation_mock/arm_command_preview
       status_topic: /motion_imitation_mock/status
       publish_rate_hz: 50.0
       input_staleness_sec: 0.5
-      loop: true
+      loop: true  # animation only
       status_period_sec: 5.0
+      # retarget only. The runtime's follow-me settings (video2x2_runtime 0717710):
+      # buffer latency and lookahead in seconds, her right arm drives the robot's
+      # left, and vel_scale scales arm_velocity_limits below for the rate cap.
+      retarget:
+        retargeter: x2_followme
+        latency_s: 0.4
+        lookahead_s: 0.25
+        mirror: true
+        vel_scale: 1.0
+
+      # The neutral pose, in radians, keyed by joint name like arm_limits below.
+      # The session walks the arm here when it takes over (approach) and when a
+      # round ends (cancel / stop), and holds it while ready and cooling down.
+      # The runtime's BASE_POSE_RAD (upper_body_animation, video2x2_runtime
+      # 0717710); the vendor idle pose is the same. The retarget player also
+      # parks and fades in from it, so it is required there; with the animation
+      # player, remove it to keep the framework defaults (hold the pose measured
+      # at takeover).
+      reset_pose:
+        left_shoulder_pitch_joint: 0.4
+        left_shoulder_roll_joint: 0.0
+        left_shoulder_yaw_joint: 0.0
+        left_elbow_joint: -1.2
+        left_wrist_yaw_joint: 0.0
+        left_wrist_pitch_joint: 0.0
+        left_wrist_roll_joint: 0.0
+        right_shoulder_pitch_joint: 0.4
+        right_shoulder_roll_joint: 0.0
+        right_shoulder_yaw_joint: 0.0
+        right_elbow_joint: -1.2
+        right_wrist_yaw_joint: 0.0
+        right_wrist_pitch_joint: 0.0
+        right_wrist_roll_joint: 0.0
 
       # Arm travel the mock safety clamps against, in radians and rad/s.
       # Application configuration, deliberately not in the runtime profile. Keyed
@@ -214,7 +272,8 @@ robot:
         enabled: false
 
   # The session node: WAIT / STANDBY / MIRRORING, the only publisher of the arm
-  # and hand channels. Its hooks keep their conservative defaults; with
+  # and hand channels. mirror_start only reaches STANDBY/ready; the business
+  # hooks decide when a round starts and ends. With
   # motion_imitation_stream.mock_playback enabled the window pipeline plays
   # the mock animation.
   #
@@ -245,3 +304,29 @@ robot:
         interface: runtime.set_mode
         kind: service
         type: ibrobot_msgs/srv/SetRuntimeMode
+    # The demo rules by default: with the mock on, the default hooks' start
+    # criteria are always false, so mirror_start would stop at STANDBY/ready
+    # for good. demo starts a round when a person is in view and close enough
+    # (rules and timing in demo.yaml); a business class replaces it here.
+    business:
+      hooks: demo
+      cover_judge: demo
+      config: $(find robot_config)/config/mirror_session/demo.yaml
+    # The operator node: double cover asks for mirror_start, long cover stops
+    # the session, a head touch starts or cancels a round, the LED follows the
+    # session. With send_enabled false it only records what it would send; see
+    # /mirror_operator/status.
+    operator:
+      enabled: true
+      send_enabled: false
+    # The voice node: a phrase when the session starts, is ready, starts
+    # mirroring and goes back to WAIT, synthesized by voice_tts below. Any
+    # error on this path only warns; the mirror starts without voice.
+    voice:
+      enabled: true
+      queue_max: 8
+      phrases:
+        starting: ["启动中"]
+        ready: ["我准备好咯"]
+        mirroring: ["开始模仿啦"]
+        goodbye: ["下次再见"]

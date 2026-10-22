@@ -194,9 +194,25 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
 
 
 def build_voice_tts(context: LaunchBuildContext) -> BuildResult:
+    """Voice TTS actions; with ``voice_tts.exit_on_init_failure: false`` a failure only skips them.
+
+    That flag already keeps a ZipVoice that fails to start from stopping the launch; a voice TTS
+    that cannot even be launched (no WORKSPACE, a binding that does not resolve, ...) is treated
+    the same way.
+    """
     from voice_tts_service.launch_builders.voice_tts import generate_voice_tts_nodes
 
-    nodes = generate_voice_tts_nodes(context.robot_config)
+    try:
+        nodes = generate_voice_tts_nodes(context.robot_config)
+    except Exception as exc:
+        voice_tts_config = context.robot_config.get("voice_tts") or {}
+        if not isinstance(voice_tts_config, dict) or voice_tts_config.get("exit_on_init_failure", True) is not False:
+            raise
+        logger.error(
+            f"generating voice TTS nodes: {type(exc).__name__}: {exc}; "
+            "continuing without voice TTS (voice_tts.exit_on_init_failure is false)"
+        )
+        return BuildResult(actions=[])
     if nodes:
         logger.info(f"Added {len(nodes)} voice TTS node(s)")
     return BuildResult(actions=list(nodes))

@@ -8,6 +8,7 @@ import path changed.
 
 import pytest
 
+from robot_config.launch_registry.registry import LaunchBuildContext
 from voice_tts_service.launch_builders import voice_tts
 
 
@@ -76,6 +77,10 @@ def test_voice_tts_builder_routes_shared_playback_format(monkeypatch, tmp_path):
     assert playback["audio_topic"] == "/shared/play"
     assert playback["playback_sample_rate"] == 24000
     assert playback["playback_channels"] == 1
+    # Without a runtime binding the local audio_play contract is unchanged.
+    assert playback["audio_message_type"] == "audio_common_msgs/msg/AudioData"
+    assert playback["resample_to_playback_rate"] is False
+    assert playback["chunk_ms"] == 50
 
 
 def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_path):
@@ -214,6 +219,27 @@ def test_voice_tts_resampling_to_the_speaker_rate_is_opt_in(tmp_path, monkeypatc
     assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is True
 
 
+def test_runtime_bound_playback_forwards_the_resample_settings(tmp_path, monkeypatch):
+    """The bound sink's topic/rate/pacing, the declared type and the opt-in resample knob reach the node."""
+    config = _bound_tts_config(
+        _bound_audio_output(topic="/instance_x/play", sample_rate_hz=16000, channels=1, write_chunk_ms=100)
+    )
+    config["voice_tts"]["audio_message_type"] = "audio_common_msgs/msg/AudioDataStamped"
+    config["voice_tts"]["resample_to_playback_rate"] = True
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/instance_x/play"
+    assert parameters["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+    assert parameters["playback_sample_rate"] == 16000
+    assert parameters["resample_to_playback_rate"] is True
+    assert parameters["chunk_ms"] == 100
+
+
+# --- CANN environment for Ascend deployments -------------------------------------
+
+
 def _additional_env(node):
     """Node.additional_env holds (name, value) substitution pairs, not plain strings."""
 
@@ -273,3 +299,47 @@ def test_the_playback_node_writes_pcm_the_way_the_bound_speaker_asks(tmp_path, m
     # A speaker that declares nothing leaves the node on its own defaults.
     unpaced = _playback_parameters(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
     assert "chunk_ms" not in unpaced and "prebuffer_ms" not in unpaced
+
+
+# --- launch failure tolerance (voice_tts.exit_on_init_failure) --------------------
+
+
+def _broken(_config):
+    raise ValueError("WORKSPACE must be an absolute path")
+
+
+def test_build_passes_the_generated_nodes_through(monkeypatch):
+    marker = object()
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", lambda _config: [marker])
+
+    result = voice_tts.build_voice_tts(LaunchBuildContext(robot_config={"voice_tts": {"enabled": True}}))
+
+    assert result.actions == [marker]
+
+
+def test_build_failure_is_skipped_when_exit_on_init_failure_is_false(monkeypatch):
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", _broken)
+
+    config = {"voice_tts": {"enabled": True, "exit_on_init_failure": False}}
+
+    result = voice_tts.build_voice_tts(LaunchBuildContext(robot_config=config))
+
+    assert result.actions == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"voice_tts": {"enabled": True, "exit_on_init_failure": True}},
+        {"voice_tts": {"enabled": True}},
+        {"voice_tts": {"enabled": True, "exit_on_init_failure": "false"}},
+        {"voice_tts": None},
+        {},
+    ],
+    ids=["true", "default", "string", "none", "missing"],
+)
+def test_build_failure_stops_the_launch_otherwise(monkeypatch, config):
+    monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", _broken)
+
+    with pytest.raises(ValueError, match="WORKSPACE"):
+        voice_tts.build_voice_tts(LaunchBuildContext(robot_config=config))

@@ -16,9 +16,11 @@ perception messages (``PearFrame``, ``ActorState``, the camera) once per tick.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from manipulation_execution.mirror_session.endpoints import HAND_JOINT_COUNT
 
@@ -29,10 +31,14 @@ class UpperBodyCommand:
 
     Both in the joint order of the ``joint.arm_stream`` / ``joint.hand_stream``
     descriptions. The gate sends both channels on a tick or neither.
+    ``source_stamp_s`` is the time of the perception frame the command was
+    computed from, carried through the gate for latency accounting; None when
+    the command does not come from a frame (holds, reset pose).
     """
 
     arm: tuple[float, ...]
     hand: tuple[float, ...]
+    source_stamp_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -63,9 +69,30 @@ class PearWindow:
 
 @dataclass(frozen=True)
 class SessionInputs:
+    """One tick of inputs. The node fills the perception fields and ``publish_enabled``;
+    the core fills the rest before handing them to a hook.
+    """
+
     window: PearWindow = PearWindow()
     actor: ActorSignal | None = None
     camera_frame: object | None = None
+    measured_arm: tuple[float, ...] | None = None  # latest joint.state, arm_stream order
+    measured_arm_age_s: float = math.inf  # how long ago it was received
+    last_sent: UpperBodyCommand | None = None  # what the gate last sent, resends included
+    publish_enabled: bool = False  # False: nothing reaches the joints, so they cannot move
+    phase_elapsed_s: float = 0.0  # time spent in the current phase
+
+
+@dataclass(frozen=True)
+class HookContext:
+    """What a business hook class is constructed with, next to its own config."""
+
+    arm_joint_names: tuple[str, ...]  # 14, from the joint.arm_stream description
+    hand_joint_names: tuple[str, ...]  # 20, from the joint.hand_stream description
+    tick_hz: float
+    wrap_up_budget_s: float
+    publish_enabled: bool
+    logger: Any
 
 
 class WrapUpPurpose(str, Enum):
@@ -104,12 +131,20 @@ class CoverDetector:
 class SessionHooks:
     """Every decision of the session. Each default is a conservative no-op."""
 
+    cancel_reason: str = ""
+    """Why the round is being cancelled. The core reads it right after
+    ``cancel_criteria`` returned True (and the confirm time has passed) and
+    reports it as the transition reason; empty is reported as ``criteria``."""
+
     def start_criteria(self, inputs: SessionInputs) -> bool:
-        """STANDBY, outside cooldown: start mirroring without a request? Default: never."""
+        """STANDBY/ready: start mirroring? Must hold for ``start_confirm_s``. Default: never."""
         return False
 
     def cancel_criteria(self, inputs: SessionInputs, round_elapsed_s: float) -> bool:
-        """MIRRORING: end this round (max_round_s, person gone, ID lost)? Default: never."""
+        """MIRRORING: end this round (person gone, ID lost)? Must hold for ``cancel_confirm_s``.
+
+        Set ``cancel_reason`` before returning True. Default: never.
+        """
         return False
 
     def cooldown_over(self, elapsed_s: float) -> bool:

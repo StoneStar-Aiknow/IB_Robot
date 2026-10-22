@@ -1,0 +1,2189 @@
+{
+  "status": "axis_and_index_confirmed; value mapping confirmed for ALL SEVEN channels (three wrist, elbow, shoulder_roll, shoulder_pitch, shoulder_yaw). The per-channel stage is complete; the trajectory is still not publishable.",
+  "updated": "2026-09-08",
+  "scope": "SMPL-X local upper-limb rotations -> Lingxi/X2 arm joints",
+  "file_name_note": "The file name keeps the early 'wrist' naming for compatibility with existing handoff entry points; it now covers shoulder, elbow and wrist. Human-readable version: docs/x2_arm_joint_mapping.md",
+  "human_readable_doc": "docs/x2_arm_joint_mapping.md",
+  "x2_arm_pos_index": [
+    {
+      "index": 0,
+      "joint": "left_shoulder_pitch_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -3.08,
+        2.04
+      ],
+      "meaning": "arm swing front/back"
+    },
+    {
+      "index": 1,
+      "joint": "left_shoulder_roll_joint",
+      "channel": "roll",
+      "urdf_axis": [
+        1,
+        0,
+        0
+      ],
+      "limit_rad": [
+        -0.061,
+        2.993
+      ],
+      "meaning": "arm lift"
+    },
+    {
+      "index": 2,
+      "joint": "left_shoulder_yaw_joint",
+      "channel": "yaw",
+      "urdf_axis": [
+        0,
+        0,
+        1
+      ],
+      "limit_rad": [
+        -2.556,
+        2.556
+      ],
+      "meaning": "upper arm spin"
+    },
+    {
+      "index": 3,
+      "joint": "left_elbow_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -2.3556,
+        0.0
+      ],
+      "meaning": "elbow flexion"
+    },
+    {
+      "index": 4,
+      "joint": "left_wrist_yaw_joint",
+      "channel": "yaw",
+      "urdf_axis": [
+        0,
+        0,
+        1
+      ],
+      "limit_rad": [
+        -2.556,
+        2.556
+      ],
+      "meaning": "hand spin"
+    },
+    {
+      "index": 5,
+      "joint": "left_wrist_pitch_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -0.558,
+        0.558
+      ],
+      "meaning": "wrist swing"
+    },
+    {
+      "index": 6,
+      "joint": "left_wrist_roll_joint",
+      "channel": "roll",
+      "urdf_axis": [
+        1,
+        0,
+        0
+      ],
+      "limit_rad": [
+        -1.571,
+        0.724
+      ],
+      "meaning": "wrist flex/extend"
+    },
+    {
+      "index": 7,
+      "joint": "right_shoulder_pitch_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -3.08,
+        2.04
+      ],
+      "meaning": "arm swing front/back"
+    },
+    {
+      "index": 8,
+      "joint": "right_shoulder_roll_joint",
+      "channel": "roll",
+      "urdf_axis": [
+        1,
+        0,
+        0
+      ],
+      "limit_rad": [
+        -2.993,
+        0.061
+      ],
+      "meaning": "arm lift"
+    },
+    {
+      "index": 9,
+      "joint": "right_shoulder_yaw_joint",
+      "channel": "yaw",
+      "urdf_axis": [
+        0,
+        0,
+        1
+      ],
+      "limit_rad": [
+        -2.556,
+        2.556
+      ],
+      "meaning": "upper arm spin"
+    },
+    {
+      "index": 10,
+      "joint": "right_elbow_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -2.3556,
+        0.0
+      ],
+      "meaning": "elbow flexion"
+    },
+    {
+      "index": 11,
+      "joint": "right_wrist_yaw_joint",
+      "channel": "yaw",
+      "urdf_axis": [
+        0,
+        0,
+        1
+      ],
+      "limit_rad": [
+        -2.556,
+        2.556
+      ],
+      "meaning": "hand spin"
+    },
+    {
+      "index": 12,
+      "joint": "right_wrist_pitch_joint",
+      "channel": "pitch",
+      "urdf_axis": [
+        0,
+        1,
+        0
+      ],
+      "limit_rad": [
+        -0.558,
+        0.558
+      ],
+      "meaning": "wrist swing"
+    },
+    {
+      "index": 13,
+      "joint": "right_wrist_roll_joint",
+      "channel": "roll",
+      "urdf_axis": [
+        1,
+        0,
+        0
+      ],
+      "limit_rad": [
+        -0.724,
+        1.571
+      ],
+      "meaning": "wrist flex/extend"
+    }
+  ],
+  "x2_index_source": "aimdk/extra/mc-rl/x2_urdf/X2_URDF-v1.3.0/x2_ultra.urdf, cross-checked against the operator-supplied arm_pos table",
+  "robot_measured_zero_and_sign": {
+    "source": "../手写版.md",
+    "authority": "Highest. These are single-joint tests run on the physical robot; they outrank anything inferred from URDF limits or vendor YAML.",
+    "zero_pose": "All 14 channels at 0 means both arms hang naturally straight down with the palms facing each other.",
+    "left_right_axis_relation": "copied_not_mirrored",
+    "left_right_axis_relation_note": "The left and right joint axes are literal copies, not mirror images. A physically mirrored human motion therefore needs opposite command signs only where the operator recorded a per-side rule (shoulder_roll); everywhere else the same sign drives both arms in the same world direction.",
+    "channels": [
+      {
+        "channel": "shoulder_pitch",
+        "arm_pos": [
+          0,
+          7
+        ],
+        "zero": "arm hanging naturally",
+        "positive": "backward",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -176.5,
+          116.9
+        ]
+      },
+      {
+        "channel": "shoulder_roll",
+        "arm_pos": [
+          1,
+          8
+        ],
+        "zero": "arm hanging naturally",
+        "positive": "left arm lifts on positive, right arm lifts on negative",
+        "side_rule": "opposite_sign_for_mirrored_motion",
+        "operator_range_deg": [
+          -3.0,
+          179.0
+        ]
+      },
+      {
+        "channel": "shoulder_yaw",
+        "arm_pos": [
+          2,
+          9
+        ],
+        "zero": "arms hanging, palms facing each other",
+        "positive": "both arms rotate to the left",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -145.0,
+          145.0
+        ]
+      },
+      {
+        "channel": "elbow",
+        "arm_pos": [
+          3,
+          10
+        ],
+        "zero": "fully straight",
+        "positive": "none; negative only",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -135.0,
+          0.0
+        ]
+      },
+      {
+        "channel": "wrist_yaw",
+        "arm_pos": [
+          4,
+          11
+        ],
+        "zero": "palms facing each other",
+        "positive": "rotate to the left",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -146.0,
+          146.0
+        ]
+      },
+      {
+        "channel": "wrist_pitch",
+        "arm_pos": [
+          5,
+          12
+        ],
+        "zero": "along the forearm, pointing forward",
+        "positive": "swing down",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -30.0,
+          30.0
+        ]
+      },
+      {
+        "channel": "wrist_roll",
+        "arm_pos": [
+          6,
+          13
+        ],
+        "zero": "parallel, pointing forward",
+        "positive": "toward the left",
+        "side_rule": "same_sign_both_sides",
+        "operator_range_deg": [
+          -40.0,
+          40.0
+        ]
+      }
+    ],
+    "operator_range_note": "operator_range_deg is the practical/guaranteed travel the operator recorded, not the URDF limit. Where the two differ, URDF limit_rad in x2_arm_pos_index is the hard bound and this is the safe working envelope. Single-joint tests were run at plus or minus 30 to 40 degrees.",
+    "home_poses_are_not_zero": {
+      "vendor_nominal_configuration": "arm home = shoulder_pitch 0.196 rad on both sides, all other arm channels 0 (sim_mujoco .../model_info/default.yaml)",
+      "measured_robot_idle": [
+        0.392598,
+        -0.025215,
+        -0.013518,
+        -1.12909,
+        0.006807,
+        0.011635,
+        0.698132,
+        0.39068,
+        0.028282,
+        0.022147,
+        -1.147114,
+        0.006999,
+        0.000191,
+        0.00515
+      ],
+      "note": "Both are resting/home postures, not the zero definition above. They do not contradict it."
+    },
+    "model_cross_check": {
+      "status": "passed",
+      "method": "Nudge one channel by +20 deg on the shipped MJCF, run forward kinematics, read the hand displacement and the world turn axis. No robot involved.",
+      "world_frame": "+x = forward (the direction the face points), +y = the robot's left, +z = up. The forward direction is anchored geometrically: the left foot extends 0.139 m ahead of the ankle and 0.065 m behind it, so the toe is the +x side.",
+      "result": "All seven channels agree with the 手写版 table above.",
+      "per_channel_hand_delta_fwd_left_up_for_plus_20deg": {
+        "shoulder_pitch": {
+          "left": [
+            -0.139,
+            -0.005,
+            0.023
+          ],
+          "right": [
+            -0.139,
+            0.005,
+            0.024
+          ],
+          "reading": "positive moves both hands backward"
+        },
+        "shoulder_roll": {
+          "left": [
+            0.0,
+            0.131,
+            0.053
+          ],
+          "right": [
+            0.0,
+            0.141,
+            -0.005
+          ],
+          "reading": "positive lifts the left arm outward; on the right it presses across the body, so lifting the right arm needs a negative value"
+        },
+        "shoulder_yaw": {
+          "turn_axis": "+z on both arms",
+          "reading": "positive turns both arms to the left"
+        },
+        "elbow": {
+          "left": [
+            -0.069,
+            -0.003,
+            0.016
+          ],
+          "right": [
+            -0.068,
+            0.004,
+            0.017
+          ],
+          "reading": "upper limit is 0; flexion is reached only through negative values"
+        },
+        "wrist_yaw": {
+          "turn_axis": "+z on both hands",
+          "reading": "positive turns both hands to the left"
+        },
+        "wrist_pitch": {
+          "turn_axis": "+y on both hands",
+          "reading": "positive takes a forward-pointing hand downward"
+        },
+        "wrist_roll": {
+          "turn_axis": "+x on both hands, dot product +1.00",
+          "reading": "same axis and same sign on both hands; NOT mirrored"
+        }
+      },
+      "zero_pose_hand_axes_in_world": {
+        "left": {
+          "X": [
+            1.0,
+            0.0,
+            0.01
+          ],
+          "Y": [
+            0.0,
+            0.98,
+            0.21
+          ],
+          "Z": [
+            -0.01,
+            -0.21,
+            0.98
+          ]
+        },
+        "right": {
+          "X": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "Y": [
+            0.0,
+            0.98,
+            -0.21
+          ],
+          "Z": [
+            0.0,
+            0.21,
+            0.98
+          ]
+        },
+        "note": "Both hands' local Y points to the robot's left (dot product +0.96). A mirrored pair would oppose. This is the numeric form of 复制关系，不是镜像."
+      },
+      "tooling": {
+        "script": "tools_x2_sign_check.py",
+        "tests": "test_x2_sign_check.py",
+        "doc": "docs/x2_visualization.md section 6",
+        "contact_sheet": "outputs/x2_probe/sign_check_midrange.png"
+      },
+      "consequence": "The MJCF model can be used as an offline copy of the real-robot ruler. Source-side alignment can be validated in simulation first; it does not have to go back to hardware for every check."
+    }
+  },
+  "unsigned_axis_permutation": {
+    "applies_to": [
+      "shoulder",
+      "elbow",
+      "wrist"
+    ],
+    "smpl_x_red": "x2_z_yaw",
+    "smpl_y_green": "x2_y_pitch",
+    "smpl_z_blue": "x2_x_roll",
+    "matrix_v_x2_equals_P_times_v_smplx": [
+      [
+        0,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ],
+    "determinant": -1,
+    "warning": "SUPERSEDED by the 'resolved' block above, kept so the reasoning is traceable. The original text read: 'P is an odd permutation. A right-handed basis B for R_x2 = B @ R_smplx @ B.T needs at least one additional axis sign flip so that det(B) = +1. Which axis to flip must be measured, not guessed.' It has now been measured, and the answer is per side rather than global.",
+    "resolved": {
+      "status": "resolved_by_measurement_2026-09-08",
+      "answer": "The sign flip is not a single global choice; it is per side. The right-handed bases below both have det = +1, and they differ, because the SMPL-X wrist frame is mirrored between the hands on the forearm axis and copied on the other two.",
+      "basis_convention": "B maps a SMPL-X wrist local axis to an X2 wrist local axis: v_x2 = B @ v_smplx. Columns are the images of SMPL-X X, Y, Z.",
+      "B_left": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          -1,
+          0,
+          0
+        ]
+      ],
+      "B_right": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          -1,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ]
+      ],
+      "det_left": 1,
+      "det_right": 1,
+      "signed_axis_correspondence": {
+        "smpl_x_red -> wrist_yaw (arm_pos 4/11)": {
+          "left": -1,
+          "right": 1
+        },
+        "smpl_y_green -> wrist_pitch (arm_pos 5/12)": {
+          "left": 1,
+          "right": -1
+        },
+        "smpl_z_blue -> wrist_roll (arm_pos 6/13)": {
+          "left": 1,
+          "right": 1
+        }
+      },
+      "verified": "Only the wrist_pitch column is operator-confirmed. yaw and roll come from the same anatomy derivation and are still candidates.",
+      "how_measured": "docs/x2_visualization.md section 7; test_x2_wrist_composite.py asserts the anatomy the bases are built from, against the X2 mesh and against the source's own finger joints."
+    }
+  },
+  "shoulder_mapping": {
+    "status": "axis_correspondence_confirmed; shoulder_roll value mapping confirmed 2026-09-08; pitch and yaw pending",
+    "source_joints": {
+      "left_shoulder": "body_pose_matrix[:, 15]",
+      "right_shoulder": "body_pose_matrix[:, 16]"
+    },
+    "confirmed_axis_correspondence": {
+      "smpl_x_red": {
+        "channel": "shoulder_yaw",
+        "arm_pos": [
+          2,
+          9
+        ],
+        "meaning": "upper arm spin"
+      },
+      "smpl_y_green": {
+        "channel": "shoulder_pitch",
+        "arm_pos": [
+          0,
+          7
+        ],
+        "meaning": "arm swing front/back"
+      },
+      "smpl_z_blue": {
+        "channel": "shoulder_roll",
+        "arm_pos": [
+          1,
+          8
+        ],
+        "meaning": "arm lift"
+      }
+    },
+    "observation": "Human review of outputs/smplx_shoulder/smplx_skeleton_shoulder_review.mp4: SMPL-X local X points along the upper arm, so rotation about it is upper-arm spin (yaw); rotation about the blue Z axis raises and lowers the arm (roll); the remaining Y axis is front/back swing (pitch).",
+    "observed_smpl_positive_x_direction": {
+      "left_shoulder": "shoulder_to_elbow_along_upper_arm",
+      "right_shoulder": "elbow_to_shoulder_against_upper_arm",
+      "measurement": "cos(local X, unit shoulder->elbow vector) averages +0.979 left and -0.988 right; the sign holds for all 368 frames."
+    },
+    "pending": {
+      "shoulder_roll": "RESOLVED 2026-09-08 -- see value_mapping.channels.shoulder_roll (sign left +1 / right -1, offset +0.2104 rad both sides, scale 1.0).",
+      "left_command_sign": "shoulder_pitch, shoulder_yaw",
+      "right_command_sign": "shoulder_pitch, shoulder_yaw",
+      "zero_offsets_rad": "shoulder_pitch, shoulder_yaw",
+      "rotation_order": "shoulder_pitch, shoulder_yaw -- and note that shoulder_roll ended up needing no rotation order at all",
+      "range_scaling": "shoulder_pitch, shoulder_yaw"
+    },
+    "readout_caveat": "The blue-Z / green-Y / red-X correspondence above is an ANATOMICAL statement about which rotation does what, and it survives. It is not a statement that the Euler component of that axis is the number to drive the channel with. For shoulder_roll it is not: the intrinsic-XYZ Z component correlates well (+0.932 / -0.981) but needs a fitted slope of 1.266 / -1.227 and still leaves an 18 deg worst frame, so the confirmed mapping drives a geometric abduction angle built from joint positions instead. Expect the same distinction at shoulder_pitch and shoulder_yaw."
+  },
+  "elbow_mapping": {
+    "status": "value_mapping_confirmed_2026-09-08",
+    "source_joints": {
+      "left_elbow": "body_pose_matrix[:, 17]",
+      "right_elbow": "body_pose_matrix[:, 18]"
+    },
+    "confirmed_axis_correspondence": {
+      "smpl_y_green": {
+        "channel": "elbow_pitch",
+        "arm_pos": [
+          3,
+          10
+        ],
+        "meaning": "elbow flexion"
+      }
+    },
+    "observation": "Human review of the synchronized skeleton video identifies SMPL-X local Y as the dominant elbow flexion axis; SMPL-X X is the arm direction, not the primary hinge axis. The X2 elbow has a single DOF about Y, so it belongs to the pitch channel.",
+    "pending": null,
+    "resolved": "See value_mapping.channels.elbow. The axis correspondence recorded here stands, but the elbow is NOT driven from a Euler component: the intrinsic-XYZ readout is unusable at this joint and the channel is driven from the geometric flexion angle instead."
+  },
+  "wrist_mapping": {
+    "status": "axis_correspondence_confirmed; wrist_pitch value mapping confirmed; yaw and roll pending",
+    "source_joints": {
+      "left_wrist": "body_pose_matrix[:, 19]",
+      "right_wrist": "body_pose_matrix[:, 20]"
+    },
+    "confirmed_axis_correspondence": {
+      "smpl_x_red": {
+        "channel": "wrist_yaw",
+        "arm_pos": [
+          4,
+          11
+        ],
+        "meaning": "hand spin"
+      },
+      "smpl_y_green": {
+        "channel": "wrist_pitch",
+        "arm_pos": [
+          5,
+          12
+        ],
+        "meaning": "wrist swing"
+      },
+      "smpl_z_blue": {
+        "channel": "wrist_roll",
+        "arm_pos": [
+          6,
+          13
+        ],
+        "meaning": "wrist flex/extend"
+      }
+    },
+    "observed_smpl_positive_x_direction": {
+      "left_wrist": "elbow_to_wrist_away_from_forearm",
+      "right_wrist": "wrist_to_elbow_toward_forearm"
+    },
+    "pending": {
+      "left_command_sign": {
+        "wrist_pitch": "resolved: +1",
+        "wrist_yaw": null,
+        "wrist_roll": null
+      },
+      "right_command_sign": {
+        "wrist_pitch": "resolved: -1",
+        "wrist_yaw": null,
+        "wrist_roll": null
+      },
+      "zero_offsets_rad": {
+        "wrist_pitch": "resolved: 0.0 both sides",
+        "wrist_yaw": null,
+        "wrist_roll": null
+      },
+      "range_scaling": {
+        "wrist_pitch": "resolved: 1.0",
+        "wrist_yaw": null,
+        "wrist_roll": null
+      }
+    },
+    "value_mapping": "see value_mapping.channels"
+  },
+  "left_right_asymmetry_evidence": {
+    "x2_left_right_array_relation": "copied_not_mirrored",
+    "source_side_evidence": "SMPL-X local +X points along the limb on the left and against it on the right, for both shoulder and wrist, across all 368 frames.",
+    "robot_side_evidence": {
+      "mirrored_limits": [
+        "shoulder_roll",
+        "wrist_roll"
+      ],
+      "identical_limits": [
+        "shoulder_pitch",
+        "shoulder_yaw",
+        "elbow",
+        "wrist_pitch",
+        "wrist_yaw"
+      ],
+      "conclusion": "Mirrored limits alone do not prove a sign flip. Resolved against the physical-robot tests in robot_measured_zero_and_sign: shoulder_roll IS sign-opposed between the sides ('left lifts positive, right lifts negative'). wrist_roll is NOT: the operator's rule is a direction-in-space convention ('positive toward the left') that applies to both hands, and its asymmetric limits reflect the different flex/extend travel of each hand, not a sign flip.",
+      "superseded_claim": "An earlier revision of this file inferred that both roll channels must be sign-mirrored. That inference was correct for shoulder_roll and wrong for wrist_roll."
+    }
+  },
+  "source_range_diagnostics_deg": {
+    "note": "Intrinsic XYZ decomposition of the raw local matrices over 368 frames. Diagnostic only, not a mapping. The elbow rows are unusable: the values come from unwrapping near a decomposition singularity, not from real travel. The elbow is now driven from elbow_geometric_flexion_deg instead; see value_mapping.channels.elbow.",
+    "shoulder_left": {
+      "x": [
+        -34.9,
+        20.1
+      ],
+      "y": [
+        -36.0,
+        2.0
+      ],
+      "z": [
+        -60.0,
+        -9.1
+      ]
+    },
+    "shoulder_right": {
+      "x": [
+        -31.6,
+        32.2
+      ],
+      "y": [
+        -6.4,
+        32.7
+      ],
+      "z": [
+        9.0,
+        65.2
+      ]
+    },
+    "wrist_left": {
+      "x": [
+        -24.2,
+        23.1
+      ],
+      "y": [
+        -22.8,
+        27.4
+      ],
+      "z": [
+        -38.0,
+        37.6
+      ]
+    },
+    "wrist_right": {
+      "x": [
+        -31.5,
+        36.0
+      ],
+      "y": [
+        -28.0,
+        25.6
+      ],
+      "z": [
+        -39.5,
+        32.2
+      ]
+    },
+    "elbow_left_unusable": {
+      "x": [
+        -20.7,
+        160.4
+      ],
+      "y": [
+        -86.6,
+        -18.3
+      ],
+      "z": [
+        4.5,
+        190.3
+      ]
+    },
+    "elbow_right_unusable": {
+      "x": [
+        -484.9,
+        39.5
+      ],
+      "y": [
+        27.4,
+        88.9
+      ],
+      "z": [
+        -77.8,
+        437.9
+      ]
+    },
+    "elbow_geometric_flexion_deg": {
+      "definition": "angle between the shoulder->elbow and elbow->wrist vectors; 0 means straight",
+      "left": [
+        28.7,
+        132.8
+      ],
+      "right": [
+        34.9,
+        119.5
+      ],
+      "x2_limit_deg": [
+        -134.97,
+        0.0
+      ],
+      "note": "CONFIRMED as the elbow's driving readout on 2026-09-08 (option B). The X2 reachable flexion is 0..124.28 deg, so her left arm's 132.79 deg peak saturates on 39 of 368 frames; her right arm fits. The offset is NOT explained by 'the source never straightens' -- that was an early wrong reason. It is explained by the ROBOT: X2 carries a built-in 10.69 deg elbow bend at command zero. See value_mapping.channels.elbow."
+    },
+    "local_rotation_magnitude_deg": {
+      "shoulder_left": [
+        9.5,
+        68.7
+      ],
+      "shoulder_right": [
+        9.2,
+        73.1
+      ],
+      "elbow_left": [
+        23.1,
+        124.1
+      ],
+      "elbow_right": [
+        32.0,
+        117.3
+      ],
+      "wrist_left": [
+        4.9,
+        43.9
+      ],
+      "wrist_right": [
+        3.2,
+        46.8
+      ]
+    }
+  },
+  "pending_next_stage": {
+    "name": "range_mapping",
+    "resolved_on_the_x2_side": "Zero definitions and positive directions for all 7 channels are now recorded in robot_measured_zero_and_sign, from physical-robot tests. What remains is entirely on the SMPL-X side and at the interface.",
+    "steps": [
+      "decomposition: which Euler sequence extracts the three joint angles from each 3x3 source matrix, and how coupling and singularities are handled (the elbow already shows an unusable XYZ readout)",
+      "source zero: which SMPL-X frame or synthetic pose corresponds to the X2 zero (arms hanging, palms facing each other); the source never reaches it, so an explicit offset is required per channel",
+      "sign: per channel, verify the SMPL-X positive direction against the X2 positive direction from robot_measured_zero_and_sign; shoulder_roll additionally needs opposite signs on the two sides",
+      "scaling: how source ROM aligns to the operator_range_deg working envelope (direct / linear scale / clamp)",
+      "clipping: keep clip_to_limits true",
+      "dynamics: velocity, acceleration and per-frame continuity limits",
+      "timing: play back on timestamp_ns, not on 30 Hz row index"
+    ],
+    "instrument": "tools_x2_mujoco_render.py + tools_x2_joint_probe.py (single-joint sweep) and tools_x2_smplx_composite.py (source video | SMPL-X skeleton | X2 render). See docs/x2_visualization.md."
+  },
+  "warning": "This file records axis and index correspondence only. It is not a set of publishable robot joint angles. wrist_retarget_config.json and outputs/wrist_retarget/ predate this mapping, still carry an identity smpl_to_x2_basis, and must not be sent to the robot. Position clipping alone is not safety: velocity limits, acceleration limits, per-frame continuity checks, comms timeout and an e-stop are all still required.",
+  "hand_anatomy": {
+    "note": "The physical meaning of each axis, on both sides of the mapping. This is what makes a sign derivable rather than guessable.",
+    "x2_wrist_roll_link_body_frame": {
+      "fingers_point": "local -Z on both hands (mesh z reaches -0.1817)",
+      "finger_spread_axis": "local X (distal slab x-extent 0.0686 vs y-extent 0.0197)",
+      "palm_normal_axis": "local Y",
+      "palm_faces": "-Y on the left hand, +Y on the right (fingertip mean y -0.0131 / +0.0127)",
+      "thumb_side": "local +X on BOTH hands; the two meshes are mirrored in Y only",
+      "channel_meaning": {
+        "wrist_yaw (Z)": "forearm spin 自旋 -- matches 手写版",
+        "wrist_pitch (Y)": "deviation 摇摆, radial/ulnar -- matches 手写版 and the symmetric +/-32 deg limit",
+        "wrist_roll (X)": "flexion/extension 翻和勾 -- matches 手写版 and the asymmetric [-90,+41.5] deg limit"
+      },
+      "CRITICAL_geom_quat": "m.geom_quat MUST be applied when reading mesh vertices. The X2 hand geom carries quat [0.7697,-0.0256,0.0079,0.6379] (left), about 79 deg around Z. Reading m.mesh_vert raw reports the spread axis and the palm normal the other way round, which is exactly the bug that produced the earlier, wrong 'the two axes are anatomically perpendicular' claim."
+    },
+    "smplx_wrist_local_axes": {
+      "left": {
+        "X": "+forearm",
+        "Y": "-palmar, i.e. the dorsal normal",
+        "Z": "+radial (toward the thumb)"
+      },
+      "right": {
+        "X": "-forearm",
+        "Y": "-palmar, i.e. the dorsal normal",
+        "Z": "+radial (toward the thumb)"
+      },
+      "check": "Both satisfy X cross Y = Z, which is required of a rotation matrix and is what validates the palmar/dorsal sign."
+    },
+    "handedness_rule": "With F = distal/finger direction, P = palmar normal, R = radial/thumb direction: F cross P = -R for the LEFT hand and +R for the RIGHT hand. An earlier revision had this backwards and produced a systematic sign slip."
+  },
+  "value_mapping": {
+    "status": "All seven channels confirmed: wrist_pitch, wrist_roll, wrist_yaw, elbow, shoulder_roll, shoulder_pitch and shoulder_yaw. The per-channel value-mapping stage is complete. Still NOT a publishable trajectory -- see warning.",
+    "method": "docs/x2_visualization.md section 7. One channel at a time: drive only that channel on the X2 from the raw source angle, render each hand from its medial camera, and put it beside the operator's own video and the SMPL-X hand skeleton. The operator reads the sign off the picture.",
+    "decomposition": "scipy Rotation.from_matrix(R).as_euler('XYZ') (intrinsic), unwrapped -- continuous_intrinsic_xyz(). Applies to the six euler-source channels. The elbow does not use it: see channels.elbow.source_readouts.",
+    "formula": "x2_arm_pos[index] = sign * (source_rad - offset_rad) * scale. `source_rad` is whichever readout smplx_source.source_type names. 'euler' = the intrinsic-XYZ component named by euler_axis, taken from body_pose_matrix[body_index] (the three wrist channels). 'geometric_flexion' = the unsigned bend angle between the shoulder->elbow and elbow->wrist joint positions, 0 = straight (the elbow). 'geometric_abduction' = the signed angle of the shoulder->elbow vector away from the torso down-axis, measured in the coronal plane of a torso frame built from the pelvis/neck/collar joints, 0 = hanging and +90 = T-pose (shoulder_roll). 'geometric_hinge_pitch' = the signed angle of the same vector inside the plane of the robot's own measured hinge axis, transplanted into that torso frame (shoulder_pitch). 'geometric_plane_twist_minus_coupling' = the right-handed angle of her upper-arm/forearm plane normal about her own bone, MINUS the same angle measured on the robot with this joint at zero, per frame (shoulder_yaw). The geometric types exist because the Euler readout failed differently at each joint: at the elbow it sits on a decomposition singularity and is unusable; at the shoulder it correlates well at best and its slope must be fitted rather than being 1. NOTE the last type breaks the formula's independence assumption: shoulder_yaw's source_rad is a function of the other channels' commands and must be computed after them. See channels.shoulder_yaw.zero_position_answer.",
+    "channels": {
+      "shoulder_pitch": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_shoulder_pitch/x2_shoulder_pitch_composite.mp4 and x2_shoulder_pitch_sign_question.png, 2026-09-08: sign -1 on BOTH arms, i.e. the \"derived\" option that forward kinematics had predicted. Operator: \"LEFT的sign=-1是对的，RIGHT的sign=-1是对的。更新一下吧\"",
+        "arm_pos": [
+          0,
+          7
+        ],
+        "smplx_source": {
+          "source_type": "geometric_hinge_pitch",
+          "body_index": {
+            "left": 15,
+            "right": 16
+          },
+          "euler_axis": null,
+          "axis_name": null,
+          "readout": "pitch_deg(): the signed angle of the shoulder->elbow vector inside the plane of the ROBOT'S OWN HINGE, transplanted into a torso frame built from the source's own joints (up = neck - pelvis, left = the collar-to-collar vector orthogonalised against up, fwd = left x up). The X2 pitch axis is read from the model at the zero pose as a world vector; because the robot's base is pinned and its waist is zero, its torso frame IS the world frame, so those world components are directly the axis's (fwd, left, up) coefficients and can be rebuilt in her torso frame as c_fwd*fwd + c_left*left + c_up*up. The readout is then hinge_basis() + atan2: project torso-down and torso-forward perpendicular to that axis (full Gram-Schmidt, both against the axis AND against each other) and take pitch = degrees(atan2(arm . fwd_perp, arm . down_perp)). 0 = arm hanging, +90 = arm straight forward, negative = behind the body. Signed ANATOMICALLY -- forward is positive on both arms -- deliberately NOT by the joint's own turning sense, which would have made the sign derivation vacuous. NOT a Euler component -- see source_readouts.why_not_euler."
+        },
+        "anatomy": "Arm swing fore/aft (前后摆动). X2: axis (0,1,0) in the URDF but NOT a world axis once assembled -- measured at the zero pose it is [0, 0.9781478, +0.2079108] on the left and [0, 0.9781470, -0.2079147] on the right, i.e. 12.00 deg off world +y on both sides, tilted UP on the left and DOWN on the right. The two are copies, not mirrors (dot +0.9135; a true mirror pair would be opposed). arm_pos[0] and arm_pos[7] share the same limits [-176.471, +116.883] deg. Command 0 is NOT the arm hanging: it carries a small built-in FORWARD hang of +4.265 deg (left) / +3.914 deg (right). SMPL-X: identity is the T-pose, which is zero swing -- so on this channel the source end of the zero costs nothing.",
+        "independent_measurement": "Signed geometric swing from the source's own 3D joints, read in the plane of the robot's real hinge rather than in an assumed sagittal plane. Here it is not merely the check but the driving readout; the Euler components are kept only as the rejected alternative they turned out to be.",
+        "sign": {
+          "left": -1,
+          "right": -1
+        },
+        "offset_rad": {
+          "left": 0.07444652880814312,
+          "right": 0.068315798757255
+        },
+        "scale": 1.0,
+        "offset_deg": {
+          "left": 4.265472,
+          "right": 3.914207
+        },
+        "zero_position_answer": "The zero lives ONLY on the robot side, and it is different on the two arms. On the source: SMPL-X identity is the T-pose, which carries zero fore/aft swing, so the geometric readout starts from anatomical zero for free -- the opposite of shoulder_roll, where the T-pose sat at the far end of the range. On the robot: X2 does not hang its upper arms at arm_pos = 0. Forward kinematics puts a built-in FORWARD hang of +4.265472 deg (left) and +3.914207 deg (right) at command zero. The two sides differ by 0.351 deg, which is not a construction error: the URDF elbow anchors differ by about 1.2 mm in x, and at that lever arm 1.2 mm is 0.35 deg. Both are kept at full precision rather than averaged -- averaging would push one side's measurement into the other's. So offset = +the robot's own forward hang, measured from the model and never tuned. Measurement detail: read the geometry at the joint ANCHORS (data.xanchor). As on shoulder_roll the xpos-vs-xanchor half of that trap is a no-op here, but the other half bites: the proximal point must be a point the hinge cannot move. Under a 60 deg pitch command the shoulder_pitch anchor moves 0.0000 m while the shoulder_yaw anchor moves 0.1212 m, so the pitch anchor is the only legal pivot.",
+        "sign_answer": "-1 on BOTH arms. Derived non-circularly from forward kinematics alone, before any source data or joint limit was consulted: d(pitch)/d(command) = -1.000000 on both sides over a sweep of the reachable range, where pitch is signed anatomically (forward positive on both arms). A positive X2 command therefore swings both arms BACKWARD, which independently reproduces the 手写版.md real-robot note '向后为正，两边同号'. Confirmed by the operator from the video, 2026-09-08. IMPORTANT: on this channel clipping could not have argued the sign even as corroboration -- neither option clips a single frame (0/368 in all four cases). The picture carried the whole verdict, and what it showed is the flipped option running her swing backwards: swing error mean -16.34 deg (left) / -11.29 deg (right) with a worst frame of -113.34 / -122.89 deg.",
+        "range_answer": "Comfortable, with the widest margins of any channel so far. Her swing runs -37.16 .. +60.94 deg (left) and -35.84 .. +65.36 deg (right); the derived commands are [-56.67, +41.42] deg (left) and [-61.45, +39.75] deg (right) against limits [-176.471, +116.883] deg on both sides. 0 of 368 frames clip on either side, and the closest approach to a limit is 75.46 deg (left) / 77.13 deg (right) at the top and 119.80 / 115.03 deg at the bottom. Scale stays 1.0: the hinge slope is exactly 1 with no fit, so one source degree is one robot degree. Clip in RADIANS, in the units the limits are stored in. Note the ranges recorded here supersede the forward-swing figures the shoulder_roll stage carried forward (-26.90 .. +43.49 / -29.91 .. +51.73): those came from an arcsine out-of-plane probe read against a world axis, not from this hinge readout.",
+        "source_readouts": {
+          "why_not_euler": "No Euler component is clean enough to LOOK at on this channel, let alone to drive it -- a weaker starting point than shoulder_roll, where Euler-Z was a good correlate that merely could not calibrate. The best component is not even the one the axis-permutation stage had pencilled in: it is X, not Y (left: X -0.812, Y -0.613, Z +0.058; right: X -0.881, Y +0.120, Z -0.267). Fitting that best component gives swing = -1.501*X - 7.14 (left, rms 12.79 deg, worst 43.54 deg) and swing = -1.547*X - 0.23 (right, rms 11.49 deg, worst 43.91 deg): the slope is nowhere near 1 even after fitting, and a 44 deg worst frame is most of the motion. The geometric readout needs no fit at all.",
+          "driving": "pitch_deg from the source's own 3D joint positions, a torso frame built from the same array, and the robot's real hinge axis transplanted into that frame. Left -37.16 .. +60.94 deg (mean +12.44), right -35.84 .. +65.36 deg (mean +9.56).",
+          "frame_construction": "up = unit(neck - pelvis); left = unit(orthogonalise(l_collar - r_collar, up)); fwd = cross(left, up). Reused verbatim from shoulder_roll, not rebuilt. Built from joint positions only, so it is independent of any naming or handedness convention in the npz, and asserted orthonormal and right-handed on every frame. The hinge plane inside it is then built by hinge_basis(), which orthogonalises down and forward against the axis AND against each other; skipping the second step leaves the two reference vectors up to 0.0028 out of square on a general axis.",
+          "out_of_plane": "The same frame gives the out-of-plane lift, the component this readout deliberately ignores: left -1.54 .. +56.80 deg, right -61.90 .. -0.52 deg (opposite signs because lift is read against the un-mirrored torso-left axis here). That motion belongs to shoulder_roll. It never degenerates the pitch readout -- the norm of the arm vector projected into the hinge plane stays >= 0.548 (left) / 0.471 (right). Against a naive world-y axis the same norms fall to 0.379 / 0.278, which is one more reason the transplanted axis is the right plane to read in.",
+          "hinge_evidence": "The X2 side is an EXACT hinge when read about its true axis: over a +/-70 deg sweep the unfitted residual against pitch = -cmd + built_in is 0.000000 deg on both sides and the fitted slope is -1.0000. Read about world +y instead -- the axis the URDF nominally names -- the same sweep gives an unfitted worst residual of 3.37 deg (left) / 3.35 deg (right) and a fitted slope of -1.0554 / -1.0555, i.e. it would force a 5.5% scale that does not exist. One measurement at command zero therefore pins the entire curve, but only in the true plane."
+        },
+        "independent_confirmations": [
+          "The sign pair was derived from forward kinematics alone (-1.000000 on both sides) and independently matches the operator's PHYSICAL-robot note in 手写版.md: shoulder_pitch is positive backward with the same sign on both arms. Two sources that share no arithmetic.",
+          "The transplanted axis keeps its shape: rebuilt frame by frame in her torso basis it stays unit-length and 12.00 deg off her torso-left axis on all 368 frames, which a frame-construction error would not preserve.",
+          "The two sides' built-in hangs land 0.351 deg apart, and that gap is explained by an independently measured 1.2 mm x-offset between the two elbow anchors in the URDF rather than assumed to be noise.",
+          "The medial cameras are asserted to look down the pitch axis at |cos| = 0.9781, which is exactly the ceiling for a horizontal camera against an axis with a 0.2079 z-component (sqrt(1 - 0.2079^2) = 0.97815) -- the test asserts it as a ceiling, not as a shortfall.",
+          "Image-front is measured, not reasoned from the azimuth: the changed-pixel column centroid puts the robot's front at 146.5 of 388 on the left panel (image LEFT) and 240.3 of 388 on the right panel (image RIGHT), and the panel labels are asserted against those pixels."
+        ],
+        "no_circularity_check": "The sign was fixed by forward kinematics before the source data or the joint limits were touched: x2_pitch_slope() takes the renderer, a side and the measured axis, and reads nothing else. The OFFSET likewise comes from the robot model alone, at command zero, so no property of the source could have biased it. This channel is also the cleanest case in the archive for the rule that clipping must never argue a sign, because here clipping says NOTHING: 0 of 368 frames clip under either option. Finally the extreme frames shown to the operator were chosen by a conditioning filter that never looks at either candidate -- see diagnostics_deg.extreme_frames.",
+        "camera": "The existing medial hand cameras, reused: left_hand (azimuth 270) for the left arm and right_hand (azimuth 90) for the right, lookat (0, 0, 1.10), distance 1.90, elevation -6. Alignment with the pitch axis is |cos| = 0.9781 on both sides. Unlike shoulder_roll this channel CANNOT show both arms in one image: the two hinge axes are tilted apart (dot +0.9135) and a camera down one of them is 12 deg off the other, so each arm gets its own panel and the two panels are mirror views. Image-front differs between them accordingly (left panel: robot front is image LEFT; right panel: image RIGHT), measured on pixels.",
+        "display_pose": "All fourteen channels zero, as for shoulder_roll and for the same reason: a bent elbow foreshortens the line of the upper arm, which is the only thing this channel is about.",
+        "rejected_options": {
+          "euler_component": {
+            "definition": "cmd = sign * (fitted_slope * euler_component + fitted_intercept), driving from an intrinsic-XYZ component of body_pose_matrix[15/16]. The axis-permutation stage had pencilled in Y for this channel.",
+            "why_rejected": "Y is not even the best component -- X correlates better on both sides (-0.812 / -0.881 against -0.613 / +0.120) -- and X itself is unusable: fitted slope -1.501 / -1.547, residual rms 12.79 / 11.49 deg, worst frame 43.54 / 43.91 deg. Two fitted parameters and still a 44 deg error. Given no panel in the video; reported to the operator in prose.",
+            "genuine_advantage": "Shape independence -- it reads pose parameters only, where the geometric readout reads joint positions and therefore depends on betas. Same trade-off as the elbow's option A and shoulder_roll's Euler-Z, recoverable the same way: re-derive per subject."
+          },
+          "world_y_axis": {
+            "definition": "Read the swing in the true sagittal plane, i.e. about world +y, the axis the URDF nominally names for this joint.",
+            "why_rejected": "Assembled, the joint's axis is 12.00 deg off world +y. Reading about world +y turns an exact hinge into an approximate one: unfitted worst residual 3.37 / 3.35 deg, and a fitted slope of -1.0554 / -1.0555 that would invent a 5.5% scale. It is also worse conditioned on her clip (projection norm min 0.379 / 0.278 against 0.548 / 0.471). Transplanting the measured axis costs nothing and removes both problems.",
+            "genuine_advantage": "It needs no axis measurement and matches the anatomical vocabulary ('sagittal plane') people reason in."
+          }
+        },
+        "diagnostics_deg": {
+          "x2_pitch_axis_world": {
+            "left": [
+              0.0,
+              0.9781478,
+              0.2079108
+            ],
+            "right": [
+              0.0,
+              0.978147,
+              -0.2079147
+            ]
+          },
+          "x2_pitch_axis_tilt_from_world_y": {
+            "left": 12.0,
+            "right": 12.0
+          },
+          "x2_pitch_axis_dot_between_sides": 0.9135,
+          "x2_built_in_forward_hang_at_command_zero": {
+            "left": 4.265472,
+            "right": 3.914207
+          },
+          "x2_pitch_slope_per_command_deg": {
+            "left": -1.0,
+            "right": -1.0
+          },
+          "x2_hinge_residual_true_axis": {
+            "left": 0.0,
+            "right": 0.0
+          },
+          "x2_hinge_residual_world_axis": {
+            "left": 3.3677,
+            "right": 3.3533
+          },
+          "x2_hinge_fitted_slope_world_axis": {
+            "left": -1.0554,
+            "right": -1.0555
+          },
+          "x2_limits": {
+            "left": [
+              -176.471,
+              116.883
+            ],
+            "right": [
+              -176.471,
+              116.883
+            ]
+          },
+          "source_swing": {
+            "left": [
+              -37.16,
+              60.94
+            ],
+            "right": [
+              -35.84,
+              65.36
+            ]
+          },
+          "source_swing_mean": {
+            "left": 12.44,
+            "right": 9.56
+          },
+          "source_out_of_plane_lift": {
+            "left": [
+              -1.54,
+              56.8
+            ],
+            "right": [
+              -61.9,
+              -0.52
+            ]
+          },
+          "hinge_projection_norm_min": {
+            "left": 0.548,
+            "right": 0.471
+          },
+          "world_axis_projection_norm_min": {
+            "left": 0.379,
+            "right": 0.278
+          },
+          "derived_command_range": {
+            "left": [
+              -56.67,
+              41.42
+            ],
+            "right": [
+              -61.45,
+              39.75
+            ]
+          },
+          "flipped_command_range": {
+            "left": [
+              -41.42,
+              56.67
+            ],
+            "right": [
+              -39.75,
+              61.45
+            ]
+          },
+          "derived_clipped_frames": {
+            "left": 0,
+            "right": 0
+          },
+          "flipped_clipped_frames": {
+            "left": 0,
+            "right": 0
+          },
+          "limit_margin": {
+            "left": [
+              119.8,
+              75.46
+            ],
+            "right": [
+              115.03,
+              77.13
+            ]
+          },
+          "euler_correlation": {
+            "left": {
+              "X": -0.812,
+              "Y": -0.613,
+              "Z": 0.058
+            },
+            "right": {
+              "X": -0.881,
+              "Y": 0.12,
+              "Z": -0.267
+            }
+          },
+          "euler_best_fit": {
+            "left": {
+              "axis": "X",
+              "slope": -1.501,
+              "intercept": -7.14,
+              "rms": 12.79,
+              "worst": 43.54
+            },
+            "right": {
+              "axis": "X",
+              "slope": -1.547,
+              "intercept": -0.23,
+              "rms": 11.49,
+              "worst": 43.91
+            }
+          },
+          "camera_alignment_with_axis": {
+            "left": 0.9781,
+            "right": 0.9781
+          },
+          "image_front_column_centroid_of_388": {
+            "left": 146.5,
+            "right": 240.3
+          },
+          "extreme_frames": {
+            "both_forward": 252,
+            "right_back": 303,
+            "left_back": 353,
+            "note": "Chosen among frames whose out-of-plane lift is in the smaller half, NOT by raw argmax/argmin. The raw extremes are 215 and 184, where her arms are overhead (lift 38 / 47 deg, projection norm 0.55) -- that is shoulder_roll's pose, and judging this channel on it would be judging it on another channel's motion. The filter never looks at either candidate."
+          },
+          "anchor_displacement_m_under_60deg_pitch_command": {
+            "shoulder_pitch": 0.0,
+            "shoulder_roll": 0.0005,
+            "shoulder_yaw": 0.1212
+          }
+        },
+        "notes": "The three shoulder channels are a ball joint and do cross-talk, as expected: her out-of-plane lift reaches +56.8 deg (left) / -61.9 deg (right) while this channel is being read. The cross-talk is handled by reading in the hinge plane rather than by hoping for selectivity, which is why no Euler component needed to be clean."
+      },
+      "shoulder_roll": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_shoulder_roll/x2_shoulder_roll_composite.mp4 and x2_shoulder_roll_sign_question.png, 2026-09-08: the left-hand robot panel, \"left +1 / right -1\", is the correct pair. Operator: \"你给我的视频里左边的那组，就是left+1 right-1那一组是正确的。可以归档。\"",
+        "arm_pos": [
+          1,
+          8
+        ],
+        "smplx_source": {
+          "source_type": "geometric_abduction",
+          "body_index": {
+            "left": 15,
+            "right": 16
+          },
+          "euler_axis": null,
+          "axis_name": null,
+          "readout": "abduction_deg(): in a torso frame built from the source's own joints (up = neck - pelvis, left = the collar-to-collar vector orthogonalised against up, fwd = left x up), the signed angle of the shoulder->elbow vector away from the torso down-axis, measured in the coronal plane: abduction = degrees(atan2(arm . lateral, -arm . up)) with lateral = +left for the left arm and -left for the right. 0 = arm hanging, +90 = T-pose, negative = arm crossed over the body. Mirrored so both sides read positive when lifting. NOT a Euler component -- see source_readouts.why_not_euler."
+        },
+        "anatomy": "Abduction/adduction (上下抬臂, T-pose). X2: axis (1,0,0), arm_pos[1] limit [-3.495, +171.486] deg and arm_pos[8] limit [-171.486, +3.495] deg -- mirrored limits, which is the shape of a sign-opposed pair. Positive lifts the LEFT arm and lowers the right. Command 0 is NOT the arm hanging: it carries +12.056 deg of splay on both sides. SMPL-X: identity is the T-pose, about +95 deg of abduction.",
+        "independent_measurement": "Signed geometric abduction from the source's own 3D joints in a torso frame built from those same joints. Here it is not merely the check but the driving readout; the Euler-Z component is kept only as the rejected alternative it turned out to be.",
+        "sign": {
+          "left": 1,
+          "right": -1
+        },
+        "offset_rad": {
+          "left": 0.21041860254591085,
+          "right": 0.21042220578483997
+        },
+        "scale": 1.0,
+        "offset_deg": {
+          "left": 12.056098,
+          "right": 12.056304
+        },
+        "zero_position_answer": "THE ZERO LIVES ON BOTH SIDES AT ONCE, and this is the first channel where that is true. On the robot: X2 does not hang its arms at arm_pos = 0. Forward kinematics puts a built-in splay of +12.056098 deg (left) / +12.056304 deg (right) of abduction at command zero -- the arms sit slightly away from the body. On the source: SMPL-X identity is a T-POSE, i.e. about +95 deg of abduction, the opposite end of the range from the X2 zero (the Euler-Z regression intercepts, +96.70 deg left and +93.05 deg right, are that template pose showing up as a number). The geometric readout is what dissolves the second half: because abduction is measured from the joint positions against the torso axes rather than from the local rotation, the template pose is already absorbed and only the robot's own splay survives as an offset. So offset = +the robot splay, measured from the model and never tuned. Measurement detail: read the geometry at the joint ANCHORS (data.xanchor). Here the shoulder_roll and elbow anchors happen to coincide exactly with their link origins (measured gap 0.0 m), unlike the elbow channel -- but the other half of that trap does bite: the proximal point must be a point the hinge does not move. Under a 60 deg roll command the shoulder_roll anchor moves 0.0 m while the shoulder_yaw anchor moves 0.1212 m, so the roll anchor is the only legal pivot.",
+        "sign_answer": "+1 on the left, -1 on the right -- the one channel so far that is sign-opposed between the sides, exactly as the operator had recorded from the physical robot in 手写版.md. Derived non-circularly from forward kinematics alone, before any source data or joint limit was consulted: d(abduction)/d(command) = +1.000 (left) and -1.000 (right) over a +/-20 deg central difference. Confirmed by the operator from the video, 2026-09-08. The flipped pair drives the arms down into the floor of the range and clips 358/368 frames on the left and 340/368 on the right; that is legible on screen and is recorded as corroboration only -- it must NOT be used to argue the sign, because choosing a sign by which one fits the limits is circular.",
+        "range_answer": "Comfortable, and nothing clips. Her abduction runs 10.41 .. 76.32 deg (left) and 12.53 .. 77.20 deg (right); the derived commands are [-1.65, +64.27] deg (left) and [-65.15, -0.48] deg (right) against limits [-3.495, +171.486] and [-171.486, +3.495]. 0 of 368 frames clip on either side. The margin is thin at the BOTTOM, not the top: her arms never come fully to her sides, and the closest approach to the near limit is 1.85 deg (left) / 3.01 deg (right) -- a body that hangs its arms straighter than she does would clip there, because the X2 cannot bring the upper arm past 3.495 deg inside the splay. The top of the robot range (171 deg, arm over the head) is nowhere near used. Scale stays 1.0: one source degree is one robot degree, both ends being the same physical angle in the same unit. Clip in RADIANS, in the units the limits are stored in.",
+        "source_readouts": {
+          "why_not_euler": "Euler-Z is a genuinely good CORRELATE and still an unusable DRIVER, which is the lesson this channel adds. Selectivity is fine for a ball joint -- corr +0.932 (left) / -0.981 (right) against |0.48| or less for X and Y -- but a correlate is not a calibration. Its slope has to be FITTED (+1.266 left, -1.227 right) instead of being 1, so a degree of source is not a degree of robot; its intercept is +96.70 / +93.05 deg, the SMPL-X T-pose template; and after that two-parameter fit the residual is still rms 6.04 deg with a 18.22 deg worst frame (left) and rms 3.44 / worst 14.25 deg (right). The geometric readout needs no fit at all. Rule of thumb this channel establishes: selectivity qualifies a readout to be LOOKED at; only a slope of 1 without fitting qualifies it to DRIVE.",
+          "driving": "abduction_deg from the source's own 3D joint positions and a torso frame built from the same array. Left 10.41 .. 76.32 deg, right 12.53 .. 77.20 deg.",
+          "frame_construction": "up = unit(neck - pelvis); left = unit(orthogonalise(l_collar - r_collar, up)); fwd = cross(left, up). Built from joint positions only, so it is independent of any naming or handedness convention in the npz, and asserted orthonormal and right-handed on every frame.",
+          "out_of_plane": "The same frame gives the forward swing, the component the coronal readout deliberately ignores: left -26.90 .. +43.49 deg, right -29.91 .. +51.73 deg. That motion belongs to shoulder_pitch. It never degenerates the abduction readout -- the norm of the arm vector projected into the coronal plane stays >= 0.725 (left) / 0.619 (right), so the atan2 is well conditioned throughout.",
+          "hinge_evidence": "The X2 side is an exact hinge in abduction: abduction = +cmd + 12.056098 (left) and -cmd + 12.056304 (right), max residual 0.000000 deg (left) / 0.000626 deg (right) over a 25-point sweep of the FULL reachable range. One measurement at command zero therefore pins the entire curve. (The atan2 readout wraps past +/-180 deg near the extreme top of the left range; that wrap is an artefact of the readout, not of the joint, and lies far outside the range this animation uses.)"
+        },
+        "independent_confirmations": [
+          "The sign pair was derived from forward kinematics alone (+1.000 / -1.000 slopes) and independently matches what the operator had already recorded from the PHYSICAL robot in 手写版.md: shoulder_roll is the one left/right opposite-signed channel. Two sources that share no arithmetic, and the model was not consulted when the handwritten note was made.",
+          "The two sides' built-in splays land 0.0002 deg apart (12.056098 vs 12.056304), which a left/right construction error would not do.",
+          "The torso frame is asserted orthonormal and right-handed on all 368 frames, and its left axis is asserted to point at her left shoulder from the joint positions -- not trusted from the joint NAMES.",
+          "The front camera is asserted to look down the roll axis (|cos| = 0.995) and image-right is asserted to be the robot's LEFT arm from the changed-pixel centroid, measured rather than reasoned from the azimuth."
+        ],
+        "no_circularity_check": "The sign was fixed by forward kinematics before the source data or the joint limits were touched: x2_abduction_slope() takes the renderer and a step size and reads nothing else. The wrong sign's catastrophic clipping (358/368 and 340/368) is therefore corroboration after the fact, never the argument. The OFFSET likewise comes from the robot model alone, at command zero, so no property of the source could have biased it -- and unlike a fitted intercept it is a measurement, not a residual-minimiser.",
+        "camera": "No new camera. The X2 shoulder_roll axis is (1,0,0) in the URDF, i.e. a WORLD axis, so the existing front view (azimuth 180, elevation -6) already looks down it at |cos| = 0.995 -- and because both hinges share that one axis, a single image shows both arms, which no wrist channel allowed. Lookat (0, 0, 1.14), distance 1.55, picked from three rendered framing probes. Image RIGHT is the robot's LEFT arm, asserted on pixels. Compute the alignment before building a camera: the answer here was that the cheapest camera was the one already there.",
+        "display_pose": "All fourteen channels zero, NOT the wrist tools' DISPLAY_POSE with its -pi/2 elbow. A bent elbow foreshortens and hides the line of the upper arm, which is the only thing this channel is about. The display pose is a per-channel choice.",
+        "rejected_options": {
+          "euler_z": {
+            "definition": "cmd = sign * (fitted_slope * euler_Z + fitted_intercept), i.e. drive from the intrinsic-XYZ Z component of body_pose_matrix[15/16], the readout the axis-permutation stage had originally pencilled in for this channel.",
+            "why_rejected": "It requires a two-parameter FIT and still does not fit: slope +1.266 / -1.227 (so source degrees are not robot degrees), intercept +96.70 / +93.05 deg, residual rms 6.04 deg with a 18.22 deg worst frame on the left and rms 3.44 / worst 14.25 deg on the right. The geometric readout has slope exactly 1 with no fit and a measured offset. Given no panel in the video; reported to the operator in prose so the choice was visible.",
+            "genuine_advantage": "Shape independence -- it reads pose parameters only, where the geometric readout reads joint positions and therefore depends on betas. Same trade-off as the elbow's option A, and recoverable the same way: re-derive per subject."
+          }
+        },
+        "diagnostics_deg": {
+          "x2_built_in_splay_at_command_zero": {
+            "left": 12.056098,
+            "right": 12.056304
+          },
+          "x2_abduction_slope_per_command_deg": {
+            "left": 1.0,
+            "right": -1.0
+          },
+          "x2_hinge_residual_full_range": {
+            "left": 0.0,
+            "right": 0.000626
+          },
+          "x2_limits": {
+            "left": [
+              -3.495,
+              171.486
+            ],
+            "right": [
+              -171.486,
+              3.495
+            ]
+          },
+          "source_abduction": {
+            "left": [
+              10.41,
+              76.32
+            ],
+            "right": [
+              12.53,
+              77.2
+            ]
+          },
+          "source_forward_swing": {
+            "left": [
+              -26.9,
+              43.49
+            ],
+            "right": [
+              -29.91,
+              51.73
+            ]
+          },
+          "coronal_projection_norm_min": {
+            "left": 0.725,
+            "right": 0.619
+          },
+          "derived_command_range": {
+            "left": [
+              -1.65,
+              64.27
+            ],
+            "right": [
+              -65.15,
+              -0.48
+            ]
+          },
+          "derived_clipped_frames": {
+            "left": 0,
+            "right": 0
+          },
+          "flipped_clipped_frames": {
+            "left": 358,
+            "right": 340
+          },
+          "euler_z_correlation": {
+            "left": 0.932,
+            "right": -0.981
+          },
+          "euler_z_fit": {
+            "left": {
+              "slope": 1.266,
+              "intercept": 96.7,
+              "rms": 6.04,
+              "worst": 18.22
+            },
+            "right": {
+              "slope": -1.227,
+              "intercept": 93.05,
+              "rms": 3.44,
+              "worst": 14.25
+            }
+          },
+          "extreme_frames": {
+            "left_highest": 121,
+            "left_lowest": 364,
+            "right_highest": 196,
+            "right_lowest": 364
+          }
+        }
+      },
+      "shoulder_yaw": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_shoulder_yaw/x2_shoulder_yaw_composite.mp4 and x2_shoulder_yaw_readout_question.png, 2026-09-08: readout B (her forearm's own plane). The operator's own reading was that the two options look nearly alike on screen and that B looked slightly more accurate, then asked for a recommendation; the recommendation was B and the operator confirmed it. Operator: \"按B归档\". The question put to them was NOT a sign -- sign, offset and scale were all settled by forward kinematics and closure before the picture was drawn -- it was which of two exact readouts of HER body should drive the channel.",
+        "arm_pos": [
+          2,
+          9
+        ],
+        "smplx_source": {
+          "source_type": "geometric_plane_twist_minus_coupling",
+          "body_index": {
+            "left": 15,
+            "right": 16
+          },
+          "euler_axis": null,
+          "axis_name": null,
+          "readout": "source_rad = wrap(psi_coupling - psi_B), computed PER FRAME, in her torso frame. psi_B = twist_about(bone, unit(cross(bone, forearm)), torso_fwd): the right-handed angle of the normal of her own upper-arm/forearm plane about her own upper-arm bone, referenced to torso-forward. bone = unit(elbow - shoulder) and forearm = unit(wrist - elbow) from ehm_joints_3d_model; the torso frame is the same one shoulder_roll and shoulder_pitch use (up = neck - pelvis, left = orthogonalised collar-to-collar, fwd = left x up). psi_coupling = the SAME readout measured on the ROBOT by forward kinematics with shoulder_yaw held at 0 and the three confirmed channels (shoulder_pitch, shoulder_roll, elbow) driven from this same frame. Both terms are the identical construction, one on her and one on the robot, so the difference is exactly the yaw the robot still owes. IMPORTANT: the coupling term lives in the READOUT, not in offset_rad, because it is not a constant -- see zero_position_answer."
+        },
+        "anatomy": "Upper-arm spin about its own long axis (大臂自旋). X2: axis (0,0,1) in the URDF but NOT the bone once assembled -- measured at the zero pose it is [-0.0059756, -0.2079071, +0.9781303] (left) and [+0.0001540, +0.2079147, +0.9781470] (right) in (fwd, left, up), which is 4.0631 deg away from the upper-arm bone on both sides (a . bone = -0.99749). The two are copies, not mirrors (dot +0.913527). arm_pos[2] and arm_pos[9] share the limits [-146.448, +146.448] deg. SMPL-X: the fitted rotation matrix DOES carry the twist -- this was the operator's correction and it is what makes readout A possible at all -- but the twist is invisible in the shoulder->elbow vector, so any joint-position readout needs the forearm as its indicator.",
+        "independent_measurement": "psi_B from her own 3D joint positions, and psi_A = the same plane normal carried by the shoulder's FK rotation matrix, which is an entirely different route to the same physical quantity. The two agree to rms 11.99 deg (left) / 15.99 deg (right) and their disagreement is not noise: it is the part of her elbow motion that leaves the robot's single-hinge plane. This channel is also the first whose SOURCE readout runs the ROBOT's forward kinematics, because the coupling term has no closed form.",
+        "sign": {
+          "left": 1,
+          "right": 1
+        },
+        "offset_rad": {
+          "left": 0.0,
+          "right": 0.0
+        },
+        "scale": 1.0,
+        "offset_deg": {
+          "left": 0.0,
+          "right": 0.0
+        },
+        "zero_position_answer": "offset_rad is 0 on both sides, and that is NOT the usual 'the zero happens to line up'. It is 0 because the zero of this channel is not a constant at all and therefore cannot live in an offset. X2's shoulder is pitch -> roll -> yaw with yaw DISTAL, so R_arm = R_p R_r R_y and the product R_p R_r already carries twist about the bone before yaw does anything. Along this clip, with shoulder_yaw held at 0 and the three confirmed channels driven, the robot's own twist sweeps [+35.93, +124.57] deg on the left (spread 88.63) and [+56.06, +148.30] deg on the right (spread 92.24). Substituting any single constant for it -- the best one being the clip mean -- is wrong by rms 15.88 max 47.42 deg (left) and rms 16.14 max 52.47 deg (right). So the coupling is computed per frame and folded into source_rad, leaving offset_rad = 0. This is the same move shoulder_roll made when it absorbed the T-pose template into a geometric readout instead of carrying it as a second offset, one order of magnitude harder: there the absorbed term was constant, here it is a trajectory. CONSEQUENCE FOR THE PIPELINE: shoulder_yaw cannot be computed independently of the other channels. arm_pos[2] and arm_pos[9] must be computed AFTER arm_pos[0,1,3] and arm_pos[7,8,10], from those very values, by running forward kinematics per frame. Any future retarget script must respect that order.",
+        "sign_answer": "+1 on BOTH arms, with the subtraction order already inside source_rad -- read this together with smplx_source.readout or the sign will be applied twice. Derived non-circularly from forward kinematics before any source data or joint limit was consulted: d(psi_robot)/d(yaw command) = -0.993029 (left) / -0.994429 (right) at the pose frame 0 drives, -0.9899 at the all-zero pose, and -0.9939 / -0.9937 fitted over the full +-146.448 deg range. It is the SIGN of that number, not its magnitude, that says the command is wrap(coupling - source) and not the other way round; the flipped order does not close (the closure test asserts this). The magnitude is not exactly -1 because the yaw axis is 4.0631 deg off the bone, so a yaw command spins the bone a little as well as about it. That 1% is deliberately NOT divided out: dividing would be fitting a scale, and the playbook forbids letting a fitted scale drive a channel. What the 1% actually costs is measured by closure instead -- rms 0.5131 deg (left) / 0.6001 deg (right), worst frame 2.0198 deg.",
+        "range_answer": "Comfortable. The B commands run [-40.36, +66.92] deg (left) and [-61.17, +49.72] deg (right) against limits [-146.448, +146.448] deg on both sides: 0 of 368 frames clip, and the closest approach to a limit is 79.53 deg (left) / 85.28 deg (right). check_limits reports no out-of-range channel for the assembled [368,14] sequence. Scale stays 1.0. As on shoulder_pitch, clipping could not have argued anything here even as corroboration: BOTH readouts clip 0 of 368 frames on both arms (A: [-19.61, +62.88] left, [-52.94, +25.82] right). Clip in RADIANS, in the units the limits are stored in.",
+        "verification_by_closure": "Unlike the six channels before it, this one is not verified by a correlation or a slope but by CLOSURE: the command is rendered back through forward kinematics and the robot's twist is re-measured and compared with the twist that was asked for. B closes to rms 0.5131 deg / max 1.9371 deg (left) and rms 0.6001 deg / max 2.0198 deg (right). A closes slightly tighter (rms 0.4038 / 0.3291) because it asks for a smaller command excursion, which is a fact about the residual 1% slope and not a reason to prefer it. Closure is the right check here because the coupling term has no analytic form to compare against -- the only honest test of 'does the robot end up twisted the way she is' is to put the robot there and measure.",
+        "chosen_readout": "B, her forearm's own plane. The two readouts are both exact statements about her body and they differ by the component of her elbow motion that leaves the robot's hinge plane; a single-hinge elbow cannot express that component, so the channel must spend its one degree of freedom on either her upper arm's spin (A) or her forearm's direction (B). Measured over the clip, with the upper-arm DIRECTION error common to both (set by the confirmed pitch and roll: mean 4.12 / 4.31 deg left, 3.36 / 4.07 deg right, worst about 23 deg): A gives forearm direction error mean 10.32 deg / max 33.36 deg (left) and mean 13.93 / max 41.85 (right), with upper-arm spin error rms 0.40 / 0.33 deg (that residual IS the closure residual, not zero). B gives forearm direction error mean 3.27 / max 14.78 (left) and mean 2.79 / max 17.27 (right), with upper-arm spin error rms 12.06 / max 34.42 (left) and rms 15.89 / max 38.48 (right). B wins on the mean AND on the worst frame for the forearm. The physical argument the operator's verdict rests on: the X2 upper-arm link is nearly rotationally symmetric about its own axis, so a 12-16 deg spin error has almost no visible or functional consequence of its own -- its only consequence is where it puts the forearm, which is exactly what B optimises. A spends the channel on an invisible quantity. B also reuses the joint-position readout machinery all six earlier channels use, where A is the only matrix-driven readout of the seven.",
+        "independent_confirmations": [
+          "The sign came from forward kinematics alone -- x2_twist_slope() takes the renderer, a side and a step size and touches neither the source data nor the joint limits -- and it is corroborated by closure, which is a different computation on a different quantity: the flipped subtraction order fails to close by tens of degrees.",
+          "The two source readouts are built by disjoint routes -- A from body_pose_matrix through the FK chain, B from ehm_joints_3d_model positions -- and they share a zero only by construction (rest_direction() averages A's reference over the clip so the two agree at the mean frame). They then track each other to rms 12-16 deg over 368 frames, which two unrelated constructions would not do if either were wrong.",
+          "The yaw axis measured from the assembled model is 4.0631 deg off the bone on BOTH sides with the same a . bone = -0.99749, and the two axes are copies rather than mirrors (dot +0.913527), matching the pattern shoulder_pitch established independently.",
+          "The robot-side readout is asserted against its own tolerance rather than an assumed identity: it would be exactly elbow-invariant only if the elbow hinge axis were perpendicular to the bone and the wrist anchor lay in the hinge plane; measured, the axis is 0.056 deg off perpendicular (axis . bone = +-0.00098) and the anchor sits 0.10 mm off the plane, so sweeping the elbow over [-140, -20] deg moves the readout by at most 1.56 deg. The test asserts that measured bound, not zero.",
+          "The camera is asserted to look ALONG the driven bone on every frame of the clip, not at the rest pose: mean cos -0.9116 (left) / -0.8917 (right), and cos stays negative and never rises above -0.3 on all 368 frames of both arms, so the on-screen sense of a positive spin never flips mid-clip."
+        ],
+        "no_circularity_check": "The sign was fixed by forward kinematics before the source data or the limits were touched. The offset is 0 by a structural argument (the coupling is not constant, so it cannot be an offset), not by a fit. The scale is 1.0 unfitted, and the 1% the axis tilt costs is reported through closure rather than divided out. Clipping says nothing on this channel -- 0 of 368 frames under BOTH readouts on BOTH arms -- so it could not have argued anything. The five extreme frames shown to the operator were chosen by a filter that looks only at the source twist and at the A-B disagreement, never at which option is better. The one thing the operator decided is the one thing arithmetic could not: which exact readout of her body the single available degree of freedom should serve.",
+        "camera": "Two new views, left_upper_arm (azimuth 255, elevation +46) and right_upper_arm (azimuth 102, elevation +50), looking UP the upper-arm bone from below and outside, lookat at the elbow ((0.0196, 0.2544, 1.2901) left, (0.0154, -0.2494, 1.2876) right), distance 1.25. A spin about an axis is only readable when the camera lies ON that axis, and the bone is not fixed here -- it swings with the confirmed pitch and roll -- so the azimuths were chosen by grid search over the mean bone direction the clip actually produces (no existing view reaches |cos| 0.85). The search's first answers (az 76 / el -46 and az 282 / el -49) look DOWN the same lines and put the torso and head in front of the arm; the opposite ends of those lines are clean. Same alignment, no occluder -- decided by looking at rendered frames, as occlusion always must be. Distance was raised from 1.10 to 1.25 after the hand ran off the panel edge on 8 frames; it is sized by projecting the limb through the frustum on every frame, not by eyeballing one.",
+        "display_pose": "Not a static display pose: BOTH robot panels drive shoulder_pitch, shoulder_roll and elbow from the confirmed ledger, byte-identically, and differ only in shoulder_yaw. That is forced by the channel itself -- the twist is only defined relative to where the arm is swung to, so freezing the other channels would have removed the very configuration the question is about. The three driving channels are read from wrist_axis_mapping.json at run time and every one is checked to be verified before it is allowed to drive anything.",
+        "rejected_options": {
+          "upper_arm_spin_readout_A": {
+            "definition": "source_rad = wrap(psi_coupling - psi_A), where psi_A is her own plane normal at the clip-average frame carried by the shoulder's FK rotation matrix -- the twist that the fitted SMPL-X rotation genuinely contains.",
+            "why_rejected": "It spends the channel's single degree of freedom on the upper arm's own spin, which on a nearly axisymmetric upper-arm link has no visible or functional consequence except through where it puts the forearm -- and it puts the forearm 10.32 deg (left) / 13.93 deg (right) off on average, worst frame 33.36 / 41.85 deg, against B's 3.27 / 2.79 mean and 14.78 / 17.27 worst. Operator chose B, 2026-09-08.",
+            "genuine_advantage": "It does not degenerate. B's indicator is undefined when the elbow straightens (its conditioning is |sin(elbow flexion)|, which bottoms out at 0.4802 left / 0.5717 right on THIS clip -- comfortable, but a clip with a straight arm would break it). A rides on the rotation matrix and is defined everywhere. It is also shape-independent: it reads pose parameters where B reads joint positions and so depends on betas. If a future clip extends the elbow, fall back to A on the degenerate frames or blend on the conditioning -- see open_questions_carried_forward."
+          },
+          "constant_offset": {
+            "definition": "Treat the robot's built-in twist as a constant offset_rad, the way shoulder_roll and shoulder_pitch treat their built-in splay and hang.",
+            "why_rejected": "It is not a constant. It sweeps 88.63 deg (left) / 92.24 deg (right) along this clip, and the best constant is wrong by rms 15.88 / 16.14 deg, worst 47.42 / 52.47 deg -- the same order as the entire A-versus-B question. This is a property of the kinematic chain (yaw is distal to pitch and roll), not of this animation.",
+            "genuine_advantage": "It would fit the plain ledger formula with no per-frame forward kinematics, and would make shoulder_yaw computable independently of the other channels."
+          },
+          "euler_component": {
+            "definition": "Drive from the intrinsic-XYZ X component of body_pose_matrix[15/16], which the axis-permutation stage had pencilled in for this channel.",
+            "why_rejected": "A Euler component of the LOCAL shoulder rotation is not the upper arm's twist in any frame the robot shares, and it carries none of the coupling that dominates this channel. Superseded by readout A, which uses the same matrix but extracts the physically meaningful quantity from it.",
+            "genuine_advantage": "Same as A's: shape independence, and no forward kinematics."
+          }
+        },
+        "diagnostics_deg": {
+          "x2_yaw_axis_world": {
+            "left": [
+              -0.0059756,
+              -0.2079071,
+              0.9781303
+            ],
+            "right": [
+              0.000154,
+              0.2079147,
+              0.978147
+            ]
+          },
+          "x2_yaw_axis_tilt_from_bone": {
+            "left": 4.0631,
+            "right": 4.0631
+          },
+          "x2_yaw_axis_dot_with_bone": {
+            "left": -0.99749,
+            "right": -0.99749
+          },
+          "x2_yaw_axis_dot_between_sides": 0.913527,
+          "x2_twist_slope_per_command": {
+            "left": -0.993029,
+            "right": -0.994429,
+            "at_zero_pose": -0.9899,
+            "fitted_over_full_range": {
+              "left": -0.9939,
+              "right": -0.9937
+            }
+          },
+          "x2_limits": {
+            "left": [
+              -146.448,
+              146.448
+            ],
+            "right": [
+              -146.448,
+              146.448
+            ]
+          },
+          "x2_own_twist_at_yaw_zero": {
+            "left": [
+              35.93,
+              124.57
+            ],
+            "right": [
+              56.06,
+              148.3
+            ]
+          },
+          "x2_own_twist_spread": {
+            "left": 88.63,
+            "right": 92.24
+          },
+          "best_constant_offset_error": {
+            "left": {
+              "rms": 15.88,
+              "max": 47.42
+            },
+            "right": {
+              "rms": 16.14,
+              "max": 52.47
+            }
+          },
+          "source_twist_A_spin": {
+            "left": [
+              37.1,
+              96.73
+            ],
+            "right": [
+              62.3,
+              130.08
+            ]
+          },
+          "source_twist_B_plane": {
+            "left": [
+              26.0,
+              132.45
+            ],
+            "right": [
+              22.32,
+              141.93
+            ]
+          },
+          "source_twist_mean": {
+            "left": {
+              "A": 59.91,
+              "B": 60.03
+            },
+            "right": {
+              "A": 103.53,
+              "B": 103.35
+            }
+          },
+          "readout_disagreement": {
+            "left": {
+              "rms": 11.99,
+              "max": 35.72
+            },
+            "right": {
+              "rms": 15.99,
+              "max": 39.97
+            }
+          },
+          "conditioning_abs_sin_flexion_min": {
+            "left": 0.4802,
+            "right": 0.5717
+          },
+          "reference_norm_min": {
+            "left": 0.7255,
+            "right": 0.6194
+          },
+          "source_elbow_flexion": {
+            "left": [
+              28.7,
+              132.79
+            ],
+            "right": [
+              34.87,
+              119.54
+            ]
+          },
+          "derived_command_range_B": {
+            "left": [
+              -40.36,
+              66.92
+            ],
+            "right": [
+              -61.17,
+              49.72
+            ]
+          },
+          "derived_command_range_A": {
+            "left": [
+              -19.61,
+              62.88
+            ],
+            "right": [
+              -52.94,
+              25.82
+            ]
+          },
+          "clipped_frames": {
+            "A": {
+              "left": 0,
+              "right": 0
+            },
+            "B": {
+              "left": 0,
+              "right": 0
+            }
+          },
+          "limit_margin_B": {
+            "left": [
+              106.09,
+              79.53
+            ],
+            "right": [
+              85.28,
+              96.72
+            ]
+          },
+          "closure_residual": {
+            "A": {
+              "left": {
+                "rms": 0.4038,
+                "max": 1.3673
+              },
+              "right": {
+                "rms": 0.3291,
+                "max": 1.4598
+              }
+            },
+            "B": {
+              "left": {
+                "rms": 0.5131,
+                "max": 1.9371
+              },
+              "right": {
+                "rms": 0.6001,
+                "max": 2.0198
+              }
+            }
+          },
+          "fidelity_upper_arm_direction_common_to_both": {
+            "left": {
+              "A_mean": 4.12,
+              "A_max": 19.95,
+              "B_mean": 4.31,
+              "B_max": 20.43
+            },
+            "right": {
+              "A_mean": 3.36,
+              "A_max": 22.86,
+              "B_mean": 4.07,
+              "B_max": 23.59
+            }
+          },
+          "fidelity_forearm_direction": {
+            "A": {
+              "left": {
+                "mean": 10.32,
+                "max": 33.36
+              },
+              "right": {
+                "mean": 13.93,
+                "max": 41.85
+              }
+            },
+            "B": {
+              "left": {
+                "mean": 3.27,
+                "max": 14.78
+              },
+              "right": {
+                "mean": 2.79,
+                "max": 17.27
+              }
+            }
+          },
+          "fidelity_upper_arm_spin": {
+            "A": {
+              "left": {
+                "rms": 0.4,
+                "max": 1.37
+              },
+              "right": {
+                "rms": 0.33,
+                "max": 1.46
+              }
+            },
+            "B": {
+              "left": {
+                "rms": 12.06,
+                "max": 34.42
+              },
+              "right": {
+                "rms": 15.89,
+                "max": 38.48
+              }
+            }
+          },
+          "camera_alignment_along_driven_bone": {
+            "left": {
+              "mean_cos": -0.9116,
+              "worst_abs_cos": 0.7053
+            },
+            "right": {
+              "mean_cos": -0.8917,
+              "worst_abs_cos": 0.6317
+            },
+            "frames_with_cos_above_-0.3": 0
+          },
+          "robot_readout_elbow_sensitivity": {
+            "hinge_axis_off_perpendicular_deg": 0.056,
+            "hinge_axis_dot_bone": {
+              "left": 0.00098,
+              "right": -0.00098
+            },
+            "wrist_anchor_off_plane_m": 0.0001,
+            "readout_spread_over_elbow_sweep_deg": {
+              "at_yaw_0": 0.61,
+              "at_yaw_30": 1.09,
+              "at_yaw_90": 1.56
+            }
+          },
+          "extreme_frames": {
+            "right_most_negative": 50,
+            "left_most_negative_and_max_disagreement": 162,
+            "left_most_positive": 172,
+            "right_most_positive": 353,
+            "right_max_disagreement": 360,
+            "note": "Chosen by a filter that looks only at the source twist and at the A-B disagreement, never at which option is better."
+          }
+        },
+        "open_question_degeneracy": "Readout B's indicator is unit(cross(bone, forearm)), whose conditioning is |sin(elbow flexion)|. On this clip it never drops below 0.4802 (left) / 0.5717 (right) -- her elbow flexion stays in [28.70, 132.79] / [34.87, 119.54] deg and never approaches extension -- so the choice is unaffected here. A NEW SOURCE CLIP CONTAINING A STRAIGHT ARM WILL BREAK IT. Before running this channel on new material, check the flexion range first; if it approaches extension, either fall back to readout A on the degenerate frames or blend the two on the conditioning. A is defined everywhere and is already implemented in tools_x2_shoulder_yaw_composite.py.",
+        "notes": "The last of the seven, and the only one where the operator's question was not a sign or a zero. It is also the first channel whose SOURCE readout has to run the ROBOT's forward kinematics: the coupling term is a property of the assembled chain and has no closed form. The operator's own correction started this -- SMPL-X's fitted 6D/rotation does contain the twist -- and it is what made readout A available as a real candidate rather than a hand-wave. The archive keeps A fully implemented and tested precisely because the degeneracy note above may one day force a fall-back to it."
+      },
+      "elbow": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_elbow/x2_elbow_zero_question.png and x2_elbow_composite.mp4, 2026-09-08: option B (subtract the robot's own built-in bend, drive from the geometric flexion). Operator: \"B, 我也觉得B效果好\".",
+        "arm_pos": [
+          3,
+          10
+        ],
+        "smplx_source": {
+          "source_type": "geometric_flexion",
+          "body_index": {
+            "left": 17,
+            "right": 18
+          },
+          "euler_axis": null,
+          "axis_name": null,
+          "readout": "flexion_from_joints_deg(): the angle at the elbow between the shoulder->elbow and elbow->wrist vectors of ehm_joints_3d_model (left 16/18/20, right 17/19/21). Unsigned, 0 = straight. NOT a Euler component -- see source_readouts."
+        },
+        "sign": {
+          "left": -1,
+          "right": -1
+        },
+        "offset_rad": {
+          "left": -0.18658464239640196,
+          "right": -0.18639534504895822
+        },
+        "scale": 1.0,
+        "offset_deg": {
+          "left": -10.690512531271558,
+          "right": -10.67966659219001
+        },
+        "zero_position_answer": "THE ZERO LIVES ON THE ROBOT SIDE, and this is the one channel so far where 'offset 0' would have been wrong. X2 is NOT straight at arm_pos = 0: forward kinematics on the model puts a built-in 10.6905 deg (left) / 10.6797 deg (right) bend in the elbow at command zero. The arm straightens at command -10.69 deg. SMPL-X identity, by contrast, IS straight. So setting offset 0 would equate two different physical poses and bias every frame by 10.69 deg. The offset is therefore the negative of the robot's own bend -- measured from the model, not tuned to look right, and it is the only free number on this channel. Measurement detail that matters: the bend must be read at the joint ANCHORS (data.xanchor), not the link origins (data.xpos); link frames need not sit on the joint axis and the origin-based number is off by more than a degree, which is the size of the effect being measured. The shoulder end of the upper-arm vector is the shoulder_ROLL anchor: pitch and roll anchors sit together at the shoulder while the yaw anchor is displaced 12 cm down the humerus, and roll's upper-arm vector is the one lying in the elbow's hinge plane (|cos| with the hinge axis 0.0010, against 0.2360 for pitch).",
+        "sign_answer": "-1 on BOTH sides, and unlike every wrist channel there was no choice to make. The source readout is an unsigned bend MAGNITUDE (always >= 0) and the X2 elbow's upper limit is exactly 0, so the only reachable commands are negative; a +1 sign would leave the joint's range on every frame. Derived non-circularly all the same, from forward kinematics rather than from the limit: at command -90 deg the forearm points forward (+x component > 0.8) on both arms, at +90 deg it points backward. Both elbows share one limit and one sign -- no left/right asymmetry here, in contrast to wrist_pitch (+1/-1) and wrist_yaw (-1/+1).",
+        "range_answer": "This is the first channel where the source outruns the robot, and the saturation is honest rather than a mapping defect. X2 reachable flexion is 0 .. 124.28 deg (at the -134.97 deg limit); her flexion runs 28.70 .. 132.79 deg (left) and 34.87 .. 119.54 deg (right). Under option B the commands are [-143.48, -39.39] deg on the left -- 39 of 368 frames (10.6%) clip, in 7 runs, the longest 15 frames (0.50 s), worst overshoot 8.51 deg -- and [-130.22, -45.56] deg on the right, where nothing clips. Her left elbow simply folds 8.5 deg past what the X2 elbow can do; no faithful mapping avoids that, and biasing the whole channel to hide it (see rejected_options.D) makes every other frame worse. Scale stays 1.0: one source degree is one robot degree, because both ends are the same physical angle in the same units. Clip in RADIANS, in the units the limits are stored in -- clipping in degrees and converting afterwards lands a hair outside the limit that was just enforced and check_limits reports a violation that is not one.",
+        "source_readouts": {
+          "why_not_euler": "The intrinsic-XYZ decomposition is unusable at the elbow. The right elbow reports 524 deg of peak-to-peak travel on X and 516 deg on Z -- artefacts of unwrapping next to a decomposition singularity, not motion. The best |corr| any Euler component reaches against the true flexion is 0.925 (left) / 0.807 (right), against 0.98+ for every confirmed wrist channel.",
+          "driving": "flexion_from_joints_deg: the angle between the shoulder->elbow and elbow->wrist vectors of the source's own 3D joints. Left 28.70 .. 132.79 deg, right 34.87 .. 119.54 deg.",
+          "cross_check": "flexion_from_matrix_deg: the rotation magnitude arccos((tr(R)-1)/2) of body_pose_matrix[17/18], which is identically the axis-angle norm. No sequence, no gimbal, no unwrap, 0 = SMPL-X identity = straight. Left 23.06 .. 124.11 deg, right 32.04 .. 117.32 deg.",
+          "agreement": "corr +0.9967 (left) / +0.9970 (right). Regression joints = 1.0549*matrix + 3.3702 (left), 0.9702*matrix + 4.9060 (right). The two share no arithmetic -- one is joint positions, the other is the local rotation matrix -- so this agreement is the independent confirmation.",
+          "hinge_evidence": "The source rotation axis is Y-dominant: mean |axis| = (0.176, 0.908, 0.351) left and (0.183, 0.916, 0.308) right. A genuine hinge, which is why a scalar magnitude is a legitimate readout for it."
+        },
+        "independent_confirmations": [
+          "Two source readouts sharing no arithmetic agree at corr +0.997 (joint geometry vs rotation magnitude).",
+          "flexion_from_matrix_deg equals the npz's own body_pose_axis_angle_rad norm to 1e-3 -- the magnitude readout is not an artefact of the matrix conversion.",
+          "The X2 elbow is a clean hinge: flexion(cmd) = |cmd + bend| exactly over a 25-point sweep of the whole range, max residual 0.0133 deg. One measurement at command zero therefore pins the entire curve.",
+          "The two sides' built-in bends land 0.011 deg apart, which a left/right construction error would not do."
+        ],
+        "no_circularity_check": "The sign is fixed by the joint's own upper bound of 0, so the usual 'does the range decide the sign' question has a different shape here: it is the range that decides, and that is admissible only because the readout is an unsigned magnitude by construction. The independent derivation from forward kinematics (forearm forward at -90, backward at +90) was done anyway and agrees. The OFFSET, which is the number that was actually open, is measured from the robot model alone and never touches the source data, so nothing about the source could have biased it.",
+        "independent_measurement": "Geometric flexion from the source's own 3D joint positions: the angle between the shoulder->elbow and elbow->wrist vectors, 0 = straight. It needs no frame at all, only three points. Here it is not merely the check but the driving readout, with the axis-angle magnitude of the local rotation matrix as the independent second opinion.",
+        "camera": "No new camera was needed -- the only channel so far where that was true. The elbow hinge axis is nearly +/-y in the display pose ([0, 0.978, +/-0.208]), and the medial cameras built for wrist_pitch (left_hand azimuth 270, right_hand azimuth 90) look along it at |cos| = 0.9945. They are MIRROR views, so the robot's front is image LEFT on the left panel and image RIGHT on the right panel -- measured from the changed-pixel centroid (155.1 vs 231.5 against a 194 centre), never reasoned from the azimuth.",
+        "anatomy": "Single hinge, flexion (屈伸). X2: axis (0,1,0), limit [-134.97, 0.00] deg identical on both sides, negative = more bent, upper bound 0 -- but 0 is NOT the straight arm, it carries a built-in 10.69 deg bend. SMPL-X: identity IS the straight arm.",
+        "rejected_options": {
+          "A": {
+            "definition": "cmd = -flexion_from_matrix_deg. Offset 0, drive from the rotation magnitude.",
+            "why_rejected": "It never subtracts the robot's built-in bend, so every frame is at least 10.69 deg too straight. Absolute error 11.80 .. 23.15 deg (left) and 5.79 .. 18.07 deg (right); B's WORST frame (8.51 deg) beats A's BEST frame on both arms, on all 368 frames. The error is not a constant bias either: on top of the fixed bend sits the joints-vs-matrix gap, which wanders 1.11 .. 12.45 deg (left) and -4.89 .. +7.39 deg (right).",
+            "genuine_advantage": "Shape independence. A reads pose parameters only; B reads joint positions, which depend on betas. This matters only if the same mapping is later applied to a different body, and can be recovered then by re-deriving the offset per subject.",
+            "non_arguments": "Speed and simplicity decide nothing here. A costs 22.7 ns/frame, B 76.6 ns/frame, against a 33,000,000 ns budget at 30 fps, and both operands are already in the npz. Both options need the same JSON schema change, so 'A is consistent with the wrist channels' is also false."
+          },
+          "D": {
+            "definition": "A's arithmetic plus one constant K = built-in bend + template carry (14.06 deg left, 15.59 deg right), i.e. cmd = -(matrix_flexion + K).",
+            "why_rejected": "Worse than B and better than A: -9.08 deg worst on the left with 9 frames clipped, +9.80 deg worst on the right. Recorded so it is not re-derived; a third option was not worth putting to the operator."
+          }
+        },
+        "diagnostics_deg": {
+          "x2_built_in_bend_at_command_zero": {
+            "left": 10.6905,
+            "right": 10.6797
+          },
+          "x2_command_that_straightens": {
+            "left": -10.6905,
+            "right": -10.6797
+          },
+          "x2_reachable_flexion": [
+            0.0,
+            124.28
+          ],
+          "source_flexion_from_joints": {
+            "left": [
+              28.7,
+              132.79
+            ],
+            "right": [
+              34.87,
+              119.54
+            ]
+          },
+          "source_flexion_from_matrix": {
+            "left": [
+              23.06,
+              124.11
+            ],
+            "right": [
+              32.04,
+              117.32
+            ]
+          },
+          "option_b_command_range": {
+            "left": [
+              -143.48,
+              -39.39
+            ],
+            "right": [
+              -130.22,
+              -45.56
+            ]
+          },
+          "option_b_clipped_frames": {
+            "left": 39,
+            "right": 0
+          },
+          "option_b_worst_error": {
+            "left": 8.51,
+            "right": 0.0
+          },
+          "option_a_absolute_error": {
+            "left": [
+              11.8,
+              23.15
+            ],
+            "right": [
+              5.79,
+              18.07
+            ]
+          }
+        }
+      },
+      "wrist_yaw": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_wrist/x2_wrist_yaw_sign_question.png and x2_wrist_yaw_composite.mp4, 2026-09-08: left -1, right +1",
+        "arm_pos": [
+          4,
+          11
+        ],
+        "smplx_source": {
+          "body_index": {
+            "left": 19,
+            "right": 20
+          },
+          "euler_axis": 0,
+          "axis_name": "local X (red)"
+        },
+        "sign": {
+          "left": -1,
+          "right": 1
+        },
+        "offset_rad": {
+          "left": 0.0,
+          "right": 0.0
+        },
+        "scale": 1.0,
+        "zero_position_answer": "No offset -- but the evidence is NOT the same shape as it was for wrist_pitch and wrist_roll, and the difference is worth reading before trusting this row. Forearm spin has no observable anatomical zero: pitch and roll are bending angles, so 'straight' is a thing you can see and the regression intercept tests it directly, whereas 'unpronated' is a convention with no landmark on the forearm to point at. The independent measurement's reference is the elbow frame's third column, which sits about 80 deg off the palmar normal BY CONSTRUCTION, so the intercepts (+80.32 left / +80.29 right) are that convention constant and not a zero error. What they DO test is that the mirrored left/right construction is correct: the two sides land 0.03 deg apart, which a handedness bug would not do. The basis for offset 0 is therefore structural and the same one used for the other two channels: under the confirmed axis permutation the SMPL-X identity wrist rotation maps to the X2 zero. Corroborating, not load-bearing: the operator's independent read of the clip was that the wrist yaw sits essentially at the X2 zero, and the source does hover there -- mean +6.59 / +9.51 deg, with 53% / 44% of frames inside +/-10 deg.",
+        "sign_answer": "-1 on the LEFT, +1 on the RIGHT. Two factors, neither of them remembered: forward kinematics on the X2 mesh gives d(anatomical spin)/d(wrist_yaw) = -1 on the left and +1 on the right in a mirrored anatomical convention; the source Euler-X correlates with the same anatomical quantity at +0.924 (left) and +0.952 (right). The product is -1 / +1. Confirmed by operator visual review. This is the second channel whose signs differ per side (wrist_pitch was the first, +1/-1); wrist_roll's did not.",
+        "range_answer": "The roomiest of the three wrist channels by a wide margin. Source travel is [-24.18,+23.11] deg (left) and [-31.46,+35.98] deg (right) against a symmetric +/-146.4 deg URDF limit and a +/-146 deg operator envelope, leaving over 110 deg of margin everywhere. Neither limit is anywhere near binding, which is also why the range contributes nothing to the sign -- see no_circularity_check. Contrast wrist_roll, where the right hand kept only 0.49 deg.",
+        "scale_answer": "1.0, and unlike wrist_roll this one is not an open question. The regression slope of the independent measurement against the source channel is +0.979 (left) and +1.048 (right), i.e. one source degree really is one robot degree to within 5%. With 110+ deg of headroom there is no envelope pressure that would tempt a reduction either.",
+        "quietest_channel_note": "The operator's prior going in was that the wrist barely spins in this clip and that the yaw sits essentially at the X2 zero. Measured, that is right in the sense that matters: yaw has the smallest spread of the three wrist channels on both sides (std 9.71/11.28 deg, vs pitch 12.03/12.02 and roll 17.75/18.66) and about half its frames sit within 10 deg of zero. It is not identically zero -- peaks reach 24 deg and 36 deg -- so the channel is still worth driving, but it is the quietest one and a scale or sign error here would be the least visible of the three.",
+        "diagnostics_deg": {
+          "source_euler_x": {
+            "left": [
+              -24.18,
+              23.11
+            ],
+            "right": [
+              -31.46,
+              35.98
+            ]
+          },
+          "source_euler_x_mean": {
+            "left": 6.59,
+            "right": 9.51
+          },
+          "source_euler_x_std": {
+            "left": 9.71,
+            "right": 11.28
+          },
+          "fraction_of_frames_within_10_deg_of_zero": {
+            "left": 0.533,
+            "right": 0.438
+          },
+          "fraction_of_frames_within_5_deg_of_zero": {
+            "left": 0.264,
+            "right": 0.201
+          },
+          "measured_forearm_spin": {
+            "left": [
+              60.58,
+              110.85
+            ],
+            "right": [
+              48.7,
+              127.11
+            ]
+          },
+          "measured_forearm_spin_mean": {
+            "left": 86.76,
+            "right": 90.25
+          },
+          "measured_forearm_spin_std": {
+            "left": 10.28,
+            "right": 12.42
+          },
+          "correlation_with_forearm_spin": {
+            "left": 0.924,
+            "right": 0.952
+          },
+          "regression_slope": {
+            "left": 0.979,
+            "right": 1.048
+          },
+          "regression_intercept": {
+            "left": 80.32,
+            "right": 80.29
+          },
+          "intercept_is_a_convention_constant": true,
+          "correlation_of_the_other_two_channels": {
+            "left": {
+              "pitch": 0.104,
+              "roll": -0.354
+            },
+            "right": {
+              "pitch": -0.376,
+              "roll": 0.537
+            }
+          },
+          "channel_selectivity_note": "Euler-X wins on both sides by a margin of more than 0.3, so the axis assignment is independently confirmed and not inherited from the earlier unsigned axis call.",
+          "reference_conditioning_min": {
+            "left": 0.999,
+            "right": 0.998
+          },
+          "operator_envelope_margin": {
+            "left": [
+              121.82,
+              122.89
+            ],
+            "right": [
+              114.54,
+              110.02
+            ]
+          },
+          "hard_limit_margin": {
+            "left": [
+              122.27,
+              123.34
+            ],
+            "right": [
+              114.98,
+              110.47
+            ]
+          },
+          "spread_of_all_three_wrist_channels_std": {
+            "yaw": {
+              "left": 9.71,
+              "right": 11.28
+            },
+            "pitch": {
+              "left": 12.03,
+              "right": 12.02
+            },
+            "roll": {
+              "left": 17.75,
+              "right": 18.66
+            }
+          },
+          "extreme_frames": {
+            "left_most_positive": 349,
+            "left_most_negative": 308,
+            "right_most_positive": 258,
+            "right_most_negative": 233
+          }
+        },
+        "independent_confirmations": [
+          "anatomy: both the X2 wrist_yaw axis and the SMPL-X wrist local X run along the forearm, so the two are the same anatomical axis (自旋, pronation/supination)",
+          "model: forward kinematics on the X2 itself -- d(palm spin about the distal forearm)/d(wrist_yaw) = -0.998 on the left and +0.998 on the right, in the same mirrored convention the source measurement uses",
+          "measurement: correlation against a forearm spin angle built from the source's own joints and the forearm link's FK rotation, which never touches the wrist local matrix being decomposed",
+          "operator: visual review of the extreme-frame sheet and the 368-frame composite, 2026-09-08",
+          "the two mirrored intercepts agreeing to 0.03 deg, which is a handedness check on the measurement rather than evidence about the joint"
+        ],
+        "no_circularity_check": "check_limits reports 'out-of-range channels none' for BOTH sign +1 and sign -1, and here it is not even close: the joint spans +/-146 deg while the source spans at most 36. The range rules out nothing, so the sign rests entirely on anatomy, the independent measurement and the operator's eyes.",
+        "independent_measurement": "pronation_deg(): signed angle of the palmar normal about the forearm axis, referenced to the forearm link's FK rotation. This is the WEAKEST of the three independent measurements and the weakness is structural, not an oversight: forearm spin needs a forearm-fixed direction perpendicular to the forearm, and the forearm carries only two joints (elbow and wrist) which between them give the axis and nothing else, so no joints-only construction exists. The reference has to be borrowed from rotations[ELBOW_ROTATION_INDEX]. The independence that still holds is the one that matters -- the elbow rotation is the FK chain down to but NOT including the wrist, so nothing here passes through the wrist local matrix whose Euler decomposition is under test. The cheap alternative reference, the upper-arm direction, is wrong and measurably so: it makes the angle read hand-relative-to-UPPER-ARM, which adds shoulder internal rotation on top of the wrist spin. It regressed at slope 1.41/1.48 instead of ~1.0 and its reference norm collapsed to 0.48 at the most extended frames, which is where its frame-to-frame jitter came from. Against the forearm frame the slope is 0.98/1.05 and the norm never drops below 0.998. Recorded because the contaminated version briefly looked like evidence that the operator's read of the clip was wrong, and it was the measurement that was wrong.",
+        "camera": "hand_front (azimuth 180, elevation -8), added for this channel. The yaw axis IS the forearm, which at the display pose lies along -x, so the default medial hand cameras look at it at |cos| = 0.000 -- exactly edge-on, reading literally nothing, not merely poorly. hand_front stands at +x facing the robot and aligns at 0.990. Image up is +z and image right is +y, the robot's own LEFT; measured from where the torso lands relative to each hand in rendered frames, not reasoned from the azimuth number. Note this is the opposite hand of hand_top's image right, which is why the label is per-channel.",
+        "anatomy": "both axes run along the forearm -- 自旋, pronation/supination"
+      },
+      "wrist_pitch": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_wrist/x2_wrist_pitch_sign_question.png and x2_wrist_pitch_composite.mp4, 2026-09-08",
+        "arm_pos": [
+          5,
+          12
+        ],
+        "smplx_source": {
+          "body_index": {
+            "left": 19,
+            "right": 20
+          },
+          "euler_axis": 1,
+          "axis_name": "local Y (green)"
+        },
+        "sign": {
+          "left": 1,
+          "right": -1
+        },
+        "offset_rad": {
+          "left": 0.0,
+          "right": 0.0
+        },
+        "scale": 1.0,
+        "zero_position_answer": "The SMPL-X identity rotation is an anatomically neutral, undeviated wrist, which is where the X2 zero also sits. No offset is needed. Evidence: source Euler-Y mean is -0.40 deg (left) / +0.57 deg (right), and the independently measured radial deviation mean is -0.30 deg / +1.00 deg.",
+        "sign_answer": "X2 positive wrist_pitch swings the fingers away from the thumb (ulnar). The source's Euler-Y correlates with measured radial deviation at -0.984 (left) and +0.976 (right), and the sign is minus the sign of that correlation.",
+        "range_answer": "Source travel is [-22.79,+27.41] deg (left) and [-28.00,+25.57] deg (right) against an X2 hard limit of +/-32 deg. Fits at scale 1.0 with no clipping on either sign, so the scale is not what the sign decision rests on.",
+        "diagnostics_deg": {
+          "source_euler_y": {
+            "left": [
+              -22.79,
+              27.41
+            ],
+            "right": [
+              -28.0,
+              25.57
+            ]
+          },
+          "source_euler_y_mean": {
+            "left": -0.4,
+            "right": 0.57
+          },
+          "source_euler_y_std": {
+            "left": 12.03,
+            "right": 12.02
+          },
+          "measured_radial_deviation": {
+            "left": [
+              -32.1,
+              21.79
+            ],
+            "right": [
+              -32.35,
+              24.06
+            ]
+          },
+          "measured_radial_deviation_mean": {
+            "left": -0.3,
+            "right": 1.0
+          },
+          "correlation_with_deviation": {
+            "left": -0.984,
+            "right": 0.976
+          },
+          "regression_slope": {
+            "left": -1.052,
+            "right": 1.172
+          },
+          "correlation_of_the_other_two_channels": {
+            "left": {
+              "yaw": 0.159,
+              "roll": 0.452
+            },
+            "right": {
+              "yaw": 0.461,
+              "roll": 0.602
+            }
+          },
+          "channel_selectivity_note": "Only Euler-Y tracks the deviation the hand physically performed. This is independent evidence for Y -> wrist_pitch, separate from the operator's earlier axis call.",
+          "extreme_frames": {
+            "left_most_positive": 266,
+            "left_most_negative": 340,
+            "right_most_positive": 303,
+            "right_most_negative": 276
+          }
+        },
+        "independent_confirmations": [
+          "anatomy: X2 palm normal is local Y and the SMPL-X wrist Y is the dorsal normal, so the two are the same anatomical axis",
+          "measurement: correlation against radial deviation computed from the source's own finger joints, which never touches the Euler decomposition",
+          "operator: visual review of the extreme-frame sheet and the 368-frame composite"
+        ],
+        "independent_measurement": "radial_deviation_deg(): signed angle between forearm and middle-finger direction, measured in the palm plane about the palmar normal, + = toward the thumb. Built from ehm_joints_3d_model only.",
+        "anatomy": "both axes are the palm normal -- 摇摆, radial/ulnar deviation. X2 local Y is the palm normal; the SMPL-X wrist local Y is the dorsal normal."
+      },
+      "wrist_roll": {
+        "verified": true,
+        "verified_by": "operator visual review of outputs/x2_wrist/x2_wrist_roll_sign_question.png and x2_wrist_roll_composite.mp4, 2026-09-08: both hands sign +1",
+        "arm_pos": [
+          6,
+          13
+        ],
+        "smplx_source": {
+          "body_index": {
+            "left": 19,
+            "right": 20
+          },
+          "euler_axis": 2,
+          "axis_name": "local Z (blue)"
+        },
+        "sign": {
+          "left": 1,
+          "right": 1
+        },
+        "offset_rad": {
+          "left": 0.0,
+          "right": 0.0
+        },
+        "scale": 1.0,
+        "zero_position_answer": "No offset. The SMPL-X identity rotation is a neutral, unflexed wrist, which is where the X2 zero also sits. The evidence is the REGRESSION INTERCEPT of the independent measurement against the source channel -- +2.12 deg (left) / +1.37 deg (right) -- i.e. what the measured flexion reads when the source channel reads zero. The MEAN is not usable here and would have been misleading: her wrists sit about 15 deg off neutral through this clip, so the source means are +15.12 / -11.93 deg and the measured means -11.84 / -9.80 deg. This is the first channel where mean and intercept disagree; wrist_pitch happened to be centred.",
+        "sign_answer": "+1 on BOTH sides. X2 positive wrist_roll turns both hands toward the robot's own left, which is EXTENSION on the left hand and FLEXION on the right -- one command sign, two opposite anatomical meanings, because the two arm frames are copied rather than mirrored. The source Euler-Z correlates with measured flexion at -0.989 (left) and +0.995 (right); combining each correlation with that side's anatomical meaning gives +1 on both. Independently recorded the same way in robot_measured_zero_and_sign: 'positive: toward the left', 'side_rule: same_sign_both_sides'.",
+        "range_answer": "Source travel is [-37.99,+37.57] deg (left) and [-39.51,+32.17] deg (right). The URDF hard limits are asymmetric and NOT binding (left [-90,+41.5], right [-41.5,+90]); the binding constraint is the operator's +/-40 deg envelope. At scale 1.0 the left hand keeps 2.01 deg of margin but the RIGHT HAND KEEPS ONLY 0.49 deg. Nothing is clipped, but the margin is thin. See open_question_scale.",
+        "open_question_scale": "NOT ANSWERED BY THE OPERATOR. The visual review confirmed the sign and the direction; the scale was not put to them as a decision they made. 1.0 is recorded because it is what the reviewed video showed and because the regression slope (0.92 left / 0.94 right) says one source degree really is about one robot degree, so 1.0 is physically honest. But the right hand exceeds 39 deg on 2 frames, 38 deg on 7 frames and 36 deg on 33 frames against a 40 deg envelope. Alternatives if more margin is wanted: scale 0.95 -> right peak 37.54 deg (margin 2.46), scale 0.90 -> 35.56 deg (margin 4.44). Revisit before any hardware step.",
+        "diagnostics_deg": {
+          "source_euler_z": {
+            "left": [
+              -37.99,
+              37.57
+            ],
+            "right": [
+              -39.51,
+              32.17
+            ]
+          },
+          "source_euler_z_mean": {
+            "left": 15.12,
+            "right": -11.93
+          },
+          "measured_flexion": {
+            "left": [
+              -32.92,
+              40.45
+            ],
+            "right": [
+              -36.04,
+              35.7
+            ]
+          },
+          "measured_flexion_mean": {
+            "left": -11.84,
+            "right": -9.8
+          },
+          "correlation_with_flexion": {
+            "left": -0.989,
+            "right": 0.995
+          },
+          "regression_slope": {
+            "left": -0.923,
+            "right": 0.936
+          },
+          "regression_intercept": {
+            "left": 2.12,
+            "right": 1.37
+          },
+          "correlation_of_the_other_two_channels": {
+            "left": {
+              "yaw": -0.001,
+              "pitch": 0.206
+            },
+            "right": {
+              "yaw": 0.244,
+              "pitch": -0.376
+            }
+          },
+          "channel_selectivity_note": "Only Euler-Z tracks the flexion the hand physically performed. Independent evidence for Z -> wrist_roll, separate from the earlier axis call.",
+          "operator_envelope_margin": {
+            "left": [
+              2.01,
+              2.43
+            ],
+            "right": [
+              0.49,
+              7.83
+            ]
+          },
+          "hard_limit_margin": {
+            "left": [
+              52.02,
+              3.91
+            ],
+            "right": [
+              1.97,
+              57.84
+            ]
+          },
+          "frames_over_threshold_right": {
+            "36": 33,
+            "38": 7,
+            "39": 2,
+            "40": 0
+          },
+          "extreme_frames": {
+            "left_most_positive": 93,
+            "left_most_negative": 158,
+            "right_most_positive": 258,
+            "right_most_negative": 78
+          }
+        },
+        "independent_confirmations": [
+          "anatomy: X2 wrist_roll turns about the hand's local X (thumb-to-pinky) and the SMPL-X wrist local Z is the radial direction on both hands, so the two are the same anatomical axis",
+          "model: forward kinematics on the X2 itself -- positive roll drives fingers.palm0 from +0.343 to -0.343 on the left (extension) and -0.343 to +0.343 on the right (flexion)",
+          "measurement: correlation against a flexion angle computed from the source's own finger joints, which never touches the Euler decomposition",
+          "operator: visual review of the extreme-frame sheet and the 368-frame composite",
+          "corroboration, not a basis: under this sign the asymmetric URDF limits decode to 90 deg flexion / 41.5 deg extension on BOTH hands; under the flipped sign they would decode to 41.5 flexion / 90 extension, which is anatomically backwards"
+        ],
+        "no_circularity_check": "check_limits reports 'out-of-range channels none' for BOTH sign +1 and sign -1, so the range contributes nothing to the sign decision and the sign rests entirely on anatomy, the independent measurement and the operator's eyes.",
+        "independent_measurement": "flexion_deg(): signed angle between forearm and hand measured out of the palm plane about the palmar normal, + = toward the palm. Two traps, both hit or avoided during this channel: the palmar normal must be built from the forearm and the radial direction, NOT from the finger direction (a reference derived from the measured vector makes the dot product identically zero); and the hand direction must be taken to the KNUCKLES (index/pinky MCP midpoint), not to a fingertip, because finger curl lies in this measurement's plane and reads as wrist flexion -- measuring to the middle fingertip put a spurious +13 deg into the intercept, which is precisely the number the measurement exists to test.",
+        "anatomy": "both axes run thumb-to-pinky -- 翻和勾, flexion/extension. X2 local X is the thumb-to-pinky axis; the SMPL-X wrist local Z is the radial direction."
+      }
+    },
+    "tooling": {
+      "script": {
+        "wrist": "tools_x2_wrist_composite.py",
+        "elbow": "tools_x2_elbow_composite.py",
+        "shoulder_roll": "tools_x2_shoulder_roll_composite.py",
+        "shoulder_pitch": "tools_x2_shoulder_pitch_composite.py",
+        "shoulder_yaw": "tools_x2_shoulder_yaw_composite.py"
+      },
+      "tests": {
+        "wrist": "test_x2_wrist_composite.py (51 checks)",
+        "elbow": "test_x2_elbow_composite.py (20 checks)",
+        "shoulder_roll": "test_x2_shoulder_roll_composite.py (27 checks)",
+        "shoulder_pitch": "test_x2_shoulder_pitch_composite.py (35 checks)",
+        "shoulder_yaw": "test_x2_shoulder_yaw_composite.py (42 checks)",
+        "renderer": "test_x2_mujoco_render.py (42 checks)",
+        "sign_check": "test_x2_sign_check.py (14 checks)",
+        "drift_guard": "test_x2_retarget_results.py (16 checks)",
+        "suite": "python3 -m unittest discover -p 'test_*.py' -- 273 tests"
+      },
+      "outputs": [
+        "outputs/x2_wrist/x2_wrist_pitch_composite.mp4",
+        "outputs/x2_wrist/x2_wrist_pitch_sign_question.png",
+        "outputs/x2_wrist/x2_wrist_pitch_source.csv",
+        "outputs/x2_wrist/x2_wrist_roll_composite.mp4",
+        "outputs/x2_wrist/x2_wrist_roll_sign_question.png",
+        "outputs/x2_wrist/x2_wrist_roll_source.csv",
+        "outputs/x2_wrist/x2_wrist_yaw_composite.mp4",
+        "outputs/x2_wrist/x2_wrist_yaw_sign_question.png",
+        "outputs/x2_wrist/x2_wrist_yaw_source.csv",
+        "outputs/x2_wrist/hand_axis_check_left.png",
+        "outputs/x2_wrist/x2_pitch_motion_check.png",
+        "outputs/x2_elbow/x2_elbow_composite.mp4",
+        "outputs/x2_elbow/x2_elbow_zero_question.png",
+        "outputs/x2_elbow/x2_elbow_source.csv",
+        "outputs/x2_shoulder_roll/x2_shoulder_roll_composite.mp4",
+        "outputs/x2_shoulder_roll/x2_shoulder_roll_sign_question.png",
+        "outputs/x2_shoulder_roll/x2_shoulder_roll_source.csv",
+        "outputs/x2_shoulder_pitch/x2_shoulder_pitch_composite.mp4",
+        "outputs/x2_shoulder_pitch/x2_shoulder_pitch_sign_question.png",
+        "outputs/x2_shoulder_pitch/x2_shoulder_pitch_source.csv",
+        "outputs/x2_shoulder_yaw/x2_shoulder_yaw_composite.mp4",
+        "outputs/x2_shoulder_yaw/x2_shoulder_yaw_readout_question.png",
+        "outputs/x2_shoulder_yaw/x2_shoulder_yaw_source.csv"
+      ]
+    },
+    "warning": "A verified sign, zero and scale for one channel is still not a publishable trajectory. Velocity limits, acceleration limits, per-frame continuity checks, comms timeout and an e-stop remain absent.",
+    "playbook": "docs/x2_retarget_playbook.md",
+    "archive": "docs/x2_retarget_results.md",
+    "schema": {
+      "note": "Every channel carries the same fields, verified or not. A channel is promoted by flipping `verified` and moving candidate_* into the plain fields; nothing else about the row changes shape.",
+      "fields": {
+        "verified": "true only after the operator confirmed from the picture",
+        "verified_by": "what was looked at, and when",
+        "arm_pos": "[left index, right index]",
+        "smplx_source": "which source readout drives the channel. source_type is 'euler' (body_pose_matrix[body_index] intrinsic-XYZ component euler_axis), 'geometric_flexion' (an unsigned angle built from joint positions), 'geometric_abduction' or 'geometric_hinge_pitch' (signed angles built from joint positions in a torso frame), or 'geometric_plane_twist_minus_coupling' (as the previous, minus a per-frame term measured on the robot by forward kinematics). body_index still names the joint either way; for the geometric types euler_axis and axis_name are null and `readout` says exactly what is computed.",
+        "sign / candidate_sign": "per side; x2 = sign * (source - offset) * scale",
+        "offset_rad / candidate_offset_rad": "per side, subtracted from the source before scaling",
+        "scale / candidate_scale": "single number, both sides",
+        "independent_measurement": "a signed physical angle built from the source's own 3D joints that never passes through the Euler decomposition. This is what makes the sign derivable instead of guessable.",
+        "anatomy": "the physical meaning of the axis at both ends"
+      }
+    },
+    "progress": {
+      "confirmed": [
+        "wrist_pitch",
+        "wrist_roll",
+        "wrist_yaw",
+        "elbow",
+        "shoulder_roll",
+        "shoulder_pitch",
+        "shoulder_yaw"
+      ],
+      "remaining": [],
+      "suggested_order": [],
+      "suggested_order_reason": "All seven channels are confirmed. The per-channel value-mapping stage is COMPLETE; the remaining work is no longer per-channel. Next: assemble the full [368,14] trajectory into x2_retarget_candidate.json, respecting the one ordering constraint this stage produced -- shoulder_yaw (arm_pos 2 and 9) must be computed AFTER shoulder_pitch, shoulder_roll and elbow, from those very values, by running forward kinematics per frame. Then the safety layer that is still entirely absent: velocity limits, acceleration limits, per-frame continuity checks (mind the elbow's 39 flat-topped frames), timestamp-based playback, smoothing, comms timeout and e-stop.",
+      "open_questions_carried_forward": [
+        "wrist_roll scale: recorded as 1.0 but never put to the operator as a decision; the right hand keeps only 0.49 deg of margin against the +/-40 deg envelope. Must be revisited before any hardware step. See value_mapping.channels.wrist_roll.open_question_scale.",
+        "elbow left-arm clipping: 39 of 368 frames (10.6%) saturate at the X2 lower limit because her left elbow folds to 132.79 deg against the robot's 124.28 deg ceiling. Accepted deliberately -- the alternative is biasing every frame -- but the trajectory will flat-top there, and the velocity check still to be written must not read the entry and exit of each clipped run as a step.",
+        "shoulder_roll bottom-of-range margin: nothing clips on this animation, but the closest approach to the near limit is 1.85 deg (left) / 3.01 deg (right) because the X2 cannot bring the upper arm inside +3.495 deg of its own 12.06 deg splay. A subject who hangs their arms straighter than she does WILL clip there. Re-check this range on any new source clip.",
+        "shoulder_yaw readout degeneracy: the chosen readout B rides on unit(cross(bone, forearm)), whose conditioning is |sin(elbow flexion)|. Safe on this clip (min 0.4802 left / 0.5717 right, her elbow never approaches extension) but it BREAKS on a clip with a straight arm. Check the flexion range before running this channel on new material; readout A is fully implemented and defined everywhere, and is the fall-back. See value_mapping.channels.shoulder_yaw.open_question_degeneracy."
+      ]
+    },
+    "updated": "2026-09-08"
+  },
+  "superseded_claims": {
+    "2026-09-08_smplx_y_perpendicular_to_wrist_pitch": {
+      "claim": "SMPL-X wrist local Y and the X2 wrist_pitch axis are anatomically perpendicular, so the confirmed Y -> wrist_pitch correspondence had to be wrong.",
+      "verdict": "WRONG. Withdrawn.",
+      "cause": "Two independent bugs. (1) Mesh vertices were read from m.mesh_vert without applying m.geom_quat, so the X2 hand's spread axis and palm normal came out swapped. (2) The source-side 'dorsal' direction was computed as cross(forearm, radial), which is the palmar direction, under a handedness rule that had the left hand backwards.",
+      "corrected": "They are the same anatomical axis -- the palm normal. The operator's original visual call (X -> yaw, Y -> pitch, Z -> roll) is correct."
+    },
+    "2026-09-08_x2_elbow_is_straight_at_command_zero": {
+      "claim": "The X2 elbow is straight at arm_pos = 0, so the elbow offset only has to absorb the fact that the source never straightens.",
+      "verdict": "WRONG. Withdrawn the same day it was written.",
+      "cause": "Two throwaway diagnostic scripts printed conclusion sentences that had been composed BEFORE the numbers existed, and the sentences were kept when the numbers came back saying otherwise. The first FK attempt also measured at link origins (data.xpos) instead of joint anchors (data.xanchor), which mixed in an out-of-plane component and gave 13.54 deg.",
+      "corrected": "The X2 elbow carries a built-in 10.6905 deg (left) / 10.6797 deg (right) bend at command zero, measured at the joint anchors; flexion(cmd) = |cmd + bend| exactly. The offset is the negative of that bend, and it is the robot's number, not the source's."
+    }
+  }
+}

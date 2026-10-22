@@ -17,6 +17,8 @@ Modules:
               per tick.
 ``mock_playback``  a window pipeline that plays the mock node's recorded
               animation through the gate, so the data flow runs end to end.
+``demo``      the demo start/cancel rules (business hooks ``demo``).
+``business``  the business config file and the business hook classes by name.
 
 Nothing in this package imports ROS, so all of it can be exercised with a fake
 runtime. ``mirror_session_node`` adapts it to ROS.

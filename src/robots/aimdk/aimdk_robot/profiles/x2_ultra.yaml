@@ -277,6 +277,15 @@ vendor:
   # subscription forgoes the latched last sample a TRANSIENT_LOCAL publisher
   # offers, which is how the platform's state topics deliver their current value
   # immediately on subscribe.
+  #
+  # audio_capture is the opposite direction from audio_playback: the platform
+  # publishes it (RELIABLE, KEEP_LAST 1000 in hal_audio.yaml) and we subscribe.
+  # The interface table leaves its QoS unspecified; the SDK's own raw-audio
+  # examples subscribe BEST_EFFORT with KEEP_LAST 500 (example_Python /
+  # example_Cpp), which still matches a RELIABLE publisher. A RELIABLE
+  # subscription lets the platform retransmit from that 1000-deep history
+  # whenever a fragment is lost; on 2026-10-16 capture traffic to RELIABLE
+  # readers filled the SoC's 800 Mbit/s egress and starved every other stream.
   qos:
     processed_audio: {reliability: best_effort, durability: volatile}
     upper_body_command: {reliability: best_effort, durability: volatile}
@@ -288,7 +297,7 @@ vendor:
     power_state: {reliability: best_effort, durability: transient_local}
     diag_codes: {reliability: best_effort, durability: transient_local}
     alert_codes: {reliability: best_effort, durability: transient_local}
-    audio_capture: {reliability: reliable, durability: volatile}
+    audio_capture: {reliability: best_effort, durability: volatile, depth: 500}
     audio_playback: {reliability: reliable, durability: volatile}
     audio_focus_response: {reliability: reliable, durability: transient_local}
     localization_pose: {reliability: reliable, durability: volatile}

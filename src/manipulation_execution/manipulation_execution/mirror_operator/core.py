@@ -1,0 +1,371 @@
+"""The operator: frames, touches and the session state in, calls out. No ROS.
+
+The node feeds it and makes the calls it asks for through ``OperatorCalls``;
+every answer comes back through the ``done`` callback it was given.
+
+==================  ==============================  ==========================
+input               when                            call
+==================  ==============================  ==========================
+double cover        session state WAIT              ``mirror_start`` (Gateway)
+long cover          session STANDBY or MIRRORING    ``set_session(false)``
+head touch held     any session state               ``operator_touch``
+(``tick``)          on/off stable ``stable_s``      the light
+==================  ==============================  ==========================
+
+* The session state is the ``state`` of the newest message on the session
+  state topic. Its age is this process's receive time, not the message's
+  ``stamp`` (the session's clock). Silent for longer than
+  ``session_silent_s``: no session, nothing is sent and the light goes off.
+  The old message a transient_local subscription hands over counts once.
+* Two channels, the Gateway and the session, each carry at most one call; a
+  gesture or touch whose channel is busy is dropped and logged. A call with
+  no answer within its timeout frees the channel; a late answer is ignored.
+* The light is only sent, never waited for, and is not a channel.
+* ``send_enabled`` False: every call is recorded as not sent, nothing is sent.
+* ``operator_touch`` answering ``success=False`` ("nothing to do") is a normal
+  answer, recorded as ``declined``.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from embodied_common.mirror_session_contract import DEFAULT_STOP_TIMEOUT_SEC, STOP_TIMEOUT_MARGIN_SEC
+from manipulation_execution.mirror_operator.config import LedColor, OperatorConfig
+from manipulation_execution.mirror_operator.gateway import RESULT_WAIT_SEC
+from manipulation_execution.mirror_operator.gesture import DOUBLE_COVER, LONG_COVER, GestureRecognizer
+from manipulation_execution.mirror_operator.judge import CoverJudge, GrayFrame
+from manipulation_execution.mirror_operator.led import ON, LedPolicy, status_note
+from manipulation_execution.mirror_operator.touch import TouchDetector
+from manipulation_execution.mirror_session.core import SessionState
+
+GATEWAY_TIMEOUT_S = RESULT_WAIT_SEC
+STOP_TIMEOUT_S = DEFAULT_STOP_TIMEOUT_SEC + STOP_TIMEOUT_MARGIN_SEC
+TOUCH_TIMEOUT_S = 2.0
+FRAME_HZ_WINDOW_S = 1.0
+SESSION_ON = (SessionState.STANDBY.value, SessionState.MIRRORING.value)
+_STATES = tuple(state.value for state in SessionState)
+TOUCH_INTERFACE = "touch.head"
+
+# success True / False is the answer; None: no answer (the call failed).
+Done = Callable[[bool | None, str], None]
+# The light's status_code, or None with the reason there is none.
+LedDone = Callable[[int | None, str], None]
+
+
+class OperatorCalls(Protocol):
+    def mirror_start(self, done: Done) -> None: ...
+
+    def stop_session(self, done: Done) -> None: ...
+
+    def operator_touch(self, done: Done) -> None: ...
+
+    def set_led(self, color: LedColor, priority: int, done: LedDone) -> None: ...
+
+
+@dataclass(frozen=True)
+class TouchEndpoint:
+    endpoint: str
+    message_type: str
+    qos: Mapping
+
+
+def resolve_touch_endpoint(description: Mapping) -> tuple[TouchEndpoint | None, str]:
+    """``touch.head`` from the runtime description, or ``(None, reason)``: the touch is then off."""
+    interfaces = description.get("interfaces") if isinstance(description, Mapping) else None
+    item = interfaces.get(TOUCH_INTERFACE) if isinstance(interfaces, Mapping) else None
+    if not isinstance(item, Mapping):
+        return None, f"{TOUCH_INTERFACE} is not in the runtime description"
+    if (item.get("kind"), item.get("direction")) != ("topic", "publish"):
+        return None, f"{TOUCH_INTERFACE} must be a published topic"
+    endpoint, message_type = item.get("endpoint"), item.get("message_type")
+    if not isinstance(endpoint, str) or not endpoint.startswith("/"):
+        return None, f"{TOUCH_INTERFACE} endpoint must be an absolute ROS name"
+    if not isinstance(message_type, str) or not message_type:
+        return None, f"{TOUCH_INTERFACE} has no message_type"
+    return TouchEndpoint(endpoint, message_type, dict(item.get("qos") or {})), ""
+
+
+@dataclass
+class _Flight:
+    call: str
+    token: int
+    started_at: float
+    timeout_s: float
+
+
+def _age(record: dict | None, now: float) -> dict | None:
+    if record is None:
+        return None
+    shown = {key: value for key, value in record.items() if not key.endswith("_at")}
+    for key, value in record.items():
+        if key.endswith("_at"):
+            shown[key[: -len("_at")] + "_age_s"] = None if value is None else round(now - value, 3)
+    return shown
+
+
+class Operator:
+    def __init__(
+        self,
+        config: OperatorConfig,
+        judge: CoverJudge,
+        calls: OperatorCalls,
+        *,
+        send_enabled: bool,
+        touch_unavailable: str = "",
+        led_unavailable: str = "",
+        clock: Callable[[], float] = time.monotonic,
+        log: Callable[[str, str], None] | None = None,
+    ):
+        self._config = config
+        self._judge = judge
+        self._calls = calls
+        self._send_enabled = bool(send_enabled)
+        self._touch_unavailable = touch_unavailable
+        self._led_unavailable = led_unavailable
+        self._clock = clock
+        self._log = log or (lambda level, message: None)
+        self._lock = threading.RLock()
+        self._gestures = GestureRecognizer(config)
+        self._touch = TouchDetector(config.touch)
+        self._led = LedPolicy(config.led)
+        self._tokens = 0
+        self._flights: dict[str, _Flight | None] = {"gateway": None, "session": None}
+        self._frame_times: deque[float] = deque()
+        self._frame: GrayFrame | None = None
+        self._covered: bool | None = None
+        self._frame_error: dict | None = None
+        self._gesture: dict | None = None
+        self._touch_last: dict | None = None
+        self._state: str | None = None
+        self._state_at: float | None = None
+        self._state_error = ""
+        self._last_gateway: dict | None = None
+        self._last_session_call: dict | None = None
+        self._last_led: dict | None = None
+        self._led_token = 0
+        self.dropped = {"gateway": 0, "session": 0}
+
+    # ------------------------------------------------------------------
+    # inputs
+    # ------------------------------------------------------------------
+
+    def on_frame(self, frame: GrayFrame) -> str | None:
+        """Judge one decoded frame; the gesture it completed, if any."""
+        with self._lock:
+            now = self._clock()
+            self._frame_times.append(now)
+            self._frame = frame
+            try:
+                covered = bool(self._judge.covered(frame))
+                self._frame_error = None
+            except Exception as exc:  # noqa: BLE001 - a business judge must not stop the node
+                covered = False
+                self._frame_error = {"reason": f"cover judge failed: {exc}", "at": now}
+            self._covered = covered
+            gesture = self._gestures.update(covered, now)
+            if gesture is not None:
+                self._on_gesture(gesture, now)
+            return gesture
+
+    def frame_failed(self, reason: str) -> None:
+        """A frame that did not decode; the gesture state sees it as a gap."""
+        with self._lock:
+            self._frame_error = {"reason": reason, "at": self._clock()}
+
+    def on_touch(self, event_type: int) -> bool:
+        """One touch message; True when it completed a hold."""
+        with self._lock:
+            now = self._clock()
+            if not self._touch.update(int(event_type), now):
+                return False
+            state = self._session_state(now)
+            if state is None:
+                self._touch_last = {"action": "ignored: no session", "at": now}
+            else:
+                self._touch_last = {"action": self._send("session", "touch", now), "at": now}
+            return True
+
+    def on_state(self, message: str | Mapping) -> None:
+        """One session state message (the JSON text or its mapping); only ``state`` is read."""
+        with self._lock:
+            now = self._clock()
+            try:
+                content = json.loads(message) if isinstance(message, str) else message
+                state = content.get("state") if isinstance(content, Mapping) else None
+                error = "" if state in _STATES else f"unknown session state {state!r}"
+            except ValueError as exc:
+                error = f"unreadable state message: {exc}"
+            if error:
+                self._state_error = error
+                self._log("warning", error)
+                return
+            self._state, self._state_at, self._state_error = state, now, ""
+
+    def tick(self) -> None:
+        """Call timeouts and the light; the node calls it about 10 times a second."""
+        with self._lock:
+            now = self._clock()
+            for channel, flight in self._flights.items():
+                if flight is not None and now - flight.started_at > flight.timeout_s:
+                    self._finish(channel, flight.token, "timeout", f"no answer within {flight.timeout_s:g} s", now)
+            color = self._led.update(self._session_state(now) in SESSION_ON, now)
+            if color is not None:
+                self._set_led(color, now)
+
+    # ------------------------------------------------------------------
+    # calls
+    # ------------------------------------------------------------------
+
+    def _session_state(self, now: float) -> str | None:
+        if self._state_at is None or now - self._state_at > self._config.session_silent_s:
+            return None
+        return self._state
+
+    def _on_gesture(self, gesture: str, now: float) -> None:
+        state = self._session_state(now)
+        if gesture == DOUBLE_COVER and state == SessionState.WAIT.value:
+            action = self._send("gateway", "mirror_start", now)
+        elif gesture == LONG_COVER and state in SESSION_ON:
+            action = self._send("session", "stop", now)
+        else:
+            action = f"ignored: session {state or 'none'}"
+        self._gesture = {"name": gesture, "action": action, "at": now}
+        self._log("info", f"{gesture}: {action}")
+
+    def _send(self, channel: str, call: str, now: float) -> str:
+        record = {"call": call, "result": "", "message": "", "sent_at": now, "answered_at": None}
+        if not self._send_enabled:
+            record["result"] = "not_sent"
+            record["message"] = "send_enabled is false"
+            self._store(channel, record)
+            return "not sent: send_enabled is false"
+        flight = self._flights[channel]
+        if flight is not None:
+            self.dropped[channel] += 1
+            self._log("warning", f"{call} dropped: {flight.call} is still in flight on the {channel} channel")
+            return f"dropped: {flight.call} in flight"
+        self._tokens += 1
+        token = self._tokens
+        timeout_s = {"mirror_start": GATEWAY_TIMEOUT_S, "stop": STOP_TIMEOUT_S, "touch": TOUCH_TIMEOUT_S}[call]
+        self._flights[channel] = _Flight(call, token, now, timeout_s)
+        self._store(channel, record)
+        method = {"mirror_start": self._calls.mirror_start, "stop": self._calls.stop_session}.get(
+            call, self._calls.operator_touch
+        )
+
+        def done(success: bool | None, message: str) -> None:
+            if success is None:
+                result = "error"
+            elif success:
+                result = "ok"
+            else:
+                result = "failed" if channel == "gateway" else "declined"
+            with self._lock:
+                self._finish(channel, token, result, message, self._clock())
+
+        try:
+            method(done)
+        except Exception as exc:  # noqa: BLE001 - a failed call frees its channel
+            self._finish(channel, token, "error", f"call failed: {exc}", now)
+        return f"sent {call}"
+
+    def _store(self, channel: str, record: dict) -> None:
+        if channel == "gateway":
+            self._last_gateway = record
+        else:
+            self._last_session_call = record
+
+    def _finish(self, channel: str, token: int, result: str, message: str, now: float) -> None:
+        flight = self._flights[channel]
+        if flight is None or flight.token != token:
+            return  # an answer after its timeout, or a second answer
+        self._flights[channel] = None
+        record = self._last_gateway if channel == "gateway" else self._last_session_call
+        record.update(result=result, message=message, answered_at=now)
+        if result in ("timeout", "error", "failed"):
+            self._log("warning", f"{flight.call}: {result}: {message}")
+        else:
+            self._log("info", f"{flight.call}: {result}: {message}")
+
+    def _set_led(self, color: str, now: float) -> None:
+        self._led_token += 1
+        token = self._led_token
+        record = {"color": color, "result": "", "status_code": None, "note": "", "sent_at": now, "answered_at": None}
+        self._last_led = record
+        if self._led_unavailable:
+            record.update(result="unavailable", note=self._led_unavailable)
+            return
+        if not self._send_enabled:
+            record.update(result="not_sent", note="send_enabled is false")
+            return
+        record["result"] = "sent"
+
+        def done(code: int | None, message: str) -> None:
+            with self._lock:
+                if token != self._led_token:
+                    return  # a newer request was sent
+                if code is None:
+                    record.update(result="error", note=message or status_note(None), answered_at=self._clock())
+                else:
+                    note = status_note(code)
+                    record.update(result="answered", status_code=code, note=note, answered_at=self._clock())
+
+        led = self._config.led
+        try:
+            self._calls.set_led(led.on if color == ON else led.off, led.priority, done)
+        except Exception as exc:  # noqa: BLE001 - the light never stops the node
+            record.update(result="error", note=f"call failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # ~/status
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            now = self._clock()
+            while self._frame_times and now - self._frame_times[0] > FRAME_HZ_WINDOW_S:
+                self._frame_times.popleft()
+            frame = self._frame
+            state = self._session_state(now)
+            return {
+                "send_enabled": self._send_enabled,
+                "frame_hz": len(self._frame_times) / FRAME_HZ_WINDOW_S,
+                "mean": None if frame is None else round(frame.mean, 2),
+                "max": None if frame is None else round(frame.max, 2),
+                "level": self._judge.level,
+                "covered": self._covered,
+                "frame_error": _age(self._frame_error, now),
+                "armed": self._gestures.armed,
+                "gesture": _age(self._gesture, now),
+                "touch": {
+                    "available": not self._touch_unavailable,
+                    "reason": self._touch_unavailable,
+                    "event_type": self._touch.event_type,
+                    "last": _age(self._touch_last, now),
+                },
+                "session_state": state,
+                "session_age_s": None if self._state_at is None else round(now - self._state_at, 3),
+                "session_error": self._state_error,
+                "in_flight": {channel: flight and flight.call for channel, flight in self._flights.items()},
+                "dropped": {
+                    **self.dropped,
+                    "gesture_debounce": self._gestures.dropped,
+                    "touch_debounce": self._touch.dropped,
+                },
+                "last_gateway": _age(self._last_gateway, now),
+                "last_session_call": _age(self._last_session_call, now),
+                "led": {
+                    "available": not self._led_unavailable,
+                    "reason": self._led_unavailable,
+                    "wanted": self._led.wanted,
+                    "applied": self._led.applied,
+                },
+                "last_led": _age(self._last_led, now),
+            }
