@@ -35,6 +35,7 @@ Then point action_probe at --frames-root <out> --truth <out>/truth.json.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -94,8 +95,15 @@ def record(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # Both suppressed, and the index is written below rather than here.
+        # Ctrl-C had already shut the context down, so rclpy.shutdown() raised
+        # "rcl_shutdown already called" out of the finally block and skipped
+        # the index entirely — 95 seconds of recording with nothing to slice,
+        # because teardown was allowed to destroy the result.
+        with contextlib.suppress(Exception):
+            node.destroy_node()
+        with contextlib.suppress(Exception):
+            rclpy.shutdown()
 
     if not entries:
         print("pose_recorder: no frames arrived; check the topic and the QoS", file=sys.stderr)
@@ -111,6 +119,41 @@ def record(args) -> int:
     (out / INDEX_NAME).write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"pose_recorder: {len(entries)} frames over {span:.1f}s ({index['rate_hz']} Hz) -> {out / INDEX_NAME}")
     print("pose_recorder: now slice it, e.g. --cut 5-12=gesture")
+    return 0
+
+
+def reindex(args) -> int:
+    """Rebuild index.json from frames already on disk, at an assumed rate.
+
+    For a recording whose index was lost — an interrupted run, a copied frame
+    directory. The stamps are reconstructed from the file order and ``--rate``,
+    not recovered: the real camera stamps are gone. That is accurate enough to
+    cut by time, since a pose held for seconds spans hundreds of frames, and
+    the index records that the stamps are synthetic so no later measurement
+    mistakes them for observation times.
+    """
+    out = Path(args.out)
+    frames_dir = out / "frames"
+    files = sorted(path.name for path in frames_dir.glob("*.jpg"))
+    if not files:
+        print(f"pose_recorder: no .jpg under {frames_dir}", file=sys.stderr)
+        return 2
+    period = 1.0 / args.rate
+    entries = [{"file": name, "stamp": index * period} for index, name in enumerate(files)]
+    index = {
+        "topic": args.topic,
+        "frames": len(entries),
+        "span_sec": round(entries[-1]["stamp"], 2),
+        "rate_hz": args.rate,
+        "stamps": "synthetic: reconstructed from file order at --rate, not camera stamps",
+        "entries": entries,
+    }
+    (out / INDEX_NAME).write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        f"pose_recorder: rebuilt {len(entries)} entries spanning "
+        f"{index['span_sec']:.1f}s at {args.rate:g} Hz -> {out / INDEX_NAME}"
+    )
+    print("pose_recorder: stamps are synthetic; cut positions are approximate")
     return 0
 
 
@@ -205,6 +248,12 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds from the recording's start, e.g. 5-12=gesture (repeatable)",
     )
     slicer.set_defaults(run=slice_)
+
+    fixer = sub.add_parser("reindex", help="rebuild index.json from frames on disk")
+    fixer.add_argument("--out", required=True, help="the recording directory")
+    fixer.add_argument("--rate", type=float, default=30.0, help="frames per second to assume")
+    fixer.add_argument("--topic", default=CAMERA_TOPIC)
+    fixer.set_defaults(run=reindex)
 
     args = parser.parse_args(argv)
     return args.run(args)
