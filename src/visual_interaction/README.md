@@ -226,3 +226,26 @@ source .shrc_local && colcon test-result --verbose --test-result-base build/visu
 `session/` 全部 ROS-free，配合 `fake_vl.ScriptedVision` 和显式传入的时间，
 测试可以在毫秒内跑完若干分钟的互动且结果确定。`phase0/` 的算术部分
 （`stats`、`budget`、`prompts`、`pcm`、`golden`、`report`）同样不需要 ROS、模型或 NPU。
+
+### 七动作回放：先优化说话内容
+
+`action_probe` 默认使用 `natural_reply` 提示词，分类字段与解析方式不变，
+但本轮重点是话术：少猜动作目的、明显互动手势直接回应、普通姿势允许安静。
+不提供可被模型照抄的示例句，不再强制每句带「你」。安静使用 `reply: ""`，
+包括识别出了动作却不值得主动评论的情况；不生成「保持安静」等可被误播的文字。
+
+```bash
+# 板端使用既有环境入口；以下参数路径指向自己的回放片段和 demo。
+python3 -m visual_interaction.phase0.action_probe \
+    --demo-root <demo目录> --frames-root <标注片段目录> --output replies.json
+
+# 原来的四种分类问法保持原文，显式选择即可复现对照。
+python3 -m visual_interaction.phase0.action_probe \
+    --demo-root <demo目录> --frames-root <标注片段目录> --output baseline.json \
+    --variants bare_list glossed glossed_examples two_step_category
+```
+
+人工对照原来的七段画面与报告中的 `records[].reply`，重点看：是否编造、是否像面对面回应、
+是否复读套话、是否应该安静。分类准确率不代表话术质量。提示词里「同一持续动作不重复说」
+只是模型要求，**本次未实现跨轮记忆、宿主去重、冷却或 TTS 播放控制**，也未修改互动运行时。
+实际模型效果与固定 OM 的 token 预算仍须在板端回放验证，不能由主机单测代替。
