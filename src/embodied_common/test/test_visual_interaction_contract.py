@@ -80,6 +80,16 @@ def test_suppress_reasons_separate_working_silence_from_failure():
     assert contract.SUPPRESS_MODEL_NOT_READY in contract.SUPPRESS_REASONS
 
 
+def test_mirror_inactive_is_a_parked_feature_not_a_failure():
+    """In the magicmirror entry the rounds suspend while the mirror is not
+    MIRRORING: a bystander must be able to tell that from a broken model or a
+    decided silence, which is the difference the status topic exists for."""
+    assert contract.SUPPRESS_MIRROR_INACTIVE in contract.SUPPRESS_REASONS
+    assert contract.SUPPRESS_MIRROR_INACTIVE != contract.SUPPRESS_MODEL_NOT_READY
+    assert contract.SUPPRESS_MIRROR_INACTIVE != contract.SUPPRESS_NO_NEW_TOPIC
+    assert contract.SUPPRESS_MIRROR_INACTIVE != contract.SUPPRESS_MUTED
+
+
 def test_value_sets_have_no_duplicates_and_no_blanks():
     for name in ("KINDS", "SPEAKABLE_KINDS", "CATEGORIES", "REGIONS", "COVERAGE_STATES", "SUPPRESS_REASONS"):
         values = getattr(contract, name)

@@ -15,6 +15,18 @@ SESSION_SERVICE = f"/{NODE_NAME}/set_session"
 # depth 1): one message per state transition, and a heartbeat at this period.
 STATE_TOPIC = f"/{NODE_NAME}/state"
 STATE_PERIOD_SEC = 1.0
+
+# The states a session reports on STATE_TOPIC, repeated from
+# manipulation_execution.mirror_session.core.SessionState so a consumer (the
+# visual interaction node, the voice node) needs no cross-package import: this
+# module must stay dependency-free.
+STATE_WAIT = "WAIT"
+STATE_STANDBY = "STANDBY"
+STATE_MIRRORING = "MIRRORING"
+STATES = (STATE_WAIT, STATE_STANDBY, STATE_MIRRORING)
+# Two missed heartbeats mean the state is unknown rather than current. A
+# consumer gating on the state treats unknown as off, the conservative side.
+STATE_STALE_SEC = 2.0
 # The operator touch (std_srvs/Trigger): STANDBY cooldown/ready -> MIRRORING,
 # MIRRORING running -> cancel; nothing elsewhere.
 OPERATOR_TOUCH_SERVICE = f"/{NODE_NAME}/operator_touch"

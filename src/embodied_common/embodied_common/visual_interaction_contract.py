@@ -88,6 +88,11 @@ SUPPRESS_SCHEMA_INVALID = "SCHEMA_INVALID"
 # visitor would say the same things to them again every couple of minutes. Only
 # an explicit hand-over, or a confirmed absence, ends it.
 SUPPRESS_WAITING_NEXT_VISITOR = "WAITING_NEXT_VISITOR"
+# The deployment's speech context is absent. In the magicmirror entry the
+# rounds are suspended with this while the mirror session is not MIRRORING (or
+# its state went stale): the session keeps observing but calls no model, so a
+# quiet period here reads as "the feature is parked", not as a fault.
+SUPPRESS_MIRROR_INACTIVE = "MIRROR_INACTIVE"
 SUPPRESS_REASONS = (
     SUPPRESS_NO_NEW_TOPIC,
     SUPPRESS_UNCERTAIN,
@@ -102,6 +107,7 @@ SUPPRESS_REASONS = (
     SUPPRESS_MODEL_NOT_READY,
     SUPPRESS_SCHEMA_INVALID,
     SUPPRESS_WAITING_NEXT_VISITOR,
+    SUPPRESS_MIRROR_INACTIVE,
 )
 
 # Timing defaults. Every one of these is a proposal until phase zero measures
