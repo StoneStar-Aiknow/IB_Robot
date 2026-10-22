@@ -1,0 +1,34 @@
+# AgiBot X2 "magic mirror", board deployment, arms and talk together.
+#
+# The board entry (aimdk_x2_magicmirror_board.yaml) with the two things that
+# make it the live show:
+#
+# * the arms follow the visitor: mirror_session.publish_enabled and the
+#   operator's send_enabled are on, the same values the real-arm run
+#   (aimdk_x2_magicmirror_R1novoice.yaml on feat/x2-mirror-voice) uses;
+# * the visual interaction runs in chatter mode: one warm line every 5–10 s
+#   while mirroring, keyed by the gesture or object the model names
+#   (visual_interaction.session.chatter). The mirror voice's status holds the
+#   next line back while it is still speaking.
+#
+# Back to the observation-only board entry: launch
+# aimdk_x2_magicmirror_board instead of this file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_board.yaml
+  name: aimdk_x2_magicmirror_live
+
+  mirror_session:
+    publish_enabled: true
+    operator:
+      send_enabled: true
+
+  visual_interaction:
+    mode: chatter
+    voice_status_topic: /mirror_voice/status
+    vl:
+      # The chatter answer is a phrase of at most ten characters.
+      max_new_tokens: 16
+    chatter:
+      gap_min_sec: 5.0
+      gap_max_sec: 10.0

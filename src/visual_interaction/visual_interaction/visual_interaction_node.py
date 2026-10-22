@@ -40,10 +40,12 @@ from embodied_common.visual_interaction_contract import (
     NODE_NAME,
     SET_ENABLED_SERVICE,
     STATUS_TOPIC,
+    SUPPRESS_MIRROR_INACTIVE,
     SUPPRESS_MODEL_NOT_READY,
     UTTERANCE_TOPIC,
 )
 from ibrobot_msgs.msg import ActorState, VisualInteractionUtterance
+from visual_interaction.session.chatter import Chatter, ChatterConfig
 from visual_interaction.session.core import SessionConfig, VisualInteractionSession
 from visual_interaction.session.endpoints import CAMERA_COMPRESSED, Endpoint, resolve_camera
 from visual_interaction.session.fake_vl import ScriptedVision
@@ -103,6 +105,20 @@ PARAMETERS: dict[str, object] = {
     # contract's whole whitelist.
     "categories_json": "[]",
     "status_period_sec": 5.0,
+    # "observe" is the closed-schema session; "chatter" says one host-owned
+    # line every chatter_gap_min..max seconds while mirroring, keyed by what
+    # the model names (visual_interaction.session.chatter).
+    "mode": "observe",
+    "chatter_gap_min_sec": 5.0,
+    "chatter_gap_max_sec": 10.0,
+    "chatter_fresh_sec": 3.0,
+    "chatter_action_cooldown_sec": 15.0,
+    "chatter_object_cooldown_sec": 60.0,
+    "chatter_latest_start_sec": 4.0,
+    # The mirror voice's ~/status: while it speaks or has a queue, the next
+    # line waits. Empty or stale falls back to a length estimate.
+    "voice_status_topic": "",
+    "voice_status_stale_sec": 3.0,
 }
 
 
@@ -214,6 +230,9 @@ class VisualInteractionNode(Node):
         for name, default in PARAMETERS.items():
             self.declare_parameter(name, default)
 
+        self._mode = str(self._value("mode"))
+        if self._mode not in ("observe", "chatter"):
+            raise ValueError(f"mode {self._mode!r} is not one of 'observe', 'chatter'")
         # Config-only checks first, so a typo is reported as itself rather than
         # as whatever the runtime description happens to be missing.
         session_hooks = hooks or self._build_hooks()
@@ -265,6 +284,24 @@ class VisualInteractionNode(Node):
         # The last MODEL_NOT_READY cause logged, so a permanent
         # fault warns once instead of every round.
         self._last_model_error: str | None = None
+
+        self._chatter: Chatter | None = None
+        self._voice_busy_now = False
+        self._voice_status_at: float | None = None
+        self._last_phrase: str | None = None
+        if self._mode == "chatter":
+            self._chatter = Chatter(
+                ChatterConfig(
+                    gap_min_sec=float(self._value("chatter_gap_min_sec")),
+                    gap_max_sec=float(self._value("chatter_gap_max_sec")),
+                    fresh_sec=float(self._value("chatter_fresh_sec")),
+                    action_cooldown_sec=float(self._value("chatter_action_cooldown_sec")),
+                    object_cooldown_sec=float(self._value("chatter_object_cooldown_sec")),
+                )
+            )
+            voice_topic = str(self._value("voice_status_topic")).strip()
+            if voice_topic:
+                self.create_subscription(String, voice_topic, self._on_voice_status, 10)
 
         self._utterances = self.create_publisher(VisualInteractionUtterance, UTTERANCE_TOPIC, 10)
         self._status = self.create_publisher(String, STATUS_TOPIC, 10)
@@ -373,6 +410,7 @@ class VisualInteractionNode(Node):
                     demo_root=demo_root,
                     frames=max(1, int(self._value("frames_per_window"))),
                     max_new_tokens=int(self._value("vl_max_new_tokens")),
+                    prompt_mode="chatter" if self._mode == "chatter" else "observe",
                 )
             )
         raise ValueError(f"vl_implementation {implementation!r} is not available; expected 'fake' or 'internvl'")
@@ -474,12 +512,86 @@ class VisualInteractionNode(Node):
         if self._actor_received_at is None or now - self._actor_received_at > self._stale_actor_sec:
             actor = ActorSignal(present=False, known=False, bbox=None, stamp=now)
 
+        if self._chatter is not None:
+            self._chatter_round(window, actor, now)
+            return
+
         result = self._session.step(
             RoundInputs(window=window, actor=actor, now=now, mirror_active=self._mirror_active(now))
         )
         self._rounds += 1
         self._count(result.reason or "spoken")
         self._publish(result, window)
+
+    # -- chatter ----------------------------------------------------------
+
+    def _on_voice_status(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._voice_busy_now = (
+            bool(payload.get("speaking")) or bool(payload.get("in_flight")) or (int(payload.get("queue") or 0) > 0)
+        )
+        self._voice_status_at = self._now()
+
+    def _voice_busy(self, now: float) -> bool:
+        if self._voice_status_at is None or now - self._voice_status_at > float(self._value("voice_status_stale_sec")):
+            return False
+        return self._voice_busy_now
+
+    def _chatter_round(self, window: Window, actor: ActorSignal, now: float) -> None:
+        """One chatter round: look, remember what was named, speak when due."""
+        chatter = self._chatter
+        chatter.voice(now, self._voice_busy(now))
+        if not self._mirror_active(now):
+            chatter.due(now, False)
+            self._count(SUPPRESS_MIRROR_INACTIVE)
+            return
+
+        phrase = self._session.hooks.vision.observe(
+            RoundInputs(window=window, actor=actor, now=now, mirror_active=True)
+        )
+        self._rounds += 1
+        if phrase is None:
+            self._count(SUPPRESS_MODEL_NOT_READY)
+            detail = getattr(self._session.hooks.vision, "last_error", "")
+            if detail != self._last_model_error:
+                self._last_model_error = detail
+                self.get_logger().warning(f"quiet: MODEL_NOT_READY{f' ({detail})' if detail else ''}")
+        else:
+            self._last_model_error = None
+            text = phrase if isinstance(phrase, str) else ""
+            found = chatter.observe(now, text)
+            if text != self._last_phrase:
+                self._last_phrase = text
+                self.get_logger().info(f'seen: "{text}" -> {"/".join(found) if found else "-"}')
+
+        after = self._now()
+        chatter.voice(after, self._voice_busy(after))
+        if not chatter.due(after, self._mirror_active(after)):
+            self._count("chatter_wait")
+            return
+        line = chatter.pick(after)
+        self._count(f"said_{line.kind}")
+
+        message = VisualInteractionUtterance()
+        message.header.stamp = _as_time(window.newest_stamp)
+        message.evidence_start_stamp = _as_time(window.oldest_stamp)
+        message.session_id = "chatter"
+        message.event_id = f"chatter-{chatter.spoken}"
+        message.episode_seq = chatter.spoken
+        message.text = line.text
+        message.kind = line.kind
+        message.category = line.subject
+        message.suppress_reason = ""
+        message.latest_start_at = _as_time(after + float(self._value("chatter_latest_start_sec")))
+        self._utterances.publish(message)
+        self.get_logger().info(
+            f'say: "{line.text}"  [{line.kind}/{line.subject}] next in {chatter.next_due - after:.1f}s'
+        )
 
     # -- publishing -------------------------------------------------------
 
@@ -559,7 +671,11 @@ class VisualInteractionNode(Node):
             "mirror_active": self._mirror_active(self._now()),
             "outcomes": dict(sorted(self._counts.items())),
             "spoken_topics": self._session.ledger().spoken_count(),
+            "mode": self._mode,
         }
+        if self._chatter is not None:
+            payload["chatter_spoken"] = self._chatter.spoken
+            payload["voice_busy"] = self._voice_busy(self._now())
         self._status.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     def _count(self, key: str) -> None:

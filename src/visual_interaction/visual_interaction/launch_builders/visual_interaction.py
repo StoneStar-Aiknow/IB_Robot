@@ -53,6 +53,20 @@ _KEYS = frozenset(
         "buffer_sec",
         "stale_stream_sec",
         "status_period_sec",
+        "mode",
+        "chatter",
+        "voice_status_topic",
+    }
+)
+# visual_interaction.chatter, read only with mode "chatter".
+_CHATTER_KEYS = frozenset(
+    {
+        "gap_min_sec",
+        "gap_max_sec",
+        "fresh_sec",
+        "action_cooldown_sec",
+        "object_cooldown_sec",
+        "latest_start_sec",
     }
 )
 _FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "qos"})
@@ -289,6 +303,20 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
 
     if camera_qos_json:
         parameters["camera_topic_qos_json"] = camera_qos_json
+
+    mode = section.get("mode", "observe")
+    if mode not in ("observe", "chatter"):
+        raise ValueError(f"visual_interaction.mode {mode!r} is not one of 'observe', 'chatter'")
+    chatter = _mapping(section.get("chatter", {}), "visual_interaction.chatter")
+    _unknown(chatter, _CHATTER_KEYS, "visual_interaction.chatter")
+    voice_status_topic = section.get("voice_status_topic", "")
+    if not isinstance(voice_status_topic, str) or (voice_status_topic and not voice_status_topic.startswith("/")):
+        raise ValueError("visual_interaction.voice_status_topic must be empty or an absolute ROS name")
+    parameters["mode"] = mode
+    parameters["voice_status_topic"] = voice_status_topic
+    for key in sorted(_CHATTER_KEYS):
+        if key in chatter:
+            parameters[f"chatter_{key}"] = float(chatter[key])
 
     return [
         Node(
