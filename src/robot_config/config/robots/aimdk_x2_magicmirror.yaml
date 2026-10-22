@@ -95,8 +95,9 @@ robot:
   # The voice's speech output; the base turns both off. ZipVoice speaks 24 kHz
   # and the runtime's audio.play takes 16 kHz mono (/audio/play,
   # AudioDataStamped), so the playback node resamples. The speaker is the
-  # runtime's: no local ALSA node is launched. ZipVoice failing to start must
-  # not take the mirror down, hence exit_on_init_failure false.
+  # runtime's: no local ALSA node is launched. ZipVoice failing to start, or
+  # voice_tts failing to launch at all, must not take the mirror down, hence
+  # exit_on_init_failure false.
   audio_io:
     enabled: true
     playback_source: runtime
