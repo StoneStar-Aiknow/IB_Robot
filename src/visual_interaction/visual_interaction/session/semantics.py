@@ -270,27 +270,41 @@ def check_reply(
     those fields settled.
     """
     text = normalise_text(reply)
+    # Every refusal below carries the sentence it refused. Which rule fired is
+    # only half the story: a bring-up run reporting "does not describe the
+    # confirmed toy" fourteen times cannot tell whether the model wrote
+    # something reasonable the word list misses, or wandered off the subject
+    # entirely, and those need opposite fixes.
     if not text:
         raise SemanticsError(SUPPRESS_SCHEMA_INVALID, "reply is empty")
     if len(text) < min_chars:
-        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"reply is shorter than {min_chars} characters")
+        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"reply is shorter than {min_chars} characters: {_trimmed(text)}")
     if len(text) > max_chars:
-        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"reply is longer than {max_chars} characters")
+        raise SemanticsError(SUPPRESS_SCHEMA_INVALID, f"reply is longer than {max_chars} characters: {_trimmed(text)}")
     if _INSTRUCTION_SHAPED.search(text):
-        raise SemanticsError(SUPPRESS_PRIVACY, "reply is shaped like an instruction, not a remark")
+        raise SemanticsError(SUPPRESS_PRIVACY, f"reply is shaped like an instruction, not a remark: {_trimmed(text)}")
     if "?" in text or "？" in text:
         # Asking invites an answer nothing here can hear, so the first version
         # states rather than asks.
-        raise SemanticsError(SUPPRESS_PRIVACY, "reply asks a question; the first version only states")
+        raise SemanticsError(
+            SUPPRESS_PRIVACY, f"reply asks a question; the first version only states: {_trimmed(text)}"
+        )
     if _FORBIDDEN_REPLY_PATTERN.search(text):
-        raise SemanticsError(SUPPRESS_PRIVACY, "reply contains digits or Latin letters, which no allowed remark needs")
+        raise SemanticsError(
+            SUPPRESS_PRIVACY,
+            f"reply contains digits or Latin letters, which no allowed remark needs: {_trimmed(text)}",
+        )
     for pattern, label in _OUT_OF_RANGE:
         if pattern.search(text):
-            raise SemanticsError(SUPPRESS_PRIVACY, f"reply asserts {label}, which is out of range")
+            raise SemanticsError(SUPPRESS_PRIVACY, f"reply asserts {label}, which is out of range: {_trimmed(text)}")
     if category:
         words = _CATEGORY_WORDS.get(category, ())
         if words and not any(word in text for word in words):
-            raise SemanticsError(SUPPRESS_PRIVACY, f"reply does not describe the confirmed {category}")
+            raise SemanticsError(
+                SUPPRESS_PRIVACY,
+                f"reply does not describe the confirmed {category}, "
+                f"which needs one of {'/'.join(words)}: {_trimmed(text)}",
+            )
     return text
 
 
