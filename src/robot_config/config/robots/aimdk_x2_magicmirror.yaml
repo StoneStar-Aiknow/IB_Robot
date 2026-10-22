@@ -190,6 +190,10 @@ robot:
         lookahead_s: 0.25
         mirror: true
         vel_scale: 1.0
+        # Read the elbow's twist about the forearm as wrist_yaw too: PEAR splits a
+        # palm flip between elbow and wrist and only the wrist reached the robot.
+        # Off until checked on the real robot (docs/x2_wrist_spin_plan_A.md).
+        elbow_spin_to_wrist: false
 
       # The neutral pose, in radians, keyed by joint name like arm_limits below.
       # The session walks the arm here when it takes over (approach) and when a

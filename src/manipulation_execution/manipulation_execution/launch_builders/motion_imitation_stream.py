@@ -414,6 +414,8 @@ def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
         "latency_s": _non_negative(retarget, "latency_s", 0.4),
         "lookahead_s": _non_negative(retarget, "lookahead_s", 0.25),
         "mirror": _required_bool(retarget, "mirror") if "mirror" in retarget else True,
+        "elbow_spin_to_wrist": (_required_bool(retarget, "elbow_spin_to_wrist")
+                                if "elbow_spin_to_wrist" in retarget else False),
     }
 
 
