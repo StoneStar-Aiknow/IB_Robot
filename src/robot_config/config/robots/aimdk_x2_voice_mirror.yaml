@@ -1,0 +1,66 @@
+# AgiBot X2: voice loop (ASR -> ibrobot_agent -> ZipVoice) on the magic-mirror app.
+#
+# Layers the agent voice chain on aimdk_x2_magicmirror (perception services,
+# PEAR stream, mock retarget playback, mirror_session). The catalog carries only
+# mirror_start/mirror_stop because the mirror runs in model_inference; preset
+# named motions stay switched off (same reason as the base).
+#
+# publish_enabled stays false: the session takes over policy_stream and every
+# command it would send lands on /mirror_session/arm_command_preview until the
+# deployment explicitly enables publishing.
+robot:
+  base_config: aimdk_x2_magicmirror.yaml
+  name: aimdk_x2_mirror_voice
+
+  embodied:
+    # The base app leaves the agent entry off; this deployment runs it.
+    entry_mode: agent
+    skill_catalog_profile: aimdk_x2_mirror_voice
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: true
+      channel_id: voice_asr
+      principal_id: local_operator
+      presentation_timeout_sec: 600.0
+      ledger_path: /tmp/ibrobot-agent-x2-voice/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-x2-voice/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-x2-voice/agent.lock
+      test_allowlist:
+        - mirror_start
+        - mirror_stop
+      planner:
+        mode: vlm
+        provider: openai_compatible
+        base_url: http://10.42.0.177:18094/v1
+        model: qwen3.8-27b
+        timeout_sec: 120.0
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_timeout_sec: 90.0
+        mute_asr_during_tts: true
+
+  # Runtime-owned microphone: the vendor capture stream republished as the
+  # stamped raw contract, so no vendor wake word is involved.
+  voice_asr:
+    enabled: true
+    input_mode: shared_audio
+    active_mode: continuous
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
+    output_topic: /voice_command
+
+  # The platform publishes the full-resolution compressed stream only; the
+  # half-resolution variant the mirror config names is absent on this firmware.
+  motion_imitation_stream:
+    frame_source:
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image/compressed
+
+  mirror_session:
+    publish_enabled: true
+    # The agent's TTS owns the speaker in this deployment; the mirror's own
+    # phrases would fight it for audio focus.
+    voice:
+      enabled: false
