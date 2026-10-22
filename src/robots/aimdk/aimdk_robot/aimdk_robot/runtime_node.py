@@ -255,6 +255,11 @@ class AimdkRuntimeNode(Node):
         # the robot, so the platform got a stale pose, then nothing once it
         # aged past stream_staleness_s, then a jump.
         self._command_cb = MutuallyExclusiveCallbackGroup()
+        # The speaker stream too: behind the joint torrent a 1 s phrase came
+        # out as 3-11 of its 20 chunks spread over up to 5 s, the depth-10
+        # queue having dropped the rest. Mutually exclusive, so chunks of one
+        # phrase are still published in the order they arrive.
+        self._audio_cb = MutuallyExclusiveCallbackGroup()
         # Stop and status must never queue behind a mode switch that is
         # waiting for the platform's confirmation: they run in their own
         # reentrant group, and the stop path serialises itself.
@@ -470,7 +475,11 @@ class AimdkRuntimeNode(Node):
                 self._vendor_qos("audio_focus_response", reliability="reliable", durability="transient_local"),
             )
             self.create_subscription(
-                AudioDataStamped, str(audio.get("play_topic", "/audio/play")), self._on_audio_play, _SENSOR_QOS
+                AudioDataStamped,
+                str(audio.get("play_topic", "/audio/play")),
+                self._on_audio_play,
+                _SENSOR_QOS,
+                callback_group=self._audio_cb,
             )
             self._focus_timer = self.create_timer(0.1, self._audio_focus_tick, callback_group=self._client_cb)
 

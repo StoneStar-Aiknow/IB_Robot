@@ -1396,6 +1396,17 @@ def test_command_streams_are_not_taken_up_behind_the_feedback_torrent(harness):
     assert arm[0].callback_group is not runtime.default_callback_group
 
 
+def test_speaker_stream_is_not_taken_up_behind_the_feedback_torrent(harness):
+    """In the default group a 1 s phrase reached the platform as 3-11 of 20 chunks."""
+    harness.wait_active()
+    runtime = harness.runtime
+    play = [s for s in runtime.subscriptions if s.topic_name == "/audio/play"]
+    joints = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/arm/state"]
+    assert len(play) == 1 and len(joints) == 1
+    assert play[0].callback_group is not runtime.default_callback_group
+    assert play[0].callback_group is not joints[0].callback_group
+
+
 # --- named motion dispatch --------------------------------------------------
 
 
