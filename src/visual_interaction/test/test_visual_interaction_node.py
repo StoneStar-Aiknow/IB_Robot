@@ -630,6 +630,31 @@ class TestCameraTopicEscapeHatch:
 MIRROR_TOPIC = "/mirror_session/state"
 
 
+def mirror_node(**overrides):
+    """A node wired to the mirror gate, built without a launch file."""
+    import json
+
+    import rclpy
+    from rclpy.parameter import Parameter
+
+    from visual_interaction.visual_interaction_node import VisualInteractionNode
+
+    values = {
+        "runtime_description_json": json.dumps({"robot": {}, "interfaces": {}}),
+        "categories_json": '["toy","sign","hat","badge"]',
+        "camera_topic": "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed",
+        "mirror_state_topic": MIRROR_TOPIC,
+    }
+    values.update(overrides)
+    rclpy.init()
+    try:
+        node = VisualInteractionNode(parameter_overrides=[Parameter(k, value=v) for k, v in values.items()])
+        return node, rclpy
+    except Exception:
+        rclpy.shutdown()
+        raise
+
+
 class TestMirrorStateGate:
     """The magicmirror entry suspends the rounds unless the mirror is MIRRORING.
 
@@ -641,27 +666,7 @@ class TestMirrorStateGate:
     """
 
     def node(self, **overrides):
-        import json
-
-        import rclpy
-        from rclpy.parameter import Parameter
-
-        from visual_interaction.visual_interaction_node import VisualInteractionNode
-
-        values = {
-            "runtime_description_json": json.dumps({"robot": {}, "interfaces": {}}),
-            "categories_json": '["toy","sign","hat","badge"]',
-            "camera_topic": "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed",
-            "mirror_state_topic": MIRROR_TOPIC,
-        }
-        values.update(overrides)
-        rclpy.init()
-        try:
-            node = VisualInteractionNode(parameter_overrides=[Parameter(k, value=v) for k, v in values.items()])
-            return node, rclpy
-        except Exception:
-            rclpy.shutdown()
-            raise
+        return mirror_node(**overrides)
 
     def state(self, payload):
         from std_msgs.msg import String
@@ -785,6 +790,124 @@ class TestMirrorStateGate:
 
             assert status["mirror_state"] == "STANDBY"
             assert status["mirror_active"] is False
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+
+class TestTheVisitFollowsTheMirror:
+    """With a mirror configured, one visit is one mirror session.
+
+    The interaction used to end its own session after ``max_session_sec``, and
+    nothing could clear the resulting "waiting for the next visitor" flag while
+    the mirror kept that visitor: the board sat in WAITING_NEXT_VISITOR with
+    ``mirror_active`` true for the rest of the visit. So the duration limit is
+    off when the mirror is the owner of the lifecycle, and the session starts
+    on the edge that gives a visit to a new visitor.
+    """
+
+    def state(self, payload):
+        from std_msgs.msg import String
+
+        return String(data=payload)
+
+    def test_with_a_mirror_there_is_no_duration_limit(self):
+        """The configured limit is overridden, not merely ignored downstream:
+        SessionWindow is built from this value."""
+        node, rclpy = mirror_node(max_session_sec=120.0)
+        try:
+            assert node._session.config.max_session_sec == 0.0
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_without_a_mirror_the_configured_limit_stays(self):
+        """Ungated deployments (the standalone entry) keep their own clock."""
+        node, rclpy = mirror_node(mirror_state_topic="", max_session_sec=120.0)
+        try:
+            assert node._session.config.max_session_sec == 120.0
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_an_open_visit_never_expires_by_duration(self):
+        node, rclpy = mirror_node(max_session_sec=120.0)
+        try:
+            node._on_mirror_state(self.state('{"state": "WAIT"}'))
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+
+            window = node._session._window
+            assert window.expired_reason(window.started_at + 10_000.0) == ""
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_standby_opens_the_session(self):
+        node, rclpy = mirror_node()
+        try:
+            node._on_mirror_state(self.state('{"state": "WAIT"}'))
+            assert node._session.session_id == ""
+
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+
+            assert node._session.session_id != ""
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_mirroring_stays_inside_the_same_session(self):
+        """STANDBY → MIRRORING is the mirror starting a round, not a new
+        visitor: restarting here would forget what was just said."""
+        node, rclpy = mirror_node()
+        try:
+            node._on_mirror_state(self.state('{"state": "WAIT"}'))
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+            opened = node._session.session_id
+
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+
+            assert node._session.session_id == opened
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_the_next_visit_opens_a_new_session(self):
+        node, rclpy = mirror_node()
+        try:
+            node._on_mirror_state(self.state('{"state": "WAIT"}'))
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+            first = node._session.session_id
+
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+            node._on_mirror_state(self.state('{"state": "WAIT"}'))
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+
+            assert node._session.session_id != first
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_latched_state_can_open_the_session_on_startup(self):
+        """The subscription is transient_local: the node may join a visit that
+        is already running, and its first message is the current state."""
+        node, rclpy = mirror_node()
+        try:
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+
+            assert node._session.session_id != ""
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_opening_a_visit_clears_the_waiting_for_the_next_visitor_flag(self):
+        """The flag the board was stuck on: only a fresh session clears it."""
+        node, rclpy = mirror_node()
+        try:
+            node._session._awaiting_handover = True
+
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+
+            assert node._session._awaiting_handover is False
         finally:
             node.destroy_node()
             rclpy.shutdown()

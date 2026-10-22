@@ -399,5 +399,10 @@ robot:
       confirmation_count: 2
       max_evidence_age_sec: 8.0
       min_gap_sec: 10.0
+      # Still the visitor-rotation guard inside one mirror visit: a visitor who
+      # leaves for this long makes the next person a new subject.
       absent_reset_sec: 30.0
+      # Inert here: with mirror_state_topic set, the visit begins when the
+      # mirror session takes over and ends when it is released, so the node
+      # runs without its own duration limit (see visual_interaction_node).
       max_session_sec: 120.0

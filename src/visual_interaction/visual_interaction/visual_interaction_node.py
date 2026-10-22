@@ -30,7 +30,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
-from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC
+from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC, STATE_STANDBY, STATE_WAIT
 from embodied_common.visual_interaction_contract import (
     DEFAULT_ABSENT_RESET_SEC,
     DEFAULT_CONFIRMATION_COUNT,
@@ -225,20 +225,6 @@ class VisualInteractionNode(Node):
         self._stale_actor_sec = float(self._value("stale_actor_sec"))
         self._buffer = FrameBuffer(float(self._value("buffer_sec")), int(self._value("max_buffered_frames")))
 
-        self._session = VisualInteractionSession(
-            hooks=session_hooks,
-            config=SessionConfig(
-                confirmation_count=int(self._value("confirmation_count")),
-                max_evidence_age_sec=float(self._value("max_evidence_age_sec")),
-                min_gap_sec=float(self._value("min_gap_sec")),
-                absent_reset_sec=float(self._value("absent_reset_sec")),
-                max_session_sec=float(self._value("max_session_sec")),
-                **self._categories(),
-            ),
-        )
-
-        self._actor = ActorSignal(present=False, known=False, bbox=None, stamp=0.0)
-        self._actor_received_at: float | None = None
         # The mirror gate, when the deployment has one: the last state reported
         # on mirror_state_topic and when it arrived. Until the first message
         # lands the gate stays closed — TRANSIENT_LOCAL delivers the latched
@@ -246,6 +232,32 @@ class VisualInteractionNode(Node):
         # and a dead one never pretends to.
         self._mirror_topic = str(self._value("mirror_state_topic")).strip() or None
         self._mirror_state_stale_sec = float(self._value("mirror_state_stale_sec"))
+
+        max_session_sec = float(self._value("max_session_sec"))
+        if self._mirror_topic is not None:
+            # A deployment with a mirror has one visit, not two: the mirror
+            # session's start opens the interaction's session and its end closes
+            # it (see _on_mirror_state). The duration limit is the guard for a
+            # stand where nobody announces hand-overs, and applying it here
+            # would expire a visit the mirror is still serving — the interaction
+            # then goes quiet for the rest of that visit, exactly as observed on
+            # the X2 board before this was tied together.
+            max_session_sec = 0.0
+
+        self._session = VisualInteractionSession(
+            hooks=session_hooks,
+            config=SessionConfig(
+                confirmation_count=int(self._value("confirmation_count")),
+                max_evidence_age_sec=float(self._value("max_evidence_age_sec")),
+                min_gap_sec=float(self._value("min_gap_sec")),
+                absent_reset_sec=float(self._value("absent_reset_sec")),
+                max_session_sec=max_session_sec,
+                **self._categories(),
+            ),
+        )
+
+        self._actor = ActorSignal(present=False, known=False, bbox=None, stamp=0.0)
+        self._actor_received_at: float | None = None
         self._mirror_state = ""
         self._mirror_state_at: float | None = None
         self._counts: dict[str, int] = {}
@@ -405,14 +417,28 @@ class VisualInteractionNode(Node):
         leaves the previous state in place, and staleness — judged by arrival —
         then closes the gate on the next round, which needs no clock agreement
         with the publisher.
+
+        With a mirror configured, this is also where the interaction's session
+        begins: WAIT → STANDBY is the mirror taking over a mode (the set_session
+        that opens a visit), and STANDBY → MIRRORING stays inside the same
+        visit, so only the first edge starts a new range. One visitor therefore
+        gets exactly the lifetime the mirror gives them, and the covered topics
+        are forgotten when the mirror starts the next visit rather than when a
+        timer inside this node says so.
         """
         try:
             payload = json.loads(message.data)
         except ValueError:
             return
         state = payload.get("state") if isinstance(payload, dict) else None
+        previous = self._mirror_state
         self._mirror_state = state if isinstance(state, str) else ""
         self._mirror_state_at = self._now()
+        if self._mirror_topic is None:
+            return
+        started = self._mirror_state in (STATE_STANDBY, STATE_MIRRORING) and previous in ("", STATE_WAIT)
+        if started:
+            self._session.start_session(now=self._mirror_state_at, reason="mirror_session")
 
     def _mirror_active(self, now: float) -> bool:
         """Whether the mirror gate is open: MIRRORING, and recently heard.
