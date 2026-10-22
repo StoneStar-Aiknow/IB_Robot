@@ -300,10 +300,20 @@ def check_reply(
     if category:
         words = _CATEGORY_WORDS.get(category, ())
         if words and not any(word in text for word in words):
+            # The model contradicting its own field, which the board run showed
+            # is what a small model does when a closed list has no right answer:
+            # 46 of 54 rounds filled category=toy and then wrote "它看起来像一个
+            # 机器人。", or filled sign and wrote "你正在展示一个手势。". Rules 1
+            # and 3 already tell it to answer none or uncertain instead and it
+            # does not comply, so the host decides rather than trusting a field
+            # the reply itself disowns.
+            #
+            # SUPPRESS_UNCERTAIN, not SUPPRESS_PRIVACY: nothing was leaked, the
+            # answer is simply unusable, and diagnostics that call this a
+            # privacy refusal hide how often the whitelist has no answer at all.
             raise SemanticsError(
-                SUPPRESS_PRIVACY,
-                f"reply does not describe the confirmed {category}, "
-                f"which needs one of {'/'.join(words)}: {_trimmed(text)}",
+                SUPPRESS_UNCERTAIN,
+                f"reply disowns the confirmed {category}, which needs one of {'/'.join(words)}: {_trimmed(text)}",
             )
     return text
 

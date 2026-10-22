@@ -363,14 +363,46 @@ class TestReplyContent:
     def test_a_reply_that_drifted_off_the_confirmed_category_is_refused(self):
         """The grounding check: it fails closed on a drift with no pattern.
 
-        Built entirely from allowed words and still not about the toy the
-        closed fields settled, so the vocabulary check cannot catch it.
+        Reported as UNCERTAIN rather than PRIVACY. Nothing leaked here — the
+        reply and the field simply disagree, so the answer is unusable rather
+        than unsafe. A board run made the distinction matter: 46 of 54 rounds
+        filled category=toy and wrote "它看起来像一个机器人。", and counting
+        those as privacy refusals hid that the whitelist had no right answer.
         """
         with pytest.raises(SemanticsError) as error:
             parse_observation(answer(category="toy", reply="你戴的帽子很特别。"))
 
-        assert error.value.reason == SUPPRESS_PRIVACY
+        assert error.value.reason == SUPPRESS_UNCERTAIN
         assert "toy" in error.value.detail
+
+    def test_a_model_disowning_its_own_category_is_uncertain_not_private(self):
+        """What the board model actually did, 46 rounds out of 54.
+
+        It answered category=toy and then described a robot, or category=sign
+        and then described a gesture. The closed list had no right answer and
+        rules 1 and 3 telling it to say none or uncertain did not take, so the
+        host decides: a field the reply itself disowns is not a usable answer.
+        """
+        for category, reply in (
+            ("toy", "它看起来像一个机器人。"),
+            ("sign", "你正在展示一个手势。"),
+        ):
+            with pytest.raises(SemanticsError) as error:
+                parse_observation(answer(category=category, reply=reply))
+
+            assert error.value.reason == SUPPRESS_UNCERTAIN, reply
+            assert reply in error.value.detail
+
+    def test_a_real_privacy_breach_is_still_a_privacy_refusal(self):
+        """The reclassification must not soften anything that leaks."""
+        for category, reply in (
+            ("sign", "你举着的牌子写了电话号码13800138000。"),
+            ("toy", "你举起的玩偶旁边有助听器。"),
+        ):
+            with pytest.raises(SemanticsError) as error:
+                parse_observation(answer(category=category, reply=reply))
+
+            assert error.value.reason == SUPPRESS_PRIVACY, reply
 
     @pytest.mark.parametrize(
         ("category", "reply"),
