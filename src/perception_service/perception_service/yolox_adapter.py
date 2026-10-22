@@ -11,6 +11,7 @@ import numpy as np
 from inference_service.unified_runtime import ModelResult
 
 from .adapter_support import output_tensor, read_adapter_identity
+from .nv12_image import Nv12Image
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
 
@@ -41,6 +42,11 @@ class YoloXAdapter(PerceptionAdapter):
         return cls()
 
     def preprocess(self, image_rgb: np.ndarray) -> dict[str, np.ndarray]:
+        if isinstance(image_rgb, Nv12Image):
+            image = image_rgb.small_bgr(640)
+            canvas = np.full((640, 640, 3), 114, dtype=np.uint8)
+            canvas[: image.shape[0], : image.shape[1]] = image
+            return {"observation.image": np.ascontiguousarray(canvas.transpose(2, 0, 1), dtype=np.float32)[None]}
         image = np.asarray(image_rgb)
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
             raise ValueError("image must be an RGB uint8 HxWx3 array")

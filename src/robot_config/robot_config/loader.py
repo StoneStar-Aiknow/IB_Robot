@@ -1,11 +1,13 @@
 """Configuration loader and validator for robot_config."""
 
 import copy
+import dataclasses
 import hashlib
 import json
 import logging
 import math
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -1912,6 +1914,7 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    validation_errors.extend(validate_audio_playback_config(robot_config))
     validation_errors.extend(validate_speech_direction_config(robot_config))
     if not deferred_interfaces:
         try:
@@ -2114,7 +2117,67 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         tts_timeout_sec=data.get("tts_timeout_sec", defaults.tts_timeout_sec),
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+        audio_output=data.get("audio_output", defaults.audio_output),
+        resample_to_playback_rate=data.get("resample_to_playback_rate", defaults.resample_to_playback_rate),
+        chunk_ms=data.get("chunk_ms", defaults.chunk_ms),
     )
+
+
+_TTS_AUDIO_OUTPUT_TYPES = ("audio_common_msgs/msg/AudioData", "audio_common_msgs/msg/AudioDataStamped")
+
+
+def validate_audio_playback_config(robot_config: Mapping[str, Any]) -> list[str]:
+    """Playback sink rules: the playback axis is declared, never inferred from the capture axis.
+
+    Two invariants keep the local sink and the runtime binding from disagreeing: a runtime
+    speaker requires ``voice_tts.audio_output``, and declaring that binding requires
+    ``audio_io.playback_source=runtime``. ``audio_io.source`` only describes capture.
+
+    This runs on the effective config dict so every launch is covered: the typed
+    :func:`validate_config` path is not reached by ``load_robot_config_dict``, and a profile
+    with a logical interface binding cannot be loaded as a :class:`RobotConfig` at all.
+    """
+
+    audio_io = robot_config.get("audio_io") or {}
+    tts = robot_config.get("voice_tts") or {}
+    if not isinstance(audio_io, Mapping):
+        return ["audio_io must be a mapping"]
+    if not isinstance(tts, Mapping):
+        return ["voice_tts must be a mapping"]
+    defaults = AudioIOConfig()
+    playback_source = audio_io.get("playback_source", defaults.playback_source)
+    audio_enabled = is_audio_io_enabled(audio_io)
+
+    errors: list[str] = []
+    if playback_source not in ("alsa", "runtime"):
+        errors.append(f"audio_io.playback_source must be 'alsa' or 'runtime', got {playback_source!r}")
+    if not tts.get("enabled", False):
+        return errors
+
+    tts_defaults = VoiceTTSConfig()
+    chunk_ms = tts.get("chunk_ms", tts_defaults.chunk_ms)
+    if isinstance(chunk_ms, bool) or not isinstance(chunk_ms, int) or not 20 <= chunk_ms <= 200:
+        errors.append("voice_tts.chunk_ms must be an integer between 20 and 200")
+    if not isinstance(tts.get("resample_to_playback_rate", tts_defaults.resample_to_playback_rate), bool):
+        errors.append("voice_tts.resample_to_playback_rate must be a boolean")
+
+    output = tts.get("audio_output", tts_defaults.audio_output)
+    if output is not None:
+        if not isinstance(output, Mapping) or not output.get("interface") or not output.get("type"):
+            errors.append("voice_tts.audio_output must be a mapping with interface and type")
+        elif output["type"] not in _TTS_AUDIO_OUTPUT_TYPES:
+            errors.append(f"voice_tts.audio_output.type must be one of {list(_TTS_AUDIO_OUTPUT_TYPES)}")
+        if audio_enabled and playback_source != "runtime":
+            errors.append(
+                "voice_tts.audio_output binds the runtime speaker, so audio_io.playback_source must be "
+                f"'runtime', got {playback_source!r}"
+            )
+    elif audio_enabled and playback_source == "runtime":
+        errors.append(
+            "audio_io.playback_source=runtime requires voice_tts.audio_output "
+            "(bind the runtime playback interface; there is no local speaker to assume)"
+        )
+    return errors
 
 
 def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
@@ -2124,6 +2187,7 @@ def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
     return AudioIOConfig(
         enabled=data.get("enabled", defaults.enabled),
         microphone=data.get("microphone", defaults.microphone),
+        playback_source=data.get("playback_source", defaults.playback_source),
         capture_topic=data.get("capture_topic", defaults.capture_topic),
         capture_stamped_topic=data.get("capture_stamped_topic", defaults.capture_stamped_topic),
         audio_info_topic=data.get("audio_info_topic", defaults.audio_info_topic),
@@ -2641,6 +2705,14 @@ def validate_config(config: RobotConfig) -> list[str]:
     playback_required = config.voice_tts.enabled
     if (capture_required or playback_required) and not is_audio_io_enabled(config.audio_io):
         errors.append("audio_io.enabled must be true when voice ASR, speech direction, or voice TTS is enabled")
+    errors.extend(
+        validate_audio_playback_config(
+            {
+                "audio_io": dataclasses.asdict(config.audio_io),
+                "voice_tts": dataclasses.asdict(config.voice_tts),
+            }
+        )
+    )
     if config.audio_io.enabled:
         for name in (
             "capture_topic",

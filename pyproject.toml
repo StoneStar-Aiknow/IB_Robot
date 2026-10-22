@@ -63,6 +63,8 @@ extend-exclude = [
     "libs/lerobot",
     "src/pymoveit2",
     "src/rosclaw",
+    # Vendored verbatim (plus marked patches) from video2x2_runtime; keep it diffable against upstream.
+    "src/manipulation_execution/manipulation_execution/imitation_retargeting/x2/_vendor",
 ]
 
 [tool.ruff.lint]

@@ -19,7 +19,25 @@ class InterfaceBindingError(ValueError):
         super().__init__(f"{code}: {path}: {detail}")
 
 
+_TTS_AUDIO_OUTPUT_TYPES = ("audio_common_msgs/msg/AudioData", "audio_common_msgs/msg/AudioDataStamped")
+
+
 def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    tts = config.get("voice_tts") or {}
+    if isinstance(tts, Mapping) and tts.get("enabled"):
+        item = tts.get("audio_output")
+        if item is not None:
+            if not isinstance(item, dict):
+                raise InterfaceBindingError("invalid_binding", "voice_tts.audio_output", "must be a mapping")
+            interface_id = item.get("interface")
+            if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+                raise InterfaceBindingError("invalid_interface", "voice_tts.audio_output", "logical ID required")
+            if item.get("type") not in _TTS_AUDIO_OUTPUT_TYPES:
+                raise InterfaceBindingError(
+                    "type_mismatch", "voice_tts.audio_output", "AudioData or AudioDataStamped required"
+                )
+            # The runtime subscribes to the playback topic; this consumer publishes to it.
+            yield item, "voice_tts.audio_output", "subscribe"
     contract = config.get("contract") or {}
     if not isinstance(contract, Mapping):
         return

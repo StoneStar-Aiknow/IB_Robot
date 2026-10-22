@@ -33,7 +33,7 @@ from robot_config.interface_binding import InterfaceBindingError
 _COMPRESSED_TYPE = "sensor_msgs/msg/CompressedImage"
 # The runtime publishes the camera; the stream subscribes it.
 _CAMERA_SHAPE = ("topic", "publish", _COMPRESSED_TYPE)
-_FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "decoder", "decoder_params"})
+_FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "decoder", "decoder_params", "require_unique_publisher"})
 # Superseded by frame_source; refused rather than silently ignored.
 _LEGACY_STREAM_KEYS = ("rgb_compressed_topic", "rgb_compressed_type")
 _DEFAULT_DECODER = "mock_cpu"
@@ -122,6 +122,53 @@ def mock_playback_endpoints(robot_config: Mapping) -> tuple[str, str] | None:
     return _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW), MOCK_PLAY_SERVICE
 
 
+def mock_reset_pose(robot_config: Mapping) -> list[float] | None:
+    """The mock pipeline's reset pose in the arm channel's order, or None if unset.
+
+    ``mock_playback.reset_pose`` is keyed by joint name like ``arm_limits`` and
+    must name exactly the ``joint.arm_stream`` joints. The session walks the arm
+    to it when it takes over and when a round ends.
+    """
+    config = _stream_config(robot_config)
+    mock = None if config is None else _mock_config(config)
+    if mock is None or mock.get("reset_pose") is None:
+        return None
+    pose = mock["reset_pose"]
+    _, joint_names = _arm_stream(robot_config)
+    if not isinstance(pose, Mapping) or set(pose) != set(joint_names):
+        raise ValueError(f"motion_imitation_stream.mock_playback.reset_pose must name exactly the {_ARM_STREAM} joints")
+    values = []
+    for name in joint_names:
+        value = pose[name]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            raise ValueError(f"motion_imitation_stream.mock_playback.reset_pose.{name} must be a finite number")
+        values.append(float(value))
+    return values
+
+
+def mock_velocity_limits(robot_config: Mapping) -> list[float] | None:
+    """The mock pipeline's ``arm_velocity_limits`` in the arm channel's order (rad/s), or None if disabled.
+
+    The session limits each tick of the window pipeline to them, as the player
+    node limits its own output.
+    """
+    config = _stream_config(robot_config)
+    mock = None if config is None else _mock_config(config)
+    if mock is None:
+        return None
+    _, joint_names = _arm_stream(robot_config)
+    _, velocity = _arm_limits(mock, joint_names)
+    values = []
+    for name in joint_names:
+        value = velocity[name]
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"motion_imitation_stream.mock_playback.arm_velocity_limits.{name} must be a positive number"
+            )
+        values.append(float(value))
+    return values
+
+
 def generate_motion_imitation_stream_nodes(robot_config: dict) -> list[Node]:
     """Launch the head-camera -> YOLOX -> PEAR frame stream, if the robot enables it."""
     config = _stream_config(robot_config)
@@ -172,6 +219,9 @@ def _stream_parameters(config: Mapping, robot_config: Mapping) -> dict:
         "status_period_sec": _positive(config, "status_period_sec", 5.0),
         "actor_stale_sec": _positive(config, "actor_stale_sec", 3.0),
     }
+    source_config = config["frame_source"]
+    if "require_unique_publisher" in source_config:
+        parameters["require_unique_publisher"] = _required_bool(source_config, "require_unique_publisher")
     outputs = [parameters[key] for key in ("frame_topic", "status_topic", "actor_state_topic")]
     if len(set(outputs)) != len(outputs):
         raise ValueError("motion_imitation_stream.frame_topic, status_topic and actor_state_topic must differ")
@@ -220,8 +270,8 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
         raise ValueError(f"motion_imitation_stream.frame_source has unknown keys {unknown}")
     if ("interface" in source) == ("topic" in source):
         raise ValueError("motion_imitation_stream.frame_source needs exactly one of interface or topic")
-    interfaces = _described_interfaces(robot_config, "motion_imitation_stream.frame_source subscribes a camera")
     if "interface" in source:
+        interfaces = _described_interfaces(robot_config, "motion_imitation_stream.frame_source subscribes a camera")
         interface_id = source["interface"]
         if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
             raise InterfaceBindingError(
@@ -234,7 +284,9 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
             raise InterfaceBindingError("unknown_interface", interface_id, "ID is not in the runtime description")
         if (item.get("kind"), item.get("direction"), item.get("message_type")) != _CAMERA_SHAPE:
             kind, direction, message_type = _CAMERA_SHAPE
-            raise InterfaceBindingError("invalid_interface", interface_id, f"requires {kind} {message_type} {direction}")
+            raise InterfaceBindingError(
+                "invalid_interface", interface_id, f"requires {kind} {message_type} {direction}"
+            )
         topic = item.get("endpoint")
         if not isinstance(topic, str) or not topic.startswith("/"):
             raise InterfaceBindingError("invalid_interface", interface_id, "endpoint must be an absolute ROS name")
@@ -243,13 +295,17 @@ def _frame_source(config: Mapping, robot_config: Mapping) -> tuple[str, str, str
         topic = source["topic"]
         if not isinstance(topic, str) or not topic.startswith("/") or topic.strip() != topic:
             raise ValueError("motion_imitation_stream.frame_source.topic must be an absolute ROS name")
+        runtime = robot_config.get("runtime") or {}
+        description = runtime.get("interface_description") if isinstance(runtime, Mapping) else None
+        interfaces = description.get("interfaces", {}) if isinstance(description, Mapping) else {}
+        if not isinstance(interfaces, Mapping):
+            interfaces = {}
         described = sorted(
             name for name, item in interfaces.items() if isinstance(item, Mapping) and item.get("endpoint") == topic
         )
         if described:
             raise ValueError(
-                f"motion_imitation_stream.frame_source.topic is described as {described[0]}; "
-                "use frame_source.interface"
+                f"motion_imitation_stream.frame_source.topic is described as {described[0]}; use frame_source.interface"
             )
     decoder = source.get("decoder", _DEFAULT_DECODER)
     if not isinstance(decoder, str) or not decoder:
@@ -328,36 +384,65 @@ def _mock_config(config: Mapping) -> Mapping | None:
     return mock
 
 
+def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
+    """Parameters only the live retarget node takes; ``reset_pose`` is required for it."""
+    retarget = mock.get("retarget", {})
+    if not isinstance(retarget, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.retarget must be a mapping")
+    reset_pose = mock_reset_pose(robot_config)
+    if reset_pose is None:
+        raise ValueError("motion_imitation_stream.mock_playback.reset_pose is required when player is retarget")
+    retargeter = retarget.get("retargeter", "x2_followme")
+    if not isinstance(retargeter, str) or not retargeter.strip():
+        raise ValueError("motion_imitation_stream.mock_playback.retarget.retargeter must be a non-empty string")
+    return {
+        "reset_pose_json": json.dumps(reset_pose),
+        "retargeter": retargeter.strip(),
+        "vel_scale": _positive(retarget, "vel_scale", 1.0),
+        "latency_s": _non_negative(retarget, "latency_s", 0.4),
+        "lookahead_s": _non_negative(retarget, "lookahead_s", 0.25),
+        "mirror": _required_bool(retarget, "mirror") if "mirror" in retarget else True,
+    }
+
+
 def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mapping) -> list[Node]:
     mock = _mock_config(config)
     if mock is None:
         return []
     _, joint_names = _arm_stream(robot_config)
     limits, velocity = _arm_limits(mock, joint_names)
-    manifest = str(mock.get("animation_manifest", "")).strip()
-    if not manifest:
-        manifest = str(Path(get_package_share_directory("manipulation_execution")) / _DEFAULT_ANIMATION)
+    # Either node takes the preview contract below; mirror_session cannot tell them apart.
+    player = mock.get("player", "animation")
+    parameters = {
+        "pear_frame_topic": frame_topic,
+        "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
+        "status_topic": _required_topic(mock, "status_topic", "/motion_imitation_mock/status"),
+        "publish_rate_hz": _positive(mock, "publish_rate_hz", 50.0),
+        "input_staleness_sec": _positive(mock, "input_staleness_sec", 0.5),
+        "status_period_sec": _positive(mock, "status_period_sec", 5.0),
+        "joint_names_json": json.dumps(joint_names),
+        "joint_limits_json": json.dumps({name: list(limits[name]) for name in joint_names}),
+        "velocity_limits_json": json.dumps({name: float(velocity[name]) for name in joint_names}),
+    }
+    if player == "animation":
+        executable = "motion_imitation_mock_node"
+        manifest = str(mock.get("animation_manifest", "")).strip()
+        if not manifest:
+            manifest = str(Path(get_package_share_directory("manipulation_execution")) / _DEFAULT_ANIMATION)
+        parameters["animation_manifest"] = manifest
+        parameters["loop"] = _required_bool(mock, "loop") if "loop" in mock else True
+    elif player == "retarget":
+        executable = "motion_imitation_retarget_node"
+        parameters.update(_retarget_parameters(mock, robot_config))
+    else:
+        raise ValueError("motion_imitation_stream.mock_playback.player must be 'animation' or 'retarget'")
     return [
         Node(
             package="manipulation_execution",
-            executable="motion_imitation_mock_node",
+            executable=executable,
             name=MOCK_NODE_NAME,
             output="screen",
-            parameters=[
-                {
-                    "animation_manifest": manifest,
-                    "pear_frame_topic": frame_topic,
-                    "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
-                    "status_topic": _required_topic(mock, "status_topic", "/motion_imitation_mock/status"),
-                    "publish_rate_hz": _positive(mock, "publish_rate_hz", 50.0),
-                    "input_staleness_sec": _positive(mock, "input_staleness_sec", 0.5),
-                    "status_period_sec": _positive(mock, "status_period_sec", 5.0),
-                    "loop": _required_bool(mock, "loop") if "loop" in mock else True,
-                    "joint_names_json": json.dumps(joint_names),
-                    "joint_limits_json": json.dumps({name: list(limits[name]) for name in joint_names}),
-                    "velocity_limits_json": json.dumps({name: float(velocity[name]) for name in joint_names}),
-                }
-            ],
+            parameters=[parameters],
         )
     ]
 
@@ -367,5 +452,7 @@ __all__ = [
     "MOCK_PLAY_SERVICE",
     "generate_motion_imitation_stream_nodes",
     "mock_playback_endpoints",
+    "mock_reset_pose",
+    "mock_velocity_limits",
     "motion_imitation_stream_parameters",
 ]

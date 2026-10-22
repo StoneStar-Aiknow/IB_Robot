@@ -921,6 +921,23 @@ def test_vendor_audio_playback_is_published_reliable(harness):
     assert harness.runtime._locomotion_pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
 
 
+def test_vendor_audio_capture_is_read_best_effort(harness):
+    """The platform publishes capture RELIABLE from a 1000-deep history.
+
+    A RELIABLE reader lets it retransmit that history whenever a fragment is
+    lost; capture traffic to RELIABLE readers filled the SoC's egress on the
+    robot (2026-10-16). The SDK's own raw-audio examples read it BEST_EFFORT
+    with a 500-deep queue.
+    """
+    from rclpy.qos import ReliabilityPolicy
+
+    harness.wait_active()
+    capture = [s for s in harness.runtime.subscriptions if s.topic_name == "/aima/hal/audio/capture"]
+    assert len(capture) == 1
+    assert capture[0].qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert capture[0].qos_profile.depth == 500
+
+
 def test_audio_play_reaches_the_platform(harness):
     """End to end over the QoS the platform really uses.
 
@@ -1365,6 +1382,29 @@ def test_platform_state_is_read_off_the_feedback_torrents_callback_group(harness
     assert telemetry is not joint_publish
     assert telemetry is not harness.runtime.default_callback_group
     assert joint_publish is not harness.runtime.default_callback_group
+
+
+def test_command_streams_are_not_taken_up_behind_the_feedback_torrent(harness):
+    """On the robot the arm stream in the default group was read ~2 times a second."""
+    harness.wait_active()
+    runtime = harness.runtime
+    arm = [s for s in runtime.subscriptions if s.topic_name == "/aimdk/arm/commands"]
+    joints = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/arm/state"]
+    assert len(arm) == 1 and len(joints) == 1
+    assert arm[0].callback_group is runtime._command_cb
+    assert arm[0].callback_group is not joints[0].callback_group
+    assert arm[0].callback_group is not runtime.default_callback_group
+
+
+def test_speaker_stream_is_not_taken_up_behind_the_feedback_torrent(harness):
+    """In the default group a 1 s phrase reached the platform as 3-11 of 20 chunks."""
+    harness.wait_active()
+    runtime = harness.runtime
+    play = [s for s in runtime.subscriptions if s.topic_name == "/audio/play"]
+    joints = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/arm/state"]
+    assert len(play) == 1 and len(joints) == 1
+    assert play[0].callback_group is not runtime.default_callback_group
+    assert play[0].callback_group is not joints[0].callback_group
 
 
 # --- named motion dispatch --------------------------------------------------

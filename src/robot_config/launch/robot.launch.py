@@ -210,6 +210,28 @@ def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
     robot_config["voice_asr"] = voice_asr_config
 
 
+def _generate_voice_tts_actions(robot_config: dict) -> list:
+    """Voice TTS launch actions; with ``voice_tts.exit_on_init_failure: false`` a failure only skips them.
+
+    That flag already keeps a ZipVoice that fails to start from stopping the launch; a voice TTS that
+    cannot even be launched (no WORKSPACE, a binding that does not resolve, ...) is treated the same way.
+    """
+    try:
+        from robot_config.launch_builders.voice_tts import generate_voice_tts_nodes
+
+        return generate_voice_tts_nodes(robot_config)
+    except Exception as e:
+        voice_tts_config = robot_config.get("voice_tts") or {}
+        if voice_tts_config.get("exit_on_init_failure", True) is not False:
+            logger.error(f"generating voice TTS nodes: {e}")
+            raise
+        logger.error(
+            f"generating voice TTS nodes: {type(e).__name__}: {e}; "
+            "continuing without voice TTS (voice_tts.exit_on_init_failure is false)"
+        )
+        return []
+
+
 def _validate_benchmark_inference_closure(
     robot_config: dict,
     *,
@@ -940,16 +962,10 @@ def _construct_robot_nodes(
 
     # ========== 9. Generate Voice TTS Nodes ==========
     logger.info("========== Checking Voice TTS ==========")
-    try:
-        from robot_config.launch_builders.voice_tts import generate_voice_tts_nodes
-
-        voice_tts_nodes = generate_voice_tts_nodes(robot_config)
-        actions.extend(voice_tts_nodes)
-        if voice_tts_nodes:
-            logger.info(f"Added {len(voice_tts_nodes)} voice TTS node(s)")
-    except Exception as e:
-        logger.error(f"generating voice TTS nodes: {e}")
-        raise
+    voice_tts_nodes = _generate_voice_tts_actions(robot_config)
+    actions.extend(voice_tts_nodes)
+    if voice_tts_nodes:
+        logger.info(f"Added {len(voice_tts_nodes)} voice TTS node(s)")
 
     # ========== 9.5 Generate Speech Direction Node ==========
     logger.info("========== Checking Speech Direction ==========")

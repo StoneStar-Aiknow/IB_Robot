@@ -1,3 +1,5 @@
+import math
+import struct
 import sys
 import types
 import wave
@@ -5,7 +7,12 @@ import wave
 import pytest
 
 from voice_tts_service.audio_playback import AudioFilePlayer, AudioPlaybackConfig, AudioPlaybackError
-from voice_tts_service.audio_playback_node import AudioPlaybackNode
+from voice_tts_service.audio_playback_node import (
+    AUDIO_DATA_STAMPED_TYPE,
+    AUDIO_DATA_TYPE,
+    AudioPlaybackNode,
+    _audio_message_class,
+)
 
 
 def _write_wav(path, *, sample_rate=16000, channels=1, sample_width=2, frames=160):
@@ -72,22 +79,54 @@ class _FakeAudioPublisher:
         return self.ack
 
 
-def _make_playback_node(publisher, *, timeout_sec=1.0):
+class _FakeAudioData:
+    def __init__(self):
+        self.data = []
+
+
+class _FakeHeader:
+    def __init__(self):
+        self.stamp = None
+        self.frame_id = ""
+
+
+class _FakeAudioDataStamped:
+    def __init__(self):
+        self.header = _FakeHeader()
+        self.audio = _FakeAudioData()
+
+
+class _FakeClock:
+    def now(self):
+        return types.SimpleNamespace(to_msg=lambda: "stamp")
+
+
+def _make_playback_node(
+    publisher,
+    *,
+    timeout_sec=1.0,
+    sample_rate=24000,
+    resample=False,
+    message_type=AUDIO_DATA_TYPE,
+    chunk_ms=50,
+):
     node = AudioPlaybackNode.__new__(AudioPlaybackNode)
     node._player = AudioFilePlayer(AudioPlaybackConfig(timeout_sec=timeout_sec))
     node._audio_pub = publisher
-    node._playback_sample_rate = 24000
+    node._playback_sample_rate = sample_rate
     node._playback_channels = 1
+    node._resample = resample
+    node._chunk_ms = chunk_ms
+    node._audio_message_type = message_type
+    node._audio_message_class = _FakeAudioDataStamped if message_type == AUDIO_DATA_STAMPED_TYPE else _FakeAudioData
+    node.get_clock = _FakeClock
     return node
 
 
 def _install_fake_audio_common_msgs(monkeypatch):
-    class FakeAudioData:
-        def __init__(self):
-            self.data = []
-
     msg_module = types.ModuleType("audio_common_msgs.msg")
-    msg_module.AudioData = FakeAudioData
+    msg_module.AudioData = _FakeAudioData
+    msg_module.AudioDataStamped = _FakeAudioDataStamped
     package_module = types.ModuleType("audio_common_msgs")
     package_module.msg = msg_module
     monkeypatch.setitem(sys.modules, "audio_common_msgs", package_module)
@@ -222,3 +261,86 @@ def test_publish_stall_cannot_run_past_playback_budget(monkeypatch, tmp_path):
 
     assert error.value.code == "PLAYBACK_TIMEOUT"
     assert len(publisher.messages) == 1
+
+
+def _write_tone(path, *, sample_rate, seconds, frequency=1000.0, channels=1):
+    frames = int(sample_rate * seconds)
+    values = [round(0.5 * 32767 * math.sin(2 * math.pi * frequency * i / sample_rate)) for i in range(frames)]
+    interleaved = [value for value in values for _ in range(channels)]
+    with wave.open(str(path), "wb") as stream:
+        stream.setnchannels(channels)
+        stream.setsampwidth(2)
+        stream.setframerate(sample_rate)
+        stream.writeframes(struct.pack(f"<{len(interleaved)}h", *interleaved))
+
+
+def test_load_without_resample_keeps_rejecting_rate_mismatch(tmp_path):
+    audio_path = tmp_path / "zipvoice.wav"
+    _write_wav(audio_path, sample_rate=24000)
+
+    with pytest.raises(AudioPlaybackError) as error:
+        AudioFilePlayer.load_pcm_for_playback(str(audio_path), sample_rate=16000, channels=1, resample=False)
+    assert error.value.code == "UNSUPPORTED_AUDIO_FORMAT"
+    assert "got 24000 Hz" in str(error.value)
+
+
+def test_load_with_resample_converts_to_playback_rate(tmp_path):
+    audio_path = tmp_path / "zipvoice.wav"
+    _write_tone(audio_path, sample_rate=24000, seconds=0.5)
+
+    pcm = AudioFilePlayer.load_pcm_for_playback(str(audio_path), sample_rate=16000, channels=1, resample=True)
+
+    assert len(pcm) == 8000 * 2
+
+
+def test_load_with_resample_still_rejects_channel_mismatch(tmp_path):
+    audio_path = tmp_path / "stereo.wav"
+    _write_tone(audio_path, sample_rate=24000, seconds=0.1, channels=2)
+
+    with pytest.raises(AudioPlaybackError) as error:
+        AudioFilePlayer.load_pcm_for_playback(str(audio_path), sample_rate=16000, channels=1, resample=True)
+    assert error.value.code == "UNSUPPORTED_AUDIO_FORMAT"
+
+
+def test_resampled_stamped_playback_is_paced_on_the_target_rate(monkeypatch, tmp_path):
+    """24 kHz ZipVoice audio reaches a 16 kHz runtime speaker as stamped 50 ms chunks."""
+    audio_path = tmp_path / "zipvoice.wav"
+    _write_tone(audio_path, sample_rate=24000, seconds=1.0)
+    clock = _Clock()
+    publisher = _FakeAudioPublisher()
+    node = _make_playback_node(
+        publisher, timeout_sec=3.0, sample_rate=16000, resample=True, message_type=AUDIO_DATA_STAMPED_TYPE
+    )
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    node._publish_audio(str(audio_path))
+
+    assert all(isinstance(message, _FakeAudioDataStamped) for message in publisher.messages)
+    assert all(message.header.stamp == "stamp" for message in publisher.messages)
+    assert [len(message.audio.data) for message in publisher.messages] == [1600] * 20
+    expected = AudioFilePlayer.load_pcm_for_playback(str(audio_path), sample_rate=16000, channels=1, resample=True)
+    assert b"".join(bytes(message.audio.data) for message in publisher.messages) == expected
+    assert clock.now == pytest.approx(1.0)
+
+
+def test_chunk_ms_sets_the_publication_granularity(monkeypatch, tmp_path):
+    audio_path = tmp_path / "speech.wav"
+    _write_wav(audio_path, sample_rate=16000, frames=16000)
+    clock = _Clock()
+    publisher = _FakeAudioPublisher()
+    node = _make_playback_node(publisher, timeout_sec=3.0, sample_rate=16000, chunk_ms=100)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("voice_tts_service.audio_playback_node.time.sleep", clock.sleep)
+
+    node._publish_audio(str(audio_path))
+
+    assert [len(message.data) for message in publisher.messages] == [3200] * 10
+
+
+def test_unknown_audio_message_type_is_rejected(monkeypatch):
+    _install_fake_audio_common_msgs(monkeypatch)
+
+    assert _audio_message_class(AUDIO_DATA_STAMPED_TYPE) is _FakeAudioDataStamped
+    with pytest.raises(ValueError, match="audio_message_type"):
+        _audio_message_class("std_msgs/msg/String")

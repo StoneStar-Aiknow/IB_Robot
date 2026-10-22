@@ -11,6 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["setuptools", "numpy", "av>=15,<16", "tensormsg"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="ib-robot",
     maintainer_email="ib-robot@example.com",
