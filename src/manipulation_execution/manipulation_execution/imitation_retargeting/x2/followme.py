@@ -15,7 +15,13 @@ its inputs and its round:
   live node caps the published command against the robot's measured bands;
 * with ``separate_process=True`` the mapping (``retarget``/``reset_input``) runs
   in a child process. On duck one frame costs ~36 ms of the GIL, and a worker
-  thread holding it starved the 50 Hz timer down to ~17 Hz.
+  thread holding it starved the 50 Hz timer down to ~17 Hz;
+* with ``elbow_spin_to_wrist=True`` the elbow's twist about the forearm bone is
+  moved onto the wrist before the vendor reads the frame (``elbow_spin_to_wrist``
+  below). PEAR splits a forearm turn between the two, the vendor's ``wrist_yaw``
+  reads only the wrist's Euler-X, and no geometric channel sees the elbow's part,
+  so most of a palm flip was lost. With it on, ``wrist_yaw`` reads elbow twist
+  plus wrist, unlike the ledger's note; see docs/x2_wrist_spin_plan_A.md.
 """
 
 from __future__ import annotations
@@ -53,6 +59,29 @@ NOTES_KEPT = 10
 # Status keys that describe the mapping; with a child process they come from there.
 _MAPPING_KEYS = ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets")
 _CHILD_START_TIMEOUT_S = 120.0
+# (elbow, wrist) indices into the 52 decoded rotations, left then right.
+_FOREARMS = ((18, 20), (19, 21))
+
+
+def elbow_spin_to_wrist(rotations: np.ndarray, forearm_axes: Sequence[np.ndarray]) -> np.ndarray:
+    """Move each elbow's twist about its forearm bone onto the wrist; returns a copy.
+
+    ``rotations`` are the (52, 3, 3) local rotations; ``forearm_axes`` the unit
+    wrist offsets in the elbow frames, left then right. With ``R_elbow = S @ T``
+    (swing-twist, T about the axis) the elbow becomes S and the wrist
+    ``T @ R_wrist``: every global rotation is unchanged, and T keeps the axis,
+    so every joint position is too.
+    """
+    out = rotations.copy()
+    for (elbow, wrist), axis in zip(_FOREARMS, forearm_axes):
+        quat = scipy.spatial.transform.Rotation.from_matrix(rotations[elbow]).as_quat()  # x y z w
+        along = quat[:3] @ axis
+        if np.hypot(along, quat[3]) < 1e-6:
+            continue  # bent half a turn about an axis across the bone: no twist to read
+        twist = scipy.spatial.transform.Rotation.from_rotvec(axis * 2.0 * np.arctan2(along, quat[3])).as_matrix()
+        out[elbow] = rotations[elbow] @ twist.T
+        out[wrist] = twist @ rotations[wrist]
+    return out
 
 
 def _session() -> core.Session:
@@ -64,13 +93,16 @@ class X2FollowMe:
 
     def __init__(self, *, base_pose: Sequence[float], latency_s: float = core.DEFAULT_LATENCY_S,
                  lookahead_s: float = core.DEFAULT_LOOKAHEAD_S, mirror: bool = True,
-                 separate_process: bool = False):
+                 separate_process: bool = False, elbow_spin_to_wrist: bool = False):
         self._vendor = core._import_vendor()
         self.joint_names = tuple(self._vendor["ARM_JOINT_NAMES"])
         base = np.asarray(base_pose, dtype=np.float64)
         if base.shape != (len(self.joint_names),) or not np.isfinite(base).all():
             raise ValueError(f"base_pose must be {len(self.joint_names)} finite radians")
         self._fk = NeutralFK()
+        self.elbow_spin_to_wrist = bool(elbow_spin_to_wrist)
+        self._forearm_axes = tuple(self._fk.offsets[wrist] / np.linalg.norm(self._fk.offsets[wrist])
+                                   for _, wrist in _FOREARMS)
         self._base = base
         self._stream = core.FollowMeStream(
             vendor=self._vendor, session=_session(), latency_s=latency_s, lookahead_s=lookahead_s,
@@ -88,7 +120,8 @@ class X2FollowMe:
         self._child = None
         if separate_process:
             self._child = _MappingProcess(dict(base_pose=base.tolist(), latency_s=latency_s,
-                                               lookahead_s=lookahead_s, mirror=mirror))
+                                               lookahead_s=lookahead_s, mirror=mirror,
+                                               elbow_spin_to_wrist=self.elbow_spin_to_wrist))
 
     def _dry_run(self) -> None:
         """Pay the first-call costs now and run the mirror's FK self-check once.
@@ -118,6 +151,8 @@ class X2FollowMe:
         rotations = decode_rotation_6d(raw)
         if np.abs(np.linalg.det(rotations) - 1.0).max() > 1e-3:
             raise ValueError("smplx_pose_raw holds a degenerate 6D rotation")
+        if self.elbow_spin_to_wrist:
+            rotations = elbow_spin_to_wrist(rotations, self._forearm_axes)
         # float32, as the runtime's PEAR node published them.
         rotations = rotations.astype(np.float32)
         decoded = {
@@ -201,6 +236,7 @@ class X2FollowMe:
             "branch_guard_worst": max(self._guard_worst, guard.worst_branch),
             "retargeted": self.retarget_count,
             "input_resets": self.input_resets,
+            "elbow_spin_to_wrist": self.elbow_spin_to_wrist,
             "notes": (stream.notes + stream.retargeter.notes)[-3:],
         }
         if self._child is not None:
