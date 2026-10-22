@@ -30,6 +30,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
+from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC
 from embodied_common.visual_interaction_contract import (
     DEFAULT_ABSENT_RESET_SEC,
     DEFAULT_CONFIRMATION_COUNT,
@@ -65,6 +66,16 @@ PARAMETERS: dict[str, object] = {
     "camera_topic": "",
     "camera_topic_qos_json": '{"reliability": "best_effort", "durability": "volatile", "depth": 5}',
     "actor_state_topic": "",
+    # The mirror session's state topic (/mirror_session/state). When set, the
+    # rounds are suspended with MIRROR_INACTIVE unless it currently reports
+    # MIRRORING: in the magicmirror entry the feature is part of the mirror
+    # experience and stays parked while the mirror is not following anyone.
+    # Empty means no such gate (a deployment without a mirror).
+    "mirror_state_topic": "",
+    # How old the last state message may be, by arrival, before the state
+    # counts as unknown — and unknown gates the round off, the conservative
+    # side. The publisher heartbeats once a second.
+    "mirror_state_stale_sec": STATE_STALE_SEC,
     "vl_implementation": "fake",
     # Where the board's InternVL deployment lives, for
     # vl_implementation "internvl". Empty with "fake".
@@ -228,6 +239,15 @@ class VisualInteractionNode(Node):
 
         self._actor = ActorSignal(present=False, known=False, bbox=None, stamp=0.0)
         self._actor_received_at: float | None = None
+        # The mirror gate, when the deployment has one: the last state reported
+        # on mirror_state_topic and when it arrived. Until the first message
+        # lands the gate stays closed — TRANSIENT_LOCAL delivers the latched
+        # current state at startup, so a live deployment opens it immediately
+        # and a dead one never pretends to.
+        self._mirror_topic = str(self._value("mirror_state_topic")).strip() or None
+        self._mirror_state_stale_sec = float(self._value("mirror_state_stale_sec"))
+        self._mirror_state = ""
+        self._mirror_state_at: float | None = None
         self._counts: dict[str, int] = {}
         self._rounds = 0
         # The last MODEL_NOT_READY cause logged, so a permanent
@@ -245,6 +265,20 @@ class VisualInteractionNode(Node):
         actor_topic = str(self._value("actor_state_topic"))
         if actor_topic:
             self.create_subscription(ActorState, actor_topic, self._on_actor, 10)
+        if self._mirror_topic is not None:
+            # Reliable + transient_local, depth 1, matching the publisher's
+            # contract (embodied_common.mirror_session_contract): the latched
+            # current state arrives without waiting for the next heartbeat.
+            self.create_subscription(
+                String,
+                self._mirror_topic,
+                self._on_mirror_state,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
 
         # How an attendant stops the robot talking. A visitor cannot reach a
         # ROS service, so the console that calls this is part of the feature,
@@ -255,6 +289,7 @@ class VisualInteractionNode(Node):
         self.create_timer(float(self._value("status_period_sec")), self._publish_status)
         self.get_logger().info(
             f"visual interaction on {camera.endpoint}; actor_state={actor_topic or '(none)'}; "
+            f"mirror_state={self._mirror_topic or '(none)'}; "
             f"vl={self._value('vl_implementation')}; publishing {UTTERANCE_TOPIC} (no speech)"
         )
 
@@ -362,6 +397,38 @@ class VisualInteractionNode(Node):
         )
         self._actor_received_at = self._now()
 
+    def _on_mirror_state(self, message: String) -> None:
+        """Record the mirror session's current state, keyed by arrival.
+
+        The payload is the state topic's JSON (a ``state`` field plus the rest
+        of the snapshot); only the state name is read here. A malformed payload
+        leaves the previous state in place, and staleness — judged by arrival —
+        then closes the gate on the next round, which needs no clock agreement
+        with the publisher.
+        """
+        try:
+            payload = json.loads(message.data)
+        except ValueError:
+            return
+        state = payload.get("state") if isinstance(payload, dict) else None
+        self._mirror_state = state if isinstance(state, str) else ""
+        self._mirror_state_at = self._now()
+
+    def _mirror_active(self, now: float) -> bool:
+        """Whether the mirror gate is open: MIRRORING, and recently heard.
+
+        Every other state — WAIT, STANDBY, unknown, silent — closes it, as
+        does a subscription that was never configured (no gate) or one whose
+        publisher has gone quiet past mirror_state_stale_sec.
+        """
+        if self._mirror_topic is None:
+            return True
+        return (
+            self._mirror_state == STATE_MIRRORING
+            and self._mirror_state_at is not None
+            and now - self._mirror_state_at <= self._mirror_state_stale_sec
+        )
+
     def _on_round(self) -> None:
         window = self._buffer.window(self._window_sec, self._frames)
         if window is None:
@@ -381,7 +448,9 @@ class VisualInteractionNode(Node):
         if self._actor_received_at is None or now - self._actor_received_at > self._stale_actor_sec:
             actor = ActorSignal(present=False, known=False, bbox=None, stamp=now)
 
-        result = self._session.step(RoundInputs(window=window, actor=actor, now=now))
+        result = self._session.step(
+            RoundInputs(window=window, actor=actor, now=now, mirror_active=self._mirror_active(now))
+        )
         self._rounds += 1
         self._count(result.reason or "spoken")
         self._publish(result, window)
@@ -457,6 +526,11 @@ class VisualInteractionNode(Node):
             "session_id": self._session.session_id,
             "actor_epoch": self._session.actor_epoch,
             "muted": self._session.muted,
+            # The mirror gate, for the same reason every other quiet cause is
+            # reported: "parked while the mirror is not mirroring" must be
+            # readable off the status topic, not guessed from silence.
+            "mirror_state": self._mirror_state,
+            "mirror_active": self._mirror_active(self._now()),
             "outcomes": dict(sorted(self._counts.items())),
             "spoken_topics": self._session.ledger().spoken_count(),
         }

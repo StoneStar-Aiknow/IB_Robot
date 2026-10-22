@@ -41,6 +41,7 @@ from embodied_common.visual_interaction_contract import (
     SPEAKABLE_KINDS,
     SUPPRESS_AMBIGUOUS,
     SUPPRESS_COOLDOWN,
+    SUPPRESS_MIRROR_INACTIVE,
     SUPPRESS_MODEL_NOT_READY,
     SUPPRESS_MUTED,
     SUPPRESS_NO_NEW_TOPIC,
@@ -236,6 +237,14 @@ class VisualInteractionSession:
             return self._finish(inputs, SUPPRESS_WAITING_NEXT_VISITOR)
         if self._awaiting_handover:
             return self._finish(inputs, SUPPRESS_WAITING_NEXT_VISITOR)
+        if not inputs.mirror_active:
+            # The speech context is absent (the mirror is not MIRRORING). The
+            # window bookkeeping above still ran, so a visitor who leaves while
+            # the feature is parked still rotates the session; skipping the
+            # association is conservative and self-healing, because the first
+            # round after a real pause sees a stamp gap that relocks the target
+            # and breaks every chain collected before it.
+            return self._finish(inputs, SUPPRESS_MIRROR_INACTIVE)
 
         association = self.tracker.update(
             present=inputs.actor.present,

@@ -212,6 +212,23 @@ class TestParameters:
         assert self.parameters()["actor_state_topic"] == ""
         assert self.parameters(actor_state_topic="/stream/actor")["actor_state_topic"] == "/stream/actor"
 
+    def test_the_mirror_gate_keys_reach_the_node(self):
+        """The magicmirror entry wires both: the state topic, and how old a
+        state message may be before it counts as unknown."""
+        values = self.parameters(mirror_state_topic="/mirror_session/state", mirror_state_stale_sec=3.0)
+
+        assert values["mirror_state_topic"] == "/mirror_session/state"
+        assert values["mirror_state_stale_sec"] == 3.0
+
+    def test_the_mirror_gate_defaults_to_ungated(self):
+        """A deployment without a mirror gates nothing, on the contract's staleness."""
+        from embodied_common.mirror_session_contract import STATE_STALE_SEC
+
+        values = self.parameters()
+
+        assert values["mirror_state_topic"] == ""
+        assert values["mirror_state_stale_sec"] == STATE_STALE_SEC
+
     def test_every_passed_name_is_declared_by_the_node(self):
         """rclpy drops an override it has no declaration for without a warning."""
         from visual_interaction.visual_interaction_node import PARAMETERS
@@ -284,6 +301,20 @@ class TestValidation:
     def test_a_relative_actor_topic_is_refused(self):
         with pytest.raises(ValueError, match="absolute ROS name"):
             generate_visual_interaction_nodes(config(actor_state_topic="stream/actor"))
+
+    def test_a_relative_mirror_state_topic_is_refused(self):
+        with pytest.raises(ValueError, match="absolute ROS name"):
+            generate_visual_interaction_nodes(config(mirror_state_topic="mirror_session/state"))
+
+    @pytest.mark.parametrize("value", [0, -1.0])
+    def test_a_non_positive_stale_sec_is_refused(self, value):
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            generate_visual_interaction_nodes(config(mirror_state_stale_sec=value))
+
+    def test_a_boolean_stale_sec_is_refused(self):
+        """A missing key reads as absent all over this config; a stray true must not pass as 1."""
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            generate_visual_interaction_nodes(config(mirror_state_stale_sec=True))
 
     def test_an_empty_category_list_is_refused(self):
         with pytest.raises(ValueError, match="can never speak"):

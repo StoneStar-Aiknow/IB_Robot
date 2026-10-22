@@ -104,6 +104,12 @@ class RoundInputs:
     window: Window
     actor: ActorSignal
     now: float
+    # False while the deployment's speech context is absent — for the X2
+    # magicmirror entry, while the mirror session is not MIRRORING (or its
+    # state has gone stale). The adapter decides; the session only knows the
+    # round is suspended, keeps observing, and calls no model. Defaults to
+    # true so a deployment without a mirror gates nothing.
+    mirror_active: bool = True
 
 
 @dataclass(frozen=True)

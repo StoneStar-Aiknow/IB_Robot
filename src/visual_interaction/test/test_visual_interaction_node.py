@@ -625,3 +625,166 @@ class TestCameraTopicEscapeHatch:
             node, rclpy = self.node(camera_topic_qos_json="not json")
             node.destroy_node()
             rclpy.shutdown()
+
+
+MIRROR_TOPIC = "/mirror_session/state"
+
+
+class TestMirrorStateGate:
+    """The magicmirror entry suspends the rounds unless the mirror is MIRRORING.
+
+    The state arrives as JSON on /mirror_session/state, and the subscription
+    matches the publisher (reliable + transient_local, depth 1) so the latched
+    current state is there from the start. It is judged by arrival — two
+    missed heartbeats count as unknown, and unknown gates the round off, the
+    conservative side.
+    """
+
+    def node(self, **overrides):
+        import json
+
+        import rclpy
+        from rclpy.parameter import Parameter
+
+        from visual_interaction.visual_interaction_node import VisualInteractionNode
+
+        values = {
+            "runtime_description_json": json.dumps({"robot": {}, "interfaces": {}}),
+            "categories_json": '["toy","sign","hat","badge"]',
+            "camera_topic": "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed",
+            "mirror_state_topic": MIRROR_TOPIC,
+        }
+        values.update(overrides)
+        rclpy.init()
+        try:
+            node = VisualInteractionNode(parameter_overrides=[Parameter(k, value=v) for k, v in values.items()])
+            return node, rclpy
+        except Exception:
+            rclpy.shutdown()
+            raise
+
+    def state(self, payload):
+        from std_msgs.msg import String
+
+        return String(data=payload)
+
+    def test_without_the_topic_there_is_no_mirror_subscription(self, node):
+        """The default gate is "no gate"; the module fixture's node has no topic."""
+        assert not any("/mirror_session" in sub.topic_name for sub in node.subscriptions)
+
+    def test_the_subscription_matches_the_publisher(self):
+        """Reliable + transient_local, depth 1, or the latched state never arrives."""
+        from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+        node, rclpy = self.node()
+        try:
+            sub = next(s for s in node.subscriptions if s.topic_name == MIRROR_TOPIC)
+
+            assert sub.qos_profile.reliability == ReliabilityPolicy.RELIABLE
+            assert sub.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+            assert sub.qos_profile.depth == 1
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_mirroring_opens_the_gate(self):
+        node, rclpy = self.node()
+        try:
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+
+            assert node._mirror_active(node._now()) is True
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_every_other_state_closes_it(self):
+        node, rclpy = self.node()
+        try:
+            for state in ("WAIT", "STANDBY"):
+                node._on_mirror_state(self.state(f'{{"state": "{state}"}}'))
+
+                assert node._mirror_active(node._now()) is False, state
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_state_that_went_stale_closes_it(self):
+        """Two missed heartbeats: the state is unknown, not current."""
+        node, rclpy = self.node()
+        try:
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+            node._mirror_state_at -= node._mirror_state_stale_sec + 1.0
+
+            assert node._mirror_active(node._now()) is False
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_no_state_at_all_closes_it(self):
+        """Before the first message the conservative answer is closed."""
+        node, rclpy = self.node()
+        try:
+            assert node._mirror_active(node._now()) is False
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_malformed_payload_leaves_the_last_state_aging(self):
+        """Kept, not cleared: its arrival moment keeps aging, so the gate closes
+        on staleness rather than on a parse."""
+        node, rclpy = self.node()
+        try:
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+            heard_at = node._mirror_state_at
+
+            node._on_mirror_state(self.state("not json"))
+
+            assert node._mirror_state == "MIRRORING"
+            assert node._mirror_state_at == heard_at
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_the_gate_reaches_the_round(self):
+        """What the session receives is the gate's answer, not the raw state."""
+        node, rclpy = self.node()
+        try:
+            seen = {}
+            original = node._session.step
+
+            def recording(round_inputs):
+                seen["mirror_active"] = round_inputs.mirror_active
+                return original(round_inputs)
+
+            node._session.step = recording
+            node._buffer.put(node._now(), node._now(), b"frame")
+            node._on_round()
+
+            assert seen["mirror_active"] is False
+
+            node._on_mirror_state(self.state('{"state": "MIRRORING"}'))
+            node._buffer.put(node._now(), node._now(), b"frame")
+            node._on_round()
+
+            assert seen["mirror_active"] is True
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_the_status_carries_the_mirror_fields(self):
+        import json
+
+        node, rclpy = self.node()
+        try:
+            node._on_mirror_state(self.state('{"state": "STANDBY"}'))
+            captured = {}
+            node._status.publish = lambda message: captured.setdefault("data", message.data)
+            node._publish_status()
+
+            status = json.loads(captured["data"])
+
+            assert status["mirror_state"] == "STANDBY"
+            assert status["mirror_active"] is False
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
