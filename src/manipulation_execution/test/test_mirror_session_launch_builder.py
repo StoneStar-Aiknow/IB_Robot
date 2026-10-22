@@ -213,6 +213,47 @@ class TestGenerateNodes:
         assert _node_parameters(session)["publish_enabled"] is True
 
 
+class TestVoiceNode:
+    """The voice node's parameters, including the utterance topic the visual
+    interaction feature added to the shared section: it travels inside
+    ``voice_json``, checked by the contract both sides read."""
+
+    def config_with_voice(self, **voice):
+        config = _config()
+        # deployment is what _voice_tts_unmet checks beyond the defaults; an
+        # empty one is how the real configs keep the voice off.
+        config["voice_tts"] = {"enabled": True, "deployment": "/opt/zipvoice"}
+        config["mirror_session"]["voice"] = {"enabled": True, "queue_max": 8, **voice}
+        return config
+
+    def voice_parameters(self, config):
+        actions = generate_mirror_session_nodes(config)
+        voice = next(
+            node for node in actions if isinstance(node, Node) and node._Node__node_executable == "mirror_voice_node"
+        )
+        return _node_parameters(voice)
+
+    def test_an_utterance_topic_reaches_the_voice_node(self):
+        parameters = self.voice_parameters(self.config_with_voice(utterance_topic="/visual_interaction/utterance"))
+
+        assert json.loads(parameters["voice_json"])["utterance_topic"] == "/visual_interaction/utterance"
+
+    def test_without_the_key_the_node_gets_today_s_behaviour(self):
+        parameters = self.voice_parameters(self.config_with_voice())
+
+        assert json.loads(parameters["voice_json"])["utterance_topic"] == ""
+
+    def test_a_wrong_voice_section_still_launches_the_mirror(self):
+        """Voice is an extra: a section the contract refuses means no voice
+        node and a WARNING, never a failed launch."""
+        actions = generate_mirror_session_nodes(self.config_with_voice(utterance_topic="visual_interaction/utterance"))
+
+        assert not any(
+            isinstance(node, Node) and node._Node__node_executable == "mirror_voice_node" for node in actions
+        )
+        assert len(actions) == 2  # the session node and its release handler
+
+
 class TestGenerateNodesValidation:
     """The builder's config checks, migrated verbatim: each failure names
     the offending key instead of starting a half-wired node."""
