@@ -5,9 +5,9 @@
 # mirror_start/mirror_stop because the mirror runs in model_inference; preset
 # named motions stay switched off (same reason as the base).
 #
-# publish_enabled stays false: the session takes over policy_stream and every
-# command it would send lands on /mirror_session/arm_command_preview until the
-# deployment explicitly enables publishing.
+# publish_enabled is true for the bench deployment, so a round drives the upper
+# body. Set it to false to let the session take over policy_stream while every
+# command it would send lands on /mirror_session/arm_command_preview instead.
 robot:
   base_config: aimdk_x2_magicmirror.yaml
   name: aimdk_x2_mirror_voice
