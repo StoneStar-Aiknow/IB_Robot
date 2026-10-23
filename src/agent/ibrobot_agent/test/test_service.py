@@ -125,6 +125,7 @@ class FakeExecution:
         presentation_callback,
         submission_callback,
         stop_event,
+        continues_from_execution_id="",
     ):
         from ibrobot_agent.contracts import ExecutionResult, Presentation, TaskRef
 

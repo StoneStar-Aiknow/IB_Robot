@@ -209,13 +209,24 @@ class _Events:
 class _Gateway:
     """Cancels each Program after ``stop_after`` steps and keeps a Gateway-style ledger."""
 
-    def __init__(self, stop_after):
+    def __init__(self, stop_after, *, resumable=False):
         self.stop_after = list(stop_after)
+        self.resumable = resumable
         self.programs: list[list[str]] = []
+        self.continues_from: list[str] = []
         self.ledger: dict[str, dict] = {}
         self.lookup_error: Exception | None = None
 
-    def execute(self, proposal, *, expected_registry_identity, presentation_callback, submission_callback, stop_event):
+    def execute(
+        self,
+        proposal,
+        *,
+        expected_registry_identity,
+        presentation_callback,
+        submission_callback,
+        stop_event,
+        continues_from_execution_id="",
+    ):
         steps = proposal.outcome.steps
         task_ref = TaskRef(f"task-{len(self.programs)}", "plan", "digest", "epoch", 1, "digest", len(steps))
         presentation_callback(
@@ -224,6 +235,7 @@ class _Gateway:
         submission_callback(task_ref, {})
         names = [step.skill_name for step in steps]
         self.programs.append(names)
+        self.continues_from.append(continues_from_execution_id)
         request_id = proposal.request.request_id
         execution_id = f"exec-{request_id}"
         completed = self.stop_after.pop(0) if self.stop_after else len(names)
@@ -234,6 +246,8 @@ class _Gateway:
             "state": state,
             "completed_step_count": completed,
             "canonical_steps": _steps(*names),
+            "step_resumable": state == "CANCELED" and self.resumable,
+            "step_progress": 0.4 if state == "CANCELED" and self.resumable else 0.0,
         }
         detail = {"submitted": True, "execution_id": execution_id, "state": state, "completed_step_count": completed}
         if state == "CANCELED":
@@ -249,10 +263,19 @@ class _Gateway:
         return self.ledger.get(request_id, {"found": False})
 
 
-def _service(tmp_path, gateway):
+class _CountingPlanner(RulePlanner):
+    def __init__(self):
+        self.calls = 0
+
+    def plan(self, request, context, catalog, cancel_token):
+        self.calls += 1
+        return super().plan(request, context, catalog, cancel_token)
+
+
+def _service(tmp_path, gateway, *, planner=None):
     events = _Events()
     service = AgentService(
-        planner=RulePlanner(),
+        planner=planner or RulePlanner(),
         catalog=_Catalog(),
         store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
         execution=gateway,
@@ -353,5 +376,65 @@ def test_continue_only_sees_its_own_session(tmp_path):
 
         assert record.state == "ANSWERED"
         assert len(gateway.programs) == 1
+    finally:
+        service.close()
+
+
+def test_a_resumable_interrupted_step_is_announced_and_hinted_as_resumed():
+    gateway = {**_canceled(1), "step_resumable": True, "step_progress": 0.4}
+    decision = decide_continuation(
+        _record("CANCELLED", detail={"submitted": True, "execution_id": "exec-1"}), gateway=gateway
+    )
+
+    assert decision.hint["resume_progress"] == pytest.approx(0.4)
+    assert "1/3" in decision.message and "40%" in decision.message
+    assert not any(phrase in decision.message for phrase in STOP_PHRASES)
+
+
+def test_a_new_command_after_a_stop_abandons_the_interrupted_task(tmp_path):
+    gateway = _Gateway(stop_after=[1], resumable=True)
+    service, _events = _service(tmp_path, gateway)
+    try:
+        _say(service, "r1", THREE_STEPS)
+        assert _say(service, "r2", "点头").state == "SUCCEEDED"
+        answered = _say(service, "r3", "继续")
+
+        assert answered.state == "ANSWERED"
+        assert gateway.programs == [list(SKILLS), ["nod_yes"]]
+        assert gateway.continues_from == ["", ""]
+    finally:
+        service.close()
+
+
+def test_a_resumable_step_is_resubmitted_from_the_ledger_without_planning(tmp_path):
+    gateway = _Gateway(stop_after=[1], resumable=True)
+    planner = _CountingPlanner()
+    service, events = _service(tmp_path, gateway, planner=planner)
+    try:
+        _say(service, "r1", THREE_STEPS)
+        assert planner.calls == 1
+        record = _say(service, "r2", "继续")
+
+        assert record.state == "SUCCEEDED"
+        assert planner.calls == 1
+        assert gateway.programs[-1] == ["nod_yes", "shake_no"]
+        assert gateway.continues_from[-1] == "exec-r1"
+        proposal = json.loads(record.proposal_json)
+        assert proposal["planner_identity"]["route"] == "continuation_ledger_replay"
+        # The original text stays on the proposal, so a later "继续" chains from this request.
+        assert proposal["request"]["text"] == THREE_STEPS
+    finally:
+        service.close()
+
+
+def test_a_continuation_that_cannot_resume_is_still_planned(tmp_path):
+    gateway = _Gateway(stop_after=[1], resumable=False)
+    planner = _CountingPlanner()
+    service, _events = _service(tmp_path, gateway, planner=planner)
+    try:
+        _say(service, "r1", THREE_STEPS)
+        assert _say(service, "r2", "继续").state == "SUCCEEDED"
+        assert planner.calls == 2
+        assert gateway.continues_from[-1] == ""
     finally:
         service.close()

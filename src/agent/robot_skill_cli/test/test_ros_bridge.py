@@ -603,3 +603,45 @@ def test_get_execution_reports_gateway_ledger_progress():
     assert execution["completed_step_count"] == 1
     assert execution["stop_requested"] is True and execution["reconciled"] is False
     assert [step["skill_name"] for step in execution["canonical_steps"]] == ["wave_hello", "nod_yes"]
+
+
+def test_get_execution_reports_a_resumable_interrupted_step():
+    from ibrobot_msgs.msg import WorkflowStep
+    from ibrobot_msgs.srv import GetExecution
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._GetExecution = GetExecution
+    bridge._WorkflowStep = WorkflowStep
+    response = GetExecution.Response()
+    response.found, response.state = True, "CANCELED"
+    response.step_resumable, response.step_progress = True, 0.25
+    bridge._call_service = lambda _client, _request, **_kwargs: response
+
+    execution = bridge.get_execution(request_id="voice-1", execution_id="", timeout_sec=1.0)
+
+    assert execution["step_resumable"] is True
+    assert execution["step_progress"] == pytest.approx(0.25)
+
+
+def test_program_goal_names_the_execution_it_continues():
+    from ibrobot_msgs.action import ExecuteProgram
+    from ibrobot_msgs.msg import WorkflowStep
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._ExecuteProgram = ExecuteProgram
+    bridge._WorkflowStep = WorkflowStep
+    sent = []
+    bridge._program_client = SimpleNamespace(send_goal_async=lambda goal, **_kwargs: sent.append(goal))
+    registry = {"registry_epoch": "epoch", "registry_generation": 1, "registry_digest": "digest"}
+    steps = [{"schema_version": 1, "skill_name": "wave_hand"}]
+
+    bridge.send_program_goal(request_id="r1", workflow_steps=steps, registry=registry, task_budget_sec=30.0)
+    bridge.send_program_goal(
+        request_id="r2",
+        workflow_steps=steps,
+        registry=registry,
+        task_budget_sec=30.0,
+        continues_from_execution_id="exec-1",
+    )
+
+    assert [goal.continues_from_execution_id for goal in sent] == ["", "exec-1"]

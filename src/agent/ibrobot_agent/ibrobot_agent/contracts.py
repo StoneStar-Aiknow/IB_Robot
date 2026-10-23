@@ -659,7 +659,10 @@ class ExecutionPort(Protocol):
         presentation_callback: Callable[[Presentation], None],
         submission_callback: Callable[[TaskRef, Mapping[str, object]], None],
         stop_event: threading.Event,
-    ) -> ExecutionResult: ...
+        continues_from_execution_id: str = "",
+    ) -> ExecutionResult:
+        """``continues_from_execution_id`` names the execution whose interrupted step this resumes."""
+        ...
 
     def request_stop(self, request_key: RequestKey | None) -> None: ...
 

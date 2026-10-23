@@ -769,6 +769,7 @@ class RosBridge:
         registry: dict[str, Any],
         task_budget_sec: float,
         feedback_callback=None,
+        continues_from_execution_id: str = "",
     ):
         if self._ExecuteProgram is None or self._program_client is None:
             raise BridgeError("ROS_UNAVAILABLE", "program action client is not started", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -785,6 +786,7 @@ class RosBridge:
         goal.trace_id = request_id
         goal.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
         goal.task_budget_sec = float(task_budget_sec)
+        goal.continues_from_execution_id = str(continues_from_execution_id)
         if hasattr(goal, "caller_token"):
             goal.caller_token = self._caller_token
         try:
@@ -820,6 +822,9 @@ class RosBridge:
             "stop_requested": bool(response.stop_requested),
             "reconciled": bool(response.reconciled),
             "canonical_steps": [self._workflow_step_dict(step) for step in response.canonical_steps],
+            # Whether the interrupted step can continue from where it stopped, and how far it got.
+            "step_resumable": bool(response.step_resumable),
+            "step_progress": float(response.step_progress),
         }
 
     def get_execution_events(

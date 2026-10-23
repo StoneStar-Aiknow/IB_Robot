@@ -193,7 +193,16 @@ class _RosExecutionAdapter:
         self._active_stop_event: threading.Event | None = None
         self._active_task_id: str | None = None
 
-    def execute(self, proposal, *, expected_registry_identity, presentation_callback, submission_callback, stop_event):
+    def execute(
+        self,
+        proposal,
+        *,
+        expected_registry_identity,
+        presentation_callback,
+        submission_callback,
+        stop_event,
+        continues_from_execution_id="",
+    ):
         task_id = uuid.uuid4().hex
         with self._active_lock:
             self._active_stop_event = stop_event
@@ -206,6 +215,7 @@ class _RosExecutionAdapter:
                 presentation_callback=presentation_callback,
                 submission_callback=submission_callback,
                 stop_event=stop_event,
+                continues_from_execution_id=continues_from_execution_id,
             )
         finally:
             with self._active_lock:
@@ -232,6 +242,7 @@ class _RosExecutionAdapter:
         presentation_callback,
         submission_callback,
         stop_event: threading.Event,
+        continues_from_execution_id: str = "",
     ) -> ExecutionResult:
         expected_identity = (
             expected_registry_identity.epoch,
@@ -252,6 +263,7 @@ class _RosExecutionAdapter:
                 expected_registry_digest=expected_identity[2],
                 workflow_steps=steps,
                 task_budget_sec=self._task_budget_sec,
+                continues_from_execution_id=continues_from_execution_id,
             )
             presentation = _presentation_from_mapping(
                 {
@@ -309,6 +321,7 @@ class _RosExecutionAdapter:
                         "registry_digest": expected_identity[2],
                     },
                     task_budget_sec=self._task_budget_sec,
+                    continues_from_execution_id=continues_from_execution_id,
                 )
                 if not self._wait_future(goal_future, self._rpc_timeout_sec, stop_event):
                     if stop_event.is_set():

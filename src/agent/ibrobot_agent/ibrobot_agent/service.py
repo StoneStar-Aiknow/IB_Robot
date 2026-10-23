@@ -14,12 +14,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
+from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.continuation import (
     CONTINUE_REFUSED,
     ContinuationDecision,
     decide_continuation,
     is_continue_request,
     needs_gateway,
+    resume_execution_id,
     select_anchor,
 )
 from ibrobot_agent.contracts import (
@@ -32,6 +34,7 @@ from ibrobot_agent.contracts import (
     ExecutionPort,
     ExecutionResult,
     Planner,
+    PlannerIdentity,
     PlannerOutcome,
     PlanProposal,
     PresentationPort,
@@ -46,6 +49,17 @@ from ibrobot_agent.planner import RulePlanner, read_only_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _trace = create_trace_logger("ib_trace.agent")
+
+# Proposals that resume an interrupted step from the Gateway ledger were not
+# planned by a model; the proposal snapshot says so.
+LEDGER_REPLAY_IDENTITY = PlannerIdentity(
+    route="continuation_ledger_replay",
+    returned_model="none",
+    protocol="gateway-canonical-steps-v1",
+    prompt_version="none",
+    schema_version="1",
+    config_digest="none",
+)
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -363,6 +377,7 @@ class AgentService:
                 "messages": self._conversation.context(request),
                 "clarification": clarification,
             }
+            replayed: PlannerOutcome | None = None
             if request.reply_to_request_id is None and is_continue_request(request.text):
                 decision = self._resolve_continuation(request)
                 if decision.text is None:
@@ -384,8 +399,18 @@ class AgentService:
                 self._emit(key, "continuation", "PLANNING", decision.message, detail={"continuation": decision.hint})
                 planned_request = dataclasses.replace(request, text=decision.text)
                 planner_context["continuation"] = dict(decision.hint)
-            query = read_only_outcome(planned_request.text)
-            if query is not None:
+                if decision.steps:
+                    replayed = _ledger_replay_outcome(decision.steps)
+                    self._store.record_event(
+                        key,
+                        event_type="continuation_replayed",
+                        state="PLANNING",
+                        detail_json=json.dumps({"step_count": len(replayed.steps)}, sort_keys=True),
+                    )
+            query = None if replayed is not None else read_only_outcome(planned_request.text)
+            if replayed is not None:
+                outcome = replayed
+            elif query is not None:
                 outcome = query
             else:
                 with trace_stage(_trace, "agent.planner", request_id=request.request_id):
@@ -426,7 +451,7 @@ class AgentService:
                 planning_generation=record.planning_generation,
                 catalog_identity=identity,
                 outcome=outcome,
-                planner_identity=self._planner.identity,
+                planner_identity=LEDGER_REPLAY_IDENTITY if replayed is not None else self._planner.identity,
             )
             record = self._store.mark_proposal_ready(key, expected_generation=record.planning_generation)
             self._store.record_event(
@@ -451,6 +476,7 @@ class AgentService:
                         key, record.planning_generation, task_ref, detail
                     ),
                     stop_event=cancel_token,
+                    continues_from_execution_id=resume_execution_id(planner_context.get("continuation"), outcome.steps),
                 )
             if execution_result.status == "unknown":
                 current = self._store.get_request(key)
@@ -780,3 +806,10 @@ class AgentService:
                 # The ledger is authoritative; a broken transport must not reopen
                 # the request through the outer failure handler.
                 _LOGGER.exception("Could not publish Agent event for %s", key.request_id)
+
+
+def _ledger_replay_outcome(steps) -> PlannerOutcome:
+    """The workflow that resumes an interrupted step: the Gateway's canonical steps, not a plan."""
+    canonical = normalize_workflow_steps(list(steps))
+    summary = "、".join(step.skill_name for step in canonical)
+    return PlannerOutcome(kind="workflow", user_message=f"从中断处继续：{summary}。", summary=summary, steps=canonical)

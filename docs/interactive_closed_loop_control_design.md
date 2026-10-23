@@ -66,7 +66,7 @@ uncertain-motion code，CLI/控制器保留该原始 code 并以 unknown 状态/
 ## 5. 继续语义
 
 当前 `ExecuteAgentPlan.action` 只返回 `completed_step_count` 遥测，没有 prior-task identity、停止证明或
-server-owned continuation admission。客户端直接执行
+server-owned continuation admission（Gateway 的步内续做准入只在 `ExecuteProgram` 上，见 5.1）。客户端直接执行
 `prior_steps[completed_step_count:]` 会把遥测误当授权，并可通过新 task ID 绕过 Gateway。
 
 因此当前契约为：
@@ -86,11 +86,15 @@ server-owned continuation admission。客户端直接执行
 
 - 停止证明来自两本服务端账本——Agent 请求账本的终态，以及 Gateway `GetExecution` 返回的 `CANCELED`、一致的
   execution ID 和 `completed_step_count`；任一不确定即拒绝（`CONTINUE_REFUSED`），不产生运动；
-- 不切片旧 plan：Agent 把原始指令与进度交给规划器重新规划未完成部分，被打断的那一步从头重做；VLM Planner
+- 不切片旧 plan（步内续做例外，见本节末条）：Agent 把原始指令与进度交给规划器重新规划未完成部分，被打断的那一步从头重做；VLM Planner
   依据进度提示自行规划，离线 RulePlanner（仅仿真/测试）对原文重新规划后按累计 `completed_step_count` 去掉
   已完整完成的前 N 步——截取的是新规划结果，不是旧 plan；
 - 结果是使用新 request ID 的全新 Program，照常经过 presentation、白名单、Gateway 与 `safety_guard`；
-- Gateway 契约（`ExecuteProgram` / `GetExecution`）不变，Gateway 内部不做续跑。
+- 例外是步内续做：被打断步的执行器留下了断点（`GetExecution.step_resumable`，目前只有 X2 `stream` 模式下回放的
+  手势）时，Agent 不调用规划器，直接提交 Gateway 账本中从该步开始的规范步骤，并用
+  `ExecuteProgram.continues_from_execution_id` 引用被打断的执行。续做由 Gateway 准入（同一 caller/robot、该机器人
+  最近一次执行、`CANCELED` 且有断点、第 0 步与被打断步规范化一致，否则 `RESUME_CHECKPOINT_INVALID`），断点是否
+  仍有效由出具它的运行时判定；其余技能仍按上面的方式重新规划。
 
 检视或后续修改时不要把这条路径当作“用新 task ID 绕过 Gateway 的断点续跑”处理。实现与限制见
 [`ibrobot_agent` README](../src/agent/ibrobot_agent/README.md)「继续」一节。

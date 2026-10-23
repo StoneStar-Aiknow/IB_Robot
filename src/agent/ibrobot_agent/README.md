@@ -210,8 +210,8 @@ Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robo
    与 Agent 记录一致，并取 `completed_step_count` 与 `canonical_steps`。
 
 只有确认安全取消（或尚未提交就停止）才继续：Agent 用原始文本和“已完整完成 N/M 步、第 N+1 步需重做”的提示
-**重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划，Gateway 照常
-校验。播报“上次任务已完整完成 N/M 步，现在继续剩余部分。”（播报时请求可被中断，故不含停止词）。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
+**重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划（被打断步可续做时
+例外，见下文「步内续做」），Gateway 照常校验。播报“上次任务已完整完成 N/M 步，现在继续剩余部分。”（播报时请求可被中断，故不含停止词）。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
 规划阶段取消、Gateway 查询失败或两本账不一致一律拒绝（`CONTINUE_REFUSED`），不产生任何运动。
 
 这是已确认的语义。`robot_skill_cli` README 与 `ibrobot-control` skill 中“不得切片旧步骤、拒绝 `--resume`”约束的是
@@ -221,8 +221,17 @@ Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robo
 对原文重新规划后，按累计 `completed_step_count` 去掉已完整完成的前 N 步（`steps[N:]`）。后者是对**新规划结果**
 按计数截取，不复用旧 plan，生成的 Program 同样经过 presentation、白名单与 Gateway 校验。
 
-限制：`completed_step_count` 是下界——Gateway 不记录步内进度，被打断的那一步会从头重做，非幂等技能（如
-已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
+**步内续做**：Gateway 报告被打断的那一步可续做（`step_resumable`，目前只有 X2 在 `stream` 模式下回放的手势）
+时，「继续」**不调用规划器**：Agent 直接把 Gateway 账本里从被打断步开始的规范步骤
+（`canonical_steps[completed_step_count:]`）作为新 Program 提交，带 `continues_from_execution_id`，该步从停下处
+接着做（Gateway 与运行时会再次校验，失效则从头做）。这些步骤仍经过白名单、catalog 与 schema 版本校验；proposal
+的 `planner_identity.route` 为 `continuation_ledger_replay`，请求账本记 `continuation_replayed` 事件。播报“上次任务被
+打断的动作已做到 40%，现在从中断处接着做。”。X2 实测「继续」到手臂开始动由约 5.7 s（规划）降到亚秒级。
+不可续做的「继续」（步间停下、断点失效、尚未提交即停止）仍按原话重新规划。停止后若
+先下了别的指令，「继续」指向的是那条新指令，被打断的任务即作废。
+
+限制：其他技能的 `completed_step_count` 是下界——Gateway 不记录它们的步内进度，被打断的那一步会从头重做，
+非幂等技能（如已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
 `session_idle_sec`（默认 120 秒）无活动后换新会话即无可继续的任务。连续“停—继续—停—继续”时，
 已完成步骤跨请求累计。
 
