@@ -911,3 +911,102 @@ class TestTheVisitFollowsTheMirror:
         finally:
             node.destroy_node()
             rclpy.shutdown()
+
+
+class TestChatterYieldsToSynthesis:
+    """A chatter round does not look while the voice is synthesizing.
+
+    Both models share the NPU, and together they starved the mirror's pose
+    model. Playback does not use the NPU, so it does not stop a round.
+    """
+
+    VOICE_TOPIC = "/mirror_voice/status"
+
+    def node(self):
+        return mirror_node(mode="chatter", voice_status_topic=self.VOICE_TOPIC)
+
+    def voice(self, node, **fields):
+        import json
+
+        from std_msgs.msg import String
+
+        payload = {"speaking": False, "in_flight": None, "queue": 0, **fields}
+        node._on_voice_status(String(data=json.dumps(payload)))
+
+    def looked(self, node) -> list:
+        calls = []
+        original = node._session.hooks.vision.observe
+
+        def recording(round_inputs):
+            calls.append(round_inputs.now)
+            return original(round_inputs)
+
+        node._session.hooks.vision.observe = recording
+        return calls
+
+    def round(self, node):
+        from std_msgs.msg import String
+
+        node._on_mirror_state(String(data='{"state": "MIRRORING"}'))
+        node._buffer.put(node._now(), node._now(), b"frame")
+        node._on_round()
+
+    def test_a_synthesis_in_flight_skips_the_look(self):
+        node, rclpy = self.node()
+        try:
+            calls = self.looked(node)
+            self.voice(node, speaking=True, in_flight="synthesis", queue=1)
+
+            self.round(node)
+
+            assert calls == []
+            assert node._counts.get("skip_voice_synthesis") == 1
+            assert node._rounds == 0
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_playback_does_not(self):
+        node, rclpy = self.node()
+        try:
+            calls = self.looked(node)
+            self.voice(node, speaking=True, in_flight="playback")
+
+            self.round(node)
+
+            assert len(calls) == 1
+            assert "skip_voice_synthesis" not in node._counts
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_a_stale_synthesis_does_not(self):
+        """A voice that went quiet mid-synthesis must not stop the looking for good."""
+        node, rclpy = self.node()
+        try:
+            calls = self.looked(node)
+            self.voice(node, in_flight="synthesis")
+            node._voice_status_at -= node._value("voice_status_stale_sec") + 1.0
+
+            self.round(node)
+
+            assert len(calls) == 1
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
+
+    def test_the_next_round_looks_once_the_synthesis_is_done(self):
+        node, rclpy = self.node()
+        try:
+            calls = self.looked(node)
+            self.voice(node, in_flight="synthesis")
+            self.round(node)
+            self.voice(node)
+
+            self.round(node)
+
+            assert len(calls) == 1
+            assert node._counts.get("skip_voice_synthesis") == 1
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()

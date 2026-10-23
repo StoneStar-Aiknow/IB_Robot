@@ -287,6 +287,7 @@ class VisualInteractionNode(Node):
 
         self._chatter: Chatter | None = None
         self._voice_busy_now = False
+        self._voice_synthesizing_now = False
         self._voice_status_at: float | None = None
         self._last_phrase: str | None = None
         if self._mode == "chatter":
@@ -551,12 +552,19 @@ class VisualInteractionNode(Node):
         self._voice_busy_now = (
             bool(payload.get("speaking")) or bool(payload.get("in_flight")) or (int(payload.get("queue") or 0) > 0)
         )
+        self._voice_synthesizing_now = payload.get("in_flight") == "synthesis"
         self._voice_status_at = self._now()
 
+    def _voice_heard(self, now: float) -> bool:
+        return self._voice_status_at is not None and now - self._voice_status_at <= float(
+            self._value("voice_status_stale_sec")
+        )
+
     def _voice_busy(self, now: float) -> bool:
-        if self._voice_status_at is None or now - self._voice_status_at > float(self._value("voice_status_stale_sec")):
-            return False
-        return self._voice_busy_now
+        return self._voice_heard(now) and self._voice_busy_now
+
+    def _voice_synthesizing(self, now: float) -> bool:
+        return self._voice_heard(now) and self._voice_synthesizing_now
 
     def _chatter_round(self, window: Window, actor: ActorSignal, now: float) -> None:
         """One chatter round: look, remember what was named, speak when due."""
@@ -565,6 +573,16 @@ class VisualInteractionNode(Node):
         if not self._mirror_active(now):
             chatter.due(now, False)
             self._count(SUPPRESS_MIRROR_INACTIVE)
+            return
+        # Looking while the voice is being synthesized put both models on the
+        # 310P's NPU at once, and the pose model in the mirror's path fell
+        # behind: on the board (10-23) the arm's stalls and jumps gathered in
+        # the seconds where the two overlapped, and were rare with either
+        # alone. The pose model never yields; this round does, and the next
+        # one looks again. A synthesis that starts during a round still
+        # overlaps it, as the status arrives about once a second.
+        if self._voice_synthesizing(now):
+            self._count("skip_voice_synthesis")
             return
 
         phrase = self._session.hooks.vision.observe(
