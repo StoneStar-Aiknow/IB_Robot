@@ -103,7 +103,7 @@ from std_srvs.srv import SetBool, Trigger
 
 from embodied_common.mirror_session_contract import NODE_NAME, STATE_PERIOD_SEC, STATE_TOPIC
 from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
-from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode
+from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from manipulation_execution.mirror_session.business import build_hooks, load_business_config
 from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, RELEASE_INTERFACES, resolve_endpoints
@@ -149,6 +149,9 @@ class RosRuntimePort:
         self._set = node.create_client(
             SetRuntimeMode, endpoints["runtime.set_mode"].endpoint, callback_group=callback_group
         )
+        self._stop = node.create_client(
+            StopRuntime, endpoints["runtime.stop"].endpoint, callback_group=callback_group
+        )
         self.spin_once = None
 
     def get_status(self, timeout_s: float) -> RuntimeObservation | None:
@@ -161,6 +164,13 @@ class RosRuntimePort:
         response = self._call(self._set, SetRuntimeMode.Request(mode=mode), timeout_s)
         if response is None:
             return False, "runtime set_mode unavailable or timed out"
+        return bool(response.success), response.message
+
+    def stop(self, policy: str, timeout_s: float) -> tuple[bool, str]:
+        """Cancel the platform's running action so a release can follow (MOTION_BUSY)."""
+        response = self._call(self._stop, StopRuntime.Request(policy=policy), timeout_s)
+        if response is None:
+            return False, "runtime stop unavailable or timed out"
         return bool(response.success), response.message
 
     def _wait(self, done, deadline: float) -> bool:

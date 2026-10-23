@@ -71,6 +71,8 @@ class RuntimePort(Protocol):
 
     def set_mode(self, mode: str, timeout_s: float) -> tuple[bool, str]: ...
 
+    def stop(self, policy: str, timeout_s: float) -> tuple[bool, str]: ...
+
 
 def assess(
     observation: RuntimeObservation | None, identity: Mapping | None, max_age_s: float = STATUS_MAX_AGE_S
@@ -133,6 +135,22 @@ RELEASE_RETRY_S = 0.3
 RELEASE_MAX_ATTEMPTS = 4
 
 
+def _busy_refusal(message: str) -> bool:
+    """True when the platform refused the mode switch because it is still playing."""
+    lowered = message.lower()
+    return "motion_busy" in lowered or "busy" in lowered or "\u6b63\u5728\u64ad\u653e" in message
+
+
+def _clip_outcome_message(message: str, limit: int = 240) -> str:
+    """Keep a release failure inside the Agent contract's 300-character field.
+
+    The Agent rejects a terminal message longer than 300 characters, and a
+    refused release message repeats the platform answer per attempt; the whole
+    request then ends UNKNOWN and the robot scope stays quarantined.
+    """
+    return message if len(message) <= limit else message[: limit - 3] + "..."
+
+
 def release_to_idle(
     port: RuntimePort,
     policy_mode: str,
@@ -169,32 +187,43 @@ def release_to_idle(
             return ReleaseOutcome(True, sent, "runtime already idle" + history())
         if status.stop_latched:
             return ReleaseOutcome(
-                False, sent, "runtime stop is latched; idle is never requested over a latch" + history()
+                False, sent, _clip_outcome_message("runtime stop is latched; idle is never requested over a latch" + history())
             )
         if status.active_mode != policy_mode:
             message = f"runtime mode {status.active_mode!r} is not {policy_mode!r}; not ours to release"
-            return ReleaseOutcome(False, sent, message + history())
+            return ReleaseOutcome(False, sent, _clip_outcome_message(message + history()))
         if held():
-            return ReleaseOutcome(False, sent, "a later start holds the mode; idle not requested" + history())
+            return ReleaseOutcome(False, sent, _clip_outcome_message("a later start holds the mode; idle not requested" + history()))
         return None
 
     outcome = unreleasable(port.get_status(remaining()))
     if outcome is not None:
         return outcome
     sleep(min(RELEASE_DRAIN_S, remaining()))
+    stop_requested = False
     while True:
         outcome = unreleasable(port.get_status(remaining()))
         if outcome is not None:
             return outcome
         success, message = port.set_mode(IDLE, remaining())
+        if not success and not stop_requested and _busy_refusal(message) and hasattr(port, "stop"):
+            # The platform refuses STAND_DEFAULT while an action it dispatched is
+            # still playing. HOLD cancels that action; the idle request that
+            # follows clears the stop latch, so the release can go through.
+            stop_requested = True
+            stop_ok, stop_message = port.stop("HOLD", remaining())
+            attempts.append(f"{clock() - started:.2f} s stop(HOLD) {'accepted' if stop_ok else 'refused'}: {stop_message}")
+            success, message = port.set_mode(IDLE, remaining())
         attempts.append(f"{clock() - started:.2f} s {'accepted' if success else 'refused'}: {message}")
         if success:
             break
         if len(attempts) >= RELEASE_MAX_ATTEMPTS or remaining() < RELEASE_RETRY_S:
-            return ReleaseOutcome(False, True, f"idle request refused {len(attempts)} times: {message}" + history())
+            return ReleaseOutcome(
+                False, True, _clip_outcome_message(f"idle request refused {len(attempts)} times: {message}" + history())
+            )
         sleep(RELEASE_RETRY_S)
     after = port.get_status(remaining())
     if after is None or after.active_mode != IDLE:
         mode = None if after is None else after.active_mode
-        return ReleaseOutcome(False, True, f"idle requested but runtime reports {mode!r}" + history())
+        return ReleaseOutcome(False, True, _clip_outcome_message(f"idle requested but runtime reports {mode!r}" + history()))
     return ReleaseOutcome(True, True, "runtime returned to idle" + history())

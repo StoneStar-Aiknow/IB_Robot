@@ -18,12 +18,15 @@ _SHAPES = {
     "runtime.status": ("topic", "publish", "ibrobot_msgs/msg/RuntimeStatus"),
     "runtime.get_status": ("service", "serve", "ibrobot_msgs/srv/GetRuntimeStatus"),
     "runtime.set_mode": ("service", "serve", "ibrobot_msgs/srv/SetRuntimeMode"),
+    "runtime.stop": ("service", "serve", "ibrobot_msgs/srv/StopRuntime"),
     "joint.state": ("topic", "publish", "sensor_msgs/msg/JointState"),
     "joint.arm_stream": ("topic", "subscribe", "std_msgs/msg/Float64MultiArray"),
     "joint.hand_stream": ("topic", "subscribe", "std_msgs/msg/Float64MultiArray"),
 }
-# What the one-shot release needs: it only ever calls set_mode.
-RELEASE_INTERFACES = ("runtime.get_status", "runtime.set_mode")
+# What the one-shot release needs: set_mode for the release itself, and stop
+# because the platform refuses STAND_DEFAULT while an action is still playing
+# (MOTION_BUSY); HOLD clears it and the following idle request clears the latch.
+RELEASE_INTERFACES = ("runtime.get_status", "runtime.set_mode", "runtime.stop")
 _CHANNELS = {"joint.arm_stream": ARM_JOINT_COUNT, "joint.hand_stream": HAND_JOINT_COUNT}
 
 
