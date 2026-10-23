@@ -393,3 +393,61 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 `/mirror_session/status` 的 `state/phase`（`WAIT/none` = 空闲，`STANDBY/ready` = 等待人进入画面，
 `MIRRORING/running` = 正在跟随）。轮次靠“人在头部相机画面里且距离够近”，侧身或太远会以
 `no_actor` 收尾。
+
+## 14. 自我介绍技能（录音回放，2026-10-23 落地）
+
+团队 10-21 的决定：自我介绍稿不再走 ZipVoice 合成（长文本会丢结尾、分块拼接有接缝），
+改为**预先录音 + 按固定音频回放**，并且要**固化成 embodied 技能**，不在语音桥里硬编码。
+
+### 14.1 组成
+
+| 环节 | 实现 |
+|---|---|
+| 技能定义 | `skill_catalog/config/skills/self_introduction/{manifest.yaml, SKILL.md, implementations/x2_runtime_v1.yaml}` |
+| 执行器 | 新增 delegated executor `runtime_play_audio`（`embodied_common/skill_templates.py` 注册；`skill_executor_node.py` 的 `_execute_play_audio_skill`） |
+| 绑定 | catalog 只写 `binding.clip: self_intro`；文件路径由部署 profile 的 `embodied.runtime_play_audio.clips` 解析 |
+| 播放服务 | `/voice_tts/play`（`ibrobot_msgs/srv/PlayAudioFile`，路径必须是板子上存在的 wav） |
+| ASR 静音 | 播放前发 `/voice_control` `stop`，播完发 `start`（`asr_control_topic` 可配） |
+| 不报幕 | 语音桥新增 `silent_skills`：计划里每一步都是它时，不念“正在执行：X。”也不念“执行完成。”（失败仍报） |
+| CLI 侧 | `robot_skill_cli/catalog.py` 同步注册该执行器，否则 daemon 会报 `delegated executor is not registered` |
+
+### 14.2 换音频 / 加技能
+
+- 换音频：直接替换板子上 `/root/workspace/lyx/IB_Robot_hz/assets/audio/self_introduction.wav`
+  （单声道、当前 32 kHz / 34.5 s / 2.2 MB），重启栈即可；clip 名不用改。
+- 加第二段录音：在 profile 的 `embodied.runtime_play_audio.clips` 里加 `另一名字: /绝对路径`，
+  复制一份 skill 目录并把 `binding.clip` 改成该名字。
+
+### 14.3 实测与已知
+
+- 真机实测：`自我介绍` → 规划 → 安全放行 → 播放 **35.2–35.4 s** → SUCCEEDED；
+  第三次起日志里没有任何 `[say]`（前后都不再念话）。
+- **音频文件不入库**（2.2 MB 二进制），只保留路径约定；部署时从 `assets/audio/` 放置。
+- 技能装在 `aimdk_x2_all` 目录（不是 `aimdk_x2_skills`）：后者没有启用 `voice_tts`，
+  放进去会让纯手势部署因缺少播放服务而启动失败。
+
+## 15. 镜子“卡顿”的实测结论（2026-10-23 下午）
+
+现象：照镜子过程中机械臂会“僵住—猛地跟上”，说话时更明显。排查方法与会话内工具：
+`/root/workspace/lyx/tools/mirror_monitor.py`（每 2 s 采样 preview 增量、`age_ms`、每进程 CPU、`core_busy`）。
+
+关键数据（同一块板、同一轮次）：
+
+| 指标 | 实测 |
+|---|---|
+| preview 每 2 s 发布增量 | 中位 **0**，80 个窗口里 **47 个为 0**，峰值 250 |
+| `age_ms`（retarget 看到的姿态年龄） | 中位 365 ms，峰值 **1959–3121 ms** |
+| retarget 自身耗时 | p50 **32.8 ms**（不是瓶颈） |
+| PEAR 服务单次往返 | **110–190 ms**（`inference_time_ms` 只 32–39 ms） |
+| YOLOX 服务单次往返 | **275–386 ms**（推理 185–218 ms），每秒插一次 |
+| 相机 | 2688×1944 @21.7 Hz（已是“半分辨率”） |
+| 把图缩到 1344×972 / 672×486 | 往返时间几乎不变 → 开销在**服务往返与排队**，不在图像大小 |
+| 整机 CPU | 16 核平均 **41%**（中位 36%、峰值 77%），远未饱和 |
+
+结论：
+1. 感知链路的上限就是 **5–7 Hz 且抖动**，`mock_playback.input_staleness_sec=0.5` 会在超过 0.5 s 的
+   间隔里让 retarget 直接停发，于是“停—爆发”。
+2. 回退三处配置（镜子自己的 voice 关、`rpc_timeout_sec` 2.0、`demo.yaml`）**没有改善**
+   零窗口比例（62% → 59%），所以不是配置问题。
+3. 可行方向（未实施）：在 50 Hz 输出端对姿态做**线性插值**（5–7 Hz 关键帧 → 连续轨迹）；
+   把 YOLOX 刷新从 1 s 放宽到 2 s 以减少插队；缩小相机分辨率只降低 CPU，不能改善往返。
