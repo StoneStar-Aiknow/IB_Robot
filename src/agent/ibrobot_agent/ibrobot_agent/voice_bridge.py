@@ -38,7 +38,7 @@ _ACTIVE_ASR_STATES = {"listening", "recognizing"}
 #: A refusal can contain a confirm word ("不执行" has 执行, "我不确定" has 确定); it must never
 #: acknowledge a plan. "没" is left out on purpose: "没问题" is consent.
 _NEGATION_MARKERS = ("不", "别")
-_PHRASE_FIELDS = ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases")
+_PHRASE_FIELDS = ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "silent_skills")
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,9 @@ class VoiceBridgeConfig:
     # Spoken while a request runs and the microphone stays open for stop words, so it must not
     # contain one (the bridge would hear itself and stop the robot).
     busy_message: str = "我正在执行上一个任务，请稍等。"
+    # Skills whose output is speech itself: announcing the plan and then saying
+    # "执行完成。" would talk over the clip they play.
+    silent_skills: tuple[str, ...] = ()
     # Domain term -> homophones the ASR model prefers (e.g. 夹爪 jiā zhǎo is heard as 家找/家长).
     text_corrections: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
@@ -179,6 +182,8 @@ class _BridgeState:
     # later partials and its final transcript belong to that stop. Cleared by every final.
     utterance_stopped: bool = False
     clarification_request_id: str = ""
+    # The running request belongs to a silent skill: its plan and completion are not spoken.
+    silent_request_id: str = ""
     pending: _PendingConfirmation | None = None
 
 
@@ -286,6 +291,7 @@ class VoiceBridgeCore:
         if request_id not in self._state.known_request_ids:
             return []
         self._state.last_activity = now
+        silent = self._silent(request_id)
         if payload.get("accepted") is False or payload.get("state") in TERMINAL_REQUEST_STATES:
             # A rejected admission is also emitted as a terminal event; speak only once.
             if not self._finish(request_id):
@@ -293,6 +299,8 @@ class VoiceBridgeCore:
             message = str(payload.get("message", "")).strip()
             reason = payload.get("reason_code", "")
             spoken = self.config.busy_message if reason == "BUSY" else _spoken_reply(payload.get("state"), message)
+            if silent:
+                spoken = ""
             return [Log(f"request {request_id} not admitted: {reason} {message}"), *self._say(spoken)]
         return []
 
@@ -310,12 +318,14 @@ class VoiceBridgeCore:
             # The Agent resolved "继续" against its ledgers; tell the user what resumes.
             message = str(payload.get("user_message", "")).strip()
             return [Log(f"request {request_id} continuation: {message}"), *self._say(message)]
+        silent = self._silent(request_id)
         if state not in TERMINAL_REQUEST_STATES or not self._finish(request_id):
             return []
         if event_type == "needs_clarification":
             self._state.clarification_request_id = request_id
         message = str(payload.get("user_message", "")).strip()
-        return [Log(f"request {request_id} {event_type} {state}: {message}"), *self._say(_spoken_reply(state, message))]
+        spoken = "" if silent else _spoken_reply(state, message)
+        return [Log(f"request {request_id} {event_type} {state}: {message}"), *self._say(spoken)]
 
     def tick(self, now: float) -> list[Action]:
         state = self._state
@@ -366,6 +376,11 @@ class VoiceBridgeCore:
             return [Log(f"presentation digest mismatch for {request_id}; not acknowledging")]
         summary = _presentation_summary(presentation, payload.get("user_message", ""))
         plan_log = Log("exact plan " + json.dumps(presentation, ensure_ascii=False, sort_keys=True))
+        if self._is_silent_presentation(presentation):
+            # The skill plays a recorded clip: the clip is the reply, so neither the plan nor
+            # the completion may be spoken over it.
+            self._state.silent_request_id = request_id
+            return [plan_log]
         if detail.get("async_display") is True or presentation.get("execution_mode") == ASYNC_PRESENTATION_MODE:
             # Typed Programs execute without waiting for any client: there is no receipt to give, and
             # asking for a confirmation that cannot hold the robot back would mislead the user.
@@ -430,9 +445,26 @@ class VoiceBridgeCore:
             self._state.active_request_id = ""
         if self._state.timed_out_request_id == request_id:
             self._state.timed_out_request_id = ""
+        if self._state.silent_request_id == request_id:
+            self._state.silent_request_id = ""
         if self._state.pending is not None and self._state.pending.request_id == request_id:
             self._state.pending = None
         return True
+
+    def _silent(self, request_id: str) -> bool:
+        return bool(request_id) and request_id == self._state.silent_request_id
+
+    def _is_silent_presentation(self, presentation: dict[str, Any]) -> bool:
+        """True when every step of the plan is a skill whose output is speech itself."""
+        if not self.config.silent_skills:
+            return False
+        steps = presentation.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return False
+        names = [
+            _normalize(step.get("skill_name", "")) for step in steps if isinstance(step, dict) and step.get("skill_name")
+        ]
+        return bool(names) and len(names) == len(steps) and all(name in self.config.silent_skills for name in names)
 
     def _say(self, text: str) -> list[Action]:
         if not text or not self.config.speak_replies:
@@ -516,6 +548,32 @@ def node_parameter_defaults() -> dict[str, Any]:
     return defaults
 
 
+def _normalize_for_echo(text: str) -> str:
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
+def _echoes_reply(heard: str, spoken: str) -> bool:
+    """True when a transcript is this bridge hearing its own reply.
+
+    Raw capture carries no echo cancellation: the microphone picks the speaker
+    up and the ASR returns the reply as if it had been addressed to us. Stopping
+    the ASR for the play interval is not enough on its own, because buffered
+    audio still finalizes after the restart. Compare normalized text and require
+    a real overlap, so unrelated speech of the same length still gets through.
+    """
+    a, b = _normalize_for_echo(heard), _normalize_for_echo(spoken)
+    if len(a) < 2 or len(b) < 2:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    best = 0
+    for start in range(len(longer) - len(shorter) + 1):
+        window = longer[start : start + len(shorter)]
+        best = max(best, sum(1 for left, right in zip(shorter, window, strict=True) if left == right))
+    return best / len(shorter) >= 0.6
+
+
 def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
     return VoiceBridgeConfig(
         channel_id=str(values["channel_id"]),
@@ -532,6 +590,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         request_timeout_sec=float(values["request_timeout_sec"]),
         speak_replies=bool(values["speak_replies"]),
         busy_message=str(values["busy_message"]),
+        silent_skills=_string_tuple(values.get("silent_skills_json", "[]"), "silent_skills"),
         text_corrections=_corrections(values.get("text_corrections_json", "{}")),
     )
 
@@ -631,6 +690,9 @@ def _build_node_class():
             # While a request can be interrupted ASR is not muted; until then only stop words pass,
             # so the robot's own reply is not routed as a command.
             self._echo_until = 0.0
+            #: How long a transcript may still be the tail of our own reply.
+            self._echo_text_window_sec = 20.0
+            self._last_spoken: tuple[str, float] | None = None
             self._resume_settle_sec = float(values["resume_settle_sec"])
 
             inbound = MutuallyExclusiveCallbackGroup()
@@ -651,6 +713,7 @@ def _build_node_class():
             self.create_subscription(
                 String, str(values["asr_status_topic"]), self._on_asr_status, 10, callback_group=inbound
             )
+            self._watch_vendor_playback()
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
             self._speech_thread = threading.Thread(target=self._speech_loop, daemon=True)
             self._speech_thread.start()
@@ -667,10 +730,63 @@ def _build_node_class():
 
         def _on_transcript(self, message: String) -> None:
             now = time.monotonic()
+            spoken = getattr(self, "_last_spoken", None)
+            if spoken is not None and now - spoken[1] < self._echo_text_window_sec and _echoes_reply(
+                message.data, spoken[0]
+            ):
+                # Raw capture carries no echo cancellation, so the microphone
+                # repeats the reply. Stopping the ASR for the play interval is not
+                # enough: buffered audio still finalizes after the restart.
+                self.get_logger().info(f"ignored transcript that repeats the reply: {message.data!r}")
+                return
             if now < self._deaf_until or (now < self._echo_until and not self._core.is_stop_text(message.data)):
                 self.get_logger().info(f"ignored transcript heard during playback: {message.data!r}")
                 return
             self._run(lambda now: self._core.on_transcript(message.data, now))
+
+        def _watch_vendor_playback(self) -> None:
+            """Keep the ASR deaf while the platform's own player is still talking.
+
+            The playback service returns when the PCM queue has been handed to
+            the platform, not when the last sample left the speaker, so a reply's
+            tail can come back as a transcript ("it answers itself"). The platform
+            publishes its player state; while it is playing, any transcript is our
+            own voice. Skipped where the X2 message type does not exist, so other
+            robots are unaffected. Board-local patch (2026-10-23).
+            """
+            try:
+                from aimdk_msgs.msg import PlayStateChange  # noqa: PLC0415
+            except ImportError:
+                return
+            from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: PLC0415
+
+            qos = QoSProfile(
+                depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE
+            )
+            self.create_subscription(
+                PlayStateChange, "/aima/hal/audio/play_state", self._on_vendor_play_state, qos
+            )
+
+        def _on_vendor_play_state(self, message) -> None:
+            """Stop the ASR outright while the platform plays, not merely filter text.
+
+            Dropping transcripts is not enough: the ASR keeps decoding the room,
+            its VAD finalizes the reply's echo seconds after the speaker went
+            quiet, and the transcript then lands outside any fixed deaf window.
+            Stopping the input for the play interval keeps the echo out of the
+            buffer instead. Barge-in is traded away; this is the board patch.
+            """
+            state = int(getattr(getattr(message, "state", None), "value", 0))
+            now = time.monotonic()
+            if state == 1:  # PLAYER_STATE_PLAYING
+                if self._mute_asr:
+                    self._asr_control_publisher.publish(String(data="stop"))
+                    self._deaf_until = float("inf")
+                else:
+                    self._deaf_until = max(self._deaf_until, now + 0.3)
+            elif state in (0, 2) and self._mute_asr:  # CLOSED / STOPED
+                self._asr_control_publisher.publish(String(data="start"))
+                self._deaf_until = now + self._resume_settle_sec
 
         def _on_partial(self, message: String) -> None:
             if time.monotonic() < self._deaf_until:
@@ -756,6 +872,7 @@ def _build_node_class():
                 self._echo_until = float("inf")
             try:
                 self.get_logger().info(f"[say] {action.text}")
+                self._last_spoken = (action.text, time.monotonic())
                 spoken = self._speaker.speak(action.text)
             finally:
                 settled = time.monotonic() + self._resume_settle_sec
