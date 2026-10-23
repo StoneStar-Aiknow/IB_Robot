@@ -1990,3 +1990,23 @@ def test_a_cancel_holds_the_target_sent_one_tracking_lag_ago(tmp_path):
         assert _right_pitch(harness) > last_target + 0.05
     finally:
         harness.shutdown()
+
+
+def test_a_mode_whose_platform_action_is_already_active_is_entered_without_asking_again(tmp_path):
+    """The platform refuses a request for the action it is already in (MOTION_BUSY), e.g. one an
+    earlier run left it in: entering that mode must not depend on that request."""
+    harness = Harness(
+        OMNIHAND_PROFILE,
+        hand_type="dexterous",
+        right_hand_type="none",
+        initial_action="UPPERBODY_REMOTE_SPLIT",
+        reject_action_code=9,
+    )
+    try:
+        harness.wait_active()
+        response = harness.set_mode("stream")
+        assert response.success, response.message
+        assert "already in UPPERBODY_REMOTE_SPLIT" in response.message
+        assert harness.status().active_mode == "stream"
+    finally:
+        harness.shutdown()

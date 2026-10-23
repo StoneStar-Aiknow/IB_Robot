@@ -1119,6 +1119,13 @@ class AimdkRuntimeNode(Node):
         ends it at once, so a stop never queues behind a confirmation.
         """
         action = projection.mode_action(self._profile, mode)
+        with self._lock:
+            already = self._vendor_action == action
+        if already:
+            # The platform answers a request for the action it is already in
+            # with MOTION_BUSY (firmware v1.1.1, 2026-10-23), e.g. when an
+            # earlier run left it in the upper-body mode; there is nothing to switch.
+            return True, f"platform already in {action}"
         result = self._set_action.call(vg.set_action_request(self, source=self._source, action_name=action))
         if not result.ok:
             reason = projection.mode_rejection_reason(result.code)
