@@ -53,6 +53,9 @@ class ExecutionRecord:
     actual_registry_digest: str
     created_at: str
     updated_at: str
+    #: JSON {step_index, skill_name, resume_token, progress} when the step a
+    #: cancel interrupted stopped at a point it can resume from; "" otherwise.
+    resume_checkpoint_json: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -61,6 +64,10 @@ class ExecutionRecord:
     @property
     def program(self) -> dict[str, Any]:
         return json.loads(self.program_json)
+
+    @property
+    def resume_checkpoint(self) -> dict[str, Any] | None:
+        return json.loads(self.resume_checkpoint_json) if self.resume_checkpoint_json else None
 
 
 @dataclass(frozen=True)
@@ -173,6 +180,8 @@ class SQLiteExecutionStore:
             columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(executions)").fetchall()}
             if "workflow_digest" not in columns:
                 connection.execute("ALTER TABLE executions ADD COLUMN workflow_digest TEXT NOT NULL DEFAULT ''")
+            if "resume_checkpoint_json" not in columns:
+                connection.execute("ALTER TABLE executions ADD COLUMN resume_checkpoint_json TEXT NOT NULL DEFAULT ''")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS execution_stop_intents (
                     caller_scope TEXT NOT NULL, robot_id TEXT NOT NULL,
@@ -347,6 +356,29 @@ class SQLiteExecutionStore:
                 actual_registry_generation=actual_registry_generation,
                 actual_registry_digest=actual_registry_digest,
             )
+
+    def record_resume_checkpoint(self, execution_id: str, checkpoint: dict[str, Any]) -> None:
+        """Attach the interrupted step's resume point; only before the execution is terminal."""
+        with self._transaction() as connection:
+            if self._get_in_transaction(connection, execution_id).terminal:
+                raise ExecutionConflictError("terminal execution result is immutable")
+            connection.execute(
+                "UPDATE executions SET resume_checkpoint_json=? WHERE execution_id=?",
+                (json.dumps(checkpoint, sort_keys=True, separators=(",", ":")), execution_id),
+            )
+
+    def latest_execution_id(self, robot_id: str, *, before: str) -> str:
+        """The robot's most recent execution created before ``before``, or ""."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT execution_id FROM executions
+                 WHERE robot_id=? AND rowid < (SELECT rowid FROM executions WHERE execution_id=?)
+                 ORDER BY rowid DESC LIMIT 1
+                """,
+                (robot_id, before),
+            ).fetchone()
+        return "" if row is None else str(row["execution_id"])
 
     def request_stop(self, execution_id: str) -> ExecutionRecord:
         """Persist a monotonic stop request independently from worker progress."""
@@ -636,6 +668,7 @@ class SQLiteExecutionStore:
             actual_registry_digest=str(row["actual_registry_digest"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            resume_checkpoint_json=str(row["resume_checkpoint_json"]),
         )
 
     def _transaction(self):

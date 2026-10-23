@@ -81,9 +81,11 @@ required_args: []
 timeout_sec: 45.0     # above the runtime's own motion timeout
 ```
 
-Named motions cannot be cancelled once started (the runtime refuses it); see the
-`skill_library` README for the executor's cancel and deadline semantics. Postures
-and stairs are deliberately not exposed by `aimdk_x2_skills`.
+A replayed gesture (the runtime's trajectory mode, `stream` on the X2) stops on
+a cancel and can resume from that point; presets and postures cannot be
+cancelled once started (the runtime refuses it). See the `skill_library` README
+for the executor's cancel and deadline semantics. Postures and stairs are
+deliberately not exposed by `aimdk_x2_skills`.
 
 ## Mirror session skills
 

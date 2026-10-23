@@ -241,14 +241,29 @@ class _EePoseSnapshotExpired(Exception):
     pass
 
 
+def _cancel_accepted(cancel_future) -> bool:
+    """Whether a completed cancel request was accepted by the action server."""
+    try:
+        return bool(getattr(cancel_future.result(), "goals_canceling", []))
+    except Exception:
+        return False
+
+
 class _ProgramGoalHandle:
     """Adapter that gives the existing Skill Gateway a typed Program child."""
 
-    def __init__(self, request, root_handle, execution_store=None, execution_id="") -> None:
+    def __init__(self, request, root_handle, execution_store=None, execution_id="", resume_token="") -> None:
         self.request = request
         self._root_handle = root_handle
         self._execution_store = execution_store
         self._program_execution_id = execution_id
+        # Set by the Program for a step that continues an interrupted one; the
+        # executor that ran the step leaves its resume point in motion_checkpoint.
+        self.resume_token = resume_token
+        self.motion_checkpoint: dict | None = None
+
+    def record_motion_checkpoint(self, checkpoint: dict) -> None:
+        self.motion_checkpoint = dict(checkpoint)
 
     @property
     def is_cancel_requested(self):
@@ -1172,6 +1187,7 @@ class SkillExecutorNode(Node):
                 expected_registry_digest=goal.expected_registry_digest,
                 workflow_steps=goal.workflow_steps,
                 task_budget_sec=goal.task_budget_sec,
+                continues_from_execution_id=goal.continues_from_execution_id,
             )
             record, created = self._execution_store.begin(program)
             result.execution_id = record.execution_id
@@ -1227,6 +1243,15 @@ class SkillExecutorNode(Node):
                 )
                 goal_handle.abort()
                 return result
+            resume_token, resume_error = self._program_resume_token(program, record)
+            if resume_error:
+                self._finish_program(
+                    record, result, state="FAILED", error_code="RESUME_CHECKPOINT_INVALID", message=resume_error
+                )
+                goal_handle.abort()
+                return result
+            goal_handle._program_resume_token = resume_token
+            goal_handle._program_step_checkpoint = None
             self._execution_store.mark_committing(record.execution_id)
             program_owner = ExecutionOwner.workflow(program.root_task_id)
             workflow_error, lease_token = self._gateway_policy.admit_workflow(
@@ -1388,6 +1413,11 @@ class SkillExecutorNode(Node):
                         PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                         SKILL_CANCEL_TIMEOUT,
                     }
+                    checkpoint = getattr(goal_handle, "_program_step_checkpoint", None)
+                    if child_result.error_code == "SKILL_CANCELLED" and checkpoint:
+                        self._execution_store.record_resume_checkpoint(
+                            record.execution_id, {"step_index": index, "skill_name": step.skill_name, **checkpoint}
+                        )
                     self._execution_store.finish(
                         record.execution_id,
                         state="UNKNOWN"
@@ -1462,10 +1492,49 @@ class SkillExecutorNode(Node):
             goal_handle.abort()
         return result
 
+    def _program_resume_token(self, program, record) -> tuple[str, str]:
+        """The resume token step 0 continues from, or why the continuation is refused.
+
+        A continuation is honoured only against this robot's latest execution,
+        cancelled with a checkpoint, whose interrupted step is exactly the new
+        Program's first step. Whether the arm is still where it stopped is the
+        runtime's to judge when it is handed the token.
+        """
+        previous_id = program.continues_from_execution_id
+        if not previous_id:
+            return "", ""
+        previous = self._execution_store.get(
+            execution_id=previous_id, caller_scope=program.caller_scope, robot_id=program.robot_id
+        )
+        if previous is None:
+            return "", f"execution {previous_id} is not this caller's on this robot"
+        if self._execution_store.latest_execution_id(program.robot_id, before=record.execution_id) != previous_id:
+            return "", f"execution {previous_id} is not this robot's latest execution"
+        checkpoint = previous.resume_checkpoint
+        if previous.state != "CANCELED" or not checkpoint:
+            return "", f"execution {previous_id} was not cancelled at a resumable point"
+        steps = previous.program["workflow_steps"]
+        index = int(checkpoint.get("step_index", -1))
+        if index != previous.completed_step_count or not 0 <= index < len(steps):
+            return "", f"execution {previous_id} has an inconsistent resume checkpoint"
+        if program.steps[0].to_dict() != steps[index]:
+            return "", f"the first step does not match the step execution {previous_id} interrupted"
+        return str(checkpoint.get("resume_token", "")), ""
+
     def _execute_program_child(self, goal, root_goal_handle, execution_id):
-        """Execute one canonical child through the existing workflow lifecycle."""
-        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id)
-        return self._execute_workflow_skill_gateway(child_handle)
+        """Execute one canonical child through the existing workflow lifecycle.
+
+        A validated continuation leaves the interrupted step's resume token on
+        the root handle for step 0; the child's own resume point, if it stopped
+        part-way, is left there for the Program to record.
+        """
+        resume_token = ""
+        if int(goal.dispatch_binding.workflow_step_index) == 0:
+            resume_token = str(getattr(root_goal_handle, "_program_resume_token", "") or "")
+        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id, resume_token)
+        result = self._execute_workflow_skill_gateway(child_handle)
+        root_goal_handle._program_step_checkpoint = child_handle.motion_checkpoint
+        return result
 
     def _program_cancel_requested(self, root_goal_handle, execution_id: str) -> bool:
         if bool(getattr(root_goal_handle, "is_cancel_requested", False)):
@@ -1532,6 +1601,10 @@ class SkillExecutorNode(Node):
         reconciliation = self._execution_store.reconciliation(record.execution_id)
         response.reconciled = reconciliation is not None
         response.reconciliation_evidence = reconciliation["evidence"] if reconciliation else ""
+        checkpoint = record.resume_checkpoint
+        if record.state == "CANCELED" and checkpoint and checkpoint.get("step_index") == record.completed_step_count:
+            response.step_resumable = True
+            response.step_progress = float(checkpoint.get("progress", 0.0))
         return response
 
     def _get_execution_events(self, request, response):
@@ -1873,10 +1946,14 @@ class SkillExecutorNode(Node):
     ) -> SkillCommand.Result:
         """Run the named motion the catalog binds through the runtime's neutral action.
 
-        The runtime refuses cancellation of named motions, so a cancel request is
-        recorded but never forwarded and the motion is reported as it ends. If
-        the skill deadline passes first, the admission is retained until the
-        runtime reports a terminal state; the runtime bounds every motion itself.
+        A cancel request is forwarded. The runtime accepts it only where it can
+        stop the motion part-way (a replayed trajectory); the skill then ends
+        cancelled and hands the runtime's resume token to a Program step's
+        handle for the ledger. Where the runtime refuses, the motion is reported
+        as it ends. If the skill deadline passes first, the admission is
+        retained until the runtime reports a terminal state; the runtime bounds
+        every motion itself. A Program child that continues an interrupted
+        step carries that step's resume token on ``goal_handle``.
         """
         goal = goal_handle.request
         result = SkillCommand.Result()
@@ -1929,6 +2006,7 @@ class SkillExecutorNode(Node):
         motion_goal.target = ""
         # Never pre-empt a motion that is already playing.
         motion_goal.interrupt = False
+        motion_goal.resume_token = str(getattr(goal_handle, "resume_token", "") or "")
 
         def feedback_cb(feedback_msg) -> None:
             feedback = SkillCommand.Feedback()
@@ -1947,6 +2025,7 @@ class SkillExecutorNode(Node):
         late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
         send_future = None
         result_future = None
+        cancel_future = None
         try:
             send_future = client.send_goal_async(motion_goal, feedback_callback=feedback_cb)
             if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
@@ -1970,14 +2049,10 @@ class SkillExecutorNode(Node):
                 )
             result_future = motion_handle.get_result_async()
             deadline = time.monotonic() + timeout_sec
-            cancel_recorded = False
             while rclpy.ok() and not result_future.done():
-                if goal_handle.is_cancel_requested and not cancel_recorded:
-                    cancel_recorded = True
-                    self._audit("cancel_not_supported", **self._public_audit_context_copy())
-                    self.get_logger().warning(
-                        f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
-                    )
+                if goal_handle.is_cancel_requested and cancel_future is None:
+                    cancel_future = motion_handle.cancel_goal_async()
+                    cancel_future.add_done_callback(lambda done: self._note_named_motion_cancel(motion, done))
                 if time.monotonic() >= deadline:
                     late_cleanup.watch_result_future(result_future)
                     return self._abort_skill(
@@ -2024,6 +2099,21 @@ class SkillExecutorNode(Node):
                 result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} returned no result"
             )
         message = str(motion_result.message).strip()
+        if (
+            cancel_future is not None
+            and self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout)
+            and _cancel_accepted(cancel_future)
+            and motion_result.error_code == ExecuteNamedMotion.Result.CANCELLED
+        ):
+            # The runtime honoured the cancel and stopped the motion part-way.
+            # A method, not an attribute: the Gateway's terminal proxy forwards
+            # reads to the Program handle but would keep a write for itself.
+            record = getattr(goal_handle, "record_motion_checkpoint", None)
+            if record is not None and motion_result.resume_token:
+                record({"resume_token": str(motion_result.resume_token), "progress": float(motion_result.progress)})
+            self._cancel_skill(result, goal_handle, executed, goal.skill_name)
+            result.message = message or result.message
+            return result
         if not motion_result.success:
             return self._abort_skill(
                 result,
@@ -2042,6 +2132,15 @@ class SkillExecutorNode(Node):
         result.diagnostics = []
         goal_handle.succeed()
         return result
+
+    def _note_named_motion_cancel(self, motion: str, cancel_future) -> None:
+        if _cancel_accepted(cancel_future):
+            self._audit_cancel_propagated()
+            return
+        self._audit("cancel_not_supported", **self._public_audit_context_copy())
+        self.get_logger().warning(
+            f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
+        )
 
     def _execute_sound_following_skill(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()

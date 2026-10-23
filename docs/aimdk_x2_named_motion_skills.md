@@ -117,9 +117,11 @@ robot-skill --config-path "$SNAP" cancel --task-id demo-1
 | 运行时超时 | `NAMED_MOTION_TIMEOUT` |
 | 成功 | `success=true`，如“replayed handshake in stream (6.6s)” |
 
-**取消**：Gateway 接受取消请求，但执行器不会把取消转发给运行时（运行时拒绝取消命名动作）。动作照常完成，
-结果按真实情况上报（成功时 message 以 `cancel not supported;` 开头）；动作结束前其他技能都返回
-`SKILL_BUSY`。技能 deadline 先到时同样保留占用，直到运行时报告终态。
+**取消**：执行器把取消请求转发给运行时。`stream` 下回放的手势接受取消：手臂当场停住，技能以
+`SKILL_CANCELLED` 结束，Gateway 账本记下断点，之后的「继续」从停下处接着做（断点失效则从头做）。其他模式
+（如 `idle`）下的预设动作与姿态切换被运行时拒绝取消：动作照常完成，结果按真实情况上报（成功时 message 以
+`cancel not supported;` 开头），动作结束前其他技能都返回 `SKILL_BUSY`。技能 deadline 先到时同样保留占用，
+直到运行时报告终态。
 
 ## 真机验收（操作员在场，机器人上吊架）
 

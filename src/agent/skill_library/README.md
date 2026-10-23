@@ -52,6 +52,14 @@ Program root execution 的查询和取消入口为：
 `(execution_id, sequence)` 去重，并在启动或发现序号空洞时用
 `/embodied/get_execution_events` 从最后序号补齐。
 
+**步内续做**：子技能被取消时若其执行器给出了断点（目前只有运行时命名动作在轨迹回放模式下会给，见 8.7），
+Gateway 在该执行上记录 `{step_index, skill_name, resume_token, progress}`，`GetExecution` 以
+`step_resumable` / `step_progress` 暴露。新 Program 用 `continues_from_execution_id` 引用它时，Gateway 在准入前
+校验：同一 caller_scope 与 robot_id、是该机器人**最近一次**执行、状态 `CANCELED` 且有断点、新 Program 第 0 步与被
+中断步规范化后完全一致；任一不满足即 `RESUME_CHECKPOINT_INVALID` 终态失败、不产生运动。通过后只把 token
+交给第 0 步的执行器；断点是否仍然有效（手臂是否被动过）由出具它的运行时判定。`continues_from_execution_id`
+非空时计入 Program digest，为空时 digest 与之前一致。
+
 未对账的 `UNKNOWN` 执行会隔离所有新的 root 准入：`ExecuteProgram`、legacy
 `BeginWorkflowExecution`、直接 `SkillCommand` 与外部 `PrimitiveCommand` 均返回
 `EXECUTION_QUARANTINED`，直到运维在停机状态下用 `execution_maintenance` 记录对账证据。
@@ -617,11 +625,19 @@ catalog implementation 用 `binding: {motion: <名字>}` 绑定一个运行时�
 未声明命名动作能力）、`NAMED_MOTION_RUNTIME_UNAVAILABLE`（未启用或 action 不可达）、
 `NAMED_MOTION_REJECTED`（goal 被拒，通常是已有动作在播放）。
 
-**取消语义（与其他技能不同）**：运行时拒绝取消命名动作（平台无法停止预设动作，姿态切换半途停止会摔倒），
-因此执行器收到取消请求时只审计 `cancel_not_supported`，**不**向运行时转发取消，继续等待动作结束，
-并按真实结果上报（成功时 message 以 `cancel not supported;` 开头）。动作结束前 root lease 一直占用，
-其他技能返回 `SKILL_BUSY`。需要立即中断运动只能由操作员调用运行时的 `/runtime/stop`。
-技能 deadline 先到时同样不取消，而是走 late-cleanup：Gateway 以 `SKILL_CANCEL_TIMEOUT` 结束该请求并保留
+**取消语义**：执行器把取消请求转发给运行时，由运行时决定能否中途停下：
+
+- 运行时处于轨迹回放模式（X2 的 `stream`）时接受取消：手臂当场停住（运行时保持手臂正在跟踪的那条指令，
+  见 aimdk_robot README），动作以 `CANCELLED` 结束并带回
+  `resume_token` 与 `progress`。执行器审计 `cancel_propagated`，技能以 `SKILL_CANCELLED` 进入 canceled 终态，
+  并把断点交给 Program 账本（见上文「步内续做」）。Program 子步骤带着 token 时，执行器把它放进
+  `ExecuteNamedMotion.Goal.resume_token`，运行时从停下处继续；断点失效时从头播放并在 message 中说明原因。
+- 其他模式下运行时拒绝取消（平台无法停止预设动作，姿态切换半途停止会摔倒）：执行器审计
+  `cancel_not_supported`，继续等待动作结束并按真实结果上报（成功时 message 以 `cancel not supported;` 开头）。
+  动作结束前 root lease 一直占用，其他技能返回 `SKILL_BUSY`；需要立即中断只能调用运行时的 `/runtime/stop`。
+- 没有取消请求却以 `CANCELLED` 结束（被其他 goal 抢占）仍映射为 `NAMED_MOTION_PREEMPTED`。
+
+技能 deadline 先到时不取消，而是走 late-cleanup：Gateway 以 `SKILL_CANCEL_TIMEOUT` 结束该请求并保留
 admission，直到运行时报告终态（运行时自己对每个动作有超时上限）。
 
 部署接线：`robot_config` 的 `embodied.runtime_named_motion` 是显式逻辑接口绑定（`interface`、

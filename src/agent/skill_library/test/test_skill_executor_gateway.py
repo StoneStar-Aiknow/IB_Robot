@@ -2043,3 +2043,109 @@ def test_constructor_rejects_unknown_gateway_primitive(tmp_path):
             ],
             node_name=f"executor_{suffix}",
         )
+
+
+def _cancelled_with_checkpoint(gateway_rig, monkeypatch, *, request_id, steps, progress=0.4):
+    """Run ``steps`` with the last child stopped part-way at a resume checkpoint."""
+    original_child = gateway_rig.executor_node._execute_program_child
+
+    def child(goal, root_handle, execution_id):
+        if goal.dispatch_binding.workflow_step_index < len(steps) - 1:
+            return original_child(goal, root_handle, execution_id)
+        root_handle._program_step_checkpoint = {"resume_token": f"token-{request_id}", "progress": progress}
+        stopped = SkillCommand.Result()
+        stopped.success = False
+        stopped.error_code = "SKILL_CANCELLED"
+        stopped.message = "skill cancelled: move"
+        return stopped
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    result = _send_program(gateway_rig, _program_goal(gateway_rig, request_id=request_id, steps=steps))
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", original_child)
+    assert (result.state, result.completed_step_count) == ("CANCELED", len(steps) - 1)
+    return result
+
+
+def _capture_resume_tokens(gateway_rig, monkeypatch):
+    tokens = []
+    original_child = gateway_rig.executor_node._execute_program_child
+
+    def child(goal, root_handle, execution_id):
+        tokens.append(getattr(root_handle, "_program_resume_token", None))
+        return original_child(goal, root_handle, execution_id)
+
+    monkeypatch.setattr(gateway_rig.executor_node, "_execute_program_child", child)
+    return tokens
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_a_cancelled_step_with_a_checkpoint_is_queryable_and_resumed_by_its_continuation(gateway_rig, monkeypatch):
+    move = workflow_step(skill_name="move", timeout_sec=1.0)
+    stopped = _cancelled_with_checkpoint(gateway_rig, monkeypatch, request_id="interrupted", steps=[move, move])
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = "robot_skill_cli"
+    query.robot_id = gateway_rig.overrides["robot_name"]
+    query.execution_id = stopped.execution_id
+    response = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert response.step_resumable is True
+    assert response.step_progress == pytest.approx(0.4)
+
+    tokens = _capture_resume_tokens(gateway_rig, monkeypatch)
+    goal = _program_goal(gateway_rig, request_id="continue", steps=[move])
+    goal.continues_from_execution_id = stopped.execution_id
+    result = _send_program(gateway_rig, goal)
+    assert result.success is True, result.message
+    assert tokens == ["token-interrupted"]
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_a_continuation_whose_first_step_differs_moves_nothing(gateway_rig, monkeypatch):
+    stopped = _cancelled_with_checkpoint(
+        gateway_rig, monkeypatch, request_id="interrupted", steps=[workflow_step(skill_name="move", timeout_sec=1.0)]
+    )
+    tokens = _capture_resume_tokens(gateway_rig, monkeypatch)
+    goal = _program_goal(gateway_rig, request_id="continue", steps=[workflow_step(skill_name="move", timeout_sec=2.0)])
+    goal.continues_from_execution_id = stopped.execution_id
+    result = _send_program(gateway_rig, goal)
+    assert (result.state, result.error_code) == ("FAILED", "RESUME_CHECKPOINT_INVALID")
+    assert "does not match" in result.message
+    assert tokens == []
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_a_continuation_of_anything_but_the_latest_execution_moves_nothing(gateway_rig, monkeypatch):
+    move = workflow_step(skill_name="move", timeout_sec=1.0)
+    stopped = _cancelled_with_checkpoint(gateway_rig, monkeypatch, request_id="interrupted", steps=[move])
+    assert _send_program(gateway_rig, _program_goal(gateway_rig, request_id="something-else", steps=[move])).success
+    tokens = _capture_resume_tokens(gateway_rig, monkeypatch)
+    goal = _program_goal(gateway_rig, request_id="continue", steps=[move])
+    goal.continues_from_execution_id = stopped.execution_id
+    result = _send_program(gateway_rig, goal)
+    assert (result.state, result.error_code) == ("FAILED", "RESUME_CHECKPOINT_INVALID")
+    assert "latest execution" in result.message
+    assert tokens == []
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_steps_read_back_from_the_ledger_are_admitted_as_the_interrupted_step(gateway_rig, monkeypatch):
+    """A continuation that replays GetExecution's canonical steps (float32 on the wire, e.g. a
+    1.3 s timeout) passes the Gateway's exact-step check."""
+    move = workflow_step(skill_name="move", timeout_sec=1.3)
+    stopped = _cancelled_with_checkpoint(gateway_rig, monkeypatch, request_id="interrupted", steps=[move])
+    query = GetExecution.Request()
+    query.schema_version = 1
+    query.caller_scope = "robot_skill_cli"
+    query.robot_id = gateway_rig.overrides["robot_name"]
+    query.execution_id = stopped.execution_id
+    ledger = _future_result(gateway_rig.get_execution_client.call_async(query))
+    assert ledger.step_resumable is True
+
+    tokens = _capture_resume_tokens(gateway_rig, monkeypatch)
+    goal = _program_goal(
+        gateway_rig, request_id="continue", steps=list(ledger.canonical_steps[ledger.completed_step_count :])
+    )
+    goal.continues_from_execution_id = stopped.execution_id
+    result = _send_program(gateway_rig, goal)
+    assert result.success is True, result.message
+    assert tokens == ["token-interrupted"]

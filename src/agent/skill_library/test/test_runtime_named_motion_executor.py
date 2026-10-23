@@ -50,9 +50,10 @@ class _Future:
 
 
 class _MotionHandle:
-    def __init__(self, result_future, *, accepted=True):
+    def __init__(self, result_future, *, accepted=True, cancel_accepted=False):
         self.accepted = accepted
         self.result_future = result_future
+        self.cancel_accepted = cancel_accepted
         self.cancel_calls = 0
 
     def get_result_async(self):
@@ -60,7 +61,7 @@ class _MotionHandle:
 
     def cancel_goal_async(self):
         self.cancel_calls += 1
-        raise AssertionError("named motions must never be cancelled through the action")
+        return _Future(SimpleNamespace(goals_canceling=[object()] if self.cancel_accepted else []))
 
 
 class _Client:
@@ -87,6 +88,12 @@ class _GoalHandle:
     def succeed(self):
         self.terminal = "succeeded"
 
+    def canceled(self):
+        self.terminal = "canceled"
+
+    def record_motion_checkpoint(self, checkpoint):
+        self.motion_checkpoint = checkpoint
+
     def abort(self):
         self.terminal = "aborted"
 
@@ -94,8 +101,12 @@ class _GoalHandle:
         self.feedback.append(feedback)
 
 
-def _motion_result(*, success=True, error_code=RESULT.NONE, message="done"):
-    return SimpleNamespace(result=SimpleNamespace(success=success, error_code=error_code, message=message))
+def _motion_result(*, success=True, error_code=RESULT.NONE, message="done", resume_token="", progress=1.0):
+    return SimpleNamespace(
+        result=SimpleNamespace(
+            success=success, error_code=error_code, message=message, resume_token=resume_token, progress=progress
+        )
+    )
 
 
 def _status(capabilities=ADVERTISED):
@@ -259,18 +270,62 @@ def test_runtime_failure_codes_map_to_public_codes(runtime_code, public_code):
     assert goal_handle.terminal == "aborted"
 
 
-def test_cancel_is_never_forwarded_and_the_real_outcome_is_reported():
+def test_a_cancel_the_runtime_refuses_reports_the_real_outcome():
     motion = _MotionHandle(_Future(_motion_result(message="preset motion handshake completed"), done_after_polls=3))
     node = _node(_Client(_Future(motion)))
     goal_handle = _GoalHandle(cancel_requested=True)
 
     result = _run(node, goal_handle)
 
-    assert motion.cancel_calls == 0
+    assert motion.cancel_calls == 1
     assert node.audits == ["cancel_not_supported"]
     assert result.success is True
     assert result.message == "cancel not supported; preset motion handshake completed"
     assert node.confirmed == node.registered
+
+
+def test_a_cancel_the_runtime_honours_ends_the_skill_cancelled_with_its_resume_point():
+    stopped = _motion_result(
+        success=False,
+        error_code=RESULT.CANCELLED,
+        message="handshake cancelled at 1.2s of 3.0s; arm held where measured",
+        resume_token="token-1",
+        progress=0.4,
+    )
+    motion = _MotionHandle(_Future(stopped, done_after_polls=3), cancel_accepted=True)
+    node = _node(_Client(_Future(motion)))
+    node._audit_cancel_propagated = lambda: node.audits.append("cancel_propagated")
+    goal_handle = _GoalHandle(cancel_requested=True)
+
+    result = _run(node, goal_handle)
+
+    assert motion.cancel_calls == 1
+    assert node.audits == ["cancel_propagated"]
+    assert (result.success, result.error_code, goal_handle.terminal) == (False, "SKILL_CANCELLED", "canceled")
+    assert "cancelled at 1.2s" in result.message
+    assert goal_handle.motion_checkpoint == {"resume_token": "token-1", "progress": pytest.approx(0.4)}
+    assert node.confirmed == node.registered
+
+
+def test_a_program_step_resume_point_passes_through_the_gateway_terminal_proxy():
+    """The Gateway hands executors a proxy of the Program child handle: the resume token must be
+    readable through it and the checkpoint must land on the Program handle, not on the proxy."""
+    program_handle = executor_module._ProgramGoalHandle(SimpleNamespace(), root_handle=None, resume_token="token-1")
+    proxy = executor_module._DeferredTerminalGoalHandle(program_handle)
+
+    assert proxy.resume_token == "token-1"
+    proxy.record_motion_checkpoint({"resume_token": "token-2", "progress": 0.5})
+    assert program_handle.motion_checkpoint == {"resume_token": "token-2", "progress": 0.5}
+
+
+def test_the_resume_token_a_program_step_carries_is_sent_to_the_runtime():
+    client = _Client(_Future(_MotionHandle(_Future(_motion_result()))))
+    node = _node(client)
+    goal_handle = _GoalHandle()
+    goal_handle.resume_token = "token-1"
+
+    assert _run(node, goal_handle).success
+    assert client.goals[0].resume_token == "token-1"
 
 
 def test_deadline_keeps_the_admission_until_the_runtime_reports_a_terminal_state():
