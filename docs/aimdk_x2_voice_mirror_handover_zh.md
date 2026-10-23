@@ -375,9 +375,11 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 3. mirror session 的契约是“runtime DEGRADED 即故障”，于是轮次在 0.16 秒内被取消
    （`last_transition: reason=fault`，`detail: runtime DEGRADED: joint feedback stale: hand`）。
 
-表现就是“刚说照镜子、它应了一声、然后什么都没发生”。修法（板端补丁，
-`aimdk_robot/runtime_node.py::_check_feedback`）：手型未经平台验证时，把 `hand` 从必需反馈组里剔除——
-声明之外的手型数据是加成，不是契约，它瞬断不该降级 runtime。
+表现就是“刚说照镜子、它应了一声、然后什么都没发生”。
+
+**当时的修法是板端绕行**：在 `aimdk_robot/runtime_node.py::_check_feedback` 里，手型未经平台验证时把
+`hand` 从必需反馈组剔除。**这个绕行补丁已于 2026-10-23 晚删除**——上级分支从根因上修好了（hand 订阅
+单独一个 callback group，不再排在 4 路 500 Hz 关节流之后被饿死），细节见第 17 节。
 
 **修好后实测（同一会话，2026-10-23 15:0x–15:2x）**：
 
@@ -493,3 +495,52 @@ ros2 param get /agent_voice_bridge resume_settle_sec
   否则 beam 会偏向短词。
 - `max_active_paths` 现在写死 4（模块内 `self._beam_size`）；识别变慢可降到 2。
 - 错词映射是纯配置：加一行 `规范词: [变体…]` 再重编 `robot_config` 重启即可，不必改代码。
+
+## 17. 合入上级分支 1028_agi（2026-10-23 晚，本地已合、未推送）
+
+上游 `origin/1028_agi`（`ef0d9df8`）比我们的分叉点 `d7b6600b` 多 4 个提交（2 个真实改动 + 2 个 PR 合并），
+只碰 4 个文件、+43/-9。这 4 个文件本分支也都改过，`git merge` 全部自动合并、无冲突。合并提交 `d13fb421`
+在分支 `1028_agi_lyx` 上，**尚未 push**。
+
+### 17.1 带进来什么
+
+| 上游提交 | 内容 | 对我们的影响 |
+|---|---|---|
+| `9e31a250`（PR !3） | `aimdk_robot`：hand 状态订阅单独一个 `MutuallyExclusiveCallbackGroup`，配套新增测试 | 就是 13.5“原因二”的根因修法；板端绕行补丁已删（见 17.3），效果待重编重启后验证 |
+| `62121c77`（PR !2） | `robot_config`：镜子 operator 的相机改由 `operator.camera_topic` 指定，magicmirror 指向后脑相机 | 我们的 profile 继承了该 operator 块，**operator 从此看后脑相机**（见 17.2） |
+
+`mirror_session.py` 在本分支已从 `robot_config/launch_builders/` 搬到
+`manipulation_execution/launch_builders/`，git 靠重命名识别把上游那段 operator 相机补丁落到了新路径。
+合完核对过：`_operator_parameters` 里 `camera_topic` 优先取 `operator.camera_topic`，缺省才回落到模仿相机。
+
+### 17.2 operator 相机的变化（继承来的，不需要改配置）
+
+继承链是 `aimdk_x2_voice_mirror_all → aimdk_x2_voice_mirror → aimdk_x2_magicmirror`，我们两个 voice 镜子
+profile 都没写 `operator` 块，所以合并后解析结果是：
+
+```yaml
+mirror_session:
+  operator:
+    enabled: true
+    send_enabled: false
+    camera_topic: /aima/hal/sensor/rgb_head_rear/rgb_image/compressed
+```
+
+即遮挡判断 / 摸头 / LED 用的是后脑相机，不再是模仿用的前中相机。**这不影响姿态流**——
+`motion_imitation_stream` 的帧源没有变。要退回前中相机，在部署 profile 里覆盖一行
+`mirror_session.operator.camera_topic: <原相机>` 即可。
+
+### 17.3 板端现状
+
+- 板子 HEAD 仍是 `f4219dd9`（合并未推送，拉不到）。
+- `aimdk_robot/runtime_node.py` 已就地改成“上游修法 + 保留 `player_state()`”：与合并后的分支**逐字节一致**，
+  只多一个 T6 用的 `player_state()` 访问器。原绕行补丁已删除，备份在
+  `/tmp/runtime_node.py.bak-20261023-193751`。
+- 改的是源码，`install/` 里的旧文件没换——**要重编 `aimdk_robot` 并重启 runtime 才生效**，重编前板子仍是旧行为。
+
+### 17.4 待办
+
+- 推送合并后，板子按第 3 节流程同步（`git checkout -- <已提交路径>` → 删同名未跟踪文件 → `merge --ff-only`）。
+  届时板端 `runtime_node.py` 的本地改动会被上游版本覆盖，`player_state()` 要重新补，或推动上游接受它。
+- 真机验两件事：① 长时照镜子并同时说话时，`joint feedback stale: hand` 是否彻底不再出现；
+  ② operator 换后脑相机后，遮挡判断与摸头是否仍正常触发。
