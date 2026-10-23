@@ -587,7 +587,12 @@ class VisualInteractionNode(Node):
 
         after = self._now()
         chatter.voice(after, self._voice_busy(after))
-        if not chatter.due(after, self._mirror_active(after)):
+        # The gate was open when this round began. Asking again after the
+        # ~1.2 s inference closed it whenever the 1 Hz state heartbeat had
+        # not been taken yet (2 s stale), and each close re-armed the first
+        # line, so on the board no line was ever due. A mirror that ended
+        # meanwhile closes the next round; the voice refuses a late line.
+        if not chatter.due(after, True):
             self._count("chatter_wait")
             return
         line = chatter.pick(after)

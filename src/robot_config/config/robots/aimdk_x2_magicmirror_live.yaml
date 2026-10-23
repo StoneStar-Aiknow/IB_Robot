@@ -32,9 +32,15 @@ robot:
   visual_interaction:
     mode: chatter
     voice_status_topic: /mirror_voice/status
+    # One look every 2.5 s, not every 1 s: a line is due only every 5–10 s,
+    # and the board also runs the arms' PEAR/YOLOX and the runtime, which
+    # faulted on stale hand feedback while the model looked back to back.
+    round_period_sec: 2.5
     vl:
       # The chatter answer is a phrase of at most ten characters.
       max_new_tokens: 16
     chatter:
       gap_min_sec: 5.0
       gap_max_sec: 10.0
+      # A look at most ~4 s old still counts as what the visitor is doing.
+      fresh_sec: 5.0
