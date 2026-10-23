@@ -236,17 +236,31 @@ class VoiceBridgeCore:
         return corrected + actions if actions else corrected
 
     def on_partial(self, text: str, now: float) -> list[Action]:
-        """Stop as soon as a partial transcript contains a stop keyword; ignore everything else.
+        """Stop as soon as a partial is a stop keyword; ignore everything else.
 
         Final transcripts only arrive after VAD silence plus tail padding, which is
         seconds of extra motion when the user says "停".
+
+        Partial matching is exact (or a prefix of a stop phrase), not "contains":
+        "停止照镜子" grows through the partial "停止", and treating that as a stop
+        would cancel the very request that stops the mirror. The final transcript
+        still stops on a keyword, just after the tail padding.
         """
-        if not self.is_stop_text(text):
+        if not self._is_stop_partial(text):
             return []
         if self._state.utterance_stopped or not self._stop_target():
             return []
         self._state.utterance_stopped = True
         return self._stop(now, reason=f"stop keyword in partial {text!r}")
+
+    def _is_stop_partial(self, text: str) -> bool:
+        """A partial that is itself a stop keyword, or a prefix on its way to one."""
+        normalized = _normalize(self.config.correct(str(text).strip()))
+        if not normalized:
+            return False
+        if normalized in self.config.stop_phrases:
+            return True
+        return any(phrase.startswith(normalized) for phrase in self.config.stop_phrases)
 
     def _contains_stop(self, normalized: str) -> bool:
         # Keyword, not whole-sentence, matching: "帮我停一下" and "别动了谢谢" must interrupt.
@@ -483,6 +497,9 @@ def _spoken_reply(state: Any, message: str) -> str:
     if state == "FAILED":
         # Gateway/planner failures carry English technical text (allowlist, registry, RPC);
         # it stays in the log while the user hears one actionable Chinese sentence.
+        if "another runtime producer" in message:
+            # The mirror session owns policy_stream: a second producer is refused.
+            return "照镜子正占着动作通道，请先说停止照镜子。"
         return "执行失败，详情见日志。"
     return message
 
