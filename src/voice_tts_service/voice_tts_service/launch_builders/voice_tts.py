@@ -82,6 +82,12 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             "max_response_audio_bytes",
         }
     }
+    if "num_steps" in config:
+        # Flow-matching steps: ~98% of synthesis time and linear in the count.
+        # There is no default here on purpose -- unset means the value the
+        # digest-verified bundle ships with (4 on the Ascend 310P bundle, 8 on
+        # the host ONNX one), and a profile opts into fewer.
+        runtime_options["num_steps"] = int(config["num_steps"])
     node_params = {
         "instance_id": str(config.get("instance_id", "voice_tts")),
         "bundle_path": bundle_path,

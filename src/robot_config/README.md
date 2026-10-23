@@ -1546,7 +1546,71 @@ robot:
         api_key_env: KIMICODE_API_KEY   # 密钥只允许环境变量名；字面 api_key 会被校验拒绝
         model: kimi-for-coding
         temperature: 1.0          # kimi-for-coding 强制 temperature=1
+        timeout_sec: 120.0        # 非流式调用，等价于「等首字」上限
+        enable_thinking: true     # 仅 dashscope 原生识别；其他 provider 用 extra_body
+        max_tokens: null          # 正整数；planner 只需一个小 JSON
+        extra_body: {}            # provider 私有字段，最后合并进请求体
+        catalog_view: planner     # planner（精简，默认）| full（完整 catalog 进 prompt）
+        stream: false             # 本轮新增；见下方「流式与提前出声」
 ```
+
+##### 规划时延相关字段
+
+规划是一次非流式调用，整段生成完才返回，所以「等首字」就是整段耗时。影响它的字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `timeout_sec` | 传给 socket 的空闲超时。非流式下服务端生成完才发第一个字节，所以它实际是「等首字」上限。默认 120 s 对对话偏宽 |
+| `enable_thinking` | 思考 token 会整段算进等待时间。**只有 base_url 含 `dashscope.aliyuncs.com` 时客户端才会下发原生的 `enable_thinking: false`**；其他 provider 各有各的写法，用 `extra_body` 下发 |
+| `max_tokens` | 规划输出只是一个小 JSON 对象。不设上限时模型可以一直写下去，每个多余 token 都加在说出第一句话之前 |
+| `extra_body` | 原样合并进请求体（最后合并），用于 provider 私有开关。不允许覆盖 `model`/`messages`/`input`/`stream` |
+| `catalog_view` | `planner` 只把 planner 可选的技能和它们的必要字段放进 prompt；`full` 保留旧行为（整个 catalog，含 `planner_visible=false` 的技能与校验用字段）。**无论取哪个值，workflow 校验与只读应答始终使用完整 catalog** |
+
+HTTP 连接在同一个 client 实例内复用（keep-alive），所以第一轮之后不再重复付
+DNS、TCP 与 TLS 握手。空闲连接只有一条：并发调用（如 `perception_service` 每个请求一个线程）
+发现它正被占用时各自新开连接，不排队等别人的模型调用。代理按改动前所用的 urllib 处理：
+`HTTPS_PROXY` 下 https 目标走 CONNECT（代理 URL 的 scheme 被忽略，缺省端口 443），
+账号与密码都非空才发送代理凭据。
+
+##### 流式与提前出声
+
+`stream: true` 把规划改成 SSE，并在模型吐出 `user_message` 这一个字段、它刚闭合时
+就把它作为 `/agent/event` 的 `reply_preview` 事件（`state=PLANNING`）发布，而不等整段
+计划生成完。Agent 自己不出声：由请求所属的通道决定怎么呈现——`agent_voice_bridge`
+在启用 TTS 时播报它，最终回答与它相同时不再重复；`chat_tui` 只显示一行事件。
+**只有回复提前，执行没有**：完整 JSON 到达后仍然走原来那套严格校验
+（`parse_planner_outcome` + `validate_workflow_steps`），任何不合法的计划照旧被拒。
+预告要等 `kind` 也到达才发布，且 `read_only` 不预告：它的回复会被 Gateway 的真实状态
+替换，先说模型自己的文字可能与之矛盾。
+
+代价是明确的：语音通道在计划通过校验**之前**就播报了回复，所以一个随后校验失败的计划
+会留下「说了但没做」——随后的 FAILED 终态会播报「执行失败」，ledger 里也留有这条
+`reply_preview` 记录。这比「每次都等着不说话」好，但比「错的计划就该沉默」差——
+这是有意选择的权衡，所以默认关闭，由部署显式开启。
+
+实测（`doubao-seed-2-1-lite`，真实 planner 请求，交替采样）：
+
+| 环境 | 非流式整段 | 流式可出声 | 提前 |
+| --- | --- | --- | --- |
+| 开发机 | 2478 ms | **1575 ms** | 803 ms |
+| 灵犀 X2（经 CONNECT 代理） | 1836 ms | **1443 ms** | 431 ms |
+
+X2 那一行同时验证了它的 CONNECT 代理不会缓冲 SSE（单次 51 个 chunk）——代理一旦缓冲，
+流式在机器人上就会静默失效，而在开发机上看起来一切正常。
+
+**流式的价值取决于模型**。它省下的是「答案生成」那一段，所以模型必须把时间花在生成上
+而不是花在思考上。实测对比：
+
+| 模型 | 思考阶段 | 答案阶段 | 流式可省 |
+| --- | --- | --- | --- |
+| `kimi-for-coding` | 2375 ms（99%） | 15 ms | **8 ms** |
+| `doubao-seed-2-1-lite`（关思考） | 852 ms 首字 | 1216 ms | **803 ms** |
+
+Kimi 的时间几乎全在出第一个字之前，答案本身 15 ms 就吐完，所以在它上面开流式没有意义。
+
+每次规划会记录一行 `planner call status=... timing_ms=... prompt_tokens=...
+completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）。
+**content 很短而 `completion_tokens` 很大，就是思考没关掉的特征。**
 
 #### Agent 孵化入口（entry_mode: agent）
 
@@ -1570,6 +1634,13 @@ robot:
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
 | `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
 | `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+| `agent.planner.enable_thinking` | 布尔 |
+| `agent.planner.max_tokens` | 未设置或正整数 |
+| `agent.planner.extra_body` | 映射；不得覆盖 `model`/`messages`/`input`/`stream` |
+| `agent.planner.catalog_view` | `planner` 或 `full` |
+| `agent.planner.stream` | 布尔；为 `true` 时提前发布 `reply_preview` 事件（由语音通道决定是否播报），执行仍需完整校验；要求 `api_protocol` 为 `chat_completions` |
+| `agent.planner.direct_commands` | 映射 `整句话语: 技能名`；整句精确匹配时不调用模型、直接生成单步计划（否定/假设句不触发，技能须在 live catalog 中且 planner 可选），提案的 `planner_identity` 记为 `route=direct_command`；`execution_enabled` 时每个技能都必须在 `test_allowlist` 内 |
+| `voice_asr.vad_*` / `voice_tts.num_steps` | 只校验 profile 实际配置的值：VAD 时长为有限正数（`post_roll` / `pre_roll` 可为 0），`num_steps` 为正整数；默认值归属 `voice_asr_service` / `voice_tts_service` |
 | `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
 | `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
 | `agent.voice_bridge.input_topic` | 绝对 topic；默认跟随 `voice_asr.output_topic` |
@@ -1587,7 +1658,12 @@ robot:
 （rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
 `so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
 （真机停止验证）、`so101_single_arm_agent_voice_gazebo`（仿真语音入口：ASR → voice bridge → Agent）、
-`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）。
+`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）、
+`so101_voice_latency`（语音时延测量：豆包关思考 + 流式 `reply_preview` + `num_steps: 4`，
+需要 `ARK_API_KEY`；其余 profile 的 Planner 与默认值不受影响。`so101_robot` runtime 没有麦克风，
+provider 路径上不能启用 ASR，文本经 `/voice_command` 注入，调优判停留给本地 VAD 部署按 `voice_asr.vad_*`
+开启（见 `voice_asr_service` README「判停时延」）；TTS 在旁单独启动，`num_steps` 要经 `runtime_options_json`
+一并传入，见 profile 注释）。
 运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约

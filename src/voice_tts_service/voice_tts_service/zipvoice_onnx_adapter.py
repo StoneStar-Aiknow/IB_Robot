@@ -33,8 +33,13 @@ class ZipVoiceOnnxSession(ModelSession):
 
     execution_contract = "request-iterative"
     orchestration_visibility = "session"
+    # ModelSession has no such attribute; this session is constructed by the
+    # session-builder registry, which passes the runtime options as keyword
+    # arguments, so the declaration is documentation plus a guard for callers
+    # that do check it (see AscendOmModelSession).
+    allowed_runtime_options = frozenset({"prompt_profile", "num_steps"})
 
-    def __init__(self, *, prompt_profile: str = "default", **kwargs) -> None:
+    def __init__(self, *, prompt_profile: str = "default", num_steps: int | None = None, **kwargs) -> None:
         super().__init__(
             "zipvoice-onnx",
             BackendCapabilities(
@@ -44,6 +49,7 @@ class ZipVoiceOnnxSession(ModelSession):
         )
         self._root: Path | None = None
         self._prompt_profile_name = prompt_profile
+        self._num_steps_override = num_steps
         self._config: dict[str, Any] = {}
         self._tokenizer: ChineseTokenizer | None = None
         self._prompt: PromptProfile | None = None
@@ -85,10 +91,23 @@ class ZipVoiceOnnxSession(ModelSession):
             raise SessionLoadError("ZipVoice ONNX session requires a compiled torch deployment")
         self._root = context.validated_manifest.bundle_root
         self._config = self._load_json(self._root / "assets" / "zipvoice_onnx.json")
+        # The flow-matching loop is run once per step and is ~98% of synthesis
+        # time, so num_steps is the dominant latency knob. It lives in the
+        # bundle asset, which is digest-verified and must not be edited in
+        # place, so allow a deployment to override it from robot_config.
+        self._apply_num_steps_override()
         rollback.defer(self._release_assets)
 
         self._load_onnx_models()
         self._load_assets()
+
+    def _apply_num_steps_override(self) -> None:
+        if self._num_steps_override is None:
+            return
+        num_steps = int(self._num_steps_override)
+        if num_steps < 1:
+            raise BackendLoadError(f"ZipVoice num_steps must be >= 1, got {num_steps}")
+        self._config["num_steps"] = num_steps
 
     def _load_onnx_models(self) -> None:
         try:

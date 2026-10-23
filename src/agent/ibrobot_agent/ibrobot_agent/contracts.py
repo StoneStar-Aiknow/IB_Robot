@@ -610,7 +610,16 @@ class Planner(Protocol):
         context: Mapping[str, Any],
         catalog: Mapping[str, Any],
         cancel_token: threading.Event,
-    ) -> PlannerOutcome: ...
+        *,
+        on_preview: Callable[[str], None] | None = None,
+    ) -> PlannerOutcome:
+        """Plan one request.
+
+        ``on_preview`` may be called at most once, before this returns, with
+        the reply text the model is producing. It is advisory: the outcome is
+        validated afterwards exactly as if no preview had been made.
+        """
+        ...
 
 
 class CatalogPort(Protocol):

@@ -220,6 +220,10 @@ class VoiceASRConfig:
     vad_sensitivity: float = 0.6
     vad_bundle_path: str = "models/silero-vad"
     vad_deployment: str = "torch_cpu"
+    vad_min_silence_duration: float = 0.5
+    vad_post_roll_ms: float = 500.0
+    vad_pre_roll_ms: float = 300.0
+    vad_min_speech_duration: float = 0.3
     realtime_pre_roll_seconds: float = 0.5
     final_tail_padding_seconds: float = 1.5
     publish_partial: bool = True

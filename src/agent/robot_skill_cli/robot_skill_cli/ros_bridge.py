@@ -281,18 +281,51 @@ class RosBridge:
             return False
         return True
 
-    @staticmethod
-    def _wait_future(future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+    #: How often a pending future is re-checked for the deadline and for an
+    #: interrupt. Completion itself does not wait for this tick -- it is
+    #: delivered by the future's done callback -- so this only bounds how
+    #: quickly a cancellation or a timeout is noticed.
+    _WAIT_POLL_SEC = 0.01
+
+    @classmethod
+    def _wait_future(cls, future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+        """Wait for a future, returning as soon as it completes.
+
+        This used to sleep in 10 ms steps and re-check ``future.done()``, which
+        added up to a full step to every call. The round trip itself is about
+        1 ms for even a six-figure payload, so most of the observed RPC time
+        was this sleep -- and the request path makes several calls in series.
+
+        Waiting on a done callback instead returns immediately on completion
+        while keeping the same 10 ms responsiveness to an interrupt, so
+        cancellation latency does not regress.
+        """
         deadline = time.monotonic() + timeout_sec
+        completed = threading.Event()
+        try:
+            future.add_done_callback(lambda _future: completed.set())
+        except Exception:
+            # A future implementation without done callbacks (some test
+            # doubles) still has to work; fall back to polling it.
+            while True:
+                if future.done():
+                    return True
+                if interrupt_event is not None and interrupt_event.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                time.sleep(min(cls._WAIT_POLL_SEC, remaining))
         while True:
+            remaining = deadline - time.monotonic()
+            if completed.wait(min(cls._WAIT_POLL_SEC, remaining) if remaining > 0 else 0):
+                return True
             if future.done():
                 return True
             if interrupt_event is not None and interrupt_event.is_set():
                 return False
-            remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
-            time.sleep(min(0.01, remaining))
 
     def wait_future(self, future, *, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
         return self._wait_future(future, timeout_sec, interrupt_event)

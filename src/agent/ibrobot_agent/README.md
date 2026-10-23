@@ -59,6 +59,14 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 
 节点另提供 `~/health` 与 `~/ready`（`std_srvs/Trigger`）。
 
+Planner 配置 `stream: true` 时，模型回答里的 `user_message` 一闭合，Agent 就在
+`/agent/event` 上发布一条 `reply_preview` 事件（`state=PLANNING`，正文在
+`user_message`），每个请求至多一次，请求已停止时不发；要等 `kind` 到达才发，
+`read_only` 不发（其回复由 Gateway 状态重建）。它只是**预告**：Agent 不渲染、
+不播报，计划仍在完整回答到达后按原样严格校验；事件同样写入 ledger。由通道决定是否
+呈现——`agent_voice_bridge` 在启用 TTS 时播报，并在最终回答与预告相同时不再重复；
+预告之后计划被拒，终态照常报失败。
+
 生产 Program 路径使用 `registry_epoch`、`registry_generation` 和
 `registry_digest` 绑定一次精确 Skill catalog snapshot；ExecutionStore 负责 root
 execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为兼容/诊断入口，不能作为
@@ -74,7 +82,11 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
 - 运动默认关闭：`execution_enabled=false` 时零 goal 提交，仅规划与应答。
 - 执行必须同时满足：非空 `test_allowlist`、Gateway readiness（live catalog 身份一致）、
   操作员 `authorize_motion` launch 参数。
-- 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。
+- 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。唯一例外是部署显式列出的
+  `planner.direct_commands`：整句精确匹配（否定/假设句不触发）时本地生成单步计划而不调用模型，
+  技能必须在 live catalog 中且 planner 可选、启用执行时还必须在 allowlist 内；之后的 Gateway
+  校验与执行路径与模型规划完全相同。提案的 `planner_identity` 记为 `route=direct_command`，
+  ledger 可区分这一步不是模型的决定。没有内置短语。
 - Planner 输出只接受单一严格 JSON 对象；未知字段、未知 skill、编造参数一律拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
@@ -181,6 +193,10 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
 - 请求超过 `request_timeout_sec`（默认 180 秒）仍无终态事件时，桥接先发送 stop 再释放通道并播报
   “任务超时，正在中止。”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
 - 「继续」由 Agent 处理（见下节），桥接只把它当普通话语发送，并播报 Agent 的 `continuation` 事件。
+- `reply_preview` 事件（流式 Planner 的提前回复）只对当前活动请求播报一次；终态回复与它相同则不再重复。
+  桥接已对该请求发出 stop 后到达的预告不播报（Agent 可能尚未收到 stop）。typed Program 的
+  “正在执行：…”在已有预告时不再播报（预告已经说过要做什么，这一句没有回执在等）；旧回执路径仍播报
+  exact plan，因为它的回执表示用户听到的是计划本身，而预告只是模型的文字。
 - **typed Program（真机与仿真经 Gateway 的默认路径）不等待任何回执**（见上文「typed Program：异步展示」）：
   `presentation` 事件带 `async_display: true` 时，桥接只播报（无 TTS 时写日志）“正在执行：…”，不回执、
   不询问确认——机器人此时可能已经在动，再问“请说确认或取消”只会误导用户。语音通道对运动的控制手段是

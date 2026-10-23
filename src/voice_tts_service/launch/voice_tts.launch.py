@@ -5,6 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -18,6 +19,8 @@ def generate_launch_description():
             DeclareLaunchArgument("audio_topic", default_value="/audio/play"),
             DeclareLaunchArgument("playback_sample_rate", default_value="24000"),
             DeclareLaunchArgument("playback_channels", default_value="1"),
+            # JSON object of adapter runtime options, e.g. '{"num_steps": 4}'.
+            DeclareLaunchArgument("runtime_options_json", default_value="{}"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -37,7 +40,9 @@ def generate_launch_description():
                         "adapter_class": "voice_tts_service.model_service_plugin:ZipVoiceSynthesizePlugin",
                         "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
                         "service_endpoint": LaunchConfiguration("service_name"),
-                        "runtime_options_json": "{}",
+                        "runtime_options_json": ParameterValue(
+                            LaunchConfiguration("runtime_options_json"), value_type=str
+                        ),
                     }
                 ],
             ),

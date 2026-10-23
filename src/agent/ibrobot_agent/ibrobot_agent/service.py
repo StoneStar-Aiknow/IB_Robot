@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import threading
@@ -45,7 +46,7 @@ from ibrobot_agent.contracts import (
     planner_outcome_to_mapping,
     request_hash_text,
 )
-from ibrobot_agent.planner import RulePlanner, read_only_outcome
+from ibrobot_agent.planner import RulePlanner, direct_command_outcome, read_only_outcome
 
 _LOGGER = logging.getLogger(__name__)
 _trace = create_trace_logger("ib_trace.agent")
@@ -159,6 +160,7 @@ class AgentService:
         allowed_skills: set[str] | None = None,
         max_planning_workers: int = 1,
         robot_scope: str = "so101_single_arm",
+        direct_commands: Mapping[str, str] | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -172,6 +174,21 @@ class AgentService:
         self._execution_enabled = execution_enabled
         self._allowed_skills = frozenset(allowed_skills or ())
         self._robot_scope = robot_scope
+        # Utterance -> skill name. Empty by default: no phrase reaches the robot
+        # without the planner unless a deployment opted it in.
+        self._direct_commands = dict(direct_commands or {})
+        # A shortcut is not the model's decision, so a proposal it produced
+        # must not be recorded under the model's identity.
+        self._direct_identity = PlannerIdentity(
+            route="direct_command",
+            returned_model="none",
+            protocol="phrase_table",
+            prompt_version="none",
+            schema_version=planner.identity.schema_version,
+            config_digest=hashlib.sha256(
+                json.dumps(self._direct_commands, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        )
         if execution_enabled and not self._allowed_skills:
             raise ValueError("execution-enabled AgentService requires a non-empty incubation allowlist")
         if execution_enabled and execution is None:
@@ -408,13 +425,35 @@ class AgentService:
                         detail_json=json.dumps({"step_count": len(replayed.steps)}, sort_keys=True),
                     )
             query = None if replayed is not None else read_only_outcome(planned_request.text)
+            direct = (
+                None
+                if replayed is not None or query is not None
+                else direct_command_outcome(planned_request.text, self._direct_commands, catalog)
+            )
+            planned_by = self._planner.identity
             if replayed is not None:
                 outcome = replayed
+                planned_by = LEDGER_REPLAY_IDENTITY
             elif query is not None:
                 outcome = query
+            elif direct is not None:
+                # Skips the model call entirely; the Gateway still validates the
+                # workflow against the same catalog as a planned one.
+                _trace.info(
+                    "direct command matched",
+                    extra={"request_id": request.request_id, "skill": direct.summary},
+                )
+                outcome = direct
+                planned_by = self._direct_identity
             else:
                 with trace_stage(_trace, "agent.planner", request_id=request.request_id):
-                    outcome = self._planner.plan(planned_request, planner_context, catalog, cancel_token)
+                    outcome = self._planner.plan(
+                        planned_request,
+                        planner_context,
+                        catalog,
+                        cancel_token,
+                        on_preview=lambda text: self._emit_reply_preview(key, text, cancel_token),
+                    )
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
@@ -451,7 +490,7 @@ class AgentService:
                 planning_generation=record.planning_generation,
                 catalog_identity=identity,
                 outcome=outcome,
-                planner_identity=LEDGER_REPLAY_IDENTITY if replayed is not None else self._planner.identity,
+                planner_identity=planned_by,
             )
             record = self._store.mark_proposal_ready(key, expected_generation=record.planning_generation)
             self._store.record_event(
@@ -535,6 +574,17 @@ class AgentService:
             if gateway_error:
                 _LOGGER.warning("Continuation %s cannot read the Gateway ledger: %s", request.request_id, gateway_error)
         return decide_continuation(anchor, gateway=gateway, gateway_error=gateway_error, previous_hint=previous_hint)
+
+    def _emit_reply_preview(self, key: RequestKey, text: str, cancel_token: threading.Event) -> None:
+        """Publish the reply the planner is still producing, ahead of its outcome.
+
+        Only an event: the Agent does not speak or render anything itself. The
+        channel that owns the request decides whether to present it, and the
+        ledger keeps the record that it was offered before validation.
+        """
+        if cancel_token.is_set():
+            return
+        self._emit(key, "reply_preview", "PLANNING", text)
 
     def _finish_cancel_before_execution(self, key: RequestKey, generation: int) -> None:
         self._store.finish(

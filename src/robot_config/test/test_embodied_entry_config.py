@@ -661,3 +661,195 @@ def test_enabled_embodied_config_uses_configured_default_place_pose(monkeypatch,
 
     assert validate_config(config) == []
     assert config.embodied.default_place_name in config.embodied.named_poses
+
+
+def _agent_planner_launch_dict(**planner_overrides):
+    planner = {
+        "mode": "vlm",
+        "provider": "openai_compatible",
+        "base_url": "https://example.invalid/v1",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "model": "test-model",
+    }
+    planner.update(planner_overrides)
+    return {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "execution_enabled": False,
+                "test_allowlist": ["wave_hello"],
+                "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+                "planner": planner,
+            },
+        }
+    }
+
+
+def test_launch_dict_accepts_the_planner_latency_options():
+    errors = validate_embodied_launch_dict(
+        _agent_planner_launch_dict(
+            enable_thinking=False,
+            max_tokens=512,
+            extra_body={"thinking": {"type": "disabled"}},
+            catalog_view="planner",
+        )
+    )
+
+    assert [error for error in errors if "planner" in error] == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"enable_thinking": "false"}, "embodied.agent.planner.enable_thinking must be a boolean"),
+        ({"max_tokens": 0}, "embodied.agent.planner.max_tokens must be a positive integer when set"),
+        ({"max_tokens": True}, "embodied.agent.planner.max_tokens must be a positive integer when set"),
+        ({"max_tokens": 1.5}, "embodied.agent.planner.max_tokens must be a positive integer when set"),
+        ({"extra_body": ["thinking"]}, "embodied.agent.planner.extra_body must be a mapping"),
+        ({"catalog_view": "trimmed"}, "embodied.agent.planner.catalog_view must be 'planner' or 'full'"),
+    ],
+)
+def test_launch_dict_rejects_bad_planner_latency_options(overrides, expected):
+    """These are silently ignored if unvalidated.
+
+    The planner config is a free-form dict, so a wrong type or a typo would
+    surface only as "the robot is still slow", never as an error.
+    """
+    assert expected in validate_embodied_launch_dict(_agent_planner_launch_dict(**overrides))
+
+
+def test_launch_dict_rejects_extra_body_that_overrides_the_request():
+    """extra_body is merged last; it must not be able to rewrite the request."""
+    errors = validate_embodied_launch_dict(
+        _agent_planner_launch_dict(extra_body={"model": "other-model", "messages": []})
+    )
+
+    assert "embodied.agent.planner.extra_body must not override request fields: messages, model" in errors
+
+
+def test_launch_dict_accepts_direct_command_shortcuts():
+    errors = validate_embodied_launch_dict(
+        _agent_planner_launch_dict(direct_commands={"点头": "nod_yes", "停": "recover_safe_pose"})
+    )
+
+    assert [error for error in errors if "direct_commands" in error] == []
+
+
+def test_launch_dict_rejects_shortcuts_to_skills_the_deployment_cannot_run():
+    """A shortcut skips the model, so a skill outside the allowlist is a config error up front."""
+    launch_dict = _agent_planner_launch_dict(direct_commands={"挥手": "wave_hello", "点头": "nod_yes"})
+    launch_dict["embodied"]["agent"]["execution_enabled"] = True
+
+    errors = validate_embodied_launch_dict(launch_dict)
+
+    assert "embodied.agent.planner.direct_commands name skills outside test_allowlist: nod_yes" in errors
+
+
+def test_launch_dict_rejects_streaming_over_the_responses_protocol():
+    """The stream reader assembles chat deltas; Responses events would read as an empty answer."""
+    errors = validate_embodied_launch_dict(_agent_planner_launch_dict(stream=True, api_protocol="responses"))
+
+    assert "embodied.agent.planner.stream requires api_protocol chat_completions" in errors
+
+
+@pytest.mark.parametrize(
+    ("value", "fragment"),
+    [
+        (["点头"], "must be a mapping"),
+        ({"": "nod_yes"}, "non-empty utterances"),
+        ({"点头": ""}, "must name a skill"),
+        ({"点头": 7}, "must name a skill"),
+    ],
+)
+def test_launch_dict_rejects_bad_direct_command_shortcuts(value, fragment):
+    """These phrases reach the robot without the model seeing them.
+
+    A silently ignored typo here means the shortcut never fires and nobody
+    notices, so the mapping is validated rather than best-effort parsed.
+    """
+    errors = validate_embodied_launch_dict(_agent_planner_launch_dict(direct_commands=value))
+
+    assert any(fragment in error for error in errors), errors
+
+
+def test_launch_dict_accepts_the_streaming_switch():
+    assert [e for e in validate_embodied_launch_dict(_agent_planner_launch_dict(stream=True)) if "stream" in e] == []
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_launch_dict_rejects_a_non_boolean_stream(value):
+    """A truthy string would silently enable the early reply, which changes when
+    a voice channel commits to talking."""
+    assert "embodied.agent.planner.stream must be a boolean" in validate_embodied_launch_dict(
+        _agent_planner_launch_dict(stream=value)
+    )
+
+
+def test_voice_latency_profile_loads_on_its_provider_path():
+    """The measurement profile must load on the provider path it runs on.
+
+    Audio devices are runtime-owned there, so an audio_io section is rejected;
+    the profile keeps voice_tts unlaunched and lets the voice bridge, which
+    says the planner's reply_preview, speak through the named TTS services.
+    """
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_voice_latency.yaml"
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
+
+    assert "audio_io" not in config
+    assert config["voice_tts"]["enabled"] is False
+    # The latency trades are opted into here, not changed for every deployment.
+    assert config["voice_tts"]["num_steps"] == 4
+    # No microphone on this runtime, so voice_asr cannot be launched from here: a tuned
+    # endpoint in this profile would be a setting that reaches nothing.
+    assert config["voice_asr"].get("enabled") is not True
+    assert "vad_min_silence_duration" not in config["voice_asr"]
+    assert "vad_post_roll_ms" not in config["voice_asr"]
+    agent = config["embodied"]["agent"]
+    assert agent["voice_bridge"]["enabled"] is True
+    assert agent["voice_bridge"]["tts_enabled"] is True
+    assert agent["planner"]["stream"] is True
+
+
+@pytest.mark.parametrize("config_name", ["so101_agent_manual", "so101_agent_manual_hardware"])
+def test_shared_agent_profiles_keep_their_planner(config_name):
+    """Measurement choices stay in the latency profile; shared bases do not change provider."""
+    config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
+    planner = load_robot_config_dict(config_path, defer_interface_binding=True)["embodied"]["agent"]["planner"]
+
+    assert planner["model"] == "kimi-for-coding"
+    assert planner.get("stream", False) is False
+
+
+@pytest.mark.parametrize(
+    ("section", "values", "message"),
+    [
+        (
+            "voice_asr",
+            {"vad_min_silence_duration": 0},
+            "voice_asr.vad_min_silence_duration must be a finite positive number",
+        ),
+        ("voice_asr", {"vad_post_roll_ms": -1}, "voice_asr.vad_post_roll_ms must be a finite non-negative number"),
+        (
+            "voice_asr",
+            {"vad_min_speech_duration": "0.3"},
+            "voice_asr.vad_min_speech_duration must be a finite positive number",
+        ),
+        ("voice_tts", {"num_steps": 0}, "voice_tts.num_steps must be a positive integer"),
+        ("voice_tts", {"num_steps": True}, "voice_tts.num_steps must be a positive integer"),
+    ],
+)
+def test_voice_latency_knobs_are_range_checked(section, values, message):
+    from robot_config.loader import validate_voice_latency_options
+
+    assert message in validate_voice_latency_options({section: values})
+
+
+def test_unset_voice_latency_knobs_are_not_an_error():
+    from robot_config.loader import validate_voice_latency_options
+
+    assert validate_voice_latency_options({"voice_asr": {"vad_post_roll_ms": 0}, "voice_tts": {"num_steps": 4}}) == []

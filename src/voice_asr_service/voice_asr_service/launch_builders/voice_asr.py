@@ -290,6 +290,16 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     voice_asr_config.get("vad_bundle_path", voice_asr_defaults["vad_bundle_path"])
                 ),
                 "vad_deployment": voice_asr_config.get("vad_deployment", voice_asr_defaults["vad_deployment"]),
+                # VAD endpointing timings; defaults live only in VOICE_ASR_DEFAULTS.
+                **{
+                    name: float(voice_asr_config.get(name, voice_asr_defaults[name]))
+                    for name in (
+                        "vad_min_silence_duration",
+                        "vad_post_roll_ms",
+                        "vad_pre_roll_ms",
+                        "vad_min_speech_duration",
+                    )
+                },
                 "realtime_pre_roll_seconds": voice_asr_config.get(
                     "realtime_pre_roll_seconds", voice_asr_defaults["realtime_pre_roll_seconds"]
                 ),

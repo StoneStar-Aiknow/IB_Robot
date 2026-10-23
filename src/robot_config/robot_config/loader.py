@@ -2079,6 +2079,43 @@ def validate_runtime_owned_audio_config(robot_config: dict[str, Any]) -> list[st
     return errors
 
 
+def validate_voice_latency_options(robot_config: dict[str, Any]) -> list[str]:
+    """Check the per-utterance latency knobs a profile may set.
+
+    Their defaults live in the owning packages (VOICE_ASR_DEFAULTS and
+    VOICE_TTS_DEFAULTS); only values a profile actually sets are checked here,
+    because a wrong one shows up as "the robot is slow" or clipped speech
+    rather than as an error.
+    """
+    errors: list[str] = []
+    voice_asr = robot_config.get("voice_asr") or {}
+    if isinstance(voice_asr, dict):
+        for name, allow_zero in (
+            ("vad_min_silence_duration", False),
+            ("vad_min_speech_duration", False),
+            ("vad_post_roll_ms", True),
+            ("vad_pre_roll_ms", True),
+        ):
+            if name not in voice_asr:
+                continue
+            value = voice_asr[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and not allow_zero)
+            ):
+                bound = "non-negative" if allow_zero else "positive"
+                errors.append(f"voice_asr.{name} must be a finite {bound} number")
+    voice_tts = robot_config.get("voice_tts") or {}
+    if isinstance(voice_tts, dict) and "num_steps" in voice_tts:
+        num_steps = voice_tts["num_steps"]
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 1:
+            errors.append("voice_tts.num_steps must be a positive integer")
+    return errors
+
+
 def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfaces: bool = False) -> None:
     """Validate an effective config, including an in-memory launch binding before snapshotting."""
     validation_errors = validate_navigation_endpoint_contract(robot_config)
@@ -2104,6 +2141,7 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
     validation_errors.extend(validate_speech_direction_config(robot_config))
+    validation_errors.extend(validate_voice_latency_options(robot_config))
     if not deferred_interfaces:
         try:
             validation_errors.extend(validate_robot_config_observation_transports(robot_config))
@@ -2268,6 +2306,10 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         vad_sensitivity=data.get("vad_sensitivity", defaults.vad_sensitivity),
         vad_bundle_path=resolve_ros_path(data.get("vad_bundle_path", defaults.vad_bundle_path)),
         vad_deployment=data.get("vad_deployment", defaults.vad_deployment),
+        vad_min_silence_duration=data.get("vad_min_silence_duration", defaults.vad_min_silence_duration),
+        vad_post_roll_ms=data.get("vad_post_roll_ms", defaults.vad_post_roll_ms),
+        vad_pre_roll_ms=data.get("vad_pre_roll_ms", defaults.vad_pre_roll_ms),
+        vad_min_speech_duration=data.get("vad_min_speech_duration", defaults.vad_min_speech_duration),
         realtime_pre_roll_seconds=data.get("realtime_pre_roll_seconds", defaults.realtime_pre_roll_seconds),
         final_tail_padding_seconds=data.get("final_tail_padding_seconds", defaults.final_tail_padding_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
@@ -2732,7 +2774,59 @@ def validate_agent_entry_config(embodied: dict[str, Any]) -> list[str]:
             and planner.get("temperature", 1.0) != 1.0
         ):
             errors.append("embodied.agent.planner.temperature must be 1 for kimi-for-coding")
+        errors.extend(_validate_planner_latency_options(planner))
+        direct_commands = planner.get("direct_commands", {})
+        if execution_enabled is True and isinstance(direct_commands, dict) and isinstance(allowlist, list):
+            # A shortcut resolves without the model, so a skill the deployment
+            # cannot run is a configuration error, not a turn that fails later.
+            outside = sorted({str(skill) for skill in direct_commands.values()} - set(allowlist))
+            if outside:
+                errors.append(
+                    "embodied.agent.planner.direct_commands name skills outside test_allowlist: " + ", ".join(outside)
+                )
     errors.extend(_validate_agent_voice_bridge(agent.get("voice_bridge")))
+    return errors
+
+
+def _validate_planner_latency_options(planner: dict[str, Any]) -> list[str]:
+    """Validate the knobs that decide how long one planning turn takes.
+
+    These are silently ignored when misspelled (the planner config is a free
+    dict), and the symptom is "the robot is still slow" rather than an error,
+    so the values themselves are checked here.
+    """
+    errors: list[str] = []
+    enable_thinking = planner.get("enable_thinking", True)
+    if not isinstance(enable_thinking, bool):
+        errors.append("embodied.agent.planner.enable_thinking must be a boolean")
+    max_tokens = planner.get("max_tokens")
+    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0):
+        errors.append("embodied.agent.planner.max_tokens must be a positive integer when set")
+    extra_body = planner.get("extra_body", {})
+    if not isinstance(extra_body, dict):
+        errors.append("embodied.agent.planner.extra_body must be a mapping")
+    else:
+        reserved = sorted({"model", "messages", "input", "stream"}.intersection(extra_body))
+        if reserved:
+            errors.append("embodied.agent.planner.extra_body must not override request fields: " + ", ".join(reserved))
+    catalog_view = planner.get("catalog_view", "planner")
+    if catalog_view not in {"planner", "full"}:
+        errors.append("embodied.agent.planner.catalog_view must be 'planner' or 'full'")
+    if not isinstance(planner.get("stream", False), bool):
+        errors.append("embodied.agent.planner.stream must be a boolean")
+    elif planner.get("stream", False) and planner.get("api_protocol", "chat_completions") == "responses":
+        errors.append("embodied.agent.planner.stream requires api_protocol chat_completions")
+    direct_commands = planner.get("direct_commands", {})
+    if not isinstance(direct_commands, dict):
+        errors.append("embodied.agent.planner.direct_commands must be a mapping of utterance to skill name")
+    else:
+        for phrase, skill in direct_commands.items():
+            if not isinstance(phrase, str) or not phrase.strip():
+                errors.append("embodied.agent.planner.direct_commands keys must be non-empty utterances")
+                break
+            if not isinstance(skill, str) or not skill.strip():
+                errors.append(f"embodied.agent.planner.direct_commands[{phrase!r}] must name a skill")
+                break
     return errors
 
 

@@ -29,8 +29,18 @@ class FakePlanner:
         self.outcome = outcome
         self.calls = 0
 
-    def plan(self, request, context, catalog, cancel_token):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
         self.calls += 1
+        return self.outcome
+
+
+class PreviewingPlanner(FakePlanner):
+    """Hand the reply over mid-plan, as a streaming model planner does."""
+
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
+        self.calls += 1
+        if on_preview is not None:
+            on_preview(self.outcome.user_message)
         return self.outcome
 
 
@@ -40,7 +50,7 @@ class BlockingPlanner(FakePlanner):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def plan(self, request, context, catalog, cancel_token):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
         self.calls += 1
         self.started.set()
         self.release.wait(2)
@@ -195,6 +205,106 @@ def test_conversation_is_answered_without_execution(tmp_path):
         assert service._store.get_request(_request().to_key()).state == "ANSWERED"
     finally:
         service.close()
+
+
+def _wait_for_event(events, event_type):
+    # The ledger state flips before the event is published, so wait on the event itself.
+    for _ in range(200):
+        if any(event.event_type == event_type for event in events.items):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"no {event_type} event was published")
+
+
+def test_a_planner_preview_is_published_as_an_event_before_the_answer(tmp_path):
+    """The Agent only publishes the preview; channels decide whether to say it."""
+    events = Events()
+    service = AgentService(
+        planner=PreviewingPlanner(PlannerOutcome(kind="conversation", user_message="你好呀")),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=events,
+    )
+    try:
+        assert service.send_message(_request()).accepted
+        _wait_for_event(events, "conversation")
+        published = [(event.event_type, event.state, event.user_message) for event in events.items]
+        assert published[0] == ("reply_preview", "PLANNING", "你好呀")
+        assert published[-1][0] == "conversation"
+        # The ledger keeps what was offered before validation.
+        assert service._store.latest_event_detail(_request().to_key(), "reply_preview")["message"] == "你好呀"
+    finally:
+        service.close()
+
+
+def test_a_preview_is_not_published_for_a_stopped_request(tmp_path):
+    events = Events()
+    service = AgentService(
+        planner=PreviewingPlanner(PlannerOutcome(kind="conversation", user_message="你好呀")),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=events,
+    )
+    cancelled = threading.Event()
+    cancelled.set()
+    try:
+        service._emit_reply_preview(_request().to_key(), "你好呀", cancelled)
+        assert events.items == []
+    finally:
+        service.close()
+
+
+def _proposal_identity(service):
+    for _ in range(200):
+        snapshot = service._store.latest_event_detail(_request().to_key(), "proposal_snapshot")
+        if snapshot is not None:
+            return snapshot["planner_identity"]
+        time.sleep(0.01)
+    raise AssertionError("no proposal was recorded")
+
+
+def test_a_direct_command_proposal_is_not_attributed_to_the_model(tmp_path):
+    """The ledger must show that no model chose this plan."""
+    planner = FakePlanner(PlannerOutcome(kind="conversation", user_message="unused"))
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+        direct_commands={"挥手": "wave_hello"},
+    )
+    try:
+        assert service.send_message(_request(text="挥手")).accepted
+        identity = _proposal_identity(service)
+    finally:
+        service.close()
+
+    assert planner.calls == 0
+    assert identity["route"] == "direct_command"
+    assert identity["returned_model"] == "none"
+
+
+def test_a_planned_proposal_keeps_the_planner_identity(tmp_path):
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="准备挥手",
+        summary="wave_hello",
+        steps=(CanonicalWorkflowStep(1, "wave_hello"),),
+    )
+    service = AgentService(
+        planner=FakePlanner(outcome),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+        direct_commands={"点头": "nod_yes"},
+    )
+    try:
+        assert service.send_message(_request(text="跟大家打个招呼")).accepted
+        identity = _proposal_identity(service)
+    finally:
+        service.close()
+
+    assert identity["route"] == "fake"
 
 
 def test_conversation_remains_available_when_gateway_is_offline(tmp_path):

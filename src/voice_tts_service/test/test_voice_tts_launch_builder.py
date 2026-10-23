@@ -23,6 +23,16 @@ def _node_parameters(node):
     return parameters
 
 
+def _runtime_options(node):
+    """Parse runtime_options_json out of the YAML-wrapped launch parameter."""
+    import json
+
+    raw = _node_parameters(node)["runtime_options_json"].strip()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1]
+    return json.loads("".join(line.strip() for line in raw.splitlines()))
+
+
 def test_voice_tts_builder_does_not_open_bundle_before_node_start(monkeypatch, tmp_path):
     defaults = {
         "enabled": False,
@@ -192,3 +202,55 @@ def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypat
     parameters = _playback_parameters(nodes)
     assert parameters["audio_topic"] == "/audio/play"
     assert parameters["playback_sample_rate"] == 24000
+
+
+def test_voice_tts_builder_passes_num_steps_to_the_session(monkeypatch, tmp_path):
+    """The flow step count must be reachable from YAML.
+
+    It is ~98% of synthesis time and linear in the step count, but it lives in
+    a digest-verified bundle asset, so the only way to pick a different
+    latency/quality point is to send it as a runtime option.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
+
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+                "num_steps": 2,
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+    options = _runtime_options(nodes[0])
+
+    assert options["num_steps"] == 2
+
+
+def test_voice_tts_builder_leaves_num_steps_to_the_bundle_when_unset(monkeypatch, tmp_path):
+    """Unset in YAML, the session uses the step count its bundle ships with.
+
+    Fewer steps is a measured trade a profile opts into; it must not change
+    every deployment that never asked for it.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
+
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+    options = _runtime_options(nodes[0])
+
+    assert "num_steps" not in options

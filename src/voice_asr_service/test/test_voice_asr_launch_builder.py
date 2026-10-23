@@ -82,6 +82,10 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.vad_bundle_path == VOICE_ASR_DEFAULTS["vad_bundle_path"]
     assert config_defaults.vad_deployment == VOICE_ASR_DEFAULTS["vad_deployment"]
     assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+    assert config_defaults.vad_min_silence_duration == VOICE_ASR_DEFAULTS["vad_min_silence_duration"]
+    assert config_defaults.vad_post_roll_ms == VOICE_ASR_DEFAULTS["vad_post_roll_ms"]
+    assert config_defaults.vad_pre_roll_ms == VOICE_ASR_DEFAULTS["vad_pre_roll_ms"]
+    assert config_defaults.vad_min_speech_duration == VOICE_ASR_DEFAULTS["vad_min_speech_duration"]
     assert config_defaults.final_tail_padding_seconds == VOICE_ASR_DEFAULTS["final_tail_padding_seconds"]
     assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
     assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
@@ -275,6 +279,10 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
             "vad_sensitivity": 0.6,
             "vad_bundle_path": "models/silero-vad",
             "vad_deployment": "torch_cpu",
+            "vad_min_silence_duration": 0.5,
+            "vad_post_roll_ms": 500.0,
+            "vad_pre_roll_ms": 300.0,
+            "vad_min_speech_duration": 0.3,
             "realtime_pre_roll_seconds": 0.5,
             "final_tail_padding_seconds": 1.5,
             "publish_partial": True,

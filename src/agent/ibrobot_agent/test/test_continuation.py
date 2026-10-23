@@ -267,9 +267,9 @@ class _CountingPlanner(RulePlanner):
     def __init__(self):
         self.calls = 0
 
-    def plan(self, request, context, catalog, cancel_token):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
         self.calls += 1
-        return super().plan(request, context, catalog, cancel_token)
+        return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
 
 
 def _service(tmp_path, gateway, *, planner=None):

@@ -460,6 +460,59 @@ def _skill_entry(view: dict[str, Any], skill_name: str) -> dict[str, Any]:
     raise UnknownSkillError(normalized_name)
 
 
+#: Fields a planner needs to choose a skill and fill its parameters. Everything
+#: else in a capability entry exists for validation and execution, which happen
+#: locally against the full view after the model answers.
+_PLANNER_SKILL_FIELDS = (
+    "summary",
+    "domain",
+    "semantic_level",
+    "moves_robot",
+    "required_control_mode",
+    "parameters",
+    "schema_version",
+)
+
+
+def planner_catalog_view(view: dict[str, Any]) -> dict[str, Any]:
+    """Return the smallest catalog a planner prompt needs.
+
+    Every planning turn serializes this into the request body, so its size is
+    paid in prompt tokens and in time-to-first-token on each turn. Two things
+    are dropped: skills the planner is not allowed to choose (they were sent
+    with ``planner_visible: false``, which only invited the model to try them),
+    and per-skill fields that exist for local validation and execution.
+
+    This is a prompt-shaping view only. Workflow validation and the read-only
+    answers must keep using the full view, which is the authority on what the
+    robot can actually do.
+
+    The view may be empty: with the Gateway offline the Agent still plans
+    against ``{}`` so a conversation can be answered, and only a workflow is
+    refused afterwards. So no field is required here.
+    """
+    skills = [
+        {
+            "name": skill["name"],
+            **{field: copy.deepcopy(skill[field]) for field in _PLANNER_SKILL_FIELDS if field in skill},
+        }
+        for skill in view.get("skills", [])
+        if skill.get("planner_visible", True)
+    ]
+    projected = {
+        "robot_name": view.get("robot_name", ""),
+        "skills": skills,
+        "pose_names": list(view.get("pose_names", [])),
+        "capability_digest": view.get("capability_digest", ""),
+    }
+    # Control-plane state changes what the planner may propose right now, so it
+    # stays even though it is not part of the skill list.
+    for field in ("control_plane_ready", "active_control_mode", "motion_authorized"):
+        if field in view:
+            projected[field] = view[field]
+    return projected
+
+
 def list_skills(view: dict[str, Any]) -> dict[str, Any]:
     skills = []
     for skill in view["skills"]:

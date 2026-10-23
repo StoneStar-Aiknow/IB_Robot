@@ -645,3 +645,74 @@ def test_program_goal_names_the_execution_it_continues():
     )
 
     assert [goal.continues_from_execution_id for goal in sent] == ["", "exec-1"]
+
+
+def test_wait_future_returns_as_soon_as_the_future_completes():
+    """Polling added up to 10 ms to every RPC, and the request path chains several.
+
+    The round trip is about 1 ms even for a six-figure payload, so the sleep
+    dominated what looked like transport time.
+    """
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()
+    threading.Timer(0.02, lambda: future.set_result("done")).start()
+
+    started = time.monotonic()
+    assert RosBridge._wait_future(future, 5.0) is True
+    elapsed = time.monotonic() - started
+
+    # Completion is delivered by the done callback, not by the next poll tick.
+    assert elapsed < 0.02 + RosBridge._WAIT_POLL_SEC
+
+
+def test_wait_future_still_honours_an_interrupt_within_one_poll():
+    """Cancellation latency must not regress for the sake of throughput."""
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()  # never completes
+    interrupt = threading.Event()
+    threading.Timer(0.02, interrupt.set).start()
+
+    started = time.monotonic()
+    assert RosBridge._wait_future(future, 5.0, interrupt) is False
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.02 + 3 * RosBridge._WAIT_POLL_SEC
+
+
+def test_wait_future_still_times_out():
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()
+    started = time.monotonic()
+
+    assert RosBridge._wait_future(future, 0.05) is False
+
+    assert time.monotonic() - started >= 0.05
+
+
+def test_wait_future_falls_back_for_a_future_without_done_callbacks():
+    """Test doubles and older future shapes must keep working."""
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    class _Bare:
+        def __init__(self):
+            self.checks = 0
+
+        def add_done_callback(self, _callback):
+            raise AttributeError("no done callbacks here")
+
+        def done(self):
+            self.checks += 1
+            return self.checks > 2
+
+    bare = _Bare()
+    assert RosBridge._wait_future(bare, 5.0) is True
+    assert bare.checks > 2
