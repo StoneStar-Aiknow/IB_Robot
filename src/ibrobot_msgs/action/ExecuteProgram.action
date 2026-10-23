@@ -21,6 +21,11 @@ string expected_registry_digest
 WorkflowStep[] workflow_steps
 float32 task_budget_sec
 string trace_id
+# "" for a new task. Otherwise the execution this Program continues: the
+# Gateway checks that it is this robot's latest execution, that it was
+# cancelled with a resume checkpoint, and that workflow_steps[0] is the step it
+# interrupted; the step then resumes from its checkpoint. Part of the digest.
+string continues_from_execution_id
 ---
 # --- Result ---
 bool success
