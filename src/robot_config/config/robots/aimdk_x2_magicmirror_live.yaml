@@ -16,7 +16,13 @@
 
 robot:
   base_config: aimdk_x2_magicmirror_board.yaml
-  name: aimdk_x2_magicmirror_live
+  # The skill catalog profile is keyed by this name (as in R1novoice).
+  name: aimdk_x2_magicmirror
+
+  embodied:
+    # The skill executor and daemon that serve the Gateway (mirror_start /
+    # mirror_stop) read the catalog from this tree's source.
+    skill_catalog_source_root: src/agent/skill_catalog
 
   mirror_session:
     publish_enabled: true

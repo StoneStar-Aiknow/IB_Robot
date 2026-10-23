@@ -25,6 +25,8 @@ def test_phrases_map_to_subjects():
     assert classify("正在挥手打招呼") == ("action", "wave")
     assert classify("双手举高伸懒腰") == ("action", "stretch")
     assert classify("拿着一个玩偶") == ("object", "toy")
+    # Said on the board, 10-23.
+    assert classify("画面里离镜头最近的人正在用右手做手势。") == ("action", "gesture")
     assert classify("无") is None
     assert classify("") is None
     assert classify(None) is None

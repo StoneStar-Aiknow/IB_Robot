@@ -336,6 +336,10 @@ class VisualInteractionNode(Node):
 
         self.create_timer(float(self._value("round_period_sec")), self._on_round)
         self.create_timer(float(self._value("status_period_sec")), self._publish_status)
+        if self._mode == "chatter":
+            # Pay the ~20 s model load while the mirror still waits, not in
+            # the first mirroring round, where it ate the visitor's turn.
+            self._preload_timer = self.create_timer(1.0, self._preload)
         self.get_logger().info(
             f"visual interaction on {camera.endpoint}; actor_state={actor_topic or '(none)'}; "
             f"mirror_state={self._mirror_topic or '(none)'}; "
@@ -524,6 +528,18 @@ class VisualInteractionNode(Node):
         self._publish(result, window)
 
     # -- chatter ----------------------------------------------------------
+
+    def _preload(self) -> None:
+        self._preload_timer.cancel()
+        load = getattr(self._session.hooks.vision, "load", None)
+        if load is None:
+            return
+        try:
+            load()
+        except Exception as error:  # noqa: BLE001 - the first round retries and reports it
+            self.get_logger().warning(f"model preload failed: {error}")
+            return
+        self.get_logger().info("model preloaded")
 
     def _on_voice_status(self, message: String) -> None:
         try:

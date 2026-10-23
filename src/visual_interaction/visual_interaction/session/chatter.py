@@ -185,6 +185,17 @@ ACTIONS: tuple[Subject, ...] = (
             "看到你的笑容，今天都亮起来了！",
         ),
     ),
+    # Last: what the 1B model says most on the board ("正在用右手做手势")
+    # when it does not name the gesture.
+    Subject(
+        "gesture",
+        ("手势", "右手", "左手", "双手", "手臂", "抬"),
+        (
+            "你的手势好有范儿，我也学一学！",
+            "这个动作真棒，我们配合得真好！",
+            "你一抬手，我就跟上啦！",
+        ),
+    ),
 )
 
 OBJECTS: tuple[Subject, ...] = (
