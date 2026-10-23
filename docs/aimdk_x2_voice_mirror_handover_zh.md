@@ -329,7 +329,19 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 
 - 现象：`set_session stop` 报 `idle request refused 3 times ... MOTION_BUSY（当前动作正在播放，无法切换到 STAND_DEFAULT）`，随后 bridge 回「执行结果未知，请人工检查机器人状态」，后续所有技能被 `ROBOT_QUARANTINED` 拒绝。
 - 根因链：① 平台在释放那一刻仍“动作播放中”，`SetMcAction STAND_DEFAULT` 被拒；② 失败 message 超过 300 字 → Agent 契约校验失败 → 请求状态 UNKNOWN；③ Agent 的 `is_robot_quarantined`（`request_store.py:201`）看到该 scope 存在 UNKNOWN 就隔离整个机器人。
-- 已修：message 截断（避免 UNKNOWN）。**未修**：MOTION_BUSY 本身（需要等平台空闲或先 `/runtime/stop` 再释放）。
+- 已修（2026-10-23 下午）：
+  1. **message 截断到 240 字**，失败不再因为超过 Agent 的 300 字上限变成 UNKNOWN；
+  2. **MOTION_BUSY 自愈**：`release_to_idle` 遇到平台拒绝（消息含 `MOTION_BUSY`/`busy`/“正在播放”）时，
+     先调 `/runtime/stop` 的 `HOLD` 取消正在播放的动作，再重发 `set_mode("idle")`（HOLD 会留下 stop latch，
+     紧随其后的 idle 请求正是官方文档里清 latch 的动作）。实现三处：
+     `mirror_session/runtime.py`（`_busy_refusal` + 重试分支 + `RuntimePort.stop`）、
+     `mirror_session/endpoints.py`（新增 `runtime.stop` 接口与 `RELEASE_INTERFACES`）、
+     `mirror_session_node.py`（`RosRuntimePort.stop` 客户端，`ibrobot_msgs/srv/StopRuntime`）。
+- 回归验证：`manipulation_execution` 426 个测试只有 1 个失败
+  （`test_magicmirror_plan_reaches_mirror_session_through_the_entry_point`），把本次改动 `git stash`
+  后仍然失败，属该分支既有的 launch-baseline 漂移，不是本次引入。起停实测：start→MIRRORING→stop 1.02 s
+  回 idle，平台确认 STAND_DEFAULT；MOTION_BUSY 分支因当时平台不忙未被触发，触发时会打印
+  `stop(HOLD) accepted/refused`。
 - 手工解除隔离（本轮用过，有效）：停栈 → 在 `/tmp/ibrobot-agent-x2-voice/requests.sqlite3` 里把该 `state='UNKNOWN'` 的行改成 `FAILED` 并写入一条 `reconciled` 事件 → 重启栈。
 - 另一条正路：`skill_library.execution_maintenance`（`--store /root/.ros/ibrobot/executions.sqlite3 --execution-id ... --evidence ... --confirm-hardware-stopped --confirm-controller-queues-reset`），但它只管执行器 ledger，Agent 的 requests ledger 要上面那步。
 
