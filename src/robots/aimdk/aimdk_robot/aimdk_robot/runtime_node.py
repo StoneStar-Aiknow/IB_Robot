@@ -419,8 +419,19 @@ class AimdkRuntimeNode(Node):
                 joint_state_qos,
             )
         if topics.get("hand_state"):
+            # The hand state gets a group of its own. Behind the four joint
+            # streams it went unread for more than 0.5 s on the robot while the
+            # arm streamed and the speaker played, though it kept arriving at
+            # 200 Hz, and the runtime faulted on "joint feedback stale: hand".
+            # The joint streams stay together in the default group, which caps
+            # them at one thread: in parallel they would take the interpreter
+            # from every other group in the process.
             self.create_subscription(
-                HandStateArray, str(topics["hand_state"]), self._on_hand_state, self._vendor_qos("hand_state")
+                HandStateArray,
+                str(topics["hand_state"]),
+                self._on_hand_state,
+                self._vendor_qos("hand_state"),
+                callback_group=MutuallyExclusiveCallbackGroup(),
             )
             # The hands' touch arrays ride on the state message the line above
             # already subscribes to, so publishing them costs no extra traffic.

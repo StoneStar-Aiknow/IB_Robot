@@ -315,10 +315,13 @@ robot:
     # The operator node: double cover asks for mirror_start, long cover stops
     # the session, a head touch starts or cancels a round, the LED follows the
     # session. With send_enabled false it only records what it would send; see
-    # /mirror_operator/status.
+    # /mirror_operator/status. The gestures use the rear head camera: covered,
+    # the front center camera's auto gain brightens the frame again. Without
+    # camera_topic the operator uses the imitation camera.
     operator:
       enabled: true
       send_enabled: false
+      camera_topic: /aima/hal/sensor/rgb_head_rear/rgb_image/compressed
     # The voice node: a phrase when the session starts, is ready, starts
     # mirroring and goes back to WAIT, synthesized by voice_tts below. Any
     # error on this path only warns; the mirror starts without voice.
