@@ -451,3 +451,45 @@ ros2 param get /agent_voice_bridge resume_settle_sec
    零窗口比例（62% → 59%），所以不是配置问题。
 3. 可行方向（未实施）：在 50 Hz 输出端对姿态做**线性插值**（5–7 Hz 关键帧 → 连续轨迹）；
    把 YOLOX 刷新从 1 s 放宽到 2 s 以减少插队；缩小相机分辨率只降低 CPU，不能改善往返。
+
+## 16. ASR 准确率：从贪婪解码到 beam + 热词（2026-10-23 晚）
+
+症状：短指令偶尔对、长句基本乱；`停止照镜子` 被听成 `银子/名字/瓶子/影子照镜子`，于是规划器匹配到尾巴的
+`照镜子`，用户说“停止”反而开了镜子。
+
+### 16.1 三个根因
+
+1. **解码方式**：`_create_streaming_recognizer()` 调 `OnlineRecognizer.from_transducer()` 时没传
+   `decoding_method`，sherpa 默认 greedy——int8 量化的小模型上 greedy 错误率明显高。
+2. **热词是假的**：节点有 `~/set_hotwords`（`ibrobot_msgs/srv/SetHotwords`），但实现里
+   `if hasattr(self._recognizer, "set_hotwords")` 对 `sherpa_onnx.OnlineRecognizer` 恒为 False，
+   所以调用永远“成功但无效果”，热词从来没生效过。
+3. **桥接器抢停**：`on_partial()` 用“包含停止词”判定，`停止照镜子` 的部分结果 `停止` 一出现就
+   把当前请求取消（`CANCELLED_BEFORE_EXECUTION`），随后最终文本又被当作“已停过”丢弃 →
+   镜子继续跑，用户听到“已停止”。
+
+### 16.2 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `asr_inference_module.py` | `decoding_method="modified_beam_search"`、`max_active_paths=4`；有热词文件时加 `hotwords_file` + `hotwords_score=1.5`；`set_hotwords()` 改为写盘 + 重建识别器（真的生效） |
+| `voice_asr_node.py` | 新增 `hotwords_file` 参数并在启动日志里标出 `beam_search + hotwords` |
+| `launch_builders/voice_asr.py` | 把 `voice_asr.hotwords_file` 传给节点，并用 `resolve_ros_path()` 支持 `$(find robot_config)` |
+| `config/hotwords/x2_commands.txt` | 指令热词表（`停止照镜子 :5`、`停止/停下/别照了 :4`、手势与自我介绍词 :2–3） |
+| `ibrobot_agent/voice_bridge.py` | ① 部分结果只在“本身是停止词、或是停止词前缀”时才抢停；② 网关因镜子占着 `policy_stream` 拒绝第二个生产者时，提示“照镜子正占着动作通道，请先说停止照镜子。” |
+| 部署 profile | `voice_asr.hotwords_file` + `agent.voice_bridge.text_corrections`（把 `银子/名字/瓶子/影子/林子照镜子` 等变体映射回规范词；**注意 YAML 重复键后写覆盖先写**，本次踩过一次） |
+
+### 16.3 实测（2026-10-23 19:00–19:20）
+
+- `停止照镜子` → 识别正确 → 请求 → `mirror_stop` → `set_session stop: success=True … 0.99–1.02 s` → 回 idle。
+- `开始照镜子` → 识别正确 → `mirror_start` → `MIRRORING/running`。
+- 自我介绍录音回放：35.2–35.4 s，SUCCEEDED，前后无 TTS。
+- 仍然存在的问题：自由长句依旧会错（例如 `等级太低了`、`只要不说话他就很顺畅`），那是厂商 VAD 分段 +
+  480 ms 流式 int8 模型的能力上限；要彻底解决需把“分段完成后的最终识别”换成非流式 paraformer（未实施）。
+
+### 16.4 调参备忘
+
+- 热词格式：每行 `词 :权重`，权重 2–5；**长词权重高于短词**（`停止照镜子 :5` vs `照镜子 :2`），
+  否则 beam 会偏向短词。
+- `max_active_paths` 现在写死 4（模块内 `self._beam_size`）；识别变慢可降到 2。
+- 错词映射是纯配置：加一行 `规范词: [变体…]` 再重编 `robot_config` 重启即可，不必改代码。
