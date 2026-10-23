@@ -38,6 +38,8 @@ RUNTIME_NAMED_MOTION_EXECUTOR = "runtime_named_motion"
 # Delegated executor whose implementation binds the command it sends (the X2
 # mirror session's start/stop); the caller supplies no argument either.
 MIRROR_SESSION_EXECUTOR = "mirror_session"
+# Delegated executor that plays a recorded clip the deployment profile resolves.
+RUNTIME_PLAY_AUDIO_EXECUTOR = "runtime_play_audio"
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
@@ -262,7 +264,14 @@ def validate_manifest(
             field_path="description",
         )
     else:
-        _validate_description(description, diagnostics, source_relative_path)
+        _validate_description(
+            description,
+            diagnostics,
+            source_relative_path,
+            allow_empty_scope=(manifest.get("capability") or {}).get("moves_robot") is False
+            if isinstance(manifest.get("capability"), Mapping)
+            else False,
+        )
     description_variants = manifest.get("description_variants", {})
     if not isinstance(description_variants, Mapping):
         _error(
@@ -491,6 +500,9 @@ def validate_implementation(
         if executor_name == MIRROR_SESSION_EXECUTOR:
             # So is the bound session command.
             allowed.add("binding")
+        if executor_name == RUNTIME_PLAY_AUDIO_EXECUTOR:
+            # So is the bound clip name.
+            allowed.add("binding")
         _exact_fields(implementation, allowed, diagnostics, source_relative_path=source_relative_path)
         if implementation.get("schema_version") != source_version:
             _error(
@@ -531,6 +543,13 @@ def validate_implementation(
             )
         elif executor_name == MIRROR_SESSION_EXECUTOR:
             _validate_mirror_session(
+                implementation,
+                capability_parameters,
+                diagnostics,
+                source_relative_path=source_relative_path,
+            )
+        elif executor_name == RUNTIME_PLAY_AUDIO_EXECUTOR:
+            _validate_play_audio(
                 implementation,
                 capability_parameters,
                 diagnostics,
@@ -637,6 +656,52 @@ def _validate_runtime_named_motion(
         )
 
 
+def _validate_play_audio(
+    implementation: Mapping[str, Any],
+    capability_parameters: Any,
+    diagnostics: list[SkillDiagnostic],
+    *,
+    source_relative_path: str,
+) -> None:
+    """A clip playback skill binds exactly one clip and takes no arguments."""
+    if implementation.get("required_args") != []:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_play_audio takes no caller arguments; required_args must be []",
+            source_relative_path=source_relative_path,
+            field_path="required_args",
+        )
+    if capability_parameters:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_play_audio skills must declare no capability parameters",
+            source_relative_path=source_relative_path,
+            field_path="capability.parameters.properties",
+        )
+    binding = implementation.get("binding")
+    if not isinstance(binding, Mapping):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_play_audio requires binding.clip",
+            source_relative_path=source_relative_path,
+            field_path="binding",
+        )
+        return
+    _exact_fields(binding, {"clip"}, diagnostics, source_relative_path=source_relative_path, field_path="binding")
+    clip = binding.get("clip")
+    if not isinstance(clip, str) or not clip.strip():
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "binding.clip must be a non-empty clip name",
+            source_relative_path=source_relative_path,
+            field_path="binding.clip",
+        )
+
+
 def _validate_mirror_session(
     implementation: Mapping[str, Any],
     capability_parameters: Any,
@@ -682,6 +747,7 @@ def _validate_description(
     path: str,
     *,
     field_prefix: str = "description",
+    allow_empty_scope: bool = False,
 ) -> None:
     _exact_fields(description, DESCRIPTION_FIELDS, diagnostics, source_relative_path=path, field_path=field_prefix)
     for field_name in ("summary", "category"):
@@ -707,7 +773,9 @@ def _validate_description(
             field_path=f"{field_prefix}.when_to_use",
         )
     motion_scope = description.get("motion_scope")
-    if (
+    if allow_empty_scope and motion_scope == []:
+        pass
+    elif (
         not isinstance(motion_scope, list)
         or not motion_scope
         or len(set(motion_scope)) != len(motion_scope)
@@ -1174,14 +1242,20 @@ def validate_robot_context(context: SkillRobotContext) -> list[SkillDiagnostic]:
     if context.required_control_mode not in allowed_control_modes:
         _error(diagnostics, "SKILL_SCHEMA_INVALID", "invalid required control mode", field_path="required_control_mode")
     supported_control_modes = tuple(getattr(context, "supported_control_modes", ()))
-    if context.context_schema_version < 3 and supported_control_modes:
-        _error(
-            diagnostics,
-            "SKILL_SCHEMA_INVALID",
-            "supported_control_modes requires robot context schema v3",
-            field_path="supported_control_modes",
-        )
-    if context.context_schema_version == 3 and len(set(supported_control_modes)) < 2:
+    # A deployment may state the modes explicitly instead of deriving them from
+    # a hybrid navigation stage (the X2 pack has no navigation service). The
+    # contract that matters is the same one schema v3 enforces: every mode is
+    # valid for this schema and there are at least two of them.
+    if supported_control_modes:
+        unknown_modes = [mode for mode in supported_control_modes if mode not in allowed_control_modes]
+        if unknown_modes:
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                f"supported_control_modes entries are not valid control modes: {unknown_modes}",
+                field_path="supported_control_modes",
+            )
+    if supported_control_modes and len(set(supported_control_modes)) < 2:
         _error(
             diagnostics,
             "SKILL_SCHEMA_INVALID",

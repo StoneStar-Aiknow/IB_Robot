@@ -29,6 +29,10 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
+from std_msgs.msg import String
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -85,6 +89,7 @@ from ibrobot_msgs.srv import (
     GetSkillGatewayStatus,
     GetSkillSnapshot,
     MoveToConfiguration,
+    PlayAudioFile,
     ReloadSkillCatalog,
     SetRuntimeMode,
     SetSoundFollowing,
@@ -94,9 +99,6 @@ from ibrobot_msgs.srv import (
 from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_runtime import contract as RUNTIME
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
 from skill_library.execution_store import (
     ExecutionBusyError,
@@ -126,6 +128,8 @@ PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
 # The X2 mirror session's switch. Its skills take no arguments: the catalog
 # implementation binds the command, sent as the session's SetBool.
 MIRROR_SESSION_EXECUTOR = "mirror_session"
+# Delegated executor that plays a recorded clip bound by the catalog.
+RUNTIME_PLAY_AUDIO_EXECUTOR = "runtime_play_audio"
 MIRROR_SESSION_COMMANDS = {"start": True, "stop": False}
 
 
@@ -562,6 +566,13 @@ class SkillExecutorNode(Node):
         self.declare_parameter(
             "mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC, descriptor=startup_descriptor
         )
+        # Recorded-clip playback (ibrobot_msgs/srv/PlayAudioFile): the catalog binds
+        # a clip name, the deployment profile resolves it to a file on this machine.
+        self.declare_parameter("runtime_play_audio_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("runtime_play_audio_service", "", descriptor=startup_descriptor)
+        self.declare_parameter("runtime_play_audio_clips_json", "{}", descriptor=startup_descriptor)
+        # While a clip plays the ASR is muted through this topic (stop/start).
+        self.declare_parameter("asr_control_topic", "", descriptor=startup_descriptor)
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
@@ -677,6 +688,20 @@ class SkillExecutorNode(Node):
         self._mirror_session_stop_timeout_sec = float(self.get_parameter("mirror_session_stop_timeout_sec").value)
         if not math.isfinite(self._mirror_session_stop_timeout_sec) or self._mirror_session_stop_timeout_sec <= 0.0:
             raise ValueError("mirror_session_stop_timeout_sec must be finite and positive")
+        self._play_audio_enabled = self.get_parameter("runtime_play_audio_enabled").value is True
+        self._play_audio_service = (
+            self.get_parameter("runtime_play_audio_service").get_parameter_value().string_value.strip()
+        )
+        if self._play_audio_enabled and not self._play_audio_service:
+            raise ValueError("runtime_play_audio_service must be set when runtime_play_audio_enabled is true")
+        self._play_audio_clips = load_json_mapping(self.get_parameter("runtime_play_audio_clips_json").value)
+        if self._play_audio_enabled:
+            for clip_name, clip_path in self._play_audio_clips.items():
+                if not isinstance(clip_name, str) or not clip_name.strip():
+                    raise ValueError("runtime_play_audio_clips_json keys must be non-empty clip names")
+                if not isinstance(clip_path, str) or not clip_path.strip():
+                    raise ValueError(f"runtime_play_audio clip {clip_name!r} must map to a file path")
+        self._asr_control_topic = self.get_parameter("asr_control_topic").get_parameter_value().string_value.strip()
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
             self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
@@ -963,6 +988,14 @@ class SkillExecutorNode(Node):
             self.create_client(SetBool, self._mirror_session_service, callback_group=callback_group)
             if self._mirror_session_enabled
             else None
+        )
+        self._play_audio_client = (
+            self.create_client(PlayAudioFile, self._play_audio_service, callback_group=callback_group)
+            if self._play_audio_enabled
+            else None
+        )
+        self._asr_control_pub = (
+            self.create_publisher(String, self._asr_control_topic, 10) if self._asr_control_topic else None
         )
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
@@ -1736,6 +1769,17 @@ class SkillExecutorNode(Node):
                 "mirror_session configuration mismatch: "
                 f"runtime enabled={mirror_runtime_enabled}, catalog enabled={mirror_catalog_enabled}"
             )
+        play_audio_runtime_enabled = bool(getattr(self, "_play_audio_enabled", False))
+        play_audio_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == RUNTIME_PLAY_AUDIO_EXECUTOR
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if play_audio_runtime_enabled != play_audio_catalog_enabled:
+            raise ValueError(
+                "runtime_play_audio configuration mismatch: "
+                f"runtime enabled={play_audio_runtime_enabled}, catalog enabled={play_audio_catalog_enabled}"
+            )
         # The session answers stop within its own stop timeout; the skill must wait longer.
         required_stop_timeout = (
             getattr(self, "_mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC)
@@ -1782,6 +1826,8 @@ class SkillExecutorNode(Node):
             configured_executors.add(named_motion.EXECUTOR_NAME)
         if getattr(self, "_mirror_session_enabled", False):
             configured_executors.add(MIRROR_SESSION_EXECUTOR)
+        if getattr(self, "_play_audio_enabled", False):
+            configured_executors.add(RUNTIME_PLAY_AUDIO_EXECUTOR)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
@@ -1804,6 +1850,20 @@ class SkillExecutorNode(Node):
                 continue
             if name == "sound_following":
                 endpoint_name = self._sound_following_service
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_service",
+                        configuration={},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
+            if name == RUNTIME_PLAY_AUDIO_EXECUTOR:
+                endpoint_name = getattr(self, "_play_audio_service", "")
+                if not getattr(self, "_play_audio_enabled", False) or not endpoint_name:
+                    continue
                 descriptor = DelegatedExecutorDescriptor(
                     **delegated_executor_identity(
                         name=name,
@@ -2180,6 +2240,88 @@ class SkillExecutorNode(Node):
                 give_back=start and left_idle,
             )
         return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _publish_asr_control(self, command: str) -> None:
+        """Mute (stop) or restore (start) the ASR while a recorded clip plays."""
+        publisher = getattr(self, "_asr_control_pub", None)
+        if publisher is None:
+            return
+        message = String()
+        message.data = command
+        publisher.publish(message)
+
+    def _execute_play_audio_skill(self, goal_handle, template, *, effective_timeout_sec: float | None = None):
+        """Play the clip the catalog binds for this skill, muting the ASR while it runs."""
+        result = SkillCommand.Result()
+        skill_name = str(goal_handle.request.skill_name)
+        binding = template.get("binding") if isinstance(template, Mapping) else None
+        clip = str((binding or {}).get("clip", "")).strip() if isinstance(binding, Mapping) else ""
+        path = str(self._play_audio_clips.get(clip, "")).strip() if clip else ""
+        if not clip or not path:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PLAY_AUDIO_CLIP_UNKNOWN",
+                f"{skill_name} binds clip {clip!r}, which the deployment profile does not resolve",
+            )
+        if not Path(path).is_file():
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PLAY_AUDIO_CLIP_MISSING",
+                f"clip file is missing: {path}",
+            )
+        client = getattr(self, "_play_audio_client", None)
+        if client is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PLAY_AUDIO_SERVICE_UNAVAILABLE",
+                "playback service is not configured",
+            )
+        timeout_sec = float(effective_timeout_sec or template.get("timeout_sec") or self._rpc_timeout)
+        if not client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PLAY_AUDIO_SERVICE_UNAVAILABLE",
+                f"playback service unavailable: {self._play_audio_service}",
+            )
+        self._publish_asr_control("stop")
+        try:
+            future = client.call_async(PlayAudioFile.Request(file_path=path))
+            if not self._wait_for_future(
+                future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested
+            ):
+                if goal_handle.is_cancel_requested:
+                    return self._cancel_skill(result, goal_handle, [], skill_name)
+                return self._abort_skill(
+                    result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out"
+                )
+            try:
+                response = future.result()
+            except Exception as exc:
+                return self._abort_skill(
+                    result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}"
+                )
+            if response is None or not response.success:
+                code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
+                message = str(getattr(response, "message", "") or f"{skill_name} failed")
+                return self._abort_skill(result, goal_handle, [], code, message)
+        finally:
+            self._publish_asr_control("start")
+        result.success = True
+        result.error_code = ""
+        result.message = f"{skill_name}: played {clip}"
+        result.executed_primitives = [f"runtime_play_audio:{clip}"]
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
 
     def _succeed_mirror_session(self, result, goal_handle, skill_name: str, message: str, *, called: bool = True):
         result.success = True
@@ -6347,6 +6489,12 @@ class SkillExecutorNode(Node):
         if str(template.get("executor", "")).strip() == "sound_following":
             return self._execute_sound_following_skill(
                 goal_handle,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == RUNTIME_PLAY_AUDIO_EXECUTOR:
+            return self._execute_play_audio_skill(
+                goal_handle,
+                template,
                 effective_timeout_sec=effective_timeout_sec,
             )
         if str(template.get("executor", "")).strip() == MIRROR_SESSION_EXECUTOR:

@@ -55,6 +55,9 @@ SUPPORTED_SKILL_EXECUTORS = {
     "runtime_named_motion",
     # The X2 mirror session's start/stop switch; the catalog binds the command.
     "mirror_session",
+    # Playback of a recorded clip (the self-introduction): the catalog binds the
+    # clip name, the deployment profile resolves the file.
+    "runtime_play_audio",
 }
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 

@@ -1,0 +1,90 @@
+# AgiBot X2: one stack with the voice agent, the preset gestures and the mirror.
+#
+# Layers on aimdk_x2_voice_mirror (agent + ZipVoice + PEAR stream + mirror
+# session) and re-enables the preset named motions. The two skill families run
+# in different control modes (gestures named_motion, mirror model_inference), so
+# this deployment states the supported modes explicitly instead of using
+# nav_stage: hybrid — the X2 compute pack has no navigation service, and hybrid
+# would demand navigation.command_server.
+robot:
+  base_config: aimdk_x2_voice_mirror.yaml
+  name: aimdk_x2_all
+
+  # The mirror session takes over exactly the mode the Gateway switches to, and
+  # its builder requires that mode to be the deployment's skill mode. Gestures
+  # still run: their own required mode (named_motion) is in the supported list,
+  # so the executor switches the runtime to idle for them.
+  default_control_mode: model_inference
+  skill_required_control_mode: model_inference
+  skill_supported_control_modes:
+    - named_motion
+    - model_inference
+
+  control_modes:
+    named_motion:
+      description: "Runtime-owned named motions (preset gestures)"
+      description_cn: "运行时自持的命名动作（预设手势）"
+      runtime_mode: idle
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  # The vendor enhanced stream is the ASR input: the runtime republishes the
+  # vendor's VAD-segmented chunks on audio.speech.
+  voice_asr:
+    enabled: true
+    input_mode: external_vad
+    active_mode: continuous
+    audio_input:
+      interface: audio.speech
+      type: ibrobot_msgs/msg/SpeechAudioChunk
+    output_topic: /voice_command
+
+  embodied:
+    entry_mode: agent
+    skill_catalog_profile: aimdk_x2_all
+    agent:
+      # Replaces the mirror-only allowlist inherited from the base: this
+      # deployment exposes both families to the planner.
+      test_allowlist:
+        - wave_hand
+        - handshake
+        - raise_hand
+        - blow_kiss
+        - clap_hands
+        - mirror_start
+        - mirror_stop
+        - self_introduction
+      voice_bridge:
+        # The clip is the reply: announcing the plan and then saying "执行完成。"
+        # would talk over the self-introduction.
+        silent_skills:
+          - self_introduction
+    # The self-introduction plays a recorded clip; the catalog binds the name.
+    runtime_play_audio:
+      enabled: true
+      service: /voice_tts/play
+      asr_control_topic: /voice_control
+      clips:
+        self_intro: /root/workspace/lyx/IB_Robot_hz/assets/audio/self_introduction.wav
+    runtime_named_motion:
+      enabled: true
+      interface: motion.named
+      kind: action
+      type: ibrobot_msgs/action/ExecuteNamedMotion
+      requires:
+        capability: motion.named
+
+  # The mirror drives the upper body itself. The demo rules are the relaxed
+  # copy: a reply's TTS synthesis shares this board's single NPU with the
+  # detector, and the default 1.0 s freshness rule would end the round mid-gesture.
+  mirror_session:
+    enabled: true
+    publish_enabled: true
+    # Same as the voice_mirror deployment: the agent's TTS owns the speaker, and
+    # every mirror phrase would also cost ~2 s of inference on the NPU that the
+    # pose stream shares. Inherited defaults (voice on, demo_relaxed rules,
+    # 4 s RPC timeout) made the mirroring stutter.
+    voice:
+      enabled: false

@@ -8,6 +8,7 @@ from typing import Any
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
+from skill_catalog.source import resolve_development_source_root
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
@@ -26,7 +27,6 @@ from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
 from robot_runtime import contract as RUNTIME
-from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup")
 
@@ -321,6 +321,24 @@ def generate_embodied_nodes(
             mirror_session_stop_timeout_sec=float(
                 mirror_session.get("stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC)
             ),
+        )
+    play_audio = embodied_config.get("runtime_play_audio", {})
+    if isinstance(play_audio, dict) and play_audio.get("enabled") is True:
+        # Recorded clips (the self-introduction): the catalog binds a clip name and
+        # this deployment profile resolves it, so the skill carries no file path.
+        clips = play_audio.get("clips", {})
+        if not isinstance(clips, dict) or not clips:
+            raise ValueError("embodied.runtime_play_audio.clips must map clip names to file paths")
+        for clip_name, clip_path in clips.items():
+            if not isinstance(clip_name, str) or not str(clip_name).strip():
+                raise ValueError("embodied.runtime_play_audio.clips keys must be clip names")
+            if not isinstance(clip_path, str) or not clip_path.strip():
+                raise ValueError(f"embodied.runtime_play_audio clip {clip_name!r} must be a file path")
+        common_params.update(
+            runtime_play_audio_enabled=True,
+            runtime_play_audio_service=str(play_audio.get("service", "/voice_tts/play")),
+            runtime_play_audio_clips_json=json.dumps(clips),
+            asr_control_topic=str(play_audio.get("asr_control_topic", "/voice_control")),
         )
     if arm_surface:
         common_params.update(
@@ -846,7 +864,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     for field_name in ("speak_replies", "mute_asr_during_tts"):
         if field_name in voice_bridge:
             params[field_name] = bool(voice_bridge[field_name])
-    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "silent_skills"):
         if field_name in voice_bridge:
             params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)
     if "text_corrections" in voice_bridge:

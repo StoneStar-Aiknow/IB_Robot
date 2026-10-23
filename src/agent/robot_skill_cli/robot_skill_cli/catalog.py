@@ -9,6 +9,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from skill_catalog.compiler import compile_skill_catalog
+from skill_catalog.digest import (
+    derive_capability_digest,
+    derive_provenance_digest,
+    derive_registry_digest,
+    to_canonical_json,
+)
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
+from skill_catalog.source import (
+    AmentShareSkillSource,
+    DevelopmentStagingSkillSource,
+    DirectoryReleaseSkillSource,
+    resolve_development_source_root,
+)
+
 from embodied_common.capability_view import project_capability_timeout_policy
 from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
 from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
@@ -24,20 +39,6 @@ from robot_config.loader import (
     robot_supported_control_modes,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
-from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.digest import (
-    derive_capability_digest,
-    derive_provenance_digest,
-    derive_registry_digest,
-    to_canonical_json,
-)
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
-from skill_catalog.source import (
-    AmentShareSkillSource,
-    DevelopmentStagingSkillSource,
-    DirectoryReleaseSkillSource,
-    resolve_development_source_root,
-)
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -301,6 +302,20 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
             **delegated_executor_identity(
                 name="mirror_session",
                 endpoint_name=MIRROR_SESSION_SERVICE,
+                endpoint_kind="ros_service",
+                configuration={},
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
+    play_audio = embodied.get("runtime_play_audio", {}) if isinstance(embodied, dict) else {}
+    if isinstance(play_audio, dict) and play_audio.get("enabled") is True:
+        # Recorded-clip playback (the self-introduction); same endpoint the
+        # SkillExecutorNode is given, so both catalogs compile identically.
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="runtime_play_audio",
+                endpoint_name=str(play_audio.get("service", "/voice_tts/play")),
                 endpoint_kind="ros_service",
                 configuration={},
             )
