@@ -99,9 +99,16 @@ robot:
   mirror_session:
     enabled: true
     publish_enabled: true
-    # Same as the voice_mirror deployment: the agent's TTS owns the speaker, and
-    # every mirror phrase would also cost ~2 s of inference on the NPU that the
-    # pose stream shares. Inherited defaults (voice on, demo_relaxed rules,
-    # 4 s RPC timeout) made the mirroring stutter.
+    # The mirror speaks again (2026-10-23 evening, on request): the four phrases
+    # (starting / ready / mirroring / goodbye) go through the same ZipVoice the
+    # agent uses. Each phrase costs ~2 s of NPU inference, so the opening seconds
+    # of a round now share the device with the pose stream -- watch the stutter
+    # before raising anything else.
     voice:
-      enabled: false
+      enabled: true
+    # The physical triggers act instead of only being recorded: double cover asks
+    # for mirror_start, a long cover stops the session, a head touch starts or
+    # cancels a round. The operator reads the rear head camera, so covering the
+    # back of the head IS a long cover (a stop) -- that is the gesture, by design.
+    operator:
+      send_enabled: true
