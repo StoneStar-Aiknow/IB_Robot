@@ -337,3 +337,47 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 
 1. **MC 卡在 UPPERBODY_REMOTE_SPLIT**：早上 06:42 有人用厂商 `py_examples set_mc_action` 切过去没切回，`status=100(busy)` 导致所有预设动作被拒。恢复顺序：`JD` → `SD`（切回 STAND_DEFAULT），必要时 `aima em restart-app mc`。
 2. **310P 板子约 50 分钟 SSH/ICMP 不可达但进程没死**（uptime 未归零、dmesg 无 OOM）。同期 load 21+，怀疑重载把网络/sshd 饿死；恢复后一切正常。重负载实验（感知三模型 + TTS 同卡）要小心。
+
+### 13.5 “进得了状态却照不了镜子”的两个原因（2026-10-23 下午，已修）
+
+**原因一：`mirror_session.publish_enabled` 是部署开关，默认关。**
+合并 profile 最初写的是 `false`（安全默认）。此时会话一切正常——`set_session success`、接管
+`policy_stream`、进入 `MIRRORING/running` 跑了 42 秒、内部算出 819 条指令——但按契约**一条都不发给
+机械臂**，全部落到 `/mirror_session/arm_command_preview`。日志里这句就是判据：
+
+```
+[mirror_session]: publish_enabled=false: nothing is sent to /aimdk/arm/commands
+                  or /aimdk/hand/joint_commands; commands go to ~/arm_command_preview ...
+```
+
+所以“技能执行成功、状态也进去了，但机器人不动”不是 bug，是配置。要真跟随必须
+`aimdk_x2_voice_mirror_all.yaml: mirror_session.publish_enabled: true`。
+
+**原因二：手型口径不匹配 → runtime DEGRADED → 会话把轮次当故障取消。**
+平台报的手型是 `nimble_hands`（有时 `none`），而本部署用的 runtime profile
+`x2_ultra_omnihand` 声明 `dexterous_joint`。于是：
+
+1. runtime 启动时 `_verify_hand_type()` 报 “declared 'dexterous_joint' is unverified”；
+2. 手部反馈 `/aima/hal/joint/hand/state` 一旦断 0.5 秒，`_check_feedback()` 判
+   `joint feedback stale: hand` → runtime DEGRADED；
+3. mirror session 的契约是“runtime DEGRADED 即故障”，于是轮次在 0.16 秒内被取消
+   （`last_transition: reason=fault`，`detail: runtime DEGRADED: joint feedback stale: hand`）。
+
+表现就是“刚说照镜子、它应了一声、然后什么都没发生”。修法（板端补丁，
+`aimdk_robot/runtime_node.py::_check_feedback`）：手型未经平台验证时，把 `hand` 从必需反馈组里剔除——
+声明之外的手型数据是加成，不是契约，它瞬断不该降级 runtime。
+
+**修好后实测（同一会话，2026-10-23 15:0x–15:2x）**：
+
+| 指标 | 值 |
+|---|---|
+| MIRRORING 轮次 | 4 次 |
+| 轮次结束原因 | 2 次 `no_actor`（人走出画面，设计行为）、2 次 `mirror_stop`（口述停止） |
+| `/aimdk/arm/commands` | 50.045 Hz（406 帧窗口） |
+| mirror_stop 释放 | 1.02 s / 1.05 s，`platform confirmed STAND_DEFAULT` |
+| 控制模式 | start 接管 `policy_stream`，stop 回 `idle` |
+
+**排障提示**：轮次没在跑时 `/aimdk/arm/commands` 没有发布者是正常的（不是卡死）；判活看
+`/mirror_session/status` 的 `state/phase`（`WAIT/none` = 空闲，`STANDBY/ready` = 等待人进入画面，
+`MIRRORING/running` = 正在跟随）。轮次靠“人在头部相机画面里且距离够近”，侧身或太远会以
+`no_actor` 收尾。
