@@ -24,6 +24,14 @@ robot:
     # mirror_stop) read the catalog from this tree's source.
     skill_catalog_source_root: src/agent/skill_catalog
 
+  # Wrist plan A: the elbow's twist about the forearm turns the wrist too, all
+  # of it past PEAR's rest twist (gain 1.0, as set on the real robot).
+  motion_imitation_stream:
+    mock_playback:
+      retarget:
+        elbow_spin_to_wrist: true
+        elbow_spin_gain: 1.0
+
   mirror_session:
     publish_enabled: true
     operator:
