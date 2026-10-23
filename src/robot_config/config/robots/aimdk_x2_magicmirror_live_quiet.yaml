@@ -1,0 +1,18 @@
+# AgiBot X2 "magic mirror", live show, the arms only.
+#
+# The live entry (aimdk_x2_magicmirror_live.yaml) with the visual interaction,
+# the mirror voice and its ZipVoice all off: the arms follow the visitor and
+# nothing is looked at or said.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live.yaml
+
+  visual_interaction:
+    enabled: false
+
+  mirror_session:
+    voice:
+      enabled: false
+
+  voice_tts:
+    enabled: false

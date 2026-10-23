@@ -1,0 +1,11 @@
+# AgiBot X2 "magic mirror", live show, talking without looking.
+#
+# The live entry (aimdk_x2_magicmirror_live.yaml) with the visual interaction
+# off: no model looks at the visitor, and the voice says only the four state
+# phrases.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live.yaml
+
+  visual_interaction:
+    enabled: false
