@@ -300,3 +300,40 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 - 恢复步骤：机器人上电/网络恢复 → 确认 `ping 10.0.1.42` 通 → `ros2 topic list | grep aima | wc -l`
   能看到话题 → `systemd-run --unit=x2-voice --collect bash -c '/root/workspace/lyx/run_x2_voice_raw.sh > /tmp/x2_voice_raw.log 2>&1'`
   → 看 `/runtime_status` 是否 ACTIVE、`/voice_status` 是否 listening。
+
+## 13. 2026-10-23 白天：手势 + 照镜子合并栈（状态与坑）
+
+### 13.1 合并栈怎么来的
+
+一个栈里同时跑「5 个预设手势 + mirror_start/stop + 增强流 ASR + agent + ZipVoice」，
+新增两个文件 + 两个框架小补丁（都在板子工作区，**未入库**）：
+
+| 改动 | 作用 |
+|---|---|
+| `robot_config/config/robots/aimdk_x2_voice_mirror_all.yaml` | 继承 `aimdk_x2_voice_mirror`，重新打开 `runtime_named_motion`、`named_motion` 控制模式、7 项 `test_allowlist`、外部 VAD 语音链；`skill_required_control_mode: model_inference`（mirror session 要求与全局技能模式相同），`skill_supported_control_modes: [named_motion, model_inference]` |
+| `skill_catalog/config/profiles/aimdk_x2_all.yaml` | 5 手势 + mirror_start/stop 的目录 |
+| `robot_config/loader.py` | 支持显式 `skill_supported_control_modes`（没有它就只能靠 `nav_stage: hybrid`，而 X2 没有导航服务）；digest 也带上该字段 |
+| `skill_catalog/validator.py` | 放宽「supported_control_modes 必须 schema v3」，改为「必须是本 schema 合法模式且至少两个」 |
+| `manipulation_execution/mirror_session/runtime.py` | 释放失败的 message 截断到 240 字（Agent 的 message 字段上限 300，超了会让请求变 UNKNOWN 并隔离机器人） |
+
+启动：`systemd-run --unit=x2-all --collect bash -c '/root/workspace/lyx/run_x2_all.sh > /tmp/x2_all.log 2>&1'`
+（`run_x2_all.sh` 用 `robot_config:=aimdk_x2_voice_mirror_all control_mode:=named_motion authorize_motion:=true`）
+
+### 13.2 已验证
+
+- `挥挥手` → `wave_hand` 真机执行 7.2–7.4 s → SUCCEEDED（runtime 自己从 idle/policy_stream 之间切换正常）。
+- `照镜子` → `mirror_start` → `set_session success` 接管 `policy_stream` → STANDBY/approach→ready → SUCCEEDED → 有人的话进 MIRRORING。
+- 增强流在**有人说话时**确实出帧（5 分钟窗口 212 帧，0.71 Hz），静默期 0 条是正常的。
+
+### 13.3 已知问题：`mirror_stop` 释放失败 → 机器人被隔离
+
+- 现象：`set_session stop` 报 `idle request refused 3 times ... MOTION_BUSY（当前动作正在播放，无法切换到 STAND_DEFAULT）`，随后 bridge 回「执行结果未知，请人工检查机器人状态」，后续所有技能被 `ROBOT_QUARANTINED` 拒绝。
+- 根因链：① 平台在释放那一刻仍“动作播放中”，`SetMcAction STAND_DEFAULT` 被拒；② 失败 message 超过 300 字 → Agent 契约校验失败 → 请求状态 UNKNOWN；③ Agent 的 `is_robot_quarantined`（`request_store.py:201`）看到该 scope 存在 UNKNOWN 就隔离整个机器人。
+- 已修：message 截断（避免 UNKNOWN）。**未修**：MOTION_BUSY 本身（需要等平台空闲或先 `/runtime/stop` 再释放）。
+- 手工解除隔离（本轮用过，有效）：停栈 → 在 `/tmp/ibrobot-agent-x2-voice/requests.sqlite3` 里把该 `state='UNKNOWN'` 的行改成 `FAILED` 并写入一条 `reconciled` 事件 → 重启栈。
+- 另一条正路：`skill_library.execution_maintenance`（`--store /root/.ros/ibrobot/executions.sqlite3 --execution-id ... --evidence ... --confirm-hardware-stopped --confirm-controller-queues-reset`），但它只管执行器 ledger，Agent 的 requests ledger 要上面那步。
+
+### 13.4 今天还遇到的两件现场事
+
+1. **MC 卡在 UPPERBODY_REMOTE_SPLIT**：早上 06:42 有人用厂商 `py_examples set_mc_action` 切过去没切回，`status=100(busy)` 导致所有预设动作被拒。恢复顺序：`JD` → `SD`（切回 STAND_DEFAULT），必要时 `aima em restart-app mc`。
+2. **310P 板子约 50 分钟 SSH/ICMP 不可达但进程没死**（uptime 未归零、dmesg 无 OOM）。同期 load 21+，怀疑重载把网络/sshd 饿死；恢复后一切正常。重负载实验（感知三模型 + TTS 同卡）要小心。
