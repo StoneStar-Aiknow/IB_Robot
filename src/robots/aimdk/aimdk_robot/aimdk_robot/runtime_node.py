@@ -251,6 +251,11 @@ class AimdkRuntimeNode(Node):
         self._arm_owner: int | None = None
         #: When the public arm stream last set a target; a fresh one is not preempted.
         self._public_arm_stamp: float | None = None
+        #: Moves on anything that may have moved the arm or changed who commands
+        #: it: a public arm target, a named motion taking the channel, and every
+        #: command reset (mode change, stop, lost arbitration). A named motion
+        #: cancelled part-way resumes only while it has not moved.
+        self._arm_motion_epoch = 0
         self._twist: tuple[float, float, float] | None = None
         self._twist_stamp = 0.0
         self._sequence = 0
@@ -1332,6 +1337,7 @@ class AimdkRuntimeNode(Node):
                     self._arm_cmd = payload
                     self._arm_stamp = time.monotonic()
                     self._public_arm_stamp = self._arm_stamp
+                    self._arm_motion_epoch += 1
             elif name == "head_stream":
                 payload = projection.head_payload(message.data, channel_joints=joints, limits=self._head_limits)
                 with self._lock:
@@ -1404,6 +1410,7 @@ class AimdkRuntimeNode(Node):
 
     def _clear_commands(self) -> None:
         with self._lock:
+            self._arm_motion_epoch += 1
             self._arm_cmd = None
             self._hand_cmd = None
             self._head_cmd = None
@@ -2042,7 +2049,13 @@ class AimdkRuntimeNode(Node):
             ):
                 return False
             self._arm_owner = owner
+            self._arm_motion_epoch += 1
             return True
+
+    def arm_motion_epoch(self) -> int:
+        """A counter that moves whenever something may have moved the arm; see ``__init__``."""
+        with self._lock:
+            return self._arm_motion_epoch
 
     def release_arm(self, owner: int) -> None:
         with self._lock:

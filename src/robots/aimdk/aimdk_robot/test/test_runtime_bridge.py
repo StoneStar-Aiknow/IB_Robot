@@ -1629,7 +1629,7 @@ def test_a_claw_contributes_no_tactile_frames():
 _RIGHT_PITCH = projection.VENDOR_ARM_ORDER.index("right_shoulder_pitch_joint")
 
 
-def _replay_harness(tmp_path: Path, *, duration_s: float, **mock_params) -> Harness:
+def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, **mock_params) -> Harness:
     """The OmniHand profile on an X2 with only a left hand, ``wave`` recorded as a right shoulder
     pitch out-and-back to -0.3 rad."""
     import json
@@ -1650,6 +1650,7 @@ def _replay_harness(tmp_path: Path, *, duration_s: float, **mock_params) -> Harn
     )
     profile = yaml.safe_load(OMNIHAND_PROFILE.read_text())
     profile["vendor"]["named_motion"]["trajectories"] = {"wave": "wave.json"}
+    profile["vendor"]["named_motion"].update(named_motion or {})
     (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
     harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none", **mock_params)
     harness.wait_active()
@@ -1726,6 +1727,8 @@ def test_a_replay_asked_for_its_recorded_side_plays(tmp_path):
 
 class _GoalHandle:
     """The part of a server goal handle the named-motion server uses."""
+
+    is_cancel_requested = False
 
     def __init__(self, name: str, interrupt: bool) -> None:
         self.request = ExecuteNamedMotion.Goal()
@@ -1852,5 +1855,138 @@ def test_stop_ends_a_replay_and_no_further_arm_target_is_sent(tmp_path):
         time.sleep(0.5)
         # HOLD may publish one explicit safe command; the replay must not continue.
         assert harness.mock.upper_body_count - count <= 1
+    finally:
+        harness.shutdown()
+
+
+# --- cancelling a replay part-way and resuming it ------------------------------
+
+
+def _wave_goal(harness, resume_token: str = ""):
+    from rclpy.action import ActionClient
+
+    client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+    goal = ExecuteNamedMotion.Goal()
+    goal.name, goal.resume_token = "wave", resume_token
+    handle_future = client.send_goal_async(goal)
+    harness.wait_for(lambda: handle_future.done(), "the goal decision")
+    handle = handle_future.result()
+    assert handle.accepted
+    return handle
+
+
+def _right_pitch(harness) -> float | None:
+    message = harness.mock.last_upper_body
+    return None if message is None else message.arm_pos[_RIGHT_PITCH]
+
+
+def _cancel(harness, handle):
+    from action_msgs.msg import GoalStatus
+
+    cancel_future = handle.cancel_goal_async()
+    harness.wait_for(lambda: cancel_future.done(), "the cancel decision")
+    assert cancel_future.result().goals_canceling
+    result_future = handle.get_result_async()
+    harness.wait_for(lambda: result_future.done(), "the cancelled result", timeout_s=3.0)
+    assert result_future.result().status == GoalStatus.STATUS_CANCELED
+    return result_future.result().result
+
+
+def _play_to_the_end(harness, handle) -> tuple[object, list[float]]:
+    result_future = handle.get_result_async()
+    pitches: list[float] = []
+    deadline = time.time() + TIMEOUT_S
+    while not result_future.done() and time.time() < deadline:
+        pitch = _right_pitch(harness)
+        if pitch is not None:
+            pitches.append(pitch)
+        time.sleep(0.01)
+    assert result_future.done(), "the replay did not finish"
+    return result_future.result().result, pitches
+
+
+def _cancel_past_the_turn(harness):
+    """Start ``wave`` and cancel it on the way back from its -0.3 rad turning point."""
+    handle = _wave_goal(harness)
+    lowest = [0.0]
+
+    def past_the_turn() -> bool:
+        pitch = _right_pitch(harness)
+        if pitch is None:
+            return False
+        lowest[0] = min(lowest[0], pitch)
+        return lowest[0] < -0.28 and pitch > -0.2
+
+    harness.wait_for(past_the_turn, "the replay to pass its turning point")
+    return _cancel(harness, handle)
+
+
+def test_a_cancelled_replay_holds_where_it_is_and_hands_back_a_resume_token(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        handle = _wave_goal(harness)
+        harness.wait_for(lambda: (_right_pitch(harness) or 0.0) < -0.1, "the replay to be under way")
+        result = _cancel(harness, handle)
+        assert result.error_code == ExecuteNamedMotion.Result.CANCELLED, result.message
+        assert result.resume_token
+        assert 0.0 < result.progress < 1.0
+        held = _right_pitch(harness)
+        time.sleep(0.3)
+        assert _right_pitch(harness) == pytest.approx(held, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+def test_a_resumed_replay_continues_from_where_it_stopped(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        cancelled = _cancel_past_the_turn(harness)
+        assert cancelled.progress > 0.5
+        result, pitches = _play_to_the_end(harness, _wave_goal(harness, resume_token=cancelled.resume_token))
+        assert result.success, result.message
+        assert "resumed from" in result.message
+        assert result.progress == pytest.approx(1.0)
+        # The turning point it had already played is not played again.
+        assert min(pitches) > -0.25
+        assert pitches[-1] == pytest.approx(0.0, abs=0.02)
+    finally:
+        harness.shutdown()
+
+
+def test_a_resume_token_is_not_honoured_once_the_arm_was_commanded(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        cancelled = _cancel_past_the_turn(harness)
+        command = Float64MultiArray()
+        command.data = [0.0] * len(projection.VENDOR_ARM_ORDER)
+        harness.publish("/aimdk/arm/commands", command, count=5)
+        # A fresh public arm stream is not preempted; let it go stale first.
+        time.sleep(0.7)
+        result, pitches = _play_to_the_end(harness, _wave_goal(harness, resume_token=cancelled.resume_token))
+        assert result.success, result.message
+        assert "arm was commanded since" in result.message
+        assert min(pitches) < -0.28
+    finally:
+        harness.shutdown()
+
+
+def test_a_cancel_holds_the_target_sent_one_tracking_lag_ago(tmp_path):
+    """The arm trails the command: it is told to stay where it is, a target sent one lag earlier,
+    instead of carrying on to the latest target."""
+    harness = _replay_harness(tmp_path, duration_s=2.0, named_motion={"trajectory_hold_lag_s": 0.3})
+    try:
+        handle = _wave_goal(harness)
+        sent: list[tuple[int, float]] = []
+        while not sent or sent[-1][1] > -0.15:
+            message = harness.mock.last_upper_body
+            if message is not None and (not sent or harness.mock.upper_body_count != sent[-1][0]):
+                sent.append((harness.mock.upper_body_count, message.arm_pos[_RIGHT_PITCH]))
+            time.sleep(0.002)
+        count_at_cancel = harness.mock.upper_body_count
+        _cancel(harness, handle)
+        last_target = [pitch for count, pitch in sent if count <= count_at_cancel][-1]
+        # Still on the way out, so a target sent 0.3 s earlier is well short of the latest.
+        assert _right_pitch(harness) > last_target + 0.05
     finally:
         harness.shutdown()

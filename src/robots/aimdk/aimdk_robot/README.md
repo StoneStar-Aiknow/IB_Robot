@@ -220,6 +220,21 @@ succeeds only if the measured arm followed it — at least
 — and otherwise fails `REJECTED_BY_PLATFORM`, because the platform drops
 upper-body commands it cannot use without saying so.
 
+A replay is the only named motion that accepts a cancel (presets and postures
+refuse it and point at `/runtime/stop`). It stops on the next tick and holds
+the target it sent `trajectory_hold_lag_s` ago, the one the arm is realizing:
+holding the last target would carry the motion on, and holding the measured
+pose lets the arm sag, because the platform holds a pose only with an error
+against gravity. On the X2 this stops a 2.6 rad/s wave within 0.1 rad and
+0.4 s. The goal ends `CANCELLED` with a
+`resume_token` and the `progress` reached. A later goal carrying that token
+eases from the measured pose to the point where the recording stopped and
+plays the rest. The runtime keeps one checkpoint and honours it once, within
+`trajectory_resume_ttl_s` (default 120 s), and only while nothing has moved the
+arm or changed who commands it: a public arm target, another named motion, a
+mode change, a stop or lost arbitration all void it. A void token plays the
+motion from the start and says why in the result message.
+
 Record a gesture with the runtime in `idle` (stable stand, so the preset plays):
 
 ```bash
