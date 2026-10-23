@@ -34,6 +34,9 @@ robot:
   # vendor's VAD-segmented chunks on audio.speech.
   voice_asr:
     enabled: true
+    # Beam search + domain hotwords: the quantized streaming transducer is weak on
+    # command words, and sherpa only applies hotwords through this file.
+    hotwords_file: $(find robot_config)/config/hotwords/x2_commands.txt
     input_mode: external_vad
     active_mode: continuous
     audio_input:
@@ -57,6 +60,20 @@ robot:
         - mirror_stop
         - self_introduction
       voice_bridge:
+        # Known mishearings of the command vocabulary, mapped to the canonical form
+        # (the planner matches aliases, so canonical text is enough).
+        text_corrections:
+          # "停止" is the fragile part: the transducer hears 停止照镜子 as 银子/名字照镜子,
+          # and the planner then matches the 照镜子 tail and starts a round instead of stopping.
+          停止照镜子: [银子照镜子, 名字照镜子, 明子照镜子, 瓶子照镜子, 影子照镜子, 林子照镜子, 停了照镜子, 听止照镜子, 停止找镜子, 挺直照镜子, 停下照镜子, 停止照镜像]
+          停止: [银子, 名字, 听止, 停职, 挺直]
+          挥挥手: [灰灰手, 恢恢手, 回回手, 挥挥手手]
+          握个手: [卧个手, 我个手, 握握手]
+          举手: [据手, 举起手]
+          比个心: [比个星, 比个信, 比心]
+          鼓掌: [古掌, 股掌]
+          照镜子: [找镜子, 照境子, 照紧子]
+          自我介绍: [自我介少, 自我结绍]
         # The clip is the reply: announcing the plan and then saying "执行完成。"
         # would talk over the self-introduction.
         silent_skills:

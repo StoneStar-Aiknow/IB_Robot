@@ -246,6 +246,7 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         "exit_on_init_failure": voice_asr_config.get(
             "exit_on_init_failure", voice_asr_defaults["exit_on_init_failure"]
         ),
+        "hotwords_file": resolve_ros_path(str(voice_asr_config.get("hotwords_file", "") or "")),
         "final_tail_padding_seconds": voice_asr_config.get(
             "final_tail_padding_seconds", voice_asr_defaults["final_tail_padding_seconds"]
         ),

@@ -180,6 +180,8 @@ class VoiceASRNode(Node):
         self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
         self.declare_parameter("realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"])
         self.declare_parameter("final_tail_padding_seconds", VOICE_ASR_DEFAULTS["final_tail_padding_seconds"])
+        # Hotword list for the streaming transducer (sherpa: hotwords_file).
+        self.declare_parameter("hotwords_file", "")
         self.declare_parameter("audio_topic", "/audio/capture_stamped")
         self.declare_parameter("audio_channels", 6)
         self.declare_parameter("audio_input_channel", VOICE_ASR_DEFAULTS["audio_input_channel"])
@@ -205,6 +207,7 @@ class VoiceASRNode(Node):
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
         self._realtime_pre_roll_seconds = max(0.0, float(self.get_parameter("realtime_pre_roll_seconds").value))
         self._final_tail_padding_seconds = max(0.0, float(self.get_parameter("final_tail_padding_seconds").value))
+        self._hotwords_file = str(self.get_parameter("hotwords_file").value or "").strip()
         self._audio_topic = str(self.get_parameter("audio_topic").value)
         self._audio_channels = int(self.get_parameter("audio_channels").value)
         self._audio_input_channel = int(self.get_parameter("audio_input_channel").value)
@@ -273,6 +276,7 @@ class VoiceASRNode(Node):
                 deployment=self._deployment,
                 language=self._language,
                 final_tail_padding_seconds=self._final_tail_padding_seconds,
+                hotwords_file=self._hotwords_file,
             )
             # ASR 模型采样率只有初始化 recognizer 后才能确定；必须与音频输入一致。
             self._validate_asr_audio_sample_rate()
@@ -283,7 +287,8 @@ class VoiceASRNode(Node):
                 self._vad.initialize()
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
             self.get_logger().info(
-                f"ASR deployment loaded: {self._bundle_path}#{self._deployment} (type: {model_type_str})"
+                f"ASR deployment loaded: {self._bundle_path}#{self._deployment} (type: {model_type_str}"
+                f"{', beam_search' + (' + hotwords' if self._hotwords_file else '') if model_type_str == 'streaming' else ''})"
             )
             if not self._asr.is_streaming():
                 self.get_logger().info(

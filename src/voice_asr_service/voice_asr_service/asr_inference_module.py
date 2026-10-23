@@ -143,6 +143,11 @@ class ASRInferenceModule:
         self._stream: Any | None = None
         self._model_type: ModelType = ModelType.OFFLINE
         self._hotwords: dict[str, float] = {}
+        # Optional hotword list for the streaming transducer: sherpa only applies it
+        # with modified_beam_search, which the default factory call never enabled.
+        self._hotwords_file: str = ""
+        self._beam_size: int = 4
+        self._streaming_factory_kwargs: dict[str, Any] = {}
         self._sample_rate: int = 16000
 
         self._active_stream: Any | None = None
@@ -164,6 +169,7 @@ class ASRInferenceModule:
         deployment: str,
         language: str = "zh",
         final_tail_padding_seconds: float = 0.0,
+        hotwords_file: str = "",
     ) -> bool:
         """
         初始化 ASR 模型
@@ -196,6 +202,7 @@ class ASRInferenceModule:
             self._bundle_path = str(validated.bundle_root)
             self._deployment = deployment
             self._language = language
+            self._hotwords_file = str(hotwords_file or "").strip()
 
             roles = validated.resolved_artifacts
             role_paths = {str(role): str(path) for role, path in roles.items()}
@@ -326,14 +333,23 @@ class ASRInferenceModule:
         """
         import sherpa_onnx
 
-        return sherpa_onnx.OnlineRecognizer.from_transducer(
-            encoder=encoder,
-            decoder=decoder,
-            joiner=joiner,
-            tokens=tokens_path,
-            num_threads=4,
-            provider=provider,
-        )
+        # Beam search beats greedy on a small quantized transducer, and it is the only
+        # decoding method that can carry a hotword list.
+        kwargs: dict[str, Any] = {
+            "encoder": encoder,
+            "decoder": decoder,
+            "joiner": joiner,
+            "tokens": tokens_path,
+            "num_threads": 4,
+            "provider": provider,
+            "decoding_method": "modified_beam_search",
+            "max_active_paths": self._beam_size,
+        }
+        if self._hotwords_file:
+            kwargs["hotwords_file"] = self._hotwords_file
+            kwargs["hotwords_score"] = 1.5
+        self._streaming_factory_kwargs = dict(kwargs)
+        return sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
 
     def _create_streaming_paraformer_recognizer(
         self, encoder: str, decoder: str, tokens_path: str, provider: str
@@ -625,13 +641,34 @@ class ASRInferenceModule:
         """
         设置热词
 
+        sherpa 的 OnlineRecognizer 没有 set_hotwords 方法，热词只能通过
+        hotwords_file 在构造时生效，所以这里把词表写盘并重建识别器。
+
         Args:
             hotwords: 热词字典 {word: boost_score}
         """
-        self._hotwords = hotwords
+        self._hotwords = dict(hotwords)
+        if not hotwords:
+            return
+        if self._model_type is not ModelType.STREAMING or not self._streaming_factory_kwargs:
+            return
+        path = self._hotwords_file or "/tmp/voice_asr_hotwords.txt"
+        with open(path, "w", encoding="utf-8") as handle:
+            for word, score in hotwords.items():
+                handle.write(f"{word} :{float(score)}\n")
+        self._hotwords_file = path
+        self._rebuild_streaming_recognizer()
 
-        if self._recognizer and hasattr(self._recognizer, "set_hotwords"):
-            self._recognizer.set_hotwords(hotwords)
+    def _rebuild_streaming_recognizer(self) -> None:
+        """Recreate the streaming recognizer so a new hotword file takes effect."""
+        import sherpa_onnx
+
+        kwargs = dict(self._streaming_factory_kwargs)
+        kwargs["hotwords_file"] = self._hotwords_file
+        kwargs["hotwords_score"] = 1.5
+        self._streaming_factory_kwargs = dict(kwargs)
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
+        self._install_streaming_runtime(_SherpaStreamingRuntime(self._recognizer, self._sample_rate, 0.0))
 
     def add_hotword(self, word: str, boost: float = 1.5):
         """添加单个热词"""
