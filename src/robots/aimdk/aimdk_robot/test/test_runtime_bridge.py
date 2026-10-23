@@ -1384,6 +1384,17 @@ def test_platform_state_is_read_off_the_feedback_torrents_callback_group(harness
     assert joint_publish is not harness.runtime.default_callback_group
 
 
+def test_hand_state_is_not_taken_up_behind_the_feedback_torrent(harness):
+    """Behind the joint streams the hand state went unread for 0.5 s on the robot."""
+    harness.wait_active()
+    runtime = harness.runtime
+    hand = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/hand/state"]
+    joints = [s for s in runtime.subscriptions if s.topic_name == "/aima/hal/joint/arm/state"]
+    assert len(hand) == 1 and len(joints) == 1
+    assert hand[0].callback_group is not runtime.default_callback_group
+    assert hand[0].callback_group is not joints[0].callback_group
+
+
 def test_command_streams_are_not_taken_up_behind_the_feedback_torrent(harness):
     """On the robot the arm stream in the default group was read ~2 times a second."""
     harness.wait_active()
