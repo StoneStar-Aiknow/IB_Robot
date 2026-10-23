@@ -1,0 +1,11 @@
+# Python dependencies for the training profile
+# (./scripts/setup.sh --profile training).
+#
+# Training hosts run LeRobot training only: no ROS 2 runtime, no rosdep, no
+# colcon, and no workspace build overlay. LeRobot itself (with its
+# smolvla/pi/diffusion/dataset extras) plus the CUDA or CPU Torch build come
+# from the editable install in setup_python_venv; this file carries only the
+# training-relevant add-ons that are not part of LeRobot's dependency graph.
+#
+# TensorBoard is LeRobot's default local training logging backend.
+tensorboard

@@ -7,6 +7,7 @@
 #   scripts/verify_runtime_independence.sh runtime so101_robot [--profile so101_single_arm]
 #   scripts/verify_runtime_independence.sh runtime lekiwi_robot [--profile lekiwi_lidar]
 #   scripts/verify_runtime_independence.sh runtime aimdk_robot [--profile x2_ultra]
+#   scripts/verify_runtime_independence.sh runtime unitree_g1_robot [--profile g1_29dof_dex3]
 #   scripts/verify_runtime_independence.sh core
 #
 # runtime mode: build <robot>_robot in an ISOLATED workspace containing only its
@@ -65,6 +66,14 @@ LEKIWI_RUNTIME_MEMBERS=(
 # developer's AimDK overlay and is never vendored into this repository.
 AIMDK_RUNTIME_MEMBERS=(aimdk_robot)
 AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
+# The G1 runtime is a bridge onto the vendor DDS tier: no SDK or hardware
+# adapter of its own, but it owns the vendored message packages (unitree_hg /
+# unitree_go / unitree_api) and the vendored robot description, all in-tree —
+# no external overlay, unlike aimdk. unitree_go is a member for the vendored
+# family even though the current bridge does not link it yet.
+UNITREE_RUNTIME_MEMBERS=(
+  unitree_g1_robot unitree_g1_description unitree_hg unitree_go unitree_api
+)
 # Third-party/vendored packages that may appear in a runtime closure without
 # being IB-Robot generic packages (they are not listed by `colcon list` in the
 # main workspace src/ tree anyway; this list documents intent).
@@ -164,6 +173,11 @@ runtime_gate() {
         exit 0
       fi
       VENDOR_OVERLAY_SETUP="${AIMDK_OVERLAY_SETUP:-}"
+      ;;
+    unitree_g1_robot)
+      members=("${UNITREE_RUNTIME_MEMBERS[@]}")
+      profile_dir="$MAIN_WORKSPACE/src/robots/unitree/unitree_g1_robot/profiles"
+      default_profile="g1_29dof_dex3"
       ;;
     *)
       log_error "no runtime allow-list declared for '${robot_pkg}'"

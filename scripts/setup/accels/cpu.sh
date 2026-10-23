@@ -13,6 +13,14 @@ accel_supports_torch_grasp() {
     return 1
 }
 
+# Whether GraspGenX can be installed on this accelerator; see the note in
+# accels/cann.sh for why it is asked separately from the GraspGen stack.
+accel_supports_torch_graspgenx() {
+    # Its only deployments are cuda and npu, so a CPU-only host has no backend
+    # to serve it even though the wheel itself would install.
+    return 1
+}
+
 # Workspace pip constraint file that protects this accelerator's Torch ABI
 # during every dependency install, or no output when none is needed.
 accel_pip_constraints() {

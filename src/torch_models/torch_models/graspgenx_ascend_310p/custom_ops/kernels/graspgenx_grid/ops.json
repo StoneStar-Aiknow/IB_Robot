@@ -1,0 +1,12 @@
+[
+  {
+    "op": "GridEncode",
+    "input_desc": [
+      {"name": "grid_coord", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "spatial_codes", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "attr": [{"name": "depth", "param_type": "required", "type": "int"}]
+  }
+]

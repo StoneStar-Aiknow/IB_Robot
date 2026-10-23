@@ -52,7 +52,7 @@ class Harness:
         self.runtime = AimdkRuntimeNode(
             parameter_overrides=[
                 rclpy.parameter.Parameter("profile", value=str(profile)),
-                rclpy.parameter.Parameter("simulated", value=True),
+                rclpy.parameter.Parameter("use_sim", value=True),
                 rclpy.parameter.Parameter("startup_timeout_s", value=8.0),
             ]
         )

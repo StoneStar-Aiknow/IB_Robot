@@ -13,6 +13,16 @@
 - ✅ VR 遥操作作为**独立 TCP 节点**（`vr_teleop`）提供，绕过 `TeleopNode` 设备抽象层（见「VR 遥操作」一节）
 - ✅ Cartesian 模式设备通过 `placo_servo` 或 `moveit_servo` 后端实时驱动
 
+### 统一 launch 的条目贡献
+
+本包经 entry point 组 `ibrobot.launch_builders` 向 `robot_config` 的统一 launch 贡献两个条目
+（`launch_builders/` 目录，见 `setup.py`）：
+
+- `teleop`（`teleop.py`）：遥操作设备节点，仅在 teleop 控制模式参与；
+- `hand_sources`（`hand_sources.py`，openspec change `migrate-hand-sources-to-robot-teleop`）：MHandPro
+  数据手套输入源，含 `hand_profile` 参数（right/left/dual 选择）、`hand_profiles` 的配置覆盖 hook 与
+  启动前交互式 P 位姿确认。未安装本包时这两个条目与参数都不出现。
+
 ---
 
 ## 架构设计 (Architecture Design)

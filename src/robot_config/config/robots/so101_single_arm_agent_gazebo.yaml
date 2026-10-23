@@ -3,8 +3,8 @@
 robot:
   name: so101_single_arm
   base_config: so101_single_arm_agent_test.yaml
-  audio_io:
-    enabled: false
+  simulation:
+    platform: gazebo
   voice_asr:
     enabled: false
   voice_tts:

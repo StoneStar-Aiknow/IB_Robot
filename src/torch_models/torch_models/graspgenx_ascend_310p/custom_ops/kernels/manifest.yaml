@@ -1,0 +1,74 @@
+schema_version: 1
+name: graspgenx-ascend-ops
+kind: source
+origin:
+  project: GraspGenX-ascend
+  description: >
+    Custom Ascend C operators written for GraspGenX's PTV3 encoder on an
+    Ascend 310P. First-party source for this package, kept as source rather
+    than as a built artifact because neither product of the build is
+    portable: see `binding` below. Not built by colcon -- see
+    scripts/setup/install_graspgenx_ascend_ops.sh and the package README.
+  files:
+    - ops.json
+    - op_host/
+    - op_kernel/
+    - torch_bridge.cpp
+
+operators:
+  graspgenx_subm:
+    vendor_name: graspgenx_subm
+    ops:
+      - name: BuildSubmMap
+        purpose: >
+          Build the submanifold neighbour map for a voxel set. The neighbour
+          width is ceil(K^3 / 8) * 8 -- 32 for a 3x3x3 kernel -- and absent
+          neighbours are -1; the tiling function rejects any other width.
+      - name: SubmConv3d
+        purpose: Submanifold sparse convolution over that map, used by PTV3's CPE.
+  graspgenx_grid:
+    vendor_name: graspgenx_grid
+    ops:
+      - name: GridEncode
+        purpose: >
+          Integer space-filling-curve codes for PTV3 serialization, matching
+          ptv3_vanilla.encode column for column.
+
+binding:
+  # Why this is built at setup time instead of downloaded with the bundle.
+  operator_package:
+    bound_to: CANN release and compute unit
+    compute_unit: ascend310p
+    verified_cann: 8.1.RC1
+    note: >
+      Built by msopgen plus cmake against the installed toolkit. An offline
+      model that embeds these kernels carries them, but PTV3 runs in Torch and
+      calls the operators directly, so the package has to be present at run
+      time.
+  torch_bridge:
+    bound_to: the installed Torch ABI
+    note: >
+      Compiled against the venv's libtorch and libtorch_npu, with
+      -D_GLIBCXX_USE_CXX11_ABI read from the installed Torch and an rpath into
+      those directories. It cannot be shipped as a model artifact, because a
+      different Torch in the venv makes it unloadable.
+  verified_runtime:
+    torch: "2.5.1"
+    torch_npu: "2.5.1"
+    device: Ascend310P1
+
+build:
+  command: scripts/setup/install_graspgenx_ascend_ops.sh
+  requires:
+    - CANN toolkit (msopgen and the Ascend C compiler, not only the runtime)
+    - cmake
+    - a C++17 host compiler
+    - the workspace venv, for the Torch headers and ABI flag
+  output_layout: >
+    <root>/<vendor_name>/torch_bridge.so and <root>/vendors/<vendor_name>/ for
+    ASCEND_CUSTOM_OPP_PATH, where <root> is IBROBOT_GRASPGENX_ASCEND_OPS. See
+    src/torch_models/torch_models/graspgenx_ascend_310p/custom_ops/__init__.py.
+
+licensing:
+  status: first_party
+  license: Apache-2.0

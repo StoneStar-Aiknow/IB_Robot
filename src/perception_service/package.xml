@@ -19,6 +19,10 @@
   <!-- Bundle packaging only: package_graspgen_ascend_bundle reads compiled OM ABIs
        through model_utils.inference_manifest_export. The runtime services do not. -->
   <exec_depend>model_utils</exec_depend>
+  <!-- torch_model_loaders assembles the Ascend GraspGenX model from
+       torch_models.graspgenx_ascend_310p for the npu deployment. Only that
+       deployment imports it, so it stays an exec dependency. -->
+  <exec_depend>torch_models</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
@@ -28,6 +32,9 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>inference_manifest</test_depend>
+  <test_depend>model_utils</test_depend>
+  <test_depend>torch_models</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

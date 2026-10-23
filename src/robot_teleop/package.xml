@@ -17,11 +17,23 @@
   <!-- Runtime dependencies -->
   <depend>rclpy</depend>
   <depend>robot_runtime</depend>
+  <!-- Launch-builder registration (openspec change
+       ``migrate-business-launch-builders``): launch_builders/teleop.py
+       contributes the teleop entry to robot_config's launch registry
+       through the ibrobot.launch_builders entry point group, and the
+       operator launch entry loads robot configs — both import robot_config
+       at runtime. The dependency is one way: robot_config does not depend
+       on robot_teleop. -->
+  <depend>robot_config</depend>
   <depend>ibrobot_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>tf2_ros</depend>
   <exec_depend>pymoveit2</exec_depend>
   <exec_depend>joy</exec_depend>
+  <!-- joy_teleop moved here with the teleop launch builder (it launches
+       joy_teleop nodes for mobile-base profiles); robot_config no longer
+       declares it. -->
+  <exec_depend>joy_teleop</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>python3-websockets</exec_depend>
   <depend>sensor_msgs</depend>
@@ -33,6 +45,10 @@
 
   <!-- Test dependencies -->
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated launch-builder and operator-launch tests import
+       robot_config's loader and registry (openspec change
+       ``migrate-business-launch-builders``). -->
+  <test_depend>robot_config</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

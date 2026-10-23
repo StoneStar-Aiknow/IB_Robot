@@ -181,6 +181,7 @@ def _launch_setup(context):
         ("microphone_channels", "audio_channels"),
         ("microphone_sample_rate", "sample_rate"),
         ("speech_direction_audio_topic", "audio_topic"),
+        ("speech_direction_enhanced_audio_topic", "enhanced_audio_topic"),
     ):
         value = LaunchConfiguration(launch_name).perform(context).strip()
         if value:
@@ -256,6 +257,7 @@ def generate_launch_description():
             DeclareLaunchArgument("microphone_sample_rate", default_value=""),
             DeclareLaunchArgument("microphone_channels", default_value=""),
             DeclareLaunchArgument("speech_direction_audio_topic", default_value=""),
+            DeclareLaunchArgument("speech_direction_enhanced_audio_topic", default_value=""),
             DeclareLaunchArgument("microphone_channel_indices", default_value=""),
             DeclareLaunchArgument("speech_direction_mount_yaw_deg", default_value=""),
             OpaqueFunction(function=_launch_setup),

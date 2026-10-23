@@ -36,7 +36,6 @@ robot:
     arm_surface: false
     skill_catalog_profile: aimdk_x2_skills
     skill_catalog_source_mode: development
-    skill_catalog_source_root: src/skill_catalog
     runtime_named_motion:
       enabled: true
       # Logical binding: launch waits for this runtime interface and binds its
@@ -46,3 +45,8 @@ robot:
       type: ibrobot_msgs/action/ExecuteNamedMotion
       requires:
         capability: motion.named
+
+# The voice chain lives in aimdk_x2_voice.yaml, which layers on this profile.
+# It is not enabled here on purpose: it needs the out-of-repo X-ASR bundle and
+# the runtime audio.speech interface, so a deployment that only wants the
+# preset gestures must not inherit either dependency.

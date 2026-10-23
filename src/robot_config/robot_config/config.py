@@ -230,11 +230,18 @@ class VoiceASRConfig:
     audio_input_channel: int = 1
     vad_input_channel: int | None = None
     exit_on_init_failure: bool = True
+    #: shared_audio = 本地 Silero VAD + 共享音频流；external_vad = 音源自带分段事件。
+    input_mode: str = "shared_audio"
+    #: external_vad 通过 audio.speech 逻辑接口消费 SpeechAudioChunk；chunk_topic 是独立节点 fallback。
+    chunk_topic: str = "/audio/speech_chunk"
+    audio_input: dict[str, Any] | None = None
+    external_min_samples: int = 3200
+    external_idle_timeout: float = 2.0
 
 
 @dataclass
 class AudioIOConfig:
-    """Cross-platform audio_common device-owner configuration."""
+    """Cross-platform audio_common device-owner configuration (provider-less legacy path)."""
 
     enabled: bool = False
     microphone: str = ""
@@ -259,6 +266,9 @@ class SpeechDirectionConfig:
     enabled: bool = False
     profile: str = "ascend_310p"
     microphone: str = ""
+    #: Bound to the runtime's audio.capture interface (runtime-owned-audio-io);
+    #: the resolved topic and array format are written by bind_robot_interfaces.
+    audio_input: dict[str, Any] | None = None
     config_file: str = ""
     profiles_file: str = ""
     models_root: str = ""
@@ -287,10 +297,11 @@ class VoiceTTSConfig:
     tts_timeout_sec: float = 15.0
     device_id: int = 0
     exit_on_init_failure: bool = True
-    #: Logical binding of the playback sink to a runtime interface (e.g. aimdk
-    #: audio.play); when set, no local ALSA playback node is launched.
+    #: Bound to the runtime's audio.play interface (runtime-owned-audio-io);
+    #: the resolved topic and playback format are written by bind_robot_interfaces.
     audio_output: dict[str, Any] | None = None
-    #: Opt-in conversion of synthesized audio to audio_io.playback_sample_rate.
+    #: Opt-in conversion of synthesized audio to the playback sample rate (the
+    #: bound runtime rate, or audio_io.playback_sample_rate for a local sink).
     resample_to_playback_rate: bool = False
     chunk_ms: int = 50
 

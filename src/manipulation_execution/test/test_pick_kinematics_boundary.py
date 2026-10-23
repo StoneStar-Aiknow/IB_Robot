@@ -31,7 +31,8 @@ def description():
                 "motion.move_to_joint": {"endpoints": ["/custom/move"]},
             },
         },
-        simulated=True,
+        use_sim=True,
+        sim_platform="sdk",
     )
 
 

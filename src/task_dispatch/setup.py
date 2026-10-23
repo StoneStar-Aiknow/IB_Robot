@@ -21,5 +21,14 @@ setup(
         "console_scripts": [
             "task_executor_node = task_dispatch.task_executor_node:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the task executor's
+        # launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the with_moveit resolution.
+        "ibrobot.launch_builders": [
+            "task_executor = task_dispatch.launch_builders.task_execution:TASK_EXECUTOR_BUILDER",
+        ],
     },
 )

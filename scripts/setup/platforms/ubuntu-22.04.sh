@@ -17,7 +17,9 @@ platform_install_colcon() {
 
 platform_install_python_bootstrap() {
     run_sudo apt-get update -qq
-    run_sudo apt-get install -y python3-venv python3-pip -qq
+    # LeRobot video decoding needs the FFmpeg runtime libraries in every profile.
+    # Do not rely on ROS/OpenCV bringing them in transitively.
+    run_sudo apt-get install -y python3-venv python3-pip ffmpeg -qq
 }
 
 platform_install_benchmark_system_deps() {
@@ -26,7 +28,7 @@ platform_install_benchmark_system_deps() {
     fi
 
     log_info "Installing benchmark headless rendering dependency..."
-    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev ffmpeg -qq
+    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev -qq
 }
 
 platform_pre_install_rosdeps() {

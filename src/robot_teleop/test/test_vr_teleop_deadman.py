@@ -103,6 +103,12 @@ def _install_stubs():
     # cartesian_backend.frame_adapter — vr_teleop imports ToolAngularAdapter from
     # it, and its package __init__ transitively needs pymoveit2. Provide the one
     # symbol so the import line resolves without dragging in the servo backends.
+    # The bare package stub is only needed while vr_teleop.py loads: pytest
+    # imports every test module during collection before any test runs, so a
+    # stub left in sys.modules would leak into other files' `from robot_teleop
+    # import X` (the PEP 562 facade would be shadowed); it is restored below.
+    global _ORIGINAL_ROBOT_TELEOP
+    _ORIGINAL_ROBOT_TELEOP = sys.modules.get("robot_teleop")
     pkg = types.ModuleType("robot_teleop")
     pkg.__path__ = [_PKG_DIR]
     sys.modules["robot_teleop"] = pkg
@@ -120,6 +126,10 @@ _spec = importlib.util.spec_from_file_location("robot_teleop.vr_teleop", os.path
 vr_teleop = importlib.util.module_from_spec(_spec)
 sys.modules["robot_teleop.vr_teleop"] = vr_teleop
 _spec.loader.exec_module(vr_teleop)
+if _ORIGINAL_ROBOT_TELEOP is None:
+    sys.modules.pop("robot_teleop", None)
+else:
+    sys.modules["robot_teleop"] = _ORIGINAL_ROBOT_TELEOP
 
 from std_srvs.srv import Trigger  # noqa: E402  (our stub)
 

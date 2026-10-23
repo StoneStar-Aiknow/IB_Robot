@@ -1,7 +1,7 @@
 """LeKiwi runtime launch entry (robot-runtime-packaging spec).
 
 robot_state_publisher + ros2_control (lekiwi_hardware, shared bus, real or
-SDK simulated transport) + controllers + so101_motion for the arm + the
+SDK simulation platform) + controllers + so101_motion for the arm + the
 LeKiwi base node (cmd_vel, odometry, navigation gating) + sensor peripherals
 (D12: profile defaults, deployment overrides via peripherals:=<file>) with
 the fast_lio lidar odometry chain + runtime facade.
@@ -26,7 +26,7 @@ from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
     resolve_profile_argument,
-    resolve_simulated,
+    resolve_sim_selection,
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file
@@ -36,7 +36,14 @@ from robot_runtime.profile import load_profile
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("lekiwi_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
+    use_sim, sim_platform = resolve_sim_selection(
+        profile,
+        LaunchConfiguration("use_sim").perform(context),
+        LaunchConfiguration("sim_platform").perform(context),
+        LaunchConfiguration("simulated").perform(context),
+        source=str(profile_path),
+    )
+    simulated = use_sim
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
 
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
@@ -65,13 +72,13 @@ def _launch_setup(context, *_args, **_kwargs):
                     os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
                 ),
                 launch_arguments={
-                    **motion_launch_arguments(profile, profile_path, simulated, display),
+                    **motion_launch_arguments(profile, profile_path, simulated, sim_platform or "", display),
                     "robot_description": arm_motion_model(profile, profile_path, simulated),
                 }.items(),
             )
         )
     peripherals = [
-        *peripheral_stack_actions(profile, peripherals_file, simulated),
+        *peripheral_stack_actions(profile, peripherals_file, simulated, sim_platform=sim_platform or ""),
         *fast_lio_nodes(fast_lio_config, bridge_package="lekiwi_robot", use_sim=simulated),
     ]
     return [
@@ -81,6 +88,7 @@ def _launch_setup(context, *_args, **_kwargs):
             simulated,
             peripherals_file,
             LaunchConfiguration("instance_id").perform(context).strip(),
+            sim_platform=sim_platform or "",
         ),
         base_node,
         *motion_actions,
@@ -92,7 +100,22 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("profile", description="Runtime profile path or shipped profile name (required)"),
-            DeclareLaunchArgument("simulated", default_value="", description="Override profile.simulated"),
+            DeclareLaunchArgument(
+                "use_sim",
+                default_value="",
+                description="Run simulated (true) or physical (false); default: the profile's selection",
+            ),
+            DeclareLaunchArgument(
+                "sim_platform",
+                default_value="",
+                description="Simulation platform: sdk | gazebo (sdk: the vendor SDK virtual bus, no physics); "
+                "implies use_sim:=true when given alone",
+            ),
+            DeclareLaunchArgument(
+                "simulated",
+                default_value="",
+                description="Deprecated alias of use_sim (a warning names use_sim)",
+            ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument(

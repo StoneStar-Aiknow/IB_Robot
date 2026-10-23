@@ -1,0 +1,16 @@
+[
+ {"category":"hat","reply":"你戴的帽子很有特点。"},
+ {"category":"hat","reply":"戴着这顶帽子很显眼呀。"},
+ {"category":"hat","reply":"你的红帽子真好看。"},
+ {"category":"hat","reply":"这顶蓝色帽子我注意到了。"},
+ {"category":"toy","reply":"你举起的玩偶真有趣。"},
+ {"category":"toy","reply":"举着的那个玩偶真可爱。"},
+ {"category":"toy","reply":"你手上的黄色玩偶很醒目。"},
+ {"category":"toy","reply":"这个毛茸茸的玩偶真好玩。"},
+ {"category":"sign","reply":"你举着的牌子我看到了。"},
+ {"category":"sign","reply":"举着的牌子真显眼呀。"},
+ {"category":"sign","reply":"你手里那块牌子很特别。"},
+ {"category":"badge","reply":"你别着的徽章很醒目。"},
+ {"category":"badge","reply":"胸前那枚徽章真精致。"},
+ {"category":"badge","reply":"你的徽章我注意到了。"}
+]

@@ -98,16 +98,34 @@ GC_HOST=atomgit.com gitcode pr view 123 -R openEuler/IB_Robot --json
 ```
 
 回读核对目标、source repo/branch/SHA、base、标题、正文与 draft。
-实测创建可能已成功却返回非零退出，且 WIP 标题/draft 可能需要显式 edit 后才能正确读回；
-不能仅凭返回码判定“没创建”，也不能仅凭写入成功就宣布验证完成。
+gitcode 写命令（create/edit/close/comment）的退出码双向不可靠：超时/非零退出可能已写入
+（CLI 会在客户端超时后内部重试），退出 0 也不免除回读。实测创建可能已成功却返回非零退出，
+且 WIP 标题/draft 可能需要显式 edit 后才能正确读回。
 正式检视仅在证据补齐后用规范化标题和 `--draft false`。
 
-创建结果不确定（超时、非零退出、缺编号）时，先执行只读对账：
+写入结果不确定（超时、非零退出、缺编号）时，先等约 20 s 让服务端写入与索引落定，
+再只读对账，绝不自动重发任何写命令。一次 create 可能因 CLI 内部重试产生多条完全相同的
+PR（实测先例 !519–!521 同秒创建三条），必须拉全量列表核对，不能只看最新一条：
 
 ```bash
 GC_HOST=atomgit.com gitcode pr list -R openEuler/IB_Robot --state all --paginate --json
+# 候选过多可加 --head <source-branch> --base master 过滤；跨 fork 时过滤结果不作完整证据
 ```
 
-按完整源仓库身份、head branch/SHA、目标 base 和正文核对候选。
-唯一匹配可回读确认；无匹配或歧义均不能自动重新创建，先人工核对。
-编辑结果不确定也先回读，报告“写入结果未知”或“已写入但核验失败”，不能自动重发。
+`--paginate`、`--head`、`--base` 为 `pr list --help` 实测支持；`issue list` 没有
+`--paginate`（见 atomgit-issue）。按完整身份核对候选：源仓库、head branch + 完整 SHA、
+base、标题、正文哈希。
+
+- 唯一匹配：回读确认后继续。
+- 无匹配或身份对不上：人工核对，不自动重建。
+- 多条完全一致：CLI 重试复制的重复 PR。停止发布流程，把清单交给用户确认；确认后保留
+  最小编号，其余逐个带指向评论关闭；head/base/正文任一不同的 PR 一律不关：
+
+```bash
+GC_HOST=atomgit.com gitcode pr close 520 -R openEuler/IB_Robot \
+  --comment 'CLI 超时重试产生的重复 PR，请改看 <保留编号>。' --yes --json --no-interactive
+```
+
+close/edit/comment 同样以回读为准（close 回读 state、comment 回读评论、edit 回读标题/正文），
+退出码只作参考——实测 close 退出码 5 却已关闭并发出评论。回读失败如实报告
+“写入结果未知”或“已写入但核验失败”，不能自动重发。

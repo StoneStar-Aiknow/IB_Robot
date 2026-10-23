@@ -12,6 +12,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import yaml
 from launch.actions import EmitEvent
@@ -19,6 +20,17 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.description import generate_robot_description
+from robot_config.launch_registry.builder_support import (
+    readiness_attribute,
+    resolve_display,
+    runtime_provider_name,
+)
+from robot_config.launch_registry.registry import (
+    BuilderSpec,
+    BuildResult,
+    ControlStartup,
+    LaunchBuildContext,
+)
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     parse_bool,
@@ -399,18 +411,29 @@ def generate_controller_spawners(
     ]
 
 
-def _calibration_tool_command(robot_config: dict, arm: str, port: str) -> str:
+def calibration_tool_command(robot_config: dict, arm: str, port: str) -> str:
     """Build the calibration tool command from the robot configuration.
 
     The command is derived from ``robot.calibration.tool_command`` (a format
     string with ``{arm}`` and ``{port}`` placeholders) instead of hardcoding
     a specific robot package. When the key is absent, the proven default
     tool is used.
+
+    Openspec change ``migrate-business-launch-builders`` (design decision 4)
+    made this name public: the migrated teleop builder (now in
+    robot_teleop) consumes it across the package boundary, and cross-package
+    consumers must not reach for the underscore-prefixed spelling.
     """
     template = (robot_config.get("calibration") or {}).get(
         "tool_command"
     ) or "ros2 run so101_hardware calibrate_arm --arm {arm} --port {port}"
     return template.format(arm=arm, port=port)
+
+
+# Backwards-compatible alias for robot_config's internal call sites and any
+# in-tree tests that still patch or import the private spelling: the public
+# name above is the same function object, never a wrapper.
+_calibration_tool_command = calibration_tool_command
 
 
 def generate_ros2_control_nodes(
@@ -595,3 +618,107 @@ def generate_ros2_control_nodes(
             logger.info(f"Deferring {len(deferred_spawners)} controller spawners (handled by caller)")
 
     return nodes, controller_names, deferred_spawners, robot_description
+
+
+# ---------------------------------------------------------------------------
+# Registry entries (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constants and build functions moved here from the retired
+# ``adapters.py``; bodies are verbatim migrations (only the shared-helper
+# call sites now resolve through ``builder_support``).
+# ---------------------------------------------------------------------------
+
+
+def build_control(context: LaunchBuildContext) -> BuildResult:
+    """Design §2 control entry: ros2_control nodes or provider delegation.
+
+    Always participates (never mock-skipped). Benchmark target, a backend
+    without ros2_control, and an already-started provider all yield the
+    explicit empty :class:`ControlStartup` state. The provider include is
+    only generated when the provider has not been started yet (the
+    live-binding path runs this entry a second time with
+    ``provider_started=True``).
+    """
+    robot_config = context.robot_config
+    use_sim = context.use_sim
+    actions: list[Any] = []
+    runtime_ready_waiter = None
+    deferred_spawners: list[Any] = []
+    controller_names: list[str] = []
+    robot_description: dict[str, Any] = {}
+
+    provider_name = runtime_provider_name(context)
+    if context.is_benchmark:
+        # ros2_control skipped by benchmark target; the
+        # [IBROBOT_BENCHMARK][SKIP] ros2_control marker is already printed at
+        # runtime target resolution.
+        logger.info("benchmark target: skipping ros2_control / controller spawners")
+    elif provider_name and not context.provider_started:
+        from robot_config.launch_builders.runtime import generate_runtime_provider_actions
+
+        provider_actions, runtime_ready_waiter = generate_runtime_provider_actions(
+            robot_config,
+            use_sim=use_sim,
+            sim_platform=context.sim_platform,
+            simulation_startup=context.simulation_startup,
+            display=resolve_display(context),
+            readiness_timeout_s=readiness_attribute("resolve_controller_startup_timeout")(
+                robot_config, use_sim, context.sim_platform
+            ),
+        )
+        actions.extend(provider_actions)
+        logger.info(f"Added runtime provider include for {provider_name}")
+    elif not context.sim_backend_needs_ros2_control:
+        logger.info(f"simulation.platform={context.sim_platform}: skipping ros2_control / controller spawners")
+    else:
+        from robot_config.launch_builders.control import generate_ros2_control_nodes
+
+        control_nodes, controller_names, deferred_spawners, robot_description = generate_ros2_control_nodes(
+            robot_config,
+            use_sim,
+            context.auto_start_controllers,
+            controller_startup_timeout=readiness_attribute("resolve_controller_startup_timeout")(robot_config, use_sim),
+        )
+        actions.extend(control_nodes)
+        logger.info(f"Added {len(control_nodes)} control nodes")
+
+    return BuildResult(
+        actions=actions,
+        control_startup=ControlStartup(
+            robot_description=robot_description,
+            controller_names=tuple(controller_names),
+            deferred_spawners=tuple(deferred_spawners),
+            runtime_ready_waiter=runtime_ready_waiter,
+        ),
+    )
+
+
+def build_auxiliary_actuators(context: LaunchBuildContext) -> BuildResult:
+    from robot_config.launch_builders.control import generate_auxiliary_actuator_nodes
+
+    nodes = generate_auxiliary_actuator_nodes(
+        context.robot_config,
+        use_sim=context.use_sim,
+        control_mode=context.control_mode,
+    )
+    if nodes:
+        logger.info(f"Added {len(nodes)} auxiliary actuator node(s)")
+    return BuildResult(actions=list(nodes))
+
+
+CONTROL_BUILDER = BuilderSpec(
+    id="control",
+    factory=f"{__name__}:build_control",
+    provides=("control_startup",),
+    # The provider include may need the world the simulation entry starts
+    # (runtime-simulation-transport D3b: on the non-binding branch the world
+    # must be running before the provider waits for its clock), so control
+    # builds after simulation; controller_startup already declares
+    # after=("control", "simulation") and stays after both.
+    after=("simulation",),
+)
+
+AUXILIARY_ACTUATORS_BUILDER = BuilderSpec(
+    id="auxiliary_actuators",
+    factory=f"{__name__}:build_auxiliary_actuators",
+    after=("control",),
+)

@@ -31,7 +31,12 @@ def runtime_node(tmp_path, monkeypatch, request):
     profile_path = root / "src/robots/so101/so101_robot/profiles/so101_single_arm.yaml"
     profile = yaml.safe_load(profile_path.read_text())
     xml = render_robot_description(profile, profile_path, True)
-    descriptor = build_description(profile, simulated=True, robot_description=xml)
+    descriptor = build_description(
+        profile,
+        use_sim=True,
+        sim_platform="sdk",
+        robot_description=xml,
+    )
     monkeypatch.setattr(teleoperation, "Node", lambda **kwargs: kwargs)
     action = teleoperation.generate_teleoperation_nodes(profile, descriptor, {"robot_description": xml})[0]
     params = action["parameters"][0]
@@ -219,5 +224,71 @@ def test_nonmanaged_stop_keeps_estop_and_feedback_live(runtime_node, available):
         deadline = time.monotonic() + 0.1
         while time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.01)
+        executor.shutdown(timeout_sec=2.0)
+        peer.destroy_node()
+
+
+@pytest.mark.parametrize("runtime_node", [{"use_sim_time": True}], indirect=True)
+def test_sim_time_node_accepts_sim_stamped_feedback(runtime_node):
+    """Managed admission must accept sim-stamped feedback on the sim clock (PR !515 P2).
+
+    Under Gazebo the servo runs with ``use_sim_time``; its managed stamp
+    check then compares sim stamps against the sim clock. The wall-clock
+    regression dropped every such sample, so Start could never see feedback.
+    """
+    from builtin_interfaces.msg import Time as TimeMsg
+    from rosgraph_msgs.msg import Clock
+
+    node, _module, _captured, _xml = runtime_node
+    peer = Node("sim_clock_test_peer")
+    executor = MultiThreadedExecutor(num_threads=4)
+    joints = peer.create_publisher(JointState, "/joint_states", 1)
+    clock = peer.create_publisher(Clock, "/clock", 1)
+    executor.add_node(peer)
+    executor.add_node(node)
+    try:
+        node.home_joint_state_stale_s = 1.0
+
+        def stamp_ns(sim_s: float) -> int:
+            # one rounding rule for the message stamp, the clock and the
+            # comparison (10.2 is not exact in binary: 0.2*1e9 -> 199999999.2)
+            return int(sim_s) * 1_000_000_000 + int(round((sim_s - int(sim_s)) * 1e9))
+
+        def advance_clock(sim_s: float) -> None:
+            message = Clock()
+            message.clock.sec = int(sim_s)
+            message.clock.nanosec = stamp_ns(sim_s) % 1_000_000_000
+            clock.publish(message)
+
+        def publish_feedback(sim_s: float) -> None:
+            msg = JointState()
+            msg.name = node.arm_joint_names + node.gripper_joint_names
+            msg.position = [0.1] * len(msg.name)
+            msg.header.stamp = TimeMsg(sec=int(sim_s), nanosec=stamp_ns(sim_s) % 1_000_000_000)
+            joints.publish(msg)
+
+        # Advance the sim clock first and wait for the node to observe it, so
+        # the admission comparison runs sim-stamp vs sim clock even if the
+        # joint sample is processed before the newest tick; the wall-clock
+        # regression rejected such samples outright (now - stamp < 0).
+        def clock_reached(sim_s: float) -> bool:
+            return node.get_clock().now().nanoseconds >= stamp_ns(sim_s)
+
+        for sim_s in (10.0, 10.2, 10.4):
+            advance_clock(sim_s)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not clock_reached(sim_s):
+                executor.spin_once(timeout_sec=0.05)
+            assert clock_reached(sim_s), f"sim clock never reached t={sim_s}"
+
+            publish_feedback(sim_s)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and node._latest_js is None:
+                executor.spin_once(timeout_sec=0.05)
+            assert node._latest_js is not None, f"sim-stamped feedback at t={sim_s} was dropped"
+            assert node._latest_js.header.stamp.sec == int(sim_s)
+            node._latest_js = None
+    finally:
+        node.prepare_shutdown()
         executor.shutdown(timeout_sec=2.0)
         peer.destroy_node()

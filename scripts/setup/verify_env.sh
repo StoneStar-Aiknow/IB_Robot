@@ -13,8 +13,11 @@
 #   SETUP_ROS_SETUP_PATH — path to ROS 2 setup script (e.g. /opt/ros/humble/setup.bash)
 #
 # Optional variables (default to the full-workspace behavior when unset):
-#   SETUP_PROFILE       — "full" (default) or "inference"; gates checks whose
-#                         dependencies are outside the inference profile scope
+#   SETUP_PROFILE       — "full" (default), "inference", or "training"; gates
+#                         checks whose dependencies are outside the active
+#                         profile scope. On "training" the ROS 2 / rosdep /
+#                         colcon checks are replaced by the venv + LeRobot
+#                         verification in verify_training_env.
 #
 # Colors (imported from setup.sh context):
 #   RED, GREEN, YELLOW, NC, log_info, log_warn, log_error, log_done
@@ -24,9 +27,14 @@
 : "${WORKSPACE:?Variable WORKSPACE is not set}"
 : "${VENV_PYTHON:?Variable VENV_PYTHON is not set}"
 : "${SETUP_PLATFORM_ID:?Variable SETUP_PLATFORM_ID is not set}"
-: "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
 : "${USE_SUDO:?Variable USE_SUDO is not set}"
-: "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+# A profile without a ROS 2 runtime (training) installs neither rosdep nor
+# ROS 2, so these two are optional there; every other profile keeps the
+# fail-closed contract.
+if setup_profile_enables ros_runtime; then
+    : "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
+    : "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+fi
 
 verify_ros() {
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -197,8 +205,8 @@ verify_tracing() {
     # Tracing packages (lttng-ust, babeltrace2, tracetools_analysis) are pulled
     # in via robot_config's rosdep keys, which the inference profile does not
     # install; tracing is a full-workspace diagnostics feature.
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        log_info "Skipping tracing verification (inference profile)."
+    if [[ "$(setup_profile_get verify)" != "full" ]]; then
+        log_info "Skipping tracing verification (${SETUP_PROFILE} profile)."
         return 0
     fi
 
@@ -475,7 +483,69 @@ PYBENCH
     return 0
 }
 
+# Training profile entry point: the workspace venv plus the LeRobot training
+# stack only. ROS 2, rosdep, colcon, cv_bridge, pygraphviz, and tracing are all
+# intentionally out of scope, and NumPy/OpenCV are deliberately not pinned to
+# the ROS 2 ABI.
+verify_training_env() {
+    local venv_python="${VENV_PYTHON}"
+    local verify_log="${WORKSPACE}/venv/.ibrobot_training_verify.log"
+
+    log_info "Verifying training profile environment (venv + LeRobot)..."
+
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" >"${verify_log}" 2>&1 <<'PY'
+import importlib.util
+import os
+import sys
+
+import numpy
+import torch
+
+import lerobot
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies.act import ACTConfig, ACTPolicy
+
+if not issubclass(ACTConfig, PreTrainedConfig):
+    raise SystemExit("LeRobot ACTConfig is not a PreTrainedConfig")
+if ACTPolicy.config_class is not ACTConfig:
+    raise SystemExit("LeRobot ACTPolicy is not bound to ACTConfig")
+if not callable(getattr(ACTPolicy, "reset", None)):
+    raise SystemExit("LeRobot ACTPolicy.reset API is unavailable")
+
+print("lerobot={} ({})".format(getattr(lerobot, "__version__", "unknown"), getattr(lerobot, "__file__", "<unknown>")))
+print("torch={} numpy={}".format(torch.__version__, numpy.__version__))
+# Importing the decoder loads FFmpeg libraries and surfaces ABI/linker failures.
+# Some platforms deliberately do not install torchcodec and use another backend.
+if importlib.util.find_spec("torchcodec") is not None:
+    import torchcodec.decoders
+    print("torchcodec FFmpeg libraries loadable")
+else:
+    print("torchcodec not installed; decoder load check not applicable")
+
+train_cli = os.path.join(os.path.dirname(sys.executable), "lerobot-train")
+if not os.path.isfile(train_cli):
+    raise SystemExit("lerobot-train CLI is missing from the venv: {}".format(train_cli))
+print("lerobot-train CLI available: {}".format(train_cli))
+PY
+    then
+        cat "${verify_log}" >&2
+        log_error "Verification failed: the training profile environment is incomplete."
+        log_error "Re-run ./scripts/setup.sh --yes --profile training and inspect the log above."
+        return 1
+    fi
+    cat "${verify_log}"
+
+    log_done "Verified training environment (venv + LeRobot + torch)"
+    return 0
+}
+
 verify_env() {
+    if [[ "$(setup_profile_get verify)" == "training" ]]; then
+        # Training hosts install no ROS 2 runtime, rosdep, or colcon.
+        verify_training_env || return 1
+        return 0
+    fi
+
     if ! platform_supports_local_workspace_build 2>/dev/null; then
         log_info "Verifying OpenHarmony ROS runtime..."
         if verify_runtime_ros_python_bridge >/dev/null 2>&1; then

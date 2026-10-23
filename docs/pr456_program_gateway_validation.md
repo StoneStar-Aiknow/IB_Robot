@@ -29,7 +29,7 @@ ros2 run ibrobot_agent ibrobot_agent_chat \
 ```
 
 客户端可随时连接；typed Program 采用直接执行、异步展示，不再需要展示回执，
-机器人可能先于界面显示开始运动（见 `src/ibrobot_agent/README.md`「展示协议」）。
+机器人可能先于界面显示开始运动（见 `src/agent/ibrobot_agent/README.md`「展示协议」）。
 不要通过立即 EOF 或紧接 `/quit` 的管道模拟交互客户端。
 直接使用 `robot-skill` 时，provider 配置需要本次 launch 生成的
 `/tmp/ibrobot_interfaces_*/robot.yaml` 绑定快照。
@@ -39,7 +39,7 @@ ros2 run ibrobot_agent ibrobot_agent_chat \
 同一入口与 provider（`kimicode` / `kimi-for-coding`），探针不发送任何展示回执：
 
 ```bash
-cd src/ibrobot_agent/test
+cd src/agent/ibrobot_agent/test
 python3 agent_node_kimi_hardware_probe.py --steps nod_yes
 python3 agent_node_kimi_hardware_probe.py \
   --text "先点头一次，然后回到安全位置，只执行这两个动作。" --steps nod_yes recover_safe_pose

@@ -1,10 +1,11 @@
 <mujoco model="pick_banana">
   <!--
     pick_banana MuJoCo scene template.
-    Placeholders substituted at launch time by scene_compiler.get_mujoco_scene_path():
-      {{ROBOT_XML_PATH}}  — absolute path to robot MJCF (e.g. so101.xml); T6 fills this.
-                            When omitted from get_mujoco_scene_path(), this include line
-                            is stripped so the file works standalone in MuJoCo Viewer.
+    Placeholders substituted at launch time by scene_compiler.compose_mujoco_model():
+      {{ROBOT_XML_PATH}}  — absolute path to the provider's rendered robot MJCF;
+                            compose_mujoco_model(robot, scene=None) compiles the robot
+                            alone, so a robot-less standalone use strips this include.
+      {{MESHES_DIR}}      — absolute path to this scene's meshes/ directory.
       {{MESHES_DIR}}      — absolute path to this scene's meshes/ directory.
 
     Object parameters (lighting, banana scale, contact/friction) are independently

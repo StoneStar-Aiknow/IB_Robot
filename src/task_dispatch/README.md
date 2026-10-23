@@ -298,7 +298,9 @@ control_modes:
       - gripper_trajectory_controller  # → /gripper_trajectory_controller/follow_joint_trajectory
 ```
 
-**自动启动条件**（`launch_builders/task_execution.py`）：
+**自动启动条件**（本包 `task_dispatch/launch_builders/task_execution.py`，经 entry point 组
+`ibrobot.launch_builders` 注册进 robot_config 的启动注册表；openspec change
+`migrate-business-launch-builders` 前它位于 `robot_config/launch_builders/task_execution.py`）：
 
 满足以下任一条件时，task_executor 会自动加入 launch：
 - `control_mode` 包含 `moveit`

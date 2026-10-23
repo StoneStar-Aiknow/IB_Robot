@@ -160,3 +160,148 @@ def test_a_mapping_process_gives_the_in_process_poses_and_counts():
     finally:
         remote.close()
     assert remote._child._process.poll() == 0
+
+
+# elbow_spin_to_wrist: the elbow's twist about the forearm bone moves onto the wrist.
+LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST = 18, 19, 20   # indices into the 52 rotations
+SHOULDERS_AND_ELBOWS = [0, 1, 2, 3, 7, 8, 9, 10]
+WRISTS = [4, 5, 6, 11, 12, 13]
+
+
+def _people(count, seed=0):
+    # Random poses of every joint, up to 1.5 rad each, as (52, 3, 3) local rotations.
+    rng = np.random.default_rng(seed)
+    rotvecs = rng.normal(size=(count, 52, 3))
+    rotvecs *= rng.uniform(0.0, 1.5, (count, 52, 1)) / np.linalg.norm(rotvecs, axis=-1, keepdims=True)
+    return Rotation.from_rotvec(rotvecs.reshape(-1, 3)).as_matrix().reshape(count, 52, 3, 3)
+
+
+def _posed(stream, rotations):
+    # The NeutralFK points and global rotations of a (52, 3, 3) pose.
+    fk = stream._fk
+    points = fk({"global_orient": rotations[0:1], "body_pose": rotations[1:22],
+                 "left_hand_pose": rotations[22:37], "right_hand_pose": rotations[37:52]})
+    return points.astype(np.float64), fk._rot.copy()
+
+
+def _mapped(rotations, **params):
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, **params)
+    return stream.retarget(0.0, 0, encode_rotation_6d(rotations).reshape(-1))
+
+
+def _twist(rotation, axis):
+    # The twist about the axis, within half a turn.
+    quat = Rotation.from_matrix(rotation).as_quat()
+    return (2.0 * np.arctan2(quat[:3] @ axis, quat[3]) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+@pytest.mark.parametrize("gain, rest", [(1.0, 0.0), (0.5, -0.4)])
+def test_moving_the_elbow_spin_keeps_every_point_and_global_rotation(gain, rest):
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    for rotations in _people(20):
+        moved = followme.elbow_spin_to_wrist(rotations, stream._forearm_axes, gain, rest)
+        changed = np.flatnonzero(np.abs(moved - rotations).max(axis=(1, 2)) > 0)
+        assert set(changed) <= set(sum(followme._FOREARMS, ())), changed
+        points, rots = _posed(stream, rotations)
+        moved_points, moved_rots = _posed(stream, moved)
+        np.testing.assert_allclose(moved_points, points, atol=1e-9)
+        # The elbows' own global rotations lose the twist; from the wrists down nothing moves.
+        others = [j for j in range(55) if j not in (LEFT_ELBOW, RIGHT_ELBOW)]
+        np.testing.assert_allclose(moved_rots[others], rots[others], atol=1e-9)
+        # The elbow keeps the share not moved, measured from the rest twist.
+        for (elbow, _), axis in zip(followme._FOREARMS, stream._forearm_axes):
+            phi, rest_about = _twist(rotations[elbow], axis), np.sign(axis[0]) * rest
+            assert abs(_twist(moved[elbow], axis) - (phi - gain * (phi - rest_about))) < 1e-9
+
+
+def test_with_the_spin_moved_only_the_wrist_channels_change():
+    for rotations in _people(5, seed=1):
+        off, on = _mapped(rotations), _mapped(rotations, elbow_spin_to_wrist=True)
+        np.testing.assert_allclose(on[SHOULDERS_AND_ELBOWS], off[SHOULDERS_AND_ELBOWS], atol=1e-5)
+        assert np.abs(on[WRISTS] - off[WRISTS]).max() > 1e-3
+
+
+def test_an_elbow_at_pears_rest_twist_maps_as_before():
+    # PEAR twists a still elbow by ELBOW_REST_TWIST_DEG; moving that turned the palms on the robot.
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    rotations = np.tile(np.eye(3), (52, 1, 1))
+    for (elbow, wrist), axis in zip(followme._FOREARMS, stream._forearm_axes):
+        rest = np.sign(axis[0]) * np.radians(followme.ELBOW_REST_TWIST_DEG)
+        rotations[elbow] = (Rotation.from_rotvec(1.2 * np.cross(axis, [0.0, 0.0, 1.0])).as_matrix()
+                            @ Rotation.from_rotvec(rest * axis).as_matrix())
+        rotations[wrist] = Rotation.from_euler("XYZ", [0.3, 0.2, -0.1]).as_matrix()
+    off = _mapped(rotations)
+    for gain in (0.5, 1.0):
+        np.testing.assert_allclose(_mapped(rotations, elbow_spin_to_wrist=True, elbow_spin_gain=gain), off,
+                                   atol=1e-6)
+    # Moved from no twist instead, the wrist turns: the test can fail.
+    plain = followme.elbow_spin_to_wrist(rotations, stream._forearm_axes)
+    assert np.abs(stream.retarget(0.0, 0, encode_rotation_6d(plain).reshape(-1)) - off).max() > np.radians(10.0)
+
+
+def test_a_gain_of_zero_maps_as_off():
+    for rotations in _people(3, seed=3):
+        np.testing.assert_array_equal(_mapped(rotations, elbow_spin_to_wrist=True, elbow_spin_gain=0.0),
+                                      _mapped(rotations))
+
+
+@pytest.mark.parametrize("gain", [-0.1, 1.1])
+def test_a_gain_outside_zero_to_one_is_refused(gain):
+    with pytest.raises(ValueError, match="elbow_spin_gain"):
+        create_stream("x2_followme", base_pose=NEUTRAL, elbow_spin_to_wrist=True, elbow_spin_gain=gain)
+
+
+@pytest.mark.parametrize("elbow, robot_wrist_yaw", [(LEFT_ELBOW, 11), (RIGHT_ELBOW, 4)])
+def test_an_elbow_twist_turns_the_mirrored_wrist_as_the_wrist_euler_x_does(elbow, robot_wrist_yaw):
+    # Mirrored, her left arm drives the robot's right. The wrist's own Euler-X turn is
+    # the ledger's checked reading; the elbow's twist must now land the same way.
+    axis = create_stream("x2_followme", base_pose=NEUTRAL)._forearm_axes[elbow - LEFT_ELBOW]
+    bent = Rotation.from_rotvec(1.0 * np.cross(axis, [0.0, 0.0, 1.0])).as_matrix()
+    rest = np.tile(np.eye(3), (52, 1, 1))
+    rest[elbow] = bent
+    by_elbow, by_wrist = rest.copy(), rest.copy()
+    by_elbow[elbow] = bent @ Rotation.from_rotvec(np.radians(30.0) * axis).as_matrix()
+    # The bone runs along +x on her left and -x on her right: +30 deg about it is Euler-X of that sign.
+    by_wrist[elbow + 2] = Rotation.from_euler("XYZ", [np.sign(axis[0]) * np.radians(30.0), 0.0, 0.0]).as_matrix()
+    whole = dict(elbow_spin_to_wrist=True, elbow_spin_gain=1.0)
+    base = _mapped(rest, **whole)[robot_wrist_yaw]
+    turned = _mapped(by_elbow, **whole)[robot_wrist_yaw] - base
+    reference = _mapped(by_wrist, **whole)[robot_wrist_yaw] - base
+    assert abs(reference) > np.radians(25.0)
+    assert abs(turned - reference) < np.radians(3.0), np.degrees([turned, reference])
+    # At the default gain half of the elbow's turn arrives.
+    half = (_mapped(by_elbow, elbow_spin_to_wrist=True)[robot_wrist_yaw]
+            - _mapped(rest, elbow_spin_to_wrist=True)[robot_wrist_yaw])
+    assert abs(half - 0.5 * reference) < np.radians(3.0), np.degrees([half, reference])
+    # Off, the elbow's twist never reaches the wrist: the loss this fixes.
+    assert abs(_mapped(by_elbow)[robot_wrist_yaw] - _mapped(rest)[robot_wrist_yaw]) < np.radians(1.0)
+
+
+def test_an_elbow_bent_half_a_turn_is_left_alone():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, elbow_spin_to_wrist=True)
+    rotations = np.tile(np.eye(3), (52, 1, 1))
+    across = np.cross(stream._forearm_axes[0], [0.0, 0.0, 1.0])
+    rotations[LEFT_ELBOW] = Rotation.from_rotvec(np.pi * across / np.linalg.norm(across)).as_matrix()
+    moved = followme.elbow_spin_to_wrist(rotations, stream._forearm_axes)
+    np.testing.assert_array_equal(moved[LEFT_ELBOW], rotations[LEFT_ELBOW])
+    np.testing.assert_array_equal(moved[LEFT_WRIST], rotations[LEFT_WRIST])
+    assert np.isfinite(stream.retarget(0.0, 0, encode_rotation_6d(rotations).reshape(-1))).all()
+
+
+def test_the_mapping_process_moves_the_spin_too_and_status_says_so():
+    raws = [encode_rotation_6d(r).reshape(-1) for r in _people(10, seed=2)]
+    spin = dict(elbow_spin_to_wrist=True, elbow_spin_gain=0.7)
+    local = create_stream("x2_followme", base_pose=NEUTRAL, **spin)
+    remote = create_stream("x2_followme", base_pose=NEUTRAL, separate_process=True, **spin)
+    # Had the child missed the gain it would map as the default does, which differs.
+    default = create_stream("x2_followme", base_pose=NEUTRAL, elbow_spin_to_wrist=True)
+    try:
+        for i, r in enumerate(raws):
+            pose = remote.retarget(i * 0.05, i, r)
+            np.testing.assert_array_equal(pose, local.retarget(i * 0.05, i, r))
+            assert np.abs(pose - default.retarget(i * 0.05, i, r)).max() > 1e-3
+        assert (remote.status()["elbow_spin_to_wrist"], remote.status()["elbow_spin_gain"]) == (True, 0.7)
+    finally:
+        remote.close()
+    status = create_stream("x2_followme", base_pose=NEUTRAL).status()
+    assert (status["elbow_spin_to_wrist"], status["elbow_spin_gain"]) == (False, followme.ELBOW_SPIN_GAIN)

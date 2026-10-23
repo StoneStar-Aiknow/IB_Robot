@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.launch_registry.builder_support import runtime_provider_name
+from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
-from robot_runtime.peripherals import load_isp_override
 
 logger = get_colored_logger("robot_config.perception")
 
@@ -32,6 +34,10 @@ def generate_camera_nodes(robot_config, use_sim=False):
     Returns:
         List of Node actions for cameras
     """
+    # Function-local import: keep registry construction free of the
+    # peripherals module's jsonschema dependency chain.
+    from robot_runtime.peripherals import load_isp_override
+
     is_sim = parse_bool(use_sim, default=False)
     if is_sim:
         logger.info("Skipping physical camera drivers in sim mode")
@@ -702,3 +708,63 @@ def generate_tf_nodes(robot_config, use_sim=False):
             )
 
     return nodes
+
+
+# ---------------------------------------------------------------------------
+# Registry entry (openspec change ``decentralize-launch-builder-registration``):
+# the BuilderSpec constant and build function moved here from the retired
+# ``adapters.py``; the body is a verbatim migration.
+# ---------------------------------------------------------------------------
+
+
+def build_perception(context: LaunchBuildContext) -> BuildResult:
+    """Physical/virtual perception; runtime_ready timing.
+
+    Benchmark target and the mock backend never reach this build function
+    (the registry enable predicate and mock skip key own that filtering);
+    provider configs keep only the virtual camera relays (physical
+    drivers and their static TF are owned by the robot runtime).
+    """
+    robot_config = context.robot_config
+    perception_nodes: list[Any] = []
+    if runtime_provider_name(context):
+        # D12: physical sensor drivers and their static TF are owned by
+        # the robot runtime (peripherals_file passthrough); the generic
+        # layer only consumes the resulting topics. Virtual camera
+        # relays are topic-level utilities and stay here.
+        logger.info("runtime.provider active: physical perception owned by the robot runtime")
+    else:
+        from robot_config.launch_builders.perception import (
+            generate_camera_nodes,
+            generate_lidar_nodes,
+            generate_tf_nodes,
+        )
+
+        camera_nodes = generate_camera_nodes(robot_config, context.use_sim)
+        perception_nodes.extend(camera_nodes)
+        logger.info(f"Added {len(camera_nodes)} camera nodes")
+
+        lidar_nodes = generate_lidar_nodes(robot_config, context.use_sim)
+        perception_nodes.extend(lidar_nodes)
+        print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
+
+        tf_nodes = generate_tf_nodes(robot_config, context.use_sim)
+        perception_nodes.extend(tf_nodes)
+        logger.info(f"Added {len(tf_nodes)} TF nodes")
+
+    from robot_config.launch_builders.perception import generate_virtual_camera_relays
+
+    virtual_nodes = generate_virtual_camera_relays(robot_config)
+    perception_nodes.extend(virtual_nodes)
+    if virtual_nodes:
+        logger.info(f"Added {len(virtual_nodes)} virtual camera relays")
+    return BuildResult(actions=perception_nodes)
+
+
+PERCEPTION_BUILDER = BuilderSpec(
+    id="perception",
+    factory=f"{__name__}:build_perception",
+    timing="runtime_ready",
+    enabled=lambda context: not context.is_benchmark,
+    mock_skip_key="perception",
+)

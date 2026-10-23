@@ -201,7 +201,7 @@ class Harness(Node):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def profile() -> dict:
     if TARGET_LAUNCH:
         assert TARGET_PROFILE, "CONFORMANCE_PROFILE is required when CONFORMANCE_LAUNCH is set"
@@ -211,7 +211,7 @@ def profile() -> dict:
     return default_profile(base=True)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def target(profile):
     """Start the runtime under test: mock in-process, or the external launch command."""
     rclpy.init()
@@ -243,7 +243,7 @@ def target(profile):
     rclpy.shutdown()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def harness(target, profile) -> Harness:
     node = Harness(profile)
     node.spin_until(

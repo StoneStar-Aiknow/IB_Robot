@@ -9,8 +9,10 @@ uses one runtime-exclusive stream at a time.
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 
@@ -47,12 +49,14 @@ class SpeechDirectionStreamingRuntime:
         close_backends: bool = False,
         stream_id_prefix: str = "speech-direction",
         failure_factory: ExecutionFailureFactory | None = None,
+        on_enhanced_audio: Callable[[np.ndarray, int], None] | None = None,
     ) -> None:
         if pipeline is None:
             raise TypeError("SpeechDirectionStreamingRuntime requires a pipeline")
         if not isinstance(stream_id_prefix, str) or not stream_id_prefix.strip():
             raise ValueError("stream_id_prefix must be non-empty")
         self.pipeline = pipeline
+        self.on_enhanced_audio = on_enhanced_audio
         self.close_backends = bool(close_backends)
         self._stream_id_prefix = stream_id_prefix.strip()
         self._failure_factory = failure_factory or ExecutionFailureFactory()
@@ -220,6 +224,13 @@ class SpeechDirectionStreamingRuntime:
             # Do not catch backend/pipeline exceptions here.  ModelRuntimeHandle
             # needs their started/unknown evidence to gate this exclusive bank.
             hop = self.pipeline.process_block(audio, capture_start_sample=capture_start)
+            enhanced = getattr(hop, "enh4", None)
+            enhanced_start = getattr(hop, "enh_start_sample", None)
+            if self.on_enhanced_audio is not None and enhanced is not None and enhanced_start is not None:
+                try:
+                    self.on_enhanced_audio(enhanced, enhanced_start)
+                except Exception:
+                    logging.getLogger(__name__).exception("Enhanced audio output failed")
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             segment_angle = getattr(hop, "seg_output", None)
             if segment_angle is not None:

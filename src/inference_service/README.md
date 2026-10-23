@@ -1,5 +1,9 @@
 # inference_service
 
+`cloud_inference.launch.py` 在 inference/recording 两个分支的节点执行前检查本机受管 DDS
+环境。错误按原因、实际状态与建议报告，环境不会被自动改写。这不是跨机通信认证，其他
+独立推理入口未自动获得此检查。详见 [DDS 配置工具](../../scripts/dds/README.md)。
+
 `inference_service` 是 IB-Robot 的统一推理运行时。它以一个模型 bundle 和一个命名
 deployment 为输入，统一承载 Torch、Ascend、Hisilicon、RKNN 与 HMM 后端。策略模型额外使用稳定的
 pipeline ID，并支持单体和边云分布式执行。

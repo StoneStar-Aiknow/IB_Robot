@@ -474,6 +474,63 @@ PointNet++ 采样几何变更都会 bump 该版本号，避免旧图编出的 OM
 `test_graspgen_plugin.py` 用 fake `AclModel` 驱动八个角色，manifest 与 packager 保持真实，
 因此 binding 写错会在这里失败而不是在设备上。
 
+### 10.6 GraspGenX（跨夹爪）
+
+GraspGenX 是 NVlabs 的跨夹爪版 GraspGen：一个与夹爪无关的扩散模型，以夹爪描述为条件，同一份
+checkpoint 可以服务 X2 OmniHand 等任何已描述的末端。它复用同一个 typed service，调用方无需区分：
+
+| 项 | 值 |
+|---|---|
+| Service type | `ibrobot_msgs/srv/GenerateGrasps` |
+| Plugin | `perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin` |
+| Adapter | `perception_service.graspgenx_adapter:GraspGenXAdapter` |
+| Model identity | `tensor_model/graspgenx/generate_grasps`，`torch_cuda` 与 `torch_npu` |
+
+与 GraspGen 的差别在预处理：官方 sampler 自己做居中并把位姿还原回输入 frame，所以 adapter
+**不居中、不乘 kappa**，只剔除非有限点和统计离群点（与 sampler 相同的规则：20 近邻平均 L1
+距离 < 1.4 cm，在主机上计算，避免官方实现的 N×N GPU 缓冲）；过滤后不足 10 点时退回未过滤点云，
+总点数不足 10 时直接返回 0 个抓取。默认每次采样 400 个并全部返回——这是 X2 管线在 200/400/800
+之间扫参后定下的值，也是 Ascend 310P 离线循环图编译的行数；返回数少于采样数只是丢掉已经算出的
+候选，而 reach filter 要消费它们：X2 瓶子录制里可达的抓取落在置信度第 8–36 / 45–99 名，截断到
+100 以下会把它们全部丢掉。`max_grasps` 大于 400 时采样数随之增大（上限 1000），但携带编译图的
+npu 部署例外——那里采样数钉在图的行数上，`max_grasps` 只约束返回数量；`min_confidence` 先过滤
+再截断；非有限或旋转不正交的位姿被丢弃。请求点云必须带 `header.frame_id`，返回位姿与之同 frame。
+
+Bundle 把官方 release checkpoint 与**一个**夹爪描述绑定在一起，运行时不联网、不读 bundle 以外的
+文件（loader 在首次 `import graspgenx` 前把 `GRASPGENX_GRIPPER_CFG_DIR` /
+`GRASPGENX_CHECKPOINT_DIR` 指向 bundle，否则官方包会在 import 时从 Hugging Face 克隆资源）：
+
+```bash
+source .shrc_local
+python3 -m perception_service.package_graspgenx_torch_bundle \
+  --bundle-root models/graspgenx_omnihand_left_x2 \
+  --checkpoint-root <GraspGenX release 目录，含 gen/ 与 dis/> \
+  --gripper-dir <夹爪描述目录，含 config.json / gripper.urdf / meshes>
+```
+
+```text
+models/graspgenx_omnihand_left_x2/
+├── inference_manifest.json
+└── assets/
+    ├── adapter.json
+    ├── graspgenx/{gen,dis}/{config.yaml,generator.pth|discriminator.pth}
+    └── x_grippers/omnihand_left_x2/
+```
+
+手动调试时同样要先设置这两个变量再 `import graspgenx`，否则 import 会尝试从 Hugging Face 克隆到
+`venv/.../site-packages/ext/`，无网络时会卡住数分钟。
+
+GraspGenX 由 `./scripts/setup.sh` 在 GraspGen 之后默认安装：仓库内 `third_party/wheels/graspgenx/b942909/` 的审计 wheel（`scripts/build_graspgenx_wheel.sh` 从固定 upstream commit 可复现构建，Apache-2.0，附 LICENSE），校验 SHA256 后以 `--no-deps` 安装，setup 不访问 GitHub；平台范围与 GraspGen 相同。upstream 声明的 `torch<2.7`、
+`diffusers==0.11.1` 等上限只反映其作者的驱动环境；本工作区在 torch 2.7.1+cu126 / diffusers 0.35.2
+上验证，输出与 torch 2.6 / diffusers 0.11.1 参考环境逐名次对齐的位姿差 < 2e-4。
+
+GPU 冒烟测试默认跳过，指定真实 bundle 后运行：
+
+```bash
+IBROBOT_GRASPGENX_BUNDLE=$PWD/models/graspgenx_omnihand_left_x2 \
+  python3 -m pytest src/perception_service/test/test_graspgenx_plugin.py -q
+```
+
 ## 11. HRI 人体感知（YOLOX + PEAR）
 
 HRI 链使用两个独立的 generic `model_service_node` 进程，与语义建图服务同构：一个 typed endpoint

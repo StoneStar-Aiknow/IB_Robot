@@ -1,0 +1,21 @@
+[
+  {
+    "op": "BuildSubmMap",
+    "input_desc": [
+      {"name": "indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "sorted_keys", "param_type": "optional", "format": ["ND"], "type": ["int64"]},
+      {"name": "source_rows", "param_type": "optional", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [{"name": "neighbors", "param_type": "required", "format": ["ND"], "type": ["int32"]}],
+    "attr": [{"name": "kernel_size", "param_type": "required", "type": "int"}]
+  },
+  {
+    "op": "SubmConv3d",
+    "input_desc": [
+      {"name": "features", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+      {"name": "neighbors", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "weight", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+    ],
+    "output_desc": [{"name": "output", "param_type": "required", "format": ["ND"], "type": ["float16"]}]
+  }
+]

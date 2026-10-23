@@ -1,15 +1,38 @@
-"""PickBananaTask — scene task for the pick_banana scene.
+"""PickBananaTask — scene task for the pick_banana scene (D9 refactor).
 
 Exposes three ROS2 services:
-  /sim/pick_banana/random_set     (Trigger) — apply a pre-baked random keyframe
-  /sim/pick_banana/reset          (Trigger) — reset scene to default
-  /sim/pick_banana/autotest/start (Trigger) — run full AutoTest loop (non-blocking)
+  /sim/pick_banana/random_set     (Trigger) — advance the shared grid and place the banana
+  /sim/pick_banana/reset          (Trigger) — reset the scene to the layout default
+  /sim/pick_banana/autotest/start (Trigger) — run the full AutoTest loop (non-blocking)
 
-Position-based evaluation is performed via a ShadowSim that mirrors the main
-mujoco_ros2_control simulation by tracking arm /joint_states and stepping a
-local mujoco Python instance in a background thread.
+Platform specifics live in :mod:`sim_models.tasks.backends` (MuJoCo ResetWorld +
+ShadowSim, Gazebo SetEntityPose through the bridge); both use the single
+``scene_compiler.randomization_grid`` generator so index *k* is the same banana
+placement on every platform.
+
+Safety properties (each covered by a service-callback regression test):
+
+- **Single operation owner**: the three services share one non-blocking
+  ownership token; a competing request is rejected immediately with ``busy``
+  instead of blocking an executor thread. AutoTest holds ownership for its
+  whole run (through each episode's evaluation); shutdown stops and joins the
+  worker.
+- **Readiness first**: every public operation revalidates backend readiness
+  (live, not a latched startup flag) before any dispatcher call, mode change
+  or trajectory goal.
+- **Exception-safe cleanup**: the mode-switch → goals → placement span runs
+  under try/finally; operational exceptions become failure responses, the
+  task's own goals are cancelled and the pre-reset mode is restored within a
+  bounded cleanup budget. A refused or failed restore fails the operation.
+- **Fail-closed restore**: restoration is refused when the runtime status is
+  unknown or the stop latch is engaged; restoring to ``idle`` re-checks the
+  latch immediately before sending, because the facade treats an idle request
+  as a latch clear.
+- **Late goal acceptance**: an acceptance future that completes after the
+  timeout gets a late-acceptance handler that cancels the goal.
 """
 
+import contextlib
 import json
 import threading
 import time
@@ -18,92 +41,29 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
+from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Empty, Trigger
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-try:
-    import mujoco as _mujoco
-
-    _MUJOCO_OK = True
-except ImportError:
-    _mujoco = None  # type: ignore[assignment]
-    _MUJOCO_OK = False
-
-from mujoco_ros2_control_msgs.srv import ResetWorld
-
-from sim_models.scene_compiler import get_mujoco_scene_path, get_scene_layout
+from sim_models.scene_compiler import get_scene_layout, randomization_grid
+from sim_models.tasks.backends import GazeboBackend, MujocoBackend, PickBananaBackend
 from sim_models.tasks.base import EvalResult, SceneTask
 
-# Fixed plate centre (from layout.yaml); used for eval distance check.
-_PLATE_XY = np.array([0.22, 0.02])
-_SUCCESS_RADIUS_M = 0.15
-_FLEW_OUT_RADIUS_M = 0.40
-_FELL_OFF_Z = -0.05
+# Defaults the layout's ``evaluation:`` section may override.
+_DEFAULT_SUCCESS_RADIUS_M = 0.15
+_DEFAULT_FLEW_OUT_RADIUS_M = 0.40
+_DEFAULT_FELL_OFF_Z = -0.05
+
+_IDLE_MODE = "idle"
 
 
-# ─── Shadow Simulation ───────────────────────────────────────────────────────
-
-
-class ShadowSim:
-    """Runs a local MuJoCo instance in a background thread.
-
-    Receives arm joint positions from /joint_states and applies them each step
-    so that free-body (banana) positions roughly track the real simulation.
-    mujoco_ros2_control does not publish free-body poses, so this is the only
-    way to observe banana position without modifying the third-party package.
-    """
-
-    def __init__(self, mjb_path: str) -> None:
-        self._model = _mujoco.MjModel.from_binary_path(mjb_path)
-        self._data = _mujoco.MjData(self._model)
-        self._lock = threading.Lock()
-        self._running = True
-        self._dt = float(self._model.opt.timestep)
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def reset_to_keyframe(self, name: str) -> bool:
-        kid = _mujoco.mj_name2id(self._model, _mujoco.mjtObj.mjOBJ_KEY, name)
-        if kid < 0:
-            return False
-        with self._lock:
-            _mujoco.mj_resetDataKeyframe(self._model, self._data, kid)
-        return True
-
-    def reset_default(self) -> None:
-        with self._lock:
-            _mujoco.mj_resetData(self._model, self._data)
-
-    def set_joint_pos(self, joint_name: str, value: float) -> None:
-        jid = _mujoco.mj_name2id(self._model, _mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        if jid < 0:
-            return
-        with self._lock:
-            self._data.qpos[self._model.jnt_qposadr[jid]] = value
-
-    def get_body_pos(self, body_name: str) -> np.ndarray | None:
-        bid = _mujoco.mj_name2id(self._model, _mujoco.mjtObj.mjOBJ_BODY, body_name)
-        if bid < 0:
-            return None
-        with self._lock:
-            return self._data.xpos[bid].copy()
-
-    def shutdown(self) -> None:
-        self._running = False
-        self._thread.join(timeout=1.0)
-
-    def _loop(self) -> None:
-        while self._running:
-            with self._lock:
-                _mujoco.mj_step(self._model, self._data)
-            time.sleep(max(self._dt, 0.02))
-
-
-# ─── PickBananaTask ───────────────────────────────────────────────────────────
+class ResetFailure(RuntimeError):
+    """A reset-sequence step failed after the runtime mode was switched."""
 
 
 class PickBananaTask(SceneTask):
@@ -115,354 +75,590 @@ class PickBananaTask(SceneTask):
 
         layout = get_scene_layout("pick_banana")
         rand = layout.get("randomization", {})
-        banana_cfg = rand.get("banana", {})
-        self._arm_joint_names: list[str] = rand.get("arm_joint_names", ["1", "2", "3", "4", "5", "6"])
-        cols = int(banana_cfg.get("grid_cols", 5))
-        rows = int(banana_cfg.get("grid_rows", 7))
-        yaws = int(banana_cfg.get("yaw_steps", 6))
-        self._n_keyframes = cols * rows * yaws  # 210
+        self._grid = randomization_grid(layout)
+        self._n_keyframes = len(self._grid)
         self._kf_idx = -1
 
-        # Shadow sim
-        self._shadow: ShadowSim | None = None
-        if _MUJOCO_OK:
-            try:
-                mjb = self._resolve_scene_mjb()
-                self._shadow = ShadowSim(str(mjb))
-                node.get_logger().info(f"ShadowSim running from {mjb}")
-            except Exception as exc:
-                node.get_logger().warning(f"ShadowSim unavailable: {exc}")
+        # Layout-driven evaluation (D9): plate centre from the layout objects,
+        # thresholds from the optional evaluation section.
+        objects = {str(obj.get("name")): obj for obj in layout.get("objects", []) or []}
+        evaluation = layout.get("evaluation", {}) or {}
+        self._plate_xy = np.array([float(v) for v in objects["plate"]["position"][:2]])
+        self._success_radius_m = float(evaluation.get("success_radius_m", _DEFAULT_SUCCESS_RADIUS_M))
+        self._flew_out_radius_m = float(evaluation.get("flew_out_radius_m", _DEFAULT_FLEW_OUT_RADIUS_M))
+        self._fell_off_z = float(evaluation.get("fell_off_z", _DEFAULT_FELL_OFF_Z))
 
-        # AutoTest state
-        self._autotest_running = False
-        self._autotest_lock = threading.Lock()
+        # Rest pose keyed by joint name (D9 arm reset target).
+        rest_joints = [str(j) for j in rand.get("arm_joint_names", [])]
+        rest_values = [float(v) for v in rand.get("arm_rest_qpos", [])]
+        self._rest_positions = dict(zip(rest_joints, rest_values, strict=False))
 
-        # Eval output dir (configurable via ROS param eval_output_dir)
-        default_out = str(Path.home() / "ib_robot_eval")
-        out_dir = node.declare_parameter("eval_output_dir", default_out).value
-        self._eval_root = Path(out_dir) / "pick_banana"
+        # Launch parameters (the scene_task builder passes these from the
+        # bound effective config). Array parameters are declared with an
+        # explicit type: an inferred empty default becomes BYTE_ARRAY and
+        # rejects the builder's string arrays.
+        def param(name, default):
+            return node.declare_parameter(name, default).value
 
-        # Subscriptions & service clients
-        node.create_subscription(
-            JointState,
-            "/joint_states",
-            self._on_js,
-            10,
-            callback_group=self._cbg,
-        )
-        # mujoco_ros2_control advertises ~/reset_world relative to its node, so
-        # the fully-qualified name is /<mujoco_node>/reset_world — NOT the bare
-        # /reset_world. The default matches the installed plugin's node name;
-        # override via the reset_world_service param, and we also auto-discover
-        # the real name at first use to stay robust across plugin versions
-        # (e.g. /ros2_control_node/reset_world).
-        configured_rw = node.declare_parameter("reset_world_service", "").value
-        self._reset_world_name = configured_rw or "/mujoco_ros2_control_node/reset_world"
-        self._reset_world = node.create_client(ResetWorld, self._reset_world_name, callback_group=self._cbg)
+        def string_array_param(name):
+            from rclpy.parameter import Parameter
 
-        # Dispatcher control clients (used by AutoTest to drive clean episodes).
+            return [str(j) for j in node.declare_parameter(name, Parameter.Type.STRING_ARRAY).value]
+
+        sim_platform = str(param("sim_platform", ""))
+        self._trajectory_mode = str(param("trajectory_mode", "trajectory"))
+        self._rest_duration_s = float(param("rest_trajectory_duration_s", 3.0))
+        self._cleanup_budget_s = float(param("cleanup_budget_s", 5.0))
+        self._accept_timeout_s = float(param("goal_acceptance_timeout_s", 5.0))
+        self._mode_timeout_s = float(param("mode_request_timeout_s", 5.0))
+        arm_endpoint = str(param("arm_trajectory_endpoint", ""))
+        self._arm_joints = string_array_param("arm_joint_names")
+        gripper_endpoint = str(param("gripper_trajectory_endpoint", ""))
+        self._gripper_joints = string_array_param("gripper_joint_names")
+
+        # Platform backend (lazy platform imports inside the backends).
+        self._backend: PickBananaBackend | None = None
+        if sim_platform == "mujoco":
+            self._backend = MujocoBackend(
+                node,
+                layout,
+                scene_model_path=str(param("scene_model_path", "")),
+                reset_world_service=str(param("reset_world_service", "")),
+                callback_group=self._cbg,
+            )
+        elif sim_platform == "gazebo":
+            self._backend = GazeboBackend(
+                node,
+                layout,
+                world_name=str(param("world_name", "demo")),
+                scene=self.scene_name,
+                callback_group=self._cbg,
+            )
+        else:
+            node.get_logger().error(f"unsupported sim_platform {sim_platform!r}; services will refuse")
+        if self._backend is not None:
+            self._backend.start_readiness(timeout_s=float(param("readiness_timeout_s", 10.0)))
+
+        # Runtime facade: mode sequencing and stop-latch respect (D9).
+        from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode
+
+        self._get_status = node.create_client(GetRuntimeStatus, "/runtime/get_status", callback_group=self._cbg)
+        self._set_mode = node.create_client(SetRuntimeMode, "/runtime/set_mode", callback_group=self._cbg)
+
+        # Trajectory action clients for the runtime arm reset.
+        self._goal_clients: dict[str, ActionClient] = {}
+        self._arm_endpoint = arm_endpoint or ""
+        self._gripper_endpoint = gripper_endpoint or ""
+        for endpoint in (self._arm_endpoint, self._gripper_endpoint):
+            if endpoint:
+                self._goal_clients[endpoint] = ActionClient(
+                    node, FollowJointTrajectory, endpoint, callback_group=self._cbg
+                )
+        self._goal_lock = threading.Lock()
+        self._outstanding_goals: list[object] = []
+
+        # Dispatcher control clients (AutoTest drives clean episodes; each
+        # step is skipped when the dispatcher is absent).
         self._disp_start = node.create_client(Trigger, "/action_dispatcher/start_evaluate", callback_group=self._cbg)
         self._disp_stop = node.create_client(Trigger, "/action_dispatcher/stop_evaluate", callback_group=self._cbg)
         self._disp_reset = node.create_client(Empty, "/action_dispatcher/reset", callback_group=self._cbg)
 
-        # Arm command publishers + rest pose. Re-commanding the rest pose right
-        # before a world reset aligns the controller setpoint with the keyframe,
-        # so the arm does not snap back to the last inference target while the
-        # controllers stay active during reset_world.
-        rest_qpos = list(rand.get("arm_rest_qpos", [0.0, -1.5854, 1.5708, 0.7854, 0.0, 0.0]))
-        self._rest_arm = rest_qpos[:5]
-        self._rest_gripper = float(rest_qpos[5]) if len(rest_qpos) > 5 else 0.0
-        arm_topic = node.declare_parameter("arm_command_topic", "/arm_position_controller/commands").value
-        gripper_topic = node.declare_parameter("gripper_command_topic", "/gripper_position_controller/commands").value
-        self._arm_pub = node.create_publisher(Float64MultiArray, arm_topic, 10)
-        self._grip_pub = node.create_publisher(Float64MultiArray, gripper_topic, 10)
+        # Single operation owner (reentrant callbacks + the AutoTest worker
+        # otherwise share mode/goal state); AutoTest state and eval output.
+        self._operation = threading.Lock()
+        self._autotest_thread: threading.Thread | None = None
+        self._autotest_stop = threading.Event()
+        out_dir = str(param("eval_output_dir", str(Path.home() / "ib_robot_eval")))
+        self._eval_root = Path(out_dir) / "pick_banana"
 
-        # Services exposed by this task
-        node.create_service(
-            Trigger,
-            "/sim/pick_banana/random_set",
-            self._svc_random_set,
-            callback_group=self._cbg,
-        )
-        node.create_service(
-            Trigger,
-            "/sim/pick_banana/reset",
-            self._svc_reset,
-            callback_group=self._cbg,
-        )
-        node.create_service(
-            Trigger,
-            "/sim/pick_banana/autotest/start",
-            self._svc_autotest,
-            callback_group=self._cbg,
-        )
+        node.create_service(Trigger, "/sim/pick_banana/random_set", self._svc_random_set, callback_group=self._cbg)
+        node.create_service(Trigger, "/sim/pick_banana/reset", self._svc_reset, callback_group=self._cbg)
+        node.create_service(Trigger, "/sim/pick_banana/autotest/start", self._svc_autotest, callback_group=self._cbg)
 
     # ── SceneTask interface ────────────────────────────────────────────────────
 
-    def randomize(self) -> tuple[bool, str]:
+    def randomize(self, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+        ready_ok, ready_message = self._check_backend_ready()
+        if not ready_ok:
+            return False, f"backend not ready: {ready_message}"
         self._kf_idx = (self._kf_idx + 1) % self._n_keyframes
-        kname = f"random_{self._kf_idx:03d}"
-        ok, msg = self._call_reset_world_sync(kname)
-        if ok and self._shadow is not None:
-            self._shadow.reset_to_keyframe(kname)
-        return ok, msg
+        return self._backend.place(self._kf_idx, stop_event=stop_event)
 
-    def reset(self) -> tuple[bool, str]:
-        ok, msg = self._call_reset_world_sync("")
-        if ok and self._shadow is not None:
-            self._shadow.reset_default()
-        return ok, msg
+    def reset(self, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+        ready_ok, ready_message = self._check_backend_ready()
+        if not ready_ok:
+            return False, f"backend not ready: {ready_message}"
+        return self._backend.place(None, stop_event=stop_event)
 
     def evaluate(self, duration_s: float = 30.0) -> EvalResult:
         t0 = time.monotonic()
         banana_final = [0.0, 0.0, 0.0]
         start_dist_xy: float | None = None
+        saw_data = False
 
         while (time.monotonic() - t0) < duration_s:
-            if self._shadow is not None:
-                pos = self._shadow.get_body_pos("banana")
-                if pos is not None:
-                    banana_final = pos.tolist()
-                    dist_xy = float(np.linalg.norm(pos[:2] - _PLATE_XY))
-                    if start_dist_xy is None:
-                        start_dist_xy = dist_xy
-                    if pos[2] < _FELL_OFF_Z or dist_xy > _FLEW_OUT_RADIUS_M:
-                        return EvalResult(
-                            success=False,
-                            reason="flew_out",
-                            banana_final_pos=banana_final,
-                            duration_s=time.monotonic() - t0,
-                        )
-                    if start_dist_xy >= _SUCCESS_RADIUS_M and dist_xy < _SUCCESS_RADIUS_M:
-                        return EvalResult(
-                            success=True,
-                            reason="placed_on_plate",
-                            banana_final_pos=banana_final,
-                            duration_s=time.monotonic() - t0,
-                        )
+            if self._autotest_stop.is_set():
+                return EvalResult(success=False, reason="stopped", duration_s=time.monotonic() - t0)
+            pos = self._backend.object_position("banana") if self._backend is not None else None
+            if pos is not None:
+                saw_data = True
+                banana_final = pos.tolist()
+                dist_xy = float(np.linalg.norm(pos[:2] - self._plate_xy))
+                if start_dist_xy is None:
+                    start_dist_xy = dist_xy
+                if pos[2] < self._fell_off_z or dist_xy > self._flew_out_radius_m:
+                    return EvalResult(
+                        success=False,
+                        reason="flew_out",
+                        banana_final_pos=banana_final,
+                        duration_s=time.monotonic() - t0,
+                    )
+                if start_dist_xy >= self._success_radius_m and dist_xy < self._success_radius_m:
+                    return EvalResult(
+                        success=True,
+                        reason="placed_on_plate",
+                        banana_final_pos=banana_final,
+                        duration_s=time.monotonic() - t0,
+                    )
             time.sleep(0.1)
 
         return EvalResult(
             success=False,
-            reason="timeout",
+            reason="timeout" if saw_data else "no_data",
             banana_final_pos=banana_final,
             duration_s=duration_s,
         )
 
-    # ── service handlers ──────────────────────────────────────────────────────
+    # ── service handlers (single owner + readiness gate) ──────────────────────
 
     def _svc_random_set(self, _req: Trigger.Request, resp: Trigger.Response):
-        ok, msg = self._clean_world_reset(randomize=True, resume=True)
+        if not self._begin_operation():
+            return self._busy(resp)
+        try:
+            ok, msg = self._clean_world_reset(randomize=True, resume=True)
+        finally:
+            self._end_operation()
         resp.success = ok
         resp.message = msg
         return resp
 
     def _svc_reset(self, _req: Trigger.Request, resp: Trigger.Response):
-        ok, msg = self._clean_world_reset(randomize=False, resume=True)
+        if not self._begin_operation():
+            return self._busy(resp)
+        try:
+            ok, msg = self._clean_world_reset(randomize=False, resume=True)
+        finally:
+            self._end_operation()
         resp.success = ok
         resp.message = msg
         return resp
 
-    def _clean_world_reset(self, randomize: bool, resume: bool, settle_s: float = 0.8) -> tuple[bool, str]:
-        """Pause inference → reset the world → (optionally) resume inference.
-
-        Stop, publish the rest pose, reset the world and policy episode, then
-        resume when requested. This task uses the legacy dispatcher only.
-        """
-        self._call_service_sync(
-            self._disp_stop,
-            Trigger.Request(),
-            "dispatcher/stop",
-            check_success=True,
-        )
-        self._publish_rest_pose()
-
-        ok, msg = self.randomize() if randomize else self.reset()
-
-        if ok:
-            time.sleep(settle_s)
-
-        if resume:
-            if ok:
-                self._call_service_sync(self._disp_reset, Empty.Request(), "dispatcher/reset")
-            # Preserve the legacy resume behavior even when the world reset fails.
-            self._call_service_sync(self._disp_start, Trigger.Request(), "dispatcher/start")
-        return ok, msg
-
-    def _publish_rest_pose(self, count: int = 6, period: float = 0.05) -> None:
-        for _ in range(count):
-            self._arm_pub.publish(Float64MultiArray(data=list(self._rest_arm)))
-            self._grip_pub.publish(Float64MultiArray(data=[self._rest_gripper]))
-            time.sleep(period)
-
     def _svc_autotest(self, _req: Trigger.Request, resp: Trigger.Response):
-        with self._autotest_lock:
-            if self._autotest_running:
-                resp.success = False
-                resp.message = "AutoTest already running"
-                return resp
-            self._autotest_running = True
-        threading.Thread(target=self._run_autotest, daemon=True).start()
+        if not self._begin_operation():
+            return self._busy(resp)
+        ready_ok, ready_message = self._check_backend_ready()
+        if not ready_ok:
+            self._end_operation()
+            resp.success = False
+            resp.message = f"backend not ready: {ready_message}"
+            return resp
+        # Ownership passes to the worker; it releases in its finally block.
+        self._autotest_stop.clear()
+        self._autotest_thread = threading.Thread(target=self._run_autotest, daemon=True, name="pick_banana_autotest")
+        self._autotest_thread.start()
         resp.success = True
         resp.message = f"AutoTest started ({self._n_keyframes} iterations)"
         return resp
 
-    # ── AutoTest loop ─────────────────────────────────────────────────────────
+    def _begin_operation(self) -> bool:
+        return self._operation.acquire(blocking=False)
 
-    def _run_autotest(self) -> None:
-        log = self._node.get_logger()
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = self._eval_root / timestamp
-            run_dir.mkdir(parents=True, exist_ok=True)
-            results_path = run_dir / "results.jsonl"
-            summary_path = run_dir / "summary.yaml"
+    def _end_operation(self) -> None:
+        with contextlib.suppress(RuntimeError):
+            self._operation.release()
 
-            log.info(f"AutoTest: saving to {run_dir}")
+    @staticmethod
+    def _busy(resp: Trigger.Response) -> Trigger.Response:
+        resp.success = False
+        resp.message = "busy: another scene-task operation is running"
+        return resp
 
-            passed = 0
-            total = self._n_keyframes
-
-            with results_path.open("w") as fh:
-                for i in range(total):
-                    # Clean episode: pause → reposition (no snap) → settle → resume.
-                    ok, _ = self._clean_world_reset(randomize=True, resume=True, settle_s=1.5)
-                    if not ok:
-                        log.warning(f"AutoTest {i}: random_set failed, skipping")
-                        continue
-
-                    result = self.evaluate(duration_s=30.0)
-                    if result.success:
-                        passed += 1
-
-                    record = {
-                        "idx": i,
-                        "keyframe": f"random_{self._kf_idx:03d}",
-                        "success": result.success,
-                        "reason": result.reason,
-                        "banana_final_pos": result.banana_final_pos,
-                        "duration_s": round(result.duration_s, 2),
-                    }
-                    fh.write(json.dumps(record) + "\n")
-                    fh.flush()
-
-                    sym = "✓" if result.success else "✗"
-                    log.info(f"AutoTest {i + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
-
-            # Leave the robot idle after the batch completes.
-            self._call_service_sync(self._disp_stop, Trigger.Request(), "dispatcher/stop")
-
-            rate = passed / total if total > 0 else 0.0
-            summary_path.write_text(
-                f"scene: pick_banana\n"
-                f'date: "{datetime.now().isoformat()}"\n'
-                f"total: {total}\n"
-                f"passed: {passed}\n"
-                f"failed: {total - passed}\n"
-                f"success_rate: {rate:.3f}\n"
+    def shutdown(self) -> None:
+        """Stop the AutoTest worker, then (only once it has exited) the backend."""
+        self._autotest_stop.set()
+        worker = self._autotest_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=5.0)
+        if worker is not None and worker.is_alive():
+            # Never tear the backend out from under a still-running worker:
+            # surface the timeout and leave every resource in place.
+            self._node.get_logger().error(
+                "AutoTest worker did not exit within the shutdown budget; "
+                "leaving the backend running (teardown timeout)"
             )
-            log.info(f"AutoTest complete: {passed}/{total} ({rate:.1%})")
-        except Exception as exc:  # noqa: BLE001
-            log.error(f"AutoTest failed: {exc!r}")
-            self._call_service_sync(self._disp_stop, Trigger.Request(), "dispatcher/stop")
-        finally:
-            with self._autotest_lock:
-                self._autotest_running = False
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def _resolve_scene_mjb(self) -> Path:
-        """Return the compiled scene model that mirrors the live simulation.
-
-        The launch's MuJoCo backend compiles the full robot+scene (with the
-        injected ``random_KKK`` keyframes) to ``/tmp/sim_models_<scene>.mjb``.
-        Reusing that exact file is essential: a robot-less recompile would have
-        no arm, so the ShadowSim could never observe the gripper pushing the
-        banana, and the keyframe qpos layout would not match.
-        """
-        compiled = Path(f"/tmp/sim_models_{self.scene_name}.mjb")
-        if compiled.exists():
-            return compiled
-        self._node.get_logger().warning(
-            f"{compiled} not found; falling back to a standalone scene compile "
-            "(no robot arm — banana contact eval will be unreliable)"
-        )
-        return get_mujoco_scene_path(self.scene_name)
-
-    def _discover_reset_world_service(self) -> str | None:
-        """Find the live reset_world service by scanning the ROS graph."""
-        try:
-            names_and_types = self._node.get_service_names_and_types()
-        except Exception:  # noqa: BLE001
-            return None
-        for name, types in names_and_types:
-            if name.endswith("/reset_world") and any("ResetWorld" in t for t in types):
-                return name
-        return None
-
-    def _on_js(self, msg: JointState) -> None:
-        if self._shadow is None:
             return
-        for name, pos in zip(msg.name, msg.position, strict=False):
-            if name in self._arm_joint_names:
-                self._shadow.set_joint_pos(name, pos)
+        if self._backend is not None:
+            self._backend.shutdown()
 
-    def _call_reset_world_sync(self, keyframe: str) -> tuple[bool, str]:
-        """Call /reset_world from a background thread (NOT from a ROS callback).
+    # ── reset sequence (D9): readiness → dispatcher → runtime arm reset ───────
 
-        Uses a threading.Event so the calling thread blocks while the ROS
-        executor (running in another thread) processes the response callback.
-        This avoids the deadlock that occurs when you spin-wait inside a
-        callback thread — the executor can't deliver the response because the
-        callback thread is blocked polling future.done().
+    def _clean_world_reset(
+        self,
+        randomize: bool,
+        resume: bool,
+        settle_s: float = 0.8,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[bool, str]:
+        """Revalidate readiness → pause inference → park the arm → place → resume.
+
+        The readiness gate comes first: no dispatcher call, mode change or
+        goal happens before the backend confirms it can place. Dispatcher
+        steps are skipped (and logged) when the dispatcher is not running;
+        with it present the order pause → arm reset → place → reset → resume
+        is preserved.
         """
-        if not self._reset_world.wait_for_service(timeout_sec=5.0):
-            # The configured name may be wrong for this plugin version; try to
-            # locate the real service on the graph and rebind the client.
-            discovered = self._discover_reset_world_service()
-            if discovered and discovered != self._reset_world_name:
-                self._node.get_logger().info(f"reset_world: using discovered service '{discovered}'")
-                self._reset_world_name = discovered
-                self._reset_world = self._node.create_client(ResetWorld, discovered, callback_group=self._cbg)
-            if not self._reset_world.wait_for_service(timeout_sec=5.0):
-                return False, f"reset_world service not available ({self._reset_world_name})"
-        req = ResetWorld.Request()
-        req.keyframe = keyframe
-        future = self._reset_world.call_async(req)
+        ready_ok, ready_message = self._check_backend_ready()
+        if not ready_ok:
+            return False, f"backend not ready: {ready_message}"
 
-        done_event = threading.Event()
-        result_box: list = []
+        stop_outcome = self._dispatcher_step(
+            self._disp_stop, Trigger.Request(), "dispatcher/stop", check_success=True, stop_event=stop_event
+        )
+        if stop_outcome is False:
+            # The dispatcher is running but did not confirm the pause: fail
+            # before any mode change or trajectory (finding B).
+            return False, "dispatcher/stop failed; refusing to reset the scene"
 
-        def _cb(f):
+        place = (
+            (lambda: self.randomize(stop_event=stop_event))
+            if randomize
+            else (lambda: self.reset(stop_event=stop_event))
+        )
+        ok, msg = self._reset_sequence(place, stop_event=stop_event)
+
+        if ok and settle_s:
+            if stop_event is None:
+                time.sleep(settle_s)
+            else:
+                stop_event.wait(settle_s)
+
+        cancelled = stop_event is not None and stop_event.is_set()
+        if resume and not cancelled:
+            if ok:
+                self._dispatcher_step(self._disp_reset, Empty.Request(), "dispatcher/reset", stop_event=stop_event)
+            # Preserve the legacy resume behavior even when the reset fails
+            # (but never after a cancellation: a stopped run must not resume).
+            self._dispatcher_step(
+                self._disp_start, Trigger.Request(), "dispatcher/start", check_success=True, stop_event=stop_event
+            )
+        elif resume and cancelled:
+            self._node.get_logger().info("cancelled; skipping dispatcher reset/start")
+        return ok, msg
+
+    def _reset_sequence(self, place, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+        """The runtime arm reset (D9): status → mode → trajectories → place → restore.
+
+        Any rejection fails with the runtime's message. The mode-switch →
+        goals → placement span runs under try/finally: on any failure the
+        task's own goals are cancelled and the previous mode is restored
+        within the cleanup budget — only while the runtime is not
+        stop-latched and its status is known. A refused or failed restore
+        fails the operation; the response reports both the original failure
+        and the restoration outcome.
+        """
+        status = self._runtime_status(stop_event=stop_event)
+        if status is None:
+            return False, "runtime status unavailable (/runtime/get_status)"
+        previous_mode, stop_latched, _stop_policy = status
+        if stop_latched:
+            return False, "runtime is stop-latched; refusing to reset the scene"
+
+        switched = previous_mode != self._trajectory_mode
+        if switched:
+            ok, message = self._set_runtime_mode(self._trajectory_mode, stop_event=stop_event)
+            if not ok:
+                # Ambiguous switch: a rejected or timed-out request may still
+                # have taken effect server-side. Read the live mode; if it
+                # moved, restore the previous mode under the same fail-closed
+                # rules (unknown status or stop-latched ⇒ no restore, report).
+                status_after = self._runtime_status(stop_event=stop_event)
+                if status_after is None:
+                    return False, (
+                        f"set_mode({self._trajectory_mode!r}) {message}; "
+                        "switch outcome unknown (runtime status unavailable)"
+                    )
+                if status_after[0] != previous_mode:
+                    restored, restore_note = self._restore_mode(previous_mode, None, stop_event=stop_event)
+                    return False, (
+                        f"set_mode({self._trajectory_mode!r}) {message}; runtime switched anyway{restore_note}"
+                        if restored
+                        else f"set_mode({self._trajectory_mode!r}) {message}; runtime switched "
+                        f"anyway but{restore_note.lstrip('; ')}"
+                    )
+                return False, f"set_mode({self._trajectory_mode!r}) rejected: {message}"
+
+        failure: str | None = None
+        cleanup_deadline: float | None = None
+        restore_ok, restore_note = True, ""
+        cleanup_errors: list[str] = []
+        try:
             try:
-                r = f.result()
-                result_box.append((r.success, r.message))
-            except Exception as exc:
-                result_box.append((False, str(exc)))
-            done_event.set()
+                ok, message = self._send_rest_trajectories(stop_event=stop_event)
+                if not ok:
+                    raise ResetFailure(f"rest trajectory rejected: {message}")
+                ok, message = place()
+                if not ok:
+                    raise ResetFailure(message)
+            except ResetFailure as exc:
+                failure = str(exc)
+            except Exception as exc:  # noqa: BLE001 — operational errors become responses
+                failure = f"reset sequence error: {exc!r}"
+        finally:
+            # Cleanup itself must be exception-safe: each step is guarded and
+            # its outcome lands in the response; the service always answers.
+            if failure is not None:
+                cleanup_deadline = time.monotonic() + self._cleanup_budget_s
+                try:
+                    self._cancel_outstanding_goals(cleanup_deadline)
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_errors.append(f"goal cancellation failed: {exc!r}")
+            if switched:
+                try:
+                    restore_ok, restore_note = self._restore_mode(
+                        previous_mode, cleanup_deadline, stop_event=stop_event
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    restore_ok, restore_note = False, f"; mode restore error: {exc!r}"
 
-        future.add_done_callback(_cb)
-        if not done_event.wait(timeout=15.0):
-            return False, "reset_world timeout"
-        return result_box[0]
+        suffix = restore_note + "".join(f"; {note}" for note in cleanup_errors)
+        if failure is not None:
+            return False, f"{failure}{suffix}"
+        if not restore_ok:
+            return False, f"reset completed but{suffix}"
+        return True, ("ok" + suffix).strip("; ") or "ok"
 
-    def _call_service_sync(
-        self, client, request, label: str, timeout: float = 5.0, *, check_success: bool = False
-    ) -> bool:
-        """Call a service and block (safe only from a background thread).
+    def _restore_mode(
+        self, previous_mode: str, deadline: float | None = None, stop_event: threading.Event | None = None
+    ) -> tuple[bool, str]:
+        """Restore the pre-reset mode, failing closed on unknown/latched status.
 
-        Uses the same Event-based pattern as _call_reset_world_sync so the
-        executor (running in other threads) can deliver the response. When
-        check_success is True the Trigger.success field is inspected so
-        stop/start/restart must be confirmed, not just completed.
+        Restoring to ``idle`` would clear the facade's stop latch, so that
+        path re-checks the status immediately before sending.
         """
-        if not client.wait_for_service(timeout_sec=timeout):
-            self._node.get_logger().warning(f"{label}: service not available")
-            return False
-        future = client.call_async(request)
+        status = self._runtime_status(deadline, stop_event)
+        if status is None:
+            return False, "; mode not restored: runtime status unknown"
+        if status[1]:
+            return False, "; mode not restored: runtime is stop-latched"
+        if previous_mode == _IDLE_MODE:
+            recheck = self._runtime_status(deadline, stop_event)
+            if recheck is None:
+                return False, "; mode not restored: runtime status unknown (pre-idle recheck)"
+            if recheck[1]:
+                return False, "; mode not restored: runtime is stop-latched (pre-idle recheck)"
+        if deadline is not None and time.monotonic() > deadline:
+            return False, "; mode not restored: cleanup budget exhausted"
+        ok, message = self._set_runtime_mode(previous_mode, deadline, stop_event)
+        if not ok:
+            return False, f"; mode restore rejected: {message}"
+        if previous_mode == _IDLE_MODE:
+            post = self._runtime_status(deadline, stop_event)
+            if post is not None and not post[1] and post[2]:
+                warning = (
+                    f"; WARNING: stop_policy={post[2]!r} survived the idle restore — a stop "
+                    "requested in the closing window may have been cleared (runtime follow-up)"
+                )
+                self._node.get_logger().error(warning.lstrip("; "))
+                return True, f"; mode restored{warning}"
+        return True, "; mode restored"
+
+    def _check_backend_ready(self) -> tuple[bool, str]:
+        if self._backend is None:
+            return False, "no backend for this platform"
+        return self._backend.check_ready()
+
+    # ── runtime facade helpers ────────────────────────────────────────────────
+
+    def _bounded_timeout(self, timeout_s: float, deadline: float | None) -> float:
+        if deadline is None:
+            return timeout_s
+        return max(min(timeout_s, deadline - time.monotonic()), 0.05)
+
+    def _runtime_status(
+        self, deadline: float | None = None, stop_event: threading.Event | None = None
+    ) -> tuple[str, bool, str] | None:
+        """(active_mode, stop_latched, stop_policy) from /runtime/get_status, or None."""
+        if not self._get_status.wait_for_service(timeout_sec=self._bounded_timeout(2.0, deadline)):
+            return None
+        future = self._get_status.call_async(self._get_status.srv_type.Request())
+        future = self._wait_future(future, timeout_s=self._bounded_timeout(5.0, deadline), stop_event=stop_event)
+        if future is None:
+            return None
+        response = future.result()
+        status = getattr(response, "status", None)
+        if status is None:
+            return None
+        return str(status.active_mode), bool(status.stop_latched), str(getattr(status, "stop_policy", "") or "")
+
+    def _set_runtime_mode(
+        self, mode: str, deadline: float | None = None, stop_event: threading.Event | None = None
+    ) -> tuple[bool, str]:
+        if not self._set_mode.wait_for_service(timeout_sec=self._bounded_timeout(2.0, deadline)):
+            return False, "service not available"
+        request = self._set_mode.srv_type.Request()
+        request.mode = mode
+        future = self._set_mode.call_async(request)
+        future = self._wait_future(
+            future, timeout_s=self._bounded_timeout(self._mode_timeout_s, deadline), stop_event=stop_event
+        )
+        if future is None:
+            return False, "timeout"
+        response = future.result()
+        return bool(response.success), str(response.message)
+
+    def _send_rest_trajectories(self, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+        """Park arm and gripper at the rest pose through the trajectory actions."""
+        for endpoint, joints in (
+            (self._arm_endpoint, self._arm_joints),
+            (self._gripper_endpoint, self._gripper_joints),
+        ):
+            if not endpoint:
+                continue
+            try:
+                positions = [self._rest_positions[joint] for joint in joints]
+            except KeyError as missing:
+                return False, f"rest pose has no value for joint {missing} of {endpoint}"
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory = JointTrajectory()
+            goal.trajectory.joint_names = list(joints)
+            point = JointTrajectoryPoint()
+            point.positions = positions
+            seconds = int(self._rest_duration_s)
+            point.time_from_start.sec = seconds
+            point.time_from_start.nanosec = int((self._rest_duration_s - seconds) * 1e9)
+            goal.trajectory.points = [point]
+            ok, message = self._send_trajectory_goal(endpoint, goal, stop_event=stop_event)
+            if not ok:
+                return False, message
+        return True, "rest pose reached"
+
+    def _send_trajectory_goal(self, endpoint: str, goal, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+        client = self._goal_clients[endpoint]
+        if not client.wait_for_server(timeout_sec=self._accept_timeout_s):
+            return False, f"action server not available ({endpoint})"
+        future = client.send_goal_async(goal)
+        goal_future = self._wait_future(future, timeout_s=self._accept_timeout_s, stop_event=stop_event)
+        if goal_future is None:
+            # The server may still accept after our timeout: attach a
+            # late-acceptance handler so the goal is cancelled, not orphaned.
+            future.add_done_callback(self._on_late_goal_acceptance)
+            return False, f"goal acceptance timeout ({endpoint})"
+        goal_handle = goal_future.result()
+        if not getattr(goal_handle, "accepted", False):
+            return False, f"goal rejected ({endpoint})"
+        # The goal stays registered as outstanding until it SUCCEEDS: a
+        # timed-out or errored goal is left for the failure cleanup to cancel.
+        self._track_goal(goal_handle)
+        result_future = self._wait_future(
+            goal_handle.get_result_async(), timeout_s=self._rest_duration_s + 10.0, stop_event=stop_event
+        )
+        if result_future is None:
+            return False, f"goal result timeout ({endpoint})"
+        wrapper = result_future.result()
+        if getattr(wrapper, "status", GoalStatus.STATUS_SUCCEEDED) != GoalStatus.STATUS_SUCCEEDED:
+            return False, f"goal aborted ({endpoint})"
+        result = getattr(wrapper, "result", None)
+        error_code = getattr(result, "error_code", FollowJointTrajectory.Result.SUCCESSFUL)
+        if error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            return False, f"{endpoint}: {getattr(result, 'error_string', '') or f'error_code={error_code}'}"
+        self._untrack_goal(goal_handle)
+        return True, "ok"
+
+    def _on_late_goal_acceptance(self, future) -> None:
+        """Cancel a goal the server accepted after we stopped waiting."""
+        try:
+            goal_handle = future.result()
+        except Exception:  # noqa: BLE001
+            return
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            return
+        self._node.get_logger().warning("goal accepted after the timeout; cancelling")
+        self._track_goal(goal_handle)
+        self._cancel_goal_handle(goal_handle, time.monotonic() + self._cleanup_budget_s)
+        self._untrack_goal(goal_handle)
+
+    def _track_goal(self, goal_handle) -> None:
+        with self._goal_lock:
+            self._outstanding_goals.append(goal_handle)
+
+    def _untrack_goal(self, goal_handle) -> None:
+        with self._goal_lock:
+            self._outstanding_goals = [g for g in self._outstanding_goals if g is not goal_handle]
+
+    def _cancel_outstanding_goals(self, deadline: float | None = None) -> None:
+        with self._goal_lock:
+            goals, self._outstanding_goals = list(self._outstanding_goals), []
+        for goal_handle in goals:
+            self._cancel_goal_handle(goal_handle, deadline)
+
+    def _cancel_goal_handle(self, goal_handle, deadline: float | None) -> None:
+        try:
+            cancel_future = goal_handle.cancel_goal_async()
+        except Exception as exc:  # noqa: BLE001
+            self._node.get_logger().warning(f"cancelling rest goal failed: {exc}")
+            return
+        timeout = 2.0 if deadline is None else max(deadline - time.monotonic(), 0.05)
+        self._wait_future(cancel_future, timeout_s=timeout)
+
+    # ── generic helpers ───────────────────────────────────────────────────────
+
+    def _wait_future(self, future, timeout_s: float | None, stop_event: threading.Event | None = None):
+        """Block for a future from a non-executor thread; None on timeout.
+
+        Service callbacks run on the MultiThreadedExecutor with a reentrant
+        callback group, so another executor thread can deliver the response
+        while this one waits on the event.
+        """
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
-        if not done.wait(timeout=timeout + 5.0):
+        if stop_event is None:
+            if not done.wait(timeout=timeout_s):
+                return None
+            return future
+        if timeout_s is None:
+            timeout_s = 60.0
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if done.wait(timeout=min(remaining, 0.1)):
+                return future
+            if stop_event.is_set():
+                return None
+
+    def _dispatcher_step(
+        self, client, request, label: str, *, check_success: bool = False, stop_event: threading.Event | None = None
+    ) -> bool | None:
+        """One dispatcher step: None = absent (skipped, logged), False = failed."""
+        if not client.wait_for_service(timeout_sec=1.0):
+            self._node.get_logger().info(f"{label}: dispatcher not running; skipping")
+            return None
+        return self._call_service_sync(client, request, label, check_success=check_success, stop_event=stop_event)
+
+    def _call_service_sync(
+        self,
+        client,
+        request,
+        label: str,
+        timeout: float = 5.0,
+        *,
+        check_success: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        """Call a service and block (safe from a non-executor thread)."""
+        future = client.call_async(request)
+        if self._wait_future(future, timeout_s=timeout + 5.0, stop_event=stop_event) is None:
             self._node.get_logger().warning(f"{label}: timed out")
             return False
         if not check_success:
@@ -476,6 +672,75 @@ class PickBananaTask(SceneTask):
             self._node.get_logger().warning(f"{label}: service returned failure")
             return False
         return True
+
+    # ── AutoTest loop ─────────────────────────────────────────────────────────
+
+    def _run_autotest(self) -> None:
+        log = self._node.get_logger()
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = self._eval_root / timestamp
+            run_dir.mkdir(parents=True, exist_ok=True)
+            results_path = run_dir / "results.jsonl"
+            summary_path = run_dir / "summary.yaml"
+            log.info(f"AutoTest: saving to {run_dir}")
+
+            passed = 0
+            total = self._n_keyframes
+            completed = 0
+
+            with results_path.open("w") as fh:
+                for i in range(total):
+                    if self._autotest_stop.is_set():
+                        log.info("AutoTest: stop requested; ending the run")
+                        break
+                    ok, _ = self._clean_world_reset(
+                        randomize=True, resume=True, settle_s=1.5, stop_event=self._autotest_stop
+                    )
+                    if not ok:
+                        log.warning(f"AutoTest {i}: random_set failed, skipping")
+                        continue
+                    completed += 1
+
+                    result = self.evaluate(duration_s=30.0)
+                    if result.success:
+                        passed += 1
+
+                    placement = list(self._grid[self._kf_idx]) if 0 <= self._kf_idx < total else []
+                    record = {
+                        "idx": i,
+                        "placement_index": self._kf_idx,
+                        "banana_spawn": placement,
+                        "success": result.success,
+                        "reason": result.reason,
+                        "banana_final_pos": result.banana_final_pos,
+                        "duration_s": round(result.duration_s, 2),
+                    }
+                    fh.write(json.dumps(record) + "\n")
+                    fh.flush()
+
+                    sym = "✓" if result.success else "✗"
+                    log.info(f"AutoTest {i + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
+
+            # Leave the robot idle after the batch completes.
+            self._dispatcher_step(self._disp_stop, Trigger.Request(), "dispatcher/stop", check_success=True)
+
+            rate = passed / completed if completed > 0 else 0.0
+            summary_path.write_text(
+                f"scene: pick_banana\n"
+                f'date: "{datetime.now().isoformat()}"\n'
+                f"total: {total}\n"
+                f"completed: {completed}\n"
+                f"passed: {passed}\n"
+                f"failed: {completed - passed}\n"
+                f"success_rate: {rate:.3f}\n"
+            )
+            log.info(f"AutoTest complete: {passed}/{completed} ({rate:.1%})")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"AutoTest failed: {exc!r}")
+            self._dispatcher_step(self._disp_stop, Trigger.Request(), "dispatcher/stop", check_success=True)
+        finally:
+            self._end_operation()
 
 
 # ─── Node entrypoint ──────────────────────────────────────────────────────────
@@ -492,8 +757,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        if task._shadow is not None:
-            task._shadow.shutdown()
+        task.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

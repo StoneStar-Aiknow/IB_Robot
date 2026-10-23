@@ -39,4 +39,4 @@ fi
 if command -v ros2 >/dev/null 2>&1; then
     exec env PYTHONUNBUFFERED=1 ros2 run ibrobot_agent ibrobot_agent_chat "$@"
 fi
-exec env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" "${ROOT_DIR}/src/ibrobot_agent/ibrobot_agent/chat_tui.py" "$@"
+exec env PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m ibrobot_agent.chat_tui "$@"

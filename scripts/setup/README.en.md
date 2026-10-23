@@ -13,6 +13,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `tests/test_lerobot_filter.sh` | Regression fixtures pinned to the canonical 3-platform matrix + tag-binding cases. |
 | `tests/test_cann_torch_versions.sh` | Tests CANN detection and openEuler Torch ABI selection without a CANN installation. |
 | `tests/test_openeuler_cv_bridge_abi.sh` | Tests installation of the OpenCV 4.13-compatible openEuler `cv_bridge` RPM. |
+| `tests/test_setup_profile_training.sh` | Asserts `--profile training` never triggers ROS 2 / rosdep / colcon while `full` / `inference` keep their behaviour. |
 
 ## Setup profiles (dependency-scope parameterization)
 
@@ -23,6 +24,9 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | --- | --- |
 | `full` (default) | Complete development workspace: hardware, teleop, perception, grasp, voice, sim, and dev tooling. |
 | `inference` | Minimal policy-inference runtime for edge-cloud collaborative inference verification hosts. |
+| `training` | **Ubuntu 22.04 only.** LeRobot training host: creates the venv, applies the LeRobot patch stack, and installs LeRobot plus the training dependencies only. No ROS 2 / rosdep / colcon. |
+
+The single source of truth for the capability matrix is `_SETUP_PROFILE_TABLE` in [`common.sh`](./common.sh): one row per profile, cells separated by `|` (columns are the `rosdep` cell, the `submodules` scope, the `verify` strictness, and the comma-separated `features`), and any cell may be wrapped onto indented continuation lines — the physical lines are glued together before the cells are split and cell whitespace is normalised. The `rosdep` cell reads `<scope>:<paths>` (for example `full:src`, `narrow:src/a,src/b`, `skip:-`), so a profile cannot claim `skip` while still resolving a path set. `setup_profile_enables <feature>` answers "what is installed" and `setup_profile_get rosdep|rosdep_paths|submodules|verify` answers scope, paths, and verification strictness, so **adding a profile means adding one row**.
 
 Differences of `inference` vs. `full`:
 
@@ -37,6 +41,26 @@ Differences of `inference` vs. `full`:
 # Edge-cloud collaborative inference verification host:
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
+```
+
+Differences of `training` vs. `full` (for Ubuntu 22.04 hosts that only run LeRobot training):
+
+`training` supports only `ubuntu-22.04`. Other platforms are rejected after platform detection, before dependency previews, submodule synchronization or system installation. Neither `--only-patch` nor `--skip-verify` bypasses this restriction. The platform support of `full` / `inference` is unchanged. `training` cannot be combined with `--with-benchmark`; use `full` for benchmark setup.
+
+- **ROS 2**: never installed. `scripts/install_ros.sh`, rosdep, colcon, and the ROS third-party patch stacks are all skipped, and no `install/` overlay is required.
+- **Submodules**: only `libs/lerobot` is initialized.
+- **System packages**: only the Python bootstrap (`python3-venv` / `python3-pip`) and `ffmpeg` (torchcodec video decoding) are required. All profiles share the Ubuntu dependency installation hook; apt handles already-installed packages idempotently. FFmpeg is declared explicitly instead of relying on ROS/OpenCV to install it transitively.
+- **Python venv**: keeps `--system-site-packages` (same layout as `full` / `inference`) and installs only `base.txt`, `requirements/training.txt` (TensorBoard), and the LeRobot editable install (extras: `smolvla,pi,diffusion,dataset,deepdiff-dep`). It skips `hardware.txt`, WebPhone, `dev-tools.txt`, voice-tts, perception, FullSubNet, GraspGen, colcon, the `empy` / `rosdep` pins, the pre-commit / gitlint hooks, and the teleop-only `kinematics` extra.
+- **NumPy / OpenCV**: the ROS 2 ABI pins (`numpy==1.26.4` / `opencv<4.12`) are deliberately **not** applied; LeRobot's own resolution is kept. CANN hosts now take that layer from the **accelerator axis** (see [accelerator dependency placement in the Chinese README](./README.md#加速器轴依赖落位)).
+- **Verification**: ROS 2 / rosdep / colcon / cv_bridge / pygraphviz / tracing checks are skipped; the venv, `import lerobot`, the `lerobot.policies.act` API, and the `lerobot-train` executable are verified. When torchcodec is installed its decoder module is also loaded, surfacing missing FFmpeg libraries or ABI mismatches.
+- **`.shrc_local`**: reads `venv/.ibrobot_setup_profile`; with `training` it labels the banner `(profile: training)`, reports the missing ROS 2 / `install/` / CANN entries as expected, and stops advertising the `cb` / `cbp` / `src` colcon aliases.
+
+> Naming note: this `training` value is the **install-scope** profile. It is a different namespace from the LeRobot patch-filter `training` profile (`IBR_LEROBOT_PROFILES` / `--lerobot-profiles`); `--profile training` leaves the patch filter set untouched, so the training-relevant patches are still applied.
+
+```bash
+# Ubuntu 22.04 training host (no ROS 2):
+./scripts/setup.sh --yes --profile training
+source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
 ```
 
 ## CANN dependency layers

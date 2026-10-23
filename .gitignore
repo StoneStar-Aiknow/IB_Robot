@@ -14,6 +14,12 @@ tmp/
 # not match the in-repo runtime package src/robots/aimdk/.
 /aimdk/
 
+# Unitree upstream checkouts used for analysis (BSD-3-Clause). Unlike AimDK the
+# message packages and the G1 URDF ARE vendorable and will land under
+# src/robots/unitree/; this tree is only the upstream working copy.
+# Root-anchored so it cannot match the in-repo runtime package.
+/unitree/
+
 # Python
 __pycache__/
 *.py[cod]

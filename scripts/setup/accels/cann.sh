@@ -13,6 +13,16 @@ accel_supports_torch_grasp() {
     return 1
 }
 
+# Whether GraspGenX can be installed on this accelerator. It is a separate
+# question from accel_supports_torch_grasp: GraspGenX is a pure-Python wheel
+# whose encoder is PTV3, so it never touches pointnet2_ops, and its 310P
+# deployment runs on torch_npu with the diffusion loop as an offline model.
+# Answering it with the GraspGen predicate is what kept GraspGenX off an
+# Ascend host for a reason that does not apply to it.
+accel_supports_torch_graspgenx() {
+    return 0
+}
+
 # CANN releases with a supported Torch ABI in this tree, keyed off the
 # detected release. Every hook below keys off this one selector so a release
 # cannot be half adopted. The family tests are anchored so 8.1 does not match

@@ -515,7 +515,7 @@ digest 比较，并从 `provenance_preimage` 重算 `provenance_digest`；只比
 该包保持为轻量级 catalog，而不是插件市场：
 
 ```text
-src/skill_catalog/
+src/agent/skill_catalog/
 ├── package.xml
 ├── setup.py
 ├── skill_catalog/
@@ -2301,8 +2301,9 @@ release 部署完成、且活动指针完成原子切换后，生产环境才能
 - Production `DirectoryReleaseSkillSource` 允许 release 根目录外唯一的原子 `current` symlink，但其目标
   `releases/<digest>/` 子树必须全部是 materialize 后的普通文件；release 内部任何 symlink 都必须拒绝。
 - `--symlink-install` 只用于 `DevelopmentStagingSkillSource`，不得冒充 production immutable release。
-- Source workspace 的三份迁移 profile 使用 `skill_catalog_source_mode=development`，由 launch builder 根据
-  robot config 的绝对路径解析 staging root；非 symlink release build 可切换到 ament `installed` source。
+- Source workspace 的迁移 profile 使用 `skill_catalog_source_mode=development` 且不写 root，由
+  `skill_catalog.source.resolve_development_source_root()` 取已安装 `skill_catalog` 包的源码树作为 staging root；
+  非 symlink release build 回退到 ament `installed` source。
 - 两种模式的 package share 都必须可发现全部 manifest、implementation、profile、schema 和 `SKILL.md`。
 - Production compiler 不访问源码绝对路径；`current` 只能指向完整且 release digest 校验通过的目录。
 - Release 激活后发现文件内容变化时，runtime 必须拒绝并报告 immutable violation。
@@ -2311,7 +2312,7 @@ release 部署完成、且活动指针完成原子切换后，生产环境才能
 
 | 区域 | 必需修改 |
 |---|---|
-| `src/skill_catalog/**` | 新增 compiler、schema、source、snapshot model 和测试。 |
+| `src/agent/skill_catalog/**` | 新增 compiler、schema、source、snapshot model 和测试。 |
 | `src/embodied_common/embodied_common/primitive_contracts.py` | 新增唯一静态 Primitive descriptor registry 和 canonical digest helper；从 `skill_templates.py` 移出白名单、参数表和 runtime capability mapping，供 catalog、executor 和 safety 只读复用。 |
 | `src/embodied_common/embodied_common/workflow_contracts.py` | 新增 typed plan 规范化和 canonical `workflow_digest` helper，供 planner、task executor 和 coordinator 复用；不持久化 Workflow。 |
 | `src/robot_config/robot_config/loader.py` | 构建完整机器人执行上下文和 `robot_config_digest`，并校验 legacy/profile 互斥；不管理运行时 generation。 |

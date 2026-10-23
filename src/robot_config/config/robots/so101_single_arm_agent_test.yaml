@@ -35,8 +35,6 @@ robot:
 
   # Agent incubation is text-only. Do not initialize microphone or TTS model
   # runtimes while validating the no-motion/Gazebo control path.
-  audio_io:
-    enabled: false
   voice_tts:
     enabled: false
 

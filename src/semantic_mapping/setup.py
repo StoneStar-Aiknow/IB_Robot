@@ -35,5 +35,15 @@ setup(
             "semantic_map_standoff = semantic_mapping.standoff_query:main",
             "save_semantic_map = semantic_mapping.dataset_capture:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the mapping node's
+        # launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the robot YAML
+        # (``semantic_mapping.enabled``).
+        "ibrobot.launch_builders": [
+            "semantic_mapping = semantic_mapping.launch_builders.semantic_mapping:SEMANTIC_MAPPING_BUILDER",
+        ],
     },
 )

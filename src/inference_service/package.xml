@@ -45,6 +45,9 @@
   <test_depend>launch_testing</test_depend>
   <test_depend>action_dispatch</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated launch-builder tests import robot_config's registry and
+       loader (openspec change ``migrate-business-launch-builders``). -->
+  <test_depend>robot_config</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

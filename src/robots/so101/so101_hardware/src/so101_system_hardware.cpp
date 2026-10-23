@@ -647,7 +647,7 @@ SO101SystemHardware::handle_active_protections(std::chrono::steady_clock::time_p
   return hardware_interface::return_type::OK;
 }
 hardware_interface::return_type
-SO101SystemHardware::write(const rclcpp::Time &, const rclcpp::Duration & period)
+SO101SystemHardware::write(const rclcpp::Time &, const rclcpp::Duration &)
 {
   if (motion_faulted_) {
     return hardware_interface::return_type::ERROR;
@@ -684,10 +684,11 @@ SO101SystemHardware::write(const rclcpp::Time &, const rclcpp::Duration & period
   }
   bool write_ok = false;
   const auto started = std::chrono::steady_clock::now();
-  const auto budget = period.nanoseconds() > 0 ? std::min(
-    write_retry_budget_, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-      std::chrono::duration<double>(period.seconds() * WRITE_RETRY_BUDGET_RATIO))) :
-    write_retry_budget_;
+  // The measured period describes the previous loop, not this write's time
+  // allowance. Startup or catch-up iterations can be only microseconds apart.
+  // Use a fixed 10 ms budget for RoboPi validation of serial flush latency.
+  // This trial budget does not guarantee that blocking driver calls finish in time.
+  const auto budget = std::chrono::milliseconds(10);
   const auto deadline = started + budget;
   if (bus_) {
     const ScopedIoDeadline io_deadline(*bus_, deadline);

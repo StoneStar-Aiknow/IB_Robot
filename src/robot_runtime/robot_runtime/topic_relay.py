@@ -27,7 +27,16 @@ def _load_message_type(type_name: str):
 
 
 class TopicRelay(Node):
-    """Relays messages from one topic to another, optionally normalizing frame_id."""
+    """Relays messages from one topic to another, optionally normalizing frame_id.
+
+    ``reliable`` upgrades both the SUBSCRIPTION and the PUBLICATION to
+    reliable QoS. The subscription side matters for sources whose publishers
+    are reliable and whose messages are large enough to suffer best-effort
+    fragment loss (e.g. the mujoco_ros2_control camera streams); the
+    publication side matters when the relay fills an endpoint whose advertised
+    contract is reliable. Relays without the flag keep the historical
+    best-effort sensor-data behaviour.
+    """
 
     def __init__(
         self,
@@ -35,21 +44,37 @@ class TopicRelay(Node):
         target_topic: str,
         message_type: str,
         target_frame_id: str | None = None,
+        reliable: bool = False,
     ):
         super().__init__("topic_relay")
 
         self._target_frame_id = target_frame_id
         msg_cls = _load_message_type(message_type)
-        self._publisher = self.create_publisher(msg_cls, target_topic, qos_profile_sensor_data)
+        if reliable:
+            from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+
+            reliable_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5,
+            )
+            publisher_qos = subscription_qos = reliable_qos
+        else:
+            publisher_qos = subscription_qos = qos_profile_sensor_data
+        self._publisher = self.create_publisher(msg_cls, target_topic, publisher_qos)
         self._subscription = self.create_subscription(
             msg_cls,
             source_topic,
             self._relay,
-            qos_profile_sensor_data,
+            subscription_qos,
         )
 
         frame_suffix = f" (frame_id -> {target_frame_id})" if target_frame_id else ""
-        self.get_logger().info(f"Relaying {message_type}: {source_topic} -> {target_topic}{frame_suffix}")
+        reliable_suffix = " (reliable source)" if reliable else ""
+        self.get_logger().info(
+            f"Relaying {message_type}: {source_topic} -> {target_topic}{frame_suffix}{reliable_suffix}"
+        )
 
     def _relay(self, msg):
         if self._target_frame_id and hasattr(msg, "header"):
@@ -62,14 +87,17 @@ def main(argv=None):
     ros_args_index = raw_args.index("--ros-args") if "--ros-args" in raw_args else len(raw_args)
     args = raw_args[:ros_args_index]
 
-    if len(args) not in (3, 4):
-        raise SystemExit("usage: topic_relay <source_topic> <target_topic> <package/msg/MessageName> [target_frame_id]")
+    if len(args) not in (3, 4, 5):
+        raise SystemExit(
+            "usage: topic_relay <source_topic> <target_topic> <package/msg/MessageName> [target_frame_id] [--reliable]"
+        )
 
     source_topic, target_topic, message_type = args[:3]
-    target_frame_id = args[3] if len(args) == 4 else None
+    target_frame_id = args[3] if len(args) >= 4 and args[3] != "--reliable" else None
+    reliable = "--reliable" in args
 
     rclpy.init(args=raw_args[ros_args_index:])
-    node = TopicRelay(source_topic, target_topic, message_type, target_frame_id)
+    node = TopicRelay(source_topic, target_topic, message_type, target_frame_id, reliable=reliable)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):

@@ -3,32 +3,40 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
-from robot_config.launch_builders.teleop import validate_teleop_config
 from robot_config.loader import _load_robot_section, load_robot_config_dict
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "robots"
 
 
-def test_so101_aero_profile_inherits_base_without_copying_unrelated_sections() -> None:
-    # The Aero Hand overlay stays on the provider-less legacy path; its base is
-    # the retained legacy single-arm configuration, not the migrated
-    # runtime-provider configuration.
-    base_path, base = _load_robot_section(CONFIG_DIR / "so101_single_arm_legacy.yaml")
-    resolved_path, resolved = _load_robot_section(CONFIG_DIR / "so101_arm_aero_hand.yaml")
+def test_so101_rtp_overlay_keeps_only_application_deltas() -> None:
+    # so101_rtp_distributed is the shipped real-world overlay: it layers the
+    # RTP application deltas (observation transport, distributed inference,
+    # disabled front camera, Gazebo pick_banana scene) on the runtime-provider
+    # base instead of duplicating runtime-owned blocks (openspec D10).
+    overlay_raw = yaml.safe_load((CONFIG_DIR / "so101_rtp_distributed.yaml").read_text(encoding="utf-8"))["robot"]
 
-    assert base_path.name == "so101_single_arm_legacy.yaml"
-    assert resolved_path.name == "so101_arm_aero_hand.yaml"
-    assert resolved["name"] == "so101_arm_aero_hand"
-    assert resolved["joints"]["arm"] == base["joints"]["arm"]
-    assert resolved["joints"]["gripper"] == base["joints"]["gripper"]
-    for key in ("control_modes", "moveit", "peripherals", "ros2_control", "embodied", "voice_asr", "voice_tts"):
-        assert resolved[key] == base[key], f"unexpected drift in inherited robot.{key}"
+    assert overlay_raw["base_config"] == "so101_single_arm"
+    assert overlay_raw["name"] == "so101_rtp_distributed"
+    for key in ("joints", "moveit", "ros2_control"):
+        assert key not in overlay_raw, f"runtime-owned robot.{key} belongs to the runtime profile, not the overlay"
+    assert overlay_raw["simulation"] == {
+        "platform": "gazebo",
+        "scene": "pick_banana",
+        "robot_spawn": {"x": 0.0, "y": 0.3, "z": -0.03},
+        "sim_models_pkg": "sim_models",
+    }
+    assert {entry["name"]: entry for entry in overlay_raw["peripherals"]}["front"]["disabled"] is True
 
-    assert [device["name"] for device in resolved["teleoperation"]["devices"]][-1] == "aero_glove_right"
-    assert resolved["teleoperation"]["active_devices"] == ["so101_leader", "aero_glove_right"]
-    assert resolved["hand_sources"]["mhandpro"]["exclusive_resources"] == ["mhandpro_sdk"]
-    assert resolved["auxiliary_actuators"]["aero_hand_right"]["command_topic"] == "/aero_hand_right/commands"
+    base_path, base = _load_robot_section(CONFIG_DIR / "so101_single_arm.yaml")
+    resolved_path, resolved = _load_robot_section(CONFIG_DIR / "so101_rtp_distributed.yaml")
+
+    assert base_path.name == "so101_single_arm.yaml"
+    assert resolved_path.name == "so101_rtp_distributed.yaml"
+    assert resolved["name"] == "so101_rtp_distributed"
+    # Sections the overlay does not override still resolve from the base.
+    assert resolved["voice_tts"] == base["voice_tts"]
 
 
 def test_overlay_append_requires_a_base_list(tmp_path: Path) -> None:
@@ -88,18 +96,6 @@ def test_overlay_rejects_cross_directory_base_config(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must reference a sibling robot YAML"):
         _load_robot_section(overlay_dir / "overlay.yaml")
-
-
-def test_legacy_mhandpro_glove_is_rejected_as_active_runtime_path() -> None:
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_device": "legacy_glove",
-            "devices": [{"name": "legacy_glove", "type": "mhandpro_glove"}],
-        }
-    )
-
-    assert any("has been removed" in error for error in errors)
 
 
 def test_overlay_cycle_is_rejected(tmp_path: Path) -> None:

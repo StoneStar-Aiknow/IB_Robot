@@ -191,7 +191,7 @@ Drive them with the closed vocabulary only; free text outside the grammar never 
    accepted `继续`: after confirming the cancellation in its own ledger and the Gateway ledger it re-plans the
    unfinished part of the original request and submits it as a fresh Program with a new request ID through the
    normal presentation and Gateway checks. Do not flag or "fix" that as breakpoint resume; see
-   `src/ibrobot_agent/README.md`.
+   `src/agent/ibrobot_agent/README.md`.
 
 A reference implementation of this loop (catalog discovery, out-of-catalog rejection, in-session prepare/confirm,
 stop-to-definite-terminal, and fresh-state continuation) lives in

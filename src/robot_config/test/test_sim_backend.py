@@ -202,3 +202,137 @@ def test_gazebo_adapter_bridge_delegates():
     ]
     nodes = adapter.spawn_peripheral_bridges(peripherals)
     assert len(nodes) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# World-only mode (runtime-simulation-transport D4, task 3.2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_gazebo_world_only_emits_server_and_clock_but_no_embodiment():
+    from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+    from launch_ros.actions import Node
+
+    adapter = get_sim_backend("gazebo")
+    actions, world_name, spawn_pose = adapter.start_world_only(
+        {
+            "name": "test_robot",
+            "gazebo_world_name": "demo",
+            "simulation": {"platform": "gazebo"},
+        }
+    )
+    assert world_name == "demo"
+    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
+    executables = {node._Node__node_executable for node in actions if isinstance(node, Node)}
+    assert "parameter_bridge" in executables, "the world owner bridges /clock"
+    assert "create" not in executables, "the provider spawns its own embodiment"
+    assert "bridge_node" not in executables, "camera bridges are embodiment"
+    assert "wait_for_clock" not in executables, "the provider gates its own create"
+    assert sum(isinstance(action, IncludeLaunchDescription) for action in actions) == 1
+    # no description-derived resource paths: the provider's description carries
+    # absolute file:// mesh URIs and the scene world resolves its own assets
+    assert not any(isinstance(action, SetEnvironmentVariable) for action in actions)
+
+
+def test_gazebo_world_only_resolves_scene_world_and_full_spawn_pose():
+    adapter = get_sim_backend("gazebo")
+    config = {
+        "name": "test_robot",
+        "gazebo_world_name": "demo",
+        "simulation": {
+            "platform": "gazebo",
+            "scene": "pick_banana",
+            "robot_spawn": {"x": 0.25, "y": -0.1, "z": -0.03, "yaw": 0.7},
+        },
+    }
+    actions, world_name, spawn_pose = adapter.start_world_only(config)
+    assert world_name == "demo"
+    assert spawn_pose == (0.25, -0.1, -0.03, 0.7)
+    # the robot_spawn precedence beats the scene layout (pick_banana: 0.0/0.30/-0.03)
+    from launch.actions import IncludeLaunchDescription
+
+    include = next(action for action in actions if isinstance(action, IncludeLaunchDescription))
+    (gz_args,) = [
+        value
+        for key, value in include.launch_arguments
+        if str(key[0].text if hasattr(key[0], "text") else key) == "gz_args"
+    ]
+    assert "sim_models_pick_banana.world" in str(gz_args[0].text if hasattr(gz_args[0], "text") else gz_args)
+
+
+def test_gazebo_world_only_falls_back_to_the_scene_layout_spawn():
+    adapter = get_sim_backend("gazebo")
+    config = {
+        "name": "test_robot",
+        "gazebo_world_name": "demo",
+        "simulation": {"platform": "gazebo", "scene": "pick_banana"},
+    }
+    _actions, _world, spawn_pose = adapter.start_world_only(config)
+    assert spawn_pose == (0.0, 0.30, -0.03, 0.0)
+
+
+def test_provider_gazebo_simulation_startup_carries_world_and_pose():
+    from robot_config.launch_builders.simulation import build_simulation
+    from robot_config.launch_registry.registry import LaunchBuildContext
+    from robot_config.runtime_target import RuntimeTarget
+
+    context = LaunchBuildContext(
+        robot_config={
+            "name": "test_robot",
+            "runtime": {"provider": "test_robot", "profile": "p"},
+            "simulation": {
+                "platform": "gazebo",
+                "scene": "pick_banana",
+                "robot_spawn": {"x": 0.1, "y": 0.2, "z": 0.3, "yaw": 0.5},
+            },
+        },
+        runtime_target=RuntimeTarget.SIMULATION,
+        sim_platform="gazebo",
+        use_sim=True,
+    )
+    result = build_simulation(context)
+    assert result.simulation_startup is not None
+    assert result.simulation_startup.entity_action is None
+    assert result.simulation_startup.world_name == "demo"
+    assert result.simulation_startup.spawn_pose == (0.1, 0.2, 0.3, 0.5)
+    # world-only: no create, no joint-state bridge, no camera bridges
+    from launch_ros.actions import Node
+
+    executables = {node._Node__node_executable for node in result.actions if isinstance(node, Node)}
+    assert "parameter_bridge" in executables
+    assert "create" not in executables and "bridge_node" not in executables
+
+
+def test_preseeded_simulation_startup_is_reused_without_relaunching():
+    from robot_config.launch_builders.simulation import build_simulation
+    from robot_config.launch_registry.registry import LaunchBuildContext, SimulationStartup
+    from robot_config.runtime_target import RuntimeTarget
+
+    preseed = SimulationStartup(entity_action=None, world_name="demo", spawn_pose=(0.0, 0.3, -0.03, 0.0))
+    context = LaunchBuildContext(
+        robot_config={"name": "test_robot", "runtime": {"provider": "test_robot", "profile": "p"}},
+        runtime_target=RuntimeTarget.SIMULATION,
+        sim_platform="gazebo",
+        use_sim=True,
+        simulation_startup=preseed,
+    )
+    result = build_simulation(context)
+    assert result.actions == [], "the second plan pass must not relaunch the world"
+    assert result.simulation_startup is preseed
+
+
+def test_provider_sdk_simulation_still_yields_the_empty_startup():
+    from robot_config.launch_builders.simulation import build_simulation
+    from robot_config.launch_registry.registry import LaunchBuildContext
+    from robot_config.runtime_target import RuntimeTarget
+
+    context = LaunchBuildContext(
+        robot_config={"name": "test_robot", "runtime": {"provider": "test_robot", "profile": "p"}},
+        runtime_target=RuntimeTarget.SIMULATION,
+        sim_platform="sdk",
+        use_sim=True,
+    )
+    result = build_simulation(context)
+    assert result.actions == []
+    assert result.simulation_startup.entity_action is None
+    assert result.simulation_startup.world_name == ""

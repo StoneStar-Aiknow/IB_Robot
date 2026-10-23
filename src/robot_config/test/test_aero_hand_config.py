@@ -2,9 +2,6 @@ from pathlib import Path
 
 import yaml
 
-from robot_config.launch_builders.control import generate_auxiliary_actuator_nodes
-from robot_config.launch_builders.hand_sources import apply_hand_profile
-from robot_config.launch_builders.recording import get_recording_topics
 from robot_config.loader import _load_robot_section
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_arm_aero_hand.yaml"
@@ -102,30 +99,3 @@ def test_aero_hand_config_defaults_to_real_hardware_with_external_sdk():
     }
     assert "normalized_deadbands" not in glove
     assert "task_space" not in glove
-
-
-def test_aero_hand_topics_are_in_continuous_recording_set():
-    topics = get_recording_topics(_config())
-
-    assert "/aero_hand_right/commands" in topics
-    assert "/aero_hand_right/joint_states" in topics
-    assert "/hand_sources/mhandpro/right/frame" not in topics
-
-
-def test_standalone_profiles_pass_safety_limits_to_each_aero_driver(monkeypatch):
-    monkeypatch.setenv("AERO_HAND_LEFT_PORT", "/dev/aero-left")
-    monkeypatch.setenv("AERO_HAND_RIGHT_PORT", "/dev/aero-right")
-    source = yaml.safe_load(TELEOP_CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
-    for profile in ("left", "right", "dual"):
-        config = yaml.safe_load(yaml.safe_dump(source))
-        apply_hand_profile(config, profile)
-
-        nodes = generate_auxiliary_actuator_nodes(config, control_mode="teleop")
-
-        assert len(nodes) == (2 if profile == "dual" else 1)
-        for node in nodes:
-            parameters = _node_parameters(node)
-            joint_names = parameters["joint_names"]
-            limits = config["teleoperation"]["safety"]["joint_limits"]
-            assert parameters["command_lower_limits"] == [limits[name]["min"] for name in joint_names]
-            assert parameters["command_upper_limits"] == [limits[name]["max"] for name in joint_names]

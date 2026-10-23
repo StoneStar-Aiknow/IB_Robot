@@ -228,8 +228,8 @@ rsync -avi \
 
 ```bash
 ssh 310p-wm \
-  'test -f /IB_Robot-lwh/src/embodied_agent/embodied_agent/sound_orientation_node.py &&
-   test -f /IB_Robot-lwh/src/embodied_agent/embodied_agent/sound_orientation_policy.py &&
+  'test -f /IB_Robot-lwh/src/agent/embodied_agent/embodied_agent/sound_orientation_node.py &&
+   test -f /IB_Robot-lwh/src/agent/embodied_agent/embodied_agent/sound_orientation_policy.py &&
    echo SOUND_ORIENTATION_SOURCE_OK'
 ```
 
@@ -365,7 +365,6 @@ robot:
       embodied:
         enabled: true
         skill_catalog_source_mode: development
-        skill_catalog_source_root: src/skill_catalog
         skill_catalog_profile: lekiwi_lidar
         idle_behaviors:
           sound_orientation:

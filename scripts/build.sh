@@ -43,6 +43,7 @@ Options:
   --so101                  Build the SO-101 robot plus its base dependencies
   --lekiwi                 Build the LeKiwi robot plus its base dependencies
   --aimdk                  Build the AgiBot X2 (AimDK) robot plus its base dependencies
+  --unitree                Build the Unitree G1 robot plus its base dependencies
   --rosclaw                Build rosclaw plus its base dependencies
   --list-groups            Resolve and list group members, then exit
   --clean                  Clean build (cmake-clean-cache)
@@ -118,7 +119,7 @@ while [[ $# -gt 0 ]]; do
             list_mixins
             exit 0
             ;;
-        --base|--agent|--so101|--lekiwi|--aimdk|--rosclaw)
+        --base|--agent|--so101|--lekiwi|--aimdk|--unitree|--rosclaw)
             GROUP_FLAGS+=("${1#--}")
             shift
             ;;
@@ -261,7 +262,7 @@ require_setup_environment() {
 require_setup_environment
 
 # ============================================================================
-# Package Group Selection (--base / --agent / --so101 / --lekiwi / --aimdk / --rosclaw)
+# Package Group Selection (--base / --agent / --so101 / --lekiwi / --aimdk / --unitree / --rosclaw)
 # Groups map to src/ path prefixes; membership is resolved from the colcon
 # package index so the lists follow the tree instead of rotting. The build
 # uses --packages-up-to, which adds each selected package's workspace
@@ -269,12 +270,17 @@ require_setup_environment
 # ============================================================================
 declare -A GROUP_PATHS=(
     [base]="ibrobot_msgs robot_config robot_runtime robot_teleop tensormsg model_utils hardware_mock observation_transport perception_service manipulation_service action_dispatch task_dispatch inference_service inference_manifest torch_models ibrobot_tracing voice_asr_service voice_tts_service manipulation_execution semantic_mapping object_tracker sim_models dataset_tools benchmark aero_hand_hardware attention_viz pymoveit2"
-    [agent]="embodied_agent embodied_bringup embodied_common skill_library skill_catalog robot_skill_cli safety_guard workflows ibrobot_agent"
+    [agent]="agent embodied_common"
     [so101]="robots/so101 robots/feetech"
     [lekiwi]="robots/lekiwi robots/feetech omni_wheel_controller robot_navigation fast_calib fast_lio livox_ros_driver2"
     # The X2 runtime additionally needs the vendor AimDK overlay on the ROS 2
     # path (aimdk_msgs is not vendored here); see the aimdk_robot README.
     [aimdk]="robots/aimdk"
+    # The G1's vendor messages (unitree_hg/unitree_go/unitree_api) and robot
+    # description are vendored under robots/unitree, so unlike aimdk no
+    # external overlay is needed; the sensor driver packages its closure
+    # pulls in (livox_ros_driver2, fast_lio) arrive via --packages-up-to.
+    [unitree]="robots/unitree"
     [rosclaw]="rosclaw"
 )
 
@@ -304,7 +310,7 @@ if [[ "${LIST_GROUPS}" == "true" || ${#GROUP_FLAGS[@]} -gt 0 ]]; then
     done
     if [[ "${LIST_GROUPS}" == "true" ]]; then
         if [[ ${#GROUP_FLAGS[@]} -eq 0 ]]; then
-            log_warning "--list-groups without group flags; pass one or more of --base --agent --so101 --lekiwi --aimdk --rosclaw."
+            log_warning "--list-groups without group flags; pass one or more of --base --agent --so101 --lekiwi --aimdk --unitree --rosclaw."
         fi
         echo "Selected packages (${#GROUP_PKGS[@]}):"
         for pkg_name in ${!GROUP_PKGS[@]}; do echo "  ${pkg_name}"; done | sort

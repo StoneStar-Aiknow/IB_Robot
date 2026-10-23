@@ -504,7 +504,7 @@ def test_sdk_provisioning_ack_is_required(version):
 
 @pytest.mark.parametrize("name", ["so101_leader", "xbox_controller", "phone_teleop", "vr_teleop"])
 def test_real_launch_builder_has_no_generic_solver_or_follower_files(monkeypatch, name):
-    from robot_config.launch_builders import teleop
+    from robot_teleop.launch_builders import teleop
 
     item = config()
     item["teleoperation"]["safety"] = {
@@ -540,16 +540,16 @@ def test_real_launch_builder_has_no_generic_solver_or_follower_files(monkeypatch
 def test_real_runtime_projection_composes_executor_and_all_inputs(monkeypatch):
     import yaml
 
-    from robot_config.launch_builders import teleop
     from robot_runtime.interface_description import build_description
     from robot_runtime.launch_support import render_robot_description
+    from robot_teleop.launch_builders import teleop
     from so101_robot import teleoperation
 
     root = Path(__file__).resolve().parents[2]
     path = root / "robots/so101/so101_robot/profiles/so101_single_arm.yaml"
     profile = yaml.safe_load(path.read_text())
     xml = render_robot_description(profile, path, True)
-    descriptor = build_description(profile, simulated=True, robot_description=xml)
+    descriptor = build_description(profile, use_sim=True, robot_description=xml)
     item = yaml.safe_load((root / "robot_config/config/robots/so101_single_arm.yaml").read_text())["robot"]
     item["robot_model"] = descriptor["model"]
     item["runtime"]["interface_description"] = descriptor

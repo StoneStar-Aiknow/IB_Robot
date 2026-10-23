@@ -9,7 +9,7 @@
 # for bring-up with an operator watching the terminal (confirm_mode: auto keeps
 # the legacy receipt path explicit as well). The skill allowlist is
 # inherited unchanged from so101_agent_manual_hardware, so the voice channel can
-# run exactly what the text channel can. audio_io/voice_asr stay off here; run voice_asr_node beside
+# run exactly what the text channel can. voice_asr stays off here; run voice_asr_node beside
 # the pipeline (microphone via robot.launch, or /voice_file_input for tests).
 robot:
   name: so101_single_arm

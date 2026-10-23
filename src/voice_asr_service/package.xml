@@ -13,6 +13,15 @@
   <depend>ibrobot_msgs</depend>
   <depend>diagnostic_msgs</depend>
   <depend>audio_common_msgs</depend>
+  <!-- Launch-builder registration (openspec change
+       ``migrate-business-launch-builders``): launch_builders/voice_asr.py
+       and launch_builders/speech_direction.py contribute the voice_asr and
+       speech_direction entries (plus the voice_asr config-override hook) to
+       robot_config's launch registry through the ibrobot.launch_builders
+       entry point group, importing robot_config at registration time. The
+       dependency direction reversed with that change: robot_config no
+       longer depends on this package. -->
+  <depend>robot_config</depend>
 
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
@@ -30,14 +39,19 @@
   <!-- speech_direction 走标准 inference_manifest 契约 + inference_service ACL/Torch 后端。
        inference_manifest 是 bindings 契约的静态导入源（setup.py 不 import，节点运行时必导）。
         inference_service.backends.ascend 仅 Ascend ACL backend 运行时动态导入（torch/onnx 后端不导入），
-       属可选运行时依赖；不在 package.xml 声明 exec_depend，否则会与 inference_service→robot_config→
-       voice_asr_service 的既有 depend 链形成环，破坏 colcon 拓扑排序。 -->
+       属可选运行时依赖，不在 package.xml 声明 exec_depend。
+       （历史上这里还叠了一层依赖环顾虑——inference_service→robot_config→voice_asr_service；
+       openspec change ``migrate-business-launch-builders`` 反转依赖方向后 robot_config 不再依赖本包，
+       该环已不存在，仅保留"可选动态导入不声明"这一条理由。） -->
   <exec_depend>inference_manifest</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated launch-builder tests import robot_config's registry and
+       loader (openspec change ``migrate-business-launch-builders``). -->
+  <test_depend>robot_config</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

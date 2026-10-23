@@ -22,7 +22,9 @@ Ubuntu/openEuler 原生源码工作区需要 ROS 2 Humble 和与机器人匹配�
 ```bash
 source .shrc_local
 source /path/to/aimdk/install/local_setup.sh
-./scripts/build.sh -- --packages-up-to robot_config aimdk_robot
+# interaction_demo 的 launch 条目已随其节点迁入 robot_interaction_demo
+# （openspec change migrate-business-launch-builders），需一并构建：
+./scripts/build.sh -- --packages-up-to robot_interaction_demo aimdk_robot
 ```
 
 重新加载环境，参与终端使用相同 `ROS_DOMAIN_ID` 和 `RMW_IMPLEMENTATION`。以下 localhost

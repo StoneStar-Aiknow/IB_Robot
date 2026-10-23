@@ -18,6 +18,7 @@
 | `tests/test_lerobot_filter.sh` | 锁定 3 平台基准矩阵 + tag 绑定用例的回归 fixture。 |
 | `tests/test_cann_torch_versions.sh` | 无需安装 CANN，验证 CANN 版本探测与 openEuler Torch ABI 选择。 |
 | `tests/test_openeuler_cv_bridge_abi.sh` | 验证 openEuler 安装匹配 OpenCV 4.13 的 `cv_bridge` RPM。 |
+| `tests/test_setup_profile_training.sh` | 验证 `--profile training` 不触发 ROS 2 / rosdep / colcon，且 `full` / `inference` 行为不变。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
@@ -29,12 +30,15 @@
 | --- | --- |
 | `full`（默认） | 完整开发工作区：硬件、遥操作、感知、抓取、语音、仿真与开发工具全量安装。 |
 | `inference` | 仅运行策略推理的最小运行时，面向端边协同推理验证主机。 |
+| `training` | **仅支持 Ubuntu 22.04** 的 LeRobot 训练主机：只建 venv、应用 LeRobot 补丁栈并安装 LeRobot + 训练依赖，不装 ROS 2 / rosdep / colcon。 |
+
+能力矩阵的**单一事实源**是 [`common.sh`](./common.sh) 里的 `_SETUP_PROFILE_TABLE`：一行一个 profile，单元格以 `|` 分隔（列 = `rosdep` 单元格 / `submodules` 范围 / `verify` 校验档 / `features` 能力清单），长单元格可用缩进续行 —— 物理行先粘合再切格、格内空白归一化，所以任一单元格都能在逗号后折行。`rosdep` 单元格写作 `<scope>:<paths>`（如 `full:src`、`narrow:src/a,src/b`、`skip:-`），scope 与 `--from-paths` 同格声明，因此不会出现“skip 却仍在解析某个路径集”的非法组合。`setup_profile_enables <feature>` 查“装什么”，`setup_profile_get rosdep|rosdep_paths|submodules|verify` 查范围、路径与校验档；**新增一个 profile = 新增一行**。
 
 `inference` profile 相对 `full` 的差异：
 
 - **submodules**：只初始化 `libs/lerobot`（跳过 LiDAR / bringup 子模块与 ROS 第三方 patch 栈）。
 - **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`torch_models`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
-- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的 OS 依赖，与 CANN 匹配的 `torch_npu` 由加速器轴安装；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
+- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、GraspGenX、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的 OS 依赖，与 CANN 匹配的 `torch_npu` 由加速器轴安装；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
 - **CANN Torch ABI**：LeRobot 按自身声明正常安装（含所选 extras），随后由 `accel-cann-8.1.txt`（已真机验证的 2.5.1 三元组）或 `accel-cann-8.3.txt`（官方配套的 2.8.0 三元组）按检测到的 CANN 版本覆盖，再由对应 `constraints-cann-<release>.txt` 经 `PIP_CONSTRAINT` 保护其后每一步 pip。`openeuler-24.03.txt` 只负责 OS 包。
 - **OpenCV / cv_bridge ABI**：openEuler aarch64 同时安装 `opencv>=4.13.0` 与 `ros-humble-cv-bridge>=3.2.1-2.oe2403`；后者是针对 OpenCV 4.13 重新构建的 RPM。环境校验在工作区 Python 中执行 BGR/RGB 转换、非连续数组及 mono8/mono16/32FC1 往返，不要求将 NumPy 1.x 兼容的 `cv2` wheel 升到 4.13，也不拒绝后续兼容的 RPM 修订。
 - **验证**：跳过 tracing 校验（lttng / tracetools 属于全工作区诊断能力），并跳过 Ubuntu 平台的 tracing 工具安装钩子（`platform_post_install_rosdeps`）。
@@ -43,6 +47,26 @@
 # 端边协同推理验证主机：
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
+```
+
+`training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的 Ubuntu 22.04 训练机）：
+
+`training` 仅支持 `ubuntu-22.04`。平台识别后，其他平台会在依赖预览、子模块同步和系统安装前报错退出；`--only-patch` / `--skip-verify` 不绕过此限制。`full` / `inference` 的平台支持范围不变。`training` 与 `--with-benchmark` 不兼容，benchmark 环境请使用 `full`。
+
+- **ROS 2**：完全不安装。跳过 `scripts/install_ros.sh`、rosdep、colcon 与 ROS 第三方 patch 栈，也不要求 `install/` overlay。
+- **submodules**：只初始化 `libs/lerobot`。
+- **系统依赖**：只需要 Python bootstrap（`python3-venv` / `python3-pip`）与 `ffmpeg`（torchcodec 视频解码）。与其他 profile 共用 Ubuntu 的系统依赖安装入口，由 apt 幂等处理已安装的包；FFmpeg 不再依赖 ROS/OpenCV 间接带入。
+- **Python venv**：保留 `--system-site-packages`（与 `full` / `inference` 布局一致）；只安装 `base.txt`、`requirements/training.txt`（TensorBoard）与 LeRobot editable（extras：`smolvla,pi,diffusion,dataset,deepdiff-dep`）。跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception、FullSubNet、GraspGen、colcon、`empy` / `rosdep`、pre-commit / gitlint 钩子以及仅服务遥操作的 `kinematics` extra。
+- **NumPy / OpenCV**：**不做** ROS 2 ABI 钉版（`numpy==1.26.4` / `opencv<4.12`），沿用 LeRobot 解析出的版本；CANN 侧的依赖落位改由**加速器轴**决定（见下文[「加速器轴依赖落位」](#加速器轴依赖落位)）。
+- **验证**：跳过 ROS 2 / rosdep / colcon / cv_bridge / pygraphviz / tracing 校验，校验 venv + `import lerobot` + `lerobot.policies.act` API + `lerobot-train` 可执行文件；安装了 torchcodec 时还会加载其解码模块，以发现缺失的 FFmpeg 动态库或 ABI 不匹配。
+- **`.shrc_local`**：读取 `venv/.ibrobot_setup_profile`；`training` 时欢迎信息标注 `(profile: training)`，把 ROS 2 / `install/` / CANN 的缺失显示为「按预期缺失」，并不再提示 `cb` / `cbp` / `src` 等 colcon 别名。
+
+> 命名提醒：此处的 `training` 是**安装范围** profile；它与 LeRobot 补丁过滤的 `training` profile（`IBR_LEROBOT_PROFILES` / `--lerobot-profiles`）属于不同命名空间。`--profile training` 不会改动补丁过滤集合，训练相关补丁照常应用。
+
+```bash
+# 纯训练机（无 ROS 2）：
+./scripts/setup.sh --yes --profile training
+source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
 ```
 
 ## 加速器轴依赖落位
@@ -57,6 +81,7 @@
 | `accel_pip_constraints` | 无 | `constraints-cann-8.1.txt` / `constraints-cann-8.3.txt`（按版本） | 无 |
 | `accel_post_requirements` | 无 | 8.1 / 8.3 卸载 `torchcodec`（aarch64 wheel 的 ABI 绑定在更新的 Torch 上，但其元数据不声明 torch 依赖，pip 察觉不到） | 无 |
 | `accel_supports_torch_grasp` | 是 | 否（`pointnet2_ops` 无昇腾构建） | 否 |
+| `accel_supports_torch_graspgenx` | 是 | 是（纯 Python wheel，编码器为 PTV3，不碰 `pointnet2_ops`；310P 部署跑在 `torch_npu` 上，扩散循环为离线 OM 图） | 否（无后端可服务） |
 | `accel_verify_runtime` | 无 | `verify_cann_runtime_versions`（8.1 / 8.3，按版本） | 无 |
 
 已知的不对称，列在这里以免被误读成违规：
@@ -68,6 +93,12 @@
 - **`requirements/manipulation.txt` 仍含 `spconv-cu120`、`torch-scatter` 等 CUDA 包**。该文件
   只由 `install_graspgen_pip` 安装，而那一步受 `accel_supports_torch_grasp` 把关，因此实际
   只在 `cuda` 上执行；但它位于 OS 无关的文件里，尚未迁入 `accel-cuda*.txt`。
+- **`requirements/graspgenx.txt` 与 `manipulation.txt` 重复声明 `h5py`、`trimesh`、`scikit-learn`
+  等**。这不是冗余：GraspGenX 的 wheel 以 `--no-deps` 安装，而 `manipulation.txt` 只由
+  `install_graspgen_pip` 在 `cuda` 上安装，所以 `cann` 上没有任何东西提供
+  `graspgenx.grasp_server` 在模块级 import 的那些包。该文件因此必须对
+  `accel_supports_torch_graspgenx` 答"是"的每个加速器自足，由
+  `scripts/setup/tests/test_graspgenx_requirements.sh` 比对 wheel 的模块级 import 闭包守住。
 - **CANN 8.1 与 8.3 自动安装，其余版本留给操作者**。8.1 的三元组经 Ascend310P 真机验证；
   8.3 的三元组取自昇腾官方配套表（`torch_npu` 2.8.0 恒要求 torch 2.8.0）并核实了 cp310/cp311
   的 aarch64 wheel 可用性，但尚未上真机。其他 CANN 版本一律不装 NPU 后端且 setup 继续

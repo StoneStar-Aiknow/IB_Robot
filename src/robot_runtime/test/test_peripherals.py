@@ -108,8 +108,14 @@ def test_peripheral_nodes_realsense_spawns_relay_chain():
     assert ("robot_runtime", "topic_relay") in specs, "realsense composition declares its relays"
 
 
-def test_peripheral_nodes_microphone_is_data_only():
-    assert peripheral_nodes([{"type": "microphone", "name": "respeaker", "driver": "alsa"}], use_sim=False) == []
+def test_peripheral_nodes_compose_the_alsa_capture_owner():
+    """Microphones used to be data-only; the runtime now owns the ALSA node (runtime-owned-audio-io)."""
+    nodes = peripheral_nodes(
+        [{"type": "microphone", "name": "respeaker", "driver": "alsa", "params": {"channels": 4}}], use_sim=False
+    )
+    assert [(node.node_package, node.node_executable, node._Node__node_name) for node in nodes] == [
+        ("audio_capture", "audio_capture_node", "audio_capture")
+    ]
 
 
 def test_peripheral_nodes_sim_skips_physical():

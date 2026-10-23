@@ -53,7 +53,7 @@ norecursedirs = [
 [tool.ruff]
 target-version = "py310"
 line-length = 120
-src = ["src"]
+src = ["src", "src/agent"]
 
 extend-exclude = [
     "build",
@@ -119,6 +119,7 @@ known-first-party = [
     "benchmark_libero",
     "ibrobot_tracing",
     "ibrobot_tracing_web",
+    "visual_interaction",
 ]
 
 [tool.ruff.format]

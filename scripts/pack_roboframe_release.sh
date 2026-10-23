@@ -87,11 +87,11 @@ done
 # [2] Extract the base pysite and dependency syslib
 if [[ -n "${DEPS_ARCHIVE}" ]]; then
     log_info "Extracting pysite and syslib from $(basename "${DEPS_ARCHIVE}")..."
-    tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" ./pysite
+    tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" pysite
     rm -rf "${PKG_ROOT}/pysite"
     mv "${STAGE_DIR}/pysite" "${PKG_ROOT}/pysite"
-    if tar tzf "${DEPS_ARCHIVE}" ./syslib >/dev/null 2>&1; then
-        tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" ./syslib
+    if tar tzf "${DEPS_ARCHIVE}" syslib >/dev/null 2>&1; then
+        tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" syslib
         cp -a "${STAGE_DIR}/syslib/." "${PKG_ROOT}/syslib/"
         rm -rf "${STAGE_DIR}/syslib"
     fi
@@ -265,6 +265,7 @@ PY_PATH=/data/roboframe/pysite:\
 /data/roboframe/install/so101_suite/lib/python3.12/site-packages:\
 /data/roboframe/install/so101_robot/lib/python3.12/site-packages:\
 /data/roboframe/install/robot_runtime/lib/python3.12/site-packages:\
+/data/roboframe/install/robot_teleop/lib/python3.12/site-packages:\
 /data/roboframe/install/task_dispatch/lib/python3.12/site-packages:\
 /data/roboframe/install/dataset_tools/lib/python3.12/site-packages:\
 /sys_prod/robot/out/lib/python3.12/site-packages:\

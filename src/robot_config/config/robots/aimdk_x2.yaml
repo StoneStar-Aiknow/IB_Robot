@@ -82,15 +82,21 @@ robot:
         queue_size: 50
         control_frequency: 50.0
 
-  # X2 publishes its own audio on the project's audio contract topics, so the
-  # shared ALSA capture/playback nodes are not launched here. Enabling the
-  # voice stack against the runtime-published audio needs the audio_io capture
-  # gate to accept a runtime-provided source; that is a separate change.
-  audio_io:
-    enabled: false
+  # X2 publishes its own audio on the project's audio contract topics; the
+  # runtime-owned audio interfaces (audio.capture / audio.play /
+  # audio.speech) carry the formats, and voice consumers bind them directly.
 
   voice_asr:
     enabled: false
+    # Streaming capture binds the built-in array's audio.capture interface
+    # (the runtime publishes the interleaved 6-channel stream; the node picks
+    # its channel), so `voice_asr_auto_start:=true` can enable this section
+    # without further config edits. The enhanced vendor path stays on
+    # aimdk_x2_voice, whose ASR binds the runtime's audio.speech chunks. The
+    # binding is inert while this section stays disabled.
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
 
   voice_tts:
     # The platform's own speech output is exposed as interaction.tts on

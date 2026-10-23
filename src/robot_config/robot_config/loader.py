@@ -90,6 +90,8 @@ _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES = {
     "sample_rate",
 }
 _SPEECH_DIRECTION_OVERRIDE_NAMES = {"mount_yaw_deg"}
+#: The stamped raw capture type every bound audio_input/audio_output consumes.
+_AUDIO_DATA_STAMPED_TYPE = "audio_common_msgs/msg/AudioDataStamped"
 
 
 def _deep_merge_config(
@@ -223,7 +225,7 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
     if not enabled:
         return errors
 
-    for name in ("profile", "microphone", "config_file", "profiles_file", "models_root"):
+    for name in ("profile", "config_file", "profiles_file", "models_root"):
         if not isinstance(config.get(name), str) or not config[name].strip():
             errors.append(f"speech_direction.{name} must be a non-empty string when enabled")
 
@@ -235,53 +237,104 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
     if unexpected_overrides:
         errors.append(f"speech_direction.parameters contains unsupported keys: {sorted(unexpected_overrides)}")
 
-    microphone_name = config.get("microphone")
-    peripherals = robot_config.get("peripherals", [])
-    if not isinstance(peripherals, list):
-        errors.append("robot.peripherals must be a list")
-        return errors
-    matches = [item for item in peripherals if isinstance(item, dict) and item.get("name") == microphone_name]
-    if len(matches) != 1:
-        errors.append(f"speech_direction.microphone must reference exactly one peripheral: {microphone_name!r}")
-        return errors
+    audio_input = config.get("audio_input")
+    if isinstance(audio_input, dict):
+        # runtime-owned-audio-io: the capture topic and the array format come
+        # from the runtime's audio.capture interface, not from a deployment
+        # microphone peripheral. Before the live binding only the declaration
+        # is checked; the bound form (the resolved topic plus the format
+        # metadata written by bind_robot_interfaces) also checks the array
+        # parameters the direction pipeline relies on. A microphone in the
+        # deployment peripherals is the legacy path only.
+        for name in ("interface", "type"):
+            if not isinstance(audio_input.get(name), str) or not audio_input[name].strip():
+                errors.append(f"speech_direction.audio_input.{name} must be a non-empty string")
+        declared_type = audio_input.get("type")
+        if isinstance(declared_type, str) and declared_type.strip() and declared_type != _AUDIO_DATA_STAMPED_TYPE:
+            errors.append(f"speech_direction.audio_input.type must be {_AUDIO_DATA_STAMPED_TYPE}")
+        if "_interface_source" in audio_input:
+            topic = audio_input.get("topic")
+            if not isinstance(topic, str) or not topic.strip():
+                errors.append("speech_direction.audio_input.topic must be a non-empty string once bound")
+            channels = audio_input.get("channels")
+            if channels is not None and (isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0):
+                errors.append("speech_direction.audio_input.channels must be a positive integer")
+            sample_rate = audio_input.get("sample_rate_hz")
+            if sample_rate is not None and (
+                isinstance(sample_rate, bool) or not isinstance(sample_rate, int | float) or sample_rate <= 0
+            ):
+                errors.append("speech_direction.audio_input.sample_rate_hz must be a positive number")
+            channel_indices = audio_input.get("channel_indices")
+            if channel_indices is not None:
+                if (
+                    not isinstance(channel_indices, list)
+                    or len(channel_indices) != 4
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in channel_indices
+                    )
+                    or len(set(channel_indices)) != len(channel_indices)
+                ):
+                    errors.append(
+                        "speech_direction.audio_input.channel_indices must contain 4 unique non-negative integers"
+                    )
+                elif isinstance(channels, int) and any(
+                    isinstance(value, int) and not isinstance(value, bool) and value >= channels
+                    for value in channel_indices
+                ):
+                    errors.append("speech_direction.audio_input.channel_indices must be smaller than channels")
+    else:
+        for name in ("microphone",):
+            if not isinstance(config.get(name), str) or not config[name].strip():
+                errors.append(f"speech_direction.{name} must be a non-empty string when enabled")
+        microphone_name = config.get("microphone")
+        peripherals = robot_config.get("peripherals", [])
+        if not isinstance(peripherals, list):
+            errors.append("robot.peripherals must be a list")
+            return errors
+        matches = [item for item in peripherals if isinstance(item, dict) and item.get("name") == microphone_name]
+        if len(matches) != 1:
+            errors.append(f"speech_direction.microphone must reference exactly one peripheral: {microphone_name!r}")
+            return errors
 
-    microphone = matches[0]
-    if microphone.get("type") != "microphone":
-        errors.append("speech_direction.microphone must reference a peripheral with type=microphone")
-    if not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip():
-        errors.append("speech direction microphone driver must be a non-empty string")
-    microphone_parameters = microphone.get("params", {})
-    if not isinstance(microphone_parameters, dict):
-        errors.append("speech direction microphone params must be a mapping")
-        return errors
-    missing = _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES - set(microphone_parameters)
-    if missing:
-        errors.append(f"speech direction microphone params is missing: {sorted(missing)}")
-        return errors
+        microphone = matches[0]
+        if microphone.get("type") != "microphone":
+            errors.append("speech_direction.microphone must reference a peripheral with type=microphone")
+        if not isinstance(microphone.get("driver"), str) or not microphone["driver"].strip():
+            errors.append("speech direction microphone driver must be a non-empty string")
+        microphone_parameters = microphone.get("params", {})
+        if not isinstance(microphone_parameters, dict):
+            errors.append("speech direction microphone params must be a mapping")
+            return errors
+        missing = _SPEECH_DIRECTION_MICROPHONE_PARAMETER_NAMES - set(microphone_parameters)
+        if missing:
+            errors.append(f"speech direction microphone params is missing: {sorted(missing)}")
+            return errors
 
-    for name in ("device", "sample_format"):
-        value = microphone_parameters.get(name)
-        if not isinstance(value, str) or not value.strip():
-            errors.append(f"speech direction microphone params.{name} must be a non-empty string")
-    sample_rate = microphone_parameters.get("sample_rate")
-    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
-        errors.append("speech direction microphone params.sample_rate must be a positive integer")
-    channel_indices = microphone_parameters.get("channel_indices")
-    if (
-        not isinstance(channel_indices, list)
-        or len(channel_indices) != 4
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in channel_indices)
-        or len(set(channel_indices)) != len(channel_indices)
-    ):
-        errors.append("speech direction microphone params.channel_indices must contain 4 unique non-negative integers")
+        for name in ("device", "sample_format"):
+            value = microphone_parameters.get(name)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"speech direction microphone params.{name} must be a non-empty string")
+        sample_rate = microphone_parameters.get("sample_rate")
+        if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+            errors.append("speech direction microphone params.sample_rate must be a positive integer")
+        channel_indices = microphone_parameters.get("channel_indices")
+        if (
+            not isinstance(channel_indices, list)
+            or len(channel_indices) != 4
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in channel_indices)
+            or len(set(channel_indices)) != len(channel_indices)
+        ):
+            errors.append(
+                "speech direction microphone params.channel_indices must contain 4 unique non-negative integers"
+            )
 
-    channels = microphone_parameters.get("channels")
-    if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
-        errors.append("speech direction microphone params.channels must be a positive integer")
-    elif isinstance(channel_indices, list) and any(
-        isinstance(value, int) and not isinstance(value, bool) and value >= channels for value in channel_indices
-    ):
-        errors.append("speech direction microphone params.channel_indices must be smaller than params.channels")
+        channels = microphone_parameters.get("channels")
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
+            errors.append("speech direction microphone params.channels must be a positive integer")
+        elif isinstance(channel_indices, list) and any(
+            isinstance(value, int) and not isinstance(value, bool) and value >= channels for value in channel_indices
+        ):
+            errors.append("speech direction microphone params.channel_indices must be smaller than params.channels")
     mount_yaw_deg = parameters.get("mount_yaw_deg", 0.0)
     if isinstance(mount_yaw_deg, bool) or not isinstance(mount_yaw_deg, int | float):
         errors.append("speech_direction.parameters.mount_yaw_deg must be numeric")
@@ -296,7 +349,9 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     the runtime facade; robot_config only delegates and reconciles
     ``capabilities.requires`` against ``RuntimeStatus``. A provider is
     mutually exclusive with a legacy simulation platform. Provider-less
-    configurations retain their existing launch path until separately migrated.
+    configurations retain their existing launch path until separately
+    migrated, except ``simulation.platform: mujoco``, which is rejected here
+    and in launch preparation (MuJoCo is served through a runtime provider).
     """
     errors: list[str] = []
     runtime = robot_config.get("runtime") or {}
@@ -310,18 +365,47 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     if provider:
         if not profile:
             errors.append(f"runtime.profile is required when runtime.provider={provider!r}")
+        from robot_config.utils import provider_sim_platform_error
+
         sim_platform = str((robot_config.get("simulation") or {}).get("platform", "sdk")).lower()
-        if sim_platform != "sdk":
-            errors.append(
-                "runtime.provider supports simulation.platform=sdk only; "
-                "Gazebo, MuJoCo and legacy mock backends are not interchangeable with SDK simulated transport"
-            )
+        platform_error = provider_sim_platform_error(sim_platform, provider)
+        if platform_error:
+            errors.append(platform_error)
         if runtime.get("require_model"):
-            if robot_config.get("ros2_control") or robot_config.get("peripherals"):
+            if robot_config.get("ros2_control"):
                 errors.append("public runtime consumers must place hardware and peripherals in runtime.profile")
+            peripherals = robot_config.get("peripherals")
+            if peripherals:
+                # Deployment peripheral overrides on the provider path are
+                # toggle-only (runtime-simulation-transport D8): enabling or
+                # disabling a runtime-declared peripheral by (type, name).
+                # Anything that changes a driver or device settings belongs in
+                # the runtime profile; unknown names are rejected by the
+                # runtime's peripheral merge.
+                if not isinstance(peripherals, list):
+                    errors.append("peripherals must be a list")
+                else:
+                    for entry in peripherals:
+                        if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+                            errors.append("peripherals entries require type and name")
+                            continue
+                        extra_keys = sorted(set(entry) - {"type", "name", "enabled", "disabled"})
+                        if extra_keys:
+                            errors.append(
+                                f"peripheral ({entry.get('type')}, {entry.get('name')!r}) on a provider path "
+                                f"may only toggle enabled/disabled (unexpected keys: {extra_keys}); "
+                                "driver and device settings belong in the runtime profile"
+                            )
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
+    else:
+        from robot_config.utils import providerless_sim_platform_error
+
+        sim_platform = str((robot_config.get("simulation") or {}).get("platform", "sdk")).lower()
+        platform_error = providerless_sim_platform_error(sim_platform)
+        if platform_error:
+            errors.append(platform_error)
 
     required = (robot_config.get("capabilities") or {}).get("requires") or []
     if required:
@@ -1591,10 +1675,10 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         profile_name = embodied.get("skill_catalog_profile", "")
         if source_mode not in {"installed", "development", "production"}:
             errors.append("embodied.skill_catalog_source_mode must be installed, development, or production")
-        elif source_mode in {"development", "production"} and (
-            not isinstance(source_root, str) or not source_root.strip()
-        ):
-            errors.append("embodied.skill_catalog_source_root is required in development and production modes")
+        elif source_mode == "production" and (not isinstance(source_root, str) or not source_root.strip()):
+            errors.append("embodied.skill_catalog_source_root is required in production mode")
+        elif source_mode == "development" and not isinstance(source_root, str):
+            errors.append("embodied.skill_catalog_source_root must be a string")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
         if not isinstance(embodied.get("resident_cli_bridge", True), bool):
@@ -1865,9 +1949,16 @@ def load_robot_config_dict(
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
     peripherals = robot_config.get("peripherals", [])
     if isinstance(peripherals, list):
-        robot_config["peripherals"] = [
-            item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
-        ]
+        runtime = robot_config.get("runtime") or {}
+        provider_owns_peripherals = bool(runtime.get("provider") and runtime.get("require_model"))
+        if not provider_owns_peripherals:
+            robot_config["peripherals"] = [
+                item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
+            ]
+        # Provider configs keep their toggle-only peripheral entries so the
+        # deployment fragment handed to the runtime carries the enable/disable
+        # selections (runtime-simulation-transport D8); the runtime's merge
+        # applies the toggles to its declared peripherals.
     robot_config["_config_path"] = str(resolved_config_path)
     robot_config["_config_sources"] = [str(path) for path in config_sources]
     robot_config = resolve_robot_interfaces(robot_config, defer=defer_interface_binding)
@@ -1891,10 +1982,46 @@ def load_robot_config_dict(
     return robot_config
 
 
+def validate_runtime_owned_audio_config(robot_config: dict[str, Any]) -> list[str]:
+    """Provider deployments own their audio devices (runtime-owned-audio-io).
+
+    A ``runtime.provider`` deployment must not carry an ``audio_io`` section
+    (the runtime's peripheral list launches the ALSA owners), and every enabled
+    audio consumer must bind its runtime interface instead of reading the
+    legacy ``audio_io``/peripherals fields.
+    """
+    provider = str((robot_config.get("runtime") or {}).get("provider", "") or "").strip()
+    if not provider:
+        return []
+    errors: list[str] = []
+    if "audio_io" in robot_config:
+        errors.append(
+            f"audio_io section is not allowed with runtime.provider={provider}: audio devices are "
+            "runtime-owned; declare microphone/speaker peripherals and bind the voice consumers via "
+            "speech_direction.audio_input / voice_asr.audio_input / voice_tts.audio_output "
+            "(see the runtime-owned-audio-io migration notes)"
+        )
+    bindings = (
+        ("voice_asr", "audio_input"),
+        ("speech_direction", "audio_input"),
+        ("voice_tts", "audio_output"),
+    )
+    for section, field in bindings:
+        config = robot_config.get(section) or {}
+        if isinstance(config, dict) and config.get("enabled") and not isinstance(config.get(field), dict):
+            errors.append(
+                f"{section}.enabled=true with runtime.provider={provider} requires {section}.{field} "
+                f"bound to the runtime audio interface (e.g. {field}: {{interface: audio.capture, "
+                "type: audio_common_msgs/msg/AudioDataStamped})"
+            )
+    return errors
+
+
 def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfaces: bool = False) -> None:
     """Validate an effective config, including an in-memory launch binding before snapshotting."""
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_runtime_provider_config(robot_config))
+    validation_errors.extend(validate_runtime_owned_audio_config(robot_config))
     validation_errors.extend(validate_arm_surface_config(robot_config))
     validation_errors.extend(validate_runtime_named_motion_config(robot_config))
     validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
@@ -2090,6 +2217,11 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         audio_input_channel=data.get("audio_input_channel", defaults.audio_input_channel),
         vad_input_channel=data.get("vad_input_channel", defaults.vad_input_channel),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+        input_mode=data.get("input_mode", defaults.input_mode),
+        chunk_topic=data.get("chunk_topic", defaults.chunk_topic),
+        audio_input=data.get("audio_input", defaults.audio_input),
+        external_min_samples=data.get("external_min_samples", defaults.external_min_samples),
+        external_idle_timeout=data.get("external_idle_timeout", defaults.external_idle_timeout),
     )
 
 
@@ -2123,7 +2255,10 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
     )
 
 
-_TTS_AUDIO_OUTPUT_TYPES = ("audio_common_msgs/msg/AudioData", "audio_common_msgs/msg/AudioDataStamped")
+# Kept in lockstep with interface_binding's voice_tts.audio_output rule: the
+# runtime-owned playback interface is AudioDataStamped, so accepting AudioData
+# here would only defer the binding error to launch time.
+_TTS_AUDIO_OUTPUT_TYPES = ("audio_common_msgs/msg/AudioDataStamped",)
 
 
 def validate_audio_playback_config(robot_config: Mapping[str, Any]) -> list[str]:
@@ -2182,6 +2317,12 @@ def validate_audio_playback_config(robot_config: Mapping[str, Any]) -> list[str]
 
 def load_audio_io_config(data: dict[str, Any]) -> AudioIOConfig:
     """Load shared audio_common I/O settings without enabling them implicitly."""
+    if "source" in data:
+        raise ValueError(
+            "audio_io.source was removed (runtime-owned-audio-io): audio devices are runtime-owned; "
+            "a provider deployment declares microphone/speaker peripherals and binds consumers via "
+            "audio_input/audio_output, a provider-less deployment just omits the source key"
+        )
 
     defaults = AudioIOConfig()
     return AudioIOConfig(
@@ -2207,6 +2348,7 @@ def load_speech_direction_config(data: dict[str, Any]) -> SpeechDirectionConfig:
         enabled=data.get("enabled", defaults.enabled),
         profile=data.get("profile", defaults.profile),
         microphone=data.get("microphone", defaults.microphone),
+        audio_input=data.get("audio_input", defaults.audio_input),
         config_file=resolve_ros_path(data.get("config_file", defaults.config_file))
         if data.get("config_file", defaults.config_file)
         else "",
@@ -2701,10 +2843,35 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
-    capture_required = config.voice_asr.enabled or config.speech_direction.enabled
-    playback_required = config.voice_tts.enabled
+    streaming_capture = config.voice_asr.enabled and config.voice_asr.input_mode != "external_vad"
+    # A consumer bound to the runtime's audio interface reads its topic and
+    # format from the binding, never from the provider-less audio_io device
+    # owners (runtime-owned-audio-io): provider deployments forbid an
+    # audio_io section, so an enabled bound consumer must not demand one.
+    asr_bound = isinstance(config.voice_asr.audio_input, dict)
+    direction_bound = isinstance(config.speech_direction.audio_input, dict)
+    tts_bound = isinstance(config.voice_tts.audio_output, dict)
+    capture_required = (streaming_capture and not asr_bound) or (
+        config.speech_direction.enabled and not direction_bound
+    )
+    playback_required = config.voice_tts.enabled and not tts_bound
     if (capture_required or playback_required) and not is_audio_io_enabled(config.audio_io):
         errors.append("audio_io.enabled must be true when voice ASR, speech direction, or voice TTS is enabled")
+    if config.voice_asr.enabled:
+        if config.voice_asr.input_mode not in ("shared_audio", "external_vad"):
+            errors.append(
+                f"voice_asr.input_mode must be 'shared_audio' or 'external_vad': {config.voice_asr.input_mode!r}"
+            )
+        if config.voice_asr.input_mode == "external_vad" and not isinstance(config.voice_asr.audio_input, dict):
+            errors.append(
+                "voice_asr.input_mode=external_vad requires the voice_asr.audio_input interface binding "
+                "(the segmented audio stream is provided by the robot runtime; audio_io.source was removed)"
+            )
+        if config.voice_asr.input_mode == "external_vad":
+            for name in ("chunk_topic",):
+                value = getattr(config.voice_asr, name)
+                if value and not value.startswith("/"):
+                    errors.append(f"voice_asr.{name} must be an absolute ROS topic name")
     errors.extend(
         validate_audio_playback_config(
             {
@@ -2722,9 +2889,9 @@ def validate_config(config: RobotConfig) -> list[str]:
         ):
             if not getattr(config.audio_io, name).startswith("/"):
                 errors.append(f"audio_io.{name} must be an absolute ROS topic name")
-        if capture_required and not config.audio_io.microphone:
+        if streaming_capture and not config.audio_io.microphone:
             errors.append("audio_io.microphone is required when shared audio capture is enabled")
-        elif capture_required:
+        elif streaming_capture:
             microphone_matches = [
                 peripheral
                 for peripheral in find_microphones(config.peripherals, config.audio_io.microphone)
@@ -2749,7 +2916,12 @@ def validate_config(config: RobotConfig) -> list[str]:
                     errors.append("audio_io microphone params.sample_rate must be a positive integer")
                 if sample_format != "S16LE":
                     errors.append("audio_io microphone params.sample_format must be S16LE")
-                if config.voice_asr.enabled and isinstance(channels, int) and not isinstance(channels, bool):
+                if (
+                    config.voice_asr.enabled
+                    and config.voice_asr.input_mode != "external_vad"
+                    and isinstance(channels, int)
+                    and not isinstance(channels, bool)
+                ):
                     for field_name, input_channel in (
                         ("audio_input_channel", config.voice_asr.audio_input_channel),
                         ("vad_input_channel", config.voice_asr.vad_input_channel),
@@ -2777,6 +2949,7 @@ def validate_config(config: RobotConfig) -> list[str]:
                     "enabled": speech_direction.enabled,
                     "profile": speech_direction.profile,
                     "microphone": speech_direction.microphone,
+                    "audio_input": speech_direction.audio_input,
                     "config_file": speech_direction.config_file,
                     "profiles_file": speech_direction.profiles_file,
                     "models_root": speech_direction.models_root,

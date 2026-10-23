@@ -33,9 +33,22 @@ GC_HOST=atomgit.com gitcode issue edit 123 -R openEuler/IB_Robot --state closed 
 # 重开：将上行 --state closed 改为 --state reopen
 ```
 
-写入后回读资源，确认目标、正文和状态。创建超时、非零退出或未返回编号都可能已经写入，
-先查询核对，不能盲目重复创建或评论。读取失败不能当作“没有 Issue/评论”。
-`issue list` 的分页参数以本机 help 为准，不假定支持 `--paginate`。
+写入后以回读为准核对目标、正文和状态；gitcode 写命令（create/comment/edit）退出码双向
+不可靠：超时、非零退出或未返回编号都可能已经写入，退出 0 也不免除回读。
+结果不确定时先等约 20 s 再只读对账，不能盲目重复创建或评论：
+
+```bash
+GC_HOST=atomgit.com gitcode issue list -R openEuler/IB_Robot --state all --limit 50 --json
+```
+
+`issue list` 实测无 `--paginate`（unknown flag），翻页用 `--page`/`--per-page`，
+或按需加大 `--limit`（只有 `pr list` 才有 `--paginate`）。按仓库 + 标题 + 正文核对候选：
+唯一匹配即已创建；无匹配或身份对不上先人工核对，不自动重建。一次 create 出现多条
+仓库/标题/正文完全相同的 Issue 属 CLI 超时重试复制的重复：停止，列清单请用户确认，
+保留最小编号，其余先评论指向保留者再 `issue edit --state closed` 关闭；
+标题/正文不同的 Issue 一律不关。重发评论前必须先回读评论列表确认未发出。
+读取失败不能当作“没有 Issue/评论”，回读不了就如实报告“写入结果未知”；
+完整对账流程见 [atomgit-pr](../atomgit-pr/SKILL.md)。
 
 ## IB_Robot 分类规则
 

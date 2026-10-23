@@ -53,5 +53,15 @@ setup(
             "nav_cmd = robot_navigation.nav_cmd:main",
             "evaluate_controller_regression = robot_navigation.controller_regression:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the navigation stack's
+        # launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the with_navigation switch /
+        # robot.navigation.enabled.
+        "ibrobot.launch_builders": [
+            "navigation = robot_navigation.launch_builders.navigation:NAVIGATION_BUILDER",
+        ],
     },
 )

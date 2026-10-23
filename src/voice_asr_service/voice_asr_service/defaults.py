@@ -21,4 +21,8 @@ VOICE_ASR_DEFAULTS = {
     "buffer_seconds": 5.0,
     "audio_input_channel": 1,
     "exit_on_init_failure": True,
+    "input_mode": "shared_audio",
+    "chunk_topic": "/audio/speech_chunk",
+    "external_min_samples": 3200,
+    "external_idle_timeout": 2.0,
 }

@@ -21,8 +21,9 @@ Plus stock ros2_control controllers. No generic IB-Robot package is in the closu
 ## Running standalone
 
 ```bash
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm            # hardware
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true   # SDK simulated transport
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm                          # hardware
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true            # sdk platform
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=gazebo     # Gazebo physics
 ```
 
 `profile` is a path or the name of a file in `profiles/`. The profile is the
@@ -34,10 +35,62 @@ The runtime reaches `ACTIVE` when the initial mode's controllers are active
 and publishes `/runtime_status`; `/runtime/set_mode`, `/runtime/stop`,
 `/runtime/get_status` and `/motion/*` are then available.
 
+### Simulation selection
+
+The runtime uses the same vocabulary as generic launch: `use_sim:=` selects
+simulated (`true`) or physical (`false`) execution, `sim_platform:=` selects
+which simulation platform replaces the robot when simulated. `use_sim:=false`
+means physical (no platform applies; passing a platform alongside it fails
+fast). `sdk` is the vendor SDK virtual bus behind the production hardware
+adapter — the full controller stack with no serial port and no physics.
+`gazebo` and `mujoco` are physics simulators. The profile declares the
+platforms it supports (`sim_platforms: [sdk, gazebo, mujoco]`) and a default
+(`sim_platform: sdk`); `sim_platform:=gazebo` (or `mujoco`) alone implies
+`use_sim:=true`, and a platform the profile does not declare fails before any
+process starts. The legacy `simulated:=` boolean stays a deprecated alias of
+`use_sim:=` (a warning names `use_sim`); a conflicting pair fails fast.
+`sim_platform:=gazebo` runs the same controllers, motion services, modes and
+stop behaviour against the simulator's ros2_control interface: the runtime
+starts a minimal empty world on its own (bring `IBROBOT_GAZEBO_HEADLESS=1`
+for server-only rendering), spawns the SO-101 into it and republishes the
+simulated joint effort as `joint.current`. When generic launch owns the
+world it passes `gazebo_world` and the spawn pose (`spawn_x/y/z/yaw`) and
+the runtime attaches to that world instead of starting one. Every node the
+runtime starts on this platform runs on simulation time. The Gazebo camera
+poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
+the profile); user-saved overrides under
+`~/.ros/ibrobot/sim_camera_overrides/` take precedence.
+
+`sim_platform:=mujoco` (issue #167) runs the same runtime against
+`mujoco_ros2_control`: one process is both the simulator and the controller
+manager, and the runtime starts it alone by default —
+
+```bash
+# provider alone (robot model only, no scene)
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
+# headless (no Simulate UI; camera rendering still needs a GL context,
+# so run on a desktop display or under xvfb-run)
+IBROBOT_MUJOCO_HEADLESS=1 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
+```
+
+When generic launch owns the world it passes the scene by name
+(`mujoco_scene:=<scene>`) plus the spawn pose, and the runtime composes its
+robot MJCF with that scene (e.g.
+`robot_config:=so101_single_arm_pick_banana use_sim:=true sim_platform:=mujoco`
+for the pick-and-place scene). The MuJoCo camera poses/FOV are runtime-owned
+too (`simulation.mujoco.transform` per camera; the same user-saved overrides
+apply, converted from the Gazebo convention), the plugin's single camera
+rate comes from `simulation.mujoco.camera_publish_rate` (default: the
+minimum camera fps), and the camera streams are advertised with reliable
+delivery. Every node the runtime starts on this platform runs on simulation
+time. A provider-less MuJoCo bring-up does not exist: MuJoCo is served
+through the runtime provider, and selecting `mujoco` without one fails at
+load.
+
 ## Conformance
 
 ```bash
-CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true" \
+CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true" \
 CONFORMANCE_PROFILE=$(ros2 pkg prefix so101_robot)/share/so101_robot/profiles/so101_single_arm.yaml \
 python3 -m pytest src/robot_runtime/test/test_conformance.py -q
 ```
@@ -114,7 +167,8 @@ images and joint feedback were saved.
 
 `robot_config/config/robots/so101_single_arm.yaml` selects this runtime
 (`runtime.provider: so101_robot`, `simulation.platform: sdk`) and binds its
-contract to the public interfaces above. The retained
-`so101_single_arm_legacy.yaml` is the provider-less in-config bring-up used
-by unmigrated overlays (e.g. `so101_arm_aero_hand.yaml`) until their own
-migration; it is not the new-path configuration.
+contract to the public interfaces above. Overlays such as
+`so101_rtp_distributed.yaml` layer application deltas on it, and
+`so101_arm_aero_hand.yaml` is the retained provider-less profile for setups
+whose extra hardware (the Aero Hand) is not part of this runtime; the old
+provider-less single-arm bring-up configuration has been removed.

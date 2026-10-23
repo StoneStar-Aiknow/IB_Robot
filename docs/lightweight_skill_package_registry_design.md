@@ -124,7 +124,7 @@ No silent resumption is promised after crash.
 The package layout stays logical, not a plugin marketplace:
 
 ```text
-src/skill_catalog/
+src/agent/skill_catalog/
 ├── package.xml
 ├── setup.py
 ├── skill_catalog/
@@ -508,7 +508,7 @@ deployed and the active pointer is atomically switched.
 
 | Area | Required change |
 |---|---|
-| `src/skill_catalog/**` | Add compiler, schemas, sources, snapshot models, and tests. |
+| `src/agent/skill_catalog/**` | Add compiler, schemas, sources, snapshot models, and tests. |
 | `src/robot_config/robot_config/loader.py` | Build robot context and enforce legacy/profile mutual exclusion; do not own runtime generation. |
 | `src/robot_config/robot_config/config.py` | Add typed profile and implementation-variant fields. |
 | `so101_single_arm.yaml` | Remove inline templates after migration and select a profile. |

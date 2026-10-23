@@ -41,5 +41,15 @@ setup(
             "model_service_node = inference_service.model_service_node:main",
             "recording_node = inference_service.recording_node:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the model-service
+        # nodes' launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the robot YAML
+        # (``perception_services.services``).
+        "ibrobot.launch_builders": [
+            "perception_models = inference_service.launch_builders.perception_models:PERCEPTION_MODELS_BUILDER",
+        ],
     },
 )

@@ -19,25 +19,51 @@ class InterfaceBindingError(ValueError):
         super().__init__(f"{code}: {path}: {detail}")
 
 
-_TTS_AUDIO_OUTPUT_TYPES = ("audio_common_msgs/msg/AudioData", "audio_common_msgs/msg/AudioDataStamped")
+def _audio_binding(
+    section: Mapping[str, Any],
+    section_name: str,
+    field: str,
+    expected_type: str,
+    direction: str,
+):
+    """Yield one declared audio binding field (runtime-owned-audio-io, design D4)."""
+    item = section.get(field)
+    if item is None:
+        return
+    path = f"{section_name}.{field}"
+    if not isinstance(item, dict):
+        raise InterfaceBindingError("invalid_binding", path, "must be a mapping")
+    interface_id = item.get("interface")
+    if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+        raise InterfaceBindingError("invalid_interface", path, "logical ID required")
+    if item.get("type") != expected_type:
+        raise InterfaceBindingError("type_mismatch", path, f"{expected_type.split('/')[-1]} required")
+    yield item, path, direction
 
 
 def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    voice = config.get("voice_asr") or {}
+    if isinstance(voice, Mapping) and voice.get("enabled"):
+        external_mode = str(voice.get("input_mode", "shared_audio")) == "external_vad"
+        yield from _audio_binding(
+            voice,
+            "voice_asr",
+            "audio_input",
+            # External segmented input carries SpeechAudioChunk; the streaming
+            # input is the runtime's raw stamped capture (AudioDataStamped).
+            "ibrobot_msgs/msg/SpeechAudioChunk" if external_mode else "audio_common_msgs/msg/AudioDataStamped",
+            "publish",
+        )
+    direction = config.get("speech_direction") or {}
+    if isinstance(direction, Mapping) and direction.get("enabled"):
+        yield from _audio_binding(
+            direction, "speech_direction", "audio_input", "audio_common_msgs/msg/AudioDataStamped", "publish"
+        )
     tts = config.get("voice_tts") or {}
     if isinstance(tts, Mapping) and tts.get("enabled"):
-        item = tts.get("audio_output")
-        if item is not None:
-            if not isinstance(item, dict):
-                raise InterfaceBindingError("invalid_binding", "voice_tts.audio_output", "must be a mapping")
-            interface_id = item.get("interface")
-            if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
-                raise InterfaceBindingError("invalid_interface", "voice_tts.audio_output", "logical ID required")
-            if item.get("type") not in _TTS_AUDIO_OUTPUT_TYPES:
-                raise InterfaceBindingError(
-                    "type_mismatch", "voice_tts.audio_output", "AudioData or AudioDataStamped required"
-                )
-            # The runtime subscribes to the playback topic; this consumer publishes to it.
-            yield item, "voice_tts.audio_output", "subscribe"
+        yield from _audio_binding(
+            tts, "voice_tts", "audio_output", "audio_common_msgs/msg/AudioDataStamped", "subscribe"
+        )
     contract = config.get("contract") or {}
     if not isinstance(contract, Mapping):
         return
@@ -206,7 +232,12 @@ def bind_robot_interfaces(
         interface_id = item["interface"]
         interface = descriptor["interfaces"].get(interface_id)
         if interface is None:
-            raise InterfaceBindingError("unknown_interface", path, "ID is not in the runtime description")
+            raise InterfaceBindingError(
+                "unknown_interface",
+                path,
+                "ID is not in the runtime description; this runtime does not publish it, "
+                "so the consumer must not be launched against it",
+            )
         if interface["kind"] != "topic":
             raise InterfaceBindingError("kind_mismatch", path, f"expected topic, described {interface['kind']!r}")
         if interface["direction"] != direction:
@@ -220,6 +251,11 @@ def bind_robot_interfaces(
                     f"{field}_mismatch", path, f"explicit {field} {explicit!r} differs from {interface[source]!r}"
                 )
             item[field] = interface[source]
+        # Audio format metadata rides with the interface (runtime-owned-audio-io):
+        # absent fields stay absent so consumers can tell "undeclared" apart.
+        for field in ("sample_rate_hz", "channels", "sample_format", "channel_indices"):
+            if field in interface:
+                item[field] = copy.deepcopy(interface[field])
 
         qos = copy.deepcopy(interface["qos"])
         explicit_qos = item.get("qos")
@@ -330,7 +366,12 @@ def bind_robot_interfaces(
         interface_id = item["interface"]
         interface = descriptor["interfaces"].get(interface_id)
         if interface is None:
-            raise InterfaceBindingError("unknown_interface", path, "ID is not in the runtime description")
+            raise InterfaceBindingError(
+                "unknown_interface",
+                path,
+                "ID is not in the runtime description; this runtime does not serve it, "
+                "so the consumer must not be launched against it",
+            )
         expected_kind = item.get("kind")
         if expected_kind not in {"service", "action"}:
             raise InterfaceBindingError("invalid_binding", path, "kind must be service or action")

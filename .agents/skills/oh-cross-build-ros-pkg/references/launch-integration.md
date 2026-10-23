@@ -34,10 +34,14 @@ If adding a new driver type, add its branch to `generate_camera_nodes()` rather 
 
 ## For Non-Camera Packages
 
-Add the package to the appropriate launch builder:
-- Navigation: `launch_builders/navigation.py`
-- Voice/sensors: create a new builder
-- Or add directly in `robot.launch.py`
+Business launch wiring lives in its owning package now (openspec change
+`migrate-business-launch-builders`): declare a `launch_builders/` module plus
+an `ibrobot.launch_builders` entry point in the owning package's `setup.py`
+(see robot_config's README「跨包扩展」). robot_config only keeps the registry
+framework, infrastructure entries and helpers:
+- Navigation: `robot_navigation/launch_builders/navigation.py`
+- Voice: `voice_asr_service/` / `voice_tts_service/` launch_builders
+- Or contribute a new extension entry point from the owning package
 
 ## Deployed Packages Registry
 

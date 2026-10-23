@@ -24,6 +24,13 @@
 # changes state, through our ZipVoice (models/zipvoice, also on the 310P) and
 # the runtime's speaker. The voice is an extra: when it cannot start, the
 # mirror starts without it.
+#
+# The visual interaction session ("看图说话") is part of this entry: one
+# observation round per second over the same half-resolution stream, suspended
+# unless the mirror session is MIRRORING, and its replies are spoken through
+# the mirror voice's utterance input — the same queue, the same ZipVoice, one
+# TTS client per deployment. The standalone aimdk_x2_visual_interaction.yaml
+# stays as the observation-only dev entry.
 
 robot:
   base_config: aimdk_x2_skills.yaml
@@ -95,15 +102,11 @@ robot:
   # The voice's speech output; the base turns both off. ZipVoice speaks 24 kHz
   # and the runtime's audio.play takes 16 kHz mono (/audio/play,
   # AudioDataStamped), so the playback node resamples. The speaker is the
-  # runtime's: no local ALSA node is launched. ZipVoice failing to start, or
-  # voice_tts failing to launch at all, must not take the mirror down, hence
-  # exit_on_init_failure false.
-  audio_io:
-    enabled: true
-    playback_source: runtime
-    playback_sample_rate: 16000
-    playback_channels: 1
-
+  # runtime's: the audio_output binding carries the topic, format and rate
+  # from the live description, no local ALSA node is launched, and a provider
+  # robot declares no audio_io section at all (runtime-owned-audio-io).
+  # ZipVoice failing to start, or voice_tts failing to launch at all, must not
+  # take the mirror down, hence exit_on_init_failure false.
   voice_tts:
     enabled: true
     bundle_path: models/zipvoice
@@ -117,7 +120,7 @@ robot:
 
   # Resident head-camera -> YOLOX -> PEAR frame stream.
   #
-  # Consumed by robot_config/launch_builders/motion_imitation_stream.py, which
+  # Consumed by manipulation_execution/launch_builders/motion_imitation_stream.py, which
   # launches manipulation_execution/motion_imitation_stream_node alongside the
   # two services above. The node is perception only: it publishes parameter
   # frames and commands no motion, so starting it cannot move the robot.
@@ -187,6 +190,12 @@ robot:
         lookahead_s: 0.25
         mirror: true
         vel_scale: 1.0
+        # Read the elbow's twist about the forearm as wrist_yaw too: PEAR splits a
+        # palm flip between elbow and wrist and only the wrist reached the robot.
+        # Off until checked on the real robot (docs/x2_wrist_spin_plan_A.md).
+        elbow_spin_to_wrist: false
+        # The share of the elbow's twist (past PEAR's rest twist) moved, within [0, 1].
+        elbow_spin_gain: 0.5
 
       # The neutral pose, in radians, keyed by joint name like arm_limits below.
       # The session walks the arm here when it takes over (approach) and when a
@@ -271,6 +280,16 @@ robot:
         enabled: false
       executor:
         enabled: false
+    # teleop and base_navigation are inherited through aimdk_x2_skills.yaml
+    # with their executors on (no "enabled" key reads as enabled). This entry
+    # launches neither, and visual_interaction below refuses to share an entry
+    # point with a motion producer; the mirror demo needs neither one.
+    teleop:
+      executor:
+        enabled: false
+    base_navigation:
+      executor:
+        enabled: false
 
   # The session node: WAIT / STANDBY / MIRRORING, the only publisher of the arm
   # and hand channels. mirror_start only reaches STANDBY/ready; the business
@@ -329,8 +348,67 @@ robot:
     voice:
       enabled: true
       queue_max: 8
+      # The visual interaction replies ride the same queue and the same
+      # ZipVoice as the phrases below: one TTS client per deployment. Empty
+      # would keep the voice to the four phrases.
+      utterance_topic: /visual_interaction/utterance
       phrases:
         starting: ["启动中"]
         ready: ["我准备好咯"]
         mirroring: ["开始模仿啦"]
         goodbye: ["下次再见"]
+
+  # The visual interaction session: what is worth saying about the person in
+  # the mirror. Observation only — the node resolves a camera and nothing from
+  # a motion family, and the control modes above launch no motion producer.
+  #
+  # Both wiring keys below are what makes this the combined entry rather than
+  # a second feature beside the mirror: the actor state comes from the
+  # imitation stream's PEAR pipeline (the same person the arms follow), and
+  # the rounds are suspended with MIRROR_INACTIVE unless the mirror session is
+  # MIRRORING — while the mirror is parked the camera is watched, the model is
+  # not called, and nothing is said. The replies leave on
+  # /visual_interaction/utterance, which mirror_session.voice above consumes.
+  #
+  # vl.implementation is 'fake' on a workstation; the board overlay
+  # (aimdk_x2_magicmirror_board.yaml) swaps in internvl. The stream, window
+  # and session values are the standalone entry's; the measurement notes
+  # behind them are in aimdk_x2_visual_interaction.yaml.
+  visual_interaction:
+    enabled: true
+    frame_source:
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+      # Stated, not assumed: the relay (hri_halfres_relay) publishes
+      # BEST_EFFORT/VOLATILE, and a mismatched subscription receives nothing
+      # and reports nothing.
+      qos:
+        reliability: best_effort
+        durability: volatile
+        history: keep_last
+        depth: 5
+    vl:
+      implementation: fake
+    actor_state_topic: /motion_imitation_stream/actor_state
+    mirror_state_topic: /mirror_session/state
+    round_period_sec: 1.0
+    window_sec: 2.0
+    frames_per_window: 4
+    buffer_sec: 6.0
+    stale_stream_sec: 2.0
+    status_period_sec: 5.0
+    categories:
+      - toy
+      - sign
+      - hat
+      - badge
+    session:
+      confirmation_count: 2
+      max_evidence_age_sec: 8.0
+      min_gap_sec: 10.0
+      # Still the visitor-rotation guard inside one mirror visit: a visitor who
+      # leaves for this long makes the next person a new subject.
+      absent_reset_sec: 30.0
+      # Inert here: with mirror_state_topic set, the visit begins when the
+      # mirror session takes over and ends when it is released, so the node
+      # runs without its own duration limit (see visual_interaction_node).
+      max_session_sec: 120.0

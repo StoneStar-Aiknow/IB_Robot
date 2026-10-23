@@ -1,0 +1,183 @@
+robot:
+  name: so101_single_arm
+  type: so101
+  robot_type: so_101
+  joints:
+    arm:
+    - '1'
+    - '2'
+    - '3'
+    - '4'
+    - '5'
+    gripper:
+    - '6'
+    all:
+    - '1'
+    - '2'
+    - '3'
+    - '4'
+    - '5'
+    - '6'
+  teleoperation:
+    safety:
+      joint_limits:
+        '1':
+          min: -2.0693
+          max: 2.0709
+        '2':
+          min: -1.92
+          max: 1.92
+        '3':
+          min: -1.6813
+          max: 1.6828
+        '4':
+          min: -1.65806
+          max: 1.65806
+        '5':
+          min: -2.9115
+          max: 2.9115
+        '6':
+          min: 0.0
+          max: 1.0
+  embodied:
+    debug_tracing: true
+    default_place_name: home
+    default_target_name: demo_object
+    enabled: false
+    entry_mode: hermes
+    execution:
+      gripper_closed_position: 0.15
+      gripper_open_position: 1.0
+      relative_motion_direction_mapping:
+        backward:
+        - 0.0
+        - 1.0
+        - 0.0
+        down:
+        - 0.0
+        - 0.0
+        - -1.0
+        forward:
+        - 0.0
+        - -1.0
+        - 0.0
+        left:
+        - 1.0
+        - 0.0
+        - 0.0
+        right:
+        - -1.0
+        - 0.0
+        - 0.0
+        up:
+        - 0.0
+        - 0.0
+        - 1.0
+      relative_motion_reference_frame: base
+      relative_motion_step_m: 0.03
+      task_executor_action_name: /task_executor/execute_task_plan
+    get_visual_game_result_service: /embodied/get_visual_game_result
+    named_poses:
+      home:
+        orientation:
+          w: 0.6585534402654153
+          x: -0.26790866048257905
+          y: -0.2622185975709204
+          z: -0.6525133891660432
+        position:
+          x: 0.020030733201442157
+          y: -0.11809839488683391
+          z: 0.13887055751050842
+      observe_table:
+        orientation:
+          w: 0.6567126207053827
+          x: -0.35328551634048977
+          y: -0.32020226597268203
+          z: -0.5842845082802226
+        position:
+          x: 0.02160863957360322
+          y: -0.1310933191355222
+          z: 0.33769602460194537
+      zero:
+        orientation:
+          w: 0.532757645647648
+          x: -0.4740206645801369
+          y: -0.4668084047044082
+          z: -0.523033090590171
+        position:
+          x: 0.0210077843415008
+          y: -0.278950111258735
+          z: 0.24858389783148477
+    perception:
+      conversation:
+        max_history_turns: 4
+      default_session_id: default
+      enabled: false
+      request_topic: /embodied/perception_request
+      result_topic: /embodied/perception_result
+      scene_sources:
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        require_depth: false
+        require_pointcloud: false
+        wrist_aligned_depth_topic: ''
+        wrist_camera_info_topic: ''
+        wrist_camera_topic: ''
+        wrist_pointcloud_topic: ''
+      summary_topic: /embodied/perception_summary
+      text_input_topic: /embodied/perception_text
+      vlm_api:
+        api_key_env: ''
+        base_url: http://localhost:8000/v1
+        jpeg_quality: 70
+        max_image_width: 320
+        model: Qwen3.5-9B
+        provider: openai_compatible
+    planned_task_topic: /embodied/planned_task
+    primitive_action_name: /embodied/execute_primitive
+    safety:
+      workspace:
+        x:
+        - -0.32
+        - 0.25
+        y:
+        - -0.42
+        - 0.0
+        z:
+        - 0.05
+        - 0.55
+    skill_action_name: /embodied/execute_skill
+    skill_catalog_profile: so101_single_arm
+    skill_catalog_source_mode: development
+    skill_gateway_status_service: /embodied/get_skill_gateway_status
+    start_visual_game_service: /embodied/start_visual_game
+    status_topic: /embodied/task_status
+    task_command_topic: /embodied/task_command
+    task_input_topic: /voice_command
+    timeouts:
+      default_skill_timeout_sec: 120.0
+      gripper_settle_sec: 1.5
+      model_idle_timeout_sec: 120.0
+      robot_state_freshness_sec: 0.5
+      rpc_timeout_sec: 5.0
+      scene_freshness_sec: 0.5
+      task_budget_sec: 180.0
+      visual_game_result_retention_sec: 300.0
+      visual_game_timeout_sec: 130.0
+    validate_primitive_service: /embodied/validate_primitive
+    validate_skill_service: /embodied/validate_skill
+    visual_game_event_topic: /embodied/visual_game_events
+    visual_game_result_capacity: 128
+    visual_games:
+      sorting_hat:
+        announce: true
+        enabled: false
+        handler: sorting_hat_v1
+        summary: 根据主相机中的人物形象判断其霍格沃茨学院
+  skill_required_control_mode: moveit_planning
+  control_modes:
+    moveit_planning: {}
