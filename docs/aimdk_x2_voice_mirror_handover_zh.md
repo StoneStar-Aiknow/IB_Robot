@@ -536,7 +536,8 @@ mirror_session:
 - `aimdk_robot/runtime_node.py` 已就地改成“上游修法 + 保留 `player_state()`”：与合并后的分支**逐字节一致**，
   只多一个 T6 用的 `player_state()` 访问器。原绕行补丁已删除，备份在
   `/tmp/runtime_node.py.bak-20261023-193751`。
-- 改的是源码，`install/` 里的旧文件没换——**要重编 `aimdk_robot` 并重启 runtime 才生效**，重编前板子仍是旧行为。
+- 改的是源码。这个工作区是 `--symlink-install`，`build/` 与 `install/` 里的 `.py` / `.yaml` 和 `src/` 是**硬链接/软链接（inode 相同）**，
+  所以**重启 `x2-all` 就生效，不需要重编**——只有改 `setup.py`、入口点或新增文件才需要 `colcon build`。
 
 ### 17.4 待办
 
@@ -544,3 +545,30 @@ mirror_session:
   届时板端 `runtime_node.py` 的本地改动会被上游版本覆盖，`player_state()` 要重新补，或推动上游接受它。
 - 真机验两件事：① 长时照镜子并同时说话时，`joint feedback stale: hand` 是否彻底不再出现；
   ② operator 换后脑相机后，遮挡判断与摸头是否仍正常触发。
+
+### 17.5 2026-10-23 晚：真机验证 + 镜子语音/物理触发打开
+
+**已做的验证（重启后跑的是新代码）**：
+
+| 项 | 结果 |
+|---|---|
+| 启动 | 105 节点，`runtime ACTIVE`，`faults: []` |
+| ASR | `beam_search + hotwords` 加载完成；`/voice_status: listening` |
+| 语音→LLM→TTS | 注入「你好」→ 中文回复并播报 |
+| 手势 | 「挥挥手」→ `wave_hand` 7.18 s，`SUCCEEDED` |
+| 照镜子 | 接管 `policy_stream`，`/mc/upper_body_command` 43.5 Hz |
+| 停镜子 | `set_session stop` 0.98–1.06 s，平台确认 `STAND_DEFAULT` |
+| hand 反馈 | 全日志 0 次 `joint feedback stale`、0 次 DEGRADED；hand 流实测 150 Hz |
+
+**打开的两个开关**（`aimdk_x2_voice_mirror_all.yaml`，已随合并一起入库）：
+
+- `mirror_session.voice.enabled: true` —— 四句语音恢复（启动中 / 我准备好咯 / 开始模仿啦 / 下次再见），实测全部播报。
+  代价：每句约 2 s NPU 推理，轮次开头几秒会和姿态流抢设备。
+- `mirror_session.operator.send_enabled: true` —— 物理触发真的生效（启动日志：`gestures and touches WILL call the Gateway and the session`）。
+  **注意**：operator 看后脑相机，所以“摸后脑勺”= 遮挡 = `long_cover` = **停止**轮次；双遮才是启动。
+
+**当晚发现但未修的**：个别轮次以 `MIRRORING/running -> WAIT/none (runtime_lost)` 结束——会话要求 2 s 内收到
+`/runtime_status`，而 runtime 只发 1 Hz，语音预热时板子变忙，会话自己晚到就判“runtime 丢了”。外部探针实测
+`max_gap 1.016 s`，runtime 本身正常。修法见 `aimdk_x2_handover_2026-10-23_zh.md` 第 6.2 节（`STATUS_MAX_AGE_S` 2.0 → 4.0）。
+
+**接手入口**：日常操作手册见 [`aimdk_x2_handover_2026-10-23_zh.md`](aimdk_x2_handover_2026-10-23_zh.md)（启动全链路 / 停止 / 验证 / 已知问题 / 板端补丁清单）。
