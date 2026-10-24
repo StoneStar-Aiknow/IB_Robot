@@ -42,6 +42,7 @@ setup(
             "mirror_operator_node = manipulation_execution.mirror_operator_node:main",
             "mirror_voice_node = manipulation_execution.mirror_voice_node:main",
             "placement_replay = manipulation_execution.placement_replay:main",
+            "hand_perception_node = manipulation_execution.hand_perception_node:main",
         ],
         # Cross-package launch-builder registration (openspec change
         # ``decentralize-launch-builder-registration``, design decision 4):
