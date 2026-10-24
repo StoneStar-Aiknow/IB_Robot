@@ -17,8 +17,8 @@ to neutral, and the gesture layer (labels with hysteresis -> presets from
 tracked thumb, otherwise a function of the four-finger mean only, may open
 further when the person's thumb is out (``thumb_tuck`` of the world
 keypoints); closing stays capped by the four-finger curve.
-``thumb_fold`` (off by default) adds the other direction with the fingers
-open, after hand_core (``thumb_fold.ThumbFold``).
+``thumb_fold`` (off by default) drives the tracked thumb by its tip's distance
+to the other fingers instead, after hand_core (``thumb_fold.ThumbFold``).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from ...hand_perception.npu_hands import DEFAULT_EXTERN_DIR, HAND_CORE_PY, load_extern
-from .thumb_fold import ThumbFold, thumb_pinky
+from .thumb_fold import ThumbFold, thumb_dists
 
 HAND_COUNT = 20
 AGE_WINDOW = 50  # frames in the age median
@@ -66,7 +66,7 @@ class HandFollow:
         gesture_labels: Sequence[str] | None = None,
         gesture_theta_in: float | None = None,
         thumb_follow: tuple[float, float] | None = None,
-        thumb_fold: tuple[float, float] | None = None,
+        thumb_fold: tuple[float, float, float, float] | None = None,  # pk_in, pk_out, tip_in, tip_out
         calib_path=None,
         robot_path=None,
         extern_dir=DEFAULT_EXTERN_DIR,
@@ -129,7 +129,7 @@ class HandFollow:
                 d = [thumb_tuck(obs[3]) if obs is not None and len(obs) > 3 else float("nan") for obs in (left, right)]
                 self.stream.push_thumb(t_camera, d[::-1] if self.mirror else d)
             if self.fold is not None:
-                d = [thumb_pinky(obs[3]) if obs is not None and len(obs) > 3 else float("nan") for obs in (left, right)]
+                d = [thumb_dists(obs[3]) if obs is not None and len(obs) > 3 else np.full(5, np.nan) for obs in (left, right)]
                 self.fold.push(t_camera, d[::-1] if self.mirror else d)
 
     def tick(self, now: float) -> list[float] | None:
@@ -161,4 +161,5 @@ class HandFollow:
                 "hand_stale": [bool(v) for v in self.stream.stale_last],
                 "gesture": gestures,
                 "thumb_fold_active": list(self.fold.active) if self.fold is not None else None,
+                "thumb_fold_stage": [round(v, 2) for v in self.fold.stage] if self.fold is not None else None,
             }

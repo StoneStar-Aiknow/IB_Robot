@@ -37,12 +37,14 @@ robot:
         # (thumb tip to index/middle PIP/DIP over palm length, world keypoints) on 10-24 run
         # 164923: six 0.71-0.87, fists 0.23-0.45. <= d_tuck: no change; >= d_out: thumb open.
         thumb_follow: {d_tuck: 0.45, d_out: 0.60}
-        # Thumb fold with the fingers open ("four"): hand_core keeps that thumb open. Thumb tip
-        # to pinky MCP over palm length on 10-24 run 171354: thumb in the palm 0.27-0.53, open
-        # palm / six / thumbs up 0.96-1.35. <= pk_in: fist thumb; >= pk_out: no change. Only
-        # with the four pips <= 0.4, with hand_core's 3d-thumb collision order (thumb_fold.py).
+        # Tracked thumb by its tip's distance to the fingers (zll 10-24), not the four-finger
+        # curl: thumb tip to each fingertip / pinky MCP over palm length picks a stop on
+        # open -> ok -> (middle) -> Victory thumb -> fist thumb ("four"), closer = deeper.
+        # 10-24 run 175919: touching 0.06-0.25, open palm >= 0.60, six >= 0.80; four, thumb to
+        # pinky MCP 0.13-0.44 (run 171354 up to 0.60). <= *_in: the stop; >= *_out: open.
+        # Fist / gestures stay hand_core's; collision order in thumb_fold.py.
         # Delete this line to turn it off.
-        thumb_fold: {pk_in: 0.55, pk_out: 0.85}
+        thumb_fold: {pk_in: 0.55, pk_out: 0.85, tip_in: 0.25, tip_out: 0.60}
         perception:
           parameters:
             camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed

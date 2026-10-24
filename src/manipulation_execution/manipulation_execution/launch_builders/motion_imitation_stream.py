@@ -466,16 +466,18 @@ def _thumb_follow_parameters(hands: Mapping) -> dict:
 
 
 def _thumb_fold_parameters(hands: Mapping) -> dict:
-    """``hands.thumb_fold: {pk_in, pk_out}`` (absent = off) -> the retarget node's thresholds."""
+    """``hands.thumb_fold: {pk_in, pk_out[, tip_in, tip_out]}`` (absent = off) -> the retarget node's thresholds."""
     fold = hands.get("thumb_fold")
     if fold is None:
         return {"hand_thumb_fold_pk_out": 0.0}
     if not isinstance(fold, Mapping):
         raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold must be a mapping")
     pk_in, pk_out = _positive(fold, "pk_in", 0.55), _positive(fold, "pk_out", 0.85)
-    if not pk_in < pk_out:
-        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold needs pk_in < pk_out")
-    return {"hand_thumb_fold_pk_in": pk_in, "hand_thumb_fold_pk_out": pk_out}
+    tip_in, tip_out = _positive(fold, "tip_in", 0.25), _positive(fold, "tip_out", 0.60)
+    if not (pk_in < pk_out and tip_in < tip_out):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold needs pk_in < pk_out, tip_in < tip_out")
+    return {"hand_thumb_fold_pk_in": pk_in, "hand_thumb_fold_pk_out": pk_out,
+            "hand_thumb_fold_tip_in": tip_in, "hand_thumb_fold_tip_out": tip_out}
 
 
 def _hand_parameters(hands: Mapping) -> dict:

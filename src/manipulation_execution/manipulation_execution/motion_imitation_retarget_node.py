@@ -110,9 +110,11 @@ class MotionImitationRetargetNode(Node):
         # Thumb follow (hand_core ThumbFollowConfig) thresholds on thumb_tuck; d_out <= 0 = off.
         self.declare_parameter("hand_thumb_d_tuck", 0.40)
         self.declare_parameter("hand_thumb_d_out", 0.0)
-        # Thumb fold with the fingers open (thumb_fold.ThumbFold) on thumb tip -> pinky MCP; pk_out <= 0 = off.
+        # Thumb by its tip's distance to the fingers (thumb_fold.ThumbFold): pinky MCP and tips; pk_out <= 0 = off.
         self.declare_parameter("hand_thumb_fold_pk_in", 0.55)
         self.declare_parameter("hand_thumb_fold_pk_out", 0.0)
+        self.declare_parameter("hand_thumb_fold_tip_in", 0.25)
+        self.declare_parameter("hand_thumb_fold_tip_out", 0.60)
         self.declare_parameter("hand_robot_json", "")
         self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
 
@@ -171,7 +173,8 @@ class MotionImitationRetargetNode(Node):
             d_out = float(self.get_parameter("hand_thumb_d_out").value)
             thumb = (float(self.get_parameter("hand_thumb_d_tuck").value), d_out) if d_out > 0.0 else None
             pk_out = float(self.get_parameter("hand_thumb_fold_pk_out").value)
-            fold = (float(self.get_parameter("hand_thumb_fold_pk_in").value), pk_out) if pk_out > 0.0 else None
+            fold = tuple(float(self.get_parameter(f"hand_thumb_fold_{k}").value)
+                         for k in ("pk_in", "pk_out", "tip_in", "tip_out")) if pk_out > 0.0 else None
             self._hands = HandFollow(
                 latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
                 gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
