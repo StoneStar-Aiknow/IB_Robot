@@ -67,16 +67,25 @@ class Box:
     bbox: tuple[float, float, float, float]
 
     def as_dict(self) -> dict:
-        return {"label": self.label, "conf": _round(self.confidence), "bbox": [_round(v, 1) for v in self.bbox]}
+        return {"label": self.label, "conf": _finite(self.confidence), "bbox": [_finite(v, 1) for v in self.bbox]}
 
 
 def boxes_from_report(report: dict) -> list[Box]:
     """The raw boxes recorded in a report, for replay."""
-    return [Box(str(b["label"]), float(b["conf"]), tuple(float(v) for v in b["bbox"])) for b in report["raw"]]
+    def number(value) -> float:
+        return math.nan if value is None else float(value)
+
+    return [Box(str(b["label"]), number(b["conf"]), tuple(number(v) for v in b["bbox"])) for b in report["raw"]]
 
 
 def _round(value: float, digits: int = 4) -> float:
     return round(float(value), digits)
+
+
+def _finite(value: float, digits: int = 4) -> float | None:
+    # Raw boxes are recorded before filtering; JSON has no NaN.
+    value = float(value)
+    return round(value, digits) if math.isfinite(value) else None
 
 
 class Homography:
