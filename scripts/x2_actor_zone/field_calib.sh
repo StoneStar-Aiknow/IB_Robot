@@ -117,7 +117,8 @@ do_deploy() {
     local ts stage
     ts=$(date +%m%d-%H%M%S); stage=$RUN/.deploy-$ts
     say "把 $HERE/duck/ 装到 $DUCK:$RUN（不同的旧文件备份成 .bak-$ts；区域/参数文件已有就不动）"
-    ssh "$DUCK" "mkdir -p $stage" && scp -q -r "$HERE/duck/." "$DUCK:$stage/" || die "上传失败"
+    # 目标目录不存在时 scp -r 把 duck/ 拷成它；不能写 duck/.（新版 scp 拒收文件名 "."）
+    scp -q -r "$HERE/duck" "$DUCK:$stage" || die "上传失败"
     ssh "$DUCK" "bash -s" <<EOF
 set -e
 cd $stage
