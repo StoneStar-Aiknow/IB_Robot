@@ -14,7 +14,11 @@ the ``.om`` models and ``ais_bench`` are. ``load_extern`` is the only door.
 Gesture label: ``gesture_embedder.om`` followed by the 8-way classifier head
 (BN -> ReLU -> dense -> softmax) in numpy, weights from
 ``canned_gesture_classifier.npz``. The embedder gets the pipeline's keypoints
-in crop pixels; handedness and world_hand are fed zeros.
+in crop pixels; handedness and world_hand are fed zeros (the model ignores
+them). The embedder only reads right hands: a left hand (landmark model's
+handedness < 0.5) is mirrored in x first (``as_right_hand``). Without it a
+person's left hand gets the right label at 0.5-0.6, under the 0.7 entry gate
+(10-24 run, replayed: Victory 0.01 -> 0.93 of frames over the gate).
 
 Every call must come from the thread that built the object (ACL contexts are
 per thread).
@@ -74,6 +78,15 @@ def relabel(label: str, score: float, rule: str) -> tuple[str, float]:
     return label, float(score)
 
 
+def as_right_hand(lm: np.ndarray, handed: float) -> np.ndarray:
+    """Keypoints the embedder can read: a left hand (handed < 0.5) mirrored in x about its own mean."""
+    if handed >= 0.5:
+        return lm
+    out = np.array(lm, dtype=np.float64, copy=True)
+    out[:, 0] = 2.0 * out[:, 0].mean() - out[:, 0]
+    return out
+
+
 class NpuHands:
     def __init__(self, model_dir, extern_dir, device: int = 0, rule_labels: bool = False):
         from ais_bench.infer.interface import InferSession
@@ -119,11 +132,11 @@ class NpuHands:
         out = []
         for h in hands:
             lm = np.asarray(h["lm"], dtype=np.float64)  # (21,3) crop pixels
-            label, score = self._classify(lm)
+            handed = float(h["handed"])
+            label, score = self._classify(as_right_hand(lm, handed))
             rule = str(h.get("gesture") or "")
             if self.rule_labels:
                 label, score = relabel(label, score, rule)
-            handed = float(h["handed"])
             out.append(
                 {
                     "lm": lm[:, :2].copy(),
