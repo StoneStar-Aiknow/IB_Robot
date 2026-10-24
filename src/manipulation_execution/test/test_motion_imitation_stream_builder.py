@@ -282,10 +282,12 @@ def test_bad_zone_settings_stop_the_launch_with_the_field_named(tmp_path, case, 
 
 def test_zone_profile_is_dexhand_rec_plus_the_two_board_files():
     # D15: parsed only; the files live on the board, so the builder is not run.
-    zone = load_robot_config_dict(
-        resolve_robot_config_path(config_name="aimdk_x2_magicmirror_live_quiet_dexhand_rec_zone")
-    )
-    base = load_robot_config_dict(resolve_robot_config_path(config_name="aimdk_x2_magicmirror_live_quiet_dexhand_rec"))
+    # The base is read beside the zone profile, not by name: before a build the
+    # new profile exists only in the source tree while the old one is also
+    # installed, and the two copies would differ in path.
+    zone_path = resolve_robot_config_path(config_name="aimdk_x2_magicmirror_live_quiet_dexhand_rec_zone")
+    zone = load_robot_config_dict(zone_path)
+    base = load_robot_config_dict(zone_path.parent / "aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml")
     stream = dict(zone["motion_imitation_stream"])
     assert stream.pop("actor_zone_file") == "/root/x2-actor-run/zone/actor_zone.yaml"
     assert stream.pop("actor_tuning_file") == "/root/x2-actor-run/zone/actor_tuning.yaml"
