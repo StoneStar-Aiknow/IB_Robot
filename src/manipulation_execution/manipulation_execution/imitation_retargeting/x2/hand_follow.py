@@ -41,6 +41,7 @@ class HandFollow:
         stale_s: float = 1.0,
         gestures: bool = True,
         gesture_labels: Sequence[str] | None = None,
+        gesture_theta_in: float | None = None,
         calib_path=None,
         robot_path=None,
         extern_dir=DEFAULT_EXTERN_DIR,
@@ -53,7 +54,8 @@ class HandFollow:
         self.stream = hand_core.HandStream(
             cfg, mirror=self.mirror, history_s=HISTORY_S, lookahead_s=lookahead_s, out_hz=out_hz,
             buf_span=latency_s + HISTORY_S + 1.5, stale_s=stale_s,
-            gesture=hand_core.GestureConfig() if gestures else None,
+            gesture=(hand_core.GestureConfig(**({} if gesture_theta_in is None else {"theta_in": float(gesture_theta_in)}))
+                     if gestures else None),
             gesture_labels=hand_core.GESTURE_LABELS if gesture_labels is None else gesture_labels,
         )
         self._lock = threading.Lock()

@@ -461,6 +461,7 @@ def _hand_parameters(hands: Mapping) -> dict:
         "hand_preview_topic": _required_topic(hands, "preview_topic", _DEFAULT_HAND_PREVIEW),
         "hand_gestures": _required_bool(hands, "gestures") if "gestures" in hands else True,
         "hand_gesture_labels_json": json.dumps(labels),
+        "hand_gesture_theta_in": _unit_interval(hands, "gesture_theta_in", 0.0),
         "hand_robot_json": str(hands.get("robot_presets", "") or ""),
         "hand_extern_dir": _extern_dir(hands),
     }

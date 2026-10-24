@@ -105,6 +105,8 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("hand_preview_topic", "/motion_imitation_mock/hand_command_preview")
         self.declare_parameter("hand_gestures", True)
         self.declare_parameter("hand_gesture_labels_json", '["Victory", "Thumb_Up", "Pointing_Up"]')
+        # Score a label must hold to enter its preset; <= 0 keeps hand_core's default (0.7).
+        self.declare_parameter("hand_gesture_theta_in", 0.0)
         self.declare_parameter("hand_robot_json", "")
         self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
 
@@ -159,16 +161,18 @@ class MotionImitationRetargetNode(Node):
             hand_topic = _validated_topic(hand_topic, "hand_frame_topic")
             labels = json.loads(str(self.get_parameter("hand_gesture_labels_json").value))
             robot_json = str(self.get_parameter("hand_robot_json").value).strip() or None
+            theta_in = float(self.get_parameter("hand_gesture_theta_in").value)
             self._hands = HandFollow(
                 latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
                 gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
-                robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
+                gesture_theta_in=theta_in if theta_in > 0.0 else None, robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
             )
             hand_preview = _validated_topic(self.get_parameter("hand_preview_topic").value, "hand_preview_topic")
             self._hand_publisher = self.create_publisher(Float64MultiArray, hand_preview, 10)
             self.create_subscription(HandFrame, hand_topic, self._on_hand_frame, qos_profile_sensor_data)
             self.get_logger().info(
-                f"hands: {hand_topic} -> {hand_preview}, gestures {labels if self._hands.stream.gesture else 'off'}, "
+                f"hands: {hand_topic} -> {hand_preview}, gestures {labels if self._hands.stream.gesture else 'off'} "
+                f"(theta_in {self._hands.stream.gesture.theta_in if self._hands.stream.gesture else '-'}), "
                 f"robot presets {robot_json or 'packaged'}, calib sha {self._hands.cfg.sha256[:12]}"
             )
 
