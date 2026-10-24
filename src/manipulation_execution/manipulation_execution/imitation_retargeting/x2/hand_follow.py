@@ -17,6 +17,8 @@ to neutral, and the gesture layer (labels with hysteresis -> presets from
 tracked thumb, otherwise a function of the four-finger mean only, may open
 further when the person's thumb is out (``thumb_tuck`` of the world
 keypoints); closing stays capped by the four-finger curve.
+``thumb_fold`` (off by default) adds the other direction with the fingers
+open, after hand_core (``thumb_fold.ThumbFold``).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from ...hand_perception.npu_hands import DEFAULT_EXTERN_DIR, HAND_CORE_PY, load_extern
+from .thumb_fold import ThumbFold, thumb_pinky
 
 HAND_COUNT = 20
 AGE_WINDOW = 50  # frames in the age median
@@ -63,6 +66,7 @@ class HandFollow:
         gesture_labels: Sequence[str] | None = None,
         gesture_theta_in: float | None = None,
         thumb_follow: tuple[float, float] | None = None,
+        thumb_fold: tuple[float, float] | None = None,
         calib_path=None,
         robot_path=None,
         extern_dir=DEFAULT_EXTERN_DIR,
@@ -80,6 +84,7 @@ class HandFollow:
             gesture_labels=hand_core.GESTURE_LABELS if gesture_labels is None else gesture_labels,
             thumb_follow=None if thumb_follow is None else hand_core.ThumbFollowConfig(*map(float, thumb_follow)),
         )
+        self.fold = None if thumb_fold is None else ThumbFold(cfg, out_hz, *map(float, thumb_fold))
         self._lock = threading.Lock()
         self._pear_ages: deque[float] = deque(maxlen=AGE_WINDOW)
         self._hand_ages: deque[float] = deque(maxlen=AGE_WINDOW)
@@ -123,6 +128,9 @@ class HandFollow:
             if self.stream.thumb_follow is not None:
                 d = [thumb_tuck(obs[3]) if obs is not None and len(obs) > 3 else float("nan") for obs in (left, right)]
                 self.stream.push_thumb(t_camera, d[::-1] if self.mirror else d)
+            if self.fold is not None:
+                d = [thumb_pinky(obs[3]) if obs is not None and len(obs) > 3 else float("nan") for obs in (left, right)]
+                self.fold.push(t_camera, d[::-1] if self.mirror else d)
 
     def tick(self, now: float) -> list[float] | None:
         with self._lock:
@@ -132,6 +140,9 @@ class HandFollow:
             t_out = now - (statistics.median(ages) + self.latency_s)
             self.last_t_out = t_out
             q = self.stream.emit(t_out, 1.0, False)
+            if self.fold is not None:
+                modes = [m for m, _ in self.stream.gesture_state()] or ["track", "track"]
+                q = self.fold.apply(q, t_out, modes)
         return [float(v) for v in q]
 
     def status(self, now: float) -> dict:
@@ -149,4 +160,5 @@ class HandFollow:
                 ),
                 "hand_stale": [bool(v) for v in self.stream.stale_last],
                 "gesture": gestures,
+                "thumb_fold_active": list(self.fold.active) if self.fold is not None else None,
             }

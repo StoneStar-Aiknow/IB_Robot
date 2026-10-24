@@ -465,6 +465,19 @@ def _thumb_follow_parameters(hands: Mapping) -> dict:
     return {"hand_thumb_d_tuck": d_tuck, "hand_thumb_d_out": d_out}
 
 
+def _thumb_fold_parameters(hands: Mapping) -> dict:
+    """``hands.thumb_fold: {pk_in, pk_out}`` (absent = off) -> the retarget node's thresholds."""
+    fold = hands.get("thumb_fold")
+    if fold is None:
+        return {"hand_thumb_fold_pk_out": 0.0}
+    if not isinstance(fold, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold must be a mapping")
+    pk_in, pk_out = _positive(fold, "pk_in", 0.55), _positive(fold, "pk_out", 0.85)
+    if not pk_in < pk_out:
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold needs pk_in < pk_out")
+    return {"hand_thumb_fold_pk_in": pk_in, "hand_thumb_fold_pk_out": pk_out}
+
+
 def _hand_parameters(hands: Mapping) -> dict:
     labels = hands.get("gesture_labels", ["Victory", "Thumb_Up", "Pointing_Up"])
     if not isinstance(labels, list) or not all(isinstance(label, str) and label for label in labels):
@@ -476,6 +489,7 @@ def _hand_parameters(hands: Mapping) -> dict:
         "hand_gesture_labels_json": json.dumps(labels),
         "hand_gesture_theta_in": _unit_interval(hands, "gesture_theta_in", 0.0),
         **_thumb_follow_parameters(hands),
+        **_thumb_fold_parameters(hands),
         "hand_robot_json": str(hands.get("robot_presets", "") or ""),
         "hand_extern_dir": _extern_dir(hands),
     }
