@@ -247,12 +247,19 @@ class MotionImitationRetargetNode(Node):
             sides.append((tuple(obs.curl_rad), obs.gesture, obs.gesture_score) if obs.detected else None)
         stamp = message.header.stamp
         t_camera = message.timestamp_ns * 1e-9 if message.timestamp_ns else stamp.sec + stamp.nanosec * 1e-9
-        self._hands.on_hand(self._now(), t_camera, sides[0], sides[1])
+        try:
+            self._hands.on_hand(self._now(), t_camera, sides[0], sides[1])
+        except Exception as exc:  # a hand fault must not take the arm's node down
+            self.get_logger().error(f"hand frame dropped: {exc!r}", throttle_duration_sec=1.0)
 
     def _tick(self) -> None:
         if self._hands is not None:
             # Hands first and independent of the arm: a held arm tick still sends the hands.
-            hand = self._hands.tick(self._now())
+            try:
+                hand = self._hands.tick(self._now())
+            except Exception as exc:  # the session holds the hands; the arm tick below still runs
+                hand = None
+                self.get_logger().error(f"hand tick failed: {exc!r}", throttle_duration_sec=1.0)
             if hand is not None:
                 self._hand_publisher.publish(Float64MultiArray(data=hand))
         command = self._player.tick(self._now())
