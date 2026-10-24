@@ -1,8 +1,10 @@
 """Dexterous-hand following beside the arm stream: HandFrame observations in, 20 hand radians out.
 
 The arm path is untouched. This holds its own ``hand_core.HandStream``
-(vendored from video2x2_runtime 570c53c, where ``FollowMeStream`` holds it)
-and runs it on the same output clock idea as the arm: ``t_out = now - offset``,
+(video2x2_runtime 570c53c, where ``FollowMeStream`` holds it). ``hand_core.py``
+and its ``data/*.json`` are not in this repository: they are loaded at run time
+from ``extern_dir`` (``hand_perception.npu_hands.load_extern``).
+It runs on the same output clock idea as the arm: ``t_out = now - offset``,
 ``offset`` = median age of the camera frames + ``latency_s``. The ages are the
 PEAR frames' when they arrive (the arm's clock), else the hand frames' own.
 
@@ -21,7 +23,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from ._vendor import hand_core
+from ...hand_perception.npu_hands import DEFAULT_EXTERN_DIR, HAND_CORE_PY, load_extern
 
 HAND_COUNT = 20
 AGE_WINDOW = 50  # frames in the age median
@@ -38,10 +40,12 @@ class HandFollow:
         out_hz: float,
         stale_s: float = 1.0,
         gestures: bool = True,
-        gesture_labels: Sequence[str] = hand_core.GESTURE_LABELS,
+        gesture_labels: Sequence[str] | None = None,
         calib_path=None,
         robot_path=None,
+        extern_dir=DEFAULT_EXTERN_DIR,
     ):
+        hand_core = load_extern(extern_dir, HAND_CORE_PY)
         cfg = hand_core.load_config(calib_path or hand_core.CALIB_MEDIAPIPE_PATH, robot_path)
         self.cfg = cfg
         self.latency_s = float(latency_s)
@@ -49,7 +53,8 @@ class HandFollow:
         self.stream = hand_core.HandStream(
             cfg, mirror=self.mirror, history_s=HISTORY_S, lookahead_s=lookahead_s, out_hz=out_hz,
             buf_span=latency_s + HISTORY_S + 1.5, stale_s=stale_s,
-            gesture=hand_core.GestureConfig() if gestures else None, gesture_labels=gesture_labels,
+            gesture=hand_core.GestureConfig() if gestures else None,
+            gesture_labels=hand_core.GESTURE_LABELS if gesture_labels is None else gesture_labels,
         )
         self._lock = threading.Lock()
         self._pear_ages: deque[float] = deque(maxlen=AGE_WINDOW)

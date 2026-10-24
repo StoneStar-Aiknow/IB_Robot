@@ -43,7 +43,6 @@ from sensor_msgs.msg import CompressedImage
 from ibrobot_msgs.msg import HandFrame, HandObservation, PearFrame
 
 from .hand_perception import npu_hands
-from .imitation_retargeting.x2._vendor.hand_core import CALIB_MEDIAPIPE_PATH
 
 SIDES = ("left", "right")
 CAMERA_QOS = QoSProfile(
@@ -64,10 +63,10 @@ PARAMS = {
     "pear_frame_topic": "/motion_imitation_stream/pear_frame",
     "frame_topic": "/hri/hand/frame",
     "model_dir": "/root/x2-dexhand-run/models",
-    "extern_dir": "/root/x2-dexhand-run/extern",
+    "extern_dir": npu_hands.DEFAULT_EXTERN_DIR,
     "device": 0,
     "rule_labels": False,
-    "calib_path": str(CALIB_MEDIAPIPE_PATH),
+    "calib_path": "",  # empty: extern_dir/data/dexhand_calib_mediapipe.json
     "max_bbox_age_s": 0.5,
     "min_detector_score": 0.5,
     "reset_gap_s": 1.0,
@@ -121,6 +120,7 @@ class HandPerceptionNode(Node):
     def __init__(self):
         super().__init__("hand_perception")
         p = {k: self.declare_parameter(k, v).value for k, v in PARAMS.items()}
+        p["calib_path"] = p["calib_path"] or str(Path(p["extern_dir"]) / npu_hands.CALIB_MEDIAPIPE_JSON)
         self.p = p
         self.keypoints = npu_hands.load_extern(p["extern_dir"], npu_hands.KEYPOINTS_PY)
         calib = json.loads(Path(p["calib_path"]).read_text())

@@ -447,6 +447,11 @@ def mock_hand_endpoints(robot_config: Mapping) -> dict | None:
     }
 
 
+def _extern_dir(hands: Mapping) -> str:
+    """Where the video2x2 hand files (not in this repository) are deployed."""
+    return str(hands.get("extern_dir", "") or "/root/x2-dexhand-run/extern")
+
+
 def _hand_parameters(hands: Mapping) -> dict:
     labels = hands.get("gesture_labels", ["Victory", "Thumb_Up", "Pointing_Up"])
     if not isinstance(labels, list) or not all(isinstance(label, str) and label for label in labels):
@@ -457,6 +462,7 @@ def _hand_parameters(hands: Mapping) -> dict:
         "hand_gestures": _required_bool(hands, "gestures") if "gestures" in hands else True,
         "hand_gesture_labels_json": json.dumps(labels),
         "hand_robot_json": str(hands.get("robot_presets", "") or ""),
+        "hand_extern_dir": _extern_dir(hands),
     }
 
 
@@ -469,6 +475,7 @@ def _hand_perception_nodes(hands: Mapping) -> list[Node]:
         return []
     parameters = dict(perception.get("parameters", {}) or {})
     parameters.setdefault("frame_topic", _required_topic(hands, "frame_topic", "/hri/hand/frame"))
+    parameters.setdefault("extern_dir", _extern_dir(hands))
     return [
         Node(
             package="manipulation_execution",

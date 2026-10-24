@@ -24,7 +24,7 @@ per-person state is reset before the next frame. ``~/play``
 
 **Hands (optional).** With ``hand_frame_topic`` set it also follows the
 dexterous hands: ``HandFrame`` observations go through ``x2.hand_follow``
-(hand_core) and 20 hand radians are published every tick on
+(hand_core, loaded from ``hand_extern_dir``) and 20 hand radians are published every tick on
 ``hand_preview_topic``, playing or not; the session decides when to use them.
 Empty (the default) creates neither the subscription nor the publisher.
 
@@ -106,6 +106,7 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("hand_gestures", True)
         self.declare_parameter("hand_gesture_labels_json", '["Victory", "Thumb_Up", "Pointing_Up"]')
         self.declare_parameter("hand_robot_json", "")
+        self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
 
         self._pear_topic = _validated_topic(self.get_parameter("pear_frame_topic").value, "pear_frame_topic")
         preview_topic = _validated_topic(self.get_parameter("preview_topic").value, "preview_topic")
@@ -161,7 +162,7 @@ class MotionImitationRetargetNode(Node):
             self._hands = HandFollow(
                 latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
                 gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
-                robot_path=robot_json,
+                robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
             )
             hand_preview = _validated_topic(self.get_parameter("hand_preview_topic").value, "hand_preview_topic")
             self._hand_publisher = self.create_publisher(Float64MultiArray, hand_preview, 10)

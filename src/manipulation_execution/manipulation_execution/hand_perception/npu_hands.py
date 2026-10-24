@@ -38,6 +38,9 @@ HEAD = "canned_gesture_classifier.npz"
 MODEL_FILES = (DET_OM, LM_OM, EMB_OM, HEAD)
 PIPELINE_PY = "mp_hand_pipeline.py"
 KEYPOINTS_PY = "hand_keypoints.py"
+HAND_CORE_PY = "hand_core.py"  # loaded by x2.hand_follow
+CALIB_MEDIAPIPE_JSON = "data/dexhand_calib_mediapipe.json"
+DEFAULT_EXTERN_DIR = "/root/x2-dexhand-run/extern"
 EXTERN_FILES = (PIPELINE_PY, KEYPOINTS_PY)
 
 

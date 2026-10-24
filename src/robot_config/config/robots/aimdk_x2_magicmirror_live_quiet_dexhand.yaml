@@ -4,8 +4,9 @@
 #
 # * the hand perception node (MediaPipe hand landmarks + gestures on the NPU)
 #   reads the head camera and publishes ibrobot_msgs/HandFrame;
-# * the retarget node turns the frames into 20 hand radians (hand_core,
-#   vendored from video2x2_runtime 570c53c) beside the arm stream;
+# * the retarget node turns the frames into 20 hand radians (hand_core from
+#   video2x2_runtime 570c53c, loaded at run time from
+#   /root/x2-dexhand-run/extern, not in this repo) beside the arm stream;
 # * mirror_session overlays them on every command it sends (HandOverlay):
 #   following while mirroring, neutral otherwise, B2 rate limits, unjam at
 #   takeover, neutral when hand feedback is lost;
