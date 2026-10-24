@@ -242,7 +242,54 @@ def _stream_parameters(config: Mapping, robot_config: Mapping) -> dict:
     # would make the actor unknown between every two refreshes.
     if parameters["actor_stale_sec"] <= parameters["yolox_refresh_interval_sec"]:
         raise ValueError("motion_imitation_stream.actor_stale_sec must exceed yolox_refresh_interval_sec")
+    parameters.update(_actor_zone_parameters(config, outputs))
     return parameters
+
+
+def _actor_zone_parameters(config: Mapping, other_topics: list[str]) -> dict:
+    """The standing-zone selector's parameters, only when a zone file is configured.
+
+    Without ``actor_zone_file`` nothing is emitted, so the node's parameters are
+    exactly what they were before the zone selector existed. With it, both files
+    are checked in full here, so a bad file stops the launch with its field
+    named instead of starting a node that would refuse it.
+    """
+    zone_file = config.get("actor_zone_file")
+    tuning_file = config.get("actor_tuning_file")
+    if zone_file is None:
+        if tuning_file is not None or "actor_candidates_topic" in config:
+            raise ValueError(
+                "motion_imitation_stream.actor_tuning_file and actor_candidates_topic need actor_zone_file"
+            )
+        return {}
+    parameters = {"actor_zone_file": _absolute_file(zone_file, "actor_zone_file")}
+    if tuning_file is not None:
+        parameters["actor_tuning_file"] = _absolute_file(tuning_file, "actor_tuning_file")
+    candidates = _required_topic(config, "actor_candidates_topic", "/motion_imitation_stream/actor_candidates")
+    if candidates in other_topics:
+        raise ValueError("motion_imitation_stream.actor_candidates_topic must differ from the other outputs")
+    parameters["actor_candidates_topic"] = candidates
+
+    # Imported here: launches without a zone never load it (import budget).
+    from manipulation_execution.actor_zone_config import load_tuning, load_zone
+
+    try:
+        load_zone(parameters["actor_zone_file"])
+    except ValueError as exc:
+        raise ValueError(f"motion_imitation_stream.actor_zone_file: {exc}") from exc
+    try:
+        load_tuning(parameters.get("actor_tuning_file"))
+    except ValueError as exc:
+        raise ValueError(f"motion_imitation_stream.actor_tuning_file: {exc}") from exc
+    return parameters
+
+
+def _absolute_file(value: object, key: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"motion_imitation_stream.{key} must be a non-empty string")
+    if not Path(value).is_absolute():
+        raise ValueError(f"motion_imitation_stream.{key} must be an absolute path, got {value!r}")
+    return value
 
 
 def _described_interfaces(robot_config: Mapping, consumer: str) -> Mapping:

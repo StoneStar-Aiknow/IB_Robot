@@ -23,6 +23,8 @@ from sensor_msgs.msg import CompressedImage, Image
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from manipulation_execution.actor_selector import ActorSelector
+from manipulation_execution.actor_zone_config import TuningConfig, ZoneConfig
+from manipulation_execution.actor_zone_selector import ZoneActorSelector
 from manipulation_execution.hri_vision import (
     PEAR_CROP_EXPANSION,
     PEAR_FIELD_LENGTHS,
@@ -686,3 +688,107 @@ def test_put_latest_keeps_the_newest_frame_and_reports_the_eviction():
     assert put_latest(slot, "second") is True
     assert slot.get_nowait() == "second"
     assert slot.empty()
+
+
+# ----- the standing-zone selector in the same frame path (dev plan D9, D10) -----
+
+_ZONE = ZoneConfig(
+    path="/test/actor_zone.yaml",
+    sha256="z" * 64,
+    image_size=(1000, 800),
+    crop_x=(100.0, 900.0),
+    floor_quad=((300.0, 700.0), (700.0, 700.0), (650.0, 500.0), (350.0, 500.0)),
+    near_edge_margin_px=30,
+    note="test",
+)
+# Feet at (500, 650): inside the zone; a 400 px tall person.
+_ZONE_PERSON = [440.0, 250.0, 560.0, 650.0]
+
+
+def _zone_harness(refreshes, pear_calls):
+    harness = _harness(
+        yolox=[_yolox_response(_detection("person", 0.9, _ZONE_PERSON)) for _ in range(refreshes)],
+        pear=[_pear_response() for _ in range(pear_calls)],
+    )
+    harness._candidates = []
+    harness._actor_selector = ZoneActorSelector(
+        _ZONE, TuningConfig(), 0.30, 3.0, on_report=harness._candidates.append, on_warning=None
+    )
+    return harness
+
+
+def _zone_image(seconds):
+    image = _image(width=1000, height=800)
+    image.header.stamp.sec = seconds
+    image.header.stamp.nanosec = 0
+    return image
+
+
+def test_zone_selector_feeds_pear_the_locked_box_and_the_fallback_otherwise():
+    # D9: ACQUIRING -> centred crop; LOCKED -> the target's box, source yolox.
+    harness = _zone_harness(refreshes=2, pear_calls=2)
+
+    assert harness._process_yolox_frame(_zone_image(10))
+    harness._process_pear_frame(_zone_image(10))
+    acquiring = harness._frame_publisher.published[-1]
+    assert acquiring.source == "center_fallback"
+    assert not harness._actor_publisher.published[-1].actor_present
+    assert harness._actor_publisher.published[-1].reason == "zone_acquiring"
+
+    assert harness._process_yolox_frame(_zone_image(11))
+    harness._process_pear_frame(_zone_image(11))
+    locked = harness._frame_publisher.published[-1]
+    assert locked.source == "yolox"
+    assert list(locked.bbox) == _ZONE_PERSON
+    assert locked.actor_id == 1
+    assert harness._actor_publisher.published[-1].reason == "zone_locked"
+    assert len(harness._candidates) == 2
+    assert json.loads(harness._candidates[-1])["state"] == "LOCKED"
+
+
+def test_zone_selector_in_hold_falls_back_to_the_centred_crop():
+    # D9: after missing detections release the actor, PEAR gets the fallback.
+    harness = _zone_harness(refreshes=2, pear_calls=3)
+    for seconds in (10, 11):
+        harness._process_yolox_frame(_zone_image(seconds))
+        harness._process_pear_frame(_zone_image(seconds))
+    assert harness._frame_publisher.published[-1].source == "yolox"
+
+    harness._process_pear_frame(_zone_image(20))
+    assert harness._frame_publisher.published[-1].source == "center_fallback"
+    assert harness._actor_publisher.published[-1].reason == "stale_detections"
+    assert harness._actor_selector.core.state == "HOLD"
+    assert json.loads(harness._candidates[-1])["kind"] == "unknown"
+
+
+def test_zone_selector_survives_a_camera_timestamp_restart(monkeypatch):
+    # D10, written like test_timestamp_restart_clears_old_detection_and_waits_for_fresh_yolox.
+    harness = _zone_harness(refreshes=3, pear_calls=3)
+    for seconds in (100, 101):
+        harness._process_yolox_frame(_zone_image(seconds))
+        harness._process_pear_frame(_zone_image(seconds))
+    assert harness._actor_publisher.published[-1].actor_present
+    harness._last_capture_stamp = (101, 0)
+    harness._last_encoded_at = 10.0
+    harness._received = harness._window_received = harness._out_of_order = harness._compressed_dropped = 0
+    generation = harness._source_generation
+    monkeypatch.setattr("manipulation_execution.motion_imitation_stream_node.time.monotonic", lambda: 20.0)
+    message = CompressedImage()
+    message.header.stamp.sec = 1
+    harness._on_compressed_frame(message)
+    accepted = harness._decode_queue.get_nowait()
+    assert accepted.generation == generation + 1
+    assert harness._yolox_detections is None
+
+    fresh = _zone_image(1)
+    harness._process_pear_frame(fresh, accepted.generation)
+    assert not harness._actor_publisher.published[-1].actor_present
+    assert harness._actor_publisher.published[-1].reason == "no_detections"
+    assert harness._pear_client.requests[2:] == []
+
+    # The first YOLOX on the new clock: the old tracks are gone, nobody is picked yet.
+    assert harness._process_yolox_frame(_zone_image(2))
+    harness._process_pear_frame(_zone_image(2))
+    assert harness._frame_publisher.published[-1].source == "center_fallback"
+    assert harness._actor_publisher.published[-1].reason == "zone_hold"
+    assert "stamp_backwards" in json.loads(harness._candidates[-1])["events"]
