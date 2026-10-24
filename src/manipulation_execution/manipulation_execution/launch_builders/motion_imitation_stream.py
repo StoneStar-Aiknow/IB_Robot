@@ -59,6 +59,7 @@ _DEFAULT_ANIMATION = "data/x2_mock_imitation/rec_20260914_212729_delivery.json"
 MOCK_NODE_NAME = "motion_imitation_mock"
 MOCK_PLAY_SERVICE = f"/{MOCK_NODE_NAME}/play"
 _DEFAULT_MOCK_PREVIEW = f"/{MOCK_NODE_NAME}/arm_command_preview"
+_DEFAULT_HAND_PREVIEW = f"/{MOCK_NODE_NAME}/hand_command_preview"
 
 
 def _required_bool(config: Mapping, key: str) -> bool:
@@ -420,6 +421,65 @@ def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
     }
 
 
+def _hands_config(robot_config: Mapping) -> Mapping | None:
+    """``mock_playback.hands`` if the retarget player runs and it is enabled, else None."""
+    config = _stream_config(robot_config)
+    mock = _mock_config(config) if config is not None else None
+    if mock is None or mock.get("player", "animation") != "retarget":
+        return None
+    hands = mock.get("hands", {})
+    if not isinstance(hands, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands must be a mapping")
+    if not (_required_bool(hands, "enabled") if "enabled" in hands else False):
+        return None
+    return hands
+
+
+def mock_hand_endpoints(robot_config: Mapping) -> dict | None:
+    """The session's hand overlay wiring (``hand_follow_topic`` ...), or None without hands."""
+    hands = _hands_config(robot_config)
+    if hands is None:
+        return None
+    return {
+        "hand_follow_topic": _required_topic(hands, "preview_topic", _DEFAULT_HAND_PREVIEW),
+        "hand_state_topic": _required_topic(hands, "state_topic", "/aima/hal/joint/hand/state"),
+        "hand_command_topic": _required_topic(hands, "command_topic", "/aima/hal/joint/hand/command"),
+    }
+
+
+def _hand_parameters(hands: Mapping) -> dict:
+    labels = hands.get("gesture_labels", ["Victory", "Thumb_Up", "Pointing_Up"])
+    if not isinstance(labels, list) or not all(isinstance(label, str) and label for label in labels):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.gesture_labels must list label names")
+    return {
+        "hand_frame_topic": _required_topic(hands, "frame_topic", "/hri/hand/frame"),
+        "hand_preview_topic": _required_topic(hands, "preview_topic", _DEFAULT_HAND_PREVIEW),
+        "hand_gestures": _required_bool(hands, "gestures") if "gestures" in hands else True,
+        "hand_gesture_labels_json": json.dumps(labels),
+        "hand_robot_json": str(hands.get("robot_presets", "") or ""),
+    }
+
+
+def _hand_perception_nodes(hands: Mapping) -> list[Node]:
+    """The hand perception node; its ``parameters`` mapping is passed through as given."""
+    perception = hands.get("perception", {})
+    if not isinstance(perception, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.perception must be a mapping")
+    if not (_required_bool(perception, "enabled") if "enabled" in perception else True):
+        return []
+    parameters = dict(perception.get("parameters", {}) or {})
+    parameters.setdefault("frame_topic", _required_topic(hands, "frame_topic", "/hri/hand/frame"))
+    return [
+        Node(
+            package="manipulation_execution",
+            executable="hand_perception_node",
+            name="hand_perception",
+            output="screen",
+            parameters=[parameters],
+        )
+    ]
+
+
 def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mapping) -> list[Node]:
     mock = _mock_config(config)
     if mock is None:
@@ -428,6 +488,7 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
     limits, velocity = _arm_limits(mock, joint_names)
     # Either node takes the preview contract below; mirror_session cannot tell them apart.
     player = mock.get("player", "animation")
+    extra: list[Node] = []
     parameters = {
         "pear_frame_topic": frame_topic,
         "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
@@ -449,6 +510,10 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
     elif player == "retarget":
         executable = "motion_imitation_retarget_node"
         parameters.update(_retarget_parameters(mock, robot_config))
+        hands = _hands_config(robot_config)
+        if hands is not None:
+            parameters.update(_hand_parameters(hands))
+            extra = _hand_perception_nodes(hands)
     else:
         raise ValueError("motion_imitation_stream.mock_playback.player must be 'animation' or 'retarget'")
     return [
@@ -459,13 +524,14 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
             output="screen",
             parameters=[parameters],
         )
-    ]
+    ] + extra
 
 
 __all__ = [
     "MOCK_NODE_NAME",
     "MOCK_PLAY_SERVICE",
     "generate_motion_imitation_stream_nodes",
+    "mock_hand_endpoints",
     "mock_playback_endpoints",
     "mock_reset_pose",
     "mock_velocity_limits",

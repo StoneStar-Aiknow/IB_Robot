@@ -1,0 +1,33 @@
+# AgiBot X2 "magic mirror", quiet live show, with the dexterous hands following.
+#
+# aimdk_x2_magicmirror_live_quiet.yaml plus:
+#
+# * the hand perception node (MediaPipe hand landmarks + gestures on the NPU)
+#   reads the head camera and publishes ibrobot_msgs/HandFrame;
+# * the retarget node turns the frames into 20 hand radians (hand_core,
+#   vendored from video2x2_runtime 570c53c) beside the arm stream;
+# * mirror_session overlays them on every command it sends (HandOverlay):
+#   following while mirroring, neutral otherwise, B2 rate limits, unjam at
+#   takeover, neutral when hand feedback is lost;
+# * the runtime profile x2_ultra_omnihand_dexhand requires arm feedback only,
+#   so a hand feedback dropout never faults the arms.
+#
+# Without hands: launch aimdk_x2_magicmirror_live_quiet instead of this file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live_quiet.yaml
+
+  runtime:
+    profile: x2_ultra_omnihand_dexhand
+
+  motion_imitation_stream:
+    mock_playback:
+      hands:
+        enabled: true
+        frame_topic: /hri/hand/frame
+        # The gestures with a preset on both hands in dexhand_robot.json.
+        gesture_labels: [Victory, Thumb_Up, Pointing_Up]
+        perception:
+          parameters:
+            camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+            model_dir: /root/x2-dexhand-run/models

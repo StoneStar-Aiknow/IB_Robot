@@ -22,6 +22,12 @@ per-person state is reset before the next frame. ``~/play``
 (``reset_pose_json``); false pauses. To watch it alone:
 ``ros2 service call /motion_imitation_mock/play std_srvs/srv/SetBool "{data: true}"``.
 
+**Hands (optional).** With ``hand_frame_topic`` set it also follows the
+dexterous hands: ``HandFrame`` observations go through ``x2.hand_follow``
+(hand_core) and 20 hand radians are published every tick on
+``hand_preview_topic``, playing or not; the session decides when to use them.
+Empty (the default) creates neither the subscription nor the publisher.
+
 ``~/retarget_debug`` carries every mapped frame before the buffer and the smoothing:
 ``[t_camera, t_received, t_mapped, 14 joint angles]`` (seconds, radians), for
 measuring where the delay goes.
@@ -40,7 +46,7 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool
 
-from ibrobot_msgs.msg import PearFrame
+from ibrobot_msgs.msg import HandFrame, PearFrame
 
 from .imitation_retargeting.live_player import LivePlayer
 from .imitation_retargeting.streaming import create_stream
@@ -95,6 +101,11 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("mirror", True)
         self.declare_parameter("elbow_spin_to_wrist", False)
         self.declare_parameter("elbow_spin_gain", 0.5)
+        self.declare_parameter("hand_frame_topic", "")
+        self.declare_parameter("hand_preview_topic", "/motion_imitation_mock/hand_command_preview")
+        self.declare_parameter("hand_gestures", True)
+        self.declare_parameter("hand_gesture_labels_json", '["Victory", "Thumb_Up", "Pointing_Up"]')
+        self.declare_parameter("hand_robot_json", "")
 
         self._pear_topic = _validated_topic(self.get_parameter("pear_frame_topic").value, "pear_frame_topic")
         preview_topic = _validated_topic(self.get_parameter("preview_topic").value, "preview_topic")
@@ -138,6 +149,27 @@ class MotionImitationRetargetNode(Node):
             stream, low_rad=low_rad, high_rad=high_rad, rated_rad_s=rated, vel_scale=vel_scale, rate_hz=rate_hz,
             staleness_s=staleness_sec, base_pose=reset_pose, on_mapped=self._publish_mapped,
         )
+
+        self._hands = None
+        hand_topic = str(self.get_parameter("hand_frame_topic").value).strip()
+        if hand_topic:
+            from .imitation_retargeting.x2.hand_follow import HandFollow
+
+            hand_topic = _validated_topic(hand_topic, "hand_frame_topic")
+            labels = json.loads(str(self.get_parameter("hand_gesture_labels_json").value))
+            robot_json = str(self.get_parameter("hand_robot_json").value).strip() or None
+            self._hands = HandFollow(
+                latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
+                gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
+                robot_path=robot_json,
+            )
+            hand_preview = _validated_topic(self.get_parameter("hand_preview_topic").value, "hand_preview_topic")
+            self._hand_publisher = self.create_publisher(Float64MultiArray, hand_preview, 10)
+            self.create_subscription(HandFrame, hand_topic, self._on_hand_frame, qos_profile_sensor_data)
+            self.get_logger().info(
+                f"hands: {hand_topic} -> {hand_preview}, gestures {labels if self._hands.stream.gesture else 'off'}, "
+                f"robot presets {robot_json or 'packaged'}, calib sha {self._hands.cfg.sha256[:12]}"
+            )
 
         self._preview_publisher = self.create_publisher(Float64MultiArray, preview_topic, 10)
         self._debug_publisher = self.create_publisher(Float64MultiArray, "~/retarget_debug", 50)
@@ -202,12 +234,27 @@ class MotionImitationRetargetNode(Node):
 
     def _on_pear_frame(self, message: PearFrame) -> None:
         stamp = message.header.stamp
+        if self._hands is not None:
+            self._hands.on_pear(self._now(), stamp.sec + stamp.nanosec * 1e-9)
         self._player.on_frame(
             self._now(), stamp.sec + stamp.nanosec * 1e-9, message.sequence, message.source,
             np.asarray(message.smplx_pose_raw, dtype=np.float64),
         )
 
+    def _on_hand_frame(self, message: HandFrame) -> None:
+        sides = []
+        for obs in (message.left, message.right):
+            sides.append((tuple(obs.curl_rad), obs.gesture, obs.gesture_score) if obs.detected else None)
+        stamp = message.header.stamp
+        t_camera = message.timestamp_ns * 1e-9 if message.timestamp_ns else stamp.sec + stamp.nanosec * 1e-9
+        self._hands.on_hand(self._now(), t_camera, sides[0], sides[1])
+
     def _tick(self) -> None:
+        if self._hands is not None:
+            # Hands first and independent of the arm: a held arm tick still sends the hands.
+            hand = self._hands.tick(self._now())
+            if hand is not None:
+                self._hand_publisher.publish(Float64MultiArray(data=hand))
         command = self._player.tick(self._now())
         if command is None:
             # Publishing nothing is the hold: the session gate keeps sending its last command.
@@ -224,6 +271,8 @@ class MotionImitationRetargetNode(Node):
     def _publish_status(self) -> None:
         status = self._player.status(self._now())
         status["input_topic"] = self._pear_topic
+        if self._hands is not None:
+            status["hands"] = self._hands.status(self._now())
         message = String()
         message.data = json.dumps(status, ensure_ascii=False)
         self._status_publisher.publish(message)
