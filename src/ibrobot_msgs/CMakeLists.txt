@@ -59,6 +59,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DetectionArray.msg"
   "msg/PearFrame.msg"
   "msg/ActorState.msg"
+  "msg/HandObservation.msg"
+  "msg/HandFrame.msg"
   "msg/ModelRuntimeInfo.msg"
   "msg/MaskEmbedding.msg"
   "msg/TextEmbedding.msg"

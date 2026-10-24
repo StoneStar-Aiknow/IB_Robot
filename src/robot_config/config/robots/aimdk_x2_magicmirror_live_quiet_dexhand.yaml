@@ -1,0 +1,51 @@
+# AgiBot X2 "magic mirror", quiet live show, with the dexterous hands following.
+#
+# aimdk_x2_magicmirror_live_quiet.yaml plus:
+#
+# * the hand perception node (MediaPipe hand landmarks + gestures on the NPU)
+#   reads the head camera and publishes ibrobot_msgs/HandFrame;
+# * the retarget node turns the frames into 20 hand radians (hand_core from
+#   video2x2_runtime 570c53c, loaded at run time from
+#   /root/x2-dexhand-run/extern, not in this repo) beside the arm stream;
+# * mirror_session overlays them on every command it sends (HandOverlay):
+#   following while mirroring, neutral otherwise, B2 rate limits, unjam at
+#   takeover, neutral when hand feedback is lost;
+# * the runtime profile x2_ultra_omnihand_dexhand requires arm feedback only,
+#   so a hand feedback dropout never faults the arms.
+#
+# Without hands: launch aimdk_x2_magicmirror_live_quiet instead of this file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live_quiet.yaml
+
+  runtime:
+    profile: x2_ultra_omnihand_dexhand
+
+  motion_imitation_stream:
+    mock_playback:
+      hands:
+        enabled: true
+        frame_topic: /hri/hand/frame
+        # The gestures with a preset on both hands in dexhand_robot.json.
+        gesture_labels: [Victory, Thumb_Up, Pointing_Up]
+        # Score a label must hold (0.15 s) to enter its preset; hand_core's default is 0.7.
+        # The person's left hand scores ~0.65 on a held Victory (10-24 run 162444), so 0.7
+        # left the robot's right hand following; 0.6 entered on 0.97 of those frames.
+        gesture_theta_in: 0.6
+        # Thumb follow: the tracked thumb otherwise follows the four-finger mean only, so a
+        # "six" (three fingers curled, thumb out) folded the robot thumb halfway. thumb_tuck
+        # (thumb tip to index/middle PIP/DIP over palm length, world keypoints) on 10-24 run
+        # 164923: six 0.71-0.87, fists 0.23-0.45. <= d_tuck: no change; >= d_out: thumb open.
+        thumb_follow: {d_tuck: 0.45, d_out: 0.60}
+        # Tracked thumb by its tip's distance to the fingers (zll 10-24), not the four-finger
+        # curl: thumb tip to each fingertip / pinky MCP over palm length picks a stop on
+        # open -> ok -> (middle) -> Victory thumb -> fist thumb ("four"), closer = deeper.
+        # 10-24 run 175919: touching 0.06-0.25, open palm >= 0.60, six >= 0.80; four, thumb to
+        # pinky MCP 0.13-0.44 (run 171354 up to 0.60). <= *_in: the stop; >= *_out: open.
+        # Fist / gestures stay hand_core's; collision order in thumb_fold.py.
+        # Delete this line to turn it off.
+        thumb_fold: {pk_in: 0.55, pk_out: 0.85, tip_in: 0.25, tip_out: 0.60}
+        perception:
+          parameters:
+            camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+            model_dir: /root/x2-dexhand-run/models
