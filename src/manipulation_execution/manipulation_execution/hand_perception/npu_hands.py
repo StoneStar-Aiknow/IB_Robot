@@ -132,6 +132,11 @@ class NpuHands:
                     "gesture": label,
                     "gesture_score": score,
                     "rule": rule,
+                    # raw pipeline values, for the debug record (dump.py)
+                    "lm3": lm.copy(),
+                    "handed": handed,
+                    "presence": float(h.get("presence", np.nan)),
+                    "roi": np.asarray(h.get("roi", ()), dtype=np.float64),
                 }
             )
         return out

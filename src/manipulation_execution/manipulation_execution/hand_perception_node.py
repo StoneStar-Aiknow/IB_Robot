@@ -42,7 +42,7 @@ from sensor_msgs.msg import CompressedImage
 
 from ibrobot_msgs.msg import HandFrame, HandObservation, PearFrame
 
-from .hand_perception import npu_hands
+from .hand_perception import dump, npu_hands
 
 SIDES = ("left", "right")
 CAMERA_QOS = QoSProfile(
@@ -71,6 +71,10 @@ PARAMS = {
     "min_detector_score": 0.5,
     "reset_gap_s": 1.0,
     "log_period_s": 5.0,
+    # debug record (hand_perception/dump.py); empty: off
+    "dump_dir": "",
+    "dump_crops": False,
+    "dump_crop_every": 2,
 }
 
 
@@ -145,6 +149,11 @@ class HandPerceptionNode(Node):
         self.dropped = self.resets = self.frame_count = 0
         self.labels = {s: ("", 0.0) for s in SIDES}
         self.stats = Stats()
+        self._found = None  # (found, pick, crop rect) of the frame being processed, for the dump
+        self.dump = None
+        if p["dump_dir"]:
+            self.dump = dump.FrameDump(p["dump_dir"], bool(p["dump_crops"]), int(p["dump_crop_every"]))
+            self.get_logger().info(f"debug record -> {self.dump.dir} (crops={self.dump.crops})")
 
         self.pub = self.create_publisher(HandFrame, p["frame_topic"], FRAME_QOS)
         self.create_subscription(PearFrame, p["pear_frame_topic"], self._on_pear, qos_profile_sensor_data)
@@ -236,6 +245,7 @@ class HandPerceptionNode(Node):
         stamp = stamp_ns(msg.header)
         box, age, valid = self._person_box(stamp)
         hands, n_hands, decode_ms, infer_ms = dict.fromkeys(SIDES), 0, 0.0, 0.0
+        img, self._found = None, None
         if valid:
             prev = self._prev_stamp
             if prev is not None and (stamp < prev or stamp - prev > float(self.p["reset_gap_s"]) * 1e9):
@@ -264,6 +274,10 @@ class HandPerceptionNode(Node):
         out.decode_ms, out.infer_ms = float(decode_ms), float(infer_ms)
         out.latency_ms = float((time.perf_counter() - t_arrival) * 1000)
         self.pub.publish(out)
+        if self.dump is not None:
+            found, pick, rect = self._found or (None, None, None)
+            self.dump.add(stamp_ns=stamp, frame_id=out.frame_id, valid=bool(valid), box=box,
+                          crop_rect=rect, found=found, pick=pick, img=img)
         self.frame_count += 1
         self._account(out, valid, (time.time_ns() - stamp) / 1e6)
 
@@ -277,6 +291,7 @@ class HandPerceptionNode(Node):
         for f in found:
             f["lm"] = f["lm"] + (x0, y0)  # crop -> source pixels
         pick = kp.assign_sides([f["lm"] for f in found], 0.5 * (box[0] + box[2]))
+        self._found = (found, pick, (x0, y0, x1, y1))
         return {s: None if pick[s] is None else found[pick[s]] for s in SIDES}, len(found)
 
     def _observation(self, side: str, hand) -> HandObservation:
@@ -319,6 +334,8 @@ class HandPerceptionNode(Node):
         self._has_frame.set()
         if self.worker.is_alive() and self.worker is not threading.current_thread():
             self.worker.join(timeout=2.0)
+        if self.dump is not None:
+            self.dump.close()
         super().destroy_node()
 
 

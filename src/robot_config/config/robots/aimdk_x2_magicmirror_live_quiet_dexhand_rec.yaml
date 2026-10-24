@@ -1,0 +1,18 @@
+# aimdk_x2_magicmirror_live_quiet_dexhand.yaml plus the hand perception node's
+# debug record (hand_perception/dump.py): one JSON line per frame with every
+# hand found, its keypoints, raw handedness and side, and small JPEG crops
+# around the hands, under /root/x2-dexhand-run/dump/<start time>-<pid>/.
+# For comparing the two hands offline; the crops stay on the board and are
+# deleted after the analysis. Everything else is the dexhand file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live_quiet_dexhand.yaml
+
+  motion_imitation_stream:
+    mock_playback:
+      hands:
+        perception:
+          parameters:
+            dump_dir: /root/x2-dexhand-run/dump
+            dump_crops: true
+            dump_crop_every: 2
