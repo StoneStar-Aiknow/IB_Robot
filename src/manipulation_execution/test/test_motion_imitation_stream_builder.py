@@ -286,8 +286,11 @@ def test_zone_profile_is_dexhand_rec_plus_the_two_board_files():
     # new profile exists only in the source tree while the old one is also
     # installed, and the two copies would differ in path.
     zone_path = resolve_robot_config_path(config_name="aimdk_x2_magicmirror_live_quiet_dexhand_rec_zone")
-    zone = load_robot_config_dict(zone_path)
-    base = load_robot_config_dict(zone_path.parent / "aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml")
+    # Live profiles bind their logical interfaces at launch, as in the test above.
+    zone = load_robot_config_dict(zone_path, defer_interface_binding=True)
+    base = load_robot_config_dict(
+        zone_path.parent / "aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml", defer_interface_binding=True
+    )
     stream = dict(zone["motion_imitation_stream"])
     assert stream.pop("actor_zone_file") == "/root/x2-actor-run/zone/actor_zone.yaml"
     assert stream.pop("actor_tuning_file") == "/root/x2-actor-run/zone/actor_tuning.yaml"
