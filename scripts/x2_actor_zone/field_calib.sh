@@ -134,7 +134,7 @@ cp zone/actor_zone.lab-1024.yaml $RUN/zone/
 rm -rf $stage
 EOF
     echo "   start.sh 还依赖：/root/x2-dexhand-wt（actor-select 分支已构建）、/root/x2-dexhand-run/{models,pydeps,extern}、"
-    echo "   /root/visual-talk-run/{rt_watch,fb_watch}.py、/root/x2-retarget-run/mc_state.py。见 README 第 6 节"
+    echo "   /root/visual-talk-run/{rt_watch,fb_watch}.py、/root/x2-retarget-run/mc_state.py。见 README 第 5 节"
 }
 
 case "${1:-all}" in
