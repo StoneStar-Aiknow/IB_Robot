@@ -61,7 +61,13 @@ class FrameDump:
         self._t = threading.Thread(target=self._write, name="hand-dump", daemon=True)
         self._t.start()
 
-    def add(self, *, stamp_ns: int, frame_id: int, valid: bool, box, crop_rect, found, pick, img) -> None:
+    def add(self, **kw) -> None:
+        try:
+            self._add(**kw)
+        except Exception:  # noqa: BLE001  debug output must never stop the stream
+            self.dropped += 1
+
+    def _add(self, *, stamp_ns: int, frame_id: int, valid: bool, box, crop_rect, found, pick, img) -> None:
         rec = {"t": time.time(), "stamp_ns": int(stamp_ns), "frame_id": int(frame_id), "valid": bool(valid)}
         crops = []
         if valid and found is not None:
