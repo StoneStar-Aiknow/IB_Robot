@@ -107,6 +107,9 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("hand_gesture_labels_json", '["Victory", "Thumb_Up", "Pointing_Up"]')
         # Score a label must hold to enter its preset; <= 0 keeps hand_core's default (0.7).
         self.declare_parameter("hand_gesture_theta_in", 0.0)
+        # Thumb follow (hand_core ThumbFollowConfig) thresholds on thumb_tuck; d_out <= 0 = off.
+        self.declare_parameter("hand_thumb_d_tuck", 0.40)
+        self.declare_parameter("hand_thumb_d_out", 0.0)
         self.declare_parameter("hand_robot_json", "")
         self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
 
@@ -162,10 +165,12 @@ class MotionImitationRetargetNode(Node):
             labels = json.loads(str(self.get_parameter("hand_gesture_labels_json").value))
             robot_json = str(self.get_parameter("hand_robot_json").value).strip() or None
             theta_in = float(self.get_parameter("hand_gesture_theta_in").value)
+            d_out = float(self.get_parameter("hand_thumb_d_out").value)
+            thumb = (float(self.get_parameter("hand_thumb_d_tuck").value), d_out) if d_out > 0.0 else None
             self._hands = HandFollow(
                 latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
                 gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
-                gesture_theta_in=theta_in if theta_in > 0.0 else None, robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
+                gesture_theta_in=theta_in if theta_in > 0.0 else None, thumb_follow=thumb, robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
             )
             hand_preview = _validated_topic(self.get_parameter("hand_preview_topic").value, "hand_preview_topic")
             self._hand_publisher = self.create_publisher(Float64MultiArray, hand_preview, 10)
@@ -173,6 +178,7 @@ class MotionImitationRetargetNode(Node):
             self.get_logger().info(
                 f"hands: {hand_topic} -> {hand_preview}, gestures {labels if self._hands.stream.gesture else 'off'} "
                 f"(theta_in {self._hands.stream.gesture.theta_in if self._hands.stream.gesture else '-'}), "
+                f"thumb follow {thumb or 'off'}, "
                 f"robot presets {robot_json or 'packaged'}, calib sha {self._hands.cfg.sha256[:12]}"
             )
 
@@ -249,7 +255,8 @@ class MotionImitationRetargetNode(Node):
     def _on_hand_frame(self, message: HandFrame) -> None:
         sides = []
         for obs in (message.left, message.right):
-            sides.append((tuple(obs.curl_rad), obs.gesture, obs.gesture_score) if obs.detected else None)
+            sides.append((tuple(obs.curl_rad), obs.gesture, obs.gesture_score, tuple(obs.world_landmarks))
+                         if obs.detected else None)
         stamp = message.header.stamp
         t_camera = message.timestamp_ns * 1e-9 if message.timestamp_ns else stamp.sec + stamp.nanosec * 1e-9
         try:

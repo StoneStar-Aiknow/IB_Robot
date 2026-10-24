@@ -452,6 +452,19 @@ def _extern_dir(hands: Mapping) -> str:
     return str(hands.get("extern_dir", "") or "/root/x2-dexhand-run/extern")
 
 
+def _thumb_follow_parameters(hands: Mapping) -> dict:
+    """``hands.thumb_follow: {d_tuck, d_out}`` (absent = off) -> the retarget node's thresholds."""
+    thumb = hands.get("thumb_follow")
+    if thumb is None:
+        return {"hand_thumb_d_out": 0.0}
+    if not isinstance(thumb, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_follow must be a mapping")
+    d_tuck, d_out = _positive(thumb, "d_tuck", 0.40), _positive(thumb, "d_out", 0.55)
+    if not d_tuck < d_out:
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_follow needs d_tuck < d_out")
+    return {"hand_thumb_d_tuck": d_tuck, "hand_thumb_d_out": d_out}
+
+
 def _hand_parameters(hands: Mapping) -> dict:
     labels = hands.get("gesture_labels", ["Victory", "Thumb_Up", "Pointing_Up"])
     if not isinstance(labels, list) or not all(isinstance(label, str) and label for label in labels):
@@ -462,6 +475,7 @@ def _hand_parameters(hands: Mapping) -> dict:
         "hand_gestures": _required_bool(hands, "gestures") if "gestures" in hands else True,
         "hand_gesture_labels_json": json.dumps(labels),
         "hand_gesture_theta_in": _unit_interval(hands, "gesture_theta_in", 0.0),
+        **_thumb_follow_parameters(hands),
         "hand_robot_json": str(hands.get("robot_presets", "") or ""),
         "hand_extern_dir": _extern_dir(hands),
     }

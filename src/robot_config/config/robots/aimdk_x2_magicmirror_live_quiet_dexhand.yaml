@@ -32,6 +32,11 @@ robot:
         # The person's left hand scores ~0.65 on a held Victory (10-24 run 162444), so 0.7
         # left the robot's right hand following; 0.6 entered on 0.97 of those frames.
         gesture_theta_in: 0.6
+        # Thumb follow: the tracked thumb otherwise follows the four-finger mean only, so a
+        # "six" (three fingers curled, thumb out) folded the robot thumb halfway. thumb_tuck
+        # (thumb tip to index/middle PIP/DIP over palm length, world keypoints) on 10-24 run
+        # 164923: six 0.71-0.87, fists 0.23-0.45. <= d_tuck: no change; >= d_out: thumb open.
+        thumb_follow: {d_tuck: 0.45, d_out: 0.60}
         perception:
           parameters:
             camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed

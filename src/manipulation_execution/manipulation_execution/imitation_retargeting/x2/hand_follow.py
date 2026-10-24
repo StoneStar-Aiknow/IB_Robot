@@ -12,6 +12,11 @@ Everything else is hand_core as upstream: curl per finger -> joint map, window
 smoothing, B2 rate limits, a hand whose data is invalid for ``stale_s`` going
 to neutral, and the gesture layer (labels with hysteresis -> presets from
 ``dexhand_robot.json``). ``tick`` returns None until the first hand frame.
+
+``thumb_follow`` (off by default) wires hand_core's ThumbFollowConfig: the
+tracked thumb, otherwise a function of the four-finger mean only, may open
+further when the person's thumb is out (``thumb_tuck`` of the world
+keypoints); closing stays capped by the four-finger curve.
 """
 
 from __future__ import annotations
@@ -28,6 +33,21 @@ from ...hand_perception.npu_hands import DEFAULT_EXTERN_DIR, HAND_CORE_PY, load_
 HAND_COUNT = 20
 AGE_WINDOW = 50  # frames in the age median
 HISTORY_S = 1.0  # followme_core's history_s
+_THUMB_NEAR = [6, 7, 10, 11]  # index / middle PIP and DIP
+_PALM = (0, 9)  # wrist -> middle MCP
+
+
+def thumb_tuck(world_landmarks) -> float:
+    """21 x 3 world keypoints -> thumb tip's nearest distance to the index / middle PIP / DIP over palm
+    length (video2x2 hand_keypoints.thumb_tuck). NaN when missing or degenerate."""
+    a = np.asarray(world_landmarks, dtype=np.float64)
+    if a.size != 63 or not np.all(np.isfinite(a)):
+        return float("nan")
+    a = a.reshape(21, 3)
+    palm = float(np.linalg.norm(a[_PALM[1]] - a[_PALM[0]]))
+    if palm < 1e-4:
+        return float("nan")
+    return float(np.linalg.norm(a[_THUMB_NEAR] - a[4], axis=1).min() / palm)
 
 
 class HandFollow:
@@ -42,6 +62,7 @@ class HandFollow:
         gestures: bool = True,
         gesture_labels: Sequence[str] | None = None,
         gesture_theta_in: float | None = None,
+        thumb_follow: tuple[float, float] | None = None,
         calib_path=None,
         robot_path=None,
         extern_dir=DEFAULT_EXTERN_DIR,
@@ -57,6 +78,7 @@ class HandFollow:
             gesture=(hand_core.GestureConfig(**({} if gesture_theta_in is None else {"theta_in": float(gesture_theta_in)}))
                      if gestures else None),
             gesture_labels=hand_core.GESTURE_LABELS if gesture_labels is None else gesture_labels,
+            thumb_follow=None if thumb_follow is None else hand_core.ThumbFollowConfig(*map(float, thumb_follow)),
         )
         self._lock = threading.Lock()
         self._pear_ages: deque[float] = deque(maxlen=AGE_WINDOW)
@@ -76,7 +98,8 @@ class HandFollow:
             self._pear_ages.append(now - t_camera)
 
     def on_hand(self, now: float, t_camera: float, left, right) -> None:
-        """One HandFrame. ``left`` / ``right`` (the person's) are ``(curl_rad[5], label, score)`` or None."""
+        """One HandFrame. ``left`` / ``right`` (the person's) are ``(curl_rad[5], label, score[, world_landmarks[63]])``
+        or None."""
         with self._lock:
             self._hand_ages.append(now - t_camera)
             self.frames += 1
@@ -97,6 +120,9 @@ class HandFollow:
                     for obs in (left, right)
                 ]
                 self.stream.push_gesture(t_camera, human[::-1] if self.mirror else human)
+            if self.stream.thumb_follow is not None:
+                d = [thumb_tuck(obs[3]) if obs is not None and len(obs) > 3 else float("nan") for obs in (left, right)]
+                self.stream.push_thumb(t_camera, d[::-1] if self.mirror else d)
 
     def tick(self, now: float) -> list[float] | None:
         with self._lock:
