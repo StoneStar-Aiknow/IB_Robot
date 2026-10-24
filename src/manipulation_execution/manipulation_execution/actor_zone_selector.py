@@ -14,7 +14,9 @@ detections, or detections more than ``stale_sec`` older than the frame, are
 unknown, never present, and release a locked actor.
 
 Each refresh produces one report (the raw boxes plus every track and the
-decision). It goes to ``on_report``, which the node wires to the
+decision), and each unknown frame that changes the state produces one record
+with ``"kind": "unknown"``, its frame stamp and events; together they replay to
+the same answers. Both go to ``on_report``, which the node wires to the
 ``actor_candidates`` publisher; the selector never touches ROS publishers
 itself, so the node's frame path stays unchanged.
 """
@@ -57,6 +59,8 @@ class ZoneActorSelector:
             raise ValueError("actor_stale_sec must be finite and greater than zero")
         self._stale_sec = stale
         self._core = ZoneCore(zone, tuning, person_confidence_threshold)
+        self._zone_sha256 = zone.sha256
+        self._tuning_sha256 = tuning.sha256
         self._on_report = on_report
         self._on_warning = on_warning
 
@@ -68,11 +72,11 @@ class ZoneActorSelector:
         """Decide the actor for ``frame`` from the newest YOLOX ``detections``."""
         frame_stamp = stamp_seconds(frame.header.stamp)
         if detections is None:
-            self._core.unknown(frame_stamp)
+            self._unknown_step(frame_stamp, REASON_NO_DETECTIONS)
             return self._unknown(frame, None, REASON_NO_DETECTIONS)
         detections_stamp = stamp_seconds(detections.header.stamp)
         if frame_stamp - detections_stamp > self._stale_sec:
-            self._core.unknown(frame_stamp)
+            self._unknown_step(frame_stamp, REASON_STALE)
             return self._unknown(frame, detections.header.stamp, REASON_STALE)
         if detections_stamp != self._core.last_stamp:
             boxes = [
@@ -94,6 +98,22 @@ class ZoneActorSelector:
             confidence=core.confidence,
             reason=core.reason,
         )
+
+    def _unknown_step(self, frame_stamp: float, reason: str) -> None:
+        # Only a change of state is recorded, so a replay can apply the same
+        # unknown() at the same frame stamp; repeats change nothing.
+        events = self._core.unknown(frame_stamp)
+        if events:
+            self._emit({
+                "kind": "unknown",
+                "frame_stamp": frame_stamp,
+                "reason": reason,
+                "zone_sha256": self._zone_sha256,
+                "tuning_sha256": self._tuning_sha256,
+                "state": self._core.state,
+                "events": events,
+                "warnings": [],
+            })
 
     def _emit(self, report: dict) -> None:
         # The report is a record: failing to publish it must not cost the frame its decision.
