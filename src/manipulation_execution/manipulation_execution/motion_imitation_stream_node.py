@@ -121,6 +121,10 @@ class MotionImitationStreamNode(Node):
         self.declare_parameter("decoder_params_json", "{}")
         self.declare_parameter("actor_state_topic", "/motion_imitation_stream/actor_state")
         self.declare_parameter("actor_stale_sec", _DEFAULT_ACTOR_STALE_SEC)
+        # Empty: the original highest-confidence ActorSelector, unchanged.
+        self.declare_parameter("actor_zone_file", "")
+        self.declare_parameter("actor_tuning_file", "")
+        self.declare_parameter("actor_candidates_topic", "/motion_imitation_stream/actor_candidates")
         self.declare_parameter("frame_topic", "/motion_imitation_stream/pear_frame")
         self.declare_parameter("status_topic", "/motion_imitation_stream/status")
         self.declare_parameter("yolox_detect_service", "/perception/hri/yolox_detect")
@@ -167,9 +171,8 @@ class MotionImitationStreamNode(Node):
         if type(publish_fallback) is not bool:
             raise ValueError("publish_fallback_frames must be a boolean")
         self._publish_fallback_frames = publish_fallback
-        self._actor_selector = ActorSelector(
-            self._person_confidence_threshold, self.get_parameter("actor_stale_sec").value
-        )
+        self._actor_zone_summary = ""
+        self._actor_selector = self._create_actor_selector()
 
         self._stats_lock = threading.RLock()
         self._source_generation = 0
@@ -262,6 +265,44 @@ class MotionImitationStreamNode(Node):
             f"motion imitation stream services: yolox={yolox_service} pear={pear_service} "
             f"yolox_refresh={self._yolox_refresh_interval_sec:.2f}s rpc_timeout={self._rpc_timeout:.2f}s"
         )
+        if self._actor_zone_summary:
+            self.get_logger().info(f"motion imitation stream actor zone: {self._actor_zone_summary}")
+
+    def _create_actor_selector(self):
+        zone_file = str(self.get_parameter("actor_zone_file").value).strip()
+        tuning_file = str(self.get_parameter("actor_tuning_file").value).strip()
+        stale_sec = self.get_parameter("actor_stale_sec").value
+        if not zone_file:
+            if tuning_file:
+                raise ValueError("actor_tuning_file is set but actor_zone_file is not")
+            return ActorSelector(self._person_confidence_threshold, stale_sec)
+        # Imported only here so a node without a zone loads exactly what it did before.
+        from manipulation_execution.actor_zone_config import load_tuning, load_zone
+        from manipulation_execution.actor_zone_selector import ZoneActorSelector
+
+        zone = load_zone(zone_file)
+        tuning, warnings = load_tuning(tuning_file or None)
+        for warning in warnings:
+            self.get_logger().warning(f"actor tuning: {warning}")
+        candidates_topic = _validated_topic(
+            self.get_parameter("actor_candidates_topic").value, "actor_candidates_topic"
+        )
+        self._candidates_publisher = self.create_publisher(String, candidates_topic, 10)
+        self._actor_zone_summary = (
+            f"zone={zone.path} sha256={zone.sha256} tuning={tuning.path or '(defaults)'} "
+            f"sha256={tuning.sha256 or '-'} candidates={candidates_topic}"
+        )
+        return ZoneActorSelector(
+            zone,
+            tuning,
+            self._person_confidence_threshold,
+            stale_sec,
+            on_report=self._publish_actor_candidates,
+            on_warning=lambda warning: self.get_logger().warning(f"actor zone: {warning}"),
+        )
+
+    def _publish_actor_candidates(self, report: str) -> None:
+        self._candidates_publisher.publish(String(data=report))
 
     def _source_available(self) -> bool:
         if not self._require_unique_publisher:
