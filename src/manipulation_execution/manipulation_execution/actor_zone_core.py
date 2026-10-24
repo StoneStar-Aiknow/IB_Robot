@@ -72,6 +72,7 @@ class Box:
 
 def boxes_from_report(report: dict) -> list[Box]:
     """The raw boxes recorded in a report, for replay."""
+
     def number(value) -> float:
         return math.nan if value is None else float(value)
 
@@ -344,7 +345,9 @@ class ZoneCore:
             "raw": [b.as_dict() for b in boxes],
             "persons_count": self._persons_count,
             "tracks": [self._obs_report(o, o.track.track_id == self._target and handoff) for o in observations],
-            "unmatched_tracks": [{"track": t.track_id, "misses": t.misses} for t in unmatched if t.track_id in self._tracks],
+            "unmatched_tracks": [
+                {"track": t.track_id, "misses": t.misses} for t in unmatched if t.track_id in self._tracks
+            ],
             "pairs": pairs,
             "state": self._state,
             "bad": self._bad,
@@ -407,7 +410,9 @@ class ZoneCore:
             used_boxes.add(index)
             uv = geometry.uv(foot_x, boxes[index].bbox[3])
             observations.append(
-                _Observation(self._tracks[track_id], index, boxes[index], foot_x, uv, in_zone(uv), dist, dx, dy, h_ratio)
+                _Observation(
+                    self._tracks[track_id], index, boxes[index], foot_x, uv, in_zone(uv), dist, dx, dy, h_ratio
+                )
             )
         unmatched = [track for track in self._tracks.values() if track.track_id not in used_tracks]
         for index, box in banded:

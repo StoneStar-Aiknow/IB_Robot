@@ -29,7 +29,6 @@ from manipulation_execution.actor_zone_core import (
     ACQUIRING,
     GRACE,
     HOLD,
-    IDLE,
     LOCKED,
     NO_ACTOR,
     Box,
@@ -108,10 +107,11 @@ def other_track(report):
 
 # ---------------------------------------------------------------- A2: the homography
 
+
 def test_trapezoid_corners_map_to_the_unit_square_corners():
     quad = ((452.0, 932.0), (892.0, 932.0), (812.0, 682.0), (532.0, 682.0))
     h = Homography(quad)
-    for (x, y), expected in zip(quad, ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))):
+    for (x, y), expected in zip(quad, ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)), strict=True):
         u, v = h.to_zone(x, y)
         assert u == pytest.approx(expected[0], abs=1e-9)
         assert v == pytest.approx(expected[1], abs=1e-9)
@@ -140,6 +140,7 @@ def test_rectangle_zone_of_these_tests_is_linear_in_x_and_y():
 
 
 # ---------------------------------------------------------------- B: picking and holding on
+
 
 def test_same_stamp_twenty_times_changes_nothing_and_reports_once():
     core = ZoneCore(ZONE, DEFAULTS, THRESHOLD)
@@ -514,6 +515,7 @@ def test_grace_outside_the_zone_reports_this_refresh_box_and_confidence():
 
 # ---------------------------------------------------------------- C: occlusion, release, hold
 
+
 def legs_blocked(feed):
     """C1: someone steps right in front of the actor and hides their legs."""
     a = person(672.0, 807.0)
@@ -841,7 +843,7 @@ def test_tracks_do_not_leak_over_ten_thousand_random_refreshes():
 
         # Every surviving non-target track was matched or created in one of the
         # last keep + 1 refreshes, and each refresh feeds one box per track.
-        window = (window + [sum(1 for b in boxes if _tracked(b))])[-(keep + 1):]
+        window = (window + [sum(1 for b in boxes if _tracked(b))])[-(keep + 1) :]
         assert core.track_count <= sum(window) + 1
         assert core.present == (core.state in (LOCKED, GRACE))
         if not core.present:

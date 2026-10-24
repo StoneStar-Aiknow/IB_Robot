@@ -118,7 +118,7 @@ def _read(path: str | Path, what: str) -> tuple[str, str, object]:
 
 
 def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 def _number(path: str, field: str, value: object) -> float:
@@ -128,7 +128,7 @@ def _number(path: str, field: str, value: object) -> float:
 
 
 def _pair(path: str, field: str, value: object) -> tuple[float, float]:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
+    if not isinstance(value, list | tuple) or len(value) != 2:
         raise ZoneConfigError(f"{path}: {field}: must be a list of two numbers, got {value!r}")
     return _number(path, f"{field}[0]", value[0]), _number(path, f"{field}[1]", value[1])
 
@@ -144,7 +144,9 @@ def load_zone(path: str | Path) -> ZoneConfig:
         raise ZoneConfigError(f"{path}: zone file must be a mapping, got {type(data).__name__}")
     unknown = sorted(str(key) for key in data if key not in _ZONE_REQUIRED + _ZONE_OPTIONAL)
     if unknown:
-        raise ZoneConfigError(f"{path}: {unknown[0]}: unknown key (allowed: {', '.join(_ZONE_REQUIRED + _ZONE_OPTIONAL)})")
+        raise ZoneConfigError(
+            f"{path}: {unknown[0]}: unknown key (allowed: {', '.join(_ZONE_REQUIRED + _ZONE_OPTIONAL)})"
+        )
     for key in _ZONE_REQUIRED:
         if key not in data:
             raise ZoneConfigError(f"{path}: {key}: missing")
@@ -155,7 +157,7 @@ def load_zone(path: str | Path) -> ZoneConfig:
 
     size = data["image_size"]
     if (
-        not isinstance(size, (list, tuple))
+        not isinstance(size, list | tuple)
         or len(size) != 2
         or not all(_is_number(v) and not isinstance(v, float) and v > 0 for v in size)
     ):
@@ -167,26 +169,34 @@ def load_zone(path: str | Path) -> ZoneConfig:
         raise ZoneConfigError(f"{path}: crop_x: must satisfy 0 <= L < R <= {width}, got [{left:g}, {right:g}]")
 
     quad_raw = data["floor_quad"]
-    if not isinstance(quad_raw, (list, tuple)) or len(quad_raw) != 4:
+    if not isinstance(quad_raw, list | tuple) or len(quad_raw) != 4:
         raise ZoneConfigError(f"{path}: floor_quad: must be 4 points ({', '.join(QUAD_CORNERS)}), got {quad_raw!r}")
-    quad = tuple(_pair(path, f"floor_quad.{name}", point) for name, point in zip(QUAD_CORNERS, quad_raw))
-    for name, (x, y) in zip(QUAD_CORNERS, quad):
+    quad = tuple(_pair(path, f"floor_quad.{name}", point) for name, point in zip(QUAD_CORNERS, quad_raw, strict=True))
+    for name, (x, y) in zip(QUAD_CORNERS, quad, strict=True):
         if not (0.0 <= x <= width and 0.0 <= y <= height):
             raise ZoneConfigError(f"{path}: floor_quad.{name}: ({x:g}, {y:g}) is outside the {width}x{height} image")
         if not left <= x <= right:
             raise ZoneConfigError(f"{path}: floor_quad.{name}: x {x:g} is outside crop_x [{left:g}, {right:g}]")
     near_left, near_right, far_right, far_left = quad
     if not (near_left[0] < near_right[0] and far_left[0] < far_right[0]):
-        raise ZoneConfigError(f"{path}: floor_quad: left points must be left of right points (order is {', '.join(QUAD_CORNERS)})")
+        raise ZoneConfigError(
+            f"{path}: floor_quad: left points must be left of right points (order is {', '.join(QUAD_CORNERS)})"
+        )
     if not (near_left[1] > far_left[1] and near_right[1] > far_right[1]):
-        raise ZoneConfigError(f"{path}: floor_quad: near points must be below far points (order is {', '.join(QUAD_CORNERS)})")
+        raise ZoneConfigError(
+            f"{path}: floor_quad: near points must be below far points (order is {', '.join(QUAD_CORNERS)})"
+        )
     crosses = [_cross(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4]) for i in range(4)]
     if not (all(c > 0.0 for c in crosses) or all(c < 0.0 for c in crosses)):
-        raise ZoneConfigError(f"{path}: floor_quad: the 4 points must form a convex quadrilateral (no dents, crossings or 3 points on a line)")
+        raise ZoneConfigError(
+            f"{path}: floor_quad: the 4 points must form a convex quadrilateral (no dents, crossings or 3 points on a line)"
+        )
 
     margin = data.get("near_edge_margin_px", DEFAULT_NEAR_EDGE_MARGIN_PX)
     if not _is_number(margin) or isinstance(margin, float) or margin < MIN_NEAR_EDGE_MARGIN_PX:
-        raise ZoneConfigError(f"{path}: near_edge_margin_px: must be an integer >= {MIN_NEAR_EDGE_MARGIN_PX}, got {margin!r}")
+        raise ZoneConfigError(
+            f"{path}: near_edge_margin_px: must be an integer >= {MIN_NEAR_EDGE_MARGIN_PX}, got {margin!r}"
+        )
     for name, (_, y) in (("near_left", near_left), ("near_right", near_right)):
         if y > height - margin:
             raise ZoneConfigError(
@@ -234,9 +244,8 @@ def load_tuning(path: str | Path | None) -> tuple[TuningConfig, list[str]]:
                 raise ZoneConfigError(f"{path}: {key}: must not be null")
             values[key] = None
             continue
-        if kind == "int":
-            if not _is_number(value) or isinstance(value, float):
-                raise ZoneConfigError(f"{path}: {key}: must be an integer, got {value!r}")
+        if kind == "int" and (not _is_number(value) or isinstance(value, float)):
+            raise ZoneConfigError(f"{path}: {key}: must be an integer, got {value!r}")
         number = _number(path, key, value)
         below = number < low if low_in else number <= low
         above = high is not None and (number > high if high_in else number >= high)

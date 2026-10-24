@@ -14,9 +14,9 @@ tall box whose feet are at the box's bottom centre.
 
 import json
 
-from ibrobot_msgs.msg import Detection2D, DetectionArray
 from sensor_msgs.msg import Image
 
+from ibrobot_msgs.msg import Detection2D, DetectionArray
 from manipulation_execution.actor_zone_config import TuningConfig, ZoneConfig
 from manipulation_execution.actor_zone_core import (
     ACQUIRING,

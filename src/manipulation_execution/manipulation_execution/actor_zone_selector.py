@@ -80,8 +80,7 @@ class ZoneActorSelector:
             return self._unknown(frame, detections.header.stamp, REASON_STALE)
         if detections_stamp != self._core.last_stamp:
             boxes = [
-                Box(str(d.label), float(d.confidence), tuple(float(v) for v in d.bbox))
-                for d in detections.detections
+                Box(str(d.label), float(d.confidence), tuple(float(v) for v in d.bbox)) for d in detections.detections
             ]
             report = self._core.step(detections_stamp, (int(frame.width), int(frame.height)), boxes)
             if report is not None:
@@ -104,16 +103,18 @@ class ZoneActorSelector:
         # unknown() at the same frame stamp; repeats change nothing.
         events = self._core.unknown(frame_stamp)
         if events:
-            self._emit({
-                "kind": "unknown",
-                "frame_stamp": frame_stamp,
-                "reason": reason,
-                "zone_sha256": self._zone_sha256,
-                "tuning_sha256": self._tuning_sha256,
-                "state": self._core.state,
-                "events": events,
-                "warnings": [],
-            })
+            self._emit(
+                {
+                    "kind": "unknown",
+                    "frame_stamp": frame_stamp,
+                    "reason": reason,
+                    "zone_sha256": self._zone_sha256,
+                    "tuning_sha256": self._tuning_sha256,
+                    "state": self._core.state,
+                    "events": events,
+                    "warnings": [],
+                }
+            )
 
     def _emit(self, report: dict) -> None:
         # The report is a record: failing to publish it must not cost the frame its decision.
