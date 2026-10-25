@@ -63,8 +63,9 @@
   <!-- Gazebo simulation -->
   <exec_depend>gz_ros2_control</exec_depend>
 
-  <!-- MuJoCo simulation -->
-  <exec_depend>mujoco_ros2_control</exec_depend>
+  <!-- MuJoCo simulation. 0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1);
+       rosdep does not enforce versions, the runtime check is the guard. -->
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
 
   <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>

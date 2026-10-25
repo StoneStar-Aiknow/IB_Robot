@@ -2,7 +2,7 @@
 
 Mirrors ``robot_runtime.gazebo`` (openspec change ``so101-gazebo-runtime-
 transport`` D6.1): the camera pose resolution, MJCF camera generation, URDF
-camera TF, the ros2_control camera sensor blocks and the depth fan-out relays
+camera TF, the simulator CameraPlugin parameters and the depth fan-out relays
 are robot-agnostic algorithms living in the contract layer. Robot-specific
 values (the MJCF template, meshes, SDF mesh names and the default camera
 poses) come from the runtime profile.
@@ -20,14 +20,22 @@ Conventions:
   world pose (the MJCF world is the true world; the robot base carries the
   spawn pose). Their URDF TF is anchored under the model-local ``world`` link
   using the inverse of the full spawn transform, exactly as on Gazebo.
+
+Simulator baseline: ``mujoco_ros2_control`` 0.1.2 / ``mujoco_vendor`` 0.1.1
+(libmujoco 3.12.0). Cameras are configured through the simulator's
+``mujoco_ros2_control_plugins/CameraPlugin`` parameters, never through the
+deprecated URDF ``<sensor>`` auto-registration; ``simulator_versions`` /
+``check_simulator_versions`` keep the composed ``.mjb`` on exactly the
+simulator's MuJoCo version.
 """
 
 from __future__ import annotations
 
 import math
-import os
+import re
 import tempfile
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -218,14 +226,140 @@ def camera_tf_urdf(peripherals: list, *, spawn_pose: tuple[float, float, float, 
 
 
 # ---------------------------------------------------------------------------
-# ros2_control camera sensor blocks (D5 primary path, spike T0)
+# Simulator versions (D1/D2): the CameraPlugin release line and one MuJoCo
 # ---------------------------------------------------------------------------
+
+# mujoco_ros2_control 0.1.0 moved cameras into the CameraPlugin; the
+# generated plugin parameters only work from that release on.
+_CAMERA_PLUGIN_MIN_CONTROL_VERSION = "0.1.0"
+
+_APT_UPGRADE_HINT = (
+    "sudo apt install --only-upgrade ros-humble-mujoco-ros2-control "
+    "ros-humble-mujoco-ros2-control-msgs ros-humble-mujoco-ros2-control-plugins ros-humble-mujoco-vendor"
+)
+
+
+@dataclass(frozen=True)
+class SimulatorVersions:
+    """The simulator release the composed ``.mjb`` must agree with (D2).
+
+    ``control`` is the ``mujoco_ros2_control`` package version (the CameraPlugin
+    release line starts at 0.1.0); ``mujoco`` is the ``X.Y.Z`` of the libmujoco
+    that ``mujoco_vendor`` ships. Each field is ``None`` when its package or
+    file cannot be found — an unknown version must never pass the check.
+    """
+
+    control: str | None = None
+    mujoco: str | None = None
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """The leading dotted-numeric parts of a version (``0.1.2-1`` → ``(0, 1, 2)``)."""
+    key: list[int] = []
+    for part in version.strip().split("."):
+        leading = part[: len(part) - len(part.lstrip("0123456789"))]
+        if not leading:
+            break
+        key.append(int(leading))
+    return tuple(key)
+
+
+def simulator_versions() -> SimulatorVersions:
+    """Read the simulator release from the ament index.
+
+    ``control`` comes from the ``<version>`` of the ``mujoco_ros2_control``
+    ``package.xml``; ``mujoco`` from the ``libmujoco.so.X.Y.Z`` under
+    ``<prefix>/opt/mujoco_vendor/lib``. Missing packages or files leave the
+    field ``None`` instead of guessing.
+    """
+    control: str | None = None
+    mujoco: str | None = None
+    try:
+        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+
+        package_xml = Path(get_package_share_directory("mujoco_ros2_control")) / "package.xml"
+        version = (ET.parse(package_xml).getroot().findtext("version") or "").strip()
+        control = version or None
+    except (PackageNotFoundError, OSError, ET.ParseError):
+        control = None
+    try:
+        from ament_index_python.packages import PackageNotFoundError, get_package_prefix
+
+        lib_dir = Path(get_package_prefix("mujoco_vendor")) / "opt" / "mujoco_vendor" / "lib"
+        candidates = sorted(
+            (
+                match.group(1)
+                for path in lib_dir.glob("libmujoco.so.*")
+                if (match := re.fullmatch(r"libmujoco\.so\.(\d+\.\d+\.\d+)", path.name))
+            ),
+            key=_version_key,
+        )
+        mujoco = candidates[-1] if candidates else None
+    except (PackageNotFoundError, OSError):
+        mujoco = None
+    return SimulatorVersions(control=control, mujoco=mujoco)
+
+
+def check_simulator_versions(versions: SimulatorVersions | None = None) -> None:
+    """Fail fast unless the simulator can load the composed model (D2).
+
+    Two invariants: the simulator is a CameraPlugin release
+    (``mujoco_ros2_control`` >= 0.1.0), and the Python ``mujoco`` that
+    compiles the ``.mjb`` has exactly the version of the simulator's
+    libmujoco. Any violation raises ``RuntimeProfileError`` with an
+    installation diagnostic before the model is composed; nothing is a
+    silent no-op on the provider path.
+    """
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    if versions is None:
+        versions = simulator_versions()
+    if versions.control is None:
+        raise RuntimeProfileError(
+            "mujoco_ros2_control not found; install ros-humble-mujoco-ros2-control >= 0.1.2 "
+            f"({_APT_UPGRADE_HINT} once installed)"
+        )
+    if _version_key(versions.control) < _version_key(_CAMERA_PLUGIN_MIN_CONTROL_VERSION):
+        raise RuntimeProfileError(
+            f"mujoco_ros2_control {versions.control} is older than the CameraPlugin release "
+            f"({_CAMERA_PLUGIN_MIN_CONTROL_VERSION}); run the apt upgrade: {_APT_UPGRADE_HINT}"
+        )
+    if versions.mujoco is None:
+        raise RuntimeProfileError(
+            "mujoco_vendor libmujoco not found under <prefix>/opt/mujoco_vendor/lib; "
+            "install ros-humble-mujoco-vendor 0.1.1 "
+            f"({_APT_UPGRADE_HINT} once installed)"
+        )
+    try:
+        import mujoco  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeProfileError(
+            f"the MuJoCo embodiment needs the mujoco Python package ({exc}); "
+            f"install mujoco=={versions.mujoco} (requirements/mujoco-sim.txt)"
+        ) from exc
+    if mujoco.__version__ != versions.mujoco:
+        raise RuntimeProfileError(
+            f"Python mujoco {mujoco.__version__} != mujoco_vendor libmujoco {versions.mujoco}; "
+            "the composed .mjb would not load. "
+            f"Install mujoco=={versions.mujoco} (requirements/mujoco-sim.txt); a venv set up with the "
+            "LIBERO benchmark dependencies cannot run the MuJoCo simulation"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cameras through the simulator CameraPlugin (D3, mujoco_ros2_control 0.1.2)
+# ---------------------------------------------------------------------------
+
+# One fixed CameraPlugin instance carries every enabled camera; the per-camera
+# parameter key is the MJCF camera name (``camera_mjcf_elements``).
+CAMERA_PLUGIN_INSTANCE = "ibrobot_cameras"
+CAMERA_PLUGIN_TYPE = "mujoco_ros2_control_plugins/CameraPlugin"
 
 
 def camera_depth_topics(periph: dict) -> tuple[str, bool]:
-    """The (depth_topic, advertised) pair for one camera's sensor block.
+    """The (depth_topic, advertised) pair for one camera's plugin entry.
 
-    The 0.0.3 plugin always publishes one depth stream per camera, so the
+    The plugin always publishes one depth stream per camera, so the
     ``depth_topic`` param is always set: to the advertised native-depth
     endpoint when the camera advertises depth, otherwise to a runtime-private,
     never-advertised topic (D5).
@@ -238,48 +372,40 @@ def camera_depth_topics(periph: dict) -> tuple[str, bool]:
     return f"/_runtime/mujoco/{name}/depth", False
 
 
-def camera_sensor_blocks_urdf(robot_urdf: str, peripherals: list) -> str:
-    """Inject the ros2_control ``<sensor>`` blocks for the enabled cameras.
+def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
+    """The nested ``mujoco_plugins`` CameraPlugin parameter tree (D3).
 
-    Every block carries all four parameters the 0.0.3 plugin reads
-    (``frame_name``, ``image_topic``, ``info_topic``, ``depth_topic``): the
-    frame is the shared advertised frame (5b.3: ``advertised_camera_frame``,
-    identical to hardware/sdk/gazebo — opencv → ``frame_id``, realsense →
-    optical); the image/info topics are the
-    advertised color endpoints; the depth topic follows
-    ``camera_depth_topics``. The single CameraInfo publisher serves the color
-    endpoint; the depth/aligned-depth info endpoints are filled by the relay
-    fan-out (``mujoco_camera_relays``).
+    One plugin instance carries every enabled camera. The per-camera key is
+    the MJCF camera name (``<name>_camera``, what ``camera_mjcf_elements``
+    writes), and the four values are exactly the ones the 0.0.3 ``<sensor>``
+    blocks carried: the frame is the shared advertised frame (5b.3:
+    ``advertised_camera_frame`` — opencv → ``frame_id``, realsense →
+    optical), the image/info topics are the advertised color endpoints, and
+    the depth topic follows ``camera_depth_topics``. The single publish rate
+    is ``mujoco_camera_publish_rate``. An empty camera list returns ``{}``
+    (no plugin is configured, and with ``auto_register_cameras=false`` no
+    deprecated auto-registration fills in).
     """
     cameras = _enabled_cameras(peripherals)
     if not cameras:
-        return robot_urdf
-    try:
-        root = ET.fromstring(robot_urdf)
-    except ET.ParseError as exc:
-        raise RuntimeError(f"cannot inject MuJoCo camera sensors: {exc}") from exc
-    ros2_control = root.find(".//ros2_control")
-    if ros2_control is None:
-        raise RuntimeError("cannot inject MuJoCo camera sensors: no <ros2_control> element in the URDF")
+        return {}
+    from robot_runtime.gazebo import advertised_camera_frame
+
+    instance: dict[str, Any] = {
+        "type": CAMERA_PLUGIN_TYPE,
+        "camera_publish_rate": float(mujoco_camera_publish_rate({**profile, "peripherals": peripherals})),
+    }
     for periph in cameras:
         name = periph["name"]
-        from robot_runtime.gazebo import advertised_camera_frame
-
-        advertised_frame = advertised_camera_frame(periph)
         depth_topic, _advertised = camera_depth_topics(periph)
-        sensor = ET.SubElement(ros2_control, "sensor")
-        sensor.set("name", f"{name}_camera")
-        for key, value in (
-            ("frame_name", advertised_frame),
-            ("image_topic", f"/camera/{name}/image_raw"),
-            ("info_topic", f"/camera/{name}/camera_info"),
-            ("depth_topic", depth_topic),
-        ):
-            param = ET.SubElement(sensor, "param")
-            param.set("name", key)
-            param.text = value
-    ET.indent(root, space="  ")
-    return ET.tostring(root, encoding="unicode")
+        instance[f"{name}_camera"] = {
+            "policy": "streaming",
+            "frame_name": advertised_camera_frame(periph),
+            "image_topic": f"/camera/{name}/image_raw",
+            "info_topic": f"/camera/{name}/camera_info",
+            "depth_topic": depth_topic,
+        }
+    return {"mujoco_plugins": {CAMERA_PLUGIN_INSTANCE: instance}}
 
 
 # ---------------------------------------------------------------------------
@@ -296,24 +422,6 @@ def mujoco_camera_publish_rate(profile: dict) -> float:
         return float(configured)
     fps = [float(p.get("fps", 30)) for p in _enabled_cameras(profile.get("peripherals") or [])]
     return min(fps) if fps else 5.0
-
-
-# ---------------------------------------------------------------------------
-# Plugin path (D2): MUJOCO_PLUGIN_PATH comes from the mujoco Python package
-# ---------------------------------------------------------------------------
-
-
-def find_mujoco_plugin_path() -> str:
-    """Locate the MuJoCo plugin directory (libstl_decoder.so etc.), or ''."""
-    try:
-        import mujoco  # noqa: PLC0415
-
-        plugin_dir = os.path.join(os.path.dirname(mujoco.__file__), "plugin")
-        if os.path.isdir(plugin_dir):
-            return plugin_dir
-    except ImportError:
-        pass
-    return ""
 
 
 # ---------------------------------------------------------------------------

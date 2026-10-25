@@ -66,7 +66,6 @@ def test_ros2_control_xacro_renders_for_every_platform():
             "simulated": "false",
             "sim_effort_state": "true",
             "mujoco_model": "/tmp/composed.mjb",
-            "camera_publish_rate": "5.0",
             "mujoco_headless": "true",
         }
     )
@@ -74,11 +73,16 @@ def test_ros2_control_xacro_renders_for_every_platform():
     assert hardware.findtext("plugin") == "mujoco_ros2_control/MujocoSystemInterface"
     params = {node.get("name"): node.text or "" for node in hardware.findall("param")}
     assert params["mujoco_model"] == "/tmp/composed.mjb"
-    assert params["camera_publish_rate"] == "5.0"
+    # cameras run through the simulator's CameraPlugin parameters; the
+    # deprecated <sensor> auto-registration is off and the rate param is gone
+    assert params["auto_register_cameras"] == "false"
+    assert "camera_publish_rate" not in params
     assert params["headless"] == "true"
     assert robot.find(".//state_interface[@name='effort']") is not None
+    assert robot.find(".//ros2_control/sensor") is None
 
-    # headless stays off by default (the viewer path)
+    # headless stays off by default (the viewer path); auto-register stays off
+    # whenever a mujoco model is configured
     robot = _render(
         {
             "use_sim": "true",
@@ -86,4 +90,12 @@ def test_ros2_control_xacro_renders_for_every_platform():
             "mujoco_model": "/tmp/composed.mjb",
         }
     )
-    assert "headless" not in {node.get("name") for node in robot.find(".//ros2_control/hardware").findall("param")}
+    hardware_params = {node.get("name") for node in robot.find(".//ros2_control/hardware").findall("param")}
+    assert "headless" not in hardware_params
+    assert "auto_register_cameras" in hardware_params
+
+    # the Gazebo plugin never carries the MuJoCo-only params
+    robot = _render({"use_sim": "true", "sim_plugin": "gz_ros2_control/GazeboSimSystem"})
+    hardware_params = {node.get("name") for node in robot.find(".//ros2_control/hardware").findall("param")}
+    assert "auto_register_cameras" not in hardware_params
+    assert "camera_publish_rate" not in hardware_params

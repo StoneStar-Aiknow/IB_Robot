@@ -61,17 +61,25 @@ poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
 the profile); user-saved overrides under
 `~/.ros/ibrobot/sim_camera_overrides/` take precedence.
 
-`sim_platform:=mujoco` (issue #167) runs the same runtime against
+`sim_platform:=mujoco` (issue #167, `mujoco_ros2_control` 0.1.2 /
+`mujoco_vendor` 0.1.1 / libmujoco 3.12.0) runs the same runtime against
 `mujoco_ros2_control`: one process is both the simulator and the controller
 manager, and the runtime starts it alone by default —
 
 ```bash
 # provider alone (robot model only, no scene)
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
-# headless (no Simulate UI; camera rendering still needs a GL context,
-# so run on a desktop display or under xvfb-run)
+# headless (no Simulate UI): camera rendering falls back to EGL when no
+# display is available, so no xvfb-run wrapper is needed (requires libegl1
+# plus a GL driver, both pulled in by the mujoco_ros2_control packages)
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
 ```
+
+The workspace Python `mujoco` must equal the simulator's libmujoco
+(`requirements/mujoco-sim.txt` pins 3.12.0); a mismatch fails the launch
+before the model is composed. A venv installed with the LIBERO benchmark
+dependencies (`mujoco<3.9`) cannot run this platform — the same check
+reports it.
 
 When generic launch owns the world it passes the scene by name
 (`mujoco_scene:=<scene>`) plus the spawn pose, and the runtime composes its

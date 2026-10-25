@@ -88,6 +88,18 @@ def xacro_value(value: Any) -> str:
     return str(value)
 
 
+def write_node_params(node_name: str, params: dict[str, Any]) -> str:
+    """Write ``params`` under ``node_name`` as a ros__parameters YAML file.
+
+    ros2_control_node creates its nodes with the executable-derived names, so
+    a parameter file keyed by the node name is the reliable way to hand over
+    parameters without a global ``__node`` remapping.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, prefix="runtime_cm_") as handle:
+        yaml.safe_dump({node_name: {"ros__parameters": params}}, handle, default_flow_style=False)
+        return handle.name
+
+
 def write_controller_manager_params(robot_description: str, extra_params: dict[str, Any] | None = None) -> str:
     """Write robot_description under the ``controller_manager`` node name.
 
@@ -99,9 +111,7 @@ def write_controller_manager_params(robot_description: str, extra_params: dict[s
     params = {"robot_description": robot_description}
     if extra_params:
         params.update(extra_params)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, prefix="runtime_cm_") as handle:
-        yaml.safe_dump({"controller_manager": {"ros__parameters": params}}, handle, default_flow_style=False)
-        return handle.name
+    return write_node_params("controller_manager", params)
 
 
 def profile_controllers(profile: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
@@ -592,21 +602,24 @@ def render_mujoco_description(
 ) -> str:
     """Render the MuJoCo-platform robot description (URDF) for RSP + the plugin (D2/D3/D5).
 
-    Steps: the runtime-private robot MJCF (template + meshes from
-    ``simulation.mujoco``, cameras injected, base at the spawn pose including
-    yaw); the composed robot+scene model (``compose_mujoco_model``, the
-    domain-keyed ``.mjb`` — a missing ``mujoco`` Python package is fatal on
-    the provider path); the xacro URDF with
-    ``sim_plugin=mujoco_ros2_control/MujocoSystemInterface``,
-    ``simulated=false``, ``mujoco_model=<composed path>``, the effective
-    ``camera_publish_rate``, ``sim_effort_state=true`` and ``mujoco_headless``
-    from ``IBROBOT_MUJOCO_HEADLESS``; the camera TF (mount + optical frames)
-    and the ros2_control camera ``<sensor>`` blocks.
+    Steps: the simulator version check (``check_simulator_versions`` — a
+    CameraPlugin-capable ``mujoco_ros2_control`` and a Python ``mujoco``
+    matching the simulator's libmujoco are hard preconditions, D2); the
+    runtime-private robot MJCF (template + meshes from ``simulation.mujoco``,
+    cameras injected, base at the spawn pose including yaw); the composed
+    robot+scene model (``compose_mujoco_model``, the domain-keyed ``.mjb`` —
+    a missing ``mujoco`` Python package is fatal on the provider path); the
+    xacro URDF with ``sim_plugin=mujoco_ros2_control/MujocoSystemInterface``,
+    ``simulated=false``, ``mujoco_model=<composed path>``,
+    ``auto_register_cameras=false`` (the deprecated sensor auto-registration
+    stays off; cameras run through the CameraPlugin parameters, D3),
+    ``sim_effort_state=true`` and ``mujoco_headless`` from
+    ``IBROBOT_MUJOCO_HEADLESS``; the camera TF (mount + optical frames). The
+    URDF carries no camera ``<sensor>`` blocks.
     """
     from robot_runtime.mujoco import (
-        camera_sensor_blocks_urdf,
         camera_tf_urdf,
-        mujoco_camera_publish_rate,
+        check_simulator_versions,
         render_robot_mjcf,
     )
     from sim_models.scene_compiler import compose_mujoco_model
@@ -614,6 +627,7 @@ def render_mujoco_description(
     description = profile.get("description") or {}
     if not description.get("xacro"):
         raise RuntimeProfileError(f"runtime profile missing required key 'description.xacro': {profile_path}")
+    check_simulator_versions()
     effective_peripherals = profile.get("peripherals") if peripherals is None else peripherals
     robot_mjcf = render_robot_mjcf(profile, spawn_pose, effective_peripherals)
     sdf_meshes = ((profile.get("simulation") or {}).get("mujoco") or {}).get("sdf_meshes") or []
@@ -625,8 +639,7 @@ def render_mujoco_description(
     composed = compose_mujoco_model(str(robot_mjcf), scene_name, sdf_meshes)
     if composed.suffix != ".mjb":
         raise RuntimeProfileError(
-            f"the MuJoCo embodiment needs the mujoco Python package (composition fell back to {composed}); "
-            "install mujoco==3.4.0 in the workspace environment"
+            f"the MuJoCo embodiment needs the mujoco Python package (composition fell back to {composed})"
         )
 
     xacro_args = {str(k): xacro_value(v) for k, v in (description.get("xacro_args") or {}).items()}
@@ -637,7 +650,6 @@ def render_mujoco_description(
             "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
             "sim_effort_state": "true",
             "mujoco_model": str(composed),
-            "camera_publish_rate": str(mujoco_camera_publish_rate({**profile, "peripherals": effective_peripherals})),
         }
     )
     if os.environ.get("IBROBOT_MUJOCO_HEADLESS", "0") == "1":
@@ -648,8 +660,14 @@ def render_mujoco_description(
     cameras_xml = camera_tf_urdf(effective_peripherals, spawn_pose=spawn_pose)
     if cameras_xml:
         robot_description = robot_description.replace("</robot>", cameras_xml + "\n</robot>", 1)
-    robot_description = camera_sensor_blocks_urdf(robot_description, effective_peripherals)
     return _resolve_package_uris(robot_description)
+
+
+# The node name mujoco_ros2_control's hardware interface hard-codes for the
+# node that carries the simulator (and CameraPlugin) parameters. Global
+# --params-file arguments reach it because it is created with default node
+# options and automatically_declare_parameters_from_overrides.
+MUJOCO_SIMULATION_NODE = "mujoco_ros2_control_node"
 
 
 def mujoco_embodiment_actions(
@@ -673,10 +691,15 @@ def mujoco_embodiment_actions(
     adapter's no-scene behaviour), with a scene the composed model already
     contains it (D3). The spawners start immediately; their
     ``--controller-manager-timeout`` waits for the in-process controller
-    manager. ``IBROBOT_MUJOCO_HEADLESS=1`` mirrors the Gazebo headless mode
-    (the headless flag is a URDF ``<hardware>`` parameter in 0.0.3).
+    manager. ``IBROBOT_MUJOCO_HEADLESS=1`` mirrors the Gazebo headless mode:
+    with no display the CameraPlugin renders through EGL (D4), so no
+    ``xvfb-run`` wrapper is needed. The cameras are configured through a
+    per-launch params file keyed under ``MUJOCO_SIMULATION_NODE`` carrying the
+    ``mujoco_plugins`` CameraPlugin tree (D3); MuJoCo plugins load from the
+    executable directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH``
+    is set.
     """
-    from robot_runtime.mujoco import find_mujoco_plugin_path, mujoco_camera_relays
+    from robot_runtime.mujoco import camera_plugin_parameters, mujoco_camera_relays
 
     if robot_description is None:
         robot_description = render_mujoco_description(profile, profile_path, spawn_pose=spawn_pose, scene=mujoco_scene)
@@ -692,10 +715,10 @@ def mujoco_embodiment_actions(
         (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
     )
     cm_params = write_controller_manager_params(robot_description)
-    additional_env: dict[str, str] = {}
-    plugin_path = find_mujoco_plugin_path()
-    if plugin_path:
-        additional_env["MUJOCO_PLUGIN_PATH"] = plugin_path
+    mujoco_node_parameters = [cm_params, controllers_config, {"use_sim_time": True}]
+    plugin_parameters = camera_plugin_parameters(profile, peripherals)
+    if plugin_parameters:
+        mujoco_node_parameters.append(write_node_params(MUJOCO_SIMULATION_NODE, plugin_parameters))
     return [
         Node(
             package="robot_state_publisher",
@@ -707,8 +730,7 @@ def mujoco_embodiment_actions(
             package="mujoco_ros2_control",
             executable="ros2_control_node",
             output="screen",
-            parameters=[cm_params, controllers_config, {"use_sim_time": True}],
-            additional_env=additional_env,
+            parameters=mujoco_node_parameters,
         ),
         *spawner_nodes(
             broadcasters,

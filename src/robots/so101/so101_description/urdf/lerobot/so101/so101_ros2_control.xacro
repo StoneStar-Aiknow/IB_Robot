@@ -24,11 +24,12 @@
          export effort. -->
     <xacro:arg name="sim_effort_state" default="false"/>
     <xacro:arg name="mujoco_model" default=""/>
-    <xacro:arg name="camera_publish_rate" default=""/>
-    <!-- mujoco_headless: the mujoco_ros2_control 0.0.3 <hardware> "headless"
-         parameter (no Simulate UI window). Camera rendering still opens a
-         hidden GLFW context, so a GL context (desktop display or xvfb-run)
-         remains required. -->
+    <!-- mujoco_headless: the mujoco_ros2_control <hardware> "headless"
+         parameter (no Simulate UI window). Camera rendering tries GLFW first
+         and falls back to EGL when no display is available, so headless
+         camera streaming needs no xvfb-run wrapper (mujoco_ros2_control
+         0.1.2). Cameras themselves are configured through the simulator's
+         CameraPlugin parameters, never through this file. -->
     <xacro:arg name="mujoco_headless" default="false"/>
 
     <ros2_control name="RobotSystem" type="system">
@@ -37,9 +38,13 @@
                 <plugin>$(arg sim_plugin)</plugin>
                 <xacro:if value="${'$(arg mujoco_model)' != ''}">
                     <param name="mujoco_model">$(arg mujoco_model)</param>
-                </xacro:if>
-                <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
-                    <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
+                    <!-- Turn the deprecated URDF <sensor> camera
+                         auto-registration off: cameras are configured through
+                         the mujoco_plugins CameraPlugin parameters
+                         (mujoco_ros2_control >= 0.1.0), and a model camera
+                         that is somehow not configured must not be silently
+                         auto-registered by the legacy path. -->
+                    <param name="auto_register_cameras">false</param>
                 </xacro:if>
                 <xacro:if value="$(arg mujoco_headless)">
                     <param name="headless">true</param>

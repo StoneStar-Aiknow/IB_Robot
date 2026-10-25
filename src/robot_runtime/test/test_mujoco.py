@@ -1,14 +1,17 @@
-"""MuJoCo platform tests (so101-mujoco-runtime-platform tasks 3.1-3.4).
+"""MuJoCo platform tests (so101-mujoco-runtime-platform tasks 3.1-3.4,
+upgrade-mujoco-ros2-control-0-1 D2/D3/D6).
 
 Covers the robot-agnostic MuJoCo helpers (pose resolution with override
-conversion, MJCF camera generation, camera TF, sensor blocks, the depth
-fan-out relays), the launch-structure contract of the MuJoCo embodiment and
-the SO-101 profile's runtime-owned MuJoCo camera defaults (golden values).
+conversion, MJCF camera generation, camera TF, the simulator version check,
+the CameraPlugin parameter tree, the depth fan-out relays), the
+launch-structure contract of the MuJoCo embodiment and the SO-101 profile's
+runtime-owned MuJoCo camera defaults (golden values).
 """
 
 from __future__ import annotations
 
 import math
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,19 +21,25 @@ from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
 from robot_runtime.launch_support import (
+    MUJOCO_SIMULATION_NODE,
     mujoco_embodiment_actions,
     render_mujoco_description,
     runtime_stack_actions,
 )
 from robot_runtime.mujoco import (
+    CAMERA_PLUGIN_INSTANCE,
+    CAMERA_PLUGIN_TYPE,
+    SimulatorVersions,
     camera_mjcf_elements,
-    camera_sensor_blocks_urdf,
+    camera_plugin_parameters,
     camera_tf_urdf,
+    check_simulator_versions,
     gazebo_rpy_to_mujoco_rpy,
     mujoco_camera_publish_rate,
     mujoco_camera_relays,
     render_robot_mjcf,
     resolve_mujoco_camera_pose,
+    simulator_versions,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -59,7 +68,6 @@ XACRO = """<?xml version="1.0"?>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="sim_effort_state" default="false"/>
   <xacro:arg name="mujoco_model" default=""/>
-  <xacro:arg name="camera_publish_rate" default=""/>
   <xacro:arg name="mujoco_headless" default="false"/>
   <link name="world"/>
   <link name="base"/>
@@ -76,9 +84,7 @@ XACRO = """<?xml version="1.0"?>
         <plugin>$(arg sim_plugin)</plugin>
         <xacro:if value="${'$(arg mujoco_model)' != ''}">
           <param name="mujoco_model">$(arg mujoco_model)</param>
-        </xacro:if>
-        <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
-          <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
+          <param name="auto_register_cameras">false</param>
         </xacro:if>
         <xacro:if value="$(arg mujoco_headless)">
           <param name="headless">true</param>
@@ -372,41 +378,124 @@ def test_disabled_cameras_emit_nothing(tmp_path):
     peripherals = [disabled, WRIST]
     assert [(parent, "wrist_camera" in xml) for parent, xml in camera_mjcf_elements(peripherals)] == [("gripper", True)]
     assert "camera_top" not in camera_tf_urdf(peripherals)
-    base_urdf = (
-        '<robot name="t"><ros2_control name="RobotSystem" type="system"><hardware>'
-        "<plugin>p</plugin></hardware></ros2_control></robot>"
-    )
-    urdf = camera_sensor_blocks_urdf(base_urdf, peripherals)
-    assert "top_camera" not in urdf and "wrist_camera" in urdf
+    parameters = camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals)
+    cameras = parameters["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert "top_camera" not in cameras and "wrist_camera" in cameras
 
 
-def test_sensor_blocks_carry_all_four_params():
-    base_urdf = (
-        '<robot name="t"><ros2_control name="RobotSystem" type="system"><hardware>'
-        "<plugin>mujoco_ros2_control/MujocoSystemInterface</plugin></hardware>"
-        '<joint name="1"><command_interface name="position"/></joint></ros2_control></robot>'
-    )
-    urdf = camera_sensor_blocks_urdf(base_urdf, [TOP, WRIST, FRONT])
-    root = ET.fromstring(urdf)
-    sensors = root.findall(".//ros2_control/sensor")
-    assert [s.get("name") for s in sensors] == ["top_camera", "wrist_camera", "front_camera"]
-    for sensor, periph in zip(sensors, [TOP, WRIST, FRONT], strict=True):
-        params = {p.get("name"): p.text for p in sensor.findall("param")}
+def test_camera_plugin_parameters_match_the_advertised_contract(tmp_path):
+    peripherals = [TOP, WRIST, FRONT]
+    profile = _profile(tmp_path, peripherals=peripherals)
+    parameters = camera_plugin_parameters(profile, peripherals)
+    assert set(parameters) == {"mujoco_plugins"}
+    instance = parameters["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert instance["type"] == CAMERA_PLUGIN_TYPE
+    assert instance["camera_publish_rate"] == mujoco_camera_publish_rate(profile)
+    assert [key for key in instance if key.endswith("_camera")] == ["top_camera", "wrist_camera", "front_camera"]
+    for periph in peripherals:
         name = periph["name"]
-        assert set(params) == {"frame_name", "image_topic", "info_topic", "depth_topic"}
+        entry = instance[f"{name}_camera"]
+        assert set(entry) == {"policy", "frame_name", "image_topic", "info_topic", "depth_topic"}
+        assert entry["policy"] == "streaming"
         # 5b.3: the shared advertised frame — opencv → frame_id, realsense → optical
         expected_frame = str(periph["optical_frame_id"] if periph.get("driver") == "realsense" else periph["frame_id"])
-        assert params["frame_name"] == expected_frame
-        assert params["image_topic"] == f"/camera/{name}/image_raw"
-        assert params["info_topic"] == f"/camera/{name}/camera_info"
+        assert entry["frame_name"] == expected_frame
+        assert entry["image_topic"] == f"/camera/{name}/image_raw"
+        assert entry["info_topic"] == f"/camera/{name}/camera_info"
         if name == "front":
             # the realsense advertises depth: the plugin's depth stream lands
             # on the advertised native-depth endpoint
-            assert params["depth_topic"] == "/camera/front/depth/image_rect_raw"
+            assert entry["depth_topic"] == "/camera/front/depth/image_rect_raw"
         else:
             # opencv cameras are color-only: the always-published depth goes
             # to the runtime-private, never-advertised topic
-            assert params["depth_topic"] == f"/_runtime/mujoco/{name}/depth"
+            assert entry["depth_topic"] == f"/_runtime/mujoco/{name}/depth"
+
+
+def test_camera_plugin_parameters_without_cameras_is_empty(tmp_path):
+    peripherals = [{**TOP, "disabled": True}, {**WRIST, "disabled": True}, {**FRONT, "disabled": True}]
+    assert camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals) == {}
+
+
+# ---------------------------------------------------------------------------
+# D2: the simulator version check
+# ---------------------------------------------------------------------------
+
+
+def test_check_simulator_versions_passes_on_a_match(monkeypatch):
+    monkeypatch.setattr(mujoco, "__version__", "3.12.0")
+    check_simulator_versions(SimulatorVersions(control="0.1.2", mujoco="3.12.0"))
+
+
+def test_check_simulator_versions_names_both_versions_on_a_mismatch(monkeypatch):
+    monkeypatch.setattr(mujoco, "__version__", "3.4.0")
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    with pytest.raises(RuntimeProfileError, match=r"Python mujoco 3\.4\.0 != mujoco_vendor libmujoco 3\.12\.0"):
+        check_simulator_versions(SimulatorVersions(control="0.1.2", mujoco="3.12.0"))
+
+
+def test_check_simulator_versions_missing_control_package_diagnoses_the_install():
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    with pytest.raises(RuntimeProfileError, match="mujoco_ros2_control not found; install"):
+        check_simulator_versions(SimulatorVersions(control=None, mujoco="3.12.0"))
+
+
+def test_check_simulator_versions_missing_vendor_library_diagnoses_the_install(monkeypatch):
+    monkeypatch.setattr(mujoco, "__version__", "3.12.0")
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    with pytest.raises(RuntimeProfileError, match="mujoco_vendor libmujoco not found"):
+        check_simulator_versions(SimulatorVersions(control="0.1.2", mujoco=None))
+
+
+def test_check_simulator_versions_too_old_control_diagnoses_the_upgrade(monkeypatch):
+    """A pre-CameraPlugin release fails even with matching MuJoCo versions."""
+    monkeypatch.setattr(mujoco, "__version__", "3.4.0")
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    with pytest.raises(RuntimeProfileError, match=r"mujoco_ros2_control 0\.0\.3 is older than the CameraPlugin"):
+        check_simulator_versions(SimulatorVersions(control="0.0.3", mujoco="3.4.0"))
+
+
+def test_check_simulator_versions_missing_python_mujoco_is_fatal(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mujoco", None)
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    with pytest.raises(RuntimeProfileError, match="needs the mujoco Python package"):
+        check_simulator_versions(SimulatorVersions(control="0.1.2", mujoco="3.12.0"))
+
+
+def test_simulator_versions_reads_a_fake_prefix_tree(tmp_path, monkeypatch):
+    """simulator_versions() reads package.xml + libmujoco from the ament index."""
+    import ament_index_python.packages as packages
+    from ament_index_python.packages import PackageNotFoundError
+
+    prefix = tmp_path / "opt-ros"
+    (prefix / "share" / "mujoco_ros2_control").mkdir(parents=True)
+    (prefix / "share" / "mujoco_ros2_control" / "package.xml").write_text(
+        '<?xml version="1.0"?><package><name>mujoco_ros2_control</name><version>0.1.2</version></package>',
+        encoding="utf-8",
+    )
+    lib_dir = prefix / "opt" / "mujoco_vendor" / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libmujoco.so.3.12.0").touch()
+    monkeypatch.setattr(packages, "get_package_share_directory", lambda name: str(prefix / "share" / name))
+    monkeypatch.setattr(packages, "get_package_prefix", lambda name: str(prefix))
+    assert simulator_versions() == SimulatorVersions(control="0.1.2", mujoco="3.12.0")
+
+    # a missing package or library leaves the field None, never a guess
+    def _raise_lookup(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(packages, "get_package_share_directory", _raise_lookup)
+    assert simulator_versions() == SimulatorVersions(control=None, mujoco="3.12.0")
+    empty_prefix = tmp_path / "empty-ros"
+    empty_prefix.mkdir()
+    monkeypatch.setattr(packages, "get_package_share_directory", lambda name: str(prefix / "share" / name))
+    monkeypatch.setattr(packages, "get_package_prefix", lambda name: str(empty_prefix))
+    assert simulator_versions() == SimulatorVersions(control="0.1.2", mujoco=None)
 
 
 def test_camera_rate_defaults_to_min_fps_and_honours_the_profile():
@@ -496,12 +585,59 @@ def test_mujoco_urdf_carries_plugin_params_and_camera_contract(tmp_path):
     assert "mujoco_model" in description and ".mjb" in description
     assert '<state_interface name="effort"' in description
     root = ET.fromstring(description)
-    sensors = root.findall(".//ros2_control/sensor")
-    assert [s.get("name") for s in sensors] == ["top_camera", "wrist_camera", "front_camera"]
+    # D3: no simulator-specific camera <sensor> blocks, and the deprecated
+    # auto-registration is explicitly off; the rate is a plugin parameter now
+    assert root.findall(".//ros2_control/sensor") == []
+    params = {param.get("name"): param.text for param in root.findall(".//ros2_control/hardware/param")}
+    assert params["auto_register_cameras"] == "false"
+    assert "camera_publish_rate" not in params
     # the camera TF links exist for every enabled camera
     for periph in (TOP, WRIST, FRONT):
         assert f'link name="{periph["frame_id"]}"' in description
         assert f'link name="{periph["optical_frame_id"]}"' in description
+
+
+def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkeypatch):
+    """D3/D6: the params file is keyed under the upstream node name and
+    carries the CameraPlugin tree (structure only — the version result is
+    injected and the composition faked, so no installed simulator needed)."""
+    import yaml
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+
+    # structure only: the injected simulator version follows this module's
+    # imported mujoco (already importorskip'ed), and the composition is faked
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    profile = _profile(tmp_path)
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    actions = mujoco_embodiment_actions(
+        profile, tmp_path / "profile.yaml", robot_description=description, mujoco_scene=""
+    )
+    simulator_nodes = [node for node in _nodes(actions) if node._Node__node_executable == "ros2_control_node"]
+    assert [node._Node__package for node in simulator_nodes] == ["mujoco_ros2_control"]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    def _param_file_paths(node):
+        # launch_ros normalizes a parameter-file path to a list of substitutions
+        return [
+            "".join(getattr(part, "text", None) or str(part) for part in entry.param_file)
+            for entry in node._Node__parameters
+            if isinstance(entry, ParameterFile)
+        ]
+
+    param_files = [Path(path) for path in _param_file_paths(simulator_nodes[0])]
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in yaml.safe_load(path.read_text())]
+    assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
+    tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
 
 
 def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
@@ -548,18 +684,24 @@ def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
     assert "camera.front.depth_info" in interfaces
     assert "camera.front.aligned_depth_info" in interfaces
 
-    # every advertised camera endpoint is produced by a sensor block or a
+    # every advertised camera endpoint is produced by a plugin entry or a
     # relay; private depth topics (color-only cameras) are never advertised
-    base_urdf = (
-        '<robot name="t"><ros2_control name="RobotSystem" type="system"><hardware>'
-        "<plugin>p</plugin></hardware></ros2_control></robot>"
-    )
-    urdf = camera_sensor_blocks_urdf(base_urdf, peripherals)
-    produced = {
-        p.text
-        for p in ET.fromstring(urdf).findall(".//ros2_control/sensor/param")
-        if p.get("name") != "frame_name" and not p.text.startswith("/_runtime/")
-    }
+    peripherals = [TOP, WRIST, FRONT]
+    produced: set[str] = set()
+    for entry in camera_plugin_parameters(
+        {
+            "runtime": {"name": "test_robot", "version": "0.1.0"},
+            "capabilities": {},
+            "joints": ["1"],
+            "peripherals": peripherals,
+        },
+        peripherals,
+    )["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE].values():
+        if isinstance(entry, dict):
+            produced.add(entry["image_topic"])
+            produced.add(entry["info_topic"])
+            if not entry["depth_topic"].startswith("/_runtime/"):
+                produced.add(entry["depth_topic"])
     relay_nodes = mujoco_camera_relays(peripherals)
     for node in relay_nodes:
         args = node._Node__arguments

@@ -295,9 +295,29 @@ def test_shipped_profile_declares_mujoco_and_keeps_the_golden_camera_poses():
     assert (front["roll"], front["pitch"], front["yaw"]) == (0.0, 0.0, 3.1415)
 
 
+def _inject_simulator_versions(monkeypatch):
+    """Pin the version discovery for structure tests (task 1.4).
+
+    The check itself stays real: only the ament-index lookups are faked, and
+    the fake MuJoCo version follows the machine's Python mujoco so the strict
+    equality inside check_simulator_versions still holds. Pure structure
+    tests must not depend on the machine's simulator install.
+    """
+    import mujoco
+
+    import robot_runtime.mujoco as mujoco_helpers
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+
+
 def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
     import sim_models.scene_compiler as scene_compiler
 
+    _inject_simulator_versions(monkeypatch)
     captured = {}
 
     def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
@@ -319,6 +339,7 @@ def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
     """5b.2 revision: no scene composes the `empty` scene (lit ground), never robot-only."""
     import sim_models.scene_compiler as scene_compiler
 
+    _inject_simulator_versions(monkeypatch)
     captured = {}
 
     def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
@@ -328,6 +349,68 @@ def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
     _render({"use_sim": "true", "sim_platform": "mujoco"})
     assert captured["scene"] == "empty"
+
+
+def test_mujoco_version_mismatch_fails_the_launch_setup(monkeypatch):
+    """D2: a simulator/python MuJoCo mismatch fails before model composition."""
+    import mujoco
+    import pytest
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    # both sides pinned so the mismatch holds on any installed stack
+    monkeypatch.setattr(mujoco, "__version__", "3.12.0")
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco="3.4.0"),
+    )
+    monkeypatch.setattr(
+        scene_compiler,
+        "compose_mujoco_model",
+        lambda *args, **kwargs: pytest.fail("composition must not run on a version mismatch"),
+    )
+    with pytest.raises(RuntimeProfileError, match="the composed .mjb would not load"):
+        _render({"use_sim": "true", "sim_platform": "mujoco"})
+
+
+def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
+    """D3/D6: the camera plugin parameters ride a params file keyed under the
+    upstream mujoco_ros2_control_node name."""
+    import sim_models.scene_compiler as scene_compiler
+    from robot_runtime.launch_support import MUJOCO_SIMULATION_NODE
+    from robot_runtime.mujoco import CAMERA_PLUGIN_INSTANCE, CAMERA_PLUGIN_TYPE
+
+    _inject_simulator_versions(monkeypatch)
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco"})
+    simulator_nodes = [
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "ros2_control_node"
+    ]
+    assert [node._Node__package for node in simulator_nodes] == ["mujoco_ros2_control"]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    def _param_file_paths(node):
+        # launch_ros normalizes a parameter-file path to a list of substitutions
+        return [
+            "".join(getattr(part, "text", None) or str(part) for part in entry.param_file)
+            for entry in node._Node__parameters
+            if isinstance(entry, ParameterFile)
+        ]
+
+    param_files = _param_file_paths(simulator_nodes[0])
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in Path(path).read_text(encoding="utf-8")]
+    assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
+    tree = yaml.safe_load(Path(keyed[0]).read_text(encoding="utf-8"))[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    instance = tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert instance["type"] == CAMERA_PLUGIN_TYPE
+    # the shipped profile's cameras: one entry per MJCF camera name
+    assert set(key for key in instance if key.endswith("_camera")) == {"top_camera", "wrist_camera", "front_camera"}
+    assert instance["camera_publish_rate"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -378,16 +461,18 @@ def test_advertised_camera_frames_are_identical_on_every_platform():
     assert frames["wrist"]["mujoco"] == "camera_wrist_frame"
     assert frames["front"]["mujoco"] == "camera_front_optical_frame"
 
-    # the MuJoCo sensor blocks stamp exactly the advertised frame
+    # the MuJoCo CameraPlugin parameters stamp exactly the advertised frame
+    # (the URDF carries no camera <sensor> blocks any more, D3)
     description = render_mujoco_description(profile, _PROFILE, profile.get("peripherals"), scene="")
     root = ET.fromstring(description)
-    sensor_frames = {
-        sensor.get("name").removesuffix("_camera"): param.text
-        for sensor in root.findall(".//ros2_control/sensor")
-        for param in sensor.findall("param")
-        if param.get("name") == "frame_name"
+    assert root.findall(".//ros2_control/sensor") == []
+    from robot_runtime.mujoco import camera_plugin_parameters
+
+    instance = camera_plugin_parameters(profile, profile.get("peripherals"))["mujoco_plugins"]["ibrobot_cameras"]
+    plugin_frames = {
+        key.removesuffix("_camera"): entry["frame_name"] for key, entry in instance.items() if isinstance(entry, dict)
     }
-    assert sensor_frames == {name: frames[name]["mujoco"] for name in cameras}
+    assert plugin_frames == {name: frames[name]["mujoco"] for name in cameras}
 
 
 # ---------------------------------------------------------------------------
