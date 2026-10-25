@@ -1,0 +1,9 @@
+# MuJoCo ROS simulation pin (upgrade-mujoco-ros2-control-0-1 D1/D5).
+# Must equal mujoco_vendor 0.1.1's bundled libmujoco.so (3.12.0):
+# scene_compiler uses the Python mujoco to compile the .mjb, and the
+# mujoco_ros2_control 0.1.2 plugin can only load a .mjb built by the same
+# MuJoCo version.
+# LIBERO benchmark venvs must NOT install this pin: hf-libero 0.1.4 needs
+# mujoco<3.9 (robosuite 1.4 breaks on MuJoCo >= 3.10), so setup skips this
+# file there and sim_platform:=mujoco fails fast through the version check.
+mujoco==3.12.0

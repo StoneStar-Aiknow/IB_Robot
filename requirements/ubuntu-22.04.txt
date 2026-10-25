@@ -1,7 +1,5 @@
 onnx
 onnxsim
 onnxruntime
-# Must match mujoco_ros2_control's bundled libmujoco.so version (3.4.0).
-# scene_compiler uses mujoco Python to compile .mjb with SDF; version mismatch
-# causes mj_loadModel to fail at runtime.
-mujoco==3.4.0
+# The MuJoCo pin moved to requirements/mujoco-sim.txt (it must match
+# mujoco_vendor's libmujoco and is skipped in LIBERO benchmark venvs).

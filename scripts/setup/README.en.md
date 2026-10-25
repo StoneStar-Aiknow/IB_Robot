@@ -5,7 +5,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | File | Responsibility |
 | --- | --- |
 | `detect.sh` | OS / arch / Python detection; resolves `IBR_HOST_*` and `IBR_LEROBOT_PROFILES`. |
-| `benchmark_profile.sh` | Ubuntu GPU preflight, validated PyTorch/TorchVision/TorchCodec CUDA profile, and provider ABI boundary for `--with-benchmark`; NVIDIA driver >=560.28.03 is required, local nvcc is not required and GraspGen is excluded. |
+| `benchmark_profile.sh` | Ubuntu GPU preflight, validated PyTorch/TorchVision/TorchCodec CUDA profile, and provider ABI boundary for `--with-benchmark`; NVIDIA driver >=560.28.03 is required, local nvcc is not required and GraspGen is excluded. The generated benchmark constraints include `mujoco<3.9` (hf-libero 0.1.4's cap). |
 | `platforms/<id>.sh` | Per-platform package managers, ROS source, and `platform_lerobot_profiles()` defaults. |
 | `lerobot_patches.sh` | Drives `git am` of the curated lerobot patch stack into `libs/lerobot`. |
 | `lerobot_resolve_active.py` | Resolves the active lerobot tag from `INDEX.yaml`; cross-checks the per-tag `manifest.yaml`. |
@@ -14,6 +14,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `tests/test_cann_torch_versions.sh` | Tests CANN detection and openEuler Torch ABI selection without a CANN installation. |
 | `tests/test_openeuler_cv_bridge_abi.sh` | Tests installation of the OpenCV 4.13-compatible openEuler `cv_bridge` RPM. |
 | `tests/test_setup_profile_training.sh` | Asserts `--profile training` never triggers ROS 2 / rosdep / colcon while `full` / `inference` keep their behaviour. |
+| `tests/test_mujoco_sim_pin.sh` | Tests the three MuJoCo-sim-pin install orders, the benchmark `mujoco<3.9` constraint, the inference-profile skip, and the stdlib-only verification on an unbuilt workspace (issue #190). |
 
 ## Setup profiles (dependency-scope parameterization)
 
@@ -62,6 +63,37 @@ Differences of `training` vs. `full` (for Ubuntu 22.04 hosts that only run LeRob
 ./scripts/setup.sh --yes --profile training
 source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
 ```
+
+## MuJoCo simulation version rule (issue #190)
+
+The SO-101 MuJoCo simulation platform runs on `mujoco_ros2_control` 0.1.2 /
+`mujoco_vendor` 0.1.1 (libmujoco 3.12.0). The `.mjb` model is compiled by the
+workspace Python `mujoco`, and its version must exactly equal the simulator's
+libmujoco, therefore:
+
+- The Python pin moved into a dedicated `requirements/mujoco-sim.txt`
+  (`mujoco==3.12.0`), installed only on the Ubuntu `full` profile without
+  benchmark dependencies and without `hf-libero`/`robosuite` already in the
+  venv (`python_venv.sh::mujoco_sim_pin_mode`).
+- The LIBERO benchmark and the MuJoCo ROS simulation are **mutually exclusive
+  in one venv**: hf-libero 0.1.4 declares `mujoco<3.9` (robosuite 1.4 breaks
+  on MuJoCo >= 3.10), so the pip constraints generated for `--with-benchmark`
+  include `mujoco<3.9`; a venv that already holds a benchmark install skips
+  the 3.12.0 pin with a warning — **recreate the venv** to use the MuJoCo
+  simulation.
+- `verify_env.sh::verify_mujoco_sim` re-checks the same versions with a
+  stdlib-only snippet where the pin would be installed (the ROS prefix is
+  derived from `SETUP_ROS_SETUP_PATH`); every other profile and benchmark
+  venv gets an info line at most.
+- The runtime adds a strict check
+  (`robot_runtime.mujoco.check_simulator_versions`): on an inconsistent or
+  too-old simulator, `sim_platform:=mujoco` fails before model composition
+  with an installation diagnostic.
+- openEuler ships no `mujoco_ros2_control` rpm: the rosdep skip keys
+  (`mujoco_ros2_control` / `mujoco_ros2_control_msgs`) stay as they are and
+  this upgrade adds **no** new skip key (the 0.1.2 plugins package arrives
+  transitively through upstream `mujoco_ros2_control`; Ubuntu needs no new
+  key either).
 
 ## CANN dependency layers
 

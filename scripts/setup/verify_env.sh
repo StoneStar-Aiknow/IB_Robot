@@ -539,6 +539,96 @@ PY
     return 0
 }
 
+verify_mujoco_sim() {
+    # Same scope as the install (upgrade-mujoco-ros2-control-0-1 D5): Ubuntu
+    # full-profile, non-benchmark venvs. Every other profile gets an info line
+    # at most, never a false failure.
+    if ! declare -F mujoco_sim_pin_mode >/dev/null; then
+        log_info "Skipping MuJoCo simulation pin verification (mujoco_sim_pin_mode unavailable)."
+        return 0
+    fi
+    local mode
+    mode="$(mujoco_sim_pin_mode)"
+    if [[ "${mode}" != "install" ]]; then
+        log_info "Skipping MuJoCo simulation pin verification (mode: ${mode})."
+        return 0
+    fi
+
+    log_info "Verifying the MuJoCo simulation pin (mujoco_ros2_control >= 0.1.0, one libmujoco version)..."
+    # Setup verification runs before colcon build, so this must never import
+    # robot_runtime: a stdlib-only snippet run with the venv interpreter,
+    # with the ROS prefix derived from the sourced setup.bash's directory.
+    local ros_prefix
+    ros_prefix="$(dirname "${SETUP_ROS_SETUP_PATH:-}")"
+    if [[ ! -d "${ros_prefix}" ]]; then
+        log_error "MuJoCo simulation verification: ROS prefix not found at ${ros_prefix:-<empty>}."
+        return 1
+    fi
+    if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - "${ros_prefix}" <<'PY'
+import importlib.metadata
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+MIN_CONTROL = "0.1.0"
+
+
+def version_key(version):
+    key = []
+    for part in version.strip().split("."):
+        leading = part[: len(part) - len(part.lstrip("0123456789"))]
+        if not leading:
+            break
+        key.append(int(leading))
+    return tuple(key)
+
+
+def fail(message):
+    raise SystemExit(f"MuJoCo simulation pin verification failed: {message}")
+
+
+prefix = Path(sys.argv[1]).resolve()
+package_xml = prefix / "share" / "mujoco_ros2_control" / "package.xml"
+if not package_xml.is_file():
+    fail(f"mujoco_ros2_control not found; install ros-humble-mujoco-ros2-control >= 0.1.2 ({package_xml} is missing)")
+control = (ET.parse(package_xml).getroot().findtext("version") or "").strip()
+if not control:
+    fail(f"no <version> element in {package_xml}")
+if version_key(control) < version_key(MIN_CONTROL):
+    fail(
+        f"mujoco_ros2_control {control} is older than the CameraPlugin release ({MIN_CONTROL}); "
+        "run: sudo apt install --only-upgrade ros-humble-mujoco-ros2-control ros-humble-mujoco-ros2-control-msgs "
+        "ros-humble-mujoco-ros2-control-plugins ros-humble-mujoco-vendor"
+    )
+
+vendor_dir = prefix / "opt" / "mujoco_vendor" / "lib"
+versions = sorted(
+    (match.group(1) for path in vendor_dir.glob("libmujoco.so.*") if (match := re.fullmatch(r"libmujoco\.so\.(\d+\.\d+\.\d+)", path.name))),
+    key=version_key,
+)
+if not versions:
+    fail(f"mujoco_vendor libmujoco not found under {vendor_dir}; install ros-humble-mujoco-vendor 0.1.1")
+vendor = versions[-1]
+
+try:
+    python_mujoco = importlib.metadata.version("mujoco")
+except importlib.metadata.PackageNotFoundError:
+    fail(f"the MuJoCo simulation needs the mujoco Python package; install mujoco=={vendor} (requirements/mujoco-sim.txt)")
+if python_mujoco != vendor:
+    fail(
+        f"Python mujoco {python_mujoco} != mujoco_vendor libmujoco {vendor}; "
+        f"install mujoco=={vendor} (requirements/mujoco-sim.txt); a venv set up with the "
+        "LIBERO benchmark dependencies cannot run the MuJoCo simulation"
+    )
+print(f"MuJoCo simulation pin verified: mujoco_ros2_control {control}, libmujoco {vendor}, python mujoco {python_mujoco}")
+PY
+    then
+        return 1
+    fi
+    return 0
+}
+
 verify_env() {
     if [[ "$(setup_profile_get verify)" == "training" ]]; then
         # Training hosts install no ROS 2 runtime, rosdep, or colcon.
@@ -563,6 +653,7 @@ verify_env() {
     verify_colcon || return 1
     verify_numpy_compat || return 1
     verify_lerobot || return 1
+    verify_mujoco_sim || return 1
     verify_pygraphviz || return 1
     verify_openeuler_yaml_cpp_abi || return 1
     verify_openeuler_cv_bridge_abi || return 1

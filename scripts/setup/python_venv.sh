@@ -309,6 +309,85 @@ install_graspgen_torch_abi() {
     fi
 }
 
+# mujoco_sim_pin_mode — one decision function for the MuJoCo simulation pin
+# (upgrade-mujoco-ros2-control-0-1 D5). Prints exactly one mode:
+#   install             Ubuntu full-profile venv, no benchmark request, and no
+#                       hf-libero/robosuite already installed: install
+#                       requirements/mujoco-sim.txt (mujoco==3.12.0, must equal
+#                       mujoco_vendor 0.1.1's libmujoco).
+#   skip-benchmark      INSTALL_BENCHMARK_DEPS=true: the LIBERO stack needs
+#                       mujoco<3.9 (robosuite 1.4 breaks on MuJoCo >= 3.10),
+#                       so the 3.12.0 pin must not fight it.
+#   skip-libero-present benchmark is off, but the venv already holds
+#                       hf-libero/robosuite from an earlier benchmark setup:
+#                       never downgrade or break that install; recreate the
+#                       venv to use the MuJoCo ROS simulation.
+#   none                every other profile or platform (inference, training,
+#                       openEuler): no MuJoCo pin, as before.
+# The venv package probe lives in its own function so unit tests can stub it
+# (upgrade-mujoco-ros2-control-0-1 D5/D6).
+mujoco_sim_venv_has_libero() {
+    [[ -n "${VENV_PYTHON:-}" ]] || return 1
+    "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
+import importlib.util
+
+# hf-libero ships the top-level `libero` module; robosuite ships `robosuite`.
+raise SystemExit(0 if any(importlib.util.find_spec(name) for name in ("libero", "robosuite")) else 1)
+PY
+}
+
+mujoco_sim_pin_mode() {
+    if [[ "${SETUP_PLATFORM_ID:-unknown}" != "ubuntu-22.04" ]] || ! setup_profile_enables ubuntu_full_deps; then
+        echo "none"
+        return 0
+    fi
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        echo "skip-benchmark"
+        return 0
+    fi
+    if mujoco_sim_venv_has_libero; then
+        echo "skip-libero-present"
+        return 0
+    fi
+    echo "install"
+}
+
+# mujoco_sim_pin_constraint prints the constraint file that must govern every
+# later venv install once the pin is installed (D5 addendum), or nothing in
+# the skip modes. pip backtracks dm_control to the newest release the pin
+# allows instead of upgrading mujoco past mujoco_vendor's libmujoco.
+mujoco_sim_pin_constraint() {
+    if [[ "$(mujoco_sim_pin_mode)" == "install" ]]; then
+        printf '%s\n' "${WORKSPACE}/requirements/mujoco-sim.txt"
+    fi
+    return 0
+}
+
+# install_mujoco_sim_pin applies the decision on the Ubuntu full-profile path.
+install_mujoco_sim_pin() {
+    local pip_runner=("$@")
+    local mode
+    mode="$(mujoco_sim_pin_mode)"
+    case "${mode}" in
+        install)
+            log_info "Installing the MuJoCo simulation pin (requirements/mujoco-sim.txt)..."
+            run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/mujoco-sim.txt" --quiet
+            ;;
+        skip-benchmark)
+            log_warn "LIBERO benchmark dependencies requested: keeping the benchmark-compatible MuJoCo (<3.9)."
+            log_warn "The MuJoCo ROS simulation (sim_platform:=mujoco) is unavailable in this venv."
+            ;;
+        skip-libero-present)
+            log_warn "hf-libero/robosuite already installed in this venv: skipping the mujoco==3.12.0 pin"
+            log_warn "so the existing benchmark install stays intact. Recreate the venv"
+            log_warn "(rm -rf \${WORKSPACE}/venv and re-run ./scripts/setup.sh) to use the MuJoCo ROS simulation."
+            ;;
+        none)
+            ;;
+    esac
+    return 0
+}
+
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
@@ -543,6 +622,23 @@ setup_python_venv() {
         ubuntu-22.04)
             if setup_profile_enables ubuntu_full_deps; then
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
+                # The MuJoCo sim pin (mujoco-sim.txt) is decided per venv: it
+                # must match mujoco_vendor's libmujoco and is skipped next to
+                # LIBERO benchmark dependencies (D5).
+                install_mujoco_sim_pin "${pip_install[@]}"
+                # The pin must survive every later venv install (D5 addendum,
+                # Ubuntu Docker failure): constrain the rest of setup to the
+                # pin file so later full-profile steps (GraspGen ->
+                # scene-synthesizer[recommend] -> dm_control) cannot upgrade
+                # mujoco past mujoco_vendor's libmujoco — pip backtracks to
+                # the newest dm_control the pin allows instead. Skip modes add
+                # no constraint.
+                local mujoco_pin_constraint
+                mujoco_pin_constraint="$(mujoco_sim_pin_constraint)"
+                if [[ -n "${mujoco_pin_constraint}" ]]; then
+                    PIP_CONSTRAINT="${mujoco_pin_constraint}${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+                    log_info "MuJoCo sim pin active as a constraint for all later venv installs."
+                fi
             elif setup_profile_enables onnx_tooling; then
                 # Inference profile: only the ONNX toolchain; skip mujoco (sim).
                 # AtomGit collaboration now uses the official CLI (no pip package).
@@ -630,6 +726,14 @@ opencv-python-headless<4.12
 EOF
         if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
             cat "${BENCHMARK_PIP_CONSTRAINTS}" >> "${ros_abi_constraints}"
+        fi
+        # Explicit --constraint users (voice/perception/grasp/graspgenx) must
+        # keep the MuJoCo pin too: append the pin file the same way (D5
+        # addendum). Skip modes add nothing.
+        local mujoco_pin_constraint
+        mujoco_pin_constraint="$(mujoco_sim_pin_constraint)"
+        if [[ -n "${mujoco_pin_constraint}" && -f "${mujoco_pin_constraint}" ]]; then
+            cat "${mujoco_pin_constraint}" >> "${ros_abi_constraints}"
         fi
     else
         log_info "Skipping the ROS 2 NumPy/OpenCV ABI pin (${SETUP_PROFILE} profile)."
