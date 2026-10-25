@@ -33,6 +33,7 @@ Facade-relevant shape::
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,32 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
     joints = data["joints"]
     if not isinstance(joints, list) or not joints or not all(str(j).strip() for j in joints):
         raise ProfileError(f"runtime profile 'joints' must be a non-empty list of names: {source}")
+
+    conformance = data.get("conformance")
+    if conformance is not None:
+        if not isinstance(conformance, dict):
+            raise ProfileError(f"runtime profile 'conformance' must be a mapping: {source}")
+        start_positions = conformance.get("start_positions")
+        if start_positions is not None:
+            if not isinstance(start_positions, dict) or not start_positions:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' must be a non-empty mapping of joint names to radians: {source}"
+                )
+            # The conformance reset drives the arm joints only (D9: a subset
+            # of arm joints), with the same arm_joints-or-joints rule the
+            # suite's harness uses — a gripper joint would be silently ignored.
+            arm_joints = data.get("arm_joints", joints)
+            non_arm = sorted(str(joint) for joint in start_positions if str(joint) not in {str(j) for j in arm_joints})
+            if non_arm:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' names non-arm joints {non_arm}: {source}"
+                )
+            for joint, value in start_positions.items():
+                # bool is an int subclass; true/false must not become 1.0/0.0 rad targets
+                if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+                    raise ProfileError(
+                        f"runtime profile 'conformance.start_positions.{joint}' must be a finite number: {source}"
+                    )
 
     _validate_sim_selection(data, source)
 

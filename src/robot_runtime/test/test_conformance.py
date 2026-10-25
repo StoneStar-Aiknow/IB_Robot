@@ -157,6 +157,39 @@ class Harness(Node):
         response = self.set_mode(C.IDLE_MODE)
         assert response.success, f"could not reset to idle: {response.message}"
 
+    def reset_to_start_pose(self):
+        """Reset the arm to the profile-declared conformance start pose (#194, D9).
+
+        Robot-agnostic: reads the optional top-level profile key
+        ``conformance.start_positions`` (``{joint: radians}``). Absent or empty
+        means no reset (today's behaviour, no guessed default pose); a runtime
+        without a trajectory capability is also left alone. Declared joints go
+        to their declared values, every other arm joint holds its current
+        position (trajectory controllers reject partial goals), and arrival is
+        asserted within the suite's existing goal tolerance.
+        """
+        declared = (self.profile.get("conformance") or {}).get("start_positions") or {}
+        declared = {str(joint): float(value) for joint, value in declared.items()}
+        if not declared or "joint.trajectory" not in self.capabilities():
+            return
+        current = self.positions()
+        joints = list(self.arm_joints)
+        targets = [declared.get(joint, current[joint]) for joint in joints]
+        if all(abs(target - current[joint]) < 0.01 for joint, target in zip(joints, targets, strict=True)):
+            return
+        assert self.set_mode(_trajectory_mode(self)).success
+        handle = self.send_trajectory(joints, targets, 1.0)
+        assert handle.accepted, "[Conformance start pose] reset goal was rejected"
+        result = self.await_result(handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, (
+            f"[Conformance start pose] reset error_code {result.result.error_code}: {result.result.error_string}"
+        )
+        after = self.positions()
+        for joint, target in zip(joints, targets, strict=True):
+            assert abs(after[joint] - target) < 0.05, (
+                f"[Conformance start pose] joint {joint} at {after[joint]:.3f}, start {target:.3f}"
+            )
+
     def positions(self) -> dict[str, float]:
         self.joint_states.clear()
         self.spin_until(lambda: len(self.joint_states) >= 2, 5.0, "fresh joint state")
@@ -349,6 +382,7 @@ def test_read_failure_is_not_masked(harness: Harness):
 
 def test_stream_commands_honored_in_stream_mode(harness: Harness):
     requires(harness, "joint.position_stream")
+    harness.reset_to_start_pose()
     channel, joints = harness.stream_channel()
     assert harness.set_mode(_stream_mode(harness)).success
     before = harness.positions()
@@ -387,6 +421,7 @@ def test_stream_commands_rejected_outside_stream_mode(harness: Harness):
 
 def test_stream_stops_joints_hold(harness: Harness):
     requires(harness, "joint.position_stream")
+    harness.reset_to_start_pose()
     channel, joints = harness.stream_channel()
     assert harness.set_mode(_stream_mode(harness)).success
     before = harness.positions()
@@ -410,6 +445,7 @@ def test_stream_stops_joints_hold(harness: Harness):
 
 def test_trajectory_reaches_goal_tolerance(harness: Harness):
     requires(harness, "joint.trajectory")
+    harness.reset_to_start_pose()
     assert harness.set_mode(_trajectory_mode(harness)).success
     before = harness.positions()
     moved = harness.arm_joints[:2]
@@ -439,6 +475,7 @@ def test_trajectory_unknown_joints_rejected(harness: Harness):
 
 def test_trajectory_cancel_holds_position(harness: Harness):
     requires(harness, "joint.trajectory")
+    harness.reset_to_start_pose()
     assert harness.set_mode(_trajectory_mode(harness)).success
     before = harness.positions()
     moved = harness.arm_joints[0]
@@ -490,6 +527,7 @@ def test_mode_invalid_transition_lists_alternatives(harness: Harness):
 @pytest.mark.parametrize("policy", [C.STOP_HOLD, C.STOP_TORQUE_OFF])
 def test_stop_guarantees_within_declared_bounds(harness: Harness, policy: str):
     requires(harness, "runtime.stop", "joint.trajectory")
+    harness.reset_to_start_pose()
     bounds = harness.params("runtime.stop")
     assert harness.set_mode(_trajectory_mode(harness)).success
     before = harness.positions()
@@ -693,6 +731,7 @@ def test_ik_available_in_idle(harness: Harness):
 
 def test_move_to_joint_reaches_configuration(harness: Harness):
     requires(harness, "motion.move_to_joint")
+    harness.reset_to_start_pose()
     assert harness.set_mode(_trajectory_mode(harness)).success
     before = harness.positions()
     moved = harness.arm_joints[:2]
@@ -723,6 +762,7 @@ def test_move_rejected_while_stopped(harness: Harness):
 
 def test_stop_cancels_in_flight_move(harness: Harness):
     requires(harness, "motion.move_to_joint", "runtime.stop")
+    harness.reset_to_start_pose()
     assert harness.set_mode(_trajectory_mode(harness)).success
     before = harness.positions()
     joints, targets = arm_targets(harness, before, {harness.arm_joints[0]: 1.5})
@@ -739,6 +779,7 @@ def test_stop_cancels_in_flight_move(harness: Harness):
 
 def test_move_to_pose_reaches_within_reported_error(harness: Harness):
     requires(harness, "motion.move_to_pose", "motion.fk")
+    harness.reset_to_start_pose()
     assert harness.set_mode(_trajectory_mode(harness)).success
     request = MoveToPose.Request()
     request.target_pose = _reachable_pose(harness).pose

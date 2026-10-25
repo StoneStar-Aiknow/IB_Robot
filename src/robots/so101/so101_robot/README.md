@@ -105,6 +105,13 @@ python3 -m pytest src/robot_runtime/test/test_conformance.py -q
 
 This certifies the exact launch graph above (design D8), not a stand-in.
 
+The profile declares `conformance.start_positions` (all-zero for joints 1-5):
+arm-moving motion tests reset there first (issue #194). From all-zero every
+conformance target keeps the gripper above the MuJoCo mount plane (FK
+margins: stream +0.3 → +3.9 cm, hold +0.2 → +10.2 cm, trajectory +0.25 on
+joints 1-2 → +16.2 cm, move +0.2 → +17.6 cm); from the profile HOME the
+stream targets dip below it.
+
 ## Scope: single arm only
 
 `so101_robot` ships exactly one supported deployment: the single SO-101 arm
