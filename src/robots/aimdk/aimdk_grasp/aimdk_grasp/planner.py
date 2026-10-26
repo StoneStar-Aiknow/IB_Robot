@@ -2,6 +2,7 @@
 
 import copy
 import os
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
@@ -2058,8 +2059,6 @@ class LeftArmPlanner:
         if grasps.ndim != 3 or grasps.shape[1:] != (4, 4) or not 1 <= len(grasps) <= self.max_goalset:
             raise ValueError(f"Expected 1..{self.max_goalset} camera-frame grasps with shape Kx4x4")
         goals = palm_goals_from_camera_grasps(grasps, base_from_camera, self.grasp_to_palm)
-        q = feedback.vector(LEFT_ARM)
-        self._require_valid_start(q)
         hand = list(self.hand_links)
 
         def solve(transforms, start, phase, seed_config=None):
@@ -2095,9 +2094,11 @@ class LeftArmPlanner:
             # receive their own solves and full fine validation below.
             selection_goals = goals.copy()
             selection_goals[:, :3, 3] += float(approach_offset) * goals[:, :3, 2]
-        key = (q.tobytes(), goals.tobytes(), selection_goals.tobytes())
         index = None
         try:
+            q = feedback.vector(LEFT_ARM)
+            self._require_valid_start(q)
+            key = (q.tobytes(), goals.tobytes(), selection_goals.tobytes())
             check_deadline()
             if key not in self._grasp_selections:
                 # Default mode selects contact; latency mode selects an approach
@@ -2171,5 +2172,20 @@ class LeftArmPlanner:
                 raise PlannerFault(f"{type(exc).__name__}: {exc}") from exc
             raise GraspPlanningError(str(exc), index) from exc
         finally:
-            self.motion.enable_link_collision(hand)
-            self.motion.update_tool_pose_criteria({"R_palm": ToolPoseCriteria()})
+            active_error = sys.exc_info()[1]
+            cleanup_errors = []
+            try:
+                self.motion.enable_link_collision(hand)
+            except Exception as exc:  # noqa: BLE001 - preserve the planning fault already propagating
+                cleanup_errors.append(exc)
+            try:
+                self.motion.update_tool_pose_criteria({"R_palm": ToolPoseCriteria()})
+            except Exception as exc:  # noqa: BLE001 - make both cleanup steps best effort
+                cleanup_errors.append(exc)
+            cleanup_fault = next(
+                (exc for exc in cleanup_errors if isinstance(exc, RuntimeError) and device_fault(exc)), None
+            )
+            if cleanup_fault is not None and not isinstance(active_error, PlannerFault):
+                raise PlannerFault(f"{type(cleanup_fault).__name__}: {cleanup_fault}") from cleanup_fault
+            if cleanup_errors and active_error is None:
+                raise cleanup_errors[0]

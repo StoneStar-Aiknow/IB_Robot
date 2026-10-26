@@ -12,7 +12,7 @@ from aimdk_grasp.robot_model import planning_model
 from aimdk_grasp.trajectory import TimedTrajectory
 from test_hand import PRESETS
 
-#: The deployed OmniHand gripper description's palm mount (models/graspgenx_omnihand_left_x2,
+#: The deployed OmniHand gripper description's palm mount and closing sweep (models/graspgenx_omnihand_left_x2,
 #: assets/x_grippers/omnihand_left_x2/config.json), copied so the tests need no model bundle.
 GRIPPER = {
     "base_rotation": [
@@ -20,7 +20,13 @@ GRIPPER = {
         [-1.0, 0.0, 0.0, 0.0],
         [0.0, 0.43531186597968585, 0.9002797228291238, 0.0],
         [0.0, 0.0, 0.0, 1.0],
-    ]
+    ],
+    "sweep_volume": {
+        "extents": [0.0737, 0.071, 0.04],
+        "offset": [0.0, 0.0, 0.119],
+        "extents2": [0.0368, 0.071, 0.03],
+        "offset2": [0.0, 0.0, 0.099],
+    },
 }
 
 

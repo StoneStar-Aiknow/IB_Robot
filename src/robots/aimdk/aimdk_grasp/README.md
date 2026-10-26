@@ -166,6 +166,19 @@ The planner is migrated from the standalone pipeline with its tuned constants
 unchanged; the offline replay limits and the CPU sphere kinematics it carried for
 analysis tools are not.
 
+`aimdk_grasp.planner_service.GraspPlanningService` owns one warmed planner across
+requests: it rebuilds it only when the locked joints change or after a `PlannerFault`,
+and otherwise replaces the scene buffers in place, serializing every GPU call. A request
+screens the candidates, drops those whose closing sweep holds too little of the target,
+and orders the rest before `grasp_session.select_plan` searches them in goalsets of five
+over the approach distances. The ordering, from first to last within a tier: an approach
+pose the screen IK reaches, a clear grasp line, an open hand that stays 1 cm off the
+target along the line, the palm not facing the robot's left, and a confidence of at
+least 0.7. Candidates are only ever moved back, never dropped, except for those coming
+down onto a tall object from above. The approach preference by target height and the
+enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
+robot.
+
 ## Observations and revalidation
 
 `aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the

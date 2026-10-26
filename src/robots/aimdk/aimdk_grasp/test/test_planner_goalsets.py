@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aimdk_grasp.planner import LeftArmPlanner, _skip_static_scene_spheres
+from aimdk_grasp.planner_service import GraspPlanningService
 from test_planner_contracts import GRIPPER
 
 
@@ -91,6 +92,35 @@ def screen_planner(monkeypatch):
     )
     stub.feedback = SimpleNamespace(vector=lambda _: np.zeros(7))
     return stub
+
+
+def test_all_colliding_contacts_never_enter_trajectory_planning(screen_planner):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("screen goals are CUDA tensors")
+    stub = screen_planner
+    stub.planner._screen_batch_size, stub.planner._screen_ik_seeds = 2, 1
+    stub.planner.screen_ik = SimpleNamespace(
+        solve_pose=lambda pose, state, return_seeds: SimpleNamespace(
+            success=torch.ones((2, 1), dtype=torch.bool), solution=torch.zeros((2, 1, 7))
+        )
+    )
+    stub.planner.valid_positions = lambda q: np.zeros(len(q), dtype=bool)
+    stub.planner.warmup = lambda: None
+    stub.planner.close = lambda: None
+    stub.planner.plan_grasp = lambda *args, **kwargs: pytest.fail("Colliding contact entered TrajOpt")
+    with (
+        GraspPlanningService(
+            gripper=GRIPPER, planner_factory=lambda *args, **kwargs: stub.planner, clock=lambda: 0.0
+        ) as service,
+        pytest.raises(RuntimeError, match="No candidate") as error,
+    ):
+        service.plan(
+            stub.feedback, SimpleNamespace(received_at=0.0), np.eye(4)[None], [1.0], np.eye(4), screen_check=True
+        )
+    report = error.value.planning_report
+    assert report["screened_candidates"] == [] and not report.get("planning_attempts")
+    assert report["contact_screen"]["fine_rejected_states"] == 1
 
 
 def test_contact_cache_owns_exact_states_deduplicates_and_is_bounded():
