@@ -99,6 +99,17 @@ def _load(directory: str) -> tuple[dict, bytes]:
     return config, ET.tostring(tree.getroot(), encoding="utf-8", xml_declaration=True)
 
 
+@lru_cache(maxsize=4)
+def _arm_limits(directory: str) -> tuple[tuple[str, tuple[float, float]], ...]:
+    config, _ = _load(directory)
+    return tuple(planning_model_options(config["planning_model"])["arm_limits"].items())
+
+
+def arm_limits(directory: Path | None = None) -> dict[str, tuple[float, float]]:
+    """The MC-enforced left-arm limits the planning model was narrowed to (``planning_model.arm_limits_config``)."""
+    return dict(_arm_limits(str(directory or config_directory())))
+
+
 def planning_model(directory: Path | None = None) -> ET.Element:
     """The generated planning URDF the configuration in ``directory`` was built for."""
     _, urdf = _load(str(directory or config_directory()))

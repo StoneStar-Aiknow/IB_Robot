@@ -179,6 +179,24 @@ down onto a tall object from above. The approach preference by target height and
 enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
 robot.
 
+## Streaming the arm
+
+The X2 arm is driven through the robot-agnostic streaming executor of
+`manipulation_execution` (`aimdk_grasp.arm_stream.x2_arm_executor`) on the
+runtime's `joint.arm_stream`, starting from and checked against the MC command
+the runtime reports on `joint.arm_command_state`. The X2 settings: tracking 0.3
+rad and arrival 0.2 rad, MC's 40 / 2 gains required, commands 5 mrad inside the
+robot configuration's MC arm limits, the right arm and head locked, and each
+retreat ending with MC's command at a fixed home (`HOME_COMMAND`), so landings do
+not ratchet.
+
+At kp 40 the arm settles below its command by gravity torque / kp.
+`aimdk_grasp.arm_gravity.GravityShaper` raises each waypoint by the predicted sag
+change from the segment start (`config/x2_ultra/arm_gravity.json`: the official
+description's chain with a fitted torso tilt and wrist payload), and
+`require_executable` refuses a plan that leaves MC's limits or whose predicted sag
+leaves less than 0.06 of the tracking limit.
+
 ## Observations and revalidation
 
 `aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the

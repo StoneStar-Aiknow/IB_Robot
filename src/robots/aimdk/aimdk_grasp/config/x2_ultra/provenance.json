@@ -53,5 +53,6 @@
   "dummy": "wrist roll geometry is the official OmniHand one; the v1.3.0 dummy hand is not part of the model",
   "self_collision_exclusions": "mechanical tree distance <= 2; no cross-arm blanket exclusions",
   "left_arm_limits": "intersected with the MC-enforced arm_limits of the robot configuration named by planning_model.arm_limits_config (aimdk_x2_grasp)",
+  "arm_gravity": "arm_gravity.json is the original X2 grasp workspace's left-arm gravity model, unchanged (sha256 ad3ccfca5aa63822...; r25 static-equilibrium fit at MC kp 40, STAND_DEFAULT). Its chain (joint origins, axes, link masses and centres) equals the official x2_ultra.urdf v1.3.0, checked by test_arm_stream; only kp, the torso tilt and the wrist payload are fitted",
   "lower_body": "not in the planning model; the fine validation scene carries the pelvis and left leg as a fixed mesh at the measured standing pose (leg_obstacle.json, aimdk_grasp.leg_obstacle; identical to the original workspace's leg_obstacle.json, whose runtime URDF and meshes match the official ones)"
 }
