@@ -1126,3 +1126,91 @@ def test_service_retains_screen_timeout_and_passes_request_deadline():
     report = error.value.planning_report
     assert report["timings_s"]["screen"] >= 0.0 and report["timings_s"]["plan"] == 0.0
     assert "winning_candidate" not in report
+
+
+def test_a_recorded_plan_call_keeps_its_inputs_built_fine_scene_and_outcome(monkeypatch, tmp_path):
+    import pickle
+    import time
+
+    from aimdk_grasp.planner_service import PLAN_INPUTS_DIR_ENV
+    from aimdk_grasp.scene_estimation import LazyScene, SceneEstimate
+
+    class Planner:
+        refuse = False
+
+        def __init__(self, feedback, estimate, received_at, **options):
+            self.max_goalset = options["max_goalset"]
+
+        def locked_joints_match(self, feedback):
+            return True
+
+        def warmup(self):
+            pass
+
+        def update_scene(self, feedback, estimate):
+            pass
+
+        def plan_grasp(self, *args, **kwargs):
+            if Planner.refuse:
+                raise RuntimeError("nothing reaches it")
+            return SimpleNamespace(goalset_index=1)
+
+        def close(self):
+            pass
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self.lock.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *exc_info):
+            self.depth -= 1
+            self.lock.release()
+
+    gpu_lock = TrackingLock()
+    fine = {"cuboid": {"table": {"dims": [1.0, 1.0, 0.1]}}, "mesh": {}}
+    fine_builds = []
+
+    def build_fine():
+        assert gpu_lock.depth > 0
+        fine_builds.append(True)
+        return fine
+
+    estimate = SceneEstimate({"cuboid": {}, "mesh": {}}, 5.0, 1, "camera", True, None, {}, LazyScene(build_fine))
+    grasps = np.stack([np.eye(4)] * 2)
+    monkeypatch.setenv(PLAN_INPUTS_DIR_ENV, str(tmp_path / "calls"))
+    original_dump = pickle.dump
+
+    def dump_while_unlocked(*args, **kwargs):
+        assert gpu_lock.depth == 0
+        return original_dump(*args, **kwargs)
+
+    monkeypatch.setattr("aimdk_grasp.planner_service.pickle.dump", dump_while_unlocked)
+    with GraspPlanningService(
+        gripper=GRIPPER, clock=lambda: 7.0, planner_factory=Planner, gpu_lock=gpu_lock
+    ) as service:
+        _, report = service.plan(
+            {"locked": 0}, estimate, grasps, [0.8, 0.9], np.eye(4), deadline=time.perf_counter() + 30, snapshot_now=6.5
+        )
+        Planner.refuse = True
+        with pytest.raises(RuntimeError, match="three-segment"):
+            service.plan({"locked": 0}, estimate, grasps, [0.8, 0.9], np.eye(4))
+        # A recording that cannot be written changes nothing about the plan.
+        (tmp_path / "file").write_text("")
+        monkeypatch.setenv(PLAN_INPUTS_DIR_ENV, str(tmp_path / "file"))
+        Planner.refuse = False
+        assert service.plan({"locked": 0}, estimate, grasps, [0.8, 0.9], np.eye(4))[1]["candidate_index"] == 0
+    planned, refused = (pickle.loads(path.read_bytes()) for path in sorted((tmp_path / "calls").glob("plan_*.pkl")))
+    assert planned["outcome"]["success"] and planned["outcome"]["candidate_index"] == report["candidate_index"]
+    assert planned["options"] == {"snapshot_now": 6.5} and 29 < planned["budget_s"] <= 30
+    assert planned["estimate"].validation_scene == fine and planned["estimate"].received_at == 5.0
+    assert np.array_equal(planned["camera_from_grasps"], grasps) and planned["feedback"] == {"locked": 0}
+    assert planned["service"] == dict(planning_profile="default", approach_seed_policy="clear_path", max_goalset=100)
+    assert not refused["outcome"]["success"] and "three-segment" in refused["outcome"]["error"]
+    assert refused["budget_s"] is None and refused["outcome"]["wall_s"] >= 0
+    assert fine_builds == [True]

@@ -179,6 +179,13 @@ down onto a tall object from above. The approach preference by target height and
 enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
 robot.
 
+To study planning offline, start the grasp head with `IBROBOT_X2_PLAN_INPUTS_DIR` naming
+a directory: every plan call's feedback, scene (both resolutions), candidates, camera pose,
+options and live outcome are pickled there after the call, at no cost to it.
+`replay_x2_plan_inputs <dir> --output result.json` replays them on this host's GPU with the
+head's service, every clock of a call shifted together so the age checks see what they saw
+live; `--coarse-leg-boxes SHRINK_M` replaces the coarse scene's leg boxes for comparison.
+
 ## Streaming the arm
 
 The X2 arm is driven through the robot-agnostic streaming executor of
