@@ -280,8 +280,15 @@ class PickExecutorNode(
         if self._kinematics_backend == "runtime":
             return ComputeIk, ComputeFk
         # Legacy service definitions remain available only for configurations
-        # explicitly launched through the old MoveIt path.
-        from moveit_msgs.srv import GetPositionFK, GetPositionIK
+        # explicitly launched through the old MoveIt path. moveit_msgs is not a
+        # package dependency: hosts without MoveIt (the X2 Orin) run the runtime
+        # backend only, and a MoveIt bring-up installs it with its motion stack.
+        try:
+            from moveit_msgs.srv import GetPositionFK, GetPositionIK
+        except ImportError as exc:
+            raise RuntimeError(
+                "kinematics_backend 'legacy_moveit' requires moveit_msgs, which is not installed"
+            ) from exc
 
         return GetPositionIK, GetPositionFK
 

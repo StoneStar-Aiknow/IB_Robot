@@ -229,3 +229,14 @@ def test_node_initializes_without_status_discovery_and_preserves_legacy_workers(
         if node is not None:
             node.destroy_node()
         rclpy.shutdown()
+
+
+def test_legacy_backend_without_moveit_fails_with_a_named_cause(monkeypatch):
+    # moveit_msgs is not a package dependency; a host without MoveIt runs the runtime backend.
+    monkeypatch.setitem(sys.modules, "moveit_msgs.srv", None)
+    assert PickExecutorNode._kinematics_service_types(SimpleNamespace(_kinematics_backend="runtime")) == (
+        ComputeIk,
+        ComputeFk,
+    )
+    with pytest.raises(RuntimeError, match="legacy_moveit' requires moveit_msgs"):
+        PickExecutorNode._kinematics_service_types(SimpleNamespace(_kinematics_backend="legacy_moveit"))
