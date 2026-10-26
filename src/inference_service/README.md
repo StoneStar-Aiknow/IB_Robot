@@ -828,3 +828,36 @@ When `required=false`, an initialization failure leaves the typed endpoint onlin
 response and diagnostics. The host does not retry plugin initialization on later requests. After repairing a missing
 bundle, dependency, or device, restart the node to recover. Request validation and other request-scoped failures do
 not change runtime health; model resource failures are projected through handle health.
+
+### 跨主机部署模型服务（`with_model_services`）
+
+`with_model_services` 是 launch 参数，默认 `true`。它声明于 `perception_models` launch 条目，
+控制本机是否启动配置的 `perception_services` 服务节点。
+
+参数为 `false` 时的行为：
+
+- launch 计划不包含 `perception_models` 条目，本机不启动模型服务节点。
+- YAML 中的 service 配置不变，本机的调用方照常访问配置的 endpoint。
+- 配置加载和 live binding 按「元数据校验」处理 enabled service，见下文。
+
+元数据校验的规则：
+
+- `robot_config` 照常校验 service 的身份、endpoint、deployment 名称和语义契约。
+- 校验入口复用 `load_inference_manifest_metadata()`，与分布式 edge 端相同。
+- bundle 文件和 deployment artifacts 不在本机检查；托管主机保持完整校验。
+- 契约消费者同样按元数据校验。semantic mapping 的参数构造、`load_robot_config()`
+  的契约读取（scheduled dispatcher、recording node 等）只消费 endpoint 与身份，
+  不加载权重。验证配置的工具（`validate_config.py`）显式要求本机 artifacts。
+
+消费端主机的前置条件：
+
+- 必须持有每个 enabled service 的 bundle 目录和其中的 `inference_manifest.json`。
+- 权重和 deployment artifacts 只需要存在于托管模型的主机。
+- 两台主机使用同一份 robot YAML；`bundle_path` 在各自主机上解析到实际路径。
+
+示例：
+
+```bash
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/robot.yaml \
+    with_model_services:=false
+```

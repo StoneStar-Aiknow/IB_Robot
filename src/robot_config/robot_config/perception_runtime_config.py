@@ -98,8 +98,17 @@ class PerceptionRuntimeConfig:
         return generation or 1
 
 
-def parse_perception_runtime_config(robot_config: Mapping[str, Any]) -> PerceptionRuntimeConfig:
-    """Validate the ordered model-service list without a family vocabulary."""
+def parse_perception_runtime_config(
+    robot_config: Mapping[str, Any], *, require_local_artifacts: bool = True
+) -> PerceptionRuntimeConfig:
+    """Validate the ordered model-service list without a family vocabulary.
+
+    ``require_local_artifacts=False`` serves the host that leaves the model
+    services to another machine (``with_model_services:=false``): identity,
+    endpoints and the semantic contract still validate from the bundle's
+    manifest metadata, but the weights and deployment artifacts do not have to
+    exist on this host — only where the services run.
+    """
 
     perception = robot_config.get("perception_services", {})
     if not isinstance(perception, Mapping):
@@ -114,12 +123,17 @@ def parse_perception_runtime_config(robot_config: Mapping[str, Any]) -> Percepti
     raw_services = perception.get("services", [])
     if not isinstance(raw_services, Sequence) or isinstance(raw_services, str | bytes):
         raise PerceptionRuntimeConfigError(f"{path}.services must be a list")
-    services = tuple(_parse_service(value, index, path) for index, value in enumerate(raw_services))
+    services = tuple(
+        _parse_service(value, index, path, require_local_artifacts=require_local_artifacts)
+        for index, value in enumerate(raw_services)
+    )
     _validate_conflicts(services)
     return PerceptionRuntimeConfig(services)
 
 
-def _parse_service(value: Any, index: int, parent_path: str) -> PerceptionModelServiceConfig:
+def _parse_service(
+    value: Any, index: int, parent_path: str, *, require_local_artifacts: bool = True
+) -> PerceptionModelServiceConfig:
     service_path = f"{parent_path}.services[{index}]"
     if not isinstance(value, Mapping):
         raise PerceptionRuntimeConfigError(f"{service_path} must be a mapping")
@@ -158,7 +172,9 @@ def _parse_service(value: Any, index: int, parent_path: str) -> PerceptionModelS
             raise PerceptionRuntimeConfigError(f"{service_path}.service_type must use package/srv/Type syntax")
         if not _ENDPOINT_PATTERN.fullmatch(endpoint):
             raise PerceptionRuntimeConfigError(f"{service_path}.endpoint must be an absolute ROS name")
-        validated_manifest = _validate_bundle(bundle_path, deployment, service_path)
+        validated_manifest = _validate_bundle(
+            bundle_path, deployment, service_path, require_local_artifacts=require_local_artifacts
+        )
 
     return PerceptionModelServiceConfig(
         instance_id=instance_id,
@@ -216,14 +232,26 @@ def _resolve_bundle_path(value: str, service_path: str) -> Path:
     return resolved
 
 
-def _validate_bundle(path: Path, deployment: str, service_path: str) -> ValidatedManifest:
-    from inference_manifest import MANIFEST_FILENAME, ManifestError, load_inference_manifest
+def _validate_bundle(
+    path: Path, deployment: str, service_path: str, *, require_local_artifacts: bool = True
+) -> ValidatedManifest:
+    from inference_manifest import (
+        MANIFEST_FILENAME,
+        ManifestError,
+        load_inference_manifest,
+        load_inference_manifest_metadata,
+    )
 
     manifest_path = path / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise PerceptionRuntimeConfigError(f"{service_path} bundle is missing {MANIFEST_FILENAME}: {manifest_path}")
     try:
-        validated = load_inference_manifest(path, deployment)
+        # The non-hosting launch validates the same identity, endpoint and
+        # semantic contract from the manifest alone — the same metadata-only
+        # load the distributed edge uses — so only the host that runs the
+        # services has to hold their weights and deployment artifacts.
+        loader = load_inference_manifest if require_local_artifacts else load_inference_manifest_metadata
+        validated = loader(path, deployment)
     except ManifestError as exc:
         raise PerceptionRuntimeConfigError(
             f"{service_path} failed bundle validation for deployment {deployment!r}: {exc}"

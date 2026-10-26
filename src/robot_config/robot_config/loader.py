@@ -848,8 +848,15 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
-    """Validate the standalone semantic mapping SSOT contract."""
+def validate_semantic_mapping_config(
+    robot_config: dict[str, Any], *, require_local_model_artifacts: bool = True
+) -> list[str]:
+    """Validate the standalone semantic mapping SSOT contract.
+
+    ``require_local_model_artifacts`` follows ``validate_robot_config_dict``:
+    the non-hosting launch resolves the semantic roles against bundle metadata
+    without demanding the artifacts of services this host does not run.
+    """
     config = robot_config.get("semantic_mapping")
     if config is None:
         return []
@@ -954,7 +961,7 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
             )
     _positive_number(perception, "service_wait_sec", perception_path, errors)
     if mapping_backend == "service":
-        errors.extend(_validate_semantic_service_roles(robot_config, perception))
+        errors.extend(_validate_semantic_service_roles(robot_config, perception, require_local_model_artifacts))
     elif mapping_backend == "embedded" and not bool(perception.get("allow_legacy_embedded", False)):
         errors.append("semantic_mapping.perception.allow_legacy_embedded must be true for the embedded backend")
 
@@ -1110,7 +1117,9 @@ _SEMANTIC_SERVICE_TYPES = {
 _CONSTRUCTION_ROLES = frozenset({"sam2_masks", "ram_plus_tags", "siglip2_image"})
 
 
-def _validate_semantic_service_roles(robot_config: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+def _validate_semantic_service_roles(
+    robot_config: dict[str, Any], perception: dict[str, Any], require_local_model_artifacts: bool
+) -> list[str]:
     errors: list[str] = []
     roles = perception.get("semantic_roles")
     if not isinstance(roles, dict):
@@ -1122,7 +1131,7 @@ def _validate_semantic_service_roles(robot_config: dict[str, Any], perception: d
         _required_string(roles, role, "semantic_mapping.perception.semantic_roles", errors)
 
     try:
-        runtime = parse_perception_runtime_config(robot_config)
+        runtime = parse_perception_runtime_config(robot_config, require_local_artifacts=require_local_model_artifacts)
     except PerceptionRuntimeConfigError:
         return errors
     services = {service.instance_id: service for service in runtime.services}
@@ -2001,6 +2010,7 @@ def load_robot_config_dict(
     nav_stage: str = "",
     materialize_benchmark_transport: bool | None = None,
     defer_interface_binding: bool = False,
+    require_local_model_artifacts: bool = True,
 ) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
@@ -2011,6 +2021,9 @@ def load_robot_config_dict(
     after all launch overrides and the effective runtime target are resolved.
     ``defer_interface_binding`` is only for live launch's structural first phase;
     all normal loaders require an embedded or file-backed description for logical IDs.
+    ``require_local_model_artifacts=False`` is the launch path of a host that
+    leaves the model services to another machine (``with_model_services:=false``):
+    see :func:`validate_robot_config_dict`.
     """
     resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(
         resolve_robot_config_path(config_path=config_path)
@@ -2073,7 +2086,9 @@ def load_robot_config_dict(
     _apply_approved_camera_calibration(robot_config)
     _warn_unbound_serial_cameras(robot_config)
     validate_robot_config_dict(
-        robot_config, deferred_interfaces=defer_interface_binding and bool(required_interface_ids(robot_config))
+        robot_config,
+        deferred_interfaces=defer_interface_binding and bool(required_interface_ids(robot_config)),
+        require_local_model_artifacts=require_local_model_artifacts,
     )
     return robot_config
 
@@ -2150,8 +2165,17 @@ def validate_voice_latency_options(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfaces: bool = False) -> None:
-    """Validate an effective config, including an in-memory launch binding before snapshotting."""
+def validate_robot_config_dict(
+    robot_config: dict[str, Any], *, deferred_interfaces: bool = False, require_local_model_artifacts: bool = True
+) -> None:
+    """Validate an effective config, including an in-memory launch binding before snapshotting.
+
+    ``require_local_model_artifacts=False`` is the launch path of a host that
+    leaves the model services to another machine (``with_model_services:=false``):
+    the perception services still validate their identity, endpoints and
+    semantic contract from bundle metadata, without demanding the weights and
+    deployment artifacts that only the hosting machine holds.
+    """
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_runtime_provider_config(robot_config))
     validation_errors.extend(validate_runtime_owned_audio_config(robot_config))
@@ -2170,10 +2194,12 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
         except ValueError as exc:
             validation_errors.append(str(exc))
     try:
-        parse_perception_runtime_config(robot_config)
+        parse_perception_runtime_config(robot_config, require_local_artifacts=require_local_model_artifacts)
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
-    validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    validation_errors.extend(
+        validate_semantic_mapping_config(robot_config, require_local_model_artifacts=require_local_model_artifacts)
+    )
     validation_errors.extend(validate_speech_direction_config(robot_config))
     validation_errors.extend(validate_voice_latency_options(robot_config))
     if not deferred_interfaces:
@@ -2533,11 +2559,20 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     )
 
 
-def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
+def load_robot_config(
+    config_path: str | Path | None = None, *, require_local_model_artifacts: bool = False
+) -> RobotConfig:
     """Load robot configuration from YAML file.
 
     Args:
         config_path: Path to robot configuration YAML file
+        require_local_model_artifacts: demand the perception services' weights and
+            deployment artifacts locally. The default ``False`` is the contract-reader
+            semantics of this loader's callers (dispatchers, recorders, viewers read
+            their observation/action contract): identity, endpoints and the semantic
+            contract still validate from bundle metadata, and the weights are the
+            hosting launch's business — its config load and the perception_models
+            builder keep the full artifact check.
 
     Returns:
         RobotConfig object
@@ -2546,7 +2581,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         FileNotFoundError: If config file doesn't exist
         ValueError: If config is invalid
     """
-    robot_data = load_robot_config_dict(config_path)
+    robot_data = load_robot_config_dict(config_path, require_local_model_artifacts=require_local_model_artifacts)
     resolved_config_path = Path(robot_data["_config_path"])
     config_dir = resolved_config_path.parent
 
@@ -2600,7 +2635,9 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         rpc_timeout_sec=embodied.timeouts["rpc_timeout_sec"],
     )
     semantic_mapping = load_semantic_mapping_config(robot_data.get("semantic_mapping", {}))
-    perception_services = parse_perception_runtime_config(robot_data)
+    perception_services = parse_perception_runtime_config(
+        robot_data, require_local_artifacts=require_local_model_artifacts
+    )
 
     return RobotConfig(
         name=name,
@@ -3151,6 +3188,9 @@ def validate_config(config: RobotConfig) -> list[str]:
     }
     errors.extend(
         validate_semantic_mapping_config(
+            # Re-validation of an already loaded object: the roles, service types
+            # and identities are what matters here. Whether the artifacts exist
+            # locally was decided by the load that produced this config.
             {
                 "semantic_mapping": semantic_mapping_dict,
                 "perception_services": {
@@ -3186,7 +3226,8 @@ def validate_config(config: RobotConfig) -> list[str]:
                     }
                     for peripheral in config.peripherals
                 ],
-            }
+            },
+            require_local_model_artifacts=False,
         )
     )
 
@@ -3426,7 +3467,9 @@ def validate_config_file(config_path: str | Path) -> bool:
         True if valid, False otherwise
     """
     try:
-        config = load_robot_config(config_path)
+        # A validation tool answers for the machine it runs on: keep demanding
+        # the configured artifacts here, unlike the contract-reader default.
+        config = load_robot_config(config_path, require_local_model_artifacts=True)
         errors = validate_config(config)
 
         if errors:

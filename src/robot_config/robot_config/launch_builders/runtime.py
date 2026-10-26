@@ -284,20 +284,27 @@ def runtime_ready_waiter(
     )
 
 
-def materialize_interface_config(robot_config: dict[str, Any], descriptor: dict, destination: Path) -> dict:
+def materialize_interface_config(
+    robot_config: dict[str, Any], descriptor: dict, destination: Path, *, require_local_model_artifacts: bool = True
+) -> dict:
     """Validate then atomically publish one complete, bound consumer configuration.
 
     The serialised snapshot drops the framework-private
     ``runtime._disabled_peripherals`` (runtime-peripheral-overrides D2; the
     filtered entries are an in-memory hand-off to the fragment builder). The
     input configuration is not mutated.
+
+    ``require_local_model_artifacts=False`` carries the launch's
+    ``with_model_services:=false``: the bound snapshot then validates the
+    perception services by metadata, so a host that only calls the remotely
+    served endpoints does not need their weights and artifacts.
     """
     from copy import deepcopy
 
     from robot_config.loader import validate_robot_config_dict
 
     effective = bind_robot_interfaces(robot_config, descriptor, require_ready=True)
-    validate_robot_config_dict(effective)
+    validate_robot_config_dict(effective, require_local_model_artifacts=require_local_model_artifacts)
     snapshot = {key: value for key, value in effective.items() if key != "_config_path"}
     runtime = snapshot.get("runtime")
     if isinstance(runtime, dict):
@@ -330,6 +337,7 @@ def generate_bound_runtime_actions(
     display: bool = False,
     readiness_timeout_s: float = 60.0,
     start_provider: bool = True,
+    require_local_model_artifacts: bool = True,
 ) -> list:
     """Start the provider once; only construct consumers after the live description is bound.
 
@@ -340,6 +348,11 @@ def generate_bound_runtime_actions(
 
     ``start_provider=False`` binds to the runtime another host already runs
     (as the X2's grasp pipeline on the Orin does to the robot-side stack).
+
+    ``require_local_model_artifacts=False`` carries the launch's
+    ``with_model_services:=false``: the bound snapshot validates the perception
+    services by metadata, so a host that only calls the remotely served
+    endpoints does not need their weights and artifacts.
     """
     directory = Path(tempfile.mkdtemp(prefix="ibrobot_interfaces_"))
     description_path = directory / "description.yaml"
@@ -374,7 +387,12 @@ def generate_bound_runtime_actions(
         try:
             from robot_runtime.interface_description import load_description
 
-            effective = materialize_interface_config(robot_config, load_description(description_path), effective_path)
+            effective = materialize_interface_config(
+                robot_config,
+                load_description(description_path),
+                effective_path,
+                require_local_model_artifacts=require_local_model_artifacts,
+            )
             logger.info(f"Runtime interfaces bound; consumer snapshot: {effective_path}")
             return construct_consumers(effective)
         except Exception as exc:

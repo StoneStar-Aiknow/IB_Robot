@@ -16,8 +16,10 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from robot_config.launch_registry.launch_options import ArgumentSpec
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.perception_runtime_config import parse_perception_runtime_config
+from robot_config.utils import parse_bool
 
 # The operator location is owned by torch_models.graspgenx_ascend_310p
 # .custom_ops, which cannot be imported here: its package imports torch_npu.
@@ -112,6 +114,29 @@ __all__ = ["generate_perception_model_nodes"]
 # ---------------------------------------------------------------------------
 
 
+# A robot whose models are served from another host (the pipeline next to the
+# camera, the models on a GPU machine) keeps its perception_services as they
+# are: the endpoints its clients call stay configured, only the local hosts of
+# those services are not started. Config loading then validates each enabled
+# service's identity, endpoints and semantic contract from the bundle's manifest
+# metadata, so this host needs the bundle directory with its
+# inference_manifest.json but not the weights or deployment artifacts.
+_PERCEPTION_MODELS_ARGUMENTS = (
+    ArgumentSpec(
+        name="with_model_services",
+        declared_default="true",
+        absent_fallback="true",
+        description="Start the configured perception model services on this host. "
+        "false when another host serves them; the configured endpoints are still called, "
+        "and only each bundle's manifest metadata has to be present here.",
+    ),
+)
+
+
+def model_services_requested(context: LaunchBuildContext) -> bool:
+    return parse_bool(context.arguments.get("with_model_services", "true"), default=True)
+
+
 def build_perception_models(context: LaunchBuildContext) -> BuildResult:
     from inference_service.launch_builders.perception_models import generate_perception_model_nodes
 
@@ -122,4 +147,6 @@ PERCEPTION_MODELS_BUILDER = BuilderSpec(
     id="perception_models",
     factory=f"{__name__}:build_perception_models",
     timing="runtime_ready",
+    arguments=_PERCEPTION_MODELS_ARGUMENTS,
+    enabled=model_services_requested,
 )

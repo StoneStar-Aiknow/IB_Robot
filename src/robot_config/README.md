@@ -347,6 +347,17 @@ service entry 由消费功能自行注册。
 metadata 兼容性；通用 parser 仍不维护模型 family 词表。有效 role bindings、service declarations、deployment
 fingerprint 和 semantic identity fingerprint 共同生成与路径和列表顺序无关的正 63-bit configuration generation。
 
+`with_model_services` launch 参数（`inference_service` 的 `perception_models` 条目声明，默认 `true`）
+决定本机是否启动这些服务节点。参数为 `false` 时，配置加载和 live binding 按元数据校验
+enabled service。身份、endpoint、deployment 名称和语义契约照常校验。bundle 文件和
+deployment artifacts 只在托管主机校验。
+
+消费端主机只需要每个 enabled service 的 bundle 目录和 `inference_manifest.json`，
+不需要权重文件。semantic mapping 的参数构造与 `load_robot_config()` 的契约读取同样
+按元数据校验。scheduled dispatcher 和 recording node 这类消费者只读取自己的契约。
+验证配置的工具显式要求本机 artifacts。详见
+[inference_service README](../inference_service/README.md)。
+
 ## Sim camera pose override（仅限仿真标定，opt-in）
 
 仿真启动时，URDF / MJCF 中相机位姿默认来自 robot YAML 与
