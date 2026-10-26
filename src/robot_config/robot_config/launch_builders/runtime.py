@@ -234,6 +234,19 @@ def generate_runtime_provider_actions(
         PythonLaunchDescriptionSource(launch_path),
         launch_arguments=include_arguments.items(),
     )
+    waiter = runtime_ready_waiter(
+        robot_config, readiness_timeout_s=readiness_timeout_s, description_output=description_output
+    )
+    return [include], waiter
+
+
+def runtime_ready_waiter(
+    robot_config: dict[str, Any], *, readiness_timeout_s: float = 60.0, description_output: str | None = None
+) -> Node:
+    """``wait_for_runtime`` for the configured provider, wherever it runs: exits 0 once it is ready."""
+    provider = runtime_provider(robot_config)
+    if not provider:
+        raise RuntimeError("robot.runtime.provider is required to wait for a runtime")
     required = required_capabilities(robot_config)
     # runtime-peripheral-overrides review round 2 (Major 1, corrected): the
     # online semantic-mapping consumer needs the configured camera's colour,
@@ -247,7 +260,7 @@ def generate_runtime_provider_actions(
     semantic_interface_ids = semantic_mapping_interface_ids(robot_config)
     interface_ids = required_interface_ids(robot_config) if description_output else []
     instance_id = (robot_config.get("runtime") or {}).get("instance_id")
-    waiter = Node(
+    return Node(
         package="robot_runtime",
         executable="wait_for_runtime",
         name="wait_for_runtime",
@@ -269,7 +282,6 @@ def generate_runtime_provider_actions(
             *(["--instance-id", instance_id] if instance_id else []),
         ],
     )
-    return [include], waiter
 
 
 def materialize_interface_config(robot_config: dict[str, Any], descriptor: dict, destination: Path) -> dict:
@@ -317,6 +329,7 @@ def generate_bound_runtime_actions(
     simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
+    start_provider: bool = True,
 ) -> list:
     """Start the provider once; only construct consumers after the live description is bound.
 
@@ -324,20 +337,29 @@ def generate_bound_runtime_actions(
     (runtime-simulation-transport D3): the world generic launch started ahead
     of this call is passed to the provider as ``gazebo_world`` plus the full
     spawn pose instead of being recomputed or re-launched.
+
+    ``start_provider=False`` binds to the runtime another host already runs
+    (as the X2's grasp pipeline on the Orin does to the robot-side stack).
     """
     directory = Path(tempfile.mkdtemp(prefix="ibrobot_interfaces_"))
     description_path = directory / "description.yaml"
     effective_path = directory / "robot.yaml"
     try:
-        providers, waiter = generate_runtime_provider_actions(
-            robot_config,
-            use_sim=use_sim,
-            sim_platform=sim_platform,
-            simulation_startup=simulation_startup,
-            display=display,
-            readiness_timeout_s=readiness_timeout_s,
-            description_output=str(description_path),
-        )
+        if start_provider:
+            providers, waiter = generate_runtime_provider_actions(
+                robot_config,
+                use_sim=use_sim,
+                sim_platform=sim_platform,
+                simulation_startup=simulation_startup,
+                display=display,
+                readiness_timeout_s=readiness_timeout_s,
+                description_output=str(description_path),
+            )
+        else:
+            providers = []
+            waiter = runtime_ready_waiter(
+                robot_config, readiness_timeout_s=readiness_timeout_s, description_output=str(description_path)
+            )
     except Exception:
         shutil.rmtree(directory)
         raise

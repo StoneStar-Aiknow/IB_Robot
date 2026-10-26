@@ -1046,6 +1046,74 @@ def test_launch_service_materializes_before_consumer_process(config, descriptor,
         )
 
 
+def test_a_launch_binds_to_a_runtime_another_host_runs(config, descriptor, monkeypatch, tmp_path):
+    from launch import LaunchDescription, LaunchService
+    from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler, TimerAction
+    from launch.event_handlers import OnProcessExit
+    from launch.events import Shutdown
+
+    from robot_config.launch_builders import runtime as builder
+
+    consumed = tmp_path / "consumed"
+    calls = []
+
+    def waiter(_config, *, description_output, **_kwargs):
+        calls.append(description_output)
+        return ExecuteProcess(
+            cmd=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+                description_output,
+                yaml.safe_dump(descriptor),
+            ]
+        )
+
+    def consumer(effective):
+        process = ExecuteProcess(
+            cmd=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())",
+                effective["_config_path"],
+                str(consumed),
+            ]
+        )
+        return [
+            RegisterEventHandler(OnProcessExit(target_action=process, on_exit=[EmitEvent(event=Shutdown())])),
+            process,
+        ]
+
+    monkeypatch.setattr(
+        builder, "generate_runtime_provider_actions", lambda *_a, **_k: pytest.fail("this host starts no runtime")
+    )
+    monkeypatch.setattr(builder, "runtime_ready_waiter", waiter)
+    monkeypatch.setattr(builder.tempfile, "tempdir", str(tmp_path))
+    actions = builder.generate_bound_runtime_actions(config, consumer, use_sim=False, start_provider=False)
+    service = LaunchService()
+    service.include_launch_description(
+        LaunchDescription(
+            [*actions, TimerAction(period=10.0, actions=[EmitEvent(event=Shutdown(reason="test timeout"))])]
+        )
+    )
+    service.run()
+    assert len(calls) == 1
+    bound = yaml.safe_load(consumed.read_text())["robot"]
+    assert bound["runtime"]["interface_description"]["robot"] == descriptor["robot"]
+
+
+def test_waiting_for_a_runtime_names_its_provider_and_where_to_write_its_description(config):
+    waiter = runtime.runtime_ready_waiter(config, readiness_timeout_s=5.0, description_output="/tmp/d.yaml")
+    arguments = [getattr(part, "text", part) for argument in waiter.cmd for part in argument]
+    assert vars(waiter).get("_Node__node_executable") == "wait_for_runtime"
+    command = " ".join(str(argument) for argument in arguments)
+    assert f"--runtime-name {config['runtime']['provider']}" in command
+    assert "--description-output /tmp/d.yaml" in command
+    del config["runtime"]["provider"]
+    with pytest.raises(RuntimeError, match="provider is required"):
+        runtime.runtime_ready_waiter(config)
+
+
 def test_binding_rejects_selectors_that_name_no_interface_joint(config, descriptor, description_api):
     # `<field>.<joint>` selectors resolve by joint name; a suffix outside the
     # interface's declared joints reads the wrong joint (or NaN) silently.

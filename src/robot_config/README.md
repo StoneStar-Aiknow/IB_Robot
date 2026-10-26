@@ -299,6 +299,21 @@ bringup）时缺失键回落到 `absent_fallback`。两者刻意不同（`robot_
 `with_moveit`），所有权只决定由谁声明。与核心表或其他业务贡献重名在 `compose_argument_specs`
 聚合时拒绝，发生在任何副作用阶段之前。
 
+### 绑定另一台主机上的运行时（Python API）
+
+`generate_bound_runtime_actions()` 等待 runtime 描述并构造消费者，默认同时启动本机的 runtime
+provider。`start_provider=False` 表示 runtime 已由另一台主机运行：launch 只等待其就绪并绑定接口
+描述，不再启动第二个 runtime。`runtime_ready_waiter()` 单独导出该等待节点，两条路径共用同一个
+等待器。
+
+使用约束：
+
+- 这两个参数属于 Python API（`robot_config.launch_builders.runtime`）。它们不是通用的
+  launch CLI 参数。
+- 需要跨主机绑定的入口在自己的 launch 文件中调用该 API，并传入 `start_provider=False`。
+- 等待节点要求 `robot.runtime.provider` 已配置。provider 缺失时启动失败。
+- 就绪失败或超时按返回码结束启动，消费者不会启动。
+
 ### 通用模型服务 SSOT
 
 模型服务使用顶层 `perception_services`，不属于具体消费者。每个 enabled entry 必须显式选择 manifest 中的命名
