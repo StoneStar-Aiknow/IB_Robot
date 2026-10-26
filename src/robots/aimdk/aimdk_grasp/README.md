@@ -197,6 +197,24 @@ description's chain with a fitted torso tilt and wrist payload), and
 `require_executable` refuses a plan that leaves MC's limits or whose predicted sag
 leaves less than 0.06 of the tracking limit.
 
+## The hand
+
+`aimdk_grasp.omnihand.OmniHandEffector` is the left OmniHand as the pipeline's
+end effector, streamed on the runtime's `joint.hand_stream` (the left hand's ten
+native joints, then ten zeros for the right, the packing the motion-control
+contract was verified with). The last command is kept alive between actions, so
+the hand holds its target while the arm moves; after a goal the stream is
+released and the platform keeps it.
+
+Preshape and release open along a straight line, 0.01 rad per 50 Hz frame, and
+wait up to 3 s for the fingers; a hand left more than 0.1 rad short of open is
+blocked. The close moves each finger on its own and freezes it at its first
+contact, a fingertip pad reading 30 or more or the flex joint 0.15 rad behind
+its command; the thumb and one more finger in contact is a grip. The hand's
+fault codes are not used and the runtime does not publish them: a finger
+pressing an object reports one for as long as it grips. Open and close shapes
+come from the GraspGenX gripper description.
+
 ## Observations and revalidation
 
 `aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the
