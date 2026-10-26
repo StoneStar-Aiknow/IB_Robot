@@ -12,6 +12,10 @@ any launch builder or ROS package.
 ``phrases``    for each event in ``EVENTS``, a non-empty list of phrases; an
                event left out keeps its default. ZipVoice fails on ASCII
                letters, so a phrase must not contain any.
+``utterance_topic``  empty (the default: transition phrases only, today's
+               behaviour) or an absolute ROS name — the visual interaction
+               utterance topic this voice also speaks for, on demand rather
+               than from the phrase cache.
 
 A section accepts only its known keys, so a misspelt key fails at launch
 instead of being ignored. Every error is a ``ValueError`` that starts with the
@@ -49,8 +53,17 @@ SERVICE_WAIT_ERROR_SEC = 60.0
 SERVICE_WAIT_REPEAT_SEC = 30.0
 
 SECTION_PATH = "mirror_session.voice"
-_KEYS = ("enabled", "queue_max", "phrases")
+_KEYS = ("enabled", "queue_max", "phrases", "utterance_topic")
 _ASCII_LETTER = re.compile(r"[A-Za-z]")
+
+
+def has_ascii_letters(text: str) -> bool:
+    """Whether ZipVoice cannot speak ``text``: it fails on ASCII letters.
+
+    The phrase check above refuses such phrases at launch; an utterance arrives
+    at run time, so its consumer filters with this instead.
+    """
+    return bool(_ASCII_LETTER.search(text))
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,9 @@ class VoiceSection:
     queue_max: int = DEFAULT_QUEUE_MAX
     # Every event in EVENTS order; read-only.
     phrases: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: DEFAULT_PHRASES)
+    # The visual interaction utterance topic this voice also speaks for; empty
+    # when the deployment has no such feature (transition phrases only).
+    utterance_topic: str = ""
 
 
 def parse_voice_section(section: Mapping[str, Any] | None) -> VoiceSection:
@@ -76,7 +92,10 @@ def parse_voice_section(section: Mapping[str, Any] | None) -> VoiceSection:
     queue_max = section.get("queue_max", DEFAULT_QUEUE_MAX)
     if isinstance(queue_max, bool) or not isinstance(queue_max, int) or not 1 <= queue_max <= QUEUE_MAX_LIMIT:
         raise ValueError(f"{SECTION_PATH}.queue_max: must be an integer from 1 to {QUEUE_MAX_LIMIT}")
-    return VoiceSection(enabled, queue_max, _phrases(section.get("phrases")))
+    utterance_topic = section.get("utterance_topic", "")
+    if not isinstance(utterance_topic, str) or (utterance_topic and not utterance_topic.startswith("/")):
+        raise ValueError(f"{SECTION_PATH}.utterance_topic: must be empty or an absolute ROS name")
+    return VoiceSection(enabled, queue_max, _phrases(section.get("phrases")), utterance_topic)
 
 
 def _phrases(value: Any) -> Mapping[str, tuple[str, ...]]:
@@ -117,6 +136,7 @@ def to_json(section: VoiceSection) -> str:
         "enabled": section.enabled,
         "queue_max": section.queue_max,
         "phrases": {event: list(texts) for event, texts in section.phrases.items()},
+        "utterance_topic": section.utterance_topic,
     }
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 

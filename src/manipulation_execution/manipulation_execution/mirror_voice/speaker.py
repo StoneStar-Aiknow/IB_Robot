@@ -19,6 +19,16 @@ play        segment by segment in index order, ``pause_after_ms`` between
             two segments; then the next phrase
 ==========  ==============================================================
 
+An utterance — one dynamic sentence from the visual interaction feature,
+handed to :meth:`Speaker.on_utterance` — goes through the same queue and the
+same steps with two differences. It is synthesized on demand and never cached
+(each sentence is spoken at most once, so a cache could only grow), and its
+WAV files are removed the moment it finishes or fails: the board's temporary
+directory is tmpfs, and unbounded utterance audio is a memory leak rather
+than a disk one. When an ``utterance_gate`` is given, an utterance is also
+re-checked at the moment it would start synthesizing — the state it was
+admitted under may have changed while it waited.
+
 * At most one call is out at a time. A call with no answer within its
   timeout is a failure; its late answer is recognised by its token and
   ignored.
@@ -33,11 +43,13 @@ play        segment by segment in index order, ``pause_after_ms`` between
   is missing, ``core.ServiceWatch`` says when to log an ERROR.
 * Without the synthesis service a phrase is only taken off the queue when
   every phrase is cached; one whose files have gone since waits for the
-  service as the phrase being spoken.
+  service as the phrase being spoken. An utterance cannot be served from a
+  cache at all, so it waits for the service the same way, holding the queue.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -56,6 +68,10 @@ from manipulation_execution.mirror_voice.core import PhraseQueue, ServiceWatch, 
 
 AUDIO_FORMAT = "wav_pcm_s16le"
 FAILURES = ("synthesis", "synthesis_timeout", "audio", "playback", "playback_timeout", "playback_unavailable")
+
+# The queue entry kind of an on-demand utterance (``on_utterance``), beside the
+# state-phrase events of ``core.TransitionFilter``.
+UTTERANCE = "utterance"
 
 # success True / False is the answer; None: no answer (the call failed).
 Done = Callable[[bool | None, str], None]
@@ -89,6 +105,9 @@ class SpeakerFiles(Protocol):
 
     def exists(self, path: str) -> bool: ...
 
+    def remove_file(self, path: str) -> None:
+        """Remove one file; a file that is already gone is fine."""
+
 
 def wav_name(text: str, index: int) -> str:
     return f"{hashlib.sha256(text.encode()).hexdigest()}-{index:04d}.wav"
@@ -113,6 +132,11 @@ class WavDirectory:
 
     def exists(self, path: str) -> bool:
         return os.path.isfile(path)
+
+    def remove_file(self, path: str) -> None:
+        # Already gone is fine: the file is temporary either way.
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
 
     def remove(self) -> None:
         shutil.rmtree(self.path, ignore_errors=True)
@@ -160,6 +184,7 @@ class Speaker:
         watch: ServiceWatch | None = None,
         clock: Callable[[], float] = time.monotonic,
         log: Callable[[str, str], None] | None = None,
+        utterance_gate: Callable[[], bool] | None = None,
     ):
         self._phrases = section.phrases
         self._calls = calls
@@ -169,6 +194,9 @@ class Speaker:
         self._watch = watch or ServiceWatch()
         self._clock = clock
         self._log = log or (lambda level, message: None)
+        # Asked again when a queued utterance would start synthesizing: the
+        # state it was admitted under may be gone by then. None gates nothing.
+        self._utterance_gate = utterance_gate
         self._lock = threading.RLock()
         self._filter = TransitionFilter()
         self._queue = PhraseQueue(section.queue_max)
@@ -181,6 +209,8 @@ class Speaker:
         self._tts_available: bool | None = None
         self.spoken = 0
         self.failed = dict.fromkeys(FAILURES, 0)
+        self.utterances = 0
+        self.utterances_dropped = 0
         self.cache_missing = 0
         self.late_answers = 0
 
@@ -205,6 +235,25 @@ class Speaker:
             self._log("info", f"{event}: queued {text!r}")
             self._advance(self._clock())
             return event
+
+    def on_utterance(self, text: str) -> None:
+        """One dynamic sentence from the visual interaction feature.
+
+        The node has already admitted it (speakable kind, mirror MIRRORING, no
+        ASCII letters); the queue, the pop-time gate and the same steps as a
+        phrase do the rest. Nothing here expires: an utterance that went stale
+        waiting is the gate's to drop, not the queue's.
+        """
+        text = text.strip()
+        if not text:
+            return
+        with self._lock:
+            self.utterances += 1
+            dropped = self._queue.push(UTTERANCE, text)
+            if dropped is not None:
+                self._log("warning", f"queue full ({len(self._queue)}): dropped {dropped[0]} {dropped[1]!r}")
+            self._log("info", f"{UTTERANCE}: queued {text!r}")
+            self._advance(self._clock())
 
     def tick(self) -> None:
         """Call timeouts, the synthesis service wait, the next step; the node calls it a few times a second."""
@@ -249,6 +298,26 @@ class Speaker:
                 else:
                     return
                 continue
+            head = self._queue.peek()
+            if head is not None and head[0] == UTTERANCE:
+                # The state an utterance was admitted under may be gone by the
+                # time it would start synthesizing; the gate is asked again at
+                # the only moment that matters. Closed means dropped, not held:
+                # holding it would block the phrases behind it for as long as
+                # the gate stays closed.
+                if self._utterance_gate is not None and not self._utterance_gate():
+                    self._queue.pop()
+                    self.utterances_dropped += 1
+                    self._log("info", f"{UTTERANCE}: dropped {head[1]!r}: the gate closed while it waited")
+                    continue
+                if not self._tts_ready():
+                    # Never cached, so the service is its only way forward. It
+                    # waits at the head rather than letting the phrases behind
+                    # it jump the queue: their order is part of what is said.
+                    return
+                event, text = self._queue.pop()
+                self._speech = _Speech(event, text)
+                continue
             if len(self._queue) and (self._tts_ready() or self._all_cached()):
                 event, text = self._queue.pop()
                 self._speech = _Speech(event, text, self._cached_clips(text))
@@ -284,6 +353,7 @@ class Speaker:
         if speech.index >= len(speech.clips):
             self.spoken += 1
             self._speech = None
+            self._discard(speech)
             self._log("info", f"{speech.event}: said {speech.text!r}")
             return True
         if now < speech.resume_at:
@@ -305,6 +375,7 @@ class Speaker:
         self._flight = _Flight(call, token, now, timeout_s, text)
         try:
             if call == "synthesis":
+
                 def synthesized(ok: bool | None, message: str, segments: Sequence[Any] = ()) -> None:
                     self._answer(token, ok, message, segments)
 
@@ -336,8 +407,11 @@ class Speaker:
         except Exception as exc:  # noqa: BLE001 - audio that cannot be checked or written is bad audio
             self._fail("audio", text, str(exc))
             return
-        self._cache[text] = clips
         speech = self._speech
+        if text in self._texts:
+            self._cache[text] = clips
+        # An utterance's clips are not cached — each is spoken at most once —
+        # and its files are removed when its speech ends or fails.
         if speech is not None and speech.text == text and not speech.clips:
             speech.clips = clips
 
@@ -347,6 +421,12 @@ class Speaker:
         if speech.index < len(speech.clips):
             speech.resume_at = self._clock() + speech.clips[speech.index - 1].pause_s
 
+    def _discard(self, speech: _Speech) -> None:
+        """Remove an utterance's WAV files; a state phrase's stay for the next time."""
+        if speech.event == UTTERANCE and speech.text not in self._texts:
+            for clip in speech.clips:
+                self._files.remove_file(clip.path)
+
     def _write(self, text: str, segments: Sequence[Any]) -> tuple[_Clip, ...]:
         """Check the segments as the visual game announcer does, then write them."""
         ordered = sorted(segments, key=lambda segment: int(segment.index))
@@ -355,14 +435,21 @@ class Speaker:
         if [int(segment.index) for segment in ordered] != list(range(len(ordered))):
             raise ValueError("audio segment indexes must be contiguous from zero")
         clips = []
-        for segment in ordered:
-            if str(segment.audio_format).strip().lower() != AUDIO_FORMAT:
-                raise ValueError(f"unsupported audio format {segment.audio_format!r}")
-            data = bytes(segment.audio_data)
-            if not data.startswith(b"RIFF") or b"WAVE" not in data[:16]:
-                raise ValueError(f"audio segment {segment.index} is not a WAV file")
-            path = self._files.write(wav_name(text, int(segment.index)), data)
-            clips.append(_Clip(path, max(0.0, int(segment.pause_after_ms) / 1000.0)))
+        try:
+            for segment in ordered:
+                if str(segment.audio_format).strip().lower() != AUDIO_FORMAT:
+                    raise ValueError(f"unsupported audio format {segment.audio_format!r}")
+                data = bytes(segment.audio_data)
+                if not data.startswith(b"RIFF") or b"WAVE" not in data[:16]:
+                    raise ValueError(f"audio segment {segment.index} is not a WAV file")
+                path = self._files.write(wav_name(text, int(segment.index)), data)
+                clips.append(_Clip(path, max(0.0, int(segment.pause_after_ms) / 1000.0)))
+        except Exception:
+            # A speech that cannot be written is a dropped one, and nothing
+            # else will ever remove the files written so far.
+            for clip in clips:
+                self._files.remove_file(clip.path)
+            raise
         return tuple(clips)
 
     def _fail(self, reason: str, text: str, message: str) -> None:
@@ -372,6 +459,7 @@ class Speaker:
         speech = self._speech
         if speech is not None and speech.text == text:
             self._speech = None
+            self._discard(speech)
             self._log("warning", f"{speech.event}: dropped {text!r}: {reason}: {message}")
         else:
             self._log("warning", f"precache of {text!r}: {reason}: {message}")
@@ -388,6 +476,8 @@ class Speaker:
                 "speaking": self._speech and self._speech.text,
                 "in_flight": self._flight and self._flight.call,
                 "spoken": self.spoken,
+                "utterances": self.utterances,
+                "utterances_dropped": self.utterances_dropped,
                 "dropped_queue_full": self._queue.dropped,
                 "failed": dict(self.failed),
                 "late_answers": self.late_answers,

@@ -37,6 +37,15 @@ KINDS = (KIND_NONE, KIND_UNCERTAIN, KIND_OBJECT, KIND_DISPLAY)
 
 # Kinds that carry a candidate to speak. The others never produce an utterance.
 SPEAKABLE_KINDS = (KIND_OBJECT, KIND_DISPLAY)
+# Kinds an utterance may carry on the wire, which the mirror voice admits.
+# The two extra ones come from the chatter mode (visual_interaction.session
+# .chatter): there the model only names what it sees, and the line spoken is
+# chosen from a host-owned phrase bank, so an "action" utterance is our own
+# sentence keyed by a matched gesture, not a model's claim about one. They are
+# not in KINDS: the closed-schema model still cannot report a gesture.
+KIND_ACTION = "action"
+KIND_CHATTER = "chatter"
+UTTERANCE_KINDS = SPEAKABLE_KINDS + (KIND_ACTION, KIND_CHATTER)
 
 # The only subjects the first version may talk about.
 #
@@ -88,6 +97,11 @@ SUPPRESS_SCHEMA_INVALID = "SCHEMA_INVALID"
 # visitor would say the same things to them again every couple of minutes. Only
 # an explicit hand-over, or a confirmed absence, ends it.
 SUPPRESS_WAITING_NEXT_VISITOR = "WAITING_NEXT_VISITOR"
+# The deployment's speech context is absent. In the magicmirror entry the
+# rounds are suspended with this while the mirror session is not MIRRORING (or
+# its state went stale): the session keeps observing but calls no model, so a
+# quiet period here reads as "the feature is parked", not as a fault.
+SUPPRESS_MIRROR_INACTIVE = "MIRROR_INACTIVE"
 SUPPRESS_REASONS = (
     SUPPRESS_NO_NEW_TOPIC,
     SUPPRESS_UNCERTAIN,
@@ -102,6 +116,7 @@ SUPPRESS_REASONS = (
     SUPPRESS_MODEL_NOT_READY,
     SUPPRESS_SCHEMA_INVALID,
     SUPPRESS_WAITING_NEXT_VISITOR,
+    SUPPRESS_MIRROR_INACTIVE,
 )
 
 # Timing defaults. Every one of these is a proposal until phase zero measures

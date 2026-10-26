@@ -1,0 +1,15 @@
+# aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml with the standing-zone actor
+# selector: the mirror follows one person whose feet are inside the floor zone
+# drawn on the head camera, and lets go when they leave it or someone stands in
+# front of them. Both files live on the board, outside the tree, so the zone
+# can be redrawn and the tuning changed without a build; the launch checks
+# them in full and refuses to start on a bad one. Each refresh's candidates
+# and decision go to /motion_imitation_stream/actor_candidates.
+# Everything else is the dexhand_rec file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml
+
+  motion_imitation_stream:
+    actor_zone_file: /root/x2-actor-run/zone/actor_zone.yaml
+    actor_tuning_file: /root/x2-actor-run/zone/actor_tuning.yaml

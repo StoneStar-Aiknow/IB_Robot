@@ -72,9 +72,13 @@ class InternVlVision(VisionLanguagePort):
     frames: int = 2
     max_new_tokens: int = 110
     categories: tuple[str, ...] = ()
+    # "observe" asks the closed-schema question; "chatter" the short open one
+    # of visual_interaction.session.chatter, whose answer is a phrase.
+    prompt_mode: str = "observe"
     # Set on failure so the node can report *why* the model is not ready
     # instead of only that it is not.
     last_error: str = field(default="", init=False)
+    prompt_tokens: int = field(default=0, init=False)
     _loaded: bool = field(default=False, init=False)
     _tokenizer: object = field(default=None, init=False)
     _detokenizer: object = field(default=None, init=False)
@@ -83,6 +87,8 @@ class InternVlVision(VisionLanguagePort):
     _prompt_ids: object = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        if self.prompt_mode not in ("observe", "chatter"):
+            raise ValueError(f"prompt_mode must be 'observe' or 'chatter', got {self.prompt_mode!r}")
         if self.frames < 1 or self.frames > VISION_BATCH:
             raise ValueError(f"frames must be between 1 and {VISION_BATCH}, got {self.frames}")
         root = Path(self.demo_root)
@@ -159,6 +165,7 @@ class InternVlVision(VisionLanguagePort):
             eos,
         )
         self._prompt_ids = np.array(self._tokenizer.encode(self._prompt_text()))
+        self.prompt_tokens = int(len(self._prompt_ids))
 
     def _prompt_text(self) -> str:
         """Our closed-schema question, with the image slots expanded.
@@ -175,8 +182,13 @@ class InternVlVision(VisionLanguagePort):
             frames=self.frames,
             image_tokens_per_frame=IMAGE_TOKENS,
         )
-        scenario = prompts.observe_scenario("runtime", frames=self.frames)
-        text = expand_images(scenario.text, shape)
+        if self.prompt_mode == "chatter":
+            from visual_interaction.session.chatter import chatter_prompt
+
+            text = expand_images(chatter_prompt(self.frames), shape)
+        else:
+            scenario = prompts.observe_scenario("runtime", frames=self.frames)
+            text = expand_images(scenario.text, shape)
         # Fail here rather than inside the generator: it raises on an overlong
         # prompt only after the vision OM has already run.
         tokens = len(self._tokenizer.encode(text))

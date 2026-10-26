@@ -45,12 +45,28 @@ _KEYS = frozenset(
         "session",
         "categories",
         "actor_state_topic",
+        "mirror_state_topic",
+        "mirror_state_stale_sec",
         "round_period_sec",
         "window_sec",
         "frames_per_window",
         "buffer_sec",
         "stale_stream_sec",
         "status_period_sec",
+        "mode",
+        "chatter",
+        "voice_status_topic",
+    }
+)
+# visual_interaction.chatter, read only with mode "chatter".
+_CHATTER_KEYS = frozenset(
+    {
+        "gap_min_sec",
+        "gap_max_sec",
+        "fresh_sec",
+        "action_cooldown_sec",
+        "object_cooldown_sec",
+        "latest_start_sec",
     }
 )
 _FRAME_SOURCE_KEYS = frozenset({"interface", "topic", "qos"})
@@ -154,6 +170,7 @@ def _categories(section: Mapping[str, object]) -> list[str]:
 
 def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> list:
     """Return the launch actions for the visual interaction session, or none."""
+    from embodied_common.mirror_session_contract import STATE_STALE_SEC
     from embodied_common.visual_interaction_contract import (
         DEFAULT_ABSENT_RESET_SEC,
         DEFAULT_CONFIRMATION_COUNT,
@@ -245,11 +262,26 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
     if not isinstance(actor_topic, str) or (actor_topic and not actor_topic.startswith("/")):
         raise ValueError("visual_interaction.actor_state_topic must be empty or an absolute ROS name")
 
+    # The mirror gate: the magicmirror entry points this at
+    # /mirror_session/state, and the rounds suspend with MIRROR_INACTIVE
+    # unless that topic currently reports MIRRORING. Empty keeps the feature
+    # ungated, which is what a deployment without a mirror wants.
+    mirror_state_topic = section.get("mirror_state_topic", "")
+    if not isinstance(mirror_state_topic, str) or (mirror_state_topic and not mirror_state_topic.startswith("/")):
+        raise ValueError("visual_interaction.mirror_state_topic must be empty or an absolute ROS name")
+    mirror_state_stale_sec = section.get("mirror_state_stale_sec", STATE_STALE_SEC)
+    if isinstance(mirror_state_stale_sec, bool) or not isinstance(mirror_state_stale_sec, int | float):
+        raise ValueError("visual_interaction.mirror_state_stale_sec must be a positive number of seconds")
+    if mirror_state_stale_sec <= 0:
+        raise ValueError("visual_interaction.mirror_state_stale_sec must be a positive number of seconds")
+
     parameters = {
         "runtime_description_json": _runtime_description(robot_config),
         "camera_interface": interface,
         "camera_topic": camera_topic,
         "actor_state_topic": actor_topic,
+        "mirror_state_topic": mirror_state_topic,
+        "mirror_state_stale_sec": float(mirror_state_stale_sec),
         "vl_implementation": implementation,
         "vl_demo_root": demo_root,
         "vl_max_new_tokens": max_new_tokens,
@@ -271,6 +303,20 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
 
     if camera_qos_json:
         parameters["camera_topic_qos_json"] = camera_qos_json
+
+    mode = section.get("mode", "observe")
+    if mode not in ("observe", "chatter"):
+        raise ValueError(f"visual_interaction.mode {mode!r} is not one of 'observe', 'chatter'")
+    chatter = _mapping(section.get("chatter", {}), "visual_interaction.chatter")
+    _unknown(chatter, _CHATTER_KEYS, "visual_interaction.chatter")
+    voice_status_topic = section.get("voice_status_topic", "")
+    if not isinstance(voice_status_topic, str) or (voice_status_topic and not voice_status_topic.startswith("/")):
+        raise ValueError("visual_interaction.voice_status_topic must be empty or an absolute ROS name")
+    parameters["mode"] = mode
+    parameters["voice_status_topic"] = voice_status_topic
+    for key in sorted(_CHATTER_KEYS):
+        if key in chatter:
+            parameters[f"chatter_{key}"] = float(chatter[key])
 
     return [
         Node(

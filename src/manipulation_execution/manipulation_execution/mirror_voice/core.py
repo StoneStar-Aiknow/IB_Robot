@@ -1,8 +1,10 @@
 """Session state messages to spoken events, the phrase queue and the TTS service wait. No ROS.
 
-The voice node only listens to ``/mirror_session/state``. Whatever started or
-stopped the session (CLI, cover gestures, the voice agent), it ends in the
-same transition, so the transition alone decides what is said:
+The voice node listens to ``/mirror_session/state`` and, when the entry wires
+it, to the visual interaction utterance topic (see
+``speaker.Speaker.on_utterance``). Whatever started or stopped the session
+(CLI, cover gestures, the voice agent), it ends in the same transition, so
+the transition alone decides what is said:
 
 =============  =========================================================
 event          transition (``last_transition`` of a state message)
@@ -119,10 +121,12 @@ def _key(transition: object) -> tuple | None:
 
 
 class PhraseQueue:
-    """Phrases waiting to be spoken, oldest first, at most ``maxlen``.
+    """Speeches waiting to be spoken, oldest first, at most ``maxlen``.
 
-    A push into a full queue drops the oldest phrase that is not a goodbye;
-    with only goodbyes queued, the oldest goodbye.
+    A state phrase or one on-demand utterance from the visual interaction
+    feature, one queue: their order is part of what is said. A push into a
+    full queue drops the oldest item that is not a goodbye; with only goodbyes
+    queued, the oldest goodbye.
     """
 
     def __init__(self, maxlen: int):
@@ -133,7 +137,7 @@ class PhraseQueue:
         self.dropped = 0
 
     def push(self, event: str, text: str) -> tuple[str, str] | None:
-        """Queue a phrase; returns the ``(event, text)`` dropped to make room, if any."""
+        """Queue one item; returns the ``(event, text)`` dropped to make room, if any."""
         dropped = None
         if len(self._items) >= self._maxlen:
             index = next((i for i, item in enumerate(self._items) if item[0] != GOODBYE), 0)
@@ -145,6 +149,10 @@ class PhraseQueue:
 
     def pop(self) -> tuple[str, str] | None:
         return self._items.popleft() if self._items else None
+
+    def peek(self) -> tuple[str, str] | None:
+        """The oldest item without taking it; ``None`` when the queue is empty."""
+        return self._items[0] if self._items else None
 
     def __len__(self) -> int:
         return len(self._items)

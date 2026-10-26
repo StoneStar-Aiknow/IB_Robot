@@ -153,6 +153,22 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
   `ros2 service call /runtime/set_mode ibrobot_msgs/srv/SetRuntimeMode "{mode: idle}"`。之后会话停在 WAIT，
   直到下一次 `mirror_start`。
 
+### mirror_voice：状态短语与看图说话的语句
+
+`mirror_voice_node` 只在 `voice_tts` 启用且 `mirror_session.voice` 配置块有效时加入 launch；配置块无效
+只记 WARNING 并降级，launch 照常。它订阅 `/mirror_session/state`（reliable + transient_local，与 operator
+相同），在会话状态迁移时说固定短语（`embodied_common/mirror_voice_contract.py` 的 `DEFAULT_PHRASES`：
+启动中 / 我准备好咯 / 开始模仿啦 / 下次再见），TTS 服务就绪后预缓存。首条状态消息的迁移不发声
+（`TransitionFilter`），避免每次重启都自言自语。
+
+`mirror_session.voice.utterance_topic` 非空时（`aimdk_x2_magicmirror` 入口配为
+`/visual_interaction/utterance`）它额外订阅该话题，把看图说话每轮的候选回复接入**同一队列**，FIFO 不
+加塞。节点侧的准入：kind 可说、未抑制、文本非空、无 ASCII 字母（ZipVoice 读不出，与短语检查同一条
+规则）、镜像仍处 MIRRORING 且状态新鲜（错过两次 1 s 心跳即视为未知并拒绝）、仍在 `latest_start_at`
+之前。真正开始合成前 speaker 还会复查一次门控（开口那一刻状态可能已变）。动态语句**不进**短语缓存，
+播完或失败即删临时 WAV——板上 `/tmp` 是 tmpfs，不删会积累。按原因细分的拒绝计数进 `~/status` 的
+`utterance_refused`。
+
 ## 架构位置
 
 ```text

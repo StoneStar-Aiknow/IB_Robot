@@ -1,0 +1,54 @@
+# AgiBot X2 "magic mirror", board deployment, arms and talk together.
+#
+# The board entry (aimdk_x2_magicmirror_board.yaml) with the two things that
+# make it the live show:
+#
+# * the arms follow the visitor: mirror_session.publish_enabled and the
+#   operator's send_enabled are on, the same values the real-arm run
+#   (aimdk_x2_magicmirror_R1novoice.yaml on feat/x2-mirror-voice) uses;
+# * the visual interaction runs in chatter mode: one warm line every 5–10 s
+#   while mirroring, keyed by the gesture or object the model names
+#   (visual_interaction.session.chatter). The mirror voice's status holds the
+#   next line back while it is still speaking.
+#
+# Back to the observation-only board entry: launch
+# aimdk_x2_magicmirror_board instead of this file.
+
+robot:
+  base_config: aimdk_x2_magicmirror_board.yaml
+  # The skill catalog profile is keyed by this name (as in R1novoice).
+  name: aimdk_x2_magicmirror
+
+  embodied:
+    # The skill executor and daemon that serve the Gateway (mirror_start /
+    # mirror_stop) read the catalog from this tree's source.
+    skill_catalog_source_root: src/agent/skill_catalog
+
+  # Wrist plan A: the elbow's twist about the forearm turns the wrist too, all
+  # of it past PEAR's rest twist (gain 1.0, as set on the real robot).
+  motion_imitation_stream:
+    mock_playback:
+      retarget:
+        elbow_spin_to_wrist: true
+        elbow_spin_gain: 1.0
+
+  mirror_session:
+    publish_enabled: true
+    operator:
+      send_enabled: true
+
+  visual_interaction:
+    mode: chatter
+    voice_status_topic: /mirror_voice/status
+    # One look every 2.5 s, not every 1 s: a line is due only every 5–10 s,
+    # and the board also runs the arms' PEAR/YOLOX and the runtime, which
+    # faulted on stale hand feedback while the model looked back to back.
+    round_period_sec: 2.5
+    vl:
+      # The chatter answer is a phrase of at most ten characters.
+      max_new_tokens: 16
+    chatter:
+      gap_min_sec: 5.0
+      gap_max_sec: 10.0
+      # A look at most ~4 s old still counts as what the visitor is doing.
+      fresh_sec: 5.0

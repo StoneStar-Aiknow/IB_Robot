@@ -59,6 +59,7 @@ _DEFAULT_ANIMATION = "data/x2_mock_imitation/rec_20260914_212729_delivery.json"
 MOCK_NODE_NAME = "motion_imitation_mock"
 MOCK_PLAY_SERVICE = f"/{MOCK_NODE_NAME}/play"
 _DEFAULT_MOCK_PREVIEW = f"/{MOCK_NODE_NAME}/arm_command_preview"
+_DEFAULT_HAND_PREVIEW = f"/{MOCK_NODE_NAME}/hand_command_preview"
 
 
 def _required_bool(config: Mapping, key: str) -> bool:
@@ -241,7 +242,54 @@ def _stream_parameters(config: Mapping, robot_config: Mapping) -> dict:
     # would make the actor unknown between every two refreshes.
     if parameters["actor_stale_sec"] <= parameters["yolox_refresh_interval_sec"]:
         raise ValueError("motion_imitation_stream.actor_stale_sec must exceed yolox_refresh_interval_sec")
+    parameters.update(_actor_zone_parameters(config, outputs))
     return parameters
+
+
+def _actor_zone_parameters(config: Mapping, other_topics: list[str]) -> dict:
+    """The standing-zone selector's parameters, only when a zone file is configured.
+
+    Without ``actor_zone_file`` nothing is emitted, so the node's parameters are
+    exactly what they were before the zone selector existed. With it, both files
+    are checked in full here, so a bad file stops the launch with its field
+    named instead of starting a node that would refuse it.
+    """
+    zone_file = config.get("actor_zone_file")
+    tuning_file = config.get("actor_tuning_file")
+    if zone_file is None:
+        if tuning_file is not None or "actor_candidates_topic" in config:
+            raise ValueError(
+                "motion_imitation_stream.actor_tuning_file and actor_candidates_topic need actor_zone_file"
+            )
+        return {}
+    parameters = {"actor_zone_file": _absolute_file(zone_file, "actor_zone_file")}
+    if tuning_file is not None:
+        parameters["actor_tuning_file"] = _absolute_file(tuning_file, "actor_tuning_file")
+    candidates = _required_topic(config, "actor_candidates_topic", "/motion_imitation_stream/actor_candidates")
+    if candidates in other_topics:
+        raise ValueError("motion_imitation_stream.actor_candidates_topic must differ from the other outputs")
+    parameters["actor_candidates_topic"] = candidates
+
+    # Imported here: launches without a zone never load it (import budget).
+    from manipulation_execution.actor_zone_config import load_tuning, load_zone
+
+    try:
+        load_zone(parameters["actor_zone_file"])
+    except ValueError as exc:
+        raise ValueError(f"motion_imitation_stream.actor_zone_file: {exc}") from exc
+    try:
+        load_tuning(parameters.get("actor_tuning_file"))
+    except ValueError as exc:
+        raise ValueError(f"motion_imitation_stream.actor_tuning_file: {exc}") from exc
+    return parameters
+
+
+def _absolute_file(value: object, key: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"motion_imitation_stream.{key} must be a non-empty string")
+    if not Path(value).is_absolute():
+        raise ValueError(f"motion_imitation_stream.{key} must be an absolute path, got {value!r}")
+    return value
 
 
 def _described_interfaces(robot_config: Mapping, consumer: str) -> Mapping:
@@ -414,7 +462,107 @@ def _retarget_parameters(mock: Mapping, robot_config: Mapping) -> dict:
         "latency_s": _non_negative(retarget, "latency_s", 0.4),
         "lookahead_s": _non_negative(retarget, "lookahead_s", 0.25),
         "mirror": _required_bool(retarget, "mirror") if "mirror" in retarget else True,
+        "elbow_spin_to_wrist": (_required_bool(retarget, "elbow_spin_to_wrist")
+                                if "elbow_spin_to_wrist" in retarget else False),
+        "elbow_spin_gain": _unit_interval(retarget, "elbow_spin_gain", 0.5),
     }
+
+
+def _hands_config(robot_config: Mapping) -> Mapping | None:
+    """``mock_playback.hands`` if the retarget player runs and it is enabled, else None."""
+    config = _stream_config(robot_config)
+    mock = _mock_config(config) if config is not None else None
+    if mock is None or mock.get("player", "animation") != "retarget":
+        return None
+    hands = mock.get("hands", {})
+    if not isinstance(hands, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands must be a mapping")
+    if not (_required_bool(hands, "enabled") if "enabled" in hands else False):
+        return None
+    return hands
+
+
+def mock_hand_endpoints(robot_config: Mapping) -> dict | None:
+    """The session's hand overlay wiring (``hand_follow_topic`` ...), or None without hands."""
+    hands = _hands_config(robot_config)
+    if hands is None:
+        return None
+    return {
+        "hand_follow_topic": _required_topic(hands, "preview_topic", _DEFAULT_HAND_PREVIEW),
+        "hand_state_topic": _required_topic(hands, "state_topic", "/aima/hal/joint/hand/state"),
+        "hand_command_topic": _required_topic(hands, "command_topic", "/aima/hal/joint/hand/command"),
+    }
+
+
+def _extern_dir(hands: Mapping) -> str:
+    """Where the video2x2 hand files (not in this repository) are deployed."""
+    return str(hands.get("extern_dir", "") or "/root/x2-dexhand-run/extern")
+
+
+def _thumb_follow_parameters(hands: Mapping) -> dict:
+    """``hands.thumb_follow: {d_tuck, d_out}`` (absent = off) -> the retarget node's thresholds."""
+    thumb = hands.get("thumb_follow")
+    if thumb is None:
+        return {"hand_thumb_d_out": 0.0}
+    if not isinstance(thumb, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_follow must be a mapping")
+    d_tuck, d_out = _positive(thumb, "d_tuck", 0.40), _positive(thumb, "d_out", 0.55)
+    if not d_tuck < d_out:
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_follow needs d_tuck < d_out")
+    return {"hand_thumb_d_tuck": d_tuck, "hand_thumb_d_out": d_out}
+
+
+def _thumb_fold_parameters(hands: Mapping) -> dict:
+    """``hands.thumb_fold: {pk_in, pk_out[, tip_in, tip_out]}`` (absent = off) -> the retarget node's thresholds."""
+    fold = hands.get("thumb_fold")
+    if fold is None:
+        return {"hand_thumb_fold_pk_out": 0.0}
+    if not isinstance(fold, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold must be a mapping")
+    pk_in, pk_out = _positive(fold, "pk_in", 0.55), _positive(fold, "pk_out", 0.85)
+    tip_in, tip_out = _positive(fold, "tip_in", 0.25), _positive(fold, "tip_out", 0.60)
+    if not (pk_in < pk_out and tip_in < tip_out):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.thumb_fold needs pk_in < pk_out, tip_in < tip_out")
+    return {"hand_thumb_fold_pk_in": pk_in, "hand_thumb_fold_pk_out": pk_out,
+            "hand_thumb_fold_tip_in": tip_in, "hand_thumb_fold_tip_out": tip_out}
+
+
+def _hand_parameters(hands: Mapping) -> dict:
+    labels = hands.get("gesture_labels", ["Victory", "Thumb_Up", "Pointing_Up"])
+    if not isinstance(labels, list) or not all(isinstance(label, str) and label for label in labels):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.gesture_labels must list label names")
+    return {
+        "hand_frame_topic": _required_topic(hands, "frame_topic", "/hri/hand/frame"),
+        "hand_preview_topic": _required_topic(hands, "preview_topic", _DEFAULT_HAND_PREVIEW),
+        "hand_gestures": _required_bool(hands, "gestures") if "gestures" in hands else True,
+        "hand_gesture_labels_json": json.dumps(labels),
+        "hand_gesture_theta_in": _unit_interval(hands, "gesture_theta_in", 0.0),
+        **_thumb_follow_parameters(hands),
+        **_thumb_fold_parameters(hands),
+        "hand_robot_json": str(hands.get("robot_presets", "") or ""),
+        "hand_extern_dir": _extern_dir(hands),
+    }
+
+
+def _hand_perception_nodes(hands: Mapping) -> list[Node]:
+    """The hand perception node; its ``parameters`` mapping is passed through as given."""
+    perception = hands.get("perception", {})
+    if not isinstance(perception, Mapping):
+        raise ValueError("motion_imitation_stream.mock_playback.hands.perception must be a mapping")
+    if not (_required_bool(perception, "enabled") if "enabled" in perception else True):
+        return []
+    parameters = dict(perception.get("parameters", {}) or {})
+    parameters.setdefault("frame_topic", _required_topic(hands, "frame_topic", "/hri/hand/frame"))
+    parameters.setdefault("extern_dir", _extern_dir(hands))
+    return [
+        Node(
+            package="manipulation_execution",
+            executable="hand_perception_node",
+            name="hand_perception",
+            output="screen",
+            parameters=[parameters],
+        )
+    ]
 
 
 def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mapping) -> list[Node]:
@@ -425,6 +573,7 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
     limits, velocity = _arm_limits(mock, joint_names)
     # Either node takes the preview contract below; mirror_session cannot tell them apart.
     player = mock.get("player", "animation")
+    extra: list[Node] = []
     parameters = {
         "pear_frame_topic": frame_topic,
         "preview_topic": _required_topic(mock, "preview_topic", _DEFAULT_MOCK_PREVIEW),
@@ -446,6 +595,10 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
     elif player == "retarget":
         executable = "motion_imitation_retarget_node"
         parameters.update(_retarget_parameters(mock, robot_config))
+        hands = _hands_config(robot_config)
+        if hands is not None:
+            parameters.update(_hand_parameters(hands))
+            extra = _hand_perception_nodes(hands)
     else:
         raise ValueError("motion_imitation_stream.mock_playback.player must be 'animation' or 'retarget'")
     return [
@@ -456,13 +609,14 @@ def _mock_playback_nodes(config: Mapping, frame_topic: str, robot_config: Mappin
             output="screen",
             parameters=[parameters],
         )
-    ]
+    ] + extra
 
 
 __all__ = [
     "MOCK_NODE_NAME",
     "MOCK_PLAY_SERVICE",
     "generate_motion_imitation_stream_nodes",
+    "mock_hand_endpoints",
     "mock_playback_endpoints",
     "mock_reset_pose",
     "mock_velocity_limits",

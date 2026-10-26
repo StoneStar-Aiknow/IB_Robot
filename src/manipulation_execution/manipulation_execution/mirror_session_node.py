@@ -40,6 +40,14 @@ Parameters (one parameter file serves the node and the release script):
 ``business_config``           absolute path of the business config file
                               (session / timing / cover_judge / operator);
                               empty: every section empty
+``hand_follow_topic``         the retarget node's 20 hand values; set: every
+                              command the gate sends gets its hand half from
+                              ``mirror_session.hand_overlay`` (follow while
+                              mirroring, neutral otherwise); empty: unchanged
+``hand_state_topic`` /        vendor hand feedback and MC's hand command, by
+``hand_command_topic``        topic and type name (``*_type``), for the
+                              overlay's start, unjam and staleness; empty:
+                              not subscribed
 
 Interfaces:
 
@@ -106,7 +114,9 @@ from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from manipulation_execution.mirror_session.business import build_hooks, load_business_config
 from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
+from manipulation_execution.mirror_session.core import Phase, SessionState
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, RELEASE_INTERFACES, resolve_endpoints
+from manipulation_execution.mirror_session.hand_overlay import HandOverlay
 from manipulation_execution.mirror_session.hooks import HookContext
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
@@ -224,6 +234,11 @@ SESSION_PARAMETERS = {
     "mock_velocity_limits_json": "",
     "business_hooks": "",
     "business_config": "",
+    "hand_follow_topic": "",
+    "hand_state_topic": "",
+    "hand_state_type": "aimdk_msgs/msg/HandStateArray",
+    "hand_command_topic": "",
+    "hand_command_type": "aimdk_msgs/msg/HandCommandArray",
 }
 
 
@@ -400,6 +415,8 @@ class MirrorSessionNode(Node):
         self._arm_preview = self.create_publisher(Float64MultiArray, "~/arm_command_preview", 10)
         self._hand_preview = self.create_publisher(Float64MultiArray, "~/hand_command_preview", 10)
         self._latency = LatencyMeter()
+        self._hands = self._hand_overlay(rate)
+        self._hands_last: tuple[float, ...] | None = None
         self.session = MirrorSession(config, self._port, self._send, hooks=hooks, cover=cover)
 
         self._inputs = InputCollector()
@@ -469,8 +486,65 @@ class MirrorSessionNode(Node):
                 "commands go to ~/arm_command_preview and ~/hand_command_preview only"
             )
 
+    def _hand_overlay(self, rate: float) -> HandOverlay | None:
+        follow = _optional_topic(self, "hand_follow_topic")
+        if not follow:
+            return None
+        overlay = HandOverlay(rate)
+        group = MutuallyExclusiveCallbackGroup()
+        self.create_subscription(
+            Float64MultiArray, follow, self._guarded(lambda msg: overlay.observe_follow(msg.data, self._clock_s())),
+            10, callback_group=group,
+        )
+        # Vendor types by name: this package does not depend on aimdk_msgs.
+        from rosidl_runtime_py.utilities import get_message
+
+        vendor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        wired = []
+        for key, observe in (("hand_state", overlay.observe_state), ("hand_command", overlay.observe_command)):
+            topic = _optional_topic(self, f"{key}_topic")
+            if not topic:
+                continue
+            try:
+                message_type = get_message(_string(self, f"{key}_type"))
+            except (AttributeError, ModuleNotFoundError, ValueError) as exc:
+                self.get_logger().error(f"hands: {key} type not loadable ({exc!r}); {topic} not subscribed")
+                continue
+            self.create_subscription(
+                message_type, topic,
+                self._guarded(lambda msg, observe=observe: observe(
+                    [h.position for h in msg.left_hands], [h.position for h in msg.right_hands], self._clock_s()
+                )),
+                vendor_qos, callback_group=group,
+            )
+            wired.append(topic)
+        self.get_logger().info(f"hands: follow {follow}, feedback {wired or 'none'}; neutral outside mirroring")
+        return overlay
+
+    def _guarded(self, callback):
+        """A hand input callback that logs instead of raising into the executor."""
+
+        def run(message) -> None:
+            try:
+                callback(message)
+            except Exception as exc:
+                self.get_logger().error(f"hand input dropped: {exc!r}", throttle_duration_sec=1.0)
+
+        return run
+
+    def _clock_s(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
     def _publish(self, command) -> None:
         # The gate is the only caller, under the session lock.
+        if self._hands is not None:
+            following = self.session.state == SessionState.MIRRORING and self.session.phase == Phase.RUNNING
+            try:
+                self._hands_last = self._hands.apply(following, self._clock_s())
+            except Exception as exc:  # a hand fault never reaches the gate: the hands hold their last values
+                self.get_logger().error(f"hand overlay failed: {exc!r}", throttle_duration_sec=1.0)
+            if self._hands_last is not None:
+                command = dataclasses.replace(command, hand=self._hands_last)
         arm, hand = Float64MultiArray(data=list(command.arm)), Float64MultiArray(data=list(command.hand))
         if self._publish_enabled:
             self._arm_publisher.publish(arm)
@@ -560,6 +634,8 @@ class MirrorSessionNode(Node):
         status["business_hooks"] = self._business_hooks
         if self._mock is not None:
             status["mock_playback"] = self._mock.snapshot()
+        if self._hands is not None:
+            status["hands"] = self._hands.snapshot(self._clock_s())
         self._status_publisher.publish(String(data=json.dumps(status, sort_keys=True)))
 
     def release_on_exit(self, spin_once) -> None:

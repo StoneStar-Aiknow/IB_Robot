@@ -9,6 +9,7 @@ from embodied_common.visual_interaction_contract import (
     SUPPRESS_AMBIGUOUS,
     SUPPRESS_COOLDOWN,
     SUPPRESS_DUPLICATE,
+    SUPPRESS_MIRROR_INACTIVE,
     SUPPRESS_MODEL_NOT_READY,
     SUPPRESS_MUTED,
     SUPPRESS_NO_NEW_TOPIC,
@@ -61,7 +62,7 @@ class ClosedGate(ChangeGate):
         return False
 
 
-def inputs(*, now=10.0, stamp=None, present=True, known=True, bbox=HERE, others=()):
+def inputs(*, now=10.0, stamp=None, present=True, known=True, bbox=HERE, others=(), mirror_active=True):
     """One round's inputs, with the window stamped just before ``now``."""
     stamp = now - 0.1 if stamp is None else stamp
     return RoundInputs(
@@ -70,6 +71,7 @@ def inputs(*, now=10.0, stamp=None, present=True, known=True, bbox=HERE, others=
         ),
         actor=ActorSignal(present=present, known=known, bbox=bbox, stamp=stamp, others=others),
         now=now,
+        mirror_active=mirror_active,
     )
 
 
@@ -196,6 +198,67 @@ class TestQuietRounds:
     def test_an_empty_category_set_is_refused_at_construction(self):
         with pytest.raises(ValueError, match="can never speak"):
             SessionConfig(categories=())
+
+
+class TestMirrorGating:
+    """The magicmirror entry parks the rounds while the mirror is not MIRRORING.
+
+    The gate sits after the window bookkeeping and before the target
+    association, so a parked round costs no model call and a visitor who leaves
+    while the feature is parked still rotates the session.
+    """
+
+    def test_a_parked_round_is_quiet_and_calls_no_model(self):
+        vision = ScriptedVision.of(answer("toy"))
+        sess = session(vision=vision)
+
+        result = sess.step(inputs(mirror_active=False))
+
+        assert result.quiet
+        assert result.reason == SUPPRESS_MIRROR_INACTIVE
+        assert not result.model_called
+        assert vision.call_count == 0
+
+    def test_the_default_is_ungated(self):
+        """A deployment without a mirror gates nothing; the field's default says so."""
+        sess = session(vision=ScriptedVision.of(quiet()))
+
+        assert sess.step(inputs()).reason == SUPPRESS_NO_NEW_TOPIC
+
+    def test_a_parked_round_still_rotates_the_session_on_absence(self):
+        """The window bookkeeping runs ahead of the gate.
+
+        Without this a visitor who leaves while the feature is parked would
+        hand every covered topic to the next one.
+        """
+        sess = session(vision=ScriptedVision.of(answer("toy")))
+        assert sess.step(inputs(now=10.0)).reason == SUPPRESS_UNCONFIRMED
+        before = sess.session_id
+
+        sess.step(inputs(now=11.0, present=False, bbox=None, mirror_active=False))
+        after = sess.step(inputs(now=45.0, present=False, bbox=None, mirror_active=False))
+
+        assert after.reason == SUPPRESS_MIRROR_INACTIVE
+        assert sess.session_id != before
+
+    def test_resuming_after_a_pause_starts_the_confirmation_over(self):
+        """The pre-pause confirmation must not survive the pause.
+
+        The parked rounds do not feed the tracker, so the first round back sees
+        a stamp gap past the association limit, relocks the target and breaks
+        every chain — the confirmation starts over rather than resuming.
+        """
+        vision = ScriptedVision.of(*(answer("toy") for _ in range(4)))
+        sess = session(vision=vision)
+        assert sess.step(inputs(now=10.0)).reason == SUPPRESS_UNCONFIRMED
+
+        assert sess.step(inputs(now=10.5, mirror_active=False)).reason == SUPPRESS_MIRROR_INACTIVE
+
+        first_back = sess.step(inputs(now=15.0))
+        second_back = sess.step(inputs(now=16.0))
+
+        assert first_back.reason == SUPPRESS_UNCONFIRMED
+        assert second_back.spoken
 
 
 class TestTargetFirst:

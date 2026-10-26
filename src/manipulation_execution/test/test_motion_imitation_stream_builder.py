@@ -194,3 +194,110 @@ def test_require_unique_publisher_must_be_boolean():
     config = stream_config(frame_source={"topic": "/camera/left/compressed", "require_unique_publisher": "yes"})
     with pytest.raises(ValueError, match="require_unique_publisher"):
         generate_motion_imitation_stream_nodes(config)
+
+
+# ----- the standing-zone selector's files (dev plan D11-D15) -----
+# D11 is test_enabled_block_launches_one_stream_node_with_defaults above: with
+# no zone key the parameters are exactly the old ones.
+
+_ZONE_YAML = """\
+version: 1
+image_size: [1000, 800]
+crop_x: [100, 900]
+floor_quad:
+  - [300, 700]
+  - [700, 700]
+  - [650, 500]
+  - [350, 500]
+note: test
+"""
+
+
+# near_left 10 px from the bottom, under the 30 px default margin.
+_NEAR_EDGE_TOO_LOW = _ZONE_YAML.replace("[300, 700]", "[300, 790]")
+
+
+def _zone_files(tmp_path, zone=_ZONE_YAML, tuning="version: 1\nrelease_hold_s: 3.0\n"):
+    zone_file = tmp_path / "actor_zone.yaml"
+    zone_file.write_text(zone, encoding="utf-8")
+    tuning_file = tmp_path / "actor_tuning.yaml"
+    tuning_file.write_text(tuning, encoding="utf-8")
+    return str(zone_file), str(tuning_file)
+
+
+def test_zone_and_tuning_files_reach_the_node_as_absolute_paths(tmp_path):
+    # D12
+    zone_file, tuning_file = _zone_files(tmp_path)
+    config = stream_config(actor_zone_file=zone_file, actor_tuning_file=tuning_file)
+    stream = parameters(generate_motion_imitation_stream_nodes(config)[0])
+    assert stream["actor_zone_file"] == zone_file
+    assert stream["actor_tuning_file"] == tuning_file
+    assert stream["actor_candidates_topic"] == "/motion_imitation_stream/actor_candidates"
+
+
+def test_a_zone_without_a_tuning_file_uses_the_defaults(tmp_path):
+    zone_file, _ = _zone_files(tmp_path)
+    stream = parameters(generate_motion_imitation_stream_nodes(stream_config(actor_zone_file=zone_file))[0])
+    assert stream["actor_zone_file"] == zone_file
+    assert "actor_tuning_file" not in stream
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("bad_zone", "actor_zone_file.*floor_quad"),
+        ("missing_zone", "actor_zone_file.*cannot read"),
+        ("relative_zone", "actor_zone_file must be an absolute path"),
+        ("bad_tuning", "actor_tuning_file.*release_hold_s"),
+        ("tuning_without_zone", "need actor_zone_file"),
+        ("candidates_without_zone", "need actor_zone_file"),
+        ("candidates_on_the_state_topic", "actor_candidates_topic must differ"),
+    ],
+)
+def test_bad_zone_settings_stop_the_launch_with_the_field_named(tmp_path, case, match):
+    # D13
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    good.mkdir()
+    bad.mkdir()
+    zone_file, tuning_file = _zone_files(good)
+    overrides = {
+        "bad_zone": lambda: {"actor_zone_file": _zone_files(bad, zone=_NEAR_EDGE_TOO_LOW)[0]},
+        "missing_zone": lambda: {"actor_zone_file": str(tmp_path / "absent.yaml")},
+        "relative_zone": lambda: {"actor_zone_file": "zone/actor_zone.yaml"},
+        "bad_tuning": lambda: {
+            "actor_zone_file": zone_file,
+            "actor_tuning_file": _zone_files(bad, tuning="version: 1\nrelease_hold_s: 31.0\n")[1],
+        },
+        "tuning_without_zone": lambda: {"actor_tuning_file": tuning_file},
+        "candidates_without_zone": lambda: {"actor_candidates_topic": "/x/candidates"},
+        "candidates_on_the_state_topic": lambda: {
+            "actor_zone_file": zone_file,
+            "actor_candidates_topic": "/motion_imitation_stream/actor_state",
+        },
+    }[case]()
+    with pytest.raises(ValueError, match=match):
+        generate_motion_imitation_stream_nodes(stream_config(**overrides))
+
+
+def test_zone_profile_is_dexhand_rec_plus_the_two_board_files():
+    # D15: parsed only; the files live on the board, so the builder is not run.
+    # The base is read beside the zone profile, not by name: before a build the
+    # new profile exists only in the source tree while the old one is also
+    # installed, and the two copies would differ in path.
+    zone_path = resolve_robot_config_path(config_name="aimdk_x2_magicmirror_live_quiet_dexhand_rec_zone")
+    # Live profiles bind their logical interfaces at launch, as in the test above.
+    zone = load_robot_config_dict(zone_path, defer_interface_binding=True)
+    base = load_robot_config_dict(
+        zone_path.parent / "aimdk_x2_magicmirror_live_quiet_dexhand_rec.yaml", defer_interface_binding=True
+    )
+    stream = dict(zone["motion_imitation_stream"])
+    assert stream.pop("actor_zone_file") == "/root/x2-actor-run/zone/actor_zone.yaml"
+    assert stream.pop("actor_tuning_file") == "/root/x2-actor-run/zone/actor_tuning.yaml"
+    assert stream == base["motion_imitation_stream"]
+    assert "actor_zone_file" not in base["motion_imitation_stream"]
+    provenance = ("motion_imitation_stream", "_config_path", "_config_sources")
+    assert {k: v for k, v in zone.items() if k not in provenance} == {
+        k: v for k, v in base.items() if k not in provenance
+    }
+    assert zone["_config_sources"] == [*base["_config_sources"], zone["_config_path"]]

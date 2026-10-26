@@ -127,15 +127,21 @@ visual_interaction/
 
 ## 发声与协调器 TODO
 
-**本包目前不发声。** 现状是三个互不知情的发声源直接调 `/voice_tts/synthesize` 和
+**独立入口（`aimdk_x2_visual_interaction`）不发声**：`SpeechPort` 默认实现只发消息、不出声。
+**`aimdk_x2_magicmirror` 入口经 mirror_voice 送达**：magicmirror 配置把
+`mirror_session.voice.utterance_topic` 接到 `/visual_interaction/utterance`，mirror_voice 订阅它、
+做准入过滤（MIRRORING 且状态新鲜、无 ASCII 字母、未过 `latest_start_at`）后按需合成播放——
+全部署仍是单一 TTS 客户端（见 `manipulation_execution` README 的 mirror_voice 一节）。
+
+跨进程协调仍是未竟事项：现状另有三个互不知情的发声源直接调 `/voice_tts/synthesize` 和
 `/voice_tts/play`——`visual_game_announcer_node.py`、`ibrobot_agent/voice_bridge.py`、
 `robot_skill_cli/hermes_tts_hook.py`——之间只有进程内锁，播放节点 FIFO 串行、无优先级，
 输的一方最多阻塞到自己超时。全局层面**没有**跨进程发声锁、`is_speaking` 状态、优先级抢占、
-频率预算，`PlayAudioFile` 也**没有请求级取消**。另外播放服务返回成功只表示 PCM 已发布并 ack，
+频率预算，`PlayAudioFile` 也**没有**请求级取消。另外播放服务返回成功只表示 PCM 已发布并 ack，
 **不等于扬声器播完**。
 
-因此 `session/hooks.py` 的 `SpeechPort` 默认实现只发消息、不出声；
-`Delivery.estimated_end` 是**估算**，不是硬件确认。协调器（同事的节点）到位后实现同一个
+因此 `session/hooks.py` 的 `SpeechPort` 语义不变；
+`Delivery.estimated_end` 仍是**估算**，不是硬件确认。协调器（同事的节点）到位后实现同一个
 port 即可，会话逻辑不动，消息定义也不用改。
 
 注意：现有测试 `test_new_game_does_not_interrupt_previous_round_playback`

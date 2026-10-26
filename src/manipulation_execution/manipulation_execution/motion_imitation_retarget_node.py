@@ -22,6 +22,12 @@ per-person state is reset before the next frame. ``~/play``
 (``reset_pose_json``); false pauses. To watch it alone:
 ``ros2 service call /motion_imitation_mock/play std_srvs/srv/SetBool "{data: true}"``.
 
+**Hands (optional).** With ``hand_frame_topic`` set it also follows the
+dexterous hands: ``HandFrame`` observations go through ``x2.hand_follow``
+(hand_core, loaded from ``hand_extern_dir``) and 20 hand radians are published every tick on
+``hand_preview_topic``, playing or not; the session decides when to use them.
+Empty (the default) creates neither the subscription nor the publisher.
+
 ``~/retarget_debug`` carries every mapped frame before the buffer and the smoothing:
 ``[t_camera, t_received, t_mapped, 14 joint angles]`` (seconds, radians), for
 measuring where the delay goes.
@@ -40,7 +46,7 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool
 
-from ibrobot_msgs.msg import PearFrame
+from ibrobot_msgs.msg import HandFrame, PearFrame
 
 from .imitation_retargeting.live_player import LivePlayer
 from .imitation_retargeting.streaming import create_stream
@@ -93,6 +99,24 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("latency_s", 0.4)
         self.declare_parameter("lookahead_s", 0.25)
         self.declare_parameter("mirror", True)
+        self.declare_parameter("elbow_spin_to_wrist", False)
+        self.declare_parameter("elbow_spin_gain", 0.5)
+        self.declare_parameter("hand_frame_topic", "")
+        self.declare_parameter("hand_preview_topic", "/motion_imitation_mock/hand_command_preview")
+        self.declare_parameter("hand_gestures", True)
+        self.declare_parameter("hand_gesture_labels_json", '["Victory", "Thumb_Up", "Pointing_Up"]')
+        # Score a label must hold to enter its preset; <= 0 keeps hand_core's default (0.7).
+        self.declare_parameter("hand_gesture_theta_in", 0.0)
+        # Thumb follow (hand_core ThumbFollowConfig) thresholds on thumb_tuck; d_out <= 0 = off.
+        self.declare_parameter("hand_thumb_d_tuck", 0.40)
+        self.declare_parameter("hand_thumb_d_out", 0.0)
+        # Thumb by its tip's distance to the fingers (thumb_fold.ThumbFold): pinky MCP and tips; pk_out <= 0 = off.
+        self.declare_parameter("hand_thumb_fold_pk_in", 0.55)
+        self.declare_parameter("hand_thumb_fold_pk_out", 0.0)
+        self.declare_parameter("hand_thumb_fold_tip_in", 0.25)
+        self.declare_parameter("hand_thumb_fold_tip_out", 0.60)
+        self.declare_parameter("hand_robot_json", "")
+        self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
 
         self._pear_topic = _validated_topic(self.get_parameter("pear_frame_topic").value, "pear_frame_topic")
         preview_topic = _validated_topic(self.get_parameter("preview_topic").value, "preview_topic")
@@ -106,6 +130,12 @@ class MotionImitationRetargetNode(Node):
         if type(self.get_parameter("mirror").value) is not bool:
             raise ValueError("mirror must be a boolean")
         mirror = self.get_parameter("mirror").value
+        if type(self.get_parameter("elbow_spin_to_wrist").value) is not bool:
+            raise ValueError("elbow_spin_to_wrist must be a boolean")
+        elbow_spin_to_wrist = self.get_parameter("elbow_spin_to_wrist").value
+        elbow_spin_gain = float(self.get_parameter("elbow_spin_gain").value)
+        if not 0.0 <= elbow_spin_gain <= 1.0:
+            raise ValueError("elbow_spin_gain must be within [0, 1]")
         retargeter = str(self.get_parameter("retargeter").value).strip()
 
         self._joint_names = tuple(json.loads(str(self.get_parameter("joint_names_json").value)))
@@ -118,7 +148,8 @@ class MotionImitationRetargetNode(Node):
         # The mapping runs in its own process: in a thread it holds the GIL long enough
         # to starve the 50 Hz timer (17 Hz on duck).
         stream = create_stream(retargeter, base_pose=reset_pose, latency_s=latency_s, lookahead_s=lookahead_s,
-                               mirror=mirror, separate_process=True)
+                               mirror=mirror, elbow_spin_to_wrist=elbow_spin_to_wrist,
+                               elbow_spin_gain=elbow_spin_gain, separate_process=True)
         if self._joint_names != tuple(stream.joint_names):
             raise ValueError(
                 f"joint_names_json {list(self._joint_names)} does not match the {retargeter} stream's joint "
@@ -129,6 +160,36 @@ class MotionImitationRetargetNode(Node):
             stream, low_rad=low_rad, high_rad=high_rad, rated_rad_s=rated, vel_scale=vel_scale, rate_hz=rate_hz,
             staleness_s=staleness_sec, base_pose=reset_pose, on_mapped=self._publish_mapped,
         )
+
+        self._hands = None
+        hand_topic = str(self.get_parameter("hand_frame_topic").value).strip()
+        if hand_topic:
+            from .imitation_retargeting.x2.hand_follow import HandFollow
+
+            hand_topic = _validated_topic(hand_topic, "hand_frame_topic")
+            labels = json.loads(str(self.get_parameter("hand_gesture_labels_json").value))
+            robot_json = str(self.get_parameter("hand_robot_json").value).strip() or None
+            theta_in = float(self.get_parameter("hand_gesture_theta_in").value)
+            d_out = float(self.get_parameter("hand_thumb_d_out").value)
+            thumb = (float(self.get_parameter("hand_thumb_d_tuck").value), d_out) if d_out > 0.0 else None
+            pk_out = float(self.get_parameter("hand_thumb_fold_pk_out").value)
+            fold = tuple(float(self.get_parameter(f"hand_thumb_fold_{k}").value)
+                         for k in ("pk_in", "pk_out", "tip_in", "tip_out")) if pk_out > 0.0 else None
+            self._hands = HandFollow(
+                latency_s=latency_s, lookahead_s=lookahead_s, mirror=mirror, out_hz=rate_hz,
+                gestures=bool(self.get_parameter("hand_gestures").value), gesture_labels=labels,
+                gesture_theta_in=theta_in if theta_in > 0.0 else None, thumb_follow=thumb, thumb_fold=fold,
+                robot_path=robot_json, extern_dir=str(self.get_parameter("hand_extern_dir").value),
+            )
+            hand_preview = _validated_topic(self.get_parameter("hand_preview_topic").value, "hand_preview_topic")
+            self._hand_publisher = self.create_publisher(Float64MultiArray, hand_preview, 10)
+            self.create_subscription(HandFrame, hand_topic, self._on_hand_frame, qos_profile_sensor_data)
+            self.get_logger().info(
+                f"hands: {hand_topic} -> {hand_preview}, gestures {labels if self._hands.stream.gesture else 'off'} "
+                f"(theta_in {self._hands.stream.gesture.theta_in if self._hands.stream.gesture else '-'}), "
+                f"thumb follow {thumb or 'off'}, thumb fold {fold or 'off'}, "
+                f"robot presets {robot_json or 'packaged'}, calib sha {self._hands.cfg.sha256[:12]}"
+            )
 
         self._preview_publisher = self.create_publisher(Float64MultiArray, preview_topic, 10)
         self._debug_publisher = self.create_publisher(Float64MultiArray, "~/retarget_debug", 50)
@@ -141,7 +202,8 @@ class MotionImitationRetargetNode(Node):
         self._player.start()
         self.get_logger().info(
             f"motion imitation retarget ready: retargeter={retargeter}, {rate_hz:g} Hz, vel_scale={vel_scale:g}, "
-            f"mirror={mirror}; paused until ~/play; computed commands go to {preview_topic} only"
+            f"mirror={mirror}, elbow_spin_to_wrist={elbow_spin_to_wrist}, elbow_spin_gain={elbow_spin_gain:g}; "
+            f"paused until ~/play; computed commands go to {preview_topic} only"
         )
 
     def _limit_arrays(self, limits: object) -> tuple[np.ndarray, np.ndarray]:
@@ -192,12 +254,35 @@ class MotionImitationRetargetNode(Node):
 
     def _on_pear_frame(self, message: PearFrame) -> None:
         stamp = message.header.stamp
+        if self._hands is not None:
+            self._hands.on_pear(self._now(), stamp.sec + stamp.nanosec * 1e-9)
         self._player.on_frame(
             self._now(), stamp.sec + stamp.nanosec * 1e-9, message.sequence, message.source,
             np.asarray(message.smplx_pose_raw, dtype=np.float64),
         )
 
+    def _on_hand_frame(self, message: HandFrame) -> None:
+        sides = []
+        for obs in (message.left, message.right):
+            sides.append((tuple(obs.curl_rad), obs.gesture, obs.gesture_score, tuple(obs.world_landmarks))
+                         if obs.detected else None)
+        stamp = message.header.stamp
+        t_camera = message.timestamp_ns * 1e-9 if message.timestamp_ns else stamp.sec + stamp.nanosec * 1e-9
+        try:
+            self._hands.on_hand(self._now(), t_camera, sides[0], sides[1])
+        except Exception as exc:  # a hand fault must not take the arm's node down
+            self.get_logger().error(f"hand frame dropped: {exc!r}", throttle_duration_sec=1.0)
+
     def _tick(self) -> None:
+        if self._hands is not None:
+            # Hands first and independent of the arm: a held arm tick still sends the hands.
+            try:
+                hand = self._hands.tick(self._now())
+            except Exception as exc:  # the session holds the hands; the arm tick below still runs
+                hand = None
+                self.get_logger().error(f"hand tick failed: {exc!r}", throttle_duration_sec=1.0)
+            if hand is not None:
+                self._hand_publisher.publish(Float64MultiArray(data=hand))
         command = self._player.tick(self._now())
         if command is None:
             # Publishing nothing is the hold: the session gate keeps sending its last command.
@@ -214,6 +299,8 @@ class MotionImitationRetargetNode(Node):
     def _publish_status(self) -> None:
         status = self._player.status(self._now())
         status["input_topic"] = self._pear_topic
+        if self._hands is not None:
+            status["hands"] = self._hands.status(self._now())
         message = String()
         message.data = json.dumps(status, ensure_ascii=False)
         self._status_publisher.publish(message)

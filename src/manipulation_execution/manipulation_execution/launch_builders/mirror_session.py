@@ -86,6 +86,7 @@ from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
 from manipulation_execution.launch_builders.motion_imitation_stream import (
+    mock_hand_endpoints,
     mock_playback_endpoints,
     mock_reset_pose,
     mock_velocity_limits,
@@ -386,6 +387,7 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         "mock_velocity_limits_json": json.dumps(velocity) if velocity else "",
         "business_hooks": business["hooks"],
         "business_config": business["config"],
+        **(mock_hand_endpoints(robot_config) or {}),
     }
     operator = _operator_parameters(robot_config, config, parameters, business)
     session = Node(

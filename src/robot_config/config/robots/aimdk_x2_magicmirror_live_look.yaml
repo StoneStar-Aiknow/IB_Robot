@@ -1,0 +1,14 @@
+# AgiBot X2 "magic mirror", live show, looking without chatting.
+#
+# The live entry (aimdk_x2_magicmirror_live.yaml) with the visual
+# interaction's lines left unspoken: the model still looks every round, with
+# the same NPU and CPU load as the full show, but the voice no longer takes
+# its utterances, so only the four state phrases are said. Against the full
+# show this separates the cost of looking from the cost of speaking.
+
+robot:
+  base_config: aimdk_x2_magicmirror_live.yaml
+
+  mirror_session:
+    voice:
+      utterance_topic: ""
