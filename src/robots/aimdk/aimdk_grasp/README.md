@@ -136,6 +136,27 @@ mesh query sees only near its surface, while a box has a distance inside it and
 pushes a path out of the pelvis. A box's corners can stand out of its hull, so the
 fine scene keeps the exact hulls and no boxes.
 
+## Observations and revalidation
+
+`aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the
+torso-frame camera pose at its image time and the feedback at that time, which
+must be healthy and within 100 ms of the image. `ObservationBuffer` keeps the
+newest observation and, separately, the newest current feedback: the request is
+planned from the image, but starts from where the arm is now. Both are owned
+copies, and reading them never refreshes their source time.
+
+Before a plan is used, `aimdk_grasp.revalidation` compares it with what the robot
+sees and measures now, and raises `ReobserveRequired` when it no longer holds:
+
+| Check | Rejects |
+|---|---|
+| `require_fresh` | current feedback older than 100 ms, a scene older than 0.5 s, or an unhealthy runtime |
+| `require_posture` | an arm, the head or the left hand moved more than 0.025 rad since planning |
+| `require_stable_patch` | the target region changed in RGB (> 2 % of it) or in measured depth (> 5 %), or the camera geometry changed |
+
+Depth counts only where both frames measured it: a transparent target's valid
+pixels come and go between still frames.
+
 ## What replaced the standalone `x2_grasp_msgs`
 
 | Standalone interface | Replacement | Why |
