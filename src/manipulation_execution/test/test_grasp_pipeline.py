@@ -109,6 +109,8 @@ class Executor:
 
     def hold(self, seconds, *, carrying, cancelled):
         self.log.append(("hold", None, carrying))
+        if cancelled():
+            return MotionOutcome(MotionState.CANCELLED, "cancelled")
         return MotionOutcome(MotionState.SUCCEEDED)
 
     def supervise(self):
@@ -130,6 +132,12 @@ class Effector:
 
     #: Called with each action before it runs (a test's hook into the goal's flags).
     on_act: object = None
+    #: What holding() says once something is gripped ('' held, else why it slipped).
+    grip: str = ""
+    gripped: bool = False
+
+    def holding(self):
+        return self.grip if self.gripped else None
 
     def act(self, action, *, halted, cancelled):
         self.log.append(action)
@@ -141,7 +149,9 @@ class Effector:
             if self.halt_close and halted():
                 return EffectorOutcome(True, "halted", halted=True)
             held = self.held.pop(0) if len(self.held) > 1 else self.held[0]
+            self.gripped = bool(held)
             return EffectorOutcome(True, held=held, confidence=0.8 if held else 0.0)
+        self.gripped = False
         return EffectorOutcome(True)
 
 
@@ -415,6 +425,21 @@ def test_a_watch_that_cannot_start_ends_the_goal_before_anything_moves():
     outcome = run(backends)
     assert (outcome.success, outcome.error_code) == (False, "WATCH_FAILED") and outcome.at_rest
     assert names(executor) == [] and effector.log == [] and not executor.stopped
+
+
+def test_a_grip_that_slips_while_held_is_not_a_pick_and_is_taken_back():
+    """An object that slipped out after the close fell on the put-back and the pick still reported done."""
+    backends, executor, effector, _, _ = streaming()
+    effector.grip = "the contact fingers no longer press the object"
+    outcome = run(backends, release_after_success=True)
+    assert not outcome.success and outcome.error_code == "GRASP_VERIFICATION_FAILED" and outcome.held is False
+    assert outcome.message.startswith("grip lost while held: the contact fingers") and outcome.at_rest
+    assert names(executor) == ["approach", "grasp", "lift", "hold", "retreat_lift", "retreat_grasp", "retreat_approach"]
+    assert effector.log[-1] is EffectorAction.RELEASE
+    hold = next(row for row in outcome.report["executions"][-1]["phases"] if row["name"] == "hold_lifted")
+    assert hold["state"] == "grip_lost" and "no longer press" in hold["reason"]
+    backends, executor, effector, _, _ = streaming()  # a grip that holds changes nothing
+    assert run(backends).success and names(executor) == ["approach", "grasp", "lift", "hold"]
 
 
 def test_nothing_held_skips_the_lift_and_takes_everything_back():

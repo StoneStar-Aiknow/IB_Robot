@@ -61,6 +61,8 @@ class SequenceResult:
     held_confidence: float = 0.0
     #: Set when the target watch halted the plan: {"step", "reason"}.
     retreated: dict | None = None
+    #: Why the end effector stopped holding the object while it was carried.
+    lost: str = ""
     #: The arm ended under the executor's control at rest (False: stopped in place).
     at_rest: bool = True
     #: The requested post-pick release and return completed.
@@ -156,7 +158,14 @@ class GraspSequence:
                         self._expect_effect(outcome)
                         done.append(step)
                 elif isinstance(step, Hold):
-                    self._expect(self._hold(step, state["carrying"], cancelled, result))
+                    if state["carrying"]:
+                        lost = self._hold_carrying(step, cancelled, result)
+                        if lost:
+                            result.held, result.lost = False, lost
+                            abandoned = True
+                            break
+                    else:
+                        self._expect(self._hold(step, False, cancelled, result))
                     done.append(step)
                 index += 1
             if not abandoned:
@@ -168,6 +177,8 @@ class GraspSequence:
             self._undo(plan, done, state, cancelled, result)
             if result.retreated is not None:
                 result.error_code, result.message = "TARGET_MOVED", f"target moved: {result.retreated['reason']}"
+            elif result.lost:
+                result.error_code, result.message = "GRASP_VERIFICATION_FAILED", f"grip lost while held: {result.lost}"
             else:
                 result.error_code, result.message = "GRASP_VERIFICATION_FAILED", "nothing held after closing"
             return result
@@ -214,6 +225,31 @@ class GraspSequence:
         outcome = self._backends.executor.hold(step.seconds, carrying=carrying, cancelled=cancelled)
         self._phase(result, step.name, outcome)
         return outcome
+
+    def _hold_carrying(self, step: Hold, cancelled: Flag, result) -> str:
+        """A hold with the object in hand, watching the grip where the end effector can tell; why it was lost.
+
+        A grip can slip out after the close (live X2 2026-10-23: two of six, the
+        object then fell on the put-back and the pick was still reported done).
+        Losing it ends the hold at once; the sequence then takes the plan back.
+        """
+        holding = getattr(self._backends.effector, "holding", None)
+        lost: list[str] = []
+
+        def stopped() -> bool:
+            if cancelled():
+                return True
+            reason = holding() if holding is not None else None
+            if reason:
+                lost.append(reason)
+            return bool(reason)
+
+        outcome = self._hold(step, True, stopped, result)
+        if lost:
+            result.phases[-1].update(state="grip_lost", reason=lost[0])
+            return lost[0]
+        self._expect(outcome)
+        return ""
 
     def _act(self, action: EffectorAction, halted: Flag, cancelled: Flag, result) -> EffectorOutcome:
         """Run one end effector action with the arm supervised meanwhile, where the executor offers it.

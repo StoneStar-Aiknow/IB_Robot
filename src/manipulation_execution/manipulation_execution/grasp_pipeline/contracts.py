@@ -404,7 +404,12 @@ class MotionExecutor(Protocol):
 
 
 class EndEffector(Protocol):
-    """Optional: ``finish()`` ends its hold on the robot after a goal."""
+    """Optional: ``finish()`` ends its hold on the robot after a goal.
+
+    Optional: ``holding()`` tells, while an object is carried, whether the grip
+    still holds it: '' yes, a reason once it was lost, None unknown. The
+    sequence asks during every hold that carries the object.
+    """
 
     def act(self, action: EffectorAction, *, halted: Flag, cancelled: Flag) -> EffectorOutcome: ...
 
