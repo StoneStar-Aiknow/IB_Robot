@@ -68,7 +68,15 @@ class Camera:
         )
         state = SimpleNamespace(live=SimpleNamespace(observation=registered, feedback="current feedback"))
         return Observation(
-            np.zeros((H, W, 3), np.uint8), frame.depth, np.eye(3), "optical", self.stamp, "torso_link", np.eye(4), state
+            np.zeros((H, W, 3), np.uint8),
+            frame.depth,
+            np.eye(3),
+            "optical",
+            self.stamp,
+            "torso_link",
+            np.eye(4),
+            state,
+            report={"stamp_ns": self.stamp, "wait_s": 0.01},
         )
 
 

@@ -599,6 +599,19 @@ def test_a_plan_reports_how_long_each_step_took_and_what_perception_measured():
     assert outcome.report["perceive"] == {"perception_timings_s": {"detect": 0.4}}
 
 
+def test_the_capture_reports_how_it_went_in_the_goal_report():
+    backends, *_ = streaming()
+    capture = backends.observation.capture
+
+    def reporting(**budget):
+        observation = capture(**budget)
+        return observation.__class__(**{**vars(observation), "report": {"wait_s": 0.2, "recaptured": False}})
+
+    backends.observation.capture = reporting
+    outcome = run(backends)
+    assert outcome.report["observe"] == {"wait_s": 0.2, "recaptured": False}
+
+
 def test_an_empty_query_is_refused_before_observing():
     backends, *_ = streaming()
     outcome = GraspPipeline(backends).run(" ", mode=PickMode.EXECUTE, deadline=1e12, cancelled=lambda: False)

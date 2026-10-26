@@ -181,11 +181,17 @@ class RemoteHeadCamera:
 
     def capture(self, *, deadline: float, cancelled: Flag) -> Observation:
         request = self.head.types[0].Request(timeout_s=max(0.0, deadline - time.monotonic()))
+        asked = time.monotonic()
         response = self.head.call(self.head.capture_client, request, deadline + 1.0, cancelled)
+        answered = time.monotonic()
         if not response.success:
             raise GraspFailure(response.error_code or RPC_FAILED, response.message)
+        report = wire.from_json(response.report_json)
+        # The head's own breakdown, plus what the call around it cost here: the
+        # rest of rpc_s past the head's capture_s is encoding, transfer and the reply.
+        report.update(rpc_s=answered - asked, reply_bytes=len(response.rgb.data) + len(response.depth.data))
         try:
-            return Observation(
+            observation = Observation(
                 rgb=wire.decode_rgb(response.rgb),
                 depth_m=wire.decode_depth(response.depth),
                 intrinsics=wire.matrix_from_list(response.intrinsics, (3, 3)),
@@ -193,10 +199,13 @@ class RemoteHeadCamera:
                 stamp_ns=int(response.stamp_ns),
                 base_frame=response.base_frame,
                 base_from_camera=wire.matrix_from_list(response.base_from_camera, (4, 4)),
-                robot_state=RemoteCapture(response.capture_id, wire.from_json(response.report_json)),
+                robot_state=RemoteCapture(response.capture_id, report),
+                report=report,
             )
         except ValueError as exc:
             raise GraspFailure("OBSERVATION_UNAVAILABLE", f"the grasp head's capture does not decode: {exc}") from exc
+        report["decode_s"] = time.monotonic() - answered
+        return observation
 
 
 class RemotePlanner:

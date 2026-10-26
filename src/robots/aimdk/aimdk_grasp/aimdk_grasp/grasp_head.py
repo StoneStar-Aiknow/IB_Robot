@@ -246,9 +246,7 @@ class X2GraspHeadNode(Node):
         response.intrinsics = wire.matrix_to_list(observation.intrinsics, (3, 3))
         response.stamp_ns, response.base_frame = int(observation.stamp_ns), observation.base_frame
         response.base_from_camera = wire.matrix_to_list(observation.base_from_camera, (4, 4))
-        # This capture's own timings: the watch captures on another thread meanwhile.
-        own = next((call for call in reversed(head.camera.calls) if call.get("stamp_ns") == observation.stamp_ns), {})
-        response.report_json = wire.to_json(dict(own))
+        response.report_json = wire.to_json(dict(observation.report))
         return response
 
     def _on_scene(self, request, response):

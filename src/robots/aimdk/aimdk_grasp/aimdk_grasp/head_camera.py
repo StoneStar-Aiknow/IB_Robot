@@ -316,7 +316,7 @@ class HeadCamera:
         return sets
 
     def capture(self, *, deadline: float, cancelled: Flag) -> Observation:
-        started = time.monotonic()
+        started, recaptured = time.monotonic(), False
         state = self.capture_state(deadline=deadline, cancelled=cancelled)
         try:
             require_fresh(state, self.clock(), self.revalidation)
@@ -327,13 +327,17 @@ class HeadCamera:
             # this is left for an image past its age. One more capture; limits
             # are unchanged.
             state = self.capture_state(deadline=deadline, cancelled=cancelled)
-            self.calls[-1]["recaptured"] = True
+            recaptured = True
             try:
                 require_fresh(state, self.clock(), self.revalidation)
             except ReobserveRequired as exc:
                 raise GraspFailure(OBSERVATION_UNAVAILABLE, str(exc)) from None
         admitted = AdmittedState(state, self.clock(), started)
         registered = state.observation
+        stamp = registered.transform.stamp_ns
+        # This capture's own entry: the watch captures on another thread meanwhile.
+        own = next((call for call in reversed(self.calls) if call.get("stamp_ns") == stamp), {})
+        report = dict(own, capture_s=time.monotonic() - started, recaptured=recaptured)
         k = registered.frame.intrinsics
         return Observation(
             rgb=registered.frame.rgb,
@@ -344,6 +348,7 @@ class HeadCamera:
             base_frame=BASE_FRAME,
             base_from_camera=registered.transform.base_from_camera,
             robot_state=admitted,
+            report=report,
         )
 
     def capture_state(self, *, deadline: float = float("inf"), cancelled: Flag = lambda: False) -> LiveState:

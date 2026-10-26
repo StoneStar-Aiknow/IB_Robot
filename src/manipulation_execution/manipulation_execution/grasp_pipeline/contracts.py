@@ -62,7 +62,8 @@ class Observation:
     non-finite means no measurement. ``base_from_camera`` maps camera coordinates
     into ``base_frame`` at ``stamp_ns``. ``robot_state`` belongs to the backend
     that captured it (e.g. joint feedback at the image time) and is passed back
-    to the same robot's planner unread.
+    to the same robot's planner unread. ``report`` says how the capture went
+    (timings, retries); the pipeline puts it in the goal's report.
     """
 
     rgb: np.ndarray
@@ -73,6 +74,7 @@ class Observation:
     base_frame: str
     base_from_camera: np.ndarray
     robot_state: object = None
+    report: Mapping = field(default_factory=dict)
 
     def __post_init__(self):
         rgb = _frozen(self.rgb, np.uint8, lambda a: a.ndim == 3 and a.shape[2] == 3, "rgb must be HxWx3")

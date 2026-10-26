@@ -128,6 +128,7 @@ class GraspPipeline:
                 budget = {"deadline": deadline, "cancelled": stop}
                 steps: dict[str, float] = {}
                 observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
+                outcome.report["observe"] = dict(observation.report)
                 self._check_budget(cancelled, deadline)
                 if mode is PickMode.OBSERVE_ONLY:
                     outcome.success = True

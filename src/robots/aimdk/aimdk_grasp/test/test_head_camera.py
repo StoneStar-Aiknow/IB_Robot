@@ -275,7 +275,7 @@ def test_a_stale_capture_is_taken_again_once_then_refused(head):
     with pytest.raises(GraspFailure, match="stale") as raised:
         camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
     assert raised.value.code == "OBSERVATION_UNAVAILABLE" and len(camera.calls) == calls + 2
-    assert camera.calls[-1]["recaptured"] and camera.calls[-1]["feedback_wait_s"] >= 0.09  # it waited first
+    assert camera.calls[-1]["feedback_wait_s"] >= 0.09  # it waited for fresh feedback before recapturing
 
 
 def test_a_feedback_sample_just_late_waits_for_the_next_one_instead_of_a_new_image(head):
@@ -285,9 +285,11 @@ def test_a_feedback_sample_just_late_waits_for_the_next_one_instead_of_a_new_ima
     calls = len(camera.calls)
     caught_up = time.monotonic() + 0.06  # the feedback stream lags, then catches up
     camera.clock = lambda: time.time() + (0.2 if time.monotonic() < caught_up else 0.0)
-    camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
-    assert len(camera.calls) == calls + 1 and not camera.calls[-1].get("recaptured")
-    assert camera.calls[-1]["feedback_wait_s"] >= 0.03
+    observation = camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert len(camera.calls) == calls + 1 and observation.report["recaptured"] is False
+    assert observation.report["feedback_wait_s"] >= 0.03
+    report = observation.report  # the capture's own entry, with the whole capture's time
+    assert report["stamp_ns"] == observation.stamp_ns and report["capture_s"] >= report["total_s"]
 
 
 def test_a_cancel_stops_the_wait(head):
