@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, RLock
 from types import SimpleNamespace
 
 import numpy as np
@@ -102,6 +102,34 @@ def test_service_reuses_warmed_planner_updates_scene_and_rebuilds_locked_model()
         service.prepare({"locked": 1}, fresh)
     assert report["selection_mode"] == "direct_goalset" and "screened_candidates" not in report
     assert events == ["init", "warmup", "plan", "update", "close", "init", "warmup", "close"]
+
+
+def test_a_planner_build_holds_the_lock_the_other_gpu_users_share():
+    """cuRobo captures CUDA graphs while it builds; no other GPU work of the process may run meanwhile."""
+    gpu, building, release = RLock(), Event(), Event()
+
+    class Planner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def warmup(self):
+            building.set()
+            release.wait(5.0)
+
+        def close(self):
+            pass
+
+    with (
+        GraspPlanningService(gripper=GRIPPER, planner_factory=Planner, gpu_lock=gpu) as service,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        built = pool.submit(service.prepare, None, SimpleNamespace(received_at=0.0))
+        assert building.wait(5.0)
+        assert not pool.submit(gpu.acquire, timeout=0.2).result()  # another thread waits
+        release.set()
+        built.result(timeout=5.0)
+        assert gpu.acquire(timeout=1.0)
+        gpu.release()
 
 
 @pytest.mark.parametrize("error", [RuntimeError("capture failed"), KeyboardInterrupt()])

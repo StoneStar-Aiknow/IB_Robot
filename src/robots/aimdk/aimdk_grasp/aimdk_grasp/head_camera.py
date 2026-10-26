@@ -29,6 +29,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -150,6 +151,32 @@ def lookup_matrix(buffer, target: str, source: str, stamp: int) -> np.ndarray:
 
 #: Capture timings kept in HeadCamera.calls.
 CALLS_KEPT = 32
+#: How often a wait for the GPU looks at its deadline and cancel flag.
+GPU_POLL_S = 0.02
+
+
+@contextmanager
+def gpu_section(lock, *, deadline: float = float("inf"), cancelled: Flag = lambda: False, code: str = "SKILL_TIMEOUT"):
+    """Hold the head's GPU lock (see :func:`aimdk_grasp.backend.head_parts`), waiting no longer than ``deadline``.
+
+    A plan or refine holds it for seconds; a capture or scene stage waiting
+    behind one gives up at its own deadline (a ``GraspFailure`` with ``code``)
+    or on cancel instead of returning long after its caller stopped waiting.
+    """
+    acquire = getattr(lock, "acquire", None)
+    if acquire is None:  # nullcontext: nothing else uses the GPU
+        with lock:
+            yield
+        return
+    while not acquire(timeout=GPU_POLL_S):
+        if cancelled():
+            raise GraspFailure("CANCELED", "cancelled waiting for the GPU")
+        if time.monotonic() >= deadline:
+            raise GraspFailure(code, "the GPU was busy (planning) past the deadline")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def register_set(
@@ -218,7 +245,9 @@ class HeadCamera:
         calibration_verified: bool = True,
         revalidation: RevalidationConfig = RevalidationConfig(),
         clock: Callable[[], float] | None = None,
+        gpu_lock: AbstractContextManager | None = None,
     ):
+        """``gpu_lock`` is held while a capture registers on the GPU; see :func:`aimdk_grasp.backend.head_parts`."""
         import rclpy
         from rclpy.context import Context
         from sensor_msgs.msg import CameraInfo, Image
@@ -233,6 +262,7 @@ class HeadCamera:
         bound = [_bound(interfaces, name, message_type) for name, message_type in CAMERA]
         self._node, self.history = node, history
         self._device, self._depth_scale, self._verified = device, float(depth_scale), bool(calibration_verified)
+        self._gpu = nullcontext() if gpu_lock is None else gpu_lock
         self._streams = [deque(maxlen=IMAGE_QUEUE) for _ in CAMERA]
         self._images_lock = threading.Lock()
         self.revalidation = revalidation
@@ -358,9 +388,11 @@ class HeadCamera:
         found = time.monotonic()
         rgb_info, depth_info = kept[2:]
         try:
-            frame, calibration_id = register_set(
-                rgb, depth, rgb_info, depth_info, rgb_from_depth, depth_scale=self._depth_scale, device=self._device
-            )
+            with gpu_section(self._gpu, deadline=deadline, cancelled=cancelled, code=OBSERVATION_UNAVAILABLE):
+                locked = time.monotonic()
+                frame, calibration_id = register_set(
+                    rgb, depth, rgb_info, depth_info, rgb_from_depth, depth_scale=self._depth_scale, device=self._device
+                )
             registered = RegisteredObservation(
                 frame,
                 ImageTransform(stamp, frame.frame_id, BASE_FRAME, torso, self._verified),
@@ -378,7 +410,8 @@ class HeadCamera:
                 stamp_ns=int(stamp),
                 wait_s=found - started,
                 **profile,
-                registration_s=registered_at - found,
+                gpu_wait_s=locked - found,
+                registration_s=registered_at - locked,
                 feedback_wait_s=done - registered_at,
                 total_s=done - started,
                 image_age_s=(self._node.get_clock().now().nanoseconds - stamp) * 1e-9,

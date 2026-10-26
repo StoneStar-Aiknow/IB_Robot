@@ -94,6 +94,7 @@ class GraspPlanningService:
         planner_factory: Callable = LeftArmPlanner,
         planning_profile="default",
         approach_seed_policy="clear_path",
+        gpu_lock=None,
         **planner_options,
     ):
         if planning_profile not in ("default", "latency"):
@@ -119,7 +120,11 @@ class GraspPlanningService:
         self._factory = planner_factory
         self._planner = None
         self._estimate = None
-        self._lock = RLock()
+        # Every planner call runs under it. A process whose other threads also
+        # use the GPU passes one re-entrant lock they share (head_parts): cuRobo
+        # captures CUDA graphs on (re)build and first use, and any allocation or
+        # synchronization elsewhere in the process during a capture fails.
+        self._lock = RLock() if gpu_lock is None else gpu_lock
 
     def prepare(self, feedback, estimate):
         """Initialize/prewarm or replace scene buffers, preserving depth age."""

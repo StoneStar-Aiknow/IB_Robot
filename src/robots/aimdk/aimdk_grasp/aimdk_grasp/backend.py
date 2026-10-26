@@ -32,9 +32,10 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +222,8 @@ class HeadParts:
     planner: Any
     imu: Any = None
     watch: Any = None
+    #: Held by every GPU user of the head (see head_parts).
+    gpu: Any = field(default_factory=threading.RLock)
 
 
 def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: list, *, on_moved=None) -> HeadParts:
@@ -232,6 +235,13 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     from .robot_spheres import RobotSphereModel
 
     options, planning = robot.options, robot.planning
+    # One lock for every GPU user of the head: while cuRobo captures a CUDA
+    # graph, an allocation or synchronization on any other thread of the
+    # process fails ("operation not permitted when stream is capturing"). A
+    # capture registering with Warp during a planner rebuild did that and
+    # took the head down (live 2026-10-22). Re-entrant: the planner's target
+    # recheck captures on the planning thread.
+    gpu = threading.RLock()
     camera = HeadCamera(
         node,
         description,
@@ -240,6 +250,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         depth_scale=float(options["depth_scale"]),
         calibration_verified=options["calibration_verified"],
         revalidation=planning.revalidation,
+        gpu_lock=gpu,
     )
     closers.append(camera.close)
     spheres = RobotSphereModel()
@@ -248,6 +259,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
         max_goalset=planning.max_goalset,
+        gpu_lock=gpu,
     )
     closers.append(service.close)
     planner = X2GraspPlanner(
@@ -260,7 +272,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         clock=camera.clock,
         config=planning,
     )
-    parts = HeadParts(camera, spheres, service, planner)
+    parts = HeadParts(camera, spheres, service, planner, gpu=gpu)
     if options["watch"] != "off":
         parts.imu = ChestImu(node, description)
         closers.append(parts.imu.close)

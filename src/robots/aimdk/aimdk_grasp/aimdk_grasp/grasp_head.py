@@ -42,6 +42,7 @@ from manipulation_execution.grasp_pipeline.contracts import GraspFailure, GraspP
 from . import head_wire as wire
 from .backend import WARMUP_BUDGET_S, head_parts, x2_robot
 from .grasp_request import check_initial_hand
+from .head_camera import gpu_section
 from .head_interface import (
     NO_SUPPORT,
     NOT_READY,
@@ -161,7 +162,9 @@ class X2GraspHeadNode(Node):
                 )
                 admitted = observation.robot_state
                 check_initial_hand(self._robot.hand, admitted)
-                estimate = complete_scene(self._prepare_scene(observation), None, lazy_validation=False)
+                prepared = self._prepare_scene(observation)
+                with head.gpu:
+                    estimate = complete_scene(prepared, None, lazy_validation=False)
                 head.service.prepare(admitted.live.feedback, estimate)
             except Exception as exc:  # noqa: BLE001 - retried until the robot and the camera are up
                 self.get_logger().warning(f"grasp head not ready: {exc}", throttle_duration_sec=5.0)
@@ -178,17 +181,18 @@ class X2GraspHeadNode(Node):
         """The mask-independent scene stage of one capture."""
         registered = observation.robot_state.live.observation
         frame, transform = registered.frame, registered.transform
-        return prepare_scene(
-            frame.depth,
-            frame.intrinsics,
-            transform,
-            stamp_ns=transform.stamp_ns,
-            camera_frame=frame.frame_id,
-            received_at=registered.received_at,
-            robot_spheres_torso=measured_spheres(self._head.spheres, registered.image_feedback),
-            depth_scale=frame.depth_scale,
-            config=self._robot.perception.scene,
-        )
+        with self._head.gpu:
+            return prepare_scene(
+                frame.depth,
+                frame.intrinsics,
+                transform,
+                stamp_ns=transform.stamp_ns,
+                camera_frame=frame.frame_id,
+                received_at=registered.received_at,
+                robot_spheres_torso=measured_spheres(self._head.spheres, registered.image_feedback),
+                depth_scale=frame.depth_scale,
+                config=self._robot.perception.scene,
+            )
 
     # -- requests -----------------------------------------------------------------
 
@@ -257,10 +261,12 @@ class X2GraspHeadNode(Node):
             frame = registered.frame
             if mask.shape != frame.depth.shape:
                 raise wire.WireError(f"mask {mask.shape} is not on the capture's {frame.depth.shape} grid")
+            deadline = time.monotonic() + max(0.0, request.timeout_s)
             waited = time.perf_counter()
             prepared = capture.prepared.result(timeout=max(0.0, request.timeout_s))
             started = time.perf_counter()
-            estimate = complete_scene(prepared, mask, lazy_validation=True)
+            with gpu_section(self._head.gpu, deadline=deadline, cancelled=self._closing.is_set):
+                estimate = complete_scene(prepared, mask, lazy_validation=True)
             settings = self._robot.perception
             points = mask_depth_to_points(
                 mask,
@@ -272,6 +278,8 @@ class X2GraspHeadNode(Node):
             )
         except NoSupportError as exc:
             return self._fail(response, NO_SUPPORT, str(exc))
+        except GraspFailure as failure:  # the GPU stayed busy past the request's deadline
+            return self._fail(response, failure.code, str(failure))
         except FutureTimeout:
             return self._fail(response, "SKILL_TIMEOUT", "the scene's first stage did not finish in time")
         except wire.WireError as exc:
