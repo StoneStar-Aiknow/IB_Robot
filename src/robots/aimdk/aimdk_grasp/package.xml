@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aimdk_grasp</name>
+  <version>0.1.0</version>
+  <description>
+    AgiBot X2 grasp pipeline: observation, scene estimation and grasp planning
+    for the OmniHand X2. It reads the robot only through the public runtime
+    interfaces that aimdk_robot serves and calls the grasp models through the
+    typed perception services; it never imports vendor (aimdk_msgs) types.
+  </description>
+  <maintainer email="zhufei26@huawei.com">weixin_54906338</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_config</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <!-- the ROS feedback test runs the X2 runtime against its vendor mock -->
+  <test_depend>aimdk_robot</test_depend>
+  <test_depend>aimdk_dataplane</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
