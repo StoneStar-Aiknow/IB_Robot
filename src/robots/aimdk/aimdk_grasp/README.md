@@ -105,6 +105,26 @@ The standalone workspace's exact CPU self- and scene-collision check is not
 brought over: execution on the robot no longer calls it, and planning checks
 run in cuRobo.
 
+## Registration and scene estimation
+
+`aimdk_grasp.registration.register_rgbd()` rectifies the head camera's RGB and
+rasterizes each valid depth pixel's footprint into it with a nearest-surface
+z-buffer, so depth steps are never averaged and sensor holes stay holes. The
+kernel runs on NVIDIA Warp (`warp-lang`, installed by `scripts/setup.sh` with the
+grasp dependencies) on the planning host's GPU (`device="cuda"`, about 3 ms per
+1280x720 frame on an RTX 3090); Warp's CPU device runs the same kernel where no
+GPU exists. Detection, segmentation and grasp generation run as perception
+model services instead and can be deployed elsewhere, e.g. on Ascend. The X2's
+head camera is mounted upside down, so the proposer shows the detector and the
+segmenter the image turned upright (`proposer.upright_turns`, from the
+image-time camera pose) and turns their boxes and masks back.
+
+`aimdk_grasp.scene_estimation.estimate_scene()` turns the registered depth, the
+target mask, the image-time camera pose and the robot's collision spheres into
+the planner's torso-frame scene: the support plane as a cuboid, the target and
+environment as voxel meshes, cropped to the left arm's reach, with the robot's
+own body filtered out.
+
 ## What replaced the standalone `x2_grasp_msgs`
 
 | Standalone interface | Replacement | Why |
