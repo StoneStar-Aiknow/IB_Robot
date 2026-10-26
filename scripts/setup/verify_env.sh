@@ -13,8 +13,11 @@
 #   SETUP_ROS_SETUP_PATH — path to ROS 2 setup script (e.g. /opt/ros/humble/setup.bash)
 #
 # Optional variables (default to the full-workspace behavior when unset):
-#   SETUP_PROFILE       — "full" (default) or "inference"; gates checks whose
-#                         dependencies are outside the inference profile scope
+#   SETUP_PROFILE       — "full" (default), "inference", or "training"; gates
+#                         checks whose dependencies are outside the active
+#                         profile scope. On "training" the ROS 2 / rosdep /
+#                         colcon checks are replaced by the venv + LeRobot
+#                         verification in verify_training_env.
 #
 # Colors (imported from setup.sh context):
 #   RED, GREEN, YELLOW, NC, log_info, log_warn, log_error, log_done
@@ -24,9 +27,14 @@
 : "${WORKSPACE:?Variable WORKSPACE is not set}"
 : "${VENV_PYTHON:?Variable VENV_PYTHON is not set}"
 : "${SETUP_PLATFORM_ID:?Variable SETUP_PLATFORM_ID is not set}"
-: "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
 : "${USE_SUDO:?Variable USE_SUDO is not set}"
-: "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+# A profile without a ROS 2 runtime (training) installs neither rosdep nor
+# ROS 2, so these two are optional there; every other profile keeps the
+# fail-closed contract.
+if setup_profile_enables ros_runtime; then
+    : "${ROSDEP_BIN:?Variable ROSDEP_BIN is not set}"
+    : "${SETUP_ROS_SETUP_PATH:?Variable SETUP_ROS_SETUP_PATH is not set}"
+fi
 
 verify_ros() {
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -197,8 +205,8 @@ verify_tracing() {
     # Tracing packages (lttng-ust, babeltrace2, tracetools_analysis) are pulled
     # in via robot_config's rosdep keys, which the inference profile does not
     # install; tracing is a full-workspace diagnostics feature.
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        log_info "Skipping tracing verification (inference profile)."
+    if [[ "$(setup_profile_get verify)" != "full" ]]; then
+        log_info "Skipping tracing verification (${SETUP_PROFILE} profile)."
         return 0
     fi
 
@@ -475,7 +483,159 @@ PYBENCH
     return 0
 }
 
+# Training profile entry point: the workspace venv plus the LeRobot training
+# stack only. ROS 2, rosdep, colcon, cv_bridge, pygraphviz, and tracing are all
+# intentionally out of scope, and NumPy/OpenCV are deliberately not pinned to
+# the ROS 2 ABI.
+verify_training_env() {
+    local venv_python="${VENV_PYTHON}"
+    local verify_log="${WORKSPACE}/venv/.ibrobot_training_verify.log"
+
+    log_info "Verifying training profile environment (venv + LeRobot)..."
+
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" >"${verify_log}" 2>&1 <<'PY'
+import importlib.util
+import os
+import sys
+
+import numpy
+import torch
+
+import lerobot
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies.act import ACTConfig, ACTPolicy
+
+if not issubclass(ACTConfig, PreTrainedConfig):
+    raise SystemExit("LeRobot ACTConfig is not a PreTrainedConfig")
+if ACTPolicy.config_class is not ACTConfig:
+    raise SystemExit("LeRobot ACTPolicy is not bound to ACTConfig")
+if not callable(getattr(ACTPolicy, "reset", None)):
+    raise SystemExit("LeRobot ACTPolicy.reset API is unavailable")
+
+print("lerobot={} ({})".format(getattr(lerobot, "__version__", "unknown"), getattr(lerobot, "__file__", "<unknown>")))
+print("torch={} numpy={}".format(torch.__version__, numpy.__version__))
+# Importing the decoder loads FFmpeg libraries and surfaces ABI/linker failures.
+# Some platforms deliberately do not install torchcodec and use another backend.
+if importlib.util.find_spec("torchcodec") is not None:
+    import torchcodec.decoders
+    print("torchcodec FFmpeg libraries loadable")
+else:
+    print("torchcodec not installed; decoder load check not applicable")
+
+train_cli = os.path.join(os.path.dirname(sys.executable), "lerobot-train")
+if not os.path.isfile(train_cli):
+    raise SystemExit("lerobot-train CLI is missing from the venv: {}".format(train_cli))
+print("lerobot-train CLI available: {}".format(train_cli))
+PY
+    then
+        cat "${verify_log}" >&2
+        log_error "Verification failed: the training profile environment is incomplete."
+        log_error "Re-run ./scripts/setup.sh --yes --profile training and inspect the log above."
+        return 1
+    fi
+    cat "${verify_log}"
+
+    log_done "Verified training environment (venv + LeRobot + torch)"
+    return 0
+}
+
+verify_mujoco_sim() {
+    # Same scope as the install (upgrade-mujoco-ros2-control-0-1 D5): Ubuntu
+    # full-profile, non-benchmark venvs. Every other profile gets an info line
+    # at most, never a false failure.
+    if ! declare -F mujoco_sim_pin_mode >/dev/null; then
+        log_info "Skipping MuJoCo simulation pin verification (mujoco_sim_pin_mode unavailable)."
+        return 0
+    fi
+    local mode
+    mode="$(mujoco_sim_pin_mode)"
+    if [[ "${mode}" != "install" ]]; then
+        log_info "Skipping MuJoCo simulation pin verification (mode: ${mode})."
+        return 0
+    fi
+
+    log_info "Verifying the MuJoCo simulation pin (mujoco_ros2_control >= 0.1.0, one libmujoco version)..."
+    # Setup verification runs before colcon build, so this must never import
+    # robot_runtime: a stdlib-only snippet run with the venv interpreter,
+    # with the ROS prefix derived from the sourced setup.bash's directory.
+    local ros_prefix
+    ros_prefix="$(dirname "${SETUP_ROS_SETUP_PATH:-}")"
+    if [[ ! -d "${ros_prefix}" ]]; then
+        log_error "MuJoCo simulation verification: ROS prefix not found at ${ros_prefix:-<empty>}."
+        return 1
+    fi
+    if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - "${ros_prefix}" <<'PY'
+import importlib.metadata
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+MIN_CONTROL = "0.1.0"
+
+
+def version_key(version):
+    key = []
+    for part in version.strip().split("."):
+        leading = part[: len(part) - len(part.lstrip("0123456789"))]
+        if not leading:
+            break
+        key.append(int(leading))
+    return tuple(key)
+
+
+def fail(message):
+    raise SystemExit(f"MuJoCo simulation pin verification failed: {message}")
+
+
+prefix = Path(sys.argv[1]).resolve()
+package_xml = prefix / "share" / "mujoco_ros2_control" / "package.xml"
+if not package_xml.is_file():
+    fail(f"mujoco_ros2_control not found; install ros-humble-mujoco-ros2-control >= 0.1.2 ({package_xml} is missing)")
+control = (ET.parse(package_xml).getroot().findtext("version") or "").strip()
+if not control:
+    fail(f"no <version> element in {package_xml}")
+if version_key(control) < version_key(MIN_CONTROL):
+    fail(
+        f"mujoco_ros2_control {control} is older than the CameraPlugin release ({MIN_CONTROL}); "
+        "run: sudo apt install --only-upgrade ros-humble-mujoco-ros2-control ros-humble-mujoco-ros2-control-msgs "
+        "ros-humble-mujoco-ros2-control-plugins ros-humble-mujoco-vendor"
+    )
+
+vendor_dir = prefix / "opt" / "mujoco_vendor" / "lib"
+versions = sorted(
+    (match.group(1) for path in vendor_dir.glob("libmujoco.so.*") if (match := re.fullmatch(r"libmujoco\.so\.(\d+\.\d+\.\d+)", path.name))),
+    key=version_key,
+)
+if not versions:
+    fail(f"mujoco_vendor libmujoco not found under {vendor_dir}; install ros-humble-mujoco-vendor 0.1.1")
+vendor = versions[-1]
+
+try:
+    python_mujoco = importlib.metadata.version("mujoco")
+except importlib.metadata.PackageNotFoundError:
+    fail(f"the MuJoCo simulation needs the mujoco Python package; install mujoco=={vendor} (requirements/mujoco-sim.txt)")
+if python_mujoco != vendor:
+    fail(
+        f"Python mujoco {python_mujoco} != mujoco_vendor libmujoco {vendor}; "
+        f"install mujoco=={vendor} (requirements/mujoco-sim.txt); a venv set up with the "
+        "LIBERO benchmark dependencies cannot run the MuJoCo simulation"
+    )
+print(f"MuJoCo simulation pin verified: mujoco_ros2_control {control}, libmujoco {vendor}, python mujoco {python_mujoco}")
+PY
+    then
+        return 1
+    fi
+    return 0
+}
+
 verify_env() {
+    if [[ "$(setup_profile_get verify)" == "training" ]]; then
+        # Training hosts install no ROS 2 runtime, rosdep, or colcon.
+        verify_training_env || return 1
+        return 0
+    fi
+
     if ! platform_supports_local_workspace_build 2>/dev/null; then
         log_info "Verifying OpenHarmony ROS runtime..."
         if verify_runtime_ros_python_bridge >/dev/null 2>&1; then
@@ -493,6 +653,7 @@ verify_env() {
     verify_colcon || return 1
     verify_numpy_compat || return 1
     verify_lerobot || return 1
+    verify_mujoco_sim || return 1
     verify_pygraphviz || return 1
     verify_openeuler_yaml_cpp_abi || return 1
     verify_openeuler_cv_bridge_abi || return 1

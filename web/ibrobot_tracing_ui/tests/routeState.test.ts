@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { buildProfilerQuery, DETAIL_TABS, parseProfilerRoute } from "../src/utils/routeState";
 
 describe("comparison route state", () => {
+  it("retains original source identity and request list ordering in shareable URLs", () => {
+    const state = parseProfilerRoute({ source: "capture", source_version: "hash", request_offset: "100", request_sort: "inference_ms", request_order: "asc", request: "one", tab: "timeline" });
+    expect(buildProfilerQuery(state)).toMatchObject({ source: "capture", source_version: "hash", request_offset: "100", request_sort: "inference_ms", request_order: "asc", request: "one", tab: "timeline" });
+    expect(parseProfilerRoute({ request_offset: "-1", request_sort: "invalid" })).toMatchObject({ requestOffset: 0, requestSortBy: "total_ms" });
+  });
+  it("keeps list filtering separate from the active detail filter", () => {
+    const state = parseProfilerRoute({ tab: "timeline", request: "one", request_filter: "one", q: "model_call" });
+    expect(state.requestFilter).toBe("one");
+    expect(state.searchQuery).toBe("model_call");
+    expect(buildProfilerQuery(state)).toMatchObject({ request_filter: "one", q: "model_call" });
+    expect(parseProfilerRoute({ tab: "requests", q: "legacy" }).requestFilter).toBe("legacy");
+  });
   it("keeps Timeline, Span analysis, and Critical Path adjacent", () => {
     const state = parseProfilerRoute({ tab: "critical-path", request: "request 1", component: "worker" });
 
@@ -25,6 +37,7 @@ describe("comparison route state", () => {
       relative_threshold: "12.5",
       absolute_threshold_ms: "0.75",
       comparison_metric: "inference_ms",
+      comparison_result: "saved-result",
       orientation: "flame",
     });
 
@@ -35,6 +48,7 @@ describe("comparison route state", () => {
       comparisonRelativeThreshold: 12.5,
       comparisonAbsoluteThresholdMs: 0.75,
       comparisonMetric: "inference_ms",
+      comparisonResultId: "saved-result",
       spanAnalysisMode: "request",
     });
     expect(buildProfilerQuery(state)).toMatchObject({
@@ -44,6 +58,7 @@ describe("comparison route state", () => {
       relative_threshold: "12.5",
       absolute_threshold_ms: "0.75",
       comparison_metric: "inference_ms",
+      comparison_result: "saved-result",
     });
   });
 

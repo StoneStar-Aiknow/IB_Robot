@@ -1,22 +1,17 @@
 """Robot description layer: URDF building from YAML configuration.
 
 Handles xacro processing and dynamic camera URDF injection.
-Separated from control.py so both Gazebo and MuJoCo adapters can reuse
+Separated from control.py so both Gazebo adapters can reuse
 the same URDF generation without controller logic.
 
 Public API:
-    generate_robot_description(robot_config, use_sim, mujoco_model_path=None) -> (full_urdf, params) | None
+    generate_robot_description(robot_config, use_sim) -> (full_urdf, params) | None
 """
 
 import json
-import math
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import xacro as _xacro_lib
-
 from robot_config.logger_utils import get_colored_logger
-from robot_config.peripherals.camera import camera_dict_requests_depth
 from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.description")
@@ -66,6 +61,13 @@ def _build_cameras_urdf_from_yaml(
 ) -> str:
     """从 YAML peripherals 动态生成相机 link/joint/gazebo XML。
 
+    Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
+    the robot-agnostic builder lives in ``robot_runtime.gazebo`` and is shared
+    with the runtime providers; generic provider-less Gazebo callers keep the
+    same behaviour through this call site (preset defaults via
+    ``use_default_transform``, spawn-offset compensation for world-parented
+    cameras; the yaw component is 0 on this path).
+
     命名约定（与 sim_peripheral_bridge.py 的 bridge 路径对齐）：
     - URDF link 名     = YAML frame_id（如 camera_top_frame）
       → robot_state_publisher TF 帧名与图像消息 header.frame_id 一致
@@ -80,7 +82,8 @@ def _build_cameras_urdf_from_yaml(
     生成逻辑完全相同，区别仅在于 parent link 的值。
     MuJoCo 使用的 <gazebo reference> 块会被忽略（不影响 MJCF 解析）。
 
-    当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿。
+    当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿
+    （用户保存的 override 优先）。
 
     ``parent_frame="world"`` 特殊处理：URDF 的 ``world`` link 虽然名字叫 world
     但实际是模型根，在 Gazebo 里会随机器人 spawn 位置移动。因此对此类
@@ -91,144 +94,22 @@ def _build_cameras_urdf_from_yaml(
 
     Args:
         peripherals: YAML peripherals 列表。
-        platform: 当前仿真平台 ("gazebo" 或 "mujoco")。
+        platform: 当前仿真平台 ("gazebo")。
         model_spawn_offset: 机器人模型在 Gazebo 世界坐标的 spawn 位置
             (x, y, z) —— 用于修正 ``parent_frame="world"`` 的相机位姿。
     """
-    from robot_config.launch_builders.sim_backend.camera_overrides import load_with_override
+    from robot_config.launch_builders.sim_backend.camera_presets import get_preset
+    from robot_runtime.gazebo import camera_sensor_urdf
 
-    parts = []
-    for periph in peripherals:
-        if periph.get("type") != "camera":
-            continue
-        if periph.get("disabled", False):
-            continue
-        if (periph.get("simulation") or {}).get("embedded_sensor", False):
-            continue
-        if periph.get("skip_urdf_without_transform", False) and not periph.get("transform"):
-            continue
-        name = periph["name"]
-        frame_id = periph.get("frame_id", f"camera_{name}_frame")
-
-        # --- preset 查找 (优先读 override YAML，fallback 到硬编码默认值) ---
-        t = periph.get("transform", {})
-        cam_fovy = periph.get("fovy", 60)
-        if periph.get("use_default_transform", False):
-            preset = load_with_override(platform, name)
-            if preset:
-                t = preset
-                cam_fovy = preset.get("fovy", cam_fovy)
-
-        parent = t.get("parent_frame", "world")
-        x = t.get("x", 0.0)
-        y = t.get("y", 0.0)
-        z = t.get("z", 0.0)
-        roll = t.get("roll", 0.0)
-        pitch = t.get("pitch", 0.0)
-        yaw = t.get("yaw", 0.0)
-
-        # The URDF "world" link is actually model-local (sits at model spawn
-        # position in Gazebo).  Convert user-saved world-absolute coords into
-        # offsets from that model-local "world" link by subtracting spawn.
-        if parent == "world":
-            x -= model_spawn_offset[0]
-            y -= model_spawn_offset[1]
-            z -= model_spawn_offset[2]
-
-        width = periph.get("width", 640)
-        height = periph.get("height", 480)
-        fps = periph.get("fps", 30)
-        sensor_name = f"{name}_camera"
-        has_depth = camera_dict_requests_depth(periph)
-        sensor_type = "rgbd_camera" if has_depth else "camera"
-        topic_name = sensor_name if has_depth else f"{sensor_name}/image"
-
-        # fovy (vertical, degrees) → horizontal_fov (radians)
-        fovy_rad = math.radians(cam_fovy)
-        hfov_rad = 2.0 * math.atan(math.tan(fovy_rad / 2.0) * width / height)
-
-        parts.append(f"""
-    <!-- {name} camera (generated from YAML peripherals) -->
-    <link name="{frame_id}">
-        <inertial>
-            <origin xyz="0 0 0" rpy="0 0 0"/>
-            <mass value="0.01"/>
-            <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
-        </inertial>
-    </link>
-    <joint name="{name}_camera_joint" type="fixed">
-        <parent link="{parent}"/>
-        <child  link="{frame_id}"/>
-        <origin xyz="{x} {y} {z}" rpy="{roll} {pitch} {yaw}"/>
-    </joint>
-    <gazebo reference="{frame_id}">
-        <sensor type="{sensor_type}" name="{sensor_name}">
-            <update_rate>{fps}</update_rate>
-            <camera>
-                <horizontal_fov>{hfov_rad:.4f}</horizontal_fov>
-                <image>
-                    <width>{width}</width>
-                    <height>{height}</height>
-                    <format>R8G8B8</format>
-                </image>
-                <clip><near>0.01</near><far>100</far></clip>
-            </camera>
-            <always_on>true</always_on>
-            <visualize>true</visualize>
-            <topic>{topic_name}</topic>
-        </sensor>
-    </gazebo>""")
-    return "\n".join(parts)
+    return camera_sensor_urdf(
+        peripherals,
+        platform=platform,
+        spawn_pose=(*model_spawn_offset, 0.0),
+        default_pose_loader=get_preset,
+    )
 
 
-def _inject_mujoco_camera_sensors(full_urdf: str, peripherals: list) -> str:
-    """Inject MuJoCo <sensor> blocks into the <ros2_control> element of the URDF.
-
-    The upstream mujoco_ros2_control plugin reads frame_name/image_topic from
-    the URDF <sensor> params rather than using hardcoded defaults.  This makes
-    YAML ``optical_frame_id`` the single source of truth for camera frame IDs.
-
-    Only called when platform == "mujoco".  Gazebo and real-hardware paths are
-    completely untouched — this function is never invoked for them.
-
-    Args:
-        full_urdf:   Complete URDF XML string (post camera-injection).
-        peripherals: List of peripheral dicts from YAML config.
-
-    Returns:
-        Modified URDF string with sensor blocks injected, or the original
-        string unchanged if no opencv cameras are present or parsing fails.
-    """
-    opencv_cams = [p for p in peripherals if p.get("type") == "camera" and p.get("driver") == "opencv"]
-    if not opencv_cams:
-        return full_urdf
-    try:
-        root = ET.fromstring(full_urdf)
-        ros2_ctrl = root.find(".//ros2_control")
-        if ros2_ctrl is None:
-            return full_urdf
-        for periph in opencv_cams:
-            name = periph["name"]
-            cam_name = f"{name}_camera"  # must match mujoco_adapter.py convention
-            optical_frame = periph.get("optical_frame_id", f"camera_{name}_optical_frame")
-            sensor = ET.SubElement(ros2_ctrl, "sensor")
-            sensor.set("name", cam_name)
-            for param_key, param_val in [
-                ("frame_name", optical_frame),
-                ("image_topic", f"{cam_name}/color"),
-                ("info_topic", f"{cam_name}/camera_info"),
-                ("depth_topic", f"{cam_name}/depth"),
-            ]:
-                p = ET.SubElement(sensor, "param", name=param_key)
-                p.text = param_val
-        logger.info(f"Injected {len(opencv_cams)} MuJoCo camera sensor(s) into ros2_control block")
-        return ET.tostring(root, encoding="unicode")
-    except ET.ParseError as e:
-        logger.warning(f"could not inject MuJoCo camera sensors: {e}")
-        return full_urdf
-
-
-def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: str = None):
+def generate_robot_description(robot_config: dict, use_sim):
     """Build the full robot URDF from YAML config (xacro + camera injection).
 
     Processes the base xacro URDF and dynamically injects camera links/joints
@@ -291,15 +172,10 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
         xacro_mappings["use_mock"] = "true" if is_sim else "false"
 
     if is_sim:
-        sim_platform = robot_config.get("simulation", {}).get("platform", "gazebo")
-        if sim_platform == "mujoco":
-            xacro_mappings["sim_plugin"] = "mujoco_ros2_control/MujocoSystemInterface"
-            if mujoco_model_path:
-                xacro_mappings["mujoco_model"] = mujoco_model_path
-            camera_publish_rate = robot_config.get("simulation", {}).get("camera_publish_rate")
-            if camera_publish_rate is not None:
-                xacro_mappings["camera_publish_rate"] = str(camera_publish_rate)
-        # Gazebo: xacro default="gz_ros2_control/GazeboSimSystem" — no explicit mapping needed
+        # Gazebo: xacro default="gz_ros2_control/GazeboSimSystem" — no explicit mapping needed.
+        # (MuJoCo no longer reaches this provider-less path: the loader and
+        # launch preparation reject a provider-less simulation.platform: mujoco,
+        # and the provider renders its own description.)
         controllers_config = ros2_control_config.get("controllers_config")
         if controllers_config:
             controllers_config = resolve_ros_path(controllers_config)
@@ -307,6 +183,10 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
                 xacro_mappings["gz_ros2_control_parameters_file"] = str(Path(controllers_config).resolve())
 
     try:
+        # Function-local import: keep registry construction free of the
+        # xacro dependency chain.
+        import xacro as _xacro_lib
+
         doc = _xacro_lib.process_file(urdf_path, mappings=xacro_mappings)
         base_urdf = doc.toxml()
     except Exception as e:
@@ -331,15 +211,6 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
         )
     else:
         full_urdf = base_urdf
-
-    # MuJoCo camera sensor injection is disabled: apt mujoco_ros2_control 0.0.2
-    # crashes when initializing sensors for body-attached cameras (e.g. wrist_camera
-    # on the gripper body).  The fix exists in the upstream repo (3 commits beyond
-    # the 0.0.2 tag) but is not yet in the apt package.  Camera topic remappings
-    # in mujoco_adapter.py still work; frame_name defaults to the MJCF camera name.
-    # Re-enable once apt is updated past 0.0.2.
-    # if is_sim and robot_config.get("simulation", {}).get("platform") == "mujoco":
-    #     full_urdf = _inject_mujoco_camera_sensors(full_urdf, peripherals)
 
     robot_description_params = {"robot_description": full_urdf}
     if is_sim:

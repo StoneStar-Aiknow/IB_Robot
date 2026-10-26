@@ -35,3 +35,67 @@ def test_simulated_transport_model_is_single_arm_and_has_no_startup_home():
         prefix = "package://so101_description/"
         assert mesh.get("filename").startswith(prefix)
         assert (package / mesh.get("filename").removeprefix(prefix)).is_file()
+
+
+def _render(mappings):
+    package = Path(__file__).resolve().parents[1]
+    document = xacro.process_file(str(package / "urdf/lerobot/so101/so101.urdf.xacro"), mappings=mappings)
+    return ElementTree.fromstring(document.toxml())
+
+
+def test_ros2_control_xacro_renders_for_every_platform():
+    """hardware, sdk, gazebo and mujoco argument sets all render (task 3.2)."""
+    robot = _render({"use_sim": "false"})
+    assert robot.findtext(".//hardware/plugin") == "so101_hardware/SO101SystemHardware"
+    assert robot.find(".//state_interface[@name='effort']") is None
+
+    robot = _render({"use_sim": "true", "sim_plugin": "gz_ros2_control/GazeboSimSystem", "sim_effort_state": "true"})
+    assert robot.findtext(".//hardware/plugin") == "gz_ros2_control/GazeboSimSystem"
+    assert robot.find(".//state_interface[@name='effort']") is not None
+
+    # the SDK virtual transport: the hardware plugin with simulated=true
+    robot = _render({"use_sim": "false", "simulated": "true"})
+    assert robot.findtext(".//hardware/plugin") == "so101_hardware/SO101SystemHardware"
+    params = {node.get("name"): node.text or "" for node in robot.find(".//ros2_control/hardware").findall("param")}
+    assert params["simulated"] == "true"
+
+    robot = _render(
+        {
+            "use_sim": "true",
+            "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
+            "simulated": "false",
+            "sim_effort_state": "true",
+            "mujoco_model": "/tmp/composed.mjb",
+            "mujoco_headless": "true",
+        }
+    )
+    hardware = robot.find(".//ros2_control/hardware")
+    assert hardware.findtext("plugin") == "mujoco_ros2_control/MujocoSystemInterface"
+    params = {node.get("name"): node.text or "" for node in hardware.findall("param")}
+    assert params["mujoco_model"] == "/tmp/composed.mjb"
+    # cameras run through the simulator's CameraPlugin parameters; the
+    # deprecated <sensor> auto-registration is off and the rate param is gone
+    assert params["auto_register_cameras"] == "false"
+    assert "camera_publish_rate" not in params
+    assert params["headless"] == "true"
+    assert robot.find(".//state_interface[@name='effort']") is not None
+    assert robot.find(".//ros2_control/sensor") is None
+
+    # headless stays off by default (the viewer path); auto-register stays off
+    # whenever a mujoco model is configured
+    robot = _render(
+        {
+            "use_sim": "true",
+            "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
+            "mujoco_model": "/tmp/composed.mjb",
+        }
+    )
+    hardware_params = {node.get("name") for node in robot.find(".//ros2_control/hardware").findall("param")}
+    assert "headless" not in hardware_params
+    assert "auto_register_cameras" in hardware_params
+
+    # the Gazebo plugin never carries the MuJoCo-only params
+    robot = _render({"use_sim": "true", "sim_plugin": "gz_ros2_control/GazeboSimSystem"})
+    hardware_params = {node.get("name") for node in robot.find(".//ros2_control/hardware").findall("param")}
+    assert "auto_register_cameras" not in hardware_params
+    assert "camera_publish_rate" not in hardware_params

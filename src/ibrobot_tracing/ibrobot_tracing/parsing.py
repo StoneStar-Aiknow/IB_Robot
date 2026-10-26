@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 
 from .model import EventOrigin, TraceDataset, TraceEvent, TracepointDefinition
@@ -74,6 +75,21 @@ def _structured_event(line: str, origin: EventOrigin, sequence: int) -> TraceEve
     clock = payload.get("clock", "realtime")
     if not isinstance(name, str) or not name or not isinstance(fields, dict) or clock != "realtime":
         return None
+    monotonic_ns = payload.get("monotonic_ns")
+    if monotonic_ns is not None and (type(monotonic_ns) is not int or not 0 <= monotonic_ns < 2**63):
+        return None
+    provenance = payload.get("provenance", {})
+    if not isinstance(provenance, dict):
+        return None
+    text_keys = ("host", "machine_id", "boot_id", "process_instance", "capture_session")
+    int_keys = ("process_id", "thread_id", "event_sequence")
+    if any(not isinstance(provenance.get(key, ""), str) or len(provenance.get(key, "")) > 1024 for key in text_keys):
+        return None
+    if any(
+        key in provenance and (type(provenance[key]) is not int or not 0 <= provenance[key] < 2**63) for key in int_keys
+    ):
+        return None
+    origin = replace(origin, **{key: provenance[key] for key in (*text_keys, *int_keys) if key in provenance})
     return TraceEvent(
         timestamp_ns=timestamp_ns,
         name=name,
@@ -82,6 +98,7 @@ def _structured_event(line: str, origin: EventOrigin, sequence: int) -> TraceEve
         clock=clock,
         schema_version=schema_version,
         sequence=sequence,
+        monotonic_ns=monotonic_ns,
     )
 
 
@@ -181,6 +198,9 @@ def parse_ctf(path: Path, *, max_events: int | None = None) -> TraceDataset:
             if result.returncode == 0:
                 output.seek(0)
                 dataset = parse_lines(output, source=str(path), max_events=max_events)
+                dataset.events = [
+                    replace(event, origin=replace(event.origin, source="ctf")) for event in dataset.events
+                ]
                 dataset.metadata["reader"] = executable
                 return dataset
     raise RuntimeError("babeltrace2 not found or failed to read the CTF trace")
@@ -192,6 +212,12 @@ def parse_trace(path: Path, *, source_kind: str = "auto", max_events: int | None
     kind = source_kind
     if kind == "auto":
         kind = "ctf" if path.is_dir() else "log"
+        if path.is_file() and path.suffix == ".ibtrace":
+            kind = "merged"
+    if kind == "merged":
+        from .merging import read_merged_trace
+
+        return read_merged_trace(path, max_events=max_events)
     if kind == "ctf":
         return parse_ctf(path, max_events=max_events)
     if kind == "log":

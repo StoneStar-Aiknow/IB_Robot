@@ -17,8 +17,20 @@
     <!-- sim_plugin: hardware plugin for simulation. Default = Gazebo.
          MuJoCo: description.py passes "mujoco_ros2_control/MujocoSystemInterface" when platform=mujoco. -->
     <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
+    <!-- sim_effort_state: expose the effort state interface so the runtime's
+         simulated joint-current publisher can derive joint.current from the
+         simulated effort (runtime-simulation-transport D6b). Physics
+         transports only (Gazebo, MuJoCo); the hardware/SDK plugins do not
+         export effort. -->
+    <xacro:arg name="sim_effort_state" default="false"/>
     <xacro:arg name="mujoco_model" default=""/>
-    <xacro:arg name="camera_publish_rate" default=""/>
+    <!-- mujoco_headless: the mujoco_ros2_control <hardware> "headless"
+         parameter (no Simulate UI window). Camera rendering tries GLFW first
+         and falls back to EGL when no display is available, so headless
+         camera streaming needs no xvfb-run wrapper (mujoco_ros2_control
+         0.1.2). Cameras themselves are configured through the simulator's
+         CameraPlugin parameters, never through this file. -->
+    <xacro:arg name="mujoco_headless" default="false"/>
 
     <ros2_control name="RobotSystem" type="system">
         <xacro:if value="$(arg use_sim)">
@@ -26,9 +38,16 @@
                 <plugin>$(arg sim_plugin)</plugin>
                 <xacro:if value="${'$(arg mujoco_model)' != ''}">
                     <param name="mujoco_model">$(arg mujoco_model)</param>
+                    <!-- Turn the deprecated URDF <sensor> camera
+                         auto-registration off: cameras are configured through
+                         the mujoco_plugins CameraPlugin parameters
+                         (mujoco_ros2_control >= 0.1.0), and a model camera
+                         that is somehow not configured must not be silently
+                         auto-registered by the legacy path. -->
+                    <param name="auto_register_cameras">false</param>
                 </xacro:if>
-                <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
-                    <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
+                <xacro:if value="$(arg mujoco_headless)">
+                    <param name="headless">true</param>
                 </xacro:if>
             </hardware>
         </xacro:if>
@@ -52,6 +71,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">1</param>
         </joint>
 
@@ -63,6 +85,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">2</param>
         </joint>
 
@@ -74,6 +99,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">3</param>
         </joint>
 
@@ -85,6 +113,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">4</param>
         </joint>
         <joint name="5">
@@ -95,6 +126,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">5</param>
         </joint>
 
@@ -112,6 +146,9 @@
             </command_interface>
             <state_interface name="position" />
             <state_interface name="velocity" />
+            <xacro:if value="$(arg sim_effort_state)">
+                <state_interface name="effort" />
+            </xacro:if>
             <param name="id">6</param>
         </joint>
     </ros2_control>

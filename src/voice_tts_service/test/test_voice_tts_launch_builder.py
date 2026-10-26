@@ -1,0 +1,256 @@
+"""Launch-builder tests for the voice_tts entry (voice_tts_service's contribution).
+
+Migrated from ``robot_config/test/test_voice_tts_launch_builder.py``
+(openspec change ``migrate-business-launch-builders``, task B.5): the tests
+follow the module to its owning package; assertions are verbatim, only the
+import path changed.
+"""
+
+import pytest
+
+from voice_tts_service.launch_builders import voice_tts
+
+
+def _node_parameters(node):
+    parameters = {}
+    for raw_key, raw_value in node._Node__parameters[0].items():
+        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
+        if isinstance(raw_value, tuple):
+            raw_value = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
+            if raw_value.endswith("\n..."):
+                raw_value = raw_value[:-4].rstrip()
+        parameters[key] = raw_value
+    return parameters
+
+
+def _runtime_options(node):
+    """Parse runtime_options_json out of the YAML-wrapped launch parameter."""
+    import json
+
+    raw = _node_parameters(node)["runtime_options_json"].strip()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1]
+    return json.loads("".join(line.strip() for line in raw.splitlines()))
+
+
+def test_voice_tts_builder_does_not_open_bundle_before_node_start(monkeypatch, tmp_path):
+    defaults = {
+        "enabled": False,
+        "bundle_path": "models/zipvoice",
+        "deployment": "",
+        "exit_on_init_failure": False,
+    }
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: defaults)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "not-mounted-yet"),
+                "deployment": "ascend_310p",
+                "exit_on_init_failure": False,
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+
+    assert len(nodes) == 2
+
+
+def test_voice_tts_builder_routes_shared_playback_format(monkeypatch, tmp_path):
+    defaults = {
+        "enabled": False,
+        "bundle_path": "models/voice_tts/zipvoice",
+        "deployment": "",
+        "exit_on_init_failure": False,
+    }
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: defaults)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path),
+                "deployment": "ubuntu_onnx",
+            },
+            "audio_io": {
+                "enabled": True,
+                "playback_topic": "/shared/play",
+                "playback_sample_rate": 24000,
+                "playback_channels": 1,
+            },
+        }
+    )
+
+    playback = _node_parameters(nodes[1])
+    assert playback["audio_topic"] == "/shared/play"
+    assert playback["playback_sample_rate"] == 24000
+    assert playback["playback_channels"] == 1
+
+
+def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_path):
+    defaults = {
+        "enabled": False,
+        "bundle_path": "models/zipvoice",
+        "deployment": "",
+        "device_id": 0,
+        "prompt_profile": "default",
+        "max_request_chars": 4000,
+        "max_prompt_audio_bytes": 10 * 1024 * 1024,
+        "max_prompt_duration_sec": 30.0,
+        "segment_max_chars": 200,
+        "segment_pause_ms": 150,
+        "max_segments": 32,
+        "max_response_audio_bytes": 64 * 1024 * 1024,
+        "exit_on_init_failure": False,
+    }
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: defaults)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "zipvoice"),
+                "deployment": "ascend_310p",
+                "device_id": 0,
+                "max_request_chars": 100,
+                "max_prompt_audio_bytes": 1024,
+                "max_prompt_duration_sec": 3.0,
+                "exit_on_init_failure": False,
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+
+    runtime_options = _node_parameters(nodes[0])["runtime_options_json"]
+    assert '"max_request_chars": 100' in runtime_options
+    assert '"max_prompt_audio_bytes": 1024' in runtime_options
+
+
+# --- runtime-bound playback output (runtime-owned-audio-io) ----------------------
+
+
+def _bound_audio_output(**metadata):
+    return {
+        "interface": "audio.play",
+        "type": "audio_common_msgs/msg/AudioDataStamped",
+        "topic": "/audio/play",
+        "_interface_source": {"id": "audio.play"},
+        **metadata,
+    }
+
+
+def _bound_tts_config(audio_output):
+    return {
+        "voice_tts": {
+            "enabled": True,
+            "bundle_path": "models/zipvoice",
+            "deployment": "ubuntu_onnx",
+            "audio_output": audio_output,
+        },
+    }
+
+
+def _playback_parameters(nodes):
+    player = next(node for node in nodes if node._Node__node_executable == "audio_playback_node")
+    parameters = {}
+    for raw_key, raw_value in player._Node__parameters[0].items():
+        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
+        if isinstance(raw_value, tuple):
+            raw_value = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
+            if raw_value.endswith("\n..."):
+                raw_value = raw_value[:-4].rstrip()
+        parameters[key] = raw_value
+    return parameters
+
+
+def test_voice_tts_reads_topic_and_format_from_the_binding(tmp_path, monkeypatch):
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=24000, channels=1))
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/audio/play"
+    assert parameters["playback_sample_rate"] == 24000
+    assert parameters["playback_channels"] == 1
+
+
+def test_voice_tts_tracks_the_runtime_declared_playback_rate(tmp_path, monkeypatch):
+    """A vendor runtime declaring 16 kHz playback overrides the legacy default."""
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=16000, channels=1))
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["playback_sample_rate"] == 16000
+
+
+def test_voice_tts_rejects_an_unbound_audio_output(tmp_path, monkeypatch):
+    config = _bound_tts_config({"interface": "audio.play", "type": "audio_common_msgs/msg/AudioDataStamped"})
+    with pytest.raises(ValueError, match="must be bound to a runtime description"):
+        voice_tts.generate_voice_tts_nodes(config)
+
+
+def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypatch):
+    config = {
+        "audio_io": {"enabled": True, "playback_topic": "/audio/play", "playback_sample_rate": 24000},
+        "voice_tts": {"enabled": True, "bundle_path": "models/zipvoice", "deployment": "ubuntu_onnx"},
+    }
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/audio/play"
+    assert parameters["playback_sample_rate"] == 24000
+
+
+def test_voice_tts_builder_passes_num_steps_to_the_session(monkeypatch, tmp_path):
+    """The flow step count must be reachable from YAML.
+
+    It is ~98% of synthesis time and linear in the step count, but it lives in
+    a digest-verified bundle asset, so the only way to pick a different
+    latency/quality point is to send it as a runtime option.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
+
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+                "num_steps": 2,
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+    options = _runtime_options(nodes[0])
+
+    assert options["num_steps"] == 2
+
+
+def test_voice_tts_builder_leaves_num_steps_to_the_bundle_when_unset(monkeypatch, tmp_path):
+    """Unset in YAML, the session uses the step count its bundle ships with.
+
+    Fewer steps is a measured trade a profile opts into; it must not change
+    every deployment that never asked for it.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
+
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+    options = _runtime_options(nodes[0])
+
+    assert "num_steps" not in options

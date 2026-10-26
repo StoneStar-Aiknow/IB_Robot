@@ -12,6 +12,9 @@
   <depend>sensor_msgs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>robot_runtime</depend>
+  <!-- docs/testing.md: every sibling imported by tests is declared as an
+       explicit test_depend; <depend> covers build+exec scope only. -->
+  <test_depend>robot_runtime</test_depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>
   <depend>rosgraph_msgs</depend>
@@ -26,30 +29,27 @@
   <exec_depend>rosbag2_storage_mcap</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
-  <exec_depend>robot_interaction_demo</exec_depend>
-
-  <!-- Teleoperation and auxiliary hand nodes launched by this package -->
-  <exec_depend>robot_teleop</exec_depend>
+  <!-- Auxiliary hand actuator nodes launched by this package; the teleop
+       wiring and the hand_sources entry moved to robot_teleop (openspec
+       changes ``migrate-business-launch-builders`` and
+       ``migrate-hand-sources-to-robot-teleop``), which now depends on
+       robot_config. -->
   <exec_depend>aero_hand_hardware</exec_depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>camera_ros</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
-  <exec_depend>rtabmap_launch</exec_depend>
-  <exec_depend>depthimage_to_laserscan</exec_depend>
   <exec_depend>ldlidar_ros2</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>
-  <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>livox_ros_driver2</exec_depend>
   <exec_depend>fast_lio</exec_depend>
-  <exec_depend>rviz2</exec_depend>
-  <exec_depend>joy</exec_depend>
-  <exec_depend>joy_teleop</exec_depend>
-  <exec_depend>robot_localization</exec_depend>
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <depend>voice_asr_service</depend>
+  <!-- ALSA audio device owners for the provider-less legacy audio_io entry
+       (runtime-owned-audio-io). Delete both once every deployment sets
+       runtime.provider: provider deployments launch these nodes from the
+       robot runtime's peripheral list and declare the dependency there. -->
   <exec_depend>audio_capture</exec_depend>
   <exec_depend>audio_play</exec_depend>
 
@@ -63,15 +63,13 @@
   <!-- Gazebo simulation -->
   <exec_depend>gz_ros2_control</exec_depend>
 
-  <!-- MuJoCo simulation -->
-  <exec_depend>mujoco_ros2_control</exec_depend>
+  <!-- MuJoCo simulation. 0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1);
+       rosdep does not enforce versions, the runtime check is the guard. -->
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
 
   <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>
 
-  <!-- Navigation bringup -->
-  <exec_depend>nav2_bringup</exec_depend>
-  <exec_depend>robot_navigation</exec_depend>
 
   <!-- Benchmark runtime launched when runtime.target=benchmark -->
   <exec_depend>benchmark_runtime</exec_depend>
@@ -86,6 +84,8 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- new launch-builder tests compose/inspect sim_models scenes -->
+  <test_depend>sim_models</test_depend>
   <test_depend>action_msgs</test_depend>
   <test_depend>lekiwi_description</test_depend>
   <test_depend>lekiwi_hardware</test_depend>

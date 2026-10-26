@@ -3,7 +3,7 @@
 # agent_voice_bridge; robot motion still flows Agent -> Gateway -> skill
 # executor exactly as for the text channel.
 #
-# Gazebo has no microphone, so this profile keeps audio_io/voice_asr off and
+# Gazebo has no microphone, so this profile keeps voice_asr off and
 # expects the ASR node to run beside it (e.g. standalone voice_asr_node fed by
 # /voice_file_input or ~/recognize_file).
 #

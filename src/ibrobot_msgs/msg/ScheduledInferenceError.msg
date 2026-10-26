@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Bounded scheduled-path error. Replaces the legacy unbounded InferenceError on scheduled IDL.
 string<=64 code
 string<=1024 message

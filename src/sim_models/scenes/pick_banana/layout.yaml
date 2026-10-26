@@ -56,6 +56,22 @@ objects:
     mass_kg: 0.1
     description: "Yellow banana — object to be grasped"
 
+# ── Scene task declaration ────────────────────────────────────────────────────
+# The world owner (generic launch) starts this executable after runtime
+# readiness on every platform listed here (so101-mujoco-runtime-platform D8).
+task:
+  executable: pick_banana_task_node
+  platforms: [mujoco, gazebo]
+
+# ── Evaluation criteria (shared by every physics platform, D9) ───────────────
+# The plate centre is derived from objects[plate].position; these radii are
+# the success / flew-out / fell-off limits the AutoTest judges with. A scene
+# without this section uses the same values as defaults.
+evaluation:
+  success_radius_m: 0.15
+  flew_out_radius_m: 0.40
+  fell_off_z: -0.05
+
 # ── Randomisation config (used by scene_compiler keyframe injection) ─────────
 randomization:
   banana:

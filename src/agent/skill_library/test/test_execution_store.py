@@ -205,3 +205,17 @@ def test_failing_event_listener_cannot_break_the_ledger(tmp_path):
     store.mark_committing(record.execution_id)
     finished = store.finish(record.execution_id, state="SUCCEEDED", completed_step_count=1)
     assert finished.state == "SUCCEEDED"
+
+
+def test_resume_checkpoint_is_kept_with_the_execution_until_it_is_terminal(tmp_path):
+    path = tmp_path / "executions.sqlite3"
+    store = SQLiteExecutionStore(path)
+    record, _ = store.begin(_program())
+    assert record.resume_checkpoint is None
+    checkpoint = {"step_index": 0, "skill_name": "wave_hello", "resume_token": "token", "progress": 0.4}
+    store.record_resume_checkpoint(record.execution_id, checkpoint)
+    store.finish(record.execution_id, state="CANCELED", completed_step_count=0, error_code="SKILL_CANCELLED")
+    with pytest.raises(ExecutionConflictError):
+        store.record_resume_checkpoint(record.execution_id, checkpoint)
+    store.close()
+    assert SQLiteExecutionStore(path).get(execution_id=record.execution_id).resume_checkpoint == checkpoint

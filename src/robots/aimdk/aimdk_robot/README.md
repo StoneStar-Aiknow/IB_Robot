@@ -31,7 +31,7 @@ package.
 | `/joint_states`, `/aimdk/body_joint_states` | `sensor_msgs/JointState` | `/aima/hal/joint/{arm,head,waist,leg}/state`, hand state |
 | `/aimdk/arm/commands`, `/aimdk/gripper/commands`, `/aimdk/head/commands` | `Float64MultiArray` | `/mc/upper_body_command` (`arm_pos` / `hand_pos` / `head_pos`) |
 | `/cmd_vel` | `geometry_msgs/Twist` | `/aima/mc/locomotion/velocity` + input-source arbitration |
-| `/motion/execute_named` | `ibrobot_msgs/action/ExecuteNamedMotion` | `SetMcPresetMotion` (wave, handshake, clap…) and posture MC actions (sit, squat, lie, stand up, stairs) |
+| `/motion/execute_named` | `ibrobot_msgs/action/ExecuteNamedMotion` | `SetMcPresetMotion` (wave, handshake, clap…) and posture MC actions (sit, squat, lie, stand up, stairs); in `stream`, recorded arm trajectories on `/mc/upper_body_command` |
 | `/speech/speak` | `ibrobot_msgs/srv/SpeakText` | `PlayTts` (neutral 0–100 priority stepped onto the platform's TTS layers, background…warning; the safety layer is unreachable) |
 | `/expression/play` | `ibrobot_msgs/srv/PlayExpression` | `PlayEmoji` (semantic name → vendor emotion id) |
 | `/led/set_pattern` | `ibrobot_msgs/srv/SetLedPattern` | `SetPmuLed` (reports platform preemption instead of faking success) |
@@ -190,6 +190,88 @@ silence. And an accepted dispatch that carries `task_id 0` is a refusal, not a
 result: `GetMcPresetMotionState` distinguishes only "executing" from
 "completed", so a task that was never created reads as completed the instant it
 is asked about.
+
+### In the stream mode, named motions are replayed recordings
+
+The platform plays no preset in `UPPERBODY_REMOTE_SPLIT`, so a deployment that
+lives in the `stream` mode (teleop, grasping, the X2 skills) would have to
+leave it for every gesture. Instead, `vendor.named_motion.trajectory_modes`
+(declared by `x2_ultra_omnihand`) names the modes in which `/motion/execute_named` replays an arm trajectory
+recorded off the platform's own preset (`vendor.named_motion.trajectories`,
+files under `profiles/trajectories/`). The replay eases in from the measured arm
+pose, streams at the vendor command rate, and owns the arm channel while it
+runs: the public arm stream is refused (`arm_stream:NAMED_MOTION_ACTIVE`)
+rather than interleaved, and a stop ends it with `STOP_LATCHED`. It does not
+take the channel from a live public arm stream (teleop, grasping): a gesture
+asked for within `stream_staleness_s` of the last public arm target is refused
+`BUSY`, because that source's next absolute target would jump the arm back once
+the gesture released it. Only the arms
+move; head and hands hold. A name without a recording is refused in these modes
+with `MODE_NOT_ALLOWED`, and a file that does not name its recorded side
+(`left`, `right`, `both` or `body`), misses a joint, runs time backwards or
+steps faster than `trajectory_max_speed_radps` is refused at startup. A
+recording plays only the side it was recorded on: a goal whose `target` names
+another side is refused `INVALID_TARGET` without moving the arm. As with
+presets, a goal with `interrupt=false` is refused while another named motion is
+executing — at goal acceptance, or `BUSY` if both were accepted together — and
+only `interrupt=true` takes the arm channel from a running replay. A replay
+succeeds only if the measured arm followed it — at least
+`trajectory_follow_min_ratio` of the commanded motion on its most-moving joint
+— and otherwise fails `REJECTED_BY_PLATFORM`, because the platform drops
+upper-body commands it cannot use without saying so.
+
+A replay is the only named motion that accepts a cancel (presets and postures
+refuse it and point at `/runtime/stop`). It stops on the next tick and holds
+the target it sent `trajectory_hold_lag_s` ago, the one the arm is realizing:
+holding the last target would carry the motion on, and holding the measured
+pose lets the arm sag, because the platform holds a pose only with an error
+against gravity. On the X2 this stops a 2.6 rad/s wave within 0.1 rad and
+0.4 s. The goal ends `CANCELLED` with a
+`resume_token` and the `progress` reached. A later goal carrying that token
+eases from the measured pose to the point where the recording stopped and
+plays the rest. The runtime keeps one checkpoint and honours it once, within
+`trajectory_resume_ttl_s` (default 120 s), and only while nothing has moved the
+arm or changed who commands it: a public arm target, another named motion, a
+mode change, a stop or lost arbitration all void it. A void token plays the
+motion from the start and says why in the result message.
+
+Record a gesture with the runtime in `idle` (stable stand, so the preset plays):
+
+```bash
+ros2 run aimdk_robot aimdk_record_named_motion wave --target right \
+  -o src/robots/aimdk/aimdk_robot/profiles/trajectories/wave.json
+```
+
+`--target` is the side the preset plays (`body` for two-handed ones like clap);
+it is sent with the goal and written into the file.
+
+then map it in the profile (`trajectories: {wave: trajectories/wave.json}`).
+The tool plays the preset through `/motion/execute_named`, so it needs that
+preset path to work on the robot's firmware: v1.1.1 answers every accepted
+preset with `task_id 0`, which this runtime refuses as "nothing was
+dispatched", and the shipped recordings were made with that handled locally.
+
+**The hands must be in every upper-body command.** In `UPPERBODY_REMOTE_SPLIT`
+the platform drops a whole `/mc/upper_body_command` — arms included — whose
+`hand_pos` does not fit its `hand_sub_mode`: on 2026-10-20 an empty `hand_pos`
+left the MC arm command board (`/aima/hal/joint/arm/command`) untouched while
+the identical command with the 20-value dexterous layout moved it. With no hand
+command, the runtime therefore holds installed dexterous hands at their
+measured pose (sub-mode 2, zeros for a side with no hand, as on an X2 with only
+a left hand); an installed hand it cannot hold withholds the command
+(`upper_body:HAND_HOLD_UNAVAILABLE`) instead of sending one the platform would
+drop. Claw holding is not verified on hardware and still sends no targets,
+which is why only the OmniHand profile declares replay. For the same reason a
+profile whose hand family differs from one the platform reports may not enter
+a mode in `UPPERBODY_REMOTE_SPLIT`; the runtime stays ACTIVE for everything
+else, which does not involve the hands.
+
+Measured on that X2 (left dexterous hand, right none): every gesture tracks its
+recording within 0.05–0.10 rad mean (0.25 rad worst, at raise_hand's
+4.7 rad/s peak) and lags it by about 0.75 s, most of it the 0.5 s ease-in. A
+HOLD stop ends the replay at once, but the arm first reaches the target it
+already had — about 0.4 rad of overshoot when stopped mid-swing — and is still
+within 0.22 s.
 
 ### Neutral priorities are mapped, never passed through
 
@@ -431,8 +513,10 @@ the declared sensor endpoints (lidar, GNSS and relocalization are *not*
 declared because that firmware does not serve them), the registered motion
 modes, and the clock-skew limit. Treat those as measured, not assumed.
 
-What is still unverified on hardware: everything that moves the robot. Mode
-switching reached the platform, but streaming, stop latencies, locomotion,
+What is still unverified on hardware: almost everything that moves the robot.
+Mode switching reached the platform, and arm streaming in
+`UPPERBODY_REMOTE_SPLIT` was verified on 2026-10-20 (dexterous left hand; see
+the stream-mode named motions above), but claw-hand streaming, locomotion,
 posture skills and the interaction surface remain unchecked, user-executed
 gates in the OpenSpec change (§9, and the open items in §8b). The stop latency
 bounds in the profile are still placeholders — the measured values from the

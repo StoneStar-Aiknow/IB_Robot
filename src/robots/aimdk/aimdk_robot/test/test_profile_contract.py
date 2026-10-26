@@ -124,14 +124,14 @@ def test_vendor_section_covers_every_mode(profile):
 
 
 def test_description_builds_and_publishes_no_model(profile):
-    description = build_description(profile, simulated=True)
+    description = build_description(profile, use_sim=True)
     validate_description(description)
     assert "model" not in description
     assert not [name for name in description["interfaces"] if name.startswith("motion.arm")]
 
 
 def test_description_declares_vendor_sensor_endpoints(profile):
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     cameras = {name: spec for name, spec in interfaces.items() if spec["capability"] == "perception.camera"}
     assert cameras
     for spec in cameras.values():
@@ -148,7 +148,7 @@ def test_description_declares_vendor_sensor_endpoints(profile):
 
 
 def test_commandable_channels_are_bridge_owned_topics(profile):
-    interfaces = build_description(profile, simulated=True)["interfaces"]
+    interfaces = build_description(profile, use_sim=True)["interfaces"]
     assert interfaces["joint.arm_stream"]["endpoint"] == "/aimdk/arm/commands"
     assert interfaces["base.cmd_vel"]["endpoint"] == "/cmd_vel"
     assert interfaces["base.cmd_vel"]["limits"] == {"max_vx": 1.0, "max_vy": 1.0, "max_wz": 1.0}
@@ -284,3 +284,57 @@ def test_declared_preset_motions_are_pairs_the_platform_maps_to_an_animation(pro
     # Every name the capability advertises is actually mapped.
     advertised = set(profile["capabilities"]["motion.named"]["names"])
     assert advertised <= set(presets) | set(profile["vendor"]["postures"])
+
+
+def test_runtime_node_builds_its_own_description_without_injection():
+    """The no-injection construction path must use the current API (PR !515 P1).
+
+    The physical AimDK launch injects no ``interface_description_json``; the
+    node then builds the description itself. That path regressed to a
+    ``TypeError`` when ``build_description`` migrated to ``use_sim``. The
+    vendor gateway is required at construction (``require_vendor``), so this
+    test skips with a named reason where the AimDK overlay is not sourced —
+    the same rule the bridge integration tests apply.
+    """
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("aimdk_msgs", reason="AimDK overlay not sourced; source the vendor workspace to run these")
+    from aimdk_robot.runtime_node import AimdkRuntimeNode
+
+    owned = not rclpy.ok()
+    if owned:
+        rclpy.init()
+    try:
+        node = AimdkRuntimeNode(
+            parameter_overrides=[
+                rclpy.parameter.Parameter("profile", value=str(PROFILE_PATH)),
+                rclpy.parameter.Parameter("use_sim", value=False),
+            ]
+        )
+        try:
+            assert node._speech_description["execution"] == "physical"
+            assert "sim_platform" not in node._speech_description
+        finally:
+            node.destroy_node()
+    finally:
+        if owned and rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_shipped_trajectories_load_and_replay_advertised_motions():
+    """A recording that fails validation would stop the runtime at startup."""
+    from aimdk_robot.named_motion import CONTROL_AREAS
+    from aimdk_robot.trajectory import load_trajectory
+
+    path = PROFILE_PATH.with_name("x2_ultra_omnihand.yaml")
+    profile = load_profile(path)
+    config = profile["vendor"]["named_motion"]
+    assert {profile["vendor"]["mc_actions"][mode] for mode in config["trajectory_modes"]} == {"UPPERBODY_REMOTE_SPLIT"}
+    assert set(config["trajectories"]) <= set(profile["capabilities"]["motion.named"]["names"])
+    areas = {area: name for name, area in CONTROL_AREAS.items()}
+    for name, path_in_profile in config["trajectories"].items():
+        recorded = load_trajectory(
+            path.parent / path_in_profile, max_speed_radps=float(config["trajectory_max_speed_radps"])
+        )
+        # The recording plays the side the preset it was recorded from plays.
+        preset = profile["vendor"]["preset_motions"][name]
+        assert recorded.target == (areas[preset["area"]] if "area" in preset else preset["target"]), name

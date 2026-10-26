@@ -132,7 +132,8 @@ class AimdkRuntimeNode(Node):
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("aimdk_runtime", **node_kwargs)
         self.declare_parameter("profile", "")
-        self.declare_parameter("simulated", False)
+        self.declare_parameter("use_sim", False)
+        self.declare_parameter("sim_platform", "")
         self.declare_parameter("initial_mode", "")
         self.declare_parameter("instance_id", "")
         self.declare_parameter("startup_timeout_s", 20.0)
@@ -145,7 +146,8 @@ class AimdkRuntimeNode(Node):
         if not profile_path:
             raise RuntimeError("aimdk_runtime requires the 'profile' parameter")
         self._profile = load_profile(profile_path)
-        self._simulated = bool(self.get_parameter("simulated").value)
+        self._use_sim = bool(self.get_parameter("use_sim").value)
+        self._sim_platform = str(self.get_parameter("sim_platform").value or "").strip()
         instance_id = str(self.get_parameter("instance_id").value or "")
         if instance_id:
             self._profile["runtime"]["instance_id"] = instance_id
@@ -203,7 +205,9 @@ class AimdkRuntimeNode(Node):
             description = json.loads(supplied)
             validate_description(description)
         else:
-            description = build_description(self._profile, simulated=self._simulated)
+            description = build_description(
+                self._profile, use_sim=self._use_sim, sim_platform=self._sim_platform or None
+            )
         self._speech_cb = MutuallyExclusiveCallbackGroup()
         self._speech_description = description
         self._speech_enabled = False
@@ -242,6 +246,16 @@ class AimdkRuntimeNode(Node):
         self._arm_stamp = 0.0
         self._head_stamp = 0.0
         self._hand_stamp = 0.0
+        #: Token of the named motion replaying a trajectory on the arm channel;
+        #: while set, the public arm stream is refused instead of interleaved.
+        self._arm_owner: int | None = None
+        #: When the public arm stream last set a target; a fresh one is not preempted.
+        self._public_arm_stamp: float | None = None
+        #: Moves on anything that may have moved the arm or changed who commands
+        #: it: a public arm target, a named motion taking the channel, and every
+        #: command reset (mode change, stop, lost arbitration). A named motion
+        #: cancelled part-way resumes only while it has not moved.
+        self._arm_motion_epoch = 0
         self._twist: tuple[float, float, float] | None = None
         self._twist_stamp = 0.0
         self._sequence = 0
@@ -251,11 +265,14 @@ class AimdkRuntimeNode(Node):
         self._vendor_action = ""
         self._system_state = ""
         self._hold_target_missing = False
+        self._hand_hold_missing = False
         self._hand_type_verified = False
         self._hand_type_reported: list[str] = []
         #: Hand families as reported by the hand state stream (HandStateArray
         #: carries the same enumeration as GetHandType).
         self._hand_state_types: list[int] = []
+        #: Measured hand joint positions per side (left, right), by joint name.
+        self._hand_measured: list[dict[str, float]] = [{}, {}]
         # Per-source joint feedback with its receipt time: a source that goes
         # quiet must drop out of the aggregate instead of being re-stamped.
         self._joint_groups: dict[str, list[tuple[str, float, float, float]]] = {}
@@ -1039,6 +1056,12 @@ class AimdkRuntimeNode(Node):
             response.success = True
             response.message = "already active"
             return response
+        mismatch = self._hand_mismatch(target)
+        if mismatch:
+            response.success = False
+            response.message = mismatch
+            response.valid_transitions = sorted(self._modes.valid_transitions())
+            return response
         ok, detail = self._request_vendor_mode(target, epoch)
         if not ok:
             response.success = False
@@ -1096,6 +1119,13 @@ class AimdkRuntimeNode(Node):
         ends it at once, so a stop never queues behind a confirmation.
         """
         action = projection.mode_action(self._profile, mode)
+        with self._lock:
+            already = self._vendor_action == action
+        if already:
+            # The platform answers a request for the action it is already in
+            # with MOTION_BUSY (firmware v1.1.1, 2026-10-23), e.g. when an
+            # earlier run left it in the upper-body mode; there is nothing to switch.
+            return True, f"platform already in {action}"
         result = self._set_action.call(vg.set_action_request(self, source=self._source, action_name=action))
         if not result.ok:
             reason = projection.mode_rejection_reason(result.code)
@@ -1308,8 +1338,13 @@ class AimdkRuntimeNode(Node):
             if name == "arm_stream":
                 payload = projection.arm_payload(message.data, channel_joints=joints)
                 with self._lock:
+                    if self._arm_owner is not None:
+                        self._modes.note_rejected(f"{name}:NAMED_MOTION_ACTIVE")
+                        return
                     self._arm_cmd = payload
                     self._arm_stamp = time.monotonic()
+                    self._public_arm_stamp = self._arm_stamp
+                    self._arm_motion_epoch += 1
             elif name == "head_stream":
                 payload = projection.head_payload(message.data, channel_joints=joints, limits=self._head_limits)
                 with self._lock:
@@ -1382,6 +1417,7 @@ class AimdkRuntimeNode(Node):
 
     def _clear_commands(self) -> None:
         with self._lock:
+            self._arm_motion_epoch += 1
             self._arm_cmd = None
             self._hand_cmd = None
             self._head_cmd = None
@@ -1463,9 +1499,17 @@ class AimdkRuntimeNode(Node):
                     )
                 return
             self._hold_target_missing = False
-            hand_sub_mode, hand_pos = (
-                self._hand_cmd if self._hand_cmd is not None else (self._default_hand_sub_mode, [])
-            )
+            hand = self._hand_cmd if self._hand_cmd is not None else self._hand_hold_locked()
+            if hand is None:
+                if not self._hand_hold_missing:
+                    self._hand_hold_missing = True
+                    self._modes.note_rejected("upper_body:HAND_HOLD_UNAVAILABLE")
+                    self.get_logger().warning(
+                        "upper-body command withheld: the installed hands cannot be held at a measured pose"
+                    )
+                return
+            self._hand_hold_missing = False
+            hand_sub_mode, hand_pos = hand
             self._upper_body_pub.publish(
                 vg.upper_body_command(
                     self,
@@ -1477,6 +1521,55 @@ class AimdkRuntimeNode(Node):
                     hand_pos=hand_pos,
                 )
             )
+
+    def _hand_mismatch(self, mode: str) -> str:
+        """Why ``mode`` cannot carry this robot's hands, or "".
+
+        A profile whose hand family differs from one the platform reports is
+        not a fault of the whole runtime — speech, presets and the other modes
+        do not involve the hands — but every upper-body command in the
+        hands-carrying action would be dropped by the platform, arms included.
+        So only that action is refused, naming the reason.
+        """
+        if str((self._vendor.get("mc_actions") or {}).get(mode, "")) != projection.UPPER_BODY_HANDS_ACTION:
+            return ""
+        declared = "claw" if self._hand_type == "claw" else "dexterous"
+        with self._lock:
+            reported = list(self._hand_state_types)
+        if {vg.hand_type_family(value) for value in reported} - {None, declared}:
+            names = [vg.hand_type_name(value) for value in reported]
+            return (
+                f"hand type mismatch: profile declares {declared!r}, platform reports {names}; "
+                f"its upper-body commands in {mode!r} would be dropped"
+            )
+        return ""
+
+    def _hand_hold_locked(self) -> tuple[int, list[float]] | None:
+        """Hand fields for a tick with no hand command, or None to withhold it. Caller holds _lock.
+
+        In the hands-carrying action a profile that declares dexterous joint
+        control holds the installed hands at their measured pose: the platform
+        drops the whole upper-body command, arms included, when ``hand_pos``
+        does not fit ``hand_sub_mode``. The platform's hand report only says
+        which side has a hand. An installed hand that cannot be held withholds
+        the command rather than sending one that would be dropped. Claw holding
+        is not verified on hardware; it keeps the declared sub-mode with no
+        targets.
+        """
+        action = str((self._vendor.get("mc_actions") or {}).get(self._modes.mode, ""))
+        if (
+            self._default_hand_sub_mode != projection.HAND_SUB_MODE_DEXTEROUS_JOINT
+            or action != projection.UPPER_BODY_HANDS_ACTION
+        ):
+            return self._default_hand_sub_mode, []
+        installed = [vg.hand_type_family(value) is not None for value in self._hand_state_types]
+        if not any(installed):
+            return self._default_hand_sub_mode, []
+        fresh, _stale = projection.partition_fresh(
+            self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
+        )
+        payload = projection.dexterous_hold_payload(installed, self._hand_measured) if "hand" in fresh else None
+        return None if payload is None else (self._default_hand_sub_mode, payload)
 
     def _hold_target_locked(self, order: tuple[str, ...]) -> list[float] | None:
         """Fresh measured positions in vendor order, or None. Caller holds _lock."""
@@ -1508,10 +1601,15 @@ class AimdkRuntimeNode(Node):
         with self._lock:
             self._hand_state_types = [int(message.left_hand_type.value), int(message.right_hand_type.value)]
         entries: list[tuple[str, float, float, float]] = []
+        measured: list[dict[str, float]] = []
         for side, hands in (("left", message.left_hands), ("right", message.right_hands)):
+            measured.append({})
             for hand in hands:
                 name = str(hand.name) or f"{side}_hand"
                 entries.append((name, float(hand.position), float(hand.velocity), float(hand.effort)))
+                measured[-1][name] = float(hand.position)
+        with self._lock:
+            self._hand_measured = measured
         self._record_feedback("hand", entries)
         self._publish_hand_touch(message)
 
@@ -1936,6 +2034,53 @@ class AimdkRuntimeNode(Node):
 
     def current_mode(self) -> str:
         return self._modes.mode
+
+    def measured_arm_positions(self) -> list[float] | None:
+        """Fresh measured arm positions in vendor order, or None."""
+        with self._lock:
+            return self._hold_target_locked(projection.VENDOR_ARM_ORDER)
+
+    def claim_arm(self, owner: int) -> bool:
+        """Give the arm channel to a named motion; the public arm stream is refused meanwhile.
+
+        False while the public arm stream (teleop, grasping) is live: taking the
+        arm from it mid-stream would leave its next absolute target to jump the
+        arm back once the motion released it. A motion replacing another one
+        takes the channel over.
+        """
+        with self._lock:
+            if (
+                self._arm_owner is None
+                and self._public_arm_stamp is not None
+                and time.monotonic() - self._public_arm_stamp <= self._stream_staleness_s
+            ):
+                return False
+            self._arm_owner = owner
+            self._arm_motion_epoch += 1
+            return True
+
+    def arm_motion_epoch(self) -> int:
+        """A counter that moves whenever something may have moved the arm; see ``__init__``."""
+        with self._lock:
+            return self._arm_motion_epoch
+
+    def release_arm(self, owner: int) -> None:
+        with self._lock:
+            if self._arm_owner == owner:
+                self._arm_owner = None
+
+    def command_arm(self, positions: list[float], *, owner: int, epoch: int) -> bool:
+        """Set the arm target for the fixed-rate publisher, if ``owner`` still may.
+
+        False once the owner lost the channel, a stop engaged since ``epoch``,
+        or output is no longer admitted: the caller must stop, not retry.
+        """
+        with self._lock:
+            if self._arm_owner != owner or self._state.stop_epoch != epoch or not self.output_admitted():
+                return False
+            self._arm_cmd = list(positions)
+            self._arm_stamp = time.monotonic()
+            return True
 
 
 def main(argv=None) -> int:

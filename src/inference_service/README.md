@@ -198,15 +198,17 @@ prompt 匹配、快照时效和代际隔离。模型类型或两个角色本身�
 
 ## 推理调度控制面
 
-唯一开关是 `control_modes.<mode>.inference.scheduler.enable`，默认 `false`。
+唯一开关是 `robot.runtime_scheduler.enable`，默认 `false`。
+SIM/benchmark 始终直通；机器人级开关不会启用一个 `inference.enabled=false` 的控制模式。
+调度控制面使用 policy 调度器、FIFO/EDF、profile 及 Open/Dispatch/Close 契约。
 
 - 开关缺失或为 `false`：保持 legacy 路径
   `executor.inference_pipeline -> pipeline /dispatch + /reset`。Launch 只创建
   `pipeline_policy_node` 和 `action_dispatcher_node`；pipeline 不注册 scheduled action server，
   不发布 serving status，也不创建 product session 或 Global Scheduler。
-- `scheduler` 块存在且 `enable: false` 时，可以原样保留完整调度配置；这些字段处于 dormant 状态，不生成
+- `runtime_scheduler` 块存在且 `enable: false` 时，可以原样保留完整调度配置；这些字段处于 dormant 状态，不生成
   runtime policy，也不改变 legacy 节点参数、接口、线程数或 backend 执行方式。因此启停调度只需修改
-  `scheduler.enable`。若整个 `scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留拼写检查。
+  `robot.runtime_scheduler.enable`。若整个 `runtime_scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留拼写检查。
 - 开关为 `true`：Launch 创建 pipeline、`global_inference_scheduler_node` 和
   `scheduled_action_dispatcher_node`。产品调用只经过 Global 的 Open、Dispatch、Close endpoint，
   Global 负责逻辑 session、多 pipeline binding、逐请求路由、deadline precheck 和 quarantine；pipeline 负责
@@ -240,7 +242,7 @@ generation 与 prompt，且观测年龄不超过该阈值。Pipeline Node 将 RO
 - 有状态 policy 的后端已完成但结果迟到，或已开始后发生失败时，后续 `infer()` 会持续报告未就绪；成功 reset 后才能恢复。
 - LeRobot Torch session 加载后发现的 reset 能力会同步到 handle，`pipeline.reset()` 会真正调用 `policy.reset()`，不再因加载前能力缺失而成为 no-op。
 
-`scheduler.enable=false` 或缺省时保留原有拓扑、同步执行与生命周期语义；新增恢复行为不进入 legacy 路径。
+`robot.runtime_scheduler.enable=false` 或缺省时保留原有拓扑、同步执行与生命周期语义；新增恢复行为不进入 legacy 路径。
 测试同时覆盖 launch 参数和运行时迟到结果、reset 与 Close 行为。
 
 Global 只接受 `InferenceServingStatus.scheduling_capability_schema_version == 1`；零值和未知版本均在
@@ -320,7 +322,7 @@ v6 在 `DistributedInferenceResult` 及两个 `DispatchInfer` action 中新增 `
 这不是 ROS 二进制兼容变更，升级时 edge、cloud 与所有 action client 必须一起重新生成、构建并
 协调部署，握手阶段会直接拒绝旧版本 peer（详见
 [ibrobot_msgs README](../ibrobot_msgs/README.md)）。
-`scheduler.enable=true` 与 `execution_mode: distributed` 的组合会在 `robot_config` 校验阶段被拒绝。
+hardware 目标下，`robot.runtime_scheduler.enable=true` 与 `execution_mode: distributed` 的组合会在 `robot_config` 校验阶段被拒绝。
 
 ## Robot 配置
 

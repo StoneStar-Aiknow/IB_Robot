@@ -6,7 +6,7 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 
 from inference_manifest import canonical_semantic_identity_json
-from robot_config.launch_builders.perception_models import generate_perception_model_nodes
+from inference_service.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.perception_runtime_config import parse_perception_runtime_config
 

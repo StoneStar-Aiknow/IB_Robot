@@ -21,6 +21,16 @@ setup(
         "console_scripts": [
             "interaction_demo_node = robot_interaction_demo.node:main",
             "runtime-demo = robot_interaction_demo.client:main",
-        ]
+        ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the interaction demo's
+        # launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the robot YAML
+        # (``interaction_demo.enabled``).
+        "ibrobot.launch_builders": [
+            "interaction_demo = robot_interaction_demo.launch_builders.interaction_demo:INTERACTION_DEMO_BUILDER",
+        ],
     },
 )

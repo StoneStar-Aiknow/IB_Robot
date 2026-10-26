@@ -3,38 +3,22 @@
 robot:
   name: so101_single_arm
   base_config: so101_single_arm.yaml
-  audio_io:
-    enabled: false
   voice_asr:
     enabled: false
   voice_tts:
     enabled: false
+  # Toggle-only deployment overrides (runtime-simulation-transport D8): the
+  # cameras are runtime-owned (so101_robot profile); this deployment disables
+  # all three. Driver and device settings belong in the runtime profile.
   peripherals:
     - name: top
       type: camera
-      driver: opencv
-      index: 0
-      width: 640
-      height: 480
-      fps: 30
-      frame_id: camera_top_frame
       disabled: true
     - name: wrist
       type: camera
-      driver: opencv
-      index: 2
-      width: 640
-      height: 480
-      fps: 60
-      frame_id: camera_wrist_frame
       disabled: true
     - name: front
       type: camera
-      driver: realsense
-      width: 640
-      height: 480
-      fps: 30
-      frame_id: camera_front_link
       disabled: true
   embodied:
     enabled: true

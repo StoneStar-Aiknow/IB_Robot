@@ -1,10 +1,11 @@
 <mujoco model="pick_banana">
   <!--
     pick_banana MuJoCo scene template.
-    Placeholders substituted at launch time by scene_compiler.get_mujoco_scene_path():
-      {{ROBOT_XML_PATH}}  — absolute path to robot MJCF (e.g. so101.xml); T6 fills this.
-                            When omitted from get_mujoco_scene_path(), this include line
-                            is stripped so the file works standalone in MuJoCo Viewer.
+    Placeholders substituted at launch time by scene_compiler.compose_mujoco_model():
+      {{ROBOT_XML_PATH}}  — absolute path to the provider's rendered robot MJCF;
+                            compose_mujoco_model(robot, scene=None) compiles the robot
+                            alone, so a robot-less standalone use strips this include.
+      {{MESHES_DIR}}      — absolute path to this scene's meshes/ directory.
       {{MESHES_DIR}}      — absolute path to this scene's meshes/ directory.
 
     Object parameters (lighting, banana scale, contact/friction) are independently
@@ -57,8 +58,12 @@
       banana_col: contact parameters shared by all 4 CoACD hull pieces.
       Change friction here to update all pieces at once.
       friction="1.0 1.0 0.05": 1.0=sliding, 1.0=torsional, 0.05=rolling.
-      Effective gripper-banana sliding = min(banana_col.F=1.0, gripper_col.F=10.0) = 1.0;
-      banana_col is the bottleneck, keeping accidental teleop contact from sticking.
+      MuJoCo mixes friction element-wise max when both geoms have equal
+      priority, so gripper-banana sliding = max(banana_col.F=1.0,
+      gripper_col.F=10.0) = 10.0: the gripper's grasp tuning governs the
+      grasp (issue #190 D8 verified the max rule; the old "min" note was
+      wrong). Support surfaces decouple gripper-surface contacts from this
+      via geom priority (see table_surface below).
       solref="0.006 1": slightly softer than gripper (0.004) → cushions impact impulse.
       margin/gap: contact generated 1 mm early; force-free zone 1→0.5 mm.
     -->
@@ -72,15 +77,31 @@
 
   <worldbody>
     <light pos="1.0 1.0 3.5" dir="-0.2 -0.2 -1.0" directional="true" castshadow="false" diffuse="0.32 0.32 0.32"/>
-    <geom name="floor" size="0 0 0.05" pos="0 0 -0.411" type="plane" material="groundplane"/>
+    <!--
+      Support surfaces (floor, table_surface) carry geom priority="1" with
+      moderate friction (issue #190 D8): MuJoCo mixes contact friction
+      element-wise max unless one geom outranks the other, and the
+      grasp-tuned gripper contacts (friction 10, so101.xml.template
+      gripper_col) would weld the arm onto any plane they touch — the
+      contact constraint then cancels the saturated ±2.75 Nm actuator limit.
+      With priority, the surface's friction governs every pair it is in
+      (gripper–surface and banana/plate–floor/table) while gripper–object
+      contacts keep the max-mixed grasp tuning. The plate itself keeps the
+      default priority, so banana–plate and gripper–plate contacts stay
+      max-mixed (e.g. gripper–plate sliding = max(10, plate 1.0) = 10).
+    -->
+    <geom name="floor" size="0 0 0.05" pos="0 0 -0.411" type="plane" material="groundplane"
+          priority="1" friction="0.8 0.1 0.01"/>
     <!--
       table_surface: effectively rigid (solref="0.004 1", tighter than banana's 0.006).
-      Each contact constraint uses its own geom's solref; table stays stiff regardless
-      of banana contact softness.
+      With priority="1" the table's solref/solimp/friction govern every pair
+      it is in, so the table stays stiff regardless of banana contact softness
+      and gripper–table contacts use the moderate support friction above.
     -->
     <geom name="table_surface" type="plane" pos="0 0 0.0" size="0 0 0.05"
           rgba="0 0 0 0" contype="1" conaffinity="1" group="0"
-          solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
+          solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"
+          priority="1" friction="0.8 0.1 0.01"/>
 
     <body name="bluetable" pos="0.000000 0.000000 -0.321000" euler="1.570796 0.000000 0.000000">
       <geom type="mesh" mesh="bluetable_mesh" rgba="0.1700 0.3100 0.6400 1.0000"
@@ -162,8 +183,10 @@
       <!-- CoACD convex decomposition: 4 convex hulls covering the C-shaped banana.
            Mass distributed by volume fraction (total 0.03 kg = 30g).
            friction: see <default class="banana_col"> above — change there, not per-geom.
-           Effective gripper-banana sliding = min(banana_col.F=1.0, gripper_col.F=10.0) = 1.0.
-           Against table/plate: sliding=min(banana_col.F=1.0, table/plate.F=1.0) = 1.0.
+           MuJoCo mixes friction element-wise max (equal priorities), so
+           gripper-banana sliding = max(1.0, 10.0) = 10.0 (gripper governs);
+           against the table the surface's priority="1" friction governs; the
+           plate keeps the default priority, so banana-plate stays max-mixed.
            solimp/solref: solref=0.006 slightly softer than gripper to cushion impact.
            margin=0.001 gap=0.0005: contact constraint generated 1mm early (solver warm-start);
            force-free zone from 1mm to 0.5mm, force onset from 0.5mm → smooth landing. -->

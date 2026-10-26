@@ -534,3 +534,111 @@ def test_reply_with_a_stop_word_still_mutes_asr():
 
     assert node._asr_control_publisher.messages == ["stop", "start"]
     assert node._control_publisher.messages == []
+
+
+def test_reply_preview_is_spoken_once_and_not_repeated_by_the_answer():
+    # A streaming planner hands the reply over before the plan is complete; the answer that
+    # carries the same text must not make the robot say it twice.
+    core = _core()
+    core.on_transcript("你好", now=0.0)
+
+    preview = core.on_event(_event("voice-0", "reply_preview", "PLANNING", "你好呀"), now=1.0)
+    again = core.on_event(_event("voice-0", "reply_preview", "PLANNING", "你好呀"), now=1.1)
+    answer = core.on_event(_event("voice-0", "conversation", "ANSWERED", "你好呀"), now=2.0)
+
+    assert [action.text for action in _of(preview, Speak)] == ["你好呀"]
+    assert _of(again, Speak) == []
+    assert _of(answer, Speak) == []
+    # The answer still released the channel.
+    assert _of(core.on_transcript("挥手", now=3.0), PublishRequest)
+
+
+def test_an_answer_that_differs_from_its_preview_is_still_spoken():
+    core = _core()
+    core.on_transcript("现在状态怎么样", now=0.0)
+    core.on_event(_event("voice-0", "reply_preview", "PLANNING", "我查一下。"), now=1.0)
+
+    answer = core.on_event(_event("voice-0", "read_only", "ANSWERED", "机器人已就绪。"), now=2.0)
+
+    assert [action.text for action in _of(answer, Speak)] == ["机器人已就绪。"]
+
+
+def test_a_refused_plan_after_its_preview_is_reported_as_a_failure():
+    # The documented trade-off: the reply was said before validation, so a refused plan must
+    # be followed by the failure rather than by silence.
+    core = _core()
+    core.on_transcript("挥手", now=0.0)
+    core.on_event(_event("voice-0", "reply_preview", "PLANNING", "准备执行：挥手。"), now=1.0)
+
+    failed = core.on_event(_event("voice-0", "failed", "FAILED", "SKILL_SCHEMA_INVALID"), now=2.0)
+
+    assert [action.text for action in _of(failed, Speak)] == ["执行失败，详情见日志。"]
+
+
+def _async_presentation_event(request_id):
+    presentation = {"summary": "nod_yes", "execution_mode": "direct_execute_async_presentation"}
+    detail = {"presentation": presentation, "presentation_digest": presentation_digest(presentation)}
+    return _event(
+        request_id, "presentation", "MAY_EXECUTE", detail={**detail, "receipt_token": "", "async_display": True}
+    )
+
+
+def test_a_previewed_typed_program_is_not_announced_a_second_time():
+    # Seen in review: preview, then "正在执行：nod_yes。", then "执行完成。" -- the same intent twice,
+    # the second one an identifier the speech front end cannot even say.
+    core = _core()
+    core.on_transcript("点个头", now=0.0)
+    core.on_event(_event("voice-0", "reply_preview", "PLANNING", "好的，点个头。"), now=1.0)
+
+    presented = core.on_event(_async_presentation_event("voice-0"), now=1.5)
+    done = core.on_event(_event("voice-0", "workflow", "SUCCEEDED", "done"), now=5.0)
+
+    assert _of(presented, Speak) == [] and _of(presented, PublishControl) == []
+    assert any("already announced" in log.message for log in _of(presented, Log))
+    assert [action.text for action in _of(done, Speak)] == ["执行完成。"]
+
+
+def test_a_previewed_plan_on_the_receipt_path_is_still_rendered_before_its_receipt():
+    # That receipt means the user heard the exact plan; the preview is only the model's text.
+    core = _core()
+    core.on_transcript("点个头", now=0.0)
+    core.on_event(_event("voice-0", "reply_preview", "PLANNING", "好的，点个头。"), now=1.0)
+
+    actions = core.on_event(_presentation_event("voice-0"), now=1.5)
+
+    assert _of(actions, PublishControl) == []
+    (speak,) = _of(actions, Speak)
+    assert speak.text == "准备执行：nod_yes。"
+    (ack,) = speak.then
+    assert ack.payload["operation"] == "presentation_rendered"
+
+
+def test_reply_preview_for_a_request_this_channel_is_not_running_is_ignored():
+    core = _core()
+    core.on_transcript("你好", now=0.0)
+    core.on_event(_event("voice-0", "conversation", "ANSWERED", "你好呀"), now=1.0)
+
+    late = core.on_event(_event("voice-0", "reply_preview", "PLANNING", "你好呀"), now=2.0)
+
+    assert _of(late, Speak) == []
+
+
+def test_reply_preview_after_a_stop_is_not_spoken():
+    # The stop is on its way to the Agent, which may publish the preview before it sees it;
+    # "好的，我来挥手" followed by "已停止" would contradict the user who just said stop.
+    core = _core()
+    core.on_transcript("挥手", now=0.0)
+    assert _of(core.on_transcript("停止", now=0.5), PublishControl)
+
+    late = core.on_event(_event("voice-0", "reply_preview", "PLANNING", "好的，我来挥手。"), now=0.6)
+
+    assert _of(late, Speak) == []
+
+
+def test_reply_preview_is_not_spoken_when_replies_are_off():
+    core = _core(speak_replies=False)
+    core.on_transcript("你好", now=0.0)
+
+    actions = core.on_event(_event("voice-0", "reply_preview", "PLANNING", "你好呀"), now=1.0)
+
+    assert _of(actions, Speak) == []

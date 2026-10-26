@@ -117,6 +117,8 @@ known-first-party = [
     "benchmark_libero",
     "ibrobot_tracing",
     "ibrobot_tracing_web",
+    "observation_transport",
+    "manipulation_execution",
 ]
 
 [tool.ruff.format]

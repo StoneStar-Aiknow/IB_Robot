@@ -59,6 +59,14 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 
 节点另提供 `~/health` 与 `~/ready`（`std_srvs/Trigger`）。
 
+Planner 配置 `stream: true` 时，模型回答里的 `user_message` 一闭合，Agent 就在
+`/agent/event` 上发布一条 `reply_preview` 事件（`state=PLANNING`，正文在
+`user_message`），每个请求至多一次，请求已停止时不发；要等 `kind` 到达才发，
+`read_only` 不发（其回复由 Gateway 状态重建）。它只是**预告**：Agent 不渲染、
+不播报，计划仍在完整回答到达后按原样严格校验；事件同样写入 ledger。由通道决定是否
+呈现——`agent_voice_bridge` 在启用 TTS 时播报，并在最终回答与预告相同时不再重复；
+预告之后计划被拒，终态照常报失败。
+
 生产 Program 路径使用 `registry_epoch`、`registry_generation` 和
 `registry_digest` 绑定一次精确 Skill catalog snapshot；ExecutionStore 负责 root
 execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为兼容/诊断入口，不能作为
@@ -74,7 +82,11 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
 - 运动默认关闭：`execution_enabled=false` 时零 goal 提交，仅规划与应答。
 - 执行必须同时满足：非空 `test_allowlist`、Gateway readiness（live catalog 身份一致）、
   操作员 `authorize_motion` launch 参数。
-- 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。
+- 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。唯一例外是部署显式列出的
+  `planner.direct_commands`：整句精确匹配（否定/假设句不触发）时本地生成单步计划而不调用模型，
+  技能必须在 live catalog 中且 planner 可选、启用执行时还必须在 allowlist 内；之后的 Gateway
+  校验与执行路径与模型规划完全相同。提案的 `planner_identity` 记为 `route=direct_command`，
+  ledger 可区分这一步不是模型的决定。没有内置短语。
 - Planner 输出只接受单一严格 JSON 对象；未知字段、未知 skill、编造参数一律拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
@@ -181,6 +193,10 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
 - 请求超过 `request_timeout_sec`（默认 180 秒）仍无终态事件时，桥接先发送 stop 再释放通道并播报
   “任务超时，正在中止。”；在它的终态到达前，停止关键词仍指向该请求，迟到的 presentation 不再回执。
 - 「继续」由 Agent 处理（见下节），桥接只把它当普通话语发送，并播报 Agent 的 `continuation` 事件。
+- `reply_preview` 事件（流式 Planner 的提前回复）只对当前活动请求播报一次；终态回复与它相同则不再重复。
+  桥接已对该请求发出 stop 后到达的预告不播报（Agent 可能尚未收到 stop）。typed Program 的
+  “正在执行：…”在已有预告时不再播报（预告已经说过要做什么，这一句没有回执在等）；旧回执路径仍播报
+  exact plan，因为它的回执表示用户听到的是计划本身，而预告只是模型的文字。
 - **typed Program（真机与仿真经 Gateway 的默认路径）不等待任何回执**（见上文「typed Program：异步展示」）：
   `presentation` 事件带 `async_display: true` 时，桥接只播报（无 TTS 时写日志）“正在执行：…”，不回执、
   不询问确认——机器人此时可能已经在动，再问“请说确认或取消”只会误导用户。语音通道对运动的控制手段是
@@ -210,8 +226,8 @@ Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robo
    与 Agent 记录一致，并取 `completed_step_count` 与 `canonical_steps`。
 
 只有确认安全取消（或尚未提交就停止）才继续：Agent 用原始文本和“已完整完成 N/M 步、第 N+1 步需重做”的提示
-**重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划，Gateway 照常
-校验。播报“上次任务已完整完成 N/M 步，现在继续剩余部分。”（播报时请求可被中断，故不含停止词）。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
+**重新规划**，以「继续」这条请求自己的 request_id 提交一个全新 Program；不切片、不复用旧计划（被打断步可续做时
+例外，见下文「步内续做」），Gateway 照常校验。播报“上次任务已完整完成 N/M 步，现在继续剩余部分。”（播报时请求可被中断，故不含停止词）。`SUCCEEDED` 回答已完成；`FAILED`、`UNKNOWN`、
 规划阶段取消、Gateway 查询失败或两本账不一致一律拒绝（`CONTINUE_REFUSED`），不产生任何运动。
 
 这是已确认的语义。`robot_skill_cli` README 与 `ibrobot-control` skill 中“不得切片旧步骤、拒绝 `--resume`”约束的是
@@ -221,8 +237,17 @@ Agent 在规划前识别 `继续/继续吧/接着来/go on/continue`（与 `robo
 对原文重新规划后，按累计 `completed_step_count` 去掉已完整完成的前 N 步（`steps[N:]`）。后者是对**新规划结果**
 按计数截取，不复用旧 plan，生成的 Program 同样经过 presentation、白名单与 Gateway 校验。
 
-限制：`completed_step_count` 是下界——Gateway 不记录步内进度，被打断的那一步会从头重做，非幂等技能（如
-已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
+**步内续做**：Gateway 报告被打断的那一步可续做（`step_resumable`，目前只有 X2 在 `stream` 模式下回放的手势）
+时，「继续」**不调用规划器**：Agent 直接把 Gateway 账本里从被打断步开始的规范步骤
+（`canonical_steps[completed_step_count:]`）作为新 Program 提交，带 `continues_from_execution_id`，该步从停下处
+接着做（Gateway 与运行时会再次校验，失效则从头做）。这些步骤仍经过白名单、catalog 与 schema 版本校验；proposal
+的 `planner_identity.route` 为 `continuation_ledger_replay`，请求账本记 `continuation_replayed` 事件。播报“上次任务被
+打断的动作已做到 40%，现在从中断处接着做。”。X2 实测「继续」到手臂开始动由约 5.7 s（规划）降到亚秒级。
+不可续做的「继续」（步间停下、断点失效、尚未提交即停止）仍按原话重新规划。停止后若
+先下了别的指令，「继续」指向的是那条新指令，被打断的任务即作废。
+
+限制：其他技能的 `completed_step_count` 是下界——Gateway 不记录它们的步内进度，被打断的那一步会从头重做，
+非幂等技能（如已抓起再抓）需要用户自行判断；规划器看不到世界状态。「继续」只在同一会话内有效，语音通道
 `session_idle_sec`（默认 120 秒）无活动后换新会话即无可继续的任务。连续“停—继续—停—继续”时，
 已完成步骤跨请求累计。
 

@@ -25,8 +25,9 @@ X2 通过 runtime profile 的 `audio.speech` 逻辑接口绑定输入（部署�
 
 `speech_direction_node` 属于 `voice_asr_service`，与上文所述的 `VoiceASRNode` 是两个独立节点。它负责多通道人声音频增强、语音门控和方向估计，不执行 ASR，也不控制底盘。
 
-阵列、模型和运行时效参数由以下包内配置管理；音频设备和 Topic 由
-`robot_config.audio_io` 统一管理：
+阵列、模型和运行时效参数由以下包内配置管理；音频设备与采集 Topic 由机器人 runtime 的
+`peripherals` 声明，使用方经 `speech_direction.audio_input` 绑定 `audio.capture`（无 provider
+部署仍由 `robot_config.audio_io` 统一管理）：
 
 ```text
 src/voice_asr_service/config/speech_direction.yaml
@@ -588,6 +589,10 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `vad_sensitivity` | `0.6` | VAD 灵敏度 |
+| `vad_min_silence_duration` | `0.5` | SPEAKING 状态下连续静音多久判定为句末；见下方「判停时延」 |
+| `vad_post_roll_ms` | `500.0` | 判定句末后继续喂给 ASR 的尾部缓冲时长 |
+| `vad_pre_roll_ms` | `300.0` | `VADModule` 自身的预录缓冲，仅用于文件分段识别 |
+| `vad_min_speech_duration` | `0.3` | 连续语音多久才从 STARTING 进入 SPEAKING |
 | `realtime_pre_roll_seconds` | `0.5` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
 | `final_tail_padding_seconds` | `1.5` | 最终解码前补入的静音时长，冲刷分块编码器尚未输出的末尾语音，避免句尾丢字（480 ms 分块模型需 ≥ 1.5 s） |
 | `sample_rate` | `16000` | 当前完整 Voice ASR 链路仅支持 16000 Hz；其他值属于无效配置，节点会拒绝初始化 |
@@ -599,6 +604,33 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 
 当前 16kHz/512 是实时麦克风、文件识别、VAD 后端和 ASR 模型共同遵守的系统级硬限制；
 Silero ONNX 后端会在 512 样本音频帧前额外拼接 64 个内部 context 样本，该 context 由 VAD 内部跨帧维护，不应配置到 `chunk_size` 中。
+
+#### 判停时延
+
+节点只在 VAD 回到 SILENCE 时才调用 `end_streaming()` 出最终结果，所以从最后一个
+语音帧到 `/voice_command` 的固定延迟是：
+
+```
+ceil(vad_min_silence_duration / 0.032) + int(vad_post_roll_ms / 1000 / 0.032) 帧
+```
+
+帧长 512 样本 @ 16 kHz = 32 ms。默认值 = 16 + 15 = 31 帧 = 992 ms；调优值
+`0.3` / `150.0` = 10 + 4 = 14 帧 = **448 ms**（在工作站 X-ASR 上实测通过；板端整句触发词复核前
+不改全局默认，由 profile 的 `voice_asr.vad_min_silence_duration` / `vad_post_roll_ms` 按部署开启）。
+这两个值只对本节点自己跑 VAD 的部署生效（`audio_input` 绑定 `audio.capture`，或无 provider 的
+`audio_io`）：`input_mode=external_vad`（如 X2）由 runtime 分段，不经过本地 VAD；SO-101 的
+`so101_robot` runtime 没有声明麦克风，provider 路径上无法启用 `voice_asr`，所以
+`so101_voice_latency` 不配置它们。
+
+`vad_post_roll_ms` 只需覆盖 VAD 自身的判停迟疑：解码器的尾部上下文由
+`final_tail_padding_seconds` 在最终解码前补静音承担，是样本而不是墙钟时间，
+所以两者可以独立取值。把尾部上下文从 post_roll 里拿走之后，判停从 608 ms
+降到 448 ms，实测句尾字不丢。
+调大这两个参数会按上式直接拖慢整条语音链路的响应。若关闭了
+`final_tail_padding_seconds`，ENDING 期间的帧就重新成为解码器唯一的尾部上下文，
+此时 `vad_post_roll_ms` 压到 250 ms 以下会丢尾字（"挥个手" -> "挥个"）。
+`vad_min_silence_duration` 不宜低于 0.3 s：0.25 s 时句中 400 ms 的停顿会把长句切成三段。
+`src/voice_asr_service/test/test_vad_endpointing_latency.py` 锁定了这个帧数。
 
 ## 10. 状态机
 
@@ -666,12 +698,12 @@ robot:
     chunk_size: 512
     buffer_seconds: 5.0
     exit_on_init_failure: true
+    # provider 部署绑定 runtime 的采集接口；无 audio_io 段
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
 
-  audio_io:
-    enabled: true
-    microphone: respeaker
-    capture_stamped_topic: /audio/capture_stamped
-
+  # provider 部署（runtime-owned-audio-io）：外设与绑定，无 audio_io 段
   peripherals:
     - type: microphone
       name: respeaker
@@ -694,7 +726,7 @@ robot:
 | 节点能启动，但实时识别始终不可用 | 加载的是离线模型 | 查看日志里是否出现 `Offline ASR model loaded` |
 | `start_recognition` 被拒绝 | ASR 未就绪，或当前模型是离线模型 | 查看 `_asr_init_error` 相关日志和模型类型 |
 | 文件识别立即失败 | 文件路径错误或解码失败 | 确认文件存在且格式受支持 |
-| 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 `audio_io.microphone` 引用的 `device`/`channels` |
+| 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 microphone peripheral（provider 部署在 runtime `peripherals`，旧路径在 `audio_io.microphone`）的 `device`/`channels` |
 | 启动报 bundle/deployment 无效 | bundle 尚未打包或 deployment 名不匹配 | 用 `package_sherpa_asr_bundle` 生成 bundle，并确认 YAML 的 `deployment` 与 manifest 中的名字一致 |
 
 ## 14. 当前已验证行为

@@ -35,5 +35,16 @@ setup(
             "rerun_viewer = dataset_tools.rerun_viewer:main",
             "lerobot_action_gap_repair = dataset_tools.lerobot_action_gap_repair:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the recording and rerun
+        # visualizer launch wiring registers from its owning package without
+        # any robot_config change. Installing this package does not enable
+        # the entries; participation still comes from the record /
+        # record_visualizer launch arguments.
+        "ibrobot.launch_builders": [
+            "recording = dataset_tools.launch_builders.recording:RECORDING_BUILDER",
+            "rerun_visualizer = dataset_tools.launch_builders.recording:RERUN_VISUALIZER_BUILDER",
+        ],
     },
 )

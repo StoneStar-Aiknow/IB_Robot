@@ -21,10 +21,30 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
+from robot_runtime.gazebo import advertised_camera_frames
+from robot_runtime.profile import SIM_PLATFORMS
 
 
 class InterfaceDescriptionError(ValueError):
     """A public description violates its schema or semantic contract."""
+
+
+def description_sim_platform(description: dict) -> str | None:
+    """Effective simulation platform of a description, without mutating the document.
+
+    The ``sim_platform`` field is optional (schema_version stays 1), so
+    snapshots exported before it existed remain valid with their original
+    digest: they are read as ``sdk`` when execution is simulated and as no
+    platform when physical. An explicitly present but unknown value fails
+    closed instead of silently defaulting.
+    """
+    sim_platform = description.get("sim_platform")
+    if sim_platform is None:
+        return "sdk" if description.get("execution") == "simulated" else None
+    sim_platform = str(sim_platform)
+    if sim_platform not in SIM_PLATFORMS:
+        raise InterfaceDescriptionError(f"interface description sim_platform: unknown value {sim_platform!r}")
+    return sim_platform
 
 
 def validate_interface_requirements(requirements) -> dict:
@@ -167,8 +187,74 @@ def write_description(description: dict, path: str | Path) -> None:
             temp.unlink(missing_ok=True)
 
 
+def canonicalise_peripheral_entry(entry: dict) -> dict:
+    """Canonicalise one peripheral entry's toggle spelling (D3).
+
+    ``disabled: X`` becomes ``enabled: not X`` and the ``disabled`` key is
+    removed; an entry setting both keys with contradictory values is rejected
+    naming the entry. The input is not mutated. This is the one canonicaliser
+    the runtime merge applies to every layer, the runtime profile included.
+    """
+    key = (entry.get("type"), entry.get("name"))
+    canonical = deepcopy(entry)
+    if "disabled" in canonical:
+        disabled = canonical.pop("disabled")
+        if "enabled" in canonical and bool(canonical["enabled"]) != bool(disabled):
+            # Both present and agreeing (``disabled: X`` == ``enabled: not X``):
+            # the canonical ``enabled`` value wins.
+            return canonical
+        if "enabled" in canonical:
+            raise InterfaceDescriptionError(
+                f"peripheral {key} sets contradictory disabled={disabled!r} and "
+                f"enabled={canonical['enabled']!r}; pass at most one"
+            )
+        canonical["enabled"] = not bool(disabled)
+    return canonical
+
+
+def _check_camera_values(camera: dict) -> None:
+    """Value checks on one enabled merged camera entry (D5).
+
+    ``width``/``height``/``depth_width``/``depth_height`` must be positive
+    integers (bool rejected); ``fps``/``depth_fps`` positive finite numbers
+    (bool, NaN and infinity rejected); the depth dimensions are paired and
+    ``depth_fps`` requires them (without them the RealSense driver ignores it
+    while the description would advertise it). Absent fields keep their
+    documented defaults and are not checked; unknown keys are not rejected.
+    """
+    name = camera.get("name")
+    integer_fields = ("width", "height", "depth_width", "depth_height")
+    number_fields = ("fps", "depth_fps")
+    for field in integer_fields:
+        if field not in camera:
+            continue
+        value = camera[field]
+        if type(value) is not int or value <= 0:
+            raise InterfaceDescriptionError(f"camera {name}: {field} must be a positive integer, got {value!r}")
+    for field in number_fields:
+        if field not in camera:
+            continue
+        value = camera[field]
+        if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise InterfaceDescriptionError(f"camera {name}: {field} must be a positive finite number, got {value!r}")
+    if ("depth_width" in camera) != ("depth_height" in camera):
+        raise InterfaceDescriptionError(f"camera {name}: depth_width and depth_height must be given together")
+    if "depth_fps" in camera and "depth_width" not in camera:
+        raise InterfaceDescriptionError(f"camera {name}: depth_fps requires depth_width/depth_height")
+
+
 def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dict]:
-    """Resolve partial instance overrides without mutating either configuration."""
+    """Resolve partial instance overrides without mutating either configuration.
+
+    Every entry of every layer (defaults included) is canonicalised first
+    (``disabled: X`` == ``enabled: not X``; contradictory spellings in one
+    entry are rejected, D3). An override entry for an ``(type, name)`` the
+    defaults do not declare must declare ``driver`` (D5): a partial entry
+    cannot silently add a default device, which catches misspelled names. A
+    changed driver replaces the base device settings and inherits only the
+    base ``enabled`` state unless the override sets one (toggle state is not
+    vendor-specific, D3). Merged enabled cameras get value checks (D5).
+    """
 
     def merge(base, override):
         result = deepcopy(base)
@@ -186,24 +272,38 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
         if not isinstance(entries, list):
             raise InterfaceDescriptionError("peripherals must be a list")
         seen = set()
-        for entry in entries:
-            if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict) or not raw_entry.get("type") or not raw_entry.get("name"):
                 raise InterfaceDescriptionError("peripherals entries require type and name")
-            key = (entry["type"], entry["name"])
+            key = (raw_entry["type"], raw_entry["name"])
             if key in seen:
                 raise InterfaceDescriptionError(f"duplicate peripheral {key}")
             seen.add(key)
+            entry = canonicalise_peripheral_entry(raw_entry)
             if override and key in index:
                 pos = index[key]
-                # A changed driver must not inherit vendor-specific settings.
-                result[pos] = (
-                    deepcopy(entry)
-                    if entry.get("driver", result[pos].get("driver")) != result[pos].get("driver")
-                    else merge(result[pos], entry)
-                )
+                base = result[pos]
+                if entry.get("driver", base.get("driver")) != base.get("driver"):
+                    # A changed driver must not inherit vendor-specific
+                    # settings (D3); the base's enabled state carries over
+                    # unless the override sets one itself (toggle state is
+                    # not vendor-specific).
+                    if "enabled" not in entry and "enabled" in base:
+                        entry["enabled"] = base["enabled"]
+                    result[pos] = entry
+                else:
+                    result[pos] = merge(base, entry)
             else:
+                if override and "driver" not in entry:
+                    raise InterfaceDescriptionError(
+                        f"peripheral {key} is not declared by the runtime: an override must name a "
+                        "declared peripheral, or declare driver to add a new device"
+                    )
                 index[key] = len(result)
-                result.append(deepcopy(entry))
+                result.append(entry)
+    for entry in result:
+        if entry.get("type") == "camera" and entry.get("enabled", True):
+            _check_camera_values(entry)
     return [entry for entry in result if entry.get("enabled", True)]
 
 
@@ -242,24 +342,77 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
     }
 
 
-def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
+def peripheral_interfaces(
+    peripherals: list[dict] | None, *, sim_platform: str | None = None, camera_rate_hz: float | None = None
+) -> dict[str, dict]:
     interfaces: dict[str, dict] = {}
-    for periph in merge_peripherals(peripherals, []):
+    audio_counts = {"microphone": 0, "speaker": 0}
+    merged = merge_peripherals(peripherals, [])
+    for periph in merged:
         name, kind = periph["name"], periph["type"]
-        if kind == "camera" and periph.get("driver") != "virtual":
+        if kind in ("microphone", "speaker"):
+            # A runtime exposes at most one logical audio input and output:
+            # the fixed interface IDs (audio.capture / audio.play) map to a
+            # single device each, so a second device of the same kind has no
+            # surface to project onto.
+            audio_counts[kind] += 1
+            if audio_counts[kind] > 1:
+                raise InterfaceDescriptionError(
+                    f"{kind} peripheral {name}: at most one {kind} is supported "
+                    f"(found {audio_counts[kind]}; single-value mapping to a fixed logical ID)"
+                )
+            if periph.get("driver") != "alsa":
+                raise InterfaceDescriptionError(
+                    f"{kind} peripheral {name}: unsupported driver {periph.get('driver')!r}"
+                )
+            params = periph.get("params") or {}
+            if kind == "microphone":
+                metadata = {
+                    "sample_rate_hz": params.get("sample_rate", 16000),
+                    "channels": params.get("channels", 6),
+                    "sample_format": params.get("sample_format", "S16LE"),
+                }
+                if params.get("channel_indices") is not None:
+                    # Consumer-facing channel selection only; the device stays
+                    # the interleaved stream the ALSA owner publishes.
+                    metadata["channel_indices"] = params["channel_indices"]
+                interfaces["audio.capture"] = _topic(
+                    "/audio/capture_stamped",
+                    "audio_common_msgs/msg/AudioDataStamped",
+                    "interaction.audio_capture",
+                    **metadata,
+                )
+            else:
+                interfaces["audio.play"] = _topic(
+                    "/audio/play",
+                    "audio_common_msgs/msg/AudioDataStamped",
+                    "interaction.audio_playback",
+                    "subscribe",
+                    sample_rate_hz=params.get("sample_rate", 24000),
+                    channels=params.get("channels", 1),
+                    sample_format=params.get("sample_format", "S16LE"),
+                )
+        elif kind == "camera" and periph.get("driver") != "virtual":
             driver = periph.get("driver", "opencv")
             if driver not in ("opencv", "camera_ros", "realsense"):
                 raise InterfaceDescriptionError(f"camera {name}: unsupported driver {driver!r}")
             streams = camera_streams(periph)
+            if sim_platform == "gazebo":
+                # Streams the gz simulator cannot produce are not advertised on
+                # this platform (runtime-simulation-platform D6): the
+                # rgbd_camera publishes no depth camera_info (its depth image
+                # shares the color intrinsics) and no color-aligned pointcloud.
+                streams = [stream for stream in streams if stream != "pointcloud"]
+            if sim_platform == "mujoco":
+                # The MuJoCo plugin produces no color-aligned pointcloud
+                # (so101-mujoco-runtime-platform D5); depth it does produce
+                # (32FC1, spike T0).
+                streams = [stream for stream in streams if stream != "pointcloud"]
             prefix = f"/camera/{name}"
             capability = "perception.camera"
-            image_frame = periph.get("frame_id", f"camera_{name}_frame")
-            info_frame = image_frame
-            if driver == "realsense":
-                image_frame = periph.get("optical_frame_id") if not periph.get("direct_topic_remap") else None
-                info_frame = periph.get("optical_frame_id")
-            if driver == "camera_ros":
-                image_frame = info_frame = None
+            # the shared advertised-frame convention (5b.3): one helper for
+            # the description, the gz frame_id and the MuJoCo sensor frame_name
+            image_frame, info_frame = advertised_camera_frames(periph)
             for stream in ("color", "depth", "aligned_depth"):
                 aligned = stream == "aligned_depth"
                 if stream == "color" and "color" not in streams:
@@ -279,7 +432,24 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
                     if is_color or aligned
                     else periph.get("depth_height", periph.get("height", 480))
                 )
-                fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
+                if sim_platform == "mujoco" and not (is_color or aligned):
+                    # the plugin renders one MJCF camera (width x height) for
+                    # every stream (D5): the depth stream dims are the rendered
+                    # camera's dims, never the physical device's
+                    # depth_width/depth_height
+                    width = periph.get("width", 640)
+                    height = periph.get("height", 480)
+                if sim_platform == "gazebo" and not is_color:
+                    # the gz rgbd sensor renders one camera at the colour
+                    # dimensions and rate (D8): the depth/aligned-depth
+                    # streams advertise what the sensor actually renders,
+                    # never the physical device's depth_* overrides (the
+                    # MuJoCo branch above applies the same principle)
+                    width = periph.get("width", 640)
+                    height = periph.get("height", 480)
+                    fps = periph.get("fps", 30)
+                else:
+                    fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
                 if driver == "realsense":
                     wire_format = periph.get("color_format", "RGB8") if is_color else periph.get("depth_format", "Z16")
                 else:
@@ -296,9 +466,32 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
                 }.get(wire_format)
                 if wire_format in ("rgb8", "bgr8", "mono8", "16UC1", "32FC1"):
                     encoding = wire_format
+                if sim_platform == "gazebo" and not is_color:
+                    # gz rgbd depth is float32 and ros_gz_bridge maps
+                    # R_FLOAT32 to 32FC1; advertising the physical device's
+                    # encoding (RealSense Z16 -> 16UC1) would mismatch every
+                    # observed depth message in the interface monitor
+                    # (PR !515 P2). The contract on this platform is what the
+                    # simulator actually publishes.
+                    encoding = "32FC1"
+                if sim_platform == "mujoco":
+                    # the plugin always publishes rgb8 color and 32FC1 metre
+                    # depth (spike T0); the contract on this platform is what
+                    # the simulator actually publishes (D5)
+                    encoding = "rgb8" if is_color else "32FC1"
+                if sim_platform == "mujoco" and camera_rate_hz is not None:
+                    # the plugin has one rate for all cameras (D5): every
+                    # stream advertises the effective rate
+                    fps = float(camera_rate_hz)
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
                 endpoint = f"{prefix}{suffix}/{'image_raw' if is_color or aligned else 'image_rect_raw'}"
                 info_topic = f"{prefix}{suffix}/camera_info"
+                if sim_platform == "gazebo" and not is_color:
+                    # gz rgbd_camera has no depth camera_info topic; the depth
+                    # image shares the color intrinsics, so the color info
+                    # interface carries them (D6: unproducible streams are not
+                    # advertised).
+                    info_topic = f"{prefix}/camera_info"
                 stream_frame, stream_info_frame = image_frame, info_frame
                 if driver == "realsense":
                     native_prefix = periph.get(
@@ -332,9 +525,22 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
+                if sim_platform == "mujoco":
+                    # the plugin's camera publishers are reliable (depth 1):
+                    # large images lose fragments without repair under
+                    # best-effort, so the contract on this platform offers
+                    # reliable delivery (what the simulator actually publishes)
+                    interfaces[key]["qos"]["reliability"] = "reliable"
+                if sim_platform == "gazebo" and not is_color:
+                    # the shared color info interface above already carries the
+                    # depth intrinsics; a dedicated depth info topic has no
+                    # producer on this platform
+                    continue
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
                 )
+                if sim_platform == "mujoco":
+                    interfaces[f"{key}_info"]["qos"]["reliability"] = "reliable"
             if "pointcloud" in streams:
                 interfaces[f"camera.{name}.points"] = _topic(
                     f"{prefix}/depth/color/points",
@@ -388,6 +594,32 @@ def peripheral_interfaces(peripherals: list[dict] | None) -> dict[str, dict]:
             else:
                 raise InterfaceDescriptionError(f"lidar {name}: unsupported driver {driver!r}")
     return interfaces
+
+
+def audio_capability_entries(interfaces: dict[str, dict]) -> dict[str, dict]:
+    """RuntimeStatus ``interaction.audio_*`` entries for projected audio interfaces.
+
+    Field names follow the capability parameter schema (robot_runtime.capabilities):
+    capture carries ``topics`` plus the capture format, playback ``endpoints`` plus
+    the playback format. Audio interfaces a runtime does not project (e.g. the
+    vendor-bridged X2 declares them in its profile instead) contribute nothing.
+    """
+    entries: dict[str, dict] = {}
+    capture = interfaces.get("audio.capture")
+    if capture is not None:
+        entries["interaction.audio_capture"] = {
+            "topics": [capture["endpoint"]],
+            "sample_rate_hz": capture["sample_rate_hz"],
+            "channels": capture["channels"],
+        }
+    playback = interfaces.get("audio.play")
+    if playback is not None:
+        entries["interaction.audio_playback"] = {
+            "endpoints": [playback["endpoint"]],
+            "sample_rate_hz": playback["sample_rate_hz"],
+            "channels": playback["channels"],
+        }
+    return entries
 
 
 def _add_profile_interfaces(interfaces: dict[str, dict], declared: object) -> None:
@@ -496,17 +728,66 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
     }
 
 
+def _mujoco_camera_rate(profile: dict) -> float:
+    """The effective MuJoCo camera rate for the description (lazy import: the
+    rate algorithm lives next to the MuJoCo camera generation, D5)."""
+    from robot_runtime.mujoco import mujoco_camera_publish_rate  # noqa: PLC0415
+
+    return mujoco_camera_publish_rate(profile)
+
+
 def build_description(
     profile: dict,
     peripherals: list[dict] | None = None,
     *,
-    simulated: bool | None = None,
+    use_sim: bool | None = None,
     robot_description: str | None = None,
+    sim_platform: str | None = None,
 ) -> dict:
-    """Project only public ROS interfaces; do not serialize private configuration."""
+    """Project only public ROS interfaces; do not serialize private configuration.
+
+    ``use_sim``/``sim_platform`` (runtime-simulation-platform D1/D7) select the
+    execution identity recorded in the description: physical execution carries
+    no platform, simulated execution carries the platform it runs on. With
+    neither given the profile's declared selection applies; ``use_sim:=false``
+    together with a platform fails naming both.
+    """
     runtime = profile["runtime"]
     caps = profile["capabilities"]
-    interfaces = peripheral_interfaces(profile.get("peripherals") if peripherals is None else peripherals)
+    if use_sim is None:
+        use_sim = bool(profile.get("use_sim", profile.get("simulated", False)))
+    if not use_sim:
+        if sim_platform:
+            raise InterfaceDescriptionError(
+                f"conflicting execution selection: use_sim=false with sim_platform={sim_platform!r}"
+            )
+        sim_platform = None
+    else:
+        sim_platform = str(sim_platform or profile.get("sim_platform") or "sdk").strip()
+        if sim_platform not in SIM_PLATFORMS:
+            raise InterfaceDescriptionError(
+                f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}"
+            )
+    interfaces = peripheral_interfaces(
+        profile.get("peripherals") if peripherals is None else peripherals,
+        sim_platform=sim_platform,
+        camera_rate_hz=(
+            _mujoco_camera_rate({**profile, "peripherals": peripherals or profile.get("peripherals") or []})
+            if sim_platform == "mujoco"
+            else None
+        ),
+    )
+    # Audio peripherals derive the interaction.audio_* capability entries. A
+    # profile that additionally declares them explicitly must agree with the
+    # devices it also lists, or the RuntimeStatus surface would contradict the
+    # interface description (openspec change runtime-owned-audio-io, D2).
+    for capability, derived in audio_capability_entries(interfaces).items():
+        declared = caps.get(capability)
+        if declared is not None and declared != derived:
+            raise InterfaceDescriptionError(
+                f"profile capability {capability} {declared!r} contradicts the audio peripherals {derived!r}; "
+                "align the profile entry with the peripheral parameters or drop it"
+            )
     for name, endpoint, service in (
         ("get_status", C.GET_STATUS_SERVICE, "GetRuntimeStatus"),
         ("set_mode", C.SET_MODE_SERVICE, "SetRuntimeMode"),
@@ -634,7 +915,6 @@ def build_description(
             frame_id=lidar_odom.get("source_body_frame", "body"),
         )
         interfaces["localization.cloud"]["qos"]["reliability"] = "reliable"
-    effective_simulated = profile.get("simulated", False) if simulated is None else simulated
     description = {
         "schema_version": 1,
         "robot": {
@@ -643,7 +923,8 @@ def build_description(
             "runtime_name": runtime["name"],
             "runtime_version": str(runtime["version"]),
         },
-        "execution": "simulated" if effective_simulated else "physical",
+        "execution": "simulated" if use_sim else "physical",
+        **({"sim_platform": sim_platform} if use_sim else {}),
         "interfaces": interfaces,
         "states": {},
     }
@@ -653,7 +934,7 @@ def build_description(
         from robot_runtime.model_metadata import build_model_metadata
 
         description["model"] = build_model_metadata(
-            profile, simulated=bool(effective_simulated), robot_description=robot_description
+            profile, use_sim=use_sim, sim_platform=sim_platform, robot_description=robot_description
         )
         for name, interface in _teleoperation_interfaces(profile, description["model"]).items():
             if name in interfaces:
@@ -672,6 +953,7 @@ def main(argv=None):
     source.add_argument("--validate")
     parser.add_argument("--peripherals", default="")
     parser.add_argument("--simulated", choices=("true", "false"))
+    parser.add_argument("--sim_platform", choices=SIM_PLATFORMS)
     parser.add_argument("--output")
     parser.add_argument("--instance-id")
     args = parser.parse_args(argv)
@@ -685,11 +967,18 @@ def main(argv=None):
             if args.instance_id:
                 profile["runtime"]["instance_id"] = args.instance_id
             if args.peripherals:
-                fragment = yaml.safe_load(Path(args.peripherals).read_text())
+                # One structural loader for every fragment (D6): the CLI
+                # rejects the same malformed files as the runtime launches
+                # and the facade/mock nodes, with the same messages.
+                from robot_runtime.peripherals import load_peripherals_file
+
+                fragment = load_peripherals_file(args.peripherals)
                 profile["peripherals"] = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
                 profile["fast_lio"] = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
             description = build_description(
-                profile, simulated=None if args.simulated is None else args.simulated == "true"
+                profile,
+                use_sim=None if args.simulated is None else args.simulated == "true",
+                sim_platform=args.sim_platform,
             )
         if args.output:
             write_description(description, args.output)

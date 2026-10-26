@@ -1,0 +1,75 @@
+# SO-101 voice latency measurement profile.
+#
+# Derives from the no-motion manual Agent profile and turns on the speech
+# output path, so the ASR -> planner -> TTS -> speaker chain can be timed on
+# real hardware without the arm moving. Switch base_config to
+# so101_agent_manual_hardware.yaml to repeat the same measurement with motion.
+robot:
+  name: so101_single_arm
+  base_config: so101_agent_manual.yaml
+  # Speech input is not tuned here: the so101_robot runtime declares no
+  # microphone, so voice_asr cannot be enabled on this provider path and a VAD
+  # setting would reach nothing. The text is injected on /voice_command
+  # instead. Deployments that run the local VAD (an audio.capture binding, or
+  # audio_io without a provider) opt into the shorter endpoint through
+  # voice_asr.vad_min_silence_duration / vad_post_roll_ms; see the
+  # voice_asr_service README.
+  # Speech output. On this provider path the audio devices are runtime-owned
+  # and the so101_robot runtime declares no speaker; the runtime-owned
+  # playback binding (voice_tts.audio_output) does not run yet either, because
+  # its audio.play interface is declared AudioDataStamped while
+  # audio_playback_node and audio_play exchange AudioData. So voice_tts is not
+  # launched from here: run its synthesis and playback nodes beside the
+  # pipeline with the options below, and the voice bridge speaks through them.
+  # num_steps reaches the adapter only when passed to that launch as well:
+  #   ros2 launch voice_tts_service voice_tts.launch.py \
+  #     bundle_path:=models/zipvoice deployment:=ubuntu_onnx \
+  #     runtime_options_json:='{"num_steps": 4}'
+  voice_tts:
+    enabled: false
+    bundle_path: "models/zipvoice"
+    deployment: "ubuntu_onnx"
+    service_name: /voice_tts/synthesize
+    playback_service_name: /voice_tts/play
+    playback_timeout_sec: 300.0
+    synthesis_timeout_sec: 90.0
+    prompt_profile: default
+    # Flow-matching steps: ~98% of synthesis time and linear in this value.
+    num_steps: 4
+  embodied:
+    agent:
+      # The voice channel: ASR final text in, replies (including the planner's
+      # reply_preview) out through the TTS services named in voice_tts.
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_enabled: true
+      planner:
+        mode: vlm
+        provider: openai_compatible
+        base_url: https://ark.cn-beijing.volces.com/api/v3
+        api_key_env: ARK_API_KEY
+        model: doubao-seed-2-1-lite-260915
+        temperature: 0
+        timeout_sec: 20.0
+        max_tokens: 512
+        catalog_view: planner
+        # Stream the answer and publish its user_message as a reply_preview
+        # event the moment that field closes, rather than waiting for the whole
+        # plan; a voice channel with TTS says it. Measured on this model: the
+        # field is usable about 800 ms before the document is complete. Only
+        # the reply moves early -- the plan is still validated in full from
+        # the complete document before anything executes.
+        stream: true
+        extra_body:
+          thinking:
+            type: disabled
+        direct_commands:
+          点头: nod_yes
+          点个头: nod_yes
+          摇头: shake_no
+          挥手: wave_hello
+          挥个手: wave_hello
+          回到安全姿态: recover_safe_pose
+  contract:
+    observations: []

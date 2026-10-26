@@ -6,11 +6,11 @@
 | --- | --- |
 | `rosdep.sh` | 包含虚拟环境的路径解析、早期建立以及 `rosdepc` 初始化。 |
 | `submodules.sh` | Git submodule 的状态探测和自动同步。 |
-| `python_venv.sh` | 完整建立和配置最终的 Python 环境以及包安装，包括 colcon 及 NumPy 的版本锁定。 |
-| `benchmark_profile.sh` | `--with-benchmark` 专属的 Ubuntu GPU 前置检查、PyTorch CUDA profile、Torch/TorchVision/TorchCodec 与 provider ABI 约束；要求 NVIDIA driver >=560.28.03，不依赖本机 nvcc，并隔离 GraspGen。 |
+| `python_venv.sh` | 完整建立和配置最终的 Python 环境以及包安装，包括 colcon、NumPy 的版本锁定，以及 MuJoCo 仿真版本钉（`mujoco_sim_pin_mode`，见下）。 |
+| `benchmark_profile.sh` | `--with-benchmark` 专属的 Ubuntu GPU 前置检查、PyTorch CUDA profile、Torch/TorchVision/TorchCodec 与 provider ABI 约束；要求 NVIDIA driver >=560.28.03，不依赖本机 nvcc，并隔离 GraspGen；生成的 benchmark 约束包含 `mujoco<3.9`（hf-libero 0.1.4 的上限）。 |
 | `common.sh` | 通用工具函数，例如日志格式、`run_cmd` 与 `ask_yn`、`sudo` 会话等基础设施提取。 |
 | `detect.sh` | OS / 架构 / Python 探测；解析 `IBR_HOST_*` 与 `IBR_LEROBOT_PROFILES`。 |
-| `verify_env.sh` | 独立环境验证库；暴露 `verify_ros` / `verify_colcon` / `verify_numpy_compat` / `verify_lerobot` / `verify_tracing` 及入口 `verify_env`。 |
+| `verify_env.sh` | 独立环境验证库；暴露 `verify_ros` / `verify_colcon` / `verify_numpy_compat` / `verify_lerobot` / `verify_mujoco_sim` / `verify_tracing` 及入口 `verify_env`。 |
 | `platforms/<id>.sh` | 各平台的包管理器、ROS 源、`platform_lerobot_profiles()` 默认值。 |
 | `lerobot_patches.sh` | 驱动 `git am` 将精选的 lerobot 补丁栈应用到 `libs/lerobot`。 |
 | `lerobot_resolve_active.py` | 从 `INDEX.yaml` 解析当前生效的 lerobot tag；并交叉校验对应 `manifest.yaml`。 |
@@ -18,6 +18,8 @@
 | `tests/test_lerobot_filter.sh` | 锁定 3 平台基准矩阵 + tag 绑定用例的回归 fixture。 |
 | `tests/test_cann_torch_versions.sh` | 无需安装 CANN，验证 CANN 版本探测与 openEuler Torch ABI 选择。 |
 | `tests/test_openeuler_cv_bridge_abi.sh` | 验证 openEuler 安装匹配 OpenCV 4.13 的 `cv_bridge` RPM。 |
+| `tests/test_setup_profile_training.sh` | 验证 `--profile training` 不触发 ROS 2 / rosdep / colcon，且 `full` / `inference` 行为不变。 |
+| `tests/test_mujoco_sim_pin.sh` | 验证 MuJoCo 仿真钉的三种安装顺序、benchmark `mujoco<3.9` 约束、inference 跳过与未构建工作区的 stdlib 校验（issue #190）。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
@@ -29,6 +31,9 @@
 | --- | --- |
 | `full`（默认） | 完整开发工作区：硬件、遥操作、感知、抓取、语音、仿真与开发工具全量安装。 |
 | `inference` | 仅运行策略推理的最小运行时，面向端边协同推理验证主机。 |
+| `training` | **仅支持 Ubuntu 22.04** 的 LeRobot 训练主机：只建 venv、应用 LeRobot 补丁栈并安装 LeRobot + 训练依赖，不装 ROS 2 / rosdep / colcon。 |
+
+能力矩阵的**单一事实源**是 [`common.sh`](./common.sh) 里的 `_SETUP_PROFILE_TABLE`：一行一个 profile，单元格以 `|` 分隔（列 = `rosdep` 单元格 / `submodules` 范围 / `verify` 校验档 / `features` 能力清单），长单元格可用缩进续行 —— 物理行先粘合再切格、格内空白归一化，所以任一单元格都能在逗号后折行。`rosdep` 单元格写作 `<scope>:<paths>`（如 `full:src`、`narrow:src/a,src/b`、`skip:-`），scope 与 `--from-paths` 同格声明，因此不会出现“skip 却仍在解析某个路径集”的非法组合。`setup_profile_enables <feature>` 查“装什么”，`setup_profile_get rosdep|rosdep_paths|submodules|verify` 查范围、路径与校验档；**新增一个 profile = 新增一行**。
 
 `inference` profile 相对 `full` 的差异：
 
@@ -44,6 +49,50 @@
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
 ```
+
+`training` profile 相对 `full` 的差异（面向只跑 LeRobot 训练的 Ubuntu 22.04 训练机）：
+
+`training` 仅支持 `ubuntu-22.04`。平台识别后，其他平台会在依赖预览、子模块同步和系统安装前报错退出；`--only-patch` / `--skip-verify` 不绕过此限制。`full` / `inference` 的平台支持范围不变。`training` 与 `--with-benchmark` 不兼容，benchmark 环境请使用 `full`。
+
+- **ROS 2**：完全不安装。跳过 `scripts/install_ros.sh`、rosdep、colcon 与 ROS 第三方 patch 栈，也不要求 `install/` overlay。
+- **submodules**：只初始化 `libs/lerobot`。
+- **系统依赖**：只需要 Python bootstrap（`python3-venv` / `python3-pip`）与 `ffmpeg`（torchcodec 视频解码）。与其他 profile 共用 Ubuntu 的系统依赖安装入口，由 apt 幂等处理已安装的包；FFmpeg 不再依赖 ROS/OpenCV 间接带入。
+- **Python venv**：保留 `--system-site-packages`（与 `full` / `inference` 布局一致）；只安装 `base.txt`、`requirements/training.txt`（TensorBoard）与 LeRobot editable（extras：`smolvla,pi,diffusion,dataset,deepdiff-dep`）。跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception、FullSubNet、GraspGen、colcon、`empy` / `rosdep`、pre-commit / gitlint 钩子以及仅服务遥操作的 `kinematics` extra。
+- **NumPy / OpenCV**：**不做** ROS 2 ABI 钉版（`numpy==1.26.4` / `opencv<4.12`），沿用 LeRobot 解析出的版本；CANN 侧的依赖落位改由**加速器轴**决定（见下文[「加速器轴依赖落位」](#加速器轴依赖落位)）。
+- **验证**：跳过 ROS 2 / rosdep / colcon / cv_bridge / pygraphviz / tracing 校验，校验 venv + `import lerobot` + `lerobot.policies.act` API + `lerobot-train` 可执行文件；安装了 torchcodec 时还会加载其解码模块，以发现缺失的 FFmpeg 动态库或 ABI 不匹配。
+- **`.shrc_local`**：读取 `venv/.ibrobot_setup_profile`；`training` 时欢迎信息标注 `(profile: training)`，把 ROS 2 / `install/` / CANN 的缺失显示为「按预期缺失」，并不再提示 `cb` / `cbp` / `src` 等 colcon 别名。
+
+> 命名提醒：此处的 `training` 是**安装范围** profile；它与 LeRobot 补丁过滤的 `training` profile（`IBR_LEROBOT_PROFILES` / `--lerobot-profiles`）属于不同命名空间。`--profile training` 不会改动补丁过滤集合，训练相关补丁照常应用。
+
+```bash
+# 纯训练机（无 ROS 2）：
+./scripts/setup.sh --yes --profile training
+source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=act
+```
+
+## MuJoCo 仿真版本规则（issue #190）
+
+SO-101 的 MuJoCo 仿真平台运行在 `mujoco_ros2_control` 0.1.2 /
+`mujoco_vendor` 0.1.1（libmujoco 3.12.0）上。`.mjb` 模型由工作区 Python
+`mujoco` 编译，且版本必须与仿真器的 libmujoco 完全一致，因此：
+
+- Python 侧钉版移入独立的 `requirements/mujoco-sim.txt`（`mujoco==3.12.0`），
+  只在 Ubuntu `full` profile、未启用 benchmark 且 venv 中没有
+  `hf-libero`/`robosuite` 时安装（`python_venv.sh::mujoco_sim_pin_mode`）。
+- LIBERO benchmark 与 MuJoCo ROS 仿真**互斥于同一个 venv**：hf-libero 0.1.4
+  声明 `mujoco<3.9`（robosuite 1.4 在 MuJoCo >= 3.10 上崩溃），因此
+  `--with-benchmark` 生成的 pip 约束包含 `mujoco<3.9`；已有 benchmark 安装的
+  venv 跳过 3.12.0 钉版并警告，要使用 MuJoCo 仿真需**重建 venv**。
+- `verify_env.sh::verify_mujoco_sim` 在钉版会安装的环境里用纯标准库脚本复核
+  同一组版本（ROS prefix 取自 `SETUP_ROS_SETUP_PATH`）；其余 profile 与
+  benchmark venv 只输出提示行。
+- 运行时还有一道严格检查（`robot_runtime.mujoco.check_simulator_versions`）：
+  版本不一致或仿真器过旧时，`sim_platform:=mujoco` 在模型组装前直接失败并
+  给出安装诊断。
+- openEuler 无 `mujoco_ros2_control` rpm：rosdep skip 键
+  （`mujoco_ros2_control` / `mujoco_ros2_control_msgs`）保持不变，本次升级
+  未新增任何 skip 键（0.1.2 的 plugins 包由上游 `mujoco_ros2_control`
+  依赖传递带入，Ubuntu 侧同样不需要新键）。
 
 ## 加速器轴依赖落位
 

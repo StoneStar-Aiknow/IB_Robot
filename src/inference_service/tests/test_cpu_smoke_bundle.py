@@ -532,10 +532,8 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
         },
     }
     scheduled = bool(scheduler and scheduler["enable"])
-    if scheduler is not None:
-        inference_config["scheduler"] = scheduler
     if scheduled:
-        inference_config["scheduler"] = {
+        scheduler = {
             **scheduler,
             "global_endpoints": {
                 "readiness": "/inference/scheduler/ready",
@@ -559,9 +557,10 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
         )
     config = parse_inference_config(
         {
+            **({"runtime_scheduler": scheduler} if scheduler is not None else {}),
             "control_modes": {
                 "model_inference": {"inference": inference_config, "executor": {"inference_pipeline": "policy"}}
-            }
+            },
         },
         "model_inference",
     )

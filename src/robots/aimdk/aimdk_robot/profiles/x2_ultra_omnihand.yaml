@@ -24,7 +24,7 @@ runtime:
   name: aimdk_robot
   version: 0.1.0
   type: x2_ultra_omnihand
-simulated: false
+use_sim: false
 joint_state_topic: /joint_states
 joints:
 - left_shoulder_pitch_joint
@@ -460,6 +460,42 @@ vendor:
     required_action: STAND_DEFAULT
     preset_timeout_s: 30.0
     poll_s: 0.2
+    # In the upper-body stream mode (UPPERBODY_REMOTE_SPLIT) the platform plays
+    # no preset, so named motions are replayed there from arm trajectories
+    # recorded off the presets (aimdk_record_named_motion), eased in from the
+    # measured pose. Only the arms move; head and hands hold. A name without a
+    # recording is refused in these modes with MODE_NOT_ALLOWED. Declared here
+    # and not in x2_ultra: the hands must hold in every upper-body command,
+    # which is verified for dexterous hands only.
+    trajectory_modes:
+    - stream
+    trajectory_blend_speed_radps: 0.5
+    trajectory_blend_min_s: 0.5
+    # A recording faster than this anywhere is refused at startup. The
+    # platform's own presets peak at 4.7 rad/s (raise_hand, 2026-10-20).
+    trajectory_max_speed_radps: 6.0
+    # A replay fails unless the measured arm moved at least this share of the
+    # commanded motion on its most-moving joint: the platform drops commands it
+    # cannot use without saying so. Replays track at ~0.9 (2026-10-20).
+    trajectory_follow_min_ratio: 0.3
+    # A replay cancelled part-way can be resumed from where it stopped for this
+    # long, as long as nothing has moved the arm or changed the mode since.
+    trajectory_resume_ttl_s: 120.0
+    # A cancel holds the target sent this long ago, the one the arm is
+    # realizing: holding the latest target lets the arm carry on towards it,
+    # holding the measured pose lets it sag by the error the platform needs to
+    # hold it against gravity (0.05-0.19 rad on the right shoulder pitch).
+    # 0.05 s stopped a 2.3-2.6 rad/s wave within 0.1 rad and 0.4 s, settling
+    # within 0.03 rad of the pose at the cancel (2026-10-22).
+    trajectory_hold_lag_s: 0.05
+    # name -> JSON file relative to this profile, recorded off the presets on
+    # firmware release-lx2501_3_t2d5-soc1-v1.1.1 (2026-10-20).
+    trajectories:
+      wave: trajectories/wave.json
+      handshake: trajectories/handshake.json
+      raise_hand: trajectories/raise_hand.json
+      blow_kiss: trajectories/blow_kiss.json
+      clap: trajectories/clap.json
   expressions:
     blink: 1
     calm: 10
@@ -650,6 +686,10 @@ interfaces:
     endpoint: /audio/capture_stamped
     message_type: audio_common_msgs/msg/AudioDataStamped
     rate_hz: 33.3
+    # Format metadata mirrors the capability entry above so consumers bind the
+    # same fields on vendor-bridged and ALSA-backed runtimes alike.
+    sample_rate_hz: 16000.0
+    channels: 6
     qos:
       reliability: reliable
       durability: volatile
@@ -661,6 +701,8 @@ interfaces:
     direction: subscribe
     endpoint: /audio/play
     message_type: audio_common_msgs/msg/AudioDataStamped
+    sample_rate_hz: 16000.0
+    channels: 1
     qos:
       reliability: best_effort
       durability: volatile

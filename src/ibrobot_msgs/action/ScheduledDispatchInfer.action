@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Goal: Scheduled action dispatch within an active session.
 # request_id is a session-unique UUID4. priority is a backend-agnostic non-negative
 # int32: 0 is highest priority, and larger values are lower priority. Backends expose

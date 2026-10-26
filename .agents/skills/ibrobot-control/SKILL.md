@@ -183,15 +183,17 @@ Drive them with the closed vocabulary only; free text outside the grammar never 
    `SKILL_CANCEL_TIMEOUT`, identity mismatch, or an unknown result means the stop state is unknown — report uncertainty
    and send no further motion.
 5. **继续 → fresh user request only.** A continue phrase is permitted only after a definite canceled terminal
-   (`GoalStatus=5` plus `SKILL_CANCELLED`). In this baseline `--resume` is rejected because `completed_step_count` is
-   telemetry, not server-owned continuation admission. Do not slice the old plan or create a new task ID to bypass that
+   (`GoalStatus=5` plus `SKILL_CANCELLED`). In this client `--resume` is rejected because `completed_step_count` is
+   telemetry, not continuation admission. Do not slice the old plan or create a new task ID to bypass that
    boundary. After definite cancellation, a user may submit an independent fresh workflow, which re-queries the fresh
    registry and uses new plan/task tokens. Success, failure, and unknown states do not authorize automatic continuation.
    This limits the client of this loop only. The incubation Agent (`ibrobot_agent`, `entry_mode=agent`) owns an
    accepted `继续`: after confirming the cancellation in its own ledger and the Gateway ledger it re-plans the
    unfinished part of the original request and submits it as a fresh Program with a new request ID through the
-   normal presentation and Gateway checks. Do not flag or "fix" that as breakpoint resume; see
-   `src/agent/ibrobot_agent/README.md`.
+   normal presentation and Gateway checks. When the Gateway reports the interrupted step resumable
+   (`step_resumable`), the Agent instead submits the ledger's canonical steps from that step on with
+   `continues_from_execution_id`, which the Gateway itself admits (`RESUME_CHECKPOINT_INVALID` otherwise). Do not flag
+   or "fix" either as a client bypassing the Gateway; see `src/agent/ibrobot_agent/README.md`.
 
 A reference implementation of this loop (catalog discovery, out-of-catalog rejection, in-session prepare/confirm,
 stop-to-definite-terminal, and fresh-state continuation) lives in
@@ -326,4 +328,4 @@ required workflow.
 | Treating command approval as motion authorization | Command approval authorizes only that command; motion still requires `authorize_motion` (set by the operator, or by the Agent after explicit user confirmation in the current conversation) and a flushed plan presentation. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
 | Continuing after an unknown stop | `继续` needs a definite canceled terminal (5 + `SKILL_CANCELLED`). Otherwise refuse continuation and send no motion. |
-| Slicing completed steps on `继续` | In this client loop, reject breakpoint resume until the Gateway provides server-owned continuation admission. The Agent-side `继续` of `ibrobot_agent` is a different, accepted path (step 5). |
+| Slicing completed steps on `继续` | In this client loop, reject breakpoint resume: the client has no continuation admission. The Agent-side `继续` of `ibrobot_agent`, including its Gateway-admitted step resume, is a different, accepted path (step 5). |

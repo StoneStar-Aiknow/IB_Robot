@@ -33,6 +33,15 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>xacro</exec_depend>
+  <!-- MuJoCo embodiment (so101-mujoco-runtime-platform D2/D3): the provider
+       composes the robot+scene model through sim_models and starts the
+       mujoco_ros2_control simulator + controller manager process.
+       0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1): the CameraPlugin
+       parameter path needs >= 0.1.0; rosdep does not enforce versions, the
+       runtime check (robot_runtime.mujoco.check_simulator_versions) is the
+       real guard. -->
+  <exec_depend>sim_models</exec_depend>
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>

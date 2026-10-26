@@ -793,7 +793,7 @@ robot:
       default_control_mode: moveit_planning
       skill_required_control_mode: moveit_planning
       mid360_mount_file: ""
-      peripheral_names: [respeaker, wrist]
+      peripheral_names: [respeaker, speaker, wrist]
       # The fixed camera is not part of this compatibility stage, so its
       # calibration artifact must not be projected into the wrist-only config.
       sensor_calibration:
@@ -840,7 +840,7 @@ robot:
           enabled: false
     mapping:
       default_control_mode: base_navigation
-      peripheral_names: [respeaker, front, mid360]
+      peripheral_names: [respeaker, speaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       # Legacy navigation-mapping stage stays lean: online semantic mapping and
@@ -880,7 +880,7 @@ robot:
     navigation:
       default_control_mode: base_navigation
       skill_required_control_mode: base_navigation
-      peripheral_names: [respeaker, front, mid360]
+      peripheral_names: [respeaker, speaker, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       # Legacy localization-navigation stage stays lean: online semantic
@@ -938,7 +938,7 @@ robot:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
       mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
-      peripheral_names: [respeaker, wrist, front, mid360]
+      peripheral_names: [respeaker, speaker, wrist, front, mid360]
       motion_mode:
         navigation_enabled_on_startup: true
       control_modes:
@@ -1056,6 +1056,13 @@ robot:
     language: zh
     bundle_path: "models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
     deployment: ascend_310p  # X-ASR encoder OM on the 310P NPU; decoder/joiner on CPU
+    # Streaming capture binds the runtime's audio.capture interface (the
+    # respeaker peripheral above), so `voice_asr_auto_start:=true` can enable
+    # this section without further config edits; the binding is inert while
+    # the section stays disabled.
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
     realtime_pre_roll_seconds: 0.5
@@ -1068,11 +1075,16 @@ robot:
 
   # Start the ReSpeaker direction-of-arrival pipeline with this robot. Common
   # algorithm and microphone-array parameters remain owned by
-  # voice_asr_service/config/speech_direction.yaml.
+  # voice_asr_service/config/speech_direction.yaml. The capture topic and the
+  # array format are bound to the runtime's audio.capture interface (the
+  # lekiwi_robot peripheral list owns the respeaker and the speaker).
   speech_direction:
     enabled: true
     profile: ascend_310p
     microphone: respeaker
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
     config_file: "$(find voice_asr_service)/config/speech_direction.yaml"
     profiles_file: "$(find voice_asr_service)/config/speech_direction_profiles.yaml"
     models_root: "$(env WORKSPACE)/models"
@@ -1081,17 +1093,9 @@ robot:
     parameters:
       mount_yaw_deg: 90.0
 
-  # Ubuntu and openEuler use the same audio_common device owners and ROS topics.
-  audio_io:
-    enabled: true
-    microphone: respeaker
-    capture_topic: /audio/capture
-    capture_stamped_topic: /audio/capture_stamped
-    audio_info_topic: /audio/info
-    playback_topic: /audio/play
-    playback_sample_rate: 24000
-    playback_channels: 1
-    playback_sample_format: S16LE
+  # Audio I/O is runtime-owned (runtime-owned-audio-io): the microphone and
+  # speaker peripherals above are launched by lekiwi_robot on /audio/*; there
+  # is no robot_config audio_io section on a provider deployment.
 
   embodied:
     enabled: false
@@ -1103,7 +1107,7 @@ robot:
       sound_orientation:
         # Safe default for the non-hybrid stages; the hybrid stage above
         # enables the periodic session (still inactive until activated).
-        # ASR and speech direction share audio_io; motion remains separately authorized.
+        # ASR and speech direction share the runtime audio capture; motion remains separately authorized.
         enabled: false
         trigger_phrases: ["转向我"]
         direction_topic: /voice/speech_direction
@@ -1211,10 +1215,15 @@ robot:
       - gripper_trajectory_controller
       - base_velocity_controller
 
+  # Audio devices are runtime-owned: the respeaker microphone and the speaker
+  # below are launched by the lekiwi_robot runtime as ALSA device owners on
+  # the /audio/* topics; voice consumers bind audio.capture / audio.play.
+  # The entries are overrides of the runtime-declared devices (the profile
+  # owns the drivers; the speaker defaults to disabled there and this
+  # deployment enables it).
   peripherals:
     - type: microphone
       name: respeaker
-      driver: alsa
       params:
         device: "hw:0,0"
         channels: 6
@@ -1222,9 +1231,17 @@ robot:
         sample_format: S16LE
         channel_indices: [1, 2, 3, 4]
 
+    - type: speaker
+      name: speaker
+      enabled: true
+      params:
+        device: ""
+        channels: 1
+        sample_rate: 24000
+        sample_format: S16LE
+
     - type: camera
       name: wrist
-      driver: realsense
       # Device-specific serials belong in a deployment instance override.
       # Leave the generic profile empty so other LeKiwi units can bind safely.
       serial_number: ""
@@ -1266,7 +1283,6 @@ robot:
 
     - type: camera
       name: front
-      driver: realsense
       driver_camera_name: front
       # Device-specific serials belong in a deployment instance override.
       serial_number: ""
@@ -1296,7 +1312,6 @@ robot:
 
     - type: lidar
       name: mid360
-      driver: livox_mid360
       frame_id: livox_frame
       lidar_ip: 192.168.1.139
       host_ip: 192.168.1.5
@@ -1452,3 +1467,8 @@ robot:
     playback_service_name: /voice_tts/play
     playback_timeout_sec: 300.0
     prompt_profile: default
+    # Playback binds the runtime's audio.play interface: the topic and the
+    # 24 kHz mono format come from the speaker peripheral above.
+    audio_output:
+      interface: audio.play
+      type: audio_common_msgs/msg/AudioDataStamped

@@ -67,7 +67,12 @@ from robot_runtime.contract import (
 from robot_runtime.interface_description import build_description
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
-from robot_runtime.peripherals import load_peripherals_file, merge_peripherals, perception_capabilities
+from robot_runtime.peripherals import (
+    audio_capabilities,
+    load_peripherals_file,
+    merge_peripherals,
+    perception_capabilities,
+)
 from robot_runtime.profile import load_profile, validate_profile
 from robot_runtime.state import RuntimeState
 from robot_runtime.synthetic_perception import SyntheticStreams
@@ -120,7 +125,7 @@ def default_profile(base: bool = True) -> dict[str, Any]:
         modes[IDLE_MODE]["transitions"].append("base_navigation")
     return {
         "runtime": {"name": "mock_runtime", "version": "0.1.0"},
-        "simulated": True,
+        "use_sim": True,
         "modes": modes,
         "capabilities": capabilities,
         "joints": joints,
@@ -167,12 +172,19 @@ class MockRuntime(Node):
         self.declare_parameter("instance_id", str(self._profile["runtime"].get("instance_id", "")))
         if self.get_parameter("instance_id").value:
             self._profile["runtime"]["instance_id"] = str(self.get_parameter("instance_id").value)
+        self.declare_parameter("use_sim", bool(self._profile.get("use_sim", True)))
+        self.declare_parameter("sim_platform", "")
+        use_sim = bool(self.get_parameter("use_sim").value)
+        sim_platform = str(self.get_parameter("sim_platform").value or "").strip() or (
+            str(self._profile.get("sim_platform") or "sdk") if use_sim else ""
+        )
         fragment = load_peripherals_file(peripherals_path) if peripherals_path else {}
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
         capabilities = dict(self._profile["capabilities"])
         capabilities.update(perception_capabilities(peripherals))
+        capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
-        description = build_description(self._profile, peripherals, simulated=True)
+        description = build_description(self._profile, peripherals, use_sim=use_sim, sim_platform=sim_platform or None)
         self._interface_monitor = InterfaceMonitor(self, description)
         self._synthetic_streams = SyntheticStreams(self, description)
         self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))

@@ -39,5 +39,15 @@ setup(
             "mhandpro_source_node = robot_teleop.mhandpro_source_node:main",
             "vr_teleop = robot_teleop.vr_teleop:main",
         ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the teleoperation
+        # nodes' launch wiring registers from its owning package without any
+        # robot_config change. Installing this package does not enable the
+        # entry; participation still comes from the teleop control mode.
+        "ibrobot.launch_builders": [
+            "teleop = robot_teleop.launch_builders.teleop:TELEOP_BUILDER",
+            "hand_sources = robot_teleop.launch_builders.hand_sources:HAND_SOURCES_BUILDER",
+        ],
     },
 )

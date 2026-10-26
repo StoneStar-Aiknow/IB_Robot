@@ -84,11 +84,25 @@ class ResultQueries:
 
     @staticmethod
     def span_dict(span: Any) -> dict[str, Any]:
-        return to_js_safe(asdict(span) | {"id": stable_span_id(span), "duration_ms": span.duration_ms})
+        return to_js_safe(
+            asdict(span)
+            | {
+                "id": span.occurrence_id or stable_span_id(span),
+                "base_id": stable_span_id(span),
+                "duration_ms": span.duration_ms,
+            }
+        )
 
     @staticmethod
     def flow_dict(flow: Any) -> dict[str, Any]:
-        return to_js_safe(asdict(flow) | {"id": stable_flow_id(flow), "duration_ms": flow.duration_ms})
+        return to_js_safe(
+            asdict(flow)
+            | {
+                "id": flow.occurrence_id or stable_flow_id(flow),
+                "base_id": stable_flow_id(flow),
+                "duration_ms": flow.duration_ms,
+            }
+        )
 
     @staticmethod
     def tracepoint_dict(definition: Any) -> dict[str, Any]:

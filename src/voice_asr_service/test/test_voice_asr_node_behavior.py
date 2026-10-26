@@ -186,6 +186,10 @@ def make_node(
     node._vad_sensitivity = 0.6
     node._vad_bundle_path = "models/silero-vad"
     node._vad_deployment = "torch_cpu"
+    node._vad_min_silence_duration = 0.3
+    node._vad_post_roll_ms = 150.0
+    node._vad_pre_roll_ms = 300.0
+    node._vad_min_speech_duration = 0.3
     node._realtime_pre_roll_seconds = 0.0
     node._last_audio_chunk_time = 0.0
     commands: list[tuple[str, float]] = []

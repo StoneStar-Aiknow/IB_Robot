@@ -15,6 +15,11 @@ class EventOrigin:
     process_id: int | None = None
     thread_id: int | None = None
     node: str = ""
+    machine_id: str = ""
+    boot_id: str = ""
+    process_instance: str = ""
+    capture_session: str = ""
+    event_sequence: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +31,8 @@ class TraceEvent:
     clock: str = "realtime"
     schema_version: int = 0
     sequence: int = 0
+    monotonic_ns: int | None = None
+    time_mapping: dict[str, Any] = field(default_factory=dict)
 
     def field(self, name: str, default: Any = None) -> Any:
         return self.fields.get(name, default)
@@ -74,6 +81,7 @@ class TraceDataset:
     metadata: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     definitions: list[TracepointDefinition] = field(default_factory=list)
+    uncalibrated_events: list[TraceEvent] = field(default_factory=list)
 
     def sort(self) -> None:
         self.events.sort(key=lambda event: (event.timestamp_ns, event.sequence))
@@ -174,6 +182,8 @@ class SpanRecord:
     status: str
     origin: str
     fields: dict[str, Any] = field(default_factory=dict)
+    time_mapping: dict[str, Any] = field(default_factory=dict)
+    occurrence_id: str = field(default="", compare=False)
 
     @property
     def duration_ms(self) -> float | None:
@@ -196,9 +206,14 @@ class FlowRecord:
     send_ns: int | None
     receive_ns: int | None
     status: str
+    uncertainty_ns: int | None = None
+    provenance: dict[str, Any] = field(default_factory=dict)
+    occurrence_id: str = field(default="", compare=False)
 
     @property
     def duration_ms(self) -> float | None:
+        if self.status not in {"complete", "negative"}:
+            return None
         if self.send_ns is None or self.receive_ns is None:
             return None
         return (self.receive_ns - self.send_ns) / 1_000_000

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import textwrap
+
 import launch_ros.actions
+import pytest
 import yaml
 
 from robot_runtime.peripherals import (
     PERCEPTION_CAMERA,
     PERCEPTION_LIDAR,
     fast_lio_nodes,
+    load_peripherals_file,
     merge_peripherals,
     perception_capabilities,
     peripheral_nodes,
@@ -108,8 +112,14 @@ def test_peripheral_nodes_realsense_spawns_relay_chain():
     assert ("robot_runtime", "topic_relay") in specs, "realsense composition declares its relays"
 
 
-def test_peripheral_nodes_microphone_is_data_only():
-    assert peripheral_nodes([{"type": "microphone", "name": "respeaker", "driver": "alsa"}], use_sim=False) == []
+def test_peripheral_nodes_compose_the_alsa_capture_owner():
+    """Microphones used to be data-only; the runtime now owns the ALSA node (runtime-owned-audio-io)."""
+    nodes = peripheral_nodes(
+        [{"type": "microphone", "name": "respeaker", "driver": "alsa", "params": {"channels": 4}}], use_sim=False
+    )
+    assert [(node.node_package, node.node_executable, node._Node__node_name) for node in nodes] == [
+        ("audio_capture", "audio_capture_node", "audio_capture")
+    ]
 
 
 def test_peripheral_nodes_sim_skips_physical():
@@ -160,3 +170,127 @@ def test_fast_lio_nodes_disabled_or_sim_compose_nothing():
         fast_lio_nodes({"enabled": True, "params_file": "/tmp/x.yaml"}, bridge_package="lekiwi_robot", use_sim=True)
         == []
     )
+
+
+# ---------------------------------------------------------------------------
+# runtime-peripheral-overrides D6: one structural loader for every fragment
+# ---------------------------------------------------------------------------
+
+
+def _fragment(tmp_path, content, name="peripherals.yaml"):
+    path = tmp_path / name
+    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    return str(path)
+
+
+def test_load_peripherals_file_empty_path_is_the_empty_fragment():
+    assert load_peripherals_file("") == {}
+    assert load_peripherals_file("   ") == {}
+
+
+def test_load_peripherals_file_returns_the_fragment(tmp_path):
+    path = _fragment(
+        tmp_path,
+        """
+        peripherals:
+        - type: camera
+          name: top
+          width: 1280
+        fast_lio:
+          enabled: true
+        """,
+    )
+    assert load_peripherals_file(path) == {
+        "peripherals": [{"type": "camera", "name": "top", "width": 1280}],
+        "fast_lio": {"enabled": True},
+    }
+
+
+@pytest.mark.parametrize(
+    "content,pattern",
+    [
+        ("- type: camera\n", "must be a mapping"),
+        ("peripherals: {a: 1}\n", "peripherals must be a list"),
+        ("unknown_key: 1\n", "unknown top-level keys"),
+        ("peripherals:\n- type: camera\n", "requires type and name"),
+        ("peripherals:\n- type: camera\n  name: top\n- type: camera\n  name: top\n", "duplicate peripheral"),
+        ("fast_lio: [1]\n", "fast_lio must be a mapping"),
+    ],
+)
+def test_load_peripherals_file_structural_errors_name_the_file(tmp_path, content, pattern):
+    path = _fragment(tmp_path, content)
+    with pytest.raises(ValueError, match=pattern) as excinfo:
+        load_peripherals_file(path)
+    assert path in str(excinfo.value), "every structural error names the file"
+
+
+def test_load_peripherals_file_missing_file_names_the_file(tmp_path):
+    missing = str(tmp_path / "absent.yaml")
+    with pytest.raises(ValueError, match=f"peripherals file is unreadable: {missing}"):
+        load_peripherals_file(missing)
+
+
+def test_load_peripherals_file_expands_env_and_find(tmp_path, monkeypatch):
+    real = _fragment(tmp_path, "peripherals: []\n", name="env_fragment.yaml")
+    monkeypatch.setenv("IBROBOT_TEST_PERIPHERALS_FILE", real)
+    assert load_peripherals_file("$(env IBROBOT_TEST_PERIPHERALS_FILE)") == {"peripherals": []}
+    # $(find pkg) resolves through the ament index: the error names both the
+    # raw argument and the expanded share-dir path, proving the substitution ran
+    with pytest.raises(ValueError, match=r"unreadable") as excinfo:
+        load_peripherals_file("$(find robot_runtime)/no-such-fragment.yaml")
+    assert "no-such-fragment.yaml" in str(excinfo.value)
+    assert "/robot_runtime/" in str(excinfo.value)
+
+
+def test_the_offline_cli_reports_the_same_structural_error(tmp_path, capsys):
+    # D6: the CLI stopped reading YAML directly; a malformed file yields the
+    # same message the runtime launches and the facade/mock nodes report.
+    from robot_runtime.interface_description import main as cli_main
+
+    bad = _fragment(tmp_path, "unknown_key: 1\n")
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        yaml.safe_dump(
+            {
+                "runtime": {"name": "t", "version": "0.1"},
+                "modes": {"idle": {"controllers": []}},
+                "capabilities": {"joint.state": {}},
+                "joints": ["j1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cli_main(["--profile", str(profile_path), "--peripherals", bad])
+    assert excinfo.value.code == 1
+    assert f"peripherals file {bad} has unknown top-level keys" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[]\n",
+        "false\n",
+        "0\n",
+        "- peripherals\n",
+    ],
+)
+def test_load_peripherals_file_rejects_non_mapping_documents(tmp_path, content):
+    path = _fragment(tmp_path, content)
+    with pytest.raises(ValueError, match=f"peripherals file must be a mapping: {path}"):
+        load_peripherals_file(path)
+
+
+def test_load_peripherals_file_accepts_an_empty_document(tmp_path):
+    assert load_peripherals_file(str(_fragment(tmp_path, ""))) == {}
+    assert load_peripherals_file(str(_fragment(tmp_path, "# only a comment\n"))) == {}
+
+
+def test_load_peripherals_file_distinguishes_missing_keys_from_null(tmp_path):
+    # a missing key is fine; an explicit null is a malformed fragment
+    assert load_peripherals_file(str(_fragment(tmp_path, "peripherals: []\n"))) == {"peripherals": []}
+    with pytest.raises(ValueError, match="peripherals file.*must be a list"):
+        load_peripherals_file(str(_fragment(tmp_path, "peripherals:\n")))
+    assert load_peripherals_file(str(_fragment(tmp_path, "fast_lio: {}\n"))) == {"fast_lio": {}}
+    with pytest.raises(ValueError, match="peripherals file.*must be a mapping"):
+        load_peripherals_file(str(_fragment(tmp_path, "fast_lio:\n")))

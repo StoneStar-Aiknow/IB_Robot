@@ -70,6 +70,9 @@ ros2 launch voice_tts_service voice_tts.launch.py \
   deployment:=ubuntu_onnx
 ```
 
+`runtime_options_json` 向 adapter 传运行时选项（JSON 对象），例如
+`runtime_options_json:='{"num_steps": 4}'`；不传时为 `{}`，沿用 bundle 自带的值。
+
 ## 3. 数据流
 
 ```text
@@ -282,6 +285,7 @@ voice_tts:
 | `playback_service_name` | 本机 WAV 播放服务名 |
 | `playback_timeout_sec` | 单次同步播放超时 |
 | `prompt_profile` | 默认音色 profile |
+| `num_steps` | flow matching 步数；不配置时沿用 bundle 自带的值（310P bundle 为 `4`，主机 ONNX bundle 为 `8`）；见下方「合成时延」 |
 | `segment_max_chars` | 单个公共文本段的最大字符数 |
 | `max_request_chars` | 单次请求的最大字符数 |
 | `max_segments` | 单次响应允许的最大音频段数量 |
@@ -289,6 +293,29 @@ voice_tts:
 | `exit_on_init_failure` | bundle 初始化失败时是否退出节点 |
 
 代表性配置默认 `enabled=false`，在模型 bundle 和 deployment 准备完成前不会改变现有机器人启动行为。
+
+#### 合成时延
+
+合成耗时几乎全在 flow matching 循环里，且与 `num_steps` 线性相关。主机 ONNX 路径
+实测（`好的，我这就点头。`，x86 CPU）：
+
+| num_steps | 单次合成 | text_encoder | vocos |
+| --- | --- | --- | --- |
+| 8 | 1498 ms | 3 ms | 9 ms |
+| 6 | 1129 ms | 3 ms | 9 ms |
+| **4** | **764 ms** | 4 ms | 8 ms |
+| 2 | 408 ms | 4 ms | 9 ms |
+
+`text_encoder` 与 vocos 合计不到 2%，**优化这两处没有意义**。
+
+Ascend 310P bundle 在生产中一直用 `4`；主机 ONNX bundle 资产里写的是 `8`。把合成输出
+喂回本仓 ASR 做可懂度回归，2–8 步的转写完全一致，所以 `so101_voice_latency` 显式配置
+`num_steps: 4`。这是按 profile 开启的取舍，launch builder 不设默认值、不改变未配置的部署。
+该 profile 不由统一 launch 拉起 voice_tts（原因见 profile 注释），在旁单独启动时须把同一个值
+传给调试 launch（`runtime_options_json:='{"num_steps": 4}'`），否则主机 ONNX 跑的是 bundle 自带的 8 步。
+
+`num_steps` 位于 bundle 资产内，而 bundle 有摘要校验、不可原地修改，所以它作为
+**运行时选项**从 `robot_config` 下发；不配置时沿用 bundle 自带的值。
 
 ## 7. Ascend 310P 支持范围
 

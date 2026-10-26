@@ -46,6 +46,13 @@
         "simulated"
       ]
     },
+    "sim_platform": {
+      "enum": [
+        "sdk",
+        "gazebo",
+        "mujoco"
+      ]
+    },
     "digest": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
@@ -220,6 +227,26 @@
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/image_profile"
+          }
+        },
+        "sample_rate_hz": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_format": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "channel_indices": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "modes": {

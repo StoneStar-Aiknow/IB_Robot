@@ -1,6 +1,11 @@
 <mujoco model="empty">
   <!-- Minimal MuJoCo scene: floor + invisible table-surface plane, no objects.
-       Used for API-level testing without scene assets. -->
+       Used for API-level testing without scene assets.
+       {{ROBOT_XML_PATH}} — absolute path to the robot MJCF; the composition
+       API (scene_compiler.compose_mujoco_model) fills it (scene=None compiles
+       the robot alone, so this template is not involved on that path). -->
+  <include file="{{ROBOT_XML_PATH}}"/>
+
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.4 0.4 0.4" specular="0.0 0.0 0.0"/>
     <rgba haze="0.15 0.25 0.35 1.0"/>
@@ -16,9 +21,21 @@
 
   <worldbody>
     <light pos="0.0 0.0 3.5" dir="0.0 0.0 -1.0" directional="true"/>
+    <!--
+      Support surfaces (floor, table_surface) carry geom priority="1" with
+      moderate friction (issue #190 D8): MuJoCo mixes contact friction
+      element-wise max unless one geom outranks the other, and the
+      grasp-tuned gripper contacts (friction 10, so101.xml.template
+      gripper_col) would weld the arm onto any plane they touch — the
+      contact constraint then cancels the saturated ±2.75 Nm actuator limit.
+      With priority, the surface's friction governs every pair it is in
+      (gripper–surface, object–surface) while gripper–object contacts keep
+      the max-mixed grasp tuning.
+    -->
     <geom name="floor" size="0 0 0.05" pos="0 0 -0.274" type="plane"
-          material="groundplane"/>
+          material="groundplane" priority="1" friction="0.8 0.1 0.01"/>
     <geom name="table_surface" type="plane" pos="0 0 0.0" size="0 0 0.05"
-          rgba="0 0 0 0" contype="1" conaffinity="1"/>
+          rgba="0 0 0 0" contype="1" conaffinity="1"
+          priority="1" friction="0.8 0.1 0.01"/>
   </worldbody>
 </mujoco>

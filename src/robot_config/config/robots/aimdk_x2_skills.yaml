@@ -15,6 +15,37 @@ robot:
   base_config: aimdk_x2.yaml
   name: aimdk_x2_skills
 
+  # For an X2 with OmniHand dexterous hands, one or two: this entry selects the
+  # OmniHand profile, the one that declares the gesture recordings the skills
+  # replay. A claw X2 cannot use it (nor aimdk_x2_voice, which layers on it):
+  # its runtime faults at startup on the hand type mismatch. type must match
+  # the profile's public identity; aimdk_x2.yaml and the profiles are used
+  # unchanged.
+  type: x2_ultra_omnihand
+  runtime:
+    profile: x2_ultra_omnihand
+
+  # Lists replace rather than merge, so this is the whole list: the base list
+  # with gripper.1d (not declared by the OmniHand profile; launch would wait
+  # for it forever) swapped for hand.multi_joint.
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      - hand.multi_joint
+      - base.cmd_vel
+      - base.navigation_gate
+      - motion.named
+      - motion.posture
+      - perception.camera
+      - perception.imu
+      - power.state
+      - diagnostics.codes
+      - interaction.tts
+      - interaction.expression
+      - interaction.led
+      - runtime.stop
+
   default_control_mode: "named_motion"
   skill_required_control_mode: "named_motion"
 
@@ -22,9 +53,12 @@ robot:
     named_motion:
       description: "Runtime-owned named motions (preset gestures)"
       description_cn: "运行时自持的命名动作（预设手势）"
-      # The runtime admits named motions only in idle (stable stand); the skill
-      # executor never requests a switch to idle, which would clear a stop latch.
-      runtime_mode: idle
+      # The runtime's upper-body stream mode, where it replays the gestures
+      # from recorded arm trajectories: skills run without leaving the mode the
+      # teleop and grasp stacks use. The executor enters it from idle on the
+      # first skill and stays; it never requests idle, which would clear a stop
+      # latch.
+      runtime_mode: stream
       inference:
         enabled: false
       executor:

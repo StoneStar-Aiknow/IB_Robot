@@ -82,6 +82,7 @@ def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1
         "_runtime_mode_for",
         "_request_runtime_mode",
         "_ensure_skill_control_mode",
+        "_control_mode_for_runtime",
     ):
         setattr(node, name, getattr(SkillExecutorNode, name).__get__(node))
     node._runtime_mode_client = _FakeModeClient(node)
@@ -337,3 +338,12 @@ def test_runtime_constructor_requires_expected_identity(monkeypatch):
     )
     with pytest.raises(ValueError, match="runtime_name is required"):
         SkillExecutorNode()
+
+
+def test_reported_control_mode_prefers_the_served_one_among_shared_runtime_modes():
+    node = _node()
+    node._skill_required_control_mode = "model_inference"
+    assert node._control_mode_for_runtime(_status(active_mode="stream")) == "model_inference"
+    node._skill_required_control_mode = "moveit_planning"
+    assert node._control_mode_for_runtime(_status(active_mode="stream")) == "teleop"
+    assert node._control_mode_for_runtime(None) == ""

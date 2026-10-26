@@ -180,6 +180,14 @@ class _BridgeState:
     utterance_stopped: bool = False
     clarification_request_id: str = ""
     pending: _PendingConfirmation | None = None
+    # The reply already said ahead of the plan (``reply_preview``), so the
+    # answer that repeats it is not said twice. Only the active request can
+    # have one.
+    preview_request_id: str = ""
+    preview_text: str = ""
+    # Stopped by this channel but not yet terminal: the Agent may not have seen
+    # the stop when it publishes the preview, so the channel drops it itself.
+    stopped_request_id: str = ""
 
 
 def _normalize(text: str) -> str:
@@ -310,12 +318,48 @@ class VoiceBridgeCore:
             # The Agent resolved "继续" against its ledgers; tell the user what resumes.
             message = str(payload.get("user_message", "")).strip()
             return [Log(f"request {request_id} continuation: {message}"), *self._say(message)]
-        if state not in TERMINAL_REQUEST_STATES or not self._finish(request_id):
+        if event_type == "reply_preview":
+            return self._on_reply_preview(payload, request_id)
+        if state not in TERMINAL_REQUEST_STATES:
+            return []
+        previewed = self._take_preview(request_id)
+        if not self._finish(request_id):
             return []
         if event_type == "needs_clarification":
             self._state.clarification_request_id = request_id
         message = str(payload.get("user_message", "")).strip()
-        return [Log(f"request {request_id} {event_type} {state}: {message}"), *self._say(_spoken_reply(state, message))]
+        spoken = _spoken_reply(state, message)
+        log = Log(f"request {request_id} {event_type} {state}: {message}")
+        if previewed and spoken == previewed:
+            return [log, Log(f"request {request_id} reply was already said as its preview")]
+        return [log, *self._say(spoken)]
+
+    def _on_reply_preview(self, payload: dict[str, Any], request_id: str) -> list[Action]:
+        """Say the reply the planner is still producing, once per request.
+
+        The plan behind it is not validated yet: if it is refused, the terminal
+        event says so ("执行失败") instead of staying silent about it.
+        """
+        message = str(payload.get("user_message", "")).strip()
+        if (
+            request_id != self._state.active_request_id
+            or self._state.preview_request_id == request_id
+            or self._state.stopped_request_id == request_id
+        ):
+            return [Log(f"reply preview for {request_id} ignored")]
+        if not message:
+            return []
+        self._state.preview_request_id = request_id
+        self._state.preview_text = message
+        return [Log(f"request {request_id} reply preview: {message}"), *self._say(message)]
+
+    def _take_preview(self, request_id: str) -> str:
+        if self._state.preview_request_id != request_id:
+            return ""
+        text = self._state.preview_text
+        self._state.preview_request_id = ""
+        self._state.preview_text = ""
+        return text
 
     def tick(self, now: float) -> list[Action]:
         state = self._state
@@ -374,6 +418,10 @@ class VoiceBridgeCore:
                 if self.config.confirm_mode == "voice_confirm"
                 else []
             )
+            if self._state.preview_request_id == request_id:
+                # The preview already told the user what is about to happen, and nothing waits on
+                # this line; saying it again only delays the answer behind it.
+                return [plan_log, *gate, Log(f"request {request_id} plan was already announced by its preview")]
             return [plan_log, *gate, *self._say(f"正在执行：{summary}。")]
         acknowledgement = PublishControl(
             {
@@ -419,6 +467,7 @@ class VoiceBridgeCore:
         state.last_activity = now
         if not target:
             return [Log(f"{reason}: no active request")]
+        state.stopped_request_id = target
         return [Log(f"{reason}: stopping {target}"), PublishControl({"operation": "stop", "request_id": target})]
 
     def _finish(self, request_id: str) -> bool:
@@ -430,6 +479,8 @@ class VoiceBridgeCore:
             self._state.active_request_id = ""
         if self._state.timed_out_request_id == request_id:
             self._state.timed_out_request_id = ""
+        if self._state.stopped_request_id == request_id:
+            self._state.stopped_request_id = ""
         if self._state.pending is not None and self._state.pending.request_id == request_id:
             self._state.pending = None
         return True

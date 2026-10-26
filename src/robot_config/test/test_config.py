@@ -14,14 +14,8 @@ from robot_config.config import (
     RobotConfig,
     Ros2ControlConfig,
     SkillGatewayRuntimeConfig,
-    VoiceASRConfig,
-    VoiceTTSConfig,
 )
 from robot_config.contract_utils import contract_fingerprint, iter_specs
-from robot_config.launch_builders.recording import get_recording_topics
-from robot_config.launch_builders.voice_asr import (
-    resolve_voice_asr_path,
-)
 from robot_config.loader import (
     _warn_unbound_serial_cameras,
     build_contract_from_robot_config_dict,
@@ -34,8 +28,6 @@ from robot_config.loader import (
 )
 from robot_config.timeout_policy import DEFAULT_EMBODIED_TIMEOUT_POLICY, resolve_embodied_timeout_policy
 from robot_config.utils import resolve_lerobot_norm_mode
-from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
-from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 
 HUMBLE_FLOAT32_MAX = 3.402823466e38
 IEEE_FLOAT32_MAX = 3.4028234663852886e38
@@ -545,14 +537,14 @@ def test_robot_state_freshness_defaults_independently_from_perception_scene_fres
 def test_load_single_arm_config():
     """Test loading SO-101 single arm configuration."""
     # This test assumes the example config exists
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
     config = load_robot_config(config_path)
 
-    assert config.name == "so101_single_arm"
+    assert config.name == "so101_arm_aero_hand"
     assert config.robot_type == "so_101"
     assert config.ros2_control.hardware_plugin == "so101_hardware/SO101SystemHardware"
     assert len(config.peripherals) == 3
@@ -595,14 +587,14 @@ def test_load_single_arm_config():
 
 
 def test_load_single_arm_config_dict_preserves_launch_schema():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
     config = load_robot_config_dict(config_path)
 
-    assert config["name"] == "so101_single_arm"
+    assert config["name"] == "so101_arm_aero_hand"
     assert "control_modes" in config
     assert "policy" in config["control_modes"]["model_inference"]["inference"]["pipelines"]
     assert "joints" in config
@@ -613,17 +605,19 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
 
 
 def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
 
-    config = load_robot_config_dict(config_path)
+    # provider profile: interfaces bind live, so load the structural view
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
 
     assert resolve_lerobot_norm_mode(config) == "degrees"
 
 
 def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
 
-    config = load_robot_config_dict(config_path)
+    # provider profile: interfaces bind live, so load the structural view
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
     policy_keys = {"observation.state", "observation.images.top", "observation.images.wrist"}
     policy_observations = [
         observation for observation in config["contract"]["observations"] if observation["key"] in policy_keys
@@ -634,7 +628,7 @@ def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
 
 
 def test_dict_contract_builder_matches_typed_contract_shape():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -720,7 +714,7 @@ def test_align_rejects_negative_max_age():
 
 
 def test_so101_single_arm_contract_includes_motor_current_observation():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_arm_aero_hand.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -914,19 +908,6 @@ def test_load_lekiwi_config_dict():
         "base_controller",
     ]
     assert robot_config["navigation"]["default_mode"] == "full"
-
-
-def test_recording_topics_follow_contract_and_peripherals():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi.yaml"
-    robot_config = load_robot_config_dict(config_path)
-    topics = get_recording_topics(robot_config)
-
-    assert "/joint_states" in topics
-    assert "/camera/front/image_raw" in topics
-    assert "/camera/front/camera_info" in topics
-    assert "/base_controller/odom" in topics
-    assert "/base_controller/cmd_vel" in topics
-    assert "/scan" in topics
 
 
 def test_validate_valid_config():
@@ -1155,40 +1136,7 @@ def test_load_voice_asr_config_preserves_bundle_identity():
     assert config.exit_on_init_failure is True
 
 
-def test_resolve_voice_asr_path_uses_workspace_root_for_relative_paths():
-    """Test voice ASR relative paths resolve from the workspace root."""
-    resolved = resolve_voice_asr_path("models/voice_asr/demo-bundle")
-
-    assert Path(resolved).is_absolute()
-    assert resolved.endswith("models/voice_asr/demo-bundle")
-
-
-def test_voice_asr_runtime_defaults_match_robot_config_defaults():
-    """Test robot_config defaults stay aligned with runtime Voice ASR defaults."""
-    config_defaults = VoiceASRConfig()
-
-    assert config_defaults.enabled == VOICE_ASR_DEFAULTS["enabled"]
-    assert config_defaults.active_mode == VOICE_ASR_DEFAULTS["active_mode"]
-    assert config_defaults.language == VOICE_ASR_DEFAULTS["language"]
-    assert config_defaults.bundle_path == VOICE_ASR_DEFAULTS["bundle_path"]
-    assert config_defaults.deployment == VOICE_ASR_DEFAULTS["deployment"]
-    assert config_defaults.max_recording_duration == VOICE_ASR_DEFAULTS["max_recording_duration"]
-    assert config_defaults.vad_sensitivity == VOICE_ASR_DEFAULTS["vad_sensitivity"]
-    assert config_defaults.vad_bundle_path == VOICE_ASR_DEFAULTS["vad_bundle_path"]
-    assert config_defaults.vad_deployment == VOICE_ASR_DEFAULTS["vad_deployment"]
-    assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
-    assert config_defaults.final_tail_padding_seconds == VOICE_ASR_DEFAULTS["final_tail_padding_seconds"]
-    assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
-    assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
-    assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]
-    assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
-    assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
-    assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
-    assert config_defaults.input_mode == VOICE_ASR_DEFAULTS["input_mode"]
-    assert config_defaults.external_min_samples == VOICE_ASR_DEFAULTS["external_min_samples"]
-
-
-def test_voice_tts_loader_and_runtime_defaults_match():
+def test_voice_tts_loader_applies_explicit_overrides():
     config = load_voice_tts_config(
         {
             "enabled": True,
@@ -1197,19 +1145,17 @@ def test_voice_tts_loader_and_runtime_defaults_match():
             "max_request_chars": 1000,
         }
     )
-    defaults = VoiceTTSConfig()
 
     assert config.enabled is True
     assert config.bundle_path == "models/voice_tts/custom"
     assert config.deployment == "torch_cpu"
     assert config.max_request_chars == 1000
-    assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
-    assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
-    assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
-    assert defaults.playback_service_name == VOICE_TTS_DEFAULTS["playback_service_name"]
-    assert defaults.playback_timeout_sec == VOICE_TTS_DEFAULTS["playback_timeout_sec"]
-    assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
-    assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
+
+
+# The contract that VoiceTTSConfig() defaults stay in sync with the shared
+# VOICE_TTS_DEFAULTS dict moved to voice_tts_service (the defaults owner);
+# robot_config deliberately treats voice_tts_service as an undeclared runtime
+# plugin (see launch_builders/voice_tts.py), so its tests must not import it.
 
 
 def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():

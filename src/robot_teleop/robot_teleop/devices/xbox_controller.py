@@ -39,7 +39,7 @@ class XboxTeleopDevice(BaseTeleopDevice):
         self.arm_joint_names = config.get("arm_joint_names", ["1", "2", "3", "4", "5"])
         self.joint_limits = config.get("joint_limits", {})
 
-        # Injected by robot_config.launch_builders.teleop based on
+        # Injected by robot_teleop.launch_builders.teleop based on
         # robot.teleoperation.cartesian.{solver,tool_frame} SSOT fields.
         self.cartesian_solver = config.get("cartesian_solver", "placo_servo")
         self.tool_frame = config.get("tool_frame", "gripper")

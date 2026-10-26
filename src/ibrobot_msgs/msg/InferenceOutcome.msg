@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Terminal certainty for a scheduled inference request.
 # UNSPECIFIED is the ROS default only; any terminal Result using it is a protocol error.
 uint8 UNSPECIFIED=0

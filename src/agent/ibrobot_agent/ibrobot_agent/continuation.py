@@ -1,9 +1,9 @@
 """Resolve "继续" against the Agent and Gateway ledgers (ROS-free).
 
-A continuation is never a Gateway resume: the Agent re-plans the interrupted
-request's original text from the current robot state and submits a fresh
-Program under the new request id.  The ledgers only decide whether that is
-allowed and tell the planner how much already ran:
+A continuation re-plans the interrupted request's original text from the
+current robot state and submits a fresh Program under the new request id.  The
+ledgers only decide whether that is allowed and tell the planner how much
+already ran:
 
 * Agent ledger: the session's latest actionable request, its terminal state and
   the original text from its bound proposal.
@@ -12,8 +12,13 @@ allowed and tell the planner how much already ran:
 
 Only a confirmed cancellation (or a stop before anything was submitted) is
 continued; every unknown, failed or inconsistent record is refused without
-motion.  ``completed_step_count`` is a lower bound: the Gateway does not record
-progress inside a step, so the interrupted step is planned again.
+motion.  ``completed_step_count`` is a lower bound and the interrupted step is
+planned again.  When the Gateway reports that step resumable (its executor
+stopped it at a checkpoint), the new Program names the interrupted execution
+and that step continues from where it stopped instead of from its start; the
+Gateway and the step's executor re-check that before anything moves.  Such a
+continuation is not re-planned at all: the decision carries the ledger's own
+canonical steps from the interrupted one on, which a planner would only copy.
 """
 
 from __future__ import annotations
@@ -34,12 +39,17 @@ _ADMISSION_REJECTIONS = frozenset({"BUSY", "ROBOT_QUARANTINED"})
 
 @dataclass(frozen=True)
 class ContinuationDecision:
-    """``text`` set: re-plan it with ``hint``; otherwise answer ``message`` without motion."""
+    """``text`` set: re-plan it with ``hint``; otherwise answer ``message`` without motion.
+
+    ``steps`` set (only when the interrupted step can resume): submit these
+    Gateway canonical steps as they are instead of re-planning ``text``.
+    """
 
     message: str
     text: str | None = None
     error_code: str = ""
     hint: Mapping[str, Any] = field(default_factory=dict)
+    steps: tuple[Mapping[str, Any], ...] = ()
 
 
 def is_continue_request(text: str) -> bool:
@@ -124,6 +134,7 @@ def decide_continuation(
     total = len(earlier) + len(steps)
     if not remaining:
         return ContinuationDecision("上一个任务的步骤已经全部完成，没有需要继续的动作。")
+    resumable = bool(gateway and gateway.get("found") and gateway.get("step_resumable"))
     hint = {
         "original_text": original_text,
         "continues_from_request_id": anchor.key.request_id,
@@ -138,12 +149,37 @@ def decide_continuation(
             "remaining part of original_text from the current robot state."
         ),
     }
+    if resumable:
+        progress = min(max(float(gateway.get("step_progress", 0.0) or 0.0), 0.0), 1.0)
+        hint["resume_progress"] = progress
+        hint["instruction"] = (
+            "The user asked to continue an interrupted task. completed_steps finished fully; do not repeat "
+            "them. interrupted_step stopped part-way at a point it can continue from: plan it again unchanged "
+            "as the first step and it resumes where it stopped. Plan only the remaining part of original_text."
+        )
     # Spoken while this request can still be interrupted by voice: no stop word in it.
-    if completed_total:
+    if resumable:
+        resumed = f"被打断的动作已做到 {round(hint['resume_progress'] * 100)}%，现在从中断处接着做。"
+        done = f"已完整完成 {len(completed_total)}/{total} 步，" if completed_total else ""
+        message = f"上次任务{done}{resumed}"
+    elif completed_total:
         message = f"上次任务已完整完成 {len(completed_total)}/{total} 步，现在继续剩余部分。"
     else:
         message = "上次任务还没有完成任何步骤，现在重新执行。"
-    return ContinuationDecision(message, text=original_text, hint=hint)
+    # The interrupted step resumes only unchanged, and the rest is what the
+    # Gateway already admitted: there is nothing for a planner to decide.
+    replay = tuple(dict(step) for step in remaining) if resumable else ()
+    return ContinuationDecision(message, text=original_text, hint=hint, steps=replay)
+
+
+def resume_execution_id(hint: Mapping[str, Any] | None, steps: Sequence[Any]) -> str:
+    """The execution to resume when the plan starts with the resumable interrupted step, else ""."""
+    if not hint or "resume_progress" not in hint or not steps:
+        return ""
+    first = steps[0].to_dict() if hasattr(steps[0], "to_dict") else steps[0]
+    if _step_summary(first) != hint.get("interrupted_step"):
+        return ""
+    return str(hint.get("continues_from_execution_id", ""))
 
 
 def _refuse(message: str) -> ContinuationDecision:
@@ -187,5 +223,6 @@ __all__ = [
     "decide_continuation",
     "is_continue_request",
     "needs_gateway",
+    "resume_execution_id",
     "select_anchor",
 ]

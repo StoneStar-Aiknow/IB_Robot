@@ -72,17 +72,27 @@ def apply_mid360_mount(robot_config: dict[str, Any], mount: dict[str, Any]) -> d
     rpy = mount["rpy"]
     lidar_frame = mount["lidar_frame"]
     body_frame = mount["body_frame"]
-    for peripheral in result.get("peripherals", []):
-        if peripheral.get("frame_id") == lidar_frame:
-            peripheral["transform"] = {
-                "parent_frame": body_frame,
-                "x": 0.0,
-                "y": 0.0,
-                "z": 0.0,
-                "roll": 0.0,
-                "pitch": 0.0,
-                "yaw": 0.0,
-            }
+    runtime = result.get("runtime") or {}
+    provider_owns_peripherals = bool(
+        isinstance(runtime, dict) and runtime.get("provider") and runtime.get("require_model")
+    )
+    if not provider_owns_peripherals:
+        # runtime-peripheral-overrides D1 (revision 2): on the require_model
+        # provider path the lidar mounting is runtime-owned; peripheral
+        # entries are overrides, not device definitions to re-mount. The
+        # navigation provisioning below still applies (fast_lio is
+        # application-owned).
+        for peripheral in result.get("peripherals", []):
+            if peripheral.get("frame_id") == lidar_frame:
+                peripheral["transform"] = {
+                    "parent_frame": body_frame,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                }
     navigation = result.setdefault("navigation", {})
     static_tfs = navigation.setdefault("static_tfs", [])
     static_tfs[:] = [item for item in static_tfs if item.get("child_frame") != body_frame]

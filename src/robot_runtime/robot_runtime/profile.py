@@ -10,7 +10,9 @@ Facade-relevant shape::
     runtime:
       name: so101_robot
       version: 0.1.0
-    simulated: false
+    use_sim: false                            # default execution (physical)
+    sim_platforms: [sdk, gazebo]              # supported simulation platforms
+    sim_platform: sdk                         # default platform (in sim_platforms)
     controller_manager: controller_manager
     modes:                                  # see robot_runtime.modes.ModeModelConfig
       initial: idle
@@ -31,6 +33,7 @@ Facade-relevant shape::
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,18 @@ import yaml
 from robot_runtime.capabilities import validate_capability_set
 from robot_runtime.contract import IDLE_MODE, STOP_POLICIES
 
+#: Simulation platforms a runtime profile may declare (runtime-simulation-platform D1).
+#: ``sdk`` is the vendor SDK virtual bus behind the production hardware adapter
+#: (no physics); physical execution is not a simulation platform.
+SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
+
+#: Platforms that replace the robot with a physics simulator
+#: (so101-mujoco-runtime-platform D1). Every ``== "gazebo"`` test that really
+#: means "a physics simulator provides the clock and the world-side rules"
+#: must test membership here instead; tests about Gazebo specifics (entity
+#: creation, gz bridges) keep the literal platform.
+PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
+
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")
 _REQUIRED_STOP_BOUNDS = ("cancel_bound_s", "idle_bound_s", "torque_off_bound_s")
@@ -46,6 +61,59 @@ _REQUIRED_STOP_BOUNDS = ("cancel_bound_s", "idle_bound_s", "torque_off_bound_s")
 
 class ProfileError(ValueError):
     """Raised when a runtime profile is missing or invalid."""
+
+
+def _validate_sim_selection(data: dict[str, Any], source: str | Path) -> None:
+    """Normalize and validate ``use_sim`` / ``sim_platforms`` / ``sim_platform`` (D1).
+
+    A profile declares the simulation platforms it supports and a default
+    platform. The legacy boolean ``simulated`` key stays an alias of ``use_sim``:
+    both present and disagreeing fail naming both values. Without
+    ``sim_platforms`` the profile supports ``[sdk]`` (today's behaviour);
+    ``sim_platform`` defaults to ``sdk`` and must be declared.
+    """
+    sim_platforms = data.get("sim_platforms")
+    if sim_platforms is None:
+        sim_platforms = ["sdk"]
+    elif not isinstance(sim_platforms, list) or not sim_platforms:
+        raise ProfileError(
+            f"runtime profile 'sim_platforms' must be a non-empty list from {list(SIM_PLATFORMS)}: {source}"
+        )
+    else:
+        sim_platforms = [str(entry).strip() for entry in sim_platforms]
+        if any(entry not in SIM_PLATFORMS for entry in sim_platforms) or len(set(sim_platforms)) != len(sim_platforms):
+            raise ProfileError(
+                f"runtime profile 'sim_platforms' must be unique values from {list(SIM_PLATFORMS)}: {source}"
+            )
+    data["sim_platforms"] = sim_platforms
+
+    has_simulated = "simulated" in data
+    if has_simulated and not isinstance(data["simulated"], bool):
+        raise ProfileError(f"runtime profile 'simulated' must be a boolean (alias of 'use_sim'): {source}")
+    has_use_sim = "use_sim" in data
+    if has_use_sim and not isinstance(data["use_sim"], bool):
+        raise ProfileError(f"runtime profile 'use_sim' must be a boolean: {source}")
+    if has_simulated and has_use_sim and data["simulated"] != data["use_sim"]:
+        raise ProfileError(
+            f"runtime profile selects use_sim: {data['use_sim']} but 'simulated: {data['simulated']}' disagrees; "
+            f"pass at most one selection: {source}"
+        )
+    if not has_use_sim:
+        data["use_sim"] = bool(data.get("simulated", False))
+    # The legacy boolean stays consistent with the effective selection so
+    # consumers reading ``profile['simulated']`` cannot disagree with it.
+    data["simulated"] = data["use_sim"]
+
+    sim_platform = str(data.get("sim_platform", "") or "").strip()
+    if not sim_platform:
+        sim_platform = "sdk"
+    if sim_platform not in SIM_PLATFORMS:
+        raise ProfileError(f"runtime profile 'sim_platform' must be one of {list(SIM_PLATFORMS)}: {source}")
+    if sim_platform not in sim_platforms:
+        raise ProfileError(
+            f"runtime profile sim_platform {sim_platform!r} is not in the supported platforms {sim_platforms}: {source}"
+        )
+    data["sim_platform"] = sim_platform
 
 
 def load_profile(path: str | Path) -> dict[str, Any]:
@@ -103,6 +171,34 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
     joints = data["joints"]
     if not isinstance(joints, list) or not joints or not all(str(j).strip() for j in joints):
         raise ProfileError(f"runtime profile 'joints' must be a non-empty list of names: {source}")
+
+    conformance = data.get("conformance")
+    if conformance is not None:
+        if not isinstance(conformance, dict):
+            raise ProfileError(f"runtime profile 'conformance' must be a mapping: {source}")
+        start_positions = conformance.get("start_positions")
+        if start_positions is not None:
+            if not isinstance(start_positions, dict) or not start_positions:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' must be a non-empty mapping of joint names to radians: {source}"
+                )
+            # The conformance reset drives the arm joints only (D9: a subset
+            # of arm joints), with the same arm_joints-or-joints rule the
+            # suite's harness uses — a gripper joint would be silently ignored.
+            arm_joints = data.get("arm_joints", joints)
+            non_arm = sorted(str(joint) for joint in start_positions if str(joint) not in {str(j) for j in arm_joints})
+            if non_arm:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' names non-arm joints {non_arm}: {source}"
+                )
+            for joint, value in start_positions.items():
+                # bool is an int subclass; true/false must not become 1.0/0.0 rad targets
+                if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+                    raise ProfileError(
+                        f"runtime profile 'conformance.start_positions.{joint}' must be a finite number: {source}"
+                    )
+
+    _validate_sim_selection(data, source)
 
     ros2_control = data.get("ros2_control") or {}
     for key, default in (

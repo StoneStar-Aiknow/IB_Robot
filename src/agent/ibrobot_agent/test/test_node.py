@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -26,7 +27,7 @@ from ibrobot_agent.contracts import (
     RegistryIdentity,
     RequestKey,
 )
-from ibrobot_agent.node import IncubationAgentNode, _RosEventSink, _RosExecutionAdapter
+from ibrobot_agent.node import IncubationAgentNode, _RosEventSink, _RosExecutionAdapter, planner_prompt_builder
 
 
 class FakeCatalog:
@@ -745,3 +746,156 @@ def test_node_binds_runtime_identity_and_answers_read_only(tmp_path):
         node.close()
         node.destroy_node()
         rclpy.shutdown(context=context)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"direct_commands": {"点头": "nod_yes"}}', {"点头": "nod_yes"}),
+        ("{}", {}),
+        ("not json", {}),
+        ('{"direct_commands": []}', {}),
+        ('{"direct_commands": {"": "nod_yes", "点头": ""}}', {}),
+        ('{"direct_commands": {"点头": "nod_yes", "挥手": 7}}', {"点头": "nod_yes"}),
+    ],
+)
+def test_direct_commands_from_config_never_blocks_startup(raw, expected):
+    """A malformed shortcut mapping costs a model call, not the robot."""
+    from ibrobot_agent.node import _direct_commands_from_config
+
+    assert _direct_commands_from_config(raw) == expected
+
+
+class _CountingBridge:
+    """Gateway stand-in that counts how often the snapshot is actually fetched."""
+
+    def __init__(self, view):
+        self.view = view
+        self.snapshot_calls = 0
+
+    def get_status(self, **_kwargs):
+        return {}
+
+    def get_skill_snapshot(self, **_kwargs):
+        self.snapshot_calls += 1
+        return {"fetched": self.snapshot_calls}
+
+
+def _catalog_with_fake_verification(monkeypatch, view):
+    """Build the bridge catalog with snapshot verification stubbed out."""
+    from ibrobot_agent import node as node_module
+
+    bridge = _CountingBridge(view)
+    catalog = node_module._RosBridgeCatalog(bridge, rpc_timeout_sec=5.0)
+    import robot_skill_cli.catalog as catalog_module
+
+    monkeypatch.setattr(catalog_module, "capability_view_from_snapshot", lambda _snapshot, _status: copy.deepcopy(view))
+    return catalog, bridge
+
+
+def _status(generation=1, *, authorized=True, mode="idle", digest="d1"):
+    return {
+        "registry_epoch": "e1",
+        "registry_generation": generation,
+        "registry_digest": digest,
+        "control_plane_ready": True,
+        "active_control_mode": mode,
+        "motion_authorized": authorized,
+    }
+
+
+def test_catalog_is_reused_while_the_registry_identity_is_unchanged(monkeypatch):
+    """Re-fetching an unchanged snapshot costs an RPC and three digests per turn."""
+    catalog, bridge = _catalog_with_fake_verification(
+        monkeypatch, {"robot_name": "so101", "skills": [{"name": "nod_yes"}]}
+    )
+
+    for _ in range(3):
+        view = catalog.get_catalog(_status())
+
+    assert bridge.snapshot_calls == 1
+    assert view["skills"] == [{"name": "nod_yes"}]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"generation": 2}, {"digest": "d2"}],
+)
+def test_a_changed_registry_identity_refetches(monkeypatch, changed):
+    """A new registry must never be served from the previous one's cache."""
+    catalog, bridge = _catalog_with_fake_verification(monkeypatch, {"robot_name": "so101", "skills": []})
+
+    catalog.get_catalog(_status())
+    catalog.get_catalog(_status(**changed))
+
+    assert bridge.snapshot_calls == 2
+
+
+def test_control_plane_state_is_never_served_from_the_cache(monkeypatch):
+    """Authorization and control mode change without the registry changing."""
+    catalog, bridge = _catalog_with_fake_verification(monkeypatch, {"robot_name": "so101", "skills": []})
+
+    first = catalog.get_catalog(_status(authorized=True, mode="idle"))
+    second = catalog.get_catalog(_status(authorized=False, mode="stream"))
+
+    assert bridge.snapshot_calls == 1
+    assert first["motion_authorized"] is True
+    assert second["motion_authorized"] is False
+    assert second["active_control_mode"] == "stream"
+
+
+def test_a_caller_mutating_the_view_cannot_poison_the_cache(monkeypatch):
+    """The planner view is handed out and edited downstream; isolate the cache."""
+    catalog, _bridge = _catalog_with_fake_verification(
+        monkeypatch, {"robot_name": "so101", "skills": [{"name": "nod_yes"}]}
+    )
+
+    first = catalog.get_catalog(_status())
+    first["skills"].clear()
+    second = catalog.get_catalog(_status())
+
+    assert second["skills"] == [{"name": "nod_yes"}]
+
+
+def test_a_failed_verification_is_not_cached(monkeypatch):
+    """A rejected snapshot must not become the view every later turn reuses."""
+    import robot_skill_cli.catalog as catalog_module
+    from ibrobot_agent import node as node_module
+
+    bridge = _CountingBridge({})
+    catalog = node_module._RosBridgeCatalog(bridge, rpc_timeout_sec=5.0)
+
+    def explode(_snapshot, _status):
+        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH")
+
+    monkeypatch.setattr(catalog_module, "capability_view_from_snapshot", explode)
+    with pytest.raises(ValueError):
+        catalog.get_catalog(_status())
+
+    monkeypatch.setattr(
+        catalog_module, "capability_view_from_snapshot", lambda _s, _st: {"robot_name": "so101", "skills": []}
+    )
+    catalog.get_catalog(_status())
+
+    assert bridge.snapshot_calls == 2
+
+
+def test_the_default_planner_prompt_builds_without_a_gateway_catalog():
+    """catalog_view defaults to the planner projection, and with the Gateway
+    offline the service hands the planner ``{}``. "你是谁" must still reach the
+    model instead of failing the request on the missing catalog."""
+    request = AgentRequest(
+        schema_version=1,
+        request_id="request-offline",
+        session_id="session-1",
+        channel_id="channel-1",
+        principal_id="principal-1",
+        robot_scope="so101_single_arm",
+        text="你是谁",
+        received_at=datetime.now(timezone.utc),
+    )
+
+    messages = planner_prompt_builder(request=request, context={"messages": []}, catalog={})
+
+    assert messages[-1]["role"] == "user"
+    assert "你是谁" in json.dumps(messages, ensure_ascii=False)

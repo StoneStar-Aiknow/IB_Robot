@@ -51,6 +51,8 @@ class CanonicalProgram:
     steps: tuple[CanonicalWorkflowStep, ...]
     task_budget_sec: float
     program_digest: str
+    #: The execution whose interrupted step this Program resumes; "" for a new task.
+    continues_from_execution_id: str = ""
 
     @property
     def execution_key(self) -> tuple[str, str, str]:
@@ -70,6 +72,7 @@ class CanonicalProgram:
             **self.identity.to_dict(),
             "workflow_steps": [step.to_dict() for step in self.steps],
             "task_budget_sec": self.task_budget_sec,
+            **_continuation(self.continues_from_execution_id),
             "program_digest": self.program_digest,
         }
 
@@ -85,6 +88,7 @@ def canonicalize_program(
     expected_registry_digest: Any,
     workflow_steps: Sequence[Any],
     task_budget_sec: Any,
+    continues_from_execution_id: Any = "",
 ) -> CanonicalProgram:
     """Validate and freeze all execution-semantic request fields."""
     if isinstance(schema_version, bool) or schema_version != PROGRAM_SCHEMA_VERSION:
@@ -103,6 +107,11 @@ def canonicalize_program(
     normalized_budget = float(task_budget_sec)
     if not math.isfinite(normalized_budget) or normalized_budget <= 0.0:
         raise ValueError("task_budget_sec must be a finite positive number")
+    if not isinstance(continues_from_execution_id, str):
+        raise ValueError("continues_from_execution_id must be a string")
+    continues_from = continues_from_execution_id.strip()
+    if continues_from:
+        continues_from = _bounded_id(continues_from, "continues_from_execution_id")
     preimage = {
         "schema_version": PROGRAM_SCHEMA_VERSION,
         "request_id": normalized_request_id,
@@ -111,6 +120,8 @@ def canonicalize_program(
         **identity.to_dict(),
         "workflow_steps": [step.to_dict() for step in steps],
         "task_budget_sec": normalized_budget,
+        # Absent rather than empty for a new task, so its digest is unchanged.
+        **_continuation(continues_from),
     }
     return CanonicalProgram(
         schema_version=PROGRAM_SCHEMA_VERSION,
@@ -121,7 +132,12 @@ def canonicalize_program(
         steps=steps,
         task_budget_sec=normalized_budget,
         program_digest=sha256_text(to_canonical_json(preimage)),
+        continues_from_execution_id=continues_from,
     )
+
+
+def _continuation(execution_id: str) -> dict[str, str]:
+    return {"continues_from_execution_id": execution_id} if execution_id else {}
 
 
 def _required_text(value: Any, field_name: str) -> str:

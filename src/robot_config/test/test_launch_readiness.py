@@ -4,6 +4,7 @@ import builtins
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,20 +25,12 @@ from robot_config.launch_builders.control import (
     validate_runtime_resources,
 )
 from robot_config.launch_builders.execution import (
-    _attention_viz_request,
     generate_action_dispatcher_node,
     generate_execution_nodes,
     generate_inference_node,
 )
-from robot_config.launch_builders.hand_sources import (
-    apply_hand_profile,
-    confirm_interactive_startup_p_pose,
-    generate_hand_source_nodes,
-)
-from robot_config.launch_builders.navigation import generate_navigation_nodes
 from robot_config.launch_builders.perception import generate_camera_nodes, generate_tf_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
-from robot_config.launch_builders.teleop import generate_teleop_nodes, validate_teleop_config
 from robot_config.loader import load_robot_config_dict
 from robot_config.wait_for_controllers import missing_inactive_controllers
 
@@ -57,17 +50,6 @@ def _joint_limits(names):
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
-
-
-def _block_voice_asr_service_import(monkeypatch):
-    real_import = builtins.__import__
-
-    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name.startswith("voice_asr_service"):
-            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", blocked_import)
 
 
 def _text(substitutions):
@@ -326,11 +308,36 @@ def test_group_spawner_is_the_controller_readiness_barrier():
 
 
 def test_controller_readiness_handler_is_registered_before_barrier_can_start():
-    source = _LAUNCH_PATH.read_text(encoding="utf-8")
-    block = source[source.index("if controller_dependent_actions:") : source.index("# ========== N. Tracing")]
+    from launch.actions import EmitEvent, LogInfo
+    from launch.events.process import ProcessExited
 
-    assert "actions.insert(" in block
-    assert "target_action=controller_ready_barrier" in block
+    from robot_config.launch_registry.orchestrator import _assemble_actions
+    from robot_config.launch_registry.registry import LaunchBuildContext, PlanOutputs, PlanSegment
+
+    barrier = ExecuteProcess(cmd=["never-executed"])
+    consumer = LogInfo(msg="deferred")
+    outputs = PlanOutputs(
+        actions=[barrier, consumer],
+        runtime_ready_actions=[consumer],
+        segments=[
+            PlanSegment("startup", "immediate", (barrier,)),
+            PlanSegment("consumer", "runtime_ready", (consumer,)),
+        ],
+    )
+    context = LaunchBuildContext(robot_config={}, controller_readiness_barrier=barrier)
+    actions = _assemble_actions(SimpleNamespace(arguments={}), context, outputs, enable_tracing=False)
+    assert isinstance(actions[0], RegisterEventHandler)
+    assert actions[1:] == [barrier]
+    for code in (0, 1):
+        event = ProcessExited(action=barrier, name="barrier", cmd=[], cwd=None, env=None, pid=1, returncode=code)
+        handler = actions[0].event_handler
+        assert handler.matches(event)
+        released = list(handler.handle(event, LaunchContext()))
+        if code == 0:
+            assert released == [consumer]
+        else:
+            assert len(released) == 1 and isinstance(released[0], EmitEvent)
+            assert isinstance(released[0].event, Shutdown)
 
 
 def _relay_targets(nodes):
@@ -483,36 +490,22 @@ def test_start_actions_handler_snapshots_action_list():
     assert returned_actions == ["first"]
 
 
-def test_robot_launch_loads_without_voice_asr_service_when_asr_disabled(monkeypatch):
-    _block_voice_asr_service_import(monkeypatch)
-    launch_spec = importlib.util.spec_from_file_location("robot_launch_without_voice_asr", _LAUNCH_PATH)
-    assert launch_spec is not None
-    assert launch_spec.loader is not None
-    launch_module = importlib.util.module_from_spec(launch_spec)
+def test_robot_launch_description_generation_works_without_extensions(monkeypatch):
+    """An environment without the optional business packages must still
+    generate a launch description: the registry degrades to builtin-only and
+    the migrated business entries (voice_asr among them, now an
+    ibrobot.launch_builders extension) simply do not participate. The
+    pre-migration companion blocked the voice_asr_service import; the
+    migration turned that scenario into "extension package not installed",
+    simulated here hermetically through the registry's injection seam."""
+    original_build = robot_launch.build_launch_registry
 
-    launch_spec.loader.exec_module(launch_module)
+    def builtin_only_registry():
+        return original_build(entry_points=[])
 
-    assert launch_module.generate_launch_description() is not None
+    monkeypatch.setattr(robot_launch, "build_launch_registry", builtin_only_registry)
 
-
-def test_voice_asr_builder_skips_missing_package_when_disabled(monkeypatch):
-    _block_voice_asr_service_import(monkeypatch)
-    from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
-
-    nodes = generate_voice_asr_nodes({"voice_asr": {"enabled": False}})
-
-    assert nodes == []
-
-
-def test_voice_asr_builder_reports_missing_package_when_enabled(monkeypatch):
-    _block_voice_asr_service_import(monkeypatch)
-    from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
-
-    with pytest.raises(
-        ModuleNotFoundError,
-        match="voice_asr.enabled=true requires the voice_asr_service package to be installed",
-    ):
-        generate_voice_asr_nodes({"voice_asr": {"enabled": True}})
+    assert robot_launch.generate_launch_description() is not None
 
 
 def test_controller_startup_timeout_comes_from_yaml_mapping():
@@ -537,19 +530,19 @@ def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
 
 
 def test_shared_loader_preserves_source_path_metadata():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_arm_aero_hand.yaml"
     robot_config = load_robot_config_dict(config_path)
 
-    assert robot_config["name"] == "so101_single_arm"
+    assert robot_config["name"] == "so101_arm_aero_hand"
     assert robot_config["_config_path"] == str(config_path.resolve())
     assert robot_config["_config_sources"] == [str(config_path.resolve())]
 
 
 def test_launch_loader_uses_shared_dict_loader():
-    robot_config = robot_launch.load_robot_config("so101_single_arm_legacy")
+    robot_config = robot_launch.load_robot_config("so101_arm_aero_hand")
 
-    assert robot_config["name"] == "so101_single_arm"
-    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm_legacy.yaml")
+    assert robot_config["name"] == "so101_arm_aero_hand"
+    assert robot_config["_config_path"].endswith("config/robots/so101_arm_aero_hand.yaml")
 
 
 def test_default_trace_session_auto_suffixes_on_collision(monkeypatch, tmp_path):
@@ -757,22 +750,6 @@ def test_tracing_keeps_startup_error_when_cleanup_raises(monkeypatch, tmp_path, 
     assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
 
 
-def test_generate_navigation_nodes_for_lekiwi_mode():
-    ekf_config = str(Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml")
-    nodes = generate_navigation_nodes(
-        {
-            "navigation": {
-                "enabled": True,
-                "default_mode": "full",
-                "modes": {"full": {"config": ekf_config}},
-            }
-        }
-    )
-
-    assert len(nodes) == 1
-    assert isinstance(nodes[0], Node)
-
-
 def test_lekiwi_sim_uses_sim_controller_override():
     config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi.yaml"
     robot_config = load_robot_config_dict(config_path)
@@ -786,24 +763,42 @@ def test_lekiwi_sim_uses_sim_controller_override():
     assert controller_names == ["joint_state_broadcaster", "base_controller"]
 
 
-def test_generate_navigation_nodes_honors_force_enable_override():
-    ekf_config = str(Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml")
-    nodes = generate_navigation_nodes(
-        {
-            "navigation": {
-                "enabled": False,
-                "default_mode": "full",
-                "modes": {"full": {"config": ekf_config}},
-            }
-        },
-        force_enable=True,
+def test_launch_setup_enables_navigation_when_requested(monkeypatch):
+    """The with_navigation switch still reaches the navigation entry's
+    participation after the entry moved to robot_navigation: a synthetic
+    navigation entry injected through the registry's seam (hermetic — no
+    ambient extensions) participates for with_navigation:=true and its
+    action reaches the assembled launch. The real node generation is
+    covered by robot_navigation's suite."""
+    from importlib.metadata import EntryPoint
+    from types import ModuleType
+
+    from robot_config.launch_registry.registry import BuilderSpec, BuildResult
+
+    module = ModuleType("launch_readiness_synthetic_navigation")
+    module.build_navigation = lambda _context: BuildResult(
+        actions=[Node(package="robot_localization", executable="ekf_node", name="ekf_node")]
     )
+    module.NAVIGATION_BUILDER = BuilderSpec(
+        id="navigation",
+        factory="launch_readiness_synthetic_navigation:build_navigation",
+        arguments=(),
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    original_build = robot_launch.build_launch_registry
 
-    assert len(nodes) == 1
-    assert isinstance(nodes[0], Node)
+    def build_with_synthetic_navigation():
+        return original_build(
+            entry_points=[
+                EntryPoint(
+                    name="navigation",
+                    value="launch_readiness_synthetic_navigation:NAVIGATION_BUILDER",
+                    group="ibrobot.launch_builders",
+                )
+            ]
+        )
 
-
-def test_launch_setup_enables_navigation_when_requested():
+    monkeypatch.setattr(robot_launch, "build_launch_registry", build_with_synthetic_navigation)
     context = LaunchContext()
     context.launch_configurations["robot_config"] = "lekiwi"
     context.launch_configurations["use_sim"] = "false"
@@ -820,32 +815,248 @@ def test_launch_setup_enables_navigation_when_requested():
     assert len(nav_nodes) == 1
 
 
-def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
-    # The migrated provider config binds logical interfaces against the live
-    # runtime at launch time; offline structural loads defer that binding.
-    robot_config = load_robot_config_dict(src_config_path, defer_interface_binding=True)
-    robot_config.pop("_config_path", None)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
-    config_path = tmp_path / "scheduled_sim.yaml"
-    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
-    context = LaunchContext()
-    context.launch_configurations.update(
-        config_path=str(config_path),
-        use_sim="true",
-        # The migrated provider config supports the SDK simulated transport;
-        # the scheduler/simulation rejection below must fire before any nodes.
-        sim_platform="sdk",
-        control_mode="model_inference",
-        with_inference="true",
+def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
+    """Task 6.2: adding ONE registration (a minimal module + a single
+    BuilderSpec with its own CLI argument, prepare hook, enable switch and
+    a runtime-ready action) must extend the REAL production entry end to
+    end — the new CLI argument is enumerated by generate_launch_description,
+    the hook runs inside the real preparation pipeline under its own config
+    key, the enable switch controls participation, and the runtime-ready
+    action is gated behind the REAL controller-readiness barrier (invisible
+    in the immediate stream until the barrier exits; success releases it,
+    failure shuts down without release) — with NO extra modification to the
+    main launch file or the facade (design decision 4 / spec 6.2)."""
+    import sys
+    from types import ModuleType
+
+    from launch.actions import EmitEvent, LogInfo
+    from launch.event_handlers import OnProcessExit
+    from launch.events.process import ProcessExited
+
+    from robot_config.launch_registry import builtin_registry as builtin_registry_module
+    from robot_config.launch_registry.launch_options import ArgumentSpec
+    from robot_config.launch_registry.registry import BuilderSpec, BuildResult, HookSpec
+
+    factory_calls = []
+    built_actions = []
+
+    def extension_hook(config, arguments):
+        config["extension_probe"] = {"executed": True, "mode": arguments["extension_mode"]}
+
+    def extension_build(context):
+        # The hook's write under its own config key must be visible to the
+        # factory through the real preparation -> plan data flow.
+        factory_calls.append(
+            (context.arguments["extension_mode"], dict(context.robot_config.get("extension_probe", {})))
+        )
+        action = LogInfo(msg="extension runtime-ready action")
+        built_actions.append(action)
+        return BuildResult(actions=[action])
+
+    # One registration: the extension spec (CLI argument + prepare hook
+    # with its own config key + enable switch + runtime-ready action) joins
+    # the builtin table through the same build_launch_registry seam the
+    # production entry uses (migrated from build_builtin_registry when the
+    # entry switched to entry-point composition).
+    original_build = builtin_registry_module.build_launch_registry
+
+    def build_with_extension():
+        registry = original_build(entry_points=[])
+        registry.add(
+            BuilderSpec(
+                id="extension_probe",
+                factory="test_launch_readiness_extension_probe:extension_build",
+                timing="runtime_ready",
+                enabled=lambda context: context.arguments.get("extension_mode") == "true",
+                arguments=(
+                    ArgumentSpec(
+                        name="extension_mode",
+                        declared_default="false",
+                        absent_fallback="false",
+                        description="Extension probe switch",
+                    ),
+                ),
+                hooks=(
+                    HookSpec(
+                        phase="config_overrides",
+                        factory="test_launch_readiness_extension_probe:extension_hook",
+                        config_keys=("extension_probe",),
+                    ),
+                ),
+            )
+        )
+        return registry
+
+    monkeypatch.setattr(robot_launch, "build_launch_registry", build_with_extension)
+
+    probe_module = ModuleType("test_launch_readiness_extension_probe")
+    probe_module.extension_build = extension_build
+    probe_module.extension_hook = extension_hook
+    monkeypatch.setitem(sys.modules, probe_module.__name__, probe_module)
+
+    # 1. Declaration stage: the contributed CLI argument is enumerated by
+    # the real generate_launch_description without touching the entry file.
+    description = robot_launch.generate_launch_description()
+    declared_names = {getattr(entity, "name", None) for entity in description.entities}
+    assert "extension_mode" in declared_names  # the new argument IS declared
+    assert "robot_config" in declared_names  # core table still declared
+
+    def _launch(extension_mode):
+        context = LaunchContext()
+        context.launch_configurations["robot_config"] = "lekiwi"
+        context.launch_configurations["use_sim"] = "false"
+        # auto_start_controllers=true arms the REAL controller readiness
+        # barrier (the controller group spawner) of this hardware launch.
+        context.launch_configurations["auto_start_controllers"] = "true"
+        context.launch_configurations["control_mode"] = "teleop"
+        context.launch_configurations["extension_mode"] = extension_mode
+        return robot_launch.launch_setup(context)
+
+    # 2. Enabled branch: the hook ran inside the real preparation pipeline
+    # (its own config key is visible to the factory), the factory ran once
+    # with the CLI value, and the runtime-ready action is deferred behind
+    # the real barrier — invisible in the immediate stream.
+    actions = _launch("true")
+    assert factory_calls == [("true", {"executed": True, "mode": "true"})]
+    extension_action = built_actions[0]
+    assert extension_action not in actions  # gated: invisible before the barrier exits
+
+    barrier = next(
+        action
+        for action in actions
+        if isinstance(action, Node) and action.node_executable in {"controller_spawner", "wait_for_controllers"}
     )
+    assert isinstance(barrier, ExecuteProcess)  # the real readiness barrier process
+    exit_handlers = [
+        action.event_handler
+        for action in actions
+        if isinstance(action, RegisterEventHandler) and isinstance(action.event_handler, OnProcessExit)
+    ]
+    assert exit_handlers  # the success-gated consumer handler is registered before the barrier
 
-    def unexpected_control_generation(*args, **kwargs):
-        pytest.fail("control generation must not run for unsupported scheduled simulation")
+    event_context = LaunchContext()
+    for returncode in (0, 1):
+        event = ProcessExited(action=barrier, name="barrier", cmd=[], cwd=None, env=None, pid=1, returncode=returncode)
+        handler = next(handler for handler in exit_handlers if handler.matches(event))
+        released = list(handler.handle(event, event_context))
+        if returncode == 0:
+            # Success releases the deferred set: the extension action rides
+            # the same readiness gating as the builtin runtime-ready entries.
+            assert extension_action in released
+            assert any(isinstance(action, Node) for action in released)
+        else:
+            # Failure shuts down without releasing the deferred set.
+            assert len(released) == 1 and isinstance(released[0], EmitEvent)
+            assert isinstance(released[0].event, Shutdown)
+            assert extension_action not in released
 
-    monkeypatch.setattr(robot_launch, "generate_ros2_control_nodes", unexpected_control_generation)
-    with pytest.raises(ValueError, match="simulation does not support"):
-        robot_launch.launch_setup(context)
+    # 3. Disabled branch: the same registration with the switch off never
+    # resolves the factory (zero calls, zero actions created).
+    disabled_actions = _launch("false")
+    assert len(factory_calls) == 1
+    assert len(built_actions) == 1
+    assert extension_action not in disabled_actions
+
+
+@pytest.mark.parametrize(
+    ("target", "execution_mode", "transport_mode"),
+    [
+        (None, "monolithic", "dds"),  # simulation selected by CLI use_sim alone
+        ("simulation", "monolithic", "dds"),
+        ("benchmark", "monolithic", "dds"),
+        ("benchmark", "distributed", "dds"),
+        ("benchmark", "distributed", "rtp"),
+    ],
+)
+def test_virtual_target_launch_keeps_robot_scheduler_dormant(
+    tmp_path, monkeypatch, target, execution_mode, transport_mode
+):
+    from copy import deepcopy
+
+    from robot_config.launch_builders.benchmark import BENCHMARK_BUILDER
+    from robot_config.launch_builders.execution import EXECUTION_BUILDER
+    from robot_config.launch_registry.registry import LaunchBuilderRegistry
+
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {"policy": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": execution_mode}},
+        selection="policy",
+    )
+    config["runtime"] = {"target": "hardware"}
+    if target is None:
+        config.pop("runtime")
+    config["default_control_mode"] = "model_inference"
+    config["runtime_scheduler"] = {"enable": True}  # dormant tuning needs no scheduled endpoints
+    config["contract"] = {
+        "observations": [
+            {
+                "key": "observation.images.image",
+                "topic": "/camera/image",
+                "type": "sensor_msgs/msg/Image",
+                "image": {"encoding": "rgb8", "resize": [32, 32]},
+            }
+        ],
+        "actions": [],
+    }
+    if target == "benchmark":
+        config["benchmark"] = {
+            "type": "libero",
+            "adapter": "libero",
+            "evaluation": {
+                "enabled": True,
+                "suite": "libero_spatial",
+                "observation_transport": {"mode": transport_mode},
+                "output": {"root": str(tmp_path / "output")},
+            },
+        }
+        mode = config["control_modes"]["model_inference"]
+        mode["executor"]["type"] = "benchmark"
+        mode["dispatch"] = {"scheduler": "wait_for_feedback"}
+    original = deepcopy(config)
+    registry = LaunchBuilderRegistry()
+    registry.add(BENCHMARK_BUILDER)
+    registry.add(EXECUTION_BUILDER)
+    # Isolate registration and local DDS admission; the production preparation,
+    # orchestrator, benchmark and execution builders all run without stubs.
+    monkeypatch.setattr(robot_launch, "build_launch_registry", lambda: registry)
+    monkeypatch.setattr(robot_launch, "check_launch_dds", lambda context: None)
+    monkeypatch.delenv("WORKSPACE", raising=False)  # materialize run YAML inside tmp_path
+    context = LaunchContext()
+    context.launch_configurations.update(config_path=str(tmp_path / "robot.yaml"), with_inference="true")
+    if target is not None:
+        context.launch_configurations.update(runtime_target=target, sim_platform="mock")
+    else:
+        context.launch_configurations.update(use_sim="true")
+
+    actions = robot_launch.launch_setup(context, loaded_config=config)
+    nodes = {node.node_executable: node for node in actions if isinstance(node, Node)}
+    expected = {"pipeline_policy_node", "action_dispatcher_node"}
+    if target == "benchmark":
+        expected.update({"benchmark_environment_node", "benchmark_evaluator_node"})
+    if execution_mode == "distributed":
+        expected.add("pure_inference_node")
+    assert set(nodes) == expected
+    policy = _node_parameters(nodes["pipeline_policy_node"])
+    assert "runtime_policy_json" not in policy
+    assert config == original
+    if target == "benchmark":
+        evaluator = _node_parameters(nodes["benchmark_evaluator_node"])
+        assert evaluator["inference_health_topic"] == policy["health_topic"] == "/inference/policy/health"
+        assert evaluator["prepare_policy_episode_service"] == "/action_dispatcher/prepare_episode"
+        assert evaluator["run_policy_action_server"] == "/action_dispatcher/run_policy"
+        run_config = yaml.safe_load(Path(evaluator["robot_config_path"]).read_text())["robot"]
+        assert run_config["runtime"] == config["runtime"]
+        assert "use_sim" not in run_config
+        assert run_config["runtime_scheduler"]["enable"] is True
+        assert policy["robot_config_path"] == evaluator["robot_config_path"]
+        environment = _node_parameters(nodes["benchmark_environment_node"])
+        assert environment["frame_ingress_enabled"] is (transport_mode == "rtp")
+        if transport_mode == "rtp":
+            ingress = json.loads(environment["frame_ingress_contract_json"])
+            assert ingress["pipeline_id"] == "policy"
+            assert ingress["heartbeat_topic"] == policy["heartbeat_topic"]
+            assert len(ingress["streams"]) == 1
 
 
 @pytest.mark.parametrize("enable_tracing", [False, True])
@@ -857,7 +1068,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
     monkeypatch.setattr(tracing_builder, "_resolve_trace_session", lambda name, _root: (name, tmp_path / name))
     monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda _command, _reason: None)
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_arm_aero_hand.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
     bundle = _create_inference_bundle(tmp_path / "model")
@@ -867,7 +1078,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
 
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "so101_single_arm_legacy"
+    context.launch_configurations["robot_config"] = "so101_arm_aero_hand"
     context.launch_configurations["config_path"] = str(config_path)
     context.launch_configurations["use_sim"] = "true"
     context.launch_configurations["sim_platform"] = "mock"
@@ -1104,103 +1315,6 @@ def test_launch_generation_rejects_pipeline_endpoint_conflicts(tmp_path):
         generate_inference_node(robot_config, "model_inference")
 
 
-def test_attention_viz_request_uses_robot_config_only():
-    enabled, mode, _viz_config = _attention_viz_request({"attention_viz": {"enabled": False, "mode": "file"}})
-
-    assert enabled is False
-    assert mode == "file"
-
-
-def test_generate_teleop_nodes_injects_target_joint_names_into_device_config():
-    nodes = generate_teleop_nodes(
-        {
-            "joints": {
-                "arm": ["1", "2", "3", "4", "5"],
-                "gripper": ["6"],
-            },
-            "teleoperation": {
-                "enabled": True,
-                "active_device": "left_leader",
-                "devices": [
-                    {
-                        "name": "left_leader",
-                        "type": "leader_arm",
-                        "port": "/dev/ttyACM0",
-                        "target": {
-                            "arm_joint_names": ["joint1_left", "joint2_left"],
-                            "gripper_joint_names": ["joint6_left"],
-                        },
-                    }
-                ],
-                "safety": {
-                    "joint_limits": {
-                        "joint1_left": {"min": -1.0, "max": 1.0},
-                        "joint2_left": {"min": -1.0, "max": 1.0},
-                        "joint6_left": {"min": 0.0, "max": 1.0},
-                    }
-                },
-            },
-        }
-    )
-
-    params = _node_parameters(nodes[0])
-    device_config = json.loads(params["device_config"].strip("'"))
-
-    assert device_config["arm_joint_names"] == ["joint1_left", "joint2_left"]
-    assert device_config["gripper_joint_names"] == ["joint6_left"]
-
-    publish_groups = json.loads(params["publish_groups"].strip("'"))
-    assert publish_groups == [
-        {
-            "name": "arm",
-            "joint_names": ["joint1_left", "joint2_left"],
-            "topic": "/arm_position_controller/commands",
-        },
-        {
-            "name": "gripper",
-            "joint_names": ["joint6_left"],
-            "topic": "/gripper_position_controller/commands",
-        },
-    ]
-
-
-def test_dual_arm_legacy_targets_keep_topics_and_joint_order(tmp_path):
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_dual_arm.yaml"
-    robot_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
-    calibration = tmp_path / "leader.json"
-    calibration.write_text("{}\n", encoding="utf-8")
-    for device in robot_config["teleoperation"]["devices"]:
-        device["calib_file"] = str(calibration)
-
-    nodes = generate_teleop_nodes(robot_config)
-
-    assert len(nodes) == 2
-    expected = [
-        (
-            ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left"],
-            ["joint6_left"],
-            "/arm_position_controller_left/commands",
-            "/gripper_position_controller_left/commands",
-        ),
-        (
-            ["joint1_right", "joint2_right", "joint3_right", "joint4_right", "joint5_right"],
-            ["joint6_right"],
-            "/arm_position_controller_right/commands",
-            "/gripper_position_controller_right/commands",
-        ),
-    ]
-    for node, (arm_joints, gripper_joints, arm_topic, gripper_topic) in zip(nodes, expected, strict=True):
-        params = _node_parameters(node)
-        assert params["arm_joint_names"] == arm_joints
-        assert params["gripper_joint_names"] == gripper_joints
-        assert params["arm_command_topic"] == arm_topic
-        assert params["gripper_command_topic"] == gripper_topic
-        assert json.loads(params["publish_groups"].strip("'")) == [
-            {"name": "arm", "joint_names": arm_joints, "topic": arm_topic},
-            {"name": "gripper", "joint_names": gripper_joints, "topic": gripper_topic},
-        ]
-
-
 def test_generate_auxiliary_aero_hand_node_uses_configured_topics_and_rates():
     joint_names = [f"hand_{index}" for index in range(7)]
     nodes = generate_auxiliary_actuator_nodes(
@@ -1375,9 +1489,10 @@ def test_runtime_resources_allow_one_shared_mhandpro_and_disjoint_serial_ports()
     )
 
 
-def test_simulation_skips_real_external_hand_components(monkeypatch):
+def test_simulation_skips_real_auxiliary_actuators(monkeypatch):
+    """The auxiliary_actuators half of the former mixed sim-skip test (the
+    hand_sources half moved to robot_teleop with its entry)."""
     monkeypatch.delenv("AERO_HAND_RIGHT_PORT", raising=False)
-    monkeypatch.delenv("MHANDPRO_SDK_LIB", raising=False)
     config = {
         "auxiliary_actuators": {
             "hand": {
@@ -1389,21 +1504,13 @@ def test_simulation_skips_real_external_hand_components(monkeypatch):
                 "joint_state_topic": "/hand/joint_states",
             }
         },
-        "hand_sources": {
-            "mhandpro": {
-                "type": "mhandpro",
-                "mock": False,
-                "lib_path": "$(env MHANDPRO_SDK_LIB)",
-            }
-        },
     }
 
     validate_runtime_resources(config, use_sim=True, control_mode="teleop")
     assert generate_auxiliary_actuator_nodes(config, use_sim=True, control_mode="teleop") == []
-    assert generate_hand_source_nodes(config, use_sim=True, control_mode="teleop") == []
 
 
-def test_external_hand_components_respect_active_control_modes():
+def test_auxiliary_actuators_respect_active_control_modes():
     config = {
         "auxiliary_actuators": {
             "hand": {
@@ -1415,19 +1522,10 @@ def test_external_hand_components_respect_active_control_modes():
                 "joint_state_topic": "/hand/joint_states",
             }
         },
-        "hand_sources": {
-            "mhandpro": {
-                "type": "mhandpro",
-                "mock": True,
-                "active_control_modes": ["teleop"],
-            }
-        },
     }
 
     assert generate_auxiliary_actuator_nodes(config, control_mode="model_inference") == []
-    assert generate_hand_source_nodes(config, control_mode="model_inference") == []
     assert len(generate_auxiliary_actuator_nodes(config, use_sim=True, control_mode="teleop")) == 1
-    assert len(generate_hand_source_nodes(config, use_sim=True, control_mode="teleop")) == 1
 
 
 def test_generate_generic_three_channel_auxiliary_actuator():
@@ -1472,599 +1570,3 @@ def test_required_auxiliary_process_exits_shutdown_launch():
     )
 
     assert nodes[0]._ExecuteLocal__on_exit is not None
-
-
-def test_required_teleop_process_exits_shutdown_launch():
-    nodes = generate_teleop_nodes(
-        {
-            "teleoperation": {
-                "enabled": True,
-                "active_device": "leader",
-                "devices": [
-                    {
-                        "name": "leader",
-                        "type": "leader_arm",
-                        "port": "/dev/leader",
-                        "target": {"arm_joint_names": ["1"], "gripper_joint_names": ["6"]},
-                    }
-                ],
-            },
-            "joints": {"arm": ["1"], "gripper": ["6"]},
-            "safety": {"joint_limits": _joint_limits(["1", "6"])},
-        },
-        {},
-    )
-
-    assert nodes[0]._ExecuteLocal__on_exit is not None
-
-
-def test_generate_mock_mhandpro_source_for_both_sides():
-    nodes = generate_hand_source_nodes(
-        {
-            "hand_sources": {
-                "mhandpro": {
-                    "type": "mhandpro",
-                    "mock": True,
-                    "sides": ["left", "right"],
-                    "topic_prefix": "/hands/mhandpro",
-                }
-            }
-        }
-    )
-
-    assert len(nodes) == 1
-    assert nodes[0].node_package == "robot_teleop"
-    assert nodes[0].node_executable == "mhandpro_source_node"
-    params = _node_parameters(nodes[0])
-    assert params["sides"] == ["left", "right"]
-    assert params["topic_prefix"] == "/hands/mhandpro"
-    assert params["mock"] is True
-    assert params["publish_raw_frame"] is False
-    assert params["calibrate_p_pose_on_startup"] is False
-    assert params["failure_policy"] == "require_all"
-    assert params["auto_reconnect"] is True
-    assert params["reconnect_initial_delay"] == 1.0
-    assert params["reconnect_max_delay"] == 10.0
-    assert params["reconnect_max_attempts"] == 0
-    assert nodes[0]._ExecuteLocal__on_exit is None
-
-
-def test_real_mhandpro_source_exits_shutdown_launch(tmp_path):
-    library = tmp_path / "libVDMocapSDK_mHandPro.so"
-    library.touch()
-    nodes = generate_hand_source_nodes(
-        {
-            "hand_sources": {
-                "mhandpro": {
-                    "type": "mhandpro",
-                    "mock": False,
-                    "lib_path": str(library),
-                }
-            }
-        }
-    )
-
-    assert nodes[0]._ExecuteLocal__on_exit is not None
-
-
-def test_mhandpro_raw_frame_publication_requires_explicit_opt_in():
-    nodes = generate_hand_source_nodes(
-        {
-            "hand_sources": {
-                "mhandpro": {
-                    "type": "mhandpro",
-                    "mock": True,
-                    "publish_raw_frame": True,
-                }
-            }
-        }
-    )
-
-    assert _node_parameters(nodes[0])["publish_raw_frame"] is True
-
-
-def test_interactive_startup_p_pose_prompts_and_enables_in_process_calibration(monkeypatch, tmp_path):
-    library = tmp_path / "libVDMocapSDK_mHandPro.so"
-    library.touch()
-    config = {
-        "hand_sources": {
-            "mhandpro": {
-                "type": "mhandpro",
-                "mock": False,
-                "lib_path": str(library),
-                "sides": ["right"],
-                "require_p_pose": True,
-                "startup_p_pose": "interactive",
-            }
-        }
-    }
-    prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt))
-
-    confirm_interactive_startup_p_pose(config, use_sim=False, control_mode="teleop")
-    nodes = generate_hand_source_nodes(config, use_sim=False, control_mode="teleop")
-
-    assert len(prompts) == 1
-    assert "P-pose" in prompts[0]
-    assert _node_parameters(nodes[0])["calibrate_p_pose_on_startup"] is True
-
-
-def test_interactive_startup_p_pose_requires_foreground_terminal(monkeypatch, tmp_path):
-    library = tmp_path / "libVDMocapSDK_mHandPro.so"
-    library.touch()
-    config = {
-        "hand_sources": {
-            "mhandpro": {
-                "type": "mhandpro",
-                "mock": False,
-                "lib_path": str(library),
-                "startup_p_pose": "interactive",
-            }
-        }
-    }
-    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(EOFError))
-
-    with pytest.raises(RuntimeError, match="requires a terminal"):
-        confirm_interactive_startup_p_pose(config, use_sim=False, control_mode="teleop")
-
-
-def test_unknown_startup_p_pose_mode_is_rejected():
-    with pytest.raises(ValueError, match="startup_p_pose"):
-        generate_hand_source_nodes(
-            {
-                "hand_sources": {
-                    "mhandpro": {
-                        "type": "mhandpro",
-                        "mock": True,
-                        "startup_p_pose": "automatic",
-                    }
-                }
-            }
-        )
-
-
-@pytest.mark.parametrize(
-    ("profile", "sides", "actuator_count", "device_count"),
-    [
-        ("right", ["right"], 1, 1),
-        ("left", ["left"], 1, 1),
-        ("dual", ["left", "right"], 2, 2),
-    ],
-)
-def test_hand_profile_selects_sides_actuators_and_devices(profile, sides, actuator_count, device_count):
-    config = {
-        "joints": {"hand": []},
-        "hand_profiles": {
-            "default_profile": "right",
-            "profiles": {
-                "right": {
-                    "sides": ["right"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aero_hand_right"],
-                    "active_devices": ["aero_glove_right"],
-                },
-                "left": {
-                    "sides": ["left"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aero_hand_left"],
-                    "active_devices": ["aero_glove_left"],
-                },
-                "dual": {
-                    "sides": ["left", "right"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aero_hand_left", "aero_hand_right"],
-                    "active_devices": ["aero_glove_left", "aero_glove_right"],
-                },
-            },
-        },
-        "hand_sources": {"mhandpro": {"type": "mhandpro", "mock": True}},
-        "auxiliary_actuators": {
-            "aero_hand_left": {
-                "profile_managed": True,
-                "enabled": False,
-                "joint_names": [f"left_{index}" for index in range(7)],
-            },
-            "aero_hand_right": {
-                "profile_managed": True,
-                "enabled": False,
-                "joint_names": [f"right_{index}" for index in range(7)],
-            },
-        },
-        "teleoperation": {
-            "devices": [{"name": "aero_glove_left"}, {"name": "aero_glove_right"}],
-        },
-    }
-
-    assert apply_hand_profile(config, profile) == profile
-    assert config["hand_sources"]["mhandpro"]["sides"] == sides
-    assert sum(item["enabled"] for item in config["auxiliary_actuators"].values()) == actuator_count
-    assert len(config["teleoperation"]["active_devices"]) == device_count
-    assert len(config["joints"]["hand"]) == actuator_count * 7
-
-
-def test_hand_profile_defaults_to_robot_yaml_selection():
-    config = {
-        "joints": {"hand": []},
-        "hand_profiles": {
-            "default_profile": "right",
-            "profiles": {
-                "right": {
-                    "sides": ["right"],
-                    "hand_source": "mhandpro",
-                    "active_actuators": ["aero_hand_right"],
-                    "active_devices": ["aero_glove_right"],
-                }
-            },
-        },
-        "hand_sources": {"mhandpro": {}},
-        "auxiliary_actuators": {
-            "aero_hand_right": {
-                "profile_managed": True,
-                "enabled": False,
-                "joint_names": [f"right_{index}" for index in range(7)],
-            }
-        },
-        "teleoperation": {"devices": [{"name": "aero_glove_right"}]},
-    }
-
-    assert apply_hand_profile(config) == "right"
-    assert config["teleoperation"]["active_devices"] == ["aero_glove_right"]
-
-
-def test_unknown_hand_profile_is_rejected():
-    config = {"hand_profiles": {"default_profile": "right", "profiles": {"right": {}}}}
-
-    with pytest.raises(ValueError, match="unknown hand_profile"):
-        apply_hand_profile(config, "triple")
-
-
-def test_mhandpro_source_rejects_unknown_dual_hand_failure_policy():
-    with pytest.raises(ValueError, match="failure_policy"):
-        generate_hand_source_nodes(
-            {
-                "hand_sources": {
-                    "mhandpro": {
-                        "type": "mhandpro",
-                        "mock": True,
-                        "sides": ["left", "right"],
-                        "failure_policy": "ignore_missing",
-                    }
-                }
-            }
-        )
-
-
-def test_real_mhandpro_source_resolves_external_library(tmp_path, monkeypatch):
-    library = tmp_path / "libVDMocapSDK_mHandPro.so"
-    library.touch()
-    monkeypatch.setenv("MHANDPRO_SDK_LIB", str(library))
-
-    nodes = generate_hand_source_nodes(
-        {
-            "hand_sources": {
-                "mhandpro": {
-                    "type": "mhandpro",
-                    "mock": False,
-                    "lib_path": "$(env MHANDPRO_SDK_LIB)",
-                }
-            }
-        }
-    )
-
-    assert _node_parameters(nodes[0])["lib_path"] == str(library)
-
-
-def test_real_mhandpro_source_requires_external_library_when_environment_is_unset(monkeypatch):
-    monkeypatch.delenv("MHANDPRO_SDK_LIB", raising=False)
-
-    with pytest.raises(RuntimeError, match="external vendor library"):
-        generate_hand_source_nodes(
-            {
-                "hand_sources": {
-                    "mhandpro": {
-                        "type": "mhandpro",
-                        "mock": False,
-                        "lib_path": "$(env MHANDPRO_SDK_LIB)",
-                    }
-                }
-            }
-        )
-
-
-def test_hand_retarget_resolves_output_contract_from_auxiliary_actuator():
-    joints = ["thumb", "index", "middle"]
-    nodes = generate_teleop_nodes(
-        {
-            "joints": {"arm": ["1"], "gripper": ["6"]},
-            "auxiliary_actuators": {
-                "amazing_hand_right": {
-                    "type": "amazing_hand",
-                    "mock": True,
-                    "driver": {"package": "amazing_hand_hardware", "executable": "amazing_hand_node"},
-                    "joint_names": joints,
-                    "command_topic": "/amazing_hand_right/commands",
-                    "joint_state_topic": "/amazing_hand_right/joint_states",
-                }
-            },
-            "teleoperation": {
-                "enabled": True,
-                "active_device": "amazing_retarget",
-                "safety": {"joint_limits": _joint_limits(joints)},
-                "devices": [
-                    {
-                        "name": "amazing_retarget",
-                        "type": "hand_retarget",
-                        "side": "right",
-                        "source_topic": "/hand_sources/mhandpro/right/state",
-                        "retargeter": {
-                            "type": "synergy_matrix",
-                            "input_features": ["index_mcp_flex"],
-                            "matrix": [[1.0], [1.0], [1.0]],
-                        },
-                        "target": {"actuator": "amazing_hand_right"},
-                    }
-                ],
-            },
-        }
-    )
-
-    params = _node_parameters(nodes[0])
-    assert json.loads(params["publish_groups"].strip("'")) == [
-        {"name": "hand", "joint_names": joints, "topic": "/amazing_hand_right/commands"}
-    ]
-    device_config = json.loads(params["device_config"].strip("'"))
-    assert device_config["joint_names"] == joints
-
-
-def test_phone_placo_uses_explicit_arm_group_topic():
-    nodes = generate_teleop_nodes(
-        {
-            "joints": {"arm": ["1", "2"], "gripper": ["6"]},
-            "moveit": {
-                "base_link": "base",
-                "ee_link": "gripper",
-                "so101_placo_servo_config_path": "$(find so101_motion)/config/so101_placo_servo.yaml",
-            },
-            "ros2_control": {"reset_positions": {"1": 0.0, "2": 0.0}},
-            "teleoperation": {
-                "enabled": True,
-                "active_device": "phone",
-                "cartesian": {"solver": "placo_servo"},
-                "safety": {"joint_limits": _joint_limits(["1", "2", "6"])},
-                "devices": [
-                    {
-                        "name": "phone",
-                        "type": "phone",
-                        "phone_config": {
-                            "backend": "webphone",
-                            "end_effector_bounds": {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5]},
-                        },
-                        "target": {
-                            "publish_groups": [
-                                {"name": "arm", "joint_names": ["1", "2"], "topic": "/custom/arm"},
-                                {"name": "gripper", "joint_names": ["6"], "topic": "/custom/gripper"},
-                            ]
-                        },
-                    }
-                ],
-            },
-        }
-    )
-
-    teleop_params = _node_parameters(nodes[0])
-    device_config = json.loads(teleop_params["device_config"].strip("'"))
-    placo = device_config["cartesian_backend_config"]
-    assert placo["command_lease_topic"] == "/so101_placo_servo_node/command_lease"
-    placo_node = next(node for node in nodes if _text(node.node_executable) == "so101_placo_servo_node.py")
-    assert _node_parameters(placo_node)["command_out_topic"] == "/custom/arm"
-
-
-def test_synergy_hand_retarget_does_not_require_aero_calibration():
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_device": "amazing",
-            "safety": {"joint_limits": _joint_limits(["thumb", "index", "middle"])},
-            "devices": [
-                {
-                    "name": "amazing",
-                    "type": "hand_retarget",
-                    "side": "right",
-                    "source_topic": "/hands/right/state",
-                    "retargeter": {
-                        "type": "synergy_matrix",
-                        "input_features": ["index_mcp_flex"],
-                        "matrix": [[1.0], [1.0], [1.0]],
-                    },
-                    "target": {
-                        "publish_groups": [
-                            {
-                                "name": "hand",
-                                "joint_names": ["thumb", "index", "middle"],
-                                "topic": "/amazing/commands",
-                            }
-                        ]
-                    },
-                }
-            ],
-        }
-    )
-
-    assert errors == []
-
-
-def test_active_devices_allow_disjoint_arm_and_hand_topics():
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_devices": ["leader", "glove"],
-            "safety": {"joint_limits": _joint_limits(["1", *_HAND_JOINTS])},
-            "devices": [
-                {"name": "leader", "type": "leader_arm", "port": "/dev/leader"},
-                {
-                    "name": "glove",
-                    "type": "hand_retarget",
-                    "side": "right",
-                    "source_topic": "/hands/right/state",
-                    "retargeter": {
-                        "type": "synergy_matrix",
-                        "input_features": ["index_mcp_flex"],
-                        "matrix": [[1.0]] * 7,
-                    },
-                    "target": {
-                        "publish_groups": [
-                            {"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}
-                        ]
-                    },
-                },
-            ],
-        }
-    )
-
-    assert errors == []
-
-
-def test_vr_and_glove_allow_disjoint_command_topics():
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_devices": ["vr", "glove"],
-            "safety": {"joint_limits": _joint_limits(_HAND_JOINTS)},
-            "devices": [
-                {"name": "vr", "type": "vr_teleop", "vr_config": {"output_profile": "so101"}},
-                {
-                    "name": "glove",
-                    "type": "hand_retarget",
-                    "side": "right",
-                    "source_topic": "/hands/right/state",
-                    "retargeter": {
-                        "type": "synergy_matrix",
-                        "input_features": ["index_mcp_flex"],
-                        "matrix": [[1.0]] * 7,
-                    },
-                    "target": {
-                        "publish_groups": [
-                            {"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}
-                        ]
-                    },
-                },
-            ],
-        }
-    )
-
-    assert errors == []
-
-
-def test_two_gloves_reject_shared_aero_hand_topic():
-    devices = []
-    for name in ("first", "second"):
-        devices.append(
-            {
-                "name": name,
-                "type": "hand_retarget",
-                "side": "right",
-                "source_topic": f"/hands/{name}/state",
-                "retargeter": {
-                    "type": "synergy_matrix",
-                    "input_features": ["index_mcp_flex"],
-                    "matrix": [[1.0]] * 7,
-                },
-                "target": {
-                    "publish_groups": [{"name": "hand", "joint_names": _HAND_JOINTS, "topic": "/aero_hand/commands"}]
-                },
-            }
-        )
-
-    errors = validate_teleop_config({"enabled": True, "active_devices": ["first", "second"], "devices": devices})
-
-    assert any("share command topic" in error for error in errors)
-
-
-def test_hand_retarget_requires_explicit_publish_group():
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_device": "glove",
-            "devices": [
-                {
-                    "name": "glove",
-                    "type": "hand_retarget",
-                    "side": "right",
-                    "source_topic": "/hands/right/state",
-                    "retargeter": {
-                        "type": "synergy_matrix",
-                        "input_features": ["index_mcp_flex"],
-                        "matrix": [[1.0]] * 7,
-                    },
-                }
-            ],
-        }
-    )
-
-    assert any("requires explicit target.publish_groups" in error for error in errors)
-
-
-def test_vr_rejects_target_override_that_does_not_match_its_builder():
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_device": "vr",
-            "devices": [
-                {
-                    "name": "vr",
-                    "type": "vr_teleop",
-                    "vr_config": {"output_profile": "so101"},
-                    "target": {
-                        "publish_groups": [{"name": "other", "joint_names": ["1"], "topic": "/not_the_vr_output"}]
-                    },
-                }
-            ],
-        }
-    )
-
-    assert any("vr_teleop uses vr_config outputs" in error for error in errors)
-
-
-@pytest.mark.parametrize("second_type", ["leader_arm", "phone", "xbox_controller"])
-def test_active_arm_devices_reject_shared_command_topics(second_type):
-    second = {"name": "second", "type": second_type}
-    if second_type == "leader_arm":
-        second["port"] = "/dev/leader2"
-    if second_type == "phone":
-        second["phone_config"] = {"phone_os": "android"}
-
-    errors = validate_teleop_config(
-        {
-            "enabled": True,
-            "active_devices": ["leader", "second"],
-            "safety": {"joint_limits": _joint_limits(["1"])},
-            "devices": [
-                {"name": "leader", "type": "leader_arm", "port": "/dev/leader"},
-                second,
-            ],
-        }
-    )
-
-    assert any("share arm command topic" in error for error in errors)
-
-
-def test_generate_joy_teleop_nodes_for_mobile_base():
-    nodes = generate_teleop_nodes(
-        {
-            "teleoperation": {
-                "enabled": True,
-                "active_device": "lekiwi_gamepad",
-                "devices": [
-                    {
-                        "name": "lekiwi_gamepad",
-                        "type": "joy_teleop",
-                        "config_path": "$(find robot_config)/config/lekiwi/lekiwi_teleop.yaml",
-                        "input_device": "/dev/input/js0",
-                    }
-                ],
-            }
-        }
-    )
-
-    assert len(nodes) == 2
-    assert all(isinstance(node, Node) for node in nodes)

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .model import SpanRecord
-from .query import stable_span_id
+from .query import span_occurrences
 
 DIAGNOSTIC_ORDER = (
     "orphan",
@@ -88,7 +88,15 @@ def _geometry(node: SpanHierarchyNode) -> None:
     if raw_duration is not None:
         with suppress(TypeError, ValueError):
             monotonic_duration = int(raw_duration)
-    if monotonic_duration is not None:
+    if span.time_mapping.get("status") == "calibrated" and span.end_ns is not None:
+        # Shared-clock geometry must use both calibrated endpoints. Preserve
+        # the original monotonic duration separately for local stage metrics.
+        node.duration_source = "calibrated"
+        node.negative_duration = span.end_ns < span.start_ns
+        if not node.negative_duration:
+            node.duration_ns = span.end_ns - span.start_ns
+            node.end_ns = span.end_ns
+    elif monotonic_duration is not None:
         node.duration_source = "monotonic"
         if monotonic_duration < 0:
             node.negative_duration = True
@@ -201,15 +209,12 @@ def build_span_hierarchy(spans: list[SpanRecord]) -> SpanHierarchy:
     if not spans:
         return SpanHierarchy([], [], [])
 
-    ordered = sorted(spans, key=lambda span: (span.start_ns, stable_span_id(span)))
-    used: dict[str, int] = defaultdict(int)
+    ordered = span_occurrences(spans)
     by_key: dict[tuple[str, str], str] = {}
     by_id: dict[str, SpanHierarchyNode] = {}
     duplicate_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     for span in ordered:
-        base_id = stable_span_id(span)
-        used[base_id] += 1
-        occurrence_id = base_id if used[base_id] == 1 else f"{base_id}:{used[base_id]}"
+        occurrence_id = span.occurrence_id
         node = SpanHierarchyNode(occurrence_id, span)
         _geometry(node)
         by_key.setdefault((span.trace_id, span.span_id), occurrence_id)

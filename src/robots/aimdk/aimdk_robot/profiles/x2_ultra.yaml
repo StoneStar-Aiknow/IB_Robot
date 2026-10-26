@@ -19,7 +19,7 @@ runtime:
 
 # true: the bridge talks to the in-repo vendor mock instead of a robot
 # (aimdk_vendor_mock). There is no vendor-provided physics simulation here.
-simulated: false
+use_sim: false
 
 joint_state_topic: /joint_states
 
@@ -603,6 +603,10 @@ interfaces:
     endpoint: /audio/capture_stamped
     message_type: audio_common_msgs/msg/AudioDataStamped
     rate_hz: 33.3
+    # Format metadata mirrors the capability entry above so consumers bind the
+    # same fields on vendor-bridged and ALSA-backed runtimes alike.
+    sample_rate_hz: 16000.0
+    channels: 6
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
   audio.play:
     capability: interaction.audio_playback
@@ -610,6 +614,8 @@ interfaces:
     direction: subscribe
     endpoint: /audio/play
     message_type: audio_common_msgs/msg/AudioDataStamped
+    sample_rate_hz: 16000.0
+    channels: 1
     qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
 
   imu.chest:

@@ -15,15 +15,31 @@ robot:
     audio_input_channel: 1
     vad_input_channel: 1
     exit_on_init_failure: true
+    # Streaming input bound to the runtime's audio.capture (respeaker via the
+    # lekiwi_robot peripheral list); the topic and 6-ch/16 kHz format come
+    # from the interface.
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
   speech_direction:
     enabled: true
     profile: ascend_310p
     microphone: respeaker
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
     parameters:
       mount_yaw_deg: 90.0
   voice_tts:
     enabled: false
   nav_stages:
+    # voice_tts is off on this deployment: the inherited grasp/mapping stage
+    # name lists would otherwise launch the base config's speaker (audio
+    # devices launch when declared; navigation/hybrid already exclude it).
+    grasp:
+      peripheral_names: [respeaker, wrist]
+    mapping:
+      peripheral_names: [respeaker, front, mid360]
     navigation:
       peripheral_names: [respeaker, mid360]
       sensor_calibration:

@@ -13,7 +13,8 @@ from launch.event_handlers import OnProcessExit
 from launch.events.process import ProcessExited
 from launch_ros.actions import Node
 
-from robot_config.launch_builders import control, execution, perception, recording, runtime, sim_backend
+from dataset_tools.launch_builders import recording
+from robot_config.launch_builders import control, execution, perception, readiness, runtime, sim_backend
 from robot_config.loader import load_robot_config_dict
 from robot_runtime.interface_description import description_digest, validate_description
 
@@ -173,7 +174,7 @@ def startup(monkeypatch, tmp_path, public_description):
         actions = []
         for action in groups[0].execute(context):
             if isinstance(action, OpaqueFunction):
-                monkeypatch.setitem(action._OpaqueFunction__function.__globals__, "load_robot_config", forbidden)
+                monkeypatch.setattr(readiness, "load_launch_robot_config", forbidden)
             actions.extend(action.execute(context) or [])
         assert not seen and len(providers) == 1
         assert actions[-2:] == [owner, waiter]

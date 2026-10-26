@@ -8,7 +8,6 @@ from ament_index_python.packages import get_package_share_directory
 
 from embodied_common.skill_templates import get_skill_templates
 from embodied_common.trajectory_templates import _pose_within_workspace, expand_trajectory_template
-from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -35,10 +34,10 @@ GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 
 @pytest.fixture(scope="module")
 def robot_config() -> dict:
-    # Offline-complete variant of the provider-bound so101_single_arm config:
-    # gesture templates need real joint groups, and the provider config gets
-    # them only from a live runtime description.
-    config_path = resolve_robot_config_path(config_name="so101_single_arm_legacy")
+    # Offline-complete SO-101 fixture: gesture templates need real joint
+    # groups, and the provider-bound so101_single_arm config gets them only
+    # from a live runtime description.
+    config_path = Path(__file__).resolve().parent / "fixtures" / "so101_single_arm_offline.yaml"
     return load_robot_config_dict(config_path)
 
 
@@ -49,7 +48,7 @@ def embodied_config(robot_config: dict) -> dict:
 
 @pytest.fixture(scope="module")
 def skill_templates(robot_config: dict) -> dict:
-    config_path = resolve_robot_config_path(config_name="so101_single_arm_legacy")
+    config_path = Path(__file__).resolve().parent / "fixtures" / "so101_single_arm_offline.yaml"
     snapshot = compile_local_snapshot(robot_config, config_path)
     catalog_config = Path(get_package_share_directory("skill_catalog")) / "config"
     profile_path = catalog_config / "profiles" / "so101_single_arm.yaml"

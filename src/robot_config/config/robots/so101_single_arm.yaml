@@ -13,8 +13,10 @@ robot:
   robot_type: so_101  # For LeRobot dataset metadata
 
   # Robot runtime provider (robot-runtime-packaging). simulation.platform=sdk
-  # selects the SDK simulated transport; Gazebo/MuJoCo/mock are not supported
-  # on the provider path.
+  # selects the SDK simulated transport; platform=gazebo (or
+  # sim_platform:=gazebo) starts the scene world through generic launch and
+  # runs the SO-101 runtime provider on the Gazebo transport (physics ×
+  # MoveIt planning). MuJoCo/mock are not supported on the provider path.
   simulation:
     platform: sdk
 
@@ -116,16 +118,13 @@ robot:
     output_topic: /voice_command
     exit_on_init_failure: true
 
-  audio_io:
-    enabled: true
-    playback_topic: /audio/play
-    playback_device: ""
-    playback_sample_rate: 24000
-    playback_channels: 1
-    playback_sample_format: S16LE
+  # The so101_robot runtime provides no audio devices (no speaker peripheral
+  # in its profile), so this provider deployment keeps voice_tts off; a
+  # deployment with a playback device would bind voice_tts.audio_output to
+  # the runtime's audio.play interface instead of an audio_io section.
 
   voice_tts:
-    enabled: true
+    enabled: false
     bundle_path: "models/zipvoice"
     deployment: "ubuntu_onnx"
     service_name: /voice_tts/synthesize

@@ -353,3 +353,33 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q --import-mode=importlib src/manipulat
 
 通用 worker 调度由 `test_pipeline_worker.py` 覆盖；SO101 joint5 运动学约束由
 `test_so101_kinematics_guard.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+
+### X2 前中半分辨率 JPEG
+
+`aimdk_x2_magicmirror.yaml` 直接订阅机器人已有的
+`/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed`，不新增发送端 relay、
+不在接收板上缩小原图，也不自动切换到其他相机。发送端与接收端的 ROS domain、RMW 和网络须一致。
+
+`frame_source.decoder: auto` 在 JPEG 上尝试共享 `observation_transport` 的显式
+`ascend_jpeg` 后端；环境缺少 ACL 时保留 CPU 路径，PNG 仍由 CPU 解码。
+`dvpp` 强制使用 JPEG 硬解，错误不静默降级；`mock_cpu` 保持主线行为。
+`decoder_params: {device_id: 0}` 指定设备。注册 JPEG 仅影响本图像消费者，
+主线 H.264 的 `ascend` / `auto` 后端选择保持不变，不能把 JPEG 字节送给 H.264 解码器。
+
+JPEG 后端实现主线 `VideoDecoder` / `EncodedPacket` / `VideoFrame` 契约，
+通过接收节点注入主线 `AclRuntimeManager` 的 lease；共享包不反向依赖推理服务，也不自行初始化 ACL。
+输出声明为 BT.601 full-range NV12，去除 DVPP 行/列 padding，再由 ROS 适配器保留源 header。
+YOLOX 对其缩小图像转色，PEAR 对源分辨率的扩展 ROI 单独转色；原 RGB/BGR 服务保持兼容。
+
+解码、YOLOX、PEAR 使用最新帧队列，丢弃过期排队帧而不是积累延迟。
+`require_unique_publisher: true` 要求恰好一个输入发布者；缺流或冲突时停止处理，不自动回退。
+检测到输入不可用、超过恢复间隔重新收帧或图像尺寸变化时，输入代次递增，清空检测缓存和
+所有等待队列；已取出的帧与在途 YOLOX/PEAR 请求也必须匹配同一代次及尺寸才能生效。
+这样即使冲突已恢复、分辨率改回原值或相机时间戳归零，也不会重新使用恢复前的结果。
+状态消息通过 `source_generation` 暴露当前代次；未被 DDS 图或输入回调观测到的瞬时变化不作保证。
+无发布者、冲突、无可解码帧及有效帧超过一个 `status_period_sec` 未更新时输出 WARN，
+恢复后回到 INFO，状态话题持续发布；该周期默认 5 秒。
+`status.decode_ms` 是窗口内每次解码调用的平均耗时，包含冷启动时的初始化，不代表网络时延。
+测吞吐时使用业务节点自身状态计数；现场额外相机订阅会扰动实收帧率，不要把吞吐测试和
+额外图像订阅的时延测试混在一起。前后对照及名义 30 FPS 复核见
+[JPEG 解码验证记录](JPEG_DECODE_VALIDATION.md)。

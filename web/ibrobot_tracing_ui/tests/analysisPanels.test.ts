@@ -41,6 +41,24 @@ describe("non-intrusive analysis panels", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps fallback model-call statistics separate from an unavailable end-to-end boundary", async () => {
+    const store = useProfilerStore();
+    store.analysisId = "analysis"; store.tabState.summary = "ready";
+    const data = summary();
+    data.coverage.boundary = "Dispatch Request -> First Action Execute";
+    data.stages = { inference_ms: { count: 8, minimum: 70, maximum: 90, p50: 80, p95: 85, p99: 90, mean: 80 } };
+    store.summary = data;
+    mount(SummaryPanel);
+    const intro = host.querySelector(".overview-intro")!;
+    expect(intro.textContent).toContain("模型调用开始 → 模型调用结束");
+    expect(intro.textContent).toContain("未提供有效端到端耗时样本");
+    expect(intro.textContent).not.toContain("请求分发 → 首次动作执行");
+    expect(intro.querySelector(".button.primary")?.textContent).toBe("查看模型调用最慢请求");
+    data.stages.total_ms = { count: 8, minimum: 100, maximum: 130, p50: 110, p95: 125, p99: 130, mean: 110 };
+    store.summary = { ...data }; await nextTick();
+    expect(intro.textContent).toContain("请求分发 → 首次动作执行");
+  });
+
   it("makes a truncated diagnostic response visible instead of claiming completeness", () => {
     const store = useProfilerStore();
     store.tabState.warnings = "ready";
@@ -78,7 +96,7 @@ describe("non-intrusive analysis panels", () => {
     expect(Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "重试")).toBe(false);
 
     const navigate = vi.spyOn(store, "navigateToRequest").mockResolvedValue();
-    const button = host.querySelector('[id="grid-row-retry"] button[aria-label*="Span 分析"]') as HTMLButtonElement;
+    const button = host.querySelector('[id="grid-row-retry"] button[aria-label*="调用层级"]') as HTMLButtonElement;
     button.click();
     await nextTick();
     expect(navigate).toHaveBeenCalledWith("retry", "span-profile");
@@ -96,7 +114,7 @@ describe("non-intrusive analysis panels", () => {
     store.summary.span_summary_total = 250;
     store.summary.span_summary_truncated = true;
     mount(SummaryPanel);
-    expect(host.textContent).toContain("请求链投影");
+    expect(host.textContent).toContain("未计入统计不代表业务执行失败");
     expect(host.textContent).toContain("未形成投影数值");
     expect(host.textContent).toContain("不等于事件未采到");
     expect(host.textContent).toContain("100 / 250 组，上限 100");
@@ -109,7 +127,7 @@ describe("non-intrusive analysis panels", () => {
     expect(host.querySelectorAll("tr[id]")).toHaveLength(50);
     const fetch = vi.spyOn(store, "fetchTab").mockResolvedValue();
     store.componentId = "old-scope";
-    const more = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "更多见Span分析");
+    const more = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "查看全部调用聚合");
     more!.click();
     await vi.waitFor(() => expect(store.activeTab).toBe("span-profile"));
     expect(store.spanAnalysisMode).toBe("aggregate");
@@ -133,7 +151,9 @@ describe("non-intrusive analysis panels", () => {
       blocking_reasons: comparable ? [] : ["required metric preprocess_ms is missing from the candidate"],
     } satisfies ComparisonResult;
     mount(ComparisonPanel);
-    expect(host.textContent).toContain("comparable 仅表示所选指标数据足够进行比较，不等同于业务成功或可用性");
+    expect(host.textContent).toContain("可比较仅表示样本足以计算差值，不代表实验条件一致");
+    expect(host.textContent).toContain("也不据此判断业务成功");
+    expect(host.textContent).not.toContain("发现性能回归");
     expect(host.textContent).toContain(comparable ? "所选指标数据足够比较" : "所选指标数据不足以比较");
     expect(host.textContent).not.toContain("比较被阻止");
     expect(host.textContent).not.toContain("业务不可用");

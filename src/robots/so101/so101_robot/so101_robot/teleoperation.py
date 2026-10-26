@@ -6,7 +6,7 @@ from launch_ros.actions import Node
 from robot_runtime.path_subst import resolve_path
 
 
-def generate_teleoperation_nodes(profile, descriptor, robot_description_dict):
+def generate_teleoperation_nodes(profile, descriptor, robot_description_dict, *, use_sim_time: bool = False):
     config = profile.get("teleoperation", {})
     if not config.get("enabled", False):
         return []
@@ -61,6 +61,10 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict):
         }
     )
     params.update(robot_description_dict)
+    # The servo's managed mode compares its clock against JointState header
+    # stamps: on a physics platform those are sim-stamped, so the executor
+    # must run on the same clock or it drops every feedback sample (PR !515 P2).
+    params["use_sim_time"] = bool(use_sim_time)
     nodes = [
         Node(
             package="so101_motion",

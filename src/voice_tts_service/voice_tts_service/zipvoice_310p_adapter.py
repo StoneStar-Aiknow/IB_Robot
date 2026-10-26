@@ -25,14 +25,17 @@ _ChineseTokenizer = ChineseTokenizer
 class ZipVoiceAscendSession(AscendOmModelSession):
     """Run the complete ZipVoice host-orchestrated pipeline in one model session."""
 
-    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options | {"prompt_profile"}
+    allowed_runtime_options = AscendOmModelSession.allowed_runtime_options | {"prompt_profile", "num_steps"}
     execution_contract = "request-iterative"
     orchestration_visibility = "session"
 
-    def __init__(self, device_id: int = 0, *, prompt_profile: str = "default", **kwargs) -> None:
+    def __init__(
+        self, device_id: int = 0, *, prompt_profile: str = "default", num_steps: int | None = None, **kwargs
+    ) -> None:
         super().__init__(device_id, **kwargs)
         self._root: Path | None = None
         self._prompt_profile = prompt_profile
+        self._num_steps_override = num_steps
         self._config: dict[str, Any] = {}
         self._text_role = ""
         self._flow_role = ""
@@ -79,6 +82,15 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             )
         self._root = context.validated_manifest.bundle_root
         self._config = self._load_json(self._root / "assets" / "zipvoice_310p.json")
+        # The flow-matching loop is run once per step and is ~98% of synthesis
+        # time, so num_steps is the dominant latency knob. It lives in the
+        # bundle asset, which is digest-verified and must not be edited in
+        # place, so allow a deployment to override it from robot_config.
+        if self._num_steps_override is not None:
+            num_steps = int(self._num_steps_override)
+            if num_steps < 1:
+                raise SessionLoadError(f"ZipVoice num_steps must be >= 1, got {num_steps}")
+            self._config["num_steps"] = num_steps
         text_role = str(self._config.get("text_role", "text_encoder"))
         flow_role = str(self._config.get("flow_role", "flow_decoder_1537"))
         unknown_roles = sorted({text_role, flow_role} - set(deployment.execution))

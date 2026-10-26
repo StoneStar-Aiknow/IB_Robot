@@ -209,3 +209,34 @@ def test_runtime_version_reports_onnxruntime():
     version = session.runtime_version
 
     assert "onnxruntime" in version
+
+
+def test_num_steps_override_replaces_the_bundle_value():
+    """A deployment must be able to pick the step count without touching the bundle."""
+    from voice_tts_service.zipvoice_onnx_adapter import ZipVoiceOnnxSession
+
+    session = ZipVoiceOnnxSession(num_steps=4)
+    session._config = {"num_steps": 8}
+    session._apply_num_steps_override()
+
+    assert session._config["num_steps"] == 4
+
+
+def test_without_an_override_the_bundle_value_is_kept():
+    from voice_tts_service.zipvoice_onnx_adapter import ZipVoiceOnnxSession
+
+    session = ZipVoiceOnnxSession()
+    session._config = {"num_steps": 8}
+    session._apply_num_steps_override()
+
+    assert session._config["num_steps"] == 8
+
+
+def test_a_non_positive_step_count_fails_closed():
+    from voice_tts_service.errors import BackendLoadError
+    from voice_tts_service.zipvoice_onnx_adapter import ZipVoiceOnnxSession
+
+    session = ZipVoiceOnnxSession(num_steps=0)
+    session._config = {"num_steps": 8}
+    with pytest.raises(BackendLoadError, match="num_steps"):
+        session._apply_num_steps_override()

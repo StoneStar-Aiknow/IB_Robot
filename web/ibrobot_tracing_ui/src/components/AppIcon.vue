@@ -42,6 +42,12 @@ withDefaults(defineProps<{ name: string; size?: number }>(), { size: 16 });
     <template v-else-if="name === 'trace'">
       <circle cx="5" cy="6" r="2" /><circle cx="19" cy="6" r="2" /><circle cx="12" cy="18" r="2" /><path d="M7 6h10M6 8l5 8M18 8l-5 8" />
     </template>
+    <template v-else-if="name === 'plus'">
+      <path d="M5 12h14M12 5v14" />
+    </template>
+    <template v-else-if="name === 'minus'">
+      <path d="M5 12h14" />
+    </template>
     <template v-else-if="name === 'fit'">
       <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" />
     </template>

@@ -27,7 +27,12 @@
   <depend>ibrobot_msgs</depend>
   <exec_depend>embodied_common</exec_depend>
   <exec_depend>perception_service</exec_depend>
-  <exec_depend>robot_config</exec_depend>
+  <!-- depend (not exec_depend): the launch-builder contribution imports
+       robot_config at registration time, and configuration.py imports the
+       perception-model node generator from inference_service (openspec
+       change ``migrate-business-launch-builders``, design decision 3). -->
+  <depend>robot_config</depend>
+  <depend>inference_service</depend>
   <exec_depend>lekiwi_calibration</exec_depend>
   <exec_depend>robot_navigation</exec_depend>
   <exec_depend>rviz2</exec_depend>
@@ -38,6 +43,9 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated launch-builder tests import robot_config's registry and
+       loader (openspec change ``migrate-business-launch-builders``). -->
+  <test_depend>robot_config</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

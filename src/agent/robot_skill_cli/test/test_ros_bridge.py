@@ -603,3 +603,116 @@ def test_get_execution_reports_gateway_ledger_progress():
     assert execution["completed_step_count"] == 1
     assert execution["stop_requested"] is True and execution["reconciled"] is False
     assert [step["skill_name"] for step in execution["canonical_steps"]] == ["wave_hello", "nod_yes"]
+
+
+def test_get_execution_reports_a_resumable_interrupted_step():
+    from ibrobot_msgs.msg import WorkflowStep
+    from ibrobot_msgs.srv import GetExecution
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._GetExecution = GetExecution
+    bridge._WorkflowStep = WorkflowStep
+    response = GetExecution.Response()
+    response.found, response.state = True, "CANCELED"
+    response.step_resumable, response.step_progress = True, 0.25
+    bridge._call_service = lambda _client, _request, **_kwargs: response
+
+    execution = bridge.get_execution(request_id="voice-1", execution_id="", timeout_sec=1.0)
+
+    assert execution["step_resumable"] is True
+    assert execution["step_progress"] == pytest.approx(0.25)
+
+
+def test_program_goal_names_the_execution_it_continues():
+    from ibrobot_msgs.action import ExecuteProgram
+    from ibrobot_msgs.msg import WorkflowStep
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._ExecuteProgram = ExecuteProgram
+    bridge._WorkflowStep = WorkflowStep
+    sent = []
+    bridge._program_client = SimpleNamespace(send_goal_async=lambda goal, **_kwargs: sent.append(goal))
+    registry = {"registry_epoch": "epoch", "registry_generation": 1, "registry_digest": "digest"}
+    steps = [{"schema_version": 1, "skill_name": "wave_hand"}]
+
+    bridge.send_program_goal(request_id="r1", workflow_steps=steps, registry=registry, task_budget_sec=30.0)
+    bridge.send_program_goal(
+        request_id="r2",
+        workflow_steps=steps,
+        registry=registry,
+        task_budget_sec=30.0,
+        continues_from_execution_id="exec-1",
+    )
+
+    assert [goal.continues_from_execution_id for goal in sent] == ["", "exec-1"]
+
+
+def test_wait_future_returns_as_soon_as_the_future_completes():
+    """Polling added up to 10 ms to every RPC, and the request path chains several.
+
+    The round trip is about 1 ms even for a six-figure payload, so the sleep
+    dominated what looked like transport time.
+    """
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()
+    threading.Timer(0.02, lambda: future.set_result("done")).start()
+
+    started = time.monotonic()
+    assert RosBridge._wait_future(future, 5.0) is True
+    elapsed = time.monotonic() - started
+
+    # Completion is delivered by the done callback, not by the next poll tick.
+    assert elapsed < 0.02 + RosBridge._WAIT_POLL_SEC
+
+
+def test_wait_future_still_honours_an_interrupt_within_one_poll():
+    """Cancellation latency must not regress for the sake of throughput."""
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()  # never completes
+    interrupt = threading.Event()
+    threading.Timer(0.02, interrupt.set).start()
+
+    started = time.monotonic()
+    assert RosBridge._wait_future(future, 5.0, interrupt) is False
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.02 + 3 * RosBridge._WAIT_POLL_SEC
+
+
+def test_wait_future_still_times_out():
+    from rclpy.task import Future
+
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    future = Future()
+    started = time.monotonic()
+
+    assert RosBridge._wait_future(future, 0.05) is False
+
+    assert time.monotonic() - started >= 0.05
+
+
+def test_wait_future_falls_back_for_a_future_without_done_callbacks():
+    """Test doubles and older future shapes must keep working."""
+    from robot_skill_cli.ros_bridge import RosBridge
+
+    class _Bare:
+        def __init__(self):
+            self.checks = 0
+
+        def add_done_callback(self, _callback):
+            raise AttributeError("no done callbacks here")
+
+        def done(self):
+            self.checks += 1
+            return self.checks > 2
+
+    bare = _Bare()
+    assert RosBridge._wait_future(bare, 5.0) is True
+    assert bare.checks > 2

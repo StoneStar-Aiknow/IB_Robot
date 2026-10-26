@@ -39,6 +39,20 @@ def public_description():
             "message_type": message_type,
             "qos": dict(qos),
         }
+    # runtime-owned-audio-io: the lekiwi hybrid profile binds the runtime's
+    # speaker output (voice_tts); the synthetic snapshot carries the same
+    # interface shape.
+    interfaces["audio.play"] = {
+        "capability": "interaction.audio_playback",
+        "kind": "topic",
+        "direction": "subscribe",
+        "endpoint": "/audio/play",
+        "message_type": "audio_common_msgs/msg/AudioDataStamped",
+        "qos": dict(qos),
+        "sample_rate_hz": 24000,
+        "channels": 1,
+        "sample_format": "S16LE",
+    }
     for camera in ("top", "front", "wrist"):
         interfaces[f"camera.{camera}.color"] = {
             "capability": "perception.camera",
@@ -84,7 +98,7 @@ def public_description():
         "execution": "simulated",
         "interfaces": interfaces,
         "states": {},
-        "model": build_model_metadata(profile, simulated=True, robot_description=urdf),
+        "model": build_model_metadata(profile, use_sim=True, sim_platform="sdk", robot_description=urdf),
     }
     description["digest"] = description_digest(description)
     validate_description(description)

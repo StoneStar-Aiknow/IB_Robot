@@ -399,17 +399,27 @@ robot:
         control_frequency: 20.0
 ```
 
-Scheduled inference is opt-in through `control_modes.<mode>.inference.scheduler.enable`, which defaults to `false`.
+Scheduled inference is opt-in through `robot.runtime_scheduler.enable`, which defaults to `false`.
 Independent stages support `scheduling.stages.<producer>.max_snapshot_age_ms` (positive integer, default `5000`).
 The producer is the first manifest execution role; terminal and sequential stages reject this option. The age limit
 includes producer queueing and execution from observation capture, participates in the runtime policy fingerprint,
 and is forwarded by launch. Reprocessing an expired observation does not renew its validity.
-Simulation inference (`runtime_target=simulation`, including Gazebo, MuJoCo and mock) requires
-`scheduler.enable=false`. Launch rejects the enabled combination before generating control or simulation nodes.
-Simulation scenes do not manage scheduler sessions or pipeline bindings.
-With an explicit `scheduler` block and `enable: false`, the complete scheduled configuration may remain dormant while
-the generated launch graph and node parameters stay identical to the legacy path. This makes `enable` a one-line
-rollback switch. If the entire `scheduler` block is absent, scheduled fields are still rejected as unknown fields.
+The switch belongs to the robot section. Simulation (including Gazebo, MuJoCo and mock) and benchmark always run
+directly even when the switch is true. Scheduling applies to policy inference; perception and voice are not enrolled.
+Target precedence is CLI `runtime_target`, YAML `runtime.target`, CLI `use_sim`, then hardware. YAML `use_sim`
+does not select the target. Conflicting explicit CLI target/embodiment arguments fail; a CLI `sim_platform` alone
+selects virtual embodiment. Execution validates preparation's scheduling decision against the robot switch,
+active inference mode and effective target. An explicit `scheduler_enabled` is a consistency assertion, not an override;
+contradictory values are rejected. Benchmark-specific parsing always
+uses direct dispatch. Only live binding writes the effective target into its configuration snapshot; source YAML is unchanged.
+Standalone execution builders accept target and clock overrides. When `use_sim_time` is omitted, the clock follows
+the caller's `use_sim` argument as before (false when both are omitted), without inferring a clock from the backend.
+Generic launch still selects the backend clock in preparation and passes it explicitly.
+Declared topology export reads YAML, not launch overrides.
+With an explicit `runtime_scheduler` block and `enable: false`, the complete scheduled configuration may remain dormant while
+generic launch target resolution and the generated direct execution graph stay identical to the legacy path,
+including parameters, names, environment, remappings, output settings and action order. This makes `enable` a one-line
+rollback switch. If the entire `runtime_scheduler` block is absent, scheduled fields are still rejected as unknown fields.
 With the default FIFO policy and profile admission disabled, priority-0 dispatches the target directly without a resource
 queue. Nonempty default fallback chains are rejected during configuration loading when the scheduler is enabled.
 Fallback requires EDF or FIFO with profile admission enabled; deadline-driven priority-0 (EDF or FIFO admission)

@@ -109,7 +109,9 @@ class AudioPlaybackNode(Node):
                 message.data = list(data)
                 self._audio_pub.publish(message)
                 # DDS acknowledgement can take an entire PCM chunk period.
-                # Waiting here would starve audio_play between every chunk.
+                # Waiting here would starve audio_play between every chunk:
+                # measured against the real GStreamer sink, a 2.6 s clip did
+                # not finish in 90 s.
                 # Absolute sample-clock deadlines also avoid accumulating
                 # serialization and publish overhead into the sound duration.
                 remaining = deadline - time.monotonic()

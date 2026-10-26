@@ -1,4 +1,4 @@
-"""Launch-graph branch tests for the scheduler.enable and executor.enabled switches.
+"""Launch-graph branch tests for the robot.runtime_scheduler.enable and executor.enabled switches.
 
 Asserts the false/absent branch produces the legacy `action_dispatcher_node` set
 byte-for-byte unchanged, and the true branch produces the scheduled topology
@@ -17,14 +17,23 @@ from typing import Any
 
 import pytest
 import yaml
+from launch import LaunchContext
+from launch.actions import RegisterEventHandler
+from launch.events.process import ProcessExited
+from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
 from launch_ros.actions import Node
+from launch_ros.utilities import evaluate_parameters
 
 from inference_manifest import BundleFile, canonical_bundle_digest
+from robot_config import InferenceConfigError
 from robot_config.dispatch_strategies import DispatchStrategyError
-from robot_config.inference_config import InferenceConfigError
-from robot_config.launch_builders.execution import generate_action_dispatcher_node, generate_execution_nodes
+from robot_config.launch_builders.execution import (
+    generate_action_dispatcher_node,
+    generate_execution_nodes,
+    generate_inference_node,
+)
 from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
-from robot_config.runtime_target import RuntimeTarget
+from robot_config.runtime_target import RuntimeTarget, RuntimeTargetError
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -128,6 +137,127 @@ def _nodes(actions) -> list[Node]:
     return [action for action in actions if isinstance(action, Node)]
 
 
+def _launch_snapshot(actions, root: Path) -> list[dict]:
+    """Capture launch inputs without spawning processes; preserve every action's order.
+
+    Humble exposes process settings publicly but not unexpanded ROS name,
+    namespace, remappings or parameters. Keep those private reads here.
+    Only temporary paths are normalized; environment is controlled by the test.
+    """
+    context = LaunchContext()
+
+    def resolve(value):
+        return None if value is None else perform_substitutions(context, normalize_to_list_of_substitutions(value))
+
+    def environment(value):
+        return None if value is None else {resolve(key): resolve(item) for key, item in value}
+
+    snapshots = []
+    for action in actions:
+        if isinstance(action, Node):
+            process = action.process_description
+            snapshots.append(
+                {
+                    "action": "Node",
+                    "package": resolve(action.node_package),
+                    "executable": resolve(action.node_executable),
+                    "name": resolve(action._Node__node_name),
+                    "namespace": resolve(action._Node__node_namespace),
+                    "parameters": evaluate_parameters(context, action._Node__parameters),
+                    "remappings": [[resolve(src), resolve(dst)] for src, dst in action._Node__remappings],
+                    "arguments": action._Node__arguments,
+                    "ros_arguments": action._Node__ros_arguments,
+                    "env": environment(process.env),
+                    "additional_env": environment(process.additional_env),
+                    "cwd": resolve(process.cwd),
+                    "output": resolve(action.output),
+                    "shell": action.shell,
+                    "emulate_tty": action.emulate_tty,
+                }
+            )
+        elif isinstance(action, RegisterEventHandler):
+            targets = []
+            for index, node in enumerate(actions):
+                if isinstance(node, Node):
+                    event = ProcessExited(action=node, name="probe", cmd=[], cwd=None, env=None, pid=1, returncode=1)
+                    if action.event_handler.matches(event):
+                        targets.append(index)
+            snapshots.append({"action": "RegisterEventHandler", "event": "ProcessExited", "targets": targets})
+        else:
+            pytest.fail(f"Uncovered launch action: {type(action).__name__}")
+    return json.loads(json.dumps(snapshots).replace(str(root), "<tmp>"))
+
+
+def _direct_baseline_config(tmp_path: Path, scenario: str):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    mode = config["control_modes"]["model_inference"]
+    kwargs = {}
+    if scenario == "multiple_pipelines":
+        from copy import deepcopy
+
+        mode["inference"]["pipelines"]["backup"] = deepcopy(mode["inference"]["pipelines"]["policy"])
+        mode["executor"]["inference_pipeline"] = "backup"
+    elif scenario == "simulation":
+        kwargs = {"runtime_target": RuntimeTarget.SIMULATION, "use_sim": True, "use_sim_time": False}
+    elif scenario in ("mock_default_clock", "sdk_default_clock"):
+        platform = scenario.removesuffix("_default_clock")
+        config["simulation"] = {"platform": platform}
+        if platform == "sdk":
+            config["runtime"] = {"provider": "so101_robot"}
+        kwargs = {"use_sim": True}
+    elif scenario == "benchmark":
+        config["runtime"] = {"target": "benchmark"}
+        config["benchmark"] = {
+            "type": "libero",
+            "adapter": "libero",
+            "evaluation": {"enabled": True, "suite": "libero_spatial"},
+        }
+        mode["inference"]["pipelines"]["policy"]["execution_mode"] = "distributed"
+        mode["executor"]["type"] = "benchmark"
+        mode["dispatch"] = {"scheduler": "wait_for_feedback"}
+        kwargs = {"runtime_target": RuntimeTarget.BENCHMARK, "use_sim": True, "use_sim_time": False}
+    return config, kwargs
+
+
+@pytest.mark.parametrize(
+    "scenario", ["multiple_pipelines", "simulation", "benchmark", "mock_default_clock", "sdk_default_clock"]
+)
+@pytest.mark.parametrize("scheduler_block", [None, {"enable": False}])
+def test_direct_launch_matches_pre_migration_baseline(tmp_path, monkeypatch, scenario, scheduler_block):
+    from robot_config.launch_builders import execution
+
+    monkeypatch.setattr(execution, "prepare_lerobot_env", lambda: {"IBROBOT_TEST_ENV": "preserved"})
+    monkeypatch.delenv("OVERRIDE_LAUNCH_PROCESS_OUTPUT", raising=False)
+    config, kwargs = _direct_baseline_config(tmp_path, scenario)
+    if scheduler_block is not None:
+        config["runtime_scheduler"] = scheduler_block
+    baseline = json.loads((Path(__file__).parent / "fixtures" / "execution_direct_baseline.json").read_text())
+    assert (
+        _launch_snapshot(generate_execution_nodes(config, "model_inference", **kwargs), tmp_path)
+        == baseline["scenarios"][scenario]
+    )
+
+
+@pytest.mark.parametrize("scenario", ["mock_default_clock", "sdk_default_clock"])
+@pytest.mark.parametrize("scheduler_block", [None, {"enable": False}])
+def test_inference_builder_default_clock_matches_pre_migration_baseline(
+    tmp_path, monkeypatch, scenario, scheduler_block
+):
+    from robot_config.launch_builders import execution
+
+    monkeypatch.setattr(execution, "prepare_lerobot_env", lambda: {"IBROBOT_TEST_ENV": "preserved"})
+    monkeypatch.delenv("OVERRIDE_LAUNCH_PROCESS_OUTPUT", raising=False)
+    config, kwargs = _direct_baseline_config(tmp_path, scenario)
+    if scheduler_block is not None:
+        config["runtime_scheduler"] = scheduler_block
+    baseline = json.loads((Path(__file__).parent / "fixtures" / "execution_direct_baseline.json").read_text())
+    assert (
+        _launch_snapshot(generate_inference_node(config, "model_inference", **kwargs), tmp_path)
+        == baseline["scenarios"][scenario][:1]
+    )
+
+
 def _legacy_robot_config(config_path: Path, bundle: Path) -> dict[str, Any]:
     return {
         "_config_path": str(config_path),
@@ -153,7 +283,7 @@ def _legacy_robot_config(config_path: Path, bundle: Path) -> dict[str, Any]:
 
 def _scheduled_robot_config(config_path: Path, bundle: Path, profile: Path) -> dict[str, Any]:
     rc = _legacy_robot_config(config_path, bundle)
-    rc["control_modes"]["model_inference"]["inference"]["scheduler"] = {
+    rc["runtime_scheduler"] = {
         "enable": True,
         "global_endpoints": {
             "readiness": "/inference/scheduler/ready",
@@ -194,26 +324,248 @@ def _scheduled_robot_config(config_path: Path, bundle: Path, profile: Path) -> d
     return rc
 
 
+@pytest.mark.parametrize("target", list(RuntimeTarget))
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("decision", [False, True])
+def test_execution_scheduler_decision_cannot_override_activation(tmp_path, target, enabled, decision):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    config["runtime_scheduler"]["enable"] = enabled
+    config.update(runtime={"target": target.value}, benchmark={"type": "libero", "adapter": "libero"})
+    expected = enabled and target is RuntimeTarget.HARDWARE
+    if decision is not expected:
+        with pytest.raises(InferenceConfigError, match="scheduler_enabled conflicts"):
+            generate_execution_nodes(config, scheduler_enabled=decision)
+    else:
+        nodes = _nodes(generate_execution_nodes(config, scheduler_enabled=decision))
+        assert [node.node_executable for node in nodes] == (
+            ["pipeline_policy_node", "global_inference_scheduler_node", "scheduled_action_dispatcher_node"]
+            if expected
+            else ["pipeline_policy_node", "action_dispatcher_node"]
+        )
+
+
+@pytest.mark.parametrize("target", list(RuntimeTarget))
+def test_execution_scheduler_decision_uses_explicit_target_override(tmp_path, target):
+    from copy import deepcopy
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    config.update(runtime={"target": "simulation"}, benchmark={"type": "libero", "adapter": "libero"})
+    original = deepcopy(config)
+    expected = target is RuntimeTarget.HARDWARE
+    nodes = _nodes(generate_execution_nodes(config, runtime_target=target, scheduler_enabled=expected))
+    assert ("global_inference_scheduler_node" in [node.node_executable for node in nodes]) is expected
+    assert config == original
+
+
+def test_benchmark_pipeline_validation_uses_effective_target(tmp_path):
+    from robot_config.launch_builders.benchmark import _selected_benchmark_pipeline
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    config["runtime"] = {"target": "hardware"}
+    config["runtime_scheduler"] = {"enable": True}
+    pipeline_id, pipeline = _selected_benchmark_pipeline(config)
+    assert pipeline_id == "policy"
+    assert pipeline.runtime_policy_json is None
+    assert config["runtime"]["target"] == "hardware"
+
+
 # ---------------------------------------------------------------------------
 # False and absent produce the legacy launch graph.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("use_sim", [True, "true", False])
-def test_simulation_rejects_enabled_inference_scheduler(tmp_path: Path, use_sim) -> None:
+@pytest.mark.parametrize("use_sim", [True, "true", None])
+def test_simulation_keeps_enabled_scheduler_dormant(tmp_path: Path, use_sim) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
 
-    with pytest.raises(InferenceConfigError, match="simulation does not support"):
-        generate_execution_nodes(config, use_sim=use_sim, runtime_target=RuntimeTarget.SIMULATION)
+    nodes = _nodes(generate_execution_nodes(config, use_sim=use_sim, runtime_target=RuntimeTarget.SIMULATION))
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+    assert "runtime_policy_json" not in _node_parameters(nodes[0])
+    assert _node_parameters(nodes[0])["use_sim"] is True
+    assert _node_parameters(nodes[0])["use_sim_time"] is (use_sim is not None)
+    assert config["runtime_scheduler"]["enable"] is True
 
 
-def test_legacy_use_sim_argument_rejects_enabled_inference_scheduler(tmp_path: Path) -> None:
+@pytest.mark.parametrize("builder", [generate_execution_nodes, generate_inference_node])
+@pytest.mark.parametrize("target", [RuntimeTarget.SIMULATION, RuntimeTarget.BENCHMARK])
+def test_builder_uses_declared_target_without_overrides(tmp_path: Path, builder, target) -> None:
+    from copy import deepcopy
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    config["runtime"] = {"target": target.value}
+    config["runtime_scheduler"] = {"enable": True}
+    if target is RuntimeTarget.BENCHMARK:
+        config["benchmark"] = {"type": "libero", "adapter": "libero"}
+    original = deepcopy(config)
+
+    nodes = _nodes(builder(config, "model_inference"))
+    parameters = _node_parameters(nodes[0])
+    assert "runtime_policy_json" not in parameters
+    assert parameters["use_sim"] is True
+    assert parameters["use_sim_time"] is False
+    assert "global_inference_scheduler_node" not in [node.node_executable for node in nodes]
+    assert config == original
+
+
+@pytest.mark.parametrize("builder", [generate_execution_nodes, generate_inference_node])
+@pytest.mark.parametrize(("target", "use_sim"), [(RuntimeTarget.SIMULATION, False), (RuntimeTarget.HARDWARE, True)])
+def test_builder_rejects_conflicting_target_overrides(builder, target, use_sim) -> None:
+    with pytest.raises(RuntimeTargetError, match="requires use_sim"):
+        builder({}, "model_inference", runtime_target=target, use_sim=use_sim)
+
+
+@pytest.mark.parametrize("builder", [generate_execution_nodes, generate_inference_node])
+@pytest.mark.parametrize(
+    ("target", "platform", "provider", "expected_clock"),
+    [
+        ("hardware", "gazebo", "", False),
+        ("benchmark", "gazebo", "", True),
+        ("simulation", "mock", "", True),
+        ("simulation", "sdk", "so101_robot", True),
+        ("simulation", "gazebo", "so101_robot", True),
+        ("simulation", "mujoco", "so101_robot", True),
+    ],
+)
+@pytest.mark.parametrize("clock_override", [None, False, True])
+def test_builder_clock_preserves_use_sim_default(
+    tmp_path, builder, target, platform, provider, expected_clock, clock_override
+):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config.update(
+        runtime={"target": target, "provider": provider},
+        simulation={"platform": platform},
+        benchmark={"type": "libero", "adapter": "libero"},
+    )
+    nodes = _nodes(builder(config, "model_inference", use_sim=target != "hardware", use_sim_time=clock_override))
+    expected = expected_clock if clock_override is None else clock_override
+    assert all(_node_parameters(node)["use_sim_time"] is expected for node in nodes)
+
+
+@pytest.mark.parametrize("builder", [generate_execution_nodes, generate_inference_node])
+def test_builder_target_override_updates_node_flags_and_preserves_clock_override(tmp_path: Path, builder) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    config["runtime"] = {"target": "hardware"}
+    config["use_sim"] = False
+    config["runtime_scheduler"] = {"enable": True}
+
+    nodes = _nodes(builder(config, "model_inference", runtime_target=RuntimeTarget.SIMULATION, use_sim_time=False))
+    parameters = _node_parameters(nodes[0])
+    assert parameters["use_sim"] is True
+    assert parameters["use_sim_time"] is False
+    assert "runtime_policy_json" not in parameters
+    assert config["runtime"]["target"] == "hardware"
+    assert config["use_sim"] is False
+
+
+@pytest.mark.parametrize(
+    ("config_use_sim", "arguments", "expected_target"),
+    [
+        (True, {}, RuntimeTarget.HARDWARE),
+        ("true", {}, RuntimeTarget.HARDWARE),
+        (False, {}, RuntimeTarget.HARDWARE),
+        ("false", {}, RuntimeTarget.HARDWARE),
+        (None, {}, RuntimeTarget.HARDWARE),
+        (True, {"use_sim": "false"}, RuntimeTarget.HARDWARE),
+        (False, {"use_sim": "true"}, RuntimeTarget.SIMULATION),
+        (True, {"runtime_target": "hardware"}, RuntimeTarget.HARDWARE),
+        (False, {"runtime_target": "simulation"}, RuntimeTarget.SIMULATION),
+        (False, {"sim_platform": "mock"}, RuntimeTarget.SIMULATION),
+    ],
+)
+def test_target_resolution_agrees_across_preparation_builders_and_tracing(
+    tmp_path, monkeypatch, capsys, config_use_sim, arguments, expected_target
+):
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from robot_config.launch_builders import control, readiness
+    from robot_config.launch_registry.preparation import prepare_launch
+    from robot_config.launch_registry.registry import LaunchBuilderRegistry
+    from robot_config.tracing_topology import main as tracing_main
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    config_path = tmp_path / "robot.yaml"
+    config = _scheduled_robot_config(config_path, bundle, _profile_file(tmp_path))
+    if config_use_sim is not None:
+        config["use_sim"] = config_use_sim
+    original = deepcopy(config)
+    monkeypatch.setattr(readiness, "resolve_config_path", lambda *args: str(config_path))
+    monkeypatch.setattr(control, "validate_runtime_resources", lambda *args, **kwargs: None)
+
+    prepared = prepare_launch(
+        SimpleNamespace(launch_configurations=arguments), LaunchBuilderRegistry(), loaded_config=config
+    )
+    assert prepared.runtime_target is expected_target
+    scheduled = expected_target is RuntimeTarget.HARDWARE
+    assert prepared.scheduler_enabled is scheduled
+    assert prepared.context.scheduler_enabled is scheduled
+
+    # Execution must validate the prepared decision against the effective target,
+    # including CLI overrides that intentionally leave the source YAML unchanged.
+    from robot_config import inference_config
+    from robot_config.launch_builders.execution import build_execution
+
+    with monkeypatch.context() as patch:
+        parse = inference_config.parse_inference_config
+        decisions = []
+
+        def checked_parse(*args, **kwargs):
+            decisions.append((kwargs["scheduler_enabled"], kwargs["runtime_target"]))
+            return parse(*args, **kwargs)
+
+        patch.setattr(inference_config, "parse_inference_config", checked_parse)
+        built_nodes = _nodes(build_execution(prepared.context).actions)
+    assert decisions == [(prepared.scheduler_enabled, prepared.runtime_target)]
+    assert ("runtime_policy_json" in _node_parameters(built_nodes[0])) is scheduled
+    assert [node.node_executable for node in built_nodes] == (
+        ["pipeline_policy_node", "global_inference_scheduler_node", "scheduled_action_dispatcher_node"]
+        if scheduled
+        else ["pipeline_policy_node", "action_dispatcher_node"]
+    )
+
+    # Independent builders receive the same explicit target and clock as launch.
+    # Configuration declarations remain untouched by target overrides.
+    for builder in (generate_execution_nodes, generate_inference_node):
+        nodes = _nodes(
+            builder(
+                config,
+                "model_inference",
+                runtime_target=prepared.runtime_target,
+                use_sim_time=prepared.context.node_use_sim_time,
+            )
+        )
+        policy = _node_parameters(nodes[0])
+        assert policy["use_sim"] is (not scheduled)
+        assert ("runtime_policy_json" in policy) is scheduled
+        if builder is generate_execution_nodes:
+            assert [node.node_executable for node in nodes] == (
+                ["pipeline_policy_node", "global_inference_scheduler_node", "scheduled_action_dispatcher_node"]
+                if scheduled
+                else ["pipeline_policy_node", "action_dispatcher_node"]
+            )
+    if not arguments:
+        config_path.write_text(yaml.safe_dump({"robot": config}))
+        capsys.readouterr()
+        assert tracing_main([str(config_path), "--control-mode", "model_inference"]) == 0
+        topology = json.loads(capsys.readouterr().out)
+        assert (topology["metadata"].get("dispatch_path") == "scheduled") is scheduled
+    assert config == original
+
+
+def test_legacy_use_sim_argument_keeps_enabled_scheduler_dormant(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
 
-    with pytest.raises(InferenceConfigError, match="simulation does not support"):
-        generate_execution_nodes(config, use_sim="true")
+    nodes = _nodes(generate_execution_nodes(config, use_sim="true"))
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+    assert "runtime_policy_json" not in _node_parameters(nodes[0])
 
 
 @pytest.mark.parametrize("explicit_false", [False, True])
@@ -221,7 +573,7 @@ def test_simulation_uses_legacy_inference_without_scheduler(tmp_path: Path, expl
     bundle = _create_bundle(tmp_path / "bundle")
     config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
     if explicit_false:
-        config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+        config["runtime_scheduler"] = {"enable": False}
 
     nodes = generate_execution_nodes(config, use_sim=True, runtime_target=RuntimeTarget.SIMULATION)
 
@@ -289,7 +641,7 @@ def test_missing_joint_list_error_links_to_existing_documentation(tmp_path):
 def test_scheduler_enable_false_produces_legacy_dispatcher_only(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+    robot_config["runtime_scheduler"] = {"enable": False}
 
     nodes = generate_execution_nodes(robot_config, "model_inference")
 
@@ -345,14 +697,12 @@ def test_scheduler_enable_false_matches_absent_scheduler_launch_graph(tmp_path: 
     bundle = _create_bundle(tmp_path / "bundle")
     absent_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
     false_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
-    false_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+    false_config["runtime_scheduler"] = {"enable": False}
 
     absent_nodes = generate_execution_nodes(absent_config, "model_inference")
     false_nodes = generate_execution_nodes(false_config, "model_inference")
 
-    assert all(isinstance(action, Node) for action in false_nodes)
-    assert [node.node_executable for node in false_nodes] == [node.node_executable for node in absent_nodes]
-    assert [_node_parameters(node) for node in false_nodes] == [_node_parameters(node) for node in absent_nodes]
+    assert _launch_snapshot(false_nodes, tmp_path) == _launch_snapshot(absent_nodes, tmp_path)
     pipeline_params = _node_parameters(false_nodes[0])
     assert "scheduler_enabled" not in pipeline_params
     assert not any(key.startswith("scheduled_") for key in pipeline_params)
@@ -364,13 +714,12 @@ def test_complete_scheduled_config_needs_only_enable_false_for_legacy_launch(tmp
     config_path = tmp_path / "robot.yaml"
     legacy_config = _legacy_robot_config(config_path, bundle)
     disabled_config = _scheduled_robot_config(config_path, bundle, profile)
-    disabled_config["control_modes"]["model_inference"]["inference"]["scheduler"]["enable"] = False
+    disabled_config["runtime_scheduler"]["enable"] = False
 
     legacy_nodes = generate_execution_nodes(legacy_config, "model_inference")
     disabled_nodes = generate_execution_nodes(disabled_config, "model_inference")
 
-    assert [node.node_executable for node in disabled_nodes] == [node.node_executable for node in legacy_nodes]
-    assert [_node_parameters(node) for node in disabled_nodes] == [_node_parameters(node) for node in legacy_nodes]
+    assert _launch_snapshot(disabled_nodes, tmp_path) == _launch_snapshot(legacy_nodes, tmp_path)
     assert [node.node_executable for node in disabled_nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
 
     pipeline_params = _node_parameters(disabled_nodes[0])
@@ -394,7 +743,7 @@ def test_edf_policy_is_forwarded_to_global_scheduler(tmp_path: Path) -> None:
     profile = _profile_file(tmp_path)
     config_path = tmp_path / "robot.yaml"
     robot_config = _scheduled_robot_config(config_path, bundle, profile)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"]["global_policy"] = "edf"
+    robot_config["runtime_scheduler"]["global_policy"] = "edf"
 
     nodes = generate_execution_nodes(robot_config, "model_inference")
     scheduler = next(node for node in nodes if node.node_executable == "global_inference_scheduler_node")
@@ -410,7 +759,7 @@ def test_scheduler_disabled_matches_63d80599_legacy_launch_contract(tmp_path: Pa
     bundle = _create_bundle(tmp_path / "bundle")
     config_path = tmp_path / "robot.yaml"
     robot_config = _legacy_robot_config(config_path, bundle)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+    robot_config["runtime_scheduler"] = {"enable": False}
 
     nodes = generate_execution_nodes(robot_config, "model_inference")
 

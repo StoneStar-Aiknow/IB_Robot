@@ -676,6 +676,11 @@ ros2 launch robot_navigation ekf_rtabmap_launch.py
 ### 2. robot_navigation standalone 测试
 
 这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
+导航 launch builder 的单元测试（`test/test_navigation_launch_builder.py`、
+`test/test_nav2_builder.py`、`test/test_provider_navigation_ownership.py`、
+`test/test_navigation_velocity_contract.py`）已随 `launch_builders/` 从 robot_config 迁入本包
+（openspec change `migrate-business-launch-builders`），同样在这一步运行；它们导入 robot_config
+的 loader/registry，因此步骤 1 的构建需包含 robot_config。
 
 ```bash
 colcon test --packages-select robot_navigation --base-paths src --event-handlers console_direct+

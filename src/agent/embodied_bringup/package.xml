@@ -18,6 +18,12 @@
   <exec_depend>skill_library</exec_depend>
   <exec_depend>safety_guard</exec_depend>
   <exec_depend>perception_service</exec_depend>
+  <!-- The recording launch wiring moved to dataset_tools (openspec change
+       ``migrate-business-launch-builders``): the embodied pipeline's
+       record:=true consumers participate through the
+       ibrobot.launch_builders entry point group, so the package must be
+       present for them to register. -->
+  <exec_depend>dataset_tools</exec_depend>
   <exec_depend>manipulation_service</exec_depend>
   <exec_depend>manipulation_execution</exec_depend>
   <exec_depend>robot_runtime</exec_depend>
@@ -27,6 +33,12 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The migrated launch-builder tests import the perception-model node
+       generator and the recording builder from their owning packages
+       (openspec change ``migrate-business-launch-builders``, design
+       decision 3). -->
+  <test_depend>inference_service</test_depend>
+  <test_depend>dataset_tools</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

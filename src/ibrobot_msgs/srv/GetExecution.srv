@@ -28,3 +28,7 @@ string actual_registry_digest
 # UNKNOWN remains the original outcome; reconciliation only releases quarantine.
 bool reconciled
 string reconciliation_evidence
+# The interrupted step (canonical_steps[completed_step_count]) stopped at a
+# checkpoint it can resume from; step_progress is its completed share in [0, 1].
+bool step_resumable
+float32 step_progress

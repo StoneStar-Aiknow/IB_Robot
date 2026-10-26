@@ -17,7 +17,9 @@ from robot_config.loader import (
 ROBOTS = Path(__file__).resolve().parents[1] / "config" / "robots"
 CONFIG = ROBOTS / "aimdk_x2_skills.yaml"
 # src/robot_config/test/ -> src/
-PROFILE = Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
+PROFILE = (
+    Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra_omnihand.yaml"
+)
 
 
 @pytest.fixture(scope="module")
@@ -30,7 +32,8 @@ def test_configuration_is_valid(config):
     validate_robot_config_dict(config, deferred_interfaces=True)
     # The gesture profile stays voice-free: the voice chain lives in the
     # aimdk_x2_voice overlay so this deployment never needs the ASR bundle.
-    assert config["audio_io"]["enabled"] is False
+    # runtime-owned-audio-io removed the audio_io section from provider configs.
+    assert "audio_io" not in config
     assert config["voice_asr"]["enabled"] is False
 
 
@@ -48,13 +51,15 @@ def test_it_extends_the_x2_runtime_without_an_arm_surface(config):
     assert config["skill_required_control_mode"] == "named_motion"
 
 
-def test_named_motion_mode_selects_the_runtime_idle_mode_without_a_dispatcher(config):
+def test_named_motion_mode_selects_the_runtime_stream_mode_without_a_dispatcher(config):
+    """Skills run in the stream mode, where the selected profile replays recorded gestures."""
     profile = yaml.safe_load(PROFILE.read_text(encoding="utf-8"))
     mode = config["control_modes"]["named_motion"]
 
-    assert mode["runtime_mode"] == "idle"
-    assert "idle" in profile["modes"]
-    assert profile["vendor"]["named_motion"]["allowed_modes"] == ["idle"]
+    assert config["runtime"]["profile"] == PROFILE.stem
+    assert mode["runtime_mode"] == "stream"
+    assert "stream" in profile["modes"]
+    assert profile["vendor"]["named_motion"]["trajectory_modes"] == ["stream"]
     assert mode["executor"]["enabled"] is False
 
 
@@ -147,7 +152,7 @@ def _description(interfaces, *, ready=()):
 
     description = {
         "schema_version": 1,
-        "robot": {"id": "aimdk_robot", "type": "x2_ultra", "runtime_name": "aimdk_robot", "runtime_version": "0"},
+        "robot": {"id": "aimdk_robot", "type": PROFILE.stem, "runtime_name": "aimdk_robot", "runtime_version": "0"},
         "execution": "simulated",
         "interfaces": dict(interfaces),
         "states": {
@@ -193,7 +198,7 @@ def test_voice_profile_layers_on_the_gesture_profile(voice_config):
     # catalog validates the robot context name against the catalog profile.
     assert voice_config["name"] == "aimdk_x2_skills"
     assert voice_config["_config_sources"][-2].endswith("aimdk_x2_skills.yaml")
-    assert voice_config["audio_io"] == {"enabled": True, "source": "runtime"}
+    assert "audio_io" not in voice_config
     assert voice_config["voice_asr"]["input_mode"] == "external_vad"
     assert voice_config["voice_asr"]["audio_input"]["interface"] == "audio.speech"
     # bundle_path/deployment are deliberately absent so a mainline model upgrade

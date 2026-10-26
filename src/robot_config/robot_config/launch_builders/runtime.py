@@ -43,6 +43,7 @@ from robot_config.interface_binding import (
     bind_robot_interfaces,
     required_interface_ids,
     required_interface_requirements,
+    semantic_mapping_interface_ids,
 )
 from robot_config.logger_utils import get_colored_logger
 
@@ -96,13 +97,23 @@ def resolve_runtime_launch(provider: str) -> str:
 def _write_peripherals_fragment(robot_config: dict[str, Any]) -> str:
     """Serialize the deployment peripherals/fast_lio inventory for the runtime.
 
+    The application layer is ``peripherals`` followed by the loader-recorded
+    ``runtime._disabled_peripherals`` (runtime-peripheral-overrides D2; a
+    missing key means none). The runtime applies this single override layer
+    to its profile with ``merge_peripherals``, yielding profile < robot
+    configuration; without device fields the serialisation is unchanged
+    (byte-identical for shipped configurations).
+
     Returns "" when the configuration declares nothing beyond profile defaults.
     """
-    fragment: dict[str, Any] = {}
-    peripherals = robot_config.get("peripherals") or []
+    runtime = robot_config.get("runtime") or {}
+    application = list(robot_config.get("peripherals") or []) + list(
+        (runtime.get("_disabled_peripherals") if isinstance(runtime, dict) else None) or []
+    )
     fast_lio = (robot_config.get("navigation") or {}).get("fast_lio") or {}
-    if peripherals:
-        fragment["peripherals"] = peripherals
+    fragment: dict[str, Any] = {}
+    if application:
+        fragment["peripherals"] = application
     if fast_lio.get("enabled"):
         fragment["fast_lio"] = fast_lio
     if not fragment:
@@ -119,11 +130,20 @@ def generate_runtime_provider_actions(
     robot_config: dict[str, Any],
     *,
     use_sim: bool,
+    sim_platform: str = "sdk",
+    simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
     description_output: str | None = None,
 ) -> tuple[list, Node]:
-    """Return (provider launch include, wait_for_runtime readiness/reconciliation node)."""
+    """Return (provider launch include, wait_for_runtime readiness/reconciliation node).
+
+    Generic launch passes its selection through unchanged
+    (runtime-simulation-platform D1/D3): ``use_sim:=`` always, plus
+    ``sim_platform:=`` when simulated — never the legacy ``simulated`` alias.
+    The Gazebo platform additionally hands the provider the resolved world
+    name and the full spawn pose from ``simulation_startup``.
+    """
     provider = runtime_provider(robot_config)
     if not provider:
         raise RuntimeError("robot.runtime.provider is required for runtime-provider bring-up")
@@ -142,28 +162,88 @@ def generate_runtime_provider_actions(
     mode_config = (robot_config.get("control_modes") or {}).get(mode_name) or {}
     runtime_mode = str(mode_config.get("runtime_mode", "") or "").strip()
     initial_mode = "trajectory" if runtime_mode == "trajectory" else ""
-    logger.info(
-        f"runtime.provider={provider}: including {launch_path} "
-        f"(profile={profile}, simulated={use_sim}, initial_mode={initial_mode or 'profile default'}, "
-        f"peripherals={peripherals_file or 'profile defaults'})"
-    )
+    include_arguments: dict[str, str] = {
+        "profile": profile,
+        "display": "true" if display else "false",
+        "peripherals": peripherals_file,
+        **({"initial_mode": initial_mode} if initial_mode else {}),
+        **(
+            {"instance_id": str(robot_config["runtime"]["instance_id"])}
+            if (robot_config.get("runtime") or {}).get("instance_id")
+            else {}
+        ),
+    }
+    include_arguments["use_sim"] = "true" if use_sim else "false"
+    if use_sim:
+        include_arguments["sim_platform"] = str(sim_platform).lower()
+    platform = str(sim_platform).lower() if use_sim else ""
+    if platform == "gazebo":
+        # D3: the world owner hands the provider the resolved world name and
+        # spawn pose (x, y, z, yaw) — nothing is recomputed here. An empty
+        # world name means the provider starts its own minimal empty world.
+        startup = simulation_startup
+        world_name = str(getattr(startup, "world_name", "") or "")
+        spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
+        include_arguments.update(
+            {
+                "gazebo_world": world_name,
+                "spawn_x": str(spawn_pose[0]),
+                "spawn_y": str(spawn_pose[1]),
+                "spawn_z": str(spawn_pose[2]),
+                "spawn_yaw": str(spawn_pose[3]),
+            }
+        )
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, use_sim=true, sim_platform=gazebo, world={world_name!r}, spawn={spawn_pose}, "
+            f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
+        )
+    elif platform == "mujoco":
+        # so101-mujoco-runtime-platform D3: the world owner hands the provider
+        # the resolved scene NAME and spawn pose — no file path crosses the
+        # boundary and nothing is recomputed. An empty scene name means the
+        # robot model runs alone (the provider-alone behaviour).
+        startup = simulation_startup
+        scene_name = str(getattr(startup, "scene_name", "") or "")
+        spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
+        include_arguments.update(
+            {
+                "mujoco_scene": scene_name,
+                "spawn_x": str(spawn_pose[0]),
+                "spawn_y": str(spawn_pose[1]),
+                "spawn_z": str(spawn_pose[2]),
+                "spawn_yaw": str(spawn_pose[3]),
+            }
+        )
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, use_sim=true, sim_platform=mujoco, scene={scene_name!r}, spawn={spawn_pose}, "
+            f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
+        )
+    else:
+        logger.info(
+            f"runtime.provider={provider}: including {launch_path} "
+            f"(profile={profile}, use_sim={use_sim}"
+            + (f", sim_platform={str(sim_platform).lower()}" if use_sim else "")
+            + f", initial_mode={initial_mode or 'profile default'}, "
+            f"peripherals={peripherals_file or 'profile defaults'})"
+        )
 
     include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(launch_path),
-        launch_arguments={
-            "profile": profile,
-            "simulated": "true" if use_sim else "false",
-            "display": "true" if display else "false",
-            "peripherals": peripherals_file,
-            **({"initial_mode": initial_mode} if initial_mode else {}),
-            **(
-                {"instance_id": str(robot_config["runtime"]["instance_id"])}
-                if (robot_config.get("runtime") or {}).get("instance_id")
-                else {}
-            ),
-        }.items(),
+        launch_arguments=include_arguments.items(),
     )
     required = required_capabilities(robot_config)
+    # runtime-peripheral-overrides review round 2 (Major 1, corrected): the
+    # online semantic-mapping consumer needs the configured camera's colour,
+    # aligned-depth and camera-info interfaces to EXIST. The waiter checks
+    # them as declared interfaces only — no readiness, freshness or graph
+    # gate — because this waiter is the shared barrier for every
+    # runtime_ready action on non-binding provider paths, and a slow driver
+    # or a late-publishing simulator must not block the whole startup. The
+    # IDs do NOT feed required_interface_ids, so provider configurations
+    # without require_model keep their non-binding startup flow.
+    semantic_interface_ids = semantic_mapping_interface_ids(robot_config)
     interface_ids = required_interface_ids(robot_config) if description_output else []
     instance_id = (robot_config.get("runtime") or {}).get("instance_id")
     waiter = Node(
@@ -179,6 +259,7 @@ def generate_runtime_provider_actions(
             *(["--required", *required] if required else []),
             *(["--description-output", description_output] if description_output else []),
             *(["--require-interfaces", *interface_ids] if interface_ids else []),
+            *(["--declared-interfaces", *semantic_interface_ids] if semantic_interface_ids else []),
             *(
                 ["--interface-requirements", json.dumps(required_interface_requirements(robot_config))]
                 if interface_ids
@@ -191,12 +272,25 @@ def generate_runtime_provider_actions(
 
 
 def materialize_interface_config(robot_config: dict[str, Any], descriptor: dict, destination: Path) -> dict:
-    """Validate then atomically publish one complete, bound consumer configuration."""
+    """Validate then atomically publish one complete, bound consumer configuration.
+
+    The serialised snapshot drops the framework-private
+    ``runtime._disabled_peripherals`` (runtime-peripheral-overrides D2; the
+    filtered entries are an in-memory hand-off to the fragment builder). The
+    input configuration is not mutated.
+    """
+    from copy import deepcopy
+
     from robot_config.loader import validate_robot_config_dict
 
     effective = bind_robot_interfaces(robot_config, descriptor, require_ready=True)
     validate_robot_config_dict(effective)
     snapshot = {key: value for key, value in effective.items() if key != "_config_path"}
+    runtime = snapshot.get("runtime")
+    if isinstance(runtime, dict):
+        runtime = deepcopy(runtime)
+        runtime.pop("_disabled_peripherals", None)
+        snapshot["runtime"] = runtime
     encoded = yaml.safe_dump({"robot": snapshot}, sort_keys=False)
     temporary_path = None
     try:
@@ -218,10 +312,18 @@ def generate_bound_runtime_actions(
     construct_consumers,
     *,
     use_sim: bool,
+    sim_platform: str = "sdk",
+    simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
 ) -> list:
-    """Start the provider once; only construct consumers after the live description is bound."""
+    """Start the provider once; only construct consumers after the live description is bound.
+
+    ``simulation_startup`` carries the world hand-off for a physics transport
+    (runtime-simulation-transport D3): the world generic launch started ahead
+    of this call is passed to the provider as ``gazebo_world`` plus the full
+    spawn pose instead of being recomputed or re-launched.
+    """
     directory = Path(tempfile.mkdtemp(prefix="ibrobot_interfaces_"))
     description_path = directory / "description.yaml"
     effective_path = directory / "robot.yaml"
@@ -229,6 +331,8 @@ def generate_bound_runtime_actions(
         providers, waiter = generate_runtime_provider_actions(
             robot_config,
             use_sim=use_sim,
+            sim_platform=sim_platform,
+            simulation_startup=simulation_startup,
             display=display,
             readiness_timeout_s=readiness_timeout_s,
             description_output=str(description_path),

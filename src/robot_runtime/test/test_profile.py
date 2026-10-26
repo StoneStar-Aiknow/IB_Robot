@@ -24,6 +24,90 @@ def test_minimal_profile_validates_and_fills_defaults():
     assert data["stop_default_policy"] == "HOLD"
 
 
+def test_sim_selection_defaults_match_legacy_simulated():
+    data = _minimal()
+    validate_profile(data, "unit")
+    assert data["sim_platforms"] == ["sdk"]
+    assert data["sim_platform"] == "sdk"
+    assert data["use_sim"] is False
+    legacy = _minimal()
+    legacy["simulated"] = True
+    validate_profile(legacy, "unit")
+    assert legacy["use_sim"] is True
+    assert legacy["sim_platform"] == "sdk"
+    assert legacy["sim_platforms"] == ["sdk"]
+
+
+def test_profile_declares_supported_platforms_and_default():
+    data = _minimal()
+    data["sim_platforms"] = ["sdk", "gazebo"]
+    data["sim_platform"] = "gazebo"
+    validate_profile(data, "unit")
+    assert data["sim_platform"] == "gazebo"
+    # declaring a default platform does not by itself select simulation
+    assert data["use_sim"] is False
+    assert data["simulated"] is False
+
+
+def test_profile_may_declare_mujoco_and_physics_platforms_vocabulary():
+    from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
+
+    data = _minimal()
+    data["sim_platforms"] = ["sdk", "gazebo", "mujoco"]
+    data["sim_platform"] = "mujoco"
+    validate_profile(data, "unit")
+    assert data["sim_platform"] == "mujoco"
+    # the physics vocabulary is exactly the non-sdk platforms (D1)
+    assert set(PHYSICS_SIM_PLATFORMS) == set(SIM_PLATFORMS) - {"sdk"}
+
+
+def test_simulated_alias_disagreeing_with_use_sim_fails_naming_both():
+    data = _minimal()
+    data["use_sim"] = False
+    data["simulated"] = True
+    with pytest.raises(ProfileError, match=r"use_sim: False.*'simulated: True' disagrees"):
+        validate_profile(data, "unit")
+
+
+@pytest.mark.parametrize("sim_platforms", [[], "gazebo", ["sdk", "sdk"], ["teleport"]])
+def test_invalid_sim_platforms_list_rejected(sim_platforms):
+    data = _minimal()
+    data["sim_platforms"] = sim_platforms
+    with pytest.raises(ProfileError, match="'sim_platforms'"):
+        validate_profile(data, "unit")
+
+
+def test_unknown_sim_platform_value_rejected():
+    data = _minimal()
+    data["sim_platform"] = "teleport"
+    with pytest.raises(ProfileError, match="'sim_platform' must be one of"):
+        validate_profile(data, "unit")
+
+
+def test_default_platform_outside_declared_set_rejected():
+    data = _minimal()
+    data["sim_platforms"] = ["sdk"]
+    data["use_sim"] = True
+    data["sim_platform"] = "gazebo"
+    with pytest.raises(ProfileError, match=r"sim_platform 'gazebo'.*not in the supported platforms \['sdk'\]"):
+        validate_profile(data, "unit")
+
+
+def test_default_platform_outside_minimal_set_names_platform_set_and_source():
+    data = _minimal()
+    data["simulated"] = True  # default platform sdk; declare a set without it
+    data["sim_platforms"] = ["gazebo"]
+    with pytest.raises(ProfileError, match=r"sim_platform 'sdk'.*not in the supported platforms \['gazebo'\].*unit"):
+        validate_profile(data, "unit")
+
+
+def test_simulated_must_be_a_boolean():
+    data = _minimal()
+    data["simulated"] = "false"
+    with pytest.raises(ProfileError, match="'simulated' must be a boolean"):
+        validate_profile(data, "unit")
+
+
 @pytest.mark.parametrize("missing", ["runtime", "modes", "capabilities", "joints"])
 def test_missing_required_key_names_key_and_source(missing):
     data = _minimal()
@@ -92,3 +176,48 @@ def test_mock_default_profile_is_valid():
         data = default_profile(base=base)
         validate_profile(data, "mock")
         assert ("base.cmd_vel" in data["capabilities"]) is base
+
+
+# ---------------------------------------------------------------------------
+# Conformance start pose (issue #194, upgrade-mujoco D9): optional
+# conformance.start_positions shape validation.
+# ---------------------------------------------------------------------------
+
+
+def test_conformance_start_positions_accepts_arm_joints_with_int_and_float():
+    data = _minimal()
+    data["arm_joints"] = ["a", "b"]
+    data["conformance"] = {"start_positions": {"a": 0, "b": -1.5}}  # int and float both fine
+    validate_profile(data, "unit")
+
+
+def test_conformance_start_positions_rejects_non_arm_joints():
+    # the conformance reset drives arm joints only (D9); a gripper joint
+    # would be accepted against `joints` but silently ignored by the suite
+    data = _minimal()
+    data["arm_joints"] = ["a"]
+    data["conformance"] = {"start_positions": {"b": 0.0}}
+    with pytest.raises(ProfileError, match="names non-arm joints \\['b'\\]"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"nope": 0.0}}
+    with pytest.raises(ProfileError, match="names non-arm joints \\['nope'\\]"):
+        validate_profile(data, "unit")
+
+
+def test_conformance_start_positions_rejects_bools_nonfinite_and_nonmapping():
+    data = _minimal()
+    data["conformance"] = {"start_positions": {"a": True}}
+    with pytest.raises(ProfileError, match="conformance\\.start_positions\\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"a": False}}
+    with pytest.raises(ProfileError, match="conformance\\.start_positions\\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"a": float("nan")}}
+    with pytest.raises(ProfileError, match=r"conformance\.start_positions\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": ["a"]}
+    with pytest.raises(ProfileError, match="must be a non-empty mapping"):
+        validate_profile(data, "unit")
+    data["conformance"] = []
+    with pytest.raises(ProfileError, match="'conformance' must be a mapping"):
+        validate_profile(data, "unit")

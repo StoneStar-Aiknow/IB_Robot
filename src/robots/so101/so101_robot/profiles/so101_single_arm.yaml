@@ -10,16 +10,36 @@ runtime:
   version: 0.1.0
   type: so101
 
-# true: so101_hardware runs on the SDK simulated transport (no serial port, no
-# physics) — the production controller stack, headless. Overridable by the
-# `simulated` launch argument.
-simulated: false
+# use_sim selects simulated or physical execution (the same vocabulary as
+# generic launch; `simulated:` stays a deprecated alias). true: so101_hardware
+# runs on the `sdk` platform — the vendor SDK virtual bus, no serial port, no
+# physics — the production controller stack, headless. `sim_platforms`
+# declares the supported platforms; `sim_platform:=gazebo` runs the same
+# controllers against Gazebo physics (runtime-simulation-platform).
+use_sim: false
+sim_platforms: [sdk, gazebo, mujoco]
+sim_platform: sdk
 
 controller_manager: controller_manager
 joint_state_topic: /joint_states
 joints: ["1", "2", "3", "4", "5", "6"]
 arm_joints: ["1", "2", "3", "4", "5"]
 gripper_joints: ["6"]
+
+# Conformance start pose (issue #194, upgrade-mujoco D9): the robot-agnostic
+# conformance suite resets the arm joints to these values before every
+# arm-moving motion test. All-zero keeps every conformance target above the
+# MuJoCo mount plane — FK margins from zero on the composed empty model:
+# stream +0.3 -> +3.9 cm, stream hold +0.2 -> +10.2 cm, trajectory +0.25 on
+# joints 1-2 -> +16.2 cm, move_to_joint +0.2 on joints 1-2 -> +17.6 cm
+# (from the profile HOME the stream targets dip -2.7 / -1.4 cm below it).
+conformance:
+  start_positions:
+    "1": 0.0
+    "2": 0.0
+    "3": 0.0
+    "4": 0.0
+    "5": 0.0
 
 # Semantic HOME is not an actuator startup command.
 home_positions:
@@ -143,8 +163,39 @@ interfaces:
     frame_id: base
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
 
+# D6b: on the Gazebo transport the joint.current interface is a simulated
+# estimate derived from the simulated joint effort (/joint_states effort ×
+# scale, republished by robot_runtime/joint_current_publisher). Scale 1
+# matches the hardware adapter's effort-as-current semantics.
+simulation:
+  gazebo:
+    joint_current:
+      scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # MuJoCo embodiment (so101-mujoco-runtime-platform D2/D6): the runtime-
+  # private robot MJCF template and meshes, the SDF-collision gripper meshes
+  # (robot-specific input to the robot-agnostic composition API) and the
+  # joint-current scale. camera_publish_rate is left at its default (the
+  # minimum camera fps, 30): the 3.5 rate sweep measured the plugin
+  # publishing exactly at the configured rate with full reliable delivery —
+  # every advertised stream sustained 29.2-30.0 Hz at a configured 30
+  # (>= 97% of advertised), RTF 1.000, load ~5/28 cores, both by a dedicated
+  # reliable subscriber and the facade's receipt-time rates.
+  mujoco:
+    template: $(find so101_description)/mujoco/so101.xml.template
+    meshes_dir: $(find so101_description)/meshes/lerobot/so101
+    sdf_meshes: [wrist_roll_follower, moving_jaw]
+    joint_current:
+      scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
 # D12: the robot's default sensor surface. Deployment robot YAMLs override
 # entries by (type, name) via the runtime `peripherals` launch argument.
+# The Gazebo/MuJoCo default poses/FOV are runtime-owned (D6.2 /
+# so101-mujoco-runtime-platform D5): per-camera simulation.<platform>.transform
+# + fovy, resolved by the shared pose resolver with user-saved overrides
+# taking precedence. The MuJoCo transforms are in MuJoCo-native convention
+# (camera looks -Z, up +Y; extrinsic XYZ euler matching the template's
+# eulerseq) and hold the values the provider-less MuJoCo path used before
+# its removal (front takes the old generic "base" preset pose).
 peripherals:
 - type: camera
   name: top
@@ -156,7 +207,27 @@ peripherals:
   pixel_format: mjpeg2rgb
   frame_id: camera_top_frame
   optical_frame_id: camera_top_optical_frame
-  use_default_transform: true
+  simulation:
+    gazebo:
+      transform:
+        parent_frame: world
+        x: 0.0419
+        y: 0.1123
+        z: 0.6136
+        roll: 0.057596
+        pitch: 1.518436
+        yaw: -1.518436
+      fovy: 47
+    mujoco:
+      transform:
+        parent_frame: world
+        x: 0.0419
+        y: 0.1123
+        z: 0.6136
+        roll: 0.052274
+        pitch: 0.003013
+        yaw: 3.136436
+      fovy: 47
   transform:
     parent_frame: base
     x: 0.0
@@ -165,7 +236,6 @@ peripherals:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
-  fovy: 0
 - type: camera
   name: wrist
   driver: opencv
@@ -176,7 +246,27 @@ peripherals:
   pixel_format: mjpeg2rgb
   frame_id: camera_wrist_frame
   optical_frame_id: camera_wrist_optical_frame
-  use_default_transform: true
+  simulation:
+    gazebo:
+      transform:
+        parent_frame: gripper
+        x: 0.002265
+        y: 0.073023
+        z: -0.016289
+        roll: -1.512475
+        pitch: 1.079239
+        yaw: -1.541112
+      fovy: 46
+    mujoco:
+      transform:
+        parent_frame: gripper
+        x: 0.002265
+        y: 0.073023
+        z: -0.016289
+        roll: 0.031197
+        pitch: -0.490648
+        yaw: -1.607245
+      fovy: 46
   transform:
     parent_frame: gripper
     x: 0.0
@@ -185,7 +275,6 @@ peripherals:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
-  fovy: 0
 - type: camera
   name: front
   driver: realsense
@@ -198,7 +287,29 @@ peripherals:
   align_depth: true
   frame_id: camera_front_link
   optical_frame_id: camera_front_optical_frame
-  use_default_transform: true
+  simulation:
+    gazebo:
+      transform:
+        parent_frame: base
+        x: 0.0
+        y: -0.28
+        z: 0.5
+        roll: 0.0
+        pitch: 1.5708
+        yaw: -1.5708
+      fovy: 70
+    # MuJoCo: the old generic "base" preset pose (so101-mujoco-runtime-
+    # platform D5 — front has no dedicated MuJoCo preset of its own).
+    mujoco:
+      transform:
+        parent_frame: base
+        x: 0.0
+        y: -0.28
+        z: 0.55
+        roll: 0.0
+        pitch: 0.0
+        yaw: 3.1415
+      fovy: 70
   transform:
     parent_frame: base
     x: 0.0
@@ -207,4 +318,3 @@ peripherals:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
-  fovy: 0

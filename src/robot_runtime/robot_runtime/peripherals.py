@@ -15,9 +15,9 @@ Peripheral sources are merged by ``(type, name)``:
 - the deployment robot YAML's ``peripherals:`` list overrides matching
   entries and may add deployment-specific ones (lidar IPs, camera serials).
 
-In simulated transport the physical drivers are replaced by
+When simulated the physical drivers are replaced by
 ``synthetic_perception`` publishers on the same topics, so the perception
-contract holds in both modes (the same principle the SDK simulated transport
+contract holds in both modes (the same principle the SDK simulation platform
 applies to motors).
 """
 
@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ import yaml
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import (
+    audio_capability_entries,
     build_description,
     camera_streams,
     merge_peripherals,
@@ -52,14 +54,56 @@ _POINTCLOUD_TYPE = "sensor_msgs/msg/PointCloud2"
 
 
 def load_peripherals_file(path: str) -> dict[str, Any]:
-    """Load a deployment peripherals fragment ``{peripherals: [...], fast_lio: {...}}``."""
+    """Load and structurally validate a peripherals fragment (D6).
+
+    The fragment format is ``{peripherals: [...], fast_lio: {...}}``; an
+    empty path yields ``{}``, and so does an empty document. This is the one
+    structural loader every fragment source uses (runtime launches, the
+    facade/mock nodes, launch_support and the offline CLI): structural errors
+    name the file so every caller reports the same message for the same
+    malformed file. An explicitly null ``peripherals``/``fast_lio`` value is
+    an error, distinct from a missing key.
+    """
     raw = (path or "").strip()
     if not raw:
         return {}
-    with open(resolve_path(raw), encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    resolved = resolve_path(raw)
+    try:
+        with open(resolved, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"peripherals file is not valid YAML: {raw} ({exc})") from exc
+    except OSError as exc:
+        raise ValueError(f"peripherals file is unreadable: {raw} ({exc})") from exc
+    if data is None:
+        data = {}  # an empty document is the empty fragment
     if not isinstance(data, dict):
         raise ValueError(f"peripherals file must be a mapping: {raw}")
+    unknown = sorted(set(data) - {"peripherals", "fast_lio"})
+    if unknown:
+        raise ValueError(
+            f"peripherals file {raw} has unknown top-level keys: {unknown} (expected a subset of peripherals, fast_lio)"
+        )
+    if "peripherals" in data:
+        peripherals = data["peripherals"]
+        if peripherals is None:
+            raise ValueError(f"peripherals file {raw}: peripherals must be a list (explicit null is not a fragment)")
+        if not isinstance(peripherals, list):
+            raise ValueError(f"peripherals file {raw}: peripherals must be a list")
+        seen: set[tuple[Any, Any]] = set()
+        for entry in peripherals:
+            if not isinstance(entry, dict) or not entry.get("type") or not entry.get("name"):
+                raise ValueError(f"peripherals file {raw}: every peripherals entry requires type and name")
+            key = (entry["type"], entry["name"])
+            if key in seen:
+                raise ValueError(f"peripherals file {raw}: duplicate peripheral {key}")
+            seen.add(key)
+    if "fast_lio" in data:
+        fast_lio = data["fast_lio"]
+        if fast_lio is None:
+            raise ValueError(f"peripherals file {raw}: fast_lio must be a mapping (explicit null is not a fragment)")
+        if not isinstance(fast_lio, dict):
+            raise ValueError(f"peripherals file {raw}: fast_lio must be a mapping")
     return data
 
 
@@ -67,12 +111,29 @@ def perception_capabilities(peripherals: list[dict[str, Any]] | None) -> dict[st
     """Perception capability specs (RuntimeStatus surface) for a peripheral list."""
     caps: dict[str, dict[str, Any]] = {}
     for spec in peripheral_interfaces(peripherals).values():
+        if not spec["capability"].startswith("perception."):
+            continue  # interaction.audio_* entries carry their format via audio_capabilities
         caps.setdefault(spec["capability"], {"topics": []})["topics"].append(spec["endpoint"])
     return caps
 
 
+def audio_capabilities(peripherals: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """``interaction.audio_*`` capability specs (RuntimeStatus surface) for a peripheral list."""
+    return audio_capability_entries(peripheral_interfaces(peripherals))
+
+
+def _has_synthetic_streams(description: dict) -> bool:
+    """Whether SyntheticStreams would publish anything for this description."""
+    return any(
+        spec["kind"] == "topic"
+        and spec["direction"] == "publish"
+        and (spec["capability"].startswith("perception.") or name.startswith("localization."))
+        for name, spec in description["interfaces"].items()
+    )
+
+
 def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, description: dict | None = None) -> list[Node]:
-    """Simulated-transport perception: publish the declared topics with synthetic data."""
+    """Simulated-execution perception: publish the declared topics with synthetic data."""
     if not peripherals and not (
         description and any(key.startswith("localization.") for key in description["interfaces"])
     ):
@@ -84,8 +145,13 @@ def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, descrip
                 "capabilities": {},
                 "peripherals": peripherals,
             },
-            simulated=True,
+            use_sim=True,
+            sim_platform="sdk",
         )
+    if not _has_synthetic_streams(description):
+        # e.g. audio-only peripherals: the real ALSA owners serve them in both
+        # modes, so there is nothing synthetic to publish.
+        return []
     return [
         Node(
             package="robot_runtime",
@@ -95,6 +161,86 @@ def synthetic_perception_nodes(peripherals: list[dict[str, Any]] | None, descrip
             parameters=[{"description_json": json.dumps(description)}],
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Audio device owners (audio_common ALSA nodes; openspec change
+# ``runtime-owned-audio-io``). This is the single node-generation source for
+# both paths: robot runtimes launch it from the peripheral list, and
+# robot_config's legacy provider-less ``audio_io`` entry calls the same
+# functions, so defaults, node names, parameters and topics cannot drift.
+# ---------------------------------------------------------------------------
+
+AUDIO_CAPTURE_TOPIC = "/audio/capture"
+AUDIO_CAPTURE_STAMPED_TOPIC = "/audio/capture_stamped"
+AUDIO_INFO_TOPIC = "/audio/info"
+AUDIO_PLAY_TOPIC = "/audio/play"
+
+
+def audio_capture_node(
+    params: Mapping[str, Any],
+    *,
+    capture_topic: str = AUDIO_CAPTURE_TOPIC,
+    capture_stamped_topic: str = AUDIO_CAPTURE_STAMPED_TOPIC,
+    audio_info_topic: str = AUDIO_INFO_TOPIC,
+) -> Node:
+    """The shared ALSA ``audio_capture_node`` for one microphone peripheral."""
+    return Node(
+        package="audio_capture",
+        executable="audio_capture_node",
+        name="audio_capture",
+        output="screen",
+        parameters=[
+            {
+                "src": "alsasrc",
+                "dst": "appsink",
+                "format": "wave",
+                "device": str(params.get("device", "default")),
+                "channels": int(params.get("channels", 6)),
+                "sample_rate": int(params.get("sample_rate", 16000)),
+                "sample_format": str(params.get("sample_format", "S16LE")),
+                "depth": 16,
+            }
+        ],
+        remappings=[
+            ("audio", capture_topic),
+            ("audio_stamped", capture_stamped_topic),
+            ("audio_info", audio_info_topic),
+        ],
+    )
+
+
+def audio_play_node(params: Mapping[str, Any], *, playback_topic: str = AUDIO_PLAY_TOPIC) -> Node:
+    """The shared ALSA ``audio_play_node`` for one speaker peripheral."""
+    return Node(
+        package="audio_play",
+        executable="audio_play_node",
+        name="audio_play",
+        output="screen",
+        parameters=[
+            {
+                "dst": "alsasink",
+                "device": str(params.get("device", "")),
+                "format": "wave",
+                "channels": int(params.get("channels", 1)),
+                "depth": 16,
+                "sample_rate": int(params.get("sample_rate", 24000)),
+                "sample_format": str(params.get("sample_format", "S16LE")),
+            }
+        ],
+        remappings=[("audio", playback_topic)],
+    )
+
+
+def audio_nodes(peripherals: list[dict[str, Any]] | None) -> list[Node]:
+    """ALSA audio nodes for the (at most one each) microphone and speaker."""
+    nodes: list[Node] = []
+    for periph in merge_peripherals(peripherals, []):
+        if periph["type"] == "microphone":
+            nodes.append(audio_capture_node(periph.get("params") or {}))
+        elif periph["type"] == "speaker":
+            nodes.append(audio_play_node(periph.get("params") or {}))
+    return nodes
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +799,14 @@ def peripheral_nodes(peripherals: list[dict[str, Any]] | None, use_sim: bool) ->
             else:
                 logger.warning("unsupported lidar driver %r for peripheral %r, skipping", driver, periph.get("name"))
         elif ptype == "microphone":
-            continue  # audio contract data consumed by the voice stack, no ROS node
+            # Host audio device owned by the runtime (interaction.audio_capture).
+            # No static TF: audio streams carry no frame.
+            nodes.append(audio_capture_node(periph.get("params") or {}))
+            continue
+        elif ptype == "speaker":
+            # Host audio device owned by the runtime (interaction.audio_playback).
+            nodes.append(audio_play_node(periph.get("params") or {}))
+            continue
         else:
             logger.warning("unsupported peripheral type %r (%r), skipping", ptype, periph.get("name"))
         nodes.extend(_peripheral_tf_nodes(periph))

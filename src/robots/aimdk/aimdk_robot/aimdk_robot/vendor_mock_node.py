@@ -103,6 +103,8 @@ class AimdkVendorMock(Node):
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("aimdk_vendor_mock", **node_kwargs)
         self.declare_parameter("hand_type", "claw")
+        # Right side's hand type when it differs ("none": an X2 with only a left hand).
+        self.declare_parameter("right_hand_type", "")
         self.declare_parameter("body_pose", projection.BODY_POSE_STAND)
         self.declare_parameter("initial_action", "STAND_DEFAULT")
         self.declare_parameter("system_state", "Business")
@@ -349,14 +351,35 @@ class AimdkVendorMock(Node):
                 self._current_source = source
             return self._current_source == source
 
+    def _hand_type_values(self) -> tuple[int, int]:
+        left = HAND_TYPE_VALUES.get(str(self.get_parameter("hand_type").value), vg.HAND_TYPE_CLAW)
+        right_name = str(self.get_parameter("right_hand_type").value)
+        return left, HAND_TYPE_VALUES.get(right_name, vg.HAND_TYPE_CLAW) if right_name else left
+
+    @staticmethod
+    def _hand_joints(side: str, value: int, positions: dict[str, float]) -> list:
+        """A dexterous hand reports its ten joints by name, as on the robot; an absent one reports none."""
+        if vg.hand_type_family(value) == "dexterous":
+            prefix = "L" if side == "left" else "R"
+            return [
+                HandState(name=f"{prefix}_{joint}_joint", position=0.0, velocity=0.0, effort=0.0)
+                for joint in projection.DEXTEROUS_JOINT_ORDER
+            ]
+        if value == vg.HAND_TYPE_NONE and side == "right":
+            return []
+        name = f"{side}_hand"
+        return [HandState(name=name, position=positions.get(name, 0.0), velocity=0.0, effort=0.0)]
+
     def _get_hand_type(self, _request, response):
         # The service may know less than the state stream (hand_type_service
         # overrides it, e.g. NONE from the service while the stream reports a
         # real hand type).
         override = str(self.get_parameter("hand_type_service").value)
-        value = HAND_TYPE_VALUES.get(override or str(self.get_parameter("hand_type").value), vg.HAND_TYPE_CLAW)
-        response.left_hands_type = HandType(value=value)
-        response.right_hands_type = HandType(value=value)
+        left, right = self._hand_type_values()
+        if override:
+            left = right = HAND_TYPE_VALUES.get(override, vg.HAND_TYPE_CLAW)
+        response.left_hands_type = HandType(value=left)
+        response.right_hands_type = HandType(value=right)
         response.reponse.header.code = 0
         return response
 
@@ -591,15 +614,11 @@ class AimdkVendorMock(Node):
             return
         hands = HandStateArray()
         hands.header = self._header()
-        value = HAND_TYPE_VALUES.get(str(self.get_parameter("hand_type").value), vg.HAND_TYPE_CLAW)
+        value, right = self._hand_type_values()
         hands.left_hand_type = HandType(value=value)
-        hands.right_hand_type = HandType(value=value)
-        hands.left_hands = [
-            HandState(name="left_hand", position=positions.get("left_hand", 0.0), velocity=0.0, effort=0.0)
-        ]
-        hands.right_hands = [
-            HandState(name="right_hand", position=positions.get("right_hand", 0.0), velocity=0.0, effort=0.0)
-        ]
+        hands.right_hand_type = HandType(value=right)
+        hands.left_hands = self._hand_joints("left", value, positions)
+        hands.right_hands = self._hand_joints("right", right, positions)
         # Touch arrays ride on this message; a claw reports none.
         if value != vg.HAND_TYPE_CLAW:
             cell = int(self.get_parameter("hand_touch_value").value)

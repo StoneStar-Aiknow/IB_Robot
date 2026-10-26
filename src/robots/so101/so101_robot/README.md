@@ -21,8 +21,9 @@ Plus stock ros2_control controllers. No generic IB-Robot package is in the closu
 ## Running standalone
 
 ```bash
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm            # hardware
-ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true   # SDK simulated transport
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm                          # hardware
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true            # sdk platform
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=gazebo     # Gazebo physics
 ```
 
 `profile` is a path or the name of a file in `profiles/`. The profile is the
@@ -34,15 +35,82 @@ The runtime reaches `ACTIVE` when the initial mode's controllers are active
 and publishes `/runtime_status`; `/runtime/set_mode`, `/runtime/stop`,
 `/runtime/get_status` and `/motion/*` are then available.
 
+### Simulation selection
+
+The runtime uses the same vocabulary as generic launch: `use_sim:=` selects
+simulated (`true`) or physical (`false`) execution, `sim_platform:=` selects
+which simulation platform replaces the robot when simulated. `use_sim:=false`
+means physical (no platform applies; passing a platform alongside it fails
+fast). `sdk` is the vendor SDK virtual bus behind the production hardware
+adapter — the full controller stack with no serial port and no physics.
+`gazebo` and `mujoco` are physics simulators. The profile declares the
+platforms it supports (`sim_platforms: [sdk, gazebo, mujoco]`) and a default
+(`sim_platform: sdk`); `sim_platform:=gazebo` (or `mujoco`) alone implies
+`use_sim:=true`, and a platform the profile does not declare fails before any
+process starts. The legacy `simulated:=` boolean stays a deprecated alias of
+`use_sim:=` (a warning names `use_sim`); a conflicting pair fails fast.
+`sim_platform:=gazebo` runs the same controllers, motion services, modes and
+stop behaviour against the simulator's ros2_control interface: the runtime
+starts a minimal empty world on its own (bring `IBROBOT_GAZEBO_HEADLESS=1`
+for server-only rendering), spawns the SO-101 into it and republishes the
+simulated joint effort as `joint.current`. When generic launch owns the
+world it passes `gazebo_world` and the spawn pose (`spawn_x/y/z/yaw`) and
+the runtime attaches to that world instead of starting one. Every node the
+runtime starts on this platform runs on simulation time. The Gazebo camera
+poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
+the profile); user-saved overrides under
+`~/.ros/ibrobot/sim_camera_overrides/` take precedence.
+
+`sim_platform:=mujoco` (issue #167, `mujoco_ros2_control` 0.1.2 /
+`mujoco_vendor` 0.1.1 / libmujoco 3.12.0) runs the same runtime against
+`mujoco_ros2_control`: one process is both the simulator and the controller
+manager, and the runtime starts it alone by default —
+
+```bash
+# provider alone (robot model only, no scene)
+ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
+# headless (no Simulate UI): camera rendering falls back to EGL when no
+# display is available, so no xvfb-run wrapper is needed (requires libegl1
+# plus a GL driver, both pulled in by the mujoco_ros2_control packages)
+IBROBOT_MUJOCO_HEADLESS=1 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
+```
+
+The workspace Python `mujoco` must equal the simulator's libmujoco
+(`requirements/mujoco-sim.txt` pins 3.12.0); a mismatch fails the launch
+before the model is composed. A venv installed with the LIBERO benchmark
+dependencies (`mujoco<3.9`) cannot run this platform — the same check
+reports it.
+
+When generic launch owns the world it passes the scene by name
+(`mujoco_scene:=<scene>`) plus the spawn pose, and the runtime composes its
+robot MJCF with that scene (e.g.
+`robot_config:=so101_single_arm_pick_banana use_sim:=true sim_platform:=mujoco`
+for the pick-and-place scene). The MuJoCo camera poses/FOV are runtime-owned
+too (`simulation.mujoco.transform` per camera; the same user-saved overrides
+apply, converted from the Gazebo convention), the plugin's single camera
+rate comes from `simulation.mujoco.camera_publish_rate` (default: the
+minimum camera fps), and the camera streams are advertised with reliable
+delivery. Every node the runtime starts on this platform runs on simulation
+time. A provider-less MuJoCo bring-up does not exist: MuJoCo is served
+through the runtime provider, and selecting `mujoco` without one fails at
+load.
+
 ## Conformance
 
 ```bash
-CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm simulated:=true" \
+CONFORMANCE_LAUNCH="ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=true" \
 CONFORMANCE_PROFILE=$(ros2 pkg prefix so101_robot)/share/so101_robot/profiles/so101_single_arm.yaml \
 python3 -m pytest src/robot_runtime/test/test_conformance.py -q
 ```
 
 This certifies the exact launch graph above (design D8), not a stand-in.
+
+The profile declares `conformance.start_positions` (all-zero for joints 1-5):
+arm-moving motion tests reset there first (issue #194). From all-zero every
+conformance target keeps the gripper above the MuJoCo mount plane (FK
+margins: stream +0.3 → +3.9 cm, hold +0.2 → +10.2 cm, trajectory +0.25 on
+joints 1-2 → +16.2 cm, move +0.2 → +17.6 cm); from the profile HOME the
+stream targets dip below it.
 
 ## Scope: single arm only
 
@@ -65,6 +133,10 @@ description (`RuntimeStatus.interface_description_json`, schema v1,
   published under their declared profiles, pointcloud is opt-in. In simulated
   transport, synthetic publishers serve the same topics with typed payloads
   and the camera monitor measures real readiness from received samples.
+  Per-machine differences (a resolution or frame rate) go into the robot
+  configuration's `peripherals:` list next to the matching `requires` — see
+  *Peripheral overrides from the robot configuration*
+  below.
 - **Model metadata** — the description's `model` projection carries named
   joint groups, admissible physical limits, semantic home positions, motion
   frames and the `joint_conversions` table with its fingerprint. Inference,
@@ -114,7 +186,62 @@ images and joint feedback were saved.
 
 `robot_config/config/robots/so101_single_arm.yaml` selects this runtime
 (`runtime.provider: so101_robot`, `simulation.platform: sdk`) and binds its
-contract to the public interfaces above. The retained
-`so101_single_arm_legacy.yaml` is the provider-less in-config bring-up used
-by unmigrated overlays (e.g. `so101_arm_aero_hand.yaml`) until their own
-migration; it is not the new-path configuration.
+contract to the public interfaces above. Overlays such as
+`so101_rtp_distributed.yaml` layer application deltas on it, and
+`so101_arm_aero_hand.yaml` is the retained provider-less profile for setups
+whose extra hardware (the Aero Hand) is not part of this runtime; the old
+provider-less single-arm bring-up configuration has been removed.
+
+## Peripheral overrides from the robot configuration
+
+Camera settings that differ per machine (resolution, frame rate, pixel
+format) are set in the **robot configuration's `peripherals:` list**, next to
+the observation contract (`requires: {width, height, min_fps}`) they must
+satisfy — a resolution change edits the configuration anyway, so the settings
+and the contract live in one place. Per-machine variants are `base_config`
+overlays of `so101_single_arm` that change both together. The runtime owns
+which peripherals exist, their drivers and their defaults; the configuration
+may override the enabled state and device settings of a declared device:
+
+```yaml
+# an overlay of so101_single_arm (peripherals + matching requires)
+robot:
+  base_config: so101_single_arm
+  name: so101_single_arm_720p
+  peripherals:
+    - type: camera
+      name: top
+      width: 1280
+      height: 720
+      fps: 15
+  contract:
+    observations:
+      - key: observation.images.top
+        interface: camera.top.color
+        requires: {width: 1280, height: 720, min_fps: 15}
+```
+
+Effective peripherals are layered by `(type, name)` — **runtime profile <
+robot configuration** — with the configuration winning on every field, the
+enabled state included: it can even re-enable a camera the profile disables.
+In every layer `disabled: X` is the same toggle as `enabled: not X`.
+
+What stays runtime-owned: a configuration entry may not set `driver` (the
+loader rejects it naming the entry) and cannot add a peripheral the runtime
+does not declare (the runtime's merge rejects an undeclared entry, and the
+configuration cannot declare a driver to add one).
+
+Fail-fast guarantees: a misspelled `(type, name)` and invalid camera values
+(non-positive or non-integer `width`/`height`, non-finite `fps`, unpaired
+`depth_width`/`depth_height`, `depth_fps` without the depth dimensions) fail
+the launch naming the device and the field, before any bound consumer
+starts. The observation contract still fails closed at binding: changing the
+camera without changing the matching `requires` fails the binding naming the
+interface and the mismatched width.
+
+Simulator limits: on **Gazebo** the depth/aligned-depth streams advertise
+the colour dimensions and rate the RGB-D sensor actually renders (the
+physical device's `depth_*` overrides do not apply); on **MuJoCo** the
+camera rate is the plugin's single global rate
+(`simulation.mujoco.camera_publish_rate`), which supersedes a per-camera
+`fps`. `fast_lio` stays in the application's `navigation.fast_lio:`.

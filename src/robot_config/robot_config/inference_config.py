@@ -25,13 +25,14 @@ from inference_manifest import (
 )
 
 from .inference_runtime_options import effective_latency_runtime_options
+from .runtime_target import RuntimeTarget, resolve_runtime_target
 
 PIPELINE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _INT32_MAX = 2_147_483_647
 
 _NODE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENDPOINT_PATTERN = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
-_INFERENCE_FIELDS = frozenset({"enabled", "pipelines", "scheduler"})
+_INFERENCE_FIELDS = frozenset({"enabled", "pipelines"})
 _SCHEDULED_PIPELINE_FIELDS = frozenset(
     {
         "required",
@@ -96,8 +97,7 @@ _NON_SCHEDULED_INTERFACE_FIELDS = (
 )
 
 # --- scheduler: the single scheduling feature switch and its policy block ---
-# `scheduler` is the only addition to _INFERENCE_FIELDS;
-# it is not itself a switch: `scheduler.enable` is.
+# The robot-level runtime_scheduler block supplies the existing policy scheduler.
 _SCHEDULER_FIELDS = frozenset(
     {
         "enable",
@@ -208,7 +208,7 @@ class InferencePipelineConfig:
     runtime_options: Mapping[str, object]
     transport: InferenceTransportConfig
     validated_manifest: ValidatedManifest
-    # Scheduled-only fields. Present only when scheduler.enable is true;
+    # Scheduled-only fields. Present only when robot.runtime_scheduler.enable is true;
     # None otherwise.
     required: bool = True
     compatibility_group: str | None = None
@@ -308,9 +308,21 @@ def _validate_stage_priority_range(
         raise InferenceConfigError(f"{path}: priorities must fit the Ascend range 0..7")
 
 
-def scheduler_enabled_from_raw_config(robot_config: Mapping[str, Any], control_mode: str) -> bool:
-    """Read only the opt-in switch for launch branches that do not start inference."""
+def _runtime_scheduler_block(robot_config: Mapping[str, Any]) -> Mapping[str, Any]:
+    block = robot_config.get("runtime_scheduler", {})
+    if not isinstance(block, Mapping):
+        raise InferenceConfigError("robot.runtime_scheduler must be a mapping")
+    if not isinstance(block.get("enable", False), bool):
+        raise InferenceConfigError("robot.runtime_scheduler.enable must be a boolean")
+    _reject_unknown_fields(block, _SCHEDULER_FIELDS, "robot.runtime_scheduler")
+    return block
 
+
+def scheduler_enabled_from_raw_config(
+    robot_config: Mapping[str, Any], control_mode: str, *, runtime_target: RuntimeTarget | None = None
+) -> bool:
+    """Read the robot switch without loading pipelines or model artifacts."""
+    block = _runtime_scheduler_block(robot_config)
     control_modes = robot_config.get("control_modes")
     if not isinstance(control_modes, Mapping):
         return False
@@ -318,23 +330,45 @@ def scheduler_enabled_from_raw_config(robot_config: Mapping[str, Any], control_m
     if not isinstance(mode_config, Mapping):
         return False
     inference = mode_config.get("inference")
-    if not isinstance(inference, Mapping) or inference.get("enabled") is not True:
+    if not isinstance(inference, Mapping):
         return False
-    scheduler = inference.get("scheduler")
-    return isinstance(scheduler, Mapping) and scheduler.get("enable") is True
+    if inference.get("enabled") is not True or not block.get("enable", False):
+        return False
+    target = runtime_target or resolve_runtime_target(robot_config, "", None)
+    return target is RuntimeTarget.HARDWARE
 
 
 def parse_inference_config(
     robot_config: Mapping[str, Any],
     control_mode: str,
+    *,
+    scheduler_enabled: bool | None = None,
+    runtime_target: RuntimeTarget | None = None,
 ) -> ControlModeInferenceConfig:
-    """Parse and validate ``control_modes.<mode>.inference`` before launch construction."""
+    """Validate inference against the robot switch and effective runtime target.
+
+    A prepared scheduler decision is a consistency assertion, never an override.
+    Launch callers also supply the target resolved after CLI overrides so that
+    validation does not reinterpret the original YAML target.
+    """
 
     if not isinstance(robot_config, Mapping):
         raise InferenceConfigError("robot configuration must be a mapping")
     if not isinstance(control_mode, str) or not control_mode:
         raise InferenceConfigError("control mode must be a non-empty string")
 
+    expected_scheduler_enabled = scheduler_enabled_from_raw_config(
+        robot_config, control_mode, runtime_target=runtime_target
+    )
+    if scheduler_enabled is not None:
+        if not isinstance(scheduler_enabled, bool):
+            raise InferenceConfigError("scheduler_enabled must be a boolean when supplied")
+        if scheduler_enabled is not expected_scheduler_enabled:
+            raise InferenceConfigError(
+                "scheduler_enabled conflicts with robot.runtime_scheduler.enable, "
+                "the active inference mode or the effective runtime target"
+            )
+    scheduler_enabled = expected_scheduler_enabled
     control_modes = robot_config.get("control_modes", {})
     if not isinstance(control_modes, Mapping):
         raise InferenceConfigError("control_modes must be a mapping")
@@ -374,13 +408,8 @@ def parse_inference_config(
         raise InferenceConfigError(f"{inference_path}.pipelines must be non-empty when inference is enabled")
 
     pipelines: dict[str, InferencePipelineConfig] = {}
-    scheduler_enabled = False
-    allow_scheduled_config = "scheduler" in inference
-    if "scheduler" in inference:
-        # Determine activation before parsing pipelines. The presence of the
-        # scheduler block permits dormant scheduled fields so enable alone is
-        # a complete runtime rollback switch.
-        scheduler_enabled = _peek_scheduler_enable(inference["scheduler"], enabled, inference_path)
+    # Keep scheduled tuning dormant while disabled or running a virtual target.
+    allow_scheduled_config = "runtime_scheduler" in robot_config
 
     for pipeline_id, pipeline_value in raw_pipelines.items():
         validated_id = _validate_pipeline_id(pipeline_id, inference_path)
@@ -396,58 +425,56 @@ def parse_inference_config(
     if scheduler_enabled:
         _validate_compatibility_groups(pipelines)
 
-    # --- scheduler block (single switch). `scheduler` is now an allowed field. ---
+    # Preserve the existing policy scheduler contract behind the robot-level switch.
     scheduler: SchedulerConfig | None = None
     inference_pipeline: str | None = None
     fallback_chain: tuple[str, ...] = ()
     inference_priority = 0
     inference_retry: dict[str, int] = {}
-    if "scheduler" in inference:
-        scheduler = _parse_scheduler(inference["scheduler"], enabled, pipelines, inference_path)
+    if scheduler_enabled:
+        scheduler = _parse_scheduler(robot_config["runtime_scheduler"])
         # Only parse executor fields when the scheduled path is enabled; legacy
         # dispatcher never reads them and they must not change false-branch behavior.
-        if scheduler is not None and scheduler.enable:
-            mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
-            executor_config = mode_config.get("executor", {}) or {}
-            if not isinstance(executor_config, Mapping):
-                raise InferenceConfigError(f"control_modes.{control_mode}.executor must be a mapping")
-            (
-                inference_pipeline,
-                fallback_chain,
-                inference_priority,
-                inference_retry,
-            ) = _parse_executor_fields(executor_config, pipelines, f"control_modes.{control_mode}.executor")
-            if (
-                inference_priority == 0
-                and fallback_chain
-                and scheduler.global_policy == "fifo"
-                and not scheduler.priority_zero_deadline_admission.enable
-            ):
+        executor_config = mode_config.get("executor", {}) or {}
+        if not isinstance(executor_config, Mapping):
+            raise InferenceConfigError(f"control_modes.{control_mode}.executor must be a mapping")
+        (
+            inference_pipeline,
+            fallback_chain,
+            inference_priority,
+            inference_retry,
+        ) = _parse_executor_fields(executor_config, pipelines, f"control_modes.{control_mode}.executor")
+        if (
+            inference_priority == 0
+            and fallback_chain
+            and scheduler.global_policy == "fifo"
+            and not scheduler.priority_zero_deadline_admission.enable
+        ):
+            raise InferenceConfigError(
+                f"control_modes.{control_mode}.executor.inference_fallback_chain requires "
+                "global_policy=edf or FIFO priority_zero_deadline_admission.enable=true"
+            )
+        # Any deadline-driven priority-0 routing (EDF ordering or FIFO profile
+        # admission) is a sequential-only contract: independent stages split
+        # one product request across workers, so per-request deadline
+        # ordering cannot be evaluated or honored.
+        if inference_priority == 0 and (
+            scheduler.global_policy == "edf" or scheduler.priority_zero_deadline_admission.enable
+        ):
+            independent = [
+                pipeline_id
+                for pipeline_id in (inference_pipeline, *fallback_chain)
+                if (pipeline := pipelines.get(pipeline_id)) is not None
+                and pipeline.scheduling is not None
+                and pipeline.scheduling.stage_policy == "independent"
+            ]
+            if independent:
                 raise InferenceConfigError(
-                    f"control_modes.{control_mode}.executor.inference_fallback_chain requires "
-                    "global_policy=edf or FIFO priority_zero_deadline_admission.enable=true"
+                    f"control_modes.{control_mode}.executor.inference_priority=0 with "
+                    f"global_policy={scheduler.global_policy} deadline-driven scheduling cannot "
+                    f"select independent-stage pipelines: {independent}"
                 )
-            # Any deadline-driven priority-0 routing (EDF ordering or FIFO profile
-            # admission) is a sequential-only contract: independent stages split
-            # one product request across workers, so per-request deadline
-            # ordering cannot be evaluated or honored.
-            if inference_priority == 0 and (
-                scheduler.global_policy == "edf" or scheduler.priority_zero_deadline_admission.enable
-            ):
-                independent = [
-                    pipeline_id
-                    for pipeline_id in (inference_pipeline, *fallback_chain)
-                    if (pipeline := pipelines.get(pipeline_id)) is not None
-                    and pipeline.scheduling is not None
-                    and pipeline.scheduling.stage_policy == "independent"
-                ]
-                if independent:
-                    raise InferenceConfigError(
-                        f"control_modes.{control_mode}.executor.inference_priority=0 with "
-                        f"global_policy={scheduler.global_policy} deadline-driven scheduling cannot "
-                        f"select independent-stage pipelines: {independent}"
-                    )
-            _validate_global_endpoint_conflicts(pipelines, scheduler.global_endpoints)
+        _validate_global_endpoint_conflicts(pipelines, scheduler.global_endpoints)
 
     return ControlModeInferenceConfig(
         control_mode=control_mode,
@@ -499,7 +526,7 @@ def _parse_pipeline(
         )
     if scheduler_enabled and execution_mode != "monolithic":
         raise InferenceConfigError(
-            f"{pipeline_path}.execution_mode must be 'monolithic' when scheduler.enable is true; "
+            f"{pipeline_path}.execution_mode must be 'monolithic' when robot.runtime_scheduler.enable is true; "
             "distributed inference continues to use the legacy protocol"
         )
 
@@ -527,7 +554,7 @@ def _parse_pipeline(
     validated_manifest = _validate_model_bundle(model_path, deployment, execution_mode, pipeline_path)
 
     # Scheduled fields may remain in the SSOT while disabled, but are
-    # materialized only when scheduler.enable=true. This keeps false runtime
+    # materialized only when robot.runtime_scheduler.enable=true. This keeps false runtime
     # behavior identical to legacy while making enable a one-line rollback.
     required = True
     compatibility_group: str | None = None
@@ -942,21 +969,8 @@ def _sha256_hex(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _peek_scheduler_enable(scheduler_value: Any, inference_enabled: bool, inference_path: str) -> bool:
-    """Read scheduler.enable before parsing pipelines so scheduled fields parse under it."""
-    if not isinstance(scheduler_value, Mapping):
-        raise InferenceConfigError(f"{inference_path}.scheduler must be a mapping")
-    enable_raw = scheduler_value.get("enable", False)
-    if not isinstance(enable_raw, bool):
-        raise InferenceConfigError(f"{inference_path}.scheduler.enable must be a boolean")
-    enable = enable_raw
-    if enable and not inference_enabled:
-        raise InferenceConfigError(f"{inference_path}.scheduler.enable=true requires {inference_path}.enabled=true")
-    return enable
-
-
-def _parse_global_endpoints(value: Any, inference_path: str) -> GlobalEndpoints:
-    path = f"{inference_path}.scheduler.global_endpoints"
+def _parse_global_endpoints(value: Any) -> GlobalEndpoints:
+    path = "robot.runtime_scheduler.global_endpoints"
     if not isinstance(value, Mapping):
         raise InferenceConfigError(f"{path} must be a mapping")
     _reject_unknown_fields(value, frozenset(_GLOBAL_ENDPOINT_FIELDS), path)
@@ -1142,35 +1156,10 @@ def _validate_compatibility_groups(pipelines: Mapping[str, InferencePipelineConf
                 )
 
 
-def _parse_scheduler(
-    scheduler_value: Any,
-    inference_enabled: bool,
-    pipelines: Mapping[str, InferencePipelineConfig],
-    inference_path: str,
-) -> SchedulerConfig | None:
-    """Parse the scheduler policy block. Returns None only when enable is false.
-
-    When enable is false the block is structurally validated but no SchedulerConfig
-    is materialized, so the false branch creates no endpoints or sessions.
-    """
-    path = f"{inference_path}.scheduler"
-    if not isinstance(scheduler_value, Mapping):
-        raise InferenceConfigError(f"{path} must be a mapping")
-    _reject_unknown_fields(scheduler_value, _SCHEDULER_FIELDS, path)
-
-    enable_raw = scheduler_value.get("enable", False)
-    if not isinstance(enable_raw, bool):
-        raise InferenceConfigError(f"{path}.enable must be a boolean")
-    enable = enable_raw
-    if enable and not inference_enabled:
-        raise InferenceConfigError(f"{path}.enable=true requires {inference_path}.enabled=true")
-
-    if not enable:
-        # The false branch validates known retained fields but does not
-        # materialize a SchedulerConfig or create scheduled runtime state.
-        return None
-
-    global_endpoints = _parse_global_endpoints(scheduler_value.get("global_endpoints"), inference_path)
+def _parse_scheduler(scheduler_value: Mapping[str, Any]) -> SchedulerConfig:
+    """Materialize an active policy after the robot switch has been validated."""
+    path = "robot.runtime_scheduler"
+    global_endpoints = _parse_global_endpoints(scheduler_value.get("global_endpoints"))
 
     default_open_timeout = _require_pos_seconds(
         scheduler_value.get("default_open_timeout", 10.0), f"{path}.default_open_timeout"

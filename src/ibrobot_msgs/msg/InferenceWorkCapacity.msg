@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Per work-class public capacity of a pipeline, echoed from robot_config + live counts.
 uint8 SESSION_CONTROL=1
 uint8 ACTION_GENERATION=2

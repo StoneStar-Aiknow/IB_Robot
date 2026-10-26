@@ -10,7 +10,7 @@ get_status, restart_session} services.
 Shares action-chunk normalization, TopicExecutor and temporal smoothing with
 the legacy action_dispatcher_node; it does NOT share ROS action/session state.
 Safe-stop is scheduled-path behavior so the disabled legacy path remains
-unchanged. When scheduler.enable=true this executable is launched instead of
+unchanged. When robot.runtime_scheduler.enable=true this executable is launched instead of
 action_dispatcher_node; the two never coexist.
 
 The dispatcher consumes whole-graph action chunks from the scheduled pipeline

@@ -12,6 +12,7 @@ from pathlib import Path
 import yaml
 
 from ibrobot_tracing.topology import bind_robot_topology
+from robot_config.inference_config import scheduler_enabled_from_raw_config
 from robot_config.loader import load_robot_section
 
 
@@ -23,7 +24,10 @@ def main(argv=None) -> int:
     try:
         config_path, config = load_robot_section(args.robot_config)
         config["_config_path"] = str(config_path)
-        topology = bind_robot_topology(config, control_mode=args.control_mode)
+        mode = args.control_mode or str(config.get("default_control_mode", "model_inference"))
+        topology = bind_robot_topology(
+            config, control_mode=mode, scheduler_enabled=scheduler_enabled_from_raw_config(config, mode)
+        )
         topology.metadata.update(source="robot_config_yaml", provenance="declared", runtime_verified=False)
     except (OSError, ValueError, RuntimeError, yaml.YAMLError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

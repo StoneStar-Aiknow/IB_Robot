@@ -69,7 +69,7 @@ def test_opt_out_contradicting_required_arm_capabilities_is_rejected(capability)
 
 
 def test_arm_named_poses_are_still_required_by_default():
-    config = load_robot_config(ROBOTS / "so101_single_arm_legacy.yaml")
+    config = load_robot_config(ROBOTS / "so101_arm_aero_hand.yaml")
     config.embodied.enabled = True
     config.embodied.named_poses = {"home": {}}
 
@@ -79,7 +79,7 @@ def test_arm_named_poses_are_still_required_by_default():
 
 
 def test_arm_named_poses_are_not_required_without_an_arm_surface():
-    config = load_robot_config(ROBOTS / "so101_single_arm_legacy.yaml")
+    config = load_robot_config(ROBOTS / "so101_arm_aero_hand.yaml")
     config.embodied.enabled = True
     config.embodied.arm_surface = False
     config.embodied.named_poses = {}

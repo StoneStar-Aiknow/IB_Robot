@@ -173,6 +173,10 @@ class VoiceASRNode(Node):
         self.declare_parameter("vad_sensitivity", VOICE_ASR_DEFAULTS["vad_sensitivity"])
         self.declare_parameter("vad_bundle_path", VOICE_ASR_DEFAULTS["vad_bundle_path"])
         self.declare_parameter("vad_deployment", VOICE_ASR_DEFAULTS["vad_deployment"])
+        self.declare_parameter("vad_min_silence_duration", VOICE_ASR_DEFAULTS["vad_min_silence_duration"])
+        self.declare_parameter("vad_post_roll_ms", VOICE_ASR_DEFAULTS["vad_post_roll_ms"])
+        self.declare_parameter("vad_pre_roll_ms", VOICE_ASR_DEFAULTS["vad_pre_roll_ms"])
+        self.declare_parameter("vad_min_speech_duration", VOICE_ASR_DEFAULTS["vad_min_speech_duration"])
         self.declare_parameter("publish_partial", VOICE_ASR_DEFAULTS["publish_partial"])
         self.declare_parameter("output_topic", VOICE_ASR_DEFAULTS["output_topic"])
         self.declare_parameter("sample_rate", VOICE_ASR_DEFAULTS["sample_rate"])
@@ -198,6 +202,10 @@ class VoiceASRNode(Node):
         self._vad_sensitivity = self.get_parameter("vad_sensitivity").value
         self._vad_bundle_path = str(self.get_parameter("vad_bundle_path").value)
         self._vad_deployment = str(self.get_parameter("vad_deployment").value)
+        self._vad_min_silence_duration = float(self.get_parameter("vad_min_silence_duration").value)
+        self._vad_post_roll_ms = float(self.get_parameter("vad_post_roll_ms").value)
+        self._vad_pre_roll_ms = float(self.get_parameter("vad_pre_roll_ms").value)
+        self._vad_min_speech_duration = float(self.get_parameter("vad_min_speech_duration").value)
         self._publish_partial = self.get_parameter("publish_partial").value
         self._output_topic = self.get_parameter("output_topic").value
         self._sample_rate = self.get_parameter("sample_rate").value
@@ -252,7 +260,11 @@ class VoiceASRNode(Node):
                 f"(asr_ch={self._audio_input_channel}, vad_ch={vad_channel_desc})"
             )
 
-            vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
+            vad_config = VADConfig(
+                sample_rate=self._sample_rate,
+                frame_size=self._chunk_size,
+                **self._vad_timing_kwargs(),
+            )
             self._vad = VADModule(vad_config)
             self._vad.set_sensitivity(self._vad_sensitivity)
             self._vad_runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
@@ -319,8 +331,21 @@ class VoiceASRNode(Node):
                 f"but Voice ASR audio input uses chunk_size={self._chunk_size}"
             )
 
+    def _vad_timing_kwargs(self) -> dict[str, float]:
+        """Endpointing timings shared by the realtime and file VAD modules."""
+        return {
+            "min_silence_duration": self._vad_min_silence_duration,
+            "post_roll_ms": self._vad_post_roll_ms,
+            "pre_roll_ms": self._vad_pre_roll_ms,
+            "min_speech_duration": self._vad_min_speech_duration,
+        }
+
     def _create_vad_module(self) -> VADModule:
-        vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
+        vad_config = VADConfig(
+            sample_rate=self._sample_rate,
+            frame_size=self._chunk_size,
+            **self._vad_timing_kwargs(),
+        )
         vad = VADModule(vad_config)
         vad.set_sensitivity(self._vad_sensitivity)
         runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)

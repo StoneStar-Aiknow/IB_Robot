@@ -74,6 +74,21 @@ python3 -m pytest src/robot_runtime/test/test_conformance.py -q
 Tests are scoped by the capabilities the target declares in `RuntimeStatus`;
 every assertion message names the requirement and the observed deviation.
 
+### Conformance start pose (`conformance.start_positions`)
+
+Arm-moving motion tests start from a declared pose (issue #194): before each
+of them the suite sends one trajectory to the profile's optional top-level
+`conformance.start_positions` mapping (`{joint: radians}`, validated by
+`load_profile` — known joint names, finite numbers) and asserts arrival
+within the suite's goal tolerance. A profile that does not declare it gets
+today's behaviour (no reset, no guessed default); a runtime without a
+trajectory capability is never reset. Declared joints go to their values,
+every other arm joint holds its current position. The key exists so physics
+platforms with a work surface at the mount plane (MuJoCo, Gazebo) can pick a
+start pose from which the suite's blind `before + delta` motions stay clear
+of the surface — the value is the robot owner's choice, never hardcoded in
+the suite.
+
 ## Independence gates
 
 `scripts/verify_runtime_independence.sh` (repo root) automates both

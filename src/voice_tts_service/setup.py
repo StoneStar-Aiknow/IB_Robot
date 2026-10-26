@@ -24,6 +24,15 @@ setup(
         "console_scripts": [
             "audio_playback_node = voice_tts_service.audio_playback_node:main",
             "package_zipvoice_310p = voice_tts_service.package_zipvoice_310p:main",
-        ]
+        ],
+        # Cross-package launch-builder registration (openspec change
+        # ``migrate-business-launch-builders``): robot_config discovers this
+        # group when building the launch registry, so the voice TTS launch
+        # wiring registers from its owning package without any robot_config
+        # change. Installing this package does not enable the entry;
+        # participation still comes from the robot YAML (``voice_tts.enabled``).
+        "ibrobot.launch_builders": [
+            "voice_tts = voice_tts_service.launch_builders.voice_tts:VOICE_TTS_BUILDER",
+        ],
     },
 )

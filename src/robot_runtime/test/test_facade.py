@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -140,8 +141,22 @@ class Caller(Node):
 
 @pytest.fixture(scope="module")
 def stack(tmp_path_factory):
-    os.environ.setdefault("ROS_DOMAIN_ID", "48")
-    os.environ.setdefault("ROS_LOCALHOST_ONLY", "1")
+    # Own DDS domain: colcon runs this package's whole suite in one process
+    # (the pytest extra is declared in setup.py), and torn-down runtimes from
+    # the other suites leave ghost endpoints on the shared per-process domain
+    # that flip this suite's "unreachable cancel service" expectations into
+    # 5-second call timeouts. Reserve a fresh domain through the same
+    # coordinator the root conftest uses instead of a fixed ID, so concurrent
+    # workspaces never collide; restore the per-process domain afterwards.
+    previous_domain = os.environ.get("ROS_DOMAIN_ID")
+    reservation = contextlib.ExitStack()
+    try:
+        from domain_coordinator import domain_id as reserve_domain_id
+    except ImportError:
+        pass
+    else:
+        os.environ["ROS_DOMAIN_ID"] = str(reservation.enter_context(reserve_domain_id()))
+    os.environ["ROS_LOCALHOST_ONLY"] = "1"
     profile_path = tmp_path_factory.mktemp("profile") / "runtime.yaml"
     profile_path.write_text(yaml.safe_dump(PROFILE), encoding="utf-8")
     rclpy.init()
@@ -165,6 +180,11 @@ def stack(tmp_path_factory):
     executor.shutdown(timeout_sec=2.0)
     caller.destroy_node()
     rclpy.shutdown()
+    reservation.close()
+    if previous_domain is None:
+        os.environ.pop("ROS_DOMAIN_ID", None)
+    else:
+        os.environ["ROS_DOMAIN_ID"] = previous_domain
 
 
 def test_set_mode_maps_to_strict_switch(stack):
@@ -329,3 +349,38 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert not cm.active
     assert any("stop engaged during the controller switch" in fault for fault in status.faults)
     assert caller.set_mode("idle").success
+
+
+def test_facade_selection_resolution_follows_parameters():
+    from robot_runtime.facade_node import resolve_facade_selection
+
+    profile = {"runtime": {"name": "t", "version": "0"}, "use_sim": False, "sim_platforms": ["sdk", "gazebo"]}
+    assert resolve_facade_selection(profile, False, "") == (False, None)
+    assert resolve_facade_selection(profile, True, "") == (True, "sdk")
+    # an explicit platform wins over the profile default
+    assert resolve_facade_selection(profile, True, "gazebo") == (True, "gazebo")
+    with pytest.raises(ValueError, match="unknown sim_platform"):
+        resolve_facade_selection(profile, True, "teleport")
+    # physical execution cannot carry a platform
+    with pytest.raises(ValueError, match="physical execution cannot select"):
+        resolve_facade_selection(profile, False, "sdk")
+    # a platform the profile does not declare fails naming the set
+    with pytest.raises(ValueError, match="not supported by this runtime profile"):
+        resolve_facade_selection({"runtime": {"name": "t"}, "use_sim": True, "sim_platforms": ["sdk"]}, True, "gazebo")
+
+
+def test_facade_identity_check_covers_sim_platform():
+    from robot_runtime.facade_node import check_description_identity
+    from robot_runtime.interface_description import build_description, description_digest
+
+    description = build_description(PROFILE, use_sim=True, sim_platform="sdk")
+    check_description_identity(PROFILE, description, True, "sdk")
+    gazebo = build_description(PROFILE, use_sim=True, sim_platform="gazebo")
+    check_description_identity(PROFILE, gazebo, True, "gazebo")
+    with pytest.raises(ValueError, match="does not match"):
+        check_description_identity(PROFILE, gazebo, True, "sdk")
+    # pre-platform snapshots default from execution and still match the sdk facade
+    legacy = build_description(PROFILE, use_sim=True, sim_platform="sdk")
+    del legacy["sim_platform"]
+    legacy["digest"] = description_digest(legacy)
+    check_description_identity(PROFILE, legacy, True, "sdk")
