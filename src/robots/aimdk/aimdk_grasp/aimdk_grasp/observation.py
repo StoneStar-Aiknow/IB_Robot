@@ -89,6 +89,19 @@ class LiveState:
     feedback: Feedback
 
 
+@dataclass(frozen=True)
+class AdmittedState:
+    """The ``Observation.robot_state`` of an X2 capture: what one request is planned from.
+
+    ``live`` was fresh at ``admitted_at`` (source clock, s): the planner's
+    snapshot time. ``started`` (monotonic) is when the request's budget began.
+    """
+
+    live: LiveState
+    admitted_at: float
+    started: float
+
+
 class ObservationBuffer:
     """CPU-only input owner; callbacks continue updating while the GPU is busy."""
 

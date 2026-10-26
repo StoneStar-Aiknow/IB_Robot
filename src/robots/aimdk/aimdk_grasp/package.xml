@@ -18,6 +18,8 @@
   <exec_depend>robot_config</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <!-- the head camera: the platform's image-time TF -->
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
@@ -37,6 +39,9 @@
   <!-- the ROS feedback test runs the X2 runtime against its vendor mock -->
   <test_depend>aimdk_robot</test_depend>
   <test_depend>aimdk_dataplane</test_depend>
+  <!-- the head camera test publishes the camera, joint views and TF itself -->
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>
