@@ -1,0 +1,36 @@
+# AgiBot X2 grasp with the models on a robot-side host with an NVIDIA GPU (203:
+# RTX 3090, no Ascend device, checked with nvidia-smi -L and /dev/davinci* on
+# 2026-10-23). Launch it on that host and on the Orin; aimdk_x2_grasp.yaml
+# says what runs where.
+#
+#   - grounded_sam2_swint_ogc:    text-prompted detection that also returns masks,
+#                                 so no SegmentDetections service runs here
+#   - graspgenx_omnihand_left_x2: GraspGen-X bound to the left OmniHand description
+
+robot:
+  base_config: aimdk_x2_grasp.yaml
+
+  perception_services:
+    services:
+      - id: grasp_grounding
+        enabled: true
+        required: true
+        bundle_path: models/grounded_sam2_swint_ogc
+        deployment: torch_cuda
+        adapter_class: perception_service.model_service_plugins:GroundingDetectPlugin
+        service_type: ibrobot_msgs/srv/GroundingDetect
+        endpoint: /perception/grasp/grounding_detect
+        node_name: grasp_grounding_detect
+      - id: grasp_generation
+        enabled: true
+        required: true
+        bundle_path: models/graspgenx_omnihand_left_x2
+        deployment: torch_cuda
+        adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
+        service_type: ibrobot_msgs/srv/GenerateGrasps
+        endpoint: /perception/grasp/generate_grasps
+        node_name: grasp_generate_grasps
+
+  grasp_execution:
+    # The deployment grasp_generation serves: the executor identity names it.
+    model_deployment: torch_cuda

@@ -1,0 +1,85 @@
+# AgiBot X2 grasp with the models on an Ascend 310P robot-side host (the 310P:
+# /dev/davinci0, no NVIDIA GPU, checked on 2026-10-23). Launch it on that host
+# and on the Orin; aimdk_x2_grasp.yaml says what runs where. The Orin keeps its
+# CUDA for cuRobo and registration; nothing here needs CUDA.
+#
+# LeKiwi's Ascend detection pair, then GraspGen-X on the NPU:
+#   - grounding_dino_swint_seq8_1280x720 (ascend_310p): text-prompted boxes only
+#   - sam2.1_hiera_tiny_prompt_ascend (ascend_310p): a mask per box, as the
+#     pipeline's SegmentDetections service
+#   - graspgenx_omnihand_left_x2 (torch_npu): its compiled 400-grasp diffusion loop
+#
+# Compared against CUDA on 2026-10-26 on one X2 bottle frame, with a same-device
+# control: translation, rotation orthonormality and the confidence ranking the
+# reach filter walks are all inside the spread two CUDA runs show between
+# themselves (torch_models graspgenx_ascend_310p README). Steady generate_grasps
+# is 429 ms here against 159 ms on an RTX 3090 through the same harness.
+#
+# A pick ran end to end here on 2026-10-27: observe, perceive, plan, preshape,
+# approach, grasp, close, lift, hold and retreat, with the bottle lifted. Two
+# things had to be measured first, and neither was this file's models:
+#   - the runtime's command channels queued ten targets (aimdk_robot
+#     runtime_node._COMMAND_QOS), so the platform was driven to a target the
+#     executor had sent 251 ms earlier and grasp_pipeline/streaming refused
+#     every approach at its 0.2 s command_apply_s. Depth 1: 26 ms, and the
+#     approach runs;
+#   - the first request after the grasp head warms up rebuilds the cuRobo
+#     planner inside the deadline whenever a locked joint moved past 0.025 rad
+#     (~50 s on the Orin). Live it was the left hand, which a failed sequence
+#     leaves half closed; open it before the next request. Later requests plan
+#     in 0.65-1.42 s.
+# That run ended in release with "feedback unhealthy or stale", and the next two
+# in grasp and close: the runtime's feedback views were too slow (below). After
+# that fix six picks in a row succeeded, release included (2026-10-27, after a
+# power cycle). The model comparison above still covers one frame, one object
+# and one point count.
+
+robot:
+  base_config: aimdk_x2_grasp.yaml
+
+  # Nothing runtime-specific to this host. While the runtime converted every
+  # ~500 Hz vendor sample in one Python process, /joint_states fell to 0.4-1.0 Hz
+  # against 50 here (2026-10-26); keeping one sample per joint group got it to
+  # ~49 Hz by looking at 6.3% of the vendor's samples, so a one-frame fault code
+  # went unseen ~15 times in 16. The runtime's data plane is native instead
+  # (aimdk_dataplane): it takes every vendor sample, ~2800/s, at ~0.35 of one
+  # core here (measured 2026-10-28), and owns the command stream, so the Python
+  # runtime holds no high-rate traffic and no depth or rate needs tuning per host.
+
+  perception_services:
+    services:
+      - id: grasp_grounding
+        enabled: true
+        required: true
+        bundle_path: models/grounding_dino_swint_seq8_1280x720
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+        service_type: ibrobot_msgs/srv/GroundingDetect
+        endpoint: /perception/grasp/grounding_detect
+        node_name: grasp_grounding_detect
+        runtime_options:
+          device_id: 0
+      - id: grasp_segmentation
+        enabled: true
+        required: true
+        bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
+        service_type: ibrobot_msgs/srv/SegmentDetections
+        endpoint: /perception/grasp/segment_detections
+        node_name: grasp_segment_detections
+        runtime_options:
+          device_id: 0
+      - id: grasp_generation
+        enabled: true
+        required: true
+        bundle_path: models/graspgenx_omnihand_left_x2
+        deployment: torch_npu
+        adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
+        service_type: ibrobot_msgs/srv/GenerateGrasps
+        endpoint: /perception/grasp/generate_grasps
+        node_name: grasp_generate_grasps
+
+  grasp_execution:
+    # The deployment grasp_generation serves: the executor identity names it.
+    model_deployment: torch_npu

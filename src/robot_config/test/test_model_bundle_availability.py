@@ -78,7 +78,10 @@ def test_downloader_allowlist_is_loadable():
 #: a nested path (models/voice_asr/<model>) or provisioned by another route, so
 #: the downloader's allowlist is not the right authority for them. Listing them
 #: explicitly keeps the check below meaningful instead of simply weakening it.
-EXTERNALLY_PROVISIONED = frozenset({"voice_asr", "grounded_sam2_swint_ogc"})
+#: graspgenx_omnihand_left_x2 is built with package_graspgenx_torch_bundle: its
+#: OmniHand gripper description cannot be published until its redistribution
+#: terms are confirmed.
+EXTERNALLY_PROVISIONED = frozenset({"voice_asr", "grounded_sam2_swint_ogc", "graspgenx_omnihand_left_x2"})
 
 
 def test_every_referenced_bundle_is_downloadable():
