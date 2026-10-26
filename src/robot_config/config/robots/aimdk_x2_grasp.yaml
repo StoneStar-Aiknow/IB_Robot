@@ -1,9 +1,9 @@
 # AgiBot X2 grasp, shared by its host deployments: the OmniHand X2 and the grasp
 # pipeline, without the models. Launch a host deployment, never this file:
 #
-# Extends aimdk_x2.yaml with the OmniHand runtime profile and the model services
-# the X2 grasp pipeline calls. The grasp executor itself is not wired here yet;
-# this configuration brings up the runtime and serves the models it will use.
+#   aimdk_x2_grasp_cuda.yaml  robot-side host with an NVIDIA GPU (203): Torch CUDA models
+#   aimdk_x2_grasp_310p.yaml  robot-side host with an Ascend 310P: OM detection and
+#                             segmentation, GraspGen-X on torch_npu
 #
 # Both hosts launch the same deployment: the robot-side host runs the runtime,
 # the Gateway, the models and manipulation_execution's grasp_pipeline_node with
@@ -74,3 +74,54 @@ robot:
     right_wrist_pitch_joint: [-0.5580, 0.5580]
     right_wrist_roll_joint: [-0.7240, 1.5710]
 
+  # pick_object requires the moveit_planning control mode by name (the skill
+  # catalog's vocabulary). Nothing on the X2 runs MoveIt: the grasp pipeline
+  # plans with cuRobo and streams the left arm and hand itself, in the
+  # runtime's policy_stream (UPPERBODY_REMOTE_SPLIT), which the Gateway
+  # switches to before the pick.
+  skill_required_control_mode: "moveit_planning"
+  control_modes:
+    moveit_planning:
+      description: "Grasp pipeline streams the left arm and hand"
+      description_cn: "抓取流水线流式控制左臂和左手"
+      runtime_mode: policy_stream
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  embodied:
+    enabled: true
+    arm_surface: false
+    skill_catalog_profile: aimdk_x2_grasp
+    skill_catalog_source_mode: development
+    runtime_named_motion:
+      enabled: false
+
+  grasp_execution:
+    enabled: true
+    action_name: /manipulation/execute_pick
+    # The pipeline runs beside the runtime and the models; its grasp head on the
+    # Orin: only compressed captures, target masks, grasp candidates, plans and
+    # the watch's status cross between them.
+    backend: "aimdk_grasp.remote_head:x2_remote_grasp_backends"
+    # The GraspGen-X bundle the generate_grasps service serves: the executor
+    # identity pins it together with model_deployment (each host deployment
+    # sets the one its service runs), and its gripper description is what the
+    # planner mounts on the left palm.
+    model_bundle_path: "$(env WORKSPACE)/models/graspgenx_omnihand_left_x2"
+    # The runtime streams the X2 backends command (aimdk_grasp.backend):
+    # bound against the live runtime description at launch, which the pipeline
+    # node then receives and checks its camera and joint inputs against.
+    command_interfaces:
+      - joint.arm_stream
+      - joint.hand_stream
+    backend_options:
+      detect_service: /perception/grasp/grounding_detect
+      generate_grasps_service: /perception/grasp/generate_grasps
+      # Halt the approach when the target moves, and replan once it is back.
+      # A watch that cannot look stops the arm where it is instead.
+      watch: stop
+    pipeline:
+      # The X2 puts a picked object back where it was, retracing the plan.
+      release_after_success: true

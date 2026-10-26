@@ -83,3 +83,6 @@ robot:
   grasp_execution:
     # The deployment grasp_generation serves: the executor identity names it.
     model_deployment: torch_npu
+    backend_options:
+      # GroundingDINO returns boxes only; SAM2 masks them.
+      segment_service: /perception/grasp/segment_detections

@@ -34,3 +34,6 @@ robot:
   grasp_execution:
     # The deployment grasp_generation serves: the executor identity names it.
     model_deployment: torch_cuda
+    backend_options:
+      # grounded SAM2 returns masks with its detections.
+      segment_service: ""
