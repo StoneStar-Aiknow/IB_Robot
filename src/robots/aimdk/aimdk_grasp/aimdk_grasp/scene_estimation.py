@@ -16,6 +16,7 @@ from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
 
 from aimdk_grasp.frames import ImageTransform, rigid
+from aimdk_grasp.leg_obstacle import leg_obstacle
 from aimdk_grasp.rgbd_to_cloud import mask_depth_to_points
 from aimdk_grasp.types import CameraIntrinsics
 
@@ -73,6 +74,25 @@ class SceneEstimationConfig:
     # The coarse planning mesh leaves points inside the table cuboid to the
     # cuboid (see estimate_scene); the fine validation mesh always keeps them.
     leave_table_to_cuboid: bool = True
+    # The planning model has no legs. The fine validation scene gets the
+    # pelvis and left leg at the standing pose as a fixed mesh (leg_obstacle):
+    # live 2026-10-15 (move_A1) an approach swung the palm behind the torso
+    # into the left hip. Not the coarse scene: the hanging arm at the start is
+    # 5-10 mm from the hip, inside the optimizer's 2 cm activation, and every
+    # trajectory paid for it (replay of 149 inputs: median planning 0.18 ->
+    # 0.32 s, one input lost).
+    leg_obstacle: bool = True
+    # The coarse scene can carry the pelvis and left leg as oriented boxes
+    # instead, each side pulled in by coarse_leg_shrink_m (leg_boxes): a box
+    # has a distance inside it, a mesh query only near its surface, so the
+    # optimizer pushes a path out of a box but went deeper through the mesh.
+    # Live 2026-10-26 every approach to a target mid-table swung the wrist
+    # through the pelvis (20-107 mm) and only the fine check refused it.
+    # Replay of those 14 plan calls x2 on the 3090 (plan_replay): planned
+    # 13 -> 21 of 28 (apple 5 -> 9 of 12, orange 2 -> 6 of 10), the cup 6 of 6
+    # either way at 0.18 -> 0.20 s; shrink 2.5 / 1.5 / 1.0 cm planned 18 / 20 / 20.
+    coarse_leg_boxes: bool = True
+    coarse_leg_shrink_m: float = 0.02
 
     def __post_init__(self):
         values = [value for value in vars(self).values() if not isinstance(value, bool)]
@@ -103,6 +123,40 @@ class SceneEstimationConfig:
                 raise ValueError("Voxel diagonal must not exceed its self-filter margin")
         if self.self_filter_margin_m < self.validation_self_filter_margin_m:
             raise ValueError("Planning self-filter margin must cover the validation margin")
+
+
+LEG_OBSTACLE = "left_leg"
+
+
+def leg_boxes(shrink_m: float) -> dict:
+    """{name: cuboid}: one oriented box per pelvis/leg hull (its principal axes), each side pulled in by shrink_m.
+
+    A box's corners can stand out of its hull, so these are for the coarse
+    planning scene only; the fine check keeps the exact hulls (leg_obstacle).
+    """
+    mesh = leg_obstacle()
+    vertices, faces = np.asarray(mesh["vertices"]), np.asarray(mesh["faces"]).reshape(-1, 3)
+    edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]]])
+    adjacency = coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(len(vertices),) * 2)
+    _, labels = connected_components(adjacency, directed=False)
+    boxes = {}
+    for label in np.unique(labels):
+        points = vertices[labels == label]
+        centre = points.mean(axis=0)
+        axes = np.linalg.svd(points - centre, full_matrices=False)[2]
+        if np.linalg.det(axes) < 0:
+            axes[2] *= -1
+        local = (points - centre) @ axes.T
+        low, high = local.min(axis=0), local.max(axis=0)
+        dims = high - low - 2 * shrink_m
+        if (dims <= 0).any():
+            continue  # thinner than twice the shrink: nothing left of it
+        quat = Rotation.from_matrix(axes.T).as_quat()[[3, 0, 1, 2]]
+        boxes[f"{LEG_OBSTACLE}_{label}"] = {
+            "dims": dims.tolist(),
+            "pose": [*(centre + axes.T @ ((low + high) / 2)).tolist(), *quat.tolist()],
+        }
+    return boxes
 
 
 class NoSupportError(RuntimeError):
@@ -837,6 +891,8 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
     fitted = time.perf_counter()
     pose = [*translation.tolist(), *Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]].tolist()]
     meshes, mesh_counts, validation_meshes, validation_counts = {}, {}, {}, {}
+    if config.leg_obstacle:
+        validation_meshes[LEG_OBSTACLE] = leg_obstacle()
     for name, cloud, planning in (("environment", environment, planning_keep), ("target", points[target], target_keep)):
         if not planning.any():
             continue
@@ -878,7 +934,9 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
             "total": prepared.unproject_s + prepared.self_filter_s + (finished - started),
         },
     }
-    scene = {"cuboid": {"table": support.cuboid(config)}, "mesh": meshes}
+    table = {"table": support.cuboid(config)}
+    scene = {"cuboid": {**table, **(leg_boxes(config.coarse_leg_shrink_m) if config.coarse_leg_boxes else {})}}
+    scene["mesh"] = meshes
     # Both clouds are private advanced-indexing copies; freeze them before deferral.
     target_points = points[target]
     environment.setflags(write=False)
@@ -892,7 +950,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
                 validation_meshes[name], validation_counts[name] = mesh, counts
         diagnostics["timings_s"]["validation_mesh"] = time.perf_counter() - before
         diagnostics["validation_materialized"] = True
-        return {"cuboid": scene["cuboid"], "mesh": validation_meshes}
+        return {"cuboid": table, "mesh": validation_meshes}
 
     diagnostics["validation_materialized"] = False
     validation_scene = LazyScene(build_validation)

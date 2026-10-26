@@ -23,6 +23,7 @@ setup(
     entry_points={
         "console_scripts": [
             "fit_x2_torso_cover = aimdk_grasp.torso_cover:main",
+            "export_x2_leg_obstacle = aimdk_grasp.leg_obstacle:main",
         ],
     },
 )

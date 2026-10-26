@@ -60,6 +60,7 @@ kernels at run time through NVRTC, so the same wheel serves the X2 Orin.
 | `hand_collision_cover.json` | certified sphere covers of six hand links (checked against the mesh file, its URDF origin and its scale) and the hand contact exclusions |
 | `hand_collision_reference.json` | hand/wrist exclusions of the reference sphere fit |
 | `torso_collision_cover.json` | certified torso cover, checked against the mesh file, its URDF origin and normalized scale; regenerate with `fit_x2_torso_cover <file>` |
+| `leg_obstacle.json` | pelvis and left leg at the standing pose, for the fine collision check; regenerate with `export_x2_leg_obstacle <file>` |
 | `provenance.json` | where each value comes from, and the measured coverage of the official meshes |
 
 The collision data was fitted on the AimDK SDK hand and arm meshes of the
@@ -124,6 +125,16 @@ target mask, the image-time camera pose and the robot's collision spheres into
 the planner's torso-frame scene: the support plane as a cuboid, the target and
 environment as voxel meshes, cropped to the left arm's reach, with the robot's
 own body filtered out.
+
+The planning model has no legs. Every fine validation scene also carries the
+pelvis and left leg as one fixed mesh (`aimdk_grasp.leg_obstacle`, convex hulls of
+the official collision meshes at the measured standing pose): a live approach
+once swung the palm behind the torso into the left hip. The coarse scene gets it
+as one box per hull, each side pulled in by 2 cm (`scene_estimation.leg_boxes`):
+the mesh itself would cost every plan the hanging arm's 5-10 mm to the hip, and a
+mesh query sees only near its surface, while a box has a distance inside it and
+pushes a path out of the pelvis. A box's corners can stand out of its hull, so the
+fine scene keeps the exact hulls and no boxes.
 
 ## What replaced the standalone `x2_grasp_msgs`
 

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from aimdk_grasp.frames import ImageTransform
 from aimdk_grasp.scene_estimation import (
+    LEG_OBSTACLE,
     NoSupportError,
     SceneEstimationConfig,
     _sphere_membership,
@@ -322,7 +323,9 @@ def test_coarse_scene_keeps_fine_target_and_restores_filtered_obstacles_in_valid
     assert estimate.diagnostics["planning_extra_filtered_points"] > 0
     assert estimate.diagnostics["meshes"]["environment"]["faces"] < fine.diagnostics["meshes"]["environment"]["faces"]
     assert estimate.diagnostics["validation_self_filtered_points"] == fine.diagnostics["self_filtered_points"]
-    assert estimate.scene["cuboid"] == estimate.validation_scene["cuboid"] == fine.scene["cuboid"]
+    assert estimate.scene["cuboid"] == fine.scene["cuboid"]
+    # The coarse scene adds the leg boxes; the fine one keeps only the table cuboid.
+    assert estimate.validation_scene["cuboid"] == {"table": estimate.scene["cuboid"]["table"]}
     assert estimate.scene["mesh"]["target"] is estimate.validation_scene["mesh"]["target"]
     for name in ("target", "environment"):
         for field in ("vertices", "faces", "pose"):
@@ -365,6 +368,53 @@ def test_scene_invalid_depth_keeps_target_pixel_correspondence():
     assert estimate.diagnostics["input_points"] == 2494
     assert estimate.diagnostics["meshes"]["target"]["points"] == 14
     assert estimate.diagnostics["meshes"]["environment"]["points"] == 2480
+
+
+def test_every_fine_scene_carries_the_standing_leg_and_hip_in_torso_coordinates():
+    import trimesh
+
+    estimate = estimate_scene(**scene_inputs(), config=TABLE_MESHED)
+    leg = estimate.validation_scene["mesh"][LEG_OBSTACLE]
+    assert LEG_OBSTACLE not in estimate.scene["mesh"] and leg["pose"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    hulls = trimesh.Trimesh(vertices=leg["vertices"], faces=leg["faces"].reshape(-1, 3)).split(only_watertight=True)
+    assert len(hulls) == 5
+
+    def inside(point):
+        return any(hull.contains([point])[0] for hull in hulls)
+
+    # move_A1 (2026-10-15): the palm reached (0.05, 0.20, -0.21) behind the hip front;
+    # the hanging hand at the start is outside, beside the hip.
+    assert inside([0.03, 0.15, -0.20]) and not inside([0.165, 0.274, -0.175])
+    unlegged = estimate_scene(**scene_inputs(), config=replace(TABLE_MESHED, leg_obstacle=False))
+    assert LEG_OBSTACLE not in unlegged.validation_scene["mesh"]
+
+
+def test_the_leg_as_shrunk_boxes_goes_to_the_coarse_scene_only():
+    from aimdk_grasp.scene_estimation import leg_boxes
+
+    def outside(boxes, point):
+        """Signed distance (m, + outside) from the nearest box."""
+        distances = []
+        for box in boxes.values():
+            w, x, y, z = box["pose"][3:]
+            local = np.abs(Rotation.from_quat([x, y, z, w]).as_matrix().T @ (np.asarray(point) - box["pose"][:3]))
+            local -= np.asarray(box["dims"]) / 2
+            distances.append(np.linalg.norm(np.maximum(local, 0)) + min(local.max(), 0))
+        return min(distances)
+
+    boxes = leg_boxes(SceneEstimationConfig().coarse_leg_shrink_m)
+    assert len(boxes) == 5 and all(min(box["dims"]) > 0 for box in boxes.values())
+    # Live 2026-10-26: the thumb went 37-42 mm into the pelvis hull reaching mid-table; the
+    # boxes hold those points, and the hanging hand at the start stays well clear of them.
+    assert outside(boxes, [0.047, 0.035, -0.134]) < -0.02 and outside(boxes, [0.039, 0.014, -0.125]) < -0.02
+    assert outside(boxes, [0.165, 0.274, -0.175]) > 0.1
+    assert outside(leg_boxes(0.0), [0.047, 0.035, -0.134]) < outside(boxes, [0.047, 0.035, -0.134])
+    estimate = estimate_scene(**scene_inputs(), config=TABLE_MESHED)
+    assert set(estimate.scene["cuboid"]) == {"table", *boxes}
+    # A box corner may stand out of its hull: the fine check keeps the exact hulls.
+    assert set(estimate.validation_scene["cuboid"]) == {"table"} and LEG_OBSTACLE in estimate.validation_scene["mesh"]
+    plain = estimate_scene(**scene_inputs(), config=replace(TABLE_MESHED, coarse_leg_boxes=False))
+    assert set(plain.scene["cuboid"]) == {"table"}
 
 
 def test_scene_without_target_mask_keeps_all_obstacles():
