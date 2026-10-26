@@ -112,3 +112,12 @@ robot:
     # back of the head IS a long cover (a stop) -- that is the gesture, by design.
     operator:
       send_enabled: true
+
+  # The base entry turns the visual interaction ("看图说话") on. This deployment
+  # does not run it: the base names the fake backend, whose scripted replies
+  # would ride the mirror voice's utterance queue the moment a half-resolution
+  # stream appears, and this firmware publishes full-resolution only. A round
+  # would also share the single NPU with the detector and ZipVoice. Take the
+  # internvl settings from aimdk_x2_magicmirror_board.yaml when it is wanted.
+  visual_interaction:
+    enabled: false

@@ -64,3 +64,10 @@ robot:
     # phrases would fight it for audio focus.
     voice:
       enabled: false
+
+  # Off for the same reason as in aimdk_x2_voice_mirror_all.yaml: the base
+  # entry's fake backend would speak scripted replies through the mirror voice
+  # once it sees a half-resolution stream, and this firmware publishes
+  # full-resolution only.
+  visual_interaction:
+    enabled: false
