@@ -40,6 +40,15 @@ must pass.
   core-only independence gate.
 - **Reconciliation** (`wait_for_runtime.py`): replaces `wait_for_controllers`
   as the upper-layer start condition; fails fast naming missing capabilities.
+- **On-demand subscriptions** (`on_demand.py`): subscriptions live on a node no
+  executor spins, so samples wait in KEEP_LAST queues until a reader drains
+  them, bounded by the reader's declared depth. Each drained sample carries
+  the time the middleware received it — not the time it was taken — so a
+  freshness gate sees the real message age. A sample whose receive time the
+  middleware did not record is delivered with `None` and must be refused by
+  any freshness gate: pretending it was just received would pass stale data.
+  The reader node follows the launch's namespace and topic remaps like any
+  node; only its name is pinned, so it never takes its owner's.
 - **Launch support** (`launch_support.py`): profile path resolution
   (`$(find)` / `$(env)`), xacro rendering, controller_manager parameter
   files, spawners derived from the mode table, and the shared stack
