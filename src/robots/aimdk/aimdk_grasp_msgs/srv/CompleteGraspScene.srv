@@ -1,0 +1,12 @@
+# Finish the collision scene of an X2 grasp head capture with the target's mask.
+
+string capture_id
+# The target mask on the capture's pixel grid: "mono8; png", nonzero = target.
+sensor_msgs/CompressedImage target_mask
+float64 timeout_s
+---
+bool success
+# NO_SUPPORT: nothing supports the target, usually not the target at all.
+string error_code
+string message
+string report_json
