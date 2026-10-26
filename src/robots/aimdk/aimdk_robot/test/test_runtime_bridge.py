@@ -1093,6 +1093,48 @@ def test_the_microphones_and_the_speaker_are_served_under_their_own_capabilities
         harness.shutdown()
 
 
+def test_a_mode_whose_action_the_platform_already_runs_is_entered_without_a_switch():
+    """The firmware refuses a switch to the action it runs (MotionBusy): a robot left in URS must still stream."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", initial_action="UPPERBODY_REMOTE_SPLIT")
+    try:
+        harness.wait_active()
+        response = harness.set_mode("policy_stream")
+        assert response.success, response.message
+        assert harness.status().active_mode == "policy_stream"
+        assert harness.platform_action() == "UPPERBODY_REMOTE_SPLIT"
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_an_action_report_older_than_the_last_switch_or_stale_is_not_trusted():
+    """Skipping SetMcAction needs a fresh report taken after this runtime last asked for an action."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", initial_action="UPPERBODY_REMOTE_SPLIT")
+    try:
+        harness.wait_active()
+        runtime = harness.runtime
+        calls = []
+        real_call = runtime._set_action.call
+        runtime._set_action.call = lambda request: calls.append(request) or real_call(request)
+        runtime._on_mc_state = lambda message: None  # freeze the cached report
+        now = time.monotonic()
+        with runtime._lock:
+            runtime._vendor_action, runtime._vendor_action_running = "UPPERBODY_REMOTE_SPLIT", True
+            runtime._vendor_action_at, runtime._action_requested_at = now, now - 1.0
+        ok, message = runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert ok and "already in" in message and calls == []
+        with runtime._lock:
+            runtime._action_requested_at = now + 0.01  # a stop asked for another action since
+        runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert len(calls) == 1
+        with runtime._lock:
+            runtime._vendor_action_at, runtime._action_requested_at = now - 2.0, now - 3.0  # stale
+        runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert len(calls) == 2
+    finally:
+        harness.shutdown()
+
+
 def test_losing_arbitration_is_reported_as_degraded():
     """A pre-empted command source is silent on the wire; it must not be silent here."""
     harness = Harness()

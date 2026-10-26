@@ -312,6 +312,12 @@ class AimdkVendorMock(Node):
             response.response.message = f"action {action} is not registered"
             return response
         with self._lock:
+            if action == self._action:
+                # The firmware refuses a switch to the action it is running.
+                response.response.header.code = 9
+                response.response.status.value = 2
+                response.response.message = f"MotionBusy: {action} is running"
+                return response
             self._action = action
         response.response.header.code = 0
         response.response.status.value = 1
@@ -594,6 +600,7 @@ class AimdkVendorMock(Node):
             source = self._current_source
         message.action_info.action_desc = action
         message.action_info.current_action.value = vg.MC_ACTION_VALUES.get(action, 0)
+        message.action_info.status.value = vg.MC_ACTION_RUNNING
         message.body_status.value = int(self.get_parameter("body_pose").value)
         holder = str(self.get_parameter("arbitration_holder").value)
         message.input_source.name = holder or source

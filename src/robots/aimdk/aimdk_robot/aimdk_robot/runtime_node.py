@@ -308,6 +308,10 @@ class AimdkRuntimeNode(Node):
         self._body_pose = projection.BODY_POSE_UNKNOWN
         self._navigation_enabled = False
         self._vendor_action = ""
+        self._vendor_action_running = False
+        # When that state arrived, and when this runtime last asked for an action (monotonic s).
+        self._vendor_action_at = 0.0
+        self._action_requested_at = 0.0
         self._system_state = ""
         self._hold_target_missing = False
         self._hand_hold_missing = False
@@ -1277,6 +1281,10 @@ class AimdkRuntimeNode(Node):
             self._stop_lock.release()
         return True
 
+    def _note_action_request(self) -> None:
+        with self._lock:
+            self._action_requested_at = time.monotonic()
+
     def _request_vendor_mode(self, mode: str, epoch: int) -> tuple[bool, str]:
         """Switch the vendor MC action and wait for its own state to confirm.
 
@@ -1285,12 +1293,23 @@ class AimdkRuntimeNode(Node):
         """
         action = projection.mode_action(self._profile, mode)
         with self._lock:
-            already = self._vendor_action == action
-        if already:
-            # The platform answers a request for the action it is already in
-            # with MOTION_BUSY (firmware v1.1.1, 2026-10-23), e.g. when an
-            # earlier run left it in the upper-body mode; there is nothing to switch.
+            reported_at = self._vendor_action_at
+            running = (
+                self._vendor_action == action
+                and self._vendor_action_running
+                # Only a report taken after the last switch this runtime asked
+                # for, and recent: a stop or another mode may have moved the
+                # platform since the state that is cached.
+                and reported_at > self._action_requested_at
+                and time.monotonic() - reported_at <= _ACTION_REPORT_MAX_AGE_S
+            )
+        if running:
+            # The platform refuses a switch to the action it is already running
+            # (MOTION_BUSY, "动作正在播放", firmware v1.1.1): a robot left in
+            # UPPERBODY_REMOTE_SPLIT refused policy_stream that way (live
+            # 2026-10-22). Nothing to switch.
             return True, f"platform already in {action}"
+        self._note_action_request()
         result = self._set_action.call(vg.set_action_request(self, source=self._source, action_name=action))
         if not result.ok:
             reason = projection.mode_rejection_reason(result.code)
@@ -1357,6 +1376,7 @@ class AimdkRuntimeNode(Node):
                     "the platform holds its current motion mode (no registered hold action)"
                 )
                 return response
+            self._note_action_request()
             result = self._set_action.call(
                 vg.set_action_request(self, source=self._source, action_name=plan.vendor_action)
             )
@@ -1987,6 +2007,8 @@ class AimdkRuntimeNode(Node):
         hand_statuses = vg.hand_statuses(message.runtime_model)
         with self._lock:
             self._vendor_action = action
+            self._vendor_action_running = int(message.action_info.status.value) == vg.MC_ACTION_RUNNING
+            self._vendor_action_at = time.monotonic()
             self._body_pose = int(message.body_status.value)
             self._speed_envelope = envelope
             self._player_state = player_state

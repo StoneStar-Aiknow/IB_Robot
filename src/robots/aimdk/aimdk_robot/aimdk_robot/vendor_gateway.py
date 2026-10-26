@@ -87,6 +87,8 @@ MC_ACTION_VALUES: dict[str, int] = {
 # HEAD_ONLY and UPPERBODY_REMOTE_SPLIT are documented by name only; the SDK
 # examples switch modes with action_desc, which is the supported path.
 MC_ACTION_BY_VALUE: dict[int, str] = {value: name for name, value in MC_ACTION_VALUES.items()}
+#: McActionStatus: the action is running (0 idle, 200 transition, 300 uninterruptible transition).
+MC_ACTION_RUNNING = 100
 
 INPUT_ACTION_ADD = 1001
 INPUT_ACTION_ENABLE = 2001
