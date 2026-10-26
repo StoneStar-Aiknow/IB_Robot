@@ -49,3 +49,28 @@ robot:
       - interaction.led
       - runtime.stop
 
+  # Arm travel the motion-control unit enforces, in radians, keyed by joint
+  # name. From the vendor SDK's extra/mc-rl/x2_urdf/X2_URDF-v1.3.0/x2_ultra.urdf,
+  # not from aimdk_description: the published URDF carries the same version
+  # label with different values on shoulder_roll, wrist_pitch and wrist_roll.
+  # aimdk_grasp narrows the planning model to the left arm's entries, never
+  # widens it, so planning stays inside both ranges. The same values are the
+  # mirror's motion_imitation_stream.mock_playback.arm_limits
+  # (aimdk_x2_magicmirror.yaml); they become one entry when the grasp and mirror
+  # configurations merge, and test_aimdk_x2_grasp_config keeps them equal until then.
+  arm_limits:
+    left_shoulder_pitch_joint: [-3.0800, 2.0400]
+    left_shoulder_roll_joint: [-0.0610, 2.9930]
+    left_shoulder_yaw_joint: [-2.5560, 2.5560]
+    left_elbow_joint: [-2.3556, 0.0000]
+    left_wrist_yaw_joint: [-2.5560, 2.5560]
+    left_wrist_pitch_joint: [-0.5580, 0.5580]
+    left_wrist_roll_joint: [-1.5710, 0.7240]
+    right_shoulder_pitch_joint: [-3.0800, 2.0400]
+    right_shoulder_roll_joint: [-2.9930, 0.0610]
+    right_shoulder_yaw_joint: [-2.5560, 2.5560]
+    right_elbow_joint: [-2.3556, 0.0000]
+    right_wrist_yaw_joint: [-2.5560, 2.5560]
+    right_wrist_pitch_joint: [-0.5580, 0.5580]
+    right_wrist_roll_joint: [-0.7240, 1.5710]
+

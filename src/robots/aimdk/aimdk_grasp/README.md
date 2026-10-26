@@ -39,6 +39,72 @@ HAL leaves `meas_stamp` zero), so joint states and images are compared within on
 clock domain, as in the standalone pipeline; the nearest sample is at most 10 ms
 from the image.
 
+## Planning model
+
+`aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF
+of the X2 Ultra upper body with the left OmniHand from the official description
+in `aimdk_description`; no hand-edited URDF is kept. It preserves the
+conventions the pipeline's collision data and joint commands were built on:
+hand joints are `R_*` aliases (native position times a fixed sign), `R_palm`
+keeps the pipeline's tool-frame orientation, and the distal finger joints are
+independent because the pipeline drives them from the measured coupling.
+
+`config/x2_ultra/` holds the cuRobo configuration for that model. cuRobo 0.8
+itself is installed by `scripts/setup.sh` on the cuda accelerator, from the
+audited pure-Python wheel in `third_party/wheels/curobo/`; it compiles its CUDA
+kernels at run time through NVRTC, so the same wheel serves the X2 Orin.
+
+| File | Content |
+|---|---|
+| `robot.yml` | cuRobo `robot_cfg` (spheres, exclusions, locked joints, c-space) and the generator options (`planning_model`) |
+| `hand_collision_cover.json` | certified sphere covers of six hand links (checked against the mesh file, its URDF origin and its scale) and the hand contact exclusions |
+| `hand_collision_reference.json` | hand/wrist exclusions of the reference sphere fit |
+| `torso_collision_cover.json` | certified torso cover, checked against the mesh file, its URDF origin and normalized scale; regenerate with `fit_x2_torso_cover <file>` |
+| `provenance.json` | where each value comes from, and the measured coverage of the official meshes |
+
+The collision data was fitted on the AimDK SDK hand and arm meshes of the
+standalone workspace and is kept as is, with two exceptions: the shoulder roll
+spheres are re-expressed into the official link frames (only the frame origin
+differs), and the torso cover is refit on the official torso mesh, which has a
+rear protrusion the SDK mesh lacks. The official meshes deviate from the SDK
+ones by a few millimetres; `provenance.json` lists the per-link coverage.
+
+The hand is the AimDK SDK hand (`palm_mount: legacy`, `thumb_mount: legacy`),
+which the operator confirmed on the robot: the palm at the SDK position, 3 mm
+closer to the wrist than the official model, and the four fingers and the thumb
+on their SDK mounts. On the palm it is then exactly the hand of the GraspGen-X
+gripper description, which the grasps are proposed for, and the hand collision
+spheres sit where they were fitted (they are the SDK cover's, per link). The
+official model's fingers are 0.53° about the wrist axis away from the SDK's and
+its thumb roll axis ~75°; `"official"` builds it for comparison only.
+
+Open item:
+
+- **Right hand.** The right OmniHand is not in the collision model (the right
+  arm is locked during planning), as in the standalone workspace.
+
+## Robot model and collision spheres
+
+`aimdk_grasp.robot_model.collision_robot_config()` loads `config/x2_ultra`,
+verifies every cover against the description files it is bound to, and adds the
+hand and assembly exclusions; it refuses a cover whose meshes changed, or whose
+meshes the URDF moved or scaled inside their link.
+`planning_urdf()` writes the generated URDF to a content-named file for cuRobo,
+which does the collision checking on the GPU.
+
+`aimdk_grasp.robot_spheres.RobotSphereModel` places the same spheres on the CPU
+for given joint states (the scene's self filter and the planner's start state)
+and bounds the left arm's and palm's reach (the scene crop and the grasp
+candidate prefilter). `aimdk_grasp.hand.HandMapping` converts native left-hand
+positions to the model's aliases and derives the unmeasured distal joints. Its
+limits come from the planning model; the `open` / `close` presets come from the
+deployed GraspGenX gripper description (`load_gripper_presets`), since grasp
+candidates are generated for that hand shape.
+
+The standalone workspace's exact CPU self- and scene-collision check is not
+brought over: execution on the robot no longer calls it, and planning checks
+run in cuRobo.
+
 ## What replaced the standalone `x2_grasp_msgs`
 
 | Standalone interface | Replacement | Why |

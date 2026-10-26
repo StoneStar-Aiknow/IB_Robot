@@ -19,6 +19,13 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <!-- the on-demand subscriptions the head camera, hand and feedback inputs read -->
+  <exec_depend>robot_runtime</exec_depend>
+  <!-- official X2 URDF and meshes the planning model is generated from -->
+  <exec_depend>aimdk_description</exec_depend>
+  <!-- trimesh (fit_x2_torso_cover only) is a pip dependency, skipped by rosdep -->
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>python3-yaml</test_depend>

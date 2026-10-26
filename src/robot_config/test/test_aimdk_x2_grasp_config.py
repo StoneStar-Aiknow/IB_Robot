@@ -54,6 +54,15 @@ def test_it_selects_the_omnihand_runtime_profile(merged, profile):
     assert merged["type"] == profile["runtime"]["type"] == "x2_ultra_omnihand"
 
 
+def test_arm_limits_match_the_mirror_until_the_configurations_merge(merged):
+    # Two copies of the motion-control limits exist until the grasp and mirror
+    # configurations become one; a change to either must reach the other.
+    # The mirror's limits sit in its own file, so it is read without binding the
+    # runtime interface description its full load requires.
+    mirror = yaml.safe_load((ROBOTS / "aimdk_x2_magicmirror.yaml").read_text(encoding="utf-8"))["robot"]
+    assert merged["arm_limits"] == mirror["motion_imitation_stream"]["mock_playback"]["arm_limits"]
+
+
 def test_required_capabilities_are_all_provided_by_the_omnihand_profile(merged, profile):
     required = set(merged["capabilities"]["requires"])
     assert required <= all_capabilities()

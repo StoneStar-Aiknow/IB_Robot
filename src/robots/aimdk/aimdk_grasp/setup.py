@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "aimdk_grasp"
@@ -9,6 +11,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/config/x2_ultra", glob("config/x2_ultra/*")),
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},
@@ -17,4 +20,9 @@ setup(
     maintainer_email="zhufei26@huawei.com",
     description="AgiBot X2 grasp pipeline over the public runtime interfaces",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "fit_x2_torso_cover = aimdk_grasp.torso_cover:main",
+        ],
+    },
 )
