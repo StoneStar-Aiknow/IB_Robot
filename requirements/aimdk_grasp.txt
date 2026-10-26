@@ -1,0 +1,23 @@
+# Runtime dependencies of the AgiBot X2 grasp pipeline (src/robots/aimdk/aimdk_grasp).
+# Installed by ./scripts/setup.sh right after GraspGenX, behind the same
+# accelerator gate (accel_supports_torch_grasp, i.e. the cuda accelerator).
+#
+# NVIDIA Warp runs the depth-to-RGB registration kernel on the planning host's
+# GPU; cuRobo, used by the grasp planner, builds on the same pinned runtime.
+
+warp-lang==1.11.1
+
+# cuRobo itself is installed from the audited wheel in third_party/wheels/curobo/
+# with --no-deps. It compiles its kernels at run time through cuda.core NVRTC,
+# using the NVRTC that Torch's CUDA 12 wheels already install; the [cu12] extra
+# would add a second CUDA toolchain and is not used. These are the pins the X2
+# Orin deployment runs with.
+cuda-core==0.7.0
+cuda-bindings==12.9.7
+cuda-pathfinder==1.8.1
+# What cuRobo imports besides Torch, Warp, SciPy and the trimesh/yourdfpy pair of
+# requirements/manipulation.txt. Already in the environment through other
+# packages; listed because the wheel's own metadata is not used.
+networkx
+pyyaml
+tqdm

@@ -24,9 +24,14 @@ third_party/
 │   │   ├── manifest.yaml
 │   │   ├── series.txt
 │   │   └── 0001-*.patch
-│   └── groundingdino/<commit>/
+│   ├── groundingdino/<commit>/
+│   │   ├── manifest.yaml
+│   │   ├── series.txt
+│   │   └── 0001-*.patch
+│   └── curobo/<commit>/
 │       ├── manifest.yaml
 │       ├── series.txt
+│       ├── LICENSE
 │       └── 0001-*.patch
 ├── wheels/
     ├── recognize-anything/<commit>/
@@ -40,8 +45,12 @@ third_party/
     │   ├── LICENSE
     │   ├── LICENSE_ASSETS.md
     │   └── SHA256SUMS
-    └── graspgenx/<commit>/
-        ├── graspgenx-*.whl
+    ├── graspgenx/<commit>/
+    │   ├── graspgenx-*.whl
+    │   ├── LICENSE
+    │   └── SHA256SUMS
+    └── curobo/<commit>/
+        ├── nvidia_curobo-*.whl
         ├── LICENSE
         └── SHA256SUMS
 └── vendor/
@@ -60,6 +69,12 @@ CUDA 用户如需最优性能可单独构建 `_C` 扩展）。GraspGen wheel 通
 `requirements/manipulation.txt` 统一解析，避免第三方元数据覆盖
 IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 GraspGenX wheel 通过 `scripts/build_graspgenx_wheel.sh` 从固定 upstream commit 重建（只打包 `graspgenx` 包本身，构建时不拉取上游的 Git LFS 资产；字节级可复现）。它是纯 Python wheel、编码器为 PTV3，既不碰 `pointnet2_ops` 也不需要 CUDA 工具链，因此安装判定独立于 GraspGen：由 `accel_supports_torch_graspgenx` 把关，在 cuda 与 cann 加速器上安装，cpu 跳过（无后端可服务）。用 `--no-deps` 安装，运行时依赖由 `requirements/graspgenx.txt` 声明——该文件必须自足，因为 cann 上不会安装 `requirements/manipulation.txt`（回归测试见 `scripts/setup/tests/test_graspgenx_requirements.sh`）。
+cuRobo wheel 通过 `scripts/build_curobo_wheel.sh` 从 v0.8.0 的固定 commit 重建，供 X2 抓取规划器使用。cuRobo 只以源码发布，PyPI 上的
+`nvidia-curobo` 是一个没有代码的 0.1 占位包，不能用它代替。0.8 通过 cuda.core NVRTC 在运行时编译 CUDA kernel，因此 wheel 只带
+kernel 源码、不含编译扩展，同一个文件可装在 x86_64 工作站和 aarch64 的 X2 Orin 上。wheel 包含代码、kernel 源码与求解器配置，
+不含测试、示例和示例机器人的网格资产（`content/assets`，另有各自的许可证，见上游 `LICENSE_ASSETS`）；字节级可复现。GitHub 不可达时，
+可用 `CUROBO_GIT_URL` 指向持有该 commit 的本地 clone。setup 与 GraspGen 一起安装或跳过它，用 `--no-deps` 安装，运行时依赖由
+`requirements/aimdk_grasp.txt` 声明。
 
 `vendor/` 中的 manifest 记录厂商制品的技术身份、授权状态和预期外部路径，不自动授予
 许可证。未获公开再分发授权的二进制不得进入提交或发布包；用户必须从合法来源取得外部

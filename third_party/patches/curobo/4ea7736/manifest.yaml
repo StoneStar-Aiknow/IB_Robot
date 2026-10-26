@@ -1,0 +1,35 @@
+upstream:
+  repository: https://github.com/NVlabs/curobo.git
+  commit: 4ea77366ca48ee453e7df139e39fa6532af49f3b
+  tag: v0.8.0
+distribution:
+  name: nvidia-curobo
+  version: 0.8.0+ibrobot.1
+  import_package: curobo
+  wheel: ../../../wheels/curobo/4ea7736/nvidia_curobo-0.8.0+ibrobot.1-py3-none-any.whl
+  license: Apache-2.0
+  license_file: LICENSE
+build:
+  python: ">=3.10"
+  source_date_epoch: 1776540438
+  command: scripts/build_curobo_wheel.sh
+runtime:
+  torch: "2.7.1+cu126 (workstation, verified); Jetson 2.5 nv24.08 on the X2 Orin"
+  cuda_backend: "cuda-core 0.7.0 / cuda-bindings 12.9.7 (requirements/aimdk_grasp.txt)"
+  notes: >
+    Pure-Python wheel: cuRobo 0.8 compiles its CUDA kernels at run time through
+    cuda.core NVRTC, so the wheel ships the kernel sources and no compiled
+    extension, and the same file installs on x86_64 and aarch64. It packages the
+    curobo package with its solver, task and scene configurations; the tests,
+    the examples and the example robots' meshes (content/assets, separately
+    licensed, see upstream LICENSE_ASSETS) are left out. setup installs it with
+    --no-deps; the modules it imports are listed in requirements/aimdk_grasp.txt,
+    so pip check reports the metadata requirements it skips (numpy-quaternion),
+    as it does for graspgenx. PyPI's nvidia-curobo is an empty 0.1 placeholder
+    and must never be resolved instead.
+patches:
+  - file: 0001-package-runtime-configs-and-stamp-audited-version.patch
+    purpose: >
+      Stamp the audited version statically (no setuptools-scm, which needs the
+      git history), package the runtime configurations without a MANIFEST or
+      git file finder, and keep curobo.tests and curobo.examples out of the wheel.
