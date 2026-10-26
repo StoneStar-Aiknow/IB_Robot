@@ -136,6 +136,36 @@ mesh query sees only near its surface, while a box has a distance inside it and
 pushes a path out of the pelvis. A box's corners can stand out of its hull, so the
 fine scene keeps the exact hulls and no boxes.
 
+## Left-arm planner
+
+`aimdk_grasp.planner.LeftArmPlanner` is the X2's cuRobo planner, the planning half
+of its grasp backend for `manipulation_execution`'s grasp pipeline. It plans and
+checks left-arm motion only, in `torso_link`, on CUDA: the right arm, head and
+measured hand are locked into the model from feedback, and a change in them needs
+a new planner. It holds two scene resolutions: the optimizer plans against the
+coarse scene with a merged hand cover and a 2 cm activation distance, and every
+returned state is checked against the fine scene with the full cover at zero
+distance. No hand sphere may lie behind the torso's frontal plane. A segment the
+fine check refuses says where (`LeftArmPlanner.violations`): the samples, the
+links, the depth, and the deepest sphere's torso-frame centre, which tells the
+table from the target, a neighbour or the robot's own body.
+
+Grasp candidates arrive as GraspGenX gripper-base poses in the camera frame; the
+deployed gripper description's `base_rotation` (`hand.load_gripper_description`)
+turns them into `R_palm` goals, so the planner never assumes which hand the grasp
+model was trained for. A plan is three timed segments (`trajectory.TimedTrajectory`):
+an approach found by a batched contact screen and a goalset solve (its TrajOpt seed
+lifts the hand up and out from where it hangs, then comes down into the approach pose
+from 18 cm above, so the hand does not sweep through a low target on its way up), a
+straight grasp line along the palm axis, and a vertical lift that leaves the carried target out of
+its fine check (or a hold when the line cannot be planned). `warmup()` compiles and
+captures every kernel and graph before the first request. A CUDA or Warp failure
+raises `PlannerFault`, never a candidate failure, so the owner rebuilds the planner.
+
+The planner is migrated from the standalone pipeline with its tuned constants
+unchanged; the offline replay limits and the CPU sphere kinematics it carried for
+analysis tools are not.
+
 ## Observations and revalidation
 
 `aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the

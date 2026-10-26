@@ -26,16 +26,26 @@ def hand_links(model: ET.Element) -> tuple[str, ...]:
     return ("R_palm", *(link.get("name") for link in model.findall("link") if link.get("name") in moved))
 
 
-def load_gripper_presets(gripper: Path, model: ET.Element) -> dict[str, dict[str, float]]:
-    """The ``open`` and ``close`` hand presets of a GraspGenX gripper description.
+def load_gripper_description(gripper: Path, model: ET.Element) -> dict:
+    """The GraspGenX gripper description (``config.json``) the deployed grasp model was trained for.
 
-    The presets belong to the grasp model: candidates are generated for the hand
-    shape they describe, so they are read from the deployed gripper description
-    rather than kept here. Its link list must name this model's hand links.
+    Its hand presets, palm mount (``base_rotation``) and closing sweep belong to
+    the grasp model, so they are read from the deployed description rather than
+    kept here. Its link list must name this model's hand links.
     """
     annotation = json.loads((Path(gripper) / "config.json").read_text(encoding="utf-8"))
     if set(annotation["links"]) != set(hand_links(model)):
         raise ValueError(f"{gripper}: gripper links do not match the planning model's hand")
+    return annotation
+
+
+def load_gripper_presets(gripper: Path, model: ET.Element) -> dict[str, dict[str, float]]:
+    """The ``open`` and ``close`` hand presets of a GraspGenX gripper description.
+
+    The presets belong to the grasp model: candidates are generated for the hand
+    shape they describe.
+    """
+    annotation = load_gripper_description(gripper, model)
     return {name: dict(annotation[name]) for name in ("open", "close")}
 
 

@@ -26,6 +26,8 @@
   <!-- official X2 URDF and meshes the planning model is generated from -->
   <exec_depend>aimdk_description</exec_depend>
   <!-- trimesh (fit_x2_torso_cover, export_x2_leg_obstacle only) is a pip dependency, skipped by rosdep -->
+  <!-- torch, cuRobo (nvidia-curobo, audited wheel) and warp-lang are pip dependencies that
+       scripts/setup.sh installs on the cuda accelerator; the planner and registration need them -->
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>python3-yaml</test_depend>
