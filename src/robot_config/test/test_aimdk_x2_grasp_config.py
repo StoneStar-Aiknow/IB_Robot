@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.loader import load_robot_config, load_robot_config_dict, validate_config
+from robot_config.interface_binding import InterfaceBindingError, bind_robot_interfaces, required_interface_ids
+from robot_config.loader import load_robot_config_dict, validate_robot_config_dict
 from robot_runtime.capabilities import all_capabilities
 
 ROBOTS = Path(__file__).resolve().parents[1] / "config" / "robots"
@@ -36,7 +37,8 @@ pytestmark = pytest.mark.model_bundle(
 
 @pytest.fixture(scope="module")
 def merged():
-    return load_robot_config_dict(str(CONFIG))
+    # The grasp backends' runtime topics are live logical bindings, resolved at launch.
+    return load_robot_config_dict(str(CONFIG), defer_interface_binding=True)
 
 
 @pytest.fixture(scope="module")
@@ -44,8 +46,25 @@ def profile():
     return yaml.safe_load(PROFILE.read_text(encoding="utf-8"))
 
 
-def test_configuration_is_valid():
-    assert validate_config(load_robot_config(str(CONFIG))) == []
+def test_configuration_is_valid(merged):
+    validate_robot_config_dict(merged, deferred_interfaces=True)
+
+
+def test_the_grasp_topics_bind_against_the_omnihand_runtime(merged, profile):
+    from robot_runtime.interface_description import build_description, description_digest
+    from robot_runtime.profile import load_profile
+
+    assert "joint.arm_stream" in required_interface_ids(merged)
+    with pytest.raises(InterfaceBindingError, match="description_required"):
+        load_robot_config_dict(str(CONFIG))
+    description = build_description(load_profile(os.fspath(PROFILE)), use_sim=True)
+    bound = bind_robot_interfaces(merged, description)
+    assert bound["runtime"]["interface_description"]["interfaces"]["joint.arm_stream"]["endpoint"]
+    del description["interfaces"]["joint.hand_stream"]
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    with pytest.raises(InterfaceBindingError, match="unknown_interface.*joint.hand_stream"):
+        bind_robot_interfaces(merged, description)
 
 
 def test_it_selects_the_omnihand_runtime_profile(merged, profile):

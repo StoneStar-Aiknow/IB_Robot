@@ -375,6 +375,7 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         "enabled": True,
         "backend": "aimdk_grasp.pick_backend:x2_backends",
         "backend_options": {"anything": [1, 2]},
+        "command_interfaces": ["joint.arm_stream"],
         "pipeline": {
             "max_attempts": 2,
             "max_moved_replans": 1,
@@ -388,6 +389,8 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         (lambda c: c.update(backend="a b:c"), "package.module:callable"),
         (lambda c: c.pop("backend"), "requires grasp_execution.backend"),
         (lambda c: c.update(backend_options=[1]), "backend_options must be a mapping"),
+        (lambda c: c.update(command_interfaces="joint.arm_stream"), "command_interfaces must be a list"),
+        (lambda c: c.update(command_interfaces=[""]), "command_interfaces must be a list"),
         (lambda c: c["pipeline"].update(max_attempts=0), "max_attempts"),
         (lambda c: c["pipeline"].update(home_tolerance_rad=0.0), "home_tolerance_rad"),
         (lambda c: c["pipeline"].update(retries=3), "retries"),
@@ -396,6 +399,17 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         config = {**valid, "pipeline": dict(valid["pipeline"])}
         mutate(config)
         assert any(message in error for error in validate_grasp_execution_config(config)), message
+
+
+def test_a_grasp_backend_binds_only_its_command_streams() -> None:
+    from robot_config.interface_binding import InterfaceBindingError, _bindings, required_interface_ids
+
+    config = {"grasp_execution": {"enabled": True, "command_interfaces": ["joint.arm_stream", "joint.hand_stream"]}}
+    assert required_interface_ids(config) == ["joint.arm_stream", "joint.hand_stream"]
+    assert {direction for _, _, direction in _bindings(config)} == {"subscribe"}
+    assert required_interface_ids({"grasp_execution": {**config["grasp_execution"], "enabled": False}}) == []
+    with pytest.raises(InterfaceBindingError, match="invalid_interface"):
+        required_interface_ids({"grasp_execution": {"enabled": True, "command_interfaces": [" x"]}})
 
 
 def test_the_shared_schema_knows_no_planning_host() -> None:

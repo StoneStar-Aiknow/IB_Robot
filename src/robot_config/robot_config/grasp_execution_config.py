@@ -54,6 +54,10 @@ def _vector(*, nonzero: bool = False) -> _Rule:
     return _Rule("vector", length=3, nonzero=nonzero)
 
 
+def _strings() -> _Rule:
+    return _Rule("strings")
+
+
 def _mapping() -> _Rule:
     """Any mapping; its owner validates the contents."""
     return _Rule("mapping")
@@ -73,6 +77,9 @@ _SCHEMA: dict[str, Any] = {
     "backend": _string(),
     # Read by the backend factory, which validates it.
     "backend_options": _mapping(),
+    # Runtime command streams the backend publishes to; bound against the live
+    # runtime description by robot_config.interface_binding.
+    "command_interfaces": _strings(),
     "pipeline": {
         "max_attempts": _integer(1),
         "max_moved_replans": _integer(0),
@@ -358,6 +365,10 @@ def _validate_rule(value: Any, path: str, rule: _Rule, errors: list[str]) -> Non
         if not isinstance(value, dict):
             errors.append(f"{path} must be a mapping")
         return
+    elif rule.kind == "strings":
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            errors.append(f"{path} must be a list of non-empty strings")
+        return
     elif rule.kind == "vector":
         if (
             not isinstance(value, list | tuple)
@@ -411,8 +422,9 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
     backend = value.get("backend")
     if isinstance(backend, str) and backend.strip() and not _BACKEND_REFERENCE.fullmatch(backend):
         errors.append("grasp_execution.backend must be 'package.module:callable'")
-    if "backend_options" in value and not value.get("backend"):
-        errors.append("grasp_execution.backend_options requires grasp_execution.backend")
+    for key in ("backend_options", "command_interfaces"):
+        if key in value and not value.get("backend"):
+            errors.append(f"grasp_execution.{key} requires grasp_execution.backend")
 
     ik = value.get("ik")
     if isinstance(ik, dict):

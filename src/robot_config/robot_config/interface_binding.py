@@ -41,7 +41,31 @@ def _audio_binding(
     yield item, path, direction
 
 
+def _grasp_execution_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    """The runtime command streams an enabled grasp backend publishes to.
+
+    Only commands: a runtime need not sample what it publishes (the X2 runtime
+    reports no state for its camera or joint topics), so a published topic
+    bound here could never become ready. The backend checks its inputs against
+    the live description it receives.
+    """
+    grasp = config.get("grasp_execution")
+    if not isinstance(grasp, Mapping) or grasp.get("enabled") is not True:
+        return
+    ids = grasp.get("command_interfaces")
+    if ids is None:
+        return
+    if not isinstance(ids, list):
+        raise InterfaceBindingError("invalid_binding", "grasp_execution.command_interfaces", "must be a list")
+    for index, interface_id in enumerate(ids):
+        path = f"grasp_execution.command_interfaces[{index}]"
+        if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+            raise InterfaceBindingError("invalid_interface", path, "interface must be a non-empty logical ID")
+        yield {"interface": interface_id}, f"{path} interface={interface_id!r}", "subscribe"
+
+
 def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    yield from _grasp_execution_bindings(config)
     voice = config.get("voice_asr") or {}
     if isinstance(voice, Mapping) and voice.get("enabled"):
         external_mode = str(voice.get("input_mode", "shared_audio")) == "external_vad"
