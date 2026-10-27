@@ -1,0 +1,46 @@
+From 3a6fb86edb507954d63f52bbe640d4e41a402018 Mon Sep 17 00:00:00 2001
+From: DipFlip <emirof@gmail.com>
+Date: Wed, 8 Oct 2025 00:29:13 -0700
+Subject: [PATCH] Fix raw_mjpeg passthrough for compressed image publishing
+
+Change pixel format check from 'mjpeg' to 'raw_mjpeg' to enable
+direct MJPEG passthrough to compressed topic without decode/re-encode.
+
+This allows the driver to publish raw MJPEG data directly on the
+/image_raw/compressed topic, avoiding unnecessary CPU usage from
+decoding to YUV and re-encoding to JPEG.
+
+Fixes: https://github.com/ros-drivers/usb_cam/issues/346
+---
+ src/ros2/usb_cam_node.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/ros2/usb_cam_node.cpp b/src/ros2/usb_cam_node.cpp
+index f8e8ded..4c9362e 100644
+--- a/src/ros2/usb_cam_node.cpp
++++ b/src/ros2/usb_cam_node.cpp
+@@ -169,9 +169,9 @@ void UsbCamNode::init()
+     return;
+   }
+ 
+-  // if pixel format is equal to 'mjpeg', i.e. raw mjpeg stream, initialize compressed image message
+-  // and publisher
+-  if (m_parameters.pixel_format_name == "mjpeg") {
++  // if pixel format is equal to 'raw_mjpeg', i.e. raw mjpeg stream,
++  // initialize compressed image message and publisher
++  if (m_parameters.pixel_format_name == "raw_mjpeg") {
+     m_compressed_img_msg.reset(new sensor_msgs::msg::CompressedImage());
+     m_compressed_img_msg->header.frame_id = m_parameters.frame_id;
+     m_compressed_image_publisher =
+@@ -423,7 +423,7 @@ void UsbCamNode::update()
+     // If the camera exposure longer higher than the framerate period
+     // then that caps the framerate.
+     // auto t0 = now();
+-    bool isSuccessful = (m_parameters.pixel_format_name == "mjpeg") ?
++    bool isSuccessful = (m_parameters.pixel_format_name == "raw_mjpeg") ?
+       take_and_send_image_mjpeg() :
+       take_and_send_image();
+     if (!isSuccessful) {
+-- 
+2.34.1
+

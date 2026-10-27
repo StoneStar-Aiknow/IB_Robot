@@ -159,6 +159,14 @@ tokenizers、safetensors、Pillow 和 OpenCV wheel 的版本约束与 profile �
 NumPy 2，因此不将 NumPy 加入全过程约束。Transformers 5.3.0 是当前冻结精度的兼容选择，
 本轮不解决其已知安全公告；模型升级和其他模型兼容性验证另行安排。
 
+## usb_cam 补丁构建
+
+`full` profile 通过子模块下载固定版本的 `src/usb_cam`，应用
+[`third_party/patches/usb_cam/`](../../third_party/patches/usb_cam/README.md)
+管理的 mailbox 补丁，然后由 `scripts/build.sh` 编译。主仓库保存上游 gitlink
+及补丁，不提交第三方源码。`inference` / `training` 不下载该相机驱动。
+`--only-patch` 包含所选 profile 的源码准备和补丁应用，可能需要联网。
+
 ## LeRobot 补丁分发
 
 `libs/lerobot` 在 `third_party/patches/lerobot/<tag>/` 下为每一个支持的上游 tag 提供一份补丁序列。决定哪个 tag 当前生效的**单一事实源**是 `third_party/patches/lerobot/INDEX.yaml`（见下文 [多 tag 布局](#多-tag-布局)）。在生效的 tag 内，**并非每个补丁都适用于所有主机**。应用器通过 `lerobot_filter_series.py` 过滤原始 `series.txt`，按 `manifest.yaml` 中独立声明的谓词为每个补丁打门：

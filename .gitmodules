@@ -27,3 +27,7 @@
 	path = src/fast_calib
 	url = https://atomgit.com/ib_robot/FAST-Calib_Ros2.git
 	ignore = dirty
+[submodule "src/usb_cam"]
+	path = src/usb_cam
+	url = https://atomgit.com/ib_robot/usb_cam.git
+	ignore = dirty
