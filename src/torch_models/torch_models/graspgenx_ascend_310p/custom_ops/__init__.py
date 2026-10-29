@@ -13,11 +13,13 @@ from the environment with a documented default, in the same way
 
     <root>/graspgenx_grid/torch_bridge.so
     <root>/graspgenx_subm/torch_bridge.so
-    <root>/vendors/<vendor_name>/...
 
-Note that the vendor packages themselves are found by CANN through
-`ASCEND_CUSTOM_OPP_PATH`, which has to be exported before the process starts;
-nothing here can set it after the fact.
+The CANN vendor packages are *not* here. They are installed into the CANN
+tree's own `opp/vendors/`, because that is the only location CANN reuses the
+packaged binary kernels from: naming them in `ASCEND_CUSTOM_OPP_PATH` instead
+registers their operator-info, proto and tiling stores but not the binary
+store, and GE then recompiles each operator once per process. So nothing here
+sets that variable, and setup must not either.
 """
 
 from __future__ import annotations
@@ -31,8 +33,7 @@ ENVIRONMENT_VARIABLE = "IBROBOT_GRASPGENX_ASCEND_OPS"
 # The operators are built per host, for one CANN release and the installed
 # Torch's ABI, so the products are a cache rather than part of the tree: the
 # source under kernels/ is versioned, what comes out of it is not. This is the
-# only definition of that location; a launch that has to carry
-# ASCEND_CUSTOM_OPP_PATH forwards the variable above instead of recomputing it.
+# only definition of that location.
 _CACHE_DEFAULT = "~/.cache/ibrobot/graspgenx_ascend_ops"
 
 
