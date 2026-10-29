@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import launch
+import pytest
 import yaml
 from launch_ros.actions import Node
 
@@ -133,15 +135,102 @@ def test_profile_mount_defaults_equal_the_mount_file():
     assert lidar["simulation"]["mujoco"]["transform"] == expected
 
 
-def test_nav_grasp_still_rejects_gazebo_before_any_action():
-    import pytest
+def test_nav_grasp_gazebo_render_carries_the_arm_and_the_initial_values():
+    """D10 structure test (replaces the rejection test): the nav_grasp gz
+    render contains the whole robot — 9 ros2_control joints with the expected
+    interfaces and D4 initial values, the arm chain through arm_root (D8: no
+    link named world), the wrist camera, no front camera."""
+    from robot_runtime.launch_support import render_gazebo_description
+    from robot_runtime.profile import load_profile
 
-    from robot_runtime.launch_support import RuntimeProfileError
+    profile = load_profile(GRASP_PROFILE)
+    urdf = render_gazebo_description(profile, GRASP_PROFILE, spawn_pose=(0.0, 0.0, 0.05, 0.0))
+    root = ET.fromstring(urdf)
+    joints = {joint.get("name"): joint for joint in root.findall("ros2_control/joint")}
+    assert sorted(joints) == [str(number) for number in range(1, 10)]
+    for number in range(1, 7):
+        assert joints[str(number)].find("command_interface[@name='position']") is not None
+    for number in range(7, 10):
+        assert joints[str(number)].find("command_interface[@name='velocity']") is not None
+    # D4: the reset positions ride the position state interfaces
+    for joint, value in (profile["hardware"]["reset_positions"]).items():
+        initial = joints[str(joint)].find("state_interface[@name='position']/param[@name='initial_value']")
+        assert initial is not None and float(initial.text) == pytest.approx(value)
+    assert joints["6"].find("state_interface[@name='position']/param[@name='initial_value']") is None
+    # D8: the arm chain renames the reserved `world` link on every render
+    links = {link.get("name") for link in root.findall("link")}
+    assert "arm_root" in links and "world" not in links
+    assert {"base", "shoulder", "gripper", "jaw"} <= links
+    assert root.find("joint[@name='base_to_arm']/child").get("link") == "arm_root"
+    # the wrist camera renders (links + sensor); the front camera does not
+    assert {"camera_wrist_link", "camera_wrist_optical_frame"} <= links
+    assert "camera_front_link" not in links
+    assert root.find(".//sensor[@name='wrist_camera']") is not None
+    assert root.find(".//sensor[@name='front_camera']") is None
 
-    with pytest.raises(RuntimeProfileError, match="sim_platform 'gazebo' is not supported") as excinfo:
-        _render(GRASP_PROFILE, {"use_sim": "true", "sim_platform": "gazebo"})
-    message = str(excinfo.value)
-    assert "sdk" in message and "lekiwi_nav_grasp" in message
+
+def test_nav_grasp_arm_root_on_every_execution(tmp_path):
+    """D8: the reserved-name fix applies to hardware, SDK and both physics
+    platforms — the TF frame set is the same on every execution."""
+    from robot_runtime.launch_support import render_robot_description
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(GRASP_PROFILE)
+    for simulated in (False, True):
+        urdf = render_robot_description(profile, GRASP_PROFILE, simulated)
+        links = {link.get("name") for link in ET.fromstring(urdf).findall("link")}
+        assert "arm_root" in links and "world" not in links, f"simulated={simulated}"
+
+
+def test_nav_grasp_lidar_surface_equals_lekiwi_lidar_and_the_mount_file():
+    """D1: the mid360 mount, simulator blocks and FAST-LIO extrinsics are data
+    copies — this test is the single-source guard (D13 of #192)."""
+    from robot_runtime.profile import load_profile
+
+    grasp = load_profile(GRASP_PROFILE)
+    lidar = load_profile(LIDAR_PROFILE)
+    grasp_mid360 = next(entry for entry in grasp["peripherals"] if entry.get("name") == "mid360")
+    lidar_mid360 = next(entry for entry in lidar["peripherals"] if entry.get("name") == "mid360")
+    translation, rpy = _mount_translation()
+    expected = {
+        "parent_frame": "base_link",
+        "x": translation[0],
+        "y": translation[1],
+        "z": translation[2],
+        "roll": rpy[0],
+        "pitch": rpy[1],
+        "yaw": rpy[2],
+    }
+    assert grasp_mid360["transform"] == expected
+    assert grasp_mid360["simulation"]["gazebo"]["transform"] == expected
+    assert grasp_mid360["simulation"]["mujoco"]["transform"] == expected
+    assert grasp_mid360["simulation"] == lidar_mid360["simulation"]
+    for key in ("sim_params_file", "body_to_base_translation", "body_to_base_rotation"):
+        assert grasp["fast_lio"][key] == lidar["fast_lio"][key]
+    assert grasp["fast_lio"]["body_to_base_translation"] == pytest.approx([0.0, -0.08, -0.2])
+    # D7: the conformance start pose equals the hardware reset positions
+    assert grasp["conformance"]["start_positions"] == grasp["hardware"]["reset_positions"]
+
+
+def test_nav_grasp_facade_description_matches_the_platform_exclusions():
+    """D3/D10: audio and the front camera are absent from the description on
+    both physics platforms; the wrist camera and the MID-360 stay; the SDK
+    execution keeps the full inventory."""
+    from robot_runtime.interface_description import build_description
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(GRASP_PROFILE)
+    for platform in ("gazebo", "mujoco"):
+        description = build_description(profile, use_sim=True, sim_platform=platform)
+        keys = set(description["interfaces"])
+        assert not any(key.startswith("audio.") for key in keys)
+        assert not any(key.startswith("camera.front.") for key in keys)
+        assert any(key.startswith("camera.wrist.") for key in keys)
+        assert any(key.startswith("lidar.mid360.") for key in keys)
+    sdk = build_description(profile, use_sim=True, sim_platform="sdk")
+    keys = set(sdk["interfaces"])
+    assert any(key.startswith("audio.capture") for key in keys)  # microphone enabled by default
+    assert any(key.startswith("camera.front.") for key in keys)
 
 
 # ---------------------------------------------------------------------------

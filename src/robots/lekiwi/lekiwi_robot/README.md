@@ -79,9 +79,11 @@ and start no motion services.
 ## Supported profiles
 
 Only `lekiwi_lidar` (base only: modes `idle`, `base_navigation`) and
-`lekiwi_nav_grasp` (arm + base: adds `stream`, `trajectory`) are shipped. The
-other LeKiwi configurations in `robot_config` still use the legacy
-provider-less bring-up.
+`lekiwi_nav_grasp` (arm + base: adds `stream`, `trajectory`) are shipped. Both
+run on the `sdk` simulated transport; `lekiwi_nav_grasp` additionally runs its
+navigation stage on both physics platforms (`sim_platforms: [sdk, gazebo,
+mujoco]`, lekiwi-nav-grasp-sim-platforms). The other LeKiwi configurations in
+`robot_config` still use the legacy provider-less bring-up.
 
 ## Running standalone
 
@@ -148,10 +150,14 @@ sensors always sit exactly at the mount.
 accuracy gate for this runtime. It lives in `robot_navigation`, not here:
 it launches the generic application entry, and this package may not declare
 test dependencies on generic packages (the independence gate below audits
-the whole dependency closure, test dependencies included). It runs the
-production navigation stage (staged from the gate's own
-`robot_navigation/test/config/lekiwi_lio_sim.yaml` overlay) in the shipped
-`nav_room` scene and, with no Nav2 goal active, drives a scripted closed
+the whole dependency closure, test dependencies included). It is
+parametrized over profile (`lekiwi_lidar`, `lekiwi_nav_grasp`) as well as
+platform: the mobile manipulator runs the SAME thresholds over the SAME
+route, staged from the gate's own
+`robot_navigation/test/config/lekiwi_nav_grasp_lio_sim.yaml` overlay, with
+the stowed-arm envelope asserted for the whole route (see the nav_grasp
+section below). With no Nav2 goal active, it
+drives a scripted closed
 route on **`/cmd_vel_nav`** — the production chain's entry point — so the
 velocity smoother and the collision monitor stay in the loop
 (`controller → /cmd_vel_nav → velocity smoother → /cmd_vel_smoothed →
@@ -217,8 +223,14 @@ check of the same navigation stage: it sends `NavigateToPose` goals (to a
 point and back to the spawn) and a cancel-based stop, asserting the D3 stop
 thresholds and single-publisher `map -> odom` ownership (AMCL) on simulator
 ground truth. It is parametrized over `PHYSICS_SIM_PLATFORMS` — goals,
-thresholds and assertions are identical on Gazebo and MuJoCo; the staged
-`lekiwi_navi_sim` overlay (not the shipped one) carries the platform under
+thresholds and assertions are identical on Gazebo and MuJoCo — and over the
+staging base (`lekiwi_lidar`, `lekiwi_nav_grasp`): the mobile manipulator
+runs the same goals through its own overlay
+(`robot_config/test/config/lekiwi_nav_grasp_navi_sim.yaml`, whose Nav2
+parameters carry the measured `robot_radius: 0.28` footprint — the stowed
+arm's planar extent 0.240 m / conservative 0.277 m vs the base-only 0.22)
+with the stowed-arm envelope asserted throughout every navigation phase.
+The staged overlay copy (not the shipped one) carries the platform under
 test. The same capability/environment/require rule as the gate applies
 (`IBROBOT_REQUIRE_SIM_PLATFORMS` turns a skip of a listed platform into a
 failure); the shared rule lives in `robot_runtime.testing.sim_environment`
@@ -242,12 +254,16 @@ runtime left on a shared domain answers for the one under test.
 
 ## MuJoCo simulation
 
-The MuJoCo platform (`sim_platform:=mujoco`) is the lidar runtime's second
-physics backend (lekiwi-mujoco-runtime-platform, #193 stage 1). It runs the
-same production chain as Gazebo — `base_node` gating, the MID-360 mount,
-FAST-LIO, the scan converter — with the sensors simulated by MuJoCo itself
-(the `mujoco_3d_lidar` engine extension for the cloud, the MJCF sensor
-triple for the integrated IMU):
+The MuJoCo platform (`sim_platform:=mujoco`) is a physics backend of both
+shipped profiles (introduced as the lidar runtime's second backend,
+lekiwi-mujoco-runtime-platform #193; `lekiwi_nav_grasp` followed in
+lekiwi-nav-grasp-sim-platforms). It runs the same production chain as Gazebo —
+`base_node` gating, the MID-360 mount, FAST-LIO, the scan converter — with the
+sensors simulated by MuJoCo itself (the `mujoco_3d_lidar` engine extension for
+the cloud, the MJCF sensor triple for the integrated IMU); under
+`lekiwi_nav_grasp` the composed model additionally hosts the SO-101 arm MJCF
+(`so101_description/mujoco/so101.xml.template`) attached under `base_link` at
+the URDF-derived pose (D2/D8):
 
 ```bash
 # provider alone, headless (no display): sensors, admission, wheels
@@ -325,9 +341,11 @@ second hard-coded rate).
 ### Screenshots (GUI, non-headless)
 
 The MuJoCo viewer window plus RViz showing the FAST-LIO cloud/map and the
-odometry path (acceptance evidence, `DISPLAY=:1`). The shipped profile keeps
-`fast_lio.enabled: false`, so the evidence run enables it through a one-key
-deployment fragment:
+odometry path (acceptance evidence, `DISPLAY=:1`). The
+`lekiwi_nav_grasp` navigation-stage variant (map, cloud, Nav2 path and the
+wrist camera during a `NavigateToPose`) is documented with the mobile
+manipulator section below — it supersedes this base-only recipe for #205
+evidence:
 
 ```bash
 # terminal 0 — the fragment (fast_lio.enabled only)
@@ -346,4 +364,164 @@ rviz2
 # window pixels readable even when occluded — no hand-written XWD decoder):
 xwininfo -root -tree                      # find the window ids
 import -window <id> shot.png
+```
+
+## The mobile manipulator in simulation (`lekiwi_nav_grasp`)
+
+The whole robot — omni base + SO-101 arm + wrist RealSense + MID-360 — runs
+its navigation stage on **both physics platforms** (lekiwi-nav-grasp-sim-
+platforms). The arm always starts and holds at `hardware.reset_positions`
+(stowed) on Gazebo and MuJoCo: the render path injects the ros2_control
+`initial_value` of each joint's position state interface, and on MuJoCo
+`set_initial_pose()` additionally stages the position actuators' `ctrl` from
+the same values on the first control cycle (verified across controller
+release and world reset). Navigating with a non-stowed arm is **outside the
+validated envelope** (D7): the runtime admits `base_navigation` with the arm
+anywhere (no pose admission exists today — asserted by the stop cross gate
+so a later admission check changes it deliberately), the gates assert the
+stowed pose throughout every navigation phase, and Nav2 plans with the
+measured stowed footprint (`robot_radius: 0.28` in
+`robot_navigation/config/nav2_params_navgrasp_sim.yaml`, the overlay-only
+parameter variant — the shipped base-only config keeps 0.22).
+
+```bash
+# provider alone (sensors, admission, wheels, arm, MoveIt stack), either platform
+IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
+  profile:=lekiwi_nav_grasp sim_platform:=mujoco [mujoco_scene:=nav_room]
+IBROBOT_GAZEBO_HEADLESS=1 IGN_PARTITION=<fresh> GZ_PARTITION=<fresh> \
+  ros2 launch lekiwi_robot runtime.launch.py \
+  profile:=lekiwi_nav_grasp sim_platform:=gazebo
+
+# navigation (FAST-LIO + Nav2/AMCL) through the robot_config entry, from a
+# staged nav_grasp overlay whose simulation.platform carries the platform
+ros2 launch robot_config robot.launch.py \
+  config_path:=<staged>/lekiwi_nav_grasp_navi_sim.yaml \
+  use_sim:=true sim_platform:=mujoco nav_stage:=navigation
+```
+
+### Excluded peripherals (D3)
+
+The microphone (`respeaker`) and speaker are **host ALSA devices with no
+simulated stand-in**: no physics platform simulates an audio source or sink,
+so the profile excludes both on Gazebo and MuJoCo
+(`simulation.<platform>.enabled: false`) and neither is advertised nor
+claimed there. The test overlays
+(`robot_config/test/config/lekiwi_nav_grasp_navi_sim.yaml`,
+`robot_navigation/test/config/lekiwi_nav_grasp_lio_sim.yaml`) therefore turn
+off every application consumer bound to those interfaces — `speech_direction`
+(`audio.capture`) and `voice_tts` (`audio.play`) — plus `voice_asr`,
+`embodied` and RViz as the base-only overlays do; the `unknown_interface`
+binding check stays strict, so a consumer left enabled for an excluded
+interface fails the launch instead of silently skipping. The wrist camera
+stays in the runtime inventory although the navigation stage's
+`peripheral_names` does not list it (`peripheral_names` only selects fragment
+entries — the runtime's own inventory is the profile's).
+
+### Stop semantics: the platform difference (D5)
+
+- **MuJoCo / hardware / SDK**: a released position actuator keeps its last
+  goal (`mujoco_ros2_control` 0.1.2 keeps a released interface's `ctrl`; the
+  physical servos keep their last goal), so a stop mid-convergence lets the
+  arm settle at the **last accepted target** — the cross gate asserts it
+  within 0.05 rad within 1 s of simulation time.
+- **Gazebo**: the settle point is **not deterministic**. `gz_ros2_control`
+  0.7.19 implements position control as a proportional-velocity servo, and
+  `perform_command_mode_switch` clears the whole control method with
+  `joint_control_method &= (VELOCITY & EFFORT)` — a bitwise AND of disjoint
+  masks, i.e. 0 — so a released joint falls to the zero-velocity fallback
+  only on the **next** controller-manager `write()` cycle; under CPU
+  contention the last `JointVelocityCmd` persists in gz's entity-component
+  system and the joint coasts past the command by a load-dependent amount
+  (measured: up to ~0.7 rad past the target; the control group
+  `so101_single_arm` — untouched by this change — reproduces it). The cross
+  gate therefore asserts on Gazebo what actually holds: later stream
+  commands never move the arm (≤ 1e-6 rad; ≤ 1e-9 measured), the arm ends at
+  rest (max joint velocity over the final second ≤ 1e-6 rad/s; ~1e-11
+  measured), and after the stop the arm controllers are inactive claiming no
+  interface — **no landing-point number is asserted**. The upstream issue
+  draft (`gz_system.cpp` line references, timing measurements, suggested
+  fix) lives in the #205 evidence directory.
+
+### The MuJoCo controller difference, arm included (D1/D3.1)
+
+The base-only rule above extends to the arm: the profile's mode table keeps
+`base_velocity_controller` **active in every mode on MuJoCo**
+(`controllers_by_platform.mujoco`), because a released MuJoCo actuator keeps
+its last target — `base_node` is the gate there. The arm and gripper
+controllers follow the ordinary lifecycle on both platforms (released in
+`idle`); on MuJoCo their released position actuators keep the last goal
+(the settle-at-target semantics above), on Gazebo the zero-velocity hold
+applies (with the release-race caveat above).
+
+### Hardware-visible changes (D8/D13 — all need on-robot verification)
+
+This change is sim-focused, but three things are visible on the physical
+`lekiwi_nav_grasp` and must be verified on the robot:
+
+1. **TF: the arm's mid-chain link `world` is renamed `arm_root`** on every
+   LeKiwi render (hardware, SDK, Gazebo, MuJoCo; sdformat rejects a
+   mid-chain frame named `world`, spike 1.1). The fixed joint
+   `base_to_arm` (base_link → the renamed root, rpy 0 0 1.5708, xyz 0.06
+   −0.02 0.02) is unchanged; the hardware URDF render is byte-identical to
+   the pre-change baseline apart from the rename and one comment
+   (`test_hardware_render_regression.py` pins this against a golden
+   generated from `2d534791`). No in-repository consumer referenced the
+   `world` frame (searched `lekiwi_*`, `robot_config`), but an external
+   one may.
+2. **MoveIt plans in `arm_root` instead of `world`**: at the baseline
+   `2d534791` the full robot and the arm-only motion model both used
+   `world`; this change renames **both to `arm_root` at the same time**
+   (`so101_base.xacro` `root_link` arg), so move_group's planning frame
+   always matches the public model's arm chain. The two must move
+   together: during development an intermediate state that renamed only
+   the full robot's chain left move_group planning in `world` while the
+   TF no longer published it — FRAME_TRANSFORM failures on SDK execution,
+   caught by robot_config's application e2e.
+3. **MID-360 mount extrinsics now match `lekiwi_lidar`**: the profile's
+   top-level mid360 `transform` (none → the measured mount
+   `lekiwi_mid360_mount.yaml`: base_link → livox_frame, xyz −0.08 0 0.20,
+   yaw 90°) and `fast_lio.body_to_base_translation/rotation` (absent →
+   the bridge defaults were identity; now the mount inverse
+   [0, −0.08, −0.2], yaw −90°). The robot_config navigation/hybrid stage
+   fragments do **not** override `body_to_base_*` (policy only: enabled /
+   planar_output), so the profile values are what the FAST-LIO odom bridge
+   uses on hardware: the odometry frame is now conjugated by the mount
+   instead of remaining sensor-rotated — the same correction `lekiwi_lidar`
+   already carries (#192/#193, `88f2ee23`). Effect on hardware: the
+   `livox_frame` static TF appears at the measured mount, and FAST-LIO's
+   `odom` frame aligns with the base instead of the yawed sensor frame.
+
+### nav_grasp screenshot evidence (both platforms)
+
+```bash
+# terminal 0 — stage the nav_grasp navigation overlay for the platform
+# (the staging helper pattern; or copy test/config/lekiwi_nav_grasp_navi_sim.yaml
+# next to robot_config's config/robots/lekiwi_nav_grasp.yaml and set
+# robot.nav_stages.navigation.simulation.platform)
+
+# terminal 1 — the navigation stage WITH the viewer: no *_HEADLESS, DISPLAY set
+DISPLAY=:1 ros2 launch robot_config robot.launch.py \
+  config_path:=<staged>/lekiwi_nav_grasp_navi_sim.yaml \
+  use_sim:=true sim_platform:=mujoco nav_stage:=navigation
+
+# terminal 2 — RViz: map + /cloud_registered (decay time) + Nav2 path/costmap
+# + a wrist camera image panel (/camera/wrist/image_raw), fixed frame map
+DISPLAY=:1 rviz2
+
+# terminal 3 — send a goal, then capture both windows mid-navigation
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 1.0, y: 1.0}}}}"
+xwininfo -root -tree                      # find the window geometries
+# the simulators render through OpenGL: import -window on their windows comes
+# out black under Xvfb (no compositor), so capture the ROOT framebuffer and
+# crop to the window's ABSOLUTE geometry (WxH+AbsX+AbsY from xwininfo).
+# /cloud_registered is stamped in FAST-LIO's camera_init frame whose TF the
+# navigation stage isolates on /fast_lio/tf_raw; the bridge's conjugation
+# fixes camera_init -> odom at exactly fast_lio.body_to_base, so a
+# visualization-only static_transform_publisher publishing that transform
+# lets RViz render the cloud (see the #205 evidence script
+# evidence_screenshot.sh, which automates all of this).
+import -window root root.png
+convert root.png -crop <WxH+X+Y> +repage mujoco_navgrasp_nav.png
+convert root.png -crop <WxH+X+Y> +repage rviz_navgrasp_nav.png
 ```

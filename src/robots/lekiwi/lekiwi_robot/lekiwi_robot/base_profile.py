@@ -161,12 +161,23 @@ def arm_motion_model(profile: dict[str, Any], profile_path: str | Path, simulate
     It is rendered from ``motion.model_xacro`` with this profile's hardware
     arguments (port, calibration, simulated), exactly as the SO-101 runtime
     renders its own description, so calibrated limits stay authoritative.
+
+    The model's root link is rendered as ``arm_root`` (D8): the public LeKiwi
+    model mounts the arm under ``base_link -> arm_root -> base`` on every
+    execution, and MoveIt's planning frame must be a frame the public
+    robot_state_publisher actually publishes — before the rename the arm-only
+    model's root coincidentally was the full robot's ``world`` link, which
+    bridged the two TF trees. Models that do not declare the ``root_link``
+    arg ignore it.
     """
     motion = profile.get("motion") or {}
     xacro = _require(motion, "model_xacro", "motion.", str(profile_path))
     arm = copy.deepcopy(profile)
     arm["description"] = {
         "xacro": xacro,
-        "xacro_args": dict((profile.get("description") or {}).get("xacro_args") or {}),
+        "xacro_args": {
+            **dict((profile.get("description") or {}).get("xacro_args") or {}),
+            "root_link": "arm_root",
+        },
     }
     return render_robot_description(arm, Path(profile_path), simulated)

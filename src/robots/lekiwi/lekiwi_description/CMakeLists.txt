@@ -19,6 +19,7 @@ install(DIRECTORY
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_mujoco_template test/test_mujoco_template.py)
+  ament_add_pytest_test(test_hardware_render_regression test/test_hardware_render_regression.py)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips cpplint (only works in a git repo)
   # comment the line when this package is in a git repo and when

@@ -1,7 +1,11 @@
 <mujoco model="lekiwi">
   <!--
     LeKiwi base MuJoCo physics model — TEMPLATE FILE
-    (lekiwi-mujoco-runtime-platform D2; base-only: the lekiwi_lidar stage).
+    (lekiwi-mujoco-runtime-platform D2). The HOST of the composed model: the
+    base alone for lekiwi_lidar, and — since lekiwi-nav-grasp-sim-platforms
+    (D2) — also the host of the SO-101 arm MJCF attached under base_link at
+    the URDF base_link -> base fixed-chain pose when a profile declares
+    simulation.mujoco.attachments (lekiwi_nav_grasp).
 
     Substitutions before XML parse (robot_runtime.mujoco.render_robot_mjcf):
       {{MESHES_DIR}}      -> absolute path of lekiwi_description/meshes/mujoco/

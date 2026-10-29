@@ -74,6 +74,16 @@
   <!-- test_mujoco_stop_gate.py drives the simulator node's pause/reset
        services (lekiwi-mujoco-runtime-platform D3). -->
   <test_depend>mujoco_ros2_control_msgs</test_depend>
+  <!-- test_navgrasp_stop_cross_gate queries the live controller manager for
+       the post-stop controller state (D5, lekiwi-nav-grasp-sim-platforms). -->
+  <test_depend>controller_manager_msgs</test_depend>
+  <!-- Review rework: every direct import of the new tests is declared — the
+       stop cross gate drives a real FollowJointTrajectory goal, and the
+       motion smoke reads /clock and /tf_static. -->
+  <test_depend>control_msgs</test_depend>
+  <test_depend>trajectory_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>tf2_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

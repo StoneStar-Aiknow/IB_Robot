@@ -52,6 +52,7 @@ from std_srvs.srv import SetBool
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode
 from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.testing.arm_envelope import envelope_verdict
 from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
 from robot_runtime.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
@@ -71,7 +72,17 @@ WZ_STEP = 1.5 / 2
 LAUNCH_STARTUP_TIMEOUT = 180.0  # wall seconds
 COMMAND_RATE_HZ = 20.0
 
-_LIDAR_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_lidar.yaml"
+_PROFILES = Path(__file__).resolve().parents[1] / "profiles"
+_LIDAR_PROFILE = _PROFILES / "lekiwi_lidar.yaml"
+#: The gate's profiles (D7 of lekiwi-nav-grasp-sim-platforms): the base-only
+#: runtime and the mobile manipulator run the same thresholds; under
+#: nav_grasp the arm must stay within 0.1 rad of its reset pose throughout
+#: EVERY motion phase (the shared envelope rule covers the whole phase,
+#: edges included — a stale or out-of-envelope sample fails).
+GATE_PROFILES = ("lekiwi_lidar", "lekiwi_nav_grasp")
+_ARM_RESET = {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0}
+_ARM_TOLERANCE = 0.1
+_ARM_MAX_SAMPLE_GAP_SEC = 0.5
 
 
 def _environment_missing(sim_platform: str) -> str | None:
@@ -89,7 +100,7 @@ def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
     skip_or_fail(sim_platform, reason, context="chassis tracking gate")
 
 
-def _platform_capabilities_missing(sim_platform: str) -> list[str]:
+def _platform_capabilities_missing(sim_platform: str, profile: str) -> list[str]:
     """The gate's code capabilities: ground truth and the profile platform."""
     from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
 
@@ -98,25 +109,50 @@ def _platform_capabilities_missing(sim_platform: str) -> list[str]:
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
-    supported = [str(entry) for entry in load_profile(_LIDAR_PROFILE).get("sim_platforms") or []]
+    supported = [str(entry) for entry in load_profile(_PROFILES / f"{profile}.yaml").get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
     return missing
 
 
 class GateNode(Node):
-    def __init__(self):
+    def __init__(self, watch_arm: bool = False):
         super().__init__("lekiwi_chassis_gate")
         self.status: RuntimeStatus | None = None
         self.odom: list[Odometry] = []
+        self.joint_states: list[tuple[float, dict[str, float]]] = []
         self.create_subscription(RuntimeStatus, "/runtime_status", self._status, 10)
         self.create_subscription(Odometry, "/odom", self._odom, 20)
+        if watch_arm:
+            # D7 (nav_grasp only): the arm-envelope samples. Best-effort with
+            # a small depth — the simulator process is load-sensitive, and a
+            # reliable 100 Hz subscription measurably degrades its control
+            # delivery (the envelope window needs ~8 samples/s, not every
+            # message).
+            from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+            from sensor_msgs.msg import JointState
+
+            self.create_subscription(
+                JointState,
+                "/joint_states",
+                self._joints,
+                QoSProfile(
+                    reliability=ReliabilityPolicy.BEST_EFFORT,
+                    durability=DurabilityPolicy.VOLATILE,
+                    depth=10,
+                ),
+            )
 
     def _status(self, msg: RuntimeStatus) -> None:
         self.status = msg
 
     def _odom(self, msg: Odometry) -> None:
         self.odom.append(msg)
+
+    def _joints(self, msg) -> None:
+        self.joint_states.append(
+            (msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9, dict(zip(msg.name, msg.position, strict=False)))
+        )
 
 
 def _measure(window: list) -> dict:
@@ -169,9 +205,10 @@ def _angle_within(measured: float, expected: float, tolerance: float) -> bool:
     return abs(math.atan2(math.sin(measured - expected), math.cos(measured - expected))) <= tolerance
 
 
+@pytest.mark.parametrize("profile", GATE_PROFILES)
 @pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
-def test_chassis_tracking_gate(tmp_path, sim_platform):
-    missing = _platform_capabilities_missing(sim_platform)
+def test_chassis_tracking_gate(tmp_path, sim_platform, profile):
+    missing = _platform_capabilities_missing(sim_platform, profile)
     if missing:
         _gate_skip_or_fail(
             sim_platform, f"chassis tracking gate: platform {sim_platform!r} lacks capabilities: {missing}"
@@ -208,7 +245,7 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
         "launch",
         PACKAGE,
         "runtime.launch.py",
-        "profile:=lekiwi_lidar",
+        f"profile:={profile}",
         f"sim_platform:={sim_platform}",
     ]
     if sim_platform == "mujoco":
@@ -225,7 +262,7 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
     node = None
     try:
         rclpy.init()
-        node = GateNode()
+        node = GateNode(watch_arm=profile == "lekiwi_nav_grasp")
         executor = rclpy.executors.SingleThreadedExecutor()
         executor.add_node(node)
         deadline = time.monotonic() + LAUNCH_STARTUP_TIMEOUT
@@ -303,6 +340,24 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
             result = _measure(window)
             measurements[label] = {**result, "samples": len(window)}
             print(f"[gate] {label}: {measurements[label]}", flush=True)
+            if profile == "lekiwi_nav_grasp":
+                # D7 (review rework): the shared envelope rule over the
+                # COMPLETE motion phase [hold_start, hold_end] — the leading
+                # edge, the internal gaps and the trailing edge all covered
+                arm = envelope_verdict(
+                    node.joint_states,
+                    hold_start,
+                    hold_end,
+                    reset=_ARM_RESET,
+                    tolerance=_ARM_TOLERANCE,
+                    max_gap=_ARM_MAX_SAMPLE_GAP_SEC,
+                )
+                assert arm["within"], f"{label}: arm outside the navigation envelope: {arm['violations']}"
+                measurements[label]["arm_envelope"] = {
+                    "worst_rad": arm["worst_rad"],
+                    "samples": arm["samples"],
+                    "max_gap_sec": arm["max_gap_sec"],
+                }
             if expect_translation:
                 command_speed = math.hypot(twist.linear.x, twist.linear.y)
                 assert result["mean_planar_speed"] == pytest.approx(command_speed, rel=0.2), (
@@ -352,7 +407,16 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
                 window = ground_truth.window(hold_end - 2.5, hold_end - 0.05)
                 assert len(window) > 10, f"{label}: too few ground-truth samples ({len(window)})"
                 gt_vx, gt_vy, gt_wz = _measure_body(window)
-                odom_window = [msg for msg in node.odom if hold_start < _stamp(msg) <= hold_end]
+                # The SAME steady-state window as the ground truth (by message
+                # stamp). The wider hold window catches one in-flight /odom
+                # message from the previous phase — right after the switch it
+                # still reports the old command's wheel velocities (the first
+                # nav_grasp window: wz 0.75 at +0.01 s, the residual of the
+                # preceding wz step, mean 0.75/27 = 0.0278 against a 0.02
+                # bound). Measuring both sides over one interval compares the
+                # reported twist against the executed twist like-for-like; the
+                # thresholds are unchanged.
+                odom_window = [msg for msg in node.odom if hold_end - 2.5 < _stamp(msg) <= hold_end - 0.05]
                 assert len(odom_window) > 10, f"{label}: too few /odom messages ({len(odom_window)})"
                 odom_vx = sum(msg.twist.twist.linear.x for msg in odom_window) / len(odom_window)
                 odom_vy = sum(msg.twist.twist.linear.y for msg in odom_window) / len(odom_window)
@@ -363,6 +427,23 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
                     "samples": len(window),
                 }
                 print(f"[gate] {label}: {measurements[label]}", flush=True)
+                if profile == "lekiwi_nav_grasp":
+                    # D7 (review rework): the envelope over the complete
+                    # motion phase, like the tracking legs above
+                    arm = envelope_verdict(
+                        node.joint_states,
+                        hold_start,
+                        hold_end,
+                        reset=_ARM_RESET,
+                        tolerance=_ARM_TOLERANCE,
+                        max_gap=_ARM_MAX_SAMPLE_GAP_SEC,
+                    )
+                    assert arm["within"], f"{label}: arm outside the navigation envelope: {arm['violations']}"
+                    measurements[label]["arm_envelope"] = {
+                        "worst_rad": arm["worst_rad"],
+                        "samples": arm["samples"],
+                        "max_gap_sec": arm["max_gap_sec"],
+                    }
                 # /odom twist against the ground-truth twist (20 %)
                 for name, reported, measured_gt in (
                     ("vx", odom_vx, gt_vx),

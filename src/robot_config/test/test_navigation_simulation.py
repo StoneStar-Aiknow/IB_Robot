@@ -11,7 +11,13 @@ bridges the simulator's world pose itself for its assertions.
 
 The test is parametrized over ``PHYSICS_SIM_PLATFORMS`` (gazebo, mujoco):
 goals, thresholds and assertions are identical on both platforms
-(lekiwi-mujoco-runtime-platform D15). A platform runs only when its
+(lekiwi-mujoco-runtime-platform D15). It is parametrized over the staging
+base too (D7, lekiwi-nav-grasp-sim-platforms): the mobile manipulator
+``lekiwi_nav_grasp`` runs the same goals through its own overlay
+(``lekiwi_nav_grasp_navi_sim.yaml``, Nav2 robot_radius 0.28 — the stowed
+arm's measured footprint) with the stowed-arm envelope asserted throughout
+(every navigation phase; see the arm check at the end of the test). A
+platform runs only when its
 capabilities and its simulator ENVIRONMENT are present; every do-not-run
 reason goes through the required-platform rule —
 ``IBROBOT_REQUIRE_SIM_PLATFORMS`` listing the platform turns the skip into a
@@ -56,6 +62,7 @@ from tf2_msgs.msg import TFMessage
 
 from ibrobot_msgs.msg import RuntimeStatus
 from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS
+from robot_runtime.testing.arm_envelope import envelope_verdict
 from robot_runtime.testing.sim_environment import (
     REQUIRED_SIM_PLATFORMS_ENV,
     environment_missing,
@@ -69,7 +76,11 @@ from robot_runtime.testing.sim_ground_truth import (
     terminate_marked_processes,
 )
 from sim_models.scene_compiler import get_scene_file
-from test.navigation_sim_support import load_staged_navigation_config, stage_navigation_config
+from test.navigation_sim_support import (
+    NAVIGATION_STAGING,
+    load_staged_navigation_config,
+    stage_navigation_config,
+)
 
 POSITION_TOLERANCE = 0.25
 SIM_STARTUP_TIMEOUT = 240.0
@@ -78,6 +89,13 @@ NAV_GOAL_TIMEOUT = 180.0
 STOP_PLANAR_LIMIT = 0.02
 STOP_YAW_RATE_LIMIT = 0.05
 NAV_TEST_PROFILE_ENV = "NAV_TEST_PROFILE"
+#: D7 (lekiwi-nav-grasp-sim-platforms): the stowed-arm envelope the nav_grasp
+#: e2e asserts throughout every navigation phase — the arm joints within
+#: 0.1 rad of hardware.reset_positions, with fresh /joint_states (no
+#: inter-sample gap above 0.5 s; the arm moves on 100 ms timescales at most).
+_ARM_RESET = {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0}
+_ARM_TOLERANCE = 0.1
+_ARM_MAX_SAMPLE_GAP_SEC = 0.5
 NAV2_TEST_PARAMS_FILE_ENV = "NAV2_TEST_PARAMS_FILE"
 
 WORLD_NAME = "demo"  # the scene template's world name
@@ -228,13 +246,16 @@ def _map_odom_ownership_problems(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("base_config", sorted(NAVIGATION_STAGING))
 @pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
-def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_platform):
-    config = load_staged_navigation_config(stage_navigation_config(tmp_path, sim_platform=sim_platform))
+def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_platform, base_config):
+    config = load_staged_navigation_config(
+        stage_navigation_config(tmp_path, sim_platform=sim_platform, base_config=base_config)
+    )
 
     # the provider path with the production navigation stage selected
     assert config["runtime"]["provider"] == "lekiwi_robot"
-    assert config["runtime"]["profile"] == "lekiwi_lidar"
+    assert config["runtime"]["profile"] == base_config
     assert config["nav_stage"] == "navigation"
 
     # the platform under test and the scene with its spawn (inside the stage)
@@ -251,7 +272,11 @@ def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_p
     assert navigation["nav2_bringup"]["auto_global_localization"] is False
     assert navigation["nav2_bringup"]["dyn_avoid_enabled"] is True
     assert navigation["nav2_bringup"]["map_file"].endswith("maps/sim_map.yaml")
-    assert navigation["nav2_bringup"]["params_file"].endswith("nav2_params_sim.yaml")
+    # the Nav2 parameter variant follows the base configuration: the base-only
+    # footprint (robot_radius 0.22) or the mobile manipulator's measured
+    # footprint (robot_radius 0.28, the stowed arm's planar extent; D7)
+    expected_params = "nav2_params_navgrasp_sim.yaml" if base_config == "lekiwi_nav_grasp" else "nav2_params_sim.yaml"
+    assert navigation["nav2_bringup"]["params_file"].endswith(expected_params)
     # no static map -> odom is composed anywhere in the config
     for static_tf in navigation.get("static_tfs", []):
         assert static_tf.get("child_frame") != "odom" or static_tf.get("parent_frame") != "map"
@@ -275,12 +300,16 @@ def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_p
 
 
 def test_shipped_navigation_overlay_pins_gazebo():
-    """D15: the shipped overlay stays Gazebo-pinned — only the staged copy
-    carries the platform under test (the D14 gate staging pattern)."""
-    from test.navigation_sim_support import _package_dir
+    """D15: the shipped overlays stay Gazebo-pinned — only the staged copy
+    carries the platform under test (the D14 gate staging pattern); the
+    mobile manipulator's overlay follows the same rule (D7)."""
+    from test.navigation_sim_support import _package_dir, overlay_name
 
-    shipped = yaml.safe_load((_package_dir() / "test" / "config" / "lekiwi_navi_sim.yaml").read_text(encoding="utf-8"))
-    assert shipped["robot"]["nav_stages"]["navigation"]["simulation"]["platform"] == "gazebo"
+    for base_config in sorted(NAVIGATION_STAGING):
+        shipped = yaml.safe_load(
+            (_package_dir() / "test" / "config" / overlay_name(base_config)).read_text(encoding="utf-8")
+        )
+        assert shipped["robot"]["nav_stages"]["navigation"]["simulation"]["platform"] == "gazebo", base_config
 
 
 def test_staging_fails_loudly_without_a_simulation_section(tmp_path, monkeypatch):
@@ -305,7 +334,7 @@ def test_staging_fails_loudly_without_a_simulation_section(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def missing_navigation_capabilities(sim_platform: str) -> list[str]:
+def missing_navigation_capabilities(sim_platform: str, base_config: str = "lekiwi_lidar") -> list[str]:
     """Every capability the navigation e2e needs that ``sim_platform`` lacks.
 
     Inspects code and configuration only — no process, no simulator — so a
@@ -333,7 +362,7 @@ def missing_navigation_capabilities(sim_platform: str) -> list[str]:
         with tempfile.TemporaryDirectory(prefix="robot_config_nav_probe_") as probe_dir:
             try:
                 config = load_staged_navigation_config(
-                    stage_navigation_config(Path(probe_dir), sim_platform=sim_platform)
+                    stage_navigation_config(Path(probe_dir), sim_platform=sim_platform, base_config=base_config)
                 )
                 resolved = str((config.get("simulation") or {}).get("platform", ""))
                 if resolved != sim_platform:
@@ -343,11 +372,13 @@ def missing_navigation_capabilities(sim_platform: str) -> list[str]:
     return missing
 
 
+@pytest.mark.parametrize("base_config", sorted(NAVIGATION_STAGING))
 @pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
-def test_no_missing_navigation_capability(sim_platform):
+def test_no_missing_navigation_capability(sim_platform, base_config):
     """D15: both physics platforms pass every capability check, so the e2e
-    runs there, never a capability skip."""
-    assert missing_navigation_capabilities(sim_platform) == []
+    runs there, never a capability skip — for the base-only configuration
+    and the mobile manipulator alike (D7, lekiwi-nav-grasp-sim-platforms)."""
+    assert missing_navigation_capabilities(sim_platform, base_config) == []
 
 
 def test_a_synthetic_platform_reports_missing_capabilities():
@@ -415,7 +446,7 @@ def _validate_requested_profile() -> None:
         pytest.fail(f"invalid {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
 
 
-def _decide_navigation_run(sim_platform: str) -> None:
+def _decide_navigation_run(sim_platform: str, base_config: str = "lekiwi_lidar") -> None:
     """The whole do-not-run decision sequence for one platform, in order.
 
     Review round 1: an invalid profile value fails FIRST (before any skip
@@ -426,7 +457,7 @@ def _decide_navigation_run(sim_platform: str) -> None:
     into a failure.
     """
     _validate_requested_profile()
-    missing = missing_navigation_capabilities(sim_platform)
+    missing = missing_navigation_capabilities(sim_platform, base_config)
     if missing:
         _nav_skip_or_fail(sim_platform, f"platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}")
     environment_unusable = environment_missing(sim_platform)
@@ -602,7 +633,7 @@ def test_the_minimal_profile_without_a_requirement_stays_a_skip(monkeypatch):
 
 
 class NavigationProbe(Node):
-    def __init__(self):
+    def __init__(self, watch_arm: bool = False):
         super().__init__("robot_config_navigation_probe", automatically_declare_parameters_from_overrides=False)
         # the navigation world runs on the simulation clock; goal stamps must
         # carry sim time or Nav2's transforms reject them as stale
@@ -614,10 +645,33 @@ class NavigationProbe(Node):
         self.robot_description: str | None = None
         self.scans = []
         self.filtered_odometry = []
+        # D7 (nav_grasp only): the arm-envelope samples over the whole run
+        self.joint_samples: list[tuple[float, dict[str, float]]] = []
         self.create_subscription(RuntimeStatus, "/runtime_status", self._status, 10)
         self.create_subscription(Bool, "/motion_mode/base_navigation_enabled", self._gate, 10)
         self.create_subscription(TFMessage, "/tf", self.tf_frames.append, 50)
         self.create_subscription(TFMessage, "/tf_static", self.tf_static_frames.append, 10)
+        if watch_arm:
+            # best-effort with a small depth — the simulator process is
+            # load-sensitive and a reliable 100 Hz subscription measurably
+            # degrades its control delivery (the same rule as the chassis
+            # gate). Its OWN mutually-exclusive callback group: the /clock
+            # subscription lives in the node's default group, and 100 Hz of
+            # joint callbacks ahead of it would skew the clock samples the
+            # RTF evidence reads (the lidar gate's future-skew review found
+            # exactly this starvation pattern) — the arm envelope must not
+            # perturb the clock stream.
+            from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+            from sensor_msgs.msg import JointState
+
+            self._arm_group = MutuallyExclusiveCallbackGroup()
+            self.create_subscription(
+                JointState,
+                "/joint_states",
+                self._joints,
+                QoSProfile(depth=10, reliability=QoSReliability.BEST_EFFORT, durability=QoSDurability.VOLATILE),
+                callback_group=self._arm_group,
+            )
         # the description robot_state_publisher latched at startup (TRANSIENT
         # LOCAL): map->odom ownership is eliminated against the URDF's own
         # joint pairs, not against a hardcoded frame list
@@ -648,6 +702,14 @@ class NavigationProbe(Node):
 
     def _gate(self, msg: Bool) -> None:
         self.gate_enabled = msg
+
+    def _joints(self, msg) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        self.joint_samples.append((stamp, dict(zip(msg.name, msg.position, strict=False))))
+
+    def latest_sim_time(self) -> float | None:
+        """The freshest simulation time received on /clock."""
+        return self.clock[-1][1] if self.clock else None
 
     def _on_clock(self, msg: Clock) -> None:
         self.clock.append((time.time(), msg.clock.sec + msg.clock.nanosec / 1e9))
@@ -702,22 +764,31 @@ def _send_nav_goal(probe: NavigationProbe, x, y, theta, timeout=NAV_GOAL_TIMEOUT
     return result_future.result().status
 
 
-@pytest.fixture(params=PHYSICS_SIM_PLATFORMS)
+@pytest.fixture(
+    params=[(platform, base) for platform in PHYSICS_SIM_PLATFORMS for base in sorted(NAVIGATION_STAGING)],
+    ids=lambda pair: f"{pair[0]}-{pair[1]}",
+)
 def simulation_env(request):
-    sim_platform = request.param
+    sim_platform, base_config = request.param
     # the D14 decision order, with the profile value validated FIRST
     # (review round 1): capabilities, environment, profile — every
     # do-not-run reason goes through the required-platform rule
-    _decide_navigation_run(sim_platform)
+    _decide_navigation_run(sim_platform, base_config)
 
     params_override = os.environ.get(NAV2_TEST_PARAMS_FILE_ENV, "").strip()
     if params_override and not Path(params_override).expanduser().is_file():
         pytest.fail(f"{NAV2_TEST_PARAMS_FILE_ENV} does not exist: {params_override}")
 
     stage_dir = Path(tempfile.mkdtemp(prefix="robot_config_nav_stage_"))
-    config_path = stage_navigation_config(stage_dir, nav2_params_override=params_override, sim_platform=sim_platform)
-    log_dir = Path(tempfile.mkdtemp(prefix=f"robot_config_nav_sim_{sim_platform}_"))
-    print(f"[navigation-sim] platform {sim_platform}; staged config: {config_path}; logs: {log_dir}", flush=True)
+    config_path = stage_navigation_config(
+        stage_dir, nav2_params_override=params_override, sim_platform=sim_platform, base_config=base_config
+    )
+    log_dir = Path(tempfile.mkdtemp(prefix=f"robot_config_nav_sim_{sim_platform}_{base_config}_"))
+    print(
+        f"[navigation-sim] platform {sim_platform}, profile {base_config}; staged config: {config_path}; "
+        f"logs: {log_dir}",
+        flush=True,
+    )
 
     partition = f"lekiwi_nav_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)
@@ -772,7 +843,7 @@ def simulation_env(request):
     executor = None
     try:
         rclpy.init()
-        probe = NavigationProbe()
+        probe = NavigationProbe(watch_arm=base_config == "lekiwi_nav_grasp")
         executor = MultiThreadedExecutor()
         executor.add_node(probe)
         spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -815,7 +886,18 @@ def simulation_env(request):
         assert _wait_for(ground_truth.position, 30.0, "world-pose samples"), f"ground truth of {MODEL_NAME}"
         time.sleep(NAV2_SETTLE_TIME)
 
-        yield {"probe": probe, "ground_truth": ground_truth, "log_dir": log_dir, "launch": launch}
+        yield {
+            "probe": probe,
+            "ground_truth": ground_truth,
+            "log_dir": log_dir,
+            "launch": launch,
+            "base_config": base_config,
+            # D7: the navigation interval in simulation time — from the ready
+            # chain (admission + odometry + settle) to whenever the test body
+            # finishes; the arm envelope covers this whole window, edges
+            # included
+            "window_sim_start": probe.latest_sim_time(),
+        }
     finally:
         if probe is not None:
             rtf = probe.mean_rtf()
@@ -1010,3 +1092,26 @@ def test_navigation_simulation(simulation_env):
         probe.robot_description, late_pairs, late_static_pairs, late_publishers
     )
     assert not late_problems, "map -> odom ownership problems after the goals:\n  " + "\n  ".join(late_problems)
+
+    # D7 (lekiwi-nav-grasp-sim-platforms): navigation is validated only with
+    # the arm at its reset (stowed) pose — an explicit invariant, not an
+    # accident of the initial state. The shared envelope rule covers the
+    # WHOLE navigation interval (from the ready chain to the end of the
+    # observation): the first sample must arrive within the gap bound of the
+    # interval start, no internal gap may exceed it, the last sample must be
+    # within it of the end, every sample must carry every joint, and every
+    # joint must stay within 0.1 rad of hardware.reset_positions.
+    if simulation_env["base_config"] == "lekiwi_nav_grasp":
+        arm = envelope_verdict(
+            probe.joint_samples,
+            simulation_env["window_sim_start"],
+            probe.latest_sim_time(),
+            reset=_ARM_RESET,
+            tolerance=_ARM_TOLERANCE,
+            max_gap=_ARM_MAX_SAMPLE_GAP_SEC,
+        )
+        print(f"[navigation-sim] arm envelope: {arm}", flush=True)
+        assert arm["within"], (
+            f"the nav_grasp arm left the navigation envelope: {arm['violations']} "
+            f"(tolerance {_ARM_TOLERANCE} rad, gap limit {_ARM_MAX_SAMPLE_GAP_SEC} s)"
+        )

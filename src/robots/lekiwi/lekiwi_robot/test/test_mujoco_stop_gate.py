@@ -69,7 +69,17 @@ from robot_runtime.testing.sim_ground_truth import (
 PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"
 SCENE = "empty"
-PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_lidar.yaml"
+#: The gate's profiles (lekiwi-nav-grasp-sim-platforms D7 / task 4.1): the
+#: base-only runtime and the mobile manipulator run the SAME stop thresholds;
+#: the nav_grasp leg first RESETS the arm to its stowed pose so the run
+#: starts from the known arm state (the stop paths themselves drive only the
+#: base — HOLD/TORQUE_OFF fence the arm too, and the leg must not depend on
+#: whatever pose a previous launch left it in).
+_PROFILES = Path(__file__).resolve().parents[1] / "profiles"
+GATE_PROFILES = ("lekiwi_lidar", "lekiwi_nav_grasp")
+_ARM_JOINTS = ["1", "2", "3", "4", "5", "6"]
+#: The nav_grasp stowed arm pose = ``hardware.reset_positions`` (joints 1-5).
+_STOWED_TARGET = [0.0, -1.5854, 1.5708, 0.7854, 0.0]
 VX_STEP = 0.26 / 2  # 50 % of the published limit, as in the tracking gate
 
 LAUNCH_STARTUP_TIMEOUT = 120.0
@@ -81,14 +91,36 @@ class StopProbe(Node):
         super().__init__("mujoco_stop_gate_probe")
         self.status: RuntimeStatus | None = None
         self.odom: list[Odometry] = []
+        self.joint_samples: list[tuple[float, dict[str, float]]] = []
         self.create_subscription(RuntimeStatus, "/runtime_status", self._on_status, 10)
         self.create_subscription(Odometry, "/odom", self._on_odom, 20)
+        # best-effort with a small depth (a reliable 100 Hz subscription
+        # measurably degrades the simulator's control delivery)
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+        from sensor_msgs.msg import JointState
+
+        self.create_subscription(
+            JointState,
+            "/joint_states",
+            self._on_joints,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE, depth=20),
+        )
 
     def _on_status(self, msg: RuntimeStatus) -> None:
         self.status = msg
 
     def _on_odom(self, msg: Odometry) -> None:
         self.odom.append(msg)
+
+    def _on_joints(self, msg) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self.joint_samples.append((stamp, dict(zip(msg.name, msg.position, strict=False))))
+
+    def arm_positions(self) -> dict[str, float]:
+        for _stamp, positions in reversed(self.joint_samples):
+            if all(joint in positions for joint in _ARM_JOINTS):
+                return {joint: positions[joint] for joint in _ARM_JOINTS}
+        return {}
 
     def last_odom_twist(self) -> tuple[float, float, float]:
         msg = self.odom[-1]
@@ -111,13 +143,13 @@ def _measure(window: list) -> dict:
     }
 
 
-def _launch(environment: dict, log_path: Path, profile_path: Path | None = None):
+def _launch(environment: dict, log_path: Path, profile_path: Path):
     arguments = [
         "ros2",
         "launch",
         PACKAGE,
         "runtime.launch.py",
-        f"profile:={profile_path or PROFILE}",
+        f"profile:={profile_path}",
         "sim_platform:=mujoco",
         f"mujoco_scene:={SCENE}",
     ]
@@ -164,13 +196,15 @@ def _fresh_environment() -> tuple[dict, str, str]:
     return environment, domain, run
 
 
-def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path):
+@pytest.mark.parametrize("profile_name", GATE_PROFILES)
+def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path, profile_name):
     require_mujoco()
     from mujoco_ros2_control_msgs.srv import ResetWorld, SetPause
 
+    profile = _PROFILES / f"{profile_name}.yaml"
     environment, _domain, run = _fresh_environment()
     launch_log = tmp_path / "launch.log"
-    launch = _launch(environment, launch_log)
+    launch = _launch(environment, launch_log, profile)
     probe = None
     executor = None
     measurements: dict[str, dict] = {}
@@ -193,6 +227,48 @@ def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path):
         while time.monotonic() < deadline and ground_truth.latest_time() is None:
             executor.spin_once(timeout_sec=0.1)
         assert ground_truth.latest_time() is not None, "no floating-base state arrived"
+
+        if profile_name == "lekiwi_nav_grasp":
+            # RESET the arm to its stowed pose first (review round 2): the
+            # stop paths below drive only the base, and the leg's arm
+            # precondition must stand on its own — stream the stowed target
+            # until the arm sits within 0.05 rad, then return to idle.
+            from std_msgs.msg import Float64MultiArray
+
+            mode_client = probe.create_client(SetRuntimeMode, "/runtime/set_mode")
+            assert mode_client.wait_for_service(timeout_sec=15.0)
+            request = SetRuntimeMode.Request()
+            request.mode = "stream"
+            future = mode_client.call_async(request)
+            executor.spin_until_future_complete(future, timeout_sec=15.0)
+            assert future.result() is not None and future.result().success, future.result() and future.result().message
+            stream = probe.create_publisher(Float64MultiArray, "/arm_position_controller/commands", 10)
+            stow_deadline = time.monotonic() + 60.0
+            stowed_error = None
+            while time.monotonic() < stow_deadline:
+                executor.spin_once(timeout_sec=0.02)
+                stream.publish(Float64MultiArray(data=[float(value) for value in _STOWED_TARGET]))
+                positions = probe.arm_positions()
+                stowed_error = (
+                    max(
+                        (abs(positions[f"{index + 1}"] - value) for index, value in enumerate(_STOWED_TARGET)),
+                        default=float("inf"),
+                    )
+                    if positions
+                    else None
+                )
+                if stowed_error is not None and stowed_error <= 0.05:
+                    break
+                time.sleep(1.0 / COMMAND_RATE_HZ)
+            measurements["arm_reset"] = {"error_rad": stowed_error}
+            print(f"[stop-gate] arm_reset: {measurements['arm_reset']}", flush=True)
+            assert stowed_error is not None and stowed_error <= 0.05, (
+                f"the arm did not reset to the stowed pose ({stowed_error} rad)"
+            )
+            request.mode = "idle"
+            future = mode_client.call_async(request)
+            executor.spin_until_future_complete(future, timeout_sec=15.0)
+            assert future.result() is not None and future.result().success
 
         def admit() -> None:
             """base_navigation + the navigation gate open (retried)."""
@@ -499,21 +575,22 @@ def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path):
         print(f"[stop-gate] measurements: {measurements}", flush=True)
 
 
-def test_mujoco_command_latency_throttled(tmp_path):
+@pytest.mark.parametrize("profile_name", GATE_PROFILES)
+def test_mujoco_command_latency_throttled(tmp_path, profile_name):
     """D3.4/D12: the command-to-motion latency at RTF ~ 0.25 (sim_speed_factor)."""
     require_mujoco()
-    profile = load_profile(PROFILE)
+    profile = load_profile(_PROFILES / f"{profile_name}.yaml")
     throttled = copy.deepcopy(profile)
     hardware = dict(throttled.get("hardware") or {})
     xacro_args = dict(hardware.get("xacro_args") or {})
     xacro_args["mujoco_sim_speed_factor"] = "0.25"
     hardware["xacro_args"] = xacro_args
     throttled["hardware"] = hardware
-    staged = tmp_path / "lekiwi_lidar_throttled.yaml"
+    staged = tmp_path / f"{profile_name}_throttled.yaml"
     staged.write_text(yaml.safe_dump(throttled, default_flow_style=False, sort_keys=False), encoding="utf-8")
     environment, _domain, run = _fresh_environment()
     launch_log = tmp_path / "launch.log"
-    launch = _launch(environment, launch_log, profile_path=staged)
+    launch = _launch(environment, launch_log, staged)
     probe = None
     executor = None
     ground_truth = None

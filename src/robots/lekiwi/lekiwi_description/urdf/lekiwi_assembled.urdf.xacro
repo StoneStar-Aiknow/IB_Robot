@@ -31,6 +31,15 @@
        render_mujoco_description; the Gazebo treatment stays off under the
        MuJoCo plugin (test_gazebo_platform.py). -->
   <xacro:arg name="mujoco_headless" default="false"/>
+  <!-- root_link (lekiwi-nav-grasp-sim-platforms D8): the LeKiwi mounts the
+       SO-101 arm mid-chain (base_link -> <root> -> base), and the arm root
+       link must NOT be named `world`: sdformat lumps a mid-chain fixed-joint
+       link into a model-level frame, which gz-sim Fortress rejects for the
+       reserved name. Declared before the so101_base.xacro include so every
+       LeKiwi render (hardware, SDK, Gazebo, MuJoCo) uses the same frame set;
+       this removes a TF frame named `world` under base_link from the
+       physical robot (hardware-visible, checked in the README). -->
+  <xacro:arg name="root_link" default="arm_root"/>
   <!-- gz_ros2_control: always passed by render_gazebo_description (accepted
        even when unused); sim_effort_state is accepted and ignored here: this
        profile advertises no joint.current interface (D2). -->
@@ -58,7 +67,7 @@
   <xacro:include filename="$(find lekiwi_description)/urdf/base.control.xacro"/>
 
   <xacro:unless value="$(arg base_only)">
-    <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
+    <!-- SO101 arm (joints "1"-"6", links: arm_root->base->shoulder->...->jaw) -->
     <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_base.xacro"/>
   </xacro:unless>
 
@@ -254,11 +263,11 @@
 
   <xacro:unless value="$(arg base_only)">
     <!-- ============================================ -->
-    <!-- Arm Mounting: base_link -> world (arm base)  -->
+    <!-- Arm Mounting: base_link -> arm_root (D8)     -->
     <!-- ============================================ -->
     <joint name="base_to_arm" type="fixed">
       <parent link="base_link"/>
-      <child link="world"/>
+      <child link="$(arg root_link)"/>
       <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
     </joint>
   </xacro:unless>

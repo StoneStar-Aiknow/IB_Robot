@@ -11,6 +11,13 @@ ground-truth progress, and scores three estimates (FAST-LIO
 ``/odometry/filtered`` under test; wheel ``/odom`` and AMCL ``/amcl_pose``
 diagnostic) against the simulator ground truth, aligned at the route start.
 
+The gate is parametrized over profile too (D7, lekiwi-nav-grasp-sim-
+platforms): the mobile manipulator ``lekiwi_nav_grasp`` runs the SAME
+thresholds over the SAME route, staged from
+``config/lekiwi_nav_grasp_lio_sim.yaml``; its arm must stay within 0.1 rad
+of the reset (stowed) pose for the whole metrics window with fresh
+/joint_states (a stale or out-of-envelope sample fails the gate).
+
 A platform runs the gate only when its capabilities are all present
 (D14.2): ground truth, the profile's ``sim_platforms``, lidar simulation
 (``LIDAR_SIM_PLATFORMS``) and a scene template. The gate is parametrized
@@ -35,7 +42,9 @@ Measurement-only runs (threshold calibration, task 8.4) set
 route, health, watchdog and monitor problems still fail, and
 ``LIO_GATE_REPORT_DIR`` redirects plots/samples/metrics for evidence. A
 staged-variant run (the task 8.3 wrong-mount check) points
-``LIO_GATE_OVERLAY`` at an alternative overlay file.
+``LIO_GATE_OVERLAY`` at an alternative overlay file; its
+``robot.base_config`` must name the selected leg's profile (a mismatch
+fails loudly, never a silent wrong-base run).
 
 Usage:
     NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation \
@@ -76,6 +85,7 @@ from tf2_msgs.msg import TFMessage
 
 from ibrobot_msgs.msg import RuntimeStatus
 from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.testing.arm_envelope import envelope_verdict
 from robot_runtime.testing.sim_environment import REQUIRED_SIM_PLATFORMS_ENV, environment_missing, skip_or_fail
 from robot_runtime.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
@@ -210,6 +220,21 @@ DIAGNOSTIC_ATE_LIMIT = 0.5
 #: publisher that actually drives the base.
 EXPECTED_CMD_VEL_PUBLISHERS = {"collision_monitor", "behavior_server"}
 _GATE_OVERLAY = Path(__file__).resolve().parent / "config" / "lekiwi_lio_sim.yaml"
+#: The gate's profiles (D7, lekiwi-nav-grasp-sim-platforms): the base-only
+#: runtime and the mobile manipulator run the SAME thresholds over the SAME
+#: route; under nav_grasp the arm must stay within 0.1 rad of its reset pose
+#: for the whole route, with fresh /joint_states (D7 — a stale or
+#: out-of-envelope sample fails the gate).
+GATE_PROFILES = ("lekiwi_lidar", "lekiwi_nav_grasp")
+GATE_OVERLAYS = {
+    "lekiwi_lidar": _GATE_OVERLAY,
+    "lekiwi_nav_grasp": Path(__file__).resolve().parent / "config" / "lekiwi_nav_grasp_lio_sim.yaml",
+}
+#: D7 arm envelope: the stowed pose (= hardware.reset_positions, joints 1-5)
+#: and the freshness rule for /joint_states during the route.
+_ARM_RESET = {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0}
+_ARM_TOLERANCE = 0.1
+_ARM_MAX_SAMPLE_GAP_SEC = 0.5
 _BASE_NODE_NAME = "lekiwi_base"  # the wheel-odometry node (D4)
 _EXPECTED_TF_PUBLISHERS = {"amcl", _BASE_NODE_NAME, "robot_state_publisher"}
 
@@ -224,14 +249,14 @@ OVERLAY_ENV = "LIO_GATE_OVERLAY"
 # ---------------------------------------------------------------------------
 
 
-def _lidar_profile_path() -> Path:
-    """The installed LeKiwi lidar runtime profile (lekiwi_robot test dependency)."""
+def _gate_profile_path(profile: str) -> Path:
+    """The installed LeKiwi runtime profile of this gate leg (lekiwi_robot test dependency)."""
     from ament_index_python.packages import get_package_share_directory
 
-    return Path(get_package_share_directory("lekiwi_robot")) / "profiles" / "lekiwi_lidar.yaml"
+    return Path(get_package_share_directory("lekiwi_robot")) / "profiles" / f"{profile}.yaml"
 
 
-def missing_gate_capabilities(sim_platform: str) -> list[str]:
+def missing_gate_capabilities(sim_platform: str, profile: str = "lekiwi_lidar") -> list[str]:
     """Every capability the gate needs that ``sim_platform`` lacks (D14.2).
 
     Inspects code and configuration only — no process, no simulator — so a
@@ -243,8 +268,7 @@ def missing_gate_capabilities(sim_platform: str) -> list[str]:
         open_ground_truth(sim_platform, world=GATE_WORLD, model=GATE_MODEL)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
-    profile = load_profile(_lidar_profile_path())
-    supported = [str(entry) for entry in profile.get("sim_platforms") or []]
+    supported = [str(entry) for entry in load_profile(_gate_profile_path(profile)).get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
     if sim_platform not in LIDAR_SIM_PLATFORMS:
@@ -256,15 +280,17 @@ def missing_gate_capabilities(sim_platform: str) -> list[str]:
     return missing
 
 
-def test_gazebo_has_every_gate_capability():
+@pytest.mark.parametrize("profile", GATE_PROFILES)
+def test_gazebo_has_every_gate_capability(profile):
     """D14.2: gazebo passes all four checks, so the gate runs there."""
-    assert missing_gate_capabilities("gazebo") == []
+    assert missing_gate_capabilities("gazebo", profile) == []
 
 
-def test_mujoco_reports_no_missing_capability():
+@pytest.mark.parametrize("profile", GATE_PROFILES)
+def test_mujoco_reports_no_missing_capability(profile):
     """D10 (lekiwi-mujoco-runtime-platform): mujoco passes all four checks
     too — the gate runs there, never a capability skip."""
-    assert missing_gate_capabilities("mujoco") == []
+    assert missing_gate_capabilities("mujoco", profile) == []
 
 
 def test_a_synthetic_platform_reports_all_four_capabilities():
@@ -340,7 +366,7 @@ def _readiness_evidence(probe, launch_log_path) -> str:
     return "\n    ".join(lines)
 
 
-def _decide_gate_run(sim_platform: str) -> None:
+def _decide_gate_run(sim_platform: str, profile: str) -> None:
     """The whole do-not-run decision sequence for one platform, in order.
 
     Review round 1: an invalid profile value fails FIRST (before any skip
@@ -351,7 +377,7 @@ def _decide_gate_run(sim_platform: str) -> None:
     into a failure.
     """
     _validate_requested_profile()
-    missing = missing_gate_capabilities(sim_platform)
+    missing = missing_gate_capabilities(sim_platform, profile)
     if missing:
         _gate_skip_or_fail(
             sim_platform, f"lidar-odometry gate: platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}"
@@ -470,7 +496,7 @@ def test_an_invalid_profile_fails_even_when_the_run_would_skip(monkeypatch):
     monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "bogus")
     monkeypatch.delenv(REQUIRED_SIM_PLATFORMS_ENV, raising=False)
     with pytest.raises(pytest.fail.Exception, match="invalid .*expected 'full' or 'minimal'"):
-        _decide_gate_run("a_platform_without_capabilities_or_environment")
+        _decide_gate_run("a_platform_without_capabilities_or_environment", "lekiwi_lidar")
 
 
 def test_gate_staging_fails_loudly_without_a_simulation_section(tmp_path):
@@ -578,7 +604,7 @@ class GateProbe(Node):
     depends on its own clock.
     """
 
-    def __init__(self):
+    def __init__(self, watch_arm: bool = False):
         super().__init__("lekiwi_lio_gate_probe")
         self.status: RuntimeStatus | None = None
         self.gate_enabled: Bool | None = None
@@ -591,6 +617,8 @@ class GateProbe(Node):
         self.clock: list[tuple[float, float]] = []
         self.tf_frames: list[TFMessage] = []
         self.tf_static_frames: list[TFMessage] = []
+        # D7 (nav_grasp only): the arm-envelope samples over the route
+        self.joint_states: list[tuple[float, dict[str, float]]] = []
         self._lock = threading.Lock()
         self._last_clock_wall = 0.0
         self._clock_hook = None  # the supervisor's stall observer
@@ -651,6 +679,33 @@ class GateProbe(Node):
         self.create_subscription(
             TFMessage, "/tf_static", self.tf_static_frames.append, 10, callback_group=self._data_group
         )
+        if watch_arm:
+            # D7 (nav_grasp only): the arm-envelope stream. Best-effort with a
+            # small depth — the simulator process is load-sensitive and a
+            # reliable 100 Hz subscription measurably degrades its control
+            # delivery (the same rule as the chassis gate). Its OWN
+            # mutually-exclusive callback group, NOT the reentrant data
+            # group: 100 Hz of extra reentrant callbacks measurably starves
+            # the dedicated /clock callback the future-skew reference reads
+            # (review rework: the nav_grasp mujoco leg read +0.104/+0.114 s
+            # ahead under the colcon runner with this subscription in the
+            # shared group; solo runs were -0.016/-0.028 s) — the arm
+            # envelope must never perturb the clock measurement.
+            from rclpy.qos import DurabilityPolicy
+            from sensor_msgs.msg import JointState
+
+            self._arm_group = MutuallyExclusiveCallbackGroup()
+            self.create_subscription(
+                JointState,
+                "/joint_states",
+                self._joints,
+                QoSProfile(
+                    depth=10,
+                    reliability=QoSReliability.BEST_EFFORT,
+                    durability=DurabilityPolicy.VOLATILE,
+                ),
+                callback_group=self._arm_group,
+            )
 
     @staticmethod
     def _twist_qos() -> QoSProfile:
@@ -663,6 +718,11 @@ class GateProbe(Node):
 
     def _gate(self, msg: Bool) -> None:
         self.gate_enabled = msg
+
+    def _joints(self, msg) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        with self._lock:
+            self.joint_states.append((stamp, dict(zip(msg.name, msg.position, strict=False))))
 
     def _filtered_odom(self, msg: Odometry) -> None:
         self._record_odometry(self.filtered_odom, msg)
@@ -1096,7 +1156,9 @@ def _estimate_metrics(samples: list[dict], ground_truth, begin: float, end: floa
     }
 
 
-def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: float | None = None) -> dict:
+def _collision_monitor_verdict(
+    cmd_smoothed: list, cmd_vel: list, window_begin: float | None = None, clock_stalls: list | None = None
+) -> dict:
     """The D14.4 collision-monitor check (pure; unit-tested on synthetic
     streams below).
 
@@ -1125,6 +1187,32 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
     output relayed within one slot after it may belong to an input received
     just before it, which the trim removed; such an output is unobservable,
     not spontaneous — the mirror of the window-end rule for inputs below.
+
+    ``clock_stalls`` (the probe's recorded /clock pause intervals) adds the
+    SAME host-pause discrimination the frame-health check applies, reusing
+    ``_gap_is_host_pause`` with the same parameters: a missing input whose
+    output-stream silence around its slot (the receive gap bracketing the
+    slot) exceeds the committed gap bound AND is covered by a recorded
+    stall (overlapping, at least silence - 0.1 s long) is a whole-host
+    pause, not a monitor drop; a spontaneous output gets the mirrored test
+    on the input-stream silence around its expected input. A single real
+    dropped relay (silence of one sample period) never reaches the stall
+    test — it still fails. ``changed`` detections are NEVER excused by a
+    stall: a zeroed or scaled relay is the monitor's own decision, whatever
+    load triggered it.
+
+    Receive-skew (review rework): under load the probe's input-subscription
+    callback can lag tens of ms behind the output stream, so an input's
+    TRUE relay is recorded BEFORE the input itself and the nearest in-slot
+    output is a NEIGHBOUR's relay — value-different during a smoother ramp,
+    surfacing a phantom 'changed' (observed under the colcon runner: an
+    input paired with an output 4 ms after it while the modal relay is
+    10-33 ms). When the in-slot candidate is value-different but an
+    UNCONSUMED value-equal output sits before the slot, the input pairs
+    with that true relay instead (``skew_paired``); the neighbour keeps its
+    own. An earlier same-value relay of a CONSTANT stream cannot satisfy
+    this — its own input consumed it — so a genuinely zeroed or scaled
+    relay is still reported as changed.
     """
 
     def _nonzero(value) -> bool:
@@ -1132,6 +1220,22 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
 
     def _equal(left, right) -> bool:
         return all(abs(a - b) <= MONITOR_EQUALITY_TOL for a, b in zip(left, right, strict=True))
+
+    def _silence_is_host_pause(stream_walls: list, center: float, stalls: list) -> bool:
+        """The frame-health host-pause rule, same function and parameters.
+
+        The stream's receive silence bracketing ``[center - half period,
+        center + half period]`` is a whole-host pause only when it exceeds
+        the committed gap bound (a real single drop never reaches the stall
+        test) AND ``_gap_is_host_pause`` excuses it: a recorded stall that
+        overlaps the silence and lasts at least ``silence - 0.1`` s.
+        """
+        previous = max((wall for wall in stream_walls if wall <= center - PAIR_HALF_PERIOD_SEC), default=None)
+        following = min((wall for wall in stream_walls if wall >= center + PAIR_HALF_PERIOD_SEC), default=None)
+        if previous is None or following is None:
+            return False  # no observable silence at the boundary: fail closed
+        silence = following - previous
+        return silence > ODOMETRY_MAX_GAP_SEC and _gap_is_host_pause(previous, following, silence, stalls)
 
     inputs = sorted(cmd_smoothed)
     outputs = sorted(cmd_vel)
@@ -1156,6 +1260,30 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
             if _equal(value, output_value) and (equal_delta is None or delta < equal_delta):
                 equal_pair, equal_delta = (index, output_value), delta
         return any_pair, any_delta, equal_pair
+
+    def _skewed_true_relay(receive_wall, value, slot_offset):
+        """The index of an UNCONSUMED value-equal output BEFORE the slot.
+
+        The receive-skew signature (review rework, observed under the
+        colcon runner): the probe's input-subscription callback lagged tens
+        of ms behind the output stream, so the input's TRUE relay — equal in
+        value — was recorded BEFORE the input itself, and the nearest
+        in-slot output is a NEIGHBOUR's relay (value-different during a
+        smoother ramp, surfacing a phantom 'changed'). An unconsumed
+        value-equal relay before the slot is exactly that true relay; an
+        earlier same-value relay of a CONSTANT stream cannot appear here —
+        its own input consumed it — so a genuinely zeroed or scaled relay
+        (whose slot output is value-different with no earlier equal
+        available) is still reported as changed.
+        """
+        for index, (output_wall, output_value) in enumerate(outputs):
+            if output_wall < receive_wall - PAIR_WINDOW_BEFORE_SEC:
+                continue
+            if output_wall >= receive_wall + slot_offset:
+                break  # sorted: everything from the slot on is not "before"
+            if not consumed[index] and _equal(value, output_value):
+                return index
+        return None
 
     # pass 1: pair value-equal outputs to estimate the stream's relay
     # latency (the modal successful lag) — the value-equal preference is
@@ -1183,6 +1311,10 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
     consumed = [False] * len(outputs)
     changed = []
     nonzero_inputs = sum(1 for _wall, value in inputs if _nonzero(value))
+    output_walls = [wall for wall, _value in outputs]
+    input_walls = [wall for wall, _value in inputs]
+    excused_missing = 0
+    skew_paired = 0
     # frame conservation: the monitor republishes one output per input, so a
     # stream whose latency merely jitters still carries every frame — only
     # then may an empty slot fall back to a value-equal output elsewhere in
@@ -1224,11 +1356,30 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
                 consumed[index] = True
                 consecutive_missing = 0
                 continue
+            # host-pause discrimination (review rework): the output-stream
+            # silence around this slot, judged by the frame-health rule —
+            # only a silence beyond the committed gap bound covered by a
+            # recorded /clock stall is excused; a real drop still counts
+            if clock_stalls and _silence_is_host_pause(output_walls, receive_wall + slot_offset, clock_stalls):
+                excused_missing += 1
+                consecutive_missing = 0
+                continue
             nonzero_missing += 1
             consecutive_missing += 1
             worst_consecutive_missing = max(worst_consecutive_missing, consecutive_missing)
             continue
         index, output_value = any_pair
+        if not _equal(value, output_value):
+            skewed = _skewed_true_relay(receive_wall, value, slot_offset)
+            if skewed is not None:
+                # receive-skew: the input's true (value-equal) relay was
+                # recorded before the lagging input record; the in-slot
+                # value-different output belongs to a neighbour — leave it
+                # for that neighbour
+                consumed[skewed] = True
+                skew_paired += 1
+                consecutive_missing = 0
+                continue
         consumed[index] = True
         consecutive_missing = 0
         if not _equal(value, output_value):
@@ -1236,14 +1387,25 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: 
     boundary_slot_end = None
     if window_begin is not None:
         boundary_slot_end = window_begin + (relay_latency or 0.0) + PAIR_HALF_PERIOD_SEC
-    spontaneous_outputs = sum(
-        1
-        for index, (wall, value) in enumerate(outputs)
-        if not consumed[index] and _nonzero(value) and (boundary_slot_end is None or wall > boundary_slot_end)
-    )
+    excused_spontaneous = 0
+    spontaneous_outputs = 0
+    for index, (wall, value) in enumerate(outputs):
+        if consumed[index] or not _nonzero(value):
+            continue
+        if boundary_slot_end is not None and wall <= boundary_slot_end:
+            continue
+        # the mirrored host-pause rule: the input-stream silence around the
+        # expected input time (an input the probe never received)
+        if clock_stalls and _silence_is_host_pause(input_walls, wall - (relay_latency or 0.0), clock_stalls):
+            excused_spontaneous += 1
+            continue
+        spontaneous_outputs += 1
     return {
         "nonzero_inputs": nonzero_inputs,
         "nonzero_missing": nonzero_missing,
+        "excused_missing": excused_missing,
+        "excused_spontaneous": excused_spontaneous,
+        "skew_paired": skew_paired,
         "missing_fraction": (nonzero_missing / nonzero_inputs) if nonzero_inputs else 0.0,
         "consecutive_missing": worst_consecutive_missing,
         "changed": changed[:5],
@@ -1433,6 +1595,110 @@ def test_monitor_a_zeroed_relay_is_caught_even_at_high_relay_latency():
     assert verdict["spontaneous_outputs"] == 0
 
 
+def _paused_monitor_streams(drop_inputs=(), drop_outputs=()):
+    """A 20 Hz drive where a whole-host pause swallows a contiguous run of
+    both streams' samples: the probe's keep-last queues drop exactly the
+    samples received during the stall, leaving a receive silence of ~0.4 s
+    (the field signature: 7 consecutive missing around a 0.35 s stall)."""
+    inputs = _drive_inputs([(0.10, 0.0, 0.0)] * 20)
+    outputs = _relayed(inputs)
+    inputs = [sample for index, sample in enumerate(inputs) if index not in drop_inputs]
+    outputs = [sample for index, sample in enumerate(outputs) if index not in drop_outputs]
+    return inputs, outputs
+
+
+def test_monitor_missing_inside_a_host_pause_is_excused():
+    """Review rework: a missing relay whose output-stream silence exceeds the
+    committed gap bound AND is covered by a recorded /clock stall is a
+    whole-host pause, not a monitor drop — the SAME _gap_is_host_pause rule
+    the frame-health check applies (same parameters)."""
+    inputs, outputs = _paused_monitor_streams(drop_outputs=set(range(9, 16)))  # 7 relays lost
+    stall = [(100.45, 100.80)]  # 0.35 s, overlapping the ~0.4 s output silence
+    verdict = _collision_monitor_verdict(inputs, outputs, clock_stalls=stall)
+    assert verdict["nonzero_missing"] == 0 and verdict["consecutive_missing"] == 0
+    assert verdict["excused_missing"] == 7 and verdict["spontaneous_outputs"] == 0
+    # without the stalls the same stream still fails — the rule only ever
+    # excuses what a recorded pause covers
+    strict = _collision_monitor_verdict(inputs, outputs)
+    assert strict["nonzero_missing"] == 7 and strict["consecutive_missing"] == 7
+
+
+def test_monitor_missing_outside_a_host_pause_still_fails():
+    """The mirrored negative: the same swallowed relays, but the recorded
+    stall happened elsewhere (or is too short) — the missing inputs stay
+    failures."""
+    inputs, outputs = _paused_monitor_streams(drop_outputs=set(range(9, 16)))
+    elsewhere = _collision_monitor_verdict(inputs, outputs, clock_stalls=[(200.0, 200.5)])
+    assert elsewhere["nonzero_missing"] == 7 and elsewhere["excused_missing"] == 0
+    too_short = _collision_monitor_verdict(inputs, outputs, clock_stalls=[(100.60, 100.68)])
+    assert too_short["nonzero_missing"] == 7 and too_short["excused_missing"] == 0
+
+
+def test_monitor_a_single_real_drop_is_never_excused_by_a_stall():
+    """A real dropped relay leaves a one-sample-period silence — below the
+    committed gap bound, so it never reaches the stall test: an overlapping
+    stall must not excuse it (the discrimination is not a blanket pass)."""
+    inputs = _drive_inputs([(0.10, 0.0, 0.0)] * 20)
+    outputs = _relayed(inputs, drop=(12,))
+    verdict = _collision_monitor_verdict(inputs, outputs, clock_stalls=[(100.50, 100.80)])
+    assert verdict["nonzero_missing"] == 1 and verdict["excused_missing"] == 0
+
+
+def test_monitor_spontaneous_inside_a_host_pause_is_excused():
+    """The mirrored rule for spontaneous outputs: an output whose expected
+    input fell into a probe-side input silence covered by a recorded stall
+    is unobservable, not the monitor publishing on its own."""
+    inputs, outputs = _paused_monitor_streams(drop_inputs=set(range(9, 16)))  # 7 inputs lost
+    stall = [(100.45, 100.80)]
+    verdict = _collision_monitor_verdict(inputs, outputs, clock_stalls=stall)
+    assert verdict["spontaneous_outputs"] == 0 and verdict["excused_spontaneous"] == 7
+    assert verdict["nonzero_missing"] == 0
+    strict = _collision_monitor_verdict(inputs, outputs)
+    assert strict["spontaneous_outputs"] == 7 and strict["excused_spontaneous"] == 0
+
+
+def _ramp_monitor_streams(skew_index=None, skew_sec=0.026):
+    """A smoother ramp (a DISTINCT value per input, so a mispairing cannot
+    hide behind value equality) relayed at a clean 10 ms; one input's
+    recorded receive time is skewed late by ``skew_sec`` (the probe's
+    subscription callback lagging under load), which makes an EARLIER
+    input's relay land inside its slot — the colcon-runner signature."""
+    values = [(0.10 + 0.01 * index, 0.0, 0.0) for index in range(10)]
+    inputs = _drive_inputs(values)
+    outputs = [(wall + 0.010, tuple(value)) for wall, value in inputs]
+    if skew_index is not None:
+        wall, value = inputs[skew_index]
+        inputs[skew_index] = (wall + skew_sec, value)
+        inputs.sort()
+    return inputs, outputs
+
+
+def test_monitor_a_receive_skewed_input_does_not_mispair_as_changed():
+    """Review rework: an input whose recorded time lagged behind the output
+    stream pairs, in the naive nearest-to-slot rule, with a neighbour's
+    relay — value-different during a ramp, surfacing a phantom 'changed'
+    (observed under the colcon runner: an input paired with an output 4 ms
+    later while the modal relay is 10-33 ms). The skew rule pairs the input
+    with its TRUE relay (the unconsumed value-equal one recorded before the
+    lagging input); nothing is reported and the neighbour keeps its own."""
+    inputs, outputs = _ramp_monitor_streams(skew_index=6)
+    verdict = _collision_monitor_verdict(inputs, outputs)
+    assert verdict["changed"] == [] and verdict["nonzero_missing"] == 0
+    assert verdict["spontaneous_outputs"] == 0 and verdict["skew_paired"] == 1
+    assert verdict["relay_latency_ms"] == pytest.approx(10.0)
+
+
+def test_monitor_a_genuinely_scaled_relay_still_reports_changed():
+    """The causality floor must not mask real interventions: a relay the
+    monitor actually scaled sits in its own slot at the NORMAL latency and
+    is reported as changed."""
+    inputs = _drive_inputs([(0.10, 0.0, 0.0)] * 10)
+    outputs = _relayed(inputs, overrides={5: (0.20, 0.0, 0.0)})
+    verdict = _collision_monitor_verdict(inputs, outputs)
+    assert len(verdict["changed"]) == 1 and verdict["nonzero_missing"] == 0
+    assert verdict["spontaneous_outputs"] == 0
+
+
 def _plot(report: dict, log_dir: Path) -> None:
     """Trajectories over the scene and error vs. time into the log dir."""
     try:
@@ -1486,15 +1752,23 @@ def _stage_gate_config(destination: Path, overlay_path: Path, sim_platform: str)
     The overlay is staged per platform (D10, lekiwi-mujoco-runtime-platform):
     the shipped file pins ``platform: gazebo``; the staged copy carries the
     platform under test so the world owner selects the right provider branch.
+    The base configuration comes from the overlay's own ``robot.base_config``
+    (D7, lekiwi-nav-grasp-sim-platforms): the base-only leg stages
+    ``lekiwi_lidar.yaml`` beside ``lekiwi_lio_sim.yaml``, the mobile
+    manipulator stages ``lekiwi_nav_grasp.yaml`` beside
+    ``lekiwi_nav_grasp_lio_sim.yaml`` — the loader resolves sibling bases
+    only, so the pair must sit in one directory.
     """
     from ament_index_python.packages import get_package_share_directory
 
     destination.mkdir(parents=True, exist_ok=True)
-    base = Path(get_package_share_directory("robot_config")) / "config" / "robots" / "lekiwi_lidar.yaml"
-    assert base.is_file(), f"the robot_config test dependency must install {base}"
-    shutil.copy2(base, destination / "lekiwi_lidar.yaml")
-    staged_overlay = destination / "lekiwi_lio_sim.yaml"
     overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+    base_name = str((overlay.get("robot") or {}).get("base_config") or "")
+    assert base_name, f"the gate overlay {overlay_path} must declare robot.base_config"
+    base = Path(get_package_share_directory("robot_config")) / "config" / "robots" / f"{base_name}.yaml"
+    assert base.is_file(), f"the robot_config test dependency must install {base}"
+    shutil.copy2(base, destination / f"{base_name}.yaml")
+    staged_overlay = destination / overlay_path.name
     stage = (overlay.get("robot", {}).get("nav_stages") or {}).get("navigation") or {}
     simulation = stage.get("simulation")
     if not isinstance(simulation, dict):
@@ -1552,9 +1826,27 @@ def _summary(report: dict) -> str:
             latency=(f"{monitor['relay_latency_ms']:.0f} ms" if monitor["relay_latency_ms"] is not None else "n/a"),
         )
     )
+    excused = monitor.get("excused_missing", 0) + monitor.get("excused_spontaneous", 0)
+    if excused:
+        lines.append(
+            f"  collision monitor host-pause excusals: {monitor.get('excused_missing', 0)} missing + "
+            f"{monitor.get('excused_spontaneous', 0)} spontaneous (the frame-health rule; recorded /clock stalls)"
+        )
+    if monitor.get("skew_paired"):
+        lines.append(
+            f"  collision monitor receive-skew pairings: {monitor['skew_paired']} (true relays before the input record)"
+        )
     lines.append(f"  /cmd_vel publishers: {report['cmd_vel_publishers']}")
     lines.append(f"  /tf publishers: {report['tf_publishers']}")
     lines.append(f"  /tf frames carried: {report['tf_frames_carried']}")
+    if report.get("arm_envelope") is not None:
+        arm = report["arm_envelope"]
+        lines.append(
+            f"  arm envelope: worst {arm['worst_rad']:.4f} rad of the reset pose over {arm['samples']} samples, "
+            f"max sample gap {arm['max_gap_sec']:.2f} s"
+        )
+        if arm.get("violations"):
+            lines.append(f"  arm envelope violations: {arm['violations']}")
     skew = report["max_future_skew_sec"]
     lines.append(
         f"  max future skew: {'n/a' if skew is None else f'{skew:.3f} s'}; "
@@ -1568,22 +1860,29 @@ def _summary(report: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("profile", GATE_PROFILES)
 @pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
-def test_lidar_odometry_gate(sim_platform):
+def test_lidar_odometry_gate(sim_platform, profile):
     # the decision sequence, with the profile value validated FIRST
     # (review round 1): capabilities, environment, effective profile —
     # every do-not-run reason routes through the required-platform rule
-    _decide_gate_run(sim_platform)
+    _decide_gate_run(sim_platform, profile)
 
     report_only = os.environ.get(REPORT_ONLY_ENV, "").strip() == "1"
     overlay_env = os.environ.get(OVERLAY_ENV, "").strip()
-    overlay_path = Path(overlay_env).expanduser() if overlay_env else _GATE_OVERLAY
     if overlay_env:
+        overlay_path = Path(overlay_env).expanduser()
         assert overlay_path.is_file(), f"{OVERLAY_ENV} does not exist: {overlay_env}"
+        staged_profile = str(
+            (yaml.safe_load(overlay_path.read_text(encoding="utf-8")).get("robot") or {}).get("base_config") or ""
+        )
+        assert staged_profile == profile, f"{OVERLAY_ENV} targets profile {staged_profile!r}; this leg runs {profile!r}"
+    else:
+        overlay_path = GATE_OVERLAYS[profile]
     report_dir_env = os.environ.get(REPORT_DIR_ENV, "").strip()
     log_dir = Path(report_dir_env) if report_dir_env else Path(tempfile.mkdtemp(prefix="lekiwi_lio_gate_"))
     log_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[lio-gate] platform {sim_platform}; logs and plots: {log_dir}", flush=True)
+    print(f"[lio-gate] platform {sim_platform}, profile {profile}; logs and plots: {log_dir}", flush=True)
 
     partition = f"lekiwi_lio_{uuid.uuid4().hex[:8]}"
     stage_dir = Path(tempfile.mkdtemp(prefix="lekiwi_lio_stage_"))
@@ -1644,7 +1943,7 @@ def test_lidar_odometry_gate(sim_platform):
     supervisor = None
     try:
         rclpy.init()
-        probe = GateProbe()
+        probe = GateProbe(watch_arm=profile == "lekiwi_nav_grasp")
         executor = MultiThreadedExecutor()
         executor.add_node(probe)
         spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -1844,6 +2143,7 @@ def test_lidar_odometry_gate(sim_platform):
             [s for s in snapshot["cmd_smoothed"] if monitor_begin <= s[0] <= end_wall],
             [s for s in snapshot["cmd_vel"] if monitor_begin <= s[0] <= end_wall],
             window_begin=monitor_begin,
+            clock_stalls=probe._clock_stalls,
         )
         # TF ownership (D14.6/D4): the frames actually carried on /tf
         tf_publishers = {info.node_name for info in probe.get_publishers_info_by_topic("/tf")}
@@ -1943,11 +2243,25 @@ def test_lidar_odometry_gate(sim_platform):
         report = {
             "report_only": report_only,
             "platform": sim_platform,
+            "profile": profile,
             "overlay": str(overlay_path),
             "metrics_window": [metrics_begin, metrics_end],
             "segments": segment_traces,
             "metrics": metrics,
             "mean_rtf": mean_rtf,
+            # D7 (nav_grasp only): the stowed-arm envelope over the metrics
+            # window — the whole route, final settle included, edges covered
+            # by the shared freshness rule (review rework)
+            "arm_envelope": envelope_verdict(
+                probe.joint_states,
+                metrics_begin,
+                metrics_end,
+                reset=_ARM_RESET,
+                tolerance=_ARM_TOLERANCE,
+                max_gap=_ARM_MAX_SAMPLE_GAP_SEC,
+            )
+            if profile == "lekiwi_nav_grasp"
+            else None,
             "clock_samples": len(snapshot["clock"]),
             "collision_monitor": monitor,
             "cmd_vel_publishers": sorted(supervisor.publishers_seen_during_drive() or set()),
@@ -2037,6 +2351,13 @@ def test_lidar_odometry_gate(sim_platform):
             )
         if monitor["spontaneous_outputs"]:
             problems.append(f"collision monitor published {monitor['spontaneous_outputs']} outputs of its own")
+        if report["arm_envelope"] is not None and not report["arm_envelope"]["within"]:
+            arm = report["arm_envelope"]
+            problems.append(
+                f"nav_grasp arm left the navigation envelope: {arm['violations']} "
+                f"(worst {arm['worst_rad']:.3f} rad over {arm['samples']} samples, "
+                f"tolerance {_ARM_TOLERANCE} rad, gap limit {_ARM_MAX_SAMPLE_GAP_SEC} s)"
+            )
         if set(report["cmd_vel_publishers"]) != EXPECTED_CMD_VEL_PUBLISHERS:
             problems.append(
                 f"/cmd_vel publishers are {report['cmd_vel_publishers']}, not exactly "

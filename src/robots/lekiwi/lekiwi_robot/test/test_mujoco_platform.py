@@ -221,13 +221,65 @@ def test_profile_mujoco_mount_and_grid_match_the_gazebo_surface():
     assert "imu" not in mujoco_sim
 
 
-def test_nav_grasp_still_rejects_mujoco_before_any_action():
-    from robot_runtime.launch_support import RuntimeProfileError
+def test_nav_grasp_mujoco_composes_the_shared_arm_model():
+    """D10 structure test (replaces the rejection test): the composed nav_grasp
+    MJCF carries the SO-101 arm from the shared so101.xml.template under
+    base_link at the URDF-derived pose (numeric check against the rendered
+    URDF's own fixed chain), the wheels, the 1-6 position actuators, the wrist
+    camera inside the gripper body, the lidar site — and no front camera."""
+    require_mujoco()  # the render composes the model for real
+    actions = _render(GRASP_PROFILE, {"use_sim": "true", "sim_platform": "mujoco"})
+    urdf = _rendered_urdf(actions)
+    composed = _composed_model(actions)
+    root = ET.parse(composed).getroot()
 
-    with pytest.raises(RuntimeProfileError, match="sim_platform 'mujoco' is not supported") as excinfo:
-        _render(GRASP_PROFILE, {"use_sim": "true", "sim_platform": "mujoco"})
-    message = str(excinfo.value)
-    assert "sdk" in message and "lekiwi_nav_grasp" in message
+    # the arm comes from the shared template: its bodies, joints, actuators
+    arm_base = root.find("worldbody/body[@name='base_link']/body[@name='base']")
+    assert arm_base is not None, "the arm base must live under base_link"
+    bodies = {body.get("name") for body in root.iter("body")}
+    assert {"shoulder", "upper_arm", "lower_arm", "wrist", "gripper", "jaw"} <= bodies
+    arm_joints = {joint.get("name") for joint in root.iter("joint")}
+    assert {str(number) for number in range(1, 7)} <= arm_joints
+    actuators = {actuator.get("name"): actuator for actuator in root.find("actuator")}
+    # the arm position actuators (compiled to <general> with position gains)
+    # and the wheel velocity actuators, all by name and joint reference
+    for number in range(1, 7):
+        assert actuators[str(number)].get("joint") == str(number)
+    for wheel in ("wheel_7", "wheel_8", "wheel_9"):
+        assert actuators[wheel].get("joint") == wheel
+
+    # the mount pose equals the URDF's own fixed chain base_link -> base
+    # (numeric check against the chain document, not a copied number: the
+    # chain is base_to_arm followed by the identity base_joint)
+    urdf_root = ET.fromstring(urdf)
+    base_to_arm = urdf_root.find("joint[@name='base_to_arm']")
+    base_joint = urdf_root.find("joint[@name='base_joint']")
+    assert base_to_arm.get("type") == "fixed" and base_joint.get("type") == "fixed"
+    origin = base_to_arm.find("origin")
+    translation = [float(v) for v in origin.get("xyz").split()]
+    rpy = [float(v) for v in origin.get("rpy").split()]
+    assert base_joint.find("origin").get("xyz") == "0 0 0" and base_joint.find("origin").get("rpy") == "0 0 0"
+    assert [float(v) for v in arm_base.get("pos").split()] == pytest.approx(translation)
+    arm_quat = [float(v) for v in arm_base.get("quat").split()]
+    expected = [math.cos(rpy[2] / 2), 0.0, 0.0, math.sin(rpy[2] / 2)]
+    assert arm_quat == pytest.approx(expected, abs=1e-6)
+
+    # the wrist camera is injected into the arm's gripper body; no front camera
+    camera = root.find(
+        "worldbody/body[@name='base_link']/body[@name='base']//body[@name='gripper']/camera[@name='wrist_camera']"
+    )
+    assert camera is not None
+    assert root.find(".//camera[@name='front_camera']") is None
+    # the lidar site stays in base_link
+    assert root.find("worldbody/body[@name='base_link']/site[@name='mid360_lidar_site']") is not None
+
+    # D8/D4 ride the URDF: arm_root in the chain, initial values on the joints
+    assert 'link name="arm_root"' in urdf and 'link name="world"' not in urdf
+    urdf_joints = {joint.get("name"): joint for joint in urdf_root.findall("ros2_control/joint")}
+    profile = yaml.safe_load(GRASP_PROFILE.read_text(encoding="utf-8"))
+    for joint, value in profile["hardware"]["reset_positions"].items():
+        initial = urdf_joints[str(joint)].find("state_interface[@name='position']/param[@name='initial_value']")
+        assert initial is not None and float(initial.text) == pytest.approx(value)
 
 
 # ---------------------------------------------------------------------------
@@ -530,9 +582,14 @@ class _RunProbe(RclpyNode):
 
 
 @pytest.mark.parametrize("scene", ["empty", "nav_room"])
-def test_provider_alone_run_reaches_active_and_streams_the_sensor_surface(tmp_path, scene):
+@pytest.mark.parametrize(
+    "profile_name",
+    ["lekiwi_lidar", "lekiwi_nav_grasp"],
+)
+def test_provider_alone_run_reaches_active_and_streams_the_sensor_surface(tmp_path, scene, profile_name):
     """D10 (task 5.1): the real provider-alone MuJoCo run, in ``empty`` and
-    ``nav_room`` — ACTIVE in idle, the advertised cloud (``x y z intensity``
+    ``nav_room``, for the base-only profile and the mobile manipulator —
+    ACTIVE in idle, the advertised cloud (``x y z intensity``
     float32, finite, ``livox_frame``) and IMU on simulation time, exactly one
     ``odom -> base_link`` TF publisher, the ground-truth topic subscribed by
     this test only, and a closed navigation gate keeping the base still under
@@ -553,7 +610,7 @@ def test_provider_alone_run_reaches_active_and_streams_the_sensor_surface(tmp_pa
             "launch",
             "lekiwi_robot",
             "runtime.launch.py",
-            "profile:=lekiwi_lidar",
+            f"profile:={profile_name}",
             "sim_platform:=mujoco",
             f"mujoco_scene:={scene}",
             f"spawn_x:={spawn[0]}",

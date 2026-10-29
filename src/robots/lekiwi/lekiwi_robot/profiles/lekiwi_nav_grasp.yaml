@@ -1,10 +1,66 @@
 # LeKiwi runtime profile (lekiwi_nav_grasp): navigation + grasp with 1 isolated IK worker.
+#
+# Simulation platforms (lekiwi-nav-grasp-sim-platforms D1): the whole robot
+# (omni base + SO-101 arm + wrist RealSense + MID-360) runs on Gazebo and
+# MuJoCo for the navigation stage of #205. The arm always starts and holds
+# at hardware.reset_positions (stowed) on the physics platforms (D4), the
+# MuJoCo model composes the shared SO-101 MJCF under base_link (D2
+# attachment), and the peripherals this stage does not simulate are excluded
+# per platform below (D3). Navigating with a non-stowed arm is outside the
+# validated envelope (D7, README).
 
 runtime:
   name: lekiwi_robot
   version: 0.1.0
 
 use_sim: false
+sim_platforms: [sdk, gazebo, mujoco]
+sim_platform: sdk
+# The single source of the lidar pose (D13 of #192): the profile's mid360
+# transform defaults and the simulator attachment poses below derive from
+# this mount; a unit test pins them to lekiwi_lidar and the mount file.
+mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
+
+# Conformance suite start pose (D7): equal to hardware.reset_positions — the
+# arm-motion cases reset here and the base-motion cases reset to the same
+# stowed pose first, so every navigation phase starts stowed regardless of
+# test order.
+conformance:
+  start_positions:
+    "1": 0.0
+    "2": -1.5854
+    "3": 1.5708
+    "4": 0.7854
+    "5": 0.0
+
+# MuJoCo runtime platform (D1): the LeKiwi base template hosts the SO-101
+# arm attached from the shared so101.xml.template (D2) at the URDF
+# base_link -> base fixed-chain pose (base_link -> arm_root -> base after
+# the D8 root_link rename); no forked arm MJCF. No sdf_meshes: the MID-360
+# engine extension forbids them (gripper SDF collision is a grasp-stage
+# item). No joint_current block: this profile advertises no joint.current
+# interface, so the runtime's simulated joint-current publisher stays off.
+simulation:
+  mujoco:
+    template: $(find lekiwi_description)/mujoco/lekiwi_base.xml.template
+    meshes_dir: $(find lekiwi_description)/meshes/mujoco
+    sdf_meshes: []
+    floating_base:
+      # the MJCF body with the free joint the BaseVelocityPlugin drives; also
+      # the URDF root frame and the relay's validated odometry child frame
+      body: base_link
+      # the base's own wheel odometry (D3): the relay forwards the twist it
+      # reports to the simulator-internal floating-base command topic
+      twist_source_topic: /odom
+    attachments:
+    - name: arm
+      template: $(find so101_description)/mujoco/so101.xml.template
+      meshes_dir: $(find so101_description)/meshes/lerobot/so101
+      root_body: base
+      parent_body: base_link
+      urdf_parent_link: base_link
+      urdf_child_link: base
+
 controller_manager: controller_manager
 joint_state_topic: /joint_states
 joints: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
@@ -34,13 +90,26 @@ modes:
   initial: idle
   idle:
     controllers: []
+    # MuJoCo platform override (D1/#193 D3.1): a released MuJoCo velocity
+    # actuator keeps its last target, so the base controller is NEVER
+    # deactivated there — it stays active in idle and base_node is the gate
+    # (its zero on a non-base mode, stop latch, closed gate or stale /cmd_vel).
+    controllers_by_platform:
+      mujoco: [base_velocity_controller]
     transitions: [stream, trajectory, base_navigation]
   stream:
     controllers: [arm_position_controller, gripper_position_controller]
+    # MuJoCo keeps the base controller active in the arm modes too (D1):
+    # base_node still zeroes the wheels outside base_navigation, so the
+    # always-active controller cannot move the base here.
+    controllers_by_platform:
+      mujoco: [arm_position_controller, gripper_position_controller, base_velocity_controller]
     allows_stream: true
     transitions: [idle, trajectory]
   trajectory:
     controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+    controllers_by_platform:
+      mujoco: [arm_trajectory_controller, gripper_trajectory_controller, base_velocity_controller]
     allows_trajectory: true
     transitions: [idle, stream, base_navigation]
   base_navigation:
@@ -126,6 +195,13 @@ peripherals:
 - type: microphone
   name: respeaker
   driver: alsa
+  # Not simulated on the physics platforms (D3): the microphone is a host
+  # ALSA device and no simulated audio source stands in for it.
+  simulation:
+    gazebo:
+      enabled: false
+    mujoco:
+      enabled: false
   params:
     device: hw:0,0
     channels: 6
@@ -143,6 +219,13 @@ peripherals:
   name: speaker
   driver: alsa
   enabled: false
+  # Not simulated on the physics platforms (D3): same reason as the
+  # microphone — a host ALSA device with no simulated stand-in.
+  simulation:
+    gazebo:
+      enabled: false
+    mujoco:
+      enabled: false
   params:
     device: ""
     channels: 1
@@ -175,6 +258,23 @@ peripherals:
     roll: 3.093836835932143
     pitch: 1.0039505938496505
     yaw: -1.6776874824436123
+  # MuJoCo camera pose (D1): the plain transform above is the URDF/ROS
+  # camera-link convention (optical +X, up +Z) which the gz path renders
+  # as-is; MuJoCo cameras look along -Z with up +Y, so the simulator block
+  # carries the converted pose (gazebo_rpy_to_mujoco_rpy of the mount, the
+  # so101_single_arm wrist-camera pattern). fovy matches the Gazebo-side
+  # default (both platforms runtime-owned, tunable).
+  simulation:
+    mujoco:
+      transform:
+        parent_frame: gripper
+        x: -0.029804122099556248
+        y: 0.0735813073058911
+        z: -0.03849247926512127
+        roll: -0.5663291121384137
+        pitch: 0.025636684354011147
+        yaw: -0.0665955688299498
+      fovy: 60
 - type: camera
   name: front
   driver: realsense
@@ -195,6 +295,14 @@ peripherals:
   frame_id: camera_front_link
   optical_frame_id: camera_front_optical_frame
   skip_urdf_without_transform: true
+  # Not simulated on the physics platforms (D3): the front camera has no
+  # measured mount pose (the all-zero transform below is the hardware
+  # placeholder) and an unmeasured pose must not be simulated.
+  simulation:
+    gazebo:
+      enabled: false
+    mujoco:
+      enabled: false
   transform:
     parent_frame: base_link
     x: 0.0
@@ -219,6 +327,56 @@ peripherals:
   output_data_type: 0
   cmdline_input_bd_code: livox0000000001
   respawn: true
+  # D13: the public static TF of livox_frame and (below) the simulator
+  # attachment pose both default to the mount relative to base_link
+  # (lekiwi_mid360_mount.yaml: translation_m [-0.08, 0.0, 0.20],
+  # rpy_deg [0.0, 0.0, 90.0]); the profile-equality test pins these copies
+  # to lekiwi_lidar and the mount file (the single-source guard).
+  transform:
+    parent_frame: base_link
+    x: -0.08
+    y: 0.0
+    z: 0.2
+    roll: 0.0
+    pitch: 0.0
+    yaw: 1.5707963267948966
+  simulation:
+    gazebo:
+      transform:
+        parent_frame: base_link
+        x: -0.08
+        y: 0.0
+        z: 0.2
+        roll: 0.0
+        pitch: 0.0
+        yaw: 1.5707963267948966
+      # Simulated MID-360 sensor parameters (identical to lekiwi_lidar).
+      horizontal_samples: 900
+      vertical_samples: 32
+      vertical_min_deg: -7.0
+      vertical_max_deg: 52.0
+      range_min: 0.1
+      range_max: 40.0
+      update_rate: 10.0
+      # The MID-360's built-in IMU.
+      imu:
+        update_rate: 200.0
+    mujoco:
+      transform:
+        parent_frame: base_link
+        x: -0.08
+        y: 0.0
+        z: 0.2
+        roll: 0.0
+        pitch: 0.0
+        yaw: 1.5707963267948966
+      horizontal_samples: 360
+      vertical_samples: 32
+      vertical_min_deg: -7.0
+      vertical_max_deg: 52.0
+      range_min: 0.1
+      range_max: 40.0
+      update_rate: 10.0
   scan_converter:
     enabled: true
     queue_size: 1
@@ -239,10 +397,16 @@ peripherals:
     respawn: true
 
 # D12: lidar odometry chain defaults (lekiwi runtime composes fastlio_mapping
-# plus the odom bridge; deployment overrides merge on top).
+# plus the odom bridge; deployment overrides merge on top). sim_params_file
+# is the simulation parameter set the physics platforms launch with (D6;
+# blind 0.5 m — the stowed arm sits inside it, preflight-measured); the
+# hardware file stays params_file. The bridge's body-to-base extrinsic is
+# the inverse of the MID-360 mount (lekiwi_mid360_mount.yaml), the same
+# mount-derived copy lekiwi_lidar carries (pinned by the equality test).
 fast_lio:
   enabled: false
   params_file: $(find lekiwi_robot)/config/fast_lio_mid360.yaml
+  sim_params_file: $(find lekiwi_robot)/config/fast_lio_mid360_sim.yaml
   lidar_topic: /livox/lidar
   imu_topic: /livox/imu
   raw_odom_topic: /fast_lio/odometry_raw
@@ -251,6 +415,8 @@ fast_lio:
   source_body_frame: body
   odom_frame: odom
   base_frame: base_link
+  body_to_base_translation: [0.0, -0.08, -0.2]
+  body_to_base_rotation: [0.0, 0.0, -0.7071067811865476, 0.7071067811865476]
   publish_tf: true
   planar_output: false
   max_future_skew_sec: 0.1
