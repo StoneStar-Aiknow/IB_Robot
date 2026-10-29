@@ -31,6 +31,7 @@ simulator's MuJoCo version.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import tempfile
@@ -40,6 +41,9 @@ from pathlib import Path
 from typing import Any
 
 from robot_runtime.gazebo import _rotate_yaw_inverse, load_camera_override, resolve_camera_pose
+from robot_runtime.interface_description import platform_peripherals
+
+logger = logging.getLogger(__name__)
 
 # The optical frame is the MJCF camera frame rotated by π about X (MuJoCo
 # looks along −Z with +Y up; ROS optical looks along +Z with +Y down).
@@ -841,6 +845,337 @@ def imu_broadcaster_remappings(peripherals: list) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# MJCF attachments (lekiwi-nav-grasp-sim-platforms D2)
+# ---------------------------------------------------------------------------
+
+#: The placeholder model path the single xacro render carries; the composed
+#: model path replaces it in the rendered URDF afterwards (D2 render order).
+MUJOCO_MODEL_PLACEHOLDER = "__ibrobot_mujoco_model_placeholder__"
+
+_ATTACHMENT_REQUIRED_KEYS = (
+    "name",
+    "template",
+    "meshes_dir",
+    "root_body",
+    "parent_body",
+    "urdf_parent_link",
+    "urdf_child_link",
+)
+#: Compiler attributes an attachment may declare: ``meshdir`` resolves its
+#: meshes and ``angle``/``eulerseq`` must match the host's (D2.1). Anything
+#: else that could change asset resolution or model semantics is rejected.
+_ATTACHMENT_COMPILER_KEYS = frozenset({"meshdir", "angle", "eulerseq"})
+#: Asset kinds an attachment may contribute (D2.1; fail closed on the rest).
+_ATTACHMENT_ASSET_KINDS = frozenset({"mesh", "material"})
+#: Sections whose children are appended to the host (D2.5).
+_ATTACHMENT_APPENDED_SECTIONS = ("contact", "actuator", "sensor", "equality", "tendon")
+#: Sections the host governs; an attachment's copies are dropped (D2.6).
+_ATTACHMENT_HOST_SECTIONS = ("compiler", "option", "size", "visual", "statistic", "keyframe", "extension")
+
+
+def _validate_attachments(mujoco_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate ``simulation.mujoco.attachments`` (D2: unknown keys are errors)."""
+    attachments = mujoco_cfg.get("attachments") or []
+    if not isinstance(attachments, list):
+        raise RuntimeError("simulation.mujoco.attachments must be a list of attachment mappings")
+    seen: set[str] = set()
+    for entry in attachments:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"simulation.mujoco.attachments entries must be mappings: {entry!r}")
+        missing = [key for key in _ATTACHMENT_REQUIRED_KEYS if not str(entry.get(key) or "").strip()]
+        if missing:
+            raise RuntimeError(f"attachment entry {entry!r} is missing required keys {missing}")
+        unknown = sorted(set(entry) - set(_ATTACHMENT_REQUIRED_KEYS))
+        if unknown:
+            raise RuntimeError(f"attachment {entry['name']!r} declares unknown keys {unknown}")
+        if str(entry["name"]) in seen:
+            raise RuntimeError(f"duplicate attachment name {entry['name']!r} in simulation.mujoco.attachments")
+        seen.add(str(entry["name"]))
+    return attachments
+
+
+def _matrix_from_rpy(roll: float, pitch: float, yaw: float) -> list[list[float]]:
+    """R = Rz(yaw) @ Ry(pitch) @ Rx(roll) — the URDF ``rpy`` convention."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+
+
+def _matrix_to_quaternion(R) -> tuple[float, float, float, float]:
+    """The w-x-y-z quaternion of a rotation matrix."""
+    trace = R[0][0] + R[1][1] + R[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return (0.25 * s, (R[2][1] - R[1][2]) / s, (R[0][2] - R[2][0]) / s, (R[1][0] - R[0][1]) / s)
+    if R[0][0] > R[1][1] and R[0][0] > R[2][2]:
+        s = math.sqrt(1.0 + R[0][0] - R[1][1] - R[2][2]) * 2.0
+        return ((R[2][1] - R[1][2]) / s, 0.25 * s, (R[0][1] + R[1][0]) / s, (R[0][2] + R[2][0]) / s)
+    if R[1][1] > R[2][2]:
+        s = math.sqrt(1.0 + R[1][1] - R[0][0] - R[2][2]) * 2.0
+        return ((R[0][2] - R[2][0]) / s, (R[0][1] + R[1][0]) / s, 0.25 * s, (R[1][2] + R[2][1]) / s)
+    s = math.sqrt(1.0 + R[2][2] - R[0][0] - R[1][1]) * 2.0
+    return ((R[1][0] - R[0][1]) / s, (R[0][2] + R[2][0]) / s, (R[1][2] + R[2][1]) / s, 0.25 * s)
+
+
+def urdf_fixed_chain_pose(
+    urdf_root: ET.Element, parent_link: str, child_link: str
+) -> tuple[list[float], tuple[float, float, float, float]]:
+    """(pos, quat w-x-y-z) of ``parent_link`` -> ``child_link`` along FIXED joints (D2.2).
+
+    Composed from the robot description's own joint origins; a non-fixed
+    joint or a missing link on the path fails naming it, so the mount pose
+    can never be silently copied from a number.
+    """
+
+    def compose(first, second):
+        """first ∘ second (apply ``second`` first); each is (R, t)."""
+        (r1, t1), (r2, t2) = first, second
+        R = [[sum(r1[i][k] * r2[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+        t = [sum(r1[i][k] * t2[k] for k in range(3)) + t1[i] for i in range(3)]
+        return (R, t)
+
+    joints = {}
+    for joint in urdf_root.findall("joint"):
+        child = joint.find("child")
+        if child is not None:
+            joints[child.get("link")] = joint
+    chain: list[ET.Element] = []
+    link = child_link
+    while link != parent_link:
+        joint = joints.get(link)
+        if joint is None:
+            raise RuntimeError(
+                f"attachment URDF chain: link {link!r} has no parent joint (no fixed path {parent_link!r} -> {child_link!r})"
+            )
+        if joint.get("type") != "fixed":
+            raise RuntimeError(
+                f"attachment URDF chain {parent_link!r} -> {child_link!r} crosses non-fixed joint "
+                f"{joint.get('name')!r} at link {link!r}"
+            )
+        chain.append(joint)
+        link = joint.find("parent").get("link")
+    transform = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 0.0])
+    for joint in reversed(chain):  # parent-most first
+        origin = joint.find("origin")
+        xyz = [float(v) for v in (origin.get("xyz", "0 0 0") if origin is not None else "0 0 0").split()]
+        rpy = [float(v) for v in (origin.get("rpy", "0 0 0") if origin is not None else "0 0 0").split()]
+        transform = compose(transform, (_matrix_from_rpy(*rpy), xyz))
+    R, t = transform
+    return t, _matrix_to_quaternion(R)
+
+
+def _render_attachment_template(attachment: dict[str, Any]) -> tuple[ET.Element, Path]:
+    """Render one attachment's template with identity base placeholders (D2.1)."""
+    from robot_runtime.path_subst import resolve_path
+
+    template_path = Path(resolve_path(str(attachment["template"])))
+    if not template_path.is_file():
+        raise RuntimeError(f"attachment {attachment['name']!r} template not found: {template_path}")
+    meshes_dir = Path(resolve_path(str(attachment["meshes_dir"])))
+    content = template_path.read_text(encoding="utf-8")
+    content = content.replace("{{MESHES_DIR}}", str(meshes_dir))
+    # the attachment mounts inside the host: its own base placeholder takes
+    # the identity (the URDF chain pose replaces it)
+    content = content.replace("{{ROBOT_BASE_POS}}", "0 0 0")
+    content = content.replace("{{ROBOT_BASE_QUAT}}", "1 0 0 0")
+    return ET.fromstring(content), meshes_dir
+
+
+def _check_attachment_compiler(attachment: dict[str, Any], host_compiler: ET.Element, compiler: ET.Element) -> None:
+    """Fail closed on compiler incompatibility (D2.1)."""
+    name = attachment["name"]
+    unknown = sorted(set(compiler.attrib) - _ATTACHMENT_COMPILER_KEYS)
+    if unknown:
+        raise RuntimeError(f"attachment {name!r} <compiler> declares unsupported attributes {unknown}")
+    for attribute in ("angle", "eulerseq"):
+        if compiler.get(attribute) != host_compiler.get(attribute):
+            raise RuntimeError(
+                f"attachment {name!r} <compiler {attribute}={compiler.get(attribute)!r}> is incompatible with the "
+                f"host's {host_compiler.get(attribute)!r}"
+            )
+
+
+def _merge_attachment_assets(
+    attachment: dict[str, Any], host_assets: ET.Element, assets: ET.Element, meshes_dir: Path
+) -> None:
+    """Absolute mesh paths under the attachment's meshdir; clashes fail (D2.3)."""
+    name = attachment["name"]
+    for element in list(assets):
+        if element.tag not in _ATTACHMENT_ASSET_KINDS:
+            raise RuntimeError(f"attachment {name!r} declares an unsupported asset kind <{element.tag}>")
+        asset_name = element.get("name")
+        if not asset_name:
+            raise RuntimeError(f"attachment {name!r} declares an unnamed <{element.tag}> asset")
+        if element.tag == "mesh":
+            file = element.get("file")
+            if not file:
+                raise RuntimeError(f"attachment {name!r} mesh {asset_name!r} has no file")
+            element.set("file", str(meshes_dir / file))
+        if host_assets.find(f"{element.tag}[@name='{asset_name}']") is not None:
+            raise RuntimeError(
+                f"attachment {name!r} asset {element.tag} {asset_name!r} clashes with the host's asset of the same name"
+            )
+        host_assets.append(element)
+
+
+def _rename_attachment_defaults(
+    attachment: dict[str, Any], attachment_root: ET.Element, host_default: ET.Element
+) -> None:
+    """Namespace the attachment's default classes ``<name>_<class>`` (D2.4)."""
+    name = attachment["name"]
+    default = attachment_root.find("default")
+    if default is None:
+        return
+    if default.attrib:
+        raise RuntimeError(f"attachment {name!r} main <default> carries attributes {default.attrib}")
+    for child in default:
+        if child.tag != "default" or not child.get("class"):
+            raise RuntimeError(
+                f"attachment {name!r} main <default> may contain only named <default class> containers; "
+                f"found <{child.tag} {child.attrib}>"
+            )
+    renames = {d.get("class"): f"{name}_{d.get('class')}" for d in default.iter("default") if d.get("class")}
+    for element in attachment_root.iter():
+        for attribute in ("class", "childclass"):
+            if element.get(attribute) in renames:
+                element.set(attribute, renames[element.get(attribute)])
+    host_classes = {d.get("class") for d in host_default.iter("default") if d.get("class")}
+    clash = sorted(set(renames.values()) & host_classes)
+    if clash:
+        raise RuntimeError(f"attachment {name!r} prefixed default classes {clash} clash with the host's classes")
+    for child in list(default):
+        host_default.append(child)
+
+
+def _merge_attachment(host: ET.Element, attachment: dict[str, Any], urdf_root: ET.Element) -> None:
+    """Merge one attachment's model into the host MJCF (D2.2-D2.7)."""
+    name = str(attachment["name"])
+    attachment_root, meshes_dir = _render_attachment_template(attachment)
+
+    host_compiler = host.find("compiler")
+    compiler = attachment_root.find("compiler")
+    if host_compiler is None or compiler is None:
+        raise RuntimeError(f"attachment {name!r} and the host must both declare a <compiler>")
+    _check_attachment_compiler(attachment, host_compiler, compiler)
+
+    # the option diff is logged, not merged (D2.6: the host's govern)
+    host_option = host.find("option")
+    option = attachment_root.find("option")
+    if option is not None:
+        keys = set(option.attrib) | (set(host_option.attrib) if host_option is not None else set())
+        differing = {
+            key: (host_option.get(key) if host_option is not None else None, option.get(key))
+            for key in keys
+            if (host_option.get(key) if host_option is not None else None) != option.get(key)
+        }
+        flags = [ET.tostring(flag, encoding="unicode").strip() for flag in option.findall("flag")]
+        if differing or flags:
+            logger.info(
+                "attachment %r: the host <option> governs; dropped differences %s flags %s", name, differing, flags
+            )
+
+    # D2.7: duplicate names across host and attachment fail naming both
+    for tag in ("body", "joint", "geom", "site", "camera"):
+        host_names = {element.get("name") for element in host.iter(tag) if element.get("name")}
+        for element in attachment_root.iter(tag):
+            element_name = element.get("name")
+            if element_name and element_name in host_names:
+                raise RuntimeError(
+                    f"attachment {name!r} {tag} {element_name!r} clashes with the host's {tag} of the same name"
+                )
+    for tag in ("actuator", "sensor", "equality", "tendon"):
+        # these live in same-named top-level sections whose children carry
+        # the names (e.g. <actuator><position name=…/>)
+        host_section = host.find(tag)
+        host_names = (
+            {element.get("name") for element in host_section if element.get("name")}
+            if host_section is not None
+            else set()
+        )
+        attachment_section = attachment_root.find(tag)
+        if attachment_section is None:
+            continue
+        for element in attachment_section:
+            element_name = element.get("name")
+            if element_name and element_name in host_names:
+                raise RuntimeError(
+                    f"attachment {name!r} {tag} {element_name!r} clashes with the host's {tag} of the same name"
+                )
+
+    # assets first: everything else references them
+    host_assets = host.find("asset")
+    assets = attachment_root.find("asset")
+    if assets is not None:
+        if host_assets is None:
+            host_assets = ET.SubElement(host, "asset")
+        _merge_attachment_assets(attachment, host_assets, assets, meshes_dir)
+
+    host_default = host.find("default")
+    if host_default is None:
+        host_default = ET.SubElement(host, "default")
+    _rename_attachment_defaults(attachment, attachment_root, host_default)
+
+    # D2.2: the mount pose is the URDF fixed-chain transform, relative to
+    # parent_body (the spawn pose stays on the host's root body only). The
+    # parent may be NESTED anywhere in the host tree (review round 2 — a
+    # top-level-only lookup silently rejected legal mounts) and must be
+    # UNIQUE: MJCF body names are globally unique, several matches mean a
+    # malformed host and the mount point is undefined.
+    worldbody = attachment_root.find("worldbody")
+    if worldbody is None:
+        raise RuntimeError(f"attachment {name!r} template has no <worldbody>")
+    root_body = worldbody.find(f'body[@name="{attachment["root_body"]}"]')
+    if root_body is None:
+        raise RuntimeError(f"attachment {name!r} root body {attachment['root_body']!r} not found in its template")
+    parent_name = str(attachment["parent_body"])
+    parent_candidates = [body for body in host.iter("body") if body.get("name") == parent_name]
+    if not parent_candidates:
+        raise RuntimeError(f"attachment {name!r} parent body {parent_name!r} not found in the host MJCF")
+    if len(parent_candidates) > 1:
+        raise RuntimeError(
+            f"attachment {name!r} parent body {parent_name!r} is ambiguous: "
+            f"{len(parent_candidates)} host bodies carry the same name"
+        )
+    parent_body = parent_candidates[0]
+    pos, quat = urdf_fixed_chain_pose(
+        urdf_root, str(attachment["urdf_parent_link"]), str(attachment["urdf_child_link"])
+    )
+    root_body.attrib.pop("quat", None)
+    root_body.attrib.pop("euler", None)
+    root_body.set("pos", " ".join(f"{value:.9g}" for value in pos))
+    root_body.set("quat", " ".join(f"{value:.9g}" for value in quat))
+    parent_body.append(root_body)
+    dropped = [child.tag for child in worldbody if child.tag != "body"]
+    if dropped:
+        logger.info("attachment %r: dropped worldbody-level %s outside %r", name, dropped, str(attachment["root_body"]))
+
+    # D2.5: appended sections + the parent<->root contact exclude (the arm
+    # base overlaps the chassis hull)
+    for tag in _ATTACHMENT_APPENDED_SECTIONS:
+        section = attachment_root.find(tag)
+        if section is None:
+            continue
+        host_section = host.find(tag)
+        if host_section is None:
+            host_section = ET.SubElement(host, tag)
+        for element in section:
+            host_section.append(element)
+    contact = host.find("contact")
+    if contact is None:
+        contact = ET.SubElement(host, "contact")
+    ET.SubElement(contact, "exclude", {"body1": str(attachment["parent_body"]), "body2": str(attachment["root_body"])})
+    # D2.6: the host's sections govern; the attachment's copies are dropped
+    dropped_sections = [tag for tag in _ATTACHMENT_HOST_SECTIONS if attachment_root.find(tag) is not None]
+    if dropped_sections:
+        logger.info("attachment %r: the host sections govern; dropped %s", name, sorted(set(dropped_sections)))
+
+
+# ---------------------------------------------------------------------------
 # Robot MJCF rendering (D2, D4)
 # ---------------------------------------------------------------------------
 
@@ -850,6 +1185,7 @@ def render_robot_mjcf(
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
     peripherals: list | None = None,
     out_dir: str | Path | None = None,
+    urdf: str | None = None,
 ) -> Path:
     """Render the runtime-private robot MJCF with the cameras injected (D2/D4).
 
@@ -862,6 +1198,13 @@ def render_robot_mjcf(
     inventory (D5.2 — a profile without a simulated lidar renders no site,
     sensor or engine-extension element). The file is written to a per-launch
     temporary directory, never to a fixed path.
+
+    ``simulation.mujoco.attachments`` (D2) merges each declared sub-model
+    into the host before the sensor injection, so a camera whose
+    ``parent_frame`` names an attachment body finds it. The attachment mount
+    poses come from ``urdf`` — the rendered robot description — which is
+    therefore REQUIRED when the profile declares attachments; callers
+    without attachments are unchanged.
     """
     from robot_runtime.path_subst import resolve_path
 
@@ -877,6 +1220,14 @@ def render_robot_mjcf(
     if not template_path.is_file():
         raise RuntimeError(f"simulation.mujoco.template not found: {template_path}")
 
+    attachments = _validate_attachments(mujoco_cfg)
+    if attachments and urdf is None:
+        raise RuntimeError(
+            "runtime profile declares simulation.mujoco.attachments: render_robot_mjcf needs the rendered "
+            "robot description (urdf) for the attachment mount poses"
+        )
+    urdf_root = ET.fromstring(urdf) if attachments else None
+
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("{{MESHES_DIR}}", str(Path(resolve_path(str(meshes_dir)))))
     x, y, z, yaw = (float(value) for value in spawn_pose)
@@ -884,11 +1235,15 @@ def render_robot_mjcf(
     # MuJoCo free/base orientation is w-x-y-z; a pure-yaw spawn quaternion.
     content = content.replace("{{ROBOT_BASE_QUAT}}", f"{math.cos(yaw / 2):.6f} 0.0 0.0 {math.sin(yaw / 2):.6f}")
 
-    effective = peripherals if peripherals is not None else profile.get("peripherals") or []
+    # D3: a directly-passed inventory is authoritative; the profile's own
+    # peripherals are platform-filtered (this render is MuJoCo-only)
+    effective = peripherals if peripherals is not None else platform_peripherals(profile.get("peripherals"), "mujoco")
     root = ET.fromstring(content)
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise RuntimeError(f"MuJoCo template has no <worldbody>: {template_path}")
+    for attachment in attachments:
+        _merge_attachment(root, attachment, urdf_root)
     for parent, camera_xml in camera_mjcf_elements(effective):
         element = ET.fromstring(camera_xml)
         if parent is None:

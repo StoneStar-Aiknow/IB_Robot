@@ -52,6 +52,7 @@ from robot_runtime.contract import (
 from robot_runtime.interface_description import (
     build_description,
     description_sim_platform,
+    platform_peripherals,
     validate_description,
 )
 from robot_runtime.interface_monitor import InterfaceMonitor
@@ -138,6 +139,11 @@ class RuntimeFacade(Node):
             bool(self.get_parameter("use_sim").value),
             str(self.get_parameter("sim_platform").value),
         )
+        # D3: peripherals excluded on the selected physics platform are
+        # neither advertised nor claimed — the capability surface, the
+        # interface description and the interface monitor all project this
+        # one filtered inventory.
+        peripherals = platform_peripherals(peripherals, self._sim_platform)
         # D5.4: the RuntimeStatus capability surface derives from the same
         # platform-filtered projection as the interface description, so a
         # sensor the platform does not stand in for is neither advertised nor

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -23,6 +24,8 @@ from jsonschema import Draft202012Validator
 from robot_runtime import contract as C
 from robot_runtime.gazebo import advertised_camera_frames
 from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS, lidar_driver_simulated
+
+logger = logging.getLogger(__name__)
 
 
 class InterfaceDescriptionError(ValueError):
@@ -202,14 +205,55 @@ def canonicalise_peripheral_entry(entry: dict) -> dict:
         if "enabled" in canonical and bool(canonical["enabled"]) != bool(disabled):
             # Both present and agreeing (``disabled: X`` == ``enabled: not X``):
             # the canonical ``enabled`` value wins.
-            return canonical
-        if "enabled" in canonical:
+            pass
+        elif "enabled" in canonical:
             raise InterfaceDescriptionError(
                 f"peripheral {key} sets contradictory disabled={disabled!r} and "
                 f"enabled={canonical['enabled']!r}; pass at most one"
             )
-        canonical["enabled"] = not bool(disabled)
+        else:
+            canonical["enabled"] = not bool(disabled)
+    _validate_platform_exclusion_flag(canonical, key)
     return canonical
+
+
+def _validate_platform_exclusion_flag(entry: dict, key: tuple) -> None:
+    """Validate ``simulation`` and ``simulation.<platform>`` on one peripheral entry (D3).
+
+    A peripheral may be excluded on a physics simulation platform with
+    ``simulation.<platform>.enabled: false``. The flag is a device policy, so
+    it is validated for every layer here (the runtime profile included); a
+    non-bool value is an error naming the peripheral and the platform.
+
+    ``simulation`` and every physics-platform section under it must be a
+    MAPPING when present. An explicit ``null`` is an error, not "absent":
+    through the layer merge a null would delete the base's exclusion flags
+    and resurrect an excluded device on the platform — an exclusion can only
+    be lifted by an explicit ``simulation.<platform>.enabled: true``. Other
+    keys under ``simulation`` keep their meaning and are not validated here.
+    """
+    if "simulation" not in entry:
+        return
+    simulation = entry["simulation"]
+    if not isinstance(simulation, dict):
+        raise InterfaceDescriptionError(
+            f"peripheral {key} 'simulation' must be a mapping, got {simulation!r}; an explicit null "
+            "would erase the base's platform exclusion flags through the merge — omit the key or "
+            "pass a mapping (an exclusion is lifted only by simulation.<platform>.enabled: true)"
+        )
+    for platform, section in simulation.items():
+        if platform not in PHYSICS_SIM_PLATFORMS:
+            continue
+        if not isinstance(section, dict):
+            raise InterfaceDescriptionError(
+                f"peripheral {key} simulation.{platform} must be a mapping, got {section!r}; an "
+                f"explicit null would erase the {platform} exclusion through the merge — omit the "
+                f"key or re-enable explicitly with simulation.{platform}.enabled: true"
+            )
+        if "enabled" in section and not isinstance(section["enabled"], bool):
+            raise InterfaceDescriptionError(
+                f"peripheral {key} simulation.{platform}.enabled must be a boolean, got {section['enabled']!r}"
+            )
 
 
 def _check_camera_values(camera: dict) -> None:
@@ -290,6 +334,7 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
                     # not vendor-specific).
                     if "enabled" not in entry and "enabled" in base:
                         entry["enabled"] = base["enabled"]
+                    _inherit_platform_exclusion_flags(entry, base)
                     result[pos] = entry
                 else:
                     result[pos] = merge(base, entry)
@@ -305,6 +350,64 @@ def merge_peripherals(defaults: list | None, overrides: list | None) -> list[dic
         if entry.get("type") == "camera" and entry.get("enabled", True):
             _check_camera_values(entry)
     return [entry for entry in result if entry.get("enabled", True)]
+
+
+def _inherit_platform_exclusion_flags(entry: dict, base: dict) -> None:
+    """Carry the base's per-platform exclusion flags over a driver change (D3).
+
+    The ``simulation.<platform>.enabled`` flags are a device policy,
+    independent of the driver: each flag the replacing entry does not set
+    itself is inherited from the base entry. Nothing else of the old driver's
+    ``simulation`` block (poses, sensor parameters) is inherited — those are
+    vendor-specific. An override re-enables explicitly with
+    ``simulation.<platform>.enabled: true``.
+    """
+    base_simulation = base.get("simulation")
+    override_simulation = entry.get("simulation")
+    if not isinstance(base_simulation, dict):
+        return
+    inherited: dict[str, dict] = {}
+    for platform in PHYSICS_SIM_PLATFORMS:
+        base_section = base_simulation.get(platform)
+        if not isinstance(base_section, dict) or "enabled" not in base_section:
+            continue
+        override_section = override_simulation.get(platform) if isinstance(override_simulation, dict) else None
+        if isinstance(override_section, dict) and "enabled" in override_section:
+            continue
+        merged_section = dict(override_section) if isinstance(override_section, dict) else {}
+        merged_section["enabled"] = base_section["enabled"]
+        inherited[platform] = merged_section
+    if inherited:
+        entry["simulation"] = {**(override_simulation if isinstance(override_simulation, dict) else {}), **inherited}
+
+
+def platform_peripherals(peripherals: list | None, sim_platform: str | None) -> list[dict]:
+    """The effective inventory minus peripherals excluded on ``sim_platform`` (D3).
+
+    A peripheral excluded with ``simulation.<platform>.enabled: false`` is
+    neither launched, simulated nor advertised on that platform: every
+    physics-platform consumer resolves its inventory through this helper. On
+    hardware and the SDK execution (``sim_platform`` empty or not a physics
+    platform) the key is ignored and the inventory passes through unchanged.
+    One info line is logged per excluded peripheral.
+    """
+    if sim_platform not in PHYSICS_SIM_PLATFORMS:
+        return list(peripherals or [])
+    kept: list[dict] = []
+    for entry in peripherals or []:
+        simulation = entry.get("simulation")
+        section = simulation.get(sim_platform) if isinstance(simulation, dict) else None
+        if isinstance(section, dict) and section.get("enabled") is False:
+            logger.info(
+                "peripheral %s %r excluded on the %s platform (simulation.%s.enabled: false)",
+                entry.get("type"),
+                entry.get("name"),
+                sim_platform,
+                sim_platform,
+            )
+            continue
+        kept.append(entry)
+    return kept
 
 
 def camera_streams(camera: dict) -> list[str]:
@@ -354,7 +457,9 @@ def peripheral_interfaces(
 
     ``sim_platform`` adjusts streams the platform cannot produce (the gz
     camera gaps, the lidar wire type) and drops lidars the platform does not
-    stand in for (D5). ``camera_rate_hz``/``imu_rate_hz`` carry the rates the
+    stand in for (D5), as well as peripherals excluded on that platform with
+    ``simulation.<platform>.enabled: false`` (D3: neither advertised nor
+    claimed). ``camera_rate_hz``/``imu_rate_hz`` carry the rates the
     simulators actually produce when they differ from the device defaults.
     ``scan_source_runs`` says whether the derived scan's source (FAST-LIO's
     registered body cloud) runs on the selected platform; a physics platform
@@ -362,7 +467,7 @@ def peripheral_interfaces(
     """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
-    merged = merge_peripherals(peripherals, [])
+    merged = platform_peripherals(merge_peripherals(peripherals, []), sim_platform)
     for periph in merged:
         name, kind = periph["name"], periph["type"]
         if kind in ("microphone", "speaker"):
@@ -856,13 +961,15 @@ def build_description(
             raise InterfaceDescriptionError(
                 f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}"
             )
+    # D3: peripherals excluded on the selected physics platform are neither
+    # advertised nor claimed — the description projects the same filtered
+    # inventory every platform consumer resolves.
+    peripherals = platform_peripherals(profile.get("peripherals") if peripherals is None else peripherals, sim_platform)
     interfaces = peripheral_interfaces(
-        profile.get("peripherals") if peripherals is None else peripherals,
+        peripherals,
         sim_platform=sim_platform,
         camera_rate_hz=(
-            _mujoco_camera_rate({**profile, "peripherals": peripherals or profile.get("peripherals") or []})
-            if sim_platform == "mujoco"
-            else None
+            _mujoco_camera_rate({**profile, "peripherals": peripherals}) if sim_platform == "mujoco" else None
         ),
         imu_rate_hz=(_mujoco_imu_rate(profile, peripherals) if sim_platform == "mujoco" else None),
         # The derived scan's source (FAST-LIO's registered body cloud) runs

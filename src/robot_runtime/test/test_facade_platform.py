@@ -286,3 +286,80 @@ def test_gazebo_and_sdk_capabilities_are_unchanged(tmp_path):
         selected = {**profile, "sim_platform": platform}
         capabilities = _facade_capabilities(selected, tmp_path)
         assert set(capabilities["perception.lidar"]["topics"]) == {"/livox/lidar", "/livox/imu", "/ld06/scan"}, platform
+
+
+# ---------------------------------------------------------------------------
+# Per-platform peripheral exclusion (lekiwi-nav-grasp-sim-platforms D3)
+# ---------------------------------------------------------------------------
+
+_EXCLUSION_PERIPHERALS = [
+    {
+        "type": "microphone",
+        "name": "respeaker",
+        "driver": "alsa",
+        "params": {"device": "hw:0,0"},
+        "simulation": {"gazebo": {"enabled": False}, "mujoco": {"enabled": False}},
+    },
+    {
+        # enabled in the effective inventory (the deployment-override shape;
+        # the merge funnel is the same) and still excluded on the platforms
+        "type": "speaker",
+        "name": "speaker",
+        "driver": "alsa",
+        "enabled": True,
+        "params": {"device": ""},
+        "simulation": {"gazebo": {"enabled": False}, "mujoco": {"enabled": False}},
+    },
+    {
+        "type": "camera",
+        "name": "front",
+        "driver": "realsense",
+        "width": 640,
+        "height": 480,
+        "streams": ["color", "depth"],
+        "frame_id": "camera_front_link",
+        "transform": {"parent_frame": "base_link"},
+        "simulation": {"gazebo": {"enabled": False}, "mujoco": {"enabled": False}},
+    },
+    {
+        "type": "camera",
+        "name": "wrist",
+        "driver": "realsense",
+        "width": 640,
+        "height": 360,
+        "streams": ["color", "depth"],
+        "frame_id": "camera_wrist_link",
+        "transform": {"parent_frame": "gripper"},
+    },
+]
+
+
+def _exclusion_profile(sim_platform):
+    return {
+        **PLATFORM_PROFILE,
+        "sim_platforms": ["sdk", "gazebo", "mujoco"],
+        "sim_platform": sim_platform,
+        "peripherals": _EXCLUSION_PERIPHERALS,
+    }
+
+
+def test_excluded_peripherals_are_absent_from_the_facade_surface_on_physics_platforms(tmp_path):
+    """D3 end-to-end: audio and the front camera are neither advertised nor
+    claimed on both physics platforms; the wrist camera stays."""
+    for platform in ("gazebo", "mujoco"):
+        capabilities = _facade_capabilities(_exclusion_profile(platform), tmp_path)
+        assert "interaction.audio_capture" not in capabilities
+        assert "interaction.audio_playback" not in capabilities
+        assert "perception.camera" in capabilities
+        assert all("/front/" not in topic for topic in capabilities["perception.camera"]["topics"])
+        assert "/camera/wrist/image_raw" in capabilities["perception.camera"]["topics"]
+
+
+def test_excluded_peripherals_stay_advertised_on_the_sdk_execution(tmp_path):
+    """D3: the same profile on the SDK execution keeps the pre-change surface
+    (speaker enabled in this fixture, microphone and front camera present)."""
+    capabilities = _facade_capabilities(_exclusion_profile("sdk"), tmp_path)
+    assert "interaction.audio_capture" in capabilities
+    assert "interaction.audio_playback" in capabilities
+    camera_topics = capabilities["perception.camera"]["topics"]
+    assert "/camera/front/image_raw" in camera_topics and "/camera/wrist/image_raw" in camera_topics

@@ -64,7 +64,7 @@ from robot_runtime.contract import (
     STOP_SERVICE,
     STOP_TORQUE_OFF,
 )
-from robot_runtime.interface_description import build_description
+from robot_runtime.interface_description import build_description, platform_peripherals
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.peripherals import (
@@ -180,6 +180,8 @@ class MockRuntime(Node):
         )
         fragment = load_peripherals_file(peripherals_path) if peripherals_path else {}
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
+        # D3: the same platform-filtered inventory the real facade projects
+        peripherals = platform_peripherals(peripherals, sim_platform or None)
         capabilities = dict(self._profile["capabilities"])
         capabilities.update(perception_capabilities(peripherals, sim_platform=sim_platform or None))
         capabilities.update(audio_capabilities(peripherals))

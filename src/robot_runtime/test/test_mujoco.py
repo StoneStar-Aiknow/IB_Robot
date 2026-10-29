@@ -1252,3 +1252,477 @@ def test_render_mujoco_description_injects_the_imu_sensor_into_ros2_control(tmp_
     # a profile without a simulated lidar renders no sensor (SO-101 unchanged)
     plain = render_mujoco_description(_profile(tmp_path), tmp_path / "profile.yaml")
     assert ET.fromstring(plain).find("ros2_control/sensor") is None
+
+
+# ---------------------------------------------------------------------------
+# MJCF attachments (lekiwi-nav-grasp-sim-platforms D2)
+# ---------------------------------------------------------------------------
+
+ATTACHMENT_HOST = """<mujoco model="host">
+  <compiler angle="radian" eulerseq="XYZ" meshdir="{{MESHES_DIR}}"/>
+  <option gravity="0 0 -9.81" timestep="0.001"/>
+  <asset>
+    <mesh name="host_mesh" file="host.stl"/>
+  </asset>
+  <default>
+    <default class="visual"><geom contype="0" conaffinity="0" group="1"/></default>
+    <default class="wheel"><geom type="sphere" condim="1"/></default>
+  </default>
+  <worldbody>
+    <body name="base_link" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <freejoint name="floating_base_joint"/>
+      <site name="host_site" pos="0 0 0.1"/>
+      <camera name="host_cam" pos="0 0 0.5"/>
+      <geom name="chassis" type="box" size="0.13 0.13 0.03" pos="0 0 0.05"/>
+      <body name="left_wheel" pos="0.06 0.11 0.01">
+        <joint name="wheel_7" type="hinge" axis="0 0 -1"/>
+        <geom class="wheel" name="wheel_7"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="wheel_7" joint="wheel_7" kv="0.6"/>
+  </actuator>
+</mujoco>
+"""
+
+ATTACHMENT_ARM = """<mujoco model="arm">
+  <compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian"/>
+  <option gravity="0 0 -9.81" timestep="0.001" noslip_iterations="20" cone="elliptic">
+    <flag contact="enable"/>
+  </option>
+  <asset>
+    <material name="mat_arm" specular="0.1"/>
+    <mesh name="arm_base_mesh" file="arm_base.stl"/>
+  </asset>
+  <default>
+    <default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>
+    <default class="collision">
+      <geom contype="1" conaffinity="1" group="0"/>
+      <default class="grip"><geom friction="10 1 0.05"/></default>
+    </default>
+  </default>
+  <worldbody>
+    <geom type="plane" size="1 1 0.01"/>
+    <body name="arm_base" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <inertial pos="0 0 0.05" mass="0.15" diaginertia="0.001 0.001 0.002"/>
+      <geom class="visual" type="mesh" mesh="arm_base_mesh"/>
+      <body name="gripper" pos="0 0 0.1">
+        <joint name="1" type="hinge" axis="0 0 1"/>
+        <geom class="grip" type="box" size="0.01 0.01 0.01"/>
+      </body>
+    </body>
+  </worldbody>
+  <contact>
+    <exclude body1="arm_base" body2="gripper"/>
+  </contact>
+  <actuator>
+    <position name="1" joint="1" kp="998"/>
+  </actuator>
+</mujoco>
+"""
+
+ATTACHMENT_URDF = """<?xml version="1.0"?>
+<robot name="probe">
+  <link name="base_link"/>
+  <link name="arm_root"/>
+  <link name="arm_base"/>
+  <link name="gripper"/>
+  <joint name="base_to_arm" type="fixed">
+    <parent link="base_link"/><child link="arm_root"/>
+    <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
+  </joint>
+  <joint name="base_joint" type="fixed">
+    <parent link="arm_root"/><child link="arm_base"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="1" type="revolute">
+    <parent link="arm_base"/><child link="gripper"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/><limit effort="1" lower="-1" upper="1" velocity="1"/>
+  </joint>
+</robot>
+"""
+
+
+def _attachment_files(tmp_path):
+    host = tmp_path / "host.xml.template"
+    host.write_text(ATTACHMENT_HOST, encoding="utf-8")
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM, encoding="utf-8")
+    host_meshes = tmp_path / "host_meshes"
+    host_meshes.mkdir()
+    arm_meshes = tmp_path / "arm_meshes"
+    arm_meshes.mkdir()
+    return {
+        "simulation": {
+            "mujoco": {
+                "template": str(host),
+                "meshes_dir": str(host_meshes),
+                "sdf_meshes": [],
+                "attachments": [
+                    {
+                        "name": "arm",
+                        "template": str(arm),
+                        "meshes_dir": str(arm_meshes),
+                        "root_body": "arm_base",
+                        "parent_body": "base_link",
+                        "urdf_parent_link": "base_link",
+                        "urdf_child_link": "arm_base",
+                    }
+                ],
+            }
+        },
+        "peripherals": [],
+    }
+
+
+def _attachment_quat_yaw() -> tuple[float, float]:
+    half = 1.5708 / 2.0
+    return math.cos(half), math.sin(half)
+
+
+def test_attachment_merges_the_submodel_at_the_urdf_chain_pose(tmp_path):
+    profile = _attachment_files(tmp_path)
+    out = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+
+    # the root body moved under parent_body at the URDF chain pose (local
+    # mount: the spawn pose stays on the host's root body only)
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]')
+    assert arm_base is not None, "arm_base must live under base_link"
+    assert arm_base.get("pos") == "0.06 -0.02 0.02"
+    w, x, y, z = (float(v) for v in arm_base.get("quat").split())
+    expected_w, expected_z = _attachment_quat_yaw()
+    assert abs(w - expected_w) < 1e-6 and abs(z - expected_z) < 1e-6 and x == y == 0.0
+    assert (
+        root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]/body[@name="gripper"]/joint[@name="1"]')
+        is not None
+    )
+
+    # assets: the attachment's meshes resolve from its own directory, the
+    # host's keep their meshdir-relative files; the material merged
+    arm_mesh = root.find("asset/mesh[@name='arm_base_mesh']")
+    assert arm_mesh.get("file") == str(tmp_path / "arm_meshes" / "arm_base.stl")
+    assert root.find("asset/mesh[@name='host_mesh']").get("file") == "host.stl"
+    assert root.find("asset/material[@name='mat_arm']") is not None
+
+    # defaults namespaced arm_* and the references follow; the host's stay
+    assert root.find("default/default[@class='arm_visual']") is not None
+    assert root.find("default/default[@class='arm_collision']") is not None
+    assert root.find("default/default[@class='arm_collision']/default[@class='arm_grip']") is not None
+    assert root.find(".//body[@name='arm_base']/geom[@class='arm_visual']") is not None
+    assert root.find(".//body[@name='gripper']/geom[@class='arm_grip']") is not None
+    assert root.find("default/default[@class='visual']") is not None  # the host's own
+    assert root.find("default/default[@class='wheel']") is not None
+
+    # the appended sections + the parent<->root exclude
+    excludes = [(e.get("body1"), e.get("body2")) for e in root.find("contact").findall("exclude")]
+    assert ("arm_base", "gripper") in excludes and ("base_link", "arm_base") in excludes
+    actuators = [a.get("name") for a in root.find("actuator")]
+    assert actuators == ["wheel_7", "1"]
+
+    # the host's sections govern; the attachment's ground plane and flag drop
+    assert root.find(".//geom[@type='plane']") is None
+    assert root.find("option/flag") is None
+    assert root.find("option").get("noslip_iterations") is None
+
+
+def test_attachment_mounts_on_a_nested_parent_body(tmp_path):
+    """The parent body may sit anywhere in the host tree, not only at the top
+    level (review round 2)."""
+    profile = _attachment_files(tmp_path)
+    nested = ATTACHMENT_HOST.replace(
+        '<site name="host_site" pos="0 0 0.1"/>',
+        '<site name="host_site" pos="0 0 0.1"/>\n      <body name="mount_deck" pos="0 0 0.12"/>',
+    )
+    Path(profile["simulation"]["mujoco"]["template"]).write_text(nested, encoding="utf-8")
+    profile["simulation"]["mujoco"]["attachments"][0]["parent_body"] = "mount_deck"
+    out = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="mount_deck"]/body[@name="arm_base"]')
+    assert arm_base is not None, "arm_base must mount on the nested parent body"
+    excludes = [(e.get("body1"), e.get("body2")) for e in root.find("contact").findall("exclude")]
+    assert ("mount_deck", "arm_base") in excludes
+
+
+def test_an_ambiguous_parent_body_name_is_an_error(tmp_path):
+    """MJCF body names are globally unique; several host bodies sharing the
+    mount name mean a malformed host — refuse instead of picking one."""
+    profile = _attachment_files(tmp_path)
+    ambiguous = ATTACHMENT_HOST.replace(
+        '<site name="host_site" pos="0 0 0.1"/>',
+        '<site name="host_site" pos="0 0 0.1"/>\n      <body name="mount_deck"/>\n'
+        '      <body name="mount_deck" pos="0.1 0 0"/>',
+    )
+    Path(profile["simulation"]["mujoco"]["template"]).write_text(ambiguous, encoding="utf-8")
+    profile["simulation"]["mujoco"]["attachments"][0]["parent_body"] = "mount_deck"
+    with pytest.raises(RuntimeError, match="parent body 'mount_deck' is ambiguous"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_pose_ignores_the_spawn_pose(tmp_path):
+    """A non-zero spawn pose must not rotate the mount twice (D2.2)."""
+    profile = _attachment_files(tmp_path)
+    out = render_robot_mjcf(profile, spawn_pose=(1.0, 2.0, 0.05, 0.9), urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]')
+    assert arm_base.get("pos") == "0.06 -0.02 0.02"
+    w, x, y, z = (float(v) for v in arm_base.get("quat").split())
+    expected_w, expected_z = _attachment_quat_yaw()
+    assert abs(w - expected_w) < 1e-6 and abs(z - expected_z) < 1e-6
+    # the spawn pose is on the host's root body only
+    host_pos = root.find('worldbody/body[@name="base_link"]').get("pos")
+    assert host_pos == "1.000000 2.000000 0.050000"
+
+
+def test_attachments_need_the_urdf(tmp_path):
+    profile = _attachment_files(tmp_path)
+    with pytest.raises(RuntimeError, match="needs the rendered robot description"):
+        render_robot_mjcf(profile)
+
+
+def test_attachment_schema_rejects_unknown_and_missing_keys(tmp_path):
+    profile = _attachment_files(tmp_path)
+    entry = profile["simulation"]["mujoco"]["attachments"][0]
+    with_missing = {
+        **profile,
+        "simulation": {
+            "mujoco": {
+                **profile["simulation"]["mujoco"],
+                "attachments": [{k: v for k, v in entry.items() if k != "root_body"}],
+            }
+        },
+    }
+    with pytest.raises(RuntimeError, match="missing required keys.*root_body"):
+        render_robot_mjcf(with_missing, urdf=ATTACHMENT_URDF)
+    with_unknown = {
+        **profile,
+        "simulation": {"mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**entry, "scale": 2}]}},
+    }
+    with pytest.raises(RuntimeError, match="unknown keys.*scale"):
+        render_robot_mjcf(with_unknown, urdf=ATTACHMENT_URDF)
+    duplicated = {
+        **profile,
+        "simulation": {"mujoco": {**profile["simulation"]["mujoco"], "attachments": [entry, entry]}},
+    }
+    with pytest.raises(RuntimeError, match="duplicate attachment name"):
+        render_robot_mjcf(duplicated, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "arm_replacement, message",
+    [
+        ('eulerseq="ZXYZ"', "angle.*incompatible|eulerseq.*incompatible"),
+        ('angle="degree"', "incompatible"),
+        (
+            '<compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian" texturedir="/tmp"/>',
+            "unsupported attributes.*texturedir",
+        ),
+    ],
+)
+def test_attachment_compiler_incompatibilities_fail_closed(tmp_path, arm_replacement, message):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    if arm_replacement.startswith("eulerseq") or arm_replacement.startswith("angle"):
+        arm.write_text(ATTACHMENT_ARM.replace('eulerseq="XYZ" angle="radian"', arm_replacement), encoding="utf-8")
+    else:
+        arm.write_text(
+            ATTACHMENT_ARM.replace(
+                '<compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian"/>', arm_replacement
+            ),
+            encoding="utf-8",
+        )
+    with pytest.raises(RuntimeError, match=message):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "asset_replacement",
+    [
+        '<texture name="tex" type="2d" builtin="checker"/>',
+        '<hfield name="hf" size="0 0 1 1 0.1"/>',
+    ],
+)
+def test_attachment_unsupported_asset_kinds_fail_closed(tmp_path, asset_replacement):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(
+        ATTACHMENT_ARM.replace('<mesh name="arm_base_mesh" file="arm_base.stl"/>', asset_replacement), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="unsupported asset kind"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_unnamed_default_content_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    # a default-attribute element directly under the main <default>
+    arm.write_text(
+        ATTACHMENT_ARM.replace(
+            '<default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>',
+            '<default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>\n    <geom rgba="1 0 0 1"/>',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="only named <default class> containers"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    # attributes on the main <default> itself
+    arm.write_text(ATTACHMENT_ARM.replace("<default>\n", '<default margin="0.01">\n', 1), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="main <default> carries attributes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_default_class_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    # renaming visual -> arm_visual collides with a host class of that name
+    host = tmp_path / "host.xml.template"
+    host.write_text(
+        ATTACHMENT_HOST.replace(
+            '<default class="wheel">',
+            '<default class="arm_visual">\n        <geom type="sphere" condim="1"/>\n      </default>\n      <default class="wheel">',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="prefixed default classes.*arm_visual"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "arm_replacement, kind, clash_name",
+    [
+        ('<body name="left_wheel" pos="0 0 0"/>', "body", "left_wheel"),
+        ('<joint name="wheel_7" type="hinge" axis="0 0 1"/>', "joint", "wheel_7"),
+        ('<geom name="wheel_7" type="box" size="0.01 0.01 0.01"/>', "geom", "wheel_7"),
+        ('<site name="host_site" pos="0 0 0"/>', "site", "host_site"),
+        ('<camera name="host_cam" pos="0 0 0"/>', "camera", "host_cam"),
+    ],
+)
+def test_attachment_worldbody_name_clashes_fail_closed(tmp_path, arm_replacement, kind, clash_name):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(
+        ATTACHMENT_ARM.replace(
+            '<body name="gripper" pos="0 0 0.1">',
+            f'{arm_replacement}\n      <body name="gripper" pos="0 0 0.1">',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=f"{kind} '{clash_name}' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_actuator_name_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM.replace('<position name="1"', '<position name="wheel_7"'), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="actuator 'wheel_7' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_asset_name_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM.replace('name="arm_base_mesh"', 'name="host_mesh"'), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="mesh 'host_mesh' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_chain_rejects_non_fixed_joints_and_missing_links(tmp_path):
+    profile = _attachment_files(tmp_path)
+    revolute = ATTACHMENT_URDF.replace(
+        '<joint name="base_joint" type="fixed">', '<joint name="base_joint" type="revolute">'
+    ).replace(
+        '</joint>\n  <joint name="1"',
+        '<axis xyz="0 0 1"/><limit effort="1" velocity="1"/></joint>\n  <joint name="1"',
+        1,
+    )
+    with pytest.raises(RuntimeError, match="non-fixed joint 'base_joint'"):
+        render_robot_mjcf(profile, urdf=revolute)
+    # a chain target the description does not declare fails naming it
+    attachment = dict(profile["simulation"]["mujoco"]["attachments"][0])
+    missing = {
+        **profile,
+        "simulation": {
+            "mujoco": {
+                **profile["simulation"]["mujoco"],
+                "attachments": [{**attachment, "urdf_child_link": "missing_link"}],
+            }
+        },
+    }
+    with pytest.raises(RuntimeError, match="link 'missing_link' has no parent joint"):
+        render_robot_mjcf(missing, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_missing_parent_and_root_bodies_fail_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    attachment = dict(profile["simulation"]["mujoco"]["attachments"][0])
+    profile = {
+        **profile,
+        "simulation": {
+            "mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**attachment, "parent_body": "nope"}]}
+        },
+    }
+    with pytest.raises(RuntimeError, match="parent body 'nope' not found"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    profile = {
+        **profile,
+        "simulation": {
+            "mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**attachment, "root_body": "nope"}]}
+        },
+    }
+    with pytest.raises(RuntimeError, match="root body 'nope' not found"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_profiles_without_attachments_render_identically_with_the_urdf_argument(tmp_path):
+    """Callers without attachments are unchanged (D2: byte-identical output)."""
+    template = tmp_path / "robot.xml.template"
+    template.write_text(MJCF_TEMPLATE.replace('name="base"', 'name="base_link"'), encoding="utf-8")
+    profile = {
+        "simulation": {"mujoco": {"template": str(template), "meshes_dir": str(tmp_path)}},
+        "peripherals": [_mid360()],
+    }
+    plain = render_robot_mjcf(profile)
+    with_urdf = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    assert Path(plain).read_text() == Path(with_urdf).read_text()
+
+
+def test_render_mujoco_description_sets_initial_values_from_reset_positions(tmp_path, monkeypatch):
+    """D4: the MuJoCo URDF carries the same initial_value (mujoco_ros2_control's
+    set_initial_pose reads it for qpos AND the actuators' ctrl)."""
+    profile = {**_profile(tmp_path, peripherals=[]), "hardware": {"reset_positions": {"1": 1.25}}}
+    monkeypatch.setattr("robot_runtime.mujoco.check_simulator_versions", lambda: None)
+    composed = tmp_path / "composed.mjb"
+    composed.write_bytes(b"")
+    monkeypatch.setattr("sim_models.scene_compiler.compose_mujoco_model", lambda *_a, **_k: composed)
+    urdf = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    assert '<param name="initial_value">1.25</param>' in urdf
+    assert urdf.count('name="initial_value"') == 1
+    # the composed model path replaced the placeholder exactly once (D2 render
+    # order: one xacro render, the path substituted into the same document)
+    assert "__ibrobot_mujoco_model_placeholder__" not in urdf
+    assert str(composed) in urdf
+    # without reset_positions the render carries no initial_value
+    plain = render_mujoco_description(_profile(tmp_path, peripherals=[]), tmp_path / "profile.yaml")
+    assert 'name="initial_value"' not in plain
+
+
+def test_render_robot_mjcf_skips_platform_excluded_peripherals(tmp_path):
+    """D3: a camera excluded on the MuJoCo platform is not injected into the
+    robot MJCF even though it stays enabled in the inventory."""
+    from robot_runtime.interface_description import platform_peripherals
+
+    excluded = {**WRIST, "simulation": {"mujoco": {"enabled": False}}}
+    peripherals = platform_peripherals([WRIST, excluded], "mujoco")
+    # the duplicate-free inventory keeps one wrist: the exclusion filters the
+    # entry that declares it; assert on distinct names instead
+    names = [entry["name"] for entry in peripherals]
+    assert names.count("wrist") == 1
+    profile = {
+        **_profile(tmp_path, peripherals=[]),
+        "peripherals": [{**WRIST, "simulation": {"mujoco": {"enabled": False}}}, TOP],
+    }
+    out = render_robot_mjcf(profile)
+    cameras = [camera.get("name") for camera in ET.parse(out).getroot().iter("camera")]
+    assert cameras == ["top_camera"]  # the excluded wrist is not injected

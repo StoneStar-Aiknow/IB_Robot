@@ -120,3 +120,43 @@ set with every robot package excluded and composes against the mock runtime.
 
 The latch clears only on `SetRuntimeMode("idle")`; after `TORQUE_OFF` the
 facade reactivates the hardware components before clearing.
+
+## Simulation platform behaviours (robot-agnostic)
+
+Three profile-level behaviours are part of this package's public surface and
+apply to every robot runtime, not only one robot:
+
+- **Per-platform peripheral exclusion (issue #205 D3).** A peripheral entry
+  may declare `simulation.<platform>.enabled: false` for a physics platform
+  (`gazebo`, `mujoco`). On that platform the device is not launched, not
+  simulated and not advertised (`/runtime_status`, the interface
+  description, capabilities); on hardware and `sdk` executions the key is
+  ignored and the inventory passes through. `simulation` and each
+  `simulation.<platform>` section must be a mapping when present — an
+  explicit `null` (or any non-mapping) is an error naming the peripheral
+  and the key, because through the layer merge it would silently erase the
+  base's exclusion flags and resurrect an excluded device. An exclusion
+  survives a same-driver deep merge, carries over a driver change, and is
+  lifted only by an explicit `simulation.<platform>.enabled: true`.
+- **MJCF attachments (issue #205 D2).** A profile's
+  `simulation.mujoco.attachments` merges sub-model MJCFs (e.g. an arm from
+  another package's template) into the host robot model under a named
+  parent body. The schema is validated at MJCF render time with unknown
+  keys as errors (the platform-neutral profile loader does not gate on it;
+  a bad attachment fails closed at the first render). The mount pose is the
+  rendered URDF's fixed-joint chain `urdf_parent_link → urdf_child_link`
+  relative to `parent_body` (the parent may be nested anywhere in the host
+  tree and must be uniquely named); the attachment's meshes and named
+  `<default>` classes are namespaced, every cross-model name clash is an
+  error, and the host's `<compiler>`/`<option>` govern. Cameras, lidars and
+  IMUs are injected after the merge, so a `parent_frame` may name an
+  attachment body. Profiles without attachments render byte-identical
+  output.
+- **Initial joint positions (issue #205 D4).** On both physics platforms
+  the render sets the ros2_control `initial_value` of the position state
+  interface for every joint in `hardware.reset_positions`, so the robot
+  spawns at — and, with `mujoco_ros2_control`, the position actuators'
+  `ctrl` also hold — the declared pose instead of zero. A reset joint
+  missing from ros2_control, a non-finite value or an existing
+  `initial_value` conflict is an error. Profiles without
+  `reset_positions`, and the hardware/`sdk` render paths, are unchanged.

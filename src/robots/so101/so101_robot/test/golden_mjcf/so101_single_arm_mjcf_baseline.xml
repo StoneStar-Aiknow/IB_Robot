@@ -1,0 +1,133 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="so101">
+  <compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian" />
+  <option gravity="0 0 -9.81" integrator="implicitfast" timestep="0.001" noslip_iterations="20" cone="elliptic">
+    <flag contact="enable" />
+  </option>
+  <asset>
+    <material name="mat_robot" specular="0.10" shininess="0.03" />
+    <mesh name="base_motor_holder" file="base_motor_holder_so101_v1.stl" />
+    <mesh name="base_so101" file="base_so101_v2.stl" />
+    <mesh name="sts3215" file="sts3215_03a_v1.stl" />
+    <mesh name="waveshare" file="waveshare_mounting_plate_so101_v2.stl" />
+    <mesh name="motor_holder_base" file="motor_holder_so101_base_v1.stl" />
+    <mesh name="rotation_pitch" file="rotation_pitch_so101_v1.stl" />
+    <mesh name="upper_arm_mesh" file="upper_arm_so101_v1.stl" />
+    <mesh name="under_arm_mesh" file="under_arm_so101_v1.stl" />
+    <mesh name="motor_holder_wrist" file="motor_holder_so101_wrist_v1.stl" />
+    <mesh name="sts3215_no_horn" file="sts3215_03a_no_horn_v1.stl" />
+    <mesh name="wrist_roll_pitch" file="wrist_roll_pitch_so101_v2.stl" />
+    <mesh name="wrist_roll_follower" file="wrist_roll_follower_so101_v1.stl" />
+    <mesh name="wrist_roll_follower_col_0" file="wrist_roll_follower_col_0.stl" />
+    <mesh name="wrist_roll_follower_col_1" file="wrist_roll_follower_col_1.stl" />
+    <mesh name="wrist_roll_follower_col_2" file="wrist_roll_follower_col_2.stl" />
+    <mesh name="wrist_roll_follower_col_3" file="wrist_roll_follower_col_3.stl" />
+    <mesh name="wrist_roll_follower_col_4" file="wrist_roll_follower_col_4.stl" />
+    <mesh name="wrist_roll_follower_col_5" file="wrist_roll_follower_col_5.stl" />
+    <mesh name="wrist_roll_follower_col_6" file="wrist_roll_follower_col_6.stl" />
+    <mesh name="wrist_roll_follower_col_7" file="wrist_roll_follower_col_7.stl" />
+    <mesh name="moving_jaw" file="moving_jaw_so101_v1.stl" />
+    <mesh name="moving_jaw_col_0" file="moving_jaw_col_0.stl" />
+    <mesh name="moving_jaw_col_1" file="moving_jaw_col_1.stl" />
+    <mesh name="moving_jaw_col_2" file="moving_jaw_col_2.stl" />
+    <mesh name="moving_jaw_col_3" file="moving_jaw_col_3.stl" />
+    <mesh name="moving_jaw_col_4" file="moving_jaw_col_4.stl" />
+    <mesh name="moving_jaw_col_5" file="moving_jaw_col_5.stl" />
+    <mesh name="moving_jaw_col_6" file="moving_jaw_col_6.stl" />
+    <mesh name="moving_jaw_col_7" file="moving_jaw_col_7.stl" />
+  </asset>
+  <default>
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="1" rgba="0.86 0.60 0.17 1" material="mat_robot" />
+    </default>
+    <default class="collision">
+      <geom contype="1" conaffinity="1" group="0" rgba="0 0 0 0" />
+      <default class="gripper_col">
+        <geom friction="10.0 1.0 0.05" condim="4" solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1" />
+      </default>
+    </default>
+  </default>
+  <worldbody>
+    <geom type="plane" size="1 1 0.01" rgba="0 0 0 0" contype="0" conaffinity="0" />
+    <body name="base" pos="0.000000 0.000000 0.000000" quat="1.000000 0.0 0.0 0.000000">
+      <inertial pos="0.020739 0.00204287 0.065966" mass="0.147" fullinertia="0.000136117 0.000114686 0.000130364 4.59787e-07 9.75275e-08 -4.97151e-06" />
+      <geom class="collision" type="box" size="0.055 0.04 0.055" pos="0.02 0.02 0.055" />
+      <geom class="visual" type="mesh" mesh="base_motor_holder" pos="0.0206915 0.0221255 0.0300817" euler="1.5708 0 0" />
+      <geom class="visual" type="mesh" mesh="base_so101" pos="0.0207909 0.0221255 0.0300817" euler="1.5708 0 0" />
+      <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="0.0207909 -0.0105745 0.0761817" euler="0 0 -1.5708" />
+      <geom class="visual" type="mesh" mesh="waveshare" pos="0.0205915 0.0467435 0.0798817" euler="1.5708 0 0" />
+      <body name="shoulder" pos="0.0207909 -0.0230745 0.0948817" euler="-3.14159 0 1.5708">
+        <joint name="1" type="hinge" axis="0 0 1" range="-2.0693 2.0709" damping="1.5" armature="0.005" />
+        <inertial pos="-0.0307604 -1.66727e-05 -0.0252713" mass="0.100006" fullinertia="8.3759e-05 8.10403e-05 2.39783e-05 7.55525e-08 -1.16342e-06 1.54663e-07" />
+        <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="-0.0303992 0.000422241 -0.0417" euler="1.5708 1.5708 0" />
+        <geom class="visual" type="mesh" mesh="motor_holder_base" pos="-0.0675992 -0.000177759 0.0158499" euler="1.5708 -1.5708 0" />
+        <geom class="visual" type="mesh" mesh="rotation_pitch" pos="0.0122008 2.22413e-05 0.0464" euler="-1.5708 0 0" />
+        <body name="upper_arm" pos="-0.0303992 -0.0182778 -0.0542" euler="-1.5708 -1.5708 0">
+          <joint name="2" type="hinge" axis="0 0 1" range="-1.92 1.92" damping="1.5" armature="0.005" />
+          <inertial pos="-0.0898471 -0.00838224 0.0184089" mass="0.103" fullinertia="4.08002e-05 0.000147318 0.000142487 -1.97819e-05 -4.03016e-08 8.97326e-09" />
+          <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="-0.11257 -0.0155 0.0187" euler="-3.14159 0 -1.5708" />
+          <geom class="visual" type="mesh" mesh="upper_arm_mesh" pos="-0.065085 0.012 0.0182" euler="3.14159 0 0" />
+          <body name="lower_arm" pos="-0.11257 -0.028 0" euler="0 0 1.5708">
+            <joint name="3" type="hinge" axis="0 0 1" range="-1.6813 1.6828" damping="1.5" armature="0.005" />
+            <inertial pos="-0.0980701 0.00324376 0.0182831" mass="0.104" fullinertia="2.87438e-05 0.000159844 0.00014529 7.41152e-06 1.26409e-06 -4.90188e-08" />
+            <geom class="visual" type="mesh" mesh="under_arm_mesh" pos="-0.0648499 -0.032 0.0182" euler="-3.14159 0 0" />
+            <geom class="visual" type="mesh" mesh="motor_holder_wrist" pos="-0.0648499 -0.032 0.018" euler="-3.14159 0 0" />
+            <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="-0.1224 0.0052 0.0187" euler="-3.14159 0 -3.14159" />
+            <body name="wrist" pos="-0.1349 0.0052 0" euler="0 0 -1.5708">
+              <joint name="4" type="hinge" axis="0 0 1" range="-1.65806 1.65806" damping="1.5" armature="0.005" />
+              <inertial pos="-0.000103312 -0.0386143 0.0281156" mass="0.079" fullinertia="3.68263e-05 2.5391e-05 2.1e-05 1.7893e-08 -5.28128e-08 3.6412e-06" />
+              <geom class="visual" type="mesh" mesh="sts3215_no_horn" rgba="0.1 0.1 0.1 1" pos="0 -0.0424 0.0306" euler="1.5708 1.5708 0" />
+              <geom class="visual" type="mesh" mesh="wrist_roll_pitch" pos="0 -0.028 0.0181" euler="-1.5708 -1.5708 0" />
+              <body name="gripper" pos="0 -0.0611 0.0181" euler="1.5708 0 3.14159">
+                <joint name="5" type="hinge" axis="0 0 1" range="-2.9115 2.9115" damping="1.5" armature="0.005" />
+                <inertial pos="0.000213627 0.000245138 -0.025187" mass="0.087" fullinertia="2.75087e-05 4.33657e-05 3.45059e-05 -3.35241e-07 -5.7352e-06 -5.17847e-08" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_0" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_1" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_2" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_3" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_4" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_5" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_6" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_7" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="0.0077 0.0001 -0.0234" euler="-1.5708 0 0" />
+                <geom class="visual" type="mesh" mesh="wrist_roll_follower" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <body name="jaw" pos="0.0202 0.0188 -0.0234" euler="1.5708 0.209440 0.000001">
+                  <joint name="6" type="hinge" axis="0 0 1" range="0.0 1.0" damping="1.5" armature="0.028" frictionloss="0.052" />
+                  <inertial pos="-0.00157495 -0.0300244 0.0192755" mass="0.012" fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_0" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_1" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_2" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_3" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_4" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_5" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_6" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_7" pos="0 0 0.0189" euler="0 0 0" />
+                  <geom class="visual" type="mesh" mesh="moving_jaw" pos="0 0 0.0189" euler="0 0 0" />
+                </body>
+                <camera name="wrist_camera" pos="0.002265 0.073023 -0.016289" euler="0.031197 -0.490648 -1.607245" fovy="46.000000" resolution="640 480" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <camera name="front_camera" pos="0.000000 -0.280000 0.550000" euler="0.000000 0.000000 3.141500" fovy="70.000000" resolution="640 480" />
+    </body>
+    <camera name="top_camera" pos="0.041900 0.112300 0.613600" euler="0.052274 0.003013 3.136436" fovy="47.000000" resolution="640 480" />
+  </worldbody>
+  <contact>
+    <exclude body1="base" body2="shoulder" />
+    <exclude body1="shoulder" body2="upper_arm" />
+    <exclude body1="upper_arm" body2="lower_arm" />
+    <exclude body1="lower_arm" body2="wrist" />
+    <exclude body1="wrist" body2="gripper" />
+    <exclude body1="gripper" body2="jaw" />
+  </contact>
+  <actuator>
+    <position name="1" joint="1" kp="998.22" dampratio="1.0" ctrlrange="-2.0693 2.0709" forcerange="-2.75 2.75" />
+    <position name="2" joint="2" kp="998.22" dampratio="1.0" ctrlrange="-1.92 1.92" forcerange="-2.75 2.75" />
+    <position name="3" joint="3" kp="998.22" dampratio="1.0" ctrlrange="-1.6813 1.6828" forcerange="-2.75 2.75" />
+    <position name="4" joint="4" kp="998.22" dampratio="1.0" ctrlrange="-1.65806 1.65806" forcerange="-2.75 2.75" />
+    <position name="5" joint="5" kp="998.22" dampratio="1.0" ctrlrange="-2.9115 2.9115" forcerange="-2.75 2.75" />
+    <position name="6" joint="6" kp="748.66" kv="5.5" ctrlrange="0.0 1.0" forcerange="-2.75 2.75" />
+  </actuator>
+</mujoco>

@@ -1308,3 +1308,46 @@ def test_scan_converter_composition_matrix(tmp_path):
     assert len(converters) == 1
     assert _params(converters[0])["use_sim_time"] is True
     assert converters[0]._Node__node_name == "mid360_pointcloud_to_laserscan"
+
+
+# ---------------------------------------------------------------------------
+# Initial joint positions on the physics platforms (D4)
+# ---------------------------------------------------------------------------
+
+
+def test_render_gazebo_description_sets_initial_values_from_reset_positions(tmp_path):
+    """D4: each joint in hardware.reset_positions carries the initial_value on
+    its position state interface; profiles without reset_positions render
+    byte-identical; the hardware/SDK render never gains it."""
+    from robot_runtime.launch_support import render_robot_description
+
+    profile = _profile(tmp_path)
+    without = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="initial_value"' not in without
+
+    with_reset = {**profile, "hardware": {"reset_positions": {"1": -1.5854}}}
+    gz = render_gazebo_description(with_reset, tmp_path / "robot.xacro")
+    assert '<param name="initial_value">-1.5854</param>' in gz
+    assert gz.count('name="initial_value"') == 1
+    # the plain state interface spelling is gone on that joint only
+    assert (
+        '<state_interface name="position">\n          <param name="initial_value">-1.5854</param>\n        </state_interface>'
+        in gz
+    )
+
+    # the hardware/SDK render is untouched
+    hardware = render_robot_description(with_reset, tmp_path / "robot.xacro", simulated=False)
+    assert 'name="initial_value"' not in hardware
+
+
+def test_render_gazebo_description_skips_platform_excluded_peripherals(tmp_path):
+    """D3: a peripheral excluded on the platform is not simulated (no sensor,
+    no links) even though it stays enabled in the inventory."""
+    excluded = {
+        **FRONT,
+        "simulation": {"gazebo": {"enabled": False}, "mujoco": {"enabled": False}},
+    }
+    profile = _profile(tmp_path, [TOP, excluded])
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="front_camera"' not in urdf and 'link name="camera_front_link"' not in urdf
+    assert 'name="top_camera"' in urdf  # the non-excluded camera still simulates

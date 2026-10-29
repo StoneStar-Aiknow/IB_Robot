@@ -58,6 +58,32 @@ TARGET_PROFILE = os.environ.get("CONFORMANCE_PROFILE", "").strip()
 STARTUP_TIMEOUT_S = float(os.environ.get("CONFORMANCE_STARTUP_TIMEOUT", "30"))
 
 
+def _parse_required_set(raw: str) -> list[str]:
+    return [entry.strip() for entry in (raw or "").split(",") if entry.strip()]
+
+
+#: Acceptance runs pin the surface the session must prove (lekiwi-nav-grasp
+#: D6): a comma-separated capability / interface-ID list whose missing
+#: entries fail the whole session before any case runs, and whose required
+#: capabilities turn case-level skips into failures.
+REQUIRED_CAPABILITIES = _parse_required_set(os.environ.get("IBROBOT_CONFORMANCE_REQUIRED_CAPABILITIES", ""))
+REQUIRED_INTERFACES = _parse_required_set(os.environ.get("IBROBOT_CONFORMANCE_REQUIRED_INTERFACES", ""))
+
+
+def required_surface_failures(capabilities, interface_keys) -> dict[str, list[str]]:
+    """The required entries the runtime under test does not provide (D6).
+
+    ``capabilities`` is the RuntimeStatus capability set; ``interface_keys``
+    are the interface description's ``interfaces`` keys. A green acceptance
+    run must prove the cases ran, so a missing required entry is a session
+    failure, not a skip.
+    """
+    return {
+        "capabilities": [name for name in REQUIRED_CAPABILITIES if name not in set(capabilities)],
+        "interfaces": [name for name in REQUIRED_INTERFACES if name not in set(interface_keys)],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -184,7 +210,22 @@ class Harness(Node):
         assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, (
             f"[Conformance start pose] reset error_code {result.result.error_code}: {result.result.error_string}"
         )
+        # The JTC reports success when ITS tolerances are met, but a platform
+        # whose position interface is a proportional-velocity servo (gz
+        # Ros2Control on Gazebo, lekiwi-nav-grasp D5) still carries a
+        # tracking lag of about velocity x 0.1 s at that instant — measured:
+        # joint 2 0.094 rad short of the start pose right at "Goal reached"
+        # after a 1.8 rad/s reset ramp. The motion-server path already waits
+        # out this lag behind its feedback barrier; the direct-JTC reset
+        # path polls for the settle instead of sampling at the result. The
+        # 0.05 rad arrival threshold is unchanged.
         after = self.positions()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and any(
+            abs(after[joint] - target) >= 0.05 for joint, target in zip(joints, targets, strict=True)
+        ):
+            self.spin_for(0.1)
+            after = self.positions()
         for joint, target in zip(joints, targets, strict=True):
             assert abs(after[joint] - target) < 0.05, (
                 f"[Conformance start pose] joint {joint} at {after[joint]:.3f}, start {target:.3f}"
@@ -284,6 +325,14 @@ def harness(target, profile) -> Harness:
         STARTUP_TIMEOUT_S,
         f"runtime lifecycle ACTIVE on {C.STATUS_TOPIC}",
     )
+    # D6 (lekiwi-nav-grasp): with required sets declared, the session fails
+    # before any case runs when an entry is missing — a green run must prove
+    # the cases executed, and a required case may never skip.
+    if REQUIRED_CAPABILITIES or REQUIRED_INTERFACES:
+        interface_keys = set(json.loads(node.status().interface_description_json)["interfaces"])
+        failures = required_surface_failures(node.capabilities(), interface_keys)
+        if any(failures.values()):
+            pytest.fail(f"required conformance surface missing: {failures}", pytrace=False)
     yield node
     node.destroy_node()
 
@@ -305,8 +354,14 @@ def arm_targets(harness: Harness, before: dict[str, float], deltas: dict[str, fl
 
 def requires(harness: Harness, *capabilities: str):
     missing = [c for c in capabilities if c not in harness.capabilities()]
-    if missing:
-        pytest.skip(f"runtime does not declare {missing}")
+    if not missing:
+        return
+    # a REQUIRED capability may never skip: the acceptance run must fail, not
+    # quietly lose the case (D6)
+    required = [c for c in missing if c in REQUIRED_CAPABILITIES]
+    if required:
+        pytest.fail(f"required capability missing: {required}")
+    pytest.skip(f"runtime does not declare {missing}")
 
 
 def _mode_named(harness: Harness, flag: str, default: str) -> str:
@@ -803,6 +858,7 @@ def _base_mode(harness: Harness) -> str:
 
 def test_base_velocity_honored_and_odometry_integrates(harness: Harness):
     requires(harness, "base.cmd_vel", "base.odom")
+    harness.reset_to_start_pose()  # D7: every base case starts stowed
     assert harness.set_mode(_base_mode(harness)).success
     if "base.navigation_gate" in harness.capabilities():
         assert harness.call("nav_enable", SetBool.Request(data=True)).success
@@ -818,6 +874,7 @@ def test_base_velocity_honored_and_odometry_integrates(harness: Harness):
 
 def test_base_stale_velocity_stops(harness: Harness):
     requires(harness, "base.cmd_vel", "base.odom")
+    harness.reset_to_start_pose()  # D7: every base case starts stowed
     staleness = float(harness.params("base.cmd_vel").get("staleness_s", 0.3))
     assert harness.set_mode(_base_mode(harness)).success
     if "base.navigation_gate" in harness.capabilities():
@@ -834,6 +891,7 @@ def test_base_stale_velocity_stops(harness: Harness):
 
 def test_navigation_gate_enable_clears_and_disable_rejects(harness: Harness):
     requires(harness, "base.cmd_vel", "base.navigation_gate")
+    harness.reset_to_start_pose()  # D7: every base case starts stowed
     assert harness.set_mode(_base_mode(harness)).success
     acks: list[bool] = []
     sub = harness.create_subscription(
