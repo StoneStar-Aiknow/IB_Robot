@@ -10,6 +10,9 @@ message libraries.
 
 The migration is incremental; this README records what has landed.
 
+To deploy the X2 `pick_object` skill and call it, see
+[the X2 grasp skill guide](../../../../docs/aimdk_x2_grasp_skill.md).
+
 ## Robot feedback
 
 `aimdk_grasp.feedback` assembles the joint pose at an image time from the three
