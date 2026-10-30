@@ -1,0 +1,19 @@
+# Standalone simulation only. Names resolve against the server's config directory.
+string controller
+string motion
+# True resets for a new policy or replay; false resumes the same selection or uses
+# transition_from_current for a guarded no-reset handoff.
+bool reset_before_start
+# Guarded no-reset handoff; requires reset_before_start=false. It preserves MjData.
+bool transition_from_current
+# BMIMIC: 0 (configured frame interval). Velocity: finite duration in (0, 3600].
+float64 duration_s
+---
+bool success
+string message
+uint64 completed_steps
+---
+# preparing | running | paused
+string state
+uint64 completed_steps
+uint64 total_steps

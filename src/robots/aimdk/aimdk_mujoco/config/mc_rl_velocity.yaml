@@ -1,0 +1,4 @@
+# Matches the AimDK extra/mc-rl 500-observation / 29-action policy only.
+# Weight path is relative to the assets directory, not this configuration.
+controller: mc_rl_velocity
+policy: policy.onnx

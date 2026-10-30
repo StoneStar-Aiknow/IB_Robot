@@ -115,6 +115,7 @@ SO-101 默认配置使用 Robot Runtime，应用入口的 `use_sim:=true` 对应
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
 | [`src/robots/so101/so101_motion/README.md`](src/robots/so101/so101_motion/README.md) | SO-101 运动服务（motion_server / Placo servo / IK workers）与 headless 启动方式 |
+| [`src/robots/aimdk/aimdk_mujoco/README.md`](src/robots/aimdk/aimdk_mujoco/README.md) | X2 独立 MuJoCo 仿真、速度验证与真实权重的有界无重置 Action 交接验收，不连接真机 |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
 
 ### 一、Ubuntu 模拟运行场景

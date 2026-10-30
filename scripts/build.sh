@@ -42,7 +42,7 @@ Options:
   --agent                  Build the agent stack plus its base dependencies
   --so101                  Build the SO-101 robot plus its base dependencies
   --lekiwi                 Build the LeKiwi robot plus its base dependencies
-  --aimdk                  Build the AgiBot X2 (AimDK) robot plus its base dependencies
+  --aimdk                  Build the AgiBot X2 runtime and standalone MuJoCo simulation plus base dependencies
   --unitree                Build the Unitree G1 robot plus its base dependencies
   --rosclaw                Build rosclaw plus its base dependencies
   --list-groups            Resolve and list group members, then exit
@@ -57,6 +57,7 @@ packages it depends on:
   ./scripts/build.sh --so101                  # SO-101 + base
   ./scripts/build.sh --base --agent --lekiwi  # LeKiwi complete content
   ./scripts/build.sh --agent                  # Agent stack + base
+  ./scripts/build.sh --aimdk                  # X2 runtime + standalone MuJoCo + base
 Group flags cannot be combined with --this or explicit --packages-*
 selections passed after "--".
 
@@ -273,8 +274,9 @@ declare -A GROUP_PATHS=(
     [agent]="agent embodied_common"
     [so101]="robots/so101 robots/feetech"
     [lekiwi]="robots/lekiwi robots/feetech robot_navigation fast_calib fast_lio livox_ros_driver2"
-    # The X2 runtime additionally needs the vendor AimDK overlay on the ROS 2
-    # path (aimdk_msgs is not vendored here); see the aimdk_robot README.
+    # Includes aimdk_robot and the independent aimdk_mujoco simulation.
+    # Only the X2 runtime needs the vendor AimDK overlay (aimdk_msgs);
+    # see the aimdk_robot README. Simulation assets are prepared separately.
     [aimdk]="robots/aimdk"
     # The G1's vendor messages (unitree_hg/unitree_go/unitree_api) and robot
     # description are vendored under robots/unitree, so unlike aimdk no

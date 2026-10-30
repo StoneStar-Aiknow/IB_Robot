@@ -99,6 +99,9 @@ openEuler 一侧本机有 ascend-vm 时在 ascend-vm 虚拟机中验证，否则
 - 删测试前先判断被测行为是否仍然存在；删除时在 commit message 写明覆盖面去向（先例：`src/inference_service/tests/LEGACY_COVERAGE.md`）。
 - AI 生成的测试按草稿对待：断言行为而非结构、真在 `colcon test` 下跑过、API 确实存在、不与既有测试重复。
 
+X2 独立 MuJoCo 的真实权重交接验收使用 `python -m aimdk_mujoco.verify_handoff --assets <目录> --report <JSON>`，
+详见该包 README；仅首个舞蹈 goal 重置，后续交接不重置，不连接真机、不复制权重，不能替代步态验收。
+
 ## 关键约定
 
 ### 环境初始化

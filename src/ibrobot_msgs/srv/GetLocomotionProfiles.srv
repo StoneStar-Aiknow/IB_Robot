@@ -1,0 +1,7 @@
+# Read the platform's current and available speed profiles; does not change mode.
+---
+bool success
+string message
+LocomotionProfile current
+string[] names
+LocomotionProfile[] profiles

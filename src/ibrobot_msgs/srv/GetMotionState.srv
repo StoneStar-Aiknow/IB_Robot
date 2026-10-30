@@ -1,0 +1,8 @@
+# Query the platform, rather than the runtime's locally selected mode.
+---
+bool success
+string message
+string action_name
+# Raw platform action/status identifiers; no cross-platform numeric semantics.
+int32 action_id
+int32 action_status
