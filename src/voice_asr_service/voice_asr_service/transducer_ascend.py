@@ -3,7 +3,7 @@
 sherpa-onnx has no Ascend path for streaming transducers, so the ``ascend`` ASR deployment
 reimplements the sherpa ``OnlineRecognizer`` pipeline around the NPU encoder:
 
-* features: kaldi fbank identical to sherpa (80 bins, 25/10 ms Povey frames, snip_edges=False,
+* features: the shared kaldi fbank (``kaldi_fbank``), identical to sherpa (80 bins, 25/10 ms Povey frames, snip_edges=False,
   dither 0, preemphasis 0.97, DC removal, mel range [20, 8000-400] Hz, samples in [-1, 1]);
 * encoder: static OM taking ``T`` frames and advancing ``decode_chunk_len``; its cached states
   stay on the device in two ping-pong dataset banks (same pattern as SileroVadAclRunner), only
@@ -19,43 +19,14 @@ from pathlib import Path
 
 import numpy as np
 
-FBANK_SAMPLE_RATE = 16000
-_FRAME_LEN = 400
-_FRAME_SHIFT = 160
-_NUM_BINS = 80
-_FFT = 512
-_EPS = float(np.finfo(np.float32).eps)
-
-
-def _mel(freq):
-    return 1127.0 * np.log(1.0 + freq / 700.0)
-
-
-def _mel_banks() -> np.ndarray:
-    low, high = 20.0, FBANK_SAMPLE_RATE / 2 - 400.0
-    mel_low, mel_high = _mel(low), _mel(high)
-    delta = (mel_high - mel_low) / (_NUM_BINS + 1)
-    freqs = np.arange(_FFT // 2 + 1) * FBANK_SAMPLE_RATE / _FFT
-    mel_freqs = _mel(freqs)
-    banks = np.zeros((_NUM_BINS, _FFT // 2 + 1), dtype=np.float32)
-    for index in range(_NUM_BINS):
-        left, center, right = (mel_low + (index + offset) * delta for offset in range(3))
-        weights = np.maximum(
-            0.0, np.minimum((mel_freqs - left) / (center - left), (right - mel_freqs) / (right - center))
-        )
-        weights[(freqs < low) | (freqs > high)] = 0.0
-        banks[index] = weights
-    return banks
-
+from voice_asr_service.kaldi_fbank import FRAME_LENGTH, FRAME_SHIFT, log_mel_frames, num_frames
+from voice_asr_service.kaldi_fbank import SAMPLE_RATE as FBANK_SAMPLE_RATE
 
 # Manifest semantics of the encoder OM bindings (written by package_sherpa_asr_bundle).
 ENCODER_FEATURES_SEMANTIC = "host.asr.encoder.features"
 ENCODER_OUT_SEMANTIC = "host.asr.encoder.out"
 ENCODER_STATE_IN_PREFIX = "host.asr.encoder.state_in."
 ENCODER_STATE_OUT_PREFIX = "host.asr.encoder.state_out."
-
-_BANKS = _mel_banks()
-_WINDOW = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(_FRAME_LEN) / (_FRAME_LEN - 1))) ** 0.85
 
 
 class OnlineFbank:
@@ -80,32 +51,20 @@ class OnlineFbank:
             raise RuntimeError("fbank input already finished")
         self._samples = np.concatenate([self._samples, np.asarray(samples, dtype=np.float64).reshape(-1)])
         n = len(self._samples)
-        ready = (n - (_FRAME_LEN - _FRAME_LEN // 2 + _FRAME_SHIFT // 2)) // _FRAME_SHIFT + 1 if n >= 280 else 0
+        ready = (n - (FRAME_LENGTH - FRAME_LENGTH // 2 + FRAME_SHIFT // 2)) // FRAME_SHIFT + 1 if n >= 280 else 0
         self._compute(ready)
 
     def input_finished(self) -> None:
         self._finished = True
-        self._compute((len(self._samples) + _FRAME_SHIFT // 2) // _FRAME_SHIFT)
+        self._compute(num_frames(len(self._samples)))
 
     def frames(self, start: int, count: int) -> np.ndarray:
         return np.stack(self._frames[start : start + count])
 
     def _compute(self, ready: int) -> None:
         first = len(self._frames)
-        if ready <= first:
-            return
-        n = len(self._samples)
-        starts = np.arange(first, ready) * _FRAME_SHIFT + _FRAME_SHIFT // 2 - _FRAME_LEN // 2
-        index = starts[:, None] + np.arange(_FRAME_LEN)[None, :]
-        index = np.where(index < 0, -index - 1, index)
-        index = np.where(index >= n, 2 * n - index - 1, index)
-        frames = self._samples[index]
-        frames = frames - frames.mean(axis=1, keepdims=True)
-        frames[:, 1:] -= 0.97 * frames[:, :-1].copy()
-        frames[:, 0] -= 0.97 * frames[:, 0]
-        frames *= _WINDOW
-        energies = (np.abs(np.fft.rfft(frames, n=_FFT)) ** 2).astype(np.float32) @ _BANKS.T
-        self._frames.extend(np.log(np.maximum(energies, _EPS)).astype(np.float32))
+        if ready > first:
+            self._frames.extend(log_mel_frames(self._samples, first, ready - first))
 
 
 class ZipformerEncoderAclRunner:
