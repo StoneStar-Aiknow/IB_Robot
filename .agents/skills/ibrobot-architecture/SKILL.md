@@ -90,7 +90,7 @@ Model deployments are **bundles described by a schema-v3 `inference_manifest.jso
 | `hisilicon` | act policy | SD3403 worker |
 | `rknn` | act/smolvla | RKNNLite on RK3588 |
 | `hmm` | pi05/smolvla | TCIM on xh2/lq50/m50 |
-| `onnx` | fullsubnet/silero_vad/speech_direction | onnxruntime |
+| `onnx` | fullsubnet/silero_vad/speech_direction/campplus | onnxruntime |
 
 Runtime layering (package `inference_service`):
 
@@ -146,7 +146,7 @@ src/
 ├── robot_navigation/        # Nav2 client, navigation_command_server, chassis bridge
 ├── robot_runtime/           # Runtime contract: RuntimeStatus, capabilities, interface description, mock runtime
 ├── robot_teleop/            # Teleop bridges (50 Hz), glove/VR/mhandpro sources
-├── voice_asr_service/       # sherpa-onnx ASR + speech direction nodes
+├── voice_asr_service/       # sherpa-onnx ASR + speech direction + speaker ID nodes
 ├── voice_tts_service/       # Manifest-backed ZipVoice TTS typed service
 ├── robots/so101/            # SO-101 runtime suite: so101_sdk, so101_hardware, so101_description, so101_motion, so101_suite, so101_robot
 ├── robots/feetech/          # feetech_sdk (pinned Feetech servo SDK)

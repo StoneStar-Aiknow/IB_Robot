@@ -289,6 +289,11 @@ class OnnxRuntimeModelSession(ModelSession):
 
     def _session_options(self, ort: Any, profile: ONNXRuntimeProfile) -> Any:
         options = ort.SessionOptions()
+        if profile.intra_op_num_threads is not None:
+            # The deployment's own thread budget; ONNX Runtime's default is
+            # otherwise one thread per core, which on a shared board competes
+            # with whatever else is running.
+            options.intra_op_num_threads = int(profile.intra_op_num_threads)
         level = profile.optimization_level
         if level is None:
             return options

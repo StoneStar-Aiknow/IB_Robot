@@ -115,12 +115,17 @@ socket、资源句柄都会被拒绝。请求契约不包含 stream admission �
 | ZipVoice | `tensor_model` | `zipvoice` | `synthesize` |
 | FullSubNet | `tensor_model` | `fullsubnet` | `enhance` |
 | Silero VAD | `tensor_model` | `silero_vad` | `vad` |
+| CAM++ 声纹 | `tensor_model` | `campplus` | `embed` |
 
 ## 类型化 Runtime Profile
 
 单模型部署使用一个 `runtime_profile`；组合部署按 role 使用 `role_runtime_profiles` 条目。
 Profile 是类型化的，分别暴露部署投影与 runtime 实例投影。Ascend profile 只包含
 `device_id`；ACL 初始化使用注入的进程 provider，manifest 不再携带任何运行时 ACL 配置路径。
+ONNX profile 的部署字段是 `provider`、`optimization_level` 与可选的 `intra_op_num_threads`
+（单个算子内的线程数，正整数；不填即 ONNX Runtime 默认）。线程数属于部署而非主机：消费者有时延
+预算的模型（声纹须早于对应转写发布）在哪台主机上跑都需要同样的线程数。它因此参与 deployment
+fingerprint；需要跨部署比较的输出身份应取自 `semantic_identity`，而不是 fingerprint。
 
 `ValidatedDeployment` 是加载器的不可变快照，包含已解析的 artifact 句柄、role 绑定、语义
 契约、完整性状态、可移植的 deployment fingerprint，以及独立的完整 runtime profile /

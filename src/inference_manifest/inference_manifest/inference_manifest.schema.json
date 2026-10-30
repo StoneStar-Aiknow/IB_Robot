@@ -236,6 +236,7 @@
         "worker_socket": {"$ref": "#/$defs/non_empty_string"},
         "provider": {"$ref": "#/$defs/non_empty_string"},
         "optimization_level": {"$ref": "#/$defs/non_empty_string"},
+        "intra_op_num_threads": {"type": "integer", "exclusiveMinimum": 0},
         "engine_version": {"$ref": "#/$defs/non_empty_string"}
       }
     },
