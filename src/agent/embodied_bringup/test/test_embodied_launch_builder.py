@@ -689,7 +689,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
     assert params["presentation_timeout_sec"] == 12.0
 
 
-def _voice_bridge_nodes(enabled: bool, **voice_bridge):
+def _voice_bridge_nodes(enabled: bool, *, voice_asr_extra=None, **voice_bridge):
     agent = {
         "enabled": True,
         "incubation": True,
@@ -703,7 +703,7 @@ def _voice_bridge_nodes(enabled: bool, **voice_bridge):
     }
     robot = {
         "name": "so101_single_arm",
-        "voice_asr": {"enabled": True, "output_topic": "/asr/final_text"},
+        "voice_asr": {"enabled": True, "output_topic": "/asr/final_text", **(voice_asr_extra or {})},
         "embodied": {"enabled": True, "entry_mode": "agent", "agent": agent},
     }
     nodes = generate_embodied_nodes(robot, active_control_mode="moveit_planning", use_sim=False)
@@ -1554,3 +1554,93 @@ def test_resident_cli_bridge_executable_comes_from_the_robot_skill_cli_prefix(mo
 
     monkeypatch.setattr(builder, "get_package_prefix", missing)
     assert builder._resident_cli_bridge_executable() is None
+
+
+def test_voice_bridge_forwards_the_addressee_gate_when_configured():
+    """The gate is opt-in, so launch forwards it only when the YAML sets it."""
+    nodes = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀", "灵犀"], wake_window_sec=12.0)
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert json.loads(json.loads(params["wake_phrases_json"].strip())) == ["灵犀灵犀", "灵犀"]
+    assert float(params["wake_window_sec"]) == 12.0
+
+
+def test_voice_bridge_forwards_the_voiceprint_check_when_configured():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+        speaker_min_similarity=0.62,
+        speaker_max_age_sec=2.0,
+        speaker_merge_margin=0.15,
+        speaker_reject_short=True,
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert params["speaker_check_enabled"] is True
+    assert float(params["speaker_min_similarity"]) == 0.62
+    assert float(params["speaker_max_age_sec"]) == 2.0
+    assert float(params["speaker_merge_margin"]) == 0.15
+    assert params["speaker_reject_short"] is True
+    assert _decode_launch_string(params["speaker_embedding_topic"]) == "/voice/speaker_embedding"
+
+
+def test_voice_bridge_listens_where_the_voiceprint_producer_publishes():
+    """The bridge's topic is derived from voice_asr.speaker_embedding, never configured twice."""
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={"speaker_embedding": {"enabled": True, "output_topic": "/x2/voiceprint"}},
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert _decode_launch_string(params["speaker_embedding_topic"]) == "/x2/voiceprint"
+
+
+def test_voice_bridge_forwards_the_vendor_session_trigger_when_configured():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        addressee_trigger="vendor_session",
+        session_gap_sec=15.0,
+        speaker_check_enabled=True,
+        # As bind_robot_interfaces leaves it: the endpoint comes from the runtime description.
+        wake_event={
+            "interface": "audio.wake_event",
+            "type": "ibrobot_msgs/msg/SpeechWakeEvent",
+            "topic": "/x2/wake_event",
+            "_interface_source": {"id": "audio.wake_event"},
+        },
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert _decode_launch_string(params["addressee_trigger"]) == "vendor_session"
+    assert float(params["session_gap_sec"]) == 15.0
+    assert _decode_launch_string(params["wake_event_topic"]) == "/x2/wake_event"
+    assert params["speaker_check_enabled"] is True
+
+
+def test_voice_bridge_reads_the_segment_tagged_transcripts_when_the_gate_pairs_by_segment():
+    """Derived from voice_asr.transcript_topic like input_topic follows output_topic;
+    a bridge without the gate keeps reading plain text and gets no transcript_topic."""
+    paired = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={"transcript_topic": "/x2/transcript"},
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+    )
+    plain = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀"])
+
+    params = _normalize_launch_param_mapping(vars(paired["agent_voice_bridge"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["transcript_topic"]) == "/x2/transcript"
+    plain_params = _normalize_launch_param_mapping(vars(plain["agent_voice_bridge"])["_Node__parameters"][0])
+    assert "transcript_topic" not in plain_params
+
+
+def test_voice_bridge_refuses_an_unbound_wake_event():
+    with pytest.raises(ValueError, match="wake_event must be bound to a runtime description"):
+        _voice_bridge_nodes(
+            enabled=True,
+            addressee_trigger="vendor_session",
+            wake_event={"interface": "audio.wake_event", "type": "ibrobot_msgs/msg/SpeechWakeEvent"},
+        )

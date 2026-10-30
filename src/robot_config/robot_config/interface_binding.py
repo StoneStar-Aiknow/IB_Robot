@@ -85,6 +85,30 @@ def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
             yield item, f"{path} interface={interface_id!r}", direction
 
 
+def _event_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
+    """Topic bindings to event streams: bound like any topic, never waited on for readiness.
+
+    An event topic carries nothing until its event happens -- the platform's
+    wake word, for ``audio.wake_event`` -- so the runtime cannot observe it as
+    ready at launch, and requiring readiness would hold startup until someone
+    spoke. Binding still fails when the runtime does not describe the interface,
+    or describes it with another type or direction.
+    """
+    embodied = config.get("embodied")
+    agent = embodied.get("agent") if isinstance(embodied, Mapping) else None
+    bridge = agent.get("voice_bridge") if isinstance(agent, Mapping) else None
+    if not isinstance(bridge, Mapping) or bridge.get("enabled") is not True:
+        return
+    yield from _audio_binding(
+        bridge, "embodied.agent.voice_bridge", "wake_event", "ibrobot_msgs/msg/SpeechWakeEvent", "publish"
+    )
+
+
+def event_interface_ids(config: Mapping[str, Any]) -> list[str]:
+    """Interface IDs bound as event streams: the waiter checks they are declared, not that they are ready."""
+    return list(dict.fromkeys(item["interface"] for item, _, _ in _event_bindings(config)))
+
+
 def _endpoint_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str]]:
     """Yield non-topic consumer bindings such as business services and actions."""
     yield from _interaction_demo_bindings(config)
@@ -257,7 +281,9 @@ def bind_robot_interfaces(
         )
 
     digest = description_digest(descriptor)
-    for item, path, direction in _bindings(result):
+    topic_bindings = [(item, path, direction, True) for item, path, direction in _bindings(result)]
+    topic_bindings += [(item, path, direction, False) for item, path, direction in _event_bindings(result)]
+    for item, path, direction, needs_ready in topic_bindings:
         interface_id = item["interface"]
         interface = descriptor["interfaces"].get(interface_id)
         if interface is None:
@@ -348,7 +374,7 @@ def bind_robot_interfaces(
         ready = state.get("state", "unknown") == "ready"
         observed = state.get("observed_profile") if ready else None
         is_image = interface["message_type"] == "sensor_msgs/msg/Image"
-        if require_ready and direction == "publish" and (not ready or (is_image and not observed)):
+        if require_ready and needs_ready and direction == "publish" and (not ready or (is_image and not observed)):
             raise InterfaceBindingError(
                 "interface_not_ready", path, f"state={state.get('state', 'unknown')}: {state.get('detail', '')}"
             )
@@ -450,7 +476,7 @@ def bind_robot_interfaces(
 
 def resolve_robot_interfaces(config: dict[str, Any], *, defer: bool = False) -> dict[str, Any]:
     """Resolve an embedded or file-backed snapshot. Deferral is explicit and structural only."""
-    topic_bindings = list(_bindings(config))
+    topic_bindings = [*_bindings(config), *_event_bindings(config)]
     endpoint_bindings = list(_endpoint_bindings(config))
     if not topic_bindings and not endpoint_bindings and not (config.get("runtime") or {}).get("require_model"):
         return config

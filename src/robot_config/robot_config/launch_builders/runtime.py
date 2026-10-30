@@ -41,6 +41,7 @@ from launch_ros.actions import Node
 
 from robot_config.interface_binding import (
     bind_robot_interfaces,
+    event_interface_ids,
     required_interface_ids,
     required_interface_requirements,
     semantic_mapping_interface_ids,
@@ -258,6 +259,9 @@ def runtime_ready_waiter(
     # IDs do NOT feed required_interface_ids, so provider configurations
     # without require_model keep their non-binding startup flow.
     semantic_interface_ids = semantic_mapping_interface_ids(robot_config)
+    # Event streams (audio.wake_event) are declared-only for the same reason:
+    # they publish nothing until their event happens, so readiness never comes.
+    declared_interface_ids = list(dict.fromkeys([*semantic_interface_ids, *event_interface_ids(robot_config)]))
     interface_ids = required_interface_ids(robot_config) if description_output else []
     instance_id = (robot_config.get("runtime") or {}).get("instance_id")
     return Node(
@@ -273,7 +277,7 @@ def runtime_ready_waiter(
             *(["--required", *required] if required else []),
             *(["--description-output", description_output] if description_output else []),
             *(["--require-interfaces", *interface_ids] if interface_ids else []),
-            *(["--declared-interfaces", *semantic_interface_ids] if semantic_interface_ids else []),
+            *(["--declared-interfaces", *declared_interface_ids] if declared_interface_ids else []),
             *(
                 ["--interface-requirements", json.dumps(required_interface_requirements(robot_config))]
                 if interface_ids

@@ -49,6 +49,7 @@ from robot_config.perception_runtime_config import PerceptionRuntimeConfigError,
 from robot_config.placement_execution_config import validate_placement_execution_config
 from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_config.voice_contract import SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC, SPEAKER_EMBEDDING_OUTPUT_TOPIC
 from robot_runtime import contract as RUNTIME
 
 from .config_path import resolve_robot_config_path
@@ -2165,6 +2166,124 @@ def validate_voice_latency_options(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
+# SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC and SPEAKER_EMBEDDING_OUTPUT_TOPIC come from
+# robot_config.voice_contract (imported above), which speaker_id_node reads too.
+
+
+def validate_speaker_embedding_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the optional per-utterance voiceprint producer and its consumer.
+
+    The producer is ``voice_asr.speaker_embedding`` (a second node on the voice
+    ASR's own chunk stream) and the consumer is the agent voice bridge's
+    ``speaker_check_enabled``. Both are optional; the pairing is not. A check
+    with no producer would accept every utterance while reading as if it were
+    filtering, which is exactly the failure a reviewer cannot see.
+
+    Key names and file paths are checked by the launch builder that owns the
+    node's parameters; this is the config-level shape and the cross-block rule.
+    """
+    voice_asr = robot_config.get("voice_asr", {})
+    voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
+    config = voice_asr.get("speaker_embedding", {})
+    prefix = "voice_asr.speaker_embedding"
+    if not isinstance(config, dict):
+        return [f"{prefix} must be a mapping"]
+    errors: list[str] = []
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append(f"{prefix}.enabled must be a boolean")
+        enabled = False
+    if enabled and not voice_asr.get("enabled", False):
+        errors.append(f"{prefix}.enabled=true requires voice_asr.enabled=true")
+    for field_name in ("bundle_path", "deployment"):
+        if enabled and not str(config.get(field_name, "")).strip():
+            errors.append(
+                f"{prefix}.{field_name} is required when enabled; the model is a schema-v3 bundle "
+                "provisioned outside the repo, like the ASR bundle"
+            )
+    topic = config.get("output_topic", SPEAKER_EMBEDDING_OUTPUT_TOPIC)
+    if not isinstance(topic, str) or not topic.startswith("/"):
+        errors.append(f"{prefix}.output_topic must be an absolute ROS topic name")
+    for field_name in ("min_speech_seconds", "max_speech_seconds", "idle_timeout_sec"):
+        value = config.get(field_name, 1.0)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            errors.append(f"{prefix}.{field_name} must be finite and positive")
+    floor = config.get("min_speech_seconds", 1.0)
+    ceiling = config.get("max_speech_seconds", 6.0)
+    if isinstance(floor, int | float) and isinstance(ceiling, int | float) and ceiling < floor:
+        errors.append(f"{prefix}.max_speech_seconds must not be below min_speech_seconds")
+    if not isinstance(config.get("exit_on_init_failure", True), bool):
+        errors.append(f"{prefix}.exit_on_init_failure must be a boolean")
+
+    agent = robot_config.get("embodied", {})
+    agent = agent.get("agent", {}) if isinstance(agent, dict) else {}
+    voice_bridge = agent.get("voice_bridge", {}) if isinstance(agent, dict) else {}
+    checking = isinstance(voice_bridge, dict) and voice_bridge.get("speaker_check_enabled") is True
+    if checking and not enabled:
+        errors.append(
+            "embodied.agent.voice_bridge.speaker_check_enabled=true requires "
+            f"{prefix}.enabled=true; nothing would publish the voiceprints to check against"
+        )
+    if checking and enabled:
+        # The bridge holds a compared transcript until its segment's voiceprint
+        # lands, so the voiceprint should be published first. Both producers
+        # finalize on their own idle timeout, and with equal timeouts they fire
+        # on the same stall: every compared transcript would then wait for its
+        # voiceprint, and one that takes longer than measurement_grace_sec is
+        # judged without it (fail-open). Observed on the X2 with both at 2.0 s.
+        voiceprint_idle = config.get("idle_timeout_sec", SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC)
+        asr_idle = voice_asr.get("external_idle_timeout", VoiceASRConfig.external_idle_timeout)
+        comparable = isinstance(voiceprint_idle, int | float) and isinstance(asr_idle, int | float)
+        if comparable and voiceprint_idle >= asr_idle:
+            errors.append(
+                f"{prefix}.idle_timeout_sec ({voiceprint_idle}) must be below "
+                f"voice_asr.external_idle_timeout ({asr_idle}) so the voiceprint of an utterance "
+                "is published before its transcript; otherwise every compared transcript waits for it"
+            )
+    return errors
+
+
+def validate_voice_bridge_segment_inputs(robot_config: dict[str, Any]) -> list[str]:
+    """Validate what the addressee gate needs once it pairs by speech segment.
+
+    The voiceprint check and the ``vendor_session`` trigger pair each transcript
+    with its segment's voiceprint and wake event, so the bridge reads the
+    segment-tagged transcripts (``voice_asr.transcript_topic``), which only an
+    external, segmenting source produces. Under ``vendor_session`` only a wake
+    event opens a session, so without one bound the robot would hear nobody.
+    """
+    embodied = robot_config.get("embodied", {})
+    agent = embodied.get("agent", {}) if isinstance(embodied, dict) else {}
+    voice_bridge = agent.get("voice_bridge") if isinstance(agent, dict) else None
+    if not isinstance(voice_bridge, dict) or voice_bridge.get("enabled") is False:
+        return []
+    prefix = "embodied.agent.voice_bridge"
+    session = voice_bridge.get("addressee_trigger", "wake_phrase") == "vendor_session"
+    pairs_by_segment = session or voice_bridge.get("speaker_check_enabled") is True
+    if not pairs_by_segment:
+        return []
+    errors: list[str] = []
+    voice_asr = robot_config.get("voice_asr", {})
+    voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
+    if voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
+        errors.append(
+            f"{prefix}.speaker_check_enabled and addressee_trigger=vendor_session pair transcripts by speech "
+            "segment and need voice_asr.input_mode=external_vad; only a segmenting source names its segments"
+        )
+    if "input_topic" in voice_bridge:
+        # Read from voice_asr.transcript_topic instead; a copy here would be ignored.
+        errors.append(
+            f"{prefix}.input_topic must not be configured when the gate pairs by segment; "
+            "it follows voice_asr.transcript_topic"
+        )
+    if session and voice_bridge.get("wake_event") is None:
+        errors.append(
+            f"{prefix}.addressee_trigger=vendor_session needs wake_event bound to the runtime's wake event "
+            f"({{interface: audio.wake_event, type: {_WAKE_EVENT_TYPE}}}): only a wake event opens a session"
+        )
+    return errors
+
+
 def validate_robot_config_dict(
     robot_config: dict[str, Any], *, deferred_interfaces: bool = False, require_local_model_artifacts: bool = True
 ) -> None:
@@ -2202,6 +2321,8 @@ def validate_robot_config_dict(
     )
     validation_errors.extend(validate_speech_direction_config(robot_config))
     validation_errors.extend(validate_voice_latency_options(robot_config))
+    validation_errors.extend(validate_speaker_embedding_config(robot_config))
+    validation_errors.extend(validate_voice_bridge_segment_inputs(robot_config))
     if not deferred_interfaces:
         try:
             validation_errors.extend(validate_robot_config_observation_transports(robot_config))
@@ -2374,6 +2495,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         final_tail_padding_seconds=data.get("final_tail_padding_seconds", defaults.final_tail_padding_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
         output_topic=data.get("output_topic", defaults.output_topic),
+        transcript_topic=data.get("transcript_topic", defaults.transcript_topic),
         sample_rate=data.get("sample_rate", defaults.sample_rate),
         chunk_size=data.get("chunk_size", defaults.chunk_size),
         buffer_seconds=data.get("buffer_seconds", defaults.buffer_seconds),
@@ -2385,6 +2507,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         audio_input=data.get("audio_input", defaults.audio_input),
         external_min_samples=data.get("external_min_samples", defaults.external_min_samples),
         external_idle_timeout=data.get("external_idle_timeout", defaults.external_idle_timeout),
+        external_finalize_on_idle=data.get("external_finalize_on_idle", defaults.external_finalize_on_idle),
     )
 
 
@@ -2901,6 +3024,10 @@ def _validate_planner_latency_options(planner: dict[str, Any]) -> list[str]:
     return errors
 
 
+#: What a runtime reports its platform's wake word as (``audio.wake_event`` on the X2).
+_WAKE_EVENT_TYPE = "ibrobot_msgs/msg/SpeechWakeEvent"
+
+
 def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     if voice_bridge is None:
         return []
@@ -2920,7 +3047,7 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         # silently disable realtime stop or muting ASR during TTS.
         if field_name in voice_bridge:
             errors.append(f"{prefix}.{field_name} is fixed by voice_asr_node and must not be configured")
-    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "wake_phrases"):
         value = voice_bridge.get(field_name, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
             errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
@@ -2939,12 +3066,19 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         ):
             # Spoken while the microphone stays open for stop words: the bridge would stop itself.
             errors.append(f"{prefix}.busy_message must not contain a stop phrase")
+    if "wake_phrases" in voice_bridge and not voice_bridge["wake_phrases"]:
+        # An empty list reads like "no wake word needed" but would be a gate
+        # that nothing can open; leaving the key out is how that is expressed.
+        errors.append(f"{prefix}.wake_phrases must not be empty; omit the key to accept every utterance")
     for field_name in (
         "confirm_timeout_sec",
         "session_idle_sec",
         "request_timeout_sec",
         "tts_timeout_sec",
         "resume_settle_sec",
+        "wake_window_sec",
+        "session_gap_sec",
+        "speaker_max_age_sec",
     ):
         value = voice_bridge.get(field_name, 1.0)
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
@@ -2962,9 +3096,63 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     min_text_chars = voice_bridge.get("min_text_chars", 2)
     if isinstance(min_text_chars, bool) or not isinstance(min_text_chars, int) or min_text_chars < 1:
         errors.append(f"{prefix}.min_text_chars must be a positive integer")
-    for field_name in ("speak_replies", "tts_enabled", "mute_asr_during_tts"):
+    for field_name in (
+        "speak_replies",
+        "tts_enabled",
+        "mute_asr_during_tts",
+        "speaker_check_enabled",
+        "speaker_reject_short",
+    ):
         if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
             errors.append(f"{prefix}.{field_name} must be a boolean")
+    similarity = voice_bridge.get("speaker_min_similarity", 0.5)
+    if isinstance(similarity, bool) or not isinstance(similarity, int | float) or not 0 < similarity <= 1:
+        errors.append(f"{prefix}.speaker_min_similarity must be in (0, 1]")
+    margin = voice_bridge.get("speaker_merge_margin", 0.1)
+    if isinstance(margin, bool) or not isinstance(margin, int | float) or not 0 <= margin < 1:
+        errors.append(f"{prefix}.speaker_merge_margin must be in [0, 1)")
+    grace = voice_bridge.get("measurement_grace_sec", 0.4)
+    if isinstance(grace, bool) or not isinstance(grace, int | float) or not math.isfinite(grace) or grace < 0:
+        errors.append(f"{prefix}.measurement_grace_sec must be finite and not negative")
+    if "speaker_embedding_topic" in voice_bridge:
+        # A second copy of voice_asr.speaker_embedding.output_topic: once the two
+        # drift, no voiceprint arrives and the check silently accepts everyone.
+        errors.append(
+            f"{prefix}.speaker_embedding_topic must not be configured; "
+            "it follows voice_asr.speaker_embedding.output_topic"
+        )
+    if "wake_event_topic" in voice_bridge:
+        # The runtime profile owns the endpoint; a topic name here is a second
+        # copy that, once it drifts, silently stops every wake event.
+        errors.append(
+            f"{prefix}.wake_event_topic must not be configured; bind the runtime interface with "
+            f"wake_event: {{interface: audio.wake_event, type: {_WAKE_EVENT_TYPE}}}"
+        )
+    wake_event = voice_bridge.get("wake_event")
+    if wake_event is not None and (
+        not isinstance(wake_event, dict)
+        or not isinstance(wake_event.get("interface"), str)
+        or not wake_event["interface"].strip()
+        or wake_event.get("type") != _WAKE_EVENT_TYPE
+    ):
+        errors.append(f"{prefix}.wake_event must be {{interface: <logical id>, type: {_WAKE_EVENT_TYPE}}}")
+    trigger = voice_bridge.get("addressee_trigger", "wake_phrase")
+    if trigger not in {"wake_phrase", "vendor_session"}:
+        errors.append(f"{prefix}.addressee_trigger must be wake_phrase or vendor_session")
+    if wake_event is not None and trigger != "vendor_session":
+        # The wake word is already in the text under wake_phrase; a second
+        # source of the same fact could only disagree with it.
+        errors.append(f"{prefix}.wake_event only applies to addressee_trigger=vendor_session")
+    if trigger == "vendor_session" and voice_bridge.get("wake_phrases"):
+        # Two judgements of the same thing: under vendor_session the source
+        # consumes its wake word, so a phrase list rejects every utterance.
+        errors.append(f"{prefix}.addressee_trigger=vendor_session must not set wake_phrases")
+    gate_is_on = trigger == "vendor_session" or bool(voice_bridge.get("wake_phrases"))
+    if voice_bridge.get("speaker_check_enabled") is True and not gate_is_on:
+        # The anchor is only ever captured from the utterance that proves
+        # itself. With the gate off nothing captures one and the check would
+        # silently accept every utterance.
+        errors.append(f"{prefix}.speaker_check_enabled requires an enabled gate: set wake_phrases or addressee_trigger")
     return errors
 
 
@@ -3031,10 +3219,13 @@ def validate_config(config: RobotConfig) -> list[str]:
                 "(the segmented audio stream is provided by the robot runtime; audio_io.source was removed)"
             )
         if config.voice_asr.input_mode == "external_vad":
-            for name in ("chunk_topic",):
+            for name in ("chunk_topic", "transcript_topic"):
                 value = getattr(config.voice_asr, name)
                 if value and not value.startswith("/"):
                     errors.append(f"voice_asr.{name} must be an absolute ROS topic name")
+        if not isinstance(config.voice_asr.external_finalize_on_idle, bool):
+            # The launch builder passes it on as a bool: the string "false" would turn it on.
+            errors.append("voice_asr.external_finalize_on_idle must be a boolean")
     if config.audio_io.enabled:
         for name in (
             "capture_topic",

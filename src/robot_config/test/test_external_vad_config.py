@@ -81,6 +81,17 @@ def test_loader_reads_external_vad_fields():
     assert not hasattr(voice, "external_backfill_seconds")
 
 
+def test_loader_reads_finalize_on_idle_and_keeps_it_off_by_default():
+    assert load_voice_asr_config(_voice_asr_config()).external_finalize_on_idle is False
+    assert load_voice_asr_config(_voice_asr_config(external_finalize_on_idle=True)).external_finalize_on_idle is True
+
+
+def test_finalize_on_idle_must_be_a_boolean():
+    config = _robot_config(voice_asr_overrides={"external_finalize_on_idle": "false"})
+    errors = validate_config(config)
+    assert any("voice_asr.external_finalize_on_idle must be a boolean" in error for error in errors)
+
+
 def test_loader_rejects_the_removed_audio_io_source_key():
     with pytest.raises(ValueError, match="audio_io.source was removed"):
         load_audio_io_config({"enabled": True, "source": "runtime"})

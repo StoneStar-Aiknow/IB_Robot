@@ -32,6 +32,9 @@ external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消
 X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
 profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
 在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
+`aimdk_x2_voice_addressee.yaml` 再叠加语音 Agent 与寻址门控（声纹校验、`audio.wake_event` 唤醒事件、
+`external_finalize_on_idle`），参数为 2026-10-24 至 10-27 真机测试所用值；声纹模型与 X-ASR 一样
+是仓库外提供的 schema-v3 bundle（`voice_asr.speaker_embedding.bundle_path` / `.deployment`）。
 `audio_io.source` 已删除（runtime-owned-audio-io）：设置 `runtime.provider` 的部署音频设备由 runtime
 拥有——`peripherals` 中的 `microphone`/`speaker` 由机器人 runtime 启动同一组 ALSA 节点，并投影为带格式
 元数据的 `audio.capture` / `audio.play` 接口；voice_asr（流式）、speech_direction、voice_tts 通过
@@ -1688,6 +1691,8 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.planner.catalog_view` | `planner` 或 `full` |
 | `agent.planner.stream` | 布尔；为 `true` 时提前发布 `reply_preview` 事件（由语音通道决定是否播报），执行仍需完整校验；要求 `api_protocol` 为 `chat_completions` |
 | `agent.planner.direct_commands` | 映射 `整句话语: 技能名`；整句精确匹配时不调用模型、直接生成单步计划（否定/假设句不触发，技能须在 live catalog 中且 planner 可选），提案的 `planner_identity` 记为 `route=direct_command`；`execution_enabled` 时每个技能都必须在 `test_allowlist` 内 |
+| `voice_asr.transcript_topic` | 绝对 topic，默认 `/voice/transcript`，仅 `external_vad` 下发布：同一最终文本按段再发一份 `ibrobot_msgs/SpeechTranscript`（带 `source_id` 与 `segment_sequence`），`output_topic` 上的纯文本照旧。寻址门控按段配对时桥接从这里读 |
+| `voice_asr.external_finalize_on_idle` | 布尔，默认 false，仅 `external_vad` 下生效。音源发了 BEGIN 却从不发 END 时，按 `external_idle_timeout` 收尾并发布转写，而不是丢弃整段；X2 固件如此（2026-10-23 实测 BEGIN 1 / END 0），`aimdk_x2_voice_addressee` 开启它。会发 END 的音源应保持关闭：那里的空闲超时意味着话说到一半卡住，发布截断的指令比不发更糟 |
 | `voice_asr.vad_*` / `voice_tts.num_steps` | 只校验 profile 实际配置的值：VAD 时长为有限正数（`post_roll` / `pre_roll` 可为 0），`num_steps` 为正整数；默认值归属 `voice_asr_service` / `voice_tts_service` |
 | `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
 | `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
@@ -1696,6 +1701,19 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.voice_bridge.busy_message` | 非空字符串；执行中提示语。播报时 ASR 仍在监听停止词，**不得包含停止词**（否则机器人会被自己的提示中断），违反即报错 |
 | `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空，未配置时取 `embodied_common.control_phrases.STOP_PHRASES` |
 | `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
+| `agent.voice_bridge.addressee_trigger` | `wake_phrase`（默认）或 `vendor_session`。前者要求话语以 `wake_phrases` 开头；后者用于**先吃掉自身唤醒词再放行语音**的平台（X2 实测如此），此时唤醒词到不了文本层，**只有唤醒事件能开会话**（必须配 `wake_event`），会话首句是唤醒事件指明那一段的转写；静默 `session_gap_sec` 后会话结束，下一句没有新唤醒就被拒绝。`vendor_session` 下配 `wake_phrases` 会被拒绝 |
+| `agent.voice_bridge.session_gap_sec` | 有限正数，默认 15 秒。仅 `vendor_session` 下生效：会话内转写间隔超过它即结束会话，之后需要新的唤醒事件。必须大于最长话语加 ASR 定稿延迟（间隔在最终转写之间测量）；偏小会让用户停顿后的追问也要重说唤醒词 |
+| `agent.voice_bridge.wake_phrases` | 非空字符串列表，省略该键表示**接受每一句话**（现有部署的行为）。配置后，一句话必须以其中之一**开头**才算是对机器人说的；命中后唤醒词会被**从文本中剥离**再送给 planner。空列表会被拒绝（那是一道没人能打开的门）。停止词**不受此门控**，安全优先 |
+| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；窗口**只被真正被处理的话续期**，被忽略的话不会把它撑开。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
+| `agent.voice_bridge.speaker_check_enabled` | 布尔，默认 false。开启后窗口内的话要与**会话首句**（说唤醒词那句，或 `vendor_session` 下唤醒事件指明的那一句）的声纹匹配才转发。要求门控已开启（配 `wake_phrases` 或 `addressee_trigger: vendor_session`，锚点来自会话首句），且要求 `voice_asr.speaker_embedding.enabled: true`（否则没人发布可比对的声纹，门看起来在过滤实际全放行）——两条都 fail closed |
+| `agent.voice_bridge.speaker_min_similarity` | `(0, 1]`，默认 0.60。余弦相似度下限。默认值是 X2 真机测试用的值（2026-10-24，campplus，≥2 s 片段）：旁人与锚点 0.28–0.56，用户本人在锚点累积后 0.67–0.84。离线语料的数字不能作依据——其分组标签并非同一个人。**仍须用真人录音现场标定**（方法见 `ibrobot_agent/README.md`）：取决于模型、麦克风、房间与说话人相似度 |
+| `agent.voice_bridge.speaker_max_age_sec` | 有限正数，默认 2.5 秒。声纹按语音段与转写配对；某段的声纹超过这个时长仍没有等到它的转写（ASR 丢弃了该段）即丢弃，只限制内存，不决定谁判定谁 |
+| `agent.voice_bridge.measurement_grace_sec` | 非负有限数，默认 0.4 秒（X2 配置 1.5 秒）。转写等待自身声纹的**上限**：只有要和锚点比对、而测量尚未到达的转写才会等，测量一到立即判定；会话首句、停止词、确认回答不等 |
+| `agent.voice_bridge.speaker_merge_margin` | `[0, 1)`，默认 0.10。放行的话只有相似度至少达到 `speaker_min_similarity + speaker_merge_margin` 才并入声纹锚点；刚过阈值的话放行但不改动锚点，避免锚点被音色相近的旁人带偏。设为 0 即每句放行的话都并入 |
+| `agent.voice_bridge.speaker_reject_short` | 布尔，默认 false。开启后，已有声纹锚点时，`speaker_id_node` 报告「太短、没有声纹」（空向量）的后续话被挡，而不是按 fail-open 放行。会话首句、停止词、确认回答不受影响；声纹消息根本没到时仍放行。X2 真人实测指令多为 1 s 左右人声，默认放行会让第二个人的指令全部通过 |
+| `agent.voice_bridge.speaker_embedding_topic` | **不可配置**：桥接订阅的声纹话题由 `voice_asr.speaker_embedding.output_topic` 决定（默认 `/voice/speaker_embedding`），launch 只从那里推导，出现即报错——两份配置一旦不一致，桥接收不到声纹，校验会静默放行所有人 |
+| `agent.voice_bridge.input_topic`（按段配对时） | 启用 `speaker_check_enabled` 或 `vendor_session` 时门控按语音段配对转写、声纹与唤醒事件，桥接改订阅 `voice_asr.transcript_topic` 上的 `ibrobot_msgs/SpeechTranscript`（launch 推导），此时**不可配置** `input_topic`，且要求 `voice_asr.input_mode: external_vad`（只有自带分段的音源能说出转写属于哪一段） |
+| `agent.voice_bridge.wake_event` | `{interface: audio.wake_event, type: ibrobot_msgs/msg/SpeechWakeEvent}`，仅 `vendor_session` 下可配，且 `vendor_session` **必须**配（只有唤醒事件能开会话，缺了机器人对谁都不响应）。绑定 runtime 发布的唤醒事件（X2 见 `aimdk_robot/README.md`）：同一音源、从被唤醒段起的第一句转写成为会话首句并重设锚点，用于开会话与窗口内换人接管。话题名由 runtime 接口描述决定，**不接受** `wake_event_topic` 字面话题。事件型接口不等就绪（说唤醒词之前不会有消息），启动时只检查 runtime 已声明 |
 | `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
 | `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |
 | `agent.voice_bridge.resume_settle_sec` | 正数，默认 1 秒；TTS 播报结束恢复 ASR 后的静默窗口，期间丢弃识别结果 |
