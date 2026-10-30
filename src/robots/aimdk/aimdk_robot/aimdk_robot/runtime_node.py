@@ -36,7 +36,8 @@ from std_msgs.msg import Bool, Float64MultiArray
 from aimdk_robot import projection
 from aimdk_robot import vendor_gateway as vg
 from aimdk_robot.projection import CommandRejected, LocomotionLimits
-from ibrobot_msgs.msg import PowerState, RuntimeStatus
+from aimdk_robot.wake_ack import WakeAckPairer
+from ibrobot_msgs.msg import PowerState, RuntimeStatus, SpeechWakeEvent
 from ibrobot_msgs.srv import (
     GetRuntimeStatus,
     PlayExpression,
@@ -107,6 +108,10 @@ _RELIABLE_QOS = QoSProfile(
 #: a board that is already the bottleneck.
 OBSERVED_INTERFACES = ("audio.speech",)
 
+#: ProcessedAudioOutput.audio_vad_state value that opens a vendor speech segment.
+_VENDOR_SPEECH_BEGIN = 1
+#: What audio.wake_event carries: the woken segment, named like SpeakerEmbedding names one.
+_WAKE_EVENT_TYPE = "ibrobot_msgs/msg/SpeechWakeEvent"
 #: Frame id carried by project speech chunks; consumers must not depend on it.
 _SPEECH_FRAME_ID = "enhanced_audio"
 
@@ -609,6 +614,83 @@ class AimdkRuntimeNode(Node):
         # Availability heartbeat, not speech: it lets the runtime description
         # report the interface before the wake word, and carries no PCM.
         self.create_timer(0.5, self._publish_speech_heartbeat, callback_group=self._speech_cb)
+        self._setup_wake_event(interfaces, topics)
+
+    def _setup_wake_event(self, interfaces: dict[str, Any], topics: dict[str, Any]) -> None:
+        """Report the platform's wake word as a project event, when the profile declares one.
+
+        The vendor consumes its wake word before releasing speech, so a consumer
+        cannot tell an utterance that named the robot from a follow-up. Its own
+        assistant's acknowledgement on the playback topic can (see
+        ``aimdk_robot.wake_ack``). Declared like every public endpoint; not
+        declared means not published, and the vendor playback topic is then not
+        subscribed either.
+        """
+        self._wake_pairer = None
+        wake = interfaces.get("audio.wake_event")
+        if wake is None:
+            return
+        if wake.get("message_type") != _WAKE_EVENT_TYPE:
+            raise RuntimeError(f"audio.wake_event must be {_WAKE_EVENT_TYPE}, got {wake.get('message_type')!r}")
+        if not topics.get("audio_playback"):
+            raise RuntimeError(
+                "audio.wake_event is declared but vendor.topics.audio_playback is not; "
+                "the acknowledgement is read from the platform's playback topic"
+            )
+        from aimdk_msgs.msg import AudioPlayback  # noqa: PLC0415 - vendor import stays local
+
+        ack = self._vendor.get("wake_ack") or {}
+        if not str(ack.get("token_pattern") or "").strip():
+            # No default: the platform's dialog answers share the pkg_name and
+            # differ only in their token, so accepting any token re-creates the
+            # false wake the pattern exists for (see aimdk_robot.wake_ack).
+            raise RuntimeError(
+                "audio.wake_event is declared but vendor.wake_ack.token_pattern is not; "
+                "set the acknowledgement's token form (the X2's is \"^_[0-9]+_\")"
+            )
+        try:
+            self._wake_pairer = WakeAckPairer(
+                frozenset(str(name) for name in ack.get("pkg_names", ["tts"])),
+                token_pattern=str(ack["token_pattern"]),
+                window_s=float(ack.get("pair_window_s", 1.5)),
+            )
+        except ValueError as error:
+            raise RuntimeError(f"vendor.wake_ack is invalid: {error}") from error
+        self._wake_pub = self.create_publisher(
+            SpeechWakeEvent, str(wake["endpoint"]), self._public_qos(wake), callback_group=self._speech_cb
+        )
+        # Same callback group as the speech path, so the pairer is only ever
+        # touched from one thread. The runtime's own playback (pkg_name = its
+        # source) is filtered out by the pairer. Its own QoS key: on this topic
+        # the runtime is also a publisher, and vendor.qos.audio_playback must
+        # stay RELIABLE for that (the platform subscribes RELIABLE), while this
+        # subscription only listens and is BEST_EFFORT like audio_capture.
+        self.create_subscription(
+            AudioPlayback,
+            str(topics["audio_playback"]),
+            self._on_vendor_playback,
+            self._vendor_qos("audio_playback_monitor", reliability="best_effort", durability="volatile"),
+            callback_group=self._speech_cb,
+        )
+
+    def _on_vendor_playback(self, message: Any) -> None:
+        pairer = getattr(self, "_wake_pairer", None)
+        if pairer is None:
+            return
+        segment = pairer.on_playback(str(message.pkg_name), str(message.token_id), time.monotonic())
+        if segment is not None:
+            self._publish_wake_event(segment)
+
+    def _publish_wake_event(self, segment: int) -> None:
+        # Names the woken segment the way SpeakerEmbedding does, by its BEGIN
+        # chunk. The vendor's own header carries no stamp on X2 (all zero,
+        # observed 2026-10-24), so the event is stamped on arrival.
+        event = SpeechWakeEvent()
+        event.header.stamp = self.get_clock().now().to_msg()
+        event.header.frame_id = _SPEECH_FRAME_ID
+        event.source_id = self._speech_source_id
+        event.segment_sequence = int(segment)
+        self._wake_pub.publish(event)
 
     def _next_speech_sequence(self) -> int:
         """Allocate the project sequence, surfacing vendor-side loss when visible."""
@@ -663,6 +745,11 @@ class AimdkRuntimeNode(Node):
         # bounded so a bad vendor message cannot become an unbounded publish.
         chunk.audio_data = list(data[:_SPEECH_MAX_CHUNK_BYTES])
         self._speech_pub.publish(chunk)
+        pairer = getattr(self, "_wake_pairer", None)
+        if pairer is not None and chunk.state == _VENDOR_SPEECH_BEGIN:
+            segment = pairer.on_speech_begin(time.monotonic(), chunk.sequence)
+            if segment is not None:
+                self._publish_wake_event(segment)
         if self._speech_capture_pub is not None and data:
             from audio_common_msgs.msg import AudioDataStamped  # noqa: PLC0415
 

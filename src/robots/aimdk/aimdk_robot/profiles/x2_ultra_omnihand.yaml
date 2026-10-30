@@ -354,10 +354,30 @@ vendor:
       reliability: best_effort
       durability: transient_local
     audio_capture:
-      reliability: reliable
+      # Best effort on purpose. Each message carries 480 samples across 6
+      # channels (5760 B), so every one is IP-fragmented, and a RELIABLE
+      # subscription asks for every lost fragment again. On a host shared with
+      # another skill that turns into a storm instead of reliability: measured
+      # on an Ascend 310P compute pack (2026-10-27) with a grasp pipeline
+      # co-resident, 29557 fragment reassembly attempts/s at 98% failure, which
+      # also starved the processed-audio path the voice deployment actually
+      # needs -- no wake word reached the gate at all. Best effort delivered
+      # the stream in full instead (0.5 Hz -> 33 Hz, 19.8 s of audio per 20 s).
+      # Nothing here consumes the raw capture: no X2 profile enables
+      # speech_direction, and the addressee gate has no direction check. The
+      # republished /audio/capture_stamped stays reliable, so consumers of the
+      # project's own contract are unaffected. See issue #201.
+      reliability: best_effort
       durability: volatile
     audio_playback:
       reliability: reliable
+      durability: volatile
+    audio_playback_monitor:
+      # Our subscription to the same topic, to read the native assistant's
+      # wake acknowledgement (vendor.wake_ack). We only listen there, so it is
+      # best effort like audio_capture; it cannot share audio_playback, which
+      # the runtime's own publisher needs RELIABLE.
+      reliability: best_effort
       durability: volatile
     audio_focus_response:
       reliability: reliable
@@ -372,6 +392,17 @@ vendor:
     name: ibrobot.aimdk_robot
     priority: 30
     timeout_ms: 1000
+  # The platform's assistant starts a reply (a new token_id under this pkg_name)
+  # on every wake word and only then; paired with the vendor speech BEGIN it is
+  # the wake event the vendor does not publish itself. 14/14 on the robot
+  # (2026-10-24), acknowledgement 1.2 s before to 1.0 s after the BEGIN.
+  wake_ack:
+    pkg_names: [tts]
+    pair_window_s: 1.5
+    # The acknowledgement's token form (9/9 observed); the dialog subsystem's
+    # unprompted answers use hds_tts_..., and one paired with a bystander's
+    # BEGIN before this was added.
+    token_pattern: "^_[0-9]+_"
   command:
     rate_hz: 50.0
     stamp_window_s: 0.2
@@ -574,6 +605,16 @@ interfaces:
     endpoint: /audio/speech_chunk
     message_type: ibrobot_msgs/msg/SpeechAudioChunk
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 50}
+  # The platform consumes its wake word before releasing speech; this names the
+  # speech segment one opened (see aimdk_robot/wake_ack.py), so a consumer can
+  # tell a new speaker taking over from a follow-up.
+  audio.wake_event:
+    capability: interaction.audio_capture
+    kind: topic
+    direction: publish
+    endpoint: /audio/wake_event
+    message_type: ibrobot_msgs/msg/SpeechWakeEvent
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
   audio.enhanced_capture:
     capability: interaction.audio_capture
     kind: topic

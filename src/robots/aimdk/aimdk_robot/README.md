@@ -39,6 +39,7 @@ package.
 | `/power_state` | `ibrobot_msgs/msg/PowerState` | `/aima/hal/pmu/state` |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `/aima/hds/{diag,alert}_code_list` |
 | `/audio/capture_stamped`, `/audio/info`, `/audio/play` | project audio contract | `/aima/hal/audio/{capture,playback}` |
+| `/audio/wake_event` (`audio.wake_event`) | `ibrobot_msgs/SpeechWakeEvent`, one per wake word, naming the woken segment | assistant acknowledgement on `/aima/hal/audio/playback` paired with the processed-audio BEGIN |
 | camera (raw + `/compressed`) / IMU (chest, torso, RGB-D, stereo, lidar) / touch interfaces | declared, not re-driven | `/aima/hal/sensor/**`, `/aima/hal/imu/**` |
 
 ### Vendor QoS is part of the endpoint contract
@@ -60,6 +61,12 @@ other direction: the platform's state topics are TRANSIENT_LOCAL, so a
 TRANSIENT_LOCAL subscription receives the current value on subscribe instead of
 waiting for the next sample. When a firmware changes a QoS, correct the profile
 rather than the code.
+
+The SDK table binds the side that must match the platform. Where the runtime only
+listens, RELIABLE is not automatically safer: `audio_capture` and the playback
+monitor (`audio_playback_monitor`, see the wake event below) subscribe best effort,
+because each lost IP fragment of a RELIABLE stream is asked for again and on a host
+shared with another skill that became a retransmit storm (issue #201).
 
 ### Audio playback holds the platform's audio focus
 
@@ -332,6 +339,52 @@ the wake word and `wait_for_runtime` can admit ASR. The monitor is given only
 re-subscribe the camera and lidar streams inside this process on a board that is
 already the bottleneck. Its subscription runs in the speech callback group so the
 ~500 Hz joint feedback cannot delay it past the staleness window.
+
+### The platform's wake word is reported as `audio.wake_event`
+
+The X2 consumes its wake word before it releases speech and publishes no wake
+event, so a consumer cannot tell an utterance that named the robot from a
+follow-up. What the platform does do, on every wake word and only then, is start
+its native assistant's reply on the playback topic (`vendor.topics.audio_playback`,
+`/aima/hal/audio/playback`) under a new `token_id`. `aimdk_robot.wake_ack.WakeAckPairer`
+pairs such a token with the BEGIN of a vendor speech segment and the runtime
+publishes one `ibrobot_msgs/msg/SpeechWakeEvent` on the declared `audio.wake_event`
+interface (default `/audio/wake_event`). It names the woken segment the way
+`SpeakerEmbedding` does, by the `source_id` and `sequence` of its BEGIN chunk, and is
+stamped on arrival because the vendor header is all zero. Measured on the robot (2026-10-24): 14 of 14 utterances classified correctly,
+every acknowledgement between 1.2 s before and 1.0 s after its BEGIN.
+
+`vendor.wake_ack` configures the pairing:
+
+| Key | Meaning |
+|---|---|
+| `pkg_names` | Playback `pkg_name`s that count as the assistant's voice (`[tts]`) |
+| `pair_window_s` | Largest gap, either way, between the acknowledgement and the BEGIN (1.5 s) |
+| `token_pattern` | Regular expression the acknowledgement token must match. **Required** when `audio.wake_event` is declared: the runtime refuses to start without it |
+
+`token_pattern` (`"^_[0-9]+_"`) exists because the platform's dialog subsystem also
+speaks unprompted answers (`hds_tts_…` tokens), and one of those once paired with a
+bystander's BEGIN. The token form is undocumented vendor detail: if a firmware
+update changes it, the symptom is that no wake events arrive, never that a
+bystander is treated as a new wake. The voice bridge's `vendor_session` gate opens a
+session only on a wake event, so it then accepts nobody: the failure is a deaf robot,
+not an open one, and the fix is the profile's pattern. The robot's speaker does not have to work for any of this;
+the platform publishes the playback message whether or not anything is heard.
+
+The playback subscription takes its QoS from `vendor.qos.audio_playback_monitor`
+(best effort), not from `vendor.qos.audio_playback`: the runtime publishes on the same
+topic, and that publisher must stay RELIABLE because the platform subscribes RELIABLE,
+while the listening side gains nothing from RELIABLE and, like `audio_capture`, risks
+retransmit storms on a shared host. A best-effort subscription of the platform's
+RELIABLE publisher is compatible.
+
+Not declaring `audio.wake_event` turns the whole path off, including the playback
+subscription; declaring it without `vendor.topics.audio_playback`, or with another
+message type, fails at startup. The interface publishes nothing until somebody says
+the wake word, so it is never `ready` at launch: consumers bind it as an event
+stream (`wait_for_runtime --declared-interfaces`), which checks that the runtime
+declares it without waiting for a first message. The voice bridge consumes it
+through `embodied.agent.voice_bridge.wake_event` (see `src/agent/ibrobot_agent/README.md`).
 
 ### The platform's state message is read whole
 

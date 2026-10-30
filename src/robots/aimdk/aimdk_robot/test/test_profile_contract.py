@@ -8,6 +8,7 @@ produces is accepted by the contract layer as-is.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -190,14 +191,29 @@ def test_only_firmware_verified_sensor_endpoints_are_declared(profile):
 def test_vendor_endpoint_qos_matches_the_documented_profiles(profile):
     """QoS is part of the endpoint contract; a mismatch drops messages silently.
 
-    The platform subscribes RELIABLE on audio playback, so publishing
-    BEST_EFFORT there delivers nothing (observed on the robot). Its state topics
-    publish TRANSIENT_LOCAL, so subscribing TRANSIENT_LOCAL picks up the current
-    value on subscribe instead of waiting for the next sample.
+    Which side we are on decides what the contract demands. Where the runtime
+    publishes, the platform's own subscription sets the floor: it subscribes
+    RELIABLE on audio playback, so publishing BEST_EFFORT there delivers
+    nothing (observed on the robot). Its state topics publish TRANSIENT_LOCAL,
+    so subscribing TRANSIENT_LOCAL picks up the current value on subscribe
+    instead of waiting for the next sample.
+
+    Where the runtime only subscribes, RELIABLE is not automatically the safer
+    choice, and on the microphone capture it is the worse one. Each message is
+    5760 B (480 samples across 6 channels), so every one is IP-fragmented, and
+    RELIABLE asks for every lost fragment again: on an Ascend 310P compute pack
+    sharing the host with a grasp pipeline (2026-10-27) that measured 29557
+    fragment reassembly attempts/s at 98% failure, and the retransmits starved
+    the processed-audio stream the voice deployment does need. BEST_EFFORT
+    delivered the capture in full instead (0.5 Hz -> 33 Hz). A BEST_EFFORT
+    subscription of a RELIABLE publisher is compatible, so nothing is dropped
+    by the choice itself. See issue #201.
     """
     qos = profile["vendor"]["qos"]
     assert qos["audio_playback"]["reliability"] == "reliable"
-    assert qos["audio_capture"]["reliability"] == "reliable"
+    assert qos["audio_capture"]["reliability"] == "best_effort"
+    # The same playback topic, but the runtime's listening side (wake acknowledgement).
+    assert qos["audio_playback_monitor"] == {"reliability": "best_effort", "durability": "volatile"}
     for key in ("mc_state", "system_state", "joint_state", "hand_state", "power_state"):
         assert qos[key]["durability"] == "transient_local", key
     # The vendor's own command topics are BEST_EFFORT + VOLATILE.
@@ -206,6 +222,16 @@ def test_vendor_endpoint_qos_matches_the_documented_profiles(profile):
     for key, entry in qos.items():
         assert entry["reliability"] in projection.QOS_RELIABILITIES, key
         assert entry.get("durability", "volatile") in projection.QOS_DURABILITIES, key
+
+
+@pytest.mark.parametrize("name", ["x2_ultra.yaml", "x2_ultra_omnihand.yaml"])
+def test_a_declared_wake_event_comes_with_the_acknowledgement_token_form(name):
+    """The runtime refuses audio.wake_event without it; a shipped profile must not trip that."""
+    shipped = load_profile(PROFILE_PATH.with_name(name))
+    assert "audio.wake_event" in shipped["interfaces"]
+    pattern = shipped["vendor"]["wake_ack"]["token_pattern"]
+    assert re.match(pattern, "_1792835430393_7ack")
+    assert not re.match(pattern, "hds_tts_36IUknWjEw0NVKL7L4RGgK3")
 
 
 def test_audio_playback_declares_the_focus_it_has_to_hold(profile):
