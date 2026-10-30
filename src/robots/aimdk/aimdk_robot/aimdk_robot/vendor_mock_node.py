@@ -185,6 +185,7 @@ class AimdkVendorMock(Node):
         self.last_led: Any = None
         self.last_preset: Any = None
         self.upper_body_count = 0
+        self.discarded_upper_body = 0
         self.locomotion_count = 0
         self.last_playback: Any = None
         self.playback_count = 0
@@ -495,16 +496,30 @@ class AimdkVendorMock(Node):
         # Upper-body commands are not arbitration-gated on the platform: the
         # vendor's own upper_body_control example registers no input source at
         # all and still moves the arms. Only the source name is recorded.
+        hand_pos = list(message.hand_pos)
+        with self._lock:
+            hands_carried = self._action == projection.UPPER_BODY_HANDS_ACTION
+        if (
+            hands_carried
+            and int(message.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT
+            and len(hand_pos) != 2 * projection.DEXTEROUS_JOINTS_PER_HAND
+        ):
+            # In the hands-carrying action the firmware discards the whole
+            # command, arm and head included, when hand_pos does not fit
+            # hand_sub_mode; other actions do not carry the hands.
+            self.discarded_upper_body += 1
+            return
         self.last_upper_body = message
         self.upper_body_count += 1
         if not bool(self.get_parameter("follow_commands").value):
             return
+        # A loaded arm settles arm_command_offset below its target; the board reports the target.
+        sag = float(self.get_parameter("arm_command_offset").value)
         with self._lock:
             for name, value in zip(ARM_JOINTS, list(message.arm_pos), strict=False):
-                self._positions[name] = float(value)
+                self._positions[name] = float(value) - sag
             for name, value in zip(HEAD_JOINTS, list(message.head_pos), strict=False):
                 self._positions[name] = float(value)
-            hand_pos = list(message.hand_pos)
             if int(message.hand_sub_mode) == projection.HAND_SUB_MODE_CLAW and len(hand_pos) == 2:
                 self._positions["left_hand"], self._positions["right_hand"] = hand_pos[0], hand_pos[1]
             elif int(message.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT and len(hand_pos) == 20:

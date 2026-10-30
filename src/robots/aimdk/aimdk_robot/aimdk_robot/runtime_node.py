@@ -285,6 +285,8 @@ class AimdkRuntimeNode(Node):
         self._lock = threading.RLock()
         self._arm_cmd: list[float] | None = None
         self._hand_cmd: tuple[int, list[float]] | None = None
+        # The last hand command accepted in this mode, held once its channel is quiet (see _hand_hold_locked).
+        self._hand_held: tuple[int, list[float]] | None = None
         self._head_cmd: list[float] | None = None
         # One receipt stamp per channel: a channel's target expires on its own
         # clock, and input on another channel must not extend it.
@@ -312,6 +314,12 @@ class AimdkRuntimeNode(Node):
         # When that state arrived, and when this runtime last asked for an action (monotonic s).
         self._vendor_action_at = 0.0
         self._action_requested_at = 0.0
+        # The motion-control unit's own arm targets (the HAL's command board), when the profile names it.
+        self._arm_board_configured = False
+        self._arm_board: dict[str, float] | None = None
+        self._arm_board_received = 0.0
+        # The arm_pos last sent to the platform in this mode: the target it holds.
+        self._arm_sent: list[float] | None = None
         self._system_state = ""
         self._hold_target_missing = False
         self._hand_hold_missing = False
@@ -503,8 +511,9 @@ class AimdkRuntimeNode(Node):
                 str(topics["arm_command"]),
                 self._vendor_qos("arm_command"),
                 1,
-                lambda message, _received: self._publish_arm_command(message),
+                self._publish_arm_command,
             )
+            self._arm_board_configured = True
         if topics.get("mc_state"):
             self.create_subscription(
                 McCommonState,
@@ -1545,7 +1554,7 @@ class AimdkRuntimeNode(Node):
                     gesture_ids=hand.get("gesture_ids"),
                 )
                 with self._lock:
-                    self._hand_cmd = (sub_mode, payload)
+                    self._hand_cmd = self._hand_held = (sub_mode, payload)
                     self._hand_stamp = time.monotonic()
             else:
                 self._modes.note_rejected(name)
@@ -1605,6 +1614,8 @@ class AimdkRuntimeNode(Node):
             self._arm_motion_epoch += 1
             self._arm_cmd = None
             self._hand_cmd = None
+            self._hand_held = None
+            self._arm_sent = None
             self._head_cmd = None
             self._twist = None
 
@@ -1673,7 +1684,7 @@ class AimdkRuntimeNode(Node):
             # Joints this tick does not command are told to stay where the
             # platform measures them; without that measurement nothing is
             # sent, because a zero-filled vector would be a real motion.
-            arm = self._arm_cmd if self._arm_cmd is not None else self._hold_target_locked(projection.VENDOR_ARM_ORDER)
+            arm = self._arm_cmd if self._arm_cmd is not None else self._arm_hold_locked()
             head = (
                 self._head_cmd if self._head_cmd is not None else self._hold_target_locked(projection.VENDOR_HEAD_ORDER)
             )
@@ -1697,6 +1708,7 @@ class AimdkRuntimeNode(Node):
                 return
             self._hand_hold_missing = False
             hand_sub_mode, hand_pos = hand
+            self._arm_sent = list(arm)
             self._upper_body_pub.publish(
                 vg.upper_body_command(
                     self,
@@ -1742,7 +1754,15 @@ class AimdkRuntimeNode(Node):
         the command rather than sending one that would be dropped. Claw holding
         is not verified on hardware; it keeps the declared sub-mode with no
         targets.
+
+        Once this mode has sent a hand command, a quiet hand channel repeats
+        that command instead, which is also what the platform holds once
+        commands stop: a hand closed on an object stays short of its target,
+        and its measured joints sent back as the target would take the squeeze
+        off mid-lift.
         """
+        if self._hand_held is not None:
+            return self._hand_held
         action = str((self._vendor.get("mc_actions") or {}).get(self._modes.mode, ""))
         if (
             self._default_hand_sub_mode != projection.HAND_SUB_MODE_DEXTEROUS_JOINT
@@ -1765,6 +1785,29 @@ class AimdkRuntimeNode(Node):
         )
         groups = {group: entries for group, entries in self._joint_groups.items() if group in fresh}
         return projection.hold_target(groups, order=order)
+
+    def _arm_hold_locked(self) -> list[float] | None:
+        """``arm_pos`` that keeps the arms where the controller has them while their channel is quiet. Caller holds _lock.
+
+        The controller's own targets, not the measured arm: loaded, it settles
+        below its target, so a measured pose sent back as the target lowers it
+        again every tick. On the X2 the arm sank ~0.3 rad in a second while
+        only the hand streamed (live 2026-10-22). A profile that names no
+        command board keeps the measured hold; one that does, without a fresh
+        board, repeats the arm_pos it last sent in this mode, and sends nothing
+        before it has sent one.
+        """
+        if not self._arm_board_configured:
+            return self._hold_target_locked(projection.VENDOR_ARM_ORDER)
+        board = self._arm_board
+        if board is not None and time.monotonic() - self._arm_board_received <= self._feedback_window_s:
+            try:
+                return [board[name] for name in projection.VENDOR_ARM_ORDER]
+            except KeyError:
+                pass
+        # Without a fresh board, what this runtime last sent in this mode is the
+        # target the platform holds; only with neither is nothing sent.
+        return None if self._arm_sent is None else list(self._arm_sent)
 
     def publish_safe_command(self) -> None:
         """Explicit zero before we stop publishing (the tier has no fail-safe)."""
@@ -1879,7 +1922,7 @@ class AimdkRuntimeNode(Node):
             array.data.extend(float(cell) for cell in cells)
         publisher.publish(array)
 
-    def _publish_arm_command(self, message: Any) -> None:
+    def _publish_arm_command(self, message: Any, received: float | None = None) -> None:
         """Republish what the motion-control unit is driving the arm to, in the declared order.
 
         The HAL publishes the arm's position targets and gains apart from its
@@ -1901,6 +1944,9 @@ class AimdkRuntimeNode(Node):
         echo.stiffness = [row[1] for row in rows]
         echo.damping = [row[2] for row in rows]
         self._arm_command_pub.publish(echo)
+        with self._lock:
+            self._arm_board = dict(zip(self._arm_command_order, echo.position, strict=True))
+            self._arm_board_received = time.monotonic() if received is None else received
 
     def _record_feedback(
         self,

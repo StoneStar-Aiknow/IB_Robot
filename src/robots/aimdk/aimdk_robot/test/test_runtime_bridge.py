@@ -1669,10 +1669,100 @@ def test_the_arm_command_is_republished_with_its_gains_in_the_declared_order():
         command.data = [0.2] * 14
         harness.publish("/aimdk/arm/commands", command)
         echo = harness.wait_for(
-            lambda: received[-1] if received and received[-1].position[0] == pytest.approx(0.25) else None,
+            lambda: received[-1] if received and received[-1].position[0] == pytest.approx(0.2) else None,
             "the echo to follow the streamed target",
         )
-        assert list(echo.position) == pytest.approx([0.25] * 14)
+        assert list(echo.position) == pytest.approx([0.2] * 14)  # the target; the arm settles below it
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_hand_channel_holds_the_measured_hand_instead_of_voiding_the_arm():
+    """In the dexterous joint sub-mode the platform drops a command without hand targets, arm included."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        command = Float64MultiArray()
+        command.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", command)  # no hand command at all
+        sent = harness.wait_for(
+            lambda: (m := harness.mock.last_upper_body) is not None and m.arm_pos[0] == pytest.approx(0.2) and m,
+            "the arm command to reach the platform",
+        )
+        assert int(sent.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT and len(sent.hand_pos) == 20
+        measured = [harness.mock._positions[f"L_{part}_joint"] for part in projection.DEXTEROUS_JOINT_ORDER]
+        assert list(sent.hand_pos[:10]) == pytest.approx(measured, abs=1e-6)
+        assert harness.mock.discarded_upper_body == 0
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_hand_channel_keeps_its_last_command_so_a_grip_stays_squeezed():
+    """A hand closed on an object stops short of its target; sending back where it stopped would let go."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", follow_commands=False)  # the object blocks it
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        closed = Float64MultiArray()
+        closed.data = [0.6] * 10 + [0.0] * 10
+        harness.publish("/aimdk/hand/joint_commands", closed, count=10)  # then the hand executor goes quiet
+        arm = Float64MultiArray()
+        arm.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", arm, count=50)  # a one-second lift, well past the hand's staleness
+        sent = harness.mock.last_upper_body
+        measured = [harness.mock._positions.get(f"L_{part}_joint", 0.0) for part in projection.DEXTEROUS_JOINT_ORDER]
+        assert measured != pytest.approx([0.6] * 10)
+        assert list(sent.hand_pos) == pytest.approx([0.6] * 10 + [0.0] * 10)
+        assert harness.set_mode("idle").success and harness.set_mode("policy_stream").success
+        harness.publish("/aimdk/arm/commands", arm, count=5)  # a new mode starts from the measured hand again
+        assert list(harness.mock.last_upper_body.hand_pos[:10]) == pytest.approx(measured, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+def test_without_a_fresh_board_a_quiet_arm_repeats_what_was_last_sent():
+    """A board that goes quiet must not stop head and hand streams; the platform holds the last arm target."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        arm = Float64MultiArray()
+        arm.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", arm, count=10)
+        harness.mock.set_parameters([rclpy.parameter.Parameter("publish_arm_command", value=False)])
+        time.sleep(0.6)  # the arm channel and the board both go quiet
+        hand = Float64MultiArray()
+        hand.data = [0.1] * 10 + [0.0] * 10
+        before = harness.mock.upper_body_count
+        harness.publish("/aimdk/hand/joint_commands", hand, count=10)
+        assert harness.mock.upper_body_count > before
+        assert list(harness.mock.last_upper_body.arm_pos) == pytest.approx([0.2] * 14)
+        assert list(harness.mock.last_upper_body.hand_pos[:10]) == pytest.approx([0.1] * 10)
+        # A new mode has sent nothing yet: without a board there is no arm target to hold.
+        assert harness.set_mode("idle").success and harness.set_mode("policy_stream").success
+        before = harness.mock.upper_body_count
+        harness.publish("/aimdk/hand/joint_commands", hand, count=10)
+        assert harness.mock.upper_body_count == before
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_arm_channel_holds_the_controllers_target_not_the_sagging_arm():
+    """Holding the measured arm re-targets it below where it hangs, every tick: it sank on the robot."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        before = harness.mock._positions.get("left_elbow_joint", 0.0)
+        hand = Float64MultiArray()
+        left = [harness.mock._positions.get(f"L_{part}_joint", 0.0) for part in projection.DEXTEROUS_JOINT_ORDER]
+        hand.data = left + [0.0] * 10
+        harness.publish("/aimdk/hand/joint_commands", hand, count=50)  # one second of hand only
+        sent = harness.wait_for(lambda: harness.mock.last_upper_body, "a hand command to reach the platform")
+        index = projection.VENDOR_ARM_ORDER.index("left_elbow_joint")
+        assert sent.arm_pos[index] == pytest.approx(before + 0.05)  # the board, not the measured arm
+        assert harness.mock._positions.get("left_elbow_joint", 0.0) == pytest.approx(before)
     finally:
         harness.shutdown()
 
@@ -1699,11 +1789,14 @@ def test_an_incomplete_or_nonfinite_arm_command_is_not_a_target():
         _arm_command_order=names,
         _arm_command_pub=SimpleNamespace(publish=published.append),
         get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=5)),
+        _lock=threading.Lock(),
+        _arm_board=None,
     )
     AimdkRuntimeNode._publish_arm_command(node, Message([Joint(name, 0.1) for name in names[:13]]))
     assert published == []
     AimdkRuntimeNode._publish_arm_command(node, Message([Joint(name, 0.1) for name in reversed(names)]))
     assert list(published[0].name) == names and published[0].header.stamp.sec == 5
+    assert node._arm_board == dict.fromkeys(names, 0.1)  # what a quiet arm channel holds
 
 
 def test_only_a_profile_that_declares_the_arm_command_echo_publishes_one():
@@ -2430,6 +2523,7 @@ def test_platform_state_is_taken_in_batches_when_read_and_none_of_it_is_lost():
             burst.publish(message)
             sent += 1
             time.sleep(0.0025)
+        time.sleep(0.1)  # the last drain
         arm = handled.count("arm")
         assert sent > 250 and arm >= 0.9 * sent, (sent, arm)
         assert len(views) >= 35, len(views)  # 50 Hz
