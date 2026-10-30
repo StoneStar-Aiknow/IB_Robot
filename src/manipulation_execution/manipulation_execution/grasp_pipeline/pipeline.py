@@ -97,6 +97,20 @@ class GraspPipeline:
             on_phase(name, event, detail)
 
         backends = self._backends
+        try:
+            return self._run(query, mode, deadline, cancelled, stop, phase, release_after_success, outcome)
+        finally:
+            # The goal is over: the robot keeps holding what it was last sent.
+            for part in (backends.executor, backends.effector):
+                finish = getattr(part, "finish", None)
+                if finish is not None:
+                    try:
+                        finish()
+                    except Exception as exc:  # noqa: BLE001 - the goal's own outcome stands
+                        outcome.report.setdefault("finish_errors", []).append(f"{type(exc).__name__}: {exc}")
+
+    def _run(self, query, mode, deadline, cancelled, stop, phase, release_after_success, outcome) -> PickOutcome:
+        backends = self._backends
         planning_failures, replans = 0, 0
         try:
             while True:

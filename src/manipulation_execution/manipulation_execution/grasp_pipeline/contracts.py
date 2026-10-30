@@ -351,6 +351,13 @@ class GraspPlanner(Protocol):
 
 
 class MotionExecutor(Protocol):
+    """Moves one robot's arm through plan segments.
+
+    Optional: ``return_home(home_segment, *, cancelled) -> MotionOutcome | None``
+    decides where a retreat leaves the arm (None: the sequence's default, the
+    plan's start); ``finish()`` ends the executor's hold on the robot after a goal.
+    """
+
     def execute(self, segment: ArmSegment, *, carrying: bool, halted: Flag, cancelled: Flag) -> MotionOutcome:
         """Run one segment. Poll ``halted`` between commands and return HALTED,
         holding the last command, as soon as it is true; ``carrying`` says the
@@ -369,6 +376,8 @@ class MotionExecutor(Protocol):
 
 
 class EndEffector(Protocol):
+    """Optional: ``finish()`` ends its hold on the robot after a goal."""
+
     def act(self, action: EffectorAction, *, halted: Flag, cancelled: Flag) -> EffectorOutcome: ...
 
 

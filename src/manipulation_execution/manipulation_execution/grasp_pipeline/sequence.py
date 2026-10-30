@@ -297,7 +297,18 @@ class GraspSequence:
 
     def _return_home(self, plan: GraspPlan, cancelled: Flag, result) -> None:
         home = next(step.segment for step in plan.steps if isinstance(step, Move))
-        here = self._backends.executor.measured(home.joint_names)
+        executor = self._backends.executor
+        # An executor may know better where to leave the arm (e.g. a fixed controller
+        # command, so that landings do not ratchet); None leaves it to the default.
+        custom = getattr(executor, "return_home", None)
+        if custom is not None:
+            self._on_phase("home", "start", {})
+            outcome = custom(home, cancelled=cancelled)
+            if outcome is not None:
+                self._phase(result, "home", outcome)
+                self._expect(outcome)
+                return
+        here = executor.measured(home.joint_names)
         if float(np.max(np.abs(here - home.start))) <= self._home_tolerance:
             return
         correction = ArmSegment("home_correction", SegmentKind.TARGET, home.joint_names, np.stack([here, home.start]))
