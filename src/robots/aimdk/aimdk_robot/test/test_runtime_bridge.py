@@ -9,9 +9,11 @@ independence gate applies.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +21,7 @@ rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("aimdk_msgs", reason="AimDK overlay not sourced; source the vendor workspace to run these")
 
 from aimdk_robot import projection  # noqa: E402
+from aimdk_robot import vendor_gateway as vendor  # noqa: E402
 from aimdk_robot.runtime_node import AimdkRuntimeNode  # noqa: E402
 from aimdk_robot.vendor_mock_node import AimdkVendorMock  # noqa: E402
 from geometry_msgs.msg import Twist  # noqa: E402
@@ -28,7 +31,7 @@ from std_msgs.msg import Float64MultiArray  # noqa: E402
 from std_srvs.srv import SetBool  # noqa: E402
 
 from ibrobot_msgs.action import ExecuteNamedMotion  # noqa: E402
-from ibrobot_msgs.msg import PowerState  # noqa: E402
+from ibrobot_msgs.msg import JointCommandState, PowerState  # noqa: E402
 from ibrobot_msgs.srv import (  # noqa: E402
     GetRuntimeStatus,
     PlayExpression,
@@ -126,6 +129,13 @@ def _sensor_qos():
         history=HistoryPolicy.KEEP_LAST,
         depth=10,
     )
+
+
+def _vendor_qos(key: str):
+    """What the platform publishes ``key`` with: a test standing in for it must match, or nothing is delivered."""
+    from aimdk_robot.vendor_mock_node import _qos
+
+    return _qos(key)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -1577,6 +1587,74 @@ def test_head_targets_are_checked_against_the_platform_travel(harness):
     assert any("HEAD_COMMAND_RANGE" in channel for channel in status.rejected_channels)
 
 
+def test_the_arm_command_is_republished_with_its_gains_in_the_declared_order():
+    """What the motion-control unit drives the arm to, apart from where the arm is."""
+    received: list[JointCommandState] = []
+    # A loaded arm settles below its target; the mock models that gap as an offset.
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.node.create_subscription(JointCommandState, "/aimdk/arm/command_state", received.append, _sensor_qos())
+        echo = harness.wait_for(lambda: received[-1] if received else None, "an arm command echo")
+        assert list(echo.name) == list(projection.VENDOR_ARM_ORDER)
+        assert echo.stiffness.tolist() == [40.0] * 14 and echo.damping.tolist() == [2.0] * 14
+        # Stamped with the HAL's own time, not this host's receipt.
+        assert echo.header.stamp.sec > 0
+        measured = harness.mock._positions.get("left_elbow_joint", 0.0)
+        assert echo.position[echo.name.index("left_elbow_joint")] == pytest.approx(measured + 0.05)
+
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        command = Float64MultiArray()
+        command.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", command)
+        echo = harness.wait_for(
+            lambda: received[-1] if received and received[-1].position[0] == pytest.approx(0.25) else None,
+            "the echo to follow the streamed target",
+        )
+        assert list(echo.position) == pytest.approx([0.25] * 14)
+    finally:
+        harness.shutdown()
+
+
+def test_an_incomplete_or_nonfinite_arm_command_is_not_a_target():
+    from rclpy.time import Time
+
+    class Joint:
+        def __init__(self, name, position, stiffness=40.0, damping=2.0):
+            self.name, self.position, self.stiffness, self.damping = name, position, stiffness, damping
+
+    class Message:
+        def __init__(self, joints):
+            self.joints = joints
+
+    names = list(projection.VENDOR_ARM_ORDER)
+    entries = vendor.joint_command_entries(Message([Joint(name, 0.1) for name in names]))
+    assert list(entries) == names and entries[names[0]] == (0.1, 40.0, 2.0)
+    assert vendor.joint_command_entries(Message([Joint(names[0], float("nan"))])) == {}
+    assert vendor.joint_command_entries(Message([Joint(names[0], 0.1), Joint(names[0], 0.2)])) == {}
+    # The runtime publishes only a message that covers every declared joint.
+    published = []
+    node = SimpleNamespace(
+        _arm_command_order=names,
+        _arm_command_pub=SimpleNamespace(publish=published.append),
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=5)),
+    )
+    AimdkRuntimeNode._publish_arm_command(node, Message([Joint(name, 0.1) for name in names[:13]]))
+    assert published == []
+    AimdkRuntimeNode._publish_arm_command(node, Message([Joint(name, 0.1) for name in reversed(names)]))
+    assert list(published[0].name) == names and published[0].header.stamp.sec == 5
+
+
+def test_only_a_profile_that_declares_the_arm_command_echo_publishes_one():
+    from aimdk_robot.runtime_node import ARM_COMMAND_STATE, _arm_command_state
+
+    from robot_runtime.profile import load_profile
+
+    assert _arm_command_state(load_profile(OMNIHAND_PROFILE))[0] == "/aimdk/arm/command_state"
+    assert ARM_COMMAND_STATE not in (load_profile(PROFILE).get("interfaces") or {})
+    assert _arm_command_state(load_profile(PROFILE)) is None
+
+
 def test_dexterous_hand_touch_is_republished_with_named_pads():
     """The densest contact sensor on the robot rides on a message already subscribed."""
     received: list[Float64MultiArray] = []
@@ -1596,6 +1674,188 @@ def test_dexterous_hand_touch_is_republished_with_named_pads():
         assert set(frame.data) == {7.0}
     finally:
         harness.shutdown()
+
+
+def test_dexterous_hand_joint_states_are_published_in_the_declared_order():
+    """Grasping needs the finger pose at image time; the hands are not in /joint_states."""
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        message = harness.wait_for(lambda: received[-1] if received else None, "a hand joint state message")
+        import yaml
+
+        declared = yaml.safe_load(OMNIHAND_PROFILE.read_text())["interfaces"]["joint.hand_state"]["joint_names"]
+        # The mock reports the platform's finger joints; the runtime publishes all of
+        # them in the declared order, so the profile and the mock cannot drift apart.
+        assert list(message.name) == declared
+        assert len(declared) == 20 and declared[10] == "R_thumb_roll_joint"
+        assert len(message.position) == len(message.velocity) == len(message.effort) == 20
+        assert message.header.stamp.sec > 0
+    finally:
+        harness.shutdown()
+
+
+def test_a_slow_group_does_not_hold_back_the_stamp_of_views_it_does_not_feed():
+    """The hand view is stamped from the hand group only, not from the legs.
+
+    With the leg feed stopped, its last receipt stays fresh for the staleness
+    window. A stamp taken across every group would freeze there, and a consumer
+    keeping an ordered history would drop every newer finger sample as a repeat.
+    """
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters(
+            [rclpy.parameter.Parameter("publish_joint_groups", value=["arm", "head", "waist", "hand"])]
+        )
+        time.sleep(0.05)
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        harness.wait_for(lambda: len(received) >= 8, "eight hand joint state messages", timeout_s=3.0)
+        stamps = [message.header.stamp.sec * 10**9 + message.header.stamp.nanosec for message in received[:8]]
+        # Eight 50 Hz messages span ~140 ms. A stamp pinned to the stopped leg feed
+        # would not move at all; one may repeat when no new hand sample arrived.
+        assert stamps == sorted(stamps)
+        assert stamps[-1] - stamps[0] >= 80_000_000, f"hand view stamp held back: {stamps}"
+    finally:
+        harness.shutdown()
+
+
+def test_a_profile_listed_joint_fault_degrades_the_runtime_and_clears_when_healthy():
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=5)])
+        status = harness.wait_for(
+            lambda: harness.status() if harness.status().lifecycle == "DEGRADED" else None,
+            "the arm joint fault to be reported",
+        )
+        fault = next(fault for fault in status.faults if fault.startswith("arm joint fault"))
+        assert "left_shoulder_pitch_joint=5" in fault
+
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=0)])
+        harness.wait_active()
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_a_fault_code_in_a_single_sample_between_reads_is_still_seen():
+    """The runtime reads platform state at 50 Hz; a fault the HAL reports for one 2 ms sample must not slip past."""
+    from aimdk_msgs.msg import JointStateArray
+    from rclpy.qos import qos_profile_sensor_data
+
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        captured: list = []
+        harness.node.create_subscription(
+            JointStateArray, "/aima/hal/joint/arm/state", captured.append, qos_profile_sensor_data
+        )
+        harness.wait_for(lambda: captured, "an arm state from the platform")
+        burst = harness.node.create_publisher(JointStateArray, "/aima/hal/joint/arm/state", _vendor_qos("joint_state"))
+        seen: list = []
+        report = harness.runtime._report_joint_faults
+
+        def recording(group, codes):
+            seen.extend(code for _name, code in codes if code)
+            report(group, codes)
+
+        harness.runtime._report_joint_faults = recording
+        message = captured[-1]
+        for _ in range(5):
+            message.joints[0].error_code = 7
+            message.header.stamp = harness.node.get_clock().now().to_msg()
+            burst.publish(message)  # one faulted sample, then healthy ones right behind it
+            message.joints[0].error_code = 0
+            for _ in range(5):
+                message.header.stamp = harness.node.get_clock().now().to_msg()
+                burst.publish(message)
+            time.sleep(0.1)
+        assert seen.count(7) >= 4, seen  # best effort on loopback may drop one
+    finally:
+        harness.shutdown()
+
+
+def test_the_mock_dexterous_hand_follows_its_joint_commands():
+    """With follow_commands, the mock's fingers go where the hand stream sends them."""
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        command = [0.1 * (index + 1) for index in range(10)] + [0.0] * 10
+        described = json.loads(harness.status().interface_description_json)["interfaces"]
+        stream = described["joint.hand_stream"]["endpoint"]
+        harness.publish(stream, Float64MultiArray(data=command), count=25)
+
+        def thumb_abad():
+            latest = received[-1] if received else None
+            return (
+                latest is not None
+                and abs(dict(zip(latest.name, latest.position, strict=False))["L_thumb_abad_joint"] - 0.2) < 1e-6
+            )
+
+        harness.wait_for(thumb_abad, "the left thumb abduction to follow the command", timeout_s=3.0)
+        positions = dict(zip(received[-1].name, received[-1].position, strict=False))
+        assert positions["L_pinky_pip_joint"] == pytest.approx(1.0)
+    finally:
+        harness.shutdown()
+
+
+def test_hand_faultcodes_do_not_stop_commands():
+    """OmniHand faultcodes are set while a finger presses an object: a grasp."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters([rclpy.parameter.Parameter("hand_joint_faultcode", value=1)])
+        time.sleep(0.5)
+        assert harness.status().lifecycle == "ACTIVE" and not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_a_profile_without_fault_groups_ignores_joint_fault_codes(harness):
+    harness.wait_active()
+    harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=5)])
+    time.sleep(0.5)
+    assert harness.status().lifecycle == "ACTIVE" and not harness.status().faults
+
+
+def test_joint_states_carry_the_platform_stamp():
+    """Joint states share the platform clock its cameras stamp images with."""
+    offset_s = 0.08  # within the runtime's 0.1 s clock skew limit
+    harness = Harness(clock_offset_s=offset_s)
+    try:
+        harness.wait_active()
+        received = []
+        harness.node.create_subscription(JointState, "/joint_states", received.append, 10)
+        message = harness.wait_for(lambda: received[-1] if received else None, "a joint state message")
+        local_ns = harness.node.get_clock().now().nanoseconds
+        stamp_ns = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+        # Stamped on the platform clock: ahead of this host by the offset, less
+        # delivery; a receipt stamp would be behind.
+        assert 0.02 < (stamp_ns - local_ns) * 1e-9 < offset_s + 0.005
+    finally:
+        harness.shutdown()
+
+
+def test_a_measurement_stamp_is_preferred_and_a_missing_stamp_falls_back():
+    from types import SimpleNamespace
+
+    from aimdk_robot import vendor_gateway as vendor
+
+    def header(stamp, meas):
+        return SimpleNamespace(
+            stamp=SimpleNamespace(sec=stamp, nanosec=0), meas_stamp=SimpleNamespace(sec=meas, nanosec=0)
+        )
+
+    assert vendor.message_stamp(header(10, 0)).nanoseconds == 10 * 10**9
+    assert vendor.message_stamp(header(10, 9)).nanoseconds == 9 * 10**9
+    assert vendor.message_stamp(header(0, 0)) is None
+    assert vendor.message_stamp(None) is None
 
 
 def test_a_claw_contributes_no_tactile_frames():
@@ -1841,6 +2101,72 @@ def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
         harness.shutdown()
 
 
+def test_a_sample_the_middleware_did_not_time_is_never_fresh_feedback():
+    """CycloneDDS records no receive time, and such a sample may be any age.
+
+    Counting it fresh would let a quiet channel hold the arm or the hand at a
+    measured position taken seconds ago, which is what sagged the arm live.
+    """
+    from types import SimpleNamespace
+
+    harness = Harness()
+    try:
+        harness.wait_active()
+        entries = [("left_shoulder_pitch_joint", 0.1, 0.0, 0.0)]
+        stamped = SimpleNamespace(stamp=SimpleNamespace(sec=5, nanosec=0))
+        harness.runtime._record_feedback("arm", entries, stamped, time.monotonic())
+        fresh, _stale = projection.partition_fresh(
+            harness.runtime._feedback_received,
+            now_s=time.monotonic(),
+            window_s=harness.runtime._feedback_window_s,
+        )
+        assert "arm" in fresh, "a dated sample is fresh"
+        harness.runtime._record_feedback("arm", entries, stamped, None)
+        fresh, stale = projection.partition_fresh(
+            harness.runtime._feedback_received,
+            now_s=time.monotonic(),
+            window_s=harness.runtime._feedback_window_s,
+        )
+        assert "arm" in stale and "arm" not in fresh
+    finally:
+        harness.shutdown()
+
+
+def test_a_view_fed_by_stamped_and_unstamped_groups_still_publishes():
+    """Mixed stamp sources must stay comparable.
+
+    A vendor stamp becomes an rclpy ``Time`` on the platform clock (SYSTEM_TIME)
+    while a message carrying no stamp falls back to this node's clock (ROS_TIME).
+    Holding both as ``Time`` made the ``min()`` that stamps each view raise
+    ``Can't compare times with different clock types`` inside a timer callback,
+    which takes the executor down. The recorded times are plain nanoseconds, so
+    every combination compares.
+    """
+    from types import SimpleNamespace
+
+    harness = Harness()
+    try:
+        harness.wait_active()
+        # The view publisher takes the newest platform samples first: keep the
+        # mock's head and waist from replacing the ones recorded below.
+        harness.mock.set_parameters([rclpy.parameter.Parameter("publish_joint_groups", value=["arm", "leg", "hand"])])
+        time.sleep(0.2)
+        harness.runtime._drain_platform_state()
+        stamped = SimpleNamespace(stamp=SimpleNamespace(sec=5, nanosec=0))
+        now = time.monotonic()
+        harness.runtime._record_feedback("head", [("head_yaw_joint", 0.1, 0.0, 0.0)], stamped, now)
+        harness.runtime._record_feedback("waist", [("waist_yaw_joint", 0.2, 0.0, 0.0)], None, now)
+        # The body view is fed by both groups, so this is where the two sources
+        # meet. Raises TypeError when they are not the same kind of value.
+        harness.runtime._publish_joint_states()
+        recorded = harness.runtime._feedback_clock
+        assert isinstance(recorded["head"], int), "a platform stamp must be recorded as nanoseconds"
+        assert isinstance(recorded["waist"], int), "the host-clock fallback must be recorded as nanoseconds"
+        assert recorded["head"] == 5_000_000_000
+    finally:
+        harness.shutdown()
+
+
 def test_stop_ends_a_replay_and_no_further_arm_target_is_sent(tmp_path):
     harness = _replay_harness(tmp_path, duration_s=3.0)
     try:
@@ -2008,5 +2334,43 @@ def test_a_mode_whose_platform_action_is_already_active_is_entered_without_askin
         assert response.success, response.message
         assert "already in UPPERBODY_REMOTE_SPLIT" in response.message
         assert harness.status().active_mode == "stream"
+    finally:
+        harness.shutdown()
+
+
+def test_platform_state_is_taken_in_batches_when_read_and_none_of_it_is_lost():
+    """At ~400 Hz of arm state the views keep their 50 Hz, and every sample is still seen (its fault codes)."""
+    from aimdk_msgs.msg import JointStateArray
+    from rclpy.qos import qos_profile_sensor_data
+
+    harness = Harness()
+    try:
+        harness.wait_active()
+        captured: list = []
+        harness.node.create_subscription(
+            JointStateArray, "/aima/hal/joint/arm/state", captured.append, qos_profile_sensor_data
+        )
+        harness.wait_for(lambda: captured, "an arm state from the platform")
+        burst = harness.node.create_publisher(JointStateArray, "/aima/hal/joint/arm/state", _vendor_qos("joint_state"))
+        handled, views = [], []
+        handle = harness.runtime._on_joint_state
+
+        def counting(group, message, received=None):
+            handled.append(group)
+            handle(group, message, received)
+
+        harness.runtime._on_joint_state = counting
+        harness.node.create_subscription(JointState, "/joint_states", views.append, 10)
+        started = time.monotonic()
+        sent = 0
+        while time.monotonic() - started < 1.0:
+            message = captured[-1]
+            message.header.stamp = harness.node.get_clock().now().to_msg()
+            burst.publish(message)
+            sent += 1
+            time.sleep(0.0025)
+        arm = handled.count("arm")
+        assert sent > 250 and arm >= 0.9 * sent, (sent, arm)
+        assert len(views) >= 35, len(views)  # 50 Hz
     finally:
         harness.shutdown()

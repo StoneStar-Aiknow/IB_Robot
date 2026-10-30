@@ -9,6 +9,7 @@ types without a robot.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -182,6 +183,19 @@ def _stamp(node: Any) -> Any:
     return node.get_clock().now().to_msg()
 
 
+def message_stamp(header: Any) -> Any:
+    """A vendor header's time as an rclpy Time: ``meas_stamp`` (measurement time)
+    if set, else ``stamp``; None when it carries neither. The X2 HAL sets only
+    ``stamp``."""
+    from rclpy.time import Time
+
+    for field in ("meas_stamp", "stamp"):
+        stamp = getattr(header, field, None)
+        if stamp is not None and (stamp.sec or stamp.nanosec):
+            return Time(seconds=stamp.sec, nanoseconds=stamp.nanosec)
+    return None
+
+
 def message_header(node: Any, *, frame_id: str, sequence: int) -> Any:
     header = MessageHeader()
     header.stamp = _stamp(node)
@@ -347,6 +361,25 @@ def hand_statuses(runtime_model: Any) -> list[int]:
         int(getattr(getattr(runtime_model, "left_hand_status", None), "value", 0) or 0),
         int(getattr(getattr(runtime_model, "right_hand_status", None), "value", 0) or 0),
     ]
+
+
+def joint_command_entries(message: Any) -> dict[str, tuple[float, float, float]]:
+    """``{joint: (position, stiffness, damping)}`` of a HAL ``JointCommandArray``.
+
+    This is what the motion-control unit is driving each joint to, not where the
+    joint is: under load a joint settles away from its target by torque /
+    stiffness. An entry with a non-finite value, or a joint named twice, makes the
+    whole message unusable and the result empty, since a partial target is not
+    the controller's target.
+    """
+    entries: dict[str, tuple[float, float, float]] = {}
+    for joint in getattr(message, "joints", ()):
+        name = str(joint.name)
+        values = (float(joint.position), float(joint.stiffness), float(joint.damping))
+        if not name or name in entries or not all(math.isfinite(value) for value in values):
+            return {}
+        entries[name] = values
+    return entries
 
 
 def hand_touch_frames(message: Any) -> dict[str, list[int]]:

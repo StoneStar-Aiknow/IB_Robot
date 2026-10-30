@@ -53,6 +53,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SceneObject.msg"
   "msg/SceneObservation.msg"
   "msg/AttentionWeights.msg"
+  "msg/JointCommandState.msg"
   "msg/JointCurrent.msg"
   "msg/Detection2D.msg"
   "msg/DetectionArray.msg"

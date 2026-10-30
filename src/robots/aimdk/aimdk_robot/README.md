@@ -28,7 +28,9 @@ package.
 | Public surface | Type | Platform mechanism |
 |---|---|---|
 | `/runtime/set_mode`, `/runtime/get_status`, `/runtime/stop`, `/runtime_status` | contract | `SetMcAction`, `/aima/mc/common/state`, `/aima/sm/system_state` |
-| `/joint_states`, `/aimdk/body_joint_states` | `sensor_msgs/JointState` | `/aima/hal/joint/{arm,head,waist,leg}/state`, hand state |
+| `/joint_states`, `/aimdk/body_joint_states` | `sensor_msgs/JointState`, stamped on the platform clock (HAL header stamp) | `/aima/hal/joint/{arm,head,waist,leg}/state`, hand state |
+| `/aimdk/hand/joint_states` (OmniHand profile) | `sensor_msgs/JointState`, ten finger joints per hand | `/aima/hal/joint/hand/state` |
+| `faults` in `/runtime_status` (`<group> joint fault: <joint>=<code>`) | contract | non-zero `error_code` / `faultcode` of the groups a profile lists in `vendor.feedback.fault_groups` (OmniHand: arm, head; none by default) |
 | `/aimdk/arm/commands`, `/aimdk/gripper/commands`, `/aimdk/head/commands` | `Float64MultiArray` | `/mc/upper_body_command` (`arm_pos` / `hand_pos` / `head_pos`) |
 | `/cmd_vel` | `geometry_msgs/Twist` | `/aima/mc/locomotion/velocity` + input-source arbitration |
 | `/motion/execute_named` | `ibrobot_msgs/action/ExecuteNamedMotion` | `SetMcPresetMotion` (wave, handshake, clap…) and posture MC actions (sit, squat, lie, stand up, stairs); in `stream`, recorded arm trajectories on `/mc/upper_body_command` |
@@ -337,8 +339,25 @@ component the facade and mock runtimes use, so `audio.speech` is `ready` before
 the wake word and `wait_for_runtime` can admit ASR. The monitor is given only
 `OBSERVED_INTERFACES = ("audio.speech",)`: handing it the whole description would
 re-subscribe the camera and lidar streams inside this process on a board that is
-already the bottleneck. Its subscription runs in the speech callback group so the
-~500 Hz joint feedback cannot delay it past the staleness window.
+already the bottleneck. Its subscription runs in the speech callback group so
+nothing else on the executor can delay it past the staleness window.
+
+### Platform state is taken when it is read
+
+The HAL publishes each joint group, the hand state and the arm command at
+~200-500 Hz. Taking every sample in an executor callback held a core on the
+robot-side host, and under a 400 Hz group the executor published one view a
+second instead of fifty (2026-10-22). These subscriptions are therefore not in
+the executor: samples wait in reader queues (`robot_runtime.on_demand`) and the
+readers drain them first, in one batch per read: the joint state views at
+`joint_state_rate_hz` (50 Hz), the hold targets of a stream command, the 5 Hz
+staleness check and the hand-type verification. Each sample keeps its platform
+stamp and when it was received, so a quiet source still goes stale on time.
+Joint and hand state keep every sample between reads (`PLATFORM_STATE_DEPTH`),
+so a fault code that lasts a few samples is reported and the touch arrays below
+are republished at the platform's rate, in bursts at the view rate; only the
+newest arm command board is kept, and its echo below is republished at the
+view rate.
 
 ### The platform's wake word is reported as `audio.wake_event`
 
@@ -409,7 +428,7 @@ not clamped, for the same reason a gripper command is.
 
 `HandStateArray` carries a 36-cell palm, a 36-cell back and five 16-cell
 fingertips per hand. They are republished on `/aimdk/hand_touch` as a
-`Float64MultiArray` whose layout dimensions name each pad and its size, because
+`Float64MultiArray` (at the view rate, above) whose layout dimensions name each pad and its size, because
 the pads have different cell counts and a fixed-width matrix would pad or
 truncate them.
 
@@ -418,6 +437,21 @@ touch fields exist on every hand state message, a gripper's included, where
 they are all zeros — that is the absence of a sensor, not a measurement of no
 contact, and publishing it would invent a tactile array the robot does not
 have. The gripper profile therefore declares no tactile endpoint.
+
+### The arm command the motion-control unit is driving
+
+The HAL publishes the arm's position targets and gains on
+`/aima/hal/joint/arm/command`, apart from the measured state. The OmniHand
+profile republishes them as `joint.arm_command_state` on
+`/aimdk/arm/command_state` (`ibrobot_msgs/JointCommandState`, the 14 arm joints in
+the stream's order, stamped with the HAL's platform time, at the view rate). Under load an arm
+settles below its target by torque / stiffness (about 0.1 rad at the shoulder in
+an extended pose at kp 40), so an executor that takes over `joint.arm_stream`
+must start from these targets or the arm drops at takeover. It is also how an
+executor sees the platform clamp a target it sent at a joint limit, and the
+gains its gravity model assumes. A message missing a declared joint or carrying
+a non-finite value is not republished: half a target is not the controller's
+target. This runtime never writes gains; the echo only reports them.
 
 ### Declared sensors are what the firmware actually serves
 

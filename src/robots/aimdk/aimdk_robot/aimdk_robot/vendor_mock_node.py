@@ -23,6 +23,8 @@ from aimdk_msgs.msg import (
     HandState,
     HandStateArray,
     HandType,
+    JointCommand,
+    JointCommandArray,
     JointState,
     JointStateArray,
     McCommonState,
@@ -81,6 +83,9 @@ _VENDOR_QOS: dict[str, dict[str, str]] = {
     "system_state": {"reliability": "best_effort", "durability": "transient_local"},
     "joint_state": {"reliability": "best_effort", "durability": "transient_local"},
     "hand_state": {"reliability": "best_effort", "durability": "transient_local"},
+    # Not in the SDK tables; published like the HAL joint state topics. The
+    # runtime subscribes volatile, which matches either durability.
+    "arm_command": {"reliability": "best_effort", "durability": "transient_local"},
     "power_state": {"reliability": "best_effort", "durability": "transient_local"},
     "audio_capture": {"reliability": "reliable", "durability": "volatile"},
     "audio_playback": {"reliability": "reliable", "durability": "volatile"},
@@ -95,6 +100,8 @@ LEG_JOINTS = [
     for side in ("left", "right")
     for joint in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
 ]
+#: The ten driven finger joints the platform reports per OmniHand, in its order.
+DEXTEROUS_HAND_PARTS = projection.DEXTEROUS_JOINT_ORDER
 
 
 class AimdkVendorMock(Node):
@@ -150,6 +157,19 @@ class AimdkVendorMock(Node):
         self.declare_parameter("player_state", projection.PLAYER_STATE_IDLE)
         # Touch cell value reported by every pad of the dexterous hands.
         self.declare_parameter("hand_touch_value", 7)
+        # Vendor faultcode reported by every finger joint of a dexterous hand
+        # (0 = healthy), to exercise the runtime's hand joint fault path.
+        self.declare_parameter("hand_joint_faultcode", 0)
+        # Vendor error_code reported by every arm joint (0 = healthy).
+        self.declare_parameter("arm_joint_error_code", 0)
+        # The HAL's arm command: the targets the motion-control unit drives the
+        # arms to and its gains. This mock has no load, so the targets are the
+        # positions it reports; the offset lets a test model the gap a loaded
+        # arm settles below its target.
+        self.declare_parameter("publish_arm_command", True)
+        self.declare_parameter("arm_command_stiffness", 40.0)
+        self.declare_parameter("arm_command_damping", 2.0)
+        self.declare_parameter("arm_command_offset", 0.0)
 
         self._lock = threading.Lock()
         self._action = str(self.get_parameter("initial_action").value)
@@ -226,6 +246,9 @@ class AimdkVendorMock(Node):
             "leg": (self.create_publisher(JointStateArray, "/aima/hal/joint/leg/state", joint_qos), LEG_JOINTS),
         }
         self._hand_pub = self.create_publisher(HandStateArray, "/aima/hal/joint/hand/state", _qos("hand_state"))
+        self._arm_command_pub = self.create_publisher(
+            JointCommandArray, "/aima/hal/joint/arm/command", _qos("arm_command")
+        )
         # Audio: the platform publishes capture and subscribes playback RELIABLE.
         self._audio_pub = self.create_publisher(AudioCapture, "/aima/hal/audio/capture", _qos("audio_capture"))
         self.create_subscription(
@@ -357,13 +380,19 @@ class AimdkVendorMock(Node):
         return left, HAND_TYPE_VALUES.get(right_name, vg.HAND_TYPE_CLAW) if right_name else left
 
     @staticmethod
-    def _hand_joints(side: str, value: int, positions: dict[str, float]) -> list:
+    def _hand_joints(side: str, value: int, positions: dict[str, float], faultcode: int = 0) -> list:
         """A dexterous hand reports its ten joints by name, as on the robot; an absent one reports none."""
         if vg.hand_type_family(value) == "dexterous":
             prefix = "L" if side == "left" else "R"
             return [
-                HandState(name=f"{prefix}_{joint}_joint", position=0.0, velocity=0.0, effort=0.0)
-                for joint in projection.DEXTEROUS_JOINT_ORDER
+                HandState(
+                    name=(name := f"{prefix}_{joint}_joint"),
+                    position=positions.get(name, 0.0),
+                    velocity=0.0,
+                    effort=0.0,
+                    faultcode=faultcode,
+                )
+                for joint in DEXTEROUS_HAND_PARTS
             ]
         if value == vg.HAND_TYPE_NONE and side == "right":
             return []
@@ -472,6 +501,11 @@ class AimdkVendorMock(Node):
             hand_pos = list(message.hand_pos)
             if int(message.hand_sub_mode) == projection.HAND_SUB_MODE_CLAW and len(hand_pos) == 2:
                 self._positions["left_hand"], self._positions["right_hand"] = hand_pos[0], hand_pos[1]
+            elif int(message.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT and len(hand_pos) == 20:
+                # Left ten then right ten, each in the platform's finger order.
+                names = [f"{prefix}_{part}_joint" for prefix in ("L", "R") for part in DEXTEROUS_HAND_PARTS]
+                for name, value in zip(names, hand_pos, strict=True):
+                    self._positions[name] = float(value)
 
     def _on_locomotion(self, message) -> None:
         # Velocity is the arbitrated tier: a command from an unregistered or
@@ -548,6 +582,7 @@ class AimdkVendorMock(Node):
         # host's, which is how a separate compute pack fails: the stamps look
         # ordinary and every command it sends falls outside the window.
         offset_ns = int(float(self.get_parameter("clock_offset_s").value) * 1e9)
+        # Like the X2 HAL: stamp on the platform clock, meas_stamp left zero.
         header.stamp = Time(nanoseconds=self.get_clock().now().nanoseconds + offset_ns).to_msg()
         return header
 
@@ -606,10 +641,32 @@ class AimdkVendorMock(Node):
                 continue
             array = JointStateArray()
             array.header = self._header()
+            error_code = int(self.get_parameter("arm_joint_error_code").value) if group == "arm" else 0
             array.joints = [
-                JointState(name=name, position=positions.get(name, 0.0), velocity=0.0, effort=0.0) for name in names
+                JointState(
+                    name=name, position=positions.get(name, 0.0), velocity=0.0, effort=0.0, error_code=error_code
+                )
+                for name in names
             ]
             publisher.publish(array)
+        if "arm" in publishing and bool(self.get_parameter("publish_arm_command").value):
+            command = JointCommandArray()
+            command.header = self._header()
+            stiffness = float(self.get_parameter("arm_command_stiffness").value)
+            damping = float(self.get_parameter("arm_command_damping").value)
+            offset = float(self.get_parameter("arm_command_offset").value)
+            command.joints = [
+                JointCommand(
+                    name=name,
+                    position=positions.get(name, 0.0) + offset,
+                    velocity=0.0,
+                    effort=0.0,
+                    stiffness=stiffness,
+                    damping=damping,
+                )
+                for name in ARM_JOINTS
+            ]
+            self._arm_command_pub.publish(command)
         if "hand" not in publishing:
             return
         hands = HandStateArray()
@@ -617,8 +674,9 @@ class AimdkVendorMock(Node):
         value, right = self._hand_type_values()
         hands.left_hand_type = HandType(value=value)
         hands.right_hand_type = HandType(value=right)
-        hands.left_hands = self._hand_joints("left", value, positions)
-        hands.right_hands = self._hand_joints("right", right, positions)
+        faultcode = int(self.get_parameter("hand_joint_faultcode").value)
+        hands.left_hands = self._hand_joints("left", value, positions, faultcode)
+        hands.right_hands = self._hand_joints("right", right, positions, faultcode)
         # Touch arrays ride on this message; a claw reports none.
         if value != vg.HAND_TYPE_CLAW:
             cell = int(self.get_parameter("hand_touch_value").value)

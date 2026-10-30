@@ -324,6 +324,9 @@ vendor:
       waist: /aima/hal/joint/waist/state
       leg: /aima/hal/joint/leg/state
     hand_state: /aima/hal/joint/hand/state
+    # The arm's position targets and gains as the motion-control unit drives
+    # them, republished as joint.arm_command_state.
+    arm_command: /aima/hal/joint/arm/command
   qos:
     processed_audio: {reliability: best_effort, durability: volatile}
     upper_body_command:
@@ -344,6 +347,9 @@ vendor:
     hand_state:
       reliability: best_effort
       durability: transient_local
+    arm_command:
+      reliability: best_effort
+      durability: volatile
     power_state:
       reliability: best_effort
       durability: transient_local
@@ -416,6 +422,13 @@ vendor:
     required_groups:
     - arm
     - hand
+    # Groups whose vendor joint fault codes degrade the runtime. Arm and head
+    # error codes stay 0 in normal operation on the robot. OmniHand faultcodes
+    # do not: a finger pressing an object reports one for as long as it grips,
+    # so the hand is left to the grasp executor's own policy.
+    fault_groups:
+    - arm
+    - head
   # Head travel, from the platform's own McServoStatus comments
   # (yaw -0.38..0.38, pitch -0.35..0.35 rad). A target outside it is refused,
   # not clamped: clamping would execute a motion the caller did not ask for.
@@ -622,6 +635,68 @@ interfaces:
     endpoint: /audio/enhanced_capture_stamped
     message_type: audio_common_msgs/msg/AudioDataStamped
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  # Measured finger positions of both OmniHands. The hands are not public
+  # joint-group members (they are commanded through hand.multi_joint), so their
+  # state is published on its own topic rather than inside /joint_states. Grasp
+  # perception needs the finger pose at image time to exclude the hand from the
+  # scene and to check that the hand is open before an approach.
+  joint.hand_state:
+    capability: hand.multi_joint
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/hand/joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+    - L_thumb_roll_joint
+    - L_thumb_abad_joint
+    - L_thumb_mcp_joint
+    - L_index_abad_joint
+    - L_index_pip_joint
+    - L_middle_pip_joint
+    - L_ring_abad_joint
+    - L_ring_pip_joint
+    - L_pinky_abad_joint
+    - L_pinky_pip_joint
+    - R_thumb_roll_joint
+    - R_thumb_abad_joint
+    - R_thumb_mcp_joint
+    - R_index_abad_joint
+    - R_index_pip_joint
+    - R_middle_pip_joint
+    - R_ring_abad_joint
+    - R_ring_pip_joint
+    - R_pinky_abad_joint
+    - R_pinky_pip_joint
+    units:
+      position: rad
+      velocity: rad/s
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  # Measured head positions on their own topic. joint.body_state carries head,
+  # waist and legs together and is stamped with the OLDEST of those groups, so a
+  # lagging leg group would label a fresh head measurement with an older time.
+  # The head pose places the camera, so grasp perception needs its own
+  # measurement time rather than the composite's lower bound.
+  joint.head_state:
+    capability: joint.state
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/head_joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+    - head_yaw_joint
+    - head_pitch_joint
+    units:
+      position: rad
+      velocity: rad/s
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
   joint.body_state:
     capability: joint.state
     kind: topic
@@ -811,6 +886,41 @@ interfaces:
       durability: transient_local
       history: keep_last
       depth: 5
+  # What the motion-control unit is driving the arms to, and how stiffly: the
+  # HAL's arm command, apart from the measured state. Under load an arm settles
+  # below its target by torque / stiffness (about 0.1 rad at the shoulder in an
+  # extended pose at kp 40), so an executor that takes over joint.arm_stream
+  # starts from these targets, or the arm drops at takeover; it is also how it
+  # sees the platform clamp a target to a joint limit. Stamped with the HAL's
+  # platform time.
+  joint.arm_command_state:
+    capability: joint.position_stream
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/arm/command_state
+    message_type: ibrobot_msgs/msg/JointCommandState
+    joint_names:
+    - left_shoulder_pitch_joint
+    - left_shoulder_roll_joint
+    - left_shoulder_yaw_joint
+    - left_elbow_joint
+    - left_wrist_yaw_joint
+    - left_wrist_pitch_joint
+    - left_wrist_roll_joint
+    - right_shoulder_pitch_joint
+    - right_shoulder_roll_joint
+    - right_shoulder_yaw_joint
+    - right_elbow_joint
+    - right_wrist_yaw_joint
+    - right_wrist_pitch_joint
+    - right_wrist_roll_joint
+    units:
+      position: rad
+    qos:
+      reliability: best_effort
+      durability: volatile
+      history: keep_last
+      depth: 10
   touch.hands:
     capability: perception.touch
     kind: topic

@@ -30,6 +30,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray
 
@@ -37,7 +38,7 @@ from aimdk_robot import projection
 from aimdk_robot import vendor_gateway as vg
 from aimdk_robot.projection import CommandRejected, LocomotionLimits
 from aimdk_robot.wake_ack import WakeAckPairer
-from ibrobot_msgs.msg import PowerState, RuntimeStatus, SpeechWakeEvent
+from ibrobot_msgs.msg import JointCommandState, PowerState, RuntimeStatus, SpeechWakeEvent
 from ibrobot_msgs.srv import (
     GetRuntimeStatus,
     PlayExpression,
@@ -84,7 +85,16 @@ LED_SERVICE = "/led/set_pattern"
 RELOCALIZE_SERVICE = "/localization/relocalize"
 POWER_TOPIC = "/power_state"
 DIAGNOSTICS_TOPIC = "/diagnostics"
-BODY_STATE_TOPIC = "/aimdk/body_joint_states"
+
+#: Joint and hand state samples kept between drains: 64 ms of a 500 Hz group,
+#: so the 50 Hz readers see every sample, not only the newest. A fault code
+#: carried by a few samples is reported, and the touch arrays keep the
+#: platform's rate.
+PLATFORM_STATE_DEPTH = 32
+
+#: How old the platform's action report may be for a mode switch to rely on it
+#: instead of asking (the state is published at 10 Hz).
+_ACTION_REPORT_MAX_AGE_S = 0.5
 
 #: Fallback for a vendor endpoint the profile's `vendor.qos` does not name.
 #: The per-endpoint values come from the vendor's interface tables instead; see
@@ -129,6 +139,32 @@ _AUDIO_FOCUS_RETRY_S = 1.0
 #: callback latency cannot fill it, short enough to notice a clock being
 #: stepped while the runtime is up.
 _CLOCK_SKEW_WINDOW_S = 30.0
+
+
+def _joint_state_views(profile: dict) -> list[tuple[str, list[str]]]:
+    """``(endpoint, joint order)`` of every published JointState interface the profile declares."""
+    views = []
+    for interface in (profile.get("interfaces") or {}).values():
+        if (
+            interface.get("kind") == "topic"
+            and interface.get("direction") == "publish"
+            and interface.get("message_type") == "sensor_msgs/msg/JointState"
+            and interface.get("joint_names")
+        ):
+            views.append((str(interface["endpoint"]), [str(joint) for joint in interface["joint_names"]]))
+    return views
+
+
+#: The arm command echo interface: what the motion-control unit is driving the arm to.
+ARM_COMMAND_STATE = "joint.arm_command_state"
+
+
+def _arm_command_state(profile: dict) -> tuple[str, list[str]] | None:
+    """``(endpoint, joint order)`` of the arm command echo the profile declares, or None."""
+    interface = (profile.get("interfaces") or {}).get(ARM_COMMAND_STATE)
+    if not interface or not interface.get("joint_names"):
+        return None
+    return str(interface["endpoint"]), [str(joint) for joint in interface["joint_names"]]
 
 
 class AimdkRuntimeNode(Node):
@@ -186,6 +222,10 @@ class AimdkRuntimeNode(Node):
         self._joint_state_rate_hz = float(
             ((self._profile.get("capabilities") or {}).get("joint.state") or {}).get("rate_hz", 50.0)
         )
+        # Platform state is drained at most once per half publish period; see _drain_platform_state.
+        self._drain_lock = threading.Lock()
+        self._drained_at = float("-inf")
+        self._drain_interval_s = 0.5 / max(self._joint_state_rate_hz, 1.0)
         self._locomotion = LocomotionLimits.from_profile(self._vendor.get("locomotion"))
         self._hand_type = str((self._vendor.get("hand") or {}).get("type", "claw"))
         self._default_hand_sub_mode = int(
@@ -282,10 +322,15 @@ class AimdkRuntimeNode(Node):
         # quiet must drop out of the aggregate instead of being re-stamped.
         self._joint_groups: dict[str, list[tuple[str, float, float, float]]] = {}
         self._feedback_received: dict[str, float] = {}
-        self._feedback_clock: dict[str, Any] = {}
+        #: Measurement time of each group's last feedback, in nanoseconds. See _record_joint_group.
+        self._feedback_clock: dict[str, int] = {}
         feedback = self._vendor.get("feedback") or {}
         self._feedback_window_s = float(feedback.get("staleness_s", 0.5))
         self._required_feedback = [str(group) for group in feedback.get("required_groups", ["arm", "hand"])]
+        # Joint groups whose vendor fault codes stop commands. A profile opts in:
+        # what a non-zero code means is per group (OmniHand faultcodes are set
+        # while a finger presses an object, a normal grasp), so none by default.
+        self._fault_groups = {str(group) for group in feedback.get("fault_groups", [])}
         self._stream_staleness_s = float((self._vendor.get("command") or {}).get("stream_staleness_s", 0.5))
         # Fault sources that decide the lifecycle between them: each holds at
         # most one fault, DEGRADED ones are recoverable, FAULTED ones persist
@@ -309,7 +354,12 @@ class AimdkRuntimeNode(Node):
 
         self._status_pub = self.create_publisher(RuntimeStatus, STATUS_TOPIC, 10)
         self._joint_pub = self.create_publisher(JointState, str(self._profile["joint_state_topic"]), _RELIABLE_QOS)
-        self._body_pub = self.create_publisher(JointState, BODY_STATE_TOPIC, _RELIABLE_QOS)
+        # Every declared JointState interface (body, hands) is a view of the same
+        # aggregated feedback in its own joint order, published beside /joint_states.
+        self._state_views: list[tuple[Any, list[str]]] = [
+            (self.create_publisher(JointState, endpoint, _RELIABLE_QOS), order)
+            for endpoint, order in _joint_state_views(self._profile)
+        ]
         self._power_pub = self.create_publisher(PowerState, POWER_TOPIC, _RELIABLE_QOS)
         self._diag_pub = self.create_publisher(DiagnosticArray, DIAGNOSTICS_TOPIC, 10)
         self._localization_pub: Any = None
@@ -354,6 +404,7 @@ class AimdkRuntimeNode(Node):
             AudioCapture,
             DiagnosticInfoArray,
             HandStateArray,
+            JointCommandArray,
             JointStateArray,
             McCommonState,
             McLocomotionVelocity,
@@ -405,24 +456,51 @@ class AimdkRuntimeNode(Node):
         self._play_emoji = caller(PlayEmoji, "play_emoji", "/aimdk_5Fmsgs/srv/PlayEmoji")
         self._set_led = caller(SetPmuLed, "set_led", "/aimdk_5Fmsgs/srv/SetPmuLed")
 
+        from robot_runtime.on_demand import OnDemandSubscriptions  # noqa: PLC0415
+
+        # The platform publishes joint and hand state and the arm's command at
+        # ~200-500 Hz each. Taking every sample in an executor callback held a
+        # core on the robot-side host (2026-10-22). They wait in reader queues
+        # instead, and the timers that read them drain those first
+        # (_drain_platform_state), in a batch per drain; each sample keeps when
+        # it was received and the platform's stamp. State keeps every sample
+        # (PLATFORM_STATE_DEPTH) for its fault codes and touch arrays; only the
+        # newest arm command board is ever used.
+        self._platform_state = OnDemandSubscriptions(self.context, f"{self.get_name()}_platform_state")
         state_topics = topics.get("joint_state") or {}
         joint_state_qos = self._vendor_qos("joint_state")
         for group, topic in state_topics.items():
-            self.create_subscription(
+            self._platform_state.subscribe(
                 JointStateArray,
                 str(topic),
-                lambda message, group=str(group): self._on_joint_state(group, message),
                 joint_state_qos,
+                PLATFORM_STATE_DEPTH,
+                lambda message, received, group=str(group): self._on_joint_state(group, message, received),
             )
         if topics.get("hand_state"):
-            self.create_subscription(
-                HandStateArray, str(topics["hand_state"]), self._on_hand_state, self._vendor_qos("hand_state")
+            self._platform_state.subscribe(
+                HandStateArray,
+                str(topics["hand_state"]),
+                self._vendor_qos("hand_state"),
+                PLATFORM_STATE_DEPTH,
+                self._on_hand_state,
             )
             # The hands' touch arrays ride on the state message the line above
             # already subscribes to, so publishing them costs no extra traffic.
             touch_topic = str((self._vendor.get("hand") or {}).get("touch_topic", ""))
             if touch_topic:
                 self._hand_touch_pub = self.create_publisher(Float64MultiArray, touch_topic, _SENSOR_QOS)
+        echo = _arm_command_state(self._profile)
+        if echo is not None and topics.get("arm_command"):
+            endpoint, self._arm_command_order = echo
+            self._arm_command_pub = self.create_publisher(JointCommandState, endpoint, _SENSOR_QOS)
+            self._platform_state.subscribe(
+                JointCommandArray,
+                str(topics["arm_command"]),
+                self._vendor_qos("arm_command"),
+                1,
+                lambda message, _received: self._publish_arm_command(message),
+            )
         if topics.get("mc_state"):
             self.create_subscription(
                 McCommonState,
@@ -926,6 +1004,7 @@ class AimdkRuntimeNode(Node):
                 self.get_logger().warning("GetHandType did not answer; declared hand type is unverified")
         else:
             self.get_logger().warning("GetHandType unavailable; declared hand type is unverified")
+        self._drain_platform_state()
         with self._lock:
             from_state = list(self._hand_state_types)
         families = {vg.hand_type_family(value) for value in reported} if reported else {None}
@@ -1527,6 +1606,8 @@ class AimdkRuntimeNode(Node):
         """
         mode = self._modes.mode
         spec = self._modes.spec()
+        if spec.allows_stream:
+            self._drain_platform_state()  # the hold targets below are measured positions
         with self._lock:
             if not spec.allows_stream or not self.output_admitted():
                 return
@@ -1677,14 +1758,37 @@ class AimdkRuntimeNode(Node):
 
     # --- vendor state -------------------------------------------------------
 
-    def _on_joint_state(self, group: str, message: Any) -> None:
+    def _drain_platform_state(self) -> None:
+        """Take the newest joint, hand and arm command samples; call without holding _lock.
+
+        At most once per half publish period. The joint state publisher, the
+        command publisher (in stream modes) and the feedback check all drain
+        first, and the platform publishes faster than any of them, so every
+        call found new samples to convert: in a stream mode the two 50 Hz
+        timers doubled that work. On the X2's 310P this runtime already holds
+        a core, and the doubling took /joint_states from ~40 to ~25 Hz during
+        a pick, with gaps past the grasp executor's 0.1 s feedback age.
+        Skipping a drain leaves samples at most half a period older.
+        """
+        platform_state = getattr(self, "_platform_state", None)
+        if platform_state is None:
+            return
+        now = time.monotonic()
+        with self._drain_lock:
+            if now - self._drained_at < self._drain_interval_s:
+                return
+            self._drained_at = now
+        platform_state.drain()
+
+    def _on_joint_state(self, group: str, message: Any, received: float | None = None) -> None:
         entries = [
             (str(joint.name), float(joint.position), float(joint.velocity), float(joint.effort))
             for joint in message.joints
         ]
-        self._record_feedback(group, entries)
+        self._record_feedback(group, entries, message.header, received)
+        self._report_joint_faults(group, [(str(joint.name), int(joint.error_code)) for joint in message.joints])
 
-    def _on_hand_state(self, message: Any) -> None:
+    def _on_hand_state(self, message: Any, received: float | None = None) -> None:
         with self._lock:
             self._hand_state_types = [int(message.left_hand_type.value), int(message.right_hand_type.value)]
         entries: list[tuple[str, float, float, float]] = []
@@ -1697,8 +1801,32 @@ class AimdkRuntimeNode(Node):
                 measured[-1][name] = float(hand.position)
         with self._lock:
             self._hand_measured = measured
-        self._record_feedback("hand", entries)
+        self._record_feedback("hand", entries, message.header, received)
+        self._report_joint_faults(
+            "hand",
+            [
+                (str(hand.name) or f"{side}_hand", int(hand.faultcode))
+                for side, hands in (("left", message.left_hands), ("right", message.right_hands))
+                for hand in hands
+            ],
+        )
         self._publish_hand_touch(message)
+
+    def _report_joint_faults(self, group: str, codes: list[tuple[str, int]]) -> None:
+        """A joint the platform reports faulted degrades the runtime, for the groups
+        the profile lists in ``vendor.feedback.fault_groups``.
+
+        One fault source per joint group, kept apart from the ``hand`` source that
+        owns hand-type verification: a faulted joint is a hardware condition on a
+        correctly declared robot. The fault names every faulted joint with its
+        vendor code and clears when the platform reports the group healthy again;
+        a group that stops reporting keeps its last verdict.
+        """
+        if group not in self._fault_groups:
+            return
+        faulted = sorted((name, code) for name, code in codes if code != 0)
+        detail = ", ".join(f"{name}={code}" for name, code in faulted)
+        self._set_fault(f"{group}_joints", f"{group} joint fault: {detail}" if faulted else None)
 
     def _publish_hand_touch(self, message: Any) -> None:
         """Republish the hand touch arrays that arrive on this same message.
@@ -1732,52 +1860,100 @@ class AimdkRuntimeNode(Node):
             array.data.extend(float(cell) for cell in cells)
         publisher.publish(array)
 
-    def _record_feedback(self, group: str, entries: list[tuple[str, float, float, float]]) -> None:
+    def _publish_arm_command(self, message: Any) -> None:
+        """Republish what the motion-control unit is driving the arm to, in the declared order.
+
+        The HAL publishes the arm's position targets and gains apart from its
+        measured state. Under load an arm settles below its target by torque /
+        stiffness, so an executor taking over the stream has to start from this
+        target, and it is how it sees the platform clamp or replace a target it
+        sent. A message missing a declared joint is dropped: half a target is not
+        the controller's target.
+        """
+        entries = vg.joint_command_entries(message)
+        if not set(self._arm_command_order) <= set(entries):
+            return
+        echo = JointCommandState()
+        stamp = vg.message_stamp(getattr(message, "header", None))
+        echo.header.stamp = (stamp if stamp is not None else self.get_clock().now()).to_msg()
+        echo.name = list(self._arm_command_order)
+        rows = [entries[name] for name in self._arm_command_order]
+        echo.position = [row[0] for row in rows]
+        echo.stiffness = [row[1] for row in rows]
+        echo.damping = [row[2] for row in rows]
+        self._arm_command_pub.publish(echo)
+
+    def _record_feedback(
+        self,
+        group: str,
+        entries: list[tuple[str, float, float, float]],
+        header: Any = None,
+        received: float | None = None,
+    ) -> None:
+        """Keep a group's latest sample with the platform's own stamp.
+
+        The X2 HAL stamps each state message on the platform clock, which PTP
+        keeps in step with the compute pack and the head camera (``meas_stamp``
+        is left zero; it is preferred should the platform fill it). Consumers
+        can therefore match joint states to an image without crossing clock
+        domains, and a delivery stall here does not age a sample. Only a message
+        without a stamp falls back to this host's receipt time. Staleness is
+        judged on the local receipt time regardless (``received``, monotonic).
+        ``received`` is ``None`` when the middleware recorded no receive time
+        (:func:`robot_runtime.on_demand.received_monotonic`); the sample may then
+        have waited in the reader queue for any length of time, so it is kept at
+        ``-inf`` and every freshness window reads it as stale. Dating it now
+        would hold the robot at a measured position of unknown age. A caller that
+        knows when the sample arrived passes that time.
+        """
+        stamp = vg.message_stamp(header)
         with self._lock:
             self._joint_groups[group] = entries
-            self._feedback_received[group] = time.monotonic()
-            self._feedback_clock[group] = self.get_clock().now()
+            self._feedback_received[group] = float("-inf") if received is None else received
+            # Store nanoseconds, not Time: a vendor stamp is SYSTEM_TIME (it comes
+            # from the platform clock) while this node's clock is ROS_TIME, and
+            # comparing the two raises "Can't compare times with different clock
+            # types". A view fed by one stamped and one unstamped group would hit
+            # that in the min() below, inside a timer callback, taking the
+            # executor down with it. Integers compare in every combination.
+            self._feedback_clock[group] = stamp.nanoseconds if stamp is not None else self.get_clock().now().nanoseconds
 
-    def _fresh_feedback_locked(self) -> tuple[dict[str, list[tuple[str, float, float, float]]], Any]:
-        """Fresh groups and the receipt time of the oldest one. Caller holds _lock."""
+    def _fresh_feedback_locked(self) -> tuple[dict[str, list[tuple[str, float, float, float]]], dict[str, int]]:
+        """Fresh groups and the measurement time of each, in nanoseconds. Caller holds _lock."""
         fresh, _stale = projection.partition_fresh(
             self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
         )
         groups = {group: list(entries) for group, entries in self._joint_groups.items() if group in fresh}
-        oldest = min((self._feedback_clock[group] for group in groups), default=None)
-        return groups, oldest
+        return groups, {group: self._feedback_clock[group] for group in groups}
 
     def _publish_joint_states(self) -> None:
+        self._drain_platform_state()
         with self._lock:
-            groups, oldest = self._fresh_feedback_locked()
-        if not groups or oldest is None:
+            groups, clocks = self._fresh_feedback_locked()
+        if not groups:
             return
-        # The stamp is the oldest measurement in the aggregate, not "now": a
-        # source that stopped reporting drops out above instead of being
-        # re-stamped, and what remains is never newer than its stalest part.
-        stamp = oldest.to_msg()
-        public_order = [str(joint) for joint in self._profile["joints"]]
-        names, positions, velocities, efforts = projection.aggregate_joint_state(groups, order=public_order)
-        if names:
+        views = [(self._joint_pub, [str(joint) for joint in self._profile["joints"]]), *self._state_views]
+        for publisher, order in views:
+            wanted = set(order)
+            # Each view is stamped with the oldest platform stamp among the groups that
+            # feed it, not "now" and not the whole aggregate: a source that stopped
+            # reporting drops out above instead of being re-stamped, what remains is
+            # never newer than its stalest part, and a slow group a view does not
+            # carry (legs, for the hands) does not hold that view's stamp back.
+            sources = [group for group, entries in groups.items() if any(entry[0] in wanted for entry in entries)]
+            if not sources:
+                continue
+            names, positions, velocities, efforts = projection.aggregate_joint_state(
+                {group: groups[group] for group in sources}, order=order
+            )
             message = JointState()
-            message.header.stamp = stamp
+            message.header.stamp = Time(nanoseconds=min(clocks[group] for group in sources)).to_msg()
             message.name, message.position, message.velocity, message.effort = names, positions, velocities, efforts
-            self._joint_pub.publish(message)
-
-        body_interface = (self._profile.get("interfaces") or {}).get("joint.body_state") or {}
-        body_order = [str(joint) for joint in body_interface.get("joint_names", [])]
-        if not body_order:
-            return
-        names, positions, velocities, efforts = projection.aggregate_joint_state(groups, order=body_order)
-        if not names:
-            return
-        body = JointState()
-        body.header.stamp = stamp
-        body.name, body.position, body.velocity, body.effort = names, positions, velocities, efforts
-        self._body_pub.publish(body)
+            publisher.publish(message)
 
     def _check_feedback(self) -> None:
         """A required feedback source that went quiet degrades the runtime."""
+        self._drain_platform_state()
         with self._lock:
             received = dict(self._feedback_received)
             for group in self._required_feedback:
