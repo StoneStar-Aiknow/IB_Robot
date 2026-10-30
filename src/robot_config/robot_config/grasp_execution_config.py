@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,12 @@ def _vector(*, nonzero: bool = False) -> _Rule:
     return _Rule("vector", length=3, nonzero=nonzero)
 
 
+def _mapping() -> _Rule:
+    """Any mapping; its owner validates the contents."""
+    return _Rule("mapping")
+
+
+_BACKEND_REFERENCE = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*")
 _POSITIVE = _number(0.0, exclusive_minimum=True)
 _NON_NEGATIVE = _number(0.0)
 _UNIT_INTERVAL = _number(0.0, 1.0)
@@ -61,6 +68,16 @@ _VELOCITY = _number(0.0, 1.0, exclusive_minimum=True)
 _SCHEMA: dict[str, Any] = {
     "enabled": _bool(),
     "action_name": _string(),
+    # "package.module:callable" returning the robot's GraspBackends: the robot runs
+    # manipulation_execution's grasp_pipeline_node instead of pick_executor_node.
+    "backend": _string(),
+    # Read by the backend factory, which validates it.
+    "backend_options": _mapping(),
+    "pipeline": {
+        "max_attempts": _integer(1),
+        "max_moved_replans": _integer(0),
+        "home_tolerance_rad": _POSITIVE,
+    },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),
     "model_deployment": _string(),
@@ -335,6 +352,10 @@ def _validate_rule(value: Any, path: str, rule: _Rule, errors: list[str]) -> Non
             errors.append(f"{path} must be a finite number")
             return
         numeric = float(value)
+    elif rule.kind == "mapping":
+        if not isinstance(value, dict):
+            errors.append(f"{path} must be a mapping")
+        return
     elif rule.kind == "vector":
         if (
             not isinstance(value, list | tuple)
@@ -384,6 +405,12 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
     _validate_mapping(value, "grasp_execution", _SCHEMA, errors)
     if not isinstance(value, dict):
         return errors
+
+    backend = value.get("backend")
+    if isinstance(backend, str) and backend.strip() and not _BACKEND_REFERENCE.fullmatch(backend):
+        errors.append("grasp_execution.backend must be 'package.module:callable'")
+    if "backend_options" in value and not value.get("backend"):
+        errors.append("grasp_execution.backend_options requires grasp_execution.backend")
 
     ik = value.get("ik")
     if isinstance(ik, dict):

@@ -27,6 +27,7 @@ setup(
         "console_scripts": [
             "pick_action_client = manipulation_execution.pick_action_client:main",
             "pick_executor_node = manipulation_execution.pick_executor_node:main",
+            "grasp_pipeline_node = manipulation_execution.grasp_pipeline_node:main",
             "place_executor_node = manipulation_execution.placement_executor_node:main",
             "imitate_human_motion_executor_node = manipulation_execution.imitate_human_motion_executor_node:main",
             "motion_imitation_stream_node = manipulation_execution.motion_imitation_stream_node:main",
