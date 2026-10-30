@@ -38,6 +38,8 @@ from aimdk_msgs.srv import (
     AbandonAudioFocus,
     GetCurrentInputSource,
     GetHandType,
+    GetMcAction,
+    GetMcLocomotionSpeedStatus,
     GetMcPresetMotionState,
     PlayEmoji,
     PlayTts,
@@ -118,6 +120,7 @@ class AimdkVendorMock(Node):
         # Test knobs: the next SetMcAction fails with this vendor code, and the
         # arbitration query reports this holder (empty = the registered source).
         self.declare_parameter("reject_action_code", 0)
+        self.declare_parameter("reject_query_code", 0)
         self.declare_parameter("arbitration_holder", "")
         # The priority the forced holder claims. The platform's own sources all
         # outrank the 20-39 secondary-development band, so a preemption test
@@ -206,6 +209,13 @@ class AimdkVendorMock(Node):
 
         group = ReentrantCallbackGroup()
         self.create_service(SetMcAction, "/aimdk_5Fmsgs/srv/SetMcAction", self._set_action, callback_group=group)
+        self.create_service(GetMcAction, "/aimdk_5Fmsgs/srv/GetMcAction", self._get_action, callback_group=group)
+        self.create_service(
+            GetMcLocomotionSpeedStatus,
+            "/aimdk_5Fmsgs/srv/GetMcLocomotionSpeedStatus",
+            self._get_speed_profiles,
+            callback_group=group,
+        )
         self.create_service(
             SetMcInputSource, "/aimdk_5Fmsgs/srv/SetMcInputSource", self._set_input_source, callback_group=group
         )
@@ -303,7 +313,7 @@ class AimdkVendorMock(Node):
             response.response.message = f"mock rejection {code}"
             return response
         action = str(request.command.action_desc) or vg.MC_ACTION_BY_VALUE.get(int(request.command.action.value), "")
-        if action not in projection.VENDOR_ACTIONS:
+        if action not in projection.MC_RELEASE_MOTION_MODES | projection.VENDOR_SKILL_ACTIONS:
             # Code 3, "动作未在配置中登记". The firmware matches action_desc
             # against its registered configuration, which is narrower than the
             # McAction enumeration: a name that exists in the IDL and not in the
@@ -323,6 +333,35 @@ class AimdkVendorMock(Node):
         response.response.header.code = 0
         response.response.status.value = 1
         response.response.message = f"action {action} accepted"
+        return response
+
+    def _get_action(self, _request, response):
+        response.header.code = int(self.get_parameter("reject_query_code").value)
+        response.info.action_desc = self.current_action()
+        response.info.current_action.value = vg.MC_ACTION_VALUES.get(self.current_action(), 0)
+        response.info.status.value = 100
+        return response
+
+    def _get_speed_profiles(self, _request, response):
+        response.header.code = int(self.get_parameter("reject_query_code").value)
+        for name, mode, linear, angular in (
+            (
+                "current",
+                int(self.get_parameter("speed_mode").value),
+                float(self.get_parameter("speed_max_linear").value),
+                float(self.get_parameter("speed_max_angular").value),
+            ),
+            ("none", 0, 0.0, 0.0),
+            ("low", 1, 0.3, 0.2),
+            ("medium", 2, 0.5, 0.4),
+            ("high", 3, 1.0, 0.8),
+            ("step", 4, 0.4, 0.3),
+        ):
+            status = getattr(response, f"{name}_speed_status")
+            status.speed_mode.value = mode
+            for axis, limit in (("forward", linear), ("lateral", linear), ("angular", angular)):
+                bounds = getattr(status, f"{axis}_bounds")
+                bounds.min_value, bounds.max_value = -limit, limit
         return response
 
     def _set_input_source(self, request, response):

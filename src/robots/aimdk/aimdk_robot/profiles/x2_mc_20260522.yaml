@@ -1,0 +1,198 @@
+# Opt-in adapter for mc-x86-v1.0.0-20260522, lx2501_3_t2d5.
+# Based on the deployed MC configuration, not the newer upper-body SDK API.
+# Physical transport expects an externally started MC.
+# use_sim=true with sim_platform:=sdk selects the in-repo protocol mock.
+runtime:
+  name: aimdk_robot
+  version: 0.1.0
+  type: x2_mc_20260522
+use_sim: false
+sim_platforms: [sdk]
+sim_platform: sdk
+joint_state_topic: /joint_states
+# Raw MC odometry retains vendor frames; no fixed frame or TF is guaranteed.
+base: {odom_frame: null}
+joints: &arms
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_yaw_joint
+  - left_wrist_pitch_joint
+  - left_wrist_roll_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_yaw_joint
+  - right_wrist_pitch_joint
+  - right_wrist_roll_joint
+arm_joints: *arms
+gripper_joints: []
+modes:
+  initial: idle
+  prepare: {controllers: [], transitions: [sit_up]}
+  sit_up: {controllers: [], transitions: [idle]}
+  idle: {controllers: [], transitions: [prepare, locomotion, step]}
+  locomotion:
+    controllers: []
+    allows_stream: true
+    allows_base: true
+    transitions: [idle, step]
+  step:
+    controllers: []
+    allows_stream: true
+    allows_base: true
+    transitions: [idle, locomotion]
+command_channels:
+  - channel: base_velocity
+    topic: /cmd_vel
+    type: twist
+    modes: [locomotion, step]
+trajectory_actions: []
+capabilities:
+  joint.state: {joint_count: 14, rate_hz: 50.0}
+  base.cmd_vel: {max_vx: 1.0, max_vy: 1.0, max_wz: 1.0, staleness_s: 0.5}
+  base.navigation_gate: {}
+  base.odom: {}
+  motion.named:
+    names: [wave, handshake, raise_hand, blow_kiss, clap, thumbs_up, victory,
+            heart, arms_out, chest_wave, salute, welcome, cheer, bow,
+            light_wave, hug, arms_crossed, nod, shake_head, look_around, bye]
+  motion.posture: {postures: [sit_down, lie_down]}
+  runtime.status: {}
+  # Unmeasured bounds, not hardware safety acceptance.
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+stop_default_policy: HOLD
+teleoperation: {enabled: false}
+vendor:
+  mc_release: mc-x86-v1.0.0-20260522
+  registered_motion_modes:
+    [SIT_JOINT_DEFAULT, SIT_UP_DEFAULT, JOINT_DEFAULT, STAND_DEFAULT, LOCOMOTION_DEFAULT, LOCOMOTION_STEP]
+  mc_actions:
+    # The simulator falls into the documented seated posture in passive mode.
+    # Recover through MC's public seated-start sequence before stable stand.
+    prepare: SIT_JOINT_DEFAULT
+    sit_up: SIT_UP_DEFAULT
+    idle: STAND_DEFAULT
+    locomotion: LOCOMOTION_DEFAULT
+    step: LOCOMOTION_STEP
+  services:
+    set_action: /aimdk_5Fmsgs/srv/SetMcAction
+    get_action: /aimdk_5Fmsgs/srv/GetMcAction
+    set_input_source: /aimdk_5Fmsgs/srv/SetMcInputSource
+    get_input_source: /aimdk_5Fmsgs/srv/GetCurrentInputSource
+    set_preset_motion: /aimdk_5Fmsgs/srv/SetMcPresetMotion
+    get_preset_motion_state: /aimdk_5Fmsgs/srv/GetMcPresetMotionState
+    get_speed_profiles: /aimdk_5Fmsgs/srv/GetMcLocomotionSpeedStatus
+  queries:
+    get_action: /motion/get_state
+    get_speed_profiles: /motion/get_locomotion_profiles
+  topics:
+    locomotion_command: /aima/mc/locomotion/velocity
+    mc_state: /aima/mc/common/state
+    leg_odometry: /aima/mc/leg_odometry
+    joint_state:
+      arm: /aima/hal/joint/arm/state
+      head: /aima/hal/joint/head/state
+      waist: /aima/hal/joint/waist/state
+      leg: /aima/hal/joint/leg/state
+  # Volatile subscribers accept both volatile and latched state publishers.
+  qos:
+    mc_state: {reliability: best_effort, durability: volatile}
+    joint_state: {reliability: best_effort, durability: volatile}
+    locomotion_command: {reliability: reliable, durability: volatile}
+  input_source: {name: ibrobot.aimdk_robot, priority: 30, timeout_ms: 1000}
+  command:
+    rate_hz: 50.0
+    stamp_window_s: 0.2
+    clock_skew_limit_s: 0.1
+    mode_confirm_timeout_s: 5.0
+  feedback: {staleness_s: 0.5, required_groups: [arm, leg]}
+  locomotion:
+    deadband: 0.005
+    min_linear_mps: 0.2
+    min_angular_radps: 0.1
+    max_linear_mps: 1.0
+    max_angular_radps: 1.0
+  stop:
+    hold_action: ""
+    torque_off_policy: soft_estop
+    soft_estop_action: DAMPING_DEFAULT
+    zero_torque_action: PASSIVE_DEFAULT
+  # Identifier/area facts from classic/animation_player.yaml; no vendor assets copied.
+  preset_motions:
+    wave: {motion: 1002, target: right, targets: [left, right, both]}
+    handshake: {motion: 1003, target: right, targets: [left, right]}
+    raise_hand: {motion: 1001, target: right, targets: [left, right]}
+    blow_kiss: {motion: 1004, target: right, targets: [left, right]}
+    clap: {motion: 3017, area: 11}
+    thumbs_up: {motion: 1005, target: right, targets: [left, right, both]}
+    victory: {motion: 1006, target: right, targets: [left, right, both]}
+    heart: {motion: 1007, target: both, targets: [left, right, both]}
+    arms_out: {motion: 1010, target: both, targets: [left, right, both]}
+    chest_wave: {motion: 1011, target: right, targets: [left, right, both]}
+    salute: {motion: 1013, target: right, targets: [left, right]}
+    welcome: {motion: 1014, target: right, targets: [left, right]}
+    cheer: {motion: 1015, target: both, targets: [left, right, both]}
+    bow: {motion: 3001, area: 11}
+    light_wave: {motion: 3007, area: 11}
+    hug: {motion: 3008, area: 11}
+    arms_crossed: {motion: 3009, area: 11}
+    nod: {motion: 3028, area: 11}
+    shake_head: {motion: 3029, area: 11}
+    look_around: {motion: 3030, area: 11}
+    bye: {motion: 3031, area: 11}
+  postures: {sit_down: SIT_DOWN_DEFAULT, lie_down: LIE_DOWN_DEFAULT}
+  posture_poses: {sit_down: sit, lie_down: lie_face_up}
+  posture_timeout_s: 20.0
+  named_motion:
+    allowed_modes: [idle]
+    required_action: STAND_DEFAULT
+    preset_timeout_s: 30.0
+    poll_s: 0.2
+interfaces:
+  joint.body_state:
+    capability: joint.state
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/body_joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+      - head_yaw_joint
+      - head_pitch_joint
+      - waist_yaw_joint
+      - waist_pitch_joint
+      - waist_roll_joint
+      - left_hip_pitch_joint
+      - left_hip_roll_joint
+      - left_hip_yaw_joint
+      - left_knee_joint
+      - left_ankle_pitch_joint
+      - left_ankle_roll_joint
+      - right_hip_pitch_joint
+      - right_hip_roll_joint
+      - right_hip_yaw_joint
+      - right_knee_joint
+      - right_ankle_pitch_joint
+      - right_ankle_roll_joint
+    units: {position: rad, velocity: rad/s}
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  motion.named:
+    capability: motion.named
+    kind: action
+    direction: serve
+    endpoint: /motion/execute_named
+    message_type: ibrobot_msgs/action/ExecuteNamedMotion
+  motion.state:
+    capability: runtime.status
+    kind: service
+    direction: serve
+    endpoint: /motion/get_state
+    message_type: ibrobot_msgs/srv/GetMotionState
+  motion.locomotion_profiles:
+    capability: runtime.status
+    kind: service
+    direction: serve
+    endpoint: /motion/get_locomotion_profiles
+    message_type: ibrobot_msgs/srv/GetLocomotionProfiles

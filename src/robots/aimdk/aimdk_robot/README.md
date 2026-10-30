@@ -1,5 +1,11 @@
 # aimdk_robot — AgiBot X2 runtime
 
+`use_sim:=true` with `sim_platform:=sdk` uses the repository protocol mock.
+This package does not start vendor MC or simulator processes; physical transport
+expects an already running vendor stack. For standalone X2 physics without the
+vendor runtime, use [aimdk_mujoco](../aimdk_mujoco/README.md), which does not expose
+this package's public runtime contract.
+
 The X2's independently deployable runtime unit: it serves the **public runtime
 contract** (`/runtime_status`, `/runtime/set_mode`, `/runtime/get_status`,
 `/runtime/stop`, `/joint_states`, the declared streaming command channels and
@@ -573,6 +579,13 @@ launches can destabilize motion control, so the launch entry staggers its nodes.
 |---|---|---|---|
 | `profiles/x2_ultra.yaml` | X2 Ultra | OmniPicker gripper | `gripper.1d` (count 2) |
 | `profiles/x2_ultra_omnihand.yaml` | X2 Ultra | OmniHand dexterous hands | `hand.multi_joint`, `hand.gesture`; no `gripper.1d` |
+| `profiles/x2_mc_20260522.yaml` | Separate x86 MC release | Read-only joints | Velocity/step modes, 21 presets, action/speed-profile queries, leg odometry; no upper-body streaming |
+
+The separate MC release is **not** API-equivalent to the two hardware profiles.
+Its supported surface, missing vendor protocols, transport selection and testing
+limits are documented in [MC Release Adapter](MC_COVERAGE.md). The exclusions
+below refer to the original hardware profiles; the MC release additionally
+exposes its native leg odometry as `base.odom`.
 
 The profile is the single source of runtime parameters: public joint projection,
 modes and their vendor MC actions, command channels, declared capabilities, stop

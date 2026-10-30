@@ -45,6 +45,21 @@ def _render(simulated: str):
     return _runtime_launch_module()._launch_setup(context)
 
 
+def _render_mc_mujoco():
+    context = launch.LaunchContext()
+    context.launch_configurations.update(
+        {
+            "profile": str(Path(__file__).resolve().parents[1] / "profiles" / "x2_mc_20260522.yaml"),
+            "simulated": "",
+            "use_sim": "true",
+            "sim_platform": "mujoco",
+            "instance_id": "",
+            "initial_mode": "",
+        }
+    )
+    return _runtime_launch_module()._launch_setup(context)
+
+
 def _flatten(actions, out=None):
     out = out if out is not None else []
     for action in actions:
@@ -74,6 +89,11 @@ def test_simulated_execution_declares_no_alsa_audio_nodes():
     assert [type(action).__name__ for action in actions] == ["Node", "TimerAction", "TimerAction", "TimerAction"]
     packages = {node.node_package for node in _nodes(actions)}
     assert not packages & {"audio_capture", "audio_play"}, "the vendor runtime owns its audio"
+
+
+def test_mujoco_execution_is_rejected_instead_of_starting_a_mock():
+    with pytest.raises(ValueError, match="sim_platform 'mujoco' is not supported"):
+        _render_mc_mujoco()
 
 
 def test_profile_audio_interfaces_carry_format_metadata():

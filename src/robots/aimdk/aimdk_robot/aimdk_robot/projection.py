@@ -101,6 +101,14 @@ VENDOR_SKILL_ACTIONS: frozenset[str] = frozenset(
 
 VENDOR_ACTIONS: frozenset[str] = VENDOR_MOTION_MODES | VENDOR_SKILL_ACTIONS
 
+# Additional velocity mode in mc-x86-v1.0.0-20260522/action_setting.yaml.
+# It is opt-in per profile, not an alias for the hardware SDK's stream mode.
+MC_RELEASE_MOTION_MODES = VENDOR_MOTION_MODES | {
+    "LOCOMOTION_STEP",
+    "SIT_JOINT_DEFAULT",
+    "SIT_UP_DEFAULT",
+}
+
 # (motion, area) pairs the platform actually maps to an animation
 # (Interface/control_mod/preset_motion.html). Since v0.8.0 `area` is no longer
 # a body region — "area 原有的分区概念已经弱化, 仅和 motion 联合使用映射具体
@@ -324,7 +332,10 @@ def mode_action(profile: dict[str, Any], mode: str) -> str:
         action = str(actions[mode])
     except KeyError as exc:
         raise ProjectionError(f"profile declares no vendor MC action for mode {mode!r}") from exc
-    if action not in VENDOR_MOTION_MODES:
+    supported = set((profile.get("vendor") or {}).get("registered_motion_modes", VENDOR_MOTION_MODES))
+    if not supported <= MC_RELEASE_MOTION_MODES:
+        raise ProjectionError(f"profile contains unsupported vendor motion modes: {sorted(supported)}")
+    if action not in supported:
         raise ProjectionError(
             f"mode {mode!r} maps to {action!r}, which the platform does not register as a motion mode"
         )
