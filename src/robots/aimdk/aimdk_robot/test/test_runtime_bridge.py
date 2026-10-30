@@ -1074,6 +1074,25 @@ def test_a_dexterous_family_variant_still_matches_the_dexterous_profile():
         harness.shutdown()
 
 
+def test_the_microphones_and_the_speaker_are_served_under_their_own_capabilities():
+    """Each audio capability wires its own side, so a profile may declare one without the other."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        subscribed = {subscription.topic_name for subscription in harness.runtime.subscriptions}
+        published = {publisher.topic_name for publisher in harness.runtime.publishers}
+        assert {"/aima/hal/audio/capture", "/agent/process_audio_output"} <= subscribed
+        assert "/audio/capture_stamped" in published
+        capabilities = json.loads(harness.status().capabilities_json)
+        assert "interaction.audio_capture" in capabilities
+        assert "interaction.audio_playback" in capabilities
+        # The speaker is wired by the playback capability, not by the capture one.
+        assert "/audio/play" in subscribed and "/aima/hal/audio/playback" in published
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
 def test_losing_arbitration_is_reported_as_degraded():
     """A pre-empted command source is silent on the wire; it must not be silent here."""
     harness = Harness()

@@ -547,6 +547,15 @@ endpoint map. Hand type is a profile property, not runtime autodetection — the
 bridge verifies it against the vendor's `GetHandType` at startup and refuses to
 become ACTIVE on mismatch.
 
+A deployment that needs a different setting inside the profile states it in
+`robot.runtime.profile_overrides`, which the launch merges into the profile it
+hands the provider, rather than copying the profile.
+
+The platform's 6-channel microphone capture is read BEST_EFFORT: every message
+is IP-fragmented, and reading it reliably made the robot-side host resend lost
+fragments until IP reassembly was pinned and the grasp head's replies were cut
+off (issue #201).
+
 ### What the profiles deliberately do not declare
 
 - **No public model.** No URDF is rendered and no `model` block is exported, so

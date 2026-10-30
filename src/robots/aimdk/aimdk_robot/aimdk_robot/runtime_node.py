@@ -531,19 +531,16 @@ class AimdkRuntimeNode(Node):
                     AlertCodeArray, str(topics["alert_codes"]), self._on_alerts, self._vendor_qos("alert_codes")
                 )
         if self._state.has_capability("interaction.audio_capture") and topics.get("audio_capture"):
-            self._setup_audio(AudioCapture, topics, caller, RequestAudioFocus, AbandonAudioFocus)
+            self._setup_audio_capture(AudioCapture, topics)
+        # Gated on its own capability: the speaker is served by a profile that
+        # declares playback without declaring the microphones.
+        if self._state.has_capability("interaction.audio_playback") and topics.get("audio_playback"):
+            self._setup_audio_playback(topics, caller, RequestAudioFocus, AbandonAudioFocus)
         self._setup_processed_audio_if_declared(topics)
         if self._state.has_capability("localization.pose") and topics.get("localization_pose"):
             self._setup_localization(topics)
 
-    def _setup_audio(
-        self,
-        audio_capture_type: Any,
-        topics: dict[str, Any],
-        caller: Any,
-        request_focus_type: Any,
-        abandon_focus_type: Any,
-    ) -> None:
+    def _setup_audio_capture(self, audio_capture_type: Any, topics: dict[str, Any]) -> None:
         """Republish vendor microphone audio on the project's audio contract."""
         from audio_common_msgs.msg import AudioDataStamped, AudioInfo  # noqa: PLC0415
 
@@ -560,41 +557,43 @@ class AimdkRuntimeNode(Node):
             audio_capture_type,
             str(topics["audio_capture"]),
             self._on_audio_capture,
-            self._vendor_qos("audio_capture", reliability="reliable"),
+            self._vendor_qos("audio_capture", reliability="best_effort"),
         )
-        if topics.get("audio_playback"):
-            from aimdk_msgs.msg import AudioPlayback, FocusResponse  # noqa: PLC0415
 
-            # The platform subscribes RELIABLE here: a BEST_EFFORT publisher would
-            # be silently dropped (observed on the robot, 2026-09-22).
-            self._playback_pub = self.create_publisher(
-                AudioPlayback, str(topics["audio_playback"]), self._vendor_qos("audio_playback", reliability="reliable")
-            )
-            self._playback_type = AudioPlayback
-            priority, weight, release_idle_s, buffer_chunks = projection.audio_focus_request(audio)
-            self._focus_priority = priority
-            self._focus_weight = weight
-            self._focus_release_idle_s = release_idle_s
-            self._playback_buffer = deque(maxlen=buffer_chunks)
-            self._request_focus = caller(
-                request_focus_type, "request_audio_focus", "/aimdk_5Fmsgs/srv/RequestAudioFocus"
-            )
-            self._abandon_focus = caller(
-                abandon_focus_type, "abandon_audio_focus", "/aimdk_5Fmsgs/srv/AbandonAudioFocus"
-            )
-            # Preemption is announced, not polled: a higher-priority source
-            # taking the speaker arrives here, and publishing past it would
-            # only fight whatever the platform decided should be heard.
-            self.create_subscription(
-                FocusResponse,
-                str(topics.get("audio_focus_response", "/aima/hal/audio/focus_response")),
-                self._on_audio_focus,
-                self._vendor_qos("audio_focus_response", reliability="reliable", durability="transient_local"),
-            )
-            self.create_subscription(
-                AudioDataStamped, str(audio.get("play_topic", "/audio/play")), self._on_audio_play, _SENSOR_QOS
-            )
-            self._focus_timer = self.create_timer(0.1, self._audio_focus_tick, callback_group=self._client_cb)
+    def _setup_audio_playback(
+        self, topics: dict[str, Any], caller: Any, request_focus_type: Any, abandon_focus_type: Any
+    ) -> None:
+        """Play contract audio through the vendor speaker, holding its audio focus while it plays."""
+        from aimdk_msgs.msg import AudioPlayback, FocusResponse  # noqa: PLC0415
+        from audio_common_msgs.msg import AudioDataStamped  # noqa: PLC0415
+
+        audio = self._vendor.get("audio") or {}
+        # The platform subscribes RELIABLE here: a BEST_EFFORT publisher would
+        # be silently dropped (observed on the robot, 2026-09-22).
+        self._playback_pub = self.create_publisher(
+            AudioPlayback, str(topics["audio_playback"]), self._vendor_qos("audio_playback", reliability="reliable")
+        )
+        self._playback_type = AudioPlayback
+        priority, weight, release_idle_s, buffer_chunks = projection.audio_focus_request(audio)
+        self._focus_priority = priority
+        self._focus_weight = weight
+        self._focus_release_idle_s = release_idle_s
+        self._playback_buffer = deque(maxlen=buffer_chunks)
+        self._request_focus = caller(request_focus_type, "request_audio_focus", "/aimdk_5Fmsgs/srv/RequestAudioFocus")
+        self._abandon_focus = caller(abandon_focus_type, "abandon_audio_focus", "/aimdk_5Fmsgs/srv/AbandonAudioFocus")
+        # Preemption is announced, not polled: a higher-priority source
+        # taking the speaker arrives here, and publishing past it would
+        # only fight whatever the platform decided should be heard.
+        self.create_subscription(
+            FocusResponse,
+            str(topics.get("audio_focus_response", "/aima/hal/audio/focus_response")),
+            self._on_audio_focus,
+            self._vendor_qos("audio_focus_response", reliability="reliable", durability="transient_local"),
+        )
+        self.create_subscription(
+            AudioDataStamped, str(audio.get("play_topic", "/audio/play")), self._on_audio_play, _SENSOR_QOS
+        )
+        self._focus_timer = self.create_timer(0.1, self._audio_focus_tick, callback_group=self._client_cb)
 
     def _public_qos(self, spec: dict[str, Any]) -> QoSProfile:
         """QoS for one project-facing endpoint, taken from its own declaration."""
