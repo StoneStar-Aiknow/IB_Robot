@@ -1261,6 +1261,26 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
 # bundle; without scripts/download_models.py the config cannot load. A missing
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+def test_a_grasp_backend_runs_the_grasp_pipeline_instead_of_the_primitive_executor():
+    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp"))
+    config["embodied"]["enabled"] = True
+    config["grasp_execution"]["backend"] = "robot_backend.grasp:backends"
+    nodes = generate_embodied_nodes(config, "moveit_planning")
+    executables = {(node.__dict__.get("_Node__package"), node.__dict__.get("_Node__node_executable")) for node in nodes}
+    assert ("manipulation_execution", "grasp_pipeline_node") in executables
+    for legacy in ("pick_executor_node", "grasp_planner_node", "grasp_verifier_node"):
+        assert not any(executable == legacy for _, executable in executables)
+    pipeline = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_pipeline_node")
+    params = _normalize_launch_param_mapping(pipeline._Node__parameters[0])
+    grasp_execution = _decode_launch_json_string(str(params["grasp_execution_json"]))
+    assert grasp_execution["backend"] == "robot_backend.grasp:backends"
+    # The Gateway derives the executor identity from the same configuration.
+    gateway = _skill_executor_params(nodes)
+    assert _decode_launch_json_string(str(gateway["grasp_execution_json"])) == grasp_execution
+    assert isinstance(_decode_launch_json_string(str(params["interface_description_json"])), dict)
+
+
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     config_path = resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp_pc")
     config = load_robot_config_dict(config_path)

@@ -336,7 +336,14 @@ class StreamExecutor:
                     return self._end(row, MotionState.CANCELLED, "cancelled", names)
                 if halted() and last_command is not None:
                     # Nothing more is sent: the last command stands and stays alive.
-                    return self._end(row, MotionState.HALTED, "halted", names)
+                    progress = self._path_progress(timed.times, last_tick - started)
+                    return self._end(
+                        row,
+                        MotionState.HALTED,
+                        "halted",
+                        names,
+                        report={"path_progress": progress},
+                    )
                 self._admit()
                 sample = self._fresh(self.io.feedback())
                 if last_command is not None and not 0 <= tick - last_tick <= config.max_control_gap_s:
@@ -368,13 +375,13 @@ class StreamExecutor:
         except StreamFailure as exc:
             return self._end(row, MotionState.FAILED, str(exc), names)
 
-    def _end(self, row, state, reason, names) -> MotionOutcome:
+    def _end(self, row, state, reason, names, report=None) -> MotionOutcome:
         row.update(state=state.value, reason=reason)
         try:
             stopped_at = self._vector(self.io.feedback(), names)
         except (KeyError, StreamFailure):
             stopped_at = None
-        return MotionOutcome(state, reason, stopped_at)
+        return MotionOutcome(state, reason, stopped_at, report or {})
 
     # -- pieces ---------------------------------------------------------------------
 
@@ -405,7 +412,8 @@ class StreamExecutor:
         """The segment as a timed path from the measured pose, within the velocity limit."""
         config = self.config
         if segment.kind is SegmentKind.TARGET:
-            seconds = max(config.target_min_s, float(np.max(np.abs(segment.end - here))) / config.target_speed_rad_s)
+            speed = min(config.target_speed_rad_s, config.max_velocity_rad_s)
+            seconds = max(config.target_min_s, float(np.max(np.abs(segment.end - here))) / speed * 1.001)
             return ArmSegment(
                 segment.name,
                 SegmentKind.TRAJECTORY,
@@ -426,6 +434,14 @@ class StreamExecutor:
         needed = np.max(np.abs(np.diff(positions, axis=0)), axis=1) / config.max_velocity_rad_s * 1.001
         times = np.concatenate(([0.0], np.cumsum(np.maximum(steps, needed))))
         return ArmSegment(segment.name, SegmentKind.TRAJECTORY, segment.joint_names, positions, times)
+
+    @staticmethod
+    def _path_progress(times: np.ndarray, elapsed: float) -> float:
+        """Return elapsed position as a waypoint coordinate on a timed path."""
+        elapsed = float(np.clip(elapsed, times[0], times[-1]))
+        index = min(int(np.searchsorted(times, elapsed, side="right") - 1), len(times) - 2)
+        fraction = (elapsed - times[index]) / (times[index + 1] - times[index])
+        return float(index + fraction)
 
     def _raise(self, timed: ArmSegment) -> np.ndarray:
         if self.shaper is None:

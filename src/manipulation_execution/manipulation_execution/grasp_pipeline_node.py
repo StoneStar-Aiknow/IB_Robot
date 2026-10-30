@@ -44,6 +44,8 @@ MODES = {
 }
 #: Feedback progress at the start of the pipeline's own phases; plan steps keep the last value.
 PROGRESS = {"observe": 0.1, "perceive": 0.2, "plan": 0.3}
+#: Between attempts of a backend warmup that has not succeeded yet.
+PREPARE_RETRY_S = 1.0
 
 
 def pipeline_config(grasp_execution: Mapping) -> PipelineConfig:
@@ -76,7 +78,7 @@ def _json_value(value):
     return str(value)
 
 
-def pick_result(outcome: PickOutcome, identity: dict[str, str], *, release_after_success: bool) -> PickObject.Result:
+def pick_result(outcome: PickOutcome, identity: dict[str, str]) -> PickObject.Result:
     result = PickObject.Result()
     result.success = bool(outcome.success)
     result.error_code = outcome.error_code
@@ -86,7 +88,7 @@ def pick_result(outcome: PickOutcome, identity: dict[str, str], *, release_after
     result.verification_confidence = float(outcome.held_confidence)
     result.completed_phases = list(outcome.completed_phases)
     result.candidate_index = int(outcome.candidate_index)
-    result.released_after_success = bool(outcome.success and release_after_success)
+    result.released_after_success = bool(outcome.released_after_success)
     result.pipeline_timings_json = json.dumps(outcome.report, sort_keys=True, default=_json_value)
     fill_delegated_executor_identity(result.actual_executor, identity)
     return result
@@ -116,6 +118,12 @@ class GraspPipelineNode(Node):
         self._pipeline = GraspPipeline(self._backends, pipeline_config(config))
         self._goal_lock = threading.Lock()
         self._goal_active = False
+        self._closing = threading.Event()
+        self._ready = threading.Event()
+        if self._backends.prepare is None:
+            self._ready.set()
+        else:
+            threading.Thread(target=self._prepare, daemon=True, name="grasp_backend_prepare").start()
         self._action_server = ActionServer(
             self,
             PickObject,
@@ -127,6 +135,19 @@ class GraspPipelineNode(Node):
         )
         self.get_logger().info(f"grasp pipeline ready: action={self._action_name} backend={spec}")
 
+    def _prepare(self) -> None:
+        """Warm the backends up off the executor; goals are refused until it succeeds."""
+        while not self._closing.is_set():
+            try:
+                self._backends.prepare()
+            except Exception as exc:  # noqa: BLE001 - retried until the robot and its models are up
+                self.get_logger().warning(f"grasp backends not ready: {exc}", throttle_duration_sec=5.0)
+                self._closing.wait(PREPARE_RETRY_S)
+                continue
+            self._ready.set()
+            self.get_logger().info(f"grasp backends prepared; accepting {self._action_name} goals")
+            return
+
     def _now_s(self) -> float:
         return self.get_clock().now().nanoseconds / 1_000_000_000
 
@@ -134,6 +155,9 @@ class GraspPipelineNode(Node):
         reason = pick_goal_rejection(goal, self._identity, self._now_s())
         if reason:
             self.get_logger().warning(f"PickObject goal rejected: {reason}")
+            return GoalResponse.REJECT
+        if not self._ready.is_set():
+            self.get_logger().warning("PickObject goal rejected: the grasp backends are still warming up")
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:
@@ -150,7 +174,7 @@ class GraspPipelineNode(Node):
                 outcome = PickOutcome(error_code="TASK_TIMEOUT", message="task budget expired before the pick started")
             else:
                 outcome = self._run(goal_handle, time.monotonic() + remaining)
-            result = pick_result(outcome, self._identity, release_after_success=bool(goal.release_after_success))
+            result = pick_result(outcome, self._identity)
             if not outcome.at_rest:
                 self.get_logger().error(f"arm stopped in place: {outcome.error_code}: {outcome.message}")
             if outcome.success:
@@ -190,10 +214,17 @@ class GraspPipelineNode(Node):
             deadline=deadline,
             cancelled=lambda: goal_handle.is_cancel_requested,
             on_phase=on_phase,
-            release_after_success=bool(goal.release_after_success),
+            release_after_success=self._releases(goal),
         )
 
+    def _releases(self, goal) -> bool:
+        """Whether this pick puts the object back: the goal asks, or the robot always does."""
+        return bool(goal.release_after_success) or self._pipeline.config.release_after_success
+
     def destroy_node(self) -> None:
+        closing = getattr(self, "_closing", None)
+        if closing is not None:
+            closing.set()
         try:
             backends = getattr(self, "_backends", None)
             if backends is not None:

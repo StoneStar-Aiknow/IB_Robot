@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 import rclpy
@@ -16,7 +17,7 @@ from test_grasp_pipeline import Effector, Executor, Proposer, Source, StreamingP
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity
 from ibrobot_msgs.action import PickObject
-from manipulation_execution.grasp_pipeline.contracts import GraspBackends, MotionOutcome, MotionState
+from manipulation_execution.grasp_pipeline.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
 from manipulation_execution.grasp_pipeline.pipeline import PickOutcome
 from manipulation_execution.grasp_pipeline_node import GraspPipelineNode, pipeline_config, verification_status
 from manipulation_execution.pick_goal import pick_goal_rejection, remaining_budget_s
@@ -41,10 +42,26 @@ class SlowExecutor(Executor):
 
 
 def make_backends(*, node, grasp_execution, description):
-    FACTORY_CALLS.append((node, grasp_execution, description))
     executor = SlowExecutor()
     executor.slow = bool(grasp_execution.get("test_slow"))
-    return GraspBackends(Source(), Proposer(), StreamingPlanner(), executor, Effector())
+    backends = GraspBackends(Source(), Proposer(), StreamingPlanner(), executor, Effector())
+    FACTORY_CALLS.append((node, grasp_execution, description, backends))
+    return backends
+
+
+WARMUP = {"ready": threading.Event(), "attempts": 0}
+
+
+def make_warming_backends(*, node, grasp_execution, description):
+    """Backends whose warmup fails until the test lets it succeed."""
+
+    def prepare():
+        WARMUP["attempts"] += 1
+        if not WARMUP["ready"].is_set():
+            raise RuntimeError("models not loaded yet")
+
+    backends = make_backends(node=node, grasp_execution=grasp_execution, description=description)
+    return replace(backends, prepare=prepare)
 
 
 def configuration(**extra):
@@ -198,6 +215,50 @@ def test_a_cancelled_goal_stops_the_arm_and_ends_cancelled(ros):
         # One goal at a time: the node takes the next goal once this one ended.
         quick = wait(client.send_goal_async(goal(config, now_s=now, mode=PickObject.Goal.MODE_OBSERVE_ONLY)))
         assert quick.accepted and wait(quick.get_result_async()).result.success
+    finally:
+        stop(node, client_node, executor, thread)
+
+
+def test_a_robot_that_always_puts_back_does_so_unasked(ros):
+    config = configuration(pipeline={"max_attempts": 1, "release_after_success": True})
+    node, client_node, client, executor, thread = serve(config)
+    try:
+        now = node.get_clock().now().nanoseconds / 1e9
+        for mode in (PickObject.Goal.MODE_OBSERVE_ONLY, PickObject.Goal.MODE_PLAN_ONLY):
+            dry_run = goal(config, now_s=now, mode=mode)
+            result = wait(wait(client.send_goal_async(dry_run)).get_result_async()).result
+            assert result.success and not result.released_after_success
+        message = goal(config, now_s=now)
+        assert not message.release_after_success
+        result = wait(wait(client.send_goal_async(message)).get_result_async()).result
+        assert result.success and result.released_after_success
+        moves = [name for name, _, _ in FACTORY_CALLS[-1][3].executor.log]
+        # Lifted, held, then put back where it came from and the hand opened.
+        assert moves[-3:] == ["retreat_lift", "retreat_grasp", "retreat_approach"]
+        assert FACTORY_CALLS[-1][3].effector.log[-1] is EffectorAction.RELEASE
+    finally:
+        stop(node, client_node, executor, thread)
+
+
+def test_goals_are_refused_until_the_backends_are_warm(ros, monkeypatch):
+    monkeypatch.setattr("manipulation_execution.grasp_pipeline_node.PREPARE_RETRY_S", 0.05)
+    WARMUP["ready"].clear()
+    WARMUP["attempts"] = 0
+    config = configuration(backend=f"{__name__}:make_warming_backends")
+    node, client_node, client, executor, thread = serve(config)
+    try:
+        ended = time.monotonic() + 5.0
+        while WARMUP["attempts"] < 2 and time.monotonic() < ended:
+            time.sleep(0.01)
+        now = node.get_clock().now().nanoseconds / 1e9
+        assert WARMUP["attempts"] >= 2
+        assert not wait(client.send_goal_async(goal(config, now_s=now))).accepted
+        WARMUP["ready"].set()
+        ended = time.monotonic() + 5.0
+        while not node._ready.is_set() and time.monotonic() < ended:
+            time.sleep(0.01)
+        handle = wait(client.send_goal_async(goal(config, now_s=now)))
+        assert handle.accepted and wait(handle.get_result_async()).result.success
     finally:
         stop(node, client_node, executor, thread)
 

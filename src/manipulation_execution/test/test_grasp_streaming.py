@@ -250,6 +250,41 @@ def test_a_target_segment_is_a_timed_joint_line_from_where_the_arm_is():
     assert 1.6 <= arm.t - started <= 1.6 + 0.6
 
 
+def test_a_target_segment_never_exceeds_the_global_velocity_limit():
+    arm = SimArm()
+    config = StreamConfig(
+        tracking_error_rad=0.3,
+        arrival_error_rad=0.2,
+        max_velocity_rad_s=0.01,
+        target_speed_rad_s=0.05,
+    )
+    executor = StreamExecutor(arm, config)
+    target = ArmSegment("home", SegmentKind.TARGET, DRIVEN, np.stack([np.ones(3), [0.1, 0.0, 0.0]]))
+    started = arm.t
+    assert run(executor, target).state is MotionState.SUCCEEDED
+    assert arm.t - started >= 10.0
+
+
+def test_a_sparse_trajectory_retreat_starts_at_the_actual_halt():
+    arm = SimArm()
+    executor = StreamExecutor(arm, CONFIG)
+    polls = [0]
+
+    def halted():
+        polls[0] += 1
+        return polls[0] > 50
+
+    segment = line(np.zeros(3), [1.0, 0.0, 0.0], frames=2)
+    outcome = run(executor, segment, halted=halted)
+    assert outcome.state is MotionState.HALTED and 0.0 < outcome.report["path_progress"] < 1.0
+    assert executor.hold(0.3, carrying=False, cancelled=lambda: False).state is MotionState.SUCCEEDED
+    stopped_at = executor.measured(DRIVEN)
+    back = segment.walked_back(stopped_at, path_progress=outcome.report["path_progress"])
+    np.testing.assert_allclose(back.start, stopped_at)
+    np.testing.assert_allclose(back.end, np.zeros(3))
+    assert run(executor, back).state is MotionState.SUCCEEDED
+
+
 def test_the_raise_stays_inside_the_limit_margin_and_no_command_crosses_the_limit():
     class Shaper:
         def raise_for(self, names, positions):

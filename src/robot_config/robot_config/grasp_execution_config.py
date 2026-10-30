@@ -77,6 +77,8 @@ _SCHEMA: dict[str, Any] = {
         "max_attempts": _integer(1),
         "max_moved_replans": _integer(0),
         "home_tolerance_rad": _POSITIVE,
+        # Put the object back after every successful pick, even when the goal does not ask.
+        "release_after_success": _bool(),
     },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),

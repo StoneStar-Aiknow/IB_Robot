@@ -5,6 +5,8 @@ GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安�
 `ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。采集窗口内每一条 PEAR 结果都会逐帧留存在节点内存里，供后续重定向阶段消费；
 窗口关闭后 executor 把录到的 PEAR 帧重定向成 SO-101 手臂关节轨迹（`imitation_retargeting` 子包），驱动**真实机械臂**回放；重定向失败时回退为预置动画。也就是说该 executor 既消费视频也产生运动输出。
 
+配置了 `grasp_execution.backend` 的机器人不经 GraspGen/IK 这条链，改用 `grasp_pipeline_node` 和机器人自己的抓取后端服务 `PickObject`，见「通用抓取管线：为机器人接入新后端」一节。
+
 ### HRI RGB 输入与人体感知链
 
 HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，不启动或管理 RealSense 设备。
@@ -284,6 +286,113 @@ timeout_sec: 240.0
 `model_deployment` 必须指向可由 `inference_manifest` 严格校验的 bundle；Gateway 与本节点分别加载同一
 manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment name、fingerprint 和 bundle digest。
 模型 identity 缺失、manifest 不可用或两端不一致时 fail closed，不接受抓取 goal。
+
+## 通用抓取管线：为机器人接入新后端
+
+`manipulation_execution` 有两个 `PickObject` 执行器，按 `grasp_execution.backend` 选择：
+
+| 执行器 | 启用条件 | 抓取链 |
+| --- | --- | --- |
+| `pick_executor_node` | `backend` 未配置 | GraspGen 规划、SO101 夹爪几何、IK/FK 接触补偿、primitive 执行、抓后验证（见上文） |
+| `grasp_pipeline_node` | `backend` 命名了后端工厂 | 机器人无关的 observe / perceive / plan / 执行流程，机器人差异全部在后端 |
+
+节点选择规则（embodied launch）：
+
+- 配置了 `backend` 的机器人，launch 启动 `grasp_pipeline_node`，不启动 `pick_executor_node`、
+  GraspGen planner 和 gripper verifier。
+- 未配置 `backend` 的机器人，launch 行为与旧版一致。
+- Gateway 与节点用同一个函数（`delegated_grasp_execution`）推导 executor identity，两侧对
+  `grasp_execution` 的哈希保持一致。
+
+### 最小配置
+
+```yaml
+robot:
+  grasp_execution:
+    enabled: true
+    backend: "my_robot_grasp.backends:make_backends"
+    backend_options:
+      stream: joint.arm_stream        # 内容由该工厂自行校验
+    pipeline:
+      max_attempts: 2
+      max_moved_replans: 1
+      home_tolerance_rad: 0.02
+      release_after_success: false
+```
+
+`robot_config` 在配置加载时校验：
+
+- `backend` 必须是 `package.module:callable` 形式。
+- `backend_options` 是传给工厂的映射。配置 `backend_options` 时必须同时配置 `backend`。
+- `pipeline` 只接受上表的 4 个键，范围：`max_attempts` 不小于 1，`max_moved_replans` 不小于 0，
+  `home_tolerance_rad` 大于 0，`release_after_success` 是布尔值。
+
+### 后端工厂的签名与生命周期
+
+```python
+def make_backends(*, node, grasp_execution, description) -> GraspBackends:
+    ...
+```
+
+| 参数 | 内容 |
+| --- | --- |
+| `node` | `grasp_pipeline_node` 自身。后端用它创建 service client 和订阅。 |
+| `grasp_execution` | 完整的 `grasp_execution` 配置映射，含 `backend_options`。 |
+| `description` | 绑定到机器人的 interface description。`runtime.provider` 已配置时取 `runtime.interface_description`。 |
+
+`GraspBackends` 的字段（`grasp_pipeline/contracts.py`）：
+
+- 必填 5 个：`observation`、`proposer`、`planner`、`executor`、`effector`。
+- `watch` 可选。没有 `watch` 时，管线不检查目标移动。
+- `close()` 在节点销毁时调用一次，后端在这里释放它创建的 ROS 资源。
+- `prepare()` 可选，见下节。
+
+节点拥有所有机器人共享的部分：goal 准入（`pick_goal.py`，规则与 `pick_executor_node` 一致）、
+单 goal 串行、预算、取消、feedback 和 result 映射。close 步骤的结果映射为
+`verification_status`，管线报告写入 `pipeline_timings_json`。
+
+后端的 `proposer` 通过 `grasp_pipeline/perception.py` 的 client 调用 3 个感知服务：
+GroundingDetect、SegmentDetections 和 GenerateGrasps。模型跑在哪个加速器上由服务部署决定，
+后端不加载模型。
+
+### 预热
+
+后端给出 `prepare()` 时，节点在 goal 线程外重试调用它：
+
+1. `prepare()` 抛出异常时，节点记录警告，1 秒后重试。
+2. `prepare()` 正常返回后，节点开始接受 goal。
+3. 预热完成前，节点拒绝所有 goal，拒绝原因写明「still warming up」。
+
+目的：机器人的第一个 goal 不承担加载规划器和模型的时间。
+
+### 预算与放回
+
+预算：
+
+- 节点取 `goal.timeout_sec` 与共享 task budget 剩余时间的较小值，作为执行 deadline。
+- deadline 门控 observe、perceive、plan 的每个阶段边界，以及是否启动执行。
+- 某个阶段正常返回时预算已耗尽，goal 以 `SKILL_TIMEOUT` 结束；已取消则以 `CANCELED` 结束。
+- 执行开始后，只有 goal 自身的取消会停止机械臂。deadline 不再中断执行，避免物体悬在空中。
+- 执行中 deadline 已过导致的运动失败，映射为 `SKILL_TIMEOUT`。
+
+放回：
+
+- `release_after_success` 为真（goal 请求，或 `pipeline.release_after_success` 配置）时，
+  成功的抓取放回物体。
+- plan 自带 release 步骤时执行该步骤。plan 没有 release 步骤时，按原路径回放，在支撑面开爪。
+- result 的 `released_after_success` 报告是否放回。
+
+### 流式执行器与 ROS 绑定
+
+机器人 runtime 支持关节位置流（joint.position_stream）时，后端用 `grasp_pipeline/streaming.py`
+的 `StreamExecutor` 执行轨迹，用 `grasp_pipeline/ros_stream.py` 的 `RosStreamIO` 绑定运行时接口：
+
+- `bind_stream` 按 interface ID 绑定命令流、反馈视图、命令回显和 runtime status。接口的 kind、
+  direction 或 message type 不匹配时，绑定失败并指出第一个不匹配的接口。
+- 反馈视图用不同的关节名时，用 `feedback_names` 映射。反馈在返回前已重命名为流的关节名，
+  执行器只读流自己的关节名。
+- 执行器持有流期间，最后一条命令每 0.1 秒重发一次。`release()` 停止重发，机器人保持最后一条命令；
+  `release()` 返回后不再发送任何旧命令。
 
 ## 安全边界
 

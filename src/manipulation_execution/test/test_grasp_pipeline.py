@@ -287,7 +287,7 @@ def test_a_streaming_arm_picks_and_holds_the_object_lifted():
 def test_a_motion_server_arm_refines_after_the_approach_and_releases_in_place():
     backends, executor, effector, planner = server()
     outcome = run(backends, release_after_success=True)
-    assert outcome.success and planner.refined == ["approach"]
+    assert outcome.success and outcome.released_after_success and planner.refined == ["approach"]
     assert names(executor) == ["approach", "descend", "transport"]
     assert all(kind is SegmentKind.TARGET for _, kind, _ in executor.log)
     np.testing.assert_allclose(executor.position, [0.0, 0.3, 0.3])
@@ -402,7 +402,7 @@ def test_a_retrace_that_lands_off_home_gets_one_correction():
 def test_release_after_success_without_a_release_plan_puts_the_object_back():
     backends, executor, effector, _, _ = streaming()
     outcome = run(backends, release_after_success=True)
-    assert outcome.success
+    assert outcome.success and outcome.released_after_success
     assert names(executor) == ["approach", "grasp", "lift", "hold", "retreat_lift", "retreat_grasp", "retreat_approach"]
     assert [carrying for _, _, carrying in executor.log][4:] == [True, False, False]
 
@@ -542,8 +542,9 @@ def test_a_budget_that_ends_inside_a_step_ends_the_goal_at_its_boundary(mode, fl
 )
 def test_plan_and_observe_only_never_move(mode, phases):
     backends, executor, effector, *_ = streaming()
-    outcome = run(backends, mode=mode)
-    assert outcome.success and outcome.completed_phases == phases and not executor.log and not effector.log
+    outcome = run(backends, mode=mode, release_after_success=True)
+    assert outcome.success and not outcome.released_after_success
+    assert outcome.completed_phases == phases and not executor.log and not effector.log
 
 
 def test_a_plan_reports_how_long_each_step_took_and_what_perception_measured():
@@ -583,6 +584,10 @@ def test_plans_and_segments_are_checked_on_construction():
     back = segment.walked_back(np.full(3, 0.5))
     np.testing.assert_allclose(back.positions[[0, -1]], [np.full(3, 0.5), HOME])
     np.testing.assert_allclose(back.times, [0.0, 0.02, 0.04])
+    sparse = ArmSegment("sparse", SegmentKind.TRAJECTORY, JOINTS, np.stack([HOME, np.ones(3)]), [0.0, 1.0])
+    back = sparse.walked_back(np.full(3, 0.6), path_progress=0.6)
+    np.testing.assert_allclose(back.positions, [np.full(3, 0.6), HOME])
+    np.testing.assert_allclose(back.times, [0.0, 0.6])
     assert not segment.positions.flags.writeable
 
 

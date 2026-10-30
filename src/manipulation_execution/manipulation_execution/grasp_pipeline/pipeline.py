@@ -36,8 +36,12 @@ class PipelineConfig:
     max_moved_replans: int = 1
     #: How far from home a retreat may end before one corrective move.
     home_tolerance_rad: float = 0.02
+    #: Put the object back after every successful pick, whether or not the goal asks to.
+    release_after_success: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.release_after_success, bool):
+            raise ValueError("release_after_success must be a boolean")
         for name in ("max_attempts", "max_moved_replans"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < (1 if name == "max_attempts" else 0):
@@ -57,6 +61,8 @@ class PickOutcome:
     held_confidence: float = 0.0
     #: The arm ended at rest under the executor's control (False: stopped in place).
     at_rest: bool = True
+    #: The requested post-pick release and return completed.
+    released_after_success: bool = False
     report: dict = field(default_factory=dict)
 
 
@@ -71,6 +77,10 @@ class GraspPipeline:
         self._backends = backends
         self._config = config
         self._clock = clock
+
+    @property
+    def config(self) -> PipelineConfig:
+        return self._config
 
     def run(
         self,
@@ -202,6 +212,7 @@ class GraspPipeline:
             if watch is not None:
                 outcome.report.setdefault("watch", []).append(dict(watch.disarm()))
         outcome.held, outcome.held_confidence, outcome.at_rest = result.held, result.held_confidence, result.at_rest
+        outcome.released_after_success = result.released_after_success
         outcome.report.setdefault("executions", []).append({"phases": result.phases, "retreated": result.retreated})
         return result
 

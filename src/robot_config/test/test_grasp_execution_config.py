@@ -375,7 +375,12 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         "enabled": True,
         "backend": "aimdk_grasp.pick_backend:x2_backends",
         "backend_options": {"anything": [1, 2]},
-        "pipeline": {"max_attempts": 2, "max_moved_replans": 1, "home_tolerance_rad": 0.02},
+        "pipeline": {
+            "max_attempts": 2,
+            "max_moved_replans": 1,
+            "home_tolerance_rad": 0.02,
+            "release_after_success": True,
+        },
     }
     assert validate_grasp_execution_config(valid) == []
     for mutate, message in (
@@ -386,10 +391,13 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         (lambda c: c["pipeline"].update(max_attempts=0), "max_attempts"),
         (lambda c: c["pipeline"].update(home_tolerance_rad=0.0), "home_tolerance_rad"),
         (lambda c: c["pipeline"].update(retries=3), "retries"),
+        (lambda c: c["pipeline"].update(release_after_success="yes"), "release_after_success"),
     ):
         config = {**valid, "pipeline": dict(valid["pipeline"])}
         mutate(config)
         assert any(message in error for error in validate_grasp_execution_config(config)), message
+
+
 def test_the_shared_schema_knows_no_planning_host() -> None:
     """Splitting a robot's grasp across hosts is that robot's deployment (the X2's: aimdk_grasp.split)."""
     hosted = {"backend": "robot_backend.grasp:backends", "planning_host": {"package": "p", "executable": "e"}}

@@ -194,11 +194,15 @@ class ArmSegment:
         times = None if self.times is None else self.times[-1] - self.times[::-1]
         return ArmSegment(name or f"retreat_{self.name}", self.kind, self.joint_names, self.positions[::-1], times)
 
-    def walked_back(self, stopped_at, name: str | None = None) -> ArmSegment | None:
+    def walked_back(
+        self, stopped_at, name: str | None = None, *, path_progress: float | None = None
+    ) -> ArmSegment | None:
         """Back over the part walked before the arm stopped at ``stopped_at``.
 
-        A trajectory retraces its waypoints up to the one nearest the stop; a
-        target goes back to its start. None when nothing was walked.
+        ``path_progress`` is a trajectory waypoint coordinate reported by an
+        executor (0 at the first waypoint, 1 at the second, and so on). Without
+        it, the closest point on the piecewise-linear path is used. A target
+        goes back to its start. None when nothing was walked.
         """
         stopped_at = np.asarray(stopped_at, dtype=np.float64)
         name = name or f"retreat_{self.name}_partial"
@@ -206,12 +210,34 @@ class ArmSegment:
             if np.allclose(stopped_at, self.start):
                 return None
             return ArmSegment(name, SegmentKind.TARGET, self.joint_names, np.stack([stopped_at, self.start]))
-        index = int(np.argmin(np.max(np.abs(self.positions - stopped_at), axis=1)))
-        if index < 1:
+        if path_progress is None:
+            vectors = np.diff(self.positions, axis=0)
+            squared = np.sum(vectors * vectors, axis=1)
+            offsets = stopped_at - self.positions[:-1]
+            fractions = np.divide(
+                np.sum(offsets * vectors, axis=1),
+                squared,
+                out=np.zeros_like(squared),
+                where=squared > 0,
+            )
+            fractions = np.clip(fractions, 0.0, 1.0)
+            projected = self.positions[:-1] + fractions[:, None] * vectors
+            interval = int(np.argmin(np.max(np.abs(projected - stopped_at), axis=1)))
+            path_progress = interval + float(fractions[interval])
+        if not np.isfinite(path_progress) or not 0 <= path_progress <= len(self.positions) - 1:
+            raise ValueError("path_progress must lie on the trajectory")
+        if path_progress <= np.finfo(float).eps:
             return None
-        return ArmSegment(
-            self.name, self.kind, self.joint_names, self.positions[: index + 1], self.times[: index + 1]
-        ).reversed(name)
+        index = min(int(np.floor(path_progress)), len(self.positions) - 1)
+        fraction = float(path_progress - index)
+        if fraction > np.finfo(float).eps:
+            elapsed = self.times[index] + fraction * (self.times[index + 1] - self.times[index])
+            positions = np.vstack([self.positions[: index + 1], stopped_at])
+            times = np.concatenate([self.times[: index + 1], [elapsed]])
+        else:
+            positions = np.vstack([self.positions[:index], stopped_at])
+            times = np.concatenate([self.times[:index], [self.times[index]]])
+        return ArmSegment(self.name, self.kind, self.joint_names, positions, times).reversed(name)
 
 
 class EffectorAction(enum.Enum):
@@ -410,7 +436,12 @@ class TargetWatch(Protocol):
 
 @dataclass(frozen=True)
 class GraspBackends:
-    """One robot's implementations. ``watch`` is optional."""
+    """One robot's implementations. ``watch`` is optional.
+
+    ``prepare``, when given, warms the robot's backends up (loads planners,
+    runs the models once) before the first goal: it is called again until it
+    returns without raising, and goals are refused until then.
+    """
 
     observation: ObservationSource
     proposer: GraspProposer
@@ -419,3 +450,4 @@ class GraspBackends:
     effector: EndEffector
     watch: TargetWatch | None = None
     close: Callable[[], None] = lambda: None
+    prepare: Callable[[], None] | None = None

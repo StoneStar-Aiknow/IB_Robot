@@ -32,6 +32,57 @@ from skill_catalog.source import resolve_development_source_root
 logger = get_colored_logger("embodied_bringup")
 
 
+def delegated_grasp_execution(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """``grasp_execution`` as both the Gateway and the pick executor receive it.
+
+    Both hash it into the executor identity, so both are built from the robot
+    configuration by this one function.
+    """
+    grasp_execution = robot_config.get("grasp_execution", {})
+    placement_execution = robot_config.get("placement_execution", {})
+    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
+        motion = placement_execution.get("motion", {})
+        if isinstance(motion, dict):
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["post_grasp_motion"] = {
+                "pose_name": motion.get("place_pose", "place_container"),
+                "joint_names": motion.get("place_joint_names", []),
+                "joint_positions": motion.get("place_joint_positions", {}),
+                "duration_sec": motion.get("place_duration_sec", 5.0),
+                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
+            }
+    return grasp_execution
+
+
+def runs_grasp_pipeline(robot_config: dict[str, Any]) -> bool:
+    """Whether the robot names grasp backends: it then picks with the robot-agnostic grasp pipeline."""
+    grasp_execution = robot_config.get("grasp_execution", {})
+    return bool(grasp_execution.get("enabled", False) and grasp_execution.get("backend"))
+
+
+def _bound_description(robot_config: dict[str, Any]) -> dict[str, Any]:
+    runtime = robot_config.get("runtime", {})
+    return runtime.get("interface_description", {}) if runtime.get("provider") else {}
+
+
+def grasp_pipeline_node(robot_config: dict[str, Any]) -> Node:
+    """The grasp pipeline's pick executor, bound to the robot's live interface description."""
+    grasp_execution = delegated_grasp_execution(robot_config)
+    return Node(
+        package="manipulation_execution",
+        executable="grasp_pipeline_node",
+        name="grasp_pipeline_node",
+        output="screen",
+        parameters=[
+            {
+                "action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
+                "grasp_execution_json": json.dumps(grasp_execution),
+                "interface_description_json": json.dumps(_bound_description(robot_config)),
+            }
+        ],
+    )
+
+
 def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
     node_params = dict(params)
     host_runtime = node_params.pop("host_runtime", {})
@@ -156,20 +207,9 @@ def generate_embodied_nodes(
         return interface["endpoint"]
 
     perception = embodied_config.get("perception", {})
-    grasp_execution = robot_config.get("grasp_execution", {})
+    grasp_execution = delegated_grasp_execution(robot_config)
     placement_execution = robot_config.get("placement_execution", {})
     semantic_mapping = robot_config.get("semantic_mapping", {})
-    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
-        motion = placement_execution.get("motion", {})
-        if isinstance(motion, dict):
-            grasp_execution = dict(grasp_execution)
-            grasp_execution["post_grasp_motion"] = {
-                "pose_name": motion.get("place_pose", "place_container"),
-                "joint_names": motion.get("place_joint_names", []),
-                "joint_positions": motion.get("place_joint_positions", {}),
-                "duration_sec": motion.get("place_duration_sec", 5.0),
-                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
-            }
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
@@ -650,7 +690,12 @@ def generate_embodied_nodes(
     elif include_perception and perception_node is not None:
         # Preserve the legacy perception placement in the controller-gated motion closure.
         nodes.append(perception_node)
-    if grasp_execution.get("enabled", False):
+    if runs_grasp_pipeline(robot_config):
+        # A robot that names grasp backends runs the robot-agnostic grasp pipeline;
+        # the primitive executor and its GraspGen planner and gripper verifier are
+        # for robots without one.
+        nodes.append(grasp_pipeline_node(robot_config))
+    elif grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
         planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
         for field in ("local_manifest_path", "ascend_local_manifest_path"):

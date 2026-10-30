@@ -63,6 +63,8 @@ class SequenceResult:
     retreated: dict | None = None
     #: The arm ended under the executor's control at rest (False: stopped in place).
     at_rest: bool = True
+    #: The requested post-pick release and return completed.
+    released_after_success: bool = False
     completed: list[str] = field(default_factory=list)
     phases: list[dict] = field(default_factory=list)
 
@@ -122,7 +124,10 @@ class GraspSequence:
                     if outcome.state is MotionState.HALTED:
                         blind(step.name)
                         result.retreated = {"step": step.name, "reason": str(state["moved"])}
-                        back = step.segment.walked_back(self._stopped_at(step.segment, cancelled))
+                        back = step.segment.walked_back(
+                            self._stopped_at(step.segment, cancelled),
+                            path_progress=outcome.report.get("path_progress"),
+                        )
                         if back is not None:
                             self._expect(self._move(back, False, _never, cancelled, result))
                         abandoned = True
@@ -157,6 +162,7 @@ class GraspSequence:
             if not abandoned:
                 if release_after_success:
                     self._release(plan, done, state, cancelled, result)
+                    result.released_after_success = not state["carrying"]
                 result.succeeded = True
                 return result
             self._undo(plan, done, state, cancelled, result)
