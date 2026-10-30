@@ -342,22 +342,56 @@ re-subscribe the camera and lidar streams inside this process on a board that is
 already the bottleneck. Its subscription runs in the speech callback group so
 nothing else on the executor can delay it past the staleness window.
 
-### Platform state is taken when it is read
+### The data plane is a native process
 
 The HAL publishes each joint group, the hand state and the arm command at
-~200-500 Hz. Taking every sample in an executor callback held a core on the
-robot-side host, and under a 400 Hz group the executor published one view a
-second instead of fifty (2026-10-22). These subscriptions are therefore not in
-the executor: samples wait in reader queues (`robot_runtime.on_demand`) and the
-readers drain them first, in one batch per read: the joint state views at
-`joint_state_rate_hz` (50 Hz), the hold targets of a stream command, the 5 Hz
-staleness check and the hand-type verification. Each sample keeps its platform
-stamp and when it was received, so a quiet source still goes stale on time.
-Joint and hand state keep every sample between reads (`PLATFORM_STATE_DEPTH`),
-so a fault code that lasts a few samples is reported and the touch arrays below
-are republished at the platform's rate, in bursts at the view rate; only the
-newest arm command board is kept, and its echo below is republished at the
-view rate.
+~170-500 Hz, ~2800 samples a second in all. In this Python process that
+traffic decided everything else: on the 310P robot-side host `/joint_states`
+fell to 0.5 Hz against 50 (2026-10-26), commands reached the platform
+100-200 ms late, and every way of reading fewer samples (a shallower queue per
+group, dropping groups) was a per-deployment setting that left the runtime
+blind to a fault code present in one frame.
+
+So the runtime is two processes (`aimdk_robot.dataplane`):
+
+- **`aimdk_dataplane`** (C++, package `aimdk_dataplane`) takes every vendor
+  joint, hand and arm command sample; publishes `/joint_states` and every other
+  declared JointState view at the `joint.state` rate, the hand touch arrays and
+  the arm command echo; and owns the fixed-rate command stream: it subscribes
+  the public command channels, validates them, holds uncommanded joints, and
+  publishes `/mc/upper_body_command` and the locomotion velocity. On the 310P it
+  takes all ~2800 samples a second at ~0.35 of one core.
+- **`aimdk_runtime`** (this node) keeps the control plane: modes, arbitration,
+  stop, the vendor services, speech, audio, diagnostics, named motions.
+
+They share three internal topics under `/aimdk_runtime/dataplane/`. The
+runtime's **control** word (latched, sent on every change and at 10 Hz) says
+what is admitted: the mode, whether output is admitted, the navigation gate,
+the arm owner, the platform speed envelope, and two counters that clear the
+cached commands or ask for an explicit zero velocity. A stop waits for the data
+plane to acknowledge the word that closes the output and reports the stop as
+failed while it goes unacknowledged, so a safe output is never claimed before
+the data plane proves it. Closing an admission that was open does the same as a
+`clear` plus an explicit zero — the runtime closes it for its own faults (a
+faulted joint group) without counting a `safe`, and its heartbeat keeps the
+control fresh so the quiet watchdog below would never fire. A named motion's
+claim of the arm is judged by the data plane in the same step that applies it:
+while a public arm target is live the claim is refused (`arm_claim:
+PUBLIC_ARM_STREAM_ACTIVE`) and the status keeps reporting no owner, so a
+status snapshot that predates a target cannot hand the arm over. If the control
+word stops arriving for 0.5 s the data plane drops its commands and sends a zero
+itself, so a dead or stalled runtime never leaves a target streaming. The data
+plane's **status** (20 Hz) is stamped with when it was generated, on the
+monotonic clock both processes share; the runtime ages it end to end, so a
+report that queued past the freshness window is stale no matter when its
+callback ran. It reports feedback ages, the hand types, the measured arm with
+its own age, the applied arm owner, the fault codes seen since the previous
+status -- a code present in a single sample is reported -- and the commands it
+refused. **named_arm** carries a named motion's arm targets.
+
+The rules the data plane applies (payload validation and rejection reasons,
+holds, velocity limits, view stamping) are the ones this node applied before,
+ported rule for rule and tested in `aimdk_dataplane`'s gtests.
 
 ### The platform's wake word is reported as `audio.wake_event`
 
@@ -546,10 +580,6 @@ policy, arbitration identity, expression/motion/posture tables and the vendor
 endpoint map. Hand type is a profile property, not runtime autodetection — the
 bridge verifies it against the vendor's `GetHandType` at startup and refuses to
 become ACTIVE on mismatch.
-
-A deployment that needs a different setting inside the profile states it in
-`robot.runtime.profile_overrides`, which the launch merges into the profile it
-hands the provider, rather than copying the profile.
 
 The platform's 6-channel microphone capture is read BEST_EFFORT: every message
 is IP-fragmented, and reading it reliably made the robot-side host resend lost

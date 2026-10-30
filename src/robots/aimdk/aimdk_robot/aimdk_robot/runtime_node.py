@@ -25,20 +25,18 @@ from typing import Any
 
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rclpy.time import Time
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, String
 
-from aimdk_robot import projection
+from aimdk_robot import dataplane, projection
 from aimdk_robot import vendor_gateway as vg
-from aimdk_robot.projection import CommandRejected, LocomotionLimits
+from aimdk_robot.projection import CommandRejected
 from aimdk_robot.wake_ack import WakeAckPairer
-from ibrobot_msgs.msg import JointCommandState, PowerState, RuntimeStatus, SpeechWakeEvent
+from ibrobot_msgs.msg import PowerState, RuntimeStatus, SpeechWakeEvent
 from ibrobot_msgs.srv import (
     GetRuntimeStatus,
     PlayExpression,
@@ -68,15 +66,6 @@ from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.profile import load_profile
 from robot_runtime.state import RuntimeState
 
-#: Which vendor hand sub-mode a hand command channel speaks. The sub-mode
-#: follows the channel the command arrived on, so a deployment can offer joint
-#: control and gestures without a mode switch between them.
-_CHANNEL_HAND_TYPES = {
-    "gripper_stream": "claw",
-    "hand_stream": "dexterous_joint",
-    "hand_gesture_stream": "dexterous_gesture",
-}
-
 # Contract-side endpoints this runtime adds for vendor capabilities. They are
 # vendor-neutral: another robot with speech or lights serves the same names.
 SPEAK_SERVICE = "/speech/speak"
@@ -85,12 +74,6 @@ LED_SERVICE = "/led/set_pattern"
 RELOCALIZE_SERVICE = "/localization/relocalize"
 POWER_TOPIC = "/power_state"
 DIAGNOSTICS_TOPIC = "/diagnostics"
-
-#: Joint and hand state samples kept between drains: 64 ms of a 500 Hz group,
-#: so the 50 Hz readers see every sample, not only the newest. A fault code
-#: carried by a few samples is reported, and the touch arrays keep the
-#: platform's rate.
-PLATFORM_STATE_DEPTH = 32
 
 #: How old the platform's action report may be for a mode switch to rely on it
 #: instead of asking (the state is published at 10 Hz).
@@ -141,32 +124,6 @@ _AUDIO_FOCUS_RETRY_S = 1.0
 _CLOCK_SKEW_WINDOW_S = 30.0
 
 
-def _joint_state_views(profile: dict) -> list[tuple[str, list[str]]]:
-    """``(endpoint, joint order)`` of every published JointState interface the profile declares."""
-    views = []
-    for interface in (profile.get("interfaces") or {}).values():
-        if (
-            interface.get("kind") == "topic"
-            and interface.get("direction") == "publish"
-            and interface.get("message_type") == "sensor_msgs/msg/JointState"
-            and interface.get("joint_names")
-        ):
-            views.append((str(interface["endpoint"]), [str(joint) for joint in interface["joint_names"]]))
-    return views
-
-
-#: The arm command echo interface: what the motion-control unit is driving the arm to.
-ARM_COMMAND_STATE = "joint.arm_command_state"
-
-
-def _arm_command_state(profile: dict) -> tuple[str, list[str]] | None:
-    """``(endpoint, joint order)`` of the arm command echo the profile declares, or None."""
-    interface = (profile.get("interfaces") or {}).get(ARM_COMMAND_STATE)
-    if not interface or not interface.get("joint_names"):
-        return None
-    return str(interface["endpoint"]), [str(joint) for joint in interface["joint_names"]]
-
-
 class AimdkRuntimeNode(Node):
     """Bridge between the public runtime contract and the AimDK MC tier."""
 
@@ -201,7 +158,6 @@ class AimdkRuntimeNode(Node):
         self._vendor = self._profile.get("vendor") or {}
         self._source = str((self._vendor.get("input_source") or {}).get("name", "ibrobot.aimdk_robot"))
         self._source_priority = int((self._vendor.get("input_source") or {}).get("priority", 30))
-        self._command_rate_hz = float((self._vendor.get("command") or {}).get("rate_hz", 50.0))
         self._stamp_window_s = float((self._vendor.get("command") or {}).get("stamp_window_s", 0.2))
         # A command whose stamp falls outside the platform's window is dropped
         # by the platform without a word, so a clock that disagrees with the
@@ -214,23 +170,7 @@ class AimdkRuntimeNode(Node):
         self._speed_envelope: projection.SpeedEnvelope | None = None
         self._player_state = projection.PLAYER_STATE_IDLE
         self._hand_statuses: list[int] = []
-        self._head_limits = {
-            str(joint): float(limit) for joint, limit in ((self._vendor.get("head") or {}).get("limits") or {}).items()
-        }
-        # The declared rate is what the conformance suite and every consumer
-        # hold this runtime to, so it is what drives publication.
-        self._joint_state_rate_hz = float(
-            ((self._profile.get("capabilities") or {}).get("joint.state") or {}).get("rate_hz", 50.0)
-        )
-        # Platform state is drained at most once per half publish period; see _drain_platform_state.
-        self._drain_lock = threading.Lock()
-        self._drained_at = float("-inf")
-        self._drain_interval_s = 0.5 / max(self._joint_state_rate_hz, 1.0)
-        self._locomotion = LocomotionLimits.from_profile(self._vendor.get("locomotion"))
         self._hand_type = str((self._vendor.get("hand") or {}).get("type", "claw"))
-        self._default_hand_sub_mode = int(
-            (self._vendor.get("hand") or {}).get("sub_mode", projection.HAND_SUB_MODE_CLAW)
-        )
 
         # Raw audio playback is focus-gated by the platform; these stay inert
         # until a profile declares a playback endpoint.
@@ -277,35 +217,26 @@ class AimdkRuntimeNode(Node):
         )
         self._modes = modes
 
-        # Latest commands per channel, published at a fixed rate while their
-        # mode is active. None means "nothing to send". Everything a command
-        # publication reads is guarded by _lock, and the publication itself
-        # runs under it, so a stop that clears the caches cannot interleave
-        # with a copy already taken for publication.
+        # The data plane (aimdk_dataplane, see aimdk_robot.dataplane) holds the
+        # commands and the platform state; this process tells it what is
+        # admitted and reads back what it reports. _lock guards both words.
         self._lock = threading.RLock()
-        self._arm_cmd: list[float] | None = None
-        self._hand_cmd: tuple[int, list[float]] | None = None
-        # The last hand command accepted in this mode, held once its channel is quiet (see _hand_hold_locked).
-        self._hand_held: tuple[int, list[float]] | None = None
-        self._head_cmd: list[float] | None = None
-        # One receipt stamp per channel: a channel's target expires on its own
-        # clock, and input on another channel must not extend it.
-        self._arm_stamp = 0.0
-        self._head_stamp = 0.0
-        self._hand_stamp = 0.0
+        self._control = dataplane.Control()
+        self._dataplane = dataplane.Status()
+        # When the data plane generated its last status (monotonic s; the report
+        # carries it, so the time it spent queued counts as age). Its group ages
+        # are relative to that moment.
+        self._dataplane_at = float("-inf")
+        self._dataplane_seen = threading.Condition(self._lock)
         #: Token of the named motion replaying a trajectory on the arm channel;
         #: while set, the public arm stream is refused instead of interleaved.
         self._arm_owner: int | None = None
-        #: When the public arm stream last set a target; a fresh one is not preempted.
-        self._public_arm_stamp: float | None = None
         #: Moves on anything that may have moved the arm or changed who commands
-        #: it: a public arm target, a named motion taking the channel, and every
-        #: command reset (mode change, stop, lost arbitration). A named motion
+        #: it: a named motion taking the channel and every command reset (mode
+        #: change, stop, lost arbitration) here, and a public arm target in the
+        #: data plane (its count is added in arm_motion_epoch). A named motion
         #: cancelled part-way resumes only while it has not moved.
         self._arm_motion_epoch = 0
-        self._twist: tuple[float, float, float] | None = None
-        self._twist_stamp = 0.0
-        self._sequence = 0
         self._arbitration_ok = False
         self._body_pose = projection.BODY_POSE_UNKNOWN
         self._navigation_enabled = False
@@ -314,28 +245,9 @@ class AimdkRuntimeNode(Node):
         # When that state arrived, and when this runtime last asked for an action (monotonic s).
         self._vendor_action_at = 0.0
         self._action_requested_at = 0.0
-        # The motion-control unit's own arm targets (the HAL's command board), when the profile names it.
-        self._arm_board_configured = False
-        self._arm_board: dict[str, float] | None = None
-        self._arm_board_received = 0.0
-        # The arm_pos last sent to the platform in this mode: the target it holds.
-        self._arm_sent: list[float] | None = None
         self._system_state = ""
-        self._hold_target_missing = False
-        self._hand_hold_missing = False
         self._hand_type_verified = False
         self._hand_type_reported: list[str] = []
-        #: Hand families as reported by the hand state stream (HandStateArray
-        #: carries the same enumeration as GetHandType).
-        self._hand_state_types: list[int] = []
-        #: Measured hand joint positions per side (left, right), by joint name.
-        self._hand_measured: list[dict[str, float]] = [{}, {}]
-        # Per-source joint feedback with its receipt time: a source that goes
-        # quiet must drop out of the aggregate instead of being re-stamped.
-        self._joint_groups: dict[str, list[tuple[str, float, float, float]]] = {}
-        self._feedback_received: dict[str, float] = {}
-        #: Measurement time of each group's last feedback, in nanoseconds. See _record_joint_group.
-        self._feedback_clock: dict[str, int] = {}
         feedback = self._vendor.get("feedback") or {}
         self._feedback_window_s = float(feedback.get("staleness_s", 0.5))
         self._required_feedback = [str(group) for group in feedback.get("required_groups", ["arm", "hand"])]
@@ -343,7 +255,6 @@ class AimdkRuntimeNode(Node):
         # what a non-zero code means is per group (OmniHand faultcodes are set
         # while a finger presses an object, a normal grasp), so none by default.
         self._fault_groups = {str(group) for group in feedback.get("fault_groups", [])}
-        self._stream_staleness_s = float((self._vendor.get("command") or {}).get("stream_staleness_s", 0.5))
         # Fault sources that decide the lifecycle between them: each holds at
         # most one fault, DEGRADED ones are recoverable, FAULTED ones persist
         # until the platform clears the condition.
@@ -351,13 +262,10 @@ class AimdkRuntimeNode(Node):
 
         self._client_cb = ReentrantCallbackGroup()
         self._service_cb = MutuallyExclusiveCallbackGroup()
-        # The platform feeds five joint groups at ~500 Hz each. Left in the
-        # node's default group, that torrent serialises ahead of every other
-        # subscription: the low-rate state topics queue behind it, and their
-        # stamps arrive late enough to be mistaken for a clock that disagrees.
-        # Telemetry that must be timely gets its own group.
+        # Telemetry that must be timely gets its own group, and so does the data
+        # plane's status: a stop waits for it to acknowledge the closed output.
         self._telemetry_cb = MutuallyExclusiveCallbackGroup()
-        self._joint_pub_cb = MutuallyExclusiveCallbackGroup()
+        self._dataplane_cb = MutuallyExclusiveCallbackGroup()
         # Stop and status must never queue behind a mode switch that is
         # waiting for the platform's confirmation: they run in their own
         # reentrant group, and the stop path serialises itself.
@@ -365,13 +273,6 @@ class AimdkRuntimeNode(Node):
         self._stop_lock = threading.Lock()
 
         self._status_pub = self.create_publisher(RuntimeStatus, STATUS_TOPIC, 10)
-        self._joint_pub = self.create_publisher(JointState, str(self._profile["joint_state_topic"]), _RELIABLE_QOS)
-        # Every declared JointState interface (body, hands) is a view of the same
-        # aggregated feedback in its own joint order, published beside /joint_states.
-        self._state_views: list[tuple[Any, list[str]]] = [
-            (self.create_publisher(JointState, endpoint, _RELIABLE_QOS), order)
-            for endpoint, order in _joint_state_views(self._profile)
-        ]
         self._power_pub = self.create_publisher(PowerState, POWER_TOPIC, _RELIABLE_QOS)
         self._diag_pub = self.create_publisher(DiagnosticArray, DIAGNOSTICS_TOPIC, 10)
         self._localization_pub: Any = None
@@ -381,18 +282,13 @@ class AimdkRuntimeNode(Node):
         self._setup_contract_surface()
 
         self.create_timer(1.0, self._publish_status, callback_group=self._stop_cb)
-        self.create_timer(1.0 / max(self._command_rate_hz, 1.0), self._publish_commands, callback_group=self._client_cb)
+        # The data plane closes the output once this word is older than
+        # dataplane.CONTROL_TIMEOUT_S, so it is repeated well inside that.
+        self.create_timer(0.1, self._push_control, callback_group=self._stop_cb)
         self.create_timer(1.0, self._poll_arbitration, callback_group=self._client_cb)
         self.create_timer(1.0, self._check_clock_skew, callback_group=self._client_cb)
         self.create_timer(0.2, self._check_feedback, callback_group=self._client_cb)
         self.create_timer(5.0, self._recheck_hand_type, callback_group=self._client_cb)
-        # Joint feedback is published at the rate the profile declares, not at
-        # the rate the platform happens to feed it: the vendor publishes every
-        # group at ~500 Hz, and re-aggregating on each callback would make the
-        # declared rate a function of this host's spare CPU.
-        self.create_timer(
-            1.0 / max(self._joint_state_rate_hz, 1.0), self._publish_joint_states, callback_group=self._joint_pub_cb
-        )
         self._startup_thread = threading.Thread(target=self._startup_checks, daemon=True)
         self._startup_thread.start()
 
@@ -415,14 +311,9 @@ class AimdkRuntimeNode(Node):
             AlertCodeArray,
             AudioCapture,
             DiagnosticInfoArray,
-            HandStateArray,
-            JointCommandArray,
-            JointStateArray,
             McCommonState,
-            McLocomotionVelocity,
             PmuState,
             SmSystemState,
-            UpperBodyCommandArray,
         )
         from aimdk_msgs.srv import (  # noqa: PLC0415
             AbandonAudioFocus,
@@ -441,15 +332,22 @@ class AimdkRuntimeNode(Node):
         topics = self._vendor.get("topics") or {}
         services = self._vendor.get("services") or {}
 
-        self._upper_body_pub = self.create_publisher(
-            UpperBodyCommandArray,
-            str(topics.get("upper_body_command", "/mc/upper_body_command")),
-            self._vendor_qos("upper_body_command"),
+        # The data plane (aimdk_dataplane) takes the platform's joint, hand and
+        # arm command state and owns the command stream; this is the runtime's
+        # side of the wiring to it (see aimdk_robot.dataplane).
+        self._control_pub = self.create_publisher(
+            String,
+            dataplane.CONTROL_TOPIC,
+            QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
         )
-        self._locomotion_pub = self.create_publisher(
-            McLocomotionVelocity,
-            str(topics.get("locomotion_command", "/aima/mc/locomotion/velocity")),
-            self._vendor_qos("locomotion_command"),
+        self._named_arm_pub = self.create_publisher(Float64MultiArray, dataplane.NAMED_ARM_TOPIC, 1)
+        self.create_subscription(
+            String, dataplane.STATUS_TOPIC, self._on_dataplane_status, 20, callback_group=self._dataplane_cb
         )
 
         def caller(service_type: Any, key: str, default: str) -> vg.ServiceCaller:
@@ -468,52 +366,6 @@ class AimdkRuntimeNode(Node):
         self._play_emoji = caller(PlayEmoji, "play_emoji", "/aimdk_5Fmsgs/srv/PlayEmoji")
         self._set_led = caller(SetPmuLed, "set_led", "/aimdk_5Fmsgs/srv/SetPmuLed")
 
-        from robot_runtime.on_demand import OnDemandSubscriptions  # noqa: PLC0415
-
-        # The platform publishes joint and hand state and the arm's command at
-        # ~200-500 Hz each. Taking every sample in an executor callback held a
-        # core on the robot-side host (2026-10-22). They wait in reader queues
-        # instead, and the timers that read them drain those first
-        # (_drain_platform_state), in a batch per drain; each sample keeps when
-        # it was received and the platform's stamp. State keeps every sample
-        # (PLATFORM_STATE_DEPTH) for its fault codes and touch arrays; only the
-        # newest arm command board is ever used.
-        self._platform_state = OnDemandSubscriptions(self.context, f"{self.get_name()}_platform_state")
-        state_topics = topics.get("joint_state") or {}
-        joint_state_qos = self._vendor_qos("joint_state")
-        for group, topic in state_topics.items():
-            self._platform_state.subscribe(
-                JointStateArray,
-                str(topic),
-                joint_state_qos,
-                PLATFORM_STATE_DEPTH,
-                lambda message, received, group=str(group): self._on_joint_state(group, message, received),
-            )
-        if topics.get("hand_state"):
-            self._platform_state.subscribe(
-                HandStateArray,
-                str(topics["hand_state"]),
-                self._vendor_qos("hand_state"),
-                PLATFORM_STATE_DEPTH,
-                self._on_hand_state,
-            )
-            # The hands' touch arrays ride on the state message the line above
-            # already subscribes to, so publishing them costs no extra traffic.
-            touch_topic = str((self._vendor.get("hand") or {}).get("touch_topic", ""))
-            if touch_topic:
-                self._hand_touch_pub = self.create_publisher(Float64MultiArray, touch_topic, _SENSOR_QOS)
-        echo = _arm_command_state(self._profile)
-        if echo is not None and topics.get("arm_command"):
-            endpoint, self._arm_command_order = echo
-            self._arm_command_pub = self.create_publisher(JointCommandState, endpoint, _SENSOR_QOS)
-            self._platform_state.subscribe(
-                JointCommandArray,
-                str(topics["arm_command"]),
-                self._vendor_qos("arm_command"),
-                1,
-                self._publish_arm_command,
-            )
-            self._arm_board_configured = True
         if topics.get("mc_state"):
             self.create_subscription(
                 McCommonState,
@@ -867,20 +719,9 @@ class AimdkRuntimeNode(Node):
         self.create_service(GetRuntimeStatus, GET_STATUS_SERVICE, self._on_get_status, callback_group=self._stop_cb)
         self.create_service(StopRuntime, STOP_SERVICE, self._on_stop, callback_group=self._stop_cb)
 
-        for channel in self._profile.get("command_channels", []):
-            name = str(channel["channel"])
-            topic = str(channel["topic"])
-            if str(channel.get("type", "float64_array")).lower() == "twist":
-                self.create_subscription(
-                    Twist, topic, lambda message, name=name: self._on_twist(name, message), _SENSOR_QOS
-                )
-                continue
-            self.create_subscription(
-                Float64MultiArray,
-                topic,
-                lambda message, channel=channel: self._on_stream(channel, message),
-                _SENSOR_QOS,
-            )
+        # The command channels themselves are the data plane's: it subscribes
+        # them, applies the mode, admission and navigation gate this runtime
+        # reports in its control word, and reports what it refused.
 
         if self._state.has_capability("interaction.tts"):
             self.create_service(SpeakText, SPEAK_SERVICE, self._on_speak, callback_group=self._service_cb)
@@ -920,7 +761,6 @@ class AimdkRuntimeNode(Node):
             # cached velocity must not keep driving until it expires.
             with self._lock:
                 self._navigation_enabled = False
-                self._twist = None
             self.publish_safe_command()
             self._publish_navigation_ack()
             response.success, response.message = True, "navigation disabled"
@@ -948,6 +788,7 @@ class AimdkRuntimeNode(Node):
             return response
         with self._lock:
             self._navigation_enabled = True
+        self._push_control()
         self._publish_navigation_ack()
         response.success, response.message = True, "navigation enabled"
         return response
@@ -974,6 +815,18 @@ class AimdkRuntimeNode(Node):
         if missing:
             self._set_fault(
                 "startup", f"vendor services unavailable: {', '.join(missing)}", lifecycle=LIFECYCLE_FAULTED
+            )
+            self._state.set_lifecycle(LIFECYCLE_FAULTED)
+            return
+        # The data plane is half of this runtime: without its report there is no
+        # feedback, no hand type from the state stream and no command output.
+        while time.time() < deadline and not self._dataplane_reporting():
+            time.sleep(0.05)
+        if not self._dataplane_reporting():
+            self._set_fault(
+                "startup",
+                "the data plane (aimdk_dataplane) is not reporting; it carries the feedback and the command stream",
+                lifecycle=LIFECYCLE_FAULTED,
             )
             self._state.set_lifecycle(LIFECYCLE_FAULTED)
             return
@@ -1016,9 +869,8 @@ class AimdkRuntimeNode(Node):
                 self.get_logger().warning("GetHandType did not answer; declared hand type is unverified")
         else:
             self.get_logger().warning("GetHandType unavailable; declared hand type is unverified")
-        self._drain_platform_state()
         with self._lock:
-            from_state = list(self._hand_state_types)
+            from_state = list(self._dataplane.hand_types)
         families = {vg.hand_type_family(value) for value in reported} if reported else {None}
         if None in families and from_state:
             # The service had nothing definite; the state stream might.
@@ -1366,7 +1218,7 @@ class AimdkRuntimeNode(Node):
             self._state.engage_stop(policy)
             self._modes.commit(IDLE_MODE if IDLE_MODE in self._modes.declared_modes() else self._modes.mode)
             self._clear_commands()
-            self.publish_safe_command()
+            safe_confirmed = self.publish_safe_command()
             response.cancel_latency_s = time.monotonic() - started
 
             # (2) Ask the platform to hold (or release), then confirm. A plan
@@ -1376,6 +1228,18 @@ class AimdkRuntimeNode(Node):
             #     change of behaviour rather than a stop.
             if plan.release_arbitration:
                 self._release_input_source()
+            if not safe_confirmed and not plan.vendor_action:
+                # The latch and the closed admission stand, but the data plane
+                # never answered for the word that carries the zero velocity:
+                # the safe output is unproven, and success must not claim it.
+                # The heartbeat re-sends the word (the safe counter moved), so
+                # the zero still goes out the moment the data plane answers.
+                detail = "the data plane did not confirm the safe command in time"
+                self._set_fault("stop", f"{detail}; command admission stays closed (stop latched)")
+                response.idle_latency_s = time.monotonic() - started
+                response.success = False
+                response.message = f"{detail}; stop latched locally, safe output unconfirmed"
+                return response
             if not plan.vendor_action:
                 response.idle_latency_s = time.monotonic() - started
                 self._publish_status()
@@ -1401,9 +1265,23 @@ class AimdkRuntimeNode(Node):
                     f"platform rejected stop action {plan.vendor_action}: "
                     f"{projection.mode_rejection_reason(result.code)}"
                 )
+                if not safe_confirmed:
+                    detail += "; the data plane did not confirm the safe command either"
                 self._set_fault("stop", f"{detail}; command admission stays closed (stop latched)")
                 response.success = False
                 response.message = f"{detail}; stop latched locally, platform-side stop unconfirmed"
+                return response
+            if not safe_confirmed:
+                # The platform holds, but the data plane never answered for the
+                # zero velocity: one of the two guarantees is unproven, so the
+                # answer is a failure that names which.
+                detail = "the data plane did not confirm the safe command in time"
+                self._set_fault("stop", f"{detail}; command admission stays closed (stop latched)")
+                response.success = False
+                response.message = (
+                    f"platform stopped via {plan.vendor_action}, but {detail}; "
+                    "stop latched locally, safe output unconfirmed"
+                )
                 return response
             self._publish_status()
             response.success = True
@@ -1521,205 +1399,12 @@ class AimdkRuntimeNode(Node):
 
     # --- command channels ---------------------------------------------------
 
-    def _on_stream(self, channel: dict[str, Any], message: Float64MultiArray) -> None:
-        name = str(channel["channel"])
-        if not self._channel_active(channel):
-            self._modes.note_rejected(name)
-            self._publish_status()
-            return
-        joints = [str(joint) for joint in channel.get("joints", [])]
-        try:
-            if name == "arm_stream":
-                payload = projection.arm_payload(message.data, channel_joints=joints)
-                with self._lock:
-                    if self._arm_owner is not None:
-                        self._modes.note_rejected(f"{name}:NAMED_MOTION_ACTIVE")
-                        return
-                    self._arm_cmd = payload
-                    self._arm_stamp = time.monotonic()
-                    self._public_arm_stamp = self._arm_stamp
-                    self._arm_motion_epoch += 1
-            elif name == "head_stream":
-                payload = projection.head_payload(message.data, channel_joints=joints, limits=self._head_limits)
-                with self._lock:
-                    self._head_cmd = payload
-                    self._head_stamp = time.monotonic()
-            elif name in ("gripper_stream", "hand_stream", "hand_gesture_stream"):
-                hand = self._vendor.get("hand") or {}
-                sub_mode, payload = projection.hand_payload(
-                    message.data,
-                    hand_type=_CHANNEL_HAND_TYPES[name],
-                    command_min=float(hand.get("command_min", 0.0)),
-                    command_max=float(hand.get("command_max", 1.0)),
-                    gesture_ids=hand.get("gesture_ids"),
-                )
-                with self._lock:
-                    self._hand_cmd = self._hand_held = (sub_mode, payload)
-                    self._hand_stamp = time.monotonic()
-            else:
-                self._modes.note_rejected(name)
-                return
-        except CommandRejected as rejected:
-            self._modes.note_rejected(f"{name}:{rejected.reason}")
-            self.get_logger().warning(f"rejected {name} command: {rejected}")
-            self._publish_status()
-
-    def _on_twist(self, name: str, message: Twist) -> None:
-        channel = next(
-            (c for c in self._profile.get("command_channels", []) if str(c.get("channel")) == name),
-            {},
-        )
-        if not self._channel_active(channel):
-            self._modes.note_rejected(name)
-            self._publish_status()
-            return
-        try:
-            # The platform narrows its own speed envelope with battery, load
-            # and terrain and reports it in every state message; a static table
-            # would either accept what it will refuse or refuse what it allows.
-            with self._lock:
-                envelope = self._speed_envelope
-            triple = projection.twist_to_locomotion(
-                message.linear.x,
-                message.linear.y,
-                message.angular.z,
-                self._locomotion.with_platform_envelope(envelope),
-            )
-        except CommandRejected as rejected:
-            self._modes.note_rejected(f"{name}:{rejected.reason}")
-            self.get_logger().warning(f"rejected {name} command: {rejected}")
-            self._publish_status()
-            return
-        with self._lock:
-            self._twist = triple
-            self._twist_stamp = time.monotonic()
-
-    def _channel_active(self, channel: dict[str, Any]) -> bool:
-        if not self.output_admitted():
-            return False
-        modes = [str(mode) for mode in channel.get("modes", [])]
-        if not modes or self._modes.mode not in modes:
-            return False
-        if self._is_twist_channel(channel) and self._state.has_capability("base.navigation_gate"):
-            with self._lock:
-                return self._navigation_enabled
-        return True
-
-    @staticmethod
-    def _is_twist_channel(channel: dict[str, Any]) -> bool:
-        return str(channel.get("type", "float64_array")).lower() == "twist"
-
     def _clear_commands(self) -> None:
+        """Have the data plane drop every cached command; a named motion's progress counts as moved."""
         with self._lock:
             self._arm_motion_epoch += 1
-            self._arm_cmd = None
-            self._hand_cmd = None
-            self._hand_held = None
-            self._arm_sent = None
-            self._head_cmd = None
-            self._twist = None
-
-    # --- fixed-rate command publication -------------------------------------
-
-    def _publish_commands(self) -> None:
-        """Publish at the vendor's recommended rate while a command mode is active.
-
-        The vendor's low-level tier has no fail-safe and its MC tier drops stale
-        commands, so this runs on a timer rather than echoing subscriber
-        callbacks. An absent upstream publisher becomes an explicit zero
-        velocity for the base, and silence for the upper body: the platform
-        then holds, and a frozen last target is never replayed.
-
-        Admission is re-checked here, on the output, not only when a command
-        arrived: a stop, a revoked navigation gate, lost arbitration or a
-        blocking platform mode all take effect on the very next tick.
-        """
-        mode = self._modes.mode
-        spec = self._modes.spec()
-        if spec.allows_stream:
-            self._drain_platform_state()  # the hold targets below are measured positions
-        with self._lock:
-            if not spec.allows_stream or not self.output_admitted():
-                return
-            now = time.monotonic()
-            self._sequence += 1
-            sequence = self._sequence
-            locomotion_mode = str((self._vendor.get("mc_actions") or {}).get(mode, "")) in (
-                "STAND_DEFAULT",
-                "LOCOMOTION_DEFAULT",
-            )
-            if locomotion_mode:
-                if self._twist is None:
-                    return
-                gated = self._state.has_capability("base.navigation_gate") and not self._navigation_enabled
-                staleness = float(self._state.capabilities.get("base.cmd_vel", {}).get("staleness_s", 0.5))
-                twist = self._twist
-                if gated or now - self._twist_stamp > staleness:
-                    twist = (0.0, 0.0, 0.0)
-                    self._twist = None
-                self._locomotion_pub.publish(
-                    vg.locomotion_command(
-                        self,
-                        source=self._source,
-                        sequence=sequence,
-                        forward=twist[0],
-                        lateral=twist[1],
-                        angular=twist[2],
-                    )
-                )
-                return
-            # Each channel expires on its own clock: an upstream publisher
-            # that went quiet stops being repeated (its joints fall back to the
-            # measured hold target below), and traffic on another channel does
-            # not keep its last target alive.
-            if self._arm_cmd is not None and now - self._arm_stamp > self._stream_staleness_s:
-                self._arm_cmd = None
-            if self._head_cmd is not None and now - self._head_stamp > self._stream_staleness_s:
-                self._head_cmd = None
-            if self._hand_cmd is not None and now - self._hand_stamp > self._stream_staleness_s:
-                self._hand_cmd = None
-            if self._arm_cmd is None and self._head_cmd is None and self._hand_cmd is None:
-                return
-            # Every element of arm_pos/head_pos is a target on this platform.
-            # Joints this tick does not command are told to stay where the
-            # platform measures them; without that measurement nothing is
-            # sent, because a zero-filled vector would be a real motion.
-            arm = self._arm_cmd if self._arm_cmd is not None else self._arm_hold_locked()
-            head = (
-                self._head_cmd if self._head_cmd is not None else self._hold_target_locked(projection.VENDOR_HEAD_ORDER)
-            )
-            if arm is None or head is None:
-                if not self._hold_target_missing:
-                    self._hold_target_missing = True
-                    self._modes.note_rejected("upper_body:HOLD_TARGET_UNAVAILABLE")
-                    self.get_logger().warning(
-                        "upper-body command withheld: no fresh measurement to hold the uncommanded joints"
-                    )
-                return
-            self._hold_target_missing = False
-            hand = self._hand_cmd if self._hand_cmd is not None else self._hand_hold_locked()
-            if hand is None:
-                if not self._hand_hold_missing:
-                    self._hand_hold_missing = True
-                    self._modes.note_rejected("upper_body:HAND_HOLD_UNAVAILABLE")
-                    self.get_logger().warning(
-                        "upper-body command withheld: the installed hands cannot be held at a measured pose"
-                    )
-                return
-            self._hand_hold_missing = False
-            hand_sub_mode, hand_pos = hand
-            self._arm_sent = list(arm)
-            self._upper_body_pub.publish(
-                vg.upper_body_command(
-                    self,
-                    source=self._source,
-                    sequence=sequence,
-                    hand_sub_mode=hand_sub_mode,
-                    head_pos=head,
-                    arm_pos=arm,
-                    hand_pos=hand_pos,
-                )
-            )
+            self._control.clear += 1
+        self._push_control()
 
     def _hand_mismatch(self, mode: str) -> str:
         """Why ``mode`` cannot carry this robot's hands, or "".
@@ -1734,7 +1419,7 @@ class AimdkRuntimeNode(Node):
             return ""
         declared = "claw" if self._hand_type == "claw" else "dexterous"
         with self._lock:
-            reported = list(self._hand_state_types)
+            reported = list(self._dataplane.hand_types)
         if {vg.hand_type_family(value) for value in reported} - {None, declared}:
             names = [vg.hand_type_name(value) for value in reported]
             return (
@@ -1743,136 +1428,90 @@ class AimdkRuntimeNode(Node):
             )
         return ""
 
-    def _hand_hold_locked(self) -> tuple[int, list[float]] | None:
-        """Hand fields for a tick with no hand command, or None to withhold it. Caller holds _lock.
+    def publish_safe_command(self, *, wait_s: float = 0.2) -> bool:
+        """An explicit zero velocity from the data plane (the tier has no fail-safe).
 
-        In the hands-carrying action a profile that declares dexterous joint
-        control holds the installed hands at their measured pose: the platform
-        drops the whole upper-body command, arms included, when ``hand_pos``
-        does not fit ``hand_sub_mode``. The platform's hand report only says
-        which side has a hand. An installed hand that cannot be held withholds
-        the command rather than sending one that would be dropped. Claw holding
-        is not verified on hardware; it keeps the declared sub-mode with no
-        targets.
-
-        Once this mode has sent a hand command, a quiet hand channel repeats
-        that command instead, which is also what the platform holds once
-        commands stop: a hand closed on an object stays short of its target,
-        and its measured joints sent back as the target would take the squeeze
-        off mid-lift.
+        Waits up to ``wait_s`` for the data plane to acknowledge the word that
+        asks for it, which is the same word that closes the output when a stop
+        or a revoke is behind the call. Returns whether it acknowledged: a stop
+        or a revoke that hears nothing back has not proven the output closed,
+        and must not be reported as one.
         """
-        if self._hand_held is not None:
-            return self._hand_held
-        action = str((self._vendor.get("mc_actions") or {}).get(self._modes.mode, ""))
-        if (
-            self._default_hand_sub_mode != projection.HAND_SUB_MODE_DEXTEROUS_JOINT
-            or action != projection.UPPER_BODY_HANDS_ACTION
-        ):
-            return self._default_hand_sub_mode, []
-        installed = [vg.hand_type_family(value) is not None for value in self._hand_state_types]
-        if not any(installed):
-            return self._default_hand_sub_mode, []
-        fresh, _stale = projection.partition_fresh(
-            self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
-        )
-        payload = projection.dexterous_hold_payload(installed, self._hand_measured) if "hand" in fresh else None
-        return None if payload is None else (self._default_hand_sub_mode, payload)
-
-    def _hold_target_locked(self, order: tuple[str, ...]) -> list[float] | None:
-        """Fresh measured positions in vendor order, or None. Caller holds _lock."""
-        fresh, _stale = projection.partition_fresh(
-            self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
-        )
-        groups = {group: entries for group, entries in self._joint_groups.items() if group in fresh}
-        return projection.hold_target(groups, order=order)
-
-    def _arm_hold_locked(self) -> list[float] | None:
-        """``arm_pos`` that keeps the arms where the controller has them while their channel is quiet. Caller holds _lock.
-
-        The controller's own targets, not the measured arm: loaded, it settles
-        below its target, so a measured pose sent back as the target lowers it
-        again every tick. On the X2 the arm sank ~0.3 rad in a second while
-        only the hand streamed (live 2026-10-22). A profile that names no
-        command board keeps the measured hold; one that does, without a fresh
-        board, repeats the arm_pos it last sent in this mode, and sends nothing
-        before it has sent one.
-        """
-        if not self._arm_board_configured:
-            return self._hold_target_locked(projection.VENDOR_ARM_ORDER)
-        board = self._arm_board
-        if board is not None and time.monotonic() - self._arm_board_received <= self._feedback_window_s:
-            try:
-                return [board[name] for name in projection.VENDOR_ARM_ORDER]
-            except KeyError:
-                pass
-        # Without a fresh board, what this runtime last sent in this mode is the
-        # target the platform holds; only with neither is nothing sent.
-        return None if self._arm_sent is None else list(self._arm_sent)
-
-    def publish_safe_command(self) -> None:
-        """Explicit zero before we stop publishing (the tier has no fail-safe)."""
         with self._lock:
-            self._sequence += 1
-            sequence = self._sequence
-        self._locomotion_pub.publish(
-            vg.locomotion_command(self, source=self._source, sequence=sequence, forward=0.0, lateral=0.0, angular=0.0)
+            self._control.safe += 1
+        return self._push_control(wait_s=wait_s)
+
+    # --- the data plane -----------------------------------------------------
+
+    def _control_word_locked(self) -> dataplane.Control:
+        """The current control word, with the next sequence number. Caller holds _lock."""
+        spec = self._modes.spec()
+        envelope = self._speed_envelope
+        self._control.seq += 1
+        self._control.mode = self._modes.mode
+        self._control.allows_stream = bool(spec.allows_stream)
+        self._control.admitted = self.output_admitted()
+        self._control.navigation_enabled = self._navigation_enabled
+        self._control.arm_owner = self._arm_owner
+        self._control.envelope = (
+            (envelope.max_linear_mps, envelope.max_angular_radps) if envelope is not None and envelope.usable else None
         )
+        return self._control
 
-    # --- vendor state -------------------------------------------------------
+    def _push_control(self, *, wait_s: float = 0.0) -> bool:
+        """Send the data plane what is admitted now; with ``wait_s``, wait for it to apply it.
 
-    def _drain_platform_state(self) -> None:
-        """Take the newest joint, hand and arm command samples; call without holding _lock.
-
-        At most once per half publish period. The joint state publisher, the
-        command publisher (in stream modes) and the feedback check all drain
-        first, and the platform publishes faster than any of them, so every
-        call found new samples to convert: in a stream mode the two 50 Hz
-        timers doubled that work. On the X2's 310P this runtime already holds
-        a core, and the doubling took /joint_states from ~40 to ~25 Hz during
-        a pick, with gaps past the grasp executor's 0.1 s feedback age.
-        Skipping a drain leaves samples at most half a period older.
+        Built and sent under _lock, so a word computed before a stop cannot
+        overtake the stop's own word. Returns whether the data plane confirmed
+        applying this word (always False without ``wait_s``). The confirmation
+        binds this send's own sequence number, captured before the wait: the
+        word object is shared with later sends, but a status that confirms a
+        newer word confirms this one too — every later word carries it.
         """
-        platform_state = getattr(self, "_platform_state", None)
-        if platform_state is None:
+        if getattr(self, "_control_pub", None) is None:
+            return False  # still wiring up; the heartbeat sends the first word
+        with self._lock:
+            word = self._control_word_locked()
+            seq = word.seq
+            self._control_pub.publish(String(data=word.encode()))
+            if wait_s <= 0.0:
+                return False
+            return self._dataplane_seen.wait_for(lambda: self._dataplane.control_seq >= seq, timeout=wait_s)
+
+    def _on_dataplane_status(self, message: String) -> None:
+        try:
+            status = dataplane.Status.decode(message.data)
+        except (ValueError, KeyError, TypeError) as error:
+            self.get_logger().error(f"ignoring a malformed data plane status: {error}")
             return
-        now = time.monotonic()
-        with self._drain_lock:
-            if now - self._drained_at < self._drain_interval_s:
-                return
-            self._drained_at = now
-        platform_state.drain()
-
-    def _on_joint_state(self, group: str, message: Any, received: float | None = None) -> None:
-        entries = [
-            (str(joint.name), float(joint.position), float(joint.velocity), float(joint.effort))
-            for joint in message.joints
-        ]
-        self._record_feedback(group, entries, message.header, received)
-        self._report_joint_faults(group, [(str(joint.name), int(joint.error_code)) for joint in message.joints])
-
-    def _on_hand_state(self, message: Any, received: float | None = None) -> None:
         with self._lock:
-            self._hand_state_types = [int(message.left_hand_type.value), int(message.right_hand_type.value)]
-        entries: list[tuple[str, float, float, float]] = []
-        measured: list[dict[str, float]] = []
-        for side, hands in (("left", message.left_hands), ("right", message.right_hands)):
-            measured.append({})
-            for hand in hands:
-                name = str(hand.name) or f"{side}_hand"
-                entries.append((name, float(hand.position), float(hand.velocity), float(hand.effort)))
-                measured[-1][name] = float(hand.position)
+            self._dataplane = status
+            # When the data plane generated it, not when this callback ran: a
+            # report queued past the freshness window stays stale here instead
+            # of being dated "now" the moment it is read.
+            self._dataplane_at = status.at
+            self._dataplane_seen.notify_all()
+        for group, codes in status.faults.items():
+            self._report_joint_faults(group, codes)
+        if status.rejected:
+            for note in status.rejected:
+                self._modes.note_rejected(note)
+            self._publish_status()
+
+    def _dataplane_reporting(self) -> bool:
+        """Whether the data plane's status is recent enough to judge feedback by."""
         with self._lock:
-            self._hand_measured = measured
-        self._record_feedback("hand", entries, message.header, received)
-        self._report_joint_faults(
-            "hand",
-            [
-                (str(hand.name) or f"{side}_hand", int(hand.faultcode))
-                for side, hands in (("left", message.left_hands), ("right", message.right_hands))
-                for hand in hands
-            ],
-        )
-        self._publish_hand_touch(message)
+            return time.monotonic() - self._dataplane_at <= self._feedback_window_s
+
+    def _feedback_ages_locked(self) -> dict[str, float]:
+        """Seconds since each joint group last reported, end to end. Caller holds _lock.
+
+        The group's age when the data plane generated its report, plus the time
+        since that moment — the report's queue time included, not just the time
+        since this process happened to read it.
+        """
+        since = time.monotonic() - self._dataplane_at
+        return {group: age + since for group, age in self._dataplane.group_ages.items()}
 
     def _report_joint_faults(self, group: str, codes: list[tuple[str, int]]) -> None:
         """A joint the platform reports faulted degrades the runtime, for the groups
@@ -1890,144 +1529,20 @@ class AimdkRuntimeNode(Node):
         detail = ", ".join(f"{name}={code}" for name, code in faulted)
         self._set_fault(f"{group}_joints", f"{group} joint fault: {detail}" if faulted else None)
 
-    def _publish_hand_touch(self, message: Any) -> None:
-        """Republish the hand touch arrays that arrive on this same message.
-
-        The dexterous hands carry the densest contact sensing on the robot —
-        palm, back and five fingertips per hand — and it rides along with the
-        joint state the bridge already subscribes to. Dropping it left grasping
-        and contact-aware interaction with no tactile source at all.
-
-        The pads have different cell counts, so the layout names each one with
-        its size rather than forcing them into a fixed-width matrix.
-        """
-        publisher = getattr(self, "_hand_touch_pub", None)
-        if publisher is None:
-            return
-        frames = vg.hand_touch_frames(message)
-        if not frames:
-            return
-        from std_msgs.msg import MultiArrayDimension  # noqa: PLC0415
-
-        array = Float64MultiArray()
-        offset = sum(len(cells) for cells in frames.values())
-        for pad in sorted(frames):
-            cells = frames[pad]
-            dimension = MultiArrayDimension()
-            dimension.label = pad
-            dimension.size = len(cells)
-            dimension.stride = offset
-            offset -= len(cells)
-            array.layout.dim.append(dimension)
-            array.data.extend(float(cell) for cell in cells)
-        publisher.publish(array)
-
-    def _publish_arm_command(self, message: Any, received: float | None = None) -> None:
-        """Republish what the motion-control unit is driving the arm to, in the declared order.
-
-        The HAL publishes the arm's position targets and gains apart from its
-        measured state. Under load an arm settles below its target by torque /
-        stiffness, so an executor taking over the stream has to start from this
-        target, and it is how it sees the platform clamp or replace a target it
-        sent. A message missing a declared joint is dropped: half a target is not
-        the controller's target.
-        """
-        entries = vg.joint_command_entries(message)
-        if not set(self._arm_command_order) <= set(entries):
-            return
-        echo = JointCommandState()
-        stamp = vg.message_stamp(getattr(message, "header", None))
-        echo.header.stamp = (stamp if stamp is not None else self.get_clock().now()).to_msg()
-        echo.name = list(self._arm_command_order)
-        rows = [entries[name] for name in self._arm_command_order]
-        echo.position = [row[0] for row in rows]
-        echo.stiffness = [row[1] for row in rows]
-        echo.damping = [row[2] for row in rows]
-        self._arm_command_pub.publish(echo)
-        with self._lock:
-            self._arm_board = dict(zip(self._arm_command_order, echo.position, strict=True))
-            self._arm_board_received = time.monotonic() if received is None else received
-
-    def _record_feedback(
-        self,
-        group: str,
-        entries: list[tuple[str, float, float, float]],
-        header: Any = None,
-        received: float | None = None,
-    ) -> None:
-        """Keep a group's latest sample with the platform's own stamp.
-
-        The X2 HAL stamps each state message on the platform clock, which PTP
-        keeps in step with the compute pack and the head camera (``meas_stamp``
-        is left zero; it is preferred should the platform fill it). Consumers
-        can therefore match joint states to an image without crossing clock
-        domains, and a delivery stall here does not age a sample. Only a message
-        without a stamp falls back to this host's receipt time. Staleness is
-        judged on the local receipt time regardless (``received``, monotonic).
-        ``received`` is ``None`` when the middleware recorded no receive time
-        (:func:`robot_runtime.on_demand.received_monotonic`); the sample may then
-        have waited in the reader queue for any length of time, so it is kept at
-        ``-inf`` and every freshness window reads it as stale. Dating it now
-        would hold the robot at a measured position of unknown age. A caller that
-        knows when the sample arrived passes that time.
-        """
-        stamp = vg.message_stamp(header)
-        with self._lock:
-            self._joint_groups[group] = entries
-            self._feedback_received[group] = float("-inf") if received is None else received
-            # Store nanoseconds, not Time: a vendor stamp is SYSTEM_TIME (it comes
-            # from the platform clock) while this node's clock is ROS_TIME, and
-            # comparing the two raises "Can't compare times with different clock
-            # types". A view fed by one stamped and one unstamped group would hit
-            # that in the min() below, inside a timer callback, taking the
-            # executor down with it. Integers compare in every combination.
-            self._feedback_clock[group] = stamp.nanoseconds if stamp is not None else self.get_clock().now().nanoseconds
-
-    def _fresh_feedback_locked(self) -> tuple[dict[str, list[tuple[str, float, float, float]]], dict[str, int]]:
-        """Fresh groups and the measurement time of each, in nanoseconds. Caller holds _lock."""
-        fresh, _stale = projection.partition_fresh(
-            self._feedback_received, now_s=time.monotonic(), window_s=self._feedback_window_s
-        )
-        groups = {group: list(entries) for group, entries in self._joint_groups.items() if group in fresh}
-        return groups, {group: self._feedback_clock[group] for group in groups}
-
-    def _publish_joint_states(self) -> None:
-        self._drain_platform_state()
-        with self._lock:
-            groups, clocks = self._fresh_feedback_locked()
-        if not groups:
-            return
-        views = [(self._joint_pub, [str(joint) for joint in self._profile["joints"]]), *self._state_views]
-        for publisher, order in views:
-            wanted = set(order)
-            # Each view is stamped with the oldest platform stamp among the groups that
-            # feed it, not "now" and not the whole aggregate: a source that stopped
-            # reporting drops out above instead of being re-stamped, what remains is
-            # never newer than its stalest part, and a slow group a view does not
-            # carry (legs, for the hands) does not hold that view's stamp back.
-            sources = [group for group, entries in groups.items() if any(entry[0] in wanted for entry in entries)]
-            if not sources:
-                continue
-            names, positions, velocities, efforts = projection.aggregate_joint_state(
-                {group: groups[group] for group in sources}, order=order
-            )
-            message = JointState()
-            message.header.stamp = Time(nanoseconds=min(clocks[group] for group in sources)).to_msg()
-            message.name, message.position, message.velocity, message.effort = names, positions, velocities, efforts
-            publisher.publish(message)
-
     def _check_feedback(self) -> None:
-        """A required feedback source that went quiet degrades the runtime."""
-        self._drain_platform_state()
+        """A required feedback source that went quiet degrades the runtime.
+
+        Judged on the data plane's report, so a data plane that stops reporting
+        ages every group with it.
+        """
         with self._lock:
-            received = dict(self._feedback_received)
-            for group in self._required_feedback:
-                received.setdefault(group, float("-inf"))
-            _fresh, stale = projection.partition_fresh(
-                received, now_s=time.monotonic(), window_s=self._feedback_window_s
-            )
-        missing = sorted(group for group in stale if group in self._required_feedback)
-        if missing:
+            ages = self._feedback_ages_locked()
+        missing = sorted(
+            group for group in self._required_feedback if ages.get(group, float("inf")) > self._feedback_window_s
+        )
+        if missing and not self._dataplane_reporting():
+            self._set_fault("feedback", "joint feedback stale: the data plane (aimdk_dataplane) is not reporting")
+        elif missing:
             self._set_fault("feedback", f"joint feedback stale: {', '.join(missing)}")
         else:
             self._set_fault("feedback", None)
@@ -2303,6 +1818,9 @@ class AimdkRuntimeNode(Node):
 
     def _publish_status(self) -> None:
         self._status_pub.publish(self._state.to_msg(self.get_clock().now().to_msg()))
+        # Every lifecycle, mode and stop change comes through here: the data plane
+        # learns of a closed admission now rather than at the next heartbeat.
+        self._push_control()
 
     # --- accessors used by helper modules ----------------------------------
 
@@ -2366,38 +1884,53 @@ class AimdkRuntimeNode(Node):
         return self._modes.mode
 
     def measured_arm_positions(self) -> list[float] | None:
-        """Fresh measured arm positions in vendor order, or None."""
+        """Fresh measured arm positions in vendor order, or None.
+
+        Fresh by the end-to-end age: how old the measurement was when the data
+        plane reported it, plus how long that report took to arrive here.
+        """
         with self._lock:
-            return self._hold_target_locked(projection.VENDOR_ARM_ORDER)
+            arm = self._dataplane.arm_measured
+            age = self._dataplane.arm_measured_age_s
+            if arm is None or age is None:
+                return None
+            since = time.monotonic() - self._dataplane_at
+            return list(arm) if age + since <= self._feedback_window_s else None
 
     def claim_arm(self, owner: int) -> bool:
         """Give the arm channel to a named motion; the public arm stream is refused meanwhile.
 
         False while the public arm stream (teleop, grasping) is live: taking the
         arm from it mid-stream would leave its next absolute target to jump the
-        arm back once the motion released it. A motion replacing another one
-        takes the channel over.
+        arm back once the motion released it. The data plane judges that and
+        applies the owner in one step — a status snapshot here may predate a
+        target it has not shown yet — so the claim counts only once the data
+        plane confirms the word and echoes the owner back. A motion replacing
+        another one takes the channel over.
         """
         with self._lock:
-            if (
-                self._arm_owner is None
-                and self._public_arm_stamp is not None
-                and time.monotonic() - self._public_arm_stamp <= self._stream_staleness_s
-            ):
-                return False
             self._arm_owner = owner
             self._arm_motion_epoch += 1
-            return True
+        confirmed = self._push_control(wait_s=0.2)
+        with self._lock:
+            if confirmed and self._dataplane.arm_owner == owner:
+                return True
+            if self._arm_owner == owner:  # nobody took over meanwhile: take it back
+                self._arm_owner = None
+        self._push_control()
+        return False
 
     def arm_motion_epoch(self) -> int:
         """A counter that moves whenever something may have moved the arm; see ``__init__``."""
         with self._lock:
-            return self._arm_motion_epoch
+            return self._arm_motion_epoch + self._dataplane.public_arm_count
 
     def release_arm(self, owner: int) -> None:
         with self._lock:
-            if self._arm_owner == owner:
-                self._arm_owner = None
+            if self._arm_owner != owner:
+                return
+            self._arm_owner = None
+        self._push_control()
 
     def command_arm(self, positions: list[float], *, owner: int, epoch: int) -> bool:
         """Set the arm target for the fixed-rate publisher, if ``owner`` still may.
@@ -2408,9 +1941,8 @@ class AimdkRuntimeNode(Node):
         with self._lock:
             if self._arm_owner != owner or self._state.stop_epoch != epoch or not self.output_admitted():
                 return False
-            self._arm_cmd = list(positions)
-            self._arm_stamp = time.monotonic()
-            return True
+        self._named_arm_pub.publish(Float64MultiArray(data=[float(owner), *(float(value) for value in positions)]))
+        return True
 
 
 def main(argv=None) -> int:

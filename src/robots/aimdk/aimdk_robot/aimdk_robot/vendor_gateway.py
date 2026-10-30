@@ -9,7 +9,6 @@ types without a robot.
 
 from __future__ import annotations
 
-import math
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -363,57 +362,6 @@ def hand_statuses(runtime_model: Any) -> list[int]:
         int(getattr(getattr(runtime_model, "left_hand_status", None), "value", 0) or 0),
         int(getattr(getattr(runtime_model, "right_hand_status", None), "value", 0) or 0),
     ]
-
-
-def joint_command_entries(message: Any) -> dict[str, tuple[float, float, float]]:
-    """``{joint: (position, stiffness, damping)}`` of a HAL ``JointCommandArray``.
-
-    This is what the motion-control unit is driving each joint to, not where the
-    joint is: under load a joint settles away from its target by torque /
-    stiffness. An entry with a non-finite value, or a joint named twice, makes the
-    whole message unusable and the result empty, since a partial target is not
-    the controller's target.
-    """
-    entries: dict[str, tuple[float, float, float]] = {}
-    for joint in getattr(message, "joints", ()):
-        name = str(joint.name)
-        values = (float(joint.position), float(joint.stiffness), float(joint.damping))
-        if not name or name in entries or not all(math.isfinite(value) for value in values):
-            return {}
-        entries[name] = values
-    return entries
-
-
-def hand_touch_frames(message: Any) -> dict[str, list[int]]:
-    """Flatten the touch arrays of hands that actually have them, into named pads.
-
-    ``HandTouchSensorData`` carries a 36-cell palm and back plus five 16-cell
-    fingertips per hand. The arrays are fixed-length for the widest supported
-    hand, so a narrower one (the Leisai hand has no back pad and 12-cell tips)
-    simply leaves the tail zeroed.
-
-    The fields exist on every hand state message, including a gripper's, where
-    they are all zeros. A gripper has no tactile array, so those zeros are the
-    absence of a sensor and not a measurement of no contact — publishing them
-    would invent a sensor. Only a hand whose reported type belongs to the
-    dexterous family contributes.
-    """
-    pads = ("palm", "back_of_hand", "thumb", "index_finger", "middle_finger", "ring_finger", "little_finger")
-    frames: dict[str, list[int]] = {}
-    sides = (
-        ("left", "left_touch_sensors", "left_hand_type"),
-        ("right", "right_touch_sensors", "right_hand_type"),
-    )
-    for side, sensor_attribute, type_attribute in sides:
-        sensors = getattr(message, sensor_attribute, None)
-        reported = int(getattr(getattr(message, type_attribute, None), "value", HAND_TYPE_NONE))
-        if sensors is None or hand_type_family(reported) != "dexterous":
-            continue
-        for pad in pads:
-            data = getattr(sensors, f"{pad}_touch_data", None)
-            if data is not None:
-                frames[f"{side}_{pad}"] = [int(cell) for cell in data]
-    return frames
 
 
 def tts_request(node: Any, *, text: str, priority: int, interrupt: bool, trace_id: str, domain: str) -> Any:
