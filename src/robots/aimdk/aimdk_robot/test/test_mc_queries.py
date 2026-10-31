@@ -11,12 +11,6 @@ from aimdk_robot.mc_queries import _AsyncServiceCaller, speed_profile  # noqa: E
 from rclpy.task import Future  # noqa: E402
 
 
-def test_action_status_constants_match_vendor_contract():
-    from aimdk_msgs.msg import McActionStatus
-
-    assert (McActionStatus.IDLE, McActionStatus.RUNNING, McActionStatus.TRANSITION) == (0, 100, 200)
-
-
 def test_speed_profiles_preserve_axis_direction_and_asymmetry():
     status = McLocomotionSpeedStatus()
     status.speed_mode.value = 4

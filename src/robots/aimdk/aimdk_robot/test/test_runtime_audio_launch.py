@@ -27,7 +27,7 @@ def _runtime_launch_module():
     return module
 
 
-def _render(simulated: str):
+def _render(simulated: str, **overrides):
     context = launch.LaunchContext()
     context.launch_configurations.update(
         {
@@ -42,21 +42,7 @@ def _render(simulated: str):
             "peripherals": "",
         }
     )
-    return _runtime_launch_module()._launch_setup(context)
-
-
-def _render_mc_mujoco():
-    context = launch.LaunchContext()
-    context.launch_configurations.update(
-        {
-            "profile": str(Path(__file__).resolve().parents[1] / "profiles" / "x2_mc_20260522.yaml"),
-            "simulated": "",
-            "use_sim": "true",
-            "sim_platform": "mujoco",
-            "instance_id": "",
-            "initial_mode": "",
-        }
-    )
+    context.launch_configurations.update(overrides)
     return _runtime_launch_module()._launch_setup(context)
 
 
@@ -93,7 +79,12 @@ def test_simulated_execution_declares_no_alsa_audio_nodes():
 
 def test_mujoco_execution_is_rejected_instead_of_starting_a_mock():
     with pytest.raises(ValueError, match="sim_platform 'mujoco' is not supported"):
-        _render_mc_mujoco()
+        _render(
+            "",
+            profile=str(_PROFILE.with_name("x2_mc_20260522.yaml")),
+            use_sim="true",
+            sim_platform="mujoco",
+        )
 
 
 def test_profile_audio_interfaces_carry_format_metadata():

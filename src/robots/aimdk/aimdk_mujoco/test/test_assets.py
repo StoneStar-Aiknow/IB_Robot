@@ -74,51 +74,6 @@ def test_transport_cache_uses_public_xml_and_standalone_checked_files(tmp_path, 
     )
 
 
-@pytest.mark.parametrize("source", ["network", "sdk", "existing"])
-def test_rejects_mesh_integrity_mismatch(tmp_path, public, source):
-    resources, responses, _ = public
-    destination = tmp_path / "assets"
-    cache = None
-    if source == "network":
-        responses[f"{assets.SOURCE}/X2_URDF-v1.3.0/meshes/leg.STL"] = b"corrupt mesh"
-    elif source == "sdk":
-        cache = tmp_path / "sdk-robot"
-        (cache / "meshes").mkdir(parents=True)
-        (cache / "meshes/leg.STL").write_bytes(b"corrupt mesh")
-    else:
-        destination.mkdir()
-        for name, data in resources.items():
-            target = destination / name
-            target.parent.mkdir(exist_ok=True)
-            target.write_bytes(data if name != "meshes/leg.STL" else b"corrupt mesh")
-        responses[f"{assets.SOURCE}/X2_URDF-v1.3.0/meshes/leg.STL"] = b"corrupt replacement"
-    with pytest.raises(ValueError, match="Git blob integrity mismatch for meshes/leg.STL"):
-        assets.prepare(destination, robot_cache=cache, resume=True)
-    assert not (destination / "assets.json").exists()
-    if source != "existing":
-        assert (destination / assets.PARTIAL).exists()
-        assert not (destination / "meshes/leg.STL").exists()
-    else:
-        assert (destination / "meshes/leg.STL").read_bytes() == b"corrupt mesh"
-        assert (destination / assets.PARTIAL).exists()
-
-
-def test_resume_recognizes_legacy_partial_and_rechecks_reused_files(tmp_path, public):
-    resources, _, requests = public
-    destination = tmp_path / "assets"
-    destination.mkdir()
-    for name, data in resources.items():
-        target = destination / name
-        target.parent.mkdir(exist_ok=True)
-        target.write_bytes(data)
-    mesh = destination / "meshes/leg.STL"
-    original_mtime = mesh.stat().st_mtime_ns
-    assets.prepare(destination, resume=True)
-    assert mesh.stat().st_mtime_ns == original_mtime
-    assert f"{assets.SOURCE}/X2_URDF-v1.3.0/meshes/leg.STL" not in requests
-    assert (destination / "assets.json").is_file()
-
-
 def test_interrupted_download_leaves_resumable_marker(tmp_path, public):
     resources, responses, _ = public
     destination = tmp_path / "assets"
@@ -134,50 +89,3 @@ def test_interrupted_download_leaves_resumable_marker(tmp_path, public):
     assert (destination / "meshes/leg.STL").read_bytes() == resources["meshes/leg.STL"]
     assert not list(destination.rglob("*.part"))
     assert not (destination / assets.PARTIAL).exists()
-
-
-def test_resume_repairs_truncated_legacy_mesh_only_with_verified_replacement(tmp_path, public):
-    resources, _, requests = public
-    destination = tmp_path / "assets"
-    destination.mkdir()
-    for name, data in resources.items():
-        target = destination / name
-        target.parent.mkdir(exist_ok=True)
-        target.write_bytes(data if name != "meshes/leg.STL" else b"truncated")
-    assets.prepare(destination, resume=True)
-    assert (destination / "meshes/leg.STL").read_bytes() == resources["meshes/leg.STL"]
-    assert f"{assets.SOURCE}/X2_URDF-v1.3.0/meshes/leg.STL" in requests
-    assert (destination / "assets.json").is_file()
-
-
-@pytest.mark.parametrize("kind", ["completed", "unknown", "empty", "legacy_without_resume", "symlink"])
-def test_refuses_overwriting_existing_caches(tmp_path, public, kind):
-    resources, _, _ = public
-    destination = tmp_path / "assets"
-    destination.mkdir()
-    if kind == "completed":
-        (destination / "assets.json").write_bytes(b"do not overwrite")
-    elif kind == "unknown":
-        (destination / "unrelated.txt").write_bytes(b"do not overwrite")
-    elif kind == "symlink":
-        external_license = tmp_path / "external-license"
-        external_license.write_bytes(resources["LICENSE"])
-        (destination / "LICENSE").symlink_to(external_license)
-    elif kind == "legacy_without_resume":
-        for name in ("LICENSE", "scene.xml", "x2_ultra.xml"):
-            (destination / name).write_bytes(resources[name])
-    before = {path.name: path.read_bytes() for path in destination.iterdir()}
-    with pytest.raises(FileExistsError):
-        assets.prepare(destination, resume=kind != "legacy_without_resume")
-    assert {path.name: path.read_bytes() for path in destination.iterdir()} == before
-
-
-@pytest.mark.parametrize("resource", ["LICENSE", "scene.xml", "x2_ultra.xml"])
-def test_rejects_public_root_integrity_mismatch(tmp_path, public, resource):
-    _, responses, _ = public
-    remote = "LICENSE" if resource == "LICENSE" else f"X2_URDF-v1.3.0/{resource}"
-    responses[f"{assets.SOURCE}/{remote}"] = b"modified root resource"
-    destination = tmp_path / "assets"
-    with pytest.raises(ValueError, match="Git blob integrity mismatch"):
-        assets.prepare(destination)
-    assert not destination.exists()

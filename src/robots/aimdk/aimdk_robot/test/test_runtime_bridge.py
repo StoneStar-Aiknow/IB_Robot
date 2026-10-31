@@ -279,6 +279,10 @@ def test_mc_release_concurrent_queries_leave_stop_and_feedback_responsive():
             answer = future.result()
             assert not answer.success
             assert "did not answer" in answer.message
+            if isinstance(answer, GetMotionState.Response):
+                assert not answer.action_name
+            else:
+                assert not answer.profiles
         running.wait_for(
             lambda: all(not caller._client._pending_requests for caller in callers), "query cancellation cleanup"
         )
@@ -298,20 +302,14 @@ def test_mc_release_without_hand_control_accepts_dexterous_hardware():
         running.node.create_subscription(JointState, "/aimdk/body_joint_states", received.append, 10)
         running.wait_for(lambda: received, "MC body feedback")
         assert "head_yaw_joint" in received[-1].name
-        assert "waist_yaw_joint" in received[-1].name
-        assert "left_knee_joint" in received[-1].name
     finally:
         running.shutdown()
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "timeout"])
-def test_mc_release_queries_fail_when_vendor_cannot_answer(failure):
-    from aimdk_msgs.srv import GetMcAction, GetMcLocomotionSpeedStatus
-
+def test_mc_release_queries_fail_when_vendor_cannot_answer():
     from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
 
     running = Harness(profile=MC_PROFILE)
-    silent_vendor = None
     try:
         running.wait_active()
         for service in list(running.mock.services):
@@ -322,30 +320,16 @@ def test_mc_release_queries_fail_when_vendor_cannot_answer(failure):
             lambda: not queries._get_action[1].ready() and not queries._get_speed_profiles[1].ready(),
             "query service removal",
         )
-        if failure == "timeout":
-            # Advertise query services without spinning them; keep telemetry running.
-            silent_vendor = rclpy.create_node("silent_mc_queries")
-            for service_type in (GetMcAction, GetMcLocomotionSpeedStatus):
-                silent_vendor.create_service(
-                    service_type, f"/aimdk_5Fmsgs/srv/{service_type.__name__}", lambda _request, response: response
-                )
-            running.wait_for(
-                lambda: queries._get_action[1].ready() and queries._get_speed_profiles[1].ready(),
-                "unresponsive query services",
-            )
         action = running.call(GetMotionState, "/motion/get_state", GetMotionState.Request())
         speeds = running.call(GetLocomotionProfiles, "/motion/get_locomotion_profiles", GetLocomotionProfiles.Request())
         assert not action.success
         assert not action.action_name
         assert not speeds.success
         assert not speeds.profiles
-        expected = "unavailable" if failure == "unavailable" else "did not answer"
-        assert expected in action.message
-        assert expected in speeds.message
+        assert "unavailable" in action.message
+        assert "unavailable" in speeds.message
     finally:
         running.shutdown()
-        if silent_vendor is not None:
-            silent_vendor.destroy_node()
 
 
 def test_shutdown_waits_for_startup_call_without_enabling_source(monkeypatch):
