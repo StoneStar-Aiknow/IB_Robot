@@ -575,7 +575,7 @@ manifest 的 named deployment 进入 shared `AscendOmModelSession`。两条都�
 
 唯一的例外是传输层解码：服务只接受原始 `sensor_msgs/Image`（`model_contracts.validate_image_message`
 只认 `bgr8`/`rgb8`），所以面对平台的编码相机流时，调用侧**必须**先解码。该解码不属于模型语义预处理，
-归属调用方，且应集中在单独一个模块里（先例：`manipulation_execution/compressed_image_decode.py`），
+归属调用方，且应集中在单独一个模块里（先例：`manipulation_execution/hri/compressed_image_decode.py`），
 不要散入执行逻辑。
 
 `YoloXAdapter`：
