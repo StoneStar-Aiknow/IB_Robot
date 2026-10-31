@@ -10,7 +10,11 @@ from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.msg import GraspCandidate
 from manipulation_execution.geometry import TablePlane
-from manipulation_execution.grasp_geometry import CandidatePlan, FixedFingerBaseSide, FixedFingerEnvelope
+from manipulation_execution.pick.candidate_geometry import (
+    CandidatePlan,
+    FixedFingerBaseSide,
+    FixedFingerEnvelope,
+)
 
 
 @dataclass

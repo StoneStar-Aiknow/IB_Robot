@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import manipulation_execution
-from manipulation_execution.place.node import _load_exclusion_mask
+from manipulation_execution.place.containment import load_exclusion_mask
 
 _WORKSPACE_ROOT = Path(manipulation_execution.__file__).resolve().parents[2]
 
@@ -30,5 +30,5 @@ def test_source_tree_fallback_resolves_the_workspace_robot_config(monkeypatch):
     monkeypatch.setattr(ament_index_python.packages, "get_package_share_directory", refusing_lookup)
     relative = "config/place/nonexistent_mask.png"
     with pytest.raises(FileNotFoundError) as excinfo:
-        _load_exclusion_mask(f"$(find robot_config)/{relative}", (4, 4))
+        load_exclusion_mask(f"$(find robot_config)/{relative}", (4, 4))
     assert str(excinfo.value) == f"target exclusion mask not found: {_WORKSPACE_ROOT / 'robot_config' / relative}"

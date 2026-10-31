@@ -12,7 +12,7 @@ from rclpy.time import Time
 
 from ibrobot_msgs.msg import GraspCandidate
 from ibrobot_msgs.srv import DetectSegment, PlanGrasp
-from manipulation_execution.grasp_geometry import (
+from manipulation_execution.pick.candidate_geometry import (
     build_candidate_plan,
     contact_distance_score,
     fixed_finger_base_side_alignment,

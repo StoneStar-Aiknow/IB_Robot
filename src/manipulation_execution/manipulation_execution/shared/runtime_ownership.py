@@ -1,14 +1,14 @@
 """The runtime boundary: what a status means for ownership, and the one release.
 
-Rules, after ``action_dispatch.policy_admission`` with two differences the
-mirror needs:
+Rules, after ``action_dispatch.policy_admission`` with two differences a
+stream that takes over a Gateway-switched mode needs:
 
 * **Take over, never acquire.** The Gateway switches the runtime to
-  ``policy_stream`` before it calls ``mirror_start``; the session takes over
-  that mode. There is no path that requests ``policy_stream`` from idle. This
-  is sound only because the mirror is the sole ``policy_stream`` producer in
-  its configuration, which is also what lets the exit paths treat a lingering
-  ``policy_stream`` as ours.
+  ``policy_stream`` before it calls the stream's start entry point; the stream
+  takes over that mode. There is no path that requests ``policy_stream`` from
+  idle. This is sound only because the stream is the sole ``policy_stream``
+  producer in its configuration, which is also what lets the exit paths treat
+  a lingering ``policy_stream`` as ours.
 * **One release, never over a stop latch.** ``SetRuntimeMode(idle)`` is
   sent only when ``active_mode == policy_stream`` is observed and no stop is
   latched. Requesting idle clears the stop latch, so it must never be sent
@@ -17,15 +17,23 @@ mirror needs:
 
 Revocation (another mode, stop latch, fault, stale status) is never answered
 with a request: the caller closes its output and waits for an explicit start.
+
+This module is ROS-free: no ``rclpy``, no ROS message package. The status
+message is decoded by :func:`observation_from_status`, which reads only
+message attributes and parses JSON (``Any``-annotated for exactly that
+reason). Moved from ``hri/mirror_session`` (design D5 of the package-layout
+change): the grasp pipeline's runtime stream needs the same rules, so they
+live where both subsystems may import them.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 IDLE = "idle"
 STATUS_MAX_AGE_S = 2.0
@@ -70,6 +78,27 @@ class RuntimePort(Protocol):
     def get_status(self, timeout_s: float) -> RuntimeObservation | None: ...
 
     def set_mode(self, mode: str, timeout_s: float) -> tuple[bool, str]: ...
+
+
+def observation_from_status(status: Any, now_ns: int) -> RuntimeObservation:
+    try:
+        description = json.loads(status.interface_description_json)
+    except (TypeError, ValueError):
+        description = None
+    robot = description.get("robot") if isinstance(description, dict) else None
+    age = None
+    if 0 <= status.stamp.nanosec < 1_000_000_000:
+        age = (now_ns - (status.stamp.sec * 1_000_000_000 + status.stamp.nanosec)) / 1e9
+    return RuntimeObservation(
+        lifecycle=status.lifecycle,
+        active_mode=status.active_mode,
+        stop_latched=bool(status.stop_latched),
+        faults=tuple(status.faults),
+        runtime_name=status.runtime_name,
+        runtime_version=status.runtime_version,
+        robot=robot if isinstance(robot, dict) else None,
+        stamp_age_s=age,
+    )
 
 
 def assess(

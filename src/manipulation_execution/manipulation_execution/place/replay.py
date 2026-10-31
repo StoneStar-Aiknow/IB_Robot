@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from manipulation_execution.place.node import evaluate_mask_arrays
+from manipulation_execution.place.containment import evaluate_mask_arrays
 
 CURRENT_PIPELINE = "placement_pipeline"
 CURRENT_PIPELINE_VERSION = 3

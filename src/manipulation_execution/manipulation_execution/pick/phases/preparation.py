@@ -14,7 +14,7 @@ from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.srv import ComputeFk, ComputeIk
 from manipulation_execution.geometry import axis_error_deg, quaternion_error_deg
-from manipulation_execution.grasp_geometry import (
+from manipulation_execution.pick.candidate_geometry import (
     CandidatePlan,
     FixedFingerBaseSide,
     fixed_finger_base_side_alignment,

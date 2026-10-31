@@ -13,7 +13,7 @@ from sensor_msgs.msg import JointState
 from embodied_common.dispatch_binding import delegated_executor_identity, new_binding
 from ibrobot_msgs.action import PickObject
 from ibrobot_msgs.msg import GraspCandidate
-from manipulation_execution.grasp_geometry import CandidatePlan, FixedFingerEnvelope
+from manipulation_execution.pick.candidate_geometry import CandidatePlan, FixedFingerEnvelope
 from manipulation_execution.pick.helpers import PickExecutorHelpers
 from manipulation_execution.pick.models import FlowState, PreparedCandidate, RankedCandidate
 from manipulation_execution.pick.node import PickExecutorNode, PickFlowError

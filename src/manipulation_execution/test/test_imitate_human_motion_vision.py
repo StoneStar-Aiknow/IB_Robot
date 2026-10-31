@@ -8,8 +8,8 @@ from sensor_msgs.msg import Image
 
 import manipulation_execution.hri.imitate.node as vision_module  # noqa: F401
 from ibrobot_msgs.msg import Detection2D, DetectionArray, DispatchBinding
+from manipulation_execution.hri.animation import MAX_IMITATION_DURATION_SEC
 from manipulation_execution.hri.imitate.executor import (
-    MAX_IMITATION_DURATION_SEC,
     ImitationExecutor,
     ImitationGoal,
     ImitationResult,

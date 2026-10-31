@@ -25,6 +25,8 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from manipulation_execution.shared.runtime_ownership import observation_from_status, takeover_refusal
+
 from .streaming import CommandSample, JointSample, received_at_or_stale
 
 FLOAT_ARRAY = "std_msgs/msg/Float64MultiArray"
@@ -273,9 +275,6 @@ class RosStreamIO:
         self._subscriptions.close()
 
     def refusal(self) -> str | None:
-        from manipulation_execution.hri.mirror_session.node import observation_from_status
-        from manipulation_execution.hri.mirror_session.runtime import takeover_refusal
-
         self._subscriptions.drain()
         with self._lock:
             status = self._status

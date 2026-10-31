@@ -4,7 +4,7 @@ from typing import Any, cast
 import pytest
 
 import manipulation_execution.pick.phases.planning as planning_module
-from manipulation_execution.grasp_geometry import CandidatePlan
+from manipulation_execution.pick.candidate_geometry import CandidatePlan
 from manipulation_execution.pick.models import (
     BaseSceneGeometry,
     CandidateSelectionDiagnostics,

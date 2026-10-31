@@ -31,7 +31,7 @@ stop; only the Gateway's ``mirror_session`` executor calls it), ``~/status``
 ``~/hand_command_preview`` (``Float64MultiArray``, every command the gate sends,
 whether or not ``publish_enabled`` is set).
 
-Exits back to idle, all through ``runtime.release_to_idle``:
+Exits back to idle, all through ``shared.runtime_ownership.release_to_idle``:
 
 * normal exit (SIGINT, SIGTERM, an exception reaching ``main``): ``main``'s
   ``finally`` closes the gate and releases, spinning the executor itself;
@@ -70,28 +70,11 @@ from manipulation_execution.hri.mirror_session.core import DEFAULT_STOP_TIMEOUT_
 from manipulation_execution.hri.mirror_session.endpoints import RELEASE_INTERFACES, resolve_endpoints
 from manipulation_execution.hri.mirror_session.inputs import InputCollector
 from manipulation_execution.hri.mirror_session.mock_playback import MockPlaybackHooks
-from manipulation_execution.hri.mirror_session.runtime import RuntimeObservation, release_to_idle
-
-
-def observation_from_status(status: RuntimeStatus, now_ns: int) -> RuntimeObservation:
-    try:
-        description = json.loads(status.interface_description_json)
-    except (TypeError, ValueError):
-        description = None
-    robot = description.get("robot") if isinstance(description, dict) else None
-    age = None
-    if 0 <= status.stamp.nanosec < 1_000_000_000:
-        age = (now_ns - (status.stamp.sec * 1_000_000_000 + status.stamp.nanosec)) / 1e9
-    return RuntimeObservation(
-        lifecycle=status.lifecycle,
-        active_mode=status.active_mode,
-        stop_latched=bool(status.stop_latched),
-        faults=tuple(status.faults),
-        runtime_name=status.runtime_name,
-        runtime_version=status.runtime_version,
-        robot=robot if isinstance(robot, dict) else None,
-        stamp_age_s=age,
-    )
+from manipulation_execution.shared.runtime_ownership import (
+    RuntimeObservation,
+    observation_from_status,
+    release_to_idle,
+)
 
 
 class RosRuntimePort:

@@ -26,7 +26,7 @@ Runtime ownership (``runtime`` module):
 * Revocation (another mode, stop latch, fault, status older than 2 s) closes
   the gate and enters WAIT at once: no wrap-up and no idle request. Recovery
   is an explicit ``start``, never automatic.
-* Every exit back to idle calls ``runtime.release_to_idle`` and only after the
+* Every exit back to idle calls ``shared.runtime_ownership.release_to_idle`` and only after the
   gate is closed: ``stop``, the cover path, startup and shutdown here, and the
   launch exit script in the node module.
 * ``stop`` reports success only when the runtime was observed back in idle.
@@ -59,7 +59,7 @@ from manipulation_execution.hri.mirror_session.hooks import (
     WrapUpPurpose,
     WrapUpStep,
 )
-from manipulation_execution.hri.mirror_session.runtime import (
+from manipulation_execution.shared.runtime_ownership import (
     IDLE,
     STATUS_MAX_AGE_S,
     ReleaseOutcome,

@@ -5,11 +5,20 @@ import numpy as np
 from manipulation_execution.geometry import (
     TablePlane,
     axis_error_deg,
+    euler_xyz_matrix,
     orient_table_plane_upward,
     quaternion_error_deg,
+    quaternion_from_matrix,
+    quaternion_matrix,
     transform_point,
     transform_table_plane,
 )
+
+
+def test_quaternion_matrix_round_trip():
+    rotation = euler_xyz_matrix((0.3, -0.2, 1.1))
+    quaternion = quaternion_from_matrix(rotation)
+    assert np.allclose(quaternion_matrix(quaternion), rotation, atol=1e-8)
 
 
 def test_transform_table_plane_preserves_signed_distance():

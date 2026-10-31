@@ -2,17 +2,15 @@ import math
 
 import numpy as np
 
-from manipulation_execution.grasp_geometry import (
+from manipulation_execution.geometry import euler_xyz_matrix, quaternion_from_matrix
+from manipulation_execution.pick.candidate_geometry import (
     build_candidate_plan,
     contact_distance_score,
-    euler_xyz_matrix,
     fixed_finger_base_side_alignment,
     fixed_finger_envelope_score,
     fixed_finger_robust_gap,
     grasp_axis_errors,
     prepared_candidate_soft_score,
-    quaternion_from_matrix,
-    quaternion_matrix,
     source_contact_camera,
     target_width_extent_points,
     xyz_within_workspace,
@@ -38,12 +36,6 @@ def _config():
             "width_quality_min": 0.75,
         },
     }
-
-
-def test_quaternion_matrix_round_trip():
-    rotation = euler_xyz_matrix((0.3, -0.2, 1.1))
-    quaternion = quaternion_from_matrix(rotation)
-    assert np.allclose(quaternion_matrix(quaternion), rotation, atol=1e-8)
 
 
 def test_grasp_axis_errors_keep_closing_axis_signed():

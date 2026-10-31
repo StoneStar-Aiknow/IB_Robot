@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from manipulation_execution.hri.imitate.executor import AnimationPlan, _normalized_motion_config
+from manipulation_execution.hri.animation import AnimationPlan, normalized_motion_config
 
 from . import cadence, plan_builder, scoring, smoothing
 from .base import HUMAN_SIDES, Retargeter, RetargetRequest
@@ -54,7 +54,7 @@ def retarget_capture(
     case not even the idle sway can be built.
     """
     started = time.perf_counter()
-    names, prepare, limits = _normalized_motion_config(joint_names, prepare_positions, joint_limits)
+    names, prepare, limits = normalized_motion_config(joint_names, prepare_positions, joint_limits)
     retargeter: Retargeter = _RETARGETERS[retargeter_name]()
     missing = [channel for channel in retargeter.channels if channel not in names]
     if missing:

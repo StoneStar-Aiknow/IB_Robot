@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from manipulation_execution.hri.imitate.executor import AnimationPlan, _waypoints
+from manipulation_execution.hri.animation import AnimationPlan, waypoints
 
 from . import cadence, smoothing
 
@@ -114,7 +114,7 @@ def build_plan(
     points = tuple(tuple(float(value) for value in row) for row in values)
     return AnimationPlan(
         animation_id,
-        _waypoints(grid.joint_names, joint_limits, *points),
+        waypoints(grid.joint_names, joint_limits, *points),
         duration_sec=grid.duration_sec,
         grid_period_sec=grid.period,
     )

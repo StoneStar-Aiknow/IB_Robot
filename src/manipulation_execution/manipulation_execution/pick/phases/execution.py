@@ -16,7 +16,7 @@ from ibrobot_msgs.action import PickObject
 from ibrobot_msgs.msg import GraspCandidate
 from ibrobot_msgs.srv import VerifyGrasp
 from manipulation_execution.geometry import axis_error_deg, quaternion_error_deg
-from manipulation_execution.grasp_geometry import fixed_finger_robust_gap, xyz_within_workspace
+from manipulation_execution.pick.candidate_geometry import fixed_finger_robust_gap, xyz_within_workspace
 from manipulation_execution.pick.models import (
     BaseSceneGeometry,
     FlowState,

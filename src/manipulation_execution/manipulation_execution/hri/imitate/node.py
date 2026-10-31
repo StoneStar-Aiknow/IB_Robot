@@ -26,9 +26,9 @@ from embodied_common.dispatch_binding import (
 from ibrobot_msgs.action import ImitateHumanMotion, PrimitiveCommand
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from ibrobot_msgs.srv import PearParameterPredict, YoloXDetect
+from manipulation_execution.hri.animation import AnimationPlan
 from manipulation_execution.hri.imitate.executor import (
     CANCEL_CLEANUP_TIMEOUT,
-    AnimationPlan,
     ImitationExecutor,
     ImitationGoal,
     ImitationResult,

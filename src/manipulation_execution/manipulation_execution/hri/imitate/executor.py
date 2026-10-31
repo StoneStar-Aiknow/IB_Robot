@@ -9,22 +9,19 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from manipulation_execution.hri.animation import (
+    MAX_IMITATION_DURATION_SEC,
+    AnimationPlan,
+    normalized_motion_config,
+    waypoints,
+)
+
 ARM_SIDES = ("left", "right", "auto")
-MAX_IMITATION_DURATION_SEC = 20.0
 CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
 
 
 class PrimitiveStateUnknown(RuntimeError):
     """Raised when a primitive may still be executing and recovery is unsafe."""
-
-
-@dataclass(frozen=True)
-class AnimationPlan:
-    animation_id: str
-    waypoints: tuple[tuple[float, ...], ...]
-    duration_sec: float = MAX_IMITATION_DURATION_SEC
-    # > 0: waypoints form a uniform grid with this period, played as one batch.
-    grid_period_sec: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -161,58 +158,13 @@ class FallbackMotionRecorder:
             self._sleep(min(0.05, duration_sec - elapsed, max(0.0, deadline - now)))
 
 
-def _normalized_motion_config(
-    joint_names: Sequence[str],
-    reset_positions: Mapping[str, float],
-    joint_limits: Mapping[str, Mapping[str, float] | Sequence[float]],
-) -> tuple[tuple[str, ...], dict[str, float], dict[str, tuple[float, float]]]:
-    names = tuple(str(name).strip() for name in joint_names)
-    if len(names) < 2 or any(not name for name in names) or len(set(names)) != len(names):
-        raise ValueError("imitation motion requires at least two unique arm joint names")
-
-    reset: dict[str, float] = {}
-    limits: dict[str, tuple[float, float]] = {}
-    for name in names:
-        if name not in reset_positions or name not in joint_limits:
-            raise ValueError(f"imitation motion configuration is missing joint {name}")
-        position = float(reset_positions[name])
-        raw_limits = joint_limits[name]
-        if isinstance(raw_limits, Mapping):
-            lower = float(raw_limits["min"])
-            upper = float(raw_limits["max"])
-        else:
-            lower, upper = (float(value) for value in raw_limits)
-        if not all(math.isfinite(value) for value in (position, lower, upper)) or lower >= upper:
-            raise ValueError(f"imitation motion configuration for joint {name} is invalid")
-        if not lower <= position <= upper:
-            raise ValueError(f"reset position is outside joint {name} limits")
-        reset[name] = position
-        limits[name] = (lower, upper)
-    return names, reset, limits
-
-
-def _waypoints(
-    joint_names: tuple[str, ...],
-    joint_limits: Mapping[str, tuple[float, float]],
-    *points: tuple[float, ...],
-) -> tuple[tuple[float, ...], ...]:
-    for point in points:
-        if len(point) != len(joint_names) or any(not math.isfinite(value) for value in point):
-            raise ValueError("animation waypoint must contain all arm joint values")
-        for joint_name, value in zip(joint_names, point, strict=True):
-            lower, upper = joint_limits[joint_name]
-            if not lower <= value <= upper:
-                raise ValueError(f"animation waypoint is outside joint {joint_name} limits")
-    return tuple(points)
-
-
 def build_fallback_animations(
     joint_names: Sequence[str],
     reset_positions: Mapping[str, float],
     joint_limits: Mapping[str, Mapping[str, float] | Sequence[float]],
 ) -> dict[str, AnimationPlan]:
     """Build three distinct fallback animations from the robot configuration SSOT."""
-    names, reset, limits = _normalized_motion_config(joint_names, reset_positions, joint_limits)
+    names, reset, limits = normalized_motion_config(joint_names, reset_positions, joint_limits)
     first_joint, second_joint = names[:2]
     home = tuple(reset[name] for name in names)
 
@@ -227,12 +179,12 @@ def build_fallback_animations(
     auto_left = offset(**{first_joint: -0.5, second_joint: 0.5854})
     auto_right = offset(**{first_joint: 0.5, second_joint: 0.5854})
     return {
-        "fallback_left_v1": AnimationPlan("fallback_left_v1", _waypoints(names, limits, home, left, home, right, home)),
+        "fallback_left_v1": AnimationPlan("fallback_left_v1", waypoints(names, limits, home, left, home, right, home)),
         "fallback_right_v1": AnimationPlan(
-            "fallback_right_v1", _waypoints(names, limits, home, right, home, left, home)
+            "fallback_right_v1", waypoints(names, limits, home, right, home, left, home)
         ),
         "fallback_auto_v1": AnimationPlan(
-            "fallback_auto_v1", _waypoints(names, limits, home, auto_right, auto_left, auto_right, home)
+            "fallback_auto_v1", waypoints(names, limits, home, auto_right, auto_left, auto_right, home)
         ),
     }
 
@@ -254,7 +206,7 @@ class ImitationExecutor:
         clock: Callable[[], float] = time.monotonic,
         plan_provider: Callable[[ImitationGoal, float], tuple[AnimationPlan, str]] | None = None,
     ) -> None:
-        self._joint_names, self._reset_positions, self._joint_limits = _normalized_motion_config(
+        self._joint_names, self._reset_positions, self._joint_limits = normalized_motion_config(
             joint_names, reset_positions, joint_limits
         )
         self.status = ImitationStatus(
@@ -292,7 +244,7 @@ class ImitationExecutor:
             plan, note = self._plan_provider(goal, duration_sec)
             if not plan.waypoints:
                 raise ValueError("plan has no waypoints")
-            _waypoints(self._joint_names, self._joint_limits, *plan.waypoints)
+            waypoints(self._joint_names, self._joint_limits, *plan.waypoints)
             if not (math.isfinite(plan.grid_period_sec) and plan.grid_period_sec >= 0.0):
                 raise ValueError("plan grid period must be finite and non-negative")
             return plan, str(note)

@@ -1,4 +1,11 @@
-"""Pure GraspGen-to-robot geometry conversion helpers."""
+"""Pick-side candidate geometry: GraspGen-to-robot conversion and scoring.
+
+The generic rotation math this module builds on (type aliases, euler /
+quaternion conversion, matrix helpers) lives in ``manipulation_execution.geometry``.
+
+Split from the former ``grasp_geometry.py`` (design D4 of the package-layout
+change): everything here carries gripper or candidate semantics.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +16,14 @@ from typing import Any
 
 import numpy as np
 
-Vector3 = tuple[float, float, float]
-Quaternion = tuple[float, float, float, float]
+from manipulation_execution.geometry import (
+    Quaternion,
+    Vector3,
+    euler_xyz_matrix,
+    matrix_from_rowmajor,
+    quaternion_from_matrix,
+    quaternion_matrix,
+)
 
 
 @dataclass(frozen=True)
@@ -97,80 +110,6 @@ def _normalized(value: Iterable[float]) -> np.ndarray:
     return vector / norm
 
 
-def euler_xyz_matrix(rpy: Iterable[float]) -> np.ndarray:
-    roll, pitch, yaw = (float(value) for value in rpy)
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
-    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    return rz @ ry @ rx
-
-
-def quaternion_matrix(quaternion: Quaternion) -> np.ndarray:
-    x, y, z, w = (float(value) for value in quaternion)
-    norm = math.sqrt(x * x + y * y + z * z + w * w)
-    if norm <= 1e-9:
-        raise ValueError("quaternion must be non-zero")
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-    return np.array(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-
-
-def quaternion_from_matrix(matrix: np.ndarray) -> Quaternion:
-    rotation = np.asarray(matrix, dtype=np.float64)[:3, :3]
-    trace = float(np.trace(rotation))
-    if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        quaternion = (
-            (rotation[2, 1] - rotation[1, 2]) / scale,
-            (rotation[0, 2] - rotation[2, 0]) / scale,
-            (rotation[1, 0] - rotation[0, 1]) / scale,
-            0.25 * scale,
-        )
-    else:
-        diagonal = np.diag(rotation)
-        index = int(np.argmax(diagonal))
-        if index == 0:
-            scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
-            quaternion = (
-                0.25 * scale,
-                (rotation[0, 1] + rotation[1, 0]) / scale,
-                (rotation[0, 2] + rotation[2, 0]) / scale,
-                (rotation[2, 1] - rotation[1, 2]) / scale,
-            )
-        elif index == 1:
-            scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
-            quaternion = (
-                (rotation[0, 1] + rotation[1, 0]) / scale,
-                0.25 * scale,
-                (rotation[1, 2] + rotation[2, 1]) / scale,
-                (rotation[0, 2] - rotation[2, 0]) / scale,
-            )
-        else:
-            scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
-            quaternion = (
-                (rotation[0, 2] + rotation[2, 0]) / scale,
-                (rotation[1, 2] + rotation[2, 1]) / scale,
-                0.25 * scale,
-                (rotation[1, 0] - rotation[0, 1]) / scale,
-            )
-    norm = math.sqrt(sum(value * value for value in quaternion))
-    return (
-        float(quaternion[0] / norm),
-        float(quaternion[1] / norm),
-        float(quaternion[2] / norm),
-        float(quaternion[3] / norm),
-    )
-
-
 def grasp_axis_errors(
     target_quaternion: Quaternion,
     actual_quaternion: Quaternion,
@@ -198,19 +137,6 @@ def grasp_axis_errors(
         approach_deg=error_deg(approach_axis_ee),
         closing_deg=error_deg(closing_axis_ee, symmetric=closing_axis_180_symmetric),
     )
-
-
-def transform_matrix(translation: Vector3, quaternion: Quaternion) -> np.ndarray:
-    matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, :3] = quaternion_matrix(quaternion)
-    matrix[:3, 3] = translation
-    return matrix
-
-
-def matrix_from_rowmajor(values: Iterable[float]) -> np.ndarray:
-    matrix = np.asarray(list(values), dtype=np.float64).reshape(4, 4)
-    matrix[3, :] = [0.0, 0.0, 0.0, 1.0]
-    return matrix
 
 
 def source_contact_camera(

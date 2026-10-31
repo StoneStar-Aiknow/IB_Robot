@@ -4,7 +4,7 @@ import pytest
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 
-from manipulation_execution.grasp_geometry import euler_xyz_matrix, quaternion_from_matrix
+from manipulation_execution.geometry import euler_xyz_matrix, quaternion_from_matrix
 from manipulation_execution.pick.node import IKPayload, PickExecutorNode, PickFlowError
 
 
