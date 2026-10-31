@@ -579,7 +579,7 @@ launches can destabilize motion control, so the launch entry staggers its nodes.
 |---|---|---|---|
 | `profiles/x2_ultra.yaml` | X2 Ultra | OmniPicker gripper | `gripper.1d` (count 2) |
 | `profiles/x2_ultra_omnihand.yaml` | X2 Ultra | OmniHand dexterous hands | `hand.multi_joint`, `hand.gesture`; no `gripper.1d` |
-| `profiles/x2_mc_20260522.yaml` | Separate x86 MC release | Read-only joints | Velocity/step modes, 21 presets, action/speed-profile queries, leg odometry; no upper-body streaming |
+| `profiles/x2_mc.yaml` | MC-only interface | Read-only joints | Velocity/step modes, 21 presets, action/speed-profile queries, leg odometry; no upper-body streaming or bounded-stop guarantee |
 
 The separate MC release is **not** API-equivalent to the two hardware profiles.
 Its supported surface, missing vendor protocols, transport selection and testing

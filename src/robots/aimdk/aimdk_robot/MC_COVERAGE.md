@@ -1,9 +1,14 @@
 # MC Release Adapter
 
-`profiles/x2_mc_20260522.yaml` targets the separately delivered
+`profiles/x2_mc.yaml` describes the MC-only interface, checked against the separately delivered
 `mc-x86-v1.0.0-20260522`, robot `lx2501_3_t2d5`. It is opt-in: the existing
 `x2_ultra` and `x2_ultra_omnihand` profiles describe a different firmware
 interface and are unchanged. Do not interchange them based on the robot name.
+
+The profile is a runtime contract, not a vendor release selector or simulator
+startup recipe. `vendor.motion_api: mc` selects the supported action vocabulary;
+`runtime.type: x2_mc` identifies the public runtime variant. The release date
+records the source of interface facts here, not another robot type.
 
 ## Source Of Facts
 
@@ -74,12 +79,32 @@ source /path/to/aimdk/install/local_setup.bash
 ./scripts/build.sh --aimdk
 ```
 
-Select `profile:=x2_mc_20260522` on `aimdk_robot/runtime.launch.py`. With the
+Select `profile:=x2_mc` on `aimdk_robot/runtime.launch.py`. With the
 default `use_sim:=false`, the bridge expects an externally running vendor stack.
 `use_sim:=true sim_platform:=sdk` selects the repository protocol mock.
-The launch entry does not start vendor MC or simulator processes and rejects
+The launch entry starts the bridge and its independent data plane, not vendor MC
+or simulator processes, and rejects
 `sim_platform:=mujoco`. Launching the bridge does not automatically switch the
 MC action or enable velocity output.
+
+Keep deployment choices in the existing `use_sim`, `sim_platform`, `instance_id`
+and `initial_mode` launch arguments. `initial_mode` selects local admission only;
+it does not execute a vendor action. Query endpoints come from `interfaces`,
+without a second public-endpoint table under `vendor`.
+
+The shipped mode graph contains only idle, locomotion and step. It does not
+encode the seated simulator sequence `SIT_JOINT_DEFAULT` -> `SIT_UP_DEFAULT` ->
+`STAND_DEFAULT`. If the externally managed vendor simulator needs that sequence,
+perform and verify it with the vendor's own tooling before requesting runtime
+motion. It is not an automatic startup procedure, a generic recovery skill or
+a validated real-robot transition. Action-name confirmation alone does not prove
+that a recovery movement has finished or the robot is balanced.
+
+The stop service remains available, but this profile does not advertise the
+`runtime.stop` capability: its schema requires latency bounds, and none have
+been measured for this adapter. Do not substitute placeholder values. HOLD is
+a local admission/output stop; TORQUE_OFF requests damping and reports the
+downgrade. Neither is an accepted bounded physical stop.
 
 For standalone physics, use [aimdk_mujoco](../aimdk_mujoco/README.md). That package
 does not run the proprietary MC or validate this adapter's runtime contract.

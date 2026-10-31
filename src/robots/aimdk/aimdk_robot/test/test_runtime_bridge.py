@@ -44,7 +44,7 @@ from robot_runtime.profile import load_profile  # noqa: E402
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra.yaml"
 OMNIHAND_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra_omnihand.yaml"
-MC_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_mc_20260522.yaml"
+MC_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_mc.yaml"
 TIMEOUT_S = 15.0
 
 
@@ -169,18 +169,25 @@ def harness():
 # --- lifecycle --------------------------------------------------------------
 
 
-def test_mc_release_queries_return_platform_action_and_all_speed_profiles():
+def test_mc_release_queries_return_platform_action_and_all_speed_profiles(tmp_path):
+    import yaml
+
     from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
 
-    running = Harness(profile=MC_PROFILE, initial_action="JOINT_DEFAULT")
+    profile = yaml.safe_load(MC_PROFILE.read_text())
+    profile["interfaces"]["motion.state"]["endpoint"] = "/test_mc/get_state"
+    profile["interfaces"]["motion.locomotion_profiles"]["endpoint"] = "/test_mc/get_profiles"
+    profile_path = tmp_path / "mc.yaml"
+    profile_path.write_text(yaml.safe_dump(profile))
+    running = Harness(profile=profile_path, initial_action="JOINT_DEFAULT")
     try:
         running.wait_active()
-        answer = running.call(GetMotionState, "/motion/get_state", GetMotionState.Request())
+        answer = running.call(GetMotionState, "/test_mc/get_state", GetMotionState.Request())
         assert answer.success
         assert answer.action_name == "JOINT_DEFAULT"  # Not the local idle mode's STAND_DEFAULT.
         assert answer.action_id == 100
         assert answer.action_status == 100
-        speeds = running.call(GetLocomotionProfiles, "/motion/get_locomotion_profiles", GetLocomotionProfiles.Request())
+        speeds = running.call(GetLocomotionProfiles, "/test_mc/get_profiles", GetLocomotionProfiles.Request())
         assert speeds.success
         assert speeds.names == ["none", "low", "medium", "high", "step"]
         assert speeds.profiles[-1].mode == 4
@@ -205,14 +212,15 @@ def test_mc_release_does_not_turn_query_errors_into_cached_success():
         running.shutdown()
 
 
-def test_mc_release_seated_start_modes_are_confirmed_by_vendor_feedback():
-    running = Harness(profile=MC_PROFILE)
+def test_mc_release_startup_leaves_vendor_action_unchanged_and_modes_require_feedback():
+    running = Harness(profile=MC_PROFILE, initial_action="JOINT_DEFAULT")
     try:
         running.wait_active()
         assert running.status().active_mode == "idle"
+        assert running.platform_action() == "JOINT_DEFAULT"
         for mode, action in (
-            ("prepare", "SIT_JOINT_DEFAULT"),
-            ("sit_up", "SIT_UP_DEFAULT"),
+            ("locomotion", "LOCOMOTION_DEFAULT"),
+            ("step", "LOCOMOTION_STEP"),
             ("idle", "STAND_DEFAULT"),
         ):
             answer = running.set_mode(mode)
@@ -416,6 +424,7 @@ def test_mc_release_step_velocity_and_new_preset_use_real_mc_inputs():
         running.wait_active()
         assert running.set_mode("step").success
         assert running.platform_action() == "LOCOMOTION_STEP"
+        running.wait_active()
         assert running.enable_navigation().success
         message = Twist()
         message.linear.x = 0.3

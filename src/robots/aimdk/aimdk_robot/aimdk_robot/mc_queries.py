@@ -52,19 +52,27 @@ class _AsyncServiceCaller(vg.ServiceCaller):
 class McQueries:
     """Optional public query endpoints, owned and declared by the runtime profile."""
 
-    def __init__(self, node, config) -> None:
+    def __init__(self, node, interfaces) -> None:
         self._node = node
         services = node.vendor_config.get("services") or {}
-        for key, vendor_type, public_type, callback in (
-            ("get_action", GetMcAction, GetMotionState, self._action),
-            ("get_speed_profiles", GetMcLocomotionSpeedStatus, GetLocomotionProfiles, self._speeds),
+        for key, interface, vendor_type, public_type, callback in (
+            ("get_action", "motion.state", GetMcAction, GetMotionState, self._action),
+            (
+                "get_speed_profiles",
+                "motion.locomotion_profiles",
+                GetMcLocomotionSpeedStatus,
+                GetLocomotionProfiles,
+                self._speeds,
+            ),
         ):
-            if key not in config:
+            if interface not in interfaces:
                 continue
             client = node.create_client(vendor_type, services[key], callback_group=node.action_callback_group)
             caller = _AsyncServiceCaller(node, client, attempts=2, timeout_s=0.5)
             setattr(self, f"_{key}", (vendor_type, caller))
-            node.create_service(public_type, str(config[key]), callback, callback_group=node.action_callback_group)
+            node.create_service(
+                public_type, str(interfaces[interface]["endpoint"]), callback, callback_group=node.action_callback_group
+            )
 
     async def _query(self, key):
         vendor_type, caller = getattr(self, f"_{key}")

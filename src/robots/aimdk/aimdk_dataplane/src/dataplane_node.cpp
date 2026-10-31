@@ -131,8 +131,10 @@ public:
       touch_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(plan.touch->topic, sensor_qos());
       touch_timer_ = timer(plan.touch_rate_hz, [this]() {publish_touch();});
     }
-    upper_body_pub_ = create_publisher<aimdk_msgs::msg::UpperBodyCommandArray>(
-      plan.upper_body_command.topic, vendor_qos(plan.upper_body_command, plan.upper_body_command.depth));
+    if (!plan.upper_body_command.topic.empty()) {
+      upper_body_pub_ = create_publisher<aimdk_msgs::msg::UpperBodyCommandArray>(
+        plan.upper_body_command.topic, vendor_qos(plan.upper_body_command, plan.upper_body_command.depth));
+    }
     locomotion_pub_ = create_publisher<aimdk_msgs::msg::McLocomotionVelocity>(
       plan.locomotion_command.topic, vendor_qos(plan.locomotion_command, plan.locomotion_command.depth));
     for (const auto & channel : plan.channels) {
@@ -425,7 +427,7 @@ private:
         header.sequence = output.sequence;
         return header;
       };
-    if (output.kind == Output::Kind::kUpperBody) {
+    if (output.kind == Output::Kind::kUpperBody && upper_body_pub_) {
       aimdk_msgs::msg::UpperBodyCommandArray message;
       message.header = header("mc_upper_body");
       message.source = core_.plan().source;

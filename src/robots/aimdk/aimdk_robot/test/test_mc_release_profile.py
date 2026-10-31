@@ -3,13 +3,13 @@
 from pathlib import Path
 
 import pytest
-from aimdk_robot import projection
+from aimdk_robot import dataplane, projection
 
 from robot_runtime.interface_description import build_description
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.profile import load_profile
 
-PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_mc_20260522.yaml"
+PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_mc.yaml"
 
 
 def test_release_profile_does_not_advertise_unsupported_upper_body_control():
@@ -23,6 +23,15 @@ def test_release_profile_does_not_advertise_unsupported_upper_body_control():
     assert not modes.can_switch("head").allowed
     assert projection.mode_action(profile, "locomotion") == "LOCOMOTION_DEFAULT"
     assert projection.mode_action(profile, "step") == "LOCOMOTION_STEP"
+    assert not modes.can_switch("prepare").allowed
+    assert not modes.can_switch("sit_up").allowed
+    assert "runtime.stop" not in profile["capabilities"]
+    assert description["interfaces"]["runtime.stop"]["endpoint"] == "/runtime/stop"
+    assert not dataplane.plan(profile)["upper_body_command"]["topic"]
+
+    profile["vendor"]["mc_actions"]["stream"] = "UPPERBODY_REMOTE_SPLIT"
+    with pytest.raises(projection.ProjectionError):
+        projection.mode_action(profile, "stream")
 
 
 def test_step_mode_is_not_enabled_for_the_original_hardware_profile():

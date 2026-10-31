@@ -81,7 +81,7 @@ def test_mujoco_execution_is_rejected_instead_of_starting_a_mock():
     with pytest.raises(ValueError, match="sim_platform 'mujoco' is not supported"):
         _render(
             "",
-            profile=str(_PROFILE.with_name("x2_mc_20260522.yaml")),
+            profile=str(_PROFILE.with_name("x2_mc.yaml")),
             use_sim="true",
             sim_platform="mujoco",
         )

@@ -313,7 +313,7 @@ class AimdkVendorMock(Node):
             response.response.message = f"mock rejection {code}"
             return response
         action = str(request.command.action_desc) or vg.MC_ACTION_BY_VALUE.get(int(request.command.action.value), "")
-        if action not in projection.MC_RELEASE_MOTION_MODES | projection.VENDOR_SKILL_ACTIONS:
+        if action not in projection.VENDOR_ACTIONS | projection.MC_MOTION_MODES:
             # Code 3, "动作未在配置中登记". The firmware matches action_desc
             # against its registered configuration, which is narrower than the
             # McAction enumeration: a name that exists in the IDL and not in the

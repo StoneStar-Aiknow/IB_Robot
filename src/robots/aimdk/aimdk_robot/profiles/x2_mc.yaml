@@ -1,11 +1,11 @@
-# Opt-in adapter for mc-x86-v1.0.0-20260522, lx2501_3_t2d5.
-# Based on the deployed MC configuration, not the newer upper-body SDK API.
+# MC-only runtime contract; supported vendor distribution is documented in MC_COVERAGE.md.
+# No upper-body command receiver is available in this interface variant.
 # Physical transport expects an externally started MC.
 # use_sim=true with sim_platform:=sdk selects the in-repo protocol mock.
 runtime:
   name: aimdk_robot
   version: 0.1.0
-  type: x2_mc_20260522
+  type: x2_mc
 use_sim: false
 sim_platforms: [sdk]
 sim_platform: sdk
@@ -31,9 +31,7 @@ arm_joints: *arms
 gripper_joints: []
 modes:
   initial: idle
-  prepare: {controllers: [], transitions: [sit_up]}
-  sit_up: {controllers: [], transitions: [idle]}
-  idle: {controllers: [], transitions: [prepare, locomotion, step]}
+  idle: {controllers: [], transitions: [locomotion, step]}
   locomotion:
     controllers: []
     allows_stream: true
@@ -61,19 +59,12 @@ capabilities:
             light_wave, hug, arms_crossed, nod, shake_head, look_around, bye]
   motion.posture: {postures: [sit_down, lie_down]}
   runtime.status: {}
-  # Unmeasured bounds, not hardware safety acceptance.
-  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+  # /runtime/stop remains available, but no bounded-stop capability is claimed.
 stop_default_policy: HOLD
 teleoperation: {enabled: false}
 vendor:
-  mc_release: mc-x86-v1.0.0-20260522
-  registered_motion_modes:
-    [SIT_JOINT_DEFAULT, SIT_UP_DEFAULT, JOINT_DEFAULT, STAND_DEFAULT, LOCOMOTION_DEFAULT, LOCOMOTION_STEP]
+  motion_api: mc
   mc_actions:
-    # The simulator falls into the documented seated posture in passive mode.
-    # Recover through MC's public seated-start sequence before stable stand.
-    prepare: SIT_JOINT_DEFAULT
-    sit_up: SIT_UP_DEFAULT
     idle: STAND_DEFAULT
     locomotion: LOCOMOTION_DEFAULT
     step: LOCOMOTION_STEP
@@ -85,9 +76,6 @@ vendor:
     set_preset_motion: /aimdk_5Fmsgs/srv/SetMcPresetMotion
     get_preset_motion_state: /aimdk_5Fmsgs/srv/GetMcPresetMotionState
     get_speed_profiles: /aimdk_5Fmsgs/srv/GetMcLocomotionSpeedStatus
-  queries:
-    get_action: /motion/get_state
-    get_speed_profiles: /motion/get_locomotion_profiles
   topics:
     locomotion_command: /aima/mc/locomotion/velocity
     mc_state: /aima/mc/common/state

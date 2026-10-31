@@ -732,11 +732,12 @@ class AimdkRuntimeNode(Node):
         # The command channels themselves are the data plane's: it subscribes
         # them, applies the mode, admission and navigation gate this runtime
         # reports in its control word, and reports what it refused.
-        if self._vendor.get("queries"):
+        if any(
+            name in self._speech_description["interfaces"] for name in ("motion.state", "motion.locomotion_profiles")
+        ):
             from aimdk_robot.mc_queries import McQueries  # noqa: PLC0415
 
-            self._mc_queries = McQueries(self, self._vendor["queries"])
-
+            self._mc_queries = McQueries(self, self._speech_description["interfaces"])
 
         if self._state.has_capability("interaction.tts"):
             self.create_service(SpeakText, SPEAK_SERVICE, self._on_speak, callback_group=self._service_cb)
