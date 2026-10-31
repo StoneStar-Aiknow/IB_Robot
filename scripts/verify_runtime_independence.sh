@@ -65,6 +65,10 @@ LEKIWI_RUNTIME_MEMBERS=(
   # forking them. Declared by name, never by an so101_* prefix rule, so an
   # unrelated SO-101 package appearing in the closure still fails the gate.
   so101_description so101_sdk so101_hardware so101_motion
+  # The SO-101 grasp providers declared by lekiwi_nav_grasp's grasp_execution
+  # (openspec cleanup-manipulation-so101-providers D4): a dependency leaf, so
+  # it joins the closure without the manipulation/inference packages.
+  so101_suite
 )
 # The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
 # description or motion package of its own. aimdk_msgs is supplied by the

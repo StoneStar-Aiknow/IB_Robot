@@ -1,8 +1,10 @@
 """Robot-agnostic plane and quaternion geometry for grasp execution.
 
-Extracted from the former ``so101_geometry`` module (design D8): generic
-math stays in ``manipulation_execution``; SO-101-specific gripper mesh
-geometry and joint-5 wrist guards live in ``so101_suite``.
+The generic math (table-plane transformation, axis/quaternion errors) lives
+here; robot-specific gripper mesh geometry and joint-5 wrist guards live in
+the robot suites (``so101_suite``) and are loaded only through
+configuration-declared providers. This module owns the single ``TablePlane``
+type the pick pipeline uses.
 """
 
 from __future__ import annotations

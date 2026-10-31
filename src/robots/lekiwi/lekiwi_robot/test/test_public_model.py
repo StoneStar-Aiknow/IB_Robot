@@ -53,6 +53,56 @@ def test_base_only_profile_publishes_wheels_only(simulated):
     assert groups["arm"] == [] and groups["gripper"] == []
 
 
+def test_nav_grasp_home_positions_are_the_actuator_reset_positions():
+    # The public semantic HOME must equal the actuator startup pose for the
+    # arm joints: home_positions projects hardware.reset_positions for joints
+    # 1-5 (mirroring so101_single_arm), so the embodied arm surface and the
+    # pick executor's joint-5 HOME gating read one source. The projection is
+    # additive — actuator startup still drives hardware.reset_positions,
+    # which this addition does not touch.
+    profile = load_profile(resolve_profile_argument("lekiwi_robot", "lekiwi_nav_grasp"))
+    reset = profile["hardware"]["reset_positions"]
+    home = profile["home_positions"]
+    assert sorted(home) == sorted(profile["arm_joints"])
+    assert home == {name: reset[name] for name in profile["arm_joints"]}
+    assert home == {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0}
+
+
+def test_nav_grasp_declares_the_public_ee_pose_stream():
+    # The embodied arm surface requires a public end-effector pose stream;
+    # so101_motion's motion server (part of this runtime) publishes it. The
+    # declaration mirrors so101_single_arm (openspec change
+    # cleanup-manipulation-so101-providers D5).
+    profile = load_profile(resolve_profile_argument("lekiwi_robot", "lekiwi_nav_grasp"))
+    assert "motion.fk" in profile["capabilities"]
+    assert profile["interfaces"]["motion.ee_pose"] == {
+        "capability": "motion.fk",
+        "kind": "topic",
+        "direction": "publish",
+        "endpoint": "/robot_status/ee_pose",
+        "message_type": "geometry_msgs/msg/PoseStamped",
+        "frame_id": "base",
+        "qos": {"reliability": "reliable", "durability": "volatile", "history": "keep_last", "depth": 10},
+    }
+
+
+@pytest.mark.parametrize("simulated", (True, False), ids=("simulated", "physical"))
+def test_nav_grasp_description_exposes_home_positions_and_ee_pose(simulated):
+    # Both D5 profile additions are part of the public description (and
+    # therefore its digest): the model's semantic home positions and the
+    # declared motion.ee_pose stream.
+    profile = load_profile(resolve_profile_argument("lekiwi_robot", "lekiwi_nav_grasp"))
+    description = _description("lekiwi_nav_grasp", simulated)
+    assert description["model"]["home_positions"] == {
+        "1": 0.0,
+        "2": -1.5854,
+        "3": 1.5708,
+        "4": 0.7854,
+        "5": 0.0,
+    }
+    assert description["interfaces"]["motion.ee_pose"] == profile["interfaces"]["motion.ee_pose"]
+
+
 def test_runtime_launch_passes_the_model_to_the_facade():
     # Source-level pin: the description must reach runtime_stack_actions,
     # otherwise the facade rebuilds one without a model.

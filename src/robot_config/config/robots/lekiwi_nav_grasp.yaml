@@ -368,10 +368,9 @@ robot:
     detect_service: /perception/grasp/grounding_detect
     fallback_detect_service: /grasp_planner/detect_and_segment
     segment_service: /perception/grasp/segment_detections
-    ik_service: /compute_ik
-    fk_service: /compute_fk
-    joint_state_topic: /joint_states
-    move_configuration_service: /moveit_gateway/move_to_configuration
+    # IK/FK, move-to-configuration and the joint-state topic are derived from
+    # the bound public interface description (runtime.provider: lekiwi_robot);
+    # overrides conflicting with it are rejected by pick_executor_node.
     base_frame: base
     ee_frame: gripper
     observe_pose: observe_table
@@ -434,7 +433,6 @@ robot:
       confidence_weight: 1.0
       topdown_weight: 0.50
     ik:
-      group_name: arm
       # PR259-validated solver budget. LMA re-seeds from a random joint
       # configuration after a failed seeded attempt and keeps retrying until
       # this timeout expires, which destroys the joint5 seed that the IK
@@ -446,11 +444,11 @@ robot:
       rpc_timeout_sec: 3.0
       avoid_collisions: false
       check_orientation: false
-      worker_count: 1
       verification_position_tolerance_m: 0.001
       verification_orientation_tolerance_deg: 1.0
-      worker_namespace_prefix: /ik_worker
-      auto_start_workers: true
+      # worker_count/auto_start_workers/group_name are legacy_moveit-only;
+      # the runtime-backed worker pool comes from the lekiwi_robot profile
+      # (motion.ik_worker_count) and the bound public IK endpoints.
     contact_compensation:
       enabled: true
       xy_tolerance_m: 0.003
@@ -570,7 +568,10 @@ robot:
       # hard fail-closed mesh check when the fitted plane is unavailable.
       tabletop_clearance_m: -0.025
       tabletop_sweep_steps: 5
-      mesh_package: robot_description
+      # The SO-101 gripper-mesh geometry provider; the generic pipeline loads
+      # it through grasp_geometry_provider and carries no robot default.
+      grasp_geometry_provider: so101_suite.gripper_geometry
+      mesh_package: so101_description
       mesh_directory: meshes/lerobot/so101
     target_gripper:
       type: asymmetric_single_moving_jaw
@@ -586,6 +587,9 @@ robot:
       # it into the half-turn branch, and reject it if FK still misses these axes.
       ik_orientation_guard:
         enabled: true
+        # The SO-101 joint-5 guard provider; the generic pipeline loads it
+        # through wrist_guard_provider and carries no robot default.
+        wrist_guard_provider: so101_suite.wrist_guard
         approach_axis_ee: [0.0, 0.0, 1.0]
         # false because target_gripper.type is asymmetric_single_moving_jaw.
         # A half turn about the approach axis keeps the closing line but swaps

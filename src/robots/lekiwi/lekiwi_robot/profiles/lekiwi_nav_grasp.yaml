@@ -81,6 +81,18 @@ hardware:
     "4": 0.7854
     "5": 0.0
 
+# Semantic HOME for the arm (public model home_positions), not an actuator
+# startup command — same values as hardware.reset_positions above, mirroring
+# so101_single_arm. The embodied arm surface and the pick executor's joint-5
+# HOME gating read it from the public model (openspec
+# cleanup-manipulation-so101-providers D5).
+home_positions:
+  "1": 0.0
+  "2": -1.5854
+  "3": 1.5708
+  "4": 0.7854
+  "5": 0.0
+
 ros2_control:
   controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
   broadcasters: [joint_state_broadcaster, arm_joint_state_broadcaster]
@@ -188,6 +200,20 @@ capabilities:
   base.odom: {}
   base.navigation_gate: {}
   runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+
+# The arm's end-effector pose stream, published by so101_motion's motion
+# server (this runtime includes its motion.launch.py for the arm). The
+# embodied arm surface requires this public interface; the declaration mirrors
+# so101_single_arm's (openspec cleanup-manipulation-so101-providers D5).
+interfaces:
+  motion.ee_pose:
+    capability: motion.fk
+    kind: topic
+    direction: publish
+    endpoint: /robot_status/ee_pose
+    message_type: geometry_msgs/msg/PoseStamped
+    frame_id: base
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
 
 # D12: the robot's default sensor surface. Deployment robot YAMLs override
 # entries by (type, name) via the runtime `peripherals` launch argument.

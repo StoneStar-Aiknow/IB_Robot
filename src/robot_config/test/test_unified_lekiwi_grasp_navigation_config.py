@@ -125,7 +125,16 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert hybrid["mid360_mount_file"].endswith("lekiwi_mid360_mount.yaml")
     assert [item["name"] for item in hybrid["peripherals"]] == ["respeaker", "wrist", "front", "mid360"]
     assert "peripheral_names" not in hybrid
-    assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
+    # Runtime-backed grasp: the legacy-only IK worker keys are gone (the worker
+    # pool comes from the lekiwi_robot profile and the bound public endpoints),
+    # and the profile still declares exactly one IK worker.
+    for legacy_key in ("group_name", "worker_count", "worker_namespace_prefix", "auto_start_workers"):
+        assert legacy_key not in hybrid["grasp_execution"]["ik"], legacy_key
+    for legacy_endpoint in ("ik_service", "fk_service", "move_configuration_service", "joint_state_topic"):
+        assert legacy_endpoint not in hybrid["grasp_execution"], legacy_endpoint
+    from robot_runtime.profile import load_profile
+
+    assert load_profile(PROFILE_PATH)["motion"]["ik_worker_count"] == 1
     assert hybrid["grasp_execution"]["ik"]["verification_position_tolerance_m"] == 0.001
     assert hybrid["grasp_execution"]["ik"]["verification_orientation_tolerance_deg"] == 1.0
     assert hybrid["control_modes"]["base_navigation"]["runtime_mode"] == "base_navigation"

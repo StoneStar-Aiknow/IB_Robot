@@ -166,6 +166,10 @@ _SCHEMA: dict[str, Any] = {
         "worker_count": _integer(0, 8),
         "worker_namespace_prefix": _string(allow_empty=True),
         "auto_start_workers": _bool(),
+        # Providerless (legacy_moveit) bring-up with auto-started workers: the
+        # robot suite's worker launch file to include (D2/D3); runtime-backed
+        # configs take their workers from the runtime profile instead.
+        "workers_launch": _string(),
         "verification_position_tolerance_m": _NON_NEGATIVE,
         "verification_orientation_tolerance_deg": _number(0.0, 180.0),
     },
@@ -279,6 +283,10 @@ _SCHEMA: dict[str, Any] = {
         "tabletop_filter": _bool(),
         "tabletop_clearance_m": _number(),
         "tabletop_sweep_steps": _integer(1),
+        # Robot-suite module providing the gripper-mesh geometry checks; the
+        # generic pipeline loads it through providers.py (D2/D3). No import or
+        # package lookup here: robot_config cannot import manipulation_execution.
+        "grasp_geometry_provider": _string(),
         "mesh_package": _string(),
         "mesh_directory": _string(),
     },
@@ -296,6 +304,9 @@ _SCHEMA: dict[str, Any] = {
             "joint5_limit_epsilon_rad": _NON_NEGATIVE,
             "joint5_stage_continuity": _bool(),
             "joint5_stage_max_delta_rad": _number(0.0, math.pi, exclusive_minimum=True),
+            # Robot-suite module providing the joint-5 guard functions; loaded
+            # through providers.py (D2/D3), never defaulted in the node.
+            "wrist_guard_provider": _string(),
             "max_approach_error_deg": _number(0.0, 180.0),
             "max_closing_error_deg": _number(0.0, 180.0),
             "moveit_orientation_search": {

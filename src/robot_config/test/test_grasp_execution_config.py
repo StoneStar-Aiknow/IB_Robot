@@ -202,6 +202,68 @@ def test_grasp_execution_config_rejects_unknown_nested_key(tmp_path: Path) -> No
         load_robot_config_dict(path)
 
 
+def test_grasp_execution_schema_accepts_provider_and_worker_launch_fields() -> None:
+    # D2: the config-declared provider modules and the providerless worker
+    # launch are schema-accepted strings; the static requirement checks stay
+    # in pick_executor_node and the real-config regression test.
+    value = {
+        "enabled": True,
+        "ik": {"workers_launch": "$(find so101_motion)/launch/ik_workers.launch.py"},
+        "target_geometry": {
+            "tabletop_filter": True,
+            "grasp_geometry_provider": "so101_suite.gripper_geometry",
+            "mesh_package": "so101_description",
+            "mesh_directory": "meshes/lerobot/so101",
+        },
+        "target_gripper": {
+            "ik_orientation_guard": {"enabled": True, "wrist_guard_provider": "so101_suite.wrist_guard"},
+        },
+    }
+
+    assert validate_grasp_execution_config(value) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_error"),
+    [
+        (
+            {"target_geometry": {"grasp_geometry_provider": 7}},
+            "grasp_execution.target_geometry.grasp_geometry_provider must be a non-empty string",
+        ),
+        (
+            {"target_gripper": {"ik_orientation_guard": {"wrist_guard_provider": ["a"]}}},
+            "grasp_execution.target_gripper.ik_orientation_guard.wrist_guard_provider must be a non-empty string",
+        ),
+        (
+            {"ik": {"workers_launch": True}},
+            "grasp_execution.ik.workers_launch must be a non-empty string",
+        ),
+    ],
+)
+def test_grasp_execution_schema_rejects_non_string_provider_fields(value, expected_error: str) -> None:
+    assert expected_error in validate_grasp_execution_config(value)
+
+
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+def test_grasp_execution_config_accepts_provider_and_worker_launch_fields(tmp_path: Path) -> None:
+    def declare_providers(config):
+        config["target_geometry"]["grasp_geometry_provider"] = "so101_suite.gripper_geometry"
+        config["target_gripper"]["ik_orientation_guard"]["wrist_guard_provider"] = "so101_suite.wrist_guard"
+        config["ik"]["workers_launch"] = "$(find so101_motion)/launch/ik_workers.launch.py"
+
+    path = _write_config(tmp_path, declare_providers)
+
+    grasp_execution = load_robot_config_dict(path)["grasp_execution"]
+    assert grasp_execution["target_geometry"]["grasp_geometry_provider"] == "so101_suite.gripper_geometry"
+    assert (
+        grasp_execution["target_gripper"]["ik_orientation_guard"]["wrist_guard_provider"] == "so101_suite.wrist_guard"
+    )
+    assert grasp_execution["ik"]["workers_launch"] == "$(find so101_motion)/launch/ik_workers.launch.py"
+
+
 def test_grasp_execution_config_rejects_removed_joint5_abs_max(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,

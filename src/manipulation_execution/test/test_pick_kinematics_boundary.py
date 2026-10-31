@@ -4,7 +4,7 @@ import json
 import math
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import rclpy
@@ -14,8 +14,25 @@ from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.srv import ComputeFk, ComputeIk
 from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
+from manipulation_execution.providers import GRASP_GEOMETRY_FUNCTIONS, WRIST_GUARD_FUNCTIONS
 from robot_runtime.interface_description import build_description, description_digest
 from robot_runtime.model_metadata import joint_conversions_fingerprint
+
+_STUB_GRASP_GEOMETRY = "stub_grasp_geometry_provider"
+_STUB_WRIST_GUARD = "stub_wrist_guard_provider"
+
+
+@pytest.fixture
+def stub_providers(monkeypatch):
+    """Install provider modules that satisfy the contract and belong to no robot."""
+    for name, functions in (
+        (_STUB_GRASP_GEOMETRY, GRASP_GEOMETRY_FUNCTIONS),
+        (_STUB_WRIST_GUARD, WRIST_GUARD_FUNCTIONS),
+    ):
+        module = ModuleType(name)
+        for function_name in functions:
+            setattr(module, function_name, lambda *args, **kwargs: None)
+        monkeypatch.setitem(sys.modules, name, module)
 
 
 @pytest.fixture
@@ -201,8 +218,15 @@ import manipulation_execution.placement_executor_node
 
 
 @pytest.mark.parametrize("backend", ["runtime", "legacy_moveit"])
-def test_node_initializes_without_status_discovery_and_preserves_legacy_workers(description, backend):
-    config = {"base_frame": "root", "ee_frame": "tool"}
+def test_node_initializes_without_status_discovery_and_preserves_legacy_workers(description, stub_providers, backend):
+    config = {
+        "base_frame": "root",
+        "ee_frame": "tool",
+        # Providers are declared by configuration only; the generic node keeps
+        # no robot default on either backend (D1).
+        "target_geometry": {"grasp_geometry_provider": _STUB_GRASP_GEOMETRY},
+        "target_gripper": {"ik_orientation_guard": {"wrist_guard_provider": _STUB_WRIST_GUARD}},
+    }
     if backend == "legacy_moveit":
         config["ik"] = {"worker_count": 2, "worker_namespace_prefix": "/legacy_worker"}
     parameters = {
@@ -218,13 +242,71 @@ def test_node_initializes_without_status_discovery_and_preserves_legacy_workers(
             parameter_overrides=[Parameter(name, value=value) for name, value in parameters.items()]
         )
         assert node._ik_worker_count == 2
+        # Configuration-declared providers load identically on both backends.
+        assert node._grasp_geometry.__name__ == _STUB_GRASP_GEOMETRY
+        assert node._wrist_guard.__name__ == _STUB_WRIST_GUARD
         if backend == "runtime":
-            assert node._grasp_geometry is node._wrist_guard is None
             assert node._ik_client.srv_name == "/custom/ik"
         else:
-            assert node._grasp_geometry.__name__ == "manipulation_execution.so101_geometry"
-            assert node._wrist_guard.__name__ == "manipulation_execution.so101_kinematics_guard"
             assert node._ik_worker_endpoints == ["/legacy_worker_0/compute_ik", "/legacy_worker_1/compute_ik"]
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["runtime", "legacy_moveit"])
+def test_legacy_backend_without_declared_providers_fails_fast(description, backend):
+    """A legacy_moveit config with the guard enabled and no provider fails like runtime."""
+    config = {
+        "base_frame": "root",
+        "ee_frame": "tool",
+        "target_gripper": {"ik_orientation_guard": {"enabled": True}},
+    }
+    if backend == "legacy_moveit":
+        config["ik"] = {"worker_count": 0, "worker_namespace_prefix": "/legacy_worker"}
+    parameters = {
+        "kinematics_backend": backend,
+        "interface_description_json": json.dumps(description) if backend == "runtime" else "{}",
+        "grasp_execution_json": json.dumps(config),
+        "arm_joint_names_json": '["elbow"]',
+    }
+    rclpy.init()
+    node = None
+    try:
+        with pytest.raises(ValueError, match="wrist_guard_provider is required"):
+            node = PickExecutorNode(
+                parameter_overrides=[Parameter(name, value=value) for name, value in parameters.items()]
+            )
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["runtime", "legacy_moveit"])
+def test_tabletop_filter_without_mesh_fields_fails_fast_on_both_backends(description, stub_providers, backend):
+    """tabletop_filter without mesh_package/mesh_directory names both fields, on every backend."""
+    config = {
+        "base_frame": "root",
+        "ee_frame": "tool",
+        "target_geometry": {"tabletop_filter": True, "grasp_geometry_provider": _STUB_GRASP_GEOMETRY},
+    }
+    if backend == "legacy_moveit":
+        config["ik"] = {"worker_count": 0, "worker_namespace_prefix": "/legacy_worker"}
+    parameters = {
+        "kinematics_backend": backend,
+        "interface_description_json": json.dumps(description) if backend == "runtime" else "{}",
+        "grasp_execution_json": json.dumps(config),
+        "arm_joint_names_json": '["elbow"]',
+    }
+    rclpy.init()
+    node = None
+    try:
+        with pytest.raises(ValueError, match="mesh_package and target_geometry.mesh_directory are required"):
+            node = PickExecutorNode(
+                parameter_overrides=[Parameter(name, value=value) for name, value in parameters.items()]
+            )
     finally:
         if node is not None:
             node.destroy_node()

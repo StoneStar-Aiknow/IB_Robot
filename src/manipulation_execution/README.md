@@ -185,9 +185,10 @@ Gateway 自行构造 delegated `PickObject` 请求。
 
 `pick_executor_node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
 `phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
-`pick_executor_models.py` 和 `pick_executor_helpers.py`。`pipeline_worker.py` 只提供与机器人无关的动态 worker
-队列；SO101 joint5 分支、归一化、闭合轴修正和 IK 重试集中在 `so101_kinematics_guard.py`，
-不混入通用 pipeline 工具。阶段 mixin 保留原有方法入口，便于隔离测试且不改变 action 行为。
+`pick_executor_models.py` 和 `pick_executor_helpers.py`。机器人特有的抓取几何（STL 网格、桌面间隙）与
+SO-101 joint5 分支/闭合轴守卫不在本包：它们由 robot YAML 声明的 provider 模块提供（见下文「Provider 声明」），
+节点对两种 kinematics backend 一视同仁地只从配置读取。阶段 mixin 保留原有方法入口，便于隔离测试且不改变
+action 行为。
 
 ## 公开接口
 
@@ -228,6 +229,34 @@ prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节�
 
 所有抓取运行参数来自 robot YAML 的 `robot.grasp_execution`。关键配置包括：
 
+- **Provider 声明（必填，按功能分开）**：节点对 `runtime` 和 `legacy_moveit` 两种 backend 一致，
+  不提供任何机器人默认值。两项功能各自声明各自的字段，互不连带：
+
+  - 方向守卫（joint-5 约束）需要 `target_gripper.ik_orientation_guard.wrist_guard_provider`；
+  - tabletop filter 需要 `target_geometry.grasp_geometry_provider`，外加网格位置字段
+    `mesh_package` 与 `mesh_directory`。
+
+  ```yaml
+  grasp_execution:
+    ik:
+      # 仅 providerless（legacy_moveit）且 auto-start worker 时需要
+      workers_launch: $(find so101_motion)/launch/ik_workers.launch.py
+    target_geometry:
+      grasp_geometry_provider: so101_suite.gripper_geometry
+      mesh_package: so101_description
+      mesh_directory: meshes/lerobot/so101
+    target_gripper:
+      ik_orientation_guard:
+        wrist_guard_provider: so101_suite.wrist_guard
+  ```
+
+  上例中的 `so101_suite.*` 模块名只是本机器人（SO-101）的示例：任何满足 provider 契约的
+  模块都可以。功能启用而对应字段缺失时，节点构造立即失败并点名缺失字段（fail fast），
+  不会以降级方式启动。
+  runtime backend 另外拒绝 `ik.group_name` / `ik.worker_count` / `ik.worker_namespace_prefix` /
+  `ik.auto_start_workers` 和任何与绑定公共接口不一致的 `ik_service` / `fk_service` /
+  `move_configuration_service` / `joint_state_topic` 覆写；worker 数量来自 runtime profile
+  （如 `lekiwi_robot` 的 `motion.ik_worker_count`）。
 - GraspGen、验证器、IK/FK 服务名。
 - 相机 topic 和 base/EE frame。
 - source gripper 到目标夹爪的几何适配。
@@ -235,7 +264,8 @@ prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节�
 - approach、速度、候选数量和物理执行重试次数；IK/FK 准备失败不消耗物理重试次数。
 - `ik.worker_count` 个隔离 MoveIt worker 从同一个动态队列准备候选；所有 worker 使用同一份
   `/joint_states` seed，空闲 worker 立即领取下一个候选，结果仍按原候选顺序合并，并在每次抓取前校验
-  主 MoveIt 与全部 worker 的 IK 解一致。
+  主 MoveIt 与全部 worker 的 IK 解一致。runtime backend 下该 worker 池来自 runtime profile 的
+  `motion.ik_worker_count` 与绑定的公共 IK 端点，不在 robot YAML 中重复声明。
 - `candidate_selection.selection_attempts` 控制整批候选无安全 IK 解或规划暂时失败时重新获取新帧并规划；
   `TARGET_NOT_VISIBLE`（目标未检测到、置信度不足或没有生成候选）和
   `TARGET_OUTSIDE_WORKSPACE`（目标可见但所有候选均超出工作范围）会立即报错，不继续规划；不可恢复的
@@ -460,8 +490,18 @@ source .shrc_local && source install/setup.bash && \
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q --import-mode=importlib src/manipulation_execution/test
 ```
 
-通用 worker 调度由 `test_pipeline_worker.py` 覆盖；SO101 joint5 运动学约束由
-`test_so101_kinematics_guard.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+SO101 joint5 运动学约束由 `so101_suite/test/test_wrist_guard.py` 覆盖；SO101 provider 是否满足本包契约由组装根
+`embodied_bringup/test/test_so101_provider_contract.py` 检查。本包不依赖任何机器人套件（含 test_depend），
+节点测试一律使用 fake/stub provider；通用网格/平面几何由
+`test_geometry.py`、`test_grasp_geometry.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+
+### Providerless 部署前置（手眼抓取配置）
+
+`lekiwi_handeye_realsense_grasp{,_pc}` 没有 `runtime.provider`，走 `legacy_moveit` 后端，但其
+`grasp_execution` 声明的 provider、网格与 worker launch 来自机器人套件包：部署这些配置时必须一并
+构建/安装 `so101_suite`（provider 模块）、`so101_description`（STL 网格）和 `so101_motion`
+（`ik_workers.launch.py`），例如 `./scripts/build.sh -- --packages-up-to embodied_bringup so101_suite
+so101_description so101_motion`。通用包不为此声明任何机器人依赖：缺失时节点构造按上文规则 fail fast。
 
 ### X2 前中半分辨率 JPEG
 

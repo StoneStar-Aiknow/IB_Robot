@@ -39,6 +39,31 @@
        decision 3). -->
   <test_depend>inference_service</test_depend>
   <test_depend>dataset_tools</test_depend>
+  <!-- Real-config grasp startup regression (openspec change
+       ``cleanup-manipulation-so101-providers`` D5): this is the only package
+       that may depend on robot_config, manipulation_execution and the robot
+       suites without a cycle. Test-only — the runtime import guard still
+       keeps the generic nodes robot-free. -->
+  <test_depend>manipulation_execution</test_depend>
+  <test_depend>inference_manifest</test_depend>
+  <!-- The D5 suite additionally imports robot_config (loader, binding,
+       runtime target), robot_runtime (description, profile) and rclpy
+       directly. -->
+  <test_depend>robot_config</test_depend>
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>rclpy</test_depend>
+  <!-- so101_suite provides the grasp geometry / wrist guard modules the
+       loaded YAMLs declare, and test_so101_provider_contract checks them
+       against the consumer's contract here so that neither package depends on
+       the other; so101_description the gripper meshes; -->
+  <test_depend>so101_suite</test_depend>
+  <test_depend>so101_description</test_depend>
+  <!-- so101_motion ships ik_workers.launch.py that the handeye configs'
+       grasp_execution.ik.workers_launch names; -->
+  <test_depend>so101_motion</test_depend>
+  <!-- lekiwi_robot ships the runtime profile the runtime-backed LeKiwi
+       grasp configs resolve. -->
+  <test_depend>lekiwi_robot</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

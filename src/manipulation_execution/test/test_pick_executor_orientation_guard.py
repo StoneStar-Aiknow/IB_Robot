@@ -4,9 +4,42 @@ import pytest
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 
-from manipulation_execution import so101_kinematics_guard as wrist_guard
 from manipulation_execution.grasp_geometry import euler_xyz_matrix, quaternion_from_matrix
 from manipulation_execution.pick_executor_node import IKPayload, PickExecutorNode, PickFlowError
+
+
+class _FakeWristGuard:
+    """Scripted wrist-guard provider that records how the node calls it.
+
+    These tests cover the generic node's use of a provider; the SO-101 joint-5
+    semantics belong to so101_suite/test/test_wrist_guard.py.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.closing_axis_correction = math.pi / 4.0
+        self.within_limit = True
+        self.branch_continuous = True
+
+    def joint5_closing_axis_correction(
+        self, target_quaternion, actual_quaternion, approach_axis_ee, closing_axis_ee, *, closing_axis_180_symmetric
+    ):
+        self.calls.append(
+            ("closing_axis_correction", list(approach_axis_ee), list(closing_axis_ee), closing_axis_180_symmetric)
+        )
+        return self.closing_axis_correction
+
+    def canonicalize_joint5(self, joint5, center=0.0):
+        self.calls.append(("canonicalize", joint5, center))
+        return joint5
+
+    def joint5_within_abs_limit(self, joint5, limit, *, center, epsilon):
+        self.calls.append(("within_abs_limit", joint5, limit, center, epsilon))
+        return self.within_limit
+
+    def joint5_branch_continuity_check(self, seed_joint5, solution_joint5, threshold):
+        self.calls.append(("branch_continuity", seed_joint5, solution_joint5, threshold))
+        return self.branch_continuous
 
 
 def _joint_state(joint5: float) -> JointState:
@@ -34,7 +67,7 @@ class _OrientationHarness:
 
     def __init__(self) -> None:
         self._home_joint_positions = {"5": 0.0}
-        self._wrist_guard = wrist_guard
+        self._wrist_guard = _FakeWristGuard()
         self._grasp_geometry = None
         self._target_geometry = {}
         self._config = {
@@ -96,6 +129,10 @@ def test_orientation_guard_reseeds_joint5_until_fk_axes_match():
     assert corrected_joint5 is not None
     assert math.isclose(corrected_joint5, math.pi / 4.0, abs_tol=1e-8)
     assert payload.closing_axis_error_deg == 0.0
+    assert harness._wrist_guard.calls == [
+        ("closing_axis_correction", [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], True),
+        ("canonicalize", math.pi / 4.0, 0.0),
+    ]
 
 
 def test_home_joint_positions_are_loaded_from_launch_json():
@@ -158,15 +195,16 @@ def _joint5_guard_harness(*, enabled: bool = True, stage_continuity: bool = True
     return harness
 
 
-@pytest.mark.parametrize("delta", [2.001, -2.001])
-def test_joint5_runtime_guard_accepts_home_plus_configured_limit_and_epsilon(delta: float):
+def test_joint5_runtime_guard_passes_home_center_limit_and_epsilon_to_the_provider():
     harness = _joint5_guard_harness()
 
-    assert harness._validate_joint5(_joint_state(0.4 + delta)) == pytest.approx(0.4 + delta)
+    assert harness._validate_joint5(_joint_state(2.401)) == pytest.approx(2.401)
+    assert harness._wrist_guard.calls == [("within_abs_limit", 2.401, 2.0, 0.4, 0.001)]
 
 
-def test_joint5_runtime_guard_rejects_values_beyond_home_limit_and_epsilon():
+def test_joint5_runtime_guard_rejects_what_the_provider_rejects():
     harness = _joint5_guard_harness()
+    harness._wrist_guard.within_limit = False
 
     with pytest.raises(PickFlowError) as exc_info:
         harness._validate_joint5(_joint_state(0.4 + 2.0011))
@@ -178,18 +216,22 @@ def test_joint5_runtime_guard_can_be_disabled_from_config():
     harness = _joint5_guard_harness(enabled=False)
 
     assert harness._validate_joint5(_joint_state(10.0)) is None
+    assert harness._wrist_guard.calls == []
 
 
 def test_joint5_stage_continuity_uses_independent_configured_threshold():
     harness = _joint5_guard_harness()
+    harness._wrist_guard.branch_continuous = False
 
     with pytest.raises(PickFlowError) as exc_info:
         harness._validate_joint5_branch_continuity(_joint_state(0.4), _joint_state(0.66))
 
     assert exc_info.value.code == "IK_JOINT5_BRANCH_CHANGED"
+    assert harness._wrist_guard.calls == [("branch_continuity", 0.4, 0.66, 0.25)]
 
 
 def test_joint5_stage_continuity_can_be_disabled_independently():
     harness = _joint5_guard_harness(stage_continuity=False)
 
     harness._validate_joint5_branch_continuity(_joint_state(0.4), _joint_state(2.4))
+    assert harness._wrist_guard.calls == []

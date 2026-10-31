@@ -171,9 +171,8 @@ class PickExecutorNode(
         wrist_guard_provider = (
             self._config.get("target_gripper", {}).get("ik_orientation_guard", {}).get("wrist_guard_provider")
         )
-        if self._kinematics_backend == "legacy_moveit":
-            grasp_geometry_provider = grasp_geometry_provider or "manipulation_execution.so101_geometry"
-            wrist_guard_provider = wrist_guard_provider or "manipulation_execution.so101_kinematics_guard"
+        # Providers come from configuration only, identically for both
+        # kinematics backends: the generic pipeline carries no robot default.
         self._grasp_geometry = load_provider(
             "target_geometry.grasp_geometry_provider",
             grasp_geometry_provider,
@@ -187,11 +186,8 @@ class PickExecutorNode(
         self._validate_provider_requirements()
         self._mesh_directory: Path | None = None
         if bool(self._target_geometry.get("tabletop_filter", False)):
-            legacy = self._kinematics_backend == "legacy_moveit"
-            mesh_package = str(self._target_geometry.get("mesh_package", "so101_description" if legacy else "") or "")
-            mesh_subdirectory = str(
-                self._target_geometry.get("mesh_directory", "meshes/lerobot/so101" if legacy else "") or ""
-            )
+            mesh_package = str(self._target_geometry.get("mesh_package", "") or "")
+            mesh_subdirectory = str(self._target_geometry.get("mesh_directory", "") or "")
             if not mesh_package or not mesh_subdirectory:
                 raise ValueError(
                     "target_geometry.mesh_package and target_geometry.mesh_directory are required when "

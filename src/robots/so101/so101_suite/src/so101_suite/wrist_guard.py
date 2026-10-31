@@ -17,8 +17,17 @@ Quaternion = tuple[float, float, float, float]
 
 
 def _quaternion_matrix(q: Quaternion) -> np.ndarray:
-    """Build a 3x3 rotation matrix from a quaternion [x, y, z, w]."""
-    x, y, z, w = q
+    """Build a 3x3 rotation matrix from a quaternion [x, y, z, w].
+
+    Normalises the input and rejects a zero quaternion, matching the deleted
+    legacy guard's semantics: a scaled quaternion describes the same rotation,
+    a zero quaternion none at all.
+    """
+    x, y, z, w = (float(value) for value in q)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-9:
+        raise ValueError("quaternion must be non-zero")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
     return np.array(
         [
             [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w],

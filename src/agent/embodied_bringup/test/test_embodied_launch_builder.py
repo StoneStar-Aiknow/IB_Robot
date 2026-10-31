@@ -1306,34 +1306,6 @@ def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
 
 
-def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(tmp_path):
-    module = _load_launch_module()
-    workers_launch = tmp_path / "ik_workers.launch.py"
-    workers_launch.write_text("")
-    config = {
-        "moveit": {"joint_state_topic": "/arm_joint_state_broadcaster/joint_states"},
-        "grasp_execution": {
-            "enabled": True,
-            "auto_start_dependencies": True,
-            "ik": {
-                "worker_count": 4,
-                "worker_namespace_prefix": "/ik_worker",
-                "auto_start_workers": True,
-                "workers_launch": str(workers_launch),
-            },
-        },
-    }
-
-    action = module._parallel_ik_worker_action(config, "false")
-
-    assert action is not None
-    assert action.__class__.__name__ == "IncludeLaunchDescription"
-    arguments = dict(action._IncludeLaunchDescription__launch_arguments)
-    assert arguments["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
-    config["runtime"] = {"provider": "so101_robot"}
-    assert module._parallel_ik_worker_action(config, "false") is None
-
-
 def test_providerless_ik_workers_require_an_explicit_suite_launch(tmp_path):
     module = _load_launch_module()
     config = {
