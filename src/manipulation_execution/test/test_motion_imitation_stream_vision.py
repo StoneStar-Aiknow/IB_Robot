@@ -22,14 +22,14 @@ import pytest
 from sensor_msgs.msg import CompressedImage, Image
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from manipulation_execution.actor_selector import ActorSelector
-from manipulation_execution.hri_vision import (
+from manipulation_execution.hri.actor_selector import ActorSelector
+from manipulation_execution.hri.stream.node import MotionImitationStreamNode
+from manipulation_execution.hri.vision import (
     PEAR_CROP_EXPANSION,
     PEAR_FIELD_LENGTHS,
     PEAR_OUTPUT_FIELDS,
     put_latest,
 )
-from manipulation_execution.motion_imitation_stream_node import MotionImitationStreamNode
 
 
 class _Logger:
@@ -202,7 +202,7 @@ def _harness(*, yolox=(), pear=(), yolox_ready=True, pear_ready=True, publish_fa
 
 
 def _status_harness(monkeypatch, *, publishers, frames, last_frame_at):
-    monkeypatch.setattr("manipulation_execution.motion_imitation_stream_node.time.monotonic", lambda: 20.0)
+    monkeypatch.setattr("manipulation_execution.hri.stream.node.time.monotonic", lambda: 20.0)
     harness = _harness()
     harness._frame_source_interface = ""
     harness._require_unique_publisher = True
@@ -430,7 +430,7 @@ def test_timestamp_restart_clears_old_detection_and_waits_for_fresh_yolox(monkey
     harness._last_encoded_at = 10.0
     harness._received = harness._window_received = harness._out_of_order = harness._compressed_dropped = 0
     generation = harness._source_generation
-    monkeypatch.setattr("manipulation_execution.motion_imitation_stream_node.time.monotonic", lambda: 20.0)
+    monkeypatch.setattr("manipulation_execution.hri.stream.node.time.monotonic", lambda: 20.0)
     message = CompressedImage()
     message.header.stamp.sec = 1
     harness._on_compressed_frame(message)

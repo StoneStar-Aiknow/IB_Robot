@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import (
+from manipulation_execution.pick.pipeline.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,

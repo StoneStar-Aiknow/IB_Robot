@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import (
+from manipulation_execution.pick.pipeline.contracts import (
     Flag,
     GraspBackends,
     GraspFailure,
@@ -34,8 +34,8 @@ from manipulation_execution.grasp_pipeline.contracts import (
     Observation,
     Proposals,
 )
-from manipulation_execution.grasp_pipeline.perception import PerceptionServices
-from manipulation_execution.grasp_pipeline.streaming import received_at_or_stale
+from manipulation_execution.pick.pipeline.perception import PerceptionServices
+from manipulation_execution.pick.pipeline.streaming import received_at_or_stale
 
 from . import head_wire as wire
 from .backend import WARMUP_BUDGET_S, arm_and_hand, watch_timeouts, x2_robot

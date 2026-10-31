@@ -28,7 +28,7 @@ from test_observation import OPEN  # noqa: E402
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster  # noqa: E402
 
 from ibrobot_msgs.msg import RuntimeStatus  # noqa: E402
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import GraspFailure  # noqa: E402
 from robot_config.contract_utils import qos_profile_from_dict  # noqa: E402
 from robot_runtime.interface_description import build_description  # noqa: E402
 from robot_runtime.profile import load_profile  # noqa: E402

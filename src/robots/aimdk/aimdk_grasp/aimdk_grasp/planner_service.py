@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.candidates import (
+from manipulation_execution.pick.pipeline.candidates import (
     MIN_ENCLOSED_POINTS,
     approach_priority,
     enclosed_points,

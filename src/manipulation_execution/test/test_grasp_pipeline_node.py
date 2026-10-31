@@ -17,10 +17,10 @@ from test_grasp_pipeline import Effector, Executor, Proposer, Source, StreamingP
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity
 from ibrobot_msgs.action import PickObject
-from manipulation_execution.grasp_pipeline.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
-from manipulation_execution.grasp_pipeline.pipeline import PickOutcome
-from manipulation_execution.grasp_pipeline_node import GraspPipelineNode, pipeline_config, verification_status
-from manipulation_execution.pick_goal import pick_goal_rejection, remaining_budget_s
+from manipulation_execution.pick.goal import pick_goal_rejection, remaining_budget_s
+from manipulation_execution.pick.pipeline.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
+from manipulation_execution.pick.pipeline.pipeline import PickOutcome
+from manipulation_execution.pick.pipeline_node import GraspPipelineNode, pipeline_config, verification_status
 
 ACTION = "/test/grasp_pipeline/execute_pick"
 FACTORY_CALLS = []
@@ -241,7 +241,7 @@ def test_a_robot_that_always_puts_back_does_so_unasked(ros):
 
 
 def test_goals_are_refused_until_the_backends_are_warm(ros, monkeypatch):
-    monkeypatch.setattr("manipulation_execution.grasp_pipeline_node.PREPARE_RETRY_S", 0.05)
+    monkeypatch.setattr("manipulation_execution.pick.pipeline_node.PREPARE_RETRY_S", 0.05)
     WARMUP["ready"].clear()
     WARMUP["attempts"] = 0
     config = configuration(backend=f"{__name__}:make_warming_backends")

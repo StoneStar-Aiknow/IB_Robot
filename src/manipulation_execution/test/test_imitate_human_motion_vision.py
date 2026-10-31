@@ -6,15 +6,15 @@ from types import SimpleNamespace
 import pytest
 from sensor_msgs.msg import Image
 
-import manipulation_execution.imitate_human_motion_executor_node as vision_module  # noqa: F401
+import manipulation_execution.hri.imitate.node as vision_module  # noqa: F401
 from ibrobot_msgs.msg import Detection2D, DetectionArray, DispatchBinding
-from manipulation_execution.imitate_human_motion_executor import (
+from manipulation_execution.hri.imitate.executor import (
     MAX_IMITATION_DURATION_SEC,
     ImitationExecutor,
     ImitationGoal,
     ImitationResult,
 )
-from manipulation_execution.imitate_human_motion_executor_node import (
+from manipulation_execution.hri.imitate.node import (
     _MAX_CAPTURED_PEAR_FRAMES,
     ImitateHumanMotionExecutorNode,
     _center_fallback_detection,

@@ -12,8 +12,8 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import pytest
 
-from manipulation_execution.grasp_pipeline.backends import BackendLoadError, backend_spec, load_backends
-from manipulation_execution.grasp_pipeline.contracts import (
+from manipulation_execution.pick.pipeline.backends import BackendLoadError, backend_spec, load_backends
+from manipulation_execution.pick.pipeline.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,
@@ -29,7 +29,7 @@ from manipulation_execution.grasp_pipeline.contracts import (
     Proposals,
     SegmentKind,
 )
-from manipulation_execution.grasp_pipeline.pipeline import GraspPipeline, PickMode, PipelineConfig
+from manipulation_execution.pick.pipeline.pipeline import GraspPipeline, PickMode, PipelineConfig
 
 JOINTS = tuple(f"j{i}" for i in range(3))
 HOME = np.zeros(3)

@@ -45,7 +45,7 @@ from rclpy.parameter import Parameter
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
 from inference_manifest import BundleFile, canonical_bundle_digest
-from manipulation_execution.pick_executor_node import PickExecutorNode
+from manipulation_execution.pick.node import PickExecutorNode
 from robot_config.interface_binding import bind_robot_interfaces
 from robot_config.launch_builders.embodied import embodied_config_overrides_hook
 from robot_config.loader import _load_robot_section, load_robot_config_dict

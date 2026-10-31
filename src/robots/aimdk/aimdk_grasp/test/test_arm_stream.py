@@ -12,8 +12,8 @@ from aimdk_grasp.joints import HEAD, LEFT_ARM, RIGHT_ARM
 from aimdk_grasp.planning_model import BODY_URDF, description_share
 from aimdk_grasp.robot_model import arm_limits
 
-from manipulation_execution.grasp_pipeline.contracts import ArmSegment, MotionState, SegmentKind
-from manipulation_execution.grasp_pipeline.streaming import CommandSample, JointSample, StreamExecutor
+from manipulation_execution.pick.pipeline.contracts import ArmSegment, MotionState, SegmentKind
+from manipulation_execution.pick.pipeline.streaming import CommandSample, JointSample, StreamExecutor
 
 START = np.array([-0.3, 0.3, 0.0, -1.2, 0.0, 0.0, 0.0])
 APPROACH = START + np.array([-0.6, 0.1, 0.1, 0.6, 0.1, 0.05, 0.1])

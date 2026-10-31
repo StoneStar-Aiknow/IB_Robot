@@ -1,4 +1,4 @@
-"""Launch wiring for the X2 mirror session (``manipulation_execution.mirror_session_node``).
+"""Launch wiring for the X2 mirror session (``manipulation_execution.hri.mirror_session.node``).
 
 This module is ``manipulation_execution``'s contribution to the launch-builder
 registry (openspec change ``decentralize-launch-builder-registration``, design

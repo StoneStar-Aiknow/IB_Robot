@@ -10,7 +10,7 @@ from sensor_msgs.msg import Image, JointState
 from ibrobot_msgs.action import PlaceObject
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from ibrobot_msgs.srv import GroundingDetect, SegmentDetections
-from manipulation_execution.placement_executor_node import (
+from manipulation_execution.place.node import (
     PlacementExecutorNode,
     PlacementFlowError,
     PlacementState,
@@ -20,7 +20,7 @@ from manipulation_execution.placement_executor_node import (
     evaluate_mask_arrays,
     evaluate_mask_containment,
 )
-from manipulation_execution.placement_replay import audit_placement_evidence
+from manipulation_execution.place.replay import audit_placement_evidence
 
 
 def _mask(array: np.ndarray) -> Image:
@@ -198,7 +198,7 @@ def test_target_exclusion_mask_is_cached_per_frame_shape(monkeypatch):
         calls.append((path, shape))
         return expected
 
-    monkeypatch.setattr("manipulation_execution.placement_executor_node._load_exclusion_mask", load_mask)
+    monkeypatch.setattr("manipulation_execution.place.node._load_exclusion_mask", load_mask)
 
     first = node._target_exclusion_mask(image)
     second = node._target_exclusion_mask(image)

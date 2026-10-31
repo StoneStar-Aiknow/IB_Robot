@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from sensor_msgs.msg import CompressedImage
 
-from manipulation_execution.frame_decoder import create_frame_decoder
+from manipulation_execution.hri.frame_decoder import create_frame_decoder
 
 
 @pytest.mark.parametrize("name", ["auto", "dvpp"])

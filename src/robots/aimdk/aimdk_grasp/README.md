@@ -179,7 +179,7 @@ pose the screen IK reaches, a clear grasp line, an open hand that stays 1 cm off
 target along the line, the palm not facing the robot's left, and a confidence of at
 least 0.7. Candidates are only ever moved back, never dropped, except for those coming
 down onto a tall object from above. The approach preference by target height and the
-enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
+enclosure check are `manipulation_execution.pick.pipeline.candidates`, shared by every
 robot.
 
 To study planning offline, start the grasp head with `IBROBOT_X2_PLAN_INPUTS_DIR` naming

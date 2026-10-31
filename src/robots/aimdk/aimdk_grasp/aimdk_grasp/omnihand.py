@@ -25,8 +25,8 @@ from typing import Protocol
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, Flag
-from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
+from manipulation_execution.pick.pipeline.contracts import EffectorAction, EffectorOutcome, Flag
+from manipulation_execution.pick.pipeline.streaming import JointSample, received_at_or_stale
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
 from .joints import LEFT_HAND
@@ -315,7 +315,7 @@ class RosHandIO:
     def __init__(self, node, description: Mapping):
         from std_msgs.msg import Float64MultiArray
 
-        from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
+        from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
         from robot_config.contract_utils import qos_profile_from_dict
         from robot_runtime.on_demand import OnDemandSubscriptions
 

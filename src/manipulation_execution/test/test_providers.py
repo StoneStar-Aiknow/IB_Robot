@@ -3,7 +3,7 @@ from types import ModuleType
 
 import pytest
 
-from manipulation_execution.providers import (
+from manipulation_execution.pick.providers import (
     GRASP_GEOMETRY_FUNCTIONS,
     WRIST_GUARD_FUNCTIONS,
     load_provider,

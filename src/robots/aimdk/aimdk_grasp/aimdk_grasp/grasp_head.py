@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rclpy.node import Node
 
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure, GraspPlan, Observation, Proposals
+from manipulation_execution.pick.pipeline.contracts import GraspFailure, GraspPlan, Observation, Proposals
 
 from . import head_wire as wire
 from .backend import WARMUP_BUDGET_S, head_parts, x2_robot

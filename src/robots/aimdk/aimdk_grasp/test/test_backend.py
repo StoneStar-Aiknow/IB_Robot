@@ -130,7 +130,7 @@ def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup()
     from aimdk_grasp.omnihand import OmniHandEffector
     from aimdk_grasp.proposer import X2Proposer
 
-    from manipulation_execution.grasp_pipeline.streaming import StreamExecutor
+    from manipulation_execution.pick.pipeline.streaming import StreamExecutor
     from robot_runtime.interface_description import build_description
     from robot_runtime.profile import load_profile
 

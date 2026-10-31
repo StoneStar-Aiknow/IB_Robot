@@ -3,7 +3,7 @@ from builtin_interfaces.msg import Time as TimeMsg
 from geometry_msgs.msg import TransformStamped
 
 from manipulation_execution.grasp_geometry import prepared_candidate_soft_score
-from manipulation_execution.pick_executor_node import PickExecutorNode
+from manipulation_execution.pick.node import PickExecutorNode
 
 
 class _RecordingBuffer:

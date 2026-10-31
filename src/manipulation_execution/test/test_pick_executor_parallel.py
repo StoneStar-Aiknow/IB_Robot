@@ -7,7 +7,7 @@ import pytest
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
+from manipulation_execution.pick.node import PickExecutorNode, PickFlowError
 
 
 class _Logger:

@@ -15,8 +15,8 @@ from sensor_msgs.msg import Image
 
 from ibrobot_msgs.msg import Detection2D, GraspCandidate
 from ibrobot_msgs.srv import GenerateGrasps, GroundingDetect, SegmentDetections
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure
-from manipulation_execution.grasp_pipeline.perception import Detection, PerceptionServices, image_mask
+from manipulation_execution.pick.pipeline.contracts import GraspFailure
+from manipulation_execution.pick.pipeline.perception import Detection, PerceptionServices, image_mask
 
 H, W = 6, 8
 RGB = np.arange(H * W * 3, dtype=np.uint8).reshape(H, W, 3)

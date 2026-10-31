@@ -13,8 +13,8 @@ from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.srv import ComputeFk, ComputeIk
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
-from manipulation_execution.providers import GRASP_GEOMETRY_FUNCTIONS, WRIST_GUARD_FUNCTIONS
+from manipulation_execution.pick.node import PickExecutorNode, PickFlowError
+from manipulation_execution.pick.providers import GRASP_GEOMETRY_FUNCTIONS, WRIST_GUARD_FUNCTIONS
 from robot_runtime.interface_description import build_description, description_digest
 from robot_runtime.model_metadata import joint_conversions_fingerprint
 
@@ -207,10 +207,10 @@ class RejectRobotImports:
         if fullname.startswith(('moveit_msgs', 'so101_suite', 'manipulation_execution.so101_')):
             raise AssertionError('unexpected generic import: ' + fullname)
 sys.meta_path.insert(0, RejectRobotImports())
-import manipulation_execution.pick_executor_node
-import manipulation_execution.imitate_human_motion_executor
-import manipulation_execution.imitate_human_motion_executor_node
-import manipulation_execution.placement_executor_node
+import manipulation_execution.pick.node
+import manipulation_execution.hri.imitate.executor
+import manipulation_execution.hri.imitate.node
+import manipulation_execution.place.node
 """,
         ],
         check=True,

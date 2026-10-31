@@ -273,7 +273,7 @@ vendoring 清单（Q1 + Q2 共同要求）：
 | `inference_service/pipeline_policy_node.py` | `joint_groups["all"]` | 只关心 `all`，不关心怎么分组 |
 | `task_dispatch/task_executor_node.py` | `joint_groups["gripper"]` | **"exactly one joint required"** |
 | `robot_teleop/public_target.py`、`so101_robot/teleoperation.py` | 一个 arm 组 + 一个 gripper | 单臂单夹爪 |
-| `manipulation_execution/pick_executor_node.py` | `joint_groups["arm"]` | |
+| `manipulation_execution/pick/node.py` | `joint_groups["arm"]` | |
 | `joint_conversion.py` | `gripper` 成员 | 仅改归一化区间：gripper → `0..100`，其余 → `-100..100` |
 
 注意最后一行：**`gripper` 成员身份在数值上只影响归一化区间**，并不强制"一个开度值"。
@@ -343,7 +343,7 @@ G1 应预期同样的修订）：
    `arm + gripper + base` 恰好**划分** `all`；腰不进 `arm` 组 ⇒ 腰无法出现在 `all` 里 ⇒
    带腰的模型拿不到腰的归一化参数。改为"三组互不相交，且都是 `all` 的子集"（约 3 行 + 测试）。
    已核对的消费者——`interface_binding`、`robot_teleop/public_target`、`so101_robot/teleoperation`、
-   `task_executor_node`、`pick_executor_node`、`dataset_tools/bag_to_lerobot`——都只按组名取组，
+   `task_executor_node`、`pick/node.py`（pick_executor_node）、`dataset_tools/bag_to_lerobot`——都只按组名取组，
    不依赖"`all` 恰好等于三组之和"；SO-101 / LeKiwi / X2 仍满足原划分，行为不变。不动 JSON schema。
 2. **归一化保持机器人关节顺序（Q8，已定）**。`pipeline_policy_node.py:738` 按 `joint_groups["all"]`
    建换算表，在 `_rad_to_lerobot` / `_lerobot_to_rad` 中按下标作用于状态/动作向量。不改。

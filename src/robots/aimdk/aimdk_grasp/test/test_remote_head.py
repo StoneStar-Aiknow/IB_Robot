@@ -37,7 +37,7 @@ from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
 
-from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import (  # noqa: E402
     ArmSegment,
     Effect,
     EffectorAction,

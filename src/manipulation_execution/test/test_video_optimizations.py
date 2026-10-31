@@ -9,8 +9,12 @@ import pytest
 from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import CompressedImage, Image
 
-from manipulation_execution.compressed_image_decode import CompressedImageDecoder, byte_array, decode_compressed_bgr8
-from manipulation_execution.motion_imitation_stream_node import MotionImitationStreamNode
+from manipulation_execution.hri.compressed_image_decode import (
+    CompressedImageDecoder,
+    byte_array,
+    decode_compressed_bgr8,
+)
+from manipulation_execution.hri.stream.node import MotionImitationStreamNode
 from observation_transport.video_codec import CodecLifecycleState, VideoFrame
 
 
@@ -105,7 +109,7 @@ def test_auto_preserves_png_cpu_decode_and_refuses_depth():
 
 def test_callback_drops_before_decode_and_rejects_old_capture_timestamps(monkeypatch):
     clock = [10.0]
-    monkeypatch.setattr("manipulation_execution.motion_imitation_stream_node.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("manipulation_execution.hri.stream.node.time.monotonic", lambda: clock[0])
     harness = SimpleNamespace(
         _source_available=lambda: True,
         _stats_lock=threading.RLock(),

@@ -23,9 +23,9 @@ from aimdk_grasp.omnihand import (
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS, RELEASE
 
-from manipulation_execution.grasp_pipeline.contracts import EffectorAction
-from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
-from manipulation_execution.grasp_pipeline.streaming import JointSample
+from manipulation_execution.pick.pipeline.contracts import EffectorAction
+from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
+from manipulation_execution.pick.pipeline.streaming import JointSample
 from robot_runtime.interface_description import build_description
 from robot_runtime.profile import load_profile
 

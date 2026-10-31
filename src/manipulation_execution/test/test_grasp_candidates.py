@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from manipulation_execution.grasp_pipeline import candidates
-from manipulation_execution.grasp_pipeline.candidates import approach_priority, enclosed_points, sweep_boxes
+from manipulation_execution.pick.pipeline import candidates
+from manipulation_execution.pick.pipeline.candidates import approach_priority, enclosed_points, sweep_boxes
 
 #: The deployed OmniHand gripper description's closing sweep (models/graspgenx_omnihand_left_x2,
 #: assets/x_grippers/omnihand_left_x2/config.json), copied so the test needs no model bundle.

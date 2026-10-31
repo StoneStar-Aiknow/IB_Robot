@@ -6,7 +6,7 @@ from rclpy.clock import Clock
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity, new_binding
 from ibrobot_msgs.action import PickObject
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
+from manipulation_execution.pick.node import PickExecutorNode, PickFlowError
 
 
 class _PrimitiveClient:

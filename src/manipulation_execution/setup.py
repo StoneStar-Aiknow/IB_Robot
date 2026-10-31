@@ -25,16 +25,16 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "pick_action_client = manipulation_execution.pick_action_client:main",
-            "pick_executor_node = manipulation_execution.pick_executor_node:main",
-            "grasp_pipeline_node = manipulation_execution.grasp_pipeline_node:main",
-            "place_executor_node = manipulation_execution.placement_executor_node:main",
-            "imitate_human_motion_executor_node = manipulation_execution.imitate_human_motion_executor_node:main",
-            "motion_imitation_stream_node = manipulation_execution.motion_imitation_stream_node:main",
-            "motion_imitation_mock_node = manipulation_execution.motion_imitation_mock_node:main",
-            "mirror_session_node = manipulation_execution.mirror_session_node:main",
-            "mirror_session_release = manipulation_execution.mirror_session_node:release_main",
-            "placement_replay = manipulation_execution.placement_replay:main",
+            "pick_action_client = manipulation_execution.pick.action_client:main",
+            "pick_executor_node = manipulation_execution.pick.node:main",
+            "grasp_pipeline_node = manipulation_execution.pick.pipeline_node:main",
+            "place_executor_node = manipulation_execution.place.node:main",
+            "imitate_human_motion_executor_node = manipulation_execution.hri.imitate.node:main",
+            "motion_imitation_stream_node = manipulation_execution.hri.stream.node:main",
+            "motion_imitation_mock_node = manipulation_execution.hri.stream.mock_node:main",
+            "mirror_session_node = manipulation_execution.hri.mirror_session.node:main",
+            "mirror_session_release = manipulation_execution.hri.mirror_session.node:release_main",
+            "placement_replay = manipulation_execution.place.replay:main",
         ],
         # Cross-package launch-builder registration (openspec change
         # ``decentralize-launch-builder-registration``, design decision 4):

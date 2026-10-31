@@ -15,9 +15,9 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
 from ibrobot_msgs.msg import JointCommandState, RuntimeStatus
-from manipulation_execution.grasp_pipeline.contracts import ArmSegment, MotionState, SegmentKind
-from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, StreamBindingError, bind_stream
-from manipulation_execution.grasp_pipeline.streaming import StreamConfig, StreamExecutor
+from manipulation_execution.pick.pipeline.contracts import ArmSegment, MotionState, SegmentKind
+from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, StreamBindingError, bind_stream
+from manipulation_execution.pick.pipeline.streaming import StreamConfig, StreamExecutor
 
 ARM = ("left_a", "left_b", "right_a")
 QOS = {"reliability": "reliable", "durability": "volatile", "history": "keep_last", "depth": 10}

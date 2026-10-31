@@ -3,7 +3,7 @@ from typing import Any, cast
 
 import pytest
 
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
+from manipulation_execution.pick.node import PickExecutorNode, PickFlowError
 
 
 def _prepared_candidate():

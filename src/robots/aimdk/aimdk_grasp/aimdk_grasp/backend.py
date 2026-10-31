@@ -39,8 +39,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from manipulation_execution.grasp_pipeline.contracts import GraspBackends, GraspFailure
-from manipulation_execution.grasp_pipeline.perception import PerceptionServices
+from manipulation_execution.pick.pipeline.contracts import GraspBackends, GraspFailure
+from manipulation_execution.pick.pipeline.perception import PerceptionServices
 
 from .execution_watch import MAX_TIMEOUT_S, WatchTimeouts, finite_seconds
 from .feedback import FeedbackHistory
@@ -291,7 +291,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
 
 def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: list):
     """The left arm's streaming executor and the OmniHand effector over the runtime's streams."""
-    from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
+    from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
 
     from .arm_stream import x2_arm_executor
     from .omnihand import OmniHandEffector, RosHandIO
