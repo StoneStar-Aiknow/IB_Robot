@@ -335,6 +335,23 @@ class FailingWatch(Watch):
         return "no watch status for 1.2 s" if self.polls >= self.fail_at else None
 
 
+class CloseBarrierWatch(Watch):
+    """Records a close barrier fault; stop surfaces it, log only keeps observing."""
+
+    def __init__(self, executor, mode):
+        super().__init__(executor)
+        self.mode, self.fault = mode, None
+
+    def phase(self, name, event):
+        super().phase(name, event)
+        if (name, event) == ("close", "start"):
+            self.fault = "the grasp head did not close its dispatch gate"
+
+    def failed(self):
+        assert self.armed
+        return self.fault if self.mode == "stop" else None
+
+
 def failing(fail_at):
     backends, executor, effector, planner, _ = streaming()
     watch = FailingWatch(executor, fail_at)
@@ -360,6 +377,25 @@ def test_a_watch_that_fails_during_the_close_keeps_the_hand_as_it_is():
     assert outcome.error_code == "WATCH_FAILED" and "during close" in outcome.message
     assert effector.log == [EffectorAction.PRESHAPE, EffectorAction.CLOSE]  # no release
     assert names(executor) == ["approach", "grasp"] and len(executor.stopped) == 1
+
+
+@pytest.mark.parametrize("mode", ["stop", "log"])
+def test_a_close_barrier_failure_stops_in_place_only_in_stop_mode(mode):
+    backends, executor, effector, _, _ = streaming()
+    watch = CloseBarrierWatch(executor, mode)
+    backends = replace(backends, watch=watch)
+    effector.halt_close = True
+
+    outcome = run(backends)
+
+    assert effector.log == [EffectorAction.PRESHAPE, EffectorAction.CLOSE]
+    if mode == "stop":
+        assert not outcome.success and outcome.error_code == "WATCH_FAILED"
+        assert "during close: the grasp head did not close its dispatch gate" in outcome.message
+        assert names(executor) == ["approach", "grasp"] and len(executor.stopped) == 1
+        assert "retreats" not in outcome.report and EffectorAction.RELEASE not in effector.log
+    else:
+        assert outcome.success and names(executor) == ["approach", "grasp", "lift", "hold"]
 
 
 def test_a_watch_failure_is_not_asked_once_the_object_is_held():

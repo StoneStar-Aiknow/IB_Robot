@@ -118,8 +118,11 @@ def test_invalid_configuration_and_mask_are_rejected():
         target_change(rgb, depth, rgb, depth, NONE, NONE, NONE)
 
 
-def watcher_inputs(frames, phases):
-    """A planned request and a capture() that returns the given frames, phases advancing per capture."""
+def watcher_inputs(frames, phases, received=lambda: 0.0):
+    """A planned request and a capture() that returns the given frames, phases advancing per capture.
+
+    ``received()`` stamps each frame's arrival (``received_at``).
+    """
     from types import SimpleNamespace
 
     rgb, depth, mask = scene()
@@ -140,7 +143,7 @@ def watcher_inputs(frames, phases):
                 frame=SimpleNamespace(rgb=frame_rgb, depth=frame_depth, intrinsics=K),
                 transform=SimpleNamespace(base_from_camera=np.eye(4), stamp_ns=11 + index),
                 image_feedback=feedback,
-                received_at=0.0,
+                received_at=received(),
             )
         )
 
@@ -281,9 +284,24 @@ def test_execution_watcher_waits_for_the_first_segment_and_records_its_own_failu
     def broken():
         raise RuntimeError("capture service down")
 
-    watcher = ExecutionWatcher(request, broken, far_spheres, lambda: "approach")
+    # A capture that fails is a missed frame: the watch goes on (its owner judges how long frames stay away).
+    watcher = ExecutionWatcher(request, broken, far_spheres, lambda: "approach", period_s=0.02).start()
+    time.sleep(0.15)
+    assert watcher.running and watcher.error is None
+    watcher.stop()
+    assert watcher.records and all(
+        r["skipped"] == "capture failed: RuntimeError: capture service down" for r in watcher.records
+    )
+    assert watcher.fresh_frames == 0 and watcher.last_skip.startswith("capture failed")
+
+    def unmeasurable(feedback):
+        raise RuntimeError("no sphere model")
+
+    # A comparison that fails ends the watch and says why.
+    watcher = ExecutionWatcher(request, capture, far_spheres, lambda: "approach")
+    watcher.spheres = unmeasurable
     watcher._run()
-    assert watcher.error == "RuntimeError: capture service down" and not watcher.report()["moved"]
+    assert watcher.error == "RuntimeError: no sphere model" and not watcher.report()["moved"]
 
 
 def test_orientation_buffer_interpolates_between_close_samples_only():

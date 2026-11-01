@@ -471,6 +471,9 @@ class TargetWatch:
 
 
 WATCHED_PHASES = ("approach", "grasp")
+#: From these on the hand is meant to touch the target, so a late verdict from an
+#: earlier frame is no longer acted on (see ``_notify_if_moved``).
+CLOSING_PHASES = ("close", "lift", "hold_lifted")
 
 
 class ExecutionWatcher:
@@ -493,6 +496,16 @@ class ExecutionWatcher:
     search (shift_px) is too small for the grasp segment: live 2026-10-13 the
     image drifted 16-21 px as the hand reached the bottle, and 3 of 6 still
     grasp runs recorded without an IMU read moved there.
+
+    What the watch makes of its frames is kept for whoever asks how it is
+    doing (execution_watch): ``fresh_frames`` counts the newer images taken
+    while a watched phase ran, compared or not, ``last_fresh_at`` and
+    ``last_still_at`` (on ``clock``) are when the newest of them, and the
+    newest that read still, were captured, and ``last_vote`` / ``last_skip``
+    say what the newest frame was. A capture that fails, an image no newer
+    than the last one and one older than ``max_image_age_s`` (on
+    ``source_clock``) are skipped and do not count as fresh; only an error
+    in the comparison itself ends the watch (``error``).
     """
 
     def __init__(
@@ -511,9 +524,11 @@ class ExecutionWatcher:
         orientation=None,
         require_orientation=False,
         source_clock=None,
+        max_image_age_s=float("inf"),
     ):
         """``source_clock``: the clock observations are stamped on (``received_at``), when it is not ``clock``."""
         self.request = request
+        self.max_image_age_s = max_image_age_s
         self.capture, self.spheres, self.phase = capture, spheres, phase
         self.config, self.on_moved, self.period_s = config, on_moved, period_s
         self.clock = clock
@@ -552,6 +567,9 @@ class ExecutionWatcher:
             )
         self.error = None
         self.notified = None
+        self.fresh_frames, self.last_fresh_at, self.last_still_at = 0, None, None
+        self.last_vote, self.last_skip = None, ""
+        self.last_image_stamp_ns = 0
         self._last_stamp = request.transform.stamp_ns
         self._started = self.clock()
         self._stop = threading.Event()
@@ -602,7 +620,12 @@ class ExecutionWatcher:
 
     def _observe(self, phase):
         began = self.clock()
-        observation = self.capture().observation
+        try:
+            observation = self.capture().observation
+        except Exception as exc:  # noqa: BLE001 - a missed frame; the frame timeout judges a lasting one
+            self.last_skip = f"capture failed: {type(exc).__name__}: {exc}"
+            self.records.append(dict(t_s=began - self._started, phase=phase, skipped=self.last_skip))
+            return
         stamp = observation.transform.stamp_ns
         record = dict(
             t_s=began - self._started,
@@ -612,8 +635,13 @@ class ExecutionWatcher:
         )
         if stamp <= self._last_stamp:
             record["skipped"] = "not newer"
+        elif record["age_s"] > self.max_image_age_s:
+            record["skipped"] = f"image {record['age_s']:.2f} s old"
         elif not observation.image_feedback.healthy:
+            # A fresh image the watch cannot compare: the camera is alive, the target undecided.
             record["skipped"] = "image-time feedback unhealthy"
+            self._last_stamp = stamp
+            self._fresh(began, stamp, "unknown")
         else:
             self._last_stamp = stamp
             spheres = self.spheres(observation.image_feedback)[self.moving]
@@ -638,23 +666,49 @@ class ExecutionWatcher:
                 )
             )
             record.update(self.watch.update(frame.rgb, frame.depth, robot, shift, self.require_orientation))
+            self._fresh(began, stamp, record["vote"])
             if self.frames is not None:
                 self.frames.append(
                     self._frame(frame.rgb, frame.depth, spheres, observation.transform, stamp, quaternion)
                 )
+        if "skipped" in record:
+            self.last_skip = record["skipped"]
         record["wall_s"] = self.clock() - began
         self.records.append(record)
         return record
 
     def _notify_if_moved(self, record):
-        """Dispatch once only while execution is still in a watched phase."""
+        """Dispatch the moved verdict once, until the hand is meant to touch the target.
+
+        A frame takes 0.2-0.4 s to capture and compare on the robot, so the step
+        it was taken in has often ended by the time its votes decide. Dispatching
+        is therefore not gated on the phase still being watched: a target that
+        moves at the end of the grasp segment is exactly what this watch exists
+        to catch, and ``_run`` stops taking frames at that boundary anyway.
+
+        It stops once the hand closes (``CLOSING_PHASES``). From there the hand
+        touches the target on purpose, so the pixels change for a reason this
+        comparison cannot tell from a move, and halting would abort a sound
+        grasp. The X2's steps run approach, grasp, settle_grasp, close: a verdict
+        reached during the settle still counts.
+        """
         if self.watch.moved and self.notified is None and "skipped" not in record:
             with self._dispatch_lock:
-                if self._stop.is_set() or self.phase() not in WATCHED_PHASES:
+                if self._stop.is_set() or self.phase() in CLOSING_PHASES:
                     return
                 self.notified = record
                 if self.on_moved is not None:
                     self.on_moved(record)
+
+    def _fresh(self, captured_at, stamp, vote):
+        self.fresh_frames += 1
+        self.last_fresh_at, self.last_image_stamp_ns, self.last_vote = captured_at, int(stamp), vote
+        if vote == "still":
+            self.last_still_at = captured_at
+
+    @property
+    def running(self):
+        return self._thread.is_alive()
 
     def report(self):
         votes = [record.get("vote") for record in self.records]

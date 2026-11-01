@@ -172,9 +172,9 @@ class X2Proposer:
         *,
         settings: PerceptionSettings = PerceptionSettings(),
         preload: Callable[[Feedback, SceneEstimate], None] | None = None,
-        remote_scene: Callable[[Observation, np.ndarray, float], object] | None = None,
+        remote_scene: Callable[[Observation, np.ndarray, float, Flag], object] | None = None,
     ):
-        """``remote_scene(observation, mask, timeout_s)`` finishes the scene on the planning host.
+        """``remote_scene(observation, mask, timeout_s, cancelled)`` finishes the scene on the planning host.
 
         It raises NoSupportError when nothing supports the target, and what it
         returns is the proposals' scene. Without it the scene is built here,
@@ -199,7 +199,7 @@ class X2Proposer:
                 frame, stamp_ns, scene = self._local_scene(observation, report)
             else:
                 frame, stamp_ns = observed_frame(observation), observation.stamp_ns
-                scene = _RemoteScene(self.remote_scene, observation, deadline)
+                scene = _RemoteScene(self.remote_scene, observation, deadline, cancelled)
             turn = ImageTurn(upright_turns(observation.base_from_camera), *frame.rgb.shape[:2])
             report["detection_turns"] = turn.turns
             target, estimate, timings = self._run_with_scene(
@@ -491,13 +491,21 @@ class _LocalScene:
 class _RemoteScene:
     """The scene the planning host builds from the capture it keeps; it prepared on capturing."""
 
-    def __init__(self, complete, observation: Observation, deadline: float):
-        self.complete, self.observation, self.deadline = complete, observation, deadline
+    def __init__(self, complete, observation: Observation, deadline: float, cancelled: Flag):
+        self.complete, self.observation, self.deadline, self.cancelled = complete, observation, deadline, cancelled
 
     def start(self, pool, measured) -> None:
         pass
 
     def finish(self, mask, measured):
-        return measured("scene", lambda: self.complete(self.observation, mask, self.deadline - time.monotonic()))
+        return measured(
+            "scene",
+            lambda: self.complete(
+                self.observation,
+                mask,
+                self.deadline - time.monotonic(),
+                cancelled=self.cancelled,
+            ),
+        )
 
     whole = finish

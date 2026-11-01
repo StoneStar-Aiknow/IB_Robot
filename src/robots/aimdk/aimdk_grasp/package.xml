@@ -15,6 +15,14 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>ibrobot_msgs</exec_depend>
+  <!-- what the X2 pipeline and its grasp head exchange on two hosts (remote_head, grasp_head) -->
+  <exec_depend>aimdk_grasp_msgs</exec_depend>
+  <!-- head_wire.py: JPEG colour and PNG masks, zstd depth between the two hosts -->
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-zstandard</exec_depend>
+  <!-- launch/x2_grasp_head.launch.py -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>robot_config</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>

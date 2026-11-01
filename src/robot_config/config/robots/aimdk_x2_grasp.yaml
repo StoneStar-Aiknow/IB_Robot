@@ -122,6 +122,24 @@ robot:
       # Halt the approach when the target moves, and replan once it is back.
       # A watch that cannot look stops the arm where it is instead.
       watch: stop
+      # Evidence for these in aimdk_grasp.execution_watch.WatchTimeouts (123
+      # armed executions on the robot): frames every 0.21 s (p99 0.47 s); the
+      # hand hid the target for up to 2.62 s at the end of the grasp segment.
+      watch_frame_timeout_s: 1.0
+      watch_unknown_timeout_s: 4.0
+      watch_image_age_s: 0.5
+      # The grasp head on the Orin (aimdk_grasp.split).
+      head:
+        namespace: /x2_grasp_head
+        # Ten of the head's 0.1 s status periods, on the robot-side host's clock.
+        status_timeout_s: 1.0
+        # cuRobo gets cores 4-7, as the X2 pipeline ran its planner and
+        # observation (taskset -c 4-7); the rest of the head's launch goes to
+        # 1-3. Core 0 serves the robot network card's only interrupt. Plan-only
+        # on the robot (2026-10-22): 7.7-10 s unpinned, 5.2-5.4 s pinned.
+        cpu_isolation:
+          node: "4-7"
+          others: "1-3"
     pipeline:
       # The X2 puts a picked object back where it was, retracing the plan.
       release_after_success: true

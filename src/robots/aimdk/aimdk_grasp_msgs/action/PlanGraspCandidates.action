@@ -16,4 +16,4 @@ bool retryable
 string plan_id
 GraspPlan plan
 ---
-string phase
+# No feedback is published.

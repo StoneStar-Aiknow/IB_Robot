@@ -24,8 +24,8 @@ uint8 UNKNOWN=3
 # The watch cannot look: it did not start, its thread stopped, or no fresh
 # image for longer than the head's frame timeout. See reason.
 uint8 UNAVAILABLE=4
-# The watched steps are over (the close started): the hand is meant to touch
-# the target now, so nothing is compared any more.
+# The first step after the watched ones started (settle_grasp on the X2), so
+# nothing new is captured; the last watched frame may still finish comparing.
 uint8 ENDED=5
 uint8 state
 

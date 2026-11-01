@@ -31,6 +31,40 @@ def test_options_default_to_the_x2_deployment_and_refuse_what_they_do_not_know()
             _options({"backend_options": {"service_timeout_s": bad}})
     with pytest.raises(ValueError, match="watch must be stop, log or off"):
         _options({"backend_options": {"watch": "on"}})
+    assert (options["watch_frame_timeout_s"], options["watch_unknown_timeout_s"], options["watch_image_age_s"]) == (
+        1.0,
+        4.0,
+        0.5,
+    )
+    with pytest.raises(ValueError, match="watch_unknown_timeout_s must be a finite number of seconds"):
+        _options({"backend_options": {"watch_unknown_timeout_s": 0.0}})
+    with pytest.raises(ValueError, match="watch_frame_timeout_s must be a finite number"):
+        _options({"backend_options": {"watch_frame_timeout_s": float("inf")}})
+    with pytest.raises(ValueError, match="status_timeout_s must be a finite number"):
+        _options({"backend_options": {"head": {"status_timeout_s": float("nan")}}})
+    with pytest.raises(ValueError, match="head has unknown keys \\['nodes'\\]"):
+        _options({"backend_options": {"head": {"nodes": "4-7"}}})
+
+
+def test_the_x2_backends_refuse_a_configuration_that_names_no_model_deployment():
+    """The shared aimdk_x2_grasp names none; only a host deployment (CUDA or 310P) does."""
+    from aimdk_grasp.backend import x2_robot
+
+    with pytest.raises(ValueError, match="aimdk_x2_grasp_cuda or aimdk_x2_grasp_310p"):
+        x2_robot({"command_interfaces": list(COMMAND_INTERFACES), "model_bundle_path": "/nowhere"})
+
+
+def test_the_pipeline_side_of_the_split_needs_no_cuda_stack():
+    """The robot-side host (the 310P) runs the remote backends without torch, Warp or cuRobo."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, aimdk_grasp.remote_head, aimdk_grasp.split; "
+        "print(sorted({m.split('.')[0] for m in sys.modules} & {'torch', 'warp', 'curobo'}))"
+    )
+    loaded = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert loaded.strip() == "[]"
 
 
 def test_the_configuration_must_declare_the_streams_the_backends_command():
@@ -107,9 +141,13 @@ def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup()
     node = rclpy.create_node("x2_backend_test")
     grasp_execution = {
         "model_bundle_path": os.fspath(BUNDLE),
+        "model_deployment": "torch_cuda",
         "command_interfaces": list(COMMAND_INTERFACES),
         "backend_options": {"service_timeout_s": 0.2, "registration_device": "cpu"},
     }
+    split = {**grasp_execution, "backend_options": {**grasp_execution["backend_options"], "head": {"namespace": "/h"}}}
+    with pytest.raises(ValueError, match="single-process X2 backends run none"):
+        x2_grasp_backends(node=node, grasp_execution=split, description=description)
     backends = x2_grasp_backends(node=node, grasp_execution=grasp_execution, description=description)
     try:
         assert isinstance(backends.proposer, X2Proposer) and isinstance(backends.executor, StreamExecutor)

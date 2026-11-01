@@ -20,6 +20,10 @@ description is the deployed GraspGen-X bundle's
 - ``warmup_prompt``: what the warmup detects before goals are accepted
 - ``head``: the grasp head on another host (``aimdk_grasp.split``); remote_head only
 - ``perception``: PerceptionSettings fields; ``planning``: GraspRequestConfig fields
+
+``grasp_execution.model_deployment`` must name the GraspGen-X deployment a host
+deployment serves (``aimdk_x2_grasp_cuda`` / ``aimdk_x2_grasp_310p``): the shared
+``aimdk_x2_grasp`` names none and is refused here.
 """
 
 from __future__ import annotations
@@ -37,9 +41,11 @@ from typing import Any
 from manipulation_execution.grasp_pipeline.contracts import GraspBackends, GraspFailure
 from manipulation_execution.grasp_pipeline.perception import PerceptionServices
 
+from .execution_watch import MAX_TIMEOUT_S, WatchTimeouts, finite_seconds
 from .feedback import FeedbackHistory
 from .grasp_request import GraspRequestConfig, X2GraspPlanner, check_initial_hand
 from .proposer import PerceptionSettings, X2Proposer, measured_spheres
+from .split import head_options
 
 DEFAULTS = {
     "detect_service": "/perception/grasp/grounding_detect",
@@ -52,6 +58,9 @@ DEFAULTS = {
     "calibration_verified": True,
     "watch": "stop",
     "watch_period_s": 0.15,
+    "watch_frame_timeout_s": WatchTimeouts.frame_s,
+    "watch_unknown_timeout_s": WatchTimeouts.unknown_s,
+    "watch_image_age_s": WatchTimeouts.image_age_s,
     "warmup_prompt": "a bottle .",
     # The grasp head on another host (aimdk_grasp.split), for remote_head only.
     "head": {},
@@ -89,7 +98,19 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"backend_options.{name} must be a {kind}")
     if options["watch"] not in ("stop", "log", "off"):
         raise ValueError("backend_options.watch must be stop, log or off")
+    for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s"):
+        if not finite_seconds(options[name], 0.0, MAX_TIMEOUT_S):
+            raise ValueError(f"backend_options.{name} must be a finite number of seconds in (0, {MAX_TIMEOUT_S:g}]")
+    head_options(options)
     return options
+
+
+def watch_timeouts(options: Mapping[str, Any]) -> WatchTimeouts:
+    return WatchTimeouts(
+        frame_s=float(options["watch_frame_timeout_s"]),
+        unknown_s=float(options["watch_unknown_timeout_s"]),
+        image_age_s=float(options["watch_image_age_s"]),
+    )
 
 
 def _settings(cls, given: Mapping[str, Any], excluded: tuple[str, ...], name: str):
@@ -175,6 +196,11 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     from .robot_model import arm_limits, planning_model
 
     _require_declared(grasp_execution)
+    if not str(grasp_execution.get("model_deployment") or "").strip():
+        raise ValueError(
+            "grasp_execution.model_deployment names no GraspGen-X deployment: launch a host deployment of the "
+            "X2 grasp (aimdk_x2_grasp_cuda or aimdk_x2_grasp_310p), not the aimdk_x2_grasp they share"
+        )
     options = _options(grasp_execution)
     perception = _settings(PerceptionSettings, options["perception"], ("scene",), "perception")
     planning = _settings(GraspRequestConfig, options["planning"], ("revalidation",), "planning")
@@ -244,7 +270,9 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
             mode=options["watch"],
             imu=parts.imu,
             period_s=float(options["watch_period_s"]),
+            timeouts=watch_timeouts(options),
             on_moved=on_moved,
+            source_clock=camera.clock,
         )
     return parts
 
@@ -278,6 +306,11 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
 
     robot = x2_robot(grasp_execution)
     options = robot.options
+    if options["head"]:
+        raise ValueError(
+            "backend_options.head configures the grasp head of aimdk_grasp.remote_head; "
+            "the single-process X2 backends run none"
+        )
     closers = []
     try:
         head = head_parts(node, robot, description, closers)

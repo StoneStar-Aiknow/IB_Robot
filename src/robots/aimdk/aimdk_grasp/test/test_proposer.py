@@ -182,8 +182,8 @@ def test_a_scene_finished_by_the_grasp_head_keeps_the_support_fallback(overlap):
     models = FakeModels([below, on_table])
     asked = []
 
-    def remote_scene(seen, mask, timeout_s):
-        asked.append((seen, mask.copy(), timeout_s))
+    def remote_scene(seen, mask, timeout_s, *, cancelled):
+        asked.append((seen, mask.copy(), timeout_s, cancelled))
         if mask[BELOW].all():
             raise NoSupportError("nothing under it")
         return SimpleNamespace(capture_id="c1", report={"scene_s": 0.08})
@@ -191,12 +191,36 @@ def test_a_scene_finished_by_the_grasp_head_keeps_the_support_fallback(overlap):
     plain = replace(observation(), robot_state="the planning host's capture")  # no X2 state needed here
     proposer = X2Proposer(models, None, settings=PerceptionSettings(scene_overlap=overlap), remote_scene=remote_scene)
     proposals = proposer.propose(plain, "red cup", deadline=time.monotonic() + 30.0, cancelled=lambda: False)
-    assert [seen for seen, _, _ in asked] == [plain, plain]
+    assert [seen for seen, _, _, _ in asked] == [plain, plain]
     assert asked[1][1][ON_TABLE].all() and asked[1][1].sum() == 64 and 0 < asked[1][2] <= 30.0
+    assert all(not cancelled() for *_, cancelled in asked)
     assert proposals.scene.capture_id == "c1" and proposals.report["scene_host"] == {"scene_s": 0.08}
     assert len(proposals.target_points) == 64 and proposals.grasps.shape == (3, 4, 4)
     with pytest.raises(ValueError, match="sphere model"):
         X2Proposer(models, None)
+
+
+def test_a_cancel_releases_the_overlapped_remote_scene_worker():
+    models = FakeModels([Detection("cup", 0.8, box(ON_TABLE))])
+    cancel_at = time.monotonic() + 0.1
+    exited = []
+
+    def cancelled():
+        return time.monotonic() >= cancel_at
+
+    def remote_scene(seen, mask, timeout_s, *, cancelled):
+        while not cancelled():
+            time.sleep(0.002)
+        exited.append(True)
+        raise GraspFailure("CANCELED", "goal cancelled")
+
+    proposer = X2Proposer(models, None, remote_scene=remote_scene)
+    began = time.monotonic()
+    with pytest.raises(GraspFailure) as raised:
+        proposer.propose(observation(), "red cup", deadline=began + 30.0, cancelled=cancelled)
+
+    assert raised.value.code == "CANCELED" and exited
+    assert time.monotonic() - began < 1.0
 
 
 # -- the upright image the models see ---------------------------------------------------------------------------------
@@ -288,7 +312,9 @@ def test_an_upside_down_camera_is_detected_upright_and_its_target_found_where_it
     upside_down = replace(upside_down, rgb=rgb, base_from_camera=pose, robot_state="the head's capture")
     models = MarkerModels(with_mask=with_mask)
     proposer = X2Proposer(
-        models, None, remote_scene=lambda seen, mask, timeout_s: SimpleNamespace(capture_id="c1", report={})
+        models,
+        None,
+        remote_scene=lambda seen, mask, timeout_s, *, cancelled: SimpleNamespace(capture_id="c1", report={}),
     )
     proposals = proposer.propose(upside_down, "red cup", deadline=time.monotonic() + 30.0, cancelled=lambda: False)
     assert all(np.array_equal(seen, np.rot90(rgb, 2)) for seen in models.seen)  # the models saw it upright

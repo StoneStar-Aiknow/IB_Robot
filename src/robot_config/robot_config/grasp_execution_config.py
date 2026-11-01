@@ -368,6 +368,11 @@ def _validate_rule(value: Any, path: str, rule: _Rule, errors: list[str]) -> Non
     elif rule.kind == "strings":
         if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
             errors.append(f"{path} must be a list of non-empty strings")
+            return
+        if any(item != item.strip() for item in value):
+            errors.append(f"{path} strings must not have surrounding whitespace")
+        if len(set(value)) != len(value):
+            errors.append(f"{path} must not contain duplicate strings")
         return
     elif rule.kind == "vector":
         if (
@@ -422,6 +427,8 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
     backend = value.get("backend")
     if isinstance(backend, str) and backend.strip() and not _BACKEND_REFERENCE.fullmatch(backend):
         errors.append("grasp_execution.backend must be 'package.module:callable'")
+    if isinstance(backend, str) and backend.strip() and not value.get("command_interfaces"):
+        errors.append("grasp_execution.command_interfaces must be non-empty when grasp_execution.backend is set")
     for key in ("backend_options", "command_interfaces"):
         if key in value and not value.get("backend"):
             errors.append(f"grasp_execution.{key} requires grasp_execution.backend")

@@ -236,12 +236,108 @@ sees and measures now, and raises `ReobserveRequired` when it no longer holds:
 Depth counts only where both frames measured it: a transparent target's valid
 pixels come and go between still frames.
 
+## Host deployments
+
+`aimdk_x2_grasp.yaml` is the X2 grasp without its models; each robot-side host
+launches the deployment for its accelerator, and the Orin launches the same one:
+
+| Deployment | Robot-side host | Detection | Segmentation | GraspGen-X |
+|---|---|---|---|---|
+| `aimdk_x2_grasp_cuda.yaml` | NVIDIA GPU (203) | grounded SAM2, `torch_cuda` (returns masks) | none | `torch_cuda` |
+| `aimdk_x2_grasp_310p.yaml` | Ascend 310P | GroundingDINO, `ascend_310p` | SAM2 prompt, `ascend_310p` | `torch_npu` |
+
+`grasp_execution.model_deployment` names the GraspGen-X deployment the host's
+`generate_grasps` service runs, so the Gateway's executor identity matches what
+actually serves; the backends refuse the shared file, which names none. The
+310P deployment is served, not validated: the corrected CUDA/310P comparison of
+GraspGen-X's poses is still to be rerun (`torch_models` `graspgenx_ascend_310p`
+README), and it has not picked on the robot yet.
+
+## Two hosts: the pipeline and the grasp head
+
+A temporary deployment of the X2 alone (`split.py`); the robot-agnostic
+pipeline and launch builders know nothing of it. The robot-side host runs the
+runtime, the Gateway, the models and the grasp pipeline
+(`embodied_pipeline.launch.py`) with `aimdk_grasp.remote_head`'s backends,
+which need no CUDA; the Orin runs the grasp head (`grasp_head`,
+`x2_grasp_head_node`) with `launch/x2_grasp_head.launch.py`, beside the head
+camera's raw depth and the CUDA GPU. That launch refuses a configuration that
+is not an OmniHand X2 on an `aimdk_robot` runtime with the remote backends.
+The head captures and registers, keeps each capture under an id, completes its
+collision scene from the target mask, plans with cuRobo and watches the
+target; the pipeline detects, segments, generates candidates and streams the
+arm and the hand through its local runtime. The interfaces are
+`aimdk_grasp_msgs` (`CaptureGraspObservation`, `CompleteGraspScene`,
+`PlanGraspCandidates`, `RefineGraspPlan`, `WatchGraspTarget`, `WatchStatus`),
+an X2-internal protocol, under `backend_options.head.namespace`
+(`/x2_grasp_head`); `head_wire` converts what crosses. One request moves a
+compressed capture (~0.45 MB for 1280x720: JPEG colour, zstd millimetre depth)
+one way and a PNG mask plus the candidates (~60 KB) the other; the raw camera
+streams and the fine scene stay on the Orin. The head starts the
+mask-independent scene stage as it captures, so it runs while the pipeline
+detects and segments, and completes the scene while the pipeline generates
+candidates.
+
+`backend_options.head` holds the rest of the split: the head node's cores and
+those of its launch (`cpu_isolation`), and how long the robot-side host goes
+without a watch status (`status_timeout_s`). Ending the split means selecting
+`aimdk_grasp.backend:x2_grasp_backends`, which keeps everything in one process,
+and dropping that block.
+
+## Target watch states
+
+While the arm approaches and grasps (the `approach` and `grasp` steps), the
+watch compares fresh head-camera frames with the planned image. What it can
+say (`execution_watch.WatchState`) decides what `watch: stop` does:
+
+| State | Meaning | stop |
+|---|---|---|
+| stable | the newest fresh frame reads the target where it was planned | go on |
+| moved | the votes decided the target moved | halt, retrace, plan again (`TARGET_MOVED`) |
+| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s`, then stop in place (`WATCH_FAILED`) |
+| unavailable | not started, stopped, or no fresh frame for `watch_frame_timeout_s` | refuse to start; mid-way stop in place (`WATCH_FAILED`) |
+| waiting / ended | before the approach / from the close on, or `watch: off` | nothing is judged |
+
+A failed watch is not a move: nothing says where the target is, so the arm is
+held where it halted and nothing is retraced, replanned or released. When the
+watched steps end (`settle_grasp` starts) no new frame is judged, but a move or
+a failure already found stands: the last frame's votes may decide after the
+boundary, and the close (which asks the watch before it moves a finger) still
+stops on them. A frame
+counts as fresh when it is newer than the last and younger than
+`watch_image_age_s` when taken; a capture that fails is a missed frame, not
+the end of the watch. The timeouts and their evidence are in `WatchTimeouts`.
+`watch: log` records the same failures in the report and goes on.
+
+Across hosts the robot-side host does not take the head's word for it: the
+head publishes `WatchStatus` for the session the pipeline armed, every 0.1 s
+and at once on a move, and the pipeline counts only statuses of that session
+in sequence. It fails the watch when no status came for
+`head.status_timeout_s`, when a watched step ran for longer than the frame
+timeout plus that without the head's fresh frames advancing (a head alive but
+stalled, or one that never heard the step start), or when the head reports
+it unavailable or undecided for too long. All of these are measured on the
+robot-side host's clock from when statuses arrive; the two hosts' clocks are
+never compared. An ARM the head acknowledges counts only once the session's
+first status arrives. Every status taken is read, not only the newest, and the
+head keeps reporting a move (or the failure its watch ended in) until DISARM, so
+neither is lost behind a later "ended" status or a full queue. The robot-side
+host judges its own timing one last time when the watched steps end.
+
+Every watch command names its session, `<client>:<n>` with `n` rising per
+pipeline process. The head applies commands one at a time and refuses an ARM no
+newer than one it has seen from that client (a timed-out ARM delivered late, or
+one whose DISARM arrived first) and a PHASE or DISARM of any session but the
+armed one, so a late command of an earlier goal never touches the next goal's watch.
+Timeouts must be finite numbers of seconds within range (watch timeouts up to
+60 s, `head.status_timeout_s` 0.2-10 s); NaN, infinity and booleans are refused.
+
 ## What replaced the standalone `x2_grasp_msgs`
 
 | Standalone interface | Replacement | Why |
 |---|---|---|
 | `RobotFeedback.msg` | the runtime's JointState views above | the runtime is the only reader of vendor state; joint faults are part of its status |
-| `RegisteredObservation.msg` | an in-process value inside the grasp node | observation and planning run in one node, so nothing crosses a process boundary |
+| `RegisteredObservation.msg` | an in-process value inside the grasp head | observation and planning run in one node; the pipeline on the other host gets a compressed copy (`CaptureGraspObservation`) |
 | `CaptureRGBD.srv` | none needed | it existed to bridge the host observation node (which needed vendor messages) and the planning container; with vendor-free feedback both run in the container |
 | `ExecuteGrasp.action` | not migrated | motion goes through `aimdk_robot`; nothing runs on the motion-control unit |
 
