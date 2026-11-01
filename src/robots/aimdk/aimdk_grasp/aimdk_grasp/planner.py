@@ -35,102 +35,6 @@ class GraspPlan:
     lift_method: str = "optimized"
 
 
-def _mesh_sphere_cover(mesh, max_spheres):
-    """A conservative fixed-size sphere cover of every triangle in a posed scene mesh."""
-    from scipy.spatial.transform import Rotation
-
-    if mesh is None:
-        return None
-    vertices = np.asarray(mesh.get("vertices"), dtype=np.float64)
-    faces = np.asarray(mesh.get("faces"), dtype=np.int64).reshape(-1, 3)
-    pose = np.asarray(mesh.get("pose"), dtype=np.float64)
-    if (
-        vertices.ndim != 2
-        or vertices.shape[1] != 3
-        or not len(vertices)
-        or not np.isfinite(vertices).all()
-        or not len(faces)
-        or np.any(faces < 0)
-        or np.any(faces >= len(vertices))
-        or pose.shape != (7,)
-        or not np.isfinite(pose).all()
-        or not isinstance(max_spheres, int)
-        or max_spheres < 1
-    ):
-        raise ValueError("Finite nonempty mesh and positive sphere capacity required")
-    if not np.isclose(np.linalg.norm(pose[3:]), 1.0, atol=1e-5):
-        raise ValueError("Scene mesh pose quaternion must be unit length")
-
-    centers = vertices[faces].mean(axis=1)
-    clusters = [np.arange(len(faces))]
-    while len(clusters) < max_spheres:
-        spans = [np.ptp(centers[index], axis=0) if len(index) > 1 else np.zeros(3) for index in clusters]
-        selected = int(np.argmax([np.linalg.norm(span) for span in spans]))
-        axis = int(np.argmax(spans[selected]))
-        if spans[selected][axis] <= 0:
-            break
-        index = clusters[selected]
-        order = index[np.argsort(centers[index, axis], kind="stable")]
-        middle = len(order) // 2
-        if middle == 0:
-            break
-        clusters[selected : selected + 1] = [order[:middle], order[middle:]]
-
-    spheres = []
-    for index in clusters:
-        points = vertices[np.unique(faces[index])]
-        center = (points.min(axis=0) + points.max(axis=0)) / 2
-        radius = np.nextafter(np.linalg.norm(points - center, axis=1).max(), np.inf)
-        if not np.isfinite(radius) or radius <= 0:
-            raise ValueError("Scene mesh triangles must span a positive volume")
-        spheres.append([*center, radius])
-
-    base_from_mesh = np.eye(4)
-    base_from_mesh[:3, :3] = Rotation.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
-    base_from_mesh[:3, 3] = pose[:3]
-    return rigid(base_from_mesh), np.asarray(spheres, dtype=np.float64)
-
-
-def _carried_spheres(cover, base_from_palm_at_contact, base_from_palms):
-    """Move a mesh-local sphere cover rigidly with the palm along a trajectory."""
-    base_from_mesh, spheres = cover
-    contact = rigid(base_from_palm_at_contact)
-    palms = np.asarray(base_from_palms, dtype=np.float64)
-    if palms.ndim != 3 or palms.shape[1:] != (4, 4) or not np.isfinite(palms).all():
-        raise ValueError("Finite Nx4x4 palm poses required")
-    base_centers = spheres[:, :3] @ base_from_mesh[:3, :3].T + base_from_mesh[:3, 3]
-    palm_centers = (base_centers - contact[:3, 3]) @ contact[:3, :3]
-    centers = np.einsum("mj,nkj->nmk", palm_centers, palms[:, :3, :3]) + palms[:, None, :3, 3]
-    radii = np.broadcast_to(spheres[None, :, 3:4], (*centers.shape[:2], 1))
-    return np.concatenate((centers, radii), axis=2)
-
-
-def _carried_robot_clear(carried, robot, robot_mask, tolerance_m=1e-6):
-    """Per-state clearance of carried spheres from non-contact robot spheres."""
-    carried = np.asarray(carried, dtype=np.float64)
-    robot = np.asarray(robot, dtype=np.float64)
-    mask = np.asarray(robot_mask, dtype=bool)
-    if carried.ndim != 3 or carried.shape[2] != 4 or robot.ndim != 3 or robot.shape[2] != 4:
-        raise ValueError("Expected NxMx4 carried and robot sphere arrays")
-    if len(carried) != len(robot) or mask.shape != (robot.shape[1],):
-        raise ValueError("Carried and robot sphere batches must align")
-    active = robot[:, mask]
-    active = np.where(active[..., 3:4] > 0, active, np.array([0.0, 0.0, 0.0, -np.inf]))
-    distance = np.linalg.norm(carried[:, :, None, :3] - active[:, None, :, :3], axis=3)
-    required = carried[:, :, None, 3] + active[:, None, :, 3]
-    return (distance + tolerance_m >= required).all(axis=(1, 2))
-
-
-def _carried_support_clear(carried, support, tolerance_m=1e-6):
-    """The payload sphere cover must never move deeper into its initial support contact."""
-    point, normal = support
-    normal = np.asarray(normal, dtype=np.float64)
-    normal = normal / np.linalg.norm(normal)
-    values = np.asarray(carried, dtype=np.float64)
-    clearance = (values[..., :3] - np.asarray(point, dtype=np.float64)) @ normal - values[..., 3]
-    return (clearance + tolerance_m >= clearance[:1]).all(axis=1)
-
-
 def _palm_twist(target, poses):
     """Kx6 (translation, rotation vector) from Kx4x4 poses to Kx4x4 targets."""
     from scipy.spatial.transform import Rotation
@@ -462,20 +366,14 @@ class LeftArmPlanner:
     # Instead the lift raises the palm straight up by vertical_lift_m along
     # lift_up (base frame; the planner service sets the support plane normal
     # per request), keeping its orientation, timed as the linear grasp
-    # segment. Its robot fine check leaves out the target at its old world pose;
-    # a conservative sphere cover moves with the palm and is checked against
-    # the environment and non-hand robot links. The support is omitted only
-    # from that payload query because the whole segment moves away along its
-    # normal; the robot itself remains checked against the support.
+    # segment. Its fine check leaves out the target, which the hand carries
+    # (live 2026-10-13: with the target in, the open hand sliding up the
+    # standing bottle failed it); the table and the rest of the scene stay.
     # When the line cannot be planned (IK, limits, deviation, fine check) the
     # lift is a hold at the grasp pose, which the executor refuses to run
     # until lift. 0 always holds.
     vertical_lift_m = 0.05
     lift_up = (0.0, 0.0, 1.0)
-    # The fine target mesh is compressed into this many conservative spheres.
-    # They are queried in one batch only for the short lift segment. More
-    # spheres reduce false refusals without changing TrajOpt or IK cost.
-    _carried_target_max_spheres = 32
     # Experimental latency knobs; defaults keep the measured production path.
     _short_approach_retry = False
     _approach_iters = 25
@@ -576,11 +474,9 @@ class LeftArmPlanner:
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA required")
-        carried_target_support = None
         if isinstance(scene, SceneEstimate):
             if validation_scene is not None or scene_received_at != scene.received_at:
                 raise ValueError("SceneEstimate owns both geometry resolutions and their receipt time")
-            carried_target_support = (np.array(scene.support.point), np.array(scene.support.normal))
             validation_scene, scene = scene.validation_scene, scene.scene
         if not scene or not np.isfinite(scene_received_at) or not np.isfinite(max_scene_age_s) or max_scene_age_s <= 0:
             raise ValueError("Timestamped nonempty torso-frame collision scene required")
@@ -618,21 +514,11 @@ class LeftArmPlanner:
         self._checker_lock = RLock()
         self._checker_batch_size = None
         self._pending_validation_scene = validation_scene if isinstance(validation_scene, LazyScene) else None
-        self._carried_target_support = carried_target_support
-        self._carried_target_cover = (
-            None
-            if self._pending_validation_scene is not None
-            else _mesh_sphere_cover(validation_scene.get("mesh", {}).get("target"), self._carried_target_max_spheres)
-        )
         config = robot_config(feedback, reference_hand_collisions=reference_hand_collisions)
         kin = config["robot_cfg"]["kinematics"]
         self.collision_sphere_links = [
             name for name in kin["collision_link_names"] for _ in kin["collision_spheres"][name]
         ]
-        hand = set(self.hand_links)
-        self._carried_target_robot_mask = np.asarray(
-            [name not in hand for name in self.collision_sphere_links], dtype=bool
-        )
         self.locked_positions = config["robot_cfg"]["kinematics"]["lock_joints"].copy()
         activation_distance = self._optimizer_activation_m
         motion_robot = (
@@ -832,13 +718,6 @@ class LeftArmPlanner:
         if not np.isfinite(estimate.received_at) or estimate.received_at < self.scene_received_at:
             raise ValueError("Scene receipt time must be finite and nondecreasing")
         pending = estimate.validation_scene if isinstance(estimate.validation_scene, LazyScene) else None
-        carried_target_cover = (
-            None
-            if pending is not None
-            else _mesh_sphere_cover(
-                estimate.validation_scene.get("mesh", {}).get("target"), self._carried_target_max_spheres
-            )
-        )
         pairs = (
             (self.motion.scene_collision_checker, estimate.scene),
             (self.checker.scene_model, estimate.scene if pending is not None else estimate.validation_scene),
@@ -881,8 +760,6 @@ class LeftArmPlanner:
             raise
         self._checker_stream.wait_stream(torch.cuda.current_stream())
         self._pending_validation_scene = pending
-        self._carried_target_cover = carried_target_cover
-        self._carried_target_support = (np.array(estimate.support.point), np.array(estimate.support.normal))
         self.scene_received_at = estimate.received_at
         if (
             feedback is not None
@@ -951,11 +828,7 @@ class LeftArmPlanner:
         if pending is None:
             return
         try:
-            scene = pending.materialize()
-            carried_target_cover = _mesh_sphere_cover(
-                scene.get("mesh", {}).get("target"), self._carried_target_max_spheres
-            )
-            config = SceneCfg.create(copy.deepcopy(scene))
+            config = SceneCfg.create(copy.deepcopy(pending.materialize()))
             torch.cuda.synchronize()
             model = self.checker.scene_model
             for kind, data in (("mesh", model.data.meshes), ("cuboid", model.data.cuboids)):
@@ -968,7 +841,6 @@ class LeftArmPlanner:
             torch.cuda.synchronize()
             self._checker_stream.wait_stream(torch.cuda.current_stream())
             self._pending_validation_scene = None
-            self._carried_target_cover = carried_target_cover
         except Exception:
             self.close()
             raise
@@ -1697,87 +1569,7 @@ class LeftArmPlanner:
                 return False
         return True
 
-    def _carried_target_world_clear(self, spheres, *, ignore_support=False):
-        """Check all carried spheres against the scene except their source and support."""
-        from types import SimpleNamespace
-
-        import torch
-        from curobo._src.geom.collision import CollisionBuffer
-
-        values = np.asarray(spheres, dtype=np.float32)
-        if values.ndim != 3 or values.shape[2] != 4 or not len(values) or not np.isfinite(values).all():
-            raise ValueError("Finite nonempty NxMx4 carried spheres required")
-        constraint = self.checker.collision_constraint
-        scene = self.checker.scene_model
-        cuboids = self.checker.scene_model.data.cuboids
-        support = ignore_support and cuboids is not None and "table" in cuboids.get_names()
-        _ensure_mesh_query_distance(scene, float(values[..., 3].max()) + 0.001)
-        if support:
-            cuboids.set_enabled("table", False)
-            torch.cuda.synchronize()
-        try:
-            with torch.cuda.stream(self._checker_stream):
-                query = torch.as_tensor(values[:, None], device="cuda")
-                state = SimpleNamespace(robot_spheres=query)
-                buffer = CollisionBuffer.from_shape(query.shape, scene.device_cfg)
-                collision = scene.get_sphere_collision(
-                    state,
-                    buffer,
-                    constraint._weight,
-                    constraint.config.activation_distance,
-                    return_loss=constraint.config.use_grad_input,
-                )
-                collision = collision.detach().cpu().numpy().reshape(len(values), -1)
-        finally:
-            if support:
-                cuboids.set_enabled("table", True)
-                torch.cuda.synchronize()
-        return (collision == 0).all(axis=1)
-
-    def _carried_target_robot_clear(self, carried, robot, tolerance_m=1e-6):
-        """Check the carried cover against non-hand robot spheres on the checker stream."""
-        import torch
-
-        carried = np.asarray(carried, dtype=np.float32)
-        robot = np.asarray(robot, dtype=np.float32)
-        mask = self._carried_target_robot_mask
-        if carried.ndim != 3 or carried.shape[2] != 4 or robot.ndim != 3 or robot.shape[2] != 4:
-            raise ValueError("Expected NxMx4 carried and robot sphere arrays")
-        if len(carried) != len(robot) or mask.shape != (robot.shape[1],):
-            raise ValueError("Carried and robot sphere batches must align")
-        robot = robot[:, mask]
-        if not robot.shape[1]:
-            return np.ones(len(carried), dtype=bool)
-        with torch.cuda.stream(self._checker_stream):
-            payload = torch.as_tensor(carried, device="cuda")
-            links = torch.as_tensor(robot, device="cuda")
-            payload_centers, link_centers = payload[..., :3], links[..., :3]
-            distance_squared = (
-                (payload_centers * payload_centers).sum(dim=2)[:, :, None]
-                + (link_centers * link_centers).sum(dim=2)[:, None, :]
-                - 2 * torch.matmul(payload_centers, link_centers.transpose(1, 2))
-            ).clamp_min_(0)
-            required = (payload[:, :, None, 3] + links[:, None, :, 3] - tolerance_m).clamp_min_(0)
-            clear = ((distance_squared >= required * required) | (links[:, None, :, 3] <= 0)).all(dim=(1, 2))
-            return clear.cpu().numpy()
-
-    def _valid_carried_target_positions(self, positions, base_from_palm_at_contact):
-        """Fine-check robot and carried target for a lift; call inside _carried_target."""
-        cover = self._carried_target_cover
-        if cover is None:
-            return np.zeros(len(positions), dtype=bool)
-        diagnostics = self.constraint_diagnostics(positions)
-        palms = self._palm_poses(positions)
-        carried = _carried_spheres(cover, base_from_palm_at_contact, palms)
-        robot_clear = self._carried_target_robot_clear(carried, diagnostics["spheres"])
-        support = self._carried_target_support
-        support_clear = np.ones(len(positions), dtype=bool)
-        if support is not None:
-            support_clear = _carried_support_clear(carried, support)
-        world_clear = self._carried_target_world_clear(carried, ignore_support=support is not None)
-        return diagnostics["valid"] & robot_clear & support_clear & world_clear
-
-    def _linear_grasp_segment(self, start, goal, check_deadline, *, valid_positions=None, invalid_reason="fine"):
+    def _linear_grasp_segment(self, start, goal, check_deadline):
         """The grasp segment along the palm line without TrajOpt, or (None, reason); see _linear_grasp.
 
         Local IK (seeded at the approach end) gives the contact state. Interior
@@ -1787,8 +1579,7 @@ class LeftArmPlanner:
         by a minimum-jerk profile, stretched until the sampled velocity,
         acceleration and jerk are within _linear_grasp_limit_fraction of the
         solver's limits. Call with the grasp phase's collision mask (hand links
-        disabled for the coarse IK); the fine check covers every link. A caller
-        may add a stricter batched validator, as the lift does for its payload.
+        disabled for the coarse IK); the fine check covers every link.
         """
         import torch
         from scipy.interpolate import CubicSpline
@@ -1854,9 +1645,8 @@ class LeftArmPlanner:
         check_deadline()
         if deviation > self._linear_grasp_max_deviation_m or rotation > self._linear_grasp_max_rotation_rad:
             return None, "line"
-        validate = self.valid_positions if valid_positions is None else valid_positions
-        if not validate(positions).all():
-            return None, invalid_reason
+        if not self.valid_positions(positions).all():
+            return None, "fine"
         check_deadline()
         torch.cuda.synchronize()
         return TimedTrajectory(times, positions), None
@@ -1902,17 +1692,10 @@ class LeftArmPlanner:
         if self.vertical_lift_m > 0:
             up = np.asarray(self.lift_up, dtype=float)
             up = up / np.linalg.norm(up)
-            contact = self._palm_poses(grasp.positions[-1][None])[0]
-            goal = contact.copy()
+            goal = self._palm_poses(grasp.positions[-1][None])[0]
             goal[:3, 3] += self.vertical_lift_m * up
             with self._carried_target():
-                lift, reason = self._linear_grasp_segment(
-                    grasp.positions[-1],
-                    goal,
-                    check_deadline,
-                    valid_positions=lambda positions: self._valid_carried_target_positions(positions, contact),
-                    invalid_reason="carried",
-                )
+                lift, reason = self._linear_grasp_segment(grasp.positions[-1], goal, check_deadline)
         outcome = "used" if lift is not None else f"hold_{reason}"
         report[outcome] = report.get(outcome, 0) + 1
         if lift is None:
@@ -1924,7 +1707,7 @@ class LeftArmPlanner:
 
     @contextmanager
     def _carried_target(self):
-        """Hide the target's old pose while its palm-attached cover is checked exclusively."""
+        """The fine checker without the target mesh, held exclusively until the block ends."""
         import torch
 
         with self._checker_lock:

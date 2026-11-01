@@ -85,29 +85,6 @@ def test_a_reachable_palm_goal_plans_three_fine_checked_segments(planner):
     assert plan.lift_method in ("vertical", "hold")
 
 
-def test_carried_target_spheres_are_checked_against_the_scene(planner):
-    planner, _, _ = planner
-    clear = np.array([[[0.0, -2.0, 2.0, 0.01]]])
-    obstacle = np.array([[[1.5, -1.0, 0.0, 0.05]]])
-    support = np.array([[[0.55, 0.15, -0.62, 0.01]]])
-
-    assert planner._carried_target_world_clear(clear).tolist() == [True]
-    assert planner._carried_target_world_clear(obstacle).tolist() == [False]
-    assert planner._carried_target_world_clear(support).tolist() == [False]
-    assert planner._carried_target_world_clear(support, ignore_support=True).tolist() == [True]
-
-
-def test_carried_target_spheres_are_checked_against_non_hand_robot_links(planner):
-    planner, feedback, _ = planner
-    robot = planner.constraint_diagnostics(feedback.vector(LEFT_ARM)[None])["spheres"]
-    active = np.flatnonzero(planner._carried_target_robot_mask & (robot[0, :, 3] > 0))
-    carried = robot[:, active[:1]].copy()
-
-    assert planner._carried_target_robot_clear(carried, robot).tolist() == [False]
-    carried[..., :3] += 10.0
-    assert planner._carried_target_robot_clear(carried, robot).tolist() == [True]
-
-
 def test_the_standing_leg_and_a_hand_behind_the_torso_are_invalid(planner):
     planner, feedback, _ = planner
     start = feedback.vector(LEFT_ARM)

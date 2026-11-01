@@ -4,14 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aimdk_grasp.joints import LEFT_ARM
-from aimdk_grasp.planner import (
-    GraspPlanningError,
-    LeftArmPlanner,
-    _carried_robot_clear,
-    _carried_spheres,
-    _carried_support_clear,
-    _mesh_sphere_cover,
-)
+from aimdk_grasp.planner import GraspPlanningError, LeftArmPlanner
 from aimdk_grasp.trajectory import TimedTrajectory
 
 
@@ -181,7 +174,7 @@ def test_scene_replacement_invalidates_request_caches_before_loading(branch_plan
     assert not planner._grasp_selections
 
 
-@pytest.mark.parametrize("outcome", ["vertical", "hold_line", "hold_carried", "disabled"])
+@pytest.mark.parametrize("outcome", ["vertical", "hold_line", "disabled"])
 def test_vertical_lift(monkeypatch, outcome):
     """The lift raises the grasp-end palm along lift_up, or holds (vertical_lift_m)."""
     planner = LeftArmPlanner.__new__(LeftArmPlanner)
@@ -189,21 +182,15 @@ def test_vertical_lift(monkeypatch, outcome):
     planner.lift_up = (0.0, 0.0, 2.0)
     grasp = TimedTrajectory(np.array([0.0, 0.1]), np.zeros((2, 7)) + [[0.0], [0.2]])
     planner._palm_poses = lambda q: np.stack([np.eye(4)] * len(q))
-    planner._valid_carried_target_positions = lambda positions, contact: np.full(
-        len(positions), outcome != "hold_carried"
-    )
     carried = []
     planner._carried_target = lambda: __import__("contextlib").nullcontext(carried.append(True))
     goals = []
 
-    def segment(start, goal, check_deadline, *, valid_positions=None, invalid_reason="fine"):
+    def segment(start, goal, check_deadline):
         goals.append((start, goal))
         if outcome == "hold_line":
             return None, "line"
-        positions = np.stack([start + 1e-9, start + 0.1, start + 0.2])
-        if valid_positions is not None and not valid_positions(positions).all():
-            return None, invalid_reason
-        return TimedTrajectory(np.array([0.0, 0.5, 1.0]), positions), None
+        return TimedTrajectory(np.array([0.0, 0.5, 1.0]), np.stack([start + 1e-9, start + 0.1, start + 0.2])), None
 
     planner._linear_grasp_segment = segment
     lift, method = planner._vertical_lift(grasp, lambda: None)
@@ -218,103 +205,7 @@ def test_vertical_lift(monkeypatch, outcome):
     else:
         assert method == "hold"
         assert np.array_equal(lift.positions, np.repeat(grasp.positions[-1:], 2, axis=0))
-        reason = {"hold_line": "line", "hold_carried": "carried", "disabled": "disabled"}[outcome]
-        assert planner.vertical_lift_report == {f"hold_{reason}": 1}
-
-
-def test_carried_mesh_cover_contains_every_triangle_and_moves_with_the_palm():
-    vertices = np.array(
-        [
-            [-0.02, -0.01, 0.00],
-            [0.02, -0.01, 0.00],
-            [0.02, 0.01, 0.00],
-            [-0.02, 0.01, 0.00],
-            [-0.02, -0.01, 0.08],
-            [0.02, -0.01, 0.08],
-            [0.02, 0.01, 0.08],
-            [-0.02, 0.01, 0.08],
-        ]
-    )
-    faces = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-            [4, 6, 5],
-            [4, 7, 6],
-            [0, 4, 5],
-            [0, 5, 1],
-            [1, 5, 6],
-            [1, 6, 2],
-            [2, 6, 7],
-            [2, 7, 3],
-            [3, 7, 4],
-            [3, 4, 0],
-        ]
-    )
-    mesh = {
-        "vertices": vertices,
-        "faces": faces.reshape(-1),
-        "pose": [0.3, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0],
-    }
-    cover = _mesh_sphere_cover(mesh, 4)
-    assert cover is not None and len(cover[1]) <= 4
-    for face in faces:
-        assert any(np.all(np.linalg.norm(vertices[face] - sphere[:3], axis=1) <= sphere[3]) for sphere in cover[1])
-
-    contact = np.eye(4)
-    contact[:3, 3] = [0.3, -0.2, 0.4]
-    palms = np.repeat(contact[None], 2, axis=0)
-    palms[1, 2, 3] += 0.05
-    moved = _carried_spheres(cover, contact, palms)
-    assert np.allclose(moved[0, :, :3], cover[1][:, :3] + contact[:3, 3])
-    assert np.allclose(moved[1, :, :3] - moved[0, :, :3], [0.0, 0.0, 0.05])
-
-
-def test_carried_target_rejects_a_non_hand_robot_collision_only():
-    carried = np.array([[[0.0, 0.0, 0.0, 0.1]]])
-    robot = np.array([[[0.0, 0.0, 0.0, 0.1], [0.15, 0.0, 0.0, 0.1]]])
-    assert not _carried_robot_clear(carried, robot, np.array([False, True]))[0]
-    robot[0, 1, 0] = 0.25
-    assert _carried_robot_clear(carried, robot, np.array([False, True]))[0]
-
-
-def test_carried_target_may_leave_but_not_move_deeper_into_its_support():
-    carried = np.array(
-        [
-            [[0.0, 0.0, 0.05, 0.05]],
-            [[0.0, 0.0, 0.07, 0.05]],
-            [[0.0, 0.0, 0.04, 0.05]],
-        ]
-    )
-    assert _carried_support_clear(carried, (np.zeros(3), np.array([0.0, 0.0, 1.0]))).tolist() == [
-        True,
-        True,
-        False,
-    ]
-
-
-def test_carried_target_world_collision_rejects_an_otherwise_valid_lift():
-    planner = LeftArmPlanner.__new__(LeftArmPlanner)
-    planner._carried_target_cover = (np.eye(4), np.array([[0.0, 0.0, 0.0, 0.05]]))
-    planner._carried_target_support = None
-    planner._carried_target_robot_mask = np.array([True])
-    planner._palm_poses = lambda positions: np.stack(
-        [
-            np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, value], [0, 0, 0, 1]], dtype=float)
-            for value in positions[:, 0]
-        ]
-    )
-    planner.constraint_diagnostics = lambda positions: {
-        "valid": np.ones(len(positions), dtype=bool),
-        "spheres": np.tile([[[1.0, 0.0, 0.0, 0.05]]], (len(positions), 1, 1)),
-    }
-    planner._carried_target_robot_clear = lambda carried, robot: _carried_robot_clear(
-        carried, robot, planner._carried_target_robot_mask
-    )
-    planner._carried_target_world_clear = lambda spheres, **_: spheres[:, 0, 2] < 0.04
-    positions = np.array([[0.0] * 7, [0.05] + [0.0] * 6])
-    valid = planner._valid_carried_target_positions(positions, np.eye(4))
-    assert valid.tolist() == [True, False]
+        assert planner.vertical_lift_report == {f"hold_{'line' if outcome == 'hold_line' else 'disabled'}": 1}
 
 
 def test_carried_target_leaves_the_target_out_of_the_fine_check_only_inside(monkeypatch):
