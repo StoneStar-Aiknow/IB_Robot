@@ -62,21 +62,53 @@ def resolve_cann_root(runtime_abi: str | None, *, install_root: Path | None = No
     return None
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    """Whether ``path`` names ``root`` or something inside it, after resolving symlinks."""
+
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def ascend_node_environment(cann_root: Path | None) -> dict[str, str]:
     """Environment that makes a node use ``cann_root`` regardless of the caller's shell.
 
     ``pyACL`` ships its ``acl`` module outside ``python/site-packages`` in some toolkits, so both
     locations are exposed; only existing paths are added. A ``None`` root (no usable toolkit, see
     :func:`resolve_cann_root`) contributes nothing rather than naming a directory that is absent.
+
+    The caller's own entries are kept behind the selected toolkit's, except the ones that belong to
+    another installed toolkit: a shell that sourced ``.../ascend-toolkit/latest`` (or any other
+    version) would otherwise leave that tree in ``PYTHONPATH``/``LD_LIBRARY_PATH``/``PATH`` for the
+    rest of the process. Resolution is ordered, so the selected root wins for anything it ships, but
+    a library or module that only the other version has would still be loaded from it, mixing two
+    CANN ABIs in one process.
     """
 
     if cann_root is None or not cann_root.is_dir():
         return {}
 
+    # One directory per version, so the install root holding every toolkit is the selected root's
+    # parent (see :data:`CANN_INSTALL_ROOT`).
+    install_root = cann_root.parent
+
     def prepend(name: str, entries: tuple[Path, ...]) -> str:
         values = [str(path) for path in entries if path.exists()]
-        if os.environ.get(name):
-            values.append(os.environ[name])
+        dropped = []
+        for entry in (os.environ.get(name) or "").split(os.pathsep):
+            if not entry or entry in values:
+                continue
+            if _is_within(Path(entry), install_root) and not _is_within(Path(entry), cann_root):
+                dropped.append(entry)
+                continue
+            values.append(entry)
+        if dropped:
+            logger.warning(
+                f"{name}: ignoring {len(dropped)} inherited path(s) from another installed CANN toolkit: "
+                f"{', '.join(dropped)}"
+            )
         return os.pathsep.join(values)
 
     environment = {

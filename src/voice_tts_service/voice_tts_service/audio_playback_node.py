@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import rclpy
@@ -9,8 +10,10 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
 
 from ibrobot_msgs.srv import PlayAudioFile
+from robot_config.qos_profiles import qos_profile_from_dict
 
 from .audio_playback import AudioFilePlayer, AudioPlaybackConfig, AudioPlaybackError
 
@@ -37,6 +40,27 @@ def _audio_message_class(message_type: str):
     raise ValueError(f"audio_message_type must be one of {SUPPORTED_AUDIO_MESSAGE_TYPES}, got {message_type!r}")
 
 
+def _publisher_qos(audio_qos_json: str) -> QoSProfile | int:
+    """QoS for the audio publisher: the bound speaker's declared profile, or rclpy's default depth.
+
+    ``robot_config`` negotiates the speaker's subscription QoS and hands it over as JSON (a launch
+    parameter cannot carry a mapping). Publishing RELIABLE over a speaker that subscribes
+    ``best_effort`` is compatible, which is why the mismatch was silent, but it over-specifies the
+    transport and drops whatever the interface declares. Malformed JSON is rejected at startup
+    rather than falling back to a profile the speaker never asked for.
+    """
+
+    if not audio_qos_json:
+        return 10
+    try:
+        declared = json.loads(audio_qos_json)
+    except ValueError as exc:
+        raise ValueError(f"audio_qos_json must be a JSON object, got {audio_qos_json!r}") from exc
+    if not isinstance(declared, dict):
+        raise ValueError(f"audio_qos_json must be a JSON object, got {audio_qos_json!r}")
+    return qos_profile_from_dict(declared) or 10
+
+
 class AudioPlaybackNode(Node):
     """Expose synchronous, serialized local WAV playback."""
 
@@ -54,6 +78,9 @@ class AudioPlaybackNode(Node):
         # How the speaker wants PCM written; robot launches take both from its audio.play interface.
         self.declare_parameter("chunk_ms", 50)
         self.declare_parameter("prebuffer_ms", 0)
+        # The same interface's QoS, negotiated by robot_config and passed as JSON; empty keeps the
+        # rclpy default. Matters because the X2 runtime subscribes best_effort.
+        self.declare_parameter("audio_qos_json", "")
 
         self._player = AudioFilePlayer(
             AudioPlaybackConfig(
@@ -76,8 +103,9 @@ class AudioPlaybackNode(Node):
             )
         self._audio_message_type = str(self.get_parameter("audio_message_type").value)
         self._audio_message_class = _audio_message_class(self._audio_message_type)
+        self._audio_qos = _publisher_qos(str(self.get_parameter("audio_qos_json").value))
 
-        self._audio_pub = self.create_publisher(self._audio_message_class, self._audio_topic, 10)
+        self._audio_pub = self.create_publisher(self._audio_message_class, self._audio_topic, self._audio_qos)
         service_name = str(self.get_parameter("service_name").value)
         self._service = self.create_service(
             PlayAudioFile,
@@ -157,7 +185,8 @@ class AudioPlaybackNode(Node):
         # the last chunk is written up to prebuffer_ms early.
         self._sleep_until(playback_start + published_frames / rate, deadline, timeout_sec)
         # Retain reliable-delivery confirmation without putting ACK latency
-        # between PCM chunks. This is not a hardware playback-complete event.
+        # between PCM chunks. This is not a hardware playback-complete event, and a
+        # best_effort speaker (the X2 runtime) returns here immediately by definition.
         wait_for_all_acked = getattr(self._audio_pub, "wait_for_all_acked", None)
         remaining = deadline - time.monotonic()
         if remaining <= 0 or (wait_for_all_acked is not None and not wait_for_all_acked(Duration(seconds=remaining))):
