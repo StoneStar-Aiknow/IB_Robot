@@ -11,13 +11,12 @@ from pathlib import Path
 
 import rclpy
 from action_msgs.msg import GoalStatus
+from aimdk_interfaces.action import ExecuteSimulationPolicy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from std_srvs.srv import Trigger
-
-from ibrobot_msgs.action import ExecuteSimulationPolicy
 
 
 def main():
@@ -89,7 +88,7 @@ def main():
             node.create_subscription(Odometry, "/simulation/ground_truth/odom", states.append, 100)
             node.create_subscription(
                 DiagnosticArray,
-                "/diagnostics",
+                "/simulation/diagnostics",
                 lambda msg: faults.extend(
                     s.message
                     for s in msg.status
@@ -97,12 +96,12 @@ def main():
                 ),
                 10,
             )
-            publisher = node.create_publisher(Twist, "/cmd_vel", 1)
+            publisher = node.create_publisher(Twist, "/simulation/cmd_vel", 1)
             action = ActionClient(node, ExecuteSimulationPolicy, "/simulation/execute_policy")
             wait_for(
                 lambda: action.server_is_ready() and bool(states) and publisher.get_subscription_count() > 0,
                 60,
-                "resident action server, odometry and /cmd_vel subscriber",
+                "resident action server, odometry and /simulation/cmd_vel subscriber",
             )
             request = ExecuteSimulationPolicy.Goal(
                 controller="mc_rl_velocity", motion="", reset_before_start=True, duration_s=30.0

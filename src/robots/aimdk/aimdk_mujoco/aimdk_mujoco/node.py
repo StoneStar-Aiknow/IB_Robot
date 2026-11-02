@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import rclpy
+from aimdk_interfaces.action import ExecuteSimulationPolicy
 from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Time
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
@@ -24,7 +25,6 @@ from sensor_msgs.msg import Imu, JointState
 from std_srvs.srv import Trigger
 
 from aimdk_mujoco.policy_loader import PolicyLoader
-from ibrobot_msgs.action import ExecuteSimulationPolicy
 
 
 class X2Node(Node):
@@ -50,17 +50,17 @@ class X2Node(Node):
         self._command_time = None
         self._fault = None
         self._diagnostic_time = -math.inf
-        self.create_subscription(Twist, "/cmd_vel", self._on_command, 1)
+        self.create_subscription(Twist, "/simulation/cmd_vel", self._on_command, 1)
         self.create_service(Trigger, "/simulation/stand", self._on_stand)
         self.create_service(Trigger, "/simulation/stop", self._on_stand)
         self.create_service(Trigger, "/simulation/start", self._on_start)
         self._odom_pub = self.create_publisher(Odometry, "/simulation/ground_truth/odom", 10)
-        self._joints_pub = self.create_publisher(JointState, "/joint_states", qos_profile_sensor_data)
-        self._imu_pub = self.create_publisher(Imu, "/imu/data", qos_profile_sensor_data)
+        self._joints_pub = self.create_publisher(JointState, "/simulation/joint_states", qos_profile_sensor_data)
+        self._imu_pub = self.create_publisher(Imu, "/simulation/imu/data", qos_profile_sensor_data)
         self._clock_pub = self.create_publisher(
-            Clock, "/clock", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            Clock, "/simulation/clock", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         )
-        self._diagnostics_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+        self._diagnostics_pub = self.create_publisher(DiagnosticArray, "/simulation/diagnostics", 10)
         self._action = ActionServer(
             self,
             ExecuteSimulationPolicy,
@@ -202,7 +202,7 @@ class X2Node(Node):
         ):
             self._command = (0.0, 0.0, 0.0)
             self._command_time = None
-            self.get_logger().warning("Rejected invalid /cmd_vel; requesting zero velocity")
+            self.get_logger().warning("Rejected invalid /simulation/cmd_vel; requesting zero velocity")
             return
         self._command = command
         if (
@@ -214,7 +214,7 @@ class X2Node(Node):
         ) and any(command):
             self._command = (0.0, 0.0, 0.0)
             self._command_time = None
-            self.get_logger().warning("/cmd_vel requires an executing mc_rl_velocity goal")
+            self.get_logger().warning("/simulation/cmd_vel requires an executing mc_rl_velocity goal")
             return
         if (
             any(command)

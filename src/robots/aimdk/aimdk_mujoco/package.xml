@@ -8,7 +8,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>action_msgs</exec_depend>
-  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>aimdk_interfaces</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
@@ -20,13 +20,15 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ros2launch</exec_depend>
-  <!-- Native Python engines are installed through pip; see README.md. -->
+  <!-- Engines are pip-managed; the MuJoCo pin matches requirements/mujoco-sim.txt. -->
+  <exec_depend version_eq="3.12.0">python3-mujoco</exec_depend>
+  <exec_depend>python3-onnxruntime</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>rclpy</test_depend>
   <test_depend>action_msgs</test_depend>
-  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>aimdk_interfaces</test_depend>
   <test_depend>geometry_msgs</test_depend>
   <test_depend>nav_msgs</test_depend>
   <test_depend>sensor_msgs</test_depend>

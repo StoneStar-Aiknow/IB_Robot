@@ -18,7 +18,9 @@ robot:
   robot_type: agibot_x2  # For LeRobot dataset metadata
 
   simulation:
-    # The vendor mock stands in for the robot; there is no physics simulation.
+    # Runtime simulation uses the vendor protocol mock, without physics.
+    # aimdk_mujoco is a separate physics verification tool, not a runtime provider.
+    # Platform integration needs a separate OpenSpec change and maintainer review.
     platform: sdk
 
   runtime:

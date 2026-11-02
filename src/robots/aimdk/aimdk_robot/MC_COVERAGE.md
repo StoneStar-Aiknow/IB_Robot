@@ -30,11 +30,11 @@ overlay remains an external dependency with its own licensing requirements.
 |---|---|---|
 | `/runtime/set_mode` | `SetMcAction` | idle -> `STAND_DEFAULT`, locomotion -> `LOCOMOTION_DEFAULT`, step -> `LOCOMOTION_STEP`; waits for state confirmation |
 | `/cmd_vel` | `/aima/mc/locomotion/velocity` | Registered input source, ACTIVE/mode/navigation gates, limits, input timeout, explicit zero on stop |
-| `/motion/get_state` | `GetMcAction` | Actual platform action name, ID and raw action status; not cached local mode |
-| `/motion/get_locomotion_profiles` | `GetMcLocomotionSpeedStatus` | Current and none/low/medium/high/step profiles, signed per-axis bounds; read-only |
+| `/aimdk/mc/get_state` | `GetMcAction` | Actual X2 action name, ID and raw action status; not cached local mode |
+| `/aimdk/mc/get_locomotion_profiles` | `GetMcLocomotionSpeedStatus` | Current and none/low/medium/high/step profiles, signed per-axis bounds; read-only |
 | `/motion/execute_named` | `SetMcPresetMotion`, `GetMcPresetMotionState` | 21 named presets, task completion polling, configured target validation |
 | `/motion/execute_named` | `SetMcAction` | `sit_down`, `lie_down`; waits for platform body pose |
-| `/odom` | `/aima/mc/leg_odometry` | Preserves timestamp, frames, pose, twist and covariance; does not generate TF |
+| `/aimdk/leg_odometry` | `/aima/mc/leg_odometry` | X2 raw data; preserves timestamp, frames, pose, twist and covariance; does not generate TF or claim `base.odom` |
 | `/joint_states`, `/aimdk/body_joint_states` | HAL joint feedback | Read-only arm/body feedback; not independent arm/leg control |
 | `/runtime/stop` | Local admission latch, zero velocity, optional `SetMcAction` | HOLD does not cancel a vendor animation; TORQUE_OFF is downgraded to damping, not zero torque |
 
@@ -112,8 +112,8 @@ MC leg odometry, named-motion completion, locomotion displacement and HOLD
 behavior remain unverified against the real vendor stack. Simulation ground
 truth is not substituted for MC leg odometry.
 
-Queries use `ibrobot_msgs/srv/GetMotionState` and
-`ibrobot_msgs/srv/GetLocomotionProfiles`. They return failure on service absence,
+Queries use `aimdk_interfaces/srv/GetMotionState` and
+`aimdk_interfaces/srv/GetLocomotionProfiles`. They return failure on service absence,
 vendor errors, or invalid speed bounds; they do not substitute cached success.
 
 ```bash

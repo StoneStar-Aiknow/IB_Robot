@@ -14,7 +14,8 @@ setup(
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
     ],
-    install_requires=["setuptools", "mujoco>=3.0", "numpy", "onnxruntime>=1.16"],
+    # Keep aligned with requirements/mujoco-sim.txt and mujoco_vendor.
+    install_requires=["setuptools", "mujoco==3.12.0", "numpy", "onnxruntime>=1.16"],
     extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",

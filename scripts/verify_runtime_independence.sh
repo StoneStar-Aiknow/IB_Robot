@@ -73,7 +73,7 @@ LEKIWI_RUNTIME_MEMBERS=(
 # The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
 # description or motion package of its own. aimdk_msgs is supplied by the
 # developer's AimDK overlay and is never vendored into this repository.
-AIMDK_RUNTIME_MEMBERS=(aimdk_robot)
+AIMDK_RUNTIME_MEMBERS=(aimdk_robot aimdk_dataplane aimdk_interfaces)
 AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
 # The G1 runtime is a bridge onto the vendor DDS tier: no SDK or hardware
 # adapter of its own, but it owns the vendored message packages (unitree_hg /

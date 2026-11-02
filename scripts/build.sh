@@ -42,7 +42,9 @@ Options:
   --agent                  Build the agent stack plus its base dependencies
   --so101                  Build the SO-101 robot plus its base dependencies
   --lekiwi                 Build the LeKiwi robot plus its base dependencies
-  --aimdk                  Build the AgiBot X2 runtime and standalone MuJoCo simulation plus base dependencies
+  --aimdk                  Build the AgiBot X2 runtime plus base dependencies
+                           Include the standalone MuJoCo simulator on supported platforms only
+                           (not a runtime physics provider)
   --unitree                Build the Unitree G1 robot plus its base dependencies
   --rosclaw                Build rosclaw plus its base dependencies
   --list-groups            Resolve and list group members, then exit
@@ -57,7 +59,7 @@ packages it depends on:
   ./scripts/build.sh --so101                  # SO-101 + base
   ./scripts/build.sh --base --agent --lekiwi  # LeKiwi complete content
   ./scripts/build.sh --agent                  # Agent stack + base
-  ./scripts/build.sh --aimdk                  # X2 runtime + standalone MuJoCo + base
+  ./scripts/build.sh --aimdk                  # X2 + base; standalone MuJoCo where supported
 Group flags cannot be combined with --this or explicit --packages-*
 selections passed after "--".
 
@@ -406,6 +408,9 @@ if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
     fi
     if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" ]]; then
         OPENEULER_SKIP_PACKAGES+=("sim_models")
+    fi
+    if [[ "${IBR_BUILD_INCLUDE_AIMDK_MUJOCO_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("aimdk_mujoco")
     fi
     if [[ ${#OPENEULER_SKIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "openEuler detected: skipping unavailable runtime packages: ${OPENEULER_SKIP_PACKAGES[*]}."

@@ -5,11 +5,11 @@ from __future__ import annotations
 import math
 import threading
 
+from aimdk_interfaces.msg import LocomotionProfile
+from aimdk_interfaces.srv import GetLocomotionProfiles, GetMotionState
 from aimdk_msgs.srv import GetMcAction, GetMcLocomotionSpeedStatus
 
 from aimdk_robot import vendor_gateway as vg
-from ibrobot_msgs.msg import LocomotionProfile
-from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
 
 
 def speed_profile(status) -> LocomotionProfile:
@@ -56,10 +56,10 @@ class McQueries:
         self._node = node
         services = node.vendor_config.get("services") or {}
         for key, interface, vendor_type, public_type, callback in (
-            ("get_action", "motion.state", GetMcAction, GetMotionState, self._action),
+            ("get_action", "x2.mc.state", GetMcAction, GetMotionState, self._action),
             (
                 "get_speed_profiles",
-                "motion.locomotion_profiles",
+                "x2.mc.locomotion_profiles",
                 GetMcLocomotionSpeedStatus,
                 GetLocomotionProfiles,
                 self._speeds,

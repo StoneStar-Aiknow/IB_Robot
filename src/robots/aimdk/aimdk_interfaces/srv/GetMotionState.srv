@@ -1,4 +1,4 @@
-# Query the platform, rather than the runtime's locally selected mode.
+# Query X2 MC, rather than the runtime's locally selected mode.
 ---
 bool success
 string message

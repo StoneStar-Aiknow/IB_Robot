@@ -197,6 +197,11 @@ Two vendor details that neither IDL file reveals:
   documented pairs are in `projection.PRESET_MOTION_AREAS`, and the profile
   contract test holds the shipped profiles to them.
 
+A preset with a fixed profile `area` refuses a conflicting explicit `target`
+with `INVALID_TARGET` before vendor dispatch instead of silently replacing it.
+For the original hardware profiles, `clap` requires area 11: use `target: body`
+or leave the target empty for the profile default; `target: both` (area 3) is refused.
+
 Preset motions also run **only from stable stand** — every documented pair is
 annotated "稳定站立模式下执行". The runtime checks the platform's *reported*
 action, not its own mode, because a robot on a gantry may never reach stable
@@ -585,7 +590,9 @@ The separate MC release is **not** API-equivalent to the two hardware profiles.
 Its supported surface, missing vendor protocols, transport selection and testing
 limits are documented in [MC Release Adapter](MC_COVERAGE.md). The exclusions
 below refer to the original hardware profiles; the MC release additionally
-exposes its native leg odometry as `base.odom`.
+exposes native leg odometry only as the X2 extension `x2.mc.leg_odometry`
+on `/aimdk/leg_odometry`, not as portable `base.odom`. MC queries similarly use
+`x2.mc.*` interface IDs and `aimdk_interfaces` types under `/aimdk/mc/`.
 
 The profile is the single source of runtime parameters: public joint projection,
 modes and their vendor MC actions, command channels, declared capabilities, stop

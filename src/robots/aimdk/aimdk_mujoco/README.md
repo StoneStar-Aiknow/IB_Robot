@@ -5,20 +5,47 @@
 不需要 AimDK 运行时、`aimdk_msgs`、`aimdk_robot` 或厂商进程，不连接真实机器人。
 它不发布公共机器人运行时的 `ACTIVE` 或就绪声明，也不把仿真真值伪装成厂商里程计。
 
+本包不是 `sim_platform:=mujoco` 的运行时提供方。
+通用 `robot_config` launch 不能用它接入 Agent、推理或录制。
+X2 运行时的 `sim_platform:=sdk` 仍使用无物理的厂商协议 mock。
+
+后续平台化改造将另起 OpenSpec 变更，由维护者确认后实施。
+目标是在 `aimdk_msgs` 厂商协议接缝替换 MC/HAL，保留运行时和数据面。
+物理宿主计划对齐 `mujoco_ros2_control`，复用场景、传感器和时钟机制。
+实施前需确认 effort 接口、动态 PD 增益和策略同步。
+还需确认 launch 组装、外部 overlay 和仿真时间的新鲜度判断。
+
 ## 本地资源
 
 需要 ROS 2 Python 环境、MuJoCo 和 ONNX Runtime。ROS 节点启动后始终为暂停的模型预览；
 运行策略需要提交 action 显式选择控制器，并提供具有合法使用权限的匹配策略权重。
-先在仓库根目录安装 Python 引擎并构建本包；`colcon` 不会自动安装 pip 依赖：
+Ubuntu full profile 的 `setup.sh` 安装固定版本的 MuJoCo。
+ONNX Runtime 已由项目 requirements 安装，无需再次安装。
+其他非 LIBERO 环境可在仓库根目录安装同一版本清单，再构建本包：
 
 ```bash
-source .shrc_local && python3 -m pip install 'mujoco>=3.0' 'onnxruntime>=1.16'
+source .shrc_local && python3 -m pip install -r requirements/mujoco-sim.txt
 source .shrc_local && ./scripts/build.sh --aimdk
 ```
 
-`--aimdk` 统一构建 `aimdk_robot`、`aimdk_mujoco` 及其工作区依赖，不下载模型或策略资源。
+`--aimdk` 构建 X2 运行时及其工作区依赖，不下载模型或策略资源。
+支持的平台还构建独立工具 `aimdk_mujoco`，不把它注册为运行时仿真平台。
 其中 `aimdk_robot` 运行时需要外部提供的 `aimdk_msgs` overlay，独立仿真不依赖它。
-只需要独立仿真时，也可使用 `./scripts/build.sh -- --packages-select aimdk_mujoco`。
+只需要独立仿真时，也可使用 `./scripts/build.sh -- --packages-up-to aimdk_mujoco`，同时构建专用接口包 `aimdk_interfaces`。
+
+MuJoCo 必须为 `3.12.0`，与 `mujoco_vendor` 和项目版本清单一致。
+不要在要求 `mujoco<3.9` 的 LIBERO 环境安装本包；请使用独立环境。
+`colcon` 不会自动安装 pip 依赖。
+
+openEuler 的标准 setup 不安装 MuJoCo，本工具在该平台默认不构建。
+本 PR 未验证 openEuler 上的物理运行或测试。
+只有自行准备匹配依赖后，才可显式启用构建：
+
+```bash
+source .shrc_local && IBR_BUILD_INCLUDE_AIMDK_MUJOCO_ON_OPENEULER=1 ./scripts/build.sh -- --packages-up-to aimdk_mujoco
+```
+
+该开关不安装引擎，也不代表 openEuler 运行验收通过。
 
 本包不自带策略权重或厂商资产。
 策略及相关模型资产只在本地使用，应放在仓库外的独立资源目录中，不能随源码提交。
@@ -84,7 +111,7 @@ policy: policy.onnx
 执行帧为 1 至 2820（包含两端），50 Hz，共 56.4 秒。不自动复制 SDK 权重。
 BMIMIC 配置不含哈希，运行时不校验 BMIMIC 权重哈希；速度控制器的已知权重哈希门禁不变。
 
-BMIMIC 不接受非零 `/cmd_vel`。完整执行后暂停，不自动循环或切换策略；
+BMIMIC 不接受非零 `/simulation/cmd_vel`。完整执行后暂停，不自动循环或切换策略；
 回放通过新的重置 action 请求，不需要重启。终点不是已验证的静止姿态，
 不能把暂停后模型不倒误认为主动站稳。暂停、取消和恢复规则见下文。
 
@@ -170,7 +197,7 @@ launch 参数仅有 `assets`、`headless`、`config_dir`，没有 `controller_co
 可打开 MuJoCo 被动查看器，需要可用的图形环境；无头模式不导入查看器。
 即使权重已存在，节点也始终从暂停预览开始，不读取 ONNX，不自动运行策略。
 
-策略请求接口为 `/simulation/execute_policy`，类型为 `ibrobot_msgs/action/ExecuteSimulationPolicy`：
+策略请求接口为 `/simulation/execute_policy`，类型为 `aimdk_interfaces/action/ExecuteSimulationPolicy`。这是 X2 仿真专用接口，不属于公共 Robot Runtime 契约：
 
 | Goal 字段 | 约束 |
 | --- | --- |
@@ -189,14 +216,14 @@ launch 参数仅有 `assets`、`headless`、`config_dir`，没有 `controller_co
 例如先执行快乐崇拜，等待完成后再提交 10 秒速度控制请求，无需重新 launch：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action send_goal --feedback /simulation/execute_policy ibrobot_msgs/action/ExecuteSimulationPolicy '{controller: bmimic, motion: kuailechongbai, reset_before_start: true, duration_s: 0.0}'
+source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action send_goal --feedback /simulation/execute_policy aimdk_interfaces/action/ExecuteSimulationPolicy '{controller: bmimic, motion: kuailechongbai, reset_before_start: true, duration_s: 0.0}'
 ```
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action send_goal --feedback /simulation/execute_policy ibrobot_msgs/action/ExecuteSimulationPolicy '{controller: mc_rl_velocity, motion: "", reset_before_start: true, duration_s: 10.0}'
+source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action send_goal --feedback /simulation/execute_policy aimdk_interfaces/action/ExecuteSimulationPolicy '{controller: mc_rl_velocity, motion: "", reset_before_start: true, duration_s: 10.0}'
 ```
 
-速度 goal 本身不指定行走速度；运行期间通过 `/cmd_vel` 输入，零速度时策略仍执行主动平衡。
+速度 goal 本身不指定行走速度；运行期间通过 `/simulation/cmd_vel` 输入，零速度时策略仍执行主动平衡。
 反馈字段为 `state`（`preparing`、`running` 或 `paused`）、`completed_steps`、`total_steps`；
 结果字段为 `success`、`message`、`completed_steps`。完成后冻结物理，不自动循环。
 
@@ -223,11 +250,25 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service call /simulation/s
 恢复保存的稳定初态，但保持仿真时间单调，不是物理平滑过渡，不能将瞬间复位视为策略动作。
 运行时按单调墙钟以 50 Hz 调度，每次用 20 个 PD 子步推进 0.02 秒；较慢时不突发补算。
 除显式重置外，动作由力矩控制推进，不通过重写根位姿移动。
-其他需要仿真时间的节点应自行设置 `use_sim_time:=true`。
+所有仿真输入和输出话题默认位于 `/simulation/` 下，不订阅真实机器人的 `/cmd_vel`，
+也不发布全局 `/joint_states`、`/imu/data`、`/diagnostics` 或 `/clock`。
+因此，仅设置 `use_sim_time:=true` 不会让其他节点使用本仿真的时钟。
+需要仿真时间的消费节点应设置 `use_sim_time:=true`，并将其时钟订阅从 `/clock` 重映射到
+`/simulation/clock`，即添加 `--ros-args -p use_sim_time:=true -r /clock:=/simulation/clock`。
+
+如果确实要把本仿真作为当前 ROS 域的全局时钟源，可在独立节点启动时显式将
+`/simulation/clock` 重映射到 `/clock`：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && python -m aimdk_mujoco.node --assets /absolute/path/to/x2-assets --headless --ros-args -r /simulation/clock:=/clock
+```
+
+此时消费节点只需设置 `use_sim_time:=true`。启用前应确认同一域中没有其他 `/clock` 发布者，
+避免接管其他仿真或真实机器人节点的时间。验证工具使用默认 `/simulation/clock`，不使用此重映射。
 
 ### 速度输入
 
-`/cmd_vel` 使用 `geometry_msgs/Twist`，只接受平面速度：
+`/simulation/cmd_vel` 使用 `geometry_msgs/Twist`，只接受平面速度：
 
 | 分量 | 范围 |
 | --- | --- |
@@ -238,10 +279,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service call /simulation/s
 任何分量非有限、平面指令越界，或其他三个分量非零，都拒绝整条消息并清零当前指令，
 不做静默限幅。距离最后一条有效消息达到 0.5 秒墙钟时间后，自动请求零速度；
 仅在运行中的速度 goal 内执行零速度主动平衡；输入或看门狗都不会恢复暂停或启动新 goal。
-超时不依赖 `/clock`，不会因仿真时间停止而失效。
+超时不依赖 `/simulation/clock`，不会因仿真时间停止而失效。
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.2}}'
+source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic pub --rate 10 /simulation/cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.2}}'
 ```
 
 ## 输出和故障
@@ -249,10 +290,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic pub --rate 10 /cmd_v
 | 接口 | 含义 |
 | --- | --- |
 | `/simulation/ground_truth/odom` | `nav_msgs/Odometry`，`world` 到 `pelvis` 的物理真值，线速度旋转至子坐标系 `pelvis`，角速度也在该坐标系 |
-| `/joint_states` | 策略观测顺序的关节名称、位置和速度，不伪造力矩 |
-| `/imu/data` | `pelvis` 姿态和机体系角速度；无加速度测量，`linear_acceleration_covariance[0] = -1` |
-| `/clock` | MuJoCo 仿真时间；预览、暂停、取消和完成后不推进，重置不倒退 |
-| `/diagnostics` | 仿真状态；物理故障时为 `ERROR`，不是公共运行时能力声明 |
+| `/simulation/joint_states` | 策略观测顺序的关节名称、位置和速度，不伪造力矩 |
+| `/simulation/imu/data` | `pelvis` 姿态和机体系角速度；无加速度测量，`linear_acceleration_covariance[0] = -1` |
+| `/simulation/clock` | MuJoCo 仿真时间；预览、暂停、取消和完成后不推进，重置不倒退 |
+| `/simulation/diagnostics` | 仿真状态；物理故障时为 `ERROR`，不是公共运行时能力声明 |
 
 不发布 `/odom`，不启动厂商栈，也不发布 TF。使用输出时请明确区分物理真值与传感器估计。
 实际物理或推理运行故障（如跌倒、非有限数值或推理失败）永久锁存，指令清零，停止物理推进和
@@ -271,7 +312,7 @@ source .shrc_local && python -m aimdk_mujoco.physics --assets /absolute/path/to/
 ```
 
 `verify_ros` 先启动通用预览节点，再提交 `mc_rl_velocity` action，
-通过 `/cmd_vel` 测试零速平衡、前进和零速停止，随后取消 goal 并确认常驻节点仍存活，记录真值并退出：
+通过 `/simulation/cmd_vel` 测试零速平衡、前进和零速停止，随后取消 goal 并确认常驻节点仍存活，记录真值并退出：
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && python -m aimdk_mujoco.verify_ros --assets /absolute/path/to/x2-assets --report /tmp/opencode/x2-ros-acceptance.json --check-pause-resume

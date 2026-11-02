@@ -13,6 +13,7 @@ from pathlib import Path
 import rclpy
 import yaml
 from action_msgs.msg import GoalStatus
+from aimdk_interfaces.action import ExecuteSimulationPolicy
 from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import Twist
@@ -21,8 +22,6 @@ from rclpy.action import ActionClient
 from rclpy.qos import qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu, JointState
-
-from ibrobot_msgs.action import ExecuteSimulationPolicy
 
 
 class Telemetry:
@@ -169,22 +168,23 @@ def main():
             until = time.monotonic() + 1
             wait_for(lambda: time.monotonic() >= until, 3, "domain discovery")
             if action.server_is_ready() or any(
-                name in dict(node.get_topic_names_and_types()) for name in ("/simulation/ground_truth/odom", "/clock")
+                name in dict(node.get_topic_names_and_types())
+                for name in ("/simulation/ground_truth/odom", "/simulation/clock")
             ):
                 raise RuntimeError("ROS domain already contains a simulation; choose an unused ROS_DOMAIN_ID")
             node.create_subscription(Odometry, "/simulation/ground_truth/odom", telemetry.odom, 100)
             node.create_subscription(
-                Clock, "/clock", lambda msg: telemetry.observe("clock", msg.clock), qos_profile_sensor_data
+                Clock, "/simulation/clock", lambda msg: telemetry.observe("clock", msg.clock), qos_profile_sensor_data
             )
             node.create_subscription(
                 JointState,
-                "/joint_states",
+                "/simulation/joint_states",
                 lambda msg: telemetry.observe("joints", msg.header.stamp, [*msg.position, *msg.velocity]),
                 qos_profile_sensor_data,
             )
             node.create_subscription(
                 Imu,
-                "/imu/data",
+                "/simulation/imu/data",
                 lambda msg: telemetry.observe(
                     "imu",
                     msg.header.stamp,
@@ -200,8 +200,8 @@ def main():
                 ),
                 qos_profile_sensor_data,
             )
-            node.create_subscription(DiagnosticArray, "/diagnostics", telemetry.diagnostics, 10)
-            publisher = node.create_publisher(Twist, "/cmd_vel", 1)
+            node.create_subscription(DiagnosticArray, "/simulation/diagnostics", telemetry.diagnostics, 10)
+            publisher = node.create_publisher(Twist, "/simulation/cmd_vel", 1)
             process = subprocess.Popen(
                 [
                     "ros2",

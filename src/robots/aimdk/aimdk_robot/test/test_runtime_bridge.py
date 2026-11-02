@@ -171,12 +171,11 @@ def harness():
 
 def test_mc_release_queries_return_platform_action_and_all_speed_profiles(tmp_path):
     import yaml
-
-    from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
+    from aimdk_interfaces.srv import GetLocomotionProfiles, GetMotionState
 
     profile = yaml.safe_load(MC_PROFILE.read_text())
-    profile["interfaces"]["motion.state"]["endpoint"] = "/test_mc/get_state"
-    profile["interfaces"]["motion.locomotion_profiles"]["endpoint"] = "/test_mc/get_profiles"
+    profile["interfaces"]["x2.mc.state"]["endpoint"] = "/test_mc/get_state"
+    profile["interfaces"]["x2.mc.locomotion_profiles"]["endpoint"] = "/test_mc/get_profiles"
     profile_path = tmp_path / "mc.yaml"
     profile_path.write_text(yaml.safe_dump(profile))
     running = Harness(profile=profile_path, initial_action="JOINT_DEFAULT")
@@ -198,14 +197,16 @@ def test_mc_release_queries_return_platform_action_and_all_speed_profiles(tmp_pa
 
 
 def test_mc_release_does_not_turn_query_errors_into_cached_success():
-    from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
+    from aimdk_interfaces.srv import GetLocomotionProfiles, GetMotionState
 
     running = Harness(profile=MC_PROFILE, reject_query_code=3)
     try:
         running.wait_active()
-        action = running.call(GetMotionState, "/motion/get_state", GetMotionState.Request())
+        action = running.call(GetMotionState, "/aimdk/mc/get_state", GetMotionState.Request())
         assert not action.success
-        speeds = running.call(GetLocomotionProfiles, "/motion/get_locomotion_profiles", GetLocomotionProfiles.Request())
+        speeds = running.call(
+            GetLocomotionProfiles, "/aimdk/mc/get_locomotion_profiles", GetLocomotionProfiles.Request()
+        )
         assert not speeds.success
         assert not speeds.profiles
     finally:
@@ -232,9 +233,8 @@ def test_mc_release_startup_leaves_vendor_action_unchanged_and_modes_require_fee
 
 
 def test_mc_release_concurrent_queries_leave_stop_and_feedback_responsive():
+    from aimdk_interfaces.srv import GetLocomotionProfiles, GetMotionState
     from aimdk_msgs.srv import GetMcAction, GetMcLocomotionSpeedStatus
-
-    from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
 
     running = Harness(profile=MC_PROFILE, executor_threads=4)
     silent_vendor = None
@@ -254,8 +254,8 @@ def test_mc_release_concurrent_queries_leave_stop_and_feedback_responsive():
             )
         running.wait_for(lambda: all(caller.ready() for caller in callers), "silent query services")
         clients = [
-            running.node.create_client(GetMotionState, "/motion/get_state"),
-            running.node.create_client(GetLocomotionProfiles, "/motion/get_locomotion_profiles"),
+            running.node.create_client(GetMotionState, "/aimdk/mc/get_state"),
+            running.node.create_client(GetLocomotionProfiles, "/aimdk/mc/get_locomotion_profiles"),
         ]
         assert all(client.wait_for_service(timeout_sec=TIMEOUT_S) for client in clients)
         feedback = []
@@ -315,7 +315,7 @@ def test_mc_release_without_hand_control_accepts_dexterous_hardware():
 
 
 def test_mc_release_queries_fail_when_vendor_cannot_answer():
-    from ibrobot_msgs.srv import GetLocomotionProfiles, GetMotionState
+    from aimdk_interfaces.srv import GetLocomotionProfiles, GetMotionState
 
     running = Harness(profile=MC_PROFILE)
     try:
@@ -328,8 +328,10 @@ def test_mc_release_queries_fail_when_vendor_cannot_answer():
             lambda: not queries._get_action[1].ready() and not queries._get_speed_profiles[1].ready(),
             "query service removal",
         )
-        action = running.call(GetMotionState, "/motion/get_state", GetMotionState.Request())
-        speeds = running.call(GetLocomotionProfiles, "/motion/get_locomotion_profiles", GetLocomotionProfiles.Request())
+        action = running.call(GetMotionState, "/aimdk/mc/get_state", GetMotionState.Request())
+        speeds = running.call(
+            GetLocomotionProfiles, "/aimdk/mc/get_locomotion_profiles", GetLocomotionProfiles.Request()
+        )
         assert not action.success
         assert not action.action_name
         assert not speeds.success
@@ -390,17 +392,15 @@ def test_mc_release_relays_odometry_without_inventing_frames_or_time():
 
     from nav_msgs.msg import Odometry
 
-    from robot_runtime.interface_monitor import InterfaceMonitor
-
     running = Harness(profile=MC_PROFILE)
     try:
         running.wait_active()
         description = json.loads(running.status().interface_description_json)
-        odometry = description["interfaces"]["base.odom"]
+        assert "base.odom" not in description["interfaces"]
+        odometry = description["interfaces"]["x2.mc.leg_odometry"]
         assert odometry["frame_id"] is None
-        monitor = InterfaceMonitor(running.node, {"interfaces": {"base.odom": odometry}})
         received = []
-        running.node.create_subscription(Odometry, "/odom", received.append, 10)
+        running.node.create_subscription(Odometry, "/aimdk/leg_odometry", received.append, 10)
         message = Odometry()
         message.header.frame_id = "mc_odom"
         message.header.stamp.sec = 123
@@ -410,8 +410,6 @@ def test_mc_release_relays_odometry_without_inventing_frames_or_time():
         running.publish("/aima/mc/leg_odometry", message, Odometry)
         running.wait_for(lambda: received, "relayed leg odometry")
         assert received[-1] == message
-        running.wait_for(lambda: monitor.states()["base.odom"]["state"] == "ready", "vendor-frame odometry readiness")
-        assert monitor.states()["base.odom"]["observed_frame_id"] == "mc_odom"
     finally:
         running.shutdown()
 
@@ -1794,6 +1792,34 @@ def test_the_runtime_takes_none_of_the_platforms_high_rate_state_itself(harness)
 
 
 # --- named motion dispatch --------------------------------------------------
+
+
+def test_fixed_area_clap_refuses_a_wrong_target_before_vendor_dispatch(harness):
+    """The original hardware profile's clap requires area 11, not both hands (3)."""
+    from rclpy.action import ActionClient
+
+    harness.wait_active()
+    client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+
+    handle = _send_named(harness, client, "clap", target="both")
+    assert handle.accepted
+    result_future = handle.get_result_async()
+    harness.wait_for(lambda: result_future.done(), "the invalid clap target to fail")
+    result = result_future.result().result
+    assert not result.success
+    assert result.error_code == ExecuteNamedMotion.Result.INVALID_TARGET
+    assert harness.mock.last_preset is None, "a mismatched fixed-area target must not reach the vendor"
+
+    for target in ("body", ""):
+        handle = _send_named(harness, client, "clap", target=target)
+        assert handle.accepted
+        result_future = handle.get_result_async()
+        harness.wait_for(result_future.done, "the valid clap to complete")
+        result = result_future.result().result
+        assert result.success, result.message
+        assert harness.mock.last_preset.motion.value == 3017
+        assert harness.mock.last_preset.area.value == 11
 
 
 def test_a_dispatch_that_creates_no_task_is_a_refusal_not_a_completion():

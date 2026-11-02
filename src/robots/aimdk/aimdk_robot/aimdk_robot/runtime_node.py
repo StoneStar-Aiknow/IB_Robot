@@ -405,11 +405,11 @@ class AimdkRuntimeNode(Node):
         self._setup_processed_audio_if_declared(topics)
         if self._state.has_capability("localization.pose") and topics.get("localization_pose"):
             self._setup_localization(topics)
-        if self._state.has_capability("base.odom") and topics.get("leg_odometry"):
+        if "x2.mc.leg_odometry" in self._speech_description["interfaces"] and topics.get("leg_odometry"):
             from nav_msgs.msg import Odometry  # noqa: PLC0415
 
             # Preserve source frames, covariance and capture time; do not invent TF.
-            endpoint = self._speech_description["interfaces"]["base.odom"]["endpoint"]
+            endpoint = self._speech_description["interfaces"]["x2.mc.leg_odometry"]["endpoint"]
             self._odom_pub = self.create_publisher(Odometry, endpoint, _RELIABLE_QOS)
             self.create_subscription(
                 Odometry, str(topics["leg_odometry"]), self._odom_pub.publish, self._vendor_qos("leg_odometry")
@@ -732,9 +732,7 @@ class AimdkRuntimeNode(Node):
         # The command channels themselves are the data plane's: it subscribes
         # them, applies the mode, admission and navigation gate this runtime
         # reports in its control word, and reports what it refused.
-        if any(
-            name in self._speech_description["interfaces"] for name in ("motion.state", "motion.locomotion_profiles")
-        ):
+        if any(name in self._speech_description["interfaces"] for name in ("x2.mc.state", "x2.mc.locomotion_profiles")):
             from aimdk_robot.mc_queries import McQueries  # noqa: PLC0415
 
             self._mc_queries = McQueries(self, self._speech_description["interfaces"])

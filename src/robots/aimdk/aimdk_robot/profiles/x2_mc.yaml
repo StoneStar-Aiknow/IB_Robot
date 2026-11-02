@@ -10,8 +10,6 @@ use_sim: false
 sim_platforms: [sdk]
 sim_platform: sdk
 joint_state_topic: /joint_states
-# Raw MC odometry retains vendor frames; no fixed frame or TF is guaranteed.
-base: {odom_frame: null}
 joints: &arms
   - left_shoulder_pitch_joint
   - left_shoulder_roll_joint
@@ -52,7 +50,6 @@ capabilities:
   joint.state: {joint_count: 14, rate_hz: 50.0}
   base.cmd_vel: {max_vx: 1.0, max_vy: 1.0, max_wz: 1.0, staleness_s: 0.5}
   base.navigation_gate: {}
-  base.odom: {}
   motion.named:
     names: [wave, handshake, raise_hand, blow_kiss, clap, thumbs_up, victory,
             heart, arms_out, chest_wave, salute, welcome, cheer, bow,
@@ -140,6 +137,15 @@ vendor:
     preset_timeout_s: 30.0
     poll_s: 0.2
 interfaces:
+  # X2 extensions, not portable motion/base capabilities.
+  x2.mc.leg_odometry:
+    capability: runtime.status
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/leg_odometry
+    message_type: nav_msgs/msg/Odometry
+    frame_id: null
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
   joint.body_state:
     capability: joint.state
     kind: topic
@@ -172,15 +178,15 @@ interfaces:
     direction: serve
     endpoint: /motion/execute_named
     message_type: ibrobot_msgs/action/ExecuteNamedMotion
-  motion.state:
+  x2.mc.state:
     capability: runtime.status
     kind: service
     direction: serve
-    endpoint: /motion/get_state
-    message_type: ibrobot_msgs/srv/GetMotionState
-  motion.locomotion_profiles:
+    endpoint: /aimdk/mc/get_state
+    message_type: aimdk_interfaces/srv/GetMotionState
+  x2.mc.locomotion_profiles:
     capability: runtime.status
     kind: service
     direction: serve
-    endpoint: /motion/get_locomotion_profiles
-    message_type: ibrobot_msgs/srv/GetLocomotionProfiles
+    endpoint: /aimdk/mc/get_locomotion_profiles
+    message_type: aimdk_interfaces/srv/GetLocomotionProfiles

@@ -42,11 +42,24 @@ def test_step_mode_is_not_enabled_for_the_original_hardware_profile():
 
 @pytest.mark.parametrize("use_sim", [False, True])
 def test_release_odometry_contract_does_not_assert_a_vendor_frame(use_sim):
-    description = build_description(load_profile(PROFILE), use_sim=use_sim)
-    odometry = description["interfaces"]["base.odom"]
-    assert odometry["endpoint"] == "/odom"
+    profile = load_profile(PROFILE)
+    description = build_description(profile, use_sim=use_sim)
+    assert "base.odom" not in profile["capabilities"]
+    assert "base.odom" not in description["interfaces"]
+    odometry = description["interfaces"]["x2.mc.leg_odometry"]
+    assert odometry["endpoint"] == "/aimdk/leg_odometry"
     assert odometry["message_type"] == "nav_msgs/msg/Odometry"
     assert odometry["frame_id"] is None
+
+
+def test_mc_queries_are_x2_extensions_not_generic_motion_interfaces():
+    interfaces = build_description(load_profile(PROFILE))["interfaces"]
+    assert "motion.state" not in interfaces
+    assert "motion.locomotion_profiles" not in interfaces
+    for name, service in (("state", "GetMotionState"), ("locomotion_profiles", "GetLocomotionProfiles")):
+        interface = interfaces[f"x2.mc.{name}"]
+        assert interface["message_type"] == f"aimdk_interfaces/srv/{service}"
+        assert interface["endpoint"].startswith("/aimdk/mc/")
 
 
 def test_release_advertised_motions_are_dispatchable_and_no_risky_aliases_exist():

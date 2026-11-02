@@ -1,4 +1,6 @@
-# Standalone simulation only. Names resolve against the server's config directory.
+# Standalone X2 MuJoCo only; not a portable policy or hardware execution action.
+# Controllers: bmimic, mc_rl_velocity, recover_stand.
+# Names resolve against the server's config directory.
 string controller
 string motion
 # True resets for a new policy or replay; false resumes the same selection or uses

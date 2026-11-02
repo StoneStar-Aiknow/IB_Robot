@@ -9,14 +9,13 @@ from unittest.mock import Mock
 
 import pytest
 import rclpy
+from aimdk_interfaces.action import ExecuteSimulationPolicy
 from aimdk_mujoco import node as wrapper
 from diagnostic_msgs.msg import DiagnosticStatus
 from geometry_msgs.msg import Twist
 from rclpy.action import ActionClient
 from rclpy.executors import SingleThreadedExecutor
 from std_srvs.srv import Trigger
-
-from ibrobot_msgs.action import ExecuteSimulationPolicy
 
 SUCCEEDED, CANCELED, ABORTED = 4, 5, 6
 
@@ -186,6 +185,20 @@ def action_api(node):
         client.destroy()
         client_node.destroy_node()
         executor.shutdown()
+
+
+def test_default_topics_are_isolated_from_hardware_and_global_clock(node):
+    publishers = {publisher.topic_name for publisher in node.publishers}
+    subscriptions = {subscription.topic_name for subscription in node.subscriptions}
+    assert {
+        "/simulation/ground_truth/odom",
+        "/simulation/joint_states",
+        "/simulation/imu/data",
+        "/simulation/clock",
+        "/simulation/diagnostics",
+    } <= publishers
+    assert "/simulation/cmd_vel" in subscriptions
+    assert not (publishers | subscriptions) & {"/cmd_vel", "/joint_states", "/imu/data", "/clock", "/diagnostics"}
 
 
 def test_action_success_reserves_until_result_and_pauses(node, action_api):
