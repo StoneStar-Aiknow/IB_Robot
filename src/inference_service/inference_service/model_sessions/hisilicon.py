@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+import numpy as np
+
 from inference_manifest import CompiledDeployment, TensorBinding
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.hisilicon.sd3403_protocol import (
     DEFAULT_GRACEFUL_CLOSE_TIMEOUT,
     SD3403Protocol,
@@ -19,7 +22,17 @@ from inference_service.backends.hisilicon.sd3403_protocol import (
 )
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionFailureFactory,
+    LoadRollback,
+    ModelRequest,
+    OutcomeEvidence,
+    OutcomeState,
+    RecoveryRequirement,
+)
+from inference_service.unified_runtime.errors import CancellationRequested, DeadlineExceeded
+from inference_service.unified_runtime.lifecycle import lifecycle_scope
 
 LOGGER = logging.getLogger(__name__)
 _ALLOWED_RUNTIME_OPTIONS = frozenset({"perf_enabled", "perf_log_every", "graceful_close_timeout", "force_close"})
@@ -46,9 +59,13 @@ def validate_runtime_options(options: Mapping[str, object]) -> dict[str, object]
             code="invalid_runtime_options",
         )
     graceful_close_timeout = options.get("graceful_close_timeout", DEFAULT_GRACEFUL_CLOSE_TIMEOUT)
-    if type(graceful_close_timeout) not in {int, float} or graceful_close_timeout < 0:
+    if (
+        type(graceful_close_timeout) not in {int, float}
+        or not math.isfinite(graceful_close_timeout)
+        or graceful_close_timeout < 0
+    ):
         raise BackendLoadError(
-            "Hisilicon graceful_close_timeout runtime option must be a non-negative number",
+            "Hisilicon graceful_close_timeout runtime option must be a finite non-negative number",
             code="invalid_runtime_options",
         )
     return {
@@ -170,7 +187,7 @@ class HisiliconModelSession(ModelSession):
         request: ModelRequest,
         context: ExecutionContext,
     ) -> Mapping[str, object]:
-        context.check(f"model.{role}")
+        self._check_not_started_context(context, f"model.{role}")
         protocol = self._protocol
         action_binding = self._action_binding
         if protocol is None or action_binding is None:
@@ -178,73 +195,97 @@ class HisiliconModelSession(ModelSession):
         if role != "policy":
             raise BackendInferenceError(f"unknown Hisilicon execution role {role!r}", code="unknown_execution_role")
         deployment = self._require_context().deployment
-        ordered_inputs = tuple(
-            inputs[binding.semantic]
-            for binding in sorted(deployment.bindings[role].inputs, key=lambda item: item.index)
-        )
+        try:
+            ordered_inputs = []
+            for binding in sorted(deployment.bindings[role].inputs, key=lambda item: item.index):
+                value = np.ascontiguousarray(inputs[binding.semantic], dtype=np.float32)
+                if value.ndim != len(binding.shape) or any(
+                    expected != -1 and expected != actual
+                    for expected, actual in zip(binding.shape, value.shape, strict=True)
+                ):
+                    raise BackendInferenceError(
+                        f"Hisilicon input {binding.semantic!r} shape {value.shape} does not match {binding.shape}",
+                        code="runtime_input_shape_mismatch",
+                        operation_started=False,
+                        outcome_known=True,
+                    )
+                ordered_inputs.append(value)
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.not_started(f"model.{role}.inputs")
+            raise
         started = time.perf_counter()
         try:
-            response = protocol.execute(ordered_inputs)
+            with lifecycle_scope(context):
+                response = protocol.execute(ordered_inputs)
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            evidence = getattr(exc, "evidence", None)
+            if evidence is not None and evidence.state is OutcomeState.NOT_STARTED:
+                raise ExecutionFailureFactory().from_exception(exc, evidence=evidence) from exc
+            failure = BackendInferenceError(str(exc), code=exc.code, operation_started=True, outcome_known=False)
+            failure.recovery = RecoveryRequirement("runtime", "reload")
+            raise failure from exc
         except SD3403WorkerExitedError as exc:
-            raise BackendInferenceError(str(exc), code="worker_exited", recoverable=True) from exc
+            failure = BackendInferenceError(str(exc), code="worker_exited", operation_started=True, outcome_known=False)
+            # A failed worker requires replacing the runtime; this Session has
+            # no public reset/reload operation that can promise recovery here.
+            failure.recovery = RecoveryRequirement("runtime", "reload")
+            raise failure from exc
         except SD3403WorkerError as exc:
             raise BackendInferenceError(str(exc), code="worker_inference_failed") from exc
         except SD3403ProtocolError as exc:
-            raise BackendInferenceError(str(exc), code="worker_protocol_error") from exc
-        latency_ms = (time.perf_counter() - started) * 1000.0
-        try:
-            action = response.outputs[int(action_binding.index)]
-        except KeyError as exc:
-            raise BackendInferenceError(
-                f"worker response is missing manifest action output index {action_binding.index}; "
-                f"available indices: {sorted(response.outputs)}",
-                code="missing_action_output",
-            ) from exc
-        self._inference_count += 1
-        if bool(self._options["perf_enabled"]) and self._inference_count % int(self._options["perf_log_every"]) == 0:
-            LOGGER.info(
-                "Hisilicon inference request_id=%s worker_request_id=%s e2e_ms=%.3f worker_ms=%.3f",
-                context.request_id,
-                response.request_id,
-                latency_ms,
-                response.worker_latency_us / 1000.0,
+            failure = BackendInferenceError(
+                str(exc), code="worker_protocol_error", operation_started=True, outcome_known=False
             )
-        context = self._require_context()
-        self._last_metadata = {
-            "request_id": context.request_id,
-            "worker_request_id": response.request_id,
-            "worker_latency_ms": response.worker_latency_us / 1000.0,
-            "worker_model_load_ms": protocol.model_load_ms,
-            "protocol": "sd3403-v1",
-            "target_soc": context.target.soc if context.target is not None else None,
-        }
-        return {"action": action}
-
-    def _recover(self) -> None:
-        if self._worker_path is None or self._model_path is None:
-            raise BackendInferenceError("Hisilicon model session has no worker to recover", code="runtime_not_loaded")
-        previous = self._protocol
-        self._protocol = None
-        if previous is not None:
-            previous.close()
-        replacement = self._create_protocol(self._worker_path, self._model_path, self._options)
-        try:
-            replacement.start()
-        except Exception:
-            replacement.close()
-            raise
-        self._protocol = replacement
+            failure.recovery = RecoveryRequirement("runtime", "reload")
+            raise failure from exc
+        with self._completed_validation(f"model.{role}.outputs"):
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            try:
+                action = response.outputs[int(action_binding.index)]
+            except KeyError as exc:
+                raise BackendInferenceError(
+                    f"worker response is missing manifest action output index {action_binding.index}; "
+                    f"available indices: {sorted(response.outputs)}",
+                    code="missing_action_output",
+                ) from exc
+            self._inference_count += 1
+            if (
+                bool(self._options["perf_enabled"])
+                and self._inference_count % int(self._options["perf_log_every"]) == 0
+            ):
+                LOGGER.info(
+                    "Hisilicon inference request_id=%s worker_request_id=%s e2e_ms=%.3f worker_ms=%.3f",
+                    context.request_id,
+                    response.request_id,
+                    latency_ms,
+                    response.worker_latency_us / 1000.0,
+                )
+            runtime_context = self._require_context()
+            self._last_metadata = {
+                "request_id": context.request_id,
+                "worker_request_id": response.request_id,
+                "worker_latency_ms": response.worker_latency_us / 1000.0,
+                "worker_model_load_ms": protocol.model_load_ms,
+                "protocol": "sd3403-v1",
+                "target_soc": runtime_context.target.soc if runtime_context.target is not None else None,
+            }
+            return {"action": action}
 
     def _close(self) -> None:
         protocol = self._protocol
+        if protocol is not None:
+            try:
+                protocol.close()
+            except Exception as exc:
+                raise BackendLifecycleError(
+                    f"Hisilicon worker close pending: {exc}", code="close_failed", close_pending=True
+                ) from exc
         self._protocol = None
         self._model_path = None
         self._worker_path = None
         self._action_binding = None
         self._options = {}
         self._last_metadata = {}
-        if protocol is not None:
-            protocol.close()
 
     def _create_protocol(self, worker_path: Path, model_path: Path, options: Mapping[str, object]) -> SD3403Protocol:
         return self._protocol_factory(

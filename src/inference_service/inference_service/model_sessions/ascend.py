@@ -23,12 +23,20 @@ from inference_service.backends.types import (
     BackendAdmissionEvidence,
     BackendCapabilities,
     BackendPriorityMapping,
-    BackendState,
     RuntimeContext,
+    runtime_priority_scheduling_default,
 )
 from inference_service.model_sessions.base import ModelSession
 from inference_service.scheduler.operations import Certainty
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionFailureFactory,
+    LoadRollback,
+    ModelRequest,
+    OutcomeEvidence,
+)
+from inference_service.unified_runtime.errors import execution_evidence, merge_execution_evidence
+from inference_service.unified_runtime.lifecycle import check_lifecycle
 
 
 class AscendOmModelSession(ModelSession):
@@ -47,11 +55,13 @@ class AscendOmModelSession(ModelSession):
         *,
         runtime_manager: AclRuntimeManager | None = None,
         model_factory=AclModel,
-        priority_scheduling: bool = False,
+        priority_scheduling: bool | None = None,
         diagnostic_capture=None,
     ) -> None:
         if type(device_id) is not int or device_id < 0:
             raise ValueError("device_id must be a non-negative integer")
+        if priority_scheduling is None:
+            priority_scheduling = runtime_priority_scheduling_default()
         if not isinstance(priority_scheduling, bool):
             raise TypeError("priority_scheduling must be a bool")
         if diagnostic_capture is not None and not callable(diagnostic_capture):
@@ -90,27 +100,6 @@ class AscendOmModelSession(ModelSession):
     @property
     def runtime_version(self) -> str:
         return self._runtime_version(None if self._lease is None else self._lease.acl)
-
-    def close(self) -> None:
-        if not self._priority_scheduling:
-            return super().close()
-        with self._condition:
-            if self._state in (BackendState.CLOSED, BackendState.CLOSING):
-                return
-            self._state = BackendState.CLOSING
-        try:
-            self._close()
-        except Exception as exc:
-            # Failed device drain retains ownership and permits a later close retry.
-            with self._condition:
-                self._failure_count += 1
-                self._reason_code = getattr(exc, "code", "close_failed")
-                self._message = str(exc)
-                self._state = BackendState.FAILED
-            raise
-        with self._condition:
-            self._context = None
-            self._state = BackendState.CLOSED
 
     def drain_uncertain_operations(self) -> None:
         """排空所有阶段模型的隔离资源，不卸载模型。
@@ -161,22 +150,15 @@ class AscendOmModelSession(ModelSession):
             )
         lease = self._runtime_manager.acquire(self._device_id)
         rollback.defer(lease.close)
-        priority_streams = AclPriorityStreamPool.create(lease) if self._priority_scheduling else None
-        if priority_streams is not None:
-            rollback.defer(priority_streams.close)
+        priority_streams = AclPriorityStreamPool.create(lease, cleanup=rollback) if self._priority_scheduling else None
         models: dict[str, AclModel] = {}
-
-        def close_models() -> None:
-            for model in reversed(tuple(models.values())):
-                model.close()
-
-        rollback.defer(close_models)
         for role in deployment.execution:
             path = context.resolved_artifacts.get(role)
             if path is None or not path.is_file():
                 raise BackendLoadError(f"Ascend artifact {role!r} is unavailable: {path}", code="invalid_artifact")
             model_options = {"async_execution": True} if self._priority_scheduling else {}
             model = self._model_factory(lease, role, path, deployment.bindings[role], **model_options)
+            rollback.defer(model.close)
             models[role] = model
             model.load_descriptor()
         linked_inputs = {(link.consumer, link.semantic) for link in deployment.device_links}
@@ -228,12 +210,14 @@ class AscendOmModelSession(ModelSession):
             models[role].prepare_datasets(input_overrides=input_overrides)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
         deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
-            for semantic, output in self._run_role(role_index, role, values, request=request, context=context).items():
+            outputs = self._run_role(
+                role_index, role, values, request=request, context=context, previous_roles_completed=role_index > 0
+            )
+            for semantic, output in outputs.items():
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     public_outputs[semantic] = output
         return public_outputs
@@ -252,6 +236,7 @@ class AscendOmModelSession(ModelSession):
         *,
         request: ModelRequest | None = None,
         context: ExecutionContext | None = None,
+        previous_roles_completed: bool = False,
         isolated: bool = False,
         operation_factory=None,
     ) -> dict[str, np.ndarray]:
@@ -263,45 +248,64 @@ class AscendOmModelSession(ModelSession):
         read-selection behaviour per role, so that behaviour lives here rather than in the
         loop that happens to call it.
         """
-        execute_options: dict[str, object] = {
-            "read_outputs": (
-                {
-                    int(binding.index)
-                    for binding in self._loaded_deployment().bindings[role].outputs
-                    if binding.index is not None
-                }
-                if isolated
-                else self._role_read_indices(role_index, role)
-            ),
-        }
-        if request is not None:
-            stream = self._request_stream(request, context)
-            if stream is not None:
-                execute_options["stream"] = stream
-        role_inputs = self._role_inputs(role, values, isolated=isolated)
-        self._capture_role_inputs(role, role_inputs)
-        if isolated:
-            runtime_outputs = self._submit_isolated_role(
-                role, role_inputs, context, operation_factory=operation_factory, **execute_options
-            )
-        else:
-            runtime_outputs = self._models[role].execute(role_inputs, **execute_options)
-        outputs: dict[str, np.ndarray] = {}
-        for binding in self._loaded_deployment().bindings[role].outputs:
-            if binding.index is not None and int(binding.index) not in runtime_outputs:
-                continue
-            output = self._bound_output(role, binding, runtime_outputs)
-            values[binding.semantic] = output
-            outputs[binding.semantic] = output
-        self._capture_role_outputs(role, outputs)
-        if self._diagnostic_capture is not None and not isolated:
-            linked_outputs = {
-                link.semantic
-                for link in self._loaded_deployment().device_links
-                if link.producer == role and link.transport == "device_pointer"
+        try:
+            if context is not None:
+                if previous_roles_completed:
+                    self._check_completed_context(context, f"model.{role}")
+                else:
+                    self._check_not_started_context(context, f"model.{role}")
+            execute_options: dict[str, object] = {
+                "read_outputs": (
+                    {
+                        int(binding.index)
+                        for binding in self._loaded_deployment().bindings[role].outputs
+                        if binding.index is not None
+                    }
+                    if isolated
+                    else self._role_read_indices(role_index, role)
+                ),
             }
-            outputs = {semantic: value for semantic, value in outputs.items() if semantic not in linked_outputs}
-        return outputs
+            if request is not None:
+                stream = self._request_stream(request, context)
+                if stream is not None:
+                    execute_options["stream"] = stream
+            try:
+                role_inputs = self._role_inputs(role, values, isolated=isolated)
+                self._capture_role_inputs(role, role_inputs)
+            except Exception as exc:
+                raise ExecutionFailureFactory().from_exception(
+                    exc, evidence=OutcomeEvidence.not_started(f"model.{role}.inputs")
+                ) from exc
+            if isolated:
+                runtime_outputs = self._submit_isolated_role(
+                    role, role_inputs, context, operation_factory=operation_factory, **execute_options
+                )
+            else:
+                runtime_outputs = self._models[role].execute(role_inputs, **execute_options)
+            with self._completed_validation(f"model.{role}.outputs"):
+                outputs: dict[str, np.ndarray] = {}
+                for binding in self._loaded_deployment().bindings[role].outputs:
+                    if binding.index is not None and int(binding.index) not in runtime_outputs:
+                        continue
+                    output = self._bound_output(role, binding, runtime_outputs)
+                    values[binding.semantic] = output
+                    outputs[binding.semantic] = output
+                self._capture_role_outputs(role, outputs)
+                if self._diagnostic_capture is not None and not isolated:
+                    linked_outputs = {
+                        link.semantic
+                        for link in self._loaded_deployment().device_links
+                        if link.producer == role and link.transport == "device_pointer"
+                    }
+                    outputs = {semantic: value for semantic, value in outputs.items() if semantic not in linked_outputs}
+                return outputs
+        except Exception as exc:
+            if previous_roles_completed:
+                exc.evidence = merge_execution_evidence(
+                    OutcomeEvidence.completed(state_mutated=self.capabilities.stateful),
+                    execution_evidence(exc, started=True, stateful=self.capabilities.stateful, unknown_on_error=True),
+                )
+            raise
 
     def _capture_role_inputs(self, role: str, inputs: Mapping[int, np.ndarray]) -> None:
         if self._diagnostic_capture is None:
@@ -501,43 +505,24 @@ class AscendOmModelSession(ModelSession):
         self._request_stream(request)
 
     def _close(self) -> None:
-        models = self._models
-        lease = self._lease
-        priority_streams = self._priority_streams
-        if not self._priority_scheduling:
-            self._models = {}
-            self._lease = None
-            self._priority_streams = None
-            self._linked_inputs = frozenset()
-        errors: list[Exception] = []
-        for model in reversed(tuple(models.values())):
-            try:
+        try:
+            for role, model in reversed(tuple(self._models.items())):
+                check_lifecycle()
                 model.close()
-            except Exception as exc:
-                if self._priority_scheduling:
-                    raise BackendLifecycleError(
-                        f"Ascend model drain failed: {exc}", code="close_failed", close_pending=True
-                    ) from exc
-                errors.append(exc)
-        self._models = {}
-        if priority_streams is not None:
-            try:
-                priority_streams.close()
-            except Exception as exc:
-                errors.append(exc)
-        if lease is not None:
-            try:
-                lease.close()
-            except Exception as exc:
-                errors.append(exc)
-        self._lease = None
-        self._priority_streams = None
-        self._linked_inputs = frozenset()
-        if errors:
+                del self._models[role]
+            if self._priority_streams is not None:
+                check_lifecycle()
+                self._priority_streams.close()
+                self._priority_streams = None
+            if self._lease is not None:
+                check_lifecycle()
+                self._lease.close()
+                self._lease = None
+        except Exception as exc:
             raise BackendLifecycleError(
-                f"Ascend model session close failed: {'; '.join(str(error) for error in errors)}",
-                code="close_failed",
-            )
+                f"Ascend model session close pending: {exc}", code="close_failed", close_pending=True
+            ) from exc
+        self._linked_inputs = frozenset()
 
     @staticmethod
     def _bound_output(role: str, binding: TensorBinding, outputs: Mapping[int, np.ndarray]) -> np.ndarray:

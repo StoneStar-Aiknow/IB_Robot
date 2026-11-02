@@ -51,7 +51,7 @@ from inference_manifest import (
     load_inference_manifest,
     load_inference_manifest_metadata,
 )
-from inference_service.backends import InferenceRequest
+from inference_service.backends import InferenceRequest, runtime_context_defaults
 from inference_service.device_video_streams import DeviceVideoStreamManager
 from inference_service.distributed import (
     DistributedProtocolError,
@@ -483,60 +483,76 @@ class PipelinePolicyNode(Node):
             raise RuntimeError(f"pipeline {config.pipeline_id!r} runtime_options_json is invalid: {exc}") from exc
         if not isinstance(runtime_options, dict):
             raise RuntimeError(f"pipeline {config.pipeline_id!r} runtime_options_json must decode to an object")
-        if config.execution_mode == "monolithic":
-            try:
-                scheduling = json.loads(config.pipeline_scheduling_json or "{}")
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"pipeline scheduling JSON is invalid: {exc}") from exc
-            stage_scheduling = scheduling.get("stages", {}) if isinstance(scheduling, dict) else {}
-            if config.scheduler_enabled and config.pipeline_stage_policy == "independent":
-                self._frame_trigger_priority = int(scheduling.get("frame_base_priority", 0))
-            self._manager = create_pipeline_manager(
-                config.pipeline_id,
-                self._manifest,
-                request_timeout=config.request_timeout,
-                default_task=config.default_task or None,
-                runtime_options=runtime_options,
-                priority_scheduling=config.scheduler_enabled,
-                stage_policy=config.pipeline_stage_policy,
-                stage_scheduling=stage_scheduling,
-                frame_base_priority=int(scheduling.get("frame_base_priority", 0)),
-                registry_set=self._registry_set,
-                providers=self._providers,
-            )
-        else:
-            for name in ("request_topic", "result_topic", "heartbeat_topic"):
-                if not getattr(config, name):
-                    raise RuntimeError(f"distributed pipeline requires {name}")
-            self._edge_runtime = EdgeProcessorRuntime(
-                config.pipeline_id,
-                self._manifest,
-                default_task=config.default_task or None,
-            )
-            self._edge_runtime.load()
-            self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
-            self._edge_session.start()
-            if config.external_video_producer:
-                self._video_stream_manager = _ExternalVideoProducerView(
-                    self._obs_specs,
-                    pipeline_id=config.pipeline_id,
-                    contract_fingerprint=contract_fingerprint(self._contract),
-                    deployment_fingerprint=self._manifest.fingerprint,
-                )
+        try:
+            if config.execution_mode == "monolithic":
+                try:
+                    scheduling = json.loads(config.pipeline_scheduling_json or "{}")
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"pipeline scheduling JSON is invalid: {exc}") from exc
+                stage_scheduling = scheduling.get("stages", {}) if isinstance(scheduling, dict) else {}
+                if config.scheduler_enabled and config.pipeline_stage_policy == "independent":
+                    self._frame_trigger_priority = int(scheduling.get("frame_base_priority", 0))
+                with runtime_context_defaults(
+                    priority_scheduling=config.scheduler_enabled, managed_execution=config.scheduler_enabled
+                ):
+                    self._manager = create_pipeline_manager(
+                        config.pipeline_id,
+                        self._manifest,
+                        request_timeout=config.request_timeout,
+                        default_task=config.default_task or None,
+                        runtime_options=runtime_options,
+                        priority_scheduling=config.scheduler_enabled,
+                        stage_policy=config.pipeline_stage_policy,
+                        stage_scheduling=stage_scheduling,
+                        frame_base_priority=int(scheduling.get("frame_base_priority", 0)),
+                        registry_set=self._registry_set,
+                        providers=self._providers,
+                    )
             else:
-                from robot_config.observation_transport import effective_observation_transport
-
-                if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
-                    self._video_stream_manager = DeviceVideoStreamManager(
+                for name in ("request_topic", "result_topic", "heartbeat_topic"):
+                    if not getattr(config, name):
+                        raise RuntimeError(f"distributed pipeline requires {name}")
+                self._edge_runtime = EdgeProcessorRuntime(
+                    config.pipeline_id,
+                    self._manifest,
+                    default_task=config.default_task or None,
+                )
+                self._edge_runtime.load()
+                self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
+                self._edge_session.start()
+                if config.external_video_producer:
+                    self._video_stream_manager = _ExternalVideoProducerView(
+                        self._obs_specs,
                         pipeline_id=config.pipeline_id,
                         contract_fingerprint=contract_fingerprint(self._contract),
                         deployment_fingerprint=self._manifest.fingerprint,
-                        observation_specs=self._obs_specs,
                     )
-                # Pipelines whose observations all ride the request (pure DDS
-                # transport) have no video streams to manage; the frame ingress
-                # rejects an empty stream set, so the manager stays unset.
+                else:
+                    from robot_config.observation_transport import effective_observation_transport
 
+                    if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
+                        self._video_stream_manager = DeviceVideoStreamManager(
+                            pipeline_id=config.pipeline_id,
+                            contract_fingerprint=contract_fingerprint(self._contract),
+                            deployment_fingerprint=self._manifest.fingerprint,
+                            observation_specs=self._obs_specs,
+                        )
+                    # Pipelines whose observations all ride the request (pure DDS
+                    # transport) have no video streams to manage; the frame ingress
+                    # rejects an empty stream set, so the manager stays unset.
+
+            self._create_serving_interfaces(config)
+        except Exception as exc:
+            # Construction has not transferred this owner to main() yet.
+            try:
+                self.destroy_node()
+            except Exception as cleanup_error:
+                exc.cleanup_owner = self
+                exc.close_pending = True
+                exc.rollback_errors = (str(cleanup_error),)
+            raise
+
+    def _create_serving_interfaces(self, config: PipelineNodeConfig) -> None:
         self._action_pub = None
         if not config.scheduler_enabled:
             self._action_pub = self.create_publisher(VariantsList, config.action_topic, 10)
@@ -3232,23 +3248,36 @@ class PipelinePolicyNode(Node):
             try:
                 video_stream_manager.close()
             except Exception as exc:
+                self._providers.retain_cleanup(video_stream_manager)
                 self.get_logger().error(f"video stream shutdown failed: {exc}")
         manager = self._manager
-        self._manager = None
         if manager is not None:
             try:
                 manager.close()
             except Exception as exc:
+                if getattr(exc, "close_pending", False):
+                    self._providers.retain_cleanup(manager)
                 self.get_logger().error(f"pipeline shutdown failed: {exc}")
+            self._manager = None
         edge_session = self._edge_session
-        self._edge_session = None
         if edge_session is not None:
-            pending = edge_session.close()
-            self._complete_invalidated(pending, None)
+            try:
+                pending = edge_session.close()
+                self._edge_session = None
+                self._complete_invalidated(pending, None)
+            except Exception as exc:
+                if self._edge_session is not None:
+                    self._providers.retain_cleanup(edge_session)
+                self.get_logger().error(f"edge session shutdown failed: {exc}")
         edge_runtime = self._edge_runtime
-        self._edge_runtime = None
         if edge_runtime is not None:
-            edge_runtime.close()
+            try:
+                edge_runtime.close()
+            except Exception as exc:
+                self._providers.retain_cleanup(edge_runtime)
+                self.get_logger().error(f"edge runtime shutdown failed: {exc}")
+            else:
+                self._edge_runtime = None
         super().destroy_node()
 
 
@@ -3340,12 +3369,16 @@ def main(args: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.destroy_node()
-        if dependencies is not None:
-            dependencies.providers.close()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            try:
+                if dependencies is not None:
+                    dependencies.providers.close()
+            finally:
+                if rclpy.ok():
+                    rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,8 @@ class BackendInferenceError(BackendError):
 
 
 class BackendAdmissionError(BackendError):
+    admission_rejected = True
+
     def __init__(
         self,
         message: str,
@@ -62,6 +64,8 @@ class BackendAdmissionError(BackendError):
     ) -> None:
         super().__init__(message, code=code)
         self.operation_started = operation_started
+        self.outcome_known = not operation_started
+        self.state_mutated = False
 
 
 class BackendCancellationError(BackendError):

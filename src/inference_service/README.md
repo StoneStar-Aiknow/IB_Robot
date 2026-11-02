@@ -38,6 +38,331 @@ manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerp
 
 ## 核心概念
 
+### 后端完成与释放证据
+
+`runtime_context_defaults` 为当前构造上下文提供 `priority_scheduling` 和 `managed_execution`
+默认值。显式参数优先。退出上下文后恢复原值，其他线程不继承这些默认值。
+
+Pipeline 和 Manager 工厂省略优先级参数时，继承构造作用域的默认值。
+显式 `False` 仍覆盖作用域默认值。
+
+独立构造的 `AscendOmModelSession` 也读取同一优先级默认值。
+现有 monolithic policy 节点按 `robot.runtime_scheduler.enable` 同时设置这两个默认值。
+开启调度时，加载的 policy Session 使用 managed 完成等待；关闭时仍按 direct 模式加载。
+typed model services 尚未接入这个开关；执行策略接口不代表后续感知调度器已经接线。
+
+`TorchModelSession` 和 `LeRobotTorchModelSession` 共用 `torch_execution_scope()`。
+异常保留原有的开始、阶段、恢复和待清理证据。
+设备同步只补充完成证据，确定未开始的失败不改写为已开始。
+成功推理只在 `managed_execution=True` 时增加完成等待。
+
+CUDA 和 NPU Session 在加载时固定具体设备索引。
+后续执行和关闭等待同一设备，不依赖调用线程的当前设备。
+LeRobot 的 `resource_domain` 仍按设备类型分组（如 `torch:npu`），多卡共用保守额度，不表示单卡身份。
+
+LeRobot 的预处理和后处理也可能提交设备工作，使用相同的完成工具。
+processor 完成不表示 policy 模型状态已推进。
+预处理后的请求校验错误保留设备证据，不记录持续的 policy 故障。
+managed processor 成功返回前等待完成；direct 正常成功路径不新增等待。
+
+managed CUDA/NPU 成功路径只等待进入回调时的当前流。
+回调必须在这个流提交工作，或在返回前将子流汇合到这个流。
+接口不支持返回后仍独立运行的子流。
+异常、关闭和故障恢复仍使用保守的设备级等待。
+`force_completion_on_error` 只控制异常路径，成功等待由 `complete_on_success` 控制。
+
+如果 direct 返回结果时已超时或已取消，Session 先确认设备完成再丢弃结果。
+如果完成等待失败，执行结果保持未知。
+Session 成功返回后，pipeline 在下一检查点丢弃 direct 结果时也确认设备完成。
+当前帧只记录已参与执行且尚需完成等待的 Session；已取得的失败完成证据直接复用，不等待未执行的组件。
+多个完成检查合并证据，任何未确认完成的工作都不能被后续成功等待覆盖。
+
+两种模式都在执行异常和关闭时确认设备完成。LeRobot reset 也先等待设备完成。
+Session 的公开调用方式保持可用。
+SpeechDirection 的 FullSubNet Torch 执行异常也使用统一完成检查。
+FullSubNet 关闭和故障后的 reset 先等待设备完成。
+等待失败时，FullSubNet 保留资源并允许重试关闭。
+设备连续 2 次关闭排空失败后，close 放弃等待并释放引用。
+放弃时完成状态未知，日志记录放弃事件。
+健康状态的 FullSubNet reset 复用已完成的主机输出证据，不等待其他流。
+reset 重建状态后的完成等待只覆盖提交初始化工作的当前 CUDA 流。
+FullSubNet 也在构造时固定 CUDA 索引，模型、状态和完成等待使用同一设备。
+Torch 执行失败后的同步错误保留在 `completion_error` 诊断中。
+Torch 异常边界清除已退栈的局部引用。
+Handle 的 direct 和策略调用失败诊断都保存不带异常链和 traceback 的快照，避免长期持有被拒绝交付的请求和结果。
+Handle 不缓存抛出的关闭异常，关闭重试后不保留旧调用栈。
+ACL 的次要清理错误写入 `details.cleanup_error`，归一化和序列化后仍保留主错误。
+D2H 主机缓冲释放失败时，原生指针进入隔离列表，已退栈的输出数组引用从异常帧清除。
+
+ACL、HMM、RKNN 资源在释放成功后才清除所有权。
+ACL 保留未释放资源供重试。RKNN/HMM 的重试限制见「关闭失败与恢复限制」。
+
+JPEG codec 自有资源释放后，关闭重试只继续释放 ACL lease，不重新绑定已销毁的 context。
+
+HMM、Ascend、Hisilicon 和 ONNX 的提交前输入错误报告 NOT_STARTED。
+ONNX 在原生调用前复用 binding 校验，检查 dtype、rank 和静态维度。
+Ascend 输入诊断也属于提交前输入边界。
+Ascend 在公共 role 边界合并前序完成证据，Host 编排子类也保留该事实。
+ONNX 复用 Session 的多 role 进度合并。
+输入字节长度错误报告 role、输入索引、实际长度和预期长度。
+
+RKNN 原生推理成功后的输出校验错误保留 COMPLETED，多 role 聚合也保留这份证据。
+RKNN 的空输出检查和数组转换也保留完成证据。
+Session 公共入口的执行后校验不抹除完成证据。
+
+ACL 同步执行或共享 stream 同步成功后，输出读取错误保留 COMPLETED。
+静态 dataset bank 复用普通 ACL 路径的输入准备与 Host 输出读取。
+bank 输入拒绝报告 NOT_STARTED；完成后的输出错误仍要求恢复已推进的状态。
+HMM 完成后的输出提取和 NumPy 转换也保留完成证据。
+Ascend、Hisilicon 和 ONNX 的 role 输出映射复用 Session 完成边界。
+Host 输出错误保留状态修改与恢复要求，但不占用已经空闲的设备额度。
+direct Torch 校验失败时复用设备完成等待。
+
+HMM、RKNN、ACL priority stream pool 和语音 ACL runner 接受可选的 `cleanup.defer` 所有者。
+传入 `cleanup` 时，外部回滚对象保留构造中途取得的资源。
+未传入 `cleanup` 时，构造器先尝试关闭。
+如果关闭失败，初始化异常通过 `cleanup_owner` 保留重试入口。
+构造回滚失败统一通过 `rollback_errors` 记录清理错误文本。
+
+FullSubNet Torch 在构造设备对象前登记回滚。
+ASR 的导入失败保留原始原因和清理所有者。
+ASR 节点入口在构造失败后重试这个所有者。
+ASR Handle 加载失败、加载后的采样率校验失败及 VAD 初始化失败都保留相应所有者。
+ASR 节点的 ROS 接口或定时器初始化失败也保留节点所有者。
+构造函数统一移交 `cleanup_owner`，入口和嵌入调用方都能重试关闭。
+节点关闭同时覆盖尚未交给 VADModule 的 runtime；只有成功清理才删除引用。
+正常退出也保留待清理所有者，并尝试关闭 ROS。
+
+SpeechDirection 入口在节点或 provider 清理抛错时仍执行 ROS shutdown。
+SpeechDirection 创建定时器失败时，构造器关闭已经启动的 runtime。
+入口的清理范围包含节点和依赖构造，provider 重试未完成的释放。
+
+Hisilicon worker 未退出时 `close()` 返回错误并保留进程，关闭开始后不可再次启动或执行。
+执行时 worker 退出保留 `worker_exited` 和未知结果证据，并要求 runtime reload；不能通过重试请求跳过恢复。
+
+Hisilicon 请求写入和响应等待都检查请求期限、取消令牌和协议关闭标记。
+取得协议锁前或首字节写入前取消、超时，均报告 NOT_STARTED。
+这两种拒绝允许后续请求继续使用 worker。
+读写等待使用 poll，支持编号不小于 1024 的管道描述符。
+请求通过非阻塞管道分段写入，短写继续发送剩余字节。
+部分写入后中断、响应中断或协议错误保留未知结果，并要求 reload。
+
+部分写入中断或响应读取取消、超时后，协议拒绝继续发送请求。
+已有进程所有者仍负责清理。
+请求退出等待后，Handle close 才能回收 worker。
+协议层 close 也能中断 I/O 等待，继续执行 terminate/kill。
+无期限且未取消的 Handle 请求仍会等待。
+
+视频编码能力探测把驱动的 FFmpeg 错误视为设备不可用。
+
+### 资源回滚与生命周期预算
+
+`LoadRollback` 逆序释放资源；某项失败后保留该项及其依赖，下一次回滚从失败项继续。
+`ModelSession` 保留失败加载的回滚记录，后续 `close()` 可以重试。
+Factory 和 Session 共用 `LoadRollback`。
+Factory 异常通过 `cleanup_owner` 移交待清理所有者。
+
+感知和 ZipVoice 插件构造失败后先关闭 Handle，仅在清理未完成时移交 provider。
+ZipVoice 在 Handle 真正关闭后才标记自身关闭，构造清理失败不会覆盖原加载异常。
+`RuntimeProviders.retain_cleanup()` 保留 Factory 和插件构造失败的所有者。
+provider 先关闭这些所有者，再关闭准入 provider 和 ACL provider。
+`process_resources` 统一列出进程资源，关闭顺序和 Handle 所有权过滤共用这份名单。
+
+`InferencePipelineManager` 在 direct 和 priority 模式下都重试未完成的关闭。
+关闭重试是固定行为，不提供关闭重试开关。
+Manager 启动失败时通过 `cleanup_owner` 移交待清理所有者。
+Pipeline 和 Model Service 节点把关闭失败的所有者交给 provider。
+服务退出时，即使节点关闭失败，也会尝试关闭 provider 和 ROS。
+
+模型加载成功后，如果节点创建 ROS 实体失败，构造函数执行相同的关闭路径。
+Provider 关闭失败时，外层异常保留 `close_pending=True` 和原始原因链。
+
+`lifecycle_budget` 让嵌套清理共享期限。
+`lifecycle_scope` 传递控制调用的期限和取消令牌。
+
+启动检查、控制锁等待、ACL 完成等待和 Hisilicon 进程等待共享剩余预算。
+期限耗尽后，关闭操作保留资源供重试。预算不能中断已经进入的不可取消 SDK 调用。
+控制调用的取消令牌也约束控制锁和排空等待。
+
+Hisilicon 的 EOF、terminate、kill 和 stderr 线程等待轮询取消令牌。
+每段等待不超过 50 ms，取消后保留进程所有权供关闭重试。
+
+无参嵌套控制调用继承外层令牌，并采用更严格的期限。
+回滚、provider 和 ACL 所有权锁的等待也使用这个预算。
+
+ACL 在各次独立释放调用之间检查预算，保留尚未释放的资源。
+Handle 在加载前、每项资源加载前和发布 READY 前检查启动条件。
+HMM 和 RKNN 在后续原生初始化前再次检查启动条件。
+
+多角色请求和 pipeline stage 透传已有 metadata。
+`StageTicket` 是可选的阶段身份工具；当前生产调度路径不自动创建或消费它。
+派生 `RuntimeContext` 保留 `managed_execution`。
+
+### Handle 执行策略与流边界
+
+`bind_execution_policy` 一次性注入 `RuntimeExecutionPolicy`，返回本地执行授权对象。
+私有本地入口和 execute/step 的兼容参数 `_dispatch_key` 接受这个对象。
+未携带授权对象的公开 execute、stream、reset、close 使用策略；策略失败后不会直通。
+策略可扩展 `submit_frame`。`StageTicket` 是无 scheduler 依赖的不可变交接身份。
+
+基础策略要求 `ready/execute/reset/close/cancel`。
+策略必须负责取消尚未进入本地执行的排队请求。
+流策略还要求 `open_stream/step/reset_stream/close_stream`。
+stream runtime 组装时也检查这 4 个方法，缺少控制方法不能视为清理成功。
+策略只能在 Handle 空闲时绑定。
+`context_provider` 必须保留请求 ID 和同一取消令牌，只能缩短调用方期限。
+原生 Session 必须使用 `managed_execution=True` 加载。
+Handle 拒绝把已按 direct 模式加载的 Session 改绑策略。
+先绑定再加载时，Handle 也检查这个条件。
+阶段执行继续使用 `StagedModelExecutor`，Handle 不另设阶段控制入口。
+
+`drain_managed` 校验 authority，撤销准入并持有控制锁。
+drain 使用共享生命周期预算，完成后仍需明确恢复或关闭。
+drain 还取得已有 stream 控制锁，避免与 reset/close 同时访问设备。
+组合 assembly 的全部 Session 和额外可执行组件都必须支持 drain；缺少任一完成证明时拒绝操作，不归还额度。
+drain 展开 Factory 的嵌套 assembly，处理自引用并按身份去重 Session；编排包装器不负责设备完成证明。
+assembly 未声明 Session 时，执行器自身必须提供 drain。
+独占流 reset 还取得运行时控制锁，防止等待中的 drain 丢失准入屏障。
+只有当前调用携带有效 authority 时，Handle 才复用外层准入。
+Handle 统一处理策略的同步异常和 Future 异常。缺少完成证据的派发失败保持结果未知。
+原始取消和期限异常的默认属性不构成未开始证明。
+显式 `operation_started=False` 或 `NOT_STARTED` 证据表示请求未开始。
+Session 在真实后端调用前明确提供 `NOT_STARTED`。
+
+Torch callable 内的裸控制异常仍触发设备完成等待。
+只有明确的原生未开始证据允许跳过等待。
+
+通用 pipeline 在 StageFrame.evidence 字段汇总执行证据。
+后续 role 的未开始不能覆盖整个请求已经执行的事实。
+Staged worker 的检查点和错误回调使用同一帧证据；Visual snapshot 不把旧帧证据带入新的 Action 请求。
+RequestDirectExecutor 同样保留前序 role 的执行和状态修改证据。原生提交前的输入校验失败报告 NOT_STARTED。
+frame 同步提交异常即使尚未返回 Future，也按异常中的启动证据执行隔离；open_stream 保留原生拒绝证据。
+
+未绑定策略的 Handle 使用既有 direct 调用方式。
+`ready` 包含策略可用性，`local_ready` 仅表示后端状态。
+期限和取消贯穿本地执行与控制操作。
+
+普通请求、frame 和 stream step 共用活动请求身份及取消登记。
+正在开流的请求也登记取消令牌，支持公开 `cancel(request_id)`。
+绑定策略或支持 frame 的执行器要求活动 `request_id` 唯一。
+无策略的同步 direct 请求保留并行使用同一 ID 的兼容行为。
+按 ID 取消会通知当前所有匹配的请求，完成一个请求不会丢失其余登记。
+Handle 在条件锁外同步调用取消回调。
+回调必须及时返回，只发送通知，不等待当前执行或后续 policy/executor 取消钩子。
+取消预算不能强制中断任意 Python 回调；阻塞观察者不属于支持范围。
+
+取消先设置本地令牌，再通知 policy，最后调用 executor 的取消钩子。
+任一取消钩子抛错不会阻止另一侧收到通知。
+executor 的兼容签名在调用前匹配，内部 TypeError 不触发重复调用。
+
+direct 准入等待支持取消，取得额度后再次检查 context。
+等待实例或共享域额度的活动请求还检查 Handle 的现有生命周期状态。
+close/reset 撤销准入后，这些未进入后端的等待者退出，避免排空等待自身持有的额度。
+stream step 复用实例及资源域准入，并遵守 Handle 活动执行上限。
+request 和 stream 在退出原生准入范围前归一化异常，共用证据转换规则。
+原异常的 `OutcomeEvidence` 优先；提交后的普通取消不构成完成证明。
+无状态模型的普通异常也需要完成证据。
+policy 及其派发的本地执行采用相同的未知结果判定。
+如果原生执行结果未知，准入对象继续持有额度。
+成功恢复、完成排空或关闭后，Handle 才归还额度。
+`per_stream` 的成功 `close_stream` 必须证明该流原生工作和资源已排空，随后按流 ID 归还额度。
+`runtime_exclusive` 的逻辑关流不证明设备完成；运行时级故障的额度也不能由单流恢复归还。
+运行时要求恢复时，`reset_stream()` 拒绝调用；使用 `reset()` 完成恢复后才开放准入并归还额度。
+Voice ASR 的 VAD 公开 reset 使用运行时级 reset。
+VAD 仅在 reset 成功后清空主机音频上下文。
+
+运行时 reset 内的 Host 流清理不归还额度，全部原生 Session 恢复成功后才统一释放。
+如果没有独立的原生 reset，活动流通过完整 reset_stream 恢复。
+如果独占流已关闭且没有原生 reset，恢复返回 reset_unsupported。
+此时额度继续隔离，调用方必须关闭并重建运行时。
+
+独占流正在关闭时发生未知执行，也保留运行时恢复要求。
+共享设备域的其他 Handle 也受剩余额度约束。
+请求和 stream 的确定未执行准入拒绝都不增加模型故障计数。
+frame 准入失败同步抛出 `ExecutionFailure`，已准入请求通过 Future 交付结果。
+policy 的 execute、frame、step 和 open_stream 结果交付都检查期限和取消。
+
+这些工作入口在 policy 派发前也检查 context，已失效请求报告 NOT_STARTED。
+控制入口保留原有的不可逆关闭语义。
+
+首个 role 尚未执行时取消，Session 报告 NOT_STARTED。
+已完成 role 之间取消，多角色编排保留 COMPLETED 证据。
+SAM2 在 decoder 输入构造前和最终后处理前检查取消与期限。
+Session 和 frame 已完成后发生超时或取消，仍保留 COMPLETED 证据。
+Pipeline 保留原始异常类型，并将归一化证据传递到 ROS 边界。
+执行结果已知但资源清理未完成时，Handle 也会停止准入。
+未指定更大故障范围时，stream 按 state bank 的所属范围停止准入，已知结果保持已知。
+有状态步骤已推进状态但结果交付失败时，流必须恢复。
+完成证据允许释放设备额度，但不证明调用方的主机状态已经同步。
+后端明确要求 `RESET_RUNTIME` 或运行时 `RELOAD` 时，不得降级为流级恢复，即使该流正在关闭。
+request 路径同样执行显式恢复要求，包括已知结果的故障；`RELOAD` 不降级为 reset。
+
+对外异常、最后失败快照和 Handle 状态使用同一次恢复判定。
+reset 完成后，Handle 先完成恢复收尾，再检查结果交付期限和取消。
+后置控制失败保留 COMPLETED，不重新隔离已经恢复的运行时。
+
+流级 `CLOSE_STREAM` 和 `RELOAD` 阻止后续 step，也禁止用 reset_stream 替代。
+独占流结果未知时，这两种要求升级为运行时 RELOAD。
+reset 明确要求 RELOAD 后，允许重试 reset 的配置也不能绕过要求。
+
+reset 等待中的在途故障会更新恢复状态，等待超时不会重新开放旧的 READY。
+单流 reset 等待结束后，在条件锁内重新核验流状态和恢复要求，不覆盖新的 CLOSE_STREAM 或 RELOAD。
+本地 reset_stream/close_stream 失败与 step 共用恢复处理，明确的运行时恢复要求关闭整个 Handle 的准入。
+
+同步 execute/step 内重入同一 Handle 的 reset/close/drain_managed 会立即拒绝，不等待自身，也不改变关闭状态。
+open_stream 的执行线程也参与这个重入检查。
+Handle 的本地和 policy 帧结果共用交付重入检查，避免回调等待自身 worker。
+活动 step 重入同流 reset_stream/close_stream 时，公开入口先拒绝，再决定是否派发。
+拒绝重入不会关闭流，也不会阻止后续 step。
+
+SpeechDirection 的 Host、FB、SB、VAD 共用一组流状态。
+如果音频步骤中断，流适配层要求 reset。
+如果底层明确要求 RELOAD，适配层保留 RELOAD 及恢复可用性。
+单 role 的 NOT_STARTED 不能覆盖整步已推进的 Host/前序 role 状态。
+
+SpeechDirection 开流时的隐式 reset 继承开流期限和取消令牌。
+SpeechDirection 公开 `reset()` 调用运行时级 reset，保留原 stream ID。
+生产组装的 stream 层只清理 Host 状态，Handle 统一重置拥有的原生 Session，每个 Session 只重置一次。
+公开 `reset_stream()` 不接受内部控制锁开关；单流 reset 仍完整重置该流状态。
+语音组合最多使用一个共享资源域；FullSubNet Torch 与 Silero Ascend 混合时仍取得 Ascend 域额度。
+多个资源域或不一致的域上限在构造时明确拒绝。
+
+共享域额度覆盖完整音频 hop，包含 Host 和其他后端的处理时间。
+关闭 runtime scheduler 时也保留这个安全边界，不承诺逐 role 准入或延迟上限。
+
+Handle 在恢复完成前拒绝下一步输入。
+设备完成证据与整步状态恢复要求分别保留。
+流 reset 在等待活动 step 前设置控制标记，避免后续输入抢占。
+
+关闭开始后不能重新准入，清理未完成时保留资源供重试。
+Handle 拥有整个 assembly，也关闭加载失败时尚未尝试加载的组件。
+本地关闭完成后，策略关闭仍需完成确认。
+Handle 拒绝帧回调内的 reset/close，外部所有者负责控制操作。
+直接关闭 staged executor 时，自身 worker 返回 pending。
+ACL 完成回调也拒绝等待同一 worker 的排队任务。
+
+正常输出拷贝使用局部 Host buffer，只有释放失败才进入隔离。
+worker 退出等待遵守共享期限。
+两个 staged worker 退出后，executor 清空最后一帧快照。
+SpeechDirection 的线程 join 分段检查剩余期限和取消令牌。
+
+stream close 先校验参数，再在等锁或派发策略前记录关闭意图。
+reset 不能重新开放这个 stream。
+open 返回过迟或与 Close 竞争时，Handle 保留 native stream 的清理所有权。
+stream 具备所属 handle 身份校验；关闭成功后释放 native state，仅保留最近 128 条关闭记录。
+失败或未确认关闭的 stream 继续占有资源，不因历史记录淘汰而丢失。
+
+SpeechDirection 的底层关闭历史也限制为 128 条，旧的已关闭对象仍支持幂等关闭。
+SpeechDirection 的 stop、兼容包装和节点销毁保留 pending 清理责任。
+节点向 provider 移交 Runtime，让重试先等待 worker 退出。
+Runtime 构造失败但 Handle 已创建时，节点仍关闭该 Handle，并移交未完成的清理。
+stop 的首个错误不覆盖后续未完成清理；是否需要重试由最终线程和 Handle 状态决定。
+SpeechDirection 关闭流时只撤销逻辑身份，开流前才重置独占状态。
+最终销毁直接进入后端关闭，不要求设备先恢复可用。
+
+FB、SB 和 VAD 复用外层 step 的取消令牌和期限。
+SigLIP2、SAM2 automatic 和 GraspGen 把请求优先级传到各角色的实际 OM 执行。
+
 ### Bundle
 
 每个可部署目录必须包含唯一的 `inference_manifest.json`。Policy bundle 还必须包含 LeRobot 语义文件：
@@ -237,12 +562,24 @@ generation 与 prompt，且观测年龄不超过该阈值。Pipeline Node 将 RO
 
 下列生命周期行为仅在启用 scheduler 时生效：
 
-- `PipelineManager.close()` 可再次尝试释放仍处于 `close_pending` 的 owned pipeline。
 - reset 跳过明确无状态且不支持 reset 的非 executor 组件，避免无效 reset 报错。
 - 有状态 policy 的后端已完成但结果迟到，或已开始后发生失败时，后续 `infer()` 会持续报告未就绪；成功 reset 后才能恢复。
-- LeRobot Torch session 加载后发现的 reset 能力会同步到 handle，`pipeline.reset()` 会真正调用 `policy.reset()`，不再因加载前能力缺失而成为 no-op。
 
-`robot.runtime_scheduler.enable=false` 或缺省时保留原有拓扑、同步执行与生命周期语义；新增恢复行为不进入 legacy 路径。
+LeRobot Torch session 加载后发现的 reset 能力始终同步到 Handle。
+调度启用、关闭或配置缺失时，`pipeline.reset()` 都真正调用 `policy.reset()`。
+
+reset 不再是无害的空操作。drain 或 `policy.reset()` 抛错时，Handle 记录故障。
+启用了 `retry_failed_reset` 的 Handle 进入 RESET_REQUIRED，reset 可以重试。
+其他 Handle 进入 FAILED，要求 RELOAD。
+reset 服务返回 `success=false`，后续请求以 `recovery_required` 拒绝。
+reset 服务的调用方必须按失败处理返回值。
+
+`robot.runtime_scheduler.enable=false` 或默认关闭时，保留原有拓扑和同步执行方式。
+清理重试独立于调度开关：`PipelineManager.close()` 在两种模式下都重试 `close_pending`。
+Torch 异常、reset 和关闭会确认设备完成，direct 成功推理不额外同步。
+Handle 的取消和不可逆 stream Close 边界也适用于 direct 路径。
+direct 无状态同步调用的普通异常保持完成已知；原生后端显式上报的未知结果仍触发隔离。
+设备完成确认、资源安全释放和损坏状态隔离是两种模式的共同保证。
 测试同时覆盖 launch 参数和运行时迟到结果、reset 与 Close 行为。
 
 Global 只接受 `InferenceServingStatus.scheduling_capability_schema_version == 1`；零值和未知版本均在
@@ -861,3 +1198,17 @@ not change runtime health; model resource failures are projected through handle 
 ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/robot.yaml \
     with_model_services:=false
 ```
+
+### 关闭失败与恢复限制
+
+流关闭失败时，Handle 保留流和配额。`retry_pending_stream_closes()` 可重试待关闭流；
+运行时 `reset()` 先重试这些关闭。ASR 在再次开流前执行相同检查。
+reset 释放隔离额度前必须完成原生恢复，不能以空 reset 作为完成证明。
+
+RKNN/HMM 原生释放抛出无完成证据的异常时，保留所有权并报告 `close_pending`。
+后续关闭不会再次调用同一原生释放函数，也不宣称资源已经释放；这类故障需要进程重启。
+只有显式 `NOT_STARTED` 证据允许重试原生释放。成功关闭仍幂等。
+
+字符串流 ID 的关闭幂等历史仅保留最近 128 条；淘汰后返回 `stream_not_found`。
+持有原始 `StreamHandle` 对象时，已关闭对象的幂等性不受历史淘汰影响。
+该限制也适用于 SpeechDirection 的字符串流 ID。

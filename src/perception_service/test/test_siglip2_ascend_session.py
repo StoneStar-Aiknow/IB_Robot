@@ -13,7 +13,10 @@ def _session(calls):
     session._text_batch_size = MethodType(lambda _self: 4, session)
     session._embedding_dimension = MethodType(lambda _self, _role: 3, session)
 
-    def run_role(_self, _index, role, values):
+    def run_role(_self, _index, role, values, *, request, context, previous_roles_completed=False):
+        assert isinstance(request, ModelRequest)
+        assert context.request_id == "siglip2"
+        assert previous_roles_completed is bool(calls)
         calls.append((role, values))
         if role == "vision":
             value = np.asarray(values["host.siglip2.image"], dtype=np.float32)
@@ -60,4 +63,4 @@ def test_siglip2_ascend_rejects_mismatched_token_and_attention_shapes():
     )
 
     with pytest.raises(BackendInferenceError, match="token and attention shapes differ"):
-        session._execute(request, ExecutionContext("siglip2"))
+        session._validate_request(request, ExecutionContext("siglip2"))

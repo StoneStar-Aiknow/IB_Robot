@@ -119,7 +119,14 @@ class ResourceDomainLease:
     def limit(self) -> int:
         return self._gate.limit
 
-    def acquire(self, deadline: datetime | None = None) -> None:
+    def acquire(self, deadline: datetime | None = None, *, context=None, check=None) -> None:
+        if context is not None:
+            from inference_service.unified_runtime.admission import acquire_admission
+
+            acquire_admission(
+                self._gate.semaphore, context.deadline, "resource-domain admission expired", context, check
+            )
+            return
         _acquire_before_deadline(
             self._gate.semaphore,
             deadline,

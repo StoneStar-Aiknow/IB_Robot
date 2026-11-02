@@ -26,6 +26,17 @@ from voice_asr_service.speech_direction.model_sessions import SpeechDirectionRol
 from voice_asr_service.speech_direction.speech_gate import SileroVadEngine  # noqa: E402
 
 
+def test_speech_gate_routes_host_only_and_native_resets_through_one_interface():
+    from voice_asr_service.speech_direction.speech_gate import SpeechGate
+
+    calls = []
+    gate = SpeechGate.__new__(SpeechGate)
+    gate.silero = SimpleNamespace(reset_state=lambda **kwargs: calls.append(kwargs["reset_backend"]))
+    gate.reset()
+    gate.reset(reset_backend=False)
+    assert calls == [True, False]
+
+
 class _Execution:
     def __init__(self) -> None:
         self.calls = []

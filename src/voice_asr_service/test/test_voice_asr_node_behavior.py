@@ -30,6 +30,92 @@ from voice_asr_service.voice_asr_node import VoiceASRNode  # noqa: E402
 _LOGGER = logging.getLogger("voice-asr-node-test")
 
 
+def test_normal_exit_keeps_cleanup_owner_and_shuts_down_ros_after_failure(monkeypatch):
+    import rclpy
+    from rclpy.node import Node
+
+    from voice_asr_service import voice_asr_node
+
+    calls, blocked = [], [True]
+    node = VoiceASRNode.__new__(VoiceASRNode)
+    node._external_input = None
+    node._audio_capture = SimpleNamespace(cleanup=lambda: calls.append("capture"))
+
+    def cleanup():
+        calls.append("asr")
+        if blocked[0]:
+            raise RuntimeError("ASR release pending")
+
+    node._asr = SimpleNamespace(cleanup=cleanup)
+    node._vad = SimpleNamespace(close=lambda: calls.append("vad"))
+
+    def cancel_timer():
+        assert not getattr(node, "_node_destroyed", False), "timer is already destroyed"
+
+    node._control_timer = SimpleNamespace(cancel=cancel_timer)
+    monkeypatch.setattr(Node, "destroy_node", lambda _: calls.append("node"))
+    monkeypatch.setattr(voice_asr_node, "VoiceASRNode", lambda: node)
+    monkeypatch.setattr(
+        voice_asr_node,
+        "SingleThreadedExecutor",
+        lambda: SimpleNamespace(
+            add_node=lambda _: None,
+            spin=lambda: None,
+            remove_node=lambda _: calls.append("remove"),
+            shutdown=lambda **_: calls.append("executor"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="ASR release pending") as caught:
+        voice_asr_node.main()
+    assert not rclpy.ok()
+    assert calls == ["remove", "capture", "asr", "vad", "node", "executor"]
+    assert caught.value.cleanup_owner is node and caught.value.close_pending
+    blocked[0] = False
+    caught.value.cleanup_owner.close()
+    assert calls.count("node") == 1 and calls.count("asr") == 2
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("normalized_error", [False, True])
+def test_main_receives_constructor_cleanup_owner_and_retries_before_ros_shutdown(
+    monkeypatch, cleanup_fails, normalized_error
+):
+    import rclpy
+
+    from voice_asr_service import voice_asr_node
+
+    calls = []
+    blocked = [cleanup_fails]
+    original = RuntimeError("encoder construction failed")
+
+    class FailedASR:
+        def initialize(self, **kwargs):
+            original.cleanup_owner = self
+            original.close_pending = True
+            raise original
+
+        def close(self):
+            calls.append("close")
+            if blocked[0]:
+                if normalized_error:
+                    from inference_service.unified_runtime import ExecutionFailure
+
+                    raise ExecutionFailure("close_pending", "native release pending", details={"close_pending": True})
+                raise RuntimeError("native release pending")
+
+        cleanup = close
+
+    monkeypatch.setattr(voice_asr_node, "ASRInferenceModule", FailedASR)
+    args = ["--ros-args", "-p", "input_mode:=external_vad", "-p", "exit_on_init_failure:=true"]
+    try:
+        assert voice_asr_node.main(args) == 1
+        assert calls == ["close"]
+        assert not rclpy.ok()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 class FakeASR:
     def __init__(self, *, streaming: bool = True, ready: bool = True):
         self.streaming = streaming
@@ -509,3 +595,74 @@ def test_stop_recognition_returns_to_idle_when_final_decode_fails():
     assert node.commands == []
     assert node._state_machine.state is NodeState.IDLE
     assert not node._audio_capture.started
+
+
+@pytest.mark.parametrize("failure_at", ["sample_rate", "vad_load", "vad_contract", "ros_interface", "control_loop"])
+def test_startup_validation_failure_retains_all_acquired_audio_owners(monkeypatch, failure_at):
+    import rclpy
+
+    from voice_asr_service import voice_asr_node
+
+    calls, blocked = [], [True]
+
+    class ASR:
+        sample_rate = 8000 if failure_at == "sample_rate" else 16000
+
+        def initialize(self, **kwargs):
+            calls.append("asr_load")
+
+        def is_streaming(self):
+            return True
+
+        def cleanup(self):
+            calls.append("asr_close")
+            if blocked[0]:
+                raise RuntimeError("ASR cleanup pending")
+
+    class VAD:
+        sample_rate_hz = 8000 if failure_at == "vad_contract" else 16000
+        frame_size = 512
+
+        def __init__(self, *args):
+            pass
+
+        def initialize(self):
+            calls.append("vad_load")
+            if failure_at == "vad_load":
+                raise RuntimeError("partial VAD load failed")
+
+        def close(self):
+            calls.append("vad_close")
+
+    monkeypatch.setattr(voice_asr_node, "ASRInferenceModule", ASR)
+    monkeypatch.setattr(voice_asr_node, "ManifestVadRuntime", VAD)
+    if failure_at in {"ros_interface", "control_loop"}:
+        method = "create_publisher" if failure_at == "ros_interface" else "create_timer"
+        original = getattr(VoiceASRNode, method)
+
+        def fail(self, *args, **kwargs):
+            if "vad_load" not in calls:
+                return original(self, *args, **kwargs)
+            calls.append(failure_at)
+            raise RuntimeError(f"{failure_at} initialization failed")
+
+        monkeypatch.setattr(VoiceASRNode, method, fail)
+        if failure_at == "control_loop":
+            # The timer ownership test does not require the optional audio message package.
+            monkeypatch.setattr(
+                VoiceASRNode,
+                "_init_ros_interface",
+                lambda self: setattr(self, "_cb_group", voice_asr_node.MutuallyExclusiveCallbackGroup()),
+            )
+    try:
+        assert voice_asr_node.main(["--ros-args", "-p", "exit_on_init_failure:=true"]) == 1
+        assert not rclpy.ok()
+        assert "asr_close" in calls and "vad_close" in calls
+        if failure_at in {"ros_interface", "control_loop"}:
+            assert (
+                calls.index("asr_load") < calls.index("vad_load") < calls.index(failure_at) < calls.index("asr_close")
+            )
+        assert calls.count("asr_close") == 1
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()

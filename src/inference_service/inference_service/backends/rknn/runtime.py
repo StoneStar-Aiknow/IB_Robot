@@ -9,8 +9,10 @@ from pathlib import Path
 import numpy as np
 
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.types import RuntimeContext
+from inference_service.unified_runtime import OutcomeEvidence, OutcomeState
+from inference_service.unified_runtime.lifecycle import check_startup
 
 _ALLOWED_RUNTIME_OPTIONS = frozenset({"target", "core_mask", "random_seed"})
 
@@ -48,38 +50,77 @@ class RKNNSession:
         target: str | None,
         core_mask: int,
         data_format: str | None,
+        cleanup=None,
     ) -> None:
         self.role = role
+        check_startup()
         self._runtime = rknn_type()
         self._data_format = data_format
         self._closed = False
+        self._closing = False
+        self._release_uncertain: str | None = None
+        if cleanup is not None:
+            cleanup.defer(self.close)
         try:
+            check_startup()
             ret = self._runtime.load_rknn(str(path))
             if ret != 0:
                 raise RuntimeError(f"load_rknn returned {ret}")
+            check_startup()
             ret = self._runtime.init_runtime(target=target, core_mask=core_mask)
             if ret != 0:
                 raise RuntimeError(f"init_runtime returned {ret}")
-        except Exception:
-            self.close()
+        except Exception as exc:
+            if cleanup is None:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
             raise
 
     def infer(self, inputs: Mapping[int, np.ndarray]) -> dict[int, np.ndarray]:
-        if self._closed:
+        if self._closing or self._closed:
             raise BackendInferenceError(f"RKNN role {self.role!r} is closed", code="runtime_not_loaded")
         ordered = tuple(inputs[index] for index in sorted(inputs))
-        outputs = self._runtime.inference(inputs=list(ordered), data_format=self._data_format)
-        if outputs is None or len(outputs) == 0:
-            raise BackendInferenceError(f"RKNN role {self.role!r} returned no outputs", code="missing_runtime_output")
-        return {index: np.asarray(output) for index, output in enumerate(outputs)}
+        try:
+            outputs = self._runtime.inference(inputs=list(ordered), data_format=self._data_format)
+        except Exception as exc:
+            raise BackendInferenceError(
+                f"RKNN role {self.role!r} inference failed: {exc}",
+                operation_started=True,
+                outcome_known=False,
+            ) from exc
+        try:
+            if outputs is None or len(outputs) == 0:
+                raise BackendInferenceError(
+                    f"RKNN role {self.role!r} returned no outputs", code="missing_runtime_output"
+                )
+            return {index: np.asarray(output) for index, output in enumerate(outputs)}
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.completed(f"model.{self.role}.outputs")
+            raise
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        self._closing = True
+        if self._release_uncertain is not None:
+            raise BackendLifecycleError(self._release_uncertain, code="release_outcome_unknown", close_pending=True)
         release = getattr(self._runtime, "release", None)
         if callable(release):
-            release()
+            try:
+                release()
+            except Exception as exc:
+                # A raw SDK exception may follow a partial free. Retain the
+                # owner, but never repeat that release without nonstart proof.
+                if getattr(getattr(exc, "evidence", None), "state", None) is not OutcomeState.NOT_STARTED:
+                    self._release_uncertain = f"RKNN release outcome unknown; process restart required: {exc}"
+                raise BackendLifecycleError(
+                    self._release_uncertain or str(exc), code="release_outcome_unknown", close_pending=True
+                ) from exc
+        self._closed = True
 
 
 def import_rknn_type() -> type:

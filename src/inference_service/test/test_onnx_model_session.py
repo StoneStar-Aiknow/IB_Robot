@@ -12,7 +12,7 @@ import pytest
 
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, physical_device
 from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry, RuntimeContext
-from inference_service.backends.errors import BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.registry import _validate_onnx
 from inference_service.model_sessions import OnnxRuntimeModelSession, build_onnx_model_session
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
@@ -373,6 +373,104 @@ def test_onnx_session_executes_manifest_bound_graph(tmp_path) -> None:
     assert session.capabilities.stateful is False
     assert graph.feeds[0]["input"].shape == (4,)
     session.close()
+
+
+def test_onnx_session_accepts_bfloat16_bindings(tmp_path) -> None:
+    # Standard NumPy cannot resolve "bfloat16"; the session must fall back to
+    # ml_dtypes instead of rejecting the binding with a raw TypeError.
+    pytest.importorskip("ml_dtypes")
+    import ml_dtypes
+
+    bf16 = np.dtype(ml_dtypes.bfloat16)
+    graph = _FakeGraph(("input",), ("prob",), lambda feed: [feed["input"]])
+    ort = _fake_ort({str(tmp_path / "artifacts/model.onnx"): graph})
+    manifest = _stateless_manifest()
+    manifest["model"]["inputs"][0]["dtype"] = "bfloat16"
+    manifest["model"]["outputs"][0]["dtype"] = "bfloat16"
+    manifest["model"]["outputs"][0]["shape"] = [4]
+    deployment = manifest["deployments"]["onnx_cpu"]
+    deployment["bindings"]["model"]["inputs"][0]["dtype"] = "bfloat16"
+    deployment["bindings"]["model"]["outputs"][0]["dtype"] = "bfloat16"
+    deployment["bindings"]["model"]["outputs"][0]["shape"] = [4]
+    context = _context(tmp_path, manifest)
+    session = OnnxRuntimeModelSession(ort_loader=lambda: ort)
+    session.load(context)
+
+    outputs = session.execute(
+        ModelRequest({"host.silero.audio": np.ones(4, dtype=bf16)}),
+        ExecutionContext("onnx-bf16"),
+    )
+
+    assert outputs["host.silero.prob"].dtype == bf16
+    assert graph.feeds[0]["input"].dtype == bf16
+    with pytest.raises(BackendInferenceError) as error:
+        session.execute(
+            ModelRequest({"host.silero.audio": np.ones(4, dtype=np.float32)}),
+            ExecutionContext("onnx-bf16-invalid"),
+        )
+    assert error.value.code == "role_model_input_dtype_mismatch"
+    session.close()
+
+
+@pytest.mark.parametrize("role_entry", [False, True])
+@pytest.mark.parametrize("real_ort", [False, True])
+@pytest.mark.parametrize("bad_input", [np.ones(4, np.float64), np.empty(0, np.float32), np.ones((1, 4), np.float32)])
+def test_invalid_onnx_input_preserves_handle_capacity_and_next_request(tmp_path, role_entry, real_ort, bad_input):
+    from inference_service.backends import ResourceDomainAdmissions
+    from inference_service.unified_runtime import (
+        Deadline,
+        ExecutionFailure,
+        ModelRuntimeHandle,
+        OutcomeState,
+        RuntimeAssembly,
+        RuntimeProviders,
+    )
+
+    context = _context(tmp_path, _stateless_manifest())
+    path = tmp_path / "artifacts/model.onnx"
+    if real_ort:
+        onnx = pytest.importorskip("onnx")
+        ort = pytest.importorskip("onnxruntime")
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node("ReduceMean", ["input"], ["prob"], keepdims=1)],
+            "input-validation",
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [4])],
+            [onnx.helper.make_tensor_value_info("prob", onnx.TensorProto.FLOAT, [1])],
+        )
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=9)
+        onnx.save(model, path)
+    else:
+        graph = _FakeGraph(("input",), ("prob",), lambda feed: [np.asarray([1.0], np.float32)])
+        ort = _fake_ort({str(path): graph})
+    session = OnnxRuntimeModelSession(ort_loader=lambda: ort)
+
+    def execute(request, execution):
+        if role_entry:
+            return session.execute_role("model", request.inputs, request, execution)
+        return session.execute(request, execution)
+
+    providers = RuntimeProviders(object(), ResourceDomainAdmissions())
+    owner = ModelRuntimeHandle(
+        RuntimeAssembly(SimpleNamespace(execute=execute), session=session, load_context=context, providers=providers)
+    )
+    owner.load()
+    native = session._sessions["model"]
+    try:
+        with pytest.raises(ExecutionFailure) as caught:
+            owner.execute(ModelRequest({"host.silero.audio": bad_input}), ExecutionContext("invalid"))
+        assert caught.value.evidence.state is OutcomeState.NOT_STARTED
+        assert caught.value.evidence.outcome_known and not caught.value.evidence.state_mutated
+        assert owner.ready and not owner._admission._retained
+        if not real_ort:
+            assert graph.feeds == [], "invalid bindings must be rejected before the SDK call"
+        result = owner.execute(
+            ModelRequest({"host.silero.audio": np.ones(4, np.float32)}), ExecutionContext("valid", Deadline.after(1))
+        )
+        np.testing.assert_array_equal(result.outputs["host.silero.prob"], np.ones(1, np.float32))
+        assert session._sessions["model"] is native and owner.ready and not owner._admission._retained
+    finally:
+        owner.close()
+        providers.close()
 
 
 def test_onnx_stateful_session_keeps_and_resets_host_state(tmp_path) -> None:

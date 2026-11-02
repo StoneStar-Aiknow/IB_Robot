@@ -56,11 +56,16 @@ def build_perception_session(
     if context.backend == "ascend":
         device_id = _ascend_device_id(model_type, adapter, context, options, {"device_id"})
         runtime_manager = getattr(providers, "acl_runtime_provider", None) if providers is not None else None
+        session_options = {
+            "device_id": device_id,
+            "runtime_manager": runtime_manager,
+            "priority_scheduling": context.priority_scheduling,
+        }
         if model_type == "siglip2":
-            return SigLIP2AscendSession(device_id=device_id, runtime_manager=runtime_manager)
+            return SigLIP2AscendSession(**session_options)
         if model_type == "sam2" and adapter.identity.operation == "automatic":
-            return SAM2AutomaticAscendSession(device_id=device_id, runtime_manager=runtime_manager)
-        return AscendOmModelSession(device_id=device_id, runtime_manager=runtime_manager)
+            return SAM2AutomaticAscendSession(**session_options)
+        return AscendOmModelSession(**session_options)
     if context.backend == "torch":
         if options:
             raise ValueError(
@@ -99,6 +104,7 @@ def build_graspgen_session(
     return GraspGenAscendSession(
         device_id=device_id,
         config=adapter.config,
+        priority_scheduling=context.priority_scheduling,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
     )
 

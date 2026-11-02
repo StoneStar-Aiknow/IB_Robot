@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import numpy as np
 
@@ -11,7 +12,19 @@ from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.types import RuntimeContext
 from inference_service.model_sessions.ascend import AscendOmModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    LoadRollback,
+    ModelRequest,
+    OutcomeEvidence,
+    OutcomeState,
+)
+from inference_service.unified_runtime.errors import (
+    RecoveryAction,
+    RecoveryRequirement,
+    RecoveryScope,
+    execution_evidence,
+)
 
 
 class StatefulAscendOmModelSession(AscendOmModelSession):
@@ -169,14 +182,15 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
                     models[role].zero_device_buffer(buffer)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
-        deployment = self._loaded_deployment()
-        if len(deployment.execution) != 1:
-            raise BackendInferenceError(
-                "multi-role stateful sessions require explicit role execution",
-                code="host_orchestration_required",
-            )
-        role = deployment.execution[0]
+        self._check_not_started_context(context, "backend")
+        with self._host_processing("backend", completed=False):
+            deployment = self._loaded_deployment()
+            if len(deployment.execution) != 1:
+                raise BackendInferenceError(
+                    "multi-role stateful sessions require explicit role execution",
+                    code="host_orchestration_required",
+                )
+            role = deployment.execution[0]
         return self._execute_role(role, request.inputs, request, context)
 
     def _execute_role(
@@ -186,50 +200,63 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         request: ModelRequest,
         context: ExecutionContext,
     ) -> Mapping[str, object]:
-        context.check(f"model.{role}")
-        deployment = self._loaded_deployment()
-        if role not in self._state_indices:
-            raise BackendInferenceError(f"unknown stateful role {role!r}", code="unknown_execution_role")
-        stream = self._request_stream(request, context)
-        if stream is not None:
-            raise BackendInferenceError(
-                "stateful dataset-bank execution does not support priority streams",
-                code="hardware_priority_unavailable",
-            )
-        bindings = deployment.bindings[role]
-        state_input_indices = {input_index for input_index, _output_index in self._state_indices.get(role, ())}
-        state_output_indices = {output_index for _input_index, output_index in self._state_indices.get(role, ())}
-        role_inputs: dict[int, np.ndarray] = {}
-        for binding in bindings.inputs:
-            if binding.index is None or int(binding.index) in state_input_indices:
-                continue
-            try:
-                role_inputs[int(binding.index)] = np.asarray(inputs[binding.semantic])
-            except KeyError as exc:
+        try:
+            context.check(f"model.{role}")
+            deployment = self._loaded_deployment()
+            if role not in self._state_indices:
+                raise BackendInferenceError(f"unknown stateful role {role!r}", code="unknown_execution_role")
+            stream = self._request_stream(request, context)
+            if stream is not None:
                 raise BackendInferenceError(
-                    f"stateful role {role!r} is missing semantic input {binding.semantic!r}",
-                    code="missing_semantic_input",
-                ) from exc
-        self._capture_role_inputs(role, role_inputs)
+                    "stateful dataset-bank execution does not support priority streams",
+                    code="hardware_priority_unavailable",
+                )
+            bindings = deployment.bindings[role]
+            state_input_indices = {input_index for input_index, _output_index in self._state_indices.get(role, ())}
+            state_output_indices = {output_index for _input_index, output_index in self._state_indices.get(role, ())}
+            role_inputs: dict[int, np.ndarray] = {}
+            for binding in bindings.inputs:
+                if binding.index is None or int(binding.index) in state_input_indices:
+                    continue
+                try:
+                    role_inputs[int(binding.index)] = np.asarray(inputs[binding.semantic])
+                except KeyError as exc:
+                    raise BackendInferenceError(
+                        f"stateful role {role!r} is missing semantic input {binding.semantic!r}",
+                        code="missing_semantic_input",
+                    ) from exc
+            self._capture_role_inputs(role, role_inputs)
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.not_started(f"model.{role}.inputs")
+            raise
         bank = self._state_banks[role]
         try:
             runtime_outputs = self._models[role].execute_bank(bank, role_inputs)
+            self._state_banks[role] = 1 - bank
+            with self._completed_validation(f"model.{role}.outputs"):
+                outputs = {
+                    binding.semantic: self._bound_output(role, binding, runtime_outputs)
+                    for binding in bindings.outputs
+                    if binding.index is not None and int(binding.index) not in state_output_indices
+                }
+                self._capture_role_outputs(role, outputs)
+            return outputs
         except Exception as exc:
-            raise BackendInferenceError(
-                f"stateful role {role!r} failed and requires recovery: {exc}",
-                code="state_outcome_unknown",
-                recoverable=True,
-                operation_started=True,
-                outcome_known=False,
-            ) from exc
-        self._state_banks[role] = 1 - bank
-        outputs = {
-            binding.semantic: self._bound_output(role, binding, runtime_outputs)
-            for binding in bindings.outputs
-            if binding.index is not None and int(binding.index) not in state_output_indices
-        }
-        self._capture_role_outputs(role, outputs)
-        return outputs
+            evidence = execution_evidence(exc, started=True, stateful=True, unknown_on_error=True)
+            evidence = replace(evidence, state_mutated=evidence.state is not OutcomeState.NOT_STARTED)
+            error = BackendInferenceError(
+                f"stateful role {role!r} failed: {exc}",
+                code=getattr(exc, "code", "stateful_execution_failed")
+                if evidence.outcome_known
+                else "state_outcome_unknown",
+                recoverable=evidence.state_mutated,
+                operation_started=evidence.state is not OutcomeState.NOT_STARTED,
+                outcome_known=evidence.outcome_known,
+            )
+            error.evidence = evidence
+            if evidence.state_mutated:
+                error.recovery = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME)
+            raise error from exc
 
     def _validate_role_values(
         self,

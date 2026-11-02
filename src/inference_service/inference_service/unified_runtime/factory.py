@@ -15,7 +15,10 @@ from types import MappingProxyType
 
 from .adapters import ResultAdapter
 from .assembly import OwnedComponent, RuntimeAssembly, RuntimeProviders
+from .contracts import ModelRequest, OutcomeEvidence
+from .errors import execution_evidence, merge_execution_evidence
 from .handle import ModelRuntimeHandle
+from .loading import LoadRollback
 from .registry import (
     CompositeRuntimeDescriptor,
     CompositeRuntimeKey,
@@ -48,8 +51,10 @@ class RuntimeFactoryError(RuntimeRegistryError):
         *,
         code: str = "runtime_factory_error",
         details: Mapping[str, object] | None = None,
+        cleanup_owner: LoadRollback | None = None,
     ) -> None:
         super().__init__(message, code=code)
+        self.cleanup_owner = cleanup_owner
         self.details = MappingProxyType(dict(details or {}))
 
 
@@ -784,16 +789,6 @@ def _deduplicate(entries: Iterable[OwnedComponent]) -> tuple[OwnedComponent, ...
     return tuple(result)
 
 
-def _rollback(entries: Iterable[OwnedComponent]) -> tuple[BaseException, ...]:
-    errors: list[BaseException] = []
-    for entry in reversed(_deduplicate(entries)):
-        try:
-            _release(entry)
-        except BaseException as exc:
-            errors.append(exc)
-    return tuple(errors)
-
-
 def _assembly_from_result(
     result: object,
     *,
@@ -922,6 +917,11 @@ class RequestDirectExecutor:
             raise ValueError("request-direct execution requires at least one target")
         self._targets = dict(targets)
         self._execution_roles = tuple(execution_roles) or tuple(targets)
+        self.is_stateful = any(
+            bool(getattr(target, "is_stateful", False))
+            or bool(getattr(getattr(target, "capabilities", None), "stateful", False))
+            for target in self._targets.values()
+        )
         missing = [role for role in self._execution_roles if role not in self._targets]
         if missing:
             raise ValueError(f"execution roles have no target: {missing}")
@@ -931,9 +931,23 @@ class RequestDirectExecutor:
             return _invoke_execution(self._targets[self._execution_roles[0]], request, context)
         values = dict(request.inputs)
         final: object = None
+        evidence = OutcomeEvidence.not_started("backend")
         for role in self._execution_roles:
-            role_request = type(request)(values, request.metadata)
-            final = _invoke_execution(self._targets[role], role_request, context)
+            role_request = ModelRequest(values, request.metadata)
+            target = self._targets[role]
+            stateful = bool(getattr(target, "is_stateful", False)) or bool(
+                getattr(getattr(target, "capabilities", None), "stateful", False)
+            )
+            try:
+                final = _invoke_execution(target, role_request, context)
+            except Exception as exc:
+                exc.evidence = merge_execution_evidence(
+                    evidence, execution_evidence(exc, started=True, stateful=stateful, unknown_on_error=True)
+                )
+                raise
+            evidence = merge_execution_evidence(
+                evidence, OutcomeEvidence.completed(f"model.{role}", state_mutated=stateful)
+            )
             outputs = _outputs(final)
             if isinstance(outputs, Mapping):
                 values.update(outputs)
@@ -1448,24 +1462,20 @@ class ModelRuntimeFactory:
                 )
             return handle
         except Exception as exc:
-            rollback_errors = _rollback(rollback_entries)
-            if isinstance(exc, RuntimeFactoryError):
-                if rollback_errors:
-                    details = {**dict(exc.details), "rollback_errors": tuple(str(error) for error in rollback_errors)}
-                    raise RuntimeFactoryError(str(exc), code=exc.code, details=details) from exc
-                raise
-            if isinstance(exc, RuntimeRegistryError):
-                details = {"exception_type": type(exc).__name__}
-                if rollback_errors:
-                    details["rollback_errors"] = tuple(str(error) for error in rollback_errors)
-                raise RuntimeFactoryError(str(exc), code=exc.code, details=details) from exc
-            details = {"exception_type": type(exc).__name__}
+            rollback = LoadRollback()
+            for entry in _deduplicate(rollback_entries):
+                rollback.defer(_release, entry)
+            rollback_errors = rollback.rollback()
+            if rollback_errors:
+                providers.retain_cleanup(rollback)
+            details = {"exception_type": type(exc).__name__, **dict(getattr(exc, "details", {}))}
             if rollback_errors:
                 details["rollback_errors"] = tuple(str(error) for error in rollback_errors)
             raise RuntimeFactoryError(
-                f"runtime construction failed: {exc}",
-                code="runtime_factory_failed",
+                str(exc) if isinstance(exc, RuntimeRegistryError) else f"runtime construction failed: {exc}",
+                code=exc.code if isinstance(exc, RuntimeRegistryError) else "runtime_factory_failed",
                 details=details,
+                cleanup_owner=rollback if rollback_errors else None,
             ) from exc
 
     build = create
@@ -1508,7 +1518,7 @@ def _finalize_assembly(
     bindings: Mapping[str, object],
     artifact_handles: Mapping[str, object],
 ) -> None:
-    process_provider_ids = {id(providers.acl_runtime_provider), id(providers.resource_admission_provider)}
+    process_provider_ids = {id(provider) for provider in providers.process_resources}
     provider_entries: list[OwnedComponent] = []
     resource_entries: list[OwnedComponent] = []
     for candidate in (*tuple(role_assemblies), assembly):

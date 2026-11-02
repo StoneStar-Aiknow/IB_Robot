@@ -129,7 +129,14 @@ class StreamingRuntime(Protocol):
 
     def reset_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None: ...
 
-    def close_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None: ...
+    def close_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None:
+        """Release the stream's bank, or raise while its native work remains pending.
+
+        For per_stream banks, successful Close proves that this bank's work and
+        resources are drained. Runtime-exclusive streams may close only their
+        logical identity; runtime recovery/Close still owns the device fence.
+        """
+        ...
 
 
 StreamingRuntimeProtocol = StreamingRuntime

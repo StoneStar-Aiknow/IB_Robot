@@ -6,10 +6,17 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    LoadRollback,
+    ModelRequest,
+    RecoveryAction,
+    RecoveryRequirement,
+    RecoveryScope,
+)
 
 from .contract import (
     FULLSUBNET_FB_FEATURES_SEMANTIC,
@@ -114,14 +121,16 @@ class FullSubNetTorchSession(ModelSession):
             str(artifacts[_STATE_CONTRACT_ROLE]),
             device=device,
             timing_enabled=timing_enabled,
+            cleanup=rollback,
         )
-        rollback.defer(self._release)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
+        self._check_not_started_context(context, "backend")
         raise BackendInferenceError(
             "FullSubNet requires host-orchestrated role execution",
             code="host_orchestration_required",
+            operation_started=False,
+            outcome_known=True,
         )
 
     def _execute_role(
@@ -131,41 +140,52 @@ class FullSubNetTorchSession(ModelSession):
         request: ModelRequest,
         context: ExecutionContext,
     ) -> Mapping[str, object]:
-        context.check(f"model.{role}")
-        if self._executor is None:
-            raise BackendInferenceError("FullSubNet Torch session is not loaded", code="runtime_not_loaded")
-        abi = _ROLE_ABI.get(role)
-        if abi is None:
-            raise BackendInferenceError(f"unknown FullSubNet role {role!r}", code="unknown_execution_role")
-        input_semantic, output_semantic, input_shape, output_shape = abi
-        try:
-            frame = np.asarray(inputs[input_semantic], dtype=np.float32)
-        except KeyError as exc:
-            raise BackendInferenceError(
-                f"FullSubNet role {role!r} is missing semantic input {input_semantic!r}",
-                code="missing_semantic_input",
-            ) from exc
-        if frame.shape != input_shape:
-            raise BackendInferenceError(
-                f"FullSubNet role {role!r} input shape {frame.shape} does not match {input_shape}",
-                code="role_input_shape_mismatch",
-            )
+        self._check_not_started_context(context, f"model.{role}")
+        with self._host_processing(f"model.{role}.inputs", completed=False):
+            if self._executor is None:
+                raise BackendInferenceError("FullSubNet Torch session is not loaded", code="runtime_not_loaded")
+            abi = _ROLE_ABI.get(role)
+            if abi is None:
+                raise BackendInferenceError(f"unknown FullSubNet role {role!r}", code="unknown_execution_role")
+            input_semantic, output_semantic, input_shape, output_shape = abi
+            try:
+                frame = np.asarray(inputs[input_semantic], dtype=np.float32)
+            except KeyError as exc:
+                raise BackendInferenceError(
+                    f"FullSubNet role {role!r} is missing semantic input {input_semantic!r}",
+                    code="missing_semantic_input",
+                ) from exc
+            if frame.shape != input_shape:
+                raise BackendInferenceError(
+                    f"FullSubNet role {role!r} input shape {frame.shape} does not match {input_shape}",
+                    code="role_input_shape_mismatch",
+                )
         try:
             output = self._executor.run_fb(frame) if role == "fullsubnet_fb" else self._executor.run_sb(frame)
         except Exception as exc:
-            raise BackendInferenceError(
+            from inference_service.unified_runtime.errors import execution_evidence
+
+            evidence = execution_evidence(exc, started=True, stateful=True, unknown_on_error=True)
+            error = BackendInferenceError(
                 f"FullSubNet role {role!r} failed and requires recovery: {exc}",
-                code="state_outcome_unknown",
+                code=getattr(exc, "code", "stateful_execution_failed")
+                if evidence.outcome_known
+                else "state_outcome_unknown",
                 recoverable=True,
                 operation_started=True,
-                outcome_known=False,
-            ) from exc
-        result = np.asarray(output, dtype=np.float32)
-        if result.shape != output_shape:
-            raise BackendInferenceError(
-                f"FullSubNet role {role!r} output shape {result.shape} does not match {output_shape}",
-                code="role_output_shape_mismatch",
+                outcome_known=evidence.outcome_known,
             )
+            error.evidence = evidence
+            error.recovery = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME)
+            error.details = dict(getattr(exc, "details", {}))
+            raise error from exc
+        with self._completed_validation(f"model.{role}.outputs"):
+            result = np.asarray(output, dtype=np.float32)
+            if result.shape != output_shape:
+                raise BackendInferenceError(
+                    f"FullSubNet role {role!r} output shape {result.shape} does not match {output_shape}",
+                    code="role_output_shape_mismatch",
+                )
         return {output_semantic: result}
 
     def _reset(self) -> None:
@@ -174,7 +194,10 @@ class FullSubNetTorchSession(ModelSession):
 
     def _close(self) -> None:
         if self._executor is not None:
-            self._executor.close()
+            try:
+                self._executor.close()
+            except Exception as exc:
+                raise BackendLifecycleError(f"FullSubNet cleanup pending: {exc}", close_pending=True) from exc
         self._release()
 
     def _release(self) -> None:

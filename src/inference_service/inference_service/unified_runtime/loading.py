@@ -5,9 +5,11 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 
+from .lifecycle import check_lifecycle, lifecycle_lock
+
 
 class LoadRollback:
-    """Run registered partial-load cleanup callbacks once in reverse order."""
+    """Release in reverse order, retaining failed cleanup and its dependencies."""
 
     def __init__(self) -> None:
         self._callbacks: list[tuple[Callable[..., object], tuple[object, ...], dict[str, object]]] = []
@@ -28,19 +30,26 @@ class LoadRollback:
             self._callbacks.clear()
 
     def rollback(self) -> tuple[Exception, ...]:
-        with self._lock:
-            if self._finished:
+        try:
+            with lifecycle_lock(self._lock):
+                if self._finished:
+                    return ()
+                while self._callbacks:
+                    callback, args, kwargs = self._callbacks[-1]
+                    check_lifecycle()
+                    callback(*args, **kwargs)
+                    self._callbacks.pop()
+                self._finished = True
                 return ()
-            self._finished = True
-            callbacks = tuple(reversed(self._callbacks))
-            self._callbacks.clear()
-        errors: list[Exception] = []
-        for callback, args, kwargs in callbacks:
-            try:
-                callback(*args, **kwargs)
-            except Exception as exc:
-                errors.append(exc)
-        return tuple(errors)
+        except Exception as exc:
+            # Earlier callbacks may release a lease used by this resource.
+            return (exc,)
+
+    def close(self) -> None:
+        """Expose retained cleanup through the same owner interface as handles."""
+        errors = self.rollback()
+        if errors:
+            raise errors[0]
 
 
 __all__ = ["LoadRollback"]

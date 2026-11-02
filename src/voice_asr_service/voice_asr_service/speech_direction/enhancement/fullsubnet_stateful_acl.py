@@ -11,6 +11,8 @@ import numpy as np
 
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
+from inference_service.backends.errors import BackendLifecycleError
+from inference_service.unified_runtime.lifecycle import lifecycle_lock
 from voice_asr_service.speech_direction.contract import speech_direction_bindings
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,7 @@ class StatefulAclFullSubNetRunner:
         *,
         device_id: int = 0,
         runtime_manager: AclRuntimeManager | None = None,
+        cleanup=None,
         timing_enabled: bool = False,
     ):
         for path in (fb_om_path, sb_om_path):
@@ -84,7 +87,7 @@ class StatefulAclFullSubNetRunner:
                 raise FileNotFoundError(f"FullSubNet Ascend ACL OM不存在: {path}")
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理
-        self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
+        self._cleanup_complete = False  # 仅在所有资源释放成功后置位
         self._poisoned = False
         self._timing_enabled = bool(timing_enabled)
         self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
@@ -93,6 +96,8 @@ class StatefulAclFullSubNetRunner:
         self._lease = runtime_manager.acquire(device_id)
         self._fb_model: AclModel | None = None
         self._sb_model: AclModel | None = None
+        if cleanup is not None:
+            cleanup.defer(self.close)
         try:
             self._fb_model = AclModel(
                 self._lease, "fullsubnet_fb", Path(fb_om_path), speech_direction_bindings("fullsubnet_fb")
@@ -104,8 +109,17 @@ class StatefulAclFullSubNetRunner:
             )
             self._sb_model.load_descriptor()
             self._sb = _StatefulAclStage(self._sb_model)
-        except Exception:
-            self.close()
+        except Exception as exc:
+            if cleanup is not None:
+                exc.cleanup_owner = cleanup
+                exc.close_pending = True
+            else:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
             raise
         logger.info("FullSubNet Ascend ACL状态常驻已加载: fb=%s sb=%s", fb_om_path, sb_om_path)
 
@@ -153,31 +167,21 @@ class StatefulAclFullSubNetRunner:
             self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
 
     def close(self) -> None:
-        """best-effort terminal 关闭：尽力释放两个模型与 lease，单项失败不阻断其余清理，末尾汇总异常。
-
-        关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
-        因此失败后再次调用并不会"重新执行整个关闭"——属 best-effort terminal，非可重试。
-        """
-        with getattr(self, "_lock", threading.Lock()):
-            if getattr(self, "_cleanup_complete", False):
-                # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
-                return
-            self._closed = True  # 禁新推理；释放动作仍在锁内，因 ACL 释放须与推理互斥
-            errors = []
-            for model in (getattr(self, "_sb_model", None), getattr(self, "_fb_model", None)):
-                if model is not None:
-                    try:
+        """按依赖顺序关闭，失败后保留模型与 lease 供重试。"""
+        self._closed = True
+        try:
+            with lifecycle_lock(self._lock):
+                if self._cleanup_complete:
+                    return
+                for name in ("_sb_model", "_fb_model"):
+                    model = getattr(self, name)
+                    if model is not None:
                         model.close()
-                    except Exception as exc:  # 关闭阶段继续释放其余资源。
-                        errors.append(str(exc))
-            try:
+                        setattr(self, name, None)
                 self._lease.close()
-            except Exception as exc:
-                errors.append(str(exc))
-            finally:
                 self._cleanup_complete = True
-            if errors:
-                raise RuntimeError("; ".join(errors))
+        except Exception as exc:
+            raise BackendLifecycleError(str(exc), close_pending=True) from exc
 
 
 __all__ = ["StatefulAclFullSubNetRunner"]

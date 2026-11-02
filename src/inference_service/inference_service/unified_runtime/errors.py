@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import json
+import traceback
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from .contracts import OutcomeEvidence, OutcomeState, _freeze_json_mapping, json_safe_data
+
+
+def clear_exception_frames(error: BaseException) -> None:
+    """Keep diagnostic stacks while dropping resource-owning traceback locals."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__, getattr(current, "cause", None)))
 
 
 class RecoveryScope(str, Enum):
@@ -143,7 +156,9 @@ class RuntimeControlError(RuntimeError):
 class DeadlineExceeded(RuntimeControlError):
     code = "deadline_exceeded"
 
-    def __init__(self, *, phase: str = "deadline", operation_started: bool = False) -> None:
+    def __init__(self, *, phase: str = "deadline", operation_started: bool | None = None) -> None:
+        self._operation_started_explicit = operation_started is not None
+        operation_started = bool(operation_started)
         super().__init__(
             "execution deadline expired",
             phase=phase,
@@ -157,8 +172,10 @@ class CancellationRequested(RuntimeControlError):
     code = "request_canceled"
 
     def __init__(
-        self, *, phase: str = "cancellation", reason: str | None = None, operation_started: bool = False
+        self, *, phase: str = "cancellation", reason: str | None = None, operation_started: bool | None = None
     ) -> None:
+        self._operation_started_explicit = operation_started is not None
+        operation_started = bool(operation_started)
         details = {"reason": reason} if reason is not None else {}
         super().__init__(
             "execution was canceled",
@@ -168,6 +185,44 @@ class CancellationRequested(RuntimeControlError):
             state_mutated=operation_started,
             details=details,
         )
+
+
+def execution_evidence(
+    exc: BaseException, *, started: bool, stateful: bool, unknown_on_error: bool = False
+) -> OutcomeEvidence:
+    """Prefer native proof; raw control exceptions do not prove completion."""
+    evidence = getattr(exc, "evidence", None)
+    if evidence is not None:
+        return evidence
+    if isinstance(exc, DeadlineExceeded | CancellationRequested):
+        if exc._operation_started_explicit:
+            started = exc.operation_started
+        return OutcomeEvidence(
+            OutcomeState.STARTED if started else OutcomeState.NOT_STARTED,
+            not started,
+            started and stateful,
+            exc.phase,
+        )
+    started = bool(getattr(exc, "operation_started", started))
+    return OutcomeEvidence(
+        OutcomeState.STARTED if started else OutcomeState.NOT_STARTED,
+        bool(getattr(exc, "outcome_known", not (started and (stateful or unknown_on_error)))),
+        bool(getattr(exc, "state_mutated", started and stateful)),
+        str(getattr(exc, "phase", "backend")),
+    )
+
+
+def merge_execution_evidence(previous: OutcomeEvidence, current: OutcomeEvidence) -> OutcomeEvidence:
+    """A local rejection cannot erase earlier work or unresolved completion."""
+    state = previous.state if current.state is OutcomeState.NOT_STARTED else current.state
+    if not previous.outcome_known:
+        state = OutcomeState.STARTED
+    return replace(
+        current,
+        state=state,
+        outcome_known=previous.outcome_known and current.outcome_known,
+        state_mutated=previous.state_mutated or current.state_mutated,
+    )
 
 
 class OutputValidationError(ValueError):
@@ -358,6 +413,8 @@ class ExecutionFailureFactory:
             merged_details.update(error_details)
         if details:
             merged_details.update(details)
+        if getattr(error, "close_pending", False):
+            merged_details["close_pending"] = True
         return self.create(
             selected_code,
             selected_message,

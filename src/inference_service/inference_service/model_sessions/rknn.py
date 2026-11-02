@@ -20,7 +20,14 @@ from inference_service.backends.rknn.runtime import (
 )
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionFailureFactory,
+    LoadRollback,
+    ModelRequest,
+    OutcomeEvidence,
+)
+from inference_service.unified_runtime.lifecycle import check_lifecycle
 
 _HOST_ARTIFACT_FORMATS = frozenset({"pt", "pytorch"})
 
@@ -66,7 +73,7 @@ class RKNNModelSession(ModelSession):
         self._rknn_loader = rknn_loader or import_rknn_type
         self._rknn_type: type | None = None
         self._sessions: dict[str, RKNNSession] = {}
-        self._owned_sessions: tuple[RKNNSession, ...] = ()
+        self._owned_sessions: list[RKNNSession] = []
         self._host_roles: frozenset[str] = frozenset()
         self._target: str | None = None
         self._core_mask: int = 0
@@ -114,17 +121,6 @@ class RKNNModelSession(ModelSession):
         owned_sessions: list[RKNNSession] = []
         shared_sessions: dict[tuple[object, ...], RKNNSession] = {}
 
-        def close_sessions() -> None:
-            errors: list[Exception] = []
-            for session in reversed(owned_sessions):
-                try:
-                    session.close()
-                except Exception as exc:
-                    errors.append(exc)
-            if errors:
-                raise RuntimeError("; ".join(str(error) for error in errors))
-
-        rollback.defer(close_sessions)
         for role in deployment.execution:
             if role in host_roles:
                 continue
@@ -143,6 +139,7 @@ class RKNNModelSession(ModelSession):
                     target=target,
                     core_mask=core_mask,
                     data_format=data_format,
+                    cleanup=rollback,
                 )
             except BackendLoadError:
                 raise
@@ -157,23 +154,23 @@ class RKNNModelSession(ModelSession):
 
         self._rknn_type = rknn_type
         self._sessions = sessions
-        self._owned_sessions = tuple(owned_sessions)
+        self._owned_sessions = owned_sessions
         self._host_roles = frozenset(host_roles)
         self._target = target
         self._core_mask = core_mask
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
-        context = self._require_context()
-        deployment = context.deployment
+        deployment = self._require_context().deployment
         if not isinstance(deployment, CompiledDeployment) or not self._sessions:
             raise BackendInferenceError("RKNN model session is not loaded", code="runtime_not_loaded")
         values: dict[str, object] = dict(request.inputs)
         public_outputs: dict[str, object] = {}
+        completed = False
         for role in deployment.execution:
             if role in self._host_roles:
                 continue
-            outputs = self._execute_role(role, values, request, context)
+            outputs = self._execute_role_with_progress(role, values, request, context, completed=completed)
+            completed = True
             values.update(outputs)
             for semantic, value in outputs.items():
                 if not semantic.startswith("internal."):
@@ -188,7 +185,6 @@ class RKNNModelSession(ModelSession):
         context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
-        context.check(f"model.{role}")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or role not in self._sessions:
@@ -199,29 +195,40 @@ class RKNNModelSession(ModelSession):
                 )
             raise BackendInferenceError(f"unknown or unloaded RKNN role {role!r}", code="unknown_execution_role")
         bindings = deployment.bindings[role]
-        indexed_inputs = self._indexed_inputs(role, bindings.inputs, inputs)
+        try:
+            indexed_inputs = self._indexed_inputs(role, bindings.inputs, inputs)
+        except Exception as exc:
+            raise ExecutionFailureFactory().from_exception(
+                exc, evidence=OutcomeEvidence.not_started(f"model.{role}.inputs")
+            ) from exc
         runtime_outputs = self._sessions[role].infer(indexed_inputs)
-        return self._semantic_outputs(bindings, role, runtime_outputs)
+        try:
+            return self._semantic_outputs(bindings, role, runtime_outputs)
+        except Exception as exc:
+            raise ExecutionFailureFactory().from_exception(
+                exc,
+                evidence=OutcomeEvidence.completed(f"model.{role}.outputs", state_mutated=self.capabilities.stateful),
+            ) from exc
 
     def _close(self) -> None:
-        sessions = self._owned_sessions
+        try:
+            while self._owned_sessions:
+                session = self._owned_sessions[-1]
+                check_lifecycle()
+                session.close()
+                self._owned_sessions.pop()
+        except Exception as exc:
+            raise BackendLifecycleError(
+                f"RKNN model session close pending: {exc}", code="close_failed", close_pending=True
+            ) from exc
+        finally:
+            retained = {id(session) for session in self._owned_sessions}
+            self._sessions = {role: owner for role, owner in self._sessions.items() if id(owner) in retained}
         self._rknn_type = None
         self._sessions = {}
-        self._owned_sessions = ()
         self._host_roles = frozenset()
         self._target = None
         self._core_mask = 0
-        errors: list[Exception] = []
-        for session in reversed(sessions):
-            try:
-                session.close()
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise BackendLifecycleError(
-                f"RKNN model session close failed: {'; '.join(str(error) for error in errors)}",
-                code="close_failed",
-            )
 
     @staticmethod
     def _indexed_inputs(

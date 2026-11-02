@@ -162,13 +162,19 @@ class ModelServiceNode(Node):
         endpoint = str(self.get_parameter("service_endpoint").value)
         service_type = _load_service_type(service_type_name)
         _validate_service_contract(service_type)
-        self._initialize_plugin(service_type_name)
-        self.create_service(
-            service_type,
-            endpoint,
-            self._dispatch,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
+        try:
+            self._initialize_plugin(service_type_name)
+            self.create_service(
+                service_type,
+                endpoint,
+                self._dispatch,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+        except Exception:
+            # main() has no node until construction returns. Release the loaded
+            # plugin here; destroy_node transfers pending cleanup to providers.
+            self.destroy_node()
+            raise
 
     def _initialize_plugin(self, service_type_name: str) -> None:
         try:
@@ -253,7 +259,12 @@ class ModelServiceNode(Node):
 
     def destroy_node(self):
         if self.plugin is not None:
-            self.plugin.close()
+            try:
+                self.plugin.close()
+            except Exception as exc:
+                if getattr(exc, "close_pending", False):
+                    self._providers.retain_cleanup(self.plugin)
+                self.get_logger().error(f"model service shutdown failed: {exc}")
         self.plugin = None
         return super().destroy_node()
 
@@ -273,10 +284,14 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.destroy_node()
-        dependencies.providers.close()
-        rclpy.try_shutdown()
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            try:
+                dependencies.providers.close()
+            finally:
+                rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

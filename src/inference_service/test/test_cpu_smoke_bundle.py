@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import time
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,6 +16,7 @@ from ibrobot_tracing import TraceEmitter
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import InferenceRequest
 from inference_service.backends.errors import BackendInferenceError
+from inference_service.backends.types import runtime_context_defaults
 from inference_service.distributed.runtime import CloudBackendRuntime, EdgeProcessorRuntime
 from inference_service.pipeline import create_pipeline_manager
 from inference_service.pipeline import runtime as pipeline_runtime
@@ -319,6 +321,61 @@ def test_policy_runtime_traces_aggregate_call_and_keeps_backend_latency(monkeypa
         dependencies.providers.close()
 
 
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+def test_session_late_result_preserves_evidence_through_real_pipeline(monkeypatch, tmp_path, stop):
+    from datetime import datetime, timedelta, timezone
+
+    from inference_service.unified_runtime import Deadline, OutcomeState
+    from inference_service.unified_runtime.errors import CancellationRequested, DeadlineExceeded
+
+    torch = pytest.importorskip("torch")
+    bundle = _create_tracked_equivalent_bundle(tmp_path / MODEL_NAME)
+    _install_fake_lerobot(monkeypatch, torch, {})
+    dependencies = build_policy_runtime_dependencies()
+    manager = create_pipeline_manager(
+        "policy",
+        load_inference_manifest(bundle, "cpu"),
+        registry_set=dependencies.registry_set,
+        providers=dependencies.providers,
+    )
+    pipeline = manager.pipelines["policy"]
+    session = pipeline.runtime_handle.assembly.session
+    execute = session._execute
+    now = [datetime.now(timezone.utc)]
+    deadline = Deadline.after(60, now=now[0], clock=lambda: now[0])
+    monkeypatch.setattr(pipeline, "_effective_request_deadline", lambda _: deadline)
+
+    def late(request, context):
+        result = execute(request, context)
+        if stop == "deadline":
+            now[0] += timedelta(seconds=120)
+        else:
+            context.cancellation_token.cancel()
+        return result
+
+    monkeypatch.setattr(session, "_execute", late)
+    try:
+        with pytest.raises(DeadlineExceeded if stop == "deadline" else CancellationRequested) as caught:
+            manager.infer(
+                "policy",
+                InferenceRequest(
+                    "late",
+                    inputs={
+                        "observation.state": np.zeros(6, dtype=np.float32),
+                        "observation.images.top": np.zeros((480, 640, 3), dtype=np.uint8),
+                    },
+                ),
+            )
+        failure = caught.value
+        assert failure.operation_started and failure.outcome_known
+        assert failure.evidence.state is OutcomeState.COMPLETED
+        assert failure.details["evidence"] == failure.evidence.to_dict()
+        assert failure.details["recovery"] == failure.recovery.to_dict()
+    finally:
+        manager.close()
+        dependencies.providers.close()
+
+
 @pytest.mark.parametrize("failure_phase", [None, "preprocess", "model", "postprocess"])
 def test_trace_toggle_preserves_policy_output_errors_and_call_counts(monkeypatch, tmp_path, failure_phase):
     torch = pytest.importorskip("torch")
@@ -565,13 +622,14 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
         "model_inference",
     )
     dependencies = build_policy_runtime_dependencies()
-    manager = create_pipeline_manager(
-        "policy",
-        config.pipelines["policy"].validated_manifest,
-        registry_set=dependencies.registry_set,
-        providers=dependencies.providers,
-        priority_scheduling=bool(config.scheduler and config.scheduler.enable),
-    )
+    with runtime_context_defaults(priority_scheduling=scheduled, managed_execution=scheduled):
+        manager = create_pipeline_manager(
+            "policy",
+            config.pipelines["policy"].validated_manifest,
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+            priority_scheduling=bool(config.scheduler and config.scheduler.enable),
+        )
     pipeline = manager.pipelines["policy"]
     request = InferenceRequest(
         "late",
@@ -587,6 +645,13 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
 
     try:
         assert pipeline.capabilities.stateful and pipeline.capabilities.resettable
+        assert pipeline._context.managed_execution is scheduled
+        assert pipeline._context.priority_scheduling is scheduled
+        # The real LeRobot Session discovers policy.reset during load. Public
+        # reset must reach it regardless of the scheduling/recovery policy.
+        resets_before = calls.get("reset", 0)
+        manager.reset("policy")
+        assert calls.get("reset", 0) == resets_before + 1
         monkeypatch.setattr(pipeline, "_postprocessor", late_result)
         with pytest.raises(PipelineTimeoutError):
             manager.infer("policy", request)
@@ -597,7 +662,7 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
             assert manager.infer("policy", request).actual_chunk_size == 4
             resets_before = calls.get("reset", 0)
             manager.reset("policy")
-            assert calls.get("reset", 0) == resets_before
+            assert calls.get("reset", 0) == resets_before + 1
             assert pipeline._policy_failure is failure
             return
         with pytest.raises(PipelineNotReadyError, match="session left READY"):
@@ -618,6 +683,51 @@ def test_policy_late_result_recovery_is_scheduler_only(monkeypatch, tmp_path, sc
             assert calls["reset"] == resets_before + 1
             assert pipeline._policy_failure is None
             assert manager.infer("policy", request).actual_chunk_size == 4
+    finally:
+        manager.close()
+        dependencies.providers.close()
+
+
+@pytest.mark.parametrize("scheduler", [None, False, True], ids=["absent", "disabled", "enabled"])
+def test_preprocess_control_collision_does_not_poison_stateful_policy(monkeypatch, tmp_path, scheduler):
+    from inference_service.pipeline.errors import PipelineValidationError
+    from inference_service.unified_runtime import OutcomeState
+
+    torch = pytest.importorskip("torch")
+    bundle = _create_tracked_equivalent_bundle(tmp_path / MODEL_NAME)
+    calls = {}
+    _install_fake_lerobot(monkeypatch, torch, calls)
+    dependencies = build_policy_runtime_dependencies()
+    options = {} if scheduler is None else {"priority_scheduling": scheduler, "managed_execution": scheduler}
+    with runtime_context_defaults(**options) if options else nullcontext():
+        manager = create_pipeline_manager(
+            "policy",
+            load_inference_manifest(bundle, "cpu"),
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+        )
+    pipeline = manager.pipelines["policy"]
+    inputs = {
+        "observation.state": np.zeros(6, dtype=np.float32),
+        "observation.images.top": np.zeros((480, 640, 3), dtype=np.uint8),
+    }
+    try:
+        assert pipeline.capabilities.stateful
+        assert pipeline._context.managed_execution is bool(scheduler)
+        assert pipeline._context.priority_scheduling is bool(scheduler)
+        resets = calls.get("reset", 0)
+        with pytest.raises(PipelineValidationError, match="control inputs conflict") as caught:
+            manager.infer(
+                "policy",
+                InferenceRequest("bad", inputs=inputs),
+                control_inputs={"observation.state": np.ones(6, dtype=np.float32)},
+            )
+        assert caught.value.evidence.state is OutcomeState.COMPLETED
+        assert caught.value.evidence.outcome_known and not caught.value.evidence.state_mutated
+        assert pipeline._policy_failure is None and pipeline.runtime_handle.ready
+        assert calls.get("model_calls", 0) == 0 and calls["preprocess_calls"] == 1
+        assert manager.infer("policy", InferenceRequest("good", inputs=inputs)).actual_chunk_size == 4
+        assert calls.get("reset", 0) == resets
     finally:
         manager.close()
         dependencies.providers.close()

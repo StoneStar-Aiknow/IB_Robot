@@ -355,6 +355,122 @@ def test_plugin_status_projects_parseable_runtime_provenance(tmp_path, runtime_d
     plugin.close()
 
 
+def test_plugin_close_retries_handle_pending_cleanup(tmp_path, runtime_dependencies, monkeypatch):
+    from inference_service.backends.errors import BackendLifecycleError
+    from inference_service.unified_runtime import ExecutionFailure
+
+    validated = _write_bundle(tmp_path / "ram_plus", "ram_plus")
+    plugin = _plugin(RAMPlusRecognizeTagsPlugin, validated, {}, runtime_dependencies)
+    close = plugin.session._close
+    attempts = []
+
+    def pending_once():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise BackendLifecycleError("native cleanup pending", close_pending=True)
+        close()
+
+    monkeypatch.setattr(plugin.session, "_close", pending_once)
+    with pytest.raises(ExecutionFailure) as failure:
+        plugin.close()
+    assert failure.value.close_pending and not plugin._closed
+    assert not plugin.pipeline.closed and not plugin.runtime_status().ready
+    plugin.close()
+    plugin.close()
+    assert plugin._closed and plugin.pipeline.closed and len(attempts) == 2
+
+
+def test_failed_plugin_load_retains_cleanup_in_host_providers(tmp_path, runtime_dependencies, monkeypatch):
+    attempts = []
+
+    def cleanup():
+        attempts.append("close")
+        if len(attempts) <= 3:
+            raise RuntimeError("device cleanup pending")
+
+    def load(_self, _context, rollback):
+        rollback.defer(cleanup)
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(_FakeSession, "_load", load)
+    validated = _write_bundle(tmp_path / "ram_plus", "ram_plus")
+    with pytest.raises(Exception, match="load failed"):
+        _plugin(RAMPlusRecognizeTagsPlugin, validated, {}, runtime_dependencies)
+    assert attempts == ["close"] * 3
+    runtime_dependencies.providers.close()
+    assert attempts == ["close"] * 4
+
+
+def test_cleanly_rolled_back_plugin_failures_do_not_accumulate_handles(tmp_path, runtime_dependencies, monkeypatch):
+    import gc
+    import weakref
+
+    handles = []
+    construct = ModelRuntimeHandle.__init__
+
+    def track(handle, *args, **kwargs):
+        construct(handle, *args, **kwargs)
+        handles.append(weakref.ref(handle))
+
+    def load(_self, _context, rollback):
+        rollback.defer(lambda: None)
+        raise RuntimeError("clean load failure")
+
+    monkeypatch.setattr(ModelRuntimeHandle, "__init__", track)
+    monkeypatch.setattr(_FakeSession, "_load", load)
+    validated = _write_bundle(tmp_path / "ram_plus", "ram_plus")
+
+    def construct_failed():
+        with pytest.raises(Exception, match="clean load failure"):
+            _plugin(RAMPlusRecognizeTagsPlugin, validated, {}, runtime_dependencies)
+
+    for _ in range(3):
+        construct_failed()
+    gc.collect()
+    assert len(handles) == 3 and all(reference() is None for reference in handles)
+    assert not runtime_dependencies.providers.closed
+
+
+@pytest.mark.parametrize("family", ["ram_plus"])
+@pytest.mark.parametrize("priority", [False, True])
+def test_perception_builder_uses_scoped_context_priority(family, priority, tmp_path):
+    from inference_service.backends.types import runtime_context_defaults
+
+    (tmp_path / "model.om").write_bytes(b"fake SDK artifact")
+    deployment = CompiledDeployment.model_validate(
+        {
+            "execution_contract": {
+                "state_scope": "request",
+                "execution_structure": "direct",
+                "cancellation_granularity": "request_boundary",
+            },
+            "runtime_profile": {"backend": "ascend", "target": {"runtime": "acl"}, "profile": {"device_id": 0}},
+            "execution": ["model"],
+            "artifacts": {"model": {"path": "model.om", "format": "om"}},
+            "bindings": {
+                "model": {
+                    "inputs": [{"semantic": "input", "index": 0, "dtype": "float32", "shape": [1]}],
+                    "outputs": [{"semantic": "output", "index": 0, "dtype": "float32", "shape": [1]}],
+                }
+            },
+        }
+    )
+    identity = SimpleNamespace(model_type=family, operation="automatic", interface="tensor_model")
+    with runtime_context_defaults(priority_scheduling=priority):
+        context = RuntimeContext(
+            SimpleNamespace(deployment=deployment, bundle_root=tmp_path, top_level_identity=identity)
+        )
+        session = build_perception_session(
+            context,
+            adapter=SimpleNamespace(compiled_abi_finalized=True, identity=identity),
+            providers=RuntimeProviders(object(), object()),
+        )
+    assert session._priority_scheduling is priority
+    assert session.capabilities.hardware_resource_id == ("ascend:0" if priority else None)
+    assert session.capabilities.resource_domain == (None if priority else "ascend:0")
+    session.close()
+
+
 def test_plugin_fails_closed_when_loaded_runtime_exposes_no_version(tmp_path, runtime_dependencies) -> None:
     validated = _write_bundle(tmp_path / "sam2", "sam2")
     plugin = _plugin(SAM2GenerateMasksPlugin, validated, {}, runtime_dependencies)
@@ -582,6 +698,7 @@ def test_conformant_ram_plus_compiled_deployment_selects_ascend_session(runtime_
 
     context = SimpleNamespace(
         model_type="ram_plus",
+        priority_scheduling=False,
         backend="ascend",
         target_runtime="acl",
         device_id=0,

@@ -10,6 +10,8 @@ from typing import Protocol, runtime_checkable
 from .adapters import ResultAdapter
 from .contracts import ExecutionContext, ModelRequest
 from .errors import ExecutionFailureFactory
+from .lifecycle import lifecycle_lock
+from .loading import LoadRollback
 
 
 @runtime_checkable
@@ -214,10 +216,7 @@ class RuntimeAssembly:
         seen: set[int] = set()
         process_provider_ids = {id(provider) for provider in self.process_providers}
         if self.providers is not None:
-            for provider_name in ("acl_runtime_provider", "resource_admission_provider"):
-                provider = getattr(self.providers, provider_name, None)
-                if provider is not None:
-                    process_provider_ids.add(id(provider))
+            process_provider_ids.update(id(provider) for provider in self.providers.process_resources)
         for item in raw:
             if isinstance(item, OwnedComponent):
                 entry = item
@@ -248,6 +247,7 @@ class RuntimeAssembly:
 class _RuntimeProviderState:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     closed: bool = False
+    cleanup: LoadRollback = field(default_factory=LoadRollback, repr=False)
 
 
 @dataclass(frozen=True)
@@ -263,12 +263,29 @@ class RuntimeProviders:
             raise TypeError("acl_runtime_provider must be explicitly supplied")
         if self.resource_admission_provider is None:
             raise TypeError("resource_admission_provider must be explicitly supplied")
+        seen = set()
+        for provider in self.process_resources:
+            if provider is not None and id(provider) not in seen:
+                seen.add(id(provider))
+                self._state.cleanup.defer(self._close_provider, provider)
+
+    def retain_cleanup(self, owner: object) -> None:
+        """Keep a failed constructor reachable until process shutdown retries it."""
+        with self._state.lock:
+            if self._state.closed:
+                raise RuntimeError("cannot retain cleanup after providers are closed")
+            self._state.cleanup.defer(owner.close)
 
     @classmethod
     def create(cls, acl_runtime_provider: object, resource_admission_provider: object) -> RuntimeProviders:
         """Construct the process-level dependency value at the composition root."""
 
         return cls(acl_runtime_provider, resource_admission_provider)
+
+    @property
+    def process_resources(self) -> tuple[object, ...]:
+        """The process-owned resources shared by cleanup and handle filtering."""
+        return self.acl_runtime_provider, self.resource_admission_provider
 
     @property
     def closed(self) -> bool:
@@ -291,22 +308,19 @@ class RuntimeProviders:
         process-level runtime is finalized.
         """
 
-        with self._state.lock:
+        with lifecycle_lock(self._state.lock):
             if self._state.closed:
                 return
-            self._state.closed = True
-        errors: list[BaseException] = []
-        seen: set[int] = set()
-        for provider in (self.resource_admission_provider, self.acl_runtime_provider):
-            if id(provider) in seen:
-                continue
-            seen.add(id(provider))
             try:
-                self._close_provider(provider)
-            except BaseException as exc:
-                errors.append(exc)
-        if errors:
-            raise RuntimeError(f"runtime provider shutdown failed: {errors[0]}") from errors[0]
+                self._state.cleanup.close()
+            except Exception as exc:
+                raise ExecutionFailureFactory().from_exception(
+                    exc,
+                    code="provider_shutdown_failed",
+                    message=f"runtime provider shutdown failed: {exc}",
+                    details={"close_pending": True},
+                ) from exc
+            self._state.closed = True
 
     shutdown = close
 

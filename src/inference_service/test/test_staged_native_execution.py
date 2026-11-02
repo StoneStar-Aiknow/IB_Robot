@@ -124,6 +124,142 @@ def _binding(semantic, index=0):
     return TensorBinding(semantic=semantic, index=index, dtype="float32", shape=(1,))
 
 
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_two_frame_callback_control_without_deadline_cannot_deadlock(operation):
+    import multiprocessing
+
+    from inference_service.unified_runtime import ExecutionFailure
+
+    def scenario():
+        entered, release, callback_done = (threading.Event() for _ in range(3))
+        failures = []
+
+        def execute_role(role, inputs, request, context, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            return {"internal.features": np.ones(1, np.float32)}
+
+        owner = _handle(_executor(SimpleNamespace(execute_role=execute_role)))
+        first = owner.submit_frame(_request("A", 1, 0), ExecutionContext("A"))
+        assert entered.wait(1)
+        second = owner.submit_frame(_request("B", 2, 0), ExecutionContext("B"))
+
+        def completed(_):
+            try:
+                getattr(owner, operation)()  # Deliberately unbounded.
+            except ExecutionFailure as exc:
+                failures.append(exc)
+            finally:
+                callback_done.set()
+
+        first.add_done_callback(completed)
+        release.set()
+        try:
+            assert callback_done.wait(1)
+            assert len(failures) == 1 and failures[0].code == "runtime_reentrant"
+            assert owner.ready and not owner.closed
+            assert second.result(timeout=1) == 2
+        finally:
+            owner.close()
+
+    # A regression must fail the test without leaving a deadlocked worker in
+    # the pytest host. Only this deliberately unbounded scenario is isolated.
+    child = multiprocessing.get_context("fork").Process(target=scenario)
+    child.start()
+    child.join(4)
+    if child.is_alive():
+        child.terminate()
+        child.join(1)
+    assert child.exitcode == 0
+
+
+def test_closed_handle_releases_visual_snapshot_arrays():
+    import gc
+    import weakref
+
+    executor = _executor(SimpleNamespace(execute_role=lambda *_, **__: {"internal.features": np.ones(1, np.float32)}))
+    owner = _handle(executor)
+    try:
+        owner.submit_frame(_request("frame", 1, 0), ExecutionContext("frame")).result(timeout=1)
+        references = [
+            weakref.ref(value) for value in executor._snapshot.values.values() if isinstance(value, np.ndarray)
+        ]
+        assert references
+    finally:
+        owner.close()
+    gc.collect()
+    assert owner.closed and all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("close_in_callback", [False, True])
+def test_frame_callback_close_is_bounded_and_retains_worker_cleanup(close_in_callback):
+    from inference_service.unified_runtime import Deadline, ExecutionFailure
+
+    entered, release, callback_started, callback_done = (threading.Event() for _ in range(4))
+    finish_callback = threading.Event()
+    failures = []
+
+    def execute_role(role, inputs, request, context, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return {"internal.features": np.ones((1,), dtype=np.float32)}
+
+    owner = _handle(_executor(SimpleNamespace(execute_role=execute_role)))
+
+    def completed(_):
+        callback_started.set()
+        if close_in_callback:
+            try:
+                owner.close(deadline=Deadline.after(0.1))
+            except ExecutionFailure as error:
+                failures.append(error)
+        else:
+            assert finish_callback.wait(2)
+        callback_done.set()
+
+    future = owner.submit_frame(_request("frame", 1, 0), ExecutionContext("frame"))
+    assert entered.wait(1)
+    future.add_done_callback(completed)
+    try:
+        release.set()
+        assert callback_started.wait(1)
+        if close_in_callback:
+            assert callback_done.wait(1)
+            assert len(failures) == 1 and failures[0].code == "runtime_reentrant"
+            assert owner.ready and not owner.closed
+        else:
+            with pytest.raises(ExecutionFailure) as failure:
+                owner.close(deadline=Deadline.after(0.02))
+            assert failure.value.close_pending and not callback_done.is_set()
+            assert not owner.closed and not owner.ready
+    finally:
+        release.set()
+        finish_callback.set()
+        assert callback_done.wait(1)
+        owner.close(deadline=Deadline.after(1))
+    assert owner.closed
+
+
+def test_frame_submission_preserves_stage_ticket_identity_through_real_worker():
+    from inference_service.unified_runtime.stage_ticket import StageTicket
+
+    requests = []
+
+    def execute_role(role, inputs, request, context, **kwargs):
+        requests.append(request)
+        return {"internal.features": inputs["image"]}
+
+    executor = _executor(SimpleNamespace(execute_role=execute_role))
+    ticket = StageTicket(1, "camera-frame", 1)
+    request = ticket.attach(ModelRequest({"image": np.ones((1,), dtype=np.float32), "prompt": "task"}))
+    try:
+        assert executor.submit_frame(request, context=ExecutionContext("frame")).result(timeout=2) == 1
+        assert len(requests) == 1
+        assert StageTicket.from_request(requests[0]) == ticket
+    finally:
+        executor.close()
+
+
 def _executor(session, *, load=True, frame_base_priority=0, max_snapshot_age_ms=5000):
     from inference_service.model_sessions.base import ModelSession
 
@@ -538,7 +674,7 @@ def test_frame_request_id_collision_is_rejected_without_losing_active_owner(coll
         assert entered.wait(1)
         with pytest.raises(ExecutionFailure) as error:
             if colliding_frame:
-                handle.submit_frame(_request("same", 2, 0), ExecutionContext("same"))
+                handle.submit_frame(_request("same", 2, 0), ExecutionContext("same")).result(timeout=1)
             else:
                 handle.execute(_request("same", 2, 0), ExecutionContext("same"))
         assert error.value.code == "request_conflict"
@@ -782,14 +918,16 @@ def test_unknown_frame_failure_closes_handle_admission_and_updates_health():
         handle.close()
 
 
-def test_frame_submit_failure_releases_handle_record_and_does_not_block_retry():
-    from inference_service.unified_runtime import ExecutionFailure
+def test_proven_frame_rejection_releases_handle_record_and_does_not_block_retry():
+    from inference_service.unified_runtime import ExecutionFailure, OutcomeEvidence
 
     executor = _executor(SimpleNamespace())
     handle = _handle(executor)
 
     def reject(*args, **kwargs):
-        raise RuntimeError("submission rejected")
+        error = RuntimeError("submission rejected before enqueue")
+        error.evidence = OutcomeEvidence.not_started("frame_admission")
+        raise error
 
     executor.submit_frame = reject
     try:
@@ -800,6 +938,27 @@ def test_frame_submit_failure_releases_handle_record_and_does_not_block_retry():
             assert handle.ready
     finally:
         handle.close()
+
+
+def test_frame_cancel_before_enqueue_preserves_not_started(monkeypatch):
+    from inference_service.unified_runtime import ExecutionFailure, OutcomeState
+
+    executor = _executor(SimpleNamespace(execute_role=lambda *_, **__: pytest.fail("native work started")))
+    owner = _handle(executor)
+    submit = executor.submit_frame
+
+    def cancel_before_enqueue(request, *, context):
+        context.token.cancel("canceled after Handle admission")
+        return submit(request, context=context)
+
+    monkeypatch.setattr(executor, "submit_frame", cancel_before_enqueue)
+    try:
+        with pytest.raises(ExecutionFailure) as caught:
+            owner.submit_frame(_request("cancel", 1, 0), ExecutionContext("cancel")).result(timeout=1)
+        assert caught.value.evidence.state is OutcomeState.NOT_STARTED
+        assert owner.ready and owner.active_executions == 0
+    finally:
+        owner.close()
 
 
 def test_executors_share_component_health_aggregation_and_cancellation():
@@ -832,3 +991,66 @@ def test_executors_share_component_health_aggregation_and_cancellation():
         assert canceled == ["same-request", "same-request"]
     finally:
         staged.close()
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+@pytest.mark.parametrize("boundary", ["frame_publish", "queued_frame", "action_entry"])
+def test_staged_checkpoints_preserve_each_requests_actual_progress(monkeypatch, stop, boundary):
+    from inference_service.unified_runtime import Deadline, ExecutionFailure, OutcomeState
+
+    now = [datetime.now(timezone.utc)]
+    context = ExecutionContext("controlled", Deadline.after(5, now=now[0], clock=lambda: now[0]))
+    entered, release = threading.Event(), threading.Event()
+    calls, recorded = [], []
+
+    def stop_context():
+        if stop == "cancel":
+            context.token.cancel()
+        else:
+            now[0] += timedelta(seconds=10)
+
+    def execute_role(role, inputs, request, execution, **kwargs):
+        calls.append((execution.request_id, role))
+        if boundary == "frame_publish" and execution is context:
+            stop_context()
+        if boundary == "queued_frame" and execution.request_id == "first":
+            entered.set()
+            assert release.wait(2)
+        return {"internal.features": inputs["image"]} if role == "encoder" else {"action": inputs["state"]}
+
+    executor = _executor(SimpleNamespace(execute_role=execute_role))
+    executor._error_handler = lambda error, started: recorded.append(started)
+    owner = _handle(executor)
+    try:
+        if boundary == "queued_frame":
+            first = owner.submit_frame(_request("first", 1, 2), ExecutionContext("first"))
+            assert entered.wait(1)
+            result = owner.submit_frame(_request("controlled", 1, 2), context)
+            stop_context()
+            release.set()
+            first.result(2)
+        elif boundary == "action_entry":
+            owner.submit_frame(_request("first", 1, 2), ExecutionContext("first")).result(2)
+            wait = executor._wait_matching_snapshot
+
+            def stop_after_snapshot(*args, **kwargs):
+                snapshot = wait(*args, **kwargs)
+                stop_context()
+                return snapshot
+
+            monkeypatch.setattr(executor, "_wait_matching_snapshot", stop_after_snapshot)
+            with pytest.raises(ExecutionFailure) as caught:
+                owner.execute(_request("controlled", 1, 2), context)
+        else:
+            result = owner.submit_frame(_request("controlled", 1, 2), context)
+        if boundary != "action_entry":
+            with pytest.raises(ExecutionFailure) as caught:
+                result.result(2)
+        expected = OutcomeState.COMPLETED if boundary == "frame_publish" else OutcomeState.NOT_STARTED
+        assert caught.value.evidence.state is expected and caught.value.evidence.outcome_known
+        assert recorded == [boundary == "frame_publish"]
+        assert owner.ready and owner.active_executions == 0
+        assert not any(request_id == "controlled" for request_id, _ in calls) or boundary == "frame_publish"
+    finally:
+        release.set()
+        owner.close()

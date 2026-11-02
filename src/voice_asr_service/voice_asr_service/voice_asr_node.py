@@ -156,12 +156,16 @@ class VoiceASRNode(Node):
     def __init__(self):
         super().__init__("voice_asr_node")
 
-        self._declare_parameters()
-        self._init_modules()
-        self._init_ros_interface()
-        self._init_control_loop()
-
-        self.get_logger().info("VoiceASRNode initialized")
+        try:
+            self._declare_parameters()
+            self._init_modules()
+            self._init_ros_interface()
+            self._init_control_loop()
+            self.get_logger().info("VoiceASRNode initialized")
+        except Exception as exc:
+            # Keep one retryable owner across every stage after Node construction.
+            exc.cleanup_owner = self
+            raise
 
     def _declare_parameters(self):
         """声明 ROS 参数"""
@@ -296,6 +300,7 @@ class VoiceASRNode(Node):
                 self._vad_runtime.initialize()
                 self._validate_vad_audio_contract(self._vad_runtime)
                 self._vad.set_runtime(self._vad_runtime)
+                self._vad_runtime = None  # VADModule now owns the loaded runtime.
                 self._vad.initialize()
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
             self.get_logger().info(
@@ -876,16 +881,36 @@ class VoiceASRNode(Node):
 
     def destroy_node(self):
         """销毁节点"""
-        if hasattr(self, "_control_timer"):
-            self._control_timer.cancel()
-        if self._external_input is not None:
-            self._external_input.enabled = False
-        if self._audio_capture is not None:
-            self._audio_capture.cleanup()
-        self._asr.cleanup()
-        if self._vad is not None:
-            self._vad.close()
-        super().destroy_node()
+        if not getattr(self, "_node_destroyed", False):
+            if hasattr(self, "_control_timer"):
+                self._control_timer.cancel()
+            if getattr(self, "_external_input", None) is not None:
+                self._external_input.enabled = False
+        errors = []
+        for name, method in (
+            ("_audio_capture", "cleanup"),
+            ("_asr", "cleanup"),
+            ("_vad_runtime", "close"),
+            ("_vad", "close"),
+        ):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                try:
+                    getattr(resource, method)()
+                except Exception as exc:
+                    errors.append(exc)
+        if not getattr(self, "_node_destroyed", False):
+            self._destroy_result = super().destroy_node()
+            self._node_destroyed = True
+        if errors:
+            error = RuntimeError(f"Voice ASR cleanup pending: {errors[0]}")
+            error.cleanup_owner = self
+            error.close_pending = True
+            error.rollback_errors = tuple(str(item) for item in errors)
+            raise error from errors[0]
+        return self._destroy_result
+
+    close = destroy_node
 
 
 def main(args=None):
@@ -897,8 +922,18 @@ def main(args=None):
         import logging
 
         logging.getLogger("voice_asr_node").error(f"Node initialization failed: {e}")
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            owner = getattr(e, "cleanup_owner", None)
+            if owner is not None:
+                try:
+                    owner.close()
+                except Exception as cleanup_error:
+                    logging.getLogger("voice_asr_node").error(
+                        "Voice ASR startup cleanup failed before process exit: %s", cleanup_error
+                    )
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
         return 1
 
     executor = SingleThreadedExecutor()
@@ -909,13 +944,19 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        executor.remove_node(node)
-        node.destroy_node()
-        executor.shutdown(timeout_sec=0.0)
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            executor.remove_node(node)
+        finally:
+            try:
+                node.destroy_node()
+            finally:
+                try:
+                    executor.shutdown(timeout_sec=0.0)
+                finally:
+                    if rclpy.ok():
+                        rclpy.shutdown()
     return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

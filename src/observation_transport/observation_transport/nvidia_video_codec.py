@@ -32,7 +32,10 @@ def probe_nvidia_codec(kind: str) -> CodecCapabilities | None:
     """Probe codec presence and a real NVENC/CUVID session without requiring CUDA Python."""
     try:
         import av
+    except ImportError:
+        return None
 
+    try:
         if kind == "encoder":
             av.codec.Codec("h264_nvenc", "w")
             codec = _create_nvenc_context(
@@ -52,7 +55,7 @@ def probe_nvidia_codec(kind: str) -> CodecCapabilities | None:
             _close_codec_context(codec)
         else:
             return None
-    except (ImportError, LookupError, OSError, ValueError):
+    except (LookupError, OSError, ValueError, getattr(av, "FFmpegError", OSError)):
         return None
     return CodecCapabilities(pixel_formats=("rgb24", "bgr24"), hardware_accelerated=True)
 

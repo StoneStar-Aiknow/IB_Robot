@@ -23,9 +23,8 @@ class SigLIP2AscendSession(AscendOmModelSession):
             )
         super()._load(context, rollback)
 
-    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
-        images = np.asarray(request.inputs["masked_images"], dtype=np.float32)
+    def _validate_request(self, request: ModelRequest, context: ExecutionContext) -> None:
+        super()._validate_request(request, context)
         tokens = np.asarray(request.inputs["text_tokens"], dtype=np.int64)
         attention = np.asarray(request.inputs["text_attention_mask"], dtype=np.int64)
         if tokens.shape != attention.shape:
@@ -34,33 +33,59 @@ class SigLIP2AscendSession(AscendOmModelSession):
                 code="input_shape_mismatch",
             )
 
-        image_rows = [
-            self._run_role(0, "vision", {"host.siglip2.image": image[None]})["host.siglip2.image_embedding"]
-            for image in images
-        ]
-        image_embeddings = (
-            np.concatenate(image_rows, axis=0).astype(np.float32, copy=False)
-            if image_rows
-            else np.empty((0, self._embedding_dimension("vision")), dtype=np.float32)
-        )
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        self._check_not_started_context(context, "backend")
+        with self._host_processing("siglip2.inputs", completed=False):
+            images = np.asarray(request.inputs["masked_images"], dtype=np.float32)
+            tokens = np.asarray(request.inputs["text_tokens"], dtype=np.int64)
+        image_rows = []
+        for image in images:
+            with self._host_processing("siglip2.vision.inputs", completed=bool(image_rows)):
+                values = {"host.siglip2.image": image[None]}
+            output = self._run_role(
+                0,
+                "vision",
+                values,
+                request=request,
+                context=context,
+                previous_roles_completed=bool(image_rows),
+            )
+            with self._completed_validation("siglip2.vision.outputs"):
+                image_rows.append(output["host.siglip2.image_embedding"])
+        with self._host_processing("siglip2.embeddings", completed=bool(image_rows)):
+            image_embeddings = (
+                np.concatenate(image_rows, axis=0).astype(np.float32, copy=False)
+                if image_rows
+                else np.empty((0, self._embedding_dimension("vision")), dtype=np.float32)
+            )
+            text_batch = self._text_batch_size()
 
-        text_batch = self._text_batch_size()
         text_rows = []
         for start in range(0, len(tokens), text_batch):
-            chunk = tokens[start : start + text_batch]
-            padded = np.zeros((text_batch, tokens.shape[1]), dtype=np.int64)
-            padded[: len(chunk)] = chunk
-            output = self._run_role(1, "text", {"host.siglip2.input_ids": padded})["host.siglip2.text_embeddings"]
-            text_rows.append(np.asarray(output, dtype=np.float32)[: len(chunk)])
-        text_embeddings = (
-            np.concatenate(text_rows, axis=0)
-            if text_rows
-            else np.empty((0, self._embedding_dimension("text")), dtype=np.float32)
-        )
-        return {
-            "image_embeddings": np.ascontiguousarray(image_embeddings, dtype=np.float32),
-            "text_embeddings": np.ascontiguousarray(text_embeddings, dtype=np.float32),
-        }
+            with self._host_processing("siglip2.text.inputs", completed=bool(image_rows or text_rows)):
+                chunk = tokens[start : start + text_batch]
+                padded = np.zeros((text_batch, tokens.shape[1]), dtype=np.int64)
+                padded[: len(chunk)] = chunk
+            output = self._run_role(
+                1,
+                "text",
+                {"host.siglip2.input_ids": padded},
+                request=request,
+                context=context,
+                previous_roles_completed=bool(image_rows) or start > 0,
+            )
+            with self._completed_validation("siglip2.text.outputs"):
+                text_rows.append(np.asarray(output["host.siglip2.text_embeddings"], dtype=np.float32)[: len(chunk)])
+        with self._host_processing("siglip2.outputs", completed=bool(image_rows or text_rows)):
+            text_embeddings = (
+                np.concatenate(text_rows, axis=0)
+                if text_rows
+                else np.empty((0, self._embedding_dimension("text")), dtype=np.float32)
+            )
+            return {
+                "image_embeddings": np.ascontiguousarray(image_embeddings, dtype=np.float32),
+                "text_embeddings": np.ascontiguousarray(text_embeddings, dtype=np.float32),
+            }
 
     def _text_batch_size(self) -> int:
         binding = self._loaded_deployment().bindings["text"].inputs[0]

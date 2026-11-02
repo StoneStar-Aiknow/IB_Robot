@@ -11,6 +11,7 @@ from inference_service.backends.hmm.backend import HMMModule
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime.lifecycle import check_lifecycle, check_startup
 
 _HOST_ARTIFACT_FORMATS = frozenset({"pt", "pytorch"})
 
@@ -87,25 +88,12 @@ class HMMModelSession(ModelSession):
             )
 
         runtime = self._import_runtime()
+        check_startup()
         weight_manager = self._create_weight_manager(runtime, self._device_id)
         modules: dict[str, HMMModule] = {}
         host_roles: list[str] = []
 
-        def cleanup_resources() -> None:
-            errors: list[Exception] = []
-            for module in reversed(tuple(modules.values())):
-                try:
-                    module.close()
-                except Exception as exc:
-                    errors.append(exc)
-            try:
-                self._release_resource(weight_manager)
-            except Exception as exc:
-                errors.append(exc)
-            if errors:
-                raise RuntimeError("; ".join(str(error) for error in errors))
-
-        rollback.defer(cleanup_resources)
+        rollback.defer(self._release_resource, weight_manager)
 
         for role in deployment.execution:
             artifact = deployment.artifacts[role]
@@ -120,9 +108,13 @@ class HMMModelSession(ModelSession):
             path = context.resolved_artifacts.get(role)
             if path is None or not path.is_file():
                 raise BackendLoadError(f"HMM artifact {role!r} is unavailable: {path}", code="invalid_artifact")
+            check_startup()
             option = self._create_option(runtime, weight_manager)
+            check_startup()
             try:
-                modules[role] = HMMModule(runtime, role, path, deployment.bindings[role], option=option)
+                modules[role] = HMMModule(
+                    runtime, role, path, deployment.bindings[role], option=option, cleanup=rollback
+                )
             except BackendLoadError:
                 raise
             except Exception as exc:
@@ -133,6 +125,7 @@ class HMMModelSession(ModelSession):
 
         handles: list[object] = []
         for link in deployment.device_links:
+            check_startup()
             source_bindings = self._device_link_source_bindings(deployment, link.producer, link.producer_binding)
             source = self._binding_for_semantic(source_bindings, link.semantic, "device-link source")
             target = self._binding_for_semantic(
@@ -151,17 +144,17 @@ class HMMModelSession(ModelSession):
         self._device_handles = tuple(handles)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
-        context = self._require_context()
-        deployment = context.deployment
+        deployment = self._require_context().deployment
         if not isinstance(deployment, CompiledDeployment) or not self._modules:
             raise BackendInferenceError("HMM model session is not loaded", code="runtime_not_loaded")
         values: dict[str, object] = dict(request.inputs)
         public_outputs: dict[str, object] = {}
+        completed = False
         for role in deployment.execution:
             if role in self._host_roles:
                 continue
-            outputs = self._execute_role(role, values, request, context)
+            outputs = self._execute_role_with_progress(role, values, request, context, completed=completed)
+            completed = True
             values.update(outputs)
             for semantic, value in outputs.items():
                 if not semantic.startswith("internal."):
@@ -176,7 +169,6 @@ class HMMModelSession(ModelSession):
         context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
-        context.check(f"model.{role}")
         context = self._require_context()
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or role not in self._modules:
@@ -199,6 +191,8 @@ class HMMModelSession(ModelSession):
                 raise BackendInferenceError(
                     f"HMM role {role!r} is missing semantic input {binding.semantic!r}",
                     code="missing_semantic_input",
+                    operation_started=False,
+                    outcome_known=True,
                 ) from exc
         read_semantics = {binding.semantic for binding in bindings.outputs if binding.semantic not in linked_outputs}
         runtime_outputs = self._modules[role].execute(
@@ -213,28 +207,21 @@ class HMMModelSession(ModelSession):
         }
 
     def _close(self) -> None:
-        modules = self._modules
-        weight_manager = self._weight_manager
-        self._modules = {}
+        try:
+            for role, module in reversed(tuple(self._modules.items())):
+                check_lifecycle()
+                module.close()
+                del self._modules[role]
+            check_lifecycle()
+            self._release_resource(self._weight_manager)
+        except Exception as exc:
+            raise BackendLifecycleError(
+                f"HMM model session close pending: {exc}", code="close_failed", close_pending=True
+            ) from exc
         self._weight_manager = None
         self._runtime = None
         self._host_roles = frozenset()
         self._device_handles = ()
-        errors: list[Exception] = []
-        for module in reversed(tuple(modules.values())):
-            try:
-                module.close()
-            except Exception as exc:
-                errors.append(exc)
-        try:
-            self._release_resource(weight_manager)
-        except Exception as exc:
-            errors.append(exc)
-        if errors:
-            raise BackendLifecycleError(
-                f"HMM model session close failed: {'; '.join(str(error) for error in errors)}",
-                code="close_failed",
-            )
 
     def _validate_role_values(
         self,

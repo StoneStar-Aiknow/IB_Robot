@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -100,9 +101,9 @@ def test_trace_toggle_preserves_role_input_validation_position(monkeypatch, tmp_
                 outcome = (error.value.code, str(error.value), vars(error.value).copy())
             else:
                 outcome = executor.execute(ModelRequest(inputs), ExecutionContext("role")).tolist()
-            # Baseline validates role shape/dtype after the vendor call. Missing
-            # input is rejected while building the feed, before the vendor call.
-            assert len(graph.feeds) == (0 if failure == "missing" else 1)
+            # All binding errors are rejected before the vendor call, with
+            # the same position and evidence whether tracing is on or off.
+            assert len(graph.feeds) == (0 if failure in {"missing", "shape", "dtype"} else 1)
             outcomes.append((outcome, len(graph.feeds)))
         finally:
             session.close()
@@ -119,7 +120,8 @@ def test_trace_toggle_keeps_policy_validation_after_input_preparation(monkeypatc
         session._torch = SimpleNamespace()
         session._policy = SimpleNamespace()
         session._context = SimpleNamespace(
-            validated_manifest=SimpleNamespace(manifest=SimpleNamespace(model=SimpleNamespace(inputs=())))
+            managed_execution=False,
+            validated_manifest=SimpleNamespace(manifest=SimpleNamespace(model=SimpleNamespace(inputs=()))),
         )
         prepared = []
         monkeypatch.setattr(session, "_move_input", prepared.append)
@@ -152,7 +154,10 @@ def test_trace_toggle_does_not_add_processor_sync_or_device_walk(monkeypatch, de
     for enabled in (False, True):
         monkeypatch.setenv("IB_TRACE_ENABLED", "1" if enabled else "0")
         session = LeRobotTorchModelSession(device)
-        session._torch = SimpleNamespace(is_tensor=unexpected, **{device: SimpleNamespace(synchronize=unexpected)})
+        session._torch = SimpleNamespace(
+            is_tensor=unexpected, **{device: SimpleNamespace(synchronize=unexpected, device=lambda _: nullcontext())}
+        )
+        session._context = SimpleNamespace(managed_execution=False)
         session._device = device
         session._preprocessor = lambda inputs: result
         session._postprocessor = lambda action: result

@@ -31,6 +31,7 @@ from .contracts import (
     StreamLifecycleState,
     StreamState,
 )
+from .dispatch import RuntimeExecutionPolicy
 from .errors import (
     RECOVERY_MATRIX,
     VALID_RECOVERY_REQUIREMENTS,
@@ -139,6 +140,7 @@ __all__ = [
     "VALID_RECOVERY_REQUIREMENTS",
     "RuntimeDiagnostics",
     "RuntimeExecutor",
+    "RuntimeExecutionPolicy",
     "RuntimeHealth",
     "RuntimeLatency",
     "RuntimeLifecycleState",

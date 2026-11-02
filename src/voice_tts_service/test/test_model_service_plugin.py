@@ -148,3 +148,64 @@ def test_zipvoice_plugin_maps_unclassified_failures_to_internal_error():
         plugin.handle(request, _response())
 
     assert raised.value.response_fields["error_code"] == "INTERNAL_ERROR"
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_zipvoice_keeps_cleanup_owner_until_handle_close_succeeds(monkeypatch, load_fails):
+    from inference_service.backends import BackendCapabilities, ResourceDomainAdmissions
+    from inference_service.backends.errors import BackendLifecycleError
+    from inference_service.unified_runtime import ExecutionFailure, RuntimeProviders
+
+    blocked, closes = [True], []
+
+    class Session:
+        name = "zipvoice-test"
+        capabilities = BackendCapabilities()
+
+        def load(self, _):
+            if load_fails:
+                raise RuntimeError("original model load failed")
+
+        def close(self):
+            closes.append("close")
+            if blocked[0]:
+                raise BackendLifecycleError("lease release pending", close_pending=True)
+
+        def execute(self, *_):
+            return {}
+
+    session = Session()
+    providers = RuntimeProviders(object(), ResourceDomainAdmissions())
+    registry = SimpleNamespace(
+        session_builder_registry=SimpleNamespace(create=lambda *args, **kwargs: session), backend_registry=object()
+    )
+    monkeypatch.setattr(
+        "voice_tts_service.model_service_plugin.require_runtime_dependencies",
+        lambda *args, **kwargs: (registry, providers),
+    )
+    validated = SimpleNamespace(
+        manifest=SimpleNamespace(
+            model=SimpleNamespace(interface="tensor_model", model_type="zipvoice", operation="synthesize")
+        ),
+        deployment=SimpleNamespace(artifacts={}),
+        bundle_root=None,
+    )
+    try:
+        if load_fails:
+            with pytest.raises(ExecutionFailure, match="original model load failed"):
+                ZipVoiceSynthesizePlugin(None, validated, {}, registry_set=registry, providers=providers)
+        else:
+            plugin = ZipVoiceSynthesizePlugin(None, validated, {}, registry_set=registry, providers=providers)
+            with pytest.raises(ExecutionFailure) as caught:
+                plugin.close()
+            assert caught.value.close_pending
+            providers.retain_cleanup(plugin)
+        attempts = len(closes)
+        blocked[0] = False
+        providers.close()
+        assert len(closes) == attempts + 1
+        providers.close()
+        assert len(closes) == attempts + 1
+    finally:
+        blocked[0] = False
+        providers.close()

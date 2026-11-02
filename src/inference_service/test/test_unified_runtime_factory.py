@@ -144,6 +144,29 @@ def _providers() -> RuntimeProviders:
     return RuntimeProviders.create(SimpleNamespace(), SimpleNamespace())
 
 
+def test_factory_failure_retains_cleanup_before_process_provider_release():
+    events = []
+
+    class Session(RecordingResource):
+        def close(self):
+            super().close()
+            if self.close_count == 1:
+                raise RuntimeError("session still busy")
+
+    def assemble(*_args, **_kwargs):
+        raise RuntimeError("assembler failed")
+
+    session = Session("session", events)
+    registry = _single_registry(builder=lambda _: session, assembler=assemble)
+    providers = RuntimeProviders(SimpleNamespace(close=lambda: events.append("provider")), object())
+    with pytest.raises(RuntimeFactoryError) as failure:
+        ModelRuntimeFactory.create(_single_spec(), registry, providers)
+    assert failure.value.cleanup_owner is not None
+    assert events == ["close:session"]
+    providers.close()
+    assert events == ["close:session", "close:session", "provider"]
+
+
 def test_factory_builds_single_request_direct_and_transfers_ownership() -> None:
     events: list[str] = []
     session = RecordingResource("session", events, output={"outputs": {"value": 7}})
@@ -373,3 +396,30 @@ def test_factory_rolls_back_sessions_and_leases_before_transfer() -> None:
         "close:executor",
         "close:session",
     ]
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_factory_native_drain_expands_real_assemblies_and_ignores_role_executors(composite):
+    if composite:
+        spec, registries, events, _ = _composite_setup()
+        runtime = ModelRuntimeFactory.create(spec, registries, _providers())
+    else:
+        events = []
+        runtime = ModelRuntimeFactory.create(
+            _single_spec(), _single_registry(builder=lambda _: RecordingResource("session", events)), _providers()
+        )
+    calls = []
+    sessions = {id(a.session): a.session for a in runtime.assembly.role_assemblies.values()}
+    for session in sessions.values():
+        session.drain_uncertain_operations = lambda session=session: calls.append(session.name)
+    runtime.load()
+    policy = SimpleNamespace(
+        ready=True, execute=lambda *_: None, reset=lambda *_: None, close=lambda *_: None, cancel=lambda *_: None
+    )
+    authority = runtime.bind_execution_policy(policy)
+    try:
+        runtime.drain_managed(ExecutionContext("drain"), _dispatch_key=authority)
+        assert sorted(calls) == sorted(session.name for session in sessions.values())
+        assert len(calls) == (2 if composite else 1)
+    finally:
+        runtime._close_local(_dispatch_key=authority)

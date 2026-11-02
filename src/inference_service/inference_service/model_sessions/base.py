@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -26,7 +26,37 @@ from inference_service.backends.errors import (
     BackendLoadError,
 )
 from inference_service.backends.types import BackendCapabilities, BackendHealth, BackendState, RuntimeContext
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionFailureFactory,
+    LoadRollback,
+    ModelRequest,
+    OutcomeEvidence,
+)
+from inference_service.unified_runtime.errors import (
+    CancellationRequested,
+    DeadlineExceeded,
+    clear_exception_frames,
+    execution_evidence,
+    merge_execution_evidence,
+)
+
+
+def numpy_dtype(dtype: str) -> np.dtype:
+    """Resolve a manifest dtype name, including bfloat16 through ml_dtypes."""
+    if dtype != "bfloat16":
+        return np.dtype(dtype)
+    try:
+        return np.dtype(dtype)
+    except TypeError:
+        try:
+            import ml_dtypes
+        except ImportError as exc:
+            raise BackendLoadError(
+                "model-session bfloat16 bindings require NumPy bfloat16 support or ml_dtypes",
+                code="unsupported_runtime_dtype",
+            ) from exc
+        return np.dtype(ml_dtypes.bfloat16)
 
 
 class ModelSession(ABC):
@@ -50,6 +80,7 @@ class ModelSession(ABC):
         self._context: RuntimeContext | None = None
         self._last_successful_inference_time: datetime | None = None
         self._loading = False
+        self._load_rollback = None
 
     @property
     def name(self) -> str:
@@ -58,6 +89,11 @@ class ModelSession(ABC):
     @property
     def capabilities(self) -> BackendCapabilities:
         return self._capabilities
+
+    @property
+    def managed_execution(self) -> bool | None:
+        """The completion contract fixed when this native Session was loaded."""
+        return None if self._context is None else self._context.managed_execution
 
     def _update_loaded_capabilities(self, *, priority_mapping=None, **changes: object) -> None:
         """Publish backend capabilities discovered while vendor objects load."""
@@ -109,8 +145,15 @@ class ModelSession(ABC):
             self._context = context
             rollback.commit()
         except Exception as exc:
+            # Failed constructors can leave device objects in traceback locals.
+            # Preserve the diagnostic stack, but release those references before
+            # the registered backend drain/cleanup supplies completion evidence.
+            clear_exception_frames(exc)
             rollback_errors = rollback.rollback()
+            self._load_rollback = rollback if rollback_errors else None
             error = self._load_error(exc, rollback_errors)
+            error.rollback_clean = not rollback_errors
+            error.rollback_errors = tuple(str(item) for item in rollback_errors)
             with self._condition:
                 self._failure_count += 1
                 self._reason_code = error.code
@@ -134,11 +177,17 @@ class ModelSession(ABC):
         if not isinstance(context, ExecutionContext):
             raise TypeError("model runtimes require an ExecutionContext")
         self._require_ready()
-        context.check("backend")
-        self._validate_request(request, context)
+        self._check_not_started_context(context, "backend")
+        try:
+            self._validate_request(request, context)
+        except Exception as exc:
+            raise ExecutionFailureFactory().from_exception(
+                exc, evidence=OutcomeEvidence.not_started("input_validation")
+            ) from exc
         outputs = self._execute(request, context)
-        context.check("backend")
-        self._validate_values(outputs, self._require_context().validated_manifest.manifest.model.outputs, "output")
+        self._check_completed_context(context, "backend")
+        with self._completed_validation("output_validation"):
+            self._validate_values(outputs, self._require_context().validated_manifest.manifest.model.outputs, "output")
         with self._condition:
             self._last_successful_inference_time = datetime.now(timezone.utc)
         return outputs
@@ -158,14 +207,78 @@ class ModelSession(ABC):
         if not isinstance(request, ModelRequest) or not isinstance(context, ExecutionContext):
             raise TypeError("role execution requires native ModelRequest and ExecutionContext")
         self._require_ready()
-        context.check(f"model.{role}")
+        # Only the orchestrator knows whether an earlier role ran. This entry
+        # can prove only that the current role has not started.
+        self._check_not_started_context(context, f"model.{role}")
         if isolated:
             outputs = self._execute_role_isolated(role, inputs, request, context, operation_factory=operation_factory)
         else:
             outputs = self._execute_role(role, inputs, request, context)
-        self._validate_role_values(role, inputs, outputs, isolated=isolated)
-        context.check(f"model.{role}")
+        with self._completed_validation(f"model.{role}.validation"):
+            self._validate_role_values(role, inputs, outputs, isolated=isolated)
+        self._check_completed_context(context, f"model.{role}")
         return outputs
+
+    @contextmanager
+    def _host_processing(self, phase: str, *, completed: bool):
+        """Annotate host-only work between synchronous native calls, never the calls themselves."""
+        if completed:
+            with self._completed_validation(phase):
+                yield
+        else:
+            try:
+                yield
+            except Exception as exc:
+                exc.evidence = OutcomeEvidence.not_started(phase)
+                raise
+
+    @contextmanager
+    def _completed_validation(self, phase: str):
+        """Validation cannot erase a returned call's native completion proof."""
+        try:
+            yield
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.completed(phase, state_mutated=self.capabilities.stateful)
+            # Direct Torch may return device tensors before completion. Reuse
+            # its existing discard fence before advertising known completion.
+            complete_failure = getattr(self, "complete_failure", None)
+            if callable(complete_failure):
+                complete_failure(exc)
+            raise
+
+    def _execute_role_with_progress(self, role, inputs, request, context, *, completed):
+        """Preserve earlier synchronous roles across control and native errors."""
+        if completed:
+            self._check_completed_context(context, f"model.{role}")
+        else:
+            self._check_not_started_context(context, f"model.{role}")
+        try:
+            outputs = self._execute_role(role, inputs, request, context)
+        except Exception as exc:
+            if completed:
+                exc.evidence = merge_execution_evidence(
+                    OutcomeEvidence.completed(state_mutated=self.capabilities.stateful),
+                    execution_evidence(exc, started=True, stateful=self.capabilities.stateful, unknown_on_error=True),
+                )
+            raise
+        self._check_completed_context(context, f"model.{role}")
+        return outputs
+
+    @staticmethod
+    def _check_not_started_context(context: ExecutionContext, phase: str) -> None:
+        """Check control before this native call, independently of prior roles."""
+        try:
+            context.check(phase)
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            raise ExecutionFailureFactory().from_exception(exc, evidence=OutcomeEvidence.not_started(phase)) from exc
+
+    def _check_completed_context(self, context: ExecutionContext, phase: str) -> None:
+        try:
+            context.check(phase)
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            raise ExecutionFailureFactory().from_exception(
+                exc, evidence=OutcomeEvidence.completed(phase, state_mutated=self.capabilities.stateful)
+            ) from exc
 
     def _execute_role_isolated(self, role, inputs, request, context, *, operation_factory=None):
         raise BackendCapabilityError(
@@ -176,10 +289,10 @@ class ModelSession(ABC):
         if not self.capabilities.resettable:
             raise BackendCapabilityError(f"model runtime {self.name!r} does not support reset", capability="reset")
         if context is not None:
-            context.check("reset")
+            self._check_not_started_context(context, "reset")
         self._reset()
         if context is not None:
-            context.check("reset")
+            self._check_completed_context(context, "reset")
 
     def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
         if not self.capabilities.supports_cancellation:
@@ -207,17 +320,24 @@ class ModelSession(ABC):
             self._state = BackendState.CLOSING
         error: Exception | None = None
         try:
-            self._close()
+            if self._load_rollback is not None:
+                errors = self._load_rollback.rollback()
+                if errors:
+                    raise BackendLifecycleError(str(errors[0]), close_pending=True) from errors[0]
+                self._load_rollback = None
+            else:
+                self._close()
         except Exception as exc:
             error = exc
         finally:
-            self._context = None
+            if not getattr(error, "close_pending", False):
+                self._context = None
             with self._condition:
                 if error is not None:
                     self._failure_count += 1
                     self._reason_code = getattr(error, "code", "close_failed")
                     self._message = str(error)
-                self._state = BackendState.CLOSED
+                self._state = BackendState.FAILED if getattr(error, "close_pending", False) else BackendState.CLOSED
         if error is not None:
             raise error
 
@@ -309,7 +429,7 @@ class ModelSession(ABC):
                 raise BackendInferenceError(
                     f"{direction} {semantic!r} is not tensor-like: {exc}", code=f"invalid_{direction}_tensor"
                 ) from exc
-            expected_dtype = np.dtype(descriptor.dtype)
+            expected_dtype = numpy_dtype(descriptor.dtype)
             if array.dtype != expected_dtype:
                 raise BackendInferenceError(
                     f"{direction} {semantic!r} dtype {array.dtype} does not match {expected_dtype}",

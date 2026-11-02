@@ -31,6 +31,7 @@ from inference_service.backends.types import (
     BackendState,
     InferenceRequest,
     RuntimeContext,
+    runtime_context_defaults,
 )
 
 __all__ = [
@@ -60,4 +61,5 @@ __all__ = [
     "InferenceRequest",
     "ResourceDomainAdmissions",
     "RuntimeContext",
+    "runtime_context_defaults",
 ]

@@ -256,7 +256,12 @@ class Deadline:
 
 
 class CancellationToken:
-    """Thread-safe cooperative cancellation shared by one execution."""
+    """Thread-safe cooperative cancellation shared by one execution.
+
+    Observers run synchronously and must return promptly. They may signal
+    another owner, but must not wait for execution completion or later cancel
+    hooks. Cancellation deadlines cannot interrupt arbitrary Python callbacks.
+    """
 
     def __init__(self) -> None:
         self._event = threading.Event()

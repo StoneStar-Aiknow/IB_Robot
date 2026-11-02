@@ -165,6 +165,10 @@ class _UnknownOutcomeRecognizer(_Recognizer):
     """Final decode fails like an async device error: started, outcome unknown."""
 
     fail_final = True
+    reset_calls = 0
+
+    def reset(self) -> None:
+        self.reset_calls += 1
 
     def get_result(self, stream: _Stream) -> _Result:
         if stream.finished and self.fail_final:
@@ -182,7 +186,12 @@ def _runtime_exclusive_asr(recognizer: _Recognizer) -> ASRInferenceModule:
     asr = ASRInferenceModule()
     asr._recognizer = recognizer
     asr._model_type = ModelType.STREAMING
-    asr._install_streaming_runtime(_SherpaStreamingRuntime(recognizer, 16000), state_bank_mode="runtime_exclusive")
+
+    class _ExclusiveRuntime(_SherpaStreamingRuntime):
+        def reset(self, _context=None) -> None:
+            recognizer.reset()
+
+    asr._install_streaming_runtime(_ExclusiveRuntime(recognizer, 16000), state_bank_mode="runtime_exclusive")
     asr.state = ASRState.READY
     return asr
 
@@ -202,6 +211,7 @@ def test_runtime_exclusive_failed_final_decode_recovers_runtime_for_next_utteran
     asr.reset()
     assert asr.state is ASRState.READY
     assert asr._runtime_handle.recovery_requirement is None
+    assert recognizer.reset_calls == 1
 
     recognizer.fail_final = False
     assert asr.start_streaming()
@@ -217,6 +227,7 @@ def test_runtime_exclusive_failed_final_decode_recovers_without_explicit_reset()
     with pytest.raises(Exception, match="encoder execute failed"):
         asr.end_streaming()
 
+    assert recognizer.reset_calls == 1
     recognizer.fail_final = False
     assert asr.start_streaming()
     assert asr.end_streaming().text == "final"
@@ -243,3 +254,97 @@ def test_runtime_reset_failure_reports_error_instead_of_ready() -> None:
     assert "device reset failed" in asr._last_error
     assert not asr.start_streaming()
     asr.cleanup()
+
+
+@pytest.mark.parametrize("entry", ["final", "file", "reset"])
+def test_failed_stream_close_is_retried_before_next_utterance(entry):
+    from inference_service.unified_runtime import ExecutionFailure
+
+    blocked, closes = [True], []
+
+    class Runtime(_SherpaStreamingRuntime):
+        def close_stream(self, stream, context):
+            closes.append(stream)
+            if blocked[0]:
+                raise RuntimeError("native close pending")
+            return super().close_stream(stream, context)
+
+    asr = ASRInferenceModule()
+    asr._recognizer = recognizer = _Recognizer()
+    asr._model_type = ModelType.STREAMING
+    asr._install_streaming_runtime(Runtime(recognizer, 16000))
+    asr.state = ASRState.READY
+    try:
+        with pytest.raises(ExecutionFailure, match="close pending"):
+            if entry == "file":
+                asr.recognize_file(np.ones(8, np.float32), enable_vad=False)
+            else:
+                assert asr.start_streaming()
+                asr.reset() if entry == "reset" else asr.end_streaming()
+        assert asr._runtime_handle.open_stream_count == 1
+        blocked[0] = False
+        asr.reset()
+        assert asr.state is ASRState.READY and asr._runtime_handle.open_stream_count == 0
+        assert asr.start_streaming()
+        assert asr.end_streaming().text == "final"
+        assert len(closes) == 3
+    finally:
+        blocked[0] = False
+        asr.cleanup()
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_failed_initialization_only_reports_owned_cleanup(monkeypatch, closed):
+    import importlib.util
+    from types import SimpleNamespace
+
+    from voice_asr_service import asr_inference_module
+
+    asr = ASRInferenceModule()
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: object())
+
+    def fail(*_):
+        asr._runtime_handle = SimpleNamespace(closed=closed)
+        raise RuntimeError("load failed after rollback")
+
+    monkeypatch.setattr(asr_inference_module, "load_inference_manifest", fail)
+    with pytest.raises(RuntimeError, match="initialize ASR") as caught:
+        asr.initialize("unused", "cpu")
+    assert bool(getattr(caught.value, "close_pending", False)) is not closed
+    assert (getattr(caught.value, "cleanup_owner", None) is asr) is not closed
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_real_handle_load_rollback_controls_initialization_cleanup_evidence(monkeypatch, pending):
+    import importlib.util
+
+    from inference_service.backends.errors import BackendLifecycleError
+    from voice_asr_service import asr_inference_module
+
+    asr = ASRInferenceModule()
+    blocked, closes = [pending], []
+
+    class Runtime(_SherpaStreamingRuntime):
+        def load(self, _context=None):
+            raise RuntimeError("load failed")
+
+        def close(self):
+            closes.append(True)
+            if blocked[0]:
+                raise BackendLifecycleError("native cleanup pending", close_pending=True)
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: object())
+
+    def install(*_):
+        asr._install_streaming_runtime(Runtime(_Recognizer(), 16000))
+
+    monkeypatch.setattr(asr_inference_module, "load_inference_manifest", install)
+    try:
+        with pytest.raises(RuntimeError, match="initialize ASR") as caught:
+            asr.initialize("unused", "cpu")
+        assert bool(getattr(caught.value, "close_pending", False)) is pending
+        assert (asr._runtime_handle is not None) is pending
+        assert closes == [True]
+    finally:
+        blocked[0] = False
+        asr.cleanup()

@@ -64,30 +64,39 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         self._stability_thresh = float(adapter.get("stability_score_thresh", _DEFAULT_STABILITY_THRESH))
         self._decoder_batch = self._decoder_batch_size(deployment)
 
-    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
+    def _validate_request(self, request: ModelRequest, context: ExecutionContext) -> None:
+        super()._validate_request(request, context)
         image_rgb = np.asarray(request.inputs["observation.image"], dtype=np.uint8)
-        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or min(image_rgb.shape[:2]) <= 0:
             raise BackendInferenceError("SAM2 automatic requires an RGB uint8 HxWx3 image", code="input_shape_mismatch")
-        height, width = image_rgb.shape[:2]
 
-        canvas, scale, pad_h, pad_w = self._letterbox(image_rgb)
-        encoder_inputs = {"host.sam2.image": canvas[None].astype(np.float32)}
-        enc_out = self._run_role(0, "encoder", encoder_inputs)
-        image_embed = np.asarray(enc_out["internal.image_embed"], dtype=np.float32)
-        high_res_0 = np.asarray(enc_out["internal.high_res_feats_0"], dtype=np.float32)
-        high_res_1 = np.asarray(enc_out["internal.high_res_feats_1"], dtype=np.float32)
-
-        points = self._point_grid(self._points_per_side)
+    def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        self._check_not_started_context(context, "backend")
+        with self._host_processing("sam2.encoder.inputs", completed=False):
+            image_rgb = np.asarray(request.inputs["observation.image"], dtype=np.uint8)
+            height, width = image_rgb.shape[:2]
+            canvas, scale, pad_h, pad_w = self._letterbox(image_rgb)
+            encoder_inputs = {"host.sam2.image": canvas[None].astype(np.float32)}
+        enc_out = self._run_role(0, "encoder", encoder_inputs, request=request, context=context)
+        with self._completed_validation("sam2.encoder.outputs"):
+            image_embed = np.asarray(enc_out["internal.image_embed"], dtype=np.float32)
+            high_res_0 = np.asarray(enc_out["internal.high_res_feats_0"], dtype=np.float32)
+            high_res_1 = np.asarray(enc_out["internal.high_res_feats_1"], dtype=np.float32)
+            points = self._point_grid(self._points_per_side)
         masks_logits: list[np.ndarray] = []
         ious: list[float] = []
         for batch in self._batches(points, self._decoder_batch):
-            logits, iou = self._run_decoder(image_embed, high_res_0, high_res_1, batch)
-            for index in range(len(logits)):
-                masks_logits.append(logits[index, 0])
-                ious.append(float(iou[index, 0]))
+            logits, iou = self._run_decoder(
+                image_embed, high_res_0, high_res_1, batch, request=request, context=context
+            )
+            with self._completed_validation("sam2.decoder.outputs"):
+                for index in range(len(logits)):
+                    masks_logits.append(logits[index, 0])
+                    ious.append(float(iou[index, 0]))
 
-        return self._postprocess(masks_logits, ious, height, width, scale, pad_h, pad_w)
+        self._check_completed_context(context, "sam2.postprocess")
+        with self._completed_validation("sam2.postprocess"):
+            return self._postprocess(masks_logits, ious, height, width, scale, pad_h, pad_w)
 
     def _letterbox(self, image: np.ndarray) -> tuple[np.ndarray, float, int, int]:
         height, width = image.shape[:2]
@@ -113,27 +122,30 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         for start in range(0, len(points), batch):
             yield points[start : start + batch]
 
-    def _run_decoder(self, embed, hr0, hr1, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        count = len(points)
-        point_coords = np.zeros((count, 2, 2), dtype=np.float32)
-        point_labels = np.zeros((count, 2), dtype=np.int8)
-        for index, (gx, gy) in enumerate(points):
-            point_coords[index, 0] = [gx * _CANVAS_SIZE, gy * _CANVAS_SIZE]
-            point_labels[index, 0] = 1
-            point_coords[index, 1] = [gx * _CANVAS_SIZE, gy * _CANVAS_SIZE]
-            point_labels[index, 1] = -1
-        values = {
-            "internal.image_embed": np.broadcast_to(embed, (count, *embed.shape[1:])).copy(),
-            "internal.high_res_feats_0": np.broadcast_to(hr0, (count, *hr0.shape[1:])).copy(),
-            "internal.high_res_feats_1": np.broadcast_to(hr1, (count, *hr1.shape[1:])).copy(),
-            "host.sam2.point_coords": np.ascontiguousarray(point_coords),
-            "host.sam2.point_labels": np.ascontiguousarray(point_labels),
-            "host.sam2.mask_input": np.zeros((count, 1, 256, 256), dtype=np.float32),
-            "host.sam2.has_mask_input": np.zeros((count,), dtype=np.int8),
-        }
-        out = self._run_role(1, "decoder", values)
-        logits = np.asarray(out["host.sam2.mask_logits"], dtype=np.float32)
-        iou = np.asarray(out["host.sam2.iou_predictions"], dtype=np.float32)
+    def _run_decoder(self, embed, hr0, hr1, points: np.ndarray, *, request, context) -> tuple[np.ndarray, np.ndarray]:
+        self._check_completed_context(context, "sam2.decoder.inputs")
+        with self._completed_validation("sam2.decoder.inputs"):
+            count = len(points)
+            point_coords = np.zeros((count, 2, 2), dtype=np.float32)
+            point_labels = np.zeros((count, 2), dtype=np.int8)
+            for index, (gx, gy) in enumerate(points):
+                point_coords[index, 0] = [gx * _CANVAS_SIZE, gy * _CANVAS_SIZE]
+                point_labels[index, 0] = 1
+                point_coords[index, 1] = [gx * _CANVAS_SIZE, gy * _CANVAS_SIZE]
+                point_labels[index, 1] = -1
+            values = {
+                "internal.image_embed": np.broadcast_to(embed, (count, *embed.shape[1:])).copy(),
+                "internal.high_res_feats_0": np.broadcast_to(hr0, (count, *hr0.shape[1:])).copy(),
+                "internal.high_res_feats_1": np.broadcast_to(hr1, (count, *hr1.shape[1:])).copy(),
+                "host.sam2.point_coords": np.ascontiguousarray(point_coords),
+                "host.sam2.point_labels": np.ascontiguousarray(point_labels),
+                "host.sam2.mask_input": np.zeros((count, 1, 256, 256), dtype=np.float32),
+                "host.sam2.has_mask_input": np.zeros((count,), dtype=np.int8),
+            }
+        out = self._run_role(1, "decoder", values, request=request, context=context, previous_roles_completed=True)
+        with self._completed_validation("sam2.decoder.outputs"):
+            logits = np.asarray(out["host.sam2.mask_logits"], dtype=np.float32)
+            iou = np.asarray(out["host.sam2.iou_predictions"], dtype=np.float32)
         return logits, iou
 
     def _postprocess(

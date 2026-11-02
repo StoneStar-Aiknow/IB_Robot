@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from inference_manifest import ArtifactBindings, TensorBinding
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
+from inference_service.unified_runtime.contracts import OutcomeEvidence, OutcomeState
 
 _ALLOWED_RUNTIME_OPTIONS = frozenset({"device_id", "random_seed"})
 
@@ -40,6 +41,7 @@ class HMMModule:
         bindings: ArtifactBindings,
         *,
         option: object | None,
+        cleanup=None,
     ) -> None:
         self.role = role
         self._bindings = bindings
@@ -47,12 +49,22 @@ class HMMModule:
         self._input_names: dict[str, str] = {}
         self._output_names: dict[str, str] = {}
         self._closed = False
+        self._closing = False
+        self._release_uncertain: str | None = None
+        if cleanup is not None:
+            cleanup.defer(self.close)
         try:
             load = runtime.load
             self._module = load(str(path), option) if option is not None else load(str(path))
             self._validate_descriptor()
-        except Exception:
-            self.close()
+        except Exception as exc:
+            if cleanup is None:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
             raise
 
     def execute(
@@ -63,6 +75,7 @@ class HMMModule:
         read_semantics: set[str],
     ) -> dict[object, np.ndarray]:
         module = self._require_module()
+        converted_inputs = {}
         for binding in self._bindings.inputs:
             if binding.semantic in device_input_semantics:
                 continue
@@ -72,30 +85,49 @@ class HMMModule:
                 raise BackendInferenceError(
                     f"HMM role {self.role!r} is missing input semantic {binding.semantic!r}",
                     code="missing_runtime_input",
+                    operation_started=False,
+                    outcome_known=True,
                 ) from exc
-            module.set_input(
-                self._input_names[binding.semantic],
-                self._convert_value(binding, value, direction="input"),
+            converted_inputs[self._input_names[binding.semantic]] = self._convert_value(
+                binding, value, direction="input"
             )
-        module.run()
-        sync = getattr(module, "sync", None)
-        if callable(sync):
-            sync()
+        try:
+            for name, value in converted_inputs.items():
+                module.set_input(name, value)
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.not_started(f"model.{self.role}.inputs")
+            raise
+        try:
+            module.run()
+            sync = getattr(module, "sync", None)
+            if callable(sync):
+                sync()
+        except Exception as exc:
+            raise BackendInferenceError(
+                f"HMM role {self.role!r} completion is unknown: {exc}",
+                code="device_completion_unknown",
+                operation_started=True,
+                outcome_known=False,
+            ) from exc
 
-        outputs: dict[object, np.ndarray] = {}
-        for binding in self._bindings.outputs:
-            if binding.semantic not in read_semantics:
-                continue
-            value = module.get_output(self._output_names[binding.semantic])
-            to_numpy = getattr(value, "numpy", None)
-            if callable(to_numpy):
-                value = to_numpy()
-            converted = self._convert_value(binding, value, direction="output")
-            if binding.index is not None:
-                outputs[int(binding.index)] = converted
-            if binding.runtime_name is not None:
-                outputs[binding.runtime_name] = converted
-        return outputs
+        try:
+            outputs: dict[object, np.ndarray] = {}
+            for binding in self._bindings.outputs:
+                if binding.semantic not in read_semantics:
+                    continue
+                value = module.get_output(self._output_names[binding.semantic])
+                to_numpy = getattr(value, "numpy", None)
+                if callable(to_numpy):
+                    value = to_numpy()
+                converted = self._convert_value(binding, value, direction="output")
+                if binding.index is not None:
+                    outputs[int(binding.index)] = converted
+                if binding.runtime_name is not None:
+                    outputs[binding.runtime_name] = converted
+            return outputs
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.completed(f"model.{self.role}.outputs")
+            raise
 
     def get_device_source(self, binding: TensorBinding, source: str) -> object:
         module = self._require_module()
@@ -125,16 +157,28 @@ class HMMModule:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        self._closing = True
+        if self._release_uncertain is not None:
+            raise BackendLifecycleError(self._release_uncertain, code="release_outcome_unknown", close_pending=True)
         module = self._module
-        self._module = None
         if module is None:
+            self._closed = True
             return
         for method_name in ("release", "close", "destroy"):
             method = getattr(module, method_name, None)
             if callable(method):
-                method()
-                return
+                try:
+                    method()
+                except Exception as exc:
+                    # An undocumented partial free is not a retryable release.
+                    if getattr(getattr(exc, "evidence", None), "state", None) is not OutcomeState.NOT_STARTED:
+                        self._release_uncertain = f"HMM release outcome unknown; process restart required: {exc}"
+                    raise BackendLifecycleError(
+                        self._release_uncertain or str(exc), code="release_outcome_unknown", close_pending=True
+                    ) from exc
+                break
+        self._module = None
+        self._closed = True
 
     def _validate_descriptor(self) -> None:
         module = self._require_module()
@@ -201,10 +245,12 @@ class HMMModule:
     def _convert_value(self, binding: TensorBinding, value: object, *, direction: str) -> np.ndarray:
         try:
             converted = np.ascontiguousarray(np.asarray(value, dtype=self._numpy_dtype(binding.dtype)))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise BackendInferenceError(
                 f"HMM role {self.role!r} {direction} {binding.semantic!r} cannot convert to {binding.dtype}",
                 code=f"runtime_{direction}_dtype_mismatch",
+                operation_started=direction == "output",
+                outcome_known=True,
             ) from exc
         if (
             direction == "output"
@@ -219,11 +265,13 @@ class HMMModule:
                 f"HMM role {self.role!r} {direction} {binding.semantic!r} shape {converted.shape} "
                 f"does not match manifest shape {binding.shape}",
                 code=f"runtime_{direction}_shape_mismatch",
+                operation_started=direction == "output",
+                outcome_known=True,
             )
         return converted
 
     def _require_module(self) -> object:
-        if self._module is None:
+        if self._closing or self._module is None:
             raise BackendInferenceError(f"HMM role {self.role!r} is closed", code="runtime_not_loaded")
         return self._module
 

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 
 import numpy as np
 
 from inference_service.backends import RuntimeContext
+from inference_service.backends.errors import BackendLifecycleError
 from inference_service.model_sessions import ModelSession
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
+from inference_service.unified_runtime.lifecycle import lifecycle_context
 
 
 class SpeechDirectionRoleRunner:
@@ -42,7 +44,7 @@ class SpeechDirectionRoleRunner:
             request = ModelRequest(values, {"role": role})
             return self.session.execute_role(role, values, request, self._execution_context)
         self._request_counter += 1
-        context = ExecutionContext(f"speech-direction-{self._request_counter}")
+        context = lifecycle_context() or ExecutionContext(f"speech-direction-{self._request_counter}")
         request = ModelRequest(values, {"role": role})
         return self.session.execute_role(role, values, request, context)
 
@@ -52,7 +54,7 @@ class SpeechDirectionRoleRunner:
         if self._execution_context is not None:
             raise RuntimeError("speech direction execution scope is already active")
         self._request_counter += 1
-        self._execution_context = ExecutionContext(f"speech-direction-{self._request_counter}")
+        self._execution_context = lifecycle_context() or ExecutionContext(f"speech-direction-{self._request_counter}")
         try:
             yield
         finally:
@@ -138,30 +140,41 @@ class SpeechDirectionSessionResources:
             raise RuntimeError("Speech Direction Session resources are closed")
         if self._loaded:
             return
-        loaded: list[ModelSession] = []
         try:
             for _role, session, context in self._entries:
                 session.load(context)
-                loaded.append(session)
-        except Exception:
-            for session in reversed(loaded):
-                with suppress(Exception):
-                    session.close()
+        except Exception as exc:
+            # A child's rollback_clean describes only that child. Close this
+            # entire owner before reporting its aggregate rollback status.
+            exc.rollback_clean = False
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                exc.rollback_clean = self._closed
+                if not self._closed:
+                    exc.close_pending = True
+                    exc.cleanup_owner = self
+                exc.rollback_errors = (str(cleanup_error),)
+            else:
+                exc.rollback_clean = True
             raise
         self._loaded = True
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         errors: list[BaseException] = []
         for _role, session, _context in reversed(self._entries):
             try:
                 session.close()
             except BaseException as exc:
                 errors.append(exc)
+        pending = any(getattr(error, "close_pending", False) for error in errors)
+        self._closed = not pending
         if errors:
-            raise RuntimeError(f"Speech Direction Session cleanup failed: {errors[0]}") from errors[0]
+            raise BackendLifecycleError(
+                f"Speech Direction Session cleanup failed: {errors[0]}", close_pending=pending
+            ) from errors[0]
 
 
 __all__ = ["SpeechDirectionRoleRunner", "SpeechDirectionSessionResources"]

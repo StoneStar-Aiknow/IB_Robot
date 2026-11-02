@@ -413,14 +413,20 @@ class SpeechDirectionNode(Node):
             logger.error("speech_direction 降级: %s", e, exc_info=True)
 
         # ============================ 轮询定时器 ============================
-        self._poll_timer = self.create_timer(POLL_PERIOD_SEC, self._poll_and_publish)
-        # 诊断定时器(1Hz)
-        self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
+        try:
+            self._poll_timer = self.create_timer(POLL_PERIOD_SEC, self._poll_and_publish)
+            # 诊断定时器(1Hz)
+            self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
 
-        self.get_logger().info(
-            f"speech_direction_node 已启动: audio_topic={cfg.audio_topic}, "
-            f"mount_yaw_deg={cfg.mount_yaw_deg}, degraded={self._degraded}"
-        )
+            self.get_logger().info(
+                f"speech_direction_node 已启动: audio_topic={cfg.audio_topic}, "
+                f"mount_yaw_deg={cfg.mount_yaw_deg}, degraded={self._degraded}"
+            )
+        except Exception:
+            # Construction has not returned an owner to main yet. Reuse the
+            # normal stop path, which transfers pending cleanup to providers.
+            self.destroy_node()
+            raise
 
     def _declare_parameters(self) -> None:
         """声明必须由 YAML 提供的 ROS 参数，不在节点代码中设置部署默认值。"""
@@ -753,10 +759,23 @@ class SpeechDirectionNode(Node):
             max_open_streams=1,
             state_links=tuple(state_links),
         )
+        # This exclusive pipeline has one in-flight step and supports at most
+        # one shared device domain. Torch/ONNX roles need no domain lease; an
+        # Ascend VAD still requires its lease when FullSubNet is on Torch.
+        sessions = [session for session, _context in session_entries.values()]
+        constrained = [session for session in sessions if session.capabilities.resource_domain is not None]
+        domains = {
+            (session.capabilities.resource_domain, session.capabilities.resource_domain_limit)
+            for session in constrained
+        }
+        if len(domains) > 1:
+            raise ValueError("Speech Direction requires one shared resource domain with a consistent limit")
+        admission_session = next(iter(constrained or sessions), None)
         assembly = RuntimeAssembly(
+            providers=self._providers,
             runtime_executor=streaming_runtime,
             streaming_runtime=streaming_runtime,
-            session=next((session for session, _context in session_entries.values()), None),
+            session=admission_session,
             role_assemblies={role: session for role, (session, _context) in session_entries.items()},
             owned_components=tuple(owned_components),
             stateful=True,
@@ -998,8 +1017,18 @@ class SpeechDirectionNode(Node):
                 try:
                     self._runtime.stop()
                 except Exception as exc:
+                    if getattr(exc, "close_pending", False):
+                        # Runtime owns worker shutdown as well as the Handle.
+                        self._providers.retain_cleanup(self._runtime)
                     if cleanup_error is None:
                         cleanup_error = exc
+            elif getattr(self, "_runtime_handle", None) is not None:
+                try:
+                    self._runtime_handle.close()
+                except Exception as exc:
+                    if getattr(exc, "close_pending", False):
+                        self._providers.retain_cleanup(self._runtime_handle)
+                    cleanup_error = exc
             # Model Sessions are owned by the unified runtime handle.  If
             # assembly failed before a SpeechDirectionRuntime was installed,
             # release the pending Session owner here as a construction-failure
@@ -1046,19 +1075,28 @@ class SpeechDirectionNode(Node):
 def main(args=None) -> None:
     """speech_direction_node 入口。"""
     rclpy.init(args=args)
-    dependencies = build_model_service_runtime_dependencies()
-    node = SpeechDirectionNode(
-        registry_set=dependencies.registry_set,
-        providers=dependencies.providers,
-    )
+    dependencies = None
+    node = None
     try:
+        dependencies = build_model_service_runtime_dependencies()
+        node = SpeechDirectionNode(
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+        )
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("用户中断,正在停止...")
+        if node is not None:
+            node.get_logger().info("用户中断,正在停止...")
     finally:
-        node.destroy_node()
-        dependencies.providers.close()
-        rclpy.shutdown()
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            try:
+                if dependencies is not None:
+                    dependencies.providers.close()
+            finally:
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -42,6 +42,102 @@ from perception_service.graspgen_session import GraspGenAscendSession
 _POINT_COUNT = 2048
 
 
+@pytest.mark.parametrize(
+    "failure_at",
+    [
+        "features",
+        "noise",
+        "scores",
+        "group",
+        "pose",
+        "binding",
+        "native",
+        "geometry",
+        "first_binding",
+        "entry_cancel",
+        "entry_deadline",
+    ],
+)
+def test_host_orchestration_retains_completion_through_handle(graspgen_bundle, fake_acl, monkeypatch, failure_at):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from inference_service.unified_runtime import Deadline, ExecutionFailure, ModelRuntimeHandle, OutcomeState
+    from perception_service import graspgen_session
+
+    session, _ = _session(graspgen_bundle, fake_acl, random_seed=0)
+    owner = ModelRuntimeHandle(SimpleNamespace(execute=session.execute, close=session.close))
+    owner.load()
+    failing = [True]
+    now = [datetime(2026, 11, 3, tzinfo=timezone.utc)]
+    execution = ExecutionContext("bad", Deadline.after(1, now=now[0], clock=lambda: now[0]))
+    target = {"features": "generator_sa1", "noise": "denoiser", "scores": "discriminator_head", "native": "denoiser"}
+    if failure_at in target:
+        model = session._models[target[failure_at]]
+        execute = model.execute
+
+        def output(*args, **kwargs):
+            if failing[0] and failure_at == "native":
+                raise BackendInferenceError("native completion unknown", operation_started=True, outcome_known=False)
+            result = execute(*args, **kwargs)
+            return {} if failing[0] else result
+
+        monkeypatch.setattr(model, "execute", output)
+    elif failure_at in {"binding", "first_binding"}:
+        original_binding = session._binding
+
+        def bind(role, *args):
+            if failing[0] and role == ("generator_sa1" if failure_at == "first_binding" else "discriminator_sa1"):
+                raise ValueError("host binding failed after the generator")
+            return original_binding(role, *args)
+
+        monkeypatch.setattr(session, "_binding", bind)
+    elif failure_at.startswith("entry_"):
+        original_validate = session._validate_request
+
+        def validate(request, context):
+            original_validate(request, context)
+            if failing[0]:
+                # Base preflight passed; cancellation/expiry reaches the second
+                # check at the subclass entry before any native role can run.
+                if failure_at == "entry_cancel":
+                    context.token.cancel()
+                else:
+                    now[0] += timedelta(seconds=2)
+
+        monkeypatch.setattr(session, "_validate_request", validate)
+    else:
+        name = {"group": "group_features", "geometry": "build_pointnet_geometry", "pose": "rt_to_matrix"}[failure_at]
+        original = getattr(graspgen_session, name)
+
+        def host(*args, **kwargs):
+            if failing[0]:
+                raise ValueError("host computation failed")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(graspgen_session, name, host)
+    request = ModelRequest({"observation.object_points": _points()})
+    try:
+        with pytest.raises(ExecutionFailure) as caught:
+            owner.execute(request, execution)
+        before_native = failure_at in {"geometry", "first_binding", "entry_cancel", "entry_deadline"}
+        assert bool(fake_acl.order) is not before_native
+        assert caught.value.evidence.state is (
+            OutcomeState.NOT_STARTED
+            if before_native
+            else OutcomeState.STARTED
+            if failure_at == "native"
+            else OutcomeState.COMPLETED
+        )
+        assert caught.value.evidence.outcome_known is (failure_at != "native")
+        assert owner.ready is (failure_at != "native")
+        if failure_at != "native":
+            failing[0] = False
+            assert "grasp.poses" in owner.execute(request, ExecutionContext("good")).outputs
+    finally:
+        owner.close()
+
+
 def _session(bundle, fake_acl, **runtime_options) -> tuple[GraspGenAscendSession, FakeAclRuntimeManager]:
     manager = FakeAclRuntimeManager()
     session = GraspGenAscendSession(
@@ -90,6 +186,53 @@ def test_the_roles_run_in_the_shared_execution_order_with_the_denoiser_looping(g
     assert fake_acl.order.index("generator_encoder_head") < fake_acl.order.index("denoiser")
     assert fake_acl.order.index("denoiser") < fake_acl.order.index("discriminator_head")
     session.close()
+
+
+def test_priority_builder_passes_request_through_encoders_and_every_denoiser_step(graspgen_bundle, fake_acl):
+    from types import SimpleNamespace
+
+    from inference_service.unified_runtime import RuntimeProviders
+    from perception_service.model_session_builders import build_graspgen_session
+
+    streams = []
+
+    class Model(fake_acl):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+
+        def execute(self, inputs, *, stream=None, **kwargs):
+            streams.append((self.role, stream))
+            return super().execute(inputs, **kwargs)
+
+    manager = FakeAclRuntimeManager()
+    manager.lease.bind_current_thread = lambda: None
+    manager.lease.acl = SimpleNamespace(
+        rt=SimpleNamespace(
+            device_get_stream_priority_range=lambda: (7, 0, 0),
+            create_stream_with_config=lambda priority, _: (priority, 0),
+            synchronize_stream=lambda _: 0,
+            destroy_stream=lambda _: 0,
+        )
+    )
+    context = RuntimeContext(
+        load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT), {"random_seed": 0}, priority_scheduling=True
+    )
+    adapter = GraspGenAdapter.from_bundle(graspgen_bundle)
+    providers = RuntimeProviders(manager, object())
+    session = build_graspgen_session(context, adapter=adapter, providers=providers)
+    session._model_factory = Model
+    session.load(context)
+    try:
+        session.execute(
+            ModelRequest({"observation.object_points": _points()}, metadata={"priority": 6}),
+            ExecutionContext("priority"),
+        )
+        assert {role for role, _ in streams} == set(GRASPGEN_EXECUTION)
+        assert all(stream == 6 for _, stream in streams)
+        assert sum(role == "denoiser" for role, _ in streams) == adapter.config.diffusion_steps
+    finally:
+        session.close()
+        providers.close()
 
 
 def test_the_host_computes_every_grouped_neighbourhood_the_compiled_slots_expect(graspgen_bundle, fake_acl):
