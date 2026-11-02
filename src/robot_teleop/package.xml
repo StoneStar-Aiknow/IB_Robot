@@ -49,6 +49,8 @@
        robot_config's loader and registry (openspec change
        ``migrate-business-launch-builders``). -->
   <test_depend>robot_config</test_depend>
+  <!-- The VR replay gate launches the SO-101 runtime on simulated transport. -->
+  <test_depend>so101_robot</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 
