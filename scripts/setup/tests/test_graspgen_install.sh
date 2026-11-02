@@ -384,7 +384,19 @@ assert_eq "a failed build degrades to a skip" \
 assert_eq "the preflight skips non-x86_64 hosts" \
     "1" "$(grep -c 'pointnet2_ops wheel and its build script are x86_64-only' "${GRASPGEN_LIB}")"
 assert_eq "the recorded install still gates the smoke test" \
-    "1" "$(printf '%s\n' "${venv_fn}" | grep -c 'grasp_installed=true')"
+    "1" "$(printf '%s\n' "${venv_fn}" | grep -c '    grasp_installed=true')"
+
+echo "== the X2 grasp planner does not wait on pointnet2_ops =="
+
+planner_block="$(printf '%s\n' "${venv_fn}" | awk '/local x2_planning_installed=false/{capture=1} capture{print} /x2_planning_installed=true/{exit}')"
+assert_eq "cuRobo is installed in its own block" \
+    "1" "$(printf '%s\n' "${planner_block}" | grep -c 'curobo_wheel}" --quiet')"
+assert_eq "that block is gated on the accelerator" \
+    "1" "$(printf '%s\n' "${planner_block}" | grep -c 'accel_supports_torch_grasp')"
+assert_eq "and not on the pointnet2_ops plan (skipped on aarch64, Blackwell, no nvcc)" \
+    "0" "$(printf '%s\n' "${planner_block}" | grep -c 'pointnet2ops' || true)"
+assert_eq "its own record gates the cuRobo smoke test" \
+    "1" "$(printf '%s\n' "${venv_fn}" | grep -c 'x2_planning_installed}" == true')"
 
 echo
 if [[ "${FAIL}" -eq 0 ]]; then

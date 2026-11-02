@@ -28,7 +28,9 @@ package.
 | Public surface | Type | Platform mechanism |
 |---|---|---|
 | `/runtime/set_mode`, `/runtime/get_status`, `/runtime/stop`, `/runtime_status` | contract | `SetMcAction`, `/aima/mc/common/state`, `/aima/sm/system_state` |
-| `/joint_states`, `/aimdk/body_joint_states` | `sensor_msgs/JointState` | `/aima/hal/joint/{arm,head,waist,leg}/state`, hand state |
+| `/joint_states`, `/aimdk/body_joint_states` | `sensor_msgs/JointState`, stamped on the platform clock (HAL header stamp) | `/aima/hal/joint/{arm,head,waist,leg}/state`, hand state |
+| `/aimdk/hand/joint_states` (OmniHand profile) | `sensor_msgs/JointState`, ten finger joints per hand | `/aima/hal/joint/hand/state` |
+| `faults` in `/runtime_status` (`<group> joint fault: <joint>=<code>`) | contract | non-zero `error_code` / `faultcode` of the groups a profile lists in `vendor.feedback.fault_groups` (OmniHand: arm, head; none by default) |
 | `/aimdk/arm/commands`, `/aimdk/gripper/commands`, `/aimdk/head/commands` | `Float64MultiArray` | `/mc/upper_body_command` (`arm_pos` / `hand_pos` / `head_pos`) |
 | `/cmd_vel` | `geometry_msgs/Twist` | `/aima/mc/locomotion/velocity` + input-source arbitration |
 | `/motion/execute_named` | `ibrobot_msgs/action/ExecuteNamedMotion` | `SetMcPresetMotion` (wave, handshake, clap…) and posture MC actions (sit, squat, lie, stand up, stairs); in `stream`, recorded arm trajectories on `/mc/upper_body_command` |
@@ -39,6 +41,7 @@ package.
 | `/power_state` | `ibrobot_msgs/msg/PowerState` | `/aima/hal/pmu/state` |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `/aima/hds/{diag,alert}_code_list` |
 | `/audio/capture_stamped`, `/audio/info`, `/audio/play` | project audio contract | `/aima/hal/audio/{capture,playback}` |
+| `/audio/wake_event` (`audio.wake_event`) | `ibrobot_msgs/SpeechWakeEvent`, one per wake word, naming the woken segment | assistant acknowledgement on `/aima/hal/audio/playback` paired with the processed-audio BEGIN |
 | camera (raw + `/compressed`) / IMU (chest, torso, RGB-D, stereo, lidar) / touch interfaces | declared, not re-driven | `/aima/hal/sensor/**`, `/aima/hal/imu/**` |
 
 ### Vendor QoS is part of the endpoint contract
@@ -60,6 +63,12 @@ other direction: the platform's state topics are TRANSIENT_LOCAL, so a
 TRANSIENT_LOCAL subscription receives the current value on subscribe instead of
 waiting for the next sample. When a firmware changes a QoS, correct the profile
 rather than the code.
+
+The SDK table binds the side that must match the platform. Where the runtime only
+listens, RELIABLE is not automatically safer: `audio_capture` and the playback
+monitor (`audio_playback_monitor`, see the wake event below) subscribe best effort,
+because each lost IP fragment of a RELIABLE stream is asked for again and on a host
+shared with another skill that became a retransmit storm (issue #201).
 
 ### Audio playback holds the platform's audio focus
 
@@ -330,8 +339,105 @@ component the facade and mock runtimes use, so `audio.speech` is `ready` before
 the wake word and `wait_for_runtime` can admit ASR. The monitor is given only
 `OBSERVED_INTERFACES = ("audio.speech",)`: handing it the whole description would
 re-subscribe the camera and lidar streams inside this process on a board that is
-already the bottleneck. Its subscription runs in the speech callback group so the
-~500 Hz joint feedback cannot delay it past the staleness window.
+already the bottleneck. Its subscription runs in the speech callback group so
+nothing else on the executor can delay it past the staleness window.
+
+### The data plane is a native process
+
+The HAL publishes each joint group, the hand state and the arm command at
+~170-500 Hz, ~2800 samples a second in all. In this Python process that
+traffic decided everything else: on the 310P robot-side host `/joint_states`
+fell to 0.5 Hz against 50 (2026-10-26), commands reached the platform
+100-200 ms late, and every way of reading fewer samples (a shallower queue per
+group, dropping groups) was a per-deployment setting that left the runtime
+blind to a fault code present in one frame.
+
+So the runtime is two processes (`aimdk_robot.dataplane`):
+
+- **`aimdk_dataplane`** (C++, package `aimdk_dataplane`) takes every vendor
+  joint, hand and arm command sample; publishes `/joint_states` and every other
+  declared JointState view at the `joint.state` rate, the hand touch arrays and
+  the arm command echo; and owns the fixed-rate command stream: it subscribes
+  the public command channels, validates them, holds uncommanded joints, and
+  publishes `/mc/upper_body_command` and the locomotion velocity. On the 310P it
+  takes all ~2800 samples a second at ~0.35 of one core.
+- **`aimdk_runtime`** (this node) keeps the control plane: modes, arbitration,
+  stop, the vendor services, speech, audio, diagnostics, named motions.
+
+They share three internal topics under `/aimdk_runtime/dataplane/`. The
+runtime's **control** word (latched, sent on every change and at 10 Hz) says
+what is admitted: the mode, whether output is admitted, the navigation gate,
+the arm owner, the platform speed envelope, and two counters that clear the
+cached commands or ask for an explicit zero velocity. A stop waits for the data
+plane to acknowledge the word that closes the output and reports the stop as
+failed while it goes unacknowledged, so a safe output is never claimed before
+the data plane proves it. Closing an admission that was open does the same as a
+`clear` plus an explicit zero — the runtime closes it for its own faults (a
+faulted joint group) without counting a `safe`, and its heartbeat keeps the
+control fresh so the quiet watchdog below would never fire. A named motion's
+claim of the arm is judged by the data plane in the same step that applies it:
+while a public arm target is live the claim is refused (`arm_claim:
+PUBLIC_ARM_STREAM_ACTIVE`) and the status keeps reporting no owner, so a
+status snapshot that predates a target cannot hand the arm over. If the control
+word stops arriving for 0.5 s the data plane drops its commands and sends a zero
+itself, so a dead or stalled runtime never leaves a target streaming. The data
+plane's **status** (20 Hz) is stamped with when it was generated, on the
+monotonic clock both processes share; the runtime ages it end to end, so a
+report that queued past the freshness window is stale no matter when its
+callback ran. It reports feedback ages, the hand types, the measured arm with
+its own age, the applied arm owner, the fault codes seen since the previous
+status -- a code present in a single sample is reported -- and the commands it
+refused. **named_arm** carries a named motion's arm targets.
+
+The rules the data plane applies (payload validation and rejection reasons,
+holds, velocity limits, view stamping) are the ones this node applied before,
+ported rule for rule and tested in `aimdk_dataplane`'s gtests.
+
+### The platform's wake word is reported as `audio.wake_event`
+
+The X2 consumes its wake word before it releases speech and publishes no wake
+event, so a consumer cannot tell an utterance that named the robot from a
+follow-up. What the platform does do, on every wake word and only then, is start
+its native assistant's reply on the playback topic (`vendor.topics.audio_playback`,
+`/aima/hal/audio/playback`) under a new `token_id`. `aimdk_robot.wake_ack.WakeAckPairer`
+pairs such a token with the BEGIN of a vendor speech segment and the runtime
+publishes one `ibrobot_msgs/msg/SpeechWakeEvent` on the declared `audio.wake_event`
+interface (default `/audio/wake_event`). It names the woken segment the way
+`SpeakerEmbedding` does, by the `source_id` and `sequence` of its BEGIN chunk, and is
+stamped on arrival because the vendor header is all zero. Measured on the robot (2026-10-24): 14 of 14 utterances classified correctly,
+every acknowledgement between 1.2 s before and 1.0 s after its BEGIN.
+
+`vendor.wake_ack` configures the pairing:
+
+| Key | Meaning |
+|---|---|
+| `pkg_names` | Playback `pkg_name`s that count as the assistant's voice (`[tts]`) |
+| `pair_window_s` | Largest gap, either way, between the acknowledgement and the BEGIN (1.5 s) |
+| `token_pattern` | Regular expression the acknowledgement token must match. **Required** when `audio.wake_event` is declared: the runtime refuses to start without it |
+
+`token_pattern` (`"^_[0-9]+_"`) exists because the platform's dialog subsystem also
+speaks unprompted answers (`hds_tts_…` tokens), and one of those once paired with a
+bystander's BEGIN. The token form is undocumented vendor detail: if a firmware
+update changes it, the symptom is that no wake events arrive, never that a
+bystander is treated as a new wake. The voice bridge's `vendor_session` gate opens a
+session only on a wake event, so it then accepts nobody: the failure is a deaf robot,
+not an open one, and the fix is the profile's pattern. The robot's speaker does not have to work for any of this;
+the platform publishes the playback message whether or not anything is heard.
+
+The playback subscription takes its QoS from `vendor.qos.audio_playback_monitor`
+(best effort), not from `vendor.qos.audio_playback`: the runtime publishes on the same
+topic, and that publisher must stay RELIABLE because the platform subscribes RELIABLE,
+while the listening side gains nothing from RELIABLE and, like `audio_capture`, risks
+retransmit storms on a shared host. A best-effort subscription of the platform's
+RELIABLE publisher is compatible.
+
+Not declaring `audio.wake_event` turns the whole path off, including the playback
+subscription; declaring it without `vendor.topics.audio_playback`, or with another
+message type, fails at startup. The interface publishes nothing until somebody says
+the wake word, so it is never `ready` at launch: consumers bind it as an event
+stream (`wait_for_runtime --declared-interfaces`), which checks that the runtime
+declares it without waiting for a first message. The voice bridge consumes it
+through `embodied.agent.voice_bridge.wake_event` (see `src/agent/ibrobot_agent/README.md`).
 
 ### The platform's state message is read whole
 
@@ -356,7 +462,7 @@ not clamped, for the same reason a gripper command is.
 
 `HandStateArray` carries a 36-cell palm, a 36-cell back and five 16-cell
 fingertips per hand. They are republished on `/aimdk/hand_touch` as a
-`Float64MultiArray` whose layout dimensions name each pad and its size, because
+`Float64MultiArray` (at the view rate, above) whose layout dimensions name each pad and its size, because
 the pads have different cell counts and a fixed-width matrix would pad or
 truncate them.
 
@@ -365,6 +471,21 @@ touch fields exist on every hand state message, a gripper's included, where
 they are all zeros — that is the absence of a sensor, not a measurement of no
 contact, and publishing it would invent a tactile array the robot does not
 have. The gripper profile therefore declares no tactile endpoint.
+
+### The arm command the motion-control unit is driving
+
+The HAL publishes the arm's position targets and gains on
+`/aima/hal/joint/arm/command`, apart from the measured state. The OmniHand
+profile republishes them as `joint.arm_command_state` on
+`/aimdk/arm/command_state` (`ibrobot_msgs/JointCommandState`, the 14 arm joints in
+the stream's order, stamped with the HAL's platform time, at the view rate). Under load an arm
+settles below its target by torque / stiffness (about 0.1 rad at the shoulder in
+an extended pose at kp 40), so an executor that takes over `joint.arm_stream`
+must start from these targets or the arm drops at takeover. It is also how an
+executor sees the platform clamp a target it sent at a joint limit, and the
+gains its gravity model assumes. A message missing a declared joint or carrying
+a non-finite value is not republished: half a target is not the controller's
+target. This runtime never writes gains; the echo only reports them.
 
 ### Declared sensors are what the firmware actually serves
 
@@ -459,6 +580,11 @@ policy, arbitration identity, expression/motion/posture tables and the vendor
 endpoint map. Hand type is a profile property, not runtime autodetection — the
 bridge verifies it against the vendor's `GetHandType` at startup and refuses to
 become ACTIVE on mismatch.
+
+The platform's 6-channel microphone capture is read BEST_EFFORT: every message
+is IP-fragmented, and reading it reliably made the robot-side host resend lost
+fragments until IP reassembly was pinned and the grasp head's replies were cut
+off (issue #201).
 
 ### What the profiles deliberately do not declare
 

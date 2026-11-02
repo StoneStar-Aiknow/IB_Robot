@@ -183,6 +183,16 @@ def compose_registry_arguments(registry: LaunchBuilderRegistry) -> tuple[Argumen
     return compose_argument_specs(registry.contributed_arguments())
 
 
+def _model_artifacts_hosted_locally(arguments: Mapping[str, str]) -> bool:
+    """Read ``with_model_services``: does this host run the configured model services?
+
+    The argument belongs to the ``perception_models`` entry, so it is absent in
+    registries without that entry; "true" then keeps the existing single-host
+    behaviour of validating every enabled service's local bundle and artifacts.
+    """
+    return parse_bool(arguments.get("with_model_services", "true"), default=True)
+
+
 def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] | None) -> dict[str, Any]:
     if loaded_config is not None:
         config = isolated_config(loaded_config)
@@ -192,6 +202,10 @@ def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] 
             arguments["config_path"] or None,
             arguments["nav_stage"],
             defer_interface_binding=True,
+            # A host whose models are served elsewhere still validates service
+            # identity, endpoints and the semantic contract, but the weights
+            # and deployment artifacts only have to exist where they run.
+            require_local_model_artifacts=_model_artifacts_hosted_locally(arguments),
         )
     config["_config_path"] = readiness.resolve_config_path(arguments["robot_config"], arguments["config_path"])
     return config

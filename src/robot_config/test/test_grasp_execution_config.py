@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.loader import load_robot_config_dict
 
 CONFIG = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
@@ -102,7 +103,10 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert config["navigation"]["enabled"] is True
     assert config["navigation"]["nav2_bringup"]["enabled"] is False
     assert config["navigation"]["ekf_rtabmap"]["enabled"] is False
-    assert config["navigation"]["cmd_vel_bridge"]["enabled"] is True
+    # The generic cmd_vel bridge was removed (openspec
+    # lekiwi-application-migration task 2.2); this configuration is recorded
+    # unsupported for base drive.
+    assert "cmd_vel_bridge" not in config["navigation"]
     assert config["navigation"]["robot_navigation"]["enabled"] is False
     assert grasp_execution["camera"]["rgb_topic"] == "/camera/wrist/image_raw"
     assert grasp_execution["state_wait"] == {
@@ -196,6 +200,68 @@ def test_grasp_execution_config_rejects_unknown_nested_key(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="min_aligment_cos"):
         load_robot_config_dict(path)
+
+
+def test_grasp_execution_schema_accepts_provider_and_worker_launch_fields() -> None:
+    # D2: the config-declared provider modules and the providerless worker
+    # launch are schema-accepted strings; the static requirement checks stay
+    # in pick_executor_node and the real-config regression test.
+    value = {
+        "enabled": True,
+        "ik": {"workers_launch": "$(find so101_motion)/launch/ik_workers.launch.py"},
+        "target_geometry": {
+            "tabletop_filter": True,
+            "grasp_geometry_provider": "so101_suite.gripper_geometry",
+            "mesh_package": "so101_description",
+            "mesh_directory": "meshes/lerobot/so101",
+        },
+        "target_gripper": {
+            "ik_orientation_guard": {"enabled": True, "wrist_guard_provider": "so101_suite.wrist_guard"},
+        },
+    }
+
+    assert validate_grasp_execution_config(value) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_error"),
+    [
+        (
+            {"target_geometry": {"grasp_geometry_provider": 7}},
+            "grasp_execution.target_geometry.grasp_geometry_provider must be a non-empty string",
+        ),
+        (
+            {"target_gripper": {"ik_orientation_guard": {"wrist_guard_provider": ["a"]}}},
+            "grasp_execution.target_gripper.ik_orientation_guard.wrist_guard_provider must be a non-empty string",
+        ),
+        (
+            {"ik": {"workers_launch": True}},
+            "grasp_execution.ik.workers_launch must be a non-empty string",
+        ),
+    ],
+)
+def test_grasp_execution_schema_rejects_non_string_provider_fields(value, expected_error: str) -> None:
+    assert expected_error in validate_grasp_execution_config(value)
+
+
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+def test_grasp_execution_config_accepts_provider_and_worker_launch_fields(tmp_path: Path) -> None:
+    def declare_providers(config):
+        config["target_geometry"]["grasp_geometry_provider"] = "so101_suite.gripper_geometry"
+        config["target_gripper"]["ik_orientation_guard"]["wrist_guard_provider"] = "so101_suite.wrist_guard"
+        config["ik"]["workers_launch"] = "$(find so101_motion)/launch/ik_workers.launch.py"
+
+    path = _write_config(tmp_path, declare_providers)
+
+    grasp_execution = load_robot_config_dict(path)["grasp_execution"]
+    assert grasp_execution["target_geometry"]["grasp_geometry_provider"] == "so101_suite.gripper_geometry"
+    assert (
+        grasp_execution["target_gripper"]["ik_orientation_guard"]["wrist_guard_provider"] == "so101_suite.wrist_guard"
+    )
+    assert grasp_execution["ik"]["workers_launch"] == "$(find so101_motion)/launch/ik_workers.launch.py"
 
 
 def test_grasp_execution_config_rejects_removed_joint5_abs_max(tmp_path: Path) -> None:
@@ -362,3 +428,60 @@ def test_grasp_execution_config_requires_local_ascend_graspgen_bundle(tmp_path: 
 
     with pytest.raises(ValueError, match="local_manifest_path"):
         load_robot_config_dict(path)
+
+
+def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> None:
+    from robot_config.grasp_execution_config import validate_grasp_execution_config
+
+    valid = {
+        "enabled": True,
+        "backend": "aimdk_grasp.pick_backend:x2_backends",
+        "backend_options": {"anything": [1, 2]},
+        "command_interfaces": ["joint.arm_stream"],
+        "pipeline": {
+            "max_attempts": 2,
+            "max_moved_replans": 1,
+            "home_tolerance_rad": 0.02,
+            "release_after_success": True,
+        },
+    }
+    assert validate_grasp_execution_config(valid) == []
+    for mutate, message in (
+        (lambda c: c.update(backend="aimdk_grasp.pick_backend"), "package.module:callable"),
+        (lambda c: c.update(backend="a b:c"), "package.module:callable"),
+        (lambda c: c.pop("backend"), "requires grasp_execution.backend"),
+        (lambda c: c.pop("command_interfaces"), "must be non-empty"),
+        (lambda c: c.update(backend_options=[1]), "backend_options must be a mapping"),
+        (lambda c: c.update(command_interfaces="joint.arm_stream"), "command_interfaces must be a list"),
+        (lambda c: c.update(command_interfaces=[""]), "command_interfaces must be a list"),
+        (lambda c: c.update(command_interfaces=[]), "must be non-empty"),
+        (lambda c: c.update(command_interfaces=[" joint.arm_stream"]), "surrounding whitespace"),
+        (
+            lambda c: c.update(command_interfaces=["joint.arm_stream", "joint.arm_stream"]),
+            "duplicate strings",
+        ),
+        (lambda c: c["pipeline"].update(max_attempts=0), "max_attempts"),
+        (lambda c: c["pipeline"].update(home_tolerance_rad=0.0), "home_tolerance_rad"),
+        (lambda c: c["pipeline"].update(retries=3), "retries"),
+        (lambda c: c["pipeline"].update(release_after_success="yes"), "release_after_success"),
+    ):
+        config = {**valid, "pipeline": dict(valid["pipeline"])}
+        mutate(config)
+        assert any(message in error for error in validate_grasp_execution_config(config)), message
+
+
+def test_a_grasp_backend_binds_only_its_command_streams() -> None:
+    from robot_config.interface_binding import InterfaceBindingError, _bindings, required_interface_ids
+
+    config = {"grasp_execution": {"enabled": True, "command_interfaces": ["joint.arm_stream", "joint.hand_stream"]}}
+    assert required_interface_ids(config) == ["joint.arm_stream", "joint.hand_stream"]
+    assert {direction for _, _, direction in _bindings(config)} == {"subscribe"}
+    assert required_interface_ids({"grasp_execution": {**config["grasp_execution"], "enabled": False}}) == []
+    with pytest.raises(InterfaceBindingError, match="invalid_interface"):
+        required_interface_ids({"grasp_execution": {"enabled": True, "command_interfaces": [" x"]}})
+
+
+def test_the_shared_schema_knows_no_planning_host() -> None:
+    """Splitting a robot's grasp across hosts is that robot's deployment (the X2's: aimdk_grasp.split)."""
+    hosted = {"backend": "robot_backend.grasp:backends", "planning_host": {"package": "p", "executable": "e"}}
+    assert "grasp_execution contains unknown key(s): planning_host" in validate_grasp_execution_config(hosted)

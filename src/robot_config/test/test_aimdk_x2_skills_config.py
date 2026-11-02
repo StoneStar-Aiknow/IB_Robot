@@ -258,3 +258,67 @@ def test_binding_resolves_the_action_and_carries_the_live_description(config):
 def test_binding_fails_closed_when_the_runtime_lacks_the_action(config, interfaces):
     with pytest.raises(InterfaceBindingError):
         bind_robot_interfaces(config, _description(interfaces), require_ready=True)
+
+
+ADDRESSEE_CONFIG = ROBOTS / "aimdk_x2_voice_addressee.yaml"
+
+
+@pytest.fixture(scope="module")
+def addressee_config():
+    return load_robot_config_dict(ADDRESSEE_CONFIG, defer_interface_binding=True)
+
+
+def _runtime_profile_description(*, ready=()):
+    """The description the X2 runtime builds from its own profile, with fixture readiness."""
+    from robot_runtime.interface_description import build_description
+    from robot_runtime.profile import load_profile
+
+    built = build_description(load_profile(PROFILE), use_sim=True)
+    return _description(built["interfaces"], ready=ready)
+
+
+def test_addressee_profile_layers_the_gate_on_the_voice_profile(addressee_config):
+    validate_robot_config_dict(addressee_config, deferred_interfaces=True)
+    assert addressee_config["name"] == "aimdk_x2_skills"
+    assert addressee_config["_config_sources"][-2].endswith("aimdk_x2_voice.yaml")
+    bridge = addressee_config["embodied"]["agent"]["voice_bridge"]
+    assert bridge["addressee_trigger"] == "vendor_session"
+    assert bridge["speaker_check_enabled"] is True
+    assert bridge["speaker_reject_short"] is True
+    assert addressee_config["voice_asr"]["speaker_embedding"]["enabled"] is True
+    assert addressee_config["voice_asr"]["speaker_embedding"]["min_speech_seconds"] == 1.0
+    assert addressee_config["voice_asr"]["external_finalize_on_idle"] is True
+
+
+def test_addressee_profile_binds_the_wake_event_from_the_runtime_profile(addressee_config):
+    """The endpoint is the runtime profile's, and it is bound before anyone has said the wake word."""
+    assert "audio.wake_event" not in required_interface_ids(addressee_config)
+
+    bound = bind_robot_interfaces(
+        addressee_config, _runtime_profile_description(ready=("audio.speech",)), require_ready=True
+    )
+
+    wake_event = bound["embodied"]["agent"]["voice_bridge"]["wake_event"]
+    assert wake_event["topic"] == "/audio/wake_event"
+    assert wake_event["_interface_source"]["state"] == "unknown"
+    validate_robot_config_dict(bound)
+
+
+def test_the_runtime_waiter_checks_the_wake_event_is_declared_but_not_that_it_is_ready(addressee_config):
+    from robot_config.launch_builders.runtime import generate_runtime_provider_actions
+
+    _, waiter = generate_runtime_provider_actions(
+        addressee_config, use_sim=True, description_output="/tmp/description.yaml"
+    )
+    arguments = waiter._Node__arguments
+
+    def flag(name):
+        if name not in arguments:
+            return []
+        start = arguments.index(name) + 1
+        end = next((i for i in range(start, len(arguments)) if arguments[i].startswith("--")), len(arguments))
+        return arguments[start:end]
+
+    assert "audio.wake_event" in flag("--declared-interfaces")
+    assert "audio.wake_event" not in flag("--require-interfaces")
+    assert "audio.speech" in flag("--require-interfaces")

@@ -1,0 +1,19 @@
+# Plan one of a capture's grasp candidates on the X2 grasp head, against the
+# scene CompleteGraspScene finished for it.
+
+string capture_id
+# K x 16, row-major 4x4 poses of the grasp model's gripper frame in the capture's camera frame.
+float64[] grasps
+float64[] confidence
+float64 timeout_s
+---
+bool success
+string error_code
+string message
+# The failure may pass with another observation (e.g. a target recheck that saw flicker).
+bool retryable
+# Names the plan for RefineGraspPlan.
+string plan_id
+GraspPlan plan
+---
+# No feedback is published.

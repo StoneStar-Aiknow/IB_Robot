@@ -43,14 +43,21 @@ from robot_runtime.gazebo import (
     bridge_config_node,
     camera_bridge_entries,
     camera_sensor_urdf,
+    imu_bridge_entries,
+    imu_settle_filter_nodes,
+    lidar_bridge_entries,
+    lidar_finite_filter_nodes,
+    lidar_imu_sensor_urdf,
 )
-from robot_runtime.interface_description import build_description
+from robot_runtime.interface_description import build_description, platform_peripherals
 from robot_runtime.path_subst import resolve_path
 from robot_runtime.peripherals import (
     audio_nodes,
     load_peripherals_file,
     merge_peripherals,
     peripheral_nodes,
+    peripheral_tf_nodes_for_absent_frames,
+    scan_converter_nodes,
     synthetic_perception_nodes,
 )
 from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
@@ -88,6 +95,88 @@ def xacro_value(value: Any) -> str:
     return str(value)
 
 
+def _inject_initial_values(robot_description: str, profile: dict[str, Any]) -> str:
+    """Give the ros2_control position state interfaces an ``initial_value`` (D4).
+
+    On the physics platforms the simulated joints start, and are held, at the
+    profile's ``hardware.reset_positions``: each listed joint's position
+    state interface in the rendered URDF's ``<ros2_control>`` block gains
+    ``<param name="initial_value">`` (gz_ros2_control spawns the joint there;
+    mujoco_ros2_control's ``set_initial_pose()`` also sets the position
+    actuators' ``ctrl`` from it). Profiles without ``reset_positions`` render
+    byte-identical; the hardware/SDK render never calls this.
+
+    Fail-closed validation (review rework): every reset value must be a
+    finite number (booleans, NaN and Inf are rejected by name); a reset
+    joint the ros2_control block does not declare, or whose position state
+    interface is absent, is an error — a reset that silently skips joints
+    would start the arm somewhere the profile did not intend; a position
+    state interface that already carries parameters (in particular its own
+    ``initial_value``) is a conflict the profile author must resolve, not a
+    preference the injection makes silently.
+    """
+    reset = (profile.get("hardware") or {}).get("reset_positions") or {}
+    if not reset:
+        return robot_description
+    import math
+    import re
+
+    reset = {str(name): value for name, value in reset.items()}
+    for name, value in reset.items():
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            raise RuntimeProfileError(f"hardware.reset_positions.{name} must be a finite number, got {value!r}")
+
+    # ros2_control joints carry no attributes on <joint>; the URDF's
+    # kinematic joints always carry type=… and never match
+    joint_re = re.compile(r'<joint name="([^"]+)">(.*?)</joint>', re.DOTALL)
+    found: set[str] = set()
+
+    def patch(match: re.Match[str]) -> str:
+        name, body = match.group(1), match.group(2)
+        if "hardwareInterface" in body:
+            # a <transmission>'s joint REFERENCE (no attributes on <joint>,
+            # no state interfaces): not the ros2_control block — the real
+            # one follows later in the document (the rendered LeKiwi URDF
+            # carries both for every joint)
+            return match.group(0)
+        if name not in reset:
+            return match.group(0)
+        found.add(name)
+        bare = '<state_interface name="position"/>'
+        open_tag = '<state_interface name="position">'
+        if bare in body:
+            patched = body.replace(
+                bare,
+                '<state_interface name="position">\n'
+                f'          <param name="initial_value">{float(reset[name]):.9g}</param>\n'
+                "        </state_interface>",
+                1,
+            )
+            return f'<joint name="{name}">{patched}</joint>'
+        if open_tag in body:
+            if '<param name="initial_value">' in body:
+                raise RuntimeProfileError(
+                    f"hardware.reset_positions.{name} conflicts with the initial_value the URDF's "
+                    "ros2_control block already declares for its position state interface"
+                )
+            raise RuntimeProfileError(
+                f"the position state interface of ros2_control joint {name!r} already carries "
+                "parameters; the reset injection only patches the bare interface"
+            )
+        raise RuntimeProfileError(
+            f"hardware.reset_positions.{name} names a joint whose ros2_control block declares "
+            "no position state interface"
+        )
+
+    patched_description = joint_re.sub(patch, robot_description)
+    missing = sorted(set(reset) - found)
+    if missing:
+        raise RuntimeProfileError(
+            f"hardware.reset_positions names joints the ros2_control block does not declare: {missing}"
+        )
+    return patched_description
+
+
 def write_node_params(node_name: str, params: dict[str, Any]) -> str:
     """Write ``params`` under ``node_name`` as a ros__parameters YAML file.
 
@@ -114,20 +203,28 @@ def write_controller_manager_params(robot_description: str, extra_params: dict[s
     return write_node_params("controller_manager", params)
 
 
-def profile_controllers(profile: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+def profile_controllers(
+    profile: dict[str, Any], sim_platform: str | None = None
+) -> tuple[list[str], list[str], list[str]]:
     """Return (broadcasters, initially_active, initially_inactive) controllers from the profile.
 
     Broadcasters are always active. The initial mode's controllers start
     active; every other controller named by any mode starts inactive so the
-    facade can switch activation sets without spawning.
+    facade can switch activation sets without spawning. ``sim_platform``
+    selects the mode table's per-platform overrides (D3.1) through the single
+    resolver :func:`robot_runtime.modes.mode_controller_table`, so the
+    spawners, the facade and the stop path all see one controller table.
     """
+    from robot_runtime.modes import mode_controller_table
+
     modes = dict(profile.get("modes") or {})
     initial = str(modes.pop("initial", IDLE_MODE))
     broadcasters = [str(c) for c in (profile.get("ros2_control") or {}).get("broadcasters", [])]
+    controller_table = mode_controller_table(profile, sim_platform)
     active: list[str] = []
     inactive: list[str] = []
-    for name, spec in modes.items():
-        for controller in (spec or {}).get("controllers", []):
+    for name, controllers in controller_table.items():
+        for controller in controllers:
             controller = str(controller)
             target = active if str(name) == initial else inactive
             if controller not in target and controller not in active:
@@ -339,6 +436,7 @@ def render_gazebo_description(
     profile: dict[str, Any],
     profile_path: Path,
     *,
+    peripherals: list | None = None,
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> str:
     """Render the profile's xacro for the Gazebo platform (D5, D7b).
@@ -346,9 +444,13 @@ def render_gazebo_description(
     ``use_sim`` selects the ros2_control simulation plugin (gz
     ``GazeboSimSystem``), the SDK flag stays off, the gz plugin reads the
     profile's controllers parameter file and the effort state interface is
-    exposed for the simulated joint-current publisher (D6b). Camera sensors
-    are injected for the effective peripherals, meshes resolve to absolute
-    ``file://`` URIs and the SDK/hardware descriptions are untouched.
+    exposed for the simulated joint-current publisher (D6b). Camera, lidar
+    and IMU sensors are injected for the effective peripherals — pass the
+    resolved inventory (D5 inventory-first); the profile's own peripherals
+    apply when omitted — meshes resolve to absolute ``file://`` URIs and the
+    SDK/hardware descriptions are untouched. Each joint in
+    ``hardware.reset_positions`` starts, and is held, at that position (D4:
+    the position state interface carries the ``initial_value``).
     """
     description = profile.get("description") or {}
     if not description.get("xacro"):
@@ -371,15 +473,19 @@ def render_gazebo_description(
     )
     for key, value in (profile.get("hardware") or {}).get("xacro_args", {}).items():
         xacro_args[str(key)] = xacro_value(value)
-    robot_description = render_xacro(resolve_path(description["xacro"]), xacro_args)
-    cameras_xml = camera_sensor_urdf(
-        profile.get("peripherals") or [],
+    robot_description = _inject_initial_values(render_xacro(resolve_path(description["xacro"]), xacro_args), profile)
+    effective = platform_peripherals(
+        merge_peripherals(profile.get("peripherals"), []) if peripherals is None else peripherals, "gazebo"
+    )
+    sensors_xml = camera_sensor_urdf(
+        effective,
         platform="gazebo",
         spawn_pose=spawn_pose,
         frame_contract=True,
     )
-    if cameras_xml:
-        robot_description = robot_description.replace("</robot>", cameras_xml + "\n</robot>", 1)
+    sensors_xml += lidar_imu_sensor_urdf(effective, platform="gazebo")
+    if sensors_xml:
+        robot_description = robot_description.replace("</robot>", sensors_xml + "\n</robot>", 1)
     return _resolve_package_uris(robot_description)
 
 
@@ -446,28 +552,41 @@ def gazebo_embodiment_actions(
 ) -> list:
     """The provider's Gazebo embodiment (D2/D5): no ``ros2_control_node``.
 
-    robot_state_publisher on sim time; a minimal empty world plus ``/clock``
-    bridge when no world is supplied (standalone verification); ``create``
-    waits for the world clock, then spawns the entity at the given pose
-    (including yaw); controller spawners target the in-simulator controller
-    manager after ``create`` exits; the facade, the camera bridge and the
-    simulated joint-current publisher complete the embodiment. The world,
+    The effective peripheral inventory (profile defaults merged with the
+    deployment fragment, disabled removed) is resolved once, before anything
+    else, and drives everything downstream: the sensor generation inside the
+    rendered description (when this call renders it), the bridge entries and
+    the static transforms for sensor frames absent from the rendered model
+    (D5 inventory-first). robot_state_publisher runs on sim time; a minimal
+    empty world plus ``/clock`` bridge when no world is supplied (standalone
+    verification); ``create`` waits for the world clock, then spawns the
+    entity at the given pose (including yaw); controller spawners target the
+    in-simulator controller manager after ``create`` exits; the facade and
+    the simulated joint-current publisher complete the embodiment. The world,
     when supplied by generic launch, is not started or bridged here.
     """
+    # D5 inventory-first: one effective inventory for sensors, bridges,
+    # derived processors and the interface description — filtered by the
+    # platform exclusion policy (D3: an excluded peripheral is not simulated).
+    peripherals = platform_peripherals(
+        merge_peripherals(
+            profile.get("peripherals"),
+            (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
+        ),
+        "gazebo",
+    )
     if robot_description is None:
-        robot_description = render_gazebo_description(profile, profile_path, spawn_pose=spawn_pose)
+        robot_description = render_gazebo_description(
+            profile, profile_path, peripherals=peripherals, spawn_pose=spawn_pose
+        )
     ros2_control = profile.get("ros2_control") or {}
     if not ros2_control.get("controllers_config"):
         raise RuntimeProfileError(
             f"runtime profile missing required key 'ros2_control.controllers_config': {profile_path}"
         )
-    broadcasters, active, inactive = profile_controllers(profile)
+    broadcasters, active, inactive = profile_controllers(profile, "gazebo")
     controller_manager = str(profile["controller_manager"])
     model_name = str(profile["runtime"]["name"])
-    peripherals = merge_peripherals(
-        profile.get("peripherals"),
-        (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
-    )
 
     actions: list[Any] = [
         Node(
@@ -585,10 +704,25 @@ def gazebo_embodiment_actions(
         if periph.get("type") == "camera"
         for entry in camera_bridge_entries(periph, full_streams=True)
     ]
-    if camera_entries:
+    lidar_imu_entries = [
+        entry for periph in peripherals for entry in (*lidar_bridge_entries(periph), *imu_bridge_entries(periph))
+    ]
+    sensor_entries = camera_entries + lidar_imu_entries
+    if sensor_entries:
         actions.append(
-            bridge_config_node(camera_entries, Path(tempfile.gettempdir()) / "ibrobot_runtime_camera_bridge.yaml")
+            bridge_config_node(sensor_entries, Path(tempfile.gettempdir()) / "ibrobot_runtime_sensor_bridge.yaml")
         )
+    # The finite-point filter serves the advertised cloud endpoints of the
+    # 3D lidars (D5: the bridge hands the raw gz cloud to the internal
+    # topic, the filter republishes the finite points on the endpoint); the
+    # IMU settle filter holds the raw IMU back until the physics has settled
+    # (zero window and landing impulse dropped), then relays it verbatim.
+    actions.extend(lidar_finite_filter_nodes(peripherals))
+    actions.extend(imu_settle_filter_nodes(peripherals))
+    # Static TF only for sensor frames the rendered model does not contain
+    # (the lidar/IMU frames); camera frames stay owned by RSP through their
+    # rendered links (D5, D13).
+    actions.extend(peripheral_tf_nodes_for_absent_frames(peripherals, robot_description))
     return actions
 
 
@@ -618,30 +752,29 @@ def render_mujoco_description(
     URDF carries no camera ``<sensor>`` blocks.
     """
     from robot_runtime.mujoco import (
+        MUJOCO_MODEL_PLACEHOLDER,
         camera_tf_urdf,
         check_simulator_versions,
+        imu_sensor_urdf,
         render_robot_mjcf,
     )
-    from sim_models.scene_compiler import compose_mujoco_model
+    from sim_models.scene_compiler import compose_mujoco_model, mjcf_engine_extensions
 
     description = profile.get("description") or {}
     if not description.get("xacro"):
         raise RuntimeProfileError(f"runtime profile missing required key 'description.xacro': {profile_path}")
     check_simulator_versions()
-    effective_peripherals = profile.get("peripherals") if peripherals is None else peripherals
-    robot_mjcf = render_robot_mjcf(profile, spawn_pose, effective_peripherals)
-    sdf_meshes = ((profile.get("simulation") or {}).get("mujoco") or {}).get("sdf_meshes") or []
-    # D2/D3 revision (5b.2): an empty scene composes with the sim_models
-    # ``empty`` scene (ground plane + light) — a robot-only model would render
-    # on a black void. ``scene=None`` (an explicit robot-only request from a
-    # direct API caller) keeps the robot-only composition.
-    scene_name = None if scene is None else ((scene or "").strip() or "empty")
-    composed = compose_mujoco_model(str(robot_mjcf), scene_name, sdf_meshes)
-    if composed.suffix != ".mjb":
-        raise RuntimeProfileError(
-            f"the MuJoCo embodiment needs the mujoco Python package (composition fell back to {composed})"
-        )
-
+    # D3: the MuJoCo sensor generation, plugin parameters and description all
+    # project the platform-filtered inventory (an excluded peripheral is not
+    # simulated).
+    effective_peripherals = platform_peripherals(
+        profile.get("peripherals") if peripherals is None else peripherals, "mujoco"
+    )
+    # D2 render order: the xacro renders ONCE with the platform's arguments
+    # and a placeholder mujoco_model; the attachment mount poses come from
+    # that document; the composed model path is substituted into the same
+    # rendered URDF afterwards (the mujoco_model parameter is the only
+    # difference — no second xacro run).
     xacro_args = {str(k): xacro_value(v) for k, v in (description.get("xacro_args") or {}).items()}
     xacro_args.update(
         {
@@ -649,17 +782,44 @@ def render_mujoco_description(
             "simulated": "false",  # the SDK virtual transport flag is off under MuJoCo
             "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
             "sim_effort_state": "true",
-            "mujoco_model": str(composed),
+            "mujoco_model": MUJOCO_MODEL_PLACEHOLDER,
         }
     )
     if os.environ.get("IBROBOT_MUJOCO_HEADLESS", "0") == "1":
         xacro_args["mujoco_headless"] = "true"
     for key, value in (profile.get("hardware") or {}).get("xacro_args", {}).items():
         xacro_args[str(key)] = xacro_value(value)
-    robot_description = render_xacro(resolve_path(description["xacro"]), xacro_args)
+    robot_description = _inject_initial_values(render_xacro(resolve_path(description["xacro"]), xacro_args), profile)
+    robot_mjcf = render_robot_mjcf(profile, spawn_pose, effective_peripherals, urdf=robot_description)
+    sdf_meshes = ((profile.get("simulation") or {}).get("mujoco") or {}).get("sdf_meshes") or []
+    # D2/D3 revision (5b.2): an empty scene composes with the sim_models
+    # ``empty`` scene (ground plane + light) — a robot-only model would render
+    # on a black void. ``scene=None`` (an explicit robot-only request from a
+    # direct API caller) keeps the robot-only composition.
+    scene_name = None if scene is None else ((scene or "").strip() or "empty")
+    composed = compose_mujoco_model(str(robot_mjcf), scene_name, sdf_meshes)
+    if composed.suffix == ".mjb":
+        pass  # the extension-free artifact, as before
+    elif composed.suffix == ".xml" and mjcf_engine_extensions(composed):
+        # D5.1: the model declares engine extensions, so the compiler
+        # delivered the XML — a .mjb would bake this process's global plugin
+        # slot ids, which the C++ node (its own registration order) cannot
+        # read back (spike evidence /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md);
+        # the C++ node compiles the XML in-process with its own registration
+        pass
+    else:
+        raise RuntimeProfileError(
+            f"the MuJoCo embodiment needs the mujoco Python package (composition fell back to {composed})"
+        )
+    robot_description = robot_description.replace(MUJOCO_MODEL_PLACEHOLDER, str(composed), 1)
     cameras_xml = camera_tf_urdf(effective_peripherals, spawn_pose=spawn_pose)
     if cameras_xml:
         robot_description = robot_description.replace("</robot>", cameras_xml + "\n</robot>", 1)
+    # D5.3: the integrated-IMU sensors go into the rendered ros2_control
+    # block, where the system interface's register_sensors reads them
+    imus_xml = imu_sensor_urdf(effective_peripherals)
+    if imus_xml:
+        robot_description = robot_description.replace("</ros2_control>", imus_xml + "\n  </ros2_control>", 1)
     return _resolve_package_uris(robot_description)
 
 
@@ -687,19 +847,33 @@ def mujoco_embodiment_actions(
     the place of the provider's own ``ros2_control_node``: robot_state_publisher,
     spawners, the facade, the camera depth fan-out relays and the simulated
     joint-current publisher all run on sim time against it. No world process
-    is started here — with no scene the robot model runs alone (the old
-    adapter's no-scene behaviour), with a scene the composed model already
-    contains it (D3). The spawners start immediately; their
+    is started here — the composed model already contains the scene (an
+    empty ``mujoco_scene`` composes the shared sim_models ``empty`` scene;
+    only a direct API caller passing ``scene=None`` gets a robot-only model).
+    The spawners start immediately; their
     ``--controller-manager-timeout`` waits for the in-process controller
     manager. ``IBROBOT_MUJOCO_HEADLESS=1`` mirrors the Gazebo headless mode:
     with no display the CameraPlugin renders through EGL (D4), so no
-    ``xvfb-run`` wrapper is needed. The cameras are configured through a
-    per-launch params file keyed under ``MUJOCO_SIMULATION_NODE`` carrying the
-    ``mujoco_plugins`` CameraPlugin tree (D3); MuJoCo plugins load from the
-    executable directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH``
-    is set.
+    ``xvfb-run`` wrapper is needed. The cameras (and, for scenes with
+    dynamic objects, the FreeJointStatePublisherPlugin the scene task
+    observes, issue #195) are configured through a per-launch params file
+    keyed under ``MUJOCO_SIMULATION_NODE`` carrying the merged
+    ``mujoco_plugins`` tree; MuJoCo plugins load from the executable
+    directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH`` is set.
     """
-    from robot_runtime.mujoco import camera_plugin_parameters, mujoco_camera_relays
+    from robot_runtime.mujoco import (
+        base_velocity_plugin_parameters,
+        camera_plugin_parameters,
+        free_joint_state_plugin_parameters,
+        imu_broadcaster_entries,
+        imu_broadcaster_remappings,
+        lidar_plugin_parameters,
+        merge_mujoco_plugin_parameters,
+        mujoco_camera_relays,
+        mujoco_imu_filter_nodes,
+        mujoco_lidar_filter_nodes,
+        odometry_twist_relay_node,
+    )
 
     if robot_description is None:
         robot_description = render_mujoco_description(profile, profile_path, spawn_pose=spawn_pose, scene=mujoco_scene)
@@ -709,14 +883,34 @@ def mujoco_embodiment_actions(
             f"runtime profile missing required key 'ros2_control.controllers_config': {profile_path}"
         )
     controllers_config = resolve_path(ros2_control["controllers_config"])
-    broadcasters, active, inactive = profile_controllers(profile)
-    peripherals = merge_peripherals(
-        profile.get("peripherals"),
-        (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
+    peripherals = platform_peripherals(
+        merge_peripherals(
+            profile.get("peripherals"),
+            (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
+        ),
+        "mujoco",
     )
+    # D5.3: the generated IMU broadcasters ride a GENERATED controllers file
+    # merging the profile's shipped configuration (the shipped file is never
+    # edited); they join the broadcaster set — always active, in no mode.
+    broadcaster_entries = imu_broadcaster_entries(peripherals)
+    broadcasters, active, inactive = profile_controllers(profile, "mujoco")
+    if broadcaster_entries:
+        controllers_config = _merged_controllers_config(controllers_config, broadcaster_entries)
+        broadcasters = [*broadcasters, *broadcaster_entries]
+    floating_base = ((profile.get("simulation") or {}).get("mujoco") or {}).get("floating_base") or {}
     cm_params = write_controller_manager_params(robot_description)
     mujoco_node_parameters = [cm_params, controllers_config, {"use_sim_time": True}]
-    plugin_parameters = camera_plugin_parameters(profile, peripherals)
+    # One params file carries every simulator plugin: the cameras, the lidars,
+    # the floating-base drive and, when the composed scene has dynamic
+    # objects, the free-joint state publisher the scene task observes
+    # (issue #195).
+    plugin_parameters = merge_mujoco_plugin_parameters(
+        camera_plugin_parameters(profile, peripherals),
+        free_joint_state_plugin_parameters(mujoco_scene),
+        base_velocity_plugin_parameters(floating_base),
+        lidar_plugin_parameters(peripherals),
+    )
     if plugin_parameters:
         mujoco_node_parameters.append(write_node_params(MUJOCO_SIMULATION_NODE, plugin_parameters))
     return [
@@ -731,6 +925,9 @@ def mujoco_embodiment_actions(
             executable="ros2_control_node",
             output="screen",
             parameters=mujoco_node_parameters,
+            # D5.3: process-wide remaps put the IMU broadcasters' ~/imu on the
+            # internal /<name>_imu/raw topics (the settle filter's input)
+            remappings=imu_broadcaster_remappings(peripherals),
         ),
         *spawner_nodes(
             broadcasters,
@@ -764,7 +961,36 @@ def mujoco_embodiment_actions(
         ),
         *simulated_joint_current_actions(profile, sim_platform="mujoco"),
         *mujoco_camera_relays(peripherals),
+        # D5.3: the raw lidar cloud and IMU streams land on the advertised
+        # endpoints through the shared filters (the cloud gains its zero
+        # intensity field; the IMU waits out the spawn settle)
+        *mujoco_lidar_filter_nodes(peripherals),
+        *mujoco_imu_filter_nodes(peripherals),
+        # D3.3: the base's own wheel odometry drives the floating base
+        *odometry_twist_relay_node(floating_base),
+        # D5: static TF only for sensor frames the rendered model lacks
+        *peripheral_tf_nodes_for_absent_frames(peripherals, robot_description),
     ]
+
+
+def _merged_controllers_config(shipped: Path | str, generated: dict) -> Path:
+    """The shipped controllers configuration plus generated entries (D5.3).
+
+    Loads the shipped file, merges the generated controllers' type entries
+    under ``controller_manager.ros__parameters`` and their parameter sections
+    at the top level, and writes the result to a per-launch temporary file —
+    the shipped file itself is never edited.
+    """
+    shipped_path = Path(shipped)
+    data = yaml.safe_load(shipped_path.read_text(encoding="utf-8")) or {}
+    manager = data.setdefault("controller_manager", {})
+    manager_params = manager.setdefault("ros__parameters", {})
+    for name, params in generated.items():
+        manager_params[name] = {"type": "imu_sensor_broadcaster/IMUSensorBroadcaster"}
+        data[name] = {"ros__parameters": dict(params)}
+    out = Path(tempfile.mkdtemp(prefix="runtime_controllers_")) / "controllers.yaml"
+    out.write_text(yaml.safe_dump(data, default_flow_style=False), encoding="utf-8")
+    return out
 
 
 def runtime_stack_actions(
@@ -828,7 +1054,7 @@ def runtime_stack_actions(
         )
     controllers_config = resolve_path(ros2_control["controllers_config"])
     cm_params = write_controller_manager_params(robot_description)
-    broadcasters, active, inactive = profile_controllers(profile)
+    broadcasters, active, inactive = profile_controllers(profile, sim_platform or None)
     return [
         Node(
             package="robot_state_publisher",
@@ -875,16 +1101,32 @@ def peripheral_stack_actions(
 
     Physical drivers + static TF on real hardware; synthetic perception
     publishers on the same topics on the SDK simulation platform. Under a
-    physics platform the camera streams come from the simulator's sensors and
-    bridges (embodiment, D6), so only the host audio devices remain here.
-    Audio devices are host devices, so their ALSA owners run in EVERY
-    execution (the legacy robot_config audio_io entry also launched them
-    under simulation).
+    physics platform the camera and lidar streams come from the simulator's
+    sensors and bridges (embodiment, D6), so only the host audio devices
+    remain here — plus the derived scan converter, which runs on simulation
+    time when its source (FAST-LIO's registered body cloud) runs on the
+    platform (D5). Audio devices are host devices, so their ALSA owners run
+    in EVERY execution (the legacy robot_config audio_io entry also launched
+    them under simulation).
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
     if simulated and sim_platform in PHYSICS_SIM_PLATFORMS:
-        return audio_nodes(peripherals)
+        # D3: excluded peripherals are not launched on the platform (the
+        # audio owners and the scan converter resolve the filtered inventory)
+        peripherals = platform_peripherals(peripherals, sim_platform)
+        fast_lio = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
+        scan_converters = (
+            [
+                node
+                for periph in peripherals
+                if periph.get("type") == "lidar"
+                for node in scan_converter_nodes(periph, use_sim=True)
+            ]
+            if fast_lio.get("enabled", False)
+            else []
+        )
+        return [*audio_nodes(peripherals), *scan_converters]
     if simulated:
         effective = {**profile, "fast_lio": {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}}
         return [

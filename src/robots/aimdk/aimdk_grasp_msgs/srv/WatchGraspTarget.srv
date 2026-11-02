@@ -1,0 +1,23 @@
+# Drive the X2 grasp head's target watch: arm it on a capture before execution,
+# report execution phases, disarm it after. While armed the head publishes
+# WatchStatus for the session named here.
+
+uint8 ARM=0
+uint8 PHASE=1
+uint8 DISARM=2
+uint8 command
+# Every command names its session: ARM a new one ("<client>:<n>", n rising per
+# client), PHASE and DISARM the one armed. The head refuses an ARM no newer
+# than one it has seen from that client, and PHASE or DISARM of any session
+# but the armed one, so a late or repeated command never touches another goal's watch.
+string session_id
+string capture_id
+string phase_name
+# "start" or "end"
+string phase_event
+---
+# False when the watch did not start (ARM) or the session is not the armed one.
+bool success
+string message
+# DISARM: the watch report (JSON object).
+string report_json

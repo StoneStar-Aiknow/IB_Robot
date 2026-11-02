@@ -40,10 +40,34 @@ must pass.
   core-only independence gate.
 - **Reconciliation** (`wait_for_runtime.py`): replaces `wait_for_controllers`
   as the upper-layer start condition; fails fast naming missing capabilities.
+- **On-demand subscriptions** (`on_demand.py`): subscriptions live on a node no
+  executor spins, so samples wait in KEEP_LAST queues until a reader drains
+  them, bounded by the reader's declared depth. Each drained sample carries
+  the time the middleware received it — not the time it was taken — so a
+  freshness gate sees the real message age. A sample whose receive time the
+  middleware did not record is delivered with `None` and must be refused by
+  any freshness gate: pretending it was just received would pass stale data.
+  The reader node follows the launch's namespace and topic remaps like any
+  node; only its name is pinned, so it never takes its owner's.
 - **Launch support** (`launch_support.py`): profile path resolution
   (`$(find)` / `$(env)`), xacro rendering, controller_manager parameter
   files, spawners derived from the mode table, and the shared stack
   composition used by `<robot>_robot` launch entries.
+- **MuJoCo embodiment** (`mujoco.py`, in `launch_support.py`): the provider's
+  single `mujoco_ros2_control` process — robot+scene model composition,
+  simulator version checks, the CameraPlugin parameter tree, and, for
+  scenes with dynamic objects (issue #195), a
+  `FreeJointStatePublisherPlugin` instance publishing every dynamic body's
+  live pose on `/sim/<scene>/free_joint_states` for the scene task's
+  object observation.
+- **Simulated sensors** (`gazebo.py`): on the Gazebo platform the runtime
+  stands in for the declared camera, lidar and IMU peripherals — it renders
+  the sensors into the model at the peripheral's mount, bridges the gz
+  streams onto the advertised ROS endpoints, and serves those endpoints
+  through small normalizers: the finite-point cloud filter (Gazebo reports
+  no-hit beams as ±inf) and the IMU settle filter (the pre-settle zero
+  window and landing impulse never reach the endpoint). The derived scan
+  converter composes on simulation time when its source runs there.
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
 
 ## Prohibited
@@ -105,3 +129,43 @@ set with every robot package excluded and composes against the mock runtime.
 
 The latch clears only on `SetRuntimeMode("idle")`; after `TORQUE_OFF` the
 facade reactivates the hardware components before clearing.
+
+## Simulation platform behaviours (robot-agnostic)
+
+Three profile-level behaviours are part of this package's public surface and
+apply to every robot runtime, not only one robot:
+
+- **Per-platform peripheral exclusion (issue #205 D3).** A peripheral entry
+  may declare `simulation.<platform>.enabled: false` for a physics platform
+  (`gazebo`, `mujoco`). On that platform the device is not launched, not
+  simulated and not advertised (`/runtime_status`, the interface
+  description, capabilities); on hardware and `sdk` executions the key is
+  ignored and the inventory passes through. `simulation` and each
+  `simulation.<platform>` section must be a mapping when present — an
+  explicit `null` (or any non-mapping) is an error naming the peripheral
+  and the key, because through the layer merge it would silently erase the
+  base's exclusion flags and resurrect an excluded device. An exclusion
+  survives a same-driver deep merge, carries over a driver change, and is
+  lifted only by an explicit `simulation.<platform>.enabled: true`.
+- **MJCF attachments (issue #205 D2).** A profile's
+  `simulation.mujoco.attachments` merges sub-model MJCFs (e.g. an arm from
+  another package's template) into the host robot model under a named
+  parent body. The schema is validated at MJCF render time with unknown
+  keys as errors (the platform-neutral profile loader does not gate on it;
+  a bad attachment fails closed at the first render). The mount pose is the
+  rendered URDF's fixed-joint chain `urdf_parent_link → urdf_child_link`
+  relative to `parent_body` (the parent may be nested anywhere in the host
+  tree and must be uniquely named); the attachment's meshes and named
+  `<default>` classes are namespaced, every cross-model name clash is an
+  error, and the host's `<compiler>`/`<option>` govern. Cameras, lidars and
+  IMUs are injected after the merge, so a `parent_frame` may name an
+  attachment body. Profiles without attachments render byte-identical
+  output.
+- **Initial joint positions (issue #205 D4).** On both physics platforms
+  the render sets the ros2_control `initial_value` of the position state
+  interface for every joint in `hardware.reset_positions`, so the robot
+  spawns at — and, with `mujoco_ros2_control`, the position actuators'
+  `ctrl` also hold — the declared pose instead of zero. A reset joint
+  missing from ros2_control, a non-finite value or an existing
+  `initial_value` conflict is an error. Profiles without
+  `reset_positions`, and the hardware/`sdk` render paths, are unchanged.

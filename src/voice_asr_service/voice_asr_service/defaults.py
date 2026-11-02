@@ -1,5 +1,7 @@
 """Shared default values for Voice ASR configuration."""
 
+from robot_config.voice_contract import VOICE_TRANSCRIPT_TOPIC
+
 VOICE_ASR_DEFAULTS = {
     "enabled": False,
     "active_mode": "continuous",
@@ -26,6 +28,9 @@ VOICE_ASR_DEFAULTS = {
     "final_tail_padding_seconds": 1.5,
     "publish_partial": True,
     "output_topic": "/voice_command",
+    # Same final text tagged with its speech segment (ibrobot_msgs/SpeechTranscript);
+    # external_vad input only.
+    "transcript_topic": VOICE_TRANSCRIPT_TOPIC,
     "sample_rate": 16000,
     "chunk_size": 512,
     "buffer_seconds": 5.0,
@@ -35,4 +40,7 @@ VOICE_ASR_DEFAULTS = {
     "chunk_topic": "/audio/speech_chunk",
     "external_min_samples": 3200,
     "external_idle_timeout": 2.0,
+    # Finalize instead of discarding when the source goes idle without ever
+    # sending END. Off by default; see external_vad_input's module docstring.
+    "external_finalize_on_idle": False,
 }

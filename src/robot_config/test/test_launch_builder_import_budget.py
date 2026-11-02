@@ -158,6 +158,9 @@ def test_registry_core_import_loads_no_builtin_entry_modules():
         "robot_config.launch_builders.tracing",
         "robot_config.logger_utils",
         "robot_config.runtime_target",
+        # Constants only, with no imports of its own: robot_config.config takes
+        # the voice defaults other packages share from it.
+        "robot_config.voice_contract",
     }
     unexpected = [name for name in loaded if name not in allowed]
     assert unexpected == [], f"registry core imported unexpected robot_config modules: {unexpected}"

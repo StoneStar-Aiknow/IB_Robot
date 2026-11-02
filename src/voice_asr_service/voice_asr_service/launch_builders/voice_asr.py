@@ -95,6 +95,105 @@ def resolve_voice_asr_path(path: str) -> str:
     return str((_VOICE_ASR_REPO_ROOT / resolved_path).resolve())
 
 
+#: Keys a deployment may set under ``voice_asr.speaker_embedding``. chunk_topic
+#: and sample_rate are deliberately absent: they are the voice ASR's own bound
+#: input, and a second opinion on them could only disagree with it.
+_SPEAKER_EMBEDDING_KEYS = frozenset(
+    {
+        "enabled",
+        "bundle_path",
+        "deployment",
+        "output_topic",
+        "min_speech_seconds",
+        "max_speech_seconds",
+        "idle_timeout_sec",
+        "exit_on_init_failure",
+    }
+)
+
+
+def _validate_speaker_embedding_bundle(bundle_path: str, deployment: str) -> None:
+    """Fail at launch when the bundle, its digest or its identity is not what the node expects.
+
+    The same reason voice_asr validates its own bundle here: a model that only
+    fails inside the node leaves the rest of the pipeline up, and for the
+    voiceprint that reads as "everyone is accepted" rather than as an error.
+    """
+    from inference_manifest import load_inference_manifest
+    from voice_asr_service.speaker_id.session_builders import SPEAKER_EMBEDDING_BACKENDS
+
+    try:
+        validated = load_inference_manifest(bundle_path, deployment)
+    except Exception as error:
+        raise ValueError(
+            f"voice_asr.speaker_embedding bundle {bundle_path}#{deployment} is invalid: {error}"
+        ) from error
+    identity = validated.top_level_identity
+    if (identity.interface, identity.operation) != ("tensor_model", "embed"):
+        raise ValueError(
+            f"voice_asr.speaker_embedding deployment {deployment!r} is "
+            f"{identity.interface}/{identity.operation}, not tensor_model/embed"
+        )
+    backend = validated.deployment.backend
+    if backend not in SPEAKER_EMBEDDING_BACKENDS:
+        raise ValueError(
+            f"voice_asr.speaker_embedding deployment {deployment!r} needs backend in "
+            f"{sorted(SPEAKER_EMBEDDING_BACKENDS)}, got {backend!r}"
+        )
+
+
+def _speaker_embedding_nodes(
+    voice_asr_config: dict[str, Any], *, chunk_topic: str, sample_rate: int, external_mode: bool
+) -> list[Node]:
+    """Launch the per-utterance voiceprint node when the robot SSOT enables it.
+
+    Optional and off by default: it exists only so the agent's addressee gate
+    can keep its wake-phrase window for the person who opened it. The gate
+    accepts when no measurement arrives, so a deployment can leave this off and
+    lose nothing but that discrimination.
+    """
+    config = voice_asr_config.get("speaker_embedding", {})
+    if not isinstance(config, dict):
+        raise ValueError("voice_asr.speaker_embedding must be a mapping")
+    if not config.get("enabled", False):
+        return []
+    unknown = sorted(set(config) - _SPEAKER_EMBEDDING_KEYS)
+    if unknown:
+        raise ValueError(f"voice_asr.speaker_embedding has unknown keys: {', '.join(unknown)}")
+    if not external_mode:
+        # The node reads SpeechAudioChunk, which only the external path has;
+        # in shared_audio mode there is no utterance boundary to embed between.
+        raise ValueError("voice_asr.speaker_embedding requires voice_asr.input_mode=external_vad")
+
+    from voice_asr_service.speaker_id.defaults import SPEAKER_ID_DEFAULTS
+
+    bundle_path = resolve_voice_asr_path(str(config.get("bundle_path", "")).strip())
+    deployment = str(config.get("deployment", "")).strip()
+    if not bundle_path or not deployment:
+        raise ValueError("voice_asr.speaker_embedding.bundle_path and .deployment are required when enabled")
+    if not Path(bundle_path).is_dir():
+        raise FileNotFoundError(f"Speaker embedding bundle not found: {bundle_path}")
+    _validate_speaker_embedding_bundle(bundle_path, deployment)
+    params: dict[str, Any] = {
+        **SPEAKER_ID_DEFAULTS,
+        "chunk_topic": chunk_topic,
+        "sample_rate": int(sample_rate),
+        "bundle_path": bundle_path,
+        "deployment": deployment,
+    }
+    params.update({key: value for key, value in config.items() if key not in ("enabled", "bundle_path", "deployment")})
+    logger.info(f"Speaker embedding enabled: {chunk_topic} -> {params['output_topic']} ({deployment})")
+    return [
+        Node(
+            package="voice_asr_service",
+            executable="speaker_id_node",
+            name="speaker_id_node",
+            output="screen",
+            parameters=[params],
+        )
+    ]
+
+
 def voice_asr_mode_requires_streaming(active_mode: str) -> bool:
     return active_mode in _VOICE_ASR_REALTIME_MODES
 
@@ -251,6 +350,7 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         ),
         "publish_partial": voice_asr_config.get("publish_partial", voice_asr_defaults["publish_partial"]),
         "output_topic": voice_asr_config.get("output_topic", voice_asr_defaults["output_topic"]),
+        "transcript_topic": voice_asr_config.get("transcript_topic", voice_asr_defaults["transcript_topic"]),
         "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
     }
     audio_io = robot_config.get("audio_io", {})
@@ -281,6 +381,9 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         )
         node_params["external_idle_timeout"] = float(
             voice_asr_config.get("external_idle_timeout", voice_asr_defaults["external_idle_timeout"])
+        )
+        node_params["external_finalize_on_idle"] = bool(
+            voice_asr_config.get("external_finalize_on_idle", voice_asr_defaults["external_finalize_on_idle"])
         )
     else:
         node_params.update(
@@ -367,7 +470,13 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
             output="screen",
             parameters=[node_params],
             additional_env=_ascend_node_environment(bundle_path, deployment),
-        )
+        ),
+        *_speaker_embedding_nodes(
+            voice_asr_config,
+            chunk_topic=str(node_params.get("chunk_topic", "")),
+            sample_rate=int(node_params["sample_rate"]),
+            external_mode=external_mode,
+        ),
     ]
 
 

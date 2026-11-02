@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate and patch the in-tree ROS LiDAR submodules.
+# Validate and patch the downloaded ROS third-party submodules.
 # Compilation belongs to scripts/build.sh and must not be performed here.
 
 _require_ros_submodule_commit() {
@@ -97,6 +97,7 @@ _ensure_fast_calib_patch_stack() {
 }
 
 ensure_ros_third_party_patch_stacks() {
+    local usb_cam_src="${WORKSPACE}/src/usb_cam"
     local livox_sdk_src="${WORKSPACE}/libs/Livox-SDK2"
     local livox_driver_src="${WORKSPACE}/src/livox_ros_driver2"
     local fast_lio_src="${WORKSPACE}/src/fast_lio"
@@ -106,6 +107,12 @@ ensure_ros_third_party_patch_stacks() {
     local fast_calib_patch_dir="${WORKSPACE}/third_party/patches/fast_calib/7747dfc"
     local livox_sdk_patch_dir="${WORKSPACE}/third_party/patches/livox_sdk2"
     local livox_driver_patch_dir="${WORKSPACE}/third_party/patches/livox_ros_driver2"
+
+    _require_ros_submodule_commit \
+        "${usb_cam_src}" "cb2ae6bc0a312de629f84fef933fb3e07dac1ef8" "usb_cam" || return 1
+    _apply_ros_patch_once \
+        "${usb_cam_src}" \
+        "${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0001-upstream-pr378-raw-mjpeg-routing.patch" || return 1
 
     _require_ros_submodule_commit \
         "${livox_sdk_src}" "f5d9375f84efe2b15bc0a052d3e18482ed13adf4" "Livox-SDK2" || return 1
@@ -134,5 +141,5 @@ ensure_ros_third_party_patch_stacks() {
     _apply_ros_patch_once \
         "${fast_lio_src}" "${fast_lio_patch_dir}/a4743b-runtime.patch" || return 1
     _ensure_fast_calib_patch_stack "${fast_calib_src}" "${fast_calib_patch_dir}" || return 1
-    log_done "ROS LiDAR third-party sources are ready"
+    log_done "ROS third-party sources are ready"
 }

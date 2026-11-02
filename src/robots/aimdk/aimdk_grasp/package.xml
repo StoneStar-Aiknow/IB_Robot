@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aimdk_grasp</name>
+  <version>0.1.0</version>
+  <description>
+    AgiBot X2 grasp pipeline: observation, scene estimation and grasp planning
+    for the OmniHand X2. It reads the robot only through the public runtime
+    interfaces that aimdk_robot serves and calls the grasp models through the
+    typed perception services; it never imports vendor (aimdk_msgs) types.
+  </description>
+  <maintainer email="zhufei26@huawei.com">weixin_54906338</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <!-- what the X2 pipeline and its grasp head exchange on two hosts (remote_head, grasp_head) -->
+  <exec_depend>aimdk_grasp_msgs</exec_depend>
+  <!-- head_wire.py: JPEG colour and PNG masks, zstd depth between the two hosts -->
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-zstandard</exec_depend>
+  <!-- launch/x2_grasp_head.launch.py -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_config</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <!-- the head camera: the platform's image-time TF -->
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <!-- the robot-agnostic grasp pipeline this package is the X2 backend of -->
+  <exec_depend>manipulation_execution</exec_depend>
+  <!-- the on-demand subscriptions the head camera, hand and feedback inputs read -->
+  <exec_depend>robot_runtime</exec_depend>
+  <!-- official X2 URDF and meshes the planning model is generated from -->
+  <exec_depend>aimdk_description</exec_depend>
+  <!-- trimesh (fit_x2_torso_cover, export_x2_leg_obstacle only) is a pip dependency, skipped by rosdep -->
+  <!-- torch, cuRobo (nvidia-curobo, audited wheel) and warp-lang are pip dependencies that
+       scripts/setup.sh installs on the cuda accelerator; the planner and registration need them -->
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>manipulation_execution</test_depend>
+  <!-- the ROS feedback test runs the X2 runtime against its vendor mock -->
+  <test_depend>aimdk_robot</test_depend>
+  <test_depend>aimdk_dataplane</test_depend>
+  <!-- the head camera test publishes the camera, joint views and TF itself -->
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

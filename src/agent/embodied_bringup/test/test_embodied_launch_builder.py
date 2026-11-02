@@ -323,11 +323,11 @@ def test_sound_orientation_node_is_projected_from_robot_config():
 _LEKIWI_MODEL_BUNDLES = (
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounding_dino_swint_seq8_1280x720",
     "sam2.1_hiera_tiny_prompt_ascend",
     "sam2.1_hiera_tiny",
     "ram_plus_swin_large_14m",
-    "siglip2_so400m_patch14_384_ascend",
+    "siglip2_so400m_patch14_384",
 )
 
 
@@ -413,7 +413,10 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters(publi
         "moveit_planning",
         "base_navigation",
     ]
-    assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
+    # The gate service is the runtime contract's absolute name; the
+    # pre-migration relative motion_mode key only coincided with it in the
+    # root namespace (openspec lekiwi-application-migration A3).
+    assert _decode_launch_string(params["motion_mode_service"]) == "/motion_mode/set_navigation_enabled"
     assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/get_objects"
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
@@ -686,7 +689,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
     assert params["presentation_timeout_sec"] == 12.0
 
 
-def _voice_bridge_nodes(enabled: bool, **voice_bridge):
+def _voice_bridge_nodes(enabled: bool, *, voice_asr_extra=None, **voice_bridge):
     agent = {
         "enabled": True,
         "incubation": True,
@@ -700,7 +703,7 @@ def _voice_bridge_nodes(enabled: bool, **voice_bridge):
     }
     robot = {
         "name": "so101_single_arm",
-        "voice_asr": {"enabled": True, "output_topic": "/asr/final_text"},
+        "voice_asr": {"enabled": True, "output_topic": "/asr/final_text", **(voice_asr_extra or {})},
         "embodied": {"enabled": True, "entry_mode": "agent", "agent": agent},
     }
     nodes = generate_embodied_nodes(robot, active_control_mode="moveit_planning", use_sim=False)
@@ -1258,6 +1261,26 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
 # bundle; without scripts/download_models.py the config cannot load. A missing
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+def test_a_grasp_backend_runs_the_grasp_pipeline_instead_of_the_primitive_executor():
+    config = load_robot_config_dict(resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp"))
+    config["embodied"]["enabled"] = True
+    config["grasp_execution"]["backend"] = "robot_backend.grasp:backends"
+    nodes = generate_embodied_nodes(config, "moveit_planning")
+    executables = {(node.__dict__.get("_Node__package"), node.__dict__.get("_Node__node_executable")) for node in nodes}
+    assert ("manipulation_execution", "grasp_pipeline_node") in executables
+    for legacy in ("pick_executor_node", "grasp_planner_node", "grasp_verifier_node"):
+        assert not any(executable == legacy for _, executable in executables)
+    pipeline = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_pipeline_node")
+    params = _normalize_launch_param_mapping(pipeline._Node__parameters[0])
+    grasp_execution = _decode_launch_json_string(str(params["grasp_execution_json"]))
+    assert grasp_execution["backend"] == "robot_backend.grasp:backends"
+    # The Gateway derives the executor identity from the same configuration.
+    gateway = _skill_executor_params(nodes)
+    assert _decode_launch_json_string(str(gateway["grasp_execution_json"])) == grasp_execution
+    assert isinstance(_decode_launch_json_string(str(params["interface_description_json"])), dict)
+
+
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     config_path = resolve_robot_config_path(config_name="lekiwi_handeye_realsense_grasp_pc")
     config = load_robot_config_dict(config_path)
@@ -1281,34 +1304,6 @@ def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     skill_params = _skill_executor_params(nodes)
     assert _decode_launch_string(str(skill_params["skill_catalog_profile"])) == ("lekiwi_handeye_realsense_grasp_pc")
     assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
-
-
-def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(tmp_path):
-    module = _load_launch_module()
-    workers_launch = tmp_path / "ik_workers.launch.py"
-    workers_launch.write_text("")
-    config = {
-        "moveit": {"joint_state_topic": "/arm_joint_state_broadcaster/joint_states"},
-        "grasp_execution": {
-            "enabled": True,
-            "auto_start_dependencies": True,
-            "ik": {
-                "worker_count": 4,
-                "worker_namespace_prefix": "/ik_worker",
-                "auto_start_workers": True,
-                "workers_launch": str(workers_launch),
-            },
-        },
-    }
-
-    action = module._parallel_ik_worker_action(config, "false")
-
-    assert action is not None
-    assert action.__class__.__name__ == "IncludeLaunchDescription"
-    arguments = dict(action._IncludeLaunchDescription__launch_arguments)
-    assert arguments["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
-    config["runtime"] = {"provider": "so101_robot"}
-    assert module._parallel_ik_worker_action(config, "false") is None
 
 
 def test_providerless_ik_workers_require_an_explicit_suite_launch(tmp_path):
@@ -1551,3 +1546,93 @@ def test_resident_cli_bridge_executable_comes_from_the_robot_skill_cli_prefix(mo
 
     monkeypatch.setattr(builder, "get_package_prefix", missing)
     assert builder._resident_cli_bridge_executable() is None
+
+
+def test_voice_bridge_forwards_the_addressee_gate_when_configured():
+    """The gate is opt-in, so launch forwards it only when the YAML sets it."""
+    nodes = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀", "灵犀"], wake_window_sec=12.0)
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert json.loads(json.loads(params["wake_phrases_json"].strip())) == ["灵犀灵犀", "灵犀"]
+    assert float(params["wake_window_sec"]) == 12.0
+
+
+def test_voice_bridge_forwards_the_voiceprint_check_when_configured():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+        speaker_min_similarity=0.62,
+        speaker_max_age_sec=2.0,
+        speaker_merge_margin=0.15,
+        speaker_reject_short=True,
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert params["speaker_check_enabled"] is True
+    assert float(params["speaker_min_similarity"]) == 0.62
+    assert float(params["speaker_max_age_sec"]) == 2.0
+    assert float(params["speaker_merge_margin"]) == 0.15
+    assert params["speaker_reject_short"] is True
+    assert _decode_launch_string(params["speaker_embedding_topic"]) == "/voice/speaker_embedding"
+
+
+def test_voice_bridge_listens_where_the_voiceprint_producer_publishes():
+    """The bridge's topic is derived from voice_asr.speaker_embedding, never configured twice."""
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={"speaker_embedding": {"enabled": True, "output_topic": "/x2/voiceprint"}},
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert _decode_launch_string(params["speaker_embedding_topic"]) == "/x2/voiceprint"
+
+
+def test_voice_bridge_forwards_the_vendor_session_trigger_when_configured():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        addressee_trigger="vendor_session",
+        session_gap_sec=15.0,
+        speaker_check_enabled=True,
+        # As bind_robot_interfaces leaves it: the endpoint comes from the runtime description.
+        wake_event={
+            "interface": "audio.wake_event",
+            "type": "ibrobot_msgs/msg/SpeechWakeEvent",
+            "topic": "/x2/wake_event",
+            "_interface_source": {"id": "audio.wake_event"},
+        },
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert _decode_launch_string(params["addressee_trigger"]) == "vendor_session"
+    assert float(params["session_gap_sec"]) == 15.0
+    assert _decode_launch_string(params["wake_event_topic"]) == "/x2/wake_event"
+    assert params["speaker_check_enabled"] is True
+
+
+def test_voice_bridge_reads_the_segment_tagged_transcripts_when_the_gate_pairs_by_segment():
+    """Derived from voice_asr.transcript_topic like input_topic follows output_topic;
+    a bridge without the gate keeps reading plain text and gets no transcript_topic."""
+    paired = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={"transcript_topic": "/x2/transcript"},
+        wake_phrases=["灵犀灵犀"],
+        speaker_check_enabled=True,
+    )
+    plain = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀"])
+
+    params = _normalize_launch_param_mapping(vars(paired["agent_voice_bridge"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["transcript_topic"]) == "/x2/transcript"
+    plain_params = _normalize_launch_param_mapping(vars(plain["agent_voice_bridge"])["_Node__parameters"][0])
+    assert "transcript_topic" not in plain_params
+
+
+def test_voice_bridge_refuses_an_unbound_wake_event():
+    with pytest.raises(ValueError, match="wake_event must be bound to a runtime description"):
+        _voice_bridge_nodes(
+            enabled=True,
+            addressee_trigger="vendor_session",
+            wake_event={"interface": "audio.wake_event", "type": "ibrobot_msgs/msg/SpeechWakeEvent"},
+        )

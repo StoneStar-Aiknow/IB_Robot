@@ -15,7 +15,8 @@ from rclpy.node import Node
 from tf2_ros import TransformBroadcaster
 
 from lekiwi_robot.fast_lio_odom_contract import (
-    compose_pose,
+    base_pose_from_body_pose,
+    invert_transform,
     project_planar_pose,
     transform_twist,
     validate_odometry_sample,
@@ -48,7 +49,8 @@ class FastLioOdomBridge(Node):
         self._rotation = tuple(float(value) for value in self.get_parameter("body_to_base_rotation").value)
         if len(self._translation) != 3 or len(self._rotation) != 4:
             raise ValueError("FAST-LIO body-to-base transform requires 3 translation and 4 quaternion values")
-        compose_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), self._translation, self._rotation)
+        # rejects non-finite or zero-norm transforms up front
+        invert_transform(self._translation, self._rotation)
 
         source_topic = str(self.get_parameter("source_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
@@ -56,7 +58,12 @@ class FastLioOdomBridge(Node):
         self._planar_output = bool(self.get_parameter("planar_output").value)
         self._max_future_skew_sec = float(self.get_parameter("max_future_skew_sec").value)
         self._publisher = self.create_publisher(Odometry, output_topic, 10)
-        self._broadcaster = TransformBroadcaster(self)
+        # The broadcaster is created only when this bridge actually owns the
+        # odom -> base_link transform (D4): with publish_tf=false a silent
+        # /tf advertiser would still show up as a second transform publisher
+        # on the graph, and the lidar-odometry gate asserts the wheel-odometry
+        # node is the only one.
+        self._broadcaster = TransformBroadcaster(self) if self._publish_tf else None
         self._subscription = self.create_subscription(Odometry, source_topic, self._on_odometry, 10)
         self._last_error = ""
 
@@ -97,7 +104,9 @@ class FastLioOdomBridge(Node):
 
         self._last_error = ""
         output = deepcopy(message)
-        position, orientation = compose_pose(
+        # the base pose is the body pose conjugated by the mount (a yawed
+        # mount must not yaw the odometry frame with it)
+        position, orientation = base_pose_from_body_pose(
             (pose.position.x, pose.position.y, pose.position.z),
             (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w),
             self._translation,

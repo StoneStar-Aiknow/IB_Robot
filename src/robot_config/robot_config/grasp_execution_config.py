@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,16 @@ def _vector(*, nonzero: bool = False) -> _Rule:
     return _Rule("vector", length=3, nonzero=nonzero)
 
 
+def _strings() -> _Rule:
+    return _Rule("strings")
+
+
+def _mapping() -> _Rule:
+    """Any mapping; its owner validates the contents."""
+    return _Rule("mapping")
+
+
+_BACKEND_REFERENCE = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*")
 _POSITIVE = _number(0.0, exclusive_minimum=True)
 _NON_NEGATIVE = _number(0.0)
 _UNIT_INTERVAL = _number(0.0, 1.0)
@@ -61,6 +72,21 @@ _VELOCITY = _number(0.0, 1.0, exclusive_minimum=True)
 _SCHEMA: dict[str, Any] = {
     "enabled": _bool(),
     "action_name": _string(),
+    # "package.module:callable" returning the robot's GraspBackends: the robot runs
+    # manipulation_execution's grasp_pipeline_node instead of pick_executor_node.
+    "backend": _string(),
+    # Read by the backend factory, which validates it.
+    "backend_options": _mapping(),
+    # Runtime command streams the backend publishes to; bound against the live
+    # runtime description by robot_config.interface_binding.
+    "command_interfaces": _strings(),
+    "pipeline": {
+        "max_attempts": _integer(1),
+        "max_moved_replans": _integer(0),
+        "home_tolerance_rad": _POSITIVE,
+        # Put the object back after every successful pick, even when the goal does not ask.
+        "release_after_success": _bool(),
+    },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),
     "model_deployment": _string(),
@@ -140,6 +166,10 @@ _SCHEMA: dict[str, Any] = {
         "worker_count": _integer(0, 8),
         "worker_namespace_prefix": _string(allow_empty=True),
         "auto_start_workers": _bool(),
+        # Providerless (legacy_moveit) bring-up with auto-started workers: the
+        # robot suite's worker launch file to include (D2/D3); runtime-backed
+        # configs take their workers from the runtime profile instead.
+        "workers_launch": _string(),
         "verification_position_tolerance_m": _NON_NEGATIVE,
         "verification_orientation_tolerance_deg": _number(0.0, 180.0),
     },
@@ -253,6 +283,10 @@ _SCHEMA: dict[str, Any] = {
         "tabletop_filter": _bool(),
         "tabletop_clearance_m": _number(),
         "tabletop_sweep_steps": _integer(1),
+        # Robot-suite module providing the gripper-mesh geometry checks; the
+        # generic pipeline loads it through providers.py (D2/D3). No import or
+        # package lookup here: robot_config cannot import manipulation_execution.
+        "grasp_geometry_provider": _string(),
         "mesh_package": _string(),
         "mesh_directory": _string(),
     },
@@ -270,6 +304,9 @@ _SCHEMA: dict[str, Any] = {
             "joint5_limit_epsilon_rad": _NON_NEGATIVE,
             "joint5_stage_continuity": _bool(),
             "joint5_stage_max_delta_rad": _number(0.0, math.pi, exclusive_minimum=True),
+            # Robot-suite module providing the joint-5 guard functions; loaded
+            # through providers.py (D2/D3), never defaulted in the node.
+            "wrist_guard_provider": _string(),
             "max_approach_error_deg": _number(0.0, 180.0),
             "max_closing_error_deg": _number(0.0, 180.0),
             "moveit_orientation_search": {
@@ -335,6 +372,19 @@ def _validate_rule(value: Any, path: str, rule: _Rule, errors: list[str]) -> Non
             errors.append(f"{path} must be a finite number")
             return
         numeric = float(value)
+    elif rule.kind == "mapping":
+        if not isinstance(value, dict):
+            errors.append(f"{path} must be a mapping")
+        return
+    elif rule.kind == "strings":
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            errors.append(f"{path} must be a list of non-empty strings")
+            return
+        if any(item != item.strip() for item in value):
+            errors.append(f"{path} strings must not have surrounding whitespace")
+        if len(set(value)) != len(value):
+            errors.append(f"{path} must not contain duplicate strings")
+        return
     elif rule.kind == "vector":
         if (
             not isinstance(value, list | tuple)
@@ -384,6 +434,15 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
     _validate_mapping(value, "grasp_execution", _SCHEMA, errors)
     if not isinstance(value, dict):
         return errors
+
+    backend = value.get("backend")
+    if isinstance(backend, str) and backend.strip() and not _BACKEND_REFERENCE.fullmatch(backend):
+        errors.append("grasp_execution.backend must be 'package.module:callable'")
+    if isinstance(backend, str) and backend.strip() and not value.get("command_interfaces"):
+        errors.append("grasp_execution.command_interfaces must be non-empty when grasp_execution.backend is set")
+    for key in ("backend_options", "command_interfaces"):
+        if key in value and not value.get("backend"):
+            errors.append(f"grasp_execution.{key} requires grasp_execution.backend")
 
     ik = value.get("ik")
     if isinstance(ik, dict):

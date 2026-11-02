@@ -813,6 +813,8 @@ EOF
     local grasp_installed=false
     local graspgenx_wheel_root="${WORKSPACE}/third_party/wheels/graspgenx/b942909"
     local graspgenx_wheel="${graspgenx_wheel_root}/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl"
+    local curobo_wheel_root="${WORKSPACE}/third_party/wheels/curobo/4ea7736"
+    local curobo_wheel="${curobo_wheel_root}/nvidia_curobo-0.8.0+ibrobot.1-py3-none-any.whl"
     if ! setup_profile_enables grasp; then
         log_info "Skipping grasp dependencies (${SETUP_PROFILE} profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
@@ -841,6 +843,34 @@ EOF
             install_graspgen_pip "${VENV_PYTHON}" -m pip install
             grasp_installed=true
         fi
+    fi
+
+    # The X2 grasp planner (cuRobo, Warp) is installed on its own predicate,
+    # not with GraspGen: it needs neither pointnet2_ops nor a CUDA toolchain at
+    # setup, so a host where that extension is skipped (aarch64, Blackwell, no
+    # nvcc) still gets the planner it runs.
+    local x2_planning_installed=false
+    if ! setup_profile_enables grasp; then
+        log_info "Skipping the X2 grasp planner (${SETUP_PROFILE} profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping the X2 grasp planner for Benchmark-only setup."
+    elif ! accel_supports_torch_grasp; then
+        log_warn "Skipping the X2 grasp planner on accelerator ${SETUP_ACCEL_ID}; cuRobo and Warp need CUDA."
+    else
+        log_info "Installing grasp dependencies (X2 grasp pipeline)..."
+        run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/aimdk_grasp.txt" --quiet
+        # cuRobo, the X2 grasp planner, is published only as source; PyPI's
+        # nvidia-curobo is an empty placeholder. It ships as an audited
+        # pure-Python wheel (scripts/build_curobo_wheel.sh) that compiles its
+        # CUDA kernels at run time through cuda.core NVRTC. --no-deps: the
+        # runtime dependencies it needs are pinned in requirements/aimdk_grasp.txt.
+        if ! (cd "${curobo_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "cuRobo wheel checksum verification failed."
+            return 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${curobo_wheel}" --quiet
+        x2_planning_installed=true
     fi
 
     # GraspGenX is installed on its own predicate, not with GraspGen. It ships
@@ -950,6 +980,22 @@ try:
 except Exception as exc:
     raise SystemExit(f"Missing pointnet2_ops after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
+PY
+    fi
+    # Only assert the import when this run actually installed the X2 planner.
+    if [[ "${x2_planning_installed}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib
+
+try:
+    curobo = importlib.import_module("curobo")
+    importlib.import_module("curobo.motion_planner")
+except Exception as exc:
+    raise SystemExit(f"Missing cuRobo after the X2 grasp planner install: {exc}")
+# The audited build, never PyPI's empty nvidia-curobo placeholder.
+if curobo.__version__ != "0.8.0+ibrobot.1":
+    raise SystemExit(f"Expected the audited cuRobo 0.8.0+ibrobot.1, got {curobo.__version__}")
+print("X2 grasp planner smoke test passed")
 PY
     fi
     # Only assert the import when this run actually installed GraspGenX.

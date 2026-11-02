@@ -12,6 +12,9 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["setuptools"],
+    # Without this colcon silently falls back to unittest and collects zero
+    # tests while reporting success (AGENTS.md / docs/testing.md).
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",

@@ -23,10 +23,12 @@ if str(_PACKAGE_ROOT) not in sys.path:
 from robot_config.interface_binding import (  # noqa: E402
     InterfaceBindingError,
     bind_robot_interfaces,
+    event_interface_ids,
     required_interface_ids,
 )
 
 _AUDIOStamped = "audio_common_msgs/msg/AudioDataStamped"
+_WAKE_EVENT = "ibrobot_msgs/msg/SpeechWakeEvent"
 
 
 @pytest.fixture
@@ -34,7 +36,7 @@ def description_api():
     return importlib.import_module("robot_runtime.interface_description")
 
 
-def _audio_description(description_api, *, with_format=True, vendor_speech=False):
+def _audio_description(description_api, *, with_format=True, vendor_speech=False, wake_event=False):
     """A minimal ALSA-runtime description: audio.capture / audio.play only."""
     capture_metadata = (
         {"sample_rate_hz": 16000, "channels": 6, "sample_format": "S16LE", "channel_indices": [1, 2, 3, 4]}
@@ -69,6 +71,15 @@ def _audio_description(description_api, *, with_format=True, vendor_speech=False
         },
         "states": {},
     }
+    if wake_event:
+        doc["interfaces"]["audio.wake_event"] = {
+            "capability": "interaction.audio_capture",
+            "kind": "topic",
+            "direction": "publish",
+            "endpoint": "/audio/wake_event",
+            "message_type": _WAKE_EVENT,
+            "qos": qos,
+        }
     if vendor_speech:
         doc["interfaces"]["audio.speech"] = {
             "capability": "interaction.audio_capture",
@@ -207,11 +218,11 @@ def test_lekiwi_style_description_without_vendor_interfaces_binds(description_ap
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounding_dino_swint_seq8_1280x720",
     "sam2.1_hiera_tiny_prompt_ascend",
     "sam2.1_hiera_tiny",
     "ram_plus_swin_large_14m",
-    "siglip2_so400m_patch14_384_ascend",
+    "siglip2_so400m_patch14_384",
 )
 def test_lekiwi_nav_grasp_asr_cli_override_validates_and_binds(description_api):
     """The real lekiwi_nav_grasp accepts `voice_asr_auto_start:=true` end to end."""
@@ -247,3 +258,45 @@ def test_aimdk_x2_asr_cli_override_validates():
     validate_robot_config_dict(config, deferred_interfaces=True)
     assert config["voice_asr"]["audio_input"]["interface"] == "audio.capture"
     assert config["voice_asr"]["audio_input"]["type"] == _AUDIOStamped
+
+
+def _wake_event_config(binding):
+    return _config(
+        embodied={
+            "agent": {"voice_bridge": {"enabled": True, "addressee_trigger": "vendor_session", "wake_event": binding}}
+        }
+    )
+
+
+def test_the_wake_event_binds_without_waiting_for_readiness(description_api):
+    """It publishes nothing until somebody says the wake word, so it is never ready at launch."""
+    config = _wake_event_config({"interface": "audio.wake_event", "type": _WAKE_EVENT})
+
+    assert required_interface_ids(config) == []
+    assert event_interface_ids(config) == ["audio.wake_event"]
+    bound = bind_robot_interfaces(config, _audio_description(description_api, wake_event=True), require_ready=True)
+    item = bound["embodied"]["agent"]["voice_bridge"]["wake_event"]
+    assert item["topic"] == "/audio/wake_event"
+    assert item["_interface_source"]["id"] == "audio.wake_event"
+
+
+def test_the_wake_event_must_be_described_by_the_runtime(description_api):
+    config = _wake_event_config({"interface": "audio.wake_event", "type": _WAKE_EVENT})
+
+    with pytest.raises(InterfaceBindingError, match="unknown_interface"):
+        bind_robot_interfaces(config, _audio_description(description_api))
+
+
+def test_the_wake_event_type_is_checked(description_api):
+    config = _wake_event_config({"interface": "audio.wake_event", "type": "std_msgs/msg/Empty"})
+
+    with pytest.raises(InterfaceBindingError, match="type_mismatch.*SpeechWakeEvent required"):
+        bind_robot_interfaces(config, _audio_description(description_api, wake_event=True))
+
+
+def test_a_disabled_voice_bridge_binds_no_wake_event():
+    config = _config(
+        embodied={"agent": {"voice_bridge": {"enabled": False, "wake_event": {"interface": "x", "type": _WAKE_EVENT}}}}
+    )
+
+    assert event_interface_ids(config) == []

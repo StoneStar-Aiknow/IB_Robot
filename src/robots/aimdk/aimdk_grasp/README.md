@@ -1,0 +1,345 @@
+# aimdk_grasp — AgiBot X2 grasp pipeline
+
+Observation, scene estimation and grasp planning for the OmniHand X2, migrated
+from the standalone X2 grasp workspace. The package reads the robot only through
+the public interfaces `aimdk_robot` serves and calls the grasp models through the
+typed perception services that `aimdk_x2_grasp.yaml` declares. It never imports
+vendor (`aimdk_msgs`) types, so it runs anywhere the runtime's topics reach —
+including the Orin planning container, which cannot load the vendor's prebuilt
+message libraries.
+
+The migration is incremental; this README records what has landed.
+
+## Robot feedback
+
+`aimdk_grasp.feedback` assembles the joint pose at an image time from the three
+JointState views the runtime publishes, bound by interface ID from the public
+description (`aimdk_grasp.feedback_ros.subscribe_feedback`):
+
+| Interface | Endpoint | Provides |
+|---|---|---|
+| `joint.state` | `/joint_states` | both arms |
+| `joint.head_state` | `/aimdk/head_joint_states` | head (camera placement) |
+| `joint.hand_state` | `/aimdk/hand/joint_states` | the ten driven joints of each OmniHand |
+| `runtime.status` | `/runtime_status` | health: `ACTIVE` with no faults; expires after 5 s without an update |
+
+For an image stamp, each view's nearest sample must lie within 50 ms of it and
+the views within 100 ms of each other, or the observation is refused. Arm and
+head joint faults (vendor `error_code`) are reported by the runtime as
+`<group> joint fault: <joint>=<code>` and make the feedback unhealthy; they are
+not re-derived here. OmniHand `faultcode`s are not runtime faults: a finger
+pressing an object reports one for as long as it grips.
+
+The runtime publishes these views at the profile's `joint.state` rate (50 Hz).
+Composite views use the oldest HAL header stamp among the groups they contain;
+`joint.head_state` contains only the head, so a lagging waist or leg cannot label
+a fresh camera pose with an older time as `joint.body_state` would. The X2 keeps
+the HAL, the compute pack and the head camera on one PTP-synchronized clock (the
+HAL leaves `meas_stamp` zero), so joint states and images are compared within one
+clock domain, as in the standalone pipeline; the nearest sample is at most 10 ms
+from the image.
+
+## Planning model
+
+`aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF
+of the X2 Ultra upper body with the left OmniHand from the official description
+in `aimdk_description`; no hand-edited URDF is kept. It preserves the
+conventions the pipeline's collision data and joint commands were built on:
+hand joints are `R_*` aliases (native position times a fixed sign), `R_palm`
+keeps the pipeline's tool-frame orientation, and the distal finger joints are
+independent because the pipeline drives them from the measured coupling.
+
+`config/x2_ultra/` holds the cuRobo configuration for that model. cuRobo 0.8
+itself is installed by `scripts/setup.sh` on the cuda accelerator, from the
+audited pure-Python wheel in `third_party/wheels/curobo/`; it compiles its CUDA
+kernels at run time through NVRTC, so the same wheel serves the X2 Orin.
+
+| File | Content |
+|---|---|
+| `robot.yml` | cuRobo `robot_cfg` (spheres, exclusions, locked joints, c-space) and the generator options (`planning_model`) |
+| `hand_collision_cover.json` | certified sphere covers of six hand links (checked against the mesh file, its URDF origin and its scale) and the hand contact exclusions |
+| `hand_collision_reference.json` | hand/wrist exclusions of the reference sphere fit |
+| `torso_collision_cover.json` | certified torso cover, checked against the mesh file, its URDF origin and normalized scale; regenerate with `fit_x2_torso_cover <file>` |
+| `leg_obstacle.json` | pelvis and left leg at the standing pose, for the fine collision check; regenerate with `export_x2_leg_obstacle <file>` |
+| `provenance.json` | where each value comes from, and the measured coverage of the official meshes |
+
+The collision data was fitted on the AimDK SDK hand and arm meshes of the
+standalone workspace and is kept as is, with two exceptions: the shoulder roll
+spheres are re-expressed into the official link frames (only the frame origin
+differs), and the torso cover is refit on the official torso mesh, which has a
+rear protrusion the SDK mesh lacks. The official meshes deviate from the SDK
+ones by a few millimetres; `provenance.json` lists the per-link coverage.
+
+The hand is the AimDK SDK hand (`palm_mount: legacy`, `thumb_mount: legacy`),
+which the operator confirmed on the robot: the palm at the SDK position, 3 mm
+closer to the wrist than the official model, and the four fingers and the thumb
+on their SDK mounts. On the palm it is then exactly the hand of the GraspGen-X
+gripper description, which the grasps are proposed for, and the hand collision
+spheres sit where they were fitted (they are the SDK cover's, per link). The
+official model's fingers are 0.53° about the wrist axis away from the SDK's and
+its thumb roll axis ~75°; `"official"` builds it for comparison only.
+
+Open item:
+
+- **Right hand.** The right OmniHand is not in the collision model (the right
+  arm is locked during planning), as in the standalone workspace.
+
+## Robot model and collision spheres
+
+`aimdk_grasp.robot_model.collision_robot_config()` loads `config/x2_ultra`,
+verifies every cover against the description files it is bound to, and adds the
+hand and assembly exclusions; it refuses a cover whose meshes changed, or whose
+meshes the URDF moved or scaled inside their link.
+`planning_urdf()` writes the generated URDF to a content-named file for cuRobo,
+which does the collision checking on the GPU.
+
+`aimdk_grasp.robot_spheres.RobotSphereModel` places the same spheres on the CPU
+for given joint states (the scene's self filter and the planner's start state)
+and bounds the left arm's and palm's reach (the scene crop and the grasp
+candidate prefilter). `aimdk_grasp.hand.HandMapping` converts native left-hand
+positions to the model's aliases and derives the unmeasured distal joints. Its
+limits come from the planning model; the `open` / `close` presets come from the
+deployed GraspGenX gripper description (`load_gripper_presets`), since grasp
+candidates are generated for that hand shape.
+
+The standalone workspace's exact CPU self- and scene-collision check is not
+brought over: execution on the robot no longer calls it, and planning checks
+run in cuRobo.
+
+## Registration and scene estimation
+
+`aimdk_grasp.registration.register_rgbd()` rectifies the head camera's RGB and
+rasterizes each valid depth pixel's footprint into it with a nearest-surface
+z-buffer, so depth steps are never averaged and sensor holes stay holes. The
+kernel runs on NVIDIA Warp (`warp-lang`, installed by `scripts/setup.sh` with the
+grasp dependencies) on the planning host's GPU (`device="cuda"`, about 3 ms per
+1280x720 frame on an RTX 3090); Warp's CPU device runs the same kernel where no
+GPU exists. Detection, segmentation and grasp generation run as perception
+model services instead and can be deployed elsewhere, e.g. on Ascend. The X2's
+head camera is mounted upside down, so the proposer shows the detector and the
+segmenter the image turned upright (`proposer.upright_turns`, from the
+image-time camera pose) and turns their boxes and masks back.
+
+`aimdk_grasp.scene_estimation.estimate_scene()` turns the registered depth, the
+target mask, the image-time camera pose and the robot's collision spheres into
+the planner's torso-frame scene: the support plane as a cuboid, the target and
+environment as voxel meshes, cropped to the left arm's reach, with the robot's
+own body filtered out.
+
+The planning model has no legs. Every fine validation scene also carries the
+pelvis and left leg as one fixed mesh (`aimdk_grasp.leg_obstacle`, convex hulls of
+the official collision meshes at the measured standing pose): a live approach
+once swung the palm behind the torso into the left hip. The coarse scene gets it
+as one box per hull, each side pulled in by 2 cm (`scene_estimation.leg_boxes`):
+the mesh itself would cost every plan the hanging arm's 5-10 mm to the hip, and a
+mesh query sees only near its surface, while a box has a distance inside it and
+pushes a path out of the pelvis. A box's corners can stand out of its hull, so the
+fine scene keeps the exact hulls and no boxes.
+
+## Left-arm planner
+
+`aimdk_grasp.planner.LeftArmPlanner` is the X2's cuRobo planner, the planning half
+of its grasp backend for `manipulation_execution`'s grasp pipeline. It plans and
+checks left-arm motion only, in `torso_link`, on CUDA: the right arm, head and
+measured hand are locked into the model from feedback, and a change in them needs
+a new planner. It holds two scene resolutions: the optimizer plans against the
+coarse scene with a merged hand cover and a 2 cm activation distance, and every
+returned state is checked against the fine scene with the full cover at zero
+distance. No hand sphere may lie behind the torso's frontal plane. A segment the
+fine check refuses says where (`LeftArmPlanner.violations`): the samples, the
+links, the depth, and the deepest sphere's torso-frame centre, which tells the
+table from the target, a neighbour or the robot's own body.
+
+Grasp candidates arrive as GraspGenX gripper-base poses in the camera frame; the
+deployed gripper description's `base_rotation` (`hand.load_gripper_description`)
+turns them into `R_palm` goals, so the planner never assumes which hand the grasp
+model was trained for. A plan is three timed segments (`trajectory.TimedTrajectory`):
+an approach found by a batched contact screen and a goalset solve (its TrajOpt seed
+lifts the hand up and out from where it hangs, then comes down into the approach pose
+from 18 cm above, so the hand does not sweep through a low target on its way up), a
+straight grasp line along the palm axis, and a vertical lift that leaves the carried target out of
+its fine check (or a hold when the line cannot be planned). `warmup()` compiles and
+captures every kernel and graph before the first request. A CUDA or Warp failure
+raises `PlannerFault`, never a candidate failure, so the owner rebuilds the planner.
+
+The planner is migrated from the standalone pipeline with its tuned constants
+unchanged; the offline replay limits and the CPU sphere kinematics it carried for
+analysis tools are not.
+
+`aimdk_grasp.planner_service.GraspPlanningService` owns one warmed planner across
+requests: it rebuilds it only when the locked joints change or after a `PlannerFault`,
+and otherwise replaces the scene buffers in place, serializing every GPU call. A request
+screens the candidates, drops those whose closing sweep holds too little of the target,
+and orders the rest before `grasp_session.select_plan` searches them in goalsets of five
+over the approach distances. The ordering, from first to last within a tier: an approach
+pose the screen IK reaches, a clear grasp line, an open hand that stays 1 cm off the
+target along the line, the palm not facing the robot's left, and a confidence of at
+least 0.7. Candidates are only ever moved back, never dropped, except for those coming
+down onto a tall object from above. The approach preference by target height and the
+enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
+robot.
+
+## Streaming the arm
+
+The X2 arm is driven through the robot-agnostic streaming executor of
+`manipulation_execution` (`aimdk_grasp.arm_stream.x2_arm_executor`) on the
+runtime's `joint.arm_stream`, starting from and checked against the MC command
+the runtime reports on `joint.arm_command_state`. The X2 settings: tracking 0.3
+rad and arrival 0.2 rad, MC's 40 / 2 gains required, commands 5 mrad inside the
+robot configuration's MC arm limits, the right arm and head locked, and each
+retreat ending with MC's command at a fixed home (`HOME_COMMAND`), so landings do
+not ratchet.
+
+At kp 40 the arm settles below its command by gravity torque / kp.
+`aimdk_grasp.arm_gravity.GravityShaper` raises each waypoint by the predicted sag
+change from the segment start (`config/x2_ultra/arm_gravity.json`: the official
+description's chain with a fitted torso tilt and wrist payload), and
+`require_executable` refuses a plan that leaves MC's limits or whose predicted sag
+leaves less than 0.06 of the tracking limit.
+
+## The hand
+
+`aimdk_grasp.omnihand.OmniHandEffector` is the left OmniHand as the pipeline's
+end effector, streamed on the runtime's `joint.hand_stream` (the left hand's ten
+native joints, then ten zeros for the right, the packing the motion-control
+contract was verified with). The last command is kept alive between actions, so
+the hand holds its target while the arm moves; after a goal the stream is
+released and the platform keeps it.
+
+Preshape and release open along a straight line, 0.01 rad per 50 Hz frame, and
+wait up to 3 s for the fingers; a hand left more than 0.1 rad short of open is
+blocked. The close moves each finger on its own and freezes it at its first
+contact, a fingertip pad reading 30 or more or the flex joint 0.15 rad behind
+its command; the thumb and one more finger in contact is a grip. The hand's
+fault codes are not used and the runtime does not publish them: a finger
+pressing an object reports one for as long as it grips. Open and close shapes
+come from the GraspGenX gripper description.
+
+## Observations and revalidation
+
+`aimdk_grasp.observation.RegisteredObservation` holds one registered frame, the
+torso-frame camera pose at its image time and the feedback at that time, which
+must be healthy and within 100 ms of the image. `ObservationBuffer` keeps the
+newest observation and, separately, the newest current feedback: the request is
+planned from the image, but starts from where the arm is now. Both are owned
+copies, and reading them never refreshes their source time.
+
+Before a plan is used, `aimdk_grasp.revalidation` compares it with what the robot
+sees and measures now, and raises `ReobserveRequired` when it no longer holds:
+
+| Check | Rejects |
+|---|---|
+| `require_fresh` | current feedback older than 100 ms, a scene older than 0.5 s, or an unhealthy runtime |
+| `require_posture` | an arm, the head or the left hand moved more than 0.025 rad since planning |
+| `require_stable_patch` | the target region changed in RGB (> 2 % of it) or in measured depth (> 5 %), or the camera geometry changed |
+
+Depth counts only where both frames measured it: a transparent target's valid
+pixels come and go between still frames.
+
+## Host deployments
+
+`aimdk_x2_grasp.yaml` is the X2 grasp without its models; each robot-side host
+launches the deployment for its accelerator, and the Orin launches the same one:
+
+| Deployment | Robot-side host | Detection | Segmentation | GraspGen-X |
+|---|---|---|---|---|
+| `aimdk_x2_grasp_cuda.yaml` | NVIDIA GPU (203) | grounded SAM2, `torch_cuda` (returns masks) | none | `torch_cuda` |
+| `aimdk_x2_grasp_310p.yaml` | Ascend 310P | GroundingDINO, `ascend_310p` | SAM2 prompt, `ascend_310p` | `torch_npu` |
+
+`grasp_execution.model_deployment` names the GraspGen-X deployment the host's
+`generate_grasps` service runs, so the Gateway's executor identity matches what
+actually serves; the backends refuse the shared file, which names none. The
+310P deployment is served, not validated: the corrected CUDA/310P comparison of
+GraspGen-X's poses is still to be rerun (`torch_models` `graspgenx_ascend_310p`
+README), and it has not picked on the robot yet.
+
+## Two hosts: the pipeline and the grasp head
+
+A temporary deployment of the X2 alone (`split.py`); the robot-agnostic
+pipeline and launch builders know nothing of it. The robot-side host runs the
+runtime, the Gateway, the models and the grasp pipeline
+(`embodied_pipeline.launch.py`) with `aimdk_grasp.remote_head`'s backends,
+which need no CUDA; the Orin runs the grasp head (`grasp_head`,
+`x2_grasp_head_node`) with `launch/x2_grasp_head.launch.py`, beside the head
+camera's raw depth and the CUDA GPU. That launch refuses a configuration that
+is not an OmniHand X2 on an `aimdk_robot` runtime with the remote backends.
+The head captures and registers, keeps each capture under an id, completes its
+collision scene from the target mask, plans with cuRobo and watches the
+target; the pipeline detects, segments, generates candidates and streams the
+arm and the hand through its local runtime. The interfaces are
+`aimdk_grasp_msgs` (`CaptureGraspObservation`, `CompleteGraspScene`,
+`PlanGraspCandidates`, `RefineGraspPlan`, `WatchGraspTarget`, `WatchStatus`),
+an X2-internal protocol, under `backend_options.head.namespace`
+(`/x2_grasp_head`); `head_wire` converts what crosses. One request moves a
+compressed capture (~0.45 MB for 1280x720: JPEG colour, zstd millimetre depth)
+one way and a PNG mask plus the candidates (~60 KB) the other; the raw camera
+streams and the fine scene stay on the Orin. The head starts the
+mask-independent scene stage as it captures, so it runs while the pipeline
+detects and segments, and completes the scene while the pipeline generates
+candidates.
+
+`backend_options.head` holds the rest of the split: the head node's cores and
+those of its launch (`cpu_isolation`), and how long the robot-side host goes
+without a watch status (`status_timeout_s`). Ending the split means selecting
+`aimdk_grasp.backend:x2_grasp_backends`, which keeps everything in one process,
+and dropping that block.
+
+## Target watch states
+
+While the arm approaches and grasps (the `approach` and `grasp` steps), the
+watch compares fresh head-camera frames with the planned image. What it can
+say (`execution_watch.WatchState`) decides what `watch: stop` does:
+
+| State | Meaning | stop |
+|---|---|---|
+| stable | the newest fresh frame reads the target where it was planned | go on |
+| moved | the votes decided the target moved | halt, retrace, plan again (`TARGET_MOVED`) |
+| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s`, then stop in place (`WATCH_FAILED`) |
+| unavailable | not started, stopped, or no fresh frame for `watch_frame_timeout_s` | refuse to start; mid-way stop in place (`WATCH_FAILED`) |
+| waiting / ended | before the approach / from the close on, or `watch: off` | nothing is judged |
+
+A failed watch is not a move: nothing says where the target is, so the arm is
+held where it halted and nothing is retraced, replanned or released. When the
+watched steps end (`settle_grasp` starts) no new frame is judged, but a move or
+a failure already found stands: the last frame's votes may decide after the
+boundary, and the close (which asks the watch before it moves a finger) still
+stops on them. A frame
+counts as fresh when it is newer than the last and younger than
+`watch_image_age_s` when taken; a capture that fails is a missed frame, not
+the end of the watch. The timeouts and their evidence are in `WatchTimeouts`.
+`watch: log` records the same failures in the report and goes on.
+
+Across hosts the robot-side host does not take the head's word for it: the
+head publishes `WatchStatus` for the session the pipeline armed, every 0.1 s
+and at once on a move, and the pipeline counts only statuses of that session
+in sequence. It fails the watch when no status came for
+`head.status_timeout_s`, when a watched step ran for longer than the frame
+timeout plus that without the head's fresh frames advancing (a head alive but
+stalled, or one that never heard the step start), or when the head reports
+it unavailable or undecided for too long. All of these are measured on the
+robot-side host's clock from when statuses arrive; the two hosts' clocks are
+never compared. An ARM the head acknowledges counts only once the session's
+first status arrives. Every status taken is read, not only the newest, and the
+head keeps reporting a move (or the failure its watch ended in) until DISARM, so
+neither is lost behind a later "ended" status or a full queue. The robot-side
+host judges its own timing one last time when the watched steps end.
+
+Every watch command names its session, `<client>:<n>` with `n` rising per
+pipeline process. The head applies commands one at a time and refuses an ARM no
+newer than one it has seen from that client (a timed-out ARM delivered late, or
+one whose DISARM arrived first) and a PHASE or DISARM of any session but the
+armed one, so a late command of an earlier goal never touches the next goal's watch.
+Timeouts must be finite numbers of seconds within range (watch timeouts up to
+60 s, `head.status_timeout_s` 0.2-10 s); NaN, infinity and booleans are refused.
+
+## What replaced the standalone `x2_grasp_msgs`
+
+| Standalone interface | Replacement | Why |
+|---|---|---|
+| `RobotFeedback.msg` | the runtime's JointState views above | the runtime is the only reader of vendor state; joint faults are part of its status |
+| `RegisteredObservation.msg` | an in-process value inside the grasp head | observation and planning run in one node; the pipeline on the other host gets a compressed copy (`CaptureGraspObservation`) |
+| `CaptureRGBD.srv` | none needed | it existed to bridge the host observation node (which needed vendor messages) and the planning container; with vendor-free feedback both run in the container |
+| `ExecuteGrasp.action` | not migrated | motion goes through `aimdk_robot`; nothing runs on the motion-control unit |
+
+Camera transforms (`torso_from_camera`, `rgb_from_depth`) come from TF, which
+the platform publishes.

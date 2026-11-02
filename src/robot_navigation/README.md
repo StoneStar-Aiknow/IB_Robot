@@ -1,27 +1,30 @@
 # robot_navigation
 
-机器人导航包，集成了语音识别、Nav2 导航、全向轮底盘桥接和定位融合功能。
+机器人导航包，集成了语音识别、Nav2 导航、导航准入和定位融合功能。
 
 ## 导航 Profile
 
-本包同时提供 RealSense/RTAB-Map 链路和 MID-360 LiDAR 链路，以下描述按 profile 与 stage 区分：
+> **底盘归 LeKiwi runtime 所有。** 通用 `cmd_vel_bridge_node` 已删除：底盘几何、轮速投影、里程计和
+> `odom -> base_link`（无 FAST-LIO 时）都由 `lekiwi_robot` runtime 提供。受支持的导航配置是
+> `lekiwi_lidar` 与 `lekiwi_nav_grasp`；RealSense 配置（`lekiwi_realsense_mapping`、
+> `lekiwi_realsense_navigation`）已标记为不支持，底盘关闭，下文 RealSense 章节仅作历史参考。
+> 配置支持状态与门控模型见 `robot_config/README.md` 的“LeKiwi 配置与底盘门控”。
 
-| Profile | `map -> odom` | `odom -> base_link` | 主要速度链 |
+| Stage | `map -> odom` | `odom -> base_link` | 速度链 |
 |---|---|---|---|
-| RealSense mapping | RTAB-Map | cmd_vel bridge | `/cmd_vel -> bridge` |
-| RealSense navigation | RTAB-Map localization | EKF | `/cmd_vel -> bridge` |
-| MID-360 mapping | SLAM Toolbox | FAST-LIO odom bridge | `/cmd_vel -> bridge` |
-| MID-360 navigation | AMCL | FAST-LIO odom bridge | `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bridge` |
+| MID-360 mapping | SLAM Toolbox | FAST-LIO odom bridge | `/cmd_vel -> runtime base_node` |
+| MID-360 navigation / hybrid（`dyn_avoid_enabled`） | AMCL | FAST-LIO odom bridge | controller `-> /cmd_vel_nav ->` velocity smoother `-> /cmd_vel_smoothed ->` collision monitor `-> /cmd_vel ->` runtime base_node |
 
-本文中 RTAB-Map、EKF、DWB 和“不启动 AMCL”的章节仅适用于 RealSense navigation profile；RealSense
-mapping 由 cmd_vel bridge 发布 `odom -> base_link`。LiDAR profile 以 `lekiwi_lidar.yaml` 的 resolved stage 配置为准。
+runtime 只在 `base_navigation` 模式且导航门打开时接收 `/cmd_vel`。runtime 启动时门关闭；声明
+`navigation.open_gate_on_startup` 的 stage 由 `navigation_admission` 在 runtime 就绪后切换模式并开门。
+手柄同样发布 `/cmd_vel`，在启用碰撞监测的 stage 中不经过碰撞监测。
 
 ## 功能特性
 
 - **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
 - **全向局部控制**: 提供 Nav2 MPPI `Omni` 候选 profile，实机门禁通过前默认保留 DWB
-- **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
+- **导航准入**: `navigation_admission` 在 runtime 就绪后选择 stage 的 runtime 模式并通过契约服务打开导航门
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
 - **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 默认保存为 `rtabmap.yaml/rtabmap.pgm`
 - **任务联动**: 语音 → 导航 → 到达 → 触发 action_dispatcher 评估，形成完整任务链
@@ -80,7 +83,7 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 |------|------|--------|
 | `voice_control` | 语音关键词匹配 + 导航桥接 (sherpa-onnx 本地 ASR) | `robot_navigation.voice_control` |
 | `nav2_goal_client` | Nav2 导航 Goal 客户端 + 评估触发 | `robot_navigation.nav2_goal_client` |
-| `cmd_vel_bridge_node` | cmd_vel → ros2_control 桥接 + 里程计发布 | `robot_navigation.cmd_vel_bridge_node` |
+| `navigation_admission` | 启动时切换 runtime 模式并打开导航门（一次性） | `robot_navigation.navigation_admission` |
 | `fast_lio_odom_bridge` | 规范化 FAST-LIO odometry 与 TF | `robot_navigation.fast_lio_odom_bridge` |
 | `navigation_lifecycle_coordinator` | 在 warm-up 后启动 Nav2 lifecycle | `robot_navigation.navigation_lifecycle_coordinator` |
 | `navigation_command_server` | 提供原子导航 Action 与取消服务 | `robot_navigation.navigation_command_server` |
@@ -675,7 +678,7 @@ ros2 launch robot_navigation ekf_rtabmap_launch.py
 
 ### 2. robot_navigation standalone 测试
 
-这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
+除 LeKiwi 激光里程计门禁外，这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
 导航 launch builder 的单元测试（`test/test_navigation_launch_builder.py`、
 `test/test_nav2_builder.py`、`test/test_provider_navigation_ownership.py`、
 `test/test_navigation_velocity_contract.py`）已随 `launch_builders/` 从 robot_config 迁入本包
@@ -688,33 +691,39 @@ colcon test --packages-select robot_navigation --base-paths src --event-handlers
 
 预期结果：`robot_navigation` 单元测试与软件闭环 E2E 通过。
 
+`test/test_lidar_odometry_gate.py` 是 LeKiwi 的 FAST-LIO 精度门禁（openspec change
+`lekiwi-gazebo-runtime-platform` D14），说明见 `lekiwi_robot` README 的「Lidar-odometry regression gate」一节。
+该门禁通过 `robot_config` 的通用入口启动仿真器（Gazebo 与 MuJoCo 各一条腿）与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
+测试依赖也计入 `scripts/verify_runtime_independence.sh` 的依赖闭包审计。Ubuntu 上默认执行；openEuler 上或设置
+`NAV_TEST_PROFILE=minimal` 时跳过。只跑该门禁：
+
+```bash
+NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation --base-paths src --event-handlers console_direct+ --pytest-args -k lidar_odometry_gate
+```
+
 ### 3. robot_config minimal 测试
 
-openEuler、无 Gazebo 或无桌面环境跑 minimal profile。该 profile 会显式跳过 Gazebo/Nav2 完整仿真，只验证测试发现和 skip 策略。
+openEuler、无仿真器或无桌面环境跑 minimal profile。该 profile 跳过两个平台的导航 E2E，只验证测试发现和 skip 策略。
 
 ```bash
 NAV_TEST_PROFILE=minimal colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
 ```
 
-预期结果：`robot_config` navigation simulation 测试 `3 skipped`，skip 原因为 minimal profile 禁用 Gazebo 仿真。
+预期结果：`-k test_navigation_simulation` 选中的用例中，无仿真用例（staging 解析、决策层、map → odom 所有权归因、收集安全）全部通过，2 个 E2E 用例 skipped。skip 原因按决策顺序给出：平台能力或仿真器环境不可用时先按环境 skip（`IBROBOT_REQUIRE_SIM_PLATFORMS` 列出该平台时改为 fail）；环境可用而 `NAV_TEST_PROFILE=minimal`（或 openEuler 默认）时按 minimal profile skip。`NAV_TEST_PROFILE` 的非法取值在任何 skip 之前直接 fail。用例总数不在文档里钉死，以 `pytest --collect-only` 为准。
 
 ### 4. robot_config full 仿真测试
 
-Ubuntu 且已安装 Gazebo/ros_gz 时运行 full profile。该测试由 `robot_config` 维护，启动 Gazebo、ros2_control、控制器、Nav2、`robot_navigation` 节点和测试辅助节点。
+Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按 `PHYSICS_SIM_PLATFORMS` 参数化。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
 
 ```bash
 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
 ```
 
-预期结果：3 个 Gazebo/Nav2 导航 E2E 通过。测试进程会打印临时日志目录，例如 `/tmp/robot_config_nav_sim_xxx`，其中包含 `robot_launch.log`、`odom_bridge.log`、`gt_odom_node.log` 和 `cmd_vel_relay.log`。
+预期结果：Gazebo 与 MuJoCo 各 1 个导航 E2E 通过。测试进程打印临时日志目录，例如 `/tmp/robot_config_nav_sim_<platform>_xxx`，其中包含 `robot_launch.log`。验收运行设置 `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco`，把任一平台的 skip 变为 fail。MuJoCo 平台依赖 `ros-humble-mujoco-ros2-control` 和 `ros-humble-mujoco-3d-lidar`。缺少依赖时该平台 skip，并给出原因。
 
-### 5. Gazebo GUI 可视化测试
+### 5. GUI 可视化
 
-GUI 不是必跑项，只用于 Ubuntu 桌面环境人工观察 Gazebo 窗口。pytest 仍会自动发送导航目标，Gazebo 窗口只负责可视化。
-
-```bash
-SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
-```
+E2E 测试固定以 headless 启动仿真：Gazebo 设 `IBROBOT_GAZEBO_HEADLESS=1`，MuJoCo 设 `IBROBOT_MUJOCO_HEADLESS=1`。测试不读取 `SIM_GUI`。人工观察窗口时，按 `lekiwi_robot/README.md` 的 launch 命令手动启动带显示的仿真。
 
 ## ROS 接口
 
@@ -1075,6 +1084,8 @@ robot_navigation/
 │   ├── test_voice_control.py      # 语音控制 pytest 测试
 │   ├── test_cmd_vel_bridge.py     # cmd_vel 桥接 pytest 测试（IK/FK/里程计）
 │   ├── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
+│   ├── test_lidar_odometry_gate.py  # LeKiwi FAST-LIO 精度门禁（Gazebo 与 MuJoCo）
+│   ├── config/lekiwi_lio_sim.yaml # 门禁 overlay（测试数据，不安装）
 │   └── e2e/
 │       ├── mock_servers.py        # Mock Trigger/Action 服务
 │       └── test_pipeline_software.py   # 软件闭环 E2E（无物理仿真）

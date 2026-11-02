@@ -1,0 +1,49 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e1f4e9d..c361294 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -2,12 +2,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ [build-system]
+-requires = ["setuptools>=45", "setuptools_scm>=6.2", "wheel"]
++requires = ["setuptools>=62.3", "wheel"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "nvidia-curobo"
+-dynamic = ["version"]
++version = "0.8.0+ibrobot.1"
+ description = "GPU robot motion toolkit containing cuda accelerated kinematics, IK, MPC, Global motion planning, and optimization solvers."
+ readme = "README.md"
+ license = {text = "Apache-2.0"}
+@@ -108,13 +108,16 @@ Repository = "https://github.com/NVlabs/curobo"
+ include-package-data = true
+ 
+ [tool.setuptools.packages.find]
+-exclude = ["tests"]
++exclude = ["tests", "curobo.tests", "curobo.tests.*", "curobo.examples", "curobo.examples.*"]
+ 
+ [tool.setuptools.package-data]
+ # Include kernel source files for cuda.core runtime compilation
+ "curobo._src.curobolib.kernels" = ["**/*.cu", "**/*.cuh", "**/*.h"]
+ # Include pybind binding and launch files for optional pybind compilation
+ "curobo._src.curobolib.backends.pybind" = ["*.cpp", "*.cu"]
++# Solver, task and scene configurations read at runtime; the robot assets
++# (meshes of the example robots) are not packaged.
++"curobo.content" = ["configs/**/*"]
+ # Include compiled shared objects
+ "*" = ["*.so"]
+ 
+@@ -155,11 +158,6 @@ section-order = ["future", "standard-library", "third-party", "first-party", "lo
+ known-first-party = ["curobo"]
+ 
+ 
+-[tool.setuptools_scm]
+-version_scheme = "no-guess-dev"
+-local_scheme = "dirty-tag"
+-
+-
+ [tool.pytest.ini_options]
+ minversion = "7.0"
+ testpaths = ["curobo/tests"]

@@ -1046,6 +1046,217 @@ def test_launch_service_materializes_before_consumer_process(config, descriptor,
         )
 
 
+def test_a_launch_binds_to_a_runtime_another_host_runs(config, descriptor, monkeypatch, tmp_path):
+    from launch import LaunchDescription, LaunchService
+    from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler, TimerAction
+    from launch.event_handlers import OnProcessExit
+    from launch.events import Shutdown
+
+    from robot_config.launch_builders import runtime as builder
+
+    consumed = tmp_path / "consumed"
+    calls = []
+
+    def waiter(_config, *, description_output, **_kwargs):
+        calls.append(description_output)
+        return ExecuteProcess(
+            cmd=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+                description_output,
+                yaml.safe_dump(descriptor),
+            ]
+        )
+
+    def consumer(effective):
+        process = ExecuteProcess(
+            cmd=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())",
+                effective["_config_path"],
+                str(consumed),
+            ]
+        )
+        return [
+            RegisterEventHandler(OnProcessExit(target_action=process, on_exit=[EmitEvent(event=Shutdown())])),
+            process,
+        ]
+
+    monkeypatch.setattr(
+        builder, "generate_runtime_provider_actions", lambda *_a, **_k: pytest.fail("this host starts no runtime")
+    )
+    monkeypatch.setattr(builder, "runtime_ready_waiter", waiter)
+    monkeypatch.setattr(builder.tempfile, "tempdir", str(tmp_path))
+    actions = builder.generate_bound_runtime_actions(config, consumer, use_sim=False, start_provider=False)
+    service = LaunchService()
+    service.include_launch_description(
+        LaunchDescription(
+            [*actions, TimerAction(period=10.0, actions=[EmitEvent(event=Shutdown(reason="test timeout"))])]
+        )
+    )
+    service.run()
+    assert len(calls) == 1
+    bound = yaml.safe_load(consumed.read_text())["robot"]
+    assert bound["runtime"]["interface_description"]["robot"] == descriptor["robot"]
+
+
+def _metadata_only_perception_service(tmp_path):
+    """A configured service whose bundle holds only its manifest, not its weights.
+
+    This is what a consumer host of a split deployment carries: the launch that
+    binds to a remote runtime must still pass the bound snapshot's validation.
+    """
+    from inference_manifest import BundleFile, canonical_bundle_digest
+
+    root = tmp_path / "depth"
+    root.mkdir(parents=True)
+    entry = BundleFile(path="assets/identity.txt")
+    manifest = {
+        "schema_version": 3,
+        "bundle": {
+            "uuid": "123e4567-e89b-42d3-a456-426614174000",
+            "revision": 1,
+            "name": "test-metric_depth",
+            "files": [entry.model_dump(mode="json")],
+            "digest": {
+                "algorithm": "sha256",
+                "scope": "structure",
+                "value": canonical_bundle_digest(
+                    "123e4567-e89b-42d3-a456-426614174000", 1, "test-metric_depth", [entry]
+                ),
+            },
+        },
+        "model": {
+            "interface": "tensor_model",
+            "model_type": "metric_depth",
+            "operation": "infer",
+            "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1]}],
+            "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1]}],
+            "semantic_identity": {
+                "logical_model_revision": "metric_depth@v1",
+                "preprocessing_contract": "test-pre-v1",
+                "output_semantics": "test-output-v1",
+            },
+        },
+        "deployments": {
+            "torch_cpu": {
+                "uuid": "123e4567-e89b-42d3-a456-426614174001",
+                "revision": 1,
+                "execution_contract": {
+                    "state_scope": "request",
+                    "execution_structure": "direct",
+                    "cancellation_granularity": "request_boundary",
+                },
+                "runtime_profile": {
+                    "backend": "torch",
+                    "target": {"runtime": "torch"},
+                    "profile": {"device": "cpu"},
+                },
+            }
+        },
+    }
+    (root / "inference_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return {
+        "perception_services": {
+            "services": [
+                {
+                    "id": "depth_front",
+                    "enabled": True,
+                    "required": True,
+                    "bundle_path": str(root),
+                    "deployment": "torch_cpu",
+                    "adapter_class": "example_depth.plugin:DepthServicePlugin",
+                    "service_type": "example_depth_msgs/srv/EstimateDepth",
+                    "endpoint": "/depth/front",
+                    "runtime_options": {},
+                }
+            ]
+        }
+    }
+
+
+def test_the_bound_snapshot_of_a_non_hosting_launch_needs_no_local_artifacts(config, descriptor, monkeypatch, tmp_path):
+    """Live binding revalidates the config; a host that only calls the remotely
+    served endpoints revalidates them by metadata, so its consumer starts and
+    reads its observation/action contract from the materialized snapshot."""
+    from launch import LaunchDescription, LaunchService
+    from launch.actions import EmitEvent, ExecuteProcess, TimerAction
+    from launch.events import Shutdown
+
+    from robot_config.launch_builders import runtime as builder
+
+    config["perception_services"] = _metadata_only_perception_service(tmp_path)["perception_services"]
+    consumed = tmp_path / "consumed"
+
+    def waiter(_config, *, description_output, **_kwargs):
+        return ExecuteProcess(
+            cmd=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+                description_output,
+                yaml.safe_dump(descriptor),
+            ]
+        )
+
+    def consumer(effective):
+        # A real contract reader (the scheduled dispatcher, the recording node):
+        # it loads the bound snapshot through the typed loader and builds its
+        # contract from it, with only the services' manifest metadata present.
+        from robot_config.loader import load_robot_config
+
+        typed = load_robot_config(effective["_config_path"])
+        contract = typed.to_contract()
+        summary = {
+            "observations": sorted(obs.key for obs in contract.observations),
+            "actions": sorted(act.key for act in contract.actions),
+            "image_topic": str(
+                next(obs.topic for obs in contract.observations if obs.key == "observation.images.front")
+            ),
+        }
+        consumed.write_text(json.dumps(summary), encoding="utf-8")
+        return [EmitEvent(event=Shutdown())]
+
+    monkeypatch.setattr(builder, "runtime_ready_waiter", waiter)
+    monkeypatch.setattr(builder.tempfile, "tempdir", str(tmp_path))
+
+    # The hosting default still refuses to bind a config whose artifacts are absent.
+    hosting = builder.generate_bound_runtime_actions(config, consumer, use_sim=False, start_provider=False)
+    hosting_service = LaunchService()
+    hosting_service.include_launch_description(
+        LaunchDescription([*hosting, TimerAction(period=10.0, actions=[EmitEvent(event=Shutdown(reason="timeout"))])])
+    )
+    hosting_service.run()
+    assert not consumed.exists()
+
+    actions = builder.generate_bound_runtime_actions(
+        config, consumer, use_sim=False, start_provider=False, require_local_model_artifacts=False
+    )
+    service = LaunchService()
+    service.include_launch_description(
+        LaunchDescription([*actions, TimerAction(period=10.0, actions=[EmitEvent(event=Shutdown(reason="timeout"))])])
+    )
+    service.run()
+    bound = json.loads(consumed.read_text())
+    assert bound["observations"] == ["observation.images.front", "observation.state"]
+    assert bound["actions"] == ["action"]
+    assert bound["image_topic"] == "/unit/front/image"
+
+
+def test_waiting_for_a_runtime_names_its_provider_and_where_to_write_its_description(config):
+    waiter = runtime.runtime_ready_waiter(config, readiness_timeout_s=5.0, description_output="/tmp/d.yaml")
+    arguments = [getattr(part, "text", part) for argument in waiter.cmd for part in argument]
+    assert vars(waiter).get("_Node__node_executable") == "wait_for_runtime"
+    command = " ".join(str(argument) for argument in arguments)
+    assert f"--runtime-name {config['runtime']['provider']}" in command
+    assert "--description-output /tmp/d.yaml" in command
+    del config["runtime"]["provider"]
+    with pytest.raises(RuntimeError, match="provider is required"):
+        runtime.runtime_ready_waiter(config)
+
+
 def test_binding_rejects_selectors_that_name_no_interface_joint(config, descriptor, description_api):
     # `<field>.<joint>` selectors resolve by joint name; a suffix outside the
     # interface's declared joints reads the wrong joint (or NaN) silently.

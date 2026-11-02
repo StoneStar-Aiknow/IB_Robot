@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pytest
 from sensor_msgs.msg import JointState
+
 from so101_suite.wrist_guard import (
     apply_joint5_retry,
     canonicalize_joint5,
@@ -13,7 +14,66 @@ from so101_suite.wrist_guard import (
     joint5_within_abs_limit,
 )
 
-from manipulation_execution.grasp_geometry import euler_xyz_matrix, quaternion_from_matrix
+
+# Local test helpers (D4: so101_suite is a dependency leaf and must not import
+# manipulation_execution even from its tests). Same semantics the suite's
+# modules implement: Rz @ Ry @ Rx for intrinsic XYZ angles, quaternion [x, y,
+# z, w] from a rotation matrix.
+def euler_xyz_matrix(rpy):
+    roll, pitch, yaw = (float(value) for value in rpy)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
+
+
+def quaternion_from_matrix(matrix):
+    rotation = np.asarray(matrix, dtype=np.float64)[:3, :3]
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = (
+            (rotation[2, 1] - rotation[1, 2]) / scale,
+            (rotation[0, 2] - rotation[2, 0]) / scale,
+            (rotation[1, 0] - rotation[0, 1]) / scale,
+            0.25 * scale,
+        )
+    else:
+        diagonal = np.diag(rotation)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            quaternion = (
+                0.25 * scale,
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+                (rotation[2, 1] - rotation[1, 2]) / scale,
+            )
+        elif index == 1:
+            scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            quaternion = (
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                0.25 * scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+                (rotation[0, 2] - rotation[2, 0]) / scale,
+            )
+        else:
+            scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            quaternion = (
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+                0.25 * scale,
+                (rotation[1, 0] - rotation[0, 1]) / scale,
+            )
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    return tuple(float(value / norm) for value in quaternion)
 
 
 def _joint_state(joint5: float) -> JointState:
@@ -55,6 +115,59 @@ def test_joint5_helpers_select_equivalent_closing_axis_branch():
     assert math.isclose(canonicalize_joint5(2.0 * math.pi / 3.0), -math.pi / 3.0, abs_tol=1e-8)
     assert math.isclose(canonicalize_joint5(1.2, center=0.5), 1.2, abs_tol=1e-8)
     assert math.isclose(canonicalize_joint5(2.2, center=0.5), 2.2 - math.pi, abs_tol=1e-8)
+
+
+def test_closing_axis_correction_normalizes_non_unit_quaternions():
+    # Legacy semantics (the deleted manipulation_execution.so101_kinematics_guard
+    # via grasp_geometry.quaternion_matrix): a scaled quaternion describes the
+    # same rotation. Identity actual orientation, Z approach axis, X closing
+    # axis and the (0, 0, sqrt(2), sqrt(2)) target must correct joint5 by
+    # exactly pi/2, as the normalised (0, 0, sqrt(0.5), sqrt(0.5)) does.
+    scaled = (0.0, 0.0, math.sqrt(2.0), math.sqrt(2.0))
+    normalized = (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    identity = quaternion_from_matrix(np.eye(3, dtype=np.float64))
+
+    for target in (scaled, normalized):
+        correction = joint5_closing_axis_correction(
+            target,
+            identity,
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+        )
+        assert math.isclose(correction, math.pi / 2.0, abs_tol=1e-9)
+
+    # The actual orientation is normalised with the same rule: a scaled actual
+    # quaternion gives the same correction as its normalised form.
+    assert math.isclose(
+        joint5_closing_axis_correction(
+            normalized,
+            scaled,
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+        ),
+        joint5_closing_axis_correction(
+            normalized,
+            normalized,
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+        ),
+        abs_tol=1e-9,
+    )
+
+
+@pytest.mark.parametrize("zero_is_target", [True, False])
+def test_closing_axis_correction_rejects_zero_quaternions(zero_is_target):
+    zero = (0.0, 0.0, 0.0, 0.0)
+    identity = quaternion_from_matrix(np.eye(3, dtype=np.float64))
+    target, actual = (zero, identity) if zero_is_target else (identity, zero)
+
+    with pytest.raises(ValueError, match="quaternion must be non-zero"):
+        joint5_closing_axis_correction(
+            target,
+            actual,
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+        )
 
 
 @pytest.mark.parametrize(

@@ -44,6 +44,48 @@ def test_agent_presentation_timeout_is_bounded(timeout):
         ({"busy_message": "正在执行，可以说停止。"}, "busy_message must not contain a stop phrase"),
         ({"busy_message": "请稍候", "stop_phrases": ["稍候"]}, "busy_message must not contain a stop phrase"),
         ({"busy_message": ""}, "busy_message must be a non-empty string"),
+        # The addressee gate: a configured wake phrase must be usable, and an
+        # empty list would be a gate nothing can open.
+        ({"wake_phrases": []}, "wake_phrases must not be empty"),
+        ({"wake_phrases": [""]}, "wake_phrases must be a list of non-empty strings"),
+        ({"wake_window_sec": 0}, "wake_window_sec must be finite and positive"),
+        # The voiceprint check over that gate's window.
+        ({"speaker_check_enabled": "yes"}, "speaker_check_enabled must be a boolean"),
+        (
+            {"speaker_check_enabled": True},
+            "speaker_check_enabled requires an enabled gate",
+        ),
+        ({"speaker_min_similarity": 0}, "speaker_min_similarity must be in (0, 1]"),
+        ({"speaker_min_similarity": 1.2}, "speaker_min_similarity must be in (0, 1]"),
+        ({"speaker_merge_margin": -0.1}, "speaker_merge_margin must be in [0, 1)"),
+        ({"speaker_merge_margin": 1}, "speaker_merge_margin must be in [0, 1)"),
+        ({"speaker_reject_short": "yes"}, "speaker_reject_short must be a boolean"),
+        ({"speaker_max_age_sec": 0}, "speaker_max_age_sec must be finite and positive"),
+        ({"speaker_embedding_topic": "/voice/embed"}, "speaker_embedding_topic must not be configured"),
+        # The vendor_session trigger: the source consumes its own wake word.
+        ({"addressee_trigger": "whenever"}, "addressee_trigger must be wake_phrase or vendor_session"),
+        (
+            {"addressee_trigger": "vendor_session", "wake_phrases": ["灵犀灵犀"]},
+            "vendor_session must not set wake_phrases",
+        ),
+        ({"session_gap_sec": 0}, "session_gap_sec must be finite and positive"),
+        # The wake event read off the platform's own acknowledgement.
+        # The runtime profile owns the endpoint, so a topic name is refused.
+        (
+            {"addressee_trigger": "vendor_session", "wake_event_topic": "/audio/wake_event"},
+            "wake_event_topic must not be configured; bind the runtime interface",
+        ),
+        (
+            {"addressee_trigger": "vendor_session", "wake_event": {"interface": "audio.wake_event"}},
+            "wake_event must be {interface: <logical id>, type: ibrobot_msgs/msg/SpeechWakeEvent}",
+        ),
+        (
+            {
+                "wake_phrases": ["灵犀灵犀"],
+                "wake_event": {"interface": "audio.wake_event", "type": "ibrobot_msgs/msg/SpeechWakeEvent"},
+            },
+            "wake_event only applies to addressee_trigger=vendor_session",
+        ),
     ],
 )
 def test_agent_voice_bridge_config_is_validated(voice_bridge, fragment):

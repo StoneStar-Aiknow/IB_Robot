@@ -31,7 +31,9 @@ def main():
 
     try:
         logger.info(f"Validating {config_path}...")
-        config = load_robot_config(config_path)
+        # This tool answers for the machine it runs on: demand the configured
+        # artifacts, unlike the contract-reader default of load_robot_config.
+        config = load_robot_config(config_path, require_local_model_artifacts=True)
 
         logger.info(f"  Robot: {config.name} ({config.robot_type})")
         logger.info(f"  Hardware plugin: {config.ros2_control.hardware_plugin}")

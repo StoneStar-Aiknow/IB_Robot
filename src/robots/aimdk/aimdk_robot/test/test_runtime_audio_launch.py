@@ -59,18 +59,19 @@ def _nodes(actions):
     return [action for action in _flatten(actions) if type(action).__name__ == "Node"]
 
 
-def test_physical_execution_renders_the_bridge_only():
+def test_physical_execution_renders_the_data_plane_then_the_bridge():
     actions = _render("false")
-    assert [type(action).__name__ for action in actions] == ["Node"]
+    assert [type(action).__name__ for action in actions] == ["Node", "TimerAction"]
     nodes = _nodes(actions)
     assert [(node.node_package, node.node_executable, node._Node__node_name) for node in nodes] == [
-        ("aimdk_robot", "aimdk_runtime", "aimdk_runtime")
+        ("aimdk_dataplane", "aimdk_dataplane", "aimdk_dataplane"),
+        ("aimdk_robot", "aimdk_runtime", "aimdk_runtime"),
     ]
 
 
 def test_simulated_execution_declares_no_alsa_audio_nodes():
     actions = _render("true")
-    assert [type(action).__name__ for action in actions] == ["Node", "TimerAction", "TimerAction"]
+    assert [type(action).__name__ for action in actions] == ["Node", "TimerAction", "TimerAction", "TimerAction"]
     packages = {node.node_package for node in _nodes(actions)}
     assert not packages & {"audio_capture", "audio_play"}, "the vendor runtime owns its audio"
 

@@ -18,12 +18,21 @@
 	-->
 	<xacro:arg name="tcp_offset_x" default="-0.005" />
 	<xacro:arg name="tcp_offset_z" default="-0.095" />
+	<!-- root_link (lekiwi-nav-grasp-sim-platforms D8): the arm model's root
+	     link and base_joint's parent. The default `world` keeps every
+	     SO-101 render byte-identical (pinned by test/golden). A robot that
+	     mounts this arm MID-CHAIN overrides the arg before the include: the
+	     URDF->SDF lumping turns a mid-chain link named `world` into a
+	     model-level frame, which gz-sim Fortress rejects as reserved. The
+	     first <xacro:arg> declaration wins. (xacro drops comments preceding
+	     an <xacro:arg>, so this note stays out of the rendered output.) -->
+	<xacro:arg name="root_link" default="world" />
 
 	<!-- Links -->
-	<link name="world" />
+	<link name="$(arg root_link)" />
 
 	<joint name="base_joint" type="fixed">
-		<parent link="world" />
+		<parent link="$(arg root_link)" />
 		<child link="base" />
 		<origin xyz="0 0 0" rpy="0 0 0" />
 	</joint>

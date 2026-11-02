@@ -36,6 +36,11 @@
        stays in robot_config. -->
   <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>so101_motion</exec_depend>
+  <!-- The SO-101 grasp providers (gripper-mesh geometry, joint-5 wrist guard)
+       that lekiwi_nav_grasp's grasp_execution declares; the generic pipeline
+       loads them only through configuration (openspec
+       cleanup-manipulation-so101-providers D4). -->
+  <exec_depend>so101_suite</exec_depend>
 
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>xacro</exec_depend>
@@ -61,6 +66,29 @@
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <!-- The gates probe RuntimeStatus directly (ibrobot_msgs). It is a
+       contract package inside the independence gate's fixed member set
+       (CONTRACT_PACKAGES in scripts/verify_runtime_independence.sh), so
+       this test_depend keeps the audited closure clean. -->
+  <test_depend>ibrobot_msgs</test_depend>
+  <!-- Test dependencies stay inside the runtime's member set: the
+       independence gate (scripts/verify_runtime_independence.sh) audits the
+       whole closure, test dependencies included. Tests that launch the
+       generic application entry live in the generic packages (the
+       lidar-odometry gate is robot_navigation/test). -->
+  <!-- test_mujoco_stop_gate.py drives the simulator node's pause/reset
+       services (lekiwi-mujoco-runtime-platform D3). -->
+  <test_depend>mujoco_ros2_control_msgs</test_depend>
+  <!-- test_navgrasp_stop_cross_gate queries the live controller manager for
+       the post-stop controller state (D5, lekiwi-nav-grasp-sim-platforms). -->
+  <test_depend>controller_manager_msgs</test_depend>
+  <!-- Review rework: every direct import of the new tests is declared — the
+       stop cross gate drives a real FollowJointTrajectory goal, and the
+       motion smoke reads /clock and /tf_static. -->
+  <test_depend>control_msgs</test_depend>
+  <test_depend>trajectory_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>tf2_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

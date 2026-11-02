@@ -13,7 +13,6 @@
   <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>
-  <depend>moveit_msgs</depend>
   <depend>robot_runtime</depend>
   <depend>tf2_ros</depend>
   <depend>ibrobot_msgs</depend>
@@ -50,6 +49,9 @@
        service parameters against inference_service's perception model
        endpoints. -->
   <test_depend>inference_service</test_depend>
+  <!-- moveit_msgs is loaded only by kinematics_backend legacy_moveit, whose
+       MoveIt bring-up installs it; the tests cover that path too. -->
+  <test_depend>moveit_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -129,9 +129,19 @@ def create_controller_ready_waiter(robot_config: dict, controller_names, use_sim
 
 
 def load_launch_robot_config(
-    robot_config_name, config_path_override=None, nav_stage="", *, defer_interface_binding=False
+    robot_config_name,
+    config_path_override=None,
+    nav_stage="",
+    *,
+    defer_interface_binding=False,
+    require_local_model_artifacts=True,
 ):
-    """Load robot configuration from YAML file (migrated from robot.launch.py)."""
+    """Load robot configuration from YAML file (migrated from robot.launch.py).
+
+    ``require_local_model_artifacts`` carries the launch's ``with_model_services``
+    decision: a host that leaves the model services to another machine validates
+    their identity and endpoints from bundle metadata without holding the weights.
+    """
     from pathlib import Path
 
     from ament_index_python.packages import get_package_share_directory
@@ -158,6 +168,7 @@ def load_launch_robot_config(
         nav_stage=nav_stage,
         materialize_benchmark_transport=False,
         defer_interface_binding=defer_interface_binding,
+        require_local_model_artifacts=require_local_model_artifacts,
     )
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")

@@ -29,12 +29,16 @@ from robot_runtime.launch_support import (
 from robot_runtime.mujoco import (
     CAMERA_PLUGIN_INSTANCE,
     CAMERA_PLUGIN_TYPE,
+    FREE_JOINT_STATE_PLUGIN_INSTANCE,
+    FREE_JOINT_STATE_PLUGIN_TYPE,
     SimulatorVersions,
     camera_mjcf_elements,
     camera_plugin_parameters,
     camera_tf_urdf,
     check_simulator_versions,
+    free_joint_state_plugin_parameters,
     gazebo_rpy_to_mujoco_rpy,
+    merge_mujoco_plugin_parameters,
     mujoco_camera_publish_rate,
     mujoco_camera_relays,
     render_robot_mjcf,
@@ -418,6 +422,52 @@ def test_camera_plugin_parameters_without_cameras_is_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# issue #195: the FreeJointStatePublisherPlugin parameters for scene objects
+# ---------------------------------------------------------------------------
+
+
+def test_free_joint_state_plugin_parameters_publish_dynamic_scene_bodies():
+    parameters = free_joint_state_plugin_parameters("pick_banana")
+    instance = parameters["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+    assert instance["type"] == FREE_JOINT_STATE_PLUGIN_TYPE
+    assert instance["body_names"] == ["plate", "banana"], "every layout dynamic body, in layout order"
+    assert instance["topic"] == "/sim/pick_banana/free_joint_states", "scene-namespaced, like Gazebo's object_poses"
+    assert instance["frame_id"] == "", "world frame"
+    assert instance["publish_rate"] == 50.0
+
+
+def test_free_joint_state_plugin_parameters_are_empty_without_dynamic_objects():
+    assert free_joint_state_plugin_parameters("") == {}, "robot-only launch: no plugin"
+    assert free_joint_state_plugin_parameters("empty") == {}, "empty scene has no dynamic bodies"
+    assert free_joint_state_plugin_parameters("does_not_exist") == {}
+
+
+def test_merge_mujoco_plugin_parameters_combines_trees_instance_wise(tmp_path):
+    peripherals = [TOP]
+    cameras = camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals)
+    objects = free_joint_state_plugin_parameters("pick_banana")
+
+    merged = merge_mujoco_plugin_parameters(cameras, objects)
+
+    assert set(merged["mujoco_plugins"]) == {CAMERA_PLUGIN_INSTANCE, FREE_JOINT_STATE_PLUGIN_INSTANCE}
+    assert merged["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE] == cameras["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert (
+        merged["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+        == (objects["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE])
+    )
+    assert merge_mujoco_plugin_parameters() == {}
+    assert merge_mujoco_plugin_parameters({}, {}) == {}
+    # a later tree wins per key inside one instance
+    later = {"mujoco_plugins": {FREE_JOINT_STATE_PLUGIN_INSTANCE: {"publish_rate": 10.0}}}
+    assert (
+        merge_mujoco_plugin_parameters(objects, later)["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE][
+            "publish_rate"
+        ]
+        == 10.0
+    )
+
+
+# ---------------------------------------------------------------------------
 # D2: the simulator version check
 # ---------------------------------------------------------------------------
 
@@ -638,6 +688,48 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
     tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
     assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
+    # the empty scene composes no dynamic objects: no free-joint publisher
+    assert FREE_JOINT_STATE_PLUGIN_INSTANCE not in tree["mujoco_plugins"]
+
+
+def test_mujoco_embodiment_adds_the_free_joint_state_plugin_for_dynamic_scenes(tmp_path, monkeypatch):
+    """Issue #195: a scene with dynamic objects gets the
+    FreeJointStatePublisherPlugin in the same params file as the cameras."""
+    import yaml
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    profile = _profile(tmp_path)
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    actions = mujoco_embodiment_actions(
+        profile, tmp_path / "profile.yaml", robot_description=description, mujoco_scene="pick_banana"
+    )
+    simulator_nodes = [node for node in _nodes(actions) if node._Node__node_executable == "ros2_control_node"]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    param_files = [
+        Path("".join(getattr(part, "text", None) or str(part) for part in entry.param_file))
+        for entry in simulator_nodes[0]._Node__parameters
+        if isinstance(entry, ParameterFile)
+    ]
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in yaml.safe_load(path.read_text())]
+    assert len(keyed) == 1
+    tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    instance = tree["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+    assert instance["type"] == FREE_JOINT_STATE_PLUGIN_TYPE
+    assert instance["body_names"] == ["plate", "banana"]
+    assert instance["topic"] == "/sim/pick_banana/free_joint_states"
+    # the cameras still ride in the same file
+    assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
 
 
 def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
@@ -786,3 +878,851 @@ def test_explicit_scene_none_stays_robot_only(tmp_path):
     profile = _profile(tmp_path)
     description = render_mujoco_description(profile, tmp_path / "profile.yaml", scene=None)
     assert str(composed_model_path(None)) in description
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D3/D5/D9: lidar/IMU MJCF, plugin parameters,
+# the floating-base constants
+# ---------------------------------------------------------------------------
+
+
+def _mid360(**simulation):
+    return {
+        "type": "lidar",
+        "name": "mid360",
+        "driver": "livox_mid360",
+        "frame_id": "livox_frame",
+        "pointcloud_topic": "/livox/lidar",
+        "imu_topic": "/livox/imu",
+        "publish_freq": 10.0,
+        "transform": {
+            "parent_frame": "base_link",
+            "x": -0.08,
+            "y": 0.0,
+            "z": 0.2,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 1.5707963,
+        },
+        "simulation": {"mujoco": dict(simulation)},
+    }
+
+
+def test_lidar_imu_mjcf_injects_site_plugin_sensor_and_imu_triple():
+    from robot_runtime.mujoco import lidar_imu_mjcf
+
+    # the D1 LeKiwi grid (the profile declares what the Gazebo section declares)
+    periph = _mid360(horizontal_samples=360, vertical_samples=32, vertical_min_deg=-7.0, vertical_max_deg=52.0)
+    sites, sensors, needs_extension = lidar_imu_mjcf([periph])
+    assert needs_extension
+    assert len(sites) == 1
+    parent, site_xml = sites[0]
+    assert parent == "base_link"
+    site = ET.fromstring(site_xml)
+    assert site.tag == "site" and site.get("name") == "mid360_lidar_site"
+    # the resolved mount pose, yaw in the w-x-y-z quaternion (extrinsic XYZ)
+    assert site.get("pos") == "-0.080000 0.000000 0.200000"
+    quat = [float(v) for v in site.get("quat").split()]
+    assert abs(quat[0] - math.cos(math.pi / 4)) < 1e-5 and abs(quat[3] - math.sin(math.pi / 4)) < 1e-5
+    # the plugin sensor on the site, the grid from the peripheral's params
+    plugin = ET.fromstring(sensors[0])
+    assert plugin.get("plugin") == "mujoco.plugin.lidar" and plugin.get("objname") == "mid360_lidar_site"
+    config = {c.get("key"): c.get("value") for c in plugin}
+    assert config["resolution"] == "360 32"  # the D1 defaults
+    assert config["azimuth_range"] == "-3.14159265 3.14159265"
+    assert config["elevation_range"] == f"{math.radians(-7.0):.6f} {math.radians(52.0):.6f}"
+    assert config["async"] == "0"
+    # the integrated IMU triple on the same site (co-located, zero extrinsic)
+    names = [ET.fromstring(s).get("name") for s in sensors[1:]]
+    assert names == ["mid360_imu_quat", "mid360_imu_gyro", "mid360_imu_accel"]
+    assert all(ET.fromstring(s).get("site") == "mid360_lidar_site" for s in sensors[2:4])
+    # a profile without a simulated lidar renders nothing
+    assert lidar_imu_mjcf([]) == ([], [], False)
+    assert lidar_imu_mjcf([{**_mid360(), "driver": "ldlidar"}]) == ([], [], False)
+
+
+def test_lidar_imu_mjcf_prefers_the_simulation_mujoco_transform():
+    from robot_runtime.mujoco import lidar_imu_mjcf
+
+    periph = _mid360(vertical_samples=32)
+    periph["simulation"]["mujoco"]["transform"] = {"parent_frame": "chassis", "x": 1.0, "y": 2.0, "z": 3.0, "yaw": 0.0}
+    sites, _sensors, _needs = lidar_imu_mjcf([periph])
+    parent, site_xml = sites[0]
+    assert parent == "chassis"
+    assert ET.fromstring(site_xml).get("pos") == "1.000000 2.000000 3.000000"
+
+
+def test_lidar_imu_mjcf_planar_lidar_renders_one_elevation_sample():
+    from robot_runtime.mujoco import lidar_imu_mjcf
+
+    periph = {**_mid360(), "driver": "livox_mid360"}
+    periph["simulation"]["mujoco"]["vertical_samples"] = 1
+    _sites, sensors, _needs = lidar_imu_mjcf([periph])
+    config = {c.get("key"): c.get("value") for c in ET.fromstring(sensors[0])}
+    assert config["resolution"] == "360 1" and config["elevation_range"] == "0 0"
+
+
+def test_render_robot_mjcf_injects_lidar_into_the_template(tmp_path):
+    template = tmp_path / "robot.xml.template"
+    template.write_text(MJCF_TEMPLATE.replace('name="base"', 'name="base_link"'), encoding="utf-8")
+    profile = {
+        "simulation": {
+            "mujoco": {"template": str(template), "meshes_dir": str(tmp_path)},
+        },
+        "peripherals": [_mid360()],
+    }
+    out = render_robot_mjcf(profile)
+    root = ET.parse(out).getroot()
+    # the site inside the mount body
+    site = root.find('.//body[@name="base_link"]/site[@name="mid360_lidar_site"]')
+    assert site is not None
+    # the sensor section with the plugin sensor and the IMU triple
+    sensor_names = [s.get("name") for s in root.find("sensor")]
+    assert sensor_names == ["mid360_lidar", "mid360_imu_quat", "mid360_imu_gyro", "mid360_imu_accel"]
+    # the engine extension, exactly once
+    extensions = root.findall("extension/plugin[@plugin='mujoco.plugin.lidar']")
+    assert len(extensions) == 1
+    # a profile without a lidar renders no site/sensor/extension (byte-identical SO-101 path)
+    out_plain = render_robot_mjcf({**profile, "peripherals": []})
+    plain = ET.parse(out_plain).getroot()
+    assert plain.find(".//site") is None and plain.find("sensor") is None and plain.find("extension") is None
+
+
+def test_lidar_plugin_parameters_target_the_advertised_frame_and_raw_topic():
+    from robot_runtime.mujoco import LIDAR_PLUGIN_INSTANCE, LIDAR_PLUGIN_TYPE, lidar_plugin_parameters
+
+    tree = lidar_plugin_parameters([_mid360()])
+    instance = tree["mujoco_plugins"][LIDAR_PLUGIN_INSTANCE]
+    assert instance["type"] == LIDAR_PLUGIN_TYPE
+    assert instance["mid360_lidar"] == {"frame_name": "livox_frame", "topic": "/mid360_lidar/raw"}
+    # only the drivers MuJoCo simulates; nothing without a lidar
+    assert lidar_plugin_parameters([{**_mid360(), "driver": "ldlidar"}]) == {}
+    assert lidar_plugin_parameters([]) == {}
+    # disabled entries are absent
+    assert lidar_plugin_parameters([{**_mid360(), "enabled": False}]) == {}
+
+
+def test_base_velocity_plugin_parameters_carry_no_second_clamp():
+    from robot_runtime.mujoco import (
+        BASE_VELOCITY_PLUGIN_INSTANCE,
+        BASE_VELOCITY_PLUGIN_TYPE,
+        FLOATING_BASE_CMD_TOPIC,
+        base_velocity_plugin_parameters,
+    )
+
+    tree = base_velocity_plugin_parameters({"body": "base_link", "twist_source_topic": "/odom"})
+    instance = tree["mujoco_plugins"][BASE_VELOCITY_PLUGIN_INSTANCE]
+    assert instance["type"] == BASE_VELOCITY_PLUGIN_TYPE
+    assert instance["body"] == "base_link"
+    assert instance["cmd_vel_topic"] == FLOATING_BASE_CMD_TOPIC
+    assert instance["use_stamped_twist"] is True
+    assert instance["cmd_timeout"] == 0.25
+    # D3.2: no limit keys — upstream defaults are +inf and the single
+    # authoritative clamp lives in base_node
+    assert "max_linear_velocity" not in instance and "max_yaw_rate" not in instance
+    # no floating-base section: no plugin (the robot has no free joint to drive)
+    assert base_velocity_plugin_parameters(None) == {}
+    assert base_velocity_plugin_parameters({}) == {}
+
+
+def test_floating_base_constants_are_simulator_namespaced():
+    from robot_runtime.mujoco import FLOATING_BASE_CMD_TOPIC, FLOATING_BASE_STATE_TOPIC, ODOM_FREE_JOINT_NAME
+
+    assert ODOM_FREE_JOINT_NAME == "floating_base_joint"
+    assert FLOATING_BASE_STATE_TOPIC == "/simulator/floating_base_state"
+    assert FLOATING_BASE_CMD_TOPIC == "/simulator/floating_base/cmd_vel"
+
+
+def test_imu_sensor_urdf_maps_the_mjcf_triple_with_the_default_suffixes():
+    from robot_runtime.mujoco import imu_sensor_urdf
+
+    xml = imu_sensor_urdf([_mid360()])
+    sensor = ET.fromstring(f"<ros2_control>{xml}</ros2_control>").find("sensor")
+    assert sensor.get("name") == "mid360_imu"
+    params = {p.get("name"): p.text for p in sensor.findall("param")}
+    assert params == {"mujoco_type": "imu", "mujoco_sensor_name": "mid360_imu"}
+    interfaces = [s.get("name") for s in sensor.findall("state_interface")]
+    assert len(interfaces) == 10
+    assert interfaces[:4] == ["orientation.x", "orientation.y", "orientation.z", "orientation.w"]
+    assert interfaces[-3:] == ["linear_acceleration.x", "linear_acceleration.y", "linear_acceleration.z"]
+    # no integrated IMU -> no sensor block
+    assert imu_sensor_urdf([]) == ""
+    assert imu_sensor_urdf([{**_mid360(), "driver": "ldlidar"}]) == ""
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D3/D5: the floating-base + lidar embodiment
+# ---------------------------------------------------------------------------
+
+LEKIWI_MJCF = """<mujoco model="lekiwi_probe">
+  <compiler eulerseq="XYZ" angle="radian"/>
+  <worldbody>
+    <body name="base_link" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <freejoint name="floating_base_joint"/>
+      <geom type="box" size="0.13 0.13 0.03"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _lekiwi_profile(tmp_path: Path):
+    mjcf = tmp_path / "lekiwi.xml.template"
+    mjcf.write_text(LEKIWI_MJCF, encoding="utf-8")
+    meshes = tmp_path / "meshes"
+    meshes.mkdir(exist_ok=True)
+    xacro = tmp_path / "robot.xacro"
+    xacro.write_text(XACRO, encoding="utf-8")
+    controllers = tmp_path / "controllers.yaml"
+    controllers.write_text(
+        "controller_manager:\n"
+        "  ros__parameters:\n"
+        "    update_rate: 100\n"
+        "    base_velocity_controller:\n"
+        "      type: velocity_controllers/JointGroupVelocityController\n"
+        "    joint_state_broadcaster:\n"
+        "      type: joint_state_broadcaster/JointStateBroadcaster\n",
+        encoding="utf-8",
+    )
+    return {
+        "runtime": {"name": "lekiwi_robot", "version": "0.1.0"},
+        "modes": {
+            "initial": "idle",
+            "idle": {
+                "controllers": [],
+                "controllers_by_platform": {"mujoco": ["base_velocity_controller"]},
+                "transitions": ["base_navigation"],
+            },
+            "base_navigation": {
+                "controllers": ["base_velocity_controller"],
+                "allows_base": True,
+                "transitions": ["idle"],
+            },
+        },
+        "capabilities": {"joint.state": {}, "runtime.stop": {}},
+        "joints": ["7", "8", "9"],
+        "sim_platforms": ["sdk", "gazebo", "mujoco"],
+        "sim_platform": "sdk",
+        "controller_manager": "controller_manager",
+        "joint_state_topic": "/joint_states",
+        "command_channels": [],
+        "trajectory_actions": [],
+        "description": {"xacro": str(xacro)},
+        "ros2_control": {"controllers_config": str(controllers), "broadcasters": ["joint_state_broadcaster"]},
+        "peripherals": [_mid360(horizontal_samples=360, vertical_samples=32)],
+        "hardware": {},
+        "simulation": {
+            "mujoco": {
+                "template": str(mjcf),
+                "meshes_dir": str(meshes),
+                "sdf_meshes": [],
+                "floating_base": {"body": "base_link", "twist_source_topic": "/odom"},
+            }
+        },
+    }
+
+
+def test_mujoco_embodiment_composes_the_floating_base_and_lidar(tmp_path, monkeypatch):
+    """D3/D5: the plugin tree, the generated controllers file, the filters,
+    the relay, the remaps and the platform spawner set of the LeKiwi shape."""
+    import yaml
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    profile = _lekiwi_profile(tmp_path)
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    actions = mujoco_embodiment_actions(
+        profile, tmp_path / "profile.yaml", robot_description=description, mujoco_scene=""
+    )
+    simulator = [node for node in _nodes(actions) if node._Node__node_executable == "ros2_control_node"][0]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    param_files = [
+        Path("".join(getattr(part, "text", None) or str(part) for part in entry.param_file))
+        for entry in simulator._Node__parameters
+        if isinstance(entry, ParameterFile)
+    ]
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in yaml.safe_load(path.read_text())]
+    assert len(keyed) == 1
+    tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]["mujoco_plugins"]
+    # the floating-base drive: stamped twist, internal topic, timeout, no clamp
+    base = tree["ibrobot_floating_base"]
+    assert base["type"] == "mujoco_ros2_control_plugins/BaseVelocityPlugin"
+    assert base["body"] == "base_link" and base["cmd_vel_topic"] == "/simulator/floating_base/cmd_vel"
+    assert base["use_stamped_twist"] is True and base["cmd_timeout"] == 0.25
+    assert "max_linear_velocity" not in base and "max_yaw_rate" not in base
+    # the lidar publisher
+    lidars = tree["ibrobot_lidars"]
+    assert lidars["type"] == "mujoco_ros2_control_plugins/Mujoco3dLidarPlugin"
+    assert lidars["mid360_lidar"] == {"frame_name": "livox_frame", "topic": "/mid360_lidar/raw"}
+    # the generated controllers file carries the IMU broadcaster
+    controllers_files = [
+        path for path in param_files if path not in keyed and "mid360_imu_broadcaster" in path.read_text()
+    ]
+    assert len(controllers_files) == 1, f"one generated controllers file, got {param_files}"
+    generated = yaml.safe_load(Path(controllers_files[0]).read_text())
+    assert generated["controller_manager"]["ros__parameters"]["mid360_imu_broadcaster"] == {
+        "type": "imu_sensor_broadcaster/IMUSensorBroadcaster"
+    }
+    assert generated["mid360_imu_broadcaster"]["ros__parameters"] == {
+        "sensor_name": "mid360_imu",
+        "frame_id": "livox_frame",
+    }
+    # the shipped entries survive the merge
+    assert "base_velocity_controller" in generated["controller_manager"]["ros__parameters"]
+    # the process-wide IMU remap (launch stores substitutions, not strings)
+    remaps = {
+        tuple("".join(getattr(part, "text", None) or str(part) for part in side) for side in remap)
+        for remap in simulator._Node__remappings
+    }
+    assert ("/mid360_imu_broadcaster/imu", "/mid360_imu/raw") in remaps
+    # the filters, the relay and the static TF
+    executables = {
+        (node._Node__package, node._Node__node_executable, node._Node__node_name): node for node in _nodes(actions)
+    }
+
+    def _plain(parameters_entry):
+        # launch stores parameter names and string values as substitution
+        # tuples, appending a "\n...\n" marker to unperformed scalars
+        def _text(value):
+            if isinstance(value, list | tuple):
+                text = "".join(getattr(part, "text", None) or str(part) for part in value)
+                return text.removesuffix("\n...\n")
+            return value
+
+        return {_text(key): _text(value) for key, value in parameters_entry.items()}
+
+    cloud_filter = executables[("robot_runtime", "finite_cloud_filter", "mid360_finite_cloud_filter")]
+    assert _plain(cloud_filter._Node__parameters[0]) == {
+        "input_topic": "/mid360_lidar/raw",
+        "output_topic": "/livox/lidar",
+        "add_intensity": True,
+    }
+    imu_filter = executables[("robot_runtime", "imu_settle_filter", "mid360_imu_settle_filter")]
+    assert _plain(imu_filter._Node__parameters[0]) == {
+        "input_topic": "/mid360_imu/raw",
+        "output_topic": "/livox/imu",
+    }
+    relay = executables[("robot_runtime", "odometry_twist_relay", "odometry_twist_relay")]
+    assert _plain(relay._Node__parameters[0]) == {
+        "twist_source_topic": "/odom",
+        "cmd_vel_topic": "/simulator/floating_base/cmd_vel",
+        "base_frame": "base_link",
+        "use_sim_time": True,
+    }
+    static_tf = [node for node in _nodes(actions) if node._Node__node_executable == "static_transform_publisher"]
+    assert static_tf, "the sensor frame absent from the model gets the runtime static TF"
+    # the platform spawner set: the base controller spawns ACTIVE on mujoco
+    # (D3.1) and the generated IMU broadcaster joins the broadcasters
+    spawners = [node for node in _nodes(actions) if node._Node__node_executable == "spawner"]
+    active_spawner = [n for n in spawners if "--inactive" not in n._Node__arguments][0]
+    assert "base_velocity_controller" in active_spawner._Node__arguments
+    assert "mid360_imu_broadcaster" in active_spawner._Node__arguments
+
+
+def test_render_mujoco_description_injects_the_imu_sensor_into_ros2_control(tmp_path, monkeypatch):
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    profile = _lekiwi_profile(tmp_path)
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    root = ET.fromstring(description)
+    sensors = root.findall("ros2_control/sensor")
+    assert [s.get("name") for s in sensors] == ["mid360_imu"]
+    params = {p.get("name"): p.text for p in sensors[0].findall("param")}
+    assert params == {"mujoco_type": "imu", "mujoco_sensor_name": "mid360_imu"}
+    assert len(sensors[0].findall("state_interface")) == 10
+    # a profile without a simulated lidar renders no sensor (SO-101 unchanged)
+    plain = render_mujoco_description(_profile(tmp_path), tmp_path / "profile.yaml")
+    assert ET.fromstring(plain).find("ros2_control/sensor") is None
+
+
+# ---------------------------------------------------------------------------
+# MJCF attachments (lekiwi-nav-grasp-sim-platforms D2)
+# ---------------------------------------------------------------------------
+
+ATTACHMENT_HOST = """<mujoco model="host">
+  <compiler angle="radian" eulerseq="XYZ" meshdir="{{MESHES_DIR}}"/>
+  <option gravity="0 0 -9.81" timestep="0.001"/>
+  <asset>
+    <mesh name="host_mesh" file="host.stl"/>
+  </asset>
+  <default>
+    <default class="visual"><geom contype="0" conaffinity="0" group="1"/></default>
+    <default class="wheel"><geom type="sphere" condim="1"/></default>
+  </default>
+  <worldbody>
+    <body name="base_link" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <freejoint name="floating_base_joint"/>
+      <site name="host_site" pos="0 0 0.1"/>
+      <camera name="host_cam" pos="0 0 0.5"/>
+      <geom name="chassis" type="box" size="0.13 0.13 0.03" pos="0 0 0.05"/>
+      <body name="left_wheel" pos="0.06 0.11 0.01">
+        <joint name="wheel_7" type="hinge" axis="0 0 -1"/>
+        <geom class="wheel" name="wheel_7"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="wheel_7" joint="wheel_7" kv="0.6"/>
+  </actuator>
+</mujoco>
+"""
+
+ATTACHMENT_ARM = """<mujoco model="arm">
+  <compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian"/>
+  <option gravity="0 0 -9.81" timestep="0.001" noslip_iterations="20" cone="elliptic">
+    <flag contact="enable"/>
+  </option>
+  <asset>
+    <material name="mat_arm" specular="0.1"/>
+    <mesh name="arm_base_mesh" file="arm_base.stl"/>
+  </asset>
+  <default>
+    <default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>
+    <default class="collision">
+      <geom contype="1" conaffinity="1" group="0"/>
+      <default class="grip"><geom friction="10 1 0.05"/></default>
+    </default>
+  </default>
+  <worldbody>
+    <geom type="plane" size="1 1 0.01"/>
+    <body name="arm_base" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <inertial pos="0 0 0.05" mass="0.15" diaginertia="0.001 0.001 0.002"/>
+      <geom class="visual" type="mesh" mesh="arm_base_mesh"/>
+      <body name="gripper" pos="0 0 0.1">
+        <joint name="1" type="hinge" axis="0 0 1"/>
+        <geom class="grip" type="box" size="0.01 0.01 0.01"/>
+      </body>
+    </body>
+  </worldbody>
+  <contact>
+    <exclude body1="arm_base" body2="gripper"/>
+  </contact>
+  <actuator>
+    <position name="1" joint="1" kp="998"/>
+  </actuator>
+</mujoco>
+"""
+
+ATTACHMENT_URDF = """<?xml version="1.0"?>
+<robot name="probe">
+  <link name="base_link"/>
+  <link name="arm_root"/>
+  <link name="arm_base"/>
+  <link name="gripper"/>
+  <joint name="base_to_arm" type="fixed">
+    <parent link="base_link"/><child link="arm_root"/>
+    <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
+  </joint>
+  <joint name="base_joint" type="fixed">
+    <parent link="arm_root"/><child link="arm_base"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <joint name="1" type="revolute">
+    <parent link="arm_base"/><child link="gripper"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/><limit effort="1" lower="-1" upper="1" velocity="1"/>
+  </joint>
+</robot>
+"""
+
+
+def _attachment_files(tmp_path):
+    host = tmp_path / "host.xml.template"
+    host.write_text(ATTACHMENT_HOST, encoding="utf-8")
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM, encoding="utf-8")
+    host_meshes = tmp_path / "host_meshes"
+    host_meshes.mkdir()
+    arm_meshes = tmp_path / "arm_meshes"
+    arm_meshes.mkdir()
+    return {
+        "simulation": {
+            "mujoco": {
+                "template": str(host),
+                "meshes_dir": str(host_meshes),
+                "sdf_meshes": [],
+                "attachments": [
+                    {
+                        "name": "arm",
+                        "template": str(arm),
+                        "meshes_dir": str(arm_meshes),
+                        "root_body": "arm_base",
+                        "parent_body": "base_link",
+                        "urdf_parent_link": "base_link",
+                        "urdf_child_link": "arm_base",
+                    }
+                ],
+            }
+        },
+        "peripherals": [],
+    }
+
+
+def _attachment_quat_yaw() -> tuple[float, float]:
+    half = 1.5708 / 2.0
+    return math.cos(half), math.sin(half)
+
+
+def test_attachment_merges_the_submodel_at_the_urdf_chain_pose(tmp_path):
+    profile = _attachment_files(tmp_path)
+    out = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+
+    # the root body moved under parent_body at the URDF chain pose (local
+    # mount: the spawn pose stays on the host's root body only)
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]')
+    assert arm_base is not None, "arm_base must live under base_link"
+    assert arm_base.get("pos") == "0.06 -0.02 0.02"
+    w, x, y, z = (float(v) for v in arm_base.get("quat").split())
+    expected_w, expected_z = _attachment_quat_yaw()
+    assert abs(w - expected_w) < 1e-6 and abs(z - expected_z) < 1e-6 and x == y == 0.0
+    assert (
+        root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]/body[@name="gripper"]/joint[@name="1"]')
+        is not None
+    )
+
+    # assets: the attachment's meshes resolve from its own directory, the
+    # host's keep their meshdir-relative files; the material merged
+    arm_mesh = root.find("asset/mesh[@name='arm_base_mesh']")
+    assert arm_mesh.get("file") == str(tmp_path / "arm_meshes" / "arm_base.stl")
+    assert root.find("asset/mesh[@name='host_mesh']").get("file") == "host.stl"
+    assert root.find("asset/material[@name='mat_arm']") is not None
+
+    # defaults namespaced arm_* and the references follow; the host's stay
+    assert root.find("default/default[@class='arm_visual']") is not None
+    assert root.find("default/default[@class='arm_collision']") is not None
+    assert root.find("default/default[@class='arm_collision']/default[@class='arm_grip']") is not None
+    assert root.find(".//body[@name='arm_base']/geom[@class='arm_visual']") is not None
+    assert root.find(".//body[@name='gripper']/geom[@class='arm_grip']") is not None
+    assert root.find("default/default[@class='visual']") is not None  # the host's own
+    assert root.find("default/default[@class='wheel']") is not None
+
+    # the appended sections + the parent<->root exclude
+    excludes = [(e.get("body1"), e.get("body2")) for e in root.find("contact").findall("exclude")]
+    assert ("arm_base", "gripper") in excludes and ("base_link", "arm_base") in excludes
+    actuators = [a.get("name") for a in root.find("actuator")]
+    assert actuators == ["wheel_7", "1"]
+
+    # the host's sections govern; the attachment's ground plane and flag drop
+    assert root.find(".//geom[@type='plane']") is None
+    assert root.find("option/flag") is None
+    assert root.find("option").get("noslip_iterations") is None
+
+
+def test_attachment_mounts_on_a_nested_parent_body(tmp_path):
+    """The parent body may sit anywhere in the host tree, not only at the top
+    level (review round 2)."""
+    profile = _attachment_files(tmp_path)
+    nested = ATTACHMENT_HOST.replace(
+        '<site name="host_site" pos="0 0 0.1"/>',
+        '<site name="host_site" pos="0 0 0.1"/>\n      <body name="mount_deck" pos="0 0 0.12"/>',
+    )
+    Path(profile["simulation"]["mujoco"]["template"]).write_text(nested, encoding="utf-8")
+    profile["simulation"]["mujoco"]["attachments"][0]["parent_body"] = "mount_deck"
+    out = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="mount_deck"]/body[@name="arm_base"]')
+    assert arm_base is not None, "arm_base must mount on the nested parent body"
+    excludes = [(e.get("body1"), e.get("body2")) for e in root.find("contact").findall("exclude")]
+    assert ("mount_deck", "arm_base") in excludes
+
+
+def test_an_ambiguous_parent_body_name_is_an_error(tmp_path):
+    """MJCF body names are globally unique; several host bodies sharing the
+    mount name mean a malformed host — refuse instead of picking one."""
+    profile = _attachment_files(tmp_path)
+    ambiguous = ATTACHMENT_HOST.replace(
+        '<site name="host_site" pos="0 0 0.1"/>',
+        '<site name="host_site" pos="0 0 0.1"/>\n      <body name="mount_deck"/>\n'
+        '      <body name="mount_deck" pos="0.1 0 0"/>',
+    )
+    Path(profile["simulation"]["mujoco"]["template"]).write_text(ambiguous, encoding="utf-8")
+    profile["simulation"]["mujoco"]["attachments"][0]["parent_body"] = "mount_deck"
+    with pytest.raises(RuntimeError, match="parent body 'mount_deck' is ambiguous"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_pose_ignores_the_spawn_pose(tmp_path):
+    """A non-zero spawn pose must not rotate the mount twice (D2.2)."""
+    profile = _attachment_files(tmp_path)
+    out = render_robot_mjcf(profile, spawn_pose=(1.0, 2.0, 0.05, 0.9), urdf=ATTACHMENT_URDF)
+    root = ET.parse(out).getroot()
+    arm_base = root.find('worldbody/body[@name="base_link"]/body[@name="arm_base"]')
+    assert arm_base.get("pos") == "0.06 -0.02 0.02"
+    w, x, y, z = (float(v) for v in arm_base.get("quat").split())
+    expected_w, expected_z = _attachment_quat_yaw()
+    assert abs(w - expected_w) < 1e-6 and abs(z - expected_z) < 1e-6
+    # the spawn pose is on the host's root body only
+    host_pos = root.find('worldbody/body[@name="base_link"]').get("pos")
+    assert host_pos == "1.000000 2.000000 0.050000"
+
+
+def test_attachments_need_the_urdf(tmp_path):
+    profile = _attachment_files(tmp_path)
+    with pytest.raises(RuntimeError, match="needs the rendered robot description"):
+        render_robot_mjcf(profile)
+
+
+def test_attachment_schema_rejects_unknown_and_missing_keys(tmp_path):
+    profile = _attachment_files(tmp_path)
+    entry = profile["simulation"]["mujoco"]["attachments"][0]
+    with_missing = {
+        **profile,
+        "simulation": {
+            "mujoco": {
+                **profile["simulation"]["mujoco"],
+                "attachments": [{k: v for k, v in entry.items() if k != "root_body"}],
+            }
+        },
+    }
+    with pytest.raises(RuntimeError, match="missing required keys.*root_body"):
+        render_robot_mjcf(with_missing, urdf=ATTACHMENT_URDF)
+    with_unknown = {
+        **profile,
+        "simulation": {"mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**entry, "scale": 2}]}},
+    }
+    with pytest.raises(RuntimeError, match="unknown keys.*scale"):
+        render_robot_mjcf(with_unknown, urdf=ATTACHMENT_URDF)
+    duplicated = {
+        **profile,
+        "simulation": {"mujoco": {**profile["simulation"]["mujoco"], "attachments": [entry, entry]}},
+    }
+    with pytest.raises(RuntimeError, match="duplicate attachment name"):
+        render_robot_mjcf(duplicated, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "arm_replacement, message",
+    [
+        ('eulerseq="ZXYZ"', "angle.*incompatible|eulerseq.*incompatible"),
+        ('angle="degree"', "incompatible"),
+        (
+            '<compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian" texturedir="/tmp"/>',
+            "unsupported attributes.*texturedir",
+        ),
+    ],
+)
+def test_attachment_compiler_incompatibilities_fail_closed(tmp_path, arm_replacement, message):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    if arm_replacement.startswith("eulerseq") or arm_replacement.startswith("angle"):
+        arm.write_text(ATTACHMENT_ARM.replace('eulerseq="XYZ" angle="radian"', arm_replacement), encoding="utf-8")
+    else:
+        arm.write_text(
+            ATTACHMENT_ARM.replace(
+                '<compiler meshdir="{{MESHES_DIR}}" eulerseq="XYZ" angle="radian"/>', arm_replacement
+            ),
+            encoding="utf-8",
+        )
+    with pytest.raises(RuntimeError, match=message):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "asset_replacement",
+    [
+        '<texture name="tex" type="2d" builtin="checker"/>',
+        '<hfield name="hf" size="0 0 1 1 0.1"/>',
+    ],
+)
+def test_attachment_unsupported_asset_kinds_fail_closed(tmp_path, asset_replacement):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(
+        ATTACHMENT_ARM.replace('<mesh name="arm_base_mesh" file="arm_base.stl"/>', asset_replacement), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="unsupported asset kind"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_unnamed_default_content_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    # a default-attribute element directly under the main <default>
+    arm.write_text(
+        ATTACHMENT_ARM.replace(
+            '<default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>',
+            '<default class="visual"><geom contype="0" conaffinity="0" group="1" material="mat_arm"/></default>\n    <geom rgba="1 0 0 1"/>',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="only named <default class> containers"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    # attributes on the main <default> itself
+    arm.write_text(ATTACHMENT_ARM.replace("<default>\n", '<default margin="0.01">\n', 1), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="main <default> carries attributes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_default_class_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    # renaming visual -> arm_visual collides with a host class of that name
+    host = tmp_path / "host.xml.template"
+    host.write_text(
+        ATTACHMENT_HOST.replace(
+            '<default class="wheel">',
+            '<default class="arm_visual">\n        <geom type="sphere" condim="1"/>\n      </default>\n      <default class="wheel">',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="prefixed default classes.*arm_visual"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+@pytest.mark.parametrize(
+    "arm_replacement, kind, clash_name",
+    [
+        ('<body name="left_wheel" pos="0 0 0"/>', "body", "left_wheel"),
+        ('<joint name="wheel_7" type="hinge" axis="0 0 1"/>', "joint", "wheel_7"),
+        ('<geom name="wheel_7" type="box" size="0.01 0.01 0.01"/>', "geom", "wheel_7"),
+        ('<site name="host_site" pos="0 0 0"/>', "site", "host_site"),
+        ('<camera name="host_cam" pos="0 0 0"/>', "camera", "host_cam"),
+    ],
+)
+def test_attachment_worldbody_name_clashes_fail_closed(tmp_path, arm_replacement, kind, clash_name):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(
+        ATTACHMENT_ARM.replace(
+            '<body name="gripper" pos="0 0 0.1">',
+            f'{arm_replacement}\n      <body name="gripper" pos="0 0 0.1">',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=f"{kind} '{clash_name}' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_actuator_name_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM.replace('<position name="1"', '<position name="wheel_7"'), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="actuator 'wheel_7' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_asset_name_clash_fails_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    arm = tmp_path / "arm.xml.template"
+    arm.write_text(ATTACHMENT_ARM.replace('name="arm_base_mesh"', 'name="host_mesh"'), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="mesh 'host_mesh' clashes"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_chain_rejects_non_fixed_joints_and_missing_links(tmp_path):
+    profile = _attachment_files(tmp_path)
+    revolute = ATTACHMENT_URDF.replace(
+        '<joint name="base_joint" type="fixed">', '<joint name="base_joint" type="revolute">'
+    ).replace(
+        '</joint>\n  <joint name="1"',
+        '<axis xyz="0 0 1"/><limit effort="1" velocity="1"/></joint>\n  <joint name="1"',
+        1,
+    )
+    with pytest.raises(RuntimeError, match="non-fixed joint 'base_joint'"):
+        render_robot_mjcf(profile, urdf=revolute)
+    # a chain target the description does not declare fails naming it
+    attachment = dict(profile["simulation"]["mujoco"]["attachments"][0])
+    missing = {
+        **profile,
+        "simulation": {
+            "mujoco": {
+                **profile["simulation"]["mujoco"],
+                "attachments": [{**attachment, "urdf_child_link": "missing_link"}],
+            }
+        },
+    }
+    with pytest.raises(RuntimeError, match="link 'missing_link' has no parent joint"):
+        render_robot_mjcf(missing, urdf=ATTACHMENT_URDF)
+
+
+def test_attachment_missing_parent_and_root_bodies_fail_closed(tmp_path):
+    profile = _attachment_files(tmp_path)
+    attachment = dict(profile["simulation"]["mujoco"]["attachments"][0])
+    profile = {
+        **profile,
+        "simulation": {
+            "mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**attachment, "parent_body": "nope"}]}
+        },
+    }
+    with pytest.raises(RuntimeError, match="parent body 'nope' not found"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    profile = {
+        **profile,
+        "simulation": {
+            "mujoco": {**profile["simulation"]["mujoco"], "attachments": [{**attachment, "root_body": "nope"}]}
+        },
+    }
+    with pytest.raises(RuntimeError, match="root body 'nope' not found"):
+        render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+
+
+def test_profiles_without_attachments_render_identically_with_the_urdf_argument(tmp_path):
+    """Callers without attachments are unchanged (D2: byte-identical output)."""
+    template = tmp_path / "robot.xml.template"
+    template.write_text(MJCF_TEMPLATE.replace('name="base"', 'name="base_link"'), encoding="utf-8")
+    profile = {
+        "simulation": {"mujoco": {"template": str(template), "meshes_dir": str(tmp_path)}},
+        "peripherals": [_mid360()],
+    }
+    plain = render_robot_mjcf(profile)
+    with_urdf = render_robot_mjcf(profile, urdf=ATTACHMENT_URDF)
+    assert Path(plain).read_text() == Path(with_urdf).read_text()
+
+
+def test_render_mujoco_description_sets_initial_values_from_reset_positions(tmp_path, monkeypatch):
+    """D4: the MuJoCo URDF carries the same initial_value (mujoco_ros2_control's
+    set_initial_pose reads it for qpos AND the actuators' ctrl)."""
+    profile = {**_profile(tmp_path, peripherals=[]), "hardware": {"reset_positions": {"1": 1.25}}}
+    monkeypatch.setattr("robot_runtime.mujoco.check_simulator_versions", lambda: None)
+    composed = tmp_path / "composed.mjb"
+    composed.write_bytes(b"")
+    monkeypatch.setattr("sim_models.scene_compiler.compose_mujoco_model", lambda *_a, **_k: composed)
+    urdf = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    assert '<param name="initial_value">1.25</param>' in urdf
+    assert urdf.count('name="initial_value"') == 1
+    # the composed model path replaced the placeholder exactly once (D2 render
+    # order: one xacro render, the path substituted into the same document)
+    assert "__ibrobot_mujoco_model_placeholder__" not in urdf
+    assert str(composed) in urdf
+    # without reset_positions the render carries no initial_value
+    plain = render_mujoco_description(_profile(tmp_path, peripherals=[]), tmp_path / "profile.yaml")
+    assert 'name="initial_value"' not in plain
+
+
+def test_render_robot_mjcf_skips_platform_excluded_peripherals(tmp_path):
+    """D3: a camera excluded on the MuJoCo platform is not injected into the
+    robot MJCF even though it stays enabled in the inventory."""
+    from robot_runtime.interface_description import platform_peripherals
+
+    excluded = {**WRIST, "simulation": {"mujoco": {"enabled": False}}}
+    peripherals = platform_peripherals([WRIST, excluded], "mujoco")
+    # the duplicate-free inventory keeps one wrist: the exclusion filters the
+    # entry that declares it; assert on distinct names instead
+    names = [entry["name"] for entry in peripherals]
+    assert names.count("wrist") == 1
+    profile = {
+        **_profile(tmp_path, peripherals=[]),
+        "peripherals": [{**WRIST, "simulation": {"mujoco": {"enabled": False}}}, TOP],
+    }
+    out = render_robot_mjcf(profile)
+    cameras = [camera.get("name") for camera in ET.parse(out).getroot().iter("camera")]
+    assert cameras == ["top_camera"]  # the excluded wrist is not injected

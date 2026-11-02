@@ -32,6 +32,7 @@ from robot_config.utils import (
     resolve_calibration_source_specs_from_config,
     resolve_ros_path,
 )
+from robot_runtime import contract as C
 
 logger = get_colored_logger("robot_config.teleop")
 
@@ -68,7 +69,9 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
-def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = None) -> list[Node]:
+def generate_teleop_nodes(
+    robot_config: dict, robot_description_dict: dict = None, use_sim_time: bool | None = None
+) -> list[Node]:
     """
     Generate teleoperation nodes based on robot configuration.
 
@@ -84,6 +87,9 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     Args:
         robot_config: Robot configuration dictionary loaded from YAML
         robot_description_dict: Dictionary containing robot_description (URDF)
+        use_sim_time: Whether the generated application-side nodes must follow
+            /clock (simulated time). When None (the default), it falls back to
+            ``robot_description_dict.get("use_sim_time")``.
 
     Returns:
         List of Node actions for teleoperation
@@ -119,7 +125,12 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         return nodes
 
     if (robot_config.get("runtime") or {}).get("provider"):
-        return _generate_public_teleop_nodes(robot_config)
+        base_device = _active_base_drive_device(teleop_config)
+        if base_device is not None:
+            return _generate_provider_base_drive_nodes(robot_config, base_device)
+        return _generate_public_teleop_nodes(
+            robot_config, use_sim_time=_effective_use_sim_time(robot_description_dict, use_sim_time)
+        )
 
     validation_errors = validate_teleop_config(
         teleop_config,
@@ -758,7 +769,97 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
 # ---------------------------------------------------------------------------
 
 
-def _generate_public_teleop_nodes(config):
+_BASE_AXES = {"linear-x": "max_vx", "linear-y": "max_vy", "angular-z": "max_wz"}
+
+
+def _active_base_drive_device(teleop: dict) -> dict | None:
+    """The active device when it is a base gamepad (``joy_teleop``), else None."""
+    name = teleop.get("active_device", "")
+    for device in teleop.get("devices") or []:
+        if device.get("name") == name and device.get("type") == "joy_teleop":
+            return device
+    return None
+
+
+def validate_provider_base_drive(joy_config: dict, base_interface: dict) -> list[str]:
+    """Check a joy_teleop base mapping against the runtime's bound ``base.cmd_vel``.
+
+    The gamepad must publish the runtime's base channel with its message type,
+    keep a deadman, and its axis scales must stay inside the limits the runtime
+    publishes; the runtime would otherwise clamp them silently. Service
+    commands may only call the runtime stop contract.
+    """
+    errors = []
+    commands = (joy_config.get("joy_teleop") or {}).get("ros__parameters") or {}
+    drives = {name: cmd for name, cmd in commands.items() if isinstance(cmd, dict) and cmd.get("type") == "topic"}
+    if len(drives) != 1:
+        return [f"base gamepad must declare exactly one topic command, found {sorted(drives)}"]
+    ((name, drive),) = drives.items()
+    if drive.get("topic_name") != base_interface["endpoint"]:
+        errors.append(
+            f"{name}.topic_name {drive.get('topic_name')!r} must be the runtime base channel "
+            f"{base_interface['endpoint']!r}"
+        )
+    if drive.get("interface_type") != base_interface["message_type"]:
+        errors.append(f"{name}.interface_type must be {base_interface['message_type']!r}")
+    if not drive.get("deadman_buttons") and not drive.get("deadman_axes"):
+        errors.append(f"{name} must declare a deadman")
+    limits = base_interface.get("limits") or {}
+    for axis, mapping in (drive.get("axis_mappings") or {}).items():
+        limit_key = _BASE_AXES.get(axis)
+        if limit_key is None:
+            errors.append(f"{name}.axis_mappings.{axis} is not a base velocity axis")
+            continue
+        scale = abs(float(mapping.get("scale", 0.0))) + abs(float(mapping.get("offset", 0.0)))
+        limit = limits.get(limit_key)
+        if limit is None:
+            errors.append(f"runtime base.cmd_vel publishes no {limit_key} limit for {name}.axis_mappings.{axis}")
+        elif scale > float(limit):
+            errors.append(f"{name}.axis_mappings.{axis} scale {scale} exceeds the runtime limit {limit_key}={limit}")
+    for other, cmd in commands.items():
+        if (
+            isinstance(cmd, dict)
+            and cmd.get("type") == "service"
+            and (
+                cmd.get("service_name") != C.STOP_SERVICE or cmd.get("interface_type") != "ibrobot_msgs/srv/StopRuntime"
+            )
+        ):
+            errors.append(f"{other} may only call the runtime stop contract {C.STOP_SERVICE}")
+    return errors
+
+
+def _generate_provider_base_drive_nodes(config: dict, device: dict) -> list[Node]:
+    """Base gamepad for a provider-bound robot: joy_teleop on the runtime base channel."""
+    import yaml
+
+    if not device.get("config_path"):
+        raise ConfigError("joy_teleop device requires 'config_path'")
+    interfaces = ((config.get("runtime") or {}).get("interface_description") or {}).get("interfaces") or {}
+    base_interface = interfaces.get("base.cmd_vel")
+    if base_interface is None:
+        raise ConfigError("base gamepad requires the runtime to declare base.cmd_vel")
+    with open(resolve_ros_path(device["config_path"]), encoding="utf-8") as handle:
+        joy_config = yaml.safe_load(handle) or {}
+    errors = validate_provider_base_drive(joy_config, base_interface)
+    if errors:
+        raise ConfigError("Invalid base gamepad configuration: " + "; ".join(errors))
+    return _create_joy_teleop_nodes(device)
+
+
+def _effective_use_sim_time(robot_description_dict: dict | None, use_sim_time: bool | None) -> bool:
+    """Resolve whether the generated application-side nodes must follow /clock.
+
+    The explicit argument wins (the launch context passes its prepared
+    ``node_use_sim_time`` — simulation with a backend that publishes /clock,
+    e.g. MuJoCo or Gazebo); without it, fall back to the description layer's
+    parameter dict, which carries ``use_sim_time`` in simulation.
+    """
+    if use_sim_time is not None:
+        return bool(use_sim_time)
+    return bool((robot_description_dict or {}).get("use_sim_time", False))
+
+
+def _generate_public_teleop_nodes(config, use_sim_time: bool = False):
     """Input deployment is separate; no robot-specific model or solver is loaded here."""
     import copy
 
@@ -837,6 +938,9 @@ def _generate_public_teleop_nodes(config):
                 ],
             }
         )
+        if use_sim_time:
+            # Sim time keeps the VR server's command stamps on /clock.
+            params["use_sim_time"] = True
         nodes.append(
             Node(package="robot_teleop", executable="vr_teleop", name="vr_teleop", output="screen", parameters=[params])
         )
@@ -852,6 +956,10 @@ def _generate_public_teleop_nodes(config):
         for key in ("latency_warn_s", "diagnostics_period_s", "rearm_timeout_s"):
             if key in device or key in teleop:
                 params[key] = float(device.get(key, teleop.get(key)))
+        if use_sim_time:
+            # The managed freshness windows compare /joint_states and /joy
+            # stamps against this node's clock (issue #197).
+            params["use_sim_time"] = True
         nodes.append(
             Node(
                 package="robot_teleop",
@@ -862,13 +970,19 @@ def _generate_public_teleop_nodes(config):
             )
         )
     if kind == "xbox_controller":
+        joy_params = {"dev": device["input_device"], "autorepeat_rate": 20.0}
+        if use_sim_time:
+            # joy_node stamps /joy with this->now() (its own node clock), so it
+            # must follow /clock in simulation or its stamps fall outside the
+            # teleop node's sim-time freshness window.
+            joy_params["use_sim_time"] = True
         nodes.append(
             Node(
                 package="joy",
                 executable="joy_node",
                 name="joy_node",
                 output="screen",
-                parameters=[{"dev": device["input_device"], "autorepeat_rate": 20.0}],
+                parameters=[joy_params],
                 remappings=[("joy", device["source_topic"])],
             )
         )
@@ -1427,7 +1541,14 @@ def build_teleop(context: LaunchBuildContext) -> BuildResult:
 
     control = context.control_startup
     robot_description = dict(control.robot_description) if control is not None else {}
-    nodes = generate_teleop_nodes(context.robot_config, robot_description)
+    # The provider path leaves control.robot_description empty, so the flag
+    # comes from the context: node_use_sim_time = use_sim AND the backend
+    # publishes /clock (MuJoCo/Gazebo yes, mock SDK transport no).
+    nodes = generate_teleop_nodes(
+        context.robot_config,
+        robot_description,
+        use_sim_time=context.node_use_sim_time,
+    )
     logger.info(f"Prepared {len(nodes)} teleop nodes")
     return BuildResult(actions=list(nodes))
 

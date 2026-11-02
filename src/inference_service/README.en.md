@@ -651,6 +651,39 @@ ACT Ascend, ACT RKNN, Hisilicon, and policy-specific multi-module exporters live
 finish through the shared `inference_manifest` writer. Artifact paths, bindings, and digests are exporter-owned,
 not hand-maintained configuration.
 
+## Serving Models From Another Host (`with_model_services`)
+
+`with_model_services` is a launch argument declared by the `perception_models` launch entry,
+default `true`. It decides whether this host starts the configured
+`perception_services` nodes.
+
+With `false`:
+
+- The launch plan omits `perception_models`; this host starts no model service nodes.
+- The YAML's service configuration is untouched, and callers here keep calling the
+  configured endpoints.
+- Config loading and the live binding validate enabled services by metadata only,
+  reusing `load_inference_manifest_metadata()` (the same load the distributed edge
+  uses): identity, endpoints, deployment names, and the semantic contract still
+  validate, while bundle files and deployment artifacts are not checked on this host.
+  The hosting machine keeps the full check.
+- Contract readers validate by metadata as well: the semantic mapping parameter
+  construction and `load_robot_config()` (the scheduled dispatcher, the recording
+  node) consume endpoints and identities, never the weights. The validation tools
+  (`validate_config.py`) explicitly demand this machine's artifacts.
+
+Prerequisites for the consumer host:
+
+- It must hold every enabled service's bundle directory and its
+  `inference_manifest.json`; weights and deployment artifacts only need to exist on
+  the host that runs the services.
+- Both hosts use the same robot YAML; `bundle_path` resolves per host.
+
+```bash
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/robot.yaml \
+    with_model_services:=false
+```
+
 ## Verification
 
 When running from source, prefer source package paths and disable unrelated external pytest plugins:
@@ -659,7 +692,7 @@ When running from source, prefer source package paths and disable unrelated exte
 source .shrc_local
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONPATH=src/inference_manifest:src/inference_service \
-pytest -q src/inference_service/tests
+pytest -q src/inference_service/test
 ```
 
 Check that removed identifiers have not re-entered active source, configuration, or tests:

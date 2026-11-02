@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 from pathlib import Path
 
@@ -19,7 +18,6 @@ from sensor_msgs.msg import JointState
 from embodied_common.dispatch_binding import (
     copy_binding,
     delegated_executor_identity,
-    delegated_executor_identity_matches,
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
@@ -41,6 +39,7 @@ from manipulation_execution.pick_executor_models import (
     PreparedCandidate,
     RankedCandidate,
 )
+from manipulation_execution.pick_goal import pick_goal_rejection
 from manipulation_execution.providers import (
     GRASP_GEOMETRY_FUNCTIONS,
     WRIST_GUARD_FUNCTIONS,
@@ -172,9 +171,8 @@ class PickExecutorNode(
         wrist_guard_provider = (
             self._config.get("target_gripper", {}).get("ik_orientation_guard", {}).get("wrist_guard_provider")
         )
-        if self._kinematics_backend == "legacy_moveit":
-            grasp_geometry_provider = grasp_geometry_provider or "manipulation_execution.so101_geometry"
-            wrist_guard_provider = wrist_guard_provider or "manipulation_execution.so101_kinematics_guard"
+        # Providers come from configuration only, identically for both
+        # kinematics backends: the generic pipeline carries no robot default.
         self._grasp_geometry = load_provider(
             "target_geometry.grasp_geometry_provider",
             grasp_geometry_provider,
@@ -188,11 +186,8 @@ class PickExecutorNode(
         self._validate_provider_requirements()
         self._mesh_directory: Path | None = None
         if bool(self._target_geometry.get("tabletop_filter", False)):
-            legacy = self._kinematics_backend == "legacy_moveit"
-            mesh_package = str(self._target_geometry.get("mesh_package", "so101_description" if legacy else "") or "")
-            mesh_subdirectory = str(
-                self._target_geometry.get("mesh_directory", "meshes/lerobot/so101" if legacy else "") or ""
-            )
+            mesh_package = str(self._target_geometry.get("mesh_package", "") or "")
+            mesh_subdirectory = str(self._target_geometry.get("mesh_directory", "") or "")
             if not mesh_package or not mesh_subdirectory:
                 raise ValueError(
                     "target_geometry.mesh_package and target_geometry.mesh_directory are required when "
@@ -280,8 +275,15 @@ class PickExecutorNode(
         if self._kinematics_backend == "runtime":
             return ComputeIk, ComputeFk
         # Legacy service definitions remain available only for configurations
-        # explicitly launched through the old MoveIt path.
-        from moveit_msgs.srv import GetPositionFK, GetPositionIK
+        # explicitly launched through the old MoveIt path. moveit_msgs is not a
+        # package dependency: hosts without MoveIt (the X2 Orin) run the runtime
+        # backend only, and a MoveIt bring-up installs it with its motion stack.
+        try:
+            from moveit_msgs.srv import GetPositionFK, GetPositionIK
+        except ImportError as exc:
+            raise RuntimeError(
+                "kinematics_backend 'legacy_moveit' requires moveit_msgs, which is not installed"
+            ) from exc
 
         return GetPositionIK, GetPositionFK
 
@@ -352,50 +354,10 @@ class PickExecutorNode(
         return ik_workers, fk_workers
 
     def _handle_goal(self, goal_request):
-        if not str(goal_request.target_query).strip():
-            return GoalResponse.REJECT
-        if not delegated_executor_identity_matches(goal_request.expected_executor, self._executor_identity):
+        now = self.get_clock().now().nanoseconds / 1_000_000_000
+        if pick_goal_rejection(goal_request, self._executor_identity, now):
             return GoalResponse.REJECT
         dispatch_nonce = str(goal_request.dispatch_binding.dispatch_nonce).strip()
-        if bool(goal_request.supervised_direct) and dispatch_nonce:
-            return GoalResponse.REJECT
-        if not bool(goal_request.supervised_direct) and not dispatch_nonce:
-            return GoalResponse.REJECT
-        binding = goal_request.dispatch_binding
-        budget = binding.task_budget
-        if (
-            binding.schema_version != 1
-            or not str(binding.task_id).strip()
-            or not str(binding.root_task_id).strip()
-            or not binding.expected_registry_epoch
-            or binding.expected_registry_generation <= 0
-            or not binding.expected_registry_digest
-            or budget.schema_version != 1
-        ):
-            return GoalResponse.REJECT
-        started = budget.started_at.sec + budget.started_at.nanosec / 1_000_000_000
-        deadline = budget.deadline.sec + budget.deadline.nanosec / 1_000_000_000
-        timeout_sec = float(goal_request.timeout_sec)
-        now = self.get_clock().now().nanoseconds / 1_000_000_000
-        if (
-            budget.started_at.sec < 0
-            or budget.deadline.sec < 0
-            or not 0 <= budget.started_at.nanosec < 1_000_000_000
-            or not 0 <= budget.deadline.nanosec < 1_000_000_000
-            or not math.isfinite(started)
-            or not math.isfinite(deadline)
-            or deadline <= started
-            or deadline <= now
-            or not math.isfinite(timeout_sec)
-            or timeout_sec <= 0.0
-        ):
-            return GoalResponse.REJECT
-        if int(goal_request.mode) not in {
-            PickObject.Goal.MODE_EXECUTE,
-            PickObject.Goal.MODE_PLAN_ONLY,
-            PickObject.Goal.MODE_OBSERVE_ONLY,
-        }:
-            return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:
                 return GoalResponse.REJECT

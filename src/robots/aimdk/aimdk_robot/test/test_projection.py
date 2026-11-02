@@ -1,7 +1,9 @@
 """Unit tests for the X2 projection rules.
 
 These are the rules that decide what the robot is told to do, so they are
-tested without ROS, without the vendor SDK and without a robot.
+tested without ROS, without the vendor SDK and without a robot. The rules the
+data plane applies at the platform's rate (command payloads, holds, velocity
+limits, joint state aggregation) are tested with it: aimdk_dataplane's gtests.
 """
 
 from __future__ import annotations
@@ -10,122 +12,7 @@ import pytest
 from aimdk_robot import projection
 from aimdk_robot.projection import CommandRejected, LocomotionLimits, ProjectionError
 
-ARM = list(projection.VENDOR_ARM_ORDER)
-HEAD = list(projection.VENDOR_HEAD_ORDER)
-
-
-# --- arm / head -------------------------------------------------------------
-
-
-def test_arm_payload_reorders_into_vendor_index_order():
-    """A profile may declare its own order; the wire order is the vendor's."""
-    reversed_order = list(reversed(ARM))
-    values = [float(index) for index in range(14)]
-    payload = projection.arm_payload(values, channel_joints=reversed_order)
-    assert payload == [float(13 - index) for index in range(14)]
-
-
-def test_arm_payload_identity_when_orders_match():
-    values = [0.1 * index for index in range(14)]
-    assert projection.arm_payload(values, channel_joints=ARM) == pytest.approx(values)
-
-
-def test_arm_payload_rejects_wrong_length():
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.arm_payload([0.0] * 13, channel_joints=ARM)
-    assert excinfo.value.reason == "ARM_COMMAND_LENGTH"
-
-
-def test_arm_payload_rejects_unknown_joint_names():
-    bad = ["not_a_joint"] + ARM[1:]
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.arm_payload([0.0] * 14, channel_joints=bad)
-    assert excinfo.value.reason == "ARM_COMMAND_JOINTS"
-
-
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_commands_are_rejected(value):
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.arm_payload([value] + [0.0] * 13, channel_joints=ARM)
-    assert excinfo.value.reason == "NON_FINITE_COMMAND"
-
-
-def test_head_payload_uses_yaw_then_pitch():
-    payload = projection.head_payload([0.2, 0.1], channel_joints=["head_pitch_joint", "head_yaw_joint"])
-    assert payload == [0.1, 0.2]
-
-
-# --- end effectors ----------------------------------------------------------
-
-
-def test_claw_payload_passes_in_range_values():
-    sub_mode, payload = projection.hand_payload([0.0, 1.0], hand_type="claw")
-    assert sub_mode == projection.HAND_SUB_MODE_CLAW
-    assert payload == [0.0, 1.0]
-
-
-def test_claw_payload_rejects_out_of_range_instead_of_clamping():
-    """Clamping would execute a grasp the caller did not ask for."""
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.claw_payload([1.5, 0.5])
-    assert excinfo.value.reason == "GRIPPER_COMMAND_RANGE"
-    assert "left" in excinfo.value.detail
-
-
-def test_dexterous_joint_payload_requires_both_hands():
-    sub_mode, payload = projection.hand_payload([0.0] * 20, hand_type="dexterous_joint")
-    assert sub_mode == projection.HAND_SUB_MODE_DEXTEROUS_JOINT
-    assert len(payload) == 20
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.dexterous_joint_payload([0.0] * 10)
-    assert excinfo.value.reason == "HAND_COMMAND_LENGTH"
-
-
-def test_gesture_payload_validates_ids_and_openness():
-    sub_mode, payload = projection.hand_payload(
-        [1.0, 0.5, 2.0, 1.0], hand_type="dexterous_gesture", gesture_ids=[0, 1, 2, 3]
-    )
-    assert sub_mode == projection.HAND_SUB_MODE_DEXTEROUS_GESTURE
-    assert payload == [1.0, 0.5, 2.0, 1.0]
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.gesture_payload([9.0, 0.5, 1.0, 0.5], gesture_ids=[0, 1])
-    assert excinfo.value.reason == "HAND_GESTURE_ID"
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.gesture_payload([1.0, 1.5, 1.0, 0.5])
-    assert excinfo.value.reason == "HAND_GESTURE_RANGE"
-
-
-def test_unknown_hand_type_is_a_configuration_error():
-    with pytest.raises(ProjectionError):
-        projection.hand_payload([0.0, 0.0], hand_type="magnetic")
-
-
 # --- locomotion -------------------------------------------------------------
-
-
-def test_twist_below_deadband_becomes_exact_zero():
-    limits = LocomotionLimits()
-    assert projection.twist_to_locomotion(0.001, -0.002, 0.0, limits) == (0.0, 0.0, 0.0)
-
-
-def test_twist_below_platform_minimum_is_rejected_not_raised_to_the_minimum():
-    limits = LocomotionLimits()
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.twist_to_locomotion(0.1, 0.0, 0.0, limits)
-    assert excinfo.value.reason == "VELOCITY_BELOW_MIN"
-    assert "would not move the robot" in excinfo.value.detail
-
-
-def test_twist_above_maximum_is_rejected():
-    limits = LocomotionLimits()
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.twist_to_locomotion(0.0, 0.0, 2.0, limits)
-    assert excinfo.value.reason == "VELOCITY_ABOVE_MAX"
-
-
-def test_twist_in_band_passes_through():
-    limits = LocomotionLimits()
-    assert projection.twist_to_locomotion(0.5, -0.3, 0.4, limits) == (0.5, -0.3, 0.4)
 
 
 def test_locomotion_limits_from_profile():
@@ -143,45 +30,6 @@ def test_stamp_outside_the_window_is_stale():
     assert not projection.is_fresh(100.0, 100.5, 0.2)
     # Stamp 0 means "use receive time" on this platform.
     assert projection.is_fresh(0.0, 100.0, 0.2)
-
-
-# --- state aggregation ------------------------------------------------------
-
-
-def test_aggregate_joint_state_follows_the_public_order():
-    groups = {
-        "arm": [("right_elbow_joint", 1.0, 0.1, 0.2), ("left_elbow_joint", 2.0, 0.0, 0.0)],
-        "hand": [("left_hand", 0.5, 0.0, 0.0)],
-    }
-    names, positions, _velocities, _efforts = projection.aggregate_joint_state(
-        groups, order=["left_elbow_joint", "left_hand", "right_elbow_joint"]
-    )
-    assert names == ["left_elbow_joint", "left_hand", "right_elbow_joint"]
-    assert positions == [2.0, 0.5, 1.0]
-
-
-def test_aggregate_joint_state_omits_absent_joints_instead_of_zero_filling():
-    """A fabricated zero reads downstream as a real measurement."""
-    names, positions, _v, _e = projection.aggregate_joint_state(
-        {"arm": [("left_elbow_joint", 1.0, 0.0, 0.0)]}, order=["left_elbow_joint", "missing_joint"]
-    )
-    assert names == ["left_elbow_joint"]
-    assert positions == [1.0]
-
-
-def test_partition_fresh_separates_quiet_sources_and_treats_silence_as_stale():
-    received = {"arm": 10.0, "hand": 9.4, "never": float("-inf")}
-    fresh, stale = projection.partition_fresh(received, now_s=10.0, window_s=0.5)
-    assert fresh == {"arm"}
-    assert stale == {"hand", "never"}
-
-
-def test_hold_target_requires_every_joint_measured():
-    """A partial measurement is no basis for a fixed-length target vector."""
-    order = ("a", "b")
-    assert projection.hold_target({"g": [("a", 0.1, 0, 0), ("b", 0.2, 0, 0)]}, order=order) == [0.1, 0.2]
-    assert projection.hold_target({"g": [("a", 0.1, 0, 0)]}, order=order) is None
-    assert projection.hold_target({}, order=order) is None
 
 
 # --- modes ------------------------------------------------------------------
@@ -470,53 +318,7 @@ def test_fsm_diagnostic_preserves_the_raw_vendor_value():
     assert projection.fsm_diagnostic(4) == "platform balance controller reported fsm_state=4"
 
 
-def test_platform_speed_envelope_only_tightens_the_profile_ceiling():
-    """The profile is the ceiling; the platform may narrow it, never widen it."""
-    limits = projection.LocomotionLimits()
-    narrow = projection.SpeedEnvelope(mode=1, max_linear_mps=0.4, max_angular_radps=0.3)
-    tightened = limits.with_platform_envelope(narrow)
-    assert tightened.max_linear_mps == 0.4
-    assert tightened.max_angular_radps == 0.3
-    # A wider platform envelope does not raise the profile's ceiling.
-    wide = projection.SpeedEnvelope(mode=3, max_linear_mps=5.0, max_angular_radps=5.0)
-    assert limits.with_platform_envelope(wide).max_linear_mps == limits.max_linear_mps
-    # Minima and dead-band are the profile's alone.
-    assert tightened.min_linear_mps == limits.min_linear_mps
-    assert tightened.deadband == limits.deadband
-
-
-def test_an_unreported_speed_envelope_is_ignored_not_enforced():
-    """All-zero bounds mean "not reported"; enforcing them would refuse everything."""
-    limits = projection.LocomotionLimits()
-    assert limits.with_platform_envelope(None) == limits
-    assert limits.with_platform_envelope(projection.SpeedEnvelope()) == limits
+def test_an_unreported_speed_envelope_is_not_usable():
+    """All-zero bounds mean "not reported": the runtime passes no envelope to the data plane for them."""
     assert not projection.SpeedEnvelope().usable
-
-
-def test_head_targets_outside_the_platform_travel_are_refused_not_clamped():
-    limits = {"head_yaw_joint": 0.38, "head_pitch_joint": 0.35}
-    joints = ["head_yaw_joint", "head_pitch_joint"]
-    assert projection.head_payload([0.3, -0.3], channel_joints=joints, limits=limits) == [0.3, -0.3]
-    with pytest.raises(CommandRejected) as excinfo:
-        projection.head_payload([0.5, 0.0], channel_joints=joints, limits=limits)
-    assert excinfo.value.reason == "HEAD_COMMAND_RANGE"
-    with pytest.raises(CommandRejected):
-        projection.head_payload([0.0, -0.4], channel_joints=joints, limits=limits)
-    # Without declared limits the behaviour is unchanged.
-    assert projection.head_payload([2.0, 2.0], channel_joints=joints) == [2.0, 2.0]
-
-
-# --- holding dexterous hands while the arms stream ---------------------------
-
-
-def test_dexterous_hands_are_held_at_their_measured_pose():
-    """An upper-body command without a fitting hand_pos is dropped whole by the platform, arms included."""
-    left = {f"L_{joint}_joint": float(i) for i, joint in enumerate(projection.DEXTEROUS_JOINT_ORDER)}
-    # An X2 with only a left hand: the right slots exist in the layout but drive nothing.
-    assert projection.dexterous_hold_payload([True, False], [left, {}]) == [float(i) for i in range(10)] + [0.0] * 10
-    # Two hands: each side is held at its own measured pose, left 10 then right 10.
-    right = {f"R_{joint}_joint": 10.0 + i for i, joint in enumerate(projection.DEXTEROUS_JOINT_ORDER)}
-    assert projection.dexterous_hold_payload([True, True], [left, right]) == [float(i) for i in range(20)]
-    left.pop("L_pinky_pip_joint")
-    assert projection.dexterous_hold_payload([True, False], [left, {}]) is None
-    assert projection.dexterous_hold_payload([False, False], [{}, {}]) is None
+    assert projection.SpeedEnvelope(mode=1, max_linear_mps=0.4, max_angular_radps=0.3).usable

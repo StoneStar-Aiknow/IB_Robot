@@ -49,6 +49,7 @@ from robot_config.perception_runtime_config import PerceptionRuntimeConfigError,
 from robot_config.placement_execution_config import validate_placement_execution_config
 from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_config.voice_contract import SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC, SPEAKER_EMBEDDING_OUTPUT_TOPIC
 from robot_runtime import contract as RUNTIME
 
 from .config_path import resolve_robot_config_path
@@ -378,6 +379,37 @@ def _provider_peripheral_entry_errors(peripherals: Any) -> list[str]:
     return errors
 
 
+def _validate_provider_owned_application_fields(robot_config: dict[str, Any], provider: str) -> list[str]:
+    """Reject pre-migration handshake and chassis data under a runtime provider.
+
+    The application half of the LeKiwi migration (openspec
+    lekiwi-application-migration, design A2/A3/A5): the ``motion_mode``
+    controller-switch handshake and the generic ``cmd_vel_bridge`` chassis
+    block are runtime-owned. A configuration bound to a provider must not
+    restate them; every key is named so the migration cannot silently keep a
+    stale copy (which is how ``lekiwi_nav_grasp`` kept its old handshake after
+    binding a provider).
+    """
+    errors: list[str] = []
+    motion_mode = robot_config.get("motion_mode")
+    if isinstance(motion_mode, dict) and motion_mode:
+        replacements = {
+            "manipulation_control_mode": "the stage skill_required_control_mode",
+            "navigation_control_mode": "the stage default_control_mode",
+            "navigation_enabled_on_startup": "navigation.open_gate_on_startup with the launch-time admission step",
+        }
+        for key in sorted(motion_mode):
+            hint = replacements.get(key, "the runtime profile modes and the contract gate names")
+            errors.append(f"motion_mode.{key} is runtime-owned under runtime.provider={provider!r}; use {hint}")
+    navigation = robot_config.get("navigation")
+    if isinstance(navigation, dict) and navigation.get("cmd_vel_bridge"):
+        errors.append(
+            f"navigation.cmd_vel_bridge is runtime-owned under runtime.provider={provider!r}; "
+            "the runtime base node owns cmd_vel projection, wheel odometry and navigation gating"
+        )
+    return errors
+
+
 def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     """Validate the optional ``runtime.provider`` selection (robot-runtime-packaging).
 
@@ -419,6 +451,7 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
+        errors.extend(_validate_provider_owned_application_fields(robot_config, provider))
     else:
         from robot_config.utils import providerless_sim_platform_error
 
@@ -810,20 +843,21 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append(f"motion_mode.{key} must be a control_modes member")
     if len(set(mode_names.values())) != len(mode_names):
         errors.append("motion_mode manipulation and navigation control modes must be distinct")
-    if robot_config.get("nav_stage") == "hybrid":
-        default_mode = str(robot_config.get("default_control_mode", "")).strip()
-        navigation_mode = mode_names.get("navigation_control_mode", "")
-        expected_navigation_enabled = default_mode == navigation_mode
-        if config.get("navigation_enabled_on_startup") is not expected_navigation_enabled:
-            errors.append("hybrid motion_mode.navigation_enabled_on_startup must match default_control_mode")
 
     for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
         _positive_number(config, key, "motion_mode", errors)
     return errors
 
 
-def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
-    """Validate the standalone semantic mapping SSOT contract."""
+def validate_semantic_mapping_config(
+    robot_config: dict[str, Any], *, require_local_model_artifacts: bool = True
+) -> list[str]:
+    """Validate the standalone semantic mapping SSOT contract.
+
+    ``require_local_model_artifacts`` follows ``validate_robot_config_dict``:
+    the non-hosting launch resolves the semantic roles against bundle metadata
+    without demanding the artifacts of services this host does not run.
+    """
     config = robot_config.get("semantic_mapping")
     if config is None:
         return []
@@ -928,7 +962,7 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
             )
     _positive_number(perception, "service_wait_sec", perception_path, errors)
     if mapping_backend == "service":
-        errors.extend(_validate_semantic_service_roles(robot_config, perception))
+        errors.extend(_validate_semantic_service_roles(robot_config, perception, require_local_model_artifacts))
     elif mapping_backend == "embedded" and not bool(perception.get("allow_legacy_embedded", False)):
         errors.append("semantic_mapping.perception.allow_legacy_embedded must be true for the embedded backend")
 
@@ -1084,7 +1118,9 @@ _SEMANTIC_SERVICE_TYPES = {
 _CONSTRUCTION_ROLES = frozenset({"sam2_masks", "ram_plus_tags", "siglip2_image"})
 
 
-def _validate_semantic_service_roles(robot_config: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+def _validate_semantic_service_roles(
+    robot_config: dict[str, Any], perception: dict[str, Any], require_local_model_artifacts: bool
+) -> list[str]:
     errors: list[str] = []
     roles = perception.get("semantic_roles")
     if not isinstance(roles, dict):
@@ -1096,7 +1132,7 @@ def _validate_semantic_service_roles(robot_config: dict[str, Any], perception: d
         _required_string(roles, role, "semantic_mapping.perception.semantic_roles", errors)
 
     try:
-        runtime = parse_perception_runtime_config(robot_config)
+        runtime = parse_perception_runtime_config(robot_config, require_local_artifacts=require_local_model_artifacts)
     except PerceptionRuntimeConfigError:
         return errors
     services = {service.instance_id: service for service in runtime.services}
@@ -1431,6 +1467,14 @@ def _load_robot_section_with_sources(
             reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
         except ValueError as exc:
             raise ValueError(f"{resolved_config_path}:robot.control_modes.{mode_name}.{exc}") from exc
+        # control_modes.<mode>.auto_start (consumed by the action dispatcher's
+        # admission): absent means true; an explicit value must be a boolean.
+        if (
+            isinstance(mode_config, dict)
+            and "auto_start" in mode_config
+            and not isinstance(mode_config["auto_start"], bool)
+        ):
+            raise ValueError(f"{resolved_config_path}:robot.control_modes.{mode_name}.auto_start must be a boolean")
 
     base_ref = robot_data.pop("base_config", None)
     if base_ref is not None:
@@ -1967,6 +2011,7 @@ def load_robot_config_dict(
     nav_stage: str = "",
     materialize_benchmark_transport: bool | None = None,
     defer_interface_binding: bool = False,
+    require_local_model_artifacts: bool = True,
 ) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
@@ -1977,6 +2022,9 @@ def load_robot_config_dict(
     after all launch overrides and the effective runtime target are resolved.
     ``defer_interface_binding`` is only for live launch's structural first phase;
     all normal loaders require an embedded or file-backed description for logical IDs.
+    ``require_local_model_artifacts=False`` is the launch path of a host that
+    leaves the model services to another machine (``with_model_services:=false``):
+    see :func:`validate_robot_config_dict`.
     """
     resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(
         resolve_robot_config_path(config_path=config_path)
@@ -2039,7 +2087,9 @@ def load_robot_config_dict(
     _apply_approved_camera_calibration(robot_config)
     _warn_unbound_serial_cameras(robot_config)
     validate_robot_config_dict(
-        robot_config, deferred_interfaces=defer_interface_binding and bool(required_interface_ids(robot_config))
+        robot_config,
+        deferred_interfaces=defer_interface_binding and bool(required_interface_ids(robot_config)),
+        require_local_model_artifacts=require_local_model_artifacts,
     )
     return robot_config
 
@@ -2116,8 +2166,135 @@ def validate_voice_latency_options(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfaces: bool = False) -> None:
-    """Validate an effective config, including an in-memory launch binding before snapshotting."""
+# SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC and SPEAKER_EMBEDDING_OUTPUT_TOPIC come from
+# robot_config.voice_contract (imported above), which speaker_id_node reads too.
+
+
+def validate_speaker_embedding_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the optional per-utterance voiceprint producer and its consumer.
+
+    The producer is ``voice_asr.speaker_embedding`` (a second node on the voice
+    ASR's own chunk stream) and the consumer is the agent voice bridge's
+    ``speaker_check_enabled``. Both are optional; the pairing is not. A check
+    with no producer would accept every utterance while reading as if it were
+    filtering, which is exactly the failure a reviewer cannot see.
+
+    Key names and file paths are checked by the launch builder that owns the
+    node's parameters; this is the config-level shape and the cross-block rule.
+    """
+    voice_asr = robot_config.get("voice_asr", {})
+    voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
+    config = voice_asr.get("speaker_embedding", {})
+    prefix = "voice_asr.speaker_embedding"
+    if not isinstance(config, dict):
+        return [f"{prefix} must be a mapping"]
+    errors: list[str] = []
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append(f"{prefix}.enabled must be a boolean")
+        enabled = False
+    if enabled and not voice_asr.get("enabled", False):
+        errors.append(f"{prefix}.enabled=true requires voice_asr.enabled=true")
+    for field_name in ("bundle_path", "deployment"):
+        if enabled and not str(config.get(field_name, "")).strip():
+            errors.append(
+                f"{prefix}.{field_name} is required when enabled; the model is a schema-v3 bundle "
+                "provisioned outside the repo, like the ASR bundle"
+            )
+    topic = config.get("output_topic", SPEAKER_EMBEDDING_OUTPUT_TOPIC)
+    if not isinstance(topic, str) or not topic.startswith("/"):
+        errors.append(f"{prefix}.output_topic must be an absolute ROS topic name")
+    for field_name in ("min_speech_seconds", "max_speech_seconds", "idle_timeout_sec"):
+        value = config.get(field_name, 1.0)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            errors.append(f"{prefix}.{field_name} must be finite and positive")
+    floor = config.get("min_speech_seconds", 1.0)
+    ceiling = config.get("max_speech_seconds", 6.0)
+    if isinstance(floor, int | float) and isinstance(ceiling, int | float) and ceiling < floor:
+        errors.append(f"{prefix}.max_speech_seconds must not be below min_speech_seconds")
+    if not isinstance(config.get("exit_on_init_failure", True), bool):
+        errors.append(f"{prefix}.exit_on_init_failure must be a boolean")
+
+    agent = robot_config.get("embodied", {})
+    agent = agent.get("agent", {}) if isinstance(agent, dict) else {}
+    voice_bridge = agent.get("voice_bridge", {}) if isinstance(agent, dict) else {}
+    checking = isinstance(voice_bridge, dict) and voice_bridge.get("speaker_check_enabled") is True
+    if checking and not enabled:
+        errors.append(
+            "embodied.agent.voice_bridge.speaker_check_enabled=true requires "
+            f"{prefix}.enabled=true; nothing would publish the voiceprints to check against"
+        )
+    if checking and enabled:
+        # The bridge holds a compared transcript until its segment's voiceprint
+        # lands, so the voiceprint should be published first. Both producers
+        # finalize on their own idle timeout, and with equal timeouts they fire
+        # on the same stall: every compared transcript would then wait for its
+        # voiceprint, and one that takes longer than measurement_grace_sec is
+        # judged without it (fail-open). Observed on the X2 with both at 2.0 s.
+        voiceprint_idle = config.get("idle_timeout_sec", SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC)
+        asr_idle = voice_asr.get("external_idle_timeout", VoiceASRConfig.external_idle_timeout)
+        comparable = isinstance(voiceprint_idle, int | float) and isinstance(asr_idle, int | float)
+        if comparable and voiceprint_idle >= asr_idle:
+            errors.append(
+                f"{prefix}.idle_timeout_sec ({voiceprint_idle}) must be below "
+                f"voice_asr.external_idle_timeout ({asr_idle}) so the voiceprint of an utterance "
+                "is published before its transcript; otherwise every compared transcript waits for it"
+            )
+    return errors
+
+
+def validate_voice_bridge_segment_inputs(robot_config: dict[str, Any]) -> list[str]:
+    """Validate what the addressee gate needs once it pairs by speech segment.
+
+    The voiceprint check and the ``vendor_session`` trigger pair each transcript
+    with its segment's voiceprint and wake event, so the bridge reads the
+    segment-tagged transcripts (``voice_asr.transcript_topic``), which only an
+    external, segmenting source produces. Under ``vendor_session`` only a wake
+    event opens a session, so without one bound the robot would hear nobody.
+    """
+    embodied = robot_config.get("embodied", {})
+    agent = embodied.get("agent", {}) if isinstance(embodied, dict) else {}
+    voice_bridge = agent.get("voice_bridge") if isinstance(agent, dict) else None
+    if not isinstance(voice_bridge, dict) or voice_bridge.get("enabled") is False:
+        return []
+    prefix = "embodied.agent.voice_bridge"
+    session = voice_bridge.get("addressee_trigger", "wake_phrase") == "vendor_session"
+    pairs_by_segment = session or voice_bridge.get("speaker_check_enabled") is True
+    if not pairs_by_segment:
+        return []
+    errors: list[str] = []
+    voice_asr = robot_config.get("voice_asr", {})
+    voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
+    if voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
+        errors.append(
+            f"{prefix}.speaker_check_enabled and addressee_trigger=vendor_session pair transcripts by speech "
+            "segment and need voice_asr.input_mode=external_vad; only a segmenting source names its segments"
+        )
+    if "input_topic" in voice_bridge:
+        # Read from voice_asr.transcript_topic instead; a copy here would be ignored.
+        errors.append(
+            f"{prefix}.input_topic must not be configured when the gate pairs by segment; "
+            "it follows voice_asr.transcript_topic"
+        )
+    if session and voice_bridge.get("wake_event") is None:
+        errors.append(
+            f"{prefix}.addressee_trigger=vendor_session needs wake_event bound to the runtime's wake event "
+            f"({{interface: audio.wake_event, type: {_WAKE_EVENT_TYPE}}}): only a wake event opens a session"
+        )
+    return errors
+
+
+def validate_robot_config_dict(
+    robot_config: dict[str, Any], *, deferred_interfaces: bool = False, require_local_model_artifacts: bool = True
+) -> None:
+    """Validate an effective config, including an in-memory launch binding before snapshotting.
+
+    ``require_local_model_artifacts=False`` is the launch path of a host that
+    leaves the model services to another machine (``with_model_services:=false``):
+    the perception services still validate their identity, endpoints and
+    semantic contract from bundle metadata, without demanding the weights and
+    deployment artifacts that only the hosting machine holds.
+    """
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_runtime_provider_config(robot_config))
     validation_errors.extend(validate_runtime_owned_audio_config(robot_config))
@@ -2136,12 +2313,16 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
         except ValueError as exc:
             validation_errors.append(str(exc))
     try:
-        parse_perception_runtime_config(robot_config)
+        parse_perception_runtime_config(robot_config, require_local_artifacts=require_local_model_artifacts)
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
-    validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    validation_errors.extend(
+        validate_semantic_mapping_config(robot_config, require_local_model_artifacts=require_local_model_artifacts)
+    )
     validation_errors.extend(validate_speech_direction_config(robot_config))
     validation_errors.extend(validate_voice_latency_options(robot_config))
+    validation_errors.extend(validate_speaker_embedding_config(robot_config))
+    validation_errors.extend(validate_voice_bridge_segment_inputs(robot_config))
     if not deferred_interfaces:
         try:
             validation_errors.extend(validate_robot_config_observation_transports(robot_config))
@@ -2314,6 +2495,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         final_tail_padding_seconds=data.get("final_tail_padding_seconds", defaults.final_tail_padding_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
         output_topic=data.get("output_topic", defaults.output_topic),
+        transcript_topic=data.get("transcript_topic", defaults.transcript_topic),
         sample_rate=data.get("sample_rate", defaults.sample_rate),
         chunk_size=data.get("chunk_size", defaults.chunk_size),
         buffer_seconds=data.get("buffer_seconds", defaults.buffer_seconds),
@@ -2325,6 +2507,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         audio_input=data.get("audio_input", defaults.audio_input),
         external_min_samples=data.get("external_min_samples", defaults.external_min_samples),
         external_idle_timeout=data.get("external_idle_timeout", defaults.external_idle_timeout),
+        external_finalize_on_idle=data.get("external_finalize_on_idle", defaults.external_finalize_on_idle),
     )
 
 
@@ -2499,11 +2682,20 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     )
 
 
-def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
+def load_robot_config(
+    config_path: str | Path | None = None, *, require_local_model_artifacts: bool = False
+) -> RobotConfig:
     """Load robot configuration from YAML file.
 
     Args:
         config_path: Path to robot configuration YAML file
+        require_local_model_artifacts: demand the perception services' weights and
+            deployment artifacts locally. The default ``False`` is the contract-reader
+            semantics of this loader's callers (dispatchers, recorders, viewers read
+            their observation/action contract): identity, endpoints and the semantic
+            contract still validate from bundle metadata, and the weights are the
+            hosting launch's business — its config load and the perception_models
+            builder keep the full artifact check.
 
     Returns:
         RobotConfig object
@@ -2512,7 +2704,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         FileNotFoundError: If config file doesn't exist
         ValueError: If config is invalid
     """
-    robot_data = load_robot_config_dict(config_path)
+    robot_data = load_robot_config_dict(config_path, require_local_model_artifacts=require_local_model_artifacts)
     resolved_config_path = Path(robot_data["_config_path"])
     config_dir = resolved_config_path.parent
 
@@ -2566,7 +2758,9 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         rpc_timeout_sec=embodied.timeouts["rpc_timeout_sec"],
     )
     semantic_mapping = load_semantic_mapping_config(robot_data.get("semantic_mapping", {}))
-    perception_services = parse_perception_runtime_config(robot_data)
+    perception_services = parse_perception_runtime_config(
+        robot_data, require_local_artifacts=require_local_model_artifacts
+    )
 
     return RobotConfig(
         name=name,
@@ -2830,6 +3024,10 @@ def _validate_planner_latency_options(planner: dict[str, Any]) -> list[str]:
     return errors
 
 
+#: What a runtime reports its platform's wake word as (``audio.wake_event`` on the X2).
+_WAKE_EVENT_TYPE = "ibrobot_msgs/msg/SpeechWakeEvent"
+
+
 def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     if voice_bridge is None:
         return []
@@ -2849,7 +3047,7 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         # silently disable realtime stop or muting ASR during TTS.
         if field_name in voice_bridge:
             errors.append(f"{prefix}.{field_name} is fixed by voice_asr_node and must not be configured")
-    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "wake_phrases"):
         value = voice_bridge.get(field_name, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
             errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
@@ -2868,12 +3066,19 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         ):
             # Spoken while the microphone stays open for stop words: the bridge would stop itself.
             errors.append(f"{prefix}.busy_message must not contain a stop phrase")
+    if "wake_phrases" in voice_bridge and not voice_bridge["wake_phrases"]:
+        # An empty list reads like "no wake word needed" but would be a gate
+        # that nothing can open; leaving the key out is how that is expressed.
+        errors.append(f"{prefix}.wake_phrases must not be empty; omit the key to accept every utterance")
     for field_name in (
         "confirm_timeout_sec",
         "session_idle_sec",
         "request_timeout_sec",
         "tts_timeout_sec",
         "resume_settle_sec",
+        "wake_window_sec",
+        "session_gap_sec",
+        "speaker_max_age_sec",
     ):
         value = voice_bridge.get(field_name, 1.0)
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
@@ -2891,9 +3096,63 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     min_text_chars = voice_bridge.get("min_text_chars", 2)
     if isinstance(min_text_chars, bool) or not isinstance(min_text_chars, int) or min_text_chars < 1:
         errors.append(f"{prefix}.min_text_chars must be a positive integer")
-    for field_name in ("speak_replies", "tts_enabled", "mute_asr_during_tts"):
+    for field_name in (
+        "speak_replies",
+        "tts_enabled",
+        "mute_asr_during_tts",
+        "speaker_check_enabled",
+        "speaker_reject_short",
+    ):
         if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
             errors.append(f"{prefix}.{field_name} must be a boolean")
+    similarity = voice_bridge.get("speaker_min_similarity", 0.5)
+    if isinstance(similarity, bool) or not isinstance(similarity, int | float) or not 0 < similarity <= 1:
+        errors.append(f"{prefix}.speaker_min_similarity must be in (0, 1]")
+    margin = voice_bridge.get("speaker_merge_margin", 0.1)
+    if isinstance(margin, bool) or not isinstance(margin, int | float) or not 0 <= margin < 1:
+        errors.append(f"{prefix}.speaker_merge_margin must be in [0, 1)")
+    grace = voice_bridge.get("measurement_grace_sec", 0.4)
+    if isinstance(grace, bool) or not isinstance(grace, int | float) or not math.isfinite(grace) or grace < 0:
+        errors.append(f"{prefix}.measurement_grace_sec must be finite and not negative")
+    if "speaker_embedding_topic" in voice_bridge:
+        # A second copy of voice_asr.speaker_embedding.output_topic: once the two
+        # drift, no voiceprint arrives and the check silently accepts everyone.
+        errors.append(
+            f"{prefix}.speaker_embedding_topic must not be configured; "
+            "it follows voice_asr.speaker_embedding.output_topic"
+        )
+    if "wake_event_topic" in voice_bridge:
+        # The runtime profile owns the endpoint; a topic name here is a second
+        # copy that, once it drifts, silently stops every wake event.
+        errors.append(
+            f"{prefix}.wake_event_topic must not be configured; bind the runtime interface with "
+            f"wake_event: {{interface: audio.wake_event, type: {_WAKE_EVENT_TYPE}}}"
+        )
+    wake_event = voice_bridge.get("wake_event")
+    if wake_event is not None and (
+        not isinstance(wake_event, dict)
+        or not isinstance(wake_event.get("interface"), str)
+        or not wake_event["interface"].strip()
+        or wake_event.get("type") != _WAKE_EVENT_TYPE
+    ):
+        errors.append(f"{prefix}.wake_event must be {{interface: <logical id>, type: {_WAKE_EVENT_TYPE}}}")
+    trigger = voice_bridge.get("addressee_trigger", "wake_phrase")
+    if trigger not in {"wake_phrase", "vendor_session"}:
+        errors.append(f"{prefix}.addressee_trigger must be wake_phrase or vendor_session")
+    if wake_event is not None and trigger != "vendor_session":
+        # The wake word is already in the text under wake_phrase; a second
+        # source of the same fact could only disagree with it.
+        errors.append(f"{prefix}.wake_event only applies to addressee_trigger=vendor_session")
+    if trigger == "vendor_session" and voice_bridge.get("wake_phrases"):
+        # Two judgements of the same thing: under vendor_session the source
+        # consumes its wake word, so a phrase list rejects every utterance.
+        errors.append(f"{prefix}.addressee_trigger=vendor_session must not set wake_phrases")
+    gate_is_on = trigger == "vendor_session" or bool(voice_bridge.get("wake_phrases"))
+    if voice_bridge.get("speaker_check_enabled") is True and not gate_is_on:
+        # The anchor is only ever captured from the utterance that proves
+        # itself. With the gate off nothing captures one and the check would
+        # silently accept every utterance.
+        errors.append(f"{prefix}.speaker_check_enabled requires an enabled gate: set wake_phrases or addressee_trigger")
     return errors
 
 
@@ -2960,10 +3219,13 @@ def validate_config(config: RobotConfig) -> list[str]:
                 "(the segmented audio stream is provided by the robot runtime; audio_io.source was removed)"
             )
         if config.voice_asr.input_mode == "external_vad":
-            for name in ("chunk_topic",):
+            for name in ("chunk_topic", "transcript_topic"):
                 value = getattr(config.voice_asr, name)
                 if value and not value.startswith("/"):
                     errors.append(f"voice_asr.{name} must be an absolute ROS topic name")
+        if not isinstance(config.voice_asr.external_finalize_on_idle, bool):
+            # The launch builder passes it on as a bool: the string "false" would turn it on.
+            errors.append("voice_asr.external_finalize_on_idle must be a boolean")
     if config.audio_io.enabled:
         for name in (
             "capture_topic",
@@ -3117,6 +3379,9 @@ def validate_config(config: RobotConfig) -> list[str]:
     }
     errors.extend(
         validate_semantic_mapping_config(
+            # Re-validation of an already loaded object: the roles, service types
+            # and identities are what matters here. Whether the artifacts exist
+            # locally was decided by the load that produced this config.
             {
                 "semantic_mapping": semantic_mapping_dict,
                 "perception_services": {
@@ -3152,7 +3417,8 @@ def validate_config(config: RobotConfig) -> list[str]:
                     }
                     for peripheral in config.peripherals
                 ],
-            }
+            },
+            require_local_model_artifacts=False,
         )
     )
 
@@ -3392,7 +3658,9 @@ def validate_config_file(config_path: str | Path) -> bool:
         True if valid, False otherwise
     """
     try:
-        config = load_robot_config(config_path)
+        # A validation tool answers for the machine it runs on: keep demanding
+        # the configured artifacts here, unlike the contract-reader default.
+        config = load_robot_config(config_path, require_local_model_artifacts=True)
         errors = validate_config(config)
 
         if errors:

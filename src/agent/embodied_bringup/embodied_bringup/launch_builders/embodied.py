@@ -25,10 +25,62 @@ from robot_config.loader import (
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
+from robot_config.voice_contract import SPEAKER_EMBEDDING_OUTPUT_TOPIC, VOICE_TRANSCRIPT_TOPIC
 from robot_runtime import contract as RUNTIME
 from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup")
+
+
+def delegated_grasp_execution(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """``grasp_execution`` as both the Gateway and the pick executor receive it.
+
+    Both hash it into the executor identity, so both are built from the robot
+    configuration by this one function.
+    """
+    grasp_execution = robot_config.get("grasp_execution", {})
+    placement_execution = robot_config.get("placement_execution", {})
+    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
+        motion = placement_execution.get("motion", {})
+        if isinstance(motion, dict):
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["post_grasp_motion"] = {
+                "pose_name": motion.get("place_pose", "place_container"),
+                "joint_names": motion.get("place_joint_names", []),
+                "joint_positions": motion.get("place_joint_positions", {}),
+                "duration_sec": motion.get("place_duration_sec", 5.0),
+                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
+            }
+    return grasp_execution
+
+
+def runs_grasp_pipeline(robot_config: dict[str, Any]) -> bool:
+    """Whether the robot names grasp backends: it then picks with the robot-agnostic grasp pipeline."""
+    grasp_execution = robot_config.get("grasp_execution", {})
+    return bool(grasp_execution.get("enabled", False) and grasp_execution.get("backend"))
+
+
+def _bound_description(robot_config: dict[str, Any]) -> dict[str, Any]:
+    runtime = robot_config.get("runtime", {})
+    return runtime.get("interface_description", {}) if runtime.get("provider") else {}
+
+
+def grasp_pipeline_node(robot_config: dict[str, Any]) -> Node:
+    """The grasp pipeline's pick executor, bound to the robot's live interface description."""
+    grasp_execution = delegated_grasp_execution(robot_config)
+    return Node(
+        package="manipulation_execution",
+        executable="grasp_pipeline_node",
+        name="grasp_pipeline_node",
+        output="screen",
+        parameters=[
+            {
+                "action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
+                "grasp_execution_json": json.dumps(grasp_execution),
+                "interface_description_json": json.dumps(_bound_description(robot_config)),
+            }
+        ],
+    )
 
 
 def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
@@ -155,20 +207,9 @@ def generate_embodied_nodes(
         return interface["endpoint"]
 
     perception = embodied_config.get("perception", {})
-    grasp_execution = robot_config.get("grasp_execution", {})
+    grasp_execution = delegated_grasp_execution(robot_config)
     placement_execution = robot_config.get("placement_execution", {})
     semantic_mapping = robot_config.get("semantic_mapping", {})
-    if isinstance(grasp_execution, dict) and isinstance(placement_execution, dict):
-        motion = placement_execution.get("motion", {})
-        if isinstance(motion, dict):
-            grasp_execution = dict(grasp_execution)
-            grasp_execution["post_grasp_motion"] = {
-                "pose_name": motion.get("place_pose", "place_container"),
-                "joint_names": motion.get("place_joint_names", []),
-                "joint_positions": motion.get("place_joint_positions", {}),
-                "duration_sec": motion.get("place_duration_sec", 5.0),
-                "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
-            }
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
@@ -225,11 +266,11 @@ def generate_embodied_nodes(
         "active_control_mode": active_control_mode,
         "skill_required_control_mode": robot_config.get("skill_required_control_mode", ""),
         "supported_control_modes_json": json.dumps(list(supported_control_modes)),
-        "motion_mode_service": str(
-            robot_config.get("motion_mode", {}).get(
-                "set_navigation_enabled_service", "motion_mode/set_navigation_enabled"
-            )
-        ),
+        # The navigation gate service is a contract name owned by the runtime:
+        # the pre-migration motion_mode key is rejected under a provider, and
+        # its relative default only coincided with the contract name in the
+        # root namespace (openspec lekiwi-application-migration A3).
+        "motion_mode_service": RUNTIME.NAVIGATION_ENABLE_SERVICE,
         "skill_gateway_status_service": embodied_config.get(
             "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
         ),
@@ -649,7 +690,12 @@ def generate_embodied_nodes(
     elif include_perception and perception_node is not None:
         # Preserve the legacy perception placement in the controller-gated motion closure.
         nodes.append(perception_node)
-    if grasp_execution.get("enabled", False):
+    if runs_grasp_pipeline(robot_config):
+        # A robot that names grasp backends runs the robot-agnostic grasp pipeline;
+        # the primitive executor and its GraspGen planner and gripper verifier are
+        # for robots without one.
+        nodes.append(grasp_pipeline_node(robot_config))
+    elif grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
         planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
         for field in ("local_manifest_path", "ascend_local_manifest_path"):
@@ -829,7 +875,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     }
     # /voice_partial, /voice_status and /voice_control are fixed by voice_asr_node; the bridge keeps
     # its own defaults for them and the loader rejects YAML overrides that could only break them.
-    for field_name in ("confirm_mode", "busy_message"):
+    for field_name in ("confirm_mode", "busy_message", "addressee_trigger"):
         if field_name in voice_bridge:
             params[field_name] = str(voice_bridge[field_name])
     for field_name in (
@@ -838,15 +884,47 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "request_timeout_sec",
         "tts_timeout_sec",
         "resume_settle_sec",
+        "wake_window_sec",
+        "session_gap_sec",
+        "speaker_min_similarity",
+        "speaker_max_age_sec",
+        "speaker_merge_margin",
+        "measurement_grace_sec",
     ):
         if field_name in voice_bridge:
             params[field_name] = float(voice_bridge[field_name])
     if "min_text_chars" in voice_bridge:
         params["min_text_chars"] = int(voice_bridge["min_text_chars"])
-    for field_name in ("speak_replies", "mute_asr_during_tts"):
+    pairs_by_segment = (
+        voice_bridge.get("speaker_check_enabled") is True or voice_bridge.get("addressee_trigger") == "vendor_session"
+    )
+    if pairs_by_segment:
+        # The gate pairs each transcript with its segment's voiceprint and wake
+        # event, so the bridge reads the segment-tagged copy the ASR publishes;
+        # one source of truth, as for input_topic.
+        params["transcript_topic"] = str(voice_asr.get("transcript_topic", VOICE_TRANSCRIPT_TOPIC))
+    if voice_bridge.get("speaker_check_enabled") is True:
+        # The bridge listens wherever speaker_id_node publishes; one source of truth.
+        speaker_embedding = voice_asr.get("speaker_embedding") or {}
+        params["speaker_embedding_topic"] = str(speaker_embedding.get("output_topic", SPEAKER_EMBEDDING_OUTPUT_TOPIC))
+    wake_event = voice_bridge.get("wake_event")
+    if wake_event is not None:
+        # Bound from the runtime description like voice_asr.audio_input; the
+        # endpoint is the runtime profile's, never a copy written here.
+        if not isinstance(wake_event, dict) or not wake_event.get("_interface_source"):
+            raise ValueError(
+                "embodied.agent.voice_bridge.wake_event must be bound to a runtime description before launch"
+            )
+        params["wake_event_topic"] = str(wake_event["topic"])
+    for field_name in (
+        "speak_replies",
+        "mute_asr_during_tts",
+        "speaker_check_enabled",
+        "speaker_reject_short",
+    ):
         if field_name in voice_bridge:
             params[field_name] = bool(voice_bridge[field_name])
-    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases"):
+    for field_name in ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "wake_phrases"):
         if field_name in voice_bridge:
             params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)
     if "text_corrections" in voice_bridge:

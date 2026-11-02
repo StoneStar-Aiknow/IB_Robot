@@ -32,6 +32,9 @@ external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消
 X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
 profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
 在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
+`aimdk_x2_voice_addressee.yaml` 再叠加语音 Agent 与寻址门控（声纹校验、`audio.wake_event` 唤醒事件、
+`external_finalize_on_idle`），参数为 2026-10-24 至 10-27 真机测试所用值；声纹模型与 X-ASR 一样
+是仓库外提供的 schema-v3 bundle（`voice_asr.speaker_embedding.bundle_path` / `.deployment`）。
 `audio_io.source` 已删除（runtime-owned-audio-io）：设置 `runtime.provider` 的部署音频设备由 runtime
 拥有——`peripherals` 中的 `microphone`/`speaker` 由机器人 runtime 启动同一组 ALSA 节点，并投影为带格式
 元数据的 `audio.capture` / `audio.play` 接口；voice_asr（流式）、speech_direction、voice_tts 通过
@@ -299,6 +302,21 @@ bringup）时缺失键回落到 `absent_fallback`。两者刻意不同（`robot_
 `with_moveit`），所有权只决定由谁声明。与核心表或其他业务贡献重名在 `compose_argument_specs`
 聚合时拒绝，发生在任何副作用阶段之前。
 
+### 绑定另一台主机上的运行时（Python API）
+
+`generate_bound_runtime_actions()` 等待 runtime 描述并构造消费者，默认同时启动本机的 runtime
+provider。`start_provider=False` 表示 runtime 已由另一台主机运行：launch 只等待其就绪并绑定接口
+描述，不再启动第二个 runtime。`runtime_ready_waiter()` 单独导出该等待节点，两条路径共用同一个
+等待器。
+
+使用约束：
+
+- 这两个参数属于 Python API（`robot_config.launch_builders.runtime`）。它们不是通用的
+  launch CLI 参数。
+- 需要跨主机绑定的入口在自己的 launch 文件中调用该 API，并传入 `start_provider=False`。
+- 等待节点要求 `robot.runtime.provider` 已配置。provider 缺失时启动失败。
+- 就绪失败或超时按返回码结束启动，消费者不会启动。
+
 ### 通用模型服务 SSOT
 
 模型服务使用顶层 `perception_services`，不属于具体消费者。每个 enabled entry 必须显式选择 manifest 中的命名
@@ -331,6 +349,17 @@ service entry 由消费功能自行注册。
 精确 service type、required/optional policy、manifest semantic identity，以及 SigLIP image/text embedding
 metadata 兼容性；通用 parser 仍不维护模型 family 词表。有效 role bindings、service declarations、deployment
 fingerprint 和 semantic identity fingerprint 共同生成与路径和列表顺序无关的正 63-bit configuration generation。
+
+`with_model_services` launch 参数（`inference_service` 的 `perception_models` 条目声明，默认 `true`）
+决定本机是否启动这些服务节点。参数为 `false` 时，配置加载和 live binding 按元数据校验
+enabled service。身份、endpoint、deployment 名称和语义契约照常校验。bundle 文件和
+deployment artifacts 只在托管主机校验。
+
+消费端主机只需要每个 enabled service 的 bundle 目录和 `inference_manifest.json`，
+不需要权重文件。semantic mapping 的参数构造与 `load_robot_config()` 的契约读取同样
+按元数据校验。scheduled dispatcher 和 recording node 这类消费者只读取自己的契约。
+验证配置的工具显式要求本机 artifacts。详见
+[inference_service README](../inference_service/README.md)。
 
 ## Sim camera pose override（仅限仿真标定，opt-in）
 
@@ -668,25 +697,47 @@ moveit:
 `pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
 清空硬件心跳话题，只保留关节与 TF 屏障。
 
-LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令授权 SSOT：
+### LeKiwi 配置与底盘门控
 
-```yaml
-motion_mode:
-  enabled: true
-  navigation_enabled_on_startup: false
-  navigation_enabled_topic: motion_mode/navigation_enabled
-  navigation_mode_ack_topic: motion_mode/base_navigation_enabled
-  set_navigation_enabled_service: motion_mode/set_navigation_enabled
-  manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
-  navigation_controllers: [base_velocity_controller]
-  manipulation_control_mode: moveit_planning
-  navigation_control_mode: base_navigation
-  transition_timeout_s: 2.0
-```
+LeKiwi 的底盘与机械臂由 `lekiwi_robot` runtime 负责（`runtime.provider: lekiwi_robot`）。受支持的
+LeKiwi 配置及其状态：
 
-默认抓取模式激活机械臂/夹爪控制器并把底盘控制器保持 inactive。任务切换只调用上述服务；
-MoveIt Gateway 按顺序停止当前运动域、切换 controller manager 中的 active/inactive 控制器集合，并等待
-底盘 bridge 的零速确认。硬件节点不重启，且 1～6 轴与 7～9 轴始终互斥。
+| 配置 | 状态 | 说明 |
+|---|---|---|
+| `lekiwi_lidar` | 受支持（runtime provider，profile `lekiwi_lidar`） | MID-360 建图/导航，纯底盘 |
+| `lekiwi_nav_grasp` | 受支持（runtime provider，profile `lekiwi_nav_grasp`） | 移动抓取 + 导航 + hybrid |
+| `lekiwi_hybrid_switch_test`、`lekiwi_nav_grasp_sound_real` | 受支持（经 `base_config: lekiwi_nav_grasp` 继承） | overlay |
+| `lekiwi_sensor_calib` | 受支持（runtime provider） | `lekiwi_calibration` 工作流启动它 |
+| `lekiwi_handeye_realsense_grasp`、`lekiwi_handeye_realsense_grasp_pc` | 不支持（底盘已关闭，仅保留供测试加载） | 改用 `lekiwi_nav_grasp` 的 `grasp` stage |
+| `lekiwi_realsense_mapping`、`lekiwi_realsense_navigation`、`lekiwi_semantic_capture` | 不支持（底盘已关闭） | 改用 `lekiwi_lidar` / `lekiwi_nav_grasp` 的对应 stage |
+| `lekiwi_rtp_distributed` | 不支持（动作空间未迁移） | 底盘动作直写轮速控制器、绕过 runtime 门控；runtime 底盘动作契约由后续变更定义 |
+| `lekiwi` | 不可启动，刻意保留 | 缺少 `sts_hardware_interface` 插件与驱动；仍是 `sim_controllers`、EKF 导航块和 `imu_sensor_broadcaster` 的唯一测试夹具 |
+
+绑定 runtime provider 的配置不再声明 `motion_mode`、`ros2_control`、`navigation.cmd_vel_bridge` 或
+`navigation_enabled_on_startup`；加载时出现这些字段会报错并指出字段名和替代来源。底盘通过 runtime 的
+公共通道驱动：
+
+- 速度只走 `/cmd_vel`（`geometry_msgs/Twist`），runtime 仅在 `base_navigation` 模式且导航门打开时接收，
+  超过 `base.cmd_vel.staleness_s` 未收到指令即置零，速度包络由 runtime profile 发布。
+- runtime 启动时导航门关闭。stage 用 `navigation.open_gate_on_startup` 声明意图，启动后由
+  `robot_navigation navigation_admission` 切到 stage 的 runtime 模式、调用
+  `/motion_mode/set_navigation_enabled` 并等待 `/motion_mode/base_navigation_enabled` 确认；任何一步失败都会
+  终止启动。
+- `/runtime/stop` 的停止锁存优先于导航门，需 `SetRuntimeMode("idle")` 才能解除。
+- 启用碰撞监测（`dyn_avoid_enabled`）的 stage 中，Nav2 链路为 controller → `/cmd_vel_nav` → velocity
+  smoother → `/cmd_vel_smoothed` → collision monitor → `/cmd_vel`。
+
+**手柄（`lekiwi_gamepad`，`joy_teleop`）**：`lekiwi_lidar` 与 `lekiwi_nav_grasp` 声明了该设备，在接手柄的主机上把
+`teleoperation.active_device` 设为 `lekiwi_gamepad` 即可启用。启动时会对照 runtime 绑定的 `base.cmd_vel`
+校验：话题和消息类型一致、有 deadman、各轴 scale 不超过发布的限速、服务命令只能是 `/runtime/stop`。
+注意两点：
+
+- 手柄与碰撞监测的输出共用 `/cmd_vel`，**启用碰撞监测的 stage 中手柄指令不经过碰撞监测**（迁移前手柄与
+  Nav2 共用碰撞监测输入，顺带被过滤）。模式、导航门、停止锁存、超时置零和速度包络仍约束每条手柄指令。
+- 松开 deadman 只在手柄是唯一指令来源时让底盘停下；Nav2 目标仍在执行时，操作员的停止手段是 B 键
+  （`/runtime/stop`，锁存）或取消导航。
+
+机械臂遥操作（`motion.arm.*`）尚未接入 LeKiwi runtime，由后续变更提供。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -1640,6 +1691,8 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.planner.catalog_view` | `planner` 或 `full` |
 | `agent.planner.stream` | 布尔；为 `true` 时提前发布 `reply_preview` 事件（由语音通道决定是否播报），执行仍需完整校验；要求 `api_protocol` 为 `chat_completions` |
 | `agent.planner.direct_commands` | 映射 `整句话语: 技能名`；整句精确匹配时不调用模型、直接生成单步计划（否定/假设句不触发，技能须在 live catalog 中且 planner 可选），提案的 `planner_identity` 记为 `route=direct_command`；`execution_enabled` 时每个技能都必须在 `test_allowlist` 内 |
+| `voice_asr.transcript_topic` | 绝对 topic，默认 `/voice/transcript`，仅 `external_vad` 下发布：同一最终文本按段再发一份 `ibrobot_msgs/SpeechTranscript`（带 `source_id` 与 `segment_sequence`），`output_topic` 上的纯文本照旧。寻址门控按段配对时桥接从这里读 |
+| `voice_asr.external_finalize_on_idle` | 布尔，默认 false，仅 `external_vad` 下生效。音源发了 BEGIN 却从不发 END 时，按 `external_idle_timeout` 收尾并发布转写，而不是丢弃整段；X2 固件如此（2026-10-23 实测 BEGIN 1 / END 0），`aimdk_x2_voice_addressee` 开启它。会发 END 的音源应保持关闭：那里的空闲超时意味着话说到一半卡住，发布截断的指令比不发更糟 |
 | `voice_asr.vad_*` / `voice_tts.num_steps` | 只校验 profile 实际配置的值：VAD 时长为有限正数（`post_roll` / `pre_roll` 可为 0），`num_steps` 为正整数；默认值归属 `voice_asr_service` / `voice_tts_service` |
 | `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
 | `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
@@ -1648,6 +1701,19 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.voice_bridge.busy_message` | 非空字符串；执行中提示语。播报时 ASR 仍在监听停止词，**不得包含停止词**（否则机器人会被自己的提示中断），违反即报错 |
 | `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空，未配置时取 `embodied_common.control_phrases.STOP_PHRASES` |
 | `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
+| `agent.voice_bridge.addressee_trigger` | `wake_phrase`（默认）或 `vendor_session`。前者要求话语以 `wake_phrases` 开头；后者用于**先吃掉自身唤醒词再放行语音**的平台（X2 实测如此），此时唤醒词到不了文本层，**只有唤醒事件能开会话**（必须配 `wake_event`），会话首句是唤醒事件指明那一段的转写；静默 `session_gap_sec` 后会话结束，下一句没有新唤醒就被拒绝。`vendor_session` 下配 `wake_phrases` 会被拒绝 |
+| `agent.voice_bridge.session_gap_sec` | 有限正数，默认 15 秒。仅 `vendor_session` 下生效：会话内转写间隔超过它即结束会话，之后需要新的唤醒事件。必须大于最长话语加 ASR 定稿延迟（间隔在最终转写之间测量）；偏小会让用户停顿后的追问也要重说唤醒词 |
+| `agent.voice_bridge.wake_phrases` | 非空字符串列表，省略该键表示**接受每一句话**（现有部署的行为）。配置后，一句话必须以其中之一**开头**才算是对机器人说的；命中后唤醒词会被**从文本中剥离**再送给 planner。空列表会被拒绝（那是一道没人能打开的门）。停止词**不受此门控**，安全优先 |
+| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；窗口**只被真正被处理的话续期**，被忽略的话不会把它撑开。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
+| `agent.voice_bridge.speaker_check_enabled` | 布尔，默认 false。开启后窗口内的话要与**会话首句**（说唤醒词那句，或 `vendor_session` 下唤醒事件指明的那一句）的声纹匹配才转发。要求门控已开启（配 `wake_phrases` 或 `addressee_trigger: vendor_session`，锚点来自会话首句），且要求 `voice_asr.speaker_embedding.enabled: true`（否则没人发布可比对的声纹，门看起来在过滤实际全放行）——两条都 fail closed |
+| `agent.voice_bridge.speaker_min_similarity` | `(0, 1]`，默认 0.60。余弦相似度下限。默认值是 X2 真机测试用的值（2026-10-24，campplus，≥2 s 片段）：旁人与锚点 0.28–0.56，用户本人在锚点累积后 0.67–0.84。离线语料的数字不能作依据——其分组标签并非同一个人。**仍须用真人录音现场标定**（方法见 `ibrobot_agent/README.md`）：取决于模型、麦克风、房间与说话人相似度 |
+| `agent.voice_bridge.speaker_max_age_sec` | 有限正数，默认 2.5 秒。声纹按语音段与转写配对；某段的声纹超过这个时长仍没有等到它的转写（ASR 丢弃了该段）即丢弃，只限制内存，不决定谁判定谁 |
+| `agent.voice_bridge.measurement_grace_sec` | 非负有限数，默认 0.4 秒（X2 配置 1.5 秒）。转写等待自身声纹的**上限**：只有要和锚点比对、而测量尚未到达的转写才会等，测量一到立即判定；会话首句、停止词、确认回答不等 |
+| `agent.voice_bridge.speaker_merge_margin` | `[0, 1)`，默认 0.10。放行的话只有相似度至少达到 `speaker_min_similarity + speaker_merge_margin` 才并入声纹锚点；刚过阈值的话放行但不改动锚点，避免锚点被音色相近的旁人带偏。设为 0 即每句放行的话都并入 |
+| `agent.voice_bridge.speaker_reject_short` | 布尔，默认 false。开启后，已有声纹锚点时，`speaker_id_node` 报告「太短、没有声纹」（空向量）的后续话被挡，而不是按 fail-open 放行。会话首句、停止词、确认回答不受影响；声纹消息根本没到时仍放行。X2 真人实测指令多为 1 s 左右人声，默认放行会让第二个人的指令全部通过 |
+| `agent.voice_bridge.speaker_embedding_topic` | **不可配置**：桥接订阅的声纹话题由 `voice_asr.speaker_embedding.output_topic` 决定（默认 `/voice/speaker_embedding`），launch 只从那里推导，出现即报错——两份配置一旦不一致，桥接收不到声纹，校验会静默放行所有人 |
+| `agent.voice_bridge.input_topic`（按段配对时） | 启用 `speaker_check_enabled` 或 `vendor_session` 时门控按语音段配对转写、声纹与唤醒事件，桥接改订阅 `voice_asr.transcript_topic` 上的 `ibrobot_msgs/SpeechTranscript`（launch 推导），此时**不可配置** `input_topic`，且要求 `voice_asr.input_mode: external_vad`（只有自带分段的音源能说出转写属于哪一段） |
+| `agent.voice_bridge.wake_event` | `{interface: audio.wake_event, type: ibrobot_msgs/msg/SpeechWakeEvent}`，仅 `vendor_session` 下可配，且 `vendor_session` **必须**配（只有唤醒事件能开会话，缺了机器人对谁都不响应）。绑定 runtime 发布的唤醒事件（X2 见 `aimdk_robot/README.md`）：同一音源、从被唤醒段起的第一句转写成为会话首句并重设锚点，用于开会话与窗口内换人接管。话题名由 runtime 接口描述决定，**不接受** `wake_event_topic` 字面话题。事件型接口不等就绪（说唤醒词之前不会有消息），启动时只检查 runtime 已声明 |
 | `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
 | `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |
 | `agent.voice_bridge.resume_settle_sec` | 正数，默认 1 秒；TTS 播报结束恢复 ASR 后的静默窗口，期间丢弃识别结果 |
@@ -2178,7 +2244,7 @@ camera_info_url: file:///home/user/.ros/camera_info/top.yaml
 
 ## 仿真依赖（MuJoCo）
 
-`use_sim:=true` 模式依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖：
+`use_sim:=true` 开启仿真，仿真后端由 `sim_platform` 选择，与 profile 的 `sim_platforms` 对齐：`gazebo`/`mujoco` 是物理仿真器平台；`sdk`（默认）是厂商 SDK 虚拟总线仿真（生产硬件适配层后的虚拟总线，无物理仿真器）——它与 `use_sim:=false`（真实硬件执行）是两回事。选择 MuJoCo 后端时依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖；Gazebo 后端依赖 gz/ign 仿真器栈：
 
 ```bash
 # 安装所有依赖（含 MuJoCo 仿真包）

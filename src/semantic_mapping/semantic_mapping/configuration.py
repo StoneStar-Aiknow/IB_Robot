@@ -44,7 +44,14 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
     roles = perception["semantic_roles"]
     query_only = bool(mapping.get("query_only", False))
     mapping_backend = perception["mapping_backend"]
-    runtime = parse_perception_runtime_config(config) if mapping_backend == "service" else None
+    # The mapping node consumes the model services through their configured
+    # endpoints; the weights are loaded by the model service processes that the
+    # hosting launch starts. Manifest metadata is therefore enough here, both on
+    # the hosting host and on a consumer host that holds only the manifests
+    # (with_model_services:=false).
+    runtime = (
+        parse_perception_runtime_config(config, require_local_artifacts=False) if mapping_backend == "service" else None
+    )
     services = {} if runtime is None else {service.instance_id: service for service in runtime.enabled_services}
 
     def service(role: str):

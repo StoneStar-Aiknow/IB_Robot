@@ -49,7 +49,7 @@ def test_declaration_does_not_require_runtime_model_availability(monkeypatch, tm
     config_path = tmp_path / "robot.yaml"
     config_path.write_text(yaml.safe_dump({"robot": {"name": "offline", "default_control_mode": "teleop"}}))
 
-    def unavailable_model(_config):
+    def unavailable_model(_config, **_kwargs):
         raise loader.PerceptionRuntimeConfigError("model bundle is unavailable")
 
     monkeypatch.setattr(loader, "parse_perception_runtime_config", unavailable_model)
