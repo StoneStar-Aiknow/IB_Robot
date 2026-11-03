@@ -444,6 +444,124 @@ def test_gazebo_description_has_no_package_uris_and_flags(tmp_path):
     assert '<state_interface name="effort"/>' in urdf
 
 
+# ---------------------------------------------------------------------------
+# the platform-scoped xacro args (review round 1, item 10)
+# ---------------------------------------------------------------------------
+
+#: A robot-agnostic xacro that ECHOES its args into the output (link names,
+#: the gated ros2_control block): the jaw_collision/gripper_effort defaults
+#: (mesh/10) are what so101_base.xacro ships, so a render that injects
+#: nothing must show them — no robot-specific value may be hardcoded in the
+#: generic renderer any more.
+ARGS_XACRO = """<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="t">
+  <xacro:arg name="use_sim" default="false"/>
+  <xacro:arg name="simulated" default="false"/>
+  <xacro:arg name="sim_plugin" default=""/>
+  <xacro:arg name="sim_effort_state" default="false"/>
+  <xacro:arg name="gz_ros2_control_parameters_file" default=""/>
+  <xacro:arg name="jaw_collision" default="mesh"/>
+  <xacro:arg name="gripper_effort" default="10"/>
+  <link name="base">
+    <inertial><mass value="1"/><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+  </link>
+  <link name="jaw_$(arg jaw_collision)"/>
+  <link name="effort_$(arg gripper_effort)"/>
+  <gazebo>
+    <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <parameters>$(arg gz_ros2_control_parameters_file)</parameters>
+    </plugin>
+  </gazebo>
+  <xacro:if value="$(arg use_sim)">
+    <ros2_control name="RobotSystem" type="system">
+      <hardware>
+        <plugin>$(arg sim_plugin)</plugin>
+        <param name="simulated">$(arg simulated)</param>
+      </hardware>
+      <joint name="1">
+        <command_interface name="position"/>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <xacro:if value="$(arg sim_effort_state)">
+          <state_interface name="effort"/>
+        </xacro:if>
+      </joint>
+    </ros2_control>
+  </xacro:if>
+</robot>
+"""
+
+
+def _args_profile(tmp_path: Path, *, description=None, platform=None, hardware=None) -> dict:
+    """A profile whose xacro echoes its args: description / platform-scoped /
+    hardware arg sets are injected individually so the precedence shows."""
+    profile = _profile(tmp_path, peripherals=[])
+    args_xacro = tmp_path / "args.xacro"
+    args_xacro.write_text(ARGS_XACRO, encoding="utf-8")
+    profile["description"]["xacro"] = str(args_xacro)
+    if description:
+        profile["description"]["xacro_args"] = dict(description)
+    if platform is not None:
+        profile.setdefault("simulation", {}).setdefault("gazebo", {})["xacro_args"] = dict(platform)
+    if hardware:
+        profile["hardware"] = {"xacro_args": dict(hardware)}
+    return profile
+
+
+def test_platform_scoped_xacro_args_reach_the_render_and_override_the_description(tmp_path):
+    """simulation.gazebo.xacro_args feed the render and replace the same-key
+    description args (the SO-101 jaw hulls / gripper effort pattern, now
+    living in the profile instead of the generic renderer)."""
+    profile = _args_profile(
+        tmp_path,
+        description={"jaw_collision": "mesh", "gripper_effort": "10"},
+        platform={"jaw_collision": "hulls", "gripper_effort": "1.0"},
+    )
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="jaw_hulls"' in urdf
+    assert 'name="effort_1.0"' in urdf
+
+
+def test_platform_scoped_xacro_args_cannot_override_the_renderers_fixed_keys(tmp_path):
+    """The renderer's own platform keys stay non-overridable: the platform
+    section's use_sim/sim_plugin/simulated/sim_effort_state are discarded —
+    the gz plugin selection and its flags are the renderer's contract, not
+    the profile's."""
+    profile = _args_profile(
+        tmp_path,
+        platform={"use_sim": "false", "sim_plugin": "evil/plugin", "simulated": "true", "sim_effort_state": "false"},
+    )
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert "<ros2_control" in urdf  # use_sim stays true (a false would drop the block)
+    assert "gz_ros2_control/GazeboSimSystem" in urdf  # sim_plugin stays the gz system
+    assert '<state_interface name="effort"/>' in urdf  # sim_effort_state stays true
+    assert '<param name="simulated">false</param>' in urdf
+
+
+def test_hardware_xacro_args_still_win_over_the_platform_section(tmp_path):
+    profile = _args_profile(
+        tmp_path,
+        description={"gripper_effort": "10"},
+        platform={"gripper_effort": "1.0"},
+        hardware={"gripper_effort": "5.0"},
+    )
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="effort_5.0"' in urdf
+
+
+def test_a_profile_without_the_platform_section_renders_the_args_byte_identically(tmp_path):
+    """Item 10's golden guarantee: with NO simulation.gazebo section the
+    renderer injects nothing — the xacro's own defaults appear (the old
+    code hardcoded jaw_collision/gripper_effort into every render) — and an
+    explicitly empty section renders the same bytes."""
+    profile = _args_profile(tmp_path)
+    baseline = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="jaw_mesh"' in baseline  # the xacro default: nothing was injected
+    assert 'name="effort_10"' in baseline
+    empty = _args_profile(tmp_path, platform={})
+    assert render_gazebo_description(empty, tmp_path / "robot.xacro") == baseline
+
+
 def test_hardware_and_sdk_action_lists_are_unchanged(tmp_path):
     profile = _profile(tmp_path)
     for sim_platform, simulated in (("", False), ("sdk", True)):

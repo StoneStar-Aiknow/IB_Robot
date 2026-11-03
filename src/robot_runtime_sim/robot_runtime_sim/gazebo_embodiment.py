@@ -24,6 +24,7 @@ from robot_runtime.interface_description import platform_peripherals
 from robot_runtime.launch_support import (
     RuntimeProfileError,
     _inject_initial_values,
+    _platform_xacro_args,
     _resolve_package_uris,
     profile_controllers,
     render_xacro,
@@ -91,6 +92,16 @@ def render_gazebo_description(
     SDK/hardware descriptions are untouched. Each joint in
     ``hardware.reset_positions`` starts, and is held, at that position (D4:
     the position state interface carries the ``initial_value``).
+
+    Xacro-arg precedence (review round 1, item 10):
+    ``description.xacro_args`` < ``simulation.gazebo.xacro_args`` (the
+    platform-scoped section may override the description ones — a robot's
+    Gazebo-specific args, e.g. the SO-101 jaw hulls and gripper effort, live
+    in the profile, not in this generic renderer) < this renderer's fixed
+    platform keys (``use_sim``, ``simulated``, ``sim_plugin``,
+    ``sim_effort_state``, ``gz_ros2_control_parameters_file`` — never
+    overridable by the profile) < ``hardware.xacro_args`` (last, as always).
+    A profile without the platform section renders byte-identically.
     """
     description = profile.get("description") or {}
     if not description.get("xacro"):
@@ -98,6 +109,7 @@ def render_gazebo_description(
     ros2_control = profile.get("ros2_control") or {}
     controllers_config = ros2_control.get("controllers_config") or ""
     xacro_args = {str(k): xacro_value(v) for k, v in (description.get("xacro_args") or {}).items()}
+    xacro_args.update(_platform_xacro_args(profile, "gazebo"))
     xacro_args.update(
         {
             "use_sim": "true",

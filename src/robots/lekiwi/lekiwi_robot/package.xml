@@ -93,6 +93,19 @@
   <test_depend>trajectory_msgs</test_depend>
   <test_depend>rosgraph_msgs</test_depend>
   <test_depend>tf2_msgs</test_depend>
+  <!-- Review r1 #18: every direct import of the tests is declared —
+       test_mujoco_render_baseline resolves ament packages,
+       test_base_tf_contract reads builtin_interfaces timestamps, and
+       test_motion_endpoints_served compiles the so101 profiles. -->
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>builtin_interfaces</test_depend>
+  <test_depend>so101_robot</test_depend>
+  <!-- test_navgrasp_reach_accuracy reads the ground-truth gripper link
+       through robot_runtime.testing.entity_ground_truth (D4, #205 grasp
+       stage) and composes the GT base pose with the mount transform from
+       TF. -->
+  <test_depend>tf2_ros</test_depend>
+  <test_depend>python3-numpy</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

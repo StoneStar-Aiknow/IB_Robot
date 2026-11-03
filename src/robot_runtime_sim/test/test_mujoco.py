@@ -1708,6 +1708,108 @@ def test_render_mujoco_description_sets_initial_values_from_reset_positions(tmp_
     assert 'name="initial_value"' not in plain
 
 
+# ---------------------------------------------------------------------------
+# the platform-scoped xacro args on the MuJoCo render path (review round 1,
+# item 10 — symmetric to the Gazebo mechanism, see test_gazebo.py)
+# ---------------------------------------------------------------------------
+
+#: Echoes its args into the output (link names + the gated ros2_control
+#: block); the jaw_collision/gripper_effort defaults are so101_base.xacro's.
+MUJOCO_ARGS_XACRO = """<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="t">
+  <xacro:arg name="use_sim" default="false"/>
+  <xacro:arg name="simulated" default="false"/>
+  <xacro:arg name="sim_plugin" default=""/>
+  <xacro:arg name="sim_effort_state" default="false"/>
+  <xacro:arg name="mujoco_model" default=""/>
+  <xacro:arg name="mujoco_headless" default="false"/>
+  <xacro:arg name="jaw_collision" default="mesh"/>
+  <xacro:arg name="gripper_effort" default="10"/>
+  <link name="base"/>
+  <link name="jaw_$(arg jaw_collision)"/>
+  <link name="effort_$(arg gripper_effort)"/>
+  <xacro:if value="$(arg use_sim)">
+    <ros2_control name="RobotSystem" type="system">
+      <hardware>
+        <plugin>$(arg sim_plugin)</plugin>
+        <param name="simulated">$(arg simulated)</param>
+        <xacro:if value="${'$(arg mujoco_model)' != ''}">
+          <param name="mujoco_model">$(arg mujoco_model)</param>
+        </xacro:if>
+        <xacro:if value="$(arg mujoco_headless)">
+          <param name="headless">true</param>
+        </xacro:if>
+      </hardware>
+      <joint name="1">
+        <command_interface name="position"/>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <xacro:if value="$(arg sim_effort_state)">
+          <state_interface name="effort"/>
+        </xacro:if>
+      </joint>
+    </ros2_control>
+  </xacro:if>
+</robot>
+"""
+
+
+def _mujoco_args_profile(tmp_path: Path, *, description=None, platform=None, hardware=None) -> dict:
+    profile = _profile(tmp_path, peripherals=[])
+    args_xacro = tmp_path / "args.xacro"
+    args_xacro.write_text(MUJOCO_ARGS_XACRO, encoding="utf-8")
+    profile["description"]["xacro"] = str(args_xacro)
+    if description:
+        profile["description"]["xacro_args"] = dict(description)
+    if platform is not None:
+        profile.setdefault("simulation", {}).setdefault("mujoco", {})["xacro_args"] = dict(platform)
+    if hardware:
+        profile["hardware"] = {"xacro_args": dict(hardware)}
+    return profile
+
+
+def _render_mujoco_args_description(monkeypatch, tmp_path, profile) -> str:
+    """render_mujoco_description with the simulator check and the scene
+    composition stubbed (the same seams the initial-value test uses)."""
+    monkeypatch.setattr("robot_runtime_sim.mujoco.check_simulator_versions", lambda: None)
+    composed = tmp_path / "composed.mjb"
+    composed.write_bytes(b"")
+    monkeypatch.setattr("sim_models.scene_compiler.compose_mujoco_model", lambda *_a, **_k: composed)
+    return render_mujoco_description(profile, tmp_path / "profile.yaml")
+
+
+def test_the_mujoco_render_reads_platform_scoped_xacro_args(tmp_path, monkeypatch):
+    """simulation.mujoco.xacro_args feed the render, override the
+    description args, cannot touch the renderer's fixed platform keys
+    (use_sim/sim_plugin/…) and lose to hardware.xacro_args — the same
+    precedence chain as the Gazebo path."""
+    profile = _mujoco_args_profile(
+        tmp_path,
+        description={"jaw_collision": "mesh", "gripper_effort": "10"},
+        platform={"jaw_collision": "hulls", "gripper_effort": "1.0", "use_sim": "false", "sim_plugin": "evil/plugin"},
+        hardware={"gripper_effort": "5.0"},
+    )
+    urdf = _render_mujoco_args_description(monkeypatch, tmp_path, profile)
+    assert 'name="jaw_hulls"' in urdf  # the platform section overrode the description arg
+    assert 'name="effort_5.0"' in urdf  # hardware.xacro_args still wins
+    assert "<ros2_control" in urdf  # use_sim stayed true (a false would drop the block)
+    assert "mujoco_ros2_control/MujocoSystemInterface" in urdf  # sim_plugin stayed fixed
+    assert '<param name="mujoco_model">' in urdf  # the placeholder came through and was substituted
+
+
+def test_a_mujoco_profile_without_the_platform_section_renders_byte_identically(tmp_path, monkeypatch):
+    """Item 10's golden guarantee on the MuJoCo path: with NO
+    simulation.mujoco.xacro_args the renderer injects nothing (the xacro's
+    own defaults appear) and an explicitly empty section renders the same
+    bytes."""
+    profile = _mujoco_args_profile(tmp_path)
+    baseline = _render_mujoco_args_description(monkeypatch, tmp_path, profile)
+    assert 'name="jaw_mesh"' in baseline  # the xacro default: nothing was injected
+    assert 'name="effort_10"' in baseline
+    empty = _mujoco_args_profile(tmp_path, platform={})
+    assert _render_mujoco_args_description(monkeypatch, tmp_path, empty) == baseline
+
+
 def test_render_robot_mjcf_skips_platform_excluded_peripherals(tmp_path):
     """D3: a camera excluded on the MuJoCo platform is not injected into the
     robot MJCF even though it stays enabled in the inventory."""
@@ -1726,3 +1828,117 @@ def test_render_robot_mjcf_skips_platform_excluded_peripherals(tmp_path):
     out = render_robot_mjcf(profile)
     cameras = [camera.get("name") for camera in ET.parse(out).getroot().iter("camera")]
     assert cameras == ["top_camera"]  # the excluded wrist is not injected
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-nav-grasp D7: the whitelisted simulation.mujoco.option override
+# ---------------------------------------------------------------------------
+
+OPTION_TEMPLATE = MJCF_TEMPLATE.replace(
+    '<compiler eulerseq="XYZ" angle="radian"/>',
+    '<compiler eulerseq="XYZ" angle="radian"/>\n'
+    '  <option gravity="0 0 -9.81" integrator="implicitfast" timestep="0.001"/>',
+)
+
+
+def _option_profile(tmp_path, option):
+    profile = _profile(tmp_path)
+    template = tmp_path / "robot.xml.template"
+    template.write_text(OPTION_TEMPLATE, encoding="utf-8")
+    profile["simulation"]["mujoco"]["template"] = str(template)
+    if option is not None:
+        profile["simulation"]["mujoco"]["option"] = option
+    return profile
+
+
+def test_the_mujoco_option_override_applies_whitelisted_keys(tmp_path):
+    """The whitelisted solver/contact keys reach the host <option> element;
+    the other attributes (gravity, integrator, timestep) stay untouched."""
+    profile = _option_profile(tmp_path, {"noslip_iterations": 20, "cone": "elliptic", "impratio": 5.0})
+    out = render_robot_mjcf(profile)
+    option = ET.parse(out).getroot().find("option")
+    assert option.get("noslip_iterations") == "20"
+    assert option.get("cone") == "elliptic"
+    assert float(option.get("impratio")) == 5.0
+    assert option.get("gravity") == "0 0 -9.81" and option.get("timestep") == "0.001"
+    # the rendered model loads with the settings applied
+    model = mujoco.MjModel.from_xml_path(str(out))
+    assert model.opt.noslip_iterations == 20
+    assert model.opt.impratio == 5.0
+
+
+def test_the_mujoco_option_override_accepts_clean_numeric_strings(tmp_path):
+    """A string that parses cleanly as an integer/number is accepted — the
+    forms a YAML scalar can take when the value is quoted (item 11's accept
+    set: a real int or a clean integer/numeric string)."""
+    profile = _option_profile(tmp_path, {"noslip_iterations": "20", "impratio": "5"})
+    out = render_robot_mjcf(profile)
+    option = ET.parse(out).getroot().find("option")
+    assert option.get("noslip_iterations") == "20"
+    assert float(option.get("impratio")) == 5.0
+    model = mujoco.MjModel.from_xml_path(str(out))
+    assert model.opt.noslip_iterations == 20 and model.opt.impratio == 5.0
+
+
+def test_the_mujoco_option_override_rejects_unknown_keys_and_bad_values(tmp_path):
+    profile = _option_profile(tmp_path, {"solver": "cg"})
+    with pytest.raises(RuntimeError, match="unknown keys \\['solver'\\]"):
+        render_robot_mjcf(profile)
+    profile = _option_profile(tmp_path, {"cone": "spherical"})
+    with pytest.raises(RuntimeError, match="cone: 'spherical'"):
+        render_robot_mjcf(profile)
+    profile = _option_profile(tmp_path, {"noslip_iterations": -1})
+    with pytest.raises(RuntimeError, match="noslip_iterations must be >= 0"):
+        render_robot_mjcf(profile)
+    profile = _option_profile(tmp_path, {"impratio": 0.0})
+    with pytest.raises(RuntimeError, match="impratio must be > 0"):
+        render_robot_mjcf(profile)
+
+
+def test_the_mujoco_option_override_rejects_a_present_but_bare_option_section(tmp_path):
+    """Review round 1 (item 11): "absent" means the KEY is missing — a
+    PRESENT-but-falsy `option` ({} / false / [] / null) is a config error
+    naming the section, not "no override" (the old `get(...) or {}` read a
+    typo as "leave the defaults")."""
+    for bare in ({}, False, [], None):
+        profile = _option_profile(tmp_path, None)
+        profile["simulation"]["mujoco"]["option"] = bare  # the key IS present
+        with pytest.raises(RuntimeError, match="simulation.mujoco.option must be a non-empty mapping"):
+            render_robot_mjcf(profile)
+    # a non-mapping scalar is the same error
+    profile = _option_profile(tmp_path, "elliptic")
+    with pytest.raises(RuntimeError, match="non-empty mapping.*got 'elliptic'"):
+        render_robot_mjcf(profile)
+
+
+def test_the_mujoco_option_override_rejects_lossy_and_non_numeric_values(tmp_path):
+    """Review round 1 (item 11): int keys reject bools (True is an int in
+    Python), floats that would silently truncate (20.5) and fraction-like
+    or non-numeric strings ("20/3"); float keys reject bools, NaN/Inf and
+    non-numeric strings. Every error names the key and the value."""
+    for bad in (True, 20.5, "20/3", "20.5", "many", None):
+        profile = _option_profile(tmp_path, {"noslip_iterations": bad})
+        with pytest.raises(RuntimeError, match=f"noslip_iterations.*got {bad!r}"):
+            render_robot_mjcf(profile)
+    for bad in (True, float("inf"), float("nan"), ".inf", ".nan", "fast", None):
+        profile = _option_profile(tmp_path, {"impratio": bad})
+        with pytest.raises(RuntimeError, match=f"impratio.*got {bad!r}"):
+            render_robot_mjcf(profile)
+    # bools are named as bools, not accepted through int/float isinstance
+    profile = _option_profile(tmp_path, {"noslip_iterations": True})
+    with pytest.raises(RuntimeError, match=r"noslip_iterations.*got True"):
+        render_robot_mjcf(profile)
+
+
+def test_no_option_section_leaves_the_render_byte_identical(tmp_path):
+    """Without the `option` KEY the rendered MJCF is byte-identical — the
+    golden renders of the shipped profiles rely on it (a PRESENT-but-empty
+    section is instead a config error, see the test above)."""
+    baseline = render_robot_mjcf(_option_profile(tmp_path, None)).read_bytes()
+    again = render_robot_mjcf(_option_profile(tmp_path, None)).read_bytes()
+    assert baseline == again
+    # a template without an <option> element cannot be overridden
+    profile = _profile(tmp_path)
+    profile["simulation"]["mujoco"]["option"] = {"cone": "elliptic"}
+    with pytest.raises(RuntimeError, match="no <option> element"):
+        render_robot_mjcf(profile)

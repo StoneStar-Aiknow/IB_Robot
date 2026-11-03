@@ -83,8 +83,27 @@ ARM_JOINTS = ["1", "2", "3", "4", "5", "6"]
 #: The stowed pose = ``hardware.reset_positions`` (joints 1-5; D4).
 STOWED_TARGET = [0.0, -1.5854, 1.5708, 0.7854, 0.0]
 #: A stream target more than 0.1 rad from the stowed pose on joint 2.
-STREAM_TARGET = [0.0, -0.5, 1.5708, 0.7854, 0.0]
-FURTHER_TARGET = [0.0, 0.3, 1.5708, 0.7854, 0.0]
+#: MEASURED 2026-10-30 (chunk D follow-up): the previous joint-3 value
+#: 1.5708 put the gripper 40.5 mm INSIDE the chassis at this joint-2 lift —
+#: with the profile's D7 solver override (noslip_iterations 20, cone
+#: elliptic) the non-penetration constraint then holds the arm 0.145 rad
+#: short of the streamed target (a steady offset, later motion 4e-7 rad;
+#: the old pyramidal/no-noslip solver tolerated the penetration and let the
+#: arm within 0.05). The value below is the closest CONTACT-FREE member of
+#: the same family: joint 2 unchanged (-0.5, 1.0854 rad from stowed), joint
+#: 3 lowered to 1.2 — verified offline by loading the provider's composed
+#: model, setting qpos at the target and listing mj_forward contacts
+#: (wheel/table contacts only; gripper-chassis clear).
+STREAM_TARGET = [0.0, -0.5, 1.2, 0.7854, 0.0]
+#: The later stream command (the idle variant): MEASURED 2026-10-30 — the
+#: previous joint-3 value 1.5708 put the gripper 12.6 mm inside the chassis
+#: at this joint-2 lift (the same defect class as STREAM_TARGET above; it
+#: passed only because the shallower penetration maps to an offset below
+#: the threshold). The value below is the closest contact-free member of
+#: the family: joint 2 unchanged (0.3), joint 3 lowered to 0.9 — 0.8 rad
+#: from STREAM_TARGET, verified by the same offline mj_forward contact
+#: check and pinned by test_navgrasp_targets_contact_free.py.
+FURTHER_TARGET = [0.0, 0.3, 0.9, 0.7854, 0.0]
 #: The (e) trajectory target: joints 1-2 +0.25 rad from the stowed pose (a
 #: real executed trajectory, displacement > 0.1 rad; the direct JTC path has
 #: no FCL, so the MoveIt-invalid stream region is irrelevant here).

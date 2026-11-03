@@ -41,10 +41,38 @@ conformance:
 # item). No joint_current block: this profile advertises no joint.current
 # interface, so the runtime's simulated joint-current publisher stays off.
 simulation:
+  # lekiwi-nav-grasp D7 (maintainer decision 2026-10-29): every
+  # Gazebo-simulated render of so101_base.xacro collides with the same CoACD
+  # jaw hulls MuJoco simulates (so101.xml.template's
+  # wrist_roll_follower_col_*/moving_jaw_col_*), so both physics platforms
+  # present the same grasp geometry; hardware, SDK and MoveIt renders never
+  # pass this arg and keep the raw STL.
+  gazebo:
+    xacro_args:
+      jaw_collision: hulls
+      # lekiwi-nav-grasp D7 "Gazebo gripper effort" (maintainer decision
+      # 2026-10-30, task 2.0b): the Gazebo-simulated joint-6 effort limit.
+      # The URDF default 10 (and 2.75/2.0/1.5) ejects the grasped cube
+      # during the close (spike 1.1r/1.5r diagnostics: the squeeze torque
+      # slides it up the fixed finger's slope); 1.0 blocks on the cube
+      # exactly like MuJoCo's +-2.75 actuator forcerange (q6 ~0.41, 5/5
+      # captures, 9 s hold drift 0.0 mm over a 226 mm lift). Only the
+      # Gazebo render path passes it; every other render keeps the default
+      # 10 byte-identically.
+      gripper_effort: "1.0"
   mujoco:
     template: $(find lekiwi_description)/mujoco/lekiwi_base.xml.template
     meshes_dir: $(find lekiwi_description)/meshes/mujoco
     sdf_meshes: []
+    # lekiwi-nav-grasp D7 (spike 1.4): with the host template's defaults the
+    # grasp cube slides out of the closed jaws during the close (measured
+    # contacts 0.01-0.07 N, the cube escapes past the fixed finger's tip);
+    # noslip iterations + elliptic cones hold it (q6 blocks at 0.39, the
+    # 9 s hold drifts 0.0 mm through a 190 mm lift). Whitelisted keys only —
+    # render_robot_mjcf rejects anything else.
+    option:
+      noslip_iterations: 20
+      cone: elliptic
     floating_base:
       # the MJCF body with the free joint the BaseVelocityPlugin drives; also
       # the URDF root frame and the relay's validated odometry child frame
@@ -189,7 +217,11 @@ capabilities:
   joint.position_stream: {joint_count: 6, rate_hz: 100.0}
   joint.trajectory: {joint_count: 6}
   gripper.1d: {count: 1}
-  motion.fk: {ee_link: gripper, endpoints: ['/motion/compute_fk', '/ik_worker_0/motion/compute_fk']}
+  # FK: the motion server serves the global /motion/compute_fk only — its
+  # per-worker registrations are IK-only (motion_server.py), so a per-worker
+  # FK endpoint here advertised a service no component serves (maintainer
+  # decision, revision-2 E2E bring-up; as so101_single_arm).
+  motion.fk: {ee_link: gripper, endpoints: ['/motion/compute_fk']}
   motion.ik: {endpoints: ['/motion/compute_ik', '/ik_worker_0/motion/compute_ik']}
   motion.move_to_joint: {}
   motion.move_to_pose: {}

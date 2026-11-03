@@ -1180,6 +1180,103 @@ def _merge_attachment(host: ET.Element, attachment: dict[str, Any], urdf_root: E
 # ---------------------------------------------------------------------------
 
 
+#: The ``simulation.mujoco.option`` keys the runtime may override on the
+#: host template's ``<option>`` element (lekiwi-nav-grasp D7, spike 1.4):
+#: solver/contact settings the shipped templates leave at MuJoCo's
+#: defaults. Everything else is rejected at render time — a typo must never
+#: silently become model behaviour.
+_MUJOCO_OPTION_KEYS = {
+    "noslip_iterations": int,
+    "cone": ("pyramidal", "elliptic"),
+    "impratio": float,
+}
+
+
+def _mujoco_option_int(key: str, value) -> int:
+    """A whitelisted integer option value: a real int or an integer string.
+
+    Fail-closed (review round 1, item 11): bools are ints in Python but
+    never a valid option; floats and fraction-like/non-numeric strings are
+    rejected by name so nothing silently truncates (``int(20.5)`` must never
+    quietly become 20).
+    """
+    if not isinstance(value, bool) and isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    raise RuntimeError(
+        f"simulation.mujoco.option.{key} must be an integer >= 0 (or a string that parses as one), got {value!r}"
+    )
+
+
+def _mujoco_option_float(key: str, value) -> float:
+    """A whitelisted float option value: an int/float or a numeric string.
+
+    Fail-closed (review round 1, item 11): bools are rejected, and so are
+    NaN/Inf (``math.isfinite``) — a YAML ``.inf``/``.nan`` (or the same as a
+    string) is a config error, not an accepted setting.
+    """
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            raise RuntimeError(f"simulation.mujoco.option.{key} must be a finite number > 0, got {value!r}") from None
+    else:
+        raise RuntimeError(f"simulation.mujoco.option.{key} must be a finite number > 0, got {value!r}")
+    if not math.isfinite(number):
+        raise RuntimeError(f"simulation.mujoco.option.{key} must be a finite number > 0, got {value!r}")
+    return number
+
+
+def _apply_mujoco_option_override(root, mujoco_cfg: dict, template_path) -> None:
+    """Apply the profile's whitelisted ``simulation.mujoco.option`` override.
+
+    "Absent" means the KEY is missing from ``simulation.mujoco``: only then
+    is the rendered MJCF byte-identical (the golden tests pin that). A
+    PRESENT-but-bad section is a config error naming it — ``option: {}``,
+    ``option: false`` or ``option: []`` is not "no override" (review round
+    1, item 11). An unknown key, a bad value or a template without an
+    ``<option>`` element raises, naming the offender; every rejection
+    message names the offending key and value.
+    """
+    if "option" not in mujoco_cfg:
+        return
+    override = mujoco_cfg["option"]
+    if not isinstance(override, dict) or not override:
+        raise RuntimeError(f"simulation.mujoco.option must be a non-empty mapping of key: value, got {override!r}")
+    unknown = sorted(set(override) - set(_MUJOCO_OPTION_KEYS))
+    if unknown:
+        raise RuntimeError(
+            f"simulation.mujoco.option has unknown keys {unknown} (supported: {sorted(_MUJOCO_OPTION_KEYS)})"
+        )
+    option = root.find("option")
+    if option is None:
+        raise RuntimeError(f"the MuJoCo template {template_path} has no <option> element to override")
+    for key, value in override.items():
+        if key == "cone":
+            text = str(value)
+            if text not in _MUJOCO_OPTION_KEYS["cone"]:
+                raise RuntimeError(
+                    f"simulation.mujoco.option.cone: {text!r} (supported: {list(_MUJOCO_OPTION_KEYS['cone'])})"
+                )
+            option.set("cone", text)
+        elif key == "noslip_iterations":
+            iterations = _mujoco_option_int(key, value)
+            if iterations < 0:
+                raise RuntimeError(f"simulation.mujoco.option.noslip_iterations must be >= 0, got {value!r}")
+            option.set("noslip_iterations", str(iterations))
+        else:
+            impratio = _mujoco_option_float(key, value)
+            if impratio <= 0.0:
+                raise RuntimeError(f"simulation.mujoco.option.impratio must be > 0, got {value!r}")
+            option.set("impratio", repr(impratio))
+
+
 def render_robot_mjcf(
     profile: dict[str, Any],
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
@@ -1239,6 +1336,7 @@ def render_robot_mjcf(
     # peripherals are platform-filtered (this render is MuJoCo-only)
     effective = peripherals if peripherals is not None else platform_peripherals(profile.get("peripherals"), "mujoco")
     root = ET.fromstring(content)
+    _apply_mujoco_option_override(root, mujoco_cfg, template_path)
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise RuntimeError(f"MuJoCo template has no <worldbody>: {template_path}")

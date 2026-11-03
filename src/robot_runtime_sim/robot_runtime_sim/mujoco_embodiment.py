@@ -21,6 +21,7 @@ from robot_runtime.interface_description import platform_peripherals
 from robot_runtime.launch_support import (
     RuntimeProfileError,
     _inject_initial_values,
+    _platform_xacro_args,
     _resolve_package_uris,
     profile_controllers,
     render_xacro,
@@ -81,6 +82,14 @@ def render_mujoco_description(
     ``sim_effort_state=true`` and ``mujoco_headless`` from
     ``IBROBOT_MUJOCO_HEADLESS``; the camera TF (mount + optical frames). The
     URDF carries no camera ``<sensor>`` blocks.
+
+    Xacro-arg precedence (review round 1, item 10): the same chain as the
+    Gazebo render — ``description.xacro_args`` <
+    ``simulation.mujoco.xacro_args`` (platform-scoped) < this renderer's
+    fixed platform keys (``use_sim``, ``simulated``, ``sim_plugin``,
+    ``sim_effort_state``, ``mujoco_model``, ``mujoco_headless`` — never
+    overridable by the profile) < ``hardware.xacro_args`` (last). A profile
+    without the platform section renders byte-identically.
     """
     from sim_models.scene_compiler import compose_mujoco_model, mjcf_engine_extensions
 
@@ -100,6 +109,7 @@ def render_mujoco_description(
     # rendered URDF afterwards (the mujoco_model parameter is the only
     # difference — no second xacro run).
     xacro_args = {str(k): xacro_value(v) for k, v in (description.get("xacro_args") or {}).items()}
+    xacro_args.update(_platform_xacro_args(profile, "mujoco"))
     xacro_args.update(
         {
             "use_sim": "true",
@@ -107,10 +117,11 @@ def render_mujoco_description(
             "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
             "sim_effort_state": "true",
             "mujoco_model": MUJOCO_MODEL_PLACEHOLDER,
+            # env-derived fixed key: always passed (the xacros default it to
+            # false), never overridable by the profile
+            "mujoco_headless": "true" if os.environ.get("IBROBOT_MUJOCO_HEADLESS", "0") == "1" else "false",
         }
     )
-    if os.environ.get("IBROBOT_MUJOCO_HEADLESS", "0") == "1":
-        xacro_args["mujoco_headless"] = "true"
     for key, value in (profile.get("hardware") or {}).get("xacro_args", {}).items():
         xacro_args[str(key)] = xacro_value(value)
     robot_description = _inject_initial_values(render_xacro(resolve_path(description["xacro"]), xacro_args), profile)

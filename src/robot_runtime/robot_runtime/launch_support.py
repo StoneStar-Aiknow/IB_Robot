@@ -420,6 +420,19 @@ def _resolve_package_uris(robot_description: str) -> str:
     return _PACKAGE_URI_PATTERN.sub(replace, robot_description)
 
 
+def _platform_xacro_args(profile: dict[str, Any], platform: str) -> dict[str, str]:
+    """The profile's ``simulation.<platform>.xacro_args`` (empty when absent).
+
+    Platform-scoped xacro args (review round 1, item 10): a robot's
+    platform-specific render arguments live in its PROFILE under
+    ``simulation.<platform>.xacro_args``, not in a renderer — a generic
+    renderer must not inject robot-specific args into every render. Consumed
+    by the physics embodiments (robot_runtime_sim), like ``profile_controllers``.
+    """
+    section = (profile.get("simulation") or {}).get(platform) or {}
+    return {str(key): xacro_value(value) for key, value in (section.get("xacro_args") or {}).items()}
+
+
 def render_sim_description(
     profile: dict[str, Any],
     profile_path: Path,

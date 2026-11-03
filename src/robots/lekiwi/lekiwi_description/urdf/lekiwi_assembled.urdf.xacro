@@ -40,6 +40,14 @@
        this removes a TF frame named `world` under base_link from the
        physical robot (hardware-visible, checked in the README). -->
   <xacro:arg name="root_link" default="arm_root"/>
+  <!-- jaw_collision (lekiwi-nav-grasp D7, maintainer decision 2026-10-29):
+       declared before the so101_base.xacro include so every LeKiwi render
+       accepts the mapping — including base_only renders whose tree never
+       includes the arm (the same "accepted even when unused" rule as
+       gz_ros2_control_parameters_file below). The Gazebo render path passes
+       `hulls` (robot_runtime.launch_support.render_gazebo_description); the
+       default `mesh` keeps hardware/SDK/MuJoCo renders byte-identical. -->
+  <xacro:arg name="jaw_collision" default="mesh"/>
   <!-- gz_ros2_control: always passed by render_gazebo_description (accepted
        even when unused); sim_effort_state is accepted and ignored here: this
        profile advertises no joint.current interface (D2). -->

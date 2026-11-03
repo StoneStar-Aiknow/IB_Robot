@@ -220,6 +220,33 @@ def test_physical_selection_passes_no_platform_to_the_facade():
     )
 
 
+def test_provider_gazebo_render_freezes_the_gripper_effort(tmp_path):
+    """lekiwi-nav-grasp D7 "Gazebo gripper effort" (task 2.0b): only the
+    Gazebo render path applies the profile's platform-scoped
+    simulation.gazebo.xacro_args — the Gazebo-simulated joint-6 limit is
+    the PROFILE's frozen measured value (the URDF default 10 ejects the
+    grasped cube), while every hardware/SDK/MoveIt render keeps the
+    default 10 byte-identically (review round 1, item 10: the value lives
+    in the profile, no longer a launch_support constant)."""
+    import xml.etree.ElementTree as ET
+
+    from robot_runtime.launch_support import render_robot_description
+    from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
+
+    def joint_six_effort(urdf):
+        root = ET.fromstring(urdf)
+        return root.find("joint[@name='6']/limit").get("effort")
+
+    profile = load_profile(_PROFILE)
+    # the frozen measured value flows from the PROFILE through the render
+    frozen = str(profile["simulation"]["gazebo"]["xacro_args"]["gripper_effort"])
+    gazebo = render_gazebo_description(profile, _PROFILE, spawn_pose=(0.0, 0.0, 0.0, 0.0))
+    assert joint_six_effort(gazebo) == frozen
+    hardware = render_robot_description(profile, _PROFILE, simulated=False)
+    assert joint_six_effort(hardware) == "10"
+
+
 def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):
     from robot_runtime.profile import load_profile
     from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
@@ -675,3 +702,35 @@ def test_launch_declares_the_peripherals_argument():
         if isinstance(action, DeclareLaunchArgument)
     }
     assert "peripherals" in names
+
+
+def test_provider_gazebo_render_uses_the_coacd_jaw_hulls():
+    """lekiwi-nav-grasp D7 (maintainer decision 2026-10-29): the Gazebo render
+    path collides with the same CoACD jaw hulls MuJoCo simulates
+    (wrist_roll_follower_col_*/moving_jaw_col_*, poses as so101.xml.template)
+    so both physics platforms present the same grasp geometry; the hardware
+    render keeps the raw jaw STLs byte-identically."""
+    import xml.etree.ElementTree as ET
+
+    from robot_runtime.launch_support import render_robot_description
+    from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
+
+    def jaw_collision_meshes(urdf):
+        root = ET.fromstring(urdf)
+        return {
+            link.get("name"): sorted(
+                mesh.get("filename").rsplit("/", 1)[-1].removesuffix(".stl")
+                for mesh in link.findall("collision/geometry/mesh")
+            )
+            for link in root.findall("link")
+            if link.get("name") in ("gripper", "jaw")
+        }
+
+    profile = load_profile(_PROFILE)
+    gazebo = jaw_collision_meshes(render_gazebo_description(profile, _PROFILE))
+    assert gazebo["jaw"] == sorted(f"moving_jaw_col_{i}" for i in range(8))
+    assert gazebo["gripper"] == sorted(["sts3215_03a_v1"] + [f"wrist_roll_follower_col_{i}" for i in range(8)])
+    hardware = jaw_collision_meshes(render_robot_description(profile, _PROFILE, simulated=False))
+    assert hardware["jaw"] == ["moving_jaw_so101_v1"]
+    assert hardware["gripper"] == ["sts3215_03a_v1", "wrist_roll_follower_so101_v1"]

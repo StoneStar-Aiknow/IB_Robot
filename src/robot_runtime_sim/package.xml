@@ -28,6 +28,9 @@
        the real guard. -->
   <exec_depend>sim_models</exec_depend>
   <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
+  <!-- entity ground truth (lekiwi-nav-grasp D3): the FreeJointStateArray the
+       MuJoCo scene-object stream subscribes to. -->
+  <exec_depend>mujoco_ros2_control_msgs</exec_depend>
   <!-- lekiwi-mujoco-runtime-platform D5/D11: the MuJoCo lidar composition.
        mujoco_3d_lidar registers the mujoco.plugin.lidar engine extension the
        composed model declares (the C++ simulator loads it from the ament
