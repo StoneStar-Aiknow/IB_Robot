@@ -18,8 +18,8 @@
   夹爪/手腕自遮挡、目标离开视野、深度缺失或反光而不可靠；此时视觉结果
   只作为诊断/弱证据，不会单独判失败。深度订阅回调只保留最新消息；全帧有效率、近距比例和
   中位深度在 `VerifyGrasp` 请求时计算，避免空闲期间持续扫描 30 Hz 深度图。
-- `debug_graspgen.py`：离线 GraspGen 调试脚本。读取已有 RGB-D/mask fixture 目录，直接运行
-  GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
+- `debug_graspgen`：离线 GraspGen 调试工具（console script）。读取已有 RGB-D/mask fixture 目录，
+  直接运行 GraspGen，并保存 PLY、JSON 和可选 Open3D 视图：`ros2 run manipulation_service debug_graspgen`。
 
 ROS 接口：
 
@@ -301,8 +301,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 抓取生成：
 
 - `grasp_threshold`：GraspGen discriminator 阈值，默认 `0.5`。
-- `num_grasps`：每轮生成的候选数量，默认 `800`。
-- `topk_num_grasps`：每轮保留的 top-K 候选，默认 `50`。
+- `num_grasps`：每轮生成的候选数量，默认 `2000`。
+- `topk_num_grasps`：每轮保留的 top-K 候选，默认 `300`。
 - `enable_object_cloud_completion`：启用目标点云补全，默认 `true`。当前在目标 mask
   内对局部 depth hole 做邻域均值补点，并可配合 prismatic side extrude 生成连接桌面的
   空心表面壳；不会向物体内部填充实心体积点。
@@ -464,18 +464,34 @@ Robotiq 候选扫描，同时保留 table plane 和 object-top：
 PNG/HTML 渲染在后台 daemon thread 中执行；service response 不等待图像导出。
 因此 `grasp_result.json` 可能先出现，预览文件稍后出现。
 
-## 调试 debug_graspgen.py
+## 调试 debug_graspgen
 
-`debug_graspgen.py` 不依赖 ROS service。它读取已有 fixture 中的 `result.json`、mask、深度和
-CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen
-模型、过滤器和可视化。
+`debug_graspgen` 不依赖 ROS service。它读取已有 fixture 中的 `result.json`、mask、深度和
+CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen 模型、过滤器和可视化。
+
+运行要求：
+
+- `local_cuda` 后端（默认）需要可用 CUDA PyTorch 和 `models/graspgen/` bundle
+  （或用 `--model-dir` 指定其他 bundle）。
+- PLY/`grasp_preview.png` 导出和 `--show` 交互式视图需要安装 `open3d`；未安装时工具仍会
+  写入 `grasp_result.json` 并成功退出，同时打印一行 `[skipped] open3d not installed: ...`
+  列出被跳过的导出文件。
+- `--inference-backend ascend_local` 需要 Ascend OM bundle 和 ACL 运行环境。
 
 基础命令：
 
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/debug_graspgen.py --data-dir "$fixture_dir"
+  ros2 run manipulation_service debug_graspgen --data-dir "$fixture_dir"
+```
+
+使用非默认模型 bundle 时显式指定（默认 `$WORKSPACE/models/graspgen`，即
+`lekiwi_handeye_realsense_grasp.yaml` 使用的 bundle）：
+
+```bash
+ros2 run manipulation_service debug_graspgen --data-dir "$fixture_dir" \
+  --model-dir /path/to/graspgen_bundle
 ```
 
 显示交互式 Open3D 视图和分数标签：
@@ -483,7 +499,7 @@ test -d "$fixture_dir" && source .shrc_local && \
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/debug_graspgen.py \
+  ros2 run manipulation_service debug_graspgen \
   --data-dir "$fixture_dir" \
   --show \
   --show-scores
@@ -494,7 +510,7 @@ test -d "$fixture_dir" && source .shrc_local && \
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/debug_graspgen.py \
+  ros2 run manipulation_service debug_graspgen \
   --data-dir "$fixture_dir" \
   --no-enable-tabletop-filter \
   --no-require-tabletop-filter
@@ -503,14 +519,21 @@ test -d "$fixture_dir" && source .shrc_local && \
 常用参数：
 
 - `--data-dir`：已有 RGB-D/mask fixture 目录；历史 `outputs/grounded_sam2/...` 数据仍可直接 replay。
+- `--inference-backend`：`local_cuda`（默认，与 planner 节点一致）或 `ascend_local`。
+- `--gripper-config`：bundle 内 gripper 配置文件名，默认 `graspgen_robotiq_2f_140.yml`（与 planner 节点一致）。
+- `--device`：推理设备，默认 `cuda`（与 planner 节点一致）。
+- `--deployment-name`：模型 deployment 覆盖，默认空（与 planner 节点一致）。
+- `--ascend-device-id`：`ascend_local` 后端的 Ascend 设备号，默认 `0`。
+- `--model-dir`：GraspGen bundle 根目录，默认 `$WORKSPACE/models/graspgen`。
+- `--manifest-path`：显式 inference manifest 路径，默认 `<model-dir>/inference_manifest.json`。
 - `--show`：打开 Open3D 交互式 3D 视图；无桌面环境时不要加。
 - `--show-scores`：在可视化中显示 confidence 标签。
 - `--show-scene`：显示完整 scene 点云；默认只显示目标点云，更清晰。
 - `--collision-gripper`：碰撞过滤和可视化使用的 gripper 名称；默认沿用模型 gripper。
 - `--max-save-grasps`：写入 PLY 的 top grasp 数量，默认 `10`。
-- `--num-grasps`：每轮生成候选数，默认 `800`。
-- `--topk-num-grasps`：每轮保留 top-K，默认 `50`。
-- `--min-grasps`：累计达到该数量后停止，默认 `5`。
+- `--num-grasps`：每轮生成候选数，默认 `1500`。
+- `--topk-num-grasps`：每轮保留 top-K，默认 `200`。
+- `--min-grasps`：累计达到该数量后停止，默认 `80`。
 - `--max-tries`：最多推理轮数，默认 `4`。
 - `--grasp-threshold`：GraspGen discriminator 阈值，默认 `0.5`。
 - `--collision-threshold`：碰撞距离阈值，单位米，默认 `0.005`。
@@ -555,7 +578,7 @@ runtime info 正确后，再进入本包调 GraspGen。
 
 ### 只调 GraspGen，不启动 ROS service
 
-使用已有 RGB-D/mask fixture 目录运行 `debug_graspgen.py`。这样可以排除
+使用已有 RGB-D/mask fixture 目录运行 `ros2 run manipulation_service debug_graspgen`。这样可以排除
 ROS topic 同步、service timeout 和在线 perception 的影响。
 
 ### 调完整在线链路
@@ -589,6 +612,28 @@ ROS topic 同步、service timeout 和在线 perception 的影响。
 - HTML/PNG 未立刻出现：预览在后台线程生成，等待几秒后查看
   `grasp_preview_meta.json`。
 - `ModuleNotFoundError`：未执行 `source .shrc_local`，或 GraspGen 依赖未安装。
+
+## 包内模块结构
+
+`manipulation_service` Python 包按职责拆分为以下模块（每个模块 ≤ 1000 行；
+`test/test_package_layout.py` 以回归测试固化该布局）：
+
+- `grasp_types.py`：`GraspCandidate` / `GraspDiagnostic` 数据类型。
+- `graspgen_backend.py`：`LocalPipelineBackend`（统一 runtime 内的 GraspGen 推理后端）与
+  模型元数据、bundle 解析。
+- `point_clouds.py`：深度/mask 转点云、mask 对齐、outlier removal、下采样（ROS-free）。
+- `point_cloud_completion.py`：目标点云补全与 scene 桌面补点（ROS-free）。
+- `table_plane.py`：桌面 RANSAC 拟合、执行桌面拟合（后台线程 start/join）与 tabletop
+  clearance 过滤阶段（ROS-free）。`TablePlane` 是规划侧相机系平面类型；执行侧
+  `manipulation_execution.geometry.TablePlane` 由 `PlanGrasp` 消息字段在 base frame 重建，
+  两者不共用 Python 类型。
+- `candidate_width.py`：候选目标宽度估计（ROS-free）。
+- `params.py` / `diagnostics.py` / `detection_geometry.py` / `debug_viz.py`：参数解析、
+  诊断序列化、检测几何和调试可视化（PLY/mesh/预览；ROS-free）。
+- `graspgen_wrapper.py`：`GraspGenWrapper` 规划编排。
+- `grasp_planner_node.py`：ROS 节点适配（`GraspPlannerNode`）。
+- `grasp_verification.py` / `grasp_verifier_node.py`：抓取验证。
+- `debug_graspgen.py`：离线调试工具（`debug_graspgen` console script）。
 
 ## 架构边界
 

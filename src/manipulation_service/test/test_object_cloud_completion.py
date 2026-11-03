@@ -1,10 +1,10 @@
 import numpy as np
 
-from manipulation_service.graspgen_wrapper import (
-    TablePlane,
+from manipulation_service.point_cloud_completion import (
     complete_object_cloud_prismatic_extrude,
     complete_scene_cloud_table_holes,
 )
+from manipulation_service.table_plane import TablePlane
 
 
 def test_prismatic_extrude_reaches_tilted_table_without_filling_interior():
