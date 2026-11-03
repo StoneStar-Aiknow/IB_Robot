@@ -22,21 +22,24 @@ from .types import RGBDFrame
 MAX_IMAGE_FEEDBACK_OFFSET_S = 0.1
 
 
-@lru_cache(maxsize=1)
-def observation_hand_mapping() -> HandMapping:
-    """Generate the planning model once per process, outside streaming callbacks."""
-    from .robot_model import planning_model
+@lru_cache(maxsize=2)
+def observation_hand_mapping(side: str = "left") -> HandMapping:
+    """Generate ``side``'s planning model once per process, outside streaming callbacks."""
+    from .robot_model import config_directory, planning_model
 
-    return HandMapping(planning_model())
+    return HandMapping(planning_model(config_directory(side)), side=side)
 
 
 def copy_feedback(feedback: Feedback) -> Feedback:
-    """An owned copy, with the body joints and the left hand checked against the planning model."""
+    """An owned copy, with the body joints and each hand it carries checked against its planning model."""
     positions = dict(zip(BODY_JOINTS, feedback.vector(BODY_JOINTS), strict=True))
     hand = observation_hand_mapping().check(feedback.left_hand).copy()
+    right = feedback.right_hand
+    if right is not None:
+        right = observation_hand_mapping("right").check(right).copy()
     if not np.isfinite(feedback.received_at):
         raise ValueError("Finite feedback source time required")
-    return replace(feedback, positions=positions, left_hand=hand)
+    return replace(feedback, positions=positions, left_hand=hand, right_hand=right)
 
 
 @dataclass(frozen=True)

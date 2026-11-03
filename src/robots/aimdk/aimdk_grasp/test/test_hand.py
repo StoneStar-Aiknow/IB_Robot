@@ -79,3 +79,27 @@ def test_gripper_presets_must_describe_this_hand(tmp_path):
     (gripper / "config.json").write_text(json.dumps({"links": links[:-1], **PRESETS}))
     with pytest.raises(ValueError, match="gripper links"):
         load_gripper_presets(gripper, planning_model())
+
+
+def test_the_right_hand_is_mounted_natively_with_the_same_alias_presets():
+    """One gripper description serves both hands: its alias presets are the right hand's native values."""
+    from aimdk_grasp.joints import HAND_SIGNS
+    from aimdk_grasp.robot_model import config_directory
+
+    left = HandMapping(planning_model(), PRESETS)
+    right = HandMapping(planning_model(config_directory("right")), PRESETS, side="right")
+    assert right.side == "right" and left.side == "left"
+    for name in ("open", "close"):
+        np.testing.assert_allclose(right.preset(name), [PRESETS[name][joint] for joint in HAND_ALIASES])
+        np.testing.assert_allclose(right.preset(name), left.preset(name) * HAND_SIGNS)
+    # Mirror poses of the two hands give the same aliases and coupled distal joints.
+    native = np.asarray(RELEASE) * HAND_SIGNS
+    assert right.to_alias(native) == pytest.approx(left.to_alias(RELEASE))
+    assert right.kinematic_alias(native) == pytest.approx(left.kinematic_alias(RELEASE))
+    np.testing.assert_allclose(right.lower, np.sort(np.c_[left.lower, left.upper] * HAND_SIGNS[:, None])[:, 0])
+    with pytest.raises(ValueError, match="Right hand exceeds"):
+        right.check(native + np.r_[0.0, 4.0, np.zeros(8)])
+    with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+        right.require_open(right.preset("close"))
+    with pytest.raises(ValueError, match="side must be"):
+        HandMapping(planning_model(), PRESETS, side="middle")

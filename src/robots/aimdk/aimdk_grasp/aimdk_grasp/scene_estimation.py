@@ -16,6 +16,7 @@ from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
 
 from aimdk_grasp.frames import ImageTransform, rigid
+from aimdk_grasp.joints import check_side
 from aimdk_grasp.leg_obstacle import leg_obstacle
 from aimdk_grasp.rgbd_to_cloud import mask_depth_to_points
 from aimdk_grasp.types import CameraIntrinsics
@@ -26,6 +27,22 @@ def left_arm_reach():
     from aimdk_grasp.robot_spheres import left_reach_bounds
 
     center, radius, _ = left_reach_bounds()
+    return center, radius
+
+
+def _config_directory(side: str):
+    from aimdk_grasp.robot_model import config_directory
+
+    return config_directory(side)
+
+
+def arm_reach(side: str = "left"):
+    """Cached torso-frame (center, radius) of ``side``'s arm/hand collision spheres."""
+    if side == "left":
+        return left_arm_reach()
+    from aimdk_grasp.robot_spheres import reach_bounds
+
+    center, radius, _ = reach_bounds(side)
     return center, radius
 
 
@@ -62,7 +79,10 @@ class SceneEstimationConfig:
     target_edge_grow_steps: int = 4
     target_edge_radius_m: float = 0.005
     target_edge_min_height_m: float = 0.01
-    # Points the left arm/hand cannot reach are left out of the environment
+    # The arm the scene is estimated for (its planning model's side): the
+    # reach crop below uses that arm's bound.
+    arm_side: str = "left"
+    # Points the planning arm/hand cannot reach are left out of the environment
     # mesh; target points are always kept, and the near field the support fit
     # uses is still self-filtered and fitted (see estimate_scene). The radius
     # is a kinematic upper bound (RobotSphereModel.left_arm_reach,
@@ -95,7 +115,8 @@ class SceneEstimationConfig:
     coarse_leg_shrink_m: float = 0.02
 
     def __post_init__(self):
-        values = [value for value in vars(self).values() if not isinstance(value, bool)]
+        check_side(self.arm_side)
+        values = [value for value in vars(self).values() if not isinstance(value, bool | str)]
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Scene estimation parameters must be finite and positive")
         for name in ("plane_iterations", "max_planes", "min_plane_points", "target_edge_grow_steps"):
@@ -128,13 +149,20 @@ class SceneEstimationConfig:
 LEG_OBSTACLE = "left_leg"
 
 
-def leg_boxes(shrink_m: float) -> dict:
+def leg_obstacle_name(side: str = "left") -> str:
+    """The scene entry name of the planning arm's leg obstacle (``LEG_OBSTACLE`` for the left)."""
+    return f"{check_side(side)}_leg"
+
+
+def leg_boxes(shrink_m: float, side: str = "left") -> dict:
     """{name: cuboid}: one oriented box per pelvis/leg hull (its principal axes), each side pulled in by shrink_m.
 
     A box's corners can stand out of its hull, so these are for the coarse
     planning scene only; the fine check keeps the exact hulls (leg_obstacle).
     """
-    mesh = leg_obstacle()
+    from aimdk_grasp.robot_model import config_directory
+
+    mesh = leg_obstacle(config_directory(side))
     vertices, faces = np.asarray(mesh["vertices"]), np.asarray(mesh["faces"]).reshape(-1, 3)
     edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]]])
     adjacency = coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(len(vertices),) * 2)
@@ -152,7 +180,7 @@ def leg_boxes(shrink_m: float) -> dict:
         if (dims <= 0).any():
             continue  # thinner than twice the shrink: nothing left of it
         quat = Rotation.from_matrix(axes.T).as_quat()[[3, 0, 1, 2]]
-        boxes[f"{LEG_OBSTACLE}_{label}"] = {
+        boxes[f"{leg_obstacle_name(side)}_{label}"] = {
             "dims": dims.tolist(),
             "pose": [*(centre + axes.T @ ((low + high) / 2)).tolist(), *quat.tolist()],
         }
@@ -771,7 +799,7 @@ def prepare_scene(
     reachable = np.ones(len(points), dtype=bool)
     base = np.ones(len(points), dtype=bool)
     if config.crop_to_left_arm_reach:
-        center, radius = left_arm_reach()
+        center, radius = arm_reach(config.arm_side)
         center_camera = torso_from_camera[:3, :3].T @ (center - torso_from_camera[:3, 3])
         offset = points - center_camera.astype(np.float32)
         reachable = np.einsum("ij,ij->i", offset, offset) <= (radius + config.reach_margin_m) ** 2
@@ -892,7 +920,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
     pose = [*translation.tolist(), *Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]].tolist()]
     meshes, mesh_counts, validation_meshes, validation_counts = {}, {}, {}, {}
     if config.leg_obstacle:
-        validation_meshes[LEG_OBSTACLE] = leg_obstacle()
+        validation_meshes[leg_obstacle_name(config.arm_side)] = leg_obstacle(_config_directory(config.arm_side))
     for name, cloud, planning in (("environment", environment, planning_keep), ("target", points[target], target_keep)):
         if not planning.any():
             continue
@@ -935,7 +963,12 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         },
     }
     table = {"table": support.cuboid(config)}
-    scene = {"cuboid": {**table, **(leg_boxes(config.coarse_leg_shrink_m) if config.coarse_leg_boxes else {})}}
+    scene = {
+        "cuboid": {
+            **table,
+            **(leg_boxes(config.coarse_leg_shrink_m, config.arm_side) if config.coarse_leg_boxes else {}),
+        }
+    }
     scene["mesh"] = meshes
     # Both clouds are private advanced-indexing copies; freeze them before deferral.
     target_points = points[target]

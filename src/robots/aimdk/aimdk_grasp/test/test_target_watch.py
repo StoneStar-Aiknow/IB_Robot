@@ -480,3 +480,16 @@ def test_the_background_measures_the_camera_shift_the_imu_misses():
     )
     watcher._run()
     assert watcher.report()["votes"] == {"still": 3, "moved": 0, "unknown": 0}
+
+
+def test_the_right_arm_watch_leaves_out_the_right_arm_and_its_hand(monkeypatch):
+    monkeypatch.undo()  # the real sphere model
+    from aimdk_grasp.robot_model import config_directory
+    from aimdk_grasp.robot_spheres import RobotSphereModel
+    from aimdk_grasp.target_watch import moving_sphere_indices
+
+    links = RobotSphereModel(directory=config_directory("right")).sphere_links
+    right = {links[i] for i in moving_sphere_indices("right")}
+    assert {"right_elbow_link", "right_wrist_roll_link", "R_palm"} <= right
+    assert not any(link.startswith("left_") for link in right) and "torso_link" not in right
+    assert len(moving_sphere_indices("right")) == len(moving_sphere_indices())

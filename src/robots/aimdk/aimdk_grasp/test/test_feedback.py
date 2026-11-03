@@ -47,6 +47,26 @@ def test_only_the_left_hand_is_taken_in_the_platform_order():
     np.testing.assert_allclose(history.latest().left_hand, list(reversed(range(10))))
 
 
+def test_the_right_hand_is_taken_in_its_platform_order_when_the_view_carries_it():
+    history = FeedbackHistory()
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    hand = LEFT_HAND + tuple(reversed(RIGHT_HAND))
+    history.record("joint.hand_state", 10 * MS, hand, [7.0] * 10 + list(range(10)))
+    feedback = history.latest()
+    np.testing.assert_allclose(feedback.hand("right"), list(reversed(range(10))))
+    np.testing.assert_allclose(feedback.hand("left"), [7.0] * 10)
+
+    history = FeedbackHistory()
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, LEFT_HAND, [0.0] * 10)
+    feedback = history.latest()
+    assert feedback.right_hand is None
+    with pytest.raises(ValueError, match="lacks right hand"):
+        feedback.hand("right")
+
+
 def test_an_image_without_feedback_within_50_ms_is_refused():
     history = FeedbackHistory()
     _record(history, 1000 * MS)

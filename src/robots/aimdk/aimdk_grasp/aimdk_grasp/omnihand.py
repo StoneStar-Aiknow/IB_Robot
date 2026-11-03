@@ -1,8 +1,10 @@
 """The OmniHand as the grasp pipeline's end effector.
 
-The left hand is streamed on the runtime's ``joint.hand_stream`` (20 native
+Either hand is streamed on the runtime's ``joint.hand_stream`` (20 native
 values: the left hand's ten driven joints in ``LEFT_HAND`` order, then the
-right's, sent as the zeros the motion-control contract was verified with). The
+right's in ``RIGHT_HAND`` order). The grasping hand (its :class:`HandMapping`'s
+side) takes its ten slots; the other hand's are sent as the zeros the
+motion-control contract was verified with. The
 last command is kept alive between actions, so the hand holds its target while
 the arm moves; after a goal the stream is released and the platform keeps the
 last hand target.
@@ -29,7 +31,7 @@ from manipulation_execution.grasp_pipeline.contracts import EffectorAction, Effe
 from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
-from .joints import LEFT_HAND
+from .joints import HAND_PARTS, check_side
 
 HAND_HZ = 50.0
 HAND_STEP_RAD = 0.01
@@ -68,7 +70,7 @@ GRIP_LOST_S = 0.2
 # last grip's levels would freeze every finger of the next close at once.
 TOUCH_MAX_AGE_S = 0.1
 CONTACT_LAG_RAD = 0.15
-# Native joint indices per finger (LEFT_HAND order), flex joint, touch pad.
+# Native joint indices per finger (HAND_PARTS order, either hand), flex joint, touch pad.
 FINGERS = {
     "thumb": ((0, 1, 2), 2, "thumb"),
     "index": ((3, 4), 4, "index_finger"),
@@ -76,9 +78,12 @@ FINGERS = {
     "ring": ((6, 7), 7, "ring_finger"),
     "pinky": ((8, 9), 9, "little_finger"),
 }
-# The right hand's slots in the 20-value command: the dummy zeros the
+# The idle hand's slots in the 20-value command: the dummy zeros the
 # motion-control contract was verified with (mc_upper_body_r13, mc_stop_r14).
-RIGHT_DUMMY = (0.0,) * 10
+IDLE_DUMMY = (0.0,) * 10
+RIGHT_DUMMY = IDLE_DUMMY
+#: Each hand's offset in the 20-value stream and the hand state view.
+HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
 
 
 class HandIO(Protocol):
@@ -89,7 +94,7 @@ class HandIO(Protocol):
         ...
 
     def touch(self) -> Mapping[str, float] | None:
-        """Max reading per left touch pad (FINGERS pad names), or None without a touch sensor."""
+        """Max reading per touch pad of the grasping hand (FINGERS pad names), or None without a touch sensor."""
         ...
 
     def publish(self, positions: Sequence[float]) -> None: ...
@@ -109,7 +114,7 @@ class _Failed(Exception):
 
 @dataclass
 class OmniHandEffector:
-    """``mapping`` must carry the gripper description's open and close presets."""
+    """``mapping`` must carry the gripper description's open and close presets; its side is the hand driven."""
 
     io: HandIO
     mapping: HandMapping
@@ -271,39 +276,49 @@ class OmniHandEffector:
         sample = self.io.feedback()
         if not sample.healthy or not 0 <= self.io.monotonic() - sample.received_at <= self.feedback_max_age_s:
             raise _Failed("hand feedback unhealthy or stale")
-        left_joints = self.io.channel_joints[: len(LEFT_HAND)]
-        if len(left_joints) != len(LEFT_HAND):
-            raise _Failed("invalid hand feedback: hand stream describes fewer than ten left joints")
+        side = self.mapping.side
+        offset = HAND_OFFSETS[side]
+        joints = self.io.channel_joints[offset : offset + len(HAND_PARTS)]
+        if len(joints) != len(HAND_PARTS):
+            raise _Failed(f"invalid hand feedback: hand stream describes fewer than ten {side} joints")
         try:
-            return self.mapping.check([sample.positions[name] for name in left_joints])
+            return self.mapping.check([sample.positions[name] for name in joints])
         except (KeyError, ValueError) as exc:
             raise _Failed(f"invalid hand feedback: {exc}") from None
 
-    def _send(self, left: np.ndarray) -> None:
-        left = self.mapping.check(left)
+    def _send(self, hand: np.ndarray) -> None:
+        hand = self.mapping.check(hand)
         if self.io.refusal():
             raise _Failed(f"runtime does not admit output: {self.io.refusal()}")
-        self.io.publish([*left.tolist(), *RIGHT_DUMMY])
-        self.command = left.copy()
+        if self.mapping.side == "left":
+            self.io.publish([*hand.tolist(), *IDLE_DUMMY])
+        else:
+            self.io.publish([*IDLE_DUMMY, *hand.tolist()])
+        self.command = hand.copy()
 
-    def _frame(self, left: np.ndarray, cancelled: Flag, name: str) -> None:
+    def _frame(self, hand: np.ndarray, cancelled: Flag, name: str) -> None:
         tick = self.io.monotonic()
         if cancelled():
             raise _Failed(f"cancelled during {name}")
         self._measured()
-        self._send(left)
+        self._send(hand)
         self.io.wait(max(0.0, tick + 1.0 / HAND_HZ - self.io.monotonic()))
 
 
-def left_touch_levels(message) -> dict[str, float] | None:
-    """Max reading of each left pad from the runtime's touch array (layout labels ``left_<pad>``)."""
+def touch_levels(message, side: str) -> dict[str, float] | None:
+    """Max reading of each pad of ``side``'s hand from the runtime's touch array (layout labels ``<side>_<pad>``)."""
+    prefix = f"{check_side(side)}_"
     levels, offset = {}, 0
     for dimension in message.layout.dim:
         cells = list(message.data[offset : offset + dimension.size])
         offset += dimension.size
-        if dimension.label.startswith("left_") and cells:
-            levels[dimension.label[len("left_") :]] = float(max(cells))
+        if dimension.label.startswith(prefix) and cells:
+            levels[dimension.label[len(prefix) :]] = float(max(cells))
     return levels or None
+
+
+def left_touch_levels(message) -> dict[str, float] | None:
+    return touch_levels(message, "left")
 
 
 class RosHandIO:
@@ -312,13 +327,14 @@ class RosHandIO:
     Like the stream's, the touch array is taken when read. Call :meth:`close` before ``node`` is destroyed.
     """
 
-    def __init__(self, node, description: Mapping):
+    def __init__(self, node, description: Mapping, side: str = "left"):
         from std_msgs.msg import Float64MultiArray
 
         from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
         from robot_config.contract_utils import qos_profile_from_dict
         from robot_runtime.on_demand import OnDemandSubscriptions
 
+        self.side = check_side(side)
         interfaces = description["interfaces"]
         # The stream names the joints left_thumb_roll..., the state view L_thumb_roll_joint..., in one order.
         aliases = dict(
@@ -347,7 +363,7 @@ class RosHandIO:
             )
 
     def _on_touch(self, message, received: float | None) -> None:
-        self._touch, self._touch_received = left_touch_levels(message), received_at_or_stale(received)
+        self._touch, self._touch_received = touch_levels(message, self.side), received_at_or_stale(received)
 
     def touch(self) -> Mapping[str, float] | None:
         """The newest touch levels, or None when none is fresh: an old grip's readings are not contact now."""

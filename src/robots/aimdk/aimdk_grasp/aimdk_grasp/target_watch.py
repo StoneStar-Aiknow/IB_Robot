@@ -6,7 +6,7 @@ and hand enter that region, so here pixels covered by the robot in either
 image are left out. The robot cover is the collision-sphere model at each
 image's own image-time feedback, projected into the (undistorted) RGB image.
 The same per-pixel thresholds as the recheck apply to what stays visible.
-Only the moving left arm and hand are projected: the torso, shoulder and
+Only the moving planning arm (left by default) and its hand are projected: the torso, shoulder and
 head spheres sit at or behind the camera plane and would cover the image.
 
 While the arm moves the camera sways and its exposure changes; target_change
@@ -91,13 +91,14 @@ class WatchConfig:
 
 
 @lru_cache(maxsize=1)
-def moving_sphere_indices():
-    """Rows of RobotSphereModel.spheres for the left arm below the shoulder and the left hand."""
+def moving_sphere_indices(side: str = "left"):
+    """Rows of ``side``'s RobotSphereModel.spheres for that arm below the shoulder and its hand."""
+    from .robot_model import config_directory
     from .robot_spheres import RobotSphereModel
 
-    moving = ("left_elbow_link", "left_wrist_yaw_link", "left_wrist_pitch_link", "left_wrist_roll_link")
-    links = RobotSphereModel().sphere_links
-    # R_* are the left OmniHand's links (the hand model keeps its own names).
+    moving = tuple(f"{side}_{link}" for link in ("elbow_link", "wrist_yaw_link", "wrist_pitch_link", "wrist_roll_link"))
+    links = RobotSphereModel(directory=config_directory(side)).sphere_links
+    # R_* are the planning hand's links (the hand model keeps its own names).
     return np.array([i for i, link in enumerate(links) if link in moving or link.startswith("R_")])
 
 
@@ -525,6 +526,7 @@ class ExecutionWatcher:
         require_orientation=False,
         source_clock=None,
         max_image_age_s=float("inf"),
+        side="left",
     ):
         """``source_clock``: the clock observations are stamped on (``received_at``), when it is not ``clock``."""
         self.request = request
@@ -543,7 +545,7 @@ class ExecutionWatcher:
             max(cols.min() - pad, 0),
             min(cols.max() + pad + 1, width),
         )
-        self.moving = moving_sphere_indices()
+        self.moving = moving_sphere_indices() if side == "left" else moving_sphere_indices(side)
         reference_spheres = spheres(request.image_feedback or request.feedback)[self.moving]
         reference_robot = robot_pixel_mask(
             reference_spheres, request.transform.base_from_camera, request.intrinsics, mask.shape, config.robot_margin_m

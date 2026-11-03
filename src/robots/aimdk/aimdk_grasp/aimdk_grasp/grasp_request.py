@@ -2,7 +2,7 @@
 
 Ported from the planning half of the X2 pipeline's request processor. The
 request was admitted at capture (fresh feedback and image, see HeadCamera);
-here the hand must be open, candidates out of left-palm reach are dropped and
+here the hand must be open, candidates out of the planning palm's reach are dropped and
 the most confident ``max_planning_candidates`` of the rest are planned with
 cuRobo at the admitted snapshot time. The plan must keep the start and the
 shared segment endpoints, and the target must be unchanged in a strictly
@@ -38,7 +38,7 @@ from manipulation_execution.grasp_pipeline.contracts import (
 
 from .arm_gravity import ArmGravity, require_executable
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
-from .joints import LEFT_ARM
+from .joints import arm_joints
 from .observation import AdmittedState, LiveState
 from .planner import PlannerFault, palm_goals_from_camera_grasps
 from .revalidation import ReobserveRequired, RevalidationConfig, require_fresh, require_posture, require_stable_patch
@@ -101,7 +101,17 @@ def left_palm_reach():
     return center, radius
 
 
-def prefilter_candidates(grasps, confidence, base_from_camera, grasp_to_palm, max_candidates):
+def palm_reach(side: str = "left"):
+    """:func:`left_palm_reach` for either arm's planning model."""
+    if side == "left":
+        return left_palm_reach()
+    from .robot_spheres import reach_bounds
+
+    center, _, radius = reach_bounds(side)
+    return center, radius
+
+
+def prefilter_candidates(grasps, confidence, base_from_camera, grasp_to_palm, max_candidates, side: str = "left"):
     """Indices of the most confident candidates whose palm goal is kinematically reachable.
 
     No reachable palm origin lies outside the bound, and IK accepts goals
@@ -109,7 +119,7 @@ def prefilter_candidates(grasps, confidence, base_from_camera, grasp_to_palm, ma
     solve. On recorded live inputs about half of GraspGen-X's candidates lie
     beyond it.
     """
-    center, radius = left_palm_reach()
+    center, radius = palm_reach(side)
     goals = palm_goals_from_camera_grasps(grasps, base_from_camera, grasp_to_palm)
     reach = np.linalg.norm(goals[:, :3, 3] - center, axis=1) <= radius + IK_POSITION_TOLERANCE_M
     order = np.flatnonzero(reach)[np.argsort(-np.asarray(confidence)[reach], kind="stable")]
@@ -127,17 +137,17 @@ def check_initial_hand(mapping: HandMapping, admitted: AdmittedState) -> dict:
     live = admitted.live
     for name, feedback in (("current", live.feedback), ("image", live.observation.image_feedback)):
         try:
-            errors[name + "_max_error_rad"] = mapping.require_open(feedback.left_hand)
+            errors[name + "_max_error_rad"] = mapping.require_open(feedback.hand(mapping.side))
         except RuntimeError as exc:
             raise RuntimeError(f"{name.capitalize()} feedback: {exc}") from exc
     return dict(preset="open", confirmed=True, tolerance_rad=OPEN_HAND_TOLERANCE_RAD, **errors)
 
 
-def segment(name: str, trajectory) -> ArmSegment:
-    return ArmSegment(name, SegmentKind.TRAJECTORY, LEFT_ARM, trajectory.positions, trajectory.times)
+def segment(name: str, trajectory, side: str = "left") -> ArmSegment:
+    return ArmSegment(name, SegmentKind.TRAJECTORY, arm_joints(side), trajectory.positions, trajectory.times)
 
 
-def grasp_steps(plan) -> tuple:
+def grasp_steps(plan, side: str = "left") -> tuple:
     """The X2 sequence. A lift the planner did not plan (it only holds the grasp pose) is refused, as the X2
     pipeline's preflight refused ``lift_not_planned``: closing and holding in place would report a pick that never
     left the table."""
@@ -145,17 +155,17 @@ def grasp_steps(plan) -> tuple:
         raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "the planner did not plan a lift for this candidate")
     return (
         Effect(EffectorAction.PRESHAPE),
-        Move(segment("approach", plan.approach)),
-        Move(segment("grasp", plan.grasp)),
+        Move(segment("approach", plan.approach, side)),
+        Move(segment("grasp", plan.grasp, side)),
         Hold(GRASP_SETTLE_S, "settle_grasp"),
         Effect(EffectorAction.CLOSE),
-        Move(segment("lift", plan.lift)),
+        Move(segment("lift", plan.lift, side)),
         Hold(LIFT_HOLD_S, "hold_lifted"),
     )
 
 
 class X2GraspPlanner:
-    """``GraspPlanner`` for the X2 left arm over the warmed GraspPlanningService.
+    """``GraspPlanner`` for one X2 arm (``hand.side``) over that arm's warmed GraspPlanningService.
 
     ``latest_state`` takes a newer capture for the target recheck
     (HeadCamera.capture_state); ``clock`` is the source clock it is judged on.
@@ -255,11 +265,12 @@ class X2GraspPlanner:
                     transform.base_from_camera,
                     self.grasp_to_palm,
                     self.config.max_planning_candidates,
+                    self.hand.side,
                 ),
             )
             report["candidate_prefilter"]["kept_indices"] = kept.tolist()
             if not len(kept):
-                raise RuntimeError("No grasp candidate within left-palm reach")
+                raise RuntimeError(f"No grasp candidate within {self.hand.side}-palm reach")
         check_deadline()
         try:
             plan, planning = measure(
@@ -285,7 +296,7 @@ class X2GraspPlanner:
         report["generated_candidate_index"] = int(kept[report["candidate_index"]])
         error = float(
             max(
-                np.abs(plan.approach.positions[0] - start.vector(LEFT_ARM)).max(),
+                np.abs(plan.approach.positions[0] - start.vector(arm_joints(self.hand.side))).max(),
                 np.abs(plan.grasp.positions[0] - plan.approach.positions[-1]).max(),
                 np.abs(plan.lift.positions[0] - plan.grasp.positions[-1]).max(),
             )
@@ -308,7 +319,7 @@ class X2GraspPlanner:
             raise ValueError(f"gravity compensation refused the plan: {exc}") from exc
         report["full_plan_valid"] = True
         report["request_timings_s"]["complete_plan_ready"] = time.monotonic() - admitted.started
-        return GraspPlan(grasp_steps(plan), report["generated_candidate_index"], None, report)
+        return GraspPlan(grasp_steps(plan, self.hand.side), report["generated_candidate_index"], None, report)
 
     def _recheck_target(self, planned, start, mask) -> dict:
         limits = self.config.revalidation
@@ -326,7 +337,7 @@ class X2GraspPlanner:
         # Strictly newer: the planned image compared with itself proves nothing.
         if state.observation.transform.stamp_ns <= planned.transform.stamp_ns:
             raise ReobserveRequired("Latest observation is not newer than the planned image")
-        posture_error = require_posture(start, state.feedback, limits)
+        posture_error = require_posture(start, state.feedback, limits, side=self.hand.side)
         patch = require_stable_patch(planned, state.observation, mask, limits)
         return dict(
             patch,

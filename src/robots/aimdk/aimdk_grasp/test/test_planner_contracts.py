@@ -104,3 +104,45 @@ def test_graspgen_base_is_converted_to_r_palm_from_the_gripper_description():
 def test_graspgen_transform_rejects_nonrigid_inputs():
     with pytest.raises(ValueError, match="proper"):
         palm_goal_from_camera_grasp(np.diag([2, 1, 1, 1]), np.eye(4), np.eye(4))
+
+
+def test_the_right_arm_plans_on_its_own_model_with_the_left_arm_and_head_locked():
+    from aimdk_grasp.planner import screen_robot_config
+    from aimdk_grasp.robot_model import config_directory
+
+    right_model = planning_model(config_directory("right"))
+    right_hand = HandMapping(right_model, PRESETS, side="right")
+    positions = dict.fromkeys(RIGHT_ARM + HEAD, 0.0)
+    positions.update(zip(LEFT_ARM, np.linspace(-0.3, 0.3, 7), strict=True))
+    feedback = Feedback(0.0, positions, np.zeros(10), right_hand=right_hand.preset("open"))
+    kin = robot_config(feedback, side="right")["robot_cfg"]["kinematics"]
+    assert kin["cspace"]["default_joint_position"] == [0.0] * 7
+    for name, value in zip(LEFT_ARM, np.linspace(-0.3, 0.3, 7), strict=True):
+        assert kin["lock_joints"][name] == pytest.approx(value)
+    assert not set(RIGHT_ARM) & set(kin["lock_joints"])
+    # The right hand's own (native) open pose is locked as the R_* joints.
+    for name, value in right_hand.kinematic_alias(right_hand.preset("open")).items():
+        assert kin["lock_joints"][name] == pytest.approx(value)
+    screen = screen_robot_config(robot_config(feedback, side="right"), set(hand_links(right_model)), "right")
+    screen = screen["robot_cfg"]["kinematics"]
+    assert screen["collision_link_names"] and all(link.startswith("right_") for link in screen["collision_link_names"])
+    # Without the right hand in the feedback the right arm cannot be planned.
+    with pytest.raises(ValueError, match="lacks right hand"):
+        robot_config(Feedback(0.0, positions, np.zeros(10)), side="right")
+
+
+def test_a_right_arm_plan_keeps_the_right_joints_and_the_locked_left_arm():
+    """cuRobo returns the planned right arm beside the locked left one (mock E2E 2026-11-03 refused it)."""
+    names = LEFT_ARM[:1] + tuple(reversed(RIGHT_ARM))
+    q = np.zeros((4, 8))
+    q[:, 0] = -0.1
+    q[:, 1:] = np.arange(7) * 0.1
+    locked = {LEFT_ARM[0]: -0.1}
+    trajectory = TimedTrajectory.from_curobo(result(names, q), 0.02, locked_positions=locked, arm=RIGHT_ARM)
+    assert trajectory.joint_names == RIGHT_ARM
+    np.testing.assert_allclose(trajectory.positions[0], (np.arange(7) * 0.1)[::-1])
+    assert trajectory.reversed().joint_names == RIGHT_ARM and trajectory.trimmed().joint_names == RIGHT_ARM
+    with pytest.raises(ValueError, match="Unexpected cuRobo planned joints"):
+        TimedTrajectory.from_curobo(result(names, q), 0.02, locked_positions=locked)  # planned as the left arm
+    with pytest.raises(ValueError, match="seven joints of one arm"):
+        TimedTrajectory(np.array([0.0, 0.1]), np.zeros((2, 7)), LEFT_ARM[:6] + RIGHT_ARM[:1])

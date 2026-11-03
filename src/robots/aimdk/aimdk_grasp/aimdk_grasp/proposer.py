@@ -184,7 +184,8 @@ class PerceptionSettings:
 
 def measured_spheres(model: RobotSphereModel, feedback) -> np.ndarray:
     """Torso-frame collision spheres of the measured pose."""
-    spheres, _ = model.spheres(feedback, feedback.vector(LEFT_ARM)[None])
+    # The planning arm's joints (a model without ``arm`` plans the left arm).
+    spheres, _ = model.spheres(feedback, feedback.vector(getattr(model, "arm", LEFT_ARM))[None])
     return spheres[0].copy()
 
 

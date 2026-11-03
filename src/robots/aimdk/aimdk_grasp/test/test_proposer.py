@@ -141,17 +141,19 @@ def test_only_unsupported_detections_end_the_pick():
     assert raised.value.code == NO_EXECUTABLE_CANDIDATE and "NoSupportError" in str(raised.value)
 
 
-def test_an_unseen_target_is_reported_as_not_visible_not_as_a_planning_failure():
-    """The caller must tell "not seen" (look elsewhere, ask) from "seen but not graspable"."""
-    with pytest.raises(GraspFailure, match="No target detected for 'red cup .'") as raised:
-        propose(FakeModels([]))
-    assert raised.value.code == "TARGET_NOT_VISIBLE" and not raised.value.retryable
-
-
-def test_too_little_depth_ends_the_pick():
-    with pytest.raises(GraspFailure, match="insufficient valid depth") as raised:
-        propose(FakeModels([Detection("cup", 0.9, np.array([0, 0, 3, 3], np.float32))]))
-    assert raised.value.code == NO_EXECUTABLE_CANDIDATE and not raised.value.retryable
+@pytest.mark.parametrize(
+    ("detections", "message"),
+    [
+        ([], "No target detected"),
+        ([Detection("cup", 0.9, np.array([0, 0, 3, 3], np.float32))], "insufficient valid depth"),
+    ],
+)
+def test_no_target_or_too_little_depth_ends_the_pick(detections, message):
+    """Keep the baseline cases while distinguishing an unseen target from an ungraspable one."""
+    with pytest.raises(GraspFailure, match=message) as raised:
+        propose(FakeModels(detections))
+    assert raised.value.code == (NO_EXECUTABLE_CANDIDATE if detections else "TARGET_NOT_VISIBLE")
+    assert not raised.value.retryable
 
 
 def test_a_failed_preload_is_reported_and_left_to_the_planner():

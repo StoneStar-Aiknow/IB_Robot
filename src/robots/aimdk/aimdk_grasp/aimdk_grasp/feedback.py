@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .joints import BODY_JOINTS, LEFT_HAND
+from .joints import BODY_JOINTS, LEFT_HAND, RIGHT_HAND, check_side
 
 #: The runtime interface IDs the feedback is assembled from, and the joints each
 #: must provide. Every view is required: an observation without the head pose
@@ -54,12 +54,24 @@ class Feedback:
     reported unhealthy, because the views keep flowing from the data plane
     after the runtime's own process has stopped; joint-level faults are
     reported by the runtime, not re-derived here.
+
+    ``left_hand`` is required; ``right_hand`` is None when the hand view did
+    not carry the right hand, and :meth:`hand` refuses it for a right-hand grasp.
     """
 
     received_at: float
     positions: Mapping[str, float]
     left_hand: np.ndarray
     healthy: bool = True
+    right_hand: np.ndarray | None = None
+
+    def hand(self, side: str) -> np.ndarray:
+        """Native finger positions of ``side``'s hand, in ``hand_joints(side)`` order."""
+        if check_side(side) == "left":
+            return self.left_hand
+        if self.right_hand is None:
+            raise ValueError("Feedback lacks right hand joints")
+        return self.right_hand
 
     def vector(self, names: Iterable[str]) -> np.ndarray:
         result = np.array([self.positions[name] for name in names], dtype=float)
@@ -154,6 +166,11 @@ def _assemble(samples: Mapping[str, tuple[int, dict[str, float]]], healthy: bool
     left_hand = np.array([hand[name] for name in LEFT_HAND], dtype=np.float64)
     if not np.isfinite(left_hand).all():
         raise ValueError("Nonfinite left hand feedback")
-    feedback = Feedback(min(stamps) * 1e-9, positions, left_hand, healthy)
+    right_hand = None
+    if all(name in hand for name in RIGHT_HAND):
+        right_hand = np.array([hand[name] for name in RIGHT_HAND], dtype=np.float64)
+        if not np.isfinite(right_hand).all():
+            raise ValueError("Nonfinite right hand feedback")
+    feedback = Feedback(min(stamps) * 1e-9, positions, left_hand, healthy, right_hand)
     feedback.vector(BODY_JOINTS)
     return feedback

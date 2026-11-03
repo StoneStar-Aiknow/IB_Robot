@@ -12,6 +12,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config/x2_ultra", glob("config/x2_ultra/*")),
+        ("share/" + package_name + "/config/x2_ultra_right", glob("config/x2_ultra_right/*")),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools"],
@@ -24,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "fit_x2_torso_cover = aimdk_grasp.torso_cover:main",
+            "mirror_x2_side_config = aimdk_grasp.mirror_side:main",
             "export_x2_leg_obstacle = aimdk_grasp.leg_obstacle:main",
             "replay_x2_plan_inputs = aimdk_grasp.plan_replay:main",
             "x2_grasp_head_node = aimdk_grasp.grasp_head:main",

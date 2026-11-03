@@ -1,8 +1,10 @@
 """The X2 Ultra planning model and its cuRobo collision configuration.
 
-``config/x2_ultra`` holds the cuRobo robot configuration; its URDF is generated
-from ``aimdk_description`` (:mod:`aimdk_grasp.planning_model`), with the left arm
-narrowed to the ``arm_limits`` of the robot configuration ``robot.yml`` names. Every collision
+``config/x2_ultra`` holds the left arm's cuRobo robot configuration and
+``config/x2_ultra_right`` the right arm's, generated from it by
+:mod:`aimdk_grasp.mirror_side`. Each URDF is generated from ``aimdk_description``
+(:mod:`aimdk_grasp.planning_model`) for the ``side`` its ``robot.yml`` names, with
+that arm narrowed to the ``arm_limits`` of the robot configuration it names. Every collision
 cover is bound to the description files it was fitted or checked on, and is
 refused if they changed.
 """
@@ -23,17 +25,30 @@ from pathlib import Path
 import yaml
 
 from aimdk_grasp.hand import hand_links
-from aimdk_grasp.joints import LEFT_ARM
+from aimdk_grasp.joints import arm_joints, check_side
 from aimdk_grasp.planning_model import build_planning_model, description_share
 
-#: Wrist links the hand's reference exclusions may also name.
+#: Wrist links the hand's reference exclusions may also name, for the left arm.
 HAND_MOUNT = ("left_wrist_yaw_link", "left_wrist_pitch_link", "left_wrist_roll_link")
+#: Configuration directory of each arm under the package's ``config``.
+CONFIG_DIRECTORIES = {"left": "x2_ultra", "right": "x2_ultra_right"}
 
 
-def config_directory() -> Path:
+def hand_mount(side: str) -> tuple[str, ...]:
+    """The wrist links the hand of ``side``'s planning model is mounted on."""
+    return tuple(f"{check_side(side)}_" + name[len("left_") :] for name in HAND_MOUNT)
+
+
+def model_side(directory: Path | None = None) -> str:
+    """The arm the planning model in ``directory`` plans (its ``planning_model.side``, default ``left``)."""
+    config, _ = _load(str(directory or config_directory()))
+    return check_side((config.get("planning_model") or {}).get("side", "left"))
+
+
+def config_directory(side: str = "left") -> Path:
     from ament_index_python.packages import get_package_share_directory
 
-    return Path(get_package_share_directory("aimdk_grasp")) / "config" / "x2_ultra"
+    return Path(get_package_share_directory("aimdk_grasp")) / "config" / CONFIG_DIRECTORIES[check_side(side)]
 
 
 def _read_json(path: Path) -> dict:
@@ -54,17 +69,17 @@ def _sphere_digest(spheres) -> str:
     return hashlib.sha256(json.dumps(spheres, sort_keys=True).encode()).hexdigest()
 
 
-def left_arm_limits(robot: Mapping) -> dict[str, tuple[float, float]]:
-    """The left-arm entries of a loaded robot configuration's ``arm_limits``.
+def side_arm_limits(robot: Mapping, side: str) -> dict[str, tuple[float, float]]:
+    """The ``side`` arm's entries of a loaded robot configuration's ``arm_limits``.
 
-    Every left-arm joint must be present with a finite, increasing range; the
+    Every joint of that arm must be present with a finite, increasing range; the
     other arm's entries are not read.
     """
     limits = robot.get("arm_limits")
     if not isinstance(limits, Mapping):
         raise ValueError("robot configuration has no arm_limits mapping")
     result = {}
-    for name in LEFT_ARM:
+    for name in arm_joints(side):
         value = limits.get(name)
         if (
             not isinstance(value, list | tuple)
@@ -77,18 +92,25 @@ def left_arm_limits(robot: Mapping) -> dict[str, tuple[float, float]]:
     return result
 
 
+def left_arm_limits(robot: Mapping) -> dict[str, tuple[float, float]]:
+    """The left-arm entries of a loaded robot configuration's ``arm_limits``."""
+    return side_arm_limits(robot, "left")
+
+
 def planning_model_options(options: Mapping) -> dict:
     """``robot.yml``'s ``planning_model`` block as :func:`build_planning_model` keywords.
 
     ``arm_limits_config`` names the robot configuration whose ``arm_limits``
-    narrow the left arm; it is resolved like any other robot configuration name.
+    narrow the planning arm, ``side`` (default ``left``); it is resolved like
+    any other robot configuration name.
     """
     from robot_config.config_path import resolve_robot_config_path
     from robot_config.loader import load_robot_config_dict
 
     options = dict(options)
     path = resolve_robot_config_path(config_name=str(options.pop("arm_limits_config")))
-    options["arm_limits"] = left_arm_limits(load_robot_config_dict(str(path), defer_interface_binding=True))
+    robot = load_robot_config_dict(str(path), defer_interface_binding=True)
+    options["arm_limits"] = side_arm_limits(robot, options.get("side", "left"))
     return options
 
 
@@ -106,7 +128,7 @@ def _arm_limits(directory: str) -> tuple[tuple[str, tuple[float, float]], ...]:
 
 
 def arm_limits(directory: Path | None = None) -> dict[str, tuple[float, float]]:
-    """The MC-enforced left-arm limits the planning model was narrowed to (``planning_model.arm_limits_config``)."""
+    """The MC-enforced limits the planning arm was narrowed to (``planning_model.arm_limits_config``)."""
     return dict(_arm_limits(str(directory or config_directory())))
 
 
@@ -181,13 +203,14 @@ def collision_robot_config(
     kinematics["urdf_path"] = str(planning_urdf(directory))
     kinematics["asset_root_path"] = str(description)
     hand = set(hand_links(model))
+    mount = set(hand_mount((loaded.get("planning_model") or {}).get("side", "left")))
 
     reference = _read_json(directory / "hand_collision_reference.json")
     if _sphere_digest(kinematics["collision_spheres"]) != reference["collision_spheres_sha256"]:
         raise ValueError("Reference exclusions do not match source collision spheres")
     if reference_hand_collisions:
         for a, b in reference["pairs"]:
-            if not ((a in hand and b in hand | set(HAND_MOUNT)) or (b in hand and a in HAND_MOUNT)):
+            if not ((a in hand and b in hand | mount) or (b in hand and a in mount)):
                 raise ValueError("Reference exclusion outside hand/mount scope")
             _ignore(kinematics, a, b)
 

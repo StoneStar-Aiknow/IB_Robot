@@ -1,0 +1,190 @@
+{
+  "description": "Right-arm gravity torques in torso_link; sag = torque / kp (MC URS gain 40)",
+  "kp": 40.0,
+  "torso_tilt_roll_rad": 0.008903763,
+  "torso_tilt_pitch_rad": 0.179268602,
+  "payload_kg": 0.244904987,
+  "payload_offset_m": [
+    0.0,
+    0.0,
+    -0.12
+  ],
+  "chain": [
+    {
+      "joint": "right_shoulder_pitch_joint",
+      "xyz": [
+        0.00330093831251838,
+        -0.143030971450747,
+        0.241648201390685
+      ],
+      "rpy": [
+        -0.209442812383636,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "mass": 0.885544,
+      "centre": [
+        0.002721,
+        -0.050304,
+        3.4e-05
+      ]
+    },
+    {
+      "joint": "right_shoulder_roll_joint",
+      "xyz": [
+        -0.000499999994070091,
+        -0.0495000000000002,
+        0.0
+      ],
+      "rpy": [
+        0.0,
+        0.000154003092926045,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "mass": 0.696963,
+      "centre": [
+        0.000598,
+        0.000185,
+        -0.079928
+      ]
+    },
+    {
+      "joint": "right_shoulder_yaw_joint",
+      "xyz": [
+        0.000499999999999765,
+        0.0,
+        -0.121199999999934
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "mass": 0.704661,
+      "centre": [
+        0.010082,
+        -0.000178,
+        -0.069484
+      ]
+    },
+    {
+      "joint": "right_elbow_joint",
+      "xyz": [
+        0.0139999999999662,
+        -0.0002000000000143,
+        -0.0829500000000745
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "mass": 0.687932,
+      "centre": [
+        -0.013517,
+        -0.003463,
+        -0.080438
+      ]
+    },
+    {
+      "joint": "right_wrist_yaw_joint",
+      "xyz": [
+        -0.0140000017961392,
+        9.7526096753231e-05,
+        -0.120694276209686
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        3.27341906322599e-05
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "mass": 0.372787,
+      "centre": [
+        0.000153,
+        -0.006979,
+        -0.032069
+      ]
+    },
+    {
+      "joint": "right_wrist_pitch_joint",
+      "xyz": [
+        0.0,
+        0.0,
+        -0.081799999999999
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        -3.27341932546355e-05
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "mass": 0.279175,
+      "centre": [
+        0.012092,
+        -0.002544,
+        0.001781
+      ]
+    },
+    {
+      "joint": "right_wrist_roll_joint",
+      "xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "mass": 0.303847,
+      "centre": [
+        0.003056,
+        0.00138,
+        -0.082799
+      ]
+    }
+  ],
+  "source": {
+    "urdf": "log/validation/mc_arm_r17/runtime_snapshot/x2_31dof_hand.urdf",
+    "urdf_sha256": "60399346c15d0855ef6a4756eb88eb74c5d9ba2e973f05a83db8cebb483eb17c",
+    "fit": "log/validation/mc_grav_r25/analysis.json",
+    "fit_sha256": "7bf64eee01d210626370db1d313b5fd90e9a283f1f3044c506692cf6937d2a5d",
+    "fit_phase": "STAND_DEFAULT",
+    "mirrored_from": "config/x2_ultra/arm_gravity.json"
+  }
+}

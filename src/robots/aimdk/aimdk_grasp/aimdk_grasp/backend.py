@@ -5,13 +5,17 @@ them all in one process; ``aimdk_grasp.remote_head:x2_remote_grasp_backends``
 splits them across the pipeline's host and the grasp head's (``aimdk_grasp.split``,
 a temporary X2 deployment). The head camera
 observes, the perception services (GroundingDINO + SAM2 or grounded SAM2, and
-GraspGen-X, on CUDA or the Ascend 310P) propose, cuRobo plans the left arm, the
-arm streams with its gravity raise and the left OmniHand grips. The gripper
+GraspGen-X, on CUDA or the Ascend 310P) propose, cuRobo plans one arm
+(``arm_side``, the left by default), the arm streams with its gravity raise and
+that side's OmniHand grips. The gripper
 description is the deployed GraspGen-X bundle's
 (``grasp_execution.model_bundle_path``): candidates are generated for it.
 
 ``grasp_execution.backend_options`` (all optional):
 
+- ``arm_side``: ``left`` (default) or ``right``, the arm and hand every part
+  plans, watches, streams and grips with (its planning model, gravity model,
+  limits, leg obstacle and hand)
 - ``detect_service``, ``segment_service`` (empty: the detector returns its
   own masks), ``generate_grasps_service``, ``service_timeout_s``
 - ``registration_device``, ``depth_scale``, ``calibration_verified``
@@ -35,7 +39,7 @@ import re
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +53,7 @@ from .proposer import PerceptionSettings, X2Proposer, measured_spheres
 from .split import head_options
 
 DEFAULTS = {
+    "arm_side": "left",
     "detect_service": "/perception/grasp/grounding_detect",
     "segment_service": "",
     "generate_grasps_service": "/perception/grasp/generate_grasps",
@@ -97,6 +102,8 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
         if not ok:
             kind = type(default).__name__ if isinstance(default, bool | str | dict) else "finite number"
             raise ValueError(f"backend_options.{name} must be a {kind}")
+    if options["arm_side"] not in ("left", "right"):
+        raise ValueError("backend_options.arm_side must be left or right")
     if options["watch"] not in ("stop", "log", "off"):
         raise ValueError("backend_options.watch must be stop, log or off")
     for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s"):
@@ -189,12 +196,14 @@ class X2Robot:
     hand: Any
     gravity: Any
     limits: Any
+    #: The arm (and hand) everything plans and drives: ``backend_options.arm_side``.
+    side: str = "left"
 
 
 def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     from .arm_gravity import ArmGravity
     from .hand import HandMapping, load_gripper_description
-    from .robot_model import arm_limits, planning_model
+    from .robot_model import arm_limits, config_directory, planning_model
 
     _require_declared(grasp_execution)
     if not str(grasp_execution.get("model_deployment") or "").strip():
@@ -205,10 +214,16 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     options = _options(grasp_execution)
     perception = _settings(PerceptionSettings, options["perception"], ("scene",), "perception")
     planning = _settings(GraspRequestConfig, options["planning"], ("revalidation",), "planning")
-    model = planning_model()
+    side = options["arm_side"]
+    # The scene is estimated for the planning arm (its reach crop and leg obstacle).
+    perception = replace(perception, scene=replace(perception.scene, arm_side=side))
+    directory = config_directory(side)
+    model = planning_model(directory)
     gripper = load_gripper_description(gripper_directory(grasp_execution), model)
-    hand = HandMapping(model, {name: dict(gripper[name]) for name in ("open", "close")})
-    return X2Robot(options, perception, planning, gripper, hand, ArmGravity.load(), arm_limits())
+    hand = HandMapping(model, {name: dict(gripper[name]) for name in ("open", "close")}, side=side)
+    return X2Robot(
+        options, perception, planning, gripper, hand, ArmGravity.load(side=side), arm_limits(directory), side
+    )
 
 
 @dataclass
@@ -232,6 +247,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     from .head_camera import HeadCamera
     from .planner import grasp_to_palm_transform
     from .planner_service import GraspPlanningService
+    from .robot_model import config_directory
     from .robot_spheres import RobotSphereModel
 
     options, planning = robot.options, robot.planning
@@ -253,9 +269,10 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         gpu_lock=gpu,
     )
     closers.append(camera.close)
-    spheres = RobotSphereModel()
+    spheres = RobotSphereModel(robot.hand, config_directory(robot.side))
     service = GraspPlanningService(
         gripper=robot.gripper,
+        side=robot.side,
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
         max_goalset=planning.max_goalset,
@@ -285,12 +302,13 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
             timeouts=watch_timeouts(options),
             on_moved=on_moved,
             source_clock=camera.clock,
+            side=robot.side,
         )
     return parts
 
 
 def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: list):
-    """The left arm's streaming executor and the OmniHand effector over the runtime's streams."""
+    """The ``robot.side`` arm's streaming executor and that side's OmniHand effector over the runtime's streams."""
     from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
 
     from .arm_stream import x2_arm_executor
@@ -306,9 +324,9 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
         ),
     )
     closers.append(arm.close)
-    hand_io = RosHandIO(node, description)
+    hand_io = RosHandIO(node, description, robot.side)
     closers.append(hand_io.close)
-    executor = x2_arm_executor(arm, gravity=robot.gravity, limits=robot.limits)
+    executor = x2_arm_executor(arm, gravity=robot.gravity, limits=robot.limits, side=robot.side)
     return executor, OmniHandEffector(hand_io, robot.hand)
 
 

@@ -299,3 +299,16 @@ def test_prepare_complete_recovers_target_pixels_the_crop_dropped(monkeypatch):
         robot_spheres_torso=values["robot_spheres_torso"],
     )
     assert len(prepared.dropped_pixel) and values["target_mask"].reshape(-1)[prepared.dropped_pixel].any()
+
+
+def test_the_crop_and_the_palm_prefilter_follow_the_planning_arm():
+    from aimdk_grasp.grasp_request import palm_reach
+    from aimdk_grasp.robot_spheres import reach_bounds
+
+    # The left bound is patched out in this module (unbounded_left_arm_reach); the right one is not.
+    left, right = reach_bounds("left"), scene_estimation.arm_reach("right")
+    assert left[0][1] > 0.1 and right[0][1] == pytest.approx(-left[0][1], abs=1e-5)
+    assert palm_reach("right")[0][1] == pytest.approx(right[0][1])
+    assert SceneEstimationConfig(arm_side="right").arm_side == "right"
+    with pytest.raises(ValueError, match="side must be"):
+        SceneEstimationConfig(arm_side="both")

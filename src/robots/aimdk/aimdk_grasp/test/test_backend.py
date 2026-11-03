@@ -44,6 +44,9 @@ def test_options_default_to_the_x2_deployment_and_refuse_what_they_do_not_know()
         _options({"backend_options": {"head": {"status_timeout_s": float("nan")}}})
     with pytest.raises(ValueError, match="head has unknown keys \\['nodes'\\]"):
         _options({"backend_options": {"head": {"nodes": "4-7"}}})
+    assert options["arm_side"] == "left" and _options({"backend_options": {"arm_side": "right"}})["arm_side"] == "right"
+    with pytest.raises(ValueError, match="arm_side must be left or right"):
+        _options({"backend_options": {"arm_side": "both"}})
 
 
 def test_the_x2_backends_refuse_a_configuration_that_names_no_model_deployment():
@@ -162,3 +165,24 @@ def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup()
         node.destroy_node()
         if owned and rclpy.ok():
             rclpy.shutdown()
+
+
+@pytest.mark.skipif(not (BUNDLE / "assets" / "adapter.json").is_file(), reason="GraspGen-X bundle not installed")
+def test_arm_side_right_switches_every_part_to_the_right_arm_and_hand():
+    from aimdk_grasp.backend import x2_robot
+    from aimdk_grasp.joints import RIGHT_ARM
+    from aimdk_grasp.robot_model import arm_limits, config_directory
+
+    grasp_execution = {
+        "model_bundle_path": os.fspath(BUNDLE),
+        "model_deployment": "torch_cuda",
+        "command_interfaces": list(COMMAND_INTERFACES),
+    }
+    left = x2_robot(grasp_execution)
+    assert (left.side, left.hand.side, left.gravity.side, left.perception.scene.arm_side) == ("left",) * 4
+    right = x2_robot({**grasp_execution, "backend_options": {"arm_side": "right"}})
+    assert (right.side, right.hand.side, right.gravity.side, right.perception.scene.arm_side) == ("right",) * 4
+    assert right.limits == arm_limits(config_directory("right")) and set(right.limits) == set(RIGHT_ARM)
+    # One gripper description serves both hands: the same alias presets, the right hand's native values.
+    for name in ("open", "close"):
+        assert right.hand.presets[name] == left.hand.presets[name]

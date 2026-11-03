@@ -1,4 +1,4 @@
-"""Left OmniHand joint mapping between native positions and planning-model aliases."""
+"""OmniHand joint mapping between native positions and planning-model aliases, per side."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_SIGNS
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, check_side, hand_alias_signs
 
 OPEN_HAND_TOLERANCE_RAD = 0.025
 
@@ -50,13 +50,19 @@ def load_gripper_presets(gripper: Path, model: ET.Element) -> dict[str, dict[str
 
 
 class HandMapping:
-    """Native left-hand positions (``L_*`` order) to and from mounted ``R_*`` aliases.
+    """Native positions of ``side``'s hand (``hand_joints(side)`` order) to and from mounted ``R_*`` aliases.
 
-    Limits come from the planning model; presets, when given, from the gripper
-    description (:func:`load_gripper_presets`).
+    ``model`` is that side's planning model: the left hand is mounted mirrored
+    (alias = native x ``HAND_SIGNS``), the right hand natively. Limits come
+    from the planning model; presets, when given, from the gripper description
+    (:func:`load_gripper_presets`), in alias space, so one description serves
+    both hands.
     """
 
-    def __init__(self, model: ET.Element, presets: Mapping[str, Mapping[str, float]] | None = None):
+    def __init__(self, model: ET.Element, presets: Mapping[str, Mapping[str, float]] | None = None, side: str = "left"):
+        self.side = check_side(side)
+        self.signs = hand_alias_signs(side)
+
         def limit(name: str) -> tuple[float, float]:
             element = model.find(f"joint[@name='{name}']/limit")
             if element is None:
@@ -64,7 +70,7 @@ class HandMapping:
             return float(element.get("lower")), float(element.get("upper"))
 
         bounds = np.array(
-            [sorted(sign * value for value in limit(name)) for name, sign in zip(HAND_ALIASES, HAND_SIGNS, strict=True)]
+            [sorted(sign * value for value in limit(name)) for name, sign in zip(HAND_ALIASES, self.signs, strict=True)]
         )
         self.lower, self.upper = bounds[:, 0].copy(), bounds[:, 1].copy()
         self.distal_limits = {name: limit(name) for name in DIP_FOLLOWERS}
@@ -76,18 +82,18 @@ class HandMapping:
     def check(self, native) -> np.ndarray:
         q = np.asarray(native, dtype=np.float64)
         if q.shape != (10,) or not np.isfinite(q).all():
-            raise ValueError("Exactly ten finite active left joints required")
+            raise ValueError(f"Exactly ten finite active {self.side} joints required")
         if np.any(q < self.lower - 1e-6) or np.any(q > self.upper + 1e-6):
-            raise ValueError("Left hand exceeds native URDF limits")
+            raise ValueError(f"{self.side.capitalize()} hand exceeds native URDF limits")
         return q
 
     def to_native(self, alias: Mapping[str, float]) -> np.ndarray:
         if set(alias) != set(HAND_ALIASES):
             raise ValueError("Active alias mapping must contain exactly the ten commanded joints")
-        return self.check([sign * alias[name] for name, sign in zip(HAND_ALIASES, HAND_SIGNS, strict=True)])
+        return self.check([sign * alias[name] for name, sign in zip(HAND_ALIASES, self.signs, strict=True)])
 
     def to_alias(self, native) -> dict[str, float]:
-        return dict(zip(HAND_ALIASES, self.check(native) * HAND_SIGNS, strict=True))
+        return dict(zip(HAND_ALIASES, self.check(native) * self.signs, strict=True))
 
     def kinematic_alias(self, native) -> dict[str, float]:
         """Active aliases plus the five model-derived, unmeasured DIP angles."""
@@ -111,7 +117,7 @@ class HandMapping:
         error = float(np.max(np.abs(self.check(native) - self.preset("open"))))
         if error > OPEN_HAND_TOLERANCE_RAD:
             raise RuntimeError(
-                "Initial left hand is not open; open the hand and confirm fresh feedback "
+                f"Initial {self.side} hand is not open; open the hand and confirm fresh feedback "
                 f"before capturing/planning (max error {error:.4f} rad, "
                 f"tolerance {OPEN_HAND_TOLERANCE_RAD:.3f} rad)"
             )

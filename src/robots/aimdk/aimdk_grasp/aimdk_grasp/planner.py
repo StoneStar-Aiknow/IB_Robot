@@ -15,9 +15,9 @@ import numpy as np
 
 from .frames import rigid
 from .hand import HandMapping, hand_links
-from .joints import HEAD, LEFT_ARM, RIGHT_ARM
+from .joints import HEAD, arm_joints, check_side, other_side
 from .mesh_loading import use_gpu_validation_meshes
-from .robot_model import collision_robot_config, planning_model
+from .robot_model import collision_robot_config, config_directory, planning_model
 from .scene_estimation import LazyScene, SceneEstimate
 from .trajectory import TimedTrajectory
 
@@ -138,12 +138,16 @@ def urdf_joints(path):
 def robot_config(
     feedback,
     *,
+    side="left",
     reference_hand_collisions=True,
     torso_merge_radius_m=None,
     torso_merge_protected_spheres=None,
     hand_merge_radius_m=None,
 ):
+    directory = config_directory(check_side(side))
+    arm, other = arm_joints(side), arm_joints(other_side(side))
     config = collision_robot_config(
+        directory,
         reference_hand_collisions=reference_hand_collisions,
         torso_merge_radius_m=torso_merge_radius_m,
         torso_merge_protected_spheres=torso_merge_protected_spheres,
@@ -163,12 +167,12 @@ def robot_config(
         if parent in links and kind not in ("fixed", "floating") and not mimic
     }
     locks = {n: v for n, v in kin["lock_joints"].items() if n in movable}
-    locks.update(zip(RIGHT_ARM + HEAD, feedback.vector(RIGHT_ARM + HEAD), strict=True))
-    locks.update(HandMapping(planning_model()).kinematic_alias(feedback.left_hand))
-    if movable - set(locks) != set(LEFT_ARM):
-        raise ValueError("Robot must expose exactly the seven left arm joints")
+    locks.update(zip(other + HEAD, feedback.vector(other + HEAD), strict=True))
+    locks.update(HandMapping(planning_model(directory), side=side).kinematic_alias(feedback.hand(side)))
+    if movable - set(locks) != set(arm):
+        raise ValueError(f"Robot must expose exactly the seven {side} arm joints")
     kin["lock_joints"] = {n: float(v) for n, v in locks.items()}
-    kin["cspace"]["default_joint_position"] = feedback.vector(LEFT_ARM).tolist()
+    kin["cspace"]["default_joint_position"] = feedback.vector(arm).tolist()
     return config
 
 
@@ -191,8 +195,8 @@ def palm_goal_pose(transforms, *, batched=False):
     )
 
 
-def screen_robot_config(config, excluded_links):
-    """The left-arm moving collision links of ``config`` minus ``excluded_links``.
+def screen_robot_config(config, excluded_links, side="left"):
+    """The ``side`` arm's moving collision links of ``config`` minus ``excluded_links``.
 
     The contact screen disables the hand links anyway, and the static body
     cannot move toward a candidate, so a batched screen over 100 candidates
@@ -202,7 +206,7 @@ def screen_robot_config(config, excluded_links):
     config = copy.deepcopy(config)
     kin = config["robot_cfg"]["kinematics"]
     joints = {child: (name, parent) for name, _, parent, child, _ in urdf_joints(kin["urdf_path"])}
-    shoulder = next(child for child, (name, _) in joints.items() if name == LEFT_ARM[0])
+    shoulder = next(child for child, (name, _) in joints.items() if name == arm_joints(side)[0])
     moving, pending = set(), [shoulder]
     while pending:
         link = pending.pop()
@@ -331,7 +335,7 @@ def _skip_static_scene_spheres(scene_collision, static):
 
 
 class LeftArmPlanner:
-    """Plans and checks only left-arm motion; hardware transport is separate.
+    """Plans and checks only the motion of one arm (``side``, the left by default); hardware transport is separate.
 
     Scene poses and palm goals are in torso_link. update_scene replaces both
     geometry resolutions in place; locked-joint changes need a new instance.
@@ -349,6 +353,10 @@ class LeftArmPlanner:
     retry after a longer approach fails.
     "native" retains cuRobo's original seed ordering.
     """
+
+    #: The planned arm; ``__init__`` sets them from ``side`` (class defaults: the left arm).
+    side = "left"
+    arm, other_arm = arm_joints("left"), arm_joints("right")
 
     _ik_validity_cache_capacity = 4096
     # Fine checks query each sphere pose shared with the batch's first state
@@ -473,6 +481,7 @@ class LeftArmPlanner:
         torso_merge_protected_spheres=None,
         planning_profile="default",
         approach_seed_policy="clear_path",
+        side="left",
     ):
         import curobo.runtime as runtime
         import torch
@@ -502,13 +511,15 @@ class LeftArmPlanner:
         if planning_profile == "latency" and max_batch_size != 1:
             raise ValueError("The latency profile requires max_batch_size=1 (direct goalsets)")
         configure_runtime(runtime)
-        self.right = feedback.vector(RIGHT_ARM)
+        self.side = check_side(side)
+        self.arm, self.other_arm = arm_joints(side), arm_joints(other_side(side))
+        self.other = feedback.vector(self.other_arm)
         self.head = feedback.vector(HEAD)
-        model = planning_model()
-        self.hand_mapping = HandMapping(model)
+        model = planning_model(config_directory(side))
+        self.hand_mapping = HandMapping(model, side=side)
         self.hand_links = list(hand_links(model))
         self.grasp_to_palm = grasp_to_palm_transform(gripper)
-        self.hand = self.hand_mapping.check(feedback.left_hand).copy()
+        self.hand = self.hand_mapping.check(feedback.hand(side)).copy()
         self.scene_received_at = scene_received_at
         self.max_scene_age_s = max_scene_age_s
         self.reference_hand_collisions = reference_hand_collisions
@@ -521,7 +532,7 @@ class LeftArmPlanner:
         self._checker_lock = RLock()
         self._checker_batch_size = None
         self._pending_validation_scene = validation_scene if isinstance(validation_scene, LazyScene) else None
-        config = robot_config(feedback, reference_hand_collisions=reference_hand_collisions)
+        config = robot_config(feedback, side=side, reference_hand_collisions=reference_hand_collisions)
         kin = config["robot_cfg"]["kinematics"]
         self.collision_sphere_links = [
             name for name in kin["collision_link_names"] for _ in kin["collision_spheres"][name]
@@ -531,6 +542,7 @@ class LeftArmPlanner:
         motion_robot = (
             robot_config(
                 feedback,
+                side=side,
                 reference_hand_collisions=reference_hand_collisions,
                 torso_merge_radius_m=torso_merge_radius_m,
                 torso_merge_protected_spheres=torso_merge_protected_spheres,
@@ -602,10 +614,10 @@ class LeftArmPlanner:
             )
             for cost in (self.checker.collision_cost, self.checker.collision_constraint):
                 cost.config.update_num_spheres(spheres)
-            if tuple(self.motion.joint_names) != LEFT_ARM or tuple(self.checker.kinematics.joint_names) != LEFT_ARM:
+            if tuple(self.motion.joint_names) != self.arm or tuple(self.checker.kinematics.joint_names) != self.arm:
                 raise ValueError("cuRobo joint order differs from SDK left arm order")
-            state = self.motion.compute_kinematics(self._state(feedback.vector(LEFT_ARM)))
-            fine_state = self.checker.get_kinematics(self._state(feedback.vector(LEFT_ARM)).position[:, None])
+            state = self.motion.compute_kinematics(self._state(feedback.vector(self.arm)))
+            fine_state = self.checker.get_kinematics(self._state(feedback.vector(self.arm)).position[:, None])
             self.mesh_query_distance = (
                 max(float(state.robot_spheres[..., 3].max()), float(fine_state.robot_spheres[..., 3].max()))
                 + activation_distance
@@ -631,7 +643,7 @@ class LeftArmPlanner:
         from curobo._src.solver.solver_ik_cfg import IKSolverCfg
         from curobo._src.types.device_cfg import DeviceCfg
 
-        screen_robot = screen_robot_config(config, self.hand_links)
+        screen_robot = screen_robot_config(config, self.hand_links, self.side)
         # L-BFGS IK as in MotionPlannerCfg.create, but with a fixed 1 cm
         # activation (not _optimizer_activation_m): it only screens, and every
         # returned state is fine-checked at 0.
@@ -649,7 +661,7 @@ class LeftArmPlanner:
         )
         ik_config.exit_early_batch_success_threshold = self._screen_exit_early_fraction
         solver = IKSolver(ik_config, checker)
-        if tuple(solver.joint_names) != LEFT_ARM:
+        if tuple(solver.joint_names) != self.arm:
             solver.destroy()
             raise ValueError("cuRobo screen joint order differs from SDK left arm order")
         return solver
@@ -773,13 +785,15 @@ class LeftArmPlanner:
             and self._approach_graph_seed in ("escape", "over")
             and self.planning_profile == "latency"
         ):
-            self._escape_chain(feedback.vector(LEFT_ARM))  # scene-independent; ready for the first attempt
+            self._escape_chain(feedback.vector(self.arm))  # scene-independent; ready for the first attempt
 
     def locked_joints_match(self, feedback):
         return bool(
-            np.allclose(feedback.vector(RIGHT_ARM), self.right, atol=LOCKED_JOINT_ATOL, rtol=0)
+            np.allclose(feedback.vector(self.other_arm), self.other, atol=LOCKED_JOINT_ATOL, rtol=0)
             and np.allclose(feedback.vector(HEAD), self.head, atol=LOCKED_JOINT_ATOL, rtol=0)
-            and np.allclose(self.hand_mapping.check(feedback.left_hand), self.hand, atol=LOCKED_JOINT_ATOL, rtol=0)
+            and np.allclose(
+                self.hand_mapping.check(feedback.hand(self.side)), self.hand, atol=LOCKED_JOINT_ATOL, rtol=0
+            )
         )
 
     def _bound_mesh_query(self, model):
@@ -795,7 +809,7 @@ class LeftArmPlanner:
         q = np.asarray(positions, dtype=np.float32)
         if q.shape != (7,) or not np.isfinite(q).all():
             raise ValueError("Seven finite left arm positions required")
-        return JointState.from_position(torch.tensor(q[None], device="cuda"), joint_names=list(LEFT_ARM))
+        return JointState.from_position(torch.tensor(q[None], device="cuda"), joint_names=list(self.arm))
 
     def snapshot_matches(self, feedback, now):
         return bool(
@@ -938,7 +952,7 @@ class LeftArmPlanner:
             parts.append(f"self cost {diagnostics['self_collision_cost'][bad].max():.3g}")
         bound = diagnostics["bound_cost"][bad].max(axis=0)
         if bound.max() > 0:
-            parts.append(f"bound_joints={[n for n, v in zip(LEFT_ARM, bound, strict=False) if v > 0]}")
+            parts.append(f"bound_joints={[n for n, v in zip(self.arm, bound, strict=False) if v > 0]}")
         if diagnostics["hand_behind_torso"][bad].any():
             parts.append("hand behind the torso")
         return "; ".join(parts)
@@ -976,7 +990,7 @@ class LeftArmPlanner:
         world = diagnostics["world_penetration_m"][0]
         raise RuntimeError(
             "Start state violates collision or joint constraints: "
-            f"bound_joints={[n for n, v in zip(LEFT_ARM, bound, strict=False) if v > 0]}, "
+            f"bound_joints={[n for n, v in zip(self.arm, bound, strict=False) if v > 0]}, "
             f"self_squared_cost={diagnostics['self_collision_cost'].max():.8g}, "
             f"world_links={sorted({n for n, v in zip(self.collision_sphere_links, world, strict=False) if v > 0})}, "
             f"world_max_m={world.max():.8g}, "
@@ -1039,7 +1053,7 @@ class LeftArmPlanner:
         from scipy.spatial.transform import Rotation
 
         q = torch.as_tensor(np.ascontiguousarray(positions, dtype=np.float32), device="cuda")
-        poses = self.motion.compute_kinematics(JointState.from_position(q, joint_names=list(LEFT_ARM))).tool_poses
+        poses = self.motion.compute_kinematics(JointState.from_position(q, joint_names=list(self.arm))).tool_poses
         frame = poses.tool_frames.index("R_palm")
         position = poses.position[:, 0, frame].detach().cpu().numpy()
         quaternion = poses.quaternion[:, 0, frame].detach().cpu().numpy()
@@ -1224,7 +1238,7 @@ class LeftArmPlanner:
         seeds = self._screen_ik_seeds
         result = self.screen_ik.solve_pose(
             pose,
-            JointState.from_position(torch.tensor(q, device="cuda"), joint_names=list(LEFT_ARM)),
+            JointState.from_position(torch.tensor(q, device="cuda"), joint_names=list(self.arm)),
             return_seeds=seeds,
         )
         if result is None or result.success is None or result.solution is None:
@@ -1311,7 +1325,7 @@ class LeftArmPlanner:
         grasps = np.asarray(camera_from_grasps, dtype=float)
         if getattr(self, "screen_ik", None) is None or not len(grasps):
             return np.zeros(len(grasps), dtype=bool)
-        q = feedback.vector(LEFT_ARM)
+        q = feedback.vector(self.arm)
         goals = palm_goals_from_camera_grasps(grasps, base_from_camera, self.grasp_to_palm)
         goals[:, :3, 3] += float(offset_m) * goals[:, :3, 2]
         batches = [
@@ -1562,16 +1576,16 @@ class LeftArmPlanner:
         last = getattr(result, "interpolated_last_tstep", None)
         count = None if last is None else int(last.reshape(-1)[0].item()) + 1
         names = list(trajectory.joint_names)
-        if not set(LEFT_ARM) <= set(names):
+        if not set(self.arm) <= set(names):
             return False
-        columns = [names.index(name) for name in LEFT_ARM]
+        columns = [names.index(name) for name in self.arm]
         limits = self.motion.kinematics.config.kinematics_config.joint_limits
         for field in ("velocity", "acceleration", "jerk"):
             value, bound = getattr(trajectory, field, None), getattr(limits, field, None)
             if value is None or bound is None:
                 return False
             value = value.detach().cpu().numpy().reshape(-1, len(names))[:count, columns]
-            bound = bound.detach().cpu().numpy().reshape(2, -1)[:, : len(LEFT_ARM)]
+            bound = bound.detach().cpu().numpy().reshape(2, -1)[:, : len(self.arm)]
             if not np.isfinite(value).all() or np.any(value < bound[0] - 1e-6) or np.any(value > bound[1] + 1e-6):
                 return False
         return True
@@ -1656,7 +1670,7 @@ class LeftArmPlanner:
             return None, "fine"
         check_deadline()
         torch.cuda.synchronize()
-        return TimedTrajectory(times, positions), None
+        return TimedTrajectory(times, positions, self.arm), None
 
     def _grasp_trajectory(self, result, phase, *, deadline=None):
         """Keep inclusive endpoints and fine-check every returned segment."""
@@ -1672,7 +1686,10 @@ class LeftArmPlanner:
             get_interpolated_plan=lambda: result.interpolated_trajectory,
         )
         out = TimedTrajectory.from_curobo(
-            raw_result, self.motion.trajopt_solver.config.interpolation_dt, locked_positions=self.locked_positions
+            raw_result,
+            self.motion.trajopt_solver.config.interpolation_dt,
+            locked_positions=self.locked_positions,
+            arm=self.arm,
         )
         last = result.interpolated_last_tstep
         if last is not None:
@@ -1680,7 +1697,7 @@ class LeftArmPlanner:
             if not 2 <= n <= len(out.times):
                 raise RuntimeError(f"Incomplete interpolated {phase} trajectory")
             if n < len(out.times):
-                out = TimedTrajectory(out.times[:n], out.positions[:n])
+                out = TimedTrajectory(out.times[:n], out.positions[:n], out.joint_names)
         if not self.valid_positions(out.positions).all():
             raise RuntimeError(
                 f"Interpolated {phase} segment violates fine collision constraints: {self.violations(out.positions)}"
@@ -1710,7 +1727,7 @@ class LeftArmPlanner:
         # Exact shared endpoint with the grasp segment (grasp_request checks it).
         positions = lift.positions.copy()
         positions[0] = grasp.positions[-1]
-        return TimedTrajectory(lift.times, positions), "vertical"
+        return TimedTrajectory(lift.times, positions, lift.joint_names), "vertical"
 
     @contextmanager
     def _carried_target(self):
@@ -1747,7 +1764,7 @@ class LeftArmPlanner:
             raise TimeoutError("Planning deadline exceeded")
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
-        q = feedback.vector(LEFT_ARM)
+        q = feedback.vector(self.arm)
         self._require_valid_start(q)
         goal = rigid(torso_from_palm)
         pose, state = self._goal_pose(goal[None]), self._state(q)
@@ -1756,7 +1773,10 @@ class LeftArmPlanner:
         if result is None or result.success is None or not bool(result.success.all()):
             raise RuntimeError(f"cuRobo pose planning failed: {self._motion_failure(result)}")
         trajectory = TimedTrajectory.from_curobo(
-            result, self.motion.trajopt_solver.config.interpolation_dt, locked_positions=self.locked_positions
+            result,
+            self.motion.trajopt_solver.config.interpolation_dt,
+            locked_positions=self.locked_positions,
+            arm=self.arm,
         )
         if not self.valid_positions(trajectory.positions).all():
             raise RuntimeError("Interpolated trajectory violates collision or joint constraints")
@@ -1797,7 +1817,7 @@ class LeftArmPlanner:
             raise RuntimeError("Planner has no screen IK (_screen_batch_size is 0)")
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
-        q = feedback.vector(LEFT_ARM)
+        q = feedback.vector(self.arm)
         self._require_valid_start(q)
         transforms = palm_goals_from_camera_grasps(np.stack(grasps), base_from_camera, self.grasp_to_palm)
         return self._batch_screen(q, transforms, check_deadline, diagnostics)
@@ -1886,7 +1906,7 @@ class LeftArmPlanner:
             selection_goals[:, :3, 3] += float(approach_offset) * goals[:, :3, 2]
         index = None
         try:
-            q = feedback.vector(LEFT_ARM)
+            q = feedback.vector(self.arm)
             self._require_valid_start(q)
             key = (q.tobytes(), goals.tobytes(), selection_goals.tobytes())
             check_deadline()

@@ -21,6 +21,7 @@ from manipulation_execution.grasp_pipeline.candidates import (
 )
 
 from .grasp_session import SIDE_FIRST_LONGEST_APPROACH, select_plan
+from .joints import check_side
 from .planner import LOCKED_JOINT_ATOL, LeftArmPlanner, PlannerFault, device_fault
 
 # A directory: every plan call's inputs and outcome are pickled there (plan_replay replays them).
@@ -53,17 +54,20 @@ def _report_rebuild(planner, feedback) -> None:
     cause at once: ``hand=0.4623 <-- over`` after a failed release left the
     hand half closed, with the right arm at 0.0017 and the head at 0.0000.
     """
-    from .joints import HEAD, RIGHT_ARM
+    from .joints import HEAD
 
     if planner is None:
         print("planner rebuild: first build", file=sys.stderr, flush=True)
         return
     try:
         moved = {
-            "right": np.max(np.abs(np.asarray(feedback.vector(RIGHT_ARM)) - np.asarray(planner.right))),
+            "other_arm": np.max(np.abs(np.asarray(feedback.vector(planner.other_arm)) - np.asarray(planner.other))),
             "head": np.max(np.abs(np.asarray(feedback.vector(HEAD)) - np.asarray(planner.head))),
             "hand": np.max(
-                np.abs(np.asarray(planner.hand_mapping.check(feedback.left_hand)) - np.asarray(planner.hand))
+                np.abs(
+                    np.asarray(planner.hand_mapping.check(feedback.hand(planner.hand_mapping.side)))
+                    - np.asarray(planner.hand)
+                )
             ),
         }
     except BaseException as exc:  # noqa: BLE001 - a diagnostic must not change what the request does
@@ -131,11 +135,11 @@ APPROACH_REACH_FALLBACK_M = -0.10
 
 
 class GraspPlanningService:
-    """Own one warmed planner across requests and RGB-D scene updates.
+    """Own one warmed planner of one arm (``side`` planner option) across requests and RGB-D scene updates.
 
     Call prepare at startup, then submit fresh SceneEstimates to plan. Locked
-    head/right-arm/hand changes rebuild the robot snapshot; left-arm motion and
-    mesh updates reuse the existing solvers. All GPU calls are serialized.
+    head/other-arm/hand changes rebuild the robot snapshot; planning-arm motion and
+    mesh updates reuse the existing solvers. Two arms are two services. All GPU calls are serialized.
     ``gripper`` is the deployed grasp model's gripper description
     (hand.load_gripper_description): its palm mount goes to the planner, its
     closing sweep to the enclosure check.
@@ -164,6 +168,8 @@ class GraspPlanningService:
             raise ValueError("The latency profile requires max_batch_size=1 (direct goalsets)")
         self.planning_profile = planning_profile
         self.approach_seed_policy = approach_seed_policy
+        #: The arm this service plans; its planner is built on that side's planning model.
+        self.side = check_side(planner_options.get("side", "left"))
         self._sweep = sweep_boxes(gripper)
         self._options: dict = dict(
             gripper=gripper,
@@ -470,11 +476,14 @@ class GraspPlanningService:
                             "with_grasp_line": merged,
                         }
                 if PALM_LEFT_Y is not None and feasible is not None:
+                    # The right arm's preference is the mirror image: its palm facing the robot's right
+                    # (mirroring the palm by x mirrors the grasp frame by its y, test_mirror_side).
                     rotation = np.asarray(base_from_camera, dtype=float)[:3, :3]
-                    left = np.asarray(feasible, dtype=bool) & ((grasps[:, :3, 0] @ rotation.T)[:, 1] > PALM_LEFT_Y)
+                    outward = (grasps[:, :3, 0] @ rotation.T)[:, 1] * (1.0 if self.side == "left" else -1.0)
+                    left = np.asarray(feasible, dtype=bool) & (outward > PALM_LEFT_Y)
                     level = np.zeros(len(grasps), dtype=int) if later is None else np.asarray(later, dtype=int)
                     later = np.where(left, np.maximum(level, 2), level)
-                    report["palm_left"] = {"min_y": PALM_LEFT_Y, "later": np.flatnonzero(left).tolist()}
+                    report[f"palm_{self.side}"] = {"min_y": PALM_LEFT_Y, "later": np.flatnonzero(left).tolist()}
                 if LOW_CONFIDENCE is not None and feasible is not None:
                     low = np.asarray(feasible, dtype=bool) & (scores < LOW_CONFIDENCE)
                     later = np.where(low, 3, np.zeros(len(grasps), dtype=int) if later is None else later)
