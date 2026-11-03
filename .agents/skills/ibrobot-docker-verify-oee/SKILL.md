@@ -1,11 +1,26 @@
 ---
 name: ibrobot-docker-verify-oee
-description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setup.sh + build.sh。Use when the user explicitly asks for openEuler/OEE Docker verification, or after an author-side PR gate asks WIP vs review and the user confirms review-ready. Skip author-side [WIP] PRs; do not run automatically during PR review."
+description: "在 openEuler Embedded (aarch64) 环境中实际执行 setup.sh + build.sh：本机有 ascend-vm 时用 ascend-vm 虚拟机，否则用 Docker 容器。Use when the user explicitly asks for openEuler/OEE Docker verification, or after an author-side PR gate asks WIP vs review and the user confirms review-ready. Skip author-side [WIP] PRs; do not run automatically during PR review."
 ---
 
 # IB-Robot openEuler Embedded Docker Verification Skill
 
-在全新 openEuler Embedded aarch64 Docker 容器中完整验证 `setup.sh` 和 `build.sh`。
+在 openEuler Embedded aarch64 环境中完整验证 `setup.sh` 和 `build.sh`。
+
+## 选择验证环境
+
+先选择验证环境，再执行对应流程：
+
+| 本机条件 | 使用的环境 | 流程 |
+|----------|------------|------|
+| 安装了 ascend-vm，并且虚拟机正在运行（`ascend-vm status` 显示 `RUNNING`） | ascend-vm 虚拟机 | [references/ascend-vm.md](references/ascend-vm.md) |
+| 没有 ascend-vm | Docker 容器 | 本文件和 [references/procedure.md](references/procedure.md) |
+
+- 两种环境只选一种。有 ascend-vm 时优先用 ascend-vm，因为它有完整的系统和真实 NPU，更接近真机。
+- 两种环境的通过结果都可以作为 PR 的 openEuler 验证证据。验证报告写明使用的环境。
+- Tree 绑定、Core Principle 和 Error Classification 对两种环境都适用。
+
+下文从 Container Architecture 开始的内容只适用于 Docker 环境。
 
 > **⚠️ 与 Ubuntu 验证的两个核心差异：**
 > 1. **以 root 用户操作**（openEuler Embedded 开发板默认 root，无需 sudo/testuser）
@@ -43,7 +58,7 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
    单纯修改 commit message、作者或 trailer 不会让结果失效。
 5. `docker cp` 当前 dirty 工作区仍可用于本地调试，但结果不得写成 PR 验证证据。
 
-## Prerequisites
+## Prerequisites（Docker 环境）
 
 - 宿主机已安装 Docker CLI（检查 `command -v docker`）。
 - PR 证据快照要求宿主机安装 Git LFS；流程会执行 `git lfs pull` 和 `git lfs fsck`，避免相同
@@ -141,6 +156,14 @@ openEuler Embedded rootfs。当镜像构建过程中基础包升级但 RPM DB �
    build 在 `livox_ros_driver2` 链接阶段失败，浪费约 1.5 小时 qemu 构建时间。
    因此 setup 完成后必须重跑探测并检查 `/usr/lib64/liblz4.so` 存在，失败则
    reinstall 修复后再启动 build。
+
+**第二个示例（libxml2，2026-11）：**
+
+- RPM DB 标称 `libxml2-2.11.5-3.oe2403`，磁盘上没有 `libxml2.so.2.11.5`。
+- `libxml2.so.2` 指向 `libxml2.so.2.12.6`，这个文件不属于任何软件包。
+- `libxslt` 按 2.11 编译，加载时报 `undefined symbol: xmlXPathDebugDumpObject`，GraspGenX 导入检查失败。
+- `dnf reinstall libxml2` 不够：`ldconfig` 仍选择版本号更高的 2.12.6。修复还要移走 `libxml2.so.2.12.6` 并执行 `ldconfig`，见 Phase 3.5。
+- 这个问题来自 openEuler Embedded rootfs 本身（`openeuler-image-qemu-aarch64-20260913010045`），Docker 和 ascend-vm 两种环境都会出现。跟踪见 #219。
 
 **扩展规则：** lz4 是首个已知示例，不是封闭列表。当 setup.sh 或 build.sh 因其他包出现
 "RPM DB 标称版本 vs 磁盘实际版本不一致"失败时，把该包加入 Phase 3.5 与

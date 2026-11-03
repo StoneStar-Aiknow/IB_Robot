@@ -86,6 +86,16 @@ docker exec verify-oee bash -c \
 #     (observed: libs/Livox-SDK2 aborted a setup run in the submodule stage).
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs git config --global --replace-all safe.directory "*"'
+
+# 2.6 Create device nodes. The rootfs /dev is empty, and GraspGenX import fails
+#     with "Unable to open /dev/urandom". Create the nodes inside the rootfs;
+#     do not bind the host /dev.
+docker exec verify-oee bash -c '
+  d=/root/openeuler_rootfs/dev
+  [ -e $d/null ] || mknod -m 666 $d/null c 1 3
+  [ -e $d/zero ] || mknod -m 666 $d/zero c 1 5
+  [ -e $d/random ] || mknod -m 444 $d/random c 1 8
+  [ -e $d/urandom ] || mknod -m 444 $d/urandom c 1 9'
 ```
 
 **Why --privileged:** chroot 和 qemu-user binfmt 模拟需要 privileged 权限。
@@ -100,7 +110,7 @@ docker exec verify-oee bash -c \
 
 **Host safety rule:** 任何 chroot 或 qemu/rootfs 相关命令都必须包在
 `docker exec verify-oee ...` 里执行。不要在宿主机直接 chroot 到 aarch64 rootfs，
-也不要把宿主机 `/proc`、`/sys`、`/dev` bind 到容器 rootfs；setup/build 不需要这些资源。
+也不要把宿主机 `/proc`、`/sys`、`/dev` bind 到容器 rootfs。setup/build 只需要 2.6 创建的 4 个设备节点。
 
 ## Phase 3 — Inspect chroot Environment
 
@@ -137,13 +147,14 @@ setup.sh 仍须完整执行，以验证 ROS 检测、workspace venv 安装和项
 
 | 包名 | 子包 | 发现镜像批次 | 现象 |
 |------|------|----------|------|
+| `libxml2` | — | `:env` 镜像（2026-11-02）和 ascend-vm rootfs | RPM DB 标称 `libxml2-2.11.5-3.oe2403`，磁盘上没有 `libxml2.so.2.11.5`；`libxml2.so.2 -> libxml2.so.2.12.6`，2.12.6 不属于任何软件包；`libxslt` 加载时报 `undefined symbol: xmlXPathDebugDumpObject`。`dnf reinstall` 后 `ldconfig` 仍选 2.12.6，必须再移走 2.12.6（见步骤 2） |
 | `lz4` | `lz4-devel` | `:env` 镜像（2026-07 前后） | RPM DB 标称 `lz4-1.9.4-2.oe2403`，磁盘实为 `lz4 1.10.0`；`/usr/lib64/liblz4.so.1 -> liblz4.so.1.10.0`；`liblz4.so.1.9.4` 与 `liblz4.so` 不存在；`rpm -V lz4` 报 `liblz4.so.1` 链接错误与 `liblz4.so.1.9.4` 缺失。setup.sh 安装 `flann-devel` → `lz4-devel` 时 dnf 创建指向不存在的 `liblz4.so.1.9.4` 的 `/usr/lib64/liblz4.so`，导致后续链接错误 |
 
 **步骤 1 — 探测已知易损坏包：**
 
 ```bash
 docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
-  for pkg in lz4 lz4-devel; do
+  for pkg in lz4 lz4-devel libxml2; do
     if rpm -q \"\$pkg\" >/dev/null 2>&1; then
       echo \"=== \$pkg ===\"
       rpm -V \"\$pkg\" || true
@@ -165,6 +176,21 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
   dnf reinstall -y --nogpgcheck lz4 lz4-devel
 "'
 ```
+
+libxml2 还要移走不属于任何软件包的 2.12.6，否则 `ldconfig` 仍把 `libxml2.so.2` 指向它：
+
+```bash
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  if [ -e /usr/lib64/libxml2.so.2.12.6 ] && ! rpm -qf /usr/lib64/libxml2.so.2.12.6 >/dev/null 2>&1; then
+    dnf reinstall -y --nogpgcheck libxml2
+    mv /usr/lib64/libxml2.so.2.12.6 /root/libxml2.so.2.12.6.bak
+    ldconfig
+  fi
+  readlink /usr/lib64/libxml2.so.2
+"'
+```
+
+`readlink` 输出 `libxml2.so.2.11.5` 才能继续。这项修复移走的是不属于任何软件包的文件，不安装新软件。验证报告中写明执行了这项修复。
 
 > **为什么是 `reinstall` 而不是 `install` / `upgrade`：** 包已经在 RPM DB 中
 > 声明，问题是磁盘内容与数据库不一致。`reinstall` 强制重新解包 RPM，把磁盘
@@ -278,6 +304,9 @@ git -C "${SNAPSHOT_ROOT}" lfs fsck
 test "$(git -C "${SNAPSHOT_ROOT}" rev-parse HEAD^{tree})" = "${VERIFIED_TREE}"
 test -z "$(git -C "${SNAPSHOT_ROOT}" status --porcelain --untracked-files=all)"
 
+# 2026-11-02 起 :env 镜像预置了 /root/IB_Robot。目标目录已存在时 docker cp 会把快照
+# 复制到它的子目录，所以先删除预置目录。
+docker exec verify-oee rm -rf /root/openeuler_rootfs/root/IB_Robot
 docker cp "${SNAPSHOT_ROOT}" verify-oee:/root/openeuler_rootfs/root/IB_Robot
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
